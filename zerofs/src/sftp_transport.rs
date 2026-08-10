@@ -509,6 +509,21 @@ fn require_publication_capabilities(capabilities: SftpCapabilities) -> Result<()
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionDisposition {
+    Reuse,
+    BrokenOrAmbiguous,
+}
+
+#[derive(Debug)]
+pub enum LeaseFinishError<E> {
+    Operation {
+        error: E,
+        cleanup: Option<TransportError>,
+    },
+    Lifecycle(TransportError),
+}
+
 pub struct SessionLease {
     pool: Arc<PoolInner>,
     session: Option<PhysicalSession>,
@@ -564,6 +579,27 @@ impl SessionLease {
             .await
             .map_err(|_| TransportError::Close("SFTP retirement task failed".to_owned()))?
     }
+
+    pub async fn finish<T, E>(
+        self,
+        operation: Result<T, E>,
+        error_disposition: SessionDisposition,
+    ) -> Result<T, LeaseFinishError<E>> {
+        match operation {
+            Ok(value) => {
+                self.complete().await.map_err(LeaseFinishError::Lifecycle)?;
+                Ok(value)
+            }
+            Err(error) => {
+                let cleanup = match error_disposition {
+                    SessionDisposition::Reuse => self.complete().await,
+                    SessionDisposition::BrokenOrAmbiguous => self.retire().await,
+                }
+                .err();
+                Err(LeaseFinishError::Operation { error, cleanup })
+            }
+        }
+    }
 }
 
 impl Drop for SessionLease {
@@ -589,8 +625,8 @@ impl Drop for SessionLease {
 #[cfg(test)]
 mod tests {
     use super::{
-        OpenSshSessionFactory, OpenSshTransportSession, OperationKind, SessionFactory,
-        SftpSessionPool, TransportError, TransportSession,
+        LeaseFinishError, OpenSshSessionFactory, OpenSshTransportSession, OperationKind,
+        SessionDisposition, SessionFactory, SftpSessionPool, TransportError, TransportSession,
     };
     use crate::config::SftpEndpoint;
     use crate::sftp_object_store::SftpCapabilities;
@@ -616,6 +652,7 @@ mod tests {
         open_started: Notify,
         allow_open: Notify,
         block_open_from: AtomicUsize,
+        fail_close: AtomicUsize,
     }
 
     impl fmt::Debug for RecordingFactory {
@@ -637,6 +674,7 @@ mod tests {
                     open_started: Notify::new(),
                     allow_open: Notify::new(),
                     block_open_from: AtomicUsize::new(0),
+                    fail_close: AtomicUsize::new(0),
                 }),
                 capabilities,
             }
@@ -709,6 +747,9 @@ mod tests {
                 self.state.allow_close.notified().await;
             }
             self.state.live.fetch_sub(1, Ordering::SeqCst);
+            if self.state.fail_close.load(Ordering::SeqCst) != 0 {
+                return Err(TransportError::Close("forced close failure".to_owned()));
+            }
             Ok(())
         }
     }
@@ -1112,24 +1153,101 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn broken_session_is_retired_before_reconnect() {
+    async fn successful_operation_finish_reuses_session_without_redial() {
         let factory = RecordingFactory::fully_capable();
         let pool = pool(factory.clone(), 1, 1, 1).await;
-        pool.checkout(OperationKind::Write)
+        let value = pool
+            .checkout(OperationKind::Read)
             .await
             .unwrap()
-            .retire()
+            .finish(Ok::<_, &'static str>(42), SessionDisposition::Reuse)
             .await
             .unwrap();
-        assert_eq!(factory.live(), 0);
+        assert_eq!(value, 42);
 
-        pool.checkout(OperationKind::Write)
+        pool.checkout(OperationKind::Read)
             .await
             .unwrap()
             .complete()
             .await
             .unwrap();
+        assert_eq!(factory.dials(), 1);
+    }
+
+    #[tokio::test]
+    async fn genuine_broken_operation_error_retires_before_redial_and_is_preserved() {
+        let factory = RecordingFactory::fully_capable();
+        let pool = Arc::new(pool(factory.clone(), 1, 1, 1).await);
+        factory.state.block_close.store(1, Ordering::SeqCst);
+        let lease = pool.checkout(OperationKind::Write).await.unwrap();
+        let finishing = tokio::spawn(async move {
+            let operation: Result<(), &'static str> = Err("connection lost after write request");
+            lease
+                .finish(operation, SessionDisposition::BrokenOrAmbiguous)
+                .await
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            factory.state.close_started.notified(),
+        )
+        .await
+        .expect("broken operation reaches blocked retirement close");
+
+        let replacement = tokio::spawn({
+            let pool = pool.clone();
+            async move { pool.checkout(OperationKind::Write).await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!replacement.is_finished());
+        assert_eq!(factory.dials(), 1);
+
+        factory.state.block_close.store(0, Ordering::SeqCst);
+        factory.state.allow_close.notify_waiters();
+        let failure = finishing.await.unwrap().unwrap_err();
+        match failure {
+            LeaseFinishError::Operation { error, cleanup } => {
+                assert_eq!(error, "connection lost after write request");
+                assert!(cleanup.is_none());
+            }
+            LeaseFinishError::Lifecycle(error) => panic!("operation error was lost: {error}"),
+        }
+        replacement
+            .await
+            .unwrap()
+            .unwrap()
+            .complete()
+            .await
+            .unwrap();
         assert_eq!(factory.dials(), 2);
+        assert_eq!(factory.peak(), 1);
+    }
+
+    #[tokio::test]
+    async fn broken_operation_preserves_close_failure_as_cleanup_evidence() {
+        let factory = RecordingFactory::fully_capable();
+        let pool = pool(factory.clone(), 1, 1, 1).await;
+        factory.state.fail_close.store(1, Ordering::SeqCst);
+        let operation: Result<(), &'static str> = Err("ambiguous remote mutation");
+
+        let failure = pool
+            .checkout(OperationKind::Write)
+            .await
+            .unwrap()
+            .finish(operation, SessionDisposition::BrokenOrAmbiguous)
+            .await
+            .unwrap_err();
+
+        match failure {
+            LeaseFinishError::Operation { error, cleanup } => {
+                assert_eq!(error, "ambiguous remote mutation");
+                assert!(matches!(
+                    cleanup,
+                    Some(TransportError::Close(ref message)) if message == "forced close failure"
+                ));
+            }
+            LeaseFinishError::Lifecycle(error) => panic!("operation error was lost: {error}"),
+        }
+        assert_eq!(factory.live(), 0);
     }
 
     #[tokio::test]
