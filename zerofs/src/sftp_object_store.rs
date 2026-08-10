@@ -1,8 +1,10 @@
 use async_trait::async_trait;
 use bytes::Bytes;
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::path::{Path as FilePath, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex as StdMutex, Weak};
+use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
 pub const OBJECT_HEADER_LEN: usize = 32;
@@ -111,11 +113,45 @@ pub enum RemoteError {
     AlreadyExists(String),
     #[error("remote precondition failed: {0}")]
     Precondition(String),
+    #[error("{operation}; cleanup required: {debt}")]
+    CleanupRequired {
+        operation: Box<RemoteError>,
+        debt: StagingCleanupDebt,
+    },
     #[error("remote SFTP operation failed: {0}")]
     Other(String),
 }
 
 pub type RemoteResult<T> = Result<T, RemoteError>;
+
+#[derive(Debug, thiserror::Error)]
+#[error("failed to remove staging path {}: {error}", path.display())]
+pub struct StagingCleanupDebt {
+    pub path: PathBuf,
+    pub error: Box<RemoteError>,
+}
+
+#[derive(Debug)]
+pub struct PublicationOutcome {
+    pub header: ObjectHeader,
+    pub cleanup_debt: Option<StagingCleanupDebt>,
+}
+
+type TargetLock = AsyncMutex<()>;
+
+static TARGET_LOCKS: LazyLock<StdMutex<HashMap<PathBuf, Weak<TargetLock>>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+fn target_lock(target: &FilePath) -> Arc<TargetLock> {
+    let mut locks = TARGET_LOCKS.lock().unwrap();
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(target).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(TargetLock::new(()));
+    locks.insert(target.to_path_buf(), Arc::downgrade(&lock));
+    lock
+}
 
 #[async_trait]
 pub trait RemoteSession: Debug + Send + Sync {
@@ -124,7 +160,7 @@ pub trait RemoteSession: Debug + Send + Sync {
     async fn write_file_durable(&self, path: &FilePath, chunks: Vec<Bytes>) -> RemoteResult<()>;
     async fn remove_file(&self, path: &FilePath) -> RemoteResult<()>;
     async fn hard_link(&self, from: &FilePath, to: &FilePath) -> RemoteResult<()>;
-    async fn rename(&self, from: &FilePath, to: &FilePath) -> RemoteResult<()>;
+    async fn posix_rename(&self, from: &FilePath, to: &FilePath) -> RemoteResult<()>;
 }
 
 pub async fn publish_payload(
@@ -133,7 +169,9 @@ pub async fn publish_payload(
     payload: Vec<Bytes>,
     mode: PublicationMode,
     expected_generation: Option<Uuid>,
-) -> RemoteResult<ObjectHeader> {
+) -> RemoteResult<PublicationOutcome> {
+    let target_lock = target_lock(target);
+    let _target_guard = target_lock.lock().await;
     validate_publication_capabilities(session.capabilities(), mode).map_err(|extension| {
         RemoteError::Other(format!("SFTP server lacks required {extension} extension"))
     })?;
@@ -153,18 +191,21 @@ pub async fn publish_payload(
     physical_payload.extend(payload);
 
     if let Err(error) = session.write_file_durable(&staging, physical_payload).await {
-        let _ = session.remove_file(&staging).await;
-        cleanup.disarm();
-        return Err(error);
+        return Err(failure_with_cleanup(&mut cleanup, error).await);
+    }
+
+    if mode == PublicationMode::Create {
+        return match session.hard_link(&staging, target).await {
+            Ok(()) => Ok(PublicationOutcome {
+                header,
+                cleanup_debt: cleanup.remove_now().await.err(),
+            }),
+            Err(error) => Err(failure_with_cleanup(&mut cleanup, error).await),
+        };
     }
 
     let publication = match mode {
-        PublicationMode::Create => {
-            let result = session.hard_link(&staging, target).await;
-            let cleanup = session.remove_file(&staging).await;
-            result.and(cleanup)
-        }
-        PublicationMode::Overwrite => session.rename(&staging, target).await,
+        PublicationMode::Overwrite => session.posix_rename(&staging, target).await,
         PublicationMode::Update => match expected_generation {
             None => Err(RemoteError::Precondition(
                 "Update requires an expected generation".to_owned(),
@@ -181,18 +222,30 @@ pub async fn publish_payload(
                         current.generation
                     )))
                 }
-                Ok(_) => session.rename(&staging, target).await,
+                Ok(_) => session.posix_rename(&staging, target).await,
             },
         },
+        PublicationMode::Create => unreachable!("Create handled above"),
     };
 
     if let Err(error) = publication {
-        let _ = session.remove_file(&staging).await;
-        cleanup.disarm();
-        return Err(error);
+        return Err(failure_with_cleanup(&mut cleanup, error).await);
     }
     cleanup.disarm();
-    Ok(header)
+    Ok(PublicationOutcome {
+        header,
+        cleanup_debt: None,
+    })
+}
+
+async fn failure_with_cleanup(cleanup: &mut StagingCleanup, operation: RemoteError) -> RemoteError {
+    match cleanup.remove_now().await {
+        Ok(()) => operation,
+        Err(debt) => RemoteError::CleanupRequired {
+            operation: Box::new(operation),
+            debt,
+        },
+    }
 }
 
 struct StagingCleanup {
@@ -210,6 +263,23 @@ impl StagingCleanup {
 
     fn disarm(&mut self) {
         self.path = None;
+    }
+
+    async fn remove_now(&mut self) -> Result<(), StagingCleanupDebt> {
+        let path = self.path.as_ref().expect("armed cleanup").clone();
+        match self.session.remove_file(&path).await {
+            Ok(()) => {
+                self.disarm();
+                Ok(())
+            }
+            Err(error) => {
+                self.disarm();
+                Err(StagingCleanupDebt {
+                    path,
+                    error: Box::new(error),
+                })
+            }
+        }
     }
 }
 
@@ -234,12 +304,15 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::sync::Mutex;
+    use std::time::Duration;
+    use tokio::sync::Barrier;
 
     #[derive(Debug)]
     struct RecordingSession {
         capabilities: SftpCapabilities,
         files: Mutex<HashMap<PathBuf, Bytes>>,
         operations: Mutex<Vec<String>>,
+        remove_error: Option<&'static str>,
     }
 
     impl RecordingSession {
@@ -252,6 +325,14 @@ mod tests {
                 },
                 files: Mutex::new(HashMap::new()),
                 operations: Mutex::new(Vec::new()),
+                remove_error: None,
+            }
+        }
+
+        fn with_remove_failure() -> Self {
+            Self {
+                remove_error: Some("forced staging removal failure"),
+                ..Self::new()
             }
         }
     }
@@ -298,8 +379,11 @@ mod tests {
         }
 
         async fn remove_file(&self, path: &FilePath) -> RemoteResult<()> {
-            self.files.lock().unwrap().remove(path);
             self.operations.lock().unwrap().push("remove".to_owned());
+            if let Some(error) = self.remove_error {
+                return Err(RemoteError::Other(error.to_owned()));
+            }
+            self.files.lock().unwrap().remove(path);
             Ok(())
         }
 
@@ -317,7 +401,7 @@ mod tests {
             Ok(())
         }
 
-        async fn rename(&self, from: &FilePath, to: &FilePath) -> RemoteResult<()> {
+        async fn posix_rename(&self, from: &FilePath, to: &FilePath) -> RemoteResult<()> {
             let bytes = self
                 .files
                 .lock()
@@ -325,8 +409,64 @@ mod tests {
                 .remove(from)
                 .ok_or_else(|| RemoteError::NotFound(from.display().to_string()))?;
             self.files.lock().unwrap().insert(to.to_path_buf(), bytes);
-            self.operations.lock().unwrap().push("rename".to_owned());
+            self.operations
+                .lock()
+                .unwrap()
+                .push("posix-rename".to_owned());
             Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct RacingSession {
+        inner: RecordingSession,
+        reads: Barrier,
+    }
+
+    impl RacingSession {
+        fn new() -> Self {
+            Self {
+                inner: RecordingSession::new(),
+                reads: Barrier::new(2),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl RemoteSession for RacingSession {
+        fn capabilities(&self) -> SftpCapabilities {
+            self.inner.capabilities()
+        }
+
+        async fn read_exact(
+            &self,
+            path: &FilePath,
+            offset: u64,
+            len: usize,
+        ) -> RemoteResult<Bytes> {
+            let snapshot = self.inner.read_exact(path, offset, len).await?;
+            let _ = tokio::time::timeout(Duration::from_secs(1), self.reads.wait()).await;
+            Ok(snapshot)
+        }
+
+        async fn write_file_durable(
+            &self,
+            path: &FilePath,
+            chunks: Vec<Bytes>,
+        ) -> RemoteResult<()> {
+            self.inner.write_file_durable(path, chunks).await
+        }
+
+        async fn remove_file(&self, path: &FilePath) -> RemoteResult<()> {
+            self.inner.remove_file(path).await
+        }
+
+        async fn hard_link(&self, from: &FilePath, to: &FilePath) -> RemoteResult<()> {
+            self.inner.hard_link(from, to).await
+        }
+
+        async fn posix_rename(&self, from: &FilePath, to: &FilePath) -> RemoteResult<()> {
+            self.inner.posix_rename(from, to).await
         }
     }
 
@@ -422,7 +562,7 @@ mod tests {
         let session = Arc::new(RecordingSession::new());
         let target = FilePath::new("/objects/segment.bin");
 
-        let header = publish_payload(
+        let outcome = publish_payload(
             session.clone(),
             target,
             vec![Bytes::from_static(b"payload")],
@@ -431,12 +571,14 @@ mod tests {
         )
         .await
         .expect("publication succeeds");
+        let header = outcome.header;
 
+        assert!(outcome.cleanup_debt.is_none());
         assert_eq!(header.logical_len, 7);
         assert_eq!(header.generation.get_version_num(), 4);
         assert_eq!(
             session.operations.lock().unwrap().as_slice(),
-            ["create", "write", "fsync", "close", "rename"]
+            ["create", "write", "fsync", "close", "posix-rename"]
         );
         let published = session.files.lock().unwrap().get(target).cloned().unwrap();
         assert_eq!(&published[OBJECT_HEADER_LEN..], b"payload");
@@ -490,5 +632,200 @@ mod tests {
             session.operations.lock().unwrap().as_slice(),
             ["create", "write", "fsync", "close", "remove"]
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_updates_with_one_expected_generation_have_one_winner() {
+        let session = Arc::new(RacingSession::new());
+        let target = PathBuf::from("/objects/segment.bin");
+        let current = ObjectHeader {
+            generation: Uuid::from_u128(0x00112233_4455_6677_8899_aabbccddeeff),
+            logical_len: 8,
+        };
+        let mut original = encode_header(current).to_vec();
+        original.extend_from_slice(b"original");
+        session
+            .inner
+            .files
+            .lock()
+            .unwrap()
+            .insert(target.clone(), original.into());
+
+        let first = {
+            let session = session.clone();
+            let target = target.clone();
+            tokio::spawn(async move {
+                publish_payload(
+                    session,
+                    &target,
+                    vec![Bytes::from_static(b"first")],
+                    PublicationMode::Update,
+                    Some(current.generation),
+                )
+                .await
+            })
+        };
+        let second = {
+            let session = session.clone();
+            let target = target.clone();
+            tokio::spawn(async move {
+                publish_payload(
+                    session,
+                    &target,
+                    vec![Bytes::from_static(b"second")],
+                    PublicationMode::Update,
+                    Some(current.generation),
+                )
+                .await
+            })
+        };
+
+        let results = [first.await.unwrap(), second.await.unwrap()];
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Err(RemoteError::Precondition(_))))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_update_remove_failure_reports_cleanup_debt() {
+        let session = Arc::new(RecordingSession::with_remove_failure());
+        let target = FilePath::new("/objects/segment.bin");
+        let current = ObjectHeader {
+            generation: Uuid::from_u128(0x00112233_4455_6677_8899_aabbccddeeff),
+            logical_len: 8,
+        };
+        let mut original = encode_header(current).to_vec();
+        original.extend_from_slice(b"original");
+        session
+            .files
+            .lock()
+            .unwrap()
+            .insert(target.to_path_buf(), original.into());
+
+        let error = publish_payload(
+            session.clone(),
+            target,
+            vec![Bytes::from_static(b"replacement")],
+            PublicationMode::Update,
+            Some(Uuid::from_u128(0xffeeddcc_bbaa_9988_7766_554433221100)),
+        )
+        .await
+        .expect_err("stale update must fail");
+
+        let (operation, debt) = match error {
+            RemoteError::CleanupRequired { operation, debt } => (operation, debt),
+            error => panic!("expected cleanup debt, got {error:?}"),
+        };
+        assert!(matches!(*operation, RemoteError::Precondition(_)));
+        let files = session.files.lock().unwrap();
+        let staging = files
+            .keys()
+            .find(|path| is_staging_name(path.file_name().unwrap().as_ref()))
+            .expect("failed removal leaves staging for a reaper");
+        assert_eq!(debt.path, *staging);
+        assert!(matches!(
+            *debt.error,
+            RemoteError::Other(ref message) if message == "forced staging removal failure"
+        ));
+    }
+
+    #[tokio::test]
+    async fn create_remove_failure_returns_committed_outcome_with_cleanup_debt() {
+        let session = Arc::new(RecordingSession::with_remove_failure());
+        let target = FilePath::new("/objects/segment.bin");
+
+        let outcome = publish_payload(
+            session.clone(),
+            target,
+            vec![Bytes::from_static(b"payload")],
+            PublicationMode::Create,
+            None,
+        )
+        .await
+        .expect("hardlink committed the create");
+
+        let files = session.files.lock().unwrap();
+        assert!(files.contains_key(target));
+        let staging = files
+            .keys()
+            .find(|path| is_staging_name(path.file_name().unwrap().as_ref()))
+            .expect("failed removal leaves staging for a reaper");
+        let debt = outcome
+            .cleanup_debt
+            .expect("committed create reports cleanup debt");
+        assert_eq!(debt.path, *staging);
+        assert!(matches!(
+            *debt.error,
+            RemoteError::Other(ref message) if message == "forced staging removal failure"
+        ));
+    }
+
+    #[tokio::test]
+    async fn create_uses_hardlink_then_removes_staging() {
+        let session = Arc::new(RecordingSession::new());
+        let target = FilePath::new("/objects/segment.bin");
+
+        let outcome = publish_payload(
+            session.clone(),
+            target,
+            vec![Bytes::from_static(b"payload")],
+            PublicationMode::Create,
+            None,
+        )
+        .await
+        .expect("create succeeds");
+
+        assert!(outcome.cleanup_debt.is_none());
+        assert_eq!(
+            session.operations.lock().unwrap().as_slice(),
+            ["create", "write", "fsync", "close", "hardlink", "remove"]
+        );
+        let files = session.files.lock().unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(
+            decode_header(files.get(target).unwrap()).unwrap(),
+            outcome.header
+        );
+    }
+
+    #[tokio::test]
+    async fn update_with_current_generation_uses_posix_rename() {
+        let session = Arc::new(RecordingSession::new());
+        let target = FilePath::new("/objects/segment.bin");
+        let current = ObjectHeader {
+            generation: Uuid::from_u128(0x00112233_4455_6677_8899_aabbccddeeff),
+            logical_len: 8,
+        };
+        let mut original = encode_header(current).to_vec();
+        original.extend_from_slice(b"original");
+        session
+            .files
+            .lock()
+            .unwrap()
+            .insert(target.to_path_buf(), original.into());
+
+        let outcome = publish_payload(
+            session.clone(),
+            target,
+            vec![Bytes::from_static(b"replacement")],
+            PublicationMode::Update,
+            Some(current.generation),
+        )
+        .await
+        .expect("current generation update succeeds");
+
+        assert!(outcome.cleanup_debt.is_none());
+        assert_eq!(
+            session.operations.lock().unwrap().as_slice(),
+            ["create", "write", "fsync", "close", "posix-rename"]
+        );
+        let published = session.files.lock().unwrap().get(target).cloned().unwrap();
+        assert_eq!(&published[OBJECT_HEADER_LEN..], b"replacement");
+        assert_eq!(decode_header(&published).unwrap(), outcome.header);
     }
 }
