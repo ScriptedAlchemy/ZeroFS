@@ -4,9 +4,10 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore, oneshot};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OperationKind {
@@ -38,6 +39,152 @@ pub trait TransportSession: fmt::Debug + Send + Sync + 'static {
 #[async_trait]
 pub trait SessionFactory: fmt::Debug + Send + Sync + 'static {
     async fn open(&self) -> Result<Box<dyn TransportSession>, TransportError>;
+}
+
+#[derive(Clone)]
+struct FairAdmission {
+    inner: Arc<AdmissionInner>,
+}
+
+struct AdmissionInner {
+    shared_limit: usize,
+    read_limit: usize,
+    write_limit: usize,
+    next_id: AtomicU64,
+    state: StdMutex<AdmissionState>,
+}
+
+#[derive(Default)]
+struct AdmissionState {
+    active_reads: usize,
+    active_writes: usize,
+    waiters: VecDeque<AdmissionWaiter>,
+}
+
+struct AdmissionWaiter {
+    id: u64,
+    kind: OperationKind,
+    sender: oneshot::Sender<OperationAdmission>,
+}
+
+struct OperationAdmission {
+    admission: FairAdmission,
+    kind: OperationKind,
+    active: bool,
+}
+
+impl FairAdmission {
+    fn new(shared_limit: usize, read_limit: usize, write_limit: usize) -> Self {
+        Self {
+            inner: Arc::new(AdmissionInner {
+                shared_limit,
+                read_limit,
+                write_limit,
+                next_id: AtomicU64::new(0),
+                state: StdMutex::new(AdmissionState::default()),
+            }),
+        }
+    }
+
+    async fn acquire(&self, kind: OperationKind) -> Result<OperationAdmission, TransportError> {
+        let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
+        let (sender, receiver) = oneshot::channel();
+        let mut registration = AdmissionRegistration {
+            admission: self.clone(),
+            id,
+            waiting: true,
+        };
+        {
+            let mut state = self.inner.state.lock().unwrap();
+            state
+                .waiters
+                .push_back(AdmissionWaiter { id, kind, sender });
+            self.dispatch_locked(&mut state);
+        }
+        let permit = receiver.await.map_err(|_| TransportError::PoolClosed)?;
+        registration.waiting = false;
+        Ok(permit)
+    }
+
+    fn dispatch_locked(&self, state: &mut AdmissionState) {
+        while state.active_reads + state.active_writes < self.inner.shared_limit {
+            let Some(index) = state.waiters.iter().position(|waiter| match waiter.kind {
+                OperationKind::Read | OperationKind::Metadata => {
+                    state.active_reads < self.inner.read_limit
+                }
+                OperationKind::Write => state.active_writes < self.inner.write_limit,
+            }) else {
+                break;
+            };
+            let waiter = state.waiters.remove(index).unwrap();
+            increment_active(state, waiter.kind);
+            let permit = OperationAdmission {
+                admission: self.clone(),
+                kind: waiter.kind,
+                active: true,
+            };
+            if let Err(mut permit) = waiter.sender.send(permit) {
+                permit.active = false;
+                decrement_active(state, permit.kind);
+            }
+        }
+    }
+
+    fn cancel_waiter(&self, id: u64) {
+        let mut state = self.inner.state.lock().unwrap();
+        if let Some(index) = state.waiters.iter().position(|waiter| waiter.id == id) {
+            state.waiters.remove(index);
+            self.dispatch_locked(&mut state);
+        }
+    }
+
+    fn release(&self, kind: OperationKind) {
+        let mut state = self.inner.state.lock().unwrap();
+        decrement_active(&mut state, kind);
+        self.dispatch_locked(&mut state);
+    }
+
+    #[cfg(test)]
+    fn waiter_count(&self) -> usize {
+        self.inner.state.lock().unwrap().waiters.len()
+    }
+}
+
+fn increment_active(state: &mut AdmissionState, kind: OperationKind) {
+    match kind {
+        OperationKind::Read | OperationKind::Metadata => state.active_reads += 1,
+        OperationKind::Write => state.active_writes += 1,
+    }
+}
+
+fn decrement_active(state: &mut AdmissionState, kind: OperationKind) {
+    match kind {
+        OperationKind::Read | OperationKind::Metadata => state.active_reads -= 1,
+        OperationKind::Write => state.active_writes -= 1,
+    }
+}
+
+struct AdmissionRegistration {
+    admission: FairAdmission,
+    id: u64,
+    waiting: bool,
+}
+
+impl Drop for AdmissionRegistration {
+    fn drop(&mut self) {
+        if self.waiting {
+            self.admission.cancel_waiter(self.id);
+        }
+    }
+}
+
+impl Drop for OperationAdmission {
+    fn drop(&mut self) {
+        if self.active {
+            self.active = false;
+            self.admission.release(self.kind);
+        }
+    }
 }
 
 pub struct OpenSshSessionFactory {
@@ -176,15 +323,20 @@ struct PhysicalSession {
 
 impl PhysicalSession {
     async fn close(self) -> Result<(), TransportError> {
-        self.transport.close().await
+        let Self {
+            transport,
+            _lifetime,
+        } = self;
+        let result = transport.close().await;
+        drop(_lifetime);
+        result
     }
 }
 
 struct PoolInner {
     factory: Arc<dyn SessionFactory>,
     shared: Arc<Semaphore>,
-    reads: Arc<Semaphore>,
-    writes: Arc<Semaphore>,
+    admission: FairAdmission,
     idle: Mutex<VecDeque<PhysicalSession>>,
     idle_available: Notify,
     writable: bool,
@@ -229,8 +381,7 @@ impl SftpSessionPool {
             inner: Arc::new(PoolInner {
                 factory,
                 shared: Arc::new(Semaphore::new(shared)),
-                reads: Arc::new(Semaphore::new(reads)),
-                writes: Arc::new(Semaphore::new(writes)),
+                admission: FairAdmission::new(shared, reads, writes),
                 idle: Mutex::new(VecDeque::new()),
                 idle_available: Notify::new(),
                 writable: true,
@@ -238,10 +389,6 @@ impl SftpSessionPool {
         };
 
         let session = pool.open_physical().await?;
-        if let Err(error) = require_publication_capabilities(session.transport.capabilities()) {
-            let _ = session.close().await;
-            return Err(error);
-        }
         pool.inner.idle.lock().await.push_back(session);
         Ok(pool)
     }
@@ -268,13 +415,7 @@ impl SftpSessionPool {
     }
 
     pub async fn checkout(&self, kind: OperationKind) -> Result<SessionLease, TransportError> {
-        let admission = match kind {
-            OperationKind::Read | OperationKind::Metadata => {
-                self.inner.reads.clone().acquire_owned().await
-            }
-            OperationKind::Write => self.inner.writes.clone().acquire_owned().await,
-        }
-        .map_err(|_| TransportError::PoolClosed)?;
+        let admission = self.inner.admission.acquire(kind).await?;
 
         let session = self.checkout_physical().await?;
         Ok(SessionLease {
@@ -296,14 +437,7 @@ impl SftpSessionPool {
                 biased;
                 permit = self.inner.shared.clone().acquire_owned() => {
                     let permit = permit.map_err(|_| TransportError::PoolClosed)?;
-                    let transport = self.inner.factory.open().await?;
-                    if self.inner.writable {
-                        if let Err(error) = require_publication_capabilities(transport.capabilities()) {
-                            let _ = transport.close().await;
-                            return Err(error);
-                        }
-                    }
-                    return Ok(PhysicalSession { transport, _lifetime: permit });
+                    return self.open_with_permit(permit).await;
                 }
                 () = &mut idle_available => {}
             }
@@ -318,11 +452,47 @@ impl SftpSessionPool {
             .acquire_owned()
             .await
             .map_err(|_| TransportError::PoolClosed)?;
-        let transport = self.inner.factory.open().await?;
-        Ok(PhysicalSession {
-            transport,
-            _lifetime: permit,
-        })
+        self.open_with_permit(permit).await
+    }
+
+    async fn open_with_permit(
+        &self,
+        permit: OwnedSemaphorePermit,
+    ) -> Result<PhysicalSession, TransportError> {
+        let factory = self.inner.factory.clone();
+        let writable = self.inner.writable;
+        let (sender, receiver) = oneshot::channel();
+        tokio::spawn(async move {
+            let result = match factory.open().await {
+                Err(error) => Err(error),
+                Ok(transport) => {
+                    if writable {
+                        if let Err(error) =
+                            require_publication_capabilities(transport.capabilities())
+                        {
+                            let _ = transport.close().await;
+                            Err(error)
+                        } else {
+                            Ok(PhysicalSession {
+                                transport,
+                                _lifetime: permit,
+                            })
+                        }
+                    } else {
+                        Ok(PhysicalSession {
+                            transport,
+                            _lifetime: permit,
+                        })
+                    }
+                }
+            };
+            if let Err(result) = sender.send(result)
+                && let Ok(session) = result
+            {
+                let _ = session.close().await;
+            }
+        });
+        receiver.await.map_err(|_| TransportError::PoolClosed)?
     }
 }
 
@@ -342,7 +512,7 @@ fn require_publication_capabilities(capabilities: SftpCapabilities) -> Result<()
 pub struct SessionLease {
     pool: Arc<PoolInner>,
     session: Option<PhysicalSession>,
-    admission: Option<OwnedSemaphorePermit>,
+    admission: Option<OperationAdmission>,
 }
 
 impl fmt::Debug for SessionLease {
@@ -367,10 +537,16 @@ impl SessionLease {
             .session
             .take()
             .expect("lease always owns a session until completion");
-        self.pool.idle.lock().await.push_back(session);
-        self.pool.idle_available.notify_one();
-        self.admission.take();
-        Ok(())
+        let pool = self.pool.clone();
+        let admission = self.admission.take();
+        let returning = tokio::spawn(async move {
+            pool.idle.lock().await.push_back(session);
+            pool.idle_available.notify_one();
+            drop(admission);
+        });
+        returning
+            .await
+            .map_err(|_| TransportError::Close("SFTP return task failed".to_owned()))
     }
 
     pub async fn retire(mut self) -> Result<(), TransportError> {
@@ -378,9 +554,15 @@ impl SessionLease {
             .session
             .take()
             .expect("lease always owns a session until retirement");
-        let result = session.close().await;
-        self.admission.take();
-        result
+        let admission = self.admission.take();
+        let cleanup = tokio::spawn(async move {
+            let result = session.close().await;
+            drop(admission);
+            result
+        });
+        cleanup
+            .await
+            .map_err(|_| TransportError::Close("SFTP retirement task failed".to_owned()))?
     }
 }
 
@@ -431,6 +613,9 @@ mod tests {
         close_started: Notify,
         allow_close: Notify,
         block_close: AtomicUsize,
+        open_started: Notify,
+        allow_open: Notify,
+        block_open_from: AtomicUsize,
     }
 
     impl fmt::Debug for RecordingFactory {
@@ -449,6 +634,9 @@ mod tests {
                     close_started: Notify::new(),
                     allow_close: Notify::new(),
                     block_close: AtomicUsize::new(0),
+                    open_started: Notify::new(),
+                    allow_open: Notify::new(),
+                    block_open_from: AtomicUsize::new(0),
                 }),
                 capabilities,
             }
@@ -481,6 +669,11 @@ mod tests {
             let id = self.state.dials.fetch_add(1, Ordering::SeqCst) + 1;
             let live = self.state.live.fetch_add(1, Ordering::SeqCst) + 1;
             self.state.peak.fetch_max(live, Ordering::SeqCst);
+            let block_open_from = self.state.block_open_from.load(Ordering::SeqCst);
+            if block_open_from != 0 && id >= block_open_from {
+                self.state.open_started.notify_waiters();
+                self.state.allow_open.notified().await;
+            }
             Ok(Box::new(RecordingSession {
                 id,
                 state: self.state.clone(),
@@ -608,6 +801,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn seven_writes_leave_one_shared_slot_for_a_read() {
+        let factory = RecordingFactory::fully_capable();
+        let pool = Arc::new(pool(factory.clone(), 8, 7, 7).await);
+        let mut writes = Vec::new();
+        for _ in 0..7 {
+            writes.push(pool.checkout(OperationKind::Write).await.unwrap());
+        }
+
+        let eighth_write = tokio::spawn({
+            let pool = pool.clone();
+            async move { pool.checkout(OperationKind::Write).await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!eighth_write.is_finished());
+
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            pool.checkout(OperationKind::Read),
+        )
+        .await
+        .expect("read uses reserved slot")
+        .unwrap();
+        assert_eq!(factory.live(), 8);
+
+        read.complete().await.unwrap();
+        writes.pop().unwrap().complete().await.unwrap();
+        eighth_write
+            .await
+            .unwrap()
+            .unwrap()
+            .complete()
+            .await
+            .unwrap();
+        for write in writes {
+            write.complete().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn cross_direction_waiters_are_admitted_in_fifo_order() {
+        let admission = super::FairAdmission::new(1, 1, 1);
+        let held = admission.acquire(OperationKind::Read).await.unwrap();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let mut tasks = Vec::new();
+
+        for (position, kind) in [
+            OperationKind::Write,
+            OperationKind::Read,
+            OperationKind::Write,
+            OperationKind::Metadata,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let task_admission = admission.clone();
+            let order = order.clone();
+            tasks.push(tokio::spawn(async move {
+                let permit = task_admission.acquire(kind).await.unwrap();
+                order.lock().unwrap().push(position);
+                drop(permit);
+            }));
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                while admission.waiter_count() != position + 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("waiter is queued in deterministic order");
+        }
+
+        drop(held);
+        for task in tasks {
+            task.await.unwrap();
+        }
+        assert_eq!(*order.lock().unwrap(), vec![0, 1, 2, 3]);
+    }
+
+    #[tokio::test]
     async fn metadata_uses_fifo_read_admission_without_starvation() {
         let factory = RecordingFactory::fully_capable();
         let pool = Arc::new(pool(factory, 2, 1, 1).await);
@@ -691,13 +962,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn canceled_complete_returns_session_before_releasing_admission() {
+        let factory = RecordingFactory::fully_capable();
+        let pool = Arc::new(pool(factory.clone(), 1, 1, 1).await);
+        let lease = pool.checkout(OperationKind::Read).await.unwrap();
+        let idle_guard = pool.inner.idle.lock().await;
+        let completing = tokio::spawn(async move { lease.complete().await });
+        tokio::task::yield_now().await;
+        completing.abort();
+        assert!(completing.await.unwrap_err().is_cancelled());
+        drop(idle_guard);
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            pool.checkout(OperationKind::Read),
+        )
+        .await
+        .expect("session return completes after caller cancellation")
+        .unwrap()
+        .complete()
+        .await
+        .unwrap();
+        assert_eq!(factory.dials(), 1);
+    }
+
+    #[tokio::test]
+    async fn canceled_open_keeps_lifetime_capacity_until_opened_session_closes() {
+        let factory = RecordingFactory::fully_capable();
+        let pool = Arc::new(pool(factory.clone(), 2, 2, 2).await);
+        let held = pool.checkout(OperationKind::Read).await.unwrap();
+        factory.state.block_open_from.store(2, Ordering::SeqCst);
+
+        let opening = tokio::spawn({
+            let pool = pool.clone();
+            async move { pool.checkout(OperationKind::Write).await }
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            factory.state.open_started.notified(),
+        )
+        .await
+        .expect("second dial reaches blocked open");
+        opening.abort();
+        assert!(opening.await.unwrap_err().is_cancelled());
+
+        let replacement = tokio::spawn({
+            let pool = pool.clone();
+            async move { pool.checkout(OperationKind::Write).await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!replacement.is_finished());
+        assert_eq!(factory.dials(), 2);
+        assert_eq!(factory.peak(), 2);
+
+        factory.state.block_close.store(1, Ordering::SeqCst);
+        factory.state.block_open_from.store(0, Ordering::SeqCst);
+        factory.state.allow_open.notify_waiters();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            factory.state.close_started.notified(),
+        )
+        .await
+        .expect("abandoned opened session reaches blocked cleanup close");
+        tokio::task::yield_now().await;
+        assert!(!replacement.is_finished());
+        assert_eq!(factory.dials(), 2);
+        assert_eq!(factory.live(), 2);
+
+        factory.state.block_close.store(0, Ordering::SeqCst);
+        factory.state.allow_close.notify_waiters();
+        let replacement = tokio::time::timeout(std::time::Duration::from_secs(1), replacement)
+            .await
+            .expect("replacement proceeds after abandoned open is closed")
+            .unwrap()
+            .unwrap();
+        assert_eq!(factory.dials(), 3);
+        assert_eq!(factory.peak(), 2);
+        replacement.complete().await.unwrap();
+        held.complete().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn blocking_close_keeps_shared_lifetime_permit_until_close_finishes() {
         let factory = RecordingFactory::fully_capable();
         let pool = Arc::new(pool(factory.clone(), 1, 1, 1).await);
         factory.state.block_close.store(1, Ordering::SeqCst);
         let lease = pool.checkout(OperationKind::Write).await.unwrap();
         let retiring = tokio::spawn(async move { lease.retire().await });
-        factory.state.close_started.notified().await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            factory.state.close_started.notified(),
+        )
+        .await
+        .expect("retirement reaches blocked close");
 
         let reconnect = tokio::spawn({
             let pool = pool.clone();
@@ -716,7 +1073,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ambiguous_mutation_error_retires_session_before_reconnect() {
+    async fn canceled_retire_keeps_admission_and_lifetime_capacity_until_close_finishes() {
+        let factory = RecordingFactory::fully_capable();
+        let pool = Arc::new(pool(factory.clone(), 1, 1, 1).await);
+        factory.state.block_close.store(1, Ordering::SeqCst);
+        let lease = pool.checkout(OperationKind::Write).await.unwrap();
+        let retiring = tokio::spawn(async move { lease.retire().await });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            factory.state.close_started.notified(),
+        )
+        .await
+        .expect("retirement reaches blocked close");
+        retiring.abort();
+        assert!(retiring.await.unwrap_err().is_cancelled());
+
+        let replacement = tokio::spawn({
+            let pool = pool.clone();
+            async move { pool.checkout(OperationKind::Write).await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!replacement.is_finished());
+        assert_eq!(factory.dials(), 1);
+        assert_eq!(factory.live(), 1);
+
+        factory.state.block_close.store(0, Ordering::SeqCst);
+        factory.state.allow_close.notify_waiters();
+        tokio::time::timeout(std::time::Duration::from_secs(1), replacement)
+            .await
+            .expect("replacement proceeds after canceled retirement finishes")
+            .unwrap()
+            .unwrap()
+            .complete()
+            .await
+            .unwrap();
+        assert_eq!(factory.dials(), 2);
+        assert_eq!(factory.peak(), 1);
+    }
+
+    #[tokio::test]
+    async fn broken_session_is_retired_before_reconnect() {
         let factory = RecordingFactory::fully_capable();
         let pool = pool(factory.clone(), 1, 1, 1).await;
         pool.checkout(OperationKind::Write)
