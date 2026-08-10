@@ -495,19 +495,31 @@ mod tests {
     }
 
     #[test]
-    fn sftp_parser_requires_username_and_rejects_password_without_leaking_it() {
+    fn sftp_parser_requires_host() {
         let missing_host = Url::parse("sftp:///data").unwrap();
         let error = parse_url_opts(&missing_host, std::iter::empty::<(&str, &str)>())
             .unwrap_err()
             .to_string();
-        assert!(error.contains("host"), "got: {error}");
+        assert_eq!(
+            error,
+            "Generic URL error: Invalid SFTP URL: a host is required"
+        );
+    }
 
+    #[test]
+    fn sftp_parser_requires_username() {
         let missing_username = Url::parse("sftp://example.com/data").unwrap();
         let error = parse_url_opts(&missing_username, std::iter::empty::<(&str, &str)>())
             .unwrap_err()
             .to_string();
-        assert!(error.contains("username"), "got: {error}");
+        assert_eq!(
+            error,
+            "Generic URL error: Invalid SFTP URL: a username is required"
+        );
+    }
 
+    #[test]
+    fn sftp_parser_rejects_password_without_leaking_it() {
         let secret = "parser-login-secret";
         let password_url = Url::parse(&format!("sftp://alice:{secret}@example.com/data")).unwrap();
         let error = parse_url_opts(&password_url, std::iter::empty::<(&str, &str)>())

@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de, ser::SerializeStruct};
 use std::collections::HashSet;
 use std::fmt;
 use std::fs;
@@ -241,12 +241,22 @@ const fn default_sftp_direction_concurrency() -> usize {
     SftpConfig::MAX_DIRECTION_CONCURRENCY
 }
 
-/// Credential-free endpoint information safe to expose to transport setup.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Parsed endpoint information for transport setup.
+#[derive(Clone, PartialEq, Eq)]
 pub struct SftpEndpoint {
     pub host: String,
     pub port: u16,
     pub username: String,
+}
+
+impl fmt::Debug for SftpEndpoint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SftpEndpoint")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Node role within an HA pair.
@@ -429,7 +439,7 @@ pub struct CacheConfig {
     pub warm_metadata: WarmMetadata,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct StorageConfig {
     #[serde(deserialize_with = "deserialize_expandable_string")]
@@ -444,6 +454,57 @@ pub struct StorageConfig {
         deserialize_with = "deserialize_optional_expandable_string"
     )]
     pub storage_class: Option<String>,
+}
+
+impl fmt::Debug for StorageConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StorageConfig")
+            .field("url", &redacted_storage_url(&self.url))
+            .field("encryption_password", &"[REDACTED]")
+            .field("storage_class", &self.storage_class)
+            .finish()
+    }
+}
+
+impl Serialize for StorageConfig {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct(
+            "StorageConfig",
+            2 + usize::from(self.storage_class.is_some()),
+        )?;
+        state.serialize_field("url", &redacted_storage_url(&self.url))?;
+        state.serialize_field("encryption_password", &self.encryption_password)?;
+        if let Some(storage_class) = &self.storage_class {
+            state.serialize_field("storage_class", storage_class)?;
+        }
+        state.end()
+    }
+}
+
+fn redacted_storage_url(raw: &str) -> String {
+    if !has_sftp_scheme(raw) {
+        return raw.to_owned();
+    }
+
+    let Ok(mut url) = url::Url::parse(raw) else {
+        return "sftp://[REDACTED_INVALID_URL]".to_owned();
+    };
+    if url.password().is_none() {
+        return raw.to_owned();
+    }
+    if url.set_password(None).is_err() {
+        return "sftp://[REDACTED_INVALID_URL]".to_owned();
+    }
+    url.into()
+}
+
+fn has_sftp_scheme(raw: &str) -> bool {
+    raw.split_once(':')
+        .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("sftp"))
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -1126,12 +1187,7 @@ impl Settings {
 
     /// Return normalized SFTP endpoint data without retaining URL credentials.
     pub fn sftp_endpoint(&self) -> Result<Option<SftpEndpoint>> {
-        let is_sftp = self
-            .storage
-            .url
-            .split_once(':')
-            .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("sftp"));
-        if !is_sftp {
+        if !has_sftp_scheme(&self.storage.url) {
             return Ok(None);
         }
 
@@ -1772,14 +1828,21 @@ known_hosts = "${ZEROFS_TEST_KNOWN_HOSTS}""#,
     }
 
     #[test]
-    fn sftp_requires_host_and_username() {
-        for url in ["sftp:///data", "sftp://example.com/data"] {
-            let err = format!("{:#}", write_and_load(&sftp_config(url, "")).unwrap_err());
-            assert!(
-                err.contains("host") || err.contains("username"),
-                "URL {url:?}: got {err}"
-            );
-        }
+    fn sftp_requires_host() {
+        let err = format!(
+            "{:#}",
+            write_and_load(&sftp_config("sftp:///data", "")).unwrap_err()
+        );
+        assert_eq!(err, "[storage] SFTP URL must include a host");
+    }
+
+    #[test]
+    fn sftp_requires_username() {
+        let err = format!(
+            "{:#}",
+            write_and_load(&sftp_config("sftp://example.com/data", "")).unwrap_err()
+        );
+        assert_eq!(err, "[storage] SFTP URL must include a username");
     }
 
     #[test]
@@ -1796,6 +1859,77 @@ known_hosts = "${ZEROFS_TEST_KNOWN_HOSTS}""#,
 
         assert!(err.contains("password"), "got: {err}");
         assert!(!err.contains(secret), "password leaked in error: {err}");
+    }
+
+    #[test]
+    fn storage_config_debug_and_serialization_redact_sftp_url_password() {
+        let secret = "storage-url-secret";
+        let storage = StorageConfig {
+            url: format!("sftp://alice:{secret}@example.com/data"),
+            encryption_password: "volume-encryption-secret".to_owned(),
+            storage_class: None,
+        };
+
+        let debug = format!("{storage:?}");
+        let toml = toml::to_string(&storage).unwrap();
+        let json = serde_json::to_string(&storage).unwrap();
+
+        for rendered in [&debug, &toml, &json] {
+            assert!(
+                !rendered.contains(secret),
+                "SFTP password leaked: {rendered}"
+            );
+        }
+        assert!(
+            toml.contains(r#"url = "sftp://alice@example.com/data""#),
+            "sanitized URL was not preserved: {toml}"
+        );
+        assert!(
+            json.contains(r#""url":"sftp://alice@example.com/data""#),
+            "sanitized URL was not preserved: {json}"
+        );
+        assert!(
+            !debug.contains("volume-encryption-secret"),
+            "encryption password leaked through Debug: {debug}"
+        );
+        assert!(
+            toml.contains("volume-encryption-secret"),
+            "config serialization must retain the encryption password"
+        );
+    }
+
+    #[test]
+    fn settings_debug_and_serialization_redact_sftp_url_password() {
+        let secret = "settings-url-secret";
+        let settings: Settings = toml::from_str(&sftp_config(
+            &format!("sftp://alice:{secret}@example.com/data"),
+            "",
+        ))
+        .unwrap();
+
+        for rendered in [
+            format!("{settings:?}"),
+            toml::to_string(&settings).unwrap(),
+            serde_json::to_string(&settings).unwrap(),
+        ] {
+            assert!(
+                !rendered.contains(secret),
+                "SFTP password leaked: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn sftp_endpoint_debug_is_host_only() {
+        let settings =
+            write_and_load(&sftp_config("sftp://alice@example.com:23/data", "")).unwrap();
+        let endpoint = settings.sftp_endpoint().unwrap().unwrap();
+
+        let debug = format!("{endpoint:?}");
+
+        assert!(debug.contains("example.com"), "got: {debug}");
+        assert!(debug.contains("23"), "got: {debug}");
+        assert!(!debug.contains("alice"), "username leaked: {debug}");
     }
 
     #[test]
