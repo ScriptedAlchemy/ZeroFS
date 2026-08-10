@@ -70,6 +70,7 @@ impl From<Error> for object_store::Error {
 /// - `az://account/container/path` -> [`MicrosoftAzure`](crate::azure::MicrosoftAzure) (also supports `adl`, `azure`, `abfs`, `abfss`)
 /// - `http://mydomain/path` -> [`HttpStore`](crate::http::HttpStore)
 /// - `https://mydomain/path` -> [`HttpStore`](crate::http::HttpStore)
+/// - `sftp://user@host:port/path` -> SFTP-backed object storage
 ///
 /// There are also special cases for AWS and Azure for `https://{host?}/path` paths:
 /// - `dfs.core.windows.net`, `blob.core.windows.net`, `dfs.fabric.microsoft.com`, `blob.fabric.microsoft.com` -> [`MicrosoftAzure`](crate::azure::MicrosoftAzure)
@@ -91,6 +92,8 @@ pub enum ObjectStoreScheme {
     MicrosoftAzure,
     /// Url corresponding to [`HttpStore`](crate::http::HttpStore)
     Http,
+    /// URL corresponding to an SFTP server.
+    Sftp,
 }
 
 impl ObjectStoreScheme {
@@ -128,6 +131,7 @@ impl ObjectStoreScheme {
             ("az", Some(_)) => (Self::MicrosoftAzure, strip_bucket().unwrap_or_default()),
             ("adl" | "azure" | "abfs" | "abfss", Some(_)) => (Self::MicrosoftAzure, url.path()),
             ("http", Some(_)) => (Self::Http, url.path()),
+            ("sftp", Some(_)) => (Self::Sftp, url.path()),
             ("https", Some(host)) => {
                 if host.ends_with("dfs.core.windows.net")
                     || host.ends_with("blob.core.windows.net")
@@ -433,5 +437,15 @@ mod tests {
             let url = Url::parse(s).unwrap();
             assert!(ObjectStoreScheme::parse(&url).is_err());
         }
+    }
+
+    #[test]
+    fn parse_storage_box_sftp_url_keeps_remote_prefix() {
+        let url = Url::parse("sftp://u123456@u123456.your-storagebox.de:23/zerofs/v1").unwrap();
+
+        let (scheme, path) = ObjectStoreScheme::parse(&url).unwrap();
+
+        assert_eq!(scheme, ObjectStoreScheme::Sftp);
+        assert_eq!(path, Path::parse("zerofs/v1").unwrap());
     }
 }
