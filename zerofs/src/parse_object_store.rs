@@ -47,6 +47,20 @@ pub enum Error {
         #[from]
         source: object_store::path::Error,
     },
+
+    #[error(
+        "SFTP backend transport is not yet wired; startup refused before capability verification (requires fsync@openssh.com and posix-rename@openssh.com)"
+    )]
+    SftpTransportUnavailable,
+
+    #[error("Invalid SFTP URL: a host is required")]
+    SftpHostRequired,
+
+    #[error("Invalid SFTP URL: a username is required")]
+    SftpUsernameRequired,
+
+    #[error("Invalid SFTP URL: passwords are not allowed; use SSH key authentication")]
+    SftpPasswordNotAllowed,
 }
 
 impl From<Error> for object_store::Error {
@@ -121,6 +135,18 @@ impl ObjectStoreScheme {
     /// assert_eq!(path.as_ref(), "path/to/my/file");
     /// ```
     pub fn parse(url: &Url) -> Result<(Self, Path), Error> {
+        if url.scheme() == "sftp" {
+            if url.password().is_some() {
+                return Err(Error::SftpPasswordNotAllowed);
+            }
+            if url.host_str().is_none_or(str::is_empty) {
+                return Err(Error::SftpHostRequired);
+            }
+            if url.username().is_empty() {
+                return Err(Error::SftpUsernameRequired);
+            }
+        }
+
         let strip_bucket = || Some(url.path().strip_prefix('/')?.split_once('/')?.1);
 
         let (scheme, path) = match (url.scheme(), url.host_str()) {
@@ -275,6 +301,7 @@ where
             );
             Box::new(builder.build()?)
         }
+        ObjectStoreScheme::Sftp => return Err(Error::SftpTransportUnavailable.into()),
         s => {
             return Err(object_store::Error::Generic {
                 store: "parse_url",
@@ -447,5 +474,46 @@ mod tests {
 
         assert_eq!(scheme, ObjectStoreScheme::Sftp);
         assert_eq!(path, Path::parse("zerofs/v1").unwrap());
+    }
+
+    #[test]
+    fn sftp_parser_refuses_to_return_an_unwired_store() {
+        let url = Url::parse("sftp://alice@example.com/data").unwrap();
+
+        let err = parse_url_opts(&url, std::iter::empty::<(&str, &str)>()).unwrap_err();
+        let message = err.to_string();
+
+        assert!(
+            message.contains("transport is not yet wired"),
+            "got: {message}"
+        );
+        assert!(message.contains("fsync@openssh.com"), "got: {message}");
+        assert!(
+            message.contains("posix-rename@openssh.com"),
+            "got: {message}"
+        );
+    }
+
+    #[test]
+    fn sftp_parser_requires_username_and_rejects_password_without_leaking_it() {
+        let missing_host = Url::parse("sftp:///data").unwrap();
+        let error = parse_url_opts(&missing_host, std::iter::empty::<(&str, &str)>())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("host"), "got: {error}");
+
+        let missing_username = Url::parse("sftp://example.com/data").unwrap();
+        let error = parse_url_opts(&missing_username, std::iter::empty::<(&str, &str)>())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("username"), "got: {error}");
+
+        let secret = "parser-login-secret";
+        let password_url = Url::parse(&format!("sftp://alice:{secret}@example.com/data")).unwrap();
+        let error = parse_url_opts(&password_url, std::iter::empty::<(&str, &str)>())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("password"), "got: {error}");
+        assert!(!error.contains(secret), "password leaked in error: {error}");
     }
 }

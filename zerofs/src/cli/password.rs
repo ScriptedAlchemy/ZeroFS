@@ -50,7 +50,7 @@ pub async fn change_password(
 
     let env_vars = settings.cloud_provider_env_vars();
 
-    let (object_store, path_from_url) = object_store::parse_url_opts(
+    let (object_store, path_from_url) = crate::parse_object_store::parse_url_opts(
         &settings
             .storage
             .url
@@ -81,6 +81,7 @@ pub async fn change_password(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::NamedTempFile;
 
     #[test]
     fn test_validate_password() {
@@ -88,5 +89,33 @@ mod tests {
         assert!(validate_password("short").is_err());
         assert!(validate_password("CHANGEME").is_err());
         assert!(validate_password("goodpassword123").is_ok());
+    }
+
+    #[tokio::test]
+    async fn change_password_uses_the_application_parser_for_sftp() {
+        let config = r#"
+[cache]
+dir = "/tmp/cache"
+disk_size_gb = 1.0
+
+[storage]
+url = "sftp://alice@example.com/data"
+encryption_password = "current-password"
+
+[servers]
+
+[sftp]
+known_hosts = "/tmp/known_hosts"
+"#;
+        let temp_file = NamedTempFile::new().unwrap();
+        std::fs::write(temp_file.path(), config).unwrap();
+        let settings = Settings::from_file(temp_file.path()).unwrap();
+
+        let error = change_password(&settings, "replacement-password".to_owned())
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("transport is not yet wired"), "got: {error}");
     }
 }

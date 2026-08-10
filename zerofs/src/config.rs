@@ -146,6 +146,9 @@ pub struct Settings {
     pub azure: Option<AzureConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gcp: Option<GcsConfig>,
+    /// Strict SSH transport settings used only when `[storage].url` is SFTP.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub sftp: Option<SftpConfig>,
     /// Location of a pre-2.0 volume's separate WAL store.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub wal: Option<WalConfig>,
@@ -156,6 +159,94 @@ pub struct Settings {
     /// HA replication. Absent means single-node (non-replicated behavior).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub replication: Option<ReplicationConfig>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct SftpConfig {
+    /// OpenSSH known-hosts file used for strict server identity verification.
+    #[serde(
+        default = "default_sftp_known_hosts",
+        deserialize_with = "deserialize_expandable_path"
+    )]
+    pub known_hosts: PathBuf,
+    /// Shared connection budget for the whole account, leaving provider headroom.
+    #[serde(default = "default_sftp_max_connections")]
+    pub max_connections: usize,
+    /// Maximum read concurrency within the shared connection budget.
+    #[serde(default = "default_sftp_direction_concurrency")]
+    pub read_concurrency: usize,
+    /// Maximum write concurrency within the shared connection budget.
+    #[serde(default = "default_sftp_direction_concurrency")]
+    pub write_concurrency: usize,
+}
+
+impl Default for SftpConfig {
+    fn default() -> Self {
+        Self {
+            known_hosts: default_sftp_known_hosts(),
+            max_connections: default_sftp_max_connections(),
+            read_concurrency: default_sftp_direction_concurrency(),
+            write_concurrency: default_sftp_direction_concurrency(),
+        }
+    }
+}
+
+impl SftpConfig {
+    pub const MAX_ACCOUNT_CONNECTIONS: usize = 8;
+    pub const MAX_DIRECTION_CONCURRENCY: usize = 7;
+
+    fn validate(&self) -> Result<()> {
+        if self.known_hosts.to_string_lossy().trim().is_empty() {
+            anyhow::bail!(
+                "[sftp] known_hosts must name a file used for strict host-key verification"
+            );
+        }
+        if !(1..=Self::MAX_ACCOUNT_CONNECTIONS).contains(&self.max_connections) {
+            anyhow::bail!(
+                "[sftp] max_connections must be between 1 and {}",
+                Self::MAX_ACCOUNT_CONNECTIONS
+            );
+        }
+        for (name, value) in [
+            ("read_concurrency", self.read_concurrency),
+            ("write_concurrency", self.write_concurrency),
+        ] {
+            if !(1..=Self::MAX_DIRECTION_CONCURRENCY).contains(&value) {
+                anyhow::bail!(
+                    "[sftp] {name} must be between 1 and {}",
+                    Self::MAX_DIRECTION_CONCURRENCY
+                );
+            }
+            if value > self.max_connections {
+                anyhow::bail!(
+                    "[sftp] {name} ({value}) must not exceed max_connections ({})",
+                    self.max_connections
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+fn default_sftp_known_hosts() -> PathBuf {
+    PathBuf::from(shellexpand::tilde("~/.ssh/known_hosts").into_owned())
+}
+
+const fn default_sftp_max_connections() -> usize {
+    SftpConfig::MAX_ACCOUNT_CONNECTIONS
+}
+
+const fn default_sftp_direction_concurrency() -> usize {
+    SftpConfig::MAX_DIRECTION_CONCURRENCY
+}
+
+/// Credential-free endpoint information safe to expose to transport setup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SftpEndpoint {
+    pub host: String,
+    pub port: u16,
+    pub username: String,
 }
 
 /// Node role within an HA pair.
@@ -971,8 +1062,12 @@ impl Settings {
         let content = fs::read_to_string(path)
             .with_context(|| format!("Failed to read config file: {}", path.display()))?;
 
-        let settings: Settings = toml::from_str(&content)
+        let mut settings: Settings = toml::from_str(&content)
             .with_context(|| format!("Failed to parse config file: {}", path.display()))?;
+
+        if settings.sftp_endpoint()?.is_some() && settings.sftp.is_none() {
+            settings.sftp = Some(SftpConfig::default());
+        }
 
         settings.validate()?;
 
@@ -981,6 +1076,18 @@ impl Settings {
 
     /// Cross-section validation applied after deserialization.
     pub fn validate(&self) -> Result<()> {
+        if self.sftp_endpoint()?.is_some() {
+            self.sftp.clone().unwrap_or_default().validate()?;
+            if self.replication.is_some() {
+                anyhow::bail!(
+                    "[replication] is not supported with an SFTP storage backend; use single-node mode"
+                );
+            }
+            if self.storage.storage_class.is_some() {
+                anyhow::bail!("[storage] storage_class is not supported with an SFTP backend");
+            }
+        }
+
         if let Some(replication) = &self.replication {
             replication
                 .validate()
@@ -1015,6 +1122,39 @@ impl Settings {
             }
         }
         Ok(())
+    }
+
+    /// Return normalized SFTP endpoint data without retaining URL credentials.
+    pub fn sftp_endpoint(&self) -> Result<Option<SftpEndpoint>> {
+        let is_sftp = self
+            .storage
+            .url
+            .split_once(':')
+            .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("sftp"));
+        if !is_sftp {
+            return Ok(None);
+        }
+
+        let url =
+            url::Url::parse(&self.storage.url).context("[storage] url is not a valid SFTP URL")?;
+        let host = url
+            .host_str()
+            .filter(|host| !host.is_empty())
+            .context("[storage] SFTP URL must include a host")?;
+        if url.username().is_empty() {
+            anyhow::bail!("[storage] SFTP URL must include a username");
+        }
+        if url.password().is_some() {
+            anyhow::bail!(
+                "[storage] SFTP URL must not contain a password; configure SSH key authentication"
+            );
+        }
+
+        Ok(Some(SftpEndpoint {
+            host: host.to_owned(),
+            port: url.port().unwrap_or(22),
+            username: url.username().to_owned(),
+        }))
     }
 
     pub fn cloud_provider_env_vars(&self) -> Vec<(String, String)> {
@@ -1088,6 +1228,7 @@ impl Settings {
             aws: Some(AwsConfig(aws_config)),
             azure: None,
             gcp: None,
+            sftp: None,
             wal: None,
             telemetry: None,
             prometheus: None,
@@ -1235,6 +1376,19 @@ impl Settings {
         );
         toml_string
             .push_str("# Or use application_credentials = \"${GOOGLE_APPLICATION_CREDENTIALS}\"\n");
+
+        toml_string.push_str("\n# Optional strict SFTP settings\n");
+        toml_string.push_str(
+            "# Hetzner Storage Box example: set [storage].url to\n\
+             # sftp://u123456@u123456.your-storagebox.de:23/zerofs/v1\n",
+        );
+        toml_string
+            .push_str("# Passwords in SFTP URLs are rejected; use SSH key authentication.\n");
+        toml_string.push_str("# [sftp]\n");
+        toml_string.push_str("# known_hosts = \"${HOME}/.ssh/known_hosts\"\n");
+        toml_string.push_str("# max_connections = 8\n");
+        toml_string.push_str("# read_concurrency = 7\n");
+        toml_string.push_str("# write_concurrency = 7\n");
 
         toml_string.push_str("\n# Anonymous telemetry (enabled by default)\n");
         toml_string.push_str(
@@ -1544,6 +1698,186 @@ encryption_password = "test"
         let temp_file = NamedTempFile::new().unwrap();
         std::fs::write(temp_file.path(), content).unwrap();
         Settings::from_file(temp_file.path().to_str().unwrap())
+    }
+
+    fn sftp_config(url: &str, extra: &str) -> String {
+        format!(
+            r#"
+[cache]
+dir = "/tmp/cache"
+disk_size_gb = 1.0
+
+[storage]
+url = {url:?}
+encryption_password = "test-password"
+
+[servers]
+
+{extra}
+"#
+        )
+    }
+
+    #[test]
+    fn sftp_defaults_are_strict_and_bounded() {
+        let settings = write_and_load(&sftp_config("sftp://alice@example.com/data", "")).unwrap();
+        let sftp = settings.sftp.as_ref().expect("effective SFTP defaults");
+
+        assert!(sftp.known_hosts.ends_with(".ssh/known_hosts"));
+        assert_eq!(sftp.max_connections, 8);
+        assert_eq!(sftp.read_concurrency, 7);
+        assert_eq!(sftp.write_concurrency, 7);
+
+        let endpoint = settings.sftp_endpoint().unwrap().expect("SFTP endpoint");
+        assert_eq!(endpoint.host, "example.com");
+        assert_eq!(endpoint.username, "alice");
+        assert_eq!(endpoint.port, 22);
+    }
+
+    #[test]
+    fn sftp_hetzner_endpoint_keeps_explicit_port_23() {
+        let settings = write_and_load(&sftp_config(
+            "sftp://u123456@u123456.your-storagebox.de:23/zerofs/v1",
+            "",
+        ))
+        .unwrap();
+
+        assert_eq!(settings.sftp_endpoint().unwrap().unwrap().port, 23);
+        let rendered = Settings::render_default_config().unwrap();
+        assert!(
+            rendered.contains("sftp://u123456@u123456.your-storagebox.de:23/zerofs/v1"),
+            "generated Hetzner example must use its explicit SFTP port"
+        );
+    }
+
+    #[test]
+    fn sftp_known_hosts_path_expands_environment_variables() {
+        unsafe {
+            env::set_var(
+                "ZEROFS_TEST_KNOWN_HOSTS",
+                "/etc/zerofs/storagebox_known_hosts",
+            );
+        }
+        let settings = write_and_load(&sftp_config(
+            "sftp://alice@example.com/data",
+            r#"[sftp]
+known_hosts = "${ZEROFS_TEST_KNOWN_HOSTS}""#,
+        ))
+        .unwrap();
+
+        assert_eq!(
+            settings.sftp.unwrap().known_hosts,
+            PathBuf::from("/etc/zerofs/storagebox_known_hosts")
+        );
+    }
+
+    #[test]
+    fn sftp_requires_host_and_username() {
+        for url in ["sftp:///data", "sftp://example.com/data"] {
+            let err = format!("{:#}", write_and_load(&sftp_config(url, "")).unwrap_err());
+            assert!(
+                err.contains("host") || err.contains("username"),
+                "URL {url:?}: got {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn sftp_rejects_password_in_url_without_echoing_it() {
+        let secret = "login-secret-123";
+        let err = format!(
+            "{:#}",
+            write_and_load(&sftp_config(
+                &format!("sftp://alice:{secret}@example.com/data"),
+                ""
+            ))
+            .unwrap_err()
+        );
+
+        assert!(err.contains("password"), "got: {err}");
+        assert!(!err.contains(secret), "password leaked in error: {err}");
+    }
+
+    #[test]
+    fn sftp_connection_and_direction_limits_are_strict() {
+        let invalid = [
+            ("max_connections = 0", "max_connections"),
+            ("max_connections = 9", "max_connections"),
+            ("read_concurrency = 0", "read_concurrency"),
+            ("read_concurrency = 8", "read_concurrency"),
+            ("write_concurrency = 0", "write_concurrency"),
+            ("write_concurrency = 8", "write_concurrency"),
+            (
+                "max_connections = 4\nread_concurrency = 5",
+                "read_concurrency",
+            ),
+            (
+                "max_connections = 4\nread_concurrency = 4\nwrite_concurrency = 5",
+                "write_concurrency",
+            ),
+        ];
+
+        for (limits, expected) in invalid {
+            let extra = format!("[sftp]\nknown_hosts = \"/tmp/known_hosts\"\n{limits}");
+            let err = format!(
+                "{:#}",
+                write_and_load(&sftp_config("sftp://alice@example.com/data", &extra)).unwrap_err()
+            );
+            assert!(err.contains(expected), "limits {limits:?}: got {err}");
+        }
+    }
+
+    #[test]
+    fn sftp_rejects_empty_known_hosts_path_and_insecure_mode() {
+        for extra in [
+            "[sftp]\nknown_hosts = \"\"",
+            "[sftp]\ninsecure_skip_host_key_check = true",
+        ] {
+            let err = format!(
+                "{:#}",
+                write_and_load(&sftp_config("sftp://alice@example.com/data", extra)).unwrap_err()
+            );
+            assert!(
+                err.contains("known_hosts") || err.contains("unknown field"),
+                "got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn sftp_rejects_replication_and_storage_class() {
+        for extra in [
+            r#"[replication]
+node_id = "n1"
+role = "leader""#,
+            r#"[sftp]
+known_hosts = "/tmp/known_hosts""#,
+        ] {
+            let mut content = sftp_config("sftp://alice@example.com/data", extra);
+            if extra.starts_with("[sftp]") {
+                content = content.replace(
+                    "encryption_password = \"test-password\"",
+                    "encryption_password = \"test-password\"\nstorage_class = \"STANDARD\"",
+                );
+            }
+            let err = format!("{:#}", write_and_load(&content).unwrap_err());
+            assert!(
+                err.contains("replication") || err.contains("storage_class"),
+                "got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_sftp_storage_does_not_apply_sftp_limits() {
+        let settings = write_and_load(&sftp_config(
+            "s3://bucket/data",
+            "[sftp]\nknown_hosts = \"\"\nmax_connections = 0",
+        ))
+        .unwrap();
+
+        assert!(settings.sftp.is_some());
+        assert!(settings.sftp_endpoint().unwrap().is_none());
     }
 
     #[test]
