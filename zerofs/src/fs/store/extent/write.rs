@@ -365,29 +365,14 @@ impl ExtentStore {
             .await
             .map_err(|_| FsError::IoError)?;
 
-        // Re-PUT any seal whose background attempt failed (still in `sealing`).
-        let pending: Vec<(Segid, Bytes)> = {
-            let s = self.sealing.lock().unwrap();
-            s.iter().map(|(seg, b)| (*seg, b.clone())).collect()
-        };
-        for (segid, bytes) in pending {
-            self.segments
-                .put_segment(segid, bytes)
-                .await
-                .map_err(|_| FsError::IoError)?;
-            self.sealing.lock().unwrap().remove(&segid);
-        }
-
         // Synchronously seal the current open buffer. Register it in `sealing`
         // under the open lock and remove it only on success, so the rotated
         // segment is never absent from both maps: a concurrent read would 404
         // the not-yet-PUT object, and a failed PUT would strand it. Mirrors
         // spawn_seal.
-        let current = {
+        {
             let mut open = self.open.lock().unwrap();
-            if open.dir.is_empty() {
-                None
-            } else {
+            if !open.dir.is_empty() {
                 let segid = open.segid;
                 #[cfg(feature = "failpoints")]
                 fail_point!(fp::SEAL_OPEN_FAIL, |_| Err(FsError::IoError));
@@ -413,10 +398,31 @@ impl ExtentStore {
                     segid.counter,
                 ));
                 self.sealing.lock().unwrap().insert(segid, bytes.clone());
-                Some((segid, bytes))
+            }
+        }
+
+        // The generation is now immutable and registered in `sealing`. Let
+        // foreground writers use the replacement segment while this barrier
+        // publishes only the captured generation. The caller's DB flush barrier
+        // prevents those later FrameLocs from entering this metadata flush.
+        drop(_append_guard);
+
+        // Re-PUT failed background seals and publish the segment just rotated.
+        // Retain all seal permits until this captured set is complete.
+        let pending: Vec<(Segid, Bytes)> = {
+            let s = self.sealing.lock().unwrap();
+            s.iter().map(|(seg, b)| (*seg, b.clone())).collect()
+        };
+        #[cfg(test)]
+        let _put_gate = if pending.is_empty() {
+            None
+        } else {
+            match &self.seal_open_put_gate {
+                Some(gate) => Some(gate.acquire().await.map_err(|_| FsError::IoError)?),
+                None => None,
             }
         };
-        if let Some((segid, bytes)) = current {
+        for (segid, bytes) in pending {
             self.segments
                 .put_segment(segid, bytes)
                 .await
@@ -1233,6 +1239,57 @@ mod tests {
         })
         .await
         .expect("writers did not resume after seal permits were released");
+    }
+
+    #[tokio::test]
+    async fn seal_open_releases_append_gate_after_generation_rotation() {
+        let (mut store, db) = make().await;
+        let put_gate = Arc::new(Semaphore::new(0));
+        store.seal_open_put_gate = Some(Arc::clone(&put_gate));
+
+        let mut first_txn = db.new_transaction().unwrap();
+        store
+            .write(
+                &mut first_txn,
+                201,
+                0,
+                &Bytes::from(vec![0x41; EXTENT_SIZE]),
+                0,
+            )
+            .await
+            .unwrap();
+        commit(&store, first_txn).await;
+
+        let flush = tokio::spawn({
+            let store = store.clone();
+            async move { store.seal_open().await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !store.open.lock().unwrap().dir.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("seal_open did not rotate its captured generation");
+
+        let later_write = tokio::spawn({
+            let store = store.clone();
+            let db = db.clone();
+            async move {
+                let mut txn = db.new_transaction().unwrap();
+                store
+                    .write(&mut txn, 202, 0, &Bytes::from(vec![0x42; EXTENT_SIZE]), 0)
+                    .await
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_millis(250), later_write)
+            .await
+            .expect("a captured generation PUT retained the global append gate")
+            .unwrap()
+            .unwrap();
+
+        put_gate.add_permits(1);
+        flush.await.unwrap().unwrap();
     }
 
     #[tokio::test]

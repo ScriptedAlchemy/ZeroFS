@@ -89,6 +89,9 @@ pub struct ExtentStore {
     /// Test observation point immediately before foreground batch AEAD.
     #[cfg(test)]
     before_batch_seal: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Test-only gate that can pause `seal_open` after rotating its generation.
+    #[cfg(test)]
+    seal_open_put_gate: Option<Arc<Semaphore>>,
     /// Writers hold the read side from FrameLoc assignment through commit; GC
     /// takes the write side before sealing and choosing its cutoff.
     extent_ref_barrier: Arc<tokio::sync::RwLock<()>>,
@@ -182,6 +185,8 @@ impl ExtentStore {
             open,
             #[cfg(test)]
             before_batch_seal: None,
+            #[cfg(test)]
+            seal_open_put_gate: None,
             extent_ref_barrier: Arc::new(tokio::sync::RwLock::new(())),
             append_gate: Arc::new(tokio::sync::Mutex::new(())),
             sealing: Arc::new(Mutex::new(BTreeMap::new())),
