@@ -4,7 +4,7 @@ use crate::db::SlateDbHandle;
 use crate::fs::CacheConfig;
 use crate::fs::key_codec::{EXTENT_DOMAIN, KeyCodec, KeyPrefix, META_DOMAIN, ParsedKey};
 use crate::key_management;
-use crate::parse_object_store::parse_url_opts;
+use crate::parse_object_store::parse_url_opts_with_sftp;
 use crate::storage_class_object_store::with_storage_class;
 use anyhow::{Context, Result};
 use slatedb::BlockTransformer;
@@ -107,7 +107,8 @@ pub async fn list_keys(config_path: PathBuf) -> Result<()> {
     };
 
     let env_vars = settings.cloud_provider_env_vars();
-    let (object_store, path_from_url) = parse_url_opts(&url.parse()?, env_vars)?;
+    let (object_store, path_from_url) =
+        parse_url_opts_with_sftp(&url.parse()?, env_vars, settings.sftp.as_ref()).await?;
 
     let object_store = with_storage_class(
         Arc::from(object_store),

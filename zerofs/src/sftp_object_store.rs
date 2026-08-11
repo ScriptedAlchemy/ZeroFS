@@ -6,8 +6,8 @@ use futures::stream::{self, BoxStream};
 use object_store::path::{Path as ObjectPath, PathPart};
 use object_store::{
     Attributes, CopyOptions, Extensions, GetOptions, GetResult, GetResultPayload, ListResult,
-    MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload,
-    PutResult,
+    MultipartUpload, ObjectMeta, ObjectStore, PutMode, PutMultipartOptions, PutOptions, PutPayload,
+    PutResult, UploadPart,
 };
 use std::collections::BTreeSet;
 use std::collections::HashMap;
@@ -317,6 +317,88 @@ pub struct SftpObjectStore {
     prefix: ObjectPath,
 }
 
+#[derive(Debug, Clone)]
+struct PooledRemoteSession {
+    pool: crate::sftp_transport::SftpSessionPool,
+}
+
+#[async_trait]
+impl RemoteSession for PooledRemoteSession {
+    fn capabilities(&self) -> SftpCapabilities {
+        SftpCapabilities {
+            fsync: true,
+            hardlink: true,
+            posix_rename: true,
+        }
+    }
+
+    async fn read_exact(&self, path: &FilePath, offset: u64, len: usize) -> RemoteResult<Bytes> {
+        let mut lease = self
+            .pool
+            .checkout(crate::sftp_transport::OperationKind::Read)
+            .await
+            .map_err(remote_transport_error)?;
+        let operation = lease.read_exact(path, offset, len).await;
+        finish_lease(lease, operation)
+            .await
+            .map_err(remote_transport_error)
+    }
+
+    async fn write_file_durable(&self, path: &FilePath, chunks: Vec<Bytes>) -> RemoteResult<()> {
+        let mut lease = self
+            .pool
+            .checkout(crate::sftp_transport::OperationKind::Write)
+            .await
+            .map_err(remote_transport_error)?;
+        let operation = async {
+            if let Some(parent) = path.parent() {
+                lease.create_dir_all(parent).await?;
+            }
+            lease.write_file_durable(path, chunks).await
+        }
+        .await;
+        finish_lease(lease, operation)
+            .await
+            .map_err(remote_transport_error)
+    }
+
+    async fn remove_file(&self, path: &FilePath) -> RemoteResult<()> {
+        let mut lease = self
+            .pool
+            .checkout(crate::sftp_transport::OperationKind::Write)
+            .await
+            .map_err(remote_transport_error)?;
+        let operation = lease.remove_file(path).await;
+        finish_lease(lease, operation)
+            .await
+            .map_err(remote_transport_error)
+    }
+
+    async fn hard_link(&self, from: &FilePath, to: &FilePath) -> RemoteResult<()> {
+        let mut lease = self
+            .pool
+            .checkout(crate::sftp_transport::OperationKind::Write)
+            .await
+            .map_err(remote_transport_error)?;
+        let operation = lease.hard_link(from, to).await;
+        finish_lease(lease, operation)
+            .await
+            .map_err(remote_transport_error)
+    }
+
+    async fn posix_rename(&self, from: &FilePath, to: &FilePath) -> RemoteResult<()> {
+        let mut lease = self
+            .pool
+            .checkout(crate::sftp_transport::OperationKind::Write)
+            .await
+            .map_err(remote_transport_error)?;
+        let operation = lease.posix_rename(from, to).await;
+        finish_lease(lease, operation)
+            .await
+            .map_err(remote_transport_error)
+    }
+}
+
 impl SftpObjectStore {
     pub fn new(
         pool: crate::sftp_transport::SftpSessionPool,
@@ -494,19 +576,66 @@ impl fmt::Display for SftpObjectStore {
 impl ObjectStore for SftpObjectStore {
     async fn put_opts(
         &self,
-        _location: &ObjectPath,
-        _payload: PutPayload,
-        _opts: PutOptions,
+        location: &ObjectPath,
+        payload: PutPayload,
+        opts: PutOptions,
     ) -> object_store::Result<PutResult> {
-        Err(not_implemented("put_opts"))
+        let target = self.remote_path(location, false)?;
+        let (mode, expected_generation) = match opts.mode {
+            PutMode::Overwrite => (PublicationMode::Overwrite, None),
+            PutMode::Create => (PublicationMode::Create, None),
+            PutMode::Update(version) => {
+                if version.version.is_some() {
+                    return Err(object_store::Error::NotSupported {
+                        source: "SFTP conditional updates use ETags, not versions".into(),
+                    });
+                }
+                let expected = version
+                    .e_tag
+                    .ok_or_else(|| object_store::Error::Precondition {
+                        path: location.to_string(),
+                        source: "SFTP update requires an ETag".into(),
+                    })?;
+                let expected = Uuid::parse_str(&expected).map_err(|error| {
+                    object_store::Error::Precondition {
+                        path: location.to_string(),
+                        source: Box::new(error),
+                    }
+                })?;
+                (PublicationMode::Update, Some(expected))
+            }
+        };
+        let outcome = publish_payload(
+            Arc::new(PooledRemoteSession {
+                pool: self.pool.clone(),
+            }),
+            &target,
+            payload.into_iter().collect(),
+            mode,
+            expected_generation,
+        )
+        .await
+        .map_err(|error| publication_error(location, error))?;
+        if let Some(debt) = outcome.cleanup_debt {
+            tracing::warn!(%debt, "SFTP object committed with staging cleanup debt");
+        }
+        Ok(PutResult {
+            e_tag: Some(outcome.header.generation.to_string()),
+            version: None,
+            extensions: Extensions::default(),
+        })
     }
 
     async fn put_multipart_opts(
         &self,
-        _location: &ObjectPath,
+        location: &ObjectPath,
         _opts: PutMultipartOptions,
     ) -> object_store::Result<Box<dyn MultipartUpload>> {
-        Err(not_implemented("put_multipart_opts"))
+        self.validate_location(location, false)?;
+        Ok(Box::new(SftpMultipartUpload::new(
+            self.clone(),
+            location.clone(),
+        )))
     }
 
     async fn get_opts(
@@ -618,6 +747,82 @@ impl ObjectStore for SftpObjectStore {
     }
 }
 
+#[derive(Debug)]
+struct SftpMultipartUpload {
+    store: SftpObjectStore,
+    location: ObjectPath,
+    parts: Arc<StdMutex<Vec<Option<PutPayload>>>>,
+    terminal: bool,
+}
+
+impl SftpMultipartUpload {
+    fn new(store: SftpObjectStore, location: ObjectPath) -> Self {
+        Self {
+            store,
+            location,
+            parts: Arc::new(StdMutex::new(Vec::new())),
+            terminal: false,
+        }
+    }
+}
+
+#[async_trait]
+impl MultipartUpload for SftpMultipartUpload {
+    fn put_part(&mut self, data: PutPayload) -> UploadPart {
+        if self.terminal {
+            return Box::pin(async {
+                Err(generic_error(
+                    "multipart upload is already completed or aborted",
+                ))
+            });
+        }
+        let parts = self.parts.clone();
+        let index = {
+            let mut parts = parts.lock().unwrap();
+            let index = parts.len();
+            parts.push(None);
+            index
+        };
+        Box::pin(async move {
+            parts.lock().unwrap()[index] = Some(data);
+            Ok(())
+        })
+    }
+
+    async fn complete(&mut self) -> object_store::Result<PutResult> {
+        if self.terminal {
+            return Err(generic_error(
+                "multipart upload is already completed or aborted",
+            ));
+        }
+        let payload = {
+            let parts = self.parts.lock().unwrap();
+            if parts.iter().any(Option::is_none) {
+                return Err(generic_error(
+                    "multipart upload completed before every part future finished",
+                ));
+            }
+            parts
+                .iter()
+                .flat_map(|part| part.as_ref().unwrap().iter().cloned())
+                .collect::<PutPayload>()
+        };
+        let result = self
+            .store
+            .put_opts(&self.location, payload, PutOptions::default())
+            .await?;
+        self.terminal = true;
+        self.parts.lock().unwrap().clear();
+        Ok(result)
+    }
+
+    async fn abort(&mut self) -> object_store::Result<()> {
+        self.terminal = true;
+        self.parts.lock().unwrap().clear();
+        Ok(())
+    }
+}
+
 fn object_meta(
     location: ObjectPath,
     object: &crate::sftp_transport::RemoteObjectRead,
@@ -645,6 +850,7 @@ async fn finish_lease<T>(
                 error,
                 crate::sftp_transport::TransportError::NotFound(_)
                     | crate::sftp_transport::TransportError::PermissionDenied(_)
+                    | crate::sftp_transport::TransportError::AlreadyExists(_)
                     | crate::sftp_transport::TransportError::CorruptObject(_)
             );
             let cleanup = if reusable {
@@ -672,6 +878,43 @@ fn transport_error(error: crate::sftp_transport::TransportError) -> object_store
                 source: "SFTP server denied access".into(),
             }
         }
+        crate::sftp_transport::TransportError::AlreadyExists(path) => {
+            object_store::Error::AlreadyExists {
+                path,
+                source: "SFTP server reported that the path already exists".into(),
+            }
+        }
+        error => object_store::Error::Generic {
+            store: STORE_NAME,
+            source: Box::new(error),
+        },
+    }
+}
+
+fn remote_transport_error(error: crate::sftp_transport::TransportError) -> RemoteError {
+    match error {
+        crate::sftp_transport::TransportError::NotFound(path) => RemoteError::NotFound(path),
+        crate::sftp_transport::TransportError::AlreadyExists(path) => {
+            RemoteError::AlreadyExists(path)
+        }
+        error => RemoteError::Other(error.to_string()),
+    }
+}
+
+fn publication_error(location: &ObjectPath, error: RemoteError) -> object_store::Error {
+    match error {
+        RemoteError::NotFound(path) => object_store::Error::NotFound {
+            path,
+            source: "SFTP server reported no such file".into(),
+        },
+        RemoteError::AlreadyExists(source) => object_store::Error::AlreadyExists {
+            path: location.to_string(),
+            source: source.into(),
+        },
+        RemoteError::Precondition(source) => object_store::Error::Precondition {
+            path: location.to_string(),
+            source: source.into(),
+        },
         error => object_store::Error::Generic {
             store: STORE_NAME,
             source: Box::new(error),
@@ -771,6 +1014,43 @@ mod tests {
 
         async fn remove_file(&mut self, path: &FilePath) -> Result<(), TransportError> {
             self.session.remove_file(path).await
+        }
+
+        async fn create_dir_all(&mut self, path: &FilePath) -> Result<(), TransportError> {
+            self.session.create_dir_all(path).await
+        }
+
+        async fn write_file_durable(
+            &mut self,
+            path: &FilePath,
+            chunks: Vec<Bytes>,
+        ) -> Result<(), TransportError> {
+            self.session.write_file_durable(path, chunks).await
+        }
+
+        async fn read_exact(
+            &mut self,
+            path: &FilePath,
+            offset: u64,
+            len: usize,
+        ) -> Result<Bytes, TransportError> {
+            self.session.read_exact(path, offset, len).await
+        }
+
+        async fn hard_link(
+            &mut self,
+            from: &FilePath,
+            to: &FilePath,
+        ) -> Result<(), TransportError> {
+            self.session.hard_link(from, to).await
+        }
+
+        async fn posix_rename(
+            &mut self,
+            from: &FilePath,
+            to: &FilePath,
+        ) -> Result<(), TransportError> {
+            self.session.posix_rename(from, to).await
         }
 
         async fn close(self: Box<Self>) -> Result<(), TransportError> {
@@ -1450,6 +1730,89 @@ mod tests {
                 .get_opts(&outside, GetOptions::default())
                 .await
                 .is_err()
+        );
+
+        let written = ObjectPath::from("zerofs/v1/new/deep/written.bin");
+        let first = store
+            .put_opts(
+                &written,
+                PutPayload::from_static(b"first"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .get_opts(&written, GetOptions::default())
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap()
+                .as_ref(),
+            b"first"
+        );
+        let create_error = store
+            .put_opts(
+                &written,
+                PutPayload::from_static(b"must not replace"),
+                PutOptions {
+                    mode: PutMode::Create,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            create_error,
+            object_store::Error::AlreadyExists { .. }
+        ));
+        let second = store
+            .put_opts(
+                &written,
+                PutPayload::from_static(b"second"),
+                PutOptions {
+                    mode: PutMode::Update(first.clone().into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let stale = store
+            .put_opts(
+                &written,
+                PutPayload::from_static(b"stale"),
+                PutOptions {
+                    mode: PutMode::Update(first.into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(stale, object_store::Error::Precondition { .. }));
+        assert!(second.e_tag.is_some());
+
+        let multipart_location = ObjectPath::from("zerofs/v1/multipart.bin");
+        let mut multipart = store
+            .put_multipart_opts(&multipart_location, PutMultipartOptions::default())
+            .await
+            .unwrap();
+        let first_part = multipart.put_part(PutPayload::from_static(b"hello "));
+        let second_part = multipart.put_part(PutPayload::from_static(b"multipart"));
+        futures::future::try_join(first_part, second_part)
+            .await
+            .unwrap();
+        multipart.complete().await.unwrap();
+        assert_eq!(
+            store
+                .get_opts(&multipart_location, GetOptions::default())
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap()
+                .as_ref(),
+            b"hello multipart"
         );
     }
 }

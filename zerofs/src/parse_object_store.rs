@@ -313,6 +313,53 @@ where
     Ok((store, path))
 }
 
+/// Create an object store, including the native async SFTP transport.
+pub async fn parse_url_opts_with_sftp<I, K, V>(
+    url: &Url,
+    options: I,
+    sftp_config: Option<&crate::config::SftpConfig>,
+) -> Result<(Box<dyn ObjectStore>, Path), object_store::Error>
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: AsRef<str>,
+    V: Into<String>,
+{
+    let (scheme, path) = ObjectStoreScheme::parse(url)?;
+    if scheme != ObjectStoreScheme::Sftp {
+        return parse_url_opts(url, options);
+    }
+
+    let config = sftp_config.cloned().unwrap_or_default();
+    let endpoint = crate::config::SftpEndpoint {
+        host: url
+            .host_str()
+            .filter(|host| !host.is_empty())
+            .ok_or(Error::SftpHostRequired)?
+            .to_owned(),
+        port: url.port().unwrap_or(22),
+        username: if url.username().is_empty() {
+            return Err(Error::SftpUsernameRequired.into());
+        } else {
+            url.username().to_owned()
+        },
+    };
+    let factory =
+        crate::sftp_transport::OpenSshSessionFactory::new(endpoint, config.known_hosts.clone())
+            .map_err(|source| object_store::Error::Generic {
+                store: "SFTP",
+                source: Box::new(source),
+            })?;
+    let pool =
+        crate::sftp_transport::SftpSessionPool::from_config_writable(Arc::new(factory), &config)
+            .await
+            .map_err(|source| object_store::Error::Generic {
+                store: "SFTP",
+                source: Box::new(source),
+            })?;
+    let store = crate::sftp_object_store::SftpObjectStore::new(pool, path.clone())?;
+    Ok((Box::new(store), path))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

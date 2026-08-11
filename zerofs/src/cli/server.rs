@@ -7,7 +7,7 @@ use crate::fs::{CacheConfig, GarbageCollector, ZeroFS};
 use crate::length_checked_object_store::LengthCheckedObjectStore;
 use crate::nbd::NBDServer;
 use crate::object_store_prefetch::PrefetchingObjectStore;
-use crate::parse_object_store::parse_url_opts;
+use crate::parse_object_store::{parse_url_opts, parse_url_opts_with_sftp};
 use crate::storage_class_object_store::with_storage_class;
 use crate::task::spawn_named;
 use anyhow::{Context, Result};
@@ -63,7 +63,12 @@ impl DatabaseMode {
 
 async fn resolve_checkpoint_name(settings: &Settings, name: &str) -> Result<uuid::Uuid> {
     let env_vars = settings.cloud_provider_env_vars();
-    let (object_store, path_from_url) = parse_url_opts(&settings.storage.url.parse()?, env_vars)?;
+    let (object_store, path_from_url) = parse_url_opts_with_sftp(
+        &settings.storage.url.parse()?,
+        env_vars,
+        settings.sftp.as_ref(),
+    )
+    .await?;
     let object_store = with_storage_class(
         Arc::from(object_store),
         settings.storage.storage_class.as_deref(),

@@ -36,6 +36,8 @@ pub enum TransportError {
     NotFound(String),
     #[error("remote path permission denied: {0}")]
     PermissionDenied(String),
+    #[error("remote path already exists: {0}")]
+    AlreadyExists(String),
     #[error("SFTP operation failed: {0}")]
     Operation(String),
     #[error("remote object is corrupt: {0}")]
@@ -88,6 +90,48 @@ pub trait TransportSession: fmt::Debug + Send + Sync + 'static {
     async fn remove_file(&mut self, _path: &std::path::Path) -> Result<(), TransportError> {
         Err(TransportError::Operation(
             "remove_file is not implemented by this session".to_owned(),
+        ))
+    }
+    async fn create_dir_all(&mut self, _path: &std::path::Path) -> Result<(), TransportError> {
+        Err(TransportError::Operation(
+            "create_dir_all is not implemented by this session".to_owned(),
+        ))
+    }
+    async fn write_file_durable(
+        &mut self,
+        _path: &std::path::Path,
+        _chunks: Vec<Bytes>,
+    ) -> Result<(), TransportError> {
+        Err(TransportError::Operation(
+            "write_file_durable is not implemented by this session".to_owned(),
+        ))
+    }
+    async fn read_exact(
+        &mut self,
+        _path: &std::path::Path,
+        _offset: u64,
+        _len: usize,
+    ) -> Result<Bytes, TransportError> {
+        Err(TransportError::Operation(
+            "read_exact is not implemented by this session".to_owned(),
+        ))
+    }
+    async fn hard_link(
+        &mut self,
+        _from: &std::path::Path,
+        _to: &std::path::Path,
+    ) -> Result<(), TransportError> {
+        Err(TransportError::Operation(
+            "hard_link is not implemented by this session".to_owned(),
+        ))
+    }
+    async fn posix_rename(
+        &mut self,
+        _from: &std::path::Path,
+        _to: &std::path::Path,
+    ) -> Result<(), TransportError> {
+        Err(TransportError::Operation(
+            "posix_rename is not implemented by this session".to_owned(),
         ))
     }
     async fn close(self: Box<Self>) -> Result<(), TransportError>;
@@ -508,6 +552,124 @@ impl TransportSession for OpenSshTransportSession {
             .map_err(|error| map_sftp_error(path, error))
     }
 
+    async fn create_dir_all(&mut self, path: &std::path::Path) -> Result<(), TransportError> {
+        let sftp = self.sftp.as_ref().expect("open transport owns SFTP client");
+        let mut fs = sftp.fs();
+        let mut current = PathBuf::new();
+        for component in path.components() {
+            let std::path::Component::Normal(component) = component else {
+                return Err(TransportError::Operation(format!(
+                    "unsafe directory path {}",
+                    path.display()
+                )));
+            };
+            current.push(component);
+            match fs.symlink_metadata(&current).await {
+                Ok(metadata) if metadata.file_type().is_some_and(|kind| kind.is_dir()) => {}
+                Ok(_) => {
+                    return Err(TransportError::Operation(format!(
+                        "{} exists and is not a directory",
+                        current.display()
+                    )));
+                }
+                Err(openssh_sftp_client::Error::SftpError(
+                    openssh_sftp_client::error::SftpErrorKind::NoSuchFile,
+                    _,
+                )) => fs
+                    .create_dir(&current)
+                    .await
+                    .map_err(|error| map_sftp_error(&current, error))?,
+                Err(error) => return Err(map_sftp_error(&current, error)),
+            }
+        }
+        Ok(())
+    }
+
+    async fn write_file_durable(
+        &mut self,
+        path: &std::path::Path,
+        chunks: Vec<Bytes>,
+    ) -> Result<(), TransportError> {
+        let sftp = self.sftp.as_ref().expect("open transport owns SFTP client");
+        let mut file = sftp
+            .create(path)
+            .await
+            .map_err(|error| map_sftp_error(path, error))?;
+        for chunk in chunks {
+            file.write_all(&chunk)
+                .await
+                .map_err(|error| map_sftp_error(path, error))?;
+        }
+        file.sync_all()
+            .await
+            .map_err(|error| map_sftp_error(path, error))?;
+        file.close()
+            .await
+            .map_err(|error| map_sftp_error(path, error))
+    }
+
+    async fn read_exact(
+        &mut self,
+        path: &std::path::Path,
+        offset: u64,
+        len: usize,
+    ) -> Result<Bytes, TransportError> {
+        let sftp = self.sftp.as_ref().expect("open transport owns SFTP client");
+        let file = sftp
+            .open(path)
+            .await
+            .map_err(|error| map_sftp_error(path, error))?;
+        let file = openssh_sftp_client::file::TokioCompatFile::new(file);
+        tokio::pin!(file);
+        file.as_mut()
+            .seek(SeekFrom::Start(offset))
+            .await
+            .map_err(|error| {
+                TransportError::Operation(format!("failed to seek {}: {error}", path.display()))
+            })?;
+        let mut bytes = vec![0_u8; len];
+        file.as_mut()
+            .read_exact(&mut bytes)
+            .await
+            .map_err(|error| {
+                TransportError::Operation(format!("short read from {}: {error}", path.display()))
+            })?;
+        Ok(Bytes::from(bytes))
+    }
+
+    async fn hard_link(
+        &mut self,
+        from: &std::path::Path,
+        to: &std::path::Path,
+    ) -> Result<(), TransportError> {
+        let sftp = self.sftp.as_ref().expect("open transport owns SFTP client");
+        match sftp.fs().hard_link(from, to).await {
+            Ok(()) => Ok(()),
+            Err(openssh_sftp_client::Error::SftpError(
+                openssh_sftp_client::error::SftpErrorKind::Failure,
+                _,
+            )) => Err(TransportError::AlreadyExists(to.display().to_string())),
+            Err(error) => Err(map_sftp_error(to, error)),
+        }
+    }
+
+    async fn posix_rename(
+        &mut self,
+        from: &std::path::Path,
+        to: &std::path::Path,
+    ) -> Result<(), TransportError> {
+        let sftp = self.sftp.as_ref().expect("open transport owns SFTP client");
+        if !sftp.support_posix_rename() {
+            return Err(TransportError::MissingCapability(
+                "posix-rename@openssh.com",
+            ));
+        }
+        sftp.fs()
+            .rename(from, to)
+            .await
+            .map_err(|error| map_sftp_error(to, error))
+    }
+
     async fn close(mut self: Box<Self>) -> Result<(), TransportError> {
         self.sftp
             .take()
@@ -795,6 +957,68 @@ impl SessionLease {
             .expect("lease always owns a session until completion")
             .transport
             .remove_file(path)
+            .await
+    }
+
+    pub async fn create_dir_all(&mut self, path: &std::path::Path) -> Result<(), TransportError> {
+        self.session
+            .as_mut()
+            .expect("lease always owns a session until completion")
+            .transport
+            .create_dir_all(path)
+            .await
+    }
+
+    pub async fn write_file_durable(
+        &mut self,
+        path: &std::path::Path,
+        chunks: Vec<Bytes>,
+    ) -> Result<(), TransportError> {
+        self.session
+            .as_mut()
+            .expect("lease always owns a session until completion")
+            .transport
+            .write_file_durable(path, chunks)
+            .await
+    }
+
+    pub async fn read_exact(
+        &mut self,
+        path: &std::path::Path,
+        offset: u64,
+        len: usize,
+    ) -> Result<Bytes, TransportError> {
+        self.session
+            .as_mut()
+            .expect("lease always owns a session until completion")
+            .transport
+            .read_exact(path, offset, len)
+            .await
+    }
+
+    pub async fn hard_link(
+        &mut self,
+        from: &std::path::Path,
+        to: &std::path::Path,
+    ) -> Result<(), TransportError> {
+        self.session
+            .as_mut()
+            .expect("lease always owns a session until completion")
+            .transport
+            .hard_link(from, to)
+            .await
+    }
+
+    pub async fn posix_rename(
+        &mut self,
+        from: &std::path::Path,
+        to: &std::path::Path,
+    ) -> Result<(), TransportError> {
+        self.session
+            .as_mut()
+            .expect("lease always owns a session until completion")
+            .transport
+            .posix_rename(from, to)
             .await
     }
 

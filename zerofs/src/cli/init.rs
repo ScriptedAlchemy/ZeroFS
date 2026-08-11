@@ -16,7 +16,7 @@ use crate::db::SlateDbHandle;
 use crate::fs::{CacheConfig, ZeroFS};
 use crate::key_management;
 use crate::object_trace::{ObjectTracer, TracingObjectStore};
-use crate::parse_object_store::parse_url_opts;
+use crate::parse_object_store::parse_url_opts_with_sftp;
 use crate::replication::transport::{PromotionSnapshot, ReceiverControl};
 use crate::replication::{LineageProof, PromotionRetryGraceProof, ReplicationParams};
 use crate::storage_class_object_store::with_storage_class;
@@ -132,10 +132,12 @@ impl StartupContext {
 
         let env_vars = settings.cloud_provider_env_vars();
 
-        let (object_store, path_from_url) = parse_url_opts(
+        let (object_store, path_from_url) = parse_url_opts_with_sftp(
             &url.parse().context("Failed to parse storage URL")?,
             env_vars,
+            settings.sftp.as_ref(),
         )
+        .await
         .context("Failed to connect to storage backend")?;
         let object_store = with_storage_class(
             Arc::from(object_store),
