@@ -22,6 +22,14 @@ INTEGRITY_SHA256=${ZEROFS_PILOT_INTEGRITY_SHA256:-db1fb0431bce321750e25a93bd46ce
 METADATA_DIR=${ZEROFS_PILOT_METADATA_DIR:-$MOUNTPOINT/metadata-v2}
 METADATA_FILE_COUNT=${ZEROFS_PILOT_METADATA_FILE_COUNT:-1024}
 RESULT_DIR=${ZEROFS_PILOT_RESULT_DIR:-/var/tmp/zerofs-pilot-results}
+CARGO_CMD=${ZEROFS_PILOT_CARGO:-}
+
+if [[ -z $CARGO_CMD ]]; then
+  CARGO_CMD=$(command -v cargo 2>/dev/null || true)
+fi
+if [[ -z $CARGO_CMD && -x ${HOME:-}/.cargo/bin/cargo ]]; then
+  CARGO_CMD=${HOME}/.cargo/bin/cargo
+fi
 
 log() { printf '[vm100-pilot] %s\n' "$*" >&2; }
 die() { log "ERROR: $*"; exit 1; }
@@ -114,14 +122,15 @@ build_deploy() {
   [[ -z $(git -C "$ROOT" status --porcelain) ]] || die "Git checkout is dirty"
   git -C "$ROOT" pull --ff-only
   [[ -z $(git -C "$ROOT" status --porcelain) ]] || die "Git checkout became dirty after pull"
+  [[ -n $CARGO_CMD && -x $CARGO_CMD ]] || die "cargo was not found; set ZEROFS_PILOT_CARGO"
   log "building locked release at $(git -C "$ROOT" rev-parse --short HEAD)"
-  (cd "$CRATE" && cargo build --release --locked)
+  (cd "$CRATE" && "$CARGO_CMD" build --release --locked)
   local built_sha
   built_sha=$(sha256sum "$CRATE/target/release/zerofs" | awk '{print $1}')
   teardown
   sudo install -m 0755 "$CRATE/target/release/zerofs" "$BINARY"
   [[ $(sha256sum "$BINARY" | awk '{print $1}') == "$built_sha" ]] || die "installed binary hash mismatch"
-  (cd "$CRATE" && cargo clean)
+  (cd "$CRATE" && "$CARGO_CMD" clean)
   printf 'installed_binary_sha256=%s\n' "$built_sha"
 }
 
