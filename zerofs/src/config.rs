@@ -164,6 +164,12 @@ pub struct Settings {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct SftpConfig {
+    /// Private key used for non-interactive public-key authentication.
+    #[serde(
+        default = "default_sftp_identity_file",
+        deserialize_with = "deserialize_expandable_path"
+    )]
+    pub identity_file: PathBuf,
     /// OpenSSH known-hosts file used for strict server identity verification.
     #[serde(
         default = "default_sftp_known_hosts",
@@ -184,6 +190,7 @@ pub struct SftpConfig {
 impl Default for SftpConfig {
     fn default() -> Self {
         Self {
+            identity_file: default_sftp_identity_file(),
             known_hosts: default_sftp_known_hosts(),
             max_connections: default_sftp_max_connections(),
             read_concurrency: default_sftp_direction_concurrency(),
@@ -197,6 +204,9 @@ impl SftpConfig {
     pub const MAX_DIRECTION_CONCURRENCY: usize = 7;
 
     fn validate(&self) -> Result<()> {
+        if self.identity_file.to_string_lossy().trim().is_empty() {
+            anyhow::bail!("[sftp] identity_file must name a private SSH key");
+        }
         if self.known_hosts.to_string_lossy().trim().is_empty() {
             anyhow::bail!(
                 "[sftp] known_hosts must name a file used for strict host-key verification"
@@ -231,6 +241,10 @@ impl SftpConfig {
 
 fn default_sftp_known_hosts() -> PathBuf {
     PathBuf::from(shellexpand::tilde("~/.ssh/known_hosts").into_owned())
+}
+
+fn default_sftp_identity_file() -> PathBuf {
+    PathBuf::from(shellexpand::tilde("~/.ssh/id_ed25519").into_owned())
 }
 
 const fn default_sftp_max_connections() -> usize {
@@ -1441,6 +1455,7 @@ impl Settings {
         toml_string
             .push_str("# Passwords in SFTP URLs are rejected; use SSH key authentication.\n");
         toml_string.push_str("# [sftp]\n");
+        toml_string.push_str("# identity_file = \"${HOME}/.ssh/id_ed25519\"\n");
         toml_string.push_str("# known_hosts = \"${HOME}/.ssh/known_hosts\"\n");
         toml_string.push_str("# max_connections = 8\n");
         toml_string.push_str("# read_concurrency = 7\n");
@@ -1779,6 +1794,7 @@ encryption_password = "test-password"
         let settings = write_and_load(&sftp_config("sftp://alice@example.com/data", "")).unwrap();
         let sftp = settings.sftp.as_ref().expect("effective SFTP defaults");
 
+        assert!(sftp.identity_file.ends_with(".ssh/id_ed25519"));
         assert!(sftp.known_hosts.ends_with(".ssh/known_hosts"));
         assert_eq!(sftp.max_connections, 8);
         assert_eq!(sftp.read_concurrency, 7);
@@ -1964,6 +1980,7 @@ known_hosts = "${ZEROFS_TEST_KNOWN_HOSTS}""#,
     #[test]
     fn sftp_rejects_empty_known_hosts_path_and_insecure_mode() {
         for extra in [
+            "[sftp]\nidentity_file = \"\"",
             "[sftp]\nknown_hosts = \"\"",
             "[sftp]\ninsecure_skip_host_key_check = true",
         ] {

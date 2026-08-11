@@ -290,6 +290,7 @@ impl Drop for OperationAdmission {
 
 pub struct OpenSshSessionFactory {
     endpoint: crate::config::SftpEndpoint,
+    identity_file: PathBuf,
     known_hosts: PathBuf,
     authentication_config: Arc<tempfile::NamedTempFile>,
 }
@@ -297,6 +298,7 @@ pub struct OpenSshSessionFactory {
 impl OpenSshSessionFactory {
     pub fn new(
         endpoint: crate::config::SftpEndpoint,
+        identity_file: PathBuf,
         known_hosts: PathBuf,
     ) -> Result<Self, TransportError> {
         let mut authentication_config = tempfile::Builder::new()
@@ -319,6 +321,7 @@ impl OpenSshSessionFactory {
             .map_err(|_| TransportError::Open("could not flush SSH policy file".to_owned()))?;
         Ok(Self {
             endpoint,
+            identity_file,
             known_hosts,
             authentication_config: Arc::new(authentication_config),
         })
@@ -344,6 +347,7 @@ impl SessionFactory for OpenSshSessionFactory {
             .user(self.endpoint.username.clone())
             .port(self.endpoint.port)
             .known_hosts_check(openssh::KnownHosts::Strict)
+            .keyfile(&self.identity_file)
             .user_known_hosts_file(&self.known_hosts)
             .config_file(self.authentication_config.path());
         let ssh = builder.connect(&self.endpoint.host).await.map_err(|_| {
@@ -1773,6 +1777,7 @@ mod tests {
     async fn writable_pool_accepts_limits_from_sftp_config() {
         let factory = RecordingFactory::fully_capable();
         let config = crate::config::SftpConfig {
+            identity_file: "/tmp/id-ed25519".into(),
             known_hosts: "/tmp/known-hosts".into(),
             max_connections: 3,
             read_concurrency: 2,
@@ -1800,6 +1805,7 @@ mod tests {
                 port: 2222,
                 username: "account-secret-name".to_owned(),
             },
+            "/tmp/id-ed25519".into(),
             "/tmp/known-hosts".into(),
         )
         .unwrap();

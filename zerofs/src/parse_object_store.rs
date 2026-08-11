@@ -343,12 +343,15 @@ where
             url.username().to_owned()
         },
     };
-    let factory =
-        crate::sftp_transport::OpenSshSessionFactory::new(endpoint, config.known_hosts.clone())
-            .map_err(|source| object_store::Error::Generic {
-                store: "SFTP",
-                source: Box::new(source),
-            })?;
+    let factory = crate::sftp_transport::OpenSshSessionFactory::new(
+        endpoint,
+        config.identity_file.clone(),
+        config.known_hosts.clone(),
+    )
+    .map_err(|source| object_store::Error::Generic {
+        store: "SFTP",
+        source: Box::new(source),
+    })?;
     let pool =
         crate::sftp_transport::SftpSessionPool::from_config_writable(Arc::new(factory), &config)
             .await
