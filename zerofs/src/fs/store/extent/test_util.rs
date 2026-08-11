@@ -59,6 +59,7 @@ pub(super) fn make_store(
         segments,
         Arc::new(KeyedLockManager::new()),
         super::write::SEAL_THRESHOLD,
+        super::write::MAX_INFLIGHT_SEALS,
     )
     .with_seal_threshold(8 * 1024 * 1024)
 }

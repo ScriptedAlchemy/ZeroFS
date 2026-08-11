@@ -52,10 +52,9 @@ const LIST_SHARD_CONCURRENCY: usize = 16;
 const SEAL_UPLOAD_CONCURRENCY: usize = 16;
 
 /// Multipart part size, and the seal size at which `put_segment` switches from
-/// a single PUT to multipart. A full 256 MiB segment becomes eight 32 MiB
-/// transfers, matching the bounded Storage Box session pool while avoiding the
-/// open/close churn observed with 10 MiB parts on a high-RTT SFTP backend.
-const SEAL_PART_SIZE: usize = 32 * 1024 * 1024;
+/// a single PUT to multipart. SFTP's 32 MiB packed segments stay single-stream
+/// objects, while a default 256 MiB segment becomes four bounded transfers.
+const SEAL_PART_SIZE: usize = 64 * 1024 * 1024;
 
 /// Warm a just-written segment into the read (parts) cache: the multipart
 /// upload bypasses the store's single-PUT write-through, so `put_segment`
@@ -926,7 +925,7 @@ mod tests {
         let codec = FrameCodec::new(&[1u8; 32], SEGMENT_INFO, CompressionConfig::Lz4);
         let store = SegmentStore::new(os.clone(), codec, 5, None);
         let frames: Vec<(u64, u64, Bytes)> =
-            (0..9u64).map(|i| (30, i, noise(i + 1, 4 << 20))).collect();
+            (0..17u64).map(|i| (30, i, noise(i + 1, 4 << 20))).collect();
         let locs = store.seal(&frames).await.unwrap();
         let segid = locs[0].2.segid;
         let size = os.head(&Path::from(segid.object_key())).await.unwrap().size;
@@ -938,6 +937,19 @@ mod tests {
             let got = store.read_extent(*loc, *id, *extent).await.unwrap();
             assert_eq!(&got, data);
         }
+    }
+
+    #[tokio::test]
+    async fn sftp_sized_seal_uses_one_put_instead_of_same_file_parts() {
+        let os = MultipartFaultStore::with_create_failure(false);
+        let codec = FrameCodec::new(&[1u8; 32], SEGMENT_INFO, CompressionConfig::Lz4);
+        let store = SegmentStore::new(os, codec, 5, None);
+
+        let error = store
+            .put_segment(store.next_segid(), noise(1, 40 * 1024 * 1024))
+            .await
+            .expect_err("a 40 MiB seal must use the injected single-PUT path");
+        assert!(error.to_string().contains("injected object-store fault"));
     }
 
     // A part failing mid-multipart must abort the upload on the way out: an

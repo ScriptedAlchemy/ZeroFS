@@ -1021,6 +1021,13 @@ impl ReconciledDb {
                  and without it un-flushed writes are lost on any crash"
             );
         }
+        let sftp_seal_profile = settings.sftp_endpoint()?.map(|_| {
+            settings
+                .sftp
+                .as_ref()
+                .expect("effective SFTP config")
+                .seal_profile()
+        });
 
         let db_handle = slatedb.clone();
         let fs = ZeroFS::new_with_slatedb_and_lease(
@@ -1037,7 +1044,8 @@ impl ReconciledDb {
             segment_object_store,
             segment_codec,
             segment_warm,
-            None,
+            sftp_seal_profile.map(|profile| profile.segment_size_bytes),
+            sftp_seal_profile.map(|profile| profile.max_inflight_seals),
         )
         .await
         .context("Failed to initialize filesystem")?;

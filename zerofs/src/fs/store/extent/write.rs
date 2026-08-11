@@ -34,7 +34,7 @@ pub(crate) const SEAL_THRESHOLD: usize = 256 * 1024 * 1024;
 /// Max segments sealing (PUT in flight) concurrently. Bounds the un-PUT RAM in
 /// `sealing` to ~this × SEAL_THRESHOLD; acquiring all permits is the fsync
 /// drain barrier.
-pub(super) const MAX_INFLIGHT_SEALS: usize = 4;
+pub(crate) const MAX_INFLIGHT_SEALS: usize = 4;
 
 /// The in-RAM open segment. Frames are sealed (compressed+encrypted) and appended
 /// here at write time, so an extent's location is known and committed eagerly;
@@ -300,7 +300,7 @@ impl ExtentStore {
         // holds new ones off until we release at end of scope.
         let _all = self
             .seal_sem
-            .acquire_many(MAX_INFLIGHT_SEALS as u32)
+            .acquire_many(self.max_inflight_seals as u32)
             .await
             .map_err(|_| FsError::IoError)?;
 
@@ -643,6 +643,7 @@ mod tests {
     use super::super::test_util::*;
     use super::*;
     use crate::config::CompressionConfig;
+    use tokio::sync::Semaphore;
 
     #[tokio::test]
     async fn segcount_tracks_live_bytes_across_overwrite_and_delete() {
@@ -975,16 +976,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn saturated_seals_backpressure_before_later_writers_append() {
+    async fn configured_seal_limit_backpressures_before_later_writers_append() {
         let (store, db) = make().await;
-        let store = store.with_seal_threshold(1);
+        let mut store = store.with_seal_threshold(1);
+        store.max_inflight_seals = 7;
+        store.seal_sem = Arc::new(Semaphore::new(store.max_inflight_seals));
 
-        // Model four slow object-store PUTs by holding every seal permit. The
+        // Model slow object-store PUTs by holding every configured seal permit. The
         // first writer can append, but then has to wait before rotating.
+        assert_eq!(store.max_inflight_seals, 7);
         let permits = store
             .seal_sem
             .clone()
-            .acquire_many_owned(MAX_INFLIGHT_SEALS as u32)
+            .acquire_many_owned(store.max_inflight_seals as u32)
             .await
             .unwrap();
         let first = tokio::spawn({

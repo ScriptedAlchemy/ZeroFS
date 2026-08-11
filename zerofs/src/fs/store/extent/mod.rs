@@ -44,8 +44,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::Semaphore;
 use tracing::error;
+pub(crate) use write::MAX_INFLIGHT_SEALS;
 pub(crate) use write::SEAL_THRESHOLD;
-use write::{MAX_INFLIGHT_SEALS, OpenSegment, TAIL_CACHE_BYTES};
+use write::{OpenSegment, TAIL_CACHE_BYTES};
 
 pub(super) const PARALLEL_EXTENT_OPS: usize = 20;
 
@@ -131,6 +132,9 @@ pub struct ExtentStore {
     /// Tests and the DST harness lower it at construction time so seal paths do
     /// not allocate 256 MiB.
     seal_threshold: usize,
+    /// Maximum segment objects publishing concurrently. SFTP uses its bounded
+    /// write concurrency so each seal can own an independent remote file.
+    max_inflight_seals: usize,
     /// Weak handle to the commit worker, injected post-construction (the worker owns
     /// an `ExtentStore` clone, so a strong handle would cycle). Set in production;
     /// unset in the extent unit tests, where `commit_via_coordinator` is the sole
@@ -148,7 +152,9 @@ impl ExtentStore {
         segments: Arc<SegmentStore>,
         lock_manager: Arc<KeyedLockManager<InodeId>>,
         seal_threshold: usize,
+        max_inflight_seals: usize,
     ) -> Self {
+        assert!(max_inflight_seals > 0);
         let tail_cache = CacheBuilder::new(TAIL_CACHE_BYTES)
             .with_weighter(|_id: &InodeId, (_idx, data): &(u64, Bytes)| data.len())
             .build();
@@ -171,7 +177,7 @@ impl ExtentStore {
             extent_ref_barrier: Arc::new(tokio::sync::RwLock::new(())),
             append_gate: Arc::new(tokio::sync::Mutex::new(())),
             sealing: Arc::new(Mutex::new(BTreeMap::new())),
-            seal_sem: Arc::new(Semaphore::new(MAX_INFLIGHT_SEALS)),
+            seal_sem: Arc::new(Semaphore::new(max_inflight_seals)),
             delete_at: Arc::new(Mutex::new(HashMap::new())),
             nominations: Arc::new(Mutex::new(NominationSet::default())),
             nominations_enabled: Arc::new(AtomicBool::new(false)),
@@ -182,6 +188,7 @@ impl ExtentStore {
             read_ahead,
             prefetch_sem: Arc::new(Semaphore::new(READ_AHEAD_MAX_CONCURRENT)),
             seal_threshold,
+            max_inflight_seals,
             coordinator: Arc::new(std::sync::OnceLock::new()),
             segment_gc_stats: Arc::new(SegmentGcStats::default()),
         }
@@ -273,7 +280,7 @@ impl ExtentStore {
     /// No seal PUT in flight or pending re-PUT. Fast passes must not queue
     /// the barrier's all-permits drain behind a seal burst.
     pub fn seals_quiet(&self) -> bool {
-        self.seal_sem.available_permits() == MAX_INFLIGHT_SEALS
+        self.seal_sem.available_permits() == self.max_inflight_seals
             && self.sealing.lock().unwrap().is_empty()
     }
 

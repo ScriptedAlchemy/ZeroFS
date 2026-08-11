@@ -2027,6 +2027,7 @@ mod tests {
             max_connections: 3,
             read_concurrency: 2,
             write_concurrency: 1,
+            segment_size_mib: 32,
         };
         let pool = SftpSessionPool::from_config_writable(Arc::new(factory.clone()), &config)
             .await

@@ -185,6 +185,16 @@ pub struct SftpConfig {
     /// Maximum write concurrency within the shared connection budget.
     #[serde(default = "default_sftp_direction_concurrency")]
     pub write_concurrency: usize,
+    /// Packed segment size. Smaller segments let SFTP publish independent files
+    /// concurrently instead of contending on disjoint writes to one large file.
+    #[serde(default = "default_sftp_segment_size_mib")]
+    pub segment_size_mib: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SftpSealProfile {
+    pub segment_size_bytes: usize,
+    pub max_inflight_seals: usize,
 }
 
 impl Default for SftpConfig {
@@ -195,6 +205,7 @@ impl Default for SftpConfig {
             max_connections: default_sftp_max_connections(),
             read_concurrency: default_sftp_direction_concurrency(),
             write_concurrency: default_sftp_direction_concurrency(),
+            segment_size_mib: default_sftp_segment_size_mib(),
         }
     }
 }
@@ -235,7 +246,17 @@ impl SftpConfig {
                 );
             }
         }
+        if !(8..=256).contains(&self.segment_size_mib) {
+            anyhow::bail!("[sftp] segment_size_mib must be between 8 and 256");
+        }
         Ok(())
+    }
+
+    pub fn seal_profile(&self) -> SftpSealProfile {
+        SftpSealProfile {
+            segment_size_bytes: self.segment_size_mib * 1024 * 1024,
+            max_inflight_seals: self.write_concurrency,
+        }
     }
 }
 
@@ -253,6 +274,10 @@ const fn default_sftp_max_connections() -> usize {
 
 const fn default_sftp_direction_concurrency() -> usize {
     SftpConfig::MAX_DIRECTION_CONCURRENCY
+}
+
+const fn default_sftp_segment_size_mib() -> usize {
+    32
 }
 
 /// Parsed endpoint information for transport setup.
@@ -1460,6 +1485,7 @@ impl Settings {
         toml_string.push_str("# max_connections = 8\n");
         toml_string.push_str("# read_concurrency = 7\n");
         toml_string.push_str("# write_concurrency = 7\n");
+        toml_string.push_str("# segment_size_mib = 32\n");
 
         toml_string.push_str("\n# Anonymous telemetry (enabled by default)\n");
         toml_string.push_str(
@@ -1799,11 +1825,47 @@ encryption_password = "test-password"
         assert_eq!(sftp.max_connections, 8);
         assert_eq!(sftp.read_concurrency, 7);
         assert_eq!(sftp.write_concurrency, 7);
+        assert_eq!(sftp.segment_size_mib, 32);
 
         let endpoint = settings.sftp_endpoint().unwrap().expect("SFTP endpoint");
         assert_eq!(endpoint.host, "example.com");
         assert_eq!(endpoint.username, "alice");
         assert_eq!(endpoint.port, 22);
+    }
+
+    #[test]
+    fn sftp_segment_size_rejects_values_outside_the_packed_object_bounds() {
+        for size in [0, 7, 257] {
+            let extra =
+                format!("[sftp]\nknown_hosts = \"/tmp/known_hosts\"\nsegment_size_mib = {size}");
+            let error =
+                write_and_load(&sftp_config("sftp://alice@example.com/data", &extra)).unwrap_err();
+            assert!(
+                error.to_string().contains("segment_size_mib"),
+                "unexpected error for {size} MiB: {error}"
+            );
+        }
+
+        for size in [8, 32, 256] {
+            let extra =
+                format!("[sftp]\nknown_hosts = \"/tmp/known_hosts\"\nsegment_size_mib = {size}");
+            let settings =
+                write_and_load(&sftp_config("sftp://alice@example.com/data", &extra)).unwrap();
+            assert_eq!(settings.sftp.unwrap().segment_size_mib, size);
+        }
+    }
+
+    #[test]
+    fn sftp_seal_profile_uses_segment_size_and_write_limit() {
+        let settings = write_and_load(&sftp_config(
+            "sftp://alice@example.com/data",
+            "[sftp]\nknown_hosts = \"/tmp/known_hosts\"\nwrite_concurrency = 3\nsegment_size_mib = 64",
+        ))
+        .unwrap();
+        let profile = settings.sftp.unwrap().seal_profile();
+
+        assert_eq!(profile.segment_size_bytes, 64 * 1024 * 1024);
+        assert_eq!(profile.max_inflight_seals, 3);
     }
 
     #[test]
