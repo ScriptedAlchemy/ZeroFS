@@ -6369,6 +6369,7 @@ dependencies = [
  "deku",
  "fail",
  "foyer",
+ "fs4",
  "fuser",
  "futures",
  "hkdf",

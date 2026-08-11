@@ -60,6 +60,15 @@ pub struct MutationRecord {
     pub last_error: Option<String>,
 }
 
+impl MutationRecord {
+    pub fn blob_path(&self) -> Option<&str> {
+        match &self.kind {
+            MutationKind::Put { blob_path, .. } => Some(blob_path),
+            MutationKind::Delete | MutationKind::Copy { .. } | MutationKind::Rename { .. } => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct LocalEtag(String);
 
