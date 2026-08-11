@@ -77,6 +77,8 @@ struct DbOpen {
     /// the prefetcher's own write-through). Applies the same db-path prefix as
     /// `segment_object_store` so the cache key matches the read path.
     segment_warm: Option<crate::segment_store::SegmentWarmHook>,
+    /// Configured clean-cache share for decoded plaintext extents.
+    decoded_extent_memory_bytes: usize,
 }
 
 /// Open database with a reconciled replication tail.
@@ -699,6 +701,7 @@ impl StartupContext {
             data: slatedb,
             metrics_recorder,
             parts_cache,
+            decoded_extent_memory_bytes,
         } = opened;
 
         if let Some(opening) = self.opening.as_ref() {
@@ -816,6 +819,7 @@ impl StartupContext {
             metrics_recorder,
             segment_object_store,
             segment_warm,
+            decoded_extent_memory_bytes,
         }))
     }
 }
@@ -895,6 +899,7 @@ impl ReconciledDb {
             metrics_recorder,
             segment_object_store,
             segment_warm,
+            decoded_extent_memory_bytes,
         } = open;
         // Activation requires the Opening token and a reconciled tail.
         let ownership = match startup.opening.take() {
@@ -1123,6 +1128,7 @@ impl ReconciledDb {
             segment_warm,
             sftp_data_profile.map(|profile| profile.segment_size_bytes),
             sftp_data_profile.map(|profile| profile.max_inflight_seals),
+            Some(decoded_extent_memory_bytes),
         )
         .await
         .context("Failed to initialize filesystem")?;

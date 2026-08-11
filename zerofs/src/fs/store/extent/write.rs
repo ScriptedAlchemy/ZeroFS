@@ -333,12 +333,17 @@ impl ExtentStore {
         let mut locs = locs.into_iter();
         for (extent, edit) in edits {
             match edit {
-                Some(_) => {
+                Some(data) => {
                     let loc = locs.next().expect("one frame location per edit");
                     txn.put_bytes(
                         &self.key_codec.extent_key(id, *extent),
                         Bytes::copy_from_slice(&loc.encode()),
                     );
+                    // The immutable FrameLoc is the cache identity. Publishing
+                    // plaintext before metadata commit is safe: a failed
+                    // transaction leaves this entry unreachable, while a
+                    // successful one becomes read-ready without a decode pass.
+                    self.decoded_insert(id, *extent, loc, data.clone());
                     // Credit the frame just appended: both live and total.
                     self.seg_delta(txn, loc.segid, loc.byte_len as i64, loc.byte_len as i64);
                 }

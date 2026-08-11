@@ -203,6 +203,8 @@ impl Storage {
                 ),
                 None,
                 Some(scale.seal_threshold),
+                None,
+                None,
             )
             .await
             .expect("zerofs open"),

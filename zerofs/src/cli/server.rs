@@ -549,17 +549,19 @@ pub(crate) fn split_disk_budget(total_disk_bytes: usize) -> (usize, usize) {
     (parts, decoded)
 }
 
-/// Split the configured memory-cache total into (parts_memory_bytes,
-/// decoded_blocks_memory_bytes). Same data-favored split as
-/// [`split_disk_budget`], with memory-scale floors so a small default still
-/// splits.
-pub(crate) fn split_memory_budget(total_memory_bytes: usize) -> (usize, usize) {
-    const MIN_BYTES: usize = 32 * 1024 * 1024; // 32 MiB floor per side
+/// Split the configured clean memory-cache total into (parts_memory_bytes,
+/// decoded_blocks_memory_bytes, decoded_extent_memory_bytes). The metadata
+/// block cache retains its existing quarter/cap policy; the data share is split
+/// evenly between encrypted segment parts and read-ready plaintext extents.
+pub(crate) fn split_memory_budget(total_memory_bytes: usize) -> (usize, usize, usize) {
+    const MIN_BYTES: usize = 32 * 1024 * 1024; // 32 MiB floor per consumer
     const MAX_META_BYTES: usize = 2 * 1024 * 1024 * 1024; // metadata blocks rarely need more
 
-    let decoded = (total_memory_bytes / 4).clamp(MIN_BYTES, MAX_META_BYTES);
-    let parts = total_memory_bytes.saturating_sub(decoded).max(MIN_BYTES);
-    (parts, decoded)
+    let decoded_blocks = (total_memory_bytes / 4).clamp(MIN_BYTES, MAX_META_BYTES);
+    let data = total_memory_bytes.saturating_sub(decoded_blocks);
+    let decoded_extents = (data / 2).max(MIN_BYTES);
+    let parts = data.saturating_sub(decoded_extents).max(MIN_BYTES);
+    (parts, decoded_blocks, decoded_extents)
 }
 
 /// Result of opening the ZeroFS database.
@@ -569,6 +571,9 @@ pub struct SlateDbOpen {
     /// The raw-parts prefetch cache, returned so the segment store reuses it
     /// (one budget; segment objects and SST objects share it, keyed by path).
     pub parts_cache: foyer::HybridCache<crate::object_store_prefetch::PartKey, bytes::Bytes>,
+    /// Portion of the configured clean memory cache reserved for read-ready
+    /// plaintext extents. This is separate from the dirty writeback budget.
+    pub decoded_extent_memory_bytes: usize,
 }
 
 /// Process-wide runtime for cache, database, and GC maintenance.
@@ -608,15 +613,17 @@ pub async fn build_slatedb(
     let total_disk_bytes = (total_disk_cache_gb * 1_000_000_000.0) as usize;
     let (parts_disk_bytes, hybrid_disk_bytes) = split_disk_budget(total_disk_bytes);
     let total_memory_bytes = (total_memory_cache_gb * 1_000_000_000.0) as usize;
-    let (parts_memory_bytes, hybrid_memory_bytes) = split_memory_budget(total_memory_bytes);
+    let (parts_memory_bytes, hybrid_memory_bytes, decoded_extent_memory_bytes) =
+        split_memory_budget(total_memory_bytes);
 
     info!(
         "Cache allocation - Disk: {:.2}GB total ({} MB decoded-blocks + {} MB raw-parts), \
-         Memory: {:.2}GB total ({} MB decoded-blocks + {} MB raw-parts)",
+         Memory: {:.2}GB total ({} MB decoded-extents + {} MB decoded-blocks + {} MB raw-parts)",
         total_disk_cache_gb,
         hybrid_disk_bytes / 1_000_000,
         parts_disk_bytes / 1_000_000,
         total_memory_cache_gb,
+        decoded_extent_memory_bytes / 1_000_000,
         hybrid_memory_bytes / 1_000_000,
         parts_memory_bytes / 1_000_000,
     );
@@ -810,6 +817,7 @@ pub async fn build_slatedb(
                 data: SlateDbHandle::ReadWrite(slatedb),
                 metrics_recorder: Some(metrics_recorder),
                 parts_cache: parts_cache.clone(),
+                decoded_extent_memory_bytes,
             })
         }
         DatabaseMode::ReadOnly => {
@@ -833,6 +841,7 @@ pub async fn build_slatedb(
                 data: SlateDbHandle::ReadOnly(ArcSwap::new(reader)),
                 metrics_recorder: None,
                 parts_cache: parts_cache.clone(),
+                decoded_extent_memory_bytes,
             })
         }
         DatabaseMode::Checkpoint(checkpoint_id) => {
@@ -857,6 +866,7 @@ pub async fn build_slatedb(
                 data: SlateDbHandle::ReadOnly(ArcSwap::new(reader)),
                 metrics_recorder: None,
                 parts_cache: parts_cache.clone(),
+                decoded_extent_memory_bytes,
             })
         }
     }
@@ -1582,12 +1592,16 @@ mod tests {
     fn split_memory_budget_favors_segments() {
         let mib = 1024 * 1024;
         let gib = 1024 * mib;
-        // 25% to metadata blocks, the rest to segment parts.
-        assert_eq!(split_memory_budget(gib), (768 * mib, 256 * mib));
-        // Metadata capped at 2 GiB on a huge budget; parts get everything else.
-        assert_eq!(split_memory_budget(40 * gib), (38 * gib, 2 * gib));
-        // Tiny budgets floor each side at 32 MiB.
-        assert_eq!(split_memory_budget(16 * mib), (32 * mib, 32 * mib));
+        // 25% to metadata blocks, then split the data share evenly between
+        // encrypted segment parts and decoded plaintext extents.
+        assert_eq!(split_memory_budget(gib), (384 * mib, 256 * mib, 384 * mib));
+        // Metadata caps at 2 GiB; large caches overwhelmingly serve data.
+        assert_eq!(split_memory_budget(40 * gib), (19 * gib, 2 * gib, 19 * gib));
+        // Tiny budgets floor all three clean-cache consumers at 32 MiB.
+        assert_eq!(
+            split_memory_budget(16 * mib),
+            (32 * mib, 32 * mib, 32 * mib)
+        );
     }
 
     // foyer builds the same `I/O error => coding error` wrapping around the os

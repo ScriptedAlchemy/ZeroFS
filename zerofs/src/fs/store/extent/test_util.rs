@@ -60,6 +60,7 @@ pub(super) fn make_store(
         Arc::new(KeyedLockManager::new()),
         8 * 1024 * 1024,
         super::write::MAX_INFLIGHT_SEALS,
+        super::DEFAULT_DECODED_EXTENT_CACHE_BYTES,
     )
 }
 

@@ -50,6 +50,10 @@ use write::{OPEN_SEGMENT_LANES, OpenLane, OpenSegment, TAIL_CACHE_BYTES};
 
 pub(super) const PARALLEL_EXTENT_OPS: usize = 20;
 
+/// Test and embedding fallback. Server startup passes an explicit share of the
+/// configured clean memory-cache budget instead.
+pub(crate) const DEFAULT_DECODED_EXTENT_CACHE_BYTES: usize = 64 * 1024 * 1024;
+
 pub(super) const ZERO_EXTENT: &[u8] = &[0u8; EXTENT_SIZE];
 
 /// What a `write` leaves for the tail cache. Applied by the caller only after
@@ -58,6 +62,32 @@ pub enum TailUpdate {
     Set { extent_idx: u64, data: Bytes },
     Clear,
     Keep,
+}
+
+/// An immutable extent frame's complete identity. Segment objects never change;
+/// rewriting or compacting an extent publishes a different `FrameLoc`, so stale
+/// decoded bytes cannot match a current lookup without explicit invalidation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct DecodedExtentKey {
+    inode: InodeId,
+    extent: u64,
+    segid: Segid,
+    frame_index: u32,
+    byte_offset: u64,
+    byte_len: u32,
+}
+
+impl DecodedExtentKey {
+    fn new(inode: InodeId, extent: u64, loc: crate::segment::FrameLoc) -> Self {
+        Self {
+            inode,
+            extent,
+            segid: loc.segid,
+            frame_index: loc.frame_index,
+            byte_offset: loc.byte_offset,
+            byte_len: loc.byte_len,
+        }
+    }
 }
 
 /// Human-readable byte size for log lines, e.g. "3.1 GiB". Display-only.
@@ -128,6 +158,10 @@ pub struct ExtentStore {
     /// sequential append splices into it rather than re-decoding the buffered/sealed
     /// frame. Eviction only ever costs a re-fetch.
     tail_cache: Cache<InodeId, (u64, Bytes)>,
+    /// Validated full-extent plaintext, keyed by immutable physical and logical
+    /// frame identity. This is the hot data cache; raw segment parts remain the
+    /// persistent/SSD cache beneath it.
+    decoded_extent_cache: Cache<DecodedExtentKey, Bytes>,
     /// Per-inode logical read-ahead state: (last_read_end, prefetched_to, seq_run).
     read_ahead: Cache<InodeId, (u64, u64, u32)>,
     /// Global bound on concurrent read-ahead fetches.
@@ -153,6 +187,22 @@ pub struct ExtentStore {
 }
 
 impl ExtentStore {
+    fn decoded_get(
+        &self,
+        id: InodeId,
+        extent: u64,
+        loc: crate::segment::FrameLoc,
+    ) -> Option<Bytes> {
+        self.decoded_extent_cache
+            .get(&DecodedExtentKey::new(id, extent, loc))
+            .map(|entry| entry.value().clone())
+    }
+
+    fn decoded_insert(&self, id: InodeId, extent: u64, loc: crate::segment::FrameLoc, data: Bytes) {
+        self.decoded_extent_cache
+            .insert(DecodedExtentKey::new(id, extent, loc), data);
+    }
+
     pub fn new(
         db: Arc<Db>,
         key_codec: Arc<KeyCodec>,
@@ -160,6 +210,7 @@ impl ExtentStore {
         lock_manager: Arc<KeyedLockManager<InodeId>>,
         seal_threshold: usize,
         max_inflight_seals: usize,
+        decoded_extent_cache_bytes: usize,
     ) -> Self {
         assert!(max_inflight_seals > 0);
         let tail_cache = CacheBuilder::new(TAIL_CACHE_BYTES)
@@ -167,6 +218,9 @@ impl ExtentStore {
             .build();
         let read_ahead = CacheBuilder::new(READ_AHEAD_TRACK_BYTES)
             .with_weighter(|_: &InodeId, _: &(u64, u64, u32)| 24)
+            .build();
+        let decoded_extent_cache = CacheBuilder::new(decoded_extent_cache_bytes)
+            .with_weighter(|_: &DecodedExtentKey, data: &Bytes| data.len())
             .build();
         let codec = segments.codec();
         let open_lanes = Arc::new(std::array::from_fn(|_| OpenLane {
@@ -198,6 +252,7 @@ impl ExtentStore {
             gc_round: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             quiescence: Arc::new(Mutex::new((0, 0, Instant::now()))),
             tail_cache,
+            decoded_extent_cache,
             read_ahead,
             prefetch_sem: Arc::new(Semaphore::new(READ_AHEAD_MAX_CONCURRENT)),
             seal_threshold,

@@ -50,6 +50,7 @@ impl ZeroFS {
             None,
             None,
             None,
+            None,
         )
         .await
     }
@@ -74,6 +75,7 @@ impl ZeroFS {
         segment_warm: Option<crate::segment_store::SegmentWarmHook>,
         seal_threshold_override: Option<usize>,
         max_inflight_seals_override: Option<usize>,
+        decoded_extent_cache_bytes: Option<usize>,
     ) -> anyhow::Result<Self> {
         // The expiry reaper may already be running from CLI setup.
         dedup.start_expiry_reaper();
@@ -174,6 +176,8 @@ impl ZeroFS {
             lock_manager.clone(),
             seal_threshold_override.unwrap_or(crate::fs::store::extent::SEAL_THRESHOLD),
             max_inflight_seals_override.unwrap_or(crate::fs::store::extent::MAX_INFLIGHT_SEALS),
+            decoded_extent_cache_bytes
+                .unwrap_or(crate::fs::store::extent::DEFAULT_DECODED_EXTENT_CACHE_BYTES),
         );
         // Seed the monitor's segment footprint gauges from the existing on-store
         // segments before any write; from here they are maintained incrementally
