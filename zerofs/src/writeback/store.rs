@@ -494,14 +494,22 @@ impl ObjectStore for WritebackObjectStore {
         location: &Path,
         options: PutMultipartOptions,
     ) -> object_store::Result<Box<dyn MultipartUpload>> {
-        let staging = create_multipart_staging(&self.inner.settings.dir).map_err(|error| {
-            generic_error(format!("failed to create multipart staging: {error}"))
-        })?;
+        let memory_parts = self.inner.settings.ack_mode == AckMode::Memory;
+        let staging = if memory_parts {
+            None
+        } else {
+            Some(
+                create_multipart_staging(&self.inner.settings.dir).map_err(|error| {
+                    generic_error(format!("failed to create multipart staging: {error}"))
+                })?,
+            )
+        };
         Ok(Box::new(WritebackMultipartUpload {
             store: self.clone(),
             location: location.clone(),
             options,
-            staging: Some(staging),
+            staging,
+            memory_parts,
             state: Arc::new(StdMutex::new(MultipartState::default())),
             notify: Arc::new(Notify::new()),
             terminal: false,
@@ -607,6 +615,7 @@ struct WritebackMultipartUpload {
     location: Path,
     options: PutMultipartOptions,
     staging: Option<PathBuf>,
+    memory_parts: bool,
     state: Arc<StdMutex<MultipartState>>,
     notify: Arc<Notify>,
     terminal: bool,
@@ -619,10 +628,11 @@ struct MultipartState {
     aborted: bool,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct MultipartPart {
     len: u64,
     completed: bool,
+    bytes: Option<Bytes>,
 }
 
 struct ActivePartGuard {
@@ -633,7 +643,7 @@ struct ActivePartGuard {
 }
 
 impl ActivePartGuard {
-    fn finish(mut self, completed: bool) -> bool {
+    fn finish(mut self, completed: bool, bytes: Option<Bytes>) -> bool {
         let mut state = self.state.lock().unwrap();
         state.active = state
             .active
@@ -641,6 +651,7 @@ impl ActivePartGuard {
             .expect("active multipart part accounting underflow");
         if completed && !state.aborted {
             state.parts[self.index].completed = true;
+            state.parts[self.index].bytes = bytes;
         }
         let aborted = state.aborted;
         self.active = false;
@@ -698,15 +709,16 @@ impl MultipartUpload for WritebackMultipartUpload {
             state.parts.push(MultipartPart {
                 len,
                 completed: false,
+                bytes: None,
             });
             index
         };
         let staging = self.staging.clone();
+        let memory_parts = self.memory_parts;
         let state = self.state.clone();
         let notify = self.notify.clone();
         let min_free_bytes = self.store.inner.settings.min_free_bytes;
         Box::pin(async move {
-            let staging = staging.ok_or_else(|| generic_error("multipart staging is missing"))?;
             {
                 let mut state = state.lock().unwrap();
                 if state.aborted {
@@ -720,6 +732,20 @@ impl MultipartUpload for WritebackMultipartUpload {
                 index,
                 active: true,
             };
+            if memory_parts {
+                let bytes = Bytes::from(data);
+                let valid = bytes.len() as u64 == len;
+                let aborted = guard.finish(valid, valid.then_some(bytes));
+                if aborted {
+                    return Err(generic_error("multipart upload was aborted"));
+                }
+                return if valid {
+                    Ok(())
+                } else {
+                    Err(generic_error("multipart part length mismatch"))
+                };
+            }
+            let staging = staging.ok_or_else(|| generic_error("multipart staging is missing"))?;
             let part_path = staging.join(format!("part-{index:020}"));
             let write = match tokio::task::spawn_blocking(move || {
                 write_multipart_part(&part_path, data, min_free_bytes)
@@ -733,7 +759,7 @@ impl MultipartUpload for WritebackMultipartUpload {
                     "multipart part task failed: {error}"
                 ))),
             };
-            let aborted = guard.finish(write.is_ok());
+            let aborted = guard.finish(write.is_ok(), None);
             if aborted {
                 Err(generic_error("multipart upload was aborted"))
             } else {
@@ -748,7 +774,7 @@ impl MultipartUpload for WritebackMultipartUpload {
                 "multipart upload is already completed or aborted",
             ));
         }
-        let (part_lengths, total_len) = {
+        let (part_lengths, memory_payload, total_len) = {
             let state = self.state.lock().unwrap();
             if state.aborted {
                 return Err(generic_error("multipart upload was aborted"));
@@ -762,21 +788,37 @@ impl MultipartUpload for WritebackMultipartUpload {
                 .parts
                 .iter()
                 .try_fold(0_u64, |total, part| total.checked_add(part.len));
+            let memory_payload = if self.memory_parts {
+                Some(
+                    state
+                        .parts
+                        .iter()
+                        .map(|part| part.bytes.clone())
+                        .collect::<Option<Vec<_>>>()
+                        .ok_or_else(|| generic_error("memory multipart part is missing"))?,
+                )
+            } else {
+                None
+            };
             (
                 state.parts.iter().map(|part| part.len).collect::<Vec<_>>(),
+                memory_payload,
                 total.ok_or_else(|| generic_error("multipart length overflow"))?,
             )
         };
-        let staging = self
-            .staging
-            .take()
-            .ok_or_else(|| generic_error("multipart staging is missing"))?;
+        let staging = self.staging.take();
         self.terminal = true;
         let store = self.store.clone();
         let location = self.location.clone();
         let options = self.options.clone();
         tokio::spawn(async move {
-            complete_multipart(store, location, options, staging, part_lengths, total_len).await
+            if let Some(parts) = memory_payload {
+                complete_memory_multipart(store, location, options, parts, total_len).await
+            } else {
+                let staging =
+                    staging.ok_or_else(|| generic_error("multipart staging is missing"))?;
+                complete_multipart(store, location, options, staging, part_lengths, total_len).await
+            }
         })
         .await
         .map_err(|error| generic_error(format!("owned multipart completion failed: {error}")))?
@@ -801,10 +843,13 @@ impl MultipartUpload for WritebackMultipartUpload {
 
 impl Drop for WritebackMultipartUpload {
     fn drop(&mut self) {
+        if self.terminal {
+            return;
+        }
+        self.state.lock().unwrap().aborted = true;
         let Some(staging) = self.staging.take() else {
             return;
         };
-        self.state.lock().unwrap().aborted = true;
         let state = self.state.clone();
         let notify = self.notify.clone();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
@@ -818,6 +863,49 @@ impl Drop for WritebackMultipartUpload {
             tracing::warn!(%error, "failed to clean dropped writeback multipart staging");
         }
     }
+}
+
+async fn complete_memory_multipart(
+    store: WritebackObjectStore,
+    location: Path,
+    options: PutMultipartOptions,
+    parts: Vec<Bytes>,
+    total_len: u64,
+) -> object_store::Result<PutResult> {
+    let ram = store
+        .inner
+        .admission
+        .reserve(total_len)
+        .await
+        .map_err(|error| generic_error(format!("dirty RAM admission failed: {error}")))?
+        .accept();
+    let capacity = usize::try_from(total_len)
+        .map_err(|_| generic_error("multipart object exceeds addressable memory"))?;
+    let mut assembled = Vec::with_capacity(capacity);
+    for part in parts {
+        assembled.extend_from_slice(&part);
+    }
+    if assembled.len() != capacity {
+        return Err(generic_error("multipart assembled length mismatch"));
+    }
+    let available = fs4::available_space(&store.inner.settings.dir)
+        .map_err(|error| generic_error(format!("failed to inspect writeback SSD: {error}")))?;
+    let disk = store
+        .inner
+        .disk
+        .reserve(total_len, available)
+        .await
+        .map_err(|error| generic_error(format!("dirty SSD admission failed: {error}")))?;
+    let put_options = PutOptions {
+        mode: PutMode::Overwrite,
+        tags: options.tags,
+        attributes: options.attributes,
+        extensions: options.extensions,
+    };
+    store
+        .clone()
+        .owned_put(location, Bytes::from(assembled), put_options, ram, disk)
+        .await
 }
 
 async fn complete_multipart(
@@ -1125,6 +1213,12 @@ mod tests {
         enabled: bool,
     ) -> (WritebackObjectStore, Arc<InMemory>, tempfile::TempDir) {
         let (store, remote, temp, _controls) = test_store_with_controls(enabled).await;
+        (store, remote, temp)
+    }
+
+    async fn test_ssd_store() -> (WritebackObjectStore, Arc<InMemory>, tempfile::TempDir) {
+        let (store, remote, temp, _controls) =
+            test_store_with_options(false, AckMode::Ssd, ShutdownFlush::Local).await;
         (store, remote, temp)
     }
 
@@ -1638,8 +1732,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn multipart_abort_removes_private_parts_without_a_visible_mutation() {
+    async fn memory_ack_multipart_parts_do_not_stage_on_ssd() {
         let (store, _remote, _temp) = test_store().await;
+        let staging_root = store.inner.settings.dir.join("tmp").join("multipart");
+        let mut upload = store
+            .put_multipart(&Path::from("ram-first-segment"))
+            .await
+            .unwrap();
+
+        upload
+            .put_part(Bytes::from_static(b"first").into())
+            .await
+            .unwrap();
+
+        assert!(
+            !staging_root.exists(),
+            "memory acknowledgement staged multipart bytes on SSD"
+        );
+        upload.abort().await.unwrap();
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn multipart_abort_removes_private_parts_without_a_visible_mutation() {
+        let (store, _remote, _temp) = test_ssd_store().await;
         let location = Path::from("aborted-object");
         let mut upload = store.put_multipart(&location).await.unwrap();
         upload
@@ -1659,7 +1775,7 @@ mod tests {
 
     #[tokio::test]
     async fn multipart_abort_does_not_wait_for_an_unpolled_part_future() {
-        let (store, _remote, _temp) = test_store().await;
+        let (store, _remote, _temp) = test_ssd_store().await;
         let location = Path::from("aborted-unpolled-object");
         let mut upload = store.put_multipart(&location).await.unwrap();
         let unpolled = upload.put_part(Bytes::from_static(b"never-started").into());
@@ -1676,7 +1792,7 @@ mod tests {
 
     #[tokio::test]
     async fn multipart_assembly_failure_cleans_staging_and_publishes_nothing() {
-        let (store, _remote, _temp) = test_store().await;
+        let (store, _remote, _temp) = test_ssd_store().await;
         let location = Path::from("corrupt-multipart-object");
         let mut upload = store.put_multipart(&location).await.unwrap();
         upload
@@ -1707,7 +1823,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn dropped_multipart_cleans_owner_only_staging() {
-        let (store, _remote, _temp) = test_store().await;
+        let (store, _remote, _temp) = test_ssd_store().await;
         let mut upload = store
             .put_multipart(&Path::from("dropped-multipart-object"))
             .await
