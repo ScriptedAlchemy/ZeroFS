@@ -406,11 +406,20 @@ impl FairAdmission {
             return;
         }
         while state.active_reads + state.active_writes < self.inner.shared_limit {
-            let Some(index) = state.waiters.iter().position(|waiter| match waiter.kind {
-                OperationKind::Read | OperationKind::Metadata => {
-                    state.active_reads < self.inner.read_limit
-                }
-                OperationKind::Write => state.active_writes < self.inner.write_limit,
+            let reads_waiting = state
+                .waiters
+                .iter()
+                .any(|waiter| matches!(waiter.kind, OperationKind::Read | OperationKind::Metadata));
+            let writes_waiting = state
+                .waiters
+                .iter()
+                .any(|waiter| waiter.kind == OperationKind::Write);
+            let Some(index) = state.waiters.iter().position(|waiter| {
+                let opposite_waiting = match waiter.kind {
+                    OperationKind::Read | OperationKind::Metadata => writes_waiting,
+                    OperationKind::Write => reads_waiting,
+                };
+                self.can_admit(state, waiter.kind, opposite_waiting)
             }) else {
                 break;
             };
@@ -426,6 +435,35 @@ impl FairAdmission {
                 decrement_active(state, permit.kind);
             }
         }
+    }
+
+    fn can_admit(
+        &self,
+        state: &AdmissionState,
+        kind: OperationKind,
+        opposite_waiting: bool,
+    ) -> bool {
+        let (active, configured_limit, opposite_limit) = match kind {
+            OperationKind::Read | OperationKind::Metadata => (
+                state.active_reads,
+                self.inner.read_limit,
+                self.inner.write_limit,
+            ),
+            OperationKind::Write => (
+                state.active_writes,
+                self.inner.write_limit,
+                self.inner.read_limit,
+            ),
+        };
+        let limit = if opposite_waiting {
+            // Active work is never preempted; each release moves a contended pool
+            // toward an even split while respecting lower configured limits.
+            let opposite_reservation = opposite_limit.min(self.inner.shared_limit / 2);
+            configured_limit.min(self.inner.shared_limit - opposite_reservation)
+        } else {
+            configured_limit
+        };
+        active < limit
     }
 
     fn cancel_waiter(&self, id: u64) {
@@ -2358,6 +2396,197 @@ mod tests {
         for write in writes {
             write.complete().await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn queued_reads_take_freed_write_slots_until_the_pool_reaches_four_four() {
+        let admission = super::FairAdmission::new(8, 7, 7);
+        let mut held_writes = Vec::new();
+        for _ in 0..7 {
+            held_writes.push(admission.acquire(OperationKind::Write).await.unwrap());
+        }
+        let mut held_reads = vec![admission.acquire(OperationKind::Read).await.unwrap()];
+
+        let mut queued_writes = Vec::new();
+        for expected_waiters in 1..=4 {
+            let task_admission = admission.clone();
+            queued_writes.push(tokio::spawn(async move {
+                task_admission.acquire(OperationKind::Write).await.unwrap()
+            }));
+            while admission.waiter_count() != expected_waiters {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        let mut queued_reads = Vec::new();
+        for expected_waiters in 5..=7 {
+            let task_admission = admission.clone();
+            queued_reads.push(tokio::spawn(async move {
+                task_admission.acquire(OperationKind::Read).await.unwrap()
+            }));
+            while admission.waiter_count() != expected_waiters {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        for queued_read in queued_reads {
+            drop(held_writes.pop().unwrap());
+            held_reads.push(
+                tokio::time::timeout(std::time::Duration::from_secs(1), queued_read)
+                    .await
+                    .expect("a freed write slot converges toward four active reads")
+                    .unwrap(),
+            );
+            assert!(queued_writes.iter().all(|waiter| !waiter.is_finished()));
+        }
+
+        drop(held_reads.pop().unwrap());
+        let expanded_write =
+            tokio::time::timeout(std::time::Duration::from_secs(1), queued_writes.remove(0))
+                .await
+                .expect("writes expand beyond four after read demand disappears")
+                .unwrap();
+
+        drop(expanded_write);
+        drop(held_reads);
+        drop(held_writes);
+        for queued_write in queued_writes {
+            drop(queued_write.await.unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_writes_take_freed_read_slots_until_the_pool_reaches_four_four() {
+        let admission = super::FairAdmission::new(8, 7, 7);
+        let mut held_reads = Vec::new();
+        for _ in 0..7 {
+            held_reads.push(admission.acquire(OperationKind::Read).await.unwrap());
+        }
+        let mut held_writes = vec![admission.acquire(OperationKind::Write).await.unwrap()];
+
+        let mut queued_reads = Vec::new();
+        for expected_waiters in 1..=4 {
+            let task_admission = admission.clone();
+            queued_reads.push(tokio::spawn(async move {
+                task_admission.acquire(OperationKind::Read).await.unwrap()
+            }));
+            while admission.waiter_count() != expected_waiters {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        let mut queued_writes = Vec::new();
+        for expected_waiters in 5..=7 {
+            let task_admission = admission.clone();
+            queued_writes.push(tokio::spawn(async move {
+                task_admission.acquire(OperationKind::Write).await.unwrap()
+            }));
+            while admission.waiter_count() != expected_waiters {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        for queued_write in queued_writes {
+            drop(held_reads.pop().unwrap());
+            held_writes.push(
+                tokio::time::timeout(std::time::Duration::from_secs(1), queued_write)
+                    .await
+                    .expect("a freed read slot converges toward four active writes")
+                    .unwrap(),
+            );
+            assert!(queued_reads.iter().all(|waiter| !waiter.is_finished()));
+        }
+
+        drop(held_writes.pop().unwrap());
+        let expanded_read =
+            tokio::time::timeout(std::time::Duration::from_secs(1), queued_reads.remove(0))
+                .await
+                .expect("reads expand beyond four after write demand disappears")
+                .unwrap();
+
+        drop(expanded_read);
+        drop(held_reads);
+        drop(held_writes);
+        for queued_read in queued_reads {
+            drop(queued_read.await.unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_metadata_reserves_read_capacity_during_writeback_drain() {
+        let admission = super::FairAdmission::new(8, 7, 7);
+        let mut held_writes = Vec::new();
+        for _ in 0..7 {
+            held_writes.push(admission.acquire(OperationKind::Write).await.unwrap());
+        }
+        let held_read = admission.acquire(OperationKind::Read).await.unwrap();
+
+        let queued_write = tokio::spawn({
+            let admission = admission.clone();
+            async move { admission.acquire(OperationKind::Write).await.unwrap() }
+        });
+        while admission.waiter_count() != 1 {
+            tokio::task::yield_now().await;
+        }
+        let queued_metadata = tokio::spawn({
+            let admission = admission.clone();
+            async move { admission.acquire(OperationKind::Metadata).await.unwrap() }
+        });
+        while admission.waiter_count() != 2 {
+            tokio::task::yield_now().await;
+        }
+
+        drop(held_writes.pop().unwrap());
+        let metadata = tokio::time::timeout(std::time::Duration::from_secs(1), queued_metadata)
+            .await
+            .expect("metadata shares reserved foreground read capacity")
+            .unwrap();
+        assert!(!queued_write.is_finished());
+
+        drop(metadata);
+        drop(held_read);
+        drop(held_writes);
+        drop(queued_write.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn canceling_the_opposite_waiter_restores_idle_direction_burst_capacity() {
+        let admission = super::FairAdmission::new(8, 7, 7);
+        let mut held_writes = Vec::new();
+        for _ in 0..7 {
+            held_writes.push(admission.acquire(OperationKind::Write).await.unwrap());
+        }
+        let held_read = admission.acquire(OperationKind::Read).await.unwrap();
+
+        let queued_read = tokio::spawn({
+            let admission = admission.clone();
+            async move { admission.acquire(OperationKind::Read).await.unwrap() }
+        });
+        while admission.waiter_count() != 1 {
+            tokio::task::yield_now().await;
+        }
+        let queued_write = tokio::spawn({
+            let admission = admission.clone();
+            async move { admission.acquire(OperationKind::Write).await.unwrap() }
+        });
+        while admission.waiter_count() != 2 {
+            tokio::task::yield_now().await;
+        }
+
+        queued_read.abort();
+        assert!(matches!(queued_read.await, Err(error) if error.is_cancelled()));
+        while admission.waiter_count() != 1 {
+            tokio::task::yield_now().await;
+        }
+        drop(held_writes.pop().unwrap());
+        let expanded_write = tokio::time::timeout(std::time::Duration::from_secs(1), queued_write)
+            .await
+            .expect("cancelled read demand no longer reserves write capacity")
+            .unwrap();
+
+        drop(expanded_write);
+        drop(held_read);
+        drop(held_writes);
     }
 
     #[tokio::test]
