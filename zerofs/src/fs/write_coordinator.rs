@@ -7,6 +7,7 @@
 use crate::db::{Db, Transaction};
 use crate::fs::errors::FsError;
 use crate::fs::flush_coordinator::FlushCoordinator;
+use crate::fs::inode::Inode;
 use crate::fs::key_codec::KeyCodec;
 use crate::fs::stats::FileSystemGlobalStats;
 use crate::fs::store::{DirectoryStore, ExtentStore, InodeStore};
@@ -16,7 +17,7 @@ use crate::task::spawn_named;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use slatedb::WriteBatch;
 use slatedb::config::WriteOptions;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
@@ -278,8 +279,9 @@ async fn worker_loop(
         // Pin staged FrameLocs until the merged write resolves.
         let mut extent_ref_guards = Vec::new();
         let mut any_ops = false;
-        let mut inode_cache_invalidations: HashSet<u64> = HashSet::new();
-        let mut directory_entry_cache_invalidations: HashSet<(u64, bytes::Bytes)> = HashSet::new();
+        let mut inode_cache_updates: HashMap<u64, Option<Inode>> = HashMap::new();
+        let mut directory_entry_cache_updates: HashMap<(u64, bytes::Bytes), Option<(u64, u64)>> =
+            HashMap::new();
         let mut shard_deltas: HashMap<usize, (i64, i64)> = HashMap::new();
         let mut seg_map: HashMap<bytes::Bytes, (i64, i64)> = HashMap::new();
         let mut batch_dedup_entries: Vec<crate::dedup::DedupEntry> = Vec::new();
@@ -291,11 +293,11 @@ async fn worker_loop(
             if let Some(entry) = txn.take_dedup_entry() {
                 batch_dedup_entries.push(entry);
             }
-            for inode_id in txn.take_inode_cache_invalidations() {
-                inode_cache_invalidations.insert(inode_id);
+            for (inode_id, inode) in txn.take_inode_cache_updates() {
+                inode_cache_updates.insert(inode_id, inode);
             }
-            for key in txn.take_directory_entry_cache_invalidations() {
-                directory_entry_cache_invalidations.insert(key);
+            for (key, entry) in txn.take_directory_entry_cache_updates() {
+                directory_entry_cache_updates.insert(key, entry);
             }
             for delta in txn.take_stats_deltas() {
                 let entry = shard_deltas
@@ -497,10 +499,10 @@ async fn worker_loop(
                 Ok(permit) => {
                     let inode_cache_guard = ctx
                         .inode_store
-                        .invalidate_cache(inode_cache_invalidations.iter().copied());
+                        .invalidate_cache(inode_cache_updates.keys().copied());
                     let directory_cache_guard = ctx
                         .directory_store
-                        .invalidate_cache(directory_entry_cache_invalidations.iter().cloned());
+                        .invalidate_cache(directory_entry_cache_updates.keys().cloned());
 
                     let write_result = permit
                         .write_with_options(
@@ -512,9 +514,18 @@ async fn worker_loop(
                         )
                         .await;
 
-                    drop(directory_cache_guard);
-                    drop(inode_cache_guard);
-                    write_result
+                    match write_result {
+                        Ok(seqno) => {
+                            inode_cache_guard.publish(inode_cache_updates);
+                            directory_cache_guard.publish(directory_entry_cache_updates);
+                            Ok(seqno)
+                        }
+                        Err(error) => {
+                            drop(directory_cache_guard);
+                            drop(inode_cache_guard);
+                            Err(error)
+                        }
+                    }
                 }
                 Err(error) => Err(error),
             };
@@ -588,6 +599,8 @@ mod tests {
     use super::*;
     use crate::fs::ZeroFS;
     use crate::fs::inode::{Inode, test_file_inode};
+    use crate::fs::permissions::Credentials;
+    use crate::fs::types::{AuthContext, SetAttributes, SetMode};
     use bytes::Bytes;
 
     /// `DST_PANIC_ON_WRITE_ERROR` is process-global, so fatal-path unit tests
@@ -617,8 +630,29 @@ mod tests {
         KeyCodec::new()
     }
 
+    fn test_creds() -> Credentials {
+        Credentials {
+            uid: 1000,
+            gid: 1000,
+            gid_known: true,
+            groups: [1000; 16],
+            groups_count: 1,
+            groups_complete: true,
+        }
+    }
+
+    fn test_auth() -> AuthContext {
+        AuthContext {
+            uid: 1000,
+            gid: 1000,
+            gid_known: true,
+            gids: vec![1000],
+            groups_complete: true,
+        }
+    }
+
     #[tokio::test]
-    async fn inode_commits_invalidate_without_write_through_pollution() {
+    async fn inode_commits_promote_the_last_committed_value() {
         let fs = make_fs().await;
         assert!(fs.inode_store.cache_enabled());
         let inode_id = fs.inode_store.allocate();
@@ -628,7 +662,7 @@ mod tests {
             .save(&mut create, inode_id, &test_file_inode(10))
             .unwrap();
         fs.write_coordinator.commit(create).await.unwrap();
-        assert_eq!(file_size(fs.inode_store.cached_inode(inode_id)), None);
+        assert_eq!(file_size(fs.inode_store.cached_inode(inode_id)), Some(10));
         assert_eq!(
             file_size(Some(fs.inode_store.get(inode_id).await.unwrap())),
             Some(10)
@@ -643,7 +677,7 @@ mod tests {
             .save(&mut update, inode_id, &test_file_inode(30))
             .unwrap();
         fs.write_coordinator.commit(update).await.unwrap();
-        assert_eq!(file_size(fs.inode_store.cached_inode(inode_id)), None);
+        assert_eq!(file_size(fs.inode_store.cached_inode(inode_id)), Some(30));
         assert_eq!(
             file_size(Some(fs.inode_store.get(inode_id).await.unwrap())),
             Some(30)
@@ -658,6 +692,57 @@ mod tests {
             fs.inode_store.get(inode_id).await,
             Err(FsError::NotFound)
         ));
+    }
+
+    #[tokio::test]
+    async fn create_write_setattr_does_not_reload_promoted_metadata() {
+        let fs = make_fs().await;
+        let creds = test_creds();
+        let auth = test_auth();
+        let (inode_id, _) = fs
+            .create(&creds, 0, b"hot", &SetAttributes::default())
+            .await
+            .unwrap();
+        let inode_loads = fs.inode_store.cache_load_count();
+        let entry_loads = fs.directory_store.cache_load_count();
+
+        fs.write(&auth, inode_id, 0, &Bytes::from_static(b"payload"))
+            .await
+            .unwrap();
+        fs.setattr(
+            &creds,
+            inode_id,
+            &SetAttributes {
+                mode: SetMode::Set(0o600),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(fs.inode_store.cache_load_count(), inode_loads);
+        assert_eq!(fs.directory_store.cache_load_count(), entry_loads);
+    }
+
+    #[tokio::test]
+    async fn sequential_remove_does_not_reload_the_parent_or_entries() {
+        let fs = make_fs().await;
+        let creds = test_creds();
+        let auth = test_auth();
+        fs.create(&creds, 0, b"first", &SetAttributes::default())
+            .await
+            .unwrap();
+        fs.create(&creds, 0, b"second", &SetAttributes::default())
+            .await
+            .unwrap();
+        let inode_loads = fs.inode_store.cache_load_count();
+        let entry_loads = fs.directory_store.cache_load_count();
+
+        fs.remove(&auth, 0, b"first").await.unwrap();
+        fs.remove(&auth, 0, b"second").await.unwrap();
+
+        assert_eq!(fs.inode_store.cache_load_count(), inode_loads);
+        assert_eq!(fs.directory_store.cache_load_count(), entry_loads);
     }
 
     #[tokio::test]

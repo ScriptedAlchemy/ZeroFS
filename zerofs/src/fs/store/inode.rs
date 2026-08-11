@@ -121,6 +121,11 @@ impl InodeStore {
         self.cache.is_enabled()
     }
 
+    #[cfg(test)]
+    pub(crate) fn cache_load_count(&self) -> u64 {
+        self.cache.load_count()
+    }
+
     pub fn save(
         &self,
         txn: &mut Transaction,
@@ -130,14 +135,14 @@ impl InodeStore {
         let key = self.key_codec.inode_key(id);
         let data = Bytes::from(bincode::serialize(inode)?);
         txn.put_bytes(&key, data);
-        txn.invalidate_cached_inode(id);
+        txn.update_cached_inode(id, Some(inode.clone()));
         Ok(())
     }
 
     pub fn delete(&self, txn: &mut Transaction, id: InodeId) {
         let key = self.key_codec.inode_key(id);
         txn.delete_bytes(&key);
-        txn.invalidate_cached_inode(id);
+        txn.update_cached_inode(id, None);
     }
 
     /// Resolve inode ID to full path components by walking parent chain.

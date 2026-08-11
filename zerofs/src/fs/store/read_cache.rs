@@ -3,15 +3,29 @@ use crate::fs::errors::FsError;
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 use foyer::{Cache, CacheBuilder};
+use std::collections::HashMap;
 use std::future::Future;
 use std::hash::Hash;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-#[derive(Default)]
-struct KeyState {
+struct KeyState<V> {
     loads: Vec<u64>,
     mutation_count: usize,
+    /// Most recently completed successful mutation while invalidations overlap.
+    /// The outer option distinguishes "no successful mutation" from a committed
+    /// deletion represented by the inner `None`.
+    pending_update: Option<Option<V>>,
+}
+
+impl<V> Default for KeyState<V> {
+    fn default() -> Self {
+        Self {
+            loads: Vec::new(),
+            mutation_count: 0,
+            pending_update: None,
+        }
+    }
 }
 
 /// Positive read-through cache that rejects fills overtaken by a mutation.
@@ -24,8 +38,10 @@ where
     V: Send + Sync + 'static,
 {
     entries: Cache<K, V>,
-    states: DashMap<K, KeyState>,
+    states: DashMap<K, KeyState<V>>,
     next_load: AtomicU64,
+    #[cfg(test)]
+    load_count: AtomicU64,
 }
 
 /// Optional coherent metadata cache with one serving-authority policy.
@@ -88,6 +104,25 @@ where
             keys: Vec::new(),
         }
     }
+
+    /// Publish values from a successful database mutation while ending its
+    /// invalidation window. `None` records a committed deletion.
+    pub(crate) fn publish(mut self, updates: HashMap<K, Option<V>>) {
+        let Some(cache) = self.cache.take() else {
+            return;
+        };
+        let keys = std::mem::take(&mut self.keys);
+        assert_eq!(
+            keys.len(),
+            updates.len(),
+            "cache publication must cover every invalidated key"
+        );
+        assert!(
+            keys.iter().all(|key| updates.contains_key(key)),
+            "cache publication key does not match an invalidated key"
+        );
+        cache.end_invalidation_with(&keys, &updates);
+    }
 }
 
 struct LoadGuard<'a, K, V>
@@ -145,6 +180,8 @@ where
             entries,
             states,
             next_load: AtomicU64::new(1),
+            #[cfg(test)]
+            load_count: AtomicU64::new(0),
         }
     }
 
@@ -189,6 +226,7 @@ where
                 entry.insert(KeyState {
                     loads: vec![token],
                     mutation_count: 0,
+                    pending_update: None,
                 });
                 Some(LoadGuard {
                     cache: self,
@@ -198,6 +236,8 @@ where
             }
         };
 
+        #[cfg(test)]
+        self.load_count.fetch_add(1, Ordering::Relaxed);
         match load().await {
             Ok(value) => {
                 if let Some(guard) = load_guard {
@@ -231,6 +271,14 @@ where
     }
 
     fn end_invalidation(&self, keys: &[K]) {
+        self.finish_invalidation(keys, None);
+    }
+
+    fn end_invalidation_with(&self, keys: &[K], updates: &HashMap<K, Option<V>>) {
+        self.finish_invalidation(keys, Some(updates));
+    }
+
+    fn finish_invalidation(&self, keys: &[K], updates: Option<&HashMap<K, Option<V>>>) {
         for key in keys {
             let Entry::Occupied(mut entry) = self.states.entry(key.clone()) else {
                 panic!("ending a cache invalidation that was not active");
@@ -240,9 +288,29 @@ where
                 state.mutation_count != 0,
                 "ending a cache invalidation that was not active"
             );
+            if let Some(updates) = updates {
+                state.pending_update = Some(
+                    updates
+                        .get(key)
+                        .expect("cache publication missing an invalidated key")
+                        .clone(),
+                );
+            }
             state.mutation_count -= 1;
-            if state.mutation_count == 0 && state.loads.is_empty() {
-                entry.remove();
+            if state.mutation_count == 0 {
+                if let Some(update) = state.pending_update.take() {
+                    match update {
+                        Some(value) => {
+                            self.entries.insert(key.clone(), value);
+                        }
+                        None => {
+                            self.entries.remove(key);
+                        }
+                    }
+                }
+                if state.loads.is_empty() {
+                    entry.remove();
+                }
             }
         }
     }
@@ -270,6 +338,11 @@ where
     #[cfg(test)]
     fn active_state_count(&self) -> usize {
         self.states.len()
+    }
+
+    #[cfg(test)]
+    fn load_count(&self) -> u64 {
+        self.load_count.load(Ordering::Relaxed)
     }
 }
 
@@ -325,6 +398,11 @@ where
     #[cfg(test)]
     pub(crate) fn is_enabled(&self) -> bool {
         self.cache.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn load_count(&self) -> u64 {
+        self.cache.as_ref().map_or(0, |cache| cache.load_count())
     }
 }
 
@@ -493,6 +571,29 @@ mod tests {
             Ok(3)
         );
         assert_eq!(cache.get(&1), Some(3));
+        assert_eq!(cache.active_state_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn failed_overlapping_invalidation_keeps_the_successful_publication() {
+        let cache = Arc::new(ReadCache::new(16, "overlapping-publish-test", |_, _| 1));
+        assert_eq!(
+            cache.get_or_load(1, || async { Ok::<_, ()>(1) }).await,
+            Ok(1)
+        );
+
+        let successful = cache.invalidate([1]);
+        let failed = cache.invalidate([1]);
+        successful.publish(HashMap::from([(1, Some(2))]));
+
+        assert_eq!(
+            cache.get(&1),
+            None,
+            "a committed value must remain hidden during an overlapping mutation"
+        );
+        drop(failed);
+
+        assert_eq!(cache.get(&1), Some(2));
         assert_eq!(cache.active_state_count(), 0);
     }
 }

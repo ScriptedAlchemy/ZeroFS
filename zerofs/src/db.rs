@@ -5,6 +5,7 @@
 //! just passes through operations.
 
 use crate::fs::errors::FsError;
+use crate::fs::inode::Inode;
 use anyhow::Result;
 use arc_swap::ArcSwap;
 use bytes::Bytes;
@@ -127,8 +128,8 @@ pub struct StatsDelta {
 /// several transactions into a single merged `WriteBatch` via [`apply_to`].
 pub struct Transaction {
     ops: Vec<TxOp>,
-    inode_cache_invalidations: Vec<u64>,
-    directory_entry_cache_invalidations: Vec<(u64, Bytes)>,
+    inode_cache_updates: Vec<(u64, Option<Inode>)>,
+    directory_entry_cache_updates: Vec<((u64, Bytes), Option<(u64, u64)>)>,
     stats_deltas: Vec<StatsDelta>,
     /// Per-segment counter adjustments (segcount key, `(live_delta, total_delta)`),
     /// aggregated by the commit worker into one absolute `(live, total)` per
@@ -146,8 +147,8 @@ impl Transaction {
     pub fn new() -> Self {
         Self {
             ops: Vec::new(),
-            inode_cache_invalidations: Vec::new(),
-            directory_entry_cache_invalidations: Vec::new(),
+            inode_cache_updates: Vec::new(),
+            directory_entry_cache_updates: Vec::new(),
             stats_deltas: Vec::new(),
             seg_deltas: Vec::new(),
             extent_ref_guard: None,
@@ -193,21 +194,28 @@ impl Transaction {
         self.ops.push(TxOp::Delete(key.clone()));
     }
 
-    pub(crate) fn invalidate_cached_inode(&mut self, inode_id: u64) {
-        self.inode_cache_invalidations.push(inode_id);
+    pub(crate) fn update_cached_inode(&mut self, inode_id: u64, inode: Option<Inode>) {
+        self.inode_cache_updates.push((inode_id, inode));
     }
 
-    pub(crate) fn take_inode_cache_invalidations(&mut self) -> Vec<u64> {
-        std::mem::take(&mut self.inode_cache_invalidations)
+    pub(crate) fn take_inode_cache_updates(&mut self) -> Vec<(u64, Option<Inode>)> {
+        std::mem::take(&mut self.inode_cache_updates)
     }
 
-    pub(crate) fn invalidate_cached_directory_entry(&mut self, dir_id: u64, name: Bytes) {
-        self.directory_entry_cache_invalidations
-            .push((dir_id, name));
+    pub(crate) fn update_cached_directory_entry(
+        &mut self,
+        dir_id: u64,
+        name: Bytes,
+        entry: Option<(u64, u64)>,
+    ) {
+        self.directory_entry_cache_updates
+            .push(((dir_id, name), entry));
     }
 
-    pub(crate) fn take_directory_entry_cache_invalidations(&mut self) -> Vec<(u64, Bytes)> {
-        std::mem::take(&mut self.directory_entry_cache_invalidations)
+    pub(crate) fn take_directory_entry_cache_updates(
+        &mut self,
+    ) -> Vec<((u64, Bytes), Option<(u64, u64)>)> {
+        std::mem::take(&mut self.directory_entry_cache_updates)
     }
 
     /// Record a usage-stats adjustment for `inode_id`'s shard, materialized
@@ -263,13 +271,13 @@ impl Transaction {
 
     fn assert_side_channels_drained(&self) {
         assert!(
-            self.inode_cache_invalidations.is_empty(),
-            "inode cache invalidations would be dropped: commit inode mutations through the \
+            self.inode_cache_updates.is_empty(),
+            "inode cache updates would be dropped: commit inode mutations through the \
              WriteCoordinator"
         );
         assert!(
-            self.directory_entry_cache_invalidations.is_empty(),
-            "directory-entry cache invalidations would be dropped: commit namespace mutations \
+            self.directory_entry_cache_updates.is_empty(),
+            "directory-entry cache updates would be dropped: commit namespace mutations \
              through the WriteCoordinator"
         );
         assert!(

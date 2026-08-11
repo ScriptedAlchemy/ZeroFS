@@ -302,7 +302,8 @@ impl DirectoryStore {
     ) {
         let entry_key = self.key_codec.dir_entry_key(dir_id, name);
         txn.put_bytes(&entry_key, KeyCodec::encode_dir_entry(entry_id, cookie));
-        txn.invalidate_cached_directory_entry(dir_id, Bytes::copy_from_slice(name));
+        let cache_name = Bytes::copy_from_slice(name);
+        txn.update_cached_directory_entry(dir_id, cache_name, Some((entry_id, cookie)));
 
         let scan_value = match inode {
             Some(inode) => DirScanValueRef::WithInode {
@@ -319,7 +320,8 @@ impl DirectoryStore {
     pub fn unlink_entry(&self, txn: &mut Transaction, dir_id: InodeId, name: &[u8], cookie: u64) {
         let entry_key = self.key_codec.dir_entry_key(dir_id, name);
         txn.delete_bytes(&entry_key);
-        txn.invalidate_cached_directory_entry(dir_id, Bytes::copy_from_slice(name));
+        let cache_name = Bytes::copy_from_slice(name);
+        txn.update_cached_directory_entry(dir_id, cache_name, None);
 
         let scan_key = self.key_codec.dir_scan_key(dir_id, cookie);
         txn.delete_bytes(&scan_key);
@@ -357,6 +359,11 @@ impl DirectoryStore {
     #[cfg(test)]
     pub(crate) fn cache_enabled(&self) -> bool {
         self.entry_cache.is_enabled()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cache_load_count(&self) -> u64 {
+        self.entry_cache.load_count()
     }
 
     /// Update the embedded inode in a directory scan entry.
@@ -408,7 +415,7 @@ mod tests {
     use std::time::Duration;
 
     #[tokio::test]
-    async fn commits_invalidate_entries_without_write_through_pollution() {
+    async fn commits_promote_the_last_directory_entry_value() {
         let fs = ZeroFS::new_in_memory().await.unwrap();
         assert!(fs.directory_store.cache_enabled());
 
@@ -416,7 +423,10 @@ mod tests {
         fs.directory_store
             .add(&mut create, 0, b"name", 10, COOKIE_FIRST_ENTRY, None);
         fs.write_coordinator.commit(create).await.unwrap();
-        assert_eq!(fs.directory_store.cached_entry(0, b"name"), None);
+        assert_eq!(
+            fs.directory_store.cached_entry(0, b"name"),
+            Some((10, COOKIE_FIRST_ENTRY))
+        );
         assert_eq!(
             fs.directory_store.get_entry_with_cookie(0, b"name").await,
             Ok((10, COOKIE_FIRST_ENTRY))
@@ -432,7 +442,7 @@ mod tests {
         fs.directory_store
             .add(&mut replace, 0, b"name", 20, 7, None);
         fs.write_coordinator.commit(replace).await.unwrap();
-        assert_eq!(fs.directory_store.cached_entry(0, b"name"), None);
+        assert_eq!(fs.directory_store.cached_entry(0, b"name"), Some((20, 7)));
         assert_eq!(
             fs.directory_store.get_entry_with_cookie(0, b"name").await,
             Ok((20, 7))
