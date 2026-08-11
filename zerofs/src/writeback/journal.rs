@@ -1,4 +1,4 @@
-use crate::writeback::model::{JournalIdentity, MutationKind, MutationRecord, Sequence};
+use crate::writeback::model::{JournalIdentity, MutationRecord, Sequence};
 use anyhow::{Context, Result, bail};
 use fs4::fs_std::FileExt;
 use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
@@ -136,10 +136,10 @@ impl Journal {
             let record: MutationRecord =
                 bincode::deserialize(value.value()).context("failed to decode journal mutation")?;
             if record.sequence > remote_seq
-                && let MutationKind::Put { payload_len, .. } = &record.kind
+                && let Some((payload_len, _)) = record.payload()
             {
                 dirty_blob_bytes = dirty_blob_bytes
-                    .checked_add(*payload_len)
+                    .checked_add(payload_len)
                     .context("dirty journal byte count overflow")?;
             }
             records.push(record);
@@ -165,15 +165,9 @@ impl Journal {
 
     pub fn commit_put(&self, mut record: MutationRecord, payload: &[u8]) -> Result<MutationRecord> {
         self.validate_record_format(&record)?;
-        let (payload_len, payload_sha256, blob_path) = match &mut record.kind {
-            MutationKind::Put {
-                payload_len,
-                payload_sha256,
-                blob_path,
-                ..
-            } => (*payload_len, *payload_sha256, blob_path),
-            _ => bail!("commit_put requires a put mutation"),
-        };
+        let (payload_len, payload_sha256) = record
+            .payload()
+            .context("commit_put requires a payload mutation")?;
         if payload_len != payload.len() as u64 {
             bail!("put payload length does not match mutation record");
         }
@@ -184,16 +178,17 @@ impl Journal {
         self.require_next_local_sequence(record.sequence)?;
 
         let relative = blob_relative_path(record.sequence, record.operation_id);
-        *blob_path = path_to_portable_string(&relative)?;
-        let final_path = checked_join(&self.root, blob_path)?;
+        let blob_path = path_to_portable_string(&relative)?;
+        *record
+            .blob_path_mut()
+            .context("payload mutation has no blob path")? = blob_path.clone();
+        let operation_id = record.operation_id;
+        let final_path = checked_join(&self.root, &blob_path)?;
         let shard = final_path.parent().context("blob path has no parent")?;
         ensure_owner_directory(shard, true)?;
         sync_directory(self.root.join("blobs"))?;
 
-        let tmp_path = self
-            .root
-            .join("tmp")
-            .join(format!("{}.tmp", record.operation_id));
+        let tmp_path = self.root.join("tmp").join(format!("{operation_id}.tmp"));
         reject_symlink_if_present(&tmp_path, "journal temporary blob")?;
         let mut tmp_file = open_owner_file(&tmp_path, false)
             .with_context(|| format!("failed to create temporary blob {}", tmp_path.display()))?;
@@ -207,9 +202,9 @@ impl Journal {
         verify_file_payload(&tmp_path, payload_len, payload_sha256, false)
             .context("temporary blob verification failed")?;
 
-        self.record_pending_blob(record.operation_id, blob_path)?;
+        self.record_pending_blob(operation_id, &blob_path)?;
         if let Err(error) = fs::rename(&tmp_path, &final_path) {
-            let cleanup = self.abort_unpublished_blob(record.operation_id, &tmp_path);
+            let cleanup = self.abort_unpublished_blob(operation_id, &tmp_path);
             let publication = anyhow::Error::new(error).context(format!(
                 "failed to publish local blob {} to {}",
                 tmp_path.display(),
@@ -224,14 +219,14 @@ impl Journal {
             };
         }
         sync_directory(shard)?;
-        self.commit_record(&record, Some(record.operation_id))?;
+        self.commit_record(&record, Some(operation_id))?;
         Ok(record)
     }
 
     pub fn commit_metadata(&self, record: MutationRecord) -> Result<MutationRecord> {
         self.validate_record_format(&record)?;
-        if matches!(record.kind, MutationKind::Put { .. }) {
-            bail!("commit_metadata cannot commit a put mutation");
+        if record.payload().is_some() {
+            bail!("commit_metadata cannot commit a payload mutation");
         }
         self.require_next_local_sequence(record.sequence)?;
         self.commit_record(&record, None)?;
@@ -731,28 +726,18 @@ fn checked_join(root: &Path, relative: &str) -> Result<PathBuf> {
 }
 
 fn read_verified_blob(path: &Path, record: &MutationRecord) -> Result<Vec<u8>> {
-    let MutationKind::Put {
-        payload_len,
-        payload_sha256,
-        ..
-    } = &record.kind
-    else {
-        bail!("journal record does not reference a put blob");
-    };
-    verify_file_payload(path, *payload_len, *payload_sha256, true)?
+    let (payload_len, payload_sha256) = record
+        .payload()
+        .context("journal record does not reference a payload blob")?;
+    verify_file_payload(path, payload_len, payload_sha256, true)?
         .context("verified blob read did not return payload bytes")
 }
 
 fn verify_record_blob(path: &Path, record: &MutationRecord) -> Result<()> {
-    let MutationKind::Put {
-        payload_len,
-        payload_sha256,
-        ..
-    } = &record.kind
-    else {
-        bail!("journal record does not reference a put blob");
-    };
-    verify_file_payload(path, *payload_len, *payload_sha256, false).map(drop)
+    let (payload_len, payload_sha256) = record
+        .payload()
+        .context("journal record does not reference a payload blob")?;
+    verify_file_payload(path, payload_len, payload_sha256, false).map(drop)
 }
 
 fn verify_file_payload(

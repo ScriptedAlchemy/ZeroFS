@@ -10,16 +10,16 @@ use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt, stream};
 use object_store::path::Path;
 use object_store::{
-    CopyOptions, Extensions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
-    ObjectStore, PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions,
-    UpdateVersion,
+    CopyMode, CopyOptions, Extensions, GetOptions, GetResult, ListResult, MultipartUpload,
+    ObjectMeta, ObjectStore, PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    RenameOptions, RenameTargetMode, UpdateVersion,
 };
 use sha2::{Digest, Sha256};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 use uuid::Uuid;
 
 const KEY_LOCK_SHARDS: usize = 256;
@@ -136,9 +136,30 @@ impl WritebackObjectStore {
     }
 
     fn key_lock(&self, path: &Path) -> Arc<Mutex<()>> {
+        self.inner.key_locks[self.key_lock_index(path)].clone()
+    }
+
+    fn key_lock_index(&self, path: &Path) -> usize {
         let mut hasher = DefaultHasher::new();
         path.hash(&mut hasher);
-        self.inner.key_locks[hasher.finish() as usize % self.inner.key_locks.len()].clone()
+        hasher.finish() as usize % self.inner.key_locks.len()
+    }
+
+    async fn lock_pair(&self, first: &Path, second: &Path) -> Vec<OwnedMutexGuard<()>> {
+        let first_index = self.key_lock_index(first);
+        let second_index = self.key_lock_index(second);
+        if first_index == second_index {
+            return vec![self.inner.key_locks[first_index].clone().lock_owned().await];
+        }
+        let (low, high) = if first_index < second_index {
+            (first_index, second_index)
+        } else {
+            (second_index, first_index)
+        };
+        vec![
+            self.inner.key_locks[low].clone().lock_owned().await,
+            self.inner.key_locks[high].clone().lock_owned().await,
+        ]
     }
 
     fn allocate_sequence(&self) -> object_store::Result<u64> {
@@ -266,6 +287,126 @@ impl WritebackObjectStore {
         }
         Ok(location)
     }
+
+    async fn owned_copy_or_rename(
+        self,
+        from: Path,
+        to: Path,
+        mode: MutationMode,
+        rename: bool,
+    ) -> object_store::Result<()> {
+        let key_guards = self.lock_pair(&from, &to).await;
+        let target_visible = self.inner.overlay.visible_version(&to).await?;
+        if mode == MutationMode::Create && target_visible.is_some() {
+            return Err(object_store::Error::AlreadyExists {
+                path: to.to_string(),
+                source: "overlay-visible copy target already exists".into(),
+            });
+        }
+        let source_meta = self.inner.overlay.head(&from).await?;
+        if from == to {
+            return Ok(());
+        }
+        let bytes_len = source_meta.size;
+        let ram = self
+            .inner
+            .admission
+            .reserve(bytes_len)
+            .await
+            .map_err(|error| generic_error(format!("dirty RAM admission failed: {error}")))?
+            .accept();
+        let available = fs4::available_space(&self.inner.settings.dir)
+            .map_err(|error| generic_error(format!("failed to inspect writeback SSD: {error}")))?;
+        let disk = self
+            .inner
+            .disk
+            .reserve(bytes_len, available)
+            .await
+            .map_err(|error| generic_error(format!("dirty SSD admission failed: {error}")))?;
+        let bytes = self.inner.overlay.get(&from).await?.bytes().await?;
+        if bytes.len() as u64 != bytes_len {
+            return Err(generic_error(
+                "copy source changed while being materialized",
+            ));
+        }
+
+        let order_guard = self.inner.admission_order.lock().await;
+        let sequence = self.allocate_sequence()?;
+        let local_etag = LocalEtag::new(self.inner.incarnation, sequence);
+        let payload_sha256 = Sha256::digest(&bytes).into();
+        let kind = if rename {
+            MutationKind::Rename {
+                source: from.to_string(),
+                mode,
+                payload_len: bytes_len,
+                payload_sha256,
+                blob_path: String::new(),
+            }
+        } else {
+            MutationKind::Copy {
+                source: from.to_string(),
+                mode,
+                payload_len: bytes_len,
+                payload_sha256,
+                blob_path: String::new(),
+            }
+        };
+        let record = MutationRecord {
+            format_version: 1,
+            sequence,
+            operation_id: Uuid::new_v4(),
+            path: to.to_string(),
+            kind,
+            local_etag,
+            accepted_at_unix_ms: chrono::Utc::now().timestamp_millis().max(0) as u64,
+            remote_predecessor_etag: None,
+            remote_result_etag: None,
+            fence: if mode == MutationMode::Create {
+                FenceClass::ImmutableCreate
+            } else {
+                FenceClass::Fence
+            },
+            retry_count: 0,
+            last_error: None,
+        };
+        let overlay_result = if rename {
+            self.inner
+                .overlay
+                .install_rename(record.clone(), bytes.clone())
+                .await
+        } else {
+            self.inner
+                .overlay
+                .install_copy(record.clone(), bytes.clone())
+                .await
+        };
+        overlay_result.map_err(|error| {
+            generic_error(format!("copy/rename overlay admission failed: {error:#}"))
+        })?;
+        let barrier = match self
+            .inner
+            .journaler
+            .submit_put_with_disk(record, bytes, ram, disk)
+            .await
+        {
+            Ok(barrier) => barrier,
+            Err(error) => {
+                self.inner.overlay.remove_sequence(sequence).await;
+                return Err(generic_error(format!(
+                    "copy/rename journal admission failed: {error}"
+                )));
+            }
+        };
+        drop(order_guard);
+        drop(key_guards);
+        if self.inner.settings.ack_mode == AckMode::Ssd {
+            barrier
+                .wait_local(sequence)
+                .await
+                .map_err(|error| generic_error(format!("local durability failed: {error}")))?;
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -370,26 +511,38 @@ impl ObjectStore for WritebackObjectStore {
 
     async fn copy_opts(
         &self,
-        _from: &Path,
-        _to: &Path,
-        _options: CopyOptions,
+        from: &Path,
+        to: &Path,
+        options: CopyOptions,
     ) -> object_store::Result<()> {
-        Err(object_store::Error::NotImplemented {
-            operation: "copy_opts".to_owned(),
-            implementer: "WritebackObjectStore".to_owned(),
-        })
+        let mode = match options.mode {
+            CopyMode::Overwrite => MutationMode::Overwrite,
+            CopyMode::Create => MutationMode::Create,
+        };
+        let owned = self.clone();
+        let from = from.clone();
+        let to = to.clone();
+        tokio::spawn(async move { owned.owned_copy_or_rename(from, to, mode, false).await })
+            .await
+            .map_err(|error| generic_error(format!("owned copy task failed: {error}")))?
     }
 
     async fn rename_opts(
         &self,
-        _from: &Path,
-        _to: &Path,
-        _options: RenameOptions,
+        from: &Path,
+        to: &Path,
+        options: RenameOptions,
     ) -> object_store::Result<()> {
-        Err(object_store::Error::NotImplemented {
-            operation: "rename_opts".to_owned(),
-            implementer: "WritebackObjectStore".to_owned(),
-        })
+        let mode = match options.target_mode {
+            RenameTargetMode::Overwrite => MutationMode::Overwrite,
+            RenameTargetMode::Create => MutationMode::Create,
+        };
+        let owned = self.clone();
+        let from = from.clone();
+        let to = to.clone();
+        tokio::spawn(async move { owned.owned_copy_or_rename(from, to, mode, true).await })
+            .await
+            .map_err(|error| generic_error(format!("owned rename task failed: {error}")))?
     }
 }
 
@@ -482,8 +635,12 @@ mod tests {
     use futures::{StreamExt, stream};
     use object_store::memory::InMemory;
     use object_store::path::Path;
-    use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, UpdateVersion};
+    use object_store::{
+        CopyMode, CopyOptions, ObjectStore, ObjectStoreExt, PutMode, PutOptions, RenameOptions,
+        RenameTargetMode, UpdateVersion,
+    };
     use std::sync::Arc;
+    use std::time::Duration;
 
     async fn test_store() -> (WritebackObjectStore, Arc<InMemory>, tempfile::TempDir) {
         let temp = tempfile::tempdir().unwrap();
@@ -706,6 +863,237 @@ mod tests {
             store.get(&path).await.unwrap().bytes().await.unwrap(),
             Bytes::from_static(b"payload")
         );
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn copy_resolves_pending_and_remote_sources_and_honors_create_mode() {
+        let (store, remote, _temp) = test_store().await;
+        store
+            .put(
+                &Path::from("pending-source"),
+                Bytes::from_static(b"pending").into(),
+            )
+            .await
+            .unwrap();
+        remote
+            .put(
+                &Path::from("remote-source"),
+                Bytes::from_static(b"remote").into(),
+            )
+            .await
+            .unwrap();
+
+        store
+            .copy_opts(
+                &Path::from("pending-source"),
+                &Path::from("pending-copy"),
+                CopyOptions::default(),
+            )
+            .await
+            .unwrap();
+        store
+            .copy_opts(
+                &Path::from("remote-source"),
+                &Path::from("remote-copy"),
+                CopyOptions {
+                    mode: CopyMode::Create,
+                    ..CopyOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .copy_opts(
+                    &Path::from("remote-source"),
+                    &Path::from("remote-copy"),
+                    CopyOptions {
+                        mode: CopyMode::Create,
+                        ..CopyOptions::default()
+                    },
+                )
+                .await
+                .is_err()
+        );
+
+        assert_eq!(
+            store
+                .get(&Path::from("pending-copy"))
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap(),
+            Bytes::from_static(b"pending")
+        );
+        assert_eq!(
+            store
+                .get(&Path::from("remote-copy"))
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap(),
+            Bytes::from_static(b"remote")
+        );
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rename_atomically_hides_source_and_exposes_target() {
+        let (store, _remote, _temp) = test_store().await;
+        store
+            .put(&Path::from("source"), Bytes::from_static(b"payload").into())
+            .await
+            .unwrap();
+
+        store
+            .rename_opts(
+                &Path::from("source"),
+                &Path::from("target"),
+                RenameOptions {
+                    target_mode: RenameTargetMode::Create,
+                    ..RenameOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(store.get(&Path::from("source")).await.is_err());
+        assert_eq!(
+            store
+                .get(&Path::from("target"))
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap(),
+            Bytes::from_static(b"payload")
+        );
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn copy_and_rename_recover_from_the_local_journal() {
+        let temp = tempfile::tempdir().unwrap();
+        let remote = Arc::new(InMemory::new());
+        let identity = JournalIdentity {
+            format_version: 1,
+            bucket_id: "bucket-a".to_owned(),
+            backend_endpoint: "memory://remote".to_owned(),
+            database_prefix: "zerofs/pilot".to_owned(),
+            backend_kind: "memory".to_owned(),
+            encryption_key_identity_sha256: [0x77; 32],
+        };
+        let settings = WritebackSettings {
+            dir: temp.path().join("writeback"),
+            ack_mode: AckMode::Ssd,
+            memory_bytes: 1_000_000,
+            disk_bytes: 10_000_000,
+            min_free_bytes: 1,
+            high_watermark_percent: 95,
+            resume_percent: 85,
+            upload_concurrency: 4,
+            shutdown_flush: ShutdownFlush::Local,
+        };
+        let journal = Arc::new(Journal::open(settings.dir.clone(), identity.clone()).unwrap());
+        let store = WritebackObjectStore::open(remote.clone(), journal, settings.clone())
+            .await
+            .unwrap();
+        store
+            .put(&Path::from("source"), Bytes::from_static(b"payload").into())
+            .await
+            .unwrap();
+        store
+            .copy(&Path::from("source"), &Path::from("copy"))
+            .await
+            .unwrap();
+        store
+            .rename(&Path::from("source"), &Path::from("renamed"))
+            .await
+            .unwrap();
+        store.shutdown().await.unwrap();
+        drop(store);
+
+        let journal = Arc::new(Journal::open(settings.dir.clone(), identity).unwrap());
+        let recovered = WritebackObjectStore::open(remote, journal, settings)
+            .await
+            .unwrap();
+        assert_eq!(recovered.dirty_ssd_bytes(), 21);
+        assert!(recovered.get(&Path::from("source")).await.is_err());
+        for path in ["copy", "renamed"] {
+            assert_eq!(
+                recovered
+                    .get(&Path::from(path))
+                    .await
+                    .unwrap()
+                    .bytes()
+                    .await
+                    .unwrap(),
+                Bytes::from_static(b"payload")
+            );
+        }
+        recovered.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reversed_two_key_renames_do_not_deadlock() {
+        let (store, _remote, _temp) = test_store().await;
+        store
+            .put(&Path::from("a"), Bytes::from_static(b"a").into())
+            .await
+            .unwrap();
+        store
+            .put(&Path::from("b"), Bytes::from_static(b"b").into())
+            .await
+            .unwrap();
+
+        let a = Path::from("a");
+        let b = Path::from("b");
+        let first = store.rename(&a, &b);
+        let second = store.rename(&b, &a);
+        tokio::time::timeout(Duration::from_secs(2), async move {
+            tokio::try_join!(first, second)
+        })
+        .await
+        .expect("reversed key order deadlocked")
+        .unwrap();
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn canceled_copy_caller_does_not_cancel_owned_mutation() {
+        let (store, _remote, _temp) = test_store().await;
+        let source = Path::from("source");
+        let target = Path::from("target");
+        store
+            .put(&source, Bytes::from_static(b"payload").into())
+            .await
+            .unwrap();
+        let blocker = store.key_lock(&target).lock_owned().await;
+        let caller_store = store.clone();
+        let caller_source = source.clone();
+        let caller_target = target.clone();
+        let caller =
+            tokio::spawn(async move { caller_store.copy(&caller_source, &caller_target).await });
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        caller.abort();
+        drop(blocker);
+
+        let payload = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(result) = store.get(&target).await {
+                    break result.bytes().await.unwrap();
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("owned copy did not finish after caller cancellation");
+        assert_eq!(payload, Bytes::from_static(b"payload"));
         store.shutdown().await.unwrap();
     }
 }

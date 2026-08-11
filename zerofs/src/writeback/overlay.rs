@@ -32,9 +32,16 @@ enum PayloadLocation {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OverlayEffect {
+    Put,
+    Delete,
+}
+
 #[derive(Clone)]
 struct OverlayEntry {
     record: MutationRecord,
+    effect: OverlayEffect,
     payload: Option<PayloadLocation>,
 }
 
@@ -71,18 +78,29 @@ impl OverlayIndex {
         for record in records {
             let path = parse_path(&record.path)?;
             let payload = match record.kind {
-                MutationKind::Put { .. } => Some(PayloadLocation::Journal {
+                MutationKind::Put { .. }
+                | MutationKind::Copy { .. }
+                | MutationKind::Rename { .. } => Some(PayloadLocation::Journal {
                     journal: journal.clone(),
                     sequence: record.sequence,
                 }),
-                MutationKind::Delete | MutationKind::Copy { .. } | MutationKind::Rename { .. } => {
-                    None
-                }
+                MutationKind::Delete => None,
             };
-            entries
-                .entry(path)
-                .or_default()
-                .push_back(OverlayEntry { record, payload });
+            let effect = if matches!(record.kind, MutationKind::Delete) {
+                OverlayEffect::Delete
+            } else {
+                OverlayEffect::Put
+            };
+            install_locked(&mut entries, path, record.clone(), effect, payload)?;
+            if let MutationKind::Rename { source, .. } = &record.kind {
+                install_locked(
+                    &mut entries,
+                    parse_path(source)?,
+                    record,
+                    OverlayEffect::Delete,
+                    None,
+                )?;
+            }
         }
         *overlay.entries.write().await = entries;
         Ok(overlay)
@@ -109,32 +127,75 @@ impl OverlayIndex {
         {
             anyhow::bail!("memory payload does not match its mutation record");
         }
-        self.install(record, Some(PayloadLocation::Memory(payload)))
-            .await
+        self.install(
+            record,
+            OverlayEffect::Put,
+            Some(PayloadLocation::Memory(payload)),
+        )
+        .await
     }
 
     pub async fn install_delete(&self, record: MutationRecord) -> anyhow::Result<()> {
         if !matches!(record.kind, MutationKind::Delete) {
             anyhow::bail!("delete overlay requires a delete mutation");
         }
-        self.install(record, None).await
+        self.install(record, OverlayEffect::Delete, None).await
+    }
+
+    pub async fn install_copy(&self, record: MutationRecord, payload: Bytes) -> anyhow::Result<()> {
+        if !matches!(record.kind, MutationKind::Copy { .. }) {
+            anyhow::bail!("copy overlay requires a copy mutation");
+        }
+        validate_payload(&record, &payload)?;
+        self.install(
+            record,
+            OverlayEffect::Put,
+            Some(PayloadLocation::Memory(payload)),
+        )
+        .await
+    }
+
+    pub async fn install_rename(
+        &self,
+        record: MutationRecord,
+        payload: Bytes,
+    ) -> anyhow::Result<()> {
+        let MutationKind::Rename { source, .. } = &record.kind else {
+            anyhow::bail!("rename overlay requires a rename mutation");
+        };
+        validate_payload(&record, &payload)?;
+        let target = parse_path(&record.path)?;
+        let source = parse_path(source)?;
+        let mut entries = self.entries.write().await;
+        install_locked(
+            &mut entries,
+            target,
+            record.clone(),
+            OverlayEffect::Put,
+            Some(PayloadLocation::Memory(payload)),
+        )?;
+        if let Err(error) = install_locked(
+            &mut entries,
+            source,
+            record.clone(),
+            OverlayEffect::Delete,
+            None,
+        ) {
+            remove_sequence_locked(&mut entries, record.sequence);
+            return Err(error);
+        }
+        Ok(())
     }
 
     async fn install(
         &self,
         record: MutationRecord,
+        effect: OverlayEffect,
         payload: Option<PayloadLocation>,
     ) -> anyhow::Result<()> {
         let path = parse_path(&record.path)?;
         let mut entries = self.entries.write().await;
-        let versions = entries.entry(path).or_default();
-        if let Some(previous) = versions.back()
-            && record.sequence <= previous.record.sequence
-        {
-            anyhow::bail!("overlay sequences must increase for each path");
-        }
-        versions.push_back(OverlayEntry { record, payload });
-        Ok(())
+        install_locked(&mut entries, path, record, effect, payload)
     }
 
     pub async fn mark_local(
@@ -145,20 +206,26 @@ impl OverlayIndex {
         let committed = journal
             .mutation(sequence)?
             .ok_or_else(|| anyhow::anyhow!("journal sequence {sequence} does not exist"))?;
-        let path = parse_path(&committed.path)?;
         let mut entries = self.entries.write().await;
-        let entry = entries
-            .get_mut(&path)
-            .and_then(|versions| {
-                versions
-                    .iter_mut()
-                    .find(|entry| entry.record.sequence == sequence)
-            })
-            .ok_or_else(|| anyhow::anyhow!("overlay sequence {sequence} does not exist"))?;
-        if matches!(committed.kind, MutationKind::Put { .. }) {
-            entry.payload = Some(PayloadLocation::Journal { journal, sequence });
+        let mut matched = false;
+        for versions in entries.values_mut() {
+            for entry in versions
+                .iter_mut()
+                .filter(|entry| entry.record.sequence == sequence)
+            {
+                if entry.effect == OverlayEffect::Put {
+                    entry.payload = Some(PayloadLocation::Journal {
+                        journal: journal.clone(),
+                        sequence,
+                    });
+                }
+                entry.record = committed.clone();
+                matched = true;
+            }
         }
-        entry.record = committed;
+        if !matched {
+            anyhow::bail!("overlay sequence {sequence} does not exist");
+        }
         Ok(())
     }
 
@@ -172,10 +239,7 @@ impl OverlayIndex {
 
     pub async fn remove_sequence(&self, sequence: Sequence) {
         let mut entries = self.entries.write().await;
-        entries.retain(|_, versions| {
-            versions.retain(|entry| entry.record.sequence != sequence);
-            !versions.is_empty()
-        });
+        remove_sequence_locked(&mut entries, sequence);
     }
 
     pub async fn visible_version(
@@ -183,9 +247,9 @@ impl OverlayIndex {
         location: &Path,
     ) -> object_store::Result<Option<VisibleVersion>> {
         if let Some(entry) = self.visible_entry(location).await {
-            return Ok(match entry.record.kind {
-                MutationKind::Delete => None,
-                _ => Some(VisibleVersion::Local(entry.record.local_etag)),
+            return Ok(match entry.effect {
+                OverlayEffect::Delete => None,
+                OverlayEffect::Put => Some(VisibleVersion::Local(entry.record.local_etag)),
             });
         }
         match self.remote.head(location).await {
@@ -259,11 +323,11 @@ impl OverlayIndex {
             .map(|meta| (meta.location.clone(), meta))
             .collect::<BTreeMap<_, _>>();
         for (path, entry) in self.visible_entries(prefix).await {
-            match entry.record.kind {
-                MutationKind::Delete => {
+            match entry.effect {
+                OverlayEffect::Delete => {
                     merged.remove(&path);
                 }
-                _ => {
+                OverlayEffect::Put => {
                     merged.insert(path.clone(), entry_meta(path, &entry.record)?);
                 }
             }
@@ -354,7 +418,7 @@ async fn load_payload(payload: PayloadLocation) -> object_store::Result<Bytes> {
 }
 
 fn entry_meta(location: Path, record: &MutationRecord) -> object_store::Result<ObjectMeta> {
-    let MutationKind::Put { payload_len, .. } = &record.kind else {
+    let Some((payload_len, _)) = record.payload() else {
         return Err(not_found(&location));
     };
     let timestamp = i64::try_from(record.accepted_at_unix_ms)
@@ -365,10 +429,53 @@ fn entry_meta(location: Path, record: &MutationRecord) -> object_store::Result<O
     Ok(ObjectMeta {
         location,
         last_modified: timestamp,
-        size: *payload_len,
+        size: payload_len,
         e_tag: Some(local.clone()),
         version: Some(local),
     })
+}
+
+fn validate_payload(record: &MutationRecord, payload: &Bytes) -> anyhow::Result<()> {
+    let Some((payload_len, payload_sha256)) = record.payload() else {
+        anyhow::bail!("overlay payload requires a payload mutation");
+    };
+    if payload_len != payload.len() as u64
+        || <[u8; 32]>::from(Sha256::digest(payload)) != payload_sha256
+    {
+        anyhow::bail!("memory payload does not match its mutation record");
+    }
+    Ok(())
+}
+
+fn install_locked(
+    entries: &mut BTreeMap<Path, VecDeque<OverlayEntry>>,
+    path: Path,
+    record: MutationRecord,
+    effect: OverlayEffect,
+    payload: Option<PayloadLocation>,
+) -> anyhow::Result<()> {
+    let versions = entries.entry(path).or_default();
+    if let Some(previous) = versions.back()
+        && record.sequence <= previous.record.sequence
+    {
+        anyhow::bail!("overlay sequences must increase for each path");
+    }
+    versions.push_back(OverlayEntry {
+        record,
+        effect,
+        payload,
+    });
+    Ok(())
+}
+
+fn remove_sequence_locked(
+    entries: &mut BTreeMap<Path, VecDeque<OverlayEntry>>,
+    sequence: Sequence,
+) {
+    entries.retain(|_, versions| {
+        versions.retain(|entry| entry.record.sequence != sequence);
+        !versions.is_empty()
+    });
 }
 
 fn parse_path(path: &str) -> anyhow::Result<Path> {

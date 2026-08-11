@@ -32,9 +32,17 @@ pub enum MutationKind {
     Delete,
     Copy {
         source: String,
+        mode: MutationMode,
+        payload_len: u64,
+        payload_sha256: [u8; 32],
+        blob_path: String,
     },
     Rename {
         source: String,
+        mode: MutationMode,
+        payload_len: u64,
+        payload_sha256: [u8; 32],
+        blob_path: String,
     },
 }
 
@@ -63,8 +71,40 @@ pub struct MutationRecord {
 impl MutationRecord {
     pub fn blob_path(&self) -> Option<&str> {
         match &self.kind {
-            MutationKind::Put { blob_path, .. } => Some(blob_path),
-            MutationKind::Delete | MutationKind::Copy { .. } | MutationKind::Rename { .. } => None,
+            MutationKind::Put { blob_path, .. }
+            | MutationKind::Copy { blob_path, .. }
+            | MutationKind::Rename { blob_path, .. } => Some(blob_path),
+            MutationKind::Delete => None,
+        }
+    }
+
+    pub fn payload(&self) -> Option<(u64, [u8; 32])> {
+        match &self.kind {
+            MutationKind::Put {
+                payload_len,
+                payload_sha256,
+                ..
+            }
+            | MutationKind::Copy {
+                payload_len,
+                payload_sha256,
+                ..
+            }
+            | MutationKind::Rename {
+                payload_len,
+                payload_sha256,
+                ..
+            } => Some((*payload_len, *payload_sha256)),
+            MutationKind::Delete => None,
+        }
+    }
+
+    pub fn blob_path_mut(&mut self) -> Option<&mut String> {
+        match &mut self.kind {
+            MutationKind::Put { blob_path, .. }
+            | MutationKind::Copy { blob_path, .. }
+            | MutationKind::Rename { blob_path, .. } => Some(blob_path),
+            MutationKind::Delete => None,
         }
     }
 }
