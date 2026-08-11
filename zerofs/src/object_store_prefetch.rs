@@ -25,9 +25,13 @@ const ACCESS_TRACKER_CAPACITY: usize = 8 * 1024;
 const FETCH_WINDOW_MIN: usize = 128 * 1024;
 const FETCH_WINDOW_MAX: usize = 8 * 1024 * 1024;
 const MAX_STREAMS: usize = 4;
-/// Windows kept fetched ahead of a proven sequential stream, so several large
-/// GETs stay in flight. At the max window that's 32 MiB outstanding, well
-/// inside the parts cache.
+/// Minimum confirmed-stream window relative to the random-access minimum. The
+/// live SFTP profile therefore promotes 1 MiB to 16 MiB after sequential access
+/// is proven, while an unproven/random stream stays at 1 MiB.
+const SEQUENTIAL_FETCH_WINDOW_MULTIPLIER: usize = 16;
+/// Look-ahead horizon for a proven sequential stream. Adjacent candidates are
+/// merged into one GET and capped at `fetch_window_max`, avoiding a burst of
+/// independent backend requests.
 const PREFETCH_DEPTH_WINDOWS: usize = 4;
 
 type PartId = usize;
@@ -69,16 +73,27 @@ struct AccessHistory {
     len: usize,
     stride_limit: u64,
     fetch_window_min: usize,
+    sequential_fetch_window_min: usize,
     fetch_window_max: usize,
 }
 
 impl AccessHistory {
     #[cfg(test)]
     fn new(part_size: usize) -> Self {
-        Self::with_windows(part_size, FETCH_WINDOW_MIN, FETCH_WINDOW_MAX)
+        Self::with_windows(
+            part_size,
+            FETCH_WINDOW_MIN,
+            FETCH_WINDOW_MIN,
+            FETCH_WINDOW_MAX,
+        )
     }
 
-    fn with_windows(part_size: usize, fetch_window_min: usize, fetch_window_max: usize) -> Self {
+    fn with_windows(
+        part_size: usize,
+        fetch_window_min: usize,
+        sequential_fetch_window_min: usize,
+        fetch_window_max: usize,
+    ) -> Self {
         Self {
             streams: [Stream {
                 last_offset: u64::MAX,
@@ -89,6 +104,7 @@ impl AccessHistory {
             len: 0,
             stride_limit: part_size as u64 * 4,
             fetch_window_min,
+            sequential_fetch_window_min,
             fetch_window_max,
         }
     }
@@ -98,7 +114,9 @@ impl AccessHistory {
             let s = &mut self.streams[i];
             s.last_offset = offset;
             s.last_end = offset.saturating_add(len);
-            s.fetch_window = (s.fetch_window * 2).min(self.fetch_window_max);
+            s.fetch_window = (s.fetch_window * 2)
+                .max(self.sequential_fetch_window_min)
+                .min(self.fetch_window_max);
 
             // Refill the prefetch frontier to PREFETCH_DEPTH_WINDOWS ahead of the
             // read, once the stream has proven sequential (window ramped past the
@@ -108,14 +126,15 @@ impl AccessHistory {
             let mut async_prefetch = Vec::new();
             if s.fetch_window > self.fetch_window_min && s.fetched_until > offset {
                 let window = s.fetch_window as u64;
-                let target = offset + PREFETCH_DEPTH_WINDOWS as u64 * window;
-                let mut cursor = s.fetched_until;
-                while cursor < target && async_prefetch.len() < PREFETCH_DEPTH_WINDOWS {
+                let target =
+                    offset.saturating_add((PREFETCH_DEPTH_WINDOWS as u64).saturating_mul(window));
+                if s.fetched_until < target {
                     async_prefetch.push(AsyncPrefetch {
-                        start: cursor,
-                        size: s.fetch_window,
+                        start: s.fetched_until,
+                        size: usize::try_from(target - s.fetched_until)
+                            .unwrap_or(usize::MAX)
+                            .min(self.fetch_window_max),
                     });
-                    cursor += window;
                 }
             }
 
@@ -255,6 +274,7 @@ pub struct PrefetchingObjectStore {
     inner: Arc<dyn ObjectStore>,
     part_size_bytes: usize,
     fetch_window_min_bytes: usize,
+    sequential_fetch_window_min_bytes: usize,
     fetch_window_max_bytes: usize,
     parts: HybridCache<PartKey, Bytes>,
     heads: Cache<Path, Arc<CachedHead>>,
@@ -313,10 +333,11 @@ impl PrefetchingObjectStore {
         parts: HybridCache<PartKey, Bytes>,
         part_size_bytes: usize,
     ) -> Self {
-        Self::with_tuning(
+        Self::with_windows(
             inner,
             parts,
             part_size_bytes,
+            FETCH_WINDOW_MIN,
             FETCH_WINDOW_MIN,
             FETCH_WINDOW_MAX,
         )
@@ -327,6 +348,26 @@ impl PrefetchingObjectStore {
         parts: HybridCache<PartKey, Bytes>,
         part_size_bytes: usize,
         fetch_window_min_bytes: usize,
+        fetch_window_max_bytes: usize,
+    ) -> Self {
+        Self::with_windows(
+            inner,
+            parts,
+            part_size_bytes,
+            fetch_window_min_bytes,
+            fetch_window_min_bytes
+                .saturating_mul(SEQUENTIAL_FETCH_WINDOW_MULTIPLIER)
+                .min(fetch_window_max_bytes),
+            fetch_window_max_bytes,
+        )
+    }
+
+    fn with_windows(
+        inner: Arc<dyn ObjectStore>,
+        parts: HybridCache<PartKey, Bytes>,
+        part_size_bytes: usize,
+        fetch_window_min_bytes: usize,
+        sequential_fetch_window_min_bytes: usize,
         fetch_window_max_bytes: usize,
     ) -> Self {
         assert!(
@@ -343,6 +384,12 @@ impl PrefetchingObjectStore {
                 && fetch_window_max_bytes.is_multiple_of(1024),
             "fetch_window_max_bytes must be at least the minimum and a multiple of 1024"
         );
+        assert!(
+            sequential_fetch_window_min_bytes >= fetch_window_min_bytes
+                && sequential_fetch_window_min_bytes <= fetch_window_max_bytes
+                && sequential_fetch_window_min_bytes.is_multiple_of(1024),
+            "sequential_fetch_window_min_bytes must be within the fetch window bounds and a multiple of 1024"
+        );
 
         let heads = foyer::CacheBuilder::new(HEADS_CAPACITY_ENTRIES)
             .with_name("zerofs-object-prefetch-heads")
@@ -357,6 +404,7 @@ impl PrefetchingObjectStore {
             inner,
             part_size_bytes,
             fetch_window_min_bytes,
+            sequential_fetch_window_min_bytes,
             fetch_window_max_bytes,
             parts,
             heads,
@@ -415,6 +463,7 @@ impl PrefetchingObjectStore {
                 let hist = Arc::new(Mutex::new(AccessHistory::with_windows(
                     self.part_size_bytes,
                     self.fetch_window_min_bytes,
+                    self.sequential_fetch_window_min_bytes,
                     self.fetch_window_max_bytes,
                 )));
                 self.access_tracker.insert(location.clone(), hist.clone());
@@ -1539,6 +1588,147 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sftp_sequential_120_mib_stream_coalesces_into_large_backend_gets() {
+        const MIB: usize = 1024 * 1024;
+        const OBJECT_LEN: usize = 120 * MIB;
+        let mem = Arc::new(InMemory::new());
+        let path = Path::from("segments/aa/sftp-120m");
+        mem.put(&path, vec![0x6Bu8; OBJECT_LEN].into())
+            .await
+            .unwrap();
+        let ranges = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let backend: Arc<dyn ObjectStore> = Arc::new(RangeRecordingStore {
+            inner: mem,
+            ranges: ranges.clone(),
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let parts = HybridCacheBuilder::new()
+            .with_name("sftp-120m-parts")
+            .memory(192 * MIB)
+            .with_weighter(|_: &PartKey, v: &Bytes| v.len())
+            .storage()
+            .with_io_engine_config(PsyncIoEngineConfig::new())
+            .with_engine_config(
+                BlockEngineConfig::new(
+                    foyer::DeviceBuilder::build(
+                        FsDeviceBuilder::new(dir.path()).with_capacity(256 * MIB),
+                    )
+                    .unwrap(),
+                )
+                .with_block_size(16 * MIB),
+            )
+            .build()
+            .await
+            .unwrap();
+        let store = PrefetchingObjectStore::with_tuning(backend, parts, MIB, MIB, OBJECT_LEN);
+
+        for chunk in 0..120u64 {
+            let start = chunk * MIB as u64;
+            let bytes = store
+                .get_range(&path, start..start + MIB as u64)
+                .await
+                .unwrap();
+            assert_eq!(bytes.len(), MIB);
+        }
+        for _ in 0..100 {
+            if store.fetches.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            store.fetches.lock().unwrap().is_empty(),
+            "async prefetch did not settle before measurement"
+        );
+
+        let recorded = ranges.lock().unwrap();
+        let bounded = recorded
+            .iter()
+            .filter_map(|range| match range {
+                GetRange::Bounded(range) => Some(range.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let fetched = bounded
+            .iter()
+            .map(|range| range.end.min(OBJECT_LEN as u64) - range.start)
+            .sum::<u64>();
+        let amplification = fetched as f64 / OBJECT_LEN as f64;
+
+        println!(
+            "SFTP 120 MiB sequential: {} GETs, amplification {amplification:.3}x, ranges {bounded:?}",
+            bounded.len()
+        );
+
+        assert_eq!(bounded.first(), Some(&(0..MIB as u64)));
+        let confirmed = bounded.get(1).expect("confirmed-stream backend GET");
+        assert!(
+            confirmed.end - confirmed.start >= 15 * MIB as u64,
+            "first confirmed-sequential GET was smaller than 15 MiB: {confirmed:?}"
+        );
+        assert!(
+            bounded
+                .iter()
+                .all(|range| range.end - range.start <= OBJECT_LEN as u64),
+            "coalesced GET exceeded the configured 120 MiB maximum: {bounded:?}"
+        );
+        assert!(
+            bounded.len() <= 4,
+            "120 MiB sequential stream used {} backend GETs instead of <=4: {bounded:?}",
+            bounded.len()
+        );
+        assert!(
+            amplification <= 1.15,
+            "120 MiB sequential amplification {amplification:.3}x > 1.15x ({fetched} fetched)"
+        );
+    }
+
+    #[tokio::test]
+    async fn sftp_random_4k_and_32k_reads_never_exceed_one_mib_backend_gets() {
+        const MIB: usize = 1024 * 1024;
+        let mem = Arc::new(InMemory::new());
+        let path = Path::from("segments/aa/sftp-random");
+        mem.put(&path, vec![0x31u8; 120 * MIB].into())
+            .await
+            .unwrap();
+        let ranges = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let backend: Arc<dyn ObjectStore> = Arc::new(RangeRecordingStore {
+            inner: mem,
+            ranges: ranges.clone(),
+        });
+        let (store, _dir) = store_over_with_tuning(backend, MIB, MIB, 120 * MIB).await;
+
+        for (offset_mib, length) in [
+            (0u64, 4 * 1024u64),
+            (17, 32 * 1024),
+            (39, 4 * 1024),
+            (64, 32 * 1024),
+            (91, 4 * 1024),
+            (117, 32 * 1024),
+        ] {
+            let start = offset_mib * MIB as u64;
+            let bytes = store.get_range(&path, start..start + length).await.unwrap();
+            assert_eq!(bytes.len() as u64, length);
+        }
+
+        let recorded = ranges.lock().unwrap();
+        let bounded = recorded
+            .iter()
+            .filter_map(|range| match range {
+                GetRange::Bounded(range) => Some(range.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(bounded.len(), 6, "each random region should need one GET");
+        assert!(
+            bounded
+                .iter()
+                .all(|range| range.end - range.start <= MIB as u64),
+            "random 4 KiB/32 KiB reads exceeded the 1 MiB SFTP minimum window: {bounded:?}"
+        );
+    }
+
     // A burst of concurrent reads whose parts fall inside one prefetch window must
     // collapse onto a single object-store GET, not one GET each.
     #[tokio::test]
@@ -2173,7 +2363,7 @@ mod tests {
     }
 
     #[test]
-    fn record_emits_async_prefetch_in_trigger_zone() {
+    fn record_merges_adjacent_async_prefetch_windows_in_trigger_zone() {
         let part_size = 64 * 1024;
         let mut h = AccessHistory::new(part_size);
 
@@ -2185,15 +2375,16 @@ mod tests {
 
         let d = h.record((FETCH_WINDOW_MIN / 2) as u64, 0);
         assert_eq!(d.fetch_window, FETCH_WINDOW_MIN * 2);
-        // The frontier refills up to PREFETCH_DEPTH_WINDOWS ahead; the first window
-        // starts where the read had already fetched to.
+        // The frontier refills up to PREFETCH_DEPTH_WINDOWS ahead, but adjacent
+        // candidates are represented by one backend range starting where the
+        // read had already fetched to.
         let p = d
             .async_prefetch
             .first()
             .expect("should fire in trigger zone");
         assert_eq!(p.start, FETCH_WINDOW_MIN as u64);
-        assert_eq!(p.size, FETCH_WINDOW_MIN * 2);
-        assert_eq!(d.async_prefetch.len(), PREFETCH_DEPTH_WINDOWS);
+        assert_eq!(p.size, 15 * FETCH_WINDOW_MIN / 2);
+        assert_eq!(d.async_prefetch.len(), 1);
     }
 
     #[test]
