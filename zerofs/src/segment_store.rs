@@ -201,7 +201,7 @@ impl SegmentStore {
         frames: Vec<(InodeId, u64, Compressed)>,
     ) -> Result<Vec<(InodeId, u64, FrameLoc)>> {
         let segid = self.next_segid();
-        let sealed = seal_compressed_batch(&self.codec, segid, frames)?;
+        let sealed = seal_compressed_batch(&self.codec, segid, 0, frames)?;
         let mut builder = SegmentBuilder::new(&self.codec, segid);
         let mut locs = Vec::with_capacity(sealed.len());
         for (id, extent, body) in sealed {

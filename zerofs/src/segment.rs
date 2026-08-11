@@ -664,21 +664,27 @@ pub(crate) fn read_compressed_frames_from_region(
     })
 }
 
-/// [`seal_compressed_frame`] over a whole batch destined for a fresh segment:
-/// frame `i` gets index `i`, so every AAD is known upfront and the seals are
+/// [`seal_compressed_frame`] over a whole contiguous batch. Frame `i` gets
+/// index `first_frame + i`, so every AAD is known upfront and the seals are
 /// independent pure functions. A batch past [`PARALLEL_CRYPTO_MIN_BYTES`]
 /// stored bytes encrypts across cores, under the same dispatch rules as
 /// [`open_spans`].
 pub(crate) fn seal_compressed_batch(
     codec: &FrameCodec,
     segid: Segid,
+    first_frame: u32,
     frames: Vec<(u64, u64, Compressed)>,
 ) -> Result<Vec<(u64, u64, Vec<u8>)>, SegmentError> {
     let seal_one = |(i, (inode, extent, compressed)): (usize, (u64, u64, Compressed))| {
+        let frame_offset =
+            u32::try_from(i).map_err(|_| SegmentError::Malformed("frame index overflow"))?;
+        let frame_index = first_frame
+            .checked_add(frame_offset)
+            .ok_or(SegmentError::Malformed("frame index overflow"))?;
         Ok((
             inode,
             extent,
-            seal_compressed_frame(codec, segid, i as u32, inode, extent, compressed)?,
+            seal_compressed_frame(codec, segid, frame_index, inode, extent, compressed)?,
         ))
     };
     let stored: usize = frames.iter().map(|(_, _, c)| c.len()).sum();
@@ -755,7 +761,7 @@ mod tests {
             .map(|(ino, ext, p)| (*ino, *ext, c.compress(p).unwrap()))
             .collect();
         assert!(batch.iter().map(|(_, _, p)| p.len()).sum::<usize>() >= PARALLEL_CRYPTO_MIN_BYTES);
-        let sealed = seal_compressed_batch(&c, seg_a, batch).unwrap();
+        let sealed = seal_compressed_batch(&c, seg_a, 0, batch).unwrap();
         let mut b = SegmentBuilder::new(&c, seg_a);
         for (ino, ext, body) in &sealed {
             b.append_sealed(*ino, *ext, body);
@@ -776,7 +782,7 @@ mod tests {
             .zip(got)
             .map(|(&(ino, ext), p)| (ino, ext, p))
             .collect();
-        let resealed = seal_compressed_batch(&c, seg_b, rebatch).unwrap();
+        let resealed = seal_compressed_batch(&c, seg_b, 0, rebatch).unwrap();
         for (i, ((ino, ext, body), (_, _, want))) in resealed.iter().zip(&plains).enumerate() {
             let aad = frame_aad(seg_b, i as u32, *ino, *ext);
             assert_eq!(&c.open(body, &aad).unwrap(), want);

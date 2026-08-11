@@ -58,10 +58,9 @@ pub(super) fn make_store(
         key_codec,
         segments,
         Arc::new(KeyedLockManager::new()),
-        super::write::SEAL_THRESHOLD,
+        8 * 1024 * 1024,
         super::write::MAX_INFLIGHT_SEALS,
     )
-    .with_seal_threshold(8 * 1024 * 1024)
 }
 
 pub(super) async fn commit(store: &ExtentStore, txn: Transaction) {

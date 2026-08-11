@@ -86,6 +86,9 @@ pub struct ExtentStore {
     lock_manager: Arc<KeyedLockManager<InodeId>>,
     codec: Arc<FrameCodec>,
     open: Arc<Mutex<OpenSegment>>,
+    /// Test observation point immediately before foreground batch AEAD.
+    #[cfg(test)]
+    before_batch_seal: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Writers hold the read side from FrameLoc assignment through commit; GC
     /// takes the write side before sealing and choosing its cutoff.
     extent_ref_barrier: Arc<tokio::sync::RwLock<()>>,
@@ -167,7 +170,7 @@ impl ExtentStore {
         let codec = segments.codec();
         let open = Arc::new(Mutex::new(OpenSegment {
             segid: segments.next_segid(),
-            buf: Vec::new(),
+            buf: Vec::with_capacity(seal_threshold),
             dir: Vec::new(),
         }));
         Self {
@@ -177,6 +180,8 @@ impl ExtentStore {
             lock_manager,
             codec,
             open,
+            #[cfg(test)]
+            before_batch_seal: None,
             extent_ref_barrier: Arc::new(tokio::sync::RwLock::new(())),
             append_gate: Arc::new(tokio::sync::Mutex::new(())),
             sealing: Arc::new(Mutex::new(BTreeMap::new())),
@@ -328,6 +333,10 @@ impl ExtentStore {
     /// 256 MiB segment.
     #[cfg(test)]
     fn with_seal_threshold(mut self, n: usize) -> Self {
+        let mut open = self.open.lock().unwrap();
+        assert!(open.dir.is_empty());
+        open.buf = Vec::with_capacity(n);
+        drop(open);
         self.seal_threshold = n;
         self
     }

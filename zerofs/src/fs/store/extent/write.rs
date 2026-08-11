@@ -244,8 +244,8 @@ impl ExtentStore {
                 .collect::<Result<_, _>>()
                 .map_err(|_| FsError::IoError)?
         };
-        let mut compressed = compressed.into_iter();
-        if edits.iter().any(|(_, edit)| edit.is_some()) {
+        let has_frames = !compressed.is_empty();
+        if has_frames {
             // Must precede FrameLoc assignment under `open`.
             self.protect_extent_ref(txn).await;
         }
@@ -253,49 +253,90 @@ impl ExtentStore {
         // rotation is due. In particular, this guard stays held while
         // spawn_seal waits for an in-flight-seal permit.
         let _append_guard = self.append_gate.lock().await;
-        {
-            let mut open = self.open.lock().unwrap();
-            for (extent, edit) in edits {
-                match edit {
-                    Some(_) => {
-                        let frame_index = open.dir.len() as u32;
-                        let segid = open.segid;
-                        let sealed = crate::segment::seal_compressed_frame(
-                            &self.codec,
-                            segid,
-                            frame_index,
+        let prepared = if has_frames {
+            // Reserve the segment identity and contiguous frame-index run under
+            // the append gate, but do the batch AEAD without holding the open
+            // buffer mutex. `seal_open` takes the same gate before rotation.
+            let (segid, first_frame) = {
+                let open = self.open.lock().unwrap();
+                (open.segid, open.dir.len() as u32)
+            };
+            #[cfg(test)]
+            if let Some(probe) = &self.before_batch_seal {
+                probe();
+            }
+            let mut compressed = compressed.into_iter();
+            let frames = edits
+                .iter()
+                .filter_map(|(extent, edit)| {
+                    edit.as_ref().map(|_| {
+                        (
                             id,
                             *extent,
                             compressed.next().expect("one compressed payload per edit"),
                         )
-                        .map_err(|_| FsError::IoError)?;
-                        let byte_offset = open.buf.len() as u64;
-                        let sealed_len = sealed.len() as u32;
-                        open.buf.extend_from_slice(&sealed_len.to_le_bytes());
-                        open.buf.extend_from_slice(&sealed);
-                        open.dir.push(DirEntry {
-                            byte_offset,
-                            len: sealed_len,
-                            inode: id,
-                            extent: *extent,
-                        });
-                        let loc = FrameLoc {
-                            segid,
-                            frame_index,
-                            byte_offset,
-                            byte_len: 4 + sealed_len,
-                        };
-                        txn.put_bytes(
-                            &self.key_codec.extent_key(id, *extent),
-                            Bytes::copy_from_slice(&loc.encode()),
-                        );
-                        // Credit the frame just appended: both live and total.
-                        self.seg_delta(txn, segid, loc.byte_len as i64, loc.byte_len as i64);
-                    }
-                    None => self.delete(txn, id, *extent),
-                }
+                    })
+                })
+                .collect();
+            let sealed =
+                crate::segment::seal_compressed_batch(&self.codec, segid, first_frame, frames)
+                    .map_err(|_| FsError::IoError)?;
+            let packed_len = sealed.iter().map(|(_, _, body)| 4 + body.len()).sum();
+            let mut packed = Vec::with_capacity(packed_len);
+            let mut entries = Vec::with_capacity(sealed.len());
+            for (inode, extent, body) in sealed {
+                let byte_offset = packed.len() as u64;
+                let len = body.len() as u32;
+                packed.extend_from_slice(&len.to_le_bytes());
+                packed.extend_from_slice(&body);
+                entries.push(DirEntry {
+                    byte_offset,
+                    len,
+                    inode,
+                    extent,
+                });
+            }
+            Some((segid, first_frame, packed, entries))
+        } else {
+            None
+        };
+        let mut locs = Vec::with_capacity(prepared.as_ref().map_or(0, |p| p.3.len()));
+        if let Some((segid, first_frame, packed, entries)) = prepared {
+            let mut open = self.open.lock().unwrap();
+            if open.segid != segid || open.dir.len() as u32 != first_frame {
+                return Err(FsError::IoError);
+            }
+            let base_offset = open.buf.len() as u64;
+            open.buf.extend_from_slice(&packed);
+            open.dir.reserve(entries.len());
+            for (i, mut entry) in entries.into_iter().enumerate() {
+                entry.byte_offset += base_offset;
+                let loc = FrameLoc {
+                    segid,
+                    frame_index: first_frame + i as u32,
+                    byte_offset: entry.byte_offset,
+                    byte_len: 4 + entry.len,
+                };
+                locs.push(loc);
+                open.dir.push(entry);
             }
         }
+        let mut locs = locs.into_iter();
+        for (extent, edit) in edits {
+            match edit {
+                Some(_) => {
+                    let loc = locs.next().expect("one frame location per edit");
+                    txn.put_bytes(
+                        &self.key_codec.extent_key(id, *extent),
+                        Bytes::copy_from_slice(&loc.encode()),
+                    );
+                    // Credit the frame just appended: both live and total.
+                    self.seg_delta(txn, loc.segid, loc.byte_len as i64, loc.byte_len as i64);
+                }
+                None => self.delete(txn, id, *extent),
+            }
+        }
+        debug_assert!(locs.next().is_none());
         for (segid, byte_len) in old_debits {
             // Overwrite debit of the superseded frame: live only, total untouched.
             self.seg_delta(txn, segid, -(byte_len as i64), 0);
@@ -312,6 +353,10 @@ impl ExtentStore {
     /// then synchronously seal the current open buffer. After this returns, every
     /// segment referenced by a committed extent is durable on the object store.
     pub async fn seal_open(&self) -> Result<(), FsError> {
+        // Serialize rotation with foreground frame-index reservation and batch
+        // sealing. This gate must be acquired before seal permits to preserve
+        // the foreground path's gate-then-permit lock order.
+        let _append_guard = self.append_gate.lock().await;
         // Acquire all permits: waits for in-flight background seals to finish, and
         // holds new ones off until we release at end of scope.
         let _all = self
@@ -352,7 +397,8 @@ impl ExtentStore {
                 let sealed_dir = crate::segment::seal_directory(&self.codec, segid, &open.dir)
                     .map_err(|_| FsError::IoError)?;
                 let k = open.dir.len() as u32;
-                let buf = std::mem::take(&mut open.buf);
+                let buf =
+                    std::mem::replace(&mut open.buf, Vec::with_capacity(self.seal_threshold()));
                 open.dir.clear();
                 open.segid = self.segments.next_segid();
                 debug_assert_ne!(
@@ -405,7 +451,7 @@ impl ExtentStore {
                 }
             };
             let k = open.dir.len() as u32;
-            let buf = std::mem::take(&mut open.buf);
+            let buf = std::mem::replace(&mut open.buf, Vec::with_capacity(self.seal_threshold()));
             open.dir.clear();
             open.segid = self.segments.next_segid();
             debug_assert_ne!(
@@ -831,6 +877,121 @@ mod tests {
         )
         .await;
         write_and_check(&store, &db, &mut model, EXTENT_SIZE - 5, &[9u8; 20]).await;
+    }
+
+    // A foreground multi-frame write must not hold the globally shared open
+    // buffer mutex while it performs per-frame AEAD. Moving or mis-indexing a
+    // batch must also fail here: the independently opened run binds each frame
+    // to its exact (segment, index, inode, extent) AAD.
+    #[tokio::test]
+    async fn multi_frame_stage_edits_seals_outside_open_lock_without_reordering_frames() {
+        let (mut store, db) = make().await;
+        let inode: InodeId = 73;
+        let seed_inode: InodeId = 72;
+        let seed = Bytes::from(vec![0x77; EXTENT_SIZE]);
+        let mut seed_txn = db.new_transaction().unwrap();
+        store
+            .stage_edits(&mut seed_txn, seed_inode, &[(2, Some(seed.clone()))], 0)
+            .await
+            .unwrap();
+        commit(&store, seed_txn).await;
+
+        let observed_unlocked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        store.before_batch_seal = Some({
+            let open = Arc::clone(&store.open);
+            let observed_unlocked = Arc::clone(&observed_unlocked);
+            Arc::new(move || {
+                observed_unlocked
+                    .store(open.try_lock().is_ok(), std::sync::atomic::Ordering::SeqCst);
+            })
+        });
+
+        let plains = [
+            Bytes::from(vec![0x11; EXTENT_SIZE]),
+            Bytes::from(vec![0x22; EXTENT_SIZE]),
+            Bytes::from(vec![0x33; EXTENT_SIZE]),
+        ];
+        let edits = vec![
+            (9, Some(plains[0].clone())),
+            (4, Some(plains[1].clone())),
+            (12, Some(plains[2].clone())),
+        ];
+        let mut txn = db.new_transaction().unwrap();
+        store.stage_edits(&mut txn, inode, &edits, 0).await.unwrap();
+
+        assert!(
+            observed_unlocked.load(std::sync::atomic::Ordering::SeqCst),
+            "foreground batch AEAD held the global open-segment mutex"
+        );
+
+        let (segid, region, dir) = {
+            let open = store.open.lock().unwrap();
+            (open.segid, open.buf.clone(), open.dir.clone())
+        };
+        assert_eq!(
+            dir.iter()
+                .map(|entry| (entry.inode, entry.extent))
+                .collect::<Vec<_>>(),
+            vec![(seed_inode, 2), (inode, 9), (inode, 4), (inode, 12)]
+        );
+        let decoded = crate::segment::read_frames_from_region(
+            &store.codec,
+            &region,
+            segid,
+            0,
+            &[(seed_inode, 2), (inode, 9), (inode, 4), (inode, 12)],
+        )
+        .unwrap();
+        assert_eq!(
+            decoded,
+            std::iter::once(seed.to_vec())
+                .chain(plains.clone().map(|plain| plain.to_vec()))
+                .collect::<Vec<_>>()
+        );
+
+        commit(&store, txn).await;
+        for ((extent, _), plain) in edits.iter().zip(plains) {
+            assert_eq!(
+                store
+                    .read(inode, extent * EXTENT_SIZE as u64, EXTENT_SIZE as u64)
+                    .await
+                    .unwrap(),
+                plain
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn configured_seal_threshold_preallocates_the_open_buffer() {
+        let (store, db) = make().await;
+        let store = store.with_seal_threshold(1024);
+        {
+            let open = store.open.lock().unwrap();
+            assert!(open.buf.capacity() >= store.seal_threshold());
+        }
+
+        let mut txn = db.new_transaction().unwrap();
+        store
+            .write(
+                &mut txn,
+                1,
+                0,
+                &Bytes::from(incompressible(91, EXTENT_SIZE)),
+                0,
+            )
+            .await
+            .unwrap();
+        {
+            let open = store.open.lock().unwrap();
+            assert!(open.dir.is_empty(), "threshold write did not rotate");
+            assert!(
+                open.buf.capacity() >= store.seal_threshold(),
+                "rotated open buffer capacity {} is below configured seal threshold {}",
+                open.buf.capacity(),
+                store.seal_threshold()
+            );
+        }
+        store.seal_open().await.unwrap();
     }
 
     #[tokio::test]
