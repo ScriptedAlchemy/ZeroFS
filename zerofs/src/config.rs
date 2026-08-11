@@ -1991,6 +1991,23 @@ min_free_gb = {reserve}"#
     }
 
     #[test]
+    fn writeback_remote_mode_still_requires_the_independent_ssd_journal() {
+        let error = write_and_load(&writeback_sftp_config(
+            16.0,
+            r#"[writeback]
+enabled = true
+dir = "/var/cache/zerofs-writeback"
+ack_mode = "remote"
+memory_size_gb = 16.0
+disk_size_gb = 0.0
+min_free_gb = 0.0"#,
+        ))
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("disk_size_gb"));
+    }
+
+    #[test]
     fn writeback_watermark_hysteresis_must_be_ordered() {
         for (resume, high) in [(0, 95), (95, 95), (96, 95), (85, 101)] {
             let body = format!(

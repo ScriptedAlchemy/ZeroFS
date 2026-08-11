@@ -15,6 +15,7 @@ use object_store::{
 use std::fmt::{self, Display, Formatter};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use tokio::sync::Notify;
 
 /// Knobs shared with the test driving the store. Everything defaults to "no fault".
 #[derive(Debug, Default)]
@@ -32,6 +33,11 @@ pub struct FaultControls {
     truncate_bytes: AtomicUsize,
     gets: AtomicUsize,
     puts: AtomicUsize,
+    block_puts: AtomicBool,
+    active_puts: AtomicUsize,
+    max_active_puts: AtomicUsize,
+    put_activity: Arc<Notify>,
+    put_release: Arc<Notify>,
 }
 
 impl FaultControls {
@@ -57,6 +63,19 @@ impl FaultControls {
     }
     pub fn put_count(&self) -> usize {
         self.puts.load(Ordering::SeqCst)
+    }
+    pub fn block_puts(&self) {
+        self.block_puts.store(true, Ordering::SeqCst);
+    }
+    pub fn release_puts(&self) {
+        self.block_puts.store(false, Ordering::SeqCst);
+        self.put_release.notify_waiters();
+    }
+    pub fn max_active_puts(&self) -> usize {
+        self.max_active_puts.load(Ordering::SeqCst)
+    }
+    pub fn put_activity(&self) -> Arc<Notify> {
+        self.put_activity.clone()
     }
 }
 
@@ -124,6 +143,14 @@ impl ObjectStore for FaultStore {
         self.check_writable("put")?;
         if take_one(&self.ctl.fail_next_puts) {
             return Err(Self::transient("put"));
+        }
+        let _active = ActivePut::enter(self.ctl.clone());
+        while self.ctl.block_puts.load(Ordering::SeqCst) {
+            let notified = self.ctl.put_release.notified();
+            if !self.ctl.block_puts.load(Ordering::SeqCst) {
+                break;
+            }
+            notified.await;
         }
         let result = self.inner.put_opts(location, payload, opts).await?;
         if take_one(&self.ctl.fail_after_puts) {
@@ -201,6 +228,26 @@ impl ObjectStore for FaultStore {
     ) -> object_store::Result<()> {
         self.check_writable("copy")?;
         self.inner.copy_opts(from, to, options).await
+    }
+}
+
+struct ActivePut {
+    controls: Arc<FaultControls>,
+}
+
+impl ActivePut {
+    fn enter(controls: Arc<FaultControls>) -> Self {
+        let active = controls.active_puts.fetch_add(1, Ordering::SeqCst) + 1;
+        controls.max_active_puts.fetch_max(active, Ordering::SeqCst);
+        controls.put_activity.notify_waiters();
+        Self { controls }
+    }
+}
+
+impl Drop for ActivePut {
+    fn drop(&mut self) {
+        self.controls.active_puts.fetch_sub(1, Ordering::SeqCst);
+        self.controls.put_activity.notify_waiters();
     }
 }
 

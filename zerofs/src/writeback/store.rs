@@ -4,6 +4,7 @@ use crate::writeback::journal::Journal;
 use crate::writeback::journaler::{LocalBarrierError, LocalJournaler};
 use crate::writeback::model::{FenceClass, LocalEtag, MutationKind, MutationMode, MutationRecord};
 use crate::writeback::overlay::{OverlayCommitObserver, OverlayIndex, VisibleVersion};
+use crate::writeback::remote::{RemoteBarrierError, RemoteScheduler};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::BoxStream;
@@ -41,6 +42,7 @@ struct WritebackStoreInner {
     admission: Admission,
     disk: DiskAdmission,
     journaler: LocalJournaler,
+    remote: RemoteScheduler,
     incarnation: Uuid,
     next_sequence: AtomicU64,
     key_locks: Vec<Arc<Mutex<()>>>,
@@ -79,9 +81,6 @@ impl WritebackObjectStore {
         journal: Arc<Journal>,
         settings: WritebackSettings,
     ) -> anyhow::Result<Self> {
-        if settings.ack_mode == AckMode::Remote {
-            anyhow::bail!("remote acknowledgement requires the remote scheduler");
-        }
         if settings.memory_bytes == 0 {
             anyhow::bail!("writeback requires a positive independent dirty RAM budget");
         }
@@ -96,7 +95,7 @@ impl WritebackObjectStore {
             snapshot.dirty_blob_bytes,
             available,
         )?;
-        let overlay = OverlayIndex::recover(remote, journal.clone()).await?;
+        let overlay = OverlayIndex::recover(remote.clone(), journal.clone()).await?;
         let observer = Arc::new(OverlayCommitObserver::new(overlay.clone(), journal.clone()));
         let queue_depth = settings.upload_concurrency.saturating_mul(4).max(16);
         let journaler = LocalJournaler::start_with_observer(
@@ -104,6 +103,14 @@ impl WritebackObjectStore {
             admission.clone(),
             queue_depth,
             Some(observer),
+        )?;
+        let remote = RemoteScheduler::start(
+            remote,
+            journal.clone(),
+            overlay.clone(),
+            disk.clone(),
+            journaler.barrier(),
+            settings.upload_concurrency,
         )?;
         Ok(Self {
             inner: Arc::new(WritebackStoreInner {
@@ -113,6 +120,7 @@ impl WritebackObjectStore {
                 admission,
                 disk,
                 journaler,
+                remote,
                 incarnation: snapshot.incarnation,
                 next_sequence: AtomicU64::new(snapshot.local_seq),
                 key_locks: (0..KEY_LOCK_SHARDS)
@@ -127,6 +135,10 @@ impl WritebackObjectStore {
         self.inner.journaler.barrier().wait_local(sequence).await
     }
 
+    pub async fn wait_remote(&self, sequence: u64) -> Result<(), RemoteBarrierError> {
+        self.inner.remote.barrier().wait_remote(sequence).await
+    }
+
     pub fn dirty_ram_bytes(&self) -> u64 {
         self.inner.admission.used_bytes()
     }
@@ -136,8 +148,26 @@ impl WritebackObjectStore {
     }
 
     pub async fn shutdown(&self) -> Result<(), LocalBarrierError> {
+        match self.inner.settings.shutdown_flush {
+            crate::writeback::config::ShutdownFlush::Local => {
+                self.inner.remote.shutdown().await.map_err(|error| {
+                    LocalBarrierError::LocalDurability(format!("remote shutdown failed: {error}"))
+                })?;
+                self.inner.journaler.shutdown().await?;
+            }
+            crate::writeback::config::ShutdownFlush::Remote => {
+                self.inner.journaler.shutdown().await?;
+                let target = self.inner.next_sequence.load(Ordering::Acquire);
+                self.wait_remote(target).await.map_err(|error| {
+                    LocalBarrierError::LocalDurability(format!("remote flush failed: {error}"))
+                })?;
+                self.inner.remote.shutdown().await.map_err(|error| {
+                    LocalBarrierError::LocalDurability(format!("remote shutdown failed: {error}"))
+                })?;
+            }
+        }
         self.inner.disk.close();
-        self.inner.journaler.shutdown().await
+        Ok(())
     }
 
     fn key_lock(&self, path: &Path) -> Arc<Mutex<()>> {
@@ -239,6 +269,10 @@ impl WritebackObjectStore {
                 .wait_local(sequence)
                 .await
                 .map_err(|error| generic_error(format!("local durability failed: {error}")))?;
+        } else if self.inner.settings.ack_mode == AckMode::Remote {
+            self.wait_remote(sequence)
+                .await
+                .map_err(|error| generic_error(format!("remote durability failed: {error}")))?;
         }
         Ok(PutResult {
             e_tag: Some(local_etag.as_str().to_owned()),
@@ -289,6 +323,10 @@ impl WritebackObjectStore {
                 .wait_local(sequence)
                 .await
                 .map_err(|error| generic_error(format!("local durability failed: {error}")))?;
+        } else if self.inner.settings.ack_mode == AckMode::Remote {
+            self.wait_remote(sequence)
+                .await
+                .map_err(|error| generic_error(format!("remote durability failed: {error}")))?;
         }
         Ok(location)
     }
@@ -409,6 +447,10 @@ impl WritebackObjectStore {
                 .wait_local(sequence)
                 .await
                 .map_err(|error| generic_error(format!("local durability failed: {error}")))?;
+        } else if self.inner.settings.ack_mode == AckMode::Remote {
+            self.wait_remote(sequence)
+                .await
+                .map_err(|error| generic_error(format!("remote durability failed: {error}")))?;
         }
         Ok(())
     }
@@ -1058,6 +1100,7 @@ fn generic_error(message: impl Into<String>) -> object_store::Error {
 #[cfg(test)]
 mod tests {
     use super::WritebackObjectStore;
+    use crate::fault_store::{FaultControls, FaultStore};
     use crate::writeback::config::{AckMode, ShutdownFlush, WritebackSettings};
     use crate::writeback::journal::Journal;
     use crate::writeback::model::JournalIdentity;
@@ -1075,6 +1118,37 @@ mod tests {
     use std::time::Duration;
 
     async fn test_store() -> (WritebackObjectStore, Arc<InMemory>, tempfile::TempDir) {
+        test_store_with_remote_drain(false).await
+    }
+
+    async fn test_store_with_remote_drain(
+        enabled: bool,
+    ) -> (WritebackObjectStore, Arc<InMemory>, tempfile::TempDir) {
+        let (store, remote, temp, _controls) = test_store_with_controls(enabled).await;
+        (store, remote, temp)
+    }
+
+    async fn test_store_with_controls(
+        enabled: bool,
+    ) -> (
+        WritebackObjectStore,
+        Arc<InMemory>,
+        tempfile::TempDir,
+        Arc<FaultControls>,
+    ) {
+        test_store_with_options(enabled, AckMode::Memory, ShutdownFlush::Local).await
+    }
+
+    async fn test_store_with_options(
+        enabled: bool,
+        ack_mode: AckMode,
+        shutdown_flush: ShutdownFlush,
+    ) -> (
+        WritebackObjectStore,
+        Arc<InMemory>,
+        tempfile::TempDir,
+        Arc<FaultControls>,
+    ) {
         let temp = tempfile::tempdir().unwrap();
         let journal = Arc::new(
             Journal::open(
@@ -1091,21 +1165,23 @@ mod tests {
             .unwrap(),
         );
         let remote = Arc::new(InMemory::new());
+        let (writeback_remote, controls) = FaultStore::new(remote.clone());
+        controls.partition_writes(!enabled);
         let settings = WritebackSettings {
             dir: temp.path().join("writeback"),
-            ack_mode: AckMode::Memory,
+            ack_mode,
             memory_bytes: 1_000_000,
             disk_bytes: 10_000_000,
             min_free_bytes: 1,
             high_watermark_percent: 95,
             resume_percent: 85,
             upload_concurrency: 4,
-            shutdown_flush: ShutdownFlush::Local,
+            shutdown_flush,
         };
-        let store = WritebackObjectStore::open(remote.clone(), journal, settings)
+        let store = WritebackObjectStore::open(writeback_remote, journal, settings)
             .await
             .unwrap();
-        (store, remote, temp)
+        (store, remote, temp, controls)
     }
 
     #[tokio::test]
@@ -1410,6 +1486,8 @@ mod tests {
     async fn copy_and_rename_recover_from_the_local_journal() {
         let temp = tempfile::tempdir().unwrap();
         let remote = Arc::new(InMemory::new());
+        let (writeback_remote, controls) = FaultStore::new(remote.clone());
+        controls.partition_writes(true);
         let identity = JournalIdentity {
             format_version: 1,
             bucket_id: "bucket-a".to_owned(),
@@ -1430,7 +1508,7 @@ mod tests {
             shutdown_flush: ShutdownFlush::Local,
         };
         let journal = Arc::new(Journal::open(settings.dir.clone(), identity.clone()).unwrap());
-        let store = WritebackObjectStore::open(remote.clone(), journal, settings.clone())
+        let store = WritebackObjectStore::open(writeback_remote.clone(), journal, settings.clone())
             .await
             .unwrap();
         store
@@ -1449,7 +1527,7 @@ mod tests {
         drop(store);
 
         let journal = Arc::new(Journal::open(settings.dir.clone(), identity).unwrap());
-        let recovered = WritebackObjectStore::open(remote, journal, settings)
+        let recovered = WritebackObjectStore::open(writeback_remote, journal, settings)
             .await
             .unwrap();
         assert_eq!(recovered.dirty_ssd_bytes(), 21);
@@ -1668,5 +1746,317 @@ mod tests {
         .await
         .expect("dropped multipart staging was not cleaned");
         store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_mutation_replays_to_remote_and_reclaims_dirty_ssd() {
+        let (store, remote, _temp) = test_store_with_remote_drain(true).await;
+        let location = Path::from("remote-drain");
+        store
+            .put(&location, Bytes::from_static(b"payload").into())
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(3), store.wait_remote(1))
+            .await
+            .expect("remote replay did not advance")
+            .unwrap();
+
+        assert_eq!(
+            remote.get(&location).await.unwrap().bytes().await.unwrap(),
+            Bytes::from_static(b"payload")
+        );
+        assert_eq!(store.dirty_ssd_bytes(), 0);
+        assert_eq!(store.inner.journal.snapshot().unwrap().remote_seq, 1);
+        assert!(store.inner.journal.snapshot().unwrap().records.is_empty());
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn remote_replay_uses_configured_upload_concurrency() {
+        let (store, _remote, _temp, controls) = test_store_with_controls(true).await;
+        controls.block_puts();
+        let puts = (0..4).map(|index| {
+            let store = store.clone();
+            async move {
+                store
+                    .put(
+                        &Path::from(format!("batch/{index}")),
+                        Bytes::from(vec![index; 1024]).into(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        futures::future::join_all(puts).await;
+        store.wait_local(4).await.unwrap();
+
+        let concurrent = tokio::time::timeout(Duration::from_secs(2), async {
+            while controls.max_active_puts() < 4 {
+                controls.put_activity().notified().await;
+            }
+        })
+        .await
+        .is_ok();
+        controls.release_puts();
+        store.wait_remote(4).await.unwrap();
+        store.shutdown().await.unwrap();
+
+        assert!(
+            concurrent,
+            "remote replay never reached four concurrent puts"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_create_recovers_a_lost_success_response_idempotently() {
+        let (store, remote, _temp, controls) = test_store_with_controls(true).await;
+        controls.fail_puts_after_apply(1);
+        let location = Path::from("immutable-create");
+        store
+            .put_opts(
+                &location,
+                Bytes::from_static(b"payload").into(),
+                PutOptions::from(PutMode::Create),
+            )
+            .await
+            .unwrap();
+
+        let recovered = tokio::time::timeout(Duration::from_secs(2), store.wait_remote(1))
+            .await
+            .is_ok();
+        store.shutdown().await.unwrap();
+
+        assert!(recovered, "lost create reply was not recognized on retry");
+        assert_eq!(
+            remote.get(&location).await.unwrap().bytes().await.unwrap(),
+            Bytes::from_static(b"payload")
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_replay_never_overtakes_an_earlier_same_key_mutation() {
+        let (store, remote, _temp, controls) = test_store_with_controls(true).await;
+        controls.block_puts();
+        let location = Path::from("ordered-key");
+        store
+            .put(&location, Bytes::from_static(b"obsolete").into())
+            .await
+            .unwrap();
+        store.delete(&location).await.unwrap();
+        store.wait_local(2).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while controls.max_active_puts() == 0 {
+                controls.put_activity().notified().await;
+            }
+        })
+        .await
+        .expect("the blocked predecessor put never started");
+        tokio::task::yield_now().await;
+        controls.release_puts();
+        store.wait_remote(2).await.unwrap();
+        store.shutdown().await.unwrap();
+
+        assert!(
+            remote.head(&location).await.is_err(),
+            "later delete was overtaken by its blocked predecessor put"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_update_recovers_a_lost_success_response_idempotently() {
+        let (store, remote, _temp, controls) = test_store_with_controls(true).await;
+        let location = Path::from("mutable-manifest");
+        remote
+            .put(&location, Bytes::from_static(b"before").into())
+            .await
+            .unwrap();
+        let predecessor = remote.head(&location).await.unwrap();
+        controls.fail_puts_after_apply(1);
+        store
+            .put_opts(
+                &location,
+                Bytes::from_static(b"after").into(),
+                PutOptions::from(PutMode::Update(UpdateVersion {
+                    e_tag: predecessor.e_tag,
+                    version: predecessor.version,
+                })),
+            )
+            .await
+            .unwrap();
+
+        let recovered = tokio::time::timeout(Duration::from_secs(2), store.wait_remote(1))
+            .await
+            .is_ok();
+        store.shutdown().await.unwrap();
+
+        assert!(recovered, "lost update reply was not recognized on retry");
+        assert_eq!(
+            remote.get(&location).await.unwrap().bytes().await.unwrap(),
+            Bytes::from_static(b"after")
+        );
+    }
+
+    #[tokio::test]
+    async fn local_shutdown_cancels_a_stalled_remote_batch() {
+        let (store, _remote, _temp, controls) = test_store_with_controls(true).await;
+        controls.block_puts();
+        store
+            .put(
+                &Path::from("stalled-upload"),
+                Bytes::from_static(b"payload").into(),
+            )
+            .await
+            .unwrap();
+        store.wait_local(1).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while controls.max_active_puts() == 0 {
+                controls.put_activity().notified().await;
+            }
+        })
+        .await
+        .expect("stalled remote put never started");
+
+        let mut shutdown = tokio::spawn({
+            let store = store.clone();
+            async move { store.shutdown().await }
+        });
+        let bounded = tokio::time::timeout(Duration::from_secs(1), &mut shutdown)
+            .await
+            .is_ok();
+        if !bounded {
+            controls.release_puts();
+            shutdown.await.unwrap().unwrap();
+        }
+
+        assert!(bounded, "local shutdown waited for a stalled remote upload");
+    }
+
+    #[tokio::test]
+    async fn remote_shutdown_flush_drains_the_local_journal() {
+        let (store, remote, _temp, _controls) =
+            test_store_with_options(true, AckMode::Memory, ShutdownFlush::Remote).await;
+        for index in 0..4 {
+            store
+                .put(
+                    &Path::from(format!("shutdown-drain/{index}")),
+                    Bytes::from(vec![index; 1024]).into(),
+                )
+                .await
+                .unwrap();
+        }
+
+        tokio::time::timeout(Duration::from_secs(3), store.shutdown())
+            .await
+            .expect("remote shutdown flush did not finish")
+            .unwrap();
+
+        for index in 0..4 {
+            assert_eq!(
+                remote
+                    .get(&Path::from(format!("shutdown-drain/{index}")))
+                    .await
+                    .unwrap()
+                    .bytes()
+                    .await
+                    .unwrap(),
+                Bytes::from(vec![index; 1024])
+            );
+        }
+        assert_eq!(store.dirty_ssd_bytes(), 0);
+        let snapshot = store.inner.journal.snapshot().unwrap();
+        assert_eq!(snapshot.remote_seq, 4);
+        assert!(snapshot.records.is_empty());
+    }
+
+    #[tokio::test]
+    async fn restart_automatically_resumes_dirty_ssd_replay() {
+        let temp = tempfile::tempdir().unwrap();
+        let remote = Arc::new(InMemory::new());
+        let identity = JournalIdentity {
+            format_version: 1,
+            bucket_id: "bucket-a".to_owned(),
+            backend_endpoint: "memory://remote".to_owned(),
+            database_prefix: "zerofs/pilot".to_owned(),
+            backend_kind: "memory".to_owned(),
+            encryption_key_identity_sha256: [0x77; 32],
+        };
+        let settings = WritebackSettings {
+            dir: temp.path().join("writeback"),
+            ack_mode: AckMode::Memory,
+            memory_bytes: 1_000_000,
+            disk_bytes: 10_000_000,
+            min_free_bytes: 1,
+            high_watermark_percent: 95,
+            resume_percent: 85,
+            upload_concurrency: 4,
+            shutdown_flush: ShutdownFlush::Local,
+        };
+        let (partitioned, controls) = FaultStore::new(remote.clone());
+        controls.partition_writes(true);
+        let first = WritebackObjectStore::open(
+            partitioned,
+            Arc::new(Journal::open(settings.dir.clone(), identity.clone()).unwrap()),
+            settings.clone(),
+        )
+        .await
+        .unwrap();
+        let location = Path::from("restart-dirty");
+        first
+            .put(&location, Bytes::from_static(b"payload").into())
+            .await
+            .unwrap();
+        first.wait_local(1).await.unwrap();
+        first.shutdown().await.unwrap();
+        assert_eq!(first.inner.journal.snapshot().unwrap().dirty_blob_bytes, 7);
+        drop(first);
+
+        let resumed = WritebackObjectStore::open(
+            remote.clone(),
+            Arc::new(Journal::open(settings.dir.clone(), identity).unwrap()),
+            settings,
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), resumed.wait_remote(1))
+            .await
+            .expect("restart did not resume remote replay")
+            .unwrap();
+
+        assert_eq!(
+            remote.get(&location).await.unwrap().bytes().await.unwrap(),
+            Bytes::from_static(b"payload")
+        );
+        assert_eq!(resumed.dirty_ssd_bytes(), 0);
+        resumed.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn remote_outage_retries_are_rate_limited_instead_of_hammering_sftp() {
+        let (store, _remote, _temp, controls) = test_store_with_controls(false).await;
+        store
+            .put(
+                &Path::from("outage-backoff"),
+                Bytes::from_static(b"payload").into(),
+            )
+            .await
+            .unwrap();
+        store.wait_local(1).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while controls.put_count() == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("remote replay never attempted the first upload");
+
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let attempts = controls.put_count();
+        store.shutdown().await.unwrap();
+
+        assert!(
+            attempts <= 3,
+            "remote outage caused {attempts} attempts in 400ms"
+        );
     }
 }

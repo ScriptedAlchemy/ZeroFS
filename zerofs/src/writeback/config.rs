@@ -115,8 +115,10 @@ impl WritebackConfig {
         if memory_bytes == 0 {
             bail!("[writeback] memory_size_gb must be greater than zero when writeback is enabled");
         }
-        if matches!(self.ack_mode, AckMode::Memory | AckMode::Ssd) && disk_bytes == 0 {
-            bail!("[writeback] disk_size_gb must be greater than zero in memory or ssd mode");
+        if disk_bytes == 0 {
+            bail!(
+                "[writeback] disk_size_gb must be greater than zero; every acknowledgement mode uses the independent SSD journal"
+            );
         }
         if disk_bytes > 0 && min_free_bytes == 0 {
             bail!(
