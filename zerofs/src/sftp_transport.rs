@@ -10,7 +10,9 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::{Duration, SystemTime};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, SeekFrom};
+#[cfg(test)]
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -42,6 +44,7 @@ const SFTP_READ_REQUEST_CONCURRENCY: usize = 64;
 
 const SFTP_SESSION_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
 const SFTP_SESSION_CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
+const SFTP_SESSION_FORCE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 const SFTP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const SFTP_IDLE_REAP_INTERVAL: Duration = Duration::from_secs(10);
 const SFTP_IDLE_WARM_FLOOR: usize = 1;
@@ -727,6 +730,7 @@ impl Drop for OpenSshTransportSession {
 }
 
 impl OpenSshTransportSession {
+    #[cfg(test)]
     pub async fn from_streams<W, R>(stdin: W, stdout: R) -> Result<Self, TransportError>
     where
         W: AsyncWrite + Send + 'static,
@@ -1274,23 +1278,34 @@ impl PoolInner {
             let force = CancellationToken::new();
             let closing = transport.close(force.clone());
             tokio::pin!(closing);
-            let result = tokio::select! {
-                result = &mut closing => result,
-                _ = tokio::time::sleep(SFTP_SESSION_CLOSE_TIMEOUT) => {
-                    owner_pool.fail_closed();
-                    let error = TransportError::Close(format!(
-                        "SFTP session close timed out after {}s",
-                        SFTP_SESSION_CLOSE_TIMEOUT.as_secs()
-                    ));
-                    owner_pool.record_close_error(&error);
+            let result = match tokio::time::timeout(SFTP_SESSION_CLOSE_TIMEOUT, &mut closing).await {
+                Ok(result) => result,
+                Err(_) => {
                     force.cancel();
-                    drop(lifetime);
-                    let _ = sender.send(Err(error));
-                    if let Err(error) = closing.await {
-                        tracing::error!(%error, "forced SFTP child/master cleanup failed after close timeout");
-                        owner_pool.record_forced_cleanup_error(&error);
+                    match tokio::time::timeout(
+                        SFTP_SESSION_FORCE_CLEANUP_TIMEOUT,
+                        &mut closing,
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(_) => {
+                            owner_pool.fail_closed();
+                            let error = TransportError::Close(format!(
+                                "forced SFTP session cleanup timed out after {}s",
+                                SFTP_SESSION_FORCE_CLEANUP_TIMEOUT.as_secs()
+                            ));
+                            owner_pool.record_close_error(&error);
+                            let _ = sender.send(Err(error));
+                            if let Err(error) = closing.await {
+                                tracing::error!(%error, "forced SFTP child/master cleanup failed after close timeout");
+                                owner_pool.record_forced_cleanup_error(&error);
+                            }
+                            fail_closed_on_drop.disarm();
+                            drop(lifetime);
+                            return;
+                        }
                     }
-                    return;
                 }
             };
 
@@ -1645,12 +1660,14 @@ fn require_publication_capabilities(capabilities: SftpCapabilities) -> Result<()
     Ok(())
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionDisposition {
     Reuse,
     BrokenOrAmbiguous,
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 pub enum LeaseFinishError<E> {
     Operation {
@@ -1690,14 +1707,6 @@ impl fmt::Debug for SessionLease {
 }
 
 impl SessionLease {
-    pub fn capabilities(&self) -> SftpCapabilities {
-        self.session
-            .as_ref()
-            .expect("lease always owns a session until completion")
-            .transport()
-            .capabilities()
-    }
-
     pub async fn read_object(
         &mut self,
         path: &std::path::Path,
@@ -1870,6 +1879,7 @@ impl SessionLease {
             .map_err(|_| TransportError::Close("SFTP retirement task failed".to_owned()))?
     }
 
+    #[cfg(test)]
     pub async fn finish<T, E>(
         self,
         operation: Result<T, E>,
@@ -2126,6 +2136,55 @@ mod tests {
         }
 
         async fn close(self: Box<Self>, _force: CancellationToken) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct ForcedCleanupFactory {
+        state: Arc<ForcedCleanupState>,
+    }
+
+    #[derive(Debug, Default)]
+    struct ForcedCleanupState {
+        live: AtomicUsize,
+        force_seen: Notify,
+        allow_cleanup: Notify,
+    }
+
+    #[async_trait]
+    impl SessionFactory for ForcedCleanupFactory {
+        async fn open(
+            &self,
+            _force: CancellationToken,
+        ) -> Result<Box<dyn TransportSession>, TransportError> {
+            self.state.live.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(ForcedCleanupSession {
+                state: self.state.clone(),
+            }))
+        }
+    }
+
+    #[derive(Debug)]
+    struct ForcedCleanupSession {
+        state: Arc<ForcedCleanupState>,
+    }
+
+    #[async_trait]
+    impl TransportSession for ForcedCleanupSession {
+        fn capabilities(&self) -> SftpCapabilities {
+            SftpCapabilities {
+                fsync: true,
+                hardlink: true,
+                posix_rename: true,
+            }
+        }
+
+        async fn close(self: Box<Self>, force: CancellationToken) -> Result<(), TransportError> {
+            force.cancelled().await;
+            self.state.force_seen.notify_one();
+            self.state.allow_cleanup.notified().await;
+            self.state.live.fetch_sub(1, Ordering::SeqCst);
             Ok(())
         }
     }
@@ -2703,18 +2762,22 @@ mod tests {
         let lease = pool.checkout(OperationKind::Write).await.unwrap();
 
         let retiring =
-            tokio::time::timeout(std::time::Duration::from_secs(11), lease.retire()).await;
+            tokio::time::timeout(std::time::Duration::from_secs(17), lease.retire()).await;
 
         assert!(matches!(
             retiring,
-            Ok(Err(TransportError::Close(ref message))) if message == "SFTP session close timed out after 10s"
+            Ok(Err(TransportError::Close(ref message))) if message == "forced SFTP session cleanup timed out after 5s"
         ));
         assert!(matches!(
             pool.checkout(OperationKind::Write).await,
             Err(TransportError::PoolClosed)
         ));
         assert_eq!(factory.dials(), 1);
-        assert_eq!(pool.inner.shared.available_permits(), 1);
+        assert_eq!(
+            pool.inner.shared.available_permits(),
+            0,
+            "a still-live session keeps its lifetime permit after the caller timeout"
+        );
         assert_eq!(
             pool.inner
                 .admission
@@ -2743,6 +2806,39 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert!(pool.shutdown().await.is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn successful_forced_cleanup_keeps_pool_open_and_holds_lifetime_capacity() {
+        let factory = ForcedCleanupFactory::default();
+        let pool = Arc::new(
+            SftpSessionPool::new_writable(Arc::new(factory.clone()), 1, 1, 1)
+                .await
+                .unwrap(),
+        );
+        let lease = pool.checkout(OperationKind::Write).await.unwrap();
+        let force_seen = factory.state.force_seen.notified();
+        let retiring = tokio::spawn(async move { lease.retire().await });
+
+        tokio::time::advance(std::time::Duration::from_secs(11)).await;
+        force_seen.await;
+
+        assert!(!pool.inner.closed.load(Ordering::SeqCst));
+        assert_eq!(pool.inner.shared.available_permits(), 0);
+        assert_eq!(factory.state.live.load(Ordering::SeqCst), 1);
+        assert!(!retiring.is_finished());
+
+        factory.state.allow_cleanup.notify_one();
+        retiring.await.unwrap().unwrap();
+        assert!(!pool.inner.closed.load(Ordering::SeqCst));
+        assert_eq!(factory.state.live.load(Ordering::SeqCst), 0);
+
+        pool.checkout(OperationKind::Write)
+            .await
+            .unwrap()
+            .complete()
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

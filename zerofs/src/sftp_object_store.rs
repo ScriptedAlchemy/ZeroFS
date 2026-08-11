@@ -491,10 +491,6 @@ impl SftpObjectStore {
         Ok(Self { pool, prefix })
     }
 
-    pub fn prefix(&self) -> &ObjectPath {
-        &self.prefix
-    }
-
     fn validate_location(
         &self,
         location: &ObjectPath,
