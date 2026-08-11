@@ -112,8 +112,8 @@ impl WritebackConfig {
         let disk_bytes = decimal_gb_to_bytes("disk_size_gb", self.disk_size_gb)?;
         let min_free_bytes = decimal_gb_to_bytes("min_free_gb", self.min_free_gb)?;
 
-        if self.ack_mode == AckMode::Memory && memory_bytes == 0 {
-            bail!("[writeback] memory_size_gb must be greater than zero in memory mode");
+        if memory_bytes == 0 {
+            bail!("[writeback] memory_size_gb must be greater than zero when writeback is enabled");
         }
         if matches!(self.ack_mode, AckMode::Memory | AckMode::Ssd) && disk_bytes == 0 {
             bail!("[writeback] disk_size_gb must be greater than zero in memory or ssd mode");

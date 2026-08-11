@@ -1924,6 +1924,7 @@ encryption_password = "test-password"
             r#"[writeback]
 enabled = true
 dir = "/var/cache/zerofs-writeback"
+memory_size_gb = 16.0
 disk_size_gb = 512.0
 min_free_gb = 256.0"#,
         ))
@@ -1996,6 +1997,7 @@ min_free_gb = {reserve}"#
                 r#"[writeback]
 enabled = true
 dir = "/var/cache/zerofs-writeback"
+memory_size_gb = 16.0
 disk_size_gb = 512.0
 min_free_gb = 256.0
 resume_percent = {resume}
@@ -2019,6 +2021,7 @@ write_concurrency = 4
 [writeback]
 enabled = true
 dir = "/var/cache/zerofs-writeback"
+memory_size_gb = 16.0
 disk_size_gb = 512.0
 min_free_gb = 256.0
 upload_concurrency = 5"#,
@@ -2050,6 +2053,7 @@ min_free_gb = 256.0"#,
             r#"[writeback]
 enabled = true
 dir = "/var/cache/zerofs-writeback"
+memory_size_gb = 16.0
 disk_size_gb = 512.0
 min_free_gb = 256.0"#,
         ))

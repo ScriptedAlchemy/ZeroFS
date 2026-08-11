@@ -8,6 +8,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
+#[async_trait::async_trait]
+pub trait LocalCommitObserver: Send + Sync + 'static {
+    async fn committed(&self, sequence: Sequence) -> AnyResult<()>;
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum LocalBarrierError {
     #[error("local writeback journal is closed")]
@@ -105,20 +110,41 @@ impl LocalJournaler {
         admission: Admission,
         queue_depth: usize,
     ) -> AnyResult<Self> {
+        Self::start_with_observer(journal, admission, queue_depth, None)
+    }
+
+    pub fn start_with_observer(
+        journal: Arc<Journal>,
+        admission: Admission,
+        queue_depth: usize,
+        observer: Option<Arc<dyn LocalCommitObserver>>,
+    ) -> AnyResult<Self> {
         let local_sequence = journal.snapshot()?.local_seq;
-        Ok(Self::start_with_sink(
+        Ok(Self::start_with_sink_and_observer(
             journal,
             admission,
             local_sequence,
             queue_depth,
+            observer,
         ))
     }
 
+    #[cfg(test)]
     fn start_with_sink(
         sink: Arc<dyn LocalJournalSink>,
         admission: Admission,
         local_sequence: Sequence,
         queue_depth: usize,
+    ) -> Self {
+        Self::start_with_sink_and_observer(sink, admission, local_sequence, queue_depth, None)
+    }
+
+    fn start_with_sink_and_observer(
+        sink: Arc<dyn LocalJournalSink>,
+        admission: Admission,
+        local_sequence: Sequence,
+        queue_depth: usize,
+        observer: Option<Arc<dyn LocalCommitObserver>>,
     ) -> Self {
         let (sender, receiver) = mpsc::channel(queue_depth.max(1));
         let (progress_sender, progress) = watch::channel(LocalProgress {
@@ -132,6 +158,7 @@ impl LocalJournaler {
             receiver,
             progress_sender,
             local_sequence,
+            observer,
         ));
         Self {
             inner: Arc::new(LocalJournalerInner {
@@ -232,6 +259,7 @@ async fn run_journaler(
     mut receiver: mpsc::Receiver<JournalCommand>,
     progress: watch::Sender<LocalProgress>,
     mut local_sequence: Sequence,
+    observer: Option<Arc<dyn LocalCommitObserver>>,
 ) {
     while let Some(command) = receiver.recv().await {
         match command {
@@ -261,21 +289,31 @@ async fn run_journaler(
                 let sequence = record.sequence;
                 let result = tokio::task::spawn_blocking(move || {
                     let result = sink.commit(record, payload.as_deref());
-                    if result.is_ok()
-                        && let Some(disk) = disk
-                    {
-                        disk.accept();
-                    }
-                    drop(ram);
-                    result
+                    (result, ram, disk)
                 })
                 .await;
                 match result {
-                    Ok(Ok(_)) => {
+                    Ok((Ok(_), ram, disk)) => {
+                        if let Some(observer) = &observer
+                            && let Err(error) = observer.committed(sequence).await
+                        {
+                            let error = format!("local commit observer failed: {error:#}");
+                            admission.poison(error.clone());
+                            progress.send_modify(|state| state.terminal_error = Some(error));
+                            drop(ram);
+                            drop(disk);
+                            break;
+                        }
+                        if let Some(disk) = disk {
+                            disk.accept();
+                        }
+                        drop(ram);
                         local_sequence = sequence;
                         progress.send_modify(|state| state.local_seq = sequence);
                     }
-                    Ok(Err(error)) => {
+                    Ok((Err(error), ram, disk)) => {
+                        drop(ram);
+                        drop(disk);
                         let error = format!("{error:#}");
                         admission.poison(error.clone());
                         progress.send_modify(|state| state.terminal_error = Some(error));
@@ -312,7 +350,7 @@ fn terminal_or_closed(barrier: &LocalBarrier) -> LocalBarrierError {
 
 #[cfg(test)]
 mod tests {
-    use super::{LocalBarrierError, LocalJournalSink, LocalJournaler};
+    use super::{LocalBarrierError, LocalCommitObserver, LocalJournalSink, LocalJournaler};
     use crate::writeback::admission::{Admission, AdmissionError, DiskAdmission};
     use crate::writeback::journal::Journal;
     use crate::writeback::model::{
@@ -323,6 +361,7 @@ mod tests {
     use sha2::{Digest, Sha256};
     use std::sync::{Arc, Mutex, mpsc};
     use std::time::Duration;
+    use tokio::sync::Notify;
     use tokio::sync::mpsc as tokio_mpsc;
     use uuid::Uuid;
 
@@ -331,6 +370,21 @@ mod tests {
         release: Mutex<mpsc::Receiver<()>>,
         fail_sequence: Option<u64>,
         committed: Mutex<Vec<u64>>,
+    }
+
+    #[derive(Default)]
+    struct BlockingObserver {
+        entered: Notify,
+        release: Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl LocalCommitObserver for BlockingObserver {
+        async fn committed(&self, _sequence: u64) -> Result<()> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(())
+        }
     }
 
     impl LocalJournalSink for BlockingSink {
@@ -415,6 +469,45 @@ mod tests {
                 .is_err()
         );
         release.send(()).unwrap();
+        barrier.wait_local(1).await.unwrap();
+        assert_eq!(admission.used_bytes(), 0);
+        journaler.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dirty_ram_remains_owned_until_overlay_switches_to_the_ssd_blob() {
+        let admission = Admission::new(10);
+        let (entered_tx, mut entered_rx) = tokio_mpsc::unbounded_channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let sink = Arc::new(BlockingSink {
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+            fail_sequence: None,
+            committed: Mutex::new(Vec::new()),
+        });
+        let observer = Arc::new(BlockingObserver::default());
+        let journaler = LocalJournaler::start_with_sink_and_observer(
+            sink,
+            admission.clone(),
+            0,
+            8,
+            Some(observer.clone()),
+        );
+        let ram = admission.reserve(7).await.unwrap().accept();
+        let barrier = journaler
+            .submit_put(
+                put_record(1, b"payload"),
+                Bytes::from_static(b"payload"),
+                ram,
+            )
+            .await
+            .unwrap();
+        assert_eq!(entered_rx.recv().await.unwrap(), 1);
+        release_tx.send(()).unwrap();
+        observer.entered.notified().await;
+
+        assert_eq!(admission.used_bytes(), 7);
+        observer.release.notify_one();
         barrier.wait_local(1).await.unwrap();
         assert_eq!(admission.used_bytes(), 0);
         journaler.shutdown().await.unwrap();

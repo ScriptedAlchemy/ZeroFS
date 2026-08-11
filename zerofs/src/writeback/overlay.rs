@@ -1,4 +1,5 @@
 use crate::writeback::journal::Journal;
+use crate::writeback::journaler::LocalCommitObserver;
 use crate::writeback::model::{LocalEtag, MutationKind, MutationRecord, Sequence};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
@@ -169,6 +170,14 @@ impl OverlayIndex {
         });
     }
 
+    pub async fn remove_sequence(&self, sequence: Sequence) {
+        let mut entries = self.entries.write().await;
+        entries.retain(|_, versions| {
+            versions.retain(|entry| entry.record.sequence != sequence);
+            !versions.is_empty()
+        });
+    }
+
     pub async fn visible_version(
         &self,
         location: &Path,
@@ -308,6 +317,27 @@ impl OverlayIndex {
                 entries.back().cloned().map(|entry| (path.clone(), entry))
             })
             .collect()
+    }
+}
+
+#[derive(Clone)]
+pub struct OverlayCommitObserver {
+    overlay: OverlayIndex,
+    journal: Arc<Journal>,
+}
+
+impl OverlayCommitObserver {
+    pub fn new(overlay: OverlayIndex, journal: Arc<Journal>) -> Self {
+        Self { overlay, journal }
+    }
+}
+
+#[async_trait::async_trait]
+impl LocalCommitObserver for OverlayCommitObserver {
+    async fn committed(&self, sequence: Sequence) -> anyhow::Result<()> {
+        self.overlay
+            .mark_local(sequence, self.journal.clone())
+            .await
     }
 }
 
