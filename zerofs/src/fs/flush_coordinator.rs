@@ -13,6 +13,8 @@ use tokio::task::{AbortHandle, JoinHandle};
 /// memtable is flushed, so a durable manifest never references an un-PUT segment.
 type SealHook =
     Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Result<(), FsError>> + Send>> + Send + Sync>;
+type LocalDurabilityHook =
+    Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Result<(), FsError>> + Send>> + Send + Sync>;
 type Reply = oneshot::Sender<Result<(), FsError>>;
 
 /// Move-only evidence that the shared flush coordinator completed a durability
@@ -39,6 +41,7 @@ enum Request {
 pub struct FlushCoordinator {
     sender: mpsc::UnboundedSender<Request>,
     seal_hook: Arc<OnceLock<SealHook>>,
+    local_durability_hook: Arc<OnceLock<LocalDurabilityHook>>,
     db: Arc<Db>,
     worker: Arc<Mutex<Option<JoinHandle<()>>>>,
     worker_abort: AbortHandle,
@@ -55,6 +58,8 @@ impl FlushCoordinator {
     pub fn new(db: Arc<Db>) -> Self {
         let seal_hook: Arc<OnceLock<SealHook>> = Arc::new(OnceLock::new());
         let hook = Arc::clone(&seal_hook);
+        let local_durability_hook: Arc<OnceLock<LocalDurabilityHook>> = Arc::new(OnceLock::new());
+        let local_durability = Arc::clone(&local_durability_hook);
         let (sender, mut receiver) = mpsc::unbounded_channel::<Request>();
         #[cfg(test)]
         let requested_flushes = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -94,6 +99,10 @@ impl FlushCoordinator {
                     },
                     None => worker_db.flush().await.map_err(|_| FsError::IoError),
                 };
+                let result = match (result, local_durability.get()) {
+                    (Ok(()), Some(wait_local)) => wait_local().await,
+                    (result, _) => result,
+                };
 
                 let close_result = if closer.is_some() && result.is_ok() {
                     worker_db.mark_closing();
@@ -131,6 +140,7 @@ impl FlushCoordinator {
         Self {
             sender,
             seal_hook,
+            local_durability_hook,
             db,
             worker: Arc::new(Mutex::new(Some(worker))),
             worker_abort,
@@ -145,6 +155,15 @@ impl FlushCoordinator {
     /// after the data plane is constructed.
     pub fn set_sealer(&self, hook: SealHook) {
         let _ = self.seal_hook.set(hook);
+    }
+
+    /// Install the post-flush local durability barrier (first call wins).
+    ///
+    /// The worker invokes it only after the data segment is sealed and SlateDB
+    /// flushes its metadata. Writeback uses this point to capture the newest
+    /// accepted object mutation and wait until the SSD journal covers it.
+    pub fn set_local_durability_barrier(&self, hook: LocalDurabilityHook) {
+        let _ = self.local_durability_hook.set(hook);
     }
 
     pub async fn flush(&self) -> Result<(), FsError> {

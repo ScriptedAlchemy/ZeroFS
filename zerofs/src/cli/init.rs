@@ -1127,6 +1127,24 @@ impl ReconciledDb {
         .await
         .context("Failed to initialize filesystem")?;
 
+        if let Some(writeback) = writeback.clone() {
+            fs.flush_coordinator
+                .set_local_durability_barrier(Arc::new(move || {
+                    let writeback = writeback.clone();
+                    Box::pin(async move {
+                        writeback
+                            .wait_local_through_accepted()
+                            .await
+                            .map_err(|error| {
+                                tracing::error!(
+                                    "writeback local durability barrier failed: {error}"
+                                );
+                                crate::fs::errors::FsError::IoError
+                            })
+                    })
+                }));
+        }
+
         let fs = Arc::new(fs);
         // Reclaims open-unlinked inodes once their last open handle is dropped.
         fs.start_reclaim_drainer();

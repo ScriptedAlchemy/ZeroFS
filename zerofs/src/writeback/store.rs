@@ -137,6 +137,16 @@ impl WritebackObjectStore {
         self.inner.journaler.barrier().wait_local(sequence).await
     }
 
+    /// Capture every mutation accepted before this barrier and wait until the
+    /// contiguous local SSD journal covers that sequence.
+    pub async fn wait_local_through_accepted(&self) -> Result<(), LocalBarrierError> {
+        let target = {
+            let _order_guard = self.inner.admission_order.lock().await;
+            self.inner.next_sequence.load(Ordering::Acquire)
+        };
+        self.wait_local(target).await
+    }
+
     pub async fn wait_remote(&self, sequence: u64) -> Result<(), RemoteBarrierError> {
         self.inner.remote.barrier().wait_remote(sequence).await
     }
@@ -1332,6 +1342,26 @@ mod tests {
         store.wait_local(1).await.unwrap();
         assert_eq!(store.dirty_ram_bytes(), 0);
         assert_eq!(store.dirty_ssd_bytes(), 7);
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_barrier_covers_current_accepted_sequence_in_memory_ack_mode() {
+        let (store, _remote, _temp) = test_store().await;
+        store
+            .put(
+                &Path::from("segments/local-barrier"),
+                Bytes::from_static(b"payload").into(),
+            )
+            .await
+            .unwrap();
+
+        store.wait_local_through_accepted().await.unwrap();
+
+        let status = store.status().unwrap();
+        assert_eq!(status.accepted_seq, 1);
+        assert_eq!(status.local_seq, status.accepted_seq);
+        assert_eq!(status.remote_seq, 0);
         store.shutdown().await.unwrap();
     }
 

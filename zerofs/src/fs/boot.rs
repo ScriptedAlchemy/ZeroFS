@@ -427,6 +427,9 @@ mod tests {
 
     use crate::db::SlateDbHandle;
     use crate::fs::inode::Inode;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::Notify;
 
     #[tokio::test]
     async fn test_create_filesystem() {
@@ -452,6 +455,45 @@ mod tests {
         fs.client_fsync_verified(fs.lineage_token.wrapping_add(1))
             .await
             .expect("the explicit ignore_fsync opt-out bypasses lineage verification");
+    }
+
+    #[tokio::test]
+    async fn client_fsync_waits_for_configured_local_durability_barrier() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        fs.flush_coordinator.set_local_durability_barrier({
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            Arc::new(move || {
+                let entered = Arc::clone(&entered);
+                let release = Arc::clone(&release);
+                Box::pin(async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    Ok(())
+                })
+            })
+        });
+
+        let mut fsync = tokio::spawn({
+            let fs = Arc::clone(&fs);
+            async move { fs.client_fsync().await }
+        });
+        entered.notified().await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut fsync)
+                .await
+                .is_err(),
+            "client_fsync returned before the local durability barrier completed"
+        );
+
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), fsync)
+            .await
+            .expect("client_fsync did not resume after local durability")
+            .expect("client_fsync task panicked")
+            .expect("client_fsync failed");
     }
 
     #[tokio::test]
