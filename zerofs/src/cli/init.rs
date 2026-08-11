@@ -716,10 +716,26 @@ impl StartupContext {
         // Retries sit under the prefetcher, so a single-flight window GET rides
         // out a transient error before failing every waiting reader, and above
         // the tracing layer, so each attempt is visible to otrace.
-        let prefetch = Arc::new(crate::object_store_prefetch::PrefetchingObjectStore::new(
-            self.retrying_object_store.clone(),
-            parts_cache,
-        ));
+        let sftp_profile = settings.sftp_endpoint()?.map(|_| {
+            settings
+                .sftp
+                .as_ref()
+                .expect("effective SFTP config")
+                .data_profile()
+        });
+        let prefetch = Arc::new(match sftp_profile {
+            Some(profile) => crate::object_store_prefetch::PrefetchingObjectStore::with_tuning(
+                self.retrying_object_store.clone(),
+                parts_cache,
+                profile.read_cache_part_size_bytes,
+                profile.read_fetch_window_min_bytes,
+                profile.read_fetch_window_max_bytes,
+            ),
+            None => crate::object_store_prefetch::PrefetchingObjectStore::new(
+                self.retrying_object_store.clone(),
+                parts_cache,
+            ),
+        });
         let db_prefix = Path::from(self.actual_db_path.clone());
         let segment_object_store: Arc<dyn object_store::ObjectStore> =
             Arc::new(object_store::prefix::PrefixStore::new(
@@ -1021,12 +1037,12 @@ impl ReconciledDb {
                  and without it un-flushed writes are lost on any crash"
             );
         }
-        let sftp_seal_profile = settings.sftp_endpoint()?.map(|_| {
+        let sftp_data_profile = settings.sftp_endpoint()?.map(|_| {
             settings
                 .sftp
                 .as_ref()
                 .expect("effective SFTP config")
-                .seal_profile()
+                .data_profile()
         });
 
         let db_handle = slatedb.clone();
@@ -1044,8 +1060,8 @@ impl ReconciledDb {
             segment_object_store,
             segment_codec,
             segment_warm,
-            sftp_seal_profile.map(|profile| profile.segment_size_bytes),
-            sftp_seal_profile.map(|profile| profile.max_inflight_seals),
+            sftp_data_profile.map(|profile| profile.segment_size_bytes),
+            sftp_data_profile.map(|profile| profile.max_inflight_seals),
         )
         .await
         .context("Failed to initialize filesystem")?;

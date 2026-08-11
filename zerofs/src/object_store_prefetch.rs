@@ -68,19 +68,28 @@ struct AccessHistory {
     streams: [Stream; MAX_STREAMS],
     len: usize,
     stride_limit: u64,
+    fetch_window_min: usize,
+    fetch_window_max: usize,
 }
 
 impl AccessHistory {
+    #[cfg(test)]
     fn new(part_size: usize) -> Self {
+        Self::with_windows(part_size, FETCH_WINDOW_MIN, FETCH_WINDOW_MAX)
+    }
+
+    fn with_windows(part_size: usize, fetch_window_min: usize, fetch_window_max: usize) -> Self {
         Self {
             streams: [Stream {
                 last_offset: u64::MAX,
                 last_end: u64::MAX,
-                fetch_window: FETCH_WINDOW_MIN,
+                fetch_window: fetch_window_min,
                 fetched_until: 0,
             }; MAX_STREAMS],
             len: 0,
             stride_limit: part_size as u64 * 4,
+            fetch_window_min,
+            fetch_window_max,
         }
     }
 
@@ -89,7 +98,7 @@ impl AccessHistory {
             let s = &mut self.streams[i];
             s.last_offset = offset;
             s.last_end = offset.saturating_add(len);
-            s.fetch_window = (s.fetch_window * 2).min(FETCH_WINDOW_MAX);
+            s.fetch_window = (s.fetch_window * 2).min(self.fetch_window_max);
 
             // Refill the prefetch frontier to PREFETCH_DEPTH_WINDOWS ahead of the
             // read, once the stream has proven sequential (window ramped past the
@@ -97,7 +106,7 @@ impl AccessHistory {
             // only; the caller confirms coverage via note_fetch for the windows it
             // actually arranged, so a dropped candidate can't leave a phantom hole.
             let mut async_prefetch = Vec::new();
-            if s.fetch_window > FETCH_WINDOW_MIN && s.fetched_until > offset {
+            if s.fetch_window > self.fetch_window_min && s.fetched_until > offset {
                 let window = s.fetch_window as u64;
                 let target = offset + PREFETCH_DEPTH_WINDOWS as u64 * window;
                 let mut cursor = s.fetched_until;
@@ -124,7 +133,7 @@ impl AccessHistory {
         // zone must not inherit an 8 MiB window over cold bytes.
         if self.find_lagging_stream(offset, len).is_some() {
             return RecordDecision {
-                fetch_window: FETCH_WINDOW_MIN,
+                fetch_window: self.fetch_window_min,
                 async_prefetch: Vec::new(),
             };
         }
@@ -140,12 +149,12 @@ impl AccessHistory {
         self.streams[slot] = Stream {
             last_offset: offset,
             last_end: offset.saturating_add(len),
-            fetch_window: FETCH_WINDOW_MIN,
+            fetch_window: self.fetch_window_min,
             fetched_until: offset,
         };
 
         RecordDecision {
-            fetch_window: FETCH_WINDOW_MIN,
+            fetch_window: self.fetch_window_min,
             async_prefetch: Vec::new(),
         }
     }
@@ -245,6 +254,8 @@ struct CachedHead {
 pub struct PrefetchingObjectStore {
     inner: Arc<dyn ObjectStore>,
     part_size_bytes: usize,
+    fetch_window_min_bytes: usize,
+    fetch_window_max_bytes: usize,
     parts: HybridCache<PartKey, Bytes>,
     heads: Cache<Path, Arc<CachedHead>>,
     access_tracker: Cache<Path, Arc<Mutex<AccessHistory>>>,
@@ -302,9 +313,35 @@ impl PrefetchingObjectStore {
         parts: HybridCache<PartKey, Bytes>,
         part_size_bytes: usize,
     ) -> Self {
+        Self::with_tuning(
+            inner,
+            parts,
+            part_size_bytes,
+            FETCH_WINDOW_MIN,
+            FETCH_WINDOW_MAX,
+        )
+    }
+
+    pub fn with_tuning(
+        inner: Arc<dyn ObjectStore>,
+        parts: HybridCache<PartKey, Bytes>,
+        part_size_bytes: usize,
+        fetch_window_min_bytes: usize,
+        fetch_window_max_bytes: usize,
+    ) -> Self {
         assert!(
             part_size_bytes > 0 && part_size_bytes.is_multiple_of(1024),
             "part_size_bytes must be a positive multiple of 1024"
+        );
+        assert!(
+            fetch_window_min_bytes >= part_size_bytes
+                && fetch_window_min_bytes.is_multiple_of(1024),
+            "fetch_window_min_bytes must be at least one cache part and a multiple of 1024"
+        );
+        assert!(
+            fetch_window_max_bytes >= fetch_window_min_bytes
+                && fetch_window_max_bytes.is_multiple_of(1024),
+            "fetch_window_max_bytes must be at least the minimum and a multiple of 1024"
         );
 
         let heads = foyer::CacheBuilder::new(HEADS_CAPACITY_ENTRIES)
@@ -319,6 +356,8 @@ impl PrefetchingObjectStore {
         Self {
             inner,
             part_size_bytes,
+            fetch_window_min_bytes,
+            fetch_window_max_bytes,
             parts,
             heads,
             access_tracker,
@@ -373,7 +412,11 @@ impl PrefetchingObjectStore {
             .get(location)
             .map(|e| e.value().clone())
             .unwrap_or_else(|| {
-                let hist = Arc::new(Mutex::new(AccessHistory::new(self.part_size_bytes)));
+                let hist = Arc::new(Mutex::new(AccessHistory::with_windows(
+                    self.part_size_bytes,
+                    self.fetch_window_min_bytes,
+                    self.fetch_window_max_bytes,
+                )));
                 self.access_tracker.insert(location.clone(), hist.clone());
                 hist
             });
@@ -1405,6 +1448,15 @@ mod tests {
         inner: Arc<dyn ObjectStore>,
         part_size: usize,
     ) -> (PrefetchingObjectStore, TempDir) {
+        store_over_with_tuning(inner, part_size, FETCH_WINDOW_MIN, FETCH_WINDOW_MAX).await
+    }
+
+    async fn store_over_with_tuning(
+        inner: Arc<dyn ObjectStore>,
+        part_size: usize,
+        fetch_window_min: usize,
+        fetch_window_max: usize,
+    ) -> (PrefetchingObjectStore, TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let parts = HybridCacheBuilder::new()
             .with_name("test-parts")
@@ -1425,9 +1477,66 @@ mod tests {
             .await
             .unwrap();
         (
-            PrefetchingObjectStore::with_options(inner, parts, part_size),
+            PrefetchingObjectStore::with_tuning(
+                inner,
+                parts,
+                part_size,
+                fetch_window_min,
+                fetch_window_max,
+            ),
             dir,
         )
+    }
+
+    #[tokio::test]
+    async fn sftp_tuning_hydrates_one_mib_first_then_ramps_to_segment_windows() {
+        const MIB: usize = 1024 * 1024;
+        let mem = Arc::new(InMemory::new());
+        let path = Path::from("segments/aa/large");
+        mem.put(&path, vec![0x5Au8; 64 * MIB].into()).await.unwrap();
+        let ranges = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let backend: Arc<dyn ObjectStore> = Arc::new(RangeRecordingStore {
+            inner: mem,
+            ranges: ranges.clone(),
+        });
+        let (store, _dir) = store_over_with_tuning(backend, MIB, MIB, 16 * MIB).await;
+
+        for part in 0..8u64 {
+            let start = part * MIB as u64;
+            let result = store
+                .get_opts(
+                    &path,
+                    GetOptions {
+                        range: Some(GetRange::Bounded(start..start + 1)),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.bytes().await.unwrap().as_ref(), &[0x5A]);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let recorded = ranges.lock().unwrap();
+        let bounded = recorded
+            .iter()
+            .filter_map(|range| match range {
+                GetRange::Bounded(range) => Some(range.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(bounded.first().unwrap(), &(0..MIB as u64));
+        assert!(
+            bounded
+                .iter()
+                .any(|range| range.end - range.start == 16 * MIB as u64),
+            "sequential reads never reached the configured 16 MiB segment window: {bounded:?}"
+        );
+        assert!(
+            bounded
+                .iter()
+                .all(|range| range.end - range.start <= 16 * MIB as u64)
+        );
     }
 
     // A burst of concurrent reads whose parts fall inside one prefetch window must

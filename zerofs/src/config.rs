@@ -189,12 +189,20 @@ pub struct SftpConfig {
     /// concurrently instead of contending on disjoint writes to one large file.
     #[serde(default = "default_sftp_segment_size_mib")]
     pub segment_size_mib: usize,
+    /// Aligned SSD/RAM cache part used for cold segment reads. A larger part
+    /// amortizes SFTP open/stat/header latency while the adaptive prefetcher
+    /// still bounds random-read amplification.
+    #[serde(default = "default_sftp_read_cache_part_size_kib")]
+    pub read_cache_part_size_kib: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SftpSealProfile {
+pub struct SftpDataProfile {
     pub segment_size_bytes: usize,
     pub max_inflight_seals: usize,
+    pub read_cache_part_size_bytes: usize,
+    pub read_fetch_window_min_bytes: usize,
+    pub read_fetch_window_max_bytes: usize,
 }
 
 impl Default for SftpConfig {
@@ -206,6 +214,7 @@ impl Default for SftpConfig {
             read_concurrency: default_sftp_direction_concurrency(),
             write_concurrency: default_sftp_direction_concurrency(),
             segment_size_mib: default_sftp_segment_size_mib(),
+            read_cache_part_size_kib: default_sftp_read_cache_part_size_kib(),
         }
     }
 }
@@ -249,13 +258,23 @@ impl SftpConfig {
         if !(8..=256).contains(&self.segment_size_mib) {
             anyhow::bail!("[sftp] segment_size_mib must be between 8 and 256");
         }
+        if !(256..=8192).contains(&self.read_cache_part_size_kib)
+            || !self.read_cache_part_size_kib.is_power_of_two()
+        {
+            anyhow::bail!(
+                "[sftp] read_cache_part_size_kib must be a power of two between 256 and 8192"
+            );
+        }
         Ok(())
     }
 
-    pub fn seal_profile(&self) -> SftpSealProfile {
-        SftpSealProfile {
+    pub fn data_profile(&self) -> SftpDataProfile {
+        SftpDataProfile {
             segment_size_bytes: self.segment_size_mib * 1024 * 1024,
             max_inflight_seals: self.write_concurrency,
+            read_cache_part_size_bytes: self.read_cache_part_size_kib * 1024,
+            read_fetch_window_min_bytes: self.read_cache_part_size_kib * 1024,
+            read_fetch_window_max_bytes: self.segment_size_mib * 1024 * 1024,
         }
     }
 }
@@ -278,6 +297,10 @@ const fn default_sftp_direction_concurrency() -> usize {
 
 const fn default_sftp_segment_size_mib() -> usize {
     32
+}
+
+const fn default_sftp_read_cache_part_size_kib() -> usize {
+    1024
 }
 
 /// Parsed endpoint information for transport setup.
@@ -1486,6 +1509,7 @@ impl Settings {
         toml_string.push_str("# read_concurrency = 7\n");
         toml_string.push_str("# write_concurrency = 7\n");
         toml_string.push_str("# segment_size_mib = 32\n");
+        toml_string.push_str("# read_cache_part_size_kib = 1024\n");
 
         toml_string.push_str("\n# Anonymous telemetry (enabled by default)\n");
         toml_string.push_str(
@@ -1826,6 +1850,7 @@ encryption_password = "test-password"
         assert_eq!(sftp.read_concurrency, 7);
         assert_eq!(sftp.write_concurrency, 7);
         assert_eq!(sftp.segment_size_mib, 32);
+        assert_eq!(sftp.read_cache_part_size_kib, 1024);
 
         let endpoint = settings.sftp_endpoint().unwrap().expect("SFTP endpoint");
         assert_eq!(endpoint.host, "example.com");
@@ -1856,16 +1881,19 @@ encryption_password = "test-password"
     }
 
     #[test]
-    fn sftp_seal_profile_uses_segment_size_and_write_limit() {
+    fn sftp_data_profile_drives_segment_writes_and_cold_read_hydration() {
         let settings = write_and_load(&sftp_config(
             "sftp://alice@example.com/data",
-            "[sftp]\nknown_hosts = \"/tmp/known_hosts\"\nwrite_concurrency = 3\nsegment_size_mib = 64",
+            "[sftp]\nknown_hosts = \"/tmp/known_hosts\"\nwrite_concurrency = 3\nsegment_size_mib = 64\nread_cache_part_size_kib = 2048",
         ))
         .unwrap();
-        let profile = settings.sftp.unwrap().seal_profile();
+        let profile = settings.sftp.unwrap().data_profile();
 
         assert_eq!(profile.segment_size_bytes, 64 * 1024 * 1024);
         assert_eq!(profile.max_inflight_seals, 3);
+        assert_eq!(profile.read_cache_part_size_bytes, 2 * 1024 * 1024);
+        assert_eq!(profile.read_fetch_window_min_bytes, 2 * 1024 * 1024);
+        assert_eq!(profile.read_fetch_window_max_bytes, 64 * 1024 * 1024);
     }
 
     #[test]
