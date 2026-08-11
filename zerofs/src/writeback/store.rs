@@ -12,14 +12,19 @@ use object_store::path::Path;
 use object_store::{
     CopyMode, CopyOptions, Extensions, GetOptions, GetResult, ListResult, MultipartUpload,
     ObjectMeta, ObjectStore, PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult,
-    RenameOptions, RenameTargetMode, UpdateVersion,
+    RenameOptions, RenameTargetMode, UpdateVersion, UploadPart,
 };
 use sha2::{Digest, Sha256};
 use std::collections::hash_map::DefaultHasher;
+use std::fs::{self, OpenOptions};
 use std::hash::{Hash, Hasher};
-use std::sync::Arc;
+use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::{Path as FilePath, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::sync::{Mutex, OwnedMutexGuard};
+use std::sync::{Arc, Mutex as StdMutex};
+use tokio::sync::{Mutex, Notify, OwnedMutexGuard};
 use uuid::Uuid;
 
 const KEY_LOCK_SHARDS: usize = 256;
@@ -444,13 +449,21 @@ impl ObjectStore for WritebackObjectStore {
 
     async fn put_multipart_opts(
         &self,
-        _location: &Path,
-        _options: PutMultipartOptions,
+        location: &Path,
+        options: PutMultipartOptions,
     ) -> object_store::Result<Box<dyn MultipartUpload>> {
-        Err(object_store::Error::NotImplemented {
-            operation: "put_multipart_opts".to_owned(),
-            implementer: "WritebackObjectStore".to_owned(),
-        })
+        let staging = create_multipart_staging(&self.inner.settings.dir).map_err(|error| {
+            generic_error(format!("failed to create multipart staging: {error}"))
+        })?;
+        Ok(Box::new(WritebackMultipartUpload {
+            store: self.clone(),
+            location: location.clone(),
+            options,
+            staging: Some(staging),
+            state: Arc::new(StdMutex::new(MultipartState::default())),
+            notify: Arc::new(Notify::new()),
+            terminal: false,
+        }))
     }
 
     async fn get_opts(
@@ -546,6 +559,423 @@ impl ObjectStore for WritebackObjectStore {
     }
 }
 
+#[derive(Debug)]
+struct WritebackMultipartUpload {
+    store: WritebackObjectStore,
+    location: Path,
+    options: PutMultipartOptions,
+    staging: Option<PathBuf>,
+    state: Arc<StdMutex<MultipartState>>,
+    notify: Arc<Notify>,
+    terminal: bool,
+}
+
+#[derive(Debug, Default)]
+struct MultipartState {
+    parts: Vec<MultipartPart>,
+    active: usize,
+    aborted: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MultipartPart {
+    len: u64,
+    completed: bool,
+}
+
+struct ActivePartGuard {
+    state: Arc<StdMutex<MultipartState>>,
+    notify: Arc<Notify>,
+    index: usize,
+    active: bool,
+}
+
+impl ActivePartGuard {
+    fn finish(mut self, completed: bool) -> bool {
+        let mut state = self.state.lock().unwrap();
+        state.active = state
+            .active
+            .checked_sub(1)
+            .expect("active multipart part accounting underflow");
+        if completed && !state.aborted {
+            state.parts[self.index].completed = true;
+        }
+        let aborted = state.aborted;
+        self.active = false;
+        drop(state);
+        self.notify.notify_waiters();
+        aborted
+    }
+}
+
+impl Drop for ActivePartGuard {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let mut state = self.state.lock().unwrap();
+        state.active = state
+            .active
+            .checked_sub(1)
+            .expect("active multipart part accounting underflow");
+        drop(state);
+        self.notify.notify_waiters();
+    }
+}
+
+#[async_trait]
+impl MultipartUpload for WritebackMultipartUpload {
+    fn put_part(&mut self, data: PutPayload) -> UploadPart {
+        if self.terminal {
+            return Box::pin(async {
+                Err(generic_error(
+                    "multipart upload is already completed or aborted",
+                ))
+            });
+        }
+        let Ok(len) = u64::try_from(data.content_length()) else {
+            return Box::pin(async { Err(generic_error("multipart part is too large")) });
+        };
+        let index = {
+            let mut state = self.state.lock().unwrap();
+            let Some(total) = state
+                .parts
+                .iter()
+                .try_fold(len, |total, part| total.checked_add(part.len))
+            else {
+                return Box::pin(async { Err(generic_error("multipart length overflow")) });
+            };
+            if total > self.store.inner.settings.disk_bytes {
+                return Box::pin(async {
+                    Err(generic_error(
+                        "multipart object exceeds the dirty SSD budget",
+                    ))
+                });
+            }
+            let index = state.parts.len();
+            state.parts.push(MultipartPart {
+                len,
+                completed: false,
+            });
+            index
+        };
+        let staging = self.staging.clone();
+        let state = self.state.clone();
+        let notify = self.notify.clone();
+        let min_free_bytes = self.store.inner.settings.min_free_bytes;
+        Box::pin(async move {
+            let staging = staging.ok_or_else(|| generic_error("multipart staging is missing"))?;
+            {
+                let mut state = state.lock().unwrap();
+                if state.aborted {
+                    return Err(generic_error("multipart upload was aborted"));
+                }
+                state.active += 1;
+            }
+            let guard = ActivePartGuard {
+                state: state.clone(),
+                notify,
+                index,
+                active: true,
+            };
+            let part_path = staging.join(format!("part-{index:020}"));
+            let write = match tokio::task::spawn_blocking(move || {
+                write_multipart_part(&part_path, data, min_free_bytes)
+            })
+            .await
+            {
+                Ok(result) => result.map_err(|error| {
+                    generic_error(format!("multipart part write failed: {error}"))
+                }),
+                Err(error) => Err(generic_error(format!(
+                    "multipart part task failed: {error}"
+                ))),
+            };
+            let aborted = guard.finish(write.is_ok());
+            if aborted {
+                Err(generic_error("multipart upload was aborted"))
+            } else {
+                write
+            }
+        })
+    }
+
+    async fn complete(&mut self) -> object_store::Result<PutResult> {
+        if self.terminal {
+            return Err(generic_error(
+                "multipart upload is already completed or aborted",
+            ));
+        }
+        let (part_lengths, total_len) = {
+            let state = self.state.lock().unwrap();
+            if state.aborted {
+                return Err(generic_error("multipart upload was aborted"));
+            }
+            if state.active != 0 || state.parts.iter().any(|part| !part.completed) {
+                return Err(generic_error(
+                    "multipart upload completed before every part future finished",
+                ));
+            }
+            let total = state
+                .parts
+                .iter()
+                .try_fold(0_u64, |total, part| total.checked_add(part.len));
+            (
+                state.parts.iter().map(|part| part.len).collect::<Vec<_>>(),
+                total.ok_or_else(|| generic_error("multipart length overflow"))?,
+            )
+        };
+        let staging = self
+            .staging
+            .take()
+            .ok_or_else(|| generic_error("multipart staging is missing"))?;
+        self.terminal = true;
+        let store = self.store.clone();
+        let location = self.location.clone();
+        let options = self.options.clone();
+        tokio::spawn(async move {
+            complete_multipart(store, location, options, staging, part_lengths, total_len).await
+        })
+        .await
+        .map_err(|error| generic_error(format!("owned multipart completion failed: {error}")))?
+    }
+
+    async fn abort(&mut self) -> object_store::Result<()> {
+        if self.terminal {
+            return Ok(());
+        }
+        self.terminal = true;
+        let staging = self.staging.take();
+        {
+            self.state.lock().unwrap().aborted = true;
+        }
+        wait_for_multipart_parts(&self.state, &self.notify).await;
+        if let Some(staging) = staging {
+            cleanup_multipart_staging(staging).await?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for WritebackMultipartUpload {
+    fn drop(&mut self) {
+        let Some(staging) = self.staging.take() else {
+            return;
+        };
+        self.state.lock().unwrap().aborted = true;
+        let state = self.state.clone();
+        let notify = self.notify.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                wait_for_multipart_parts(&state, &notify).await;
+                if let Err(error) = cleanup_multipart_staging(staging).await {
+                    tracing::warn!(%error, "failed to clean dropped writeback multipart staging");
+                }
+            });
+        } else if let Err(error) = remove_private_directory(&staging) {
+            tracing::warn!(%error, "failed to clean dropped writeback multipart staging");
+        }
+    }
+}
+
+async fn complete_multipart(
+    store: WritebackObjectStore,
+    location: Path,
+    options: PutMultipartOptions,
+    staging: PathBuf,
+    part_lengths: Vec<u64>,
+    total_len: u64,
+) -> object_store::Result<PutResult> {
+    let mut cleanup = MultipartCleanupGuard::new(staging.clone());
+    let ram = store
+        .inner
+        .admission
+        .reserve(total_len)
+        .await
+        .map_err(|error| generic_error(format!("dirty RAM admission failed: {error}")))?
+        .accept();
+    let available = fs4::available_space(&store.inner.settings.dir)
+        .map_err(|error| generic_error(format!("failed to inspect writeback SSD: {error}")))?;
+    let disk = store
+        .inner
+        .disk
+        .reserve(total_len, available)
+        .await
+        .map_err(|error| generic_error(format!("dirty SSD admission failed: {error}")))?;
+    let read_staging = staging.clone();
+    let bytes = tokio::task::spawn_blocking(move || {
+        read_multipart_parts(&read_staging, &part_lengths, total_len)
+    })
+    .await
+    .map_err(|error| generic_error(format!("multipart assembly task failed: {error}")))?
+    .map_err(|error| generic_error(format!("multipart assembly failed: {error}")))?;
+    let put_options = PutOptions {
+        mode: PutMode::Overwrite,
+        tags: options.tags,
+        attributes: options.attributes,
+        extensions: options.extensions,
+    };
+    let owned = store.clone();
+    let result = tokio::spawn(async move {
+        owned
+            .owned_put(location, bytes, put_options, ram, disk)
+            .await
+    })
+    .await
+    .map_err(|error| generic_error(format!("owned multipart put failed: {error}")))?;
+    match result {
+        Ok(result) => {
+            cleanup_multipart_staging(staging).await?;
+            cleanup.disarm();
+            Ok(result)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+struct MultipartCleanupGuard {
+    staging: Option<PathBuf>,
+}
+
+impl MultipartCleanupGuard {
+    fn new(staging: PathBuf) -> Self {
+        Self {
+            staging: Some(staging),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.staging = None;
+    }
+}
+
+impl Drop for MultipartCleanupGuard {
+    fn drop(&mut self) {
+        if let Some(staging) = self.staging.take()
+            && let Err(error) = remove_private_directory(&staging)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(%error, "failed to clean failed writeback multipart staging");
+        }
+    }
+}
+
+async fn wait_for_multipart_parts(state: &StdMutex<MultipartState>, notify: &Notify) {
+    loop {
+        let notified = notify.notified();
+        if state.lock().unwrap().active == 0 {
+            return;
+        }
+        notified.await;
+    }
+}
+
+async fn cleanup_multipart_staging(staging: PathBuf) -> object_store::Result<()> {
+    tokio::task::spawn_blocking(move || remove_private_directory(&staging))
+        .await
+        .map_err(|error| generic_error(format!("multipart cleanup task failed: {error}")))?
+        .map_err(|error| generic_error(format!("multipart cleanup failed: {error}")))
+}
+
+fn create_multipart_staging(writeback_root: &FilePath) -> std::io::Result<PathBuf> {
+    let root = writeback_root.join("tmp").join("multipart");
+    match fs::create_dir(&root) {
+        Ok(()) => set_directory_mode(&root)?,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+    validate_private_directory(&root)?;
+    let staging = root.join(Uuid::new_v4().to_string());
+    fs::create_dir(&staging)?;
+    set_directory_mode(&staging)?;
+    Ok(staging)
+}
+
+fn write_multipart_part(
+    path: &FilePath,
+    payload: PutPayload,
+    min_free_bytes: u64,
+) -> std::io::Result<()> {
+    let len = u64::try_from(payload.content_length())
+        .map_err(|_| std::io::Error::other("multipart part length exceeds u64"))?;
+    let available = fs4::available_space(path.parent().unwrap_or(path))?;
+    if available < min_free_bytes.saturating_add(len) {
+        return Err(std::io::Error::other(
+            "multipart part would consume the writeback filesystem reserve",
+        ));
+    }
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    let mut file = options.open(path)?;
+    #[cfg(unix)]
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    for chunk in payload {
+        file.write_all(&chunk)?;
+    }
+    file.sync_all()?;
+    Ok(())
+}
+
+fn read_multipart_parts(
+    staging: &FilePath,
+    part_lengths: &[u64],
+    total_len: u64,
+) -> std::io::Result<Bytes> {
+    let capacity = usize::try_from(total_len)
+        .map_err(|_| std::io::Error::other("multipart object exceeds addressable memory"))?;
+    let mut assembled = Vec::with_capacity(capacity);
+    for (index, expected_len) in part_lengths.iter().copied().enumerate() {
+        let path = staging.join(format!("part-{index:020}"));
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        options.custom_flags(libc::O_NOFOLLOW);
+        let mut file = options.open(path)?;
+        if file.metadata()?.len() != expected_len {
+            return Err(std::io::Error::other("multipart part length mismatch"));
+        }
+        file.read_to_end(&mut assembled)?;
+    }
+    if assembled.len() != capacity {
+        return Err(std::io::Error::other("multipart assembled length mismatch"));
+    }
+    Ok(Bytes::from(assembled))
+}
+
+fn remove_private_directory(path: &FilePath) -> std::io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(std::io::Error::other(
+            "multipart staging path is not a private directory",
+        ));
+    }
+    fs::remove_dir_all(path)
+}
+
+fn validate_private_directory(path: &FilePath) -> std::io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(std::io::Error::other(
+            "multipart staging root is not a directory",
+        ));
+    }
+    #[cfg(unix)]
+    if metadata.permissions().mode() & 0o777 != 0o700 {
+        return Err(std::io::Error::other(
+            "multipart staging root is not mode 0700",
+        ));
+    }
+    Ok(())
+}
+
+fn set_directory_mode(path: &FilePath) -> std::io::Result<()> {
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
 fn validate_put_mode(
     location: &Path,
     mode: &PutMode,
@@ -639,6 +1069,8 @@ mod tests {
         CopyMode, CopyOptions, ObjectStore, ObjectStoreExt, PutMode, PutOptions, RenameOptions,
         RenameTargetMode, UpdateVersion,
     };
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -1094,6 +1526,147 @@ mod tests {
         .await
         .expect("owned copy did not finish after caller cancellation");
         assert_eq!(payload, Bytes::from_static(b"payload"));
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn multipart_parts_are_private_ordered_and_publish_as_one_mutation() {
+        let (store, _remote, _temp) = test_store().await;
+        let location = Path::from("multipart-object");
+        let before = store.inner.journal.snapshot().unwrap().local_seq;
+        let mut upload = store.put_multipart(&location).await.unwrap();
+        let first = upload.put_part(Bytes::from_static(b"first-").into());
+        let second = upload.put_part(Bytes::from_static(b"second").into());
+        futures::future::try_join(second, first).await.unwrap();
+
+        assert!(store.get(&location).await.is_err());
+        let result = upload.complete().await.unwrap();
+        assert!(
+            result
+                .e_tag
+                .as_deref()
+                .is_some_and(|etag| etag.starts_with("wb:"))
+        );
+        store.wait_local(before + 1).await.unwrap();
+        assert_eq!(
+            store.inner.journal.snapshot().unwrap().local_seq,
+            before + 1
+        );
+        assert_eq!(
+            store.get(&location).await.unwrap().bytes().await.unwrap(),
+            Bytes::from_static(b"first-second")
+        );
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn multipart_abort_removes_private_parts_without_a_visible_mutation() {
+        let (store, _remote, _temp) = test_store().await;
+        let location = Path::from("aborted-object");
+        let mut upload = store.put_multipart(&location).await.unwrap();
+        upload
+            .put_part(Bytes::from_static(b"private").into())
+            .await
+            .unwrap();
+        let staging_root = store.inner.settings.dir.join("tmp/multipart");
+        assert_eq!(std::fs::read_dir(&staging_root).unwrap().count(), 1);
+
+        upload.abort().await.unwrap();
+
+        assert_eq!(std::fs::read_dir(&staging_root).unwrap().count(), 0);
+        assert!(store.get(&location).await.is_err());
+        assert_eq!(store.inner.journal.snapshot().unwrap().local_seq, 0);
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn multipart_abort_does_not_wait_for_an_unpolled_part_future() {
+        let (store, _remote, _temp) = test_store().await;
+        let location = Path::from("aborted-unpolled-object");
+        let mut upload = store.put_multipart(&location).await.unwrap();
+        let unpolled = upload.put_part(Bytes::from_static(b"never-started").into());
+
+        tokio::time::timeout(Duration::from_secs(1), upload.abort())
+            .await
+            .expect("abort waited for an unpolled part")
+            .unwrap();
+        assert!(unpolled.await.is_err());
+        let staging_root = store.inner.settings.dir.join("tmp/multipart");
+        assert_eq!(std::fs::read_dir(&staging_root).unwrap().count(), 0);
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn multipart_assembly_failure_cleans_staging_and_publishes_nothing() {
+        let (store, _remote, _temp) = test_store().await;
+        let location = Path::from("corrupt-multipart-object");
+        let mut upload = store.put_multipart(&location).await.unwrap();
+        upload
+            .put_part(Bytes::from_static(b"payload").into())
+            .await
+            .unwrap();
+        let staging_root = store.inner.settings.dir.join("tmp/multipart");
+        let staging = std::fs::read_dir(&staging_root)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(staging.join("part-00000000000000000000"))
+            .unwrap()
+            .set_len(1)
+            .unwrap();
+
+        assert!(upload.complete().await.is_err());
+        assert_eq!(std::fs::read_dir(&staging_root).unwrap().count(), 0);
+        assert!(store.get(&location).await.is_err());
+        assert_eq!(store.inner.journal.snapshot().unwrap().local_seq, 0);
+        store.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropped_multipart_cleans_owner_only_staging() {
+        let (store, _remote, _temp) = test_store().await;
+        let mut upload = store
+            .put_multipart(&Path::from("dropped-multipart-object"))
+            .await
+            .unwrap();
+        upload
+            .put_part(Bytes::from_static(b"private").into())
+            .await
+            .unwrap();
+        let staging_root = store.inner.settings.dir.join("tmp/multipart");
+        let staging = std::fs::read_dir(&staging_root)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let part = staging.join("part-00000000000000000000");
+        assert_eq!(
+            std::fs::metadata(&staging).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(part).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        drop(upload);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if std::fs::read_dir(&staging_root).unwrap().next().is_none() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropped multipart staging was not cleaned");
         store.shutdown().await.unwrap();
     }
 }
