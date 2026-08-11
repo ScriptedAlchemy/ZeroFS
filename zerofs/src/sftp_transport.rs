@@ -406,21 +406,27 @@ impl FairAdmission {
             return;
         }
         while state.active_reads + state.active_writes < self.inner.shared_limit {
-            let reads_waiting = state
-                .waiters
-                .iter()
-                .any(|waiter| matches!(waiter.kind, OperationKind::Read | OperationKind::Metadata));
             let writes_waiting = state
                 .waiters
                 .iter()
                 .any(|waiter| waiter.kind == OperationKind::Write);
-            let Some(index) = state.waiters.iter().position(|waiter| {
-                let opposite_waiting = match waiter.kind {
-                    OperationKind::Read | OperationKind::Metadata => writes_waiting,
-                    OperationKind::Write => reads_waiting,
-                };
-                self.can_admit(state, waiter.kind, opposite_waiting)
-            }) else {
+            // Draining dirty data is the long-running bulk path. Prefer queued
+            // writes up to their configured ceiling when that ceiling reserves
+            // shared capacity for reads. Once writeback empties, reads
+            // immediately expand to their own configured ceiling.
+            let write_reserves_opposite_slot = self.inner.write_limit < self.inner.shared_limit;
+            let preferred_write = (writes_waiting && write_reserves_opposite_slot).then(|| {
+                state.waiters.iter().position(|waiter| {
+                    waiter.kind == OperationKind::Write && self.can_admit(state, waiter.kind)
+                })
+            });
+            let index = preferred_write.flatten().or_else(|| {
+                state
+                    .waiters
+                    .iter()
+                    .position(|waiter| self.can_admit(state, waiter.kind))
+            });
+            let Some(index) = index else {
                 break;
             };
             let waiter = state.waiters.remove(index).unwrap();
@@ -437,33 +443,14 @@ impl FairAdmission {
         }
     }
 
-    fn can_admit(
-        &self,
-        state: &AdmissionState,
-        kind: OperationKind,
-        opposite_waiting: bool,
-    ) -> bool {
-        let (active, configured_limit, opposite_limit) = match kind {
-            OperationKind::Read | OperationKind::Metadata => (
-                state.active_reads,
-                self.inner.read_limit,
-                self.inner.write_limit,
-            ),
-            OperationKind::Write => (
-                state.active_writes,
-                self.inner.write_limit,
-                self.inner.read_limit,
-            ),
+    fn can_admit(&self, state: &AdmissionState, kind: OperationKind) -> bool {
+        let (active, configured_limit) = match kind {
+            OperationKind::Read | OperationKind::Metadata => {
+                (state.active_reads, self.inner.read_limit)
+            }
+            OperationKind::Write => (state.active_writes, self.inner.write_limit),
         };
-        let limit = if opposite_waiting {
-            // Active work is never preempted; each release moves a contended pool
-            // toward an even split while respecting lower configured limits.
-            let opposite_reservation = opposite_limit.min(self.inner.shared_limit / 2);
-            configured_limit.min(self.inner.shared_limit - opposite_reservation)
-        } else {
-            configured_limit
-        };
-        active < limit
+        active < configured_limit
     }
 
     fn cancel_waiter(&self, id: u64) {
@@ -2399,84 +2386,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn queued_reads_take_freed_write_slots_until_the_pool_reaches_four_four() {
-        let admission = super::FairAdmission::new(8, 7, 7);
-        let mut held_writes = Vec::new();
-        for _ in 0..7 {
-            held_writes.push(admission.acquire(OperationKind::Write).await.unwrap());
-        }
-        let mut held_reads = vec![admission.acquire(OperationKind::Read).await.unwrap()];
-
-        let mut queued_writes = Vec::new();
-        for expected_waiters in 1..=4 {
-            let task_admission = admission.clone();
-            queued_writes.push(tokio::spawn(async move {
-                task_admission.acquire(OperationKind::Write).await.unwrap()
-            }));
-            while admission.waiter_count() != expected_waiters {
-                tokio::task::yield_now().await;
-            }
-        }
-
-        let mut queued_reads = Vec::new();
-        for expected_waiters in 5..=7 {
-            let task_admission = admission.clone();
-            queued_reads.push(tokio::spawn(async move {
-                task_admission.acquire(OperationKind::Read).await.unwrap()
-            }));
-            while admission.waiter_count() != expected_waiters {
-                tokio::task::yield_now().await;
-            }
-        }
-
-        for queued_read in queued_reads {
-            drop(held_writes.pop().unwrap());
-            held_reads.push(
-                tokio::time::timeout(std::time::Duration::from_secs(1), queued_read)
-                    .await
-                    .expect("a freed write slot converges toward four active reads")
-                    .unwrap(),
-            );
-            assert!(queued_writes.iter().all(|waiter| !waiter.is_finished()));
-        }
-
-        drop(held_reads.pop().unwrap());
-        let expanded_write =
-            tokio::time::timeout(std::time::Duration::from_secs(1), queued_writes.remove(0))
-                .await
-                .expect("writes expand beyond four after read demand disappears")
-                .unwrap();
-
-        drop(expanded_write);
-        drop(held_reads);
-        drop(held_writes);
-        for queued_write in queued_writes {
-            drop(queued_write.await.unwrap());
-        }
-    }
-
-    #[tokio::test]
-    async fn queued_writes_take_freed_read_slots_until_the_pool_reaches_four_four() {
+    async fn queued_writes_reclaim_read_slots_until_the_pool_reaches_seven_one() {
         let admission = super::FairAdmission::new(8, 7, 7);
         let mut held_reads = Vec::new();
         for _ in 0..7 {
             held_reads.push(admission.acquire(OperationKind::Read).await.unwrap());
         }
-        let mut held_writes = vec![admission.acquire(OperationKind::Write).await.unwrap()];
-
-        let mut queued_reads = Vec::new();
-        for expected_waiters in 1..=4 {
-            let task_admission = admission.clone();
-            queued_reads.push(tokio::spawn(async move {
-                task_admission.acquire(OperationKind::Read).await.unwrap()
-            }));
-            while admission.waiter_count() != expected_waiters {
-                tokio::task::yield_now().await;
-            }
-        }
+        let held_write = admission.acquire(OperationKind::Write).await.unwrap();
 
         let mut queued_writes = Vec::new();
-        for expected_waiters in 5..=7 {
+        for expected_waiters in 1..=6 {
             let task_admission = admission.clone();
             queued_writes.push(tokio::spawn(async move {
                 task_admission.acquire(OperationKind::Write).await.unwrap()
@@ -2486,27 +2405,40 @@ mod tests {
             }
         }
 
+        let mut queued_reads = Vec::new();
+        for expected_waiters in 7..=12 {
+            let task_admission = admission.clone();
+            queued_reads.push(tokio::spawn(async move {
+                task_admission.acquire(OperationKind::Read).await.unwrap()
+            }));
+            while admission.waiter_count() != expected_waiters {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        let mut promoted_writes = Vec::new();
         for queued_write in queued_writes {
             drop(held_reads.pop().unwrap());
-            held_writes.push(
+            promoted_writes.push(
                 tokio::time::timeout(std::time::Duration::from_secs(1), queued_write)
                     .await
-                    .expect("a freed read slot converges toward four active writes")
+                    .expect("writeback reclaims a released read slot up to seven writers")
                     .unwrap(),
             );
             assert!(queued_reads.iter().all(|waiter| !waiter.is_finished()));
         }
 
-        drop(held_writes.pop().unwrap());
-        let expanded_read =
+        drop(held_reads.pop().unwrap());
+        let reserved_read =
             tokio::time::timeout(std::time::Duration::from_secs(1), queued_reads.remove(0))
                 .await
-                .expect("reads expand beyond four after write demand disappears")
+                .expect("the eighth shared slot remains available to reads")
                 .unwrap();
 
-        drop(expanded_read);
+        drop(reserved_read);
+        drop(held_write);
         drop(held_reads);
-        drop(held_writes);
+        drop(promoted_writes);
         for queued_read in queued_reads {
             drop(queued_read.await.unwrap());
         }
@@ -2537,16 +2469,22 @@ mod tests {
         }
 
         drop(held_writes.pop().unwrap());
+        let replacement_write =
+            tokio::time::timeout(std::time::Duration::from_secs(1), queued_write)
+                .await
+                .expect("writeback retains its released writer slot")
+                .unwrap();
+        assert!(!queued_metadata.is_finished());
+
+        drop(held_read);
         let metadata = tokio::time::timeout(std::time::Duration::from_secs(1), queued_metadata)
             .await
             .expect("metadata shares reserved foreground read capacity")
             .unwrap();
-        assert!(!queued_write.is_finished());
 
         drop(metadata);
-        drop(held_read);
+        drop(replacement_write);
         drop(held_writes);
-        drop(queued_write.await.unwrap());
     }
 
     #[tokio::test]
@@ -2590,7 +2528,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cross_direction_waiters_are_admitted_in_fifo_order() {
+    async fn cross_direction_waiters_stay_fifo_without_a_reserved_slot() {
         let admission = super::FairAdmission::new(1, 1, 1);
         let held = admission.acquire(OperationKind::Read).await.unwrap();
         let order = Arc::new(Mutex::new(Vec::new()));
