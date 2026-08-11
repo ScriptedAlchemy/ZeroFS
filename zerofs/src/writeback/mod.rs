@@ -3,6 +3,7 @@ pub mod config;
 pub mod journal;
 pub mod journaler;
 pub mod model;
+pub mod overlay;
 
 #[cfg(test)]
 mod model_contract_tests {

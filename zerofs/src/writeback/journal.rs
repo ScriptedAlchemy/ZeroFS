@@ -464,7 +464,7 @@ impl Journal {
             .context("failed to commit journal mutation")
     }
 
-    fn mutation(&self, sequence: Sequence) -> Result<Option<MutationRecord>> {
+    pub(crate) fn mutation(&self, sequence: Sequence) -> Result<Option<MutationRecord>> {
         let read = self
             .database
             .begin_read()
