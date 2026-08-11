@@ -28,7 +28,7 @@ const MAX_STREAMS: usize = 4;
 /// Minimum confirmed-stream window relative to the random-access minimum. The
 /// live SFTP profile therefore promotes 1 MiB to 16 MiB after sequential access
 /// is proven, while an unproven/random stream stays at 1 MiB.
-const SEQUENTIAL_FETCH_WINDOW_MULTIPLIER: usize = 16;
+const SEQUENTIAL_FETCH_WINDOW_MULTIPLIER: usize = 15;
 /// Look-ahead horizon for a proven sequential stream. Adjacent candidates are
 /// merged into one GET and capped at `fetch_window_max`, avoiding a burst of
 /// independent backend requests.
@@ -1663,9 +1663,10 @@ mod tests {
 
         assert_eq!(bounded.first(), Some(&(0..MIB as u64)));
         let confirmed = bounded.get(1).expect("confirmed-stream backend GET");
-        assert!(
-            confirmed.end - confirmed.start >= 15 * MIB as u64,
-            "first confirmed-sequential GET was smaller than 15 MiB: {confirmed:?}"
+        assert_eq!(
+            confirmed.end - confirmed.start,
+            15 * MIB as u64,
+            "the first confirmed-sequential GET must fit one 64-request SFTP payload wave"
         );
         assert!(
             bounded
