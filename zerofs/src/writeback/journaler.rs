@@ -1,6 +1,7 @@
 use crate::writeback::admission::{AcceptedAdmission, Admission, DiskPermit};
 use crate::writeback::journal::Journal;
 use crate::writeback::model::{MutationRecord, Sequence};
+use crate::writeback::payload::VerifiedPayload;
 use anyhow::Result as AnyResult;
 use bytes::Bytes;
 use std::sync::Arc;
@@ -60,13 +61,21 @@ impl LocalBarrier {
 }
 
 trait LocalJournalSink: Send + Sync + 'static {
-    fn commit(&self, record: MutationRecord, payload: Option<&[u8]>) -> AnyResult<MutationRecord>;
+    fn commit(
+        &self,
+        record: MutationRecord,
+        payload: Option<&VerifiedPayload>,
+    ) -> AnyResult<MutationRecord>;
 }
 
 impl LocalJournalSink for Journal {
-    fn commit(&self, record: MutationRecord, payload: Option<&[u8]>) -> AnyResult<MutationRecord> {
+    fn commit(
+        &self,
+        record: MutationRecord,
+        payload: Option<&VerifiedPayload>,
+    ) -> AnyResult<MutationRecord> {
         match payload {
-            Some(payload) => self.commit_put(record, payload),
+            Some(payload) => self.commit_verified_put(record, payload),
             None => self.commit_metadata(record),
         }
     }
@@ -97,7 +106,7 @@ struct LocalJournalerInner {
 enum JournalCommand {
     Mutation {
         record: Box<MutationRecord>,
-        payload: Option<Bytes>,
+        payload: Option<VerifiedPayload>,
         ram: Option<AcceptedAdmission>,
         disk: Option<DiskPermit>,
     },
@@ -181,6 +190,16 @@ impl LocalJournaler {
         payload: Bytes,
         ram: AcceptedAdmission,
     ) -> Result<LocalBarrier, LocalBarrierError> {
+        self.submit_verified_put(record, VerifiedPayload::new(payload), ram)
+            .await
+    }
+
+    async fn submit_verified_put(
+        &self,
+        record: MutationRecord,
+        payload: VerifiedPayload,
+        ram: AcceptedAdmission,
+    ) -> Result<LocalBarrier, LocalBarrierError> {
         self.submit(record, Some(payload), Some(ram), None).await
     }
 
@@ -188,6 +207,17 @@ impl LocalJournaler {
         &self,
         record: MutationRecord,
         payload: Bytes,
+        ram: AcceptedAdmission,
+        disk: DiskPermit,
+    ) -> Result<LocalBarrier, LocalBarrierError> {
+        self.submit_verified_put_with_disk(record, VerifiedPayload::new(payload), ram, disk)
+            .await
+    }
+
+    pub(crate) async fn submit_verified_put_with_disk(
+        &self,
+        record: MutationRecord,
+        payload: VerifiedPayload,
         ram: AcceptedAdmission,
         disk: DiskPermit,
     ) -> Result<LocalBarrier, LocalBarrierError> {
@@ -205,7 +235,7 @@ impl LocalJournaler {
     async fn submit(
         &self,
         record: MutationRecord,
-        payload: Option<Bytes>,
+        payload: Option<VerifiedPayload>,
         ram: Option<AcceptedAdmission>,
         disk: Option<DiskPermit>,
     ) -> Result<LocalBarrier, LocalBarrierError> {
@@ -288,7 +318,7 @@ async fn run_journaler(
                 let sink = sink.clone();
                 let sequence = record.sequence;
                 let result = tokio::task::spawn_blocking(move || {
-                    let result = sink.commit(record, payload.as_deref());
+                    let result = sink.commit(record, payload.as_ref());
                     (result, ram, disk)
                 })
                 .await;
@@ -356,6 +386,7 @@ mod tests {
     use crate::writeback::model::{
         FenceClass, JournalIdentity, LocalEtag, MutationKind, MutationMode, MutationRecord,
     };
+    use crate::writeback::payload::VerifiedPayload;
     use anyhow::{Result, bail};
     use bytes::Bytes;
     use sha2::{Digest, Sha256};
@@ -391,7 +422,7 @@ mod tests {
         fn commit(
             &self,
             record: MutationRecord,
-            _payload: Option<&[u8]>,
+            _payload: Option<&VerifiedPayload>,
         ) -> Result<MutationRecord> {
             self.entered.send(record.sequence).unwrap();
             self.release.lock().unwrap().recv().unwrap();

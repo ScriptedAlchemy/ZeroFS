@@ -1,4 +1,5 @@
 use crate::writeback::model::{JournalIdentity, MutationRecord, Sequence};
+use crate::writeback::payload::VerifiedPayload;
 use anyhow::{Context, Result, bail};
 use fs4::fs_std::FileExt;
 use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
@@ -172,7 +173,25 @@ impl Journal {
         })
     }
 
-    pub fn commit_put(&self, mut record: MutationRecord, payload: &[u8]) -> Result<MutationRecord> {
+    pub fn commit_put(&self, record: MutationRecord, payload: &[u8]) -> Result<MutationRecord> {
+        let payload_sha256 = Sha256::digest(payload).into();
+        self.commit_put_inner(record, payload, payload_sha256)
+    }
+
+    pub(crate) fn commit_verified_put(
+        &self,
+        record: MutationRecord,
+        payload: &VerifiedPayload,
+    ) -> Result<MutationRecord> {
+        self.commit_put_inner(record, payload.bytes(), payload.sha256())
+    }
+
+    fn commit_put_inner(
+        &self,
+        mut record: MutationRecord,
+        payload: &[u8],
+        actual_hash: [u8; 32],
+    ) -> Result<MutationRecord> {
         self.validate_record_format(&record)?;
         let (payload_len, payload_sha256) = record
             .payload()
@@ -180,7 +199,6 @@ impl Journal {
         if payload_len != payload.len() as u64 {
             bail!("put payload length does not match mutation record");
         }
-        let actual_hash: [u8; 32] = Sha256::digest(payload).into();
         if actual_hash != payload_sha256 {
             bail!("put payload hash does not match mutation record");
         }

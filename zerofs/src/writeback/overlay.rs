@@ -1,6 +1,7 @@
 use crate::writeback::journal::Journal;
 use crate::writeback::journaler::LocalCommitObserver;
 use crate::writeback::model::{LocalEtag, MutationKind, MutationRecord, Sequence};
+use crate::writeback::payload::VerifiedPayload;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures::{StreamExt, TryStreamExt, stream};
@@ -9,7 +10,6 @@ use object_store::{
     Attributes, Extensions, GetOptions, GetResult, GetResultPayload, ListResult, ObjectMeta,
     ObjectStore, ObjectStoreExt,
 };
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -111,26 +111,25 @@ impl OverlayIndex {
         record: MutationRecord,
         payload: Bytes,
     ) -> anyhow::Result<()> {
+        self.install_verified_memory(record, VerifiedPayload::new(payload))
+            .await
+    }
+
+    pub(crate) async fn install_verified_memory(
+        &self,
+        record: MutationRecord,
+        payload: VerifiedPayload,
+    ) -> anyhow::Result<()> {
         if !matches!(record.kind, MutationKind::Put { .. }) {
             anyhow::bail!("memory payload requires a put mutation");
         }
-        let MutationKind::Put {
-            payload_len,
-            payload_sha256,
-            ..
-        } = &record.kind
-        else {
-            unreachable!("put mutation checked above");
-        };
-        if *payload_len != payload.len() as u64
-            || <[u8; 32]>::from(Sha256::digest(&payload)) != *payload_sha256
-        {
+        if !payload.matches_record(&record) {
             anyhow::bail!("memory payload does not match its mutation record");
         }
         self.install(
             record,
             OverlayEffect::Put,
-            Some(PayloadLocation::Memory(payload)),
+            Some(PayloadLocation::Memory(payload.into_bytes())),
         )
         .await
     }
@@ -143,14 +142,23 @@ impl OverlayIndex {
     }
 
     pub async fn install_copy(&self, record: MutationRecord, payload: Bytes) -> anyhow::Result<()> {
+        self.install_verified_copy(record, VerifiedPayload::new(payload))
+            .await
+    }
+
+    pub(crate) async fn install_verified_copy(
+        &self,
+        record: MutationRecord,
+        payload: VerifiedPayload,
+    ) -> anyhow::Result<()> {
         if !matches!(record.kind, MutationKind::Copy { .. }) {
             anyhow::bail!("copy overlay requires a copy mutation");
         }
-        validate_payload(&record, &payload)?;
+        validate_verified_payload(&record, &payload)?;
         self.install(
             record,
             OverlayEffect::Put,
-            Some(PayloadLocation::Memory(payload)),
+            Some(PayloadLocation::Memory(payload.into_bytes())),
         )
         .await
     }
@@ -160,10 +168,19 @@ impl OverlayIndex {
         record: MutationRecord,
         payload: Bytes,
     ) -> anyhow::Result<()> {
+        self.install_verified_rename(record, VerifiedPayload::new(payload))
+            .await
+    }
+
+    pub(crate) async fn install_verified_rename(
+        &self,
+        record: MutationRecord,
+        payload: VerifiedPayload,
+    ) -> anyhow::Result<()> {
         let MutationKind::Rename { source, .. } = &record.kind else {
             anyhow::bail!("rename overlay requires a rename mutation");
         };
-        validate_payload(&record, &payload)?;
+        validate_verified_payload(&record, &payload)?;
         let target = parse_path(&record.path)?;
         let source = parse_path(source)?;
         let mut entries = self.entries.write().await;
@@ -172,7 +189,7 @@ impl OverlayIndex {
             target,
             record.clone(),
             OverlayEffect::Put,
-            Some(PayloadLocation::Memory(payload)),
+            Some(PayloadLocation::Memory(payload.into_bytes())),
         )?;
         if let Err(error) = install_locked(
             &mut entries,
@@ -435,13 +452,11 @@ fn entry_meta(location: Path, record: &MutationRecord) -> object_store::Result<O
     })
 }
 
-fn validate_payload(record: &MutationRecord, payload: &Bytes) -> anyhow::Result<()> {
-    let Some((payload_len, payload_sha256)) = record.payload() else {
-        anyhow::bail!("overlay payload requires a payload mutation");
-    };
-    if payload_len != payload.len() as u64
-        || <[u8; 32]>::from(Sha256::digest(payload)) != payload_sha256
-    {
+fn validate_verified_payload(
+    record: &MutationRecord,
+    payload: &VerifiedPayload,
+) -> anyhow::Result<()> {
+    if !payload.matches_record(record) {
         anyhow::bail!("memory payload does not match its mutation record");
     }
     Ok(())

@@ -6,6 +6,7 @@ use crate::writeback::model::{
     FenceClass, LocalEtag, MutationKind, MutationMode, MutationRecord, WritebackStatus,
 };
 use crate::writeback::overlay::{OverlayCommitObserver, OverlayIndex, VisibleVersion};
+use crate::writeback::payload::VerifiedPayload;
 use crate::writeback::remote::{RemoteBarrierError, RemoteScheduler};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -17,7 +18,6 @@ use object_store::{
     ObjectMeta, ObjectStore, PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult,
     RenameOptions, RenameTargetMode, UpdateVersion, UploadPart,
 };
-use sha2::{Digest, Sha256};
 use std::collections::hash_map::DefaultHasher;
 use std::fs::{self, OpenOptions};
 use std::hash::{Hash, Hasher};
@@ -250,10 +250,11 @@ impl WritebackObjectStore {
     ) -> object_store::Result<PutResult> {
         let lock = self.key_lock(&location);
         let key_guard = lock.lock_owned().await;
-        let order_guard = self.inner.admission_order.lock().await;
         let visible = self.inner.overlay.visible_version(&location).await?;
         let (mode, expected_visible_version, predecessor, fence) =
             validate_put_mode(&location, &options.mode, visible)?;
+        let payload = VerifiedPayload::new(bytes);
+        let order_guard = self.inner.admission_order.lock().await;
         let sequence = self.allocate_sequence()?;
         let local_etag = LocalEtag::new(self.inner.incarnation, sequence);
         let record = MutationRecord {
@@ -264,8 +265,8 @@ impl WritebackObjectStore {
             kind: MutationKind::Put {
                 mode,
                 expected_visible_version,
-                payload_len: bytes.len() as u64,
-                payload_sha256: Sha256::digest(&bytes).into(),
+                payload_len: payload.byte_len(),
+                payload_sha256: payload.sha256(),
                 blob_path: String::new(),
             },
             local_etag: local_etag.clone(),
@@ -278,13 +279,13 @@ impl WritebackObjectStore {
         };
         self.inner
             .overlay
-            .install_memory(record.clone(), bytes.clone())
+            .install_verified_memory(record.clone(), payload.clone())
             .await
             .map_err(|error| generic_error(format!("overlay admission failed: {error:#}")))?;
         let barrier = match self
             .inner
             .journaler
-            .submit_put_with_disk(record, bytes, ram, disk)
+            .submit_verified_put_with_disk(record, payload, ram, disk)
             .await
         {
             Ok(barrier) => barrier,
@@ -405,11 +406,12 @@ impl WritebackObjectStore {
                 "copy source changed while being materialized",
             ));
         }
+        let payload = VerifiedPayload::new(bytes);
 
         let order_guard = self.inner.admission_order.lock().await;
         let sequence = self.allocate_sequence()?;
         let local_etag = LocalEtag::new(self.inner.incarnation, sequence);
-        let payload_sha256 = Sha256::digest(&bytes).into();
+        let payload_sha256 = payload.sha256();
         let kind = if rename {
             MutationKind::Rename {
                 source: from.to_string(),
@@ -448,12 +450,12 @@ impl WritebackObjectStore {
         let overlay_result = if rename {
             self.inner
                 .overlay
-                .install_rename(record.clone(), bytes.clone())
+                .install_verified_rename(record.clone(), payload.clone())
                 .await
         } else {
             self.inner
                 .overlay
-                .install_copy(record.clone(), bytes.clone())
+                .install_verified_copy(record.clone(), payload.clone())
                 .await
         };
         overlay_result.map_err(|error| {
@@ -462,7 +464,7 @@ impl WritebackObjectStore {
         let barrier = match self
             .inner
             .journaler
-            .submit_put_with_disk(record, bytes, ram, disk)
+            .submit_verified_put_with_disk(record, payload, ram, disk)
             .await
         {
             Ok(barrier) => barrier,
@@ -1527,6 +1529,45 @@ mod tests {
         assert_eq!(store.dirty_ram_bytes(), 0);
         assert_eq!(store.dirty_ssd_bytes(), 64 * 1024);
         store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn remote_precondition_lookup_does_not_hold_global_admission_order() {
+        let (store, _remote, _temp, controls) = test_store_with_controls(false).await;
+        let order_guard = store.inner.admission_order.lock().await;
+        let path = Path::from("segments/independent");
+        let put = tokio::spawn({
+            let store = store.clone();
+            let path = path.clone();
+            async move {
+                store
+                    .put(&path, Bytes::from_static(b"payload").into())
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while store.dirty_ram_bytes() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let lookup_started = tokio::time::timeout(Duration::from_secs(1), async {
+            while controls.get_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+
+        drop(order_guard);
+        put.await.unwrap().unwrap();
+        store.wait_local(1).await.unwrap();
+        store.shutdown().await.unwrap();
+        assert!(
+            lookup_started.is_ok(),
+            "remote version lookup was serialized behind global admission order"
+        );
     }
 
     #[tokio::test]

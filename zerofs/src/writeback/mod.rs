@@ -5,6 +5,7 @@ pub mod journal;
 pub mod journaler;
 pub mod model;
 pub mod overlay;
+mod payload;
 pub mod remote;
 pub mod store;
 
