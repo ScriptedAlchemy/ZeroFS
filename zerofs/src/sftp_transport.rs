@@ -1,7 +1,7 @@
 use crate::sftp_object_store::{OBJECT_HEADER_LEN, ObjectHeader, SftpCapabilities, decode_header};
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use std::collections::VecDeque;
 use std::fmt;
 use std::io::Write;
@@ -18,6 +18,72 @@ pub enum OperationKind {
     Read,
     Write,
     Metadata,
+}
+
+/// Match the largest safe OpenSSH SFTP v3 payload used by the proven rclone
+/// path. The client still clips a request if a server negotiates a lower limit.
+const SFTP_WRITE_PACKET_SIZE: usize = 255 * 1024;
+
+/// Maximum outstanding WRITE requests on one leased SFTP session. A 64-request
+/// window hides the Storage Box WAN RTT without consuming more TCP sessions.
+const SFTP_WRITE_REQUEST_CONCURRENCY: usize = 64;
+
+#[derive(Debug)]
+struct PipelinedWrite {
+    offset: u64,
+    payload: Bytes,
+}
+
+fn plan_pipelined_writes(
+    initial_offset: u64,
+    chunks: Vec<Bytes>,
+) -> Result<Vec<PipelinedWrite>, TransportError> {
+    let mut offset = initial_offset;
+    let mut requests = Vec::new();
+    for mut chunk in chunks {
+        while !chunk.is_empty() {
+            let len = chunk.len().min(SFTP_WRITE_PACKET_SIZE);
+            let payload = chunk.split_to(len);
+            requests.push(PipelinedWrite { offset, payload });
+            offset = offset.checked_add(len as u64).ok_or_else(|| {
+                TransportError::Operation("SFTP write offset overflow".to_owned())
+            })?;
+        }
+    }
+    Ok(requests)
+}
+
+async fn write_file_pipelined(
+    file: &openssh_sftp_client::file::File,
+    path: &std::path::Path,
+    offset: u64,
+    chunks: Vec<Bytes>,
+) -> Result<(), TransportError> {
+    let requests = plan_pipelined_writes(offset, chunks)?;
+    futures::stream::iter(requests)
+        .map(|request| {
+            let mut writer = file.clone();
+            async move {
+                writer
+                    .seek(SeekFrom::Start(request.offset))
+                    .await
+                    .map_err(|error| {
+                        TransportError::Operation(format!(
+                            "failed to seek {} to {}: {error}",
+                            path.display(),
+                            request.offset
+                        ))
+                    })?;
+                writer
+                    .write_all(&request.payload)
+                    .await
+                    .map_err(|error| map_sftp_error(path, error))
+            }
+        })
+        .buffer_unordered(SFTP_WRITE_REQUEST_CONCURRENCY)
+        .try_collect::<Vec<_>>()
+        .await?;
+    Ok(())
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -619,11 +685,7 @@ impl TransportSession for OpenSshTransportSession {
             .create(path)
             .await
             .map_err(|error| map_sftp_error(path, error))?;
-        for chunk in chunks {
-            file.write_all(&chunk)
-                .await
-                .map_err(|error| map_sftp_error(path, error))?;
-        }
+        write_file_pipelined(&file, path, 0, chunks).await?;
         file.sync_all()
             .await
             .map_err(|error| map_sftp_error(path, error))?;
@@ -645,17 +707,7 @@ impl TransportSession for OpenSshTransportSession {
             .open(path)
             .await
             .map_err(|error| map_sftp_error(path, error))?;
-        file.seek(SeekFrom::Start(offset)).await.map_err(|error| {
-            TransportError::Operation(format!(
-                "failed to seek {} to {offset}: {error}",
-                path.display()
-            ))
-        })?;
-        for chunk in chunks {
-            file.write_all(&chunk)
-                .await
-                .map_err(|error| map_sftp_error(path, error))?;
-        }
+        write_file_pipelined(&file, path, offset, chunks).await?;
         file.sync_all()
             .await
             .map_err(|error| map_sftp_error(path, error))?;
@@ -673,21 +725,11 @@ impl TransportSession for OpenSshTransportSession {
         let sftp = self.sftp.as_ref().expect("open transport owns SFTP client");
         let mut options = sftp.options();
         options.write(true);
-        let mut file = options
+        let file = options
             .open(path)
             .await
             .map_err(|error| map_sftp_error(path, error))?;
-        file.seek(SeekFrom::Start(offset)).await.map_err(|error| {
-            TransportError::Operation(format!(
-                "failed to seek {} to {offset}: {error}",
-                path.display()
-            ))
-        })?;
-        for chunk in chunks {
-            file.write_all(&chunk)
-                .await
-                .map_err(|error| map_sftp_error(path, error))?;
-        }
+        write_file_pipelined(&file, path, offset, chunks).await?;
         file.close()
             .await
             .map_err(|error| map_sftp_error(path, error))
@@ -1214,16 +1256,35 @@ impl Drop for SessionLease {
 mod tests {
     use super::{
         LeaseFinishError, OpenSshSessionFactory, OpenSshTransportSession, OperationKind,
-        RemoteEntryKind, SessionDisposition, SessionFactory, SftpSessionPool, TransportError,
-        TransportSession,
+        RemoteEntryKind, SFTP_WRITE_PACKET_SIZE, SFTP_WRITE_REQUEST_CONCURRENCY,
+        SessionDisposition, SessionFactory, SftpSessionPool, TransportError, TransportSession,
+        plan_pipelined_writes,
     };
     use crate::config::SftpEndpoint;
     use crate::sftp_object_store::{ObjectHeader, SftpCapabilities, encode_header};
     use async_trait::async_trait;
+    use bytes::Bytes;
     use std::fmt;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use tokio::sync::Notify;
+
+    #[test]
+    fn pipelined_write_plan_matches_rclone_packet_window_and_offsets() {
+        let first = Bytes::from(vec![0x11; SFTP_WRITE_PACKET_SIZE + 3]);
+        let second = Bytes::from_static(b"tail");
+
+        let requests = plan_pipelined_writes(17, vec![first, second]).unwrap();
+
+        assert_eq!(SFTP_WRITE_REQUEST_CONCURRENCY, 64);
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0].offset, 17);
+        assert_eq!(requests[0].payload.len(), SFTP_WRITE_PACKET_SIZE);
+        assert_eq!(requests[1].offset, 17 + SFTP_WRITE_PACKET_SIZE as u64);
+        assert_eq!(requests[1].payload.len(), 3);
+        assert_eq!(requests[2].offset, 20 + SFTP_WRITE_PACKET_SIZE as u64);
+        assert_eq!(requests[2].payload.as_ref(), b"tail");
+    }
 
     #[derive(Clone)]
     struct RecordingFactory {
@@ -1992,8 +2053,24 @@ mod tests {
             entry.filename == std::path::Path::new("nested")
                 && entry.kind == RemoteEntryKind::Directory
         }));
+        let pipelined_payload = Bytes::from(vec![0x5a; 2 * SFTP_WRITE_PACKET_SIZE + 17]);
+        session
+            .write_file_durable(
+                std::path::Path::new("pipelined.bin"),
+                vec![pipelined_payload.clone()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(root.path().join("pipelined.bin")).unwrap(),
+            pipelined_payload.as_ref()
+        );
         session
             .remove_file(std::path::Path::new("object.bin"))
+            .await
+            .unwrap();
+        session
+            .remove_file(std::path::Path::new("pipelined.bin"))
             .await
             .unwrap();
         assert!(!root.path().join("object.bin").exists());
