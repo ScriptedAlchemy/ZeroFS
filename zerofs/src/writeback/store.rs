@@ -2,7 +2,9 @@ use crate::writeback::admission::{Admission, DiskAdmission};
 use crate::writeback::config::{AckMode, WritebackSettings};
 use crate::writeback::journal::Journal;
 use crate::writeback::journaler::{LocalBarrierError, LocalJournaler};
-use crate::writeback::model::{FenceClass, LocalEtag, MutationKind, MutationMode, MutationRecord};
+use crate::writeback::model::{
+    FenceClass, LocalEtag, MutationKind, MutationMode, MutationRecord, WritebackStatus,
+};
 use crate::writeback::overlay::{OverlayCommitObserver, OverlayIndex, VisibleVersion};
 use crate::writeback::remote::{RemoteBarrierError, RemoteScheduler};
 use async_trait::async_trait;
@@ -145,6 +147,37 @@ impl WritebackObjectStore {
 
     pub fn dirty_ssd_bytes(&self) -> u64 {
         self.inner.disk.used_bytes()
+    }
+
+    pub fn status(&self) -> anyhow::Result<WritebackStatus> {
+        let snapshot = self.inner.journal.snapshot()?;
+        let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        let pending = snapshot
+            .records
+            .iter()
+            .filter(|record| record.sequence > snapshot.remote_seq)
+            .collect::<Vec<_>>();
+        let oldest_pending_age_ms = pending
+            .iter()
+            .map(|record| now.saturating_sub(record.accepted_at_unix_ms))
+            .max()
+            .unwrap_or(0);
+        Ok(WritebackStatus {
+            accepted_seq: self.inner.next_sequence.load(Ordering::Acquire),
+            local_seq: snapshot.local_seq,
+            remote_seq: snapshot.remote_seq,
+            dirty_ram_bytes: self.inner.admission.used_bytes(),
+            dirty_ram_capacity_bytes: self.inner.settings.memory_bytes,
+            dirty_ram_operations: self.inner.admission.used_operations(),
+            dirty_ssd_bytes: self.inner.disk.used_bytes(),
+            dirty_ssd_capacity_bytes: self.inner.settings.disk_bytes,
+            dirty_ssd_operations: pending.len() as u64,
+            oldest_pending_age_ms,
+            remote_bytes_completed: snapshot.remote_bytes_completed,
+            remote_operations_completed: snapshot.remote_seq,
+            retries: snapshot.remote_retries,
+            terminal_error: self.inner.remote.terminal_error(),
+        })
     }
 
     pub async fn shutdown(&self) -> Result<(), LocalBarrierError> {
@@ -1297,6 +1330,68 @@ mod tests {
         store.wait_local(1).await.unwrap();
         assert_eq!(store.dirty_ram_bytes(), 0);
         assert_eq!(store.dirty_ssd_bytes(), 7);
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn status_reports_independent_dirty_ram_and_ssd_tiers() {
+        let (store, _remote, _temp) = test_store().await;
+        store
+            .put(
+                &Path::from("status-pending"),
+                Bytes::from_static(b"payload").into(),
+            )
+            .await
+            .unwrap();
+        store.wait_local(1).await.unwrap();
+
+        let status = store.status().unwrap();
+        assert_eq!(status.accepted_seq, 1);
+        assert_eq!(status.local_seq, 1);
+        assert_eq!(status.remote_seq, 0);
+        assert_eq!(status.dirty_ram_bytes, 0);
+        assert_eq!(status.dirty_ram_capacity_bytes, 1_000_000);
+        assert_eq!(status.dirty_ssd_bytes, 7);
+        assert_eq!(status.dirty_ssd_capacity_bytes, 10_000_000);
+        assert_eq!(status.dirty_ssd_operations, 1);
+        assert!(status.oldest_pending_age_ms < 10_000);
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn status_persists_completed_remote_bytes_and_operations() {
+        let (store, _remote, _temp) = test_store_with_remote_drain(true).await;
+        store
+            .put(
+                &Path::from("status-complete"),
+                Bytes::from_static(b"payload").into(),
+            )
+            .await
+            .unwrap();
+        store.wait_remote(1).await.unwrap();
+
+        let status = store.status().unwrap();
+        assert_eq!(status.remote_bytes_completed, 7);
+        assert_eq!(status.remote_operations_completed, 1);
+        assert_eq!(status.dirty_ssd_bytes, 0);
+        assert_eq!(status.dirty_ssd_operations, 0);
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn status_persists_remote_retry_count_after_recovery() {
+        let (store, _remote, _temp, controls) = test_store_with_controls(true).await;
+        controls.fail_puts(1);
+        store
+            .put(
+                &Path::from("status-retry"),
+                Bytes::from_static(b"payload").into(),
+            )
+            .await
+            .unwrap();
+        store.wait_remote(1).await.unwrap();
+
+        assert_eq!(store.status().unwrap().retries, 1);
         store.shutdown().await.unwrap();
     }
 

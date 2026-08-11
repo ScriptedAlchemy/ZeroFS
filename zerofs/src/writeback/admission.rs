@@ -30,6 +30,7 @@ struct RamInner {
 #[derive(Debug, Default)]
 struct RamState {
     used: u64,
+    used_operations: u64,
     next_waiter: u64,
     waiters: VecDeque<RamWaiter>,
     terminal: Option<AdmissionError>,
@@ -76,6 +77,7 @@ impl Admission {
             }
             if state.waiters.is_empty() && fits(state.used, bytes, self.inner.capacity) {
                 state.used += bytes;
+                state.used_operations += 1;
                 return Ok(AdmissionPermit::new(self.inner.clone(), bytes));
             }
             let id = state.next_waiter;
@@ -96,6 +98,10 @@ impl Admission {
 
     pub fn used_bytes(&self) -> u64 {
         lock(&self.inner.state).used
+    }
+
+    pub fn used_operations(&self) -> u64 {
+        lock(&self.inner.state).used_operations
     }
 
     pub fn poison(&self, message: impl Into<String>) {
@@ -177,15 +183,27 @@ fn terminate_ram(inner: &Arc<RamInner>, error: AdmissionError) {
 fn release_ram_bytes(inner: &Arc<RamInner>, bytes: u64) {
     let accounting_error = {
         let mut state = lock(&inner.state);
-        match state.used.checked_sub(bytes) {
-            Some(remaining) => {
+        match (
+            state.used.checked_sub(bytes),
+            state.used_operations.checked_sub(1),
+        ) {
+            (Some(remaining), Some(remaining_operations)) => {
                 state.used = remaining;
+                state.used_operations = remaining_operations;
                 None
             }
-            None => {
+            (None, _) => {
                 state.used = 0;
+                state.used_operations = 0;
                 Some(AdmissionError::Poisoned(
                     "dirty RAM accounting underflow".to_owned(),
+                ))
+            }
+            (_, None) => {
+                state.used = 0;
+                state.used_operations = 0;
+                Some(AdmissionError::Poisoned(
+                    "dirty RAM operation accounting underflow".to_owned(),
                 ))
             }
         }
@@ -214,10 +232,12 @@ fn grant_ram_waiters(inner: &Arc<RamInner>) {
             .used
             .checked_add(waiter.bytes)
             .expect("RAM admission fit was checked before accounting");
+        state.used_operations += 1;
         let permit = AdmissionPermit::new(inner.clone(), waiter.bytes);
         if let Err(Ok(mut permit)) = waiter.sender.send(Ok(permit)) {
             permit.active = false;
             state.used -= waiter.bytes;
+            state.used_operations -= 1;
         }
     }
 }
@@ -539,7 +559,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Admission, AdmissionError, DiskAdmission};
+    use super::{Admission, AdmissionError, DiskAdmission, lock};
     use std::time::Duration;
 
     #[tokio::test]
@@ -563,6 +583,34 @@ mod tests {
             .unwrap();
         assert_eq!(second.bytes(), 4);
         assert_eq!(admission.used_bytes(), 4);
+    }
+
+    #[tokio::test]
+    async fn dirty_ram_operation_accounting_tracks_each_live_reservation() {
+        let admission = Admission::new(10);
+        let first = admission.reserve(3).await.unwrap();
+        let second = admission.reserve(4).await.unwrap();
+        assert_eq!(admission.used_operations(), 2);
+
+        drop(first);
+        assert_eq!(admission.used_operations(), 1);
+        drop(second);
+        assert_eq!(admission.used_operations(), 0);
+    }
+
+    #[tokio::test]
+    async fn dirty_ram_operation_underflow_poisons_admission() {
+        let admission = Admission::new(10);
+        let permit = admission.reserve(3).await.unwrap();
+        lock(&admission.inner.state).used_operations = 0;
+
+        drop(permit);
+
+        assert!(matches!(
+            admission.reserve(1).await,
+            Err(AdmissionError::Poisoned(message))
+                if message.contains("operation accounting underflow")
+        ));
     }
 
     #[tokio::test]

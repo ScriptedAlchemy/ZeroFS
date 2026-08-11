@@ -952,6 +952,7 @@ pub async fn run_server(
 
     let init_result = crate::cli::init::initialize_filesystem(&settings, db_mode).await?;
     let writeback_for_shutdown = init_result.writeback.clone();
+    let writeback_for_metrics = init_result.writeback.clone();
     let sftp_pool = init_result.sftp_pool.clone();
     let sftp_pool_for_close = sftp_pool.clone();
     let using_sftp = sftp_pool.is_some();
@@ -1000,11 +1001,14 @@ pub async fn run_server(
             let slatedb_registry = fs.db.slatedb_metrics();
             crate::prometheus::start(
                 prometheus_config,
-                Arc::clone(&fs.stats),
-                Arc::clone(&fs.global_stats),
-                fs.extent_store.segment_gc_stats(),
-                Arc::clone(&fs.dedup),
-                slatedb_registry,
+                crate::prometheus::CollectorSources {
+                    fs_stats: Arc::clone(&fs.stats),
+                    global_stats: Arc::clone(&fs.global_stats),
+                    segment_gc_stats: fs.extent_store.segment_gc_stats(),
+                    dedup: Arc::clone(&fs.dedup),
+                    slatedb_registry,
+                    writeback: writeback_for_metrics,
+                },
                 shutdown.clone(),
             )
         } else {

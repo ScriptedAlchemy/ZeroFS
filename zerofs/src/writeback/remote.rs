@@ -106,6 +106,10 @@ impl RemoteScheduler {
         self.barrier.clone()
     }
 
+    pub fn terminal_error(&self) -> Option<String> {
+        self.barrier.progress.borrow().terminal_error.clone()
+    }
+
     pub async fn shutdown(&self) -> Result<(), RemoteBarrierError> {
         let _ = self.stop.send(true);
         if let Some(join) = self.join.lock().await.take() {
@@ -197,7 +201,19 @@ async fn run_remote_scheduler(worker: RemoteWorker) {
         for (record, result) in outcomes {
             let result = match result {
                 Ok(result) => result,
-                Err(_error) => {
+                Err(error) => {
+                    if let Err(journal_error) =
+                        journal.record_remote_failure(record.sequence, &error.to_string())
+                    {
+                        progress.send_modify(|state| {
+                            state.terminal_error = Some(format!(
+                                "failed to persist remote retry for sequence {}: {journal_error:#}",
+                                record.sequence
+                            ));
+                            state.closed = true;
+                        });
+                        return;
+                    }
                     retry = true;
                     break;
                 }

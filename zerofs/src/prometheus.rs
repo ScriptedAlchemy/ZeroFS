@@ -3,6 +3,8 @@ use crate::dedup::DedupCache;
 use crate::fs::metrics::{FileSystemStats, SegmentGcStats};
 use crate::fs::stats::FileSystemGlobalStats;
 use crate::task::spawn_named;
+use crate::writeback::model::WritebackStatus;
+use crate::writeback::store::WritebackObjectStore;
 use metrics::{counter, gauge};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use slatedb_common::metrics::{DefaultMetricsRecorder, MetricValue};
@@ -17,13 +19,18 @@ use tokio_util::sync::CancellationToken;
 /// Installs the global metrics recorder, spawns an HTTP server per configured address
 /// serving `/metrics`, and starts a background collector task that bridges existing
 /// ZeroFS and SlateDB stats into the metrics crate.
+pub struct CollectorSources {
+    pub fs_stats: Arc<FileSystemStats>,
+    pub global_stats: Arc<FileSystemGlobalStats>,
+    pub segment_gc_stats: Arc<SegmentGcStats>,
+    pub dedup: Arc<DedupCache>,
+    pub slatedb_registry: Option<Arc<DefaultMetricsRecorder>>,
+    pub writeback: Option<WritebackObjectStore>,
+}
+
 pub fn start(
     config: &PrometheusConfig,
-    fs_stats: Arc<FileSystemStats>,
-    global_stats: Arc<FileSystemGlobalStats>,
-    segment_gc_stats: Arc<SegmentGcStats>,
-    dedup: Arc<DedupCache>,
-    slatedb_registry: Option<Arc<DefaultMetricsRecorder>>,
+    sources: CollectorSources,
     shutdown: CancellationToken,
 ) -> Vec<JoinHandle<()>> {
     let recorder = PrometheusBuilder::new().build_recorder();
@@ -47,6 +54,14 @@ pub fn start(
 
     let upkeep_handle = handle.clone();
     handles.push(spawn_named("prometheus-collector", async move {
+        let CollectorSources {
+            fs_stats,
+            global_stats,
+            segment_gc_stats,
+            dedup,
+            slatedb_registry,
+            writeback,
+        } = sources;
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
         loop {
             tokio::select! {
@@ -62,6 +77,7 @@ pub fn start(
                     if let Some(ref registry) = slatedb_registry {
                         collect_lsm_stats(registry);
                     }
+                    collect_writeback_stats(writeback.as_ref());
                     collect_jemalloc_stats();
                     upkeep_handle.run_upkeep();
                 }
@@ -221,6 +237,48 @@ fn collect_jemalloc_stats() {
     gauge!("zerofs_jemalloc_metadata_bytes").set(mem.metadata as f64);
 }
 
+fn collect_writeback_stats(writeback: Option<&WritebackObjectStore>) {
+    gauge!("zerofs_writeback_enabled").set(f64::from(writeback.is_some()));
+    let Some(writeback) = writeback else {
+        gauge!("zerofs_writeback_status_collection_error").set(0.0);
+        return;
+    };
+    match writeback.status() {
+        Ok(status) => {
+            gauge!("zerofs_writeback_status_collection_error").set(0.0);
+            record_writeback_status(&status);
+        }
+        Err(error) => {
+            gauge!("zerofs_writeback_status_collection_error").set(1.0);
+            tracing::warn!(error = %error, "failed to collect writeback status");
+        }
+    }
+}
+
+fn record_writeback_status(status: &WritebackStatus) {
+    gauge!("zerofs_writeback_dirty_ram_bytes").set(status.dirty_ram_bytes as f64);
+    gauge!("zerofs_writeback_dirty_ram_capacity_bytes").set(status.dirty_ram_capacity_bytes as f64);
+    gauge!("zerofs_writeback_dirty_ram_operations").set(status.dirty_ram_operations as f64);
+    gauge!("zerofs_writeback_dirty_ssd_bytes").set(status.dirty_ssd_bytes as f64);
+    gauge!("zerofs_writeback_dirty_ssd_capacity_bytes").set(status.dirty_ssd_capacity_bytes as f64);
+    gauge!("zerofs_writeback_dirty_ssd_operations").set(status.dirty_ssd_operations as f64);
+    gauge!("zerofs_writeback_accepted_sequence").set(status.accepted_seq as f64);
+    gauge!("zerofs_writeback_local_sequence").set(status.local_seq as f64);
+    gauge!("zerofs_writeback_remote_sequence").set(status.remote_seq as f64);
+    gauge!("zerofs_writeback_local_lag_operations")
+        .set(status.accepted_seq.saturating_sub(status.local_seq) as f64);
+    gauge!("zerofs_writeback_remote_lag_operations")
+        .set(status.local_seq.saturating_sub(status.remote_seq) as f64);
+    gauge!("zerofs_writeback_oldest_pending_age_seconds")
+        .set(status.oldest_pending_age_ms as f64 / 1_000.0);
+    counter!("zerofs_writeback_remote_bytes_completed_total")
+        .absolute(status.remote_bytes_completed);
+    counter!("zerofs_writeback_remote_operations_completed_total")
+        .absolute(status.remote_operations_completed);
+    counter!("zerofs_writeback_retries_total").absolute(status.retries);
+    gauge!("zerofs_writeback_terminal_error").set(f64::from(status.terminal_error.is_some()));
+}
+
 /// Export name for a metadata-engine metric: the engine registers under
 /// "slatedb.…", but the exported series speak the same vocabulary as the docs
 /// and logs (the metadata LSM), so the prefix becomes "lsm_".
@@ -256,7 +314,8 @@ fn collect_lsm_stats(recorder: &DefaultMetricsRecorder) {
 
 #[cfg(test)]
 mod tests {
-    use super::lsm_export_name;
+    use super::{lsm_export_name, record_writeback_status};
+    use crate::writeback::model::WritebackStatus;
 
     #[test]
     fn engine_metric_names_export_under_the_lsm_prefix() {
@@ -267,5 +326,47 @@ mod tests {
         // A name without the engine prefix still exports under lsm_: the
         // recorder holds only metadata-engine metrics.
         assert_eq!(lsm_export_name("some.other.stat"), "lsm_some_other_stat");
+    }
+
+    #[test]
+    fn writeback_metrics_expose_independent_dirty_ram_and_ssd_budgets() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::set_global_recorder(recorder).unwrap();
+        let status = WritebackStatus {
+            accepted_seq: 9,
+            local_seq: 8,
+            remote_seq: 5,
+            dirty_ram_bytes: 4,
+            dirty_ram_capacity_bytes: 16,
+            dirty_ram_operations: 1,
+            dirty_ssd_bytes: 3,
+            dirty_ssd_capacity_bytes: 512,
+            dirty_ssd_operations: 2,
+            oldest_pending_age_ms: 6_000,
+            remote_bytes_completed: 7,
+            remote_operations_completed: 5,
+            retries: 2,
+            terminal_error: Some("remote unavailable".to_owned()),
+        };
+
+        record_writeback_status(&status);
+        let rendered = handle.render();
+        for expected in [
+            "zerofs_writeback_dirty_ram_bytes 4",
+            "zerofs_writeback_dirty_ram_capacity_bytes 16",
+            "zerofs_writeback_dirty_ssd_bytes 3",
+            "zerofs_writeback_dirty_ssd_capacity_bytes 512",
+            "zerofs_writeback_remote_lag_operations 3",
+            "zerofs_writeback_oldest_pending_age_seconds 6",
+            "zerofs_writeback_remote_bytes_completed_total 7",
+            "zerofs_writeback_retries_total 2",
+            "zerofs_writeback_terminal_error 1",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "missing metric: {expected}\n{rendered}"
+            );
+        }
     }
 }

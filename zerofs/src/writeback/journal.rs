@@ -20,6 +20,8 @@ const IDENTITY_KEY: &str = "identity";
 const INCARNATION_KEY: &str = "incarnation";
 const LOCAL_SEQ_KEY: &str = "local_seq";
 const REMOTE_SEQ_KEY: &str = "remote_seq";
+const REMOTE_BYTES_COMPLETED_KEY: &str = "remote_bytes_completed";
+const REMOTE_RETRIES_KEY: &str = "remote_retries";
 
 pub struct Journal {
     root: PathBuf,
@@ -43,6 +45,8 @@ pub struct JournalSnapshot {
     pub incarnation: Uuid,
     pub local_seq: Sequence,
     pub remote_seq: Sequence,
+    pub remote_bytes_completed: u64,
+    pub remote_retries: u64,
     pub records: Vec<MutationRecord>,
     pub dirty_blob_bytes: u64,
     pub pending_blob_count: u64,
@@ -121,6 +125,9 @@ impl Journal {
         let incarnation = read_required::<Uuid>(&meta, INCARNATION_KEY)?;
         let local_seq = read_required::<u64>(&meta, LOCAL_SEQ_KEY)?;
         let remote_seq = read_required::<u64>(&meta, REMOTE_SEQ_KEY)?;
+        let remote_bytes_completed =
+            read_optional::<u64>(&meta, REMOTE_BYTES_COMPLETED_KEY)?.unwrap_or_default();
+        let remote_retries = read_optional::<u64>(&meta, REMOTE_RETRIES_KEY)?.unwrap_or_default();
         drop(meta);
 
         let table = read
@@ -157,6 +164,8 @@ impl Journal {
             incarnation,
             local_seq,
             remote_seq,
+            remote_bytes_completed,
+            remote_retries,
             records,
             dirty_blob_bytes,
             pending_blob_count,
@@ -276,6 +285,11 @@ impl Journal {
                 .with_context(|| format!("journal mutation {sequence} does not exist"))?;
             let mut record: MutationRecord =
                 bincode::deserialize(&encoded).context("failed to decode remote mutation")?;
+            let completed_bytes = record.payload().map_or(0, |(payload_len, _)| payload_len);
+            let total_completed = read_optional::<u64>(&meta, REMOTE_BYTES_COMPLETED_KEY)?
+                .unwrap_or_default()
+                .checked_add(completed_bytes)
+                .context("remote completed byte counter overflow")?;
             record.remote_result_etag = result_etag;
             let encoded =
                 bincode::serialize(&record).context("failed to encode remote mutation")?;
@@ -284,10 +298,64 @@ impl Journal {
                 .context("failed to store remote result")?;
             drop(mutations);
             write_value(&mut meta, REMOTE_SEQ_KEY, &sequence)?;
+            write_value(&mut meta, REMOTE_BYTES_COMPLETED_KEY, &total_completed)?;
         }
         transaction
             .commit()
             .context("failed to commit remote watermark")
+    }
+
+    pub fn record_remote_failure(&self, sequence: Sequence, error: &str) -> Result<()> {
+        let mut transaction = self
+            .database
+            .begin_write()
+            .context("failed to record remote retry")?;
+        transaction
+            .set_durability(Durability::Immediate)
+            .context("failed to set journal durability")?;
+        {
+            let mut meta = transaction
+                .open_table(META)
+                .context("failed to open journal metadata")?;
+            let remote_seq = read_required::<u64>(&meta, REMOTE_SEQ_KEY)?;
+            let local_seq = read_required::<u64>(&meta, LOCAL_SEQ_KEY)?;
+            if sequence <= remote_seq || sequence > local_seq {
+                bail!(
+                    "remote failure sequence {sequence} must be above remote watermark {remote_seq} and at or below local watermark {local_seq}"
+                );
+            }
+
+            let mut mutations = transaction
+                .open_table(MUTATIONS)
+                .context("failed to open journal mutations")?;
+            let encoded = mutations
+                .get(sequence)
+                .context("failed to read failed remote mutation")?
+                .map(|value| value.value().to_vec())
+                .with_context(|| format!("journal mutation {sequence} does not exist"))?;
+            let mut record: MutationRecord = bincode::deserialize(&encoded)
+                .context("failed to decode failed remote mutation")?;
+            record.retry_count = record
+                .retry_count
+                .checked_add(1)
+                .context("remote mutation retry count overflow")?;
+            record.last_error = Some(error.chars().take(2_048).collect());
+            let encoded =
+                bincode::serialize(&record).context("failed to encode failed remote mutation")?;
+            mutations
+                .insert(sequence, encoded.as_slice())
+                .context("failed to store failed remote mutation")?;
+            drop(mutations);
+
+            let remote_retries = read_optional::<u64>(&meta, REMOTE_RETRIES_KEY)?
+                .unwrap_or_default()
+                .checked_add(1)
+                .context("remote retry counter overflow")?;
+            write_value(&mut meta, REMOTE_RETRIES_KEY, &remote_retries)?;
+        }
+        transaction
+            .commit()
+            .context("failed to commit remote retry")
     }
 
     pub fn remove_remote_prefix(&self, through: Sequence) -> Result<()> {
@@ -645,6 +713,8 @@ fn initialize_or_validate_identity(database: &Database, expected: &JournalIdenti
                 write_value(&mut meta, INCARNATION_KEY, &Uuid::new_v4())?;
                 write_value(&mut meta, LOCAL_SEQ_KEY, &0_u64)?;
                 write_value(&mut meta, REMOTE_SEQ_KEY, &0_u64)?;
+                write_value(&mut meta, REMOTE_BYTES_COMPLETED_KEY, &0_u64)?;
+                write_value(&mut meta, REMOTE_RETRIES_KEY, &0_u64)?;
             }
         }
         drop(meta);
@@ -671,6 +741,22 @@ fn read_required<T: serde::de::DeserializeOwned>(
         .with_context(|| format!("journal metadata key {key} is missing"))?;
     bincode::deserialize(&bytes)
         .with_context(|| format!("failed to decode journal metadata key {key}"))
+}
+
+fn read_optional<T: serde::de::DeserializeOwned>(
+    table: &impl ReadableTable<&'static str, &'static [u8]>,
+    key: &str,
+) -> Result<Option<T>> {
+    let Some(bytes) = table
+        .get(key)
+        .with_context(|| format!("failed to read journal metadata key {key}"))?
+        .map(|value| value.value().to_vec())
+    else {
+        return Ok(None);
+    };
+    bincode::deserialize(&bytes)
+        .with_context(|| format!("failed to decode journal metadata key {key}"))
+        .map(Some)
 }
 
 fn write_value<T: SerializeValue>(
