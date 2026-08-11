@@ -940,9 +940,7 @@ impl Db {
         self.mark_closing();
         match &self.inner {
             SlateDbHandle::ReadWrite(db) => {
-                if let Err(e) = db.close().await {
-                    exit_on_write_error(e);
-                }
+                db.close().await?;
             }
             SlateDbHandle::ReadOnly(reader_swap) => {
                 let reader = reader_swap.load();

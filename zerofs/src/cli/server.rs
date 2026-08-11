@@ -30,6 +30,10 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
+const SFTP_FINAL_DATABASE_CLOSE_TIMEOUT: Duration = Duration::from_secs(20);
+const SFTP_FINAL_WORKER_ABORT_TIMEOUT: Duration = Duration::from_secs(5);
+const SERVER_AUTHORITY_FINISH_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Parse a WAL config into an object store rooted at the full URL path.
 pub(crate) fn parse_wal_object_store(
     wal_config: &crate::config::WalConfig,
@@ -63,7 +67,7 @@ impl DatabaseMode {
 
 async fn resolve_checkpoint_name(settings: &Settings, name: &str) -> Result<uuid::Uuid> {
     let env_vars = settings.cloud_provider_env_vars();
-    let (object_store, path_from_url) = parse_url_opts_with_sftp(
+    let (object_store, path_from_url, sftp_pool) = parse_url_opts_with_sftp(
         &settings.storage.url.parse()?,
         env_vars,
         settings.sftp.as_ref(),
@@ -77,14 +81,45 @@ async fn resolve_checkpoint_name(settings: &Settings, name: &str) -> Result<uuid
 
     let mut admin_builder = AdminBuilder::new(db_path, object_store);
     if let Some(wal_config) = &settings.wal {
-        admin_builder = admin_builder.with_wal_object_store(parse_wal_object_store(wal_config)?);
+        let wal_object_store = match parse_wal_object_store(wal_config) {
+            Ok(store) => store,
+            Err(error) => {
+                if let Some(pool) = &sftp_pool
+                    && let Err(cleanup) = pool.shutdown().await
+                {
+                    return Err(error.context(format!(
+                        "SFTP checkpoint pool cleanup also failed: {cleanup}"
+                    )));
+                }
+                return Err(error);
+            }
+        };
+        admin_builder = admin_builder.with_wal_object_store(wal_object_store);
     }
     let admin = admin_builder.build();
 
-    let checkpoints = admin
-        .list_checkpoints(Some(name))
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to list checkpoints: {}", e))?;
+    let checkpoints = admin.list_checkpoints(Some(name)).await;
+    drop(admin);
+    let shutdown = match sftp_pool {
+        Some(pool) => pool.shutdown().await,
+        None => Ok(()),
+    };
+    let checkpoints = match (checkpoints, shutdown) {
+        (Ok(checkpoints), Ok(())) => checkpoints,
+        (Ok(_), Err(cleanup)) => {
+            return Err(anyhow::anyhow!(
+                "Failed to shut down SFTP checkpoint pool: {cleanup}"
+            ));
+        }
+        (Err(error), Ok(())) => {
+            return Err(anyhow::anyhow!("Failed to list checkpoints: {error}"));
+        }
+        (Err(error), Err(cleanup)) => {
+            return Err(anyhow::anyhow!(
+                "Failed to list checkpoints: {error}; SFTP checkpoint pool cleanup also failed: {cleanup}"
+            ));
+        }
+    };
 
     checkpoints
         .into_iter()
@@ -329,6 +364,27 @@ fn start_periodic_flush(
             }
         }
     })
+}
+
+async fn join_or_abort_background_tasks(mut handles: Vec<JoinHandle<()>>, deadline: Duration) {
+    if tokio::time::timeout(deadline, futures::future::join_all(handles.iter_mut()))
+        .await
+        .is_ok()
+    {
+        return;
+    }
+
+    tracing::warn!(
+        count = handles.len(),
+        timeout_secs = deadline.as_secs(),
+        "background tasks did not stop before final close; aborting them"
+    );
+    for handle in &handles {
+        handle.abort();
+    }
+    for handle in handles {
+        let _ = handle.await;
+    }
 }
 
 fn leadership_lost_error() -> anyhow::Error {
@@ -809,6 +865,7 @@ pub async fn build_slatedb(
 pub struct InitResult {
     pub fs: Arc<ZeroFS>,
     pub object_store: Arc<dyn object_store::ObjectStore>,
+    pub sftp_pool: Option<crate::sftp_transport::SftpSessionPool>,
     pub wal_object_store: Option<Arc<dyn object_store::ObjectStore>>,
     pub db_path: String,
     pub db_handle: SlateDbHandle,
@@ -893,342 +950,547 @@ pub async fn run_server(
     crate::telemetry::send_startup_event(&settings);
 
     let init_result = crate::cli::init::initialize_filesystem(&settings, db_mode).await?;
-    let fs = init_result.fs;
-    let authority = init_result.authority;
-    let leadership_deposed = authority
-        .as_ref()
-        .map_or_else(CancellationToken::new, |authority| authority.loss_token());
-    let shutdown = leadership_deposed.child_token();
+    let sftp_pool = init_result.sftp_pool.clone();
+    let sftp_pool_for_close = sftp_pool.clone();
+    let using_sftp = sftp_pool.is_some();
+    let server_result: anyhow::Result<()> = async move {
+        let fs = init_result.fs;
+        let authority = init_result.authority;
+        let leadership_deposed = authority
+            .as_ref()
+            .map_or_else(CancellationToken::new, |authority| authority.loss_token());
+        let shutdown = leadership_deposed.child_token();
 
-    // Do not start listeners after authority was revoked during initialization.
-    if leadership_deposed.is_cancelled() {
-        return Err(leadership_lost_error());
-    }
-
-    if !db_mode.is_read_only() && settings.servers.nbd.is_some() {
-        ensure_nbd_directory(&fs).await?;
-    }
-
-    let telemetry_handle = crate::telemetry::start_periodic_reporting(
-        &settings,
-        Arc::clone(&fs.global_stats),
-        shutdown.clone(),
-    );
-
-    let prometheus_handles = if let Some(ref prometheus_config) = settings.prometheus {
-        let slatedb_registry = fs.db.slatedb_metrics();
-        crate::prometheus::start(
-            prometheus_config,
-            Arc::clone(&fs.stats),
-            Arc::clone(&fs.global_stats),
-            fs.extent_store.segment_gc_stats(),
-            Arc::clone(&fs.dedup),
-            slatedb_registry,
-            shutdown.clone(),
-        )
-    } else {
-        Vec::new()
-    };
-
-    // Metadata compaction digest: at most one line per interval, only when
-    // compaction ran, plus a crossing-only L0 backlog warning. Summarizes the
-    // engine's per-compaction lines, which the default filter drops.
-    // Read-write mode only: readers run no compaction.
-    let digest_handle = match (fs.db.slatedb_metrics(), fs.db.subscribe_status()) {
-        (Some(recorder), Some(status)) => Some(crate::metadata_digest::spawn(
-            recorder,
-            status,
-            settings
-                .lsm
-                .map(|c| c.l0_max_ssts())
-                .unwrap_or(crate::config::LsmConfig::DEFAULT_L0_MAX_SSTS),
-            shutdown.clone(),
-        )),
-        _ => None,
-    };
-
-    let nfs_handles = start_nfs_servers(
-        Arc::clone(&fs),
-        settings.servers.nfs.as_ref(),
-        shutdown.clone(),
-    )
-    .await;
-
-    let ninep_handles = start_ninep_servers(
-        Arc::clone(&fs),
-        settings.servers.ninep.as_ref(),
-        shutdown.clone(),
-    );
-
-    let nbd_handles = start_nbd_servers(
-        Arc::clone(&fs),
-        settings.servers.nbd.as_ref(),
-        shutdown.clone(),
-    )
-    .await;
-
-    // A read-only admin over the same store for the GC's checkpoint gate; built
-    // before the store/path are moved into the checkpoint manager below.
-    let gc_admin = if !db_mode.is_read_only() {
-        Some(
-            AdminBuilder::new(
-                slatedb::object_store::path::Path::from(init_result.db_path.clone()),
-                Arc::clone(&init_result.object_store),
-            )
-            .build(),
-        )
-    } else {
-        None
-    };
-
-    let checkpoint_manager = Arc::new(CheckpointManager::new(
-        init_result.db_handle,
-        slatedb::object_store::path::Path::from(init_result.db_path),
-        init_result.object_store,
-        init_result.wal_object_store.clone(),
-    ));
-    // Checkpoints must not durably publish a FrameLoc whose segment is still in
-    // the RAM open buffer: seal + flush under the barrier first (see
-    // CheckpointManager::create_checkpoint). Read-only mode has no writer to seal.
-    if !db_mode.is_read_only() {
-        let fc = fs.flush_coordinator.clone();
-        checkpoint_manager.set_pre_flush(Arc::new(move || {
-            let fc = fc.clone();
-            Box::pin(async move {
-                fc.flush()
-                    .await
-                    .map_err(|e| anyhow::anyhow!("seal+flush failed: {:?}", e))
-            })
-        }));
-    }
-    #[cfg(feature = "webui")]
-    let checkpoint_manager_for_webui = Arc::clone(&checkpoint_manager);
-    let rpc_handles = start_rpc_servers(
-        settings.servers.rpc.as_ref(),
-        checkpoint_manager,
-        Arc::clone(&fs),
-        shutdown.clone(),
-    )
-    .await;
-
-    // Keep the metadata block cache warm so the first wave of reads (and the
-    // reads right after every compaction, which replaces meta SSTs with cold
-    // ones) doesn't serialize on object-store GETs of filters/indexes. Read-only
-    // opens get no block cache (see `open_database`), so `subscribe_status`
-    // returns `None` and warming is skipped there.
-    if settings.cache.warm_metadata != crate::config::WarmMetadata::Off
-        && let Some(status) = fs.db.subscribe_status()
-    {
-        let fs = Arc::clone(&fs);
-        let warm_data = settings.cache.warm_metadata == crate::config::WarmMetadata::Full;
-        let shutdown = shutdown.clone();
-        let warm = async move {
-            fs.db.warm_metadata_watch(warm_data, status, shutdown).await;
-        };
-        match &maintenance_runtime {
-            Some(handle) => {
-                handle.spawn(warm);
-            }
-            None => {
-                tokio::spawn(warm);
-            }
-        }
-    }
-
-    let gc_handle = if !db_mode.is_read_only() {
-        let tuning = crate::fs::gc::GcTuning::from(settings.gc.unwrap_or_default());
-        let gc = Arc::new(GarbageCollector::new(
-            Arc::clone(&fs.db),
-            fs.tombstone_store.clone(),
-            fs.extent_store.clone(),
-            Arc::clone(&fs.stats),
-            gc_admin,
-            tuning,
-        ));
-        Some(gc.start(shutdown.clone(), maintenance_runtime.clone()))
-    } else {
-        None
-    };
-    let stats_handle = start_stats_reporting(Arc::clone(&fs), shutdown.clone());
-    let flush_handle = if !db_mode.is_read_only() {
-        let flush_interval_secs = settings
-            .lsm
-            .map(|c| c.flush_interval_secs())
-            .unwrap_or(crate::config::LsmConfig::DEFAULT_FLUSH_INTERVAL_SECS);
-        Some(start_periodic_flush(
-            Arc::clone(&fs),
-            flush_interval_secs,
-            shutdown.clone(),
-        ))
-    } else {
-        None
-    };
-
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-
-    #[cfg(feature = "webui")]
-    let webui_handles = if let Some(ref webui_config) = settings.servers.webui {
-        let webui_rpc_service = crate::rpc::server::AdminRpcServer::new(
-            checkpoint_manager_for_webui,
-            Arc::clone(&fs),
-            shutdown.clone(),
-        );
-        let webui_lock_manager = Arc::new(crate::ninep::lock_manager::FileLockManager::new());
-        crate::webui::start(
-            webui_config,
-            Arc::clone(&fs),
-            webui_lock_manager,
-            webui_rpc_service,
-            shutdown.clone(),
-        )
-    } else {
-        Vec::new()
-    };
-
-    let mut server_handles = Vec::new();
-    server_handles.extend(nfs_handles);
-    server_handles.extend(ninep_handles);
-    server_handles.extend(nbd_handles);
-    server_handles.extend(rpc_handles);
-    #[cfg(feature = "webui")]
-    server_handles.extend(webui_handles);
-
-    if server_handles.is_empty() {
-        return Err(anyhow::anyhow!(
-            "No servers configured. At least one server (NFS, 9P, NBD, or RPC) must be enabled."
-        ));
-    }
-
-    let deposed = tokio::select! {
-        biased;
-        _ = leadership_deposed.cancelled() => {
-            tracing::error!(
-                "HA: this serving runtime was fenced or superseded; stopping without flushing \
-                 the stale database"
-            );
-            true
-        }
-        _ = tokio::signal::ctrl_c() => {
-            info!("Received SIGINT, initiating graceful shutdown...");
-            false
-        }
-        _ = sigterm.recv() => {
-            info!("Received SIGTERM, initiating graceful shutdown...");
-            false
-        }
-    };
-
-    info!("Cancelling all servers and background tasks...");
-    shutdown.cancel();
-
-    // Retain the join future so leadership loss cannot detach serving tasks.
-    let mut serving_drain = Box::pin(futures::future::join_all(server_handles));
-
-    let deposed_while_draining_servers = if deposed {
-        true
-    } else {
-        info!("Waiting for servers to exit...");
-        tokio::select! {
-            biased;
-            _ = leadership_deposed.cancelled() => true,
-            _ = &mut serving_drain => false,
-        }
-    };
-    if deposed_while_draining_servers {
-        // A deposed database is not flushed. Serving transports get one bounded
-        // interval to emit queued CLEAN responses.
-        if tokio::time::timeout(
-            crate::replication::RESPONSE_DRAIN_TIMEOUT,
-            &mut serving_drain,
-        )
-        .await
-        .is_err()
-        {
-            tracing::warn!("serving response drain timed out after leadership loss");
-        }
-        return Err(leadership_lost_error());
-    }
-
-    let drain = async move {
-        info!("Waiting for background tasks to exit...");
-        if let Some(gc_handles) = gc_handle {
-            for handle in gc_handles {
-                if tokio::time::timeout(std::time::Duration::from_secs(15), handle)
-                    .await
-                    .is_err()
-                {
-                    info!("a GC task is still mid-pass after 15s; proceeding to the final flush");
-                }
-            }
-        }
-        let _ = stats_handle.await;
-        if let Some(flush_handle) = flush_handle {
-            let _ = flush_handle.await;
-        }
-        if let Some(handle) = telemetry_handle {
-            let _ = handle.await;
-        }
-        if let Some(handle) = digest_handle {
-            let _ = handle.await;
-        }
-        for handle in prometheus_handles {
-            let _ = handle.await;
-        }
-    };
-    tokio::select! {
-        biased;
-        _ = leadership_deposed.cancelled() => {
+        // Do not start listeners after authority was revoked during initialization.
+        if leadership_deposed.is_cancelled() {
             return Err(leadership_lost_error());
         }
-        _ = drain => {}
-    }
 
-    // Flush remains lease-gated while background tasks drain.
-    if leadership_deposed.is_cancelled() {
-        return Err(leadership_lost_error());
-    }
-    info!("Performing final flush and closing database...");
-    if db_mode.is_read_only() {
-        if let Err(e) = fs.db.close().await {
-            tracing::error!("Database close failed: {:?}", e);
-            return Err(e);
+        if !db_mode.is_read_only() && settings.servers.nbd.is_some() {
+            ensure_nbd_directory(&fs).await?;
         }
-    } else {
-        let close_result = tokio::select! {
+
+        let any_server_configured = settings.servers.nfs.is_some()
+            || settings.servers.ninep.is_some()
+            || settings.servers.nbd.is_some()
+            || settings.servers.rpc.is_some();
+        #[cfg(feature = "webui")]
+        let any_server_configured =
+            any_server_configured || settings.servers.webui.is_some();
+        if !any_server_configured {
+            return Err(anyhow::anyhow!(
+                "No servers configured. At least one server (NFS, 9P, NBD, or RPC) must be enabled."
+            ));
+        }
+
+        // Register the only fallible signal source before starting any
+        // background object-store consumers.
+        let mut sigterm =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+
+        let telemetry_handle = crate::telemetry::start_periodic_reporting(
+            &settings,
+            Arc::clone(&fs.global_stats),
+            shutdown.clone(),
+        );
+
+        let prometheus_handles = if let Some(ref prometheus_config) = settings.prometheus {
+            let slatedb_registry = fs.db.slatedb_metrics();
+            crate::prometheus::start(
+                prometheus_config,
+                Arc::clone(&fs.stats),
+                Arc::clone(&fs.global_stats),
+                fs.extent_store.segment_gc_stats(),
+                Arc::clone(&fs.dedup),
+                slatedb_registry,
+                shutdown.clone(),
+            )
+        } else {
+            Vec::new()
+        };
+
+        // Metadata compaction digest: at most one line per interval, only when
+        // compaction ran, plus a crossing-only L0 backlog warning. Summarizes the
+        // engine's per-compaction lines, which the default filter drops.
+        // Read-write mode only: readers run no compaction.
+        let digest_handle = match (fs.db.slatedb_metrics(), fs.db.subscribe_status()) {
+            (Some(recorder), Some(status)) => Some(crate::metadata_digest::spawn(
+                recorder,
+                status,
+                settings
+                    .lsm
+                    .map(|c| c.l0_max_ssts())
+                    .unwrap_or(crate::config::LsmConfig::DEFAULT_L0_MAX_SSTS),
+                shutdown.clone(),
+            )),
+            _ => None,
+        };
+
+        let nfs_handles = start_nfs_servers(
+            Arc::clone(&fs),
+            settings.servers.nfs.as_ref(),
+            shutdown.clone(),
+        )
+        .await;
+
+        let ninep_handles = start_ninep_servers(
+            Arc::clone(&fs),
+            settings.servers.ninep.as_ref(),
+            shutdown.clone(),
+        );
+
+        let nbd_handles = start_nbd_servers(
+            Arc::clone(&fs),
+            settings.servers.nbd.as_ref(),
+            shutdown.clone(),
+        )
+        .await;
+
+        // A read-only admin over the same store for the GC's checkpoint gate; built
+        // before the store/path are moved into the checkpoint manager below.
+        let gc_admin = if !db_mode.is_read_only() {
+            Some(
+                AdminBuilder::new(
+                    slatedb::object_store::path::Path::from(init_result.db_path.clone()),
+                    Arc::clone(&init_result.object_store),
+                )
+                .build(),
+            )
+        } else {
+            None
+        };
+
+        let checkpoint_manager = Arc::new(CheckpointManager::new(
+            init_result.db_handle,
+            slatedb::object_store::path::Path::from(init_result.db_path),
+            init_result.object_store,
+            init_result.wal_object_store.clone(),
+        ));
+        // Checkpoints must not durably publish a FrameLoc whose segment is still in
+        // the RAM open buffer: seal + flush under the barrier first (see
+        // CheckpointManager::create_checkpoint). Read-only mode has no writer to seal.
+        if !db_mode.is_read_only() {
+            let fc = fs.flush_coordinator.clone();
+            checkpoint_manager.set_pre_flush(Arc::new(move || {
+                let fc = fc.clone();
+                Box::pin(async move {
+                    fc.flush()
+                        .await
+                        .map_err(|e| anyhow::anyhow!("seal+flush failed: {:?}", e))
+                })
+            }));
+        }
+        #[cfg(feature = "webui")]
+        let checkpoint_manager_for_webui = Arc::clone(&checkpoint_manager);
+        let rpc_handles = start_rpc_servers(
+            settings.servers.rpc.as_ref(),
+            checkpoint_manager,
+            Arc::clone(&fs),
+            shutdown.clone(),
+        )
+        .await;
+
+        // Keep the metadata block cache warm so the first wave of reads (and the
+        // reads right after every compaction, which replaces meta SSTs with cold
+        // ones) doesn't serialize on object-store GETs of filters/indexes. Read-only
+        // opens get no block cache (see `open_database`), so `subscribe_status`
+        // returns `None` and warming is skipped there.
+        let warm_metadata_handle = if settings.cache.warm_metadata
+            != crate::config::WarmMetadata::Off
+            && let Some(status) = fs.db.subscribe_status()
+        {
+            let fs = Arc::clone(&fs);
+            let warm_data = settings.cache.warm_metadata == crate::config::WarmMetadata::Full;
+            let shutdown = shutdown.clone();
+            let warm = async move {
+                fs.db.warm_metadata_watch(warm_data, status, shutdown).await;
+            };
+            Some(match &maintenance_runtime {
+                Some(handle) => handle.spawn(warm),
+                None => tokio::spawn(warm),
+            })
+        } else {
+            None
+        };
+
+        let gc_handle = if !db_mode.is_read_only() {
+            let tuning = crate::fs::gc::GcTuning::from(settings.gc.unwrap_or_default());
+            let gc = Arc::new(GarbageCollector::new(
+                Arc::clone(&fs.db),
+                fs.tombstone_store.clone(),
+                fs.extent_store.clone(),
+                Arc::clone(&fs.stats),
+                gc_admin,
+                tuning,
+            ));
+            Some(gc.start(shutdown.clone(), maintenance_runtime.clone()))
+        } else {
+            None
+        };
+        let stats_handle = start_stats_reporting(Arc::clone(&fs), shutdown.clone());
+        let flush_handle = if !db_mode.is_read_only() {
+            let flush_interval_secs = settings
+                .lsm
+                .map(|c| c.flush_interval_secs())
+                .unwrap_or(crate::config::LsmConfig::DEFAULT_FLUSH_INTERVAL_SECS);
+            Some(start_periodic_flush(
+                Arc::clone(&fs),
+                flush_interval_secs,
+                shutdown.clone(),
+            ))
+        } else {
+            None
+        };
+
+        #[cfg(feature = "webui")]
+        let webui_handles = if let Some(ref webui_config) = settings.servers.webui {
+            let webui_rpc_service = crate::rpc::server::AdminRpcServer::new(
+                checkpoint_manager_for_webui,
+                Arc::clone(&fs),
+                shutdown.clone(),
+            );
+            let webui_lock_manager = Arc::new(crate::ninep::lock_manager::FileLockManager::new());
+            crate::webui::start(
+                webui_config,
+                Arc::clone(&fs),
+                webui_lock_manager,
+                webui_rpc_service,
+                shutdown.clone(),
+            )
+        } else {
+            Vec::new()
+        };
+
+        let mut server_handles = Vec::new();
+        server_handles.extend(nfs_handles);
+        server_handles.extend(ninep_handles);
+        server_handles.extend(nbd_handles);
+        server_handles.extend(rpc_handles);
+        #[cfg(feature = "webui")]
+        server_handles.extend(webui_handles);
+
+        debug_assert!(!server_handles.is_empty());
+
+        let deposed = tokio::select! {
             biased;
             _ = leadership_deposed.cancelled() => {
-                return Err(leadership_lost_error());
+                tracing::error!(
+                    "HA: this serving runtime was fenced or superseded; stopping without flushing \
+                     the stale database"
+                );
+                true
             }
-            result = fs.flush_coordinator.close() => result,
+            _ = tokio::signal::ctrl_c() => {
+                info!("Received SIGINT, initiating graceful shutdown...");
+                false
+            }
+            _ = sigterm.recv() => {
+                info!("Received SIGTERM, initiating graceful shutdown...");
+                false
+            }
         };
-        if let Err(e) = close_result {
-            // `db.close()` may flush metadata, so it is unsafe after seal failure.
-            tracing::error!(
-                "Final flush+close failed ({e:?}); exiting without a separate database close"
-            );
-            std::process::exit(1);
+
+        info!("Cancelling all servers and background tasks...");
+        shutdown.cancel();
+
+        // Retain the join future so leadership loss cannot detach serving tasks.
+        let mut serving_drain = Box::pin(futures::future::join_all(server_handles));
+
+        let deposed_while_draining_servers = if deposed {
+            true
+        } else {
+            info!("Waiting for servers to exit...");
+            tokio::select! {
+                biased;
+                _ = leadership_deposed.cancelled() => true,
+                _ = &mut serving_drain => false,
+            }
+        };
+        if deposed_while_draining_servers {
+            // A deposed database is not flushed. Serving transports get one bounded
+            // interval to emit queued CLEAN responses.
+            if tokio::time::timeout(
+                crate::replication::RESPONSE_DRAIN_TIMEOUT,
+                &mut serving_drain,
+            )
+            .await
+            .is_err()
+            {
+                tracing::warn!("serving response drain timed out after leadership loss");
+            }
+            return Err(leadership_lost_error());
+        }
+
+        let drain = async move {
+            info!("Waiting for background tasks to exit...");
+            if let Some(mut gc_handles) = gc_handle
+                && tokio::time::timeout(
+                    std::time::Duration::from_secs(15),
+                    futures::future::join_all(gc_handles.iter_mut()),
+                )
+                .await
+                .is_err()
+            {
+                info!("GC tasks are still mid-pass after 15s; aborting them before final flush");
+                for handle in &gc_handles {
+                    handle.abort();
+                }
+                for handle in gc_handles {
+                    let _ = handle.await;
+                }
+            }
+            if let Some(mut handle) = warm_metadata_handle
+                && tokio::time::timeout(std::time::Duration::from_secs(5), &mut handle)
+                    .await
+                    .is_err()
+            {
+                info!("metadata warming is still active after 5s; aborting it before final flush");
+                handle.abort();
+                let _ = handle.await;
+            }
+            let mut background_handles = vec![stats_handle];
+            if let Some(flush_handle) = flush_handle {
+                background_handles.push(flush_handle);
+            }
+            if let Some(handle) = telemetry_handle {
+                background_handles.push(handle);
+            }
+            if let Some(handle) = digest_handle {
+                background_handles.push(handle);
+            }
+            background_handles.extend(prometheus_handles);
+            join_or_abort_background_tasks(
+                background_handles,
+                SFTP_FINAL_WORKER_ABORT_TIMEOUT,
+            )
+            .await;
+        };
+        drain.await;
+
+        // Flush remains lease-gated while background tasks drain.
+        if leadership_deposed.is_cancelled() {
+            return Err(leadership_lost_error());
+        }
+        info!("Performing final flush and closing database...");
+        if db_mode.is_read_only() {
+            let close_result = if using_sftp {
+                let db = Arc::clone(&fs.db);
+                let mut close_owner = tokio::spawn(async move { db.close().await });
+                match tokio::time::timeout(SFTP_FINAL_DATABASE_CLOSE_TIMEOUT, &mut close_owner)
+                    .await
+                {
+                    Ok(result) => result.map_err(|error| {
+                        anyhow::anyhow!("read-only database close owner failed: {error}")
+                    })?,
+                    Err(_) => {
+                        sftp_pool_for_close
+                            .as_ref()
+                            .expect("using_sftp implies a retained pool")
+                            .begin_shutdown();
+                        match tokio::time::timeout(
+                            SFTP_FINAL_DATABASE_CLOSE_TIMEOUT,
+                            &mut close_owner,
+                        )
+                        .await
+                        {
+                            Ok(result) => result.map_err(|error| {
+                                anyhow::anyhow!(
+                                    "read-only database close owner failed after SFTP shutdown began: {error}"
+                                )
+                            })?,
+                            Err(_) => {
+                                close_owner.abort();
+                                let _ = close_owner.await;
+                                return Err(anyhow::anyhow!(
+                                    "SFTP-backed database close did not finish within {}s after terminal pool shutdown began",
+                                    SFTP_FINAL_DATABASE_CLOSE_TIMEOUT.as_secs()
+                                ));
+                            }
+                        }
+                    }
+                }
+            } else {
+                fs.db.close().await
+            };
+            if let Err(e) = close_result {
+                tracing::error!("Database close failed: {:?}", e);
+                return Err(e);
+            }
+        } else {
+            let close_result = if using_sftp {
+                let mut closing = Box::pin(fs.flush_coordinator.close());
+                tokio::select! {
+                    biased;
+                    _ = leadership_deposed.cancelled() => {
+                        drop(closing);
+                        match tokio::time::timeout(
+                            SFTP_FINAL_WORKER_ABORT_TIMEOUT,
+                            fs.flush_coordinator.abort_close_worker(),
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => {}
+                            Ok(Err(error)) => tracing::error!(
+                                ?error,
+                                "failed to abort final flush worker after leadership loss"
+                            ),
+                            Err(error) => tracing::error!(
+                                %error,
+                                "timed out aborting final flush worker after leadership loss"
+                            ),
+                        }
+                        return Err(leadership_lost_error());
+                    }
+                    result = tokio::time::timeout(
+                        SFTP_FINAL_DATABASE_CLOSE_TIMEOUT,
+                        &mut closing,
+                    ) => match result {
+                        Ok(result) => result,
+                        Err(_) => {
+                            sftp_pool_for_close
+                                .as_ref()
+                                .expect("using_sftp implies a retained pool")
+                                .begin_shutdown();
+                            match tokio::time::timeout(
+                                SFTP_FINAL_DATABASE_CLOSE_TIMEOUT,
+                                &mut closing,
+                            ).await {
+                                Ok(result) => result,
+                                Err(_) => {
+                                    drop(closing);
+                                    tokio::time::timeout(
+                                        SFTP_FINAL_WORKER_ABORT_TIMEOUT,
+                                        fs.flush_coordinator.abort_close_worker(),
+                                    )
+                                    .await
+                                    .map_err(|_| {
+                                        anyhow::anyhow!(
+                                            "timed out aborting the SFTP-backed final flush worker after {}s",
+                                            SFTP_FINAL_WORKER_ABORT_TIMEOUT.as_secs()
+                                        )
+                                    })?
+                                    .map_err(|error| {
+                                        anyhow::anyhow!(
+                                            "failed to abort the SFTP-backed final flush worker: {error:?}"
+                                        )
+                                    })?;
+                                    return Err(anyhow::anyhow!(
+                                        "SFTP-backed final flush+close did not finish within {}s after terminal pool shutdown began",
+                                        SFTP_FINAL_DATABASE_CLOSE_TIMEOUT.as_secs()
+                                    ));
+                                }
+                            }
+                        }
+                    },
+                }
+            } else {
+                let mut closing = Box::pin(fs.flush_coordinator.close());
+                tokio::select! {
+                    biased;
+                    _ = leadership_deposed.cancelled() => {
+                        drop(closing);
+                        match tokio::time::timeout(
+                            SFTP_FINAL_WORKER_ABORT_TIMEOUT,
+                            fs.flush_coordinator.abort_close_worker(),
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => {}
+                            Ok(Err(error)) => tracing::error!(
+                                ?error,
+                                "failed to abort final flush worker after leadership loss"
+                            ),
+                            Err(error) => tracing::error!(
+                                %error,
+                                "timed out aborting final flush worker after leadership loss"
+                            ),
+                        }
+                        return Err(leadership_lost_error());
+                    }
+                    result = &mut closing => result,
+                }
+            };
+            if let Err(e) = close_result {
+                // `db.close()` may flush metadata, so it is unsafe after seal failure.
+                tracing::error!(
+                    "Final flush+close failed ({e:?}); exiting without a separate database close"
+                );
+                return Err(anyhow::anyhow!("Final flush+close failed: {e:?}"));
+            }
+        }
+
+        if leadership_deposed.is_cancelled() {
+            return Err(leadership_lost_error());
+        }
+
+        // Retain authority monitors until the database is closed.
+        if let Some(authority) = authority {
+            tokio::time::timeout(
+                SERVER_AUTHORITY_FINISH_TIMEOUT,
+                authority.finish_after_close(),
+            )
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "authority shutdown timed out after {}s",
+                    SERVER_AUTHORITY_FINISH_TIMEOUT.as_secs()
+                )
+            })?;
+        }
+        if leadership_deposed.is_cancelled() {
+            return Err(leadership_lost_error());
+        }
+
+        Ok(())
+    }
+    .await;
+
+    let sftp_shutdown = match sftp_pool {
+        Some(pool) => {
+            info!("Waiting for SFTP sessions and lifecycle tasks to exit...");
+            pool.shutdown()
+                .await
+                .context("Failed to shut down SFTP session pool")
+        }
+        None => Ok(()),
+    };
+    match (server_result, sftp_shutdown) {
+        (Ok(()), Ok(())) => {
+            info!("Shutdown complete");
+            Ok(())
+        }
+        (Err(server), Ok(())) => Err(server),
+        (Ok(()), Err(shutdown)) => Err(shutdown),
+        (Err(server), Err(shutdown)) => {
+            Err(server.context(format!("SFTP shutdown also failed: {shutdown:#}")))
         }
     }
-
-    if leadership_deposed.is_cancelled() {
-        return Err(leadership_lost_error());
-    }
-
-    // Retain authority monitors until the database is closed.
-    if let Some(authority) = authority {
-        authority.finish_after_close().await;
-    }
-    if leadership_deposed.is_cancelled() {
-        return Err(leadership_lost_error());
-    }
-
-    info!("Shutdown complete");
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn final_drain_aborts_a_stuck_background_caller() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (alive_tx, alive_rx) = tokio::sync::oneshot::channel::<()>();
+        let handle = tokio::spawn(async move {
+            let _alive = alive_tx;
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        started_rx.await.unwrap();
+
+        let started = tokio::time::Instant::now();
+        join_or_abort_background_tasks(vec![handle], std::time::Duration::from_secs(5)).await;
+
+        assert_eq!(started.elapsed(), std::time::Duration::from_secs(5));
+        assert!(
+            alive_rx.await.is_err(),
+            "stuck task was not aborted and joined"
+        );
+    }
 
     #[test]
     fn barrier_controlled_flush_thresholds_are_valid() {

@@ -31,6 +31,7 @@ use tracing::info;
 /// State retained across role-election and writer-open retries.
 struct StartupContext {
     object_store: Arc<dyn object_store::ObjectStore>,
+    sftp_pool: Option<crate::sftp_transport::SftpSessionPool>,
     /// Retrying store for direct ZeroFS I/O, including pre-serving HA ownership.
     retrying_object_store: Arc<dyn object_store::ObjectStore>,
     wal_object_store: Option<Arc<dyn object_store::ObjectStore>>,
@@ -132,126 +133,150 @@ impl StartupContext {
 
         let env_vars = settings.cloud_provider_env_vars();
 
-        let (object_store, path_from_url) = parse_url_opts_with_sftp(
+        let (object_store, path_from_url, sftp_pool) = parse_url_opts_with_sftp(
             &url.parse().context("Failed to parse storage URL")?,
             env_vars,
             settings.sftp.as_ref(),
         )
         .await
         .context("Failed to connect to storage backend")?;
-        let object_store = with_storage_class(
-            Arc::from(object_store),
-            settings.storage.storage_class.as_deref(),
-        );
+        let cleanup_pool = sftp_pool.clone();
+        let prepared: Result<Self> = async {
+            let object_store = with_storage_class(
+                Arc::from(object_store),
+                settings.storage.storage_class.as_deref(),
+            );
 
-        let actual_db_path = path_from_url.to_string();
+            let actual_db_path = path_from_url.to_string();
 
-        info!("Starting ZeroFS server with {} backend", object_store);
-        info!("DB Path: {}", actual_db_path);
-        info!(
-            "Base Cache Directory: {}",
-            cache_config.root_folder.display()
-        );
-        info!("Cache Size: {} GB", cache_config.max_cache_size_gb);
+            info!("Starting ZeroFS server with {} backend", object_store);
+            info!("DB Path: {}", actual_db_path);
+            info!(
+                "Base Cache Directory: {}",
+                cache_config.root_folder.display()
+            );
+            info!("Cache Size: {} GB", cache_config.max_cache_size_gb);
 
-        info!("Checking bucket identity...");
-        let bucket = bucket_identity::BucketIdentity::get_or_create(&object_store, &actual_db_path)
-            .await
-            .context("Failed to resolve bucket identity")?;
+            info!("Checking bucket identity...");
+            let bucket =
+                bucket_identity::BucketIdentity::get_or_create(&object_store, &actual_db_path)
+                    .await
+                    .context("Failed to resolve bucket identity")?;
 
-        let cache_config = CacheConfig {
-            root_folder: cache_config.root_folder.join(bucket.cache_directory_name()),
-            ..cache_config
-        };
-
-        info!(
-            "Bucket ID: {}, Cache directory: {}",
-            bucket.id(),
-            cache_config.root_folder.display()
-        );
-
-        if !db_mode.is_read_only() {
-            crate::storage_compatibility::check_if_match_support(&object_store, &actual_db_path)
-                .await?;
-        }
-
-        let password = settings.storage.encryption_password.clone();
-        crate::cli::password::validate_password(&password).context("Password validation failed")?;
-
-        info!("Loading or initializing encryption key from object store");
-        let db_path = Path::from(actual_db_path.clone());
-        let encryption_key = key_management::load_or_init_encryption_key(
-            &object_store,
-            &db_path,
-            &password,
-            db_mode.is_read_only(),
-        )
-        .await
-        .context("Failed to load or initialize encryption key")?;
-
-        let block_transformer: Arc<dyn BlockTransformer> =
-            ZeroFsBlockTransformer::new_arc(&encryption_key, settings.compression());
-
-        let wal_object_store: Option<Arc<dyn object_store::ObjectStore>> =
-            if let Some(wal_config) = &settings.wal {
-                info!("Using separate WAL object store: {}", wal_config.url);
-                Some(
-                    parse_wal_object_store(wal_config)
-                        .context("Failed to connect to WAL object store")?,
-                )
-            } else {
-                None
+            let cache_config = CacheConfig {
+                root_folder: cache_config.root_folder.join(bucket.cache_directory_name()),
+                ..cache_config
             };
 
-        let replication_params = settings
-            .replication
-            .as_ref()
-            .map(crate::replication::ReplicationParams::from_config);
-        let configured_replication_role = settings.replication.as_ref().map(|cfg| cfg.role);
+            info!(
+                "Bucket ID: {}, Cache directory: {}",
+                bucket.id(),
+                cache_config.root_folder.display()
+            );
 
-        // Shared by request handling and takeover reconciliation.
-        let dedup = Arc::new(crate::dedup::DedupCache::new());
-        dedup.start_expiry_reaper();
+            if !db_mode.is_read_only() {
+                crate::storage_compatibility::check_if_match_support(
+                    &object_store,
+                    &actual_db_path,
+                )
+                .await?;
+            }
 
-        // Trace at the bottom of the stack so otrace sees the requests that
-        // actually leave the process. Everything above (length-check, prefetch,
-        // compactor) reads through these wrappers; cache hits make no backend
-        // request and so produce no event.
-        let object_tracer = ObjectTracer::new();
-        let object_store = Arc::new(TracingObjectStore::new(
-            object_store,
-            object_tracer.clone(),
-            "data",
-        )) as Arc<dyn object_store::ObjectStore>;
-        let wal_object_store = wal_object_store.map(|s| {
-            Arc::new(TracingObjectStore::new(s, object_tracer.clone(), "wal"))
-                as Arc<dyn object_store::ObjectStore>
-        });
+            let password = settings.storage.encryption_password.clone();
+            crate::cli::password::validate_password(&password)
+                .context("Password validation failed")?;
 
-        Ok(Self {
-            retrying_object_store: Arc::new(
-                crate::retrying_object_store::RetryingObjectStore::new(object_store.clone()),
-            ),
-            object_store,
-            wal_object_store,
-            object_tracer,
-            actual_db_path,
-            block_transformer,
-            segment_codec: crate::frame_codec::FrameCodec::new(
-                &encryption_key,
-                crate::segment::SEGMENT_INFO,
-                settings.compression(),
-            ),
-            cache_config,
-            dedup,
-            replication_params,
-            configured_replication_role,
-            db_mode,
-            ha: None,
-            took_over_from_standby: false,
-            recovering_handoff: false,
-            opening: None,
-        })
+            info!("Loading or initializing encryption key from object store");
+            let db_path = Path::from(actual_db_path.clone());
+            let encryption_key = key_management::load_or_init_encryption_key(
+                &object_store,
+                &db_path,
+                &password,
+                db_mode.is_read_only(),
+            )
+            .await
+            .context("Failed to load or initialize encryption key")?;
+
+            let block_transformer: Arc<dyn BlockTransformer> =
+                ZeroFsBlockTransformer::new_arc(&encryption_key, settings.compression());
+
+            let wal_object_store: Option<Arc<dyn object_store::ObjectStore>> =
+                if let Some(wal_config) = &settings.wal {
+                    info!("Using separate WAL object store: {}", wal_config.url);
+                    Some(
+                        parse_wal_object_store(wal_config)
+                            .context("Failed to connect to WAL object store")?,
+                    )
+                } else {
+                    None
+                };
+
+            let replication_params = settings
+                .replication
+                .as_ref()
+                .map(crate::replication::ReplicationParams::from_config);
+            let configured_replication_role = settings.replication.as_ref().map(|cfg| cfg.role);
+
+            // Shared by request handling and takeover reconciliation.
+            let dedup = Arc::new(crate::dedup::DedupCache::new());
+            dedup.start_expiry_reaper();
+
+            // Trace at the bottom of the stack so otrace sees the requests that
+            // actually leave the process. Everything above (length-check, prefetch,
+            // compactor) reads through these wrappers; cache hits make no backend
+            // request and so produce no event.
+            let object_tracer = ObjectTracer::new();
+            let object_store = Arc::new(TracingObjectStore::new(
+                object_store,
+                object_tracer.clone(),
+                "data",
+            )) as Arc<dyn object_store::ObjectStore>;
+            let wal_object_store = wal_object_store.map(|s| {
+                Arc::new(TracingObjectStore::new(s, object_tracer.clone(), "wal"))
+                    as Arc<dyn object_store::ObjectStore>
+            });
+
+            Ok(Self {
+                retrying_object_store: Arc::new(
+                    crate::retrying_object_store::RetryingObjectStore::new(object_store.clone()),
+                ),
+                object_store,
+                sftp_pool,
+                wal_object_store,
+                object_tracer,
+                actual_db_path,
+                block_transformer,
+                segment_codec: crate::frame_codec::FrameCodec::new(
+                    &encryption_key,
+                    crate::segment::SEGMENT_INFO,
+                    settings.compression(),
+                ),
+                cache_config,
+                dedup,
+                replication_params,
+                configured_replication_role,
+                db_mode,
+                ha: None,
+                took_over_from_standby: false,
+                recovering_handoff: false,
+                opening: None,
+            })
+        }
+        .await;
+
+        match prepared {
+            Ok(prepared) => Ok(prepared),
+            Err(error) => {
+                if let Some(pool) = cleanup_pool
+                    && let Err(cleanup) = pool.shutdown().await
+                {
+                    return Err(error.context(format!(
+                        "SFTP pool cleanup after initialization failure also failed: {cleanup}"
+                    )));
+                }
+                Err(error)
+            }
+        }
     }
 
     /// Answers Hello (so a peer learns our state) and buffers the leader's stream
@@ -858,6 +883,7 @@ impl ReconciledDb {
         };
         let StartupContext {
             object_store,
+            sftp_pool,
             retrying_object_store,
             wal_object_store,
             object_tracer,
@@ -1086,6 +1112,7 @@ impl ReconciledDb {
             // admin and the checkpoint manager), whose listings would otherwise
             // fail on one transient backend error.
             object_store: retrying_object_store,
+            sftp_pool,
             wal_object_store,
             db_path: actual_db_path,
             db_handle,
@@ -1099,28 +1126,45 @@ pub async fn initialize_filesystem(
     settings: &Settings,
     db_mode: DatabaseMode,
 ) -> Result<InitResult> {
-    let mut startup = StartupContext::prepare(settings, db_mode)
-        .await?
-        .start_receiver()?;
-    'role_election: loop {
-        startup.become_writer().await?;
-        startup.opening = match startup.claim_opening().await? {
-            ClaimOutcome::Claimed(opening) => opening,
-            ClaimOutcome::RetryRole => continue,
-        };
-        loop {
-            let db = match startup.open_db(settings).await? {
-                OpenOutcome::Opened(db) => db,
-                OpenOutcome::RetryWriter => continue,
-                OpenOutcome::RetryRole => continue 'role_election,
+    let startup = StartupContext::prepare(settings, db_mode).await?;
+    let cleanup_pool = startup.sftp_pool.clone();
+    let initialized = async move {
+        let mut startup = startup.start_receiver()?;
+        'role_election: loop {
+            startup.become_writer().await?;
+            startup.opening = match startup.claim_opening().await? {
+                ClaimOutcome::Claimed(opening) => opening,
+                ClaimOutcome::RetryRole => continue,
             };
-            match db.reconcile_tail(&mut startup).await? {
-                ReconcileOutcome::Reconciled(db) => {
-                    return (*db).into_filesystem(startup, settings).await;
+            loop {
+                let db = match startup.open_db(settings).await? {
+                    OpenOutcome::Opened(db) => db,
+                    OpenOutcome::RetryWriter => continue,
+                    OpenOutcome::RetryRole => continue 'role_election,
+                };
+                match db.reconcile_tail(&mut startup).await? {
+                    ReconcileOutcome::Reconciled(db) => {
+                        return (*db).into_filesystem(startup, settings).await;
+                    }
+                    ReconcileOutcome::RetryRole => continue 'role_election,
+                    ReconcileOutcome::RetryWriter => continue,
                 }
-                ReconcileOutcome::RetryRole => continue 'role_election,
-                ReconcileOutcome::RetryWriter => continue,
             }
+        }
+    }
+    .await;
+
+    match initialized {
+        Ok(initialized) => Ok(initialized),
+        Err(error) => {
+            if let Some(pool) = cleanup_pool
+                && let Err(cleanup) = pool.shutdown().await
+            {
+                return Err(error.context(format!(
+                    "SFTP pool cleanup after filesystem initialization failure also failed: {cleanup}"
+                )));
+            }
+            Err(error)
         }
     }
 }
@@ -1162,6 +1206,7 @@ mod role_decision_tests {
         let mut startup = StartupContext {
             object_store: store.clone(),
             retrying_object_store: store.clone(),
+            sftp_pool: None,
             wal_object_store: None,
             object_tracer: crate::object_trace::ObjectTracer::new(),
             actual_db_path: "db".into(),

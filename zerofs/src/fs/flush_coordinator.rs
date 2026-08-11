@@ -6,8 +6,8 @@ use crate::task::spawn_named;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
-use tokio::sync::mpsc;
-use tokio::sync::oneshot;
+use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::task::{AbortHandle, JoinHandle};
 
 /// Pre-flush hook: seals the data-plane open segment (PUT) before the metadata
 /// memtable is flushed, so a durable manifest never references an un-PUT segment.
@@ -39,6 +39,9 @@ enum Request {
 pub struct FlushCoordinator {
     sender: mpsc::UnboundedSender<Request>,
     seal_hook: Arc<OnceLock<SealHook>>,
+    db: Arc<Db>,
+    worker: Arc<Mutex<Option<JoinHandle<()>>>>,
+    worker_abort: AbortHandle,
     /// Test-only count of submitted flush requests. Unlike completed cycles,
     /// this advances before the worker can block acquiring the flush barrier.
     #[cfg(test)]
@@ -60,7 +63,8 @@ impl FlushCoordinator {
         #[cfg(test)]
         let flush_counter = Arc::clone(&completed_flushes);
 
-        spawn_named("flush-coordinator", async move {
+        let worker_db = Arc::clone(&db);
+        let worker = spawn_named("flush-coordinator", async move {
             while let Some(request) = receiver.recv().await {
                 let mut pending_senders = Vec::new();
                 let mut closer = None;
@@ -78,22 +82,22 @@ impl FlushCoordinator {
 
                 // A close keeps the barrier through db.close(), leaving no gap
                 // in which a FrameLoc can commit after the final seal.
-                let barrier = db.flush_barrier().write_owned().await;
+                let barrier = worker_db.flush_barrier().write_owned().await;
                 let result = match hook.get() {
                     Some(seal) => match seal().await {
                         Ok(()) => {
                             #[cfg(feature = "failpoints")]
                             fail_point!(fp::FLUSH_AFTER_SEAL_BEFORE_MANIFEST);
-                            db.flush().await.map_err(|_| FsError::IoError)
+                            worker_db.flush().await.map_err(|_| FsError::IoError)
                         }
                         Err(e) => Err(e),
                     },
-                    None => db.flush().await.map_err(|_| FsError::IoError),
+                    None => worker_db.flush().await.map_err(|_| FsError::IoError),
                 };
 
                 let close_result = if closer.is_some() && result.is_ok() {
-                    db.mark_closing();
-                    db.close().await.map_err(|_| FsError::IoError)
+                    worker_db.mark_closing();
+                    worker_db.close().await.map_err(|_| FsError::IoError)
                 } else {
                     result
                 };
@@ -123,9 +127,13 @@ impl FlushCoordinator {
             }
         });
 
+        let worker_abort = worker.abort_handle();
         Self {
             sender,
             seal_hook,
+            db,
+            worker: Arc::new(Mutex::new(Some(worker))),
+            worker_abort,
             #[cfg(test)]
             requested_flushes,
             #[cfg(test)]
@@ -176,10 +184,43 @@ impl FlushCoordinator {
     pub async fn close(&self) -> Result<(), FsError> {
         let (tx, rx) = oneshot::channel();
 
-        self.sender
-            .send(Request::Close(tx))
-            .map_err(|_| FsError::ShuttingDown)?;
+        let reply = match self.sender.send(Request::Close(tx)) {
+            Ok(()) => rx.await.unwrap_or(Err(FsError::ShuttingDown)),
+            Err(_) => Err(FsError::ShuttingDown),
+        };
+        let joined = self.join_worker().await;
+        joined.and(reply)
+    }
 
-        rx.await.map_err(|_| FsError::ShuttingDown)?
+    async fn join_worker(&self) -> Result<(), FsError> {
+        let mut worker = self.worker.lock().await;
+        let Some(handle) = worker.as_mut() else {
+            return Ok(());
+        };
+        let result = handle.await;
+        worker.take();
+        result.map_err(|_| FsError::IoError)
+    }
+
+    /// Stop and join the actual coordinator worker after its final close
+    /// deadline expires. This is stronger than dropping the `close()` future,
+    /// which only abandons its reply receiver while the worker keeps using the
+    /// database and object store.
+    pub async fn abort_close_worker(&self) -> Result<(), FsError> {
+        self.db.mark_closing();
+        // Abort before taking the mutex: a canceled close can leave its join
+        // future holding that mutex while the worker itself is stuck.
+        self.worker_abort.abort();
+        let mut worker = self.worker.lock().await;
+        let Some(handle) = worker.as_mut() else {
+            return Ok(());
+        };
+        let result = handle.await;
+        worker.take();
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) if error.is_cancelled() => Ok(()),
+            Err(_) => Err(FsError::IoError),
+        }
     }
 }

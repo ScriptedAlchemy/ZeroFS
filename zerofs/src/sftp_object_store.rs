@@ -123,6 +123,8 @@ pub enum RemoteError {
     AlreadyExists(String),
     #[error("remote precondition failed: {0}")]
     Precondition(String),
+    #[error("SFTP session pool is closed")]
+    PoolClosed,
     #[error("{operation}; cleanup required: {debt}")]
     CleanupRequired {
         operation: Box<RemoteError>,
@@ -130,6 +132,18 @@ pub enum RemoteError {
     },
     #[error("remote SFTP operation failed: {0}")]
     Other(String),
+}
+
+impl RemoteError {
+    fn is_pool_closed(&self) -> bool {
+        match self {
+            Self::PoolClosed => true,
+            Self::CleanupRequired { operation, debt } => {
+                operation.is_pool_closed() || debt.error.is_pool_closed()
+            }
+            _ => false,
+        }
+    }
 }
 
 pub type RemoteResult<T> = Result<T, RemoteError>;
@@ -271,6 +285,10 @@ pub async fn publish_payload(
 }
 
 async fn failure_with_cleanup(cleanup: &mut StagingCleanup, operation: RemoteError) -> RemoteError {
+    if operation.is_pool_closed() {
+        cleanup.disarm();
+        return operation;
+    }
     match cleanup.remove_now().await {
         Ok(()) => operation,
         Err(debt) => RemoteError::CleanupRequired {
@@ -456,15 +474,20 @@ impl RemoteSession for PooledRemoteSession {
 }
 
 impl SftpObjectStore {
-    pub fn new(
-        pool: crate::sftp_transport::SftpSessionPool,
-        prefix: ObjectPath,
-    ) -> object_store::Result<Self> {
+    pub(crate) fn validate_prefix(prefix: &ObjectPath) -> object_store::Result<()> {
         if prefix.is_root() {
             return Err(generic_error(
                 "the SFTP pilot requires a non-root dedicated prefix",
             ));
         }
+        Ok(())
+    }
+
+    pub fn new(
+        pool: crate::sftp_transport::SftpSessionPool,
+        prefix: ObjectPath,
+    ) -> object_store::Result<Self> {
+        Self::validate_prefix(&prefix)?;
         Ok(Self { pool, prefix })
     }
 
@@ -1040,6 +1063,9 @@ fn transport_error(error: crate::sftp_transport::TransportError) -> object_store
                 source: "SFTP server reported that the path already exists".into(),
             }
         }
+        crate::sftp_transport::TransportError::PoolClosed => object_store::Error::NotSupported {
+            source: Box::new(crate::sftp_transport::TransportError::PoolClosed),
+        },
         error => object_store::Error::Generic {
             store: STORE_NAME,
             source: Box::new(error),
@@ -1053,11 +1079,17 @@ fn remote_transport_error(error: crate::sftp_transport::TransportError) -> Remot
         crate::sftp_transport::TransportError::AlreadyExists(path) => {
             RemoteError::AlreadyExists(path)
         }
+        crate::sftp_transport::TransportError::PoolClosed => RemoteError::PoolClosed,
         error => RemoteError::Other(error.to_string()),
     }
 }
 
 fn publication_error(location: &ObjectPath, error: RemoteError) -> object_store::Error {
+    if error.is_pool_closed() {
+        return object_store::Error::NotSupported {
+            source: Box::new(crate::sftp_transport::TransportError::PoolClosed),
+        };
+    }
     match error {
         RemoteError::NotFound(path) => object_store::Error::NotFound {
             path,
@@ -1071,6 +1103,7 @@ fn publication_error(location: &ObjectPath, error: RemoteError) -> object_store:
             path: location.to_string(),
             source: source.into(),
         },
+        RemoteError::PoolClosed => unreachable!("pool-closed errors returned above"),
         error => object_store::Error::Generic {
             store: STORE_NAME,
             source: Box::new(error),
@@ -1103,7 +1136,153 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
-    use tokio::sync::Barrier;
+    use tokio::sync::{Barrier, Notify};
+
+    #[test]
+    fn pool_closed_is_a_terminal_object_store_error() {
+        let error = transport_error(TransportError::PoolClosed);
+        assert!(matches!(error, object_store::Error::NotSupported { .. }));
+
+        let nested = publication_error(
+            &ObjectPath::from("object"),
+            RemoteError::CleanupRequired {
+                operation: Box::new(RemoteError::Other("write failed".to_owned())),
+                debt: StagingCleanupDebt {
+                    path: PathBuf::from("staging"),
+                    error: Box::new(RemoteError::PoolClosed),
+                },
+            },
+        );
+        assert!(matches!(nested, object_store::Error::NotSupported { .. }));
+    }
+
+    #[derive(Debug, Default)]
+    struct ProtocolCleanupState {
+        dials: AtomicUsize,
+        live: AtomicUsize,
+        close_started: AtomicUsize,
+        protocol_close_failures: AtomicUsize,
+        release_close: Notify,
+    }
+
+    #[derive(Debug, Clone)]
+    struct ProtocolCleanupFactory(Arc<ProtocolCleanupState>);
+
+    #[async_trait]
+    impl SessionFactory for ProtocolCleanupFactory {
+        async fn open(
+            &self,
+            _force: tokio_util::sync::CancellationToken,
+        ) -> Result<Box<dyn TransportSession>, TransportError> {
+            self.0.dials.fetch_add(1, Ordering::SeqCst);
+            self.0.live.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(ProtocolCleanupSession(self.0.clone())))
+        }
+    }
+
+    #[derive(Debug)]
+    struct ProtocolCleanupSession(Arc<ProtocolCleanupState>);
+
+    #[async_trait]
+    impl TransportSession for ProtocolCleanupSession {
+        fn capabilities(&self) -> SftpCapabilities {
+            SftpCapabilities {
+                fsync: true,
+                hardlink: true,
+                posix_rename: true,
+            }
+        }
+
+        async fn create_dir_all(&mut self, _path: &FilePath) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        async fn write_file_durable(
+            &mut self,
+            _path: &FilePath,
+            _chunks: Vec<Bytes>,
+        ) -> Result<(), TransportError> {
+            Err(TransportError::Operation(
+                "forced final-flush write failure".to_owned(),
+            ))
+        }
+
+        async fn close(
+            self: Box<Self>,
+            _force: tokio_util::sync::CancellationToken,
+        ) -> Result<(), TransportError> {
+            self.0.close_started.fetch_add(1, Ordering::SeqCst);
+            self.0.release_close.notified().await;
+            self.0
+                .protocol_close_failures
+                .fetch_add(1, Ordering::SeqCst);
+            self.0.live.fetch_sub(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn production_adapter_cleanup_overlaps_and_drains_before_pool_shutdown() {
+        let state = Arc::new(ProtocolCleanupState::default());
+        let pool = crate::sftp_transport::SftpSessionPool::new_writable(
+            Arc::new(ProtocolCleanupFactory(state.clone())),
+            3,
+            3,
+            3,
+        )
+        .await
+        .unwrap();
+        let store = Arc::new(SftpObjectStore::new(pool.clone(), ObjectPath::from("root")).unwrap());
+        let operations = (0..3)
+            .map(|index| {
+                let store = store.clone();
+                tokio::spawn(async move {
+                    store
+                        .put_opts(
+                            &ObjectPath::from(format!("root/object-{index}")),
+                            PutPayload::from_static(b"payload"),
+                            PutOptions::default(),
+                        )
+                        .await
+                })
+            })
+            .collect::<Vec<_>>();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while state.close_started.load(Ordering::SeqCst) != 3 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "cleanup did not overlap: dials={} live={} closes={}",
+                state.dials.load(Ordering::SeqCst),
+                state.live.load(Ordering::SeqCst),
+                state.close_started.load(Ordering::SeqCst)
+            )
+        });
+
+        let shutdown = tokio::spawn({
+            let pool = pool.clone();
+            async move { pool.shutdown().await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!shutdown.is_finished());
+        state.release_close.notify_waiters();
+
+        for operation in operations {
+            let error = operation.await.unwrap().unwrap_err();
+            assert!(matches!(error, object_store::Error::NotSupported { .. }));
+        }
+        tokio::time::timeout(Duration::from_secs(1), shutdown)
+            .await
+            .expect("shutdown drains production adapter cleanup")
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.dials.load(Ordering::SeqCst), 3);
+        assert_eq!(state.live.load(Ordering::SeqCst), 0);
+        assert_eq!(state.protocol_close_failures.load(Ordering::SeqCst), 3);
+    }
 
     #[derive(Debug)]
     struct LocalSftpFactory {
@@ -1113,7 +1292,10 @@ mod tests {
 
     #[async_trait]
     impl SessionFactory for LocalSftpFactory {
-        async fn open(&self) -> Result<Box<dyn TransportSession>, TransportError> {
+        async fn open(
+            &self,
+            _force: tokio_util::sync::CancellationToken,
+        ) -> Result<Box<dyn TransportSession>, TransportError> {
             let mut child = tokio::process::Command::new(&self.server)
                 .current_dir(&self.root)
                 .stdin(std::process::Stdio::piped())
@@ -1230,9 +1412,12 @@ mod tests {
             self.session.posix_rename(from, to).await
         }
 
-        async fn close(self: Box<Self>) -> Result<(), TransportError> {
+        async fn close(
+            self: Box<Self>,
+            force: tokio_util::sync::CancellationToken,
+        ) -> Result<(), TransportError> {
             let LocalSftpSession { session, mut child } = *self;
-            Box::new(session).close().await?;
+            Box::new(session).close(force).await?;
             let status = child
                 .wait()
                 .await

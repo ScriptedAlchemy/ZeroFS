@@ -318,7 +318,14 @@ pub async fn parse_url_opts_with_sftp<I, K, V>(
     url: &Url,
     options: I,
     sftp_config: Option<&crate::config::SftpConfig>,
-) -> Result<(Box<dyn ObjectStore>, Path), object_store::Error>
+) -> Result<
+    (
+        Box<dyn ObjectStore>,
+        Path,
+        Option<crate::sftp_transport::SftpSessionPool>,
+    ),
+    object_store::Error,
+>
 where
     I: IntoIterator<Item = (K, V)>,
     K: AsRef<str>,
@@ -326,8 +333,11 @@ where
 {
     let (scheme, path) = ObjectStoreScheme::parse(url)?;
     if scheme != ObjectStoreScheme::Sftp {
-        return parse_url_opts(url, options);
+        let (store, path) = parse_url_opts(url, options)?;
+        return Ok((store, path, None));
     }
+
+    crate::sftp_object_store::SftpObjectStore::validate_prefix(&path)?;
 
     let config = sftp_config.cloned().unwrap_or_default();
     let endpoint = crate::config::SftpEndpoint {
@@ -359,8 +369,8 @@ where
                 store: "SFTP",
                 source: Box::new(source),
             })?;
-    let store = crate::sftp_object_store::SftpObjectStore::new(pool, path.clone())?;
-    Ok((Box::new(store), path))
+    let store = crate::sftp_object_store::SftpObjectStore::new(pool.clone(), path.clone())?;
+    Ok((Box::new(store), path, Some(pool)))
 }
 
 #[cfg(test)]

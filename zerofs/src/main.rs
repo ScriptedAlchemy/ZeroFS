@@ -105,28 +105,16 @@ async fn async_main() -> Result<()> {
             eprintln!("New password read successfully.");
 
             eprintln!("Changing encryption password...");
-            match cli::password::change_password(&settings, new_password).await {
-                Ok(()) => {
-                    println!("✓ Encryption password changed successfully!");
-                    println!(
-                        "ℹ To use the new password, update your config file or environment variable"
-                    );
-                }
-                Err(e) => {
-                    eprintln!("✗ Error: {}", e);
-                    std::process::exit(1);
-                }
-            }
+            cli::password::change_password(&settings, new_password).await?;
+            println!("✓ Encryption password changed successfully!");
+            println!("ℹ To use the new password, update your config file or environment variable");
         }
         cli::Commands::Run {
             config,
             read_only,
             checkpoint,
         } => {
-            if let Err(e) = cli::server::run_server(config, read_only, checkpoint).await {
-                eprintln!("✗ Error: {:#}", e);
-                std::process::exit(1);
-            }
+            cli::server::run_server(config, read_only, checkpoint).await?;
         }
         cli::Commands::Debug { subcommand } => match subcommand {
             cli::DebugCommands::ListKeys { config } => {

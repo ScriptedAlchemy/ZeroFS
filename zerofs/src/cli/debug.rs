@@ -107,122 +107,143 @@ pub async fn list_keys(config_path: PathBuf) -> Result<()> {
     };
 
     let env_vars = settings.cloud_provider_env_vars();
-    let (object_store, path_from_url) =
+    let (object_store, path_from_url, sftp_pool) =
         parse_url_opts_with_sftp(&url.parse()?, env_vars, settings.sftp.as_ref()).await?;
+    let command_result: Result<()> = async move {
+        let object_store = with_storage_class(
+            Arc::from(object_store),
+            settings.storage.storage_class.as_deref(),
+        );
 
-    let object_store = with_storage_class(
-        Arc::from(object_store),
-        settings.storage.storage_class.as_deref(),
-    );
+        let actual_db_path = path_from_url.to_string();
 
-    let actual_db_path = path_from_url.to_string();
+        let bucket =
+            crate::bucket_identity::BucketIdentity::get_or_create(&object_store, &actual_db_path)
+                .await?;
 
-    let bucket =
-        crate::bucket_identity::BucketIdentity::get_or_create(&object_store, &actual_db_path)
-            .await?;
-
-    let cache_config = CacheConfig {
-        root_folder: cache_config.root_folder.join(bucket.cache_directory_name()),
-        ..cache_config
-    };
-
-    let password = settings.storage.encryption_password.clone();
-
-    crate::cli::password::validate_password(&password)
-        .map_err(|e| anyhow::anyhow!("Password validation failed: {}", e))?;
-
-    let db_path = Path::from(actual_db_path.clone());
-    let encryption_key =
-        key_management::load_or_init_encryption_key(&object_store, &db_path, &password, false)
-            .await?;
-
-    let block_transformer: Arc<dyn BlockTransformer> =
-        ZeroFsBlockTransformer::new_arc(&encryption_key, settings.compression());
-
-    let wal_object_store: Option<Arc<dyn object_store::ObjectStore>> =
-        if let Some(wal_config) = &settings.wal {
-            Some(super::server::parse_wal_object_store(wal_config)?)
-        } else {
-            None
+        let cache_config = CacheConfig {
+            root_folder: cache_config.root_folder.join(bucket.cache_directory_name()),
+            ..cache_config
         };
 
-    let opened = super::server::build_slatedb(
-        object_store,
-        &cache_config,
-        actual_db_path,
-        super::server::DatabaseMode::ReadWrite,
-        settings.lsm,
-        block_transformer,
-        wal_object_store,
-        None, // debug command never participates in replication
-    )
-    .await?;
+        let password = settings.storage.encryption_password.clone();
 
-    let db = match opened.data {
-        SlateDbHandle::ReadWrite(db) => db,
-        SlateDbHandle::ReadOnly(_) => {
-            return Err(anyhow::anyhow!(
-                "Expected read-write mode for debug command"
-            ));
-        }
-    };
+        crate::cli::password::validate_password(&password)
+            .map_err(|e| anyhow::anyhow!("Password validation failed: {}", e))?;
 
-    println!("Scanning all keys in the database...\n");
+        let db_path = Path::from(actual_db_path.clone());
+        let encryption_key =
+            key_management::load_or_init_encryption_key(&object_store, &db_path, &password, false)
+                .await?;
 
-    let scan_options = ScanOptions {
-        durability_filter: DurabilityLevel::Memory,
-        read_ahead_bytes: 1024 * 1024,
-        cache_blocks: false,
-        max_fetch_tasks: 4,
-        ..Default::default()
-    };
+        let block_transformer: Arc<dyn BlockTransformer> =
+            ZeroFsBlockTransformer::new_arc(&encryption_key, settings.compression());
 
-    let mut iter = db.scan_with_options(.., &scan_options).await?;
+        let wal_object_store: Option<Arc<dyn object_store::ObjectStore>> =
+            if let Some(wal_config) = &settings.wal {
+                Some(super::server::parse_wal_object_store(wal_config)?)
+            } else {
+                None
+            };
 
-    let codec = KeyCodec::new();
-    let mut count = 0;
-    let mut count_by_prefix: std::collections::HashMap<KeyPrefix, usize> =
-        std::collections::HashMap::new();
+        let opened = super::server::build_slatedb(
+            object_store,
+            &cache_config,
+            actual_db_path,
+            super::server::DatabaseMode::ReadWrite,
+            settings.lsm,
+            block_transformer,
+            wal_object_store,
+            None, // debug command never participates in replication
+        )
+        .await?;
 
-    loop {
-        let kv = match iter.next().await {
-            Ok(Some(kv)) => kv,
-            Ok(None) => break,
-            Err(e) => anyhow::bail!("dump scan failed after {count} keys: {e}"),
-        };
-        let key = kv.key;
-
-        let (prefix, detail) = match describe_key(&codec, &key) {
-            Some(described) => described,
-            None => {
-                if key.is_empty() {
-                    println!("Empty key found");
-                } else {
-                    println!("Unknown key: {:?}", key);
-                }
-                continue;
+        let db = match opened.data {
+            SlateDbHandle::ReadWrite(db) => db,
+            SlateDbHandle::ReadOnly(_) => {
+                return Err(anyhow::anyhow!(
+                    "Expected read-write mode for debug command"
+                ));
             }
         };
 
-        *count_by_prefix.entry(prefix).or_insert(0) += 1;
+        println!("Scanning all keys in the database...\n");
 
-        println!("[{}] {}", prefix.as_str(), detail);
+        let scan_options = ScanOptions {
+            durability_filter: DurabilityLevel::Memory,
+            read_ahead_bytes: 1024 * 1024,
+            cache_blocks: false,
+            max_fetch_tasks: 4,
+            ..Default::default()
+        };
 
-        count += 1;
+        let mut iter = db.scan_with_options(.., &scan_options).await?;
+
+        let codec = KeyCodec::new();
+        let mut count = 0;
+        let mut count_by_prefix: std::collections::HashMap<KeyPrefix, usize> =
+            std::collections::HashMap::new();
+
+        loop {
+            let kv = match iter.next().await {
+                Ok(Some(kv)) => kv,
+                Ok(None) => break,
+                Err(e) => anyhow::bail!("dump scan failed after {count} keys: {e}"),
+            };
+            let key = kv.key;
+
+            let (prefix, detail) = match describe_key(&codec, &key) {
+                Some(described) => described,
+                None => {
+                    if key.is_empty() {
+                        println!("Empty key found");
+                    } else {
+                        println!("Unknown key: {:?}", key);
+                    }
+                    continue;
+                }
+            };
+
+            *count_by_prefix.entry(prefix).or_insert(0) += 1;
+
+            println!("[{}] {}", prefix.as_str(), detail);
+
+            count += 1;
+        }
+
+        println!("\n=== Summary ===");
+        println!("Total keys: {}", count);
+        println!("\nKeys by type:");
+
+        let mut prefix_counts: Vec<_> = count_by_prefix.iter().collect();
+        prefix_counts.sort_by_key(|(prefix, _)| u8::from(**prefix));
+
+        for (prefix, count) in prefix_counts {
+            println!("  {}: {}", prefix.as_str(), count);
+        }
+
+        drop(iter);
+        db.close().await.context("Failed to close debug database")?;
+
+        Ok(())
     }
+    .await;
 
-    println!("\n=== Summary ===");
-    println!("Total keys: {}", count);
-    println!("\nKeys by type:");
-
-    let mut prefix_counts: Vec<_> = count_by_prefix.iter().collect();
-    prefix_counts.sort_by_key(|(prefix, _)| u8::from(**prefix));
-
-    for (prefix, count) in prefix_counts {
-        println!("  {}: {}", prefix.as_str(), count);
+    let shutdown_result = match sftp_pool {
+        Some(pool) => pool
+            .shutdown()
+            .await
+            .context("Failed to shut down SFTP debug pool"),
+        None => Ok(()),
+    };
+    match (command_result, shutdown_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(command), Ok(())) => Err(command),
+        (Ok(()), Err(shutdown)) => Err(shutdown),
+        (Err(command), Err(shutdown)) => Err(command.context(format!(
+            "SFTP debug pool shutdown also failed: {shutdown:#}"
+        ))),
     }
-
-    Ok(())
 }
 
 #[cfg(test)]

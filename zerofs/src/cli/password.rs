@@ -50,17 +50,18 @@ pub async fn change_password(
 
     let env_vars = settings.cloud_provider_env_vars();
 
-    let (object_store, path_from_url) = crate::parse_object_store::parse_url_opts_with_sftp(
-        &settings
-            .storage
-            .url
-            .parse::<url::Url>()
-            .map_err(|e| PasswordError::Other(e.to_string()))?,
-        env_vars,
-        settings.sftp.as_ref(),
-    )
-    .await
-    .map_err(|e| PasswordError::Other(e.to_string()))?;
+    let (object_store, path_from_url, sftp_pool) =
+        crate::parse_object_store::parse_url_opts_with_sftp(
+            &settings
+                .storage
+                .url
+                .parse::<url::Url>()
+                .map_err(|e| PasswordError::Other(e.to_string()))?,
+            env_vars,
+            settings.sftp.as_ref(),
+        )
+        .await
+        .map_err(|e| PasswordError::Other(e.to_string()))?;
 
     let object_store = with_storage_class(
         Arc::from(object_store),
@@ -68,16 +69,27 @@ pub async fn change_password(
     );
     let db_path = Path::from(path_from_url.to_string());
 
-    key_management::change_encryption_password(
+    let change = key_management::change_encryption_password(
         &object_store,
         &db_path,
         current_password,
         &new_password,
     )
-    .await
-    .map_err(|e| PasswordError::EncryptionError(e.to_string()))?;
-
-    Ok(())
+    .await;
+    let shutdown = match sftp_pool {
+        Some(pool) => pool.shutdown().await,
+        None => Ok(()),
+    };
+    match (change, shutdown) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(change), Ok(())) => Err(PasswordError::EncryptionError(change.to_string())),
+        (Ok(()), Err(shutdown)) => Err(PasswordError::Other(format!(
+            "encryption password changed, but SFTP shutdown failed: {shutdown}"
+        ))),
+        (Err(change), Err(shutdown)) => Err(PasswordError::EncryptionError(format!(
+            "{change}; SFTP shutdown also failed: {shutdown}"
+        ))),
+    }
 }
 
 #[cfg(test)]
@@ -93,15 +105,15 @@ mod tests {
         assert!(validate_password("goodpassword123").is_ok());
     }
 
-    #[tokio::test]
-    async fn change_password_uses_the_application_parser_for_sftp() {
+    #[test]
+    fn settings_reject_invalid_sftp_url_before_password_change() {
         let config = r#"
 [cache]
 dir = "/tmp/cache"
 disk_size_gb = 1.0
 
 [storage]
-url = "sftp://alice@example.com/data"
+url = "sftp:///data"
 encryption_password = "current-password"
 
 [servers]
@@ -111,13 +123,10 @@ known_hosts = "/tmp/known_hosts"
 "#;
         let temp_file = NamedTempFile::new().unwrap();
         std::fs::write(temp_file.path(), config).unwrap();
-        let settings = Settings::from_file(temp_file.path()).unwrap();
-
-        let error = change_password(&settings, "replacement-password".to_owned())
-            .await
+        let error = Settings::from_file(temp_file.path())
             .unwrap_err()
             .to_string();
 
-        assert!(error.contains("transport is not yet wired"), "got: {error}");
+        assert!(error.contains("must include a host"), "got: {error}");
     }
 }

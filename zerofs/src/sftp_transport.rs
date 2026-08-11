@@ -7,11 +7,14 @@ use std::fmt;
 use std::io::Write;
 use std::ops::Range;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
-use std::time::SystemTime;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, Weak};
+use std::time::{Duration, SystemTime};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, SeekFrom};
 use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore, oneshot};
+use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OperationKind {
@@ -36,6 +39,14 @@ const SFTP_READ_PACKET_SIZE: usize = 255 * 1024;
 /// sequential cache windows to 8 MiB; issuing their packets together hides the
 /// WAN RTT while preserving the shared physical-session limit.
 const SFTP_READ_REQUEST_CONCURRENCY: usize = 64;
+
+const SFTP_SESSION_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
+const SFTP_SESSION_CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
+const SFTP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const SFTP_IDLE_REAP_INTERVAL: Duration = Duration::from_secs(10);
+const SFTP_IDLE_WARM_FLOOR: usize = 1;
+const SFTP_POOL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(45);
+const SSH_PROCESS_FORCE_REAP_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
 struct PipelinedWrite {
@@ -307,12 +318,15 @@ pub trait TransportSession: fmt::Debug + Send + Sync + 'static {
             "posix_rename is not implemented by this session".to_owned(),
         ))
     }
-    async fn close(self: Box<Self>) -> Result<(), TransportError>;
+    async fn close(self: Box<Self>, force: CancellationToken) -> Result<(), TransportError>;
 }
 
 #[async_trait]
 pub trait SessionFactory: fmt::Debug + Send + Sync + 'static {
-    async fn open(&self) -> Result<Box<dyn TransportSession>, TransportError>;
+    async fn open(
+        &self,
+        force: CancellationToken,
+    ) -> Result<Box<dyn TransportSession>, TransportError>;
 }
 
 #[derive(Clone)]
@@ -333,6 +347,7 @@ struct AdmissionState {
     active_reads: usize,
     active_writes: usize,
     waiters: VecDeque<AdmissionWaiter>,
+    closed: bool,
 }
 
 struct AdmissionWaiter {
@@ -370,6 +385,9 @@ impl FairAdmission {
         };
         {
             let mut state = self.inner.state.lock().unwrap();
+            if state.closed {
+                return Err(TransportError::PoolClosed);
+            }
             state
                 .waiters
                 .push_back(AdmissionWaiter { id, kind, sender });
@@ -381,6 +399,9 @@ impl FairAdmission {
     }
 
     fn dispatch_locked(&self, state: &mut AdmissionState) {
+        if state.closed {
+            return;
+        }
         while state.active_reads + state.active_writes < self.inner.shared_limit {
             let Some(index) = state.waiters.iter().position(|waiter| match waiter.kind {
                 OperationKind::Read | OperationKind::Metadata => {
@@ -416,6 +437,12 @@ impl FairAdmission {
         let mut state = self.inner.state.lock().unwrap();
         decrement_active(&mut state, kind);
         self.dispatch_locked(&mut state);
+    }
+
+    fn close(&self) {
+        let mut state = self.inner.state.lock().unwrap();
+        state.closed = true;
+        state.waiters.clear();
     }
 
     #[cfg(test)]
@@ -482,11 +509,18 @@ impl OpenSshSessionFactory {
         authentication_config
             .write_all(
                 b"Host *\n\
+                  BatchMode yes\n\
                   PasswordAuthentication no\n\
                   KbdInteractiveAuthentication no\n\
                   ChallengeResponseAuthentication no\n\
                   PreferredAuthentications publickey\n\
-                  PubkeyAuthentication yes\n",
+                  PubkeyAuthentication yes\n\
+                  ConnectTimeout 20\n\
+                  ConnectionAttempts 1\n\
+                  ServerAliveInterval 30\n\
+                  ServerAliveCountMax 3\n\
+                  ControlMaster no\n\
+                  ControlPersist no\n",
             )
             .map_err(|_| TransportError::Open("could not write SSH policy file".to_owned()))?;
         authentication_config
@@ -512,40 +546,167 @@ impl fmt::Debug for OpenSshSessionFactory {
     }
 }
 
+async fn force_reap_ssh_process(child: &mut tokio::process::Child) -> Result<(), String> {
+    // The direct ssh child is the physical session. Unlike an OpenSSH
+    // ControlMaster, it cannot daemonize away from this owned process handle.
+    // start_kill followed by wait gives positive local-process death evidence
+    // before the pool may reuse the lifetime permit.
+    let kill_error = child.start_kill().err().map(|error| error.to_string());
+    match tokio::time::timeout(SSH_PROCESS_FORCE_REAP_TIMEOUT, child.wait()).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(error)) => Err(match kill_error {
+            Some(kill_error) => {
+                format!("could not kill SSH process: {kill_error}; could not reap it: {error}")
+            }
+            None => format!("could not reap SSH process: {error}"),
+        }),
+        Err(_) => Err(match kill_error {
+            Some(kill_error) => format!(
+                "could not kill SSH process: {kill_error}; process was not reaped within {}s",
+                SSH_PROCESS_FORCE_REAP_TIMEOUT.as_secs()
+            ),
+            None => format!(
+                "SSH process was killed but not reaped within {}s",
+                SSH_PROCESS_FORCE_REAP_TIMEOUT.as_secs()
+            ),
+        }),
+    }
+}
+
+async fn supervise_ssh_process(
+    mut child: tokio::process::Child,
+    force: CancellationToken,
+) -> Result<(), String> {
+    tokio::select! {
+        result = child.wait() => result.map(|_| ()).map_err(|error| error.to_string()),
+        _ = force.cancelled() => force_reap_ssh_process(&mut child).await,
+    }
+}
+
 #[async_trait]
 impl SessionFactory for OpenSshSessionFactory {
-    async fn open(&self) -> Result<Box<dyn TransportSession>, TransportError> {
-        let mut builder = openssh::SessionBuilder::default();
-        builder
-            .user(self.endpoint.username.clone())
-            .port(self.endpoint.port)
-            .known_hosts_check(openssh::KnownHosts::Strict)
-            .keyfile(&self.identity_file)
-            .user_known_hosts_file(&self.known_hosts)
-            .config_file(self.authentication_config.path());
-        let ssh = builder.connect(&self.endpoint.host).await.map_err(|_| {
+    async fn open(
+        &self,
+        force: CancellationToken,
+    ) -> Result<Box<dyn TransportSession>, TransportError> {
+        // One owned, foreground ssh process is one physical pool session. Do
+        // not use OpenSSH multiplexing here: its daemonized ControlMaster is
+        // outside Tokio's process ownership and cannot be reliably reaped on a
+        // lifecycle deadline.
+        if force.is_cancelled() {
+            return Err(TransportError::PoolClosed);
+        }
+
+        let mut command = tokio::process::Command::new("ssh");
+        command
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .arg("-F")
+            .arg(self.authentication_config.path())
+            .arg("-o")
+            .arg("StrictHostKeyChecking=yes")
+            .arg("-o")
+            .arg(format!("UserKnownHostsFile={}", self.known_hosts.display()))
+            .arg("-o")
+            .arg("IdentitiesOnly=yes")
+            .arg("-i")
+            .arg(&self.identity_file)
+            .arg("-p")
+            .arg(self.endpoint.port.to_string())
+            .arg("-l")
+            .arg(&self.endpoint.username)
+            .arg("-T")
+            .arg("-s")
+            .arg("--")
+            .arg(&self.endpoint.host)
+            .arg("sftp");
+
+        let mut child = command.spawn().map_err(|_| {
             TransportError::Open(format!(
-                "OpenSSH connection to {}:{} failed",
+                "OpenSSH SFTP process for {}:{} failed to start",
                 self.endpoint.host, self.endpoint.port
             ))
         })?;
-        let sftp = openssh_sftp_client::Sftp::from_session(
-            ssh,
+        let stdin = match child.stdin.take() {
+            Some(stdin) => stdin,
+            None => {
+                let cleanup = force_reap_ssh_process(&mut child).await;
+                return match cleanup {
+                    Ok(()) => Err(TransportError::Open(
+                        "OpenSSH SFTP process has no stdin".to_owned(),
+                    )),
+                    Err(cleanup) => {
+                        tracing::error!(%cleanup, "failed to reap OpenSSH process with no stdin");
+                        Err(TransportError::PoolClosed)
+                    }
+                };
+            }
+        };
+        let stdout = match child.stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                drop(stdin);
+                let cleanup = force_reap_ssh_process(&mut child).await;
+                return match cleanup {
+                    Ok(()) => Err(TransportError::Open(
+                        "OpenSSH SFTP process has no stdout".to_owned(),
+                    )),
+                    Err(cleanup) => {
+                        tracing::error!(%cleanup, "failed to reap OpenSSH process with no stdout");
+                        Err(TransportError::PoolClosed)
+                    }
+                };
+            }
+        };
+        let mut handshake = Box::pin(openssh_sftp_client::Sftp::new(
+            stdin,
+            stdout,
             openssh_sftp_client::SftpOptions::default(),
-        )
-        .await
-        .map_err(|_| {
-            TransportError::Open(format!(
-                "SFTP handshake with {}:{} failed",
-                self.endpoint.host, self.endpoint.port
-            ))
-        })?;
-        Ok(Box::new(OpenSshTransportSession { sftp: Some(sftp) }))
+        ));
+        let sftp = tokio::select! {
+            result = &mut handshake => result,
+            _ = force.cancelled() => {
+                drop(handshake);
+                if let Err(cleanup) = force_reap_ssh_process(&mut child).await {
+                    return Err(TransportError::Close(format!(
+                        "OpenSSH process cleanup after SFTP open timeout failed: {cleanup}"
+                    )));
+                }
+                return Err(TransportError::PoolClosed);
+            }
+        };
+        let sftp = match sftp {
+            Ok(sftp) => sftp,
+            Err(_) => {
+                let error = TransportError::Open(format!(
+                    "SFTP handshake with {}:{} failed",
+                    self.endpoint.host, self.endpoint.port
+                ));
+                if let Err(cleanup) = force_reap_ssh_process(&mut child).await {
+                    return Err(TransportError::Close(format!(
+                        "OpenSSH process cleanup after SFTP handshake failure failed: {cleanup}"
+                    )));
+                }
+                return Err(error);
+            }
+        };
+        let process_force = force.clone();
+        let process_owner =
+            tokio::spawn(async move { supervise_ssh_process(child, process_force).await });
+        Ok(Box::new(OpenSshTransportSession {
+            sftp: Some(sftp),
+            ssh_force: force,
+            ssh_process: Some(process_owner),
+        }))
     }
 }
 
 pub struct OpenSshTransportSession {
     sftp: Option<openssh_sftp_client::Sftp>,
+    ssh_force: CancellationToken,
+    ssh_process: Option<tokio::task::JoinHandle<Result<(), String>>>,
 }
 
 impl fmt::Debug for OpenSshTransportSession {
@@ -553,6 +714,15 @@ impl fmt::Debug for OpenSshTransportSession {
         formatter
             .debug_struct("OpenSshTransportSession")
             .finish_non_exhaustive()
+    }
+}
+
+impl Drop for OpenSshTransportSession {
+    fn drop(&mut self) {
+        // The process owner holds and reaps the direct ssh child. Cancellation
+        // here is the last-resort path for a session dropped outside the pool's
+        // awaited close protocol.
+        self.ssh_force.cancel();
     }
 }
 
@@ -569,7 +739,11 @@ impl OpenSshTransportSession {
         )
         .await
         .map_err(|_| TransportError::Open("SFTP stream handshake failed".to_owned()))?;
-        Ok(Self { sftp: Some(sftp) })
+        Ok(Self {
+            sftp: Some(sftp),
+            ssh_force: CancellationToken::new(),
+            ssh_process: None,
+        })
     }
 }
 
@@ -849,13 +1023,41 @@ impl TransportSession for OpenSshTransportSession {
             .map_err(|error| map_sftp_error(to, error))
     }
 
-    async fn close(mut self: Box<Self>) -> Result<(), TransportError> {
-        self.sftp
-            .take()
-            .expect("open transport owns SFTP client")
-            .close()
-            .await
-            .map_err(|_| TransportError::Close("OpenSSH SFTP shutdown failed".to_owned()))
+    async fn close(mut self: Box<Self>, force: CancellationToken) -> Result<(), TransportError> {
+        let sftp = self.sftp.take().expect("open transport owns SFTP client");
+        let mut graceful = Box::pin(sftp.close());
+        let graceful_result = tokio::select! {
+            result = &mut graceful => Some(result),
+            _ = force.cancelled() => None,
+            _ = self.ssh_force.cancelled() => None,
+        };
+        drop(graceful);
+
+        self.ssh_force.cancel();
+        if let Some(process_owner) = self.ssh_process.take() {
+            match process_owner.await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    return Err(TransportError::Close(format!(
+                        "OpenSSH SFTP process did not terminate: {error}"
+                    )));
+                }
+                Err(error) => {
+                    return Err(TransportError::Close(format!(
+                        "OpenSSH SFTP process owner failed: {error}"
+                    )));
+                }
+            }
+        }
+
+        if let Some(Err(error)) = graceful_result {
+            tracing::warn!(%error, "SFTP protocol shutdown failed after the SSH process exited");
+        } else if graceful_result.is_none() {
+            tracing::warn!(
+                "SFTP protocol shutdown exceeded its deadline; the SSH process was killed and reaped"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -874,19 +1076,58 @@ fn map_sftp_error(path: &std::path::Path, error: openssh_sftp_client::Error) -> 
 }
 
 struct PhysicalSession {
-    transport: Box<dyn TransportSession>,
-    _lifetime: OwnedSemaphorePermit,
+    transport: Option<Box<dyn TransportSession>>,
+    lifetime: Option<OwnedSemaphorePermit>,
+    idle_since: Instant,
+    pool: Weak<PoolInner>,
 }
 
 impl PhysicalSession {
-    async fn close(self) -> Result<(), TransportError> {
-        let Self {
-            transport,
-            _lifetime,
-        } = self;
-        let result = transport.close().await;
-        drop(_lifetime);
-        result
+    fn take_parts(&mut self) -> (Box<dyn TransportSession>, OwnedSemaphorePermit) {
+        (
+            self.transport
+                .take()
+                .expect("physical session transport is taken exactly once"),
+            self.lifetime
+                .take()
+                .expect("physical session permit is taken exactly once"),
+        )
+    }
+
+    fn transport(&self) -> &dyn TransportSession {
+        self.transport
+            .as_deref()
+            .expect("leased physical session owns its transport")
+    }
+
+    fn transport_mut(&mut self) -> &mut dyn TransportSession {
+        self.transport
+            .as_deref_mut()
+            .expect("leased physical session owns its transport")
+    }
+}
+
+impl Drop for PhysicalSession {
+    fn drop(&mut self) {
+        let (Some(transport), Some(lifetime)) = (self.transport.take(), self.lifetime.take())
+        else {
+            return;
+        };
+        let Some(pool) = self.pool.upgrade() else {
+            drop(transport);
+            drop(lifetime);
+            return;
+        };
+        if tokio::runtime::Handle::try_current().is_ok() {
+            let cleanup_pool = pool.clone();
+            pool.tasks.spawn(async move {
+                let _ = cleanup_pool.close_parts(transport, lifetime).await;
+            });
+        } else {
+            pool.fail_closed();
+            drop(transport);
+            drop(lifetime);
+        }
     }
 }
 
@@ -897,6 +1138,211 @@ struct PoolInner {
     idle: Mutex<VecDeque<PhysicalSession>>,
     idle_available: Notify,
     writable: bool,
+    closed: AtomicBool,
+    activity_gate: StdMutex<()>,
+    active: AtomicUsize,
+    activity_changed: Notify,
+    reaper_shutdown: CancellationToken,
+    session_shutdown: CancellationToken,
+    tasks: TaskTracker,
+    shutdown_lock: Mutex<()>,
+    shutdown_complete: AtomicBool,
+    close_error: StdMutex<Option<String>>,
+}
+
+struct FailClosedOnOwnerDrop {
+    pool: Arc<PoolInner>,
+    armed: bool,
+}
+
+impl FailClosedOnOwnerDrop {
+    fn new(pool: Arc<PoolInner>) -> Self {
+        Self { pool, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for FailClosedOnOwnerDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            self.pool.fail_closed();
+        }
+    }
+}
+
+impl PoolInner {
+    fn fail_closed(self: &Arc<Self>) {
+        let _gate = self.activity_gate.lock().unwrap();
+        if self.closed.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        self.reaper_shutdown.cancel();
+        self.session_shutdown.cancel();
+        self.admission.close();
+        self.shared.close();
+        self.idle_available.notify_waiters();
+        if tokio::runtime::Handle::try_current().is_ok() {
+            let pool = self.clone();
+            self.tasks.spawn(async move {
+                let idle = {
+                    let mut idle = pool.idle.lock().await;
+                    idle.drain(..).collect::<Vec<_>>()
+                };
+                for session in idle {
+                    let cleanup_pool = pool.clone();
+                    pool.tasks.spawn(async move {
+                        let _ = cleanup_pool.close_session(session).await;
+                    });
+                }
+            });
+        }
+    }
+
+    fn register_activity(self: &Arc<Self>) -> Result<PoolActivity, TransportError> {
+        let _gate = self.activity_gate.lock().unwrap();
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(TransportError::PoolClosed);
+        }
+        self.active.fetch_add(1, Ordering::SeqCst);
+        Ok(PoolActivity {
+            pool: self.clone(),
+            active: true,
+        })
+    }
+
+    fn finish_activity(&self) {
+        self.active.fetch_sub(1, Ordering::SeqCst);
+        self.activity_changed.notify_waiters();
+    }
+
+    async fn wait_for_activity_drain(&self) {
+        loop {
+            let changed = self.activity_changed.notified();
+            if self.active.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            changed.await;
+        }
+    }
+
+    fn record_close_error(&self, error: &TransportError) {
+        let mut first = self.close_error.lock().unwrap();
+        if first.is_none() {
+            *first = Some(error.to_string());
+        }
+    }
+
+    fn record_forced_cleanup_error(&self, error: &TransportError) {
+        let mut recorded = self.close_error.lock().unwrap();
+        match recorded.as_mut() {
+            Some(recorded) => {
+                recorded.push_str("; forced cleanup also failed: ");
+                recorded.push_str(&error.to_string());
+            }
+            None => *recorded = Some(error.to_string()),
+        }
+    }
+
+    async fn close_parts(
+        self: &Arc<Self>,
+        transport: Box<dyn TransportSession>,
+        lifetime: OwnedSemaphorePermit,
+    ) -> Result<(), TransportError> {
+        self.close_owned(transport, Some(lifetime)).await
+    }
+
+    async fn close_transport(
+        self: &Arc<Self>,
+        transport: Box<dyn TransportSession>,
+    ) -> Result<(), TransportError> {
+        self.close_owned(transport, None).await
+    }
+
+    async fn close_owned(
+        self: &Arc<Self>,
+        transport: Box<dyn TransportSession>,
+        lifetime: Option<OwnedSemaphorePermit>,
+    ) -> Result<(), TransportError> {
+        let (sender, receiver) = oneshot::channel();
+        let owner_pool = self.clone();
+        self.tasks.spawn(async move {
+            let lifetime = lifetime;
+            let mut fail_closed_on_drop = FailClosedOnOwnerDrop::new(owner_pool.clone());
+            let force = CancellationToken::new();
+            let closing = transport.close(force.clone());
+            tokio::pin!(closing);
+            let result = tokio::select! {
+                result = &mut closing => result,
+                _ = tokio::time::sleep(SFTP_SESSION_CLOSE_TIMEOUT) => {
+                    owner_pool.fail_closed();
+                    let error = TransportError::Close(format!(
+                        "SFTP session close timed out after {}s",
+                        SFTP_SESSION_CLOSE_TIMEOUT.as_secs()
+                    ));
+                    owner_pool.record_close_error(&error);
+                    force.cancel();
+                    drop(lifetime);
+                    let _ = sender.send(Err(error));
+                    if let Err(error) = closing.await {
+                        tracing::error!(%error, "forced SFTP child/master cleanup failed after close timeout");
+                        owner_pool.record_forced_cleanup_error(&error);
+                    }
+                    return;
+                }
+            };
+
+            if let Err(error) = &result {
+                owner_pool.fail_closed();
+                owner_pool.record_close_error(error);
+            }
+            fail_closed_on_drop.disarm();
+            drop(lifetime);
+            let _ = sender.send(result);
+        });
+        match receiver.await {
+            Ok(result) => result,
+            Err(_) => {
+                self.fail_closed();
+                let error = TransportError::Close("SFTP close owner task failed".to_owned());
+                self.record_close_error(&error);
+                Err(error)
+            }
+        }
+    }
+
+    async fn close_session(
+        self: &Arc<Self>,
+        mut session: PhysicalSession,
+    ) -> Result<(), TransportError> {
+        let (transport, lifetime) = session.take_parts();
+        self.close_parts(transport, lifetime).await
+    }
+
+    async fn reap_expired_idle(self: &Arc<Self>) {
+        let expired = {
+            let now = Instant::now();
+            let mut idle = self.idle.lock().await;
+            let mut expired = Vec::new();
+            while idle.len() > SFTP_IDLE_WARM_FLOOR
+                && idle.front().is_some_and(|session| {
+                    now.saturating_duration_since(session.idle_since) >= SFTP_IDLE_TIMEOUT
+                })
+            {
+                expired.push(idle.pop_front().expect("idle front checked above"));
+            }
+            expired
+        };
+
+        for session in expired {
+            let inner = self.clone();
+            self.tasks.spawn(async move {
+                let _ = inner.close_session(session).await;
+            });
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -942,12 +1388,43 @@ impl SftpSessionPool {
                 idle: Mutex::new(VecDeque::new()),
                 idle_available: Notify::new(),
                 writable: true,
+                closed: AtomicBool::new(false),
+                activity_gate: StdMutex::new(()),
+                active: AtomicUsize::new(0),
+                activity_changed: Notify::new(),
+                reaper_shutdown: CancellationToken::new(),
+                session_shutdown: CancellationToken::new(),
+                tasks: TaskTracker::new(),
+                shutdown_lock: Mutex::new(()),
+                shutdown_complete: AtomicBool::new(false),
+                close_error: StdMutex::new(None),
             }),
         };
 
         let session = pool.open_physical().await?;
         pool.inner.idle.lock().await.push_back(session);
+        pool.start_idle_reaper();
         Ok(pool)
+    }
+
+    fn start_idle_reaper(&self) {
+        let inner = Arc::downgrade(&self.inner);
+        let shutdown = self.inner.reaper_shutdown.clone();
+        let mut next_tick = Instant::now() + SFTP_IDLE_REAP_INTERVAL;
+        self.inner.tasks.spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    _ = tokio::time::sleep_until(next_tick) => {
+                        next_tick += SFTP_IDLE_REAP_INTERVAL;
+                        let Some(inner) = inner.upgrade() else {
+                            break;
+                        };
+                        inner.reap_expired_idle().await;
+                    }
+                }
+            }
+        });
     }
 
     fn validate_limits(shared: usize, reads: usize, writes: usize) -> Result<(), TransportError> {
@@ -973,13 +1450,68 @@ impl SftpSessionPool {
 
     pub async fn checkout(&self, kind: OperationKind) -> Result<SessionLease, TransportError> {
         let admission = self.inner.admission.acquire(kind).await?;
+        let activity = self.inner.register_activity()?;
 
         let session = self.checkout_physical().await?;
         Ok(SessionLease {
             pool: self.inner.clone(),
             session: Some(session),
             admission: Some(admission),
+            activity: Some(activity),
         })
+    }
+
+    pub fn begin_shutdown(&self) {
+        self.inner.fail_closed();
+    }
+
+    pub async fn shutdown(&self) -> Result<(), TransportError> {
+        let deadline = Instant::now() + SFTP_POOL_SHUTDOWN_TIMEOUT;
+        let _shutdown = tokio::time::timeout_at(deadline, self.inner.shutdown_lock.lock())
+            .await
+            .map_err(|_| {
+                TransportError::Close(format!(
+                    "SFTP pool shutdown timed out after {}s",
+                    SFTP_POOL_SHUTDOWN_TIMEOUT.as_secs()
+                ))
+            })?;
+        if self.inner.shutdown_complete.load(Ordering::SeqCst) {
+            return match self.inner.close_error.lock().unwrap().as_ref() {
+                Some(error) => Err(TransportError::Close(error.clone())),
+                None => Ok(()),
+            };
+        }
+
+        self.inner.fail_closed();
+        self.inner.reaper_shutdown.cancel();
+        let inner = self.inner.clone();
+        let drain = async move {
+            inner.wait_for_activity_drain().await;
+            let idle = {
+                let mut idle = inner.idle.lock().await;
+                idle.drain(..).collect::<Vec<_>>()
+            };
+            for session in idle {
+                let cleanup_pool = inner.clone();
+                inner.tasks.spawn(async move {
+                    let _ = cleanup_pool.close_session(session).await;
+                });
+            }
+            inner.tasks.close();
+            inner.tasks.wait().await;
+        };
+
+        if tokio::time::timeout_at(deadline, drain).await.is_err() {
+            return Err(TransportError::Close(format!(
+                "SFTP pool shutdown timed out after {}s",
+                SFTP_POOL_SHUTDOWN_TIMEOUT.as_secs()
+            )));
+        }
+        self.inner.shutdown_complete.store(true, Ordering::SeqCst);
+        match self.inner.close_error.lock().unwrap().as_ref() {
+            Some(error) => Err(TransportError::Close(error.clone())),
+            None => Ok(()),
+        }
     }
 
     async fn checkout_physical(&self) -> Result<PhysicalSession, TransportError> {
@@ -1016,40 +1548,87 @@ impl SftpSessionPool {
         &self,
         permit: OwnedSemaphorePermit,
     ) -> Result<PhysicalSession, TransportError> {
-        let factory = self.inner.factory.clone();
-        let writable = self.inner.writable;
+        let inner = self.inner.clone();
+        let factory = inner.factory.clone();
+        let writable = inner.writable;
+        let owner_pool = inner.clone();
         let (sender, receiver) = oneshot::channel();
-        tokio::spawn(async move {
-            let result = match factory.open().await {
-                Err(error) => Err(error),
-                Ok(transport) => {
-                    if writable {
-                        if let Err(error) =
-                            require_publication_capabilities(transport.capabilities())
-                        {
-                            let _ = transport.close().await;
-                            Err(error)
-                        } else {
-                            Ok(PhysicalSession {
-                                transport,
-                                _lifetime: permit,
-                            })
+        self.inner.tasks.spawn(async move {
+            let mut permit = Some(permit);
+            let mut fail_closed_on_drop = FailClosedOnOwnerDrop::new(owner_pool.clone());
+            let force = owner_pool.session_shutdown.child_token();
+            let opening = factory.open(force.clone());
+            tokio::pin!(opening);
+            let result = tokio::select! {
+                result = &mut opening => result.map(|transport| {
+                    let session = PhysicalSession {
+                        transport: Some(transport),
+                        lifetime: permit.take(),
+                        idle_since: Instant::now(),
+                        pool: Arc::downgrade(&owner_pool),
+                    };
+                    debug_assert!(session.lifetime.is_some());
+                    session
+                }),
+                _ = tokio::time::sleep(SFTP_SESSION_OPEN_TIMEOUT) => {
+                    owner_pool.fail_closed();
+                    drop(permit.take());
+                    let _ = sender.send(Err(TransportError::Open(format!(
+                        "SFTP session open timed out after {}s",
+                        SFTP_SESSION_OPEN_TIMEOUT.as_secs()
+                    ))));
+                    force.cancel();
+                    match opening.await {
+                        Ok(transport) => {
+                            let _ = owner_pool.close_transport(transport).await;
                         }
-                    } else {
-                        Ok(PhysicalSession {
-                            transport,
-                            _lifetime: permit,
-                        })
+                        Err(error @ TransportError::Close(_)) => {
+                            tracing::error!(%error, "SFTP opener cleanup failed after open timeout");
+                            owner_pool.record_forced_cleanup_error(&error);
+                        }
+                        Err(_) => {}
                     }
+                    return;
                 }
             };
-            if let Err(result) = sender.send(result)
-                && let Ok(session) = result
-            {
-                let _ = session.close().await;
+            if matches!(
+                result,
+                Err(TransportError::PoolClosed | TransportError::Close(_))
+            ) {
+                owner_pool.fail_closed();
+            }
+            if let Err(error @ TransportError::Close(_)) = &result {
+                owner_pool.record_forced_cleanup_error(error);
+            }
+            fail_closed_on_drop.disarm();
+            if let Err(Ok(session)) = sender.send(result) {
+                let _ = owner_pool.close_session(session).await;
             }
         });
-        receiver.await.map_err(|_| TransportError::PoolClosed)?
+        let session = match receiver.await {
+            Ok(Ok(session)) => session,
+            Ok(Err(error)) => return Err(error),
+            Err(_) => {
+                self.inner.fail_closed();
+                return Err(TransportError::PoolClosed);
+            }
+        };
+        if writable
+            && let Err(error) = require_publication_capabilities(session.transport().capabilities())
+        {
+            match self.inner.close_session(session).await {
+                Ok(()) => return Err(error),
+                Err(cleanup) => {
+                    self.inner.fail_closed();
+                    tracing::error!(
+                        %cleanup,
+                        "failed to clean up a capability-rejected SFTP session"
+                    );
+                    return Err(cleanup);
+                }
+            }
+        }
+        Ok(session)
     }
 }
 
@@ -1085,6 +1664,21 @@ pub struct SessionLease {
     pool: Arc<PoolInner>,
     session: Option<PhysicalSession>,
     admission: Option<OperationAdmission>,
+    activity: Option<PoolActivity>,
+}
+
+struct PoolActivity {
+    pool: Arc<PoolInner>,
+    active: bool,
+}
+
+impl Drop for PoolActivity {
+    fn drop(&mut self) {
+        if self.active {
+            self.active = false;
+            self.pool.finish_activity();
+        }
+    }
 }
 
 impl fmt::Debug for SessionLease {
@@ -1100,7 +1694,7 @@ impl SessionLease {
         self.session
             .as_ref()
             .expect("lease always owns a session until completion")
-            .transport
+            .transport()
             .capabilities()
     }
 
@@ -1113,7 +1707,7 @@ impl SessionLease {
         self.session
             .as_mut()
             .expect("lease always owns a session until completion")
-            .transport
+            .transport_mut()
             .read_object(path, range, head)
             .await
     }
@@ -1125,7 +1719,7 @@ impl SessionLease {
         self.session
             .as_mut()
             .expect("lease always owns a session until completion")
-            .transport
+            .transport_mut()
             .list_directory(path)
             .await
     }
@@ -1134,7 +1728,7 @@ impl SessionLease {
         self.session
             .as_mut()
             .expect("lease always owns a session until completion")
-            .transport
+            .transport_mut()
             .remove_file(path)
             .await
     }
@@ -1143,7 +1737,7 @@ impl SessionLease {
         self.session
             .as_mut()
             .expect("lease always owns a session until completion")
-            .transport
+            .transport_mut()
             .create_dir_all(path)
             .await
     }
@@ -1156,7 +1750,7 @@ impl SessionLease {
         self.session
             .as_mut()
             .expect("lease always owns a session until completion")
-            .transport
+            .transport_mut()
             .write_file_durable(path, chunks)
             .await
     }
@@ -1170,7 +1764,7 @@ impl SessionLease {
         self.session
             .as_mut()
             .expect("lease always owns a session until completion")
-            .transport
+            .transport_mut()
             .write_file_at_durable(path, offset, chunks)
             .await
     }
@@ -1184,7 +1778,7 @@ impl SessionLease {
         self.session
             .as_mut()
             .expect("lease always owns a session until completion")
-            .transport
+            .transport_mut()
             .write_file_at(path, offset, chunks)
             .await
     }
@@ -1198,7 +1792,7 @@ impl SessionLease {
         self.session
             .as_mut()
             .expect("lease always owns a session until completion")
-            .transport
+            .transport_mut()
             .read_exact(path, offset, len)
             .await
     }
@@ -1211,7 +1805,7 @@ impl SessionLease {
         self.session
             .as_mut()
             .expect("lease always owns a session until completion")
-            .transport
+            .transport_mut()
             .hard_link(from, to)
             .await
     }
@@ -1224,7 +1818,7 @@ impl SessionLease {
         self.session
             .as_mut()
             .expect("lease always owns a session until completion")
-            .transport
+            .transport_mut()
             .posix_rename(from, to)
             .await
     }
@@ -1236,10 +1830,21 @@ impl SessionLease {
             .expect("lease always owns a session until completion");
         let pool = self.pool.clone();
         let admission = self.admission.take();
-        let returning = tokio::spawn(async move {
-            pool.idle.lock().await.push_back(session);
-            pool.idle_available.notify_one();
+        let activity = self.activity.take();
+        let returning = self.pool.tasks.spawn(async move {
+            let mut idle = pool.idle.lock().await;
+            if pool.closed.load(Ordering::SeqCst) {
+                drop(idle);
+                let _ = pool.close_session(session).await;
+            } else {
+                let mut session = session;
+                session.idle_since = Instant::now();
+                idle.push_back(session);
+                drop(idle);
+                pool.idle_available.notify_one();
+            }
             drop(admission);
+            drop(activity);
         });
         returning
             .await
@@ -1252,9 +1857,12 @@ impl SessionLease {
             .take()
             .expect("lease always owns a session until retirement");
         let admission = self.admission.take();
-        let cleanup = tokio::spawn(async move {
-            let result = session.close().await;
+        let activity = self.activity.take();
+        let pool = self.pool.clone();
+        let cleanup = self.pool.tasks.spawn(async move {
+            let result = pool.close_session(session).await;
             drop(admission);
+            drop(activity);
             result
         });
         cleanup
@@ -1290,16 +1898,20 @@ impl Drop for SessionLease {
             return;
         };
         let admission = self.admission.take();
+        let activity = self.activity.take();
+        let pool = self.pool.clone();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
-                let _ = session.close().await;
+            drop(runtime);
+            self.pool.tasks.spawn(async move {
+                let _ = pool.close_session(session).await;
                 drop(admission);
+                drop(activity);
             });
         } else {
-            // Releasing a physical permit before an async close would make a
-            // ninth connection possible. Without a runtime, retain both.
-            std::mem::forget(session);
-            std::mem::forget(admission);
+            pool.fail_closed();
+            drop(session);
+            drop(admission);
+            drop(activity);
         }
     }
 }
@@ -1311,7 +1923,7 @@ mod tests {
         RemoteEntryKind, SFTP_READ_PACKET_SIZE, SFTP_READ_REQUEST_CONCURRENCY,
         SFTP_WRITE_PACKET_SIZE, SFTP_WRITE_REQUEST_CONCURRENCY, SessionDisposition, SessionFactory,
         SftpSessionPool, TransportError, TransportSession, plan_pipelined_reads,
-        plan_pipelined_writes,
+        plan_pipelined_writes, supervise_ssh_process,
     };
     use crate::config::SftpEndpoint;
     use crate::sftp_object_store::{ObjectHeader, SftpCapabilities, encode_header};
@@ -1321,6 +1933,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use tokio::sync::Notify;
+    use tokio_util::sync::CancellationToken;
 
     #[test]
     fn pipelined_write_plan_matches_rclone_packet_window_and_offsets() {
@@ -1372,12 +1985,18 @@ mod tests {
         live: AtomicUsize,
         peak: AtomicUsize,
         close_started: Notify,
+        close_started_count: AtomicUsize,
         allow_close: Notify,
         block_close: AtomicUsize,
         open_started: Notify,
         allow_open: Notify,
         block_open_from: AtomicUsize,
+        panic_open_from: AtomicUsize,
+        fail_open_from: AtomicUsize,
         fail_close: AtomicUsize,
+        panic_close: AtomicUsize,
+        protocol_close_failure: AtomicUsize,
+        protocol_close_failures: AtomicUsize,
     }
 
     impl fmt::Debug for RecordingFactory {
@@ -1394,12 +2013,18 @@ mod tests {
                     live: AtomicUsize::new(0),
                     peak: AtomicUsize::new(0),
                     close_started: Notify::new(),
+                    close_started_count: AtomicUsize::new(0),
                     allow_close: Notify::new(),
                     block_close: AtomicUsize::new(0),
                     open_started: Notify::new(),
                     allow_open: Notify::new(),
                     block_open_from: AtomicUsize::new(0),
+                    panic_open_from: AtomicUsize::new(0),
+                    fail_open_from: AtomicUsize::new(0),
                     fail_close: AtomicUsize::new(0),
+                    panic_close: AtomicUsize::new(0),
+                    protocol_close_failure: AtomicUsize::new(0),
+                    protocol_close_failures: AtomicUsize::new(0),
                 }),
                 capabilities,
             }
@@ -1428,14 +2053,26 @@ mod tests {
 
     #[async_trait]
     impl SessionFactory for RecordingFactory {
-        async fn open(&self) -> Result<Box<dyn TransportSession>, TransportError> {
+        async fn open(
+            &self,
+            _force: CancellationToken,
+        ) -> Result<Box<dyn TransportSession>, TransportError> {
             let id = self.state.dials.fetch_add(1, Ordering::SeqCst) + 1;
             let live = self.state.live.fetch_add(1, Ordering::SeqCst) + 1;
             self.state.peak.fetch_max(live, Ordering::SeqCst);
             let block_open_from = self.state.block_open_from.load(Ordering::SeqCst);
             if block_open_from != 0 && id >= block_open_from {
-                self.state.open_started.notify_waiters();
+                self.state.open_started.notify_one();
                 self.state.allow_open.notified().await;
+            }
+            let panic_open_from = self.state.panic_open_from.load(Ordering::SeqCst);
+            if panic_open_from != 0 && id >= panic_open_from {
+                panic!("injected SFTP open owner panic");
+            }
+            let fail_open_from = self.state.fail_open_from.load(Ordering::SeqCst);
+            if fail_open_from != 0 && id >= fail_open_from {
+                self.state.live.fetch_sub(1, Ordering::SeqCst);
+                return Err(TransportError::PoolClosed);
             }
             Ok(Box::new(RecordingSession {
                 id,
@@ -1449,6 +2086,48 @@ mod tests {
         id: usize,
         state: Arc<FactoryState>,
         capabilities: SftpCapabilities,
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct ShutdownAwareFactory {
+        live_processes: Arc<AtomicUsize>,
+        process_exited: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl SessionFactory for ShutdownAwareFactory {
+        async fn open(
+            &self,
+            force: CancellationToken,
+        ) -> Result<Box<dyn TransportSession>, TransportError> {
+            self.live_processes.fetch_add(1, Ordering::SeqCst);
+            let live_processes = self.live_processes.clone();
+            let process_exited = self.process_exited.clone();
+            tokio::spawn(async move {
+                force.cancelled().await;
+                live_processes.fetch_sub(1, Ordering::SeqCst);
+                process_exited.notify_waiters();
+            });
+            Ok(Box::new(ShutdownAwareSession))
+        }
+    }
+
+    #[derive(Debug)]
+    struct ShutdownAwareSession;
+
+    #[async_trait]
+    impl TransportSession for ShutdownAwareSession {
+        fn capabilities(&self) -> SftpCapabilities {
+            SftpCapabilities {
+                fsync: true,
+                hardlink: true,
+                posix_rename: true,
+            }
+        }
+
+        async fn close(self: Box<Self>, _force: CancellationToken) -> Result<(), TransportError> {
+            Ok(())
+        }
     }
 
     impl fmt::Debug for RecordingSession {
@@ -1466,15 +2145,26 @@ mod tests {
             self.capabilities
         }
 
-        async fn close(self: Box<Self>) -> Result<(), TransportError> {
+        async fn close(self: Box<Self>, _force: CancellationToken) -> Result<(), TransportError> {
             if self.state.block_close.load(Ordering::SeqCst) != 0 {
-                self.state.close_started.notify_waiters();
+                self.state
+                    .close_started_count
+                    .fetch_add(1, Ordering::SeqCst);
+                self.state.close_started.notify_one();
                 self.state.allow_close.notified().await;
             }
-            self.state.live.fetch_sub(1, Ordering::SeqCst);
+            if self.state.panic_close.load(Ordering::SeqCst) != 0 {
+                panic!("injected SFTP close owner panic");
+            }
             if self.state.fail_close.load(Ordering::SeqCst) != 0 {
                 return Err(TransportError::Close("forced close failure".to_owned()));
             }
+            if self.state.protocol_close_failure.load(Ordering::SeqCst) != 0 {
+                self.state
+                    .protocol_close_failures
+                    .fetch_add(1, Ordering::SeqCst);
+            }
+            self.state.live.fetch_sub(1, Ordering::SeqCst);
             Ok(())
         }
     }
@@ -1514,7 +2204,9 @@ mod tests {
             }));
         }
 
-        tokio::task::yield_now().await;
+        while pool.inner.admission.waiter_count() != 32 {
+            tokio::task::yield_now().await;
+        }
         assert!(tasks.iter().all(|task| !task.is_finished()));
         assert_eq!(factory.live(), 8);
         assert_eq!(factory.peak(), 8);
@@ -1540,7 +2232,9 @@ mod tests {
             let pool = pool.clone();
             async move { pool.checkout(OperationKind::Read).await }
         });
-        tokio::task::yield_now().await;
+        while pool.inner.admission.waiter_count() != 1 {
+            tokio::task::yield_now().await;
+        }
         assert!(!eighth_read.is_finished());
 
         let write = tokio::time::timeout(
@@ -1579,7 +2273,9 @@ mod tests {
             let pool = pool.clone();
             async move { pool.checkout(OperationKind::Write).await }
         });
-        tokio::task::yield_now().await;
+        while pool.inner.admission.waiter_count() != 1 {
+            tokio::task::yield_now().await;
+        }
         assert!(!eighth_write.is_finished());
 
         let read = tokio::time::timeout(
@@ -1685,7 +2381,9 @@ mod tests {
             let pool = pool.clone();
             async move { pool.checkout(OperationKind::Metadata).await }
         });
-        tokio::task::yield_now().await;
+        while pool.inner.admission.waiter_count() != 1 {
+            tokio::task::yield_now().await;
+        }
         waiter.abort();
         assert!(waiter.await.unwrap_err().is_cancelled());
         assert_eq!(factory.dials(), 1);
@@ -1809,6 +2507,165 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn canceled_open_owner_panic_closes_pool_before_capacity_is_released() {
+        let factory = RecordingFactory::fully_capable();
+        let pool = Arc::new(pool(factory.clone(), 2, 2, 2).await);
+        let held = pool.checkout(OperationKind::Read).await.unwrap();
+        factory.state.block_open_from.store(2, Ordering::SeqCst);
+        factory.state.panic_open_from.store(2, Ordering::SeqCst);
+
+        let opening = tokio::spawn({
+            let pool = pool.clone();
+            async move { pool.checkout(OperationKind::Write).await }
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            factory.state.open_started.notified(),
+        )
+        .await
+        .expect("second dial reached the injected open panic gate");
+        opening.abort();
+        assert!(opening.await.unwrap_err().is_cancelled());
+
+        factory.state.allow_open.notify_waiters();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !pool.inner.closed.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("owner unwind closes the pool");
+
+        assert!(matches!(
+            pool.checkout(OperationKind::Write).await,
+            Err(TransportError::PoolClosed)
+        ));
+        assert_eq!(factory.dials(), 2, "owner panic must not permit a redial");
+        held.retire().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn canceled_close_owner_panic_closes_pool_before_capacity_is_released() {
+        let factory = RecordingFactory::fully_capable();
+        let pool = Arc::new(pool(factory.clone(), 1, 1, 1).await);
+        let session = pool
+            .inner
+            .idle
+            .lock()
+            .await
+            .pop_front()
+            .expect("constructor leaves one warm session");
+        factory.state.block_close.store(1, Ordering::SeqCst);
+        factory.state.panic_close.store(1, Ordering::SeqCst);
+
+        let closing = tokio::spawn({
+            let pool = pool.clone();
+            async move { pool.inner.close_session(session).await }
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            factory.state.close_started.notified(),
+        )
+        .await
+        .expect("close reached the injected panic gate");
+        closing.abort();
+        assert!(closing.await.unwrap_err().is_cancelled());
+
+        factory.state.allow_close.notify_waiters();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !pool.inner.closed.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("owner unwind closes the pool");
+
+        assert!(matches!(
+            pool.checkout(OperationKind::Write).await,
+            Err(TransportError::PoolClosed)
+        ));
+        assert_eq!(factory.dials(), 1, "owner panic must not permit a redial");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn forever_pending_open_times_out_and_closes_admission() {
+        let factory = RecordingFactory::fully_capable();
+        let pool = pool(factory.clone(), 2, 2, 2).await;
+        let held = pool.checkout(OperationKind::Read).await.unwrap();
+        factory.state.block_open_from.store(2, Ordering::SeqCst);
+
+        let open_started = factory.state.open_started.notified();
+        let opening = tokio::spawn({
+            let pool = pool.clone();
+            async move { pool.checkout(OperationKind::Write).await }
+        });
+        open_started.await;
+        tokio::time::advance(std::time::Duration::from_secs(31)).await;
+        tokio::task::yield_now().await;
+        let opening = tokio::time::timeout(std::time::Duration::from_secs(1), opening).await;
+
+        assert!(matches!(
+            opening,
+            Ok(Ok(Err(TransportError::Open(ref message)))) if message == "SFTP session open timed out after 30s"
+        ));
+        assert!(matches!(
+            pool.checkout(OperationKind::Read).await,
+            Err(TransportError::PoolClosed)
+        ));
+        assert_eq!(factory.dials(), 2);
+        held.retire().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn canceled_forever_pending_open_still_expires_owner_deadline() {
+        let factory = RecordingFactory::fully_capable();
+        let pool = pool(factory.clone(), 2, 2, 2).await;
+        let held = pool.checkout(OperationKind::Read).await.unwrap();
+        factory.state.block_open_from.store(2, Ordering::SeqCst);
+
+        let open_started = factory.state.open_started.notified();
+        let opening = tokio::spawn({
+            let pool = pool.clone();
+            async move { pool.checkout(OperationKind::Write).await }
+        });
+        open_started.await;
+        opening.abort();
+        assert!(opening.await.unwrap_err().is_cancelled());
+
+        tokio::time::advance(std::time::Duration::from_secs(31)).await;
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        assert!(pool.inner.closed.load(Ordering::SeqCst));
+        assert_eq!(pool.inner.shared.available_permits(), 1);
+
+        held.retire().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ambiguous_partial_open_cleanup_fails_the_actual_pool_closed() {
+        let factory = RecordingFactory::fully_capable();
+        let pool = pool(factory.clone(), 2, 2, 2).await;
+        let held = pool.checkout(OperationKind::Read).await.unwrap();
+        factory.state.fail_open_from.store(2, Ordering::SeqCst);
+
+        assert!(matches!(
+            pool.checkout(OperationKind::Write).await,
+            Err(TransportError::PoolClosed)
+        ));
+        assert!(pool.inner.closed.load(Ordering::SeqCst));
+        assert!(matches!(
+            pool.checkout(OperationKind::Read).await,
+            Err(TransportError::PoolClosed)
+        ));
+        assert_eq!(factory.dials(), 2);
+
+        held.retire().await.unwrap();
+        pool.shutdown().await.unwrap();
+        assert_eq!(factory.live(), 0);
+    }
+
+    #[tokio::test]
     async fn blocking_close_keeps_shared_lifetime_permit_until_close_finishes() {
         let factory = RecordingFactory::fully_capable();
         let pool = Arc::new(pool(factory.clone(), 1, 1, 1).await);
@@ -1836,6 +2693,56 @@ mod tests {
         retiring.await.unwrap().unwrap();
         reconnect.await.unwrap().unwrap().complete().await.unwrap();
         assert_eq!(factory.peak(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn forever_pending_close_times_out_and_closes_admission() {
+        let factory = RecordingFactory::fully_capable();
+        let pool = pool(factory.clone(), 1, 1, 1).await;
+        factory.state.block_close.store(1, Ordering::SeqCst);
+        let lease = pool.checkout(OperationKind::Write).await.unwrap();
+
+        let retiring =
+            tokio::time::timeout(std::time::Duration::from_secs(11), lease.retire()).await;
+
+        assert!(matches!(
+            retiring,
+            Ok(Err(TransportError::Close(ref message))) if message == "SFTP session close timed out after 10s"
+        ));
+        assert!(matches!(
+            pool.checkout(OperationKind::Write).await,
+            Err(TransportError::PoolClosed)
+        ));
+        assert_eq!(factory.dials(), 1);
+        assert_eq!(pool.inner.shared.available_permits(), 1);
+        assert_eq!(
+            pool.inner
+                .admission
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .active_writes,
+            0
+        );
+
+        let shutdown = tokio::spawn({
+            let pool = pool.clone();
+            async move { pool.shutdown().await }
+        });
+        tokio::time::advance(std::time::Duration::from_secs(46)).await;
+        assert!(matches!(
+            shutdown.await.unwrap(),
+            Err(TransportError::Close(ref message)) if message == "SFTP pool shutdown timed out after 45s"
+        ));
+        assert_eq!(factory.live(), 1);
+
+        factory.state.block_close.store(0, Ordering::SeqCst);
+        factory.state.allow_close.notify_waiters();
+        while factory.live() != 0 {
+            tokio::task::yield_now().await;
+        }
+        assert!(pool.shutdown().await.is_err());
     }
 
     #[tokio::test]
@@ -1948,7 +2855,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn broken_operation_preserves_close_failure_as_cleanup_evidence() {
+    async fn close_failure_with_live_master_fails_closed_without_redial() {
         let factory = RecordingFactory::fully_capable();
         let pool = pool(factory.clone(), 1, 1, 1).await;
         factory.state.fail_close.store(1, Ordering::SeqCst);
@@ -1972,7 +2879,78 @@ mod tests {
             }
             LeaseFinishError::Lifecycle(error) => panic!("operation error was lost: {error}"),
         }
+        assert_eq!(factory.live(), 1);
+        assert!(matches!(
+            pool.checkout(OperationKind::Write).await,
+            Err(TransportError::PoolClosed)
+        ));
+        assert_eq!(factory.dials(), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_operation_cleanup_finishes_before_terminal_shutdown_returns() {
+        let factory = RecordingFactory::fully_capable();
+        let pool = pool(factory.clone(), 3, 3, 3).await;
+        let mut leases = Vec::new();
+        for _ in 0..3 {
+            leases.push(pool.checkout(OperationKind::Write).await.unwrap());
+        }
+        factory
+            .state
+            .protocol_close_failure
+            .store(1, Ordering::SeqCst);
+        factory.state.block_close.store(1, Ordering::SeqCst);
+
+        let cleanups = leases
+            .into_iter()
+            .map(|lease| {
+                tokio::spawn(async move {
+                    lease
+                        .finish(
+                            Err::<(), _>("ambiguous final-flush write"),
+                            SessionDisposition::BrokenOrAmbiguous,
+                        )
+                        .await
+                })
+            })
+            .collect::<Vec<_>>();
+        while factory.state.close_started_count.load(Ordering::SeqCst) != 3 {
+            tokio::task::yield_now().await;
+        }
+        let shutting_down = tokio::spawn({
+            let pool = pool.clone();
+            async move { pool.shutdown().await }
+        });
+        while !pool.inner.closed.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+        assert!(!shutting_down.is_finished());
+
+        factory.state.block_close.store(0, Ordering::SeqCst);
+        factory.state.allow_close.notify_waiters();
+        for cleanup in cleanups {
+            let failure = cleanup.await.unwrap().unwrap_err();
+            assert!(matches!(
+                failure,
+                LeaseFinishError::Operation { cleanup: None, .. }
+            ));
+        }
+
+        let shutdown = tokio::time::timeout(std::time::Duration::from_secs(1), shutting_down)
+            .await
+            .expect("terminal shutdown is reachable after concurrent cleanup")
+            .unwrap();
+        shutdown.unwrap();
+        assert_eq!(factory.dials(), 3);
         assert_eq!(factory.live(), 0);
+        assert_eq!(
+            factory.state.protocol_close_failures.load(Ordering::SeqCst),
+            3
+        );
+        assert!(matches!(
+            pool.checkout(OperationKind::Write).await,
+            Err(TransportError::PoolClosed)
+        ));
     }
 
     #[tokio::test]
@@ -2044,6 +3022,146 @@ mod tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn idle_reaper_closes_expired_sessions_but_keeps_one_warm() {
+        let factory = RecordingFactory::fully_capable();
+        let pool = pool(factory.clone(), 3, 3, 3).await;
+        let mut leases = Vec::new();
+        for _ in 0..3 {
+            leases.push(pool.checkout(OperationKind::Read).await.unwrap());
+        }
+        for lease in leases {
+            lease.complete().await.unwrap();
+        }
+        assert_eq!(factory.live(), 3);
+
+        tokio::time::advance(std::time::Duration::from_secs(59)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(factory.live(), 3);
+
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while factory.live() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("expired idle sessions close on the reap tick");
+        assert_eq!(factory.live(), 1);
+
+        pool.checkout(OperationKind::Read)
+            .await
+            .unwrap()
+            .complete()
+            .await
+            .unwrap();
+        assert_eq!(factory.dials(), 3);
+    }
+
+    #[tokio::test]
+    async fn shutdown_wakes_queued_checkout_and_drains_returned_active_session() {
+        let factory = RecordingFactory::fully_capable();
+        let pool = pool(factory.clone(), 1, 1, 1).await;
+        let held = pool.checkout(OperationKind::Read).await.unwrap();
+        let waiter = tokio::spawn({
+            let pool = pool.clone();
+            async move { pool.checkout(OperationKind::Write).await }
+        });
+        while pool.inner.admission.waiter_count() != 1 {
+            tokio::task::yield_now().await;
+        }
+
+        let shutting_down = tokio::spawn({
+            let pool = pool.clone();
+            async move { pool.shutdown().await }
+        });
+        assert!(matches!(
+            waiter.await.unwrap(),
+            Err(TransportError::PoolClosed)
+        ));
+        assert!(!shutting_down.is_finished());
+
+        held.complete().await.unwrap();
+        shutting_down.await.unwrap().unwrap();
+        assert_eq!(factory.live(), 0);
+        assert!(matches!(
+            pool.checkout(OperationKind::Read).await,
+            Err(TransportError::PoolClosed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn shutdown_closes_every_idle_session_and_is_idempotent() {
+        let factory = RecordingFactory::fully_capable();
+        let pool = pool(factory.clone(), 3, 3, 3).await;
+        let mut leases = Vec::new();
+        for _ in 0..3 {
+            leases.push(pool.checkout(OperationKind::Read).await.unwrap());
+        }
+        for lease in leases {
+            lease.complete().await.unwrap();
+        }
+        assert_eq!(factory.live(), 3);
+
+        pool.shutdown().await.unwrap();
+        assert_eq!(factory.live(), 0);
+        pool.shutdown().await.unwrap();
+        assert_eq!(factory.live(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_deadline_bounds_an_active_lease_that_never_returns() {
+        let factory = RecordingFactory::fully_capable();
+        let pool = pool(factory.clone(), 1, 1, 1).await;
+        let held = pool.checkout(OperationKind::Read).await.unwrap();
+        let shutting_down = tokio::spawn({
+            let pool = pool.clone();
+            async move { pool.shutdown().await }
+        });
+        while !pool.inner.closed.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+
+        tokio::time::advance(std::time::Duration::from_secs(46)).await;
+        let error = shutting_down.await.unwrap().unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "failed to close SFTP session: SFTP pool shutdown timed out after 45s"
+        );
+        assert_eq!(factory.live(), 1);
+
+        held.retire().await.unwrap();
+        pool.shutdown().await.unwrap();
+        assert_eq!(factory.live(), 0);
+    }
+
+    #[tokio::test]
+    async fn shutdown_forces_the_process_behind_an_active_lease_before_returning() {
+        let factory = ShutdownAwareFactory::default();
+        let pool = SftpSessionPool::new_writable(Arc::new(factory.clone()), 1, 1, 1)
+            .await
+            .unwrap();
+        let held = pool.checkout(OperationKind::Write).await.unwrap();
+        let process_exited = factory.process_exited.notified();
+        let shutting_down = tokio::spawn({
+            let pool = pool.clone();
+            async move { pool.shutdown().await }
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), process_exited)
+            .await
+            .expect("terminal pool cancellation reaches the active physical process");
+        assert_eq!(factory.live_processes.load(Ordering::SeqCst), 0);
+        assert!(!shutting_down.is_finished());
+
+        held.retire().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), shutting_down)
+            .await
+            .expect("shutdown finishes after the active lease returns")
+            .unwrap()
+            .unwrap();
+    }
+
     #[test]
     fn openssh_factory_debug_redacts_the_username() {
         let factory = OpenSshSessionFactory::new(
@@ -2061,6 +3179,54 @@ mod tests {
         assert!(debug.contains("storage.example.test"));
         assert!(debug.contains("2222"));
         assert!(!debug.contains("account-secret-name"));
+    }
+
+    #[test]
+    fn openssh_factory_effective_policy_bounds_connect_and_dead_peer_detection() {
+        let factory = OpenSshSessionFactory::new(
+            SftpEndpoint {
+                host: "storage.example.test".to_owned(),
+                port: 2222,
+                username: "account-name".to_owned(),
+            },
+            "/tmp/id-ed25519".into(),
+            "/tmp/known-hosts".into(),
+        )
+        .unwrap();
+
+        let output = std::process::Command::new("ssh")
+            .args(["-G", "-F"])
+            .arg(factory.authentication_config.path())
+            .arg("storage.example.test")
+            .output()
+            .expect("local ssh client evaluates the generated policy");
+        assert!(output.status.success());
+        let policy = String::from_utf8(output.stdout).unwrap();
+
+        assert!(policy.lines().any(|line| line == "connecttimeout 20"));
+        assert!(policy.lines().any(|line| line == "batchmode yes"));
+        assert!(policy.lines().any(|line| line == "serveraliveinterval 30"));
+        assert!(policy.lines().any(|line| line == "serveralivecountmax 3"));
+        assert!(policy.lines().any(|line| line == "controlmaster false"));
+        assert!(policy.lines().any(|line| line == "controlpersist no"));
+    }
+
+    #[tokio::test]
+    async fn terminal_force_kills_and_reaps_the_owned_ssh_process() {
+        let child = tokio::process::Command::new("sleep")
+            .arg("60")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn local stand-in for the owned ssh process");
+        let force = CancellationToken::new();
+        let owner = tokio::spawn(supervise_ssh_process(child, force.clone()));
+
+        force.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(1), owner)
+            .await
+            .expect("forced process owner terminates within its deadline")
+            .expect("process owner task does not panic")
+            .expect("owned process is positively reaped");
     }
 
     #[tokio::test]
@@ -2179,7 +3345,10 @@ mod tests {
             .await
             .unwrap();
         assert!(!root.path().join("object.bin").exists());
-        Box::new(session).close().await.unwrap();
+        Box::new(session)
+            .close(CancellationToken::new())
+            .await
+            .unwrap();
         assert!(child.wait().await.unwrap().success());
     }
 }
