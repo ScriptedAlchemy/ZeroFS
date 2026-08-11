@@ -179,6 +179,17 @@ pub trait RemoteSession: Debug + Send + Sync {
             "write_file_at_durable is not implemented by this session".to_owned(),
         ))
     }
+    async fn write_file_at(
+        &self,
+        path: &FilePath,
+        offset: u64,
+        chunks: Vec<Bytes>,
+    ) -> RemoteResult<()> {
+        let _ = (path, offset, chunks);
+        Err(RemoteError::Other(
+            "write_file_at is not implemented by this session".to_owned(),
+        ))
+    }
     async fn remove_file(&self, path: &FilePath) -> RemoteResult<()>;
     async fn hard_link(&self, from: &FilePath, to: &FilePath) -> RemoteResult<()>;
     async fn posix_rename(&self, from: &FilePath, to: &FilePath) -> RemoteResult<()>;
@@ -385,6 +396,23 @@ impl RemoteSession for PooledRemoteSession {
             .await
             .map_err(remote_transport_error)?;
         let operation = lease.write_file_at_durable(path, offset, chunks).await;
+        finish_lease(lease, operation)
+            .await
+            .map_err(remote_transport_error)
+    }
+
+    async fn write_file_at(
+        &self,
+        path: &FilePath,
+        offset: u64,
+        chunks: Vec<Bytes>,
+    ) -> RemoteResult<()> {
+        let mut lease = self
+            .pool
+            .checkout(crate::sftp_transport::OperationKind::Write)
+            .await
+            .map_err(remote_transport_error)?;
+        let operation = lease.write_file_at(path, offset, chunks).await;
         finish_lease(lease, operation)
             .await
             .map_err(remote_transport_error)
@@ -872,7 +900,7 @@ impl MultipartUpload for SftpMultipartUpload {
                 .checked_add(offset)
                 .ok_or_else(|| generic_error("multipart physical offset overflow"))?;
             session
-                .write_file_at_durable(&staging, physical_offset, chunks)
+                .write_file_at(&staging, physical_offset, chunks)
                 .await
                 .map_err(|error| publication_error(&location, error))?;
             state.lock().unwrap().completed[index] = true;
@@ -1168,6 +1196,15 @@ mod tests {
                 .await
         }
 
+        async fn write_file_at(
+            &mut self,
+            path: &FilePath,
+            offset: u64,
+            chunks: Vec<Bytes>,
+        ) -> Result<(), TransportError> {
+            self.session.write_file_at(path, offset, chunks).await
+        }
+
         async fn read_exact(
             &mut self,
             path: &FilePath,
@@ -1245,6 +1282,8 @@ mod tests {
         part_barrier: Barrier,
         part_writes_in_flight: AtomicUsize,
         max_part_writes_in_flight: AtomicUsize,
+        part_writes: AtomicUsize,
+        durable_writes: AtomicUsize,
     }
 
     impl ParallelMultipartSession {
@@ -1254,6 +1293,8 @@ mod tests {
                 part_barrier: Barrier::new(2),
                 part_writes_in_flight: AtomicUsize::new(0),
                 max_part_writes_in_flight: AtomicUsize::new(0),
+                part_writes: AtomicUsize::new(0),
+                durable_writes: AtomicUsize::new(0),
             }
         }
     }
@@ -1300,12 +1341,13 @@ mod tests {
             Ok(())
         }
 
-        async fn write_file_at_durable(
+        async fn write_file_at(
             &self,
             path: &FilePath,
             offset: u64,
             chunks: Vec<Bytes>,
         ) -> RemoteResult<()> {
+            self.part_writes.fetch_add(1, Ordering::SeqCst);
             if offset >= OBJECT_HEADER_LEN as u64 {
                 let current = self.part_writes_in_flight.fetch_add(1, Ordering::SeqCst) + 1;
                 self.max_part_writes_in_flight
@@ -1328,6 +1370,28 @@ mod tests {
             if offset >= OBJECT_HEADER_LEN as u64 {
                 self.part_writes_in_flight.fetch_sub(1, Ordering::SeqCst);
             }
+            Ok(())
+        }
+
+        async fn write_file_at_durable(
+            &self,
+            path: &FilePath,
+            offset: u64,
+            chunks: Vec<Bytes>,
+        ) -> RemoteResult<()> {
+            self.durable_writes.fetch_add(1, Ordering::SeqCst);
+            let mut files = self.files.lock().unwrap();
+            let file = files
+                .get_mut(path)
+                .ok_or_else(|| RemoteError::NotFound(path.display().to_string()))?;
+            let start = usize::try_from(offset)
+                .map_err(|_| RemoteError::Other("test offset overflow".to_owned()))?;
+            let bytes = chunks.into_iter().flatten().collect::<Vec<_>>();
+            let end = start + bytes.len();
+            let mut contents = file.to_vec();
+            contents.resize(contents.len().max(end), 0);
+            contents[start..end].copy_from_slice(&bytes);
+            *file = contents.into();
             Ok(())
         }
 
@@ -1377,8 +1441,11 @@ mod tests {
         .unwrap();
 
         assert_eq!(session.max_part_writes_in_flight.load(Ordering::SeqCst), 2);
+        assert_eq!(session.part_writes.load(Ordering::SeqCst), 2);
+        assert_eq!(session.durable_writes.load(Ordering::SeqCst), 0);
         assert!(!session.files.lock().unwrap().contains_key(target));
         upload.complete().await.unwrap();
+        assert_eq!(session.durable_writes.load(Ordering::SeqCst), 1);
 
         let published = session.files.lock().unwrap().get(target).cloned().unwrap();
         assert_eq!(&published[OBJECT_HEADER_LEN..], b"hello world");
