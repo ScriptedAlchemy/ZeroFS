@@ -52,8 +52,10 @@ const LIST_SHARD_CONCURRENCY: usize = 16;
 const SEAL_UPLOAD_CONCURRENCY: usize = 16;
 
 /// Multipart part size, and the seal size at which `put_segment` switches from
-/// a single PUT to multipart.
-const SEAL_PART_SIZE: usize = 10 * 1024 * 1024;
+/// a single PUT to multipart. A full 256 MiB segment becomes eight 32 MiB
+/// transfers, matching the bounded Storage Box session pool while avoiding the
+/// open/close churn observed with 10 MiB parts on a high-RTT SFTP backend.
+const SEAL_PART_SIZE: usize = 32 * 1024 * 1024;
 
 /// Warm a just-written segment into the read (parts) cache: the multipart
 /// upload bypasses the store's single-PUT write-through, so `put_segment`
@@ -924,7 +926,7 @@ mod tests {
         let codec = FrameCodec::new(&[1u8; 32], SEGMENT_INFO, CompressionConfig::Lz4);
         let store = SegmentStore::new(os.clone(), codec, 5, None);
         let frames: Vec<(u64, u64, Bytes)> =
-            (0..4u64).map(|i| (30, i, noise(i + 1, 4 << 20))).collect();
+            (0..9u64).map(|i| (30, i, noise(i + 1, 4 << 20))).collect();
         let locs = store.seal(&frames).await.unwrap();
         let segid = locs[0].2.segid;
         let size = os.head(&Path::from(segid.object_key())).await.unwrap().size;
