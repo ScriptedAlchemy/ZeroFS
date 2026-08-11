@@ -1,4 +1,5 @@
 pub mod admission;
+pub mod bootstrap;
 pub mod config;
 pub mod journal;
 pub mod journaler;

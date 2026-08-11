@@ -865,6 +865,7 @@ pub async fn build_slatedb(
 pub struct InitResult {
     pub fs: Arc<ZeroFS>,
     pub object_store: Arc<dyn object_store::ObjectStore>,
+    pub writeback: Option<crate::writeback::store::WritebackObjectStore>,
     pub sftp_pool: Option<crate::sftp_transport::SftpSessionPool>,
     pub wal_object_store: Option<Arc<dyn object_store::ObjectStore>>,
     pub db_path: String,
@@ -950,6 +951,7 @@ pub async fn run_server(
     crate::telemetry::send_startup_event(&settings);
 
     let init_result = crate::cli::init::initialize_filesystem(&settings, db_mode).await?;
+    let writeback_for_shutdown = init_result.writeback.clone();
     let sftp_pool = init_result.sftp_pool.clone();
     let sftp_pool_for_close = sftp_pool.clone();
     let using_sftp = sftp_pool.is_some();
@@ -1445,6 +1447,13 @@ pub async fn run_server(
     }
     .await;
 
+    let writeback_shutdown = match writeback_for_shutdown {
+        Some(writeback) => writeback
+            .shutdown()
+            .await
+            .context("Failed to shut down persistent writeback"),
+        None => Ok(()),
+    };
     let sftp_shutdown = match sftp_pool {
         Some(pool) => {
             info!("Waiting for SFTP sessions and lifecycle tasks to exit...");
@@ -1454,15 +1463,26 @@ pub async fn run_server(
         }
         None => Ok(()),
     };
-    match (server_result, sftp_shutdown) {
-        (Ok(()), Ok(())) => {
+    match (server_result, writeback_shutdown, sftp_shutdown) {
+        (Ok(()), Ok(()), Ok(())) => {
             info!("Shutdown complete");
             Ok(())
         }
-        (Err(server), Ok(())) => Err(server),
-        (Ok(()), Err(shutdown)) => Err(shutdown),
-        (Err(server), Err(shutdown)) => {
-            Err(server.context(format!("SFTP shutdown also failed: {shutdown:#}")))
+        (Err(server), Ok(()), Ok(())) => Err(server),
+        (Ok(()), Err(writeback), Ok(())) => Err(writeback),
+        (Ok(()), Ok(()), Err(sftp)) => Err(sftp),
+        (server, writeback, sftp) => {
+            let mut failures = Vec::new();
+            if let Err(error) = writeback {
+                failures.push(format!("writeback shutdown failed: {error:#}"));
+            }
+            if let Err(error) = sftp {
+                failures.push(format!("SFTP shutdown failed: {error:#}"));
+            }
+            match server {
+                Err(server) => Err(server.context(failures.join("; "))),
+                Ok(()) => Err(anyhow::anyhow!(failures.join("; "))),
+            }
         }
     }
 }

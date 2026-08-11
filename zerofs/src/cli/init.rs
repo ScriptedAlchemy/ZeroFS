@@ -21,6 +21,7 @@ use crate::replication::transport::{PromotionSnapshot, ReceiverControl};
 use crate::replication::{LineageProof, PromotionRetryGraceProof, ReplicationParams};
 use crate::storage_class_object_store::with_storage_class;
 use anyhow::{Context, Result};
+use sha2::{Digest, Sha256};
 use slatedb::BlockTransformer;
 use slatedb::object_store::path::Path;
 use slatedb_common::metrics::DefaultMetricsRecorder;
@@ -31,6 +32,7 @@ use tracing::info;
 /// State retained across role-election and writer-open retries.
 struct StartupContext {
     object_store: Arc<dyn object_store::ObjectStore>,
+    writeback: Option<crate::writeback::store::WritebackObjectStore>,
     sftp_pool: Option<crate::sftp_transport::SftpSessionPool>,
     /// Retrying store for direct ZeroFS I/O, including pre-serving HA ownership.
     retrying_object_store: Arc<dyn object_store::ObjectStore>,
@@ -217,20 +219,51 @@ impl StartupContext {
                 .map(crate::replication::ReplicationParams::from_config);
             let configured_replication_role = settings.replication.as_ref().map(|cfg| cfg.role);
 
-            // Shared by request handling and takeover reconciliation.
-            let dedup = Arc::new(crate::dedup::DedupCache::new());
-            dedup.start_expiry_reaper();
-
-            // Trace at the bottom of the stack so otrace sees the requests that
-            // actually leave the process. Everything above (length-check, prefetch,
-            // compactor) reads through these wrappers; cache hits make no backend
-            // request and so produce no event.
+            // Trace at the bottom of the writeback stack so otrace records only
+            // requests that actually leave the process. Overlay hits and locally
+            // acknowledged writes make no backend request and emit no event.
             let object_tracer = ObjectTracer::new();
-            let object_store = Arc::new(TracingObjectStore::new(
+            let traced_remote = Arc::new(TracingObjectStore::new(
                 object_store,
                 object_tracer.clone(),
                 "data",
             )) as Arc<dyn object_store::ObjectStore>;
+            let (object_store, writeback) = match settings.writeback_settings(match db_mode {
+                DatabaseMode::ReadWrite => crate::writeback::config::WritebackAccessMode::ReadWrite,
+                DatabaseMode::ReadOnly => crate::writeback::config::WritebackAccessMode::ReadOnly,
+                DatabaseMode::Checkpoint(_) => {
+                    crate::writeback::config::WritebackAccessMode::Checkpoint
+                }
+            })? {
+                Some(writeback_settings) => {
+                    let storage_url = url::Url::parse(&settings.storage.url)
+                        .context("[storage] url is not valid for writeback identity")?;
+                    let backend_kind = storage_url.scheme().to_owned();
+                    let backend_endpoint = canonical_backend_endpoint(settings, &storage_url)?;
+                    let identity = crate::writeback::model::JournalIdentity {
+                        format_version: 1,
+                        bucket_id: bucket.id().to_string(),
+                        backend_endpoint,
+                        database_prefix: actual_db_path.clone(),
+                        backend_kind,
+                        encryption_key_identity_sha256: Sha256::digest(encryption_key).into(),
+                    };
+                    let attached = crate::writeback::bootstrap::attach(
+                        traced_remote,
+                        writeback_settings,
+                        identity,
+                        &bucket.cache_directory_name(),
+                    )
+                    .await
+                    .context("Failed to attach persistent writeback")?;
+                    (attached.store, Some(attached.lifecycle))
+                }
+                None => (traced_remote, None),
+            };
+
+            // Shared by request handling and takeover reconciliation.
+            let dedup = Arc::new(crate::dedup::DedupCache::new());
+            dedup.start_expiry_reaper();
             let wal_object_store = wal_object_store.map(|s| {
                 Arc::new(TracingObjectStore::new(s, object_tracer.clone(), "wal"))
                     as Arc<dyn object_store::ObjectStore>
@@ -241,6 +274,7 @@ impl StartupContext {
                     crate::retrying_object_store::RetryingObjectStore::new(object_store.clone()),
                 ),
                 object_store,
+                writeback,
                 sftp_pool,
                 wal_object_store,
                 object_tracer,
@@ -883,6 +917,7 @@ impl ReconciledDb {
         };
         let StartupContext {
             object_store,
+            writeback,
             sftp_pool,
             retrying_object_store,
             wal_object_store,
@@ -1112,6 +1147,7 @@ impl ReconciledDb {
             // admin and the checkpoint manager), whose listings would otherwise
             // fail on one transient backend error.
             object_store: retrying_object_store,
+            writeback,
             sftp_pool,
             wal_object_store,
             db_path: actual_db_path,
@@ -1127,6 +1163,7 @@ pub async fn initialize_filesystem(
     db_mode: DatabaseMode,
 ) -> Result<InitResult> {
     let startup = StartupContext::prepare(settings, db_mode).await?;
+    let cleanup_writeback = startup.writeback.clone();
     let cleanup_pool = startup.sftp_pool.clone();
     let initialized = async move {
         let mut startup = startup.start_receiver()?;
@@ -1157,6 +1194,13 @@ pub async fn initialize_filesystem(
     match initialized {
         Ok(initialized) => Ok(initialized),
         Err(error) => {
+            if let Some(writeback) = cleanup_writeback
+                && let Err(cleanup) = writeback.shutdown().await
+            {
+                return Err(error.context(format!(
+                    "writeback cleanup after filesystem initialization failure also failed: {cleanup}"
+                )));
+            }
             if let Some(pool) = cleanup_pool
                 && let Err(cleanup) = pool.shutdown().await
             {
@@ -1167,6 +1211,21 @@ pub async fn initialize_filesystem(
             Err(error)
         }
     }
+}
+
+fn canonical_backend_endpoint(settings: &Settings, url: &url::Url) -> Result<String> {
+    if let Some(endpoint) = settings.sftp_endpoint()? {
+        return Ok(format!(
+            "sftp://{}@{}:{}",
+            endpoint.username, endpoint.host, endpoint.port
+        ));
+    }
+    let host = url.host_str().unwrap_or_default();
+    let port = url
+        .port()
+        .map(|port| format!(":{port}"))
+        .unwrap_or_default();
+    Ok(format!("{}://{host}{port}", url.scheme()))
 }
 
 #[cfg(test)]
@@ -1205,6 +1264,7 @@ mod role_decision_tests {
 
         let mut startup = StartupContext {
             object_store: store.clone(),
+            writeback: None,
             retrying_object_store: store.clone(),
             sftp_pool: None,
             wal_object_store: None,
