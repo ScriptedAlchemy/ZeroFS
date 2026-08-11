@@ -137,11 +137,7 @@ impl Drop for AdmissionPermit {
             return;
         }
         self.active = false;
-        {
-            let mut state = lock(&self.inner.state);
-            state.used = state.used.saturating_sub(self.bytes);
-        }
-        grant_ram_waiters(&self.inner);
+        release_ram_bytes(&self.inner, self.bytes);
     }
 }
 
@@ -178,6 +174,29 @@ fn terminate_ram(inner: &Arc<RamInner>, error: AdmissionError) {
     }
 }
 
+fn release_ram_bytes(inner: &Arc<RamInner>, bytes: u64) {
+    let accounting_error = {
+        let mut state = lock(&inner.state);
+        match state.used.checked_sub(bytes) {
+            Some(remaining) => {
+                state.used = remaining;
+                None
+            }
+            None => {
+                state.used = 0;
+                Some(AdmissionError::Poisoned(
+                    "dirty RAM accounting underflow".to_owned(),
+                ))
+            }
+        }
+    };
+    if let Some(error) = accounting_error {
+        terminate_ram(inner, error);
+    } else {
+        grant_ram_waiters(inner);
+    }
+}
+
 fn grant_ram_waiters(inner: &Arc<RamInner>) {
     let mut state = lock(&inner.state);
     if state.terminal.is_some() {
@@ -191,7 +210,10 @@ fn grant_ram_waiters(inner: &Arc<RamInner>) {
             break;
         }
         let waiter = state.waiters.pop_front().expect("front waiter exists");
-        state.used += waiter.bytes;
+        state.used = state
+            .used
+            .checked_add(waiter.bytes)
+            .expect("RAM admission fit was checked before accounting");
         let permit = AdmissionPermit::new(inner.clone(), waiter.bytes);
         if let Err(Ok(mut permit)) = waiter.sender.send(Ok(permit)) {
             permit.active = false;
@@ -245,6 +267,24 @@ impl DiskAdmission {
         resume_percent: u8,
         min_free_bytes: u64,
     ) -> Result<Self, AdmissionError> {
+        Self::with_used(
+            capacity,
+            high_watermark_percent,
+            resume_percent,
+            min_free_bytes,
+            0,
+            0,
+        )
+    }
+
+    pub fn with_used(
+        capacity: u64,
+        high_watermark_percent: u8,
+        resume_percent: u8,
+        min_free_bytes: u64,
+        used_bytes: u64,
+        available_filesystem_bytes: u64,
+    ) -> Result<Self, AdmissionError> {
         if capacity == 0
             || resume_percent == 0
             || resume_percent >= high_watermark_percent
@@ -254,13 +294,19 @@ impl DiskAdmission {
                 "requires capacity > 0 and 0 < resume < high <= 100",
             ));
         }
+        let high_bytes = percent_bytes(capacity, high_watermark_percent);
         Ok(Self {
             inner: Arc::new(DiskInner {
                 capacity,
-                high_bytes: percent_bytes(capacity, high_watermark_percent),
+                high_bytes,
                 resume_bytes: percent_bytes(capacity, resume_percent),
                 min_free_bytes,
-                state: Mutex::new(DiskState::default()),
+                state: Mutex::new(DiskState {
+                    used: used_bytes,
+                    available: available_filesystem_bytes,
+                    paused: used_bytes > high_bytes || available_filesystem_bytes < min_free_bytes,
+                    ..DiskState::default()
+                }),
             }),
         })
     }
@@ -287,7 +333,7 @@ impl DiskAdmission {
                 state.used += bytes;
                 return Ok(DiskPermit::new(self.inner.clone(), bytes));
             }
-            if projected(state.used, bytes) > self.inner.high_bytes {
+            if projected_exceeds(state.used, bytes, self.inner.high_bytes) {
                 state.paused = true;
             }
             let id = state.next_waiter;
@@ -380,12 +426,7 @@ impl Drop for DiskPermit {
             return;
         }
         self.active = false;
-        {
-            let mut state = lock(&self.inner.state);
-            state.used = state.used.saturating_sub(self.bytes);
-            refresh_disk_pause(&self.inner, &mut state);
-        }
-        grant_disk_waiters(&self.inner);
+        release_disk_bytes(&self.inner, self.bytes);
     }
 }
 
@@ -419,18 +460,49 @@ fn grant_disk_waiters(inner: &Arc<DiskInner>) {
             break;
         };
         if !disk_fits(inner, &state, waiter.bytes) {
-            if projected(state.used, waiter.bytes) > inner.high_bytes {
+            if projected_exceeds(state.used, waiter.bytes, inner.high_bytes) {
                 state.paused = true;
             }
             break;
         }
         let waiter = state.waiters.pop_front().expect("front waiter exists");
-        state.used += waiter.bytes;
+        state.used = state
+            .used
+            .checked_add(waiter.bytes)
+            .expect("disk admission fit was checked before accounting");
         let permit = DiskPermit::new(inner.clone(), waiter.bytes);
         if let Err(Ok(mut permit)) = waiter.sender.send(Ok(permit)) {
             permit.active = false;
             state.used -= waiter.bytes;
         }
+    }
+}
+
+fn release_disk_bytes(inner: &Arc<DiskInner>, bytes: u64) {
+    let (accounting_error, waiters) = {
+        let mut state = lock(&inner.state);
+        match state.used.checked_sub(bytes) {
+            Some(remaining) => {
+                state.used = remaining;
+                refresh_disk_pause(inner, &mut state);
+                (None, Vec::new())
+            }
+            None => {
+                state.used = 0;
+                let error = AdmissionError::Poisoned("dirty SSD accounting underflow".to_owned());
+                if state.terminal.is_none() {
+                    state.terminal = Some(error.clone());
+                }
+                (Some(error), state.waiters.drain(..).collect::<Vec<_>>())
+            }
+        }
+    };
+    if let Some(error) = accounting_error {
+        for waiter in waiters {
+            let _ = waiter.sender.send(Err(error.clone()));
+        }
+    } else {
+        grant_disk_waiters(inner);
     }
 }
 
@@ -442,7 +514,7 @@ fn refresh_disk_pause(inner: &DiskInner, state: &mut DiskState) {
 
 fn disk_fits(inner: &DiskInner, state: &DiskState, bytes: u64) -> bool {
     !state.paused
-        && projected(state.used, bytes) <= inner.high_bytes
+        && !projected_exceeds(state.used, bytes, inner.high_bytes)
         && state.available.saturating_sub(bytes) >= inner.min_free_bytes
 }
 
@@ -451,11 +523,12 @@ fn percent_bytes(capacity: u64, percent: u8) -> u64 {
 }
 
 fn fits(used: u64, requested: u64, capacity: u64) -> bool {
-    projected(used, requested) <= capacity
+    !projected_exceeds(used, requested, capacity)
 }
 
-fn projected(used: u64, requested: u64) -> u64 {
-    used.saturating_add(requested)
+fn projected_exceeds(used: u64, requested: u64, limit: u64) -> bool {
+    used.checked_add(requested)
+        .is_none_or(|total| total > limit)
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -534,6 +607,22 @@ mod tests {
             }
         );
         assert_eq!(admission.used_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn byte_accounting_never_wraps_at_u64_capacity() {
+        let admission = Admission::new(u64::MAX);
+        let held = admission.reserve(u64::MAX - 1).await.unwrap();
+        let blocked = tokio::spawn({
+            let admission = admission.clone();
+            async move { admission.reserve(2).await }
+        });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!blocked.is_finished());
+        assert_eq!(admission.used_bytes(), u64::MAX - 1);
+        drop(held);
+        assert_eq!(blocked.await.unwrap().unwrap().bytes(), 2);
     }
 
     #[tokio::test]
@@ -616,5 +705,12 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(permit.bytes(), 100);
+    }
+
+    #[test]
+    fn disk_gate_restores_pending_blob_bytes_before_accepting_new_writes() {
+        let disk = DiskAdmission::with_used(100, 90, 70, 10, 80, 1_000).unwrap();
+
+        assert_eq!(disk.used_bytes(), 80);
     }
 }

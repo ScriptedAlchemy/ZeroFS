@@ -1,6 +1,7 @@
 pub mod admission;
 pub mod config;
 pub mod journal;
+pub mod journaler;
 pub mod model;
 
 #[cfg(test)]
