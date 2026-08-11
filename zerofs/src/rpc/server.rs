@@ -9,6 +9,7 @@ use crate::task::spawn_named;
 use anyhow::{Context, Result};
 use std::future::Future;
 use std::net::SocketAddr;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -724,6 +725,8 @@ pub async fn serve_unix(
 
     let listener = UnixListener::bind(&socket_path)
         .with_context(|| format!("Failed to bind RPC Unix socket to {:?}", socket_path))?;
+    std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("Failed to secure RPC Unix socket at {:?}", socket_path))?;
 
     info!("RPC server listening on Unix socket: {:?}", socket_path);
 
@@ -891,6 +894,25 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         panic!("trash directory was not drained");
+    }
+
+    #[tokio::test]
+    async fn unix_admin_socket_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_fs, _client, shutdown, dir) = setup().await;
+        let mode = std::fs::metadata(dir.path().join("admin.sock"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+
+        assert_eq!(
+            mode, 0o600,
+            "admin RPC socket must not be group/world accessible"
+        );
+
+        shutdown.cancel();
     }
 
     #[tokio::test]
