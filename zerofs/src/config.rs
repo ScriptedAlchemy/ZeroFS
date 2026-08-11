@@ -1979,19 +1979,19 @@ known_hosts = "${ZEROFS_TEST_KNOWN_HOSTS}""#,
 
     #[test]
     fn sftp_rejects_empty_known_hosts_path_and_insecure_mode() {
-        for extra in [
-            "[sftp]\nidentity_file = \"\"",
-            "[sftp]\nknown_hosts = \"\"",
-            "[sftp]\ninsecure_skip_host_key_check = true",
+        for (extra, expected) in [
+            ("[sftp]\nidentity_file = \"\"", "identity_file"),
+            ("[sftp]\nknown_hosts = \"\"", "known_hosts"),
+            (
+                "[sftp]\ninsecure_skip_host_key_check = true",
+                "unknown field",
+            ),
         ] {
             let err = format!(
                 "{:#}",
                 write_and_load(&sftp_config("sftp://alice@example.com/data", extra)).unwrap_err()
             );
-            assert!(
-                err.contains("known_hosts") || err.contains("unknown field"),
-                "got: {err}"
-            );
+            assert!(err.contains(expected), "got: {err}");
         }
     }
 

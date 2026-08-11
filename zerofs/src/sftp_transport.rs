@@ -106,6 +106,16 @@ pub trait TransportSession: fmt::Debug + Send + Sync + 'static {
             "write_file_durable is not implemented by this session".to_owned(),
         ))
     }
+    async fn write_file_at_durable(
+        &mut self,
+        _path: &std::path::Path,
+        _offset: u64,
+        _chunks: Vec<Bytes>,
+    ) -> Result<(), TransportError> {
+        Err(TransportError::Operation(
+            "write_file_at_durable is not implemented by this session".to_owned(),
+        ))
+    }
     async fn read_exact(
         &mut self,
         _path: &std::path::Path,
@@ -612,6 +622,38 @@ impl TransportSession for OpenSshTransportSession {
             .map_err(|error| map_sftp_error(path, error))
     }
 
+    async fn write_file_at_durable(
+        &mut self,
+        path: &std::path::Path,
+        offset: u64,
+        chunks: Vec<Bytes>,
+    ) -> Result<(), TransportError> {
+        let sftp = self.sftp.as_ref().expect("open transport owns SFTP client");
+        let mut options = sftp.options();
+        options.write(true);
+        let mut file = options
+            .open(path)
+            .await
+            .map_err(|error| map_sftp_error(path, error))?;
+        file.seek(SeekFrom::Start(offset)).await.map_err(|error| {
+            TransportError::Operation(format!(
+                "failed to seek {} to {offset}: {error}",
+                path.display()
+            ))
+        })?;
+        for chunk in chunks {
+            file.write_all(&chunk)
+                .await
+                .map_err(|error| map_sftp_error(path, error))?;
+        }
+        file.sync_all()
+            .await
+            .map_err(|error| map_sftp_error(path, error))?;
+        file.close()
+            .await
+            .map_err(|error| map_sftp_error(path, error))
+    }
+
     async fn read_exact(
         &mut self,
         path: &std::path::Path,
@@ -983,6 +1025,20 @@ impl SessionLease {
             .expect("lease always owns a session until completion")
             .transport
             .write_file_durable(path, chunks)
+            .await
+    }
+
+    pub async fn write_file_at_durable(
+        &mut self,
+        path: &std::path::Path,
+        offset: u64,
+        chunks: Vec<Bytes>,
+    ) -> Result<(), TransportError> {
+        self.session
+            .as_mut()
+            .expect("lease always owns a session until completion")
+            .transport
+            .write_file_at_durable(path, offset, chunks)
             .await
     }
 

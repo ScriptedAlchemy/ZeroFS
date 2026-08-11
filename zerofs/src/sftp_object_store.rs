@@ -168,6 +168,17 @@ pub trait RemoteSession: Debug + Send + Sync {
     fn capabilities(&self) -> SftpCapabilities;
     async fn read_exact(&self, path: &FilePath, offset: u64, len: usize) -> RemoteResult<Bytes>;
     async fn write_file_durable(&self, path: &FilePath, chunks: Vec<Bytes>) -> RemoteResult<()>;
+    async fn write_file_at_durable(
+        &self,
+        path: &FilePath,
+        offset: u64,
+        chunks: Vec<Bytes>,
+    ) -> RemoteResult<()> {
+        let _ = (path, offset, chunks);
+        Err(RemoteError::Other(
+            "write_file_at_durable is not implemented by this session".to_owned(),
+        ))
+    }
     async fn remove_file(&self, path: &FilePath) -> RemoteResult<()>;
     async fn hard_link(&self, from: &FilePath, to: &FilePath) -> RemoteResult<()>;
     async fn posix_rename(&self, from: &FilePath, to: &FilePath) -> RemoteResult<()>;
@@ -357,6 +368,23 @@ impl RemoteSession for PooledRemoteSession {
             lease.write_file_durable(path, chunks).await
         }
         .await;
+        finish_lease(lease, operation)
+            .await
+            .map_err(remote_transport_error)
+    }
+
+    async fn write_file_at_durable(
+        &self,
+        path: &FilePath,
+        offset: u64,
+        chunks: Vec<Bytes>,
+    ) -> RemoteResult<()> {
+        let mut lease = self
+            .pool
+            .checkout(crate::sftp_transport::OperationKind::Write)
+            .await
+            .map_err(remote_transport_error)?;
+        let operation = lease.write_file_at_durable(path, offset, chunks).await;
         finish_lease(lease, operation)
             .await
             .map_err(remote_transport_error)
@@ -631,11 +659,14 @@ impl ObjectStore for SftpObjectStore {
         location: &ObjectPath,
         _opts: PutMultipartOptions,
     ) -> object_store::Result<Box<dyn MultipartUpload>> {
-        self.validate_location(location, false)?;
-        Ok(Box::new(SftpMultipartUpload::new(
-            self.clone(),
-            location.clone(),
-        )))
+        let target = self.remote_path(location, false)?;
+        let session: Arc<dyn RemoteSession> = Arc::new(PooledRemoteSession {
+            pool: self.pool.clone(),
+        });
+        let upload = SftpMultipartUpload::begin(session, location.clone(), target)
+            .await
+            .map_err(|error| publication_error(location, error))?;
+        Ok(Box::new(upload))
     }
 
     async fn get_opts(
@@ -749,20 +780,59 @@ impl ObjectStore for SftpObjectStore {
 
 #[derive(Debug)]
 struct SftpMultipartUpload {
-    store: SftpObjectStore,
+    session: Arc<dyn RemoteSession>,
     location: ObjectPath,
-    parts: Arc<StdMutex<Vec<Option<PutPayload>>>>,
+    target: PathBuf,
+    staging: Option<PathBuf>,
+    generation: Uuid,
+    state: Arc<StdMutex<SftpMultipartState>>,
     terminal: bool,
 }
 
+#[derive(Debug, Default)]
+struct SftpMultipartState {
+    logical_len: u64,
+    completed: Vec<bool>,
+}
+
 impl SftpMultipartUpload {
-    fn new(store: SftpObjectStore, location: ObjectPath) -> Self {
-        Self {
-            store,
-            location,
-            parts: Arc::new(StdMutex::new(Vec::new())),
-            terminal: false,
+    async fn begin(
+        session: Arc<dyn RemoteSession>,
+        location: ObjectPath,
+        target: PathBuf,
+    ) -> RemoteResult<Self> {
+        validate_publication_capabilities(session.capabilities(), PublicationMode::Overwrite)
+            .map_err(|extension| {
+                RemoteError::Other(format!("SFTP server lacks required {extension} extension"))
+            })?;
+        let generation = Uuid::new_v4();
+        let staging = staging_path(&target, generation).map_err(RemoteError::Other)?;
+        let placeholder = encode_header(ObjectHeader {
+            generation,
+            logical_len: 0,
+        });
+        if let Err(error) = session
+            .write_file_durable(&staging, vec![Bytes::copy_from_slice(&placeholder)])
+            .await
+        {
+            let _ = session.remove_file(&staging).await;
+            return Err(error);
         }
+        Ok(Self {
+            session,
+            location,
+            target,
+            staging: Some(staging),
+            generation,
+            state: Arc::new(StdMutex::new(SftpMultipartState::default())),
+            terminal: false,
+        })
+    }
+
+    fn staging(&self) -> object_store::Result<&FilePath> {
+        self.staging
+            .as_deref()
+            .ok_or_else(|| generic_error("multipart upload has no staging path"))
     }
 }
 
@@ -776,15 +846,36 @@ impl MultipartUpload for SftpMultipartUpload {
                 ))
             });
         }
-        let parts = self.parts.clone();
-        let index = {
-            let mut parts = parts.lock().unwrap();
-            let index = parts.len();
-            parts.push(None);
-            index
+        let chunks = data.into_iter().collect::<Vec<_>>();
+        let len = chunks.iter().map(Bytes::len).sum::<usize>();
+        let (index, offset) = {
+            let mut state = self.state.lock().unwrap();
+            let Ok(len) = u64::try_from(len) else {
+                return Box::pin(async { Err(generic_error("multipart part is too large")) });
+            };
+            let Some(next) = state.logical_len.checked_add(len) else {
+                return Box::pin(async { Err(generic_error("multipart object length overflow")) });
+            };
+            let index = state.completed.len();
+            let offset = state.logical_len;
+            state.logical_len = next;
+            state.completed.push(false);
+            (index, offset)
         };
+        let session = self.session.clone();
+        let staging = self.staging().map(PathBuf::from);
+        let state = self.state.clone();
+        let location = self.location.clone();
         Box::pin(async move {
-            parts.lock().unwrap()[index] = Some(data);
+            let staging = staging?;
+            let physical_offset = (OBJECT_HEADER_LEN as u64)
+                .checked_add(offset)
+                .ok_or_else(|| generic_error("multipart physical offset overflow"))?;
+            session
+                .write_file_at_durable(&staging, physical_offset, chunks)
+                .await
+                .map_err(|error| publication_error(&location, error))?;
+            state.lock().unwrap().completed[index] = true;
             Ok(())
         })
     }
@@ -795,31 +886,68 @@ impl MultipartUpload for SftpMultipartUpload {
                 "multipart upload is already completed or aborted",
             ));
         }
-        let payload = {
-            let parts = self.parts.lock().unwrap();
-            if parts.iter().any(Option::is_none) {
+        let logical_len = {
+            let state = self.state.lock().unwrap();
+            if state.completed.iter().any(|completed| !completed) {
                 return Err(generic_error(
                     "multipart upload completed before every part future finished",
                 ));
             }
-            parts
-                .iter()
-                .flat_map(|part| part.as_ref().unwrap().iter().cloned())
-                .collect::<PutPayload>()
+            state.logical_len
         };
-        let result = self
-            .store
-            .put_opts(&self.location, payload, PutOptions::default())
-            .await?;
+        let staging = self.staging()?.to_path_buf();
+        let target_lock = target_lock(&self.target);
+        let _target_guard = target_lock.lock().await;
+        let header = ObjectHeader {
+            generation: self.generation,
+            logical_len,
+        };
+        self.session
+            .write_file_at_durable(
+                &staging,
+                0,
+                vec![Bytes::copy_from_slice(&encode_header(header))],
+            )
+            .await
+            .map_err(|error| publication_error(&self.location, error))?;
+        self.session
+            .posix_rename(&staging, &self.target)
+            .await
+            .map_err(|error| publication_error(&self.location, error))?;
         self.terminal = true;
-        self.parts.lock().unwrap().clear();
-        Ok(result)
+        self.staging = None;
+        Ok(PutResult {
+            e_tag: Some(self.generation.to_string()),
+            version: None,
+            extensions: Extensions::default(),
+        })
     }
 
     async fn abort(&mut self) -> object_store::Result<()> {
+        if let Some(staging) = self.staging.take() {
+            self.session
+                .remove_file(&staging)
+                .await
+                .map_err(|error| publication_error(&self.location, error))?;
+        }
         self.terminal = true;
-        self.parts.lock().unwrap().clear();
         Ok(())
+    }
+}
+
+impl Drop for SftpMultipartUpload {
+    fn drop(&mut self) {
+        let Some(staging) = self.staging.take() else {
+            return;
+        };
+        let session = self.session.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                if let Err(error) = session.remove_file(&staging).await {
+                    tracing::warn!(path = %staging.display(), %error, "failed to clean dropped multipart staging write");
+                }
+            });
+        }
     }
 }
 
@@ -945,6 +1073,7 @@ mod tests {
     };
     use std::collections::HashMap;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::sync::Barrier;
 
@@ -1028,6 +1157,17 @@ mod tests {
             self.session.write_file_durable(path, chunks).await
         }
 
+        async fn write_file_at_durable(
+            &mut self,
+            path: &FilePath,
+            offset: u64,
+            chunks: Vec<Bytes>,
+        ) -> Result<(), TransportError> {
+            self.session
+                .write_file_at_durable(path, offset, chunks)
+                .await
+        }
+
         async fn read_exact(
             &mut self,
             path: &FilePath,
@@ -1097,6 +1237,160 @@ mod tests {
                 ..Self::new()
             }
         }
+    }
+
+    #[derive(Debug)]
+    struct ParallelMultipartSession {
+        files: Mutex<HashMap<PathBuf, Bytes>>,
+        part_barrier: Barrier,
+        part_writes_in_flight: AtomicUsize,
+        max_part_writes_in_flight: AtomicUsize,
+    }
+
+    impl ParallelMultipartSession {
+        fn new() -> Self {
+            Self {
+                files: Mutex::new(HashMap::new()),
+                part_barrier: Barrier::new(2),
+                part_writes_in_flight: AtomicUsize::new(0),
+                max_part_writes_in_flight: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl RemoteSession for ParallelMultipartSession {
+        fn capabilities(&self) -> SftpCapabilities {
+            SftpCapabilities {
+                fsync: true,
+                hardlink: true,
+                posix_rename: true,
+            }
+        }
+
+        async fn read_exact(
+            &self,
+            path: &FilePath,
+            offset: u64,
+            len: usize,
+        ) -> RemoteResult<Bytes> {
+            let files = self.files.lock().unwrap();
+            let bytes = files
+                .get(path)
+                .ok_or_else(|| RemoteError::NotFound(path.display().to_string()))?;
+            let start = usize::try_from(offset)
+                .map_err(|_| RemoteError::Other("test offset overflow".to_owned()))?;
+            let end = start + len;
+            bytes
+                .get(start..end)
+                .map(Bytes::copy_from_slice)
+                .ok_or_else(|| RemoteError::Other(format!("short read for {}", path.display())))
+        }
+
+        async fn write_file_durable(
+            &self,
+            path: &FilePath,
+            chunks: Vec<Bytes>,
+        ) -> RemoteResult<()> {
+            let bytes = chunks.into_iter().flatten().collect::<Vec<_>>();
+            self.files
+                .lock()
+                .unwrap()
+                .insert(path.to_path_buf(), bytes.into());
+            Ok(())
+        }
+
+        async fn write_file_at_durable(
+            &self,
+            path: &FilePath,
+            offset: u64,
+            chunks: Vec<Bytes>,
+        ) -> RemoteResult<()> {
+            if offset >= OBJECT_HEADER_LEN as u64 {
+                let current = self.part_writes_in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                self.max_part_writes_in_flight
+                    .fetch_max(current, Ordering::SeqCst);
+                self.part_barrier.wait().await;
+            }
+
+            let mut files = self.files.lock().unwrap();
+            let file = files
+                .get_mut(path)
+                .ok_or_else(|| RemoteError::NotFound(path.display().to_string()))?;
+            let start = usize::try_from(offset)
+                .map_err(|_| RemoteError::Other("test offset overflow".to_owned()))?;
+            let bytes = chunks.into_iter().flatten().collect::<Vec<_>>();
+            let end = start + bytes.len();
+            let mut contents = file.to_vec();
+            contents.resize(contents.len().max(end), 0);
+            contents[start..end].copy_from_slice(&bytes);
+            *file = contents.into();
+            if offset >= OBJECT_HEADER_LEN as u64 {
+                self.part_writes_in_flight.fetch_sub(1, Ordering::SeqCst);
+            }
+            Ok(())
+        }
+
+        async fn remove_file(&self, path: &FilePath) -> RemoteResult<()> {
+            self.files.lock().unwrap().remove(path);
+            Ok(())
+        }
+
+        async fn hard_link(&self, from: &FilePath, to: &FilePath) -> RemoteResult<()> {
+            let mut files = self.files.lock().unwrap();
+            let bytes = files
+                .get(from)
+                .cloned()
+                .ok_or_else(|| RemoteError::NotFound(from.display().to_string()))?;
+            files.insert(to.to_path_buf(), bytes);
+            Ok(())
+        }
+
+        async fn posix_rename(&self, from: &FilePath, to: &FilePath) -> RemoteResult<()> {
+            let mut files = self.files.lock().unwrap();
+            let bytes = files
+                .remove(from)
+                .ok_or_else(|| RemoteError::NotFound(from.display().to_string()))?;
+            files.insert(to.to_path_buf(), bytes);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn multipart_parts_write_in_parallel_before_atomic_completion() {
+        let session = Arc::new(ParallelMultipartSession::new());
+        let location = ObjectPath::from("zerofs/v1/parallel.bin");
+        let target = FilePath::new("zerofs/v1/parallel.bin");
+        let mut upload =
+            SftpMultipartUpload::begin(session.clone(), location, target.to_path_buf())
+                .await
+                .unwrap();
+
+        let first = upload.put_part(PutPayload::from_static(b"hello "));
+        let second = upload.put_part(PutPayload::from_static(b"world"));
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            futures::future::try_join(first, second),
+        )
+        .await
+        .expect("part uploads must make progress concurrently")
+        .unwrap();
+
+        assert_eq!(session.max_part_writes_in_flight.load(Ordering::SeqCst), 2);
+        assert!(!session.files.lock().unwrap().contains_key(target));
+        upload.complete().await.unwrap();
+
+        let published = session.files.lock().unwrap().get(target).cloned().unwrap();
+        assert_eq!(&published[OBJECT_HEADER_LEN..], b"hello world");
+        assert_eq!(decode_header(&published).unwrap().logical_len, 11);
+        assert!(
+            session
+                .files
+                .lock()
+                .unwrap()
+                .keys()
+                .all(|path| !is_staging_name(path.file_name().unwrap().as_ref()))
+        );
     }
 
     #[async_trait]
