@@ -38,6 +38,7 @@ mod task;
 mod telemetry;
 #[cfg(feature = "webui")]
 mod webui;
+pub mod writeback;
 
 #[cfg(test)]
 mod fault_store;

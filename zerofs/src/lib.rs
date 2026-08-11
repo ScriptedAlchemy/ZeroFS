@@ -17,6 +17,7 @@ pub mod sftp_object_store;
 pub mod sftp_transport;
 pub mod storage_class_object_store;
 pub mod task;
+pub mod writeback;
 
 #[cfg(feature = "failpoints")]
 pub mod failpoints;

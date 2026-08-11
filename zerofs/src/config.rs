@@ -149,6 +149,9 @@ pub struct Settings {
     /// Strict SSH transport settings used only when `[storage].url` is SFTP.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub sftp: Option<SftpConfig>,
+    /// Optional local RAM/SSD dirty-data tier in front of the remote store.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub writeback: Option<crate::writeback::config::WritebackConfig>,
     /// Location of a pre-2.0 volume's separate WAL store.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub wal: Option<WalConfig>,
@@ -1116,7 +1119,7 @@ where
         .transpose()
 }
 
-fn deserialize_expandable_path<'de, D>(deserializer: D) -> Result<PathBuf, D::Error>
+pub(crate) fn deserialize_expandable_path<'de, D>(deserializer: D) -> Result<PathBuf, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -1217,6 +1220,8 @@ impl Settings {
                 .context("Invalid [replication] configuration")?;
         }
 
+        self.writeback_settings(crate::writeback::config::WritebackAccessMode::ReadWrite)?;
+
         if let Some(fs) = &self.filesystem
             && fs.ignore_fsync
             && self.lsm.as_ref().map(|l| l.sync_writes()).unwrap_or(false)
@@ -1245,6 +1250,32 @@ impl Settings {
             }
         }
         Ok(())
+    }
+
+    pub fn writeback_settings(
+        &self,
+        access_mode: crate::writeback::config::WritebackAccessMode,
+    ) -> Result<Option<crate::writeback::config::WritebackSettings>> {
+        let Some(writeback) = &self.writeback else {
+            return Ok(None);
+        };
+        let sftp_write_concurrency = if self.sftp_endpoint()?.is_some() {
+            Some(
+                self.sftp
+                    .as_ref()
+                    .cloned()
+                    .unwrap_or_default()
+                    .write_concurrency,
+            )
+        } else {
+            None
+        };
+        writeback.normalize(
+            &self.cache.dir,
+            sftp_write_concurrency,
+            access_mode,
+            self.replication.is_some(),
+        )
     }
 
     /// Return normalized SFTP endpoint data without retaining URL credentials.
@@ -1347,6 +1378,7 @@ impl Settings {
             azure: None,
             gcp: None,
             sftp: None,
+            writeback: None,
             wal: None,
             telemetry: None,
             prometheus: None,
@@ -1510,6 +1542,21 @@ impl Settings {
         toml_string.push_str("# write_concurrency = 7\n");
         toml_string.push_str("# segment_size_mib = 32\n");
         toml_string.push_str("# read_cache_part_size_kib = 1024\n");
+
+        toml_string.push_str("\n# Optional persistent dirty-data tier (disabled by default)\n");
+        toml_string.push_str("# [writeback]\n");
+        toml_string.push_str("# enabled = true\n");
+        toml_string.push_str("# dir = \"/var/cache/zerofs-writeback\"\n");
+        toml_string.push_str("# ack_mode = \"ssd\"              # remote | ssd | memory\n");
+        toml_string.push_str(
+            "# memory_size_gb = 16.0          # additional dirty-write RAM; does not consume [cache] memory\n",
+        );
+        toml_string.push_str("# disk_size_gb = 512.0\n");
+        toml_string.push_str("# min_free_gb = 256.0\n");
+        toml_string.push_str("# high_watermark_percent = 95\n");
+        toml_string.push_str("# resume_percent = 85\n");
+        toml_string.push_str("# upload_concurrency = 4\n");
+        toml_string.push_str("# shutdown_flush = \"local\"       # local | remote\n");
 
         toml_string.push_str("\n# Anonymous telemetry (enabled by default)\n");
         toml_string.push_str(
@@ -1837,6 +1884,194 @@ encryption_password = "test-password"
 {extra}
 "#
         )
+    }
+
+    fn writeback_sftp_config(clean_memory_gb: f64, writeback: &str) -> String {
+        format!(
+            r#"
+[cache]
+dir = "/var/cache/zerofs/clean"
+disk_size_gb = 512.0
+memory_size_gb = {clean_memory_gb}
+
+[storage]
+url = "sftp://alice@example.com/data"
+encryption_password = "test-password"
+
+[servers]
+
+{writeback}
+"#
+        )
+    }
+
+    #[test]
+    fn writeback_disabled_by_default_has_no_runtime_budget() {
+        let settings = write_and_load(&writeback_sftp_config(16.0, "")).unwrap();
+
+        assert!(
+            settings
+                .writeback_settings(crate::writeback::config::WritebackAccessMode::ReadWrite)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn writeback_enabled_without_ack_mode_defaults_to_ssd() {
+        let settings = write_and_load(&writeback_sftp_config(
+            16.0,
+            r#"[writeback]
+enabled = true
+dir = "/var/cache/zerofs-writeback"
+disk_size_gb = 512.0
+min_free_gb = 256.0"#,
+        ))
+        .unwrap();
+
+        let writeback = settings
+            .writeback_settings(crate::writeback::config::WritebackAccessMode::ReadWrite)
+            .unwrap()
+            .unwrap();
+        assert_eq!(writeback.ack_mode, crate::writeback::config::AckMode::Ssd);
+        assert_eq!(writeback.disk_bytes, 512_000_000_000);
+    }
+
+    #[test]
+    fn writeback_dirty_memory_budget_is_additional_to_clean_read_cache() {
+        let settings = write_and_load(&writeback_sftp_config(
+            11.0,
+            r#"[writeback]
+enabled = true
+dir = "/var/cache/zerofs-writeback"
+ack_mode = "memory"
+memory_size_gb = 16.0
+disk_size_gb = 512.0
+min_free_gb = 256.0
+high_watermark_percent = 95
+resume_percent = 85
+upload_concurrency = 7
+shutdown_flush = "local""#,
+        ))
+        .unwrap();
+
+        let writeback = settings
+            .writeback_settings(crate::writeback::config::WritebackAccessMode::ReadWrite)
+            .unwrap()
+            .unwrap();
+        assert_eq!(settings.cache.memory_size_gb, Some(11.0));
+        assert_eq!(writeback.memory_bytes, 16_000_000_000);
+        assert_eq!(writeback.disk_bytes, 512_000_000_000);
+        assert_eq!(writeback.min_free_bytes, 256_000_000_000);
+    }
+
+    #[test]
+    fn writeback_memory_mode_requires_positive_independent_budgets() {
+        for (field, memory, disk, reserve) in [
+            ("memory_size_gb", 0.0, 512.0, 256.0),
+            ("disk_size_gb", 16.0, 0.0, 256.0),
+            ("min_free_gb", 16.0, 512.0, 0.0),
+        ] {
+            let body = format!(
+                r#"[writeback]
+enabled = true
+dir = "/var/cache/zerofs-writeback"
+ack_mode = "memory"
+memory_size_gb = {memory}
+disk_size_gb = {disk}
+min_free_gb = {reserve}"#
+            );
+            let error = write_and_load(&writeback_sftp_config(16.0, &body)).unwrap_err();
+            assert!(
+                format!("{error:#}").contains(field),
+                "field={field}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn writeback_watermark_hysteresis_must_be_ordered() {
+        for (resume, high) in [(0, 95), (95, 95), (96, 95), (85, 101)] {
+            let body = format!(
+                r#"[writeback]
+enabled = true
+dir = "/var/cache/zerofs-writeback"
+disk_size_gb = 512.0
+min_free_gb = 256.0
+resume_percent = {resume}
+high_watermark_percent = {high}"#
+            );
+            let error = write_and_load(&writeback_sftp_config(16.0, &body)).unwrap_err();
+            assert!(
+                format!("{error:#}").contains("resume_percent"),
+                "resume={resume} high={high}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn writeback_upload_concurrency_cannot_exceed_sftp_write_concurrency() {
+        let config = writeback_sftp_config(
+            16.0,
+            r#"[sftp]
+write_concurrency = 4
+
+[writeback]
+enabled = true
+dir = "/var/cache/zerofs-writeback"
+disk_size_gb = 512.0
+min_free_gb = 256.0
+upload_concurrency = 5"#,
+        );
+
+        let error = write_and_load(&config).unwrap_err();
+        assert!(format!("{error:#}").contains("upload_concurrency"));
+    }
+
+    #[test]
+    fn writeback_directory_cannot_be_nested_in_clean_cache() {
+        let error = write_and_load(&writeback_sftp_config(
+            16.0,
+            r#"[writeback]
+enabled = true
+dir = "/var/cache/zerofs/clean/writeback"
+disk_size_gb = 512.0
+min_free_gb = 256.0"#,
+        ))
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("clean cache"));
+    }
+
+    #[test]
+    fn writeback_rejects_read_only_and_checkpoint_servers() {
+        let settings = write_and_load(&writeback_sftp_config(
+            16.0,
+            r#"[writeback]
+enabled = true
+dir = "/var/cache/zerofs-writeback"
+disk_size_gb = 512.0
+min_free_gb = 256.0"#,
+        ))
+        .unwrap();
+
+        for mode in [
+            crate::writeback::config::WritebackAccessMode::ReadOnly,
+            crate::writeback::config::WritebackAccessMode::Checkpoint,
+        ] {
+            let error = settings.writeback_settings(mode).unwrap_err();
+            assert!(format!("{error:#}").contains("read-write"));
+        }
+    }
+
+    #[test]
+    fn writeback_default_config_documents_separate_clean_and_dirty_memory() {
+        let rendered = Settings::render_default_config().unwrap();
+
+        assert!(rendered.contains("# [writeback]"));
+        assert!(rendered.contains("# memory_size_gb = 16.0"));
+        assert!(rendered.contains("additional dirty-write RAM"));
+        assert!(rendered.contains("# ack_mode = \"ssd\""));
     }
 
     #[test]

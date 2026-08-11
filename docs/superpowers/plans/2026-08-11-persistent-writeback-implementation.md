@@ -59,8 +59,8 @@
 - Create: `zerofs/src/writeback/model.rs`
 
 **Interfaces:**
-- Produces: `AckMode`, `ShutdownFlush`, top-level `WritebackConfig`, normalized `WritebackSettings`, `JournalIdentity`, `MutationRecord`, `MutationKind`, `FenceClass`, `WritebackStatus`, and `LocalEtag`.
-- Consumes: `Settings::sftp_endpoint()`, `SftpConfig::write_concurrency`, `DatabaseMode`, and the resolved bucket identity from startup.
+- Produces: `AckMode`, `ShutdownFlush`, library-owned `WritebackAccessMode`, top-level `WritebackConfig`, normalized `WritebackSettings`, `JournalIdentity`, `MutationRecord`, `MutationKind`, `FenceClass`, `WritebackStatus`, and `LocalEtag`.
+- Consumes: `Settings::sftp_endpoint()`, `SftpConfig::write_concurrency`, and the resolved bucket identity from startup. The binary maps its private `DatabaseMode` to `WritebackAccessMode` at the startup seam.
 
 - [ ] **Step 1: Write failing configuration tests**
 
@@ -83,7 +83,7 @@ upload_concurrency = 7
 shutdown_flush = "local"
 "#);
 
-    let normalized = settings.writeback_settings(DatabaseMode::ReadWrite).unwrap().unwrap();
+    let normalized = settings.writeback_settings(WritebackAccessMode::ReadWrite).unwrap().unwrap();
     assert_eq!(normalized.memory_bytes, 16_000_000_000);
     assert_eq!(normalized.disk_bytes, 512_000_000_000);
     assert_eq!(normalized.min_free_bytes, 256_000_000_000);
@@ -92,9 +92,9 @@ shutdown_flush = "local"
 
 #[test]
 fn dirty_memory_budget_is_additional_to_clean_read_cache() {
-    let settings = settings_with_clean_cache_gb_and_dirty_writeback_gb(16.0, 16.0);
-    let normalized = settings.writeback_settings(DatabaseMode::ReadWrite).unwrap().unwrap();
-    assert_eq!(settings.cache.memory_size_gb, 16.0);
+    let settings = settings_with_clean_cache_gb_and_dirty_writeback_gb(11.0, 16.0);
+    let normalized = settings.writeback_settings(WritebackAccessMode::ReadWrite).unwrap().unwrap();
+    assert_eq!(settings.cache.memory_size_gb, 11.0);
     assert_eq!(normalized.memory_bytes, 16_000_000_000);
 }
 ```
