@@ -14,6 +14,7 @@ use object_store::{
 };
 use std::fmt::{self, Display, Formatter};
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tokio::sync::Notify;
 
@@ -33,6 +34,7 @@ pub struct FaultControls {
     truncate_bytes: AtomicUsize,
     gets: AtomicUsize,
     puts: AtomicUsize,
+    put_paths: StdMutex<Vec<String>>,
     block_puts: AtomicBool,
     active_puts: AtomicUsize,
     max_active_puts: AtomicUsize,
@@ -63,6 +65,9 @@ impl FaultControls {
     }
     pub fn put_count(&self) -> usize {
         self.puts.load(Ordering::SeqCst)
+    }
+    pub fn put_paths(&self) -> Vec<String> {
+        self.put_paths.lock().unwrap().clone()
     }
     pub fn block_puts(&self) {
         self.block_puts.store(true, Ordering::SeqCst);
@@ -140,6 +145,11 @@ impl ObjectStore for FaultStore {
         opts: PutOptions,
     ) -> object_store::Result<PutResult> {
         self.ctl.puts.fetch_add(1, Ordering::SeqCst);
+        self.ctl
+            .put_paths
+            .lock()
+            .unwrap()
+            .push(location.to_string());
         self.check_writable("put")?;
         if take_one(&self.ctl.fail_next_puts) {
             return Err(Self::transient("put"));

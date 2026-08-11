@@ -449,7 +449,9 @@ impl WritebackObjectStore {
             accepted_at_unix_ms: chrono::Utc::now().timestamp_millis().max(0) as u64,
             remote_predecessor_etag: None,
             remote_result_etag: None,
-            fence: if mode == MutationMode::Create {
+            fence: if rename {
+                FenceClass::Fence
+            } else if mode == MutationMode::Create {
                 immutable_data_fence(&to)
             } else {
                 FenceClass::Fence
@@ -2180,6 +2182,132 @@ mod tests {
             concurrent,
             "remote replay never reached four concurrent puts"
         );
+    }
+
+    #[tokio::test]
+    async fn remote_replay_preuploads_immutable_objects_across_later_fences() {
+        let (store, _remote, _temp, controls) = test_store_with_controls(true).await;
+        controls.block_puts();
+        let records = [
+            ("manifest/one".to_owned(), 1_u8),
+            (
+                "segments/01/0000000000000001/0000000000000001".to_owned(),
+                2,
+            ),
+            ("manifest/two".to_owned(), 3),
+            (
+                "segments/02/0000000000000001/0000000000000002".to_owned(),
+                4,
+            ),
+            ("manifest/three".to_owned(), 5),
+            (
+                "segments/03/0000000000000001/0000000000000003".to_owned(),
+                6,
+            ),
+            ("manifest/four".to_owned(), 7),
+        ];
+        for (path, byte) in &records {
+            store
+                .put(
+                    &Path::from(path.as_str()),
+                    Bytes::from(vec![*byte; 1024]).into(),
+                )
+                .await
+                .unwrap();
+        }
+        store.wait_local(7).await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while controls.put_count() < 4 {
+                controls.put_activity().notified().await;
+            }
+        })
+        .await
+        .expect("remote replay did not fill the four upload slots across fences");
+
+        let mut started = controls.put_paths();
+        started.sort();
+        let mut expected = vec![
+            "manifest/one".to_owned(),
+            "segments/01/0000000000000001/0000000000000001".to_owned(),
+            "segments/02/0000000000000001/0000000000000002".to_owned(),
+            "segments/03/0000000000000001/0000000000000003".to_owned(),
+        ];
+        expected.sort();
+        assert_eq!(
+            started, expected,
+            "later ordering fences must wait while immutable objects preupload"
+        );
+
+        controls.release_puts();
+        tokio::time::timeout(Duration::from_millis(400), store.wait_remote(7))
+            .await
+            .expect("held immutable completions were delayed behind fence coalescing")
+            .unwrap();
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn remote_replay_never_preuploads_a_rename_that_deletes_its_source() {
+        let (store, remote, _temp, controls) = test_store_with_controls(true).await;
+        remote
+            .put(
+                &Path::from("rename-source"),
+                Bytes::from_static(b"rename-payload").into(),
+            )
+            .await
+            .unwrap();
+        controls.block_puts();
+        store
+            .put(
+                &Path::from("manifest/one"),
+                Bytes::from_static(b"manifest").into(),
+            )
+            .await
+            .unwrap();
+        let rename_target = "segments/09/0000000000000001/0000000000000009";
+        store
+            .rename_opts(
+                &Path::from("rename-source"),
+                &Path::from(rename_target),
+                RenameOptions {
+                    target_mode: RenameTargetMode::Create,
+                    ..RenameOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        for index in 10_u8..=12 {
+            store
+                .put(
+                    &Path::from(format!(
+                        "segments/{index:02x}/0000000000000001/{index:016x}"
+                    )),
+                    Bytes::from(vec![index; 1024]).into(),
+                )
+                .await
+                .unwrap();
+        }
+        store.wait_local(5).await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while controls.put_count() < 4 {
+                controls.put_activity().notified().await;
+            }
+        })
+        .await
+        .expect("remote replay did not fill the safe upload slots");
+        assert!(
+            !controls
+                .put_paths()
+                .iter()
+                .any(|path| path == rename_target),
+            "rename publication started before its source deletion was ordered"
+        );
+
+        controls.release_puts();
+        store.wait_remote(5).await.unwrap();
+        store.shutdown().await.unwrap();
     }
 
     #[tokio::test]
