@@ -29,9 +29,8 @@ const MAX_STREAMS: usize = 4;
 /// live SFTP profile therefore promotes 1 MiB to 16 MiB after sequential access
 /// is proven, while an unproven/random stream stays at 1 MiB.
 const SEQUENTIAL_FETCH_WINDOW_MULTIPLIER: usize = 15;
-/// Look-ahead horizon for a proven sequential stream. Adjacent candidates are
-/// merged into one GET and capped at `fetch_window_max`, avoiding a burst of
-/// independent backend requests.
+/// Look-ahead horizon for a proven sequential stream. Each window remains a
+/// separate backend GET so SFTP can use several physical sessions at once.
 const PREFETCH_DEPTH_WINDOWS: usize = 4;
 
 type PartId = usize;
@@ -114,9 +113,14 @@ impl AccessHistory {
             let s = &mut self.streams[i];
             s.last_offset = offset;
             s.last_end = offset.saturating_add(len);
-            s.fetch_window = (s.fetch_window * 2)
-                .max(self.sequential_fetch_window_min)
-                .min(self.fetch_window_max);
+            s.fetch_window = if self.sequential_fetch_window_min > self.fetch_window_min {
+                // High-latency backends use a fixed one-wave window and obtain
+                // throughput from several concurrent ranges/sessions instead
+                // of growing one range until it monopolizes a session.
+                self.sequential_fetch_window_min
+            } else {
+                (s.fetch_window * 2).min(self.fetch_window_max)
+            };
 
             // Refill the prefetch frontier to PREFETCH_DEPTH_WINDOWS ahead of the
             // read, once the stream has proven sequential (window ramped past the
@@ -128,13 +132,13 @@ impl AccessHistory {
                 let window = s.fetch_window as u64;
                 let target =
                     offset.saturating_add((PREFETCH_DEPTH_WINDOWS as u64).saturating_mul(window));
-                if s.fetched_until < target {
+                let mut cursor = s.fetched_until;
+                while cursor < target && async_prefetch.len() < PREFETCH_DEPTH_WINDOWS {
                     async_prefetch.push(AsyncPrefetch {
-                        start: s.fetched_until,
-                        size: usize::try_from(target - s.fetched_until)
-                            .unwrap_or(usize::MAX)
-                            .min(self.fetch_window_max),
+                        start: cursor,
+                        size: s.fetch_window,
                     });
+                    cursor = cursor.saturating_add(window);
                 }
             }
 
@@ -1538,7 +1542,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sftp_tuning_hydrates_one_mib_first_then_ramps_to_segment_windows() {
+    async fn sftp_tuning_hydrates_one_mib_first_then_uses_one_wave_windows() {
         const MIB: usize = 1024 * 1024;
         let mem = Arc::new(InMemory::new());
         let path = Path::from("segments/aa/large");
@@ -1578,18 +1582,18 @@ mod tests {
         assert!(
             bounded
                 .iter()
-                .any(|range| range.end - range.start == 16 * MIB as u64),
-            "sequential reads never reached the configured 16 MiB segment window: {bounded:?}"
+                .any(|range| range.end - range.start == 15 * MIB as u64),
+            "sequential reads never reached the 15 MiB one-wave window: {bounded:?}"
         );
         assert!(
             bounded
                 .iter()
-                .all(|range| range.end - range.start <= 16 * MIB as u64)
+                .all(|range| range.end - range.start <= 15 * MIB as u64)
         );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn sftp_sequential_120_mib_stream_coalesces_into_large_backend_gets() {
+    async fn sftp_sequential_120_mib_stream_uses_parallel_one_wave_gets() {
         const MIB: usize = 1024 * 1024;
         const OBJECT_LEN: usize = 120 * MIB;
         let mem = Arc::new(InMemory::new());
@@ -1671,12 +1675,13 @@ mod tests {
         assert!(
             bounded
                 .iter()
-                .all(|range| range.end - range.start <= OBJECT_LEN as u64),
-            "coalesced GET exceeded the configured 120 MiB maximum: {bounded:?}"
+                .skip(1)
+                .all(|range| range.end - range.start <= 15 * MIB as u64),
+            "a proven-sequential GET exceeded one 64-request SFTP wave: {bounded:?}"
         );
         assert!(
-            bounded.len() <= 4,
-            "120 MiB sequential stream used {} backend GETs instead of <=4: {bounded:?}",
+            bounded.len() <= 9,
+            "120 MiB sequential stream used {} backend GETs instead of <=9: {bounded:?}",
             bounded.len()
         );
         assert!(
@@ -2364,7 +2369,7 @@ mod tests {
     }
 
     #[test]
-    fn record_merges_adjacent_async_prefetch_windows_in_trigger_zone() {
+    fn record_emits_parallel_async_prefetch_windows_in_trigger_zone() {
         let part_size = 64 * 1024;
         let mut h = AccessHistory::new(part_size);
 
@@ -2376,16 +2381,15 @@ mod tests {
 
         let d = h.record((FETCH_WINDOW_MIN / 2) as u64, 0);
         assert_eq!(d.fetch_window, FETCH_WINDOW_MIN * 2);
-        // The frontier refills up to PREFETCH_DEPTH_WINDOWS ahead, but adjacent
-        // candidates are represented by one backend range starting where the
-        // read had already fetched to.
+        // The frontier refills with separate windows so the SFTP backend can
+        // lease several sessions instead of serializing one giant range.
         let p = d
             .async_prefetch
             .first()
             .expect("should fire in trigger zone");
         assert_eq!(p.start, FETCH_WINDOW_MIN as u64);
-        assert_eq!(p.size, 15 * FETCH_WINDOW_MIN / 2);
-        assert_eq!(d.async_prefetch.len(), 1);
+        assert_eq!(p.size, FETCH_WINDOW_MIN * 2);
+        assert_eq!(d.async_prefetch.len(), PREFETCH_DEPTH_WINDOWS);
     }
 
     #[test]
