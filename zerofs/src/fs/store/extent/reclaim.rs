@@ -213,15 +213,13 @@ impl ExtentStore {
     {
         // Drain FrameLoc publishers before seal+flush+cutoff. Lock order matches
         // the commit path: extent-reference barrier, then DB flush barrier.
-        let (cur_epoch, cutoff) = {
+        let (cur_epoch, cutoff, current_open) = {
             let _refs = self.extent_ref_barrier.clone().write_owned().await;
             let _barrier = self.db.flush_barrier().write_owned().await;
             self.seal_open().await?;
             self.db.flush().await.map_err(|_| FsError::IoError)?;
-            (
-                self.segments.epoch(),
-                self.open.lock().unwrap().segid.counter,
-            )
+            let (cutoff, current_open) = self.current_open_boundary();
+            (self.segments.epoch(), cutoff, current_open)
         };
         tracing::debug!("segment GC: durable barrier done (sealed + flushed), scanning extents");
 
@@ -245,12 +243,9 @@ impl ExtentStore {
             fp::widen(fp::RECLAIM_AFTER_BARRIER_BEFORE_SCAN).await;
         }
 
-        // Exclusive counter cutoff for eligibility: the still-open segment's
-        // own counter, not `next_counter()`. seal_open() just rotated in a
-        // fresh open segment that is still accepting frames whose credits may
-        // not be visible to the scan below; `next_counter()` would include it,
-        // and a mid-pass background seal could then mis-classify that fully
-        // live segment as dead.
+        // The four current open generations are explicitly excluded. If one
+        // rotates mid-pass it remains excluded, while its replacement has a
+        // counter at or above the captured cutoff.
         // A persistent checkpoint pins a view this scan-driven path can't
         // bound by object mtime (it never LISTs). Skip classification entirely
         // while one exists; the scan still runs for the footprint log.
@@ -258,8 +253,10 @@ impl ExtentStore {
 
         // A segment is reclaimable only once it can no longer gain references: it was
         // sealed before this round (older epoch, or below the counter cutoff).
-        let eligible =
-            |s: &Segid| s.epoch < cur_epoch || (s.epoch == cur_epoch && s.counter < cutoff);
+        let eligible = |s: &Segid| {
+            s.epoch < cur_epoch
+                || (s.epoch == cur_epoch && s.counter < cutoff && !current_open.contains(s))
+        };
 
         // Drain nominations; pinned passes leave them queued. Gone or dense
         // segids drop out at the scan and are re-nominated if still relevant.
@@ -807,21 +804,21 @@ impl ExtentStore {
     pub async fn sweep_orphans(&self, modified_before: DateTime<Utc>) -> Result<usize, FsError> {
         // Use the fast-reclaim barrier order and capture the cutoff while new
         // FrameLoc publishers are excluded.
-        let (cur_epoch, cutoff) = {
+        let (cur_epoch, cutoff, current_open) = {
             let _refs = self.extent_ref_barrier.clone().write_owned().await;
             let _barrier = self.db.flush_barrier().write_owned().await;
             self.seal_open().await?;
             self.db.flush().await.map_err(|_| FsError::IoError)?;
-            (
-                self.segments.epoch(),
-                self.open.lock().unwrap().segid.counter,
-            )
+            let (cutoff, current_open) = self.current_open_boundary();
+            (self.segments.epoch(), cutoff, current_open)
         };
         // Same eligibility cutoff as reclaim_segments_gated. A freshly-packed
         // compaction segment always carries a higher counter, so it is never
         // eligible even mid-compaction.
-        let eligible =
-            |s: &Segid| s.epoch < cur_epoch || (s.epoch == cur_epoch && s.counter < cutoff);
+        let eligible = |s: &Segid| {
+            s.epoch < cur_epoch
+                || (s.epoch == cur_epoch && s.counter < cutoff && !current_open.contains(s))
+        };
 
         // The one and only list("segments"). Point-get each object's counter
         // as the listing streams: present => the fast loop owns it; absent =>
@@ -1056,7 +1053,9 @@ mod tests {
         // retain its transaction instead of committing it.
         let expected = Bytes::from(vec![7u8; 1000]);
         let mut pending = db.new_transaction().unwrap();
-        store.write(&mut pending, 2, 0, &expected, 0).await.unwrap();
+        // Inode 5 shares inode 1's append lane, so this staged reference lands
+        // in the same generation whose dead counter row was seeded above.
+        store.write(&mut pending, 5, 0, &expected, 0).await.unwrap();
         assert!(pending.has_extent_ref_guard());
         assert!(
             store.extent_ref_barrier.try_write().is_err(),
@@ -1086,7 +1085,7 @@ mod tests {
             .expect("reclaim task")
             .expect("reclaim pass");
         assert_eq!(deleted, 0, "the newly referenced segment must be kept");
-        assert_eq!(store.read(2, 0, 1000).await.unwrap(), expected);
+        assert_eq!(store.read(5, 0, 1000).await.unwrap(), expected);
 
         let footprint = store.sample_footprint().await.unwrap();
         let gauges = store.segment_gc_stats();
@@ -1646,7 +1645,9 @@ mod tests {
         let per_file = 17u64;
         let mut sizes = [0u64, 0u64];
         for extent in 0..per_file {
-            for (i, inode) in [1u64, 2u64].into_iter().enumerate() {
+            // Both inodes deliberately share one append lane, preserving the
+            // scattered single-segment layout this self-seam test exercises.
+            for (i, inode) in [1u64, 5u64].into_iter().enumerate() {
                 let mut txn = db.new_transaction().unwrap();
                 let tu = store
                     .write(

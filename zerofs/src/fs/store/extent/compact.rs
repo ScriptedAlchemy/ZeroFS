@@ -620,7 +620,9 @@ mod tests {
         // frames are in write order: A0, B0, A1, B1, A2, B2.
         let mut sizes = [0u64, 0u64];
         for extent in 0..3u64 {
-            for (i, inode) in [1u64, 2u64].into_iter().enumerate() {
+            // Both files share an append lane so the source remains the one
+            // deliberately interleaved segment this compaction test requires.
+            for (i, inode) in [1u64, 5u64].into_iter().enumerate() {
                 let mut txn = db.new_transaction().unwrap();
                 let tu = store
                     .write(

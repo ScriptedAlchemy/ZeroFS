@@ -38,7 +38,7 @@ use futures::stream::StreamExt;
 use read::{READ_AHEAD_MAX_CONCURRENT, READ_AHEAD_TRACK_BYTES};
 use select::{NominationSet, PairStats};
 use slatedb::config::WriteOptions;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -46,7 +46,7 @@ use tokio::sync::Semaphore;
 use tracing::error;
 pub(crate) use write::MAX_INFLIGHT_SEALS;
 pub(crate) use write::SEAL_THRESHOLD;
-use write::{OpenSegment, TAIL_CACHE_BYTES};
+use write::{OPEN_SEGMENT_LANES, OpenLane, OpenSegment, TAIL_CACHE_BYTES};
 
 pub(super) const PARALLEL_EXTENT_OPS: usize = 20;
 
@@ -85,7 +85,9 @@ pub struct ExtentStore {
     /// conditional swap can't be clobbered by a concurrent write.
     lock_manager: Arc<KeyedLockManager<InodeId>>,
     codec: Arc<FrameCodec>,
-    open: Arc<Mutex<OpenSegment>>,
+    /// Inode-affine open segments. Independent files append through different
+    /// lanes so their compression/AEAD work does not serialize globally.
+    open_lanes: Arc<[OpenLane; OPEN_SEGMENT_LANES]>,
     /// Test observation point immediately before foreground batch AEAD.
     #[cfg(test)]
     before_batch_seal: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -95,10 +97,6 @@ pub struct ExtentStore {
     /// Writers hold the read side from FrameLoc assignment through commit; GC
     /// takes the write side before sealing and choosing its cutoff.
     extent_ref_barrier: Arc<tokio::sync::RwLock<()>>,
-    /// Serializes appends through threshold-triggered rotation. The writer that
-    /// crosses the threshold keeps this gate while waiting for a seal permit,
-    /// so later writers cannot keep extending an overdue open segment.
-    append_gate: Arc<tokio::sync::Mutex<()>>,
     /// Finalized bytes of segments whose PUT is in flight (or failed and pending a
     /// re-PUT). Reads consult these before the object store. Ordered so the
     /// barrier's re-PUT sequence is deterministic (seal order).
@@ -171,10 +169,13 @@ impl ExtentStore {
             .with_weighter(|_: &InodeId, _: &(u64, u64, u32)| 24)
             .build();
         let codec = segments.codec();
-        let open = Arc::new(Mutex::new(OpenSegment {
-            segid: segments.next_segid(),
-            buf: Vec::with_capacity(seal_threshold),
-            dir: Vec::new(),
+        let open_lanes = Arc::new(std::array::from_fn(|_| OpenLane {
+            append_gate: tokio::sync::Mutex::new(()),
+            open: Mutex::new(OpenSegment {
+                segid: segments.next_segid(),
+                buf: Vec::with_capacity(seal_threshold),
+                dir: Vec::new(),
+            }),
         }));
         Self {
             db,
@@ -182,13 +183,12 @@ impl ExtentStore {
             segments,
             lock_manager,
             codec,
-            open,
+            open_lanes,
             #[cfg(test)]
             before_batch_seal: None,
             #[cfg(test)]
             seal_open_put_gate: None,
             extent_ref_barrier: Arc::new(tokio::sync::RwLock::new(())),
-            append_gate: Arc::new(tokio::sync::Mutex::new(())),
             sealing: Arc::new(Mutex::new(BTreeMap::new())),
             seal_sem: Arc::new(Semaphore::new(max_inflight_seals)),
             delete_at: Arc::new(Mutex::new(HashMap::new())),
@@ -270,7 +270,11 @@ impl ExtentStore {
     /// the write-back buffer, the recently-written data a crash would lose
     /// without a flush. Read fresh (it is volatile); cheap in-memory lengths.
     pub fn unflushed_bytes(&self) -> u64 {
-        let open = self.open.lock().unwrap().buf.len() as u64;
+        let open: u64 = self
+            .open_lanes
+            .iter()
+            .map(|lane| lane.open.lock().unwrap().buf.len() as u64)
+            .sum();
         let sealing: u64 = self
             .sealing
             .lock()
@@ -338,16 +342,36 @@ impl ExtentStore {
     /// 256 MiB segment.
     #[cfg(test)]
     fn with_seal_threshold(mut self, n: usize) -> Self {
-        let mut open = self.open.lock().unwrap();
-        assert!(open.dir.is_empty());
-        open.buf = Vec::with_capacity(n);
-        drop(open);
+        for lane in self.open_lanes.iter() {
+            let mut open = lane.open.lock().unwrap();
+            assert!(open.dir.is_empty());
+            open.buf = Vec::with_capacity(n);
+        }
         self.seal_threshold = n;
         self
     }
 
     pub(super) fn seal_threshold(&self) -> usize {
         self.seal_threshold
+    }
+
+    /// Reclaim boundary after a seal barrier. Counters below `cutoff` are old
+    /// enough to classify except for the exact current lane generations, which
+    /// can still gain references and remain excluded even if they rotate while
+    /// the scan is running.
+    pub(super) fn current_open_boundary(&self) -> (u64, HashSet<Segid>) {
+        let current: HashSet<_> = self
+            .open_lanes
+            .iter()
+            .map(|lane| lane.open.lock().unwrap().segid)
+            .collect();
+        let cutoff = current
+            .iter()
+            .map(|segid| segid.counter)
+            .max()
+            .expect("at least one open-segment lane")
+            .saturating_add(1);
+        (cutoff, current)
     }
 
     #[cfg(test)]

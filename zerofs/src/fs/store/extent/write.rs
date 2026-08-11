@@ -25,15 +25,19 @@ const PARALLEL_COMPRESS_MIN_FRAMES: usize = 8;
 
 pub(super) const TAIL_CACHE_BYTES: usize = 32 * 1024 * 1024;
 
+/// Independent inode-affine append lanes. Four matches the foreground fio
+/// workload while keeping the number of preallocated open buffers bounded.
+pub(super) const OPEN_SEGMENT_LANES: usize = 4;
+
 /// Seal (PUT) the open segment once its packed frames reach this size, bounding
 /// the in-RAM buffer between flushes. The seal PUT is concurrent multipart
 /// (`SegmentStore::put_segment`), so its fsync-path latency stays bounded
 /// despite the size.
 pub(crate) const SEAL_THRESHOLD: usize = 256 * 1024 * 1024;
 
-/// Max segments sealing (PUT in flight) concurrently. Bounds the un-PUT RAM in
-/// `sealing` to ~this × SEAL_THRESHOLD; acquiring all permits is the fsync
-/// drain barrier.
+/// Max segments sealing (PUT in flight) concurrently. Bounds finalized un-PUT
+/// RAM in `sealing` to ~this × SEAL_THRESHOLD; acquiring all permits is the
+/// fsync drain barrier. Each append lane also has at most one open generation.
 pub(crate) const MAX_INFLIGHT_SEALS: usize = 4;
 
 /// The in-RAM open segment. Frames are sealed (compressed+encrypted) and appended
@@ -45,7 +49,20 @@ pub(super) struct OpenSegment {
     pub(super) dir: Vec<DirEntry>,
 }
 
+/// One independently ordered append stream. Its gate covers frame-index/AAD
+/// assignment through threshold rotation, while other lanes remain concurrent.
+pub(super) struct OpenLane {
+    pub(super) append_gate: tokio::sync::Mutex<()>,
+    pub(super) open: std::sync::Mutex<OpenSegment>,
+}
+
 impl ExtentStore {
+    #[inline]
+    pub(super) fn open_lane(&self, id: InodeId) -> &OpenLane {
+        let mixed = id ^ (id >> 32);
+        &self.open_lanes[(mixed as usize) & (OPEN_SEGMENT_LANES - 1)]
+    }
+
     fn tail_get(&self, id: InodeId) -> Option<(u64, Bytes)> {
         self.tail_cache.get(&id).map(|e| (*e).clone())
     }
@@ -71,8 +88,8 @@ impl ExtentStore {
     fn read_frame_for_ship(&self, segid: Segid, byte_offset: u64, byte_len: u32) -> Option<Bytes> {
         let start = byte_offset as usize;
         let end = start.checked_add(byte_len as usize)?;
-        {
-            let open = self.open.lock().unwrap();
+        for lane in self.open_lanes.iter() {
+            let open = lane.open.lock().unwrap();
             if open.segid == segid {
                 return open.buf.get(start..end).map(Bytes::copy_from_slice);
             }
@@ -252,13 +269,14 @@ impl ExtentStore {
         // Keep later writers from appending once this writer discovers that a
         // rotation is due. In particular, this guard stays held while
         // spawn_seal waits for an in-flight-seal permit.
-        let _append_guard = self.append_gate.lock().await;
+        let lane = self.open_lane(id);
+        let _append_guard = lane.append_gate.lock().await;
         let prepared = if has_frames {
             // Reserve the segment identity and contiguous frame-index run under
             // the append gate, but do the batch AEAD without holding the open
             // buffer mutex. `seal_open` takes the same gate before rotation.
             let (segid, first_frame) = {
-                let open = self.open.lock().unwrap();
+                let open = lane.open.lock().unwrap();
                 (open.segid, open.dir.len() as u32)
             };
             #[cfg(test)]
@@ -281,44 +299,35 @@ impl ExtentStore {
             let sealed =
                 crate::segment::seal_compressed_batch(&self.codec, segid, first_frame, frames)
                     .map_err(|_| FsError::IoError)?;
-            let packed_len = sealed.iter().map(|(_, _, body)| 4 + body.len()).sum();
-            let mut packed = Vec::with_capacity(packed_len);
-            let mut entries = Vec::with_capacity(sealed.len());
-            for (inode, extent, body) in sealed {
-                let byte_offset = packed.len() as u64;
+            Some((segid, first_frame, sealed))
+        } else {
+            None
+        };
+        let mut locs = Vec::with_capacity(prepared.as_ref().map_or(0, |p| p.2.len()));
+        if let Some((segid, first_frame, sealed)) = prepared {
+            let mut open = lane.open.lock().unwrap();
+            if open.segid != segid || open.dir.len() as u32 != first_frame {
+                return Err(FsError::IoError);
+            }
+            open.dir.reserve(sealed.len());
+            for (i, (inode, extent, body)) in sealed.into_iter().enumerate() {
+                let byte_offset = open.buf.len() as u64;
                 let len = body.len() as u32;
-                packed.extend_from_slice(&len.to_le_bytes());
-                packed.extend_from_slice(&body);
-                entries.push(DirEntry {
+                open.buf.extend_from_slice(&len.to_le_bytes());
+                open.buf.extend_from_slice(&body);
+                let loc = FrameLoc {
+                    segid,
+                    frame_index: first_frame + i as u32,
+                    byte_offset,
+                    byte_len: 4 + len,
+                };
+                locs.push(loc);
+                open.dir.push(DirEntry {
                     byte_offset,
                     len,
                     inode,
                     extent,
                 });
-            }
-            Some((segid, first_frame, packed, entries))
-        } else {
-            None
-        };
-        let mut locs = Vec::with_capacity(prepared.as_ref().map_or(0, |p| p.3.len()));
-        if let Some((segid, first_frame, packed, entries)) = prepared {
-            let mut open = self.open.lock().unwrap();
-            if open.segid != segid || open.dir.len() as u32 != first_frame {
-                return Err(FsError::IoError);
-            }
-            let base_offset = open.buf.len() as u64;
-            open.buf.extend_from_slice(&packed);
-            open.dir.reserve(entries.len());
-            for (i, mut entry) in entries.into_iter().enumerate() {
-                entry.byte_offset += base_offset;
-                let loc = FrameLoc {
-                    segid,
-                    frame_index: first_frame + i as u32,
-                    byte_offset: entry.byte_offset,
-                    byte_len: 4 + entry.len,
-                };
-                locs.push(loc);
-                open.dir.push(entry);
             }
         }
         let mut locs = locs.into_iter();
@@ -341,9 +350,9 @@ impl ExtentStore {
             // Overwrite debit of the superseded frame: live only, total untouched.
             self.seg_delta(txn, segid, -(byte_len as i64), 0);
         }
-        let over_threshold = self.open.lock().unwrap().buf.len() >= self.seal_threshold();
+        let over_threshold = lane.open.lock().unwrap().buf.len() >= self.seal_threshold();
         if over_threshold {
-            self.spawn_seal().await;
+            self.spawn_seal(lane).await;
         }
         Ok(())
     }
@@ -353,10 +362,13 @@ impl ExtentStore {
     /// then synchronously seal the current open buffer. After this returns, every
     /// segment referenced by a committed extent is durable on the object store.
     pub async fn seal_open(&self) -> Result<(), FsError> {
-        // Serialize rotation with foreground frame-index reservation and batch
-        // sealing. This gate must be acquired before seal permits to preserve
+        // Freeze every lane's foreground frame-index reservation and batch
+        // sealing. Lane gates must be acquired before seal permits to preserve
         // the foreground path's gate-then-permit lock order.
-        let _append_guard = self.append_gate.lock().await;
+        let mut append_guards = Vec::with_capacity(OPEN_SEGMENT_LANES);
+        for lane in self.open_lanes.iter() {
+            append_guards.push(lane.append_gate.lock().await);
+        }
         // Acquire all permits: waits for in-flight background seals to finish, and
         // holds new ones off until we release at end of scope.
         let _all = self
@@ -370,8 +382,8 @@ impl ExtentStore {
         // segment is never absent from both maps: a concurrent read would 404
         // the not-yet-PUT object, and a failed PUT would strand it. Mirrors
         // spawn_seal.
-        {
-            let mut open = self.open.lock().unwrap();
+        for lane in self.open_lanes.iter() {
+            let mut open = lane.open.lock().unwrap();
             if !open.dir.is_empty() {
                 let segid = open.segid;
                 #[cfg(feature = "failpoints")]
@@ -405,7 +417,7 @@ impl ExtentStore {
         // foreground writers use the replacement segment while this barrier
         // publishes only the captured generation. The caller's DB flush barrier
         // prevents those later FrameLocs from entering this metadata flush.
-        drop(_append_guard);
+        drop(append_guards);
 
         // Re-PUT failed background seals and publish the segment just rotated.
         // Retain all seal permits until this captured set is complete.
@@ -436,13 +448,13 @@ impl ExtentStore {
     /// path). Acquires a permit first, so a writer that outruns the object store
     /// blocks here (backpressure) instead of growing RAM without bound. The
     /// rotated buffer stays readable via `sealing` until its PUT lands.
-    async fn spawn_seal(&self) {
+    async fn spawn_seal(&self, lane: &OpenLane) {
         let permit = match Arc::clone(&self.seal_sem).acquire_owned().await {
             Ok(p) => p,
             Err(_) => return,
         };
         let prepared = {
-            let mut open = self.open.lock().unwrap();
+            let mut open = lane.open.lock().unwrap();
             if open.dir.is_empty() {
                 return;
             }
@@ -893,7 +905,7 @@ mod tests {
     async fn multi_frame_stage_edits_seals_outside_open_lock_without_reordering_frames() {
         let (mut store, db) = make().await;
         let inode: InodeId = 73;
-        let seed_inode: InodeId = 72;
+        let seed_inode: InodeId = 69;
         let seed = Bytes::from(vec![0x77; EXTENT_SIZE]);
         let mut seed_txn = db.new_transaction().unwrap();
         store
@@ -904,11 +916,14 @@ mod tests {
 
         let observed_unlocked = Arc::new(std::sync::atomic::AtomicBool::new(false));
         store.before_batch_seal = Some({
-            let open = Arc::clone(&store.open);
+            let lanes = Arc::clone(&store.open_lanes);
+            let lane = (inode as usize) & (OPEN_SEGMENT_LANES - 1);
             let observed_unlocked = Arc::clone(&observed_unlocked);
             Arc::new(move || {
-                observed_unlocked
-                    .store(open.try_lock().is_ok(), std::sync::atomic::Ordering::SeqCst);
+                observed_unlocked.store(
+                    lanes[lane].open.try_lock().is_ok(),
+                    std::sync::atomic::Ordering::SeqCst,
+                );
             })
         });
 
@@ -931,7 +946,7 @@ mod tests {
         );
 
         let (segid, region, dir) = {
-            let open = store.open.lock().unwrap();
+            let open = store.open_lane(inode).open.lock().unwrap();
             (open.segid, open.buf.clone(), open.dir.clone())
         };
         assert_eq!(
@@ -967,13 +982,68 @@ mod tests {
         }
     }
 
+    // Removing the global append bottleneck must let independent files perform
+    // their batch AEAD concurrently. A single shared append gate makes these
+    // probes run one after another, keeping `max_active` at one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn distinct_inode_batches_enter_aead_concurrently() {
+        let (mut store, db) = make().await;
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        store.before_batch_seal = Some({
+            let active = Arc::clone(&active);
+            let max_active = Arc::clone(&max_active);
+            Arc::new(move || {
+                let now = active.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                max_active.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            })
+        });
+
+        let writes: Vec<_> = (0..4u64)
+            .map(|lane| {
+                let store = store.clone();
+                let db = db.clone();
+                tokio::spawn(async move {
+                    let inode = 100 + lane;
+                    let mut txn = db.new_transaction().unwrap();
+                    store
+                        .stage_edits(
+                            &mut txn,
+                            inode,
+                            &[(
+                                0,
+                                Some(Bytes::from(incompressible(inode as usize, EXTENT_SIZE))),
+                            )],
+                            0,
+                        )
+                        .await
+                        .unwrap();
+                    commit(&store, txn).await;
+                })
+            })
+            .collect();
+        for write in writes {
+            write.await.unwrap();
+        }
+
+        assert_eq!(
+            max_active.load(std::sync::atomic::Ordering::SeqCst),
+            4,
+            "independent inode batches did not seal concurrently"
+        );
+    }
+
     #[tokio::test]
     async fn configured_seal_threshold_preallocates_the_open_buffer() {
         let (store, db) = make().await;
         let store = store.with_seal_threshold(1024);
         {
-            let open = store.open.lock().unwrap();
-            assert!(open.buf.capacity() >= store.seal_threshold());
+            for lane in store.open_lanes.iter() {
+                let open = lane.open.lock().unwrap();
+                assert!(open.buf.capacity() >= store.seal_threshold());
+            }
         }
 
         let mut txn = db.new_transaction().unwrap();
@@ -988,7 +1058,7 @@ mod tests {
             .await
             .unwrap();
         {
-            let open = store.open.lock().unwrap();
+            let open = store.open_lane(1).open.lock().unwrap();
             assert!(open.dir.is_empty(), "threshold write did not rotate");
             assert!(
                 open.buf.capacity() >= store.seal_threshold(),
@@ -1191,7 +1261,7 @@ mod tests {
 
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             loop {
-                if store.open.lock().unwrap().dir.len() == 1 {
+                if store.open_lane(100).open.lock().unwrap().dir.len() == 1 {
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -1206,7 +1276,7 @@ mod tests {
             async move {
                 let mut txn = db.new_transaction().unwrap();
                 store
-                    .write(&mut txn, 101, 0, &Bytes::from_static(b"b"), 0)
+                    .write(&mut txn, 104, 0, &Bytes::from_static(b"b"), 0)
                     .await
                     .unwrap();
             }
@@ -1215,7 +1285,7 @@ mod tests {
         let appended_behind_blocked_seal =
             tokio::time::timeout(std::time::Duration::from_millis(100), async {
                 loop {
-                    if store.open.lock().unwrap().dir.len() > 1 {
+                    if store.open_lane(100).open.lock().unwrap().dir.len() > 1 {
                         break;
                     }
                     tokio::task::yield_now().await;
@@ -1265,7 +1335,7 @@ mod tests {
             async move { store.seal_open().await }
         });
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            while !store.open.lock().unwrap().dir.is_empty() {
+            while !store.open_lane(201).open.lock().unwrap().dir.is_empty() {
                 tokio::task::yield_now().await;
             }
         })

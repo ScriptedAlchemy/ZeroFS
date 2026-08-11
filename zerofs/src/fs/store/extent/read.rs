@@ -223,8 +223,8 @@ impl ExtentStore {
                     FsError::IoError
                 })
         }
-        {
-            let open = self.open.lock().unwrap();
+        for lane in self.open_lanes.iter() {
+            let open = lane.open.lock().unwrap();
             if segid == open.segid {
                 let frames = crate::segment::read_frames_from_region(
                     &self.codec,
@@ -556,7 +556,7 @@ mod tests {
 
         // Fabricate a pointer at the current open segment with an impossible range.
         let bogus = FrameLoc {
-            segid: store.open.lock().unwrap().segid,
+            segid: store.open_lane(1).open.lock().unwrap().segid,
             frame_index: 0,
             byte_offset: 1 << 40,
             byte_len: 4096,
@@ -722,7 +722,7 @@ mod tests {
         // segments and still never nominates the open segid.
         store.read(1, 0, 6 * EXTENT_SIZE as u64).await.unwrap();
         {
-            let open_segid = store.open.lock().unwrap().segid;
+            let open_segid = store.open_lane(1).open.lock().unwrap().segid;
             let noms = store.nominations.lock().unwrap();
             assert_eq!(noms.set.len(), 2);
             assert!(noms.set.contains(&seg_a) && noms.set.contains(&seg_b));
