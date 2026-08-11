@@ -179,15 +179,31 @@ impl ExtentStore {
         txn: &mut Transaction,
         id: InodeId,
         edits: &[(u64, Option<Bytes>)],
+        old_extent_end: u64,
     ) -> Result<(), FsError> {
-        let mut old_debits: Vec<(Segid, u32)> = Vec::with_capacity(edits.len());
+        let mut old_debits: Vec<(Segid, u32)> = Vec::new();
         if let (Some(min), Some(max)) = (
             edits.iter().map(|(e, _)| *e).min(),
             edits.iter().map(|(e, _)| *e).max(),
-        ) {
-            let edited: HashSet<u64> = edits.iter().map(|(e, _)| *e).collect();
+        ) && min < old_extent_end
+        {
+            // An extent whose index starts at or beyond the old EOF cannot
+            // supersede an old FrameLoc. Keep the unaligned old tail in range,
+            // but do not make append-only metadata reads for newer extents.
+            let scan_end = max.saturating_add(1).min(old_extent_end);
+            let edited: HashSet<u64> = edits
+                .iter()
+                .map(|(e, _)| *e)
+                .filter(|extent| *extent < scan_end)
+                .collect();
+            old_debits.reserve(edited.len());
             let start_key = self.key_codec.extent_key(id, min);
-            let end_key = self.key_codec.extent_key(id, max.saturating_add(1));
+            let end_key = self.key_codec.extent_key(id, scan_end);
+            #[cfg(test)]
+            self.old_extent_scan_ranges
+                .lock()
+                .unwrap()
+                .push((min, scan_end));
             let mut stream = self
                 .db
                 .scan(start_key..end_key)
@@ -519,7 +535,8 @@ impl ExtentStore {
             }
         }
 
-        self.stage_edits(txn, id, &edits).await?;
+        self.stage_edits(txn, id, &edits, old_size.div_ceil(EXTENT_SIZE as u64))
+            .await?;
 
         Ok(match tail {
             Some(data) => TailUpdate::Set {
@@ -560,7 +577,8 @@ impl ExtentStore {
                 } else {
                     (last_extent_idx, Some(extent.freeze()))
                 };
-                self.stage_edits(txn, id, &[edit]).await?;
+                self.stage_edits(txn, id, &[edit], old_size.div_ceil(EXTENT_SIZE as u64))
+                    .await?;
             }
         }
         Ok(())
@@ -614,7 +632,8 @@ impl ExtentStore {
                 }
             }
         }
-        self.stage_edits(txn, id, &edits).await
+        self.stage_edits(txn, id, &edits, file_size.div_ceil(EXTENT_SIZE as u64))
+            .await
     }
 
     /// Delete an extent range under the inode's write lock, in its own transaction.
@@ -1066,5 +1085,78 @@ mod tests {
             write_and_check(&store, &db, &mut model, off, b"0123456789").await;
         }
         assert_eq!(model.len(), 500);
+    }
+
+    #[tokio::test]
+    async fn aligned_append_skips_old_extent_scan() {
+        let (store, db) = make().await;
+        let inode: InodeId = 1;
+
+        // The first full extent leaves an aligned EOF. Appending the next full
+        // extent cannot supersede any old FrameLoc, so it needs no debit scan.
+        let mut txn = db.new_transaction().unwrap();
+        store
+            .write(&mut txn, inode, 0, &Bytes::from(vec![1u8; EXTENT_SIZE]), 0)
+            .await
+            .unwrap();
+        commit(&store, txn).await;
+        let scans_before_append = store.old_extent_scan_ranges().len();
+
+        let mut txn = db.new_transaction().unwrap();
+        store
+            .write(
+                &mut txn,
+                inode,
+                EXTENT_SIZE as u64,
+                &Bytes::from(vec![2u8; EXTENT_SIZE]),
+                EXTENT_SIZE as u64,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.old_extent_scan_ranges().len(),
+            scans_before_append,
+            "an aligned append must not scan extents at or beyond old EOF"
+        );
+    }
+
+    #[tokio::test]
+    async fn unaligned_append_scans_only_old_tail_extent() {
+        let (store, db) = make().await;
+        let inode: InodeId = 1;
+        let old_size = 2 * EXTENT_SIZE as u64 - 13;
+
+        let mut txn = db.new_transaction().unwrap();
+        store
+            .write(
+                &mut txn,
+                inode,
+                0,
+                &Bytes::from(vec![1u8; old_size as usize]),
+                0,
+            )
+            .await
+            .unwrap();
+        commit(&store, txn).await;
+
+        // An unaligned EOF still has one old tail FrameLoc. A write that fills
+        // that tail and extends into a new extent must scan exactly the tail,
+        // not the newly appended extent.
+        let mut txn = db.new_transaction().unwrap();
+        store
+            .write(
+                &mut txn,
+                inode,
+                old_size,
+                &Bytes::from(vec![3u8; EXTENT_SIZE]),
+                old_size,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.old_extent_scan_ranges().last().copied(),
+            Some((1, 2)),
+            "an unaligned append must retain the old tail debit scan only"
+        );
     }
 }

@@ -143,6 +143,9 @@ pub struct ExtentStore {
     /// Reclaim/compaction counters and footprint gauges, bridged to Prometheus.
     /// Written only by the segment-GC task (see `reclaim_segments_gated`).
     segment_gc_stats: Arc<SegmentGcStats>,
+    /// Actual old-extent debit scan ranges, for focused write-path tests.
+    #[cfg(test)]
+    old_extent_scan_ranges: Arc<Mutex<Vec<(u64, u64)>>>,
 }
 
 impl ExtentStore {
@@ -191,6 +194,8 @@ impl ExtentStore {
             max_inflight_seals,
             coordinator: Arc::new(std::sync::OnceLock::new()),
             segment_gc_stats: Arc::new(SegmentGcStats::default()),
+            #[cfg(test)]
+            old_extent_scan_ranges: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -329,6 +334,11 @@ impl ExtentStore {
 
     pub(super) fn seal_threshold(&self) -> usize {
         self.seal_threshold
+    }
+
+    #[cfg(test)]
+    fn old_extent_scan_ranges(&self) -> Vec<(u64, u64)> {
+        self.old_extent_scan_ranges.lock().unwrap().clone()
     }
 }
 
