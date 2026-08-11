@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
+use dashmap::DashSet;
 use futures::StreamExt;
 use futures::stream::{self, BoxStream};
 use object_store::path::{Path as ObjectPath, PathPart};
@@ -350,11 +351,18 @@ impl Drop for StagingCleanup {
 }
 
 const STORE_NAME: &str = "SFTP";
+const SFTP_NEGATIVE_CACHE_MAX_ENTRIES: usize = 16 * 1024;
 
 #[derive(Clone)]
 pub struct SftpObjectStore {
     pool: crate::sftp_transport::SftpSessionPool,
     prefix: ObjectPath,
+    // This backend is deliberately single-owner: SFTP cannot provide the
+    // distributed CAS needed by multiple ZeroFS writers. Remember confirmed
+    // misses for this process lifetime so metadata/GC polling does not spend
+    // four WAN round trips rediscovering the same absent object. Every local
+    // publication invalidates its target before and after the remote write.
+    known_missing: Arc<DashSet<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -488,7 +496,26 @@ impl SftpObjectStore {
         prefix: ObjectPath,
     ) -> object_store::Result<Self> {
         Self::validate_prefix(&prefix)?;
-        Ok(Self { pool, prefix })
+        Ok(Self {
+            pool,
+            prefix,
+            known_missing: Arc::new(DashSet::new()),
+        })
+    }
+
+    fn forget_missing(&self, location: &ObjectPath) {
+        self.known_missing.remove(location.as_ref());
+    }
+
+    fn remember_missing(&self, location: &ObjectPath) {
+        // Absent future manifests are normally removed as soon as this writer
+        // publishes them. Deleted historical objects can remain absent for the
+        // process lifetime, so bound that residue rather than letting a busy
+        // long-running filesystem grow the cache indefinitely.
+        if self.known_missing.len() >= SFTP_NEGATIVE_CACHE_MAX_ENTRIES {
+            self.known_missing.clear();
+        }
+        self.known_missing.insert(location.to_string());
     }
 
     fn validate_location(
@@ -535,6 +562,12 @@ impl SftpObjectStore {
             });
         }
         let remote = self.remote_path(location, false)?;
+        if self.known_missing.contains(location.as_ref()) {
+            return Err(object_store::Error::NotFound {
+                path: location.to_string(),
+                source: "SFTP object is known absent for this single-owner process".into(),
+            });
+        }
         let mut lease = self
             .pool
             .checkout(if options.head {
@@ -547,9 +580,19 @@ impl SftpObjectStore {
         let operation = lease
             .read_object(&remote, options.range.clone(), options.head)
             .await;
-        finish_lease(lease, operation)
+        let result = finish_lease(lease, operation)
             .await
-            .map_err(transport_error)
+            .map_err(transport_error);
+        match &result {
+            Ok(_) => {
+                self.forget_missing(location);
+            }
+            Err(object_store::Error::NotFound { .. }) => {
+                self.remember_missing(location);
+            }
+            Err(_) => {}
+        }
+        result
     }
 
     async fn directory_snapshot(
@@ -626,9 +669,13 @@ impl SftpObjectStore {
             .await
             .map_err(transport_error)?;
         let operation = lease.remove_file(&remote).await;
-        finish_lease(lease, operation)
+        let result = finish_lease(lease, operation)
             .await
-            .map_err(transport_error)
+            .map_err(transport_error);
+        if result.is_ok() || matches!(&result, Err(object_store::Error::NotFound { .. })) {
+            self.remember_missing(location);
+        }
+        result
     }
 }
 
@@ -656,6 +703,7 @@ impl ObjectStore for SftpObjectStore {
         opts: PutOptions,
     ) -> object_store::Result<PutResult> {
         let target = self.remote_path(location, false)?;
+        self.forget_missing(location);
         let (mode, expected_generation) = match opts.mode {
             PutMode::Overwrite => (PublicationMode::Overwrite, None),
             PutMode::Create => (PublicationMode::Create, None),
@@ -694,6 +742,7 @@ impl ObjectStore for SftpObjectStore {
         if let Some(debt) = outcome.cleanup_debt {
             tracing::warn!(%debt, "SFTP object committed with staging cleanup debt");
         }
+        self.forget_missing(location);
         Ok(PutResult {
             e_tag: Some(outcome.header.generation.to_string()),
             version: None,
@@ -707,12 +756,18 @@ impl ObjectStore for SftpObjectStore {
         _opts: PutMultipartOptions,
     ) -> object_store::Result<Box<dyn MultipartUpload>> {
         let target = self.remote_path(location, false)?;
+        self.forget_missing(location);
         let session: Arc<dyn RemoteSession> = Arc::new(PooledRemoteSession {
             pool: self.pool.clone(),
         });
-        let upload = SftpMultipartUpload::begin(session, location.clone(), target)
-            .await
-            .map_err(|error| publication_error(location, error))?;
+        let upload = SftpMultipartUpload::begin(
+            session,
+            location.clone(),
+            target,
+            self.known_missing.clone(),
+        )
+        .await
+        .map_err(|error| publication_error(location, error))?;
         Ok(Box::new(upload))
     }
 
@@ -833,6 +888,7 @@ struct SftpMultipartUpload {
     staging: Option<PathBuf>,
     generation: Uuid,
     state: Arc<StdMutex<SftpMultipartState>>,
+    known_missing: Arc<DashSet<String>>,
     terminal: bool,
 }
 
@@ -847,6 +903,7 @@ impl SftpMultipartUpload {
         session: Arc<dyn RemoteSession>,
         location: ObjectPath,
         target: PathBuf,
+        known_missing: Arc<DashSet<String>>,
     ) -> RemoteResult<Self> {
         validate_publication_capabilities(session.capabilities(), PublicationMode::Overwrite)
             .map_err(|extension| {
@@ -872,6 +929,7 @@ impl SftpMultipartUpload {
             staging: Some(staging),
             generation,
             state: Arc::new(StdMutex::new(SftpMultipartState::default())),
+            known_missing,
             terminal: false,
         })
     }
@@ -963,6 +1021,7 @@ impl MultipartUpload for SftpMultipartUpload {
             .map_err(|error| publication_error(&self.location, error))?;
         self.terminal = true;
         self.staging = None;
+        self.known_missing.remove(self.location.as_ref());
         Ok(PutResult {
             e_tag: Some(self.generation.to_string()),
             version: None,
@@ -1128,6 +1187,7 @@ mod tests {
         OpenSshTransportSession, RemoteDirectoryEntry, RemoteObjectRead, SessionFactory,
         TransportError, TransportSession,
     };
+    use object_store::ObjectStoreExt;
     use std::collections::HashMap;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1284,6 +1344,7 @@ mod tests {
     struct LocalSftpFactory {
         server: PathBuf,
         root: PathBuf,
+        reads: Arc<AtomicUsize>,
     }
 
     #[async_trait]
@@ -1308,13 +1369,18 @@ mod tests {
                 .take()
                 .ok_or_else(|| TransportError::Open("missing sftp-server stdout".to_owned()))?;
             let session = OpenSshTransportSession::from_streams(stdin, stdout).await?;
-            Ok(Box::new(LocalSftpSession { session, child }))
+            Ok(Box::new(LocalSftpSession {
+                session,
+                child,
+                reads: self.reads.clone(),
+            }))
         }
     }
 
     struct LocalSftpSession {
         session: OpenSshTransportSession,
         child: tokio::process::Child,
+        reads: Arc<AtomicUsize>,
     }
 
     impl Debug for LocalSftpSession {
@@ -1337,6 +1403,7 @@ mod tests {
             range: Option<object_store::GetRange>,
             head: bool,
         ) -> Result<RemoteObjectRead, TransportError> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
             self.session.read_object(path, range, head).await
         }
 
@@ -1412,7 +1479,9 @@ mod tests {
             self: Box<Self>,
             force: tokio_util::sync::CancellationToken,
         ) -> Result<(), TransportError> {
-            let LocalSftpSession { session, mut child } = *self;
+            let LocalSftpSession {
+                session, mut child, ..
+            } = *self;
             Box::new(session).close(force).await?;
             let status = child
                 .wait()
@@ -1606,10 +1675,14 @@ mod tests {
         let session = Arc::new(ParallelMultipartSession::new());
         let location = ObjectPath::from("zerofs/v1/parallel.bin");
         let target = FilePath::new("zerofs/v1/parallel.bin");
-        let mut upload =
-            SftpMultipartUpload::begin(session.clone(), location, target.to_path_buf())
-                .await
-                .unwrap();
+        let mut upload = SftpMultipartUpload::begin(
+            session.clone(),
+            location,
+            target.to_path_buf(),
+            Arc::new(DashSet::new()),
+        )
+        .await
+        .unwrap();
 
         let first = upload.put_part(PutPayload::from_static(b"hello "));
         let second = upload.put_part(PutPayload::from_static(b"world"));
@@ -2179,10 +2252,12 @@ mod tests {
             b"hidden",
         );
 
+        let reads = Arc::new(AtomicUsize::new(0));
         let pool = crate::sftp_transport::SftpSessionPool::new_writable(
             Arc::new(LocalSftpFactory {
                 server: server.into(),
                 root: root.path().to_path_buf(),
+                reads: reads.clone(),
             }),
             2,
             1,
@@ -2192,6 +2267,38 @@ mod tests {
         .unwrap();
         let store = SftpObjectStore::new(pool, ObjectPath::from("zerofs/v1")).unwrap();
         let location = ObjectPath::from("zerofs/v1/top.bin");
+
+        let missing = ObjectPath::from("zerofs/v1/eventually-created.bin");
+        assert!(matches!(
+            store.get(&missing).await.unwrap_err(),
+            object_store::Error::NotFound { .. }
+        ));
+        assert!(matches!(
+            store.get(&missing).await.unwrap_err(),
+            object_store::Error::NotFound { .. }
+        ));
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            1,
+            "a repeated known miss must not consume another SFTP request"
+        );
+        store
+            .put(&missing, PutPayload::from_static(b"now present"))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get(&missing).await.unwrap().bytes().await.unwrap(),
+            Bytes::from_static(b"now present"),
+            "a successful publication must invalidate the negative entry"
+        );
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+        store
+            .delete_stream(stream::iter([Ok(missing)]).boxed())
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<object_store::Result<Vec<_>>>()
+            .unwrap();
 
         let result = store
             .get_opts(
@@ -2339,6 +2446,10 @@ mod tests {
             .put_multipart_opts(&multipart_location, PutMultipartOptions::default())
             .await
             .unwrap();
+        assert!(matches!(
+            store.get(&multipart_location).await.unwrap_err(),
+            object_store::Error::NotFound { .. }
+        ));
         let first_part = multipart.put_part(PutPayload::from_static(b"hello "));
         let second_part = multipart.put_part(PutPayload::from_static(b"multipart"));
         futures::future::try_join(first_part, second_part)
