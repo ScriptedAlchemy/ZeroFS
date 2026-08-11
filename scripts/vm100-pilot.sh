@@ -254,7 +254,7 @@ raw_sftp() {
   timestamp=$(date -u +%Y%m%dT%H%M%SZ)
   remote="zerofs-raw-control-$timestamp-$$"
   localdir="/var/tmp/$remote"
-  sudo mkdir -p "$localdir"
+  sudo install -d -m 0755 -o "$(id -un)" -g "$(id -gn)" "$localdir"
   for i in $(seq 0 7); do sudo fallocate -l 128M "$localdir/file-$i.bin"; done
   local -a sftp_cmd=(sudo sftp -q -B 261120 -R 64 -P "$port" -i "$key" -o UserKnownHostsFile="$known" -o StrictHostKeyChecking=yes -o BatchMode=yes -o Compression=no "$user@$host")
   teardown
@@ -281,14 +281,14 @@ raw_sftp() {
   local t0 t1 t2 pids=()
   t0=$(date +%s%3N)
   for i in $(seq 0 7); do
-    (printf 'put %s %s/file-%s.bin\n' "$localdir/file-$i.bin" "$remote" "$i" | "${sftp_cmd[@]}" >"$localdir/upload-$i.log" 2>&1) &
+    (trap - EXIT; printf 'put %s %s/file-%s.bin\n' "$localdir/file-$i.bin" "$remote" "$i" | "${sftp_cmd[@]}" >"$localdir/upload-$i.log" 2>&1) &
     pids+=("$!")
   done
   for pid in "${pids[@]}"; do wait "$pid"; done
   t1=$(date +%s%3N)
   pids=()
   for i in $(seq 0 7); do
-    (printf 'get %s/file-%s.bin /dev/null\n' "$remote" "$i" | "${sftp_cmd[@]}" >"$localdir/download-$i.log" 2>&1) &
+    (trap - EXIT; printf 'get %s/file-%s.bin /dev/null\n' "$remote" "$i" | "${sftp_cmd[@]}" >"$localdir/download-$i.log" 2>&1) &
     pids+=("$!")
   done
   for pid in "${pids[@]}"; do wait "$pid"; done
