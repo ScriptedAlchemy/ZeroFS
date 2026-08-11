@@ -1151,16 +1151,16 @@ mod tests {
             "the read was served from the open buffer"
         );
 
-        // Sealing PUTs exactly one segment. With no in-RAM segment cache, the read
-        // after seal is a ranged GET (in production the object store's parts cache,
-        // warmed at seal time, absorbs it; these tests wire up no such cache).
+        // Sealing PUTs exactly one segment. The validated plaintext written
+        // through before commit remains read-ready after the open buffer rotates,
+        // so this reread must not issue a segment GET.
         store.seal_open().await.unwrap();
         assert_eq!(store.segments.list_segments().await.unwrap().len(), 1);
         assert_eq!(store.read(1, 0, 100).await.unwrap().as_ref(), &model[..]);
         assert_eq!(
             store.segments.read_calls(),
-            1,
-            "a read of a sealed segment is one ranged GET"
+            0,
+            "a freshly sealed write remains in the decoded extent cache"
         );
     }
 

@@ -64,6 +64,14 @@ pub(super) fn make_store(
     )
 }
 
+/// Simulate eviction of the process-local plaintext cache while preserving
+/// the durable segment and metadata state. GC heat tests use this between
+/// read episodes because only reads that reach stored segments should create
+/// nominations or seam heat.
+pub(super) fn evict_decoded_extents(store: &ExtentStore) {
+    store.decoded_extent_cache.clear();
+}
+
 pub(super) async fn commit(store: &ExtentStore, txn: Transaction) {
     // No commit worker in these tests, so commit_via_coordinator takes its
     // fallback path: this test task is the sole segcount writer.

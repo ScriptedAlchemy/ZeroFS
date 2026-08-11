@@ -929,12 +929,14 @@ mod tests {
         // Two boundary-crossing reads in distinct GC rounds arm the seam;
         // the negative control pins that one episode packs nothing.
         let boundary = (a_extents - 1) * EXTENT_SIZE as u64;
+        evict_decoded_extents(&store);
         store
             .read(1, boundary, 2 * EXTENT_SIZE as u64)
             .await
             .unwrap();
         let (deleted, relocated) = store.reclaim_segments(Utc::now(), None).await.unwrap();
         assert_eq!((deleted, relocated), (0, 0), "one episode: not hot yet");
+        evict_decoded_extents(&store);
         store
             .read(1, boundary, 2 * EXTENT_SIZE as u64)
             .await
@@ -1068,6 +1070,7 @@ mod tests {
         // Arm both seams across two GC rounds.
         let a_boundary = (a1_extents - 1) * EXTENT_SIZE as u64;
         let b_boundary = (b_extents - 1) * EXTENT_SIZE as u64;
+        evict_decoded_extents(&store);
         store
             .read(1, a_boundary, 2 * EXTENT_SIZE as u64)
             .await
@@ -1077,6 +1080,7 @@ mod tests {
             .await
             .unwrap();
         store.reclaim_segments(Utc::now(), None).await.unwrap();
+        evict_decoded_extents(&store);
         store
             .read(1, a_boundary, 2 * EXTENT_SIZE as u64)
             .await

@@ -1588,11 +1588,13 @@ mod tests {
         let whole = 2 * per_seg * EXTENT_SIZE as u64;
 
         // First pass over the seam: one episode, no chain.
+        evict_decoded_extents(&store);
         store.read(1, 0, whole).await.unwrap();
         store.reclaim_segments(Utc::now(), None).await.unwrap();
         // Second episode in a later round: the seam is now hot — but the
         // members are freshly sealed (counter-young) and the store isn't
         // quiescent yet, so the write-cold gate must hold the chain back.
+        evict_decoded_extents(&store);
         store.read(1, 0, whole).await.unwrap();
         let (_, relocated) = store.reclaim_segments(Utc::now(), None).await.unwrap();
         assert_eq!(relocated, 0, "hot but not write-cold: chain held back");
@@ -1673,6 +1675,7 @@ mod tests {
 
         // Scattered layout: the whole-file read is one GET per frame, and all
         // its internal seams collapse into one self-pair bump.
+        evict_decoded_extents(&store);
         let before = store.segments.read_calls();
         store.read(1, 0, len).await.unwrap();
         assert_eq!(store.segments.read_calls() - before, per_file);
@@ -1684,6 +1687,7 @@ mod tests {
         // Second episode in a later round arms the seam; the repack still
         // waits out the write-cold gate, then fires.
         store.reclaim_segments(Utc::now(), None).await.unwrap();
+        evict_decoded_extents(&store);
         store.read(1, 0, len).await.unwrap();
         let (_, relocated) = store.reclaim_segments(Utc::now(), None).await.unwrap();
         assert_eq!(relocated, 0, "hot but not write-cold: held back");
@@ -1702,6 +1706,7 @@ mod tests {
         assert_ne!(frameloc_of(&store, &db, 1, 0).await.unwrap().segid, s);
 
         // Re-grouped: the file now reads back correct in a single GET.
+        evict_decoded_extents(&store);
         let before = store.segments.read_calls();
         let got = store.read(1, 0, len).await.unwrap();
         assert_eq!(store.segments.read_calls() - before, 1, "seam dissolved");
@@ -2090,6 +2095,7 @@ mod tests {
 
         // One read fans out across the two youngest segments -> nominated.
         let (last, prev) = (n as u64 - 1, n as u64 - 2);
+        evict_decoded_extents(&store);
         store
             .read(1, prev * 2 * EXTENT_SIZE as u64, 4 * EXTENT_SIZE as u64)
             .await
@@ -2123,6 +2129,7 @@ mod tests {
             write_extent(&store, &db, extent, &[extent as u8 + 1; EXTENT_SIZE]).await;
             store.seal_open().await.unwrap();
         }
+        evict_decoded_extents(&store);
         store.read(1, 0, 2 * EXTENT_SIZE as u64).await.unwrap();
         assert_eq!(store.nominations.lock().unwrap().set.len(), 2);
 
@@ -2170,6 +2177,7 @@ mod tests {
         let seg_a = frameloc_of(&store, &db, 1, 0).await.unwrap().segid;
         let seg_b = frameloc_of(&store, &db, 1, per_seg).await.unwrap().segid;
 
+        evict_decoded_extents(&store);
         store
             .read(1, 0, 2 * per_seg * EXTENT_SIZE as u64)
             .await
@@ -2258,7 +2266,10 @@ mod tests {
         store.seal_open().await.unwrap();
 
         // Nominate all 40 hot segments (the per-call cap forces three reads).
-        for start in [0u64, 16, 32] {
+        // Walk backwards so one slice's sequential read-ahead cannot warm the
+        // next slice after its explicit cache eviction.
+        for start in [32u64, 16, 0] {
+            evict_decoded_extents(&store);
             let len = (hot_n - start).min(NOMINATE_PER_CALL_CAP as u64);
             store
                 .read(1, start * EXTENT_SIZE as u64, len * EXTENT_SIZE as u64)

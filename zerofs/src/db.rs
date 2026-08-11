@@ -122,6 +122,8 @@ pub struct StatsDelta {
     pub inodes: i64,
 }
 
+pub(crate) type DirectoryEntryCacheUpdate = ((u64, Bytes), Option<(u64, u64)>);
+
 /// Transaction for batching database writes.
 ///
 /// Ops are recorded as a flat vector so the commit coordinator can replay
@@ -129,7 +131,7 @@ pub struct StatsDelta {
 pub struct Transaction {
     ops: Vec<TxOp>,
     inode_cache_updates: Vec<(u64, Option<Inode>)>,
-    directory_entry_cache_updates: Vec<((u64, Bytes), Option<(u64, u64)>)>,
+    directory_entry_cache_updates: Vec<DirectoryEntryCacheUpdate>,
     stats_deltas: Vec<StatsDelta>,
     /// Per-segment counter adjustments (segcount key, `(live_delta, total_delta)`),
     /// aggregated by the commit worker into one absolute `(live, total)` per
@@ -212,9 +214,7 @@ impl Transaction {
             .push(((dir_id, name), entry));
     }
 
-    pub(crate) fn take_directory_entry_cache_updates(
-        &mut self,
-    ) -> Vec<((u64, Bytes), Option<(u64, u64)>)> {
+    pub(crate) fn take_directory_entry_cache_updates(&mut self) -> Vec<DirectoryEntryCacheUpdate> {
         std::mem::take(&mut self.directory_entry_cache_updates)
     }
 

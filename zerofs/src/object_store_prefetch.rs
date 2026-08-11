@@ -702,8 +702,18 @@ impl PrefetchingObjectStore {
                     None => WindowPlan::Covered,
                 };
             }
-        } else if let Some(fut) = map.get(&PartKey::new(location, start)) {
-            return WindowPlan::Join(fut.clone());
+        } else {
+            let key = PartKey::new(location, start);
+            if let Some(fut) = map.get(&key) {
+                return WindowPlan::Join(fut.clone());
+            }
+            // The caller's initial HybridCache lookup may have begun as a
+            // disk miss while a window fetch inserted this part and dropped
+            // its registry guard. Recheck under the planner lock so demand
+            // does not lead a redundant one-part GET.
+            if ctx.parts.contains(&key) {
+                return WindowPlan::Covered;
+            }
         }
 
         let mut end = start + 1;
@@ -1021,9 +1031,18 @@ impl PrefetchingObjectStore {
                 {
                     WindowPlan::Join(shared) => (shared, None),
                     WindowPlan::Lead { shared, guard, .. } => (shared, Some(guard)),
-                    // Unreachable without front-trimming; handle it as a
-                    // direct fetch anyway.
+                    // A window may have populated the part after our initial
+                    // cache miss. Read it once more; if it was concurrently
+                    // evicted (or contains was stale), fall back to one exact
+                    // part rather than widening the request.
                     WindowPlan::Covered => {
+                        if let Ok(Some(entry)) = ctx.parts.get(&key).await {
+                            let bytes = entry.value().clone();
+                            if range_in_part.end <= bytes.len() {
+                                return Ok(bytes.slice(range_in_part));
+                            }
+                            ctx.parts.remove(&key);
+                        }
                         return Self::fetch_single_part(&ctx, &location, part_id, range_in_part)
                             .await;
                     }
@@ -1678,6 +1697,12 @@ mod tests {
                 .skip(1)
                 .all(|range| range.end - range.start <= 15 * MIB as u64),
             "a proven-sequential GET exceeded one 64-request SFTP wave: {bounded:?}"
+        );
+        let mut ordered = bounded.clone();
+        ordered.sort_unstable_by_key(|range| range.start);
+        assert!(
+            ordered.windows(2).all(|pair| pair[0].end <= pair[1].start),
+            "sequential SFTP windows overlapped: {bounded:?}"
         );
         assert!(
             bounded.len() <= 9,
@@ -3059,6 +3084,33 @@ mod tests {
             vec![GetRange::Bounded(0..part_size as u64)],
             "window must be end-trimmed at the first cached part"
         );
+    }
+
+    // A HybridCache lookup can begin as a disk miss while an in-flight window
+    // concurrently inserts the requested part and then leaves the fetch
+    // registry. Demand planning must recheck the cache instead of leading a
+    // duplicate one-part backend GET.
+    #[tokio::test]
+    async fn demand_plan_rechecks_part_cached_after_initial_miss() {
+        let part_size = 1024;
+        let mem = Arc::new(InMemory::new());
+        let path = Path::from("demand-cache-race");
+        let body = Bytes::from(vec![0x5a; part_size]);
+        mem.put(&path, body.clone().into()).await.unwrap();
+        let (store, _dir) = store_over(mem, part_size).await;
+        let ctx = store.ctx();
+        let key = PartKey::new(&path, 0);
+
+        assert!(ctx.parts.get(&key).await.unwrap().is_none());
+        ctx.parts.insert(key, body);
+
+        match PrefetchingObjectStore::plan_window(&ctx, &path, 0, 8, None, 0) {
+            WindowPlan::Covered => {}
+            WindowPlan::Lead { .. } => {
+                panic!("a newly cached demand part must not lead a duplicate GET")
+            }
+            WindowPlan::Join(_) => panic!("no fetch was registered for the cached part"),
+        }
     }
 
     // A head eviction mid-stream must not re-GET bytes the parts cache already
