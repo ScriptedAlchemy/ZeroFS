@@ -1,7 +1,7 @@
 use crate::writeback::admission::DiskAdmission;
 use crate::writeback::journal::Journal;
 use crate::writeback::journaler::{LocalBarrier, LocalBarrierError};
-use crate::writeback::model::{MutationKind, MutationMode, MutationRecord, Sequence};
+use crate::writeback::model::{FenceClass, MutationKind, MutationMode, MutationRecord, Sequence};
 use crate::writeback::overlay::OverlayIndex;
 use bytes::Bytes;
 use object_store::path::Path;
@@ -296,6 +296,12 @@ fn collect_disjoint_batch(
         if record.sequence != expected || batch.len() == limit {
             break;
         }
+        if record.fence == FenceClass::Fence {
+            if batch.is_empty() {
+                batch.push(record.clone());
+            }
+            break;
+        }
         let keys = touched_keys(record);
         if keys.iter().any(|key| touched.contains(key)) {
             break;
@@ -431,5 +437,66 @@ fn generic_error(message: impl Into<String>) -> object_store::Error {
     object_store::Error::Generic {
         store: "ZeroFSWritebackRemote",
         source: message.into().into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::collect_disjoint_batch;
+    use crate::writeback::model::{FenceClass, LocalEtag, MutationKind, MutationRecord};
+    use uuid::Uuid;
+
+    fn record(sequence: u64, path: &str, fence: FenceClass) -> MutationRecord {
+        MutationRecord {
+            format_version: 1,
+            sequence,
+            operation_id: Uuid::from_u128(sequence as u128),
+            path: path.to_owned(),
+            kind: MutationKind::Delete,
+            local_etag: LocalEtag::new(Uuid::nil(), sequence),
+            accepted_at_unix_ms: sequence,
+            remote_predecessor_etag: None,
+            remote_result_etag: None,
+            fence,
+            retry_count: 0,
+            last_error: None,
+        }
+    }
+
+    #[test]
+    fn remote_batches_stop_before_and_after_ordering_fences() {
+        let records = vec![
+            record(1, "segments/1", FenceClass::ImmutableCreate),
+            record(2, "segments/2", FenceClass::ImmutableCreate),
+            record(3, "manifest/current", FenceClass::Fence),
+            record(4, "segments/4", FenceClass::ImmutableCreate),
+        ];
+
+        let first = collect_disjoint_batch(&records, 1, 8);
+        assert_eq!(
+            first
+                .iter()
+                .map(|record| record.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+
+        let fence = collect_disjoint_batch(&records, 3, 8);
+        assert_eq!(
+            fence
+                .iter()
+                .map(|record| record.sequence)
+                .collect::<Vec<_>>(),
+            vec![3]
+        );
+
+        let after = collect_disjoint_batch(&records, 4, 8);
+        assert_eq!(
+            after
+                .iter()
+                .map(|record| record.sequence)
+                .collect::<Vec<_>>(),
+            vec![4]
+        );
     }
 }

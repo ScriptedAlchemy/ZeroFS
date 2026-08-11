@@ -450,7 +450,7 @@ impl WritebackObjectStore {
             remote_predecessor_etag: None,
             remote_result_etag: None,
             fence: if mode == MutationMode::Create {
-                FenceClass::ImmutableCreate
+                immutable_data_fence(&to)
             } else {
                 FenceClass::Fence
             },
@@ -1157,7 +1157,12 @@ fn validate_put_mode(
     visible: Option<VisibleVersion>,
 ) -> object_store::Result<(MutationMode, Option<String>, Option<String>, FenceClass)> {
     match mode {
-        PutMode::Overwrite => Ok((MutationMode::Overwrite, None, None, FenceClass::Fence)),
+        PutMode::Overwrite => Ok((
+            MutationMode::Overwrite,
+            None,
+            None,
+            immutable_data_fence(location),
+        )),
         PutMode::Create => {
             if visible.is_some() {
                 return Err(object_store::Error::AlreadyExists {
@@ -1169,7 +1174,7 @@ fn validate_put_mode(
                 MutationMode::Create,
                 None,
                 None,
-                FenceClass::ImmutableCreate,
+                immutable_data_fence(location),
             ))
         }
         PutMode::Update(expected) => {
@@ -1195,6 +1200,50 @@ fn validate_put_mode(
             ))
         }
     }
+}
+
+fn immutable_data_fence(location: &Path) -> FenceClass {
+    let parts = location
+        .parts()
+        .map(|part| part.as_ref().to_owned())
+        .collect::<Vec<_>>();
+
+    if let Some(index) = parts.iter().rposition(|part| part == "segments") {
+        let tail = &parts[index + 1..];
+        if tail.len() == 3
+            && is_fixed_hex(&tail[0], 2)
+            && is_fixed_hex(&tail[1], 16)
+            && is_fixed_hex(&tail[2], 16)
+        {
+            return FenceClass::ImmutableCreate;
+        }
+    }
+
+    if parts.len() >= 2 {
+        let directory = parts[parts.len() - 2].as_str();
+        let filename = parts[parts.len() - 1].as_str();
+        let immutable_sst = match directory {
+            "wal" => filename.strip_suffix(".sst").is_some_and(|stem| {
+                stem.len() == 20 && stem.bytes().all(|byte| byte.is_ascii_digit())
+            }),
+            "compacted" => filename.strip_suffix(".sst").is_some_and(|stem| {
+                stem.len() == 26
+                    && stem
+                        .bytes()
+                        .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+            }),
+            _ => false,
+        };
+        if immutable_sst {
+            return FenceClass::ImmutableCreate;
+        }
+    }
+
+    FenceClass::Fence
+}
+
+fn is_fixed_hex(value: &str, len: usize) -> bool {
+    value.len() == len && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn version_matches(expected: &UpdateVersion, visible: &VisibleVersion) -> bool {
@@ -1232,11 +1281,11 @@ fn generic_error(message: impl Into<String>) -> object_store::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::WritebackObjectStore;
+    use super::{WritebackObjectStore, validate_put_mode};
     use crate::fault_store::{FaultControls, FaultStore};
     use crate::writeback::config::{AckMode, ShutdownFlush, WritebackSettings};
     use crate::writeback::journal::Journal;
-    use crate::writeback::model::JournalIdentity;
+    use crate::writeback::model::{FenceClass, JournalIdentity};
     use bytes::Bytes;
     use futures::{StreamExt, stream};
     use object_store::memory::InMemory;
@@ -1252,6 +1301,47 @@ mod tests {
 
     async fn test_store() -> (WritebackObjectStore, Arc<InMemory>, tempfile::TempDir) {
         test_store_with_remote_drain(false).await
+    }
+
+    #[test]
+    fn only_recognized_immutable_data_objects_bypass_remote_fences() {
+        let cases = [
+            (
+                "zerofs/pilot/segments/0a/0000000000000001/0000000000000002",
+                PutMode::Overwrite,
+                FenceClass::ImmutableCreate,
+            ),
+            (
+                "zerofs/pilot/wal/00000000000000000042.sst",
+                PutMode::Create,
+                FenceClass::ImmutableCreate,
+            ),
+            (
+                "zerofs/pilot/compacted/01KZS4K6C1G11KM91DJ3YA9TJE.sst",
+                PutMode::Create,
+                FenceClass::ImmutableCreate,
+            ),
+            (
+                "zerofs/pilot/manifest/00000000000000000134.manifest",
+                PutMode::Create,
+                FenceClass::Fence,
+            ),
+            (
+                "zerofs/pilot/gc/manifest.boundary",
+                PutMode::Create,
+                FenceClass::Fence,
+            ),
+            (
+                "zerofs/pilot/unknown/object",
+                PutMode::Create,
+                FenceClass::Fence,
+            ),
+        ];
+
+        for (path, mode, expected) in cases {
+            let (_, _, _, actual) = validate_put_mode(&Path::from(path), &mode, None).unwrap();
+            assert_eq!(actual, expected, "classification for {path}");
+        }
     }
 
     async fn test_store_with_remote_drain(
@@ -2063,7 +2153,9 @@ mod tests {
             async move {
                 store
                     .put(
-                        &Path::from(format!("batch/{index}")),
+                        &Path::from(format!(
+                            "segments/{index:02x}/0000000000000001/{index:016x}"
+                        )),
                         Bytes::from(vec![index; 1024]).into(),
                     )
                     .await

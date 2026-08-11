@@ -268,6 +268,8 @@ fn record_writeback_status(status: &WritebackStatus) {
     gauge!("zerofs_writeback_local_lag_operations")
         .set(status.accepted_seq.saturating_sub(status.local_seq) as f64);
     gauge!("zerofs_writeback_remote_lag_operations")
+        .set(status.accepted_seq.saturating_sub(status.remote_seq) as f64);
+    gauge!("zerofs_writeback_ssd_remote_lag_operations")
         .set(status.local_seq.saturating_sub(status.remote_seq) as f64);
     gauge!("zerofs_writeback_oldest_pending_age_seconds")
         .set(status.oldest_pending_age_ms as f64 / 1_000.0);
@@ -357,7 +359,8 @@ mod tests {
             "zerofs_writeback_dirty_ram_capacity_bytes 16",
             "zerofs_writeback_dirty_ssd_bytes 3",
             "zerofs_writeback_dirty_ssd_capacity_bytes 512",
-            "zerofs_writeback_remote_lag_operations 3",
+            "zerofs_writeback_remote_lag_operations 4",
+            "zerofs_writeback_ssd_remote_lag_operations 3",
             "zerofs_writeback_oldest_pending_age_seconds 6",
             "zerofs_writeback_remote_bytes_completed_total 7",
             "zerofs_writeback_retries_total 2",
