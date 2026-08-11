@@ -1,12 +1,16 @@
-use crate::sftp_object_store::SftpCapabilities;
+use crate::sftp_object_store::{OBJECT_HEADER_LEN, ObjectHeader, SftpCapabilities, decode_header};
 use async_trait::async_trait;
+use bytes::Bytes;
+use futures::StreamExt;
 use std::collections::VecDeque;
 use std::fmt;
 use std::io::Write;
+use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use tokio::io::{AsyncRead, AsyncWrite};
+use std::time::SystemTime;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, SeekFrom};
 use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore, oneshot};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,11 +32,64 @@ pub enum TransportError {
     Close(String),
     #[error("SFTP session pool is closed")]
     PoolClosed,
+    #[error("remote path not found: {0}")]
+    NotFound(String),
+    #[error("remote path permission denied: {0}")]
+    PermissionDenied(String),
+    #[error("SFTP operation failed: {0}")]
+    Operation(String),
+    #[error("remote object is corrupt: {0}")]
+    CorruptObject(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteEntryKind {
+    File,
+    Directory,
+    Symlink,
+    Other,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteDirectoryEntry {
+    pub filename: PathBuf,
+    pub kind: RemoteEntryKind,
+}
+
+#[derive(Debug, Clone)]
+pub struct RemoteObjectRead {
+    pub header: ObjectHeader,
+    pub modified: SystemTime,
+    pub range: Range<u64>,
+    pub payload: Bytes,
 }
 
 #[async_trait]
 pub trait TransportSession: fmt::Debug + Send + Sync + 'static {
     fn capabilities(&self) -> SftpCapabilities;
+    async fn read_object(
+        &mut self,
+        _path: &std::path::Path,
+        _range: Option<object_store::GetRange>,
+        _head: bool,
+    ) -> Result<RemoteObjectRead, TransportError> {
+        Err(TransportError::Operation(
+            "read_object is not implemented by this session".to_owned(),
+        ))
+    }
+    async fn list_directory(
+        &mut self,
+        _path: &std::path::Path,
+    ) -> Result<Vec<RemoteDirectoryEntry>, TransportError> {
+        Err(TransportError::Operation(
+            "list_directory is not implemented by this session".to_owned(),
+        ))
+    }
+    async fn remove_file(&mut self, _path: &std::path::Path) -> Result<(), TransportError> {
+        Err(TransportError::Operation(
+            "remove_file is not implemented by this session".to_owned(),
+        ))
+    }
     async fn close(self: Box<Self>) -> Result<(), TransportError>;
 }
 
@@ -306,6 +363,151 @@ impl TransportSession for OpenSshTransportSession {
         }
     }
 
+    async fn read_object(
+        &mut self,
+        path: &std::path::Path,
+        requested_range: Option<object_store::GetRange>,
+        head: bool,
+    ) -> Result<RemoteObjectRead, TransportError> {
+        let sftp = self.sftp.as_ref().expect("open transport owns SFTP client");
+        let mut file = sftp
+            .open(path)
+            .await
+            .map_err(|error| map_sftp_error(path, error))?;
+        let metadata = file
+            .metadata()
+            .await
+            .map_err(|error| map_sftp_error(path, error))?;
+        if !metadata.file_type().is_some_and(|kind| kind.is_file()) {
+            return Err(TransportError::CorruptObject(format!(
+                "{} is not a regular file",
+                path.display()
+            )));
+        }
+        let physical_len = metadata.len().ok_or_else(|| {
+            TransportError::CorruptObject(format!("{} has no physical length", path.display()))
+        })?;
+        let modified = metadata.modified().ok_or_else(|| {
+            TransportError::CorruptObject(format!("{} has no modification time", path.display()))
+        })?;
+
+        let file = openssh_sftp_client::file::TokioCompatFile::new(file);
+        tokio::pin!(file);
+        let mut encoded_header = [0_u8; OBJECT_HEADER_LEN];
+        file.as_mut()
+            .read_exact(&mut encoded_header)
+            .await
+            .map_err(|error| {
+                TransportError::Operation(format!(
+                    "failed to read {} header: {error}",
+                    path.display()
+                ))
+            })?;
+        let header = decode_header(&encoded_header).map_err(|error| {
+            TransportError::CorruptObject(format!("{}: {error}", path.display()))
+        })?;
+        let expected_physical_len = (OBJECT_HEADER_LEN as u64)
+            .checked_add(header.logical_len)
+            .ok_or_else(|| {
+                TransportError::CorruptObject(format!(
+                    "{} logical length overflows its physical representation",
+                    path.display()
+                ))
+            })?;
+        if physical_len != expected_physical_len {
+            return Err(TransportError::CorruptObject(format!(
+                "{} physical length {physical_len} does not match expected {expected_physical_len}",
+                path.display()
+            )));
+        }
+
+        let range = match requested_range {
+            Some(range) => range.as_range(header.logical_len).map_err(|error| {
+                TransportError::Operation(format!(
+                    "invalid logical range for {}: {error}",
+                    path.display()
+                ))
+            })?,
+            None => 0..header.logical_len,
+        };
+        let payload = if head || range.is_empty() {
+            Bytes::new()
+        } else {
+            let physical_start = (OBJECT_HEADER_LEN as u64)
+                .checked_add(range.start)
+                .ok_or_else(|| {
+                    TransportError::CorruptObject(format!(
+                        "{} physical read offset overflow",
+                        path.display()
+                    ))
+                })?;
+            file.as_mut()
+                .seek(SeekFrom::Start(physical_start))
+                .await
+                .map_err(|error| {
+                    TransportError::Operation(format!("failed to seek {}: {error}", path.display()))
+                })?;
+            let len: usize = (range.end - range.start).try_into().map_err(|_| {
+                TransportError::Operation(format!(
+                    "requested range for {} does not fit memory",
+                    path.display()
+                ))
+            })?;
+            let mut payload = vec![0_u8; len];
+            file.as_mut()
+                .read_exact(&mut payload)
+                .await
+                .map_err(|error| {
+                    TransportError::Operation(format!(
+                        "short read from {}: {error}",
+                        path.display()
+                    ))
+                })?;
+            Bytes::from(payload)
+        };
+        Ok(RemoteObjectRead {
+            header,
+            modified: modified.as_system_time(),
+            range,
+            payload,
+        })
+    }
+
+    async fn list_directory(
+        &mut self,
+        path: &std::path::Path,
+    ) -> Result<Vec<RemoteDirectoryEntry>, TransportError> {
+        let sftp = self.sftp.as_ref().expect("open transport owns SFTP client");
+        let mut fs = sftp.fs();
+        let directory = fs
+            .open_dir(path)
+            .await
+            .map_err(|error| map_sftp_error(path, error))?;
+        let entries = directory.read_dir();
+        tokio::pin!(entries);
+        let mut result = Vec::new();
+        while let Some(entry) = entries.as_mut().next().await {
+            let entry = entry.map_err(|error| map_sftp_error(path, error))?;
+            let filename = entry.filename().to_path_buf();
+            let kind = match entry.file_type() {
+                Some(kind) if kind.is_file() => RemoteEntryKind::File,
+                Some(kind) if kind.is_dir() => RemoteEntryKind::Directory,
+                Some(kind) if kind.is_symlink() => RemoteEntryKind::Symlink,
+                _ => RemoteEntryKind::Other,
+            };
+            result.push(RemoteDirectoryEntry { filename, kind });
+        }
+        Ok(result)
+    }
+
+    async fn remove_file(&mut self, path: &std::path::Path) -> Result<(), TransportError> {
+        let sftp = self.sftp.as_ref().expect("open transport owns SFTP client");
+        sftp.fs()
+            .remove_file(path)
+            .await
+            .map_err(|error| map_sftp_error(path, error))
+    }
+
     async fn close(mut self: Box<Self>) -> Result<(), TransportError> {
         self.sftp
             .take()
@@ -313,6 +515,20 @@ impl TransportSession for OpenSshTransportSession {
             .close()
             .await
             .map_err(|_| TransportError::Close("OpenSSH SFTP shutdown failed".to_owned()))
+    }
+}
+
+fn map_sftp_error(path: &std::path::Path, error: openssh_sftp_client::Error) -> TransportError {
+    match error {
+        openssh_sftp_client::Error::SftpError(
+            openssh_sftp_client::error::SftpErrorKind::NoSuchFile,
+            _,
+        ) => TransportError::NotFound(path.display().to_string()),
+        openssh_sftp_client::Error::SftpError(
+            openssh_sftp_client::error::SftpErrorKind::PermDenied,
+            _,
+        ) => TransportError::PermissionDenied(path.display().to_string()),
+        error => TransportError::Operation(format!("{}: {error}", path.display())),
     }
 }
 
@@ -547,6 +763,41 @@ impl SessionLease {
             .capabilities()
     }
 
+    pub async fn read_object(
+        &mut self,
+        path: &std::path::Path,
+        range: Option<object_store::GetRange>,
+        head: bool,
+    ) -> Result<RemoteObjectRead, TransportError> {
+        self.session
+            .as_mut()
+            .expect("lease always owns a session until completion")
+            .transport
+            .read_object(path, range, head)
+            .await
+    }
+
+    pub async fn list_directory(
+        &mut self,
+        path: &std::path::Path,
+    ) -> Result<Vec<RemoteDirectoryEntry>, TransportError> {
+        self.session
+            .as_mut()
+            .expect("lease always owns a session until completion")
+            .transport
+            .list_directory(path)
+            .await
+    }
+
+    pub async fn remove_file(&mut self, path: &std::path::Path) -> Result<(), TransportError> {
+        self.session
+            .as_mut()
+            .expect("lease always owns a session until completion")
+            .transport
+            .remove_file(path)
+            .await
+    }
+
     pub async fn complete(mut self) -> Result<(), TransportError> {
         let session = self
             .session
@@ -626,10 +877,11 @@ impl Drop for SessionLease {
 mod tests {
     use super::{
         LeaseFinishError, OpenSshSessionFactory, OpenSshTransportSession, OperationKind,
-        SessionDisposition, SessionFactory, SftpSessionPool, TransportError, TransportSession,
+        RemoteEntryKind, SessionDisposition, SessionFactory, SftpSessionPool, TransportError,
+        TransportSession,
     };
     use crate::config::SftpEndpoint;
-    use crate::sftp_object_store::SftpCapabilities;
+    use crate::sftp_object_store::{ObjectHeader, SftpCapabilities, encode_header};
     use async_trait::async_trait;
     use std::fmt;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1345,7 +1597,19 @@ mod tests {
             );
             return;
         };
+        let root = tempfile::tempdir().unwrap();
+        let generation = uuid::Uuid::from_u128(0x00112233_4455_6677_8899_aabbccddeeff);
+        let mut object = encode_header(ObjectHeader {
+            generation,
+            logical_len: 11,
+        })
+        .to_vec();
+        object.extend_from_slice(b"hello world");
+        std::fs::write(root.path().join("object.bin"), object).unwrap();
+        std::fs::create_dir(root.path().join("nested")).unwrap();
+
         let mut child = tokio::process::Command::new(server)
+            .current_dir(root.path())
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .kill_on_drop(true)
@@ -1354,7 +1618,7 @@ mod tests {
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
 
-        let session = OpenSshTransportSession::from_streams(stdin, stdout)
+        let mut session = OpenSshTransportSession::from_streams(stdin, stdout)
             .await
             .expect("complete the real SFTP extension handshake");
         assert_eq!(
@@ -1365,6 +1629,35 @@ mod tests {
                 posix_rename: true,
             }
         );
+        let read = session
+            .read_object(
+                std::path::Path::new("object.bin"),
+                Some(object_store::GetRange::Bounded(6..11)),
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(read.header.generation, generation);
+        assert_eq!(read.header.logical_len, 11);
+        assert_eq!(read.range, 6..11);
+        assert_eq!(read.payload.as_ref(), b"world");
+        let entries = session
+            .list_directory(std::path::Path::new("."))
+            .await
+            .unwrap();
+        assert!(entries.iter().any(|entry| {
+            entry.filename == std::path::Path::new("object.bin")
+                && entry.kind == RemoteEntryKind::File
+        }));
+        assert!(entries.iter().any(|entry| {
+            entry.filename == std::path::Path::new("nested")
+                && entry.kind == RemoteEntryKind::Directory
+        }));
+        session
+            .remove_file(std::path::Path::new("object.bin"))
+            .await
+            .unwrap();
+        assert!(!root.path().join("object.bin").exists());
         Box::new(session).close().await.unwrap();
         assert!(child.wait().await.unwrap().success());
     }

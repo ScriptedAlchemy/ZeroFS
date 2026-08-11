@@ -1,7 +1,17 @@
 use async_trait::async_trait;
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
+use futures::StreamExt;
+use futures::stream::{self, BoxStream};
+use object_store::path::{Path as ObjectPath, PathPart};
+use object_store::{
+    Attributes, CopyOptions, Extensions, GetOptions, GetResult, GetResultPayload, ListResult,
+    MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload,
+    PutResult,
+};
+use std::collections::BTreeSet;
 use std::collections::HashMap;
-use std::fmt::Debug;
+use std::fmt::{self, Debug};
 use std::path::{Path as FilePath, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex as StdMutex, Weak};
 use tokio::sync::Mutex as AsyncMutex;
@@ -299,13 +309,485 @@ impl Drop for StagingCleanup {
     }
 }
 
+const STORE_NAME: &str = "SFTP";
+
+#[derive(Clone)]
+pub struct SftpObjectStore {
+    pool: crate::sftp_transport::SftpSessionPool,
+    prefix: ObjectPath,
+}
+
+impl SftpObjectStore {
+    pub fn new(
+        pool: crate::sftp_transport::SftpSessionPool,
+        prefix: ObjectPath,
+    ) -> object_store::Result<Self> {
+        if prefix.is_root() {
+            return Err(generic_error(
+                "the SFTP pilot requires a non-root dedicated prefix",
+            ));
+        }
+        Ok(Self { pool, prefix })
+    }
+
+    pub fn prefix(&self) -> &ObjectPath {
+        &self.prefix
+    }
+
+    fn validate_location(
+        &self,
+        location: &ObjectPath,
+        allow_prefix: bool,
+    ) -> object_store::Result<()> {
+        if !location.prefix_matches(&self.prefix) || (!allow_prefix && location == &self.prefix) {
+            return Err(generic_error(format!(
+                "object path {location} is outside the configured SFTP prefix {}",
+                self.prefix
+            )));
+        }
+        Ok(())
+    }
+
+    fn remote_path(
+        &self,
+        location: &ObjectPath,
+        allow_prefix: bool,
+    ) -> object_store::Result<PathBuf> {
+        self.validate_location(location, allow_prefix)?;
+        let mut path = PathBuf::new();
+        for part in location.parts() {
+            let part = part.as_ref();
+            if part.is_empty() || matches!(part, "." | "..") {
+                return Err(generic_error(format!(
+                    "unsafe SFTP path component in {location}"
+                )));
+            }
+            path.push(part);
+        }
+        Ok(path)
+    }
+
+    async fn read_remote(
+        &self,
+        location: &ObjectPath,
+        options: &GetOptions,
+    ) -> object_store::Result<crate::sftp_transport::RemoteObjectRead> {
+        if options.version.is_some() {
+            return Err(object_store::Error::NotSupported {
+                source: "SFTP object versions are not exposed separately from ETags".into(),
+            });
+        }
+        let remote = self.remote_path(location, false)?;
+        let mut lease = self
+            .pool
+            .checkout(if options.head {
+                crate::sftp_transport::OperationKind::Metadata
+            } else {
+                crate::sftp_transport::OperationKind::Read
+            })
+            .await
+            .map_err(transport_error)?;
+        let operation = lease
+            .read_object(&remote, options.range.clone(), options.head)
+            .await;
+        finish_lease(lease, operation)
+            .await
+            .map_err(transport_error)
+    }
+
+    async fn directory_snapshot(
+        &self,
+        location: &ObjectPath,
+    ) -> object_store::Result<Vec<crate::sftp_transport::RemoteDirectoryEntry>> {
+        let remote = self.remote_path(location, true)?;
+        let mut lease = self
+            .pool
+            .checkout(crate::sftp_transport::OperationKind::Metadata)
+            .await
+            .map_err(transport_error)?;
+        let operation = lease.list_directory(&remote).await;
+        finish_lease(lease, operation)
+            .await
+            .map_err(transport_error)
+    }
+
+    async fn metadata(&self, location: &ObjectPath) -> object_store::Result<ObjectMeta> {
+        let options = GetOptions {
+            head: true,
+            ..Default::default()
+        };
+        let object = self.read_remote(location, &options).await?;
+        Ok(object_meta(location.clone(), &object))
+    }
+
+    async fn collect_recursive(&self, prefix: ObjectPath) -> object_store::Result<Vec<ObjectMeta>> {
+        self.validate_location(&prefix, true)?;
+        let mut pending = vec![prefix];
+        let mut objects = Vec::new();
+        while let Some(directory) = pending.pop() {
+            let entries = match self.directory_snapshot(&directory).await {
+                Ok(entries) => entries,
+                Err(object_store::Error::NotFound { .. }) => continue,
+                Err(error) => return Err(error),
+            };
+            for entry in entries {
+                let Some(filename) = entry.filename.to_str() else {
+                    return Err(generic_error("SFTP listing returned a non-UTF-8 filename"));
+                };
+                if matches!(filename, "." | "..") || is_staging_name(FilePath::new(filename)) {
+                    continue;
+                }
+                let part = PathPart::parse(filename)
+                    .map_err(|error| generic_error(format!("invalid SFTP filename: {error}")))?;
+                let child = directory.clone().join(part);
+                match entry.kind {
+                    crate::sftp_transport::RemoteEntryKind::Directory => pending.push(child),
+                    crate::sftp_transport::RemoteEntryKind::File => {
+                        objects.push(self.metadata(&child).await?)
+                    }
+                    crate::sftp_transport::RemoteEntryKind::Symlink => {
+                        return Err(generic_error(format!(
+                            "refusing to follow SFTP symlink {child}"
+                        )));
+                    }
+                    crate::sftp_transport::RemoteEntryKind::Other => {
+                        return Err(generic_error(format!(
+                            "refusing non-regular SFTP entry {child}"
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(objects)
+    }
+
+    async fn remove_remote(&self, location: &ObjectPath) -> object_store::Result<()> {
+        let remote = self.remote_path(location, false)?;
+        let mut lease = self
+            .pool
+            .checkout(crate::sftp_transport::OperationKind::Write)
+            .await
+            .map_err(transport_error)?;
+        let operation = lease.remove_file(&remote).await;
+        finish_lease(lease, operation)
+            .await
+            .map_err(transport_error)
+    }
+}
+
+impl fmt::Debug for SftpObjectStore {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SftpObjectStore")
+            .field("prefix", &self.prefix)
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Display for SftpObjectStore {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "SftpObjectStore(prefix={})", self.prefix)
+    }
+}
+
+#[async_trait]
+impl ObjectStore for SftpObjectStore {
+    async fn put_opts(
+        &self,
+        _location: &ObjectPath,
+        _payload: PutPayload,
+        _opts: PutOptions,
+    ) -> object_store::Result<PutResult> {
+        Err(not_implemented("put_opts"))
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        _location: &ObjectPath,
+        _opts: PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        Err(not_implemented("put_multipart_opts"))
+    }
+
+    async fn get_opts(
+        &self,
+        location: &ObjectPath,
+        options: GetOptions,
+    ) -> object_store::Result<GetResult> {
+        let object = self.read_remote(location, &options).await?;
+        let meta = object_meta(location.clone(), &object);
+        options.check_preconditions(&meta)?;
+        let payload = object.payload;
+        Ok(GetResult {
+            payload: GetResultPayload::Stream(stream::once(async move { Ok(payload) }).boxed()),
+            meta,
+            range: object.range,
+            attributes: Attributes::default(),
+            extensions: Extensions::default(),
+        })
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, object_store::Result<ObjectPath>>,
+    ) -> BoxStream<'static, object_store::Result<ObjectPath>> {
+        let store = self.clone();
+        locations
+            .then(move |location| {
+                let store = store.clone();
+                async move {
+                    let location = location?;
+                    store.remove_remote(&location).await?;
+                    Ok(location)
+                }
+            })
+            .boxed()
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&ObjectPath>,
+    ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        let store = self.clone();
+        let prefix = prefix.cloned().unwrap_or_else(|| self.prefix.clone());
+        stream::once(async move {
+            match store.collect_recursive(prefix).await {
+                Ok(objects) => objects.into_iter().map(Ok).collect::<Vec<_>>(),
+                Err(error) => vec![Err(error)],
+            }
+        })
+        .flat_map(stream::iter)
+        .boxed()
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&ObjectPath>,
+    ) -> object_store::Result<ListResult> {
+        let directory = prefix.cloned().unwrap_or_else(|| self.prefix.clone());
+        let entries = match self.directory_snapshot(&directory).await {
+            Ok(entries) => entries,
+            Err(object_store::Error::NotFound { .. }) => Vec::new(),
+            Err(error) => return Err(error),
+        };
+        let mut common_prefixes = BTreeSet::new();
+        let mut objects = Vec::new();
+        for entry in entries {
+            let Some(filename) = entry.filename.to_str() else {
+                return Err(generic_error("SFTP listing returned a non-UTF-8 filename"));
+            };
+            if matches!(filename, "." | "..") || is_staging_name(FilePath::new(filename)) {
+                continue;
+            }
+            let part = PathPart::parse(filename)
+                .map_err(|error| generic_error(format!("invalid SFTP filename: {error}")))?;
+            let child = directory.clone().join(part);
+            match entry.kind {
+                crate::sftp_transport::RemoteEntryKind::Directory => {
+                    common_prefixes.insert(child);
+                }
+                crate::sftp_transport::RemoteEntryKind::File => {
+                    objects.push(self.metadata(&child).await?);
+                }
+                crate::sftp_transport::RemoteEntryKind::Symlink => {
+                    return Err(generic_error(format!(
+                        "refusing to follow SFTP symlink {child}"
+                    )));
+                }
+                crate::sftp_transport::RemoteEntryKind::Other => {
+                    return Err(generic_error(format!(
+                        "refusing non-regular SFTP entry {child}"
+                    )));
+                }
+            }
+        }
+        Ok(ListResult {
+            common_prefixes: common_prefixes.into_iter().collect(),
+            objects,
+            extensions: Extensions::default(),
+        })
+    }
+
+    async fn copy_opts(
+        &self,
+        _from: &ObjectPath,
+        _to: &ObjectPath,
+        _options: CopyOptions,
+    ) -> object_store::Result<()> {
+        Err(not_implemented("copy_opts"))
+    }
+}
+
+fn object_meta(
+    location: ObjectPath,
+    object: &crate::sftp_transport::RemoteObjectRead,
+) -> ObjectMeta {
+    ObjectMeta {
+        location,
+        last_modified: DateTime::<Utc>::from(object.modified),
+        size: object.header.logical_len,
+        e_tag: Some(object.header.generation.to_string()),
+        version: None,
+    }
+}
+
+async fn finish_lease<T>(
+    lease: crate::sftp_transport::SessionLease,
+    operation: Result<T, crate::sftp_transport::TransportError>,
+) -> Result<T, crate::sftp_transport::TransportError> {
+    match operation {
+        Ok(value) => {
+            lease.complete().await?;
+            Ok(value)
+        }
+        Err(error) => {
+            let reusable = matches!(
+                error,
+                crate::sftp_transport::TransportError::NotFound(_)
+                    | crate::sftp_transport::TransportError::PermissionDenied(_)
+                    | crate::sftp_transport::TransportError::CorruptObject(_)
+            );
+            let cleanup = if reusable {
+                lease.complete().await
+            } else {
+                lease.retire().await
+            };
+            if let Err(cleanup) = cleanup {
+                tracing::warn!(%cleanup, "failed to finish SFTP session after operation error");
+            }
+            Err(error)
+        }
+    }
+}
+
+fn transport_error(error: crate::sftp_transport::TransportError) -> object_store::Error {
+    match error {
+        crate::sftp_transport::TransportError::NotFound(path) => object_store::Error::NotFound {
+            path,
+            source: "SFTP server reported no such file".into(),
+        },
+        crate::sftp_transport::TransportError::PermissionDenied(path) => {
+            object_store::Error::PermissionDenied {
+                path,
+                source: "SFTP server denied access".into(),
+            }
+        }
+        error => object_store::Error::Generic {
+            store: STORE_NAME,
+            source: Box::new(error),
+        },
+    }
+}
+
+fn generic_error(error: impl Into<String>) -> object_store::Error {
+    object_store::Error::Generic {
+        store: STORE_NAME,
+        source: error.into().into(),
+    }
+}
+
+fn not_implemented(operation: &str) -> object_store::Error {
+    object_store::Error::NotImplemented {
+        operation: operation.to_owned(),
+        implementer: "SftpObjectStore".to_owned(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sftp_transport::{
+        OpenSshTransportSession, RemoteDirectoryEntry, RemoteObjectRead, SessionFactory,
+        TransportError, TransportSession,
+    };
     use std::collections::HashMap;
     use std::sync::Mutex;
     use std::time::Duration;
     use tokio::sync::Barrier;
+
+    #[derive(Debug)]
+    struct LocalSftpFactory {
+        server: PathBuf,
+        root: PathBuf,
+    }
+
+    #[async_trait]
+    impl SessionFactory for LocalSftpFactory {
+        async fn open(&self) -> Result<Box<dyn TransportSession>, TransportError> {
+            let mut child = tokio::process::Command::new(&self.server)
+                .current_dir(&self.root)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .map_err(|error| TransportError::Open(error.to_string()))?;
+            let stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| TransportError::Open("missing sftp-server stdin".to_owned()))?;
+            let stdout = child
+                .stdout
+                .take()
+                .ok_or_else(|| TransportError::Open("missing sftp-server stdout".to_owned()))?;
+            let session = OpenSshTransportSession::from_streams(stdin, stdout).await?;
+            Ok(Box::new(LocalSftpSession { session, child }))
+        }
+    }
+
+    struct LocalSftpSession {
+        session: OpenSshTransportSession,
+        child: tokio::process::Child,
+    }
+
+    impl Debug for LocalSftpSession {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter
+                .debug_struct("LocalSftpSession")
+                .finish_non_exhaustive()
+        }
+    }
+
+    #[async_trait]
+    impl TransportSession for LocalSftpSession {
+        fn capabilities(&self) -> SftpCapabilities {
+            self.session.capabilities()
+        }
+
+        async fn read_object(
+            &mut self,
+            path: &FilePath,
+            range: Option<object_store::GetRange>,
+            head: bool,
+        ) -> Result<RemoteObjectRead, TransportError> {
+            self.session.read_object(path, range, head).await
+        }
+
+        async fn list_directory(
+            &mut self,
+            path: &FilePath,
+        ) -> Result<Vec<RemoteDirectoryEntry>, TransportError> {
+            self.session.list_directory(path).await
+        }
+
+        async fn remove_file(&mut self, path: &FilePath) -> Result<(), TransportError> {
+            self.session.remove_file(path).await
+        }
+
+        async fn close(self: Box<Self>) -> Result<(), TransportError> {
+            let LocalSftpSession { session, mut child } = *self;
+            Box::new(session).close().await?;
+            let status = child
+                .wait()
+                .await
+                .map_err(|error| TransportError::Close(error.to_string()))?;
+            if !status.success() {
+                return Err(TransportError::Close(format!(
+                    "sftp-server exited with {status}"
+                )));
+            }
+            Ok(())
+        }
+    }
 
     #[derive(Debug)]
     struct RecordingSession {
@@ -827,5 +1309,147 @@ mod tests {
         let published = session.files.lock().unwrap().get(target).cloned().unwrap();
         assert_eq!(&published[OBJECT_HEADER_LEN..], b"replacement");
         assert_eq!(decode_header(&published).unwrap(), outcome.header);
+    }
+
+    #[tokio::test]
+    async fn real_sftp_object_store_hides_headers_ranges_lists_and_deletes() {
+        let Some(server) = ["/usr/libexec/sftp-server", "/usr/lib/openssh/sftp-server"]
+            .into_iter()
+            .find(|path| FilePath::new(path).is_file())
+        else {
+            eprintln!(
+                "skipped: neither /usr/libexec/sftp-server nor /usr/lib/openssh/sftp-server exists"
+            );
+            return;
+        };
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("zerofs/v1/nested")).unwrap();
+        let write_object = |path: &FilePath, generation: Uuid, payload: &[u8]| {
+            let mut physical = encode_header(ObjectHeader {
+                generation,
+                logical_len: payload.len() as u64,
+            })
+            .to_vec();
+            physical.extend_from_slice(payload);
+            std::fs::write(path, physical).unwrap();
+        };
+        let top_generation = Uuid::from_u128(0x00112233_4455_6677_8899_aabbccddeeff);
+        write_object(
+            &root.path().join("zerofs/v1/top.bin"),
+            top_generation,
+            b"hello world",
+        );
+        write_object(
+            &root.path().join("zerofs/v1/nested/child.bin"),
+            Uuid::from_u128(0xffeeddcc_bbaa_9988_7766_554433221100),
+            b"child",
+        );
+        write_object(
+            &root.path().join("zerofs/v1/empty.bin"),
+            Uuid::from_u128(0x11111111_2222_3333_4444_555555555555),
+            b"",
+        );
+        write_object(
+            &root
+                .path()
+                .join("zerofs/v1/.zerofs-staging-top.bin-00112233-4455-6677-8899-aabbccddeeff"),
+            Uuid::new_v4(),
+            b"hidden",
+        );
+
+        let pool = crate::sftp_transport::SftpSessionPool::new_writable(
+            Arc::new(LocalSftpFactory {
+                server: server.into(),
+                root: root.path().to_path_buf(),
+            }),
+            2,
+            1,
+            1,
+        )
+        .await
+        .unwrap();
+        let store = SftpObjectStore::new(pool, ObjectPath::from("zerofs/v1")).unwrap();
+        let location = ObjectPath::from("zerofs/v1/top.bin");
+
+        let result = store
+            .get_opts(
+                &location,
+                GetOptions::new().with_range(Some(object_store::GetRange::Bounded(6..11))),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.meta.size, 11);
+        assert_eq!(
+            result.meta.e_tag.as_deref(),
+            Some(&*top_generation.to_string())
+        );
+        assert_eq!(result.range, 6..11);
+        assert_eq!(result.bytes().await.unwrap().as_ref(), b"world");
+
+        let head = store
+            .get_opts(
+                &location,
+                GetOptions {
+                    head: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(head.meta.size, 11);
+        assert!(head.bytes().await.unwrap().is_empty());
+        let empty = store
+            .get_opts(
+                &ObjectPath::from("zerofs/v1/empty.bin"),
+                GetOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(empty.range, 0..0);
+        assert_eq!(empty.meta.size, 0);
+        assert!(empty.bytes().await.unwrap().is_empty());
+
+        let mut listed = store
+            .list(None)
+            .map(|result| result.unwrap().location)
+            .collect::<Vec<_>>()
+            .await;
+        listed.sort();
+        assert_eq!(
+            listed,
+            [
+                ObjectPath::from("zerofs/v1/empty.bin"),
+                ObjectPath::from("zerofs/v1/nested/child.bin"),
+                ObjectPath::from("zerofs/v1/top.bin"),
+            ]
+        );
+        let delimiter = store.list_with_delimiter(None).await.unwrap();
+        assert_eq!(
+            delimiter.common_prefixes,
+            [ObjectPath::from("zerofs/v1/nested")]
+        );
+        assert_eq!(delimiter.objects.len(), 2);
+        assert!(
+            delimiter
+                .objects
+                .iter()
+                .any(|object| object.location == location)
+        );
+
+        let deleted = store
+            .delete_stream(stream::iter(vec![Ok(location.clone())]).boxed())
+            .collect::<Vec<_>>()
+            .await;
+        assert_eq!(deleted.len(), 1);
+        assert_eq!(deleted[0].as_ref().unwrap(), &location);
+        assert!(!root.path().join("zerofs/v1/top.bin").exists());
+
+        let outside = ObjectPath::from("other/prefix.bin");
+        assert!(
+            store
+                .get_opts(&outside, GetOptions::default())
+                .await
+                .is_err()
+        );
     }
 }
