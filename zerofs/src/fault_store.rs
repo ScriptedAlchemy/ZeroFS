@@ -12,6 +12,7 @@ use object_store::{
     CopyOptions, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta,
     ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
 };
+use std::collections::HashSet;
 use std::fmt::{self, Display, Formatter};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -36,6 +37,7 @@ pub struct FaultControls {
     puts: AtomicUsize,
     put_paths: StdMutex<Vec<String>>,
     block_puts: AtomicBool,
+    released_put_paths: StdMutex<HashSet<String>>,
     active_puts: AtomicUsize,
     max_active_puts: AtomicUsize,
     put_activity: Arc<Notify>,
@@ -74,6 +76,13 @@ impl FaultControls {
     }
     pub fn release_puts(&self) {
         self.block_puts.store(false, Ordering::SeqCst);
+        self.put_release.notify_waiters();
+    }
+    pub fn release_put_path(&self, path: &str) {
+        self.released_put_paths
+            .lock()
+            .unwrap()
+            .insert(path.to_owned());
         self.put_release.notify_waiters();
     }
     pub fn max_active_puts(&self) -> usize {
@@ -157,6 +166,15 @@ impl ObjectStore for FaultStore {
         let _active = ActivePut::enter(self.ctl.clone());
         while self.ctl.block_puts.load(Ordering::SeqCst) {
             let notified = self.ctl.put_release.notified();
+            if self
+                .ctl
+                .released_put_paths
+                .lock()
+                .unwrap()
+                .remove(location.as_ref())
+            {
+                break;
+            }
             if !self.ctl.block_puts.load(Ordering::SeqCst) {
                 break;
             }

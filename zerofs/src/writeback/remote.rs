@@ -4,6 +4,9 @@ use crate::writeback::journaler::{LocalBarrier, LocalBarrierError};
 use crate::writeback::model::{FenceClass, MutationKind, MutationMode, MutationRecord, Sequence};
 use crate::writeback::overlay::OverlayIndex;
 use bytes::Bytes;
+use futures::future::BoxFuture;
+use futures::stream::FuturesUnordered;
+use futures::{FutureExt, StreamExt};
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutResult, UpdateVersion};
 use std::collections::{BTreeMap, BTreeSet};
@@ -157,7 +160,7 @@ async fn run_remote_scheduler(worker: RemoteWorker) {
     // not make each intervening manifest fence pay that delay again.
     let mut known_local_tail = progress.borrow().sequence;
     let mut completed = BTreeMap::<Sequence, CompletedRemote>::new();
-    loop {
+    'scheduler: loop {
         if *stop.borrow() {
             break;
         }
@@ -195,33 +198,48 @@ async fn run_remote_scheduler(worker: RemoteWorker) {
                 break;
             }
         };
-        let batch = collect_pipeline_batch(&snapshot.records, next, upload_concurrency, &completed);
-        if batch.is_empty() {
-            progress.send_modify(|state| {
-                state.terminal_error = Some(format!("local mutation {next} is missing"));
-            });
-            break;
-        }
-        let outcomes = futures::future::join_all(batch.iter().cloned().map(|record| {
-            let remote = remote.clone();
-            let journal = journal.clone();
-            async move {
-                let result = apply_record(remote, journal, record.clone()).await;
-                (record, result)
-            }
-        }));
-        let outcomes = tokio::select! {
-            outcomes = outcomes => outcomes,
-            changed = stop.changed() => {
-                if changed.is_err() || *stop.borrow() {
-                    break;
-                }
-                continue;
-            }
-        };
-        known_local_tail = snapshot.local_seq;
+        let mut snapshot = snapshot;
+        let mut active = FuturesUnordered::<
+            BoxFuture<'static, (MutationRecord, object_store::Result<PutResult>)>,
+        >::new();
+        let mut active_sequences = BTreeSet::new();
         let mut retry = false;
-        for (record, result) in outcomes {
+        loop {
+            if !retry {
+                let batch = collect_pipeline_batch(
+                    &snapshot.records,
+                    next,
+                    upload_concurrency,
+                    &completed,
+                    &active_sequences,
+                );
+                for record in batch {
+                    active_sequences.insert(record.sequence);
+                    let remote = remote.clone();
+                    let journal = journal.clone();
+                    active.push(
+                        async move {
+                            let result = apply_record(remote, journal, record.clone()).await;
+                            (record, result)
+                        }
+                        .boxed(),
+                    );
+                }
+            }
+            if active.is_empty() {
+                break;
+            }
+            let outcome = tokio::select! {
+                outcome = active.next() => outcome.expect("active remote upload set is non-empty"),
+                changed = stop.changed() => {
+                    if changed.is_err() || *stop.borrow() {
+                        break 'scheduler;
+                    }
+                    continue;
+                }
+            };
+            let (record, result) = outcome;
+            active_sequences.remove(&record.sequence);
             let result = match result {
                 Ok(result) => result,
                 Err(error) => {
@@ -248,23 +266,37 @@ async fn run_remote_scheduler(worker: RemoteWorker) {
                     e_tag: result.e_tag,
                 },
             );
+            if let Err(error) = commit_ready_prefix(
+                &journal,
+                &overlay,
+                &disk,
+                &progress,
+                &mut next,
+                &mut completed,
+            )
+            .await
+            {
+                progress.send_modify(|state| {
+                    state.terminal_error = Some(format!("{error:#}"));
+                    state.closed = true;
+                });
+                return;
+            }
+            if !retry {
+                snapshot = match journal.snapshot() {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        progress.send_modify(|state| {
+                            state.terminal_error = Some(format!("{error:#}"));
+                            state.closed = true;
+                        });
+                        return;
+                    }
+                };
+                known_local_tail = known_local_tail.max(snapshot.local_seq);
+            }
         }
-        if let Err(error) = commit_ready_prefix(
-            &journal,
-            &overlay,
-            &disk,
-            &progress,
-            &mut next,
-            &mut completed,
-        )
-        .await
-        {
-            progress.send_modify(|state| {
-                state.terminal_error = Some(format!("{error:#}"));
-                state.closed = true;
-            });
-            return;
-        }
+        known_local_tail = known_local_tail.max(snapshot.local_seq);
         if retry {
             tokio::select! {
                 _ = tokio::time::sleep(REMOTE_RETRY_DELAY) => {}
@@ -295,7 +327,14 @@ async fn coalesce_local_batch(
     let mut idle_deadline = tokio::time::Instant::now() + REMOTE_COALESCE_IDLE;
     loop {
         if !completed.is_empty()
-            || collect_pipeline_batch(&snapshot.records, next, upload_concurrency, completed).len()
+            || collect_pipeline_batch(
+                &snapshot.records,
+                next,
+                upload_concurrency,
+                completed,
+                &BTreeSet::new(),
+            )
+            .len()
                 == upload_concurrency
             || tokio::time::Instant::now() >= idle_deadline
         {
@@ -323,8 +362,12 @@ fn collect_pipeline_batch(
     first_sequence: Sequence,
     limit: usize,
     completed: &BTreeMap<Sequence, CompletedRemote>,
+    active: &BTreeSet<Sequence>,
 ) -> Vec<MutationRecord> {
-    let available = limit.saturating_sub(completed.len());
+    let held_limit = limit.saturating_mul(4).max(limit);
+    let available = limit
+        .saturating_sub(active.len())
+        .min(held_limit.saturating_sub(completed.len()));
     if available == 0 {
         return Vec::new();
     }
@@ -345,6 +388,7 @@ fn collect_pipeline_batch(
         // Only immutable, unreferenced data may cross a fence. Results remain
         // held in memory and are journal-committed strictly in sequence order.
         if !completed.contains_key(&record.sequence)
+            && !active.contains(&record.sequence)
             && !conflicts_with_earlier
             && (is_frontier || may_preupload)
         {
@@ -536,7 +580,7 @@ mod tests {
         ];
 
         let completed = Default::default();
-        let first = collect_pipeline_batch(&records, 1, 8, &completed);
+        let first = collect_pipeline_batch(&records, 1, 8, &completed, &Default::default());
         assert_eq!(
             first
                 .iter()
@@ -545,7 +589,7 @@ mod tests {
             vec![1, 2, 4]
         );
 
-        let fence = collect_pipeline_batch(&records, 3, 8, &completed);
+        let fence = collect_pipeline_batch(&records, 3, 8, &completed, &Default::default());
         assert_eq!(
             fence
                 .iter()
@@ -554,7 +598,7 @@ mod tests {
             vec![3, 4]
         );
 
-        let after = collect_pipeline_batch(&records, 4, 8, &completed);
+        let after = collect_pipeline_batch(&records, 4, 8, &completed, &Default::default());
         assert_eq!(
             after
                 .iter()
@@ -572,7 +616,8 @@ mod tests {
             record(3, "segments/independent", FenceClass::ImmutableCreate),
         ];
 
-        let batch = collect_pipeline_batch(&records, 1, 8, &Default::default());
+        let batch =
+            collect_pipeline_batch(&records, 1, 8, &Default::default(), &Default::default());
 
         assert_eq!(
             batch
@@ -584,7 +629,7 @@ mod tests {
     }
 
     #[test]
-    fn held_remote_completions_count_against_the_pipeline_limit() {
+    fn held_remote_completions_do_not_idle_network_slots() {
         let records = vec![
             record(1, "manifest/frontier", FenceClass::Fence),
             record(2, "segments/held-2", FenceClass::ImmutableCreate),
@@ -607,14 +652,38 @@ mod tests {
             })
             .collect();
 
-        let batch = collect_pipeline_batch(&records, 1, 4, &completed);
+        let batch = collect_pipeline_batch(&records, 1, 4, &completed, &Default::default());
 
         assert_eq!(
             batch
                 .iter()
                 .map(|record| record.sequence)
                 .collect::<Vec<_>>(),
-            vec![1]
+            vec![1, 3, 5, 7]
+        );
+    }
+
+    #[test]
+    fn active_remote_uploads_are_not_dispatched_twice() {
+        let records = (1_u64..=6)
+            .map(|sequence| {
+                record(
+                    sequence,
+                    &format!("segments/{sequence}"),
+                    FenceClass::ImmutableCreate,
+                )
+            })
+            .collect::<Vec<_>>();
+        let active = [1_u64, 2, 3].into_iter().collect();
+
+        let batch = collect_pipeline_batch(&records, 1, 4, &Default::default(), &active);
+
+        assert_eq!(
+            batch
+                .iter()
+                .map(|record| record.sequence)
+                .collect::<Vec<_>>(),
+            vec![4]
         );
     }
 }

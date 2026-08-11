@@ -2185,6 +2185,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_replay_refills_a_slot_before_the_slowest_wave_member_finishes() {
+        let (store, _remote, _temp, controls) = test_store_with_controls(true).await;
+        controls.block_puts();
+        for index in 1_u8..=8 {
+            store
+                .put(
+                    &Path::from(format!(
+                        "segments/{index:02x}/0000000000000001/{index:016x}"
+                    )),
+                    Bytes::from(vec![index; 1024]).into(),
+                )
+                .await
+                .unwrap();
+        }
+        store.wait_local(8).await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while controls.put_count() < 4 {
+                controls.put_activity().notified().await;
+            }
+        })
+        .await
+        .expect("the first four remote slots were not filled");
+        controls.release_put_path("segments/02/0000000000000001/0000000000000002");
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !controls
+                .put_paths()
+                .iter()
+                .any(|path| path == "segments/05/0000000000000001/0000000000000005")
+            {
+                controls.put_activity().notified().await;
+            }
+        })
+        .await
+        .expect("a free remote slot waited for the rest of its batch");
+
+        controls.release_puts();
+        store.wait_remote(8).await.unwrap();
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn remote_replay_preuploads_immutable_objects_across_later_fences() {
         let (store, _remote, _temp, controls) = test_store_with_controls(true).await;
         controls.block_puts();
