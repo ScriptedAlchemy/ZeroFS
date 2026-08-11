@@ -1,3 +1,4 @@
+pub mod admission;
 pub mod config;
 pub mod journal;
 pub mod model;
