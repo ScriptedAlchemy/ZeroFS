@@ -24,7 +24,20 @@ pub async fn attach(
     ensure_base_directory(&settings.dir)?;
     settings.dir = settings.dir.join(namespace);
     let journal = Arc::new(Journal::open(&settings.dir, identity)?);
+    let recovery = journal.progress()?;
     let lifecycle = WritebackObjectStore::open(remote, journal, settings).await?;
+    if recovery.remote_seq < recovery.local_seq {
+        tracing::info!(
+            remote_sequence = recovery.remote_seq,
+            local_sequence = recovery.local_seq,
+            pending_operations = recovery.local_seq - recovery.remote_seq,
+            "replaying the locally durable writeback journal before opening the database"
+        );
+        lifecycle
+            .wait_remote(recovery.local_seq)
+            .await
+            .map_err(|error| anyhow::anyhow!("writeback recovery replay failed: {error}"))?;
+    }
     Ok(AttachedWriteback {
         store: Arc::new(lifecycle.clone()),
         lifecycle,
@@ -155,6 +168,76 @@ mod tests {
         assert!(remote.head(&location).await.is_err());
         assert!(base.join("bucket_12345678").join("journal.redb").exists());
         attached.lifecycle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn recovered_journal_replays_before_attachment_becomes_visible() {
+        let temp = tempfile::tempdir().unwrap();
+        let remote = Arc::new(InMemory::new());
+        let (partitioned, controls) = FaultStore::new(remote.clone());
+        controls.partition_writes(true);
+        let settings = WritebackSettings {
+            dir: temp.path().join("dirty"),
+            ack_mode: AckMode::Memory,
+            memory_bytes: 1_000_000,
+            disk_bytes: 10_000_000,
+            min_free_bytes: 1,
+            high_watermark_percent: 95,
+            resume_percent: 85,
+            upload_concurrency: 4,
+            shutdown_flush: ShutdownFlush::Local,
+        };
+        let identity = JournalIdentity {
+            format_version: 1,
+            bucket_id: "bucket-recovery".to_owned(),
+            backend_endpoint: "sftp://storage.example:23".to_owned(),
+            database_prefix: "zerofs/recovery".to_owned(),
+            backend_kind: "sftp".to_owned(),
+            encryption_key_identity_sha256: [0x66; 32],
+        };
+        let location = Path::from("zerofs/recovery/manifest/00000000000000000001.manifest");
+
+        let first = super::attach(
+            partitioned.clone(),
+            settings.clone(),
+            identity.clone(),
+            "bucket_recovery",
+        )
+        .await
+        .unwrap();
+        first
+            .store
+            .put(&location, Bytes::from_static(b"manifest").into())
+            .await
+            .unwrap();
+        first.lifecycle.wait_local_through_accepted().await.unwrap();
+        first.lifecycle.shutdown().await.unwrap();
+        drop(first);
+
+        let mut recovery = tokio::spawn(super::attach(
+            partitioned,
+            settings,
+            identity,
+            "bucket_recovery",
+        ));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut recovery)
+                .await
+                .is_err(),
+            "attachment exposed the overlay before recovered mutations reached the backend"
+        );
+
+        controls.partition_writes(false);
+        let recovered = tokio::time::timeout(std::time::Duration::from_secs(5), recovery)
+            .await
+            .expect("recovery should finish after the backend heals")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            remote.get(&location).await.unwrap().bytes().await.unwrap(),
+            Bytes::from_static(b"manifest")
+        );
+        recovered.lifecycle.shutdown().await.unwrap();
     }
 
     #[cfg(unix)]
