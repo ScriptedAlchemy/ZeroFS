@@ -25,7 +25,8 @@ record_fail() {
 new_fixture() {
   FIXTURE=$(mktemp -d "$TEST_ROOT/case.XXXXXX")
   FAKEBIN="$FIXTURE/bin"
-  mkdir -p "$FAKEBIN" "$FIXTURE/results" "$FIXTURE/tmp" "$FIXTURE/mount/metadata"
+  mkdir -p "$FAKEBIN" "$FIXTURE/results" "$FIXTURE/tmp" "$FIXTURE/mount/metadata" "$FIXTURE/cgroup/pilot"
+  printf '456\n' >"$FIXTURE/cgroup/pilot/cgroup.procs"
   : >"$FIXTURE/env"
   printf '0\n' >"$FIXTURE/date-counter"
   printf 'sentinel\n' >"$FIXTURE/mount/integrity.bin"
@@ -64,7 +65,13 @@ EOF
   make_fake hostname 'printf "ubuntu-main\n"'
   make_fake flock '[[ ${FAKE_FLOCK_FAIL:-0} != 1 ]]'
   make_fake sudo 'exec "$@"'
-  make_fake findmnt 'if [[ ${1:-} == -rn ]]; then exit 1; fi; printf "/dev/nbd0 xfs %s\n" "$ZEROFS_PILOT_MOUNTPOINT"'
+  make_fake findmnt '
+if [[ ${FAKE_EXACT_MOUNT_REMAINS:-0} == 1 ]]; then
+  if [[ $* == "-rn -M $ZEROFS_PILOT_MOUNTPOINT" ]]; then exit 0; fi
+  if [[ $* == "-rn $ZEROFS_PILOT_MOUNTPOINT" ]]; then exit 1; fi
+fi
+if [[ ${1:-} == -rn ]]; then exit 1; fi
+printf "/dev/nbd0 xfs %s\n" "$ZEROFS_PILOT_MOUNTPOINT"'
   make_fake find 'if [[ $* == *"-printf ."* ]]; then /usr/bin/find "$1" -type f | while IFS= read -r _; do printf .; done; else exec /usr/bin/find "$@"; fi'
   make_fake sha256sum 'exec /usr/bin/shasum -a 256 "$@"'
   make_fake curl 'cat "$FAKE_METRICS_FILE"'
@@ -93,7 +100,20 @@ case ${1:-} in
     printf "active\n"; exit 0 ;;
   show)
     case "$*" in
-      *MainPID*) printf "123\n" ;;
+      *ActiveState*)
+        if [[ ${FAKE_STICKY_ACTIVE:-0} == 1 ]]; then printf "active\n"
+        elif [[ -n ${FAKE_STUCK_TRANSITION:-} ]]; then printf "%s\n" "$FAKE_STUCK_TRANSITION"
+        elif grep -Fq "stop $2" "$FAKE_CALL_LOG" 2>/dev/null; then printf "inactive\n"
+        else printf "active\n"
+        fi ;;
+      *MainPID*)
+        if [[ ${FAKE_STICKY_ACTIVE:-0} == 1 || ${FAKE_STALE_MAINPID:-0} == 1 ]]; then printf "123\n"
+        elif grep -Fq "stop $2" "$FAKE_CALL_LOG" 2>/dev/null; then printf "0\n"
+        else printf "123\n"
+        fi ;;
+      *ControlPID*) printf "0\n" ;;
+      *ControlGroup*)
+        if [[ ${FAKE_CGROUP_PROCESS:-0} == 1 ]]; then printf "/pilot\n"; else printf "\n"; fi ;;
       *NRestarts*) printf "0\n" ;;
       *) printf "0\n" ;;
     esac
@@ -136,6 +156,7 @@ run_pilot() {
     ZEROFS_PILOT_ENV="$FIXTURE/env" \
     ZEROFS_PILOT_BINARY="$FIXTURE/zerofs" \
     ZEROFS_PILOT_PROC_ROOT="$FIXTURE/proc" \
+    ZEROFS_PILOT_CGROUP_ROOT="$FIXTURE/cgroup" \
     ZEROFS_PILOT_LOCK_FILE="$FIXTURE/pilot.lock" \
     ZEROFS_PILOT_TMP_DIR="$FIXTURE/tmp" \
     ZEROFS_PILOT_RESULT_DIR="$FIXTURE/results" \
@@ -144,6 +165,7 @@ run_pilot() {
     ZEROFS_PILOT_INTEGRITY_SHA256="$(sha256sum "$FIXTURE/mount/integrity.bin" | awk '{print $1}')" \
     ZEROFS_PILOT_METADATA_DIR="$FIXTURE/mount/metadata" \
     ZEROFS_PILOT_METADATA_FILE_COUNT=1 \
+    ZEROFS_PILOT_STOP_TIMEOUT=2 \
     "$@" bash "$SCRIPT" "$command"
 }
 
@@ -160,8 +182,44 @@ test_teardown_requires_every_unit_inactive() {
   if FAKE_STICKY_ACTIVE=1 run_pilot teardown >"$FIXTURE/out" 2>"$FIXTURE/err"; then
     return 1
   fi
-  grep -q 'remains active after stop' "$FIXTURE/err" || return 1
+  grep -q 'did not reach a terminal stopped state' "$FIXTURE/err" || return 1
   [[ $(grep -c '^stop ' "$FIXTURE/calls.log") == 3 ]]
+}
+
+test_teardown_rejects_units_stuck_in_transitional_states() {
+  local state
+  for state in activating deactivating; do
+    new_fixture
+    if FAKE_STUCK_TRANSITION=$state run_pilot teardown >"$FIXTURE/out" 2>"$FIXTURE/err"; then
+      return 1
+    fi
+    grep -q 'did not reach a terminal stopped state' "$FIXTURE/err" || return 1
+    [[ $(grep -c '^sleep$' "$FIXTURE/calls.log") == 2 ]] || return 1
+  done
+}
+
+test_teardown_rejects_inactive_unit_with_a_stale_main_pid() {
+  new_fixture
+  if FAKE_STALE_MAINPID=1 run_pilot teardown >"$FIXTURE/out" 2>"$FIXTURE/err"; then
+    return 1
+  fi
+  grep -q 'MainPID=123' "$FIXTURE/err"
+}
+
+test_teardown_rejects_inactive_unit_with_a_cgroup_process() {
+  new_fixture
+  if FAKE_CGROUP_PROCESS=1 run_pilot teardown >"$FIXTURE/out" 2>"$FIXTURE/err"; then
+    return 1
+  fi
+  grep -q 'cgroup_pids=456' "$FIXTURE/err"
+}
+
+test_teardown_checks_the_exact_mount_target() {
+  new_fixture
+  if FAKE_EXACT_MOUNT_REMAINS=1 run_pilot teardown >"$FIXTURE/out" 2>"$FIXTURE/err"; then
+    return 1
+  fi
+  grep -q "$FIXTURE/mount remains mounted" "$FIXTURE/err"
 }
 
 test_wait_drain_fails_before_sleep_on_terminal_error() {
@@ -212,13 +270,20 @@ test_successful_benchmark_labels_local_boundary_without_fake_throughput() {
   grep -q 'first_drained_epoch_ms=' "$FIXTURE/results"/storage-*-drain.txt
 }
 
-test_raw_sftp_reaps_every_upload_worker_after_one_fails() {
+test_raw_sftp_reaps_all_eight_override_workers_after_one_fails() {
   new_fixture
-  if FAKE_SFTP_FAIL_UPLOAD=1 run_pilot raw-sftp >"$FIXTURE/out" 2>"$FIXTURE/err"; then
+  if FAKE_SFTP_FAIL_UPLOAD=1 ZEROFS_RAW_SFTP_JOBS=8 run_pilot raw-sftp >"$FIXTURE/out" 2>"$FIXTURE/err"; then
     return 1
   fi
   [[ $(grep -c '^upload_start ' "$FIXTURE/calls.log") == 8 ]] || return 1
   [[ $(grep -c '^upload_end ' "$FIXTURE/calls.log") == 8 ]]
+}
+
+test_raw_sftp_defaults_to_seven_matched_streams_and_records_bytes() {
+  new_fixture
+  run_pilot raw-sftp >"$FIXTURE/out" 2>"$FIXTURE/err"
+  grep -q 'raw_sftp_jobs=7 raw_sftp_bytes=939524096' "$FIXTURE/out" || return 1
+  [[ $(grep -c '^upload_start ' "$FIXTURE/calls.log") == 7 ]]
 }
 
 run_test() {
@@ -228,12 +293,17 @@ run_test() {
 
 run_test test_global_lock_rejects_overlap
 run_test test_teardown_requires_every_unit_inactive
+run_test test_teardown_rejects_units_stuck_in_transitional_states
+run_test test_teardown_rejects_inactive_unit_with_a_stale_main_pid
+run_test test_teardown_rejects_inactive_unit_with_a_cgroup_process
+run_test test_teardown_checks_the_exact_mount_target
 run_test test_wait_drain_fails_before_sleep_on_terminal_error
 run_test test_status_rejects_unexpected_ack_mode
 run_test test_status_records_runtime_and_durability_receipt
 run_test test_failed_benchmark_cleans_sampler_and_keeps_evidence
 run_test test_successful_benchmark_labels_local_boundary_without_fake_throughput
-run_test test_raw_sftp_reaps_every_upload_worker_after_one_fails
+run_test test_raw_sftp_reaps_all_eight_override_workers_after_one_fails
+run_test test_raw_sftp_defaults_to_seven_matched_streams_and_records_bytes
 
 printf '%s passed; %s failed\n' "$pass" "$fail"
 (( fail == 0 ))

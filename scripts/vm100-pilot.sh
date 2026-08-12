@@ -27,12 +27,15 @@ LOCK_FILE=${ZEROFS_PILOT_LOCK_FILE:-/var/tmp/zerofs-vm100-pilot.lock}
 PROC_ROOT=${ZEROFS_PILOT_PROC_ROOT:-/proc}
 EXPECTED_ACK_MODE=${ZEROFS_PILOT_EXPECT_ACK_MODE:-memory}
 DRAIN_TIMEOUT=${ZEROFS_PILOT_DRAIN_TIMEOUT:-600}
+STOP_TIMEOUT=${ZEROFS_PILOT_STOP_TIMEOUT:-60}
+CGROUP_ROOT=${ZEROFS_PILOT_CGROUP_ROOT:-/sys/fs/cgroup}
 CARGO_CMD=${ZEROFS_PILOT_CARGO:-}
 NPM_WORKLOAD_REPO=${ZEROFS_NPM_WORKLOAD_REPO:-https://github.com/npm/cli.git}
 NPM_WORKLOAD_COMMIT=${ZEROFS_NPM_WORKLOAD_COMMIT:-64763a341e7aa5b456e696f956759bf9b3440dc1}
 RUST_WORKLOAD_REPO=${ZEROFS_RUST_WORKLOAD_REPO:-https://github.com/BurntSushi/ripgrep.git}
 RUST_WORKLOAD_COMMIT=${ZEROFS_RUST_WORKLOAD_COMMIT:-af60c2de9d85e7f3d81c78601669468cf02dabab}
 DELETE_JOBS=${ZEROFS_DELETE_JOBS:-4}
+RAW_SFTP_JOBS=${ZEROFS_RAW_SFTP_JOBS:-7}
 
 if [[ -z $CARGO_CMD ]]; then
   CARGO_CMD=$(command -v cargo 2>/dev/null || true)
@@ -172,7 +175,7 @@ status() {
     [[ $(systemctl is-active "$unit" 2>/dev/null || true) == active ]] || die "$unit is not active"
     printf '%s=active\n' "$unit"
   done
-  findmnt -no SOURCE,FSTYPE,TARGET "$MOUNTPOINT"
+  findmnt -no SOURCE,FSTYPE,TARGET -M "$MOUNTPOINT"
   local binary_sha integrity_sha metadata_count snapshot runtime_receipt
   binary_sha=$(sha256sum "$BINARY" | awk '{print $1}')
   runtime_receipt=$(validate_runtime)
@@ -195,19 +198,45 @@ status() {
 
 teardown() {
   require_vm100
+  [[ $STOP_TIMEOUT =~ ^[1-9][0-9]*$ ]] || die "ZEROFS_PILOT_STOP_TIMEOUT must be positive"
   log "stopping mount, NBD client, and ZeroFS daemon"
   sudo systemctl stop "$MOUNT_UNIT" || true
   sudo systemctl stop "$CLIENT_SERVICE" || true
   sudo systemctl stop "$SERVICE" || true
-  local unit active_units=()
+  local unit
   for unit in "$MOUNT_UNIT" "$CLIENT_SERVICE" "$SERVICE"; do
-    if [[ $(systemctl is-active "$unit" 2>/dev/null || true) == active ]]; then
-      active_units+=("$unit")
-    fi
+    wait_stopped "$unit" "$STOP_TIMEOUT" || die "$unit did not reach a terminal stopped state within ${STOP_TIMEOUT}s"
   done
-  findmnt -rn "$MOUNTPOINT" >/dev/null && die "$MOUNTPOINT remains mounted"
-  (( ${#active_units[@]} == 0 )) || die "${active_units[*]} remains active after stop"
+  findmnt -rn -M "$MOUNTPOINT" >/dev/null && die "$MOUNTPOINT remains mounted"
   log "teardown complete; canonical data/cache/journal were retained"
+}
+
+wait_stopped() {
+  local unit=$1 timeout=$2 state main_pid control_pid control_group process_file process_ids
+  for _ in $(seq 1 "$timeout"); do
+    state=$(systemctl show "$unit" -p ActiveState --value 2>/dev/null || true)
+    main_pid=$(systemctl show "$unit" -p MainPID --value 2>/dev/null || true)
+    control_pid=$(systemctl show "$unit" -p ControlPID --value 2>/dev/null || true)
+    control_group=$(systemctl show "$unit" -p ControlGroup --value 2>/dev/null || true)
+    main_pid=${main_pid:-0}
+    control_pid=${control_pid:-0}
+    process_ids=
+    if [[ -n $control_group ]]; then
+      process_file="$CGROUP_ROOT$control_group/cgroup.procs"
+      if [[ -r $process_file ]]; then
+        process_ids=$(tr '\n' ',' <"$process_file")
+        process_ids=${process_ids%,}
+      fi
+    fi
+    if [[ $state == inactive || $state == failed ]] \
+      && [[ $main_pid == 0 && $control_pid == 0 && -z $process_ids ]]; then
+      return 0
+    fi
+    sleep 1
+  done
+  log "$unit stop state: ActiveState=${state:-unknown} MainPID=$main_pid ControlPID=$control_pid cgroup_pids=${process_ids:-none}"
+  systemctl status "$unit" --no-pager -l >&2 || true
+  return 1
 }
 
 build_deploy() {
@@ -378,8 +407,10 @@ benchmark() {
 
 raw_sftp() {
   require_vm100
+  [[ $RAW_SFTP_JOBS =~ ^[1-9][0-9]*$ ]] || die "ZEROFS_RAW_SFTP_JOBS must be positive"
   wait_drain "$DRAIN_TIMEOUT" >/dev/null
   local url authority user hostport host port key known timestamp remote localdir result
+  local last_job=$((RAW_SFTP_JOBS - 1)) total_mib=$((RAW_SFTP_JOBS * 128)) total_bytes=$((RAW_SFTP_JOBS * 128 * 1024 * 1024))
   url=$(sudo awk -F'"' '/^url = / { print $2; exit }' "$CONFIG")
   authority=${url#sftp://}; authority=${authority%%/*}
   user=${authority%@*}; hostport=${authority#*@}; host=${hostport%:*}; port=${hostport##*:}
@@ -391,7 +422,7 @@ raw_sftp() {
   sudo install -d -m 0755 -o "$(id -un)" -g "$(id -gn)" "$RESULT_DIR"
   result="$RESULT_DIR/raw-sftp-$timestamp-$$.txt"
   sudo install -d -m 0755 -o "$(id -un)" -g "$(id -gn)" "$localdir"
-  for i in $(seq 0 7); do sudo fallocate -l 128M "$localdir/file-$i.bin"; done
+  for i in $(seq 0 "$last_job"); do sudo fallocate -l 128M "$localdir/file-$i.bin"; done
   local -a sftp_cmd=(sudo sftp -q -B 261120 -R 64 -P "$port" -i "$key" -o UserKnownHostsFile="$known" -o StrictHostKeyChecking=yes -o BatchMode=yes -o Compression=no "$user@$host")
   teardown
   local restored=0 restore_failed=0 remote_created=0 cleaned=0
@@ -401,7 +432,7 @@ raw_sftp() {
     trap - EXIT INT TERM
     stop_and_reap_raw_jobs
     if (( remote_created && ! cleaned )); then
-      { for i in $(seq 0 7); do printf 'rm %s/file-%s.bin\n' "$remote" "$i"; done; printf 'rmdir %s\n' "$remote"; } | "${sftp_cmd[@]}" >/dev/null 2>&1 || true
+      { for i in $(seq 0 "$last_job"); do printf 'rm %s/file-%s.bin\n' "$remote" "$i"; done; printf 'rmdir %s\n' "$remote"; } | "${sftp_cmd[@]}" >/dev/null 2>&1 || true
     fi
     sudo rm -rf "$localdir"
     restore
@@ -421,26 +452,27 @@ raw_sftp() {
   remote_created=1
   local t0 t1 t2
   t0=$(date +%s%3N)
-  for i in $(seq 0 7); do
+  for i in $(seq 0 "$last_job"); do
     (trap - EXIT INT TERM; printf 'put %s %s/file-%s.bin\n' "$localdir/file-$i.bin" "$remote" "$i" | "${sftp_cmd[@]}" >"$RESULT_DIR/raw-sftp-$timestamp-$$-upload-$i.log" 2>&1) &
     RAW_SFTP_PIDS+=("$!")
   done
   wait_all_raw_jobs || die "one or more raw SFTP upload workers failed"
   t1=$(date +%s%3N)
-  for i in $(seq 0 7); do
+  for i in $(seq 0 "$last_job"); do
     (trap - EXIT INT TERM; printf 'get %s/file-%s.bin /dev/null\n' "$remote" "$i" | "${sftp_cmd[@]}" >"$RESULT_DIR/raw-sftp-$timestamp-$$-download-$i.log" 2>&1) &
     RAW_SFTP_PIDS+=("$!")
   done
   wait_all_raw_jobs || die "one or more raw SFTP download workers failed"
   t2=$(date +%s%3N)
-  { for i in $(seq 0 7); do printf 'rm %s/file-%s.bin\n' "$remote" "$i"; done; printf 'rmdir %s\n' "$remote"; } | "${sftp_cmd[@]}"
+  { for i in $(seq 0 "$last_job"); do printf 'rm %s/file-%s.bin\n' "$remote" "$i"; done; printf 'rmdir %s\n' "$remote"; } | "${sftp_cmd[@]}"
   cleaned=1
   sudo rm -rf "$localdir"
   restore
   trap - EXIT INT TERM
-  printf 'raw_sftp_bytes=1073741824 upload_ms=%s upload_MiBps=%s download_ms=%s download_MiBps=%s\n' \
-    "$((t1-t0))" "$(awk -v ms="$((t1-t0))" 'BEGIN { printf "%.2f", 1024/(ms/1000) }')" \
-    "$((t2-t1))" "$(awk -v ms="$((t2-t1))" 'BEGIN { printf "%.2f", 1024/(ms/1000) }')" | tee "$result"
+  printf 'raw_sftp_jobs=%s raw_sftp_bytes=%s upload_ms=%s upload_MiBps=%s download_ms=%s download_MiBps=%s\n' \
+    "$RAW_SFTP_JOBS" "$total_bytes" \
+    "$((t1-t0))" "$(awk -v mib="$total_mib" -v ms="$((t1-t0))" 'BEGIN { printf "%.2f", mib/(ms/1000) }')" \
+    "$((t2-t1))" "$(awk -v mib="$total_mib" -v ms="$((t2-t1))" 'BEGIN { printf "%.2f", mib/(ms/1000) }')" | tee "$result"
   printf 'result=%s\n' "$result"
   (( restore_failed == 0 )) || die "raw SFTP control completed, but ZeroFS required a recovery restart"
 }
@@ -665,11 +697,14 @@ Environment:
   ZEROFS_BENCH_JOBS=N       Concurrent fio jobs (default 4).
   ZEROFS_PILOT_DRAIN_TIMEOUT=N
                              Maximum writeback drain wait in seconds (default 600).
+  ZEROFS_PILOT_STOP_TIMEOUT=N
+                             Maximum per-unit stop wait in seconds (default 60).
   ZEROFS_PILOT_EXPECT_ACK_MODE=MODE
                              Required configured durability mode (default memory).
   ZEROFS_NPM_WORKLOAD_*     Override the pinned npm repository and commit.
   ZEROFS_RUST_WORKLOAD_*    Override the pinned Cargo repository and commit.
   ZEROFS_DELETE_JOBS=N      Parallel node_modules deletion workers (default 4).
+  ZEROFS_RAW_SFTP_JOBS=N    Raw SFTP streams/files (default 7; set 8 for the account maximum).
 EOF
 }
 
