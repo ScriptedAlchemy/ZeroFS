@@ -23,8 +23,8 @@ METADATA_DIR=${ZEROFS_PILOT_METADATA_DIR:-$MOUNTPOINT/metadata-v2}
 METADATA_FILE_COUNT=${ZEROFS_PILOT_METADATA_FILE_COUNT:-1024}
 RESULT_DIR=${ZEROFS_PILOT_RESULT_DIR:-/var/tmp/zerofs-pilot-results}
 CARGO_CMD=${ZEROFS_PILOT_CARGO:-}
-NPM_WORKLOAD_REPO=${ZEROFS_NPM_WORKLOAD_REPO:-https://github.com/expressjs/express.git}
-NPM_WORKLOAD_COMMIT=${ZEROFS_NPM_WORKLOAD_COMMIT:-cd7d4397c398a3f3ecadeaf9ef6ac1377bd414c4}
+NPM_WORKLOAD_REPO=${ZEROFS_NPM_WORKLOAD_REPO:-https://github.com/npm/cli.git}
+NPM_WORKLOAD_COMMIT=${ZEROFS_NPM_WORKLOAD_COMMIT:-64763a341e7aa5b456e696f956759bf9b3440dc1}
 RUST_WORKLOAD_REPO=${ZEROFS_RUST_WORKLOAD_REPO:-https://github.com/BurntSushi/ripgrep.git}
 RUST_WORKLOAD_COMMIT=${ZEROFS_RUST_WORKLOAD_COMMIT:-af60c2de9d85e7f3d81c78601669468cf02dabab}
 
@@ -354,13 +354,13 @@ workloads() {
   local npm_remove_start npm_remove_ms npm_remove_sync_start npm_remove_sync_ms npm_remove_remote_start npm_remove_remote_ms
   local npm_warm_start npm_warm_ms npm_warm_sync_start npm_warm_sync_ms npm_warm_remote_start npm_warm_remote_ms
   clone_start=$(date +%s%3N)
-  clone_pinned "$NPM_WORKLOAD_REPO" "$NPM_WORKLOAD_COMMIT" "$workroot/npm-express"
+  clone_pinned "$NPM_WORKLOAD_REPO" "$NPM_WORKLOAD_COMMIT" "$workroot/npm-cli"
   npm_clone_ms=$(($(date +%s%3N) - clone_start))
   sudo sync -f "$MOUNTPOINT"
   wait_drain 600 >/dev/null
 
   npm_cold_start=$(date +%s%3N)
-  if ! (cd "$workroot/npm-express" && npm ci --ignore-scripts --no-audit --no-fund) >"$npm_log" 2>&1; then
+  if ! (cd "$workroot/npm-cli" && npm ci --ignore-scripts --no-audit --no-fund) >"$npm_log" 2>&1; then
     tail -100 "$npm_log" >&2
     die "npm cold install failed"
   fi
@@ -373,7 +373,7 @@ workloads() {
   npm_cold_remote_ms=$(($(date +%s%3N) - npm_cold_remote_start))
 
   npm_remove_start=$(date +%s%3N)
-  rm -rf -- "$workroot/npm-express/node_modules"
+  rm -rf -- "$workroot/npm-cli/node_modules"
   npm_remove_ms=$(($(date +%s%3N) - npm_remove_start))
   npm_remove_sync_start=$(date +%s%3N)
   sudo sync -f "$MOUNTPOINT"
@@ -383,7 +383,7 @@ workloads() {
   npm_remove_remote_ms=$(($(date +%s%3N) - npm_remove_remote_start))
 
   npm_warm_start=$(date +%s%3N)
-  if ! (cd "$workroot/npm-express" && npm ci --ignore-scripts --no-audit --no-fund) >>"$npm_log" 2>&1; then
+  if ! (cd "$workroot/npm-cli" && npm ci --ignore-scripts --no-audit --no-fund) >>"$npm_log" 2>&1; then
     tail -100 "$npm_log" >&2
     die "npm warm install failed"
   fi
