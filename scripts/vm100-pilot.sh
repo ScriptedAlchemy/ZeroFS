@@ -23,6 +23,10 @@ METADATA_DIR=${ZEROFS_PILOT_METADATA_DIR:-$MOUNTPOINT/metadata-v2}
 METADATA_FILE_COUNT=${ZEROFS_PILOT_METADATA_FILE_COUNT:-1024}
 RESULT_DIR=${ZEROFS_PILOT_RESULT_DIR:-/var/tmp/zerofs-pilot-results}
 CARGO_CMD=${ZEROFS_PILOT_CARGO:-}
+NPM_WORKLOAD_REPO=${ZEROFS_NPM_WORKLOAD_REPO:-https://github.com/expressjs/express.git}
+NPM_WORKLOAD_COMMIT=${ZEROFS_NPM_WORKLOAD_COMMIT:-cd7d4397c398a3f3ecadeaf9ef6ac1377bd414c4}
+RUST_WORKLOAD_REPO=${ZEROFS_RUST_WORKLOAD_REPO:-https://github.com/BurntSushi/ripgrep.git}
+RUST_WORKLOAD_COMMIT=${ZEROFS_RUST_WORKLOAD_COMMIT:-af60c2de9d85e7f3d81c78601669468cf02dabab}
 
 if [[ -z $CARGO_CMD ]]; then
   CARGO_CMD=$(command -v cargo 2>/dev/null || true)
@@ -130,7 +134,6 @@ build_deploy() {
   teardown
   sudo install -m 0755 "$CRATE/target/release/zerofs" "$BINARY"
   [[ $(sha256sum "$BINARY" | awk '{print $1}') == "$built_sha" ]] || die "installed binary hash mismatch"
-  (cd "$CRATE" && "$CARGO_CMD" clean)
   printf 'installed_binary_sha256=%s\n' "$built_sha"
 }
 
@@ -304,14 +307,182 @@ raw_sftp() {
   (( restore_failed == 0 )) || die "raw SFTP control completed, but ZeroFS required a recovery restart"
 }
 
+clone_pinned() {
+  local repo=$1 commit=$2 destination=$3
+  git init -q "$destination"
+  git -C "$destination" remote add origin "$repo"
+  git -C "$destination" fetch -q --depth 1 origin "$commit"
+  git -C "$destination" checkout -q --detach FETCH_HEAD
+  [[ $(git -C "$destination" rev-parse HEAD) == "$commit" ]] || die "pinned checkout mismatch for $repo"
+}
+
+workloads() {
+  require_vm100
+  command -v git >/dev/null || die "git is required for workload benchmarks"
+  command -v npm >/dev/null || die "npm is required for workload benchmarks"
+  [[ -n $CARGO_CMD && -x $CARGO_CMD ]] || die "cargo was not found; set ZEROFS_PILOT_CARGO"
+  status >/dev/null
+  wait_drain 600 >/dev/null
+
+  local timestamp run workroot result npm_log cargo_log
+  timestamp=$(date -u +%Y%m%dT%H%M%SZ)
+  run="${timestamp}-$$"
+  workroot="$MOUNTPOINT/.zerofs-workloads-$run"
+  sudo install -d -m 0755 -o "$(id -un)" -g "$(id -gn)" "$RESULT_DIR"
+  result="$RESULT_DIR/workloads-$run.txt"
+  npm_log="$RESULT_DIR/workloads-$run-npm.log"
+  cargo_log="$RESULT_DIR/workloads-$run-cargo.log"
+  mkdir -p "$workroot"
+
+  local cleaned=0 cleanup_ms=0
+  cleanup_workloads() {
+    local exit_status=$? cleanup_start
+    if (( ! cleaned )); then
+      cleanup_start=$(date +%s%3N)
+      sudo rm -rf -- "$workroot"
+      cleanup_ms=$(($(date +%s%3N) - cleanup_start))
+      cleaned=1
+      sudo sync -f "$MOUNTPOINT" || exit_status=1
+      wait_drain 600 >/dev/null || exit_status=1
+      [[ ! -e $workroot ]] || exit_status=1
+    fi
+    return "$exit_status"
+  }
+  trap cleanup_workloads EXIT
+
+  local clone_start npm_clone_ms npm_cold_start npm_cold_ms npm_cold_sync_start npm_cold_sync_ms npm_cold_remote_start npm_cold_remote_ms
+  local npm_remove_start npm_remove_ms npm_remove_sync_start npm_remove_sync_ms npm_remove_remote_start npm_remove_remote_ms
+  local npm_warm_start npm_warm_ms npm_warm_sync_start npm_warm_sync_ms npm_warm_remote_start npm_warm_remote_ms
+  clone_start=$(date +%s%3N)
+  clone_pinned "$NPM_WORKLOAD_REPO" "$NPM_WORKLOAD_COMMIT" "$workroot/npm-express"
+  npm_clone_ms=$(($(date +%s%3N) - clone_start))
+  sudo sync -f "$MOUNTPOINT"
+  wait_drain 600 >/dev/null
+
+  npm_cold_start=$(date +%s%3N)
+  if ! (cd "$workroot/npm-express" && npm ci --ignore-scripts --no-audit --no-fund) >"$npm_log" 2>&1; then
+    tail -100 "$npm_log" >&2
+    die "npm cold install failed"
+  fi
+  npm_cold_ms=$(($(date +%s%3N) - npm_cold_start))
+  npm_cold_sync_start=$(date +%s%3N)
+  sudo sync -f "$MOUNTPOINT"
+  npm_cold_sync_ms=$(($(date +%s%3N) - npm_cold_sync_start))
+  npm_cold_remote_start=$(date +%s%3N)
+  wait_drain 600 >/dev/null
+  npm_cold_remote_ms=$(($(date +%s%3N) - npm_cold_remote_start))
+
+  npm_remove_start=$(date +%s%3N)
+  rm -rf -- "$workroot/npm-express/node_modules"
+  npm_remove_ms=$(($(date +%s%3N) - npm_remove_start))
+  npm_remove_sync_start=$(date +%s%3N)
+  sudo sync -f "$MOUNTPOINT"
+  npm_remove_sync_ms=$(($(date +%s%3N) - npm_remove_sync_start))
+  npm_remove_remote_start=$(date +%s%3N)
+  wait_drain 600 >/dev/null
+  npm_remove_remote_ms=$(($(date +%s%3N) - npm_remove_remote_start))
+
+  npm_warm_start=$(date +%s%3N)
+  if ! (cd "$workroot/npm-express" && npm ci --ignore-scripts --no-audit --no-fund) >>"$npm_log" 2>&1; then
+    tail -100 "$npm_log" >&2
+    die "npm warm install failed"
+  fi
+  npm_warm_ms=$(($(date +%s%3N) - npm_warm_start))
+  npm_warm_sync_start=$(date +%s%3N)
+  sudo sync -f "$MOUNTPOINT"
+  npm_warm_sync_ms=$(($(date +%s%3N) - npm_warm_sync_start))
+  npm_warm_remote_start=$(date +%s%3N)
+  wait_drain 600 >/dev/null
+  npm_warm_remote_ms=$(($(date +%s%3N) - npm_warm_remote_start))
+
+  local cargo_clone_start cargo_clone_ms cargo_cold_start cargo_cold_ms cargo_cold_sync_start cargo_cold_sync_ms cargo_cold_remote_start cargo_cold_remote_ms
+  local cargo_noop_start cargo_noop_ms cargo_incremental_start cargo_incremental_ms cargo_incremental_sync_start cargo_incremental_sync_ms cargo_incremental_remote_start cargo_incremental_remote_ms
+  cargo_clone_start=$(date +%s%3N)
+  clone_pinned "$RUST_WORKLOAD_REPO" "$RUST_WORKLOAD_COMMIT" "$workroot/ripgrep"
+  cargo_clone_ms=$(($(date +%s%3N) - cargo_clone_start))
+  sudo sync -f "$MOUNTPOINT"
+  wait_drain 600 >/dev/null
+
+  cargo_cold_start=$(date +%s%3N)
+  if ! (cd "$workroot/ripgrep" && "$CARGO_CMD" build --locked) >"$cargo_log" 2>&1; then
+    tail -100 "$cargo_log" >&2
+    die "Cargo cold build failed"
+  fi
+  cargo_cold_ms=$(($(date +%s%3N) - cargo_cold_start))
+  cargo_cold_sync_start=$(date +%s%3N)
+  sudo sync -f "$MOUNTPOINT"
+  cargo_cold_sync_ms=$(($(date +%s%3N) - cargo_cold_sync_start))
+  cargo_cold_remote_start=$(date +%s%3N)
+  wait_drain 600 >/dev/null
+  cargo_cold_remote_ms=$(($(date +%s%3N) - cargo_cold_remote_start))
+
+  cargo_noop_start=$(date +%s%3N)
+  (cd "$workroot/ripgrep" && "$CARGO_CMD" build --locked) >>"$cargo_log" 2>&1
+  cargo_noop_ms=$(($(date +%s%3N) - cargo_noop_start))
+
+  touch "$workroot/ripgrep/crates/core/main.rs"
+  cargo_incremental_start=$(date +%s%3N)
+  if ! (cd "$workroot/ripgrep" && "$CARGO_CMD" build --locked) >>"$cargo_log" 2>&1; then
+    tail -100 "$cargo_log" >&2
+    die "Cargo incremental rebuild failed"
+  fi
+  cargo_incremental_ms=$(($(date +%s%3N) - cargo_incremental_start))
+  cargo_incremental_sync_start=$(date +%s%3N)
+  sudo sync -f "$MOUNTPOINT"
+  cargo_incremental_sync_ms=$(($(date +%s%3N) - cargo_incremental_sync_start))
+  cargo_incremental_remote_start=$(date +%s%3N)
+  wait_drain 600 >/dev/null
+  cargo_incremental_remote_ms=$(($(date +%s%3N) - cargo_incremental_remote_start))
+
+  local cleanup_start
+  cleanup_start=$(date +%s%3N)
+  sudo rm -rf -- "$workroot"
+  cleanup_ms=$(($(date +%s%3N) - cleanup_start))
+  cleaned=1
+  sudo sync -f "$MOUNTPOINT"
+  wait_drain 600 >/dev/null
+  [[ ! -e $workroot ]] || die "disposable workload tree remains after cleanup"
+  trap - EXIT
+
+  {
+    printf 'commit=%s\n' "$(git -C "$ROOT" rev-parse HEAD)"
+    printf 'mountpoint=%s\n' "$MOUNTPOINT"
+    printf 'npm_repo=%s npm_commit=%s clone_ms=%s\n' "$NPM_WORKLOAD_REPO" "$NPM_WORKLOAD_COMMIT" "$npm_clone_ms"
+    printf 'npm_cold_install_ms=%s npm_cold_local_sync_ms=%s npm_cold_remote_tail_ms=%s npm_cold_end_to_end_ms=%s\n' \
+      "$npm_cold_ms" "$npm_cold_sync_ms" "$npm_cold_remote_ms" "$((npm_cold_ms + npm_cold_sync_ms + npm_cold_remote_ms))"
+    printf 'npm_remove_node_modules_ms=%s npm_remove_local_sync_ms=%s npm_remove_remote_tail_ms=%s npm_remove_end_to_end_ms=%s\n' \
+      "$npm_remove_ms" "$npm_remove_sync_ms" "$npm_remove_remote_ms" "$((npm_remove_ms + npm_remove_sync_ms + npm_remove_remote_ms))"
+    printf 'npm_warm_install_ms=%s npm_warm_local_sync_ms=%s npm_warm_remote_tail_ms=%s npm_warm_end_to_end_ms=%s\n' \
+      "$npm_warm_ms" "$npm_warm_sync_ms" "$npm_warm_remote_ms" "$((npm_warm_ms + npm_warm_sync_ms + npm_warm_remote_ms))"
+    printf 'cargo_repo=%s cargo_commit=%s clone_ms=%s\n' "$RUST_WORKLOAD_REPO" "$RUST_WORKLOAD_COMMIT" "$cargo_clone_ms"
+    printf 'cargo_cold_build_ms=%s cargo_cold_local_sync_ms=%s cargo_cold_remote_tail_ms=%s cargo_cold_end_to_end_ms=%s\n' \
+      "$cargo_cold_ms" "$cargo_cold_sync_ms" "$cargo_cold_remote_ms" "$((cargo_cold_ms + cargo_cold_sync_ms + cargo_cold_remote_ms))"
+    printf 'cargo_noop_rebuild_ms=%s\n' "$cargo_noop_ms"
+    printf 'cargo_incremental_rebuild_ms=%s cargo_incremental_local_sync_ms=%s cargo_incremental_remote_tail_ms=%s cargo_incremental_end_to_end_ms=%s\n' \
+      "$cargo_incremental_ms" "$cargo_incremental_sync_ms" "$cargo_incremental_remote_ms" "$((cargo_incremental_ms + cargo_incremental_sync_ms + cargo_incremental_remote_ms))"
+    printf 'workload_cleanup_ms=%s cleanup_verified=1\n' "$cleanup_ms"
+    printf 'npm_log=%s cargo_log=%s\n' "$npm_log" "$cargo_log"
+  } | tee "$result"
+  printf 'result=%s\n' "$result"
+}
+
+iterate() {
+  setup
+  benchmark
+  workloads
+  raw_sftp
+}
+
 usage() {
   cat <<'EOF'
-Usage: scripts/vm100-pilot.sh <setup|teardown|restart|status|benchmark|raw-sftp|all>
+Usage: scripts/vm100-pilot.sh <setup|teardown|restart|status|benchmark|workloads|raw-sftp|iterate|all>
 
 Environment:
   ZEROFS_SKIP_BUILD=1       Start without pulling/building/installing.
   ZEROFS_BENCH_TOTAL_MIB=N  Logical benchmark size (default 1024).
   ZEROFS_BENCH_JOBS=N       Concurrent fio jobs (default 4).
+  ZEROFS_NPM_WORKLOAD_*     Override the pinned npm repository and commit.
+  ZEROFS_RUST_WORKLOAD_*    Override the pinned Cargo repository and commit.
 EOF
 }
 
@@ -321,7 +492,9 @@ case ${1:-} in
   restart) teardown; ZEROFS_SKIP_BUILD=1 start_stack ;;
   status) status ;;
   benchmark) benchmark ;;
+  workloads) workloads ;;
   raw-sftp) raw_sftp ;;
-  all) raw_sftp; benchmark ;;
+  iterate) iterate ;;
+  all) benchmark; workloads; raw_sftp ;;
   *) usage; exit 2 ;;
 esac
