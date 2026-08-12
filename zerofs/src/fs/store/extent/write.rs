@@ -439,12 +439,31 @@ impl ExtentStore {
                 None => None,
             }
         };
-        for (segid, bytes) in pending {
-            self.segments
-                .put_segment(segid, bytes)
-                .await
-                .map_err(|_| FsError::IoError)?;
-            self.sealing.lock().unwrap().remove(&segid);
+        let results: Vec<_> = stream::iter(pending)
+            .map(|(segid, bytes)| {
+                let segments = Arc::clone(&self.segments);
+                async move { (segid, segments.put_segment(segid, bytes).await) }
+            })
+            // Keep BTreeMap seal order deterministic while polling at most the
+            // configured number of independent immutable PUTs concurrently.
+            .buffered(self.max_inflight_seals)
+            .collect()
+            .await;
+
+        let mut failed = false;
+        for (segid, result) in results {
+            match result {
+                Ok(()) => {
+                    self.sealing.lock().unwrap().remove(&segid);
+                }
+                Err(e) => {
+                    failed = true;
+                    error!("seal PUT failed for {:?}: {}; retained for retry", segid, e);
+                }
+            }
+        }
+        if failed {
+            return Err(FsError::IoError);
         }
         Ok(())
     }
@@ -731,7 +750,91 @@ mod tests {
     use super::super::test_util::*;
     use super::*;
     use crate::config::CompressionConfig;
+    use crate::fault_store::{FaultControls, FaultStore};
+    use slatedb::object_store::ObjectStore;
+    use slatedb::object_store::memory::InMemory;
     use tokio::sync::Semaphore;
+
+    async fn four_dirty_lanes(max_inflight_seals: usize) -> (ExtentStore, Arc<FaultControls>) {
+        let (_store, db) = make().await;
+        let (object_store, controls) = FaultStore::new(Arc::new(InMemory::new()));
+        let object_store: Arc<dyn ObjectStore> = object_store;
+        let mut store = make_store(object_store, db.clone(), CompressionConfig::Lz4, 7);
+        store.max_inflight_seals = max_inflight_seals;
+        store.seal_sem = Arc::new(Semaphore::new(max_inflight_seals));
+        for lane in 0..OPEN_SEGMENT_LANES as u64 {
+            let inode = 100 + lane;
+            let mut txn = db.new_transaction().unwrap();
+            store
+                .write(
+                    &mut txn,
+                    inode,
+                    0,
+                    &Bytes::from(incompressible(inode as usize, EXTENT_SIZE)),
+                    0,
+                )
+                .await
+                .unwrap();
+            commit(&store, txn).await;
+        }
+        (store, controls)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn seal_open_publishes_dirty_lanes_concurrently_within_limit() {
+        let (store, controls) = four_dirty_lanes(2).await;
+        controls.block_puts();
+
+        let seal = tokio::spawn({
+            let store = store.clone();
+            async move { store.seal_open().await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while controls.max_active_puts() < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dirty lane PUTs did not fill the configured concurrency limit");
+
+        assert_eq!(
+            controls.max_active_puts(),
+            2,
+            "dirty lane PUTs must overlap without exceeding max_inflight_seals"
+        );
+        controls.release_puts();
+        seal.await.unwrap().unwrap();
+        assert!(store.sealing.lock().unwrap().is_empty());
+        assert_eq!(store.segments.list_segments().await.unwrap().len(), 4);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn seal_open_retains_only_failed_segments_for_retry() {
+        let (store, controls) = four_dirty_lanes(2).await;
+        let segment_puts = || {
+            controls
+                .put_paths()
+                .iter()
+                .filter(|path| path.starts_with("segments/"))
+                .count()
+        };
+        let puts_before = segment_puts();
+        controls.fail_puts(1);
+
+        assert!(store.seal_open().await.is_err());
+        assert_eq!(
+            segment_puts() - puts_before,
+            4,
+            "one failed PUT must not cancel independent captured lanes"
+        );
+        assert_eq!(store.sealing.lock().unwrap().len(), 1);
+        assert_eq!(store.segments.list_segments().await.unwrap().len(), 3);
+
+        store.seal_open().await.unwrap();
+        assert_eq!(segment_puts() - puts_before, 5);
+        assert!(store.sealing.lock().unwrap().is_empty());
+        assert_eq!(store.segments.list_segments().await.unwrap().len(), 4);
+    }
 
     #[tokio::test]
     async fn segcount_tracks_live_bytes_across_overwrite_and_delete() {
