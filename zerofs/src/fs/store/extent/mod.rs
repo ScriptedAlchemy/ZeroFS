@@ -51,10 +51,22 @@ use write::{OPEN_SEGMENT_LANES, OpenLane, OpenSegment, TAIL_CACHE_BYTES};
 
 pub(super) const PARALLEL_EXTENT_OPS: usize = 20;
 
-/// Test and embedding fallback. Server startup passes an explicit share of the
-/// configured clean memory-cache budget instead.
+/// Test and embedding fallback for the combined decoded-data and extent-location
+/// read caches. Server startup passes an explicit share of the configured clean
+/// memory-cache budget instead.
 pub(crate) const DEFAULT_DECODED_EXTENT_CACHE_BYTES: usize = 64 * 1024 * 1024;
-const EXTENT_LOCATION_CACHE_BYTES: usize = 128 * 1024 * 1024;
+const MAX_EXTENT_LOCATION_CACHE_BYTES: usize = 128 * 1024 * 1024;
+/// Allow for the hash-table node, eviction metadata, and allocator bookkeeping
+/// that `size_of` on the logical key and value cannot see.
+const EXTENT_LOCATION_ENTRY_OVERHEAD_BYTES: usize = 64;
+
+/// Split one configured extent-read budget into decoded data and logical
+/// locations. Locations receive one eighth up to a 128 MiB cap; subtraction
+/// keeps every total, including tiny values, strictly conserved.
+pub(crate) fn split_extent_read_budget(total: usize) -> (usize, usize) {
+    let locations = (total / 8).min(MAX_EXTENT_LOCATION_CACHE_BYTES);
+    (total - locations, locations)
+}
 
 pub(super) const ZERO_EXTENT: &[u8] = &[0u8; EXTENT_SIZE];
 
@@ -233,16 +245,19 @@ impl ExtentStore {
         let read_ahead = CacheBuilder::new(READ_AHEAD_TRACK_BYTES)
             .with_weighter(|_: &InodeId, _: &(u64, u64, u32)| 24)
             .build();
+        let (decoded_extent_cache_bytes, extent_location_cache_bytes) =
+            split_extent_read_budget(decoded_extent_cache_bytes);
         let decoded_extent_cache = CacheBuilder::new(decoded_extent_cache_bytes)
             .with_weighter(|_: &DecodedExtentKey, data: &Bytes| data.len())
             .build();
         let extent_location_cache = ExtentLocationCache::new(
             db.clone(),
-            EXTENT_LOCATION_CACHE_BYTES,
+            extent_location_cache_bytes,
             "zerofs-extent-location-cache",
             |_: &ExtentLocationKey, _: &CachedExtentLocation| {
                 std::mem::size_of::<ExtentLocationKey>()
                     + std::mem::size_of::<CachedExtentLocation>()
+                    + EXTENT_LOCATION_ENTRY_OVERHEAD_BYTES
             },
         );
         let codec = segments.codec();
@@ -506,6 +521,36 @@ impl ExtentStore {
 mod tests {
     use super::test_util::*;
     use super::*;
+
+    #[test]
+    fn extent_read_budget_is_conserved() {
+        let mib = 1024 * 1024;
+        let total = 512 * mib;
+
+        let (decoded, locations) = split_extent_read_budget(total);
+
+        assert_eq!(decoded, 448 * mib);
+        assert_eq!(locations, 64 * mib);
+        assert_eq!(decoded + locations, total);
+    }
+
+    #[test]
+    fn extent_location_budget_is_capped_at_128_mib() {
+        let mib = 1024 * 1024;
+        let total = 16 * 1024 * mib;
+
+        let (decoded, locations) = split_extent_read_budget(total);
+
+        assert_eq!(locations, 128 * mib);
+        assert_eq!(decoded, total - 128 * mib);
+    }
+
+    #[test]
+    fn tiny_extent_read_budgets_never_invent_capacity() {
+        assert_eq!(split_extent_read_budget(0), (0, 0));
+        assert_eq!(split_extent_read_budget(7), (7, 0));
+        assert_eq!(split_extent_read_budget(8), (7, 1));
+    }
 
     // The footprint gauges are maintained incrementally off the commit path, so
     // they must track writes and overwrites with no reclaim pass, and always

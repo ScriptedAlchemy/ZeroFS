@@ -585,7 +585,8 @@ pub(crate) fn split_disk_budget(total_disk_bytes: usize) -> (usize, usize) {
 /// Split the configured clean memory-cache total into (parts_memory_bytes,
 /// decoded_blocks_memory_bytes, decoded_extent_memory_bytes). The metadata
 /// block cache retains its existing quarter/cap policy; the data share is split
-/// evenly between encrypted segment parts and read-ready plaintext extents.
+/// evenly between encrypted segment parts and the extent-read caches (decoded
+/// plaintext plus their logical location map).
 pub(crate) fn split_memory_budget(total_memory_bytes: usize) -> (usize, usize, usize) {
     const MIN_BYTES: usize = 32 * 1024 * 1024; // 32 MiB floor per consumer
     const MAX_META_BYTES: usize = 2 * 1024 * 1024 * 1024; // metadata blocks rarely need more
@@ -604,8 +605,9 @@ pub struct SlateDbOpen {
     /// The raw-parts prefetch cache, returned so the segment store reuses it
     /// (one budget; segment objects and SST objects share it, keyed by path).
     pub parts_cache: foyer::HybridCache<crate::object_store_prefetch::PartKey, bytes::Bytes>,
-    /// Portion of the configured clean memory cache reserved for read-ready
-    /// plaintext extents. This is separate from the dirty writeback budget.
+    /// Portion of the configured clean memory cache reserved for extent reads:
+    /// read-ready plaintext plus its logical location map. This is separate from
+    /// the dirty writeback budget.
     pub decoded_extent_memory_bytes: usize,
 }
 
@@ -651,7 +653,7 @@ pub async fn build_slatedb(
 
     info!(
         "Cache allocation - Disk: {:.2}GB total ({} MB decoded-blocks + {} MB raw-parts), \
-         Memory: {:.2}GB total ({} MB decoded-extents + {} MB decoded-blocks + {} MB raw-parts)",
+         Memory: {:.2}GB total ({} MB extent-reads + {} MB decoded-blocks + {} MB raw-parts)",
         total_disk_cache_gb,
         hybrid_disk_bytes / 1_000_000,
         parts_disk_bytes / 1_000_000,
