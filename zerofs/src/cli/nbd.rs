@@ -3,10 +3,12 @@ use crate::nbd::{
     NBD_STRIPE_MAX_MEMBERS, NBD_STRIPE_MIN_BYTES as MIN_STRIPE_BYTES, StripeManifest,
 };
 use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use zerofs_client::{Client, OpenOptions, ZeroFsError};
 
 const PROVISION_MARKER: &str = ".zerofs-nbd-provision-v1";
+const PROVISION_PREFIX: &str = ".zerofs-nbd-provision-v1-";
 
 /// A validated striped NBD export geometry.
 #[derive(Clone, Debug)]
@@ -111,6 +113,23 @@ pub enum ProvisionOutcome {
     AlreadyProvisioned,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+struct ProvisionManifest {
+    version: u32,
+    export_name: String,
+    layout: StripeManifest,
+}
+
+impl ProvisionManifest {
+    fn new(layout: &StripedLayout) -> Self {
+        Self {
+            version: 1,
+            export_name: layout.export_name.clone(),
+            layout: layout.manifest(),
+        }
+    }
+}
+
 /// Parse an integer byte size with an optional binary suffix.
 ///
 /// Supported suffixes are `B`, `KiB`, `MiB`, `GiB`, and `TiB`.
@@ -195,12 +214,13 @@ async fn verify_complete(client: &Client, layout: &StripedLayout) -> Result<()> 
         .iter()
         .map(String::as_str)
         .chain(std::iter::once(STRIPE_MARKER))
+        .chain(std::iter::once(PROVISION_MARKER))
         .collect::<HashSet<_>>();
     let entries = client
         .read_dir(&export_path)
         .await
         .with_context(|| format!("list existing NBD export {export_path}"))?;
-    if entries.len() != expected.len()
+    if !(entries.len() == expected.len() || entries.len() + 1 == expected.len())
         || entries
             .iter()
             .any(|entry| !entry.name_is_utf8 || !expected.contains(entry.name.as_str()))
@@ -209,6 +229,25 @@ async fn verify_complete(client: &Client, layout: &StripedLayout) -> Result<()> 
             layout,
             "the export directory has unexpected entries",
         ));
+    }
+    let provision_path = format!("{export_path}/{PROVISION_MARKER}");
+    if client
+        .exists(&provision_path)
+        .await
+        .with_context(|| format!("inspect {provision_path}"))?
+    {
+        let bytes = client
+            .read(&provision_path)
+            .await
+            .with_context(|| format!("read {provision_path}"))?;
+        let provision: ProvisionManifest = serde_json::from_slice(&bytes)
+            .map_err(|error| conflict(layout, format!("invalid provision marker: {error}")))?;
+        if provision != ProvisionManifest::new(layout) {
+            return Err(conflict(
+                layout,
+                "the provision marker has different geometry",
+            ));
+        }
     }
     for member in &layout.members {
         verify_lane(
@@ -234,59 +273,112 @@ async fn create_manifest_file(client: &Client, path: &str, bytes: &[u8]) -> Resu
     Ok(())
 }
 
-async fn prepare_or_resume(client: &Client, layout: &StripedLayout) -> Result<()> {
-    let export_path = layout.export_path();
-    let draft_path = format!("{export_path}/{PROVISION_MARKER}");
-    let manifest = serde_json::to_vec(&layout.manifest()).context("encode stripe manifest")?;
-
-    match client.create_dir(&export_path, 0o755).await {
-        Ok(_) => create_manifest_file(client, &draft_path, &manifest).await?,
-        Err(ZeroFsError::AlreadyExists { .. }) => {
-            let metadata = client
-                .stat(&export_path)
-                .await
-                .with_context(|| format!("inspect existing NBD export {export_path}"))?;
-            if !metadata.is_dir() {
-                return Err(conflict(layout, "the export path is not a directory"));
-            }
-            let draft = client.read(&draft_path).await.map_err(|error| {
-                conflict(
-                    layout,
-                    format!("incomplete export has no valid provision marker: {error}"),
-                )
-            })?;
-            if decode_manifest(&draft, layout)? != layout.manifest() {
-                return Err(conflict(
-                    layout,
-                    "the provision marker has different geometry",
-                ));
-            }
-        }
-        Err(error) => return Err(error).context("create striped NBD export directory"),
-    }
-
+async fn validate_staging(
+    client: &Client,
+    layout: &StripedLayout,
+    staging_path: &str,
+) -> Result<()> {
     let allowed = layout
         .members
         .iter()
         .map(String::as_str)
         .chain(std::iter::once(PROVISION_MARKER))
+        .chain(std::iter::once(STRIPE_MARKER))
         .collect::<HashSet<_>>();
     let entries = client
-        .read_dir(&export_path)
+        .read_dir(staging_path)
         .await
-        .with_context(|| format!("list incomplete NBD export {export_path}"))?;
+        .with_context(|| format!("list incomplete NBD staging directory {staging_path}"))?;
     if entries
         .iter()
         .any(|entry| !entry.name_is_utf8 || !allowed.contains(entry.name.as_str()))
     {
         return Err(conflict(
             layout,
-            "the incomplete export has unexpected entries",
+            format!("staging directory {staging_path} has unexpected entries"),
         ));
     }
+    Ok(())
+}
 
+async fn read_provision_manifest(
+    client: &Client,
+    staging_path: &str,
+) -> Result<Option<ProvisionManifest>> {
+    let marker_path = format!("{staging_path}/{PROVISION_MARKER}");
+    match client.read(&marker_path).await {
+        // A crash can leave a marker inode before its short payload reaches
+        // ZeroFS. It cannot identify a resumable draft, so leave that unique
+        // staging directory untouched and let this attempt use a fresh one.
+        Ok(bytes) => Ok(serde_json::from_slice(&bytes).ok()),
+        Err(ZeroFsError::NotFound { .. }) => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("read staging marker {marker_path}")),
+    }
+}
+
+async fn find_matching_staging(client: &Client, layout: &StripedLayout) -> Result<Option<String>> {
+    let mut matching = None;
+    for entry in client
+        .read_dir("/.nbd")
+        .await
+        .context("list ZeroFS NBD directory for interrupted provisioning")?
+    {
+        if !entry.metadata.is_dir()
+            || !entry.name_is_utf8
+            || !entry.name.starts_with(PROVISION_PREFIX)
+        {
+            continue;
+        }
+        let path = format!("/.nbd/{}", entry.name);
+        let Some(provision) = read_provision_manifest(client, &path).await? else {
+            continue;
+        };
+        if provision.export_name != layout.export_name {
+            continue;
+        }
+        if provision.version != 1 {
+            return Err(conflict(
+                layout,
+                format!(
+                    "staging directory {path} uses unsupported provision version {}",
+                    provision.version
+                ),
+            ));
+        }
+        if provision.layout != layout.manifest() {
+            return Err(conflict(
+                layout,
+                format!("staging directory {path} has different geometry"),
+            ));
+        }
+        validate_staging(client, layout, &path).await?;
+        if matching.replace(path).is_some() {
+            return Err(conflict(
+                layout,
+                "multiple matching staging directories require manual inspection",
+            ));
+        }
+    }
+    Ok(matching)
+}
+
+async fn create_unique_staging(client: &Client, _layout: &StripedLayout) -> Result<String> {
+    for _ in 0..8 {
+        let path = format!("/.nbd/{PROVISION_PREFIX}{}", uuid::Uuid::new_v4());
+        match client.create_dir(&path, 0o755).await {
+            Ok(_) => return Ok(path),
+            Err(ZeroFsError::AlreadyExists { .. }) => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("create NBD staging directory {path}"));
+            }
+        }
+    }
+    bail!("could not allocate a unique NBD staging directory after 8 attempts")
+}
+
+async fn prepare_lanes(client: &Client, layout: &StripedLayout, root_path: &str) -> Result<()> {
     for member in &layout.members {
-        let path = format!("{export_path}/{member}");
+        let path = format!("{root_path}/{member}");
         match client.stat(&path).await {
             Ok(metadata) if metadata.is_file() && metadata.size == layout.member_size => {}
             Ok(metadata) if metadata.is_file() && metadata.size == 0 => {
@@ -317,15 +409,87 @@ async fn prepare_or_resume(client: &Client, layout: &StripedLayout) -> Result<()
             Err(error) => return Err(error).with_context(|| format!("inspect {path}")),
         }
     }
+    Ok(())
+}
 
-    match client
+async fn prepare_staging(client: &Client, layout: &StripedLayout) -> Result<String> {
+    let staging_path = match find_matching_staging(client, layout).await? {
+        Some(path) => path,
+        None => {
+            let path = create_unique_staging(client, layout).await?;
+            let provision = serde_json::to_vec(&ProvisionManifest::new(layout))
+                .context("encode NBD provision marker")?;
+            create_manifest_file(client, &format!("{path}/{PROVISION_MARKER}"), &provision).await?;
+            path
+        }
+    };
+    validate_staging(client, layout, &staging_path).await?;
+    prepare_lanes(client, layout, &staging_path).await?;
+
+    let manifest_path = format!("{staging_path}/{STRIPE_MARKER}");
+    let manifest = serde_json::to_vec(&layout.manifest()).context("encode stripe manifest")?;
+    match client.read(&manifest_path).await {
+        Ok(existing) if decode_manifest(&existing, layout)? == layout.manifest() => {}
+        Ok(_) => {
+            return Err(conflict(
+                layout,
+                "the staged stripe manifest has different geometry",
+            ));
+        }
+        Err(ZeroFsError::NotFound { .. }) => {
+            create_manifest_file(client, &manifest_path, &manifest).await?
+        }
+        Err(error) => return Err(error).with_context(|| format!("inspect {manifest_path}")),
+    }
+    validate_staging(client, layout, &staging_path).await?;
+    client
+        .sync()
+        .await
+        .context("flush completed NBD staging directory")?;
+    Ok(staging_path)
+}
+
+async fn resume_legacy_final_draft(client: &Client, layout: &StripedLayout) -> Result<()> {
+    let export_path = layout.export_path();
+    let draft_path = format!("{export_path}/{PROVISION_MARKER}");
+    let draft = client.read(&draft_path).await.map_err(|error| {
+        conflict(
+            layout,
+            format!("existing directory is not a recognized export or legacy draft: {error}"),
+        )
+    })?;
+    if decode_manifest(&draft, layout)? != layout.manifest() {
+        return Err(conflict(
+            layout,
+            "the legacy provision marker has different geometry",
+        ));
+    }
+    let allowed = layout
+        .members
+        .iter()
+        .map(String::as_str)
+        .chain(std::iter::once(PROVISION_MARKER))
+        .collect::<HashSet<_>>();
+    let entries = client
+        .read_dir(&export_path)
+        .await
+        .with_context(|| format!("list legacy draft {export_path}"))?;
+    if entries
+        .iter()
+        .any(|entry| !entry.name_is_utf8 || !allowed.contains(entry.name.as_str()))
+    {
+        return Err(conflict(layout, "the legacy draft has unexpected entries"));
+    }
+    prepare_lanes(client, layout, &export_path).await?;
+    client
+        .sync()
+        .await
+        .context("flush completed legacy NBD draft")?;
+    client
         .rename(&draft_path, format!("{export_path}/{STRIPE_MARKER}"))
         .await
-    {
-        Ok(()) => Ok(()),
-        Err(ZeroFsError::NotFound { .. }) => verify_complete(client, layout).await,
-        Err(error) => Err(error).context("publish striped NBD manifest"),
-    }
+        .context("publish legacy striped NBD manifest")?;
+    Ok(())
 }
 
 /// Provision a striped export through ZeroFS itself without formatting or attaching it.
@@ -360,9 +524,30 @@ pub async fn provision_striped(
             client.sync().await.context("flush existing NBD export")?;
             return Ok(ProvisionOutcome::AlreadyProvisioned);
         }
+        resume_legacy_final_draft(client, layout).await?;
+        verify_complete(client, layout).await?;
+        client
+            .sync()
+            .await
+            .context("flush migrated legacy NBD export")?;
+        return Ok(ProvisionOutcome::Created);
     }
 
-    prepare_or_resume(client, layout).await?;
+    let staging_path = prepare_staging(client, layout).await?;
+    if client
+        .exists(layout.export_path())
+        .await
+        .context("recheck the final NBD export before publication")?
+    {
+        return Err(conflict(
+            layout,
+            "the final export appeared while provisioning",
+        ));
+    }
+    client
+        .rename(&staging_path, layout.export_path())
+        .await
+        .context("atomically publish striped NBD export")?;
     verify_complete(client, layout).await?;
     client
         .sync()
@@ -404,7 +589,10 @@ pub async fn run_provision_striped(
 
 #[cfg(test)]
 mod tests {
-    use super::{ProvisionOutcome, StripedLayout, parse_byte_size, provision_striped};
+    use super::{
+        PROVISION_MARKER, ProvisionOutcome, StripedLayout, create_unique_staging, parse_byte_size,
+        provision_striped,
+    };
     use crate::fs::ZeroFS;
     use crate::nbd::NbdExportGates;
     use crate::nbd::handler::NBDHandler;
@@ -580,6 +768,74 @@ mod tests {
                 .unwrap(),
             original_marker
         );
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn interrupted_staging_creation_never_exposes_the_final_export_name() {
+        let (client, _filesystem, shutdown, _directory) = setup().await;
+        client.create_dir_all("/.nbd", 0o755).await.unwrap();
+        let layout = StripedLayout::new("vm100", 64 * MIB, 4, MIB).unwrap();
+
+        let staging_path = create_unique_staging(&client, &layout).await.unwrap();
+
+        assert_ne!(staging_path, "/.nbd/vm100");
+        assert!(staging_path.starts_with("/.nbd/.zerofs-nbd-provision-v1-"));
+        assert!(client.exists(&staging_path).await.unwrap());
+        assert!(!client.exists("/.nbd/vm100").await.unwrap());
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn interrupted_marker_write_does_not_block_a_fresh_staging_attempt() {
+        let (client, filesystem, shutdown, _directory) = setup().await;
+        client.create_dir_all("/.nbd", 0o755).await.unwrap();
+        let layout = StripedLayout::new("vm100", 64 * MIB, 4, MIB).unwrap();
+        let abandoned = create_unique_staging(&client, &layout).await.unwrap();
+        client
+            .write(format!("{abandoned}/{PROVISION_MARKER}"), b"")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            provision_striped(&client, &layout).await.unwrap(),
+            ProvisionOutcome::Created
+        );
+        assert!(client.exists(&abandoned).await.unwrap());
+        let handler = NBDHandler::new(filesystem, Arc::new(NbdExportGates::default()));
+        assert_eq!(handler.get_device(b"vm100").await.unwrap().size, 64 * MIB);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn provision_recovers_a_matching_sibling_staging_directory() {
+        let (client, filesystem, shutdown, _directory) = setup().await;
+        let staging = "/.nbd/.zerofs-nbd-provision-v1-interrupted";
+        client.create_dir_all(staging, 0o755).await.unwrap();
+        client
+            .write(
+                format!("{staging}/.zerofs-nbd-provision-v1"),
+                br#"{"version":1,"export_name":"vm100","layout":{"version":1,"stripe_bytes":1048576,"members":["lane-0","lane-1","lane-2","lane-3"]}}"#,
+            )
+            .await
+            .unwrap();
+        client
+            .write(format!("{staging}/lane-0"), b"")
+            .await
+            .unwrap();
+        client
+            .truncate(format!("{staging}/lane-0"), 16 * MIB)
+            .await
+            .unwrap();
+        let layout = StripedLayout::new("vm100", 64 * MIB, 4, MIB).unwrap();
+
+        assert_eq!(
+            provision_striped(&client, &layout).await.unwrap(),
+            ProvisionOutcome::Created
+        );
+        assert!(!client.exists(staging).await.unwrap());
+        let handler = NBDHandler::new(filesystem, Arc::new(NbdExportGates::default()));
+        assert_eq!(handler.get_device(b"vm100").await.unwrap().size, 64 * MIB);
         shutdown.cancel();
     }
 }

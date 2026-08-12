@@ -60,11 +60,12 @@ the command with the exact same geometry is safe: it verifies the manifest and
 every lane, flushes the export, and reports that it is already provisioned.
 Conflicting existing files, directories, or geometry are never replaced.
 
-Provisioning writes a private draft marker before creating lanes, then
-atomically renames that marker to the NBD manifest only after every lane has
-the requested sparse length. A rerun can resume a matching draft after an
-interrupted command; an unrecognized partial directory is left untouched for
-manual inspection.
+Provisioning builds the marker, sparse lanes, and NBD manifest in a unique
+hidden sibling directory. It flushes that complete staging layout before one
+atomic rename publishes the final export name. A rerun can resume a matching
+staging directory after an interrupted command; an unrecognized partial
+directory is left untouched for manual inspection. Drafts left under the final
+name by older versions of this command are also recognized and completed.
 
 <Note>
   `provision-striped` only creates and flushes the export. It does not format a
