@@ -178,12 +178,12 @@ impl ExtentStore {
             .map_err(|_| FsError::IoError)?;
         while let Some(result) = stream.next().await {
             let (key, value) = result.map_err(|_| FsError::IoError)?;
-            if self.key_codec.parse_extent_key(&key).is_some() {
+            if let Some(extent_idx) = self.key_codec.parse_extent_key(&key) {
                 if let Some(loc) = FrameLoc::decode(&value) {
                     // Delete debit: live only, total untouched (monotonic).
                     self.seg_delta(txn, loc.segid, -(loc.byte_len as i64), 0);
                 }
-                txn.delete_bytes(&key);
+                self.delete(txn, id, extent_idx);
             }
         }
         Ok(())
@@ -760,15 +760,25 @@ mod tests {
     use slatedb::object_store::memory::InMemory;
     use tokio::sync::Semaphore;
 
-    fn staged_delete_keys(mut txn: Transaction) -> Vec<Bytes> {
+    fn staged_deletes(mut txn: Transaction) -> (Vec<Bytes>, Vec<(InodeId, u64)>) {
         let _ = txn.take_seg_deltas();
-        txn.apply_to_collecting(&mut WriteBatch::new())
+        let cache_deletes = txn
+            .take_extent_location_cache_updates()
+            .into_iter()
+            .map(|(key, location)| {
+                assert!(location.is_none(), "an extent delete must cache a hole");
+                key
+            })
+            .collect();
+        let delete_keys = txn
+            .apply_to_collecting(&mut WriteBatch::new())
             .into_iter()
             .filter_map(|op| match op {
                 ReplOp::Delete(key) => Some(key),
                 _ => None,
             })
-            .collect()
+            .collect();
+        (delete_keys, cache_deletes)
     }
 
     async fn four_dirty_lanes(max_inflight_seals: usize) -> (ExtentStore, Arc<FaultControls>) {
@@ -1008,10 +1018,12 @@ mod tests {
         let mut txn = db.new_transaction().unwrap();
         store.delete_range(&mut txn, inode, 0, 8).await.unwrap();
 
+        let (delete_keys, cache_deletes) = staged_deletes(txn);
         assert_eq!(
-            staged_delete_keys(txn),
+            delete_keys,
             allocated.map(|extent| store.key_codec.extent_key(inode, extent)),
         );
+        assert_eq!(cache_deletes, allocated.map(|extent| (inode, extent)));
     }
 
     #[tokio::test]
@@ -1056,6 +1068,54 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn sparse_truncate_invalidates_a_warm_extent_location() {
+        let (store, db) = make().await;
+        let inode: InodeId = 29;
+        let sparse_extent = 7_u64;
+        let old_size = sparse_extent * EXTENT_SIZE as u64 + 1;
+
+        let mut txn = db.new_transaction().unwrap();
+        store
+            .write(
+                &mut txn,
+                inode,
+                sparse_extent * EXTENT_SIZE as u64,
+                &Bytes::from_static(b"x"),
+                0,
+            )
+            .await
+            .unwrap();
+        commit(&store, txn).await;
+
+        let location = frameloc_of(&store, &db, inode, sparse_extent)
+            .await
+            .unwrap();
+        assert!(store.get(inode, sparse_extent).await.unwrap().is_some());
+        assert_eq!(
+            store.cached_extent_location(inode, sparse_extent),
+            Some(location),
+            "the regression requires a warm logical-to-physical cache entry"
+        );
+        let (live_before, total_before) = segcount_pair_of(&store, &db, location.segid).await;
+        assert_eq!(live_before, total_before);
+        assert!(live_before > 0);
+
+        let mut txn = db.new_transaction().unwrap();
+        store.truncate(&mut txn, inode, old_size, 0).await.unwrap();
+        commit(&store, txn).await;
+
+        assert_eq!(
+            segcount_pair_of(&store, &db, location.segid).await,
+            (0, total_before),
+            "truncate must debit the deleted frame's live bytes without reducing total"
+        );
+        assert!(
+            store.get(inode, sparse_extent).await.unwrap().is_none(),
+            "a deleted sparse extent must not survive through its cached FrameLoc"
         );
     }
 
