@@ -415,6 +415,7 @@ impl ExtentStore {
                     && loc == old_loc
                 {
                     txn.put_bytes(&key, Bytes::copy_from_slice(&new_loc.encode()));
+                    txn.update_cached_extent_location(inode, extent, Some(new_loc));
                     // Move the bytes only on a won CAS: after a lost race the
                     // relocated frame is dead weight (no live pointer) and must
                     // not be credited. Source debit is live-only; the packed
@@ -649,6 +650,13 @@ mod tests {
             .await
             .unwrap();
         store.reclaim_segments(Utc::now(), None).await.unwrap();
+
+        let current = frameloc_of(&store, &db, 1, 0).await.unwrap();
+        assert_eq!(
+            store.cached_extent_location(1, 0),
+            Some(current),
+            "GC repoint must publish the new physical location"
+        );
 
         // File A's three extents are now contiguous, so the whole-file read is a
         // single ranged GET, not three.

@@ -282,6 +282,10 @@ async fn worker_loop(
         let mut inode_cache_updates: HashMap<u64, Option<Inode>> = HashMap::new();
         let mut directory_entry_cache_updates: HashMap<(u64, bytes::Bytes), Option<(u64, u64)>> =
             HashMap::new();
+        let mut extent_location_cache_updates: HashMap<
+            (u64, u64),
+            Option<crate::segment::FrameLoc>,
+        > = HashMap::new();
         let mut shard_deltas: HashMap<usize, (i64, i64)> = HashMap::new();
         let mut seg_map: HashMap<bytes::Bytes, (i64, i64)> = HashMap::new();
         let mut batch_dedup_entries: Vec<crate::dedup::DedupEntry> = Vec::new();
@@ -298,6 +302,9 @@ async fn worker_loop(
             }
             for (key, entry) in txn.take_directory_entry_cache_updates() {
                 directory_entry_cache_updates.insert(key, entry);
+            }
+            for (key, location) in txn.take_extent_location_cache_updates() {
+                extent_location_cache_updates.insert(key, location);
             }
             for delta in txn.take_stats_deltas() {
                 let entry = shard_deltas
@@ -503,6 +510,10 @@ async fn worker_loop(
                     let directory_cache_guard = ctx
                         .directory_store
                         .invalidate_cache(directory_entry_cache_updates.keys().cloned());
+                    let extent_location_cache_guard =
+                        ctx.extent_store.invalidate_extent_location_cache(
+                            extent_location_cache_updates.keys().copied(),
+                        );
 
                     let write_result = permit
                         .write_with_options(
@@ -518,9 +529,14 @@ async fn worker_loop(
                         Ok(seqno) => {
                             inode_cache_guard.publish(inode_cache_updates);
                             directory_cache_guard.publish(directory_entry_cache_updates);
+                            ExtentStore::publish_extent_location_cache(
+                                extent_location_cache_guard,
+                                extent_location_cache_updates,
+                            );
                             Ok(seqno)
                         }
                         Err(error) => {
+                            drop(extent_location_cache_guard);
                             drop(directory_cache_guard);
                             drop(inode_cache_guard);
                             Err(error)
@@ -722,6 +738,69 @@ mod tests {
 
         assert_eq!(fs.inode_store.cache_load_count(), inode_loads);
         assert_eq!(fs.directory_store.cache_load_count(), entry_loads);
+    }
+
+    #[tokio::test]
+    async fn extent_location_publication_follows_the_coordinator_commit() {
+        let fs = make_fs().await;
+        let initial = Bytes::from(vec![0x21; 2 * crate::fs::EXTENT_SIZE]);
+        let mut create = Transaction::new();
+        let tail = fs
+            .extent_store
+            .write(&mut create, 41, 0, &initial, 0)
+            .await
+            .unwrap();
+        fs.write_coordinator.commit(create).await.unwrap();
+        fs.extent_store.apply_tail_update(41, tail);
+
+        let before = fs.db.scan_call_count();
+        assert_eq!(
+            fs.extent_store
+                .read(41, 0, initial.len() as u64)
+                .await
+                .unwrap(),
+            initial
+        );
+        assert_eq!(fs.db.scan_call_count(), before);
+
+        let key = codec().extent_key(41, 0);
+        let old_loc =
+            crate::segment::FrameLoc::decode(&fs.db.get_bytes(&key).await.unwrap().unwrap())
+                .unwrap();
+        let segcount = codec().segcount_key(old_loc.segid.epoch, old_loc.segid.counter);
+        fs.db
+            .put_with_options(
+                &segcount,
+                b"bogus",
+                &slatedb::config::PutOptions::default(),
+                &WriteOptions::default(),
+            )
+            .await
+            .unwrap();
+
+        let mut failed = Transaction::new();
+        fs.extent_store
+            .write(
+                &mut failed,
+                41,
+                0,
+                &Bytes::from(vec![0x99; crate::fs::EXTENT_SIZE]),
+                initial.len() as u64,
+            )
+            .await
+            .unwrap();
+        fs.write_coordinator.commit(failed).await.unwrap_err();
+
+        let before = fs.db.scan_call_count();
+        assert_eq!(
+            fs.extent_store
+                .read(41, 0, initial.len() as u64)
+                .await
+                .unwrap(),
+            initial,
+            "a failed batch must leave the previously committed location visible"
+        );
+        assert_eq!(fs.db.scan_call_count(), before);
     }
 
     #[tokio::test]

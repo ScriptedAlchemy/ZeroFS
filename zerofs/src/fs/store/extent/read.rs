@@ -4,7 +4,7 @@
 //! crossing pairs).
 
 use super::select::{NOMINATE_MIN_FANOUT, NOMINATE_PER_CALL_CAP, PAIR_BUMPS_PER_CALL, PairStats};
-use super::{ExtentStore, ZERO_EXTENT};
+use super::{CachedExtentLocation, ExtentStore, ZERO_EXTENT};
 #[cfg(feature = "failpoints")]
 use crate::failpoints::{self as fp, fail_point};
 use crate::fs::inode::InodeId;
@@ -59,27 +59,44 @@ fn plan_read_ahead(
 }
 
 impl ExtentStore {
+    async fn load_extent_location(
+        &self,
+        id: InodeId,
+        extent_idx: u64,
+    ) -> Result<CachedExtentLocation, FsError> {
+        let key = self.key_codec.extent_key(id, extent_idx);
+        let encoded = self.db.get_bytes(&key).await.map_err(|error| {
+            error!(
+                "Failed to read extent (inode={}, extent={}): {}",
+                id, extent_idx, error
+            );
+            FsError::IoError
+        })?;
+        let Some(encoded) = encoded else {
+            return Ok(CachedExtentLocation::Hole);
+        };
+        FrameLoc::decode(&encoded)
+            .map(CachedExtentLocation::Frame)
+            .ok_or_else(|| {
+                error!("Corrupt extent value (inode={}, extent={})", id, extent_idx);
+                FsError::IoError
+            })
+    }
+
     /// The full-extent (EXTENT_SIZE) plaintext for `(id, extent)`, or `None` for a
     /// hole. Resolves the extent key's `FrameLoc` then fetches the frame.
     pub async fn get(&self, id: InodeId, extent_idx: u64) -> Result<Option<Bytes>, FsError> {
         let key = self.key_codec.extent_key(id, extent_idx);
-        let encoded = match self.db.get_bytes(&key).await {
-            Ok(v) => v,
-            Err(e) => {
-                error!(
-                    "Failed to read extent (inode={}, extent={}): {}",
-                    id, extent_idx, e
-                );
-                return Err(FsError::IoError);
-            }
+        let location = self
+            .extent_location_cache
+            .get_or_load((id, extent_idx), || {
+                self.load_extent_location(id, extent_idx)
+            })
+            .await?;
+        let loc = match location {
+            CachedExtentLocation::Hole => return Ok(None),
+            CachedExtentLocation::Frame(loc) => loc,
         };
-        let Some(encoded) = encoded else {
-            return Ok(None);
-        };
-        let loc = FrameLoc::decode(&encoded).ok_or_else(|| {
-            error!("Corrupt extent value (inode={}, extent={})", id, extent_idx);
-            FsError::IoError
-        })?;
         if let Some(frame) = self.decoded_get(id, extent_idx, loc) {
             return Ok(Some(frame));
         }
@@ -330,14 +347,14 @@ impl ExtentStore {
 
     /// The segment an extent's current frame lives in, or `None` for a hole.
     async fn segment_at(&self, id: InodeId, extent: u64) -> Option<Segid> {
-        let key = self.key_codec.extent_key(id, extent);
-        self.db
-            .get_bytes(&key)
+        self.extent_location_cache
+            .get_or_load((id, extent), || self.load_extent_location(id, extent))
             .await
             .ok()
-            .flatten()
-            .and_then(|b| FrameLoc::decode(&b))
-            .map(|loc| loc.segid)
+            .and_then(|location| match location {
+                CachedExtentLocation::Hole => None,
+                CachedExtentLocation::Frame(loc) => Some(loc.segid),
+            })
     }
 
     /// A byte-range read with no read-ahead side effect (the raw path; also what
@@ -367,29 +384,48 @@ impl ExtentStore {
             });
         }
 
-        let start_key = self.key_codec.extent_key(id, start_extent);
-        let end_key = self.key_codec.extent_key(id, end_extent + 1);
-        let mut loc_map: HashMap<u64, FrameLoc> = HashMap::new();
-        let mut stream = self.db.scan(start_key..end_key).await.map_err(|e| {
-            error!("Failed to scan extents (inode={}): {}", id, e);
-            FsError::IoError
-        })?;
-        while let Some(result) = stream.next().await {
-            let (key, value) = result.map_err(|e| {
-                error!("Failed to read extent during scan (inode={}): {}", id, e);
-                FsError::IoError
-            })?;
-            if let Some(extent_idx) = self.key_codec.parse_extent_key(&key) {
-                // A present-but-undecodable value is the same corrupt-value
-                // EIO as the single-extent path (`get`) — skipping it would
-                // serve the extent as a fabricated hole of zeros.
-                let loc = FrameLoc::decode(&value).ok_or_else(|| {
-                    error!("Corrupt extent value (inode={}, extent={})", id, extent_idx);
+        let extent_keys: Vec<_> = (start_extent..=end_extent)
+            .map(|extent| (id, extent))
+            .collect();
+        let locations = self
+            .extent_location_cache
+            .get_all_or_load(extent_keys, || async {
+                let start_key = self.key_codec.extent_key(id, start_extent);
+                let end_key = self.key_codec.extent_key(id, end_extent + 1);
+                let mut locations =
+                    vec![CachedExtentLocation::Hole; (end_extent - start_extent + 1) as usize];
+                let mut stream = self.db.scan(start_key..end_key).await.map_err(|e| {
+                    error!("Failed to scan extents (inode={}): {}", id, e);
                     FsError::IoError
                 })?;
-                loc_map.insert(extent_idx, loc);
-            }
-        }
+                while let Some(result) = stream.next().await {
+                    let (key, value) = result.map_err(|e| {
+                        error!("Failed to read extent during scan (inode={}): {}", id, e);
+                        FsError::IoError
+                    })?;
+                    if let Some(extent_idx) = self.key_codec.parse_extent_key(&key) {
+                        // A present-but-undecodable value is the same corrupt-value
+                        // EIO as the single-extent path (`get`) — skipping it would
+                        // serve the extent as a fabricated hole of zeros.
+                        let loc = FrameLoc::decode(&value).ok_or_else(|| {
+                            error!("Corrupt extent value (inode={}, extent={})", id, extent_idx);
+                            FsError::IoError
+                        })?;
+                        locations[(extent_idx - start_extent) as usize] =
+                            CachedExtentLocation::Frame(loc);
+                    }
+                }
+                Ok(locations)
+            })
+            .await?;
+        let loc_map: HashMap<u64, FrameLoc> = locations
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, location)| match location {
+                CachedExtentLocation::Hole => None,
+                CachedExtentLocation::Frame(loc) => Some((start_extent + index as u64, loc)),
+            })
+            .collect();
 
         // Assemble, coalescing each maximal run of extents that are contiguous in
         // one segment (consecutive frame index + adjacent byte range) into a
@@ -557,6 +593,7 @@ mod tests {
     use super::super::test_util::*;
     use super::*;
     use crate::config::CompressionConfig;
+    use slatedb::config::{PutOptions, WriteOptions};
 
     #[tokio::test]
     async fn contiguous_multiextent_read_is_one_ranged_get() {
@@ -586,13 +623,16 @@ mod tests {
             write_extent(&writer, &db, extent, &[extent as u8 + 1; EXTENT_SIZE]).await;
         }
         writer.seal_open().await.unwrap();
-        let store = make_store(object_store, db, CompressionConfig::Lz4, 8);
+        let store = make_store(object_store, db.clone(), CompressionConfig::Lz4, 8);
 
         let before = store.segments.read_calls();
+        let scans_before = db.scan_call_count();
         let first = store.read(1, 0, 4 * EXTENT_SIZE as u64).await.unwrap();
         let after_first = store.segments.read_calls();
+        let scans_after_first = db.scan_call_count();
         let second = store.read(1, 0, 4 * EXTENT_SIZE as u64).await.unwrap();
         let after_second = store.segments.read_calls();
+        let scans_after_second = db.scan_call_count();
 
         assert_eq!(first, second);
         assert_eq!(after_first - before, 1, "the first read fetches the run");
@@ -600,6 +640,16 @@ mod tests {
             after_second - after_first,
             0,
             "validated plaintext should be reused without another segment fetch"
+        );
+        assert_eq!(
+            scans_after_first - scans_before,
+            1,
+            "the first read resolves the logical extent map once"
+        );
+        assert_eq!(
+            scans_after_second - scans_after_first,
+            0,
+            "a repeated read must reuse committed FrameLocs without another metadata scan"
         );
     }
 
@@ -619,6 +669,80 @@ mod tests {
             0,
             "freshly written plaintext should already be in the clean extent cache"
         );
+    }
+
+    #[tokio::test]
+    async fn committed_overwrite_and_delete_refresh_the_logical_extent_map() {
+        let (store, db) = make().await;
+        write_extent(&store, &db, 0, &[0x11; EXTENT_SIZE]).await;
+        write_extent(&store, &db, 1, &[0x22; EXTENT_SIZE]).await;
+
+        let mut overwrite = db.new_transaction().unwrap();
+        store
+            .write(
+                &mut overwrite,
+                1,
+                0,
+                &Bytes::from(vec![0x33; EXTENT_SIZE]),
+                2 * EXTENT_SIZE as u64,
+            )
+            .await
+            .unwrap();
+        commit(&store, overwrite).await;
+
+        let before_overwrite_read = db.scan_call_count();
+        let got = store.read(1, 0, 2 * EXTENT_SIZE as u64).await.unwrap();
+        assert_eq!(&got[..EXTENT_SIZE], &[0x33; EXTENT_SIZE]);
+        assert_eq!(&got[EXTENT_SIZE..], &[0x22; EXTENT_SIZE]);
+        assert_eq!(db.scan_call_count(), before_overwrite_read);
+
+        let mut delete = db.new_transaction().unwrap();
+        store.delete_range(&mut delete, 1, 1, 2).await.unwrap();
+        commit(&store, delete).await;
+
+        let before_delete_read = db.scan_call_count();
+        let got = store.read(1, 0, 2 * EXTENT_SIZE as u64).await.unwrap();
+        assert_eq!(&got[..EXTENT_SIZE], &[0x33; EXTENT_SIZE]);
+        assert_eq!(&got[EXTENT_SIZE..], ZERO_EXTENT);
+        assert_eq!(db.scan_call_count(), before_delete_read);
+    }
+
+    #[tokio::test]
+    async fn failed_commit_never_publishes_its_staged_frameloc() {
+        let (store, db) = make().await;
+        write_extent(&store, &db, 0, &[0x11; EXTENT_SIZE]).await;
+        write_extent(&store, &db, 1, &[0x22; EXTENT_SIZE]).await;
+        let old_loc = frameloc_of(&store, &db, 1, 0).await.unwrap();
+        let segcount = store
+            .key_codec
+            .segcount_key(old_loc.segid.epoch, old_loc.segid.counter);
+        db.put_with_options(
+            &segcount,
+            b"bogus",
+            &PutOptions::default(),
+            &WriteOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        let mut failed = db.new_transaction().unwrap();
+        store
+            .write(
+                &mut failed,
+                1,
+                0,
+                &Bytes::from(vec![0x99; EXTENT_SIZE]),
+                2 * EXTENT_SIZE as u64,
+            )
+            .await
+            .unwrap();
+        assert!(store.commit_via_coordinator(failed).await.is_err());
+
+        let before = db.scan_call_count();
+        let got = store.read(1, 0, 2 * EXTENT_SIZE as u64).await.unwrap();
+        assert_eq!(&got[..EXTENT_SIZE], &[0x11; EXTENT_SIZE]);
+        assert_eq!(&got[EXTENT_SIZE..], &[0x22; EXTENT_SIZE]);
+        assert_eq!(db.scan_call_count(), before);
     }
 
     #[tokio::test]

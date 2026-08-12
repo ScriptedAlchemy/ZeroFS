@@ -249,6 +249,77 @@ where
         }
     }
 
+    /// Resolve an ordered key set from one shared load. A partially warm set is
+    /// deliberately reloaded as a whole so range readers observe one database
+    /// scan rather than a mixture of independently loaded snapshots.
+    async fn get_all_or_load<F, Fut, E>(&self, keys: Vec<K>, load: F) -> Result<Vec<V>, E>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<Vec<V>, E>>,
+    {
+        let mut cached = Vec::with_capacity(keys.len());
+        let mut load_guards = Vec::with_capacity(keys.len());
+        let mut all_cached = true;
+
+        for key in &keys {
+            if let Some(value) = self.get(key) {
+                cached.push(Some(value));
+                load_guards.push(None);
+                continue;
+            }
+            all_cached = false;
+            cached.push(None);
+
+            let token = self.next_load.fetch_add(1, Ordering::Relaxed);
+            let registered = match self.states.entry(key.clone()) {
+                Entry::Occupied(mut entry) => {
+                    let state = entry.get_mut();
+                    if state.mutation_count != 0 {
+                        false
+                    } else {
+                        state.loads.push(token);
+                        true
+                    }
+                }
+                Entry::Vacant(entry) => {
+                    entry.insert(KeyState {
+                        loads: vec![token],
+                        mutation_count: 0,
+                        pending_update: None,
+                    });
+                    true
+                }
+            };
+            load_guards.push(registered.then(|| LoadGuard {
+                cache: self,
+                key: key.clone(),
+                token: Some(token),
+            }));
+        }
+
+        if all_cached {
+            return Ok(cached
+                .into_iter()
+                .map(|value| value.expect("all batch keys were cached"))
+                .collect());
+        }
+
+        #[cfg(test)]
+        self.load_count.fetch_add(1, Ordering::Relaxed);
+        let loaded = load().await?;
+        assert_eq!(
+            loaded.len(),
+            keys.len(),
+            "batch cache load must return one value per requested key"
+        );
+        for (guard, value) in load_guards.into_iter().zip(&loaded) {
+            if let Some(guard) = guard {
+                guard.publish(value);
+            }
+        }
+        Ok(loaded)
+    }
+
     /// Evict `keys` and block fills until the returned guard is dropped.
     pub(crate) fn invalidate(
         self: &Arc<Self>,
@@ -383,6 +454,24 @@ where
         Ok(value)
     }
 
+    pub(crate) async fn get_all_or_load<F, Fut>(
+        &self,
+        keys: Vec<K>,
+        load: F,
+    ) -> Result<Vec<V>, FsError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<Vec<V>, FsError>>,
+    {
+        self.db.check_serving_authority()?;
+        let value = match &self.cache {
+            Some(cache) => cache.get_all_or_load(keys, load).await?,
+            None => load().await?,
+        };
+        self.db.check_serving_authority()?;
+        Ok(value)
+    }
+
     pub(crate) fn invalidate(&self, keys: impl IntoIterator<Item = K>) -> InvalidationGuard<K, V> {
         match &self.cache {
             Some(cache) => cache.invalidate(keys),
@@ -451,6 +540,33 @@ mod tests {
             Ok(20)
         );
         assert_eq!(cache.get(&key), Some(20));
+    }
+
+    #[tokio::test]
+    async fn mutation_overtaking_a_batch_fill_keeps_the_committed_value() {
+        let cache = Arc::new(ReadCache::new(16, "overtaken-batch-fill-test", |_, _| 1));
+        let (load_started_tx, load_started_rx) = oneshot::channel();
+        let (finish_load_tx, finish_load_rx) = oneshot::channel();
+
+        let reader_cache = cache.clone();
+        let reader = tokio::spawn(async move {
+            reader_cache
+                .get_all_or_load(vec![1, 2], || async move {
+                    load_started_tx.send(()).unwrap();
+                    finish_load_rx.await.unwrap();
+                    Ok::<_, ()>(vec![1, 2])
+                })
+                .await
+        });
+        load_started_rx.await.unwrap();
+
+        let mutation = cache.invalidate([1]);
+        mutation.publish(HashMap::from([(1, Some(10))]));
+        finish_load_tx.send(()).unwrap();
+
+        assert_eq!(reader.await.unwrap(), Ok(vec![1, 2]));
+        assert_eq!(cache.get(&1), Some(10));
+        assert_eq!(cache.get(&2), Some(2));
     }
 
     #[tokio::test]

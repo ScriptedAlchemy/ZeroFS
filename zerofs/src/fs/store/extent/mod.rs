@@ -28,6 +28,7 @@ use crate::fs::inode::InodeId;
 use crate::fs::key_codec::KeyCodec;
 use crate::fs::lock_manager::KeyedLockManager;
 use crate::fs::metrics::{SegmentFootprint, SegmentGcStats};
+use crate::fs::store::read_cache::{InvalidationGuard, MetadataCache};
 use crate::fs::{EXTENT_SIZE, FsError};
 use crate::segment::Segid;
 use crate::segment_store::SegmentStore;
@@ -53,6 +54,7 @@ pub(super) const PARALLEL_EXTENT_OPS: usize = 20;
 /// Test and embedding fallback. Server startup passes an explicit share of the
 /// configured clean memory-cache budget instead.
 pub(crate) const DEFAULT_DECODED_EXTENT_CACHE_BYTES: usize = 64 * 1024 * 1024;
+const EXTENT_LOCATION_CACHE_BYTES: usize = 128 * 1024 * 1024;
 
 pub(super) const ZERO_EXTENT: &[u8] = &[0u8; EXTENT_SIZE];
 
@@ -89,6 +91,15 @@ impl DecodedExtentKey {
         }
     }
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CachedExtentLocation {
+    Hole,
+    Frame(crate::segment::FrameLoc),
+}
+
+type ExtentLocationKey = (InodeId, u64);
+type ExtentLocationCache = MetadataCache<ExtentLocationKey, CachedExtentLocation>;
 
 /// Human-readable byte size for log lines, e.g. "3.1 GiB". Display-only.
 pub(crate) fn human_bytes(n: u64) -> String {
@@ -162,6 +173,9 @@ pub struct ExtentStore {
     /// frame identity. This is the hot data cache; raw segment parts remain the
     /// persistent/SSD cache beneath it.
     decoded_extent_cache: Cache<DecodedExtentKey, Bytes>,
+    /// Coherent logical-to-physical map. Mutation entries are invalidated
+    /// immediately before SlateDB apply and published only after it succeeds.
+    extent_location_cache: ExtentLocationCache,
     /// Per-inode logical read-ahead state: (last_read_end, prefetched_to, seq_run).
     read_ahead: Cache<InodeId, (u64, u64, u32)>,
     /// Global bound on concurrent read-ahead fetches.
@@ -222,6 +236,15 @@ impl ExtentStore {
         let decoded_extent_cache = CacheBuilder::new(decoded_extent_cache_bytes)
             .with_weighter(|_: &DecodedExtentKey, data: &Bytes| data.len())
             .build();
+        let extent_location_cache = ExtentLocationCache::new(
+            db.clone(),
+            EXTENT_LOCATION_CACHE_BYTES,
+            "zerofs-extent-location-cache",
+            |_: &ExtentLocationKey, _: &CachedExtentLocation| {
+                std::mem::size_of::<ExtentLocationKey>()
+                    + std::mem::size_of::<CachedExtentLocation>()
+            },
+        );
         let codec = segments.codec();
         let open_lanes = Arc::new(std::array::from_fn(|_| OpenLane {
             append_gate: tokio::sync::Mutex::new(()),
@@ -253,6 +276,7 @@ impl ExtentStore {
             quiescence: Arc::new(Mutex::new((0, 0, Instant::now()))),
             tail_cache,
             decoded_extent_cache,
+            extent_location_cache,
             read_ahead,
             prefetch_sem: Arc::new(Semaphore::new(READ_AHEAD_MAX_CONCURRENT)),
             seal_threshold,
@@ -261,6 +285,39 @@ impl ExtentStore {
             segment_gc_stats: Arc::new(SegmentGcStats::default()),
             #[cfg(test)]
             old_extent_scan_ranges: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    pub(crate) fn invalidate_extent_location_cache(
+        &self,
+        keys: impl IntoIterator<Item = ExtentLocationKey>,
+    ) -> InvalidationGuard<ExtentLocationKey, CachedExtentLocation> {
+        self.extent_location_cache.invalidate(keys)
+    }
+
+    pub(crate) fn publish_extent_location_cache(
+        guard: InvalidationGuard<ExtentLocationKey, CachedExtentLocation>,
+        updates: HashMap<ExtentLocationKey, Option<crate::segment::FrameLoc>>,
+    ) {
+        guard.publish(
+            updates
+                .into_iter()
+                .map(|(key, location)| {
+                    let cached = match location {
+                        Some(location) => CachedExtentLocation::Frame(location),
+                        None => CachedExtentLocation::Hole,
+                    };
+                    (key, Some(cached))
+                })
+                .collect(),
+        );
+    }
+
+    #[cfg(test)]
+    fn cached_extent_location(&self, id: InodeId, extent: u64) -> Option<crate::segment::FrameLoc> {
+        match self.extent_location_cache.peek(&(id, extent)) {
+            Some(CachedExtentLocation::Frame(location)) => Some(location),
+            Some(CachedExtentLocation::Hole) | None => None,
         }
     }
 
@@ -368,10 +425,16 @@ impl ExtentStore {
         // Unit-test fallback: retain the same publication lifetime the real
         // coordinator carries across its merged database write.
         let extent_ref_guard = txn.take_extent_ref_guard();
+        let extent_location_cache_updates: HashMap<_, _> = txn
+            .take_extent_location_cache_updates()
+            .into_iter()
+            .collect();
         let deltas = txn.take_seg_deltas();
         let mut batch = txn.into_inner();
         let (_, footprint_delta) =
             crate::fs::write_coordinator::stage_seg_deltas(&self.db, deltas, &mut batch).await?;
+        let extent_location_cache_guard =
+            self.invalidate_extent_location_cache(extent_location_cache_updates.keys().copied());
         self.db
             .write_with_options(
                 batch,
@@ -382,6 +445,10 @@ impl ExtentStore {
             )
             .await
             .map_err(|_| FsError::IoError)?;
+        Self::publish_extent_location_cache(
+            extent_location_cache_guard,
+            extent_location_cache_updates,
+        );
         // Committed: fold the batch's net footprint into the monitor gauges,
         // mirroring the write coordinator's apply on its own path.
         self.segment_gc_stats.apply_footprint_delta(

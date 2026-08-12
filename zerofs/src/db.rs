@@ -6,6 +6,7 @@
 
 use crate::fs::errors::FsError;
 use crate::fs::inode::Inode;
+use crate::segment::FrameLoc;
 use anyhow::Result;
 use arc_swap::ArcSwap;
 use bytes::Bytes;
@@ -15,6 +16,8 @@ use slatedb::{CacheTarget, DbCacheManagerOps, DbReader, WriteBatch};
 use slatedb_common::metrics::DefaultMetricsRecorder;
 use std::pin::Pin;
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio_stream::Stream;
 
@@ -123,6 +126,7 @@ pub struct StatsDelta {
 }
 
 pub(crate) type DirectoryEntryCacheUpdate = ((u64, Bytes), Option<(u64, u64)>);
+pub(crate) type ExtentLocationCacheUpdate = ((u64, u64), Option<FrameLoc>);
 
 /// Transaction for batching database writes.
 ///
@@ -132,6 +136,7 @@ pub struct Transaction {
     ops: Vec<TxOp>,
     inode_cache_updates: Vec<(u64, Option<Inode>)>,
     directory_entry_cache_updates: Vec<DirectoryEntryCacheUpdate>,
+    extent_location_cache_updates: Vec<ExtentLocationCacheUpdate>,
     stats_deltas: Vec<StatsDelta>,
     /// Per-segment counter adjustments (segcount key, `(live_delta, total_delta)`),
     /// aggregated by the commit worker into one absolute `(live, total)` per
@@ -151,6 +156,7 @@ impl Transaction {
             ops: Vec::new(),
             inode_cache_updates: Vec::new(),
             directory_entry_cache_updates: Vec::new(),
+            extent_location_cache_updates: Vec::new(),
             stats_deltas: Vec::new(),
             seg_deltas: Vec::new(),
             extent_ref_guard: None,
@@ -218,6 +224,20 @@ impl Transaction {
         std::mem::take(&mut self.directory_entry_cache_updates)
     }
 
+    pub(crate) fn update_cached_extent_location(
+        &mut self,
+        inode_id: u64,
+        extent: u64,
+        location: Option<FrameLoc>,
+    ) {
+        self.extent_location_cache_updates
+            .push(((inode_id, extent), location));
+    }
+
+    pub(crate) fn take_extent_location_cache_updates(&mut self) -> Vec<ExtentLocationCacheUpdate> {
+        std::mem::take(&mut self.extent_location_cache_updates)
+    }
+
     /// Record a usage-stats adjustment for `inode_id`'s shard, materialized
     /// by the commit worker. No-op deltas are dropped so callers can pass
     /// computed differences unconditionally.
@@ -279,6 +299,11 @@ impl Transaction {
             self.directory_entry_cache_updates.is_empty(),
             "directory-entry cache updates would be dropped: commit namespace mutations \
              through the WriteCoordinator"
+        );
+        assert!(
+            self.extent_location_cache_updates.is_empty(),
+            "extent-location cache updates would be dropped: commit extent mutations through the \
+             WriteCoordinator"
         );
         assert!(
             self.stats_deltas.is_empty(),
@@ -358,6 +383,9 @@ pub struct Db {
     flush_barrier: Arc<tokio::sync::RwLock<()>>,
     /// Rejects cache hits and writers once local close begins.
     closing: AtomicBool,
+    /// Focused read-path observation point: counts logical range scans.
+    #[cfg(test)]
+    scan_calls: AtomicU64,
 }
 
 /// Admission to one database write while holding the flush barrier's read side.
@@ -396,6 +424,8 @@ impl Db {
             status,
             flush_barrier: Arc::new(tokio::sync::RwLock::new(())),
             closing: AtomicBool::new(false),
+            #[cfg(test)]
+            scan_calls: AtomicU64::new(0),
         }
     }
 
@@ -407,6 +437,8 @@ impl Db {
             status: None,
             flush_barrier: Arc::new(tokio::sync::RwLock::new(())),
             closing: AtomicBool::new(false),
+            #[cfg(test)]
+            scan_calls: AtomicU64::new(0),
         }
     }
 
@@ -578,7 +610,14 @@ impl Db {
         &self,
         range: R,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<(Bytes, Bytes)>> + Send + '_>>> {
+        #[cfg(test)]
+        self.scan_calls.fetch_add(1, Ordering::Relaxed);
         self.scan_at(range, DurabilityLevel::Memory).await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scan_call_count(&self) -> u64 {
+        self.scan_calls.load(Ordering::Relaxed)
     }
 
     /// Scan seeing only object-storage-durable data.

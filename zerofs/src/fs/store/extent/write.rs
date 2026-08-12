@@ -127,6 +127,7 @@ impl ExtentStore {
     pub fn delete(&self, txn: &mut Transaction, id: InodeId, extent_idx: u64) {
         let key = self.key_codec.extent_key(id, extent_idx);
         txn.delete_bytes(&key);
+        txn.update_cached_extent_location(id, extent_idx, None);
     }
 
     /// Stage live/total byte deltas for `segid`'s counter onto the txn; the
@@ -339,6 +340,7 @@ impl ExtentStore {
                         &self.key_codec.extent_key(id, *extent),
                         Bytes::copy_from_slice(&loc.encode()),
                     );
+                    txn.update_cached_extent_location(id, *extent, Some(loc));
                     // The immutable FrameLoc is the cache identity. Publishing
                     // plaintext before metadata commit is safe: a failed
                     // transaction leaves this entry unreachable, while a
