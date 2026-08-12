@@ -405,6 +405,25 @@ fn leadership_lost_error() -> anyhow::Error {
     anyhow::anyhow!("HA writer was fenced or superseded; restart required")
 }
 
+async fn abort_final_flush_after_leadership_loss(fs: &ZeroFS) {
+    match tokio::time::timeout(
+        SFTP_FINAL_WORKER_ABORT_TIMEOUT,
+        fs.flush_coordinator.abort_close_worker(),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::error!(
+            ?error,
+            "failed to abort final flush worker after leadership loss"
+        ),
+        Err(error) => tracing::error!(
+            %error,
+            "timed out aborting final flush worker after leadership loss"
+        ),
+    }
+}
+
 /// Walk an error's source chain looking for an open-file-descriptor exhaustion
 /// (EMFILE/ENFILE). foyer reports these as an opaque `I/O error => coding error`
 /// whose only clue is the wrapped os error code, so detection has to go by the
@@ -980,7 +999,6 @@ pub async fn run_server(
     let writeback_for_checkpoints = init_result.writeback.clone();
     let sftp_pool = init_result.sftp_pool.clone();
     let sftp_pool_for_close = sftp_pool.clone();
-    let using_sftp = sftp_pool.is_some();
     let server_result: anyhow::Result<()> = async move {
         let fs = init_result.fs;
         let authority = init_result.authority;
@@ -1311,7 +1329,7 @@ pub async fn run_server(
         }
         info!("Performing final flush and closing database...");
         if db_mode.is_read_only() {
-            let close_result = if using_sftp {
+            let close_result = if let Some(sftp_pool) = &sftp_pool_for_close {
                 let db = Arc::clone(&fs.db);
                 let mut close_owner = tokio::spawn(async move { db.close().await });
                 match tokio::time::timeout(SFTP_FINAL_DATABASE_CLOSE_TIMEOUT, &mut close_owner)
@@ -1321,10 +1339,7 @@ pub async fn run_server(
                         anyhow::anyhow!("read-only database close owner failed: {error}")
                     })?,
                     Err(_) => {
-                        sftp_pool_for_close
-                            .as_ref()
-                            .expect("using_sftp implies a retained pool")
-                            .begin_shutdown();
+                        sftp_pool.begin_shutdown();
                         match tokio::time::timeout(
                             SFTP_FINAL_DATABASE_CLOSE_TIMEOUT,
                             &mut close_owner,
@@ -1355,28 +1370,13 @@ pub async fn run_server(
                 return Err(e);
             }
         } else {
-            let close_result = if using_sftp {
+            let close_result = if let Some(sftp_pool) = &sftp_pool_for_close {
                 let mut closing = Box::pin(fs.flush_coordinator.close());
                 tokio::select! {
                     biased;
                     _ = leadership_deposed.cancelled() => {
                         drop(closing);
-                        match tokio::time::timeout(
-                            SFTP_FINAL_WORKER_ABORT_TIMEOUT,
-                            fs.flush_coordinator.abort_close_worker(),
-                        )
-                        .await
-                        {
-                            Ok(Ok(())) => {}
-                            Ok(Err(error)) => tracing::error!(
-                                ?error,
-                                "failed to abort final flush worker after leadership loss"
-                            ),
-                            Err(error) => tracing::error!(
-                                %error,
-                                "timed out aborting final flush worker after leadership loss"
-                            ),
-                        }
+                        abort_final_flush_after_leadership_loss(&fs).await;
                         return Err(leadership_lost_error());
                     }
                     result = tokio::time::timeout(
@@ -1385,10 +1385,7 @@ pub async fn run_server(
                     ) => match result {
                         Ok(result) => result,
                         Err(_) => {
-                            sftp_pool_for_close
-                                .as_ref()
-                                .expect("using_sftp implies a retained pool")
-                                .begin_shutdown();
+                            sftp_pool.begin_shutdown();
                             match tokio::time::timeout(
                                 SFTP_FINAL_DATABASE_CLOSE_TIMEOUT,
                                 &mut closing,
@@ -1427,22 +1424,7 @@ pub async fn run_server(
                     biased;
                     _ = leadership_deposed.cancelled() => {
                         drop(closing);
-                        match tokio::time::timeout(
-                            SFTP_FINAL_WORKER_ABORT_TIMEOUT,
-                            fs.flush_coordinator.abort_close_worker(),
-                        )
-                        .await
-                        {
-                            Ok(Ok(())) => {}
-                            Ok(Err(error)) => tracing::error!(
-                                ?error,
-                                "failed to abort final flush worker after leadership loss"
-                            ),
-                            Err(error) => tracing::error!(
-                                %error,
-                                "timed out aborting final flush worker after leadership loss"
-                            ),
-                        }
+                        abort_final_flush_after_leadership_loss(&fs).await;
                         return Err(leadership_lost_error());
                     }
                     result = &mut closing => result,

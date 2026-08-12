@@ -343,15 +343,10 @@ where
     let endpoint = crate::config::SftpEndpoint {
         host: url
             .host_str()
-            .filter(|host| !host.is_empty())
-            .ok_or(Error::SftpHostRequired)?
+            .expect("SFTP URL was validated above")
             .to_owned(),
         port: url.port().unwrap_or(22),
-        username: if url.username().is_empty() {
-            return Err(Error::SftpUsernameRequired.into());
-        } else {
-            url.username().to_owned()
-        },
+        username: url.username().to_owned(),
     };
     let factory = crate::sftp_transport::OpenSshSessionFactory::new(
         endpoint,

@@ -34,8 +34,6 @@ struct StartupContext {
     object_store: Arc<dyn object_store::ObjectStore>,
     writeback: Option<crate::writeback::store::WritebackObjectStore>,
     sftp_pool: Option<crate::sftp_transport::SftpSessionPool>,
-    /// Retrying store for direct ZeroFS I/O, including pre-serving HA ownership.
-    retrying_object_store: Arc<dyn object_store::ObjectStore>,
     wal_object_store: Option<Arc<dyn object_store::ObjectStore>>,
     /// Shared by the data and WAL `TracingObjectStore` wrappers and handed to
     /// the filesystem so the RPC server can stream backend requests (`otrace`).
@@ -123,6 +121,16 @@ enum ReconcileOutcome {
     Reconciled(Box<ReconciledDb>),
     RetryRole,
     RetryWriter,
+}
+
+fn sftp_data_profile(settings: &Settings) -> Result<Option<crate::config::SftpDataProfile>> {
+    Ok(settings.sftp_endpoint()?.map(|_| {
+        settings
+            .sftp
+            .as_ref()
+            .expect("effective SFTP config")
+            .data_profile()
+    }))
 }
 
 impl StartupContext {
@@ -275,7 +283,6 @@ impl StartupContext {
             });
 
             Ok(Self {
-                retrying_object_store: object_store.clone(),
                 object_store,
                 writeback,
                 sftp_pool,
@@ -429,7 +436,7 @@ impl StartupContext {
                     }
                 }
                 let ownership = crate::replication::leader_record::inspect(
-                    &self.retrying_object_store,
+                    &self.object_store,
                     &self.actual_db_path,
                 )
                 .await
@@ -583,14 +590,14 @@ impl StartupContext {
         }
         let claim_result = if recovering_handoff && !force {
             crate::replication::leader_record::recover_handoff(
-                &self.retrying_object_store,
+                &self.object_store,
                 &self.actual_db_path,
                 &node_id,
             )
             .await
         } else {
             crate::replication::leader_record::claim(
-                &self.retrying_object_store,
+                &self.object_store,
                 &self.actual_db_path,
                 &node_id,
                 force,
@@ -779,23 +786,17 @@ impl StartupContext {
         // Retries sit under the prefetcher, so a single-flight window GET rides
         // out a transient error before failing every waiting reader, and above
         // the tracing layer, so each attempt is visible to otrace.
-        let sftp_profile = settings.sftp_endpoint()?.map(|_| {
-            settings
-                .sftp
-                .as_ref()
-                .expect("effective SFTP config")
-                .data_profile()
-        });
+        let sftp_profile = sftp_data_profile(settings)?;
         let prefetch = Arc::new(match sftp_profile {
             Some(profile) => crate::object_store_prefetch::PrefetchingObjectStore::with_tuning(
-                self.retrying_object_store.clone(),
+                self.object_store.clone(),
                 parts_cache,
                 profile.read_cache_part_size_bytes,
                 profile.read_fetch_window_min_bytes,
                 profile.read_fetch_window_max_bytes,
             ),
             None => crate::object_store_prefetch::PrefetchingObjectStore::new(
-                self.retrying_object_store.clone(),
+                self.object_store.clone(),
                 parts_cache,
             ),
         });
@@ -925,7 +926,6 @@ impl ReconciledDb {
             object_store,
             writeback,
             sftp_pool,
-            retrying_object_store,
             wal_object_store,
             object_tracer,
             actual_db_path,
@@ -1104,13 +1104,7 @@ impl ReconciledDb {
                  and without it un-flushed writes are lost on any crash"
             );
         }
-        let sftp_data_profile = settings.sftp_endpoint()?.map(|_| {
-            settings
-                .sftp
-                .as_ref()
-                .expect("effective SFTP config")
-                .data_profile()
-        });
+        let sftp_profile = sftp_data_profile(settings)?;
 
         let db_handle = slatedb.clone();
         let fs = ZeroFS::new_with_slatedb_and_lease(
@@ -1127,8 +1121,8 @@ impl ReconciledDb {
             segment_object_store,
             segment_codec,
             segment_warm,
-            sftp_data_profile.map(|profile| profile.segment_size_bytes),
-            sftp_data_profile.map(|profile| profile.max_inflight_seals),
+            sftp_profile.map(|profile| profile.segment_size_bytes),
+            sftp_profile.map(|profile| profile.max_inflight_seals),
             Some(decoded_extent_memory_bytes),
         )
         .await
@@ -1176,7 +1170,7 @@ impl ReconciledDb {
             // Retry-wrapped for the consumers downstream (the GC's checkpoint-gate
             // admin and the checkpoint manager), whose listings would otherwise
             // fail on one transient backend error.
-            object_store: retrying_object_store,
+            object_store,
             writeback,
             sftp_pool,
             wal_object_store,
@@ -1309,7 +1303,7 @@ mod role_decision_tests {
         let startup = StartupContext::prepare(&settings, DatabaseMode::ReadWrite)
             .await
             .unwrap();
-        let data_stack = startup.retrying_object_store.to_string();
+        let data_stack = startup.object_store.to_string();
         assert!(
             data_stack.starts_with("WritebackObjectStore("),
             "writeback must own the top-level mutation boundary, got {data_stack}"
@@ -1336,7 +1330,6 @@ mod role_decision_tests {
         let mut startup = StartupContext {
             object_store: store.clone(),
             writeback: None,
-            retrying_object_store: store.clone(),
             sftp_pool: None,
             wal_object_store: None,
             object_tracer: crate::object_trace::ObjectTracer::new(),
