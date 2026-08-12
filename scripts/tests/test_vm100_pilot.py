@@ -108,6 +108,8 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(config.mountpoint, Path("/mnt/storagebox-nbd-pilot"))
         self.assertEqual(config.expected_ack_mode, "memory")
         self.assertEqual(config.raw_sftp_jobs, 7)
+        self.assertEqual(config.build_target, Path("/var/tmp/zerofs-build-target"))
+        self.assertNotIn(Path("/fast"), config.build_target.parents)
 
     def test_disposable_path_refuses_root_fast_and_mount_root(self) -> None:
         config = PilotConfig.from_mapping(self.root, {})

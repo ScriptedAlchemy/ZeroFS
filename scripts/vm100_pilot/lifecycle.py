@@ -182,9 +182,10 @@ class PilotLifecycle:
         self.runner.run(
             [self.config.cargo, "build", "--release", "--locked"],
             cwd=self.config.crate,
+            env={"CARGO_TARGET_DIR": str(self.config.build_target)},
             capture=False,
         )
-        built = self.config.crate / "target" / "release" / "zerofs"
+        built = self.config.build_target / "release" / "zerofs"
         built_sha = self._local_sha256(built)
         backup_dir = Path(
             tempfile.mkdtemp(prefix="zerofs-deploy-backup-", dir=self.config.temp_dir)

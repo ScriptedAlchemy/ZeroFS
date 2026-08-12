@@ -44,6 +44,7 @@ class PilotConfig:
     drain_timeout: int
     stop_timeout: int
     profile_timeout: int
+    build_target: Path
     profile_target: Path
     cargo: Path
     npm_repo: str
@@ -67,6 +68,9 @@ class PilotConfig:
         result_dir = Path(values.get("ZEROFS_PILOT_RESULT_DIR", "/var/tmp/zerofs-pilot-results"))
         profile_target = Path(
             values.get("ZEROFS_PROFILE_TARGET_DIR", "/var/tmp/zerofs-profile-target")
+        )
+        build_target = Path(
+            values.get("ZEROFS_BUILD_TARGET_DIR", "/var/tmp/zerofs-build-target")
         )
         cargo = Path(values.get("ZEROFS_PILOT_CARGO", str(Path.home() / ".cargo/bin/cargo")))
         config = cls(
@@ -118,6 +122,7 @@ class PilotConfig:
             drain_timeout=_integer(values, "ZEROFS_PILOT_DRAIN_TIMEOUT", 600),
             stop_timeout=_integer(values, "ZEROFS_PILOT_STOP_TIMEOUT", 60),
             profile_timeout=_integer(values, "ZEROFS_PROFILE_TIMEOUT", 1800),
+            build_target=build_target,
             profile_target=profile_target,
             cargo=cargo,
             npm_repo=values.get("ZEROFS_NPM_WORKLOAD_REPO", "https://github.com/npm/cli.git"),
@@ -139,6 +144,7 @@ class PilotConfig:
             group=values.get("ZEROFS_PILOT_GROUP", values.get("ZEROFS_PILOT_USER", getpass.getuser())),
         )
         config.require_disposable(config.result_dir)
+        config.require_disposable(config.build_target)
         config.require_disposable(config.profile_target)
         return config
 
