@@ -17,6 +17,7 @@ from typing import Any, Sequence
 from scripts.vm100_pilot.config import PilotConfig
 from scripts.vm100_pilot.benchmark import (
     BenchmarkRunner,
+    FioResult,
     _active_windows,
     calculate_tiers,
 )
@@ -36,7 +37,12 @@ from scripts.vm100_pilot.metrics import (
     wait_for_local,
 )
 from scripts.vm100_pilot.profile import CanonicalDeployment, ProfileRunner
-from scripts.vm100_pilot.system_io import SystemIoSnapshot, summarize_system_io
+from scripts.vm100_pilot.system_io import (
+    BlockIoSnapshot,
+    SystemIoSnapshot,
+    summarize_system_io,
+    verify_page_cache_hit,
+)
 from scripts.vm100_pilot.raw_sftp import RawSftpRunner, SftpEndpoint
 from scripts.vm100_pilot.receipts import RunReceipt
 from scripts.vm100_pilot.runner import CommandError, ManagedProcess
@@ -862,15 +868,51 @@ class BenchmarkTests(unittest.TestCase):
             remote_end_to_end_ms=10000,
             local_active_ms=1000,
             remote_active_ms=5000,
-            buffered_read_ms=2000,
-            direct_read_ms=500,
+            page_cache_hot_read_ms=2000,
+            zerofs_direct_read_ms=500,
         )
         self.assertEqual(result.foreground_mibps, 1024.0)
         self.assertEqual(result.local_mibps, 256.0)
         self.assertEqual(result.remote_mibps, 102.4)
         self.assertEqual(result.local_active_mibps, 1024.0)
         self.assertEqual(result.remote_active_mibps, 204.8)
-        self.assertEqual(result.direct_read_mibps, 2048.0)
+        self.assertEqual(result.zerofs_direct_read_mibps, 2048.0)
+
+    def test_fio_result_uses_fio_internal_runtime_and_bytes(self) -> None:
+        path = Path(self.temp.name) / "fio.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "jobs": [
+                        {
+                            "read": {
+                                "io_bytes": 536_870_912,
+                                "runtime": 40,
+                                "bw_bytes": 13_421_772_800,
+                            },
+                            "write": {"io_bytes": 0, "runtime": 0, "bw_bytes": 0},
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        result = FioResult.from_json(path, operation="read")
+
+        self.assertEqual(result.bytes, 536_870_912)
+        self.assertEqual(result.runtime_ms, 40)
+        self.assertEqual(result.mibps, 12_800.0)
+
+    def test_page_cache_hit_requires_zero_nbd_reads(self) -> None:
+        before = BlockIoSnapshot("nbd0", 1000, 2000, 30)
+        after = BlockIoSnapshot("nbd0", 1000, 2000, 35)
+        evidence = verify_page_cache_hit(before, after)
+        self.assertEqual(evidence.read_bytes, 0)
+        self.assertTrue(evidence.proven)
+
+        with self.assertRaisesRegex(RuntimeError, "reached nbd0"):
+            verify_page_cache_hit(before, BlockIoSnapshot("nbd0", 1512, 2000, 40))
 
     def test_system_io_snapshot_and_summary_attribute_root_disk_pressure(self) -> None:
         proc = Path(self.temp.name) / "proc"
@@ -967,8 +1009,15 @@ class BenchmarkTests(unittest.TestCase):
 
     def test_failed_fio_cleans_scoped_root_and_preserves_receipt(self) -> None:
         class FailingBenchmark(BenchmarkRunner):
-            def _run_fio(self, *args: object, **kwargs: object) -> None:
+            def _run_fio(self, *args: object, **kwargs: object) -> FioResult:
                 raise CommandError(("fio",), 19, "injected fio failure")
+
+            def _local_device(self) -> tuple[int, int]:
+                return (8, 1)
+
+            def _system_io(self, device: tuple[int, int]) -> SystemIoSnapshot:
+                assert device == (8, 1)
+                return SystemIoSnapshot("sda1", 0, 0, 0, 0, 0, 0, 0)
 
         benchmark = FailingBenchmark(self.config, self.runner, self.lifecycle)  # type: ignore[arg-type]
         with self.assertRaisesRegex(CommandError, "injected fio failure"):

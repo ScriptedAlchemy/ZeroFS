@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import stat
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -8,6 +9,13 @@ from pathlib import Path
 def root_device() -> tuple[int, int]:
     device = os.stat("/").st_dev
     return (os.major(device), os.minor(device))
+
+
+def block_device(path: Path) -> tuple[int, int]:
+    metadata = path.stat()
+    if not stat.S_ISBLK(metadata.st_mode):
+        raise ValueError(f"not a block device: {path}")
+    return (os.major(metadata.st_rdev), os.minor(metadata.st_rdev))
 
 
 def _pressure(path: Path) -> tuple[float, float, int, int]:
@@ -34,7 +42,54 @@ def _diskstats(path: Path, device: tuple[int, int]) -> tuple[str, int, int, int]
             int(fields[9]) * 512,
             int(fields[12]),
         )
-    raise ValueError(f"root block device {device[0]}:{device[1]} missing from diskstats")
+    raise ValueError(f"block device {device[0]}:{device[1]} missing from diskstats")
+
+
+@dataclass(frozen=True, slots=True)
+class BlockIoSnapshot:
+    device: str
+    read_bytes: int
+    write_bytes: int
+    busy_ms: int
+
+    @classmethod
+    def capture(cls, proc_root: Path, *, device: tuple[int, int]) -> "BlockIoSnapshot":
+        name, read_bytes, write_bytes, busy_ms = _diskstats(
+            proc_root / "diskstats", device
+        )
+        return cls(name, read_bytes, write_bytes, busy_ms)
+
+
+@dataclass(frozen=True, slots=True)
+class PageCacheEvidence:
+    device: str
+    read_bytes: int
+    write_bytes: int
+    busy_ms: int
+    proven: bool
+
+    def to_dict(self) -> dict[str, str | int | bool]:
+        return asdict(self)
+
+
+def verify_page_cache_hit(
+    before: BlockIoSnapshot, after: BlockIoSnapshot
+) -> PageCacheEvidence:
+    if before.device != after.device:
+        raise ValueError("block device changed during page-cache measurement")
+    read_bytes = max(0, after.read_bytes - before.read_bytes)
+    evidence = PageCacheEvidence(
+        device=before.device,
+        read_bytes=read_bytes,
+        write_bytes=max(0, after.write_bytes - before.write_bytes),
+        busy_ms=max(0, after.busy_ms - before.busy_ms),
+        proven=read_bytes == 0,
+    )
+    if not evidence.proven:
+        raise RuntimeError(
+            f"measured page-cache pass reached {before.device}: read_bytes={read_bytes}"
+        )
+    return evidence
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,8 +155,12 @@ def summarize_system_io(
     elapsed_ms = max(1, elapsed_ms)
     return SystemIoSummary(
         root_device=before.root_device,
-        some_stall_ms=round(max(0, after.some_total_us - before.some_total_us) / 1000, 3),
-        full_stall_ms=round(max(0, after.full_total_us - before.full_total_us) / 1000, 3),
+        some_stall_ms=round(
+            max(0, after.some_total_us - before.some_total_us) / 1000, 3
+        ),
+        full_stall_ms=round(
+            max(0, after.full_total_us - before.full_total_us) / 1000, 3
+        ),
         root_read_mib=round(
             max(0, after.root_read_bytes - before.root_read_bytes) / 1_048_576, 3
         ),

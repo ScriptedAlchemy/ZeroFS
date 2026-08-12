@@ -19,7 +19,14 @@ from .metrics import (
 )
 from .receipts import RunReceipt
 from .runner import Runner
-from .system_io import SystemIoSnapshot, root_device, summarize_system_io
+from .system_io import (
+    BlockIoSnapshot,
+    SystemIoSnapshot,
+    block_device,
+    root_device,
+    summarize_system_io,
+    verify_page_cache_hit,
+)
 
 
 def _rate(byte_count: int, elapsed_ms: int) -> float:
@@ -30,6 +37,38 @@ def _rate(byte_count: int, elapsed_ms: int) -> float:
 
 class BenchmarkContaminatedError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class FioResult:
+    bytes: int
+    runtime_ms: int
+    mibps: float
+
+    @classmethod
+    def from_json(cls, path: Path, *, operation: str) -> "FioResult":
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        jobs = payload.get("jobs")
+        if not isinstance(jobs, list) or not jobs:
+            raise ValueError(f"fio output has no jobs: {path}")
+        byte_count = 0
+        runtime_ms = 0
+        for job in jobs:
+            stats = job.get(operation)
+            if not isinstance(stats, dict):
+                raise ValueError(f"fio output has no {operation} stats: {path}")
+            byte_count += int(stats.get("io_bytes", 0))
+            runtime_ms = max(runtime_ms, int(stats.get("runtime", 0)))
+        if byte_count <= 0 or runtime_ms <= 0:
+            raise ValueError(
+                f"fio {operation} did no measurable I/O: "
+                f"bytes={byte_count}, runtime_ms={runtime_ms}"
+            )
+        return cls(
+            bytes=byte_count,
+            runtime_ms=runtime_ms,
+            mibps=_rate(byte_count, runtime_ms),
+        )
 
 
 def _assert_no_maintenance(before: WritebackSnapshot, after: WritebackSnapshot) -> None:
@@ -52,15 +91,15 @@ class BenchmarkResult:
     remote_end_to_end_ms: int
     local_active_ms: int
     remote_active_ms: int
-    buffered_read_ms: int
-    direct_read_ms: int
+    page_cache_hot_read_ms: int
+    zerofs_direct_read_ms: int
     foreground_mibps: float
     local_mibps: float
     remote_mibps: float
     local_active_mibps: float
     remote_active_mibps: float
-    buffered_read_mibps: float
-    direct_read_mibps: float
+    page_cache_hot_read_mibps: float
+    zerofs_direct_read_mibps: float
     receipt_dir: str = ""
 
     def to_dict(self) -> dict[str, object]:
@@ -77,8 +116,8 @@ def calculate_tiers(
     remote_end_to_end_ms: int,
     local_active_ms: int,
     remote_active_ms: int,
-    buffered_read_ms: int,
-    direct_read_ms: int,
+    page_cache_hot_read_ms: int,
+    zerofs_direct_read_ms: int,
 ) -> BenchmarkResult:
     return BenchmarkResult(
         logical_bytes=logical_bytes,
@@ -89,15 +128,15 @@ def calculate_tiers(
         remote_end_to_end_ms=remote_end_to_end_ms,
         local_active_ms=local_active_ms,
         remote_active_ms=remote_active_ms,
-        buffered_read_ms=buffered_read_ms,
-        direct_read_ms=direct_read_ms,
+        page_cache_hot_read_ms=page_cache_hot_read_ms,
+        zerofs_direct_read_ms=zerofs_direct_read_ms,
         foreground_mibps=_rate(logical_bytes, foreground_ms),
         local_mibps=_rate(local_bytes, local_end_to_end_ms),
         remote_mibps=_rate(remote_bytes, remote_end_to_end_ms),
         local_active_mibps=_rate(local_bytes, local_active_ms),
         remote_active_mibps=_rate(remote_bytes, remote_active_ms),
-        buffered_read_mibps=_rate(logical_bytes, buffered_read_ms),
-        direct_read_mibps=_rate(logical_bytes, direct_read_ms),
+        page_cache_hot_read_mibps=_rate(logical_bytes, page_cache_hot_read_ms),
+        zerofs_direct_read_mibps=_rate(logical_bytes, zerofs_direct_read_ms),
     )
 
 
@@ -127,8 +166,9 @@ def _active_windows(
         return value(rows[0], "timestamp_ms")
 
     local_start = transition_start(
-        lambda row: value(row, "accepted") > before_accepted
-        or value(row, "dirty_ram") > 0
+        lambda row: (
+            value(row, "accepted") > before_accepted or value(row, "dirty_ram") > 0
+        )
     )
     local_end = next(
         (
@@ -228,9 +268,7 @@ class _MetricSampler:
                     )
                     self.system_io.append(io_snapshot)
                     timestamp_ms = round(time.time() * 1000)
-                    writer.writerow(
-                        (timestamp_ms, *snapshot.to_dict().values())
-                    )
+                    writer.writerow((timestamp_ms, *snapshot.to_dict().values()))
                     io_writer.writerow((timestamp_ms, *io_snapshot.to_dict().values()))
                     handle.flush()
                     io_handle.flush()
@@ -249,6 +287,17 @@ class BenchmarkRunner:
         self.config = config
         self.runner = runner
         self.lifecycle = lifecycle
+
+    def _local_device(self) -> tuple[int, int]:
+        return root_device()
+
+    def _system_io(self, device: tuple[int, int]) -> SystemIoSnapshot:
+        return SystemIoSnapshot.capture(self.config.proc_root, root_device=device)
+
+    def _nbd_io(self) -> BlockIoSnapshot:
+        return BlockIoSnapshot.capture(
+            self.config.proc_root, device=block_device(self.config.nbd_device)
+        )
 
     def prepare_root(self, run_root: Path) -> None:
         self.config.require_disposable(run_root)
@@ -281,7 +330,7 @@ class BenchmarkRunner:
         output: Path,
         read: bool,
         direct: bool | None = None,
-    ) -> None:
+    ) -> FioResult:
         argv: list[str | Path] = [
             "fio",
             f"--name={name}",
@@ -292,6 +341,7 @@ class BenchmarkRunner:
             f"--size={per_job_mib}M",
             f"--numjobs={jobs}",
             "--group_reporting",
+            "--output-format=json",
             f"--output={output}",
         ]
         if not read:
@@ -308,6 +358,7 @@ class BenchmarkRunner:
         if read and direct is False:
             argv.append("--invalidate=0")
         self.runner.run(argv, sudo=True, capture=False)
+        return FioResult.from_json(output, operation="read" if read else "write")
 
     def _cleanup_root(self, run_root: Path) -> None:
         self.config.require_disposable(run_root)
@@ -344,9 +395,10 @@ class BenchmarkRunner:
             receipt.record("run_root", str(run_root))
             receipt.record("maintenance_before", quiescent.to_dict())
             self.prepare_root(run_root)
-            write_output = receipt.path("write-fio.txt")
-            buffered_output = receipt.path("buffered-read-fio.txt")
-            direct_output = receipt.path("direct-read-fio.txt")
+            write_output = receipt.path("write-fio.json")
+            buffered_warmup_output = receipt.path("buffered-read-warmup-fio.json")
+            buffered_output = receipt.path("buffered-read-hot-fio.json")
+            direct_output = receipt.path("direct-read-fio.json")
             sample_output = receipt.path("metrics.csv")
             system_io_output = receipt.path("system-io.csv")
             try:
@@ -355,6 +407,8 @@ class BenchmarkRunner:
                     self.lifecycle, sample_output, system_io_output
                 )
                 sampler.start()
+                phase_device = self._local_device()
+                write_io_before = self._system_io(phase_device)
                 started = time.monotonic_ns()
                 self._run_fio(
                     name="zerofs_user_write",
@@ -365,6 +419,7 @@ class BenchmarkRunner:
                     read=False,
                 )
                 foreground_end = time.monotonic_ns()
+                write_io_after = self._system_io(phase_device)
                 self.runner.run(["sync", "-f", self.config.mountpoint], sudo=True)
                 accepted_after_write = wait_for_accepted_after(
                     self.lifecycle.metrics.snapshot,
@@ -377,12 +432,27 @@ class BenchmarkRunner:
                     timeout=self.config.drain_timeout,
                 )
                 local_end = time.monotonic_ns()
+                local_io_after = self._system_io(phase_device)
                 self.lifecycle.drain()
                 remote_end = time.monotonic_ns()
+                remote_io_after = self._system_io(phase_device)
                 remote_snapshot = self.lifecycle.metrics.snapshot()
-                buffered_start = time.monotonic_ns()
-                self._run_fio(
-                    name="zerofs_buffered_warm_read",
+                warmup_start = time.monotonic_ns()
+                buffered_warmup = self._run_fio(
+                    name="zerofs_buffered_read_warmup",
+                    run_root=run_root,
+                    per_job_mib=per_job_mib,
+                    jobs=jobs,
+                    output=buffered_warmup_output,
+                    read=True,
+                    direct=False,
+                )
+                warmup_end = time.monotonic_ns()
+                warmup_io_after = self._system_io(phase_device)
+                nbd_before = self._nbd_io()
+                hot_start = time.monotonic_ns()
+                buffered_read = self._run_fio(
+                    name="zerofs_buffered_page_cache_hot_read",
                     run_root=run_root,
                     per_job_mib=per_job_mib,
                     jobs=jobs,
@@ -390,9 +460,14 @@ class BenchmarkRunner:
                     read=True,
                     direct=False,
                 )
-                buffered_end = time.monotonic_ns()
+                hot_end = time.monotonic_ns()
+                hot_io_after = self._system_io(phase_device)
+                nbd_after = self._nbd_io()
+                page_cache = verify_page_cache_hit(nbd_before, nbd_after)
+                receipt.record("buffered_read_warmup", asdict(buffered_warmup))
+                receipt.record("page_cache_evidence", page_cache.to_dict())
                 direct_start = time.monotonic_ns()
-                self._run_fio(
+                direct_read = self._run_fio(
                     name="zerofs_direct_read",
                     run_root=run_root,
                     per_job_mib=per_job_mib,
@@ -402,6 +477,7 @@ class BenchmarkRunner:
                     direct=True,
                 )
                 direct_end = time.monotonic_ns()
+                direct_io_after = self._system_io(phase_device)
                 sampler.stop()
                 sampler_system_io = sampler.system_io
                 sampler = None
@@ -418,6 +494,41 @@ class BenchmarkRunner:
                     elapsed_ms=max(1, round((direct_end - started) / 1_000_000)),
                 )
                 receipt.record("system_io", system_io.to_dict())
+
+                def phase_io(
+                    before_io: SystemIoSnapshot,
+                    after_io: SystemIoSnapshot,
+                    begin_ns: int,
+                    end_ns: int,
+                ) -> dict[str, str | int | float]:
+                    return summarize_system_io(
+                        [before_io, after_io],
+                        elapsed_ms=max(1, round((end_ns - begin_ns) / 1_000_000)),
+                    ).to_dict()
+
+                receipt.record(
+                    "phase_system_io",
+                    {
+                        "foreground_write": phase_io(
+                            write_io_before, write_io_after, started, foreground_end
+                        ),
+                        "local_durability_tail": phase_io(
+                            write_io_after, local_io_after, foreground_end, local_end
+                        ),
+                        "remote_durability_tail": phase_io(
+                            local_io_after, remote_io_after, local_end, remote_end
+                        ),
+                        "buffered_warmup": phase_io(
+                            remote_io_after, warmup_io_after, warmup_start, warmup_end
+                        ),
+                        "page_cache_hot_read": phase_io(
+                            warmup_io_after, hot_io_after, hot_start, hot_end
+                        ),
+                        "direct_read": phase_io(
+                            hot_io_after, direct_io_after, direct_start, direct_end
+                        ),
+                    },
+                )
                 maintenance_after = self.lifecycle.metrics.snapshot()
                 receipt.record("maintenance_after", maintenance_after.to_dict())
                 _assert_no_maintenance(quiescent, maintenance_after)
@@ -436,8 +547,8 @@ class BenchmarkRunner:
                     remote_end_to_end_ms=millis(remote_end, started),
                     local_active_ms=local_active_ms,
                     remote_active_ms=remote_active_ms,
-                    buffered_read_ms=millis(buffered_end, buffered_start),
-                    direct_read_ms=millis(direct_end, direct_start),
+                    page_cache_hot_read_ms=buffered_read.runtime_ms,
+                    zerofs_direct_read_ms=direct_read.runtime_ms,
                 )
                 result = BenchmarkResult(
                     **{**result.to_dict(), "receipt_dir": str(receipt.directory)}

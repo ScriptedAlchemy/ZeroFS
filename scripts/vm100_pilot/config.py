@@ -60,6 +60,7 @@ class PilotConfig:
     nbd_stripe_lanes: int
     nbd_stripe_kib: int
     nbd_socket: Path
+    nbd_device: Path
     ninep_target: str
     migration_device: Path
     migration_mountpoint: Path
@@ -173,6 +174,7 @@ class PilotConfig:
             nbd_socket=Path(
                 values.get("ZEROFS_PILOT_NBD_SOCKET", "/run/zerofs-nbd-pilot/nbd.sock")
             ),
+            nbd_device=Path(values.get("ZEROFS_PILOT_NBD_DEVICE", "/dev/nbd0")),
             ninep_target=values.get(
                 "ZEROFS_PILOT_9P_TARGET",
                 "unix:/run/zerofs-nbd-pilot/9p.sock",
