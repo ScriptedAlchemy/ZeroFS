@@ -14,6 +14,9 @@ use std::sync::atomic::Ordering;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+const GENERAL_COLLECT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+const WRITEBACK_COLLECT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// Start the Prometheus metrics exporter.
 ///
 /// Installs the global metrics recorder, spawns an HTTP server per configured address
@@ -52,20 +55,22 @@ pub fn start(
         }));
     }
 
+    let CollectorSources {
+        fs_stats,
+        global_stats,
+        segment_gc_stats,
+        dedup,
+        slatedb_registry,
+        writeback,
+    } = sources;
+    let writeback_source = writeback.clone();
+    let collector_shutdown = shutdown.clone();
     let upkeep_handle = handle.clone();
     handles.push(spawn_named("prometheus-collector", async move {
-        let CollectorSources {
-            fs_stats,
-            global_stats,
-            segment_gc_stats,
-            dedup,
-            slatedb_registry,
-            writeback,
-        } = sources;
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        let mut interval = tokio::time::interval(GENERAL_COLLECT_INTERVAL);
         loop {
             tokio::select! {
-                _ = shutdown.cancelled() => {
+                _ = collector_shutdown.cancelled() => {
                     tracing::info!("Prometheus collector shutting down");
                     break;
                 }
@@ -77,9 +82,23 @@ pub fn start(
                     if let Some(ref registry) = slatedb_registry {
                         collect_lsm_stats(registry);
                     }
-                    collect_writeback_stats(writeback.as_ref());
                     collect_jemalloc_stats();
                     upkeep_handle.run_upkeep();
+                }
+            }
+        }
+    }));
+
+    handles.push(spawn_named("prometheus-writeback", async move {
+        let mut interval = tokio::time::interval(WRITEBACK_COLLECT_INTERVAL);
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => {
+                    tracing::info!("Prometheus writeback collector shutting down");
+                    break;
+                }
+                _ = interval.tick() => {
+                    collect_writeback_stats(writeback_source.as_ref());
                 }
             }
         }
@@ -317,8 +336,16 @@ fn collect_lsm_stats(recorder: &DefaultMetricsRecorder) {
 
 #[cfg(test)]
 mod tests {
-    use super::{lsm_export_name, record_writeback_status};
+    use super::{WRITEBACK_COLLECT_INTERVAL, lsm_export_name, record_writeback_status};
     use crate::writeback::model::WritebackStatus;
+
+    #[test]
+    fn writeback_metrics_refresh_fast_enough_for_durability_tier_measurement() {
+        assert_eq!(
+            WRITEBACK_COLLECT_INTERVAL,
+            std::time::Duration::from_millis(100)
+        );
+    }
 
     #[test]
     fn engine_metric_names_export_under_the_lsm_prefix() {

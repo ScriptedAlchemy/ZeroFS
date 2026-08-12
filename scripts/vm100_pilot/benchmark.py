@@ -114,7 +114,7 @@ class _MetricSampler:
                         (round(time.time() * 1000), *snapshot.to_dict().values())
                     )
                     handle.flush()
-                    self.stop_event.wait(0.25)
+                    self.stop_event.wait(0.05)
         except BaseException as error:
             self.error = error
 
