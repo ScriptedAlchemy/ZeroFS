@@ -627,7 +627,14 @@ impl SftpObjectStore {
         while let Some(directory) = pending.pop() {
             let entries = match self.directory_snapshot(&directory).await {
                 Ok(entries) => entries,
-                Err(object_store::Error::NotFound { .. }) => continue,
+                Err(object_store::Error::NotFound { .. }) => {
+                    match self.metadata(&directory).await {
+                        Ok(object) => objects.push(object),
+                        Err(object_store::Error::NotFound { .. }) => {}
+                        Err(error) => return Err(error),
+                    }
+                    continue;
+                }
                 Err(error) => return Err(error),
             };
             for entry in entries {
@@ -776,6 +783,20 @@ impl ObjectStore for SftpObjectStore {
         location: &ObjectPath,
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
+        let has_preconditions = options.if_match.is_some()
+            || options.if_none_match.is_some()
+            || options.if_modified_since.is_some()
+            || options.if_unmodified_since.is_some();
+        if has_preconditions && !options.head {
+            let metadata_options = GetOptions {
+                version: options.version.clone(),
+                head: true,
+                ..Default::default()
+            };
+            let object = self.read_remote(location, &metadata_options).await?;
+            let meta = object_meta(location.clone(), &object);
+            options.check_preconditions(&meta)?;
+        }
         let object = self.read_remote(location, &options).await?;
         let meta = object_meta(location.clone(), &object);
         options.check_preconditions(&meta)?;
@@ -794,8 +815,9 @@ impl ObjectStore for SftpObjectStore {
         locations: BoxStream<'static, object_store::Result<ObjectPath>>,
     ) -> BoxStream<'static, object_store::Result<ObjectPath>> {
         let store = self.clone();
+        let concurrency = self.pool.write_concurrency();
         locations
-            .then(move |location| {
+            .map(move |location| {
                 let store = store.clone();
                 async move {
                     let location = location?;
@@ -803,6 +825,7 @@ impl ObjectStore for SftpObjectStore {
                     Ok(location)
                 }
             })
+            .buffered(concurrency)
             .boxed()
     }
 
@@ -1030,11 +1053,12 @@ impl MultipartUpload for SftpMultipartUpload {
     }
 
     async fn abort(&mut self) -> object_store::Result<()> {
-        if let Some(staging) = self.staging.take() {
+        if let Some(staging) = self.staging.as_ref() {
             self.session
-                .remove_file(&staging)
+                .remove_file(staging)
                 .await
                 .map_err(|error| publication_error(&self.location, error))?;
+            self.staging = None;
         }
         self.terminal = true;
         Ok(())
@@ -1277,6 +1301,88 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct ConcurrentDeleteState {
+        barrier: Barrier,
+        in_flight: AtomicUsize,
+        peak: AtomicUsize,
+    }
+
+    #[derive(Debug, Clone)]
+    struct ConcurrentDeleteFactory(Arc<ConcurrentDeleteState>);
+
+    #[async_trait]
+    impl SessionFactory for ConcurrentDeleteFactory {
+        async fn open(
+            &self,
+            _force: tokio_util::sync::CancellationToken,
+        ) -> Result<Box<dyn TransportSession>, TransportError> {
+            Ok(Box::new(ConcurrentDeleteSession(self.0.clone())))
+        }
+    }
+
+    #[derive(Debug)]
+    struct ConcurrentDeleteSession(Arc<ConcurrentDeleteState>);
+
+    #[async_trait]
+    impl TransportSession for ConcurrentDeleteSession {
+        fn capabilities(&self) -> SftpCapabilities {
+            SftpCapabilities {
+                fsync: true,
+                hardlink: true,
+                posix_rename: true,
+            }
+        }
+
+        async fn remove_file(&mut self, _path: &FilePath) -> Result<(), TransportError> {
+            let current = self.0.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.0.peak.fetch_max(current, Ordering::SeqCst);
+            self.0.barrier.wait().await;
+            self.0.in_flight.fetch_sub(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn close(
+            self: Box<Self>,
+            _force: tokio_util::sync::CancellationToken,
+        ) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn bulk_delete_uses_configured_write_concurrency() {
+        let state = Arc::new(ConcurrentDeleteState {
+            barrier: Barrier::new(2),
+            in_flight: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+        });
+        let pool = crate::sftp_transport::SftpSessionPool::new_writable(
+            Arc::new(ConcurrentDeleteFactory(state.clone())),
+            2,
+            1,
+            2,
+        )
+        .await
+        .unwrap();
+        let store = SftpObjectStore::new(pool.clone(), ObjectPath::from("root")).unwrap();
+        let locations = (0..4)
+            .map(|index| Ok(ObjectPath::from(format!("root/object-{index}"))))
+            .collect::<Vec<_>>();
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            store
+                .delete_stream(stream::iter(locations).boxed())
+                .collect::<Vec<_>>(),
+        )
+        .await
+        .expect("two deletes should be admitted together");
+
+        assert_eq!(state.peak.load(Ordering::SeqCst), 2);
+        pool.shutdown().await.unwrap();
+    }
+
     #[tokio::test]
     async fn production_adapter_cleanup_overlaps_and_drains_before_pool_shutdown() {
         let state = Arc::new(ProtocolCleanupState::default());
@@ -1345,6 +1451,7 @@ mod tests {
         server: PathBuf,
         root: PathBuf,
         reads: Arc<AtomicUsize>,
+        payload_reads: Arc<AtomicUsize>,
     }
 
     #[async_trait]
@@ -1373,6 +1480,7 @@ mod tests {
                 session,
                 child,
                 reads: self.reads.clone(),
+                payload_reads: self.payload_reads.clone(),
             }))
         }
     }
@@ -1381,6 +1489,7 @@ mod tests {
         session: OpenSshTransportSession,
         child: tokio::process::Child,
         reads: Arc<AtomicUsize>,
+        payload_reads: Arc<AtomicUsize>,
     }
 
     impl Debug for LocalSftpSession {
@@ -1404,6 +1513,9 @@ mod tests {
             head: bool,
         ) -> Result<RemoteObjectRead, TransportError> {
             self.reads.fetch_add(1, Ordering::SeqCst);
+            if !head {
+                self.payload_reads.fetch_add(1, Ordering::SeqCst);
+            }
             self.session.read_object(path, range, head).await
         }
 
@@ -1712,6 +1824,25 @@ mod tests {
                 .keys()
                 .all(|path| !is_staging_name(path.file_name().unwrap().as_ref()))
         );
+    }
+
+    #[tokio::test]
+    async fn failed_multipart_abort_keeps_staging_armed_for_retry() {
+        let session = Arc::new(RecordingSession::with_remove_failure());
+        let location = ObjectPath::from("zerofs/v1/abort.bin");
+        let target = PathBuf::from("zerofs/v1/abort.bin");
+        let mut upload =
+            SftpMultipartUpload::begin(session, location, target, Arc::new(DashSet::new()))
+                .await
+                .unwrap();
+
+        upload.abort().await.expect_err("forced removal must fail");
+
+        assert!(
+            upload.staging.is_some(),
+            "failed cleanup must remain armed for an explicit retry or Drop"
+        );
+        assert!(!upload.terminal);
     }
 
     #[async_trait]
@@ -2253,11 +2384,13 @@ mod tests {
         );
 
         let reads = Arc::new(AtomicUsize::new(0));
+        let payload_reads = Arc::new(AtomicUsize::new(0));
         let pool = crate::sftp_transport::SftpSessionPool::new_writable(
             Arc::new(LocalSftpFactory {
                 server: server.into(),
                 root: root.path().to_path_buf(),
                 reads: reads.clone(),
+                payload_reads: payload_reads.clone(),
             }),
             2,
             1,
@@ -2315,6 +2448,27 @@ mod tests {
         assert_eq!(result.range, 6..11);
         assert_eq!(result.bytes().await.unwrap().as_ref(), b"world");
 
+        let payload_reads_before = payload_reads.load(Ordering::SeqCst);
+        let not_modified = store
+            .get_opts(
+                &location,
+                GetOptions {
+                    if_none_match: Some(top_generation.to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            not_modified,
+            object_store::Error::NotModified { .. }
+        ));
+        assert_eq!(
+            payload_reads.load(Ordering::SeqCst),
+            payload_reads_before,
+            "a rejected conditional GET must not download object payload"
+        );
+
         let head = store
             .get_opts(
                 &location,
@@ -2363,6 +2517,16 @@ mod tests {
                 .objects
                 .iter()
                 .any(|object| object.location == location)
+        );
+        let exact = store
+            .list(Some(&location))
+            .map(|result| result.unwrap().location)
+            .collect::<Vec<_>>()
+            .await;
+        assert_eq!(
+            exact.as_slice(),
+            std::slice::from_ref(&location),
+            "an exact object path is also a valid list prefix"
         );
 
         let deleted = store

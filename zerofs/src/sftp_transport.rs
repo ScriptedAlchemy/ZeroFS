@@ -1400,6 +1400,10 @@ impl fmt::Debug for SftpSessionPool {
 }
 
 impl SftpSessionPool {
+    pub(crate) fn write_concurrency(&self) -> usize {
+        self.inner.admission.inner.write_limit
+    }
+
     pub async fn from_config_writable(
         factory: Arc<dyn SessionFactory>,
         config: &crate::config::SftpConfig,
