@@ -557,6 +557,9 @@ async fn run_journaler(
                 ));
                 break;
             }
+            let durable_batch_tail = *expected_sequences
+                .last()
+                .expect("a published batch contains at least one record");
 
             for (_, _, disk) in &mut ownership {
                 if let Some(disk) = disk.take() {
@@ -578,18 +581,18 @@ async fn run_journaler(
                     break;
                 }
                 drop(ram);
-                progress.send_modify(|state| state.local_seq = sequence);
-                next_admitted = match sequence.checked_add(1) {
-                    Some(next) => next,
-                    None => {
-                        terminal = Some("local journal sequence overflow".to_owned());
-                        break;
-                    }
-                };
             }
             if terminal.is_some() {
                 break;
             }
+            progress.send_modify(|state| state.local_seq = durable_batch_tail);
+            next_admitted = match durable_batch_tail.checked_add(1) {
+                Some(next) => next,
+                None => {
+                    terminal = Some("local journal sequence overflow".to_owned());
+                    break;
+                }
+            };
         }
 
         if terminal.is_some() {
@@ -683,14 +686,20 @@ mod tests {
         DEFAULT_LOCAL_PREPARE_CONCURRENCY, LocalBarrierError, LocalCommitObserver,
         LocalJournalSink, LocalJournaler,
     };
+    use crate::fault_store::FaultStore;
     use crate::writeback::admission::{Admission, AdmissionError, DiskAdmission};
     use crate::writeback::journal::Journal;
     use crate::writeback::model::{
         FenceClass, JournalIdentity, LocalEtag, MutationKind, MutationMode, MutationRecord,
     };
+    use crate::writeback::overlay::{OverlayCommitObserver, OverlayIndex};
     use crate::writeback::payload::VerifiedPayload;
+    use crate::writeback::remote::RemoteScheduler;
     use anyhow::{Result, bail};
     use bytes::Bytes;
+    use object_store::ObjectStoreExt;
+    use object_store::memory::InMemory;
+    use object_store::path::Path;
     use sha2::{Digest, Sha256};
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -745,7 +754,13 @@ mod tests {
         release: Notify,
     }
 
-    struct FailingObserver;
+    struct FailingSecondObserver;
+
+    struct BlockingSecondOverlayObserver {
+        inner: OverlayCommitObserver,
+        entered: Notify,
+        release: Notify,
+    }
 
     #[async_trait::async_trait]
     impl LocalCommitObserver for BlockingObserver {
@@ -757,9 +772,23 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl LocalCommitObserver for FailingObserver {
-        async fn committed(&self, _sequence: u64) -> Result<()> {
-            bail!("injected overlay handoff failure")
+    impl LocalCommitObserver for FailingSecondObserver {
+        async fn committed(&self, sequence: u64) -> Result<()> {
+            if sequence == 2 {
+                bail!("injected overlay handoff failure")
+            }
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LocalCommitObserver for BlockingSecondOverlayObserver {
+        async fn committed(&self, sequence: u64) -> Result<()> {
+            if sequence == 2 {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            self.inner.committed(sequence).await
         }
     }
 
@@ -1464,7 +1493,7 @@ mod tests {
             0,
             8,
             8,
-            Some(Arc::new(FailingObserver)),
+            Some(Arc::new(FailingSecondObserver)),
         );
         for sequence in 1..=2 {
             let ram = admission.reserve(1).await.unwrap().accept();
@@ -1487,7 +1516,12 @@ mod tests {
             Err(LocalBarrierError::LocalDurability(_))
         ));
         assert_eq!(journal.progress().unwrap().local_seq, 2);
-        assert_eq!(admission.used_bytes(), 2);
+        assert_eq!(journaler.barrier().local_sequence(), 0);
+        assert_eq!(
+            admission.used_bytes(),
+            1,
+            "only the RAM for the unobserved durable tail remains owned"
+        );
         assert_eq!(disk.used_bytes(), 2);
         assert!(matches!(
             journaler.shutdown().await,
@@ -1507,6 +1541,112 @@ mod tests {
         assert_eq!(recovered.progress().unwrap().local_seq, 2);
         assert_eq!(recovered.read_blob(1).unwrap(), b"x");
         assert_eq!(recovered.read_blob(2).unwrap(), b"x");
+    }
+
+    #[tokio::test]
+    async fn active_remote_scheduler_waits_for_every_observer_in_a_durable_batch() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("writeback");
+        let journal = Arc::new(
+            Journal::open(
+                &root,
+                JournalIdentity {
+                    format_version: 1,
+                    bucket_id: "bucket-active-remote".to_owned(),
+                    backend_endpoint: "memory://remote".to_owned(),
+                    database_prefix: "zerofs/pilot".to_owned(),
+                    backend_kind: "memory".to_owned(),
+                    encryption_key_identity_sha256: [0x66; 32],
+                },
+            )
+            .unwrap(),
+        );
+        let remote_data = Arc::new(InMemory::new());
+        let (remote, remote_controls) = FaultStore::new(remote_data.clone());
+        let overlay = OverlayIndex::new(remote.clone());
+        let admission = Admission::new(1_000_000);
+        let disk = DiskAdmission::new(1_000_000, 95, 85, 1).unwrap();
+        let observer = Arc::new(BlockingSecondOverlayObserver {
+            inner: OverlayCommitObserver::new(overlay.clone(), journal.clone()),
+            entered: Notify::new(),
+            release: Notify::new(),
+        });
+        let (head_release_tx, head_release_rx) = mpsc::channel();
+        let (prepared_tx, mut prepared_rx) = tokio_mpsc::unbounded_channel();
+        let sink = Arc::new(HeadBlockingJournalSink {
+            journal: journal.clone(),
+            head_release: Mutex::new(Some(head_release_rx)),
+            prepared: prepared_tx,
+        });
+        let journaler = LocalJournaler::start_with_sink_and_observer(
+            sink,
+            admission.clone(),
+            0,
+            8,
+            8,
+            Some(observer.clone()),
+        );
+        let remote_scheduler = RemoteScheduler::start(
+            remote,
+            journal.clone(),
+            overlay.clone(),
+            admission.clone(),
+            disk.clone(),
+            journaler.barrier(),
+            4,
+        )
+        .unwrap();
+        for (sequence, payload) in [(1, b"one".as_slice()), (2, b"two".as_slice())] {
+            let record = put_record(sequence, payload);
+            overlay
+                .install_memory(record.clone(), Bytes::copy_from_slice(payload))
+                .await
+                .unwrap();
+            let ram = admission
+                .reserve(payload.len() as u64)
+                .await
+                .unwrap()
+                .accept();
+            let disk_permit = disk
+                .reserve(record.disk_charge_bytes().unwrap(), 1_000_000)
+                .await
+                .unwrap();
+            journaler
+                .submit_put_with_disk(record, Bytes::copy_from_slice(payload), ram, disk_permit)
+                .await
+                .unwrap();
+        }
+        assert_eq!(prepared_rx.recv().await.unwrap(), 2);
+        head_release_tx.send(()).unwrap();
+        observer.entered.notified().await;
+
+        assert_eq!(journal.progress().unwrap().local_seq, 2);
+        assert_eq!(
+            journaler.barrier().local_sequence(),
+            0,
+            "the local barrier must not expose a partially observed durable batch"
+        );
+        assert_eq!(
+            remote_controls.put_count(),
+            0,
+            "the active remote scheduler must not see the unobserved durable tail"
+        );
+
+        observer.release.notify_one();
+        journaler.barrier().wait_local(2).await.unwrap();
+        remote_scheduler.barrier().wait_remote(2).await.unwrap();
+        assert_eq!(
+            remote_data
+                .get(&Path::from("segments/2"))
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap(),
+            Bytes::from_static(b"two")
+        );
+        remote_scheduler.shutdown().await.unwrap();
+        journaler.shutdown().await.unwrap();
     }
 
     #[tokio::test]
