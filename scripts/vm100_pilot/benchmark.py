@@ -11,7 +11,12 @@ from pathlib import Path
 
 from .config import PilotConfig
 from .lifecycle import PilotLifecycle
-from .metrics import wait_for_accepted_after, wait_for_local
+from .metrics import (
+    WritebackSnapshot,
+    wait_for_accepted_after,
+    wait_for_gc_quiescence,
+    wait_for_local,
+)
 from .receipts import RunReceipt
 from .runner import Runner
 
@@ -20,6 +25,20 @@ def _rate(byte_count: int, elapsed_ms: int) -> float:
     if elapsed_ms <= 0:
         return 0.0
     return round(byte_count / 1_048_576 / (elapsed_ms / 1000), 2)
+
+
+class BenchmarkContaminatedError(RuntimeError):
+    pass
+
+
+def _assert_no_maintenance(before: WritebackSnapshot, after: WritebackSnapshot) -> None:
+    before_epoch = (before.gc_passes, before.gc_batches, before.gc_deleted_bytes)
+    after_epoch = (after.gc_passes, after.gc_batches, after.gc_deleted_bytes)
+    if after.gc_active or after_epoch != before_epoch:
+        raise BenchmarkContaminatedError(
+            "segment GC overlapped the measured benchmark epoch: "
+            f"before={before_epoch}, after={after_epoch}, active={after.gc_active}"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,6 +189,10 @@ class _MetricSampler:
                         "local_bytes",
                         "remote_bytes",
                         "terminal",
+                        "gc_active",
+                        "gc_passes",
+                        "gc_batches",
+                        "gc_deleted_bytes",
                     )
                 )
                 while not self.stop_event.is_set():
@@ -272,6 +295,10 @@ class BenchmarkRunner:
             raise ValueError("total MiB must be positive and divisible by jobs")
         self.lifecycle.status()
         self.lifecycle.drain()
+        quiescent = wait_for_gc_quiescence(
+            self.lifecycle.metrics.snapshot,
+            timeout=self.config.drain_timeout,
+        )
         run_root = self.config.mountpoint / f".zerofs-bench-{uuid.uuid4().hex}"
         per_job_mib = total_mib // jobs
         logical_bytes = total_mib * 1_048_576
@@ -282,6 +309,7 @@ class BenchmarkRunner:
             receipt.record("total_mib", total_mib)
             receipt.record("jobs", jobs)
             receipt.record("run_root", str(run_root))
+            receipt.record("maintenance_before", quiescent.to_dict())
             self.prepare_root(run_root)
             write_output = receipt.path("write-fio.txt")
             buffered_output = receipt.path("buffered-read-fio.txt")
@@ -349,6 +377,9 @@ class BenchmarkRunner:
                     direct=True,
                 )
                 direct_end = time.monotonic_ns()
+                maintenance_after = self.lifecycle.metrics.snapshot()
+                receipt.record("maintenance_after", maintenance_after.to_dict())
+                _assert_no_maintenance(quiescent, maintenance_after)
 
                 def millis(end: int, begin: int) -> int:
                     return max(1, round((end - begin) / 1_000_000))

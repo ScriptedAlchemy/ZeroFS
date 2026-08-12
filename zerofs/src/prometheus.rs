@@ -210,6 +210,7 @@ fn collect_dedup_stats(dedup: &DedupCache) {
 fn collect_segment_gc_stats(stats: &SegmentGcStats) {
     let load = |a: &std::sync::atomic::AtomicU64| a.load(Ordering::Relaxed);
 
+    gauge!("zerofs_segment_gc_active").set(f64::from(stats.active.load(Ordering::Relaxed)));
     counter!("zerofs_segment_gc_passes_total").absolute(load(&stats.passes));
     counter!("zerofs_segment_gc_segments_deleted_total").absolute(load(&stats.segments_deleted));
     counter!("zerofs_segment_gc_deleted_bytes_total").absolute(load(&stats.deleted_bytes));

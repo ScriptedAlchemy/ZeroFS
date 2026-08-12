@@ -37,7 +37,11 @@ class ManagedProcess:
         if self.process.poll() is not None:
             return
         try:
-            os.killpg(self.process.pid, signal.SIGINT)
+            # Signal the supervisor once. In particular, sudo forwards SIGINT
+            # to its child; signaling the whole process group would also hit
+            # that child directly and can interrupt perf while it finalizes
+            # its data header.
+            self.process.send_signal(signal.SIGINT)
             self.process.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             self.terminate(timeout)

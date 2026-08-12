@@ -19,6 +19,10 @@ _METRICS = {
     "zerofs_writeback_local_bytes_completed_total": "local_bytes",
     "zerofs_writeback_remote_bytes_completed_total": "remote_bytes",
     "zerofs_writeback_terminal_error": "terminal",
+    "zerofs_segment_gc_active": "gc_active",
+    "zerofs_segment_gc_passes_total": "gc_passes",
+    "zerofs_segment_gc_batches_total": "gc_batches",
+    "zerofs_segment_gc_deleted_bytes_total": "gc_deleted_bytes",
 }
 
 
@@ -32,6 +36,10 @@ class WritebackSnapshot:
     local_bytes: int
     remote_bytes: int
     terminal: bool
+    gc_active: bool | None = None
+    gc_passes: int = 0
+    gc_batches: int = 0
+    gc_deleted_bytes: int = 0
 
     @classmethod
     def parse(cls, text: str) -> "WritebackSnapshot":
@@ -47,7 +55,8 @@ class WritebackSnapshot:
                 found[_METRICS[parts[0]]] = int(float(parts[1]))
             except ValueError as error:
                 raise ValueError(f"invalid writeback metric: {line}") from error
-        missing = sorted(set(_METRICS.values()) - found.keys())
+        required = set(_METRICS.values()) - {"gc_active"}
+        missing = sorted(required - found.keys())
         if missing:
             raise ValueError(f"writeback metrics missing fields: {', '.join(missing)}")
         return cls(
@@ -59,6 +68,10 @@ class WritebackSnapshot:
             local_bytes=found["local_bytes"],
             remote_bytes=found["remote_bytes"],
             terminal=bool(found["terminal"]),
+            gc_active=(bool(found["gc_active"]) if "gc_active" in found else None),
+            gc_passes=found["gc_passes"],
+            gc_batches=found["gc_batches"],
+            gc_deleted_bytes=found["gc_deleted_bytes"],
         )
 
     @property
@@ -70,7 +83,7 @@ class WritebackSnapshot:
             and self.dirty_ssd == 0
         )
 
-    def to_dict(self) -> dict[str, int | bool]:
+    def to_dict(self) -> dict[str, int | bool | None]:
         return {
             "accepted": self.accepted,
             "local": self.local,
@@ -80,6 +93,10 @@ class WritebackSnapshot:
             "local_bytes": self.local_bytes,
             "remote_bytes": self.remote_bytes,
             "terminal": self.terminal,
+            "gc_active": self.gc_active,
+            "gc_passes": self.gc_passes,
+            "gc_batches": self.gc_batches,
+            "gc_deleted_bytes": self.gc_deleted_bytes,
         }
 
 
@@ -100,6 +117,42 @@ class MetricsClient:
         with urllib.request.urlopen(self.url, timeout=self.timeout) as response:
             text = response.read().decode("utf-8")
         return WritebackSnapshot.parse(text)
+
+
+def wait_for_gc_quiescence(
+    snapshot: Callable[[], WritebackSnapshot],
+    *,
+    timeout: float,
+    stable_samples: int = 4,
+    interval: float = 0.25,
+    monotonic: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+) -> WritebackSnapshot:
+    """Wait for the startup reclaim pass to finish and remain idle."""
+    started = monotonic()
+    stable = 0
+    last: WritebackSnapshot | None = None
+    while True:
+        last = snapshot()
+        if last.terminal:
+            raise TerminalWritebackError("writeback reported a terminal error")
+        if last.gc_active is None:
+            raise ValueError(
+                "ZeroFS does not expose zerofs_segment_gc_active; deploy the "
+                "profile-capable build before benchmarking"
+            )
+        if not last.gc_active and last.gc_passes > 0:
+            stable += 1
+            if stable >= stable_samples:
+                return last
+        else:
+            stable = 0
+        if monotonic() - started >= timeout:
+            raise TimeoutError(
+                f"segment GC did not become quiescent within {timeout}s; "
+                f"last={last.to_dict()}"
+            )
+        sleep(interval)
 
 
 def wait_for_drain(

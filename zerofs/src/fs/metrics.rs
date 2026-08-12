@@ -1,7 +1,7 @@
 use comfy_table::{Attribute, Cell, Color, ContentArrangement, Table};
 use num_format::{Locale, ToFormattedString};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 const MIB_IN_BYTES: f64 = 1024.0 * 1024.0;
@@ -320,6 +320,9 @@ pub struct SegmentGcStats {
     pub nominations_dropped: AtomicU64,
     pub hot_seams: AtomicU64,
     pub orphans_reclaimed: AtomicU64,
+    /// True for the complete reclaim/orphan-sweep pass. Benchmark and operator
+    /// tooling use this to avoid attributing maintenance I/O to foreground work.
+    pub active: AtomicBool,
 
     // Gauges (last pass)
     pub segment_count: AtomicU64,
@@ -349,7 +352,25 @@ pub struct SegmentGcStats {
     pub reason: Mutex<String>,
 }
 
+pub struct SegmentGcActivity {
+    stats: Arc<SegmentGcStats>,
+}
+
+impl Drop for SegmentGcActivity {
+    fn drop(&mut self) {
+        self.stats.active.store(false, Ordering::Release);
+    }
+}
+
 impl SegmentGcStats {
+    pub fn begin_activity(self: &Arc<Self>) -> SegmentGcActivity {
+        let was_active = self.active.swap(true, Ordering::AcqRel);
+        debug_assert!(!was_active, "segment GC passes must not overlap");
+        SegmentGcActivity {
+            stats: Arc::clone(self),
+        }
+    }
+
     pub fn record_pass(&self, p: &SegmentGcPass) {
         use Ordering::Relaxed;
         self.passes.fetch_add(1, Relaxed);
@@ -452,5 +473,24 @@ fn apply_i64(a: &AtomicU64, d: i64) {
         let _ = a.fetch_update(Relaxed, Relaxed, |cur| {
             Some(cur.saturating_sub(d.unsigned_abs()))
         });
+    }
+}
+
+#[cfg(test)]
+mod segment_gc_tests {
+    use super::SegmentGcStats;
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn segment_gc_activity_guard_tracks_inflight_pass() {
+        let stats = Arc::new(SegmentGcStats::default());
+        assert!(!stats.active.load(Ordering::Relaxed));
+
+        let activity = stats.begin_activity();
+        assert!(stats.active.load(Ordering::Relaxed));
+
+        drop(activity);
+        assert!(!stats.active.load(Ordering::Relaxed));
     }
 }

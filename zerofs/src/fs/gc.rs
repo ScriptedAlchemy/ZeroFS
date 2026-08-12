@@ -452,6 +452,7 @@ impl GarbageCollector {
                 // pass's floor forward. The first pass uses the initial floor.
                 let mut plan = GcPlan::initial(&gc.tuning);
                 loop {
+                    let activity = seg_stats.begin_activity();
                     // Batch approval: no seal in flight, not shutting down, and
                     // (past the throughput floor) as idle as pass start. A busy
                     // store still drains `plan.min_batches` batches; beyond the
@@ -476,6 +477,7 @@ impl GarbageCollector {
                     // Right after the fast reclaim so no in-flight compaction can
                     // leave a not-yet-credited packed segment eligible.
                     gc.maybe_sweep_orphans().await;
+                    drop(activity);
                     // The window spans the pass, so mid-pass ops read as
                     // busy; the first decision after startup is always base.
                     let sample = Activity::sample(&gc.stats);

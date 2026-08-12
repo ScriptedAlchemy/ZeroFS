@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import shutil
+import sys
 import tempfile
 import unittest
 from dataclasses import replace
@@ -26,7 +28,7 @@ from scripts.vm100_pilot.metrics import (
 from scripts.vm100_pilot.profile import CanonicalDeployment, ProfileRunner
 from scripts.vm100_pilot.raw_sftp import RawSftpRunner, SftpEndpoint
 from scripts.vm100_pilot.receipts import RunReceipt
-from scripts.vm100_pilot.runner import CommandError
+from scripts.vm100_pilot.runner import CommandError, ManagedProcess
 from scripts.vm100_pilot.workloads import WorkloadRunner
 
 
@@ -139,6 +141,60 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(payload["phase"], "write")
         self.assertIn("boom", payload["error"])
 
+    def test_interrupt_signals_a_sudo_style_parent_only_once(self) -> None:
+        marker = Path(self.temp.name) / "signals"
+        child = Path(self.temp.name) / "child.py"
+        parent = Path(self.temp.name) / "parent.py"
+        child.write_text(
+            "import pathlib, signal, sys, time\n"
+            "marker = pathlib.Path(sys.argv[1])\n"
+            "count = 0\n"
+            "def interrupted(_signum, _frame):\n"
+            "    global count\n"
+            "    count += 1\n"
+            "    marker.write_text(str(count))\n"
+            "    if count >= 2:\n"
+            "        raise SystemExit(0)\n"
+            "signal.signal(signal.SIGINT, interrupted)\n"
+            "print('ready', flush=True)\n"
+            "signal.pause()\n"
+            "time.sleep(0.3)\n"
+            "marker.write_text(str(count))\n",
+            encoding="utf-8",
+        )
+        parent.write_text(
+            "import signal, subprocess, sys, time\n"
+            "child = subprocess.Popen(\n"
+            "    [sys.executable, sys.argv[1], sys.argv[2]],\n"
+            "    stdout=subprocess.PIPE, text=True,\n"
+            ")\n"
+            "assert child.stdout is not None\n"
+            "assert child.stdout.readline().strip() == 'ready'\n"
+            "def interrupted(_signum, _frame):\n"
+            "    time.sleep(0.1)\n"
+            "    child.send_signal(signal.SIGINT)\n"
+            "    raise SystemExit(child.wait())\n"
+            "signal.signal(signal.SIGINT, interrupted)\n"
+            "print('ready', flush=True)\n"
+            "signal.pause()\n",
+            encoding="utf-8",
+        )
+        process = subprocess.Popen(
+            [sys.executable, parent, child, marker],
+            stdout=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        stdout = process.stdout
+        self.assertIsNotNone(stdout)
+        assert stdout is not None
+        self.assertEqual(stdout.readline().strip(), "ready")
+
+        ManagedProcess(process, ("sudo", "perf")).interrupt(timeout=2)
+        stdout.close()
+
+        self.assertEqual(marker.read_text(), "1")
+
 
 class LifecycleTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -170,12 +226,38 @@ class LifecycleTests(unittest.TestCase):
                     "zerofs_writeback_local_bytes_completed_total 4",
                     "zerofs_writeback_remote_bytes_completed_total 3",
                     "zerofs_writeback_terminal_error 0",
+                    "zerofs_segment_gc_active 1",
+                    "zerofs_segment_gc_passes_total 3",
+                    "zerofs_segment_gc_batches_total 5",
+                    "zerofs_segment_gc_deleted_bytes_total 100",
                 )
             )
         )
         self.assertEqual(snapshot.accepted, 9)
         self.assertEqual(snapshot.remote, 7)
+        self.assertTrue(snapshot.gc_active)
+        self.assertEqual(snapshot.gc_passes, 3)
+        self.assertEqual(snapshot.gc_batches, 5)
+        self.assertEqual(snapshot.gc_deleted_bytes, 100)
         self.assertFalse(snapshot.drained)
+        legacy_snapshot = WritebackSnapshot.parse(
+            "\n".join(
+                (
+                    "zerofs_writeback_accepted_sequence 9",
+                    "zerofs_writeback_local_sequence 9",
+                    "zerofs_writeback_remote_sequence 9",
+                    "zerofs_writeback_dirty_ram_bytes 0",
+                    "zerofs_writeback_dirty_ssd_bytes 0",
+                    "zerofs_writeback_local_bytes_completed_total 4",
+                    "zerofs_writeback_remote_bytes_completed_total 4",
+                    "zerofs_writeback_terminal_error 0",
+                    "zerofs_segment_gc_passes_total 3",
+                    "zerofs_segment_gc_batches_total 5",
+                    "zerofs_segment_gc_deleted_bytes_total 100",
+                )
+            )
+        )
+        self.assertIsNone(legacy_snapshot.gc_active)
         with self.assertRaisesRegex(ValueError, "missing"):
             WritebackSnapshot.parse("zerofs_writeback_accepted_sequence 1\n")
 
@@ -189,6 +271,27 @@ class LifecycleTests(unittest.TestCase):
                 sleep=lambda delay: sleeps.append(delay),
             )
         self.assertEqual(sleeps, [])
+
+    def test_gc_quiescence_waits_for_the_first_completed_pass(self) -> None:
+        from scripts.vm100_pilot.metrics import wait_for_gc_quiescence
+
+        snapshots = iter(
+            (
+                WritebackSnapshot(9, 9, 9, 0, 0, 1, 1, False, True, 0, 0, 0),
+                WritebackSnapshot(9, 9, 9, 0, 0, 1, 1, False, False, 1, 2, 64),
+                WritebackSnapshot(9, 9, 9, 0, 0, 1, 1, False, False, 1, 2, 64),
+            )
+        )
+        result = wait_for_gc_quiescence(
+            lambda: next(snapshots),
+            timeout=1,
+            stable_samples=2,
+            interval=0,
+            monotonic=lambda: 0,
+            sleep=lambda _: None,
+        )
+        self.assertEqual(result.gc_passes, 1)
+        self.assertFalse(result.gc_active)
 
     def test_local_barrier_waits_for_the_captured_accepted_sequence(self) -> None:
         snapshots = iter(
@@ -304,7 +407,9 @@ class BenchmarkTests(unittest.TestCase):
                 "ZEROFS_PILOT_METADATA_DIR": str(mount / "metadata"),
             },
         )
-        self.snapshot = WritebackSnapshot(9, 9, 9, 0, 0, 1 << 20, 1 << 20, False)
+        self.snapshot = WritebackSnapshot(
+            9, 9, 9, 0, 0, 1 << 20, 1 << 20, False, False, 1, 0, 0
+        )
         self.runner = FakeRunner()
         self.lifecycle = _HealthyLifecycle(self.snapshot)
 
@@ -349,6 +454,18 @@ class BenchmarkTests(unittest.TestCase):
             ),
             (200, 300),
         )
+
+    def test_benchmark_rejects_a_gc_pass_inside_the_measured_epoch(self) -> None:
+        from scripts.vm100_pilot.benchmark import (
+            BenchmarkContaminatedError,
+            _assert_no_maintenance,
+        )
+
+        before = WritebackSnapshot(9, 9, 9, 0, 0, 1, 1, False, False, 4, 8, 10)
+        after = replace(before, gc_passes=5, gc_batches=9, gc_deleted_bytes=74)
+
+        with self.assertRaisesRegex(BenchmarkContaminatedError, "segment GC"):
+            _assert_no_maintenance(before, after)
 
     def test_prepare_root_uses_explicit_owner(self) -> None:
         benchmark = BenchmarkRunner(self.config, self.runner, self.lifecycle)  # type: ignore[arg-type]
