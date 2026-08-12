@@ -79,6 +79,35 @@ impl ZeroFS {
         to_name: &[u8],
         op_id: crate::dedup::OpId,
     ) -> Result<(), FsError> {
+        self.rename_with_options(auth, from_dirid, from_name, to_dirid, to_name, op_id, true)
+            .await
+    }
+
+    /// Atomic no-replace rename tagged with an idempotency op-id.
+    pub async fn rename_noreplace_idempotent(
+        &self,
+        auth: &AuthContext,
+        from_dirid: u64,
+        from_name: &[u8],
+        to_dirid: u64,
+        to_name: &[u8],
+        op_id: crate::dedup::OpId,
+    ) -> Result<(), FsError> {
+        self.rename_with_options(auth, from_dirid, from_name, to_dirid, to_name, op_id, false)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn rename_with_options(
+        &self,
+        auth: &AuthContext,
+        from_dirid: u64,
+        from_name: &[u8],
+        to_dirid: u64,
+        to_name: &[u8],
+        op_id: crate::dedup::OpId,
+        replace_existing: bool,
+    ) -> Result<(), FsError> {
         if from_name.is_empty() || to_name.is_empty() {
             return Err(FsError::InvalidArgument);
         }
@@ -190,6 +219,9 @@ impl ZeroFS {
             Err(FsError::NotFound) => None,
             Err(e) => return Err(e),
         };
+        if !replace_existing && verified_target_entry.is_some() {
+            return Err(FsError::Exists);
+        }
         if verified_target_entry.map(|(id, _)| id) != target_inode_id {
             return Err(FsError::StaleHandle);
         }

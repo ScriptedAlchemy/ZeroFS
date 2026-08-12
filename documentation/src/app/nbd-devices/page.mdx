@@ -63,10 +63,11 @@ Conflicting existing files, directories, or geometry are never replaced.
 
 Provisioning builds the marker, sparse lanes, and NBD manifest in a unique
 hidden sibling directory. It flushes that complete staging layout before one
-atomic rename publishes the final export name. A rerun can resume a matching
-staging directory after an interrupted command; an unrecognized partial
-directory is left untouched for manual inspection. Drafts left under the final
-name by older versions of this command are also recognized and completed.
+atomic no-replace rename publishes the final export name. Each attempt owns its
+staging directory exclusively; interrupted staging directories are left
+untouched for manual inspection and are never resumed automatically. An
+incomplete directory already using the final export name is rejected without
+modification and must be inspected and moved aside before retrying.
 
 <Note>
   `provision-striped` only creates and flushes the export. It does not format a

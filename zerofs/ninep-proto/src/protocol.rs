@@ -717,6 +717,7 @@ pub const T_SYMLINKATTR: u8 = message_type::TSYMLINKATTR;
 pub const T_MKNODATTR: u8 = message_type::TMKNODATTR;
 pub const T_LINKATTR: u8 = message_type::TLINKATTR;
 pub const T_SETATTRATTR: u8 = message_type::TSETATTRATTR;
+pub const T_RENAME_NOREPLACE: u8 = message_type::TRENAMENOREPLACE;
 // Delayed fallocate retries can reorder with writes and therefore carry op-ids.
 pub const T_FALLOCATE: u8 = message_type::TFALLOCATE;
 pub const R_FALLOCATE: u8 = message_type::RFALLOCATE;
@@ -807,6 +808,8 @@ pub enum Message {
     Trenameat(Trenameat),
     #[deku(id = "message_type::RRENAMEAT")]
     Rrenameat(Rrenameat),
+    #[deku(id = "message_type::TRENAMENOREPLACE")]
+    Trenamenoreplace(Trenameat),
     #[deku(id = "message_type::TUNLINKAT")]
     Tunlinkat(Tunlinkat),
     #[deku(id = "message_type::RUNLINKAT")]
@@ -907,6 +910,7 @@ impl Message {
             | Message::Tmknodattr(_)
             | Message::Tlinkattr(_)
             | Message::Tsetattrattr(_)
+            | Message::Trenamenoreplace(_)
             | Message::Trebind(_)
             | Message::Twalkgetattr(_)
             | Message::Treaddirattr(_) => true,
@@ -998,7 +1002,9 @@ impl Message {
             Message::Treadlink(m) => [Some(m.fid), None],
             Message::Tlink(m) | Message::Tlinkattr(m) => [Some(m.dfid), Some(m.fid)],
             Message::Trename(m) => [Some(m.fid), Some(m.dfid)],
-            Message::Trenameat(m) => [Some(m.olddirfid), Some(m.newdirfid)],
+            Message::Trenameat(m) | Message::Trenamenoreplace(m) => {
+                [Some(m.olddirfid), Some(m.newdirfid)]
+            }
             Message::Tunlinkat(m) => [Some(m.dirfid), None],
             Message::Tfsync(m) => [Some(m.fid), None],
             Message::Tfsyncdur(m) => [Some(m.fid), None],
@@ -1081,7 +1087,7 @@ impl Message {
             Message::Tlink(m) => Some(m.dfid),
             Message::Tlinkattr(m) => Some(m.dfid),
             Message::Trename(m) => Some(m.dfid),
-            Message::Trenameat(m) => Some(m.newdirfid),
+            Message::Trenameat(m) | Message::Trenamenoreplace(m) => Some(m.newdirfid),
             Message::Tunlinkat(m) => Some(m.dirfid),
             _ => None,
         }
@@ -1090,7 +1096,7 @@ impl Message {
     /// Fids changed by the mutation. `Trenameat` includes both directories.
     pub fn durability_fids(&self) -> impl Iterator<Item = u32> {
         let extra = match self {
-            Message::Trenameat(m) => Some(m.olddirfid),
+            Message::Trenameat(m) | Message::Trenamenoreplace(m) => Some(m.olddirfid),
             _ => None,
         };
         self.durability_fid().into_iter().chain(extra)
@@ -1280,6 +1286,7 @@ impl P9Message {
             | T_LCREATEATTR | T_MKDIRATTR | T_SYMLINKATTR | T_MKNODATTR | T_LINKATTR
             // setattr compound form
             | T_SETATTRATTR
+            | T_RENAME_NOREPLACE
         )
     }
 

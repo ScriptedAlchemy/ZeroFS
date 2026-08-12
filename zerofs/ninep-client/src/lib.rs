@@ -2504,6 +2504,29 @@ impl NinePClient {
         }
     }
 
+    /// Atomically rename one entry without replacing an existing destination.
+    /// This uses the private ZeroFS dialect and replies with `Rrenameat`.
+    pub async fn renameat_noreplace(
+        &self,
+        olddirfid: u32,
+        oldname: &[u8],
+        newdirfid: u32,
+        newname: &[u8],
+    ) -> ClientResult<()> {
+        let resp = self
+            .rpc(Message::Trenamenoreplace(Trenameat {
+                olddirfid,
+                oldname: P9String::new(oldname.to_vec()),
+                newdirfid,
+                newname: P9String::new(newname.to_vec()),
+            }))
+            .await?;
+        match resp {
+            Message::Rrenameat(_) => Ok(()),
+            _ => Err(ClientError::Unexpected("renameat noreplace")),
+        }
+    }
+
     pub async fn unlinkat(&self, dirfid: u32, name: &[u8], flags: u32) -> ClientResult<()> {
         let resp = self
             .rpc(Message::Tunlinkat(Tunlinkat {

@@ -1,8 +1,8 @@
 use super::error::{CommandError, CommandResult, NBDError, Result};
 use super::out_of_bounds;
 use super::{
-    NBD_STRIPE_MARKER, NBD_STRIPE_MAX_BYTES, NBD_STRIPE_MAX_MEMBERS, NBD_STRIPE_MIN_BYTES,
-    StripeManifest, is_nbd_provision_staging_name,
+    NBD_STRIPE_MANIFEST_MAX_BYTES, NBD_STRIPE_MARKER, NBD_STRIPE_MAX_BYTES, NBD_STRIPE_MAX_MEMBERS,
+    NBD_STRIPE_MIN_BYTES, StripeManifest, is_nbd_provision_staging_name,
 };
 use crate::fs::ZeroFS;
 use crate::fs::errors::FsError;
@@ -22,8 +22,6 @@ use tokio::sync::{OwnedRwLockReadGuard, RwLock};
 use tracing::debug;
 
 const NBD_READDIR_DEFAULT_LIMIT: usize = 1000;
-const NBD_STRIPE_MANIFEST_MAX_BYTES: u64 = 4096;
-
 /// Response to send back for an option
 pub struct OptionReply {
     pub reply_type: u32,

@@ -238,6 +238,7 @@ pub mod message_type {
     pub const TFSYNCDUR: u8 = 232;
     pub const TGETLINEAGE: u8 = 233;
     pub const RGETLINEAGE: u8 = 234;
+    pub const TRENAMENOREPLACE: u8 = 235;
     pub const TLOPENAT: u8 = 236;
     pub const RLOPENAT: u8 = 237;
     pub const TLCREATEATTR: u8 = 238;

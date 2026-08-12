@@ -686,7 +686,7 @@ fn request_fid_footprint(type_byte: u8, body: &[u8]) -> FidFootprint {
         20 | 30 | 70 | 104 | 110 | 230 | 236 | 238 | 246 | 252 => fixed_two_fids(body),
 
         // `Trenameat.newdirfid` follows the variable-length old name.
-        74 => {
+        74 | 235 => {
             let Some(old_dir) = read_u32_at(body, 0) else {
                 return FidFootprint::None;
             };

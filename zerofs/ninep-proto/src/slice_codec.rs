@@ -327,6 +327,14 @@ pub enum Request<'a> {
         newdirfid: u32,
         newname: &'a [u8],
     },
+    /// Atomically rename one directory entry without replacing a target.
+    Trenamenoreplace {
+        envelope: MutationEnvelope,
+        olddirfid: u32,
+        oldname: &'a [u8],
+        newdirfid: u32,
+        newname: &'a [u8],
+    },
     /// Remove a directory entry; `AT_REMOVEDIR` selects rmdir semantics.
     Tunlinkat {
         envelope: MutationEnvelope,

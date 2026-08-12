@@ -109,6 +109,13 @@ macro_rules! for_each_request {
                 newdirfid: u32,
                 newname: str
             };
+            Trenamenoreplace, TRENAMENOREPLACE, tag, {
+                envelope: envelope,
+                olddirfid: u32,
+                oldname: str,
+                newdirfid: u32,
+                newname: str
+            };
             Tunlinkat, TUNLINKAT, tag, {
                 envelope: envelope,
                 dirfid: u32,

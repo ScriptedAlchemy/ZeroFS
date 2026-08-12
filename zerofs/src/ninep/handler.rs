@@ -732,6 +732,7 @@ impl NinePHandler {
             Message::Tlink(tl) => self.link(tl, op_id).await,
             Message::Trename(tr) => self.rename(tr, op_id).await,
             Message::Trenameat(tr) => self.renameat(tr, op_id).await,
+            Message::Trenamenoreplace(tr) => self.renameat_noreplace(tr, op_id).await,
             Message::Tunlinkat(tu) => self.unlinkat(tu, op_id).await,
             Message::Tfsync(tf) => self.fsync(tf).await,
             Message::Tfsyncdur(tf) => self.fsyncdur(tf).await,
@@ -2122,6 +2123,30 @@ impl NinePHandler {
 
         self.filesystem
             .rename_idempotent(
+                &auth,
+                old_dir_fid.inode_id,
+                &tr.oldname.data,
+                new_dir_fid.inode_id,
+                &tr.newname.data,
+                op_id,
+            )
+            .await?;
+
+        Ok(Message::Rrenameat(Rrenameat))
+    }
+
+    async fn renameat_noreplace(
+        &self,
+        tr: Trenameat,
+        op_id: crate::dedup::OpId,
+    ) -> P9Result<Message> {
+        let old_dir_fid = self.get_fid(tr.olddirfid)?;
+        let new_dir_fid = self.get_fid(tr.newdirfid)?;
+
+        let auth = AuthContext::from(&old_dir_fid.creds);
+
+        self.filesystem
+            .rename_noreplace_idempotent(
                 &auth,
                 old_dir_fid.inode_id,
                 &tr.oldname.data,

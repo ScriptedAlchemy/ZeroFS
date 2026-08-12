@@ -547,6 +547,24 @@ impl Client {
             .ctx(&fd)
     }
 
+    /// Atomically rename/move within the filesystem without replacing an
+    /// existing target. A destination race returns [`ZeroFsError::AlreadyExists`].
+    pub async fn rename_no_replace(
+        &self,
+        from: impl AsRef<Path>,
+        to: impl AsRef<Path>,
+    ) -> Result<(), ZeroFsError> {
+        let (from, to) = (from.as_ref(), to.as_ref());
+        let (fd, td) = (display(from), display(to));
+        let (from_guard, from_name) = self.parent_of(from, &fd).await?;
+        let (to_guard, to_name) = self.parent_of(to, &td).await?;
+        self.session
+            .client
+            .renameat_noreplace(from_guard.fid(), from_name, to_guard.fid(), to_name)
+            .await
+            .ctx(&fd)
+    }
+
     /// Create a hard link at `link` pointing to the inode of `original`.
     pub async fn hard_link(
         &self,
