@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import time
 import tomllib
 from dataclasses import dataclass

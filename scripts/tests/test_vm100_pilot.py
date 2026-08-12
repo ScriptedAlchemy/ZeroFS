@@ -1,15 +1,14 @@
 from __future__ import annotations
 
 import json
-import os
 import tempfile
-import time
 import unittest
 from dataclasses import replace
 from pathlib import Path
 from subprocess import CompletedProcess
 
 from scripts.vm100_pilot.config import PilotConfig
+from scripts.vm100_pilot.benchmark import BenchmarkRunner, calculate_tiers
 from scripts.vm100_pilot.lifecycle import PilotLifecycle
 from scripts.vm100_pilot.metrics import (
     TerminalWritebackError,
@@ -39,6 +38,8 @@ class FakeRunner:
         if args == ("hostname",):
             return CompletedProcess(args, 0, "ubuntu-main\n", "")
         if args[:3] == ("findmnt", "-rn", "-M"):
+            return CompletedProcess(args, 1, "", "")
+        if args[:2] == ("test", "-e"):
             return CompletedProcess(args, 1, "", "")
         if args[:2] == ("systemctl", "start"):
             unit = args[2]
@@ -179,6 +180,102 @@ class LifecycleTests(unittest.TestCase):
         stops = [call[0][3] for call in self.runner.calls if call[0][:3] == ("systemctl", "stop", "--no-block")]
         self.assertEqual(stops, [self.config.service])
         self.assertNotIn(self.config.service, self.runner.active)
+
+
+class _StaticMetrics:
+    def __init__(self, snapshot: WritebackSnapshot) -> None:
+        self.value = snapshot
+
+    def snapshot(self) -> WritebackSnapshot:
+        return self.value
+
+
+class _HealthyLifecycle:
+    def __init__(self, snapshot: WritebackSnapshot) -> None:
+        self.metrics = _StaticMetrics(snapshot)
+        self.drain_calls = 0
+
+    def status(self, *, validate_data: bool = True) -> dict[str, object]:
+        return {"healthy": True, "deployed_commit": "test"}
+
+    def drain(self, timeout: int | None = None) -> object:
+        self.drain_calls += 1
+        return object()
+
+
+class BenchmarkTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        root = Path(self.temp.name) / "repo"
+        root.mkdir()
+        mount = Path(self.temp.name) / "mount"
+        mount.mkdir()
+        self.config = PilotConfig.from_mapping(
+            root,
+            {
+                "ZEROFS_PILOT_RESULT_DIR": str(Path(self.temp.name) / "results"),
+                "ZEROFS_PROFILE_TARGET_DIR": str(Path(self.temp.name) / "profile"),
+                "ZEROFS_PILOT_MOUNTPOINT": str(mount),
+                "ZEROFS_PILOT_INTEGRITY_FILE": str(mount / "integrity"),
+                "ZEROFS_PILOT_METADATA_DIR": str(mount / "metadata"),
+            },
+        )
+        self.snapshot = WritebackSnapshot(9, 9, 9, 0, 0, 1 << 20, 1 << 20, False)
+        self.runner = FakeRunner()
+        self.lifecycle = _HealthyLifecycle(self.snapshot)
+
+    def test_local_rate_uses_completed_payload_and_full_interval(self) -> None:
+        result = calculate_tiers(
+            logical_bytes=1 << 30,
+            local_bytes=1 << 30,
+            remote_bytes=1 << 30,
+            foreground_ms=1000,
+            local_end_to_end_ms=4000,
+            remote_end_to_end_ms=10000,
+            buffered_read_ms=2000,
+            direct_read_ms=500,
+        )
+        self.assertEqual(result.foreground_mibps, 1024.0)
+        self.assertEqual(result.local_mibps, 256.0)
+        self.assertEqual(result.remote_mibps, 102.4)
+        self.assertEqual(result.direct_read_mibps, 2048.0)
+
+    def test_prepare_root_uses_explicit_owner(self) -> None:
+        benchmark = BenchmarkRunner(self.config, self.runner, self.lifecycle)  # type: ignore[arg-type]
+        run_root = self.config.mountpoint / ".zerofs-bench-test"
+        benchmark.prepare_root(run_root)
+        self.assertIn(
+            (
+                (
+                    "install",
+                    "-d",
+                    "-m",
+                    "0755",
+                    "-o",
+                    self.config.user,
+                    "-g",
+                    self.config.group,
+                    str(run_root),
+                ),
+                True,
+            ),
+            self.runner.calls,
+        )
+
+    def test_failed_fio_cleans_scoped_root_and_preserves_receipt(self) -> None:
+        class FailingBenchmark(BenchmarkRunner):
+            def _run_fio(self, *args: object, **kwargs: object) -> None:
+                raise CommandError(("fio",), 19, "injected fio failure")
+
+        benchmark = FailingBenchmark(self.config, self.runner, self.lifecycle)  # type: ignore[arg-type]
+        with self.assertRaisesRegex(CommandError, "injected fio failure"):
+            benchmark.run(total_mib=4, jobs=1)
+        rm_calls = [call for call in self.runner.calls if call[0][:3] == ("rm", "-rf", "--")]
+        self.assertEqual(len(rm_calls), 1)
+        manifests = list(self.config.result_dir.glob("benchmark-*/manifest.json"))
+        self.assertEqual(len(manifests), 1)
+        self.assertEqual(json.loads(manifests[0].read_text())["status"], "failed")
 
 
 if __name__ == "__main__":
