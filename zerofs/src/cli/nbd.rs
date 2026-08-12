@@ -130,6 +130,10 @@ struct ProvisionHooks {
     #[cfg(test)]
     before_missing_stripe_manifest_create: Option<std::sync::Arc<tokio::sync::Barrier>>,
     #[cfg(test)]
+    before_final_staging_validation: Option<std::sync::Arc<tokio::sync::Barrier>>,
+    #[cfg(test)]
+    resume_final_staging_validation: Option<std::sync::Arc<tokio::sync::Notify>>,
+    #[cfg(test)]
     missing_lane_hook_used: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     missing_stripe_manifest_hook_used: std::sync::atomic::AtomicBool,
@@ -168,6 +172,16 @@ impl ProvisionHooks {
             && let Some(barrier) = &self.before_missing_stripe_manifest_create
         {
             barrier.wait().await;
+        }
+    }
+
+    async fn before_final_staging_validation(&self) {
+        #[cfg(test)]
+        if let Some(barrier) = &self.before_final_staging_validation {
+            barrier.wait().await;
+            if let Some(resume) = &self.resume_final_staging_validation {
+                resume.notified().await;
+            }
         }
     }
 }
@@ -598,6 +612,7 @@ async fn prepare_staging(
     validate_staging(client, layout, &staging_path).await?;
     prepare_lanes(client, layout, &staging_path, hooks).await?;
     prepare_stripe_manifest(client, layout, &staging_path, hooks).await?;
+    hooks.before_final_staging_validation().await;
     validate_staging(client, layout, &staging_path).await?;
     client
         .sync()
@@ -707,7 +722,21 @@ async fn provision_striped_inner(
         return Ok(ProvisionOutcome::Created);
     }
 
-    let staging_path = prepare_staging(client, layout, hooks).await?;
+    let staging_path = match prepare_staging(client, layout, hooks).await {
+        Ok(staging_path) => staging_path,
+        Err(prepare_error) => {
+            let final_matches = client.exists(layout.export_path()).await.unwrap_or(false)
+                && verify_complete(client, layout).await.is_ok();
+            if final_matches {
+                client
+                    .sync()
+                    .await
+                    .context("flush converged NBD provisioning")?;
+                return Ok(ProvisionOutcome::AlreadyProvisioned);
+            }
+            return Err(prepare_error);
+        }
+    };
     if client
         .exists(layout.export_path())
         .await
@@ -788,7 +817,7 @@ mod tests {
     use crate::ninep::NinePServer;
     use std::sync::Arc;
     use std::time::Duration;
-    use tokio::sync::Barrier;
+    use tokio::sync::{Barrier, Notify};
     use tokio_util::sync::CancellationToken;
     use zerofs_client::Client;
 
@@ -1237,6 +1266,59 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![unsafe_partial.rsplit('/').next().unwrap(), "vm100"]
         );
+        let handler = NBDHandler::new(filesystem, Arc::new(NbdExportGates::default()));
+        assert_eq!(handler.get_device(b"vm100").await.unwrap().size, 64 * MIB);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn shared_draft_loser_converges_when_winner_publishes_before_final_validation() {
+        let (client, filesystem, shutdown, _directory) = setup().await;
+        let staging = "/.nbd/.zerofs-nbd-provision-v1-shared-final-validation";
+        client.create_dir_all(staging, 0o755).await.unwrap();
+        client
+            .write(
+                format!("{staging}/{PROVISION_MARKER}"),
+                br#"{"version":1,"export_name":"vm100","layout":{"version":1,"stripe_bytes":1048576,"members":["lane-0","lane-1","lane-2","lane-3"]}}"#,
+            )
+            .await
+            .unwrap();
+        let layout = StripedLayout::new("vm100", 64 * MIB, 4, MIB).unwrap();
+        assert_eq!(
+            prepare_staging(&client, &layout, &ProvisionHooks::default())
+                .await
+                .unwrap(),
+            staging
+        );
+
+        let validation_reached = Arc::new(Barrier::new(2));
+        let resume_validation = Arc::new(Notify::new());
+        let losing_client = Arc::clone(&client);
+        let losing_layout = layout.clone();
+        let losing_hooks = ProvisionHooks {
+            before_final_staging_validation: Some(Arc::clone(&validation_reached)),
+            resume_final_staging_validation: Some(Arc::clone(&resume_validation)),
+            ..Default::default()
+        };
+        let losing_task = tokio::spawn(async move {
+            provision_striped_inner(&losing_client, &losing_layout, &losing_hooks).await
+        });
+        validation_reached.wait().await;
+
+        assert_eq!(
+            provision_striped(&client, &layout).await.unwrap(),
+            ProvisionOutcome::Created
+        );
+        resume_validation.notify_one();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), losing_task)
+                .await
+                .expect("losing caller resumed")
+                .expect("losing caller did not panic")
+                .expect("losing caller converged on the exact final export"),
+            ProvisionOutcome::AlreadyProvisioned
+        );
+        assert!(!client.exists(staging).await.unwrap());
         let handler = NBDHandler::new(filesystem, Arc::new(NbdExportGates::default()));
         assert_eq!(handler.get_device(b"vm100").await.unwrap().size, 64 * MIB);
         shutdown.cancel();
