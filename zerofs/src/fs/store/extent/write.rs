@@ -14,7 +14,7 @@ use crate::fs::{EXTENT_SIZE, FsError};
 use crate::replication::ReplOp;
 use crate::segment::{DirEntry, FrameLoc, Segid};
 use bytes::{Bytes, BytesMut};
-use futures::stream::{self, StreamExt, TryStreamExt};
+use futures::stream::{self, FuturesUnordered, StreamExt, TryStreamExt};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::error;
@@ -35,9 +35,10 @@ pub(super) const OPEN_SEGMENT_LANES: usize = 4;
 /// despite the size.
 pub(crate) const SEAL_THRESHOLD: usize = 256 * 1024 * 1024;
 
-/// Max segments sealing (PUT in flight) concurrently. Bounds finalized un-PUT
-/// RAM in `sealing` to ~this × SEAL_THRESHOLD; acquiring all permits is the
-/// fsync drain barrier. Each append lane also has at most one open generation.
+/// Max active seal PUTs and finalized seal generations retained in RAM. Separate
+/// semaphores enforce both limits so a failed PUT keeps its residency charge
+/// without consuming upload capacity needed by a flush retry. Each append lane
+/// also has at most one open generation.
 pub(crate) const MAX_INFLIGHT_SEALS: usize = 4;
 
 /// The in-RAM open segment. Frames are sealed (compressed+encrypted) and appended
@@ -54,6 +55,13 @@ pub(super) struct OpenSegment {
 pub(super) struct OpenLane {
     pub(super) append_gate: tokio::sync::Mutex<()>,
     pub(super) open: std::sync::Mutex<OpenSegment>,
+}
+
+/// Immutable segment bytes retained until publication succeeds. The owned permit
+/// makes removal from `sealing` the single release point for its RAM budget.
+pub(super) struct SealingGeneration {
+    pub(super) bytes: Bytes,
+    _residency: tokio::sync::OwnedSemaphorePermit,
 }
 
 impl ExtentStore {
@@ -95,8 +103,8 @@ impl ExtentStore {
             }
         }
         let sealing = self.sealing.lock().unwrap();
-        let bytes = sealing.get(&segid)?;
-        (end <= bytes.len()).then(|| bytes.slice(start..end))
+        let generation = sealing.get(&segid)?;
+        (end <= generation.bytes.len()).then(|| generation.bytes.slice(start..end))
     }
 
     /// Enrich a batch's replication ops: an extent-write `Put` whose segment is
@@ -364,84 +372,16 @@ impl ExtentStore {
         Ok(())
     }
 
-    /// The durability barrier (called by the flush path before the manifest is
-    /// flushed): wait for every in-flight background seal, re-PUT any that failed,
-    /// then synchronously seal the current open buffer. After this returns, every
-    /// segment referenced by a committed extent is durable on the object store.
-    pub async fn seal_open(&self) -> Result<(), FsError> {
-        // Freeze every lane's foreground frame-index reservation and batch
-        // sealing. Lane gates must be acquired before seal permits to preserve
-        // the foreground path's gate-then-permit lock order.
-        let mut append_guards = Vec::with_capacity(OPEN_SEGMENT_LANES);
-        for lane in self.open_lanes.iter() {
-            append_guards.push(lane.append_gate.lock().await);
-        }
-        // Acquire all permits: waits for in-flight background seals to finish, and
-        // holds new ones off until we release at end of scope.
-        let _all = self
-            .seal_sem
-            .acquire_many(self.max_inflight_seals as u32)
-            .await
-            .map_err(|_| FsError::IoError)?;
+    fn pending_seals(&self) -> Vec<(Segid, Bytes)> {
+        let sealing = self.sealing.lock().unwrap();
+        sealing
+            .iter()
+            .map(|(segid, generation)| (*segid, generation.bytes.clone()))
+            .collect()
+    }
 
-        // Synchronously seal the current open buffer. Register it in `sealing`
-        // under the open lock and remove it only on success, so the rotated
-        // segment is never absent from both maps: a concurrent read would 404
-        // the not-yet-PUT object, and a failed PUT would strand it. Mirrors
-        // spawn_seal.
-        for lane in self.open_lanes.iter() {
-            let mut open = lane.open.lock().unwrap();
-            if !open.dir.is_empty() {
-                let segid = open.segid;
-                #[cfg(feature = "failpoints")]
-                fail_point!(fp::SEAL_OPEN_FAIL, |_| Err(FsError::IoError));
-                // Seal the directory first: on error the open buffer and its
-                // committed FrameLocs stay intact for retry, instead of being
-                // dropped into a dangling pointer.
-                let sealed_dir = crate::segment::seal_directory(&self.codec, segid, &open.dir)
-                    .map_err(|_| FsError::IoError)?;
-                let k = open.dir.len() as u32;
-                let buf =
-                    std::mem::replace(&mut open.buf, Vec::with_capacity(self.seal_threshold()));
-                open.dir.clear();
-                open.segid = self.segments.next_segid();
-                debug_assert_ne!(
-                    open.segid, segid,
-                    "rotated open segid must differ from the sealed one"
-                );
-                let bytes = Bytes::from(crate::segment::assemble_segment(
-                    segid,
-                    buf,
-                    k,
-                    &sealed_dir,
-                    segid.counter,
-                ));
-                self.sealing.lock().unwrap().insert(segid, bytes.clone());
-            }
-        }
-
-        // The generation is now immutable and registered in `sealing`. Let
-        // foreground writers use the replacement segment while this barrier
-        // publishes only the captured generation. The caller's DB flush barrier
-        // prevents those later FrameLocs from entering this metadata flush.
-        drop(append_guards);
-
-        // Re-PUT failed background seals and publish the segment just rotated.
-        // Retain all seal permits until this captured set is complete.
-        let pending: Vec<(Segid, Bytes)> = {
-            let s = self.sealing.lock().unwrap();
-            s.iter().map(|(seg, b)| (*seg, b.clone())).collect()
-        };
-        #[cfg(test)]
-        let _put_gate = if pending.is_empty() {
-            None
-        } else {
-            match &self.seal_open_put_gate {
-                Some(gate) => Some(gate.acquire().await.map_err(|_| FsError::IoError)?),
-                None => None,
-            }
-        };
-        let mut results: Vec<_> = stream::iter(pending)
+    async fn publish_pending_seals(&self) -> bool {
+        let mut results: Vec<_> = stream::iter(self.pending_seals())
             .map(|(segid, bytes)| {
                 let segments = Arc::clone(&self.segments);
                 async move { (segid, segments.put_segment(segid, bytes).await) }
@@ -449,8 +389,6 @@ impl ExtentStore {
             .buffer_unordered(self.max_inflight_seals)
             .collect()
             .await;
-        // Completion order is intentionally free to refill available capacity;
-        // apply removals and errors in stable seal order after every PUT settles.
         results.sort_by_key(|(segid, _)| *segid);
 
         let mut failed = false;
@@ -465,6 +403,153 @@ impl ExtentStore {
                 }
             }
         }
+        failed
+    }
+
+    fn rotate_sealing_generation(
+        &self,
+        lane: &OpenLane,
+        residency: tokio::sync::OwnedSemaphorePermit,
+    ) -> Result<Option<(Segid, Bytes)>, FsError> {
+        let mut open = lane.open.lock().unwrap();
+        if open.dir.is_empty() {
+            return Ok(None);
+        }
+        let segid = open.segid;
+        let sealed_dir = crate::segment::seal_directory(&self.codec, segid, &open.dir)
+            .map_err(|_| FsError::IoError)?;
+        let k = open.dir.len() as u32;
+        let buf = std::mem::replace(&mut open.buf, Vec::with_capacity(self.seal_threshold()));
+        open.dir.clear();
+        open.segid = self.segments.next_segid();
+        debug_assert_ne!(
+            open.segid, segid,
+            "rotated open segid must differ from the sealed one"
+        );
+        let bytes = Bytes::from(crate::segment::assemble_segment(
+            segid,
+            buf,
+            k,
+            &sealed_dir,
+            segid.counter,
+        ));
+        let replaced = self.sealing.lock().unwrap().insert(
+            segid,
+            SealingGeneration {
+                bytes: bytes.clone(),
+                _residency: residency,
+            },
+        );
+        debug_assert!(replaced.is_none(), "sealing generation ids must be unique");
+        Ok(Some((segid, bytes)))
+    }
+
+    /// The durability barrier (called by the flush path before the manifest is
+    /// flushed): wait for every in-flight background seal, re-PUT any that failed,
+    /// then synchronously seal the current open buffer. After this returns, every
+    /// segment referenced by a committed extent is durable on the object store.
+    pub async fn seal_open(&self) -> Result<(), FsError> {
+        // Active-upload capacity is independent from resident-buffer capacity.
+        // Drain uploads first so a failed resident generation cannot deadlock a
+        // writer holding an append gate while it waits for memory budget.
+        let _all_uploads = self
+            .seal_upload_sem
+            .acquire_many(self.max_inflight_seals as u32)
+            .await
+            .map_err(|_| FsError::IoError)?;
+
+        // Freeze the append lanes one at a time. Re-publishing before each wait
+        // releases residency for a writer already blocked inside that lane, then
+        // the semaphore's FIFO lock hands the gate to this barrier next.
+        let mut append_guards = Vec::with_capacity(OPEN_SEGMENT_LANES);
+        for lane in self.open_lanes.iter() {
+            if self.publish_pending_seals().await {
+                return Err(FsError::IoError);
+            }
+            append_guards.push(lane.append_gate.lock().await);
+        }
+        if self.publish_pending_seals().await {
+            return Err(FsError::IoError);
+        }
+
+        let dirty_lanes: Vec<_> = self
+            .open_lanes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, lane)| {
+                (!lane.open.lock().unwrap().dir.is_empty()).then_some(index)
+            })
+            .collect();
+        if dirty_lanes.is_empty() {
+            return Ok(());
+        }
+
+        let mut append_guards = Some(append_guards);
+        let mut uploads = FuturesUnordered::new();
+        let mut next_lane = 0;
+        let mut failed = false;
+        #[cfg(test)]
+        let mut put_gate = self.seal_open_put_gate.clone();
+
+        loop {
+            while next_lane < dirty_lanes.len() {
+                let residency = match Arc::clone(&self.seal_residency_sem).try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(tokio::sync::TryAcquireError::NoPermits) => break,
+                    Err(tokio::sync::TryAcquireError::Closed) => return Err(FsError::IoError),
+                };
+                let index = dirty_lanes[next_lane];
+                next_lane += 1;
+                #[cfg(feature = "failpoints")]
+                fail_point!(fp::SEAL_OPEN_FAIL, |_| Err(FsError::IoError));
+                match self.rotate_sealing_generation(&self.open_lanes[index], residency) {
+                    Ok(Some((segid, bytes))) => {
+                        let segments = Arc::clone(&self.segments);
+                        uploads
+                            .push(async move { (segid, segments.put_segment(segid, bytes).await) });
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        failed = true;
+                        error!("failed to seal open segment directory: {}", e);
+                    }
+                }
+            }
+
+            if next_lane == dirty_lanes.len() {
+                // Every generation in the flush cutoff is immutable and resident.
+                // Later writers may use the replacement buffers while only this
+                // captured set is published below.
+                drop(append_guards.take());
+            }
+
+            #[cfg(test)]
+            if !uploads.is_empty()
+                && let Some(gate) = put_gate.take()
+            {
+                let _permit = gate.acquire().await.map_err(|_| FsError::IoError)?;
+            }
+
+            let Some((segid, result)) = uploads.next().await else {
+                break;
+            };
+            match result {
+                Ok(()) => {
+                    self.sealing.lock().unwrap().remove(&segid);
+                }
+                Err(e) => {
+                    failed = true;
+                    error!("seal PUT failed for {:?}: {}; retained for retry", segid, e);
+                }
+            }
+        }
+
+        if next_lane < dirty_lanes.len() {
+            failed = true;
+            error!(
+                "seal residency budget exhausted by failed generations; remaining lanes retained"
+            );
+        }
         if failed {
             return Err(FsError::IoError);
         }
@@ -476,51 +561,37 @@ impl ExtentStore {
     /// blocks here (backpressure) instead of growing RAM without bound. The
     /// rotated buffer stays readable via `sealing` until its PUT lands.
     async fn spawn_seal(&self, lane: &OpenLane) {
-        let permit = match Arc::clone(&self.seal_sem).acquire_owned().await {
+        let residency = match Arc::clone(&self.seal_residency_sem).acquire_owned().await {
             Ok(p) => p,
             Err(_) => return,
         };
-        let prepared = {
-            let mut open = lane.open.lock().unwrap();
-            if open.dir.is_empty() {
+        let (segid, _) = match self.rotate_sealing_generation(lane, residency) {
+            Ok(Some(generation)) => generation,
+            Ok(None) => return,
+            Err(e) => {
+                error!("failed to seal open segment directory: {}", e);
                 return;
             }
-            let segid = open.segid;
-            // Directory first, as in seal_open: an error must leave the open
-            // buffer intact for the next seal/flush to retry.
-            let sealed_dir = match crate::segment::seal_directory(&self.codec, segid, &open.dir) {
-                Ok(s) => s,
-                Err(e) => {
-                    error!("failed to seal open segment directory {:?}: {}", segid, e);
-                    return;
-                }
-            };
-            let k = open.dir.len() as u32;
-            let buf = std::mem::replace(&mut open.buf, Vec::with_capacity(self.seal_threshold()));
-            open.dir.clear();
-            open.segid = self.segments.next_segid();
-            debug_assert_ne!(
-                open.segid, segid,
-                "rotated open segid must differ from the sealed one"
-            );
-            let bytes = Bytes::from(crate::segment::assemble_segment(
-                segid,
-                buf,
-                k,
-                &sealed_dir,
-                segid.counter,
-            ));
-            // Insert into `sealing` while still holding `open`, so the segid is
-            // never absent from both maps (a concurrent read would miss it).
-            self.sealing.lock().unwrap().insert(segid, bytes.clone());
-            Some((segid, bytes))
-        };
-        let Some((segid, bytes)) = prepared else {
-            return;
         };
         let segments = self.segments.clone();
         let sealing = self.sealing.clone();
+        let upload_sem = self.seal_upload_sem.clone();
         crate::task::spawn_named("segment-seal", async move {
+            let _upload = match upload_sem.acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => return,
+            };
+            // A flush may have published this generation while the background
+            // task waited for upload capacity. Skip the stale queued attempt.
+            let bytes = {
+                let sealing = sealing.lock().unwrap();
+                sealing
+                    .get(&segid)
+                    .map(|generation| generation.bytes.clone())
+            };
+            let Some(bytes) = bytes else {
+                return;
+            };
             match segments.put_segment(segid, bytes).await {
                 Ok(()) => {
                     sealing.lock().unwrap().remove(&segid);
@@ -532,7 +603,6 @@ impl ExtentStore {
                     );
                 }
             }
-            drop(permit);
         });
     }
 
@@ -787,7 +857,8 @@ mod tests {
         let object_store: Arc<dyn ObjectStore> = object_store;
         let mut store = make_store(object_store, db.clone(), CompressionConfig::Lz4, 7);
         store.max_inflight_seals = max_inflight_seals;
-        store.seal_sem = Arc::new(Semaphore::new(max_inflight_seals));
+        store.seal_upload_sem = Arc::new(Semaphore::new(max_inflight_seals));
+        store.seal_residency_sem = Arc::new(Semaphore::new(max_inflight_seals));
         for lane in 0..OPEN_SEGMENT_LANES as u64 {
             let inode = 100 + lane;
             let mut txn = db.new_transaction().unwrap();
@@ -1567,13 +1638,14 @@ mod tests {
         let (store, db) = make().await;
         let mut store = store.with_seal_threshold(1);
         store.max_inflight_seals = 7;
-        store.seal_sem = Arc::new(Semaphore::new(store.max_inflight_seals));
+        store.seal_upload_sem = Arc::new(Semaphore::new(store.max_inflight_seals));
+        store.seal_residency_sem = Arc::new(Semaphore::new(store.max_inflight_seals));
 
-        // Model slow object-store PUTs by holding every configured seal permit. The
-        // first writer can append, but then has to wait before rotating.
+        // Model a full resident-buffer budget. The first writer can append, but
+        // then has to wait before rotating.
         assert_eq!(store.max_inflight_seals, 7);
         let permits = store
-            .seal_sem
+            .seal_residency_sem
             .clone()
             .acquire_many_owned(store.max_inflight_seals as u32)
             .await
@@ -1640,6 +1712,67 @@ mod tests {
         })
         .await
         .expect("writers did not resume after seal permits were released");
+    }
+
+    #[tokio::test]
+    async fn failed_background_seal_keeps_residency_bound_and_flush_makes_progress() {
+        let (_store, db) = make().await;
+        let (object_store, controls) = FaultStore::new(Arc::new(InMemory::new()));
+        let object_store: Arc<dyn ObjectStore> = object_store;
+        let mut store =
+            make_store(object_store, db.clone(), CompressionConfig::Lz4, 7).with_seal_threshold(1);
+        store.max_inflight_seals = 1;
+        store.seal_upload_sem = Arc::new(Semaphore::new(1));
+        store.seal_residency_sem = Arc::new(Semaphore::new(1));
+        controls.fail_puts(2);
+
+        let mut first_txn = db.new_transaction().unwrap();
+        store
+            .write(&mut first_txn, 100, 0, &Bytes::from_static(b"a"), 0)
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while controls.put_count() < 1 || store.sealing.lock().unwrap().len() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the first background seal did not fail and remain resident");
+
+        let mut second = tokio::spawn({
+            let store = store.clone();
+            let db = db.clone();
+            async move {
+                let mut txn = db.new_transaction().unwrap();
+                store
+                    .write(&mut txn, 104, 0, &Bytes::from_static(b"b"), 0)
+                    .await
+            }
+        });
+        let completed = tokio::time::timeout(std::time::Duration::from_millis(250), &mut second)
+            .await
+            .is_ok();
+        assert!(
+            !completed,
+            "a failed resident seal released its memory budget to a later writer"
+        );
+        assert_eq!(store.sealing.lock().unwrap().len(), 1);
+        assert_eq!(controls.put_count(), 1);
+
+        assert!(store.seal_open().await.is_err());
+        assert!(!second.is_finished());
+        assert_eq!(store.sealing.lock().unwrap().len(), 1);
+
+        store.seal_open().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            second.await.unwrap().unwrap();
+            while !store.seals_quiet() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("flush did not release the residency budget for the blocked writer");
+        assert!(store.sealing.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

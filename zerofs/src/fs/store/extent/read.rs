@@ -267,9 +267,9 @@ impl ExtentStore {
                 // zero-copy. Release the map lock before decoding it.
                 let sealing = self.sealing.lock().unwrap();
                 match sealing.get(&segid) {
-                    Some(bytes) => {
-                        let range = bounds(bytes.len(), segid, byte_offset, byte_len)?;
-                        Some(bytes.slice(range))
+                    Some(generation) => {
+                        let range = bounds(generation.bytes.len(), segid, byte_offset, byte_len)?;
+                        Some(generation.bytes.slice(range))
                     }
                     None => None,
                 }

@@ -47,7 +47,7 @@ use tokio::sync::Semaphore;
 use tracing::error;
 pub(crate) use write::MAX_INFLIGHT_SEALS;
 pub(crate) use write::SEAL_THRESHOLD;
-use write::{OPEN_SEGMENT_LANES, OpenLane, OpenSegment, TAIL_CACHE_BYTES};
+use write::{OPEN_SEGMENT_LANES, OpenLane, OpenSegment, SealingGeneration, TAIL_CACHE_BYTES};
 
 pub(super) const PARALLEL_EXTENT_OPS: usize = 20;
 
@@ -150,12 +150,14 @@ pub struct ExtentStore {
     /// Writers hold the read side from FrameLoc assignment through commit; GC
     /// takes the write side before sealing and choosing its cutoff.
     extent_ref_barrier: Arc<tokio::sync::RwLock<()>>,
-    /// Finalized bytes of segments whose PUT is in flight (or failed and pending a
-    /// re-PUT). Reads consult these before the object store. Ordered so the
-    /// barrier's re-PUT sequence is deterministic (seal order).
-    sealing: Arc<Mutex<BTreeMap<Segid, Bytes>>>,
-    /// Permits = max in-flight seals; acquiring all is the fsync drain barrier.
-    seal_sem: Arc<Semaphore>,
+    /// Finalized segments whose PUT is in flight (or failed and pending a re-PUT).
+    /// Each generation owns one residency permit until successful publication
+    /// removes it. Ordered so the barrier's re-PUT sequence is deterministic.
+    sealing: Arc<Mutex<BTreeMap<Segid, SealingGeneration>>>,
+    /// Bounds active segment PUTs. Acquiring all is the fsync upload-drain barrier.
+    seal_upload_sem: Arc<Semaphore>,
+    /// Bounds finalized segment buffers resident in `sealing`, including failures.
+    seal_residency_sem: Arc<Semaphore>,
     /// Deadline after which each currently-dead segment may be deleted:
     /// recorded the first pass it's seen dead, from the latest expiry of the
     /// checkpoints active then, so reclamation outlasts anything that could
@@ -282,7 +284,8 @@ impl ExtentStore {
             seal_open_put_gate: None,
             extent_ref_barrier: Arc::new(tokio::sync::RwLock::new(())),
             sealing: Arc::new(Mutex::new(BTreeMap::new())),
-            seal_sem: Arc::new(Semaphore::new(max_inflight_seals)),
+            seal_upload_sem: Arc::new(Semaphore::new(max_inflight_seals)),
+            seal_residency_sem: Arc::new(Semaphore::new(max_inflight_seals)),
             delete_at: Arc::new(Mutex::new(HashMap::new())),
             nominations: Arc::new(Mutex::new(NominationSet::default())),
             nominations_enabled: Arc::new(AtomicBool::new(false)),
@@ -392,9 +395,9 @@ impl ExtentStore {
         Ok(())
     }
 
-    /// Bytes held in RAM, not yet PUT to the object store: the open write
-    /// buffer plus any sealed segments whose PUT is still in flight. This is
-    /// the write-back buffer, the recently-written data a crash would lose
+    /// Bytes held in RAM, not yet PUT to the object store: the open write buffer
+    /// plus sealed segments whose PUT is active or failed and pending retry. This
+    /// is the write-back buffer, the recently-written data a crash would lose
     /// without a flush. Read fresh (it is volatile); cheap in-memory lengths.
     pub fn unflushed_bytes(&self) -> u64 {
         let open: u64 = self
@@ -407,7 +410,7 @@ impl ExtentStore {
             .lock()
             .unwrap()
             .values()
-            .map(|b| b.len() as u64)
+            .map(|generation| generation.bytes.len() as u64)
             .sum();
         open + sealing
     }
@@ -426,7 +429,7 @@ impl ExtentStore {
     /// No seal PUT in flight or pending re-PUT. Fast passes must not queue
     /// the barrier's all-permits drain behind a seal burst.
     pub fn seals_quiet(&self) -> bool {
-        self.seal_sem.available_permits() == self.max_inflight_seals
+        self.seal_upload_sem.available_permits() == self.max_inflight_seals
             && self.sealing.lock().unwrap().is_empty()
     }
 
