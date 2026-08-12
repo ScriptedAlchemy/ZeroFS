@@ -30,18 +30,19 @@ type SegBase = (bytes::Bytes, (i64, i64), (u64, u64));
 
 type Reply = oneshot::Sender<Result<(), FsError>>;
 
-// `Barrier` is test-only; boxing `Commit` would add an allocation to the hot path.
+// Boxing `Commit` would add an allocation to the hot path.
 #[allow(clippy::large_enum_variant)]
 enum Request {
     Commit(Transaction, Reply),
-    #[cfg(any(test, dst))]
-    #[allow(dead_code)]
     Barrier(Reply),
 }
 
 #[derive(Clone)]
 pub struct WriteCoordinator {
     sender: mpsc::UnboundedSender<Request>,
+    #[cfg(test)]
+    #[allow(dead_code)] // The binary NBD tests consume this; the lib test target does not.
+    apply_probe: Arc<std::sync::Mutex<Option<oneshot::Sender<()>>>>,
 }
 
 /// Commit worker dependencies.
@@ -61,6 +62,8 @@ struct WorkerContext {
     lineage_token: u64,
     /// Data plane used to attach un-PUT segment bytes to replication.
     extent_store: ExtentStore,
+    #[cfg(test)]
+    apply_probe: Arc<std::sync::Mutex<Option<oneshot::Sender<()>>>>,
 }
 
 impl WriteCoordinator {
@@ -82,6 +85,8 @@ impl WriteCoordinator {
         // worker's initial persisted watermark.
         let initial_counter = inode_store.next_id();
         let (sender, receiver) = mpsc::unbounded_channel();
+        #[cfg(test)]
+        let apply_probe = Arc::new(std::sync::Mutex::new(None));
         let ctx = WorkerContext {
             db,
             inode_store,
@@ -94,9 +99,15 @@ impl WriteCoordinator {
             dedup,
             lineage_token,
             extent_store,
+            #[cfg(test)]
+            apply_probe: Arc::clone(&apply_probe),
         };
         spawn_named("commit-worker", worker_loop(ctx, receiver, initial_counter));
-        Self { sender }
+        Self {
+            sender,
+            #[cfg(test)]
+            apply_probe,
+        }
     }
 
     pub async fn commit(&self, txn: Transaction) -> Result<(), FsError> {
@@ -109,14 +120,27 @@ impl WriteCoordinator {
 
     /// Wait until every commit submitted before this call has finished,
     /// including publication of its in-memory statistics.
-    #[cfg(any(test, dst))]
-    #[allow(dead_code)]
     pub async fn barrier(&self) -> Result<(), FsError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.sender
             .send(Request::Barrier(reply_tx))
             .map_err(|_| FsError::IoError)?;
         reply_rx.await.map_err(|_| FsError::IoError)?
+    }
+
+    /// Notify a test immediately before the next non-empty batch waits for its
+    /// database write permit.
+    #[cfg(test)]
+    #[allow(dead_code)] // The binary NBD tests consume this; the lib test target does not.
+    pub(crate) fn probe_next_apply(&self) -> oneshot::Receiver<()> {
+        let (reached, receiver) = oneshot::channel();
+        let previous = self
+            .apply_probe
+            .lock()
+            .expect("write coordinator apply probe poisoned")
+            .replace(reached);
+        assert!(previous.is_none(), "an apply probe is already installed");
+        receiver
     }
 
     /// Weak commit handle for data-plane GC and compaction.
@@ -252,19 +276,16 @@ async fn worker_loop(
         };
         let (txn, reply) = match first {
             Request::Commit(txn, reply) => (txn, reply),
-            #[cfg(any(test, dst))]
             Request::Barrier(reply) => {
                 let _ = reply.send(Ok(()));
                 continue;
             }
         };
         let mut batch = vec![(txn, reply)];
-        #[cfg(any(test, dst))]
         let mut barrier_reply = None;
         while let Ok(msg) = rx.try_recv() {
             match msg {
                 Request::Commit(txn, reply) => batch.push((txn, reply)),
-                #[cfg(any(test, dst))]
                 Request::Barrier(reply) => {
                     barrier_reply = Some(reply);
                     break;
@@ -377,7 +398,6 @@ async fn worker_loop(
                 for reply in replies {
                     let _ = reply.send(Err(e));
                 }
-                #[cfg(any(test, dst))]
                 if let Some(reply) = barrier_reply {
                     let _ = reply.send(Err(e));
                 }
@@ -451,7 +471,6 @@ async fn worker_loop(
             for reply in replies {
                 let _ = reply.send(Err(FsError::LeaderRejectedBeforeApply));
             }
-            #[cfg(any(test, dst))]
             if let Some(reply) = barrier_reply {
                 let _ = reply.send(Err(FsError::LeaderRejectedBeforeApply));
             }
@@ -499,6 +518,15 @@ async fn worker_loop(
 
         let mut local_applied = false;
         if any_ops && result.is_ok() {
+            #[cfg(test)]
+            if let Some(reached) = ctx
+                .apply_probe
+                .lock()
+                .expect("write coordinator apply probe poisoned")
+                .take()
+            {
+                let _ = reached.send(());
+            }
             // Complete lease and flush-barrier admission before evicting. The
             // affected keys then stay uncacheable only across SlateDB's atomic
             // apply, not while a suspended lease or seal+flush is awaited.
@@ -603,7 +631,6 @@ async fn worker_loop(
         for reply in replies {
             let _ = reply.send(result);
         }
-        #[cfg(any(test, dst))]
         if let Some(reply) = barrier_reply {
             let _ = reply.send(result);
         }

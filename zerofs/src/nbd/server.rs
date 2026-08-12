@@ -10,12 +10,16 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{TcpListener, UnixListener};
+use tokio::task::JoinSet;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 const MAX_OPTION_LENGTH: u32 = 4096;
 const MAX_REQUEST_LENGTH: u32 = 128 * 1024 * 1024;
 const DISCARD_CHUNK_SIZE: usize = 64 * 1024;
+/// Leave half of the CLI's serving-drain interval for abort/join and handoff.
+const CLIENT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 #[cfg(not(test))]
 const WRITE_PAYLOAD_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(test)]
@@ -57,15 +61,20 @@ impl NBDServer {
         }
     }
 
-    fn spawn_client_handler<S>(&self, stream: S, shutdown: &CancellationToken, client_name: String)
-    where
+    fn spawn_client_handler<S>(
+        &self,
+        clients: &mut JoinSet<()>,
+        stream: S,
+        shutdown: &CancellationToken,
+        client_name: String,
+    ) where
         S: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static,
     {
         let filesystem = Arc::clone(&self.filesystem);
         let export_gates = Arc::clone(&self.export_gates);
         let client_shutdown = shutdown.child_token();
 
-        tokio::spawn(async move {
+        clients.spawn(async move {
             if let Err(e) =
                 handle_client_stream(stream, filesystem, export_gates, client_shutdown).await
             {
@@ -75,7 +84,9 @@ impl NBDServer {
     }
 
     pub async fn start(&self, shutdown: CancellationToken) -> std::io::Result<()> {
-        match &self.transport {
+        let clients_shutdown = shutdown.child_token();
+        let mut clients = JoinSet::new();
+        let serve_result = match &self.transport {
             Transport::Tcp(socket) => {
                 let listener = TcpListener::bind(socket)
                     .await
@@ -84,15 +95,32 @@ impl NBDServer {
 
                 loop {
                     tokio::select! {
+                        biased;
                         _ = shutdown.cancelled() => {
                             info!("NBD TCP server shutting down on {}", socket);
-                            break;
+                            break Ok(());
+                        }
+                        finished = clients.join_next(), if !clients.is_empty() => {
+                            if let Some(Err(error)) = finished {
+                                warn!("NBD client task failed: {error}");
+                            }
                         }
                         result = listener.accept() => {
-                            let (stream, addr) = result?;
+                            let (stream, addr) = match result {
+                                Ok(accepted) => accepted,
+                                Err(error) => break Err(error),
+                            };
                             info!("NBD client connected from {}", addr);
-                            stream.set_nodelay(true)?;
-                            self.spawn_client_handler(stream, &shutdown, addr.to_string());
+                            if let Err(error) = stream.set_nodelay(true) {
+                                warn!("Failed to configure NBD TCP client {addr}: {error}");
+                                continue;
+                            }
+                            self.spawn_client_handler(
+                                &mut clients,
+                                stream,
+                                &clients_shutdown,
+                                addr.to_string(),
+                            );
                         }
                     }
                 }
@@ -111,21 +139,77 @@ impl NBDServer {
 
                 loop {
                     tokio::select! {
+                        biased;
                         _ = shutdown.cancelled() => {
                             info!("NBD Unix socket server shutting down at {:?}", path);
-                            break;
+                            break Ok(());
+                        }
+                        finished = clients.join_next(), if !clients.is_empty() => {
+                            if let Some(Err(error)) = finished {
+                                warn!("NBD client task failed: {error}");
+                            }
                         }
                         result = listener.accept() => {
-                            let (stream, _) = result?;
+                            let (stream, _) = match result {
+                                Ok(accepted) => accepted,
+                                Err(error) => break Err(error),
+                            };
                             info!("NBD client connected via Unix socket");
-                            self.spawn_client_handler(stream, &shutdown, "unix".to_string());
+                            self.spawn_client_handler(
+                                &mut clients,
+                                stream,
+                                &clients_shutdown,
+                                "unix".to_string(),
+                            );
                         }
                     }
                 }
             }
-        }
+        };
 
-        Ok(())
+        clients_shutdown.cancel();
+        drain_clients(&mut clients, Instant::now() + CLIENT_DRAIN_TIMEOUT).await;
+
+        // A canceled filesystem operation can leave its already-submitted
+        // transaction owned solely by the commit worker. Do not let the CLI
+        // close the database until that ordered prefix has fully published.
+        let commit_drain = self
+            .filesystem
+            .write_coordinator
+            .barrier()
+            .await
+            .map_err(std::io::Error::other);
+
+        serve_result?;
+        commit_drain
+    }
+}
+
+async fn drain_clients(clients: &mut JoinSet<()>, deadline: Instant) {
+    while !clients.is_empty() {
+        match tokio::time::timeout_at(deadline, clients.join_next()).await {
+            Ok(Some(Err(error))) => warn!("NBD client task failed while draining: {error}"),
+            Ok(Some(Ok(()))) => {}
+            Ok(None) => return,
+            Err(_) => break,
+        }
+    }
+
+    if clients.is_empty() {
+        return;
+    }
+
+    warn!(
+        "NBD client drain reached its deadline with {} active connection(s); aborting them",
+        clients.len()
+    );
+    clients.abort_all();
+    while let Some(result) = clients.join_next().await {
+        if let Err(error) = result
+            && !error.is_cancelled()
+        {
+            warn!("NBD client task failed during abort: {error}");
+        }
     }
 }
 
@@ -195,7 +279,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
         self.writer.flush().await?;
 
         let mut buf = [0u8; 4];
-        self.reader.read_exact(&mut buf).await?;
+        self.read_exact_or_shutdown(&mut buf).await?;
         let client_flags = NBDClientFlags::from_bytes((&buf, 0))?.1;
 
         debug!("Client flags: 0x{:x}", client_flags.flags);
@@ -212,7 +296,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
     async fn negotiate_options(&mut self) -> Result<NBDDevice> {
         loop {
             let mut header_buf = [0u8; NBD_OPTION_HEADER_SIZE];
-            match self.reader.read_exact(&mut header_buf).await {
+            match self.read_exact_or_shutdown(&mut header_buf).await {
                 Ok(_) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                     // Client disconnected, this is normal after LIST
@@ -294,7 +378,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
 
     async fn handle_export_name_option(&mut self, length: u32) -> Result<NBDDevice> {
         let mut name_buf = vec![0u8; length as usize];
-        self.reader.read_exact(&mut name_buf).await?;
+        self.read_exact_or_shutdown(&mut name_buf).await?;
 
         debug!(
             "Client requested export: '{}' (length: {})",
@@ -355,7 +439,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
     /// Read option data from the stream
     async fn read_option_data(&mut self, length: u32) -> Result<Vec<u8>> {
         let mut data = vec![0u8; length as usize];
-        self.reader.read_exact(&mut data).await?;
+        self.read_exact_or_shutdown(&mut data).await?;
         Ok(data)
     }
 
@@ -363,7 +447,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
     async fn drain_option_data(&mut self, length: u32) -> Result<()> {
         if length > 0 {
             let mut buf = vec![0u8; length as usize];
-            self.reader.read_exact(&mut buf).await?;
+            self.read_exact_or_shutdown(&mut buf).await?;
         }
         Ok(())
     }
@@ -415,6 +499,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
             let mut request_buf = [0u8; NBD_REQUEST_HEADER_SIZE];
 
             tokio::select! {
+                biased;
                 _ = self.shutdown.cancelled() => {
                     debug!("NBD client handler shutting down");
                     return Ok(());
@@ -496,6 +581,17 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
                     .await;
                 }
             }
+        }
+    }
+
+    async fn read_exact_or_shutdown(&mut self, buffer: &mut [u8]) -> std::io::Result<()> {
+        tokio::select! {
+            biased;
+            _ = self.shutdown.cancelled() => Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "NBD session is shutting down",
+            )),
+            result = self.reader.read_exact(buffer) => result.map(|_| ()),
         }
     }
 
@@ -606,19 +702,24 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
 
 #[cfg(test)]
 mod tests {
-    use super::NBDSession;
+    use super::{NBDServer, NBDSession};
     use crate::fs::ZeroFS;
     use crate::fs::permissions::Credentials;
     use crate::fs::types::{SetAttributes, SetSize};
     use crate::nbd::handler::{NBDHandler, NbdExportGates};
     use bytes::Bytes;
     use deku::{DekuContainerRead, DekuContainerWrite};
-    use nbd_proto::{NBD_EINVAL, NBD_REQUEST_MAGIC, NBDCommand, NBDRequest, NBDSimpleReply};
+    use nbd_proto::{
+        NBD_EINVAL, NBD_FLAG_C_FIXED_NEWSTYLE, NBD_FLAG_C_NO_ZEROES, NBD_IHAVEOPT,
+        NBD_OPT_EXPORT_NAME, NBD_REQUEST_MAGIC, NBDCommand, NBDRequest, NBDSimpleReply,
+    };
     use std::io;
     use std::pin::Pin;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::{Context, Poll};
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
+    use tokio::net::{TcpStream, UnixStream};
     use tokio::sync::oneshot;
     use tokio::time::{Duration, timeout};
     use tokio_util::sync::CancellationToken;
@@ -643,6 +744,27 @@ mod tests {
     struct PartialThenBlockingPayload {
         started: Option<oneshot::Sender<()>>,
         delivered: bool,
+    }
+
+    struct PrebufferedRequest {
+        bytes: Vec<u8>,
+        position: usize,
+        polls: Arc<AtomicUsize>,
+    }
+
+    impl AsyncRead for PrebufferedRequest {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            self.polls.fetch_add(1, Ordering::Relaxed);
+            let remaining = &self.bytes[self.position..];
+            let length = remaining.len().min(buf.remaining());
+            buf.put_slice(&remaining[..length]);
+            self.position += length;
+            Poll::Ready(Ok(()))
+        }
     }
 
     impl AsyncRead for PartialThenBlockingPayload {
@@ -709,6 +831,338 @@ mod tests {
             .get_device(b"flush-ordering-test")
             .await
             .expect("discover test export")
+    }
+
+    async fn assert_server_shutdown_closes_stalled_handshake<S>(
+        mut client: S,
+        shutdown: CancellationToken,
+        server_task: tokio::task::JoinHandle<io::Result<()>>,
+    ) where
+        S: AsyncRead + Unpin,
+    {
+        let mut handshake = [0; 18];
+        timeout(Duration::from_secs(2), client.read_exact(&mut handshake))
+            .await
+            .expect("server sent its handshake")
+            .expect("read server handshake");
+
+        shutdown.cancel();
+        timeout(Duration::from_secs(2), server_task)
+            .await
+            .expect("NBD server stopped after cancellation")
+            .expect("NBD server task did not panic")
+            .expect("NBD server stopped cleanly");
+
+        let mut trailing = [0];
+        assert_eq!(
+            timeout(Duration::from_secs(2), client.read(&mut trailing))
+                .await
+                .expect("tracked client task closed after server shutdown")
+                .expect("read client EOF"),
+            0,
+            "NBD start() must not return while a stalled handshake task owns the socket"
+        );
+    }
+
+    async fn enter_transmission<S>(client: &mut S, export: &[u8])
+    where
+        S: AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        let mut handshake = [0; 18];
+        timeout(Duration::from_secs(2), client.read_exact(&mut handshake))
+            .await
+            .expect("server sent its handshake")
+            .expect("read server handshake");
+        client
+            .write_all(&(NBD_FLAG_C_FIXED_NEWSTYLE | NBD_FLAG_C_NO_ZEROES).to_be_bytes())
+            .await
+            .expect("send client flags");
+        client
+            .write_all(&NBD_IHAVEOPT.to_be_bytes())
+            .await
+            .expect("send option magic");
+        client
+            .write_all(&NBD_OPT_EXPORT_NAME.to_be_bytes())
+            .await
+            .expect("send export-name option");
+        client
+            .write_all(&(export.len() as u32).to_be_bytes())
+            .await
+            .expect("send export-name length");
+        client.write_all(export).await.expect("send export name");
+
+        let mut export_info = [0; 10];
+        timeout(Duration::from_secs(2), client.read_exact(&mut export_info))
+            .await
+            .expect("server sent export info")
+            .expect("read export info");
+    }
+
+    async fn assert_server_shutdown_waits_for_accepted_commit<S>(
+        mut client: S,
+        shutdown: CancellationToken,
+        mut server_task: tokio::task::JoinHandle<io::Result<()>>,
+        filesystem: Arc<ZeroFS>,
+        export_gates: Arc<NbdExportGates>,
+        apply_reached: oneshot::Receiver<()>,
+        commit_block: tokio::sync::OwnedRwLockWriteGuard<()>,
+    ) where
+        S: AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        enter_transmission(&mut client, b"flush-ordering-test").await;
+        let write = NBDRequest {
+            magic: NBD_REQUEST_MAGIC,
+            flags: 0,
+            cmd_type: NBDCommand::Write,
+            cookie: 0x1122_3344_5566_7788,
+            offset: 0,
+            length: 1,
+        };
+        client
+            .write_all(&write.to_bytes().expect("encode write"))
+            .await
+            .expect("send write header");
+        client.write_all(&[0x7b]).await.expect("send write payload");
+        timeout(Duration::from_secs(2), apply_reached)
+            .await
+            .expect("accepted write reached the commit boundary")
+            .expect("commit apply probe remained installed");
+
+        shutdown.cancel();
+        let mut trailing = [0];
+        assert_eq!(
+            timeout(Duration::from_secs(3), client.read(&mut trailing))
+                .await
+                .expect("bounded client retirement closed the active connection")
+                .expect("read active-client EOF"),
+            0,
+            "the active NBD client must be aborted and joined at the drain deadline"
+        );
+        assert!(
+            !server_task.is_finished(),
+            "NBD start() returned before its accepted WriteCoordinator commit finished"
+        );
+
+        drop(commit_block);
+        timeout(Duration::from_secs(2), &mut server_task)
+            .await
+            .expect("NBD server returned after the accepted commit completed")
+            .expect("NBD server task did not panic")
+            .expect("NBD server stopped cleanly");
+
+        let handler = NBDHandler::new(Arc::clone(&filesystem), export_gates);
+        let device = handler
+            .get_device(b"flush-ordering-test")
+            .await
+            .expect("reopen test export");
+        assert_eq!(
+            handler
+                .read(&device, 0, 1)
+                .await
+                .expect("read committed byte"),
+            Bytes::from_static(&[0x7b]),
+            "the queued write must finish before NBD server shutdown returns"
+        );
+    }
+
+    #[tokio::test]
+    async fn unix_shutdown_joins_a_client_that_withholds_handshake_flags() {
+        let filesystem = Arc::new(
+            ZeroFS::new_in_memory()
+                .await
+                .expect("create test filesystem"),
+        );
+        let directory = tempfile::tempdir().expect("temporary socket directory");
+        let socket = directory.path().join("nbd.sock");
+        let server = NBDServer::new_unix(filesystem, Arc::new(NbdExportGates::default()), &socket);
+        let shutdown = CancellationToken::new();
+        let server_shutdown = shutdown.clone();
+        let server_task = tokio::spawn(async move { server.start(server_shutdown).await });
+        let client = timeout(Duration::from_secs(2), async {
+            loop {
+                match UnixStream::connect(&socket).await {
+                    Ok(client) => return client,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        tokio::task::yield_now().await;
+                    }
+                    Err(error) => panic!("connect Unix NBD client: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("Unix NBD listener became ready");
+
+        assert_server_shutdown_closes_stalled_handshake(client, shutdown, server_task).await;
+    }
+
+    #[tokio::test]
+    async fn tcp_shutdown_joins_a_client_that_withholds_handshake_flags() {
+        let filesystem = Arc::new(
+            ZeroFS::new_in_memory()
+                .await
+                .expect("create test filesystem"),
+        );
+        let reserved = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .expect("reserve loopback address");
+        let address = reserved.local_addr().expect("reserved loopback address");
+        drop(reserved);
+        let server = NBDServer::new_tcp(filesystem, Arc::new(NbdExportGates::default()), address);
+        let shutdown = CancellationToken::new();
+        let server_shutdown = shutdown.clone();
+        let server_task = tokio::spawn(async move { server.start(server_shutdown).await });
+        let client = timeout(Duration::from_secs(2), async {
+            loop {
+                match TcpStream::connect(address).await {
+                    Ok(client) => return client,
+                    Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
+                        tokio::task::yield_now().await;
+                    }
+                    Err(error) => panic!("connect TCP NBD client: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("TCP NBD listener became ready");
+
+        assert_server_shutdown_closes_stalled_handshake(client, shutdown, server_task).await;
+    }
+
+    #[tokio::test]
+    async fn unix_shutdown_waits_for_an_accepted_commit_before_returning() {
+        let filesystem = Arc::new(
+            ZeroFS::new_in_memory()
+                .await
+                .expect("create test filesystem"),
+        );
+        let export_gates = Arc::new(NbdExportGates::default());
+        single_file_export(&filesystem, &export_gates).await;
+        let commit_block = filesystem.db.flush_barrier().write_owned().await;
+        let apply_reached = filesystem.write_coordinator.probe_next_apply();
+        let directory = tempfile::tempdir().expect("temporary socket directory");
+        let socket = directory.path().join("nbd.sock");
+        let server =
+            NBDServer::new_unix(Arc::clone(&filesystem), Arc::clone(&export_gates), &socket);
+        let shutdown = CancellationToken::new();
+        let server_shutdown = shutdown.clone();
+        let server_task = tokio::spawn(async move { server.start(server_shutdown).await });
+        let client = timeout(Duration::from_secs(2), async {
+            loop {
+                match UnixStream::connect(&socket).await {
+                    Ok(client) => return client,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        tokio::task::yield_now().await;
+                    }
+                    Err(error) => panic!("connect Unix NBD client: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("Unix NBD listener became ready");
+
+        assert_server_shutdown_waits_for_accepted_commit(
+            client,
+            shutdown,
+            server_task,
+            filesystem,
+            export_gates,
+            apply_reached,
+            commit_block,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn tcp_shutdown_waits_for_an_accepted_commit_before_returning() {
+        let filesystem = Arc::new(
+            ZeroFS::new_in_memory()
+                .await
+                .expect("create test filesystem"),
+        );
+        let export_gates = Arc::new(NbdExportGates::default());
+        single_file_export(&filesystem, &export_gates).await;
+        let commit_block = filesystem.db.flush_barrier().write_owned().await;
+        let apply_reached = filesystem.write_coordinator.probe_next_apply();
+        let reserved = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .expect("reserve loopback address");
+        let address = reserved.local_addr().expect("reserved loopback address");
+        drop(reserved);
+        let server =
+            NBDServer::new_tcp(Arc::clone(&filesystem), Arc::clone(&export_gates), address);
+        let shutdown = CancellationToken::new();
+        let server_shutdown = shutdown.clone();
+        let server_task = tokio::spawn(async move { server.start(server_shutdown).await });
+        let client = timeout(Duration::from_secs(2), async {
+            loop {
+                match TcpStream::connect(address).await {
+                    Ok(client) => return client,
+                    Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
+                        tokio::task::yield_now().await;
+                    }
+                    Err(error) => panic!("connect TCP NBD client: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("TCP NBD listener became ready");
+
+        assert_server_shutdown_waits_for_accepted_commit(
+            client,
+            shutdown,
+            server_task,
+            filesystem,
+            export_gates,
+            apply_reached,
+            commit_block,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_wins_over_a_prebuffered_transmission_header() {
+        let filesystem = Arc::new(
+            ZeroFS::new_in_memory()
+                .await
+                .expect("create test filesystem"),
+        );
+        let export_gates = Arc::new(NbdExportGates::default());
+        let device = single_file_export(&filesystem, &export_gates).await;
+        let request = NBDRequest {
+            magic: NBD_REQUEST_MAGIC,
+            flags: 0,
+            cmd_type: NBDCommand::WriteZeroes,
+            cookie: 0x9988_7766_5544_3322,
+            offset: 0,
+            length: 4096,
+        }
+        .to_bytes()
+        .expect("encode prebuffered request");
+        let polls = Arc::new(AtomicUsize::new(0));
+
+        for _ in 0..64 {
+            let shutdown = CancellationToken::new();
+            shutdown.cancel();
+            let mut session = NBDSession::new(
+                PrebufferedRequest {
+                    bytes: request.clone(),
+                    position: 0,
+                    polls: Arc::clone(&polls),
+                },
+                tokio::io::sink(),
+                Arc::clone(&filesystem),
+                Arc::clone(&export_gates),
+                shutdown,
+            );
+            session
+                .handle_transmission(device.clone())
+                .await
+                .expect("canceled transmission stopped cleanly");
+        }
+
+        assert_eq!(
+            polls.load(Ordering::Relaxed),
+            0,
+            "a buffered command must not be read or dispatched after shutdown is observable"
+        );
     }
 
     #[tokio::test]
