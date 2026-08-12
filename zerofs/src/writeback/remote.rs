@@ -711,10 +711,8 @@ async fn commit_remote(
     journal.mark_remote(record.sequence, e_tag)?;
     overlay.remove_remote_prefix(record.sequence).await;
     journal.remove_remote_prefix(record.sequence)?;
-    if let Some((payload_len, _)) = record.payload() {
-        let available = fs4::available_space(journal.root())?;
-        disk.set_remote_complete(payload_len, available)?;
-    }
+    let available = fs4::available_space(journal.root())?;
+    disk.set_remote_complete(record.disk_charge_bytes()?, available)?;
     Ok(())
 }
 

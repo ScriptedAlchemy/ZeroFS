@@ -1222,6 +1222,20 @@ impl Settings {
 
         self.writeback_settings(crate::writeback::config::WritebackAccessMode::ReadWrite)?;
 
+        if self
+            .writeback
+            .as_ref()
+            .is_some_and(|writeback| writeback.enabled)
+            && self
+                .filesystem
+                .as_ref()
+                .is_some_and(|filesystem| filesystem.ignore_fsync)
+        {
+            anyhow::bail!(
+                "[filesystem] ignore_fsync is incompatible with [writeback]: fsync must retain the local SSD durability boundary"
+            );
+        }
+
         if let Some(fs) = &self.filesystem
             && fs.ignore_fsync
             && self.lsm.as_ref().map(|l| l.sync_writes()).unwrap_or(false)
@@ -2083,6 +2097,28 @@ min_free_gb = 256.0"#,
             let error = settings.writeback_settings(mode).unwrap_err();
             assert!(format!("{error:#}").contains("read-write"));
         }
+    }
+
+    #[test]
+    fn writeback_rejects_ignore_fsync() {
+        let error = write_and_load(&writeback_sftp_config(
+            16.0,
+            r#"[filesystem]
+ignore_fsync = true
+
+[writeback]
+enabled = true
+dir = "/var/cache/zerofs-writeback"
+memory_size_gb = 16.0
+disk_size_gb = 512.0
+min_free_gb = 256.0"#,
+        ))
+        .unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("ignore_fsync"),
+            "unexpected error: {error:#}"
+        );
     }
 
     #[test]

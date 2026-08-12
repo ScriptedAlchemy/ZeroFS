@@ -966,6 +966,7 @@ pub async fn run_server(
     let init_result = crate::cli::init::initialize_filesystem(&settings, db_mode).await?;
     let writeback_for_shutdown = init_result.writeback.clone();
     let writeback_for_metrics = init_result.writeback.clone();
+    let writeback_for_checkpoints = init_result.writeback.clone();
     let sftp_pool = init_result.sftp_pool.clone();
     let sftp_pool_for_close = sftp_pool.clone();
     let using_sftp = sftp_pool.is_some();
@@ -1085,6 +1086,17 @@ pub async fn run_server(
             init_result.object_store,
             init_result.wal_object_store.clone(),
         ));
+        if let Some(writeback) = writeback_for_checkpoints {
+            checkpoint_manager.set_post_mutation_durability(Arc::new(move || {
+                let writeback = writeback.clone();
+                Box::pin(async move {
+                    writeback
+                        .wait_local_through_accepted()
+                        .await
+                        .map_err(|error| anyhow::anyhow!("writeback local barrier failed: {error}"))
+                })
+            }));
+        }
         // Checkpoints must not durably publish a FrameLoc whose segment is still in
         // the RAM open buffer: seal + flush under the barrier first (see
         // CheckpointManager::create_checkpoint). Read-only mode has no writer to seal.

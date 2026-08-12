@@ -225,11 +225,12 @@ impl LocalJournaler {
             .await
     }
 
-    pub async fn submit_metadata(
+    pub async fn submit_metadata_with_disk(
         &self,
         record: MutationRecord,
+        disk: DiskPermit,
     ) -> Result<LocalBarrier, LocalBarrierError> {
-        self.submit(record, None, None, None).await
+        self.submit(record, None, None, Some(disk)).await
     }
 
     async fn submit(

@@ -351,6 +351,9 @@ impl DiskAdmission {
             }
             if state.waiters.is_empty() && disk_fits(&self.inner, &state, bytes) {
                 state.used += bytes;
+                if state.used > self.inner.high_bytes {
+                    state.paused = true;
+                }
                 return Ok(DiskPermit::new(self.inner.clone(), bytes));
             }
             if projected_exceeds(state.used, bytes, self.inner.high_bytes) {
@@ -490,10 +493,14 @@ fn grant_disk_waiters(inner: &Arc<DiskInner>) {
             .used
             .checked_add(waiter.bytes)
             .expect("disk admission fit was checked before accounting");
+        if state.used > inner.high_bytes {
+            state.paused = true;
+        }
         let permit = DiskPermit::new(inner.clone(), waiter.bytes);
         if let Err(Ok(mut permit)) = waiter.sender.send(Ok(permit)) {
             permit.active = false;
             state.used -= waiter.bytes;
+            refresh_disk_pause(inner, &mut state);
         }
     }
 }
@@ -534,7 +541,8 @@ fn refresh_disk_pause(inner: &DiskInner, state: &mut DiskState) {
 
 fn disk_fits(inner: &DiskInner, state: &DiskState, bytes: u64) -> bool {
     !state.paused
-        && !projected_exceeds(state.used, bytes, inner.high_bytes)
+        && (!projected_exceeds(state.used, bytes, inner.high_bytes)
+            || (state.used == 0 && !projected_exceeds(0, bytes, inner.capacity)))
         && state.available.saturating_sub(bytes) >= inner.min_free_bytes
 }
 
@@ -559,7 +567,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Admission, AdmissionError, DiskAdmission, lock};
+    use super::{Admission, AdmissionError, DiskAdmission, DiskWaiter, grant_disk_waiters, lock};
     use std::time::Duration;
 
     #[tokio::test]
@@ -753,6 +761,69 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(permit.bytes(), 100);
+    }
+
+    #[tokio::test]
+    async fn empty_disk_gate_accepts_one_capacity_fitting_reservation_above_high_water() {
+        let disk = DiskAdmission::new(100, 90, 70, 10).unwrap();
+
+        let permit = tokio::time::timeout(Duration::from_secs(1), disk.reserve(95, 1_000))
+            .await
+            .expect("an empty tier must not wait forever for a capacity-fitting mutation")
+            .unwrap();
+
+        assert_eq!(permit.bytes(), 95);
+        assert_eq!(disk.used_bytes(), 95);
+        permit.accept();
+
+        let blocked = tokio::spawn({
+            let disk = disk.clone();
+            async move { disk.reserve(1, 1_000).await }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !blocked.is_finished(),
+            "the exceptional reservation must still engage high-water backpressure"
+        );
+
+        disk.set_remote_complete(25, 1_000).unwrap();
+        let resumed = tokio::time::timeout(Duration::from_secs(1), blocked)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(resumed.bytes(), 1);
+    }
+
+    #[tokio::test]
+    async fn canceled_exceptional_disk_grant_does_not_strand_the_next_waiter() {
+        let disk = DiskAdmission::new(100, 90, 70, 10).unwrap();
+        let (canceled_sender, canceled_receiver) = tokio::sync::oneshot::channel();
+        drop(canceled_receiver);
+        let (next_sender, next_receiver) = tokio::sync::oneshot::channel();
+        {
+            let mut state = lock(&disk.inner.state);
+            state.available = 1_000;
+            state.waiters.push_back(DiskWaiter {
+                id: 0,
+                bytes: 95,
+                sender: canceled_sender,
+            });
+            state.waiters.push_back(DiskWaiter {
+                id: 1,
+                bytes: 1,
+                sender: next_sender,
+            });
+        }
+
+        grant_disk_waiters(&disk.inner);
+
+        let permit = tokio::time::timeout(Duration::from_secs(1), next_receiver)
+            .await
+            .expect("the next waiter was stranded behind a canceled exceptional grant")
+            .unwrap()
+            .unwrap();
+        assert_eq!(permit.bytes(), 1);
     }
 
     #[test]

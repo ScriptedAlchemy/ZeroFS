@@ -58,6 +58,7 @@ pub struct JournalSnapshot {
     pub remote_retries: u64,
     pub records: Vec<MutationRecord>,
     pub dirty_blob_bytes: u64,
+    pub dirty_metadata_bytes: u64,
     pub pending_blob_count: u64,
 }
 
@@ -156,6 +157,7 @@ impl Journal {
             .context("failed to open journal mutations")?;
         let mut records = Vec::new();
         let mut dirty_blob_bytes = 0_u64;
+        let mut dirty_metadata_bytes = 0_u64;
         for entry in table
             .iter()
             .context("failed to iterate journal mutations")?
@@ -163,12 +165,19 @@ impl Journal {
             let (_, value) = entry.context("failed to read journal mutation")?;
             let record: MutationRecord =
                 bincode::deserialize(value.value()).context("failed to decode journal mutation")?;
-            if record.sequence > remote_seq
-                && let Some((payload_len, _)) = record.payload()
-            {
-                dirty_blob_bytes = dirty_blob_bytes
-                    .checked_add(payload_len)
-                    .context("dirty journal byte count overflow")?;
+            if record.sequence > remote_seq {
+                match record.payload() {
+                    Some((payload_len, _)) => {
+                        dirty_blob_bytes = dirty_blob_bytes
+                            .checked_add(payload_len)
+                            .context("dirty journal blob byte count overflow")?;
+                    }
+                    None => {
+                        dirty_metadata_bytes = dirty_metadata_bytes
+                            .checked_add(record.disk_charge_bytes()?)
+                            .context("dirty journal metadata byte count overflow")?;
+                    }
+                }
             }
             records.push(record);
         }
@@ -189,6 +198,7 @@ impl Journal {
             remote_retries,
             records,
             dirty_blob_bytes,
+            dirty_metadata_bytes,
             pending_blob_count,
         })
     }
@@ -1327,6 +1337,10 @@ mod tests {
         let snapshot = journal.snapshot().unwrap();
         assert_eq!(snapshot.local_seq, 1);
         assert_eq!(snapshot.dirty_blob_bytes, 0);
+        assert_eq!(
+            snapshot.dirty_metadata_bytes,
+            MutationRecord::metadata_disk_charge("obsolete").unwrap()
+        );
         assert_eq!(snapshot.records, vec![committed]);
     }
 

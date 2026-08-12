@@ -16,6 +16,11 @@ use uuid::Uuid;
 pub type PreCheckpointFlush =
     Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send + Sync>;
 
+/// Wait for a completed checkpoint mutation to reach the writeback journal.
+/// This is installed only when the database object store uses writeback.
+pub type PostMutationDurability =
+    Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send + Sync>;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckpointInfo {
     pub id: Uuid,
@@ -29,6 +34,7 @@ pub struct CheckpointManager {
     /// Set once at bring-up (see [`PreCheckpointFlush`]); unset in tests, which
     /// checkpoint durable state as-is.
     pre_flush: Arc<OnceLock<PreCheckpointFlush>>,
+    post_mutation_durability: Arc<OnceLock<PostMutationDurability>>,
 }
 
 impl CheckpointManager {
@@ -47,6 +53,7 @@ impl CheckpointManager {
             db_handle,
             admin,
             pre_flush: Arc::new(OnceLock::new()),
+            post_mutation_durability: Arc::new(OnceLock::new()),
         }
     }
 
@@ -54,6 +61,11 @@ impl CheckpointManager {
     /// bring-up to the filesystem's flush coordinator.
     pub fn set_pre_flush(&self, hook: PreCheckpointFlush) {
         let _ = self.pre_flush.set(hook);
+    }
+
+    /// Install the post-mutation local durability barrier (first call wins).
+    pub fn set_post_mutation_durability(&self, hook: PostMutationDurability) {
+        let _ = self.post_mutation_durability.set(hook);
     }
 
     pub async fn create_checkpoint(&self, name: &str) -> Result<CheckpointInfo> {
@@ -104,6 +116,12 @@ impl CheckpointManager {
             )
             .await
             .map_err(|e| anyhow!("Failed to create checkpoint: {}", e))?;
+
+        if let Some(wait_local) = self.post_mutation_durability.get() {
+            wait_local()
+                .await
+                .map_err(|e| anyhow!("Failed to make checkpoint locally durable: {}", e))?;
+        }
 
         let checkpoints = self
             .admin
@@ -165,6 +183,12 @@ impl CheckpointManager {
             .await
             .map_err(|e| anyhow!("Failed to delete checkpoint: {}", e))?;
 
+        if let Some(wait_local) = self.post_mutation_durability.get() {
+            wait_local().await.map_err(|e| {
+                anyhow!("Failed to make checkpoint deletion locally durable: {}", e)
+            })?;
+        }
+
         Ok(())
     }
 
@@ -185,5 +209,67 @@ impl CheckpointManager {
                 name: name.to_string(),
                 created_at: cp.create_time.timestamp() as u64,
             }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CheckpointManager;
+    use crate::db::SlateDbHandle;
+    use slatedb::DbBuilder;
+    use slatedb::object_store::path::Path;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn checkpoint_mutations_wait_for_the_installed_local_durability_barrier() {
+        let object_store: Arc<dyn slatedb::object_store::ObjectStore> =
+            Arc::new(slatedb::object_store::memory::InMemory::new());
+        let path = Path::from("checkpoint-local-durability");
+        let db = Arc::new(
+            DbBuilder::new(path.clone(), Arc::clone(&object_store))
+                .build()
+                .await
+                .unwrap(),
+        );
+        let manager = Arc::new(CheckpointManager::new(
+            SlateDbHandle::ReadWrite(Arc::clone(&db)),
+            path,
+            object_store,
+            None,
+        ));
+        let (entered, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        manager.set_post_mutation_durability(Arc::new({
+            let release = Arc::clone(&release);
+            move || {
+                let entered = entered.clone();
+                let release = Arc::clone(&release);
+                Box::pin(async move {
+                    entered.send(()).unwrap();
+                    release.acquire_owned().await.unwrap().forget();
+                    Ok(())
+                })
+            }
+        }));
+
+        let create = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            async move { manager.create_checkpoint("durable").await }
+        });
+        entered_rx.recv().await.unwrap();
+        assert!(!create.is_finished());
+        release.add_permits(1);
+        create.await.unwrap().unwrap();
+
+        let delete = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            async move { manager.delete_checkpoint("durable").await }
+        });
+        entered_rx.recv().await.unwrap();
+        assert!(!delete.is_finished());
+        release.add_permits(1);
+        delete.await.unwrap().unwrap();
+
+        db.close().await.unwrap();
     }
 }

@@ -107,12 +107,16 @@ impl WritebackObjectStore {
         let snapshot = journal.snapshot()?;
         let available = fs4::available_space(&settings.dir)?;
         let admission = Admission::new(settings.memory_bytes);
+        let dirty_ssd_bytes = snapshot
+            .dirty_blob_bytes
+            .checked_add(snapshot.dirty_metadata_bytes)
+            .ok_or_else(|| anyhow::anyhow!("dirty journal SSD byte count overflow"))?;
         let disk = DiskAdmission::with_used(
             settings.disk_bytes,
             settings.high_watermark_percent,
             settings.resume_percent,
             settings.min_free_bytes,
-            snapshot.dirty_blob_bytes,
+            dirty_ssd_bytes,
             available,
         )?;
         let overlay = OverlayIndex::recover(remote.clone(), journal.clone()).await?;
@@ -363,6 +367,18 @@ impl WritebackObjectStore {
     }
 
     async fn owned_delete(self, location: Path) -> object_store::Result<Path> {
+        let path = location.to_string();
+        let disk_charge = MutationRecord::metadata_disk_charge(&path).map_err(|error| {
+            generic_error(format!("failed to size delete journal record: {error}"))
+        })?;
+        let available = fs4::available_space(&self.inner.settings.dir)
+            .map_err(|error| generic_error(format!("failed to inspect writeback SSD: {error}")))?;
+        let disk = self
+            .inner
+            .disk
+            .reserve(disk_charge, available)
+            .await
+            .map_err(|error| generic_error(format!("dirty SSD admission failed: {error}")))?;
         let lock = self.key_lock(&location);
         let key_guard = lock.lock_owned().await;
         let order_guard = self.inner.admission_order.lock().await;
@@ -371,7 +387,7 @@ impl WritebackObjectStore {
             format_version: 1,
             sequence,
             operation_id: Uuid::new_v4(),
-            path: location.to_string(),
+            path,
             kind: MutationKind::Delete,
             local_etag: LocalEtag::new(self.inner.incarnation, sequence),
             accepted_at_unix_ms: chrono::Utc::now().timestamp_millis().max(0) as u64,
@@ -388,7 +404,12 @@ impl WritebackObjectStore {
             .map_err(|error| {
                 generic_error(format!("delete overlay admission failed: {error:#}"))
             })?;
-        let barrier = match self.inner.journaler.submit_metadata(record).await {
+        let barrier = match self
+            .inner
+            .journaler
+            .submit_metadata_with_disk(record, disk)
+            .await
+        {
             Ok(barrier) => barrier,
             Err(error) => {
                 self.inner.overlay.remove_sequence(sequence).await;
@@ -1324,7 +1345,7 @@ mod tests {
     use crate::fault_store::{FaultControls, FaultStore};
     use crate::writeback::config::{AckMode, ShutdownFlush, WritebackSettings};
     use crate::writeback::journal::Journal;
-    use crate::writeback::model::{FenceClass, JournalIdentity};
+    use crate::writeback::model::{FenceClass, JournalIdentity, MutationRecord};
     use bytes::Bytes;
     use futures::{StreamExt, stream};
     use object_store::memory::InMemory;
@@ -1417,6 +1438,20 @@ mod tests {
         tempfile::TempDir,
         Arc<FaultControls>,
     ) {
+        test_store_with_disk_capacity(enabled, ack_mode, shutdown_flush, 10_000_000).await
+    }
+
+    async fn test_store_with_disk_capacity(
+        enabled: bool,
+        ack_mode: AckMode,
+        shutdown_flush: ShutdownFlush,
+        disk_bytes: u64,
+    ) -> (
+        WritebackObjectStore,
+        Arc<InMemory>,
+        tempfile::TempDir,
+        Arc<FaultControls>,
+    ) {
         let temp = tempfile::tempdir().unwrap();
         let journal = Arc::new(
             Journal::open(
@@ -1439,7 +1474,7 @@ mod tests {
             dir: temp.path().join("writeback"),
             ack_mode,
             memory_bytes: 1_000_000,
-            disk_bytes: 10_000_000,
+            disk_bytes,
             min_free_bytes: 1,
             high_watermark_percent: 95,
             resume_percent: 85,
@@ -1754,6 +1789,50 @@ mod tests {
         for path in ["a", "b", "c"] {
             assert!(store.get(&Path::from(path)).await.is_err());
         }
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn metadata_delete_is_rejected_when_its_journal_charge_exceeds_disk_capacity() {
+        let (store, _remote, _temp, _controls) =
+            test_store_with_disk_capacity(false, AckMode::Memory, ShutdownFlush::Local, 64).await;
+
+        let error = store
+            .delete(&Path::from(
+                "metadata/delete/whose/record/exceeds/sixty-four/bytes",
+            ))
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("capacity"),
+            "metadata mutation bypassed SSD admission: {error}"
+        );
+        assert_eq!(store.status().unwrap().accepted_seq, 0);
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn metadata_delete_charge_is_persisted_and_released_after_remote_completion() {
+        let (store, remote, _temp, controls) = test_store_with_controls(false).await;
+        let path = Path::from("metadata/delete/accounted");
+        remote
+            .put(&path, Bytes::from_static(b"remote").into())
+            .await
+            .unwrap();
+
+        store.delete(&path).await.unwrap();
+        store.wait_local(1).await.unwrap();
+        let expected = MutationRecord::metadata_disk_charge(path.as_ref()).unwrap();
+        assert_eq!(store.dirty_ssd_bytes(), expected);
+        assert_eq!(
+            store.inner.journal.snapshot().unwrap().dirty_metadata_bytes,
+            expected
+        );
+
+        controls.partition_writes(false);
+        store.wait_remote(1).await.unwrap();
+        assert_eq!(store.dirty_ssd_bytes(), 0);
         store.shutdown().await.unwrap();
     }
 

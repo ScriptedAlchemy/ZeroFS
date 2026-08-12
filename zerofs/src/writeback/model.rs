@@ -69,6 +69,12 @@ pub struct MutationRecord {
 }
 
 impl MutationRecord {
+    /// Maximum UTF-8 byte length of the persisted retry text. The journal
+    /// truncates remote errors to 2,048 Unicode scalar values, each of which
+    /// can occupy four UTF-8 bytes. The small suffix covers bincode's option
+    /// and string-length encoding.
+    const MAX_RETRY_ERROR_ENCODED_BYTES: u64 = 2_048 * 4 + 16;
+
     pub fn blob_path(&self) -> Option<&str> {
         match &self.kind {
             MutationKind::Put { blob_path, .. }
@@ -105,6 +111,40 @@ impl MutationRecord {
             | MutationKind::Copy { blob_path, .. }
             | MutationKind::Rename { blob_path, .. } => Some(blob_path),
             MutationKind::Delete => None,
+        }
+    }
+
+    /// Logical SSD charge for a pending mutation without a payload blob.
+    ///
+    /// Sequence and UUID values have fixed-width bincode encodings. Using the
+    /// longest possible local ETag makes this independent of admission order,
+    /// so the caller can reserve space before allocating a sequence.
+    pub fn metadata_disk_charge(path: &str) -> bincode::Result<u64> {
+        let record = Self {
+            format_version: u32::MAX,
+            sequence: u64::MAX,
+            operation_id: Uuid::nil(),
+            path: path.to_owned(),
+            kind: MutationKind::Delete,
+            local_etag: LocalEtag::new(Uuid::nil(), u64::MAX),
+            accepted_at_unix_ms: u64::MAX,
+            remote_predecessor_etag: None,
+            remote_result_etag: None,
+            fence: FenceClass::Fence,
+            retry_count: u32::MAX,
+            last_error: None,
+        };
+        bincode::serialized_size(&record).and_then(|encoded| {
+            encoded
+                .checked_add(Self::MAX_RETRY_ERROR_ENCODED_BYTES)
+                .ok_or_else(|| Box::new(bincode::ErrorKind::SizeLimit))
+        })
+    }
+
+    pub fn disk_charge_bytes(&self) -> bincode::Result<u64> {
+        match self.payload() {
+            Some((payload_len, _)) => Ok(payload_len),
+            None => Self::metadata_disk_charge(&self.path),
         }
     }
 }
