@@ -380,6 +380,12 @@ async fn run_remote_scheduler(worker: RemoteWorker) {
             let result = match result {
                 Ok(result) => result,
                 Err(error) => {
+                    tracing::warn!(
+                        sequence = record.sequence,
+                        path = %record.path,
+                        error = %error,
+                        "remote writeback operation failed; retrying from the durable journal"
+                    );
                     if let Err(journal_error) =
                         journal.record_remote_failure(record.sequence, &error.to_string())
                     {

@@ -13,6 +13,7 @@ use object_store::{
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::fmt::{self, Debug};
+use std::future::Future;
 use std::path::{Path as FilePath, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex as StdMutex, Weak};
 use tokio::sync::Mutex as AsyncMutex;
@@ -20,6 +21,24 @@ use uuid::Uuid;
 
 pub const OBJECT_HEADER_LEN: usize = 32;
 const OBJECT_HEADER_MAGIC: &[u8; 8] = b"ZEROFS\x01\0";
+const SFTP_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+
+async fn bounded_sftp_request<T, F>(
+    operation: &'static str,
+    future: F,
+) -> Result<T, crate::sftp_transport::TransportError>
+where
+    F: Future<Output = Result<T, crate::sftp_transport::TransportError>>,
+{
+    tokio::time::timeout(SFTP_REQUEST_TIMEOUT, future)
+        .await
+        .map_err(|_| {
+            crate::sftp_transport::TransportError::Operation(format!(
+                "{operation} timed out after {:.3}s",
+                SFTP_REQUEST_TIMEOUT.as_secs_f64()
+            ))
+        })?
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ObjectHeader {
@@ -386,7 +405,8 @@ impl RemoteSession for PooledRemoteSession {
             .checkout(crate::sftp_transport::OperationKind::Read)
             .await
             .map_err(remote_transport_error)?;
-        let operation = lease.read_exact(path, offset, len).await;
+        let operation =
+            bounded_sftp_request("SFTP range read", lease.read_exact(path, offset, len)).await;
         finish_lease(lease, operation)
             .await
             .map_err(remote_transport_error)
@@ -398,12 +418,12 @@ impl RemoteSession for PooledRemoteSession {
             .checkout(crate::sftp_transport::OperationKind::Write)
             .await
             .map_err(remote_transport_error)?;
-        let operation = async {
+        let operation = bounded_sftp_request("SFTP durable write", async {
             if let Some(parent) = path.parent() {
                 lease.create_dir_all(parent).await?;
             }
             lease.write_file_durable(path, chunks).await
-        }
+        })
         .await;
         finish_lease(lease, operation)
             .await
@@ -421,7 +441,11 @@ impl RemoteSession for PooledRemoteSession {
             .checkout(crate::sftp_transport::OperationKind::Write)
             .await
             .map_err(remote_transport_error)?;
-        let operation = lease.write_file_at_durable(path, offset, chunks).await;
+        let operation = bounded_sftp_request(
+            "SFTP durable ranged write",
+            lease.write_file_at_durable(path, offset, chunks),
+        )
+        .await;
         finish_lease(lease, operation)
             .await
             .map_err(remote_transport_error)
@@ -438,7 +462,11 @@ impl RemoteSession for PooledRemoteSession {
             .checkout(crate::sftp_transport::OperationKind::Write)
             .await
             .map_err(remote_transport_error)?;
-        let operation = lease.write_file_at(path, offset, chunks).await;
+        let operation = bounded_sftp_request(
+            "SFTP ranged write",
+            lease.write_file_at(path, offset, chunks),
+        )
+        .await;
         finish_lease(lease, operation)
             .await
             .map_err(remote_transport_error)
@@ -450,7 +478,7 @@ impl RemoteSession for PooledRemoteSession {
             .checkout(crate::sftp_transport::OperationKind::Write)
             .await
             .map_err(remote_transport_error)?;
-        let operation = lease.remove_file(path).await;
+        let operation = bounded_sftp_request("SFTP remove", lease.remove_file(path)).await;
         finish_lease(lease, operation)
             .await
             .map_err(remote_transport_error)
@@ -462,7 +490,7 @@ impl RemoteSession for PooledRemoteSession {
             .checkout(crate::sftp_transport::OperationKind::Write)
             .await
             .map_err(remote_transport_error)?;
-        let operation = lease.hard_link(from, to).await;
+        let operation = bounded_sftp_request("SFTP hard link", lease.hard_link(from, to)).await;
         finish_lease(lease, operation)
             .await
             .map_err(remote_transport_error)
@@ -474,7 +502,8 @@ impl RemoteSession for PooledRemoteSession {
             .checkout(crate::sftp_transport::OperationKind::Write)
             .await
             .map_err(remote_transport_error)?;
-        let operation = lease.posix_rename(from, to).await;
+        let operation =
+            bounded_sftp_request("SFTP POSIX rename", lease.posix_rename(from, to)).await;
         finish_lease(lease, operation)
             .await
             .map_err(remote_transport_error)
@@ -577,9 +606,11 @@ impl SftpObjectStore {
             })
             .await
             .map_err(transport_error)?;
-        let operation = lease
-            .read_object(&remote, options.range.clone(), options.head)
-            .await;
+        let operation = bounded_sftp_request(
+            "SFTP object read",
+            lease.read_object(&remote, options.range.clone(), options.head),
+        )
+        .await;
         let result = finish_lease(lease, operation)
             .await
             .map_err(transport_error);
@@ -605,7 +636,8 @@ impl SftpObjectStore {
             .checkout(crate::sftp_transport::OperationKind::Metadata)
             .await
             .map_err(transport_error)?;
-        let operation = lease.list_directory(&remote).await;
+        let operation =
+            bounded_sftp_request("SFTP directory listing", lease.list_directory(&remote)).await;
         finish_lease(lease, operation)
             .await
             .map_err(transport_error)
@@ -675,7 +707,7 @@ impl SftpObjectStore {
             .checkout(crate::sftp_transport::OperationKind::Write)
             .await
             .map_err(transport_error)?;
-        let operation = lease.remove_file(&remote).await;
+        let operation = bounded_sftp_request("SFTP remove", lease.remove_file(&remote)).await;
         let result = finish_lease(lease, operation)
             .await
             .map_err(transport_error);
@@ -1299,6 +1331,135 @@ mod tests {
             self.0.live.fetch_sub(1, Ordering::SeqCst);
             Ok(())
         }
+    }
+
+    #[derive(Debug, Default)]
+    struct HangingOperationState {
+        dials: AtomicUsize,
+        write_started: Notify,
+    }
+
+    #[derive(Debug, Clone)]
+    struct HangingOperationFactory(Arc<HangingOperationState>);
+
+    #[async_trait]
+    impl SessionFactory for HangingOperationFactory {
+        async fn open(
+            &self,
+            _force: tokio_util::sync::CancellationToken,
+        ) -> Result<Box<dyn TransportSession>, TransportError> {
+            let dial = self.0.dials.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(HangingOperationSession {
+                state: self.0.clone(),
+                hang_write: dial == 0,
+            }))
+        }
+    }
+
+    #[derive(Debug)]
+    struct HangingOperationSession {
+        state: Arc<HangingOperationState>,
+        hang_write: bool,
+    }
+
+    #[async_trait]
+    impl TransportSession for HangingOperationSession {
+        fn capabilities(&self) -> SftpCapabilities {
+            SftpCapabilities {
+                fsync: true,
+                hardlink: true,
+                posix_rename: true,
+            }
+        }
+
+        async fn create_dir_all(&mut self, _path: &FilePath) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        async fn write_file_durable(
+            &mut self,
+            _path: &FilePath,
+            _chunks: Vec<Bytes>,
+        ) -> Result<(), TransportError> {
+            if self.hang_write {
+                self.state.write_started.notify_one();
+                std::future::pending().await
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn remove_file(&mut self, _path: &FilePath) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        async fn hard_link(
+            &mut self,
+            _from: &FilePath,
+            _to: &FilePath,
+        ) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        async fn posix_rename(
+            &mut self,
+            _from: &FilePath,
+            _to: &FilePath,
+        ) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        async fn close(
+            self: Box<Self>,
+            _force: tokio_util::sync::CancellationToken,
+        ) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hung_protocol_operation_is_bounded_and_reconnects() {
+        let state = Arc::new(HangingOperationState::default());
+        let pool = crate::sftp_transport::SftpSessionPool::new_writable(
+            Arc::new(HangingOperationFactory(state.clone())),
+            1,
+            1,
+            1,
+        )
+        .await
+        .unwrap();
+        let store = Arc::new(SftpObjectStore::new(pool.clone(), ObjectPath::from("root")).unwrap());
+        let first = tokio::spawn({
+            let store = store.clone();
+            async move {
+                store
+                    .put_opts(
+                        &ObjectPath::from("root/first"),
+                        PutPayload::from_static(b"first"),
+                        PutOptions::default(),
+                    )
+                    .await
+            }
+        });
+        state.write_started.notified().await;
+        tokio::time::advance(Duration::from_secs(46)).await;
+        tokio::task::yield_now().await;
+
+        assert!(
+            first.is_finished(),
+            "a stalled SFTP request must release the writeback frontier"
+        );
+        assert!(first.await.unwrap().is_err());
+        store
+            .put_opts(
+                &ObjectPath::from("root/second"),
+                PutPayload::from_static(b"second"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert!(state.dials.load(Ordering::SeqCst) >= 2);
+        pool.shutdown().await.unwrap();
     }
 
     #[derive(Debug)]
