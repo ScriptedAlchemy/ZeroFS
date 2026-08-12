@@ -86,16 +86,19 @@ impl Segid {
         )
     }
 
-    /// Parse a `segments/<shard>/<epoch>/<counter>` object key back into a
-    /// [`Segid`]. The shard is derived from the counter, so it's ignored here.
+    /// Parse the canonical `segments/<shard>/<epoch>/<counter>` object key back
+    /// into a [`Segid`]. The round-trip check rejects extra components,
+    /// non-lowercase or non-fixed-width hex, and shards that do not match the
+    /// counter's low byte.
     pub fn from_object_key(key: &str) -> Option<Segid> {
         let rest = key.strip_prefix("segments/")?;
         let (_shard, rest) = rest.split_once('/')?;
         let (epoch, counter) = rest.split_once('/')?;
-        Some(Segid::new(
+        let segid = Segid::new(
             u64::from_str_radix(epoch, 16).ok()?,
             u64::from_str_radix(counter, 16).ok()?,
-        ))
+        );
+        (segid.object_key() == key).then_some(segid)
     }
 }
 
@@ -840,6 +843,24 @@ mod tests {
         let shard = |c: u64| Segid::new(9, c).object_key()[9..11].to_string();
         assert_ne!(shard(0), shard(1));
         assert_eq!(shard(0), shard(256));
+    }
+
+    #[test]
+    fn object_key_parser_rejects_noncanonical_segment_layouts() {
+        for key in [
+            "segments/ff/0000000000000001/0000000000000002",
+            "segments/02/0000000000000001/0000000000000002/extra",
+            "segments/02/000000000000001/0000000000000002",
+            "segments/02/0000000000000001/0000000000000002.sst",
+            "segments/02/0000000000000001/000000000000000A",
+            "prefix/segments/02/0000000000000001/0000000000000002",
+        ] {
+            assert_eq!(
+                Segid::from_object_key(key),
+                None,
+                "noncanonical segment key was accepted: {key}"
+            );
+        }
     }
 
     #[test]

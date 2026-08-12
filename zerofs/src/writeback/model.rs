@@ -1,3 +1,4 @@
+use object_store::path::Path;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -50,6 +51,70 @@ pub enum MutationKind {
 pub enum FenceClass {
     ImmutableCreate,
     Fence,
+}
+
+/// Derive replay ordering from the persisted operation contract, not from an
+/// object key alone. Only an explicit create-only PUT to a canonical immutable
+/// database object may preupload across an earlier ordering fence. Multipart
+/// completion is persisted as `Overwrite`, so it deliberately cannot qualify
+/// even when its destination resembles a compacted SST.
+pub(crate) fn classify_mutation_fence(
+    path: &str,
+    kind: &MutationKind,
+    database_prefix: &str,
+) -> FenceClass {
+    if !matches!(
+        kind,
+        MutationKind::Put {
+            mode: MutationMode::Create,
+            ..
+        }
+    ) {
+        return FenceClass::Fence;
+    }
+
+    let (Ok(location), Ok(database_prefix)) = (Path::parse(path), Path::parse(database_prefix))
+    else {
+        return FenceClass::Fence;
+    };
+    let Some(suffix) = location.prefix_match(&database_prefix) else {
+        return FenceClass::Fence;
+    };
+    let suffix = suffix
+        .map(|part| part.as_ref().to_owned())
+        .collect::<Vec<_>>();
+
+    let is_segment = suffix.len() == 4
+        && suffix[0] == "segments"
+        && crate::segment::Segid::from_object_key(&suffix.join("/")).is_some();
+    let is_sst = match suffix.as_slice() {
+        [directory, filename] if directory == "wal" => canonical_wal_filename(filename),
+        [directory, filename] if directory == "compacted" => canonical_compacted_filename(filename),
+        _ => false,
+    };
+
+    if is_segment || is_sst {
+        FenceClass::ImmutableCreate
+    } else {
+        FenceClass::Fence
+    }
+}
+
+fn canonical_wal_filename(filename: &str) -> bool {
+    filename
+        .strip_suffix(".sst")
+        .and_then(|stem| stem.parse::<u64>().ok().map(|id| (stem, id)))
+        .is_some_and(|(stem, id)| stem == format!("{id:020}"))
+}
+
+fn canonical_compacted_filename(filename: &str) -> bool {
+    const CROCKFORD_BASE32: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    filename.strip_suffix(".sst").is_some_and(|stem| {
+        stem.len() == 26
+            && stem.as_bytes()[0].is_ascii_digit()
+            && stem.as_bytes()[0] <= b'7'
+            && stem.bytes().all(|byte| CROCKFORD_BASE32.contains(&byte))
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

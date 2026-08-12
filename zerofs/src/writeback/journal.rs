@@ -1,5 +1,5 @@
 use crate::writeback::model::{
-    FenceClass, JournalIdentity, MutationKind, MutationRecord, Sequence,
+    FenceClass, JournalIdentity, MutationKind, MutationRecord, Sequence, classify_mutation_fence,
 };
 use crate::writeback::payload::VerifiedPayload;
 use anyhow::{Context, Result, bail};
@@ -31,6 +31,8 @@ const LOCAL_BYTES_COMPLETED_KEY: &str = "local_bytes_completed";
 const REMOTE_SEQ_KEY: &str = "remote_seq";
 const REMOTE_BYTES_COMPLETED_KEY: &str = "remote_bytes_completed";
 const REMOTE_RETRIES_KEY: &str = "remote_retries";
+const FENCE_CLASSIFICATION_VERSION_KEY: &str = "fence_classification_version";
+const FENCE_CLASSIFICATION_VERSION: u32 = 1;
 
 pub struct Journal {
     root: PathBuf,
@@ -263,6 +265,7 @@ impl Journal {
         }
 
         initialize_or_validate_identity(&database, &expected_identity)?;
+        normalize_mutation_fences(&database, &expected_identity)?;
         backfill_local_payload_bytes(&database)?;
         backfill_remote_object_versions(&database)?;
         let journal = Self {
@@ -1226,6 +1229,93 @@ fn initialize_or_validate_identity(database: &Database, expected: &JournalIdenti
         .context("failed to commit journal identity")
 }
 
+/// Re-derive persisted fence classes before any recovery path can use them.
+///
+/// Version-1 journals serialized `FenceClass` while classification was based
+/// on a loose path heuristic, so an overwrite, copy, or malformed key could be
+/// recovered as `ImmutableCreate`. This durable migration uses the persisted
+/// mutation kind and the journal identity's database prefix as the authority.
+/// The marker and rewrites share one immediate transaction so replay and
+/// remote-version backfill never observe a partially normalized journal.
+fn normalize_mutation_fences(database: &Database, identity: &JournalIdentity) -> Result<()> {
+    let mut transaction = database
+        .begin_write()
+        .context("failed to migrate mutation fence classifications")?;
+    transaction
+        .set_durability(Durability::Immediate)
+        .context("failed to set fence classification migration durability")?;
+    let existing_version = {
+        let meta = transaction
+            .open_table(META)
+            .context("failed to open journal metadata for fence classification migration")?;
+        read_optional::<u32>(&meta, FENCE_CLASSIFICATION_VERSION_KEY)?
+    };
+    if let Some(existing_version) = existing_version {
+        if existing_version == FENCE_CLASSIFICATION_VERSION {
+            return Ok(());
+        }
+        if existing_version > FENCE_CLASSIFICATION_VERSION {
+            bail!(
+                "journal fence classification version {existing_version} is newer than supported version {FENCE_CLASSIFICATION_VERSION}"
+            );
+        }
+    }
+
+    let rewritten = {
+        let mutations = transaction
+            .open_table(MUTATIONS)
+            .context("failed to open journal mutations for fence classification migration")?;
+        let mut rewritten = Vec::new();
+        for entry in mutations
+            .iter()
+            .context("failed to scan mutations for fence classification migration")?
+        {
+            let (sequence, encoded) =
+                entry.context("failed to read mutation for fence classification migration")?;
+            let mut record: MutationRecord = bincode::deserialize(encoded.value())
+                .context("failed to decode mutation for fence classification migration")?;
+            if record.format_version != identity.format_version {
+                bail!(
+                    "journal mutation {} format version {} does not match journal format version {}",
+                    record.sequence,
+                    record.format_version,
+                    identity.format_version
+                );
+            }
+            let expected =
+                classify_mutation_fence(&record.path, &record.kind, &identity.database_prefix);
+            if record.fence != expected {
+                record.fence = expected;
+                rewritten.push((sequence.value(), bincode::serialize(&record)?));
+            }
+        }
+        rewritten
+    };
+    if !rewritten.is_empty() {
+        let mut mutations = transaction
+            .open_table(MUTATIONS)
+            .context("failed to reopen journal mutations for fence classification migration")?;
+        for (sequence, encoded) in &rewritten {
+            mutations
+                .insert(*sequence, encoded.as_slice())
+                .context("failed to rewrite normalized mutation fence classification")?;
+        }
+    }
+    {
+        let mut meta = transaction
+            .open_table(META)
+            .context("failed to reopen journal metadata for fence classification migration")?;
+        write_value(
+            &mut meta,
+            FENCE_CLASSIFICATION_VERSION_KEY,
+            &FENCE_CLASSIFICATION_VERSION,
+        )?;
+    }
+    transaction
+        .commit()
+        .context("failed to commit mutation fence classification migration")
+}
+
 fn backfill_remote_object_versions(database: &Database) -> Result<()> {
     let mut transaction = database
         .begin_write()
@@ -1694,12 +1784,16 @@ fn sync_directory(path: impl AsRef<Path>) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Journal, JournalSnapshot, JournalWriteGate, REMOTE_OBJECT_VERSIONS};
+    use super::{
+        FENCE_CLASSIFICATION_VERSION, FENCE_CLASSIFICATION_VERSION_KEY, Journal, JournalSnapshot,
+        JournalWriteGate, META, REMOTE_OBJECT_VERSIONS, read_optional, write_value,
+    };
     use crate::writeback::model::{
         FenceClass, JournalIdentity, LocalEtag, MutationKind, MutationMode, MutationRecord,
     };
     use crate::writeback::payload::VerifiedPayload;
     use bytes::Bytes;
+    use redb::ReadableDatabase;
     use sha2::{Digest, Sha256};
     use std::fs;
     #[cfg(unix)]
@@ -1825,6 +1919,163 @@ mod tests {
         assert_eq!(snapshot.remote_seq, 0);
         assert_eq!(snapshot.records, vec![committed]);
         assert_eq!(reopened.read_blob(1).unwrap(), b"payload");
+    }
+
+    #[test]
+    fn reopening_a_v1_journal_normalizes_legacy_immutable_fences_before_replay() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = open_temp_journal(&temp, "bucket-a");
+        let canonical_segment = "zerofs/pilot/segments/02/0000000000000001/0000000000000002";
+
+        let mut overwrite = put_record(1, canonical_segment, b"overwrite");
+        overwrite.kind = MutationKind::Put {
+            mode: MutationMode::Overwrite,
+            expected_visible_version: None,
+            payload_len: 9,
+            payload_sha256: Sha256::digest(b"overwrite").into(),
+            blob_path: String::new(),
+        };
+        journal.commit_put(overwrite, b"overwrite").unwrap();
+
+        let mut copy = put_record(2, canonical_segment, b"copy");
+        copy.kind = MutationKind::Copy {
+            source: "source".to_owned(),
+            mode: MutationMode::Create,
+            payload_len: 4,
+            payload_sha256: Sha256::digest(b"copy").into(),
+            blob_path: String::new(),
+        };
+        journal.commit_put(copy, b"copy").unwrap();
+
+        journal
+            .commit_put(
+                put_record(
+                    3,
+                    "zerofs/pilot/uploads/segments/02/0000000000000001/0000000000000002",
+                    b"malformed",
+                ),
+                b"malformed",
+            )
+            .unwrap();
+        journal
+            .commit_put(
+                put_record(
+                    4,
+                    "zerofs/pilot/segments/04/0000000000000001/0000000000000004",
+                    b"create",
+                ),
+                b"create",
+            )
+            .unwrap();
+
+        // Simulate a journal created before fence-classification migrations
+        // were versioned, regardless of which implementation created this fixture.
+        let transaction = journal.database.begin_write().unwrap();
+        {
+            let mut meta = transaction.open_table(META).unwrap();
+            meta.remove(FENCE_CLASSIFICATION_VERSION_KEY).unwrap();
+        }
+        transaction.commit().unwrap();
+        drop(journal);
+
+        let reopened = open_temp_journal(&temp, "bucket-a");
+        let pending = reopened.pending_from(1, 4).unwrap();
+        assert_eq!(
+            pending
+                .iter()
+                .map(|record| record.fence)
+                .collect::<Vec<_>>(),
+            vec![
+                FenceClass::Fence,
+                FenceClass::Fence,
+                FenceClass::Fence,
+                FenceClass::ImmutableCreate,
+            ]
+        );
+        assert!(pending.iter().all(|record| record.format_version == 1));
+        let read = reopened.database.begin_read().unwrap();
+        let meta = read.open_table(META).unwrap();
+        assert_eq!(
+            read_optional::<u32>(&meta, FENCE_CLASSIFICATION_VERSION_KEY).unwrap(),
+            Some(FENCE_CLASSIFICATION_VERSION)
+        );
+        drop(meta);
+        drop(read);
+        drop(reopened);
+
+        let reopened_again = open_temp_journal(&temp, "bucket-a");
+        assert_eq!(
+            reopened_again
+                .pending_from(1, 4)
+                .unwrap()
+                .iter()
+                .map(|record| record.fence)
+                .collect::<Vec<_>>(),
+            vec![
+                FenceClass::Fence,
+                FenceClass::Fence,
+                FenceClass::Fence,
+                FenceClass::ImmutableCreate,
+            ]
+        );
+    }
+
+    #[test]
+    fn reopening_rejects_a_newer_fence_classification_version() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = open_temp_journal(&temp, "bucket-a");
+        let transaction = journal.database.begin_write().unwrap();
+        {
+            let mut meta = transaction.open_table(META).unwrap();
+            write_value(
+                &mut meta,
+                FENCE_CLASSIFICATION_VERSION_KEY,
+                &(FENCE_CLASSIFICATION_VERSION + 1),
+            )
+            .unwrap();
+        }
+        transaction.commit().unwrap();
+        drop(journal);
+
+        let error = Journal::open(temp.path().join("writeback"), identity("bucket-a")).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("fence classification version"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn v1_fence_migration_precedes_remote_version_backfill() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = open_temp_journal(&temp, "bucket-a");
+        let path = "zerofs/pilot/segments/02/0000000000000001/0000000000000002";
+        let mut overwrite = put_record(1, path, b"overwrite");
+        overwrite.kind = MutationKind::Put {
+            mode: MutationMode::Overwrite,
+            expected_visible_version: None,
+            payload_len: 9,
+            payload_sha256: Sha256::digest(b"overwrite").into(),
+            blob_path: String::new(),
+        };
+        journal.commit_put(overwrite, b"overwrite").unwrap();
+        journal
+            .mark_remote(1, Some("remote-etag-one".to_owned()))
+            .unwrap();
+
+        let transaction = journal.database.begin_write().unwrap();
+        assert!(transaction.delete_table(REMOTE_OBJECT_VERSIONS).unwrap());
+        {
+            let mut meta = transaction.open_table(META).unwrap();
+            meta.remove(FENCE_CLASSIFICATION_VERSION_KEY).unwrap();
+        }
+        transaction.commit().unwrap();
+        drop(journal);
+
+        let reopened = open_temp_journal(&temp, "bucket-a");
+        assert_eq!(
+            reopened.remote_object_etag(path, 1).unwrap().as_deref(),
+            Some("remote-etag-one")
+        );
     }
 
     #[test]

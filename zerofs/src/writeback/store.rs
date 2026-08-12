@@ -3,7 +3,7 @@ use crate::writeback::config::{AckMode, WritebackSettings};
 use crate::writeback::journal::Journal;
 use crate::writeback::journaler::{LocalBarrierError, LocalJournaler};
 use crate::writeback::model::{
-    FenceClass, LocalEtag, MutationKind, MutationMode, MutationRecord, WritebackStatus,
+    LocalEtag, MutationKind, MutationMode, MutationRecord, WritebackStatus, classify_mutation_fence,
 };
 use crate::writeback::overlay::{OverlayCommitObserver, OverlayIndex, VisibleVersion};
 use crate::writeback::payload::VerifiedPayload;
@@ -45,6 +45,7 @@ struct WritebackStoreInner {
     disk: DiskAdmission,
     journaler: LocalJournaler,
     remote: RemoteScheduler,
+    database_prefix: String,
     incarnation: Uuid,
     next_sequence: AtomicU64,
     key_locks: Vec<Arc<Mutex<()>>>,
@@ -105,6 +106,7 @@ impl WritebackObjectStore {
             anyhow::bail!("writeback requires a positive independent dirty RAM budget");
         }
         let snapshot = journal.snapshot()?;
+        let database_prefix = snapshot.identity.database_prefix.clone();
         let available = fs4::available_space(&settings.dir)?;
         let admission = Admission::new(settings.memory_bytes);
         let dirty_ssd_bytes = snapshot
@@ -163,6 +165,7 @@ impl WritebackObjectStore {
                 disk,
                 journaler,
                 remote,
+                database_prefix,
                 incarnation: snapshot.incarnation,
                 next_sequence: AtomicU64::new(snapshot.local_seq),
                 key_locks: (0..KEY_LOCK_SHARDS)
@@ -317,24 +320,27 @@ impl WritebackObjectStore {
         let lock = self.key_lock(&location);
         let key_guard = lock.lock_owned().await;
         let visible = self.inner.overlay.visible_version(&location).await?;
-        let (mode, expected_visible_version, predecessor, fence) =
+        let (mode, expected_visible_version, predecessor) =
             validate_put_mode(&location, &options.mode, visible)?;
         let payload = VerifiedPayload::new(bytes);
         let order_guard = self.inner.admission_order.lock().await;
         let sequence = self.allocate_sequence()?;
         let local_etag = LocalEtag::new(self.inner.incarnation, sequence);
+        let path = location.to_string();
+        let kind = MutationKind::Put {
+            mode,
+            expected_visible_version,
+            payload_len: payload.byte_len(),
+            payload_sha256: payload.sha256(),
+            blob_path: String::new(),
+        };
+        let fence = classify_mutation_fence(&path, &kind, &self.inner.database_prefix);
         let record = MutationRecord {
             format_version: 1,
             sequence,
             operation_id: Uuid::new_v4(),
-            path: location.to_string(),
-            kind: MutationKind::Put {
-                mode,
-                expected_visible_version,
-                payload_len: payload.byte_len(),
-                payload_sha256: payload.sha256(),
-                blob_path: String::new(),
-            },
+            path,
+            kind,
             local_etag: local_etag.clone(),
             accepted_at_unix_ms: chrono::Utc::now().timestamp_millis().max(0) as u64,
             remote_predecessor_etag: predecessor,
@@ -398,17 +404,19 @@ impl WritebackObjectStore {
         let key_guard = lock.lock_owned().await;
         let order_guard = self.inner.admission_order.lock().await;
         let sequence = self.allocate_sequence()?;
+        let kind = MutationKind::Delete;
+        let fence = classify_mutation_fence(&path, &kind, &self.inner.database_prefix);
         let record = MutationRecord {
             format_version: 1,
             sequence,
             operation_id: Uuid::new_v4(),
             path,
-            kind: MutationKind::Delete,
+            kind,
             local_etag: LocalEtag::new(self.inner.incarnation, sequence),
             accepted_at_unix_ms: chrono::Utc::now().timestamp_millis().max(0) as u64,
             remote_predecessor_etag: None,
             remote_result_etag: None,
-            fence: FenceClass::Fence,
+            fence,
             retry_count: 0,
             last_error: None,
         };
@@ -533,23 +541,19 @@ impl WritebackObjectStore {
                 blob_path: String::new(),
             }
         };
+        let path = to.to_string();
+        let fence = classify_mutation_fence(&path, &kind, &self.inner.database_prefix);
         let record = MutationRecord {
             format_version: 1,
             sequence,
             operation_id: Uuid::new_v4(),
-            path: to.to_string(),
+            path,
             kind,
             local_etag,
             accepted_at_unix_ms: chrono::Utc::now().timestamp_millis().max(0) as u64,
             remote_predecessor_etag: None,
             remote_result_etag: None,
-            fence: if rename {
-                FenceClass::Fence
-            } else if mode == MutationMode::Create {
-                immutable_data_fence(&to)
-            } else {
-                FenceClass::Fence
-            },
+            fence,
             retry_count: 0,
             last_error: None,
         };
@@ -1258,14 +1262,9 @@ fn validate_put_mode(
     location: &Path,
     mode: &PutMode,
     visible: Option<VisibleVersion>,
-) -> object_store::Result<(MutationMode, Option<String>, Option<String>, FenceClass)> {
+) -> object_store::Result<(MutationMode, Option<String>, Option<String>)> {
     match mode {
-        PutMode::Overwrite => Ok((
-            MutationMode::Overwrite,
-            None,
-            None,
-            immutable_data_fence(location),
-        )),
+        PutMode::Overwrite => Ok((MutationMode::Overwrite, None, None)),
         PutMode::Create => {
             if visible.is_some() {
                 return Err(object_store::Error::AlreadyExists {
@@ -1273,12 +1272,7 @@ fn validate_put_mode(
                     source: "overlay-visible object already exists".into(),
                 });
             }
-            Ok((
-                MutationMode::Create,
-                None,
-                None,
-                immutable_data_fence(location),
-            ))
+            Ok((MutationMode::Create, None, None))
         }
         PutMode::Update(expected) => {
             let Some(visible) = visible else {
@@ -1295,58 +1289,9 @@ fn validate_put_mode(
                 VisibleVersion::Local(_) => None,
                 VisibleVersion::Remote { e_tag, .. } => e_tag,
             };
-            Ok((
-                MutationMode::Update,
-                expected_string,
-                predecessor,
-                FenceClass::Fence,
-            ))
+            Ok((MutationMode::Update, expected_string, predecessor))
         }
     }
-}
-
-fn immutable_data_fence(location: &Path) -> FenceClass {
-    let parts = location
-        .parts()
-        .map(|part| part.as_ref().to_owned())
-        .collect::<Vec<_>>();
-
-    if let Some(index) = parts.iter().rposition(|part| part == "segments") {
-        let tail = &parts[index + 1..];
-        if tail.len() == 3
-            && is_fixed_hex(&tail[0], 2)
-            && is_fixed_hex(&tail[1], 16)
-            && is_fixed_hex(&tail[2], 16)
-        {
-            return FenceClass::ImmutableCreate;
-        }
-    }
-
-    if parts.len() >= 2 {
-        let directory = parts[parts.len() - 2].as_str();
-        let filename = parts[parts.len() - 1].as_str();
-        let immutable_sst = match directory {
-            "wal" => filename.strip_suffix(".sst").is_some_and(|stem| {
-                stem.len() == 20 && stem.bytes().all(|byte| byte.is_ascii_digit())
-            }),
-            "compacted" => filename.strip_suffix(".sst").is_some_and(|stem| {
-                stem.len() == 26
-                    && stem
-                        .bytes()
-                        .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
-            }),
-            _ => false,
-        };
-        if immutable_sst {
-            return FenceClass::ImmutableCreate;
-        }
-    }
-
-    FenceClass::Fence
-}
-
-fn is_fixed_hex(value: &str, len: usize) -> bool {
-    value.len() == len && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn version_matches(expected: &UpdateVersion, visible: &VisibleVersion) -> bool {
@@ -1384,11 +1329,14 @@ fn generic_error(message: impl Into<String>) -> object_store::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{WritebackObjectStore, validate_put_mode};
+    use super::WritebackObjectStore;
     use crate::fault_store::{FaultControls, FaultStore};
     use crate::writeback::config::{AckMode, ShutdownFlush, WritebackSettings};
     use crate::writeback::journal::Journal;
-    use crate::writeback::model::{FenceClass, JournalIdentity, MutationRecord};
+    use crate::writeback::model::{
+        FenceClass, JournalIdentity, MutationKind, MutationMode, MutationRecord,
+        classify_mutation_fence,
+    };
     use bytes::Bytes;
     use futures::{StreamExt, stream};
     use object_store::memory::InMemory;
@@ -1412,6 +1360,11 @@ mod tests {
             (
                 "zerofs/pilot/segments/0a/0000000000000001/0000000000000002",
                 PutMode::Overwrite,
+                FenceClass::Fence,
+            ),
+            (
+                "zerofs/pilot/segments/02/0000000000000001/0000000000000002",
+                PutMode::Create,
                 FenceClass::ImmutableCreate,
             ),
             (
@@ -1439,12 +1392,161 @@ mod tests {
                 PutMode::Create,
                 FenceClass::Fence,
             ),
+            (
+                "other/prefix/segments/02/0000000000000001/0000000000000002",
+                PutMode::Create,
+                FenceClass::Fence,
+            ),
+            (
+                "zerofs/pilot/uploads/segments/02/0000000000000001/0000000000000002",
+                PutMode::Create,
+                FenceClass::Fence,
+            ),
+            (
+                "zerofs/pilot/segments/ff/0000000000000001/0000000000000002",
+                PutMode::Create,
+                FenceClass::Fence,
+            ),
+            (
+                "zerofs/pilot/segments/02/0000000000000001/000000000000000A",
+                PutMode::Create,
+                FenceClass::Fence,
+            ),
+            (
+                "zerofs/pilot/tmp/wal/00000000000000000042.sst",
+                PutMode::Create,
+                FenceClass::Fence,
+            ),
+            (
+                "zerofs/pilot/wal/99999999999999999999.sst",
+                PutMode::Create,
+                FenceClass::Fence,
+            ),
+            (
+                "zerofs/pilot/compacted/01KZS4K6C1G11KM91DI3YA9TJE.sst",
+                PutMode::Create,
+                FenceClass::Fence,
+            ),
+            (
+                "zerofs/pilot/compacted/81KZS4K6C1G11KM91DJ3YA9TJE.sst",
+                PutMode::Create,
+                FenceClass::Fence,
+            ),
         ];
 
         for (path, mode, expected) in cases {
-            let (_, _, _, actual) = validate_put_mode(&Path::from(path), &mode, None).unwrap();
+            let mode = match mode {
+                PutMode::Overwrite => MutationMode::Overwrite,
+                PutMode::Create => MutationMode::Create,
+                PutMode::Update(_) => MutationMode::Update,
+            };
+            let kind = MutationKind::Put {
+                mode,
+                expected_visible_version: None,
+                payload_len: 0,
+                payload_sha256: [0; 32],
+                blob_path: String::new(),
+            };
+            let actual = classify_mutation_fence(path, &kind, "zerofs/pilot");
             assert_eq!(actual, expected, "classification for {path}");
         }
+
+        let encoded_prefix_create = MutationKind::Put {
+            mode: MutationMode::Create,
+            expected_visible_version: None,
+            payload_len: 0,
+            payload_sha256: [0; 32],
+            blob_path: String::new(),
+        };
+        assert_eq!(
+            classify_mutation_fence(
+                "zerofs/tenant%20a/segments/02/0000000000000001/0000000000000002",
+                &encoded_prefix_create,
+                "zerofs/tenant%20a",
+            ),
+            FenceClass::ImmutableCreate,
+            "persisted encoded path components must be parsed without double encoding"
+        );
+    }
+
+    #[tokio::test]
+    async fn only_explicit_safe_put_create_records_are_immutable() {
+        let (store, remote, _temp) = test_store().await;
+        let update_path = Path::from("zerofs/pilot/segments/03/0000000000000001/0000000000000003");
+        let updated = remote
+            .put(&update_path, Bytes::from_static(b"old").into())
+            .await
+            .unwrap();
+        for path in ["copy-source", "rename-source"] {
+            remote
+                .put(&Path::from(path), Bytes::from_static(b"source").into())
+                .await
+                .unwrap();
+        }
+
+        store
+            .put(
+                &Path::from("zerofs/pilot/segments/01/0000000000000001/0000000000000001"),
+                Bytes::from_static(b"overwrite").into(),
+            )
+            .await
+            .unwrap();
+        store
+            .put_opts(
+                &Path::from("zerofs/pilot/segments/02/0000000000000001/0000000000000002"),
+                Bytes::from_static(b"create").into(),
+                PutOptions::from(PutMode::Create),
+            )
+            .await
+            .unwrap();
+        store
+            .put_opts(
+                &update_path,
+                Bytes::from_static(b"update").into(),
+                PutOptions::from(PutMode::Update(updated.into())),
+            )
+            .await
+            .unwrap();
+        store
+            .delete(&Path::from(
+                "zerofs/pilot/segments/04/0000000000000001/0000000000000004",
+            ))
+            .await
+            .unwrap();
+        store
+            .copy_opts(
+                &Path::from("copy-source"),
+                &Path::from("zerofs/pilot/segments/05/0000000000000001/0000000000000005"),
+                CopyOptions {
+                    mode: CopyMode::Create,
+                    ..CopyOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .rename_opts(
+                &Path::from("rename-source"),
+                &Path::from("zerofs/pilot/segments/06/0000000000000001/0000000000000006"),
+                RenameOptions {
+                    target_mode: RenameTargetMode::Create,
+                    ..RenameOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        store.wait_local(6).await.unwrap();
+
+        let records = store.inner.journal.snapshot().unwrap().records;
+        assert_eq!(records.len(), 6);
+        assert_eq!(records[0].fence, FenceClass::Fence);
+        assert_eq!(records[1].fence, FenceClass::ImmutableCreate);
+        assert_eq!(records[2].fence, FenceClass::Fence);
+        assert_eq!(records[3].fence, FenceClass::Fence);
+        assert_eq!(records[4].fence, FenceClass::Fence);
+        assert_eq!(records[5].fence, FenceClass::Fence);
+
+        store.shutdown().await.unwrap();
     }
 
     async fn test_store_with_remote_drain(
@@ -2743,11 +2845,12 @@ mod tests {
             let store = store.clone();
             async move {
                 store
-                    .put(
+                    .put_opts(
                         &Path::from(format!(
-                            "segments/{index:02x}/0000000000000001/{index:016x}"
+                            "zerofs/pilot/segments/{index:02x}/0000000000000001/{index:016x}"
                         )),
                         Bytes::from(vec![index; 1024]).into(),
+                        PutOptions::from(PutMode::Create),
                     )
                     .await
                     .unwrap();
@@ -2781,11 +2884,12 @@ mod tests {
             let store = store.clone();
             async move {
                 store
-                    .put(
+                    .put_opts(
                         &Path::from(format!(
-                            "segments/{index:02x}/0000000000000001/{index:016x}"
+                            "zerofs/pilot/segments/{index:02x}/0000000000000001/{index:016x}"
                         )),
                         Bytes::from(vec![index; 1024]).into(),
+                        PutOptions::from(PutMode::Create),
                     )
                     .await
                     .unwrap();
@@ -2815,11 +2919,12 @@ mod tests {
         controls.block_puts();
         for index in 1_u8..=8 {
             store
-                .put(
+                .put_opts(
                     &Path::from(format!(
-                        "segments/{index:02x}/0000000000000001/{index:016x}"
+                        "zerofs/pilot/segments/{index:02x}/0000000000000001/{index:016x}"
                     )),
                     Bytes::from(vec![index; 1024]).into(),
+                    PutOptions::from(PutMode::Create),
                 )
                 .await
                 .unwrap();
@@ -2833,13 +2938,13 @@ mod tests {
         })
         .await
         .expect("the first four remote slots were not filled");
-        controls.release_put_path("segments/02/0000000000000001/0000000000000002");
+        controls.release_put_path("zerofs/pilot/segments/02/0000000000000001/0000000000000002");
 
         tokio::time::timeout(Duration::from_secs(2), async {
             while !controls
                 .put_paths()
                 .iter()
-                .any(|path| path == "segments/05/0000000000000001/0000000000000005")
+                .any(|path| path == "zerofs/pilot/segments/05/0000000000000001/0000000000000005")
             {
                 controls.put_activity().notified().await;
             }
@@ -2867,7 +2972,11 @@ mod tests {
             .collect::<Vec<_>>();
         for (sequence, path) in paths.iter().enumerate() {
             store
-                .put(path, Bytes::from(vec![sequence as u8 + 1; 1024]).into())
+                .put_opts(
+                    path,
+                    Bytes::from(vec![sequence as u8 + 1; 1024]).into(),
+                    PutOptions::from(PutMode::Create),
+                )
                 .await
                 .unwrap();
         }
@@ -2938,7 +3047,7 @@ mod tests {
         let journal = store.inner.journal.clone();
         let pause = journal.pause_remote_mark(1);
         controls.block_puts();
-        let path = Path::from("zerofs/pilot/segments/01/0000000000000001/0000000000000001");
+        let path = Path::from("shutdown/in-progress");
         store
             .put(&path, Bytes::from_static(b"payload").into())
             .await
@@ -2981,7 +3090,7 @@ mod tests {
         let journal = store.inner.journal.clone();
         let pause = journal.pause_remote_mark(1);
         controls.block_puts();
-        let path = Path::from("zerofs/pilot/segments/01/0000000000000001/0000000000000001");
+        let path = Path::from("shutdown/canceled");
         store
             .put(&path, Bytes::from_static(b"payload").into())
             .await
@@ -3131,26 +3240,32 @@ mod tests {
         let records = [
             ("manifest/one".to_owned(), 1_u8),
             (
-                "segments/01/0000000000000001/0000000000000001".to_owned(),
+                "zerofs/pilot/segments/01/0000000000000001/0000000000000001".to_owned(),
                 2,
             ),
             ("manifest/two".to_owned(), 3),
             (
-                "segments/02/0000000000000001/0000000000000002".to_owned(),
+                "zerofs/pilot/segments/02/0000000000000001/0000000000000002".to_owned(),
                 4,
             ),
             ("manifest/three".to_owned(), 5),
             (
-                "segments/03/0000000000000001/0000000000000003".to_owned(),
+                "zerofs/pilot/segments/03/0000000000000001/0000000000000003".to_owned(),
                 6,
             ),
             ("manifest/four".to_owned(), 7),
         ];
         for (path, byte) in &records {
+            let mode = if path.contains("/segments/") {
+                PutMode::Create
+            } else {
+                PutMode::Overwrite
+            };
             store
-                .put(
+                .put_opts(
                     &Path::from(path.as_str()),
                     Bytes::from(vec![*byte; 1024]).into(),
+                    PutOptions::from(mode),
                 )
                 .await
                 .unwrap();
@@ -3169,9 +3284,9 @@ mod tests {
         started.sort();
         let mut expected = vec![
             "manifest/one".to_owned(),
-            "segments/01/0000000000000001/0000000000000001".to_owned(),
-            "segments/02/0000000000000001/0000000000000002".to_owned(),
-            "segments/03/0000000000000001/0000000000000003".to_owned(),
+            "zerofs/pilot/segments/01/0000000000000001/0000000000000001".to_owned(),
+            "zerofs/pilot/segments/02/0000000000000001/0000000000000002".to_owned(),
+            "zerofs/pilot/segments/03/0000000000000001/0000000000000003".to_owned(),
         ];
         expected.sort();
         assert_eq!(
@@ -3185,6 +3300,53 @@ mod tests {
             .expect("held immutable completions were delayed behind fence coalescing")
             .unwrap();
         store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn remote_replay_never_preuploads_segment_overwrite_across_an_earlier_fence() {
+        let (store, _remote, _temp, controls) = test_store_with_controls(true).await;
+        controls.block_puts();
+        let manifest = Path::from("zerofs/pilot/manifest/one");
+        let overwritten = Path::from("zerofs/pilot/segments/02/0000000000000001/0000000000000002");
+        let created = Path::from("zerofs/pilot/segments/03/0000000000000001/0000000000000003");
+
+        store
+            .put(&manifest, Bytes::from_static(b"manifest").into())
+            .await
+            .unwrap();
+        store
+            .put(&overwritten, Bytes::from_static(b"overwrite").into())
+            .await
+            .unwrap();
+        store
+            .put_opts(
+                &created,
+                Bytes::from_static(b"create").into(),
+                PutOptions::from(PutMode::Create),
+            )
+            .await
+            .unwrap();
+        store.wait_local(3).await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while controls.put_count() < 2 {
+                controls.put_activity().notified().await;
+            }
+        })
+        .await
+        .expect("the frontier and safe immutable create did not start");
+        let started = controls.put_paths();
+
+        controls.release_puts();
+        store.wait_remote(3).await.unwrap();
+        store.shutdown().await.unwrap();
+
+        assert!(started.contains(&manifest.to_string()));
+        assert!(started.contains(&created.to_string()));
+        assert!(
+            !started.contains(&overwritten.to_string()),
+            "an overwrite must not preupload across an earlier ordering fence"
+        );
     }
 
     #[tokio::test]
@@ -3205,7 +3367,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let rename_target = "segments/09/0000000000000001/0000000000000009";
+        let rename_target = "zerofs/pilot/segments/09/0000000000000001/0000000000000009";
         store
             .rename_opts(
                 &Path::from("rename-source"),
@@ -3219,11 +3381,12 @@ mod tests {
             .unwrap();
         for index in 10_u8..=12 {
             store
-                .put(
+                .put_opts(
                     &Path::from(format!(
-                        "segments/{index:02x}/0000000000000001/{index:016x}"
+                        "zerofs/pilot/segments/{index:02x}/0000000000000001/{index:016x}"
                     )),
                     Bytes::from(vec![index; 1024]).into(),
+                    PutOptions::from(PutMode::Create),
                 )
                 .await
                 .unwrap();
