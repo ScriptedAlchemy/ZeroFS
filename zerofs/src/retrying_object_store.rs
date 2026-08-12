@@ -21,6 +21,8 @@ use object_store::{
     PutResult, RenameOptions,
 };
 
+const RETRY_DELETE_CONCURRENCY: usize = 10;
+
 #[derive(Debug)]
 pub struct RetryingObjectStore {
     inner: Arc<dyn ObjectStore>,
@@ -58,6 +60,10 @@ impl RetryingObjectStore {
                 | object_store::Error::NotFound { .. }
                 | object_store::Error::NotImplemented { .. }
                 | object_store::Error::NotSupported { .. }
+                | object_store::Error::PermissionDenied { .. }
+                | object_store::Error::Unauthenticated { .. }
+                | object_store::Error::InvalidPath { .. }
+                | object_store::Error::UnknownConfigurationKey { .. }
         ) && !Self::is_unsatisfiable_range(err)
     }
 
@@ -179,7 +185,7 @@ impl ObjectStore for RetryingObjectStore {
     ) -> BoxStream<'static, object_store::Result<Path>> {
         let inner = Arc::clone(&self.inner);
         locations
-            .then(move |loc| {
+            .map(move |loc| {
                 let inner = Arc::clone(&inner);
                 async move {
                     let loc = loc?;
@@ -191,6 +197,7 @@ impl ObjectStore for RetryingObjectStore {
                     Ok(loc)
                 }
             })
+            .buffered(RETRY_DELETE_CONCURRENCY)
             .boxed()
     }
 
@@ -278,6 +285,7 @@ mod tests {
     use object_store::memory::InMemory;
     use object_store::{ObjectStoreExt, PutMode};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Barrier;
 
     /// Fails the first `fail` calls of each op kind with a transient error,
     /// then delegates.
@@ -289,6 +297,9 @@ mod tests {
         fail_lists: AtomicUsize,
         gets: AtomicUsize,
         truncate_gets: AtomicUsize,
+        delete_barrier: Option<Arc<Barrier>>,
+        deletes_in_flight: Arc<AtomicUsize>,
+        peak_deletes_in_flight: Arc<AtomicUsize>,
     }
 
     impl FlakyStore {
@@ -300,6 +311,16 @@ mod tests {
                 fail_lists: AtomicUsize::new(0),
                 gets: AtomicUsize::new(0),
                 truncate_gets: AtomicUsize::new(0),
+                delete_barrier: None,
+                deletes_in_flight: Arc::new(AtomicUsize::new(0)),
+                peak_deletes_in_flight: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn with_delete_barrier(inner: Arc<dyn ObjectStore>, participants: usize) -> Self {
+            Self {
+                delete_barrier: Some(Arc::new(Barrier::new(participants))),
+                ..Self::new(inner)
             }
         }
 
@@ -379,6 +400,25 @@ mod tests {
             &self,
             locations: BoxStream<'static, object_store::Result<Path>>,
         ) -> BoxStream<'static, object_store::Result<Path>> {
+            if let Some(barrier) = self.delete_barrier.clone() {
+                let deletes_in_flight = self.deletes_in_flight.clone();
+                let peak_deletes_in_flight = self.peak_deletes_in_flight.clone();
+                return locations
+                    .then(move |location| {
+                        let barrier = barrier.clone();
+                        let deletes_in_flight = deletes_in_flight.clone();
+                        let peak_deletes_in_flight = peak_deletes_in_flight.clone();
+                        async move {
+                            let location = location?;
+                            let current = deletes_in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                            peak_deletes_in_flight.fetch_max(current, Ordering::SeqCst);
+                            barrier.wait().await;
+                            deletes_in_flight.fetch_sub(1, Ordering::SeqCst);
+                            Ok(location)
+                        }
+                    })
+                    .boxed();
+            }
             self.inner.delete_stream(locations)
         }
 
@@ -528,5 +568,61 @@ mod tests {
         flaky.fail_lists.store(1, Ordering::SeqCst);
         let listed: Vec<_> = retrying.list(None).try_collect().await.unwrap();
         assert_eq!(listed.len(), 3);
+    }
+
+    #[test]
+    fn deterministic_provider_errors_are_not_retryable() {
+        let errors = [
+            object_store::Error::PermissionDenied {
+                path: "forbidden".to_owned(),
+                source: "denied".into(),
+            },
+            object_store::Error::Unauthenticated {
+                path: "private".to_owned(),
+                source: "expired credentials".into(),
+            },
+            object_store::Error::InvalidPath {
+                source: Path::parse("../escape").expect_err("parent traversal is invalid"),
+            },
+            object_store::Error::UnknownConfigurationKey {
+                store: "test",
+                key: "unknown".to_owned(),
+            },
+        ];
+
+        for error in errors {
+            assert!(
+                !RetryingObjectStore::should_retry(&error),
+                "deterministic error must not retry forever: {error:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn bulk_delete_preserves_bounded_inner_concurrency_and_input_order() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let flaky = Arc::new(FlakyStore::with_delete_barrier(
+            inner,
+            RETRY_DELETE_CONCURRENCY,
+        ));
+        let retrying = RetryingObjectStore::new(flaky.clone());
+        let expected = (0..(RETRY_DELETE_CONCURRENCY * 2))
+            .map(|index| Path::from(format!("object-{index}")))
+            .collect::<Vec<_>>();
+        let input = stream::iter(expected.clone().into_iter().map(Ok)).boxed();
+
+        let deleted = tokio::time::timeout(
+            Duration::from_secs(1),
+            retrying.delete_stream(input).try_collect::<Vec<_>>(),
+        )
+        .await
+        .expect("the retry layer must admit more than one inner delete at a time")
+        .unwrap();
+
+        assert_eq!(deleted, expected);
+        assert_eq!(
+            flaky.peak_deletes_in_flight.load(Ordering::SeqCst),
+            RETRY_DELETE_CONCURRENCY
+        );
     }
 }
