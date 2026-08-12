@@ -128,7 +128,7 @@ impl LocalJournaler {
         queue_depth: usize,
         observer: Option<Arc<dyn LocalCommitObserver>>,
     ) -> AnyResult<Self> {
-        let local_sequence = journal.snapshot()?.local_seq;
+        let local_sequence = journal.progress()?.local_seq;
         Ok(Self::start_with_sink_and_observer(
             journal,
             admission,

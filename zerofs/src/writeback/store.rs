@@ -160,32 +160,29 @@ impl WritebackObjectStore {
     }
 
     pub fn status(&self) -> anyhow::Result<WritebackStatus> {
-        let snapshot = self.inner.journal.snapshot()?;
+        let progress = self.inner.journal.progress()?;
         let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
-        let pending = snapshot
-            .records
-            .iter()
-            .filter(|record| record.sequence > snapshot.remote_seq)
-            .collect::<Vec<_>>();
-        let oldest_pending_age_ms = pending
-            .iter()
+        let oldest_pending_age_ms = self
+            .inner
+            .journal
+            .pending_from(progress.remote_seq.saturating_add(1), 1)?
+            .first()
             .map(|record| now.saturating_sub(record.accepted_at_unix_ms))
-            .max()
             .unwrap_or(0);
         Ok(WritebackStatus {
             accepted_seq: self.inner.next_sequence.load(Ordering::Acquire),
-            local_seq: snapshot.local_seq,
-            remote_seq: snapshot.remote_seq,
+            local_seq: progress.local_seq,
+            remote_seq: progress.remote_seq,
             dirty_ram_bytes: self.inner.admission.used_bytes(),
             dirty_ram_capacity_bytes: self.inner.settings.memory_bytes,
             dirty_ram_operations: self.inner.admission.used_operations(),
             dirty_ssd_bytes: self.inner.disk.used_bytes(),
             dirty_ssd_capacity_bytes: self.inner.settings.disk_bytes,
-            dirty_ssd_operations: pending.len() as u64,
+            dirty_ssd_operations: progress.local_seq.saturating_sub(progress.remote_seq),
             oldest_pending_age_ms,
-            remote_bytes_completed: snapshot.remote_bytes_completed,
-            remote_operations_completed: snapshot.remote_seq,
-            retries: snapshot.remote_retries,
+            remote_bytes_completed: progress.remote_bytes_completed,
+            remote_operations_completed: progress.remote_seq,
+            retries: progress.remote_retries,
             terminal_error: self.inner.remote.terminal_error(),
         })
     }
@@ -1483,6 +1480,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn status_does_not_materialize_the_pending_journal() {
+        let (store, _remote, _temp) = test_store().await;
+        for sequence in 1..=32 {
+            store
+                .put(
+                    &Path::from(format!("status-pending-{sequence}")),
+                    Bytes::from_static(b"payload").into(),
+                )
+                .await
+                .unwrap();
+        }
+        store.wait_local(32).await.unwrap();
+        store.inner.remote.shutdown().await.unwrap();
+        store.inner.journal.reset_snapshot_calls();
+
+        let status = store.status().unwrap();
+
+        assert_eq!(status.dirty_ssd_operations, 32);
+        assert_eq!(store.inner.journal.snapshot_calls(), 0);
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn status_persists_completed_remote_bytes_and_operations() {
         let (store, _remote, _temp) = test_store_with_remote_drain(true).await;
         store
@@ -2182,6 +2202,42 @@ mod tests {
             concurrent,
             "remote replay never reached four concurrent puts"
         );
+    }
+
+    #[tokio::test]
+    async fn remote_replay_does_not_materialize_the_complete_backlog() {
+        let (store, _remote, _temp, controls) = test_store_with_controls(true).await;
+        controls.block_puts();
+        let puts = (0..16).map(|index| {
+            let store = store.clone();
+            async move {
+                store
+                    .put(
+                        &Path::from(format!(
+                            "segments/{index:02x}/0000000000000001/{index:016x}"
+                        )),
+                        Bytes::from(vec![index; 1024]).into(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        futures::future::join_all(puts).await;
+        store.wait_local(16).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while controls.max_active_puts() < 4 {
+                controls.put_activity().notified().await;
+            }
+        })
+        .await
+        .expect("remote replay did not fill the upload pipeline");
+        store.inner.journal.reset_snapshot_calls();
+
+        controls.release_puts();
+        store.wait_remote(16).await.unwrap();
+
+        assert_eq!(store.inner.journal.snapshot_calls(), 0);
+        store.shutdown().await.unwrap();
     }
 
     #[tokio::test]

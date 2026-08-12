@@ -86,9 +86,9 @@ impl RemoteScheduler {
         local: LocalBarrier,
         upload_concurrency: usize,
     ) -> anyhow::Result<Self> {
-        let snapshot = journal.snapshot()?;
+        let journal_progress = journal.progress()?;
         let (progress_sender, progress) = watch::channel(RemoteProgress {
-            sequence: snapshot.remote_seq,
+            sequence: journal_progress.remote_seq,
             terminal_error: None,
             closed: false,
         });
@@ -146,6 +146,11 @@ struct CompletedRemote {
     e_tag: Option<String>,
 }
 
+struct SchedulerWindow {
+    local_seq: Sequence,
+    records: Vec<MutationRecord>,
+}
+
 async fn run_remote_scheduler(worker: RemoteWorker) {
     let RemoteWorker {
         remote,
@@ -183,7 +188,7 @@ async fn run_remote_scheduler(worker: RemoteWorker) {
                 continue;
             }
         }
-        let snapshot = match coalesce_local_batch(
+        let window = match coalesce_local_batch(
             &journal,
             next,
             upload_concurrency,
@@ -193,14 +198,14 @@ async fn run_remote_scheduler(worker: RemoteWorker) {
         )
         .await
         {
-            Ok(Some(snapshot)) => snapshot,
+            Ok(Some(window)) => window,
             Ok(None) => break,
             Err(error) => {
                 progress.send_modify(|state| state.terminal_error = Some(format!("{error:#}")));
                 break;
             }
         };
-        let mut snapshot = snapshot;
+        let mut window = window;
         let mut active = FuturesUnordered::<
             BoxFuture<'static, (MutationRecord, object_store::Result<PutResult>)>,
         >::new();
@@ -209,7 +214,7 @@ async fn run_remote_scheduler(worker: RemoteWorker) {
         loop {
             if !retry {
                 let batch = collect_pipeline_batch(
-                    &snapshot.records,
+                    &window.records,
                     next,
                     upload_concurrency,
                     &completed,
@@ -291,8 +296,8 @@ async fn run_remote_scheduler(worker: RemoteWorker) {
                 return;
             }
             if !retry {
-                snapshot = match journal.snapshot() {
-                    Ok(snapshot) => snapshot,
+                window = match load_scheduler_window(&journal, next, upload_concurrency) {
+                    Ok(window) => window,
                     Err(error) => {
                         progress.send_modify(|state| {
                             state.terminal_error = Some(format!("{error:#}"));
@@ -301,10 +306,10 @@ async fn run_remote_scheduler(worker: RemoteWorker) {
                         return;
                     }
                 };
-                known_local_tail = known_local_tail.max(snapshot.local_seq);
+                known_local_tail = known_local_tail.max(window.local_seq);
             }
         }
-        known_local_tail = known_local_tail.max(snapshot.local_seq);
+        known_local_tail = known_local_tail.max(window.local_seq);
         if retry {
             tokio::select! {
                 _ = tokio::time::sleep(REMOTE_RETRY_DELAY) => {}
@@ -345,17 +350,17 @@ async fn coalesce_local_batch(
     completed: &BTreeMap<Sequence, CompletedRemote>,
     drain_known_backlog: bool,
     stop: &mut watch::Receiver<bool>,
-) -> anyhow::Result<Option<crate::writeback::journal::JournalSnapshot>> {
-    let mut snapshot = journal.snapshot()?;
+) -> anyhow::Result<Option<SchedulerWindow>> {
+    let mut window = load_scheduler_window(journal, next, upload_concurrency)?;
     if drain_known_backlog {
-        return Ok(Some(snapshot));
+        return Ok(Some(window));
     }
-    let mut observed_local = snapshot.local_seq;
+    let mut observed_local = window.local_seq;
     let mut idle_deadline = tokio::time::Instant::now() + REMOTE_COALESCE_IDLE;
     loop {
         if !completed.is_empty()
             || collect_pipeline_batch(
-                &snapshot.records,
+                &window.records,
                 next,
                 upload_concurrency,
                 completed,
@@ -365,7 +370,7 @@ async fn coalesce_local_batch(
                 == upload_concurrency
             || tokio::time::Instant::now() >= idle_deadline
         {
-            return Ok(Some(snapshot));
+            return Ok(Some(window));
         }
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_millis(10)) => {}
@@ -375,13 +380,26 @@ async fn coalesce_local_batch(
                 }
             }
         }
-        let next_snapshot = journal.snapshot()?;
-        if next_snapshot.local_seq > observed_local {
-            observed_local = next_snapshot.local_seq;
+        let next_window = load_scheduler_window(journal, next, upload_concurrency)?;
+        if next_window.local_seq > observed_local {
+            observed_local = next_window.local_seq;
             idle_deadline = tokio::time::Instant::now() + REMOTE_COALESCE_IDLE;
         }
-        snapshot = next_snapshot;
+        window = next_window;
     }
+}
+
+fn load_scheduler_window(
+    journal: &Journal,
+    first_sequence: Sequence,
+    upload_concurrency: usize,
+) -> anyhow::Result<SchedulerWindow> {
+    let progress = journal.progress()?;
+    let scan_limit = upload_concurrency.saturating_mul(8).max(upload_concurrency);
+    Ok(SchedulerWindow {
+        local_seq: progress.local_seq,
+        records: journal.pending_from(first_sequence, scan_limit)?,
+    })
 }
 
 fn collect_pipeline_batch(

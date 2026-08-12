@@ -11,6 +11,8 @@ use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, Ordering};
 use uuid::Uuid;
 
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
@@ -29,6 +31,8 @@ pub struct Journal {
     database: Database,
     _lock_file: File,
     format_version: u32,
+    #[cfg(test)]
+    snapshot_calls: AtomicU64,
 }
 
 impl fmt::Debug for Journal {
@@ -51,6 +55,14 @@ pub struct JournalSnapshot {
     pub records: Vec<MutationRecord>,
     pub dirty_blob_bytes: u64,
     pub pending_blob_count: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JournalProgress {
+    pub local_seq: Sequence,
+    pub remote_seq: Sequence,
+    pub remote_bytes_completed: u64,
+    pub remote_retries: u64,
 }
 
 impl Journal {
@@ -100,9 +112,11 @@ impl Journal {
             database,
             _lock_file: lock_file,
             format_version: expected_identity.format_version,
+            #[cfg(test)]
+            snapshot_calls: AtomicU64::new(0),
         };
         journal.recover_local_artifacts()?;
-        let remote_seq = journal.snapshot()?.remote_seq;
+        let remote_seq = journal.progress()?.remote_seq;
         if remote_seq > 0 {
             journal.remove_remote_prefix(remote_seq)?;
         }
@@ -115,6 +129,8 @@ impl Journal {
     }
 
     pub fn snapshot(&self) -> Result<JournalSnapshot> {
+        #[cfg(test)]
+        self.snapshot_calls.fetch_add(1, Ordering::Relaxed);
         let read = self
             .database
             .begin_read()
@@ -171,6 +187,63 @@ impl Journal {
             dirty_blob_bytes,
             pending_blob_count,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_snapshot_calls(&self) {
+        self.snapshot_calls.store(0, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn snapshot_calls(&self) -> u64 {
+        self.snapshot_calls.load(Ordering::Relaxed)
+    }
+
+    pub fn progress(&self) -> Result<JournalProgress> {
+        let read = self
+            .database
+            .begin_read()
+            .context("failed to read journal progress")?;
+        let meta = read
+            .open_table(META)
+            .context("failed to open journal metadata")?;
+        Ok(JournalProgress {
+            local_seq: read_required::<u64>(&meta, LOCAL_SEQ_KEY)?,
+            remote_seq: read_required::<u64>(&meta, REMOTE_SEQ_KEY)?,
+            remote_bytes_completed: read_optional::<u64>(&meta, REMOTE_BYTES_COMPLETED_KEY)?
+                .unwrap_or_default(),
+            remote_retries: read_optional::<u64>(&meta, REMOTE_RETRIES_KEY)?.unwrap_or_default(),
+        })
+    }
+
+    pub fn pending_from(
+        &self,
+        first_sequence: Sequence,
+        limit: usize,
+    ) -> Result<Vec<MutationRecord>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let read = self
+            .database
+            .begin_read()
+            .context("failed to read pending journal mutations")?;
+        let table = read
+            .open_table(MUTATIONS)
+            .context("failed to open journal mutations")?;
+        let mut records = Vec::with_capacity(limit);
+        for entry in table
+            .range(first_sequence..)
+            .context("failed to seek pending journal mutations")?
+            .take(limit)
+        {
+            let (_, value) = entry.context("failed to read pending journal mutation")?;
+            records.push(
+                bincode::deserialize(value.value())
+                    .context("failed to decode pending journal mutation")?,
+            );
+        }
+        Ok(records)
     }
 
     pub fn commit_put(&self, record: MutationRecord, payload: &[u8]) -> Result<MutationRecord> {
@@ -377,18 +450,33 @@ impl Journal {
     }
 
     pub fn remove_remote_prefix(&self, through: Sequence) -> Result<()> {
-        let snapshot = self.snapshot()?;
-        if through > snapshot.remote_seq {
+        let progress = self.progress()?;
+        if through > progress.remote_seq {
             bail!(
                 "cannot clean through sequence {through} above remote watermark {}",
-                snapshot.remote_seq
+                progress.remote_seq
             );
         }
-        let removable: Vec<_> = snapshot
-            .records
-            .into_iter()
-            .filter(|record| record.sequence <= through)
-            .collect();
+        let read = self
+            .database
+            .begin_read()
+            .context("failed to read remote-complete journal prefix")?;
+        let table = read
+            .open_table(MUTATIONS)
+            .context("failed to open journal mutations")?;
+        let mut removable = Vec::<MutationRecord>::new();
+        for entry in table
+            .range(..=through)
+            .context("failed to scan remote-complete journal prefix")?
+        {
+            let (_, value) = entry.context("failed to read remote-complete mutation")?;
+            removable.push(
+                bincode::deserialize(value.value())
+                    .context("failed to decode remote-complete mutation")?,
+            );
+        }
+        drop(table);
+        drop(read);
         for record in &removable {
             if let Some(relative) = record.blob_path() {
                 let path = checked_join(&self.root, relative)?;
@@ -429,15 +517,15 @@ impl Journal {
     }
 
     fn require_next_local_sequence(&self, sequence: Sequence) -> Result<()> {
-        let snapshot = self.snapshot()?;
-        let expected = snapshot
+        let progress = self.progress()?;
+        let expected = progress
             .local_seq
             .checked_add(1)
             .context("local sequence overflow")?;
         if sequence != expected {
             bail!(
                 "local sequence must advance contiguously from {} to {expected}, got {sequence}",
-                snapshot.local_seq
+                progress.local_seq
             );
         }
         Ok(())
@@ -1169,6 +1257,45 @@ mod tests {
         assert_eq!(snapshot.local_seq, 1);
         assert_eq!(snapshot.dirty_blob_bytes, 0);
         assert_eq!(snapshot.records, vec![committed]);
+    }
+
+    #[test]
+    fn pending_from_returns_only_the_requested_contiguous_window() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = open_temp_journal(&temp, "bucket-a");
+        for sequence in 1..=32 {
+            journal
+                .commit_metadata(delete_record(sequence, &format!("obsolete-{sequence}")))
+                .unwrap();
+        }
+
+        let pending = journal.pending_from(17, 4).unwrap();
+
+        assert_eq!(
+            pending
+                .iter()
+                .map(|record| record.sequence)
+                .collect::<Vec<_>>(),
+            vec![17, 18, 19, 20]
+        );
+    }
+
+    #[test]
+    fn progress_reads_watermarks_without_materializing_pending_records() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = open_temp_journal(&temp, "bucket-a");
+        for sequence in 1..=32 {
+            journal
+                .commit_metadata(delete_record(sequence, &format!("obsolete-{sequence}")))
+                .unwrap();
+        }
+
+        let progress = journal.progress().unwrap();
+
+        assert_eq!(progress.local_seq, 32);
+        assert_eq!(progress.remote_seq, 0);
+        assert_eq!(progress.remote_bytes_completed, 0);
+        assert_eq!(progress.remote_retries, 0);
     }
 
     #[test]
