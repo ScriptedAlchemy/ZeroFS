@@ -296,6 +296,13 @@ test_status_rejects_stale_deployed_build_receipt() {
   grep -q 'build receipt binary hash' "$FIXTURE/err"
 }
 
+test_status_rejects_terminal_writeback_error() {
+  new_fixture
+  sed -i.bak 's/zerofs_writeback_terminal_error 0/zerofs_writeback_terminal_error 1/' "$FIXTURE/metrics"
+  if run_pilot status >"$FIXTURE/out" 2>"$FIXTURE/err"; then return 1; fi
+  grep -q 'terminal error' "$FIXTURE/err"
+}
+
 test_failed_benchmark_cleans_sampler_and_keeps_evidence() {
   new_fixture
   if FAKE_FIO_RC=17 ZEROFS_BENCH_TOTAL_MIB=4 ZEROFS_BENCH_JOBS=1 run_pilot benchmark >"$FIXTURE/out" 2>"$FIXTURE/err"; then
@@ -388,6 +395,7 @@ run_test test_wait_drain_fails_before_sleep_on_terminal_error
 run_test test_status_rejects_unexpected_ack_mode
 run_test test_status_records_runtime_and_durability_receipt
 run_test test_status_rejects_stale_deployed_build_receipt
+run_test test_status_rejects_terminal_writeback_error
 run_test test_failed_benchmark_cleans_sampler_and_keeps_evidence
 run_test test_successful_benchmark_reports_measured_local_durable_throughput
 run_test test_benchmark_reports_buffered_warm_and_direct_reads_separately

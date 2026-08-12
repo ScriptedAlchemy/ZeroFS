@@ -37,6 +37,19 @@ struct RemoteProgress {
     closed: bool,
 }
 
+fn publish_terminal(
+    progress: &watch::Sender<RemoteProgress>,
+    error: impl Into<String>,
+    closed: bool,
+) {
+    let error = error.into();
+    tracing::error!(error = %error, "remote writeback scheduler entered terminal state");
+    progress.send_modify(|state| {
+        state.terminal_error = Some(error.clone());
+        state.closed |= closed;
+    });
+}
+
 #[derive(Clone)]
 pub struct RemoteBarrier {
     progress: watch::Receiver<RemoteProgress>,
@@ -268,7 +281,7 @@ async fn run_remote_scheduler(worker: RemoteWorker) {
             result = local_wait => {
                 if let Err(error) = result {
                     if !matches!(error, LocalBarrierError::Closed) {
-                        progress.send_modify(|state| state.terminal_error = Some(error.to_string()));
+                        publish_terminal(&progress, error.to_string(), false);
                     }
                     break;
                 }
@@ -293,7 +306,7 @@ async fn run_remote_scheduler(worker: RemoteWorker) {
             Ok(Some(window)) => window,
             Ok(None) => break,
             Err(error) => {
-                progress.send_modify(|state| state.terminal_error = Some(format!("{error:#}")));
+                publish_terminal(&progress, format!("{error:#}"), false);
                 break;
             }
         };
@@ -351,23 +364,25 @@ async fn run_remote_scheduler(worker: RemoteWorker) {
                     if let Err(journal_error) =
                         journal.record_remote_failure(record.sequence, &error.to_string())
                     {
-                        progress.send_modify(|state| {
-                            state.terminal_error = Some(format!(
+                        publish_terminal(
+                            &progress,
+                            format!(
                                 "failed to persist remote retry for sequence {}: {journal_error:#}",
                                 record.sequence
-                            ));
-                            state.closed = true;
-                        });
+                            ),
+                            true,
+                        );
                         return;
                     }
                     if is_terminal_remote_error(&error) {
-                        progress.send_modify(|state| {
-                            state.terminal_error = Some(format!(
+                        publish_terminal(
+                            &progress,
+                            format!(
                                 "permanent remote divergence at sequence {}: {error}",
                                 record.sequence
-                            ));
-                            state.closed = true;
-                        });
+                            ),
+                            true,
+                        );
                         return;
                     }
                     retry = true;
@@ -391,20 +406,14 @@ async fn run_remote_scheduler(worker: RemoteWorker) {
             )
             .await
             {
-                progress.send_modify(|state| {
-                    state.terminal_error = Some(format!("{error:#}"));
-                    state.closed = true;
-                });
+                publish_terminal(&progress, format!("{error:#}"), true);
                 return;
             }
             if !retry {
                 window = match load_scheduler_window(&journal, next, upload_concurrency) {
                     Ok(window) => window,
                     Err(error) => {
-                        progress.send_modify(|state| {
-                            state.terminal_error = Some(format!("{error:#}"));
-                            state.closed = true;
-                        });
+                        publish_terminal(&progress, format!("{error:#}"), true);
                         return;
                     }
                 };

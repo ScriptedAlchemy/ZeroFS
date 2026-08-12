@@ -183,14 +183,17 @@ status() {
     printf '%s=active\n' "$unit"
   done
   findmnt -no SOURCE,FSTYPE,TARGET -M "$MOUNTPOINT"
-  local binary_sha integrity_sha metadata_count snapshot runtime_receipt
+  local binary_sha integrity_sha metadata_count snapshot runtime_receipt terminal
   binary_sha=$(sha256sum "$BINARY" | awk '{print $1}')
   runtime_receipt=$(validate_runtime)
+  snapshot=$(metrics_snapshot)
+  terminal=$(metric_from zerofs_writeback_terminal_error "$snapshot")
+  [[ -n $terminal ]] || die "writeback metrics snapshot is missing terminal-error state"
+  [[ $terminal == 0 ]] || die "writeback reported a terminal error"
   integrity_sha=$(sudo timeout 180 sha256sum "$INTEGRITY_FILE" | awk '{print $1}')
   [[ $integrity_sha == "$INTEGRITY_SHA256" ]] || die "integrity sentinel hash mismatch"
   metadata_count=$(sudo find "$METADATA_DIR" -type f -printf . | wc -c | tr -d '[:space:]')
   [[ $metadata_count == "$METADATA_FILE_COUNT" ]] || die "metadata file count is $metadata_count, expected $METADATA_FILE_COUNT"
-  snapshot=$(metrics_snapshot)
   printf 'binary_sha256=%s integrity_sha256=%s metadata_files=%s restarts=%s\n' \
     "$binary_sha" "$integrity_sha" "$metadata_count" \
     "$(systemctl show "$SERVICE" -p NRestarts --value)"
