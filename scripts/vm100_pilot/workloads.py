@@ -21,11 +21,6 @@ class PhaseTiming:
     local_sync_ms: int
     remote_tail_ms: int
 
-    @property
-    def end_to_end_ms(self) -> int:
-        return self.foreground_ms + self.local_sync_ms + self.remote_tail_ms
-
-
 @dataclass(frozen=True, slots=True)
 class WorkloadResult:
     npm_clone_ms: int

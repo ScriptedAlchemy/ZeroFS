@@ -9,6 +9,7 @@ import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from subprocess import CompletedProcess
+from typing import IO
 from urllib.parse import urlsplit
 
 from .config import PilotConfig
@@ -118,7 +119,7 @@ class RawSftpRunner:
         batches: list[Path],
         logs: list[Path],
     ) -> None:
-        processes: list[tuple[ManagedProcess, object]] = []
+        processes: list[tuple[ManagedProcess, IO[str]]] = []
         failure: BaseException | None = None
         try:
             for batch, log in zip(batches, logs, strict=True):
@@ -141,7 +142,7 @@ class RawSftpRunner:
                 if process.process.poll() is None:
                     process.terminate()
             for _, handle in processes:
-                handle.close()  # type: ignore[attr-defined]
+                handle.close()
         if failure is not None:
             raise failure
 

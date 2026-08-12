@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Callable
 
 
@@ -84,20 +84,7 @@ class WritebackSnapshot:
         )
 
     def to_dict(self) -> dict[str, int | bool | None]:
-        return {
-            "accepted": self.accepted,
-            "local": self.local,
-            "remote": self.remote,
-            "dirty_ram": self.dirty_ram,
-            "dirty_ssd": self.dirty_ssd,
-            "local_bytes": self.local_bytes,
-            "remote_bytes": self.remote_bytes,
-            "terminal": self.terminal,
-            "gc_active": self.gc_active,
-            "gc_passes": self.gc_passes,
-            "gc_batches": self.gc_batches,
-            "gc_deleted_bytes": self.gc_deleted_bytes,
-        }
+        return asdict(self)
 
 
 @dataclass(frozen=True, slots=True)

@@ -12,7 +12,7 @@ from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from subprocess import CompletedProcess
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 from scripts.vm100_pilot.config import PilotConfig
 from scripts.vm100_pilot.benchmark import (
@@ -46,24 +46,28 @@ from scripts.vm100_pilot.system_io import (
 )
 from scripts.vm100_pilot.raw_sftp import RawSftpRunner, SftpEndpoint
 from scripts.vm100_pilot.receipts import RunReceipt
-from scripts.vm100_pilot.runner import CommandError, ManagedProcess
+from scripts.vm100_pilot.runner import CommandError, ManagedProcess, Runner
 from scripts.vm100_pilot.workloads import WorkloadRunner
 
 
-class FakeRunner:
+class FakeRunner(Runner):
     def __init__(self) -> None:
+        super().__init__(base_env={})
         self.calls: list[tuple[tuple[str, ...], bool]] = []
         self.active: set[str] = set()
         self.fail_start: str | None = None
 
     def run(
         self,
-        argv: list[str | Path] | tuple[str | Path, ...],
+        argv: Sequence[str | Path],
         *,
         sudo: bool = False,
+        timeout: float | None = None,
+        capture: bool = True,
         check: bool = True,
-        env: dict[str, str] | None = None,
-        **_: object,
+        cwd: Path | None = None,
+        env: Mapping[str, str] | None = None,
+        input_text: str | None = None,
     ) -> CompletedProcess[str]:
         args = tuple(str(value) for value in argv)
         self.calls.append((args, sudo))
@@ -221,60 +225,6 @@ max_size_gb = 128
                 with self.assertRaises(ValueError):
                     rewrite_storage_prefix(source, prefix)
 
-    def test_interrupt_signals_a_sudo_style_parent_only_once(self) -> None:
-        marker = Path(self.temp.name) / "signals"
-        child = Path(self.temp.name) / "child.py"
-        parent = Path(self.temp.name) / "parent.py"
-        child.write_text(
-            "import pathlib, signal, sys, time\n"
-            "marker = pathlib.Path(sys.argv[1])\n"
-            "count = 0\n"
-            "def interrupted(_signum, _frame):\n"
-            "    global count\n"
-            "    count += 1\n"
-            "    marker.write_text(str(count))\n"
-            "    if count >= 2:\n"
-            "        raise SystemExit(0)\n"
-            "signal.signal(signal.SIGINT, interrupted)\n"
-            "print('ready', flush=True)\n"
-            "signal.pause()\n"
-            "time.sleep(0.3)\n"
-            "marker.write_text(str(count))\n",
-            encoding="utf-8",
-        )
-        parent.write_text(
-            "import signal, subprocess, sys, time\n"
-            "child = subprocess.Popen(\n"
-            "    [sys.executable, sys.argv[1], sys.argv[2]],\n"
-            "    stdout=subprocess.PIPE, text=True,\n"
-            ")\n"
-            "assert child.stdout is not None\n"
-            "assert child.stdout.readline().strip() == 'ready'\n"
-            "def interrupted(_signum, _frame):\n"
-            "    time.sleep(0.1)\n"
-            "    child.send_signal(signal.SIGINT)\n"
-            "    raise SystemExit(child.wait())\n"
-            "signal.signal(signal.SIGINT, interrupted)\n"
-            "print('ready', flush=True)\n"
-            "signal.pause()\n",
-            encoding="utf-8",
-        )
-        process = subprocess.Popen(
-            [sys.executable, parent, child, marker],
-            stdout=subprocess.PIPE,
-            text=True,
-            start_new_session=True,
-        )
-        stdout = process.stdout
-        self.assertIsNotNone(stdout)
-        assert stdout is not None
-        self.assertEqual(stdout.readline().strip(), "ready")
-
-        ManagedProcess(process, ("sudo", "perf")).interrupt(timeout=2)
-        stdout.close()
-
-        self.assertEqual(marker.read_text(), "1")
-
     def test_interrupt_child_waits_for_the_supervisor_to_reap_it(self) -> None:
         marker = Path(self.temp.name) / "child-interrupted"
         child = Path(self.temp.name) / "profile-child.py"
@@ -381,7 +331,7 @@ class LifecycleTests(unittest.TestCase):
         )
         self.config = replace(base, stop_timeout=1)
         self.runner = FakeRunner()
-        self.lifecycle = PilotLifecycle(self.config, self.runner)  # type: ignore[arg-type]
+        self.lifecycle = PilotLifecycle(self.config, self.runner)
 
     def test_snapshot_parser_requires_every_durability_field(self) -> None:
         snapshot = WritebackSnapshot.parse(
@@ -576,8 +526,8 @@ class LifecycleTests(unittest.TestCase):
                 return super().run(args, **kwargs)
 
         runner = BusyDeviceRunner()
-        lifecycle = PilotLifecycle(self.config, runner)  # type: ignore[arg-type]
-        migrator = StripedMigrator(self.config, runner, lifecycle)  # type: ignore[arg-type]
+        lifecycle = PilotLifecycle(self.config, runner)
+        migrator = StripedMigrator(self.config, runner, lifecycle)
 
         with self.assertRaisesRegex(RuntimeError, "/dev/nbd1 is already attached"):
             migrator.run()
@@ -602,7 +552,7 @@ class LifecycleTests(unittest.TestCase):
         migrator = CutoverMigrator(
             self.config,
             self.runner,
-            self.lifecycle,  # type: ignore[arg-type]
+            self.lifecycle,
         )
 
         with self.assertRaisesRegex(RuntimeError, "remained attached"):
@@ -814,7 +764,8 @@ class FreshResetTests(unittest.TestCase):
 
 
 class _HealthyLifecycle:
-    def __init__(self, snapshot: WritebackSnapshot) -> None:
+    def __init__(self, config: PilotConfig, snapshot: WritebackSnapshot) -> None:
+        self.config = config
         self.metrics = _StaticMetrics(snapshot)
         self.drain_calls = 0
         self.start_calls = 0
@@ -857,7 +808,7 @@ class BenchmarkTests(unittest.TestCase):
             9, 9, 9, 0, 0, 1 << 20, 1 << 20, False, False, 1, 0, 0
         )
         self.runner = FakeRunner()
-        self.lifecycle = _HealthyLifecycle(self.snapshot)
+        self.lifecycle = _HealthyLifecycle(self.config, self.snapshot)
 
     def test_local_rate_uses_completed_payload_and_full_interval(self) -> None:
         result = calculate_tiers(
@@ -1082,10 +1033,10 @@ class ProfileTests(unittest.TestCase):
         self.config = replace(base, binary=self.binary, build_receipt=self.receipt_file)
         self.runner = FakeRunner()
         self.snapshot = WritebackSnapshot(9, 9, 9, 0, 0, 1, 1, False)
-        self.lifecycle = _HealthyLifecycle(self.snapshot)
+        self.lifecycle = _HealthyLifecycle(self.config, self.snapshot)
 
     def test_canonical_restore_reinstalls_binary_and_receipt(self) -> None:
-        snapshot = CanonicalDeployment.capture(self.config, self.runner)  # type: ignore[arg-type]
+        snapshot = CanonicalDeployment.capture(self.config, self.runner)
         self.binary.write_bytes(b"profile-binary")
         self.receipt_file.write_text("commit=profile\n")
         snapshot.restore()
@@ -1114,7 +1065,7 @@ class ProfileTests(unittest.TestCase):
 
         profiler = TestProfile(
             self.config,
-            self.runner,  # type: ignore[arg-type]
+            self.runner,
             self.lifecycle,  # type: ignore[arg-type]
             FailingBenchmark(),  # type: ignore[arg-type]
         )
@@ -1142,7 +1093,7 @@ class ProfileTests(unittest.TestCase):
 
         profiler = TestProfile(
             self.config,
-            self.runner,  # type: ignore[arg-type]
+            self.runner,
             self.lifecycle,  # type: ignore[arg-type]
         )
         with self.assertRaisesRegex(RuntimeError, "injected install failure"):
@@ -1173,7 +1124,7 @@ class WorkloadEngineTests(unittest.TestCase):
         )
         self.config.temp_dir.mkdir()
         snapshot = WritebackSnapshot(9, 9, 9, 0, 0, 1, 1, False)
-        self.lifecycle = _HealthyLifecycle(snapshot)
+        self.lifecycle = _HealthyLifecycle(self.config, snapshot)
         self.runner = FakeRunner()
 
     def test_workload_root_is_created_with_explicit_owner(self) -> None:

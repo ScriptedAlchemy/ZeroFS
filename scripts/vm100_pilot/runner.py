@@ -33,19 +33,6 @@ class ManagedProcess:
             os.killpg(self.process.pid, signal.SIGKILL)
             self.process.wait(timeout=timeout)
 
-    def interrupt(self, timeout: float = 10.0) -> None:
-        if self.process.poll() is not None:
-            return
-        try:
-            # Signal the supervisor once. In particular, sudo forwards SIGINT
-            # to its child; signaling the whole process group would also hit
-            # that child directly and can interrupt perf while it finalizes
-            # its data header.
-            self.process.send_signal(signal.SIGINT)
-            self.process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            self.terminate(timeout)
-
     def interrupt_child(
         self, signal_child: Callable[[int], None], timeout: float = 10.0
     ) -> None:

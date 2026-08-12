@@ -6,7 +6,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 from .config import PilotConfig
@@ -555,9 +555,7 @@ class BenchmarkRunner:
                     page_cache_hot_read_ms=buffered_read.runtime_ms,
                     zerofs_direct_read_ms=direct_read.runtime_ms,
                 )
-                result = BenchmarkResult(
-                    **{**result.to_dict(), "receipt_dir": str(receipt.directory)}
-                )
+                result = replace(result, receipt_dir=str(receipt.directory))
                 receipt.record("result", result.to_dict())
                 receipt.path("summary.json").write_text(
                     json.dumps(result.to_dict(), indent=2, sort_keys=True) + "\n",
