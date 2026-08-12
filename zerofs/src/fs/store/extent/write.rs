@@ -439,16 +439,17 @@ impl ExtentStore {
                 None => None,
             }
         };
-        let results: Vec<_> = stream::iter(pending)
+        let mut results: Vec<_> = stream::iter(pending)
             .map(|(segid, bytes)| {
                 let segments = Arc::clone(&self.segments);
                 async move { (segid, segments.put_segment(segid, bytes).await) }
             })
-            // Keep BTreeMap seal order deterministic while polling at most the
-            // configured number of independent immutable PUTs concurrently.
-            .buffered(self.max_inflight_seals)
+            .buffer_unordered(self.max_inflight_seals)
             .collect()
             .await;
+        // Completion order is intentionally free to refill available capacity;
+        // apply removals and errors in stable seal order after every PUT settles.
+        results.sort_by_key(|(segid, _)| *segid);
 
         let mut failed = false;
         for (segid, result) in results {
@@ -806,6 +807,59 @@ mod tests {
         seal.await.unwrap().unwrap();
         assert!(store.sealing.lock().unwrap().is_empty());
         assert_eq!(store.segments.list_segments().await.unwrap().len(), 4);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn seal_open_refills_capacity_when_a_later_put_finishes_first() {
+        let (store, controls) = four_dirty_lanes(2).await;
+        controls.block_puts();
+
+        let seal = tokio::spawn({
+            let store = store.clone();
+            async move { store.seal_open().await }
+        });
+        let first_pair = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let paths: Vec<_> = controls
+                    .put_paths()
+                    .into_iter()
+                    .filter(|path| path.starts_with("segments/"))
+                    .collect();
+                if paths.len() >= 2 {
+                    break paths;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the first two dirty lane PUTs did not start");
+
+        // Leave the oldest PUT blocked, but complete the second. The newly free
+        // slot must immediately admit the third captured lane rather than wait
+        // for results to become ready in segment order.
+        controls.release_put_path(&first_pair[1]);
+        let refilled = tokio::time::timeout(std::time::Duration::from_millis(250), async {
+            loop {
+                let started = controls
+                    .put_paths()
+                    .iter()
+                    .filter(|path| path.starts_with("segments/"))
+                    .count();
+                if started >= 3 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_ok();
+
+        controls.release_puts();
+        seal.await.unwrap().unwrap();
+        assert!(
+            refilled,
+            "a completed later PUT left seal capacity idle behind the oldest straggler"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
