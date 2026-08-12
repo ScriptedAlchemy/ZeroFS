@@ -9,6 +9,7 @@ use zerofs_client::{Client, OpenOptions, ZeroFsError};
 
 const PROVISION_MARKER: &str = ".zerofs-nbd-provision-v1";
 const PROVISION_PREFIX: &str = ".zerofs-nbd-provision-v1-";
+const STRIPE_TEMP_PREFIX: &str = ".zerofs-nbd-stripe-v1-";
 
 /// A validated striped NBD export geometry.
 #[derive(Clone, Debug)]
@@ -118,6 +119,57 @@ struct ProvisionManifest {
     version: u32,
     export_name: String,
     layout: StripeManifest,
+}
+
+#[derive(Default)]
+struct ProvisionHooks {
+    #[cfg(test)]
+    after_staging_scan: Option<std::sync::Arc<tokio::sync::Barrier>>,
+    #[cfg(test)]
+    before_first_missing_lane_create: Option<std::sync::Arc<tokio::sync::Barrier>>,
+    #[cfg(test)]
+    before_missing_stripe_manifest_create: Option<std::sync::Arc<tokio::sync::Barrier>>,
+    #[cfg(test)]
+    missing_lane_hook_used: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    missing_stripe_manifest_hook_used: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    after_staging_scan_hook_used: std::sync::atomic::AtomicBool,
+}
+
+impl ProvisionHooks {
+    async fn after_staging_scan(&self) {
+        #[cfg(test)]
+        if !self
+            .after_staging_scan_hook_used
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+            && let Some(barrier) = &self.after_staging_scan
+        {
+            barrier.wait().await;
+        }
+    }
+
+    async fn before_missing_lane_create(&self) {
+        #[cfg(test)]
+        if !self
+            .missing_lane_hook_used
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+            && let Some(barrier) = &self.before_first_missing_lane_create
+        {
+            barrier.wait().await;
+        }
+    }
+
+    async fn before_missing_stripe_manifest_create(&self) {
+        #[cfg(test)]
+        if !self
+            .missing_stripe_manifest_hook_used
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+            && let Some(barrier) = &self.before_missing_stripe_manifest_create
+        {
+            barrier.wait().await;
+        }
+    }
 }
 
 impl ProvisionManifest {
@@ -289,10 +341,11 @@ async fn validate_staging(
         .read_dir(staging_path)
         .await
         .with_context(|| format!("list incomplete NBD staging directory {staging_path}"))?;
-    if entries
-        .iter()
-        .any(|entry| !entry.name_is_utf8 || !allowed.contains(entry.name.as_str()))
-    {
+    if entries.iter().any(|entry| {
+        !entry.name_is_utf8
+            || (!allowed.contains(entry.name.as_str())
+                && !entry.name.starts_with(STRIPE_TEMP_PREFIX))
+    }) {
         return Err(conflict(
             layout,
             format!("staging directory {staging_path} has unexpected entries"),
@@ -352,11 +405,40 @@ async fn find_matching_staging(client: &Client, layout: &StripedLayout) -> Resul
             ));
         }
         validate_staging(client, layout, &path).await?;
-        if matching.replace(path).is_some() {
-            return Err(conflict(
-                layout,
-                "multiple matching staging directories require manual inspection",
-            ));
+        if client
+            .read_dir(&path)
+            .await
+            .with_context(|| format!("list staging directory {path} for partial markers"))?
+            .iter()
+            .any(|entry| entry.name_is_utf8 && entry.name.starts_with(STRIPE_TEMP_PREFIX))
+        {
+            continue;
+        }
+        let stripe_path = format!("{path}/{STRIPE_MARKER}");
+        match client.read(&stripe_path).await {
+            Ok(bytes) => match serde_json::from_slice::<StripeManifest>(&bytes) {
+                Ok(manifest) if manifest == layout.manifest() => {}
+                Ok(_) => {
+                    return Err(conflict(
+                        layout,
+                        format!("staging directory {path} has different stripe geometry"),
+                    ));
+                }
+                // A partial stripe marker cannot be rewritten safely: another
+                // caller may already have replaced it after this read. Leave
+                // the unsafe draft untouched and prepare a fresh UUID draft.
+                Err(_) => continue,
+            },
+            Err(ZeroFsError::NotFound { .. }) => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("inspect {stripe_path}"));
+            }
+        }
+        if matching
+            .as_ref()
+            .is_none_or(|current: &String| path < *current)
+        {
+            matching = Some(path);
         }
     }
     Ok(matching)
@@ -376,44 +458,134 @@ async fn create_unique_staging(client: &Client, _layout: &StripedLayout) -> Resu
     bail!("could not allocate a unique NBD staging directory after 8 attempts")
 }
 
-async fn prepare_lanes(client: &Client, layout: &StripedLayout, root_path: &str) -> Result<()> {
+async fn prepare_lanes(
+    client: &Client,
+    layout: &StripedLayout,
+    root_path: &str,
+    hooks: &ProvisionHooks,
+) -> Result<()> {
     for member in &layout.members {
         let path = format!("{root_path}/{member}");
-        match client.stat(&path).await {
-            Ok(metadata) if metadata.is_file() && metadata.size == layout.member_size => {}
-            Ok(metadata) if metadata.is_file() && metadata.size == 0 => {
-                client
-                    .truncate(&path, layout.member_size)
-                    .await
-                    .with_context(|| format!("size striped NBD lane {path}"))?;
+        loop {
+            match client.stat(&path).await {
+                Ok(metadata) if metadata.is_file() && metadata.size == layout.member_size => break,
+                Ok(metadata) if metadata.is_file() && metadata.size == 0 => {
+                    client
+                        .truncate(&path, layout.member_size)
+                        .await
+                        .with_context(|| format!("size striped NBD lane {path}"))?;
+                    break;
+                }
+                Ok(metadata) => {
+                    return Err(conflict(
+                        layout,
+                        format!(
+                            "lane {member} has unexpected size {} or type",
+                            metadata.size
+                        ),
+                    ));
+                }
+                Err(ZeroFsError::NotFound { .. }) => {
+                    hooks.before_missing_lane_create().await;
+                    match client
+                        .open(&path, OpenOptions::write_only().create_new(true))
+                        .await
+                    {
+                        Ok(file) => {
+                            let size_result = file.set_len(layout.member_size).await;
+                            file.close().await;
+                            size_result.with_context(|| format!("size striped NBD lane {path}"))?;
+                            break;
+                        }
+                        Err(ZeroFsError::AlreadyExists { .. }) => continue,
+                        Err(error) => {
+                            return Err(error)
+                                .with_context(|| format!("create striped NBD lane {path}"));
+                        }
+                    }
+                }
+                Err(error) => return Err(error).with_context(|| format!("inspect {path}")),
             }
-            Ok(metadata) => {
-                return Err(conflict(
-                    layout,
-                    format!(
-                        "lane {member} has unexpected size {} or type",
-                        metadata.size
-                    ),
-                ));
-            }
-            Err(ZeroFsError::NotFound { .. }) => {
-                let file = client
-                    .open(&path, OpenOptions::write_only().create_new(true))
-                    .await
-                    .with_context(|| format!("create striped NBD lane {path}"))?;
-                file.set_len(layout.member_size)
-                    .await
-                    .with_context(|| format!("size striped NBD lane {path}"))?;
-                file.close().await;
-            }
-            Err(error) => return Err(error).with_context(|| format!("inspect {path}")),
         }
     }
     Ok(())
 }
 
-async fn prepare_staging(client: &Client, layout: &StripedLayout) -> Result<String> {
-    let staging_path = match find_matching_staging(client, layout).await? {
+async fn prepare_stripe_manifest(
+    client: &Client,
+    layout: &StripedLayout,
+    staging_path: &str,
+    hooks: &ProvisionHooks,
+) -> Result<()> {
+    let manifest_path = format!("{staging_path}/{STRIPE_MARKER}");
+    let manifest = serde_json::to_vec(&layout.manifest()).context("encode stripe manifest")?;
+    loop {
+        match client.read(&manifest_path).await {
+            Ok(existing) => match serde_json::from_slice::<StripeManifest>(&existing) {
+                Ok(existing) if existing == layout.manifest() => return Ok(()),
+                Ok(_) => {
+                    return Err(conflict(
+                        layout,
+                        "the staged stripe manifest has different geometry",
+                    ));
+                }
+                Err(error) => {
+                    return Err(conflict(
+                        layout,
+                        format!("the staged stripe manifest is incomplete: {error}"),
+                    ));
+                }
+            },
+            Err(ZeroFsError::NotFound { .. }) => {
+                hooks.before_missing_stripe_manifest_create().await;
+                let temp_path = format!(
+                    "{staging_path}/{STRIPE_TEMP_PREFIX}{}",
+                    uuid::Uuid::new_v4()
+                );
+                let file = client
+                    .open(&temp_path, OpenOptions::write_only().create_new(true))
+                    .await
+                    .with_context(|| format!("create temporary stripe manifest {temp_path}"))?;
+                let write_result = file.write_at(0, &manifest).await;
+                file.close().await;
+                write_result
+                    .with_context(|| format!("write temporary stripe manifest {temp_path}"))?;
+                if let Err(rename_error) = client.rename(&temp_path, &manifest_path).await {
+                    let final_is_exact = client
+                        .read(&manifest_path)
+                        .await
+                        .ok()
+                        .and_then(|bytes| serde_json::from_slice::<StripeManifest>(&bytes).ok())
+                        .is_some_and(|existing| existing == layout.manifest());
+                    if !final_is_exact {
+                        return Err(rename_error)
+                            .with_context(|| format!("publish stripe manifest {manifest_path}"));
+                    }
+                    match client.remove_file(&temp_path).await {
+                        Ok(()) | Err(ZeroFsError::NotFound { .. }) => {}
+                        Err(error) => {
+                            return Err(error).with_context(|| {
+                                format!("remove superseded temporary stripe manifest {temp_path}")
+                            });
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("inspect {manifest_path}"));
+            }
+        }
+    }
+}
+
+async fn prepare_staging(
+    client: &Client,
+    layout: &StripedLayout,
+    hooks: &ProvisionHooks,
+) -> Result<String> {
+    let matching = find_matching_staging(client, layout).await?;
+    hooks.after_staging_scan().await;
+    let staging_path = match matching {
         Some(path) => path,
         None => {
             let path = create_unique_staging(client, layout).await?;
@@ -424,37 +596,8 @@ async fn prepare_staging(client: &Client, layout: &StripedLayout) -> Result<Stri
         }
     };
     validate_staging(client, layout, &staging_path).await?;
-    prepare_lanes(client, layout, &staging_path).await?;
-
-    let manifest_path = format!("{staging_path}/{STRIPE_MARKER}");
-    let manifest = serde_json::to_vec(&layout.manifest()).context("encode stripe manifest")?;
-    match client.read(&manifest_path).await {
-        Ok(existing) => match serde_json::from_slice::<StripeManifest>(&existing) {
-            Ok(existing) if existing == layout.manifest() => {}
-            Ok(_) => {
-                return Err(conflict(
-                    layout,
-                    "the staged stripe manifest has different geometry",
-                ));
-            }
-            Err(_) => {
-                // `create_manifest_file` creates the inode before writing its
-                // payload. A crash can therefore leave a recognizable, valid
-                // provision draft with a truncated stripe marker. That marker
-                // was never publishable, so recreate it from the durable
-                // provision geometry before the atomic directory rename.
-                client
-                    .remove_file(&manifest_path)
-                    .await
-                    .with_context(|| format!("remove partial stripe manifest {manifest_path}"))?;
-                create_manifest_file(client, &manifest_path, &manifest).await?;
-            }
-        },
-        Err(ZeroFsError::NotFound { .. }) => {
-            create_manifest_file(client, &manifest_path, &manifest).await?
-        }
-        Err(error) => return Err(error).with_context(|| format!("inspect {manifest_path}")),
-    }
+    prepare_lanes(client, layout, &staging_path, hooks).await?;
+    prepare_stripe_manifest(client, layout, &staging_path, hooks).await?;
     validate_staging(client, layout, &staging_path).await?;
     client
         .sync()
@@ -503,7 +646,7 @@ async fn resume_legacy_final_draft(client: &Client, layout: &StripedLayout) -> R
     {
         return Err(conflict(layout, "the legacy draft has unexpected entries"));
     }
-    prepare_lanes(client, layout, &export_path).await?;
+    prepare_lanes(client, layout, &export_path, &ProvisionHooks::default()).await?;
     client
         .sync()
         .await
@@ -519,6 +662,14 @@ async fn resume_legacy_final_draft(client: &Client, layout: &StripedLayout) -> R
 pub async fn provision_striped(
     client: &Client,
     layout: &StripedLayout,
+) -> Result<ProvisionOutcome> {
+    provision_striped_inner(client, layout, &ProvisionHooks::default()).await
+}
+
+async fn provision_striped_inner(
+    client: &Client,
+    layout: &StripedLayout,
+    hooks: &ProvisionHooks,
 ) -> Result<ProvisionOutcome> {
     client
         .create_dir_all("/.nbd", 0o755)
@@ -556,7 +707,7 @@ pub async fn provision_striped(
         return Ok(ProvisionOutcome::Created);
     }
 
-    let staging_path = prepare_staging(client, layout).await?;
+    let staging_path = prepare_staging(client, layout, hooks).await?;
     if client
         .exists(layout.export_path())
         .await
@@ -628,8 +779,8 @@ pub async fn run_provision_striped(
 #[cfg(test)]
 mod tests {
     use super::{
-        PROVISION_MARKER, ProvisionOutcome, StripedLayout, create_unique_staging, parse_byte_size,
-        provision_striped,
+        PROVISION_MARKER, ProvisionHooks, ProvisionOutcome, StripedLayout, create_unique_staging,
+        parse_byte_size, prepare_staging, provision_striped, provision_striped_inner,
     };
     use crate::fs::ZeroFS;
     use crate::nbd::NbdExportGates;
@@ -879,7 +1030,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provision_recovers_a_valid_draft_with_a_partial_stripe_marker() {
+    async fn provision_leaves_a_partial_stripe_draft_and_uses_a_fresh_one() {
         let (client, filesystem, shutdown, _directory) = setup().await;
         let staging = "/.nbd/.zerofs-nbd-provision-v1-partial-manifest";
         client.create_dir_all(staging, 0o755).await.unwrap();
@@ -903,7 +1054,7 @@ mod tests {
             provision_striped(&client, &layout).await.unwrap(),
             ProvisionOutcome::Created
         );
-        assert!(!client.exists(staging).await.unwrap());
+        assert!(client.exists(staging).await.unwrap());
         let handler = NBDHandler::new(filesystem, Arc::new(NbdExportGates::default()));
         assert_eq!(handler.get_device(b"vm100").await.unwrap().size, 64 * MIB);
         shutdown.cancel();
@@ -946,6 +1097,145 @@ mod tests {
                 .map(|entry| entry.name.as_str())
                 .collect::<Vec<_>>(),
             vec!["vm100"]
+        );
+        let handler = NBDHandler::new(filesystem, Arc::new(NbdExportGates::default()));
+        assert_eq!(handler.get_device(b"vm100").await.unwrap().size, 64 * MIB);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn multiple_authenticated_drafts_choose_one_and_leave_unowned_drafts_untouched() {
+        let (client, filesystem, shutdown, _directory) = setup().await;
+        client.create_dir_all("/.nbd", 0o755).await.unwrap();
+        let provision = br#"{"version":1,"export_name":"vm100","layout":{"version":1,"stripe_bytes":1048576,"members":["lane-0","lane-1","lane-2","lane-3"]}}"#;
+        let first = "/.nbd/.zerofs-nbd-provision-v1-draft-a";
+        let second = "/.nbd/.zerofs-nbd-provision-v1-draft-b";
+        for draft in [first, second] {
+            client.create_dir(draft, 0o755).await.unwrap();
+            client
+                .write(format!("{draft}/{PROVISION_MARKER}"), provision)
+                .await
+                .unwrap();
+        }
+        let unsafe_partial = "/.nbd/.zerofs-nbd-provision-v1-unsafe-partial";
+        client.create_dir(unsafe_partial, 0o755).await.unwrap();
+        client
+            .write(format!("{unsafe_partial}/{PROVISION_MARKER}"), b"{")
+            .await
+            .unwrap();
+        let layout = StripedLayout::new("vm100", 64 * MIB, 4, MIB).unwrap();
+
+        assert_eq!(
+            provision_striped(&client, &layout).await.unwrap(),
+            ProvisionOutcome::Created
+        );
+        assert!(!client.exists(first).await.unwrap());
+        assert!(client.exists(second).await.unwrap());
+        assert!(client.exists(unsafe_partial).await.unwrap());
+        let handler = NBDHandler::new(filesystem, Arc::new(NbdExportGates::default()));
+        assert_eq!(handler.get_device(b"vm100").await.unwrap().size, 64 * MIB);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn shared_draft_lane_create_race_is_idempotent() {
+        let (client, _filesystem, shutdown, _directory) = setup().await;
+        let staging = "/.nbd/.zerofs-nbd-provision-v1-shared";
+        client.create_dir_all(staging, 0o755).await.unwrap();
+        client
+            .write(
+                format!("{staging}/{PROVISION_MARKER}"),
+                br#"{"version":1,"export_name":"vm100","layout":{"version":1,"stripe_bytes":1048576,"members":["lane-0","lane-1","lane-2","lane-3"]}}"#,
+            )
+            .await
+            .unwrap();
+        let layout = StripedLayout::new("vm100", 64 * MIB, 4, MIB).unwrap();
+        let scan_barrier = Arc::new(Barrier::new(2));
+        let lane_barrier = Arc::new(Barrier::new(2));
+        let stripe_manifest_barrier = Arc::new(Barrier::new(2));
+        let mut tasks = Vec::new();
+        for _ in 0..2 {
+            let client = Arc::clone(&client);
+            let layout = layout.clone();
+            let hooks = ProvisionHooks {
+                after_staging_scan: Some(Arc::clone(&scan_barrier)),
+                before_first_missing_lane_create: Some(Arc::clone(&lane_barrier)),
+                before_missing_stripe_manifest_create: Some(Arc::clone(&stripe_manifest_barrier)),
+                ..Default::default()
+            };
+            tasks.push(tokio::spawn(async move {
+                prepare_staging(&client, &layout, &hooks).await
+            }));
+        }
+
+        for task in tasks {
+            assert_eq!(
+                task.await
+                    .expect("staging task did not panic")
+                    .expect("shared draft preparation converged"),
+                staging
+            );
+        }
+        for lane in layout.members() {
+            assert_eq!(
+                client.stat(format!("{staging}/{lane}")).await.unwrap().size,
+                16 * MIB
+            );
+        }
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn callers_forced_to_create_separate_drafts_converge_and_clean_their_own() {
+        let (client, filesystem, shutdown, _directory) = setup().await;
+        let unsafe_partial = "/.nbd/.zerofs-nbd-provision-v1-unsafe-partial";
+        client.create_dir_all(unsafe_partial, 0o755).await.unwrap();
+        client
+            .write(format!("{unsafe_partial}/{PROVISION_MARKER}"), b"{")
+            .await
+            .unwrap();
+        let layout = StripedLayout::new("vm100", 64 * MIB, 4, MIB).unwrap();
+        let scan_barrier = Arc::new(Barrier::new(2));
+        let mut tasks = Vec::new();
+        for _ in 0..2 {
+            let client = Arc::clone(&client);
+            let layout = layout.clone();
+            let hooks = ProvisionHooks {
+                after_staging_scan: Some(Arc::clone(&scan_barrier)),
+                ..Default::default()
+            };
+            tasks.push(tokio::spawn(async move {
+                provision_striped_inner(&client, &layout, &hooks).await
+            }));
+        }
+
+        let outcomes = futures::future::try_join_all(tasks)
+            .await
+            .expect("provisioning tasks did not panic")
+            .into_iter()
+            .collect::<anyhow::Result<Vec<_>>>()
+            .expect("separate draft callers converged");
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| **outcome == ProvisionOutcome::Created)
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| **outcome == ProvisionOutcome::AlreadyProvisioned)
+                .count(),
+            1
+        );
+        let entries = client.read_dir("/.nbd").await.unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![unsafe_partial.rsplit('/').next().unwrap(), "vm100"]
         );
         let handler = NBDHandler::new(filesystem, Arc::new(NbdExportGates::default()));
         assert_eq!(handler.get_device(b"vm100").await.unwrap().size, 64 * MIB);
