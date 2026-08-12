@@ -208,6 +208,10 @@ class LifecycleTests(unittest.TestCase):
             (
                 WritebackSnapshot(12, 12, 12, 0, 0, 10, 10, False),
                 WritebackSnapshot(12, 12, 12, 0, 0, 10, 10, False),
+                WritebackSnapshot(14, 14, 12, 0, 4, 13, 10, False),
+                WritebackSnapshot(15, 15, 12, 0, 4, 14, 10, False),
+                WritebackSnapshot(15, 15, 12, 0, 4, 14, 10, False),
+                WritebackSnapshot(15, 15, 12, 0, 4, 14, 10, False),
                 WritebackSnapshot(15, 15, 12, 0, 4, 14, 10, False),
             )
         )

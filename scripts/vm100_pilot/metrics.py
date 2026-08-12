@@ -169,18 +169,30 @@ def wait_for_accepted_after(
     *,
     previous_sequence: int,
     timeout: float,
+    stable_samples: int = 4,
     interval: float = 0.05,
     monotonic: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
 ) -> WritebackSnapshot:
     """Wait until the exported status observes work submitted after a baseline."""
     started = monotonic()
+    candidate: int | None = None
+    stable = 0
     while True:
         current = snapshot()
         if current.terminal:
             raise TerminalWritebackError("writeback reported a terminal error")
         if current.accepted > previous_sequence:
-            return current
+            if current.accepted == candidate:
+                stable += 1
+            else:
+                candidate = current.accepted
+                stable = 1
+            if stable >= stable_samples:
+                return current
+        else:
+            candidate = None
+            stable = 0
         if monotonic() - started >= timeout:
             raise TimeoutError(
                 "writeback did not observe a new accepted sequence after "
