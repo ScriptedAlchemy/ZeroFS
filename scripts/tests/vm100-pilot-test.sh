@@ -122,7 +122,22 @@ case ${1:-} in
   status) exit 0 ;;
 esac
 exit 1'
-  make_fake fio 'printf "fio invoked\n" >>"$FAKE_CALL_LOG"; for arg in "$@"; do case $arg in --output=*) output=${arg#--output=} ;; esac; done; [[ -z ${output:-} ]] || printf "WRITE: bw=1MiB/s\n" >"$output"; exit "${FAKE_FIO_RC:-0}"'
+  make_fake fio '
+name= rw= direct= output=
+for arg in "$@"; do
+  case $arg in
+    --name=*) name=${arg#--name=} ;;
+    --rw=*) rw=${arg#--rw=} ;;
+    --direct=*) direct=${arg#--direct=} ;;
+    --output=*) output=${arg#--output=} ;;
+  esac
+done
+printf "fio name=%s rw=%s direct=%s\n" "$name" "$rw" "${direct:-unset}" >>"$FAKE_CALL_LOG"
+if [[ -n $output ]]; then
+  if [[ $rw == read ]]; then printf "READ: bw=2MiB/s\n" >"$output"; else printf "WRITE: bw=1MiB/s\n" >"$output"; fi
+fi
+if [[ ${FAKE_FIO_FAIL_NAME:-} == "$name" ]]; then exit 19; fi
+exit "${FAKE_FIO_RC:-0}"'
   make_fake sync '
 if [[ ${FAKE_ADVANCE_LOCAL_DURABLE:-0} == 1 ]]; then
   sed -i.bak "s/zerofs_writeback_local_bytes_completed_total 1048576/zerofs_writeback_local_bytes_completed_total 3145728/" "$FAKE_METRICS_FILE"
@@ -284,6 +299,31 @@ test_successful_benchmark_reports_measured_local_durable_throughput() {
   grep -q 'first_drained_epoch_ms=' "$FIXTURE/results"/storage-*-drain.txt
 }
 
+test_benchmark_reports_buffered_warm_and_direct_reads_separately() {
+  new_fixture
+  FAKE_ADVANCE_LOCAL_DURABLE=1 ZEROFS_BENCH_TOTAL_MIB=4 ZEROFS_BENCH_JOBS=1 run_pilot benchmark >"$FIXTURE/out" 2>"$FIXTURE/err"
+  result=$(find "$FIXTURE/results" -name 'storage-*.txt' ! -name '*-status.txt' ! -name '*-drain.txt' ! -name '*-fio.txt' | head -1)
+  grep -q '^buffered_warm_read_ms=.*buffered_warm_read_MiBps=.*cache=kernel_page_cache' "$result" || return 1
+  grep -q '^direct_read_ms=.*direct_read_MiBps=.*cache=direct_io_bypasses_kernel_page_cache' "$result" || return 1
+  [[ $(grep -c '^fio name=' "$FIXTURE/calls.log") == 3 ]] || return 1
+  grep -q '^fio name=zerofs_buffered_warm_read rw=read direct=0$' "$FIXTURE/calls.log" || return 1
+  grep -q '^fio name=zerofs_direct_read rw=read direct=1$' "$FIXTURE/calls.log" || return 1
+  find "$FIXTURE/results" -name 'storage-*-write-fio.txt' | grep -q . || return 1
+  find "$FIXTURE/results" -name 'storage-*-buffered-warm-read-fio.txt' | grep -q . || return 1
+  find "$FIXTURE/results" -name 'storage-*-direct-read-fio.txt' | grep -q .
+}
+
+test_failed_direct_read_preserves_all_fio_evidence_and_cleans_files() {
+  new_fixture
+  if FAKE_ADVANCE_LOCAL_DURABLE=1 FAKE_FIO_FAIL_NAME=zerofs_direct_read ZEROFS_BENCH_TOTAL_MIB=4 ZEROFS_BENCH_JOBS=1 run_pilot benchmark >"$FIXTURE/out" 2>"$FIXTURE/err"; then
+    return 1
+  fi
+  if find "$FIXTURE/mount" -maxdepth 1 -name '.zerofs-bench-*' | grep -q .; then return 1; fi
+  find "$FIXTURE/results" -name 'storage-*-write-fio.txt' | grep -q . || return 1
+  find "$FIXTURE/results" -name 'storage-*-buffered-warm-read-fio.txt' | grep -q . || return 1
+  find "$FIXTURE/results" -name 'storage-*-direct-read-fio.txt' | grep -q .
+}
+
 test_raw_sftp_reaps_all_eight_override_workers_after_one_fails() {
   new_fixture
   if FAKE_SFTP_FAIL_UPLOAD=1 ZEROFS_RAW_SFTP_JOBS=8 run_pilot raw-sftp >"$FIXTURE/out" 2>"$FIXTURE/err"; then
@@ -316,6 +356,8 @@ run_test test_status_rejects_unexpected_ack_mode
 run_test test_status_records_runtime_and_durability_receipt
 run_test test_failed_benchmark_cleans_sampler_and_keeps_evidence
 run_test test_successful_benchmark_reports_measured_local_durable_throughput
+run_test test_benchmark_reports_buffered_warm_and_direct_reads_separately
+run_test test_failed_direct_read_preserves_all_fio_evidence_and_cleans_files
 run_test test_raw_sftp_reaps_all_eight_override_workers_after_one_fails
 run_test test_raw_sftp_defaults_to_seven_matched_streams_and_records_bytes
 

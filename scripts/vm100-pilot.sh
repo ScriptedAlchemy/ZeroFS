@@ -333,14 +333,16 @@ benchmark() {
   local jobs=${ZEROFS_BENCH_JOBS:-4}
   (( total_mib > 0 && jobs > 0 && total_mib % jobs == 0 )) || die "total MiB must be positive and divisible by jobs"
   local per_job_mib=$((total_mib / jobs))
-  local run timestamp result sample stop_file fio_output status_output drain_output prefix
+  local run timestamp result sample stop_file write_fio_output buffered_read_fio_output direct_read_fio_output status_output drain_output prefix
   timestamp=$(date -u +%Y%m%dT%H%M%SZ)
   run="${timestamp}-$$"
   sudo install -d -m 0755 -o "$(id -un)" -g "$(id -gn)" "$RESULT_DIR"
   result="$RESULT_DIR/storage-$run.txt"
   sample="$RESULT_DIR/storage-$run-metrics.csv"
   stop_file="$TMP_DIR/zerofs-metrics-$run.stop"
-  fio_output="$RESULT_DIR/storage-$run-fio.txt"
+  write_fio_output="$RESULT_DIR/storage-$run-write-fio.txt"
+  buffered_read_fio_output="$RESULT_DIR/storage-$run-buffered-warm-read-fio.txt"
+  direct_read_fio_output="$RESULT_DIR/storage-$run-direct-read-fio.txt"
   status_output="$RESULT_DIR/storage-$run-status.txt"
   drain_output="$RESULT_DIR/storage-$run-drain.txt"
   prefix=".zerofs-bench-$run"
@@ -355,7 +357,7 @@ benchmark() {
   sample_metrics "$sample" "$stop_file" &
   local sampler=$!
   BENCH_SAMPLER=$sampler
-  local snapshot local_bytes0 local_bytes1 remote_bytes0 remote_bytes1 t0 t1 t2 t3
+  local snapshot local_bytes0 local_bytes1 remote_bytes0 remote_bytes1 t0 t1 t2 t3 t4 t5 t6 t7
   snapshot=$(metrics_snapshot)
   local_bytes0=$(metric_from zerofs_writeback_local_bytes_completed_total "$snapshot")
   remote_bytes0=$(metric_from zerofs_writeback_remote_bytes_completed_total "$snapshot")
@@ -364,7 +366,7 @@ benchmark() {
     "--filename_format=$prefix.\$jobnum" --rw=write --bs=1M \
     "--size=${per_job_mib}M" "--numjobs=$jobs" --group_reporting \
     --fallocate=none --refill_buffers=1 --scramble_buffers=1 \
-    --buffer_compress_percentage=0 --output="$fio_output"
+    --buffer_compress_percentage=0 --output="$write_fio_output"
   t1=$(date +%s%3N)
   sudo sync -f "$MOUNTPOINT"
   t2=$(date +%s%3N)
@@ -377,11 +379,26 @@ benchmark() {
   touch "$stop_file"
   BENCH_SAMPLER=
   wait "$sampler"
+  t4=$(date +%s%3N)
+  sudo fio --name=zerofs_buffered_warm_read --directory="$MOUNTPOINT" \
+    "--filename_format=$prefix.\$jobnum" --rw=read --bs=1M \
+    "--size=${per_job_mib}M" "--numjobs=$jobs" --group_reporting \
+    --direct=0 --invalidate=0 --output="$buffered_read_fio_output"
+  t5=$(date +%s%3N)
+  t6=$(date +%s%3N)
+  sudo fio --name=zerofs_direct_read --directory="$MOUNTPOINT" \
+    "--filename_format=$prefix.\$jobnum" --rw=read --bs=1M \
+    "--size=${per_job_mib}M" "--numjobs=$jobs" --group_reporting \
+    --direct=1 --output="$direct_read_fio_output"
+  t7=$(date +%s%3N)
   local user_ms=$((t1 - t0)) local_ms=$((t2 - t1)) end_ms=$((t3 - t0))
+  local buffered_read_ms=$((t5 - t4)) direct_read_ms=$((t7 - t6))
   local logical_bytes=$((total_mib * 1024 * 1024))
   local local_durable_bytes=$((local_bytes1 - local_bytes0)) remote_bytes=$((remote_bytes1 - remote_bytes0))
-  local user_mibps local_durable_mibps remote_wall_mibps remote_active first_drained_epoch_ms first_drained_ms
+  local user_mibps buffered_read_mibps direct_read_mibps local_durable_mibps remote_wall_mibps remote_active first_drained_epoch_ms first_drained_ms
   user_mibps=$(awk -v b="$logical_bytes" -v ms="$user_ms" 'BEGIN { printf "%.2f", b/1048576/(ms/1000) }')
+  buffered_read_mibps=$(awk -v b="$logical_bytes" -v ms="$buffered_read_ms" 'BEGIN { printf "%.2f", b/1048576/(ms/1000) }')
+  direct_read_mibps=$(awk -v b="$logical_bytes" -v ms="$direct_read_ms" 'BEGIN { printf "%.2f", b/1048576/(ms/1000) }')
   local_durable_mibps=$(awk -v b="$local_durable_bytes" -v ms="$((t2 - t0))" 'BEGIN { if (ms>0) printf "%.2f", b/1048576/(ms/1000); else print "0.00" }')
   remote_wall_mibps=$(awk -v b="$remote_bytes" -v ms="$end_ms" 'BEGIN { printf "%.2f", b/1048576/(ms/1000) }')
   first_drained_epoch_ms=$(awk '{ for (i=1; i<=NF; i++) if ($i ~ /^first_drained_epoch_ms=/) { sub(/^[^=]*=/, "", $i); print $i; exit } }' "$drain_output")
@@ -393,13 +410,19 @@ benchmark() {
     printf 'commit=%s\n' "$(git -C "$ROOT" rev-parse HEAD)"
     printf 'logical_bytes=%s remote_bytes=%s\n' "$logical_bytes" "$remote_bytes"
     printf 'user_experienced_ms=%s user_experienced_MiBps=%s durability=volatile_page_cache_and_memory_ack\n' "$user_ms" "$user_mibps"
+    printf 'buffered_warm_read_ms=%s buffered_warm_read_MiBps=%s cache=kernel_page_cache dataset=just_written_no_global_cache_drop\n' \
+      "$buffered_read_ms" "$buffered_read_mibps"
+    printf 'direct_read_ms=%s direct_read_MiBps=%s cache=direct_io_bypasses_kernel_page_cache dataset=same_files_after_remote_drain\n' \
+      "$direct_read_ms" "$direct_read_mibps"
     printf 'local_durable_bytes=%s local_sync_wait_ms=%s local_durable_end_to_end_ms=%s foreground_to_local_durable_MiBps=%s durability=zerofs_ssd_journal\n' \
       "$local_durable_bytes" "$local_ms" "$((t2 - t0))" "$local_durable_mibps"
     printf 'remote_first_drained_end_to_end_ms=%s remote_stable_end_to_end_ms=%s remote_wall_MiBps=%s remote_active_ms=%s remote_active_MiBps=%s durability=storage_box_sftp_ack\n' \
       "$first_drained_ms" "$end_ms" "$remote_wall_mibps" "$remote_active" "$remote_active_mibps"
-    grep -E 'WRITE:|write: IOPS' "$fio_output" | tail -n 3
-    printf 'status_receipt=%s metric_samples=%s fio_output=%s drain_receipt=%s\n' \
-      "$status_output" "$sample" "$fio_output" "$drain_output"
+    grep -E 'WRITE:|write: IOPS' "$write_fio_output" | tail -n 3
+    grep -E 'READ:|read: IOPS' "$buffered_read_fio_output" | tail -n 3
+    grep -E 'READ:|read: IOPS' "$direct_read_fio_output" | tail -n 3
+    printf 'status_receipt=%s metric_samples=%s write_fio_output=%s buffered_warm_read_fio_output=%s direct_read_fio_output=%s drain_receipt=%s\n' \
+      "$status_output" "$sample" "$write_fio_output" "$buffered_read_fio_output" "$direct_read_fio_output" "$drain_output"
   } | tee "$result"
   sudo rm -f "$MOUNTPOINT/$prefix".*
   sudo sync -f "$MOUNTPOINT"
