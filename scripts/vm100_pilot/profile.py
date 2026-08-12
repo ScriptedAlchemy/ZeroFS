@@ -49,6 +49,19 @@ def _phase_perf_report_argv(
     ]
 
 
+def _phase_report_text(stdout: str, stderr: str, returncode: int) -> str:
+    if stdout.strip():
+        return stdout + stderr
+    detail = stderr.rstrip()
+    suffix = f"{detail}\n" if detail else ""
+    return f"status=insufficient_samples\nreturncode={returncode}\n{suffix}"
+
+
+def _require_perf_data(path: Path) -> None:
+    if not path.is_file() or path.stat().st_size == 0:
+        raise RuntimeError(f"perf data is missing or empty: {path}")
+
+
 def _perf_record_argv(pid: int, perf_data: Path) -> list[str | Path]:
     return [
         "perf",
@@ -381,35 +394,39 @@ class CollectorGroup:
         ).stdout
         self.receipt.path("process-io-after.txt").write_text(after, encoding="utf-8")
         perf_data = self.receipt.directory / "perf.data"
-        if perf_data.exists() and perf_data.stat().st_size:
-            report = self.runner.run(
-                [
-                    "perf",
-                    "report",
-                    "--stdio",
-                    "--no-children",
-                    "--sort",
-                    "comm,dso,symbol",
-                    "-i",
-                    perf_data,
-                ],
+        _require_perf_data(perf_data)
+        report = self.runner.run(
+            [
+                "perf",
+                "report",
+                "--stdio",
+                "--no-children",
+                "--sort",
+                "comm,dso,symbol",
+                "-i",
+                perf_data,
+            ],
+            sudo=True,
+        )
+        if not report.stdout.strip():
+            raise RuntimeError("perf produced an empty aggregate report")
+        self.receipt.path("perf-report.txt").write_text(
+            report.stdout + report.stderr, encoding="utf-8"
+        )
+        for phase, (start_ns, end_ns) in (phase_windows or {}).items():
+            phase_report = self.runner.run(
+                _phase_perf_report_argv(perf_data, start_ns, end_ns),
                 sudo=True,
+                check=False,
             )
-            if not report.stdout.strip():
-                raise RuntimeError("perf produced an empty aggregate report")
-            self.receipt.path("perf-report.txt").write_text(
-                report.stdout + report.stderr, encoding="utf-8"
+            self.receipt.path(f"perf-report-{phase}.txt").write_text(
+                _phase_report_text(
+                    phase_report.stdout,
+                    phase_report.stderr,
+                    phase_report.returncode,
+                ),
+                encoding="utf-8",
             )
-            for phase, (start_ns, end_ns) in (phase_windows or {}).items():
-                phase_report = self.runner.run(
-                    _phase_perf_report_argv(perf_data, start_ns, end_ns),
-                    sudo=True,
-                )
-                if not phase_report.stdout.strip():
-                    raise RuntimeError(f"perf produced an empty report for {phase}")
-                self.receipt.path(f"perf-report-{phase}.txt").write_text(
-                    phase_report.stdout + phase_report.stderr, encoding="utf-8"
-                )
         if errors:
             raise RuntimeError("collector cleanup failures: " + "; ".join(errors))
 

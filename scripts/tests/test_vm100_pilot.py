@@ -50,8 +50,10 @@ from scripts.vm100_pilot.profile import (
     CanonicalDeployment,
     ProfileRunner,
     _load_phase_windows,
+    _phase_report_text,
     _phase_perf_report_argv,
     _perf_record_argv,
+    _require_perf_data,
 )
 from scripts.vm100_pilot.system_io import (
     BlockIoSnapshot,
@@ -1790,6 +1792,20 @@ class ProfileTests(unittest.TestCase):
 
         self.assertEqual(argv[argv.index("--time") + 1], "1.000000001,2.500000009")
         self.assertEqual(argv[-2:], ["-i", Path("/tmp/perf.data")])
+
+    def test_short_perf_phase_records_insufficient_samples(self) -> None:
+        self.assertEqual(
+            _phase_report_text("", "zero-sized data", 1),
+            "status=insufficient_samples\nreturncode=1\nzero-sized data\n",
+        )
+
+    def test_profile_rejects_missing_or_empty_perf_data(self) -> None:
+        path = Path(self.temp.name) / "perf.data"
+        with self.assertRaisesRegex(RuntimeError, "missing or empty"):
+            _require_perf_data(path)
+        path.touch()
+        with self.assertRaisesRegex(RuntimeError, "missing or empty"):
+            _require_perf_data(path)
 
     def test_perf_record_uses_the_same_monotonic_clock_as_phase_receipts(self) -> None:
         argv = _perf_record_argv(123, Path("/tmp/perf.data"))
