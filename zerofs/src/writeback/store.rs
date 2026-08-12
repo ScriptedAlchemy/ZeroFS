@@ -1746,18 +1746,104 @@ mod tests {
             .unwrap();
         controls.release_put_path(path.as_ref());
 
-        assert!(
-            tokio::time::timeout(Duration::from_millis(400), store.wait_remote(2))
-                .await
-                .is_err(),
-            "chained update overwrote a concurrent remote mutation"
-        );
+        let error = tokio::time::timeout(Duration::from_secs(1), store.wait_remote(2))
+            .await
+            .expect("remote CAS divergence must wake waiters promptly")
+            .expect_err("remote CAS divergence must be terminal");
+        assert!(error.to_string().contains("permanent remote divergence"));
         assert_eq!(
             remote.get(&path).await.unwrap().bytes().await.unwrap(),
             Bytes::from_static(b"external")
         );
+        assert!(store.status().unwrap().terminal_error.is_some());
         controls.release_puts();
         store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn recovered_chained_update_without_a_migratable_predecessor_is_terminal() {
+        let (store, remote, _temp, controls) = test_store_with_controls(true).await;
+        let path = Path::from("manifest");
+        remote
+            .put(&path, Bytes::from_static(b"remote-zero").into())
+            .await
+            .unwrap();
+        let remote_zero = remote.head(&path).await.unwrap();
+        controls.block_puts();
+        let first = store
+            .put_opts(
+                &path,
+                Bytes::from_static(b"local-one").into(),
+                PutOptions::from(PutMode::Update(UpdateVersion {
+                    e_tag: remote_zero.e_tag,
+                    version: remote_zero.version,
+                })),
+            )
+            .await
+            .unwrap();
+        store
+            .put_opts(
+                &path,
+                Bytes::from_static(b"local-two").into(),
+                PutOptions::from(PutMode::Update(first.into())),
+            )
+            .await
+            .unwrap();
+        store.wait_local(2).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while controls.put_count() < 1 {
+                controls.put_activity().notified().await;
+            }
+        })
+        .await
+        .expect("first remote update did not start");
+        controls.release_put_path(path.as_ref());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while controls.put_count() < 2 {
+                controls.put_activity().notified().await;
+            }
+        })
+        .await
+        .expect("chained remote update did not reach the blocked backend");
+        assert_eq!(store.inner.journal.progress().unwrap().remote_seq, 1);
+        let settings = store.inner.settings.clone();
+        let identity = store.inner.journal.snapshot().unwrap().identity;
+        let journal_root = store.inner.journal.root().to_path_buf();
+        store.shutdown().await.unwrap();
+        drop(store);
+        controls.release_puts();
+
+        let database = redb::Database::create(journal_root.join("journal.redb")).unwrap();
+        let transaction = database.begin_write().unwrap();
+        assert!(
+            transaction
+                .delete_table(redb::TableDefinition::<&str, &[u8]>::new(
+                    "remote_object_versions"
+                ))
+                .unwrap()
+        );
+        transaction.commit().unwrap();
+        drop(database);
+
+        let journal = Arc::new(Journal::open(&journal_root, identity).unwrap());
+        let (recovery_remote, recovery_controls) = FaultStore::new(remote);
+        let recovered = WritebackObjectStore::open_paused(recovery_remote, journal, settings)
+            .await
+            .unwrap();
+        recovered.activate_remote().unwrap();
+
+        let error = tokio::time::timeout(Duration::from_secs(1), recovered.wait_remote(2))
+            .await
+            .expect("missing predecessor metadata must not retry forever")
+            .expect_err("missing predecessor metadata must be terminal");
+        assert!(error.to_string().contains("predecessor ETag"));
+        assert!(recovered.status().unwrap().terminal_error.is_some());
+        assert_eq!(
+            recovery_controls.put_count(),
+            0,
+            "recovery must fail before mutating the remote object"
+        );
+        recovered.shutdown().await.unwrap();
     }
 
     #[tokio::test]

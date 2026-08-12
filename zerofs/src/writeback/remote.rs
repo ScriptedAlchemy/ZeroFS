@@ -210,6 +210,15 @@ struct SchedulerWindow {
 #[error("remote target contains different bytes than the locally durable mutation")]
 struct RemoteContentDivergence;
 
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "remote predecessor ETag for local sequence {predecessor_sequence} is unavailable at writeback sequence {sequence}"
+)]
+struct MissingRemotePredecessor {
+    sequence: Sequence,
+    predecessor_sequence: Sequence,
+}
+
 async fn run_remote_scheduler(worker: RemoteWorker) {
     let RemoteWorker {
         remote,
@@ -420,6 +429,7 @@ async fn run_remote_scheduler(worker: RemoteWorker) {
 fn is_terminal_remote_error(error: &object_store::Error) -> bool {
     match error {
         object_store::Error::AlreadyExists { source, .. } => source.is::<RemoteContentDivergence>(),
+        object_store::Error::Precondition { source, .. } => source.is::<MissingRemotePredecessor>(),
         _ => false,
     }
 }
@@ -656,12 +666,7 @@ fn remote_put_mode(
                             record.sequence
                         ))
                     })?
-                    .ok_or_else(|| {
-                        precondition(
-                            &record.path,
-                            "update remote predecessor ETag is unavailable",
-                        )
-                    })?
+                    .ok_or_else(|| missing_remote_predecessor(record, predecessor_sequence))?
             };
             Ok(PutMode::Update(UpdateVersion {
                 e_tag: Some(e_tag),
@@ -735,6 +740,19 @@ fn precondition(path: &str, message: &'static str) -> object_store::Error {
     object_store::Error::Precondition {
         path: path.to_owned(),
         source: message.into(),
+    }
+}
+
+fn missing_remote_predecessor(
+    record: &MutationRecord,
+    predecessor_sequence: Sequence,
+) -> object_store::Error {
+    object_store::Error::Precondition {
+        path: record.path.clone(),
+        source: Box::new(MissingRemotePredecessor {
+            sequence: record.sequence,
+            predecessor_sequence,
+        }),
     }
 }
 

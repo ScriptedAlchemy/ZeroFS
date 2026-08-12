@@ -112,6 +112,7 @@ impl Journal {
         }
 
         initialize_or_validate_identity(&database, &expected_identity)?;
+        backfill_remote_object_versions(&database)?;
         let journal = Self {
             root,
             database,
@@ -405,22 +406,7 @@ impl Journal {
             let mut versions = transaction
                 .open_table(REMOTE_OBJECT_VERSIONS)
                 .context("failed to open remote object versions")?;
-            match &record.kind {
-                MutationKind::Delete => {
-                    versions
-                        .remove(record.path.as_str())
-                        .context("failed to clear deleted remote object version")?;
-                }
-                MutationKind::Rename { source, .. } => {
-                    versions
-                        .remove(source.as_str())
-                        .context("failed to clear renamed remote source version")?;
-                    store_remote_object_version(&mut versions, &record)?;
-                }
-                MutationKind::Put { .. } | MutationKind::Copy { .. } => {
-                    store_remote_object_version(&mut versions, &record)?;
-                }
-            }
+            apply_remote_object_version(&mut versions, &record)?;
             drop(versions);
             write_value(&mut meta, REMOTE_SEQ_KEY, &sequence)?;
             write_value(&mut meta, REMOTE_BYTES_COMPLETED_KEY, &total_completed)?;
@@ -896,6 +882,52 @@ fn initialize_or_validate_identity(database: &Database, expected: &JournalIdenti
         .context("failed to commit journal identity")
 }
 
+fn backfill_remote_object_versions(database: &Database) -> Result<()> {
+    let mut transaction = database
+        .begin_write()
+        .context("failed to migrate remote object versions")?;
+    transaction
+        .set_durability(Durability::Immediate)
+        .context("failed to set remote object version migration durability")?;
+    let remote_seq = {
+        let meta = transaction
+            .open_table(META)
+            .context("failed to open journal metadata for migration")?;
+        read_required::<u64>(&meta, REMOTE_SEQ_KEY)?
+    };
+    let completed = {
+        let mutations = transaction
+            .open_table(MUTATIONS)
+            .context("failed to open journal mutations for migration")?;
+        let mut completed = Vec::new();
+        for entry in mutations
+            .range(..=remote_seq)
+            .context("failed to scan completed mutations for migration")?
+        {
+            let (_, value) = entry.context("failed to read completed migration record")?;
+            completed.push(
+                bincode::deserialize(value.value())
+                    .context("failed to decode completed migration record")?,
+            );
+        }
+        completed
+    };
+    if completed.is_empty() {
+        return Ok(());
+    }
+    {
+        let mut versions = transaction
+            .open_table(REMOTE_OBJECT_VERSIONS)
+            .context("failed to open remote object versions for migration")?;
+        for record in completed {
+            apply_remote_object_version(&mut versions, &record)?;
+        }
+    }
+    transaction
+        .commit()
+        .context("failed to commit remote object version migration")
+}
+
 fn read_required<T: serde::de::DeserializeOwned>(
     table: &impl ReadableTable<&'static str, &'static [u8]>,
     key: &str,
@@ -955,6 +987,29 @@ fn store_remote_object_version(
     versions
         .insert(record.path.as_str(), encoded.as_slice())
         .context("failed to store remote object version")?;
+    Ok(())
+}
+
+fn apply_remote_object_version(
+    versions: &mut redb::Table<'_, &str, &[u8]>,
+    record: &MutationRecord,
+) -> Result<()> {
+    match &record.kind {
+        MutationKind::Delete => {
+            versions
+                .remove(record.path.as_str())
+                .context("failed to clear deleted remote object version")?;
+        }
+        MutationKind::Rename { source, .. } => {
+            versions
+                .remove(source.as_str())
+                .context("failed to clear renamed remote source version")?;
+            store_remote_object_version(versions, record)?;
+        }
+        MutationKind::Put { .. } | MutationKind::Copy { .. } => {
+            store_remote_object_version(versions, record)?;
+        }
+    }
     Ok(())
 }
 
@@ -1241,7 +1296,7 @@ fn sync_directory(path: impl AsRef<Path>) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Journal, JournalSnapshot};
+    use super::{Journal, JournalSnapshot, REMOTE_OBJECT_VERSIONS};
     use crate::writeback::model::{
         FenceClass, JournalIdentity, LocalEtag, MutationKind, MutationMode, MutationRecord,
     };
@@ -1504,6 +1559,40 @@ mod tests {
         assert_eq!(snapshot.remote_seq, 2);
         assert!(snapshot.records.is_empty());
         assert!(!journal.root().join(first.blob_path().unwrap()).exists());
+    }
+
+    #[test]
+    fn opening_a_pre_version_table_journal_backfills_preserved_remote_results() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = open_temp_journal(&temp, "bucket-a");
+        let path = "manifest/current";
+        let mut predecessor = put_record(1, path, b"one");
+        predecessor.fence = FenceClass::Fence;
+        journal.commit_put(predecessor, b"one").unwrap();
+        let mut chained = put_record(2, path, b"two");
+        chained.fence = FenceClass::Fence;
+        chained.kind = MutationKind::Put {
+            mode: MutationMode::Update,
+            expected_visible_version: Some(LocalEtag::new(Uuid::nil(), 1).as_str().to_owned()),
+            payload_len: 3,
+            payload_sha256: Sha256::digest(b"two").into(),
+            blob_path: String::new(),
+        };
+        journal.commit_put(chained, b"two").unwrap();
+        journal
+            .mark_remote(1, Some("remote-etag-one".to_owned()))
+            .unwrap();
+        let transaction = journal.database.begin_write().unwrap();
+        assert!(transaction.delete_table(REMOTE_OBJECT_VERSIONS).unwrap());
+        transaction.commit().unwrap();
+        drop(journal);
+
+        let reopened = open_temp_journal(&temp, "bucket-a");
+
+        assert_eq!(
+            reopened.remote_object_etag(path, 1).unwrap().as_deref(),
+            Some("remote-etag-one")
+        );
     }
 
     #[test]
