@@ -121,6 +121,14 @@ async fn async_main() -> Result<()> {
             cli::DebugCommands::ListKeys { config } => {
                 cli::debug::list_keys(config).await?;
             }
+            cli::DebugCommands::ReseedWritebackPredecessor {
+                config,
+                journal,
+                path,
+                sequence,
+            } => {
+                cli::debug::reseed_writeback_predecessor(config, journal, path, sequence).await?;
+            }
         },
         cli::Commands::Checkpoint { subcommand } => match subcommand {
             cli::CheckpointCommands::Create { config, name } => {

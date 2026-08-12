@@ -166,6 +166,23 @@ pub enum DebugCommands {
         #[arg(short, long)]
         config: PathBuf,
     },
+    /// Explicitly repair one pruned writeback predecessor from remote HEAD.
+    ///
+    /// The ZeroFS server must be stopped. This command is intended only for
+    /// upgrading journals created before remote predecessor ETags were retained.
+    ReseedWritebackPredecessor {
+        #[arg(short, long)]
+        config: PathBuf,
+        /// Exact writeback journal namespace containing journal.redb.
+        #[arg(long)]
+        journal: PathBuf,
+        /// Full object-store path reported by the terminal replay error.
+        #[arg(long)]
+        path: String,
+        /// Pruned local sequence reported by the terminal replay error.
+        #[arg(long)]
+        sequence: u64,
+    },
 }
 
 #[derive(Subcommand)]

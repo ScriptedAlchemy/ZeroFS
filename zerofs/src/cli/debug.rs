@@ -7,6 +7,7 @@ use crate::key_management;
 use crate::parse_object_store::parse_url_opts_with_sftp;
 use crate::storage_class_object_store::with_storage_class;
 use anyhow::{Context, Result};
+use object_store::ObjectStoreExt;
 use slatedb::BlockTransformer;
 use slatedb::config::{DurabilityLevel, ScanOptions};
 use slatedb::object_store::path::Path;
@@ -244,6 +245,64 @@ pub async fn list_keys(config_path: PathBuf) -> Result<()> {
             "SFTP debug pool shutdown also failed: {shutdown:#}"
         ))),
     }
+}
+
+pub async fn reseed_writeback_predecessor(
+    config_path: PathBuf,
+    journal_path: PathBuf,
+    path: String,
+    sequence: u64,
+) -> Result<()> {
+    let settings = Settings::from_file(&config_path)
+        .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
+    if !settings
+        .writeback
+        .as_ref()
+        .is_some_and(|writeback| writeback.enabled)
+    {
+        anyhow::bail!("[writeback] must be enabled in the supplied config");
+    }
+    let env_vars = settings.cloud_provider_env_vars();
+    let (remote, _, sftp_pool) = parse_url_opts_with_sftp(
+        &settings.storage.url.parse()?,
+        env_vars,
+        settings.sftp.as_ref(),
+    )
+    .await?;
+    let remote = with_storage_class(Arc::from(remote), settings.storage.storage_class.as_deref());
+    let location = Path::parse(&path).context("invalid remote predecessor path")?;
+    let result: Result<()> = async {
+        let metadata = remote
+            .head(&location)
+            .await
+            .with_context(|| format!("failed to inspect remote predecessor {path}"))?;
+        let e_tag = metadata
+            .e_tag
+            .context("remote predecessor has no ETag and cannot be safely reseeded")?;
+        let journal = crate::writeback::journal::Journal::open_existing(&journal_path)
+            .with_context(|| {
+                format!(
+                    "failed to open stopped writeback journal {}",
+                    journal_path.display()
+                )
+            })?;
+        journal.seed_remote_object_etag(&path, sequence, &e_tag)?;
+        println!(
+            "seeded_remote_predecessor path={} sequence={} etag={}",
+            path, sequence, e_tag
+        );
+        Ok(())
+    }
+    .await;
+    if let Some(pool) = sftp_pool
+        && let Err(cleanup) = pool.shutdown().await
+    {
+        return match result {
+            Ok(()) => Err(cleanup.into()),
+            Err(error) => Err(error.context(format!("SFTP cleanup also failed: {cleanup}"))),
+        };
+    }
+    result
 }
 
 #[cfg(test)]

@@ -93,6 +93,34 @@ pub struct JournalProgress {
 }
 
 impl Journal {
+    pub fn open_existing(root: impl AsRef<Path>) -> Result<Self> {
+        let root = root.as_ref().to_path_buf();
+        let database_path = root.join("journal.redb");
+        if !database_path.is_file() {
+            bail!(
+                "writeback journal database does not exist at {}",
+                database_path.display()
+            );
+        }
+        let database = Database::create(&database_path).with_context(|| {
+            format!(
+                "failed to open existing journal database {}",
+                database_path.display()
+            )
+        })?;
+        let read = database
+            .begin_read()
+            .context("failed to read existing journal identity")?;
+        let meta = read
+            .open_table(META)
+            .context("failed to open existing journal metadata")?;
+        let identity = read_required::<JournalIdentity>(&meta, IDENTITY_KEY)?;
+        drop(meta);
+        drop(read);
+        drop(database);
+        Self::open(root, identity)
+    }
+
     pub fn open(root: impl AsRef<Path>, expected_identity: JournalIdentity) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
         ensure_journal_root(&root)?;
@@ -538,6 +566,58 @@ impl Journal {
         let (published_sequence, e_tag): (Sequence, String) = bincode::deserialize(encoded.value())
             .context("failed to decode remote object version")?;
         Ok((published_sequence == sequence).then_some(e_tag))
+    }
+
+    pub fn seed_remote_object_etag(
+        &self,
+        path: &str,
+        sequence: Sequence,
+        e_tag: &str,
+    ) -> Result<()> {
+        if path.is_empty() || e_tag.is_empty() {
+            bail!("remote object path and ETag must be non-empty");
+        }
+        let progress = self.progress()?;
+        if sequence > progress.remote_seq {
+            bail!(
+                "cannot seed predecessor sequence {sequence} above remote watermark {}",
+                progress.remote_seq
+            );
+        }
+        let mut transaction = self
+            .database
+            .begin_write()
+            .context("failed to seed remote object predecessor")?;
+        transaction
+            .set_durability(Durability::Immediate)
+            .context("failed to set predecessor seed durability")?;
+        {
+            let mut versions = transaction
+                .open_table(REMOTE_OBJECT_VERSIONS)
+                .context("failed to open remote object versions")?;
+            if let Some(existing) = versions
+                .get(path)
+                .context("failed to read existing remote object version")?
+            {
+                let existing: (Sequence, String) = bincode::deserialize(existing.value())
+                    .context("failed to decode existing remote object version")?;
+                if existing == (sequence, e_tag.to_owned()) {
+                    return Ok(());
+                }
+                bail!(
+                    "remote object version for {path} is already seeded at sequence {}",
+                    existing.0
+                );
+            }
+            let encoded = bincode::serialize(&(sequence, e_tag.to_owned()))
+                .context("failed to encode remote object predecessor")?;
+            versions
+                .insert(path, encoded.as_slice())
+                .context("failed to store remote object predecessor")?;
+        }
+        transaction
+            .commit()
+            .context("failed to commit remote object predecessor seed")
     }
 
     pub fn record_remote_failure(&self, sequence: Sequence, error: &str) -> Result<()> {
@@ -1795,6 +1875,53 @@ mod tests {
         assert_eq!(snapshot.remote_seq, 2);
         assert!(snapshot.records.is_empty());
         assert!(!journal.root().join(first.blob_path().unwrap()).exists());
+    }
+
+    #[test]
+    fn explicit_reseed_repairs_a_pruned_predecessor_without_overwriting_conflicts() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("writeback");
+        let journal = open_temp_journal(&temp, "bucket-a");
+        journal
+            .commit_put(put_record(1, "gc/manifest.boundary", b"one"), b"one")
+            .unwrap();
+        journal
+            .mark_remote(1, Some("remote-etag-one".to_owned()))
+            .unwrap();
+        journal.remove_remote_prefix(1).unwrap();
+        let transaction = journal.database.begin_write().unwrap();
+        assert!(transaction.delete_table(REMOTE_OBJECT_VERSIONS).unwrap());
+        transaction.commit().unwrap();
+        drop(journal);
+
+        let reopened = Journal::open_existing(&root).unwrap();
+        assert!(
+            reopened
+                .remote_object_etag("gc/manifest.boundary", 1)
+                .unwrap()
+                .is_none()
+        );
+        reopened
+            .seed_remote_object_etag("gc/manifest.boundary", 1, "remote-etag-one")
+            .unwrap();
+        reopened
+            .seed_remote_object_etag("gc/manifest.boundary", 1, "remote-etag-one")
+            .unwrap();
+        assert_eq!(
+            reopened
+                .remote_object_etag("gc/manifest.boundary", 1)
+                .unwrap()
+                .as_deref(),
+            Some("remote-etag-one")
+        );
+        let conflict = reopened
+            .seed_remote_object_etag("gc/manifest.boundary", 1, "different")
+            .unwrap_err();
+        assert!(format!("{conflict:#}").contains("already seeded"));
+        let future = reopened
+            .seed_remote_object_etag("other", 2, "future")
+            .unwrap_err();
+        assert!(format!("{future:#}").contains("above remote watermark"));
     }
 
     #[test]
