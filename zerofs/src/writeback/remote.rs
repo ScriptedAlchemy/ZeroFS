@@ -1,7 +1,9 @@
 use crate::writeback::admission::DiskAdmission;
 use crate::writeback::journal::Journal;
 use crate::writeback::journaler::{LocalBarrier, LocalBarrierError};
-use crate::writeback::model::{FenceClass, MutationKind, MutationMode, MutationRecord, Sequence};
+use crate::writeback::model::{
+    FenceClass, LocalEtag, MutationKind, MutationMode, MutationRecord, Sequence,
+};
 use crate::writeback::overlay::OverlayIndex;
 use bytes::Bytes;
 use futures::future::BoxFuture;
@@ -591,13 +593,13 @@ async fn apply_record(
         MutationKind::Put { mode, .. }
         | MutationKind::Copy { mode, .. }
         | MutationKind::Rename { mode, .. } => {
+            let options = PutOptions::from(remote_put_mode(*mode, &record, journal.as_ref())?);
             let sequence = record.sequence;
             let bytes = tokio::task::spawn_blocking(move || journal.read_blob(sequence))
                 .await
                 .map_err(|error| generic_error(format!("journal read task failed: {error}")))?
                 .map(Bytes::from)
                 .map_err(|error| generic_error(format!("journal read failed: {error:#}")))?;
-            let options = PutOptions::from(remote_put_mode(*mode, &record));
             let result = match remote
                 .put_opts(&target, bytes.clone().into(), options)
                 .await
@@ -624,17 +626,58 @@ async fn apply_record(
     }
 }
 
-fn remote_put_mode(mode: MutationMode, record: &MutationRecord) -> PutMode {
+fn remote_put_mode(
+    mode: MutationMode,
+    record: &MutationRecord,
+    journal: &Journal,
+) -> object_store::Result<PutMode> {
     match mode {
-        MutationMode::Overwrite => PutMode::Overwrite,
-        MutationMode::Create => PutMode::Create,
-        MutationMode::Update => match record.remote_predecessor_etag.clone() {
-            Some(e_tag) => PutMode::Update(UpdateVersion {
+        MutationMode::Overwrite => Ok(PutMode::Overwrite),
+        MutationMode::Create => Ok(PutMode::Create),
+        MutationMode::Update => {
+            let e_tag = if let Some(e_tag) = record.remote_predecessor_etag.clone() {
+                e_tag
+            } else {
+                let expected = expected_visible_version(record).ok_or_else(|| {
+                    precondition(&record.path, "update has no visible predecessor")
+                })?;
+                let predecessor_sequence =
+                    LocalEtag::sequence_from_str(expected).ok_or_else(|| {
+                        precondition(
+                            &record.path,
+                            "update has no durable remote predecessor ETag",
+                        )
+                    })?;
+                journal
+                    .remote_object_etag(&record.path, predecessor_sequence)
+                    .map_err(|error| {
+                        generic_error(format!(
+                            "failed to resolve remote predecessor for sequence {}: {error:#}",
+                            record.sequence
+                        ))
+                    })?
+                    .ok_or_else(|| {
+                        precondition(
+                            &record.path,
+                            "update remote predecessor ETag is unavailable",
+                        )
+                    })?
+            };
+            Ok(PutMode::Update(UpdateVersion {
                 e_tag: Some(e_tag),
                 version: None,
-            }),
-            None => PutMode::Overwrite,
-        },
+            }))
+        }
+    }
+}
+
+fn expected_visible_version(record: &MutationRecord) -> Option<&str> {
+    match &record.kind {
+        MutationKind::Put {
+            expected_visible_version,
+            ..
+        } => expected_visible_version.as_deref(),
+        _ => None,
     }
 }
 
@@ -687,6 +730,13 @@ fn generic_error(message: impl Into<String>) -> object_store::Error {
     object_store::Error::Generic {
         store: "ZeroFSWritebackRemote",
         source: message.into().into(),
+    }
+}
+
+fn precondition(path: &str, message: &'static str) -> object_store::Error {
+    object_store::Error::Precondition {
+        path: path.to_owned(),
+        source: message.into(),
     }
 }
 

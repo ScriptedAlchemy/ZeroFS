@@ -1,4 +1,6 @@
-use crate::writeback::model::{JournalIdentity, MutationRecord, Sequence};
+use crate::writeback::model::{
+    FenceClass, JournalIdentity, MutationKind, MutationRecord, Sequence,
+};
 use crate::writeback::payload::VerifiedPayload;
 use anyhow::{Context, Result, bail};
 use fs4::fs_std::FileExt;
@@ -18,6 +20,8 @@ use uuid::Uuid;
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 const MUTATIONS: TableDefinition<u64, &[u8]> = TableDefinition::new("mutations");
 const PENDING_BLOBS: TableDefinition<&str, &[u8]> = TableDefinition::new("pending_blobs");
+const REMOTE_OBJECT_VERSIONS: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("remote_object_versions");
 
 const IDENTITY_KEY: &str = "identity";
 const INCARNATION_KEY: &str = "incarnation";
@@ -388,12 +392,55 @@ impl Journal {
                 .insert(sequence, encoded.as_slice())
                 .context("failed to store remote result")?;
             drop(mutations);
+            let mut versions = transaction
+                .open_table(REMOTE_OBJECT_VERSIONS)
+                .context("failed to open remote object versions")?;
+            match &record.kind {
+                MutationKind::Delete => {
+                    versions
+                        .remove(record.path.as_str())
+                        .context("failed to clear deleted remote object version")?;
+                }
+                MutationKind::Rename { source, .. } => {
+                    versions
+                        .remove(source.as_str())
+                        .context("failed to clear renamed remote source version")?;
+                    store_remote_object_version(&mut versions, &record)?;
+                }
+                MutationKind::Put { .. } | MutationKind::Copy { .. } => {
+                    store_remote_object_version(&mut versions, &record)?;
+                }
+            }
+            drop(versions);
             write_value(&mut meta, REMOTE_SEQ_KEY, &sequence)?;
             write_value(&mut meta, REMOTE_BYTES_COMPLETED_KEY, &total_completed)?;
         }
         transaction
             .commit()
             .context("failed to commit remote watermark")
+    }
+
+    pub(crate) fn remote_object_etag(
+        &self,
+        path: &str,
+        sequence: Sequence,
+    ) -> Result<Option<String>> {
+        let read = self
+            .database
+            .begin_read()
+            .context("failed to read remote object version")?;
+        let versions = read
+            .open_table(REMOTE_OBJECT_VERSIONS)
+            .context("failed to open remote object versions")?;
+        let Some(encoded) = versions
+            .get(path)
+            .context("failed to fetch remote object version")?
+        else {
+            return Ok(None);
+        };
+        let (published_sequence, e_tag): (Sequence, String) = bincode::deserialize(encoded.value())
+            .context("failed to decode remote object version")?;
+        Ok((published_sequence == sequence).then_some(e_tag))
     }
 
     pub fn record_remote_failure(&self, sequence: Sequence, error: &str) -> Result<()> {
@@ -830,6 +877,9 @@ fn initialize_or_validate_identity(database: &Database, expected: &JournalIdenti
         transaction
             .open_table(PENDING_BLOBS)
             .context("failed to create pending blob table")?;
+        transaction
+            .open_table(REMOTE_OBJECT_VERSIONS)
+            .context("failed to create remote object versions")?;
     }
     transaction
         .commit()
@@ -874,6 +924,27 @@ fn write_value<T: SerializeValue>(
     table
         .insert(key, encoded.as_slice())
         .with_context(|| format!("failed to write journal metadata key {key}"))?;
+    Ok(())
+}
+
+fn store_remote_object_version(
+    versions: &mut redb::Table<'_, &str, &[u8]>,
+    record: &MutationRecord,
+) -> Result<()> {
+    if record.fence == FenceClass::ImmutableCreate {
+        return Ok(());
+    }
+    let Some(e_tag) = record.remote_result_etag.as_ref() else {
+        versions
+            .remove(record.path.as_str())
+            .context("failed to clear remote object version without an ETag")?;
+        return Ok(());
+    };
+    let encoded = bincode::serialize(&(record.sequence, e_tag))
+        .context("failed to encode remote object version")?;
+    versions
+        .insert(record.path.as_str(), encoded.as_slice())
+        .context("failed to store remote object version")?;
     Ok(())
 }
 

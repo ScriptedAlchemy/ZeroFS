@@ -331,6 +331,9 @@ impl OverlayIndex {
     }
 
     pub async fn list(&self, prefix: Option<&Path>) -> object_store::Result<Vec<ObjectMeta>> {
+        // Snapshot the overlay first so this list linearizes before any remote
+        // publication/removal handoff that may run while the backend streams.
+        let visible = self.visible_entries(prefix).await;
         let mut merged = self
             .remote
             .list(prefix)
@@ -339,7 +342,7 @@ impl OverlayIndex {
             .into_iter()
             .map(|meta| (meta.location.clone(), meta))
             .collect::<BTreeMap<_, _>>();
-        for (path, entry) in self.visible_entries(prefix).await {
+        for (path, entry) in visible {
             match entry.effect {
                 OverlayEffect::Delete => {
                     merged.remove(&path);
@@ -518,14 +521,120 @@ mod tests {
     use crate::writeback::model::{
         FenceClass, JournalIdentity, LocalEtag, MutationKind, MutationMode, MutationRecord,
     };
+    use async_trait::async_trait;
     use bytes::Bytes;
+    use futures::{StreamExt, stream::BoxStream};
     use object_store::memory::InMemory;
     use object_store::path::Path;
-    use object_store::{GetOptions, GetRange, ObjectStore, ObjectStoreExt};
+    use object_store::{
+        CopyOptions, GetOptions, GetRange, GetResult, ListResult, MultipartUpload, ObjectMeta,
+        ObjectStore, ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    };
     use sha2::{Digest, Sha256};
     use std::collections::BTreeMap;
+    use std::fmt::{self, Display, Formatter};
     use std::sync::Arc;
+    use tokio::sync::Notify;
     use uuid::Uuid;
+
+    #[derive(Debug)]
+    struct PausedListStore {
+        inner: Arc<InMemory>,
+        captured: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    impl Display for PausedListStore {
+        fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+            write!(formatter, "PausedListStore")
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for PausedListStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            options: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            self.inner.put_opts(location, payload, options).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            options: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, options).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: GetOptions,
+        ) -> object_store::Result<GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, object_store::Result<Path>>,
+        ) -> BoxStream<'static, object_store::Result<Path>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            let inner = self.inner.clone();
+            let prefix = prefix.cloned();
+            let captured = self.captured.clone();
+            let release = self.release.clone();
+            futures::stream::once(async move {
+                let snapshot = inner
+                    .list(prefix.as_ref())
+                    .collect::<Vec<object_store::Result<ObjectMeta>>>()
+                    .await;
+                captured.notify_one();
+                release.notified().await;
+                snapshot
+            })
+            .flat_map(futures::stream::iter)
+            .boxed()
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    fn paused_list_store(inner: Arc<InMemory>) -> (Arc<dyn ObjectStore>, Arc<Notify>, Arc<Notify>) {
+        let captured = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        (
+            Arc::new(PausedListStore {
+                inner,
+                captured: captured.clone(),
+                release: release.clone(),
+            }),
+            captured,
+            release,
+        )
+    }
 
     fn put_record(sequence: u64, path: &str, payload: &[u8]) -> MutationRecord {
         MutationRecord {
@@ -603,6 +712,72 @@ mod tests {
             .map(|meta| meta.location.to_string())
             .collect::<Vec<_>>();
         assert_eq!(paths, vec!["tree/b", "tree/c"]);
+    }
+
+    #[tokio::test]
+    async fn list_keeps_a_put_visible_while_remote_publication_removes_its_overlay() {
+        let inner = Arc::new(InMemory::new());
+        let (remote, captured, release) = paused_list_store(inner.clone());
+        let overlay = OverlayIndex::new(remote);
+        overlay
+            .install_memory(
+                put_record(1, "tree/object", b"local"),
+                Bytes::from_static(b"local"),
+            )
+            .await
+            .unwrap();
+
+        let listing = tokio::spawn({
+            let overlay = overlay.clone();
+            async move { overlay.list(Some(&Path::from("tree"))).await.unwrap() }
+        });
+        captured.notified().await;
+        inner
+            .put(
+                &Path::from("tree/object"),
+                Bytes::from_static(b"local").into(),
+            )
+            .await
+            .unwrap();
+        overlay.remove_remote_prefix(1).await;
+        release.notify_one();
+
+        let paths = listing
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|meta| meta.location.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(paths, vec!["tree/object"]);
+    }
+
+    #[tokio::test]
+    async fn list_keeps_a_delete_hidden_while_remote_removal_clears_its_tombstone() {
+        let inner = Arc::new(InMemory::new());
+        inner
+            .put(
+                &Path::from("tree/object"),
+                Bytes::from_static(b"remote").into(),
+            )
+            .await
+            .unwrap();
+        let (remote, captured, release) = paused_list_store(inner.clone());
+        let overlay = OverlayIndex::new(remote);
+        overlay
+            .install_delete(delete_record(1, "tree/object"))
+            .await
+            .unwrap();
+
+        let listing = tokio::spawn({
+            let overlay = overlay.clone();
+            async move { overlay.list(Some(&Path::from("tree"))).await.unwrap() }
+        });
+        captured.notified().await;
+        inner.delete(&Path::from("tree/object")).await.unwrap();
+        overlay.remove_remote_prefix(1).await;
+        release.notify_one();
+
+        assert!(listing.await.unwrap().is_empty());
     }
 
     #[tokio::test]

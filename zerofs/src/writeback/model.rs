@@ -120,6 +120,13 @@ impl LocalEtag {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    pub(crate) fn sequence_from_str(value: &str) -> Option<Sequence> {
+        let (namespace_and_incarnation, sequence) = value.rsplit_once(':')?;
+        let incarnation = namespace_and_incarnation.strip_prefix("wb:")?;
+        Uuid::parse_str(incarnation).ok()?;
+        sequence.parse().ok()
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

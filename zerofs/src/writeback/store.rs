@@ -1658,6 +1658,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chained_local_update_preserves_the_published_predecessor_cas() {
+        let (store, remote, _temp, controls) = test_store_with_controls(true).await;
+        let path = Path::from("manifest");
+        remote
+            .put(&path, Bytes::from_static(b"remote-zero").into())
+            .await
+            .unwrap();
+        let remote_zero = remote.head(&path).await.unwrap();
+        controls.block_puts();
+
+        let first = store
+            .put_opts(
+                &path,
+                Bytes::from_static(b"local-one").into(),
+                PutOptions::from(PutMode::Update(UpdateVersion {
+                    e_tag: remote_zero.e_tag,
+                    version: remote_zero.version,
+                })),
+            )
+            .await
+            .unwrap();
+        store
+            .put_opts(
+                &path,
+                Bytes::from_static(b"local-two").into(),
+                PutOptions::from(PutMode::Update(first.into())),
+            )
+            .await
+            .unwrap();
+        store.wait_local(2).await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while controls.put_count() < 1 {
+                controls.put_activity().notified().await;
+            }
+        })
+        .await
+        .expect("first remote update did not start");
+        controls.release_put_path(path.as_ref());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while controls.put_count() < 2 {
+                controls.put_activity().notified().await;
+            }
+        })
+        .await
+        .expect("chained remote update did not start");
+
+        remote
+            .put(&path, Bytes::from_static(b"external").into())
+            .await
+            .unwrap();
+        controls.release_put_path(path.as_ref());
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(400), store.wait_remote(2))
+                .await
+                .is_err(),
+            "chained update overwrote a concurrent remote mutation"
+        );
+        assert_eq!(
+            remote.get(&path).await.unwrap().bytes().await.unwrap(),
+            Bytes::from_static(b"external")
+        );
+        controls.release_puts();
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn delete_stream_preserves_input_order_and_hides_each_path_immediately() {
         let (store, remote, _temp) = test_store().await;
         for path in ["a", "b", "c"] {
