@@ -11,6 +11,7 @@ import subprocess
 import shutil
 import sys
 import tempfile
+import threading
 import tomllib
 import unittest
 from unittest import mock
@@ -151,6 +152,56 @@ class FakeRunner(Runner):
             }
             return CompletedProcess(args, 0, values[property_name] + "\n", "")
         return CompletedProcess(args, 0, "", "")
+
+
+class FakeCollectorProcess:
+    def __init__(self, argv: Sequence[str | Path], events: list[str]) -> None:
+        self.argv = tuple(str(value) for value in argv)
+        self.events = events
+
+    def interrupt_child(self, _signal_child: Any) -> None:
+        self.events.append("interrupt")
+
+    def terminate(self) -> None:
+        self.events.append("terminate")
+
+
+class CollectorRunner(FakeRunner):
+    def __init__(
+        self,
+        events: list[str],
+        sampler_failure: BaseException | None = None,
+    ) -> None:
+        super().__init__()
+        self.events = events
+        self.sampler_failure = sampler_failure
+
+    def spawn(
+        self,
+        argv: Sequence[str | Path],
+        **_kwargs: Any,
+    ) -> Any:
+        args = tuple(str(value) for value in argv)
+        if args[:2] == ("perf", "record"):
+            self.events.append("record-spawned")
+            Path(args[args.index("-o") + 1]).write_bytes(b"perf-data")
+        else:
+            if "enabled" not in self.events:
+                raise AssertionError("sampler started before perf acknowledgement")
+            if self.sampler_failure is not None:
+                raise self.sampler_failure
+            self.events.append(f"sampler-spawned:{args[0]}")
+        return FakeCollectorProcess(argv, self.events)
+
+    def run(
+        self,
+        argv: Sequence[str | Path],
+        **kwargs: Any,
+    ) -> CompletedProcess[str]:
+        args = tuple(str(value) for value in argv)
+        if args[:2] == ("perf", "report"):
+            return CompletedProcess(args, 0, "profile\n", "")
+        return super().run(argv, **kwargs)
 
 
 class CoreTests(unittest.TestCase):
@@ -1807,12 +1858,163 @@ class ProfileTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "missing or empty"):
             _require_perf_data(path)
 
-    def test_perf_record_uses_the_same_monotonic_clock_as_phase_receipts(self) -> None:
-        argv = _perf_record_argv(123, Path("/tmp/perf.data"))
+    def test_perf_record_starts_disabled_with_acknowledged_fifo_control(self) -> None:
+        argv = _perf_record_argv(
+            123,
+            Path("/tmp/perf.data"),
+            Path("/tmp/perf-control.fifo"),
+            Path("/tmp/perf-ack.fifo"),
+        )
 
         self.assertEqual(argv[argv.index("--clockid") + 1], "monotonic")
         self.assertEqual(argv[argv.index("--call-graph") + 1], "fp")
         self.assertIn("--timestamp", argv)
+        self.assertIn("--delay=-1", argv)
+        self.assertEqual(
+            argv[argv.index("--control") + 1],
+            "fifo:/tmp/perf-control.fifo,/tmp/perf-ack.fifo",
+        )
+
+    def test_perf_control_waits_for_enable_ack_and_cleans_fifos(self) -> None:
+        control = profile_module._PerfControlFifos.create(Path(self.temp.name))
+        observed: list[str] = []
+
+        def acknowledge() -> None:
+            with control.control_fifo.open(encoding="utf-8") as source:
+                observed.append(source.readline())
+            with control.ack_fifo.open("w", encoding="utf-8") as sink:
+                sink.write("ack\n")
+
+        worker = threading.Thread(target=acknowledge)
+        worker.start()
+        try:
+            control.enable(timeout=2)
+        finally:
+            control.close()
+            worker.join(timeout=2)
+
+        self.assertEqual(observed, ["enable\n"])
+        self.assertFalse(worker.is_alive())
+        self.assertFalse(control.control_fifo.exists())
+        self.assertFalse(control.ack_fifo.exists())
+
+    def test_perf_control_timeout_cleans_fifos(self) -> None:
+        control = profile_module._PerfControlFifos.create(Path(self.temp.name))
+        self.addCleanup(control.close)
+
+        with (
+            mock.patch.object(
+                profile_module.select,
+                "select",
+                return_value=([], [], []),
+            ),
+            self.assertRaisesRegex(TimeoutError, "did not acknowledge"),
+        ):
+            control.enable(timeout=2)
+
+        self.assertFalse(control.control_fifo.exists())
+        self.assertFalse(control.ack_fifo.exists())
+
+    def test_perf_control_cancellation_cleans_fifos(self) -> None:
+        control = profile_module._PerfControlFifos.create(Path(self.temp.name))
+        self.addCleanup(control.close)
+
+        with (
+            mock.patch.object(
+                profile_module.select,
+                "select",
+                side_effect=KeyboardInterrupt("cancelled"),
+            ),
+            self.assertRaisesRegex(KeyboardInterrupt, "cancelled"),
+        ):
+            control.enable(timeout=2)
+
+        self.assertFalse(control.control_fifo.exists())
+        self.assertFalse(control.ack_fifo.exists())
+
+    def test_collectors_wait_for_perf_ack_before_starting_other_samplers(
+        self,
+    ) -> None:
+        events: list[str] = []
+        control = mock.Mock()
+        control.control_fifo = Path(self.temp.name) / "perf-control.fifo"
+        control.ack_fifo = Path(self.temp.name) / "perf-control-ack.fifo"
+        control.enable.side_effect = lambda **_kwargs: events.append("enabled")
+        receipt = RunReceipt.start(self.config, "profile-readiness")
+
+        with mock.patch.object(
+            profile_module._PerfControlFifos,
+            "create",
+            return_value=control,
+        ):
+            collectors = profile_module.CollectorGroup(
+                CollectorRunner(events), receipt, pid=123
+            )
+            collectors.stop()
+
+        self.assertLess(events.index("record-spawned"), events.index("enabled"))
+        self.assertLess(events.index("enabled"), events.index("sampler-spawned:perf"))
+        control.close.assert_called_once_with()
+
+    def test_collector_start_failure_or_cancellation_cleans_up(
+        self,
+    ) -> None:
+        cases = (
+            (RuntimeError("sampler startup failure"), None),
+            (KeyboardInterrupt("cancelled"), KeyboardInterrupt("cancelled")),
+        )
+        for expected, enable_failure in cases:
+            with self.subTest(expected=type(expected).__name__):
+                events: list[str] = []
+                sampler_failure = expected if enable_failure is None else None
+                runner = CollectorRunner(events, sampler_failure)
+                control = mock.Mock()
+                control.control_fifo = Path(self.temp.name) / "perf-control.fifo"
+                control.ack_fifo = Path(self.temp.name) / "perf-control-ack.fifo"
+                if enable_failure is None:
+                    control.enable.side_effect = lambda **_kwargs: events.append(
+                        "enabled"
+                    )
+                else:
+                    control.enable.side_effect = enable_failure
+                receipt = RunReceipt.start(
+                    self.config, f"profile-start-{type(expected).__name__}"
+                )
+
+                with (
+                    mock.patch.object(
+                        profile_module._PerfControlFifos,
+                        "create",
+                        return_value=control,
+                    ),
+                    self.assertRaisesRegex(type(expected), str(expected)),
+                ):
+                    profile_module.CollectorGroup(runner, receipt, pid=123)
+
+                self.assertIn("interrupt", events)
+                control.close.assert_called_once_with()
+
+    def test_collector_stop_error_still_cleans_control_fifos(self) -> None:
+        receipt = RunReceipt.start(self.config, "profile-stop-failure")
+        receipt.path("perf.data").write_bytes(b"perf-data")
+        broken_handle = mock.Mock()
+        broken_handle.close.side_effect = OSError("injected close failure")
+        control = mock.Mock()
+        collectors = profile_module.CollectorGroup.__new__(
+            profile_module.CollectorGroup
+        )
+        collectors.runner = CollectorRunner([])
+        collectors.receipt = receipt
+        collectors.pid = 123
+        collectors.processes = []
+        collectors.handles = [broken_handle]
+        collectors.perf_control = control
+        collectors._stopped = False
+
+        with self.assertRaisesRegex(RuntimeError, "collector cleanup failures"):
+            collectors.stop()
+
+        control.close.assert_called_once_with()
 
     def test_profile_loads_benchmark_phase_windows_for_perf_slicing(self) -> None:
         receipt = Path(self.temp.name) / "benchmark-receipt"

@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import select
 import shutil
 import tempfile
+import time
 import tomllib
 import uuid
 from dataclasses import dataclass
@@ -23,6 +26,72 @@ _GC_CADENCE_KEYS = (
     "idle_interval_secs",
     "busy_backlog_interval_secs",
 )
+
+
+@dataclass(slots=True)
+class _PerfControlFifos:
+    control_fifo: Path
+    ack_fifo: Path
+    _control_fd: int | None
+    _ack_fd: int | None
+
+    @classmethod
+    def create(cls, directory: Path) -> "_PerfControlFifos":
+        paths = (
+            directory / "perf-control.fifo",
+            directory / "perf-control-ack.fifo",
+        )
+        created: list[Path] = []
+        descriptors: list[int] = []
+        try:
+            for path in paths:
+                os.mkfifo(path, mode=0o600)
+                created.append(path)
+            flags = os.O_RDWR | os.O_NONBLOCK | os.O_CLOEXEC
+            for path in paths:
+                descriptors.append(os.open(path, flags))
+            return cls(paths[0], paths[1], descriptors[0], descriptors[1])
+        except BaseException:
+            for descriptor in descriptors:
+                os.close(descriptor)
+            for path in created:
+                path.unlink(missing_ok=True)
+            raise
+
+    def enable(self, *, timeout: float) -> None:
+        if timeout <= 0:
+            raise ValueError("perf readiness timeout must be positive")
+        if self._control_fd is None or self._ack_fd is None:
+            raise RuntimeError("perf control FIFOs are closed")
+        try:
+            os.write(self._control_fd, b"enable\n")
+            deadline = time.monotonic() + timeout
+            response = bytearray()
+            while b"\n" not in response:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("perf did not acknowledge enable")
+                readable, _, _ = select.select([self._ack_fd], [], [], remaining)
+                if not readable:
+                    raise TimeoutError("perf did not acknowledge enable")
+                chunk = os.read(self._ack_fd, 4096)
+                if not chunk:
+                    raise RuntimeError("perf acknowledgement FIFO closed")
+                response.extend(chunk)
+            if response.partition(b"\n")[0] != b"ack":
+                raise RuntimeError("perf returned an invalid enable acknowledgement")
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        for attribute in ("_control_fd", "_ack_fd"):
+            descriptor = getattr(self, attribute)
+            if descriptor is not None:
+                os.close(descriptor)
+                setattr(self, attribute, None)
+        self.control_fifo.unlink(missing_ok=True)
+        self.ack_fifo.unlink(missing_ok=True)
 
 
 def _phase_perf_report_argv(
@@ -62,7 +131,12 @@ def _require_perf_data(path: Path) -> None:
         raise RuntimeError(f"perf data is missing or empty: {path}")
 
 
-def _perf_record_argv(pid: int, perf_data: Path) -> list[str | Path]:
+def _perf_record_argv(
+    pid: int,
+    perf_data: Path,
+    control_fifo: Path,
+    ack_fifo: Path,
+) -> list[str | Path]:
     return [
         "perf",
         "record",
@@ -74,6 +148,9 @@ def _perf_record_argv(pid: int, perf_data: Path) -> list[str | Path]:
         "--timestamp",
         "--clockid",
         "monotonic",
+        "--delay=-1",
+        "--control",
+        f"fifo:{control_fifo},{ack_fifo}",
         "-p",
         str(pid),
         "-o",
@@ -305,14 +382,50 @@ class _Benchmark(Protocol):
 
 
 class CollectorGroup:
+    _PERF_READY_TIMEOUT = 10.0
+
     def __init__(self, runner: Runner, receipt: RunReceipt, pid: int) -> None:
         self.runner = runner
         self.receipt = receipt
         self.pid = pid
         self.processes: list[tuple[str, ManagedProcess]] = []
         self.handles: list[IO[str]] = []
+        self.perf_control: _PerfControlFifos | None = None
         self._stopped = False
-        self._start()
+        try:
+            self._start()
+        except BaseException as error:
+            self._abort_start(error)
+            raise
+
+    def _abort_start(self, primary: BaseException) -> None:
+        cleanup_errors: list[str] = []
+
+        def interrupt_privileged_child(pid: int) -> None:
+            self.runner.run(["kill", "-INT", str(pid)], sudo=True)
+
+        for mode, process in reversed(self.processes):
+            try:
+                if mode == "interrupt":
+                    process.interrupt_child(interrupt_privileged_child)
+                else:
+                    process.terminate()
+            except BaseException as error:
+                cleanup_errors.append(f"{' '.join(process.argv)}: {error}")
+        for handle in self.handles:
+            try:
+                handle.close()
+            except BaseException as error:
+                cleanup_errors.append(f"collector output: {error}")
+        if self.perf_control is not None:
+            try:
+                self.perf_control.close()
+            except BaseException as error:
+                cleanup_errors.append(f"perf control: {error}")
+        if cleanup_errors:
+            primary.add_note(
+                "collector startup cleanup failures: " + "; ".join(cleanup_errors)
+            )
 
     def _output(self, name: str) -> tuple[Path, IO[str]]:
         path = self.receipt.path(name)
@@ -337,10 +450,18 @@ class CollectorGroup:
         )
 
         perf_data = self.receipt.path("perf.data")
+        self.perf_control = _PerfControlFifos.create(self.receipt.directory)
         perf_record = self.runner.spawn(
-            _perf_record_argv(self.pid, perf_data), sudo=True
+            _perf_record_argv(
+                self.pid,
+                perf_data,
+                self.perf_control.control_fifo,
+                self.perf_control.ack_fifo,
+            ),
+            sudo=True,
         )
         self.processes.append(("interrupt", perf_record))
+        self.perf_control.enable(timeout=self._PERF_READY_TIMEOUT)
 
         perf_stat_path = self.receipt.path("perf-stat.txt")
         perf_stat = self.runner.spawn(
@@ -388,7 +509,15 @@ class CollectorGroup:
             except BaseException as error:
                 errors.append(f"{' '.join(process.argv)}: {error}")
         for handle in self.handles:
-            handle.close()
+            try:
+                handle.close()
+            except BaseException as error:
+                errors.append(f"collector output cleanup: {error}")
+        if self.perf_control is not None:
+            try:
+                self.perf_control.close()
+            except BaseException as error:
+                errors.append(f"perf control cleanup: {error}")
         after = self.runner.run(
             ["cat", f"/proc/{self.pid}/io"], sudo=True, check=False
         ).stdout
