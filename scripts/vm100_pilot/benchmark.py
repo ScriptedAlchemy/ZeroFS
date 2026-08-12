@@ -299,6 +299,14 @@ class BenchmarkRunner:
             self.config.proc_root, device=block_device(self.config.nbd_device)
         )
 
+    def _wait_clean_gc(self) -> WritebackSnapshot:
+        baseline = self.lifecycle.metrics.snapshot().gc_passes
+        return wait_for_gc_quiescence(
+            self.lifecycle.metrics.snapshot,
+            timeout=self.config.drain_timeout,
+            after_pass=baseline,
+        )
+
     def prepare_root(self, run_root: Path) -> None:
         self.config.require_disposable(run_root)
         if run_root.parent.resolve(strict=False) != self.config.mountpoint.resolve(
@@ -379,10 +387,7 @@ class BenchmarkRunner:
             raise ValueError("total MiB must be positive and divisible by jobs")
         self.lifecycle.status()
         self.lifecycle.drain()
-        quiescent = wait_for_gc_quiescence(
-            self.lifecycle.metrics.snapshot,
-            timeout=self.config.drain_timeout,
-        )
+        quiescent = self._wait_clean_gc()
         run_root = self.config.mountpoint / f".zerofs-bench-{uuid.uuid4().hex}"
         per_job_mib = total_mib // jobs
         logical_bytes = total_mib * 1_048_576

@@ -123,12 +123,17 @@ def wait_for_gc_quiescence(
     snapshot: Callable[[], WritebackSnapshot],
     *,
     timeout: float,
+    after_pass: int | None = None,
     stable_samples: int = 4,
     interval: float = 0.25,
     monotonic: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
 ) -> WritebackSnapshot:
-    """Wait for the startup reclaim pass to finish and remain idle."""
+    """Wait for a reclaim pass to finish and remain idle.
+
+    When ``after_pass`` is supplied, an already-idle old epoch is not enough:
+    the caller gets a full clean cadence window immediately after a fresh pass.
+    """
     started = monotonic()
     stable = 0
     last: WritebackSnapshot | None = None
@@ -141,7 +146,8 @@ def wait_for_gc_quiescence(
                 "ZeroFS does not expose zerofs_segment_gc_active; deploy the "
                 "profile-capable build before benchmarking"
             )
-        if not last.gc_active and last.gc_passes > 0:
+        minimum_pass = 1 if after_pass is None else after_pass + 1
+        if not last.gc_active and last.gc_passes >= minimum_pass:
             stable += 1
             if stable >= stable_samples:
                 return last

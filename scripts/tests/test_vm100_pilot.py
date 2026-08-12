@@ -34,6 +34,7 @@ from scripts.vm100_pilot.metrics import (
     WritebackSnapshot,
     wait_for_accepted_after,
     wait_for_drain,
+    wait_for_gc_quiescence,
     wait_for_local,
 )
 from scripts.vm100_pilot.profile import CanonicalDeployment, ProfileRunner
@@ -985,6 +986,25 @@ class BenchmarkTests(unittest.TestCase):
         with self.assertRaisesRegex(BenchmarkContaminatedError, "segment GC"):
             _assert_no_maintenance(before, after)
 
+    def test_gc_quiescence_waits_for_a_fresh_pass_when_requested(self) -> None:
+        snapshots = iter(
+            (
+                WritebackSnapshot(9, 9, 9, 0, 0, 1, 1, False, False, 4, 0, 0),
+                WritebackSnapshot(9, 9, 9, 0, 0, 1, 1, False, True, 5, 0, 0),
+                WritebackSnapshot(9, 9, 9, 0, 0, 1, 1, False, False, 5, 0, 0),
+            )
+        )
+
+        result = wait_for_gc_quiescence(
+            lambda: next(snapshots),
+            timeout=1,
+            after_pass=4,
+            stable_samples=1,
+            interval=0,
+        )
+
+        self.assertEqual(result.gc_passes, 5)
+
     def test_prepare_root_uses_explicit_owner(self) -> None:
         benchmark = BenchmarkRunner(self.config, self.runner, self.lifecycle)  # type: ignore[arg-type]
         run_root = self.config.mountpoint / ".zerofs-bench-test"
@@ -1018,6 +1038,9 @@ class BenchmarkTests(unittest.TestCase):
             def _system_io(self, device: tuple[int, int]) -> SystemIoSnapshot:
                 assert device == (8, 1)
                 return SystemIoSnapshot("sda1", 0, 0, 0, 0, 0, 0, 0)
+
+            def _wait_clean_gc(self) -> WritebackSnapshot:
+                return self.lifecycle.metrics.snapshot()
 
         benchmark = FailingBenchmark(self.config, self.runner, self.lifecycle)  # type: ignore[arg-type]
         with self.assertRaisesRegex(CommandError, "injected fio failure"):
