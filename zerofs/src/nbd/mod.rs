@@ -2,6 +2,7 @@ pub mod error;
 pub mod handler;
 pub mod server;
 
+pub use handler::NbdExportGates;
 pub use server::NBDServer;
 
 fn out_of_bounds(offset: u64, length: u32, device_size: u64) -> bool {

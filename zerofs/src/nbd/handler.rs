@@ -5,17 +5,26 @@ use crate::fs::errors::FsError;
 use crate::fs::inode::Inode;
 use crate::fs::tracing::FileOperation;
 use crate::fs::types::AuthContext;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use deku::DekuContainerWrite;
+use futures::future::try_join_all;
 use nbd_proto::{
     NBD_INFO_EXPORT, NBD_REP_ACK, NBD_REP_ERR_INVALID, NBD_REP_ERR_UNKNOWN, NBD_REP_INFO,
     NBD_REP_SERVER, NBDInfoExport, TRANSMISSION_FLAGS,
 };
-use std::sync::Arc;
+use serde::Deserialize;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex as StdMutex, Weak};
+use tokio::sync::{OwnedRwLockReadGuard, RwLock};
 use tracing::debug;
 
 const NBD_READDIR_DEFAULT_LIMIT: usize = 1000;
 const NBD_ZERO_CHUNK_SIZE: usize = 1024 * 1024;
+const NBD_STRIPE_MARKER: &[u8] = b".zerofs-nbd-stripe-v1";
+const NBD_STRIPE_MANIFEST_MAX_BYTES: u64 = 4096;
+const NBD_STRIPE_MIN_BYTES: u64 = 4096;
+const NBD_STRIPE_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const NBD_STRIPE_MAX_MEMBERS: usize = 32;
 
 /// Response to send back for an option
 pub struct OptionReply {
@@ -52,7 +61,154 @@ pub enum OptionResult {
 pub struct NBDDevice {
     pub name: Vec<u8>,
     pub size: u64,
-    pub inode: u64,
+    backing: NbdBacking,
+    trace_inode: u64,
+    gate: Arc<RwLock<()>>,
+}
+
+#[derive(Clone, Debug)]
+struct NbdMember {
+    inode: u64,
+    size: u64,
+}
+
+#[derive(Clone, Debug)]
+enum NbdBacking {
+    Single {
+        inode: u64,
+        size: u64,
+    },
+    Striped {
+        members: Arc<[NbdMember]>,
+        stripe_bytes: u64,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+struct StripeManifest {
+    version: u32,
+    stripe_bytes: u64,
+    members: Vec<String>,
+}
+
+fn parse_stripe_manifest(data: &[u8]) -> Result<StripeManifest> {
+    let manifest: StripeManifest = serde_json::from_slice(data)
+        .map_err(|error| NBDError::Protocol(format!("invalid striped NBD manifest: {error}")))?;
+    if manifest.version != 1 {
+        return Err(NBDError::Protocol(format!(
+            "unsupported striped NBD manifest version {}",
+            manifest.version
+        )));
+    }
+    if manifest.members.len() < 2 || manifest.members.len() > NBD_STRIPE_MAX_MEMBERS {
+        return Err(NBDError::Protocol(format!(
+            "striped NBD requires 2..={NBD_STRIPE_MAX_MEMBERS} members"
+        )));
+    }
+    if !manifest.stripe_bytes.is_power_of_two()
+        || !(NBD_STRIPE_MIN_BYTES..=NBD_STRIPE_MAX_BYTES).contains(&manifest.stripe_bytes)
+    {
+        return Err(NBDError::Protocol(format!(
+            "striped NBD stripe_bytes must be a power of two in {NBD_STRIPE_MIN_BYTES}..={NBD_STRIPE_MAX_BYTES}"
+        )));
+    }
+    let mut unique = HashSet::with_capacity(manifest.members.len());
+    for member in &manifest.members {
+        if member.is_empty()
+            || member == "."
+            || member == ".."
+            || member.as_bytes() == NBD_STRIPE_MARKER
+            || member.as_bytes().contains(&b'/')
+            || !unique.insert(member.as_bytes().to_vec())
+        {
+            return Err(NBDError::Protocol(
+                "striped NBD member names must be unique direct children".to_string(),
+            ));
+        }
+    }
+    Ok(manifest)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StripeChunk {
+    member_index: usize,
+    inode: u64,
+    member_offset: u64,
+    logical_offset: u64,
+    length: u64,
+}
+
+fn map_stripe_chunks(
+    backing: &NbdBacking,
+    offset: u64,
+    length: u64,
+) -> CommandResult<Vec<StripeChunk>> {
+    if length == 0 {
+        return Ok(Vec::new());
+    }
+    match backing {
+        NbdBacking::Single { inode, size } => {
+            if offset.checked_add(length).is_none_or(|end| end > *size) {
+                return Err(CommandError::InvalidArgument);
+            }
+            Ok(vec![StripeChunk {
+                member_index: 0,
+                inode: *inode,
+                member_offset: offset,
+                logical_offset: 0,
+                length,
+            }])
+        }
+        NbdBacking::Striped {
+            members,
+            stripe_bytes,
+        } => {
+            if members.is_empty() || *stripe_bytes == 0 {
+                return Err(CommandError::InvalidArgument);
+            }
+            let member_count = members.len() as u64;
+            let mut chunks = Vec::new();
+            let mut logical_offset = 0_u64;
+            while logical_offset < length {
+                let position = offset
+                    .checked_add(logical_offset)
+                    .ok_or(CommandError::InvalidArgument)?;
+                let stripe = position / stripe_bytes;
+                let within_stripe = position % stripe_bytes;
+                let member_index = (stripe % member_count) as usize;
+                let row = stripe / member_count;
+                let member_offset = row
+                    .checked_mul(*stripe_bytes)
+                    .and_then(|base| base.checked_add(within_stripe))
+                    .ok_or(CommandError::InvalidArgument)?;
+                let chunk_length = (length - logical_offset).min(*stripe_bytes - within_stripe);
+                let member = &members[member_index];
+                if member_offset
+                    .checked_add(chunk_length)
+                    .is_none_or(|end| end > member.size)
+                {
+                    return Err(CommandError::InvalidArgument);
+                }
+                chunks.push(StripeChunk {
+                    member_index,
+                    inode: member.inode,
+                    member_offset,
+                    logical_offset,
+                    length: chunk_length,
+                });
+                logical_offset += chunk_length;
+            }
+            Ok(chunks)
+        }
+    }
+}
+
+fn group_stripe_chunks(chunks: Vec<StripeChunk>, member_count: usize) -> Vec<Vec<StripeChunk>> {
+    let mut groups = (0..member_count).map(|_| Vec::new()).collect::<Vec<_>>();
+    for chunk in chunks {
+        groups[chunk.member_index].push(chunk);
+    }
+    groups
 }
 
 impl NBDDevice {
@@ -65,14 +221,38 @@ impl NBDDevice {
     }
 }
 
+#[derive(Default)]
+pub struct NbdExportGates {
+    gates: StdMutex<HashMap<Vec<u8>, Weak<RwLock<()>>>>,
+}
+
+impl NbdExportGates {
+    fn for_export(&self, name: &[u8]) -> Arc<RwLock<()>> {
+        let mut gates = self
+            .gates
+            .lock()
+            .expect("NBD export gate registry poisoned");
+        if let Some(gate) = gates.get(name).and_then(Weak::upgrade) {
+            return gate;
+        }
+        let gate = Arc::new(RwLock::new(()));
+        gates.insert(name.to_vec(), Arc::downgrade(&gate));
+        gate
+    }
+}
+
 /// Handler for NBD protocol operations
 pub struct NBDHandler {
     filesystem: Arc<ZeroFS>,
+    export_gates: Arc<NbdExportGates>,
 }
 
 impl NBDHandler {
-    pub fn new(filesystem: Arc<ZeroFS>) -> Self {
-        Self { filesystem }
+    pub fn new(filesystem: Arc<ZeroFS>, export_gates: Arc<NbdExportGates>) -> Self {
+        Self {
+            filesystem,
+            export_gates,
+        }
     }
 
     /// Get the .nbd directory inode
@@ -101,14 +281,14 @@ impl NBDHandler {
                 continue;
             }
 
-            let inode = self.filesystem.inode_store.get(entry.fileid).await?;
-
-            if let Inode::File(file_inode) = inode {
-                devices.push(NBDDevice {
-                    name: name.to_vec(),
-                    size: file_inode.size,
-                    inode: entry.fileid,
-                });
+            match self.resolve_device(name, entry.fileid).await {
+                Ok(device) => devices.push(device),
+                Err(error) => {
+                    debug!(
+                        "skipping invalid NBD export '{}': {error}",
+                        String::from_utf8_lossy(name)
+                    );
+                }
             }
         }
 
@@ -247,29 +427,104 @@ impl NBDHandler {
                 e => NBDError::Filesystem(e),
             })?;
 
-        let inode = self.filesystem.inode_store.get(device_inode).await?;
+        self.resolve_device(name, device_inode).await
+    }
 
-        match inode {
+    async fn resolve_device(&self, name: &[u8], device_inode: u64) -> Result<NBDDevice> {
+        match self.filesystem.inode_store.get(device_inode).await? {
             Inode::File(file_inode) => Ok(NBDDevice {
                 name: name.to_vec(),
                 size: file_inode.size,
-                inode: device_inode,
+                backing: NbdBacking::Single {
+                    inode: device_inode,
+                    size: file_inode.size,
+                },
+                trace_inode: device_inode,
+                gate: self.export_gates.for_export(name),
             }),
+            Inode::Directory(_) => self.resolve_striped_device(name, device_inode).await,
             _ => Err(NBDError::Protocol(format!(
-                "NBD device '{}' is not a regular file",
+                "NBD device '{}' is neither a regular file nor a striped export directory",
                 String::from_utf8_lossy(name)
             ))),
         }
     }
 
-    pub async fn read(
-        &self,
-        inode: u64,
-        offset: u64,
-        length: u32,
-        device_size: u64,
-    ) -> CommandResult<Bytes> {
-        if out_of_bounds(offset, length, device_size) {
+    async fn resolve_striped_device(&self, name: &[u8], directory_inode: u64) -> Result<NBDDevice> {
+        let marker_inode = self
+            .filesystem
+            .directory_store
+            .get(directory_inode, NBD_STRIPE_MARKER)
+            .await
+            .map_err(NBDError::from)?;
+        let marker_size = match self.filesystem.inode_store.get(marker_inode).await? {
+            Inode::File(file) if file.size > 0 && file.size <= NBD_STRIPE_MANIFEST_MAX_BYTES => {
+                file.size
+            }
+            _ => {
+                return Err(NBDError::Protocol(format!(
+                    "striped NBD export '{}' has an invalid manifest file",
+                    String::from_utf8_lossy(name)
+                )));
+            }
+        };
+        let auth = AuthContext::default();
+        let (manifest_bytes, _) = self
+            .filesystem
+            .read_file(&auth, marker_inode, 0, marker_size as u32)
+            .await?;
+        let manifest = parse_stripe_manifest(&manifest_bytes)?;
+        let mut members = Vec::with_capacity(manifest.members.len());
+        let mut member_size = None;
+        for member_name in &manifest.members {
+            let member_inode = self
+                .filesystem
+                .directory_store
+                .get(directory_inode, member_name.as_bytes())
+                .await
+                .map_err(NBDError::from)?;
+            let size = match self.filesystem.inode_store.get(member_inode).await? {
+                Inode::File(file) => file.size,
+                _ => {
+                    return Err(NBDError::Protocol(format!(
+                        "striped NBD member '{member_name}' is not a regular file"
+                    )));
+                }
+            };
+            if size == 0 || size % manifest.stripe_bytes != 0 {
+                return Err(NBDError::Protocol(format!(
+                    "striped NBD member '{member_name}' size must be non-zero and stripe-aligned"
+                )));
+            }
+            if member_size.is_some_and(|expected| expected != size) {
+                return Err(NBDError::Protocol(
+                    "striped NBD members must have equal sizes".to_string(),
+                ));
+            }
+            member_size = Some(size);
+            members.push(NbdMember {
+                inode: member_inode,
+                size,
+            });
+        }
+        let size = member_size
+            .unwrap_or(0)
+            .checked_mul(members.len() as u64)
+            .ok_or_else(|| NBDError::Protocol("striped NBD size overflow".to_string()))?;
+        Ok(NBDDevice {
+            name: name.to_vec(),
+            size,
+            backing: NbdBacking::Striped {
+                members: members.into(),
+                stripe_bytes: manifest.stripe_bytes,
+            },
+            trace_inode: directory_inode,
+            gate: self.export_gates.for_export(name),
+        })
+    }
+
+    pub async fn read(&self, device: &NBDDevice, offset: u64, length: u32) -> CommandResult<Bytes> {
+        if out_of_bounds(offset, length, device.size) {
             return Err(CommandError::InvalidArgument);
         }
 
@@ -277,30 +532,112 @@ impl NBDHandler {
             return Ok(Bytes::new());
         }
 
-        let auth = AuthContext::default();
-        let (data, _) = self
-            .filesystem
-            .read_file(&auth, inode, offset, length)
-            .await?;
-        Ok(data)
+        match &device.backing {
+            NbdBacking::Single { inode, .. } => {
+                let auth = AuthContext::default();
+                let (data, _) = self
+                    .filesystem
+                    .read_file(&auth, *inode, offset, length)
+                    .await?;
+                Ok(data)
+            }
+            NbdBacking::Striped { members, .. } => {
+                let groups = group_stripe_chunks(
+                    map_stripe_chunks(&device.backing, offset, length as u64)?,
+                    members.len(),
+                );
+                let reads = groups
+                    .into_iter()
+                    .filter(|group| !group.is_empty())
+                    .map(|group| {
+                        let filesystem = Arc::clone(&self.filesystem);
+                        async move {
+                            let auth = AuthContext::default();
+                            let mut parts = Vec::with_capacity(group.len());
+                            for chunk in group {
+                                let (data, _) = filesystem
+                                    .read_file(
+                                        &auth,
+                                        chunk.inode,
+                                        chunk.member_offset,
+                                        chunk.length as u32,
+                                    )
+                                    .await?;
+                                parts.push((chunk.logical_offset, data));
+                            }
+                            Ok::<_, FsError>(parts)
+                        }
+                    });
+                let mut output = BytesMut::zeroed(length as usize);
+                for parts in try_join_all(reads).await? {
+                    for (logical_offset, data) in parts {
+                        let start = logical_offset as usize;
+                        output[start..start + data.len()].copy_from_slice(&data);
+                    }
+                }
+                Ok(output.freeze())
+            }
+        }
     }
 
-    pub async fn write(
+    pub(crate) async fn begin_mutation(&self, device: &NBDDevice) -> OwnedRwLockReadGuard<()> {
+        Arc::clone(&device.gate).read_owned().await
+    }
+
+    pub(crate) async fn write_admitted(
         &self,
-        inode: u64,
+        device: &NBDDevice,
         offset: u64,
         data: &Bytes,
         fua: bool,
+        admission: OwnedRwLockReadGuard<()>,
     ) -> CommandResult<()> {
         if data.is_empty() {
             return Ok(());
         }
 
-        let auth = AuthContext::default();
-        self.filesystem.write(&auth, inode, offset, data).await?;
+        if offset
+            .checked_add(data.len() as u64)
+            .is_none_or(|end| end > device.size)
+        {
+            return Err(CommandError::NoSpace);
+        }
+
+        match &device.backing {
+            NbdBacking::Single { inode, .. } => {
+                let auth = AuthContext::default();
+                self.filesystem.write(&auth, *inode, offset, data).await?;
+            }
+            NbdBacking::Striped { members, .. } => {
+                let groups = group_stripe_chunks(
+                    map_stripe_chunks(&device.backing, offset, data.len() as u64)?,
+                    members.len(),
+                );
+                let writes = groups
+                    .into_iter()
+                    .filter(|group| !group.is_empty())
+                    .map(|group| {
+                        let filesystem = Arc::clone(&self.filesystem);
+                        let data = data.clone();
+                        async move {
+                            let auth = AuthContext::default();
+                            for chunk in group {
+                                let start = chunk.logical_offset as usize;
+                                let part = data.slice(start..start + chunk.length as usize);
+                                filesystem
+                                    .write(&auth, chunk.inode, chunk.member_offset, &part)
+                                    .await?;
+                            }
+                            Ok::<_, FsError>(())
+                        }
+                    });
+                try_join_all(writes).await?;
+            }
+        }
+        drop(admission);
 
         if fua {
-            self.flush(inode).await?;
+            self.flush(device).await?;
         }
 
         Ok(())
@@ -308,13 +645,12 @@ impl NBDHandler {
 
     pub async fn trim(
         &self,
-        inode: u64,
+        device: &NBDDevice,
         offset: u64,
         length: u32,
         fua: bool,
-        device_size: u64,
     ) -> CommandResult<()> {
-        if out_of_bounds(offset, length, device_size) {
+        if out_of_bounds(offset, length, device.size) {
             return Err(CommandError::InvalidArgument);
         }
 
@@ -322,13 +658,34 @@ impl NBDHandler {
             return Ok(());
         }
 
-        let auth = AuthContext::default();
-        self.filesystem
-            .trim(&auth, inode, offset, length as u64)
-            .await?;
+        let write_guard = device.gate.read().await;
+        let groups = group_stripe_chunks(
+            map_stripe_chunks(&device.backing, offset, length as u64)?,
+            match &device.backing {
+                NbdBacking::Single { .. } => 1,
+                NbdBacking::Striped { members, .. } => members.len(),
+            },
+        );
+        let trims = groups
+            .into_iter()
+            .filter(|group| !group.is_empty())
+            .map(|group| {
+                let filesystem = Arc::clone(&self.filesystem);
+                async move {
+                    let auth = AuthContext::default();
+                    for chunk in group {
+                        filesystem
+                            .trim(&auth, chunk.inode, chunk.member_offset, chunk.length)
+                            .await?;
+                    }
+                    Ok::<_, FsError>(())
+                }
+            });
+        try_join_all(trims).await?;
+        drop(write_guard);
 
         if fua {
-            self.flush(inode).await?;
+            self.flush(device).await?;
         }
 
         Ok(())
@@ -336,13 +693,12 @@ impl NBDHandler {
 
     pub async fn write_zeroes(
         &self,
-        inode: u64,
+        device: &NBDDevice,
         offset: u64,
         length: u32,
         fua: bool,
-        device_size: u64,
     ) -> CommandResult<()> {
-        if out_of_bounds(offset, length, device_size) {
+        if out_of_bounds(offset, length, device.size) {
             return Err(CommandError::NoSpace);
         }
 
@@ -350,31 +706,44 @@ impl NBDHandler {
             return Ok(());
         }
 
-        let auth = AuthContext::default();
         let zero_chunk = Bytes::from(vec![0u8; NBD_ZERO_CHUNK_SIZE.min(length as usize)]);
-
-        // Write zeros in chunks to avoid huge allocations
-        let mut remaining = length as usize;
-        let mut current_offset = offset;
-
-        while remaining > 0 {
-            let chunk_size = remaining.min(NBD_ZERO_CHUNK_SIZE);
-            let chunk_data = if chunk_size == zero_chunk.len() {
-                &zero_chunk
-            } else {
-                &zero_chunk.slice(..chunk_size)
-            };
-
-            self.filesystem
-                .write(&auth, inode, current_offset, chunk_data)
-                .await?;
-
-            remaining -= chunk_size;
-            current_offset += chunk_size as u64;
-        }
+        let write_guard = device.gate.read().await;
+        let groups = group_stripe_chunks(
+            map_stripe_chunks(&device.backing, offset, length as u64)?,
+            match &device.backing {
+                NbdBacking::Single { .. } => 1,
+                NbdBacking::Striped { members, .. } => members.len(),
+            },
+        );
+        let writes = groups
+            .into_iter()
+            .filter(|group| !group.is_empty())
+            .map(|group| {
+                let filesystem = Arc::clone(&self.filesystem);
+                let zero_chunk = zero_chunk.clone();
+                async move {
+                    let auth = AuthContext::default();
+                    for chunk in group {
+                        let mut remaining = chunk.length as usize;
+                        let mut member_offset = chunk.member_offset;
+                        while remaining > 0 {
+                            let chunk_size = remaining.min(zero_chunk.len());
+                            let chunk_data = zero_chunk.slice(..chunk_size);
+                            filesystem
+                                .write(&auth, chunk.inode, member_offset, &chunk_data)
+                                .await?;
+                            remaining -= chunk_size;
+                            member_offset += chunk_size as u64;
+                        }
+                    }
+                    Ok::<_, FsError>(())
+                }
+            });
+        try_join_all(writes).await?;
+        drop(write_guard);
 
         if fua {
-            self.flush(inode).await?;
+            self.flush(device).await?;
         }
 
         Ok(())
@@ -387,16 +756,236 @@ impl NBDHandler {
         Ok(())
     }
 
-    pub async fn flush(&self, inode: u64) -> CommandResult<()> {
+    pub async fn flush(&self, device: &NBDDevice) -> CommandResult<()> {
+        let _flush_guard = device.gate.write().await;
         self.filesystem
             .client_fsync()
             .await
             .map_err(|_| CommandError::IoError)?;
 
-        self.filesystem
-            .tracer
-            .emit(&self.filesystem.inode_store, inode, FileOperation::Fsync);
+        self.filesystem.tracer.emit(
+            &self.filesystem.inode_store,
+            device.trace_inode,
+            FileOperation::Fsync,
+        );
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        NBDHandler, NbdBacking, NbdExportGates, NbdMember, map_stripe_chunks, parse_stripe_manifest,
+    };
+    use crate::fs::ZeroFS;
+    use crate::fs::permissions::Credentials;
+    use crate::fs::types::{AuthContext, SetAttributes, SetSize};
+    use bytes::Bytes;
+    use std::sync::Arc;
+
+    fn root_credentials() -> Credentials {
+        Credentials {
+            uid: 0,
+            gid: 0,
+            gid_known: true,
+            groups: [0; 16],
+            groups_count: 1,
+            groups_complete: true,
+        }
+    }
+
+    async fn striped_export() -> (Arc<ZeroFS>, NBDHandler, super::NBDDevice) {
+        let filesystem = Arc::new(
+            ZeroFS::new_in_memory()
+                .await
+                .expect("create test filesystem"),
+        );
+        let credentials = root_credentials();
+        let (nbd_dir, _) = filesystem
+            .mkdir(&credentials, 0, b".nbd", &SetAttributes::default())
+            .await
+            .expect("create .nbd directory");
+        let (export_dir, _) = filesystem
+            .mkdir(
+                &credentials,
+                nbd_dir,
+                b"striped-test",
+                &SetAttributes::default(),
+            )
+            .await
+            .expect("create striped export directory");
+        let manifest =
+            br#"{"version":1,"stripe_bytes":4096,"members":["lane-0","lane-1","lane-2","lane-3"]}"#;
+        let (marker_inode, _) = filesystem
+            .create(
+                &credentials,
+                export_dir,
+                super::NBD_STRIPE_MARKER,
+                &SetAttributes::default(),
+            )
+            .await
+            .expect("create stripe manifest");
+        filesystem
+            .write(
+                &AuthContext::default(),
+                marker_inode,
+                0,
+                &Bytes::from_static(manifest),
+            )
+            .await
+            .expect("write stripe manifest");
+
+        for name in [b"lane-0", b"lane-1", b"lane-2", b"lane-3"] {
+            let (inode, _) = filesystem
+                .create(&credentials, export_dir, name, &SetAttributes::default())
+                .await
+                .expect("create stripe member");
+            filesystem
+                .setattr(
+                    &credentials,
+                    inode,
+                    &SetAttributes {
+                        size: SetSize::Set(16 * 1024),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("size stripe member");
+        }
+
+        let handler = NBDHandler::new(Arc::clone(&filesystem), Arc::new(NbdExportGates::default()));
+        let device = handler
+            .get_device(b"striped-test")
+            .await
+            .expect("discover striped export");
+        (filesystem, handler, device)
+    }
+
+    #[test]
+    fn striped_mapping_covers_each_logical_byte_once_across_rows() {
+        let backing = NbdBacking::Striped {
+            members: Arc::from([
+                NbdMember {
+                    inode: 10,
+                    size: 32,
+                },
+                NbdMember {
+                    inode: 11,
+                    size: 32,
+                },
+                NbdMember {
+                    inode: 12,
+                    size: 32,
+                },
+                NbdMember {
+                    inode: 13,
+                    size: 32,
+                },
+            ]),
+            stripe_bytes: 8,
+        };
+
+        let chunks = map_stripe_chunks(&backing, 6, 36).expect("valid mapping");
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|chunk| (
+                    chunk.member_index,
+                    chunk.member_offset,
+                    chunk.logical_offset,
+                    chunk.length,
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, 6, 0, 2),
+                (1, 0, 2, 8),
+                (2, 0, 10, 8),
+                (3, 0, 18, 8),
+                (0, 8, 26, 8),
+                (1, 8, 34, 2),
+            ]
+        );
+        assert_eq!(chunks.iter().map(|chunk| chunk.length).sum::<u64>(), 36);
+    }
+
+    #[test]
+    fn stripe_manifest_requires_a_bounded_aligned_unique_layout() {
+        let manifest = parse_stripe_manifest(
+            br#"{"version":1,"stripe_bytes":1048576,"members":["lane-0","lane-1","lane-2","lane-3"]}"#,
+        )
+        .expect("valid manifest");
+        assert_eq!(manifest.stripe_bytes, 1024 * 1024);
+        assert_eq!(manifest.members.len(), 4);
+
+        for invalid in [
+            br#"{"version":2,"stripe_bytes":1048576,"members":["a","b"]}"#.as_slice(),
+            br#"{"version":1,"stripe_bytes":1000,"members":["a","b"]}"#.as_slice(),
+            br#"{"version":1,"stripe_bytes":1048576,"members":["same","same"]}"#.as_slice(),
+            br#"{"version":1,"stripe_bytes":1048576,"members":["only"]}"#.as_slice(),
+        ] {
+            assert!(parse_stripe_manifest(invalid).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn striped_export_discovers_and_roundtrips_cross_lane_io() {
+        let (_filesystem, handler, device) = striped_export().await;
+        assert_eq!(device.size, 64 * 1024);
+        let payload = Bytes::from(
+            (0..22 * 1024)
+                .map(|index| ((index * 31 + 7) % 251) as u8)
+                .collect::<Vec<_>>(),
+        );
+
+        let admission = handler.begin_mutation(&device).await;
+        handler
+            .write_admitted(&device, 2048, &payload, false, admission)
+            .await
+            .expect("write across stripe rows");
+        let read_back = handler
+            .read(&device, 2048, payload.len() as u32)
+            .await
+            .expect("read across stripe rows");
+
+        assert_eq!(read_back, payload);
+    }
+
+    #[tokio::test]
+    async fn striped_trim_and_write_zeroes_preserve_unaffected_bytes() {
+        let (_filesystem, handler, device) = striped_export().await;
+        let payload = Bytes::from(vec![0x5a; 24 * 1024]);
+        let admission = handler.begin_mutation(&device).await;
+        handler
+            .write_admitted(&device, 0, &payload, false, admission)
+            .await
+            .expect("seed striped export");
+
+        handler
+            .trim(&device, 3 * 1024, 6 * 1024, false)
+            .await
+            .expect("trim across stripes");
+        handler
+            .write_zeroes(&device, 13 * 1024, 5 * 1024, false)
+            .await
+            .expect("write zeroes across stripes");
+        let read_back = handler
+            .read(&device, 0, payload.len() as u32)
+            .await
+            .expect("read modified striped export");
+
+        assert!(read_back[..3 * 1024].iter().all(|byte| *byte == 0x5a));
+        assert!(read_back[3 * 1024..9 * 1024].iter().all(|byte| *byte == 0));
+        assert!(
+            read_back[9 * 1024..13 * 1024]
+                .iter()
+                .all(|byte| *byte == 0x5a)
+        );
+        assert!(
+            read_back[13 * 1024..18 * 1024]
+                .iter()
+                .all(|byte| *byte == 0)
+        );
+        assert!(read_back[18 * 1024..].iter().all(|byte| *byte == 0x5a));
     }
 }

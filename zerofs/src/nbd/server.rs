@@ -1,5 +1,5 @@
 use super::error::{CommandError, NBDError, Result};
-use super::handler::{NBDDevice, NBDHandler, OptionReply, OptionResult};
+use super::handler::{NBDDevice, NBDHandler, NbdExportGates, OptionReply, OptionResult};
 use super::out_of_bounds;
 use crate::fs::ZeroFS;
 use bytes::BytesMut;
@@ -23,20 +23,31 @@ pub enum Transport {
 
 pub struct NBDServer {
     filesystem: Arc<ZeroFS>,
+    export_gates: Arc<NbdExportGates>,
     transport: Transport,
 }
 
 impl NBDServer {
-    pub fn new_tcp(filesystem: Arc<ZeroFS>, socket: SocketAddr) -> Self {
+    pub fn new_tcp(
+        filesystem: Arc<ZeroFS>,
+        export_gates: Arc<NbdExportGates>,
+        socket: SocketAddr,
+    ) -> Self {
         Self {
             filesystem,
+            export_gates,
             transport: Transport::Tcp(socket),
         }
     }
 
-    pub fn new_unix(filesystem: Arc<ZeroFS>, socket_path: impl Into<std::path::PathBuf>) -> Self {
+    pub fn new_unix(
+        filesystem: Arc<ZeroFS>,
+        export_gates: Arc<NbdExportGates>,
+        socket_path: impl Into<std::path::PathBuf>,
+    ) -> Self {
         Self {
             filesystem,
+            export_gates,
             transport: Transport::Unix(socket_path.into()),
         }
     }
@@ -46,10 +57,13 @@ impl NBDServer {
         S: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static,
     {
         let filesystem = Arc::clone(&self.filesystem);
+        let export_gates = Arc::clone(&self.export_gates);
         let client_shutdown = shutdown.child_token();
 
         tokio::spawn(async move {
-            if let Err(e) = handle_client_stream(stream, filesystem, client_shutdown).await {
+            if let Err(e) =
+                handle_client_stream(stream, filesystem, export_gates, client_shutdown).await
+            {
                 error!("Error handling NBD client {}: {}", client_name, e);
             }
         });
@@ -113,6 +127,7 @@ impl NBDServer {
 async fn handle_client_stream<S>(
     stream: S,
     filesystem: Arc<ZeroFS>,
+    export_gates: Arc<NbdExportGates>,
     shutdown: CancellationToken,
 ) -> Result<()>
 where
@@ -122,7 +137,7 @@ where
     let reader = BufReader::new(reader);
     let writer = BufWriter::new(writer);
 
-    let mut session = NBDSession::new(reader, writer, filesystem, shutdown);
+    let mut session = NBDSession::new(reader, writer, filesystem, export_gates, shutdown);
     session.perform_handshake().await?;
 
     match session.negotiate_options().await {
@@ -152,11 +167,17 @@ struct NBDSession<R, W> {
 }
 
 impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
-    fn new(reader: R, writer: W, filesystem: Arc<ZeroFS>, shutdown: CancellationToken) -> Self {
+    fn new(
+        reader: R,
+        writer: W,
+        filesystem: Arc<ZeroFS>,
+        export_gates: Arc<NbdExportGates>,
+        shutdown: CancellationToken,
+    ) -> Self {
         Self {
             reader,
             writer,
-            handler: NBDHandler::new(filesystem),
+            handler: NBDHandler::new(filesystem, export_gates),
             client_no_zeroes: false,
             shutdown,
         }
@@ -425,19 +446,13 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
                 NBDCommand::Read => {
                     let result = self
                         .handler
-                        .read(device.inode, request.offset, request.length, device.size)
+                        .read(&device, request.offset, request.length)
                         .await;
                     self.send_read_result(request.cookie, result).await;
                 }
                 NBDCommand::Write => {
                     let result = self
-                        .read_write_data(
-                            device.inode,
-                            request.offset,
-                            request.length,
-                            fua,
-                            device.size,
-                        )
+                        .read_write_data(&device, request.offset, request.length, fua, device.size)
                         .await;
                     self.send_unit_result(request.cookie, result).await;
                 }
@@ -446,32 +461,20 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
                     return Ok(());
                 }
                 NBDCommand::Flush => {
-                    let result = self.handler.flush(device.inode).await;
+                    let result = self.handler.flush(&device).await;
                     self.send_unit_result(request.cookie, result).await;
                 }
                 NBDCommand::Trim => {
                     let result = self
                         .handler
-                        .trim(
-                            device.inode,
-                            request.offset,
-                            request.length,
-                            fua,
-                            device.size,
-                        )
+                        .trim(&device, request.offset, request.length, fua)
                         .await;
                     self.send_unit_result(request.cookie, result).await;
                 }
                 NBDCommand::WriteZeroes => {
                     let result = self
                         .handler
-                        .write_zeroes(
-                            device.inode,
-                            request.offset,
-                            request.length,
-                            fua,
-                            device.size,
-                        )
+                        .write_zeroes(&device, request.offset, request.length, fua)
                         .await;
                     self.send_unit_result(request.cookie, result).await;
                 }
@@ -497,7 +500,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
     /// Read write data from stream and delegate to handler
     async fn read_write_data(
         &mut self,
-        inode: u64,
+        device: &NBDDevice,
         offset: u64,
         length: u32,
         fua: bool,
@@ -522,6 +525,10 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
             return Ok(());
         }
 
+        // Admission starts when the valid WRITE request is accepted, before
+        // its payload arrives. A FLUSH on another NBD connection must not
+        // overtake a request whose body is still in flight.
+        let admission = self.handler.begin_mutation(device).await;
         let mut data = BytesMut::zeroed(length as usize);
         self.reader
             .read_exact(&mut data)
@@ -529,7 +536,9 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
             .map_err(|_| CommandError::IoError)?;
 
         let data = data.freeze();
-        self.handler.write(inode, offset, &data, fua).await
+        self.handler
+            .write_admitted(device, offset, &data, fua, admission)
+            .await
     }
 
     /// Send read result (with data) as NBD reply
@@ -573,5 +582,137 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
         }
         self.writer.flush().await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::NBDSession;
+    use crate::fs::ZeroFS;
+    use crate::fs::permissions::Credentials;
+    use crate::fs::types::{SetAttributes, SetSize};
+    use crate::nbd::handler::{NBDHandler, NbdExportGates};
+    use std::io;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, ReadBuf};
+    use tokio::sync::oneshot;
+    use tokio::time::{Duration, timeout};
+    use tokio_util::sync::CancellationToken;
+
+    struct BlockingPayload {
+        started: Option<oneshot::Sender<()>>,
+    }
+
+    impl AsyncRead for BlockingPayload {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if let Some(started) = self.started.take() {
+                let _ = started.send(());
+            }
+            Poll::Pending
+        }
+    }
+
+    fn root_credentials() -> Credentials {
+        Credentials {
+            uid: 0,
+            gid: 0,
+            gid_known: true,
+            groups: [0; 16],
+            groups_count: 1,
+            groups_complete: true,
+        }
+    }
+
+    async fn single_file_export(
+        filesystem: &Arc<ZeroFS>,
+        export_gates: &Arc<NbdExportGates>,
+    ) -> crate::nbd::handler::NBDDevice {
+        let credentials = root_credentials();
+        let (nbd_dir, _) = filesystem
+            .mkdir(&credentials, 0, b".nbd", &SetAttributes::default())
+            .await
+            .expect("create .nbd directory");
+        let (inode, _) = filesystem
+            .create(
+                &credentials,
+                nbd_dir,
+                b"flush-ordering-test",
+                &SetAttributes::default(),
+            )
+            .await
+            .expect("create test export");
+        filesystem
+            .setattr(
+                &credentials,
+                inode,
+                &SetAttributes {
+                    size: SetSize::Set(4096),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("size test export");
+
+        NBDHandler::new(Arc::clone(filesystem), Arc::clone(export_gates))
+            .get_device(b"flush-ordering-test")
+            .await
+            .expect("discover test export")
+    }
+
+    #[tokio::test]
+    async fn flush_waits_for_an_earlier_write_whose_payload_is_still_arriving() {
+        let filesystem = Arc::new(
+            ZeroFS::new_in_memory()
+                .await
+                .expect("create test filesystem"),
+        );
+        let export_gates = Arc::new(NbdExportGates::default());
+        let write_device = single_file_export(&filesystem, &export_gates).await;
+        let flush_device = NBDHandler::new(Arc::clone(&filesystem), Arc::clone(&export_gates))
+            .get_device(b"flush-ordering-test")
+            .await
+            .expect("open the same export on another connection");
+
+        let (payload_started_tx, payload_started_rx) = oneshot::channel();
+        let mut write_session = NBDSession::new(
+            BlockingPayload {
+                started: Some(payload_started_tx),
+            },
+            tokio::io::sink(),
+            Arc::clone(&filesystem),
+            Arc::clone(&export_gates),
+            CancellationToken::new(),
+        );
+        let write_task = tokio::spawn(async move {
+            write_session
+                .read_write_data(&write_device, 0, 4096, false, write_device.size)
+                .await
+        });
+        payload_started_rx
+            .await
+            .expect("write reached its blocked payload read");
+
+        let flush_handler = NBDHandler::new(filesystem, export_gates);
+        let mut flush_task = tokio::spawn(async move { flush_handler.flush(&flush_device).await });
+        assert!(
+            timeout(Duration::from_millis(50), &mut flush_task)
+                .await
+                .is_err(),
+            "FLUSH overtook a WRITE whose request was already admitted"
+        );
+
+        write_task.abort();
+        let _ = write_task.await;
+        timeout(Duration::from_secs(2), flush_task)
+            .await
+            .expect("FLUSH resumed after the earlier write was canceled")
+            .expect("FLUSH task did not panic")
+            .expect("FLUSH succeeded");
     }
 }

@@ -5,7 +5,7 @@ use crate::fs::permissions::Credentials;
 use crate::fs::types::SetAttributes;
 use crate::fs::{CacheConfig, GarbageCollector, ZeroFS};
 use crate::length_checked_object_store::LengthCheckedObjectStore;
-use crate::nbd::NBDServer;
+use crate::nbd::{NBDServer, NbdExportGates};
 use crate::object_store_prefetch::PrefetchingObjectStore;
 use crate::parse_object_store::{parse_url_opts, parse_url_opts_with_sftp};
 use crate::storage_class_object_store::with_storage_class;
@@ -237,6 +237,7 @@ async fn start_nbd_servers(
         None => return Vec::new(),
     };
     let mut handles = Vec::new();
+    let export_gates = Arc::new(NbdExportGates::default());
 
     if let Some(addresses) = &config.addresses {
         for addr in addresses {
@@ -244,7 +245,8 @@ async fn start_nbd_servers(
                 "Starting NBD server on {} (devices dynamically discovered from .nbd/)",
                 addr
             );
-            let nbd_tcp_server = NBDServer::new_tcp(Arc::clone(&fs), *addr);
+            let nbd_tcp_server =
+                NBDServer::new_tcp(Arc::clone(&fs), Arc::clone(&export_gates), *addr);
             let shutdown_clone = shutdown.clone();
             handles.push(spawn_named("nbd-server", async move {
                 if let Err(e) = nbd_tcp_server.start(shutdown_clone).await {
@@ -261,7 +263,8 @@ async fn start_nbd_servers(
             "Starting NBD server on Unix socket {} (devices dynamically discovered from .nbd/)",
             socket_path.display()
         );
-        let nbd_unix_server = NBDServer::new_unix(Arc::clone(&fs), socket_path);
+        let nbd_unix_server =
+            NBDServer::new_unix(Arc::clone(&fs), Arc::clone(&export_gates), socket_path);
         let shutdown_clone = shutdown.clone();
         handles.push(spawn_named("nbd-unix-server", async move {
             if let Err(e) = nbd_unix_server.start(shutdown_clone).await {
