@@ -58,6 +58,7 @@ zerofs_writeback_local_sequence 9
 zerofs_writeback_remote_sequence 9
 zerofs_writeback_dirty_ram_bytes 0
 zerofs_writeback_dirty_ssd_bytes 0
+zerofs_writeback_local_bytes_completed_total 1048576
 zerofs_writeback_remote_bytes_completed_total 1048576
 zerofs_writeback_terminal_error 0
 EOF
@@ -122,7 +123,11 @@ case ${1:-} in
 esac
 exit 1'
   make_fake fio 'printf "fio invoked\n" >>"$FAKE_CALL_LOG"; for arg in "$@"; do case $arg in --output=*) output=${arg#--output=} ;; esac; done; [[ -z ${output:-} ]] || printf "WRITE: bw=1MiB/s\n" >"$output"; exit "${FAKE_FIO_RC:-0}"'
-  make_fake sync 'exit 0'
+  make_fake sync '
+if [[ ${FAKE_ADVANCE_LOCAL_DURABLE:-0} == 1 ]]; then
+  sed -i.bak "s/zerofs_writeback_local_bytes_completed_total 1048576/zerofs_writeback_local_bytes_completed_total 3145728/" "$FAKE_METRICS_FILE"
+fi
+exit 0'
   make_fake fallocate 'target=${@: -1}; : >"$target"'
   make_fake sftp '
 input=$(cat)
@@ -246,6 +251,7 @@ test_status_records_runtime_and_durability_receipt() {
   run_pilot status >"$FIXTURE/out" 2>"$FIXTURE/err"
   grep -q '^running_binary_sha256=' "$FIXTURE/out" || return 1
   grep -q '^config_sha256=' "$FIXTURE/out" || return 1
+  grep -q '^zerofs_writeback_local_bytes_completed_total=1048576$' "$FIXTURE/out" || return 1
   grep -q 'writeback_enabled=true ack_mode=memory' "$FIXTURE/out"
 }
 
@@ -260,12 +266,20 @@ test_failed_benchmark_cleans_sampler_and_keeps_evidence() {
   find "$FIXTURE/results" -name 'storage-*-metrics.csv' | grep -q . || return 1
 }
 
-test_successful_benchmark_labels_local_boundary_without_fake_throughput() {
+test_successful_benchmark_reports_measured_local_durable_throughput() {
   new_fixture
-  ZEROFS_BENCH_TOTAL_MIB=4 ZEROFS_BENCH_JOBS=1 run_pilot benchmark >"$FIXTURE/out" 2>"$FIXTURE/err"
+  FAKE_ADVANCE_LOCAL_DURABLE=1 ZEROFS_BENCH_TOTAL_MIB=4 ZEROFS_BENCH_JOBS=1 run_pilot benchmark >"$FIXTURE/out" 2>"$FIXTURE/err"
   result=$(find "$FIXTURE/results" -name 'storage-*.txt' ! -name '*-status.txt' ! -name '*-drain.txt' ! -name '*-fio.txt' | head -1)
-  grep -q 'local_sync_wait_ms=.*throughput=not_computable_without_local_durable_byte_counter' "$result" || return 1
-  if grep -q 'local_flush_MiBps' "$result"; then return 1; fi
+  grep -q 'local_durable_bytes=2097152' "$result" || return 1
+  grep -q 'local_sync_wait_ms=.*local_durable_end_to_end_ms=.*foreground_to_local_durable_MiBps=' "$result" || return 1
+  if grep -q 'throughput=not_computable_without_local_durable_byte_counter' "$result"; then return 1; fi
+  local line sync_ms end_ms actual_mibps expected_mibps
+  line=$(grep '^local_durable_bytes=' "$result")
+  sync_ms=$(sed -E 's/.*local_sync_wait_ms=([0-9]+).*/\1/' <<<"$line")
+  end_ms=$(sed -E 's/.*local_durable_end_to_end_ms=([0-9]+).*/\1/' <<<"$line")
+  actual_mibps=$(sed -E 's/.*foreground_to_local_durable_MiBps=([0-9.]+).*/\1/' <<<"$line")
+  expected_mibps=$(awk -v ms="$end_ms" 'BEGIN { printf "%.2f", 2/(ms/1000) }')
+  [[ $end_ms -gt $sync_ms && $actual_mibps == "$expected_mibps" ]] || return 1
   grep -q 'remote_first_drained_end_to_end_ms=' "$result" || return 1
   grep -q 'first_drained_epoch_ms=' "$FIXTURE/results"/storage-*-drain.txt
 }
@@ -301,7 +315,7 @@ run_test test_wait_drain_fails_before_sleep_on_terminal_error
 run_test test_status_rejects_unexpected_ack_mode
 run_test test_status_records_runtime_and_durability_receipt
 run_test test_failed_benchmark_cleans_sampler_and_keeps_evidence
-run_test test_successful_benchmark_labels_local_boundary_without_fake_throughput
+run_test test_successful_benchmark_reports_measured_local_durable_throughput
 run_test test_raw_sftp_reaps_all_eight_override_workers_after_one_fails
 run_test test_raw_sftp_defaults_to_seven_matched_streams_and_records_bytes
 

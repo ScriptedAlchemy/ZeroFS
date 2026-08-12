@@ -74,6 +74,7 @@ mod model_contract_tests {
             dirty_ssd_capacity_bytes: 512,
             dirty_ssd_operations: 2,
             oldest_pending_age_ms: 6,
+            local_bytes_completed: 11,
             remote_bytes_completed: 7,
             remote_operations_completed: 5,
             retries: 2,

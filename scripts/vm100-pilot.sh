@@ -191,7 +191,8 @@ status() {
   for name in \
     zerofs_writeback_accepted_sequence zerofs_writeback_local_sequence \
     zerofs_writeback_remote_sequence zerofs_writeback_dirty_ram_bytes \
-    zerofs_writeback_dirty_ssd_bytes zerofs_writeback_terminal_error; do
+    zerofs_writeback_dirty_ssd_bytes zerofs_writeback_local_bytes_completed_total \
+    zerofs_writeback_terminal_error; do
     printf '%s=%s\n' "$name" "$(metric_from "$name" "$snapshot")"
   done
 }
@@ -282,18 +283,19 @@ setup() {
 
 sample_metrics() {
   local output=$1 stop_file=$2
-  printf 'timestamp_ms,accepted,local,remote,dirty_ram,dirty_ssd,remote_bytes\n' >"$output"
+  printf 'timestamp_ms,accepted,local,remote,dirty_ram,dirty_ssd,local_bytes,remote_bytes\n' >"$output"
   while [[ ! -e $stop_file ]]; do
     local snapshot now
     snapshot=$(metrics_snapshot) || { sleep .25; continue; }
     now=$(date +%s%3N)
-    printf '%s,%s,%s,%s,%s,%s,%s\n' \
+    printf '%s,%s,%s,%s,%s,%s,%s,%s\n' \
       "$now" \
       "$(metric_from zerofs_writeback_accepted_sequence "$snapshot")" \
       "$(metric_from zerofs_writeback_local_sequence "$snapshot")" \
       "$(metric_from zerofs_writeback_remote_sequence "$snapshot")" \
       "$(metric_from zerofs_writeback_dirty_ram_bytes "$snapshot")" \
       "$(metric_from zerofs_writeback_dirty_ssd_bytes "$snapshot")" \
+      "$(metric_from zerofs_writeback_local_bytes_completed_total "$snapshot")" \
       "$(metric_from zerofs_writeback_remote_bytes_completed_total "$snapshot")" >>"$output"
     sleep .25
   done
@@ -353,9 +355,10 @@ benchmark() {
   sample_metrics "$sample" "$stop_file" &
   local sampler=$!
   BENCH_SAMPLER=$sampler
-  local snapshot bytes0 bytes1 t0 t1 t2 t3
+  local snapshot local_bytes0 local_bytes1 remote_bytes0 remote_bytes1 t0 t1 t2 t3
   snapshot=$(metrics_snapshot)
-  bytes0=$(metric_from zerofs_writeback_remote_bytes_completed_total "$snapshot")
+  local_bytes0=$(metric_from zerofs_writeback_local_bytes_completed_total "$snapshot")
+  remote_bytes0=$(metric_from zerofs_writeback_remote_bytes_completed_total "$snapshot")
   t0=$(date +%s%3N)
   sudo fio --name=zerofs_user_write --directory="$MOUNTPOINT" \
     "--filename_format=$prefix.\$jobnum" --rw=write --bs=1M \
@@ -365,29 +368,33 @@ benchmark() {
   t1=$(date +%s%3N)
   sudo sync -f "$MOUNTPOINT"
   t2=$(date +%s%3N)
+  snapshot=$(metrics_snapshot)
+  local_bytes1=$(metric_from zerofs_writeback_local_bytes_completed_total "$snapshot")
   wait_drain "$DRAIN_TIMEOUT" >"$drain_output"
   t3=$(date +%s%3N)
   snapshot=$(metrics_snapshot)
-  bytes1=$(metric_from zerofs_writeback_remote_bytes_completed_total "$snapshot")
+  remote_bytes1=$(metric_from zerofs_writeback_remote_bytes_completed_total "$snapshot")
   touch "$stop_file"
   BENCH_SAMPLER=
   wait "$sampler"
   local user_ms=$((t1 - t0)) local_ms=$((t2 - t1)) end_ms=$((t3 - t0))
-  local logical_bytes=$((total_mib * 1024 * 1024)) remote_bytes=$((bytes1 - bytes0))
-  local user_mibps remote_wall_mibps remote_active first_drained_epoch_ms first_drained_ms
+  local logical_bytes=$((total_mib * 1024 * 1024))
+  local local_durable_bytes=$((local_bytes1 - local_bytes0)) remote_bytes=$((remote_bytes1 - remote_bytes0))
+  local user_mibps local_durable_mibps remote_wall_mibps remote_active first_drained_epoch_ms first_drained_ms
   user_mibps=$(awk -v b="$logical_bytes" -v ms="$user_ms" 'BEGIN { printf "%.2f", b/1048576/(ms/1000) }')
+  local_durable_mibps=$(awk -v b="$local_durable_bytes" -v ms="$((t2 - t0))" 'BEGIN { if (ms>0) printf "%.2f", b/1048576/(ms/1000); else print "0.00" }')
   remote_wall_mibps=$(awk -v b="$remote_bytes" -v ms="$end_ms" 'BEGIN { printf "%.2f", b/1048576/(ms/1000) }')
   first_drained_epoch_ms=$(awk '{ for (i=1; i<=NF; i++) if ($i ~ /^first_drained_epoch_ms=/) { sub(/^[^=]*=/, "", $i); print $i; exit } }' "$drain_output")
   first_drained_ms=$((first_drained_epoch_ms - t0))
-  remote_active=$(awk -F, 'NR==2 { base=$7; prev=$7 } NR>2 && $7>prev { if (!first) first=$1; last=$1; prev=$7 } END { if (first && last>first) print last-first; else print 0 }' "$sample")
+  remote_active=$(awk -F, 'NR==2 { base=$8; prev=$8 } NR>2 && $8>prev { if (!first) first=$1; last=$1; prev=$8 } END { if (first && last>first) print last-first; else print 0 }' "$sample")
   local remote_active_mibps
   remote_active_mibps=$(awk -v b="$remote_bytes" -v ms="$remote_active" 'BEGIN { if (ms>0) printf "%.2f", b/1048576/(ms/1000); else print "0.00" }')
   {
     printf 'commit=%s\n' "$(git -C "$ROOT" rev-parse HEAD)"
     printf 'logical_bytes=%s remote_bytes=%s\n' "$logical_bytes" "$remote_bytes"
     printf 'user_experienced_ms=%s user_experienced_MiBps=%s durability=volatile_page_cache_and_memory_ack\n' "$user_ms" "$user_mibps"
-    printf 'local_sync_wait_ms=%s local_durable_end_to_end_ms=%s durability=zerofs_ssd_journal throughput=not_computable_without_local_durable_byte_counter\n' \
-      "$local_ms" "$((t2 - t0))"
+    printf 'local_durable_bytes=%s local_sync_wait_ms=%s local_durable_end_to_end_ms=%s foreground_to_local_durable_MiBps=%s durability=zerofs_ssd_journal\n' \
+      "$local_durable_bytes" "$local_ms" "$((t2 - t0))" "$local_durable_mibps"
     printf 'remote_first_drained_end_to_end_ms=%s remote_stable_end_to_end_ms=%s remote_wall_MiBps=%s remote_active_ms=%s remote_active_MiBps=%s durability=storage_box_sftp_ack\n' \
       "$first_drained_ms" "$end_ms" "$remote_wall_mibps" "$remote_active" "$remote_active_mibps"
     grep -E 'WRITE:|write: IOPS' "$fio_output" | tail -n 3

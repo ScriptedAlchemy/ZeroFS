@@ -181,6 +181,7 @@ pub struct WritebackStatus {
     pub dirty_ssd_capacity_bytes: u64,
     pub dirty_ssd_operations: u64,
     pub oldest_pending_age_ms: u64,
+    pub local_bytes_completed: u64,
     pub remote_bytes_completed: u64,
     pub remote_operations_completed: u64,
     pub retries: u64,

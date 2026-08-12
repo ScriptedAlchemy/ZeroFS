@@ -273,6 +273,7 @@ fn record_writeback_status(status: &WritebackStatus) {
         .set(status.local_seq.saturating_sub(status.remote_seq) as f64);
     gauge!("zerofs_writeback_oldest_pending_age_seconds")
         .set(status.oldest_pending_age_ms as f64 / 1_000.0);
+    counter!("zerofs_writeback_local_bytes_completed_total").absolute(status.local_bytes_completed);
     counter!("zerofs_writeback_remote_bytes_completed_total")
         .absolute(status.remote_bytes_completed);
     counter!("zerofs_writeback_remote_operations_completed_total")
@@ -346,6 +347,7 @@ mod tests {
             dirty_ssd_capacity_bytes: 512,
             dirty_ssd_operations: 2,
             oldest_pending_age_ms: 6_000,
+            local_bytes_completed: 11,
             remote_bytes_completed: 7,
             remote_operations_completed: 5,
             retries: 2,
@@ -362,6 +364,7 @@ mod tests {
             "zerofs_writeback_remote_lag_operations 4",
             "zerofs_writeback_ssd_remote_lag_operations 3",
             "zerofs_writeback_oldest_pending_age_seconds 6",
+            "zerofs_writeback_local_bytes_completed_total 11",
             "zerofs_writeback_remote_bytes_completed_total 7",
             "zerofs_writeback_retries_total 2",
             "zerofs_writeback_terminal_error 1",

@@ -219,6 +219,7 @@ impl WritebackObjectStore {
             dirty_ssd_capacity_bytes: self.inner.settings.disk_bytes,
             dirty_ssd_operations: progress.local_seq.saturating_sub(progress.remote_seq),
             oldest_pending_age_ms,
+            local_bytes_completed: progress.local_bytes_completed,
             remote_bytes_completed: progress.remote_bytes_completed,
             remote_operations_completed: progress.remote_seq,
             retries: progress.remote_retries,
@@ -1550,6 +1551,7 @@ mod tests {
         assert_eq!(status.dirty_ssd_bytes, 7);
         assert_eq!(status.dirty_ssd_capacity_bytes, 10_000_000);
         assert_eq!(status.dirty_ssd_operations, 1);
+        assert_eq!(status.local_bytes_completed, 7);
         assert!(status.oldest_pending_age_ms < 10_000);
         store.shutdown().await.unwrap();
     }

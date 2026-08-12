@@ -26,6 +26,7 @@ const REMOTE_OBJECT_VERSIONS: TableDefinition<&str, &[u8]> =
 const IDENTITY_KEY: &str = "identity";
 const INCARNATION_KEY: &str = "incarnation";
 const LOCAL_SEQ_KEY: &str = "local_seq";
+const LOCAL_BYTES_COMPLETED_KEY: &str = "local_bytes_completed";
 const REMOTE_SEQ_KEY: &str = "remote_seq";
 const REMOTE_BYTES_COMPLETED_KEY: &str = "remote_bytes_completed";
 const REMOTE_RETRIES_KEY: &str = "remote_retries";
@@ -54,6 +55,7 @@ pub struct JournalSnapshot {
     pub incarnation: Uuid,
     pub local_seq: Sequence,
     pub remote_seq: Sequence,
+    pub local_bytes_completed: u64,
     pub remote_bytes_completed: u64,
     pub remote_retries: u64,
     pub records: Vec<MutationRecord>,
@@ -66,6 +68,7 @@ pub struct JournalSnapshot {
 pub struct JournalProgress {
     pub local_seq: Sequence,
     pub remote_seq: Sequence,
+    pub local_bytes_completed: u64,
     pub remote_bytes_completed: u64,
     pub remote_retries: u64,
 }
@@ -112,6 +115,7 @@ impl Journal {
         }
 
         initialize_or_validate_identity(&database, &expected_identity)?;
+        backfill_local_payload_bytes(&database)?;
         backfill_remote_object_versions(&database)?;
         let journal = Self {
             root,
@@ -148,6 +152,7 @@ impl Journal {
         let incarnation = read_required::<Uuid>(&meta, INCARNATION_KEY)?;
         let local_seq = read_required::<u64>(&meta, LOCAL_SEQ_KEY)?;
         let remote_seq = read_required::<u64>(&meta, REMOTE_SEQ_KEY)?;
+        let local_bytes_completed = read_required::<u64>(&meta, LOCAL_BYTES_COMPLETED_KEY)?;
         let remote_bytes_completed =
             read_optional::<u64>(&meta, REMOTE_BYTES_COMPLETED_KEY)?.unwrap_or_default();
         let remote_retries = read_optional::<u64>(&meta, REMOTE_RETRIES_KEY)?.unwrap_or_default();
@@ -195,6 +200,7 @@ impl Journal {
             incarnation,
             local_seq,
             remote_seq,
+            local_bytes_completed,
             remote_bytes_completed,
             remote_retries,
             records,
@@ -225,6 +231,7 @@ impl Journal {
         Ok(JournalProgress {
             local_seq: read_required::<u64>(&meta, LOCAL_SEQ_KEY)?,
             remote_seq: read_required::<u64>(&meta, REMOTE_SEQ_KEY)?,
+            local_bytes_completed: read_required::<u64>(&meta, LOCAL_BYTES_COMPLETED_KEY)?,
             remote_bytes_completed: read_optional::<u64>(&meta, REMOTE_BYTES_COMPLETED_KEY)?
                 .unwrap_or_default(),
             remote_retries: read_optional::<u64>(&meta, REMOTE_RETRIES_KEY)?.unwrap_or_default(),
@@ -652,6 +659,11 @@ impl Journal {
                     record.sequence
                 );
             }
+            let completed_bytes = record.payload().map_or(0, |(payload_len, _)| payload_len);
+            let total_completed = read_optional::<u64>(&meta, LOCAL_BYTES_COMPLETED_KEY)?
+                .unwrap_or_default()
+                .checked_add(completed_bytes)
+                .context("local completed byte counter overflow")?;
             let encoded =
                 bincode::serialize(record).context("failed to encode journal mutation")?;
             let mut table = transaction
@@ -670,6 +682,7 @@ impl Journal {
                     .context("failed to clear pending blob")?;
             }
             write_value(&mut meta, LOCAL_SEQ_KEY, &record.sequence)?;
+            write_value(&mut meta, LOCAL_BYTES_COMPLETED_KEY, &total_completed)?;
         }
         transaction
             .commit()
@@ -861,6 +874,7 @@ fn initialize_or_validate_identity(database: &Database, expected: &JournalIdenti
                 write_value(&mut meta, IDENTITY_KEY, expected)?;
                 write_value(&mut meta, INCARNATION_KEY, &Uuid::new_v4())?;
                 write_value(&mut meta, LOCAL_SEQ_KEY, &0_u64)?;
+                write_value(&mut meta, LOCAL_BYTES_COMPLETED_KEY, &0_u64)?;
                 write_value(&mut meta, REMOTE_SEQ_KEY, &0_u64)?;
                 write_value(&mut meta, REMOTE_BYTES_COMPLETED_KEY, &0_u64)?;
                 write_value(&mut meta, REMOTE_RETRIES_KEY, &0_u64)?;
@@ -926,6 +940,60 @@ fn backfill_remote_object_versions(database: &Database) -> Result<()> {
     transaction
         .commit()
         .context("failed to commit remote object version migration")
+}
+
+fn backfill_local_payload_bytes(database: &Database) -> Result<()> {
+    let mut transaction = database
+        .begin_write()
+        .context("failed to migrate local completed byte counter")?;
+    transaction
+        .set_durability(Durability::Immediate)
+        .context("failed to set local byte counter migration durability")?;
+    let (remote_seq, remote_bytes_completed, counter_exists) = {
+        let meta = transaction
+            .open_table(META)
+            .context("failed to open journal metadata for local byte migration")?;
+        (
+            read_required::<u64>(&meta, REMOTE_SEQ_KEY)?,
+            read_optional::<u64>(&meta, REMOTE_BYTES_COMPLETED_KEY)?.unwrap_or_default(),
+            read_optional::<u64>(&meta, LOCAL_BYTES_COMPLETED_KEY)?.is_some(),
+        )
+    };
+    if counter_exists {
+        return Ok(());
+    }
+    let pending_bytes = {
+        let mutations = transaction
+            .open_table(MUTATIONS)
+            .context("failed to open journal mutations for local byte migration")?;
+        let mut total = 0_u64;
+        if let Some(first_pending) = remote_seq.checked_add(1) {
+            for entry in mutations
+                .range(first_pending..)
+                .context("failed to scan pending mutations for local byte migration")?
+            {
+                let (_, value) = entry.context("failed to read local byte migration record")?;
+                let record: MutationRecord = bincode::deserialize(value.value())
+                    .context("failed to decode local byte migration record")?;
+                total = total
+                    .checked_add(record.payload().map_or(0, |(payload_len, _)| payload_len))
+                    .context("local completed byte counter migration overflow")?;
+            }
+        }
+        total
+    };
+    let local_bytes_completed = remote_bytes_completed
+        .checked_add(pending_bytes)
+        .context("local completed byte counter migration overflow")?;
+    {
+        let mut meta = transaction
+            .open_table(META)
+            .context("failed to open journal metadata for local byte migration")?;
+        write_value(&mut meta, LOCAL_BYTES_COMPLETED_KEY, &local_bytes_completed)?;
+    }
+    transaction
+        .commit()
+        .context("failed to commit local completed byte counter migration")
 }
 
 fn read_required<T: serde::de::DeserializeOwned>(
@@ -1378,6 +1446,60 @@ mod tests {
         assert_eq!(snapshot.remote_seq, 0);
         assert_eq!(snapshot.records, vec![committed]);
         assert_eq!(reopened.read_blob(1).unwrap(), b"payload");
+    }
+
+    #[test]
+    fn local_payload_bytes_advance_atomically_with_the_local_watermark_and_survive_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = open_temp_journal(&temp, "bucket-a");
+
+        journal
+            .commit_put(put_record(1, "segments/1", b"payload"), b"payload")
+            .unwrap();
+        let after_put = journal.progress().unwrap();
+        assert_eq!(after_put.local_seq, 1);
+        assert_eq!(after_put.local_bytes_completed, 7);
+
+        journal
+            .commit_metadata(delete_record(2, "obsolete"))
+            .unwrap();
+        let after_metadata = journal.progress().unwrap();
+        assert_eq!(after_metadata.local_seq, 2);
+        assert_eq!(after_metadata.local_bytes_completed, 7);
+
+        journal
+            .commit_put(put_record(3, "segments/3", b"abc"), b"abc")
+            .unwrap();
+        assert_eq!(journal.progress().unwrap().local_bytes_completed, 10);
+        drop(journal);
+
+        let reopened = open_temp_journal(&temp, "bucket-a");
+        let progress = reopened.progress().unwrap();
+        assert_eq!(progress.local_seq, 3);
+        assert_eq!(progress.local_bytes_completed, 10);
+    }
+
+    #[test]
+    fn opening_a_pre_counter_journal_restores_the_monotonic_local_payload_total() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = open_temp_journal(&temp, "bucket-a");
+        journal
+            .commit_put(put_record(1, "segments/1", b"payload"), b"payload")
+            .unwrap();
+        journal
+            .commit_metadata(delete_record(2, "obsolete"))
+            .unwrap();
+        let transaction = journal.database.begin_write().unwrap();
+        {
+            let mut meta = transaction.open_table(super::META).unwrap();
+            meta.remove(super::LOCAL_BYTES_COMPLETED_KEY).unwrap();
+        }
+        transaction.commit().unwrap();
+        drop(journal);
+
+        let reopened = open_temp_journal(&temp, "bucket-a");
+
+        assert_eq!(reopened.progress().unwrap().local_bytes_completed, 7);
     }
 
     #[test]
