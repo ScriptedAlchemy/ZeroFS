@@ -552,10 +552,39 @@ fn load_scheduler_window(
 ) -> anyhow::Result<SchedulerWindow> {
     let progress = journal.progress()?;
     let scan_limit = upload_concurrency.saturating_mul(8).max(upload_concurrency);
-    Ok(SchedulerWindow {
+    let window = SchedulerWindow {
         local_seq: progress.local_seq,
         records: journal.pending_from(first_sequence, scan_limit)?,
-    })
+    };
+    validate_scheduler_window(&window, first_sequence)?;
+    Ok(window)
+}
+
+fn validate_scheduler_window(
+    window: &SchedulerWindow,
+    first_sequence: Sequence,
+) -> anyhow::Result<()> {
+    if window.local_seq < first_sequence {
+        return Ok(());
+    }
+    let mut expected = first_sequence;
+    for record in &window.records {
+        if record.sequence != expected {
+            anyhow::bail!(
+                "durable writeback journal is missing remote frontier sequence {expected}; found sequence {}",
+                record.sequence
+            );
+        }
+        expected = expected
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("remote scheduler sequence overflow"))?;
+    }
+    if window.records.is_empty() {
+        anyhow::bail!(
+            "durable writeback journal is missing remote frontier sequence {first_sequence}"
+        );
+    }
+    Ok(())
 }
 
 fn collect_pipeline_batch(
@@ -566,9 +595,22 @@ fn collect_pipeline_batch(
     active: &BTreeSet<Sequence>,
 ) -> Vec<MutationRecord> {
     let held_limit = limit.saturating_mul(4).max(limit);
-    let available = limit
+    let mut available = limit
         .saturating_sub(active.len())
         .min(held_limit.saturating_sub(completed.len()));
+    let frontier_needs_slot = records.first().is_some_and(|record| {
+        record.sequence == first_sequence
+            && !completed.contains_key(&first_sequence)
+            && !active.contains(&first_sequence)
+    });
+    if available == 0 && frontier_needs_slot && active.len() < limit {
+        // Speculative immutable uploads may fill the held-completion budget
+        // while an earlier ordering fence is retrying. Always reserve enough
+        // execution capacity for that frontier; otherwise the scheduler spins
+        // forever with a full completion map and can never advance its journal
+        // watermark.
+        available = 1;
+    }
     if available == 0 {
         return Vec::new();
     }
@@ -814,7 +856,10 @@ fn missing_remote_predecessor(
 
 #[cfg(test)]
 mod tests {
-    use super::{CompletedRemote, bounded_remote_operation, collect_pipeline_batch};
+    use super::{
+        CompletedRemote, SchedulerWindow, bounded_remote_operation, collect_pipeline_batch,
+        validate_scheduler_window,
+    };
     use crate::writeback::model::{FenceClass, LocalEtag, MutationKind, MutationRecord};
     use futures::future;
     use object_store::PutResult;
@@ -949,6 +994,54 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![1, 3, 5, 7]
         );
+    }
+
+    #[test]
+    fn held_completion_cap_never_blocks_the_remote_frontier() {
+        let records = (1_u64..=17)
+            .map(|sequence| {
+                record(
+                    sequence,
+                    &format!("segments/{sequence}"),
+                    FenceClass::ImmutableCreate,
+                )
+            })
+            .collect::<Vec<_>>();
+        let completed = (2_u64..=17)
+            .map(|sequence| {
+                (
+                    sequence,
+                    CompletedRemote {
+                        record: records[(sequence - 1) as usize].clone(),
+                        e_tag: None,
+                    },
+                )
+            })
+            .collect();
+
+        let batch = collect_pipeline_batch(&records, 1, 4, &completed, &Default::default());
+
+        assert_eq!(
+            batch
+                .iter()
+                .map(|record| record.sequence)
+                .collect::<Vec<_>>(),
+            vec![1],
+            "held speculative completions must reserve one slot for the ordering frontier"
+        );
+    }
+
+    #[test]
+    fn scheduler_window_rejects_a_missing_durable_frontier() {
+        let window = SchedulerWindow {
+            local_seq: 3,
+            records: vec![record(2, "segments/2", FenceClass::ImmutableCreate)],
+        };
+
+        let error = validate_scheduler_window(&window, 1)
+            .expect_err("a durable journal gap must fail closed instead of spinning");
+
+        assert!(error.to_string().contains("sequence 1"));
     }
 
     #[test]
