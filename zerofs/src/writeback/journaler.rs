@@ -117,6 +117,7 @@ struct LocalJournalerInner {
     admission_gate: Mutex<()>,
     closed: AtomicBool,
     join: Mutex<Option<JoinHandle<()>>>,
+    shutdown_result: watch::Sender<Option<Result<(), LocalBarrierError>>>,
 }
 
 enum JournalCommand {
@@ -193,6 +194,7 @@ impl LocalJournaler {
             terminal_error: None,
             closed: false,
         });
+        let (shutdown_result, _) = watch::channel(None);
         let join = tokio::spawn(run_journaler(
             sink,
             admission,
@@ -209,6 +211,7 @@ impl LocalJournaler {
                 admission_gate: Mutex::new(()),
                 closed: AtomicBool::new(false),
                 join: Mutex::new(Some(join)),
+                shutdown_result,
             }),
         }
     }
@@ -291,30 +294,73 @@ impl LocalJournaler {
     }
 
     pub async fn shutdown(&self) -> Result<(), LocalBarrierError> {
-        let receiver = {
+        let mut completion = self.inner.shutdown_result.subscribe();
+        let mut local_progress = self.inner.barrier.progress.clone();
+        let mut local_progress_open = true;
+        {
             let _gate = self.inner.admission_gate.lock().await;
-            if self.inner.closed.swap(true, Ordering::AcqRel) {
-                None
-            } else {
-                let (sender, receiver) = oneshot::channel();
-                self.inner
-                    .sender
-                    .send(JournalCommand::Shutdown(sender))
-                    .await
-                    .ok();
-                Some(receiver)
+            if !self.inner.closed.swap(true, Ordering::AcqRel) {
+                let inner = self.inner.clone();
+                tokio::spawn(async move {
+                    drive_shutdown(inner).await;
+                });
             }
-        };
-        if let Some(receiver) = receiver {
-            let _ = receiver.await;
         }
-        if let Some(join) = self.inner.join.lock().await.take() {
-            join.await.map_err(|error| {
-                LocalBarrierError::LocalDurability(format!("journal worker panicked: {error}"))
-            })?;
+
+        loop {
+            if let Some(error) = local_progress.borrow().terminal_error.clone() {
+                return Err(LocalBarrierError::LocalDurability(error));
+            }
+            if let Some(result) = completion.borrow().clone() {
+                return result;
+            }
+            tokio::select! {
+                result = completion.changed() => {
+                    if result.is_err() {
+                        return Err(terminal_or_closed(&self.inner.barrier));
+                    }
+                }
+                result = local_progress.changed(), if local_progress_open => {
+                    if result.is_err() {
+                        local_progress_open = false;
+                    }
+                }
+            }
         }
-        Ok(())
     }
+}
+
+async fn drive_shutdown(inner: Arc<LocalJournalerInner>) {
+    let mut outcome = None;
+    let (done, acknowledged) = oneshot::channel();
+    if inner
+        .sender
+        .send(JournalCommand::Shutdown(done))
+        .await
+        .is_err()
+    {
+        outcome = Some(Err(terminal_or_closed(&inner.barrier)));
+    } else if acknowledged.await.is_err() {
+        outcome = Some(Err(current_terminal(&inner.barrier).unwrap_or_else(|| {
+            LocalBarrierError::LocalDurability(
+                "journal worker dropped the shutdown acknowledgement".to_owned(),
+            )
+        })));
+    }
+
+    if let Some(join) = inner.join.lock().await.take()
+        && let Err(error) = join.await
+    {
+        outcome = Some(Err(LocalBarrierError::LocalDurability(format!(
+            "journal worker panicked: {error}"
+        ))));
+    }
+    if let Some(error) = current_terminal(&inner.barrier) {
+        outcome = Some(Err(error));
+    }
+    inner
+        .shutdown_result
+        .send_replace(Some(outcome.unwrap_or(Ok(()))));
 }
 
 async fn run_journaler(
@@ -450,6 +496,8 @@ async fn run_journaler(
     }
 
     if let Some(error) = terminal {
+        admission.poison(error.clone());
+        progress.send_modify(|state| state.terminal_error = Some(error.clone()));
         while let Some(result) = preparations.next().await {
             if let Ok((_, Ok(mutation), _, _)) = result {
                 let _ = sink.discard(mutation);
@@ -460,8 +508,6 @@ async fn run_journaler(
                 let _ = sink.discard(mutation);
             }
         }
-        admission.poison(error.clone());
-        progress.send_modify(|state| state.terminal_error = Some(error));
     } else {
         admission.close();
     }
@@ -472,13 +518,16 @@ async fn run_journaler(
 }
 
 fn terminal_or_closed(barrier: &LocalBarrier) -> LocalBarrierError {
+    current_terminal(barrier).unwrap_or(LocalBarrierError::Closed)
+}
+
+fn current_terminal(barrier: &LocalBarrier) -> Option<LocalBarrierError> {
     barrier
         .progress
         .borrow()
         .terminal_error
         .clone()
         .map(LocalBarrierError::LocalDurability)
-        .unwrap_or(LocalBarrierError::Closed)
 }
 
 #[cfg(test)]
@@ -930,7 +979,48 @@ mod tests {
         assert!(sink.published.lock().unwrap().is_empty());
         assert_eq!(*sink.discarded.lock().unwrap(), vec![2]);
         assert_eq!(admission.used_bytes(), 0);
-        journaler.shutdown().await.unwrap();
+        assert!(matches!(
+            journaler.shutdown().await,
+            Err(LocalBarrierError::LocalDurability(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn known_preparation_failure_wakes_barriers_before_blocked_cleanup_finishes() {
+        let admission = Admission::new(20);
+        let (journaler, mut entered, _prepared, releases, _sink) =
+            controlled_journaler(admission.clone(), 1..=2, Some(1));
+        for sequence in 1..=2 {
+            let ram = admission.reserve(1).await.unwrap().accept();
+            journaler
+                .submit_put(put_record(sequence, b"x"), Bytes::from_static(b"x"), ram)
+                .await
+                .unwrap();
+        }
+        let mut started = [entered.recv().await.unwrap(), entered.recv().await.unwrap()];
+        started.sort_unstable();
+        assert_eq!(started, [1, 2]);
+
+        releases[&1].send(()).unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_millis(250),
+            journaler.barrier().wait_local(1),
+        )
+        .await;
+        releases[&2].send(()).unwrap();
+
+        assert!(
+            matches!(result, Ok(Err(LocalBarrierError::LocalDurability(_)))),
+            "the known failure stayed hidden behind blocked cleanup: {result:?}"
+        );
+        assert!(matches!(
+            admission.reserve(1).await,
+            Err(AdmissionError::Poisoned(_))
+        ));
+        assert!(matches!(
+            journaler.shutdown().await,
+            Err(LocalBarrierError::LocalDurability(_))
+        ));
     }
 
     #[tokio::test]
@@ -956,7 +1046,10 @@ mod tests {
             Err(AdmissionError::Poisoned(_))
         ));
         assert_eq!(admission.used_bytes(), 0);
-        journaler.shutdown().await.unwrap();
+        assert!(matches!(
+            journaler.shutdown().await,
+            Err(LocalBarrierError::LocalDurability(_))
+        ));
     }
 
     #[tokio::test]
@@ -1054,5 +1147,83 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error, LocalBarrierError::Closed);
+    }
+
+    #[tokio::test]
+    async fn canceled_shutdown_while_queue_is_full_does_not_lose_shutdown_ownership() {
+        let admission = Admission::new(10);
+        let (entered_tx, mut entered) = tokio_mpsc::unbounded_channel();
+        let (release, release_rx) = mpsc::channel();
+        let sink = Arc::new(BlockingSink {
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+            fail_sequence: None,
+            committed: Mutex::new(Vec::new()),
+            prepared_operations: AtomicU64::new(0),
+            prepared_payload_bytes: AtomicU64::new(0),
+        });
+        let journaler =
+            LocalJournaler::start_with_sink_and_observer(sink, admission.clone(), 0, 1, 1, None);
+        let first = admission.reserve(1).await.unwrap().accept();
+        journaler
+            .submit_put(put_record(1, b"x"), Bytes::from_static(b"x"), first)
+            .await
+            .unwrap();
+        assert_eq!(entered.recv().await.unwrap(), 1);
+        let second = admission.reserve(1).await.unwrap().accept();
+        journaler
+            .submit_put(put_record(2, b"x"), Bytes::from_static(b"x"), second)
+            .await
+            .unwrap();
+
+        let first_shutdown = tokio::spawn({
+            let journaler = journaler.clone();
+            async move { journaler.shutdown().await }
+        });
+        while !journaler.inner.closed.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        assert!(!first_shutdown.is_finished());
+        first_shutdown.abort();
+        assert!(first_shutdown.await.unwrap_err().is_cancelled());
+
+        let mut second_shutdown = tokio::spawn({
+            let journaler = journaler.clone();
+            async move { journaler.shutdown().await }
+        });
+        release.send(()).unwrap();
+        assert_eq!(entered.recv().await.unwrap(), 2);
+        release.send(()).unwrap();
+
+        let result = tokio::time::timeout(Duration::from_millis(250), &mut second_shutdown).await;
+        if result.is_err() {
+            second_shutdown.abort();
+        }
+        assert!(
+            matches!(result, Ok(Ok(Ok(())))),
+            "second shutdown did not complete: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_surfaces_the_stored_local_durability_failure() {
+        let admission = Admission::new(10);
+        let (journaler, mut entered, release, _) = blocking_journaler(admission.clone(), Some(1));
+        let ram = admission.reserve(1).await.unwrap().accept();
+        journaler
+            .submit_put(put_record(1, b"x"), Bytes::from_static(b"x"), ram)
+            .await
+            .unwrap();
+        assert_eq!(entered.recv().await.unwrap(), 1);
+        release.send(()).unwrap();
+        assert!(matches!(
+            journaler.barrier().wait_local(1).await,
+            Err(LocalBarrierError::LocalDurability(_))
+        ));
+
+        assert!(matches!(
+            journaler.shutdown().await,
+            Err(LocalBarrierError::LocalDurability(_))
+        ));
     }
 }
