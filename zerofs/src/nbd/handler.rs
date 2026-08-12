@@ -2,7 +2,7 @@ use super::error::{CommandError, CommandResult, NBDError, Result};
 use super::out_of_bounds;
 use super::{
     NBD_STRIPE_MARKER, NBD_STRIPE_MAX_BYTES, NBD_STRIPE_MAX_MEMBERS, NBD_STRIPE_MIN_BYTES,
-    StripeManifest,
+    StripeManifest, is_nbd_provision_staging_name,
 };
 use crate::fs::ZeroFS;
 use crate::fs::errors::FsError;
@@ -437,6 +437,9 @@ impl NBDHandler {
     }
 
     async fn resolve_device(&self, name: &[u8], device_inode: u64) -> Result<NBDDevice> {
+        if is_nbd_provision_staging_name(name) {
+            return Err(NBDError::DeviceNotFound(name.to_vec()));
+        }
         match self.filesystem.inode_store.get(device_inode).await? {
             Inode::File(file_inode) => Ok(NBDDevice {
                 name: name.to_vec(),
@@ -731,14 +734,19 @@ impl NBDHandler {
 #[cfg(test)]
 mod tests {
     use super::{
-        CommandError, NBDHandler, NbdBacking, NbdExportGates, NbdMember, map_stripe_chunks,
-        parse_stripe_manifest,
+        CommandError, NBDError, NBDHandler, NbdBacking, NbdExportGates, NbdMember, OptionResult,
+        map_stripe_chunks, parse_stripe_manifest,
     };
     use crate::fs::ZeroFS;
     use crate::fs::permissions::Credentials;
     use crate::fs::types::{AuthContext, SetAttributes, SetSize};
     use bytes::Bytes;
+    use nbd_proto::{NBD_REP_ACK, NBD_REP_ERR_UNKNOWN, NBD_REP_INFO, NBD_REP_SERVER};
     use std::sync::Arc;
+
+    const PUBLISHED_EXPORT: &[u8] = b"vm100";
+    const STAGING_EXPORT: &[u8] = b".zerofs-nbd-provision-v1-00000000-0000-0000-0000-000000000000";
+    const NEAR_PREFIX_EXPORT: &[u8] = b".zerofs-nbd-provision-v1-archive";
 
     fn root_credentials() -> Credentials {
         Credentials {
@@ -751,24 +759,10 @@ mod tests {
         }
     }
 
-    async fn striped_export() -> (Arc<ZeroFS>, NBDHandler, super::NBDDevice) {
-        let filesystem = Arc::new(
-            ZeroFS::new_in_memory()
-                .await
-                .expect("create test filesystem"),
-        );
+    async fn create_striped_export(filesystem: &Arc<ZeroFS>, nbd_dir: u64, name: &[u8]) {
         let credentials = root_credentials();
-        let (nbd_dir, _) = filesystem
-            .mkdir(&credentials, 0, b".nbd", &SetAttributes::default())
-            .await
-            .expect("create .nbd directory");
         let (export_dir, _) = filesystem
-            .mkdir(
-                &credentials,
-                nbd_dir,
-                b"striped-test",
-                &SetAttributes::default(),
-            )
+            .mkdir(&credentials, nbd_dir, name, &SetAttributes::default())
             .await
             .expect("create striped export directory");
         let manifest =
@@ -809,6 +803,20 @@ mod tests {
                 .await
                 .expect("size stripe member");
         }
+    }
+
+    async fn striped_export() -> (Arc<ZeroFS>, NBDHandler, super::NBDDevice) {
+        let filesystem = Arc::new(
+            ZeroFS::new_in_memory()
+                .await
+                .expect("create test filesystem"),
+        );
+        let credentials = root_credentials();
+        let (nbd_dir, _) = filesystem
+            .mkdir(&credentials, 0, b".nbd", &SetAttributes::default())
+            .await
+            .expect("create .nbd directory");
+        create_striped_export(&filesystem, nbd_dir, b"striped-test").await;
 
         let handler = NBDHandler::new(Arc::clone(&filesystem), Arc::new(NbdExportGates::default()));
         let device = handler
@@ -856,6 +864,30 @@ mod tests {
             .await
             .expect("discover single-file export");
         (filesystem, handler, device, inode)
+    }
+
+    async fn handler_with_published_and_staging_exports() -> NBDHandler {
+        let filesystem = Arc::new(
+            ZeroFS::new_in_memory()
+                .await
+                .expect("create test filesystem"),
+        );
+        let (nbd_dir, _) = filesystem
+            .mkdir(&root_credentials(), 0, b".nbd", &SetAttributes::default())
+            .await
+            .expect("create .nbd directory");
+        create_striped_export(&filesystem, nbd_dir, PUBLISHED_EXPORT).await;
+        create_striped_export(&filesystem, nbd_dir, STAGING_EXPORT).await;
+        create_striped_export(&filesystem, nbd_dir, NEAR_PREFIX_EXPORT).await;
+        NBDHandler::new(filesystem, Arc::new(NbdExportGates::default()))
+    }
+
+    fn export_option_payload(name: &[u8]) -> Vec<u8> {
+        let mut payload = Vec::with_capacity(4 + name.len() + 2);
+        payload.extend_from_slice(&(name.len() as u32).to_be_bytes());
+        payload.extend_from_slice(name);
+        payload.extend_from_slice(&0_u16.to_be_bytes());
+        payload
     }
 
     #[test]
@@ -1064,5 +1096,138 @@ mod tests {
 
         assert_eq!(devices.len(), DEVICE_COUNT);
         assert!(devices.iter().any(|device| device.name == b"device-1004"));
+    }
+
+    #[tokio::test]
+    async fn list_hides_a_completed_provisioning_staging_export() {
+        let handler = handler_with_published_and_staging_exports().await;
+
+        let replies = match handler.list().await {
+            OptionResult::Continue(replies) => replies,
+            OptionResult::Done(_, _) => panic!("LIST unexpectedly completed negotiation"),
+            OptionResult::Error(_, _) => panic!("LIST unexpectedly failed"),
+        };
+        let names = replies
+            .into_iter()
+            .filter(|reply| reply.reply_type == NBD_REP_SERVER)
+            .map(|reply| {
+                let name_length = u32::from_be_bytes(
+                    reply.data[..4]
+                        .try_into()
+                        .expect("LIST reply contains a name length"),
+                ) as usize;
+                assert_eq!(reply.data.len(), 4 + name_length);
+                reply.data[4..].to_vec()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            names,
+            vec![PUBLISHED_EXPORT.to_vec(), NEAR_PREFIX_EXPORT.to_vec()]
+        );
+    }
+
+    #[tokio::test]
+    async fn info_rejects_a_completed_provisioning_staging_export() {
+        let handler = handler_with_published_and_staging_exports().await;
+
+        let replies = match handler.info(&export_option_payload(STAGING_EXPORT)).await {
+            OptionResult::Continue(replies) => replies,
+            OptionResult::Done(_, _) => panic!("INFO unexpectedly completed negotiation"),
+            OptionResult::Error(_, _) => panic!("INFO unexpectedly aborted negotiation"),
+        };
+
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].reply_type, NBD_REP_ERR_UNKNOWN);
+    }
+
+    #[tokio::test]
+    async fn go_rejects_a_completed_provisioning_staging_export() {
+        let handler = handler_with_published_and_staging_exports().await;
+
+        match handler.go(&export_option_payload(STAGING_EXPORT)).await {
+            OptionResult::Error(NBDError::DeviceNotFound(name), replies) => {
+                assert_eq!(name, STAGING_EXPORT);
+                assert_eq!(replies.len(), 1);
+                assert_eq!(replies[0].reply_type, NBD_REP_ERR_UNKNOWN);
+            }
+            OptionResult::Continue(_) => panic!("GO unexpectedly continued negotiation"),
+            OptionResult::Done(_, _) => panic!("GO attached the staging export"),
+            OptionResult::Error(_, _) => panic!("GO returned the wrong error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn get_device_rejects_a_completed_provisioning_staging_export() {
+        let handler = handler_with_published_and_staging_exports().await;
+
+        assert!(matches!(
+            handler.get_device(STAGING_EXPORT).await,
+            Err(NBDError::DeviceNotFound(name)) if name == STAGING_EXPORT
+        ));
+        assert_eq!(
+            handler
+                .get_device(PUBLISHED_EXPORT)
+                .await
+                .expect("published export remains attachable")
+                .name,
+            PUBLISHED_EXPORT
+        );
+    }
+
+    #[tokio::test]
+    async fn info_accepts_a_legitimate_near_prefix_export() {
+        let handler = handler_with_published_and_staging_exports().await;
+
+        let replies = match handler
+            .info(&export_option_payload(NEAR_PREFIX_EXPORT))
+            .await
+        {
+            OptionResult::Continue(replies) => replies,
+            OptionResult::Done(_, _) => panic!("INFO unexpectedly completed negotiation"),
+            OptionResult::Error(_, _) => panic!("INFO rejected the legitimate export"),
+        };
+
+        assert_eq!(
+            replies
+                .iter()
+                .map(|reply| reply.reply_type)
+                .collect::<Vec<_>>(),
+            vec![NBD_REP_INFO, NBD_REP_ACK]
+        );
+    }
+
+    #[tokio::test]
+    async fn go_accepts_a_legitimate_near_prefix_export() {
+        let handler = handler_with_published_and_staging_exports().await;
+
+        match handler.go(&export_option_payload(NEAR_PREFIX_EXPORT)).await {
+            OptionResult::Done(device, replies) => {
+                assert_eq!(device.name, NEAR_PREFIX_EXPORT);
+                assert_eq!(
+                    replies
+                        .iter()
+                        .map(|reply| reply.reply_type)
+                        .collect::<Vec<_>>(),
+                    vec![NBD_REP_INFO, NBD_REP_ACK]
+                );
+            }
+            OptionResult::Continue(_) => panic!("GO unexpectedly continued negotiation"),
+            OptionResult::Error(_, _) => panic!("GO rejected the legitimate export"),
+        }
+    }
+
+    #[tokio::test]
+    async fn get_device_accepts_a_legitimate_near_prefix_export() {
+        let handler = handler_with_published_and_staging_exports().await;
+
+        assert_eq!(
+            handler
+                .get_device(NEAR_PREFIX_EXPORT)
+                .await
+                .expect("near-prefix export remains attachable")
+                .name,
+            NEAR_PREFIX_EXPORT
+        );
     }
 }

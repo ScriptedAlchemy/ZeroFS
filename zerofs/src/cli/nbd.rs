@@ -1,6 +1,7 @@
 use crate::nbd::{
-    NBD_STRIPE_MARKER as STRIPE_MARKER, NBD_STRIPE_MAX_BYTES as MAX_STRIPE_BYTES,
-    NBD_STRIPE_MAX_MEMBERS, NBD_STRIPE_MIN_BYTES as MIN_STRIPE_BYTES, StripeManifest,
+    NBD_PROVISION_STAGING_PREFIX as PROVISION_PREFIX, NBD_STRIPE_MARKER as STRIPE_MARKER,
+    NBD_STRIPE_MAX_BYTES as MAX_STRIPE_BYTES, NBD_STRIPE_MAX_MEMBERS,
+    NBD_STRIPE_MIN_BYTES as MIN_STRIPE_BYTES, StripeManifest, is_nbd_provision_staging_name,
 };
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -8,7 +9,6 @@ use std::collections::HashSet;
 use zerofs_client::{Client, OpenOptions, ZeroFsError};
 
 const PROVISION_MARKER: &str = ".zerofs-nbd-provision-v1";
-const PROVISION_PREFIX: &str = ".zerofs-nbd-provision-v1-";
 const STRIPE_TEMP_PREFIX: &str = ".zerofs-nbd-stripe-v1-";
 
 /// A validated striped NBD export geometry.
@@ -35,8 +35,11 @@ impl StripedLayout {
             || export_name == ".."
             || export_name.as_bytes().contains(&b'/')
             || export_name.len() > 255
+            || is_nbd_provision_staging_name(export_name.as_bytes())
         {
-            bail!("export name must be a non-empty direct child name of at most 255 bytes");
+            bail!(
+                "export name must be a non-empty, non-reserved direct child name of at most 255 bytes"
+            );
         }
         if usize::from(lanes) < 2 || usize::from(lanes) > NBD_STRIPE_MAX_MEMBERS {
             bail!("lane count must be in 2..={NBD_STRIPE_MAX_MEMBERS}");
@@ -392,7 +395,7 @@ async fn find_matching_staging(client: &Client, layout: &StripedLayout) -> Resul
     {
         if !entry.metadata.is_dir()
             || !entry.name_is_utf8
-            || !entry.name.starts_with(PROVISION_PREFIX)
+            || !is_nbd_provision_staging_name(entry.name.as_bytes())
         {
             continue;
         }
@@ -883,6 +886,30 @@ mod tests {
         assert!(StripedLayout::new("vm100", 64 * GIB + 1, 4, MIB).is_err());
     }
 
+    #[test]
+    fn striped_layout_rejects_only_the_reserved_provisioning_namespace() {
+        assert!(
+            StripedLayout::new(
+                ".zerofs-nbd-provision-v1-00000000-0000-0000-0000-000000000000",
+                64 * GIB,
+                4,
+                MIB,
+            )
+            .is_err()
+        );
+        for legitimate in [
+            ".zerofs-nbd-provision-v1-archive",
+            ".zerofs-nbd-provision-v1-000000000000000000000000000000000000",
+            ".zerofs-nbd-provision-v1-00000000-0000-0000-0000-00000000000g",
+            ".zerofs-nbd-provision-v1-00000000-0000-0000-0000-000000000000-extra",
+        ] {
+            assert!(
+                StripedLayout::new(legitimate, 64 * GIB, 4, MIB).is_ok(),
+                "{legitimate} is outside the exact reserved UUID namespace"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn provision_creates_an_nbd_discoverable_sparse_layout_and_is_idempotent() {
         let (client, filesystem, shutdown, _directory) = setup().await;
@@ -1029,7 +1056,7 @@ mod tests {
     #[tokio::test]
     async fn provision_recovers_a_matching_sibling_staging_directory() {
         let (client, filesystem, shutdown, _directory) = setup().await;
-        let staging = "/.nbd/.zerofs-nbd-provision-v1-interrupted";
+        let staging = "/.nbd/.zerofs-nbd-provision-v1-00000000-0000-0000-0000-000000000001";
         client.create_dir_all(staging, 0o755).await.unwrap();
         client
             .write(
@@ -1061,7 +1088,7 @@ mod tests {
     #[tokio::test]
     async fn provision_leaves_a_partial_stripe_draft_and_uses_a_fresh_one() {
         let (client, filesystem, shutdown, _directory) = setup().await;
-        let staging = "/.nbd/.zerofs-nbd-provision-v1-partial-manifest";
+        let staging = "/.nbd/.zerofs-nbd-provision-v1-00000000-0000-0000-0000-000000000002";
         client.create_dir_all(staging, 0o755).await.unwrap();
         client
             .write(
@@ -1137,8 +1164,8 @@ mod tests {
         let (client, filesystem, shutdown, _directory) = setup().await;
         client.create_dir_all("/.nbd", 0o755).await.unwrap();
         let provision = br#"{"version":1,"export_name":"vm100","layout":{"version":1,"stripe_bytes":1048576,"members":["lane-0","lane-1","lane-2","lane-3"]}}"#;
-        let first = "/.nbd/.zerofs-nbd-provision-v1-draft-a";
-        let second = "/.nbd/.zerofs-nbd-provision-v1-draft-b";
+        let first = "/.nbd/.zerofs-nbd-provision-v1-00000000-0000-0000-0000-000000000003";
+        let second = "/.nbd/.zerofs-nbd-provision-v1-00000000-0000-0000-0000-000000000004";
         for draft in [first, second] {
             client.create_dir(draft, 0o755).await.unwrap();
             client
@@ -1146,7 +1173,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let unsafe_partial = "/.nbd/.zerofs-nbd-provision-v1-unsafe-partial";
+        let unsafe_partial = "/.nbd/.zerofs-nbd-provision-v1-00000000-0000-0000-0000-000000000005";
         client.create_dir(unsafe_partial, 0o755).await.unwrap();
         client
             .write(format!("{unsafe_partial}/{PROVISION_MARKER}"), b"{")
@@ -1169,7 +1196,7 @@ mod tests {
     #[tokio::test]
     async fn shared_draft_lane_create_race_is_idempotent() {
         let (client, _filesystem, shutdown, _directory) = setup().await;
-        let staging = "/.nbd/.zerofs-nbd-provision-v1-shared";
+        let staging = "/.nbd/.zerofs-nbd-provision-v1-00000000-0000-0000-0000-000000000006";
         client.create_dir_all(staging, 0o755).await.unwrap();
         client
             .write(
@@ -1217,7 +1244,7 @@ mod tests {
     #[tokio::test]
     async fn callers_forced_to_create_separate_drafts_converge_and_clean_their_own() {
         let (client, filesystem, shutdown, _directory) = setup().await;
-        let unsafe_partial = "/.nbd/.zerofs-nbd-provision-v1-unsafe-partial";
+        let unsafe_partial = "/.nbd/.zerofs-nbd-provision-v1-00000000-0000-0000-0000-000000000007";
         client.create_dir_all(unsafe_partial, 0o755).await.unwrap();
         client
             .write(format!("{unsafe_partial}/{PROVISION_MARKER}"), b"{")
@@ -1274,7 +1301,7 @@ mod tests {
     #[tokio::test]
     async fn shared_draft_loser_converges_when_winner_publishes_before_final_validation() {
         let (client, filesystem, shutdown, _directory) = setup().await;
-        let staging = "/.nbd/.zerofs-nbd-provision-v1-shared-final-validation";
+        let staging = "/.nbd/.zerofs-nbd-provision-v1-00000000-0000-0000-0000-000000000008";
         client.create_dir_all(staging, 0o755).await.unwrap();
         client
             .write(
