@@ -10,7 +10,11 @@ from subprocess import CompletedProcess
 from typing import Any, Sequence
 
 from scripts.vm100_pilot.config import PilotConfig
-from scripts.vm100_pilot.benchmark import BenchmarkRunner, calculate_tiers
+from scripts.vm100_pilot.benchmark import (
+    BenchmarkRunner,
+    _active_windows,
+    calculate_tiers,
+)
 from scripts.vm100_pilot.lifecycle import PilotLifecycle
 from scripts.vm100_pilot.metrics import (
     TerminalWritebackError,
@@ -312,13 +316,39 @@ class BenchmarkTests(unittest.TestCase):
             foreground_ms=1000,
             local_end_to_end_ms=4000,
             remote_end_to_end_ms=10000,
+            local_active_ms=1000,
+            remote_active_ms=5000,
             buffered_read_ms=2000,
             direct_read_ms=500,
         )
         self.assertEqual(result.foreground_mibps, 1024.0)
         self.assertEqual(result.local_mibps, 256.0)
         self.assertEqual(result.remote_mibps, 102.4)
+        self.assertEqual(result.local_active_mibps, 1024.0)
+        self.assertEqual(result.remote_active_mibps, 204.8)
         self.assertEqual(result.direct_read_mibps, 2048.0)
+
+    def test_active_windows_separate_local_journal_and_remote_drain(self) -> None:
+        path = Path(self.temp.name) / "metrics.csv"
+        path.write_text(
+            "timestamp_ms,accepted,local,remote,dirty_ram,dirty_ssd,local_bytes,remote_bytes,terminal\n"
+            "1000,10,10,10,0,0,100,100,False\n"
+            "1100,11,10,10,64,0,100,100,False\n"
+            "1200,11,11,10,0,64,164,100,False\n"
+            "1500,11,11,11,0,0,164,164,False\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(
+            _active_windows(
+                path,
+                before_accepted=10,
+                before_local_bytes=100,
+                target_local_bytes=164,
+                before_remote_bytes=100,
+                target_remote_bytes=164,
+            ),
+            (200, 300),
+        )
 
     def test_prepare_root_uses_explicit_owner(self) -> None:
         benchmark = BenchmarkRunner(self.config, self.runner, self.lifecycle)  # type: ignore[arg-type]

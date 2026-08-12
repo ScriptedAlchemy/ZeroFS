@@ -5,6 +5,7 @@ import json
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -29,11 +30,15 @@ class BenchmarkResult:
     foreground_ms: int
     local_end_to_end_ms: int
     remote_end_to_end_ms: int
+    local_active_ms: int
+    remote_active_ms: int
     buffered_read_ms: int
     direct_read_ms: int
     foreground_mibps: float
     local_mibps: float
     remote_mibps: float
+    local_active_mibps: float
+    remote_active_mibps: float
     buffered_read_mibps: float
     direct_read_mibps: float
     receipt_dir: str = ""
@@ -50,6 +55,8 @@ def calculate_tiers(
     foreground_ms: int,
     local_end_to_end_ms: int,
     remote_end_to_end_ms: int,
+    local_active_ms: int,
+    remote_active_ms: int,
     buffered_read_ms: int,
     direct_read_ms: int,
 ) -> BenchmarkResult:
@@ -60,14 +67,71 @@ def calculate_tiers(
         foreground_ms=foreground_ms,
         local_end_to_end_ms=local_end_to_end_ms,
         remote_end_to_end_ms=remote_end_to_end_ms,
+        local_active_ms=local_active_ms,
+        remote_active_ms=remote_active_ms,
         buffered_read_ms=buffered_read_ms,
         direct_read_ms=direct_read_ms,
         foreground_mibps=_rate(logical_bytes, foreground_ms),
         local_mibps=_rate(local_bytes, local_end_to_end_ms),
         remote_mibps=_rate(remote_bytes, remote_end_to_end_ms),
+        local_active_mibps=_rate(local_bytes, local_active_ms),
+        remote_active_mibps=_rate(remote_bytes, remote_active_ms),
         buffered_read_mibps=_rate(logical_bytes, buffered_read_ms),
         direct_read_mibps=_rate(logical_bytes, direct_read_ms),
     )
+
+
+def _active_windows(
+    path: Path,
+    *,
+    before_accepted: int,
+    before_local_bytes: int,
+    target_local_bytes: int,
+    before_remote_bytes: int,
+    target_remote_bytes: int,
+) -> tuple[int, int]:
+    with path.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    if not rows:
+        return (0, 0)
+
+    def value(row: dict[str, str], key: str) -> int:
+        return int(row[key])
+
+    def transition_start(predicate: Callable[[dict[str, str]], bool]) -> int:
+        previous = value(rows[0], "timestamp_ms")
+        for row in rows:
+            if predicate(row):
+                return previous
+            previous = value(row, "timestamp_ms")
+        return value(rows[0], "timestamp_ms")
+
+    local_start = transition_start(
+        lambda row: value(row, "accepted") > before_accepted
+        or value(row, "dirty_ram") > 0
+    )
+    local_end = next(
+        (
+            value(row, "timestamp_ms")
+            for row in rows
+            if value(row, "local_bytes") >= target_local_bytes
+        ),
+        value(rows[-1], "timestamp_ms"),
+    )
+    remote_start = transition_start(
+        lambda row: value(row, "remote_bytes") > before_remote_bytes
+    )
+    remote_end = next(
+        (
+            value(row, "timestamp_ms")
+            for row in rows
+            if value(row, "remote_bytes") >= target_remote_bytes
+        ),
+        value(rows[-1], "timestamp_ms"),
+    )
+    if target_local_bytes <= before_local_bytes:
+        local_end = local_start
+    return (max(1, local_end - local_start), max(1, remote_end - remote_start))
 
 
 class _MetricSampler:
@@ -254,6 +318,14 @@ class BenchmarkRunner:
                 remote_snapshot = self.lifecycle.metrics.snapshot()
                 sampler.stop()
                 sampler = None
+                local_active_ms, remote_active_ms = _active_windows(
+                    sample_output,
+                    before_accepted=before.accepted,
+                    before_local_bytes=before.local_bytes,
+                    target_local_bytes=local_snapshot.local_bytes,
+                    before_remote_bytes=before.remote_bytes,
+                    target_remote_bytes=remote_snapshot.remote_bytes,
+                )
 
                 buffered_start = time.monotonic_ns()
                 self._run_fio(
@@ -290,6 +362,8 @@ class BenchmarkRunner:
                     foreground_ms=millis(foreground_end, started),
                     local_end_to_end_ms=millis(local_end, started),
                     remote_end_to_end_ms=millis(remote_end, started),
+                    local_active_ms=local_active_ms,
+                    remote_active_ms=remote_active_ms,
                     buffered_read_ms=millis(buffered_end, buffered_start),
                     direct_read_ms=millis(direct_end, direct_start),
                 )
