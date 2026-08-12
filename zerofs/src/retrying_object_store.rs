@@ -64,7 +64,29 @@ impl RetryingObjectStore {
                 | object_store::Error::Unauthenticated { .. }
                 | object_store::Error::InvalidPath { .. }
                 | object_store::Error::UnknownConfigurationKey { .. }
-        ) && !Self::is_unsatisfiable_range(err)
+        ) && !Self::has_terminal_typed_source(err)
+            && !Self::is_unsatisfiable_range(err)
+    }
+
+    fn has_terminal_typed_source(err: &object_store::Error) -> bool {
+        let object_store::Error::Generic { source, .. } = err else {
+            return false;
+        };
+        if let Some(error) = source.downcast_ref::<crate::sftp_transport::TransportError>() {
+            return matches!(
+                error,
+                crate::sftp_transport::TransportError::InvalidLimits(_)
+                    | crate::sftp_transport::TransportError::MissingCapability(_)
+                    | crate::sftp_transport::TransportError::PoolClosed
+                    | crate::sftp_transport::TransportError::NotFound(_)
+                    | crate::sftp_transport::TransportError::PermissionDenied(_)
+                    | crate::sftp_transport::TransportError::AlreadyExists(_)
+                    | crate::sftp_transport::TransportError::CorruptObject(_)
+            );
+        }
+        source
+            .downcast_ref::<crate::sftp_object_store::RemoteError>()
+            .is_some_and(|error| !error.is_retryable())
     }
 
     /// Detect deterministic ranges beginning at or beyond EOF.
@@ -596,6 +618,18 @@ mod tests {
                 "deterministic error must not retry forever: {error:?}"
             );
         }
+    }
+
+    #[test]
+    fn typed_sftp_corruption_is_not_retryable() {
+        let error = object_store::Error::Generic {
+            store: "SFTP",
+            source: Box::new(crate::sftp_transport::TransportError::CorruptObject(
+                "invalid object header".to_owned(),
+            )),
+        };
+
+        assert!(!RetryingObjectStore::should_retry(&error));
     }
 
     #[tokio::test]

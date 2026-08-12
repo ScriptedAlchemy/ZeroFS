@@ -143,6 +143,12 @@ pub enum RemoteError {
     AlreadyExists(String),
     #[error("remote precondition failed: {0}")]
     Precondition(String),
+    #[error("remote path permission denied: {0}")]
+    PermissionDenied(String),
+    #[error("remote object is corrupt: {0}")]
+    CorruptObject(String),
+    #[error("remote operation is not supported: {0}")]
+    NotSupported(String),
     #[error("SFTP session pool is closed")]
     PoolClosed,
     #[error("{operation}; cleanup required: {debt}")]
@@ -162,6 +168,26 @@ impl RemoteError {
                 operation.is_pool_closed() || debt.error.is_pool_closed()
             }
             _ => false,
+        }
+    }
+
+    fn is_ambiguous(&self) -> bool {
+        matches!(self, Self::Other(_))
+    }
+
+    pub(crate) fn is_retryable(&self) -> bool {
+        match self {
+            Self::NotFound(_)
+            | Self::AlreadyExists(_)
+            | Self::Precondition(_)
+            | Self::PermissionDenied(_)
+            | Self::CorruptObject(_)
+            | Self::NotSupported(_)
+            | Self::PoolClosed => false,
+            Self::CleanupRequired { operation, debt } => {
+                operation.is_retryable() && debt.error.is_retryable()
+            }
+            Self::Other(_) => true,
         }
     }
 }
@@ -227,6 +253,7 @@ pub trait RemoteSession: Debug + Send + Sync {
     async fn remove_file(&self, path: &FilePath) -> RemoteResult<()>;
     async fn hard_link(&self, from: &FilePath, to: &FilePath) -> RemoteResult<()>;
     async fn posix_rename(&self, from: &FilePath, to: &FilePath) -> RemoteResult<()>;
+    fn schedule_cleanup(&self, path: PathBuf);
 }
 
 pub async fn publish_payload(
@@ -239,7 +266,7 @@ pub async fn publish_payload(
     let target_lock = target_lock(target);
     let _target_guard = target_lock.lock().await;
     validate_publication_capabilities(session.capabilities(), mode).map_err(|extension| {
-        RemoteError::Other(format!("SFTP server lacks required {extension} extension"))
+        RemoteError::NotSupported(format!("SFTP server lacks required {extension} extension"))
     })?;
     let logical_len = payload.iter().try_fold(0_u64, |total, chunk| {
         total
@@ -261,7 +288,11 @@ pub async fn publish_payload(
     }
 
     if mode == PublicationMode::Create {
-        return match session.hard_link(&staging, target).await {
+        let publication = match session.hard_link(&staging, target).await {
+            Ok(()) => Ok(()),
+            Err(error) => reconcile_publication(&session, target, header, error).await,
+        };
+        return match publication {
             Ok(()) => Ok(PublicationOutcome {
                 header,
                 cleanup_debt: cleanup.remove_now().await.err(),
@@ -271,7 +302,10 @@ pub async fn publish_payload(
     }
 
     let publication = match mode {
-        PublicationMode::Overwrite => session.posix_rename(&staging, target).await,
+        PublicationMode::Overwrite => match session.posix_rename(&staging, target).await {
+            Ok(()) => Ok(()),
+            Err(error) => reconcile_publication(&session, target, header, error).await,
+        },
         PublicationMode::Update => match expected_generation {
             None => Err(RemoteError::Precondition(
                 "Update requires an expected generation".to_owned(),
@@ -288,7 +322,10 @@ pub async fn publish_payload(
                         current.generation
                     )))
                 }
-                Ok(_) => session.posix_rename(&staging, target).await,
+                Ok(_) => match session.posix_rename(&staging, target).await {
+                    Ok(()) => Ok(()),
+                    Err(error) => reconcile_publication(&session, target, header, error).await,
+                },
             },
         },
         PublicationMode::Create => unreachable!("Create handled above"),
@@ -304,9 +341,24 @@ pub async fn publish_payload(
     })
 }
 
+async fn reconcile_publication(
+    session: &Arc<dyn RemoteSession>,
+    target: &FilePath,
+    expected: ObjectHeader,
+    error: RemoteError,
+) -> RemoteResult<()> {
+    if !error.is_ambiguous() {
+        return Err(error);
+    }
+    let matches = match session.read_exact(target, 0, OBJECT_HEADER_LEN).await {
+        Ok(bytes) => decode_header(&bytes).is_ok_and(|found| found == expected),
+        Err(_) => false,
+    };
+    if matches { Ok(()) } else { Err(error) }
+}
+
 async fn failure_with_cleanup(cleanup: &mut StagingCleanup, operation: RemoteError) -> RemoteError {
     if operation.is_pool_closed() {
-        cleanup.disarm();
         return operation;
     }
     match cleanup.remove_now().await {
@@ -342,13 +394,10 @@ impl StagingCleanup {
                 self.disarm();
                 Ok(())
             }
-            Err(error) => {
-                self.disarm();
-                Err(StagingCleanupDebt {
-                    path,
-                    error: Box::new(error),
-                })
-            }
+            Err(error) => Err(StagingCleanupDebt {
+                path,
+                error: Box::new(error),
+            }),
         }
     }
 }
@@ -358,14 +407,7 @@ impl Drop for StagingCleanup {
         let Some(path) = self.path.take() else {
             return;
         };
-        let session = self.session.clone();
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
-                if let Err(error) = session.remove_file(&path).await {
-                    tracing::warn!(path = %path.display(), %error, "failed to clean cancelled SFTP staging write");
-                }
-            });
-        }
+        self.session.schedule_cleanup(path);
     }
 }
 
@@ -516,6 +558,15 @@ impl RemoteSession for PooledRemoteSession {
         finish_lease(lease, operation)
             .await
             .map_err(remote_transport_error)
+    }
+
+    fn schedule_cleanup(&self, path: PathBuf) {
+        let session = self.clone();
+        self.pool.spawn_tracked(async move {
+            if let Err(error) = session.remove_file(&path).await {
+                tracing::warn!(path = %path.display(), %error, "failed to retry SFTP staging cleanup");
+            }
+        });
     }
 }
 
@@ -971,10 +1022,13 @@ impl SftpMultipartUpload {
     ) -> RemoteResult<Self> {
         validate_publication_capabilities(session.capabilities(), PublicationMode::Overwrite)
             .map_err(|extension| {
-                RemoteError::Other(format!("SFTP server lacks required {extension} extension"))
+                RemoteError::NotSupported(format!(
+                    "SFTP server lacks required {extension} extension"
+                ))
             })?;
         let generation = Uuid::new_v4();
         let staging = staging_path(&target, generation).map_err(RemoteError::Other)?;
+        let mut cleanup = StagingCleanup::new(session.clone(), staging.clone());
         let placeholder = encode_header(ObjectHeader {
             generation,
             logical_len: 0,
@@ -983,9 +1037,9 @@ impl SftpMultipartUpload {
             .write_file_durable(&staging, vec![Bytes::copy_from_slice(&placeholder)])
             .await
         {
-            let _ = session.remove_file(&staging).await;
-            return Err(error);
+            return Err(failure_with_cleanup(&mut cleanup, error).await);
         }
+        cleanup.disarm();
         Ok(Self {
             session,
             location,
@@ -1079,10 +1133,11 @@ impl MultipartUpload for SftpMultipartUpload {
             )
             .await
             .map_err(|error| publication_error(&self.location, error))?;
-        self.session
-            .posix_rename(&staging, &self.target)
-            .await
-            .map_err(|error| publication_error(&self.location, error))?;
+        let publication = match self.session.posix_rename(&staging, &self.target).await {
+            Ok(()) => Ok(()),
+            Err(error) => reconcile_publication(&self.session, &self.target, header, error).await,
+        };
+        publication.map_err(|error| publication_error(&self.location, error))?;
         self.terminal = true;
         self.staging = None;
         self.known_missing.remove(self.location.as_ref());
@@ -1111,14 +1166,7 @@ impl Drop for SftpMultipartUpload {
         let Some(staging) = self.staging.take() else {
             return;
         };
-        let session = self.session.clone();
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
-                if let Err(error) = session.remove_file(&staging).await {
-                    tracing::warn!(path = %staging.display(), %error, "failed to clean dropped multipart staging write");
-                }
-            });
-        }
+        self.session.schedule_cleanup(staging);
     }
 }
 
@@ -1196,8 +1244,17 @@ fn transport_error(error: crate::sftp_transport::TransportError) -> object_store
 fn remote_transport_error(error: crate::sftp_transport::TransportError) -> RemoteError {
     match error {
         crate::sftp_transport::TransportError::NotFound(path) => RemoteError::NotFound(path),
+        crate::sftp_transport::TransportError::PermissionDenied(path) => {
+            RemoteError::PermissionDenied(path)
+        }
         crate::sftp_transport::TransportError::AlreadyExists(path) => {
             RemoteError::AlreadyExists(path)
+        }
+        crate::sftp_transport::TransportError::CorruptObject(message) => {
+            RemoteError::CorruptObject(message)
+        }
+        crate::sftp_transport::TransportError::MissingCapability(extension) => {
+            RemoteError::NotSupported(format!("SFTP server lacks required {extension} extension"))
         }
         crate::sftp_transport::TransportError::PoolClosed => RemoteError::PoolClosed,
         error => RemoteError::Other(error.to_string()),
@@ -1221,6 +1278,13 @@ fn publication_error(location: &ObjectPath, error: RemoteError) -> object_store:
         },
         RemoteError::Precondition(source) => object_store::Error::Precondition {
             path: location.to_string(),
+            source: source.into(),
+        },
+        RemoteError::PermissionDenied(source) => object_store::Error::PermissionDenied {
+            path: location.to_string(),
+            source: source.into(),
+        },
+        RemoteError::NotSupported(source) => object_store::Error::NotSupported {
             source: source.into(),
         },
         RemoteError::PoolClosed => unreachable!("pool-closed errors returned above"),
@@ -1275,6 +1339,35 @@ mod tests {
             },
         );
         assert!(matches!(nested, object_store::Error::NotSupported { .. }));
+    }
+
+    #[test]
+    fn remote_transport_errors_keep_terminal_types() {
+        assert!(matches!(
+            remote_transport_error(TransportError::PermissionDenied("private".to_owned())),
+            RemoteError::PermissionDenied(path) if path == "private"
+        ));
+        let corrupt = remote_transport_error(TransportError::CorruptObject(
+            "invalid object header".to_owned(),
+        ));
+        assert!(matches!(
+            corrupt,
+            RemoteError::CorruptObject(ref message) if message == "invalid object header"
+        ));
+        assert!(!corrupt.is_retryable());
+
+        let error = publication_error(
+            &ObjectPath::from("root/corrupt"),
+            RemoteError::CorruptObject("invalid object header".to_owned()),
+        );
+        let object_store::Error::Generic { source, .. } = error else {
+            panic!("corruption uses a typed generic source");
+        };
+        let preserved = source
+            .downcast_ref::<RemoteError>()
+            .expect("RemoteError must not be flattened into a string");
+        assert!(matches!(preserved, RemoteError::CorruptObject(_)));
+        assert!(!preserved.is_retryable());
     }
 
     #[derive(Debug, Default)]
@@ -1482,6 +1575,78 @@ mod tests {
         barrier: Barrier,
         in_flight: AtomicUsize,
         peak: AtomicUsize,
+    }
+
+    #[derive(Debug, Default)]
+    struct StagingRetryState {
+        remove_calls: AtomicUsize,
+        retry_started: Notify,
+        release_retry: Notify,
+    }
+
+    #[derive(Debug, Clone)]
+    struct StagingRetryFactory(Arc<StagingRetryState>);
+
+    #[async_trait]
+    impl SessionFactory for StagingRetryFactory {
+        async fn open(
+            &self,
+            _force: tokio_util::sync::CancellationToken,
+        ) -> Result<Box<dyn TransportSession>, TransportError> {
+            Ok(Box::new(StagingRetrySession(self.0.clone())))
+        }
+    }
+
+    #[derive(Debug)]
+    struct StagingRetrySession(Arc<StagingRetryState>);
+
+    #[async_trait]
+    impl TransportSession for StagingRetrySession {
+        fn capabilities(&self) -> SftpCapabilities {
+            SftpCapabilities {
+                fsync: true,
+                hardlink: true,
+                posix_rename: true,
+            }
+        }
+
+        async fn create_dir_all(&mut self, _path: &FilePath) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        async fn write_file_durable(
+            &mut self,
+            _path: &FilePath,
+            _chunks: Vec<Bytes>,
+        ) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        async fn hard_link(
+            &mut self,
+            _from: &FilePath,
+            _to: &FilePath,
+        ) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        async fn remove_file(&mut self, _path: &FilePath) -> Result<(), TransportError> {
+            if self.0.remove_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(TransportError::Operation(
+                    "forced first staging removal failure".to_owned(),
+                ));
+            }
+            self.0.retry_started.notify_one();
+            self.0.release_retry.notified().await;
+            Ok(())
+        }
+
+        async fn close(
+            self: Box<Self>,
+            _force: tokio_util::sync::CancellationToken,
+        ) -> Result<(), TransportError> {
+            Ok(())
+        }
     }
 
     #[derive(Debug, Clone)]
@@ -1854,6 +2019,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn staging_cleanup_retry_is_owned_and_drained_by_pool_shutdown() {
+        let state = Arc::new(StagingRetryState::default());
+        let pool = crate::sftp_transport::SftpSessionPool::new_writable(
+            Arc::new(StagingRetryFactory(state.clone())),
+            1,
+            1,
+            1,
+        )
+        .await
+        .unwrap();
+        let store = SftpObjectStore::new(pool.clone(), ObjectPath::from("root")).unwrap();
+
+        store
+            .put_opts(
+                &ObjectPath::from("root/object"),
+                PutPayload::from_static(b"payload"),
+                PutOptions::from(PutMode::Create),
+            )
+            .await
+            .expect("hardlink committed even though the first staging removal failed");
+        tokio::time::timeout(Duration::from_secs(1), state.retry_started.notified())
+            .await
+            .expect("the pool-owned cleanup retry must start");
+
+        let shutdown = tokio::spawn({
+            let pool = pool.clone();
+            async move { pool.shutdown().await }
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !shutdown.is_finished(),
+            "shutdown must drain the cleanup retry"
+        );
+        state.release_retry.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), shutdown)
+            .await
+            .expect("bounded cleanup retry must finish within pool shutdown")
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.remove_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
     async fn production_adapter_cleanup_overlaps_and_drains_before_pool_shutdown() {
         let state = Arc::new(ProtocolCleanupState::default());
         let pool = crate::sftp_transport::SftpSessionPool::new_writable(
@@ -2086,7 +2294,9 @@ mod tests {
         capabilities: SftpCapabilities,
         files: Mutex<HashMap<PathBuf, Bytes>>,
         operations: Mutex<Vec<String>>,
+        write_error: Option<&'static str>,
         remove_error: Option<&'static str>,
+        scheduled_cleanups: AtomicUsize,
     }
 
     impl RecordingSession {
@@ -2099,7 +2309,9 @@ mod tests {
                 },
                 files: Mutex::new(HashMap::new()),
                 operations: Mutex::new(Vec::new()),
+                write_error: None,
                 remove_error: None,
+                scheduled_cleanups: AtomicUsize::new(0),
             }
         }
 
@@ -2108,6 +2320,51 @@ mod tests {
                 remove_error: Some("forced staging removal failure"),
                 ..Self::new()
             }
+        }
+
+        fn with_write_and_remove_failure() -> Self {
+            Self {
+                write_error: Some("forced staging write failure"),
+                remove_error: Some("forced staging removal failure"),
+                ..Self::new()
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct LostReplySession {
+        inner: RecordingSession,
+        replace_target_header: bool,
+    }
+
+    impl LostReplySession {
+        fn matching() -> Self {
+            Self {
+                inner: RecordingSession::new(),
+                replace_target_header: false,
+            }
+        }
+
+        fn mismatching() -> Self {
+            Self {
+                inner: RecordingSession::new(),
+                replace_target_header: true,
+            }
+        }
+
+        fn maybe_replace_target(&self, target: &FilePath) {
+            if !self.replace_target_header {
+                return;
+            }
+            let mut files = self.inner.files.lock().unwrap();
+            let bytes = files.get_mut(target).expect("publication created target");
+            let mut replacement = encode_header(ObjectHeader {
+                generation: Uuid::nil(),
+                logical_len: 5,
+            })
+            .to_vec();
+            replacement.extend_from_slice(b"other");
+            *bytes = replacement.into();
         }
     }
 
@@ -2253,6 +2510,10 @@ mod tests {
             files.insert(to.to_path_buf(), bytes);
             Ok(())
         }
+
+        fn schedule_cleanup(&self, path: PathBuf) {
+            self.files.lock().unwrap().remove(&path);
+        }
     }
 
     #[tokio::test]
@@ -2318,6 +2579,133 @@ mod tests {
         assert!(!upload.terminal);
     }
 
+    #[tokio::test]
+    async fn failed_cleanup_remains_armed_for_its_owner() {
+        let session = Arc::new(RecordingSession::with_remove_failure());
+        let staging = PathBuf::from("zerofs/v1/.zerofs-staging-object-id");
+        let mut cleanup = StagingCleanup::new(session.clone(), staging.clone());
+
+        let debt = cleanup
+            .remove_now()
+            .await
+            .expect_err("forced removal must leave cleanup debt");
+
+        assert_eq!(debt.path, staging);
+        assert_eq!(cleanup.path.as_deref(), Some(staging.as_path()));
+        drop(cleanup);
+        tokio::task::yield_now().await;
+        assert_eq!(session.scheduled_cleanups.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn multipart_initiation_surfaces_staging_cleanup_debt() {
+        let session = Arc::new(RecordingSession::with_write_and_remove_failure());
+        let location = ObjectPath::from("zerofs/v1/failed-begin.bin");
+        let target = PathBuf::from("zerofs/v1/failed-begin.bin");
+
+        let error = SftpMultipartUpload::begin(session, location, target, Arc::new(DashSet::new()))
+            .await
+            .expect_err("failed initiation must report both write failure and cleanup debt");
+
+        match error {
+            RemoteError::CleanupRequired { operation, debt } => {
+                assert!(matches!(
+                    *operation,
+                    RemoteError::Other(ref message) if message == "forced staging write failure"
+                ));
+                assert!(matches!(
+                    *debt.error,
+                    RemoteError::Other(ref message) if message == "forced staging removal failure"
+                ));
+            }
+            error => panic!("expected cleanup debt, got {error:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn lost_publication_reply_reconciles_matching_target_header() {
+        for mode in [PublicationMode::Create, PublicationMode::Overwrite] {
+            let session = Arc::new(LostReplySession::matching());
+            let target = FilePath::new("/objects/segment.bin");
+
+            let outcome = publish_payload(
+                session,
+                target,
+                vec![Bytes::from_static(b"payload")],
+                mode,
+                None,
+            )
+            .await
+            .expect("matching target header proves the atomic publication committed");
+
+            assert_eq!(outcome.header.logical_len, 7);
+        }
+    }
+
+    #[tokio::test]
+    async fn lost_publication_reply_with_mismatching_target_remains_an_error() {
+        let session = Arc::new(LostReplySession::mismatching());
+
+        let error = publish_payload(
+            session,
+            FilePath::new("/objects/segment.bin"),
+            vec![Bytes::from_static(b"payload")],
+            PublicationMode::Create,
+            None,
+        )
+        .await
+        .expect_err("a different target generation cannot reconcile this publication");
+
+        assert!(matches!(
+            error,
+            RemoteError::Other(ref message) if message == "publication reply lost"
+        ));
+    }
+
+    #[async_trait]
+    impl RemoteSession for LostReplySession {
+        fn capabilities(&self) -> SftpCapabilities {
+            self.inner.capabilities()
+        }
+
+        async fn read_exact(
+            &self,
+            path: &FilePath,
+            offset: u64,
+            len: usize,
+        ) -> RemoteResult<Bytes> {
+            self.inner.read_exact(path, offset, len).await
+        }
+
+        async fn write_file_durable(
+            &self,
+            path: &FilePath,
+            chunks: Vec<Bytes>,
+        ) -> RemoteResult<()> {
+            self.inner.write_file_durable(path, chunks).await
+        }
+
+        async fn remove_file(&self, path: &FilePath) -> RemoteResult<()> {
+            self.inner.remove_file(path).await
+        }
+
+        async fn hard_link(&self, from: &FilePath, to: &FilePath) -> RemoteResult<()> {
+            self.inner.hard_link(from, to).await?;
+            self.maybe_replace_target(to);
+            Err(RemoteError::Other("publication reply lost".to_owned()))
+        }
+
+        async fn posix_rename(&self, from: &FilePath, to: &FilePath) -> RemoteResult<()> {
+            self.inner.posix_rename(from, to).await?;
+            self.maybe_replace_target(to);
+            Err(RemoteError::Other("publication reply lost".to_owned()))
+        }
+
+        fn schedule_cleanup(&self, path: PathBuf) {
+            self.inner.schedule_cleanup(path);
+        }
+    }
+
     #[async_trait]
     impl RemoteSession for RecordingSession {
         fn capabilities(&self) -> SftpCapabilities {
@@ -2347,6 +2735,9 @@ mod tests {
             path: &FilePath,
             chunks: Vec<Bytes>,
         ) -> RemoteResult<()> {
+            if let Some(error) = self.write_error {
+                return Err(RemoteError::Other(error.to_owned()));
+            }
             let bytes = chunks.into_iter().flatten().collect::<Vec<_>>();
             self.files
                 .lock()
@@ -2395,6 +2786,13 @@ mod tests {
                 .unwrap()
                 .push("posix-rename".to_owned());
             Ok(())
+        }
+
+        fn schedule_cleanup(&self, path: PathBuf) {
+            self.scheduled_cleanups.fetch_add(1, Ordering::SeqCst);
+            if self.remove_error.is_none() {
+                self.files.lock().unwrap().remove(&path);
+            }
         }
     }
 
@@ -2448,6 +2846,10 @@ mod tests {
 
         async fn posix_rename(&self, from: &FilePath, to: &FilePath) -> RemoteResult<()> {
             self.inner.posix_rename(from, to).await
+        }
+
+        fn schedule_cleanup(&self, path: PathBuf) {
+            self.inner.schedule_cleanup(path);
         }
     }
 

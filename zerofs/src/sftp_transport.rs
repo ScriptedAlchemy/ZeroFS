@@ -1529,6 +1529,13 @@ impl SftpSessionPool {
         Ok(())
     }
 
+    pub(crate) fn spawn_tracked<F>(&self, future: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.inner.tasks.spawn(future);
+    }
+
     pub async fn from_config_writable(
         factory: Arc<dyn SessionFactory>,
         config: &crate::config::SftpConfig,
