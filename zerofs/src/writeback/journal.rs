@@ -16,6 +16,7 @@ use std::path::{Component, Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
@@ -146,6 +147,23 @@ impl Drop for JournalWriteGuard<'_> {
 pub(crate) struct PreparedMutation {
     record: MutationRecord,
     temporary_blob: Option<PathBuf>,
+}
+
+trait PublicationFilesystem {
+    fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()>;
+    fn sync_directory(&self, path: &Path) -> Result<()>;
+}
+
+struct StdPublicationFilesystem;
+
+impl PublicationFilesystem for StdPublicationFilesystem {
+    fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+        fs::rename(from, to)
+    }
+
+    fn sync_directory(&self, path: &Path) -> Result<()> {
+        sync_directory(path)
+    }
 }
 
 impl PreparedMutation {
@@ -554,56 +572,396 @@ impl Journal {
     }
 
     pub(crate) fn publish_prepared(&self, prepared: PreparedMutation) -> Result<MutationRecord> {
-        if let Err(error) = self.require_next_local_sequence(prepared.sequence()) {
-            let cleanup = self.discard_prepared(prepared);
+        let mut committed = self.publish_batch(vec![prepared])?;
+        Ok(committed
+            .pop()
+            .expect("one prepared mutation must publish as one record"))
+    }
+
+    pub(crate) fn publish_batch(
+        &self,
+        prepared: Vec<PreparedMutation>,
+    ) -> Result<Vec<MutationRecord>> {
+        self.publish_batch_with(prepared, &StdPublicationFilesystem)
+    }
+
+    fn publish_batch_with(
+        &self,
+        prepared: Vec<PreparedMutation>,
+        filesystem: &dyn PublicationFilesystem,
+    ) -> Result<Vec<MutationRecord>> {
+        if prepared.is_empty() {
+            return Ok(Vec::new());
+        }
+        if let Err(error) = self.require_contiguous_local_batch(&prepared) {
+            let cleanup = self.discard_prepared_batch(prepared);
             return match cleanup {
                 Ok(()) => Err(error),
                 Err(cleanup) => {
-                    Err(error.context(format!("prepared blob cleanup also failed: {cleanup:#}")))
+                    Err(error.context(format!("prepared batch cleanup also failed: {cleanup:#}")))
                 }
             };
         }
-        let PreparedMutation {
-            record,
-            temporary_blob,
-        } = prepared;
-        let Some(tmp_path) = temporary_blob else {
-            self.commit_record(&record, None)?;
-            return Ok(record);
+
+        let mut entries = Vec::with_capacity(prepared.len());
+        for prepared in prepared {
+            let PreparedMutation {
+                record,
+                temporary_blob,
+            } = prepared;
+            if record.payload().is_some() != temporary_blob.is_some() {
+                let cleanup = temporary_blob
+                    .as_deref()
+                    .map_or(Ok(()), |path| self.discard_temporary_blob(path));
+                let error = anyhow::anyhow!("prepared payload and temporary blob disagree");
+                return match cleanup {
+                    Ok(()) => Err(error),
+                    Err(cleanup) => {
+                        Err(error
+                            .context(format!("prepared blob cleanup also failed: {cleanup:#}")))
+                    }
+                };
+            }
+            entries.push((record, temporary_blob));
+        }
+
+        let pending = entries
+            .iter()
+            .filter_map(|(record, temporary_blob)| {
+                temporary_blob
+                    .as_ref()
+                    .map(|_| (record.operation_id, record.blob_path().map(str::to_owned)))
+            })
+            .map(|(operation_id, blob_path)| {
+                Ok((
+                    operation_id,
+                    blob_path.context("prepared payload mutation has no blob path")?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let pending_started = Instant::now();
+        let pending_result = self.record_pending_blobs(&pending);
+        record_local_publish_phase("pending_intent", pending_started.elapsed());
+        if let Err(error) = pending_result {
+            let cleanup = self.discard_prepared_entries(&entries);
+            return match cleanup {
+                Ok(()) => Err(error),
+                Err(cleanup) => {
+                    Err(error.context(format!("prepared batch cleanup also failed: {cleanup:#}")))
+                }
+            };
+        }
+
+        let mut renamed = Vec::with_capacity(pending.len());
+        let mut directories = BTreeSet::new();
+        let rename_started = Instant::now();
+        for (record, temporary_blob) in &entries {
+            let Some(tmp_path) = temporary_blob else {
+                continue;
+            };
+            let blob_path = record
+                .blob_path()
+                .context("prepared payload mutation has no blob path")?;
+            let final_path = checked_join(&self.root, blob_path)?;
+            let directory = final_path
+                .parent()
+                .context("blob path has no parent")?
+                .to_path_buf();
+            if let Err(error) = filesystem.rename(tmp_path, &final_path) {
+                let publication = anyhow::Error::new(error).context(format!(
+                    "failed to publish local blob {} to {}",
+                    tmp_path.display(),
+                    final_path.display()
+                ));
+                let cleanup = self.rollback_uncommitted_batch(
+                    &entries,
+                    &renamed,
+                    &directories,
+                    &pending,
+                    filesystem,
+                );
+                return match cleanup {
+                    Ok(()) => Err(publication),
+                    Err(cleanup) => Err(publication
+                        .context(format!("pending-intent cleanup also failed: {cleanup:#}"))),
+                };
+            }
+            renamed.push(final_path);
+            directories.insert(directory);
+        }
+        record_local_publish_phase("rename", rename_started.elapsed());
+
+        let fsync_started = Instant::now();
+        for directory in &directories {
+            if let Err(error) = filesystem.sync_directory(directory) {
+                let publication = error.context(format!(
+                    "failed to fsync published blob directory {}",
+                    directory.display()
+                ));
+                let cleanup = self.rollback_uncommitted_batch(
+                    &entries,
+                    &renamed,
+                    &directories,
+                    &pending,
+                    filesystem,
+                );
+                return match cleanup {
+                    Ok(()) => Err(publication),
+                    Err(cleanup) => Err(publication
+                        .context(format!("pending-intent cleanup also failed: {cleanup:#}"))),
+                };
+            }
+        }
+        record_local_publish_phase("directory_fsync", fsync_started.elapsed());
+
+        let records = entries
+            .into_iter()
+            .map(|(record, _)| record)
+            .collect::<Vec<_>>();
+        let commit_started = Instant::now();
+        self.commit_record_batch(&records, &pending)?;
+        record_local_publish_phase("record_commit", commit_started.elapsed());
+        metrics::counter!("zerofs_writeback_local_publish_batches_total").increment(1);
+        metrics::counter!("zerofs_writeback_local_publish_records_total")
+            .increment(records.len() as u64);
+        metrics::histogram!("zerofs_writeback_local_publish_batch_records")
+            .record(records.len() as f64);
+        Ok(records)
+    }
+
+    fn discard_prepared_batch(&self, prepared: Vec<PreparedMutation>) -> Result<()> {
+        let mut first_error = None;
+        for mutation in prepared {
+            if let Err(error) = self.discard_prepared(mutation)
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    fn discard_prepared_entries(
+        &self,
+        entries: &[(MutationRecord, Option<PathBuf>)],
+    ) -> Result<()> {
+        let mut first_error = None;
+        for (_, temporary_blob) in entries {
+            if let Some(path) = temporary_blob
+                && let Err(error) = self.discard_temporary_blob(path)
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    fn rollback_uncommitted_batch(
+        &self,
+        entries: &[(MutationRecord, Option<PathBuf>)],
+        renamed: &[PathBuf],
+        directories: &BTreeSet<PathBuf>,
+        pending: &[(Uuid, String)],
+        filesystem: &dyn PublicationFilesystem,
+    ) -> Result<()> {
+        let mut first_error = None;
+        let mut removed_temporary = false;
+        for (_, temporary_blob) in entries {
+            let Some(path) = temporary_blob else {
+                continue;
+            };
+            match fs::remove_file(path) {
+                Ok(()) => removed_temporary = true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) if first_error.is_none() => {
+                    first_error = Some(
+                        anyhow::Error::new(error)
+                            .context("failed to remove prepared temporary blob"),
+                    );
+                }
+                Err(_) => {}
+            }
+        }
+        for path in renamed {
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) if first_error.is_none() => {
+                    first_error = Some(
+                        anyhow::Error::new(error)
+                            .context("failed to remove uncommitted published blob"),
+                    );
+                }
+                Err(_) => {}
+            }
+        }
+        if removed_temporary
+            && let Err(error) = filesystem.sync_directory(&self.root.join("tmp"))
+            && first_error.is_none()
+        {
+            first_error = Some(error.context("failed to fsync journal tmp directory cleanup"));
+        }
+        for directory in directories {
+            if let Err(error) = filesystem.sync_directory(directory)
+                && first_error.is_none()
+            {
+                first_error = Some(error.context(format!(
+                    "failed to fsync uncommitted blob cleanup directory {}",
+                    directory.display()
+                )));
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        self.clear_pending_blobs(pending)
+    }
+
+    fn require_contiguous_local_batch(&self, prepared: &[PreparedMutation]) -> Result<()> {
+        let progress = self.progress()?;
+        let mut expected = progress
+            .local_seq
+            .checked_add(1)
+            .context("local sequence overflow")?;
+        for (index, mutation) in prepared.iter().enumerate() {
+            if mutation.sequence() != expected {
+                bail!(
+                    "local sequence must advance contiguously from {} to {expected}, got {}",
+                    progress.local_seq,
+                    mutation.sequence()
+                );
+            }
+            if index + 1 < prepared.len() {
+                expected = expected.checked_add(1).context("local sequence overflow")?;
+            }
+        }
+        Ok(())
+    }
+
+    fn record_pending_blobs(&self, pending: &[(Uuid, String)]) -> Result<()> {
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let _write = self.write_gate.lock();
+        let mut transaction = self
+            .database
+            .begin_write()
+            .context("failed to record pending blob batch")?;
+        transaction
+            .set_durability(Durability::Immediate)
+            .context("failed to set journal durability")?;
+        {
+            let mut table = transaction
+                .open_table(PENDING_BLOBS)
+                .context("failed to open pending blob table")?;
+            for (operation_id, relative) in pending {
+                table
+                    .insert(operation_id.to_string().as_str(), relative.as_bytes())
+                    .context("failed to store pending blob")?;
+            }
+        }
+        transaction
+            .commit()
+            .context("failed to commit pending blob batch")
+    }
+
+    fn clear_pending_blobs(&self, pending: &[(Uuid, String)]) -> Result<()> {
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let _write = self.write_gate.lock();
+        let mut transaction = self
+            .database
+            .begin_write()
+            .context("failed to clear pending blob batch")?;
+        transaction
+            .set_durability(Durability::Immediate)
+            .context("failed to set journal durability")?;
+        {
+            let mut table = transaction
+                .open_table(PENDING_BLOBS)
+                .context("failed to open pending blob table")?;
+            for (operation_id, _) in pending {
+                table
+                    .remove(operation_id.to_string().as_str())
+                    .context("failed to clear pending blob")?;
+            }
+        }
+        transaction
+            .commit()
+            .context("failed to commit pending blob cleanup")
+    }
+
+    fn commit_record_batch(
+        &self,
+        records: &[MutationRecord],
+        pending: &[(Uuid, String)],
+    ) -> Result<()> {
+        let Some(last) = records.last() else {
+            return Ok(());
         };
-        let blob_path = record
-            .blob_path()
-            .context("prepared payload mutation has no blob path")?;
-        let final_path = checked_join(&self.root, blob_path)?;
-        let shard = final_path.parent().context("blob path has no parent")?;
-        let operation_id = record.operation_id;
-        if let Err(error) = self.record_pending_blob(operation_id, blob_path) {
-            let cleanup = self.discard_temporary_blob(&tmp_path);
-            return match cleanup {
-                Ok(()) => Err(error),
-                Err(cleanup) => {
-                    Err(error.context(format!("temporary blob cleanup also failed: {cleanup:#}")))
+        let _write = self.write_gate.lock();
+        let mut transaction = self
+            .database
+            .begin_write()
+            .context("failed to commit journal record batch")?;
+        transaction
+            .set_durability(Durability::Immediate)
+            .context("failed to set journal durability")?;
+        {
+            let mut meta = transaction
+                .open_table(META)
+                .context("failed to open journal metadata")?;
+            let current = read_required::<u64>(&meta, LOCAL_SEQ_KEY)?;
+            let mut expected = current.checked_add(1).context("local sequence overflow")?;
+            let mut total_completed =
+                read_optional::<u64>(&meta, LOCAL_BYTES_COMPLETED_KEY)?.unwrap_or_default();
+            let mut table = transaction
+                .open_table(MUTATIONS)
+                .context("failed to open journal mutations")?;
+            for (index, record) in records.iter().enumerate() {
+                if record.sequence != expected {
+                    bail!(
+                        "local sequence must advance contiguously from {current} to {expected}, got {}",
+                        record.sequence
+                    );
                 }
-            };
-        }
-        if let Err(error) = fs::rename(&tmp_path, &final_path) {
-            let cleanup = self.abort_unpublished_blob(operation_id, &tmp_path);
-            let publication = anyhow::Error::new(error).context(format!(
-                "failed to publish local blob {} to {}",
-                tmp_path.display(),
-                final_path.display()
-            ));
-            return match cleanup {
-                Ok(()) => Err(publication),
-                Err(cleanup) => {
-                    Err(publication
-                        .context(format!("pending-intent cleanup also failed: {cleanup:#}")))
+                total_completed = total_completed
+                    .checked_add(record.payload().map_or(0, |(payload_len, _)| payload_len))
+                    .context("local completed byte counter overflow")?;
+                let encoded =
+                    bincode::serialize(record).context("failed to encode journal mutation")?;
+                table
+                    .insert(record.sequence, encoded.as_slice())
+                    .context("failed to store journal mutation")?;
+                if index + 1 < records.len() {
+                    expected = expected.checked_add(1).context("local sequence overflow")?;
                 }
-            };
+            }
+            drop(table);
+            if !pending.is_empty() {
+                let mut pending_table = transaction
+                    .open_table(PENDING_BLOBS)
+                    .context("failed to open pending blob table")?;
+                for (operation_id, _) in pending {
+                    pending_table
+                        .remove(operation_id.to_string().as_str())
+                        .context("failed to clear pending blob")?;
+                }
+            }
+            write_value(&mut meta, LOCAL_SEQ_KEY, &last.sequence)?;
+            write_value(&mut meta, LOCAL_BYTES_COMPLETED_KEY, &total_completed)?;
         }
-        sync_directory(shard)?;
-        self.commit_record(&record, Some(operation_id))?;
-        Ok(record)
+        transaction
+            .commit()
+            .context("failed to commit journal mutation batch")
     }
 
     pub(crate) fn discard_prepared(&self, prepared: PreparedMutation) -> Result<()> {
@@ -895,21 +1253,6 @@ impl Journal {
             .context("failed to commit journal cleanup")
     }
 
-    fn require_next_local_sequence(&self, sequence: Sequence) -> Result<()> {
-        let progress = self.progress()?;
-        let expected = progress
-            .local_seq
-            .checked_add(1)
-            .context("local sequence overflow")?;
-        if sequence != expected {
-            bail!(
-                "local sequence must advance contiguously from {} to {expected}, got {sequence}",
-                progress.local_seq
-            );
-        }
-        Ok(())
-    }
-
     fn validate_record_format(&self, record: &MutationRecord) -> Result<()> {
         if record.format_version != self.format_version {
             bail!(
@@ -919,106 +1262,6 @@ impl Journal {
             );
         }
         Ok(())
-    }
-
-    fn record_pending_blob(&self, operation_id: Uuid, relative: &str) -> Result<()> {
-        let _write = self.write_gate.lock();
-        let mut transaction = self
-            .database
-            .begin_write()
-            .context("failed to record pending blob")?;
-        transaction
-            .set_durability(Durability::Immediate)
-            .context("failed to set journal durability")?;
-        {
-            let mut table = transaction
-                .open_table(PENDING_BLOBS)
-                .context("failed to open pending blob table")?;
-            table
-                .insert(operation_id.to_string().as_str(), relative.as_bytes())
-                .context("failed to store pending blob")?;
-        }
-        transaction
-            .commit()
-            .context("failed to commit pending blob")
-    }
-
-    fn abort_unpublished_blob(&self, operation_id: Uuid, tmp_path: &Path) -> Result<()> {
-        match fs::remove_file(tmp_path) {
-            Ok(()) => sync_directory(self.root.join("tmp"))?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error).context("failed to remove unpublished temporary blob"),
-        }
-        let _write = self.write_gate.lock();
-        let mut transaction = self
-            .database
-            .begin_write()
-            .context("failed to clear pending blob")?;
-        transaction
-            .set_durability(Durability::Immediate)
-            .context("failed to set journal durability")?;
-        {
-            let mut table = transaction
-                .open_table(PENDING_BLOBS)
-                .context("failed to open pending blob table")?;
-            table
-                .remove(operation_id.to_string().as_str())
-                .context("failed to clear pending blob")?;
-        }
-        transaction
-            .commit()
-            .context("failed to commit pending cleanup")
-    }
-
-    fn commit_record(&self, record: &MutationRecord, pending: Option<Uuid>) -> Result<()> {
-        let _write = self.write_gate.lock();
-        let mut transaction = self
-            .database
-            .begin_write()
-            .context("failed to commit journal record")?;
-        transaction
-            .set_durability(Durability::Immediate)
-            .context("failed to set journal durability")?;
-        {
-            let mut meta = transaction
-                .open_table(META)
-                .context("failed to open journal metadata")?;
-            let current = read_required::<u64>(&meta, LOCAL_SEQ_KEY)?;
-            let expected = current.checked_add(1).context("local sequence overflow")?;
-            if record.sequence != expected {
-                bail!(
-                    "local sequence must advance contiguously from {current} to {expected}, got {}",
-                    record.sequence
-                );
-            }
-            let completed_bytes = record.payload().map_or(0, |(payload_len, _)| payload_len);
-            let total_completed = read_optional::<u64>(&meta, LOCAL_BYTES_COMPLETED_KEY)?
-                .unwrap_or_default()
-                .checked_add(completed_bytes)
-                .context("local completed byte counter overflow")?;
-            let encoded =
-                bincode::serialize(record).context("failed to encode journal mutation")?;
-            let mut table = transaction
-                .open_table(MUTATIONS)
-                .context("failed to open journal mutations")?;
-            table
-                .insert(record.sequence, encoded.as_slice())
-                .context("failed to store journal mutation")?;
-            drop(table);
-            if let Some(operation_id) = pending {
-                let mut pending = transaction
-                    .open_table(PENDING_BLOBS)
-                    .context("failed to open pending blob table")?;
-                pending
-                    .remove(operation_id.to_string().as_str())
-                    .context("failed to clear pending blob")?;
-            }
-            write_value(&mut meta, LOCAL_SEQ_KEY, &record.sequence)?;
-            write_value(&mut meta, LOCAL_BYTES_COMPLETED_KEY, &total_completed)?;
-        }
-        transaction
-            .commit()
-            .context("failed to commit journal mutation")
     }
 
     pub(crate) fn mutation(&self, sequence: Sequence) -> Result<Option<MutationRecord>> {
@@ -1178,6 +1421,11 @@ impl Journal {
         }
         Ok(())
     }
+}
+
+fn record_local_publish_phase(phase: &'static str, elapsed: Duration) {
+    metrics::histogram!("zerofs_writeback_local_publish_phase_seconds", "phase" => phase)
+        .record(elapsed.as_secs_f64());
 }
 
 fn initialize_or_validate_identity(database: &Database, expected: &JournalIdentity) -> Result<()> {
@@ -1786,7 +2034,8 @@ fn sync_directory(path: impl AsRef<Path>) -> Result<()> {
 mod tests {
     use super::{
         FENCE_CLASSIFICATION_VERSION, FENCE_CLASSIFICATION_VERSION_KEY, Journal, JournalSnapshot,
-        JournalWriteGate, META, REMOTE_OBJECT_VERSIONS, read_optional, write_value,
+        JournalWriteGate, META, PublicationFilesystem, REMOTE_OBJECT_VERSIONS, read_optional,
+        write_value,
     };
     use crate::writeback::model::{
         FenceClass, JournalIdentity, LocalEtag, MutationKind, MutationMode, MutationRecord,
@@ -1798,11 +2047,44 @@ mod tests {
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::{Duration, Instant};
     use tempfile::TempDir;
     use uuid::Uuid;
+
+    struct RecordingPublicationFilesystem {
+        sync_calls: Mutex<Vec<PathBuf>>,
+        fail_sync_call: Option<usize>,
+    }
+
+    impl RecordingPublicationFilesystem {
+        fn new(fail_sync_call: Option<usize>) -> Self {
+            Self {
+                sync_calls: Mutex::new(Vec::new()),
+                fail_sync_call,
+            }
+        }
+    }
+
+    impl PublicationFilesystem for RecordingPublicationFilesystem {
+        fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+            fs::rename(from, to)
+        }
+
+        fn sync_directory(&self, path: &Path) -> anyhow::Result<()> {
+            let call = {
+                let mut calls = self.sync_calls.lock().unwrap();
+                calls.push(path.to_path_buf());
+                calls.len()
+            };
+            if self.fail_sync_call == Some(call) {
+                anyhow::bail!("injected directory fsync failure");
+            }
+            super::sync_directory(path)
+        }
+    }
 
     #[test]
     fn journal_write_gate_serves_an_older_remote_waiter_before_new_local_writers() {
@@ -2107,6 +2389,225 @@ mod tests {
         let progress = reopened.progress().unwrap();
         assert_eq!(progress.local_seq, 3);
         assert_eq!(progress.local_bytes_completed, 10);
+    }
+
+    #[test]
+    fn prepared_batch_commits_one_contiguous_local_prefix() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = open_temp_journal(&temp, "bucket-a");
+        let first_payload = VerifiedPayload::new(Bytes::from_static(b"one"));
+        let third_payload = VerifiedPayload::new(Bytes::from_static(b"three"));
+        let first = journal
+            .prepare_verified_put(
+                put_record(1, "segments/1", first_payload.bytes()),
+                &first_payload,
+            )
+            .unwrap();
+        let second = journal
+            .prepare_metadata(delete_record(2, "obsolete"))
+            .unwrap();
+        let third = journal
+            .prepare_verified_put(
+                put_record(3, "segments/3", third_payload.bytes()),
+                &third_payload,
+            )
+            .unwrap();
+
+        let committed = journal.publish_batch(vec![first, second, third]).unwrap();
+
+        assert_eq!(
+            committed
+                .iter()
+                .map(|record| record.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        let snapshot = journal.snapshot().unwrap();
+        assert_eq!(snapshot.local_seq, 3);
+        assert_eq!(snapshot.local_bytes_completed, 8);
+        assert_eq!(snapshot.records, committed);
+        assert_eq!(snapshot.pending_blob_count, 0);
+        assert_eq!(journal.read_blob(1).unwrap(), b"one");
+        assert_eq!(journal.read_blob(3).unwrap(), b"three");
+    }
+
+    #[test]
+    fn prepared_batch_rejects_out_of_order_records_without_advancing_watermark() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = open_temp_journal(&temp, "bucket-a");
+        let first = journal
+            .prepare_metadata(delete_record(1, "obsolete-1"))
+            .unwrap();
+        let second = journal
+            .prepare_metadata(delete_record(2, "obsolete-2"))
+            .unwrap();
+
+        let error = journal.publish_batch(vec![second, first]).unwrap_err();
+
+        assert!(format!("{error:#}").contains("contiguous"), "{error:#}");
+        let snapshot = journal.snapshot().unwrap();
+        assert_eq!(snapshot.local_seq, 0);
+        assert!(snapshot.records.is_empty());
+    }
+
+    #[test]
+    fn prepared_batch_rejects_sequence_gap_and_discards_temporary_blobs() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = open_temp_journal(&temp, "bucket-a");
+        let payload = VerifiedPayload::new(Bytes::from_static(b"payload"));
+        let first = journal
+            .prepare_verified_put(put_record(1, "segments/1", b"payload"), &payload)
+            .unwrap();
+        let third = journal
+            .prepare_verified_put(put_record(3, "segments/3", b"payload"), &payload)
+            .unwrap();
+
+        let error = journal.publish_batch(vec![first, third]).unwrap_err();
+
+        assert!(format!("{error:#}").contains("contiguous"), "{error:#}");
+        let snapshot = journal.snapshot().unwrap();
+        assert_eq!(snapshot.local_seq, 0);
+        assert!(snapshot.records.is_empty());
+        assert_eq!(snapshot.pending_blob_count, 0);
+        assert_eq!(fs::read_dir(journal.root().join("tmp")).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn prepared_batch_can_commit_the_final_u64_sequence() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = open_temp_journal(&temp, "bucket-a");
+        let transaction = journal.database.begin_write().unwrap();
+        {
+            let mut meta = transaction.open_table(super::META).unwrap();
+            super::write_value(&mut meta, super::LOCAL_SEQ_KEY, &(u64::MAX - 1)).unwrap();
+            super::write_value(&mut meta, super::REMOTE_SEQ_KEY, &(u64::MAX - 1)).unwrap();
+        }
+        transaction.commit().unwrap();
+        let mut record = delete_record(0, "last");
+        record.sequence = u64::MAX;
+        record.local_etag = LocalEtag::new(Uuid::nil(), u64::MAX);
+        let prepared = journal.prepare_metadata(record).unwrap();
+
+        journal.publish_batch(vec![prepared]).unwrap();
+
+        assert_eq!(journal.progress().unwrap().local_seq, u64::MAX);
+    }
+
+    #[test]
+    fn partial_batch_rename_failure_rolls_back_uncommitted_blob_prefix() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = open_temp_journal(&temp, "bucket-a");
+        let first_record = put_record(1, "segments/1", b"one");
+        let second_record = put_record(2, "segments/2", b"two");
+        let first_final = journal
+            .root()
+            .join("blobs/01")
+            .join(format!("{}.blob", first_record.operation_id));
+        let second_final = journal
+            .root()
+            .join("blobs/02")
+            .join(format!("{}.blob", second_record.operation_id));
+        let first_payload = VerifiedPayload::new(Bytes::from_static(b"one"));
+        let second_payload = VerifiedPayload::new(Bytes::from_static(b"two"));
+        let first = journal
+            .prepare_verified_put(first_record, &first_payload)
+            .unwrap();
+        let second = journal
+            .prepare_verified_put(second_record, &second_payload)
+            .unwrap();
+        fs::create_dir_all(&second_final).unwrap();
+
+        let error = journal.publish_batch(vec![first, second]).unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("failed to publish local blob"),
+            "{error:#}"
+        );
+        assert!(!first_final.exists());
+        assert!(second_final.is_dir());
+        let snapshot = journal.snapshot().unwrap();
+        assert_eq!(snapshot.local_seq, 0);
+        assert!(snapshot.records.is_empty());
+        assert_eq!(snapshot.pending_blob_count, 0);
+        assert_eq!(fs::read_dir(journal.root().join("tmp")).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn partial_batch_fsync_failure_keeps_watermark_old_and_rolls_back_blobs() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = open_temp_journal(&temp, "bucket-a");
+        let first_record = put_record(1, "segments/1", b"one");
+        let second_record = put_record(2, "segments/2", b"two");
+        let first_final = journal
+            .root()
+            .join("blobs/01")
+            .join(format!("{}.blob", first_record.operation_id));
+        let second_final = journal
+            .root()
+            .join("blobs/02")
+            .join(format!("{}.blob", second_record.operation_id));
+        let first = journal
+            .prepare_verified_put(
+                first_record,
+                &VerifiedPayload::new(Bytes::from_static(b"one")),
+            )
+            .unwrap();
+        let second = journal
+            .prepare_verified_put(
+                second_record,
+                &VerifiedPayload::new(Bytes::from_static(b"two")),
+            )
+            .unwrap();
+        let filesystem = RecordingPublicationFilesystem::new(Some(2));
+
+        let error = journal
+            .publish_batch_with(vec![first, second], &filesystem)
+            .unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("injected directory fsync failure"),
+            "{error:#}"
+        );
+        assert!(!first_final.exists());
+        assert!(!second_final.exists());
+        let snapshot = journal.snapshot().unwrap();
+        assert_eq!(snapshot.local_seq, 0);
+        assert!(snapshot.records.is_empty());
+        assert_eq!(snapshot.pending_blob_count, 0);
+    }
+
+    #[test]
+    fn prepared_batch_fsyncs_each_unique_blob_directory_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = open_temp_journal(&temp, "bucket-a");
+        let payload = VerifiedPayload::new(Bytes::from_static(b"payload"));
+        let mut prepared = Vec::new();
+        prepared.push(
+            journal
+                .prepare_verified_put(put_record(1, "segments/1", b"payload"), &payload)
+                .unwrap(),
+        );
+        for sequence in 2..257 {
+            prepared.push(
+                journal
+                    .prepare_metadata(delete_record(sequence, &format!("obsolete-{sequence}")))
+                    .unwrap(),
+            );
+        }
+        prepared.push(
+            journal
+                .prepare_verified_put(put_record(257, "segments/257", b"payload"), &payload)
+                .unwrap(),
+        );
+        let filesystem = RecordingPublicationFilesystem::new(None);
+
+        journal.publish_batch_with(prepared, &filesystem).unwrap();
+
+        assert_eq!(
+            *filesystem.sync_calls.lock().unwrap(),
+            vec![journal.root().join("blobs/01")]
+        );
+        assert_eq!(journal.progress().unwrap().local_seq, 257);
     }
 
     #[test]

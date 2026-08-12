@@ -4,7 +4,7 @@ use crate::writeback::model::{MutationRecord, Sequence};
 use crate::writeback::payload::VerifiedPayload;
 use anyhow::Result as AnyResult;
 use bytes::Bytes;
-use futures::{StreamExt, stream::FuturesUnordered};
+use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -71,6 +71,13 @@ trait LocalJournalSink: Send + Sync + 'static {
 
     fn publish(&self, prepared: PreparedMutation) -> AnyResult<MutationRecord>;
 
+    fn publish_batch(&self, prepared: Vec<PreparedMutation>) -> AnyResult<Vec<MutationRecord>> {
+        prepared
+            .into_iter()
+            .map(|mutation| self.publish(mutation))
+            .collect()
+    }
+
     fn discard(&self, prepared: PreparedMutation) -> AnyResult<()>;
 }
 
@@ -88,6 +95,10 @@ impl LocalJournalSink for Journal {
 
     fn publish(&self, prepared: PreparedMutation) -> AnyResult<MutationRecord> {
         self.publish_prepared(prepared)
+    }
+
+    fn publish_batch(&self, prepared: Vec<PreparedMutation>) -> AnyResult<Vec<MutationRecord>> {
+        Journal::publish_batch(self, prepared)
     }
 
     fn discard(&self, prepared: PreparedMutation) -> AnyResult<()> {
@@ -394,55 +405,112 @@ async fn run_journaler(
 
     loop {
         while terminal.is_none() {
-            let Some((result, ram, disk)) = prepared.remove(&next_admitted) else {
-                break;
-            };
-            let mutation = match result {
-                Ok(mutation) => mutation,
-                Err(error) => {
-                    drop(ram);
-                    drop(disk);
-                    terminal = Some(format!("{error:#}"));
+            match preparations.next().now_or_never() {
+                Some(Some(Ok((sequence, result, ram, disk)))) => {
+                    prepared.insert(sequence, (result, ram, disk));
+                }
+                Some(Some(Err(error))) => {
+                    terminal = Some(format!("local journal preparer panicked: {error}"));
+                }
+                Some(None) | None => break,
+            }
+        }
+
+        while terminal.is_none() {
+            let mut mutations = Vec::new();
+            let mut ownership = Vec::new();
+            let mut candidate = Some(next_admitted);
+            while let Some(sequence) = candidate {
+                let Some((result, _, _)) = prepared.get(&sequence) else {
+                    break;
+                };
+                if result.is_err() {
+                    if mutations.is_empty() {
+                        let (result, ram, disk) = prepared
+                            .remove(&sequence)
+                            .expect("the expected failed preparation still exists");
+                        drop(ram);
+                        drop(disk);
+                        let error = match result {
+                            Err(error) => error,
+                            Ok(_) => unreachable!("the preparation result was checked above"),
+                        };
+                        terminal = Some(format!("{error:#}"));
+                    }
                     break;
                 }
-            };
-            let sequence = mutation.sequence();
+                let (result, ram, disk) = prepared
+                    .remove(&sequence)
+                    .expect("the expected prepared mutation still exists");
+                mutations.push(result.expect("the prepared mutation was checked above"));
+                ownership.push((sequence, ram, disk));
+                candidate = sequence.checked_add(1);
+            }
+            if terminal.is_some() {
+                break;
+            }
+            if mutations.is_empty() {
+                break;
+            }
+
             let publish_sink = sink.clone();
-            match tokio::task::spawn_blocking(move || publish_sink.publish(mutation)).await {
-                Ok(Ok(_)) => {}
-                Ok(Err(error)) => {
-                    drop(ram);
-                    drop(disk);
-                    terminal = Some(format!("{error:#}"));
-                    break;
-                }
-                Err(error) => {
-                    drop(ram);
-                    drop(disk);
-                    terminal = Some(format!("local journal publisher panicked: {error}"));
-                    break;
-                }
-            }
-            if let Some(observer) = &observer
-                && let Err(error) = observer.committed(sequence).await
-            {
-                drop(ram);
-                drop(disk);
-                terminal = Some(format!("local commit observer failed: {error:#}"));
+            let published =
+                match tokio::task::spawn_blocking(move || publish_sink.publish_batch(mutations))
+                    .await
+                {
+                    Ok(Ok(records)) => records,
+                    Ok(Err(error)) => {
+                        drop(ownership);
+                        terminal = Some(format!("{error:#}"));
+                        break;
+                    }
+                    Err(error) => {
+                        drop(ownership);
+                        terminal = Some(format!("local journal publisher panicked: {error}"));
+                        break;
+                    }
+                };
+            let expected_sequences = ownership
+                .iter()
+                .map(|(sequence, _, _)| *sequence)
+                .collect::<Vec<_>>();
+            let published_sequences = published
+                .iter()
+                .map(|record| record.sequence)
+                .collect::<Vec<_>>();
+            if published_sequences != expected_sequences {
+                drop(ownership);
+                terminal = Some(format!(
+                    "local journal publisher returned sequences {published_sequences:?}, expected {expected_sequences:?}"
+                ));
                 break;
             }
-            if let Some(disk) = disk {
-                disk.accept();
-            }
-            drop(ram);
-            progress.send_modify(|state| state.local_seq = sequence);
-            next_admitted = match next_admitted.checked_add(1) {
-                Some(next) => next,
-                None => {
-                    terminal = Some("local journal sequence overflow".to_owned());
+
+            for (sequence, ram, disk) in ownership {
+                if let Some(observer) = &observer
+                    && let Err(error) = observer.committed(sequence).await
+                {
+                    drop(ram);
+                    drop(disk);
+                    terminal = Some(format!("local commit observer failed: {error:#}"));
                     break;
                 }
-            };
+                if let Some(disk) = disk {
+                    disk.accept();
+                }
+                drop(ram);
+                progress.send_modify(|state| state.local_seq = sequence);
+                next_admitted = match sequence.checked_add(1) {
+                    Some(next) => next,
+                    None => {
+                        terminal = Some("local journal sequence overflow".to_owned());
+                        break;
+                    }
+                };
+            }
+            if terminal.is_some() {
+                break;
+            }
         }
 
         if terminal.is_some() {
@@ -568,7 +636,16 @@ mod tests {
         releases: Mutex<HashMap<u64, mpsc::Receiver<()>>>,
         fail_sequence: Option<u64>,
         published: Mutex<Vec<u64>>,
+        published_batches: Mutex<Vec<Vec<u64>>>,
         discarded: Mutex<Vec<u64>>,
+    }
+
+    struct ControlledBatchSink {
+        prepare_entered: tokio_mpsc::UnboundedSender<u64>,
+        prepared: tokio_mpsc::UnboundedSender<u64>,
+        prepare_releases: Mutex<HashMap<u64, mpsc::Receiver<()>>>,
+        publish_entered: tokio_mpsc::UnboundedSender<u64>,
+        publish_release: Mutex<mpsc::Receiver<()>>,
     }
 
     #[derive(Default)]
@@ -662,8 +739,63 @@ mod tests {
             Ok(put_record(sequence, b"x"))
         }
 
+        fn publish_batch(
+            &self,
+            prepared: Vec<crate::writeback::journal::PreparedMutation>,
+        ) -> Result<Vec<MutationRecord>> {
+            let sequences = prepared
+                .iter()
+                .map(crate::writeback::journal::PreparedMutation::sequence)
+                .collect::<Vec<_>>();
+            self.published.lock().unwrap().extend(&sequences);
+            self.published_batches
+                .lock()
+                .unwrap()
+                .push(sequences.clone());
+            Ok(sequences
+                .into_iter()
+                .map(|sequence| put_record(sequence, b"x"))
+                .collect())
+        }
+
         fn discard(&self, prepared: crate::writeback::journal::PreparedMutation) -> Result<()> {
             self.discarded.lock().unwrap().push(prepared.sequence());
+            Ok(())
+        }
+    }
+
+    impl LocalJournalSink for ControlledBatchSink {
+        fn prepare(
+            &self,
+            record: MutationRecord,
+            _payload: Option<&VerifiedPayload>,
+        ) -> Result<crate::writeback::journal::PreparedMutation> {
+            let sequence = record.sequence;
+            self.prepare_entered.send(sequence).unwrap();
+            let release = self
+                .prepare_releases
+                .lock()
+                .unwrap()
+                .remove(&sequence)
+                .expect("release gate exists");
+            release.recv().unwrap();
+            self.prepared.send(sequence).unwrap();
+            Ok(crate::writeback::journal::PreparedMutation::metadata(
+                record,
+            ))
+        }
+
+        fn publish(
+            &self,
+            prepared: crate::writeback::journal::PreparedMutation,
+        ) -> Result<MutationRecord> {
+            let sequence = prepared.sequence();
+            self.publish_entered.send(sequence).unwrap();
+            self.publish_release.lock().unwrap().recv().unwrap();
+            Ok(put_record(sequence, b"x"))
+        }
+
+        fn discard(&self, _prepared: crate::writeback::journal::PreparedMutation) -> Result<()> {
             Ok(())
         }
     }
@@ -742,6 +874,7 @@ mod tests {
             releases: Mutex::new(releases),
             fail_sequence,
             published: Mutex::new(Vec::new()),
+            published_batches: Mutex::new(Vec::new()),
             discarded: Mutex::new(Vec::new()),
         });
         let journaler = LocalJournaler::start_with_sink(sink.clone(), admission, 0, 8);
@@ -949,6 +1082,63 @@ mod tests {
         releases[&1].send(()).unwrap();
         journaler.barrier().wait_local(2).await.unwrap();
         assert_eq!(*sink.published.lock().unwrap(), vec![1, 2]);
+        assert_eq!(*sink.published_batches.lock().unwrap(), vec![vec![1, 2]]);
+        journaler.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn contiguous_prepared_batch_keeps_all_ram_until_the_batch_is_durable() {
+        let admission = Admission::new(20);
+        let (prepare_entered_tx, mut prepare_entered_rx) = tokio_mpsc::unbounded_channel();
+        let (prepared_tx, mut prepared_rx) = tokio_mpsc::unbounded_channel();
+        let (publish_entered_tx, mut publish_entered_rx) = tokio_mpsc::unbounded_channel();
+        let (publish_release_tx, publish_release_rx) = mpsc::channel();
+        let mut prepare_releases = HashMap::new();
+        let mut prepare_release_senders = HashMap::new();
+        for sequence in 1..=2 {
+            let (sender, receiver) = mpsc::channel();
+            prepare_release_senders.insert(sequence, sender);
+            prepare_releases.insert(sequence, receiver);
+        }
+        let sink = Arc::new(ControlledBatchSink {
+            prepare_entered: prepare_entered_tx,
+            prepared: prepared_tx,
+            prepare_releases: Mutex::new(prepare_releases),
+            publish_entered: publish_entered_tx,
+            publish_release: Mutex::new(publish_release_rx),
+        });
+        let journaler = LocalJournaler::start_with_sink(sink, admission.clone(), 0, 8);
+        for sequence in 1..=2 {
+            let ram = admission.reserve(1).await.unwrap().accept();
+            journaler
+                .submit_put(put_record(sequence, b"x"), Bytes::from_static(b"x"), ram)
+                .await
+                .unwrap();
+        }
+        let mut entered = [
+            prepare_entered_rx.recv().await.unwrap(),
+            prepare_entered_rx.recv().await.unwrap(),
+        ];
+        entered.sort_unstable();
+        assert_eq!(entered, [1, 2]);
+        prepare_release_senders[&2].send(()).unwrap();
+        assert_eq!(prepared_rx.recv().await.unwrap(), 2);
+        prepare_release_senders[&1].send(()).unwrap();
+        assert_eq!(prepared_rx.recv().await.unwrap(), 1);
+
+        assert_eq!(publish_entered_rx.recv().await.unwrap(), 1);
+        assert_eq!(admission.used_bytes(), 2);
+        publish_release_tx.send(()).unwrap();
+        assert_eq!(publish_entered_rx.recv().await.unwrap(), 2);
+        assert_eq!(
+            admission.used_bytes(),
+            2,
+            "no admission may be released before the durable batch returns"
+        );
+        publish_release_tx.send(()).unwrap();
+
+        journaler.barrier().wait_local(2).await.unwrap();
+        assert_eq!(admission.used_bytes(), 0);
         journaler.shutdown().await.unwrap();
     }
 
