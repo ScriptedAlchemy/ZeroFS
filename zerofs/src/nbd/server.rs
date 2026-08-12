@@ -7,6 +7,7 @@ use deku::prelude::*;
 use nbd_proto::*;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{TcpListener, UnixListener};
 use tokio_util::sync::CancellationToken;
@@ -15,6 +16,10 @@ use tracing::{debug, error, info, warn};
 const MAX_OPTION_LENGTH: u32 = 4096;
 const MAX_REQUEST_LENGTH: u32 = 128 * 1024 * 1024;
 const DISCARD_CHUNK_SIZE: usize = 64 * 1024;
+#[cfg(not(test))]
+const WRITE_PAYLOAD_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const WRITE_PAYLOAD_TIMEOUT: Duration = Duration::from_millis(100);
 
 pub enum Transport {
     Tcp(SocketAddr),
@@ -530,10 +535,27 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
         // overtake a request whose body is still in flight.
         let admission = self.handler.begin_mutation(device).await;
         let mut data = BytesMut::zeroed(length as usize);
-        self.reader
-            .read_exact(&mut data)
-            .await
-            .map_err(|_| CommandError::IoError)?;
+        tokio::select! {
+            _ = self.shutdown.cancelled() => return Err(CommandError::IoError),
+            result = tokio::time::timeout(
+                WRITE_PAYLOAD_TIMEOUT,
+                self.reader.read_exact(&mut data),
+            ) => {
+                match result {
+                    Ok(read) => {
+                        read.map_err(|_| CommandError::IoError)?;
+                    }
+                    Err(_) => {
+                        // The remainder of a timed-out payload cannot be
+                        // distinguished from a later request. Close this
+                        // session after returning EIO rather than continuing
+                        // on a desynchronized transmission stream.
+                        self.shutdown.cancel();
+                        return Err(CommandError::IoError);
+                    }
+                }
+            }
+        }
 
         let data = data.freeze();
         self.handler
@@ -592,6 +614,7 @@ mod tests {
     use crate::fs::permissions::Credentials;
     use crate::fs::types::{SetAttributes, SetSize};
     use crate::nbd::handler::{NBDHandler, NbdExportGates};
+    use bytes::Bytes;
     use std::io;
     use std::pin::Pin;
     use std::sync::Arc;
@@ -613,6 +636,30 @@ mod tests {
         ) -> Poll<io::Result<()>> {
             if let Some(started) = self.started.take() {
                 let _ = started.send(());
+            }
+            Poll::Pending
+        }
+    }
+
+    struct PartialThenBlockingPayload {
+        started: Option<oneshot::Sender<()>>,
+        delivered: bool,
+    }
+
+    impl AsyncRead for PartialThenBlockingPayload {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if !self.delivered {
+                let length = 512.min(buf.remaining());
+                buf.put_slice(&vec![0x5a; length]);
+                self.delivered = true;
+                if let Some(started) = self.started.take() {
+                    let _ = started.send(());
+                }
+                return Poll::Ready(Ok(()));
             }
             Poll::Pending
         }
@@ -714,5 +761,119 @@ mod tests {
             .expect("FLUSH resumed after the earlier write was canceled")
             .expect("FLUSH task did not panic")
             .expect("FLUSH succeeded");
+    }
+
+    #[tokio::test]
+    async fn shutdown_releases_a_half_delivered_write_for_a_waiting_flush() {
+        let filesystem = Arc::new(
+            ZeroFS::new_in_memory()
+                .await
+                .expect("create test filesystem"),
+        );
+        let export_gates = Arc::new(NbdExportGates::default());
+        let write_device = single_file_export(&filesystem, &export_gates).await;
+        let flush_device = NBDHandler::new(Arc::clone(&filesystem), Arc::clone(&export_gates))
+            .get_device(b"flush-ordering-test")
+            .await
+            .expect("open the same export on another connection");
+        let shutdown = CancellationToken::new();
+        let (payload_started_tx, payload_started_rx) = oneshot::channel();
+        let mut write_session = NBDSession::new(
+            PartialThenBlockingPayload {
+                started: Some(payload_started_tx),
+                delivered: false,
+            },
+            tokio::io::sink(),
+            Arc::clone(&filesystem),
+            Arc::clone(&export_gates),
+            shutdown.clone(),
+        );
+        let write_task = tokio::spawn(async move {
+            write_session
+                .read_write_data(&write_device, 0, 4096, false, write_device.size)
+                .await
+        });
+        payload_started_rx
+            .await
+            .expect("write received the first payload fragment");
+
+        let flush_handler = NBDHandler::new(filesystem, export_gates);
+        let flush_task = tokio::spawn(async move { flush_handler.flush(&flush_device).await });
+        shutdown.cancel();
+
+        assert!(
+            timeout(Duration::from_secs(2), write_task)
+                .await
+                .expect("WRITE stopped after session shutdown")
+                .expect("WRITE task did not panic")
+                .is_err(),
+            "a half-delivered WRITE must fail when its session shuts down"
+        );
+        timeout(Duration::from_secs(2), flush_task)
+            .await
+            .expect("FLUSH resumed after the stalled session shut down")
+            .expect("FLUSH task did not panic")
+            .expect("FLUSH succeeded");
+    }
+
+    #[tokio::test]
+    async fn payload_timeout_releases_a_stalled_write_for_a_waiting_fua() {
+        let filesystem = Arc::new(
+            ZeroFS::new_in_memory()
+                .await
+                .expect("create test filesystem"),
+        );
+        let export_gates = Arc::new(NbdExportGates::default());
+        let write_device = single_file_export(&filesystem, &export_gates).await;
+        let fua_device = NBDHandler::new(Arc::clone(&filesystem), Arc::clone(&export_gates))
+            .get_device(b"flush-ordering-test")
+            .await
+            .expect("open the same export on another connection");
+        let (payload_started_tx, payload_started_rx) = oneshot::channel();
+        let mut write_session = NBDSession::new(
+            BlockingPayload {
+                started: Some(payload_started_tx),
+            },
+            tokio::io::sink(),
+            Arc::clone(&filesystem),
+            Arc::clone(&export_gates),
+            CancellationToken::new(),
+        );
+        let write_task = tokio::spawn(async move {
+            write_session
+                .read_write_data(&write_device, 0, 4096, false, write_device.size)
+                .await
+        });
+        payload_started_rx
+            .await
+            .expect("write reached its blocked payload read");
+
+        let fua_handler = NBDHandler::new(filesystem, export_gates);
+        let fua_task = tokio::spawn(async move {
+            let admission = fua_handler.begin_mutation(&fua_device).await;
+            fua_handler
+                .write_admitted(
+                    &fua_device,
+                    0,
+                    &Bytes::from(vec![0x33; 4096]),
+                    true,
+                    admission,
+                )
+                .await
+        });
+
+        assert!(
+            timeout(Duration::from_secs(2), write_task)
+                .await
+                .expect("WRITE stopped after the payload deadline")
+                .expect("WRITE task did not panic")
+                .is_err(),
+            "a WRITE that misses its payload deadline must fail"
+        );
+        timeout(Duration::from_secs(2), fua_task)
+            .await
+            .expect("FUA write resumed after the stalled WRITE timed out")
+            .expect("FUA task did not panic")
+            .expect("FUA write and its flush succeeded");
     }
 }

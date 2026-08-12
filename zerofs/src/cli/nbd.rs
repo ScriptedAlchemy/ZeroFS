@@ -429,13 +429,27 @@ async fn prepare_staging(client: &Client, layout: &StripedLayout) -> Result<Stri
     let manifest_path = format!("{staging_path}/{STRIPE_MARKER}");
     let manifest = serde_json::to_vec(&layout.manifest()).context("encode stripe manifest")?;
     match client.read(&manifest_path).await {
-        Ok(existing) if decode_manifest(&existing, layout)? == layout.manifest() => {}
-        Ok(_) => {
-            return Err(conflict(
-                layout,
-                "the staged stripe manifest has different geometry",
-            ));
-        }
+        Ok(existing) => match serde_json::from_slice::<StripeManifest>(&existing) {
+            Ok(existing) if existing == layout.manifest() => {}
+            Ok(_) => {
+                return Err(conflict(
+                    layout,
+                    "the staged stripe manifest has different geometry",
+                ));
+            }
+            Err(_) => {
+                // `create_manifest_file` creates the inode before writing its
+                // payload. A crash can therefore leave a recognizable, valid
+                // provision draft with a truncated stripe marker. That marker
+                // was never publishable, so recreate it from the durable
+                // provision geometry before the atomic directory rename.
+                client
+                    .remove_file(&manifest_path)
+                    .await
+                    .with_context(|| format!("remove partial stripe manifest {manifest_path}"))?;
+                create_manifest_file(client, &manifest_path, &manifest).await?;
+            }
+        },
         Err(ZeroFsError::NotFound { .. }) => {
             create_manifest_file(client, &manifest_path, &manifest).await?
         }
@@ -447,6 +461,15 @@ async fn prepare_staging(client: &Client, layout: &StripedLayout) -> Result<Stri
         .await
         .context("flush completed NBD staging directory")?;
     Ok(staging_path)
+}
+
+async fn cleanup_staging(client: &Client, staging_path: &str) -> Result<()> {
+    match client.remove_dir_all(staging_path).await {
+        Ok(()) | Err(ZeroFsError::NotFound { .. }) => Ok(()),
+        Err(error) => {
+            Err(error).with_context(|| format!("remove superseded NBD draft {staging_path}"))
+        }
+    }
 }
 
 async fn resume_legacy_final_draft(client: &Client, layout: &StripedLayout) -> Result<()> {
@@ -539,15 +562,30 @@ pub async fn provision_striped(
         .await
         .context("recheck the final NBD export before publication")?
     {
-        return Err(conflict(
-            layout,
-            "the final export appeared while provisioning",
-        ));
+        verify_complete(client, layout).await?;
+        cleanup_staging(client, &staging_path).await?;
+        client
+            .sync()
+            .await
+            .context("flush converged NBD provisioning")?;
+        return Ok(ProvisionOutcome::AlreadyProvisioned);
     }
-    client
-        .rename(&staging_path, layout.export_path())
-        .await
-        .context("atomically publish striped NBD export")?;
+    if let Err(rename_error) = client.rename(&staging_path, layout.export_path()).await {
+        if client
+            .exists(layout.export_path())
+            .await
+            .context("check for a concurrently published NBD export")?
+        {
+            verify_complete(client, layout).await?;
+            cleanup_staging(client, &staging_path).await?;
+            client
+                .sync()
+                .await
+                .context("flush converged NBD provisioning")?;
+            return Ok(ProvisionOutcome::AlreadyProvisioned);
+        }
+        return Err(rename_error).context("atomically publish striped NBD export");
+    }
     verify_complete(client, layout).await?;
     client
         .sync()
@@ -599,6 +637,7 @@ mod tests {
     use crate::ninep::NinePServer;
     use std::sync::Arc;
     use std::time::Duration;
+    use tokio::sync::Barrier;
     use tokio_util::sync::CancellationToken;
     use zerofs_client::Client;
 
@@ -834,6 +873,80 @@ mod tests {
             ProvisionOutcome::Created
         );
         assert!(!client.exists(staging).await.unwrap());
+        let handler = NBDHandler::new(filesystem, Arc::new(NbdExportGates::default()));
+        assert_eq!(handler.get_device(b"vm100").await.unwrap().size, 64 * MIB);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn provision_recovers_a_valid_draft_with_a_partial_stripe_marker() {
+        let (client, filesystem, shutdown, _directory) = setup().await;
+        let staging = "/.nbd/.zerofs-nbd-provision-v1-partial-manifest";
+        client.create_dir_all(staging, 0o755).await.unwrap();
+        client
+            .write(
+                format!("{staging}/{PROVISION_MARKER}"),
+                br#"{"version":1,"export_name":"vm100","layout":{"version":1,"stripe_bytes":1048576,"members":["lane-0","lane-1","lane-2","lane-3"]}}"#,
+            )
+            .await
+            .unwrap();
+        client
+            .write(
+                format!("{staging}/.zerofs-nbd-stripe-v1"),
+                br#"{"version":1,"stripe_bytes":1048576,"members":["lane-0""#,
+            )
+            .await
+            .unwrap();
+        let layout = StripedLayout::new("vm100", 64 * MIB, 4, MIB).unwrap();
+
+        assert_eq!(
+            provision_striped(&client, &layout).await.unwrap(),
+            ProvisionOutcome::Created
+        );
+        assert!(!client.exists(staging).await.unwrap());
+        let handler = NBDHandler::new(filesystem, Arc::new(NbdExportGates::default()));
+        assert_eq!(handler.get_device(b"vm100").await.unwrap().size, 64 * MIB);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn concurrent_identical_provisioning_converges_without_staging_drafts() {
+        let (client, filesystem, shutdown, _directory) = setup().await;
+        let layout = StripedLayout::new("vm100", 64 * MIB, 4, MIB).unwrap();
+        const CALLERS: usize = 8;
+        let barrier = Arc::new(Barrier::new(CALLERS));
+        let mut tasks = Vec::new();
+        for _ in 0..CALLERS {
+            let client = Arc::clone(&client);
+            let layout = layout.clone();
+            let barrier = Arc::clone(&barrier);
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                provision_striped(&client, &layout).await
+            }));
+        }
+
+        let mut created = 0;
+        for task in tasks {
+            match task
+                .await
+                .expect("provisioning task did not panic")
+                .expect("identical provisioning caller converged")
+            {
+                ProvisionOutcome::Created => created += 1,
+                ProvisionOutcome::AlreadyProvisioned => {}
+            }
+        }
+        assert!(created >= 1);
+
+        let entries = client.read_dir("/.nbd").await.unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["vm100"]
+        );
         let handler = NBDHandler::new(filesystem, Arc::new(NbdExportGates::default()));
         assert_eq!(handler.get_device(b"vm100").await.unwrap().size, 64 * MIB);
         shutdown.cancel();

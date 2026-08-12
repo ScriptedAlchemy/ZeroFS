@@ -261,27 +261,42 @@ impl NBDHandler {
         let auth = AuthContext::default();
         let nbd_dir_inode = self.nbd_dir_inode().await?;
 
-        let entries = self
-            .filesystem
-            .readdir(&auth, nbd_dir_inode, 0, NBD_READDIR_DEFAULT_LIMIT)
-            .await?;
-
         let mut devices = Vec::new();
-        for entry in &entries.entries {
-            let name = &entry.name;
-            if name == b"." || name == b".." {
-                continue;
-            }
+        let mut start_after = 0;
+        loop {
+            let page = self
+                .filesystem
+                .readdir(&auth, nbd_dir_inode, start_after, NBD_READDIR_DEFAULT_LIMIT)
+                .await?;
+            let next_start = page.entries.last().map(|entry| entry.cookie);
+            for entry in &page.entries {
+                let name = &entry.name;
+                if name == b"." || name == b".." {
+                    continue;
+                }
 
-            match self.resolve_device(name, entry.fileid).await {
-                Ok(device) => devices.push(device),
-                Err(error) => {
-                    debug!(
-                        "skipping invalid NBD export '{}': {error}",
-                        String::from_utf8_lossy(name)
-                    );
+                match self.resolve_device(name, entry.fileid).await {
+                    Ok(device) => devices.push(device),
+                    Err(error) => {
+                        debug!(
+                            "skipping invalid NBD export '{}': {error}",
+                            String::from_utf8_lossy(name)
+                        );
+                    }
                 }
             }
+            if page.end {
+                break;
+            }
+            let next_start = next_start.ok_or_else(|| {
+                NBDError::Protocol("NBD export listing made no pagination progress".to_string())
+            })?;
+            if next_start <= start_after {
+                return Err(NBDError::Protocol(
+                    "NBD export listing returned a non-increasing cookie".to_string(),
+                ));
+            }
+            start_after = next_start;
         }
 
         Ok(devices)
@@ -554,10 +569,14 @@ impl NBDHandler {
                                         chunk.member_offset,
                                         chunk.length as u32,
                                     )
-                                    .await?;
+                                    .await
+                                    .map_err(CommandError::from)?;
+                                if data.len() != chunk.length as usize {
+                                    return Err(CommandError::IoError);
+                                }
                                 parts.push((chunk.logical_offset, data));
                             }
-                            Ok::<_, FsError>(parts)
+                            Ok::<_, CommandError>(parts)
                         }
                     });
                 let mut output = BytesMut::zeroed(length as usize);
@@ -768,7 +787,8 @@ impl NBDHandler {
 #[cfg(test)]
 mod tests {
     use super::{
-        NBDHandler, NbdBacking, NbdExportGates, NbdMember, map_stripe_chunks, parse_stripe_manifest,
+        CommandError, NBDHandler, NbdBacking, NbdExportGates, NbdMember, map_stripe_chunks,
+        parse_stripe_manifest,
     };
     use crate::fs::ZeroFS;
     use crate::fs::permissions::Credentials;
@@ -944,6 +964,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn striped_read_returns_io_error_when_a_member_is_shorter_than_resolved() {
+        let (filesystem, handler, device) = striped_export().await;
+        let nbd_dir = filesystem
+            .directory_store
+            .get(0, b".nbd")
+            .await
+            .expect("find .nbd directory");
+        let export_dir = filesystem
+            .directory_store
+            .get(nbd_dir, b"striped-test")
+            .await
+            .expect("find striped export");
+        let first_member = filesystem
+            .directory_store
+            .get(export_dir, b"lane-0")
+            .await
+            .expect("find first stripe member");
+        filesystem
+            .setattr(
+                &root_credentials(),
+                first_member,
+                &SetAttributes {
+                    size: SetSize::Set(2048),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("truncate member after resolving the NBD device");
+
+        assert!(matches!(
+            handler.read(&device, 0, 4096).await,
+            Err(CommandError::IoError)
+        ));
+    }
+
+    #[tokio::test]
     async fn striped_trim_and_write_zeroes_preserve_unaffected_bytes() {
         let (_filesystem, handler, device) = striped_export().await;
         let payload = Bytes::from(vec![0x5a; 24 * 1024]);
@@ -979,5 +1035,38 @@ mod tests {
                 .all(|byte| *byte == 0)
         );
         assert!(read_back[18 * 1024..].iter().all(|byte| *byte == 0x5a));
+    }
+
+    #[tokio::test]
+    async fn list_devices_pages_past_the_first_thousand_directory_entries() {
+        let filesystem = Arc::new(
+            ZeroFS::new_in_memory()
+                .await
+                .expect("create test filesystem"),
+        );
+        let credentials = root_credentials();
+        let (nbd_dir, _) = filesystem
+            .mkdir(&credentials, 0, b".nbd", &SetAttributes::default())
+            .await
+            .expect("create .nbd directory");
+        const DEVICE_COUNT: usize = 1005;
+        for index in 0..DEVICE_COUNT {
+            let name = format!("device-{index:04}");
+            filesystem
+                .create(
+                    &credentials,
+                    nbd_dir,
+                    name.as_bytes(),
+                    &SetAttributes::default(),
+                )
+                .await
+                .expect("create NBD export");
+        }
+
+        let handler = NBDHandler::new(filesystem, Arc::new(NbdExportGates::default()));
+        let devices = handler.list_devices().await.expect("list all NBD exports");
+
+        assert_eq!(devices.len(), DEVICE_COUNT);
+        assert!(devices.iter().any(|device| device.name == b"device-1004"));
     }
 }
