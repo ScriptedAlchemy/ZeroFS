@@ -21,7 +21,12 @@ use tracing::error;
 
 /// Frames per write batch before pre-compression fans out on rayon; below
 /// this the dispatch overhead outweighs the parallelism.
-const PARALLEL_COMPRESS_MIN_FRAMES: usize = 8;
+const PARALLEL_COMPRESS_MIN_FRAMES: usize = 1024 * 1024 / EXTENT_SIZE;
+
+#[inline]
+fn should_parallel_compress(frame_count: usize) -> bool {
+    frame_count >= PARALLEL_COMPRESS_MIN_FRAMES
+}
 
 pub(super) const TAIL_CACHE_BYTES: usize = 32 * 1024 * 1024;
 
@@ -251,7 +256,7 @@ impl ExtentStore {
         // batches fan out on rayon; block_in_place needs the multi-thread
         // runtime (tests run current-thread), and small batches stay inline.
         let payloads: Vec<&Bytes> = edits.iter().filter_map(|(_, e)| e.as_ref()).collect();
-        let compressed: Vec<Compressed> = if payloads.len() >= PARALLEL_COMPRESS_MIN_FRAMES
+        let compressed: Vec<Compressed> = if should_parallel_compress(payloads.len())
             && tokio::runtime::Handle::current().runtime_flavor()
                 == tokio::runtime::RuntimeFlavor::MultiThread
         {
@@ -1610,6 +1615,15 @@ mod tests {
         let mut model = Vec::new();
         let data = incompressible(3, PARALLEL_COMPRESS_MIN_FRAMES * 2 * EXTENT_SIZE);
         write_and_check(&store, &db, &mut model, 0, &data).await;
+    }
+
+    #[test]
+    fn canonical_nbd_member_batch_stays_inline_while_one_mib_batch_parallelizes() {
+        let member_frames = 256 * 1024 / EXTENT_SIZE;
+        let one_mib_frames = 1024 * 1024 / EXTENT_SIZE;
+
+        assert!(!should_parallel_compress(member_frames));
+        assert!(should_parallel_compress(one_mib_frames));
     }
 
     #[tokio::test]

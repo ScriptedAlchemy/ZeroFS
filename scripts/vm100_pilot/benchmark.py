@@ -422,6 +422,12 @@ class BenchmarkRunner:
                 sampler.start()
                 phase_device = self._local_device()
                 write_io_before = self._system_io(phase_device)
+                phase_windows: dict[str, dict[str, int]] = {}
+
+                def record_phase(name: str, start_ns: int, end_ns: int) -> None:
+                    phase_windows[name] = {"start_ns": start_ns, "end_ns": end_ns}
+                    receipt.record("phase_monotonic_ns", phase_windows)
+
                 started = time.monotonic_ns()
                 self._run_fio(
                     name="zerofs_user_write",
@@ -432,6 +438,7 @@ class BenchmarkRunner:
                     read=False,
                 )
                 foreground_end = time.monotonic_ns()
+                record_phase("foreground_write", started, foreground_end)
                 write_io_after = self._system_io(phase_device)
                 self.runner.run(["sync", "-f", self.config.mountpoint], sudo=True)
                 accepted_after_write = wait_for_accepted_after(
@@ -445,9 +452,11 @@ class BenchmarkRunner:
                     timeout=self.config.drain_timeout,
                 )
                 local_end = time.monotonic_ns()
+                record_phase("local_durability_tail", foreground_end, local_end)
                 local_io_after = self._system_io(phase_device)
                 self.lifecycle.drain()
                 remote_end = time.monotonic_ns()
+                record_phase("remote_durability_tail", local_end, remote_end)
                 remote_io_after = self._system_io(phase_device)
                 remote_snapshot = self.lifecycle.metrics.snapshot()
                 warmup_start = time.monotonic_ns()
@@ -461,6 +470,7 @@ class BenchmarkRunner:
                     direct=False,
                 )
                 warmup_end = time.monotonic_ns()
+                record_phase("buffered_warmup", warmup_start, warmup_end)
                 warmup_io_after = self._system_io(phase_device)
                 nbd_before = self._nbd_io()
                 hot_start = time.monotonic_ns()
@@ -474,6 +484,7 @@ class BenchmarkRunner:
                     direct=False,
                 )
                 hot_end = time.monotonic_ns()
+                record_phase("page_cache_hot_read", hot_start, hot_end)
                 hot_io_after = self._system_io(phase_device)
                 nbd_after = self._nbd_io()
                 page_cache = verify_page_cache_hit(nbd_before, nbd_after)
@@ -490,6 +501,7 @@ class BenchmarkRunner:
                     direct=True,
                 )
                 direct_end = time.monotonic_ns()
+                record_phase("direct_read", direct_start, direct_end)
                 direct_io_after = self._system_io(phase_device)
                 sampler.stop()
                 sampler_system_io = sampler.system_io

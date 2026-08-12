@@ -25,6 +25,64 @@ _GC_CADENCE_KEYS = (
 )
 
 
+def _phase_perf_report_argv(
+    perf_data: Path, start_ns: int, end_ns: int
+) -> list[str | Path]:
+    if end_ns <= start_ns:
+        raise ValueError("perf phase must have a positive duration")
+    time_range = f"{start_ns / 1_000_000_000:.9f},{end_ns / 1_000_000_000:.9f}"
+    return [
+        "perf",
+        "report",
+        "--stdio",
+        "--no-children",
+        "--sort",
+        "comm,dso,symbol",
+        "--time",
+        time_range,
+        "-i",
+        perf_data,
+    ]
+
+
+def _perf_record_argv(pid: int, perf_data: Path) -> list[str | Path]:
+    return [
+        "perf",
+        "record",
+        "-F",
+        "99",
+        "-g",
+        "--call-graph",
+        "fp",
+        "--clockid",
+        "mono",
+        "-p",
+        str(pid),
+        "-o",
+        perf_data,
+    ]
+
+
+def _load_phase_windows(result: BenchmarkResult) -> dict[str, tuple[int, int]]:
+    if not result.receipt_dir:
+        return {}
+    manifest = Path(result.receipt_dir) / "manifest.json"
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    windows = payload.get("phase_monotonic_ns", {})
+    parsed: dict[str, tuple[int, int]] = {}
+    for name, window in windows.items():
+        if not isinstance(name, str) or not isinstance(window, dict):
+            raise RuntimeError("invalid benchmark phase window receipt")
+        start_ns = window.get("start_ns")
+        end_ns = window.get("end_ns")
+        if not isinstance(start_ns, int) or not isinstance(end_ns, int):
+            raise RuntimeError(f"invalid benchmark phase window: {name}")
+        if end_ns <= start_ns:
+            raise RuntimeError(f"non-positive benchmark phase window: {name}")
+        parsed[name] = (start_ns, end_ns)
+    return parsed
+
+
 def rewrite_gc_cadence(text: str, interval_secs: int) -> str:
     """Set the three segment-GC cadence tiers without reformatting the config."""
 
@@ -262,20 +320,7 @@ class CollectorGroup:
 
         perf_data = self.receipt.path("perf.data")
         perf_record = self.runner.spawn(
-            [
-                "perf",
-                "record",
-                "-F",
-                "99",
-                "-g",
-                "--call-graph",
-                "dwarf",
-                "-p",
-                str(self.pid),
-                "-o",
-                perf_data,
-            ],
-            sudo=True,
+            _perf_record_argv(self.pid, perf_data), sudo=True
         )
         self.processes.append(("interrupt", perf_record))
 
@@ -307,7 +352,7 @@ class CollectorGroup:
             process = self.runner.spawn(argv, stdout=handle, stderr=handle)
             self.processes.append(("terminate", process))
 
-    def stop(self) -> None:
+    def stop(self, phase_windows: dict[str, tuple[int, int]] | None = None) -> None:
         if self._stopped:
             return
         self._stopped = True
@@ -349,6 +394,15 @@ class CollectorGroup:
             self.receipt.path("perf-report.txt").write_text(
                 report.stdout + report.stderr, encoding="utf-8"
             )
+            for phase, (start_ns, end_ns) in (phase_windows or {}).items():
+                phase_report = self.runner.run(
+                    _phase_perf_report_argv(perf_data, start_ns, end_ns),
+                    sudo=True,
+                    check=False,
+                )
+                self.receipt.path(f"perf-report-{phase}.txt").write_text(
+                    phase_report.stdout + phase_report.stderr, encoding="utf-8"
+                )
         if errors:
             raise RuntimeError("collector cleanup failures: " + "; ".join(errors))
 
@@ -380,6 +434,7 @@ class ProfileRunner:
             "CARGO_PROFILE_RELEASE_DEBUG": "1",
             "CARGO_PROFILE_RELEASE_STRIP": "false",
             "CARGO_INCREMENTAL": "0",
+            "RUSTFLAGS": "-C force-frame-pointers=yes",
         }
         self.runner.run(
             [self.config.cargo, "build", "--release", "--locked"],
@@ -494,7 +549,14 @@ class ProfileRunner:
                 cleanup_errors: list[BaseException] = []
                 if collectors is not None:
                     try:
-                        collectors.stop()  # type: ignore[attr-defined]
+                        phase_windows = (
+                            _load_phase_windows(benchmark_result)
+                            if benchmark_result is not None
+                            else {}
+                        )
+                        collectors.stop(  # type: ignore[attr-defined]
+                            phase_windows=phase_windows
+                        )
                     except BaseException as error:
                         cleanup_errors.append(error)
                 if stop_attempted:

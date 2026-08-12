@@ -43,7 +43,13 @@ from scripts.vm100_pilot.metrics import (
     wait_for_gc_quiescence,
     wait_for_local,
 )
-from scripts.vm100_pilot.profile import CanonicalDeployment, ProfileRunner
+from scripts.vm100_pilot.profile import (
+    CanonicalDeployment,
+    ProfileRunner,
+    _load_phase_windows,
+    _phase_perf_report_argv,
+    _perf_record_argv,
+)
 from scripts.vm100_pilot.system_io import (
     BlockIoSnapshot,
     SystemIoSnapshot,
@@ -90,9 +96,7 @@ class FakeRunner(Runner):
             and args[1].startswith("/sys/block/nbd")
             and args[1].endswith("/queue/max_write_zeroes_sectors")
         ):
-            return CompletedProcess(
-                args, 0, self.max_write_zeroes_sectors + "\n", ""
-            )
+            return CompletedProcess(args, 0, self.max_write_zeroes_sectors + "\n", "")
         if args[:1] == ("cat",) and Path(args[1]).is_file():
             return CompletedProcess(args, 0, Path(args[1]).read_text(), "")
         if args[:1] == ("sha256sum",) and Path(args[1]).is_file():
@@ -1614,7 +1618,7 @@ class _ProfileBenchmark:
             remote_active_mibps=4096.0,
             page_cache_hot_read_mibps=4096.0,
             zerofs_direct_read_mibps=4096.0,
-            receipt_dir="test-receipt",
+            receipt_dir="",
         )
 
 
@@ -1626,7 +1630,11 @@ class _TestProfileRunner(ProfileRunner):
         return binary
 
     def _start_collectors(self, pid: int, receipt: RunReceipt) -> Any:
-        return type("Collectors", (), {"stop": lambda _self: None})()
+        return type(
+            "Collectors",
+            (),
+            {"stop": lambda _self, *, phase_windows=None: None},
+        )()
 
     def _service_pid(self) -> int:
         return 123
@@ -1677,6 +1685,93 @@ class ProfileTests(unittest.TestCase):
         self.runner = FakeRunner()
         self.snapshot = WritebackSnapshot(9, 9, 9, 0, 0, 1, 1, False)
         self.lifecycle = _HealthyLifecycle(self.snapshot, self.config)
+
+    def test_profile_build_forces_frame_pointers_for_actionable_callchains(
+        self,
+    ) -> None:
+        class ProfileBuildRunner(FakeRunner):
+            def __init__(self, binary: Path) -> None:
+                super().__init__()
+                self.binary = binary
+                self.build_env: Mapping[str, str] | None = None
+
+            def run(
+                self,
+                argv: Sequence[str | Path],
+                **kwargs: Any,
+            ) -> CompletedProcess[str]:
+                args = tuple(str(value) for value in argv)
+                if args[:2] == (str(self_config.cargo), "build"):
+                    self.build_env = kwargs.get("env")
+                    self.binary.parent.mkdir(parents=True, exist_ok=True)
+                    self.binary.write_bytes(b"profile-binary")
+                    return CompletedProcess(args, 0, "", "")
+                if args[:2] == ("readelf", "-S"):
+                    return CompletedProcess(args, 0, "[1] .debug_info\n", "")
+                return super().run(argv, **kwargs)
+
+        self_config = self.config
+        binary = self.config.profile_target / "release" / "zerofs"
+        runner = ProfileBuildRunner(binary)
+        profiler = ProfileRunner(
+            self.config,
+            runner,
+            self.lifecycle,  # type: ignore[arg-type]
+            _ProfileBenchmark(self.config, self.config_file),
+        )
+
+        self.assertEqual(profiler._build_profile(), binary)
+        self.assertIsNotNone(runner.build_env)
+        assert runner.build_env is not None
+        self.assertIn("-C force-frame-pointers=yes", runner.build_env["RUSTFLAGS"])
+
+    def test_phase_perf_report_uses_exact_monotonic_window(self) -> None:
+        argv = _phase_perf_report_argv(
+            Path("/tmp/perf.data"), 1_000_000_001, 2_500_000_009
+        )
+
+        self.assertEqual(argv[argv.index("--time") + 1], "1.000000001,2.500000009")
+        self.assertEqual(argv[-2:], ["-i", Path("/tmp/perf.data")])
+
+    def test_perf_record_uses_the_same_monotonic_clock_as_phase_receipts(self) -> None:
+        argv = _perf_record_argv(123, Path("/tmp/perf.data"))
+
+        self.assertEqual(argv[argv.index("--clockid") + 1], "mono")
+        self.assertEqual(argv[argv.index("--call-graph") + 1], "fp")
+
+    def test_profile_loads_benchmark_phase_windows_for_perf_slicing(self) -> None:
+        receipt = Path(self.temp.name) / "benchmark-receipt"
+        receipt.mkdir()
+        (receipt / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "phase_monotonic_ns": {
+                        "foreground_write": {"start_ns": 11, "end_ns": 22},
+                        "direct_read": {"start_ns": 33, "end_ns": 44},
+                    }
+                }
+            )
+        )
+        result = replace(
+            calculate_tiers(
+                logical_bytes=1,
+                local_bytes=1,
+                remote_bytes=1,
+                foreground_ms=1,
+                local_end_to_end_ms=1,
+                remote_end_to_end_ms=1,
+                local_active_ms=1,
+                remote_active_ms=1,
+                page_cache_hot_read_ms=1,
+                zerofs_direct_read_ms=1,
+            ),
+            receipt_dir=str(receipt),
+        )
+
+        self.assertEqual(
+            _load_phase_windows(result),
+            {"foreground_write": (11, 22), "direct_read": (33, 44)},
+        )
 
     def test_maintenance_rewrite_updates_only_gc_cadence(self) -> None:
         rewritten = profile_module.rewrite_gc_cadence(
