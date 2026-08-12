@@ -160,7 +160,7 @@ class RawSftpRunner:
         scratch = Path(
             tempfile.mkdtemp(prefix="zerofs-raw-sftp-", dir=self.config.temp_dir)
         )
-        self.config.require_disposable(scratch)
+        self.config.require_temp_child(scratch, "zerofs-raw-sftp-")
         remote = f"zerofs-raw-control-{uuid.uuid4().hex}"
         remote_created = False
         stop_attempted = False

@@ -221,7 +221,7 @@ class PilotLifecycle:
         backup_dir = Path(
             tempfile.mkdtemp(prefix="zerofs-deploy-backup-", dir=self.config.temp_dir)
         )
-        self.config.require_disposable(backup_dir)
+        self.config.require_temp_child(backup_dir, "zerofs-deploy-backup-")
         backup_binary = backup_dir / "zerofs"
         backup_receipt = backup_dir / "build-receipt"
         shutil.copyfile(self.config.binary, backup_binary)
@@ -340,7 +340,7 @@ class PilotLifecycle:
         mount = self.runner.run(
             ["findmnt", "-no", "SOURCE,FSTYPE,TARGET", "-M", self.config.mountpoint]
         ).stdout.split()
-        if mount != ["/dev/nbd0", "xfs", str(self.config.mountpoint)]:
+        if mount != [str(self.config.nbd_device), "xfs", str(self.config.mountpoint)]:
             raise RuntimeError(f"unexpected pilot mount topology: {' '.join(mount)}")
         settings = self._toml()
         writeback = settings.get("writeback", {})

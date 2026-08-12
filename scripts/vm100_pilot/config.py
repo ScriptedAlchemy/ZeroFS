@@ -2,9 +2,50 @@ from __future__ import annotations
 
 import getpass
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
+
+
+_NBD_DEVICE = re.compile(r"/dev/nbd(?:0|[1-9][0-9]*)\Z")
+_STATE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+
+
+def _resolved_absolute(path: Path, role: str) -> Path:
+    if not path.is_absolute():
+        raise ValueError(f"unsafe {role} path: {path} is not absolute")
+    return path.resolve(strict=False)
+
+
+def _require_within(path: Path, parent: Path, role: str) -> Path:
+    resolved = _resolved_absolute(path, role)
+    allowed = parent.resolve(strict=False)
+    try:
+        relative = resolved.relative_to(allowed)
+    except ValueError as error:
+        raise ValueError(
+            f"unsafe {role} path: {resolved} is not below {allowed}"
+        ) from error
+    if not relative.parts:
+        raise ValueError(f"unsafe {role} path: {resolved} is the allowed parent")
+    return resolved
+
+
+def _require_direct_child(path: Path, parent: Path, role: str) -> Path:
+    resolved = _resolved_absolute(path, role)
+    allowed = parent.resolve(strict=False)
+    if resolved.parent != allowed:
+        raise ValueError(
+            f"unsafe {role} path: {resolved} is not a direct child of {allowed}"
+        )
+    return resolved
+
+
+def _require_nbd_device(path: Path, role: str) -> Path:
+    if not _NBD_DEVICE.fullmatch(str(path)):
+        raise ValueError(f"{role} must be an absolute /dev/nbdN NBD device: {path}")
+    return path
 
 
 def _integer(values: Mapping[str, str], name: str, default: int) -> int:
@@ -76,6 +117,7 @@ class PilotConfig:
     nbd_stripe_kib: int
     nbd_socket: Path
     nbd_device: Path
+    pilot_state_root: Path
     ninep_target: str
     migration_device: Path
     migration_mountpoint: Path
@@ -197,6 +239,9 @@ class PilotConfig:
                 values.get("ZEROFS_PILOT_NBD_SOCKET", "/run/zerofs-nbd-pilot/nbd.sock")
             ),
             nbd_device=Path(values.get("ZEROFS_PILOT_NBD_DEVICE", "/dev/nbd0")),
+            pilot_state_root=Path(
+                values.get("ZEROFS_PILOT_STATE_ROOT", "/var/lib/zerofs/nbd-pilot")
+            ),
             ninep_target=values.get(
                 "ZEROFS_PILOT_9P_TARGET",
                 "unix:/run/zerofs-nbd-pilot/9p.sock",
@@ -221,16 +266,93 @@ class PilotConfig:
                 "ZEROFS_PILOT_GROUP", values.get("ZEROFS_PILOT_USER", getpass.getuser())
             ),
         )
-        config.require_disposable(config.result_dir)
-        config.require_disposable(config.build_target)
-        config.require_disposable(config.profile_target)
-        config.require_disposable(config.migration_mountpoint)
-        config.require_disposable(config.admin_mountpoint)
+        config.require_result_dir()
+        config.require_temp_dir()
+        config.require_build_target()
+        config.require_profile_target()
+        config.require_helper_mountpoint(config.migration_mountpoint, "migration")
+        config.require_helper_mountpoint(config.admin_mountpoint, "admin")
+        if config.migration_mountpoint.resolve(
+            strict=False
+        ) == config.admin_mountpoint.resolve(strict=False):
+            raise ValueError("migration and admin mountpoints must be distinct")
+        _require_nbd_device(config.nbd_device, "canonical device")
+        _require_nbd_device(config.migration_device, "migration device")
+        if config.nbd_device == config.migration_device:
+            raise ValueError("canonical and migration NBD devices must be distinct")
+        config.require_pilot_state_root(config.pilot_state_root)
         return config
 
-    def require_disposable(self, path: Path) -> Path:
-        resolved = path.resolve(strict=False)
-        forbidden = {Path("/"), Path("/fast"), self.mountpoint.resolve(strict=False)}
-        if resolved in forbidden or Path("/fast") in resolved.parents:
-            raise ValueError(f"unsafe disposable path: {resolved}")
+    def require_result_dir(self) -> Path:
+        return _require_within(self.result_dir, Path("/var/tmp"), "result directory")
+
+    def require_temp_dir(self) -> Path:
+        resolved = _resolved_absolute(self.temp_dir, "temporary directory")
+        temporary_root = Path("/tmp").resolve(strict=False)
+        if resolved == temporary_root:
+            return resolved
+        return _require_within(self.temp_dir, Path("/var/tmp"), "temporary directory")
+
+    def require_build_target(self) -> Path:
+        return _require_within(self.build_target, Path("/var/tmp"), "build target")
+
+    def require_profile_target(self) -> Path:
+        return _require_within(self.profile_target, Path("/var/tmp"), "profile target")
+
+    def require_helper_mountpoint(self, path: Path, role: str) -> Path:
+        resolved = _require_direct_child(path, Path("/mnt"), f"{role} mountpoint")
+        if resolved == self.mountpoint.resolve(strict=False):
+            raise ValueError(
+                f"unsafe {role} mountpoint path: canonical mountpoint is not disposable"
+            )
         return resolved
+
+    def require_temp_child(self, path: Path, prefix: str) -> Path:
+        self.require_temp_dir()
+        resolved = _require_direct_child(path, self.temp_dir, "temporary child")
+        if not resolved.name.startswith(prefix):
+            raise ValueError(
+                f"unsafe temporary child path: {resolved} lacks prefix {prefix!r}"
+            )
+        return resolved
+
+    def require_result_child(self, path: Path, prefix: str) -> Path:
+        self.require_result_dir()
+        resolved = _require_direct_child(path, self.result_dir, "result child")
+        if not resolved.name.startswith(prefix):
+            raise ValueError(
+                f"unsafe result child path: {resolved} lacks prefix {prefix!r}"
+            )
+        return resolved
+
+    def require_mount_child(self, path: Path, prefix: str, role: str) -> Path:
+        resolved = _require_direct_child(path, self.mountpoint, role)
+        if not resolved.name.startswith(prefix):
+            raise ValueError(f"unsafe {role} path: {resolved} lacks prefix {prefix!r}")
+        return resolved
+
+    def require_pilot_state_root(self, path: Path) -> Path:
+        configured = _require_direct_child(
+            self.pilot_state_root,
+            Path("/var/lib/zerofs"),
+            "pilot state root",
+        )
+        if not _STATE_NAME.fullmatch(configured.name):
+            raise ValueError(f"unsafe pilot state root name: {configured.name!r}")
+        resolved = _resolved_absolute(path, "pilot state root")
+        if resolved != configured:
+            raise ValueError(
+                f"unsafe pilot state root path: {resolved} is not configured root "
+                f"{configured}"
+            )
+        return self.pilot_state_root
+
+    def require_reset_state_backup(self, path: Path) -> Path:
+        state = self.require_pilot_state_root(self.pilot_state_root)
+        resolved = _require_direct_child(path, state.parent, "reset state backup")
+        expected = re.compile(
+            rf"{re.escape(state.name)}-reset-rollback-[0-9a-f]{{32}}\Z"
+        )
+        if not expected.fullmatch(resolved.name):
+            raise ValueError(f"unsafe reset state backup path: {resolved}")
+        return path

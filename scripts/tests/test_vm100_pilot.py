@@ -136,7 +136,7 @@ class FakeRunner(Runner):
 
 class CoreTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.temp = tempfile.TemporaryDirectory()
+        self.temp = tempfile.TemporaryDirectory(dir="/var/tmp")
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name) / "repo"
         self.root.mkdir()
@@ -152,6 +152,73 @@ class CoreTests(unittest.TestCase):
                 self.root,
                 {"ZEROFS_PILOT_ADMIN_MOUNTPOINT": "/fast/zerofs-admin"},
             )
+
+    def test_config_rejects_unsafe_ephemeral_targets(self) -> None:
+        mountpoint = "/mnt/storagebox-nbd-pilot"
+        unsafe = (
+            "/etc/zerofs-work",
+            "/usr/local/zerofs-work",
+            "relative/zerofs-work",
+            "/fast/zerofs-work",
+            mountpoint,
+            "/var/lib/unrelated-zerofs-work",
+        )
+        variables = (
+            "ZEROFS_PILOT_RESULT_DIR",
+            "ZEROFS_PILOT_TMP_DIR",
+            "ZEROFS_BUILD_TARGET_DIR",
+            "ZEROFS_PROFILE_TARGET_DIR",
+        )
+        for variable in variables:
+            for path in unsafe:
+                with self.subTest(variable=variable, path=path):
+                    with self.assertRaisesRegex(ValueError, "unsafe .* path"):
+                        PilotConfig.from_mapping(self.root, {variable: path})
+
+    def test_config_rejects_non_nbd_and_aliased_device_targets(self) -> None:
+        for variable in (
+            "ZEROFS_PILOT_NBD_DEVICE",
+            "ZEROFS_PILOT_MIGRATION_DEVICE",
+        ):
+            for path in ("/dev/sda", "/dev/mapper/root", "dev/nbd7"):
+                with self.subTest(variable=variable, path=path):
+                    with self.assertRaisesRegex(ValueError, "NBD device"):
+                        PilotConfig.from_mapping(self.root, {variable: path})
+
+        with self.assertRaisesRegex(ValueError, "must be distinct"):
+            PilotConfig.from_mapping(
+                self.root,
+                {
+                    "ZEROFS_PILOT_NBD_DEVICE": "/dev/nbd7",
+                    "ZEROFS_PILOT_MIGRATION_DEVICE": "/dev/nbd7",
+                },
+            )
+
+    def test_config_accepts_distinct_configured_nbd_devices(self) -> None:
+        config = PilotConfig.from_mapping(
+            self.root,
+            {
+                "ZEROFS_PILOT_NBD_DEVICE": "/dev/nbd7",
+                "ZEROFS_PILOT_MIGRATION_DEVICE": "/dev/nbd8",
+            },
+        )
+        self.assertEqual(config.nbd_device, Path("/dev/nbd7"))
+        self.assertEqual(config.migration_device, Path("/dev/nbd8"))
+
+    def test_config_rejects_state_roots_outside_exact_pilot_parent(self) -> None:
+        for path in (
+            "/var/lib/zerofs",
+            "/var/lib/other/nbd-pilot",
+            "/var/lib/zerofs/nested/nbd-pilot",
+            "/etc/zerofs/nbd-pilot",
+            "var/lib/zerofs/nbd-pilot",
+        ):
+            with self.subTest(path=path):
+                with self.assertRaisesRegex(ValueError, "pilot state root"):
+                    PilotConfig.from_mapping(
+                        self.root,
+                        {"ZEROFS_PILOT_STATE_ROOT": path},
+                    )
 
     def test_config_has_complete_command_defaults(self) -> None:
         config = PilotConfig.from_mapping(self.root, {})
@@ -169,18 +236,13 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(config.nbd_stripe_kib, 256)
         self.assertEqual(config.migration_device, Path("/dev/nbd1"))
         self.assertEqual(config.nbd_socket, Path("/run/zerofs-nbd-pilot/nbd.sock"))
+        self.assertEqual(config.nbd_device, Path("/dev/nbd0"))
+        self.assertEqual(config.pilot_state_root, Path("/var/lib/zerofs/nbd-pilot"))
         self.assertEqual(config.ninep_target, "unix:/run/zerofs-nbd-pilot/9p.sock")
         self.assertEqual(config.migration_mountpoint, Path("/mnt/zerofs-nbd-migration"))
         self.assertEqual(config.admin_mountpoint, Path("/mnt/zerofs-admin"))
         self.assertEqual(config.temporary_max_size_gib, 256)
         self.assertEqual(config.maintenance_isolation_secs, 3600)
-
-    def test_disposable_path_refuses_root_fast_and_mount_root(self) -> None:
-        config = PilotConfig.from_mapping(self.root, {})
-        for path in (Path("/"), Path("/fast"), config.mountpoint):
-            with self.subTest(path=path):
-                with self.assertRaisesRegex(ValueError, "unsafe disposable path"):
-                    config.require_disposable(path)
 
     def test_profile_maintenance_isolation_has_a_finite_supported_bound(self) -> None:
         for value in (299, 86401):
@@ -345,7 +407,7 @@ max_size_gb = 64.0
 
 class LifecycleTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.temp = tempfile.TemporaryDirectory()
+        self.temp = tempfile.TemporaryDirectory(dir="/var/tmp")
         self.addCleanup(self.temp.cleanup)
         root = Path(self.temp.name) / "repo"
         root.mkdir()
@@ -795,6 +857,8 @@ class LifecycleTests(unittest.TestCase):
         self.assertFalse(any("provision-striped" in call[0] for call in runner.calls))
 
     def test_cutover_preflight_failure_restarts_the_predecessor_clients(self) -> None:
+        checked_devices: list[Path | None] = []
+
         class CutoverMigrator(StripedMigrator):
             @contextmanager
             def _admin_namespace(self) -> Any:
@@ -804,13 +868,15 @@ class LifecycleTests(unittest.TestCase):
                 return None
 
             def _device_size(self, path: Path | None = None) -> int:
+                checked_devices.append(path)
                 return 1
 
+        config = replace(self.config, nbd_device=Path("/dev/nbd7"))
         self.runner.active.update(
-            (self.config.service, self.config.client_service, self.config.mount_unit)
+            (config.service, config.client_service, config.mount_unit)
         )
         migrator = CutoverMigrator(
-            self.config,
+            config,
             self.runner,
             self.lifecycle,
         )
@@ -820,6 +886,57 @@ class LifecycleTests(unittest.TestCase):
 
         self.assertIn(self.config.client_service, self.runner.active)
         self.assertIn(self.config.mount_unit, self.runner.active)
+        self.assertEqual(checked_devices, [Path("/dev/nbd7")])
+        self.assertNotIn(Path("/dev/sda"), checked_devices)
+
+    def test_status_uses_the_configured_nbd_device_authority(self) -> None:
+        config = replace(self.config, nbd_device=Path("/dev/nbd7"))
+
+        class StatusRunner(FakeRunner):
+            def run(
+                self, argv: Sequence[str | Path], **kwargs: Any
+            ) -> CompletedProcess[str]:
+                args = tuple(str(value) for value in argv)
+                if args[:4] == ("findmnt", "-no", "SOURCE,FSTYPE,TARGET", "-M"):
+                    self.calls.append((args, bool(kwargs.get("sudo", False))))
+                    return CompletedProcess(
+                        args,
+                        0,
+                        f"/dev/nbd7 xfs {config.mountpoint}\n",
+                        "",
+                    )
+                if args[:2] == ("cat", str(config.config_file)):
+                    self.calls.append((args, bool(kwargs.get("sudo", False))))
+                    return CompletedProcess(
+                        args,
+                        0,
+                        '[writeback]\nenabled = true\nack_mode = "memory"\n',
+                        "",
+                    )
+                if args[:2] == ("cat", str(config.build_receipt)):
+                    self.calls.append((args, bool(kwargs.get("sudo", False))))
+                    return CompletedProcess(
+                        args, 0, "commit=test\nbinary_sha256=abc\n", ""
+                    )
+                if args and args[0] == "sha256sum":
+                    self.calls.append((args, bool(kwargs.get("sudo", False))))
+                    return CompletedProcess(args, 0, "abc  target\n", "")
+                return super().run(list(argv), **kwargs)
+
+        runner = StatusRunner()
+        runner.active.update((config.service, config.client_service, config.mount_unit))
+        snapshot = WritebackSnapshot(9, 9, 9, 0, 0, 1, 1, False, False, 1, 0, 0)
+        lifecycle = PilotLifecycle(
+            config,
+            runner,  # type: ignore[arg-type]
+            _StaticMetrics(snapshot),  # type: ignore[arg-type]
+        )
+
+        status = lifecycle.status(validate_data=False)
+
+        self.assertEqual(status["mount"]["source"], "/dev/nbd7")
+        findmnt = next(call[0] for call in runner.calls if call[0][0] == "findmnt")
+        self.assertEqual(findmnt[-1], str(config.mountpoint))
 
 
 class _StaticMetrics:
@@ -832,7 +949,7 @@ class _StaticMetrics:
 
 class FreshResetTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.temp = tempfile.TemporaryDirectory()
+        self.temp = tempfile.TemporaryDirectory(dir="/var/tmp")
         self.addCleanup(self.temp.cleanup)
         root = Path(self.temp.name) / "repo"
         root.mkdir()
@@ -923,7 +1040,7 @@ class FreshResetTests(unittest.TestCase):
 
         return ControlledResetter(
             self.config,
-            FakeRunner(),
+            FakeRunner(),  # type: ignore[arg-type]
             Lifecycle(),  # type: ignore[arg-type]
         )
 
@@ -988,23 +1105,27 @@ class FreshResetTests(unittest.TestCase):
         runner = SignatureRunner()
         resetter = FreshResetter(
             self.config,
-            runner,
+            runner,  # type: ignore[arg-type]
             object(),  # type: ignore[arg-type]
         )
         with self.assertRaisesRegex(RuntimeError, "existing block signature"):
             resetter._format_device()
         self.assertFalse(any(call[0][0] == "mkfs.xfs" for call in runner.calls))
 
-    def test_fresh_format_targets_exact_nbd0_without_force(self) -> None:
+    def test_fresh_format_targets_only_the_configured_device_without_force(
+        self,
+    ) -> None:
+        config = replace(self.config, nbd_device=Path("/dev/nbd7"))
+
         class EmptyDeviceRunner(FakeRunner):
             def run(
                 self, argv: Sequence[str | Path], **kwargs: Any
             ) -> CompletedProcess[str]:
                 args = tuple(str(value) for value in argv)
                 self.calls.append((args, bool(kwargs.get("sudo", False))))
-                if args == ("cat", "/sys/block/nbd0/size"):
+                if args == ("cat", "/sys/block/nbd7/size"):
                     return CompletedProcess(args, 0, "134217728\n", "")
-                if args[:4] == ("findmnt", "-rn", "-S", "/dev/nbd0"):
+                if args[:4] == ("findmnt", "-rn", "-S", "/dev/nbd7"):
                     return CompletedProcess(args, 1, "", "")
                 if args[:2] == ("wipefs", "-n"):
                     return CompletedProcess(args, 0, "", "")
@@ -1012,15 +1133,109 @@ class FreshResetTests(unittest.TestCase):
 
         runner = EmptyDeviceRunner()
         resetter = FreshResetter(
-            self.config,
-            runner,
+            config,
+            runner,  # type: ignore[arg-type]
             object(),  # type: ignore[arg-type]
         )
         resetter._format_device()
         mkfs = next(call[0] for call in runner.calls if call[0][0] == "mkfs.xfs")
-        self.assertEqual(mkfs[-1], "/dev/nbd0")
+        self.assertEqual(mkfs[-1], "/dev/nbd7")
         self.assertNotIn("-f", mkfs)
-        self.assertFalse(any("/dev/sda" in value for value in mkfs))
+        device_commands = (
+            call[0]
+            for call in runner.calls
+            if call[0][0] in {"cat", "findmnt", "wipefs", "blkid", "mkfs.xfs"}
+        )
+        for command in device_commands:
+            with self.subTest(command=command):
+                self.assertNotIn("/dev/nbd0", command)
+                self.assertNotIn("/dev/sda", command)
+
+    def test_reset_state_requires_the_configured_root_and_children(self) -> None:
+        class ConfigRunner(FakeRunner):
+            def __init__(self, text: str) -> None:
+                super().__init__()
+                self.text = text
+
+            def run(
+                self, argv: Sequence[str | Path], **kwargs: Any
+            ) -> CompletedProcess[str]:
+                args = tuple(str(value) for value in argv)
+                if args[:2] == ("cat", str(self_config.config_file)):
+                    self.calls.append((args, bool(kwargs.get("sudo", False))))
+                    return CompletedProcess(args, 0, self.text, "")
+                return super().run(list(argv), **kwargs)
+
+        self_config = self.config
+        valid = (
+            '[cache]\ndir = "/var/lib/zerofs/nbd-pilot/read-cache"\n'
+            '[writeback]\ndir = "/var/lib/zerofs/nbd-pilot/writeback"\n'
+        )
+        resetter = FreshResetter(
+            self.config,
+            ConfigRunner(valid),  # type: ignore[arg-type]
+            object(),  # type: ignore[arg-type]
+        )
+        self.assertEqual(resetter._state_root(), self.config.pilot_state_root)
+
+        invalid_pairs = (
+            (
+                "/var/lib/zerofs/another-pilot/read-cache",
+                "/var/lib/zerofs/another-pilot/writeback",
+            ),
+            (
+                "/var/lib/unrelated/read-cache",
+                "/var/lib/unrelated/writeback",
+            ),
+            (
+                "/var/lib/zerofs/nbd-pilot/read-cache",
+                "/var/lib/zerofs/nbd-pilot/not-writeback",
+            ),
+        )
+        for cache_dir, writeback_dir in invalid_pairs:
+            with self.subTest(cache_dir=cache_dir, writeback_dir=writeback_dir):
+                text = (
+                    f'[cache]\ndir = "{cache_dir}"\n'
+                    f'[writeback]\ndir = "{writeback_dir}"\n'
+                )
+                resetter = FreshResetter(
+                    self.config,
+                    ConfigRunner(text),  # type: ignore[arg-type]
+                    object(),  # type: ignore[arg-type]
+                )
+                with self.assertRaisesRegex(ValueError, "configured pilot state root"):
+                    resetter._state_root()
+
+    def test_reset_state_cleanup_refuses_an_arbitrary_var_lib_sibling(self) -> None:
+        config_text = (
+            '[cache]\ndir = "/var/lib/zerofs/nbd-pilot/read-cache"\n'
+            '[writeback]\ndir = "/var/lib/zerofs/nbd-pilot/writeback"\n'
+        )
+
+        class RecordingRunner(FakeRunner):
+            def run(
+                self, argv: Sequence[str | Path], **kwargs: Any
+            ) -> CompletedProcess[str]:
+                args = tuple(str(value) for value in argv)
+                self.calls.append((args, bool(kwargs.get("sudo", False))))
+                if args[:2] == ("cat", str(self_config.config_file)):
+                    return CompletedProcess(args, 0, config_text, "")
+                return CompletedProcess(args, 0, "", "")
+
+        self_config = self.config
+        runner = RecordingRunner()
+        resetter = FreshResetter(
+            self.config,
+            runner,  # type: ignore[arg-type]
+            object(),  # type: ignore[arg-type]
+        )
+
+        with self.assertRaisesRegex(ValueError, "reset state backup"):
+            resetter._restore_old_state(
+                Path("/var/lib/unrelated/nbd-pilot-reset-rollback-deadbeef")
+            )
+
+        self.assertFalse(any(call[0][0] == "rm" for call in runner.calls))
 
 
 class _HealthyLifecycle:
@@ -1052,7 +1267,7 @@ class _HealthyLifecycle:
 
 class BenchmarkTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.temp = tempfile.TemporaryDirectory()
+        self.temp = tempfile.TemporaryDirectory(dir="/var/tmp")
         self.addCleanup(self.temp.cleanup)
         root = Path(self.temp.name) / "repo"
         root.mkdir()
@@ -1368,7 +1583,7 @@ class _TestProfileRunner(ProfileRunner):
 
 class ProfileTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.temp = tempfile.TemporaryDirectory()
+        self.temp = tempfile.TemporaryDirectory(dir="/var/tmp")
         self.addCleanup(self.temp.cleanup)
         root = Path(self.temp.name) / "repo"
         (root / "zerofs").mkdir(parents=True)
@@ -1577,7 +1792,7 @@ enabled = true
 
 class WorkloadEngineTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.temp = tempfile.TemporaryDirectory()
+        self.temp = tempfile.TemporaryDirectory(dir="/var/tmp")
         self.addCleanup(self.temp.cleanup)
         root = Path(self.temp.name) / "repo"
         root.mkdir()
@@ -1602,7 +1817,7 @@ class WorkloadEngineTests(unittest.TestCase):
     def test_workload_root_is_created_with_explicit_owner(self) -> None:
         workload = WorkloadRunner(
             self.config,
-            self.runner,
+            self.runner,  # type: ignore[arg-type]
             self.lifecycle,  # type: ignore[arg-type]
         )
         root = self.config.mountpoint / ".zerofs-workloads-test"
@@ -1614,7 +1829,7 @@ class WorkloadEngineTests(unittest.TestCase):
     def test_parallel_delete_removes_every_child(self) -> None:
         workload = WorkloadRunner(
             self.config,
-            self.runner,
+            self.runner,  # type: ignore[arg-type]
             self.lifecycle,  # type: ignore[arg-type]
         )
         directory = self.config.mountpoint / "node_modules"
@@ -1670,7 +1885,7 @@ known_hosts = "/root/.ssh/known"
 
         raw = RawSftpRunner(
             self.config,
-            ConfigRunner(),
+            ConfigRunner(),  # type: ignore[arg-type]
             self.lifecycle,  # type: ignore[arg-type]
         )
         endpoint = raw._endpoint()

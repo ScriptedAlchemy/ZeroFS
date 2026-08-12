@@ -472,8 +472,10 @@ class StripedMigrator:
             self._verify_layout(namespace, replacement)
             self.lifecycle.stop_storage_clients()
             try:
-                if self._device_size(Path("/dev/nbd0")) != 0:
-                    raise RuntimeError("/dev/nbd0 remained attached after client stop")
+                if self._device_size(self.config.nbd_device) != 0:
+                    raise RuntimeError(
+                        f"{self.config.nbd_device} remained attached after client stop"
+                    )
 
                 def validate() -> None:
                     try:

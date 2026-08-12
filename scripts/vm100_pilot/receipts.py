@@ -39,7 +39,9 @@ class RunReceipt:
     def __enter__(self) -> "RunReceipt":
         return self
 
-    def __exit__(self, error_type: object, error: BaseException | None, tb: object) -> bool:
+    def __exit__(
+        self, error_type: object, error: BaseException | None, tb: object
+    ) -> bool:
         if error is None:
             self.finish("ok")
         else:

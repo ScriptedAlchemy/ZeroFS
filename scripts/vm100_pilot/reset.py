@@ -70,7 +70,7 @@ class FreshResetter:
 
     @property
     def _device(self) -> Path:
-        return Path("/dev/nbd0")
+        return self.config.nbd_device
 
     def _read_config(self) -> str:
         return self.runner.run(["cat", self.config.config_file], sudo=True).stdout
@@ -142,7 +142,7 @@ class FreshResetter:
 
     def _stage_fixtures(self) -> Path:
         seed = self.config.result_dir / f"reset-seed-{uuid.uuid4().hex}"
-        self.config.require_disposable(seed)
+        self.config.require_result_child(seed, "reset-seed-")
         self.runner.run(
             ["install", "-d", "-o", "root", "-g", "root", "-m", "0700", seed],
             sudo=True,
@@ -170,31 +170,30 @@ class FreshResetter:
         return seed
 
     def _remove_seed(self, seed: Path) -> None:
-        self.config.require_disposable(seed)
-        if seed.parent != self.config.result_dir:
-            raise ValueError(f"unexpected reset seed path: {seed}")
+        self.config.require_result_child(seed, "reset-seed-")
         self.runner.run(["rm", "-rf", "--", seed], sudo=True)
 
     def _state_root(self) -> Path:
         settings = tomllib.loads(self._read_config())
         cache_dir = Path(str(settings.get("cache", {}).get("dir", "")))
         writeback_dir = Path(str(settings.get("writeback", {}).get("dir", "")))
+        state = self.config.require_pilot_state_root(self.config.pilot_state_root)
+        expected_cache = (state / "read-cache").resolve(strict=False)
+        expected_writeback = (state / "writeback").resolve(strict=False)
         if (
-            not cache_dir.is_absolute()
-            or not writeback_dir.is_absolute()
-            or cache_dir.name != "read-cache"
-            or writeback_dir.name != "writeback"
-            or cache_dir.parent != writeback_dir.parent
+            cache_dir.resolve(strict=False) != expected_cache
+            or writeback_dir.resolve(strict=False) != expected_writeback
         ):
             raise ValueError(
-                "pilot cache/writeback directories do not share a safe root"
+                "pilot cache/writeback directories must be the expected children "
+                "of the configured pilot state root"
             )
-        return self.config.require_disposable(cache_dir.parent)
+        return state
 
     def _activate_fresh_state(self) -> Path:
         state = self._state_root()
         backup = state.with_name(f"{state.name}-reset-rollback-{uuid.uuid4().hex}")
-        self.config.require_disposable(backup)
+        self.config.require_reset_state_backup(backup)
         exists = self.runner.run(["test", "-e", backup], sudo=True, check=False)
         if exists.returncode == 0:
             raise FileExistsError(f"reset state backup exists: {backup}")
@@ -221,15 +220,13 @@ class FreshResetter:
 
     def _restore_old_state(self, backup: Path) -> None:
         state = self._state_root()
-        self.config.require_disposable(backup)
+        self.config.require_reset_state_backup(backup)
         self.runner.run(["rm", "-rf", "--", state], sudo=True)
         self.runner.run(["mv", "--", backup, state], sudo=True)
 
     def _remove_old_state(self, backup: Path) -> None:
-        self.config.require_disposable(backup)
-        expected_prefix = f"{self._state_root().name}-reset-rollback-"
-        if not backup.name.startswith(expected_prefix):
-            raise ValueError(f"unexpected reset rollback path: {backup}")
+        self._state_root()
+        self.config.require_reset_state_backup(backup)
         self.runner.run(["rm", "-rf", "--", backup], sudo=True)
 
     def _provision(self) -> None:

@@ -313,11 +313,7 @@ class BenchmarkRunner:
         )
 
     def prepare_root(self, run_root: Path) -> None:
-        self.config.require_disposable(run_root)
-        if run_root.parent.resolve(strict=False) != self.config.mountpoint.resolve(
-            strict=False
-        ):
-            raise ValueError(f"benchmark root must be a direct mount child: {run_root}")
+        self.config.require_mount_child(run_root, ".zerofs-bench-", "benchmark root")
         self.runner.run(
             [
                 "install",
@@ -374,7 +370,7 @@ class BenchmarkRunner:
         return FioResult.from_json(output, operation="read" if read else "write")
 
     def _cleanup_root(self, run_root: Path) -> None:
-        self.config.require_disposable(run_root)
+        self.config.require_mount_child(run_root, ".zerofs-bench-", "benchmark root")
         self.runner.run(["rm", "-rf", "--", run_root], sudo=True)
         self.runner.run(["sync", "-f", self.config.mountpoint], sudo=True, check=False)
         try:

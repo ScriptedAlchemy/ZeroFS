@@ -107,7 +107,7 @@ class CanonicalDeployment:
         directory = Path(
             tempfile.mkdtemp(prefix="zerofs-canonical-", dir=config.temp_dir)
         )
-        config.require_disposable(directory)
+        config.require_temp_child(directory, "zerofs-canonical-")
         binary = directory / "zerofs"
         receipt = directory / "build-receipt"
         config_backup = config.config_file.with_name(
@@ -214,7 +214,7 @@ class CanonicalDeployment:
 
     def cleanup(self) -> None:
         self.runner.run(["rm", "-f", "--", self.config_backup], sudo=True)
-        self.config.require_disposable(self.directory)
+        self.config.require_temp_child(self.directory, "zerofs-canonical-")
         shutil.rmtree(self.directory)
 
 
@@ -374,7 +374,7 @@ class ProfileRunner:
         self.benchmark = benchmark or BenchmarkRunner(config, runner, lifecycle)
 
     def _build_profile(self) -> Path:
-        self.config.require_disposable(self.config.profile_target)
+        self.config.require_profile_target()
         env = {
             "CARGO_TARGET_DIR": str(self.config.profile_target),
             "CARGO_PROFILE_RELEASE_DEBUG": "1",

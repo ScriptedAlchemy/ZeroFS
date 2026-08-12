@@ -21,6 +21,7 @@ class PhaseTiming:
     local_sync_ms: int
     remote_tail_ms: int
 
+
 @dataclass(frozen=True, slots=True)
 class WorkloadResult:
     npm_clone_ms: int
@@ -52,11 +53,7 @@ class WorkloadRunner:
         self.lifecycle = lifecycle
 
     def _prepare_root(self, root: Path) -> None:
-        self.config.require_disposable(root)
-        if root.parent.resolve(strict=False) != self.config.mountpoint.resolve(
-            strict=False
-        ):
-            raise ValueError("workload root must be a direct mount child")
+        self.config.require_mount_child(root, ".zerofs-workloads-", "workload root")
         self.runner.run(
             [
                 "install",
@@ -125,6 +122,7 @@ class WorkloadRunner:
         directory.rmdir()
 
     def _cleanup(self, root: Path) -> int:
+        self.config.require_mount_child(root, ".zerofs-workloads-", "workload root")
         started = time.monotonic_ns()
         self.runner.run(["rm", "-rf", "--", root], sudo=True)
         self.runner.run(["sync", "-f", self.config.mountpoint], sudo=True)
