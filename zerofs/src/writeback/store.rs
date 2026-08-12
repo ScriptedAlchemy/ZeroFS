@@ -1802,7 +1802,15 @@ mod tests {
         );
         assert!(store.status().unwrap().terminal_error.is_some());
         controls.release_puts();
-        store.shutdown().await.unwrap();
+        let shutdown_error = store
+            .shutdown()
+            .await
+            .expect_err("shutdown must preserve the remote durability failure");
+        assert!(
+            shutdown_error
+                .to_string()
+                .contains("permanent remote divergence")
+        );
     }
 
     #[tokio::test]
@@ -1959,7 +1967,15 @@ mod tests {
             "terminal rejection must not allocate another sequence"
         );
         controls.release_puts();
-        store.shutdown().await.unwrap();
+        let shutdown_error = store
+            .shutdown()
+            .await
+            .expect_err("shutdown must preserve the remote durability failure");
+        assert!(
+            shutdown_error
+                .to_string()
+                .contains("permanent remote divergence")
+        );
     }
 
     #[tokio::test]
@@ -2045,7 +2061,11 @@ mod tests {
             0,
             "recovery must fail before mutating the remote object"
         );
-        recovered.shutdown().await.unwrap();
+        let shutdown_error = recovered
+            .shutdown()
+            .await
+            .expect_err("shutdown must preserve the missing predecessor failure");
+        assert!(shutdown_error.to_string().contains("predecessor ETag"));
     }
 
     #[tokio::test]
@@ -2953,6 +2973,155 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(journal.progress().unwrap().remote_seq, 1);
+    }
+
+    #[tokio::test]
+    async fn canceled_remote_shutdown_does_not_lose_shutdown_ownership() {
+        let (store, _remote, _temp, controls) = test_store_with_controls(true).await;
+        let journal = store.inner.journal.clone();
+        let pause = journal.pause_remote_mark(1);
+        controls.block_puts();
+        let path = Path::from("zerofs/pilot/segments/01/0000000000000001/0000000000000001");
+        store
+            .put(&path, Bytes::from_static(b"payload").into())
+            .await
+            .unwrap();
+        store.wait_local(1).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while controls.put_count() == 0 {
+                controls.put_activity().notified().await;
+            }
+        })
+        .await
+        .expect("the remote upload did not start");
+        controls.release_put_path(path.as_ref());
+        tokio::time::timeout(Duration::from_secs(2), pause.wait_entered())
+            .await
+            .expect("the ordered remote commit did not begin");
+
+        let first_shutdown = tokio::spawn({
+            let scheduler = store.inner.remote.clone();
+            async move { scheduler.shutdown().await }
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !store.inner.remote.shutdown_requested() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the first caller did not request remote shutdown");
+        assert!(!first_shutdown.is_finished());
+        first_shutdown.abort();
+        assert!(first_shutdown.await.unwrap_err().is_cancelled());
+
+        let mut second_shutdown = tokio::spawn({
+            let scheduler = store.inner.remote.clone();
+            async move { scheduler.shutdown().await }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut second_shutdown)
+                .await
+                .is_err(),
+            "a replacement caller returned before the shared shutdown finished"
+        );
+        pause.release();
+        tokio::time::timeout(Duration::from_secs(2), &mut second_shutdown)
+            .await
+            .expect("replacement shutdown caller did not observe completion")
+            .unwrap()
+            .unwrap();
+        assert_eq!(journal.progress().unwrap().remote_seq, 1);
+        store.inner.journaler.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_preserves_a_staged_remote_terminal_error() {
+        let (store, remote, _temp, controls) = test_store_with_controls(true).await;
+        let terminal_pause = store.inner.remote.pause_terminal_publication();
+        let path = Path::from("manifest");
+        remote
+            .put(&path, Bytes::from_static(b"remote-zero").into())
+            .await
+            .unwrap();
+        let remote_zero = remote.head(&path).await.unwrap();
+        controls.block_puts();
+        let first = store
+            .put_opts(
+                &path,
+                Bytes::from_static(b"local-one").into(),
+                PutOptions::from(PutMode::Update(UpdateVersion {
+                    e_tag: remote_zero.e_tag,
+                    version: remote_zero.version,
+                })),
+            )
+            .await
+            .unwrap();
+        store
+            .put_opts(
+                &path,
+                Bytes::from_static(b"local-two").into(),
+                PutOptions::from(PutMode::Update(first.into())),
+            )
+            .await
+            .unwrap();
+        store.wait_local(2).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while controls.put_count() < 1 {
+                controls.put_activity().notified().await;
+            }
+        })
+        .await
+        .expect("first remote update did not start");
+        controls.release_put_path(path.as_ref());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while controls.put_count() < 2 {
+                controls.put_activity().notified().await;
+            }
+        })
+        .await
+        .expect("chained remote update did not start");
+        remote
+            .put(&path, Bytes::from_static(b"external").into())
+            .await
+            .unwrap();
+        controls.release_put_path(path.as_ref());
+        tokio::time::timeout(Duration::from_secs(2), terminal_pause.wait_entered())
+            .await
+            .expect("terminal remote error was not staged");
+
+        let shutdown = tokio::spawn({
+            let scheduler = store.inner.remote.clone();
+            async move { scheduler.shutdown().await }
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !store.inner.remote.shutdown_requested() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the concurrent stop was not delivered");
+        terminal_pause.release();
+        let shutdown_error = tokio::time::timeout(Duration::from_secs(2), shutdown)
+            .await
+            .expect("remote shutdown did not finish")
+            .unwrap()
+            .expect_err("staged durability error must win over shutdown");
+        assert!(
+            shutdown_error
+                .to_string()
+                .contains("permanent remote divergence")
+        );
+        let barrier_error = store
+            .wait_remote(2)
+            .await
+            .expect_err("staged durability error must remain observable");
+        assert!(
+            barrier_error
+                .to_string()
+                .contains("permanent remote divergence")
+        );
+        controls.release_puts();
+        store.inner.journaler.shutdown().await.unwrap();
     }
 
     #[tokio::test]

@@ -13,6 +13,7 @@ use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutResult, 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::{Mutex, watch};
 use tokio::task::{JoinHandle, JoinSet};
@@ -82,10 +83,58 @@ impl RemoteBarrier {
 
 #[derive(Clone)]
 pub struct RemoteScheduler {
+    inner: Arc<RemoteSchedulerInner>,
+}
+
+struct RemoteSchedulerInner {
     barrier: RemoteBarrier,
     activate: watch::Sender<bool>,
     stop: watch::Sender<bool>,
-    join: Arc<Mutex<Option<JoinHandle<()>>>>,
+    shutdown_started: AtomicBool,
+    join: Mutex<Option<JoinHandle<()>>>,
+    shutdown_result: watch::Sender<Option<Result<(), RemoteBarrierError>>>,
+    #[cfg(test)]
+    terminal_pause: Arc<TerminalPublicationPauseState>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct TerminalPublicationPauseState {
+    armed: AtomicBool,
+    entered: AtomicBool,
+    released: AtomicBool,
+    entered_notify: tokio::sync::Notify,
+    release_notify: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+pub(crate) struct TerminalPublicationPause {
+    state: Arc<TerminalPublicationPauseState>,
+}
+
+#[cfg(test)]
+impl TerminalPublicationPause {
+    pub(crate) async fn wait_entered(&self) {
+        loop {
+            let entered = self.state.entered_notify.notified();
+            if self.state.entered.load(Ordering::Acquire) {
+                return;
+            }
+            entered.await;
+        }
+    }
+
+    pub(crate) fn release(&self) {
+        self.state.released.store(true, Ordering::Release);
+        self.state.release_notify.notify_one();
+    }
+}
+
+#[cfg(test)]
+impl Drop for TerminalPublicationPause {
+    fn drop(&mut self) {
+        self.release();
+    }
 }
 
 impl std::fmt::Debug for RemoteScheduler {
@@ -155,6 +204,9 @@ impl RemoteScheduler {
         });
         let (activate, activation) = watch::channel(active);
         let (stop, stop_receiver) = watch::channel(false);
+        let (shutdown_result, _) = watch::channel(None);
+        #[cfg(test)]
+        let terminal_pause = Arc::new(TerminalPublicationPauseState::default());
         let join = tokio::spawn(run_remote_scheduler(RemoteWorker {
             remote,
             journal,
@@ -166,29 +218,37 @@ impl RemoteScheduler {
             progress: progress_sender,
             activation,
             stop: stop_receiver,
+            #[cfg(test)]
+            terminal_pause: terminal_pause.clone(),
         }));
         Ok(Self {
-            barrier: RemoteBarrier { progress },
-            activate,
-            stop,
-            join: Arc::new(Mutex::new(Some(join))),
+            inner: Arc::new(RemoteSchedulerInner {
+                barrier: RemoteBarrier { progress },
+                activate,
+                stop,
+                shutdown_started: AtomicBool::new(false),
+                join: Mutex::new(Some(join)),
+                shutdown_result,
+                #[cfg(test)]
+                terminal_pause,
+            }),
         })
     }
 
     pub fn barrier(&self) -> RemoteBarrier {
-        self.barrier.clone()
+        self.inner.barrier.clone()
     }
 
     pub fn terminal_error(&self) -> Option<String> {
-        self.barrier.progress.borrow().terminal_error.clone()
+        self.inner.barrier.progress.borrow().terminal_error.clone()
     }
 
     pub fn check_available(&self) -> Result<(), RemoteBarrierError> {
-        let state = self.barrier.progress.borrow();
+        let state = self.inner.barrier.progress.borrow();
         if let Some(error) = &state.terminal_error {
             return Err(RemoteBarrierError::Remote(error.clone()));
         }
-        if state.closed {
+        if state.closed || self.inner.shutdown_started.load(Ordering::Acquire) {
             return Err(RemoteBarrierError::Closed);
         }
         Ok(())
@@ -196,19 +256,75 @@ impl RemoteScheduler {
 
     pub fn activate(&self) -> Result<(), RemoteBarrierError> {
         self.check_available()?;
-        self.activate
+        self.inner
+            .activate
             .send(true)
             .map_err(|_| RemoteBarrierError::Closed)
     }
 
     pub async fn shutdown(&self) -> Result<(), RemoteBarrierError> {
-        let _ = self.stop.send(true);
-        if let Some(join) = self.join.lock().await.take() {
-            join.await
-                .map_err(|error| RemoteBarrierError::Remote(format!("worker panicked: {error}")))?;
+        let mut completion = self.inner.shutdown_result.subscribe();
+        if !self.inner.shutdown_started.swap(true, Ordering::AcqRel) {
+            let inner = self.inner.clone();
+            tokio::spawn(async move {
+                drive_remote_shutdown(inner).await;
+            });
         }
-        Ok(())
+
+        loop {
+            if let Some(result) = completion.borrow().clone() {
+                return result;
+            }
+            if completion.changed().await.is_err() {
+                return Err(remote_terminal_or_closed(&self.inner.barrier));
+            }
+        }
     }
+
+    #[cfg(test)]
+    pub(crate) fn pause_terminal_publication(&self) -> TerminalPublicationPause {
+        assert!(
+            !self.inner.terminal_pause.armed.swap(true, Ordering::AcqRel),
+            "terminal publication pause is already armed"
+        );
+        TerminalPublicationPause {
+            state: self.inner.terminal_pause.clone(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shutdown_requested(&self) -> bool {
+        *self.inner.stop.borrow()
+    }
+}
+
+async fn drive_remote_shutdown(inner: Arc<RemoteSchedulerInner>) {
+    let _ = inner.stop.send(true);
+    let mut outcome = Ok(());
+    if let Some(join) = inner.join.lock().await.take()
+        && let Err(error) = join.await
+    {
+        outcome = Err(RemoteBarrierError::Remote(format!(
+            "worker panicked: {error}"
+        )));
+    }
+    if let Some(error) = current_remote_terminal(&inner.barrier) {
+        outcome = Err(error);
+    }
+    inner.shutdown_result.send_replace(Some(outcome));
+}
+
+fn remote_terminal_or_closed(barrier: &RemoteBarrier) -> RemoteBarrierError {
+    current_remote_terminal(barrier).unwrap_or(RemoteBarrierError::Closed)
+}
+
+fn current_remote_terminal(barrier: &RemoteBarrier) -> Option<RemoteBarrierError> {
+    barrier
+        .progress
+        .borrow()
+        .terminal_error
+        .clone()
+        .map(RemoteBarrierError::Remote)
 }
 
 struct RemoteWorker {
@@ -222,6 +338,8 @@ struct RemoteWorker {
     progress: watch::Sender<RemoteProgress>,
     activation: watch::Receiver<bool>,
     stop: watch::Receiver<bool>,
+    #[cfg(test)]
+    terminal_pause: Arc<TerminalPublicationPauseState>,
 }
 
 struct CompletedRemote {
@@ -264,6 +382,8 @@ async fn run_remote_scheduler(worker: RemoteWorker) {
         progress,
         mut activation,
         mut stop,
+        #[cfg(test)]
+        terminal_pause,
     } = worker;
     loop {
         if *stop.borrow() {
@@ -338,6 +458,18 @@ async fn run_remote_scheduler(worker: RemoteWorker) {
         let mut retry = false;
         let mut terminal_error = None::<String>;
         loop {
+            #[cfg(test)]
+            if terminal_error.is_some() && terminal_pause.armed.load(Ordering::Acquire) {
+                terminal_pause.entered.store(true, Ordering::Release);
+                terminal_pause.entered_notify.notify_one();
+                loop {
+                    let released = terminal_pause.release_notify.notified();
+                    if terminal_pause.released.load(Ordering::Acquire) {
+                        break;
+                    }
+                    released.await;
+                }
+            }
             if committing.is_none() && terminal_error.is_none() {
                 committing = start_ready_commit(&journal, &overlay, &disk, next, &completed);
             }
@@ -387,6 +519,7 @@ async fn run_remote_scheduler(worker: RemoteWorker) {
                 }, if committing.is_some() => SchedulerEvent::Commit(outcome),
                 changed = stop.changed() => {
                     if changed.is_err() || *stop.borrow() {
+                        let mut shutdown_error = terminal_error.take();
                         abort_and_join_remote(&mut active).await;
                         if let Some(commit) = committing.take() {
                             let (sequence, result) = commit.await;
@@ -397,14 +530,11 @@ async fn run_remote_scheduler(worker: RemoteWorker) {
                                 &mut next,
                                 &mut completed,
                             ) {
-                                publish_terminal(
-                                    &progress,
-                                    &admission,
-                                    &disk,
-                                    format!("{error:#}"),
-                                    true,
-                                );
+                                shutdown_error.get_or_insert_with(|| format!("{error:#}"));
                             }
+                        }
+                        if let Some(error) = shutdown_error {
+                            publish_terminal(&progress, &admission, &disk, error, true);
                         }
                         break 'scheduler;
                     }

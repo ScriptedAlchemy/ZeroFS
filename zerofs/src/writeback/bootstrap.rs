@@ -419,7 +419,12 @@ mod tests {
                 .is_some(),
             "terminal divergence must remain observable after waking waiters"
         );
-        recovered.lifecycle.shutdown().await.unwrap();
+        let shutdown_error = recovered
+            .lifecycle
+            .shutdown()
+            .await
+            .expect_err("shutdown must preserve the remote durability failure");
+        assert!(shutdown_error.to_string().contains("different bytes"));
     }
 
     #[tokio::test]
