@@ -45,10 +45,18 @@ struct OverlayEntry {
     payload: Option<PayloadLocation>,
 }
 
+#[derive(Default)]
+struct OverlayState {
+    entries: BTreeMap<Path, VecDeque<OverlayEntry>>,
+    paths_by_sequence: BTreeMap<Sequence, BTreeSet<Path>>,
+}
+
 #[derive(Clone)]
 pub struct OverlayIndex {
     remote: Arc<dyn ObjectStore>,
-    entries: Arc<RwLock<BTreeMap<Path, VecDeque<OverlayEntry>>>>,
+    state: Arc<RwLock<OverlayState>>,
+    #[cfg(test)]
+    cleanup_path_visits: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl std::fmt::Debug for OverlayIndex {
@@ -64,7 +72,9 @@ impl OverlayIndex {
     pub fn new(remote: Arc<dyn ObjectStore>) -> Self {
         Self {
             remote,
-            entries: Arc::new(RwLock::new(BTreeMap::new())),
+            state: Arc::new(RwLock::new(OverlayState::default())),
+            #[cfg(test)]
+            cleanup_path_visits: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -74,7 +84,7 @@ impl OverlayIndex {
     ) -> anyhow::Result<Self> {
         let overlay = Self::new(remote);
         let records = journal.snapshot()?.records;
-        let mut entries = BTreeMap::<Path, VecDeque<OverlayEntry>>::new();
+        let mut state = OverlayState::default();
         for record in records {
             let path = parse_path(&record.path)?;
             let payload = match record.kind {
@@ -91,10 +101,10 @@ impl OverlayIndex {
             } else {
                 OverlayEffect::Put
             };
-            install_locked(&mut entries, path, record.clone(), effect, payload)?;
+            install_locked(&mut state, path, record.clone(), effect, payload)?;
             if let MutationKind::Rename { source, .. } = &record.kind {
                 install_locked(
-                    &mut entries,
+                    &mut state,
                     parse_path(source)?,
                     record,
                     OverlayEffect::Delete,
@@ -102,7 +112,7 @@ impl OverlayIndex {
                 )?;
             }
         }
-        *overlay.entries.write().await = entries;
+        *overlay.state.write().await = state;
         Ok(overlay)
     }
 
@@ -183,22 +193,22 @@ impl OverlayIndex {
         validate_verified_payload(&record, &payload)?;
         let target = parse_path(&record.path)?;
         let source = parse_path(source)?;
-        let mut entries = self.entries.write().await;
+        let mut state = self.state.write().await;
         install_locked(
-            &mut entries,
+            &mut state,
             target,
             record.clone(),
             OverlayEffect::Put,
             Some(PayloadLocation::Memory(payload.into_bytes())),
         )?;
         if let Err(error) = install_locked(
-            &mut entries,
+            &mut state,
             source,
             record.clone(),
             OverlayEffect::Delete,
             None,
         ) {
-            remove_sequence_locked(&mut entries, record.sequence);
+            remove_sequence_locked(&mut state, record.sequence);
             return Err(error);
         }
         Ok(())
@@ -211,8 +221,8 @@ impl OverlayIndex {
         payload: Option<PayloadLocation>,
     ) -> anyhow::Result<()> {
         let path = parse_path(&record.path)?;
-        let mut entries = self.entries.write().await;
-        install_locked(&mut entries, path, record, effect, payload)
+        let mut state = self.state.write().await;
+        install_locked(&mut state, path, record, effect, payload)
     }
 
     pub async fn mark_local(
@@ -223,9 +233,17 @@ impl OverlayIndex {
         let committed = journal
             .mutation(sequence)?
             .ok_or_else(|| anyhow::anyhow!("journal sequence {sequence} does not exist"))?;
-        let mut entries = self.entries.write().await;
+        let mut state = self.state.write().await;
         let mut matched = false;
-        for versions in entries.values_mut() {
+        let paths = state
+            .paths_by_sequence
+            .get(&sequence)
+            .cloned()
+            .unwrap_or_default();
+        for path in paths {
+            let Some(versions) = state.entries.get_mut(&path) else {
+                continue;
+            };
             for entry in versions
                 .iter_mut()
                 .filter(|entry| entry.record.sequence == sequence)
@@ -247,16 +265,32 @@ impl OverlayIndex {
     }
 
     pub async fn remove_remote_prefix(&self, through: Sequence) {
-        let mut entries = self.entries.write().await;
-        entries.retain(|_, versions| {
-            versions.retain(|entry| entry.record.sequence > through);
-            !versions.is_empty()
-        });
+        let mut state = self.state.write().await;
+        let affected = state
+            .paths_by_sequence
+            .range(..=through)
+            .flat_map(|(_, paths)| paths.iter().cloned())
+            .collect::<BTreeSet<_>>();
+        for path in affected {
+            #[cfg(test)]
+            self.cleanup_path_visits
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let remove_path = state.entries.get_mut(&path).is_some_and(|versions| {
+                versions.retain(|entry| entry.record.sequence > through);
+                versions.is_empty()
+            });
+            if remove_path {
+                state.entries.remove(&path);
+            }
+        }
+        state
+            .paths_by_sequence
+            .retain(|sequence, _| *sequence > through);
     }
 
     pub async fn remove_sequence(&self, sequence: Sequence) {
-        let mut entries = self.entries.write().await;
-        remove_sequence_locked(&mut entries, sequence);
+        let mut state = self.state.write().await;
+        remove_sequence_locked(&mut state, sequence);
     }
 
     pub async fn visible_version(
@@ -383,18 +417,20 @@ impl OverlayIndex {
     }
 
     async fn visible_entry(&self, location: &Path) -> Option<OverlayEntry> {
-        self.entries
+        self.state
             .read()
             .await
+            .entries
             .get(location)
             .and_then(|entries| entries.back())
             .cloned()
     }
 
     async fn visible_entries(&self, prefix: Option<&Path>) -> Vec<(Path, OverlayEntry)> {
-        self.entries
+        self.state
             .read()
             .await
+            .entries
             .iter()
             .filter(|(path, _)| prefix.is_none_or(|prefix| path.prefix_matches(prefix)))
             .filter_map(|(path, entries)| {
@@ -466,13 +502,14 @@ fn validate_verified_payload(
 }
 
 fn install_locked(
-    entries: &mut BTreeMap<Path, VecDeque<OverlayEntry>>,
+    state: &mut OverlayState,
     path: Path,
     record: MutationRecord,
     effect: OverlayEffect,
     payload: Option<PayloadLocation>,
 ) -> anyhow::Result<()> {
-    let versions = entries.entry(path).or_default();
+    let sequence = record.sequence;
+    let versions = state.entries.entry(path.clone()).or_default();
     if let Some(previous) = versions.back()
         && record.sequence <= previous.record.sequence
     {
@@ -483,17 +520,28 @@ fn install_locked(
         effect,
         payload,
     });
+    state
+        .paths_by_sequence
+        .entry(sequence)
+        .or_default()
+        .insert(path);
     Ok(())
 }
 
-fn remove_sequence_locked(
-    entries: &mut BTreeMap<Path, VecDeque<OverlayEntry>>,
-    sequence: Sequence,
-) {
-    entries.retain(|_, versions| {
-        versions.retain(|entry| entry.record.sequence != sequence);
-        !versions.is_empty()
-    });
+fn remove_sequence_locked(state: &mut OverlayState, sequence: Sequence) {
+    let paths = state
+        .paths_by_sequence
+        .remove(&sequence)
+        .unwrap_or_default();
+    for path in paths {
+        let remove_path = state.entries.get_mut(&path).is_some_and(|versions| {
+            versions.retain(|entry| entry.record.sequence != sequence);
+            versions.is_empty()
+        });
+        if remove_path {
+            state.entries.remove(&path);
+        }
+    }
 }
 
 fn parse_path(path: &str) -> anyhow::Result<Path> {
@@ -778,6 +826,33 @@ mod tests {
         release.notify_one();
 
         assert!(listing.await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn remote_cleanup_visits_only_paths_changed_by_the_completed_sequence() {
+        let overlay = OverlayIndex::new(remote_with(&[]).await);
+        for sequence in 1..=1_000 {
+            overlay
+                .install_memory(
+                    put_record(sequence, &format!("tree/object-{sequence}"), b"x"),
+                    Bytes::from_static(b"x"),
+                )
+                .await
+                .unwrap();
+        }
+        overlay
+            .cleanup_path_visits
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+
+        overlay.remove_remote_prefix(1).await;
+
+        assert_eq!(
+            overlay
+                .cleanup_path_visits
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "remote completion must not rescan every unrelated overlay path"
+        );
     }
 
     #[tokio::test]
