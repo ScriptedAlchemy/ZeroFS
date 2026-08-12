@@ -151,7 +151,9 @@ impl ExtentStore {
         );
     }
 
-    /// Stage deletes for extents `[start, end)` with their live-byte debits.
+    /// Stage deletes for allocated extents in `[start, end)` with their live-byte
+    /// debits. The transaction must be fresh with respect to this inode's extent
+    /// keys: the database scan cannot see writes already staged on `txn`.
     pub async fn delete_range(
         &self,
         txn: &mut Transaction,
@@ -176,15 +178,13 @@ impl ExtentStore {
             .map_err(|_| FsError::IoError)?;
         while let Some(result) = stream.next().await {
             let (key, value) = result.map_err(|_| FsError::IoError)?;
-            if self.key_codec.parse_extent_key(&key).is_some()
-                && let Some(loc) = FrameLoc::decode(&value)
-            {
-                // Delete debit: live only, total untouched (monotonic).
-                self.seg_delta(txn, loc.segid, -(loc.byte_len as i64), 0);
+            if self.key_codec.parse_extent_key(&key).is_some() {
+                if let Some(loc) = FrameLoc::decode(&value) {
+                    // Delete debit: live only, total untouched (monotonic).
+                    self.seg_delta(txn, loc.segid, -(loc.byte_len as i64), 0);
+                }
+                txn.delete_bytes(&key);
             }
-        }
-        for extent_idx in start..end {
-            self.delete(txn, id, extent_idx);
         }
         Ok(())
     }
@@ -754,9 +754,22 @@ mod tests {
     use super::*;
     use crate::config::CompressionConfig;
     use crate::fault_store::{FaultControls, FaultStore};
+    use crate::replication::ReplOp;
+    use slatedb::WriteBatch;
     use slatedb::object_store::ObjectStore;
     use slatedb::object_store::memory::InMemory;
     use tokio::sync::Semaphore;
+
+    fn staged_delete_keys(mut txn: Transaction) -> Vec<Bytes> {
+        let _ = txn.take_seg_deltas();
+        txn.apply_to_collecting(&mut WriteBatch::new())
+            .into_iter()
+            .filter_map(|op| match op {
+                ReplOp::Delete(key) => Some(key),
+                _ => None,
+            })
+            .collect()
+    }
 
     async fn four_dirty_lanes(max_inflight_seals: usize) -> (ExtentStore, Arc<FaultControls>) {
         let (_store, db) = make().await;
@@ -950,6 +963,100 @@ mod tests {
         store.delete_range(&mut txn, inode, 0, 2).await.unwrap();
         commit(&store, txn).await;
         assert_eq!(segcount_of(&store, &db, seg).await, 0);
+    }
+
+    #[tokio::test]
+    async fn empty_one_tib_delete_range_stages_no_operations() {
+        let (store, db) = make().await;
+        let mut txn = db.new_transaction().unwrap();
+        let one_tib_extents = (1_u64 << 40) / EXTENT_SIZE as u64;
+
+        store
+            .delete_range(&mut txn, 1, 0, one_tib_extents)
+            .await
+            .unwrap();
+
+        assert!(
+            txn.is_empty(),
+            "an empty sparse range must not stage logical-hole tombstones"
+        );
+        assert!(txn.take_seg_deltas().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sparse_delete_range_stages_only_its_two_allocated_extents() {
+        let (store, db) = make().await;
+        let inode: InodeId = 17;
+        let allocated = [2_u64, 7];
+        let mut old_size = 0;
+        for extent in allocated {
+            let mut txn = db.new_transaction().unwrap();
+            store
+                .write(
+                    &mut txn,
+                    inode,
+                    extent * EXTENT_SIZE as u64,
+                    &Bytes::from_static(b"x"),
+                    old_size,
+                )
+                .await
+                .unwrap();
+            commit(&store, txn).await;
+            old_size = extent * EXTENT_SIZE as u64 + 1;
+        }
+
+        let mut txn = db.new_transaction().unwrap();
+        store.delete_range(&mut txn, inode, 0, 8).await.unwrap();
+
+        assert_eq!(
+            staged_delete_keys(txn),
+            allocated.map(|extent| store.key_codec.extent_key(inode, extent)),
+        );
+    }
+
+    #[tokio::test]
+    async fn sparse_truncate_preserves_prefix_and_zeroes_removed_data() {
+        let (store, db) = make().await;
+        let inode: InodeId = 23;
+        let sparse_extent = 7_u64;
+        let old_size = sparse_extent * EXTENT_SIZE as u64 + 1;
+
+        let mut txn = db.new_transaction().unwrap();
+        store
+            .write(&mut txn, inode, 0, &Bytes::from(vec![0x5a; EXTENT_SIZE]), 0)
+            .await
+            .unwrap();
+        commit(&store, txn).await;
+
+        let mut txn = db.new_transaction().unwrap();
+        store
+            .write(
+                &mut txn,
+                inode,
+                sparse_extent * EXTENT_SIZE as u64,
+                &Bytes::from_static(b"x"),
+                EXTENT_SIZE as u64,
+            )
+            .await
+            .unwrap();
+        commit(&store, txn).await;
+
+        let mut txn = db.new_transaction().unwrap();
+        store
+            .truncate(&mut txn, inode, old_size, 100)
+            .await
+            .unwrap();
+        commit(&store, txn).await;
+
+        let got = store.read(inode, 0, old_size).await.unwrap();
+        assert_eq!(&got[..100], &[0x5a; 100]);
+        assert!(got[100..].iter().all(|byte| *byte == 0));
+        assert!(
+            db.get_bytes(&store.key_codec.extent_key(inode, sparse_extent))
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     // The debit scan must find and debit *every* prior frame of a multi-extent
