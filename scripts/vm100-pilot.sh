@@ -22,6 +22,11 @@ INTEGRITY_SHA256=${ZEROFS_PILOT_INTEGRITY_SHA256:-db1fb0431bce321750e25a93bd46ce
 METADATA_DIR=${ZEROFS_PILOT_METADATA_DIR:-$MOUNTPOINT/metadata-v2}
 METADATA_FILE_COUNT=${ZEROFS_PILOT_METADATA_FILE_COUNT:-1024}
 RESULT_DIR=${ZEROFS_PILOT_RESULT_DIR:-/var/tmp/zerofs-pilot-results}
+TMP_DIR=${ZEROFS_PILOT_TMP_DIR:-/tmp}
+LOCK_FILE=${ZEROFS_PILOT_LOCK_FILE:-/var/tmp/zerofs-vm100-pilot.lock}
+PROC_ROOT=${ZEROFS_PILOT_PROC_ROOT:-/proc}
+EXPECTED_ACK_MODE=${ZEROFS_PILOT_EXPECT_ACK_MODE:-memory}
+DRAIN_TIMEOUT=${ZEROFS_PILOT_DRAIN_TIMEOUT:-600}
 CARGO_CMD=${ZEROFS_PILOT_CARGO:-}
 NPM_WORKLOAD_REPO=${ZEROFS_NPM_WORKLOAD_REPO:-https://github.com/npm/cli.git}
 NPM_WORKLOAD_COMMIT=${ZEROFS_NPM_WORKLOAD_COMMIT:-64763a341e7aa5b456e696f956759bf9b3440dc1}
@@ -39,12 +44,69 @@ fi
 log() { printf '[vm100-pilot] %s\n' "$*" >&2; }
 die() { log "ERROR: $*"; exit 1; }
 
+command -v flock >/dev/null 2>&1 || die "flock is required"
+exec 9>>"$LOCK_FILE" || die "cannot open harness lock $LOCK_FILE"
+flock -n 9 || die "another vm100-pilot operation is already running (lock: $LOCK_FILE)"
+
 metric_from() {
   local name=$1 snapshot=$2
   awk -v n="$name" '$1 == n { print $2; exit }' <<<"$snapshot"
 }
 
-metrics_snapshot() { curl -fsS "$METRICS_URL"; }
+metrics_snapshot() { curl -fsS --connect-timeout 2 --max-time 5 "$METRICS_URL"; }
+
+config_value() {
+  local section=$1 key=$2
+  sudo awk -v wanted_section="$section" -v wanted_key="$key" '
+    /^[[:space:]]*\[/ {
+      current = $0
+      sub(/^[[:space:]]*\[/, "", current)
+      sub(/\][[:space:]]*(#.*)?$/, "", current)
+      next
+    }
+    current == wanted_section && $0 ~ "^[[:space:]]*" wanted_key "[[:space:]]*=" {
+      value = $0
+      sub(/^[^=]*=[[:space:]]*/, "", value)
+      sub(/[[:space:]]*#.*$/, "", value)
+      gsub(/^[[:space:]\"]+|[[:space:]\"]+$/, "", value)
+      print value
+      exit
+    }
+  ' "$CONFIG"
+}
+
+validate_runtime() {
+  local main_pid running_exe cmdline installed_sha running_sha config_sha enabled ack_mode writeback_dir
+  main_pid=$(systemctl show "$SERVICE" -p MainPID --value)
+  [[ $main_pid =~ ^[1-9][0-9]*$ ]] || die "$SERVICE has no running MainPID"
+  running_exe=$(sudo readlink "$PROC_ROOT/$main_pid/exe")
+  [[ $running_exe == "$BINARY" ]] || die "$SERVICE is running $running_exe, expected $BINARY"
+  cmdline=$(tr '\0' ' ' <"$PROC_ROOT/$main_pid/cmdline")
+  case " $cmdline " in
+    *" $BINARY "*) ;;
+    *) die "$SERVICE command line does not use $BINARY" ;;
+  esac
+  case " $cmdline " in
+    *" --config $CONFIG "*) ;;
+    *) die "$SERVICE command line does not use --config $CONFIG" ;;
+  esac
+
+  installed_sha=$(sha256sum "$BINARY" | awk '{print $1}')
+  running_sha=$(sudo sha256sum "$PROC_ROOT/$main_pid/exe" | awk '{print $1}')
+  [[ $running_sha == "$installed_sha" ]] || die "running binary does not match installed binary"
+  config_sha=$(sudo sha256sum "$CONFIG" | awk '{print $1}')
+
+  enabled=$(config_value writeback enabled)
+  ack_mode=$(config_value writeback ack_mode)
+  writeback_dir=$(config_value writeback dir)
+  [[ $enabled == true ]] || die "[writeback] enabled is ${enabled:-unset}, expected true"
+  [[ $ack_mode == "$EXPECTED_ACK_MODE" ]] || die "[writeback] ack_mode is ${ack_mode:-unset}, expected $EXPECTED_ACK_MODE"
+  [[ $writeback_dir == /* ]] || die "[writeback] dir must be an absolute path"
+
+  printf 'running_binary_sha256=%s\n' "$running_sha"
+  printf 'config_sha256=%s\n' "$config_sha"
+  printf 'writeback_enabled=%s ack_mode=%s writeback_dir=%s\n' "$enabled" "$ack_mode" "$writeback_dir"
+}
 
 require_vm100() {
   [[ $(hostname) == ubuntu-main ]] || die "run this only on VM100 (ubuntu-main)"
@@ -62,7 +124,9 @@ wait_active() {
 }
 
 wait_drain() {
-  local timeout=${1:-600} stable=0 snapshot accepted local_seq remote dirty_ram dirty_ssd terminal
+  local timeout=${1:-$DRAIN_TIMEOUT} stable=0 snapshot accepted local_seq remote dirty_ram dirty_ssd terminal
+  local started_ms first_drained_epoch_ms=0 now_ms
+  started_ms=$(date +%s%3N)
   for _ in $(seq 1 "$timeout"); do
     if ! snapshot=$(metrics_snapshot 2>/dev/null); then
       stable=0
@@ -75,19 +139,30 @@ wait_drain() {
     dirty_ram=$(metric_from zerofs_writeback_dirty_ram_bytes "$snapshot")
     dirty_ssd=$(metric_from zerofs_writeback_dirty_ssd_bytes "$snapshot")
     terminal=$(metric_from zerofs_writeback_terminal_error "$snapshot")
+    [[ -n $accepted && -n $local_seq && -n $remote && -n $dirty_ram && -n $dirty_ssd && -n $terminal ]] \
+      || die "writeback metrics snapshot is missing required fields"
+    [[ $terminal == 0 ]] || die "writeback reported a terminal error while waiting for drain"
     if [[ $accepted == "$local_seq" && $accepted == "$remote" && $dirty_ram == 0 && $dirty_ssd == 0 && $terminal == 0 ]]; then
+      now_ms=$(date +%s%3N)
+      (( first_drained_epoch_ms > 0 )) || first_drained_epoch_ms=$now_ms
       stable=$((stable + 1))
     else
       stable=0
     fi
     if (( stable >= 4 )); then
-      printf 'drained accepted=%s local=%s remote=%s dirty_ram=%s dirty_ssd=%s terminal=%s\n' \
-        "$accepted" "$local_seq" "$remote" "$dirty_ram" "$dirty_ssd" "$terminal"
+      printf 'drained accepted=%s local=%s remote=%s dirty_ram=%s dirty_ssd=%s terminal=%s first_drained_epoch_ms=%s first_drained_wait_ms=%s\n' \
+        "$accepted" "$local_seq" "$remote" "$dirty_ram" "$dirty_ssd" "$terminal" \
+        "$first_drained_epoch_ms" "$((first_drained_epoch_ms - started_ms))"
       return 0
     fi
     sleep 1
   done
   die "writeback did not drain within ${timeout}s"
+}
+
+drain() {
+  require_vm100
+  wait_drain "$DRAIN_TIMEOUT"
 }
 
 status() {
@@ -98,16 +173,18 @@ status() {
     printf '%s=active\n' "$unit"
   done
   findmnt -no SOURCE,FSTYPE,TARGET "$MOUNTPOINT"
-  local binary_sha integrity_sha metadata_count snapshot
+  local binary_sha integrity_sha metadata_count snapshot runtime_receipt
   binary_sha=$(sha256sum "$BINARY" | awk '{print $1}')
+  runtime_receipt=$(validate_runtime)
   integrity_sha=$(sudo timeout 180 sha256sum "$INTEGRITY_FILE" | awk '{print $1}')
   [[ $integrity_sha == "$INTEGRITY_SHA256" ]] || die "integrity sentinel hash mismatch"
-  metadata_count=$(sudo find "$METADATA_DIR" -type f -printf . | wc -c)
+  metadata_count=$(sudo find "$METADATA_DIR" -type f -printf . | wc -c | tr -d '[:space:]')
   [[ $metadata_count == "$METADATA_FILE_COUNT" ]] || die "metadata file count is $metadata_count, expected $METADATA_FILE_COUNT"
   snapshot=$(metrics_snapshot)
   printf 'binary_sha256=%s integrity_sha256=%s metadata_files=%s restarts=%s\n' \
     "$binary_sha" "$integrity_sha" "$metadata_count" \
     "$(systemctl show "$SERVICE" -p NRestarts --value)"
+  printf '%s\n' "$runtime_receipt"
   for name in \
     zerofs_writeback_accepted_sequence zerofs_writeback_local_sequence \
     zerofs_writeback_remote_sequence zerofs_writeback_dirty_ram_bytes \
@@ -122,7 +199,14 @@ teardown() {
   sudo systemctl stop "$MOUNT_UNIT" || true
   sudo systemctl stop "$CLIENT_SERVICE" || true
   sudo systemctl stop "$SERVICE" || true
+  local unit active_units=()
+  for unit in "$MOUNT_UNIT" "$CLIENT_SERVICE" "$SERVICE"; do
+    if [[ $(systemctl is-active "$unit" 2>/dev/null || true) == active ]]; then
+      active_units+=("$unit")
+    fi
+  done
   findmnt -rn "$MOUNTPOINT" >/dev/null && die "$MOUNTPOINT remains mounted"
+  (( ${#active_units[@]} == 0 )) || die "${active_units[*]} remains active after stop"
   log "teardown complete; canonical data/cache/journal were retained"
 }
 
@@ -186,26 +270,60 @@ sample_metrics() {
   done
 }
 
+BENCH_SAMPLER=
+BENCH_STOP_FILE=
+BENCH_PREFIX=
+BENCH_RESULT=
+
+cleanup_benchmark() {
+  local exit_status=$?
+  trap - EXIT INT TERM
+  if [[ -n ${BENCH_STOP_FILE:-} ]]; then
+    touch "$BENCH_STOP_FILE" 2>/dev/null || true
+  fi
+  if [[ -n ${BENCH_SAMPLER:-} ]]; then
+    wait "$BENCH_SAMPLER" 2>/dev/null || true
+  fi
+  if [[ -n ${BENCH_PREFIX:-} ]]; then
+    sudo rm -f "$MOUNTPOINT/$BENCH_PREFIX".* 2>/dev/null || true
+  fi
+  [[ -z ${BENCH_STOP_FILE:-} ]] || rm -f "$BENCH_STOP_FILE"
+  if [[ -n ${BENCH_RESULT:-} ]]; then
+    printf 'harness_exit_status=%s\n' "$exit_status" >>"$BENCH_RESULT"
+  fi
+  exit "$exit_status"
+}
+
 benchmark() {
   require_vm100
   status >/dev/null
-  wait_drain 600 >/dev/null
+  wait_drain "$DRAIN_TIMEOUT" >/dev/null
   local total_mib=${ZEROFS_BENCH_TOTAL_MIB:-1024}
   local jobs=${ZEROFS_BENCH_JOBS:-4}
   (( total_mib > 0 && jobs > 0 && total_mib % jobs == 0 )) || die "total MiB must be positive and divisible by jobs"
   local per_job_mib=$((total_mib / jobs))
-  local run timestamp result sample stop_file fio_output prefix
+  local run timestamp result sample stop_file fio_output status_output drain_output prefix
   timestamp=$(date -u +%Y%m%dT%H%M%SZ)
   run="${timestamp}-$$"
   sudo install -d -m 0755 -o "$(id -un)" -g "$(id -gn)" "$RESULT_DIR"
   result="$RESULT_DIR/storage-$run.txt"
-  sample="/tmp/zerofs-metrics-$run.csv"
-  stop_file="/tmp/zerofs-metrics-$run.stop"
-  fio_output="/tmp/zerofs-fio-$run.txt"
+  sample="$RESULT_DIR/storage-$run-metrics.csv"
+  stop_file="$TMP_DIR/zerofs-metrics-$run.stop"
+  fio_output="$RESULT_DIR/storage-$run-fio.txt"
+  status_output="$RESULT_DIR/storage-$run-status.txt"
+  drain_output="$RESULT_DIR/storage-$run-drain.txt"
   prefix=".zerofs-bench-$run"
   sudo rm -f "$MOUNTPOINT/$prefix".* "$stop_file"
+  status >"$status_output"
+  BENCH_STOP_FILE=$stop_file
+  BENCH_PREFIX=$prefix
+  BENCH_RESULT=$result
+  trap cleanup_benchmark EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
   sample_metrics "$sample" "$stop_file" &
   local sampler=$!
+  BENCH_SAMPLER=$sampler
   local snapshot bytes0 bytes1 t0 t1 t2 t3
   snapshot=$(metrics_snapshot)
   bytes0=$(metric_from zerofs_writeback_remote_bytes_completed_total "$snapshot")
@@ -218,18 +336,20 @@ benchmark() {
   t1=$(date +%s%3N)
   sudo sync -f "$MOUNTPOINT"
   t2=$(date +%s%3N)
-  wait_drain 600 >/dev/null
+  wait_drain "$DRAIN_TIMEOUT" >"$drain_output"
   t3=$(date +%s%3N)
   snapshot=$(metrics_snapshot)
   bytes1=$(metric_from zerofs_writeback_remote_bytes_completed_total "$snapshot")
   touch "$stop_file"
+  BENCH_SAMPLER=
   wait "$sampler"
   local user_ms=$((t1 - t0)) local_ms=$((t2 - t1)) end_ms=$((t3 - t0))
   local logical_bytes=$((total_mib * 1024 * 1024)) remote_bytes=$((bytes1 - bytes0))
-  local user_mibps local_mibps remote_wall_mibps remote_active
+  local user_mibps remote_wall_mibps remote_active first_drained_epoch_ms first_drained_ms
   user_mibps=$(awk -v b="$logical_bytes" -v ms="$user_ms" 'BEGIN { printf "%.2f", b/1048576/(ms/1000) }')
-  local_mibps=$(awk -v b="$logical_bytes" -v ms="$local_ms" 'BEGIN { printf "%.2f", b/1048576/(ms/1000) }')
   remote_wall_mibps=$(awk -v b="$remote_bytes" -v ms="$end_ms" 'BEGIN { printf "%.2f", b/1048576/(ms/1000) }')
+  first_drained_epoch_ms=$(awk '{ for (i=1; i<=NF; i++) if ($i ~ /^first_drained_epoch_ms=/) { sub(/^[^=]*=/, "", $i); print $i; exit } }' "$drain_output")
+  first_drained_ms=$((first_drained_epoch_ms - t0))
   remote_active=$(awk -F, 'NR==2 { base=$7; prev=$7 } NR>2 && $7>prev { if (!first) first=$1; last=$1; prev=$7 } END { if (first && last>first) print last-first; else print 0 }' "$sample")
   local remote_active_mibps
   remote_active_mibps=$(awk -v b="$remote_bytes" -v ms="$remote_active" 'BEGIN { if (ms>0) printf "%.2f", b/1048576/(ms/1000); else print "0.00" }')
@@ -237,23 +357,29 @@ benchmark() {
     printf 'commit=%s\n' "$(git -C "$ROOT" rev-parse HEAD)"
     printf 'logical_bytes=%s remote_bytes=%s\n' "$logical_bytes" "$remote_bytes"
     printf 'user_experienced_ms=%s user_experienced_MiBps=%s durability=volatile_page_cache_and_memory_ack\n' "$user_ms" "$user_mibps"
-    printf 'local_flush_ms=%s local_flush_MiBps=%s durability=zerofs_ssd_journal\n' "$local_ms" "$local_mibps"
-    printf 'remote_end_to_end_ms=%s remote_wall_MiBps=%s remote_active_ms=%s remote_active_MiBps=%s durability=storage_box_sftp_ack\n' \
-      "$end_ms" "$remote_wall_mibps" "$remote_active" "$remote_active_mibps"
+    printf 'local_sync_wait_ms=%s local_durable_end_to_end_ms=%s durability=zerofs_ssd_journal throughput=not_computable_without_local_durable_byte_counter\n' \
+      "$local_ms" "$((t2 - t0))"
+    printf 'remote_first_drained_end_to_end_ms=%s remote_stable_end_to_end_ms=%s remote_wall_MiBps=%s remote_active_ms=%s remote_active_MiBps=%s durability=storage_box_sftp_ack\n' \
+      "$first_drained_ms" "$end_ms" "$remote_wall_mibps" "$remote_active" "$remote_active_mibps"
     grep -E 'WRITE:|write: IOPS' "$fio_output" | tail -n 3
-    printf 'metric_samples=%s\n' "$sample"
+    printf 'status_receipt=%s metric_samples=%s fio_output=%s drain_receipt=%s\n' \
+      "$status_output" "$sample" "$fio_output" "$drain_output"
   } | tee "$result"
   sudo rm -f "$MOUNTPOINT/$prefix".*
   sudo sync -f "$MOUNTPOINT"
-  wait_drain 600 >/dev/null
-  sudo rm -f "$stop_file" "$fio_output"
+  wait_drain "$DRAIN_TIMEOUT" >/dev/null
+  rm -f "$stop_file"
+  BENCH_STOP_FILE=
+  BENCH_PREFIX=
+  BENCH_RESULT=
+  trap - EXIT INT TERM
   printf 'result=%s\n' "$result"
 }
 
 raw_sftp() {
   require_vm100
-  wait_drain 600 >/dev/null
-  local url authority user hostport host port key known timestamp remote localdir
+  wait_drain "$DRAIN_TIMEOUT" >/dev/null
+  local url authority user hostport host port key known timestamp remote localdir result
   url=$(sudo awk -F'"' '/^url = / { print $2; exit }' "$CONFIG")
   authority=${url#sftp://}; authority=${authority%%/*}
   user=${authority%@*}; hostport=${authority#*@}; host=${hostport%:*}; port=${hostport##*:}
@@ -262,20 +388,25 @@ raw_sftp() {
   timestamp=$(date -u +%Y%m%dT%H%M%SZ)
   remote="zerofs-raw-control-$timestamp-$$"
   localdir="/var/tmp/$remote"
+  sudo install -d -m 0755 -o "$(id -un)" -g "$(id -gn)" "$RESULT_DIR"
+  result="$RESULT_DIR/raw-sftp-$timestamp-$$.txt"
   sudo install -d -m 0755 -o "$(id -un)" -g "$(id -gn)" "$localdir"
   for i in $(seq 0 7); do sudo fallocate -l 128M "$localdir/file-$i.bin"; done
   local -a sftp_cmd=(sudo sftp -q -B 261120 -R 64 -P "$port" -i "$key" -o UserKnownHostsFile="$known" -o StrictHostKeyChecking=yes -o BatchMode=yes -o Compression=no "$user@$host")
   teardown
   local restored=0 restore_failed=0 remote_created=0 cleaned=0
+  RAW_SFTP_PIDS=()
   cleanup_raw() {
     local exit_status=$?
+    trap - EXIT INT TERM
+    stop_and_reap_raw_jobs
     if (( remote_created && ! cleaned )); then
       { for i in $(seq 0 7); do printf 'rm %s/file-%s.bin\n' "$remote" "$i"; done; printf 'rmdir %s\n' "$remote"; } | "${sftp_cmd[@]}" >/dev/null 2>&1 || true
     fi
     sudo rm -rf "$localdir"
     restore
     (( restore_failed == 0 )) || exit_status=1
-    return "$exit_status"
+    exit "$exit_status"
   }
   restore() {
     if (( ! restored )); then
@@ -284,32 +415,58 @@ raw_sftp() {
     fi
   }
   trap cleanup_raw EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
   printf 'mkdir %s\n' "$remote" | "${sftp_cmd[@]}"
   remote_created=1
-  local t0 t1 t2 pids=()
+  local t0 t1 t2
   t0=$(date +%s%3N)
   for i in $(seq 0 7); do
-    (trap - EXIT; printf 'put %s %s/file-%s.bin\n' "$localdir/file-$i.bin" "$remote" "$i" | "${sftp_cmd[@]}" >"$localdir/upload-$i.log" 2>&1) &
-    pids+=("$!")
+    (trap - EXIT INT TERM; printf 'put %s %s/file-%s.bin\n' "$localdir/file-$i.bin" "$remote" "$i" | "${sftp_cmd[@]}" >"$RESULT_DIR/raw-sftp-$timestamp-$$-upload-$i.log" 2>&1) &
+    RAW_SFTP_PIDS+=("$!")
   done
-  for pid in "${pids[@]}"; do wait "$pid"; done
+  wait_all_raw_jobs || die "one or more raw SFTP upload workers failed"
   t1=$(date +%s%3N)
-  pids=()
   for i in $(seq 0 7); do
-    (trap - EXIT; printf 'get %s/file-%s.bin /dev/null\n' "$remote" "$i" | "${sftp_cmd[@]}" >"$localdir/download-$i.log" 2>&1) &
-    pids+=("$!")
+    (trap - EXIT INT TERM; printf 'get %s/file-%s.bin /dev/null\n' "$remote" "$i" | "${sftp_cmd[@]}" >"$RESULT_DIR/raw-sftp-$timestamp-$$-download-$i.log" 2>&1) &
+    RAW_SFTP_PIDS+=("$!")
   done
-  for pid in "${pids[@]}"; do wait "$pid"; done
+  wait_all_raw_jobs || die "one or more raw SFTP download workers failed"
   t2=$(date +%s%3N)
   { for i in $(seq 0 7); do printf 'rm %s/file-%s.bin\n' "$remote" "$i"; done; printf 'rmdir %s\n' "$remote"; } | "${sftp_cmd[@]}"
   cleaned=1
   sudo rm -rf "$localdir"
   restore
-  trap - EXIT
+  trap - EXIT INT TERM
   printf 'raw_sftp_bytes=1073741824 upload_ms=%s upload_MiBps=%s download_ms=%s download_MiBps=%s\n' \
     "$((t1-t0))" "$(awk -v ms="$((t1-t0))" 'BEGIN { printf "%.2f", 1024/(ms/1000) }')" \
-    "$((t2-t1))" "$(awk -v ms="$((t2-t1))" 'BEGIN { printf "%.2f", 1024/(ms/1000) }')"
+    "$((t2-t1))" "$(awk -v ms="$((t2-t1))" 'BEGIN { printf "%.2f", 1024/(ms/1000) }')" | tee "$result"
+  printf 'result=%s\n' "$result"
   (( restore_failed == 0 )) || die "raw SFTP control completed, but ZeroFS required a recovery restart"
+}
+
+RAW_SFTP_PIDS=()
+
+wait_all_raw_jobs() {
+  local pid failed=0
+  [[ ${RAW_SFTP_PIDS+x} ]] || return 0
+  for pid in "${RAW_SFTP_PIDS[@]}"; do
+    wait "$pid" || failed=1
+  done
+  RAW_SFTP_PIDS=()
+  (( failed == 0 ))
+}
+
+stop_and_reap_raw_jobs() {
+  local pid
+  [[ ${RAW_SFTP_PIDS+x} ]] || return 0
+  for pid in "${RAW_SFTP_PIDS[@]}"; do
+    kill "$pid" 2>/dev/null || true
+  done
+  for pid in "${RAW_SFTP_PIDS[@]}"; do
+    wait "$pid" 2>/dev/null || true
+  done
+  RAW_SFTP_PIDS=()
 }
 
 clone_pinned() {
@@ -329,7 +486,7 @@ workloads() {
   [[ -n $CARGO_CMD && -x $CARGO_CMD ]] || die "cargo was not found; set ZEROFS_PILOT_CARGO"
   (( DELETE_JOBS > 0 )) || die "ZEROFS_DELETE_JOBS must be positive"
   status >/dev/null
-  wait_drain 600 >/dev/null
+  wait_drain "$DRAIN_TIMEOUT" >/dev/null
 
   local timestamp run workroot result npm_log cargo_log
   timestamp=$(date -u +%Y%m%dT%H%M%SZ)
@@ -352,7 +509,7 @@ workloads() {
       log "cleaned failed workload tree in $(($(date +%s%3N) - cleanup_start)) ms"
       WORKLOAD_CLEANED=1
       sudo sync -f "$MOUNTPOINT" || exit_status=1
-      wait_drain 600 >/dev/null || exit_status=1
+      wait_drain "$DRAIN_TIMEOUT" >/dev/null || exit_status=1
       [[ ! -e $WORKLOAD_ROOT ]] || exit_status=1
     fi
     exit "$exit_status"
@@ -367,7 +524,7 @@ workloads() {
   clone_pinned "$NPM_WORKLOAD_REPO" "$NPM_WORKLOAD_COMMIT" "$workroot/npm-cli"
   npm_clone_ms=$(($(date +%s%3N) - clone_start))
   sudo sync -f "$MOUNTPOINT"
-  wait_drain 600 >/dev/null
+  wait_drain "$DRAIN_TIMEOUT" >/dev/null
 
   npm_cold_start=$(date +%s%3N)
   if ! (cd "$workroot/npm-cli" && npm ci --ignore-scripts --no-audit --no-fund) >"$npm_log" 2>&1; then
@@ -379,7 +536,7 @@ workloads() {
   sudo sync -f "$MOUNTPOINT"
   npm_cold_sync_ms=$(($(date +%s%3N) - npm_cold_sync_start))
   npm_cold_remote_start=$(date +%s%3N)
-  wait_drain 600 >/dev/null
+  wait_drain "$DRAIN_TIMEOUT" >/dev/null
   npm_cold_remote_ms=$(($(date +%s%3N) - npm_cold_remote_start))
 
   npm_remove_start=$(date +%s%3N)
@@ -389,7 +546,7 @@ workloads() {
   sudo sync -f "$MOUNTPOINT"
   npm_remove_sync_ms=$(($(date +%s%3N) - npm_remove_sync_start))
   npm_remove_remote_start=$(date +%s%3N)
-  wait_drain 600 >/dev/null
+  wait_drain "$DRAIN_TIMEOUT" >/dev/null
   npm_remove_remote_ms=$(($(date +%s%3N) - npm_remove_remote_start))
 
   npm_warm_start=$(date +%s%3N)
@@ -402,7 +559,7 @@ workloads() {
   sudo sync -f "$MOUNTPOINT"
   npm_warm_sync_ms=$(($(date +%s%3N) - npm_warm_sync_start))
   npm_warm_remote_start=$(date +%s%3N)
-  wait_drain 600 >/dev/null
+  wait_drain "$DRAIN_TIMEOUT" >/dev/null
   npm_warm_remote_ms=$(($(date +%s%3N) - npm_warm_remote_start))
 
   npm_parallel_remove_start=$(date +%s%3N)
@@ -414,7 +571,7 @@ workloads() {
   sudo sync -f "$MOUNTPOINT"
   npm_parallel_remove_sync_ms=$(($(date +%s%3N) - npm_parallel_remove_sync_start))
   npm_parallel_remove_remote_start=$(date +%s%3N)
-  wait_drain 600 >/dev/null
+  wait_drain "$DRAIN_TIMEOUT" >/dev/null
   npm_parallel_remove_remote_ms=$(($(date +%s%3N) - npm_parallel_remove_remote_start))
 
   local cargo_clone_start cargo_clone_ms cargo_cold_start cargo_cold_ms cargo_cold_sync_start cargo_cold_sync_ms cargo_cold_remote_start cargo_cold_remote_ms
@@ -423,7 +580,7 @@ workloads() {
   clone_pinned "$RUST_WORKLOAD_REPO" "$RUST_WORKLOAD_COMMIT" "$workroot/ripgrep"
   cargo_clone_ms=$(($(date +%s%3N) - cargo_clone_start))
   sudo sync -f "$MOUNTPOINT"
-  wait_drain 600 >/dev/null
+  wait_drain "$DRAIN_TIMEOUT" >/dev/null
 
   cargo_cold_start=$(date +%s%3N)
   if ! (cd "$workroot/ripgrep" && "$CARGO_CMD" build --locked) >"$cargo_log" 2>&1; then
@@ -435,7 +592,7 @@ workloads() {
   sudo sync -f "$MOUNTPOINT"
   cargo_cold_sync_ms=$(($(date +%s%3N) - cargo_cold_sync_start))
   cargo_cold_remote_start=$(date +%s%3N)
-  wait_drain 600 >/dev/null
+  wait_drain "$DRAIN_TIMEOUT" >/dev/null
   cargo_cold_remote_ms=$(($(date +%s%3N) - cargo_cold_remote_start))
 
   cargo_noop_start=$(date +%s%3N)
@@ -453,7 +610,7 @@ workloads() {
   sudo sync -f "$MOUNTPOINT"
   cargo_incremental_sync_ms=$(($(date +%s%3N) - cargo_incremental_sync_start))
   cargo_incremental_remote_start=$(date +%s%3N)
-  wait_drain 600 >/dev/null
+  wait_drain "$DRAIN_TIMEOUT" >/dev/null
   cargo_incremental_remote_ms=$(($(date +%s%3N) - cargo_incremental_remote_start))
 
   local cleanup_start cleanup_ms
@@ -462,7 +619,7 @@ workloads() {
   cleanup_ms=$(($(date +%s%3N) - cleanup_start))
   WORKLOAD_CLEANED=1
   sudo sync -f "$MOUNTPOINT"
-  wait_drain 600 >/dev/null
+  wait_drain "$DRAIN_TIMEOUT" >/dev/null
   [[ ! -e $workroot ]] || die "disposable workload tree remains after cleanup"
   trap - EXIT
 
@@ -500,12 +657,16 @@ iterate() {
 
 usage() {
   cat <<'EOF'
-Usage: scripts/vm100-pilot.sh <setup|teardown|restart|status|benchmark|workloads|raw-sftp|iterate|all>
+Usage: scripts/vm100-pilot.sh <setup|teardown|restart|status|drain|benchmark|workloads|raw-sftp|iterate|all>
 
 Environment:
   ZEROFS_SKIP_BUILD=1       Start without pulling/building/installing.
   ZEROFS_BENCH_TOTAL_MIB=N  Logical benchmark size (default 1024).
   ZEROFS_BENCH_JOBS=N       Concurrent fio jobs (default 4).
+  ZEROFS_PILOT_DRAIN_TIMEOUT=N
+                             Maximum writeback drain wait in seconds (default 600).
+  ZEROFS_PILOT_EXPECT_ACK_MODE=MODE
+                             Required configured durability mode (default memory).
   ZEROFS_NPM_WORKLOAD_*     Override the pinned npm repository and commit.
   ZEROFS_RUST_WORKLOAD_*    Override the pinned Cargo repository and commit.
   ZEROFS_DELETE_JOBS=N      Parallel node_modules deletion workers (default 4).
@@ -517,6 +678,7 @@ case ${1:-} in
   teardown) teardown ;;
   restart) teardown; ZEROFS_SKIP_BUILD=1 start_stack ;;
   status) status ;;
+  drain) drain ;;
   benchmark) benchmark ;;
   workloads) workloads ;;
   raw-sftp) raw_sftp ;;

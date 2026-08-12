@@ -1,0 +1,239 @@
+#!/usr/bin/env bash
+# The single-quoted bodies below are scripts written into fake executables; their
+# variables must expand when the fake runs, not while the test creates it.
+# shellcheck disable=SC2016
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+SCRIPT="$ROOT/scripts/vm100-pilot.sh"
+TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/vm100-pilot-test.XXXXXX")
+trap '[[ ${KEEP_TEST_ROOT:-0} == 1 ]] || rm -rf "$TEST_ROOT"' EXIT
+
+pass=0
+fail=0
+
+record_pass() {
+  printf 'ok - %s\n' "$1"
+  pass=$((pass + 1))
+}
+
+record_fail() {
+  printf 'not ok - %s\n' "$1" >&2
+  fail=$((fail + 1))
+}
+
+new_fixture() {
+  FIXTURE=$(mktemp -d "$TEST_ROOT/case.XXXXXX")
+  FAKEBIN="$FIXTURE/bin"
+  mkdir -p "$FAKEBIN" "$FIXTURE/results" "$FIXTURE/tmp" "$FIXTURE/mount/metadata"
+  : >"$FIXTURE/env"
+  printf '0\n' >"$FIXTURE/date-counter"
+  printf 'sentinel\n' >"$FIXTURE/mount/integrity.bin"
+  printf 'metadata\n' >"$FIXTURE/mount/metadata/one"
+  printf 'binary\n' >"$FIXTURE/zerofs"
+  chmod +x "$FIXTURE/zerofs"
+  cat >"$FIXTURE/config.toml" <<EOF
+[storage]
+url = "sftp://user@example.invalid:23/zerofs"
+
+[cache]
+dir = "$FIXTURE/read-cache"
+disk_size_gb = 10.0
+
+[writeback]
+enabled = true
+dir = "$FIXTURE/writeback"
+ack_mode = "memory"
+memory_size_gb = 1.0
+disk_size_gb = 10.0
+min_free_gb = 1.0
+EOF
+  mkdir -p "$FIXTURE/proc/123"
+  printf '%s\0run\0--config\0%s\0' "$FIXTURE/zerofs" "$FIXTURE/config.toml" >"$FIXTURE/proc/123/cmdline"
+  ln -s "$FIXTURE/zerofs" "$FIXTURE/proc/123/exe"
+  cat >"$FIXTURE/metrics" <<'EOF'
+zerofs_writeback_accepted_sequence 9
+zerofs_writeback_local_sequence 9
+zerofs_writeback_remote_sequence 9
+zerofs_writeback_dirty_ram_bytes 0
+zerofs_writeback_dirty_ssd_bytes 0
+zerofs_writeback_remote_bytes_completed_total 1048576
+zerofs_writeback_terminal_error 0
+EOF
+
+  make_fake hostname 'printf "ubuntu-main\n"'
+  make_fake flock '[[ ${FAKE_FLOCK_FAIL:-0} != 1 ]]'
+  make_fake sudo 'exec "$@"'
+  make_fake findmnt 'if [[ ${1:-} == -rn ]]; then exit 1; fi; printf "/dev/nbd0 xfs %s\n" "$ZEROFS_PILOT_MOUNTPOINT"'
+  make_fake find 'if [[ $* == *"-printf ."* ]]; then /usr/bin/find "$1" -type f | while IFS= read -r _; do printf .; done; else exec /usr/bin/find "$@"; fi'
+  make_fake sha256sum 'exec /usr/bin/shasum -a 256 "$@"'
+  make_fake curl 'cat "$FAKE_METRICS_FILE"'
+  make_fake sleep 'printf "sleep\n" >>"$FAKE_CALL_LOG"; /bin/sleep 0.001'
+  make_fake timeout 'shift; exec "$@"'
+  make_fake date '
+if [[ $* == *"%s%3N"* ]]; then
+  while ! mkdir "$FAKE_DATE_COUNTER.lock" 2>/dev/null; do /bin/sleep 0.001; done
+  value=$(cat "$FAKE_DATE_COUNTER")
+  value=$((value + 10))
+  printf "%s\n" "$value" >"$FAKE_DATE_COUNTER"
+  rmdir "$FAKE_DATE_COUNTER.lock"
+  printf "1700000000%03d\n" "$value"
+else
+  exec /bin/date "$@"
+fi'
+  make_fake systemctl '
+case ${1:-} in
+  stop) printf "stop %s\n" "$2" >>"$FAKE_CALL_LOG"; exit 0 ;;
+  start) printf "start %s\n" "$2" >>"$FAKE_CALL_LOG"; exit 0 ;;
+  reset-failed) exit 0 ;;
+  is-active)
+    if [[ ${FAKE_STICKY_ACTIVE:-0} == 1 ]]; then printf "active\n"; exit 0; fi
+    last=$(grep -F -e "stop $2" -e "start $2" "$FAKE_CALL_LOG" 2>/dev/null | tail -1 || true)
+    if [[ $last == "stop $2" ]]; then printf "inactive\n"; exit 3; fi
+    printf "active\n"; exit 0 ;;
+  show)
+    case "$*" in
+      *MainPID*) printf "123\n" ;;
+      *NRestarts*) printf "0\n" ;;
+      *) printf "0\n" ;;
+    esac
+    exit 0 ;;
+  status) exit 0 ;;
+esac
+exit 1'
+  make_fake fio 'printf "fio invoked\n" >>"$FAKE_CALL_LOG"; for arg in "$@"; do case $arg in --output=*) output=${arg#--output=} ;; esac; done; [[ -z ${output:-} ]] || printf "WRITE: bw=1MiB/s\n" >"$output"; exit "${FAKE_FIO_RC:-0}"'
+  make_fake sync 'exit 0'
+  make_fake fallocate 'target=${@: -1}; : >"$target"'
+  make_fake sftp '
+input=$(cat)
+if [[ $input == put\ * ]]; then
+  printf "upload_start %s\n" "$$" >>"$FAKE_CALL_LOG"
+  trap '\''printf "upload_end %s\n" "$$" >>"$FAKE_CALL_LOG"'\'' EXIT
+  if [[ ${FAKE_SFTP_FAIL_UPLOAD:-0} == 1 && $input == *file-0.bin* ]]; then exit 23; fi
+  /bin/sleep 0.05
+fi
+exit 0'
+}
+
+make_fake() {
+  local name=$1 body=$2
+  {
+    printf '#!/usr/bin/env bash\nset -euo pipefail\n'
+    printf '%s\n' "$body"
+  } >"$FAKEBIN/$name"
+  chmod +x "$FAKEBIN/$name"
+}
+
+run_pilot() {
+  local command=$1
+  shift
+  env \
+    PATH="$FAKEBIN:/opt/homebrew/bin:/usr/bin:/bin" \
+    FAKE_CALL_LOG="$FIXTURE/calls.log" \
+    FAKE_METRICS_FILE="$FIXTURE/metrics" \
+    FAKE_DATE_COUNTER="$FIXTURE/date-counter" \
+    ZEROFS_PILOT_CONFIG="$FIXTURE/config.toml" \
+    ZEROFS_PILOT_ENV="$FIXTURE/env" \
+    ZEROFS_PILOT_BINARY="$FIXTURE/zerofs" \
+    ZEROFS_PILOT_PROC_ROOT="$FIXTURE/proc" \
+    ZEROFS_PILOT_LOCK_FILE="$FIXTURE/pilot.lock" \
+    ZEROFS_PILOT_TMP_DIR="$FIXTURE/tmp" \
+    ZEROFS_PILOT_RESULT_DIR="$FIXTURE/results" \
+    ZEROFS_PILOT_MOUNTPOINT="$FIXTURE/mount" \
+    ZEROFS_PILOT_INTEGRITY_FILE="$FIXTURE/mount/integrity.bin" \
+    ZEROFS_PILOT_INTEGRITY_SHA256="$(sha256sum "$FIXTURE/mount/integrity.bin" | awk '{print $1}')" \
+    ZEROFS_PILOT_METADATA_DIR="$FIXTURE/mount/metadata" \
+    ZEROFS_PILOT_METADATA_FILE_COUNT=1 \
+    "$@" bash "$SCRIPT" "$command"
+}
+
+test_global_lock_rejects_overlap() {
+  new_fixture
+  if FAKE_FLOCK_FAIL=1 run_pilot status >"$FIXTURE/out" 2>"$FIXTURE/err"; then
+    return 1
+  fi
+  grep -q 'another vm100-pilot operation is already running' "$FIXTURE/err" || return 1
+}
+
+test_teardown_requires_every_unit_inactive() {
+  new_fixture
+  if FAKE_STICKY_ACTIVE=1 run_pilot teardown >"$FIXTURE/out" 2>"$FIXTURE/err"; then
+    return 1
+  fi
+  grep -q 'remains active after stop' "$FIXTURE/err" || return 1
+  [[ $(grep -c '^stop ' "$FIXTURE/calls.log") == 3 ]]
+}
+
+test_wait_drain_fails_before_sleep_on_terminal_error() {
+  new_fixture
+  sed -i.bak 's/zerofs_writeback_terminal_error 0/zerofs_writeback_terminal_error 1/' "$FIXTURE/metrics"
+  if run_pilot drain >"$FIXTURE/out" 2>"$FIXTURE/err"; then
+    return 1
+  fi
+  grep -q 'terminal error' "$FIXTURE/err" || return 1
+  [[ ! -e $FIXTURE/calls.log ]] || ! grep -q '^sleep$' "$FIXTURE/calls.log"
+}
+
+test_status_rejects_unexpected_ack_mode() {
+  new_fixture
+  sed -i.bak 's/ack_mode = "memory"/ack_mode = "remote"/' "$FIXTURE/config.toml"
+  if run_pilot status >"$FIXTURE/out" 2>"$FIXTURE/err"; then
+    return 1
+  fi
+  grep -q 'ack_mode is remote, expected memory' "$FIXTURE/err" || return 1
+}
+
+test_status_records_runtime_and_durability_receipt() {
+  new_fixture
+  run_pilot status >"$FIXTURE/out" 2>"$FIXTURE/err"
+  grep -q '^running_binary_sha256=' "$FIXTURE/out" || return 1
+  grep -q '^config_sha256=' "$FIXTURE/out" || return 1
+  grep -q 'writeback_enabled=true ack_mode=memory' "$FIXTURE/out"
+}
+
+test_failed_benchmark_cleans_sampler_and_keeps_evidence() {
+  new_fixture
+  if FAKE_FIO_RC=17 ZEROFS_BENCH_TOTAL_MIB=4 ZEROFS_BENCH_JOBS=1 run_pilot benchmark >"$FIXTURE/out" 2>"$FIXTURE/err"; then
+    return 1
+  fi
+  if find "$FIXTURE/mount" -maxdepth 1 -name '.zerofs-bench-*' | grep -q .; then return 1; fi
+  if find "$FIXTURE/tmp" -type f | grep -q .; then return 1; fi
+  find "$FIXTURE/results" -name 'storage-*-status.txt' | grep -q . || return 1
+  find "$FIXTURE/results" -name 'storage-*-metrics.csv' | grep -q . || return 1
+}
+
+test_successful_benchmark_labels_local_boundary_without_fake_throughput() {
+  new_fixture
+  ZEROFS_BENCH_TOTAL_MIB=4 ZEROFS_BENCH_JOBS=1 run_pilot benchmark >"$FIXTURE/out" 2>"$FIXTURE/err"
+  result=$(find "$FIXTURE/results" -name 'storage-*.txt' ! -name '*-status.txt' ! -name '*-drain.txt' ! -name '*-fio.txt' | head -1)
+  grep -q 'local_sync_wait_ms=.*throughput=not_computable_without_local_durable_byte_counter' "$result" || return 1
+  if grep -q 'local_flush_MiBps' "$result"; then return 1; fi
+  grep -q 'remote_first_drained_end_to_end_ms=' "$result" || return 1
+  grep -q 'first_drained_epoch_ms=' "$FIXTURE/results"/storage-*-drain.txt
+}
+
+test_raw_sftp_reaps_every_upload_worker_after_one_fails() {
+  new_fixture
+  if FAKE_SFTP_FAIL_UPLOAD=1 run_pilot raw-sftp >"$FIXTURE/out" 2>"$FIXTURE/err"; then
+    return 1
+  fi
+  [[ $(grep -c '^upload_start ' "$FIXTURE/calls.log") == 8 ]] || return 1
+  [[ $(grep -c '^upload_end ' "$FIXTURE/calls.log") == 8 ]]
+}
+
+run_test() {
+  local name=$1
+  if "$name"; then record_pass "$name"; else record_fail "$name"; fi
+}
+
+run_test test_global_lock_rejects_overlap
+run_test test_teardown_requires_every_unit_inactive
+run_test test_wait_drain_fails_before_sleep_on_terminal_error
+run_test test_status_rejects_unexpected_ack_mode
+run_test test_status_records_runtime_and_durability_receipt
+run_test test_failed_benchmark_cleans_sampler_and_keeps_evidence
+run_test test_successful_benchmark_labels_local_boundary_without_fake_throughput
+run_test test_raw_sftp_reaps_every_upload_worker_after_one_fails
+
+printf '%s passed; %s failed\n' "$pass" "$fail"
+(( fail == 0 ))
