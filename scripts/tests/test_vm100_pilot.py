@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import tempfile
 import unittest
 from dataclasses import replace
@@ -15,6 +16,7 @@ from scripts.vm100_pilot.metrics import (
     WritebackSnapshot,
     wait_for_drain,
 )
+from scripts.vm100_pilot.profile import CanonicalDeployment, ProfileRunner
 from scripts.vm100_pilot.receipts import RunReceipt
 from scripts.vm100_pilot.runner import CommandError
 
@@ -31,6 +33,7 @@ class FakeRunner:
         *,
         sudo: bool = False,
         check: bool = True,
+        env: dict[str, str] | None = None,
         **_: object,
     ) -> CompletedProcess[str]:
         args = tuple(str(value) for value in argv)
@@ -40,7 +43,18 @@ class FakeRunner:
         if args[:3] == ("findmnt", "-rn", "-M"):
             return CompletedProcess(args, 1, "", "")
         if args[:2] == ("test", "-e"):
-            return CompletedProcess(args, 1, "", "")
+            return CompletedProcess(args, 0 if Path(args[2]).exists() else 1, "", "")
+        if args and args[0] == "install":
+            if "-d" in args:
+                Path(args[-1]).mkdir(parents=True, exist_ok=True)
+            else:
+                source, destination = Path(args[-2]), Path(args[-1])
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(source, destination)
+            return CompletedProcess(args, 0, "", "")
+        if args[:3] == ("rm", "-rf", "--"):
+            shutil.rmtree(args[3], ignore_errors=True)
+            return CompletedProcess(args, 0, "", "")
         if args[:2] == ("systemctl", "start"):
             unit = args[2]
             if unit == self.fail_start:
@@ -194,6 +208,8 @@ class _HealthyLifecycle:
     def __init__(self, snapshot: WritebackSnapshot) -> None:
         self.metrics = _StaticMetrics(snapshot)
         self.drain_calls = 0
+        self.start_calls = 0
+        self.stop_calls = 0
 
     def status(self, *, validate_data: bool = True) -> dict[str, object]:
         return {"healthy": True, "deployed_commit": "test"}
@@ -201,6 +217,13 @@ class _HealthyLifecycle:
     def drain(self, timeout: int | None = None) -> object:
         self.drain_calls += 1
         return object()
+
+    def stop(self) -> None:
+        self.stop_calls += 1
+
+    def start(self) -> dict[str, int]:
+        self.start_calls += 1
+        return {"restarts": 0}
 
 
 class BenchmarkTests(unittest.TestCase):
@@ -276,6 +299,79 @@ class BenchmarkTests(unittest.TestCase):
         manifests = list(self.config.result_dir.glob("benchmark-*/manifest.json"))
         self.assertEqual(len(manifests), 1)
         self.assertEqual(json.loads(manifests[0].read_text())["status"], "failed")
+
+
+class ProfileTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        root = Path(self.temp.name) / "repo"
+        (root / "zerofs").mkdir(parents=True)
+        mount = Path(self.temp.name) / "mount"
+        mount.mkdir()
+        base = PilotConfig.from_mapping(
+            root,
+            {
+                "ZEROFS_PILOT_RESULT_DIR": str(Path(self.temp.name) / "results"),
+                "ZEROFS_PROFILE_TARGET_DIR": str(Path(self.temp.name) / "profile-target"),
+                "ZEROFS_PILOT_MOUNTPOINT": str(mount),
+                "ZEROFS_PILOT_INTEGRITY_FILE": str(mount / "integrity"),
+                "ZEROFS_PILOT_METADATA_DIR": str(mount / "metadata"),
+            },
+        )
+        self.binary = Path(self.temp.name) / "bin" / "zerofs"
+        self.receipt_file = Path(self.temp.name) / "bin" / "zerofs.receipt"
+        self.binary.parent.mkdir()
+        self.binary.write_bytes(b"canonical-binary")
+        self.receipt_file.write_text("commit=canonical\nbinary_sha256=old\n")
+        self.config = replace(base, binary=self.binary, build_receipt=self.receipt_file)
+        self.runner = FakeRunner()
+        self.snapshot = WritebackSnapshot(9, 9, 9, 0, 0, 1, 1, False)
+        self.lifecycle = _HealthyLifecycle(self.snapshot)
+
+    def test_canonical_restore_reinstalls_binary_and_receipt(self) -> None:
+        snapshot = CanonicalDeployment.capture(self.config, self.runner)  # type: ignore[arg-type]
+        self.binary.write_bytes(b"profile-binary")
+        self.receipt_file.write_text("commit=profile\n")
+        snapshot.restore()
+        self.assertEqual(self.binary.read_bytes(), b"canonical-binary")
+        self.assertEqual(
+            self.receipt_file.read_text(), "commit=canonical\nbinary_sha256=old\n"
+        )
+
+    def test_profile_failure_restores_canonical_deployment(self) -> None:
+        class FailingBenchmark:
+            def run(self, *, total_mib: int, jobs: int) -> object:
+                raise CommandError(("fio",), 19, "injected profile benchmark failure")
+
+        class TestProfile(ProfileRunner):
+            def _build_profile(self) -> Path:
+                binary = self.config.profile_target / "release" / "zerofs"
+                binary.parent.mkdir(parents=True)
+                binary.write_bytes(b"profile-binary")
+                return binary
+
+            def _start_collectors(self, pid: int, receipt: RunReceipt) -> object:
+                return type("Collectors", (), {"stop": lambda _self: None})()
+
+            def _service_pid(self) -> int:
+                return 123
+
+        profiler = TestProfile(
+            self.config,
+            self.runner,  # type: ignore[arg-type]
+            self.lifecycle,  # type: ignore[arg-type]
+            FailingBenchmark(),  # type: ignore[arg-type]
+        )
+        with self.assertRaisesRegex(CommandError, "injected profile benchmark failure"):
+            profiler.run(total_mib=4, jobs=1)
+        self.assertEqual(self.binary.read_bytes(), b"canonical-binary")
+        self.assertEqual(
+            self.receipt_file.read_text(), "commit=canonical\nbinary_sha256=old\n"
+        )
+        self.assertGreaterEqual(self.lifecycle.stop_calls, 2)
+        self.assertGreaterEqual(self.lifecycle.start_calls, 2)
+        self.assertFalse(self.config.profile_target.exists())
 
 
 if __name__ == "__main__":
