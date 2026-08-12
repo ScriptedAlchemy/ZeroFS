@@ -19,9 +19,17 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::error;
 
-/// Frames per write batch before pre-compression fans out on rayon; below
-/// this the dispatch overhead outweighs the parallelism.
-const PARALLEL_COMPRESS_MIN_FRAMES: usize = 8;
+/// Plaintext bytes per write batch before pre-compression fans out on rayon.
+/// Keep 256 KiB striped-NBD member writes inline: profiling showed that four
+/// simultaneous eight-frame batches spent most of their CPU in Crossbeam's
+/// Rayon queue rather than the codec. The existing 1 MiB crypto crossover is
+/// also the useful compression dispatch floor.
+const PARALLEL_COMPRESS_MIN_FRAMES: usize = 1024 * 1024 / EXTENT_SIZE;
+
+#[inline]
+fn should_parallel_compress(frame_count: usize) -> bool {
+    frame_count >= PARALLEL_COMPRESS_MIN_FRAMES
+}
 
 pub(super) const TAIL_CACHE_BYTES: usize = 32 * 1024 * 1024;
 
@@ -242,7 +250,7 @@ impl ExtentStore {
         // batches fan out on rayon; block_in_place needs the multi-thread
         // runtime (tests run current-thread), and small batches stay inline.
         let payloads: Vec<&Bytes> = edits.iter().filter_map(|(_, e)| e.as_ref()).collect();
-        let compressed: Vec<Compressed> = if payloads.len() >= PARALLEL_COMPRESS_MIN_FRAMES
+        let compressed: Vec<Compressed> = if should_parallel_compress(payloads.len())
             && tokio::runtime::Handle::current().runtime_flavor()
                 == tokio::runtime::RuntimeFlavor::MultiThread
         {
@@ -1370,6 +1378,14 @@ mod tests {
         let mut model = Vec::new();
         let data = incompressible(3, PARALLEL_COMPRESS_MIN_FRAMES * 2 * EXTENT_SIZE);
         write_and_check(&store, &db, &mut model, 0, &data).await;
+    }
+
+    #[test]
+    fn nbd_member_batches_stay_below_the_rayon_dispatch_floor() {
+        let nbd_member_frames = std::hint::black_box(256 * 1024 / EXTENT_SIZE);
+        let large_batch_frames = std::hint::black_box(1024 * 1024 / EXTENT_SIZE);
+        assert!(!should_parallel_compress(nbd_member_frames));
+        assert!(should_parallel_compress(large_batch_frames));
     }
 
     #[tokio::test]
