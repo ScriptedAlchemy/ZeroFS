@@ -18,6 +18,20 @@ def _integer(values: Mapping[str, str], name: str, default: int) -> int:
     return value
 
 
+def _bounded_integer(
+    values: Mapping[str, str],
+    name: str,
+    default: int,
+    *,
+    minimum: int,
+    maximum: int,
+) -> int:
+    value = _integer(values, name, default)
+    if not minimum <= value <= maximum:
+        raise ValueError(f"{name} must be between {minimum} and {maximum}")
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class PilotConfig:
     root: Path
@@ -44,6 +58,7 @@ class PilotConfig:
     drain_timeout: int
     stop_timeout: int
     profile_timeout: int
+    maintenance_isolation_secs: int
     build_target: Path
     profile_target: Path
     cargo: Path
@@ -144,6 +159,13 @@ class PilotConfig:
             drain_timeout=_integer(values, "ZEROFS_PILOT_DRAIN_TIMEOUT", 600),
             stop_timeout=_integer(values, "ZEROFS_PILOT_STOP_TIMEOUT", 60),
             profile_timeout=_integer(values, "ZEROFS_PROFILE_TIMEOUT", 1800),
+            maintenance_isolation_secs=_bounded_integer(
+                values,
+                "ZEROFS_PROFILE_MAINTENANCE_ISOLATION_SECS",
+                3600,
+                minimum=300,
+                maximum=86400,
+            ),
             build_target=build_target,
             profile_target=profile_target,
             cargo=cargo,

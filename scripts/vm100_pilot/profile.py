@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import shutil
 import tempfile
+import tomllib
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, Protocol
@@ -13,6 +16,70 @@ from .config import PilotConfig
 from .lifecycle import PilotLifecycle
 from .receipts import RunReceipt
 from .runner import ManagedProcess, Runner
+
+
+_GC_CADENCE_KEYS = (
+    "interval_secs",
+    "idle_interval_secs",
+    "busy_backlog_interval_secs",
+)
+
+
+def rewrite_gc_cadence(text: str, interval_secs: int) -> str:
+    """Set the three segment-GC cadence tiers without reformatting the config."""
+
+    if not 300 <= interval_secs <= 86400:
+        raise ValueError("maintenance GC interval must be between 300 and 86400")
+    tomllib.loads(text)
+    lines = text.splitlines(keepends=True)
+    in_gc = False
+    gc_header: int | None = None
+    replaced: set[str] = set()
+    assignments = {
+        key: re.compile(rf"^(\s*{re.escape(key)}\s*=\s*)\d+(\s*(?:#.*)?(?:\r?\n)?)$")
+        for key in _GC_CADENCE_KEYS
+    }
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            in_gc = stripped == "[gc]"
+            if in_gc:
+                gc_header = index
+            continue
+        if not in_gc:
+            continue
+        for key, assignment in assignments.items():
+            match = assignment.fullmatch(line)
+            if match is None:
+                continue
+            lines[index] = f"{match.group(1)}{interval_secs}{match.group(2)}"
+            replaced.add(key)
+            break
+    missing = [key for key in _GC_CADENCE_KEYS if key not in replaced]
+    if missing:
+        newline = "\r\n" if "\r\n" in text else "\n"
+        additions = [
+            f"{key} = {interval_secs}{newline}"
+            for key in _GC_CADENCE_KEYS
+            if key in missing
+        ]
+        if gc_header is not None:
+            lines[gc_header + 1 : gc_header + 1] = additions
+        else:
+            if text.endswith(newline * 2):
+                separator = ""
+            elif text.endswith(newline):
+                separator = newline
+            else:
+                separator = newline * 2
+            lines.append(separator)
+            lines.extend([f"[gc]{newline}", *additions])
+    rewritten = "".join(lines)
+    settings = tomllib.loads(rewritten)
+    gc = settings.get("gc", {})
+    if any(gc.get(key) != interval_secs for key in _GC_CADENCE_KEYS):
+        raise RuntimeError("rewritten [gc] cadence did not validate")
+    return rewritten
 
 
 def _sha256(path: Path) -> str:
@@ -32,6 +99,8 @@ class CanonicalDeployment:
     receipt: Path
     binary_sha256: str
     receipt_sha256: str
+    config_backup: Path
+    config_sha256: str
 
     @classmethod
     def capture(cls, config: PilotConfig, runner: Runner) -> "CanonicalDeployment":
@@ -41,17 +110,75 @@ class CanonicalDeployment:
         config.require_disposable(directory)
         binary = directory / "zerofs"
         receipt = directory / "build-receipt"
-        shutil.copyfile(config.binary, binary)
-        shutil.copyfile(config.build_receipt, receipt)
-        return cls(
-            config=config,
-            runner=runner,
-            directory=directory,
-            binary=binary,
-            receipt=receipt,
-            binary_sha256=_sha256(binary),
-            receipt_sha256=_sha256(receipt),
+        config_backup = config.config_file.with_name(
+            f"{config.config_file.name}.profile-rollback-{uuid.uuid4().hex}"
         )
+        backup_created = False
+        try:
+            shutil.copyfile(config.binary, binary)
+            shutil.copyfile(config.build_receipt, receipt)
+            runner.run(
+                ["cp", "-aL", "--", config.config_file, config_backup], sudo=True
+            )
+            backup_created = True
+            config_sha256 = cls._runner_sha256(runner, config.config_file)
+            if cls._runner_sha256(runner, config_backup) != config_sha256:
+                raise RuntimeError("canonical config backup hash mismatch")
+            return cls(
+                config=config,
+                runner=runner,
+                directory=directory,
+                binary=binary,
+                receipt=receipt,
+                binary_sha256=_sha256(binary),
+                receipt_sha256=_sha256(receipt),
+                config_backup=config_backup,
+                config_sha256=config_sha256,
+            )
+        except BaseException:
+            if backup_created:
+                runner.run(["rm", "-f", "--", config_backup], sudo=True, check=False)
+            shutil.rmtree(directory, ignore_errors=True)
+            raise
+
+    @staticmethod
+    def _runner_sha256(runner: Runner, path: Path) -> str:
+        output = runner.run(["sha256sum", path], sudo=True, timeout=180).stdout
+        return output.split()[0]
+
+    def install_maintenance_config(self, interval_secs: int) -> str:
+        original = self.runner.run(["cat", self.config_backup], sudo=True).stdout
+        rewritten = rewrite_gc_cadence(original, interval_secs)
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            prefix="zerofs-profile-config-",
+            dir=self.config.temp_dir,
+            delete=False,
+        ) as handle:
+            handle.write(rewritten)
+            temporary = Path(handle.name)
+        try:
+            expected_sha256 = _sha256(temporary)
+            self.runner.run(
+                [
+                    "install",
+                    "-o",
+                    "root",
+                    "-g",
+                    "root",
+                    "-m",
+                    "0600",
+                    temporary,
+                    self.config.config_file,
+                ],
+                sudo=True,
+            )
+        finally:
+            temporary.unlink(missing_ok=True)
+        installed_sha256 = self._runner_sha256(self.runner, self.config.config_file)
+        if installed_sha256 != expected_sha256:
+            raise RuntimeError("installed maintenance config hash mismatch")
+        return installed_sha256
 
     def restore(self) -> None:
         self.runner.run(
@@ -71,19 +198,34 @@ class CanonicalDeployment:
             ],
             sudo=True,
         )
+        self.runner.run(
+            ["cp", "-a", "--", self.config_backup, self.config.config_file],
+            sudo=True,
+        )
         if _sha256(self.config.binary) != self.binary_sha256:
             raise RuntimeError("restored canonical binary hash mismatch")
         if _sha256(self.config.build_receipt) != self.receipt_sha256:
             raise RuntimeError("restored canonical build receipt hash mismatch")
+        if (
+            self._runner_sha256(self.runner, self.config.config_file)
+            != self.config_sha256
+        ):
+            raise RuntimeError("restored canonical config hash mismatch")
 
     def cleanup(self) -> None:
+        self.runner.run(["rm", "-f", "--", self.config_backup], sudo=True)
         self.config.require_disposable(self.directory)
         shutil.rmtree(self.directory)
 
 
 class _Benchmark(Protocol):
-    def run(self, *, total_mib: int, jobs: int) -> BenchmarkResult:
-        ...
+    def run(
+        self,
+        *,
+        total_mib: int,
+        jobs: int,
+        maintenance_isolated: bool = False,
+    ) -> BenchmarkResult: ...
 
 
 class CollectorGroup:
@@ -323,12 +465,28 @@ class ProfileRunner:
                 installation_started = True
                 self._install_profile(binary)
                 deployed = True
+                maintenance_config_sha256 = canonical.install_maintenance_config(
+                    self.config.maintenance_isolation_secs
+                )
+                receipt.record(
+                    "maintenance_isolation",
+                    {
+                        "interval_secs": self.config.maintenance_isolation_secs,
+                        "canonical_config_sha256": canonical.config_sha256,
+                        "temporary_config_sha256": maintenance_config_sha256,
+                    },
+                )
                 self.lifecycle.start()
-                self.lifecycle.status()
+                profile_status = self.lifecycle.status(validate_data=True)
+                receipt.record("profile_status", profile_status)
                 pid = self._service_pid()
                 receipt.record("profile_service_pid", pid)
                 collectors = self._start_collectors(pid, receipt)
-                benchmark_result = self.benchmark.run(total_mib=total_mib, jobs=jobs)
+                benchmark_result = self.benchmark.run(
+                    total_mib=total_mib,
+                    jobs=jobs,
+                    maintenance_isolated=True,
+                )
                 receipt.record("benchmark", benchmark_result.to_dict())
             except BaseException as error:
                 primary = error
@@ -346,7 +504,7 @@ class ProfileRunner:
                         if installation_started:
                             canonical.restore()
                         self.lifecycle.start()
-                        status = self.lifecycle.status()
+                        status = self.lifecycle.status(validate_data=True)
                         self.lifecycle.drain()
                         receipt.record("canonical_status", status)
                         restored = True
@@ -360,6 +518,9 @@ class ProfileRunner:
                 else:
                     receipt.record(
                         "retained_canonical_backup", str(canonical.directory)
+                    )
+                    receipt.record(
+                        "retained_config_backup", str(canonical.config_backup)
                     )
                 receipt.record("canonical_binary_restored", restored)
                 if cleanup_errors:

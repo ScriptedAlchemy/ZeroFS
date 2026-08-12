@@ -299,7 +299,12 @@ class BenchmarkRunner:
             self.config.proc_root, device=block_device(self.config.nbd_device)
         )
 
-    def _wait_clean_gc(self) -> WritebackSnapshot:
+    def _wait_clean_gc(self, *, maintenance_isolated: bool) -> WritebackSnapshot:
+        if maintenance_isolated:
+            return wait_for_gc_quiescence(
+                self.lifecycle.metrics.snapshot,
+                timeout=self.config.drain_timeout,
+            )
         baseline = self.lifecycle.metrics.snapshot().gc_passes
         return wait_for_gc_quiescence(
             self.lifecycle.metrics.snapshot,
@@ -382,12 +387,18 @@ class BenchmarkRunner:
         if remains.returncode == 0:
             raise RuntimeError(f"benchmark root remains after cleanup: {run_root}")
 
-    def run(self, *, total_mib: int = 1024, jobs: int = 4) -> BenchmarkResult:
+    def run(
+        self,
+        *,
+        total_mib: int = 1024,
+        jobs: int = 4,
+        maintenance_isolated: bool = False,
+    ) -> BenchmarkResult:
         if total_mib <= 0 or jobs <= 0 or total_mib % jobs:
             raise ValueError("total MiB must be positive and divisible by jobs")
         self.lifecycle.status()
         self.lifecycle.drain()
-        quiescent = self._wait_clean_gc()
+        quiescent = self._wait_clean_gc(maintenance_isolated=maintenance_isolated)
         run_root = self.config.mountpoint / f".zerofs-bench-{uuid.uuid4().hex}"
         per_job_mib = total_mib // jobs
         logical_bytes = total_mib * 1_048_576
@@ -398,6 +409,7 @@ class BenchmarkRunner:
             receipt.record("total_mib", total_mib)
             receipt.record("jobs", jobs)
             receipt.record("run_root", str(run_root))
+            receipt.record("maintenance_isolated", maintenance_isolated)
             receipt.record("maintenance_before", quiescent.to_dict())
             self.prepare_root(run_root)
             write_output = receipt.path("write-fio.json")

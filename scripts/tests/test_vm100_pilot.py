@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import io
 import json
@@ -10,6 +11,7 @@ import subprocess
 import shutil
 import sys
 import tempfile
+import tomllib
 import unittest
 from contextlib import contextmanager, redirect_stdout
 from dataclasses import replace
@@ -19,6 +21,7 @@ from typing import Any, Mapping, Sequence
 
 from scripts.vm100_pilot.config import PilotConfig
 from scripts.vm100_pilot.benchmark import (
+    BenchmarkResult,
     BenchmarkRunner,
     FioResult,
     _active_windows,
@@ -51,6 +54,7 @@ from scripts.vm100_pilot.raw_sftp import RawSftpRunner, SftpEndpoint
 from scripts.vm100_pilot.receipts import RunReceipt
 from scripts.vm100_pilot.runner import CommandError, ManagedProcess, Runner
 from scripts.vm100_pilot.workloads import WorkloadRunner
+import scripts.vm100_pilot.profile as profile_module
 
 
 class FakeRunner(Runner):
@@ -80,6 +84,14 @@ class FakeRunner(Runner):
             return CompletedProcess(args, 1, "", "")
         if args[:2] == ("test", "-e"):
             return CompletedProcess(args, 0 if Path(args[2]).exists() else 1, "", "")
+        if args[:1] == ("cat",) and Path(args[1]).is_file():
+            return CompletedProcess(args, 0, Path(args[1]).read_text(), "")
+        if args[:1] == ("sha256sum",) and Path(args[1]).is_file():
+            digest = hashlib.sha256(Path(args[1]).read_bytes()).hexdigest()
+            return CompletedProcess(args, 0, f"{digest}  {args[1]}\n", "")
+        if args[:2] in {("cp", "-a"), ("cp", "-aL")} and Path(args[-2]).exists():
+            shutil.copy2(args[-2], args[-1])
+            return CompletedProcess(args, 0, "", "")
         if args and args[0] == "install":
             if "-d" in args:
                 Path(args[-1]).mkdir(parents=True, exist_ok=True)
@@ -90,6 +102,9 @@ class FakeRunner(Runner):
             return CompletedProcess(args, 0, "", "")
         if args[:3] == ("rm", "-rf", "--"):
             shutil.rmtree(args[3], ignore_errors=True)
+            return CompletedProcess(args, 0, "", "")
+        if args[:3] == ("rm", "-f", "--"):
+            Path(args[3]).unlink(missing_ok=True)
             return CompletedProcess(args, 0, "", "")
         if args[:2] == ("systemctl", "start"):
             unit = args[2]
@@ -158,6 +173,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(config.migration_mountpoint, Path("/mnt/zerofs-nbd-migration"))
         self.assertEqual(config.admin_mountpoint, Path("/mnt/zerofs-admin"))
         self.assertEqual(config.temporary_max_size_gib, 256)
+        self.assertEqual(config.maintenance_isolation_secs, 3600)
 
     def test_disposable_path_refuses_root_fast_and_mount_root(self) -> None:
         config = PilotConfig.from_mapping(self.root, {})
@@ -165,6 +181,15 @@ class CoreTests(unittest.TestCase):
             with self.subTest(path=path):
                 with self.assertRaisesRegex(ValueError, "unsafe disposable path"):
                     config.require_disposable(path)
+
+    def test_profile_maintenance_isolation_has_a_finite_supported_bound(self) -> None:
+        for value in (299, 86401):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "between 300 and 86400"):
+                    PilotConfig.from_mapping(
+                        self.root,
+                        {"ZEROFS_PROFILE_MAINTENANCE_ISOLATION_SECS": str(value)},
+                    )
 
     def test_receipt_survives_failure(self) -> None:
         result_dir = Path(self.temp.name) / "results"
@@ -999,14 +1024,18 @@ class FreshResetTests(unittest.TestCase):
 
 
 class _HealthyLifecycle:
-    def __init__(self, config: PilotConfig, snapshot: WritebackSnapshot) -> None:
+    def __init__(
+        self, snapshot: WritebackSnapshot, config: PilotConfig | None = None
+    ) -> None:
         self.config = config
         self.metrics = _StaticMetrics(snapshot)
         self.drain_calls = 0
         self.start_calls = 0
         self.stop_calls = 0
+        self.status_validations: list[bool] = []
 
     def status(self, *, validate_data: bool = True) -> dict[str, object]:
+        self.status_validations.append(validate_data)
         return {"healthy": True, "deployed_commit": "test"}
 
     def drain(self, timeout: int | None = None) -> object:
@@ -1043,7 +1072,7 @@ class BenchmarkTests(unittest.TestCase):
             9, 9, 9, 0, 0, 1 << 20, 1 << 20, False, False, 1, 0, 0
         )
         self.runner = FakeRunner()
-        self.lifecycle = _HealthyLifecycle(self.config, self.snapshot)
+        self.lifecycle = _HealthyLifecycle(self.snapshot, self.config)
 
     def test_local_rate_uses_completed_payload_and_full_interval(self) -> None:
         result = calculate_tiers(
@@ -1191,6 +1220,38 @@ class BenchmarkTests(unittest.TestCase):
 
         self.assertEqual(result.gc_passes, 5)
 
+    def test_isolated_benchmark_accepts_the_completed_startup_gc_pass(self) -> None:
+        config = replace(self.config, drain_timeout=1)
+        benchmark = BenchmarkRunner(config, self.runner, self.lifecycle)  # type: ignore[arg-type]
+
+        result = benchmark._wait_clean_gc(maintenance_isolated=True)
+
+        self.assertEqual(result.gc_passes, 1)
+
+    def test_ordinary_benchmark_still_requires_a_fresh_gc_pass(self) -> None:
+        snapshots = iter(
+            (
+                replace(self.snapshot, gc_passes=4),
+                replace(self.snapshot, gc_active=True, gc_passes=5),
+                replace(self.snapshot, gc_passes=5),
+                replace(self.snapshot, gc_passes=5),
+                replace(self.snapshot, gc_passes=5),
+                replace(self.snapshot, gc_passes=5),
+            )
+        )
+
+        class SequenceMetrics:
+            def snapshot(self) -> WritebackSnapshot:
+                return next(snapshots)
+
+        lifecycle = _HealthyLifecycle(self.snapshot)
+        lifecycle.metrics = SequenceMetrics()  # type: ignore[assignment]
+        benchmark = BenchmarkRunner(self.config, self.runner, lifecycle)  # type: ignore[arg-type]
+
+        result = benchmark._wait_clean_gc(maintenance_isolated=False)
+
+        self.assertEqual(result.gc_passes, 5)
+
     def test_prepare_root_uses_explicit_owner(self) -> None:
         benchmark = BenchmarkRunner(self.config, self.runner, self.lifecycle)  # type: ignore[arg-type]
         run_root = self.config.mountpoint / ".zerofs-bench-test"
@@ -1225,7 +1286,9 @@ class BenchmarkTests(unittest.TestCase):
                 assert device == (8, 1)
                 return SystemIoSnapshot("sda1", 0, 0, 0, 0, 0, 0, 0)
 
-            def _wait_clean_gc(self) -> WritebackSnapshot:
+            def _wait_clean_gc(
+                self, *, maintenance_isolated: bool
+            ) -> WritebackSnapshot:
                 return self.lifecycle.metrics.snapshot()
 
         benchmark = FailingBenchmark(self.config, self.runner, self.lifecycle)  # type: ignore[arg-type]
@@ -1238,6 +1301,69 @@ class BenchmarkTests(unittest.TestCase):
         manifests = list(self.config.result_dir.glob("benchmark-*/manifest.json"))
         self.assertEqual(len(manifests), 1)
         self.assertEqual(json.loads(manifests[0].read_text())["status"], "failed")
+
+
+class _ProfileBenchmark:
+    def __init__(
+        self,
+        config: PilotConfig,
+        config_file: Path,
+        error: BaseException | None = None,
+    ) -> None:
+        self.config = config
+        self.config_file = config_file
+        self.error = error
+
+    def run(
+        self,
+        *,
+        total_mib: int,
+        jobs: int,
+        maintenance_isolated: bool = False,
+    ) -> BenchmarkResult:
+        if not maintenance_isolated:
+            raise AssertionError("profile benchmark was not isolated")
+        gc = tomllib.loads(self.config_file.read_text())["gc"]
+        expected = self.config.maintenance_isolation_secs
+        observed = tuple(gc[key] for key in profile_module._GC_CADENCE_KEYS)
+        if observed != (expected, expected, expected):
+            raise AssertionError(f"unexpected isolated GC config: {gc}")
+        if self.error is not None:
+            raise self.error
+        return BenchmarkResult(
+            logical_bytes=4 << 20,
+            local_bytes=4 << 20,
+            remote_bytes=4 << 20,
+            foreground_ms=1,
+            local_end_to_end_ms=1,
+            remote_end_to_end_ms=1,
+            local_active_ms=1,
+            remote_active_ms=1,
+            page_cache_hot_read_ms=1,
+            zerofs_direct_read_ms=1,
+            foreground_mibps=4096.0,
+            local_mibps=4096.0,
+            remote_mibps=4096.0,
+            local_active_mibps=4096.0,
+            remote_active_mibps=4096.0,
+            page_cache_hot_read_mibps=4096.0,
+            zerofs_direct_read_mibps=4096.0,
+            receipt_dir="test-receipt",
+        )
+
+
+class _TestProfileRunner(ProfileRunner):
+    def _build_profile(self) -> Path:
+        binary = self.config.profile_target / "release" / "zerofs"
+        binary.parent.mkdir(parents=True)
+        binary.write_bytes(b"profile-binary")
+        return binary
+
+    def _start_collectors(self, pid: int, receipt: RunReceipt) -> Any:
+        return type("Collectors", (), {"stop": lambda _self: None})()
+
+    def _service_pid(self) -> int:
+        return 123
 
 
 class ProfileTests(unittest.TestCase):
@@ -1262,47 +1388,137 @@ class ProfileTests(unittest.TestCase):
         )
         self.binary = Path(self.temp.name) / "bin" / "zerofs"
         self.receipt_file = Path(self.temp.name) / "bin" / "zerofs.receipt"
+        self.config_file = Path(self.temp.name) / "etc" / "zerofs.toml"
         self.binary.parent.mkdir()
+        self.config_file.parent.mkdir()
         self.binary.write_bytes(b"canonical-binary")
         self.receipt_file.write_text("commit=canonical\nbinary_sha256=old\n")
-        self.config = replace(base, binary=self.binary, build_receipt=self.receipt_file)
+        self.original_config = (
+            b"# preserved exactly, including comments\n"
+            b'[storage]\nurl = "sftp://pilot@example.test:23/data"\n\n'
+            b"[gc]\ninterval_secs = 60 # canonical base\n"
+            b"idle_interval_secs = 5\nread_directed = true\n"
+            b"busy_backlog_interval_secs = 15\n\n"
+            b'[writeback]\nenabled = true\nack_mode = "memory"\n'
+        )
+        self.config_file.write_bytes(self.original_config)
+        self.config = replace(
+            base,
+            binary=self.binary,
+            build_receipt=self.receipt_file,
+            config_file=self.config_file,
+        )
         self.runner = FakeRunner()
         self.snapshot = WritebackSnapshot(9, 9, 9, 0, 0, 1, 1, False)
-        self.lifecycle = _HealthyLifecycle(self.config, self.snapshot)
+        self.lifecycle = _HealthyLifecycle(self.snapshot, self.config)
+
+    def test_maintenance_rewrite_updates_only_gc_cadence(self) -> None:
+        rewritten = profile_module.rewrite_gc_cadence(
+            self.original_config.decode(), 3600
+        )
+
+        self.assertEqual(
+            rewritten,
+            self.original_config.decode()
+            .replace("interval_secs = 60", "interval_secs = 3600")
+            .replace("idle_interval_secs = 5", "idle_interval_secs = 3600")
+            .replace(
+                "busy_backlog_interval_secs = 15",
+                "busy_backlog_interval_secs = 3600",
+            ),
+        )
+        self.assertEqual(
+            tomllib.loads(rewritten)["gc"],
+            {
+                "interval_secs": 3600,
+                "idle_interval_secs": 3600,
+                "read_directed": True,
+                "busy_backlog_interval_secs": 3600,
+            },
+        )
+
+    def test_maintenance_rewrite_inserts_missing_gc_cadence_keys(self) -> None:
+        source = """\
+[storage]
+url = "sftp://pilot@example.test:23/data"
+
+[gc]
+read_directed = false # keep me
+
+[writeback]
+enabled = true
+"""
+
+        rewritten = profile_module.rewrite_gc_cadence(source, 3600)
+
+        self.assertEqual(
+            rewritten,
+            """\
+[storage]
+url = "sftp://pilot@example.test:23/data"
+
+[gc]
+interval_secs = 3600
+idle_interval_secs = 3600
+busy_backlog_interval_secs = 3600
+read_directed = false # keep me
+
+[writeback]
+enabled = true
+""",
+        )
+
+    def test_maintenance_rewrite_appends_a_missing_gc_section(self) -> None:
+        source = '[storage]\nurl = "sftp://pilot@example.test:23/data"'
+
+        rewritten = profile_module.rewrite_gc_cadence(source, 3600)
+
+        self.assertEqual(
+            rewritten,
+            source
+            + "\n\n[gc]\n"
+            + "interval_secs = 3600\n"
+            + "idle_interval_secs = 3600\n"
+            + "busy_backlog_interval_secs = 3600\n",
+        )
 
     def test_canonical_restore_reinstalls_binary_and_receipt(self) -> None:
         snapshot = CanonicalDeployment.capture(self.config, self.runner)
         self.binary.write_bytes(b"profile-binary")
         self.receipt_file.write_text("commit=profile\n")
+        self.config_file.write_text("[gc]\ninterval_secs = 3600\n")
         snapshot.restore()
         self.assertEqual(self.binary.read_bytes(), b"canonical-binary")
         self.assertEqual(
             self.receipt_file.read_text(), "commit=canonical\nbinary_sha256=old\n"
         )
+        self.assertEqual(self.config_file.read_bytes(), self.original_config)
+        snapshot.cleanup()
+        self.assertFalse(snapshot.config_backup.exists())
 
-    def test_profile_failure_restores_canonical_deployment(self) -> None:
-        class FailingBenchmark:
-            def run(self, *, total_mib: int, jobs: int) -> object:
-                raise CommandError(("fio",), 19, "injected profile benchmark failure")
-
-        class TestProfile(ProfileRunner):
-            def _build_profile(self) -> Path:
-                binary = self.config.profile_target / "release" / "zerofs"
-                binary.parent.mkdir(parents=True)
-                binary.write_bytes(b"profile-binary")
-                return binary
-
-            def _start_collectors(self, pid: int, receipt: RunReceipt) -> Any:
-                return type("Collectors", (), {"stop": lambda _self: None})()
-
-            def _service_pid(self) -> int:
-                return 123
-
-        profiler = TestProfile(
+    def test_profile_success_restores_canonical_config_and_validates_data(self) -> None:
+        result = _TestProfileRunner(
             self.config,
             self.runner,
             self.lifecycle,  # type: ignore[arg-type]
-            FailingBenchmark(),  # type: ignore[arg-type]
+            _ProfileBenchmark(self.config, self.config_file),
+        ).run(total_mib=4, jobs=1)
+
+        self.assertTrue(result.canonical_binary_restored)
+        self.assertEqual(self.config_file.read_bytes(), self.original_config)
+        self.assertEqual(self.binary.read_bytes(), b"canonical-binary")
+        self.assertEqual(self.lifecycle.status_validations, [True, True, True])
+
+    def test_profile_failure_restores_canonical_deployment(self) -> None:
+        profiler = _TestProfileRunner(
+            self.config,
+            self.runner,  # type: ignore[arg-type]
+            self.lifecycle,  # type: ignore[arg-type]
+            _ProfileBenchmark(
+                self.config,
+                self.config_file,
+                CommandError(("fio",), 19, "injected profile benchmark failure"),
+            ),
         )
         with self.assertRaisesRegex(CommandError, "injected profile benchmark failure"):
             profiler.run(total_mib=4, jobs=1)
@@ -1310,9 +1526,30 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(
             self.receipt_file.read_text(), "commit=canonical\nbinary_sha256=old\n"
         )
+        self.assertEqual(self.config_file.read_bytes(), self.original_config)
         self.assertGreaterEqual(self.lifecycle.stop_calls, 2)
         self.assertGreaterEqual(self.lifecycle.start_calls, 2)
+        self.assertEqual(self.lifecycle.status_validations, [True, True, True])
         self.assertTrue(self.config.profile_target.exists())
+
+    def test_profile_cancellation_restores_config_byte_for_byte(self) -> None:
+        profiler = _TestProfileRunner(
+            self.config,
+            self.runner,  # type: ignore[arg-type]
+            self.lifecycle,  # type: ignore[arg-type]
+            _ProfileBenchmark(
+                self.config,
+                self.config_file,
+                KeyboardInterrupt("injected cancellation"),
+            ),
+        )
+
+        with self.assertRaisesRegex(KeyboardInterrupt, "injected cancellation"):
+            profiler.run(total_mib=4, jobs=1)
+
+        self.assertEqual(self.config_file.read_bytes(), self.original_config)
+        self.assertEqual(self.binary.read_bytes(), b"canonical-binary")
+        self.assertEqual(self.lifecycle.status_validations, [True, True, True])
 
     def test_profile_install_failure_restores_canonical_deployment(self) -> None:
         class TestProfile(ProfileRunner):
@@ -1359,7 +1596,7 @@ class WorkloadEngineTests(unittest.TestCase):
         )
         self.config.temp_dir.mkdir()
         snapshot = WritebackSnapshot(9, 9, 9, 0, 0, 1, 1, False)
-        self.lifecycle = _HealthyLifecycle(self.config, snapshot)
+        self.lifecycle = _HealthyLifecycle(snapshot, self.config)
         self.runner = FakeRunner()
 
     def test_workload_root_is_created_with_explicit_owner(self) -> None:
