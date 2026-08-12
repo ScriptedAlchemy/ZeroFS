@@ -112,19 +112,18 @@ impl SegmentStore {
         // concurrent multipart, so the fsync-path PUT latency stays bounded
         // instead of serializing 256 MiB on one stream.
         let path = Path::from(segid.object_key());
-        let result = if bytes.len() < SEAL_PART_SIZE {
+        if bytes.len() < SEAL_PART_SIZE {
             self.object_store
                 .put(&path, bytes.clone().into())
                 .await
-                .map_err(|e| SegmentStoreError::ObjectStore(e.to_string()))?
+                .map_err(|e| SegmentStoreError::ObjectStore(e.to_string()))?;
         } else {
-            self.put_segment_multipart(&path, &bytes).await?
-        };
-        // The multipart path doesn't write through the parts cache; warm it
-        // with the bytes in hand, after the upload commits (mirroring the
-        // single-PUT path).
-        if let Some(warm) = &self.warm {
-            warm(&path, bytes, &result);
+            let result = self.put_segment_multipart(&path, &bytes).await?;
+            // Multipart bypasses the object-store wrapper's single-PUT
+            // write-through, so only this path needs the explicit warm hook.
+            if let Some(warm) = &self.warm {
+                warm(&path, bytes, &result);
+            }
         }
         Ok(())
     }
@@ -889,6 +888,29 @@ mod tests {
             let got = store.read_extent(*loc, *id, *extent).await.unwrap();
             assert_eq!(&got, data);
         }
+    }
+
+    #[tokio::test]
+    async fn single_put_segment_does_not_repeat_the_store_write_through_warm() {
+        let os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let codec = FrameCodec::new(&[1u8; 32], SEGMENT_INFO, CompressionConfig::Lz4);
+        let warms = Arc::new(AtomicU64::new(0));
+        let observed = warms.clone();
+        let warm: SegmentWarmHook = Arc::new(move |_, _, _| {
+            observed.fetch_add(1, Ordering::Relaxed);
+        });
+        let store = SegmentStore::new(os, codec, 5, Some(warm));
+
+        store
+            .put_segment(store.next_segid(), Bytes::from_static(b"small segment"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            warms.load(Ordering::Relaxed),
+            0,
+            "the explicit warm hook is only needed when multipart bypasses single-PUT write-through"
+        );
     }
 
     #[tokio::test]
