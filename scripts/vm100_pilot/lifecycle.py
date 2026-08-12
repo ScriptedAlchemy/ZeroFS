@@ -196,7 +196,7 @@ class PilotLifecycle:
                 digest.update(chunk)
         return digest.hexdigest()
 
-    def build_deploy(self) -> dict[str, str]:
+    def deploy_and_start(self) -> dict[str, object]:
         self.require_vm100()
         if self.runner.run(
             ["git", "status", "--porcelain"], cwd=self.config.root
@@ -226,11 +226,7 @@ class PilotLifecycle:
         backup_receipt = backup_dir / "build-receipt"
         shutil.copyfile(self.config.binary, backup_binary)
         shutil.copyfile(self.config.build_receipt, backup_receipt)
-        stop_attempted = False
-        rollback_succeeded = False
-        deployment_succeeded = False
         try:
-            stop_attempted = True
             self.stop()
             self.runner.run(
                 ["install", "-m", "0755", built, self.config.binary], sudo=True
@@ -262,15 +258,22 @@ class PilotLifecycle:
                 temporary_receipt.unlink(missing_ok=True)
             if self._sha256(self.config.binary, sudo=True) != built_sha:
                 raise RuntimeError("installed binary hash mismatch")
-            deployment_succeeded = True
+            started = self.start()
+            status = self.status()
         except BaseException as original:
-            if stop_attempted:
-                try:
-                    self.runner.run(
+            rollback_errors: list[str] = []
+            rollback_operations = (
+                ("rollback-stop", self.stop),
+                (
+                    "restore-binary",
+                    lambda: self.runner.run(
                         ["install", "-m", "0755", backup_binary, self.config.binary],
                         sudo=True,
-                    )
-                    self.runner.run(
+                    ),
+                ),
+                (
+                    "restore-receipt",
+                    lambda: self.runner.run(
                         [
                             "install",
                             "-o",
@@ -283,16 +286,27 @@ class PilotLifecycle:
                             self.config.build_receipt,
                         ],
                         sudo=True,
-                    )
-                    self.start()
-                    rollback_succeeded = True
+                    ),
+                ),
+                ("rollback-start", self.start),
+                ("rollback-status", self.status),
+            )
+            for operation_name, operation in rollback_operations:
+                try:
+                    operation()
                 except BaseException as restore_error:
-                    original.add_note(f"deployment rollback failed: {restore_error}")
+                    rollback_errors.append(f"{operation_name}: {restore_error}")
+            if rollback_errors:
+                original.add_note(
+                    "deployment rollback failures: " + "; ".join(rollback_errors)
+                )
             raise
-        finally:
-            if not stop_attempted or rollback_succeeded or deployment_succeeded:
-                shutil.rmtree(backup_dir, ignore_errors=True)
-        return {"commit": commit, "binary_sha256": built_sha}
+        shutil.rmtree(backup_dir)
+        return {
+            "deployed": {"commit": commit, "binary_sha256": built_sha},
+            "started": started,
+            "status": status,
+        }
 
     def drain(self, timeout: int | None = None) -> DrainReceipt:
         return wait_for_drain(

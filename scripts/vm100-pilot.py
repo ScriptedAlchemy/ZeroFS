@@ -148,9 +148,16 @@ def dispatch(args: argparse.Namespace, config: PilotConfig, runner: Runner) -> N
     resetter = FreshResetter(config, runner, lifecycle)
 
     if args.command == "setup":
-        deployed = None if args.skip_build else lifecycle.build_deploy()
-        started = lifecycle.start()
-        _emit({"deployed": deployed, "started": started, "status": lifecycle.status()})
+        if args.skip_build:
+            _emit(
+                {
+                    "deployed": None,
+                    "started": lifecycle.start(),
+                    "status": lifecycle.status(),
+                }
+            )
+        else:
+            _emit(lifecycle.deploy_and_start())
     elif args.command == "teardown":
         lifecycle.stop()
         _emit({"stopped": True})
@@ -183,8 +190,12 @@ def dispatch(args: argparse.Namespace, config: PilotConfig, runner: Runner) -> N
     elif args.command == "raw-sftp":
         _emit(raw.run(jobs=args.jobs, per_job_mib=args.per_job_mib))
     elif args.command == "iterate":
-        deployed = None if args.skip_build else lifecycle.build_deploy()
-        lifecycle.start()
+        if args.skip_build:
+            deployed = None
+            lifecycle.start()
+        else:
+            deployment = lifecycle.deploy_and_start()
+            deployed = deployment["deployed"]
         _emit(
             {
                 "deployed": deployed,

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import argparse
+import importlib.util
+import io
 import json
 import os
 import signal
@@ -8,7 +11,7 @@ import shutil
 import sys
 import tempfile
 import unittest
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stdout
 from dataclasses import replace
 from pathlib import Path
 from subprocess import CompletedProcess
@@ -332,6 +335,238 @@ class LifecycleTests(unittest.TestCase):
         self.config = replace(base, stop_timeout=1)
         self.runner = FakeRunner()
         self.lifecycle = PilotLifecycle(self.config, self.runner)
+
+    def _deployment_scenario(
+        self,
+        *,
+        fail_new_start: bool = False,
+        fail_new_status: bool = False,
+        rollback_failures: frozenset[str] = frozenset(),
+    ) -> tuple[
+        PilotConfig,
+        FakeRunner,
+        PilotLifecycle,
+        list[str],
+        tuple[Any, argparse.Namespace],
+    ]:
+        build_target = Path(self.temp.name) / "build-target"
+        built = build_target / "release" / "zerofs"
+        built.parent.mkdir(parents=True)
+        built.write_bytes(b"replacement-binary")
+        binary = Path(self.temp.name) / "bin" / "zerofs"
+        receipt = binary.with_suffix(".build-receipt")
+        binary.parent.mkdir()
+        binary.write_bytes(b"predecessor-binary")
+        receipt.write_bytes(b"commit=predecessor\nbinary_sha256=predecessor\n")
+        temp_dir = Path(self.temp.name) / "deploy-temp"
+        temp_dir.mkdir()
+        config = replace(
+            self.config,
+            build_target=build_target,
+            binary=binary,
+            build_receipt=receipt,
+            temp_dir=temp_dir,
+        )
+        events: list[str] = []
+
+        class DeploymentRunner(FakeRunner):
+            def run(
+                self, argv: Sequence[str | Path], **kwargs: Any
+            ) -> CompletedProcess[str]:
+                args = tuple(str(value) for value in argv)
+                if args == ("git", "rev-parse", "HEAD"):
+                    self.calls.append((args, bool(kwargs.get("sudo", False))))
+                    return CompletedProcess(args, 0, "replacement-commit\n", "")
+                if args and args[0] == "install" and "-d" not in args:
+                    source = Path(args[-2])
+                    destination = Path(args[-1])
+                    if source.parent.name.startswith("zerofs-deploy-backup-"):
+                        operation = (
+                            "restore-binary"
+                            if destination == config.binary
+                            else "restore-receipt"
+                        )
+                        events.append(operation)
+                        if operation in rollback_failures:
+                            self.calls.append((args, bool(kwargs.get("sudo", False))))
+                            raise RuntimeError(f"injected {operation} failure")
+                return super().run(args, **kwargs)
+
+        class TransactionLifecycle(PilotLifecycle):
+            def __init__(self, runner: DeploymentRunner) -> None:
+                super().__init__(config, runner)  # type: ignore[arg-type]
+                self.stop_calls = 0
+                self.rollback_started = False
+
+            def stop(self) -> None:
+                self.stop_calls += 1
+                if self.stop_calls == 2:
+                    self.rollback_started = True
+                    events.append("rollback-stop")
+                    if "stop" in rollback_failures:
+                        raise RuntimeError("injected rollback-stop failure")
+                else:
+                    events.append("deployment-stop")
+
+            def start(self) -> dict[str, int]:
+                phase = "rollback" if self.rollback_started else "replacement"
+                events.append(f"{phase}-start")
+                if phase == "replacement" and fail_new_start:
+                    raise RuntimeError("injected replacement-start failure")
+                if phase == "rollback" and "start" in rollback_failures:
+                    raise RuntimeError("injected rollback-start failure")
+                return {"restarts": 0}
+
+            def status(self, *, validate_data: bool = True) -> dict[str, object]:
+                phase = "rollback" if self.rollback_started else "replacement"
+                events.append(f"{phase}-status")
+                if phase == "replacement" and fail_new_status:
+                    raise RuntimeError("injected replacement-status failure")
+                if phase == "rollback" and "status" in rollback_failures:
+                    raise RuntimeError("injected rollback-status failure")
+                return {"healthy": True, "deployment": phase}
+
+            def _sha256(self, path: Path, *, sudo: bool = False) -> str:
+                return self._local_sha256(path)
+
+        runner = DeploymentRunner()
+        lifecycle = TransactionLifecycle(runner)
+        script = Path(__file__).parents[1] / "vm100-pilot.py"
+        spec = importlib.util.spec_from_file_location("vm100_pilot_cli", script)
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"could not load {script}")
+        module: Any = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.PilotLifecycle = lambda _config, _runner: lifecycle
+        args = argparse.Namespace(command="setup", skip_build=False)
+        return config, runner, lifecycle, events, (module, args)
+
+    def test_setup_start_failure_restores_the_predecessor_deployment(self) -> None:
+        config, _, _, events, dispatch = self._deployment_scenario(fail_new_start=True)
+        module, args = dispatch
+
+        with self.assertRaisesRegex(RuntimeError, "injected replacement-start failure"):
+            module.dispatch(args, config, self.runner)
+
+        self.assertEqual(config.binary.read_bytes(), b"predecessor-binary")
+        self.assertEqual(
+            config.build_receipt.read_bytes(),
+            b"commit=predecessor\nbinary_sha256=predecessor\n",
+        )
+        self.assertEqual(
+            events[-5:],
+            [
+                "rollback-stop",
+                "restore-binary",
+                "restore-receipt",
+                "rollback-start",
+                "rollback-status",
+            ],
+        )
+
+    def test_setup_status_failure_restores_the_predecessor_deployment(self) -> None:
+        config, _, _, events, dispatch = self._deployment_scenario(fail_new_status=True)
+        module, args = dispatch
+
+        with self.assertRaisesRegex(
+            RuntimeError, "injected replacement-status failure"
+        ):
+            module.dispatch(args, config, self.runner)
+
+        self.assertEqual(config.binary.read_bytes(), b"predecessor-binary")
+        self.assertEqual(
+            config.build_receipt.read_bytes(),
+            b"commit=predecessor\nbinary_sha256=predecessor\n",
+        )
+        self.assertEqual(events[-2:], ["rollback-start", "rollback-status"])
+
+    def test_setup_aggregates_every_rollback_failure(self) -> None:
+        failures = frozenset(
+            {"stop", "restore-binary", "restore-receipt", "start", "status"}
+        )
+        config, _, _, events, dispatch = self._deployment_scenario(
+            fail_new_status=True,
+            rollback_failures=failures,
+        )
+        module, args = dispatch
+
+        with self.assertRaisesRegex(
+            RuntimeError, "injected replacement-status failure"
+        ) as raised:
+            module.dispatch(args, config, self.runner)
+
+        notes = "\n".join(getattr(raised.exception, "__notes__", ()))
+        for failure in (
+            "rollback-stop",
+            "restore-binary",
+            "restore-receipt",
+            "rollback-start",
+            "rollback-status",
+        ):
+            with self.subTest(failure=failure):
+                self.assertIn(failure, notes)
+                self.assertIn(failure, " ".join(events))
+
+    def test_setup_retains_backup_through_validation_then_deletes_it(self) -> None:
+        config, _, _, events, dispatch = self._deployment_scenario()
+        module, args = dispatch
+        observed_backups: list[int] = []
+        lifecycle = module.PilotLifecycle(config, self.runner)
+        original_start = lifecycle.start
+        original_status = lifecycle.status
+
+        def start() -> dict[str, int]:
+            observed_backups.append(
+                len(list(config.temp_dir.glob("zerofs-deploy-backup-*")))
+            )
+            return original_start()
+
+        def status(*, validate_data: bool = True) -> dict[str, object]:
+            observed_backups.append(
+                len(list(config.temp_dir.glob("zerofs-deploy-backup-*")))
+            )
+            return original_status(validate_data=validate_data)
+
+        lifecycle.start = start  # type: ignore[method-assign]
+        lifecycle.status = status  # type: ignore[method-assign]
+
+        with redirect_stdout(io.StringIO()):
+            module.dispatch(args, config, self.runner)
+
+        self.assertEqual(observed_backups, [1, 1])
+        self.assertFalse(list(config.temp_dir.glob("zerofs-deploy-backup-*")))
+        self.assertEqual(events[-2:], ["replacement-start", "replacement-status"])
+
+    def test_iterate_status_failure_uses_the_same_deployment_transaction(self) -> None:
+        config, runner, _, events, dispatch = self._deployment_scenario(
+            fail_new_status=True
+        )
+        module, _ = dispatch
+        args = argparse.Namespace(command="iterate", skip_build=False)
+
+        with self.assertRaisesRegex(
+            RuntimeError, "injected replacement-status failure"
+        ):
+            module.dispatch(args, config, runner)
+
+        self.assertEqual(config.binary.read_bytes(), b"predecessor-binary")
+        self.assertEqual(events[-2:], ["rollback-start", "rollback-status"])
+
+    def test_setup_skip_build_starts_the_installed_deployment_unchanged(self) -> None:
+        config, runner, _, events, dispatch = self._deployment_scenario()
+        module, _ = dispatch
+        args = argparse.Namespace(command="setup", skip_build=True)
+
+        with redirect_stdout(io.StringIO()):
+            module.dispatch(args, config, runner)
+
+        self.assertEqual(config.binary.read_bytes(), b"predecessor-binary")
+        self.assertEqual(
+            config.build_receipt.read_bytes(),
+            b"commit=predecessor\nbinary_sha256=predecessor\n",
+        )
+        self.assertEqual(events, ["replacement-start", "replacement-status"])
+        self.assertFalse(list(config.temp_dir.glob("zerofs-deploy-backup-*")))
 
     def test_snapshot_parser_requires_every_durability_field(self) -> None:
         snapshot = WritebackSnapshot.parse(
