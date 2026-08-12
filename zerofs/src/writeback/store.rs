@@ -138,6 +138,7 @@ impl WritebackObjectStore {
                 remote,
                 journal.clone(),
                 overlay.clone(),
+                admission.clone(),
                 disk.clone(),
                 journaler.barrier(),
                 settings.upload_concurrency,
@@ -147,6 +148,7 @@ impl WritebackObjectStore {
                 remote,
                 journal.clone(),
                 overlay.clone(),
+                admission.clone(),
                 disk.clone(),
                 journaler.barrier(),
                 settings.upload_concurrency,
@@ -262,6 +264,13 @@ impl WritebackObjectStore {
 
     fn key_lock(&self, path: &Path) -> Arc<Mutex<()>> {
         self.inner.key_locks[self.key_lock_index(path)].clone()
+    }
+
+    fn ensure_writable(&self) -> object_store::Result<()> {
+        self.inner
+            .remote
+            .check_available()
+            .map_err(|error| generic_error(format!("writeback is unavailable: {error}")))
     }
 
     fn key_lock_index(&self, path: &Path) -> usize {
@@ -626,6 +635,7 @@ impl ObjectStore for WritebackObjectStore {
         location: &Path,
         options: PutMultipartOptions,
     ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        self.ensure_writable()?;
         let memory_parts = self.inner.settings.ack_mode == AckMode::Memory;
         let staging = if memory_parts {
             None
@@ -811,6 +821,9 @@ impl Drop for ActivePartGuard {
 #[async_trait]
 impl MultipartUpload for WritebackMultipartUpload {
     fn put_part(&mut self, data: PutPayload) -> UploadPart {
+        if let Err(error) = self.store.ensure_writable() {
+            return Box::pin(async move { Err(error) });
+        }
         if self.terminal {
             return Box::pin(async {
                 Err(generic_error(
@@ -850,7 +863,9 @@ impl MultipartUpload for WritebackMultipartUpload {
         let state = self.state.clone();
         let notify = self.notify.clone();
         let min_free_bytes = self.store.inner.settings.min_free_bytes;
+        let store = self.store.clone();
         Box::pin(async move {
+            store.ensure_writable()?;
             {
                 let mut state = state.lock().unwrap();
                 if state.aborted {
@@ -901,6 +916,7 @@ impl MultipartUpload for WritebackMultipartUpload {
     }
 
     async fn complete(&mut self) -> object_store::Result<PutResult> {
+        self.store.ensure_writable()?;
         if self.terminal {
             return Err(generic_error(
                 "multipart upload is already completed or aborted",
@@ -1785,6 +1801,163 @@ mod tests {
             Bytes::from_static(b"external")
         );
         assert!(store.status().unwrap().terminal_error.is_some());
+        controls.release_puts();
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn permanent_remote_divergence_rejects_every_new_mutation_before_admission() {
+        let (store, remote, _temp, controls) = test_store_with_controls(true).await;
+        let path = Path::from("manifest");
+        remote
+            .put(&path, Bytes::from_static(b"remote-zero").into())
+            .await
+            .unwrap();
+        let remote_zero = remote.head(&path).await.unwrap();
+        controls.block_puts();
+        let mut multipart_started_before_terminal = store
+            .put_multipart(&Path::from("multipart-started-before-terminal"))
+            .await
+            .unwrap();
+
+        let first = store
+            .put_opts(
+                &path,
+                Bytes::from_static(b"local-one").into(),
+                PutOptions::from(PutMode::Update(UpdateVersion {
+                    e_tag: remote_zero.e_tag,
+                    version: remote_zero.version,
+                })),
+            )
+            .await
+            .unwrap();
+        store
+            .put_opts(
+                &path,
+                Bytes::from_static(b"local-two").into(),
+                PutOptions::from(PutMode::Update(first.into())),
+            )
+            .await
+            .unwrap();
+        store.wait_local(2).await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while controls.put_count() < 1 {
+                controls.put_activity().notified().await;
+            }
+        })
+        .await
+        .expect("first remote update did not start");
+        controls.release_put_path(path.as_ref());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while controls.put_count() < 2 {
+                controls.put_activity().notified().await;
+            }
+        })
+        .await
+        .expect("chained remote update did not start");
+        remote
+            .put(&path, Bytes::from_static(b"external").into())
+            .await
+            .unwrap();
+        controls.release_put_path(path.as_ref());
+        tokio::time::timeout(Duration::from_secs(1), store.wait_remote(2))
+            .await
+            .expect("remote divergence must be detected promptly")
+            .expect_err("remote divergence must be terminal");
+
+        let accepted_before = store.status().unwrap().accepted_seq;
+        let existing_multipart_error = multipart_started_before_terminal
+            .put_part(Bytes::from_static(b"must-not-be-buffered").into())
+            .await
+            .expect_err("terminal writeback must reject parts on an existing multipart upload");
+        assert!(
+            existing_multipart_error
+                .to_string()
+                .contains("permanent remote divergence")
+        );
+
+        let put_error = tokio::time::timeout(
+            Duration::from_secs(1),
+            store.put(
+                &Path::from("after-terminal-put"),
+                Bytes::from_static(b"must-not-be-accepted").into(),
+            ),
+        )
+        .await
+        .expect("terminal put rejection must not block")
+        .expect_err("terminal writeback must reject put");
+        assert!(
+            put_error
+                .to_string()
+                .contains("permanent remote divergence")
+        );
+
+        let delete_error = tokio::time::timeout(
+            Duration::from_secs(1),
+            store.delete(&Path::from("after-terminal-delete")),
+        )
+        .await
+        .expect("terminal delete rejection must not block")
+        .expect_err("terminal writeback must reject delete");
+        assert!(
+            delete_error
+                .to_string()
+                .contains("permanent remote divergence")
+        );
+
+        let copy_error = tokio::time::timeout(
+            Duration::from_secs(1),
+            store.copy_opts(
+                &path,
+                &Path::from("after-terminal-copy"),
+                CopyOptions::default(),
+            ),
+        )
+        .await
+        .expect("terminal copy rejection must not block")
+        .expect_err("terminal writeback must reject copy");
+        assert!(
+            copy_error
+                .to_string()
+                .contains("permanent remote divergence")
+        );
+
+        let rename_error = tokio::time::timeout(
+            Duration::from_secs(1),
+            store.rename_opts(
+                &path,
+                &Path::from("after-terminal-rename"),
+                RenameOptions::default(),
+            ),
+        )
+        .await
+        .expect("terminal rename rejection must not block")
+        .expect_err("terminal writeback must reject rename");
+        assert!(
+            rename_error
+                .to_string()
+                .contains("permanent remote divergence")
+        );
+
+        let multipart_error = match store
+            .put_multipart(&Path::from("after-terminal-multipart"))
+            .await
+        {
+            Ok(_) => panic!("terminal writeback must reject multipart initiation"),
+            Err(error) => error,
+        };
+        assert!(
+            multipart_error
+                .to_string()
+                .contains("permanent remote divergence")
+        );
+
+        assert_eq!(
+            store.status().unwrap().accepted_seq,
+            accepted_before,
+            "terminal rejection must not allocate another sequence"
+        );
         controls.release_puts();
         store.shutdown().await.unwrap();
     }

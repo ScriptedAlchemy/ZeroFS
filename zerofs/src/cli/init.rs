@@ -230,6 +230,9 @@ impl StartupContext {
                 object_tracer.clone(),
                 "data",
             )) as Arc<dyn object_store::ObjectStore>;
+            let retried_remote = Arc::new(crate::retrying_object_store::RetryingObjectStore::new(
+                traced_remote,
+            )) as Arc<dyn object_store::ObjectStore>;
             let (object_store, writeback) = match settings.writeback_settings(match db_mode {
                 DatabaseMode::ReadWrite => crate::writeback::config::WritebackAccessMode::ReadWrite,
                 DatabaseMode::ReadOnly => crate::writeback::config::WritebackAccessMode::ReadOnly,
@@ -251,7 +254,7 @@ impl StartupContext {
                         encryption_key_identity_sha256: Sha256::digest(encryption_key).into(),
                     };
                     let attached = crate::writeback::bootstrap::attach(
-                        traced_remote,
+                        retried_remote,
                         writeback_settings,
                         identity,
                         &bucket.cache_directory_name(),
@@ -260,7 +263,7 @@ impl StartupContext {
                     .context("Failed to attach persistent writeback")?;
                     (attached.store, Some(attached.lifecycle))
                 }
-                None => (traced_remote, None),
+                None => (retried_remote, None),
             };
 
             // Shared by request handling and takeover reconciliation.
@@ -272,9 +275,7 @@ impl StartupContext {
             });
 
             Ok(Self {
-                retrying_object_store: Arc::new(
-                    crate::retrying_object_store::RetryingObjectStore::new(object_store.clone()),
-                ),
+                retrying_object_store: object_store.clone(),
                 object_store,
                 writeback,
                 sftp_pool,
@@ -1259,10 +1260,11 @@ fn canonical_backend_endpoint(settings: &Settings, url: &url::Url) -> Result<Str
 
 #[cfg(test)]
 mod role_decision_tests {
-    use super::{ImmediateRoleDecision, StartupContext, immediate_role_decision};
+    use super::{DatabaseMode, ImmediateRoleDecision, StartupContext, immediate_role_decision};
     use crate::config::{CompressionConfig, ReplicationRole};
     use crate::fault_store::FaultStore;
     use crate::replication::ReplicationParams;
+    use crate::writeback::config::{AckMode, ShutdownFlush, WritebackConfig};
     use object_store::{ObjectStore, ObjectStoreExt, memory::InMemory, path::Path};
     use std::{sync::Arc, time::Duration};
 
@@ -1277,6 +1279,46 @@ mod role_decision_tests {
             Some(ImmediateRoleDecision::FollowActivePeer)
         );
         assert_eq!(immediate_role_decision(false, false), None);
+    }
+
+    #[tokio::test]
+    async fn generic_retry_never_wraps_a_locally_owned_writeback_mutation() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut settings = crate::config::Settings::generate_default();
+        settings.cache.dir = temp.path().join("clean-cache");
+        settings.cache.disk_size_gb = 0.01;
+        settings.cache.memory_size_gb = Some(0.01);
+        settings.storage.url = "memory:///stack-shape".to_owned();
+        settings.storage.encryption_password = "test-password".to_owned();
+        settings.aws = None;
+        settings.writeback = Some(WritebackConfig {
+            enabled: true,
+            dir: temp.path().join("writeback"),
+            ack_mode: AckMode::Memory,
+            memory_size_gb: 0.01,
+            disk_size_gb: 0.02,
+            min_free_gb: 0.001,
+            high_watermark_percent: 95,
+            resume_percent: 85,
+            upload_concurrency: 2,
+            local_concurrency: 2,
+            shutdown_flush: ShutdownFlush::Local,
+        });
+        settings.validate().unwrap();
+
+        let startup = StartupContext::prepare(&settings, DatabaseMode::ReadWrite)
+            .await
+            .unwrap();
+        let data_stack = startup.retrying_object_store.to_string();
+        assert!(
+            data_stack.starts_with("WritebackObjectStore("),
+            "writeback must own the top-level mutation boundary, got {data_stack}"
+        );
+        assert!(
+            !data_stack.starts_with("RetryingObjectStore(WritebackObjectStore("),
+            "generic retry must never replay a locally admitted mutation, got {data_stack}"
+        );
+        startup.writeback.unwrap().shutdown().await.unwrap();
     }
 
     #[tokio::test]

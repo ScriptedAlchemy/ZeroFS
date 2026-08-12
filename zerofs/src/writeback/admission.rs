@@ -410,18 +410,12 @@ impl DiskAdmission {
         lock(&self.inner.state).used
     }
 
+    pub fn poison(&self, message: impl Into<String>) {
+        terminate_disk(&self.inner, AdmissionError::Poisoned(message.into()));
+    }
+
     pub fn close(&self) {
-        let waiters = {
-            let mut state = lock(&self.inner.state);
-            if state.terminal.is_some() {
-                return;
-            }
-            state.terminal = Some(AdmissionError::Closed);
-            state.waiters.drain(..).collect::<Vec<_>>()
-        };
-        for waiter in waiters {
-            let _ = waiter.sender.send(Err(AdmissionError::Closed));
-        }
+        terminate_disk(&self.inner, AdmissionError::Closed);
     }
 }
 
@@ -530,6 +524,20 @@ fn release_disk_bytes(inner: &Arc<DiskInner>, bytes: u64) {
         }
     } else {
         grant_disk_waiters(inner);
+    }
+}
+
+fn terminate_disk(inner: &Arc<DiskInner>, error: AdmissionError) {
+    let waiters = {
+        let mut state = lock(&inner.state);
+        if state.terminal.is_some() {
+            return;
+        }
+        state.terminal = Some(error.clone());
+        state.waiters.drain(..).collect::<Vec<_>>()
+    };
+    for waiter in waiters {
+        let _ = waiter.sender.send(Err(error.clone()));
     }
 }
 

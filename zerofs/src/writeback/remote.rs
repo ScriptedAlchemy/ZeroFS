@@ -1,4 +1,4 @@
-use crate::writeback::admission::DiskAdmission;
+use crate::writeback::admission::{Admission, DiskAdmission};
 use crate::writeback::journal::Journal;
 use crate::writeback::journaler::{LocalBarrier, LocalBarrierError};
 use crate::writeback::model::{
@@ -39,11 +39,15 @@ struct RemoteProgress {
 
 fn publish_terminal(
     progress: &watch::Sender<RemoteProgress>,
+    admission: &Admission,
+    disk: &DiskAdmission,
     error: impl Into<String>,
     closed: bool,
 ) {
     let error = error.into();
     tracing::error!(error = %error, "remote writeback scheduler entered terminal state");
+    admission.poison(error.clone());
+    disk.poison(error.clone());
     progress.send_modify(|state| {
         state.terminal_error = Some(error.clone());
         state.closed |= closed;
@@ -98,6 +102,7 @@ impl RemoteScheduler {
         remote: Arc<dyn ObjectStore>,
         journal: Arc<Journal>,
         overlay: OverlayIndex,
+        admission: Admission,
         disk: DiskAdmission,
         local: LocalBarrier,
         upload_concurrency: usize,
@@ -106,7 +111,7 @@ impl RemoteScheduler {
             remote,
             journal,
             overlay,
-            disk,
+            (admission, disk),
             local,
             upload_concurrency,
             true,
@@ -117,6 +122,7 @@ impl RemoteScheduler {
         remote: Arc<dyn ObjectStore>,
         journal: Arc<Journal>,
         overlay: OverlayIndex,
+        admission: Admission,
         disk: DiskAdmission,
         local: LocalBarrier,
         upload_concurrency: usize,
@@ -125,7 +131,7 @@ impl RemoteScheduler {
             remote,
             journal,
             overlay,
-            disk,
+            (admission, disk),
             local,
             upload_concurrency,
             false,
@@ -136,11 +142,12 @@ impl RemoteScheduler {
         remote: Arc<dyn ObjectStore>,
         journal: Arc<Journal>,
         overlay: OverlayIndex,
-        disk: DiskAdmission,
+        admissions: (Admission, DiskAdmission),
         local: LocalBarrier,
         upload_concurrency: usize,
         active: bool,
     ) -> anyhow::Result<Self> {
+        let (admission, disk) = admissions;
         let journal_progress = journal.progress()?;
         let (progress_sender, progress) = watch::channel(RemoteProgress {
             sequence: journal_progress.remote_seq,
@@ -153,6 +160,7 @@ impl RemoteScheduler {
             remote,
             journal,
             overlay,
+            admission,
             disk,
             local,
             upload_concurrency: upload_concurrency.max(1),
@@ -176,10 +184,19 @@ impl RemoteScheduler {
         self.barrier.progress.borrow().terminal_error.clone()
     }
 
-    pub fn activate(&self) -> Result<(), RemoteBarrierError> {
-        if let Some(error) = self.terminal_error() {
-            return Err(RemoteBarrierError::Remote(error));
+    pub fn check_available(&self) -> Result<(), RemoteBarrierError> {
+        let state = self.barrier.progress.borrow();
+        if let Some(error) = &state.terminal_error {
+            return Err(RemoteBarrierError::Remote(error.clone()));
         }
+        if state.closed {
+            return Err(RemoteBarrierError::Closed);
+        }
+        Ok(())
+    }
+
+    pub fn activate(&self) -> Result<(), RemoteBarrierError> {
+        self.check_available()?;
         self.activate
             .send(true)
             .map_err(|_| RemoteBarrierError::Closed)
@@ -199,6 +216,7 @@ struct RemoteWorker {
     remote: Arc<dyn ObjectStore>,
     journal: Arc<Journal>,
     overlay: OverlayIndex,
+    admission: Admission,
     disk: DiskAdmission,
     local: LocalBarrier,
     upload_concurrency: usize,
@@ -237,6 +255,7 @@ async fn run_remote_scheduler(worker: RemoteWorker) {
         remote,
         journal,
         overlay,
+        admission,
         disk,
         local,
         upload_concurrency,
@@ -281,7 +300,7 @@ async fn run_remote_scheduler(worker: RemoteWorker) {
             result = local_wait => {
                 if let Err(error) = result {
                     if !matches!(error, LocalBarrierError::Closed) {
-                        publish_terminal(&progress, error.to_string(), false);
+                        publish_terminal(&progress, &admission, &disk, error.to_string(), false);
                     }
                     break;
                 }
@@ -306,7 +325,7 @@ async fn run_remote_scheduler(worker: RemoteWorker) {
             Ok(Some(window)) => window,
             Ok(None) => break,
             Err(error) => {
-                publish_terminal(&progress, format!("{error:#}"), false);
+                publish_terminal(&progress, &admission, &disk, format!("{error:#}"), false);
                 break;
             }
         };
@@ -366,6 +385,8 @@ async fn run_remote_scheduler(worker: RemoteWorker) {
                     {
                         publish_terminal(
                             &progress,
+                            &admission,
+                            &disk,
                             format!(
                                 "failed to persist remote retry for sequence {}: {journal_error:#}",
                                 record.sequence
@@ -377,6 +398,8 @@ async fn run_remote_scheduler(worker: RemoteWorker) {
                     if is_terminal_remote_error(&error) {
                         publish_terminal(
                             &progress,
+                            &admission,
+                            &disk,
                             format!(
                                 "permanent remote divergence at sequence {}: {error}",
                                 record.sequence
@@ -406,14 +429,14 @@ async fn run_remote_scheduler(worker: RemoteWorker) {
             )
             .await
             {
-                publish_terminal(&progress, format!("{error:#}"), true);
+                publish_terminal(&progress, &admission, &disk, format!("{error:#}"), true);
                 return;
             }
             if !retry {
                 window = match load_scheduler_window(&journal, next, upload_concurrency) {
                     Ok(window) => window,
                     Err(error) => {
-                        publish_terminal(&progress, format!("{error:#}"), true);
+                        publish_terminal(&progress, &admission, &disk, format!("{error:#}"), true);
                         return;
                     }
                 };
