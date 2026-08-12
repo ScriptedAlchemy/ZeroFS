@@ -18,6 +18,7 @@ if str(ROOT) not in sys.path:
 from scripts.vm100_pilot.benchmark import BenchmarkRunner  # noqa: E402
 from scripts.vm100_pilot.config import PilotConfig  # noqa: E402
 from scripts.vm100_pilot.lifecycle import PilotLifecycle  # noqa: E402
+from scripts.vm100_pilot.migration import StripedMigrator  # noqa: E402
 from scripts.vm100_pilot.profile import ProfileRunner  # noqa: E402
 from scripts.vm100_pilot.raw_sftp import RawSftpRunner  # noqa: E402
 from scripts.vm100_pilot.runner import Runner  # noqa: E402
@@ -47,6 +48,12 @@ def build_parser() -> argparse.ArgumentParser:
     subcommands.add_parser("status", help="validate runtime topology and durable state")
     drain = subcommands.add_parser("drain", help="wait for local and remote writeback")
     drain.add_argument("--timeout", type=_positive)
+    migration = subcommands.add_parser(
+        "migrate-striped",
+        help="replace the canonical NBD export with a verified striped export",
+    )
+    migration.add_argument("--replacement-export")
+    migration.add_argument("--temporary-max-size-gib", type=_positive)
 
     for name, help_text, default_mib in (
         ("benchmark", "measure foreground, local SSD, remote, and read tiers", 1024),
@@ -125,6 +132,7 @@ def dispatch(args: argparse.Namespace, config: PilotConfig, runner: Runner) -> N
     workloads = WorkloadRunner(config, runner, lifecycle)
     raw = RawSftpRunner(config, runner, lifecycle)
     profile = ProfileRunner(config, runner, lifecycle, benchmark)
+    migration = StripedMigrator(config, runner, lifecycle)
 
     if args.command == "setup":
         deployed = None if args.skip_build else lifecycle.build_deploy()
@@ -139,6 +147,13 @@ def dispatch(args: argparse.Namespace, config: PilotConfig, runner: Runner) -> N
         _emit(lifecycle.status())
     elif args.command == "drain":
         _emit(lifecycle.drain(args.timeout))
+    elif args.command == "migrate-striped":
+        _emit(
+            migration.run(
+                replacement_export=args.replacement_export,
+                temporary_max_size_gib=args.temporary_max_size_gib,
+            )
+        )
     elif args.command == "benchmark":
         _emit(benchmark.run(total_mib=args.total_mib, jobs=args.jobs))
     elif args.command == "profile":

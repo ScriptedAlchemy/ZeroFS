@@ -123,13 +123,17 @@ class PilotLifecycle:
         if mounted.returncode == 0:
             raise RuntimeError(f"{self.config.mountpoint} remains mounted")
 
-    def start(self) -> dict[str, int]:
+    def stop_storage_clients(self) -> None:
         self.require_vm100()
-        units = (
-            (self.config.service, 180),
-            (self.config.client_service, 60),
-            (self.config.mount_unit, 60),
+        for unit in (self.config.mount_unit, self.config.client_service):
+            self._stop_one(unit)
+        mounted = self.runner.run(
+            ["findmnt", "-rn", "-M", self.config.mountpoint], check=False
         )
+        if mounted.returncode == 0:
+            raise RuntimeError(f"{self.config.mountpoint} remains mounted")
+
+    def _start_units(self, units: tuple[tuple[str, int], ...]) -> None:
         self.runner.run(
             ["systemctl", "reset-failed", *(unit for unit, _ in units)],
             sudo=True,
@@ -151,6 +155,21 @@ class PilotLifecycle:
             if cleanup:
                 original.add_note("startup cleanup failures: " + "; ".join(cleanup))
             raise
+
+    def start_storage_clients(self) -> None:
+        self.require_vm100()
+        self._start_units(
+            ((self.config.client_service, 60), (self.config.mount_unit, 60))
+        )
+
+    def start(self) -> dict[str, int]:
+        self.require_vm100()
+        units = (
+            (self.config.service, 180),
+            (self.config.client_service, 60),
+            (self.config.mount_unit, 60),
+        )
+        self._start_units(units)
         return {"restarts": int(self._show(self.config.service, "NRestarts") or "0")}
 
     def restart(self) -> dict[str, int]:

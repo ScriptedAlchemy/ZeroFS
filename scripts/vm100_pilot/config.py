@@ -54,6 +54,17 @@ class PilotConfig:
     delete_jobs: int
     raw_sftp_jobs: int
     raw_sftp_per_job_mib: int
+    nbd_export: str
+    replacement_export: str
+    nbd_size_gib: int
+    nbd_stripe_lanes: int
+    nbd_stripe_kib: int
+    nbd_socket: Path
+    ninep_target: str
+    migration_device: Path
+    migration_mountpoint: Path
+    admin_mountpoint: Path
+    temporary_max_size_gib: int
     user: str
     group: str
 
@@ -64,21 +75,31 @@ class PilotConfig:
     @classmethod
     def from_mapping(cls, root: Path, values: Mapping[str, str]) -> "PilotConfig":
         root = root.resolve()
-        mountpoint = Path(values.get("ZEROFS_PILOT_MOUNTPOINT", "/mnt/storagebox-nbd-pilot"))
-        result_dir = Path(values.get("ZEROFS_PILOT_RESULT_DIR", "/var/tmp/zerofs-pilot-results"))
+        mountpoint = Path(
+            values.get("ZEROFS_PILOT_MOUNTPOINT", "/mnt/storagebox-nbd-pilot")
+        )
+        result_dir = Path(
+            values.get("ZEROFS_PILOT_RESULT_DIR", "/var/tmp/zerofs-pilot-results")
+        )
         profile_target = Path(
             values.get("ZEROFS_PROFILE_TARGET_DIR", "/var/tmp/zerofs-profile-target")
         )
         build_target = Path(
             values.get("ZEROFS_BUILD_TARGET_DIR", "/var/tmp/zerofs-build-target")
         )
-        cargo = Path(values.get("ZEROFS_PILOT_CARGO", str(Path.home() / ".cargo/bin/cargo")))
+        cargo = Path(
+            values.get("ZEROFS_PILOT_CARGO", str(Path.home() / ".cargo/bin/cargo"))
+        )
         config = cls(
             root=root,
             crate=root / "zerofs",
-            config_file=Path(values.get("ZEROFS_PILOT_CONFIG", "/etc/zerofs/nbd-pilot.toml")),
+            config_file=Path(
+                values.get("ZEROFS_PILOT_CONFIG", "/etc/zerofs/nbd-pilot.toml")
+            ),
             env_file=Path(values.get("ZEROFS_PILOT_ENV", "/etc/zerofs/nbd-pilot.env")),
-            binary=Path(values.get("ZEROFS_PILOT_BINARY", "/usr/local/bin/zerofs-nbd-pilot")),
+            binary=Path(
+                values.get("ZEROFS_PILOT_BINARY", "/usr/local/bin/zerofs-nbd-pilot")
+            ),
             build_receipt=Path(
                 values.get(
                     "ZEROFS_PILOT_BUILD_RECEIPT",
@@ -125,7 +146,9 @@ class PilotConfig:
             build_target=build_target,
             profile_target=profile_target,
             cargo=cargo,
-            npm_repo=values.get("ZEROFS_NPM_WORKLOAD_REPO", "https://github.com/npm/cli.git"),
+            npm_repo=values.get(
+                "ZEROFS_NPM_WORKLOAD_REPO", "https://github.com/npm/cli.git"
+            ),
             npm_commit=values.get(
                 "ZEROFS_NPM_WORKLOAD_COMMIT",
                 "64763a341e7aa5b456e696f956759bf9b3440dc1",
@@ -140,12 +163,45 @@ class PilotConfig:
             delete_jobs=_integer(values, "ZEROFS_DELETE_JOBS", 4),
             raw_sftp_jobs=_integer(values, "ZEROFS_RAW_SFTP_JOBS", 7),
             raw_sftp_per_job_mib=_integer(values, "ZEROFS_RAW_SFTP_PER_JOB_MIB", 128),
+            nbd_export=values.get("ZEROFS_PILOT_NBD_EXPORT", "vm100-pilot-64g"),
+            replacement_export=values.get(
+                "ZEROFS_PILOT_REPLACEMENT_EXPORT", "vm100-pilot-64g-v3"
+            ),
+            nbd_size_gib=_integer(values, "ZEROFS_PILOT_NBD_SIZE_GIB", 64),
+            nbd_stripe_lanes=_integer(values, "ZEROFS_PILOT_NBD_STRIPE_LANES", 4),
+            nbd_stripe_kib=_integer(values, "ZEROFS_PILOT_NBD_STRIPE_KIB", 256),
+            nbd_socket=Path(
+                values.get("ZEROFS_PILOT_NBD_SOCKET", "/run/zerofs-nbd-pilot/nbd.sock")
+            ),
+            ninep_target=values.get(
+                "ZEROFS_PILOT_9P_TARGET",
+                "unix:/run/zerofs-nbd-pilot/9p.sock",
+            ),
+            migration_device=Path(
+                values.get("ZEROFS_PILOT_MIGRATION_DEVICE", "/dev/nbd1")
+            ),
+            migration_mountpoint=Path(
+                values.get(
+                    "ZEROFS_PILOT_MIGRATION_MOUNTPOINT",
+                    "/mnt/zerofs-nbd-migration",
+                )
+            ),
+            admin_mountpoint=Path(
+                values.get("ZEROFS_PILOT_ADMIN_MOUNTPOINT", "/mnt/zerofs-admin")
+            ),
+            temporary_max_size_gib=_integer(
+                values, "ZEROFS_PILOT_TEMPORARY_MAX_SIZE_GIB", 256
+            ),
             user=values.get("ZEROFS_PILOT_USER", getpass.getuser()),
-            group=values.get("ZEROFS_PILOT_GROUP", values.get("ZEROFS_PILOT_USER", getpass.getuser())),
+            group=values.get(
+                "ZEROFS_PILOT_GROUP", values.get("ZEROFS_PILOT_USER", getpass.getuser())
+            ),
         )
         config.require_disposable(config.result_dir)
         config.require_disposable(config.build_target)
         config.require_disposable(config.profile_target)
+        config.require_disposable(config.migration_mountpoint)
+        config.require_disposable(config.admin_mountpoint)
         return config
 
     def require_disposable(self, path: Path) -> Path:

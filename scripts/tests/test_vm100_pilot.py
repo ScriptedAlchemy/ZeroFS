@@ -8,6 +8,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from subprocess import CompletedProcess
@@ -20,6 +21,12 @@ from scripts.vm100_pilot.benchmark import (
     calculate_tiers,
 )
 from scripts.vm100_pilot.lifecycle import PilotLifecycle
+from scripts.vm100_pilot.migration import (
+    LocalExportNamespace,
+    StripedMigrator,
+    rewrite_toml_number,
+    swap_exports,
+)
 from scripts.vm100_pilot.metrics import (
     TerminalWritebackError,
     WritebackSnapshot,
@@ -110,6 +117,11 @@ class CoreTests(unittest.TestCase):
                 self.root,
                 {"ZEROFS_PILOT_RESULT_DIR": "/fast/zerofs-results"},
             )
+        with self.assertRaisesRegex(ValueError, "/fast"):
+            PilotConfig.from_mapping(
+                self.root,
+                {"ZEROFS_PILOT_ADMIN_MOUNTPOINT": "/fast/zerofs-admin"},
+            )
 
     def test_config_has_complete_command_defaults(self) -> None:
         config = PilotConfig.from_mapping(self.root, {})
@@ -120,6 +132,17 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(config.raw_sftp_jobs, 7)
         self.assertEqual(config.build_target, Path("/var/tmp/zerofs-build-target"))
         self.assertNotIn(Path("/fast"), config.build_target.parents)
+        self.assertEqual(config.nbd_export, "vm100-pilot-64g")
+        self.assertEqual(config.replacement_export, "vm100-pilot-64g-v3")
+        self.assertEqual(config.nbd_size_gib, 64)
+        self.assertEqual(config.nbd_stripe_lanes, 4)
+        self.assertEqual(config.nbd_stripe_kib, 256)
+        self.assertEqual(config.migration_device, Path("/dev/nbd1"))
+        self.assertEqual(config.nbd_socket, Path("/run/zerofs-nbd-pilot/nbd.sock"))
+        self.assertEqual(config.ninep_target, "unix:/run/zerofs-nbd-pilot/9p.sock")
+        self.assertEqual(config.migration_mountpoint, Path("/mnt/zerofs-nbd-migration"))
+        self.assertEqual(config.admin_mountpoint, Path("/mnt/zerofs-admin"))
+        self.assertEqual(config.temporary_max_size_gib, 256)
 
     def test_disposable_path_refuses_root_fast_and_mount_root(self) -> None:
         config = PilotConfig.from_mapping(self.root, {})
@@ -143,6 +166,19 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(payload["status"], "failed")
         self.assertEqual(payload["phase"], "write")
         self.assertIn("boom", payload["error"])
+
+    def test_cli_exposes_the_guarded_striped_migration(self) -> None:
+        script = Path(__file__).parents[1] / "vm100-pilot.py"
+        result = subprocess.run(
+            [sys.executable, script, "migrate-striped", "--help"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--replacement-export", result.stdout)
+        self.assertIn("--temporary-max-size-gib", result.stdout)
 
     def test_interrupt_signals_a_sudo_style_parent_only_once(self) -> None:
         marker = Path(self.temp.name) / "signals"
@@ -237,6 +273,50 @@ class CoreTests(unittest.TestCase):
         stdout.close()
 
         self.assertEqual(marker.read_text(), "1")
+
+    def test_export_swap_restores_the_predecessor_when_validation_fails(self) -> None:
+        exports = Path(self.temp.name) / "exports"
+        exports.mkdir()
+        (exports / "canonical").write_bytes(b"predecessor")
+        (exports / "replacement").mkdir()
+        (exports / "replacement" / "lane-0").write_bytes(b"replacement")
+        namespace = LocalExportNamespace(exports)
+
+        with self.assertRaisesRegex(RuntimeError, "injected validation failure"):
+            swap_exports(
+                namespace,
+                canonical="canonical",
+                replacement="replacement",
+                backup="zerofs-migration-predecessor",
+                validate=lambda: (_ for _ in ()).throw(
+                    RuntimeError("injected validation failure")
+                ),
+            )
+
+        self.assertEqual((exports / "canonical").read_bytes(), b"predecessor")
+        self.assertEqual(
+            (exports / "replacement" / "lane-0").read_bytes(), b"replacement"
+        )
+        self.assertFalse((exports / "zerofs-migration-predecessor").exists())
+
+    def test_quota_rewrite_changes_only_filesystem_max_size(self) -> None:
+        source = """\
+[filesystem]
+max_size_gb = 128.0
+
+[cache]
+max_size_gb = 64.0
+"""
+        self.assertEqual(
+            rewrite_toml_number(source, "filesystem", "max_size_gb", 256),
+            """\
+[filesystem]
+max_size_gb = 256
+
+[cache]
+max_size_gb = 64.0
+""",
+        )
 
 
 class LifecycleTests(unittest.TestCase):
@@ -400,6 +480,70 @@ class LifecycleTests(unittest.TestCase):
         ]
         self.assertEqual(stops, [self.config.service])
         self.assertNotIn(self.config.service, self.runner.active)
+
+    def test_storage_client_restart_keeps_the_daemon_running(self) -> None:
+        self.runner.active.update(
+            (self.config.service, self.config.client_service, self.config.mount_unit)
+        )
+
+        self.lifecycle.stop_storage_clients()
+        self.assertIn(self.config.service, self.runner.active)
+        self.assertNotIn(self.config.client_service, self.runner.active)
+        self.assertNotIn(self.config.mount_unit, self.runner.active)
+
+        self.lifecycle.start_storage_clients()
+        starts = [
+            call[0][2]
+            for call in self.runner.calls
+            if call[0][:2] == ("systemctl", "start")
+        ]
+        self.assertEqual(
+            starts[-2:], [self.config.client_service, self.config.mount_unit]
+        )
+
+    def test_striped_migration_refuses_a_busy_scratch_device(self) -> None:
+        class BusyDeviceRunner(FakeRunner):
+            def run(
+                self, argv: Sequence[str | Path], **kwargs: Any
+            ) -> CompletedProcess[str]:
+                args = tuple(str(value) for value in argv)
+                if args == ("cat", "/sys/block/nbd1/size"):
+                    return CompletedProcess(args, 0, "2048\n", "")
+                return super().run(args, **kwargs)
+
+        runner = BusyDeviceRunner()
+        lifecycle = PilotLifecycle(self.config, runner)  # type: ignore[arg-type]
+        migrator = StripedMigrator(self.config, runner, lifecycle)  # type: ignore[arg-type]
+
+        with self.assertRaisesRegex(RuntimeError, "/dev/nbd1 is already attached"):
+            migrator.run()
+
+        self.assertFalse(any("provision-striped" in call[0] for call in runner.calls))
+
+    def test_cutover_preflight_failure_restarts_the_predecessor_clients(self) -> None:
+        class CutoverMigrator(StripedMigrator):
+            @contextmanager
+            def _admin_namespace(self) -> Any:
+                yield object()
+
+            def _verify_layout(self, namespace: Any, export: str) -> None:
+                return None
+
+            def _device_size(self, path: Path | None = None) -> int:
+                return 1
+
+        self.runner.active.update(
+            (self.config.service, self.config.client_service, self.config.mount_unit)
+        )
+        migrator = CutoverMigrator(
+            self.config, self.runner, self.lifecycle  # type: ignore[arg-type]
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "remained attached"):
+            migrator._cutover("replacement", "predecessor")
+
+        self.assertIn(self.config.client_service, self.runner.active)
+        self.assertIn(self.config.mount_unit, self.runner.active)
 
 
 class _StaticMetrics:
