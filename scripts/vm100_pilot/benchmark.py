@@ -71,6 +71,24 @@ class FioResult:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class DirectReadPair:
+    warmup: FioResult
+    hot: FioResult
+    warmup_start_ns: int
+    warmup_end_ns: int
+    hot_start_ns: int
+    hot_end_ns: int
+
+
+def _validate_fio_bytes(result: FioResult, *, expected_bytes: int, phase: str) -> None:
+    if result.bytes != expected_bytes:
+        raise RuntimeError(
+            f"fio {phase} returned short I/O: "
+            f"expected={expected_bytes}, actual={result.bytes}"
+        )
+
+
 def _assert_no_maintenance(before: WritebackSnapshot, after: WritebackSnapshot) -> None:
     before_epoch = (before.gc_passes, before.gc_batches, before.gc_deleted_bytes)
     after_epoch = (after.gc_passes, after.gc_batches, after.gc_deleted_bytes)
@@ -383,6 +401,46 @@ class BenchmarkRunner:
         if remains.returncode == 0:
             raise RuntimeError(f"benchmark root remains after cleanup: {run_root}")
 
+    def _run_direct_read_pair(
+        self,
+        *,
+        run_root: Path,
+        per_job_mib: int,
+        jobs: int,
+        warmup_output: Path,
+        hot_output: Path,
+    ) -> DirectReadPair:
+        warmup_start_ns = time.monotonic_ns()
+        warmup = self._run_fio(
+            name="zerofs_direct_read_warmup",
+            run_root=run_root,
+            per_job_mib=per_job_mib,
+            jobs=jobs,
+            output=warmup_output,
+            read=True,
+            direct=True,
+        )
+        warmup_end_ns = time.monotonic_ns()
+        hot_start_ns = warmup_end_ns
+        hot = self._run_fio(
+            name="zerofs_direct_read_hot",
+            run_root=run_root,
+            per_job_mib=per_job_mib,
+            jobs=jobs,
+            output=hot_output,
+            read=True,
+            direct=True,
+        )
+        hot_end_ns = time.monotonic_ns()
+        return DirectReadPair(
+            warmup=warmup,
+            hot=hot,
+            warmup_start_ns=warmup_start_ns,
+            warmup_end_ns=warmup_end_ns,
+            hot_start_ns=hot_start_ns,
+            hot_end_ns=hot_end_ns,
+        )
+
     def run(
         self,
         *,
@@ -411,7 +469,8 @@ class BenchmarkRunner:
             write_output = receipt.path("write-fio.json")
             buffered_warmup_output = receipt.path("buffered-read-warmup-fio.json")
             buffered_output = receipt.path("buffered-read-hot-fio.json")
-            direct_output = receipt.path("direct-read-fio.json")
+            direct_warmup_output = receipt.path("direct-read-warmup-fio.json")
+            direct_output = receipt.path("direct-read-hot-fio.json")
             sample_output = receipt.path("metrics.csv")
             system_io_output = receipt.path("system-io.csv")
             try:
@@ -426,16 +485,20 @@ class BenchmarkRunner:
 
                 def record_phase(name: str, start_ns: int, end_ns: int) -> None:
                     phase_windows[name] = {"start_ns": start_ns, "end_ns": end_ns}
-                    receipt.record("phase_monotonic_ns", phase_windows)
 
                 started = time.monotonic_ns()
-                self._run_fio(
+                write_result = self._run_fio(
                     name="zerofs_user_write",
                     run_root=run_root,
                     per_job_mib=per_job_mib,
                     jobs=jobs,
                     output=write_output,
                     read=False,
+                )
+                _validate_fio_bytes(
+                    write_result,
+                    expected_bytes=logical_bytes,
+                    phase="foreground write",
                 )
                 foreground_end = time.monotonic_ns()
                 record_phase("foreground_write", started, foreground_end)
@@ -453,10 +516,12 @@ class BenchmarkRunner:
                 )
                 local_end = time.monotonic_ns()
                 record_phase("local_durability_tail", foreground_end, local_end)
+                record_phase("local_end_to_end", started, local_end)
                 local_io_after = self._system_io(phase_device)
                 self.lifecycle.drain()
                 remote_end = time.monotonic_ns()
                 record_phase("remote_durability_tail", local_end, remote_end)
+                record_phase("remote_end_to_end", started, remote_end)
                 remote_io_after = self._system_io(phase_device)
                 remote_snapshot = self.lifecycle.metrics.snapshot()
                 warmup_start = time.monotonic_ns()
@@ -468,6 +533,11 @@ class BenchmarkRunner:
                     output=buffered_warmup_output,
                     read=True,
                     direct=False,
+                )
+                _validate_fio_bytes(
+                    buffered_warmup,
+                    expected_bytes=logical_bytes,
+                    phase="buffered warmup",
                 )
                 warmup_end = time.monotonic_ns()
                 record_phase("buffered_warmup", warmup_start, warmup_end)
@@ -483,6 +553,11 @@ class BenchmarkRunner:
                     read=True,
                     direct=False,
                 )
+                _validate_fio_bytes(
+                    buffered_read,
+                    expected_bytes=logical_bytes,
+                    phase="page-cache hot read",
+                )
                 hot_end = time.monotonic_ns()
                 record_phase("page_cache_hot_read", hot_start, hot_end)
                 hot_io_after = self._system_io(phase_device)
@@ -490,22 +565,37 @@ class BenchmarkRunner:
                 page_cache = verify_page_cache_hit(nbd_before, nbd_after)
                 receipt.record("buffered_read_warmup", asdict(buffered_warmup))
                 receipt.record("page_cache_evidence", page_cache.to_dict())
-                direct_start = time.monotonic_ns()
-                direct_read = self._run_fio(
-                    name="zerofs_direct_read",
+                direct_pair = self._run_direct_read_pair(
                     run_root=run_root,
                     per_job_mib=per_job_mib,
                     jobs=jobs,
-                    output=direct_output,
-                    read=True,
-                    direct=True,
+                    warmup_output=direct_warmup_output,
+                    hot_output=direct_output,
                 )
-                direct_end = time.monotonic_ns()
-                record_phase("direct_read", direct_start, direct_end)
+                _validate_fio_bytes(
+                    direct_pair.warmup,
+                    expected_bytes=logical_bytes,
+                    phase="direct warmup",
+                )
+                _validate_fio_bytes(
+                    direct_pair.hot,
+                    expected_bytes=logical_bytes,
+                    phase="direct hot read",
+                )
+                record_phase(
+                    "direct_warmup",
+                    direct_pair.warmup_start_ns,
+                    direct_pair.warmup_end_ns,
+                )
+                record_phase(
+                    "direct_read", direct_pair.hot_start_ns, direct_pair.hot_end_ns
+                )
                 direct_io_after = self._system_io(phase_device)
+                receipt.record("direct_read_warmup", asdict(direct_pair.warmup))
                 sampler.stop()
                 sampler_system_io = sampler.system_io
                 sampler = None
+                receipt.record("phase_monotonic_ns", phase_windows)
                 local_active_ms, remote_active_ms = _active_windows(
                     sample_output,
                     before_accepted=before.accepted,
@@ -516,7 +606,9 @@ class BenchmarkRunner:
                 )
                 system_io = summarize_system_io(
                     sampler_system_io,
-                    elapsed_ms=max(1, round((direct_end - started) / 1_000_000)),
+                    elapsed_ms=max(
+                        1, round((direct_pair.hot_end_ns - started) / 1_000_000)
+                    ),
                 )
                 receipt.record("system_io", system_io.to_dict())
 
@@ -550,7 +642,10 @@ class BenchmarkRunner:
                             warmup_io_after, hot_io_after, hot_start, hot_end
                         ),
                         "direct_read": phase_io(
-                            hot_io_after, direct_io_after, direct_start, direct_end
+                            hot_io_after,
+                            direct_io_after,
+                            direct_pair.warmup_start_ns,
+                            direct_pair.hot_end_ns,
                         ),
                     },
                 )
@@ -573,7 +668,7 @@ class BenchmarkRunner:
                     local_active_ms=local_active_ms,
                     remote_active_ms=remote_active_ms,
                     page_cache_hot_read_ms=buffered_read.runtime_ms,
-                    zerofs_direct_read_ms=direct_read.runtime_ms,
+                    zerofs_direct_read_ms=direct_pair.hot.runtime_ms,
                 )
                 result = replace(result, receipt_dir=str(receipt.directory))
                 receipt.record("result", result.to_dict())

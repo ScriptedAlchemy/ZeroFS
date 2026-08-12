@@ -25,6 +25,7 @@ from scripts.vm100_pilot.benchmark import (
     BenchmarkRunner,
     FioResult,
     _active_windows,
+    _validate_fio_bytes,
     calculate_tiers,
 )
 from scripts.vm100_pilot.lifecycle import PilotLifecycle
@@ -1344,6 +1345,43 @@ class BenchmarkTests(unittest.TestCase):
         self.runner = FakeRunner()
         self.lifecycle = _HealthyLifecycle(self.snapshot, self.config)
 
+    def test_benchmark_rejects_short_fio_results(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "short I/O"):
+            _validate_fio_bytes(
+                FioResult(bytes=3 << 20, runtime_ms=1, mibps=3072.0),
+                expected_bytes=4 << 20,
+                phase="foreground write",
+            )
+
+    def test_direct_read_pair_warms_zerofs_then_measures_the_hot_path(self) -> None:
+        calls: list[tuple[str, bool | None]] = []
+
+        class RecordingBenchmark(BenchmarkRunner):
+            def _run_fio(self, *args: object, **kwargs: Any) -> FioResult:
+                calls.append((kwargs["name"], kwargs.get("direct")))
+                return FioResult(bytes=4 << 20, runtime_ms=1, mibps=4096.0)
+
+        benchmark = RecordingBenchmark(
+            self.config,
+            self.runner,
+            self.lifecycle,  # type: ignore[arg-type]
+        )
+        benchmark._run_direct_read_pair(
+            run_root=self.config.mountpoint / ".zerofs-bench-test",
+            per_job_mib=4,
+            jobs=1,
+            warmup_output=Path(self.temp.name) / "direct-warmup.json",
+            hot_output=Path(self.temp.name) / "direct-hot.json",
+        )
+
+        self.assertEqual(
+            calls,
+            [
+                ("zerofs_direct_read_warmup", True),
+                ("zerofs_direct_read_hot", True),
+            ],
+        )
+
     def test_local_rate_uses_completed_payload_and_full_interval(self) -> None:
         result = calculate_tiers(
             logical_bytes=1 << 30,
@@ -1736,8 +1774,9 @@ class ProfileTests(unittest.TestCase):
     def test_perf_record_uses_the_same_monotonic_clock_as_phase_receipts(self) -> None:
         argv = _perf_record_argv(123, Path("/tmp/perf.data"))
 
-        self.assertEqual(argv[argv.index("--clockid") + 1], "mono")
+        self.assertEqual(argv[argv.index("--clockid") + 1], "monotonic")
         self.assertEqual(argv[argv.index("--call-graph") + 1], "fp")
+        self.assertIn("--timestamp", argv)
 
     def test_profile_loads_benchmark_phase_windows_for_perf_slicing(self) -> None:
         receipt = Path(self.temp.name) / "benchmark-receipt"
@@ -1747,6 +1786,7 @@ class ProfileTests(unittest.TestCase):
                 {
                     "phase_monotonic_ns": {
                         "foreground_write": {"start_ns": 11, "end_ns": 22},
+                        "local_end_to_end": {"start_ns": 11, "end_ns": 33},
                         "direct_read": {"start_ns": 33, "end_ns": 44},
                     }
                 }
@@ -1770,7 +1810,11 @@ class ProfileTests(unittest.TestCase):
 
         self.assertEqual(
             _load_phase_windows(result),
-            {"foreground_write": (11, 22), "direct_read": (33, 44)},
+            {
+                "foreground_write": (11, 22),
+                "local_end_to_end": (11, 33),
+                "direct_read": (33, 44),
+            },
         )
 
     def test_maintenance_rewrite_updates_only_gc_cadence(self) -> None:

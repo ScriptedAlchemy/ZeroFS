@@ -30,7 +30,11 @@ def _phase_perf_report_argv(
 ) -> list[str | Path]:
     if end_ns <= start_ns:
         raise ValueError("perf phase must have a positive duration")
-    time_range = f"{start_ns / 1_000_000_000:.9f},{end_ns / 1_000_000_000:.9f}"
+    start_seconds, start_fraction = divmod(start_ns, 1_000_000_000)
+    end_seconds, end_fraction = divmod(end_ns, 1_000_000_000)
+    time_range = (
+        f"{start_seconds}.{start_fraction:09d},{end_seconds}.{end_fraction:09d}"
+    )
     return [
         "perf",
         "report",
@@ -54,8 +58,9 @@ def _perf_record_argv(pid: int, perf_data: Path) -> list[str | Path]:
         "-g",
         "--call-graph",
         "fp",
+        "--timestamp",
         "--clockid",
-        "mono",
+        "monotonic",
         "-p",
         str(pid),
         "-o",
@@ -389,8 +394,9 @@ class CollectorGroup:
                     perf_data,
                 ],
                 sudo=True,
-                check=False,
             )
+            if not report.stdout.strip():
+                raise RuntimeError("perf produced an empty aggregate report")
             self.receipt.path("perf-report.txt").write_text(
                 report.stdout + report.stderr, encoding="utf-8"
             )
@@ -398,8 +404,9 @@ class CollectorGroup:
                 phase_report = self.runner.run(
                     _phase_perf_report_argv(perf_data, start_ns, end_ns),
                     sudo=True,
-                    check=False,
                 )
+                if not phase_report.stdout.strip():
+                    raise RuntimeError(f"perf produced an empty report for {phase}")
                 self.receipt.path(f"perf-report-{phase}.txt").write_text(
                     phase_report.stdout + phase_report.stderr, encoding="utf-8"
                 )
