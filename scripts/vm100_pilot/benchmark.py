@@ -237,8 +237,8 @@ class BenchmarkRunner:
                     read=False,
                 )
                 foreground_end = time.monotonic_ns()
-                accepted_after_write = self.lifecycle.metrics.snapshot().accepted
                 self.runner.run(["sync", "-f", self.config.mountpoint], sudo=True)
+                accepted_after_write = self.lifecycle.metrics.snapshot().accepted
                 local_snapshot = wait_for_local(
                     self.lifecycle.metrics.snapshot,
                     target_sequence=accepted_after_write,
