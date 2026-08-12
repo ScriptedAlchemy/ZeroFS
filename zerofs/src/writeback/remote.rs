@@ -10,6 +10,7 @@ use futures::{FutureExt, StreamExt};
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutResult, UpdateVersion};
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, watch};
@@ -17,6 +18,7 @@ use tokio::task::JoinHandle;
 
 const REMOTE_COALESCE_IDLE: Duration = Duration::from_millis(500);
 const REMOTE_RETRY_DELAY: Duration = Duration::from_millis(200);
+const REMOTE_OPERATION_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RemoteBarrierError {
@@ -219,7 +221,13 @@ async fn run_remote_scheduler(worker: RemoteWorker) {
                     let journal = journal.clone();
                     active.push(
                         async move {
-                            let result = apply_record(remote, journal, record.clone()).await;
+                            let applying = apply_record(remote, journal, record.clone());
+                            let result = bounded_remote_operation(
+                                &record,
+                                REMOTE_OPERATION_TIMEOUT,
+                                applying,
+                            )
+                            .await;
                             (record, result)
                         }
                         .boxed(),
@@ -309,6 +317,25 @@ async fn run_remote_scheduler(worker: RemoteWorker) {
         }
     }
     progress.send_modify(|state| state.closed = true);
+}
+
+async fn bounded_remote_operation<F>(
+    record: &MutationRecord,
+    deadline: Duration,
+    operation: F,
+) -> object_store::Result<PutResult>
+where
+    F: Future<Output = object_store::Result<PutResult>>,
+{
+    tokio::time::timeout(deadline, operation)
+        .await
+        .map_err(|_| {
+            generic_error(format!(
+                "remote operation for sequence {} timed out after {:.3}s",
+                record.sequence,
+                deadline.as_secs_f64()
+            ))
+        })?
 }
 
 async fn coalesce_local_batch(
@@ -549,8 +576,11 @@ fn generic_error(message: impl Into<String>) -> object_store::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{CompletedRemote, collect_pipeline_batch};
+    use super::{CompletedRemote, bounded_remote_operation, collect_pipeline_batch};
     use crate::writeback::model::{FenceClass, LocalEtag, MutationKind, MutationRecord};
+    use futures::future;
+    use object_store::PutResult;
+    use std::time::Duration;
     use uuid::Uuid;
 
     fn record(sequence: u64, path: &str, fence: FenceClass) -> MutationRecord {
@@ -568,6 +598,26 @@ mod tests {
             retry_count: 0,
             last_error: None,
         }
+    }
+
+    #[tokio::test]
+    async fn pending_remote_operation_becomes_a_retryable_timeout() {
+        let mutation = record(41, "segments/stalled", FenceClass::ImmutableCreate);
+
+        let error = bounded_remote_operation(
+            &mutation,
+            Duration::from_millis(10),
+            future::pending::<object_store::Result<PutResult>>(),
+        )
+        .await
+        .expect_err("a permanently pending remote operation must time out");
+
+        let message = error.to_string();
+        assert!(message.contains("41"), "timeout identifies the sequence");
+        assert!(
+            message.contains("timed out"),
+            "timeout remains distinguishable from a provider error"
+        );
     }
 
     #[test]
