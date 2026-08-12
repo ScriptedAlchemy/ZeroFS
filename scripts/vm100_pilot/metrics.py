@@ -162,3 +162,28 @@ def wait_for_local(
                 f"{timeout}s; last={current.to_dict()}"
             )
         sleep(interval)
+
+
+def wait_for_accepted_after(
+    snapshot: Callable[[], WritebackSnapshot],
+    *,
+    previous_sequence: int,
+    timeout: float,
+    interval: float = 0.05,
+    monotonic: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+) -> WritebackSnapshot:
+    """Wait until the exported status observes work submitted after a baseline."""
+    started = monotonic()
+    while True:
+        current = snapshot()
+        if current.terminal:
+            raise TerminalWritebackError("writeback reported a terminal error")
+        if current.accepted > previous_sequence:
+            return current
+        if monotonic() - started >= timeout:
+            raise TimeoutError(
+                "writeback did not observe a new accepted sequence after "
+                f"{previous_sequence} within {timeout}s; last={current.to_dict()}"
+            )
+        sleep(interval)

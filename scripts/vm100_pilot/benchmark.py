@@ -10,7 +10,7 @@ from pathlib import Path
 
 from .config import PilotConfig
 from .lifecycle import PilotLifecycle
-from .metrics import wait_for_local
+from .metrics import wait_for_accepted_after, wait_for_local
 from .receipts import RunReceipt
 from .runner import Runner
 
@@ -238,7 +238,11 @@ class BenchmarkRunner:
                 )
                 foreground_end = time.monotonic_ns()
                 self.runner.run(["sync", "-f", self.config.mountpoint], sudo=True)
-                accepted_after_write = self.lifecycle.metrics.snapshot().accepted
+                accepted_after_write = wait_for_accepted_after(
+                    self.lifecycle.metrics.snapshot,
+                    previous_sequence=before.accepted,
+                    timeout=self.config.drain_timeout,
+                ).accepted
                 local_snapshot = wait_for_local(
                     self.lifecycle.metrics.snapshot,
                     target_sequence=accepted_after_write,

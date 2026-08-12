@@ -15,6 +15,7 @@ from scripts.vm100_pilot.lifecycle import PilotLifecycle
 from scripts.vm100_pilot.metrics import (
     TerminalWritebackError,
     WritebackSnapshot,
+    wait_for_accepted_after,
     wait_for_drain,
     wait_for_local,
 )
@@ -201,6 +202,23 @@ class LifecycleTests(unittest.TestCase):
         )
         self.assertEqual(result.local, 12)
         self.assertEqual(result.accepted, 13)
+
+    def test_accepted_barrier_waits_for_metrics_to_observe_submitted_work(self) -> None:
+        snapshots = iter(
+            (
+                WritebackSnapshot(12, 12, 12, 0, 0, 10, 10, False),
+                WritebackSnapshot(12, 12, 12, 0, 0, 10, 10, False),
+                WritebackSnapshot(15, 15, 12, 0, 4, 14, 10, False),
+            )
+        )
+        result = wait_for_accepted_after(
+            lambda: next(snapshots),
+            previous_sequence=12,
+            timeout=1,
+            sleep=lambda _: None,
+        )
+        self.assertEqual(result.accepted, 15)
+        self.assertEqual(result.local_bytes, 14)
 
     def test_stop_is_dependency_ordered(self) -> None:
         self.runner.active.update(
