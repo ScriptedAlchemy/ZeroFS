@@ -15,6 +15,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Condvar, Mutex};
 use uuid::Uuid;
 
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
@@ -34,10 +35,62 @@ const REMOTE_RETRIES_KEY: &str = "remote_retries";
 pub struct Journal {
     root: PathBuf,
     database: Database,
+    write_gate: JournalWriteGate,
     _lock_file: File,
     format_version: u32,
     #[cfg(test)]
     snapshot_calls: AtomicU64,
+}
+
+#[derive(Debug, Default)]
+struct JournalWriteGate {
+    state: Mutex<JournalWriteGateState>,
+    ready: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct JournalWriteGateState {
+    next_ticket: u64,
+    serving: u64,
+}
+
+struct JournalWriteGuard<'a> {
+    gate: &'a JournalWriteGate,
+}
+
+impl JournalWriteGate {
+    fn lock(&self) -> JournalWriteGuard<'_> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let ticket = state.next_ticket;
+        state.next_ticket = state
+            .next_ticket
+            .checked_add(1)
+            .expect("journal write ticket overflow");
+        while state.serving != ticket {
+            state = self
+                .ready
+                .wait(state)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+        drop(state);
+        JournalWriteGuard { gate: self }
+    }
+}
+
+impl Drop for JournalWriteGuard<'_> {
+    fn drop(&mut self) {
+        let mut state = self
+            .gate
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.serving = state
+            .serving
+            .checked_add(1)
+            .expect("journal write ticket overflow");
+        drop(state);
+        self.gate.ready.notify_all();
+    }
 }
 
 pub(crate) struct PreparedMutation {
@@ -167,6 +220,7 @@ impl Journal {
         let journal = Self {
             root,
             database,
+            write_gate: JournalWriteGate::default(),
             _lock_file: lock_file,
             format_version: expected_identity.format_version,
             #[cfg(test)]
@@ -489,6 +543,7 @@ impl Journal {
     }
 
     pub fn mark_remote(&self, sequence: Sequence, result_etag: Option<String>) -> Result<()> {
+        let _write = self.write_gate.lock();
         let mut transaction = self
             .database
             .begin_write()
@@ -584,6 +639,7 @@ impl Journal {
                 progress.remote_seq
             );
         }
+        let _write = self.write_gate.lock();
         let mut transaction = self
             .database
             .begin_write()
@@ -621,6 +677,7 @@ impl Journal {
     }
 
     pub fn record_remote_failure(&self, sequence: Sequence, error: &str) -> Result<()> {
+        let _write = self.write_gate.lock();
         let mut transaction = self
             .database
             .begin_write()
@@ -718,6 +775,7 @@ impl Journal {
             }
         }
 
+        let _write = self.write_gate.lock();
         let mut transaction = self
             .database
             .begin_write()
@@ -767,6 +825,7 @@ impl Journal {
     }
 
     fn record_pending_blob(&self, operation_id: Uuid, relative: &str) -> Result<()> {
+        let _write = self.write_gate.lock();
         let mut transaction = self
             .database
             .begin_write()
@@ -793,6 +852,7 @@ impl Journal {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error).context("failed to remove unpublished temporary blob"),
         }
+        let _write = self.write_gate.lock();
         let mut transaction = self
             .database
             .begin_write()
@@ -814,6 +874,7 @@ impl Journal {
     }
 
     fn commit_record(&self, record: &MutationRecord, pending: Option<Uuid>) -> Result<()> {
+        let _write = self.write_gate.lock();
         let mut transaction = self
             .database
             .begin_write()
@@ -898,6 +959,7 @@ impl Journal {
             }
         }
         if !pending.is_empty() {
+            let _write = self.write_gate.lock();
             let mut transaction = self
                 .database
                 .begin_write()
@@ -1538,7 +1600,7 @@ fn sync_directory(path: impl AsRef<Path>) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Journal, JournalSnapshot, REMOTE_OBJECT_VERSIONS};
+    use super::{Journal, JournalSnapshot, JournalWriteGate, REMOTE_OBJECT_VERSIONS};
     use crate::writeback::model::{
         FenceClass, JournalIdentity, LocalEtag, MutationKind, MutationMode, MutationRecord,
     };
@@ -1548,8 +1610,55 @@ mod tests {
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::time::{Duration, Instant};
     use tempfile::TempDir;
     use uuid::Uuid;
+
+    #[test]
+    fn journal_write_gate_serves_an_older_remote_waiter_before_new_local_writers() {
+        let gate = Arc::new(JournalWriteGate::default());
+        let held = gate.lock();
+        let order = Arc::new(Mutex::new(Vec::new()));
+
+        let remote_gate = Arc::clone(&gate);
+        let remote_order = Arc::clone(&order);
+        let remote = thread::spawn(move || {
+            let _write = remote_gate.lock();
+            remote_order.lock().unwrap().push("remote");
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let queued = gate
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .next_ticket;
+            if queued == 2 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "remote waiter did not queue");
+            thread::yield_now();
+        }
+
+        let mut locals = Vec::new();
+        for _ in 0..8 {
+            let local_gate = Arc::clone(&gate);
+            let local_order = Arc::clone(&order);
+            locals.push(thread::spawn(move || {
+                let _write = local_gate.lock();
+                local_order.lock().unwrap().push("local");
+            }));
+        }
+        drop(held);
+        remote.join().unwrap();
+        for local in locals {
+            local.join().unwrap();
+        }
+        assert_eq!(order.lock().unwrap().first(), Some(&"remote"));
+    }
 
     fn identity(bucket: &str) -> JournalIdentity {
         JournalIdentity {

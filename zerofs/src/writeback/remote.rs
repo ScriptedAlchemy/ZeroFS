@@ -386,8 +386,16 @@ async fn run_remote_scheduler(worker: RemoteWorker) {
                         error = %error,
                         "remote writeback operation failed; retrying from the durable journal"
                     );
-                    if let Err(journal_error) =
-                        journal.record_remote_failure(record.sequence, &error.to_string())
+                    let failure_journal = Arc::clone(&journal);
+                    let failure_sequence = record.sequence;
+                    let failure_error = error.to_string();
+                    let persisted_failure = tokio::task::spawn_blocking(move || {
+                        failure_journal.record_remote_failure(failure_sequence, &failure_error)
+                    })
+                    .await;
+                    if let Err(journal_error) = persisted_failure
+                        .map_err(|error| anyhow::anyhow!("remote retry task failed: {error}"))
+                        .and_then(|result| result)
                     {
                         publish_terminal(
                             &progress,
@@ -597,7 +605,7 @@ fn collect_pipeline_batch(
 }
 
 async fn commit_ready_prefix(
-    journal: &Journal,
+    journal: &Arc<Journal>,
     overlay: &OverlayIndex,
     disk: &DiskAdmission,
     progress: &watch::Sender<RemoteProgress>,
@@ -745,17 +753,27 @@ async fn verify_existing(
 }
 
 async fn commit_remote(
-    journal: &Journal,
+    journal: &Arc<Journal>,
     overlay: &OverlayIndex,
     disk: &DiskAdmission,
     record: &MutationRecord,
     e_tag: Option<String>,
 ) -> anyhow::Result<()> {
-    journal.mark_remote(record.sequence, e_tag)?;
+    let sequence = record.sequence;
+    let mark_journal = Arc::clone(journal);
+    tokio::task::spawn_blocking(move || mark_journal.mark_remote(sequence, e_tag))
+        .await
+        .map_err(|error| anyhow::anyhow!("remote watermark task failed: {error}"))??;
     overlay.remove_remote_prefix(record.sequence).await;
-    journal.remove_remote_prefix(record.sequence)?;
-    let available = fs4::available_space(journal.root())?;
-    disk.set_remote_complete(record.disk_charge_bytes()?, available)?;
+    let charge = record.disk_charge_bytes()?;
+    let cleanup_journal = Arc::clone(journal);
+    let available = tokio::task::spawn_blocking(move || -> anyhow::Result<u64> {
+        cleanup_journal.remove_remote_prefix(sequence)?;
+        Ok(fs4::available_space(cleanup_journal.root())?)
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("remote cleanup task failed: {error}"))??;
+    disk.set_remote_complete(charge, available)?;
     Ok(())
 }
 

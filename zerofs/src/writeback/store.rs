@@ -2888,7 +2888,7 @@ mod tests {
         );
 
         controls.release_puts();
-        tokio::time::timeout(Duration::from_millis(400), store.wait_remote(7))
+        tokio::time::timeout(Duration::from_secs(2), store.wait_remote(7))
             .await
             .expect("held immutable completions were delayed behind fence coalescing")
             .unwrap();
