@@ -319,9 +319,13 @@ impl WritebackObjectStore {
     ) -> object_store::Result<PutResult> {
         let lock = self.key_lock(&location);
         let key_guard = lock.lock_owned().await;
-        let visible = self.inner.overlay.visible_version(&location).await?;
-        let (mode, expected_visible_version, predecessor) =
-            validate_put_mode(&location, &options.mode, visible)?;
+        let (mode, expected_visible_version, predecessor) = match &options.mode {
+            PutMode::Overwrite => (MutationMode::Overwrite, None, None),
+            mode => {
+                let visible = self.inner.overlay.visible_version(&location).await?;
+                validate_put_mode(&location, mode, visible)?
+            }
+        };
         let payload = VerifiedPayload::new(bytes);
         let order_guard = self.inner.admission_order.lock().await;
         let sequence = self.allocate_sequence()?;
@@ -1656,6 +1660,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn overwrite_acknowledges_without_a_backend_head() {
+        let (store, _remote, _temp, controls) = test_store_with_controls(false).await;
+        let path = Path::from("segments/overwrite-with-blocked-head");
+        controls.block_heads();
+        let store_for_put = store.clone();
+        let path_for_put = path.clone();
+        let mut overwrite = tokio::spawn(async move {
+            store_for_put
+                .put_opts(
+                    &path_for_put,
+                    Bytes::from_static(b"payload").into(),
+                    PutOptions::from(PutMode::Overwrite),
+                )
+                .await
+        });
+
+        let acknowledged = tokio::time::timeout(Duration::from_secs(1), &mut overwrite).await;
+        if acknowledged.is_err() {
+            controls.release_heads();
+            overwrite.await.unwrap().unwrap();
+            panic!("Overwrite waited for a blocked backend HEAD");
+        }
+        acknowledged.unwrap().unwrap().unwrap();
+        assert_eq!(controls.head_count(), 0);
+
+        controls.release_heads();
+        store.wait_local(1).await.unwrap();
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn local_barrier_covers_current_accepted_sequence_in_memory_ack_mode() {
         let (store, _remote, _temp) = test_store().await;
         store
@@ -2280,7 +2315,11 @@ mod tests {
             let path = path.clone();
             async move {
                 store
-                    .put(&path, Bytes::from_static(b"payload").into())
+                    .put_opts(
+                        &path,
+                        Bytes::from_static(b"payload").into(),
+                        PutOptions::from(PutMode::Create),
+                    )
                     .await
             }
         });

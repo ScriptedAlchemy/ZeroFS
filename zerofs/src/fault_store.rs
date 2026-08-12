@@ -42,6 +42,14 @@ pub struct FaultControls {
     max_active_puts: AtomicUsize,
     put_activity: Arc<Notify>,
     put_release: Arc<Notify>,
+    #[cfg(test)]
+    block_heads: AtomicBool,
+    #[cfg(test)]
+    heads: AtomicUsize,
+    #[cfg(test)]
+    head_activity: Arc<Notify>,
+    #[cfg(test)]
+    head_release: Arc<Notify>,
 }
 
 impl FaultControls {
@@ -90,6 +98,23 @@ impl FaultControls {
     }
     pub fn put_activity(&self) -> Arc<Notify> {
         self.put_activity.clone()
+    }
+    #[cfg(test)]
+    pub fn block_heads(&self) {
+        self.block_heads.store(true, Ordering::SeqCst);
+    }
+    #[cfg(test)]
+    pub fn release_heads(&self) {
+        self.block_heads.store(false, Ordering::SeqCst);
+        self.head_release.notify_waiters();
+    }
+    #[cfg(test)]
+    pub fn head_count(&self) -> usize {
+        self.heads.load(Ordering::SeqCst)
+    }
+    #[cfg(test)]
+    pub fn head_activity(&self) -> Arc<Notify> {
+        self.head_activity.clone()
     }
 }
 
@@ -201,11 +226,23 @@ impl ObjectStore for FaultStore {
         location: &Path,
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
+        let head = options.head;
+        #[cfg(test)]
+        if head {
+            self.ctl.heads.fetch_add(1, Ordering::SeqCst);
+            self.ctl.head_activity.notify_waiters();
+            while self.ctl.block_heads.load(Ordering::SeqCst) {
+                let notified = self.ctl.head_release.notified();
+                if !self.ctl.block_heads.load(Ordering::SeqCst) {
+                    break;
+                }
+                notified.await;
+            }
+        }
         self.ctl.gets.fetch_add(1, Ordering::SeqCst);
         if take_one(&self.ctl.fail_next_gets) {
             return Err(Self::transient("get"));
         }
-        let head = options.head;
         let result = self.inner.get_opts(location, options).await?;
         // Head replies carry no body; only short-circuit truncation for them.
         if head || !take_one(&self.ctl.truncate_next_gets) {
@@ -282,8 +319,10 @@ impl Drop for ActivePut {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use object_store::ObjectStoreExt;
     use object_store::memory::InMemory;
+    use std::time::Duration;
 
     #[tokio::test]
     async fn fail_gets_then_recovers() {
@@ -356,5 +395,34 @@ mod tests {
             store.get(&path).await.unwrap().bytes().await.unwrap().len(),
             100
         );
+    }
+
+    #[tokio::test]
+    async fn blocked_heads_wait_for_release_and_are_counted() {
+        let (store, controls) = FaultStore::new(Arc::new(InMemory::new()));
+        let path = Path::from("blocked-head");
+        store
+            .put(&path, Bytes::from_static(b"value").into())
+            .await
+            .unwrap();
+        controls.block_heads();
+        let head_activity = controls.head_activity();
+        let head_started = head_activity.notified();
+        let store_for_head = store.clone();
+        let path_for_head = path.clone();
+        let head = tokio::spawn(async move { store_for_head.head(&path_for_head).await });
+
+        tokio::time::timeout(Duration::from_secs(1), head_started)
+            .await
+            .expect("blocked HEAD did not reach the fault store");
+        assert_eq!(controls.head_count(), 1);
+        assert!(!head.is_finished());
+
+        controls.release_heads();
+        tokio::time::timeout(Duration::from_secs(1), head)
+            .await
+            .expect("released HEAD did not finish")
+            .unwrap()
+            .unwrap();
     }
 }
