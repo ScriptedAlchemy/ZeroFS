@@ -83,6 +83,24 @@ impl WritebackObjectStore {
         journal: Arc<Journal>,
         settings: WritebackSettings,
     ) -> anyhow::Result<Self> {
+        Self::open_with_remote_state(remote, journal, settings, true).await
+    }
+
+    /// Open a recovered overlay without allowing the remote view to advance.
+    pub(crate) async fn open_paused(
+        remote: Arc<dyn ObjectStore>,
+        journal: Arc<Journal>,
+        settings: WritebackSettings,
+    ) -> anyhow::Result<Self> {
+        Self::open_with_remote_state(remote, journal, settings, false).await
+    }
+
+    async fn open_with_remote_state(
+        remote: Arc<dyn ObjectStore>,
+        journal: Arc<Journal>,
+        settings: WritebackSettings,
+        remote_active: bool,
+    ) -> anyhow::Result<Self> {
         if settings.memory_bytes == 0 {
             anyhow::bail!("writeback requires a positive independent dirty RAM budget");
         }
@@ -106,14 +124,25 @@ impl WritebackObjectStore {
             queue_depth,
             Some(observer),
         )?;
-        let remote = RemoteScheduler::start(
-            remote,
-            journal.clone(),
-            overlay.clone(),
-            disk.clone(),
-            journaler.barrier(),
-            settings.upload_concurrency,
-        )?;
+        let remote = if remote_active {
+            RemoteScheduler::start(
+                remote,
+                journal.clone(),
+                overlay.clone(),
+                disk.clone(),
+                journaler.barrier(),
+                settings.upload_concurrency,
+            )?
+        } else {
+            RemoteScheduler::start_paused(
+                remote,
+                journal.clone(),
+                overlay.clone(),
+                disk.clone(),
+                journaler.barrier(),
+                settings.upload_concurrency,
+            )?
+        };
         Ok(Self {
             inner: Arc::new(WritebackStoreInner {
                 journal,
@@ -149,6 +178,12 @@ impl WritebackObjectStore {
 
     pub async fn wait_remote(&self, sequence: u64) -> Result<(), RemoteBarrierError> {
         self.inner.remote.barrier().wait_remote(sequence).await
+    }
+
+    /// Start remote writeback after callers have finished opening over the
+    /// stable recovered overlay. Repeated activation is harmless.
+    pub fn activate_remote(&self) -> Result<(), RemoteBarrierError> {
+        self.inner.remote.activate()
     }
 
     pub fn dirty_ram_bytes(&self) -> u64 {
@@ -197,6 +232,11 @@ impl WritebackObjectStore {
             }
             crate::writeback::config::ShutdownFlush::Remote => {
                 self.inner.journaler.shutdown().await?;
+                self.inner.remote.activate().map_err(|error| {
+                    LocalBarrierError::LocalDurability(format!(
+                        "remote flush activation failed: {error}"
+                    ))
+                })?;
                 let target = self.inner.next_sequence.load(Ordering::Acquire);
                 self.wait_remote(target).await.map_err(|error| {
                     LocalBarrierError::LocalDurability(format!("remote flush failed: {error}"))

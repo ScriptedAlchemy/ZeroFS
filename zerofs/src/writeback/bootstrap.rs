@@ -14,6 +14,12 @@ pub struct AttachedWriteback {
     pub lifecycle: WritebackObjectStore,
 }
 
+/// Recover the local overlay while leaving remote replay paused.
+///
+/// The caller must invoke [`WritebackObjectStore::activate_remote`] after it
+/// finishes opening the database over `store`. This keeps the remote manifest
+/// view from changing underneath database recovery without making startup wait
+/// for the entire SSD backlog to reach the backend.
 pub async fn attach(
     remote: Arc<dyn ObjectStore>,
     mut settings: WritebackSettings,
@@ -25,18 +31,14 @@ pub async fn attach(
     settings.dir = settings.dir.join(namespace);
     let journal = Arc::new(Journal::open(&settings.dir, identity)?);
     let recovery = journal.progress()?;
-    let lifecycle = WritebackObjectStore::open(remote, journal, settings).await?;
+    let lifecycle = WritebackObjectStore::open_paused(remote, journal, settings).await?;
     if recovery.remote_seq < recovery.local_seq {
         tracing::info!(
             remote_sequence = recovery.remote_seq,
             local_sequence = recovery.local_seq,
             pending_operations = recovery.local_seq - recovery.remote_seq,
-            "replaying the locally durable writeback journal before opening the database"
+            "attached a stable recovered writeback overlay; remote replay remains paused until filesystem initialization completes"
         );
-        lifecycle
-            .wait_remote(recovery.local_seq)
-            .await
-            .map_err(|error| anyhow::anyhow!("writeback recovery replay failed: {error}"))?;
     }
     Ok(AttachedWriteback {
         store: Arc::new(lifecycle.clone()),
@@ -112,7 +114,8 @@ mod tests {
     use crate::writeback::config::{AckMode, ShutdownFlush, WritebackSettings};
     use crate::writeback::model::JournalIdentity;
     use bytes::Bytes;
-    use object_store::{ObjectStoreExt, memory::InMemory, path::Path};
+    use futures::TryStreamExt;
+    use object_store::{ObjectStoreExt, PutMode, PutOptions, memory::InMemory, path::Path};
     use std::sync::Arc;
     #[cfg(unix)]
     use std::{fs, os::unix::fs::PermissionsExt};
@@ -171,7 +174,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovered_journal_replays_before_attachment_becomes_visible() {
+    async fn recovered_journal_is_stable_and_available_before_remote_replay() {
         let temp = tempfile::tempdir().unwrap();
         let remote = Arc::new(InMemory::new());
         let (partitioned, controls) = FaultStore::new(remote.clone());
@@ -195,8 +198,6 @@ mod tests {
             backend_kind: "sftp".to_owned(),
             encryption_key_identity_sha256: [0x66; 32],
         };
-        let location = Path::from("zerofs/recovery/manifest/00000000000000000001.manifest");
-
         let first = super::attach(
             partitioned.clone(),
             settings.clone(),
@@ -205,39 +206,262 @@ mod tests {
         )
         .await
         .unwrap();
+        for sequence in 0..32 {
+            first
+                .store
+                .put(
+                    &Path::from(format!("zerofs/recovery/segments/{sequence:02}")),
+                    Bytes::from(format!("segment-{sequence:02}")).into(),
+                )
+                .await
+                .unwrap();
+        }
+        first.lifecycle.wait_local_through_accepted().await.unwrap();
+        first.lifecycle.shutdown().await.unwrap();
+        drop(first);
+
+        let puts_before_recovery = controls.put_count();
+        let recovered = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            super::attach(partitioned, settings, identity, "bucket_recovery"),
+        )
+        .await
+        .expect("an offline remote must not make recovered attachment wait for a full drain")
+        .unwrap();
+        let visible = recovered
+            .store
+            .list(Some(&Path::from("zerofs/recovery/segments")))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(visible.len(), 32);
+        assert_eq!(
+            recovered
+                .store
+                .get(&Path::from("zerofs/recovery/segments/31"))
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap(),
+            Bytes::from_static(b"segment-31")
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        assert_eq!(
+            controls.put_count(),
+            puts_before_recovery,
+            "remote replay must remain paused while the database opens over the recovered overlay"
+        );
+
+        recovered.lifecycle.activate_remote().unwrap();
+        controls.partition_writes(false);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            recovered.lifecycle.wait_remote(32),
+        )
+        .await
+        .expect("activated recovery should drain after the backend heals")
+        .unwrap();
+        recovered.lifecycle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelling_activated_recovery_stops_workers_and_releases_the_journal() {
+        let temp = tempfile::tempdir().unwrap();
+        let remote = Arc::new(InMemory::new());
+        let (partitioned, controls) = FaultStore::new(remote);
+        controls.partition_writes(true);
+        let settings = WritebackSettings {
+            dir: temp.path().join("dirty"),
+            ack_mode: AckMode::Memory,
+            memory_bytes: 1_000_000,
+            disk_bytes: 10_000_000,
+            min_free_bytes: 1,
+            high_watermark_percent: 95,
+            resume_percent: 85,
+            upload_concurrency: 4,
+            shutdown_flush: ShutdownFlush::Local,
+        };
+        let identity = JournalIdentity {
+            format_version: 1,
+            bucket_id: "bucket-cancel".to_owned(),
+            backend_endpoint: "sftp://storage.example:23".to_owned(),
+            database_prefix: "zerofs/cancel".to_owned(),
+            backend_kind: "sftp".to_owned(),
+            encryption_key_identity_sha256: [0x67; 32],
+        };
+        let first = super::attach(
+            partitioned.clone(),
+            settings.clone(),
+            identity.clone(),
+            "bucket_cancel",
+        )
+        .await
+        .unwrap();
         first
             .store
-            .put(&location, Bytes::from_static(b"manifest").into())
+            .put(
+                &Path::from("zerofs/cancel/segments/1"),
+                Bytes::from_static(b"segment").into(),
+            )
             .await
             .unwrap();
         first.lifecycle.wait_local_through_accepted().await.unwrap();
         first.lifecycle.shutdown().await.unwrap();
         drop(first);
 
-        let mut recovery = tokio::spawn(super::attach(
-            partitioned,
-            settings,
-            identity,
-            "bucket_recovery",
-        ));
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(100), &mut recovery)
-                .await
-                .is_err(),
-            "attachment exposed the overlay before recovered mutations reached the backend"
-        );
-
         controls.partition_writes(false);
-        let recovered = tokio::time::timeout(std::time::Duration::from_secs(5), recovery)
+        controls.block_puts();
+        let recovered = super::attach(
+            partitioned.clone(),
+            settings.clone(),
+            identity.clone(),
+            "bucket_cancel",
+        )
+        .await
+        .unwrap();
+        let puts_before_activation = controls.put_count();
+        recovered.lifecycle.activate_remote().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while controls.put_count() == puts_before_activation {
+                controls.put_activity().notified().await;
+            }
+        })
+        .await
+        .expect("activated replay should enter the blocked remote operation");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            recovered.lifecycle.shutdown(),
+        )
+        .await
+        .expect("shutdown must cancel an in-flight recovery operation")
+        .unwrap();
+        drop(recovered);
+        controls.release_puts();
+
+        let reopened = super::attach(partitioned, settings, identity, "bucket_cancel")
             .await
-            .expect("recovery should finish after the backend heals")
-            .unwrap()
+            .expect("cancelled recovery must release its journal lock");
+        reopened.lifecycle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn recovered_create_with_different_remote_bytes_is_terminal() {
+        let temp = tempfile::tempdir().unwrap();
+        let remote = Arc::new(InMemory::new());
+        let settings = WritebackSettings {
+            dir: temp.path().join("dirty"),
+            ack_mode: AckMode::Memory,
+            memory_bytes: 1_000_000,
+            disk_bytes: 10_000_000,
+            min_free_bytes: 1,
+            high_watermark_percent: 95,
+            resume_percent: 85,
+            upload_concurrency: 4,
+            shutdown_flush: ShutdownFlush::Local,
+        };
+        let identity = JournalIdentity {
+            format_version: 1,
+            bucket_id: "bucket-divergence".to_owned(),
+            backend_endpoint: "sftp://storage.example:23".to_owned(),
+            database_prefix: "zerofs/divergence".to_owned(),
+            backend_kind: "sftp".to_owned(),
+            encryption_key_identity_sha256: [0x68; 32],
+        };
+        let location = Path::from("zerofs/divergence/manifest/1");
+        let first = super::attach(
+            remote.clone(),
+            settings.clone(),
+            identity.clone(),
+            "bucket_divergence",
+        )
+        .await
+        .unwrap();
+        first
+            .store
+            .put_opts(
+                &location,
+                Bytes::from_static(b"locally-durable").into(),
+                PutOptions::from(PutMode::Create),
+            )
+            .await
             .unwrap();
-        assert_eq!(
-            remote.get(&location).await.unwrap().bytes().await.unwrap(),
-            Bytes::from_static(b"manifest")
+        first.lifecycle.wait_local_through_accepted().await.unwrap();
+        first.lifecycle.shutdown().await.unwrap();
+        drop(first);
+        remote
+            .put(&location, Bytes::from_static(b"remote-diverged").into())
+            .await
+            .unwrap();
+
+        let recovered = super::attach(remote, settings, identity, "bucket_divergence")
+            .await
+            .unwrap();
+        recovered.lifecycle.activate_remote().unwrap();
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            recovered.lifecycle.wait_remote(1),
+        )
+        .await
+        .expect("verified content divergence must not retry forever")
+        .expect_err("different bytes at a create target must be terminal");
+        assert!(error.to_string().contains("different bytes"));
+        assert!(
+            recovered
+                .lifecycle
+                .status()
+                .unwrap()
+                .terminal_error
+                .is_some(),
+            "terminal divergence must remain observable after waking waiters"
         );
         recovered.lifecycle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn remote_flush_shutdown_activates_a_paused_attachment() {
+        let temp = tempfile::tempdir().unwrap();
+        let remote = Arc::new(InMemory::new());
+        let settings = WritebackSettings {
+            dir: temp.path().join("dirty"),
+            ack_mode: AckMode::Memory,
+            memory_bytes: 1_000_000,
+            disk_bytes: 10_000_000,
+            min_free_bytes: 1,
+            high_watermark_percent: 95,
+            resume_percent: 85,
+            upload_concurrency: 4,
+            shutdown_flush: ShutdownFlush::Remote,
+        };
+        let identity = JournalIdentity {
+            format_version: 1,
+            bucket_id: "bucket-remote-shutdown".to_owned(),
+            backend_endpoint: "sftp://storage.example:23".to_owned(),
+            database_prefix: "zerofs/remote-shutdown".to_owned(),
+            backend_kind: "sftp".to_owned(),
+            encryption_key_identity_sha256: [0x69; 32],
+        };
+        let location = Path::from("zerofs/remote-shutdown/segments/1");
+        let attached = super::attach(remote.clone(), settings, identity, "bucket_remote_shutdown")
+            .await
+            .unwrap();
+        attached
+            .store
+            .put(&location, Bytes::from_static(b"segment").into())
+            .await
+            .unwrap();
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            attached.lifecycle.shutdown(),
+        )
+        .await
+        .expect("remote-flush shutdown must not wait forever on a paused scheduler")
+        .unwrap();
+        assert_eq!(
+            remote.get(&location).await.unwrap().bytes().await.unwrap(),
+            Bytes::from_static(b"segment")
+        );
     }
 
     #[cfg(unix)]

@@ -65,6 +65,7 @@ impl RemoteBarrier {
 #[derive(Clone)]
 pub struct RemoteScheduler {
     barrier: RemoteBarrier,
+    activate: watch::Sender<bool>,
     stop: watch::Sender<bool>,
     join: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
@@ -86,12 +87,52 @@ impl RemoteScheduler {
         local: LocalBarrier,
         upload_concurrency: usize,
     ) -> anyhow::Result<Self> {
+        Self::start_with_state(
+            remote,
+            journal,
+            overlay,
+            disk,
+            local,
+            upload_concurrency,
+            true,
+        )
+    }
+
+    pub fn start_paused(
+        remote: Arc<dyn ObjectStore>,
+        journal: Arc<Journal>,
+        overlay: OverlayIndex,
+        disk: DiskAdmission,
+        local: LocalBarrier,
+        upload_concurrency: usize,
+    ) -> anyhow::Result<Self> {
+        Self::start_with_state(
+            remote,
+            journal,
+            overlay,
+            disk,
+            local,
+            upload_concurrency,
+            false,
+        )
+    }
+
+    fn start_with_state(
+        remote: Arc<dyn ObjectStore>,
+        journal: Arc<Journal>,
+        overlay: OverlayIndex,
+        disk: DiskAdmission,
+        local: LocalBarrier,
+        upload_concurrency: usize,
+        active: bool,
+    ) -> anyhow::Result<Self> {
         let journal_progress = journal.progress()?;
         let (progress_sender, progress) = watch::channel(RemoteProgress {
             sequence: journal_progress.remote_seq,
             terminal_error: None,
             closed: false,
         });
+        let (activate, activation) = watch::channel(active);
         let (stop, stop_receiver) = watch::channel(false);
         let join = tokio::spawn(run_remote_scheduler(RemoteWorker {
             remote,
@@ -101,10 +142,12 @@ impl RemoteScheduler {
             local,
             upload_concurrency: upload_concurrency.max(1),
             progress: progress_sender,
+            activation,
             stop: stop_receiver,
         }));
         Ok(Self {
             barrier: RemoteBarrier { progress },
+            activate,
             stop,
             join: Arc::new(Mutex::new(Some(join))),
         })
@@ -116,6 +159,15 @@ impl RemoteScheduler {
 
     pub fn terminal_error(&self) -> Option<String> {
         self.barrier.progress.borrow().terminal_error.clone()
+    }
+
+    pub fn activate(&self) -> Result<(), RemoteBarrierError> {
+        if let Some(error) = self.terminal_error() {
+            return Err(RemoteBarrierError::Remote(error));
+        }
+        self.activate
+            .send(true)
+            .map_err(|_| RemoteBarrierError::Closed)
     }
 
     pub async fn shutdown(&self) -> Result<(), RemoteBarrierError> {
@@ -136,6 +188,7 @@ struct RemoteWorker {
     local: LocalBarrier,
     upload_concurrency: usize,
     progress: watch::Sender<RemoteProgress>,
+    activation: watch::Receiver<bool>,
     stop: watch::Receiver<bool>,
 }
 
@@ -151,6 +204,10 @@ struct SchedulerWindow {
     records: Vec<MutationRecord>,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("remote target contains different bytes than the locally durable mutation")]
+struct RemoteContentDivergence;
+
 async fn run_remote_scheduler(worker: RemoteWorker) {
     let RemoteWorker {
         remote,
@@ -160,8 +217,32 @@ async fn run_remote_scheduler(worker: RemoteWorker) {
         local,
         upload_concurrency,
         progress,
+        mut activation,
         mut stop,
     } = worker;
+    loop {
+        if *stop.borrow() {
+            progress.send_modify(|state| state.closed = true);
+            return;
+        }
+        if *activation.borrow() {
+            break;
+        }
+        tokio::select! {
+            changed = activation.changed() => {
+                if changed.is_err() {
+                    progress.send_modify(|state| state.closed = true);
+                    return;
+                }
+            }
+            changed = stop.changed() => {
+                if changed.is_err() || *stop.borrow() {
+                    progress.send_modify(|state| state.closed = true);
+                    return;
+                }
+            }
+        }
+    }
     let mut next = progress.borrow().sequence.saturating_add(1);
     // A new burst gets one coalescing window. Once its local tail is known, do
     // not make each intervening manifest fence pay that delay again.
@@ -268,6 +349,16 @@ async fn run_remote_scheduler(worker: RemoteWorker) {
                         });
                         return;
                     }
+                    if is_terminal_remote_error(&error) {
+                        progress.send_modify(|state| {
+                            state.terminal_error = Some(format!(
+                                "permanent remote divergence at sequence {}: {error}",
+                                record.sequence
+                            ));
+                            state.closed = true;
+                        });
+                        return;
+                    }
                     retry = true;
                     continue;
                 }
@@ -322,6 +413,13 @@ async fn run_remote_scheduler(worker: RemoteWorker) {
         }
     }
     progress.send_modify(|state| state.closed = true);
+}
+
+fn is_terminal_remote_error(error: &object_store::Error) -> bool {
+    match error {
+        object_store::Error::AlreadyExists { source, .. } => source.is::<RemoteContentDivergence>(),
+        _ => false,
+    }
 }
 
 async fn bounded_remote_operation<F>(
@@ -549,7 +647,7 @@ async fn verify_existing(
     if existing != *expected {
         return Err(object_store::Error::AlreadyExists {
             path: target.to_string(),
-            source: "remote create target contains different bytes".into(),
+            source: Box::new(RemoteContentDivergence),
         });
     }
     let meta = remote.head(target).await?;

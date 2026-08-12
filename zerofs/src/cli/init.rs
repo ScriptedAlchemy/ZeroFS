@@ -1152,6 +1152,11 @@ impl ReconciledDb {
         }
 
         let fs = Arc::new(fs);
+        if let Some(writeback) = &writeback {
+            writeback.activate_remote().context(
+                "Failed to activate persistent writeback after filesystem initialization",
+            )?;
+        }
         // Reclaims open-unlinked inodes once their last open handle is dropped.
         fs.start_reclaim_drainer();
 
