@@ -2036,6 +2036,29 @@ encryption_password = "test"
         );
     }
 
+    #[test]
+    fn unix_socket_is_a_real_listener_endpoint() {
+        let settings = write_and_load(
+            r#"
+[cache]
+dir = "/tmp/cache"
+disk_size_gb = 1.0
+
+[storage]
+url = "file:///tmp/data"
+encryption_password = "test"
+
+[servers]
+
+[servers.rpc]
+unix_socket = "/tmp/zerofs-test.sock"
+"#,
+        )
+        .unwrap();
+
+        settings.servers.require_listener_endpoint().unwrap();
+    }
+
     fn sftp_config(url: &str, extra: &str) -> String {
         format!(
             r#"

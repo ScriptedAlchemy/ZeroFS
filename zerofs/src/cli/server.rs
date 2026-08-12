@@ -438,6 +438,197 @@ fn listener_exit_error(
     }
 }
 
+type ServerHandle = JoinHandle<std::result::Result<(), std::io::Error>>;
+
+#[derive(Debug)]
+enum ServingStopCause {
+    Signal,
+    LeadershipLost,
+    ListenerFailure(anyhow::Error),
+}
+
+impl ServingStopCause {
+    fn is_signal(&self) -> bool {
+        matches!(self, Self::Signal)
+    }
+
+    fn is_leadership_lost(&self) -> bool {
+        matches!(self, Self::LeadershipLost)
+    }
+
+    fn into_error(self) -> Option<anyhow::Error> {
+        match self {
+            Self::Signal => None,
+            Self::LeadershipLost => Some(leadership_lost_error()),
+            Self::ListenerFailure(error) => Some(error),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PrimaryErrorWithCleanup {
+    primary: anyhow::Error,
+    cleanup: Vec<anyhow::Error>,
+}
+
+impl std::fmt::Display for PrimaryErrorWithCleanup {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{:#}", self.primary)?;
+        for error in &self.cleanup {
+            write!(formatter, "; cleanup also failed: {error:#}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for PrimaryErrorWithCleanup {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.primary.as_ref())
+    }
+}
+
+fn attach_cleanup_errors(primary: anyhow::Error, cleanup: Vec<anyhow::Error>) -> anyhow::Error {
+    if cleanup.is_empty() {
+        primary
+    } else {
+        anyhow::Error::new(PrimaryErrorWithCleanup { primary, cleanup })
+    }
+}
+
+fn merge_cleanup_results(
+    mut existing: Vec<anyhow::Error>,
+    result: anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    if let Err(error) = result {
+        existing.push(error);
+    }
+    if existing.is_empty() {
+        return Ok(());
+    }
+
+    let primary = existing.remove(0);
+    Err(attach_cleanup_errors(primary, existing))
+}
+
+fn finish_serving_shutdown(
+    cause: ServingStopCause,
+    cleanup: anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    match (cause.into_error(), cleanup) {
+        (None, cleanup) => cleanup,
+        (Some(primary), Ok(())) => Err(primary),
+        (Some(primary), Err(cleanup)) => Err(attach_cleanup_errors(primary, vec![cleanup])),
+    }
+}
+
+fn finish_process_shutdown(
+    server: anyhow::Result<()>,
+    writeback: anyhow::Result<()>,
+    sftp: anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let mut cleanup = Vec::new();
+    if let Err(error) = writeback {
+        cleanup.push(error.context("writeback shutdown failed"));
+    }
+    if let Err(error) = sftp {
+        cleanup.push(error.context("SFTP shutdown failed"));
+    }
+
+    match server {
+        Err(primary) => Err(attach_cleanup_errors(primary, cleanup)),
+        Ok(()) if cleanup.is_empty() => Ok(()),
+        Ok(()) => {
+            let primary = cleanup.remove(0);
+            Err(attach_cleanup_errors(primary, cleanup))
+        }
+    }
+}
+
+fn retain_listener_failure(
+    cause: &mut ServingStopCause,
+    cleanup_errors: &mut Vec<anyhow::Error>,
+    error: anyhow::Error,
+) {
+    if cause.is_signal() {
+        *cause = ServingStopCause::ListenerFailure(error);
+    } else {
+        cleanup_errors.push(error);
+    }
+}
+
+fn retain_leadership_loss(cause: &mut ServingStopCause, cleanup_errors: &mut Vec<anyhow::Error>) {
+    let previous = std::mem::replace(cause, ServingStopCause::LeadershipLost);
+    if let ServingStopCause::ListenerFailure(error) = previous {
+        cleanup_errors.push(error);
+    }
+}
+
+fn finish_serving_cleanup(
+    mut cause: ServingStopCause,
+    mut cleanup_errors: Vec<anyhow::Error>,
+    cleanup_result: anyhow::Result<()>,
+    leadership_lost: bool,
+) -> anyhow::Result<()> {
+    if leadership_lost && !cause.is_leadership_lost() {
+        retain_leadership_loss(&mut cause, &mut cleanup_errors);
+    }
+    finish_serving_shutdown(cause, merge_cleanup_results(cleanup_errors, cleanup_result))
+}
+
+async fn drain_server_handles_for_stop(
+    mut cause: ServingStopCause,
+    handles: &mut FuturesUnordered<ServerHandle>,
+    leadership_deposed: &CancellationToken,
+) -> (ServingStopCause, Vec<anyhow::Error>) {
+    let mut cleanup_errors = Vec::new();
+    let grace = tokio::time::sleep(crate::replication::RESPONSE_DRAIN_TIMEOUT);
+    tokio::pin!(grace);
+    let timed_out = loop {
+        if handles.is_empty() {
+            break false;
+        }
+        tokio::select! {
+            biased;
+            _ = leadership_deposed.cancelled(), if !cause.is_leadership_lost() => {
+                retain_leadership_loss(&mut cause, &mut cleanup_errors);
+            }
+            result = handles.next() => {
+                if let Some(error) = listener_exit_error(
+                    result.expect("non-empty server handles must yield a result"),
+                    false,
+                ) {
+                    retain_listener_failure(&mut cause, &mut cleanup_errors, error);
+                }
+            }
+            _ = &mut grace => break true,
+        }
+    };
+
+    if timed_out {
+        tracing::warn!(
+            count = handles.len(),
+            timeout_secs = crate::replication::RESPONSE_DRAIN_TIMEOUT.as_secs(),
+            "server listeners did not stop within the response-drain grace; aborting them"
+        );
+        for handle in handles.iter() {
+            handle.abort();
+        }
+        while let Some(result) = handles.next().await {
+            if result
+                .as_ref()
+                .is_err_and(tokio::task::JoinError::is_cancelled)
+            {
+                continue;
+            }
+            if let Some(error) = listener_exit_error(result, false) {
+                retain_listener_failure(&mut cause, &mut cleanup_errors, error);
+            }
+        }
+    }
+
+    (cause, cleanup_errors)
+}
+
 /// Walk an error's source chain looking for an open-file-descriptor exhaustion
 /// (EMFILE/ENFILE). foyer reports these as an opaque `I/O error => coding error`
 /// whose only clue is the wrapped os error code, so detection has to go by the
@@ -1237,29 +1428,27 @@ pub async fn run_server(
         server_handles.extend(webui_handles);
 
         let mut server_handles: FuturesUnordered<_> = server_handles.into_iter().collect();
-        if server_handles.is_empty() {
-            return Err(anyhow::anyhow!(
-                "no server listeners started despite validated endpoint configuration"
-            ));
-        }
+        assert!(
+            !server_handles.is_empty(),
+            "validated endpoint configuration must start at least one server listener"
+        );
 
-        let mut listener_failure = None;
-        let deposed = tokio::select! {
+        let stop_cause = tokio::select! {
             biased;
             _ = leadership_deposed.cancelled() => {
                 tracing::error!(
                     "HA: this serving runtime was fenced or superseded; stopping without flushing \
                      the stale database"
                 );
-                true
+                ServingStopCause::LeadershipLost
             }
             _ = tokio::signal::ctrl_c() => {
                 info!("Received SIGINT, initiating graceful shutdown...");
-                false
+                ServingStopCause::Signal
             }
             _ = sigterm.recv() => {
                 info!("Received SIGTERM, initiating graceful shutdown...");
-                false
+                ServingStopCause::Signal
             }
             result = server_handles.next() => {
                 let error = listener_exit_error(
@@ -1268,54 +1457,29 @@ pub async fn run_server(
                 )
                 .expect("an unexpected listener exit must be an error");
                 tracing::error!(error = %error, "server listener stopped; initiating shutdown");
-                listener_failure = Some(error);
-                false
+                ServingStopCause::ListenerFailure(error)
             }
         };
 
         info!("Cancelling all servers and background tasks...");
         shutdown.cancel();
+        info!("Waiting for servers to exit...");
+        let (stop_cause, serving_cleanup_errors) = drain_server_handles_for_stop(
+            stop_cause,
+            &mut server_handles,
+            &leadership_deposed,
+        )
+        .await;
 
-        // Retain the join future so leadership loss cannot detach serving tasks.
-        let mut serving_drain = Box::pin(async move {
-            let mut failure = None;
-            while let Some(result) = server_handles.next().await {
-                if failure.is_none() {
-                    failure = listener_exit_error(result, false);
-                }
-            }
-            failure
-        });
-
-        let (deposed_while_draining_servers, drain_failure) = if deposed {
-            (true, None)
-        } else {
-            info!("Waiting for servers to exit...");
-            tokio::select! {
-                biased;
-                _ = leadership_deposed.cancelled() => (true, None),
-                failure = &mut serving_drain => (false, failure),
-            }
-        };
-        if deposed_while_draining_servers {
-            // A deposed database is not flushed. Serving transports get one bounded
-            // interval to emit queued CLEAN responses.
-            if tokio::time::timeout(
-                crate::replication::RESPONSE_DRAIN_TIMEOUT,
-                &mut serving_drain,
-            )
-            .await
-            .is_err()
-            {
-                tracing::warn!("serving response drain timed out after leadership loss");
-            }
-            return Err(leadership_lost_error());
-        }
-        if listener_failure.is_none() {
-            listener_failure = drain_failure;
+        if stop_cause.is_leadership_lost() {
+            return finish_serving_shutdown(
+                stop_cause,
+                merge_cleanup_results(serving_cleanup_errors, Ok(())),
+            );
         }
 
-        let drain = async move {
+        let leadership_deposed_after_cleanup = leadership_deposed.clone();
+        let cleanup_result: anyhow::Result<()> = async move {
             info!("Waiting for background tasks to exit...");
             if let Some(gc_handles) = gc_handle {
                 join_or_abort_tasks(
@@ -1354,151 +1518,153 @@ pub async fn run_server(
                 SFTP_FINAL_WORKER_ABORT_TIMEOUT,
             )
             .await;
-        };
-        drain.await;
-
-        // Flush remains lease-gated while background tasks drain.
-        if leadership_deposed.is_cancelled() {
-            return Err(leadership_lost_error());
-        }
-        info!("Performing final flush and closing database...");
-        if db_mode.is_read_only() {
-            let close_result = if let Some(sftp_pool) = &sftp_pool_for_close {
-                let db = Arc::clone(&fs.db);
-                let mut close_owner = tokio::spawn(async move { db.close().await });
-                match tokio::time::timeout(SFTP_FINAL_DATABASE_CLOSE_TIMEOUT, &mut close_owner)
-                    .await
-                {
-                    Ok(result) => result.map_err(|error| {
-                        anyhow::anyhow!("read-only database close owner failed: {error}")
-                    })?,
-                    Err(_) => {
-                        sftp_pool.begin_shutdown();
-                        match tokio::time::timeout(
-                            SFTP_FINAL_DATABASE_CLOSE_TIMEOUT,
-                            &mut close_owner,
-                        )
-                        .await
-                        {
-                            Ok(result) => result.map_err(|error| {
-                                anyhow::anyhow!(
-                                    "read-only database close owner failed after SFTP shutdown began: {error}"
-                                )
-                            })?,
-                            Err(_) => {
-                                close_owner.abort();
-                                let _ = close_owner.await;
-                                return Err(anyhow::anyhow!(
-                                    "SFTP-backed database close did not finish within {}s after terminal pool shutdown began",
-                                    SFTP_FINAL_DATABASE_CLOSE_TIMEOUT.as_secs()
-                                ));
-                            }
-                        }
-                    }
-                }
-            } else {
-                fs.db.close().await
-            };
-            if let Err(e) = close_result {
-                tracing::error!("Database close failed: {:?}", e);
-                return Err(e);
+            // Flush remains lease-gated while background tasks drain.
+            if leadership_deposed.is_cancelled() {
+                return Err(leadership_lost_error());
             }
-        } else {
-            let close_result = if let Some(sftp_pool) = &sftp_pool_for_close {
-                let mut closing = Box::pin(fs.flush_coordinator.close());
-                tokio::select! {
-                    biased;
-                    _ = leadership_deposed.cancelled() => {
-                        drop(closing);
-                        abort_final_flush_after_leadership_loss(&fs).await;
-                        return Err(leadership_lost_error());
-                    }
-                    result = tokio::time::timeout(
-                        SFTP_FINAL_DATABASE_CLOSE_TIMEOUT,
-                        &mut closing,
-                    ) => match result {
-                        Ok(result) => result,
+            info!("Performing final flush and closing database...");
+            if db_mode.is_read_only() {
+                let close_result = if let Some(sftp_pool) = &sftp_pool_for_close {
+                    let db = Arc::clone(&fs.db);
+                    let mut close_owner = tokio::spawn(async move { db.close().await });
+                    match tokio::time::timeout(SFTP_FINAL_DATABASE_CLOSE_TIMEOUT, &mut close_owner)
+                        .await
+                    {
+                        Ok(result) => result.map_err(|error| {
+                            anyhow::anyhow!("read-only database close owner failed: {error}")
+                        })?,
                         Err(_) => {
                             sftp_pool.begin_shutdown();
                             match tokio::time::timeout(
                                 SFTP_FINAL_DATABASE_CLOSE_TIMEOUT,
-                                &mut closing,
-                            ).await {
-                                Ok(result) => result,
-                                Err(_) => {
-                                    drop(closing);
-                                    tokio::time::timeout(
-                                        SFTP_FINAL_WORKER_ABORT_TIMEOUT,
-                                        fs.flush_coordinator.abort_close_worker(),
+                                &mut close_owner,
+                            )
+                            .await
+                            {
+                                Ok(result) => result.map_err(|error| {
+                                    anyhow::anyhow!(
+                                        "read-only database close owner failed after SFTP shutdown began: {error}"
                                     )
-                                    .await
-                                    .map_err(|_| {
-                                        anyhow::anyhow!(
-                                            "timed out aborting the SFTP-backed final flush worker after {}s",
-                                            SFTP_FINAL_WORKER_ABORT_TIMEOUT.as_secs()
-                                        )
-                                    })?
-                                    .map_err(|error| {
-                                        anyhow::anyhow!(
-                                            "failed to abort the SFTP-backed final flush worker: {error:?}"
-                                        )
-                                    })?;
+                                })?,
+                                Err(_) => {
+                                    close_owner.abort();
+                                    let _ = close_owner.await;
                                     return Err(anyhow::anyhow!(
-                                        "SFTP-backed final flush+close did not finish within {}s after terminal pool shutdown began",
+                                        "SFTP-backed database close did not finish within {}s after terminal pool shutdown began",
                                         SFTP_FINAL_DATABASE_CLOSE_TIMEOUT.as_secs()
                                     ));
                                 }
                             }
                         }
-                    },
+                    }
+                } else {
+                    fs.db.close().await
+                };
+                if let Err(e) = close_result {
+                    tracing::error!("Database close failed: {:?}", e);
+                    return Err(e);
                 }
             } else {
-                let mut closing = Box::pin(fs.flush_coordinator.close());
-                tokio::select! {
-                    biased;
-                    _ = leadership_deposed.cancelled() => {
-                        drop(closing);
-                        abort_final_flush_after_leadership_loss(&fs).await;
-                        return Err(leadership_lost_error());
+                let close_result = if let Some(sftp_pool) = &sftp_pool_for_close {
+                    let mut closing = Box::pin(fs.flush_coordinator.close());
+                    tokio::select! {
+                        biased;
+                        _ = leadership_deposed.cancelled() => {
+                            drop(closing);
+                            abort_final_flush_after_leadership_loss(&fs).await;
+                            return Err(leadership_lost_error());
+                        }
+                        result = tokio::time::timeout(
+                            SFTP_FINAL_DATABASE_CLOSE_TIMEOUT,
+                            &mut closing,
+                        ) => match result {
+                            Ok(result) => result,
+                            Err(_) => {
+                                sftp_pool.begin_shutdown();
+                                match tokio::time::timeout(
+                                    SFTP_FINAL_DATABASE_CLOSE_TIMEOUT,
+                                    &mut closing,
+                                ).await {
+                                    Ok(result) => result,
+                                    Err(_) => {
+                                        drop(closing);
+                                        tokio::time::timeout(
+                                            SFTP_FINAL_WORKER_ABORT_TIMEOUT,
+                                            fs.flush_coordinator.abort_close_worker(),
+                                        )
+                                        .await
+                                        .map_err(|_| {
+                                            anyhow::anyhow!(
+                                                "timed out aborting the SFTP-backed final flush worker after {}s",
+                                                SFTP_FINAL_WORKER_ABORT_TIMEOUT.as_secs()
+                                            )
+                                        })?
+                                        .map_err(|error| {
+                                            anyhow::anyhow!(
+                                                "failed to abort the SFTP-backed final flush worker: {error:?}"
+                                            )
+                                        })?;
+                                        return Err(anyhow::anyhow!(
+                                            "SFTP-backed final flush+close did not finish within {}s after terminal pool shutdown began",
+                                            SFTP_FINAL_DATABASE_CLOSE_TIMEOUT.as_secs()
+                                        ));
+                                    }
+                                }
+                            }
+                        },
                     }
-                    result = &mut closing => result,
+                } else {
+                    let mut closing = Box::pin(fs.flush_coordinator.close());
+                    tokio::select! {
+                        biased;
+                        _ = leadership_deposed.cancelled() => {
+                            drop(closing);
+                            abort_final_flush_after_leadership_loss(&fs).await;
+                            return Err(leadership_lost_error());
+                        }
+                        result = &mut closing => result,
+                    }
+                };
+                if let Err(e) = close_result {
+                    // `db.close()` may flush metadata, so it is unsafe after seal failure.
+                    tracing::error!(
+                        "Final flush+close failed ({e:?}); exiting without a separate database close"
+                    );
+                    return Err(anyhow::anyhow!("Final flush+close failed: {e:?}"));
                 }
-            };
-            if let Err(e) = close_result {
-                // `db.close()` may flush metadata, so it is unsafe after seal failure.
-                tracing::error!(
-                    "Final flush+close failed ({e:?}); exiting without a separate database close"
-                );
-                return Err(anyhow::anyhow!("Final flush+close failed: {e:?}"));
             }
-        }
 
-        if leadership_deposed.is_cancelled() {
-            return Err(leadership_lost_error());
-        }
+            if leadership_deposed.is_cancelled() {
+                return Err(leadership_lost_error());
+            }
 
-        // Retain authority monitors until the database is closed.
-        if let Some(authority) = authority {
-            tokio::time::timeout(
-                SERVER_AUTHORITY_FINISH_TIMEOUT,
-                authority.finish_after_close(),
-            )
-            .await
-            .map_err(|_| {
-                anyhow::anyhow!(
-                    "authority shutdown timed out after {}s",
-                    SERVER_AUTHORITY_FINISH_TIMEOUT.as_secs()
+            // Retain authority monitors until the database is closed.
+            if let Some(authority) = authority {
+                tokio::time::timeout(
+                    SERVER_AUTHORITY_FINISH_TIMEOUT,
+                    authority.finish_after_close(),
                 )
-            })?;
-        }
-        if leadership_deposed.is_cancelled() {
-            return Err(leadership_lost_error());
-        }
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "authority shutdown timed out after {}s",
+                        SERVER_AUTHORITY_FINISH_TIMEOUT.as_secs()
+                    )
+                })?;
+            }
+            if leadership_deposed.is_cancelled() {
+                return Err(leadership_lost_error());
+            }
 
-        match listener_failure {
-            Some(error) => Err(error),
-            None => Ok(()),
+            Ok(())
         }
+        .await;
+        finish_serving_cleanup(
+            stop_cause,
+            serving_cleanup_errors,
+            cleanup_result,
+            leadership_deposed_after_cleanup.is_cancelled(),
+        )
     }
     .await;
 
@@ -1518,28 +1684,11 @@ pub async fn run_server(
         }
         None => Ok(()),
     };
-    match (server_result, writeback_shutdown, sftp_shutdown) {
-        (Ok(()), Ok(()), Ok(())) => {
-            info!("Shutdown complete");
-            Ok(())
-        }
-        (Err(server), Ok(()), Ok(())) => Err(server),
-        (Ok(()), Err(writeback), Ok(())) => Err(writeback),
-        (Ok(()), Ok(()), Err(sftp)) => Err(sftp),
-        (server, writeback, sftp) => {
-            let mut failures = Vec::new();
-            if let Err(error) = writeback {
-                failures.push(format!("writeback shutdown failed: {error:#}"));
-            }
-            if let Err(error) = sftp {
-                failures.push(format!("SFTP shutdown failed: {error:#}"));
-            }
-            match server {
-                Err(server) => Err(server.context(failures.join("; "))),
-                Ok(()) => Err(anyhow::anyhow!(failures.join("; "))),
-            }
-        }
+    let result = finish_process_shutdown(server_result, writeback_shutdown, sftp_shutdown);
+    if result.is_ok() {
+        info!("Shutdown complete");
     }
+    result
 }
 
 #[cfg(test)]
@@ -1558,6 +1707,291 @@ mod tests {
     #[test]
     fn listener_completion_after_shutdown_is_normal() {
         assert!(listener_exit_error(Ok(Ok(())), false).is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn listener_failure_aborts_and_joins_a_stuck_sibling_after_grace() {
+        let failed = tokio::spawn(async {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::AddrInUse,
+                "primary listener failure",
+            ))
+        });
+        let (alive_tx, alive_rx) = tokio::sync::oneshot::channel::<()>();
+        // Models an RPC/NFS-style serving future whose transport drain never
+        // resolves after the shared cancellation token fires.
+        let stuck_rpc_listener = tokio::spawn(async move {
+            let _alive = alive_tx;
+            std::future::pending::<std::io::Result<()>>().await
+        });
+        let mut handles: FuturesUnordered<_> = [failed, stuck_rpc_listener].into_iter().collect();
+
+        let first = handles.next().await.unwrap();
+        let primary = listener_exit_error(first, true).unwrap();
+
+        let started = tokio::time::Instant::now();
+        let (cause, cleanup) = drain_server_handles_for_stop(
+            ServingStopCause::ListenerFailure(primary),
+            &mut handles,
+            &CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(
+            started.elapsed(),
+            crate::replication::RESPONSE_DRAIN_TIMEOUT
+        );
+        assert!(cleanup.is_empty(), "unexpected secondary failure");
+        let sibling_dropped = tokio::time::timeout(Duration::from_secs(1), alive_rx).await;
+        assert!(
+            matches!(sibling_dropped, Ok(Err(_))),
+            "stuck sibling listener was not aborted and joined"
+        );
+        let message = format!("{:#}", finish_serving_shutdown(cause, Ok(())).unwrap_err());
+        assert!(
+            message.contains("primary listener failure"),
+            "unexpected primary error: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn panicking_listener_is_reported_as_a_listener_task_failure() {
+        let result = tokio::spawn(async {
+            panic!("listener panic");
+            #[allow(unreachable_code)]
+            Ok::<(), std::io::Error>(())
+        })
+        .await;
+
+        let error = listener_exit_error(result, true).unwrap();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("server listener task failed"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("listener panic"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[test]
+    fn listener_failure_stays_primary_when_database_cleanup_fails() {
+        let result = finish_serving_shutdown(
+            ServingStopCause::ListenerFailure(anyhow::anyhow!("primary listener failure")),
+            Err(anyhow::anyhow!("database close failure")),
+        );
+
+        let message = format!("{:#}", result.unwrap_err());
+        assert!(
+            message.starts_with("primary listener failure"),
+            "listener failure was masked: {message}"
+        );
+        assert!(
+            message.contains("database close failure"),
+            "lost cleanup error: {message}"
+        );
+    }
+
+    #[test]
+    fn listener_failure_stays_primary_when_outer_cleanup_fails() {
+        let result = finish_process_shutdown(
+            Err(anyhow::anyhow!("primary listener failure")),
+            Err(anyhow::anyhow!("writeback failure")),
+            Err(anyhow::anyhow!("SFTP failure")),
+        );
+
+        let message = format!("{:#}", result.unwrap_err());
+        assert!(
+            message.starts_with("primary listener failure"),
+            "listener failure was masked: {message}"
+        );
+        assert!(
+            message.contains("writeback failure"),
+            "lost cleanup error: {message}"
+        );
+        assert!(
+            message.contains("SFTP failure"),
+            "lost cleanup error: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn signal_shutdown_remains_successful_after_clean_listener_drain() {
+        let mut handles: FuturesUnordered<_> =
+            [tokio::spawn(async { Ok::<(), std::io::Error>(()) })]
+                .into_iter()
+                .collect();
+
+        let (cause, cleanup) = drain_server_handles_for_stop(
+            ServingStopCause::Signal,
+            &mut handles,
+            &CancellationToken::new(),
+        )
+        .await;
+
+        finish_serving_shutdown(cause, merge_cleanup_results(cleanup, Ok(()))).unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn signal_shutdown_aborts_and_joins_a_stuck_listener_after_grace() {
+        let (alive_tx, alive_rx) = tokio::sync::oneshot::channel::<()>();
+        let stuck = tokio::spawn(async move {
+            let _alive = alive_tx;
+            std::future::pending::<std::io::Result<()>>().await
+        });
+        let mut handles: FuturesUnordered<_> = [stuck].into_iter().collect();
+
+        let started = tokio::time::Instant::now();
+        let drained = tokio::time::timeout(
+            crate::replication::RESPONSE_DRAIN_TIMEOUT + Duration::from_secs(1),
+            drain_server_handles_for_stop(
+                ServingStopCause::Signal,
+                &mut handles,
+                &CancellationToken::new(),
+            ),
+        )
+        .await
+        .expect("signal listener drain exceeded its bounded grace");
+
+        assert_eq!(
+            started.elapsed(),
+            crate::replication::RESPONSE_DRAIN_TIMEOUT
+        );
+        assert!(handles.is_empty(), "listener handle was not joined");
+        assert!(alive_rx.await.is_err(), "stuck listener was not aborted");
+        finish_serving_shutdown(drained.0, merge_cleanup_results(drained.1, Ok(()))).unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn leadership_during_signal_drain_preserves_consumed_listener_failure() {
+        let failed = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            Err(std::io::Error::other("listener failed before fencing"))
+        });
+        let (alive_tx, alive_rx) = tokio::sync::oneshot::channel::<()>();
+        let stuck = tokio::spawn(async move {
+            let _alive = alive_tx;
+            std::future::pending::<std::io::Result<()>>().await
+        });
+        let mut handles: FuturesUnordered<_> = [failed, stuck].into_iter().collect();
+        let leadership_deposed = CancellationToken::new();
+        let cancel_leadership = leadership_deposed.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            cancel_leadership.cancel();
+        });
+
+        let (cause, cleanup) = drain_server_handles_for_stop(
+            ServingStopCause::Signal,
+            &mut handles,
+            &leadership_deposed,
+        )
+        .await;
+        let message = format!(
+            "{:#}",
+            finish_serving_shutdown(cause, merge_cleanup_results(cleanup, Ok(()))).unwrap_err()
+        );
+
+        assert!(
+            message.starts_with("HA writer was fenced or superseded"),
+            "leadership loss was not primary: {message}"
+        );
+        assert!(
+            message.contains("listener failed before fencing"),
+            "consumed listener failure was lost: {message}"
+        );
+        assert!(alive_rx.await.is_err(), "stuck listener was not joined");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn leadership_lost_during_cleanup_promotes_over_listener_failure() {
+        let failed = tokio::spawn(async {
+            Err(std::io::Error::other("listener failed during signal drain"))
+        });
+        let mut handles: FuturesUnordered<_> = [failed].into_iter().collect();
+        let leadership_deposed = CancellationToken::new();
+        let (cause, cleanup_errors) = drain_server_handles_for_stop(
+            ServingStopCause::Signal,
+            &mut handles,
+            &leadership_deposed,
+        )
+        .await;
+
+        let cancel_leadership = leadership_deposed.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            cancel_leadership.cancel();
+        });
+        let cleanup_result = async {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            Ok(())
+        }
+        .await;
+
+        let message = format!(
+            "{:#}",
+            finish_serving_cleanup(
+                cause,
+                cleanup_errors,
+                cleanup_result,
+                leadership_deposed.is_cancelled(),
+            )
+            .unwrap_err()
+        );
+        assert!(
+            message.starts_with("HA writer was fenced or superseded"),
+            "leadership loss was not primary: {message}"
+        );
+        assert!(
+            message.contains("listener failed during signal drain"),
+            "listener failure was not retained as cleanup context: {message}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn leadership_loss_aborts_and_joins_a_stuck_listener_after_grace() {
+        let (alive_tx, alive_rx) = tokio::sync::oneshot::channel::<()>();
+        let stuck = tokio::spawn(async move {
+            let _alive = alive_tx;
+            std::future::pending::<std::io::Result<()>>().await
+        });
+        let mut handles: FuturesUnordered<_> = [stuck].into_iter().collect();
+
+        let started = tokio::time::Instant::now();
+        let (cause, cleanup) = drain_server_handles_for_stop(
+            ServingStopCause::LeadershipLost,
+            &mut handles,
+            &CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(
+            started.elapsed(),
+            crate::replication::RESPONSE_DRAIN_TIMEOUT
+        );
+        assert!(cleanup.is_empty(), "unexpected listener cleanup error");
+        assert!(alive_rx.await.is_err(), "stuck listener was not joined");
+        let message = format!("{:#}", finish_serving_shutdown(cause, Ok(())).unwrap_err());
+        assert!(message.starts_with("HA writer was fenced or superseded"));
+    }
+
+    #[test]
+    fn leadership_loss_stays_primary_when_cleanup_also_fails() {
+        let result = finish_serving_shutdown(
+            ServingStopCause::LeadershipLost,
+            Err(anyhow::anyhow!("cleanup failure")),
+        );
+
+        let message = format!("{:#}", result.unwrap_err());
+        assert!(
+            message.starts_with("HA writer was fenced or superseded"),
+            "leadership failure was masked: {message}"
+        );
+        assert!(
+            message.contains("cleanup failure"),
+            "lost cleanup error: {message}"
+        );
     }
 
     #[tokio::test(start_paused = true)]
