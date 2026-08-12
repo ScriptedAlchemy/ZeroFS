@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use backon::{ExponentialBuilder, Retryable};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use dashmap::DashSet;
@@ -22,6 +23,7 @@ use uuid::Uuid;
 pub const OBJECT_HEADER_LEN: usize = 32;
 const OBJECT_HEADER_MAGIC: &[u8; 8] = b"ZEROFS\x01\0";
 const SFTP_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+const SFTP_STAGING_CLEANUP_ATTEMPTS: usize = 3;
 
 async fn bounded_sftp_request<T, F>(
     operation: &'static str,
@@ -145,6 +147,8 @@ pub enum RemoteError {
     Precondition(String),
     #[error("remote path permission denied: {0}")]
     PermissionDenied(String),
+    #[error("invalid remote object path: {0}")]
+    InvalidPath(String),
     #[error("remote object is corrupt: {0}")]
     CorruptObject(String),
     #[error("remote operation is not supported: {0}")]
@@ -181,6 +185,7 @@ impl RemoteError {
             | Self::AlreadyExists(_)
             | Self::Precondition(_)
             | Self::PermissionDenied(_)
+            | Self::InvalidPath(_)
             | Self::CorruptObject(_)
             | Self::NotSupported(_)
             | Self::PoolClosed => false,
@@ -277,7 +282,7 @@ pub async fn publish_payload(
         generation: Uuid::new_v4(),
         logical_len,
     };
-    let staging = staging_path(target, header.generation).map_err(RemoteError::Other)?;
+    let staging = staging_path(target, header.generation).map_err(RemoteError::InvalidPath)?;
     let mut cleanup = StagingCleanup::new(session.clone(), staging.clone());
     let mut physical_payload = Vec::with_capacity(payload.len() + 1);
     physical_payload.push(Bytes::copy_from_slice(&encode_header(header)));
@@ -313,7 +318,7 @@ pub async fn publish_payload(
             Some(expected) => match session
                 .read_exact(target, 0, OBJECT_HEADER_LEN)
                 .await
-                .and_then(|bytes| decode_header(&bytes).map_err(RemoteError::Other))
+                .and_then(|bytes| decode_header(&bytes).map_err(RemoteError::CorruptObject))
             {
                 Err(error) => Err(error),
                 Ok(current) if current.generation != expected => {
@@ -350,11 +355,24 @@ async fn reconcile_publication(
     if !error.is_ambiguous() {
         return Err(error);
     }
-    let matches = match session.read_exact(target, 0, OBJECT_HEADER_LEN).await {
-        Ok(bytes) => decode_header(&bytes).is_ok_and(|found| found == expected),
-        Err(_) => false,
-    };
-    if matches { Ok(()) } else { Err(error) }
+    let observed = (|| async {
+        let bytes = session.read_exact(target, 0, OBJECT_HEADER_LEN).await?;
+        decode_header(&bytes).map_err(RemoteError::CorruptObject)
+    })
+    .retry(
+        ExponentialBuilder::default()
+            .without_max_times()
+            .with_min_delay(std::time::Duration::from_millis(100))
+            .with_max_delay(std::time::Duration::from_secs(1)),
+    )
+    .when(RemoteError::is_retryable)
+    .await;
+
+    match observed {
+        Ok(found) if found == expected => Ok(()),
+        Ok(_) | Err(RemoteError::NotFound(_)) => Err(error),
+        Err(read_error) => Err(read_error),
+    }
 }
 
 async fn failure_with_cleanup(cleanup: &mut StagingCleanup, operation: RemoteError) -> RemoteError {
@@ -391,6 +409,10 @@ impl StagingCleanup {
         let path = self.path.as_ref().expect("armed cleanup").clone();
         match self.session.remove_file(&path).await {
             Ok(()) => {
+                self.disarm();
+                Ok(())
+            }
+            Err(RemoteError::NotFound(_)) => {
                 self.disarm();
                 Ok(())
             }
@@ -562,11 +584,36 @@ impl RemoteSession for PooledRemoteSession {
 
     fn schedule_cleanup(&self, path: PathBuf) {
         let session = self.clone();
-        self.pool.spawn_tracked(async move {
-            if let Err(error) = session.remove_file(&path).await {
-                tracing::warn!(path = %path.display(), %error, "failed to retry SFTP staging cleanup");
+        let pool = self.pool.clone();
+        let debt_path = path.clone();
+        if !self.pool.spawn_cleanup(&debt_path, async move {
+            for attempt in 1..=SFTP_STAGING_CLEANUP_ATTEMPTS {
+                match session.remove_file(&path).await {
+                    Ok(()) | Err(RemoteError::NotFound(_)) => return,
+                    Err(error)
+                        if error.is_retryable() && attempt < SFTP_STAGING_CLEANUP_ATTEMPTS =>
+                    {
+                        tokio::time::sleep(std::time::Duration::from_millis(100 * attempt as u64))
+                            .await;
+                    }
+                    Err(error) => {
+                        pool.record_cleanup_debt(&path, &error);
+                        tracing::warn!(
+                            path = %path.display(),
+                            %error,
+                            attempt,
+                            "SFTP staging cleanup retries were exhausted"
+                        );
+                        return;
+                    }
+                }
             }
-        });
+        }) {
+            tracing::warn!(
+                path = %debt_path.display(),
+                "SFTP staging cleanup remains required because the session pool is shutting down"
+            );
+        }
     }
 }
 
@@ -613,7 +660,7 @@ impl SftpObjectStore {
         allow_prefix: bool,
     ) -> object_store::Result<()> {
         if !location.prefix_matches(&self.prefix) || (!allow_prefix && location == &self.prefix) {
-            return Err(generic_error(format!(
+            return Err(invalid_path_error(format!(
                 "object path {location} is outside the configured SFTP prefix {}",
                 self.prefix
             )));
@@ -631,7 +678,7 @@ impl SftpObjectStore {
         for part in location.parts() {
             let part = part.as_ref();
             if part.is_empty() || matches!(part, "." | "..") {
-                return Err(generic_error(format!(
+                return Err(invalid_path_error(format!(
                     "unsafe SFTP path component in {location}"
                 )));
             }
@@ -1027,7 +1074,7 @@ impl SftpMultipartUpload {
                 ))
             })?;
         let generation = Uuid::new_v4();
-        let staging = staging_path(&target, generation).map_err(RemoteError::Other)?;
+        let staging = staging_path(&target, generation).map_err(RemoteError::InvalidPath)?;
         let mut cleanup = StagingCleanup::new(session.clone(), staging.clone());
         let placeholder = encode_header(ObjectHeader {
             generation,
@@ -1262,9 +1309,14 @@ fn remote_transport_error(error: crate::sftp_transport::TransportError) -> Remot
 }
 
 fn publication_error(location: &ObjectPath, error: RemoteError) -> object_store::Error {
-    if error.is_pool_closed() {
+    if matches!(error, RemoteError::PoolClosed) {
         return object_store::Error::NotSupported {
             source: Box::new(crate::sftp_transport::TransportError::PoolClosed),
+        };
+    }
+    if error.is_pool_closed() {
+        return object_store::Error::NotSupported {
+            source: Box::new(error),
         };
     }
     match error {
@@ -1287,7 +1339,7 @@ fn publication_error(location: &ObjectPath, error: RemoteError) -> object_store:
         RemoteError::NotSupported(source) => object_store::Error::NotSupported {
             source: source.into(),
         },
-        RemoteError::PoolClosed => unreachable!("pool-closed errors returned above"),
+        RemoteError::PoolClosed => unreachable!("bare pool-closed errors returned above"),
         error => object_store::Error::Generic {
             store: STORE_NAME,
             source: Box::new(error),
@@ -1299,6 +1351,13 @@ fn generic_error(error: impl Into<String>) -> object_store::Error {
     object_store::Error::Generic {
         store: STORE_NAME,
         source: error.into().into(),
+    }
+}
+
+fn invalid_path_error(error: impl Into<String>) -> object_store::Error {
+    object_store::Error::Generic {
+        store: STORE_NAME,
+        source: Box::new(RemoteError::InvalidPath(error.into())),
     }
 }
 
@@ -1338,7 +1397,18 @@ mod tests {
                 },
             },
         );
-        assert!(matches!(nested, object_store::Error::NotSupported { .. }));
+        let object_store::Error::NotSupported { source } = nested else {
+            panic!("nested pool closure must remain terminal");
+        };
+        let preserved = source
+            .downcast_ref::<RemoteError>()
+            .expect("terminal classification must retain the cleanup debt");
+        let RemoteError::CleanupRequired { operation, debt } = preserved else {
+            panic!("cleanup debt was flattened: {preserved:?}");
+        };
+        assert!(matches!(**operation, RemoteError::Other(_)));
+        assert_eq!(debt.path, PathBuf::from("staging"));
+        assert!(matches!(*debt.error, RemoteError::PoolClosed));
     }
 
     #[test]
@@ -1610,7 +1680,10 @@ mod tests {
             }
         }
 
-        async fn create_dir_all(&mut self, _path: &FilePath) -> Result<(), TransportError> {
+        async fn ensure_directory_component(
+            &mut self,
+            _path: &FilePath,
+        ) -> Result<(), TransportError> {
             Ok(())
         }
 
@@ -2296,6 +2369,7 @@ mod tests {
         operations: Mutex<Vec<String>>,
         write_error: Option<&'static str>,
         remove_error: Option<&'static str>,
+        remove_not_found: bool,
         scheduled_cleanups: AtomicUsize,
     }
 
@@ -2311,6 +2385,7 @@ mod tests {
                 operations: Mutex::new(Vec::new()),
                 write_error: None,
                 remove_error: None,
+                remove_not_found: false,
                 scheduled_cleanups: AtomicUsize::new(0),
             }
         }
@@ -2329,12 +2404,22 @@ mod tests {
                 ..Self::new()
             }
         }
+
+        fn with_missing_cleanup() -> Self {
+            Self {
+                remove_not_found: true,
+                ..Self::new()
+            }
+        }
     }
 
     #[derive(Debug)]
     struct LostReplySession {
         inner: RecordingSession,
         replace_target_header: bool,
+        corrupt_target_header: bool,
+        transient_read_call: Option<usize>,
+        read_calls: AtomicUsize,
     }
 
     impl LostReplySession {
@@ -2342,6 +2427,16 @@ mod tests {
             Self {
                 inner: RecordingSession::new(),
                 replace_target_header: false,
+                corrupt_target_header: false,
+                transient_read_call: None,
+                read_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn matching_after_transient_read(call: usize) -> Self {
+            Self {
+                transient_read_call: Some(call),
+                ..Self::matching()
             }
         }
 
@@ -2349,21 +2444,40 @@ mod tests {
             Self {
                 inner: RecordingSession::new(),
                 replace_target_header: true,
+                corrupt_target_header: false,
+                transient_read_call: None,
+                read_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn corrupting() -> Self {
+            Self {
+                inner: RecordingSession::new(),
+                replace_target_header: false,
+                corrupt_target_header: true,
+                transient_read_call: None,
+                read_calls: AtomicUsize::new(0),
             }
         }
 
         fn maybe_replace_target(&self, target: &FilePath) {
-            if !self.replace_target_header {
+            if !self.replace_target_header && !self.corrupt_target_header {
                 return;
             }
             let mut files = self.inner.files.lock().unwrap();
             let bytes = files.get_mut(target).expect("publication created target");
-            let mut replacement = encode_header(ObjectHeader {
-                generation: Uuid::nil(),
-                logical_len: 5,
-            })
-            .to_vec();
-            replacement.extend_from_slice(b"other");
+            let mut replacement = if self.corrupt_target_header {
+                vec![0; OBJECT_HEADER_LEN]
+            } else {
+                encode_header(ObjectHeader {
+                    generation: Uuid::nil(),
+                    logical_len: 5,
+                })
+                .to_vec()
+            };
+            if !self.corrupt_target_header {
+                replacement.extend_from_slice(b"other");
+            }
             *bytes = replacement.into();
         }
     }
@@ -2598,6 +2712,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn missing_staging_path_completes_cleanup_idempotently() {
+        let session = Arc::new(RecordingSession::with_missing_cleanup());
+        let staging = PathBuf::from("zerofs/v1/.zerofs-staging-missing-id");
+        let mut cleanup = StagingCleanup::new(session.clone(), staging);
+
+        cleanup
+            .remove_now()
+            .await
+            .expect("an already absent staging path has no cleanup debt");
+
+        assert!(cleanup.path.is_none());
+        drop(cleanup);
+        assert_eq!(session.scheduled_cleanups.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn multipart_initiation_surfaces_staging_cleanup_debt() {
         let session = Arc::new(RecordingSession::with_write_and_remove_failure());
         let location = ObjectPath::from("zerofs/v1/failed-begin.bin");
@@ -2662,6 +2792,61 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn lost_publication_reply_retries_reconciliation_with_the_original_header() {
+        let create = Arc::new(LostReplySession::matching_after_transient_read(1));
+        let target = FilePath::new("/objects/create.bin");
+        let created = publish_payload(
+            create.clone(),
+            target,
+            vec![Bytes::from_static(b"create")],
+            PublicationMode::Create,
+            None,
+        )
+        .await
+        .expect("create reconciliation must retain its committed generation");
+        assert_eq!(created.header.logical_len, 6);
+        assert_eq!(create.read_calls.load(Ordering::SeqCst), 2);
+
+        let update = Arc::new(LostReplySession::matching_after_transient_read(2));
+        let target = FilePath::new("/objects/update.bin");
+        let current = ObjectHeader {
+            generation: Uuid::new_v4(),
+            logical_len: 7,
+        };
+        update.inner.files.lock().unwrap().insert(
+            target.to_path_buf(),
+            Bytes::copy_from_slice(&encode_header(current)),
+        );
+        let updated = publish_payload(
+            update.clone(),
+            target,
+            vec![Bytes::from_static(b"updated")],
+            PublicationMode::Update,
+            Some(current.generation),
+        )
+        .await
+        .expect("update reconciliation must retain its committed generation");
+        assert_eq!(updated.header.logical_len, 7);
+        assert_eq!(update.read_calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn corrupt_reconciliation_target_is_a_terminal_typed_error() {
+        let error = publish_payload(
+            Arc::new(LostReplySession::corrupting()),
+            FilePath::new("/objects/corrupt.bin"),
+            vec![Bytes::from_static(b"payload")],
+            PublicationMode::Create,
+            None,
+        )
+        .await
+        .expect_err("corrupt target cannot prove that publication committed");
+
+        assert!(matches!(error, RemoteError::CorruptObject(_)));
+        assert!(!error.is_retryable());
+    }
+
     #[async_trait]
     impl RemoteSession for LostReplySession {
         fn capabilities(&self) -> SftpCapabilities {
@@ -2674,6 +2859,12 @@ mod tests {
             offset: u64,
             len: usize,
         ) -> RemoteResult<Bytes> {
+            let call = self.read_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if self.transient_read_call == Some(call) {
+                return Err(RemoteError::Other(
+                    "transient reconciliation read failure".to_owned(),
+                ));
+            }
             self.inner.read_exact(path, offset, len).await
         }
 
@@ -2752,6 +2943,9 @@ mod tests {
 
         async fn remove_file(&self, path: &FilePath) -> RemoteResult<()> {
             self.operations.lock().unwrap().push("remove".to_owned());
+            if self.remove_not_found {
+                return Err(RemoteError::NotFound(path.display().to_string()));
+            }
             if let Some(error) = self.remove_error {
                 return Err(RemoteError::Other(error.to_owned()));
             }
@@ -3014,6 +3208,37 @@ mod tests {
         assert_eq!(
             session.operations.lock().unwrap().as_slice(),
             ["create", "write", "fsync", "close", "remove"]
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_update_target_header_is_a_terminal_typed_error() {
+        let session = Arc::new(RecordingSession::new());
+        let target = FilePath::new("/objects/segment.bin");
+        session.files.lock().unwrap().insert(
+            target.to_path_buf(),
+            Bytes::from(vec![0; OBJECT_HEADER_LEN]),
+        );
+
+        let error = publish_payload(
+            session.clone(),
+            target,
+            vec![Bytes::from_static(b"replacement")],
+            PublicationMode::Update,
+            Some(Uuid::nil()),
+        )
+        .await
+        .expect_err("a corrupt target header must reject a conditional update");
+
+        assert!(matches!(error, RemoteError::CorruptObject(_)));
+        assert!(!error.is_retryable());
+        assert!(
+            session
+                .files
+                .lock()
+                .unwrap()
+                .keys()
+                .all(|path| !is_staging_name(path.file_name().unwrap().as_ref()))
         );
     }
 

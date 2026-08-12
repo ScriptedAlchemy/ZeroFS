@@ -630,6 +630,14 @@ mod tests {
         };
 
         assert!(!RetryingObjectStore::should_retry(&error));
+
+        let error = object_store::Error::Generic {
+            store: "SFTP",
+            source: Box::new(crate::sftp_object_store::RemoteError::InvalidPath(
+                "outside configured prefix".to_owned(),
+            )),
+        };
+        assert!(!RetryingObjectStore::should_retry(&error));
     }
 
     #[tokio::test]

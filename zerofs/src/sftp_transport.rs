@@ -1249,6 +1249,7 @@ struct PoolInner {
     reaper_shutdown: CancellationToken,
     session_shutdown: CancellationToken,
     tasks: TaskTracker,
+    runtime: tokio::runtime::Handle,
     shutdown_lock: Mutex<()>,
     shutdown_complete: AtomicBool,
     close_error: StdMutex<Option<String>>,
@@ -1333,9 +1334,13 @@ impl PoolInner {
     }
 
     fn record_close_error(&self, error: &TransportError) {
+        self.record_error_message(error.to_string());
+    }
+
+    fn record_error_message(&self, error: String) {
         let mut first = self.close_error.lock().unwrap();
         if first.is_none() {
-            *first = Some(error.to_string());
+            *first = Some(error);
         }
     }
 
@@ -1529,11 +1534,31 @@ impl SftpSessionPool {
         Ok(())
     }
 
-    pub(crate) fn spawn_tracked<F>(&self, future: F)
+    pub(crate) fn spawn_cleanup<F>(&self, path: &std::path::Path, future: F) -> bool
     where
         F: std::future::Future<Output = ()> + Send + 'static,
     {
-        self.inner.tasks.spawn(future);
+        let _gate = self.inner.activity_gate.lock().unwrap();
+        if self.inner.closed.load(Ordering::SeqCst) {
+            self.inner.record_error_message(format!(
+                "SFTP staging cleanup remains required for {} because the session pool is closed",
+                path.display()
+            ));
+            return false;
+        }
+        self.inner.tasks.spawn_on(future, &self.inner.runtime);
+        true
+    }
+
+    pub(crate) fn record_cleanup_debt(
+        &self,
+        path: &std::path::Path,
+        error: &impl std::fmt::Display,
+    ) {
+        self.inner.record_error_message(format!(
+            "SFTP staging cleanup remains required for {}: {error}",
+            path.display()
+        ));
     }
 
     pub async fn from_config_writable(
@@ -1572,6 +1597,7 @@ impl SftpSessionPool {
                 reaper_shutdown: CancellationToken::new(),
                 session_shutdown: CancellationToken::new(),
                 tasks: TaskTracker::new(),
+                runtime: tokio::runtime::Handle::current(),
                 shutdown_lock: Mutex::new(()),
                 shutdown_complete: AtomicBool::new(false),
                 close_error: StdMutex::new(None),
@@ -2402,6 +2428,53 @@ mod tests {
         SftpSessionPool::new_writable(Arc::new(factory), shared, reads, writes)
             .await
             .expect("fully capable writable pool")
+    }
+
+    #[test]
+    fn tracked_cleanup_uses_pool_runtime_outside_caller_runtime() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let pool = runtime.block_on(pool(RecordingFactory::fully_capable(), 1, 1, 1));
+
+        let ran = Arc::new(AtomicUsize::new(0));
+        let ran_in_task = ran.clone();
+        let registration = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pool.spawn_cleanup(std::path::Path::new("test-staging"), async move {
+                ran_in_task.store(1, Ordering::SeqCst);
+            });
+        }));
+        assert!(
+            registration.is_ok(),
+            "cleanup registration must use the pool runtime rather than the caller's context"
+        );
+        runtime.block_on(async {
+            while ran.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+            pool.shutdown().await.unwrap();
+        });
+    }
+
+    #[tokio::test]
+    async fn tracked_cleanup_is_rejected_after_pool_shutdown() {
+        let pool = pool(RecordingFactory::fully_capable(), 1, 1, 1).await;
+        pool.shutdown().await.unwrap();
+        let ran = Arc::new(AtomicUsize::new(0));
+        let ran_in_task = ran.clone();
+
+        assert!(
+            !pool.spawn_cleanup(std::path::Path::new("test-staging"), async move {
+                ran_in_task.store(1, Ordering::SeqCst);
+            })
+        );
+        tokio::task::yield_now().await;
+        assert_eq!(ran.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            pool.shutdown().await,
+            Err(TransportError::Close(ref message)) if message.contains("test-staging")
+        ));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
