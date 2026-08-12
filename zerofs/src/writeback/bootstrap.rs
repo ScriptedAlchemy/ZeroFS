@@ -136,6 +136,7 @@ mod tests {
             high_watermark_percent: 95,
             resume_percent: 85,
             upload_concurrency: 4,
+            local_concurrency: 4,
             shutdown_flush: ShutdownFlush::Local,
         };
         let identity = JournalIdentity {
@@ -188,6 +189,7 @@ mod tests {
             high_watermark_percent: 95,
             resume_percent: 85,
             upload_concurrency: 4,
+            local_concurrency: 4,
             shutdown_flush: ShutdownFlush::Local,
         };
         let identity = JournalIdentity {
@@ -280,6 +282,7 @@ mod tests {
             high_watermark_percent: 95,
             resume_percent: 85,
             upload_concurrency: 4,
+            local_concurrency: 4,
             shutdown_flush: ShutdownFlush::Local,
         };
         let identity = JournalIdentity {
@@ -358,6 +361,7 @@ mod tests {
             high_watermark_percent: 95,
             resume_percent: 85,
             upload_concurrency: 4,
+            local_concurrency: 4,
             shutdown_flush: ShutdownFlush::Local,
         };
         let identity = JournalIdentity {
@@ -431,6 +435,7 @@ mod tests {
             high_watermark_percent: 95,
             resume_percent: 85,
             upload_concurrency: 4,
+            local_concurrency: 4,
             shutdown_flush: ShutdownFlush::Remote,
         };
         let identity = JournalIdentity {
@@ -480,6 +485,7 @@ mod tests {
             high_watermark_percent: 95,
             resume_percent: 85,
             upload_concurrency: 1,
+            local_concurrency: 4,
             shutdown_flush: ShutdownFlush::Local,
         };
         let identity = JournalIdentity {

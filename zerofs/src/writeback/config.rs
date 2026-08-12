@@ -50,6 +50,8 @@ pub struct WritebackConfig {
     pub resume_percent: u8,
     #[serde(default = "default_upload_concurrency")]
     pub upload_concurrency: usize,
+    #[serde(default = "default_local_concurrency")]
+    pub local_concurrency: usize,
     #[serde(default)]
     pub shutdown_flush: ShutdownFlush,
 }
@@ -66,6 +68,7 @@ impl Default for WritebackConfig {
             high_watermark_percent: default_high_watermark_percent(),
             resume_percent: default_resume_percent(),
             upload_concurrency: default_upload_concurrency(),
+            local_concurrency: default_local_concurrency(),
             shutdown_flush: ShutdownFlush::Local,
         }
     }
@@ -81,6 +84,7 @@ pub struct WritebackSettings {
     pub high_watermark_percent: u8,
     pub resume_percent: u8,
     pub upload_concurrency: usize,
+    pub local_concurrency: usize,
     pub shutdown_flush: ShutdownFlush,
 }
 
@@ -134,6 +138,9 @@ impl WritebackConfig {
         if self.upload_concurrency == 0 {
             bail!("[writeback] upload_concurrency must be greater than zero");
         }
+        if !(1..=256).contains(&self.local_concurrency) {
+            bail!("[writeback] local_concurrency must be between 1 and 256");
+        }
         if let Some(limit) = sftp_write_concurrency
             && self.upload_concurrency > limit
         {
@@ -152,6 +159,7 @@ impl WritebackConfig {
             high_watermark_percent: self.high_watermark_percent,
             resume_percent: self.resume_percent,
             upload_concurrency: self.upload_concurrency,
+            local_concurrency: self.local_concurrency,
             shutdown_flush: self.shutdown_flush,
         }))
     }
@@ -166,6 +174,10 @@ const fn default_resume_percent() -> u8 {
 }
 
 const fn default_upload_concurrency() -> usize {
+    4
+}
+
+const fn default_local_concurrency() -> usize {
     4
 }
 

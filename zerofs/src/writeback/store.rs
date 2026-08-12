@@ -121,11 +121,16 @@ impl WritebackObjectStore {
         )?;
         let overlay = OverlayIndex::recover(remote.clone(), journal.clone()).await?;
         let observer = Arc::new(OverlayCommitObserver::new(overlay.clone(), journal.clone()));
-        let queue_depth = settings.upload_concurrency.saturating_mul(4).max(16);
+        let queue_depth = settings
+            .upload_concurrency
+            .max(settings.local_concurrency)
+            .saturating_mul(4)
+            .max(16);
         let journaler = LocalJournaler::start_with_observer(
             journal.clone(),
             admission.clone(),
             queue_depth,
+            settings.local_concurrency,
             Some(observer),
         )?;
         let remote = if remote_active {
@@ -1480,6 +1485,7 @@ mod tests {
             high_watermark_percent: 95,
             resume_percent: 85,
             upload_concurrency: 4,
+            local_concurrency: 4,
             shutdown_flush,
         };
         let store = WritebackObjectStore::open(writeback_remote, journal, settings)
@@ -2152,6 +2158,7 @@ mod tests {
             high_watermark_percent: 95,
             resume_percent: 85,
             upload_concurrency: 4,
+            local_concurrency: 4,
             shutdown_flush: ShutdownFlush::Local,
         };
         let journal = Arc::new(Journal::open(settings.dir.clone(), identity.clone()).unwrap());
@@ -2866,6 +2873,7 @@ mod tests {
             high_watermark_percent: 95,
             resume_percent: 85,
             upload_concurrency: 4,
+            local_concurrency: 4,
             shutdown_flush: ShutdownFlush::Local,
         };
         let (partitioned, controls) = FaultStore::new(remote.clone());

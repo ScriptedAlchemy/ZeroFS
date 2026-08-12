@@ -1569,6 +1569,7 @@ impl Settings {
         toml_string.push_str("# min_free_gb = 256.0\n");
         toml_string.push_str("# high_watermark_percent = 95\n");
         toml_string.push_str("# resume_percent = 85\n");
+        toml_string.push_str("# local_concurrency = 4\n");
         toml_string.push_str("# upload_concurrency = 4\n");
         toml_string.push_str("# shutdown_flush = \"local\"       # local | remote\n");
 
@@ -1950,6 +1951,27 @@ min_free_gb = 256.0"#,
             .unwrap();
         assert_eq!(writeback.ack_mode, crate::writeback::config::AckMode::Ssd);
         assert_eq!(writeback.disk_bytes, 512_000_000_000);
+        assert_eq!(writeback.local_concurrency, 4);
+    }
+
+    #[test]
+    fn writeback_local_concurrency_is_positive_and_bounded() {
+        for value in [0, 257] {
+            let error = write_and_load(&writeback_sftp_config(
+                16.0,
+                &format!(
+                    r#"[writeback]
+enabled = true
+dir = "/var/cache/zerofs-writeback"
+memory_size_gb = 16.0
+disk_size_gb = 512.0
+min_free_gb = 256.0
+local_concurrency = {value}"#
+                ),
+            ))
+            .unwrap_err();
+            assert!(format!("{error:#}").contains("local_concurrency"));
+        }
     }
 
     #[test]

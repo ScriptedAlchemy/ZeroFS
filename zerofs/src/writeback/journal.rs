@@ -40,6 +40,25 @@ pub struct Journal {
     snapshot_calls: AtomicU64,
 }
 
+pub(crate) struct PreparedMutation {
+    record: MutationRecord,
+    temporary_blob: Option<PathBuf>,
+}
+
+impl PreparedMutation {
+    pub(crate) fn sequence(&self) -> Sequence {
+        self.record.sequence
+    }
+
+    #[cfg(test)]
+    pub(crate) fn metadata(record: MutationRecord) -> Self {
+        Self {
+            record,
+            temporary_blob: None,
+        }
+    }
+}
+
 impl fmt::Debug for Journal {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -270,23 +289,24 @@ impl Journal {
 
     pub fn commit_put(&self, record: MutationRecord, payload: &[u8]) -> Result<MutationRecord> {
         let payload_sha256 = Sha256::digest(payload).into();
-        self.commit_put_inner(record, payload, payload_sha256)
+        let prepared = self.prepare_put_inner(record, payload, payload_sha256)?;
+        self.publish_prepared(prepared)
     }
 
-    pub(crate) fn commit_verified_put(
+    pub(crate) fn prepare_verified_put(
         &self,
         record: MutationRecord,
         payload: &VerifiedPayload,
-    ) -> Result<MutationRecord> {
-        self.commit_put_inner(record, payload.bytes(), payload.sha256())
+    ) -> Result<PreparedMutation> {
+        self.prepare_put_inner(record, payload.bytes(), payload.sha256())
     }
 
-    fn commit_put_inner(
+    fn prepare_put_inner(
         &self,
         mut record: MutationRecord,
         payload: &[u8],
         actual_hash: [u8; 32],
-    ) -> Result<MutationRecord> {
+    ) -> Result<PreparedMutation> {
         self.validate_record_format(&record)?;
         let (payload_len, payload_sha256) = record
             .payload()
@@ -297,8 +317,6 @@ impl Journal {
         if actual_hash != payload_sha256 {
             bail!("put payload hash does not match mutation record");
         }
-        self.require_next_local_sequence(record.sequence)?;
-
         let relative = blob_relative_path(record.sequence, record.operation_id);
         let blob_path = path_to_portable_string(&relative)?;
         *record
@@ -308,23 +326,89 @@ impl Journal {
         let final_path = checked_join(&self.root, &blob_path)?;
         let shard = final_path.parent().context("blob path has no parent")?;
         ensure_owner_directory(shard, true)?;
-        sync_directory(self.root.join("blobs"))?;
 
         let tmp_path = self.root.join("tmp").join(format!("{operation_id}.tmp"));
         reject_symlink_if_present(&tmp_path, "journal temporary blob")?;
-        let mut tmp_file = open_owner_file(&tmp_path, false)
-            .with_context(|| format!("failed to create temporary blob {}", tmp_path.display()))?;
-        tmp_file
-            .write_all(payload)
-            .context("failed to write temporary blob")?;
-        tmp_file
-            .sync_all()
-            .context("failed to fsync temporary blob")?;
-        drop(tmp_file);
-        verify_file_payload(&tmp_path, payload_len, payload_sha256, false)
-            .context("temporary blob verification failed")?;
+        let preparation = (|| -> Result<()> {
+            let mut tmp_file = open_owner_file(&tmp_path, false).with_context(|| {
+                format!("failed to create temporary blob {}", tmp_path.display())
+            })?;
+            tmp_file
+                .write_all(payload)
+                .context("failed to write temporary blob")?;
+            tmp_file
+                .sync_all()
+                .context("failed to fsync temporary blob")?;
+            let written_len = tmp_file
+                .metadata()
+                .context("failed to inspect prepared temporary blob")?
+                .len();
+            if written_len != payload_len {
+                bail!(
+                    "prepared temporary blob length mismatch: expected {payload_len}, got {written_len}"
+                );
+            }
+            Ok(())
+        })();
+        if let Err(error) = preparation {
+            let cleanup = self.discard_temporary_blob(&tmp_path);
+            return match cleanup {
+                Ok(()) => Err(error),
+                Err(cleanup) => {
+                    Err(error.context(format!("temporary blob cleanup also failed: {cleanup:#}")))
+                }
+            };
+        }
+        Ok(PreparedMutation {
+            record,
+            temporary_blob: Some(tmp_path),
+        })
+    }
 
-        self.record_pending_blob(operation_id, &blob_path)?;
+    pub(crate) fn prepare_metadata(&self, record: MutationRecord) -> Result<PreparedMutation> {
+        self.validate_record_format(&record)?;
+        if record.payload().is_some() {
+            bail!("prepare_metadata cannot prepare a payload mutation");
+        }
+        Ok(PreparedMutation {
+            record,
+            temporary_blob: None,
+        })
+    }
+
+    pub(crate) fn publish_prepared(&self, prepared: PreparedMutation) -> Result<MutationRecord> {
+        if let Err(error) = self.require_next_local_sequence(prepared.sequence()) {
+            let cleanup = self.discard_prepared(prepared);
+            return match cleanup {
+                Ok(()) => Err(error),
+                Err(cleanup) => {
+                    Err(error.context(format!("prepared blob cleanup also failed: {cleanup:#}")))
+                }
+            };
+        }
+        let PreparedMutation {
+            record,
+            temporary_blob,
+        } = prepared;
+        let Some(tmp_path) = temporary_blob else {
+            self.commit_record(&record, None)?;
+            return Ok(record);
+        };
+        let blob_path = record
+            .blob_path()
+            .context("prepared payload mutation has no blob path")?;
+        let final_path = checked_join(&self.root, blob_path)?;
+        let shard = final_path.parent().context("blob path has no parent")?;
+        let operation_id = record.operation_id;
+        if let Err(error) = self.record_pending_blob(operation_id, blob_path) {
+            let cleanup = self.discard_temporary_blob(&tmp_path);
+            return match cleanup {
+                Ok(()) => Err(error),
+                Err(cleanup) => {
+                    Err(error.context(format!("temporary blob cleanup also failed: {cleanup:#}")))
+                }
+            };
+        }
         if let Err(error) = fs::rename(&tmp_path, &final_path) {
             let cleanup = self.abort_unpublished_blob(operation_id, &tmp_path);
             let publication = anyhow::Error::new(error).context(format!(
@@ -345,14 +429,24 @@ impl Journal {
         Ok(record)
     }
 
-    pub fn commit_metadata(&self, record: MutationRecord) -> Result<MutationRecord> {
-        self.validate_record_format(&record)?;
-        if record.payload().is_some() {
-            bail!("commit_metadata cannot commit a payload mutation");
+    pub(crate) fn discard_prepared(&self, prepared: PreparedMutation) -> Result<()> {
+        match prepared.temporary_blob {
+            Some(path) => self.discard_temporary_blob(&path),
+            None => Ok(()),
         }
-        self.require_next_local_sequence(record.sequence)?;
-        self.commit_record(&record, None)?;
-        Ok(record)
+    }
+
+    fn discard_temporary_blob(&self, path: &Path) -> Result<()> {
+        match fs::remove_file(path) {
+            Ok(()) => sync_directory(self.root.join("tmp")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).context("failed to remove prepared temporary blob"),
+        }
+    }
+
+    pub fn commit_metadata(&self, record: MutationRecord) -> Result<MutationRecord> {
+        let prepared = self.prepare_metadata(record)?;
+        self.publish_prepared(prepared)
     }
 
     pub fn read_blob(&self, sequence: Sequence) -> Result<Vec<u8>> {
@@ -1368,6 +1462,8 @@ mod tests {
     use crate::writeback::model::{
         FenceClass, JournalIdentity, LocalEtag, MutationKind, MutationMode, MutationRecord,
     };
+    use crate::writeback::payload::VerifiedPayload;
+    use bytes::Bytes;
     use sha2::{Digest, Sha256};
     use std::fs;
     #[cfg(unix)]
@@ -1570,6 +1666,24 @@ mod tests {
             .unwrap_err();
 
         assert!(format!("{error:#}").contains("contiguous"));
+        assert_eq!(journal.snapshot().unwrap().local_seq, 0);
+    }
+
+    #[test]
+    fn rejected_prepared_sequence_does_not_leak_temporary_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = open_temp_journal(&temp, "bucket-a");
+        let payload = VerifiedPayload::new(Bytes::from_static(b"payload"));
+        let prepared = journal
+            .prepare_verified_put(put_record(2, "segments/2", b"payload"), &payload)
+            .unwrap();
+        assert_eq!(fs::read_dir(journal.root().join("tmp")).unwrap().count(), 1);
+
+        let error = journal.publish_prepared(prepared).unwrap_err();
+
+        assert!(format!("{error:#}").contains("contiguous"));
+        assert_eq!(fs::read_dir(journal.root().join("tmp")).unwrap().count(), 0);
+        assert_eq!(journal.snapshot().unwrap().pending_blob_count, 0);
         assert_eq!(journal.snapshot().unwrap().local_seq, 0);
     }
 
