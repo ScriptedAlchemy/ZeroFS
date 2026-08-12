@@ -1,5 +1,9 @@
 use super::error::{CommandError, CommandResult, NBDError, Result};
 use super::out_of_bounds;
+use super::{
+    NBD_STRIPE_MARKER, NBD_STRIPE_MAX_BYTES, NBD_STRIPE_MAX_MEMBERS, NBD_STRIPE_MIN_BYTES,
+    StripeManifest,
+};
 use crate::fs::ZeroFS;
 use crate::fs::errors::FsError;
 use crate::fs::inode::Inode;
@@ -12,7 +16,6 @@ use nbd_proto::{
     NBD_INFO_EXPORT, NBD_REP_ACK, NBD_REP_ERR_INVALID, NBD_REP_ERR_UNKNOWN, NBD_REP_INFO,
     NBD_REP_SERVER, NBDInfoExport, TRANSMISSION_FLAGS,
 };
-use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 use tokio::sync::{OwnedRwLockReadGuard, RwLock};
@@ -20,11 +23,7 @@ use tracing::debug;
 
 const NBD_READDIR_DEFAULT_LIMIT: usize = 1000;
 const NBD_ZERO_CHUNK_SIZE: usize = 1024 * 1024;
-const NBD_STRIPE_MARKER: &[u8] = b".zerofs-nbd-stripe-v1";
 const NBD_STRIPE_MANIFEST_MAX_BYTES: u64 = 4096;
-const NBD_STRIPE_MIN_BYTES: u64 = 4096;
-const NBD_STRIPE_MAX_BYTES: u64 = 64 * 1024 * 1024;
-const NBD_STRIPE_MAX_MEMBERS: usize = 32;
 
 /// Response to send back for an option
 pub struct OptionReply {
@@ -84,13 +83,6 @@ enum NbdBacking {
     },
 }
 
-#[derive(Debug, Deserialize)]
-struct StripeManifest {
-    version: u32,
-    stripe_bytes: u64,
-    members: Vec<String>,
-}
-
 fn parse_stripe_manifest(data: &[u8]) -> Result<StripeManifest> {
     let manifest: StripeManifest = serde_json::from_slice(data)
         .map_err(|error| NBDError::Protocol(format!("invalid striped NBD manifest: {error}")))?;
@@ -117,7 +109,7 @@ fn parse_stripe_manifest(data: &[u8]) -> Result<StripeManifest> {
         if member.is_empty()
             || member == "."
             || member == ".."
-            || member.as_bytes() == NBD_STRIPE_MARKER
+            || member == NBD_STRIPE_MARKER
             || member.as_bytes().contains(&b'/')
             || !unique.insert(member.as_bytes().to_vec())
         {
@@ -454,7 +446,7 @@ impl NBDHandler {
         let marker_inode = self
             .filesystem
             .directory_store
-            .get(directory_inode, NBD_STRIPE_MARKER)
+            .get(directory_inode, NBD_STRIPE_MARKER.as_bytes())
             .await
             .map_err(NBDError::from)?;
         let marker_size = match self.filesystem.inode_store.get(marker_inode).await? {
@@ -821,7 +813,7 @@ mod tests {
             .create(
                 &credentials,
                 export_dir,
-                super::NBD_STRIPE_MARKER,
+                super::NBD_STRIPE_MARKER.as_bytes(),
                 &SetAttributes::default(),
             )
             .await

@@ -5,6 +5,18 @@ pub mod server;
 pub use handler::NbdExportGates;
 pub use server::NBDServer;
 
+pub(crate) const NBD_STRIPE_MARKER: &str = ".zerofs-nbd-stripe-v1";
+pub(crate) const NBD_STRIPE_MIN_BYTES: u64 = 4096;
+pub(crate) const NBD_STRIPE_MAX_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const NBD_STRIPE_MAX_MEMBERS: usize = 32;
+
+#[derive(Clone, Debug, serde::Deserialize, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct StripeManifest {
+    pub(crate) version: u32,
+    pub(crate) stripe_bytes: u64,
+    pub(crate) members: Vec<String>,
+}
+
 fn out_of_bounds(offset: u64, length: u32, device_size: u64) -> bool {
     offset
         .checked_add(length as u64)

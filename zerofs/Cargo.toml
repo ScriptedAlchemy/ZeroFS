@@ -137,6 +137,7 @@ chrono = "0.4"
 fail = { version = "0.5", features = ["failpoints"], optional = true }
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.17", default-features = false }
+zerofs-client = { path = "zerofs-client" }
 serde_json = "1.0"
 socket2 = { version = "0.6", features = ["all"] }
 hyper = { version = "1", features = ["http1", "server"] }
@@ -157,7 +158,7 @@ tempfile = "3.21"
 # mount path via the fusermount3 helper, so no libfuse linkage is required.
 [target.'cfg(target_os = "linux")'.dependencies]
 fuser = { version = "0.17", default-features = false }
-# Only the `zerofs mount` (FUSE) command uses the 9P client.
+# The `zerofs mount` FUSE path uses the low-level 9P client directly.
 ninep-client = { path = "ninep-client" }
 
 [build-dependencies]
@@ -167,7 +168,6 @@ protobuf-src = { version = "2", optional = true }
 [dev-dependencies]
 futures = "0.3"
 proptest = "1"
-zerofs-client = { path = "zerofs-client" }
 ninep-client = { path = "ninep-client" }
 # start_paused virtual-time runtimes for the DST harness.
 tokio = { version = "1.49", features = ["test-util"] }

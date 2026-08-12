@@ -31,7 +31,48 @@ zerofs run --config zerofs.toml
 
 ## Create an Export
 
-NBD exports are ordinary files in the filesystem's `.nbd` directory. Mount ZeroFS through [9P](/9p-access) or [NFS](/nfs-access), then create a sparse file of the required size:
+For a striped export, point the ZeroFS CLI at a writable 9P endpoint. This
+creates the `.nbd` layout through ZeroFS itself; no temporary host mount is
+needed:
+
+```bash
+zerofs nbd provision-striped \
+  unix:/tmp/zerofs.9p.sock \
+  database \
+  --size 64GiB
+```
+
+The defaults are four equal sparse lane files and a 1 MiB stripe. Both are
+configurable when the export is first created:
+
+```bash
+zerofs nbd provision-striped \
+  tcp://127.0.0.1:5564 \
+  database \
+  --size 64GiB \
+  --lanes 8 \
+  --stripe-size 2MiB
+```
+
+The logical size must be divisible by `lanes × stripe-size`. ZeroFS accepts
+2-32 lanes and power-of-two stripe sizes from 4 KiB through 64 MiB. Repeating
+the command with the exact same geometry is safe: it verifies the manifest and
+every lane, flushes the export, and reports that it is already provisioned.
+Conflicting existing files, directories, or geometry are never replaced.
+
+Provisioning writes a private draft marker before creating lanes, then
+atomically renames that marker to the NBD manifest only after every lane has
+the requested sparse length. A rerun can resume a matching draft after an
+interrupted command; an unrecognized partial directory is left untouched for
+manual inspection.
+
+<Note>
+  `provision-striped` only creates and flushes the export. It does not format a
+  filesystem, attach `/dev/nbd*`, or change any existing block device.
+</Note>
+
+For a single-file export, mount ZeroFS through [9P](/9p-access) or
+[NFS](/nfs-access), then create a sparse file in `.nbd`:
 
 ```bash
 mkdir -p /mnt/zerofs/.nbd
@@ -39,7 +80,8 @@ truncate -s 20G /mnt/zerofs/.nbd/database
 ls -lh /mnt/zerofs/.nbd/database
 ```
 
-The filename is the NBD export name. New files are available without restarting ZeroFS.
+The filename or striped-directory name is the NBD export name. New exports are
+available without restarting ZeroFS.
 
 ## Connect from Linux
 

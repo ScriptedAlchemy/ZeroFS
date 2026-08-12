@@ -148,6 +148,17 @@ async fn async_main() -> Result<()> {
         cli::Commands::Monitor { config, interval } => {
             cli::monitor::run_monitor(config, interval).await?;
         }
+        cli::Commands::Nbd { subcommand } => match subcommand {
+            cli::NbdCommands::ProvisionStriped {
+                target,
+                export,
+                size,
+                lanes,
+                stripe_size,
+            } => {
+                cli::nbd::run_provision_striped(&target, &export, size, lanes, stripe_size).await?;
+            }
+        },
         #[cfg(target_os = "linux")]
         cli::Commands::Mount {
             target,

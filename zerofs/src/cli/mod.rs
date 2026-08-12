@@ -10,6 +10,7 @@ pub mod fatrace;
 pub mod flush;
 mod init;
 pub mod monitor;
+pub mod nbd;
 pub mod otrace;
 pub mod password;
 pub mod server;
@@ -85,6 +86,11 @@ pub enum Commands {
         #[arg(long, default_value = "250")]
         interval: u32,
     },
+    /// Manage Network Block Device exports
+    Nbd {
+        #[command(subcommand)]
+        subcommand: NbdCommands,
+    },
     /// Mount a ZeroFS 9P export as a local filesystem (FUSE client)
     ///
     /// Connects to a running ZeroFS 9P server and exposes it at a local mount
@@ -127,6 +133,29 @@ pub enum Commands {
         /// filesystem. The directory must already exist.
         #[arg(long)]
         aname: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum NbdCommands {
+    /// Create a striped sparse NBD export through a ZeroFS 9P endpoint
+    ///
+    /// This only provisions the export. It does not format a filesystem,
+    /// attach an NBD client, or replace a conflicting existing export.
+    ProvisionStriped {
+        /// 9P server address: host[:port], tcp://host:port, or unix:/path/to.sock
+        target: String,
+        /// Export name presented to NBD clients
+        export: String,
+        /// Logical device size (integer bytes or B/KiB/MiB/GiB/TiB)
+        #[arg(long, value_parser = nbd::parse_byte_size)]
+        size: u64,
+        /// Number of sparse backing lanes (2-32)
+        #[arg(long, default_value_t = 4)]
+        lanes: u8,
+        /// Bytes per lane before rotating (power of two, 4KiB-64MiB)
+        #[arg(long, default_value = "1MiB", value_parser = nbd::parse_byte_size)]
+        stripe_size: u64,
     },
 }
 
@@ -188,4 +217,43 @@ pub async fn connect_rpc_client(config_path: &Path) -> Result<RpcClient> {
     RpcClient::connect_from_config(rpc_config)
         .await
         .context("Failed to connect to RPC server. Is the server running?")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, Commands, NbdCommands};
+    use clap::Parser;
+
+    #[test]
+    fn striped_nbd_provision_command_has_operational_defaults() {
+        let cli = Cli::try_parse_from([
+            "zerofs",
+            "nbd",
+            "provision-striped",
+            "unix:/run/zerofs/9p.sock",
+            "vm100",
+            "--size",
+            "64GiB",
+        ])
+        .unwrap();
+
+        let Commands::Nbd {
+            subcommand:
+                NbdCommands::ProvisionStriped {
+                    target,
+                    export,
+                    size,
+                    lanes,
+                    stripe_size,
+                },
+        } = cli.command
+        else {
+            panic!("expected nbd provision-striped command");
+        };
+        assert_eq!(target, "unix:/run/zerofs/9p.sock");
+        assert_eq!(export, "vm100");
+        assert_eq!(size, 64 * 1024 * 1024 * 1024);
+        assert_eq!(lanes, 4);
+        assert_eq!(stripe_size, 1024 * 1024);
+    }
 }
