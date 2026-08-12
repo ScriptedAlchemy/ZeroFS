@@ -33,6 +33,7 @@ new_fixture() {
   printf 'metadata\n' >"$FIXTURE/mount/metadata/one"
   printf 'binary\n' >"$FIXTURE/zerofs"
   chmod +x "$FIXTURE/zerofs"
+  printf 'commit=test-deployed-commit\nbinary_sha256=%s\n' "$(sha256sum "$FIXTURE/zerofs" | awk '{print $1}')" >"$FIXTURE/build-receipt"
   cat >"$FIXTURE/config.toml" <<EOF
 [storage]
 url = "sftp://user@example.invalid:23/zerofs"
@@ -91,7 +92,10 @@ else
 fi'
   make_fake systemctl '
 case ${1:-} in
-  stop) printf "stop %s\n" "$2" >>"$FAKE_CALL_LOG"; exit 0 ;;
+  stop)
+    printf "systemctl %s\n" "$*" >>"$FAKE_CALL_LOG"
+    if [[ ${FAKE_BLOCKING_STOP:-0} == 1 && " $* " != *" --no-block "* ]]; then exit 88; fi
+    unit=${@: -1}; printf "stop %s\n" "$unit" >>"$FAKE_CALL_LOG"; exit 0 ;;
   start) printf "start %s\n" "$2" >>"$FAKE_CALL_LOG"; exit 0 ;;
   reset-failed) exit 0 ;;
   is-active)
@@ -123,16 +127,21 @@ case ${1:-} in
 esac
 exit 1'
   make_fake fio '
-name= rw= direct= output=
+name= rw= direct= output= directory= filename_format=
 for arg in "$@"; do
   case $arg in
     --name=*) name=${arg#--name=} ;;
     --rw=*) rw=${arg#--rw=} ;;
     --direct=*) direct=${arg#--direct=} ;;
     --output=*) output=${arg#--output=} ;;
+    --directory=*) directory=${arg#--directory=} ;;
+    --filename_format=*) filename_format=${arg#--filename_format=} ;;
   esac
 done
 printf "fio name=%s rw=%s direct=%s\n" "$name" "$rw" "${direct:-unset}" >>"$FAKE_CALL_LOG"
+if [[ $rw == write && -n $directory && -n $filename_format ]]; then
+  file=${filename_format//\$jobnum/0}; : >"$directory/$file"
+fi
 if [[ -n $output ]]; then
   if [[ $rw == read ]]; then printf "READ: bw=2MiB/s\n" >"$output"; else printf "WRITE: bw=1MiB/s\n" >"$output"; fi
 fi
@@ -141,7 +150,9 @@ exit "${FAKE_FIO_RC:-0}"'
   make_fake sync '
 if [[ ${FAKE_ADVANCE_LOCAL_DURABLE:-0} == 1 ]]; then
   sed -i.bak "s/zerofs_writeback_local_bytes_completed_total 1048576/zerofs_writeback_local_bytes_completed_total 3145728/" "$FAKE_METRICS_FILE"
+  sed -i.bak2 "s/zerofs_writeback_remote_bytes_completed_total 1048576/zerofs_writeback_remote_bytes_completed_total 3145728/" "$FAKE_METRICS_FILE"
 fi
+printf "sync %s\n" "$*" >>"$FAKE_CALL_LOG"
 exit 0'
   make_fake fallocate 'target=${@: -1}; : >"$target"'
   make_fake sftp '
@@ -175,6 +186,7 @@ run_pilot() {
     ZEROFS_PILOT_CONFIG="$FIXTURE/config.toml" \
     ZEROFS_PILOT_ENV="$FIXTURE/env" \
     ZEROFS_PILOT_BINARY="$FIXTURE/zerofs" \
+    ZEROFS_PILOT_BUILD_RECEIPT="$FIXTURE/build-receipt" \
     ZEROFS_PILOT_PROC_ROOT="$FIXTURE/proc" \
     ZEROFS_PILOT_CGROUP_ROOT="$FIXTURE/cgroup" \
     ZEROFS_PILOT_LOCK_FILE="$FIXTURE/pilot.lock" \
@@ -204,6 +216,12 @@ test_teardown_requires_every_unit_inactive() {
   fi
   grep -q 'did not reach a terminal stopped state' "$FIXTURE/err" || return 1
   [[ $(grep -c '^stop ' "$FIXTURE/calls.log") == 3 ]]
+}
+
+test_teardown_uses_nonblocking_stop_before_bounded_polling() {
+  new_fixture
+  FAKE_BLOCKING_STOP=1 run_pilot teardown >"$FIXTURE/out" 2>"$FIXTURE/err"
+  [[ $(grep -c '^systemctl stop --no-block ' "$FIXTURE/calls.log") == 3 ]]
 }
 
 test_teardown_rejects_units_stuck_in_transitional_states() {
@@ -265,9 +283,17 @@ test_status_records_runtime_and_durability_receipt() {
   new_fixture
   run_pilot status >"$FIXTURE/out" 2>"$FIXTURE/err"
   grep -q '^running_binary_sha256=' "$FIXTURE/out" || return 1
+  grep -q '^deployed_commit=test-deployed-commit$' "$FIXTURE/out" || return 1
   grep -q '^config_sha256=' "$FIXTURE/out" || return 1
   grep -q '^zerofs_writeback_local_bytes_completed_total=1048576$' "$FIXTURE/out" || return 1
   grep -q 'writeback_enabled=true ack_mode=memory' "$FIXTURE/out"
+}
+
+test_status_rejects_stale_deployed_build_receipt() {
+  new_fixture
+  sed -i.bak 's/^binary_sha256=.*/binary_sha256=stale/' "$FIXTURE/build-receipt"
+  if run_pilot status >"$FIXTURE/out" 2>"$FIXTURE/err"; then return 1; fi
+  grep -q 'build receipt binary hash' "$FIXTURE/err"
 }
 
 test_failed_benchmark_cleans_sampler_and_keeps_evidence() {
@@ -279,6 +305,10 @@ test_failed_benchmark_cleans_sampler_and_keeps_evidence() {
   if find "$FIXTURE/tmp" -type f | grep -q .; then return 1; fi
   find "$FIXTURE/results" -name 'storage-*-status.txt' | grep -q . || return 1
   find "$FIXTURE/results" -name 'storage-*-metrics.csv' | grep -q . || return 1
+  result=$(find "$FIXTURE/results" -name 'storage-*.txt' ! -name '*-status.txt' ! -name '*-drain.txt' ! -name '*-fio.txt' | head -1)
+  grep -q '^cleanup_failed=0$' "$result" || return 1
+  grep -q '^harness_exit_status=17$' "$result" || return 1
+  grep -q '^sync -f ' "$FIXTURE/calls.log"
 }
 
 test_successful_benchmark_reports_measured_local_durable_throughput() {
@@ -286,6 +316,7 @@ test_successful_benchmark_reports_measured_local_durable_throughput() {
   FAKE_ADVANCE_LOCAL_DURABLE=1 ZEROFS_BENCH_TOTAL_MIB=4 ZEROFS_BENCH_JOBS=1 run_pilot benchmark >"$FIXTURE/out" 2>"$FIXTURE/err"
   result=$(find "$FIXTURE/results" -name 'storage-*.txt' ! -name '*-status.txt' ! -name '*-drain.txt' ! -name '*-fio.txt' | head -1)
   grep -q 'local_durable_bytes=2097152' "$result" || return 1
+  grep -q 'local_active_ms=[1-9].*local_active_MiBps=' "$result" || return 1
   grep -q 'local_sync_wait_ms=.*local_durable_end_to_end_ms=.*foreground_to_local_durable_MiBps=' "$result" || return 1
   if grep -q 'throughput=not_computable_without_local_durable_byte_counter' "$result"; then return 1; fi
   local line sync_ms end_ms actual_mibps expected_mibps
@@ -296,6 +327,7 @@ test_successful_benchmark_reports_measured_local_durable_throughput() {
   expected_mibps=$(awk -v ms="$end_ms" 'BEGIN { printf "%.2f", 2/(ms/1000) }')
   [[ $end_ms -gt $sync_ms && $actual_mibps == "$expected_mibps" ]] || return 1
   grep -q 'remote_first_drained_end_to_end_ms=' "$result" || return 1
+  grep -q 'remote_active_ms=[1-9].*remote_active_MiBps=' "$result" || return 1
   grep -q 'first_drained_epoch_ms=' "$FIXTURE/results"/storage-*-drain.txt
 }
 
@@ -303,8 +335,8 @@ test_benchmark_reports_buffered_warm_and_direct_reads_separately() {
   new_fixture
   FAKE_ADVANCE_LOCAL_DURABLE=1 ZEROFS_BENCH_TOTAL_MIB=4 ZEROFS_BENCH_JOBS=1 run_pilot benchmark >"$FIXTURE/out" 2>"$FIXTURE/err"
   result=$(find "$FIXTURE/results" -name 'storage-*.txt' ! -name '*-status.txt' ! -name '*-drain.txt' ! -name '*-fio.txt' | head -1)
-  grep -q '^buffered_warm_read_ms=.*buffered_warm_read_MiBps=.*cache=kernel_page_cache' "$result" || return 1
-  grep -q '^direct_read_ms=.*direct_read_MiBps=.*cache=direct_io_bypasses_kernel_page_cache' "$result" || return 1
+  grep -q '^buffered_cached_candidate_read_ms=.*buffered_cached_candidate_read_MiBps=.*cache=guest_page_cache_candidate_not_guaranteed_prewarmed' "$result" || return 1
+  grep -q '^direct_read_ms=.*direct_read_MiBps=.*cache=guest_page_cache_bypass_zerofs_cache_eligible' "$result" || return 1
   [[ $(grep -c '^fio name=' "$FIXTURE/calls.log") == 3 ]] || return 1
   grep -q '^fio name=zerofs_buffered_warm_read rw=read direct=0$' "$FIXTURE/calls.log" || return 1
   grep -q '^fio name=zerofs_direct_read rw=read direct=1$' "$FIXTURE/calls.log" || return 1
@@ -347,6 +379,7 @@ run_test() {
 
 run_test test_global_lock_rejects_overlap
 run_test test_teardown_requires_every_unit_inactive
+run_test test_teardown_uses_nonblocking_stop_before_bounded_polling
 run_test test_teardown_rejects_units_stuck_in_transitional_states
 run_test test_teardown_rejects_inactive_unit_with_a_stale_main_pid
 run_test test_teardown_rejects_inactive_unit_with_a_cgroup_process
@@ -354,6 +387,7 @@ run_test test_teardown_checks_the_exact_mount_target
 run_test test_wait_drain_fails_before_sleep_on_terminal_error
 run_test test_status_rejects_unexpected_ack_mode
 run_test test_status_records_runtime_and_durability_receipt
+run_test test_status_rejects_stale_deployed_build_receipt
 run_test test_failed_benchmark_cleans_sampler_and_keeps_evidence
 run_test test_successful_benchmark_reports_measured_local_durable_throughput
 run_test test_benchmark_reports_buffered_warm_and_direct_reads_separately

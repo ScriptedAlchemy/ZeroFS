@@ -11,6 +11,7 @@ CRATE="$ROOT/zerofs"
 CONFIG=${ZEROFS_PILOT_CONFIG:-/etc/zerofs/nbd-pilot.toml}
 ENV_FILE=${ZEROFS_PILOT_ENV:-/etc/zerofs/nbd-pilot.env}
 BINARY=${ZEROFS_PILOT_BINARY:-/usr/local/bin/zerofs-nbd-pilot}
+BUILD_RECEIPT=${ZEROFS_PILOT_BUILD_RECEIPT:-$BINARY.build-receipt}
 SERVICE=${ZEROFS_PILOT_SERVICE:-zerofs-nbd-pilot.service}
 CLIENT_SERVICE=${ZEROFS_PILOT_CLIENT_SERVICE:-zerofs-nbd-client.service}
 MOUNT_UNIT=${ZEROFS_PILOT_MOUNT_UNIT:-}
@@ -79,7 +80,7 @@ config_value() {
 }
 
 validate_runtime() {
-  local main_pid running_exe cmdline installed_sha running_sha config_sha enabled ack_mode writeback_dir
+  local main_pid running_exe cmdline installed_sha running_sha config_sha enabled ack_mode writeback_dir deployed_commit receipt_sha
   main_pid=$(systemctl show "$SERVICE" -p MainPID --value)
   [[ $main_pid =~ ^[1-9][0-9]*$ ]] || die "$SERVICE has no running MainPID"
   running_exe=$(sudo readlink "$PROC_ROOT/$main_pid/exe")
@@ -97,6 +98,11 @@ validate_runtime() {
   installed_sha=$(sha256sum "$BINARY" | awk '{print $1}')
   running_sha=$(sudo sha256sum "$PROC_ROOT/$main_pid/exe" | awk '{print $1}')
   [[ $running_sha == "$installed_sha" ]] || die "running binary does not match installed binary"
+  [[ -f $BUILD_RECEIPT ]] || die "deployed build receipt is missing: $BUILD_RECEIPT"
+  deployed_commit=$(sudo awk -F= '$1 == "commit" { print $2; exit }' "$BUILD_RECEIPT")
+  receipt_sha=$(sudo awk -F= '$1 == "binary_sha256" { print $2; exit }' "$BUILD_RECEIPT")
+  [[ -n $deployed_commit ]] || die "deployed build receipt has no commit"
+  [[ $receipt_sha == "$running_sha" ]] || die "build receipt binary hash does not match running binary"
   config_sha=$(sudo sha256sum "$CONFIG" | awk '{print $1}')
 
   enabled=$(config_value writeback enabled)
@@ -107,6 +113,7 @@ validate_runtime() {
   [[ $writeback_dir == /* ]] || die "[writeback] dir must be an absolute path"
 
   printf 'running_binary_sha256=%s\n' "$running_sha"
+  printf 'deployed_commit=%s\n' "$deployed_commit"
   printf 'config_sha256=%s\n' "$config_sha"
   printf 'writeback_enabled=%s ack_mode=%s writeback_dir=%s\n' "$enabled" "$ack_mode" "$writeback_dir"
 }
@@ -201,9 +208,9 @@ teardown() {
   require_vm100
   [[ $STOP_TIMEOUT =~ ^[1-9][0-9]*$ ]] || die "ZEROFS_PILOT_STOP_TIMEOUT must be positive"
   log "stopping mount, NBD client, and ZeroFS daemon"
-  sudo systemctl stop "$MOUNT_UNIT" || true
-  sudo systemctl stop "$CLIENT_SERVICE" || true
-  sudo systemctl stop "$SERVICE" || true
+  sudo systemctl stop --no-block "$MOUNT_UNIT" || true
+  sudo systemctl stop --no-block "$CLIENT_SERVICE" || true
+  sudo systemctl stop --no-block "$SERVICE" || true
   local unit
   for unit in "$MOUNT_UNIT" "$CLIENT_SERVICE" "$SERVICE"; do
     wait_stopped "$unit" "$STOP_TIMEOUT" || die "$unit did not reach a terminal stopped state within ${STOP_TIMEOUT}s"
@@ -248,11 +255,16 @@ build_deploy() {
   [[ -n $CARGO_CMD && -x $CARGO_CMD ]] || die "cargo was not found; set ZEROFS_PILOT_CARGO"
   log "building locked release at $(git -C "$ROOT" rev-parse --short HEAD)"
   (cd "$CRATE" && "$CARGO_CMD" build --release --locked)
-  local built_sha
+  local built_sha deployed_commit receipt_tmp
   built_sha=$(sha256sum "$CRATE/target/release/zerofs" | awk '{print $1}')
+  deployed_commit=$(git -C "$ROOT" rev-parse HEAD)
   teardown
   sudo install -m 0755 "$CRATE/target/release/zerofs" "$BINARY"
   [[ $(sha256sum "$BINARY" | awk '{print $1}') == "$built_sha" ]] || die "installed binary hash mismatch"
+  receipt_tmp=$(mktemp "$TMP_DIR/zerofs-build-receipt.XXXXXX")
+  printf 'commit=%s\nbinary_sha256=%s\n' "$deployed_commit" "$built_sha" >"$receipt_tmp"
+  sudo install -o root -g root -m 0644 "$receipt_tmp" "$BUILD_RECEIPT"
+  rm -f "$receipt_tmp"
   printf 'installed_binary_sha256=%s\n' "$built_sha"
 }
 
@@ -283,22 +295,44 @@ setup() {
 
 sample_metrics() {
   local output=$1 stop_file=$2
-  printf 'timestamp_ms,accepted,local,remote,dirty_ram,dirty_ssd,local_bytes,remote_bytes\n' >"$output"
   while [[ ! -e $stop_file ]]; do
     local snapshot now
     snapshot=$(metrics_snapshot) || { sleep .25; continue; }
     now=$(date +%s%3N)
-    printf '%s,%s,%s,%s,%s,%s,%s,%s\n' \
-      "$now" \
-      "$(metric_from zerofs_writeback_accepted_sequence "$snapshot")" \
-      "$(metric_from zerofs_writeback_local_sequence "$snapshot")" \
-      "$(metric_from zerofs_writeback_remote_sequence "$snapshot")" \
-      "$(metric_from zerofs_writeback_dirty_ram_bytes "$snapshot")" \
-      "$(metric_from zerofs_writeback_dirty_ssd_bytes "$snapshot")" \
-      "$(metric_from zerofs_writeback_local_bytes_completed_total "$snapshot")" \
-      "$(metric_from zerofs_writeback_remote_bytes_completed_total "$snapshot")" >>"$output"
+    append_metric_sample "$output" "$now" "$snapshot"
     sleep .25
   done
+}
+
+append_metric_sample() {
+  local output=$1 now=$2 snapshot=$3
+  printf '%s,%s,%s,%s,%s,%s,%s,%s\n' \
+    "$now" \
+    "$(metric_from zerofs_writeback_accepted_sequence "$snapshot")" \
+    "$(metric_from zerofs_writeback_local_sequence "$snapshot")" \
+    "$(metric_from zerofs_writeback_remote_sequence "$snapshot")" \
+    "$(metric_from zerofs_writeback_dirty_ram_bytes "$snapshot")" \
+    "$(metric_from zerofs_writeback_dirty_ssd_bytes "$snapshot")" \
+    "$(metric_from zerofs_writeback_local_bytes_completed_total "$snapshot")" \
+    "$(metric_from zerofs_writeback_remote_bytes_completed_total "$snapshot")" >>"$output"
+}
+
+active_interval_ms() {
+  local sample=$1 column=$2 base=$3 final=$4
+  awk -F, -v column="$column" -v base="$base" -v final="$final" '
+    NR == 1 { next }
+    {
+      timestamp = $1; value = $column
+      if (!started && value > base) {
+        start = have_previous ? previous_timestamp : timestamp
+        started = 1
+      }
+      if (started && value >= final) { print timestamp - start; exit }
+      previous_timestamp = timestamp
+      have_previous = 1
+    }
+    END { if (!started || value < final) print 0 }
+  ' "$sample"
 }
 
 BENCH_SAMPLER=
@@ -307,7 +341,7 @@ BENCH_PREFIX=
 BENCH_RESULT=
 
 cleanup_benchmark() {
-  local exit_status=$?
+  local exit_status=$? cleanup_failed=0
   trap - EXIT INT TERM
   if [[ -n ${BENCH_STOP_FILE:-} ]]; then
     touch "$BENCH_STOP_FILE" 2>/dev/null || true
@@ -315,14 +349,29 @@ cleanup_benchmark() {
   if [[ -n ${BENCH_SAMPLER:-} ]]; then
     wait "$BENCH_SAMPLER" 2>/dev/null || true
   fi
-  if [[ -n ${BENCH_PREFIX:-} ]]; then
-    sudo rm -f "$MOUNTPOINT/$BENCH_PREFIX".* 2>/dev/null || true
-  fi
+  cleanup_benchmark_files || cleanup_failed=1
   [[ -z ${BENCH_STOP_FILE:-} ]] || rm -f "$BENCH_STOP_FILE"
   if [[ -n ${BENCH_RESULT:-} ]]; then
     printf 'harness_exit_status=%s\n' "$exit_status" >>"$BENCH_RESULT"
+    printf 'cleanup_failed=%s\n' "$cleanup_failed" >>"$BENCH_RESULT"
   fi
+  (( exit_status != 0 )) && exit "$exit_status"
+  (( cleanup_failed == 0 )) || exit 1
   exit "$exit_status"
+}
+
+cleanup_benchmark_files() {
+  [[ -n ${BENCH_PREFIX:-} ]] || return 0
+  local failed=0
+  sudo rm -f "$MOUNTPOINT/$BENCH_PREFIX".* 2>/dev/null || failed=1
+  sudo sync -f "$MOUNTPOINT" || failed=1
+  if [[ $(systemctl is-active "$SERVICE" 2>/dev/null || true) == active ]]; then
+    wait_drain "$DRAIN_TIMEOUT" >/dev/null || failed=1
+  fi
+  if find "$MOUNTPOINT" -maxdepth 1 -name "$BENCH_PREFIX.*" -print -quit | grep -q .; then
+    failed=1
+  fi
+  (( failed == 0 ))
 }
 
 benchmark() {
@@ -354,13 +403,15 @@ benchmark() {
   trap cleanup_benchmark EXIT
   trap 'exit 130' INT
   trap 'exit 143' TERM
-  sample_metrics "$sample" "$stop_file" &
-  local sampler=$!
-  BENCH_SAMPLER=$sampler
   local snapshot local_bytes0 local_bytes1 remote_bytes0 remote_bytes1 t0 t1 t2 t3 t4 t5 t6 t7
   snapshot=$(metrics_snapshot)
   local_bytes0=$(metric_from zerofs_writeback_local_bytes_completed_total "$snapshot")
   remote_bytes0=$(metric_from zerofs_writeback_remote_bytes_completed_total "$snapshot")
+  printf 'timestamp_ms,accepted,local,remote,dirty_ram,dirty_ssd,local_bytes,remote_bytes\n' >"$sample"
+  append_metric_sample "$sample" "$(date +%s%3N)" "$snapshot"
+  sample_metrics "$sample" "$stop_file" &
+  local sampler=$!
+  BENCH_SAMPLER=$sampler
   t0=$(date +%s%3N)
   sudo fio --name=zerofs_user_write --directory="$MOUNTPOINT" \
     "--filename_format=$prefix.\$jobnum" --rw=write --bs=1M \
@@ -376,6 +427,7 @@ benchmark() {
   t3=$(date +%s%3N)
   snapshot=$(metrics_snapshot)
   remote_bytes1=$(metric_from zerofs_writeback_remote_bytes_completed_total "$snapshot")
+  append_metric_sample "$sample" "$(date +%s%3N)" "$snapshot"
   touch "$stop_file"
   BENCH_SAMPLER=
   wait "$sampler"
@@ -395,27 +447,33 @@ benchmark() {
   local buffered_read_ms=$((t5 - t4)) direct_read_ms=$((t7 - t6))
   local logical_bytes=$((total_mib * 1024 * 1024))
   local local_durable_bytes=$((local_bytes1 - local_bytes0)) remote_bytes=$((remote_bytes1 - remote_bytes0))
-  local user_mibps buffered_read_mibps direct_read_mibps local_durable_mibps remote_wall_mibps remote_active first_drained_epoch_ms first_drained_ms
+  local user_mibps buffered_read_mibps direct_read_mibps local_durable_mibps local_active local_active_mibps remote_wall_mibps remote_active first_drained_epoch_ms first_drained_ms
   user_mibps=$(awk -v b="$logical_bytes" -v ms="$user_ms" 'BEGIN { printf "%.2f", b/1048576/(ms/1000) }')
   buffered_read_mibps=$(awk -v b="$logical_bytes" -v ms="$buffered_read_ms" 'BEGIN { printf "%.2f", b/1048576/(ms/1000) }')
   direct_read_mibps=$(awk -v b="$logical_bytes" -v ms="$direct_read_ms" 'BEGIN { printf "%.2f", b/1048576/(ms/1000) }')
   local_durable_mibps=$(awk -v b="$local_durable_bytes" -v ms="$((t2 - t0))" 'BEGIN { if (ms>0) printf "%.2f", b/1048576/(ms/1000); else print "0.00" }')
+  local_active=$(active_interval_ms "$sample" 7 "$local_bytes0" "$local_bytes1")
+  local_active_mibps=$(awk -v b="$local_durable_bytes" -v ms="$local_active" 'BEGIN { if (ms>0) printf "%.2f", b/1048576/(ms/1000); else print "0.00" }')
   remote_wall_mibps=$(awk -v b="$remote_bytes" -v ms="$end_ms" 'BEGIN { printf "%.2f", b/1048576/(ms/1000) }')
   first_drained_epoch_ms=$(awk '{ for (i=1; i<=NF; i++) if ($i ~ /^first_drained_epoch_ms=/) { sub(/^[^=]*=/, "", $i); print $i; exit } }' "$drain_output")
   first_drained_ms=$((first_drained_epoch_ms - t0))
-  remote_active=$(awk -F, 'NR==2 { base=$8; prev=$8 } NR>2 && $8>prev { if (!first) first=$1; last=$1; prev=$8 } END { if (first && last>first) print last-first; else print 0 }' "$sample")
+  remote_active=$(active_interval_ms "$sample" 8 "$remote_bytes0" "$remote_bytes1")
   local remote_active_mibps
   remote_active_mibps=$(awk -v b="$remote_bytes" -v ms="$remote_active" 'BEGIN { if (ms>0) printf "%.2f", b/1048576/(ms/1000); else print "0.00" }')
   {
-    printf 'commit=%s\n' "$(git -C "$ROOT" rev-parse HEAD)"
+    printf 'checkout_commit=%s\n' "$(git -C "$ROOT" rev-parse HEAD)"
+    printf 'deployed_commit=%s\n' "$(awk -F= '$1 == "deployed_commit" { print $2; exit }' "$status_output")"
+    printf 'running_binary_sha256=%s\n' "$(awk -F= '$1 == "running_binary_sha256" { print $2; exit }' "$status_output")"
     printf 'logical_bytes=%s remote_bytes=%s\n' "$logical_bytes" "$remote_bytes"
     printf 'user_experienced_ms=%s user_experienced_MiBps=%s durability=volatile_page_cache_and_memory_ack\n' "$user_ms" "$user_mibps"
-    printf 'buffered_warm_read_ms=%s buffered_warm_read_MiBps=%s cache=kernel_page_cache dataset=just_written_no_global_cache_drop\n' \
+    printf 'buffered_cached_candidate_read_ms=%s buffered_cached_candidate_read_MiBps=%s cache=guest_page_cache_candidate_not_guaranteed_prewarmed dataset=same_files_after_remote_drain_no_global_cache_drop\n' \
       "$buffered_read_ms" "$buffered_read_mibps"
-    printf 'direct_read_ms=%s direct_read_MiBps=%s cache=direct_io_bypasses_kernel_page_cache dataset=same_files_after_remote_drain\n' \
+    printf 'direct_read_ms=%s direct_read_MiBps=%s cache=guest_page_cache_bypass_zerofs_cache_eligible dataset=same_files_after_remote_drain\n' \
       "$direct_read_ms" "$direct_read_mibps"
     printf 'local_durable_bytes=%s local_sync_wait_ms=%s local_durable_end_to_end_ms=%s foreground_to_local_durable_MiBps=%s durability=zerofs_ssd_journal\n' \
       "$local_durable_bytes" "$local_ms" "$((t2 - t0))" "$local_durable_mibps"
+    printf 'local_active_ms=%s local_active_MiBps=%s interval=sample_before_first_increment_through_final_count\n' \
+      "$local_active" "$local_active_mibps"
     printf 'remote_first_drained_end_to_end_ms=%s remote_stable_end_to_end_ms=%s remote_wall_MiBps=%s remote_active_ms=%s remote_active_MiBps=%s durability=storage_box_sftp_ack\n' \
       "$first_drained_ms" "$end_ms" "$remote_wall_mibps" "$remote_active" "$remote_active_mibps"
     grep -E 'WRITE:|write: IOPS' "$write_fio_output" | tail -n 3
@@ -424,9 +482,7 @@ benchmark() {
     printf 'status_receipt=%s metric_samples=%s write_fio_output=%s buffered_warm_read_fio_output=%s direct_read_fio_output=%s drain_receipt=%s\n' \
       "$status_output" "$sample" "$write_fio_output" "$buffered_read_fio_output" "$direct_read_fio_output" "$drain_output"
   } | tee "$result"
-  sudo rm -f "$MOUNTPOINT/$prefix".*
-  sudo sync -f "$MOUNTPOINT"
-  wait_drain "$DRAIN_TIMEOUT" >/dev/null
+  cleanup_benchmark_files
   rm -f "$stop_file"
   BENCH_STOP_FILE=
   BENCH_PREFIX=
