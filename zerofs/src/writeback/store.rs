@@ -446,34 +446,55 @@ impl WritebackObjectStore {
         mode: MutationMode,
         rename: bool,
     ) -> object_store::Result<()> {
-        let key_guards = self.lock_pair(&from, &to).await;
-        let target_visible = self.inner.overlay.visible_version(&to).await?;
-        if mode == MutationMode::Create && target_visible.is_some() {
-            return Err(object_store::Error::AlreadyExists {
-                path: to.to_string(),
-                source: "overlay-visible copy target already exists".into(),
-            });
-        }
-        let source_meta = self.inner.overlay.head(&from).await?;
         if from == to {
+            let key_guards = self.lock_pair(&from, &to).await;
+            let target_visible = self.inner.overlay.visible_version(&to).await?;
+            if mode == MutationMode::Create && target_visible.is_some() {
+                return Err(object_store::Error::AlreadyExists {
+                    path: to.to_string(),
+                    source: "overlay-visible copy target already exists".into(),
+                });
+            }
+            self.inner.overlay.head(&from).await?;
+            drop(key_guards);
             return Ok(());
         }
-        let bytes_len = source_meta.size;
-        let ram = self
-            .inner
-            .admission
-            .reserve(bytes_len)
-            .await
-            .map_err(|error| generic_error(format!("dirty RAM admission failed: {error}")))?
-            .accept();
-        let available = fs4::available_space(&self.inner.settings.dir)
-            .map_err(|error| generic_error(format!("failed to inspect writeback SSD: {error}")))?;
-        let disk = self
-            .inner
-            .disk
-            .reserve(bytes_len, available)
-            .await
-            .map_err(|error| generic_error(format!("dirty SSD admission failed: {error}")))?;
+
+        let (key_guards, bytes_len, ram, disk) = loop {
+            let expected_len = self.inner.overlay.head(&from).await?.size;
+            let ram = self
+                .inner
+                .admission
+                .reserve(expected_len)
+                .await
+                .map_err(|error| generic_error(format!("dirty RAM admission failed: {error}")))?
+                .accept();
+            let available = fs4::available_space(&self.inner.settings.dir).map_err(|error| {
+                generic_error(format!("failed to inspect writeback SSD: {error}"))
+            })?;
+            let disk = self
+                .inner
+                .disk
+                .reserve(expected_len, available)
+                .await
+                .map_err(|error| generic_error(format!("dirty SSD admission failed: {error}")))?;
+
+            let key_guards = self.lock_pair(&from, &to).await;
+            let target_visible = self.inner.overlay.visible_version(&to).await?;
+            if mode == MutationMode::Create && target_visible.is_some() {
+                return Err(object_store::Error::AlreadyExists {
+                    path: to.to_string(),
+                    source: "overlay-visible copy target already exists".into(),
+                });
+            }
+            let actual_len = self.inner.overlay.head(&from).await?.size;
+            if actual_len == expected_len {
+                break (key_guards, actual_len, ram, disk);
+            }
+            drop(key_guards);
+            drop(ram);
+            drop(disk);
+        };
         let bytes = self.inner.overlay.get(&from).await?.bytes().await?;
         if bytes.len() as u64 != bytes_len {
             return Err(generic_error(
@@ -2258,6 +2279,79 @@ mod tests {
         .await
         .expect("owned copy did not finish after caller cancellation");
         assert_eq!(payload, Bytes::from_static(b"payload"));
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn copy_does_not_hold_key_locks_while_waiting_for_admission() {
+        let (store, remote, _temp) = test_store().await;
+        let source = Path::from("copy-admission-source");
+        let target = Path::from("copy-admission-target");
+        let payload = Bytes::from(vec![0x5a; 1_000_000]);
+        remote.put(&source, payload.clone().into()).await.unwrap();
+
+        let ram = store
+            .inner
+            .admission
+            .reserve(payload.len() as u64)
+            .await
+            .unwrap()
+            .accept();
+        let available = fs4::available_space(&store.inner.settings.dir).unwrap();
+        let disk = store
+            .inner
+            .disk
+            .reserve(payload.len() as u64, available)
+            .await
+            .unwrap();
+        let target_blocker = store.key_lock(&target).lock_owned().await;
+
+        let copy = tokio::spawn({
+            let store = store.clone();
+            let source = source.clone();
+            let target = target.clone();
+            async move {
+                store
+                    .copy_opts(
+                        &source,
+                        &target,
+                        CopyOptions {
+                            mode: CopyMode::Create,
+                            ..CopyOptions::default()
+                        },
+                    )
+                    .await
+            }
+        });
+        tokio::task::yield_now().await;
+
+        let put = tokio::spawn({
+            let store = store.clone();
+            let target = target.clone();
+            let payload = payload.clone();
+            async move {
+                store
+                    .owned_put(target, payload, PutOptions::default(), ram, disk)
+                    .await
+            }
+        });
+        tokio::task::yield_now().await;
+        drop(target_blocker);
+
+        let (put_result, copy_result) = tokio::time::timeout(Duration::from_secs(2), async {
+            (put.await.unwrap(), copy.await.unwrap())
+        })
+        .await
+        .expect("copy held its key locks while admission was owned by a waiting put");
+        put_result.unwrap();
+        assert!(matches!(
+            copy_result,
+            Err(object_store::Error::AlreadyExists { .. })
+        ));
+        assert_eq!(
+            store.get(&target).await.unwrap().bytes().await.unwrap(),
+            payload
+        );
         store.shutdown().await.unwrap();
     }
 
