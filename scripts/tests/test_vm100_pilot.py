@@ -251,7 +251,12 @@ class CoreTests(unittest.TestCase):
         )
         parent.write_text(
             "import subprocess, sys\n"
-            "child = subprocess.Popen([sys.executable, sys.argv[1], sys.argv[2]])\n"
+            "child = subprocess.Popen(\n"
+            "    [sys.executable, sys.argv[1], sys.argv[2]],\n"
+            "    stdout=subprocess.PIPE, text=True,\n"
+            ")\n"
+            "assert child.stdout is not None\n"
+            "assert child.stdout.readline().strip() == 'ready'\n"
             "print('ready', flush=True)\n"
             "raise SystemExit(child.wait())\n",
             encoding="utf-8",
