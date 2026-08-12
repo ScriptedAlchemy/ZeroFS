@@ -16,7 +16,7 @@ import tomllib
 import unittest
 from unittest import mock
 from contextlib import contextmanager, redirect_stdout
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from subprocess import CompletedProcess
 from typing import Any, Mapping, Sequence
@@ -24,9 +24,13 @@ from typing import Any, Mapping, Sequence
 from scripts.vm100_pilot.config import PilotConfig
 from scripts.vm100_pilot.benchmark import (
     BenchmarkResult,
+    BenchmarkCleanupError,
     BenchmarkRunner,
+    DirectWriteTiers,
     FioResult,
+    _MetricSampler,
     _active_windows,
+    _counter_delta,
     _monotonic_ms,
     _validate_fio_bytes,
     calculate_tiers,
@@ -1409,6 +1413,10 @@ class BenchmarkTests(unittest.TestCase):
                 phase="foreground write",
             )
 
+    def test_benchmark_rejects_completed_byte_counter_regressions(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "counter regressed"):
+            _counter_delta(9, 10, "remote encoded bytes")
+
     def test_direct_read_pair_warms_zerofs_then_measures_the_hot_path(self) -> None:
         calls: list[tuple[str, bool | None]] = []
 
@@ -1440,12 +1448,400 @@ class BenchmarkTests(unittest.TestCase):
             ],
         )
 
+    def test_odirect_write_uses_distinct_destructive_filenames(self) -> None:
+        output = Path(self.temp.name) / "direct-write.json"
+
+        class FioRunner(FakeRunner):
+            def run(
+                self, argv: Sequence[str | Path], **kwargs: Any
+            ) -> CompletedProcess[str]:
+                args = tuple(str(value) for value in argv)
+                if args[0] == "fio":
+                    self.calls.append((args, bool(kwargs.get("sudo", False))))
+                    output.write_text(
+                        json.dumps(
+                            {
+                                "jobs": [
+                                    {
+                                        "write": {
+                                            "io_bytes": 4 << 20,
+                                            "runtime": 2,
+                                        }
+                                    }
+                                ]
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                    return CompletedProcess(args, 0, "", "")
+                return super().run(argv, **kwargs)
+
+        runner = FioRunner()
+        benchmark = BenchmarkRunner(
+            self.config,
+            runner,
+            self.lifecycle,  # type: ignore[arg-type]
+        )
+        result = benchmark._run_fio(
+            name="zerofs_nbd_odirect_write",
+            run_root=self.config.mountpoint / ".zerofs-bench-test",
+            filename_format="odirect-write.$jobnum",
+            per_job_mib=4,
+            jobs=1,
+            output=output,
+            read=False,
+            direct=True,
+        )
+
+        fio = next(call[0] for call in runner.calls if call[0][0] == "fio")
+        self.assertIn("--filename_format=odirect-write.$jobnum", fio)
+        self.assertIn("--direct=1", fio)
+        self.assertEqual(result.bytes, 4 << 20)
+
+    def test_odirect_write_captures_accepted_local_and_remote_barriers(self) -> None:
+        events: list[str] = []
+        before = replace(self.snapshot, accepted=9, local=9, remote=9)
+        accepted = replace(
+            before,
+            accepted=10,
+            dirty_ram=4 << 20,
+            local_bytes=1 << 20,
+            remote_bytes=1 << 20,
+        )
+        local = replace(
+            accepted,
+            local=10,
+            dirty_ram=0,
+            dirty_ssd_reserved=4 << 20,
+            local_bytes=5 << 20,
+        )
+        remote = replace(
+            local,
+            remote=10,
+            dirty_ssd_reserved=0,
+            remote_bytes=5 << 20,
+        )
+
+        class SequenceMetrics:
+            def __init__(self) -> None:
+                self.snapshots = iter((before, accepted, local))
+
+            def snapshot(self) -> WritebackSnapshot:
+                snapshot = next(self.snapshots)
+                events.append(
+                    f"snapshot:{snapshot.accepted}:{snapshot.local}:{snapshot.remote}"
+                )
+                return snapshot
+
+        class RecordingLifecycle(_HealthyLifecycle):
+            def drain(self, timeout: int | None = None) -> object:
+                events.append("stable_drain")
+                return super().drain(timeout)
+
+        class RecordingRunner(FakeRunner):
+            def run(
+                self, argv: Sequence[str | Path], **kwargs: Any
+            ) -> CompletedProcess[str]:
+                if tuple(str(value) for value in argv)[:2] == ("sync", "-f"):
+                    events.append("syncfs")
+                return super().run(argv, **kwargs)
+
+        class RemoteSampler:
+            def wait_for_remote(
+                self, target_sequence: int, timeout: float
+            ) -> tuple[WritebackSnapshot, int]:
+                self_target = target_sequence
+                self_timeout = timeout
+                events.append(f"sampled_remote:{self_target}:{self_timeout}")
+                return remote, 500
+
+        lifecycle = RecordingLifecycle(before, self.config)
+        lifecycle.metrics = SequenceMetrics()  # type: ignore[assignment]
+        runner = RecordingRunner()
+        calls: list[dict[str, object]] = []
+
+        class RecordingBenchmark(BenchmarkRunner):
+            def _run_fio(self, *args: object, **kwargs: Any) -> FioResult:
+                events.append("fio")
+                calls.append(kwargs)
+                return FioResult(bytes=4 << 20, runtime_ms=2, mibps=2048.0)
+
+            def _system_io(self, device: tuple[int, int]) -> SystemIoSnapshot:
+                return SystemIoSnapshot("sda1", 0, 0, 0, 0, 0, 0, 0)
+
+        benchmark = RecordingBenchmark(
+            replace(self.config, drain_timeout=1),
+            runner,
+            lifecycle,  # type: ignore[arg-type]
+        )
+        with mock.patch(
+            "scripts.vm100_pilot.benchmark.time.monotonic_ns",
+            side_effect=(100, 200, 300, 400),
+        ):
+            phase = benchmark._run_direct_write_tiers(
+                run_root=self.config.mountpoint / ".zerofs-bench-test",
+                per_job_mib=4,
+                jobs=1,
+                expected_bytes=4 << 20,
+                output=Path(self.temp.name) / "direct-write.json",
+                phase_device=(8, 1),
+                sampler=RemoteSampler(),  # type: ignore[arg-type]
+            )
+
+        self.assertEqual(calls[0]["direct"], True)
+        self.assertEqual(calls[0]["filename_format"], "odirect-write.$jobnum")
+        self.assertEqual(phase.before.accepted, 9)
+        self.assertEqual(phase.accepted.accepted, 10)
+        self.assertEqual(phase.local.local, 10)
+        self.assertEqual(phase.remote.remote, 10)
+        self.assertEqual(
+            (
+                phase.write_start_ns,
+                phase.write_end_ns,
+                phase.local_sync_start_ns,
+                phase.local_end_ns,
+                phase.remote_end_ns,
+            ),
+            (100, 200, 300, 400, 500),
+        )
+        self.assertEqual(
+            phase.phase_windows(),
+            {
+                "zerofs_nbd_odirect_write_service_ack": {
+                    "start_ns": 100,
+                    "end_ns": 200,
+                },
+                "zerofs_nbd_odirect_local_durability_tail": {
+                    "start_ns": 300,
+                    "end_ns": 400,
+                },
+                "zerofs_nbd_odirect_local_durability_end_to_end": {
+                    "start_ns": 100,
+                    "end_ns": 400,
+                },
+                "zerofs_nbd_odirect_remote_durability_tail": {
+                    "start_ns": 400,
+                    "end_ns": 500,
+                },
+                "zerofs_nbd_odirect_remote_durability_end_to_end": {
+                    "start_ns": 100,
+                    "end_ns": 500,
+                },
+            },
+        )
+        self.assertEqual(
+            phase.barrier_receipt(),
+            {
+                "before_sequence": 9,
+                "accepted_sequence": 10,
+                "local_sequence": 10,
+                "remote_sequence": 10,
+                "fio_bytes": 4 << 20,
+                "fio_runtime_ms": 2,
+                "local_completed_bytes": 4 << 20,
+                "remote_completed_bytes": 4 << 20,
+            },
+        )
+        self.assertEqual(
+            events,
+            [
+                "stable_drain",
+                "syncfs",
+                "snapshot:9:9:9",
+                "fio",
+                "snapshot:10:9:9",
+                "syncfs",
+                "snapshot:10:10:9",
+                "sampled_remote:10:1",
+                "stable_drain",
+            ],
+        )
+        self.assertEqual(lifecycle.drain_calls, 2)
+
+    def test_odirect_remote_first_crossing_before_local_has_no_fake_tail(self) -> None:
+        snapshot = self.snapshot
+        phase = DirectWriteTiers(
+            write=FioResult(bytes=4 << 20, runtime_ms=2, mibps=2048.0),
+            before=snapshot,
+            accepted=replace(snapshot, accepted=10),
+            local=replace(snapshot, accepted=10, local=10),
+            remote=replace(snapshot, accepted=10, local=10, remote=10),
+            write_start_ns=100,
+            write_end_ns=200,
+            local_sync_start_ns=250,
+            local_end_ns=500,
+            remote_end_ns=400,
+            io_before=SystemIoSnapshot("sda1", 0, 0, 0, 0, 0, 0, 0),
+            write_io_after=SystemIoSnapshot("sda1", 0, 0, 0, 0, 0, 0, 0),
+            local_io_after=SystemIoSnapshot("sda1", 0, 0, 0, 0, 0, 0, 0),
+            remote_io_after=SystemIoSnapshot("sda1", 0, 0, 0, 0, 0, 0, 0),
+        )
+
+        windows = phase.phase_windows()
+
+        self.assertEqual(phase.remote_end_ns, 400)
+        self.assertNotIn("zerofs_nbd_odirect_remote_durability_tail", windows)
+        self.assertEqual(
+            windows["zerofs_nbd_odirect_remote_durability_end_to_end"],
+            {"start_ns": 100, "end_ns": 400},
+        )
+        self.assertEqual(phase.remote_tail_ms(), 0)
+
+    def test_benchmark_receipt_keeps_odirect_write_tiers_separate(self) -> None:
+        zero_io = SystemIoSnapshot("sda1", 0, 0, 0, 0, 0, 0, 0)
+        primary_accepted = replace(self.snapshot, accepted=10)
+        primary_local = replace(primary_accepted, local=10, local_bytes=5 << 20)
+        direct_before = replace(primary_local, remote=10, remote_bytes=5 << 20)
+        direct_accepted = replace(direct_before, accepted=11, dirty_ram=4 << 20)
+        direct_local = replace(
+            direct_accepted,
+            local=11,
+            dirty_ram=0,
+            dirty_ssd_reserved=4 << 20,
+            local_bytes=9 << 20,
+        )
+        direct_remote = replace(
+            direct_local,
+            remote=11,
+            dirty_ssd_reserved=0,
+            remote_bytes=9 << 20,
+        )
+        direct = DirectWriteTiers(
+            write=FioResult(bytes=4 << 20, runtime_ms=4, mibps=1000.0),
+            before=direct_before,
+            accepted=direct_accepted,
+            local=direct_local,
+            remote=direct_remote,
+            write_start_ns=100,
+            write_end_ns=200,
+            local_sync_start_ns=300,
+            local_end_ns=500,
+            remote_end_ns=900,
+            io_before=zero_io,
+            write_io_after=zero_io,
+            local_io_after=zero_io,
+            remote_io_after=zero_io,
+        )
+        direct_calls = 0
+        scratch_root = Path(self.temp.name) / "benchmark-tmpfs"
+        scratch_root.mkdir()
+        fio_outputs: list[Path] = []
+
+        class ReceiptBenchmark(BenchmarkRunner):
+            def _wait_clean_gc(
+                self, *, maintenance_isolated: bool
+            ) -> WritebackSnapshot:
+                return self.lifecycle.metrics.snapshot()
+
+            def _local_device(self) -> tuple[int, int]:
+                return (8, 1)
+
+            def _system_io(self, device: tuple[int, int]) -> SystemIoSnapshot:
+                return zero_io
+
+            def _nbd_io(self) -> BlockIoSnapshot:
+                return BlockIoSnapshot("nbd0", 0, 0, 0)
+
+            def _run_fio(self, *args: object, **kwargs: Any) -> FioResult:
+                output = Path(kwargs["output"])
+                fio_outputs.append(output)
+                output.write_text("{}", encoding="utf-8")
+                return FioResult(bytes=4 << 20, runtime_ms=1, mibps=4096.0)
+
+            def _run_direct_write_tiers(self, **kwargs: Any) -> DirectWriteTiers:
+                nonlocal direct_calls
+                direct_calls += 1
+                output = Path(kwargs["output"])
+                fio_outputs.append(output)
+                output.write_text("{}", encoding="utf-8")
+                return direct
+
+            def _benchmark_tmpfs_root(self) -> Path:
+                return scratch_root
+
+        class FakeSampler:
+            def __init__(
+                self,
+                lifecycle: object,
+                output: Path,
+                system_io_output: Path,
+                local_device: tuple[int, int],
+            ) -> None:
+                self.output = output
+                self.system_io_output = system_io_output
+                self.system_io = [zero_io, zero_io]
+
+            def start(self) -> None:
+                self.output.write_text(
+                    "timestamp_ms,accepted,local,remote,dirty_ram,dirty_ssd_reserved,"
+                    "local_bytes,remote_bytes,terminal,gc_active,gc_passes,"
+                    "gc_batches,gc_deleted_bytes\n"
+                    "100,9,9,9,0,0,1048576,1048576,False,False,1,0,0\n"
+                    "200,10,10,10,0,0,5242880,5242880,False,False,1,0,0\n",
+                    encoding="utf-8",
+                )
+                self.system_io_output.write_text("unused\n", encoding="utf-8")
+
+            def stop(self) -> None:
+                return None
+
+        benchmark = ReceiptBenchmark(
+            self.config,
+            self.runner,
+            self.lifecycle,  # type: ignore[arg-type]
+        )
+        with (
+            mock.patch(
+                "scripts.vm100_pilot.benchmark._MetricSampler", FakeSampler
+            ),
+            mock.patch(
+                "scripts.vm100_pilot.benchmark.wait_for_accepted_after",
+                return_value=primary_accepted,
+            ),
+            mock.patch(
+                "scripts.vm100_pilot.benchmark.wait_for_local",
+                return_value=primary_local,
+            ),
+        ):
+            result = benchmark.run(total_mib=4, jobs=1)
+
+        manifest = json.loads(
+            (Path(result.receipt_dir) / "manifest.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(direct_calls, 1)
+        self.assertEqual(len(fio_outputs), 6)
+        self.assertTrue(
+            all(path.parent.parent == scratch_root for path in fio_outputs)
+        )
+        self.assertTrue(
+            all(not path.exists() for path in fio_outputs),
+            "tmpfs benchmark artifacts must be removed after persistence",
+        )
+        self.assertTrue((Path(result.receipt_dir) / "direct-write-fio.json").is_file())
+        self.assertEqual(result.zerofs_nbd_odirect_write_bytes, 4 << 20)
+        self.assertEqual(result.zerofs_nbd_odirect_write_service_ack_mibps, 1000.0)
+        self.assertEqual(
+            result.zerofs_nbd_odirect_local_durability_end_to_end_ms, 1
+        )
+        self.assertEqual(
+            manifest["zerofs_nbd_odirect_write_barriers"]["accepted_sequence"],
+            11,
+        )
+        self.assertIn(
+            "zerofs_nbd_odirect_write_service_ack",
+            manifest["phase_monotonic_ns"],
+        )
+        self.assertIn(
+            "zerofs_nbd_odirect_remote_durability_tail",
+            manifest["phase_system_io"],
+        )
+
     def test_local_rate_uses_completed_payload_and_full_interval(self) -> None:
         result = calculate_tiers(
             logical_bytes=1 << 30,
             local_bytes=1 << 30,
             remote_bytes=1 << 30,
-            foreground_ms=1000,
+            user_buffered_page_cache_write_ms=1000,
             local_end_to_end_ms=4000,
             remote_end_to_end_ms=10000,
             local_active_ms=1000,
@@ -1453,12 +1849,57 @@ class BenchmarkTests(unittest.TestCase):
             page_cache_hot_read_ms=2000,
             zerofs_direct_read_ms=500,
         )
-        self.assertEqual(result.foreground_mibps, 1024.0)
+        self.assertEqual(result.user_buffered_page_cache_write_mibps, 1024.0)
         self.assertEqual(result.local_mibps, 256.0)
         self.assertEqual(result.remote_mibps, 102.4)
         self.assertEqual(result.local_active_mibps, 1024.0)
         self.assertEqual(result.remote_active_mibps, 204.8)
         self.assertEqual(result.zerofs_direct_read_mibps, 2048.0)
+        self.assertEqual(result.zerofs_nbd_odirect_write_bytes, 0)
+
+    def test_result_labels_separate_buffered_and_nbd_odirect_writes(self) -> None:
+        result = calculate_tiers(
+            logical_bytes=1 << 30,
+            local_bytes=1 << 30,
+            remote_bytes=1 << 30,
+            user_buffered_page_cache_write_ms=100,
+            local_end_to_end_ms=1000,
+            remote_end_to_end_ms=2000,
+            local_active_ms=800,
+            remote_active_ms=1000,
+            page_cache_hot_read_ms=50,
+            zerofs_direct_read_ms=200,
+            zerofs_nbd_odirect_write_service_ack_ms=400,
+            zerofs_nbd_odirect_write_bytes=1 << 30,
+            zerofs_nbd_odirect_local_durability_tail_ms=450,
+            zerofs_nbd_odirect_local_durability_end_to_end_ms=900,
+            zerofs_nbd_odirect_remote_durability_tail_ms=900,
+            zerofs_nbd_odirect_remote_durability_end_to_end_ms=1800,
+            zerofs_nbd_odirect_local_encoded_bytes=1 << 30,
+            zerofs_nbd_odirect_remote_encoded_bytes=1 << 30,
+        )
+
+        self.assertEqual(result.user_buffered_page_cache_write_ms, 100)
+        self.assertEqual(result.user_buffered_page_cache_write_mibps, 10_240.0)
+        self.assertEqual(result.zerofs_nbd_odirect_write_service_ack_ms, 400)
+        self.assertEqual(result.zerofs_nbd_odirect_write_service_ack_mibps, 2560.0)
+        self.assertEqual(
+            result.zerofs_nbd_odirect_local_durability_tail_mibps, 2275.56
+        )
+        self.assertEqual(
+            result.zerofs_nbd_odirect_local_durability_end_to_end_mibps, 1137.78
+        )
+        self.assertEqual(
+            result.zerofs_nbd_odirect_remote_durability_tail_mibps, 1137.78
+        )
+        self.assertEqual(
+            result.zerofs_nbd_odirect_remote_durability_end_to_end_mibps, 568.89
+        )
+        self.assertEqual(
+            asdict(result)["user_buffered_page_cache_write_mibps"], 10_240.0
+        )
+        self.assertNotIn("foreground_ms", asdict(result))
+        self.assertNotIn("foreground_mibps", asdict(result))
 
     def test_fio_result_uses_fio_internal_runtime_and_bytes(self) -> None:
         path = Path(self.temp.name) / "fio.json"
@@ -1570,6 +2011,28 @@ class BenchmarkTests(unittest.TestCase):
         ):
             self.assertEqual(_monotonic_ms(), 1234)
 
+    def test_metric_sampler_buffers_receipts_until_measurement_stops(self) -> None:
+        metrics = Path(self.temp.name) / "metrics.csv"
+        system_io = Path(self.temp.name) / "system-io.csv"
+        sampler = _MetricSampler(
+            self.lifecycle,  # type: ignore[arg-type]
+            metrics,
+            system_io,
+            (8, 1),
+        )
+        sampler.stop_event.set()
+
+        sampler._run()
+
+        self.assertFalse(metrics.exists())
+        self.assertFalse(system_io.exists())
+        sampler._persist()
+        self.assertTrue(metrics.is_file())
+        self.assertTrue(system_io.is_file())
+        self.assertIn(
+            "dirty_ssd_reserved", metrics.read_text(encoding="utf-8").splitlines()[0]
+        )
+
     def test_benchmark_rejects_a_gc_pass_inside_the_measured_epoch(self) -> None:
         from scripts.vm100_pilot.benchmark import (
             BenchmarkContaminatedError,
@@ -1672,6 +2135,10 @@ class BenchmarkTests(unittest.TestCase):
             ) -> WritebackSnapshot:
                 return self.lifecycle.metrics.snapshot()
 
+            def _benchmark_tmpfs_root(self) -> Path:
+                return Path(self_temp.name)
+
+        self_temp = self.temp
         benchmark = FailingBenchmark(self.config, self.runner, self.lifecycle)  # type: ignore[arg-type]
         with self.assertRaisesRegex(CommandError, "injected fio failure"):
             benchmark.run(total_mib=4, jobs=1)
@@ -1682,6 +2149,88 @@ class BenchmarkTests(unittest.TestCase):
         manifests = list(self.config.result_dir.glob("benchmark-*/manifest.json"))
         self.assertEqual(len(manifests), 1)
         self.assertEqual(json.loads(manifests[0].read_text())["status"], "failed")
+
+    def test_tmpfs_setup_failure_still_cleans_mount_root(self) -> None:
+        missing_tmpfs = Path(self.temp.name) / "missing-tmpfs"
+
+        class MissingTmpfsBenchmark(BenchmarkRunner):
+            def _wait_clean_gc(
+                self, *, maintenance_isolated: bool
+            ) -> WritebackSnapshot:
+                return self.lifecycle.metrics.snapshot()
+
+            def _benchmark_tmpfs_root(self) -> Path:
+                return missing_tmpfs
+
+        benchmark = MissingTmpfsBenchmark(
+            self.config,
+            self.runner,
+            self.lifecycle,  # type: ignore[arg-type]
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "tmpfs root is unavailable"):
+            benchmark.run(total_mib=4, jobs=1)
+
+        rm_calls = [
+            call for call in self.runner.calls if call[0][:3] == ("rm", "-rf", "--")
+        ]
+        self.assertEqual(len(rm_calls), 1)
+
+    def test_scratch_cleanup_failure_is_not_silenced(self) -> None:
+        scratch_root = Path(self.temp.name) / "benchmark-tmpfs"
+        scratch_root.mkdir()
+
+        class FailingBenchmark(BenchmarkRunner):
+            def _wait_clean_gc(
+                self, *, maintenance_isolated: bool
+            ) -> WritebackSnapshot:
+                return self.lifecycle.metrics.snapshot()
+
+            def _benchmark_tmpfs_root(self) -> Path:
+                return scratch_root
+
+            def _local_device(self) -> tuple[int, int]:
+                return (8, 1)
+
+            def _system_io(self, device: tuple[int, int]) -> SystemIoSnapshot:
+                return SystemIoSnapshot("sda1", 0, 0, 0, 0, 0, 0, 0)
+
+            def _run_fio(self, *args: object, **kwargs: object) -> FioResult:
+                raise CommandError(("fio",), 19, "injected fio failure")
+
+        benchmark = FailingBenchmark(
+            self.config,
+            self.runner,
+            self.lifecycle,  # type: ignore[arg-type]
+        )
+        cleanup_error = OSError("injected scratch cleanup failure")
+        real_rmtree = shutil.rmtree
+
+        def fail_scratch_only(path: str | Path, *args: object, **kwargs: object) -> None:
+            if Path(path).parent == scratch_root:
+                raise cleanup_error
+            real_rmtree(path, *args, **kwargs)  # type: ignore[arg-type]
+
+        with (
+            mock.patch(
+                "scripts.vm100_pilot.benchmark.shutil.rmtree",
+                side_effect=fail_scratch_only,
+            ),
+            self.assertRaisesRegex(
+                BenchmarkCleanupError, "benchmark cleanup failed"
+            ) as caught,
+        ):
+            benchmark.run(total_mib=4, jobs=1)
+
+        self.assertTrue(
+            "injected fio failure" in str(caught.exception.primary),
+        )
+        self.assertTrue(
+            any(
+                "injected scratch cleanup failure" in str(error)
+                for error in caught.exception.cleanup_errors
+            )
+        )
 
 
 class _ProfileBenchmark:
@@ -1715,14 +2264,14 @@ class _ProfileBenchmark:
             logical_bytes=4 << 20,
             local_bytes=4 << 20,
             remote_bytes=4 << 20,
-            foreground_ms=1,
+            user_buffered_page_cache_write_ms=1,
             local_end_to_end_ms=1,
             remote_end_to_end_ms=1,
             local_active_ms=1,
             remote_active_ms=1,
             page_cache_hot_read_ms=1,
             zerofs_direct_read_ms=1,
-            foreground_mibps=4096.0,
+            user_buffered_page_cache_write_mibps=4096.0,
             local_mibps=4096.0,
             remote_mibps=4096.0,
             local_active_mibps=4096.0,
@@ -2035,7 +2584,7 @@ class ProfileTests(unittest.TestCase):
                 logical_bytes=1,
                 local_bytes=1,
                 remote_bytes=1,
-                foreground_ms=1,
+                user_buffered_page_cache_write_ms=1,
                 local_end_to_end_ms=1,
                 remote_end_to_end_ms=1,
                 local_active_ms=1,
