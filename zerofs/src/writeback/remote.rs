@@ -981,14 +981,15 @@ async fn verify_existing(
     target: &Path,
     expected: &Bytes,
 ) -> object_store::Result<PutResult> {
-    let existing = remote.get(target).await?.bytes().await?;
+    let existing = remote.get(target).await?;
+    let meta = existing.meta.clone();
+    let existing = existing.bytes().await?;
     if existing != *expected {
         return Err(object_store::Error::AlreadyExists {
             path: target.to_string(),
             source: Box::new(RemoteContentDivergence),
         });
     }
-    let meta = remote.head(target).await?;
     Ok(PutResult {
         e_tag: meta.e_tag,
         version: meta.version,
@@ -1060,11 +1061,15 @@ fn missing_remote_predecessor(
 mod tests {
     use super::{
         CompletedRemote, SchedulerWindow, bounded_remote_operation, collect_pipeline_batch,
-        validate_scheduler_window,
+        validate_scheduler_window, verify_existing,
     };
+    use crate::fault_store::FaultStore;
     use crate::writeback::model::{FenceClass, LocalEtag, MutationKind, MutationRecord};
+    use bytes::Bytes;
     use futures::future;
-    use object_store::PutResult;
+    use object_store::memory::InMemory;
+    use object_store::{ObjectStore, ObjectStoreExt, PutPayload, PutResult, path::Path};
+    use std::sync::Arc;
     use std::time::Duration;
     use uuid::Uuid;
 
@@ -1102,6 +1107,30 @@ mod tests {
         assert!(
             message.contains("timed out"),
             "timeout remains distinguishable from a provider error"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_existing_reuses_metadata_from_its_single_get() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let target = Path::from("segments/existing");
+        let expected = Bytes::from_static(b"matching payload");
+        let created = inner
+            .put(&target, PutPayload::from(expected.clone()))
+            .await
+            .unwrap();
+        let (remote, controls) = FaultStore::new(inner);
+
+        let reconciled = verify_existing(remote.as_ref(), &target, &expected)
+            .await
+            .expect("matching existing content is a successful lost-reply reconciliation");
+
+        assert_eq!(reconciled.e_tag, created.e_tag);
+        assert_eq!(reconciled.version, created.version);
+        assert_eq!(
+            controls.get_count(),
+            1,
+            "GetResult already carries the metadata; a second HEAD is redundant"
         );
     }
 
