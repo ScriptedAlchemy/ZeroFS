@@ -74,7 +74,9 @@ class _MetricSampler:
         self.lifecycle = lifecycle
         self.output = output
         self.stop_event = threading.Event()
-        self.thread = threading.Thread(target=self._run, name="writeback-metrics", daemon=True)
+        self.thread = threading.Thread(
+            target=self._run, name="writeback-metrics", daemon=True
+        )
         self.error: BaseException | None = None
 
     def start(self) -> None:
@@ -107,7 +109,9 @@ class _MetricSampler:
                 )
                 while not self.stop_event.is_set():
                     snapshot = self.lifecycle.metrics.snapshot()
-                    writer.writerow((round(time.time() * 1000), *snapshot.to_dict().values()))
+                    writer.writerow(
+                        (round(time.time() * 1000), *snapshot.to_dict().values())
+                    )
                     handle.flush()
                     self.stop_event.wait(0.25)
         except BaseException as error:
@@ -127,7 +131,9 @@ class BenchmarkRunner:
 
     def prepare_root(self, run_root: Path) -> None:
         self.config.require_disposable(run_root)
-        if run_root.parent.resolve(strict=False) != self.config.mountpoint.resolve(strict=False):
+        if run_root.parent.resolve(strict=False) != self.config.mountpoint.resolve(
+            strict=False
+        ):
             raise ValueError(f"benchmark root must be a direct mount child: {run_root}")
         self.runner.run(
             [
@@ -261,11 +267,16 @@ class BenchmarkRunner:
                     direct=True,
                 )
                 direct_end = time.monotonic_ns()
-                millis = lambda end, begin: max(1, round((end - begin) / 1_000_000))
+
+                def millis(end: int, begin: int) -> int:
+                    return max(1, round((end - begin) / 1_000_000))
+
                 result = calculate_tiers(
                     logical_bytes=logical_bytes,
                     local_bytes=max(0, local_snapshot.local_bytes - before.local_bytes),
-                    remote_bytes=max(0, remote_snapshot.remote_bytes - before.remote_bytes),
+                    remote_bytes=max(
+                        0, remote_snapshot.remote_bytes - before.remote_bytes
+                    ),
                     foreground_ms=millis(foreground_end, started),
                     local_end_to_end_ms=millis(local_end, started),
                     remote_end_to_end_ms=millis(remote_end, started),

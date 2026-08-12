@@ -35,7 +35,9 @@ class CanonicalDeployment:
 
     @classmethod
     def capture(cls, config: PilotConfig, runner: Runner) -> "CanonicalDeployment":
-        directory = Path(tempfile.mkdtemp(prefix="zerofs-canonical-", dir=config.temp_dir))
+        directory = Path(
+            tempfile.mkdtemp(prefix="zerofs-canonical-", dir=config.temp_dir)
+        )
         config.require_disposable(directory)
         binary = directory / "zerofs"
         receipt = directory / "build-receipt"
@@ -52,7 +54,9 @@ class CanonicalDeployment:
         )
 
     def restore(self) -> None:
-        self.runner.run(["install", "-m", "0755", self.binary, self.config.binary], sudo=True)
+        self.runner.run(
+            ["install", "-m", "0755", self.binary, self.config.binary], sudo=True
+        )
         self.runner.run(
             [
                 "install",
@@ -78,7 +82,8 @@ class CanonicalDeployment:
 
 
 class _Benchmark(Protocol):
-    def run(self, *, total_mib: int, jobs: int) -> BenchmarkResult: ...
+    def run(self, *, total_mib: int, jobs: int) -> BenchmarkResult:
+        ...
 
 
 class CollectorGroup:
@@ -149,7 +154,10 @@ class CollectorGroup:
         self.processes.append(("interrupt", perf_stat))
 
         for name, argv in (
-            ("pidstat.txt", ["pidstat", "-h", "-r", "-u", "-d", "-p", str(self.pid), "1"]),
+            (
+                "pidstat.txt",
+                ["pidstat", "-h", "-r", "-u", "-d", "-p", str(self.pid), "1"],
+            ),
             ("iostat.txt", ["iostat", "-dxm", "1"]),
             ("network-sar.txt", ["sar", "-n", "DEV", "1"]),
         ):
@@ -242,17 +250,24 @@ class ProfileRunner:
         return binary
 
     def _checkout_commit(self) -> str:
-        return self.runner.run(["git", "rev-parse", "HEAD"], cwd=self.config.root).stdout.strip()
+        return self.runner.run(
+            ["git", "rev-parse", "HEAD"], cwd=self.config.root
+        ).stdout.strip()
 
     def _install_profile(self, binary: Path) -> None:
-        self.runner.run(["install", "-m", "0755", binary, self.config.binary], sudo=True)
+        self.runner.run(
+            ["install", "-m", "0755", binary, self.config.binary], sudo=True
+        )
         content = (
             f"commit={self._checkout_commit()}\n"
             f"binary_sha256={_sha256(binary)}\n"
             "profile=1\n"
         )
         with tempfile.NamedTemporaryFile(
-            mode="w", prefix="zerofs-profile-receipt-", dir=self.config.temp_dir, delete=False
+            mode="w",
+            prefix="zerofs-profile-receipt-",
+            dir=self.config.temp_dir,
+            delete=False,
         ) as handle:
             handle.write(content)
             receipt = Path(handle.name)
@@ -295,6 +310,8 @@ class ProfileRunner:
         receipt = RunReceipt.start(self.config, "profile")
         collectors: CollectorGroup | object | None = None
         deployed = False
+        stop_attempted = False
+        installation_started = False
         primary: BaseException | None = None
         benchmark_result: BenchmarkResult | None = None
         restored = False
@@ -303,7 +320,9 @@ class ProfileRunner:
                 binary = self._build_profile()
                 receipt.record("profile_binary_sha256", _sha256(binary))
                 receipt.record("profile_commit", self._checkout_commit())
+                stop_attempted = True
                 self.lifecycle.stop()
+                installation_started = True
                 self._install_profile(binary)
                 deployed = True
                 self.lifecycle.start()
@@ -322,10 +341,12 @@ class ProfileRunner:
                         collectors.stop()  # type: ignore[attr-defined]
                     except BaseException as error:
                         cleanup_errors.append(error)
-                if deployed:
+                if stop_attempted:
                     try:
-                        self.lifecycle.stop()
-                        canonical.restore()
+                        if deployed:
+                            self.lifecycle.stop()
+                        if installation_started:
+                            canonical.restore()
                         self.lifecycle.start()
                         status = self.lifecycle.status()
                         self.lifecycle.drain()
@@ -333,11 +354,16 @@ class ProfileRunner:
                         restored = True
                     except BaseException as error:
                         cleanup_errors.append(error)
-                try:
-                    canonical.cleanup()
-                except BaseException as error:
-                    cleanup_errors.append(error)
-                if not deployed or restored:
+                if not installation_started or restored:
+                    try:
+                        canonical.cleanup()
+                    except BaseException as error:
+                        cleanup_errors.append(error)
+                else:
+                    receipt.record(
+                        "retained_canonical_backup", str(canonical.directory)
+                    )
+                if not installation_started or restored:
                     try:
                         self._remove_profile_target()
                     except BaseException as error:
@@ -350,7 +376,10 @@ class ProfileRunner:
                             + "; ".join(str(error) for error in cleanup_errors)
                         )
                     else:
-                        primary = ExceptionGroup("profile cleanup failures", cleanup_errors)
+                        primary = RuntimeError(
+                            "profile cleanup failures: "
+                            + "; ".join(str(error) for error in cleanup_errors)
+                        )
             if primary is not None:
                 raise primary
         if benchmark_result is None:

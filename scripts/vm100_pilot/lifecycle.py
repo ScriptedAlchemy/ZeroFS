@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import time
 import tomllib
+import hashlib
+import shutil
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from .config import PilotConfig
-from .metrics import DrainReceipt, MetricsClient, WritebackSnapshot, wait_for_drain
-from .runner import CommandError, Runner
+from .metrics import DrainReceipt, MetricsClient, wait_for_drain
+from .runner import Runner
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,7 +46,9 @@ class PilotLifecycle:
     def require_vm100(self) -> None:
         hostname = self.runner.run(["hostname"], timeout=5).stdout.strip()
         if hostname != "ubuntu-main":
-            raise RuntimeError(f"run this only on VM100 (ubuntu-main), got {hostname!r}")
+            raise RuntimeError(
+                f"run this only on VM100 (ubuntu-main), got {hostname!r}"
+            )
         for path in (self.config.config_file, self.config.env_file):
             result = self.runner.run(["test", "-f", path], sudo=True, check=False)
             if result.returncode:
@@ -63,12 +68,18 @@ class PilotLifecycle:
         control_group = self._show(unit, "ControlGroup")
         cgroup_pids: tuple[int, ...] = ()
         if control_group:
-            process_file = self.config.cgroup_root / control_group.lstrip("/") / "cgroup.procs"
+            process_file = (
+                self.config.cgroup_root / control_group.lstrip("/") / "cgroup.procs"
+            )
             try:
-                cgroup_pids = tuple(int(line) for line in process_file.read_text().splitlines())
+                cgroup_pids = tuple(
+                    int(line) for line in process_file.read_text().splitlines()
+                )
             except FileNotFoundError:
                 pass
-        return UnitState(active_state, main_pid, control_pid, control_group, cgroup_pids)
+        return UnitState(
+            active_state, main_pid, control_pid, control_group, cgroup_pids
+        )
 
     def _wait_stopped(self, unit: str) -> None:
         deadline = time.monotonic() + self.config.stop_timeout
@@ -146,6 +157,111 @@ class PilotLifecycle:
         self.stop()
         return self.start()
 
+    @staticmethod
+    def _local_sha256(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            while chunk := handle.read(1024 * 1024):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def build_deploy(self) -> dict[str, str]:
+        self.require_vm100()
+        if self.runner.run(
+            ["git", "status", "--porcelain"], cwd=self.config.root
+        ).stdout:
+            raise RuntimeError("Git checkout is dirty")
+        self.runner.run(["git", "pull", "--ff-only"], cwd=self.config.root)
+        if self.runner.run(
+            ["git", "status", "--porcelain"], cwd=self.config.root
+        ).stdout:
+            raise RuntimeError("Git checkout became dirty after pull")
+        commit = self.runner.run(
+            ["git", "rev-parse", "HEAD"], cwd=self.config.root
+        ).stdout.strip()
+        self.runner.run(
+            [self.config.cargo, "build", "--release", "--locked"],
+            cwd=self.config.crate,
+            capture=False,
+        )
+        built = self.config.crate / "target" / "release" / "zerofs"
+        built_sha = self._local_sha256(built)
+        backup_dir = Path(
+            tempfile.mkdtemp(prefix="zerofs-deploy-backup-", dir=self.config.temp_dir)
+        )
+        self.config.require_disposable(backup_dir)
+        backup_binary = backup_dir / "zerofs"
+        backup_receipt = backup_dir / "build-receipt"
+        shutil.copyfile(self.config.binary, backup_binary)
+        shutil.copyfile(self.config.build_receipt, backup_receipt)
+        stop_attempted = False
+        rollback_succeeded = False
+        deployment_succeeded = False
+        try:
+            stop_attempted = True
+            self.stop()
+            self.runner.run(
+                ["install", "-m", "0755", built, self.config.binary], sudo=True
+            )
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                prefix="zerofs-build-receipt-",
+                dir=self.config.temp_dir,
+                delete=False,
+            ) as handle:
+                handle.write(f"commit={commit}\nbinary_sha256={built_sha}\n")
+                temporary_receipt = Path(handle.name)
+            try:
+                self.runner.run(
+                    [
+                        "install",
+                        "-o",
+                        "root",
+                        "-g",
+                        "root",
+                        "-m",
+                        "0644",
+                        temporary_receipt,
+                        self.config.build_receipt,
+                    ],
+                    sudo=True,
+                )
+            finally:
+                temporary_receipt.unlink(missing_ok=True)
+            if self._sha256(self.config.binary, sudo=True) != built_sha:
+                raise RuntimeError("installed binary hash mismatch")
+            deployment_succeeded = True
+        except BaseException as original:
+            if stop_attempted:
+                try:
+                    self.runner.run(
+                        ["install", "-m", "0755", backup_binary, self.config.binary],
+                        sudo=True,
+                    )
+                    self.runner.run(
+                        [
+                            "install",
+                            "-o",
+                            "root",
+                            "-g",
+                            "root",
+                            "-m",
+                            "0644",
+                            backup_receipt,
+                            self.config.build_receipt,
+                        ],
+                        sudo=True,
+                    )
+                    self.start()
+                    rollback_succeeded = True
+                except BaseException as restore_error:
+                    original.add_note(f"deployment rollback failed: {restore_error}")
+            raise
+        finally:
+            if not stop_attempted or rollback_succeeded or deployment_succeeded:
+                shutil.rmtree(backup_dir, ignore_errors=True)
+        return {"commit": commit, "binary_sha256": built_sha}
+
     def drain(self, timeout: int | None = None) -> DrainReceipt:
         return wait_for_drain(
             self.metrics.snapshot,
@@ -164,9 +280,15 @@ class PilotLifecycle:
         self.require_vm100()
         states = {
             unit: self.unit_state(unit)
-            for unit in (self.config.service, self.config.client_service, self.config.mount_unit)
+            for unit in (
+                self.config.service,
+                self.config.client_service,
+                self.config.mount_unit,
+            )
         }
-        inactive = [unit for unit, state in states.items() if state.active_state != "active"]
+        inactive = [
+            unit for unit, state in states.items() if state.active_state != "active"
+        ]
         if inactive:
             raise RuntimeError(f"pilot units are not active: {', '.join(inactive)}")
         mount = self.runner.run(
@@ -185,15 +307,21 @@ class PilotLifecycle:
             )
         service_pid = states[self.config.service].main_pid
         installed_sha = self._sha256(self.config.binary, sudo=True)
-        running_sha = self._sha256(self.config.proc_root / str(service_pid) / "exe", sudo=True)
+        running_sha = self._sha256(
+            self.config.proc_root / str(service_pid) / "exe", sudo=True
+        )
         if installed_sha != running_sha:
             raise RuntimeError("running binary does not match installed binary")
-        receipt_text = self.runner.run(["cat", self.config.build_receipt], sudo=True).stdout
+        receipt_text = self.runner.run(
+            ["cat", self.config.build_receipt], sudo=True
+        ).stdout
         receipt = dict(
             line.split("=", 1) for line in receipt_text.splitlines() if "=" in line
         )
         if receipt.get("binary_sha256") != running_sha:
-            raise RuntimeError("build receipt binary hash does not match running binary")
+            raise RuntimeError(
+                "build receipt binary hash does not match running binary"
+            )
         snapshot = self.metrics.snapshot()
         if snapshot.terminal:
             raise RuntimeError("writeback reported a terminal error")

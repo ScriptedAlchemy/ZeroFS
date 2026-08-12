@@ -7,6 +7,7 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 from subprocess import CompletedProcess
+from typing import Any
 
 from scripts.vm100_pilot.config import PilotConfig
 from scripts.vm100_pilot.benchmark import BenchmarkRunner, calculate_tiers
@@ -17,8 +18,10 @@ from scripts.vm100_pilot.metrics import (
     wait_for_drain,
 )
 from scripts.vm100_pilot.profile import CanonicalDeployment, ProfileRunner
+from scripts.vm100_pilot.raw_sftp import RawSftpRunner, SftpEndpoint
 from scripts.vm100_pilot.receipts import RunReceipt
 from scripts.vm100_pilot.runner import CommandError
+from scripts.vm100_pilot.workloads import WorkloadRunner
 
 
 class FakeRunner:
@@ -65,7 +68,9 @@ class FakeRunner:
         elif args[:2] == ("systemctl", "is-active"):
             unit = args[2]
             state = "active" if unit in self.active else "inactive"
-            return CompletedProcess(args, 0 if state == "active" else 3, state + "\n", "")
+            return CompletedProcess(
+                args, 0 if state == "active" else 3, state + "\n", ""
+            )
         elif args[:2] == ("systemctl", "show"):
             unit = args[2]
             active = unit in self.active
@@ -116,8 +121,9 @@ class CoreTests(unittest.TestCase):
             self.root,
             {"ZEROFS_PILOT_RESULT_DIR": str(result_dir)},
         )
+        receipt = RunReceipt.start(config, "benchmark")
         with self.assertRaisesRegex(RuntimeError, "boom"):
-            with RunReceipt.start(config, "benchmark") as receipt:
+            with receipt:
                 receipt.record("phase", "write")
                 raise RuntimeError("boom")
         payload = json.loads(receipt.manifest.read_text())
@@ -181,7 +187,11 @@ class LifecycleTests(unittest.TestCase):
             (self.config.service, self.config.client_service, self.config.mount_unit)
         )
         self.lifecycle.stop()
-        stops = [call[0][3] for call in self.runner.calls if call[0][:3] == ("systemctl", "stop", "--no-block")]
+        stops = [
+            call[0][3]
+            for call in self.runner.calls
+            if call[0][:3] == ("systemctl", "stop", "--no-block")
+        ]
         self.assertEqual(
             stops,
             [self.config.mount_unit, self.config.client_service, self.config.service],
@@ -191,7 +201,11 @@ class LifecycleTests(unittest.TestCase):
         self.runner.fail_start = self.config.client_service
         with self.assertRaisesRegex(CommandError, "injected start failure"):
             self.lifecycle.start()
-        stops = [call[0][3] for call in self.runner.calls if call[0][:3] == ("systemctl", "stop", "--no-block")]
+        stops = [
+            call[0][3]
+            for call in self.runner.calls
+            if call[0][:3] == ("systemctl", "stop", "--no-block")
+        ]
         self.assertEqual(stops, [self.config.service])
         self.assertNotIn(self.config.service, self.runner.active)
 
@@ -294,7 +308,9 @@ class BenchmarkTests(unittest.TestCase):
         benchmark = FailingBenchmark(self.config, self.runner, self.lifecycle)  # type: ignore[arg-type]
         with self.assertRaisesRegex(CommandError, "injected fio failure"):
             benchmark.run(total_mib=4, jobs=1)
-        rm_calls = [call for call in self.runner.calls if call[0][:3] == ("rm", "-rf", "--")]
+        rm_calls = [
+            call for call in self.runner.calls if call[0][:3] == ("rm", "-rf", "--")
+        ]
         self.assertEqual(len(rm_calls), 1)
         manifests = list(self.config.result_dir.glob("benchmark-*/manifest.json"))
         self.assertEqual(len(manifests), 1)
@@ -313,7 +329,9 @@ class ProfileTests(unittest.TestCase):
             root,
             {
                 "ZEROFS_PILOT_RESULT_DIR": str(Path(self.temp.name) / "results"),
-                "ZEROFS_PROFILE_TARGET_DIR": str(Path(self.temp.name) / "profile-target"),
+                "ZEROFS_PROFILE_TARGET_DIR": str(
+                    Path(self.temp.name) / "profile-target"
+                ),
                 "ZEROFS_PILOT_MOUNTPOINT": str(mount),
                 "ZEROFS_PILOT_INTEGRITY_FILE": str(mount / "integrity"),
                 "ZEROFS_PILOT_METADATA_DIR": str(mount / "metadata"),
@@ -351,7 +369,7 @@ class ProfileTests(unittest.TestCase):
                 binary.write_bytes(b"profile-binary")
                 return binary
 
-            def _start_collectors(self, pid: int, receipt: RunReceipt) -> object:
+            def _start_collectors(self, pid: int, receipt: RunReceipt) -> Any:
                 return type("Collectors", (), {"stop": lambda _self: None})()
 
             def _service_pid(self) -> int:
@@ -372,6 +390,98 @@ class ProfileTests(unittest.TestCase):
         self.assertGreaterEqual(self.lifecycle.stop_calls, 2)
         self.assertGreaterEqual(self.lifecycle.start_calls, 2)
         self.assertFalse(self.config.profile_target.exists())
+
+    def test_profile_install_failure_restores_canonical_deployment(self) -> None:
+        class TestProfile(ProfileRunner):
+            def _build_profile(self) -> Path:
+                binary = self.config.profile_target / "release" / "zerofs"
+                binary.parent.mkdir(parents=True)
+                binary.write_bytes(b"profile-binary")
+                return binary
+
+            def _install_profile(self, binary: Path) -> None:
+                self.config.binary.write_bytes(b"partial-profile-install")
+                raise RuntimeError("injected install failure")
+
+        profiler = TestProfile(
+            self.config,
+            self.runner,  # type: ignore[arg-type]
+            self.lifecycle,  # type: ignore[arg-type]
+        )
+        with self.assertRaisesRegex(RuntimeError, "injected install failure"):
+            profiler.run(total_mib=4, jobs=1)
+        self.assertEqual(self.binary.read_bytes(), b"canonical-binary")
+        self.assertGreaterEqual(self.lifecycle.start_calls, 1)
+        self.assertFalse(self.config.profile_target.exists())
+
+
+class WorkloadEngineTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        root = Path(self.temp.name) / "repo"
+        root.mkdir()
+        mount = Path(self.temp.name) / "mount"
+        mount.mkdir()
+        self.config = PilotConfig.from_mapping(
+            root,
+            {
+                "ZEROFS_PILOT_RESULT_DIR": str(Path(self.temp.name) / "results"),
+                "ZEROFS_PROFILE_TARGET_DIR": str(Path(self.temp.name) / "profile"),
+                "ZEROFS_PILOT_TMP_DIR": str(Path(self.temp.name) / "tmp"),
+                "ZEROFS_PILOT_MOUNTPOINT": str(mount),
+                "ZEROFS_PILOT_INTEGRITY_FILE": str(mount / "integrity"),
+                "ZEROFS_PILOT_METADATA_DIR": str(mount / "metadata"),
+            },
+        )
+        self.config.temp_dir.mkdir()
+        snapshot = WritebackSnapshot(9, 9, 9, 0, 0, 1, 1, False)
+        self.lifecycle = _HealthyLifecycle(snapshot)
+        self.runner = FakeRunner()
+
+    def test_workload_root_is_created_with_explicit_owner(self) -> None:
+        workload = WorkloadRunner(
+            self.config, self.runner, self.lifecycle  # type: ignore[arg-type]
+        )
+        root = self.config.mountpoint / ".zerofs-workloads-test"
+        workload._prepare_root(root)
+        self.assertTrue(root.is_dir())
+        argv = self.runner.calls[-1][0]
+        self.assertEqual(argv[argv.index("-o") + 1], self.config.user)
+
+    def test_parallel_delete_removes_every_child(self) -> None:
+        workload = WorkloadRunner(
+            self.config, self.runner, self.lifecycle  # type: ignore[arg-type]
+        )
+        directory = self.config.mountpoint / "node_modules"
+        for index in range(8):
+            child = directory / f"package-{index}"
+            child.mkdir(parents=True)
+            (child / "index.js").write_text("module.exports = 1\n")
+        workload._parallel_delete(directory, 4)
+        self.assertFalse(directory.exists())
+
+    def test_raw_failure_restores_stack_and_removes_scratch(self) -> None:
+        class FailingRaw(RawSftpRunner):
+            def _endpoint(self) -> SftpEndpoint:
+                return SftpEndpoint(
+                    "user", "example.invalid", 23, Path("/key"), Path("/known")
+                )
+
+            def _run_batch(
+                self, *args: object, **kwargs: object
+            ) -> CompletedProcess[str]:
+                return CompletedProcess(("sftp",), 0, "", "")
+
+            def _parallel_batches(self, *args: object, **kwargs: object) -> None:
+                raise RuntimeError("injected raw transfer failure")
+
+        raw = FailingRaw(self.config, self.runner, self.lifecycle)  # type: ignore[arg-type]
+        with self.assertRaisesRegex(RuntimeError, "injected raw transfer failure"):
+            raw.run(jobs=2, per_job_mib=1)
+        self.assertEqual(self.lifecycle.stop_calls, 1)
+        self.assertEqual(self.lifecycle.start_calls, 1)
+        self.assertEqual(list(self.config.temp_dir.iterdir()), [])
 
 
 if __name__ == "__main__":
