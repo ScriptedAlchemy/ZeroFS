@@ -14,7 +14,7 @@ use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 #[cfg(test)]
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
 use uuid::Uuid;
 
@@ -40,6 +40,54 @@ pub struct Journal {
     format_version: u32,
     #[cfg(test)]
     snapshot_calls: AtomicU64,
+    #[cfg(test)]
+    remote_mark_pause: Mutex<Option<std::sync::Arc<RemoteMarkPauseInner>>>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct RemoteMarkPauseInner {
+    sequence: Sequence,
+    entered: AtomicBool,
+    entered_notify: tokio::sync::Notify,
+    released: Mutex<bool>,
+    release_ready: Condvar,
+}
+
+#[cfg(test)]
+pub(crate) struct RemoteMarkPause {
+    inner: std::sync::Arc<RemoteMarkPauseInner>,
+}
+
+#[cfg(test)]
+impl RemoteMarkPause {
+    pub(crate) async fn wait_entered(&self) {
+        loop {
+            let entered = self.inner.entered_notify.notified();
+            if self.inner.entered.load(Ordering::Acquire) {
+                return;
+            }
+            entered.await;
+        }
+    }
+
+    pub(crate) fn release(&self) {
+        let mut released = self
+            .inner
+            .released
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        *released = true;
+        drop(released);
+        self.inner.release_ready.notify_all();
+    }
+}
+
+#[cfg(test)]
+impl Drop for RemoteMarkPause {
+    fn drop(&mut self) {
+        self.release();
+    }
 }
 
 #[derive(Debug, Default)]
@@ -225,6 +273,8 @@ impl Journal {
             format_version: expected_identity.format_version,
             #[cfg(test)]
             snapshot_calls: AtomicU64::new(0),
+            #[cfg(test)]
+            remote_mark_pause: Mutex::new(None),
         };
         journal.recover_local_artifacts()?;
         let remote_seq = journal.progress()?.remote_seq;
@@ -319,6 +369,48 @@ impl Journal {
     #[cfg(test)]
     pub(crate) fn snapshot_calls(&self) -> u64 {
         self.snapshot_calls.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_remote_mark(&self, sequence: Sequence) -> RemoteMarkPause {
+        let inner = std::sync::Arc::new(RemoteMarkPauseInner {
+            sequence,
+            entered: AtomicBool::new(false),
+            entered_notify: tokio::sync::Notify::new(),
+            released: Mutex::new(false),
+            release_ready: Condvar::new(),
+        });
+        let replaced = self
+            .remote_mark_pause
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .replace(inner.clone());
+        assert!(replaced.is_none(), "remote mark pause is already installed");
+        RemoteMarkPause { inner }
+    }
+
+    #[cfg(test)]
+    fn wait_if_remote_mark_paused(&self, sequence: Sequence) {
+        let pause = self
+            .remote_mark_pause
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        let Some(pause) = pause.filter(|pause| pause.sequence == sequence) else {
+            return;
+        };
+        pause.entered.store(true, Ordering::Release);
+        pause.entered_notify.notify_one();
+        let mut released = pause
+            .released
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        while !*released {
+            released = pause
+                .release_ready
+                .wait(released)
+                .unwrap_or_else(|error| error.into_inner());
+        }
     }
 
     pub fn progress(&self) -> Result<JournalProgress> {
@@ -544,6 +636,8 @@ impl Journal {
 
     pub fn mark_remote(&self, sequence: Sequence, result_etag: Option<String>) -> Result<()> {
         let _write = self.write_gate.lock();
+        #[cfg(test)]
+        self.wait_if_remote_mark_paused(sequence);
         let mut transaction = self
             .database
             .begin_write()

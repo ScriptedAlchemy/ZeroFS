@@ -6,9 +6,8 @@ use crate::writeback::model::{
 };
 use crate::writeback::overlay::OverlayIndex;
 use bytes::Bytes;
+use futures::FutureExt;
 use futures::future::BoxFuture;
-use futures::stream::FuturesUnordered;
-use futures::{FutureExt, StreamExt};
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutResult, UpdateVersion};
 use std::collections::{BTreeMap, BTreeSet};
@@ -16,7 +15,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, watch};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 
 const REMOTE_COALESCE_IDLE: Duration = Duration::from_millis(500);
 const REMOTE_RETRY_DELAY: Duration = Duration::from_millis(200);
@@ -232,6 +231,9 @@ struct CompletedRemote {
     e_tag: Option<String>,
 }
 
+type RemoteOutcome = (MutationRecord, object_store::Result<PutResult>);
+type RemoteCommit = BoxFuture<'static, (Sequence, anyhow::Result<()>)>;
+
 struct SchedulerWindow {
     local_seq: Sequence,
     records: Vec<MutationRecord>,
@@ -330,13 +332,16 @@ async fn run_remote_scheduler(worker: RemoteWorker) {
             }
         };
         let mut window = window;
-        let mut active = FuturesUnordered::<
-            BoxFuture<'static, (MutationRecord, object_store::Result<PutResult>)>,
-        >::new();
+        let mut active = JoinSet::<RemoteOutcome>::new();
         let mut active_sequences = BTreeSet::new();
+        let mut committing = None::<RemoteCommit>;
         let mut retry = false;
+        let mut terminal_error = None::<String>;
         loop {
-            if !retry {
+            if committing.is_none() && terminal_error.is_none() {
+                committing = start_ready_commit(&journal, &overlay, &disk, next, &completed);
+            }
+            if !retry && terminal_error.is_none() {
                 let batch = collect_pipeline_batch(
                     &window.records,
                     next,
@@ -348,34 +353,95 @@ async fn run_remote_scheduler(worker: RemoteWorker) {
                     active_sequences.insert(record.sequence);
                     let remote = remote.clone();
                     let journal = journal.clone();
-                    active.push(
-                        async move {
-                            let applying = apply_record(remote, journal, record.clone());
-                            let result = bounded_remote_operation(
-                                &record,
-                                REMOTE_OPERATION_TIMEOUT,
-                                applying,
-                            )
-                            .await;
-                            (record, result)
-                        }
-                        .boxed(),
-                    );
+                    active.spawn(async move {
+                        let applying = apply_record(remote, journal, record.clone());
+                        let result =
+                            bounded_remote_operation(&record, REMOTE_OPERATION_TIMEOUT, applying)
+                                .await;
+                        (record, result)
+                    });
                 }
             }
-            if active.is_empty() {
+            if active.is_empty() && committing.is_none() {
+                if let Some(error) = terminal_error {
+                    publish_terminal(&progress, &admission, &disk, error, true);
+                    return;
+                }
                 break;
             }
-            let outcome = tokio::select! {
-                outcome = active.next() => outcome.expect("active remote upload set is non-empty"),
+            enum SchedulerEvent {
+                Remote,
+                Commit((Sequence, anyhow::Result<()>)),
+            }
+            let mut remote_outcome = None;
+            let event = tokio::select! {
+                outcome = active.join_next(), if !active.is_empty() => {
+                    remote_outcome = Some(outcome);
+                    SchedulerEvent::Remote
+                },
+                outcome = async {
+                    committing
+                        .as_mut()
+                        .expect("guarded remote commit future exists")
+                        .await
+                }, if committing.is_some() => SchedulerEvent::Commit(outcome),
                 changed = stop.changed() => {
                     if changed.is_err() || *stop.borrow() {
+                        abort_and_join_remote(&mut active).await;
+                        if let Some(commit) = committing.take() {
+                            let (sequence, result) = commit.await;
+                            if let Err(error) = finish_ordered_commit(
+                                sequence,
+                                result,
+                                &progress,
+                                &mut next,
+                                &mut completed,
+                            ) {
+                                publish_terminal(
+                                    &progress,
+                                    &admission,
+                                    &disk,
+                                    format!("{error:#}"),
+                                    true,
+                                );
+                            }
+                        }
                         break 'scheduler;
                     }
                     continue;
+                },
+            };
+            let (record, result) = match event {
+                SchedulerEvent::Commit((sequence, result)) => {
+                    committing = None;
+                    if let Err(error) = finish_ordered_commit(
+                        sequence,
+                        result,
+                        &progress,
+                        &mut next,
+                        &mut completed,
+                    ) {
+                        terminal_error = Some(format!("{error:#}"));
+                        active.abort_all();
+                    }
+                    continue;
+                }
+                SchedulerEvent::Remote => {
+                    match remote_outcome.expect("remote scheduler event stores its join result") {
+                        Some(Ok(_)) if terminal_error.is_some() => continue,
+                        Some(Ok(outcome)) => outcome,
+                        Some(Err(error)) if error.is_cancelled() && terminal_error.is_some() => {
+                            continue;
+                        }
+                        Some(Err(error)) => {
+                            terminal_error = Some(format!("remote upload task failed: {error}"));
+                            active.abort_all();
+                            continue;
+                        }
+                        None => continue,
+                    }
                 }
             };
-            let (record, result) = outcome;
             active_sequences.remove(&record.sequence);
             let result = match result {
                 Ok(result) => result,
@@ -397,30 +463,20 @@ async fn run_remote_scheduler(worker: RemoteWorker) {
                         .map_err(|error| anyhow::anyhow!("remote retry task failed: {error}"))
                         .and_then(|result| result)
                     {
-                        publish_terminal(
-                            &progress,
-                            &admission,
-                            &disk,
-                            format!(
-                                "failed to persist remote retry for sequence {}: {journal_error:#}",
-                                record.sequence
-                            ),
-                            true,
-                        );
-                        return;
+                        terminal_error = Some(format!(
+                            "failed to persist remote retry for sequence {}: {journal_error:#}",
+                            record.sequence
+                        ));
+                        active.abort_all();
+                        continue;
                     }
                     if is_terminal_remote_error(&error) {
-                        publish_terminal(
-                            &progress,
-                            &admission,
-                            &disk,
-                            format!(
-                                "permanent remote divergence at sequence {}: {error}",
-                                record.sequence
-                            ),
-                            true,
-                        );
-                        return;
+                        terminal_error = Some(format!(
+                            "permanent remote divergence at sequence {}: {error}",
+                            record.sequence
+                        ));
+                        active.abort_all();
+                        continue;
                     }
                     retry = true;
                     continue;
@@ -433,25 +489,13 @@ async fn run_remote_scheduler(worker: RemoteWorker) {
                     e_tag: result.e_tag,
                 },
             );
-            if let Err(error) = commit_ready_prefix(
-                &journal,
-                &overlay,
-                &disk,
-                &progress,
-                &mut next,
-                &mut completed,
-            )
-            .await
-            {
-                publish_terminal(&progress, &admission, &disk, format!("{error:#}"), true);
-                return;
-            }
             if !retry {
                 window = match load_scheduler_window(&journal, next, upload_concurrency) {
                     Ok(window) => window,
                     Err(error) => {
-                        publish_terminal(&progress, &admission, &disk, format!("{error:#}"), true);
-                        return;
+                        terminal_error = Some(format!("{error:#}"));
+                        active.abort_all();
+                        continue;
                     }
                 };
                 known_local_tail = known_local_tail.max(window.local_seq);
@@ -470,6 +514,31 @@ async fn run_remote_scheduler(worker: RemoteWorker) {
         }
     }
     progress.send_modify(|state| state.closed = true);
+}
+
+async fn abort_and_join_remote(active: &mut JoinSet<RemoteOutcome>) {
+    active.abort_all();
+    while active.join_next().await.is_some() {}
+}
+
+fn finish_ordered_commit(
+    sequence: Sequence,
+    result: anyhow::Result<()>,
+    progress: &watch::Sender<RemoteProgress>,
+    next: &mut Sequence,
+    completed: &mut BTreeMap<Sequence, CompletedRemote>,
+) -> anyhow::Result<()> {
+    result?;
+    let completion = completed.remove(&sequence).ok_or_else(|| {
+        anyhow::anyhow!("completed remote commit {sequence} was no longer tracked")
+    })?;
+    let incremented = sequence
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("remote sequence overflow"))?;
+    progress.send_modify(|state| state.sequence = sequence);
+    *next = incremented;
+    debug_assert_eq!(completion.record.sequence, sequence);
+    Ok(())
 }
 
 fn is_terminal_remote_error(error: &object_store::Error) -> bool {
@@ -646,24 +715,27 @@ fn collect_pipeline_batch(
     batch
 }
 
-async fn commit_ready_prefix(
+fn start_ready_commit(
     journal: &Arc<Journal>,
     overlay: &OverlayIndex,
     disk: &DiskAdmission,
-    progress: &watch::Sender<RemoteProgress>,
-    next: &mut Sequence,
-    completed: &mut BTreeMap<Sequence, CompletedRemote>,
-) -> anyhow::Result<()> {
-    while let Some(completion) = completed.remove(next) {
-        commit_remote(journal, overlay, disk, &completion.record, completion.e_tag).await?;
-        progress.send_modify(|state| state.sequence = completion.record.sequence);
-        *next = completion
-            .record
-            .sequence
-            .checked_add(1)
-            .ok_or_else(|| anyhow::anyhow!("remote sequence overflow"))?;
-    }
-    Ok(())
+    next: Sequence,
+    completed: &BTreeMap<Sequence, CompletedRemote>,
+) -> Option<RemoteCommit> {
+    let completion = completed.get(&next)?;
+    let record = completion.record.clone();
+    let e_tag = completion.e_tag.clone();
+    let journal = Arc::clone(journal);
+    let overlay = overlay.clone();
+    let disk = disk.clone();
+    Some(
+        async move {
+            let sequence = record.sequence;
+            let result = commit_remote(&journal, &overlay, &disk, &record, e_tag).await;
+            (sequence, result)
+        }
+        .boxed(),
+    )
 }
 
 fn touched_keys(record: &MutationRecord) -> Vec<String> {

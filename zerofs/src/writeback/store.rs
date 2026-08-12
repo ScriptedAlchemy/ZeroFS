@@ -2833,6 +2833,129 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_replay_keeps_polling_and_refilling_while_ordered_cleanup_is_blocked() {
+        let (store, remote, _temp, controls) = test_store_with_controls(true).await;
+        let journal = store.inner.journal.clone();
+        let pause = journal.pause_remote_mark(1);
+        controls.block_puts();
+        let paths = (1_u8..=6)
+            .map(|sequence| {
+                Path::from(format!(
+                    "zerofs/pilot/segments/{sequence:02x}/0000000000000001/{sequence:016x}"
+                ))
+            })
+            .collect::<Vec<_>>();
+        for (sequence, path) in paths.iter().enumerate() {
+            store
+                .put(path, Bytes::from(vec![sequence as u8 + 1; 1024]).into())
+                .await
+                .unwrap();
+        }
+        store.wait_local(6).await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while controls.put_count() < 4 {
+                controls.put_activity().notified().await;
+            }
+        })
+        .await
+        .expect("the first four remote slots were not filled");
+        controls.release_put_path(paths[0].as_ref());
+        tokio::time::timeout(Duration::from_secs(2), pause.wait_entered())
+            .await
+            .expect("the first ordered remote commit did not begin");
+        assert_eq!(journal.progress().unwrap().remote_seq, 0);
+
+        controls.release_put_path(paths[1].as_ref());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if controls
+                    .put_paths()
+                    .iter()
+                    .any(|path| path == paths[5].as_ref())
+                {
+                    break;
+                }
+                controls.put_activity().notified().await;
+            }
+        })
+        .await
+        .expect("a free remote slot was not refilled during ordered cleanup");
+        for path in &paths[2..] {
+            controls.release_put_path(path.as_ref());
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let published =
+                    futures::future::join_all(paths[1..].iter().map(|path| remote.head(path)))
+                        .await;
+                if published.iter().all(Result::is_ok) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("later remote operations stopped progressing during ordered cleanup");
+        assert_eq!(
+            journal.progress().unwrap().remote_seq,
+            0,
+            "remote durability must still publish strictly in sequence"
+        );
+
+        pause.release();
+        controls.release_puts();
+        tokio::time::timeout(Duration::from_secs(2), store.wait_remote(6))
+            .await
+            .expect("ordered remote commits did not catch up after cleanup resumed")
+            .unwrap();
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn remote_shutdown_joins_an_in_progress_ordered_commit() {
+        let (store, _remote, _temp, controls) = test_store_with_controls(true).await;
+        let journal = store.inner.journal.clone();
+        let pause = journal.pause_remote_mark(1);
+        controls.block_puts();
+        let path = Path::from("zerofs/pilot/segments/01/0000000000000001/0000000000000001");
+        store
+            .put(&path, Bytes::from_static(b"payload").into())
+            .await
+            .unwrap();
+        store.wait_local(1).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while controls.put_count() == 0 {
+                controls.put_activity().notified().await;
+            }
+        })
+        .await
+        .expect("the remote upload did not start");
+        controls.release_put_path(path.as_ref());
+        tokio::time::timeout(Duration::from_secs(2), pause.wait_entered())
+            .await
+            .expect("the ordered remote commit did not begin");
+
+        let mut shutdown = tokio::spawn({
+            let store = store.clone();
+            async move { store.shutdown().await }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut shutdown)
+                .await
+                .is_err(),
+            "shutdown returned while ordered commit work was still running"
+        );
+        pause.release();
+        tokio::time::timeout(Duration::from_secs(2), &mut shutdown)
+            .await
+            .expect("shutdown did not join the resumed ordered commit")
+            .unwrap()
+            .unwrap();
+        assert_eq!(journal.progress().unwrap().remote_seq, 1);
+    }
+
+    #[tokio::test]
     async fn remote_replay_preuploads_immutable_objects_across_later_fences() {
         let (store, _remote, _temp, controls) = test_store_with_controls(true).await;
         controls.block_puts();
