@@ -27,6 +27,7 @@ NPM_WORKLOAD_REPO=${ZEROFS_NPM_WORKLOAD_REPO:-https://github.com/npm/cli.git}
 NPM_WORKLOAD_COMMIT=${ZEROFS_NPM_WORKLOAD_COMMIT:-64763a341e7aa5b456e696f956759bf9b3440dc1}
 RUST_WORKLOAD_REPO=${ZEROFS_RUST_WORKLOAD_REPO:-https://github.com/BurntSushi/ripgrep.git}
 RUST_WORKLOAD_COMMIT=${ZEROFS_RUST_WORKLOAD_COMMIT:-af60c2de9d85e7f3d81c78601669468cf02dabab}
+DELETE_JOBS=${ZEROFS_DELETE_JOBS:-4}
 
 if [[ -z $CARGO_CMD ]]; then
   CARGO_CMD=$(command -v cargo 2>/dev/null || true)
@@ -63,7 +64,11 @@ wait_active() {
 wait_drain() {
   local timeout=${1:-600} stable=0 snapshot accepted local_seq remote dirty_ram dirty_ssd terminal
   for _ in $(seq 1 "$timeout"); do
-    snapshot=$(metrics_snapshot)
+    if ! snapshot=$(metrics_snapshot 2>/dev/null); then
+      stable=0
+      sleep 1
+      continue
+    fi
     accepted=$(metric_from zerofs_writeback_accepted_sequence "$snapshot")
     local_seq=$(metric_from zerofs_writeback_local_sequence "$snapshot")
     remote=$(metric_from zerofs_writeback_remote_sequence "$snapshot")
@@ -320,7 +325,9 @@ workloads() {
   require_vm100
   command -v git >/dev/null || die "git is required for workload benchmarks"
   command -v npm >/dev/null || die "npm is required for workload benchmarks"
+  command -v xargs >/dev/null || die "xargs is required for the parallel deletion benchmark"
   [[ -n $CARGO_CMD && -x $CARGO_CMD ]] || die "cargo was not found; set ZEROFS_PILOT_CARGO"
+  (( DELETE_JOBS > 0 )) || die "ZEROFS_DELETE_JOBS must be positive"
   status >/dev/null
   wait_drain 600 >/dev/null
 
@@ -334,25 +341,28 @@ workloads() {
   cargo_log="$RESULT_DIR/workloads-$run-cargo.log"
   mkdir -p "$workroot"
 
-  local cleaned=0 cleanup_ms=0
+  WORKLOAD_ROOT=$workroot
+  WORKLOAD_CLEANED=0
   cleanup_workloads() {
     local exit_status=$? cleanup_start
-    if (( ! cleaned )); then
+    trap - EXIT
+    if (( ! ${WORKLOAD_CLEANED:-1} )); then
       cleanup_start=$(date +%s%3N)
-      sudo rm -rf -- "$workroot"
-      cleanup_ms=$(($(date +%s%3N) - cleanup_start))
-      cleaned=1
+      sudo rm -rf -- "$WORKLOAD_ROOT"
+      log "cleaned failed workload tree in $(($(date +%s%3N) - cleanup_start)) ms"
+      WORKLOAD_CLEANED=1
       sudo sync -f "$MOUNTPOINT" || exit_status=1
       wait_drain 600 >/dev/null || exit_status=1
-      [[ ! -e $workroot ]] || exit_status=1
+      [[ ! -e $WORKLOAD_ROOT ]] || exit_status=1
     fi
-    return "$exit_status"
+    exit "$exit_status"
   }
   trap cleanup_workloads EXIT
 
   local clone_start npm_clone_ms npm_cold_start npm_cold_ms npm_cold_sync_start npm_cold_sync_ms npm_cold_remote_start npm_cold_remote_ms
   local npm_remove_start npm_remove_ms npm_remove_sync_start npm_remove_sync_ms npm_remove_remote_start npm_remove_remote_ms
   local npm_warm_start npm_warm_ms npm_warm_sync_start npm_warm_sync_ms npm_warm_remote_start npm_warm_remote_ms
+  local npm_parallel_remove_start npm_parallel_remove_ms npm_parallel_remove_sync_start npm_parallel_remove_sync_ms npm_parallel_remove_remote_start npm_parallel_remove_remote_ms
   clone_start=$(date +%s%3N)
   clone_pinned "$NPM_WORKLOAD_REPO" "$NPM_WORKLOAD_COMMIT" "$workroot/npm-cli"
   npm_clone_ms=$(($(date +%s%3N) - clone_start))
@@ -395,6 +405,18 @@ workloads() {
   wait_drain 600 >/dev/null
   npm_warm_remote_ms=$(($(date +%s%3N) - npm_warm_remote_start))
 
+  npm_parallel_remove_start=$(date +%s%3N)
+  find "$workroot/npm-cli/node_modules" -mindepth 1 -maxdepth 1 -print0 \
+    | xargs -0 -r -P "$DELETE_JOBS" rm -rf --
+  rmdir "$workroot/npm-cli/node_modules"
+  npm_parallel_remove_ms=$(($(date +%s%3N) - npm_parallel_remove_start))
+  npm_parallel_remove_sync_start=$(date +%s%3N)
+  sudo sync -f "$MOUNTPOINT"
+  npm_parallel_remove_sync_ms=$(($(date +%s%3N) - npm_parallel_remove_sync_start))
+  npm_parallel_remove_remote_start=$(date +%s%3N)
+  wait_drain 600 >/dev/null
+  npm_parallel_remove_remote_ms=$(($(date +%s%3N) - npm_parallel_remove_remote_start))
+
   local cargo_clone_start cargo_clone_ms cargo_cold_start cargo_cold_ms cargo_cold_sync_start cargo_cold_sync_ms cargo_cold_remote_start cargo_cold_remote_ms
   local cargo_noop_start cargo_noop_ms cargo_incremental_start cargo_incremental_ms cargo_incremental_sync_start cargo_incremental_sync_ms cargo_incremental_remote_start cargo_incremental_remote_ms
   cargo_clone_start=$(date +%s%3N)
@@ -434,11 +456,11 @@ workloads() {
   wait_drain 600 >/dev/null
   cargo_incremental_remote_ms=$(($(date +%s%3N) - cargo_incremental_remote_start))
 
-  local cleanup_start
+  local cleanup_start cleanup_ms
   cleanup_start=$(date +%s%3N)
   sudo rm -rf -- "$workroot"
   cleanup_ms=$(($(date +%s%3N) - cleanup_start))
-  cleaned=1
+  WORKLOAD_CLEANED=1
   sudo sync -f "$MOUNTPOINT"
   wait_drain 600 >/dev/null
   [[ ! -e $workroot ]] || die "disposable workload tree remains after cleanup"
@@ -454,6 +476,9 @@ workloads() {
       "$npm_remove_ms" "$npm_remove_sync_ms" "$npm_remove_remote_ms" "$((npm_remove_ms + npm_remove_sync_ms + npm_remove_remote_ms))"
     printf 'npm_warm_install_ms=%s npm_warm_local_sync_ms=%s npm_warm_remote_tail_ms=%s npm_warm_end_to_end_ms=%s\n' \
       "$npm_warm_ms" "$npm_warm_sync_ms" "$npm_warm_remote_ms" "$((npm_warm_ms + npm_warm_sync_ms + npm_warm_remote_ms))"
+    printf 'npm_parallel_remove_jobs=%s npm_parallel_remove_ms=%s npm_parallel_remove_local_sync_ms=%s npm_parallel_remove_remote_tail_ms=%s npm_parallel_remove_end_to_end_ms=%s\n' \
+      "$DELETE_JOBS" "$npm_parallel_remove_ms" "$npm_parallel_remove_sync_ms" "$npm_parallel_remove_remote_ms" \
+      "$((npm_parallel_remove_ms + npm_parallel_remove_sync_ms + npm_parallel_remove_remote_ms))"
     printf 'cargo_repo=%s cargo_commit=%s clone_ms=%s\n' "$RUST_WORKLOAD_REPO" "$RUST_WORKLOAD_COMMIT" "$cargo_clone_ms"
     printf 'cargo_cold_build_ms=%s cargo_cold_local_sync_ms=%s cargo_cold_remote_tail_ms=%s cargo_cold_end_to_end_ms=%s\n' \
       "$cargo_cold_ms" "$cargo_cold_sync_ms" "$cargo_cold_remote_ms" "$((cargo_cold_ms + cargo_cold_sync_ms + cargo_cold_remote_ms))"
@@ -483,6 +508,7 @@ Environment:
   ZEROFS_BENCH_JOBS=N       Concurrent fio jobs (default 4).
   ZEROFS_NPM_WORKLOAD_*     Override the pinned npm repository and commit.
   ZEROFS_RUST_WORKLOAD_*    Override the pinned Cargo repository and commit.
+  ZEROFS_DELETE_JOBS=N      Parallel node_modules deletion workers (default 4).
 EOF
 }
 
