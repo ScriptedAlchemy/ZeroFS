@@ -171,6 +171,14 @@ impl PreparedMutation {
         self.record.sequence
     }
 
+    pub(crate) fn encoded_record_bytes(&self) -> Result<usize> {
+        usize::try_from(
+            bincode::serialized_size(&self.record)
+                .context("failed to size prepared journal mutation")?,
+        )
+        .context("prepared journal mutation size exceeds addressable memory")
+    }
+
     #[cfg(test)]
     pub(crate) fn metadata(record: MutationRecord) -> Self {
         Self {
@@ -602,6 +610,15 @@ impl Journal {
                 }
             };
         }
+        if let Err(error) = self.require_unique_local_batch_identities(&prepared) {
+            let cleanup = self.discard_prepared_batch(prepared);
+            return match cleanup {
+                Ok(()) => Err(error),
+                Err(cleanup) => {
+                    Err(error.context(format!("prepared batch cleanup also failed: {cleanup:#}")))
+                }
+            };
+        }
 
         let mut entries = Vec::with_capacity(prepared.len());
         for prepared in prepared {
@@ -840,6 +857,25 @@ impl Journal {
             }
             if index + 1 < prepared.len() {
                 expected = expected.checked_add(1).context("local sequence overflow")?;
+            }
+        }
+        Ok(())
+    }
+
+    fn require_unique_local_batch_identities(&self, prepared: &[PreparedMutation]) -> Result<()> {
+        let mut operation_ids = BTreeSet::new();
+        let mut blob_paths = BTreeSet::new();
+        for mutation in prepared {
+            if !operation_ids.insert(mutation.record.operation_id) {
+                bail!(
+                    "local publication batch contains duplicate operation ID {}",
+                    mutation.record.operation_id
+                );
+            }
+            if let Some(blob_path) = mutation.record.blob_path()
+                && !blob_paths.insert(blob_path)
+            {
+                bail!("local publication batch contains duplicate final blob path {blob_path}");
             }
         }
         Ok(())
@@ -2470,6 +2506,72 @@ mod tests {
         assert!(snapshot.records.is_empty());
         assert_eq!(snapshot.pending_blob_count, 0);
         assert_eq!(fs::read_dir(journal.root().join("tmp")).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn prepared_batch_rejects_duplicate_operation_ids_before_publication() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("writeback");
+        let journal = Journal::open(&root, identity("bucket-a")).unwrap();
+        let payload = VerifiedPayload::new(Bytes::from_static(b"payload"));
+        let first_record = put_record(1, "segments/1", b"payload");
+        let first = journal
+            .prepare_verified_put(first_record.clone(), &payload)
+            .unwrap();
+        let mut second_record = delete_record(2, "obsolete");
+        second_record.operation_id = first_record.operation_id;
+        let second = journal.prepare_metadata(second_record).unwrap();
+
+        let error = journal.publish_batch(vec![first, second]).unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("duplicate operation ID"),
+            "{error:#}"
+        );
+        let snapshot = journal.snapshot().unwrap();
+        assert_eq!(snapshot.local_seq, 0);
+        assert_eq!(snapshot.pending_blob_count, 0);
+        assert_eq!(fs::read_dir(journal.root().join("tmp")).unwrap().count(), 0);
+        drop(journal);
+
+        let recovered = Journal::open(&root, identity("bucket-a")).unwrap();
+        assert_eq!(recovered.progress().unwrap().local_seq, 0);
+        assert!(recovered.snapshot().unwrap().records.is_empty());
+    }
+
+    #[test]
+    fn prepared_batch_rejects_duplicate_final_blob_paths_before_publication_and_recovers_cleanly() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("writeback");
+        let journal = Journal::open(&root, identity("bucket-a")).unwrap();
+        let first_payload = VerifiedPayload::new(Bytes::from_static(b"one"));
+        let second_payload = VerifiedPayload::new(Bytes::from_static(b"two"));
+        let first = journal
+            .prepare_verified_put(put_record(1, "segments/1", b"one"), &first_payload)
+            .unwrap();
+        let duplicate_path = first.record.blob_path().unwrap().to_owned();
+        let mut second = journal
+            .prepare_verified_put(put_record(2, "segments/2", b"two"), &second_payload)
+            .unwrap();
+        *second.record.blob_path_mut().unwrap() = duplicate_path.clone();
+
+        let error = journal.publish_batch(vec![first, second]).unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("duplicate final blob path"),
+            "{error:#}"
+        );
+        assert!(!journal.root().join(duplicate_path).exists());
+        let snapshot = journal.snapshot().unwrap();
+        assert_eq!(snapshot.local_seq, 0);
+        assert_eq!(snapshot.pending_blob_count, 0);
+        assert!(snapshot.records.is_empty());
+        assert_eq!(fs::read_dir(journal.root().join("tmp")).unwrap().count(), 0);
+        drop(journal);
+
+        let recovered = Journal::open(&root, identity("bucket-a")).unwrap();
+        assert_eq!(recovered.progress().unwrap().local_seq, 0);
+        assert_eq!(recovered.snapshot().unwrap().pending_blob_count, 0);
     }
 
     #[test]

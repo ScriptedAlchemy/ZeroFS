@@ -7,6 +7,7 @@ use bytes::Bytes;
 use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
@@ -107,6 +108,12 @@ impl LocalJournalSink for Journal {
 }
 
 const DEFAULT_LOCAL_PREPARE_CONCURRENCY: usize = 4;
+// Blob payloads are already external files, so this bounds the serialized
+// mutation metadata retained by one redb transaction without throttling large
+// payload throughput. The record cap separately bounds transaction work when
+// mutations are individually tiny.
+const MAX_LOCAL_PUBLISH_BATCH_RECORDS: usize = 64;
+const MAX_LOCAL_PUBLISH_BATCH_RECORD_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct LocalJournaler {
@@ -129,6 +136,12 @@ struct LocalJournalerInner {
     closed: AtomicBool,
     join: Mutex<Option<JoinHandle<()>>>,
     shutdown_result: watch::Sender<Option<Result<(), LocalBarrierError>>>,
+    _retained_ram: Arc<StdMutex<Vec<AcceptedAdmission>>>,
+}
+
+struct LocalJournalerOwnership {
+    admission: Admission,
+    retained_ram: Arc<StdMutex<Vec<AcceptedAdmission>>>,
 }
 
 enum JournalCommand {
@@ -206,14 +219,18 @@ impl LocalJournaler {
             closed: false,
         });
         let (shutdown_result, _) = watch::channel(None);
+        let retained_ram = Arc::new(StdMutex::new(Vec::new()));
         let join = tokio::spawn(run_journaler(
             sink,
-            admission,
             receiver,
             progress_sender,
             local_sequence,
             observer,
             prepare_concurrency,
+            LocalJournalerOwnership {
+                admission,
+                retained_ram: retained_ram.clone(),
+            },
         ));
         Self {
             inner: Arc::new(LocalJournalerInner {
@@ -223,6 +240,7 @@ impl LocalJournaler {
                 closed: AtomicBool::new(false),
                 join: Mutex::new(Some(join)),
                 shutdown_result,
+                _retained_ram: retained_ram,
             }),
         }
     }
@@ -376,13 +394,17 @@ async fn drive_shutdown(inner: Arc<LocalJournalerInner>) {
 
 async fn run_journaler(
     sink: Arc<dyn LocalJournalSink>,
-    admission: Admission,
     mut receiver: mpsc::Receiver<JournalCommand>,
     progress: watch::Sender<LocalProgress>,
     local_sequence: Sequence,
     observer: Option<Arc<dyn LocalCommitObserver>>,
     prepare_concurrency: usize,
+    ownership: LocalJournalerOwnership,
 ) {
+    let LocalJournalerOwnership {
+        admission,
+        retained_ram,
+    } = ownership;
     let prepare_concurrency = prepare_concurrency.max(1);
     let mut next_admitted = local_sequence.saturating_add(1);
     let mut next_received = local_sequence.checked_add(1);
@@ -419,6 +441,7 @@ async fn run_journaler(
         while terminal.is_none() {
             let mut mutations = Vec::new();
             let mut ownership = Vec::new();
+            let mut encoded_record_bytes = 0_usize;
             let mut candidate = Some(next_admitted);
             while let Some(sequence) = candidate {
                 let Some((result, _, _)) = prepared.get(&sequence) else {
@@ -439,11 +462,60 @@ async fn run_journaler(
                     }
                     break;
                 }
+                if mutations.len() == MAX_LOCAL_PUBLISH_BATCH_RECORDS {
+                    break;
+                }
+                let mutation_bytes = match result {
+                    Ok(mutation) => match mutation.encoded_record_bytes() {
+                        Ok(bytes) => bytes,
+                        Err(error) => {
+                            if mutations.is_empty() {
+                                let (_, ram, disk) = prepared
+                                    .remove(&sequence)
+                                    .expect("the unsized prepared mutation still exists");
+                                drop(ram);
+                                drop(disk);
+                                terminal = Some(format!("{error:#}"));
+                            }
+                            break;
+                        }
+                    },
+                    Err(_) => unreachable!("preparation errors are handled above"),
+                };
+                if mutation_bytes > MAX_LOCAL_PUBLISH_BATCH_RECORD_BYTES {
+                    if mutations.is_empty() {
+                        let (_, ram, disk) = prepared
+                            .remove(&sequence)
+                            .expect("the oversized prepared mutation still exists");
+                        drop(ram);
+                        drop(disk);
+                        terminal = Some(format!(
+                            "prepared journal mutation {sequence} encodes to {mutation_bytes} bytes, exceeding the {MAX_LOCAL_PUBLISH_BATCH_RECORD_BYTES}-byte local publication batch limit"
+                        ));
+                    }
+                    break;
+                }
+                let Some(next_encoded_bytes) = encoded_record_bytes.checked_add(mutation_bytes)
+                else {
+                    if mutations.is_empty() {
+                        let (_, ram, disk) = prepared
+                            .remove(&sequence)
+                            .expect("the overflowed prepared mutation still exists");
+                        drop(ram);
+                        drop(disk);
+                        terminal = Some("local publication batch byte count overflow".to_owned());
+                    }
+                    break;
+                };
+                if next_encoded_bytes > MAX_LOCAL_PUBLISH_BATCH_RECORD_BYTES {
+                    break;
+                }
                 let (result, ram, disk) = prepared
                     .remove(&sequence)
                     .expect("the expected prepared mutation still exists");
                 mutations.push(result.expect("the prepared mutation was checked above"));
                 ownership.push((sequence, ram, disk));
+                encoded_record_bytes = next_encoded_bytes;
                 candidate = sequence.checked_add(1);
             }
             if terminal.is_some() {
@@ -486,17 +558,24 @@ async fn run_journaler(
                 break;
             }
 
-            for (sequence, ram, disk) in ownership {
+            for (_, _, disk) in &mut ownership {
+                if let Some(disk) = disk.take() {
+                    disk.accept();
+                }
+            }
+
+            let mut ownership = ownership.into_iter();
+            while let Some((sequence, ram, _)) = ownership.next() {
                 if let Some(observer) = &observer
                     && let Err(error) = observer.committed(sequence).await
                 {
-                    drop(ram);
-                    drop(disk);
+                    let mut retained = retained_ram
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    retained.extend(ram);
+                    retained.extend(ownership.filter_map(|(_, ram, _)| ram));
                     terminal = Some(format!("local commit observer failed: {error:#}"));
                     break;
-                }
-                if let Some(disk) = disk {
-                    disk.accept();
                 }
                 drop(ram);
                 progress.send_modify(|state| state.local_seq = sequence);
@@ -648,11 +727,25 @@ mod tests {
         publish_release: Mutex<mpsc::Receiver<()>>,
     }
 
+    struct HeadBlockingBatchSink {
+        head_release: Mutex<Option<mpsc::Receiver<()>>>,
+        prepared: tokio_mpsc::UnboundedSender<u64>,
+        published_batches: Mutex<Vec<Vec<u64>>>,
+    }
+
+    struct HeadBlockingJournalSink {
+        journal: Arc<Journal>,
+        head_release: Mutex<Option<mpsc::Receiver<()>>>,
+        prepared: tokio_mpsc::UnboundedSender<u64>,
+    }
+
     #[derive(Default)]
     struct BlockingObserver {
         entered: Notify,
         release: Notify,
     }
+
+    struct FailingObserver;
 
     #[async_trait::async_trait]
     impl LocalCommitObserver for BlockingObserver {
@@ -660,6 +753,13 @@ mod tests {
             self.entered.notify_one();
             self.release.notified().await;
             Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LocalCommitObserver for FailingObserver {
+        async fn committed(&self, _sequence: u64) -> Result<()> {
+            bail!("injected overlay handoff failure")
         }
     }
 
@@ -797,6 +897,102 @@ mod tests {
 
         fn discard(&self, _prepared: crate::writeback::journal::PreparedMutation) -> Result<()> {
             Ok(())
+        }
+    }
+
+    impl LocalJournalSink for HeadBlockingBatchSink {
+        fn prepare(
+            &self,
+            record: MutationRecord,
+            _payload: Option<&VerifiedPayload>,
+        ) -> Result<crate::writeback::journal::PreparedMutation> {
+            if record.sequence == 1 {
+                self.head_release
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("head release gate exists")
+                    .recv()
+                    .unwrap();
+            }
+            self.prepared.send(record.sequence).unwrap();
+            Ok(crate::writeback::journal::PreparedMutation::metadata(
+                record,
+            ))
+        }
+
+        fn publish(
+            &self,
+            prepared: crate::writeback::journal::PreparedMutation,
+        ) -> Result<MutationRecord> {
+            let sequence = prepared.sequence();
+            self.published_batches.lock().unwrap().push(vec![sequence]);
+            Ok(put_record(sequence, b"x"))
+        }
+
+        fn publish_batch(
+            &self,
+            prepared: Vec<crate::writeback::journal::PreparedMutation>,
+        ) -> Result<Vec<MutationRecord>> {
+            let sequences = prepared
+                .iter()
+                .map(crate::writeback::journal::PreparedMutation::sequence)
+                .collect::<Vec<_>>();
+            self.published_batches
+                .lock()
+                .unwrap()
+                .push(sequences.clone());
+            Ok(sequences
+                .into_iter()
+                .map(|sequence| put_record(sequence, b"x"))
+                .collect())
+        }
+
+        fn discard(&self, _prepared: crate::writeback::journal::PreparedMutation) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    impl LocalJournalSink for HeadBlockingJournalSink {
+        fn prepare(
+            &self,
+            record: MutationRecord,
+            payload: Option<&VerifiedPayload>,
+        ) -> Result<crate::writeback::journal::PreparedMutation> {
+            if record.sequence == 1 {
+                self.head_release
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("head release gate exists")
+                    .recv()
+                    .unwrap();
+            }
+            let sequence = record.sequence;
+            let prepared = match payload {
+                Some(payload) => self.journal.prepare_verified_put(record, payload)?,
+                None => self.journal.prepare_metadata(record)?,
+            };
+            self.prepared.send(sequence).unwrap();
+            Ok(prepared)
+        }
+
+        fn publish(
+            &self,
+            prepared: crate::writeback::journal::PreparedMutation,
+        ) -> Result<MutationRecord> {
+            self.journal.publish_prepared(prepared)
+        }
+
+        fn publish_batch(
+            &self,
+            prepared: Vec<crate::writeback::journal::PreparedMutation>,
+        ) -> Result<Vec<MutationRecord>> {
+            self.journal.publish_batch(prepared)
+        }
+
+        fn discard(&self, prepared: crate::writeback::journal::PreparedMutation) -> Result<()> {
+            self.journal.discard_prepared(prepared)
         }
     }
 
@@ -1140,6 +1336,177 @@ mod tests {
         journaler.barrier().wait_local(2).await.unwrap();
         assert_eq!(admission.used_bytes(), 0);
         journaler.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stalled_head_with_many_ready_records_publishes_bounded_batches_without_stalling() {
+        let admission = Admission::new(130);
+        let (head_release_tx, head_release_rx) = mpsc::channel();
+        let (prepared_tx, mut prepared_rx) = tokio_mpsc::unbounded_channel();
+        let sink = Arc::new(HeadBlockingBatchSink {
+            head_release: Mutex::new(Some(head_release_rx)),
+            prepared: prepared_tx,
+            published_batches: Mutex::new(Vec::new()),
+        });
+        let journaler = LocalJournaler::start_with_sink_and_observer(
+            sink.clone(),
+            admission.clone(),
+            0,
+            256,
+            256,
+            None,
+        );
+        for sequence in 1..=130 {
+            let ram = admission.reserve(1).await.unwrap().accept();
+            journaler
+                .submit_put(put_record(sequence, b"x"), Bytes::from_static(b"x"), ram)
+                .await
+                .unwrap();
+        }
+        for _ in 2..=130 {
+            tokio::time::timeout(Duration::from_secs(2), prepared_rx.recv())
+                .await
+                .expect("later preparation stalled behind the blocked head")
+                .unwrap();
+        }
+        assert!(sink.published_batches.lock().unwrap().is_empty());
+
+        head_release_tx.send(()).unwrap();
+        journaler.barrier().wait_local(130).await.unwrap();
+
+        assert_eq!(
+            sink.published_batches
+                .lock()
+                .unwrap()
+                .iter()
+                .map(Vec::len)
+                .collect::<Vec<_>>(),
+            vec![64, 64, 2]
+        );
+        assert_eq!(admission.used_bytes(), 0);
+        journaler.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn encoded_record_bytes_bound_each_ready_publication_batch() {
+        let admission = Admission::new(3);
+        let (head_release_tx, head_release_rx) = mpsc::channel();
+        let (prepared_tx, mut prepared_rx) = tokio_mpsc::unbounded_channel();
+        let sink = Arc::new(HeadBlockingBatchSink {
+            head_release: Mutex::new(Some(head_release_rx)),
+            prepared: prepared_tx,
+            published_batches: Mutex::new(Vec::new()),
+        });
+        let journaler = LocalJournaler::start_with_sink_and_observer(
+            sink.clone(),
+            admission.clone(),
+            0,
+            8,
+            8,
+            None,
+        );
+        for sequence in 1..=3 {
+            let mut record = put_record(sequence, b"x");
+            record.path = "x".repeat(8 * 1024 * 1024);
+            let ram = admission.reserve(1).await.unwrap().accept();
+            journaler
+                .submit_put(record, Bytes::from_static(b"x"), ram)
+                .await
+                .unwrap();
+        }
+        for _ in 2..=3 {
+            tokio::time::timeout(Duration::from_secs(2), prepared_rx.recv())
+                .await
+                .expect("later preparation stalled behind the blocked head")
+                .unwrap();
+        }
+
+        head_release_tx.send(()).unwrap();
+        journaler.barrier().wait_local(3).await.unwrap();
+
+        assert_eq!(
+            sink.published_batches
+                .lock()
+                .unwrap()
+                .iter()
+                .map(Vec::len)
+                .collect::<Vec<_>>(),
+            vec![1, 1, 1]
+        );
+        journaler.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn observer_failure_retains_durable_batch_ram_and_accepts_all_ssd_ownership() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("writeback");
+        let identity = JournalIdentity {
+            format_version: 1,
+            bucket_id: "bucket-observer-failure".to_owned(),
+            backend_endpoint: "sftp://example.com:23".to_owned(),
+            database_prefix: "zerofs/pilot".to_owned(),
+            backend_kind: "sftp".to_owned(),
+            encryption_key_identity_sha256: [0x55; 32],
+        };
+        let journal = Arc::new(Journal::open(&root, identity.clone()).unwrap());
+        let admission = Admission::new(10);
+        let disk = DiskAdmission::new(100, 95, 85, 10).unwrap();
+        let (head_release_tx, head_release_rx) = mpsc::channel();
+        let (prepared_tx, mut prepared_rx) = tokio_mpsc::unbounded_channel();
+        let sink = Arc::new(HeadBlockingJournalSink {
+            journal: journal.clone(),
+            head_release: Mutex::new(Some(head_release_rx)),
+            prepared: prepared_tx,
+        });
+        let journaler = LocalJournaler::start_with_sink_and_observer(
+            sink,
+            admission.clone(),
+            0,
+            8,
+            8,
+            Some(Arc::new(FailingObserver)),
+        );
+        for sequence in 1..=2 {
+            let ram = admission.reserve(1).await.unwrap().accept();
+            let disk_permit = disk.reserve(1, 1_000).await.unwrap();
+            journaler
+                .submit_put_with_disk(
+                    put_record(sequence, b"x"),
+                    Bytes::from_static(b"x"),
+                    ram,
+                    disk_permit,
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(prepared_rx.recv().await.unwrap(), 2);
+        head_release_tx.send(()).unwrap();
+
+        assert!(matches!(
+            journaler.barrier().wait_local(1).await,
+            Err(LocalBarrierError::LocalDurability(_))
+        ));
+        assert_eq!(journal.progress().unwrap().local_seq, 2);
+        assert_eq!(admission.used_bytes(), 2);
+        assert_eq!(disk.used_bytes(), 2);
+        assert!(matches!(
+            journaler.shutdown().await,
+            Err(LocalBarrierError::LocalDurability(_))
+        ));
+        drop(journaler);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while admission.used_bytes() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("retained RAM ownership was not released with the journaler");
+        drop(journal);
+
+        let recovered = Journal::open(&root, identity).unwrap();
+        assert_eq!(recovered.progress().unwrap().local_seq, 2);
+        assert_eq!(recovered.read_blob(1).unwrap(), b"x");
+        assert_eq!(recovered.read_blob(2).unwrap(), b"x");
     }
 
     #[tokio::test]
