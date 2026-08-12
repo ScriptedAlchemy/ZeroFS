@@ -19,6 +19,7 @@ from .metrics import (
 )
 from .receipts import RunReceipt
 from .runner import Runner
+from .system_io import SystemIoSnapshot, root_device, summarize_system_io
 
 
 def _rate(byte_count: int, elapsed_ms: int) -> float:
@@ -154,14 +155,19 @@ def _active_windows(
 
 
 class _MetricSampler:
-    def __init__(self, lifecycle: PilotLifecycle, output: Path) -> None:
+    def __init__(
+        self, lifecycle: PilotLifecycle, output: Path, system_io_output: Path
+    ) -> None:
         self.lifecycle = lifecycle
         self.output = output
+        self.system_io_output = system_io_output
         self.stop_event = threading.Event()
         self.thread = threading.Thread(
             target=self._run, name="writeback-metrics", daemon=True
         )
         self.error: BaseException | None = None
+        self.root_device = root_device()
+        self.system_io: list[SystemIoSnapshot] = []
 
     def start(self) -> None:
         self.thread.start()
@@ -176,8 +182,14 @@ class _MetricSampler:
 
     def _run(self) -> None:
         try:
-            with self.output.open("w", newline="", encoding="utf-8") as handle:
+            with (
+                self.output.open("w", newline="", encoding="utf-8") as handle,
+                self.system_io_output.open(
+                    "w", newline="", encoding="utf-8"
+                ) as io_handle,
+            ):
                 writer = csv.writer(handle)
+                io_writer = csv.writer(io_handle)
                 writer.writerow(
                     (
                         "timestamp_ms",
@@ -195,12 +207,33 @@ class _MetricSampler:
                         "gc_deleted_bytes",
                     )
                 )
+                io_writer.writerow(
+                    (
+                        "timestamp_ms",
+                        "root_device",
+                        "root_read_bytes",
+                        "root_write_bytes",
+                        "root_busy_ms",
+                        "some_avg10",
+                        "full_avg10",
+                        "some_total_us",
+                        "full_total_us",
+                    )
+                )
                 while not self.stop_event.is_set():
                     snapshot = self.lifecycle.metrics.snapshot()
-                    writer.writerow(
-                        (round(time.time() * 1000), *snapshot.to_dict().values())
+                    io_snapshot = SystemIoSnapshot.capture(
+                        self.lifecycle.config.proc_root,
+                        root_device=self.root_device,
                     )
+                    self.system_io.append(io_snapshot)
+                    timestamp_ms = round(time.time() * 1000)
+                    writer.writerow(
+                        (timestamp_ms, *snapshot.to_dict().values())
+                    )
+                    io_writer.writerow((timestamp_ms, *io_snapshot.to_dict().values()))
                     handle.flush()
+                    io_handle.flush()
                     self.stop_event.wait(0.05)
         except BaseException as error:
             self.error = error
@@ -315,9 +348,12 @@ class BenchmarkRunner:
             buffered_output = receipt.path("buffered-read-fio.txt")
             direct_output = receipt.path("direct-read-fio.txt")
             sample_output = receipt.path("metrics.csv")
+            system_io_output = receipt.path("system-io.csv")
             try:
                 before = self.lifecycle.metrics.snapshot()
-                sampler = _MetricSampler(self.lifecycle, sample_output)
+                sampler = _MetricSampler(
+                    self.lifecycle, sample_output, system_io_output
+                )
                 sampler.start()
                 started = time.monotonic_ns()
                 self._run_fio(
@@ -344,17 +380,6 @@ class BenchmarkRunner:
                 self.lifecycle.drain()
                 remote_end = time.monotonic_ns()
                 remote_snapshot = self.lifecycle.metrics.snapshot()
-                sampler.stop()
-                sampler = None
-                local_active_ms, remote_active_ms = _active_windows(
-                    sample_output,
-                    before_accepted=before.accepted,
-                    before_local_bytes=before.local_bytes,
-                    target_local_bytes=local_snapshot.local_bytes,
-                    before_remote_bytes=before.remote_bytes,
-                    target_remote_bytes=remote_snapshot.remote_bytes,
-                )
-
                 buffered_start = time.monotonic_ns()
                 self._run_fio(
                     name="zerofs_buffered_warm_read",
@@ -377,6 +402,22 @@ class BenchmarkRunner:
                     direct=True,
                 )
                 direct_end = time.monotonic_ns()
+                sampler.stop()
+                sampler_system_io = sampler.system_io
+                sampler = None
+                local_active_ms, remote_active_ms = _active_windows(
+                    sample_output,
+                    before_accepted=before.accepted,
+                    before_local_bytes=before.local_bytes,
+                    target_local_bytes=local_snapshot.local_bytes,
+                    before_remote_bytes=before.remote_bytes,
+                    target_remote_bytes=remote_snapshot.remote_bytes,
+                )
+                system_io = summarize_system_io(
+                    sampler_system_io,
+                    elapsed_ms=max(1, round((direct_end - started) / 1_000_000)),
+                )
+                receipt.record("system_io", system_io.to_dict())
                 maintenance_after = self.lifecycle.metrics.snapshot()
                 receipt.record("maintenance_after", maintenance_after.to_dict())
                 _assert_no_maintenance(quiescent, maintenance_after)

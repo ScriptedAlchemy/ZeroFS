@@ -28,6 +28,7 @@ from scripts.vm100_pilot.metrics import (
     wait_for_local,
 )
 from scripts.vm100_pilot.profile import CanonicalDeployment, ProfileRunner
+from scripts.vm100_pilot.system_io import SystemIoSnapshot, summarize_system_io
 from scripts.vm100_pilot.raw_sftp import RawSftpRunner, SftpEndpoint
 from scripts.vm100_pilot.receipts import RunReceipt
 from scripts.vm100_pilot.runner import CommandError, ManagedProcess
@@ -474,6 +475,43 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(result.local_active_mibps, 1024.0)
         self.assertEqual(result.remote_active_mibps, 204.8)
         self.assertEqual(result.direct_read_mibps, 2048.0)
+
+    def test_system_io_snapshot_and_summary_attribute_root_disk_pressure(self) -> None:
+        proc = Path(self.temp.name) / "proc"
+        (proc / "pressure").mkdir(parents=True)
+        (proc / "pressure" / "io").write_text(
+            "some avg10=1.25 avg60=0.50 avg300=0.10 total=1000000\n"
+            "full avg10=0.75 avg60=0.25 avg300=0.05 total=250000\n",
+            encoding="utf-8",
+        )
+        (proc / "diskstats").write_text(
+            "8 0 sda 10 0 2048 5 20 0 4096 7 0 12 14 0 0 0 0\n"
+            "8 1 sda1 8 0 1024 3 15 0 3072 4 0 8 9 0 0 0 0\n",
+            encoding="utf-8",
+        )
+        before = SystemIoSnapshot.capture(proc, root_device=(8, 1))
+        (proc / "pressure" / "io").write_text(
+            "some avg10=3.50 avg60=0.50 avg300=0.10 total=1600000\n"
+            "full avg10=2.25 avg60=0.25 avg300=0.05 total=400000\n",
+            encoding="utf-8",
+        )
+        (proc / "diskstats").write_text(
+            "8 1 sda1 9 0 3072 5 18 0 7168 8 0 508 509 0 0 0 0\n",
+            encoding="utf-8",
+        )
+        after = SystemIoSnapshot.capture(proc, root_device=(8, 1))
+
+        self.assertEqual(before.root_read_bytes, 1024 * 512)
+        self.assertEqual(before.root_write_bytes, 3072 * 512)
+        summary = summarize_system_io([before, after], elapsed_ms=1000)
+        self.assertEqual(summary.some_stall_ms, 600.0)
+        self.assertEqual(summary.full_stall_ms, 150.0)
+        self.assertEqual(summary.root_read_mib, 1.0)
+        self.assertEqual(summary.root_write_mib, 2.0)
+        self.assertEqual(summary.root_busy_ms, 500)
+        self.assertEqual(summary.root_utilization_percent, 50.0)
+        self.assertEqual(summary.peak_some_avg10, 3.5)
+        self.assertEqual(summary.peak_full_avg10, 2.25)
 
     def test_active_windows_separate_local_journal_and_remote_drain(self) -> None:
         path = Path(self.temp.name) / "metrics.csv"
