@@ -162,6 +162,18 @@ class PilotLifecycle:
             ((self.config.client_service, 60), (self.config.mount_unit, 60))
         )
 
+    def start_daemon(self) -> None:
+        self.require_vm100()
+        self._start_units(((self.config.service, 180),))
+
+    def start_client(self) -> None:
+        self.require_vm100()
+        self._start_units(((self.config.client_service, 60),))
+
+    def start_mount(self) -> None:
+        self.require_vm100()
+        self._start_units(((self.config.mount_unit, 60),))
+
     def start(self) -> dict[str, int]:
         self.require_vm100()
         units = (

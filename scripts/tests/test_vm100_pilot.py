@@ -27,6 +27,7 @@ from scripts.vm100_pilot.migration import (
     rewrite_toml_number,
     swap_exports,
 )
+from scripts.vm100_pilot.reset import FreshResetter, rewrite_storage_prefix
 from scripts.vm100_pilot.metrics import (
     TerminalWritebackError,
     WritebackSnapshot,
@@ -179,6 +180,39 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("--replacement-export", result.stdout)
         self.assertIn("--temporary-max-size-gib", result.stdout)
+
+    def test_cli_exposes_an_explicitly_confirmed_fresh_reset(self) -> None:
+        script = Path(__file__).parents[1] / "vm100-pilot.py"
+        result = subprocess.run(
+            [sys.executable, script, "reset-fresh", "--help"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--remote-prefix", result.stdout)
+        self.assertIn("--confirm-destroy-pilot", result.stdout)
+
+    def test_fresh_reset_rewrites_only_the_storage_prefix(self) -> None:
+        source = """[storage]
+url = "sftp://pilot@example.test:23/old-prefix"
+encryption_password = "${ZEROFS_PASSWORD}"
+
+[filesystem]
+max_size_gb = 128
+"""
+        rewritten = rewrite_storage_prefix(source, "new-prefix")
+        self.assertIn('url = "sftp://pilot@example.test:23/new-prefix"', rewritten)
+        self.assertIn('encryption_password = "${ZEROFS_PASSWORD}"', rewritten)
+        self.assertIn("max_size_gb = 128", rewritten)
+
+    def test_fresh_reset_rejects_a_nested_or_unchanged_remote_prefix(self) -> None:
+        source = '[storage]\nurl = "sftp://pilot@example.test:23/current"\n'
+        for prefix in ("current", "nested/path", "../escape"):
+            with self.subTest(prefix=prefix):
+                with self.assertRaises(ValueError):
+                    rewrite_storage_prefix(source, prefix)
 
     def test_interrupt_signals_a_sudo_style_parent_only_once(self) -> None:
         marker = Path(self.temp.name) / "signals"
@@ -506,6 +540,24 @@ class LifecycleTests(unittest.TestCase):
             starts[-2:], [self.config.client_service, self.config.mount_unit]
         )
 
+    def test_fresh_disk_start_can_pause_between_client_and_mount(self) -> None:
+        self.lifecycle.start_daemon()
+        self.lifecycle.start_client()
+        self.assertIn(self.config.service, self.runner.active)
+        self.assertIn(self.config.client_service, self.runner.active)
+        self.assertNotIn(self.config.mount_unit, self.runner.active)
+
+        self.lifecycle.start_mount()
+        starts = [
+            call[0][2]
+            for call in self.runner.calls
+            if call[0][:2] == ("systemctl", "start")
+        ]
+        self.assertEqual(
+            starts[-3:],
+            [self.config.service, self.config.client_service, self.config.mount_unit],
+        )
+
     def test_striped_migration_refuses_a_busy_scratch_device(self) -> None:
         class BusyDeviceRunner(FakeRunner):
             def run(
@@ -541,7 +593,9 @@ class LifecycleTests(unittest.TestCase):
             (self.config.service, self.config.client_service, self.config.mount_unit)
         )
         migrator = CutoverMigrator(
-            self.config, self.runner, self.lifecycle  # type: ignore[arg-type]
+            self.config,
+            self.runner,
+            self.lifecycle,  # type: ignore[arg-type]
         )
 
         with self.assertRaisesRegex(RuntimeError, "remained attached"):
@@ -557,6 +611,199 @@ class _StaticMetrics:
 
     def snapshot(self) -> WritebackSnapshot:
         return self.value
+
+
+class FreshResetTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        root = Path(self.temp.name) / "repo"
+        root.mkdir()
+        mount = Path(self.temp.name) / "mount"
+        mount.mkdir()
+        self.config = PilotConfig.from_mapping(
+            root,
+            {
+                "ZEROFS_PILOT_MOUNTPOINT": str(mount),
+                "ZEROFS_PILOT_INTEGRITY_FILE": str(mount / "integrity"),
+                "ZEROFS_PILOT_METADATA_DIR": str(mount / "metadata"),
+                "ZEROFS_PILOT_RESULT_DIR": str(Path(self.temp.name) / "results"),
+                "ZEROFS_PROFILE_TARGET_DIR": str(Path(self.temp.name) / "profile"),
+            },
+        )
+        self.events: list[str] = []
+
+    def _resetter(self, *, fail_provision: bool = False) -> FreshResetter:
+        events = self.events
+
+        class Lifecycle:
+            def require_vm100(self) -> None:
+                events.append("require-vm100")
+
+            def status(self) -> dict[str, object]:
+                events.append("status")
+                return {"healthy": True}
+
+            def drain(self) -> dict[str, object]:
+                events.append("drain")
+                return {"drained": True}
+
+            def stop(self) -> None:
+                events.append("stop")
+
+            def start_daemon(self) -> None:
+                events.append("start-daemon")
+
+            def start_client(self) -> None:
+                events.append("start-client")
+
+            def start_mount(self) -> None:
+                events.append("start-mount")
+
+            def start(self) -> None:
+                events.append("start-old-stack")
+
+        class ControlledResetter(FreshResetter):
+            def _read_config(self) -> str:
+                return '[storage]\nurl = "sftp://pilot@example.test:23/old"\n'
+
+            def _fast_topology(self) -> str:
+                return "fastpool/fast zfs /fast"
+
+            def _stage_fixtures(self) -> Path:
+                events.append("stage")
+                return Path("/var/tmp/reset-seed")
+
+            def _install_config_text(self, text: str) -> None:
+                events.append("install-old" if '/old"' in text else "install-new")
+
+            def _activate_fresh_state(self) -> Path:
+                events.append("activate-fresh-state")
+                return Path("/var/lib/zerofs/nbd-pilot-reset-rollback-test")
+
+            def _restore_old_state(self, backup: Path) -> None:
+                events.append("restore-old-state")
+
+            def _remove_old_state(self, backup: Path) -> None:
+                events.append("remove-old-state")
+
+            def _provision(self) -> None:
+                events.append("provision")
+                if fail_provision:
+                    raise RuntimeError("injected provision failure")
+
+            def _verify_stripe_layout(self) -> None:
+                events.append("verify-layout")
+
+            def _format_device(self) -> None:
+                events.append("format")
+
+            def _restore_fixtures(self, seed: Path) -> None:
+                events.append("restore-fixtures")
+
+            def _remove_seed(self, seed: Path) -> None:
+                events.append("remove-seed")
+
+        return ControlledResetter(
+            self.config,
+            FakeRunner(),
+            Lifecycle(),  # type: ignore[arg-type]
+        )
+
+    def test_fresh_reset_formats_before_mount_and_validates_after_restore(self) -> None:
+        result = self._resetter().run(remote_prefix="new", confirm_destroy_pilot=True)
+        self.assertTrue(result["reset"])
+        self.assertEqual(
+            self.events,
+            [
+                "require-vm100",
+                "status",
+                "stage",
+                "stop",
+                "install-new",
+                "activate-fresh-state",
+                "start-daemon",
+                "provision",
+                "start-client",
+                "verify-layout",
+                "format",
+                "start-mount",
+                "restore-fixtures",
+                "status",
+                "drain",
+                "remove-old-state",
+                "remove-seed",
+            ],
+        )
+
+    def test_fresh_reset_restores_the_old_stack_after_provision_failure(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "injected provision failure"):
+            self._resetter(fail_provision=True).run(
+                remote_prefix="new", confirm_destroy_pilot=True
+            )
+        self.assertEqual(
+            self.events[-6:],
+            [
+                "stop",
+                "install-old",
+                "restore-old-state",
+                "start-old-stack",
+                "status",
+                "remove-seed",
+            ],
+        )
+
+    def test_fresh_format_refuses_any_existing_block_signature(self) -> None:
+        class SignatureRunner(FakeRunner):
+            def run(
+                self, argv: Sequence[str | Path], **kwargs: Any
+            ) -> CompletedProcess[str]:
+                args = tuple(str(value) for value in argv)
+                self.calls.append((args, bool(kwargs.get("sudo", False))))
+                if args == ("cat", "/sys/block/nbd0/size"):
+                    return CompletedProcess(args, 0, "134217728\n", "")
+                if args[:4] == ("findmnt", "-rn", "-S", "/dev/nbd0"):
+                    return CompletedProcess(args, 1, "", "")
+                if args[:2] == ("wipefs", "-n"):
+                    return CompletedProcess(args, 0, "offset 0x0 xfs\n", "")
+                return CompletedProcess(args, 0, "", "")
+
+        runner = SignatureRunner()
+        resetter = FreshResetter(
+            self.config,
+            runner,
+            object(),  # type: ignore[arg-type]
+        )
+        with self.assertRaisesRegex(RuntimeError, "existing block signature"):
+            resetter._format_device()
+        self.assertFalse(any(call[0][0] == "mkfs.xfs" for call in runner.calls))
+
+    def test_fresh_format_targets_exact_nbd0_without_force(self) -> None:
+        class EmptyDeviceRunner(FakeRunner):
+            def run(
+                self, argv: Sequence[str | Path], **kwargs: Any
+            ) -> CompletedProcess[str]:
+                args = tuple(str(value) for value in argv)
+                self.calls.append((args, bool(kwargs.get("sudo", False))))
+                if args == ("cat", "/sys/block/nbd0/size"):
+                    return CompletedProcess(args, 0, "134217728\n", "")
+                if args[:4] == ("findmnt", "-rn", "-S", "/dev/nbd0"):
+                    return CompletedProcess(args, 1, "", "")
+                if args[:2] == ("wipefs", "-n"):
+                    return CompletedProcess(args, 0, "", "")
+                return CompletedProcess(args, 0, "", "")
+
+        runner = EmptyDeviceRunner()
+        resetter = FreshResetter(
+            self.config,
+            runner,
+            object(),  # type: ignore[arg-type]
+        )
+        resetter._format_device()
+        mkfs = next(call[0] for call in runner.calls if call[0][0] == "mkfs.xfs")
+        self.assertEqual(mkfs[-1], "/dev/nbd0")
+        self.assertNotIn("-f", mkfs)
+        self.assertFalse(any("/dev/sda" in value for value in mkfs))
 
 
 class _HealthyLifecycle:
@@ -859,7 +1106,9 @@ class WorkloadEngineTests(unittest.TestCase):
 
     def test_workload_root_is_created_with_explicit_owner(self) -> None:
         workload = WorkloadRunner(
-            self.config, self.runner, self.lifecycle  # type: ignore[arg-type]
+            self.config,
+            self.runner,
+            self.lifecycle,  # type: ignore[arg-type]
         )
         root = self.config.mountpoint / ".zerofs-workloads-test"
         workload._prepare_root(root)
@@ -869,7 +1118,9 @@ class WorkloadEngineTests(unittest.TestCase):
 
     def test_parallel_delete_removes_every_child(self) -> None:
         workload = WorkloadRunner(
-            self.config, self.runner, self.lifecycle  # type: ignore[arg-type]
+            self.config,
+            self.runner,
+            self.lifecycle,  # type: ignore[arg-type]
         )
         directory = self.config.mountpoint / "node_modules"
         for index in range(8):
@@ -923,7 +1174,9 @@ known_hosts = "/root/.ssh/known"
                 return super().run(args, **kwargs)
 
         raw = RawSftpRunner(
-            self.config, ConfigRunner(), self.lifecycle  # type: ignore[arg-type]
+            self.config,
+            ConfigRunner(),
+            self.lifecycle,  # type: ignore[arg-type]
         )
         endpoint = raw._endpoint()
         self.assertEqual(endpoint.user, "alice")

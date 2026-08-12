@@ -21,6 +21,7 @@ from scripts.vm100_pilot.lifecycle import PilotLifecycle  # noqa: E402
 from scripts.vm100_pilot.migration import StripedMigrator  # noqa: E402
 from scripts.vm100_pilot.profile import ProfileRunner  # noqa: E402
 from scripts.vm100_pilot.raw_sftp import RawSftpRunner  # noqa: E402
+from scripts.vm100_pilot.reset import FreshResetter  # noqa: E402
 from scripts.vm100_pilot.runner import Runner  # noqa: E402
 from scripts.vm100_pilot.workloads import WorkloadRunner  # noqa: E402
 
@@ -54,6 +55,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     migration.add_argument("--replacement-export")
     migration.add_argument("--temporary-max-size-gib", type=_positive)
+    reset = subcommands.add_parser(
+        "reset-fresh",
+        help="destroy and rebuild only the VM100 ZeroFS pilot on a fresh prefix",
+    )
+    reset.add_argument("--remote-prefix", required=True)
+    reset.add_argument(
+        "--confirm-destroy-pilot",
+        action="store_true",
+        required=True,
+        help="confirm that the current pilot filesystem may be replaced",
+    )
 
     for name, help_text, default_mib in (
         ("benchmark", "measure foreground, local SSD, remote, and read tiers", 1024),
@@ -133,6 +145,7 @@ def dispatch(args: argparse.Namespace, config: PilotConfig, runner: Runner) -> N
     raw = RawSftpRunner(config, runner, lifecycle)
     profile = ProfileRunner(config, runner, lifecycle, benchmark)
     migration = StripedMigrator(config, runner, lifecycle)
+    resetter = FreshResetter(config, runner, lifecycle)
 
     if args.command == "setup":
         deployed = None if args.skip_build else lifecycle.build_deploy()
@@ -152,6 +165,13 @@ def dispatch(args: argparse.Namespace, config: PilotConfig, runner: Runner) -> N
             migration.run(
                 replacement_export=args.replacement_export,
                 temporary_max_size_gib=args.temporary_max_size_gib,
+            )
+        )
+    elif args.command == "reset-fresh":
+        _emit(
+            resetter.run(
+                remote_prefix=args.remote_prefix,
+                confirm_destroy_pilot=args.confirm_destroy_pilot,
             )
         )
     elif args.command == "benchmark":
