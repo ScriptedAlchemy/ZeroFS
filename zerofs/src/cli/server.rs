@@ -424,6 +424,20 @@ async fn abort_final_flush_after_leadership_loss(fs: &ZeroFS) {
     }
 }
 
+fn listener_exit_error(
+    result: std::result::Result<std::result::Result<(), std::io::Error>, tokio::task::JoinError>,
+    unexpected_exit: bool,
+) -> Option<anyhow::Error> {
+    match result {
+        Ok(Ok(())) if unexpected_exit => {
+            Some(anyhow::anyhow!("server listener exited unexpectedly"))
+        }
+        Ok(Ok(())) => None,
+        Ok(Err(error)) => Some(anyhow::Error::new(error).context("server listener failed")),
+        Err(error) => Some(anyhow::Error::new(error).context("server listener task failed")),
+    }
+}
+
 /// Walk an error's source chain looking for an open-file-descriptor exhaustion
 /// (EMFILE/ENFILE). foyer reports these as an opaque `I/O error => coding error`
 /// whose only clue is the wrapped os error code, so detection has to go by the
@@ -971,6 +985,10 @@ pub async fn run_server(
 
     let settings = Settings::from_file(&config_path)
         .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
+    settings
+        .servers
+        .require_listener_endpoint()
+        .context("Invalid [servers] configuration")?;
 
     let db_mode = match (read_only, &checkpoint_name) {
         (false, None) => DatabaseMode::ReadWrite,
@@ -1016,19 +1034,6 @@ pub async fn run_server(
 
         if !db_mode.is_read_only() && settings.servers.nbd.is_some() {
             ensure_nbd_directory(&fs).await?;
-        }
-
-        let any_server_configured = settings.servers.nfs.is_some()
-            || settings.servers.ninep.is_some()
-            || settings.servers.nbd.is_some()
-            || settings.servers.rpc.is_some();
-        #[cfg(feature = "webui")]
-        let any_server_configured =
-            any_server_configured || settings.servers.webui.is_some();
-        if !any_server_configured {
-            return Err(anyhow::anyhow!(
-                "No servers configured. At least one server (NFS, 9P, NBD, or RPC) must be enabled."
-            ));
         }
 
         // Register the only fallible signal source before starting any
@@ -1231,8 +1236,14 @@ pub async fn run_server(
         #[cfg(feature = "webui")]
         server_handles.extend(webui_handles);
 
-        debug_assert!(!server_handles.is_empty());
+        let mut server_handles: FuturesUnordered<_> = server_handles.into_iter().collect();
+        if server_handles.is_empty() {
+            return Err(anyhow::anyhow!(
+                "no server listeners started despite validated endpoint configuration"
+            ));
+        }
 
+        let mut listener_failure = None;
         let deposed = tokio::select! {
             biased;
             _ = leadership_deposed.cancelled() => {
@@ -1250,22 +1261,40 @@ pub async fn run_server(
                 info!("Received SIGTERM, initiating graceful shutdown...");
                 false
             }
+            result = server_handles.next() => {
+                let error = listener_exit_error(
+                    result.expect("validated server handles cannot be empty"),
+                    true,
+                )
+                .expect("an unexpected listener exit must be an error");
+                tracing::error!(error = %error, "server listener stopped; initiating shutdown");
+                listener_failure = Some(error);
+                false
+            }
         };
 
         info!("Cancelling all servers and background tasks...");
         shutdown.cancel();
 
         // Retain the join future so leadership loss cannot detach serving tasks.
-        let mut serving_drain = Box::pin(futures::future::join_all(server_handles));
+        let mut serving_drain = Box::pin(async move {
+            let mut failure = None;
+            while let Some(result) = server_handles.next().await {
+                if failure.is_none() {
+                    failure = listener_exit_error(result, false);
+                }
+            }
+            failure
+        });
 
-        let deposed_while_draining_servers = if deposed {
-            true
+        let (deposed_while_draining_servers, drain_failure) = if deposed {
+            (true, None)
         } else {
             info!("Waiting for servers to exit...");
             tokio::select! {
                 biased;
-                _ = leadership_deposed.cancelled() => true,
-                _ = &mut serving_drain => false,
+                _ = leadership_deposed.cancelled() => (true, None),
+                failure = &mut serving_drain => (false, failure),
             }
         };
         if deposed_while_draining_servers {
@@ -1281,6 +1310,9 @@ pub async fn run_server(
                 tracing::warn!("serving response drain timed out after leadership loss");
             }
             return Err(leadership_lost_error());
+        }
+        if listener_failure.is_none() {
+            listener_failure = drain_failure;
         }
 
         let drain = async move {
@@ -1463,7 +1495,10 @@ pub async fn run_server(
             return Err(leadership_lost_error());
         }
 
-        Ok(())
+        match listener_failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
     .await;
 
@@ -1510,6 +1545,20 @@ pub async fn run_server(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn listener_completion_before_shutdown_is_an_error() {
+        let error = listener_exit_error(Ok(Ok(())), true).unwrap();
+        assert!(
+            error.to_string().contains("exited unexpectedly"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn listener_completion_after_shutdown_is_normal() {
+        assert!(listener_exit_error(Ok(Ok(())), false).is_none());
+    }
 
     #[tokio::test(start_paused = true)]
     async fn final_drain_aborts_a_stuck_background_caller() {

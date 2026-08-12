@@ -840,6 +840,70 @@ pub struct ServerConfig {
     pub webui: Option<WebUIConfig>,
 }
 
+impl ServerConfig {
+    fn has_listener_endpoint(&self) -> bool {
+        let has_endpoint = self
+            .nfs
+            .as_ref()
+            .and_then(|config| config.addresses.as_ref())
+            .is_some_and(|addresses| !addresses.is_empty())
+            || self.ninep.as_ref().is_some_and(NinePConfig::has_endpoint)
+            || self.nbd.as_ref().is_some_and(NbdConfig::has_endpoint)
+            || self.rpc.as_ref().is_some_and(RpcConfig::has_endpoint);
+
+        #[cfg(feature = "webui")]
+        let has_endpoint = has_endpoint
+            || self
+                .webui
+                .as_ref()
+                .is_some_and(|config| !config.addresses.is_empty());
+
+        has_endpoint
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self
+            .nfs
+            .as_ref()
+            .is_some_and(|config| config.addresses.as_ref().is_none_or(HashSet::is_empty))
+        {
+            anyhow::bail!("[servers.nfs] must configure at least one address endpoint");
+        }
+        for (name, valid) in [
+            (
+                "ninep",
+                self.ninep.as_ref().is_none_or(NinePConfig::has_endpoint),
+            ),
+            ("nbd", self.nbd.as_ref().is_none_or(NbdConfig::has_endpoint)),
+            ("rpc", self.rpc.as_ref().is_none_or(RpcConfig::has_endpoint)),
+        ] {
+            if !valid {
+                anyhow::bail!(
+                    "[servers.{name}] must configure at least one address or unix_socket endpoint"
+                );
+            }
+        }
+        if self
+            .webui
+            .as_ref()
+            .is_some_and(|config| config.addresses.is_empty())
+        {
+            anyhow::bail!("[servers.webui] must configure at least one address endpoint");
+        }
+        Ok(())
+    }
+
+    /// Require at least one endpoint that the current build can serve.
+    pub fn require_listener_endpoint(&self) -> Result<()> {
+        if !self.has_listener_endpoint() {
+            anyhow::bail!(
+                "[servers] must configure at least one listener endpoint (address or unix_socket)"
+            );
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct WebUIConfig {
@@ -889,6 +953,18 @@ pub struct NinePConfig {
     pub unix_socket: Option<PathBuf>,
 }
 
+impl NinePConfig {
+    fn has_endpoint(&self) -> bool {
+        self.addresses
+            .as_ref()
+            .is_some_and(|addresses| !addresses.is_empty())
+            || self
+                .unix_socket
+                .as_ref()
+                .is_some_and(|path| !path.as_os_str().is_empty())
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct NbdConfig {
@@ -906,6 +982,18 @@ pub struct NbdConfig {
     pub unix_socket: Option<PathBuf>,
 }
 
+impl NbdConfig {
+    fn has_endpoint(&self) -> bool {
+        self.addresses
+            .as_ref()
+            .is_some_and(|addresses| !addresses.is_empty())
+            || self
+                .unix_socket
+                .as_ref()
+                .is_some_and(|path| !path.as_os_str().is_empty())
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct RpcConfig {
@@ -921,6 +1009,18 @@ pub struct RpcConfig {
         default
     )]
     pub unix_socket: Option<PathBuf>,
+}
+
+impl RpcConfig {
+    fn has_endpoint(&self) -> bool {
+        self.addresses
+            .as_ref()
+            .is_some_and(|addresses| !addresses.is_empty())
+            || self
+                .unix_socket
+                .as_ref()
+                .is_some_and(|path| !path.as_os_str().is_empty())
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -1202,6 +1302,8 @@ impl Settings {
 
     /// Cross-section validation applied after deserialization.
     pub fn validate(&self) -> Result<()> {
+        self.servers.validate()?;
+
         if self.sftp_endpoint()?.is_some() {
             self.sftp.clone().unwrap_or_default().validate()?;
             if self.replication.is_some() {
@@ -1881,6 +1983,57 @@ encryption_password = "test"
         let temp_file = NamedTempFile::new().unwrap();
         std::fs::write(temp_file.path(), content).unwrap();
         Settings::from_file(temp_file.path().to_str().unwrap())
+    }
+
+    #[test]
+    fn rejects_server_configuration_without_a_listener_endpoint() {
+        let error = write_and_load(
+            r#"
+[cache]
+dir = "/tmp/cache"
+disk_size_gb = 1.0
+
+[storage]
+url = "file:///tmp/data"
+encryption_password = "test"
+
+[servers]
+
+[servers.nbd]
+"#,
+        )
+        .unwrap_err();
+
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("[servers.nbd]"),
+            "unexpected error: {message}"
+        );
+        assert!(message.contains("endpoint"), "unexpected error: {message}");
+    }
+
+    #[test]
+    fn serving_requires_at_least_one_configured_listener_endpoint() {
+        let settings = write_and_load(
+            r#"
+[cache]
+dir = "/tmp/cache"
+disk_size_gb = 1.0
+
+[storage]
+url = "file:///tmp/data"
+encryption_password = "test"
+
+[servers]
+"#,
+        )
+        .unwrap();
+
+        let error = settings.servers.require_listener_endpoint().unwrap_err();
+        assert!(
+            error.to_string().contains("listener endpoint"),
+            "unexpected error: {error:#}"
+        );
     }
 
     fn sftp_config(url: &str, extra: &str) -> String {
