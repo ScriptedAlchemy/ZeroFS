@@ -58,7 +58,8 @@ class RawSftpRunner:
         settings = tomllib.loads(
             self.runner.run(["cat", self.config.config_file], sudo=True).stdout
         )
-        parsed = urlsplit(str(settings.get("url", "")))
+        storage = settings.get("storage", {})
+        parsed = urlsplit(str(storage.get("url", settings.get("url", ""))))
         sftp = settings.get("sftp", {})
         if parsed.scheme != "sftp" or not parsed.username or not parsed.hostname:
             raise ValueError("pilot config does not contain a complete SFTP URL")

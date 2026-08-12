@@ -7,7 +7,7 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 from subprocess import CompletedProcess
-from typing import Any
+from typing import Any, Sequence
 
 from scripts.vm100_pilot.config import PilotConfig
 from scripts.vm100_pilot.benchmark import BenchmarkRunner, calculate_tiers
@@ -500,6 +500,35 @@ class WorkloadEngineTests(unittest.TestCase):
         self.assertEqual(self.lifecycle.stop_calls, 1)
         self.assertEqual(self.lifecycle.start_calls, 1)
         self.assertEqual(list(self.config.temp_dir.iterdir()), [])
+
+    def test_raw_endpoint_reads_the_storage_section(self) -> None:
+        class ConfigRunner(FakeRunner):
+            def run(
+                self, argv: Sequence[str | Path], **kwargs: Any
+            ) -> CompletedProcess[str]:
+                args = tuple(str(value) for value in argv)
+                if args[:1] == ("cat",):
+                    return CompletedProcess(
+                        args,
+                        0,
+                        """
+[storage]
+url = "sftp://alice@example.invalid:23/prefix"
+[sftp]
+identity_file = "/root/.ssh/id"
+known_hosts = "/root/.ssh/known"
+""",
+                        "",
+                    )
+                return super().run(args, **kwargs)
+
+        raw = RawSftpRunner(
+            self.config, ConfigRunner(), self.lifecycle  # type: ignore[arg-type]
+        )
+        endpoint = raw._endpoint()
+        self.assertEqual(endpoint.user, "alice")
+        self.assertEqual(endpoint.host, "example.invalid")
+        self.assertEqual(endpoint.port, 23)
 
 
 if __name__ == "__main__":
