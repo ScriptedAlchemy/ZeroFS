@@ -138,3 +138,27 @@ def wait_for_drain(
                 f"writeback did not drain within {timeout}s; last={last.to_dict()}"
             )
         sleep(interval)
+
+
+def wait_for_local(
+    snapshot: Callable[[], WritebackSnapshot],
+    *,
+    target_sequence: int,
+    timeout: float,
+    interval: float = 0.05,
+    monotonic: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+) -> WritebackSnapshot:
+    started = monotonic()
+    while True:
+        current = snapshot()
+        if current.terminal:
+            raise TerminalWritebackError("writeback reported a terminal error")
+        if current.local >= target_sequence:
+            return current
+        if monotonic() - started >= timeout:
+            raise TimeoutError(
+                f"writeback did not reach local sequence {target_sequence} within "
+                f"{timeout}s; last={current.to_dict()}"
+            )
+        sleep(interval)

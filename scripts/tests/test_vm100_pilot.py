@@ -16,6 +16,7 @@ from scripts.vm100_pilot.metrics import (
     TerminalWritebackError,
     WritebackSnapshot,
     wait_for_drain,
+    wait_for_local,
 )
 from scripts.vm100_pilot.profile import CanonicalDeployment, ProfileRunner
 from scripts.vm100_pilot.raw_sftp import RawSftpRunner, SftpEndpoint
@@ -181,6 +182,23 @@ class LifecycleTests(unittest.TestCase):
                 sleep=lambda delay: sleeps.append(delay),
             )
         self.assertEqual(sleeps, [])
+
+    def test_local_barrier_waits_for_the_captured_accepted_sequence(self) -> None:
+        snapshots = iter(
+            (
+                WritebackSnapshot(12, 10, 9, 1, 1, 10, 9, False),
+                WritebackSnapshot(12, 11, 9, 1, 1, 11, 9, False),
+                WritebackSnapshot(13, 12, 9, 1, 1, 12, 9, False),
+            )
+        )
+        result = wait_for_local(
+            lambda: next(snapshots),
+            target_sequence=12,
+            timeout=1,
+            sleep=lambda _: None,
+        )
+        self.assertEqual(result.local, 12)
+        self.assertEqual(result.accepted, 13)
 
     def test_stop_is_dependency_ordered(self) -> None:
         self.runner.active.update(
