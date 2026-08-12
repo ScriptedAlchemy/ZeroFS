@@ -420,9 +420,18 @@ impl RemoteSession for PooledRemoteSession {
             .map_err(remote_transport_error)?;
         let operation = bounded_sftp_request("SFTP durable write", async {
             if let Some(parent) = path.parent() {
-                lease.create_dir_all(parent).await?;
+                self.pool.ensure_directory(&mut lease, parent).await?;
             }
-            lease.write_file_durable(path, chunks).await
+            match lease.write_file_durable(path, chunks.clone()).await {
+                Err(crate::sftp_transport::TransportError::NotFound(_))
+                    if path.parent().is_some() =>
+                {
+                    let parent = path.parent().expect("parent checked above");
+                    self.pool.repair_directory(&mut lease, parent).await?;
+                    lease.write_file_durable(path, chunks).await
+                }
+                result => result,
+            }
         })
         .await;
         finish_lease(lease, operation)
@@ -1244,7 +1253,7 @@ mod tests {
         TransportError, TransportSession,
     };
     use object_store::ObjectStoreExt;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
@@ -1305,7 +1314,10 @@ mod tests {
             }
         }
 
-        async fn create_dir_all(&mut self, _path: &FilePath) -> Result<(), TransportError> {
+        async fn ensure_directory_component(
+            &mut self,
+            _path: &FilePath,
+        ) -> Result<(), TransportError> {
             Ok(())
         }
 
@@ -1372,7 +1384,10 @@ mod tests {
             }
         }
 
-        async fn create_dir_all(&mut self, _path: &FilePath) -> Result<(), TransportError> {
+        async fn ensure_directory_component(
+            &mut self,
+            _path: &FilePath,
+        ) -> Result<(), TransportError> {
             Ok(())
         }
 
@@ -1544,6 +1559,300 @@ mod tests {
         pool.shutdown().await.unwrap();
     }
 
+    #[derive(Debug, Default)]
+    struct DirectoryCacheTestState {
+        directories: Mutex<HashSet<PathBuf>>,
+        stats: Mutex<HashMap<PathBuf, usize>>,
+        mkdirs: Mutex<HashMap<PathBuf, usize>>,
+        fail_component_once: Mutex<Option<PathBuf>>,
+        parallel_leaf_barrier: Mutex<Option<Arc<Barrier>>>,
+        write_failure: Mutex<Option<TransportError>>,
+        write_attempts: AtomicUsize,
+    }
+
+    impl DirectoryCacheTestState {
+        fn count(map: &Mutex<HashMap<PathBuf, usize>>, path: &str) -> usize {
+            map.lock()
+                .unwrap()
+                .get(FilePath::new(path))
+                .copied()
+                .unwrap_or_default()
+        }
+
+        fn stat_count(&self, path: &str) -> usize {
+            Self::count(&self.stats, path)
+        }
+
+        fn mkdir_count(&self, path: &str) -> usize {
+            Self::count(&self.mkdirs, path)
+        }
+
+        fn remove_directory_tree(&self, path: &str) {
+            let path = FilePath::new(path);
+            self.directories
+                .lock()
+                .unwrap()
+                .retain(|directory| !directory.starts_with(path));
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct DirectoryCacheTestFactory(Arc<DirectoryCacheTestState>);
+
+    #[async_trait]
+    impl SessionFactory for DirectoryCacheTestFactory {
+        async fn open(
+            &self,
+            _force: tokio_util::sync::CancellationToken,
+        ) -> Result<Box<dyn TransportSession>, TransportError> {
+            Ok(Box::new(DirectoryCacheTestSession(self.0.clone())))
+        }
+    }
+
+    #[derive(Debug)]
+    struct DirectoryCacheTestSession(Arc<DirectoryCacheTestState>);
+
+    #[async_trait]
+    impl TransportSession for DirectoryCacheTestSession {
+        fn capabilities(&self) -> SftpCapabilities {
+            SftpCapabilities {
+                fsync: true,
+                hardlink: true,
+                posix_rename: true,
+            }
+        }
+
+        async fn ensure_directory_component(
+            &mut self,
+            path: &FilePath,
+        ) -> Result<(), TransportError> {
+            for component in path.components() {
+                if !matches!(component, std::path::Component::Normal(_)) {
+                    return Err(TransportError::Operation(format!(
+                        "unsafe directory path {}",
+                        path.display()
+                    )));
+                }
+            }
+            *self
+                .0
+                .stats
+                .lock()
+                .unwrap()
+                .entry(path.to_path_buf())
+                .or_default() += 1;
+            let should_fail = self
+                .0
+                .fail_component_once
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|failure| failure == path);
+            if should_fail {
+                self.0.fail_component_once.lock().unwrap().take();
+                return Err(TransportError::Operation(format!(
+                    "forced directory failure for {}",
+                    path.display()
+                )));
+            }
+            if self
+                .0
+                .directories
+                .lock()
+                .unwrap()
+                .insert(path.to_path_buf())
+            {
+                *self
+                    .0
+                    .mkdirs
+                    .lock()
+                    .unwrap()
+                    .entry(path.to_path_buf())
+                    .or_default() += 1;
+            }
+            let barrier = self.0.parallel_leaf_barrier.lock().unwrap().clone();
+            if path.parent() == Some(FilePath::new("root"))
+                && let Some(barrier) = barrier
+            {
+                barrier.wait().await;
+            }
+            tokio::task::yield_now().await;
+            Ok(())
+        }
+
+        async fn write_file_durable(
+            &mut self,
+            path: &FilePath,
+            _chunks: Vec<Bytes>,
+        ) -> Result<(), TransportError> {
+            self.0.write_attempts.fetch_add(1, Ordering::SeqCst);
+            if let Some(error) = self.0.write_failure.lock().unwrap().take() {
+                return Err(error);
+            }
+            let parent = path
+                .parent()
+                .ok_or_else(|| TransportError::NotFound(path.display().to_string()))?;
+            if !self.0.directories.lock().unwrap().contains(parent) {
+                return Err(TransportError::NotFound(path.display().to_string()));
+            }
+            Ok(())
+        }
+
+        async fn close(
+            self: Box<Self>,
+            _force: tokio_util::sync::CancellationToken,
+        ) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    async fn directory_cache_test_pool(
+        state: Arc<DirectoryCacheTestState>,
+    ) -> crate::sftp_transport::SftpSessionPool {
+        crate::sftp_transport::SftpSessionPool::new_writable(
+            Arc::new(DirectoryCacheTestFactory(state)),
+            8,
+            7,
+            7,
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn directory_cache_test_write(
+        pool: &crate::sftp_transport::SftpSessionPool,
+        path: &str,
+    ) -> RemoteResult<()> {
+        PooledRemoteSession { pool: pool.clone() }
+            .write_file_durable(FilePath::new(path), vec![Bytes::from_static(b"payload")])
+            .await
+    }
+
+    #[tokio::test]
+    async fn sibling_writes_do_not_repeat_component_stats() {
+        let state = Arc::new(DirectoryCacheTestState::default());
+        let pool = directory_cache_test_pool(state.clone()).await;
+
+        directory_cache_test_write(&pool, "root/shard-a/one")
+            .await
+            .unwrap();
+        directory_cache_test_write(&pool, "root/shard-a/two")
+            .await
+            .unwrap();
+        directory_cache_test_write(&pool, "root/shard-b/three")
+            .await
+            .unwrap();
+
+        assert_eq!(state.stat_count("root"), 1);
+        assert_eq!(state.stat_count("root/shard-a"), 1);
+        assert_eq!(state.stat_count("root/shard-b"), 1);
+        assert_eq!(state.mkdir_count("root"), 1);
+        assert_eq!(state.mkdir_count("root/shard-a"), 1);
+        assert_eq!(state.mkdir_count("root/shard-b"), 1);
+        pool.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_first_writers_single_flight_directory_creation() {
+        let state = Arc::new(DirectoryCacheTestState::default());
+        let pool = directory_cache_test_pool(state.clone()).await;
+        let writes = (0..7).map(|index| {
+            let pool = pool.clone();
+            tokio::spawn(async move {
+                directory_cache_test_write(&pool, &format!("root/shared/object-{index}")).await
+            })
+        });
+
+        for write in writes {
+            write.await.unwrap().unwrap();
+        }
+
+        assert_eq!(state.stat_count("root"), 1);
+        assert_eq!(state.stat_count("root/shared"), 1);
+        assert_eq!(state.mkdir_count("root"), 1);
+        assert_eq!(state.mkdir_count("root/shared"), 1);
+        pool.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unrelated_directory_creations_can_progress_in_parallel() {
+        let state = Arc::new(DirectoryCacheTestState::default());
+        *state.parallel_leaf_barrier.lock().unwrap() = Some(Arc::new(Barrier::new(2)));
+        let pool = directory_cache_test_pool(state.clone()).await;
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            let first = directory_cache_test_write(&pool, "root/one/object");
+            let second = directory_cache_test_write(&pool, "root/two/object");
+            futures::future::try_join(first, second).await
+        })
+        .await
+        .expect("independent directory creation must not share a global WAN lock")
+        .unwrap();
+
+        assert_eq!(state.stat_count("root"), 1);
+        assert_eq!(state.stat_count("root/one"), 1);
+        assert_eq!(state.stat_count("root/two"), 1);
+        pool.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_cached_parent_is_recreated_and_the_write_is_retried_once() {
+        let state = Arc::new(DirectoryCacheTestState::default());
+        let pool = directory_cache_test_pool(state.clone()).await;
+        directory_cache_test_write(&pool, "root/recover/first")
+            .await
+            .unwrap();
+        state.remove_directory_tree("root/recover");
+
+        directory_cache_test_write(&pool, "root/recover/second")
+            .await
+            .unwrap();
+
+        assert_eq!(state.write_attempts.load(Ordering::SeqCst), 3);
+        assert_eq!(state.stat_count("root"), 2);
+        assert_eq!(state.stat_count("root/recover"), 2);
+        assert_eq!(state.mkdir_count("root/recover"), 2);
+        pool.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_directory_creation_does_not_poison_successful_components() {
+        let state = Arc::new(DirectoryCacheTestState::default());
+        *state.fail_component_once.lock().unwrap() = Some(PathBuf::from("root/failure"));
+        let pool = directory_cache_test_pool(state.clone()).await;
+
+        directory_cache_test_write(&pool, "root/failure/first")
+            .await
+            .expect_err("the injected component failure must surface");
+        directory_cache_test_write(&pool, "root/failure/second")
+            .await
+            .unwrap();
+
+        assert_eq!(state.stat_count("root"), 1);
+        assert_eq!(state.stat_count("root/failure"), 2);
+        assert_eq!(state.mkdir_count("root"), 1);
+        assert_eq!(state.mkdir_count("root/failure"), 1);
+        pool.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn non_not_found_write_failure_is_not_retried() {
+        let state = Arc::new(DirectoryCacheTestState::default());
+        *state.write_failure.lock().unwrap() = Some(TransportError::PermissionDenied(
+            "root/denied/object".to_owned(),
+        ));
+        let pool = directory_cache_test_pool(state.clone()).await;
+
+        directory_cache_test_write(&pool, "root/denied/object")
+            .await
+            .expect_err("permission failures must surface without retrying a durable write");
+
+        assert_eq!(state.write_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(state.stat_count("root"), 1);
+        assert_eq!(state.stat_count("root/denied"), 1);
+        pool.shutdown().await.unwrap();
+    }
+
     #[tokio::test]
     async fn production_adapter_cleanup_overlaps_and_drains_before_pool_shutdown() {
         let state = Arc::new(ProtocolCleanupState::default());
@@ -1691,8 +2000,11 @@ mod tests {
             self.session.remove_file(path).await
         }
 
-        async fn create_dir_all(&mut self, path: &FilePath) -> Result<(), TransportError> {
-            self.session.create_dir_all(path).await
+        async fn ensure_directory_component(
+            &mut self,
+            path: &FilePath,
+        ) -> Result<(), TransportError> {
+            self.session.ensure_directory_component(path).await
         }
 
         async fn write_file_durable(

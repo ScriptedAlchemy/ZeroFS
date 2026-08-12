@@ -1,8 +1,9 @@
 use crate::sftp_object_store::{OBJECT_HEADER_LEN, ObjectHeader, SftpCapabilities, decode_header};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
+use dashmap::DashMap;
 use futures::{StreamExt, TryStreamExt};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::io::Write;
 use std::ops::Range;
@@ -50,6 +51,7 @@ const SFTP_IDLE_REAP_INTERVAL: Duration = Duration::from_secs(10);
 const SFTP_IDLE_WARM_FLOOR: usize = 1;
 const SFTP_POOL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(45);
 const SSH_PROCESS_FORCE_REAP_TIMEOUT: Duration = Duration::from_secs(5);
+const SFTP_DIRECTORY_CACHE_MAX_ENTRIES: usize = 64 * 1024;
 
 #[derive(Debug)]
 struct PipelinedWrite {
@@ -259,9 +261,12 @@ pub trait TransportSession: fmt::Debug + Send + Sync + 'static {
             "remove_file is not implemented by this session".to_owned(),
         ))
     }
-    async fn create_dir_all(&mut self, _path: &std::path::Path) -> Result<(), TransportError> {
+    async fn ensure_directory_component(
+        &mut self,
+        _path: &std::path::Path,
+    ) -> Result<(), TransportError> {
         Err(TransportError::Operation(
-            "create_dir_all is not implemented by this session".to_owned(),
+            "ensure_directory_component is not implemented by this session".to_owned(),
         ))
     }
     async fn write_file_durable(
@@ -908,37 +913,65 @@ impl TransportSession for OpenSshTransportSession {
             .map_err(|error| map_sftp_error(path, error))
     }
 
-    async fn create_dir_all(&mut self, path: &std::path::Path) -> Result<(), TransportError> {
+    async fn ensure_directory_component(
+        &mut self,
+        path: &std::path::Path,
+    ) -> Result<(), TransportError> {
         let sftp = self.sftp.as_ref().expect("open transport owns SFTP client");
         let mut fs = sftp.fs();
-        let mut current = PathBuf::new();
         for component in path.components() {
-            let std::path::Component::Normal(component) = component else {
+            if !matches!(component, std::path::Component::Normal(_)) {
                 return Err(TransportError::Operation(format!(
                     "unsafe directory path {}",
                     path.display()
                 )));
-            };
-            current.push(component);
-            match fs.symlink_metadata(&current).await {
-                Ok(metadata) if metadata.file_type().is_some_and(|kind| kind.is_dir()) => {}
-                Ok(_) => {
-                    return Err(TransportError::Operation(format!(
-                        "{} exists and is not a directory",
-                        current.display()
-                    )));
-                }
-                Err(openssh_sftp_client::Error::SftpError(
-                    openssh_sftp_client::error::SftpErrorKind::NoSuchFile,
-                    _,
-                )) => fs
-                    .create_dir(&current)
-                    .await
-                    .map_err(|error| map_sftp_error(&current, error))?,
-                Err(error) => return Err(map_sftp_error(&current, error)),
             }
         }
-        Ok(())
+
+        let stat_started = Instant::now();
+        let metadata = fs.symlink_metadata(path).await;
+        metrics::counter!("zerofs_sftp_directory_stats_total").increment(1);
+        metrics::histogram!("zerofs_sftp_directory_stat_duration_seconds")
+            .record(stat_started.elapsed().as_secs_f64());
+        match metadata {
+            Ok(metadata) if metadata.file_type().is_some_and(|kind| kind.is_dir()) => Ok(()),
+            Ok(_) => Err(TransportError::Operation(format!(
+                "{} exists and is not a directory",
+                path.display()
+            ))),
+            Err(openssh_sftp_client::Error::SftpError(
+                openssh_sftp_client::error::SftpErrorKind::NoSuchFile,
+                _,
+            )) => {
+                let mkdir_started = Instant::now();
+                let created = fs.create_dir(path).await;
+                metrics::counter!("zerofs_sftp_directory_mkdirs_total").increment(1);
+                metrics::histogram!("zerofs_sftp_directory_mkdir_duration_seconds")
+                    .record(mkdir_started.elapsed().as_secs_f64());
+                match created {
+                    Ok(()) => Ok(()),
+                    Err(create_error) => {
+                        // Another writer outside this pool can win the mkdir
+                        // race. Verify that result instead of turning a valid
+                        // directory into a publication failure.
+                        let verify_started = Instant::now();
+                        let verified = fs.symlink_metadata(path).await;
+                        metrics::counter!("zerofs_sftp_directory_stats_total").increment(1);
+                        metrics::histogram!("zerofs_sftp_directory_stat_duration_seconds")
+                            .record(verify_started.elapsed().as_secs_f64());
+                        match verified {
+                            Ok(metadata)
+                                if metadata.file_type().is_some_and(|kind| kind.is_dir()) =>
+                            {
+                                Ok(())
+                            }
+                            _ => Err(map_sftp_error(path, create_error)),
+                        }
+                    }
+                }
+            }
+            Err(error) => Err(map_sftp_error(path, error)),
+        }
     }
 
     async fn write_file_durable(
@@ -1160,12 +1193,54 @@ impl Drop for PhysicalSession {
     }
 }
 
+#[derive(Default)]
+struct DirectoryCache {
+    epoch: AtomicU64,
+    known: DashMap<PathBuf, u64>,
+    locks: StdMutex<HashMap<PathBuf, Weak<Mutex<()>>>>,
+}
+
+impl DirectoryCache {
+    fn contains(&self, path: &std::path::Path) -> bool {
+        let epoch = self.epoch.load(Ordering::Acquire);
+        self.known.get(path).is_some_and(|entry| *entry == epoch)
+    }
+
+    fn insert(&self, path: PathBuf, epoch: u64) {
+        if self.epoch.load(Ordering::Acquire) != epoch {
+            return;
+        }
+        if self.known.len() >= SFTP_DIRECTORY_CACHE_MAX_ENTRIES {
+            self.invalidate();
+        }
+        let epoch = self.epoch.load(Ordering::Acquire);
+        self.known.insert(path, epoch);
+    }
+
+    fn invalidate(&self) {
+        self.epoch.fetch_add(1, Ordering::AcqRel);
+        self.known.clear();
+    }
+
+    fn component_lock(&self, path: &std::path::Path) -> Arc<Mutex<()>> {
+        let mut locks = self.locks.lock().unwrap();
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(path).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(Mutex::new(()));
+        locks.insert(path.to_path_buf(), Arc::downgrade(&lock));
+        lock
+    }
+}
+
 struct PoolInner {
     factory: Arc<dyn SessionFactory>,
     shared: Arc<Semaphore>,
     admission: FairAdmission,
     idle: Mutex<VecDeque<PhysicalSession>>,
     idle_available: Notify,
+    directories: DirectoryCache,
     writable: bool,
     closed: AtomicBool,
     activity_gate: StdMutex<()>,
@@ -1404,6 +1479,56 @@ impl SftpSessionPool {
         self.inner.admission.inner.write_limit
     }
 
+    pub(crate) async fn ensure_directory(
+        &self,
+        lease: &mut SessionLease,
+        path: &std::path::Path,
+    ) -> Result<(), TransportError> {
+        self.ensure_directory_components(lease, path).await
+    }
+
+    pub(crate) async fn repair_directory(
+        &self,
+        lease: &mut SessionLease,
+        path: &std::path::Path,
+    ) -> Result<(), TransportError> {
+        self.inner.directories.invalidate();
+        metrics::counter!("zerofs_sftp_directory_cache_invalidations_total").increment(1);
+        self.ensure_directory_components(lease, path).await
+    }
+
+    async fn ensure_directory_components(
+        &self,
+        lease: &mut SessionLease,
+        path: &std::path::Path,
+    ) -> Result<(), TransportError> {
+        let mut current = PathBuf::new();
+        for component in path.components() {
+            let std::path::Component::Normal(component) = component else {
+                return Err(TransportError::Operation(format!(
+                    "unsafe directory path {}",
+                    path.display()
+                )));
+            };
+            current.push(component);
+            if self.inner.directories.contains(&current) {
+                metrics::counter!("zerofs_sftp_directory_cache_hits_total").increment(1);
+                continue;
+            }
+            let component_lock = self.inner.directories.component_lock(&current);
+            let _guard = component_lock.lock().await;
+            if self.inner.directories.contains(&current) {
+                metrics::counter!("zerofs_sftp_directory_cache_hits_total").increment(1);
+                continue;
+            }
+            metrics::counter!("zerofs_sftp_directory_cache_misses_total").increment(1);
+            let epoch = self.inner.directories.epoch.load(Ordering::Acquire);
+            lease.ensure_directory_component(&current).await?;
+            self.inner.directories.insert(current.clone(), epoch);
+        }
+        Ok(())
+    }
+
     pub async fn from_config_writable(
         factory: Arc<dyn SessionFactory>,
         config: &crate::config::SftpConfig,
@@ -1431,6 +1556,7 @@ impl SftpSessionPool {
                 admission: FairAdmission::new(shared, reads, writes),
                 idle: Mutex::new(VecDeque::new()),
                 idle_available: Notify::new(),
+                directories: DirectoryCache::default(),
                 writable: true,
                 closed: AtomicBool::new(false),
                 activity_gate: StdMutex::new(()),
@@ -1771,12 +1897,15 @@ impl SessionLease {
             .await
     }
 
-    pub async fn create_dir_all(&mut self, path: &std::path::Path) -> Result<(), TransportError> {
+    async fn ensure_directory_component(
+        &mut self,
+        path: &std::path::Path,
+    ) -> Result<(), TransportError> {
         self.session
             .as_mut()
             .expect("lease always owns a session until completion")
             .transport_mut()
-            .create_dir_all(path)
+            .ensure_directory_component(path)
             .await
     }
 
