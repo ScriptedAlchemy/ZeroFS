@@ -23,7 +23,7 @@ from .system_io import (
     BlockIoSnapshot,
     SystemIoSnapshot,
     block_device,
-    root_device,
+    filesystem_device,
     summarize_system_io,
     verify_page_cache_hit,
 )
@@ -33,6 +33,10 @@ def _rate(byte_count: int, elapsed_ms: int) -> float:
     if elapsed_ms <= 0:
         return 0.0
     return round(byte_count / 1_048_576 / (elapsed_ms / 1000), 2)
+
+
+def _monotonic_ms() -> int:
+    return time.monotonic_ns() // 1_000_000
 
 
 class BenchmarkContaminatedError(RuntimeError):
@@ -214,7 +218,11 @@ def _active_windows(
 
 class _MetricSampler:
     def __init__(
-        self, lifecycle: PilotLifecycle, output: Path, system_io_output: Path
+        self,
+        lifecycle: PilotLifecycle,
+        output: Path,
+        system_io_output: Path,
+        local_device: tuple[int, int],
     ) -> None:
         self.lifecycle = lifecycle
         self.output = output
@@ -224,7 +232,7 @@ class _MetricSampler:
             target=self._run, name="writeback-metrics", daemon=True
         )
         self.error: BaseException | None = None
-        self.root_device = root_device()
+        self.root_device = local_device
         self.system_io: list[SystemIoSnapshot] = []
 
     def start(self) -> None:
@@ -285,7 +293,7 @@ class _MetricSampler:
                         root_device=self.root_device,
                     )
                     self.system_io.append(io_snapshot)
-                    timestamp_ms = round(time.time() * 1000)
+                    timestamp_ms = _monotonic_ms()
                     writer.writerow((timestamp_ms, *snapshot.to_dict().values()))
                     io_writer.writerow((timestamp_ms, *io_snapshot.to_dict().values()))
                     handle.flush()
@@ -307,7 +315,7 @@ class BenchmarkRunner:
         self.lifecycle = lifecycle
 
     def _local_device(self) -> tuple[int, int]:
-        return root_device()
+        return filesystem_device(self.config.pilot_state_root)
 
     def _system_io(self, device: tuple[int, int]) -> SystemIoSnapshot:
         return SystemIoSnapshot.capture(self.config.proc_root, root_device=device)
@@ -409,6 +417,7 @@ class BenchmarkRunner:
         jobs: int,
         warmup_output: Path,
         hot_output: Path,
+        after_warmup: Callable[[], None] | None = None,
     ) -> DirectReadPair:
         warmup_start_ns = time.monotonic_ns()
         warmup = self._run_fio(
@@ -421,6 +430,8 @@ class BenchmarkRunner:
             direct=True,
         )
         warmup_end_ns = time.monotonic_ns()
+        if after_warmup is not None:
+            after_warmup()
         hot_start_ns = warmup_end_ns
         hot = self._run_fio(
             name="zerofs_direct_read_hot",
@@ -475,11 +486,11 @@ class BenchmarkRunner:
             system_io_output = receipt.path("system-io.csv")
             try:
                 before = self.lifecycle.metrics.snapshot()
+                phase_device = self._local_device()
                 sampler = _MetricSampler(
-                    self.lifecycle, sample_output, system_io_output
+                    self.lifecycle, sample_output, system_io_output, phase_device
                 )
                 sampler.start()
-                phase_device = self._local_device()
                 write_io_before = self._system_io(phase_device)
                 phase_windows: dict[str, dict[str, int]] = {}
 
@@ -565,13 +576,20 @@ class BenchmarkRunner:
                 page_cache = verify_page_cache_hit(nbd_before, nbd_after)
                 receipt.record("buffered_read_warmup", asdict(buffered_warmup))
                 receipt.record("page_cache_evidence", page_cache.to_dict())
+                direct_io_boundaries: list[SystemIoSnapshot] = []
                 direct_pair = self._run_direct_read_pair(
                     run_root=run_root,
                     per_job_mib=per_job_mib,
                     jobs=jobs,
                     warmup_output=direct_warmup_output,
                     hot_output=direct_output,
+                    after_warmup=lambda: direct_io_boundaries.append(
+                        self._system_io(phase_device)
+                    ),
                 )
+                if len(direct_io_boundaries) != 1:
+                    raise RuntimeError("direct warmup I/O boundary was not captured")
+                direct_warmup_io_after = direct_io_boundaries[0]
                 _validate_fio_bytes(
                     direct_pair.warmup,
                     expected_bytes=logical_bytes,
@@ -641,10 +659,16 @@ class BenchmarkRunner:
                         "page_cache_hot_read": phase_io(
                             warmup_io_after, hot_io_after, hot_start, hot_end
                         ),
-                        "direct_read": phase_io(
+                        "direct_warmup": phase_io(
                             hot_io_after,
-                            direct_io_after,
+                            direct_warmup_io_after,
                             direct_pair.warmup_start_ns,
+                            direct_pair.warmup_end_ns,
+                        ),
+                        "direct_read": phase_io(
+                            direct_warmup_io_after,
+                            direct_io_after,
+                            direct_pair.hot_start_ns,
                             direct_pair.hot_end_ns,
                         ),
                     },

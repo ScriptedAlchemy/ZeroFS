@@ -13,6 +13,7 @@ import sys
 import tempfile
 import tomllib
 import unittest
+from unittest import mock
 from contextlib import contextmanager, redirect_stdout
 from dataclasses import replace
 from pathlib import Path
@@ -25,6 +26,7 @@ from scripts.vm100_pilot.benchmark import (
     BenchmarkRunner,
     FioResult,
     _active_windows,
+    _monotonic_ms,
     _validate_fio_bytes,
     calculate_tiers,
 )
@@ -54,6 +56,7 @@ from scripts.vm100_pilot.profile import (
 from scripts.vm100_pilot.system_io import (
     BlockIoSnapshot,
     SystemIoSnapshot,
+    filesystem_device,
     summarize_system_io,
     verify_page_cache_hit,
 )
@@ -1372,12 +1375,14 @@ class BenchmarkTests(unittest.TestCase):
             jobs=1,
             warmup_output=Path(self.temp.name) / "direct-warmup.json",
             hot_output=Path(self.temp.name) / "direct-hot.json",
+            after_warmup=lambda: calls.append(("snapshot", None)),
         )
 
         self.assertEqual(
             calls,
             [
                 ("zerofs_direct_read_warmup", True),
+                ("snapshot", None),
                 ("zerofs_direct_read_hot", True),
             ],
         )
@@ -1475,6 +1480,14 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(summary.peak_some_avg10, 3.5)
         self.assertEqual(summary.peak_full_avg10, 2.25)
 
+    def test_filesystem_device_uses_the_journal_paths_device(self) -> None:
+        metadata = os.stat_result((0, 0, 0x1234, 0, 0, 0, 0, 0, 0, 0))
+        with mock.patch("scripts.vm100_pilot.system_io.os.stat", return_value=metadata):
+            self.assertEqual(
+                filesystem_device(Path("/var/lib/zerofs/nbd-pilot")),
+                (os.major(metadata.st_dev), os.minor(metadata.st_dev)),
+            )
+
     def test_active_windows_separate_local_journal_and_remote_drain(self) -> None:
         path = Path(self.temp.name) / "metrics.csv"
         path.write_text(
@@ -1496,6 +1509,13 @@ class BenchmarkTests(unittest.TestCase):
             ),
             (200, 300),
         )
+
+    def test_metric_sampling_uses_monotonic_time(self) -> None:
+        with mock.patch(
+            "scripts.vm100_pilot.benchmark.time.monotonic_ns",
+            return_value=1_234_567_890,
+        ):
+            self.assertEqual(_monotonic_ms(), 1234)
 
     def test_benchmark_rejects_a_gc_pass_inside_the_measured_epoch(self) -> None:
         from scripts.vm100_pilot.benchmark import (

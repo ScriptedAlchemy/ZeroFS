@@ -6,9 +6,13 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 
-def root_device() -> tuple[int, int]:
-    device = os.stat("/").st_dev
+def filesystem_device(path: Path) -> tuple[int, int]:
+    device = os.stat(path).st_dev
     return (os.major(device), os.minor(device))
+
+
+def root_device() -> tuple[int, int]:
+    return filesystem_device(Path("/"))
 
 
 def block_device(path: Path) -> tuple[int, int]:
