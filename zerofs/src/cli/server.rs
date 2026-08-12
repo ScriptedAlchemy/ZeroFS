@@ -16,6 +16,7 @@ use foyer::{
     BlockEngineConfig, DeviceBuilder, FsDeviceBuilder, HybridCacheBuilder, PsyncIoEngineConfig,
     S3FifoConfig, Spawner,
 };
+use futures::stream::{FuturesUnordered, StreamExt};
 use slatedb::admin::AdminBuilder;
 use slatedb::config::GarbageCollectorDirectoryOptions;
 use slatedb::config::GarbageCollectorOptions;
@@ -369,25 +370,35 @@ fn start_periodic_flush(
     })
 }
 
-async fn join_or_abort_background_tasks(mut handles: Vec<JoinHandle<()>>, deadline: Duration) {
-    if tokio::time::timeout(deadline, futures::future::join_all(handles.iter_mut()))
+async fn join_or_abort_tasks(
+    handles: Vec<JoinHandle<()>>,
+    deadline: Duration,
+    on_timeout: impl FnOnce(usize),
+) {
+    let mut handles: FuturesUnordered<_> = handles.into_iter().collect();
+    if tokio::time::timeout(deadline, async { while handles.next().await.is_some() {} })
         .await
         .is_ok()
     {
         return;
     }
 
-    tracing::warn!(
-        count = handles.len(),
-        timeout_secs = deadline.as_secs(),
-        "background tasks did not stop before final close; aborting them"
-    );
-    for handle in &handles {
+    on_timeout(handles.len());
+    for handle in handles.iter() {
         handle.abort();
     }
-    for handle in handles {
-        let _ = handle.await;
-    }
+    while handles.next().await.is_some() {}
+}
+
+async fn join_or_abort_background_tasks(handles: Vec<JoinHandle<()>>, deadline: Duration) {
+    join_or_abort_tasks(handles, deadline, |count| {
+        tracing::warn!(
+            count,
+            timeout_secs = deadline.as_secs(),
+            "background tasks did not stop before final close; aborting them"
+        );
+    })
+    .await;
 }
 
 fn leadership_lost_error() -> anyhow::Error {
@@ -1254,21 +1265,17 @@ pub async fn run_server(
 
         let drain = async move {
             info!("Waiting for background tasks to exit...");
-            if let Some(mut gc_handles) = gc_handle
-                && tokio::time::timeout(
+            if let Some(gc_handles) = gc_handle {
+                join_or_abort_tasks(
+                    gc_handles,
                     std::time::Duration::from_secs(15),
-                    futures::future::join_all(gc_handles.iter_mut()),
+                    |_| {
+                        info!(
+                            "GC tasks are still mid-pass after 15s; aborting them before final flush"
+                        );
+                    },
                 )
-                .await
-                .is_err()
-            {
-                info!("GC tasks are still mid-pass after 15s; aborting them before final flush");
-                for handle in &gc_handles {
-                    handle.abort();
-                }
-                for handle in gc_handles {
-                    let _ = handle.await;
-                }
+                .await;
             }
             if let Some(mut handle) = warm_metadata_handle
                 && tokio::time::timeout(std::time::Duration::from_secs(5), &mut handle)
@@ -1535,6 +1542,25 @@ mod tests {
         join_or_abort_background_tasks(vec![handle], std::time::Duration::from_secs(5)).await;
 
         assert_eq!(started.elapsed(), std::time::Duration::from_secs(5));
+        assert!(
+            alive_rx.await.is_err(),
+            "stuck task was not aborted and joined"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn final_drain_handles_a_task_that_finishes_while_another_is_stuck() {
+        let finished = tokio::spawn(async {});
+
+        let (alive_tx, alive_rx) = tokio::sync::oneshot::channel::<()>();
+        let stuck = tokio::spawn(async move {
+            let _alive = alive_tx;
+            std::future::pending::<()>().await;
+        });
+
+        join_or_abort_background_tasks(vec![finished, stuck], std::time::Duration::from_secs(5))
+            .await;
+
         assert!(
             alive_rx.await.is_err(),
             "stuck task was not aborted and joined"
