@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import signal
 import subprocess
 import shutil
 import sys
@@ -191,6 +193,46 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(stdout.readline().strip(), "ready")
 
         ManagedProcess(process, ("sudo", "perf")).interrupt(timeout=2)
+        stdout.close()
+
+        self.assertEqual(marker.read_text(), "1")
+
+    def test_interrupt_child_waits_for_the_supervisor_to_reap_it(self) -> None:
+        marker = Path(self.temp.name) / "child-interrupted"
+        child = Path(self.temp.name) / "profile-child.py"
+        parent = Path(self.temp.name) / "profile-supervisor.py"
+        child.write_text(
+            "import pathlib, signal, sys\n"
+            "marker = pathlib.Path(sys.argv[1])\n"
+            "def interrupted(_signum, _frame):\n"
+            "    marker.write_text('1')\n"
+            "    raise SystemExit(0)\n"
+            "signal.signal(signal.SIGINT, interrupted)\n"
+            "print('ready', flush=True)\n"
+            "signal.pause()\n",
+            encoding="utf-8",
+        )
+        parent.write_text(
+            "import subprocess, sys\n"
+            "child = subprocess.Popen([sys.executable, sys.argv[1], sys.argv[2]])\n"
+            "print('ready', flush=True)\n"
+            "raise SystemExit(child.wait())\n",
+            encoding="utf-8",
+        )
+        process = subprocess.Popen(
+            [sys.executable, parent, child, marker],
+            stdout=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        stdout = process.stdout
+        self.assertIsNotNone(stdout)
+        assert stdout is not None
+        self.assertEqual(stdout.readline().strip(), "ready")
+
+        ManagedProcess(process, ("sudo", "perf")).interrupt_child(
+            lambda pid: os.kill(pid, signal.SIGINT), timeout=2
+        )
         stdout.close()
 
         self.assertEqual(marker.read_text(), "1")
@@ -578,7 +620,7 @@ class ProfileTests(unittest.TestCase):
         )
         self.assertGreaterEqual(self.lifecycle.stop_calls, 2)
         self.assertGreaterEqual(self.lifecycle.start_calls, 2)
-        self.assertFalse(self.config.profile_target.exists())
+        self.assertTrue(self.config.profile_target.exists())
 
     def test_profile_install_failure_restores_canonical_deployment(self) -> None:
         class TestProfile(ProfileRunner):
@@ -601,7 +643,7 @@ class ProfileTests(unittest.TestCase):
             profiler.run(total_mib=4, jobs=1)
         self.assertEqual(self.binary.read_bytes(), b"canonical-binary")
         self.assertGreaterEqual(self.lifecycle.start_calls, 1)
-        self.assertFalse(self.config.profile_target.exists())
+        self.assertTrue(self.config.profile_target.exists())
 
 
 class WorkloadEngineTests(unittest.TestCase):

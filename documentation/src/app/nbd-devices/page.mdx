@@ -42,8 +42,9 @@ zerofs nbd provision-striped \
   --size 64GiB
 ```
 
-The defaults are four equal sparse lane files and a 1 MiB stripe. Both are
-configurable when the export is first created:
+The defaults are four equal sparse lane files and a 256 KiB stripe. A 1 MiB
+Linux NBD request therefore spans all four lanes instead of serializing on one
+backing inode. Both values are configurable when the export is first created:
 
 ```bash
 zerofs nbd provision-striped \

@@ -5,7 +5,7 @@ import signal
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import IO, Mapping, Sequence
+from typing import IO, Callable, Mapping, Sequence
 
 
 class CommandError(RuntimeError):
@@ -42,6 +42,44 @@ class ManagedProcess:
             # that child directly and can interrupt perf while it finalizes
             # its data header.
             self.process.send_signal(signal.SIGINT)
+            self.process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            self.terminate(timeout)
+
+    def interrupt_child(
+        self, signal_child: Callable[[int], None], timeout: float = 10.0
+    ) -> None:
+        """Interrupt one child and wait for its supervisor to reap it."""
+        if self.process.poll() is not None:
+            return
+        children_path = Path(
+            f"/proc/{self.process.pid}/task/{self.process.pid}/children"
+        )
+        try:
+            children = [int(pid) for pid in children_path.read_text().split()]
+        except (FileNotFoundError, PermissionError, ValueError):
+            discovered = subprocess.run(
+                ["ps", "-o", "pid=", "--ppid", str(self.process.pid)],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            if discovered.returncode:
+                discovered = subprocess.run(
+                    ["pgrep", "-P", str(self.process.pid)],
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+            children = [int(pid) for pid in discovered.stdout.split()]
+        if len(children) != 1:
+            raise RuntimeError(
+                f"expected one child for {' '.join(self.argv)}, found {children}"
+            )
+        signal_child(children[0])
+        try:
             self.process.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             self.terminate(timeout)

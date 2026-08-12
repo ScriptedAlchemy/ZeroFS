@@ -154,7 +154,7 @@ pub enum NbdCommands {
         #[arg(long, default_value_t = 4)]
         lanes: u8,
         /// Bytes per lane before rotating (power of two, 4KiB-64MiB)
-        #[arg(long, default_value = "1MiB", value_parser = nbd::parse_byte_size)]
+        #[arg(long, default_value = "256KiB", value_parser = nbd::parse_byte_size)]
         stripe_size: u64,
     },
 }
@@ -271,6 +271,6 @@ mod tests {
         assert_eq!(export, "vm100");
         assert_eq!(size, 64 * 1024 * 1024 * 1024);
         assert_eq!(lanes, 4);
-        assert_eq!(stripe_size, 1024 * 1024);
+        assert_eq!(stripe_size, 256 * 1024);
     }
 }

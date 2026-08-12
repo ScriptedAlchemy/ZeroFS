@@ -170,9 +170,16 @@ class CollectorGroup:
             return
         self._stopped = True
         errors: list[str] = []
+
+        def interrupt_privileged_child(pid: int) -> None:
+            self.runner.run(["kill", "-INT", str(pid)], sudo=True)
+
         for mode, process in reversed(self.processes):
             try:
-                process.interrupt() if mode == "interrupt" else process.terminate()
+                if mode == "interrupt":
+                    process.interrupt_child(interrupt_privileged_child)
+                else:
+                    process.terminate()
             except BaseException as error:
                 errors.append(f"{' '.join(process.argv)}: {error}")
         for handle in self.handles:
@@ -226,10 +233,6 @@ class ProfileRunner:
 
     def _build_profile(self) -> Path:
         self.config.require_disposable(self.config.profile_target)
-        if self.config.profile_target.exists():
-            raise RuntimeError(
-                f"profile target already exists; refusing replacement: {self.config.profile_target}"
-            )
         env = {
             "CARGO_TARGET_DIR": str(self.config.profile_target),
             "CARGO_PROFILE_RELEASE_DEBUG": "1",
@@ -298,11 +301,6 @@ class ProfileRunner:
     def _start_collectors(self, pid: int, receipt: RunReceipt) -> CollectorGroup:
         return CollectorGroup(self.runner, receipt, pid)
 
-    def _remove_profile_target(self) -> None:
-        self.config.require_disposable(self.config.profile_target)
-        if self.config.profile_target.exists():
-            shutil.rmtree(self.config.profile_target)
-
     def run(self, *, total_mib: int = 256, jobs: int = 4) -> ProfileResult:
         self.lifecycle.status()
         self.lifecycle.drain()
@@ -363,11 +361,6 @@ class ProfileRunner:
                     receipt.record(
                         "retained_canonical_backup", str(canonical.directory)
                     )
-                if not installation_started or restored:
-                    try:
-                        self._remove_profile_target()
-                    except BaseException as error:
-                        cleanup_errors.append(error)
                 receipt.record("canonical_binary_restored", restored)
                 if cleanup_errors:
                     if primary is not None:
