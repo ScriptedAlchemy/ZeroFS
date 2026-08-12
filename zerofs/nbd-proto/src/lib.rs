@@ -34,10 +34,8 @@ pub const TRANSMISSION_FLAGS: u16 = NBD_FLAG_HAS_FLAGS
     | NBD_FLAG_SEND_FLUSH
     | NBD_FLAG_SEND_FUA
     | NBD_FLAG_SEND_TRIM
-    | NBD_FLAG_SEND_WRITE_ZEROES
     | NBD_FLAG_CAN_MULTI_CONN
-    | NBD_FLAG_SEND_CACHE
-    | NBD_FLAG_CAN_FAST_ZERO;
+    | NBD_FLAG_SEND_CACHE;
 
 pub const NBD_OPT_EXPORT_NAME: u32 = 1;
 pub const NBD_OPT_ABORT: u32 = 2;
@@ -271,6 +269,17 @@ mod tests {
     fn reply_types_round_trip() {
         assert_stable(&NBDSimpleReply::new(0x1122_3344_5566_7788, NBD_SUCCESS));
         assert_stable(&NBDOptionReply::new(NBD_OPT_GO, NBD_REP_ACK, 0));
+    }
+
+    #[test]
+    fn export_info_does_not_advertise_unsupported_zero_commands() {
+        let bytes = NBDExportInfo::new(4096, TRANSMISSION_FLAGS)
+            .to_bytes()
+            .unwrap();
+        let flags = u16::from_be_bytes([bytes[8], bytes[9]]);
+        let write_zeroes_and_fast_zero = (1 << 6) | (1 << 11);
+
+        assert_eq!(flags & write_zeroes_and_fast_zero, 0);
     }
 
     #[test]

@@ -63,6 +63,7 @@ class FakeRunner(Runner):
         self.calls: list[tuple[tuple[str, ...], bool]] = []
         self.active: set[str] = set()
         self.fail_start: str | None = None
+        self.max_write_zeroes_sectors = "0"
 
     def run(
         self,
@@ -84,6 +85,14 @@ class FakeRunner(Runner):
             return CompletedProcess(args, 1, "", "")
         if args[:2] == ("test", "-e"):
             return CompletedProcess(args, 0 if Path(args[2]).exists() else 1, "", "")
+        if (
+            args[:1] == ("cat",)
+            and args[1].startswith("/sys/block/nbd")
+            and args[1].endswith("/queue/max_write_zeroes_sectors")
+        ):
+            return CompletedProcess(
+                args, 0, self.max_write_zeroes_sectors + "\n", ""
+            )
         if args[:1] == ("cat",) and Path(args[1]).is_file():
             return CompletedProcess(args, 0, Path(args[1]).read_text(), "")
         if args[:1] == ("sha256sum",) and Path(args[1]).is_file():
@@ -484,6 +493,7 @@ class LifecycleTests(unittest.TestCase):
                 super().__init__(config, runner)  # type: ignore[arg-type]
                 self.stop_calls = 0
                 self.rollback_started = False
+                self.start_requirements: list[bool] = []
 
             def stop(self) -> None:
                 self.stop_calls += 1
@@ -495,7 +505,10 @@ class LifecycleTests(unittest.TestCase):
                 else:
                     events.append("deployment-stop")
 
-            def start(self) -> dict[str, int]:
+            def start(
+                self, *, require_write_zeroes_disabled: bool = True
+            ) -> dict[str, int]:
+                self.start_requirements.append(require_write_zeroes_disabled)
                 phase = "rollback" if self.rollback_started else "replacement"
                 events.append(f"{phase}-start")
                 if phase == "replacement" and fail_new_start:
@@ -529,7 +542,9 @@ class LifecycleTests(unittest.TestCase):
         return config, runner, lifecycle, events, (module, args)
 
     def test_setup_start_failure_restores_the_predecessor_deployment(self) -> None:
-        config, _, _, events, dispatch = self._deployment_scenario(fail_new_start=True)
+        config, _, lifecycle, events, dispatch = self._deployment_scenario(
+            fail_new_start=True
+        )
         module, args = dispatch
 
         with self.assertRaisesRegex(RuntimeError, "injected replacement-start failure"):
@@ -550,6 +565,7 @@ class LifecycleTests(unittest.TestCase):
                 "rollback-status",
             ],
         )
+        self.assertEqual(getattr(lifecycle, "start_requirements"), [True, False])
 
     def test_setup_status_failure_restores_the_predecessor_deployment(self) -> None:
         config, _, _, events, dispatch = self._deployment_scenario(fail_new_status=True)
@@ -798,6 +814,41 @@ class LifecycleTests(unittest.TestCase):
         ]
         self.assertEqual(stops, [self.config.service])
         self.assertNotIn(self.config.service, self.runner.active)
+
+    def test_stale_write_zeroes_limit_refuses_configured_device_before_mount(
+        self,
+    ) -> None:
+        config = replace(self.config, nbd_device=Path("/dev/nbd7"))
+        self.runner.max_write_zeroes_sectors = "1024"
+        lifecycle = PilotLifecycle(config, self.runner)
+
+        with self.assertRaisesRegex(RuntimeError, r"/dev/nbd7.*1024"):
+            lifecycle.start()
+
+        starts = [
+            call[0][2]
+            for call in self.runner.calls
+            if call[0][:2] == ("systemctl", "start")
+        ]
+        self.assertEqual(starts, [config.service, config.client_service])
+        self.assertFalse(self.runner.active)
+        queue_call = (
+            ("cat", "/sys/block/nbd7/queue/max_write_zeroes_sectors"),
+            False,
+        )
+        self.assertIn(queue_call, self.runner.calls)
+        client_active_call = (
+            ("systemctl", "is-active", config.client_service),
+            False,
+        )
+        self.assertLess(
+            self.runner.calls.index(client_active_call),
+            self.runner.calls.index(queue_call),
+        )
+        self.assertNotIn(
+            (("cat", "/sys/block/nbd0/queue/max_write_zeroes_sectors"), False),
+            self.runner.calls,
+        )
 
     def test_storage_client_restart_keeps_the_daemon_running(self) -> None:
         self.runner.active.update(

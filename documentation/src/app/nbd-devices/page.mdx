@@ -116,6 +116,26 @@ Common `nbd-client` options have workload-dependent trade-offs:
 
 ZeroFS advertises multi-connection support. All connections share one filesystem instance and flush path, so a flush on any connection covers completed writes from every connection.
 
+After upgrading a server that no longer advertises a capability, reconnecting
+the same Linux NBD device may leave its old queue limits in place. Before
+mounting, verify the configured device reports zero for `WRITE_ZEROES`:
+
+```bash
+cat /sys/block/nbd0/queue/max_write_zeroes_sectors
+```
+
+<Warning>
+  If the result is nonzero, do not mount it: filesystems such as XFS may issue
+  an operation the new server did not advertise. For a one-time reset, first
+  unmount and disconnect every NBD device, then prove every
+  `/sys/block/nbd*/size` is zero and no `/sys/block/nbd*/pid` identifies a
+  client. Only after that proof is it safe to run `sudo modprobe -r nbd`
+  followed by `sudo modprobe nbd` and reconnect. If another NBD device must
+  remain attached, do not unload the module. Choose a never-used `/dev/nbdN`
+  instead, and update the client service, mount unit, and any
+  `ZEROFS_PILOT_NBD_DEVICE` setting to that same device.
+</Warning>
+
 ## Put a Filesystem on the Device
 
 Formatting destroys any existing contents of the export. For a new device:
@@ -132,12 +152,12 @@ Other Linux filesystems and volume managers can use the device if their block-si
 
 The NBD handshake advertises `NBD_FLAG_SEND_FLUSH`, `NBD_FLAG_SEND_FUA`, and `NBD_FLAG_CAN_MULTI_CONN`:
 
-- **FLUSH** seals and uploads the open segment, then flushes the metadata memtable. The reply is sent after both steps complete. Concurrent FLUSH and FUA requests can share one filesystem flush.
-- **FUA** on WRITE, TRIM, or WRITE_ZEROES waits for the same durability path before replying.
+- **FLUSH** waits for ZeroFS's configured client-flush barrier. Concurrent FLUSH and FUA requests can share one filesystem flush.
+- **FUA** on WRITE or TRIM waits for the same configured barrier before replying.
 - **CACHE** is accepted as a no-op.
 - **Structured replies** are not negotiated; clients use simple replies.
 
-With the default `sync_writes = false`, ordinary writes may remain buffered until the next flush. FLUSH and FUA still force the durability barrier. See [Durability and consistency](/durability) for the complete persistence model.
+With the default `sync_writes = false`, ordinary writes may remain buffered until the next flush. Without persistent writeback, FLUSH and FUA wait for the backing-store flush. With persistent writeback enabled, they wait for the local-journal durability barrier; remote publication may still be pending. The explicit `[filesystem] ignore_fsync = true` setting makes the client-flush path a no-op. See [Durability and consistency](/durability) for the complete persistence model.
 
 ## Discard and Zeroing
 
@@ -153,7 +173,10 @@ sudo zpool trim mypool
 
 TRIM deletes extent pointers for fully covered extents and debits the affected segments' live-byte counters. Segment garbage collection later deletes empty segments or repacks fragmented ones; object-store usage does not necessarily decrease immediately. See [Garbage collection](/garbage-collection).
 
-WRITE_ZEROES uses the normal write path. An extent that becomes entirely zero is reduced to a pointer deletion, but partially covered extents are rewritten. TRIM is cheaper when the caller only needs to discard data.
+ZeroFS does not advertise `WRITE_ZEROES` or fast-zero support. An unexpected
+`WRITE_ZEROES` request receives `EINVAL`; use TRIM when the caller only needs to
+discard data, or a normal WRITE when the device must contain explicit zero
+bytes.
 
 ## Resize or Remove an Export
 

@@ -133,7 +133,38 @@ class PilotLifecycle:
         if mounted.returncode == 0:
             raise RuntimeError(f"{self.config.mountpoint} remains mounted")
 
-    def _start_units(self, units: tuple[tuple[str, int], ...]) -> None:
+    def _verify_write_zeroes_disabled(self) -> None:
+        queue_limit = (
+            Path("/sys/block")
+            / self.config.nbd_device.name
+            / "queue/max_write_zeroes_sectors"
+        )
+        result = self.runner.run(["cat", queue_limit], check=False)
+        if result.returncode != 0:
+            raise RuntimeError(f"could not read {queue_limit}")
+        raw_value = result.stdout.strip()
+        try:
+            value = int(raw_value)
+        except ValueError as error:
+            raise RuntimeError(
+                f"could not verify {queue_limit}: expected an integer, got "
+                f"{raw_value!r}"
+            ) from error
+        if value != 0:
+            raise RuntimeError(
+                f"{self.config.nbd_device} reports max_write_zeroes_sectors={value}; "
+                f"refusing to mount {self.config.mountpoint}. Either reload the nbd "
+                "module only after every NBD device is unmounted and disconnected, "
+                "or configure a never-used ZEROFS_PILOT_NBD_DEVICE and update the "
+                "matching client and mount units."
+            )
+
+    def _start_units(
+        self,
+        units: tuple[tuple[str, int], ...],
+        *,
+        require_write_zeroes_disabled: bool = True,
+    ) -> None:
         self.runner.run(
             ["systemctl", "reset-failed", *(unit for unit, _ in units)],
             sudo=True,
@@ -142,6 +173,8 @@ class PilotLifecycle:
         started: list[str] = []
         try:
             for unit, timeout in units:
+                if unit == self.config.mount_unit and require_write_zeroes_disabled:
+                    self._verify_write_zeroes_disabled()
                 self.runner.run(["systemctl", "start", unit], sudo=True)
                 started.append(unit)
                 self._wait_active(unit, timeout)
@@ -174,14 +207,19 @@ class PilotLifecycle:
         self.require_vm100()
         self._start_units(((self.config.mount_unit, 60),))
 
-    def start(self) -> dict[str, int]:
+    def start(
+        self, *, require_write_zeroes_disabled: bool = True
+    ) -> dict[str, int]:
         self.require_vm100()
         units = (
             (self.config.service, 180),
             (self.config.client_service, 60),
             (self.config.mount_unit, 60),
         )
-        self._start_units(units)
+        self._start_units(
+            units,
+            require_write_zeroes_disabled=require_write_zeroes_disabled,
+        )
         return {"restarts": int(self._show(self.config.service, "NRestarts") or "0")}
 
     def restart(self) -> dict[str, int]:
@@ -288,7 +326,10 @@ class PilotLifecycle:
                         sudo=True,
                     ),
                 ),
-                ("rollback-start", self.start),
+                (
+                    "rollback-start",
+                    lambda: self.start(require_write_zeroes_disabled=False),
+                ),
                 ("rollback-status", self.status),
             )
             for operation_name, operation in rollback_operations:

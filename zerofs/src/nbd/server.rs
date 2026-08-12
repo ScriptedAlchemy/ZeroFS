@@ -477,11 +477,8 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
                     self.send_unit_result(request.cookie, result).await;
                 }
                 NBDCommand::WriteZeroes => {
-                    let result = self
-                        .handler
-                        .write_zeroes(&device, request.offset, request.length, fua)
+                    self.send_unit_result(request.cookie, Err(CommandError::InvalidArgument))
                         .await;
-                    self.send_unit_result(request.cookie, result).await;
                 }
                 NBDCommand::Cache => {
                     let result = self
@@ -615,11 +612,13 @@ mod tests {
     use crate::fs::types::{SetAttributes, SetSize};
     use crate::nbd::handler::{NBDHandler, NbdExportGates};
     use bytes::Bytes;
+    use deku::{DekuContainerRead, DekuContainerWrite};
+    use nbd_proto::{NBD_EINVAL, NBD_REQUEST_MAGIC, NBDCommand, NBDRequest, NBDSimpleReply};
     use std::io;
     use std::pin::Pin;
     use std::sync::Arc;
     use std::task::{Context, Poll};
-    use tokio::io::{AsyncRead, ReadBuf};
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
     use tokio::sync::oneshot;
     use tokio::time::{Duration, timeout};
     use tokio_util::sync::CancellationToken;
@@ -710,6 +709,73 @@ mod tests {
             .get_device(b"flush-ordering-test")
             .await
             .expect("discover test export")
+    }
+
+    #[tokio::test]
+    async fn unadvertised_write_zeroes_returns_einval_on_the_wire() {
+        let filesystem = Arc::new(
+            ZeroFS::new_in_memory()
+                .await
+                .expect("create test filesystem"),
+        );
+        let export_gates = Arc::new(NbdExportGates::default());
+        let device = single_file_export(&filesystem, &export_gates).await;
+        let (server_stream, mut client_stream) = tokio::io::duplex(1024);
+        let (reader, writer) = tokio::io::split(server_stream);
+        let mut session = NBDSession::new(
+            reader,
+            writer,
+            filesystem,
+            export_gates,
+            CancellationToken::new(),
+        );
+        let session_task = tokio::spawn(async move { session.handle_transmission(device).await });
+
+        let write_zeroes = NBDRequest {
+            magic: NBD_REQUEST_MAGIC,
+            flags: 0,
+            cmd_type: NBDCommand::WriteZeroes,
+            cookie: 0x0102_0304_0506_0708,
+            offset: 0,
+            length: 4096,
+        };
+        client_stream
+            .write_all(&write_zeroes.to_bytes().expect("encode WRITE_ZEROES"))
+            .await
+            .expect("send WRITE_ZEROES");
+
+        let mut reply_bytes = [0; 16];
+        timeout(
+            Duration::from_secs(2),
+            client_stream.read_exact(&mut reply_bytes),
+        )
+        .await
+        .expect("server replied to WRITE_ZEROES")
+        .expect("read WRITE_ZEROES reply");
+        let (_, reply) = NBDSimpleReply::from_bytes((&reply_bytes, 0)).expect("decode reply");
+        assert_eq!(reply.cookie, write_zeroes.cookie);
+        assert_eq!(
+            reply.error, NBD_EINVAL,
+            "unadvertised WRITE_ZEROES must return EINVAL"
+        );
+
+        let disconnect = NBDRequest {
+            magic: NBD_REQUEST_MAGIC,
+            flags: 0,
+            cmd_type: NBDCommand::Disconnect,
+            cookie: 0,
+            offset: 0,
+            length: 0,
+        };
+        client_stream
+            .write_all(&disconnect.to_bytes().expect("encode disconnect"))
+            .await
+            .expect("send disconnect");
+        timeout(Duration::from_secs(2), session_task)
+            .await
+            .expect("server stopped after disconnect")
+            .expect("server task did not panic")
+            .expect("server accepted disconnect");
     }
 
     #[tokio::test]

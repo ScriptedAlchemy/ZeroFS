@@ -22,7 +22,6 @@ use tokio::sync::{OwnedRwLockReadGuard, RwLock};
 use tracing::debug;
 
 const NBD_READDIR_DEFAULT_LIMIT: usize = 1000;
-const NBD_ZERO_CHUNK_SIZE: usize = 1024 * 1024;
 const NBD_STRIPE_MANIFEST_MAX_BYTES: u64 = 4096;
 
 /// Response to send back for an option
@@ -546,6 +545,9 @@ impl NBDHandler {
                     .filesystem
                     .read_file(&auth, *inode, offset, length)
                     .await?;
+                if data.len() != length as usize {
+                    return Err(CommandError::IoError);
+                }
                 Ok(data)
             }
             NbdBacking::Striped { members, .. } => {
@@ -702,64 +704,6 @@ impl NBDHandler {
         Ok(())
     }
 
-    pub async fn write_zeroes(
-        &self,
-        device: &NBDDevice,
-        offset: u64,
-        length: u32,
-        fua: bool,
-    ) -> CommandResult<()> {
-        if out_of_bounds(offset, length, device.size) {
-            return Err(CommandError::NoSpace);
-        }
-
-        if length == 0 {
-            return Ok(());
-        }
-
-        let zero_chunk = Bytes::from(vec![0u8; NBD_ZERO_CHUNK_SIZE.min(length as usize)]);
-        let write_guard = device.gate.read().await;
-        let groups = group_stripe_chunks(
-            map_stripe_chunks(&device.backing, offset, length as u64)?,
-            match &device.backing {
-                NbdBacking::Single { .. } => 1,
-                NbdBacking::Striped { members, .. } => members.len(),
-            },
-        );
-        let writes = groups
-            .into_iter()
-            .filter(|group| !group.is_empty())
-            .map(|group| {
-                let filesystem = Arc::clone(&self.filesystem);
-                let zero_chunk = zero_chunk.clone();
-                async move {
-                    let auth = AuthContext::default();
-                    for chunk in group {
-                        let mut remaining = chunk.length as usize;
-                        let mut member_offset = chunk.member_offset;
-                        while remaining > 0 {
-                            let chunk_size = remaining.min(zero_chunk.len());
-                            let chunk_data = zero_chunk.slice(..chunk_size);
-                            filesystem
-                                .write(&auth, chunk.inode, member_offset, &chunk_data)
-                                .await?;
-                            remaining -= chunk_size;
-                            member_offset += chunk_size as u64;
-                        }
-                    }
-                    Ok::<_, FsError>(())
-                }
-            });
-        try_join_all(writes).await?;
-        drop(write_guard);
-
-        if fua {
-            self.flush(device).await?;
-        }
-
-        Ok(())
-    }
-
     pub async fn cache(&self, offset: u64, length: u32, device_size: u64) -> CommandResult<()> {
         if out_of_bounds(offset, length, device_size) {
             return Err(CommandError::InvalidArgument);
@@ -872,6 +816,46 @@ mod tests {
             .await
             .expect("discover striped export");
         (filesystem, handler, device)
+    }
+
+    async fn single_file_export() -> (Arc<ZeroFS>, NBDHandler, super::NBDDevice, u64) {
+        let filesystem = Arc::new(
+            ZeroFS::new_in_memory()
+                .await
+                .expect("create test filesystem"),
+        );
+        let credentials = root_credentials();
+        let (nbd_dir, _) = filesystem
+            .mkdir(&credentials, 0, b".nbd", &SetAttributes::default())
+            .await
+            .expect("create .nbd directory");
+        let (inode, _) = filesystem
+            .create(
+                &credentials,
+                nbd_dir,
+                b"single-file-test",
+                &SetAttributes::default(),
+            )
+            .await
+            .expect("create single-file export");
+        filesystem
+            .setattr(
+                &credentials,
+                inode,
+                &SetAttributes {
+                    size: SetSize::Set(4096),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("size single-file export");
+
+        let handler = NBDHandler::new(Arc::clone(&filesystem), Arc::new(NbdExportGates::default()));
+        let device = handler
+            .get_device(b"single-file-test")
+            .await
+            .expect("discover single-file export");
+        (filesystem, handler, device, inode)
     }
 
     #[test]
@@ -1000,7 +984,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn striped_trim_and_write_zeroes_preserve_unaffected_bytes() {
+    async fn single_file_read_returns_io_error_when_backing_file_is_shorter_than_resolved() {
+        let (filesystem, handler, device, inode) = single_file_export().await;
+        filesystem
+            .setattr(
+                &root_credentials(),
+                inode,
+                &SetAttributes {
+                    size: SetSize::Set(2048),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("truncate backing file after resolving the NBD device");
+
+        assert!(matches!(
+            handler.read(&device, 0, 4096).await,
+            Err(CommandError::IoError)
+        ));
+    }
+
+    #[tokio::test]
+    async fn striped_trim_preserves_unaffected_bytes() {
         let (_filesystem, handler, device) = striped_export().await;
         let payload = Bytes::from(vec![0x5a; 24 * 1024]);
         let admission = handler.begin_mutation(&device).await;
@@ -1013,10 +1018,6 @@ mod tests {
             .trim(&device, 3 * 1024, 6 * 1024, false)
             .await
             .expect("trim across stripes");
-        handler
-            .write_zeroes(&device, 13 * 1024, 5 * 1024, false)
-            .await
-            .expect("write zeroes across stripes");
         let read_back = handler
             .read(&device, 0, payload.len() as u32)
             .await
@@ -1029,12 +1030,7 @@ mod tests {
                 .iter()
                 .all(|byte| *byte == 0x5a)
         );
-        assert!(
-            read_back[13 * 1024..18 * 1024]
-                .iter()
-                .all(|byte| *byte == 0)
-        );
-        assert!(read_back[18 * 1024..].iter().all(|byte| *byte == 0x5a));
+        assert!(read_back[13 * 1024..].iter().all(|byte| *byte == 0x5a));
     }
 
     #[tokio::test]

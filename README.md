@@ -29,7 +29,7 @@ ZeroFS differentiates itself from other "filesystem on S3" projects by:
 | | |
 |---|---|
 | **File access** | NFS and 9P servers. Use the native kernel client when an exact package is available or `zerofs mount` as a fallback. |
-| **Block access** | NBD devices with TRIM. FLUSH and FUA replies return only after data is durable. |
+| **Block access** | NBD devices with TRIM. FLUSH and FUA on WRITE/TRIM use the configured ZeroFS client-flush barrier; with persistent writeback, that barrier is the local journal rather than remote publication. |
 | **Encryption** | Extents are encrypted with XChaCha20-Poly1305. Data key wrapped via Argon2id. |
 | **Compression** | zstd or lz4, before encryption. Codec changeable at any time without migration. |
 | **Caching** | Memory and disk tiers. |
@@ -309,7 +309,7 @@ mkfs.ext4 /dev/nbd0
 zpool create mypool /dev/nbd0
 ```
 
-The handshake advertises FLUSH, FUA, and multi-connection support. FLUSH and FUA replies return only after data is durable, and a FLUSH on any connection covers all connections, so write barriers hold for ZFS pools and databases. Details: [NBD devices](https://www.zerofs.net/nbd-devices).
+The handshake advertises FLUSH, FUA, and multi-connection support. FLUSH and FUA on WRITE/TRIM wait for the configured ZeroFS client-flush barrier, and a FLUSH on any connection covers completed writes from every connection. With persistent writeback enabled, this is a local-journal barrier and does not imply that remote publication has completed. Details: [NBD devices](https://www.zerofs.net/nbd-devices).
 
 New device files are picked up at runtime. Sizes are fixed at creation: to resize, disconnect, delete, and recreate. To remove a device, disconnect the client (`nbd-client -d /dev/nbd0`), then `rm` the file.
 
