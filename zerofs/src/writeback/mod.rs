@@ -70,7 +70,7 @@ mod model_contract_tests {
             dirty_ram_bytes: 4,
             dirty_ram_capacity_bytes: 16,
             dirty_ram_operations: 1,
-            dirty_ssd_bytes: 3,
+            dirty_ssd_reserved_bytes: 3,
             dirty_ssd_capacity_bytes: 512,
             dirty_ssd_operations: 2,
             oldest_pending_age_ms: 6,

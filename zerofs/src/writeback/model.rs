@@ -134,11 +134,21 @@ pub struct MutationRecord {
 }
 
 impl MutationRecord {
-    /// Maximum UTF-8 byte length of the persisted retry text. The journal
-    /// truncates remote errors to 2,048 Unicode scalar values, each of which
-    /// can occupy four UTF-8 bytes. The small suffix covers bincode's option
-    /// and string-length encoding.
-    const MAX_RETRY_ERROR_ENCODED_BYTES: u64 = 2_048 * 4 + 16;
+    /// Bounded allowance for each persisted object-store version string.
+    /// Normal backends use short HTTP ETags, but keeping three 4 KiB slots
+    /// covers the accepted version, remote predecessor, and remote result
+    /// without making the charge depend on when retry/publication fields grow.
+    pub(crate) const MAX_PERSISTED_VERSION_BYTES: usize = 4_096;
+    /// A redb mutation entry stores the fixed-width u64 sequence key, a u32
+    /// value-end offset, and a four-byte leaf header. Charging the full header
+    /// to every entry is deliberately conservative for packed leaves.
+    const MUTATION_TABLE_ENTRY_OVERHEAD_BYTES: u64 = 8 + 4 + 4;
+    /// The remote-version table duplicates a bounded result ETag behind a
+    /// variable path key. Account for the path, encoded `(sequence, ETag)`
+    /// value, both variable-entry offsets, and a full leaf header.
+    const REMOTE_VERSION_TABLE_FIXED_BYTES: u64 = 8 + 8 + 4 + 4 + 4;
+    const MAX_BLOB_PATH: &str = "blobs/ff/00000000-0000-0000-0000-000000000000.blob";
+    const MAX_LOCAL_ETAG: &str = "wb:ffffffff-ffff-ffff-ffff-ffffffffffff:18446744073709551615";
 
     pub fn blob_path(&self) -> Option<&str> {
         match &self.kind {
@@ -179,13 +189,55 @@ impl MutationRecord {
         }
     }
 
-    /// Logical SSD charge for a pending mutation without a payload blob.
+    /// Stable SSD admission reservation for a pending mutation.
     ///
-    /// Sequence and UUID values have fixed-width bincode encodings. Using the
-    /// longest possible local ETag makes this independent of admission order,
-    /// so the caller can reserve space before allocating a sequence.
-    pub fn metadata_disk_charge(path: &str) -> bincode::Result<u64> {
+    /// The estimate covers the external blob, a conservative serialized
+    /// mutation record (including retry/version growth), and its redb table
+    /// entry. It depends only on fields known before foreground admission and
+    /// retained in the journal, so acceptance, restart recovery, metrics, and
+    /// remote release reconstruct the same value without changing the journal
+    /// format.
+    pub fn ssd_reservation_estimate(
+        path: &str,
+        source: Option<&str>,
+        payload_len: u64,
+    ) -> bincode::Result<u64> {
+        let kind = match source {
+            Some(source) => MutationKind::Rename {
+                source: source.to_owned(),
+                mode: MutationMode::Update,
+                payload_len,
+                payload_sha256: [u8::MAX; 32],
+                blob_path: Self::MAX_BLOB_PATH.to_owned(),
+            },
+            None => MutationKind::Put {
+                mode: MutationMode::Update,
+                expected_visible_version: None,
+                payload_len,
+                payload_sha256: [u8::MAX; 32],
+                blob_path: Self::MAX_BLOB_PATH.to_owned(),
+            },
+        };
         let record = Self {
+            format_version: u32::MAX,
+            sequence: u64::MAX,
+            operation_id: Uuid::nil(),
+            path: path.to_owned(),
+            kind,
+            local_etag: LocalEtag::new(Uuid::nil(), u64::MAX),
+            accepted_at_unix_ms: u64::MAX,
+            remote_predecessor_etag: None,
+            remote_result_etag: None,
+            fence: FenceClass::Fence,
+            retry_count: u32::MAX,
+            last_error: None,
+        };
+        record.ssd_reservation_bytes()
+    }
+
+    /// Compatibility wrapper for metadata-only foreground admission.
+    pub fn metadata_ssd_reservation(path: &str) -> bincode::Result<u64> {
+        Self {
             format_version: u32::MAX,
             sequence: u64::MAX,
             operation_id: Uuid::nil(),
@@ -198,20 +250,114 @@ impl MutationRecord {
             fence: FenceClass::Fence,
             retry_count: u32::MAX,
             last_error: None,
-        };
-        bincode::serialized_size(&record).and_then(|encoded| {
-            encoded
-                .checked_add(Self::MAX_RETRY_ERROR_ENCODED_BYTES)
+        }
+        .ssd_reservation_bytes()
+    }
+
+    /// Reconstruct the reservation owned by a persisted record.
+    ///
+    /// New mutations are bounded before sequence allocation. Journals created
+    /// by older binaries may contain larger version metadata, so recovery and
+    /// release expand the reservation to the record's actual logical footprint
+    /// instead of rejecting an otherwise readable journal.
+    pub fn ssd_reservation_bytes(&self) -> bincode::Result<u64> {
+        let payload_len = self.payload().map_or(0, |(payload_len, _)| payload_len);
+        let mut normalized = self.clone();
+        normalized.local_etag.0 =
+            Self::larger_value(&normalized.local_etag.0, Self::MAX_LOCAL_ETAG);
+        if let Some(blob_path) = normalized.blob_path_mut()
+            && blob_path.len() < Self::MAX_BLOB_PATH.len()
+        {
+            *blob_path = Self::MAX_BLOB_PATH.to_owned();
+        }
+        if let MutationKind::Put {
+            expected_visible_version,
+            ..
+        } = &mut normalized.kind
+        {
+            *expected_visible_version = Some(Self::larger_value(
+                expected_visible_version.as_deref().unwrap_or_default(),
+                &"v".repeat(Self::MAX_PERSISTED_VERSION_BYTES),
+            ));
+        }
+        normalized.remote_predecessor_etag = Some(Self::larger_value(
+            normalized
+                .remote_predecessor_etag
+                .as_deref()
+                .unwrap_or_default(),
+            &"p".repeat(Self::MAX_PERSISTED_VERSION_BYTES),
+        ));
+        normalized.remote_result_etag = Some(Self::larger_value(
+            normalized.remote_result_etag.as_deref().unwrap_or_default(),
+            &"r".repeat(Self::MAX_PERSISTED_VERSION_BYTES),
+        ));
+        normalized.last_error = Some(Self::larger_value(
+            normalized.last_error.as_deref().unwrap_or_default(),
+            &"\u{10ffff}".repeat(2_048),
+        ));
+        let future_result_len = normalized
+            .remote_result_etag
+            .as_ref()
+            .map_or(0, String::len) as u64;
+        let future_remote_version_entry = [
+            self.path.len() as u64,
+            future_result_len,
+            Self::REMOTE_VERSION_TABLE_FIXED_BYTES,
+        ]
+        .into_iter()
+        .try_fold(0_u64, |total, bytes| {
+            total
+                .checked_add(bytes)
+                .ok_or_else(|| Box::new(bincode::ErrorKind::SizeLimit))
+        })?;
+        [
+            payload_len,
+            bincode::serialized_size(&normalized)?,
+            Self::MUTATION_TABLE_ENTRY_OVERHEAD_BYTES,
+            future_remote_version_entry,
+        ]
+        .into_iter()
+        .try_fold(0_u64, |total, bytes| {
+            total
+                .checked_add(bytes)
                 .ok_or_else(|| Box::new(bincode::ErrorKind::SizeLimit))
         })
     }
 
-    pub fn disk_charge_bytes(&self) -> bincode::Result<u64> {
-        match self.payload() {
-            Some((payload_len, _)) => Ok(payload_len),
-            None => Self::metadata_disk_charge(&self.path),
+    fn larger_value(actual: &str, bound: &str) -> String {
+        if actual.len() > bound.len() {
+            actual.to_owned()
+        } else {
+            bound.to_owned()
         }
     }
+
+    pub fn validate_persisted_version_field(
+        field: &'static str,
+        value: Option<&str>,
+    ) -> Result<(), PersistedMetadataError> {
+        let Some(value) = value else {
+            return Ok(());
+        };
+        if value.len() > Self::MAX_PERSISTED_VERSION_BYTES {
+            return Err(PersistedMetadataError::VersionFieldTooLarge {
+                field,
+                actual: value.len(),
+                maximum: Self::MAX_PERSISTED_VERSION_BYTES,
+            });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PersistedMetadataError {
+    #[error("persisted {field} is {actual} bytes; maximum is {maximum} bytes")]
+    VersionFieldTooLarge {
+        field: &'static str,
+        actual: usize,
+        maximum: usize,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -242,7 +388,7 @@ pub struct WritebackStatus {
     pub dirty_ram_bytes: u64,
     pub dirty_ram_capacity_bytes: u64,
     pub dirty_ram_operations: u64,
-    pub dirty_ssd_bytes: u64,
+    pub dirty_ssd_reserved_bytes: u64,
     pub dirty_ssd_capacity_bytes: u64,
     pub dirty_ssd_operations: u64,
     pub oldest_pending_age_ms: u64,
@@ -251,4 +397,159 @@ pub struct WritebackStatus {
     pub remote_operations_completed: u64,
     pub retries: u64,
     pub terminal_error: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FenceClass, LocalEtag, MutationKind, MutationMode, MutationRecord};
+    use uuid::Uuid;
+
+    fn record(kind: MutationKind) -> MutationRecord {
+        MutationRecord {
+            format_version: 1,
+            sequence: 7,
+            operation_id: Uuid::from_u128(0x1234),
+            path: "target/object".to_owned(),
+            kind,
+            local_etag: LocalEtag::new(Uuid::from_u128(0x5678), 7),
+            accepted_at_unix_ms: 1_700_000_000_000,
+            remote_predecessor_etag: None,
+            remote_result_etag: None,
+            fence: FenceClass::Fence,
+            retry_count: 0,
+            last_error: None,
+        }
+    }
+
+    #[test]
+    fn payload_disk_charge_covers_blob_serialized_record_and_redb_entry() {
+        let payload_len = 1;
+        let payload_sha256 = [0x42; 32];
+        let blob_path = "blobs/07/00000000-0000-0000-0000-000000001234.blob".to_owned();
+        let records = [
+            record(MutationKind::Put {
+                mode: MutationMode::Overwrite,
+                expected_visible_version: None,
+                payload_len,
+                payload_sha256,
+                blob_path: blob_path.clone(),
+            }),
+            record(MutationKind::Copy {
+                source: "source/object".to_owned(),
+                mode: MutationMode::Create,
+                payload_len,
+                payload_sha256,
+                blob_path: blob_path.clone(),
+            }),
+            record(MutationKind::Rename {
+                source: "source/object".to_owned(),
+                mode: MutationMode::Overwrite,
+                payload_len,
+                payload_sha256,
+                blob_path,
+            }),
+        ];
+
+        for record in records {
+            let serialized_record = bincode::serialized_size(&record).unwrap();
+            let redb_sequence_key_and_value_offset = 12;
+            let minimum_persisted_bytes =
+                payload_len + serialized_record + redb_sequence_key_and_value_offset;
+
+            assert!(
+                record.ssd_reservation_bytes().unwrap() >= minimum_persisted_bytes,
+                "payload charge must cover its blob and mutation-table entry: {:?}",
+                record.kind
+            );
+        }
+    }
+
+    #[test]
+    fn payload_disk_charge_is_stable_as_retry_metadata_grows() {
+        let mut record = record(MutationKind::Put {
+            mode: MutationMode::Update,
+            expected_visible_version: Some("expected-version".to_owned()),
+            payload_len: 1,
+            payload_sha256: [0x42; 32],
+            blob_path: "blobs/07/00000000-0000-0000-0000-000000001234.blob".to_owned(),
+        });
+        record.remote_predecessor_etag = Some("remote-predecessor".to_owned());
+        let accepted_charge = record.ssd_reservation_bytes().unwrap();
+
+        record.retry_count = 17;
+        record.last_error = Some("\u{10ffff}".repeat(2_048));
+
+        assert_eq!(record.ssd_reservation_bytes().unwrap(), accepted_charge);
+    }
+
+    #[test]
+    fn legacy_payload_charge_expands_for_metadata_larger_than_the_foreground_allowance() {
+        let mut record = record(MutationKind::Put {
+            mode: MutationMode::Update,
+            expected_visible_version: Some("e".repeat(5_000)),
+            payload_len: 1,
+            payload_sha256: [0x42; 32],
+            blob_path: "blobs/07/00000000-0000-0000-0000-000000001234.blob".to_owned(),
+        });
+        record.remote_predecessor_etag = Some("p".repeat(5_000));
+        record.remote_result_etag = Some("r".repeat(5_000));
+        record.last_error = Some("\u{10ffff}".repeat(2_048));
+
+        let actual_persisted_bytes = 1
+            + bincode::serialized_size(&record).unwrap()
+            + MutationRecord::MUTATION_TABLE_ENTRY_OVERHEAD_BYTES;
+        assert!(record.ssd_reservation_bytes().unwrap() >= actual_persisted_bytes);
+    }
+
+    #[test]
+    fn reservation_covers_a_maximum_result_etag_in_both_durable_tables() {
+        let maximum_etag = "e".repeat(MutationRecord::MAX_PERSISTED_VERSION_BYTES);
+        let mut record = record(MutationKind::Put {
+            mode: MutationMode::Update,
+            expected_visible_version: Some("v".repeat(MutationRecord::MAX_PERSISTED_VERSION_BYTES)),
+            payload_len: 1,
+            payload_sha256: [0x42; 32],
+            blob_path: "blobs/07/00000000-0000-0000-0000-000000001234.blob".to_owned(),
+        });
+        record.remote_predecessor_etag =
+            Some("p".repeat(MutationRecord::MAX_PERSISTED_VERSION_BYTES));
+        record.remote_result_etag = Some(maximum_etag.clone());
+        record.last_error = Some("\u{10ffff}".repeat(2_048));
+        let remote_version_entry = bincode::serialized_size(&(record.sequence, maximum_etag))
+            .unwrap()
+            + record.path.len() as u64
+            + 12;
+        let minimum_reserved = 1
+            + bincode::serialized_size(&record).unwrap()
+            + MutationRecord::MUTATION_TABLE_ENTRY_OVERHEAD_BYTES
+            + remote_version_entry;
+
+        assert!(record.ssd_reservation_bytes().unwrap() >= minimum_reserved);
+    }
+
+    #[test]
+    fn legacy_reservation_keeps_oversized_versions_and_future_growth_allowances() {
+        let mut pending = record(MutationKind::Put {
+            mode: MutationMode::Overwrite,
+            expected_visible_version: Some("e".repeat(50_000)),
+            payload_len: 1,
+            payload_sha256: [0x42; 32],
+            blob_path: "blobs/07/00000000-0000-0000-0000-000000001234.blob".to_owned(),
+        });
+        pending.remote_predecessor_etag = Some("p".repeat(50_000));
+        let reserved_before_remote = pending.ssd_reservation_bytes().unwrap();
+
+        let maximum_result = "r".repeat(MutationRecord::MAX_PERSISTED_VERSION_BYTES);
+        pending.remote_result_etag = Some(maximum_result.clone());
+        pending.last_error = Some("\u{10ffff}".repeat(2_048));
+        let remote_version_entry = pending.path.len() as u64
+            + bincode::serialized_size(&(pending.sequence, maximum_result)).unwrap()
+            + 12;
+        let post_mark_footprint = 1
+            + bincode::serialized_size(&pending).unwrap()
+            + MutationRecord::MUTATION_TABLE_ENTRY_OVERHEAD_BYTES
+            + remote_version_entry;
+
+        assert!(reserved_before_remote >= post_mark_footprint);
+    }
 }

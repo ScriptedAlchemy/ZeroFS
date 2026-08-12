@@ -740,7 +740,7 @@ class LifecycleTests(unittest.TestCase):
                     "zerofs_writeback_local_sequence 8",
                     "zerofs_writeback_remote_sequence 7",
                     "zerofs_writeback_dirty_ram_bytes 6",
-                    "zerofs_writeback_dirty_ssd_bytes 5",
+                    "zerofs_writeback_dirty_ssd_reserved_bytes 5",
                     "zerofs_writeback_local_bytes_completed_total 4",
                     "zerofs_writeback_remote_bytes_completed_total 3",
                     "zerofs_writeback_terminal_error 0",
@@ -765,7 +765,7 @@ class LifecycleTests(unittest.TestCase):
                     "zerofs_writeback_local_sequence 9",
                     "zerofs_writeback_remote_sequence 9",
                     "zerofs_writeback_dirty_ram_bytes 0",
-                    "zerofs_writeback_dirty_ssd_bytes 0",
+                    "zerofs_writeback_dirty_ssd_reserved_bytes 0",
                     "zerofs_writeback_local_bytes_completed_total 4",
                     "zerofs_writeback_remote_bytes_completed_total 4",
                     "zerofs_writeback_terminal_error 0",
@@ -1544,7 +1544,7 @@ class BenchmarkTests(unittest.TestCase):
     def test_active_windows_separate_local_journal_and_remote_drain(self) -> None:
         path = Path(self.temp.name) / "metrics.csv"
         path.write_text(
-            "timestamp_ms,accepted,local,remote,dirty_ram,dirty_ssd,local_bytes,remote_bytes,terminal\n"
+            "timestamp_ms,accepted,local,remote,dirty_ram,dirty_ssd_reserved,local_bytes,remote_bytes,terminal\n"
             "1000,10,10,10,0,0,100,100,False\n"
             "1100,11,10,10,64,0,100,100,False\n"
             "1200,11,11,10,0,64,164,100,False\n"

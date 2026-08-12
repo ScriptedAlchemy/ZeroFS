@@ -279,7 +279,7 @@ fn record_writeback_status(status: &WritebackStatus) {
     gauge!("zerofs_writeback_dirty_ram_bytes").set(status.dirty_ram_bytes as f64);
     gauge!("zerofs_writeback_dirty_ram_capacity_bytes").set(status.dirty_ram_capacity_bytes as f64);
     gauge!("zerofs_writeback_dirty_ram_operations").set(status.dirty_ram_operations as f64);
-    gauge!("zerofs_writeback_dirty_ssd_bytes").set(status.dirty_ssd_bytes as f64);
+    gauge!("zerofs_writeback_dirty_ssd_reserved_bytes").set(status.dirty_ssd_reserved_bytes as f64);
     gauge!("zerofs_writeback_dirty_ssd_capacity_bytes").set(status.dirty_ssd_capacity_bytes as f64);
     gauge!("zerofs_writeback_dirty_ssd_operations").set(status.dirty_ssd_operations as f64);
     gauge!("zerofs_writeback_accepted_sequence").set(status.accepted_seq as f64);
@@ -371,7 +371,7 @@ mod tests {
             dirty_ram_bytes: 4,
             dirty_ram_capacity_bytes: 16,
             dirty_ram_operations: 1,
-            dirty_ssd_bytes: 3,
+            dirty_ssd_reserved_bytes: 3,
             dirty_ssd_capacity_bytes: 512,
             dirty_ssd_operations: 2,
             oldest_pending_age_ms: 6_000,
@@ -387,7 +387,7 @@ mod tests {
         for expected in [
             "zerofs_writeback_dirty_ram_bytes 4",
             "zerofs_writeback_dirty_ram_capacity_bytes 16",
-            "zerofs_writeback_dirty_ssd_bytes 3",
+            "zerofs_writeback_dirty_ssd_reserved_bytes 3",
             "zerofs_writeback_dirty_ssd_capacity_bytes 512",
             "zerofs_writeback_remote_lag_operations 4",
             "zerofs_writeback_ssd_remote_lag_operations 3",

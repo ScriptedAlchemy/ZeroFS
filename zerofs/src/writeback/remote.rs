@@ -1010,7 +1010,7 @@ async fn commit_remote(
         .await
         .map_err(|error| anyhow::anyhow!("remote watermark task failed: {error}"))??;
     overlay.remove_remote_prefix(record.sequence).await;
-    let charge = record.disk_charge_bytes()?;
+    let charge = record.ssd_reservation_bytes()?;
     let cleanup_journal = Arc::clone(journal);
     let available = tokio::task::spawn_blocking(move || -> anyhow::Result<u64> {
         cleanup_journal.remove_remote_prefix(sequence)?;

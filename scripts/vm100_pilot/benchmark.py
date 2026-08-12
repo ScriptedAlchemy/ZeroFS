@@ -263,7 +263,7 @@ class _MetricSampler:
                         "local",
                         "remote",
                         "dirty_ram",
-                        "dirty_ssd",
+                        "dirty_ssd_reserved",
                         "local_bytes",
                         "remote_bytes",
                         "terminal",

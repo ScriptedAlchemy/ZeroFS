@@ -109,16 +109,16 @@ impl WritebackObjectStore {
         let database_prefix = snapshot.identity.database_prefix.clone();
         let available = fs4::available_space(&settings.dir)?;
         let admission = Admission::new(settings.memory_bytes);
-        let dirty_ssd_bytes = snapshot
+        let dirty_ssd_reserved_bytes = snapshot
             .dirty_blob_bytes
-            .checked_add(snapshot.dirty_metadata_bytes)
+            .checked_add(snapshot.dirty_metadata_reserved_bytes)
             .ok_or_else(|| anyhow::anyhow!("dirty journal SSD byte count overflow"))?;
         let disk = DiskAdmission::with_used(
             settings.disk_bytes,
             settings.high_watermark_percent,
             settings.resume_percent,
             settings.min_free_bytes,
-            dirty_ssd_bytes,
+            dirty_ssd_reserved_bytes,
             available,
         )?;
         let overlay = OverlayIndex::recover(remote.clone(), journal.clone()).await?;
@@ -204,7 +204,7 @@ impl WritebackObjectStore {
         self.inner.admission.used_bytes()
     }
 
-    pub fn dirty_ssd_bytes(&self) -> u64 {
+    pub fn dirty_ssd_reserved_bytes(&self) -> u64 {
         self.inner.disk.used_bytes()
     }
 
@@ -225,7 +225,7 @@ impl WritebackObjectStore {
             dirty_ram_bytes: self.inner.admission.used_bytes(),
             dirty_ram_capacity_bytes: self.inner.settings.memory_bytes,
             dirty_ram_operations: self.inner.admission.used_operations(),
-            dirty_ssd_bytes: self.inner.disk.used_bytes(),
+            dirty_ssd_reserved_bytes: self.inner.disk.used_bytes(),
             dirty_ssd_capacity_bytes: self.inner.settings.disk_bytes,
             dirty_ssd_operations: progress.local_seq.saturating_sub(progress.remote_seq),
             oldest_pending_age_ms,
@@ -326,6 +326,24 @@ impl WritebackObjectStore {
                 validate_put_mode(&location, mode, visible)?
             }
         };
+        MutationRecord::validate_persisted_version_field(
+            "expected visible version",
+            expected_visible_version.as_deref(),
+        )
+        .map_err(|error| {
+            generic_error(format!(
+                "mutation metadata exceeds its bounded SSD reservation: {error}"
+            ))
+        })?;
+        MutationRecord::validate_persisted_version_field(
+            "remote predecessor ETag",
+            predecessor.as_deref(),
+        )
+        .map_err(|error| {
+            generic_error(format!(
+                "mutation metadata exceeds its bounded SSD reservation: {error}"
+            ))
+        })?;
         let payload = VerifiedPayload::new(bytes);
         let order_guard = self.inner.admission_order.lock().await;
         let sequence = self.allocate_sequence()?;
@@ -393,7 +411,7 @@ impl WritebackObjectStore {
 
     async fn owned_delete(self, location: Path) -> object_store::Result<Path> {
         let path = location.to_string();
-        let disk_charge = MutationRecord::metadata_disk_charge(&path).map_err(|error| {
+        let disk_charge = MutationRecord::metadata_ssd_reservation(&path).map_err(|error| {
             generic_error(format!("failed to size delete journal record: {error}"))
         })?;
         let available = fs4::available_space(&self.inner.settings.dir)
@@ -493,10 +511,18 @@ impl WritebackObjectStore {
             let available = fs4::available_space(&self.inner.settings.dir).map_err(|error| {
                 generic_error(format!("failed to inspect writeback SSD: {error}"))
             })?;
+            let disk_charge = MutationRecord::ssd_reservation_estimate(
+                to.as_ref(),
+                Some(from.as_ref()),
+                expected_len,
+            )
+            .map_err(|error| {
+                generic_error(format!("failed to size copy/rename journal entry: {error}"))
+            })?;
             let disk = self
                 .inner
                 .disk
-                .reserve(expected_len, available)
+                .reserve(disk_charge, available)
                 .await
                 .map_err(|error| generic_error(format!("dirty SSD admission failed: {error}")))?;
 
@@ -624,10 +650,14 @@ impl ObjectStore for WritebackObjectStore {
             .accept();
         let available = fs4::available_space(&self.inner.settings.dir)
             .map_err(|error| generic_error(format!("failed to inspect writeback SSD: {error}")))?;
+        let disk_charge =
+            MutationRecord::ssd_reservation_estimate(location.as_ref(), None, bytes_len).map_err(
+                |error| generic_error(format!("failed to size put journal entry: {error}")),
+            )?;
         let disk = self
             .inner
             .disk
-            .reserve(bytes_len, available)
+            .reserve(disk_charge, available)
             .await
             .map_err(|error| generic_error(format!("dirty SSD admission failed: {error}")))?;
         let bytes = Bytes::from(payload);
@@ -1046,10 +1076,16 @@ async fn complete_memory_multipart(
     }
     let available = fs4::available_space(&store.inner.settings.dir)
         .map_err(|error| generic_error(format!("failed to inspect writeback SSD: {error}")))?;
+    let disk_charge = MutationRecord::ssd_reservation_estimate(location.as_ref(), None, total_len)
+        .map_err(|error| {
+            generic_error(format!(
+                "failed to size memory multipart journal entry: {error}"
+            ))
+        })?;
     let disk = store
         .inner
         .disk
-        .reserve(total_len, available)
+        .reserve(disk_charge, available)
         .await
         .map_err(|error| generic_error(format!("dirty SSD admission failed: {error}")))?;
     let put_options = PutOptions {
@@ -1082,10 +1118,16 @@ async fn complete_multipart(
         .accept();
     let available = fs4::available_space(&store.inner.settings.dir)
         .map_err(|error| generic_error(format!("failed to inspect writeback SSD: {error}")))?;
+    let disk_charge = MutationRecord::ssd_reservation_estimate(location.as_ref(), None, total_len)
+        .map_err(|error| {
+            generic_error(format!(
+                "failed to size staged multipart journal entry: {error}"
+            ))
+        })?;
     let disk = store
         .inner
         .disk
-        .reserve(total_len, available)
+        .reserve(disk_charge, available)
         .await
         .map_err(|error| generic_error(format!("dirty SSD admission failed: {error}")))?;
     let read_staging = staging.clone();
@@ -1338,9 +1380,10 @@ mod tests {
     use crate::writeback::config::{AckMode, ShutdownFlush, WritebackSettings};
     use crate::writeback::journal::Journal;
     use crate::writeback::model::{
-        FenceClass, JournalIdentity, MutationKind, MutationMode, MutationRecord,
+        FenceClass, JournalIdentity, LocalEtag, MutationKind, MutationMode, MutationRecord,
         classify_mutation_fence,
     };
+    use crate::writeback::payload::VerifiedPayload;
     use bytes::Bytes;
     use futures::{StreamExt, stream};
     use object_store::memory::InMemory;
@@ -1353,6 +1396,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Arc;
     use std::time::Duration;
+    use uuid::Uuid;
 
     async fn test_store() -> (WritebackObjectStore, Arc<InMemory>, tempfile::TempDir) {
         test_store_with_remote_drain(false).await
@@ -1655,7 +1699,10 @@ mod tests {
         assert!(remote.head(&path).await.is_err());
         store.wait_local(1).await.unwrap();
         assert_eq!(store.dirty_ram_bytes(), 0);
-        assert_eq!(store.dirty_ssd_bytes(), 7);
+        let persisted_charge = store.inner.journal.snapshot().unwrap().records[0]
+            .ssd_reservation_bytes()
+            .unwrap();
+        assert_eq!(store.dirty_ssd_reserved_bytes(), persisted_charge);
         store.shutdown().await.unwrap();
     }
 
@@ -1728,7 +1775,10 @@ mod tests {
         assert_eq!(status.remote_seq, 0);
         assert_eq!(status.dirty_ram_bytes, 0);
         assert_eq!(status.dirty_ram_capacity_bytes, 1_000_000);
-        assert_eq!(status.dirty_ssd_bytes, 7);
+        let persisted_charge = store.inner.journal.snapshot().unwrap().records[0]
+            .ssd_reservation_bytes()
+            .unwrap();
+        assert_eq!(status.dirty_ssd_reserved_bytes, persisted_charge);
         assert_eq!(status.dirty_ssd_capacity_bytes, 10_000_000);
         assert_eq!(status.dirty_ssd_operations, 1);
         assert_eq!(status.local_bytes_completed, 7);
@@ -1774,7 +1824,7 @@ mod tests {
         let status = store.status().unwrap();
         assert_eq!(status.remote_bytes_completed, 7);
         assert_eq!(status.remote_operations_completed, 1);
-        assert_eq!(status.dirty_ssd_bytes, 0);
+        assert_eq!(status.dirty_ssd_reserved_bytes, 0);
         assert_eq!(status.dirty_ssd_operations, 0);
         store.shutdown().await.unwrap();
     }
@@ -2268,17 +2318,267 @@ mod tests {
 
         store.delete(&path).await.unwrap();
         store.wait_local(1).await.unwrap();
-        let expected = MutationRecord::metadata_disk_charge(path.as_ref()).unwrap();
-        assert_eq!(store.dirty_ssd_bytes(), expected);
+        let expected = MutationRecord::metadata_ssd_reservation(path.as_ref()).unwrap();
+        assert_eq!(store.dirty_ssd_reserved_bytes(), expected);
         assert_eq!(
-            store.inner.journal.snapshot().unwrap().dirty_metadata_bytes,
+            store
+                .inner
+                .journal
+                .snapshot()
+                .unwrap()
+                .dirty_metadata_reserved_bytes,
             expected
         );
 
         controls.partition_writes(false);
         store.wait_remote(1).await.unwrap();
-        assert_eq!(store.dirty_ssd_bytes(), 0);
+        assert_eq!(store.dirty_ssd_reserved_bytes(), 0);
         store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejected_oversized_update_does_not_consume_a_journal_sequence() {
+        let (store, _remote, _temp) = test_store().await;
+        let path = Path::from("oversized-update");
+        let oversized_etag = "e".repeat(50_000);
+        let local_etag: LocalEtag =
+            bincode::deserialize(&bincode::serialize(&oversized_etag).unwrap()).unwrap();
+        let visible_payload = VerifiedPayload::new(Bytes::from_static(b"old"));
+        store
+            .inner
+            .overlay
+            .install_verified_memory(
+                MutationRecord {
+                    format_version: 1,
+                    sequence: u64::MAX,
+                    operation_id: Uuid::nil(),
+                    path: path.to_string(),
+                    kind: MutationKind::Put {
+                        mode: MutationMode::Overwrite,
+                        expected_visible_version: None,
+                        payload_len: visible_payload.byte_len(),
+                        payload_sha256: visible_payload.sha256(),
+                        blob_path: String::new(),
+                    },
+                    local_etag,
+                    accepted_at_unix_ms: 0,
+                    remote_predecessor_etag: None,
+                    remote_result_etag: None,
+                    fence: FenceClass::Fence,
+                    retry_count: 0,
+                    last_error: None,
+                },
+                visible_payload,
+            )
+            .await
+            .unwrap();
+
+        let error = store
+            .put_opts(
+                &path,
+                Bytes::from_static(b"new").into(),
+                PutOptions::from(PutMode::Update(UpdateVersion {
+                    e_tag: Some(oversized_etag),
+                    version: None,
+                })),
+            )
+            .await
+            .expect_err("oversized foreground version metadata must be rejected");
+        assert!(
+            error.to_string().contains("bounded SSD reservation"),
+            "{error}"
+        );
+        assert_eq!(store.status().unwrap().accepted_seq, 0);
+
+        store
+            .put(
+                &Path::from("ordinary-after-rejection"),
+                Bytes::from_static(b"healthy").into(),
+            )
+            .await
+            .unwrap();
+        store.wait_local(1).await.unwrap();
+        let status = store.status().unwrap();
+        assert_eq!(status.accepted_seq, 1);
+        assert_eq!(status.local_seq, 1);
+        assert!(status.terminal_error.is_none());
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_oversized_version_metadata_recovers_and_releases_its_exact_reservation() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("writeback");
+        let identity = JournalIdentity {
+            format_version: 1,
+            bucket_id: "bucket-a".to_owned(),
+            backend_endpoint: "memory://remote".to_owned(),
+            database_prefix: "zerofs/pilot".to_owned(),
+            backend_kind: "memory".to_owned(),
+            encryption_key_identity_sha256: [0x77; 32],
+        };
+        let journal = Arc::new(Journal::open(&root, identity).unwrap());
+        let payload = b"legacy";
+        let verified = VerifiedPayload::new(Bytes::from_static(payload));
+        let record = MutationRecord {
+            format_version: 1,
+            sequence: 1,
+            operation_id: Uuid::nil(),
+            path: "legacy/oversized-version".to_owned(),
+            kind: MutationKind::Put {
+                mode: MutationMode::Overwrite,
+                expected_visible_version: Some("e".repeat(50_000)),
+                payload_len: verified.byte_len(),
+                payload_sha256: verified.sha256(),
+                blob_path: String::new(),
+            },
+            local_etag: LocalEtag::new(Uuid::nil(), 1),
+            accepted_at_unix_ms: 0,
+            remote_predecessor_etag: Some("p".repeat(50_000)),
+            remote_result_etag: None,
+            fence: FenceClass::Fence,
+            retry_count: 0,
+            last_error: None,
+        };
+        let expected_reservation = record.ssd_reservation_bytes().unwrap();
+        let maximum_result = "r".repeat(MutationRecord::MAX_PERSISTED_VERSION_BYTES);
+        let mut marked_record = record.clone();
+        marked_record.remote_result_etag = Some(maximum_result.clone());
+        marked_record.last_error = Some("\u{10ffff}".repeat(2_048));
+        let post_mark_footprint = verified.byte_len()
+            + bincode::serialized_size(&marked_record).unwrap()
+            + 16
+            + marked_record.path.len() as u64
+            + bincode::serialized_size(&(marked_record.sequence, maximum_result.clone())).unwrap()
+            + 12;
+        assert!(expected_reservation >= post_mark_footprint);
+        journal.commit_put(record, payload).unwrap();
+        let settings = WritebackSettings {
+            dir: root,
+            ack_mode: AckMode::Memory,
+            memory_bytes: 1_000_000,
+            disk_bytes: 1_000_000,
+            min_free_bytes: 1,
+            high_watermark_percent: 95,
+            resume_percent: 85,
+            upload_concurrency: 1,
+            local_concurrency: 1,
+            shutdown_flush: ShutdownFlush::Local,
+        };
+
+        let (remote, controls) = FaultStore::new(Arc::new(InMemory::new()));
+        controls.force_put_etag(maximum_result);
+        let recovered = WritebackObjectStore::open_paused(remote, journal, settings)
+            .await
+            .expect("legacy oversized record must remain recoverable");
+        let recovered_reservation = recovered.dirty_ssd_reserved_bytes();
+        assert_eq!(recovered_reservation, expected_reservation);
+
+        recovered.activate_remote().unwrap();
+        recovered.wait_remote(1).await.unwrap();
+        assert_eq!(recovered.dirty_ssd_reserved_bytes(), 0);
+        recovered.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn empty_payload_storm_backpressures_before_exceeding_the_dirty_ssd_budget() {
+        const DISK_BUDGET: u64 = 50_000;
+        const PUT_COUNT: u64 = 32;
+        let (store, _remote, _temp, _controls) = test_store_with_disk_capacity(
+            false,
+            AckMode::Memory,
+            ShutdownFlush::Local,
+            DISK_BUDGET,
+        )
+        .await;
+        let mut puts = tokio::task::JoinSet::new();
+        for index in 0..PUT_COUNT {
+            let store = store.clone();
+            puts.spawn(async move {
+                store
+                    .put(
+                        &Path::from(format!("empty-payload-storm/{index:02}")),
+                        Bytes::new().into(),
+                    )
+                    .await
+            });
+        }
+
+        let completed = tokio::time::timeout(Duration::from_secs(2), async {
+            while puts.join_next().await.is_some() {}
+        })
+        .await;
+        assert!(
+            completed.is_err(),
+            "all empty puts bypassed dirty-SSD admission"
+        );
+        puts.abort_all();
+        while puts.join_next().await.is_some() {}
+
+        let accepted = store.status().unwrap().accepted_seq;
+        assert!(accepted > 0 && accepted < PUT_COUNT);
+        store.wait_local(accepted).await.unwrap();
+        let snapshot = store.inner.journal.snapshot().unwrap();
+        let actual_persisted_bytes = snapshot
+            .records
+            .iter()
+            .map(|record| {
+                let payload_len = record.payload().map_or(0, |(len, _)| len);
+                payload_len + bincode::serialized_size(record).unwrap() + 12
+            })
+            .sum::<u64>();
+        assert!(actual_persisted_bytes <= DISK_BUDGET);
+        assert_eq!(
+            store.dirty_ssd_reserved_bytes(),
+            snapshot
+                .records
+                .iter()
+                .map(|record| record.ssd_reservation_bytes().unwrap())
+                .sum::<u64>()
+        );
+        assert!(store.dirty_ssd_reserved_bytes() <= DISK_BUDGET);
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn payload_charge_survives_restart_and_remote_release_exactly() {
+        let (store, remote, _temp, _controls) =
+            test_store_with_disk_capacity(false, AckMode::Memory, ShutdownFlush::Local, 50_000)
+                .await;
+        let path = Path::from("tiny-payload-restart");
+        store
+            .put(&path, Bytes::from_static(b"x").into())
+            .await
+            .unwrap();
+        store.wait_local(1).await.unwrap();
+        let accepted_charge = store.dirty_ssd_reserved_bytes();
+        assert!(accepted_charge > 1, "payload metadata was not charged");
+        let settings = store.inner.settings.clone();
+        let identity = store.inner.journal.snapshot().unwrap().identity;
+        let journal_root = store.inner.journal.root().to_path_buf();
+        store.shutdown().await.unwrap();
+        drop(store);
+
+        let journal = Arc::new(Journal::open(&journal_root, identity).unwrap());
+        let recovered = WritebackObjectStore::open_paused(remote, journal, settings)
+            .await
+            .unwrap();
+        assert_eq!(recovered.dirty_ssd_reserved_bytes(), accepted_charge);
+
+        recovered.activate_remote().unwrap();
+        recovered.wait_remote(1).await.unwrap();
+        assert_eq!(recovered.dirty_ssd_reserved_bytes(), 0);
+        assert!(recovered.status().unwrap().terminal_error.is_none());
+        recovered
+            .put(
+                &Path::from("tiny-payload-after-release"),
+                Bytes::from_static(b"x").into(),
+            )
+            .await
+            .unwrap();
+        recovered.wait_remote(2).await.unwrap();
+        assert_eq!(recovered.dirty_ssd_reserved_bytes(), 0);
+        recovered.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -2301,7 +2601,16 @@ mod tests {
         }
         store.wait_local(64).await.unwrap();
         assert_eq!(store.dirty_ram_bytes(), 0);
-        assert_eq!(store.dirty_ssd_bytes(), 64 * 1024);
+        let persisted_charge = store
+            .inner
+            .journal
+            .snapshot()
+            .unwrap()
+            .records
+            .iter()
+            .map(|record| record.ssd_reservation_bytes().unwrap())
+            .sum::<u64>();
+        assert_eq!(store.dirty_ssd_reserved_bytes(), persisted_charge);
         store.shutdown().await.unwrap();
     }
 
@@ -2539,7 +2848,16 @@ mod tests {
         let recovered = WritebackObjectStore::open(writeback_remote, journal, settings)
             .await
             .unwrap();
-        assert_eq!(recovered.dirty_ssd_bytes(), 21);
+        let persisted_charge = recovered
+            .inner
+            .journal
+            .snapshot()
+            .unwrap()
+            .records
+            .iter()
+            .map(|record| record.ssd_reservation_bytes().unwrap())
+            .sum::<u64>();
+        assert_eq!(recovered.dirty_ssd_reserved_bytes(), persisted_charge);
         assert!(recovered.get(&Path::from("source")).await.is_err());
         for path in ["copy", "renamed"] {
             assert_eq!(
@@ -2632,10 +2950,13 @@ mod tests {
             .unwrap()
             .accept();
         let available = fs4::available_space(&store.inner.settings.dir).unwrap();
+        let disk_charge =
+            MutationRecord::ssd_reservation_estimate(target.as_ref(), None, payload.len() as u64)
+                .unwrap();
         let disk = store
             .inner
             .disk
-            .reserve(payload.len() as u64, available)
+            .reserve(disk_charge, available)
             .await
             .unwrap();
         let target_blocker = store.key_lock(&target).lock_owned().await;
@@ -2870,7 +3191,7 @@ mod tests {
             remote.get(&location).await.unwrap().bytes().await.unwrap(),
             Bytes::from_static(b"payload")
         );
-        assert_eq!(store.dirty_ssd_bytes(), 0);
+        assert_eq!(store.dirty_ssd_reserved_bytes(), 0);
         assert_eq!(store.inner.journal.snapshot().unwrap().remote_seq, 1);
         assert!(store.inner.journal.snapshot().unwrap().records.is_empty());
         store.shutdown().await.unwrap();
@@ -3607,7 +3928,7 @@ mod tests {
                 Bytes::from(vec![index; 1024])
             );
         }
-        assert_eq!(store.dirty_ssd_bytes(), 0);
+        assert_eq!(store.dirty_ssd_reserved_bytes(), 0);
         let snapshot = store.inner.journal.snapshot().unwrap();
         assert_eq!(snapshot.remote_seq, 4);
         assert!(snapshot.records.is_empty());
@@ -3672,7 +3993,7 @@ mod tests {
             remote.get(&location).await.unwrap().bytes().await.unwrap(),
             Bytes::from_static(b"payload")
         );
-        assert_eq!(resumed.dirty_ssd_bytes(), 0);
+        assert_eq!(resumed.dirty_ssd_reserved_bytes(), 0);
         resumed.shutdown().await.unwrap();
     }
 

@@ -1608,7 +1608,7 @@ mod tests {
                 .unwrap()
                 .accept();
             let disk_permit = disk
-                .reserve(record.disk_charge_bytes().unwrap(), 1_000_000)
+                .reserve(record.ssd_reservation_bytes().unwrap(), 1_000_000)
                 .await
                 .unwrap();
             journaler

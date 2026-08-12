@@ -50,6 +50,7 @@ pub struct FaultControls {
     head_activity: Arc<Notify>,
     #[cfg(test)]
     head_release: Arc<Notify>,
+    forced_put_etag: StdMutex<Option<String>>,
 }
 
 impl FaultControls {
@@ -115,6 +116,9 @@ impl FaultControls {
     #[cfg(test)]
     pub fn head_activity(&self) -> Arc<Notify> {
         self.head_activity.clone()
+    }
+    pub fn force_put_etag(&self, e_tag: String) {
+        *self.forced_put_etag.lock().unwrap() = Some(e_tag);
     }
 }
 
@@ -205,7 +209,10 @@ impl ObjectStore for FaultStore {
             }
             notified.await;
         }
-        let result = self.inner.put_opts(location, payload, opts).await?;
+        let mut result = self.inner.put_opts(location, payload, opts).await?;
+        if let Some(e_tag) = self.ctl.forced_put_etag.lock().unwrap().clone() {
+            result.e_tag = Some(e_tag);
+        }
         if take_one(&self.ctl.fail_after_puts) {
             return Err(Self::transient("put response"));
         }

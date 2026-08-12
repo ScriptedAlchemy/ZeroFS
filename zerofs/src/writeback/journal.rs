@@ -208,7 +208,7 @@ pub struct JournalSnapshot {
     pub remote_retries: u64,
     pub records: Vec<MutationRecord>,
     pub dirty_blob_bytes: u64,
-    pub dirty_metadata_bytes: u64,
+    pub dirty_metadata_reserved_bytes: u64,
     pub pending_blob_count: u64,
 }
 
@@ -343,7 +343,7 @@ impl Journal {
             .context("failed to open journal mutations")?;
         let mut records = Vec::new();
         let mut dirty_blob_bytes = 0_u64;
-        let mut dirty_metadata_bytes = 0_u64;
+        let mut dirty_metadata_reserved_bytes = 0_u64;
         for entry in table
             .iter()
             .context("failed to iterate journal mutations")?
@@ -352,18 +352,17 @@ impl Journal {
             let record: MutationRecord =
                 bincode::deserialize(value.value()).context("failed to decode journal mutation")?;
             if record.sequence > remote_seq {
-                match record.payload() {
-                    Some((payload_len, _)) => {
-                        dirty_blob_bytes = dirty_blob_bytes
-                            .checked_add(payload_len)
-                            .context("dirty journal blob byte count overflow")?;
-                    }
-                    None => {
-                        dirty_metadata_bytes = dirty_metadata_bytes
-                            .checked_add(record.disk_charge_bytes()?)
-                            .context("dirty journal metadata byte count overflow")?;
-                    }
-                }
+                let payload_len = record.payload().map_or(0, |(payload_len, _)| payload_len);
+                let charge = record.ssd_reservation_bytes()?;
+                let metadata_len = charge
+                    .checked_sub(payload_len)
+                    .context("dirty journal charge is smaller than its payload")?;
+                dirty_blob_bytes = dirty_blob_bytes
+                    .checked_add(payload_len)
+                    .context("dirty journal blob byte count overflow")?;
+                dirty_metadata_reserved_bytes = dirty_metadata_reserved_bytes
+                    .checked_add(metadata_len)
+                    .context("dirty journal metadata byte count overflow")?;
             }
             records.push(record);
         }
@@ -385,7 +384,7 @@ impl Journal {
             remote_retries,
             records,
             dirty_blob_bytes,
-            dirty_metadata_bytes,
+            dirty_metadata_reserved_bytes,
             pending_blob_count,
         })
     }
@@ -1032,6 +1031,10 @@ impl Journal {
     }
 
     pub fn mark_remote(&self, sequence: Sequence, result_etag: Option<String>) -> Result<()> {
+        MutationRecord::validate_persisted_version_field(
+            "remote result ETag",
+            result_etag.as_deref(),
+        )?;
         let _write = self.write_gate.lock();
         #[cfg(test)]
         self.wait_if_remote_mark_paused(sequence);
@@ -1123,6 +1126,10 @@ impl Journal {
         if path.is_empty() || e_tag.is_empty() {
             bail!("remote object path and ETag must be non-empty");
         }
+        MutationRecord::validate_persisted_version_field(
+            "seeded remote predecessor ETag",
+            Some(e_tag),
+        )?;
         let progress = self.progress()?;
         if sequence > progress.remote_seq {
             bail!(
@@ -2748,8 +2755,8 @@ mod tests {
         assert_eq!(snapshot.local_seq, 1);
         assert_eq!(snapshot.dirty_blob_bytes, 0);
         assert_eq!(
-            snapshot.dirty_metadata_bytes,
-            MutationRecord::metadata_disk_charge("obsolete").unwrap()
+            snapshot.dirty_metadata_reserved_bytes,
+            MutationRecord::metadata_ssd_reservation("obsolete").unwrap()
         );
         assert_eq!(snapshot.records, vec![committed]);
     }
@@ -2932,6 +2939,36 @@ mod tests {
         assert_eq!(snapshot.remote_seq, 2);
         assert!(snapshot.records.is_empty());
         assert!(!journal.root().join(first.blob_path().unwrap()).exists());
+    }
+
+    #[test]
+    fn remote_result_etag_larger_than_the_persisted_bound_is_rejected_atomically() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = open_temp_journal(&temp, "bucket-a");
+        journal
+            .commit_put(put_record(1, "segments/1", b"one"), b"one")
+            .unwrap();
+
+        let error = journal
+            .mark_remote(1, Some("e".repeat(4_097)))
+            .expect_err("oversized backend ETag must not enter either journal table");
+
+        assert!(format!("{error:#}").contains("ETag"));
+        assert_eq!(journal.progress().unwrap().remote_seq, 0);
+        assert!(
+            journal
+                .mutation(1)
+                .unwrap()
+                .unwrap()
+                .remote_result_etag
+                .is_none()
+        );
+        assert!(
+            journal
+                .remote_object_etag("segments/1", 1)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

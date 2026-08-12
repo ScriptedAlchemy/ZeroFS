@@ -15,7 +15,7 @@ _METRICS = {
     "zerofs_writeback_local_sequence": "local",
     "zerofs_writeback_remote_sequence": "remote",
     "zerofs_writeback_dirty_ram_bytes": "dirty_ram",
-    "zerofs_writeback_dirty_ssd_bytes": "dirty_ssd",
+    "zerofs_writeback_dirty_ssd_reserved_bytes": "dirty_ssd_reserved",
     "zerofs_writeback_local_bytes_completed_total": "local_bytes",
     "zerofs_writeback_remote_bytes_completed_total": "remote_bytes",
     "zerofs_writeback_terminal_error": "terminal",
@@ -32,7 +32,7 @@ class WritebackSnapshot:
     local: int
     remote: int
     dirty_ram: int
-    dirty_ssd: int
+    dirty_ssd_reserved: int
     local_bytes: int
     remote_bytes: int
     terminal: bool
@@ -64,7 +64,7 @@ class WritebackSnapshot:
             local=found["local"],
             remote=found["remote"],
             dirty_ram=found["dirty_ram"],
-            dirty_ssd=found["dirty_ssd"],
+            dirty_ssd_reserved=found["dirty_ssd_reserved"],
             local_bytes=found["local_bytes"],
             remote_bytes=found["remote_bytes"],
             terminal=bool(found["terminal"]),
@@ -80,7 +80,7 @@ class WritebackSnapshot:
             not self.terminal
             and self.accepted == self.local == self.remote
             and self.dirty_ram == 0
-            and self.dirty_ssd == 0
+            and self.dirty_ssd_reserved == 0
         )
 
     def to_dict(self) -> dict[str, int | bool | None]:
