@@ -808,9 +808,9 @@ impl StartupContext {
         // object path, so prepend the db prefix exactly as PrefixStore would, giving
         // the same cache key the read path derives.
         let segment_warm: Option<crate::segment_store::SegmentWarmHook> =
-            Some(Arc::new(move |loc: &Path, bytes: bytes::Bytes| {
+            Some(Arc::new(move |loc: &Path, bytes: bytes::Bytes, result| {
                 let full: Path = db_prefix.parts().chain(loc.parts()).collect();
-                prefetch.warm_object(&full, bytes);
+                prefetch.warm_object(&full, bytes, result);
             }));
 
         Ok(OpenOutcome::Opened(DbOpen {

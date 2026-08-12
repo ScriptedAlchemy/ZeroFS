@@ -60,7 +60,8 @@ const SEAL_PART_SIZE: usize = 64 * 1024 * 1024;
 /// upload bypasses the store's single-PUT write-through, so `put_segment`
 /// calls this with the bytes it already holds. The hook applies any
 /// object-store prefix itself. `None` when there is no such cache (tests).
-pub type SegmentWarmHook = Arc<dyn Fn(&Path, Bytes) + Send + Sync>;
+pub type SegmentWarmHook =
+    Arc<dyn Fn(&Path, Bytes, &slatedb::object_store::PutResult) + Send + Sync>;
 
 /// Writes and reads `segments/` objects against an object store.
 pub struct SegmentStore {
@@ -111,19 +112,19 @@ impl SegmentStore {
         // concurrent multipart, so the fsync-path PUT latency stays bounded
         // instead of serializing 256 MiB on one stream.
         let path = Path::from(segid.object_key());
-        if bytes.len() < SEAL_PART_SIZE {
+        let result = if bytes.len() < SEAL_PART_SIZE {
             self.object_store
                 .put(&path, bytes.clone().into())
                 .await
-                .map_err(|e| SegmentStoreError::ObjectStore(e.to_string()))?;
+                .map_err(|e| SegmentStoreError::ObjectStore(e.to_string()))?
         } else {
-            self.put_segment_multipart(&path, &bytes).await?;
-        }
+            self.put_segment_multipart(&path, &bytes).await?
+        };
         // The multipart path doesn't write through the parts cache; warm it
         // with the bytes in hand, after the upload commits (mirroring the
         // single-PUT path).
         if let Some(warm) = &self.warm {
-            warm(&path, bytes);
+            warm(&path, bytes, &result);
         }
         Ok(())
     }
@@ -134,7 +135,11 @@ impl SegmentStore {
     /// invisible to LIST — and so to the orphan sweep — yet billed until
     /// aborted, and each retried seal targets a fresh upload, so leaks would
     /// accrete per failure.
-    async fn put_segment_multipart(&self, path: &Path, bytes: &Bytes) -> Result<()> {
+    async fn put_segment_multipart(
+        &self,
+        path: &Path,
+        bytes: &Bytes,
+    ) -> Result<slatedb::object_store::PutResult> {
         let mut upload = self
             .object_store
             .put_multipart(path)
@@ -162,16 +167,18 @@ impl SegmentStore {
             upload.complete().await
         }
         .await;
-        if let Err(e) = uploaded {
-            // Best-effort cleanup: surface the seal error even if the abort
-            // itself fails (leaving the parts to the backend's lifecycle rule).
-            parts.shutdown().await;
-            if let Err(abort_err) = upload.abort().await {
-                tracing::warn!("segment seal: aborting failed upload of {path}: {abort_err}");
+        match uploaded {
+            Ok(result) => Ok(result),
+            Err(e) => {
+                // Best-effort cleanup: surface the seal error even if the abort
+                // itself fails (leaving the parts to the backend's lifecycle rule).
+                parts.shutdown().await;
+                if let Err(abort_err) = upload.abort().await {
+                    tracing::warn!("segment seal: aborting failed upload of {path}: {abort_err}");
+                }
+                Err(SegmentStoreError::ObjectStore(e.to_string()))
             }
-            return Err(SegmentStoreError::ObjectStore(e.to_string()));
         }
-        Ok(())
     }
 
     /// Seal `frames` (each `(inode, extent, full-extent plaintext)`) into one new
