@@ -78,6 +78,29 @@ pub(super) async fn commit(store: &ExtentStore, txn: Transaction) {
     store.commit_via_coordinator(txn).await.unwrap();
 }
 
+/// Stage one write, commit it, and publish its tail update.
+///
+/// A write is only settled after all four steps: until `apply_tail_update`
+/// runs, a following read can still splice the pre-write tail. Keeping them in
+/// one helper is what stops a test from measuring or asserting against a
+/// half-applied write.
+pub(super) async fn write_committed(
+    store: &ExtentStore,
+    db: &Db,
+    inode: InodeId,
+    offset: u64,
+    data: &Bytes,
+    old_size: u64,
+) {
+    let mut txn = db.new_transaction().unwrap();
+    let tu = store
+        .write(&mut txn, inode, offset, data, old_size)
+        .await
+        .unwrap();
+    commit(store, txn).await;
+    store.apply_tail_update(inode, tu);
+}
+
 /// Apply a write through the store and to a byte-array model, asserting the
 /// full file reads back identically.
 pub(super) async fn write_and_check(
@@ -87,19 +110,15 @@ pub(super) async fn write_and_check(
     offset: usize,
     bytes: &[u8],
 ) {
-    let mut txn = db.new_transaction().unwrap();
-    let tu = store
-        .write(
-            &mut txn,
-            1,
-            offset as u64,
-            &Bytes::copy_from_slice(bytes),
-            model.len() as u64,
-        )
-        .await
-        .unwrap();
-    commit(store, txn).await;
-    store.apply_tail_update(1, tu);
+    write_committed(
+        store,
+        db,
+        1,
+        offset as u64,
+        &Bytes::copy_from_slice(bytes),
+        model.len() as u64,
+    )
+    .await;
     let end = offset + bytes.len();
     if model.len() < end {
         model.resize(end, 0);
