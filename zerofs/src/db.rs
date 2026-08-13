@@ -210,6 +210,12 @@ impl Transaction {
         std::mem::take(&mut self.inode_cache_updates)
     }
 
+    /// The inode mutations this transaction will publish, in application order.
+    /// Read at submit so they can be queued before the batch applies.
+    pub(crate) fn inode_cache_updates(&self) -> &[(u64, Option<Inode>)] {
+        &self.inode_cache_updates
+    }
+
     pub(crate) fn update_cached_directory_entry(
         &mut self,
         dir_id: u64,

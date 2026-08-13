@@ -71,6 +71,10 @@ enum Request {
 #[derive(Clone)]
 pub struct WriteCoordinator {
     sender: mpsc::UnboundedSender<Request>,
+    /// Queues a transaction's inode mutations from submit until its reply, so
+    /// a caller that releases its per-inode lock at submit cannot expose the
+    /// pre-write value while the batch is still in flight.
+    inode_store: InodeStore,
     #[cfg(test)]
     #[allow(dead_code)] // The binary NBD tests consume this; the lib test target does not.
     apply_probe: Arc<std::sync::Mutex<Option<oneshot::Sender<()>>>>,
@@ -132,6 +136,7 @@ impl WriteCoordinator {
         // Capture before spawning so concurrent allocations cannot advance the
         // worker's initial persisted watermark.
         let initial_counter = inode_store.next_id();
+        let submit_inode_store = inode_store.clone();
         let (sender, receiver) = mpsc::unbounded_channel();
         #[cfg(test)]
         let apply_probe = Arc::new(std::sync::Mutex::new(None));
@@ -165,6 +170,7 @@ impl WriteCoordinator {
         spawn_named("commit-worker", worker_loop(ctx, receiver, initial_counter));
         Self {
             sender,
+            inode_store: submit_inode_store,
             #[cfg(test)]
             apply_probe,
             #[cfg(test)]
@@ -177,6 +183,13 @@ impl WriteCoordinator {
     }
 
     pub async fn commit(&self, txn: Transaction) -> Result<(), FsError> {
+        // Queue this transaction's inode mutations before it enters the queue,
+        // and retire them only once the reply resolves. On success the apply
+        // has already promoted the same values into the read cache; on a
+        // pre-apply failure the cache still holds the last committed value. A
+        // caller may therefore drop its per-inode lock the moment `commit` is
+        // entered without ever exposing a stale inode.
+        let _queued = self.inode_store.install_pending(txn.inode_cache_updates());
         let (reply_tx, reply_rx) = oneshot::channel();
         self.sender
             .send(Request::Commit(txn, reply_tx))
@@ -239,17 +252,25 @@ impl WriteCoordinator {
 
     /// Weak commit handle for data-plane GC and compaction.
     pub fn downgrade(&self) -> WeakWriteCoordinator {
-        WeakWriteCoordinator(self.sender.downgrade())
+        WeakWriteCoordinator {
+            sender: self.sender.downgrade(),
+            inode_store: self.inode_store.clone(),
+        }
     }
 }
 
 /// Weak commit handle held by `ExtentStore`; a strong sender would form a cycle.
 #[derive(Clone)]
-pub struct WeakWriteCoordinator(mpsc::WeakUnboundedSender<Request>);
+pub struct WeakWriteCoordinator {
+    sender: mpsc::WeakUnboundedSender<Request>,
+    inode_store: InodeStore,
+}
 
 impl WeakWriteCoordinator {
     pub async fn commit(&self, txn: Transaction) -> Result<(), FsError> {
-        let sender = self.0.upgrade().ok_or(FsError::IoError)?;
+        let sender = self.sender.upgrade().ok_or(FsError::IoError)?;
+        // Same submit-time queueing as the strong handle; see there.
+        let _queued = self.inode_store.install_pending(txn.inode_cache_updates());
         let (reply_tx, reply_rx) = oneshot::channel();
         sender
             .send(Request::Commit(txn, reply_tx))
@@ -1074,6 +1095,57 @@ mod tests {
         assert_eq!(
             file_size(Some(fs.inode_store.get(inode_id).await.unwrap())),
             Some(10)
+        );
+        assert!(
+            fs.inode_store.pending_inode(inode_id).is_none(),
+            "a failed batch must retract the value it queued at submit"
+        );
+    }
+
+    /// The window a caller releasing its inode lock at submit depends on: from
+    /// the moment `commit` is entered until its reply resolves, the queued
+    /// inode -- not the read cache and not the database -- answers reads.
+    #[tokio::test]
+    async fn a_queued_inode_answers_reads_while_its_commit_is_in_flight() {
+        let fs = make_fs().await;
+        let inode_id = fs.inode_store.allocate();
+        let mut create = Transaction::new();
+        fs.inode_store
+            .save(&mut create, inode_id, &test_file_inode(10))
+            .unwrap();
+        fs.write_coordinator.commit(create).await.unwrap();
+        assert_eq!(file_size(fs.inode_store.cached_inode(inode_id)), Some(10));
+
+        // Stall the update at its write permit so it is provably submitted and
+        // provably unapplied while the assertions below run.
+        let commit_block = fs.db.flush_barrier().write_owned().await;
+        let apply_reached = fs.write_coordinator.probe_next_apply();
+        let mut update = Transaction::new();
+        fs.inode_store
+            .save(&mut update, inode_id, &test_file_inode(20))
+            .unwrap();
+        let coordinator = fs.write_coordinator.clone();
+        let commit = tokio::spawn(async move { coordinator.commit(update).await });
+        apply_reached.await.unwrap();
+
+        assert_eq!(
+            file_size(fs.inode_store.cached_inode(inode_id)),
+            Some(10),
+            "the apply has not promoted anything yet"
+        );
+        assert_eq!(
+            file_size(Some(fs.inode_store.get(inode_id).await.unwrap())),
+            Some(20),
+            "the queued value must outrank the last committed one"
+        );
+
+        drop(commit_block);
+        commit.await.unwrap().unwrap();
+        assert!(fs.inode_store.pending_inode(inode_id).is_none());
+        assert_eq!(
+            file_size(Some(fs.inode_store.get(inode_id).await.unwrap())),
+            Some(20),
+            "the apply promoted the same value the queue was serving"
         );
     }
 
