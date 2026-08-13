@@ -11,7 +11,7 @@ use object_store::{
     ObjectStore, ObjectStoreExt,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::RwLock;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,10 +51,54 @@ struct OverlayState {
     paths_by_sequence: BTreeMap<Sequence, BTreeSet<Path>>,
 }
 
+const BLOB_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
+
+/// Bounded cache of fully verified spilled blobs. A journal blob is read and
+/// SHA-256-verified as a whole, so without this every ranged read of the same
+/// locally-durable object would re-read and re-hash the entire blob.
+#[derive(Default)]
+struct BlobCache {
+    entries: VecDeque<(Sequence, Bytes)>,
+    total_bytes: usize,
+}
+
+impl BlobCache {
+    fn get(&mut self, sequence: Sequence) -> Option<Bytes> {
+        let index = self
+            .entries
+            .iter()
+            .position(|(cached, _)| *cached == sequence)?;
+        let entry = self.entries.remove(index).expect("cache index in bounds");
+        let bytes = entry.1.clone();
+        self.entries.push_back(entry);
+        Some(bytes)
+    }
+
+    fn insert(&mut self, sequence: Sequence, bytes: Bytes) {
+        if bytes.len() > BLOB_CACHE_MAX_BYTES
+            || self.entries.iter().any(|(cached, _)| *cached == sequence)
+        {
+            return;
+        }
+        self.total_bytes += bytes.len();
+        self.entries.push_back((sequence, bytes));
+        while self.total_bytes > BLOB_CACHE_MAX_BYTES {
+            let (_, evicted) = self.entries.pop_front().expect("cached bytes imply entries");
+            self.total_bytes -= evicted.len();
+        }
+    }
+
+    fn retain(&mut self, keep: impl Fn(Sequence) -> bool) {
+        self.entries.retain(|(sequence, _)| keep(*sequence));
+        self.total_bytes = self.entries.iter().map(|(_, bytes)| bytes.len()).sum();
+    }
+}
+
 #[derive(Clone)]
 pub struct OverlayIndex {
     remote: Arc<dyn ObjectStore>,
     state: Arc<RwLock<OverlayState>>,
+    blob_cache: Arc<StdMutex<BlobCache>>,
     #[cfg(test)]
     cleanup_path_visits: Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -73,6 +117,7 @@ impl OverlayIndex {
         Self {
             remote,
             state: Arc::new(RwLock::new(OverlayState::default())),
+            blob_cache: Arc::new(StdMutex::new(BlobCache::default())),
             #[cfg(test)]
             cleanup_path_visits: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
@@ -286,11 +331,15 @@ impl OverlayIndex {
         state
             .paths_by_sequence
             .retain(|sequence, _| *sequence > through);
+        drop(state);
+        self.blob_cache().retain(|sequence| sequence > through);
     }
 
     pub async fn remove_sequence(&self, sequence: Sequence) {
         let mut state = self.state.write().await;
         remove_sequence_locked(&mut state, sequence);
+        drop(state);
+        self.blob_cache().retain(|cached| cached != sequence);
     }
 
     pub async fn visible_version(
@@ -343,17 +392,18 @@ impl OverlayIndex {
         {
             return Err(not_found(location));
         }
-        let bytes = load_payload(payload).await?;
         let range = match options.range {
             Some(range) => range
-                .as_range(bytes.len() as u64)
+                .as_range(meta.size)
                 .map_err(|source| generic_error(format!("invalid get range: {source}")))?,
-            None => 0..bytes.len() as u64,
+            None => 0..meta.size,
         };
         let body = if options.head {
             Bytes::new()
         } else {
-            bytes.slice(range.start as usize..range.end as usize)
+            self.load_payload(payload)
+                .await?
+                .slice(range.start as usize..range.end as usize)
         };
         Ok(GetResult {
             payload: GetResultPayload::Stream(stream::once(async move { Ok(body) }).boxed()),
@@ -416,6 +466,32 @@ impl OverlayIndex {
         })
     }
 
+    async fn load_payload(&self, payload: PayloadLocation) -> object_store::Result<Bytes> {
+        match payload {
+            PayloadLocation::Memory(bytes) => Ok(bytes),
+            PayloadLocation::Journal { journal, sequence } => {
+                if let Some(bytes) = self.blob_cache().get(sequence) {
+                    return Ok(bytes);
+                }
+                let bytes =
+                    tokio::task::spawn_blocking(move || journal.read_blob(sequence).map(Bytes::from))
+                        .await
+                        .map_err(|error| {
+                            generic_error(format!("journal read task failed: {error}"))
+                        })?
+                        .map_err(|error| {
+                            generic_error(format!("journal blob read failed: {error:#}"))
+                        })?;
+                self.blob_cache().insert(sequence, bytes.clone());
+                Ok(bytes)
+            }
+        }
+    }
+
+    fn blob_cache(&self) -> std::sync::MutexGuard<'_, BlobCache> {
+        self.blob_cache.lock().expect("overlay blob cache poisoned")
+    }
+
     async fn visible_entry(&self, location: &Path) -> Option<OverlayEntry> {
         self.state
             .read()
@@ -458,18 +534,6 @@ impl LocalCommitObserver for OverlayCommitObserver {
         self.overlay
             .mark_local(sequence, self.journal.clone())
             .await
-    }
-}
-
-async fn load_payload(payload: PayloadLocation) -> object_store::Result<Bytes> {
-    match payload {
-        PayloadLocation::Memory(bytes) => Ok(bytes),
-        PayloadLocation::Journal { journal, sequence } => {
-            tokio::task::spawn_blocking(move || journal.read_blob(sequence).map(Bytes::from))
-                .await
-                .map_err(|error| generic_error(format!("journal read task failed: {error}")))?
-                .map_err(|error| generic_error(format!("journal blob read failed: {error:#}")))
-        }
     }
 }
 
@@ -1022,6 +1086,116 @@ mod tests {
                 .unwrap(),
             Bytes::from_static(b"payload")
         );
+    }
+
+    fn remove_journal_blobs(root: &std::path::Path) {
+        let blobs = root.join("blobs");
+        let mut pending = vec![blobs];
+        while let Some(directory) = pending.pop() {
+            let Ok(entries) = std::fs::read_dir(&directory) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else {
+                    std::fs::remove_file(path).unwrap();
+                }
+            }
+        }
+    }
+
+    fn test_journal(root: &std::path::Path) -> Arc<Journal> {
+        Arc::new(
+            Journal::open(
+                root.to_path_buf(),
+                JournalIdentity {
+                    format_version: 1,
+                    bucket_id: "bucket-a".to_owned(),
+                    backend_endpoint: "sftp://example.com:23".to_owned(),
+                    database_prefix: "zerofs/pilot".to_owned(),
+                    backend_kind: "sftp".to_owned(),
+                    encryption_key_identity_sha256: [0x77; 32],
+                },
+            )
+            .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn head_of_spilled_blob_does_not_read_the_journal_payload() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("writeback");
+        let journal = test_journal(&root);
+        let record = put_record(1, "object", b"spilled-data");
+        let overlay = OverlayIndex::new(remote_with(&[]).await);
+        overlay
+            .install_memory(record.clone(), Bytes::from_static(b"spilled-data"))
+            .await
+            .unwrap();
+        let committed = journal.commit_put(record, b"spilled-data").unwrap();
+        overlay
+            .mark_local(committed.sequence, journal)
+            .await
+            .unwrap();
+
+        // Metadata answers must not depend on re-reading the payload bytes.
+        remove_journal_blobs(&root);
+        assert_eq!(
+            overlay.head(&Path::from("object")).await.unwrap().size,
+            b"spilled-data".len() as u64
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_ranged_reads_of_a_spilled_blob_reuse_the_verified_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("writeback");
+        let journal = test_journal(&root);
+        let record = put_record(1, "object", b"spilled-data");
+        let overlay = OverlayIndex::new(remote_with(&[]).await);
+        overlay
+            .install_memory(record.clone(), Bytes::from_static(b"spilled-data"))
+            .await
+            .unwrap();
+        let committed = journal.commit_put(record, b"spilled-data").unwrap();
+        overlay
+            .mark_local(committed.sequence, journal)
+            .await
+            .unwrap();
+
+        let first = overlay
+            .get_opts(
+                &Path::from("object"),
+                GetOptions {
+                    range: Some(GetRange::Bounded(0..7)),
+                    ..GetOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.bytes().await.unwrap(), Bytes::from_static(b"spilled"));
+
+        // The first read verified the whole blob; later ranges are served from
+        // the cache without another full journal read + hash.
+        remove_journal_blobs(&root);
+        let second = overlay
+            .get_opts(
+                &Path::from("object"),
+                GetOptions {
+                    range: Some(GetRange::Bounded(8..12)),
+                    ..GetOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.bytes().await.unwrap(), Bytes::from_static(b"data"));
+
+        // Publication removes the overlay entry and drops the cached bytes.
+        overlay.remove_remote_prefix(1).await;
+        assert!(overlay.blob_cache().entries.is_empty());
+        assert_eq!(overlay.blob_cache().total_bytes, 0);
     }
 
     #[tokio::test]
