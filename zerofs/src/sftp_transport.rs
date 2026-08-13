@@ -971,12 +971,7 @@ impl TransportSession for OpenSshTransportSession {
             }
         }
 
-        let stat_started = Instant::now();
-        let metadata = fs.symlink_metadata(path).await;
-        metrics::counter!("zerofs_sftp_directory_stats_total").increment(1);
-        metrics::histogram!("zerofs_sftp_directory_stat_duration_seconds")
-            .record(stat_started.elapsed().as_secs_f64());
-        match metadata {
+        match stat_directory(&mut fs, path).await {
             Ok(metadata) if metadata.file_type().is_some_and(|kind| kind.is_dir()) => Ok(()),
             Ok(_) => Err(TransportError::Operation(format!(
                 "{} exists and is not a directory",
@@ -997,12 +992,7 @@ impl TransportSession for OpenSshTransportSession {
                         // Another writer outside this pool can win the mkdir
                         // race. Verify that result instead of turning a valid
                         // directory into a publication failure.
-                        let verify_started = Instant::now();
-                        let verified = fs.symlink_metadata(path).await;
-                        metrics::counter!("zerofs_sftp_directory_stats_total").increment(1);
-                        metrics::histogram!("zerofs_sftp_directory_stat_duration_seconds")
-                            .record(verify_started.elapsed().as_secs_f64());
-                        match verified {
+                        match stat_directory(&mut fs, path).await {
                             Ok(metadata)
                                 if metadata.file_type().is_some_and(|kind| kind.is_dir()) =>
                             {
@@ -1130,6 +1120,20 @@ impl TransportSession for OpenSshTransportSession {
         }
         Ok(())
     }
+}
+
+/// `symlink_metadata` under the shared directory-probe instrumentation, so
+/// every stat this module issues is counted and timed the same way.
+async fn stat_directory(
+    fs: &mut openssh_sftp_client::fs::Fs,
+    path: &std::path::Path,
+) -> Result<openssh_sftp_client::metadata::MetaData, openssh_sftp_client::Error> {
+    let started = Instant::now();
+    let metadata = fs.symlink_metadata(path).await;
+    metrics::counter!("zerofs_sftp_directory_stats_total").increment(1);
+    metrics::histogram!("zerofs_sftp_directory_stat_duration_seconds")
+        .record(started.elapsed().as_secs_f64());
+    metadata
 }
 
 fn map_sftp_error(path: &std::path::Path, error: openssh_sftp_client::Error) -> TransportError {
