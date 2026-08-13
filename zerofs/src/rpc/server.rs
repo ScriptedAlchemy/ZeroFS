@@ -800,9 +800,7 @@ mod tests {
                     CompressionConfig::default(),
                 ),
                 None,
-                None,
-                None,
-                None,
+                crate::config::StoreProfile::default(),
             )
             .await
             .unwrap(),

@@ -33,6 +33,49 @@ const SEQUENTIAL_FETCH_WINDOW_MULTIPLIER: usize = 15;
 /// separate backend GET so SFTP can use several physical sessions at once.
 const PREFETCH_DEPTH_WINDOWS: usize = 4;
 
+/// Resolved cold-read geometry for one backend. `Default` is the tuning used by
+/// every backend that does not publish a profile of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrefetchProfile {
+    pub part_size_bytes: usize,
+    pub fetch_window_min_bytes: usize,
+    /// Window floor once a stream is confirmed sequential. Never below
+    /// `fetch_window_min_bytes`, never above `fetch_window_max_bytes`.
+    pub sequential_fetch_window_min_bytes: usize,
+    pub fetch_window_max_bytes: usize,
+}
+
+impl Default for PrefetchProfile {
+    fn default() -> Self {
+        Self {
+            part_size_bytes: DEFAULT_PART_SIZE_BYTES,
+            fetch_window_min_bytes: FETCH_WINDOW_MIN,
+            sequential_fetch_window_min_bytes: FETCH_WINDOW_MIN,
+            fetch_window_max_bytes: FETCH_WINDOW_MAX,
+        }
+    }
+}
+
+impl PrefetchProfile {
+    /// Tuning for a high-latency backend: the caller sets the part size and the
+    /// window bounds, and a confirmed sequential stream starts at the multiplied
+    /// minimum, capped by the maximum.
+    pub fn tuned(
+        part_size_bytes: usize,
+        fetch_window_min_bytes: usize,
+        fetch_window_max_bytes: usize,
+    ) -> Self {
+        Self {
+            part_size_bytes,
+            fetch_window_min_bytes,
+            sequential_fetch_window_min_bytes: fetch_window_min_bytes
+                .saturating_mul(SEQUENTIAL_FETCH_WINDOW_MULTIPLIER)
+                .min(fetch_window_max_bytes),
+            fetch_window_max_bytes,
+        }
+    }
+}
+
 type PartId = usize;
 
 /// One window GET shared by every reader whose part falls inside it. Resolves
@@ -441,41 +484,41 @@ enum WindowPlan {
 }
 
 impl PrefetchingObjectStore {
+    /// Build with the crate default tuning.
     pub fn new(inner: Arc<dyn ObjectStore>, parts: HybridCache<PartKey, Bytes>) -> Self {
-        Self::with_options(inner, parts, DEFAULT_PART_SIZE_BYTES)
+        Self::with_profile(inner, parts, PrefetchProfile::default())
     }
 
+    /// Build over a backend's resolved [`PrefetchProfile`]; `Default` gives the
+    /// crate tuning.
+    pub fn with_profile(
+        inner: Arc<dyn ObjectStore>,
+        parts: HybridCache<PartKey, Bytes>,
+        profile: PrefetchProfile,
+    ) -> Self {
+        Self::with_windows(
+            inner,
+            parts,
+            profile.part_size_bytes,
+            profile.fetch_window_min_bytes,
+            profile.sequential_fetch_window_min_bytes,
+            profile.fetch_window_max_bytes,
+        )
+    }
+
+    #[cfg(test)]
     pub fn with_options(
         inner: Arc<dyn ObjectStore>,
         parts: HybridCache<PartKey, Bytes>,
         part_size_bytes: usize,
     ) -> Self {
-        Self::with_windows(
+        Self::with_profile(
             inner,
             parts,
-            part_size_bytes,
-            FETCH_WINDOW_MIN,
-            FETCH_WINDOW_MIN,
-            FETCH_WINDOW_MAX,
-        )
-    }
-
-    pub fn with_tuning(
-        inner: Arc<dyn ObjectStore>,
-        parts: HybridCache<PartKey, Bytes>,
-        part_size_bytes: usize,
-        fetch_window_min_bytes: usize,
-        fetch_window_max_bytes: usize,
-    ) -> Self {
-        Self::with_windows(
-            inner,
-            parts,
-            part_size_bytes,
-            fetch_window_min_bytes,
-            fetch_window_min_bytes
-                .saturating_mul(SEQUENTIAL_FETCH_WINDOW_MULTIPLIER)
-                .min(fetch_window_max_bytes),
-            fetch_window_max_bytes,
+            PrefetchProfile {
+                part_size_bytes,
+                ..PrefetchProfile::default()
+            },
         )
     }
 
@@ -1918,12 +1961,10 @@ mod tests {
             .await
             .unwrap();
         (
-            PrefetchingObjectStore::with_tuning(
+            PrefetchingObjectStore::with_profile(
                 inner,
                 parts,
-                part_size,
-                fetch_window_min,
-                fetch_window_max,
+                PrefetchProfile::tuned(part_size, fetch_window_min, fetch_window_max),
             ),
             dir,
         )
@@ -2013,7 +2054,11 @@ mod tests {
             .build()
             .await
             .unwrap();
-        let store = PrefetchingObjectStore::with_tuning(backend, parts, MIB, MIB, OBJECT_LEN);
+        let store = PrefetchingObjectStore::with_profile(
+            backend,
+            parts,
+            PrefetchProfile::tuned(MIB, MIB, OBJECT_LEN),
+        );
 
         for chunk in 0..120u64 {
             let start = chunk * MIB as u64;

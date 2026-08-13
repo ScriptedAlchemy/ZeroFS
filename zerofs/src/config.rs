@@ -208,6 +208,38 @@ pub struct SftpDataProfile {
     pub read_fetch_window_max_bytes: usize,
 }
 
+/// Data-plane tuning for the configured storage backend, resolved once at
+/// startup and carried as one value instead of per-knob arguments.
+///
+/// `Default` is what every backend gets unless it publishes a profile of its
+/// own: `None` means "keep the crate default" for that knob.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StoreProfile {
+    /// Open-segment seal threshold in bytes.
+    pub seal_threshold: Option<usize>,
+    /// Segment seals allowed in flight at once.
+    pub max_inflight_seals: Option<usize>,
+    /// Clean-cache budget for decoded plaintext extents.
+    pub decoded_extent_cache_bytes: Option<usize>,
+    /// Cold segment-read prefetch geometry.
+    pub prefetch: crate::object_store_prefetch::PrefetchProfile,
+}
+
+impl From<SftpDataProfile> for StoreProfile {
+    fn from(profile: SftpDataProfile) -> Self {
+        Self {
+            seal_threshold: Some(profile.segment_size_bytes),
+            max_inflight_seals: Some(profile.max_inflight_seals),
+            decoded_extent_cache_bytes: None,
+            prefetch: crate::object_store_prefetch::PrefetchProfile::tuned(
+                profile.read_cache_part_size_bytes,
+                profile.read_fetch_window_min_bytes,
+                profile.read_fetch_window_max_bytes,
+            ),
+        }
+    }
+}
+
 impl Default for SftpConfig {
     fn default() -> Self {
         Self {
@@ -1392,6 +1424,18 @@ impl Settings {
             access_mode,
             self.replication.is_some(),
         )
+    }
+
+    /// Data-plane tuning for the configured backend. SFTP publishes its own
+    /// profile; every other backend runs on the defaults.
+    pub fn store_profile(&self) -> Result<StoreProfile> {
+        Ok(match self.sftp_endpoint()? {
+            // `from_file` fills `[sftp]` whenever the URL is SFTP; fall back to
+            // the same defaults `validate` uses so a Settings built in code
+            // cannot turn a missing section into a panic.
+            Some(_) => StoreProfile::from(self.sftp.clone().unwrap_or_default().data_profile()),
+            None => StoreProfile::default(),
+        })
     }
 
     /// Return normalized SFTP endpoint data without retaining URL credentials.

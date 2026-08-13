@@ -202,9 +202,10 @@ impl Storage {
                     zerofs::config::CompressionConfig::default(),
                 ),
                 None,
-                Some(scale.seal_threshold),
-                None,
-                None,
+                zerofs::config::StoreProfile {
+                    seal_threshold: Some(scale.seal_threshold),
+                    ..Default::default()
+                },
             )
             .await
             .expect("zerofs open"),

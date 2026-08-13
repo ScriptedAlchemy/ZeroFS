@@ -55,6 +55,8 @@ struct StartupContext {
     recovering_handoff: bool,
     /// Opening capability retained across writer-open retries.
     opening: Option<crate::replication::leader_record::OpeningToken>,
+    /// Backend data-plane tuning, resolved once from the storage URL.
+    store_profile: crate::config::StoreProfile,
 }
 
 /// Receiver handles carried through role election and takeover reconciliation.
@@ -124,16 +126,6 @@ enum ReconcileOutcome {
     RetryWriter,
 }
 
-fn sftp_data_profile(settings: &Settings) -> Result<Option<crate::config::SftpDataProfile>> {
-    Ok(settings.sftp_endpoint()?.map(|_| {
-        settings
-            .sftp
-            .as_ref()
-            .expect("effective SFTP config")
-            .data_profile()
-    }))
-}
-
 impl StartupContext {
     async fn prepare(settings: &Settings, db_mode: DatabaseMode) -> Result<Self> {
         let url = settings.storage.url.clone();
@@ -145,6 +137,10 @@ impl StartupContext {
         };
 
         let env_vars = settings.cloud_provider_env_vars();
+
+        // The one place the backend decides its data-plane tuning; every
+        // consumer downstream reads the resolved profile, not the URL.
+        let store_profile = settings.store_profile()?;
 
         let (object_store, path_from_url, sftp_pool) = parse_url_opts_with_sftp(
             &url.parse().context("Failed to parse storage URL")?,
@@ -305,6 +301,7 @@ impl StartupContext {
                 took_over_from_standby: false,
                 recovering_handoff: false,
                 opening: None,
+                store_profile,
             })
         }
         .await;
@@ -785,20 +782,13 @@ impl StartupContext {
         // Retries sit under the prefetcher, so a single-flight window GET rides
         // out a transient error before failing every waiting reader, and above
         // the tracing layer, so each attempt is visible to otrace.
-        let sftp_profile = sftp_data_profile(settings)?;
-        let prefetch = Arc::new(match sftp_profile {
-            Some(profile) => crate::object_store_prefetch::PrefetchingObjectStore::with_tuning(
+        let prefetch = Arc::new(
+            crate::object_store_prefetch::PrefetchingObjectStore::with_profile(
                 self.object_store.clone(),
                 parts_cache,
-                profile.read_cache_part_size_bytes,
-                profile.read_fetch_window_min_bytes,
-                profile.read_fetch_window_max_bytes,
+                self.store_profile.prefetch,
             ),
-            None => crate::object_store_prefetch::PrefetchingObjectStore::new(
-                self.object_store.clone(),
-                parts_cache,
-            ),
-        });
+        );
         let db_prefix = Path::from(self.actual_db_path.clone());
         let segment_object_store: Arc<dyn object_store::ObjectStore> =
             Arc::new(object_store::prefix::PrefixStore::new(
@@ -939,6 +929,7 @@ impl ReconciledDb {
             took_over_from_standby: _,
             recovering_handoff: _,
             opening: _,
+            store_profile: backend_profile,
         } = startup;
 
         let serving_writer_epoch = match &slatedb {
@@ -1103,7 +1094,11 @@ impl ReconciledDb {
                  and without it un-flushed writes are lost on any crash"
             );
         }
-        let sftp_profile = sftp_data_profile(settings)?;
+        // The clean-cache share is sized by the opened db, not by the backend.
+        let store_profile = crate::config::StoreProfile {
+            decoded_extent_cache_bytes: Some(decoded_extent_memory_bytes),
+            ..backend_profile
+        };
 
         let db_handle = slatedb.clone();
         let fs = ZeroFS::new_with_slatedb_and_lease(
@@ -1120,9 +1115,7 @@ impl ReconciledDb {
             segment_object_store,
             segment_codec,
             segment_warm,
-            sftp_profile.map(|profile| profile.segment_size_bytes),
-            sftp_profile.map(|profile| profile.max_inflight_seals),
-            Some(decoded_extent_memory_bytes),
+            store_profile,
         )
         .await
         .context("Failed to initialize filesystem")?;
@@ -1359,6 +1352,7 @@ mod role_decision_tests {
             took_over_from_standby: false,
             recovering_handoff: false,
             opening: None,
+            store_profile: crate::config::StoreProfile::default(),
         };
         let election = tokio::spawn(async move {
             startup.become_writer().await?;

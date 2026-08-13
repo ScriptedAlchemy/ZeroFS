@@ -48,9 +48,7 @@ impl ZeroFS {
             object_store,
             segment_codec,
             None,
-            None,
-            None,
-            None,
+            crate::config::StoreProfile::default(),
         )
         .await
     }
@@ -73,9 +71,8 @@ impl ZeroFS {
         object_store: Arc<dyn slatedb::object_store::ObjectStore>,
         segment_codec: FrameCodec,
         segment_warm: Option<crate::segment_store::SegmentWarmHook>,
-        seal_threshold_override: Option<usize>,
-        max_inflight_seals_override: Option<usize>,
-        decoded_extent_cache_bytes: Option<usize>,
+        // Backend data-plane tuning; `Default` keeps every crate default.
+        store_profile: crate::config::StoreProfile,
     ) -> anyhow::Result<Self> {
         // The expiry reaper may already be running from CLI setup.
         dedup.start_expiry_reaper();
@@ -174,9 +171,14 @@ impl ZeroFS {
             key_codec.clone(),
             segment_store,
             lock_manager.clone(),
-            seal_threshold_override.unwrap_or(crate::fs::store::extent::SEAL_THRESHOLD),
-            max_inflight_seals_override.unwrap_or(crate::fs::store::extent::MAX_INFLIGHT_SEALS),
-            decoded_extent_cache_bytes
+            store_profile
+                .seal_threshold
+                .unwrap_or(crate::fs::store::extent::SEAL_THRESHOLD),
+            store_profile
+                .max_inflight_seals
+                .unwrap_or(crate::fs::store::extent::MAX_INFLIGHT_SEALS),
+            store_profile
+                .decoded_extent_cache_bytes
                 .unwrap_or(crate::fs::store::extent::DEFAULT_DECODED_EXTENT_CACHE_BYTES),
         );
         // Seed the monitor's segment footprint gauges from the existing on-store

@@ -1409,9 +1409,7 @@ mod tests {
             object_store,
             segment_codec,
             None,
-            None,
-            None,
-            None,
+            crate::config::StoreProfile::default(),
         )
         .await
         .unwrap();

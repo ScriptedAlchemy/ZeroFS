@@ -115,9 +115,7 @@ impl CrashTestContext {
                     zerofs::config::CompressionConfig::default(),
                 ),
                 None,
-                None,
-                None,
-                None,
+                zerofs::config::StoreProfile::default(),
             )
             .await
             .unwrap(),
