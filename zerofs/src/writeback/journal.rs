@@ -77,27 +77,30 @@
 //! SSD holds at most that many bytes beyond what `dirty_ssd_reserved_bytes`
 //! accounts for.
 //!
-//! ## What is still serial
+//! ## Two halves, pipelined
 //!
-//! Publication is one uninterrupted sequence: write, fsync, fsync, commit.
-//! Nothing else reaches the device while a batch runs, so a batch's cost is
-//! the sum of its parts rather than the maximum. Measured on a 2.4 GiB/s
-//! device, the durability path itself got 1.7x (1 MiB records) to 10x (64
-//! KiB) faster than the per-record layout it replaces -- but the drain as a
-//! whole only tracks that at small records. The layout it replaced wrote and
-//! fsynced each payload separately at a queue depth of
-//! `DEFAULT_LOCAL_PREPARE_CONCURRENCY`, and that overlap hid a large part of
-//! its own cost; at 1 MiB records it hid enough to beat a single serial
-//! container.
+//! Publication is split so the drain is not one uninterrupted device-idle
+//! sequence:
 //!
-//! Recovering it means overlapping one batch's fsync and commit with the
-//! next batch's container write. The durability contract allows this -- a
-//! record's own bytes still precede its own commit, and `commit_record_batch`
-//! already refuses any batch that is not contiguous with the watermark, so
-//! commits stay ordered no matter how the writes interleave. It needs
-//! publication split into a staging half (assign the container, write it,
-//! fsync it) and a committing half, with the journaler keeping one batch in
-//! each half. That is the next step, not this one.
+//! * [`Journal::stage_batch`] runs steps 1 and 2 -- the container write and
+//!   both fsyncs. Afterwards the payload bytes are durable under a durable
+//!   name, and nothing else is true: no record exists, the watermark has not
+//!   moved, and a restart here unlinks the container.
+//! * [`Journal::commit_staged`] runs step 3. This is the only point at which
+//!   a record becomes ACKable.
+//!
+//! The journaler keeps one batch in each half, so batch N+1's bytes reach the
+//! device while batch N's metadata commits. The durability contract survives
+//! the overlap because it is per record, not global: a record's own container
+//! is fsynced before its own commit, and only its own commit releases
+//! `wait_local`. Ordering survives because exactly one commit runs at a time,
+//! batches enter the commit half in assembly order, and `commit_record_batch`
+//! independently refuses any batch that is not contiguous with the durable
+//! watermark -- so interleaved writes cannot produce interleaved commits.
+//!
+//! Staging cannot read the watermark to check contiguity, precisely because
+//! it runs ahead of it; it takes the expected first sequence from its caller
+//! as an early check and leaves the authoritative one to the commit.
 
 use crate::writeback::model::{
     FenceClass, JournalIdentity, MutationKind, MutationRecord, Sequence, classify_mutation_fence,
@@ -242,6 +245,32 @@ impl Drop for JournalWriteGuard<'_> {
             .expect("journal write ticket overflow");
         drop(state);
         self.gate.ready.notify_all();
+    }
+}
+
+/// One publication batch between its two halves.
+///
+/// A `Durable` batch has its payload bytes and their container name on disk
+/// and fsynced, but no metadata referencing them and no watermark movement --
+/// so none of its records may be ACKed yet, and a restart at this point
+/// unlinks the container. Only [`Journal::commit_staged`] closes that gap.
+pub(crate) enum StagedBatch {
+    Durable {
+        records: Vec<MutationRecord>,
+        container: Option<PathBuf>,
+    },
+    /// A sink that does not separate the two halves (the journaler's test
+    /// doubles) carries its prepared mutations through to the commit half
+    /// instead, so the pipeline drives them unchanged.
+    Unstaged(Vec<PreparedMutation>),
+}
+
+impl StagedBatch {
+    pub(crate) fn sequences(&self) -> Vec<Sequence> {
+        match self {
+            Self::Durable { records, .. } => records.iter().map(|record| record.sequence).collect(),
+            Self::Unstaged(prepared) => prepared.iter().map(PreparedMutation::sequence).collect(),
+        }
     }
 }
 
@@ -722,10 +751,46 @@ impl Journal {
         prepared: Vec<PreparedMutation>,
         filesystem: &dyn PublicationFilesystem,
     ) -> Result<Vec<MutationRecord>> {
+        let expected_first = self
+            .progress()?
+            .local_seq
+            .checked_add(1)
+            .context("local sequence overflow")?;
+        let staged = self.stage_batch_with(prepared, expected_first, filesystem)?;
+        self.commit_staged(staged)
+    }
+
+    /// The staging half of publication: make this batch's payload bytes
+    /// durable, and nothing else.
+    ///
+    /// `expected_first` is the sequence this batch must start at. Staging
+    /// cannot read it from the watermark, because a pipelined caller stages
+    /// the next batch while the previous one is still committing and the
+    /// watermark has not moved yet. That is safe: this is an early
+    /// consistency check, and [`Journal::commit_staged`] re-validates
+    /// contiguity against the durable watermark inside the commit
+    /// transaction, which is the authority.
+    pub(crate) fn stage_batch(
+        &self,
+        prepared: Vec<PreparedMutation>,
+        expected_first: Sequence,
+    ) -> Result<StagedBatch> {
+        self.stage_batch_with(prepared, expected_first, &StdPublicationFilesystem)
+    }
+
+    fn stage_batch_with(
+        &self,
+        prepared: Vec<PreparedMutation>,
+        expected_first: Sequence,
+        filesystem: &dyn PublicationFilesystem,
+    ) -> Result<StagedBatch> {
         if prepared.is_empty() {
-            return Ok(Vec::new());
+            return Ok(StagedBatch::Durable {
+                records: Vec::new(),
+                container: None,
+            });
         }
-        if let Err(error) = self.require_contiguous_local_batch(&prepared) {
+        if let Err(error) = self.require_contiguous_local_batch(&prepared, expected_first) {
             let cleanup = self.discard_prepared_batch(prepared);
             return match cleanup {
                 Ok(()) => Err(error),
@@ -828,13 +893,33 @@ impl Journal {
         }
         record_local_publish_phase("directory_fsync", fsync_started.elapsed());
 
+        // Every payload byte in this batch is now durable under a name that
+        // is itself durable. Nothing is visible to replay or recovery yet:
+        // the watermark has not moved, so the container still reads as
+        // uncommitted and would be unlinked by a restart here.
+        Ok(StagedBatch::Durable {
+            records,
+            container: written,
+        })
+    }
+
+    /// The committing half of publication: make the metadata that names an
+    /// already-durable container durable too, and only then advance the local
+    /// watermark. This is the point at which the batch's records become
+    /// ACKable.
+    pub(crate) fn commit_staged(&self, staged: StagedBatch) -> Result<Vec<MutationRecord>> {
+        let StagedBatch::Durable { records, container } = staged else {
+            bail!("commit_staged requires a staged batch");
+        };
+        if records.is_empty() {
+            return Ok(Vec::new());
+        }
         let commit_started = Instant::now();
         if let Err(error) = self.commit_record_batch(&records) {
             // Recovery would unlink this container anyway -- the watermark
             // never reached its last member -- but a live process should not
             // sit on bytes nothing references until the next open.
-            let cleanup =
-                self.rollback_uncommitted_batch(written.as_deref(), &directories, filesystem);
+            let cleanup = self.discard_container_at(container.as_deref());
             return match cleanup {
                 Ok(()) => Err(error),
                 Err(cleanup) => {
@@ -849,6 +934,26 @@ impl Journal {
         metrics::histogram!("zerofs_writeback_local_publish_batch_records")
             .record(records.len() as f64);
         Ok(records)
+    }
+
+    /// Abandon a staged batch that will never commit, unlinking the container
+    /// it made durable. Recovery would collect it regardless -- the watermark
+    /// never reached its last member -- so this is only to keep a live process
+    /// from sitting on bytes nothing references.
+    pub(crate) fn discard_staged(&self, staged: StagedBatch) -> Result<()> {
+        match staged {
+            StagedBatch::Durable { container, .. } => {
+                self.discard_container_at(container.as_deref())
+            }
+            StagedBatch::Unstaged(prepared) => self.discard_prepared_batch(prepared),
+        }
+    }
+
+    fn discard_container_at(&self, container: Option<&Path>) -> Result<()> {
+        match container {
+            Some(path) => self.discard_container(path),
+            None => Ok(()),
+        }
     }
 
     /// Write one batch's payloads back to back into its container and fsync
@@ -961,17 +1066,17 @@ impl Journal {
         }
     }
 
-    fn require_contiguous_local_batch(&self, prepared: &[PreparedMutation]) -> Result<()> {
-        let progress = self.progress()?;
-        let mut expected = progress
-            .local_seq
-            .checked_add(1)
-            .context("local sequence overflow")?;
+    fn require_contiguous_local_batch(
+        &self,
+        prepared: &[PreparedMutation],
+        expected_first: Sequence,
+    ) -> Result<()> {
+        let mut expected = expected_first;
         for (index, mutation) in prepared.iter().enumerate() {
             if mutation.sequence() != expected {
                 bail!(
                     "local sequence must advance contiguously from {} to {expected}, got {}",
-                    progress.local_seq,
+                    expected_first.saturating_sub(1),
                     mutation.sequence()
                 );
             }
@@ -3705,6 +3810,124 @@ mod tests {
         assert!(container.exists());
         assert_eq!(recovered.progress().unwrap().local_seq, 3);
         assert_eq!(recovered.read_blob(2).unwrap(), b"payload-2");
+    }
+
+    /// Staging makes bytes durable and nothing else. Until the commit half
+    /// runs, the batch is invisible: no record exists, the watermark has not
+    /// moved, and therefore nothing is ACKable.
+    #[test]
+    fn staging_makes_payload_bytes_durable_without_publishing_anything() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = open_temp_journal(&temp, "bucket-a");
+        journal
+            .publish_batch(prepare_puts(&journal, 1..=2))
+            .unwrap();
+
+        let staged = journal
+            .stage_batch(prepare_puts(&journal, 3..=5), 3)
+            .unwrap();
+
+        let container = journal.root().join(super::container_relative_path(3, 5));
+        assert!(container.exists(), "staged payload bytes must be on disk");
+        assert_eq!(staged.sequences(), vec![3, 4, 5]);
+        assert_eq!(
+            journal.progress().unwrap().local_seq,
+            2,
+            "staging must not advance the watermark"
+        );
+        assert!(journal.mutation(3).unwrap().is_none());
+
+        let committed = journal.commit_staged(staged).unwrap();
+
+        assert_eq!(
+            committed
+                .iter()
+                .map(|record| record.sequence)
+                .collect::<Vec<_>>(),
+            vec![3, 4, 5]
+        );
+        assert_eq!(journal.progress().unwrap().local_seq, 5);
+        assert_eq!(journal.read_blob(4).unwrap(), b"payload-4");
+    }
+
+    /// The crash window the pipeline opens: a container is durable, its batch
+    /// never committed. Its name puts it above the watermark, so recovery
+    /// unlinks it and the committed prefix is untouched.
+    #[test]
+    fn reopening_after_a_crash_between_staging_and_commit_unlinks_the_staged_container() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("writeback");
+        let journal = Journal::open(&root, identity("bucket-a")).unwrap();
+        journal
+            .publish_batch(prepare_puts(&journal, 1..=2))
+            .unwrap();
+        let staged = journal
+            .stage_batch(prepare_puts(&journal, 3..=5), 3)
+            .unwrap();
+        let container = root.join(super::container_relative_path(3, 5));
+        assert!(container.exists());
+
+        // Crash: the staged batch is neither committed nor discarded.
+        drop(staged);
+        drop(journal);
+
+        let recovered = Journal::open(&root, identity("bucket-a")).unwrap();
+
+        assert!(
+            !container.exists(),
+            "a container staged but never committed must be unlinked"
+        );
+        assert_eq!(recovered.progress().unwrap().local_seq, 2);
+        assert_eq!(recovered.read_blob(1).unwrap(), b"payload-1");
+        assert_eq!(recovered.read_blob(2).unwrap(), b"payload-2");
+    }
+
+    /// Staging takes the expected first sequence from its caller so a
+    /// pipelined caller can stage ahead of the watermark. That check is only
+    /// an early one -- the commit re-validates against the durable watermark,
+    /// which is what actually keeps commits ordered.
+    #[test]
+    fn committing_a_staged_batch_that_left_a_gap_fails_without_moving_the_watermark() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = open_temp_journal(&temp, "bucket-a");
+        journal
+            .publish_batch(prepare_puts(&journal, 1..=2))
+            .unwrap();
+
+        // Internally contiguous, but it skips sequences 3 and 4.
+        let staged = journal
+            .stage_batch(prepare_puts(&journal, 5..=6), 5)
+            .unwrap();
+        let container = journal.root().join(super::container_relative_path(5, 6));
+        assert!(container.exists());
+
+        let error = journal.commit_staged(staged).unwrap_err();
+
+        assert!(format!("{error:#}").contains("contiguous"), "{error:#}");
+        assert_eq!(journal.progress().unwrap().local_seq, 2);
+        assert!(
+            !container.exists(),
+            "a rejected commit must not leave its container behind"
+        );
+    }
+
+    /// Discarding a staged batch releases the bytes it made durable, so a
+    /// live process does not wait for the next open to reclaim them.
+    #[test]
+    fn discarding_a_staged_batch_unlinks_its_container() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = open_temp_journal(&temp, "bucket-a");
+        let staged = journal
+            .stage_batch(prepare_puts(&journal, 1..=3), 1)
+            .unwrap();
+        let container = journal.root().join(super::container_relative_path(1, 3));
+        assert!(container.exists());
+
+        journal.discard_staged(staged).unwrap();
+
+        assert!(!container.exists());
+        assert_eq!(journal.progress().unwrap().local_seq, 0);
+        assert!(published_blob_files(&journal).is_empty());
     }
 
     /// Publication records no pending-blob intent at all: the container's

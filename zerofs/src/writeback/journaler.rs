@@ -1,6 +1,6 @@
 use crate::writeback::admission::{AcceptedAdmission, Admission, DiskPermit};
 use crate::writeback::barrier::{BarrierError, SequenceBarrier, SequenceProgress};
-use crate::writeback::journal::{Journal, PreparedMutation};
+use crate::writeback::journal::{Journal, PreparedMutation, StagedBatch};
 use crate::writeback::model::{MutationRecord, Sequence};
 use crate::writeback::payload::VerifiedPayload;
 use anyhow::Result as AnyResult;
@@ -70,6 +70,42 @@ trait LocalJournalSink: Send + Sync + 'static {
             .collect()
     }
 
+    /// Make a batch's payload bytes durable without publishing anything.
+    ///
+    /// The default keeps the batch whole and does all the work in
+    /// `commit_staged`, which is what a sink that does not separate the two
+    /// halves wants; the pipeline then simply never overlaps anything.
+    fn stage_batch(
+        &self,
+        prepared: Vec<PreparedMutation>,
+        _expected_first: Sequence,
+    ) -> AnyResult<StagedBatch> {
+        Ok(StagedBatch::Unstaged(prepared))
+    }
+
+    fn commit_staged(&self, staged: StagedBatch) -> AnyResult<Vec<MutationRecord>> {
+        match staged {
+            StagedBatch::Unstaged(prepared) => self.publish_batch(prepared),
+            StagedBatch::Durable { .. } => {
+                anyhow::bail!("sink cannot commit a durably staged batch")
+            }
+        }
+    }
+
+    fn discard_staged(&self, staged: StagedBatch) -> AnyResult<()> {
+        match staged {
+            StagedBatch::Unstaged(prepared) => {
+                for mutation in prepared {
+                    self.discard(mutation)?;
+                }
+                Ok(())
+            }
+            StagedBatch::Durable { .. } => {
+                anyhow::bail!("sink cannot discard a durably staged batch")
+            }
+        }
+    }
+
     fn discard(&self, prepared: PreparedMutation) -> AnyResult<()>;
 }
 
@@ -91,6 +127,22 @@ impl LocalJournalSink for Journal {
 
     fn publish_batch(&self, prepared: Vec<PreparedMutation>) -> AnyResult<Vec<MutationRecord>> {
         Journal::publish_batch(self, prepared)
+    }
+
+    fn stage_batch(
+        &self,
+        prepared: Vec<PreparedMutation>,
+        expected_first: Sequence,
+    ) -> AnyResult<StagedBatch> {
+        Journal::stage_batch(self, prepared, expected_first)
+    }
+
+    fn commit_staged(&self, staged: StagedBatch) -> AnyResult<Vec<MutationRecord>> {
+        Journal::commit_staged(self, staged)
+    }
+
+    fn discard_staged(&self, staged: StagedBatch) -> AnyResult<()> {
+        Journal::discard_staged(self, staged)
     }
 
     fn discard(&self, prepared: PreparedMutation) -> AnyResult<()> {
@@ -525,6 +577,200 @@ fn accept_journal_command(
     }
 }
 
+/// The admission permits a batch owns, released when it commits.
+type BatchOwnership = Vec<(Sequence, Option<AcceptedAdmission>, Option<DiskPermit>)>;
+
+struct AssembledBatch {
+    mutations: Vec<PreparedMutation>,
+    ownership: BatchOwnership,
+}
+
+/// Take the longest contiguous run of ready preparations that fits one batch.
+///
+/// A fatal record (failed, unsizeable, or oversized preparation) only becomes
+/// terminal once it is the head of the batch: while earlier records are
+/// already accumulated, they are published first and the fatal one is
+/// reconsidered as the head of the next batch.
+fn assemble_batch(
+    prepared: &mut BTreeMap<Sequence, PreparedEntry>,
+    next_admitted: Sequence,
+) -> Result<Option<AssembledBatch>, String> {
+    let mut mutations = Vec::new();
+    let mut ownership: BatchOwnership = Vec::new();
+    let mut encoded_record_bytes = 0_usize;
+    let mut container_payload_bytes = 0_u64;
+    let mut candidate = Some(next_admitted);
+
+    while let Some(sequence) = candidate {
+        let Some((result, _, _)) = prepared.get(&sequence) else {
+            break;
+        };
+        if result.is_err() {
+            if !mutations.is_empty() {
+                break;
+            }
+            let (result, ram, disk) = prepared
+                .remove(&sequence)
+                .expect("the expected failed preparation still exists");
+            drop(ram);
+            drop(disk);
+            let error = match result {
+                Err(error) => error,
+                Ok(_) => unreachable!("the preparation result was checked above"),
+            };
+            return Err(format!("{error:#}"));
+        }
+        if mutations.len() == MAX_LOCAL_PUBLISH_BATCH_RECORDS {
+            break;
+        }
+        let mutation = match result {
+            Ok(mutation) => mutation,
+            Err(_) => unreachable!("preparation errors are handled above"),
+        };
+        let mutation_bytes = match mutation.encoded_record_bytes() {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                if !mutations.is_empty() {
+                    break;
+                }
+                let (_, ram, disk) = prepared
+                    .remove(&sequence)
+                    .expect("the unsized prepared mutation still exists");
+                drop(ram);
+                drop(disk);
+                return Err(format!("{error:#}"));
+            }
+        };
+        if mutation_bytes > MAX_LOCAL_PUBLISH_BATCH_RECORD_BYTES {
+            if !mutations.is_empty() {
+                break;
+            }
+            let (_, ram, disk) = prepared
+                .remove(&sequence)
+                .expect("the oversized prepared mutation still exists");
+            drop(ram);
+            drop(disk);
+            return Err(format!(
+                "prepared journal mutation {sequence} encodes to {mutation_bytes} bytes, exceeding the {MAX_LOCAL_PUBLISH_BATCH_RECORD_BYTES}-byte local publication batch limit"
+            ));
+        }
+        let Some(next_encoded_bytes) = encoded_record_bytes.checked_add(mutation_bytes) else {
+            if !mutations.is_empty() {
+                break;
+            }
+            let (_, ram, disk) = prepared
+                .remove(&sequence)
+                .expect("the overflowed prepared mutation still exists");
+            drop(ram);
+            drop(disk);
+            return Err("local publication batch byte count overflow".to_owned());
+        };
+        if next_encoded_bytes > MAX_LOCAL_PUBLISH_BATCH_RECORD_BYTES {
+            break;
+        }
+        let next_payload_bytes = container_payload_bytes.saturating_add(mutation.payload_bytes());
+        // A single payload larger than the cap still publishes alone; the cap
+        // only stops a batch from growing past it.
+        if next_payload_bytes > MAX_LOCAL_PUBLISH_BATCH_PAYLOAD_BYTES && !mutations.is_empty() {
+            break;
+        }
+        let (result, ram, disk) = prepared
+            .remove(&sequence)
+            .expect("the expected prepared mutation still exists");
+        mutations.push(result.expect("the prepared mutation was checked above"));
+        ownership.push((sequence, ram, disk));
+        encoded_record_bytes = next_encoded_bytes;
+        container_payload_bytes = next_payload_bytes;
+        candidate = sequence.checked_add(1);
+    }
+
+    if mutations.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(AssembledBatch {
+        mutations,
+        ownership,
+    }))
+}
+
+/// Await one pipeline half, clearing its slot only once it has resolved.
+///
+/// Awaiting `&mut JoinHandle` is cancel safe, so losing a `select!` race here
+/// leaves the task running and the handle usable on the next poll.
+async fn join_pipeline_half<T>(
+    handle: &mut Option<JoinHandle<T>>,
+) -> Result<T, tokio::task::JoinError> {
+    match handle.as_mut() {
+        Some(join) => {
+            let result = join.await;
+            *handle = None;
+            result
+        }
+        None => std::future::pending().await,
+    }
+}
+
+/// Settle one committed batch: release its permits, notify the observer, and
+/// only then publish the new watermark. Returns a terminal error if the batch
+/// did not become durable exactly as assembled.
+async fn finish_commit(
+    result: Result<AnyResult<Vec<MutationRecord>>, tokio::task::JoinError>,
+    mut ownership: BatchOwnership,
+    observer: Option<&Arc<dyn LocalCommitObserver>>,
+    retained_ram: &Arc<StdMutex<Vec<AcceptedAdmission>>>,
+    progress: &watch::Sender<SequenceProgress>,
+) -> Option<String> {
+    let committed = match result {
+        Ok(Ok(records)) => records,
+        Ok(Err(error)) => {
+            drop(ownership);
+            return Some(format!("{error:#}"));
+        }
+        Err(error) => {
+            drop(ownership);
+            return Some(format!("local journal publisher panicked: {error}"));
+        }
+    };
+    let expected_sequences = ownership
+        .iter()
+        .map(|(sequence, _, _)| *sequence)
+        .collect::<Vec<_>>();
+    let committed_sequences = committed
+        .iter()
+        .map(|record| record.sequence)
+        .collect::<Vec<_>>();
+    if committed_sequences != expected_sequences {
+        drop(ownership);
+        return Some(format!(
+            "local journal publisher returned sequences {committed_sequences:?}, expected {expected_sequences:?}"
+        ));
+    }
+    let durable_batch_tail = *expected_sequences
+        .last()
+        .expect("a committed batch contains at least one record");
+
+    for (_, _, disk) in &mut ownership {
+        if let Some(disk) = disk.take() {
+            disk.accept();
+        }
+    }
+
+    if let Some(observer) = observer
+        && let Err(error) = observer.committed_batch(&committed).await
+    {
+        let mut retained = retained_ram
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        retained.extend(ownership.into_iter().filter_map(|(_, ram, _)| ram));
+        return Some(format!("local commit observer failed: {error:#}"));
+    }
+    drop(ownership);
+    // The watermark moves last, so `wait_local` releases a sequence only after
+    // its bytes, its metadata, and every observer of its batch are done.
+    progress.send_modify(|state| state.sequence = durable_batch_tail);
+    None
+}
+
 async fn run_journaler(
     sink: Arc<dyn LocalJournalSink>,
     mut receiver: mpsc::Receiver<JournalCommand>,
@@ -547,6 +793,25 @@ async fn run_journaler(
     let mut input_closed = false;
     let mut terminal = None;
 
+    // The publication pipeline. Staging (write the container, fsync it, fsync
+    // its directory) and committing (insert the records and advance the
+    // watermark) run as separate tasks so one batch's bytes reach the device
+    // while the previous batch's metadata commits. Both halves are bounded to
+    // one batch each, so at most two batches are in flight and the payload
+    // bytes held across publication stay bounded by two containers.
+    //
+    // Ordering survives the overlap: only one commit runs at a time and
+    // batches enter the commit slot in assembly order, and
+    // `commit_record_batch` independently refuses any batch that is not
+    // contiguous with the durable watermark. A record is still ACKed only by
+    // its own commit completing, which happens strictly after its own
+    // container was fsynced.
+    let mut staging: Option<JoinHandle<AnyResult<StagedBatch>>> = None;
+    let mut staging_ownership: BatchOwnership = Vec::new();
+    let mut ready: Option<(StagedBatch, BatchOwnership)> = None;
+    let mut committing: Option<JoinHandle<AnyResult<Vec<MutationRecord>>>> = None;
+    let mut committing_ownership: BatchOwnership = Vec::new();
+
     loop {
         while terminal.is_none() {
             match preparations.next().now_or_never() {
@@ -560,235 +825,164 @@ async fn run_journaler(
             }
         }
 
-        while terminal.is_none() {
-            let mut mutations = Vec::new();
-            let mut ownership = Vec::new();
-            let mut encoded_record_bytes = 0_usize;
-            let mut container_payload_bytes = 0_u64;
-            let mut candidate = Some(next_admitted);
-            while let Some(sequence) = candidate {
-                let Some((result, _, _)) = prepared.get(&sequence) else {
-                    break;
-                };
-                if result.is_err() {
-                    if mutations.is_empty() {
-                        let (result, ram, disk) = prepared
-                            .remove(&sequence)
-                            .expect("the expected failed preparation still exists");
-                        drop(ram);
-                        drop(disk);
-                        let error = match result {
-                            Err(error) => error,
-                            Ok(_) => unreachable!("the preparation result was checked above"),
-                        };
-                        terminal = Some(format!("{error:#}"));
-                    }
-                    break;
-                }
-                if mutations.len() == MAX_LOCAL_PUBLISH_BATCH_RECORDS {
-                    break;
-                }
-                let mutation_bytes = match result {
-                    Ok(mutation) => match mutation.encoded_record_bytes() {
-                        Ok(bytes) => bytes,
-                        Err(error) => {
-                            if mutations.is_empty() {
-                                let (_, ram, disk) = prepared
-                                    .remove(&sequence)
-                                    .expect("the unsized prepared mutation still exists");
-                                drop(ram);
-                                drop(disk);
-                                terminal = Some(format!("{error:#}"));
-                            }
-                            break;
-                        }
-                    },
-                    Err(_) => unreachable!("preparation errors are handled above"),
-                };
-                if mutation_bytes > MAX_LOCAL_PUBLISH_BATCH_RECORD_BYTES {
-                    if mutations.is_empty() {
-                        let (_, ram, disk) = prepared
-                            .remove(&sequence)
-                            .expect("the oversized prepared mutation still exists");
-                        drop(ram);
-                        drop(disk);
-                        terminal = Some(format!(
-                            "prepared journal mutation {sequence} encodes to {mutation_bytes} bytes, exceeding the {MAX_LOCAL_PUBLISH_BATCH_RECORD_BYTES}-byte local publication batch limit"
-                        ));
-                    }
-                    break;
-                }
-                let Some(next_encoded_bytes) = encoded_record_bytes.checked_add(mutation_bytes)
-                else {
-                    if mutations.is_empty() {
-                        let (_, ram, disk) = prepared
-                            .remove(&sequence)
-                            .expect("the overflowed prepared mutation still exists");
-                        drop(ram);
-                        drop(disk);
-                        terminal = Some("local publication batch byte count overflow".to_owned());
-                    }
-                    break;
-                };
-                if next_encoded_bytes > MAX_LOCAL_PUBLISH_BATCH_RECORD_BYTES {
-                    break;
-                }
-                let payload_bytes = match result {
-                    Ok(mutation) => mutation.payload_bytes(),
-                    Err(_) => unreachable!("preparation errors are handled above"),
-                };
-                let next_payload_bytes = container_payload_bytes.saturating_add(payload_bytes);
-                // A single payload larger than the cap still publishes alone;
-                // the cap only stops a batch from growing past it.
-                if next_payload_bytes > MAX_LOCAL_PUBLISH_BATCH_PAYLOAD_BYTES
-                    && !mutations.is_empty()
-                {
-                    break;
-                }
-                let (result, ram, disk) = prepared
-                    .remove(&sequence)
-                    .expect("the expected prepared mutation still exists");
-                mutations.push(result.expect("the prepared mutation was checked above"));
-                ownership.push((sequence, ram, disk));
-                encoded_record_bytes = next_encoded_bytes;
-                container_payload_bytes = next_payload_bytes;
-                candidate = sequence.checked_add(1);
-            }
-            if terminal.is_some() {
-                break;
-            }
-            if mutations.is_empty() {
-                break;
-            }
+        // Hand the staged batch to the commit half as soon as that half is
+        // free, so the next container write can start behind it.
+        if terminal.is_none()
+            && committing.is_none()
+            && let Some((staged, ownership)) = ready.take()
+        {
+            let commit_sink = sink.clone();
+            committing = Some(tokio::task::spawn_blocking(move || {
+                commit_sink.commit_staged(staged)
+            }));
+            committing_ownership = ownership;
+        }
 
-            let publish_sink = sink.clone();
-            let publish =
-                tokio::task::spawn_blocking(move || publish_sink.publish_batch(mutations));
-            tokio::pin!(publish);
-            // Publication is the journal's fixed cost (blob directory fsyncs
-            // plus the redb commits) and the SSD write pipeline is idle while it
-            // runs. Keep preparing the rest of the backlog across it, otherwise
-            // every batch is capped at `prepare_concurrency` records and the
-            // drain degenerates into one small fsync wave per commit. Faults
-            // raised here are deferred: the batch in flight must always be
-            // awaited to completion so its durability outcome is observed.
-            let mut deferred = None::<String>;
-            let publish_result = loop {
-                tokio::select! {
-                    biased;
-                    result = &mut publish => break result,
-                    Some(result) = preparations.next(), if !preparations.is_empty() => {
-                        if let Some(error) = collect_preparation(result, &mut prepared)
-                            && deferred.is_none()
-                        {
-                            deferred = Some(error);
-                        }
-                    }
-                    command = receiver.recv(),
-                        if deferred.is_none()
-                            && !input_closed
-                            && preparations.len() < prepare_concurrency =>
+        // Stage the next batch whenever the staging half is free. This is the
+        // overlap: it runs while the previous batch commits.
+        if terminal.is_none() && staging.is_none() && ready.is_none() {
+            match assemble_batch(&mut prepared, next_admitted) {
+                Err(error) => terminal = Some(error),
+                Ok(Some(AssembledBatch {
+                    mutations,
+                    ownership,
+                })) => {
+                    let expected_first = next_admitted;
+                    next_admitted = match ownership
+                        .last()
+                        .expect("an assembled batch owns at least one sequence")
+                        .0
+                        .checked_add(1)
                     {
-                        deferred = accept_journal_command(
-                            command,
-                            &sink,
-                            &mut preparations,
-                            &mut next_received,
-                            &mut input_closed,
-                            &mut shutdown,
-                        );
-                    }
+                        Some(next) => next,
+                        None => {
+                            // The batch still has to be published; refuse the
+                            // impossible successor instead of wrapping.
+                            terminal = Some("local journal sequence overflow".to_owned());
+                            drop(ownership);
+                            continue;
+                        }
+                    };
+                    let stage_sink = sink.clone();
+                    staging = Some(tokio::task::spawn_blocking(move || {
+                        stage_sink.stage_batch(mutations, expected_first)
+                    }));
+                    staging_ownership = ownership;
                 }
-            };
-            let published = match publish_result {
-                Ok(Ok(records)) => records,
-                Ok(Err(error)) => {
-                    drop(ownership);
-                    terminal = Some(format!("{error:#}"));
-                    break;
-                }
-                Err(error) => {
-                    drop(ownership);
-                    terminal = Some(format!("local journal publisher panicked: {error}"));
-                    break;
-                }
-            };
-            let expected_sequences = ownership
-                .iter()
-                .map(|(sequence, _, _)| *sequence)
-                .collect::<Vec<_>>();
-            let published_sequences = published
-                .iter()
-                .map(|record| record.sequence)
-                .collect::<Vec<_>>();
-            if published_sequences != expected_sequences {
-                drop(ownership);
-                terminal = Some(format!(
-                    "local journal publisher returned sequences {published_sequences:?}, expected {expected_sequences:?}"
-                ));
-                break;
-            }
-            let durable_batch_tail = *expected_sequences
-                .last()
-                .expect("a published batch contains at least one record");
-
-            for (_, _, disk) in &mut ownership {
-                if let Some(disk) = disk.take() {
-                    disk.accept();
-                }
-            }
-
-            if let Some(observer) = &observer
-                && let Err(error) = observer.committed_batch(&published).await
-            {
-                let mut retained = retained_ram
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner());
-                retained.extend(ownership.into_iter().filter_map(|(_, ram, _)| ram));
-                terminal = Some(format!("local commit observer failed: {error:#}"));
-                break;
-            }
-            drop(ownership);
-            progress.send_modify(|state| state.sequence = durable_batch_tail);
-            next_admitted = match durable_batch_tail.checked_add(1) {
-                Some(next) => next,
-                None => {
-                    terminal = Some("local journal sequence overflow".to_owned());
-                    break;
-                }
-            };
-            if let Some(error) = deferred {
-                terminal = Some(error);
-                break;
+                Ok(None) => {}
             }
         }
 
-        if terminal.is_some() {
+        if terminal.is_some() && staging.is_none() && committing.is_none() {
             break;
         }
-        if input_closed && preparations.is_empty() && prepared.is_empty() {
+        if terminal.is_none()
+            && input_closed
+            && preparations.is_empty()
+            && prepared.is_empty()
+            && staging.is_none()
+            && ready.is_none()
+            && committing.is_none()
+        {
             break;
         }
 
         tokio::select! {
-            result = preparations.next(), if !preparations.is_empty() => {
-                if let Some(result) = result {
-                    terminal = collect_preparation(result, &mut prepared);
+            biased;
+            // Faults are never allowed to skip an in-flight batch: both halves
+            // are always awaited to completion so their durability outcome is
+            // observed before the drain gives up.
+            result = join_pipeline_half(&mut committing), if committing.is_some() => {
+                let ownership = std::mem::take(&mut committing_ownership);
+                if let Some(error) = finish_commit(
+                    result,
+                    ownership,
+                    observer.as_ref(),
+                    &retained_ram,
+                    &progress,
+                )
+                .await
+                    && terminal.is_none()
+                {
+                    terminal = Some(error);
                 }
             }
-            command = receiver.recv(), if !input_closed && preparations.len() < prepare_concurrency => {
-                terminal = accept_journal_command(
+            result = join_pipeline_half(&mut staging), if staging.is_some() => {
+                let ownership = std::mem::take(&mut staging_ownership);
+                match result {
+                    Ok(Ok(staged)) => {
+                        let expected = ownership
+                            .iter()
+                            .map(|(sequence, _, _)| *sequence)
+                            .collect::<Vec<_>>();
+                        let actual = staged.sequences();
+                        if actual != expected {
+                            // The permits released after a commit are keyed by
+                            // the sequences assembled here, so a batch that
+                            // staged something else would release the wrong
+                            // ones. Refuse it rather than commit it.
+                            let _ = sink.discard_staged(staged);
+                            drop(ownership);
+                            if terminal.is_none() {
+                                terminal = Some(format!(
+                                    "local journal stager returned sequences {actual:?}, expected {expected:?}"
+                                ));
+                            }
+                        } else if terminal.is_some() {
+                            // The batch's bytes are durable but nothing will
+                            // reference them; unlink instead of leaking until
+                            // the next open collects it.
+                            let _ = sink.discard_staged(staged);
+                            drop(ownership);
+                        } else {
+                            ready = Some((staged, ownership));
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        drop(ownership);
+                        if terminal.is_none() {
+                            terminal = Some(format!("{error:#}"));
+                        }
+                    }
+                    Err(error) => {
+                        drop(ownership);
+                        if terminal.is_none() {
+                            terminal = Some(format!("local journal stager panicked: {error}"));
+                        }
+                    }
+                }
+            }
+            Some(result) = preparations.next(), if !preparations.is_empty() => {
+                if let Some(error) = collect_preparation(result, &mut prepared)
+                    && terminal.is_none()
+                {
+                    terminal = Some(error);
+                }
+            }
+            command = receiver.recv(),
+                if terminal.is_none()
+                    && !input_closed
+                    && preparations.len() < prepare_concurrency =>
+            {
+                if let Some(error) = accept_journal_command(
                     command,
                     &sink,
                     &mut preparations,
                     &mut next_received,
                     &mut input_closed,
                     &mut shutdown,
-                );
+                ) && terminal.is_none()
+                {
+                    terminal = Some(error);
+                }
             }
         }
     }
 
+    if let Some((staged, ownership)) = ready.take() {
+        let _ = sink.discard_staged(staged);
+        drop(ownership);
+    }
     if let Some(error) = terminal {
         admission.poison(error.clone());
         progress.send_modify(|state| state.terminal_error = Some(error.clone()));
@@ -828,8 +1022,10 @@ mod tests {
     };
     use crate::fault_store::FaultStore;
     use crate::writeback::admission::{Admission, AdmissionError, DiskAdmission};
-    use crate::writeback::journal::Journal;
-    use crate::writeback::model::{FenceClass, JournalIdentity, MutationMode, MutationRecord};
+    use crate::writeback::journal::{Journal, StagedBatch};
+    use crate::writeback::model::{
+        FenceClass, JournalIdentity, MutationMode, MutationRecord, Sequence,
+    };
     use crate::writeback::overlay::{OverlayCommitObserver, OverlayIndex};
     use crate::writeback::payload::VerifiedPayload;
     use crate::writeback::remote::RemoteScheduler;
@@ -892,6 +1088,95 @@ mod tests {
         journal: Arc<Journal>,
         head_release: Mutex<Option<mpsc::Receiver<()>>>,
         prepared: tokio_mpsc::UnboundedSender<u64>,
+    }
+
+    /// A real journal with the publication pipeline's two halves under test
+    /// control: block a chosen batch inside the commit half, and/or fail the
+    /// staging of the batch that starts at a chosen sequence.
+    struct PipelineGateSink {
+        journal: Arc<Journal>,
+        commit_gate_on: Sequence,
+        commit_entered: tokio_mpsc::UnboundedSender<Vec<Sequence>>,
+        commit_release: Mutex<Option<mpsc::Receiver<()>>>,
+        fail_stage_from: Option<Sequence>,
+        staged: tokio_mpsc::UnboundedSender<Vec<Sequence>>,
+    }
+
+    impl LocalJournalSink for PipelineGateSink {
+        fn prepare(
+            &self,
+            record: MutationRecord,
+            payload: Option<&VerifiedPayload>,
+        ) -> Result<crate::writeback::journal::PreparedMutation> {
+            match payload {
+                Some(payload) => self.journal.prepare_verified_put(record, payload),
+                None => self.journal.prepare_metadata(record),
+            }
+        }
+
+        fn publish(
+            &self,
+            prepared: crate::writeback::journal::PreparedMutation,
+        ) -> Result<MutationRecord> {
+            self.journal.publish_prepared(prepared)
+        }
+
+        fn stage_batch(
+            &self,
+            prepared: Vec<crate::writeback::journal::PreparedMutation>,
+            expected_first: Sequence,
+        ) -> Result<StagedBatch> {
+            if self.fail_stage_from == Some(expected_first) {
+                // An empty report marks the injected failure so the test can
+                // wait for it instead of racing the pipeline.
+                self.staged.send(Vec::new()).unwrap();
+                bail!("injected staging failure at {expected_first}");
+            }
+            let staged = self.journal.stage_batch(prepared, expected_first)?;
+            self.staged.send(staged.sequences()).unwrap();
+            Ok(staged)
+        }
+
+        fn commit_staged(&self, staged: StagedBatch) -> Result<Vec<MutationRecord>> {
+            let sequences = staged.sequences();
+            let gated = sequences.contains(&self.commit_gate_on);
+            self.commit_entered.send(sequences).unwrap();
+            if gated {
+                self.commit_release
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("commit release gate exists")
+                    .recv()
+                    .unwrap();
+            }
+            self.journal.commit_staged(staged)
+        }
+
+        fn discard_staged(&self, staged: StagedBatch) -> Result<()> {
+            self.journal.discard_staged(staged)
+        }
+
+        fn discard(&self, prepared: crate::writeback::journal::PreparedMutation) -> Result<()> {
+            self.journal.discard_prepared(prepared)
+        }
+    }
+
+    fn pipeline_journal(temp: &tempfile::TempDir) -> Arc<Journal> {
+        Arc::new(
+            Journal::open(
+                temp.path().join("writeback"),
+                JournalIdentity {
+                    format_version: 1,
+                    bucket_id: "bucket-pipeline".to_owned(),
+                    backend_endpoint: "sftp://example.com:23".to_owned(),
+                    database_prefix: "zerofs/pilot".to_owned(),
+                    backend_kind: "sftp".to_owned(),
+                    encryption_key_identity_sha256: [0x51; 32],
+                },
+            )
+            .unwrap(),
+        )
     }
 
     /// Records the size of every committed publication batch so throughput
@@ -2259,6 +2544,241 @@ mod tests {
         disk.set_remote_complete(7, 1_000).unwrap();
         assert_eq!(disk.used_bytes(), 0);
         journaler.shutdown().await.unwrap();
+    }
+
+    /// The durability contract across the pipeline's seam: a record's bytes
+    /// being durable is not enough to ACK it. Observed from inside the commit
+    /// half -- after staging fsynced the container, before the record commit
+    /// runs -- the payload is on disk, the watermark has not moved, and
+    /// `wait_local` must not release.
+    #[tokio::test]
+    async fn a_record_is_not_ackable_until_its_batch_commits_even_though_its_bytes_are_durable() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = pipeline_journal(&temp);
+        let (commit_entered_tx, mut commit_entered) = tokio_mpsc::unbounded_channel();
+        let (staged_tx, _staged) = tokio_mpsc::unbounded_channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let sink = Arc::new(PipelineGateSink {
+            journal: journal.clone(),
+            commit_gate_on: 1,
+            commit_entered: commit_entered_tx,
+            commit_release: Mutex::new(Some(release_rx)),
+            fail_stage_from: None,
+            staged: staged_tx,
+        });
+        let admission = Admission::new(64);
+        let journaler =
+            LocalJournaler::start_with_sink_and_observer(sink, admission.clone(), 0, 8, 8, None);
+        let ram = admission.reserve(7).await.unwrap().accept();
+        let barrier = journaler
+            .submit_put(
+                put_record(1, b"payload"),
+                Bytes::from_static(b"payload"),
+                ram,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), commit_entered.recv())
+                .await
+                .expect("the batch never reached the commit half")
+                .unwrap(),
+            vec![1]
+        );
+
+        // Staging has fsynced the container, so the bytes are durable...
+        let container = journal
+            .root()
+            .join("blobs/00/0000000000000001-0000000000000001.blobs");
+        assert!(container.exists(), "staged bytes must be durable");
+        // ...but nothing references them yet, so nothing may be ACKed.
+        assert_eq!(journal.progress().unwrap().local_seq, 0);
+        assert_eq!(barrier.local_sequence(), 0);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), barrier.wait_local(1))
+                .await
+                .is_err(),
+            "wait_local released before the batch committed"
+        );
+
+        release_tx.send(()).unwrap();
+
+        barrier.wait_local(1).await.unwrap();
+        assert_eq!(journal.progress().unwrap().local_seq, 1);
+        assert_eq!(journal.read_blob(1).unwrap(), b"payload");
+        journaler.shutdown().await.unwrap();
+    }
+
+    /// The overlap itself: while batch 1 is parked inside its commit, batch 2
+    /// must get all the way through the staging half and have its container
+    /// on disk. Serial publication would leave batch 2 untouched until batch
+    /// 1 finished, so this is what a regression to serial would break.
+    #[tokio::test]
+    async fn the_next_batch_stages_while_the_previous_batch_commits() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = pipeline_journal(&temp);
+        let (commit_entered_tx, mut commit_entered) = tokio_mpsc::unbounded_channel();
+        let (staged_tx, mut staged) = tokio_mpsc::unbounded_channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let sink = Arc::new(PipelineGateSink {
+            journal: journal.clone(),
+            commit_gate_on: 1,
+            commit_entered: commit_entered_tx,
+            commit_release: Mutex::new(Some(release_rx)),
+            fail_stage_from: None,
+            staged: staged_tx,
+        });
+        let admission = Admission::new(64);
+        let journaler =
+            LocalJournaler::start_with_sink_and_observer(sink, admission.clone(), 0, 8, 8, None);
+
+        let ram = admission.reserve(7).await.unwrap().accept();
+        let barrier = journaler
+            .submit_put(
+                put_record(1, b"payload"),
+                Bytes::from_static(b"payload"),
+                ram,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), staged.recv())
+                .await
+                .expect("batch 1 never staged")
+                .unwrap(),
+            vec![1]
+        );
+        tokio::time::timeout(Duration::from_secs(5), commit_entered.recv())
+            .await
+            .expect("batch 1 never reached the commit half")
+            .unwrap();
+
+        let ram = admission.reserve(5).await.unwrap().accept();
+        journaler
+            .submit_put(put_record(2, b"again"), Bytes::from_static(b"again"), ram)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), staged.recv())
+                .await
+                .expect("batch 2 did not stage while batch 1 was committing")
+                .unwrap(),
+            vec![2]
+        );
+        let second = journal
+            .root()
+            .join("blobs/00/0000000000000002-0000000000000002.blobs");
+        assert!(
+            second.exists(),
+            "batch 2's bytes must be durable while batch 1 is still committing"
+        );
+        // Overlapping the writes must not overlap the ACKs: neither batch is
+        // ACKable while batch 1's commit is parked.
+        assert_eq!(journal.progress().unwrap().local_seq, 0);
+        assert_eq!(barrier.local_sequence(), 0);
+
+        release_tx.send(()).unwrap();
+
+        barrier.wait_local(2).await.unwrap();
+        assert_eq!(journal.read_blob(1).unwrap(), b"payload");
+        assert_eq!(journal.read_blob(2).unwrap(), b"again");
+        journaler.shutdown().await.unwrap();
+    }
+
+    /// The fault path the overlap introduces: staging batch 2 fails while
+    /// batch 1 is still inside its commit. The in-flight commit must still be
+    /// awaited and honoured -- sequence 1 stays durable and ACKable -- while
+    /// sequence 2 is refused, and the journal reopens on exactly the
+    /// committed prefix with no container left above the watermark.
+    #[tokio::test]
+    async fn a_staging_failure_behind_an_in_flight_commit_keeps_the_committed_prefix() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("writeback");
+        let journal = pipeline_journal(&temp);
+        let (commit_entered_tx, mut commit_entered) = tokio_mpsc::unbounded_channel();
+        let (staged_tx, mut staged) = tokio_mpsc::unbounded_channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let sink = Arc::new(PipelineGateSink {
+            journal: journal.clone(),
+            commit_gate_on: 1,
+            commit_entered: commit_entered_tx,
+            commit_release: Mutex::new(Some(release_rx)),
+            fail_stage_from: Some(2),
+            staged: staged_tx,
+        });
+        let admission = Admission::new(64);
+        let journaler =
+            LocalJournaler::start_with_sink_and_observer(sink, admission.clone(), 0, 8, 8, None);
+
+        let ram = admission.reserve(7).await.unwrap().accept();
+        let barrier = journaler
+            .submit_put(
+                put_record(1, b"payload"),
+                Bytes::from_static(b"payload"),
+                ram,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), staged.recv())
+                .await
+                .expect("batch 1 never staged")
+                .unwrap(),
+            vec![1]
+        );
+        tokio::time::timeout(Duration::from_secs(5), commit_entered.recv())
+            .await
+            .expect("batch 1 never reached the commit half")
+            .unwrap();
+
+        // Batch 2 stages while batch 1 is parked inside its commit.
+        let ram = admission.reserve(5).await.unwrap().accept();
+        journaler
+            .submit_put(put_record(2, b"again"), Bytes::from_static(b"again"), ram)
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), staged.recv())
+                .await
+                .expect("batch 2 never reached the staging half")
+                .unwrap(),
+            Vec::<Sequence>::new(),
+            "batch 2 should have reported its injected staging failure"
+        );
+
+        release_tx.send(()).unwrap();
+
+        barrier
+            .wait_local(1)
+            .await
+            .expect("the in-flight commit must still be honoured");
+        let refused = barrier.wait_local(2).await.unwrap_err();
+        assert!(
+            matches!(refused, LocalBarrierError::LocalDurability(ref message)
+                if message.contains("injected staging failure")),
+            "{refused:?}"
+        );
+        assert!(journaler.shutdown().await.is_err());
+        drop(journaler);
+        drop(journal);
+
+        let recovered = Journal::open(
+            &root,
+            JournalIdentity {
+                format_version: 1,
+                bucket_id: "bucket-pipeline".to_owned(),
+                backend_endpoint: "sftp://example.com:23".to_owned(),
+                database_prefix: "zerofs/pilot".to_owned(),
+                backend_kind: "sftp".to_owned(),
+                encryption_key_identity_sha256: [0x51; 32],
+            },
+        )
+        .expect("the journal must reopen on the committed prefix");
+        assert_eq!(recovered.progress().unwrap().local_seq, 1);
+        assert_eq!(recovered.read_blob(1).unwrap(), b"payload");
+        assert!(recovered.mutation(2).unwrap().is_none());
     }
 
     #[tokio::test]
