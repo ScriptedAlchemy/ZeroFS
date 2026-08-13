@@ -1,3 +1,73 @@
+//! # Batch container blobs
+//!
+//! A publication batch packs every payload in the batch into ONE container
+//! file instead of one file per record. The drain then pays one large
+//! sequential write plus one fsync per batch rather than N pipelined
+//! small-write fsyncs, which is what makes the post-ACK durability tail
+//! bandwidth-bound instead of fsync-latency-bound.
+//!
+//! ## Layout
+//!
+//! A container is named for the contiguous sequence range it covers and is
+//! sharded by the same `(sequence >> 8) & 0xff` rule the per-record layout
+//! used, so a run of consecutive batches keeps sharing one directory and one
+//! directory fsync:
+//!
+//! ```text
+//! blobs/{(first >> 8) & 0xff:02x}/{first:016x}-{last:016x}.blobs
+//! ```
+//!
+//! Encoding the range in the name means recovery and pruning can decide a
+//! container's fate from its path alone -- no side table, no refcount.
+//!
+//! ## Blob references
+//!
+//! `MutationRecord::blob_path` stays a `String`, and gains an optional slice
+//! suffix. Both forms are accepted forever, so journals written by earlier
+//! binaries replay unchanged (see [`BlobRef::parse`]):
+//!
+//! * legacy, whole file:  `blobs/ab/{uuid}.blob`
+//! * container slice:     `blobs/ab/{first}-{last}.blobs#{offset}+{len}`
+//!
+//! `#` cannot appear in a generated path, so the split is unambiguous. Only
+//! publication mints new references; every reader goes through `BlobRef`, so
+//! the two forms cost one parse and no branching anywhere else.
+//!
+//! ## Ordering and the durability contract
+//!
+//! A record is ACKed durable only after its bytes AND the metadata naming
+//! them are fsynced. One batch therefore runs:
+//!
+//! 1. write the container to `tmp/`, `fsync` it (payload bytes durable);
+//! 2. commit the `PENDING_BLOBS` intent for the container path
+//!    (`Durability::Immediate`) -- so a crash after step 3 but before step 5
+//!    leaves a note telling recovery to delete the orphan;
+//! 3. `rename` into `blobs/{shard}/`;
+//! 4. `fsync` the shard directory (the name is durable);
+//! 5. commit records, clear the intent, and advance `LOCAL_SEQ_KEY` in one
+//!    `Durability::Immediate` transaction.
+//!
+//! The batch is atomic: any failure before step 5 rolls the container and the
+//! intent back and leaves `LOCAL_SEQ_KEY` untouched, so the whole batch fails
+//! together and the journal stays replayable. A crash at any point before
+//! step 5 recovers to the pre-batch state, because `recover_local_artifacts`
+//! wipes `tmp/` and deletes every path named by a surviving intent.
+//!
+//! ## Reclamation
+//!
+//! A container holds one contiguous sequence range, so "every member is
+//! remote-committed" is exactly `last <= remote watermark` -- a watermark
+//! comparison, not a refcount. [`Journal::remove_remote_prefix`] parses `last`
+//! out of the container name and unlinks only fully drained containers.
+//!
+//! Transient overhead: a container straddling the remote watermark keeps its
+//! already-drained members on disk until its final member drains. That is
+//! bounded by one container, whose size the journaler caps at
+//! `MAX_LOCAL_PUBLISH_BATCH_PAYLOAD_BYTES`. Because the remote watermark
+//! advances in order, at most one container straddles it at a time, so the
+//! SSD holds at most that many bytes beyond what `dirty_ssd_reserved_bytes`
+//! accounts for.
+
 use crate::writeback::model::{
     FenceClass, JournalIdentity, MutationKind, MutationRecord, Sequence, classify_mutation_fence,
 };
