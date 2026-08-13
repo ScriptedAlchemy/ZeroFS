@@ -247,7 +247,30 @@ impl Transaction {
     /// Record a usage-stats adjustment for `inode_id`'s shard, materialized
     /// by the commit worker. No-op deltas are dropped so callers can pass
     /// computed differences unconditionally.
-    pub fn add_stats_delta(&mut self, inode_id: u64, bytes: i64, inodes: i64) {
+    /// Adjust the inode-count dimension for `inode_id`.
+    ///
+    /// There is deliberately no byte counterpart. The used-bytes counter is
+    /// the sum of committed file sizes, so a byte delta is only well defined
+    /// against the value a batch actually supersedes -- and a caller staging
+    /// one cannot know that, because a transaction queued ahead of it may
+    /// still fail before its apply and drop its own delta. The commit worker
+    /// derives the byte dimension from each inode's pre- and post-image
+    /// instead; see `derive_byte_deltas`. The inode-count dimension needs no
+    /// base and so stays here.
+    pub fn add_inode_count_delta(&mut self, inode_id: u64, inodes: i64) {
+        if inodes != 0 {
+            self.stats_deltas.push(StatsDelta {
+                inode_id,
+                bytes: 0,
+                inodes,
+            });
+        }
+    }
+
+    /// Stage a raw two-dimensional delta. Test-only: production byte
+    /// accounting is derived by the commit worker, never staged by a caller.
+    #[cfg(test)]
+    pub(crate) fn add_raw_stats_delta(&mut self, inode_id: u64, bytes: i64, inodes: i64) {
         if bytes != 0 || inodes != 0 {
             self.stats_deltas.push(StatsDelta {
                 inode_id,

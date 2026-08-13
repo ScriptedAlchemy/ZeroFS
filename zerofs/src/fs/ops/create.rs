@@ -175,7 +175,7 @@ impl ZeroFS {
                         .ok();
                 }
 
-                txn.add_stats_delta(file_id, 0, 1);
+                txn.add_inode_count_delta(file_id, 1);
 
                 self.write_coordinator.commit(txn).await.inspect_err(|e| {
                     error!("Failed to write batch: {:?}", e);
@@ -389,7 +389,7 @@ impl ZeroFS {
                         .ok();
                 }
 
-                txn.add_stats_delta(new_dir_id, 0, 1);
+                txn.add_inode_count_delta(new_dir_id, 1);
 
                 self.write_coordinator.commit(txn).await?;
 
@@ -579,7 +579,7 @@ impl ZeroFS {
                         .ok();
                 }
 
-                txn.add_stats_delta(special_id, 0, 1);
+                txn.add_inode_count_delta(special_id, 1);
 
                 self.write_coordinator.commit(txn).await?;
 

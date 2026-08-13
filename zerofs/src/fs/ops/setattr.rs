@@ -11,7 +11,6 @@ use crate::fs::inode::{Inode, InodeAttrs, InodeId};
 use crate::fs::permissions::{
     AccessMode, Credentials, can_set_times, check_access, check_ownership, validate_mode,
 };
-use crate::fs::stats;
 use crate::fs::tracing::FileOperation;
 use crate::fs::types::{
     FileAttributes, InodeWithId, SetAttributes, SetGid, SetMode, SetSize, SetTime, SetUid,
@@ -355,7 +354,6 @@ impl ZeroFS {
                             attrs: post_attrs.clone(),
                         },
                     );
-                    txn.add_stats_delta(id, stats::size_delta(old_size, new_size), 0);
 
                     self.write_coordinator.commit(txn).await?;
 

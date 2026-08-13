@@ -168,7 +168,7 @@ impl ZeroFS {
                 .ok();
         }
 
-        txn.add_stats_delta(new_id, 0, 1);
+        txn.add_inode_count_delta(new_id, 1);
 
         self.write_coordinator.commit(txn).await?;
 

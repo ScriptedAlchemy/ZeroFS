@@ -9,7 +9,6 @@ use crate::dedup::DedupResult;
 use crate::fs::errors::FsError;
 use crate::fs::inode::{Inode, InodeAttrs, InodeId};
 use crate::fs::permissions::{AccessMode, Credentials, check_access, check_sticky_bit_delete};
-use crate::fs::stats;
 use crate::fs::tracing::FileOperation;
 use crate::fs::types::AuthContext;
 use crate::fs::{
@@ -334,16 +333,15 @@ impl ZeroFS {
         if let Some((target_id, existing_inode)) = target {
             target_was_directory = matches!(existing_inode, Inode::Directory(_));
 
-            let (original_nlink, original_file_size, should_always_remove_stats) =
-                match &existing_inode {
-                    Inode::File(f) => (f.nlink, Some(f.size), false),
-                    Inode::Directory(_) => (1, None, true),
-                    Inode::Symlink(s) => (s.nlink, None, false),
-                    Inode::Fifo(s)
-                    | Inode::Socket(s)
-                    | Inode::CharDevice(s)
-                    | Inode::BlockDevice(s) => (s.nlink, None, false),
-                };
+            let (original_nlink, should_always_remove_stats) = match &existing_inode {
+                Inode::File(f) => (f.nlink, false),
+                Inode::Directory(_) => (1, true),
+                Inode::Symlink(s) => (s.nlink, false),
+                Inode::Fifo(s)
+                | Inode::Socket(s)
+                | Inode::CharDevice(s)
+                | Inode::BlockDevice(s) => (s.nlink, false),
+            };
 
             // Set when the clobbered target's last link is dropped while a 9P
             // fid still holds it open: defer reclaim exactly like remove().
@@ -494,11 +492,7 @@ impl ZeroFS {
             // When deferred, the target's storage is still live; its stats are
             // subtracted at reclaim (last clunk / startup drain).
             if !target_deferred && (should_always_remove_stats || original_nlink <= 1) {
-                txn.add_stats_delta(
-                    target_id,
-                    stats::size_delta(original_file_size.unwrap_or(0), 0),
-                    -1,
-                );
+                txn.add_inode_count_delta(target_id, -1);
             }
 
             if target_deferred {

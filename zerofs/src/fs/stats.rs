@@ -125,6 +125,7 @@ impl FileSystemGlobalStats {
 mod tests {
     use super::*;
     use crate::fs::ZeroFS;
+    use crate::fs::inode::Inode;
     use crate::fs::permissions::Credentials;
     use crate::fs::types::{AuthContext, SetAttributes};
 
@@ -162,6 +163,116 @@ mod tests {
             }
         }
         (bytes, inodes)
+    }
+
+    /// The pipelined-writer accounting case, which a sequential test cannot
+    /// reach: a write releases its inode lock at submit, so a *disjoint*
+    /// successor stages while it is still queued and takes its size from the
+    /// queued value. If that queued batch then fails before its apply, the
+    /// successor's size still lands -- and any byte delta the successor had
+    /// computed from the queued base would be short by exactly the failed
+    /// write's growth, permanently, because shard counters are never
+    /// recomputed from the inodes.
+    ///
+    /// The counter is therefore derived by the commit worker from what each
+    /// batch actually supersedes, which makes it equal the durable sum of file
+    /// sizes here by construction.
+    ///
+    /// This also pins the deliberate semantic choice underneath it: the
+    /// successor's size wins and stays, so the failed write's range survives
+    /// as a sparse hole rather than being rolled back. Basing the successor on
+    /// the committed size instead is not an option -- a successor writing
+    /// below a *successful* predecessor's EOF would then shrink the file and
+    /// destroy that predecessor's data, which is a far worse failure than a
+    /// hole. POSIX leaves the file state after a failed write unspecified, the
+    /// failed writer got its error, and an unwritten range reads as zeros
+    /// anyway. The sequential counterpart, where the failure fully resolves
+    /// before the next writer reads, retracts the size instead and is pinned
+    /// by `a_failed_commit_between_two_writes_cannot_shrink_the_file`.
+    #[tokio::test]
+    async fn queued_batch_that_fails_leaves_the_counter_matching_durable_sizes() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let creds = test_creds();
+        let auth = test_auth();
+        let (file_id, _) = fs
+            .create(&creds, 0, b"pipelined.bin", &SetAttributes::default())
+            .await
+            .unwrap();
+
+        // Stand in for a first write of [0, 64K) that will fail before its
+        // apply: same queued inode, and an unreadable segment counter to abort
+        // the batch in stage_seg_deltas. Poisoning the real write's segment
+        // would take the successor down with it, since both append to the same
+        // open segment.
+        let codec = KeyCodec::new();
+        let poisoned = codec.segcount_key(9, 9);
+        fs.db
+            .put_with_options(
+                &poisoned,
+                b"bogus",
+                &slatedb::config::PutOptions::default(),
+                &slatedb::config::WriteOptions::default(),
+            )
+            .await
+            .unwrap();
+        let mut doomed_txn = fs.db.new_transaction().unwrap();
+        let mut grown = match fs.inode_store.get(file_id).await.unwrap() {
+            Inode::File(file) => file,
+            _ => panic!("expected a file inode"),
+        };
+        grown.size = 64 * 1024;
+        fs.inode_store
+            .save(&mut doomed_txn, file_id, &Inode::File(grown))
+            .unwrap();
+        doomed_txn.add_seg_delta(&poisoned, 1, 1);
+
+        // Submitted, not awaited: the queued size stays published exactly as it
+        // would while a real write waits for its reply.
+        let doomed = fs.write_coordinator.submit(doomed_txn).unwrap();
+        assert!(
+            fs.write_coordinator.barrier().await.is_err(),
+            "the barrier rides the doomed batch and must report its failure"
+        );
+
+        // The successor: disjoint extents, so it never waits for the queued
+        // write, and it reads 64K as its base.
+        let attrs = fs
+            .write(
+                &auth,
+                file_id,
+                64 * 1024,
+                &Bytes::from(vec![b'B'; 64 * 1024]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            attrs.size,
+            128 * 1024,
+            "the successor adopted the queued size"
+        );
+        drop(doomed);
+
+        // The failed write's range is a hole, not its intended bytes.
+        let (failed_range, _) = fs.read_file(&auth, file_id, 0, 64 * 1024).await.unwrap();
+        assert_eq!(failed_range, Bytes::from(vec![0u8; 64 * 1024]));
+        let (successor_range, _) = fs
+            .read_file(&auth, file_id, 64 * 1024, 64 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(successor_range, Bytes::from(vec![b'B'; 64 * 1024]));
+
+        let durable_size = match fs.inode_store.get(file_id).await.unwrap() {
+            Inode::File(file) => file.size,
+            _ => panic!("expected a file inode"),
+        };
+        assert_eq!(durable_size, 128 * 1024);
+        assert_eq!(
+            fs.global_stats.get_totals(),
+            (durable_size, 1),
+            "the counter must equal the durable sum of file sizes"
+        );
+        fs.write_coordinator.barrier().await.unwrap();
+        assert_eq!(persisted_shard_totals(&fs).await, (durable_size, 1));
     }
 
     #[tokio::test]

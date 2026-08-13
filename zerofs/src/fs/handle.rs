@@ -7,7 +7,6 @@ use fp::fail_point;
 
 use crate::fs::errors::FsError;
 use crate::fs::inode::{Inode, InodeId};
-use crate::fs::stats;
 use crate::fs::{EXTENT_SIZE, SMALL_FILE_TOMBSTONE_THRESHOLD, ZeroFS};
 use ::tracing::{error, warn};
 use dashmap::DashMap;
@@ -195,7 +194,7 @@ impl ZeroFS {
                 #[cfg(feature = "failpoints")]
                 fail_point!(fp::CLUNK_AFTER_RECLAIM_INODE_DELETE);
 
-                txn.add_stats_delta(id, stats::size_delta(file.size, 0), -1);
+                txn.add_inode_count_delta(id, -1);
                 self.orphan_store.remove(&mut txn, id);
                 self.write_coordinator.commit(txn).await?;
                 self.stats.files_deleted.fetch_add(1, Ordering::Relaxed);
@@ -209,7 +208,7 @@ impl ZeroFS {
                 #[cfg(feature = "failpoints")]
                 fail_point!(fp::CLUNK_AFTER_RECLAIM_INODE_DELETE);
 
-                txn.add_stats_delta(id, stats::size_delta(0, 0), -1);
+                txn.add_inode_count_delta(id, -1);
                 self.orphan_store.remove(&mut txn, id);
                 self.write_coordinator.commit(txn).await?;
                 self.stats.links_deleted.fetch_add(1, Ordering::Relaxed);
@@ -232,7 +231,7 @@ impl ZeroFS {
                 #[cfg(feature = "failpoints")]
                 fail_point!(fp::CLUNK_AFTER_RECLAIM_INODE_DELETE);
 
-                txn.add_stats_delta(id, stats::size_delta(0, 0), -1);
+                txn.add_inode_count_delta(id, -1);
                 self.orphan_store.remove(&mut txn, id);
                 self.write_coordinator.commit(txn).await?;
                 self.stats
@@ -253,7 +252,7 @@ impl ZeroFS {
                 #[cfg(feature = "failpoints")]
                 fail_point!(fp::CLUNK_AFTER_RECLAIM_INODE_DELETE);
 
-                txn.add_stats_delta(id, stats::size_delta(0, 0), -1);
+                txn.add_inode_count_delta(id, -1);
                 self.orphan_store.remove(&mut txn, id);
                 self.write_coordinator.commit(txn).await?;
                 Ok(())

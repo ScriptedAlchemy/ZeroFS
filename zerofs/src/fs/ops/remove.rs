@@ -9,7 +9,6 @@ use crate::dedup::DedupResult;
 use crate::fs::errors::FsError;
 use crate::fs::inode::{Inode, InodeId};
 use crate::fs::permissions::{AccessMode, Credentials, check_access, check_sticky_bit_delete};
-use crate::fs::stats;
 use crate::fs::tracing::FileOperation;
 use crate::fs::types::AuthContext;
 use crate::fs::{
@@ -352,16 +351,16 @@ impl ZeroFS {
 
                 // Directories are never hardlinked. All other inode kinds are
                 // removed from stats only when their last namespace link goes.
-                let (file_size, should_always_remove_stats) = match &file_inode {
-                    Inode::File(f) => (Some(f.size), false),
-                    Inode::Directory(_) => (None, true),
-                    _ => (None, false),
+                let should_always_remove_stats = match &file_inode {
+                    Inode::File(_) => false,
+                    Inode::Directory(_) => true,
+                    _ => false,
                 };
 
                 // When deferred, the inode's storage is still live; its stats
                 // are subtracted at reclaim (last clunk / startup drain).
                 if !deferred && (should_always_remove_stats || original_nlink <= 1) {
-                    txn.add_stats_delta(file_id, stats::size_delta(file_size.unwrap_or(0), 0), -1);
+                    txn.add_inode_count_delta(file_id, -1);
                 }
 
                 self.write_coordinator.commit(txn).await?;

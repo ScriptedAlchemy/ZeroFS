@@ -390,6 +390,42 @@ impl Drop for ApplyTimer {
     }
 }
 
+/// Byte-counter deltas this batch causes, as `(inode, delta)`.
+///
+/// The used-bytes counter is the sum of committed file sizes, so one inode's
+/// contribution changes by exactly `post_size - pre_size` where `pre_size` is
+/// what is committed right now -- read before this batch invalidates anything,
+/// and deliberately bypassing the queued-inode overlay. An inode whose
+/// post-image is not a file can never hold bytes (an inode's kind is fixed at
+/// creation), so those skip the lookup entirely; directory mtime bumps are the
+/// common case and cost nothing.
+async fn derive_byte_deltas(
+    ctx: &WorkerContext,
+    updates: &HashMap<u64, Option<Inode>>,
+) -> Result<Vec<(u64, i64)>, FsError> {
+    let mut deltas = Vec::new();
+    for (inode_id, post) in updates {
+        let post_bytes = match post {
+            Some(Inode::File(file)) => file.size,
+            // A deletion still has to give back whatever the inode held.
+            None => 0,
+            Some(_) => continue,
+        };
+        let pre_bytes = ctx.inode_store.committed_byte_usage(*inode_id).await?;
+        let delta = crate::fs::stats::size_delta(pre_bytes, post_bytes);
+        if delta != 0 {
+            deltas.push((*inode_id, delta));
+        }
+    }
+    Ok(deltas)
+}
+
+/// Whether the allocation watermark advanced past `last_emitted`, matching the
+/// check the batch itself makes before staging the counter.
+fn counter_staged_for(ctx: &WorkerContext, last_emitted: u64) -> bool {
+    ctx.inode_store.next_id() > last_emitted
+}
+
 async fn worker_loop(
     mut ctx: WorkerContext,
     mut rx: mpsc::UnboundedReceiver<Request>,
@@ -525,6 +561,41 @@ async fn worker_loop(
                 txn.apply_to(&mut merged);
             }
             replies.push(reply);
+        }
+
+        // The byte dimension is derived here, against what this batch is about
+        // to supersede, rather than staged by the callers. Doing it anywhere
+        // else is unsound: a caller computes its base from the queued inode
+        // (that is what lets the write path release its lock at submit), and a
+        // transaction queued ahead of it can still fail before its apply and
+        // drop its own delta -- leaving the successor's delta based on a value
+        // that never landed and the counter permanently short. Only the worker
+        // knows which transactions actually applied, so only the worker can
+        // produce a delta that telescopes onto the durable sum of file sizes.
+        match derive_byte_deltas(&ctx, &inode_cache_updates).await {
+            Ok(byte_deltas) => {
+                for (inode_id, bytes) in byte_deltas {
+                    let entry = shard_deltas
+                        .entry(ctx.global_stats.shard_of(inode_id))
+                        .or_default();
+                    entry.0 = entry.0.saturating_add(bytes);
+                }
+            }
+            Err(e) => {
+                // Undercounting used bytes would relax the quota permanently,
+                // so an unreadable pre-image aborts the batch before it
+                // applies, exactly as an unreadable segment counter does.
+                if counter_staged_for(&ctx, last_emitted_counter) {
+                    ctx.inode_store.allocate();
+                }
+                for reply in replies {
+                    let _ = reply.send(Err(e));
+                }
+                if let Some(reply) = barrier_reply {
+                    let _ = reply.send(Err(e));
+                }
+                continue;
+            }
         }
 
         // Persist the allocation watermark only after it advances.
@@ -1669,7 +1740,7 @@ mod tests {
             handles.push(tokio::spawn(async move {
                 let mut txn = Transaction::new();
                 txn.put_bytes(&key, Bytes::from_static(b"x"));
-                txn.add_stats_delta(inode_id, ((k + 1) * 10) as i64, 1);
+                txn.add_raw_stats_delta(inode_id, ((k + 1) * 10) as i64, 1);
                 c.commit(txn).await
             }));
         }
@@ -1717,7 +1788,7 @@ mod tests {
             handles.push(tokio::spawn(async move {
                 let mut txn = Transaction::new();
                 txn.put_bytes(&key, Bytes::from_static(b"y"));
-                txn.add_stats_delta(inode_id, -(((k + 1) * 10) as i64), 0);
+                txn.add_raw_stats_delta(inode_id, -(((k + 1) * 10) as i64), 0);
                 c.commit(txn).await
             }));
         }

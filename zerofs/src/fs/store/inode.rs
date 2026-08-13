@@ -7,7 +7,7 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 pub const MAX_HARDLINKS_PER_INODE: u32 = u32::MAX;
 
@@ -76,6 +76,9 @@ struct PendingInode {
 struct PendingInodes {
     entries: DashMap<InodeId, PendingInode>,
     next_seq: AtomicU64,
+    /// Live entry count, so the overwhelmingly common "nothing in flight"
+    /// read short-circuits on one relaxed load instead of probing the map.
+    live: AtomicUsize,
 }
 
 impl PendingInodes {
@@ -88,13 +91,16 @@ impl PendingInodes {
         let mut owned = Vec::with_capacity(latest.len());
         for (id, value) in latest {
             let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
-            self.entries.insert(
+            let replaced = self.entries.insert(
                 id,
                 PendingInode {
                     seq,
                     value: value.clone(),
                 },
             );
+            if replaced.is_none() {
+                self.live.fetch_add(1, Ordering::Release);
+            }
             owned.push((id, seq));
         }
         PendingInodeGuard {
@@ -105,6 +111,9 @@ impl PendingInodes {
 
     /// The newest queued value, or `None` when nothing is in flight.
     fn get(&self, id: InodeId) -> Option<Option<Inode>> {
+        if self.live.load(Ordering::Acquire) == 0 {
+            return None;
+        }
         self.entries.get(&id).map(|entry| entry.value.clone())
     }
 }
@@ -136,7 +145,13 @@ impl Drop for PendingInodeGuard {
         for (id, seq) in self.owned.drain(..) {
             // A later submitter that overwrote this slot owns it now; retiring
             // it here would resurrect a superseded value.
-            pending.entries.remove_if(&id, |_, entry| entry.seq == seq);
+            if pending
+                .entries
+                .remove_if(&id, |_, entry| entry.seq == seq)
+                .is_some()
+            {
+                pending.live.fetch_sub(1, Ordering::Release);
+            }
         }
     }
 }
@@ -202,6 +217,29 @@ impl InodeStore {
     #[cfg(test)]
     pub(crate) fn pending_inode(&self, id: InodeId) -> Option<Option<Inode>> {
         self.pending.get(id)
+    }
+
+    /// Bytes `id` currently contributes to the used-bytes counter, ignoring
+    /// anything queued: the read cache holds only applied values, and the
+    /// database is the fallback. Non-files and absent inodes contribute zero.
+    ///
+    /// Only the commit worker calls this, and only to derive the byte delta a
+    /// batch causes. It must not see the overlay: the whole point is to
+    /// measure against what this batch actually supersedes.
+    pub(crate) async fn committed_byte_usage(&self, id: InodeId) -> Result<u64, FsError> {
+        let committed = match self.cache.get(&id)? {
+            Some(inode) => Some(inode),
+            None => match self.load(id).await {
+                Ok(inode) => Some(inode),
+                // A brand-new inode has nothing to supersede.
+                Err(FsError::NotFound) => None,
+                Err(error) => return Err(error),
+            },
+        };
+        Ok(match committed {
+            Some(Inode::File(file)) => file.size,
+            _ => 0,
+        })
     }
 
     async fn load(&self, id: InodeId) -> Result<Inode, FsError> {

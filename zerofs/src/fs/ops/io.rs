@@ -9,7 +9,6 @@ use crate::dedup::DedupResult;
 use crate::fs::errors::FsError;
 use crate::fs::inode::{Inode, InodeId};
 use crate::fs::permissions::{AccessMode, Credentials, check_access};
-use crate::fs::stats;
 use crate::fs::tracing::FileOperation;
 use crate::fs::types::{AuthContext, FallocateMode, FileAttributes, InodeWithId};
 use crate::fs::{ZeroFS, get_current_time};
@@ -222,7 +221,6 @@ impl ZeroFS {
                         attrs: post_attrs.clone(),
                     },
                 );
-                txn.add_stats_delta(id, stats::size_delta(old_size, new_size), 0);
 
                 let db_write_start = std::time::Instant::now();
                 // Claim this write's extents before the lock goes, so a writer
@@ -543,7 +541,6 @@ impl ZeroFS {
                 attrs: post_attrs.clone(),
             },
         );
-        txn.add_stats_delta(id, stats::size_delta(old_size, new_size), 0);
 
         self.write_coordinator.commit(txn).await.inspect_err(|e| {
             error!("Failed to commit fallocate batch: {}", e);
@@ -1645,6 +1642,12 @@ mod tests {
     /// commit that fails before its apply must retract that value and leave
     /// the last committed size standing: a successor that read the retracted
     /// one would compute `max(phantom, its own end)` and drop a real write.
+    ///
+    /// This is the sequential case, where the failure resolves before the next
+    /// writer reads. A successor that is already staging when the failure
+    /// lands has necessarily read the queued size and keeps it; that case is
+    /// deliberate and pinned by
+    /// `queued_batch_that_fails_leaves_the_counter_matching_durable_sizes`.
     #[tokio::test]
     async fn a_failed_commit_between_two_writes_cannot_shrink_the_file() {
         let fs = ZeroFS::new_in_memory().await.unwrap();
