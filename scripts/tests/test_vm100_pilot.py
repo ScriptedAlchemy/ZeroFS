@@ -2480,6 +2480,8 @@ class ProfileTests(unittest.TestCase):
         self.assertIsNotNone(runner.build_env)
         assert runner.build_env is not None
         self.assertIn("-C force-frame-pointers=yes", runner.build_env["RUSTFLAGS"])
+        self.assertIn("--cfg tokio_unstable", runner.build_env["RUSTFLAGS"])
+        self.assertIn("--cfg io_uring_skip_arch_check", runner.build_env["RUSTFLAGS"])
 
     def test_phase_perf_report_uses_exact_monotonic_window(self) -> None:
         argv = _phase_perf_report_argv(

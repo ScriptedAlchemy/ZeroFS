@@ -587,7 +587,10 @@ class ProfileRunner:
             "CARGO_PROFILE_RELEASE_DEBUG": "1",
             "CARGO_PROFILE_RELEASE_STRIP": "false",
             "CARGO_INCREMENTAL": "0",
-            "RUSTFLAGS": "-C force-frame-pointers=yes",
+            "RUSTFLAGS": (
+                "--cfg tokio_unstable --cfg io_uring_skip_arch_check "
+                "-C force-frame-pointers=yes"
+            ),
         }
         self.runner.run(
             [self.config.cargo, "build", "--release", "--locked"],
