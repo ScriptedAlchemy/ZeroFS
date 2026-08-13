@@ -2060,13 +2060,7 @@ mod tests {
                 let start = std::time::Instant::now();
                 let mut size = 0u64;
                 for i in 0..(total / chunk) {
-                    let mut txn = db.new_transaction().unwrap();
-                    let tu = store
-                        .write(&mut txn, 1, (i * chunk) as u64, &payload, size)
-                        .await
-                        .unwrap();
-                    commit(&store, txn).await;
-                    store.apply_tail_update(1, tu);
+                    write_committed(&store, &db, 1, (i * chunk) as u64, &payload, size).await;
                     size += chunk as u64;
                 }
                 let secs = start.elapsed().as_secs_f64();
@@ -2409,19 +2403,15 @@ mod tests {
         let chunk = 8 * EXTENT_SIZE; // one canonical 256 KiB member chunk
 
         let scans_before = db.scan_call_count();
-        let mut txn = db.new_transaction().unwrap();
-        let tu = store
-            .write(
-                &mut txn,
-                inode,
-                0,
-                &Bytes::from(incompressible(1, chunk)),
-                presized,
-            )
-            .await
-            .unwrap();
-        commit(&store, txn).await;
-        store.apply_tail_update(inode, tu);
+        write_committed(
+            &store,
+            &db,
+            inode,
+            0,
+            &Bytes::from(incompressible(1, chunk)),
+            presized,
+        )
+        .await;
         assert_eq!(
             db.scan_call_count(),
             scans_before,
@@ -2437,19 +2427,15 @@ mod tests {
         let presized = 128 * 1024 * 1024u64;
         let chunk = 8 * EXTENT_SIZE;
 
-        let mut txn = db.new_transaction().unwrap();
-        let tu = store
-            .write(
-                &mut txn,
-                inode,
-                0,
-                &Bytes::from(incompressible(1, chunk)),
-                presized,
-            )
-            .await
-            .unwrap();
-        commit(&store, txn).await;
-        store.apply_tail_update(inode, tu);
+        write_committed(
+            &store,
+            &db,
+            inode,
+            0,
+            &Bytes::from(incompressible(1, chunk)),
+            presized,
+        )
+        .await;
         let old_segid = frameloc_of(&store, &db, inode, 0).await.unwrap().segid;
         let (live_before, total_before) = segcount_pair_of(&store, &db, old_segid).await;
         assert!(live_before > 0);
@@ -2457,19 +2443,15 @@ mod tests {
         // segment's counter isolates the debits.
         store.seal_open().await.unwrap();
 
-        let mut txn = db.new_transaction().unwrap();
-        let tu = store
-            .write(
-                &mut txn,
-                inode,
-                0,
-                &Bytes::from(incompressible(2, chunk)),
-                presized,
-            )
-            .await
-            .unwrap();
-        commit(&store, txn).await;
-        store.apply_tail_update(inode, tu);
+        write_committed(
+            &store,
+            &db,
+            inode,
+            0,
+            &Bytes::from(incompressible(2, chunk)),
+            presized,
+        )
+        .await;
 
         let (live_after, total_after) = segcount_pair_of(&store, &db, old_segid).await;
         assert_eq!(
@@ -2497,13 +2479,7 @@ mod tests {
             let scans_before = db.scan_call_count();
             let start = std::time::Instant::now();
             for i in 0..(total / chunk) {
-                let mut txn = db.new_transaction().unwrap();
-                let tu = store
-                    .write(&mut txn, 1, (i * chunk) as u64, &payload, total as u64)
-                    .await
-                    .unwrap();
-                commit(&store, txn).await;
-                store.apply_tail_update(1, tu);
+                write_committed(&store, &db, 1, (i * chunk) as u64, &payload, total as u64).await;
             }
             let secs = start.elapsed().as_secs_f64();
             let scans = db.scan_call_count() - scans_before;
@@ -2563,34 +2539,26 @@ mod tests {
         let presized = 128 * 1024 * 1024u64;
         let chunk = 8 * EXTENT_SIZE;
 
-        let mut txn = db.new_transaction().unwrap();
-        let tu = store
-            .write(
-                &mut txn,
-                inode,
-                0,
-                &Bytes::from(incompressible(1, chunk)),
-                presized,
-            )
-            .await
-            .unwrap();
-        commit(&store, txn).await;
-        store.apply_tail_update(inode, tu);
+        write_committed(
+            &store,
+            &db,
+            inode,
+            0,
+            &Bytes::from(incompressible(1, chunk)),
+            presized,
+        )
+        .await;
 
         let db_lookups_before = store.old_debit_db_lookup_count();
-        let mut txn = db.new_transaction().unwrap();
-        let tu = store
-            .write(
-                &mut txn,
-                inode,
-                0,
-                &Bytes::from(incompressible(2, chunk)),
-                presized,
-            )
-            .await
-            .unwrap();
-        commit(&store, txn).await;
-        store.apply_tail_update(inode, tu);
+        write_committed(
+            &store,
+            &db,
+            inode,
+            0,
+            &Bytes::from(incompressible(2, chunk)),
+            presized,
+        )
+        .await;
         assert_eq!(
             store.old_debit_db_lookup_count(),
             db_lookups_before,
