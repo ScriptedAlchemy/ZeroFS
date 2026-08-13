@@ -5,7 +5,7 @@ use crate::writeback::store::WritebackObjectStore;
 use object_store::ObjectStore;
 use std::fs;
 #[cfg(unix)]
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -52,8 +52,7 @@ fn ensure_base_directory(path: &Path) -> anyhow::Result<()> {
             if metadata.file_type().is_symlink() || !metadata.is_dir() {
                 anyhow::bail!("writeback base {} must be a real directory", path.display());
             }
-            #[cfg(unix)]
-            validate_owner_only_base(path, &metadata)?;
+            super::validate_owner_only(path, &metadata, 0o700, "writeback base")?;
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             fs::create_dir(path).map_err(|error| {
@@ -74,24 +73,6 @@ fn ensure_base_directory(path: &Path) -> anyhow::Result<()> {
                 path.display()
             );
         }
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn validate_owner_only_base(path: &Path, metadata: &fs::Metadata) -> anyhow::Result<()> {
-    let mode = metadata.mode() & 0o777;
-    if mode != 0o700 {
-        anyhow::bail!(
-            "writeback base {} has mode {mode:o}; expected 700",
-            path.display()
-        );
-    }
-    if metadata.uid() != unsafe { libc::geteuid() } {
-        anyhow::bail!(
-            "writeback base {} is not owned by the service user",
-            path.display()
-        );
     }
     Ok(())
 }

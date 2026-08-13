@@ -9,6 +9,38 @@ mod payload;
 pub mod remote;
 pub mod store;
 
+#[cfg(unix)]
+pub(crate) fn validate_owner_only(
+    path: &std::path::Path,
+    metadata: &std::fs::Metadata,
+    expected_mode: u32,
+    label: &str,
+) -> anyhow::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let mode = metadata.mode() & 0o777;
+    if mode != expected_mode {
+        anyhow::bail!(
+            "{label} {} has mode {mode:o}; expected {expected_mode:o}",
+            path.display()
+        );
+    }
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        anyhow::bail!("{label} {} is not owned by the service user", path.display());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn validate_owner_only(
+    _path: &std::path::Path,
+    _metadata: &std::fs::Metadata,
+    _expected_mode: u32,
+    _label: &str,
+) -> anyhow::Result<()> {
+    Ok(())
+}
+
 #[cfg(test)]
 mod model_contract_tests {
     use super::model::{

@@ -11,7 +11,7 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 #[cfg(unix)]
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -2021,27 +2021,8 @@ fn set_owner_only_directory(_path: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
 fn validate_owner_only(path: &Path, metadata: &fs::Metadata, expected_mode: u32) -> Result<()> {
-    let mode = metadata.mode() & 0o777;
-    if mode != expected_mode {
-        bail!(
-            "journal path {} has mode {mode:o}; expected {expected_mode:o}",
-            path.display()
-        );
-    }
-    if metadata.uid() != unsafe { libc::geteuid() } {
-        bail!(
-            "journal path {} is not owned by the service user",
-            path.display()
-        );
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn validate_owner_only(_path: &Path, _metadata: &fs::Metadata, _expected_mode: u32) -> Result<()> {
-    Ok(())
+    super::validate_owner_only(path, metadata, expected_mode, "journal path")
 }
 
 fn remove_directory_contents(path: &Path) -> Result<()> {
