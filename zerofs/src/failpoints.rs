@@ -140,3 +140,14 @@ pub const RECLAIM_AFTER_SEGMENT_DELETE: &str = "reclaim_after_segment_delete";
 /// can seal them, rather than being dropped into a dangling pointer. Return-style:
 /// `fail::cfg(SEAL_OPEN_FAIL, "return")`.
 pub const SEAL_OPEN_FAIL: &str = "seal_open_fail";
+
+/// The write path's batch AEAD (`stage_edits`), forcing it to fail after the
+/// reservation claimed its frame-index run and byte range but before any body
+/// was filled in. That abandons the reservation: the open buffer keeps a zeroed
+/// hole behind a valid length prefix, and the open directory keeps entries
+/// naming extents whose committed FrameLocs point elsewhere. Both compaction
+/// and reclaim must resolve past such entries by extent key, the sealed segment
+/// must stay readable for every filled frame, and the abandoned frame indices
+/// must never be reused (AAD/nonce uniqueness). Return-style, and normally
+/// armed for a single batch: `fail::cfg(STAGE_BATCH_SEAL_FAIL, "1*return")`.
+pub const STAGE_BATCH_SEAL_FAIL: &str = "stage_batch_seal_fail";

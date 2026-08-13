@@ -3,21 +3,22 @@ mod consistency;
 use bytes::Bytes;
 use futures::TryStreamExt;
 use slatedb::DbBuilder;
-use slatedb::object_store::ObjectStore;
 use slatedb::object_store::memory::InMemory;
 use slatedb::object_store::path::Path;
+use slatedb::object_store::{ObjectStore, ObjectStoreExt};
 use std::sync::Arc;
 use zerofs::db::SlateDbHandle;
 use zerofs::fs::ZeroFS;
 use zerofs::fs::permissions::Credentials;
 use zerofs::fs::store::ExtentStore;
 use zerofs::fs::types::{AuthContext, SetAttributes};
-use zerofs::segment::Segid;
+use zerofs::segment::{FrameLoc, Segid};
 
 use consistency::verify_consistency;
 use zerofs::failpoints as fp;
 use zerofs::fs::gc::GarbageCollector;
-use zerofs::fs::inode::Inode;
+use zerofs::fs::inode::{Inode, InodeId};
+use zerofs::fs::key_codec::KeyCodec;
 use zerofs::fs::types::FileType;
 
 fn test_creds() -> Credentials {
@@ -3407,5 +3408,244 @@ async fn test_unflushed_write_leaves_no_dangling_frameloc() {
         &got[..],
         &a_data[..],
         "flushed file lost data across the crash"
+    );
+}
+
+/// Total byte size of `segid`'s object on the shared store, or `None` if absent.
+async fn segment_object_len(object_store: &Arc<dyn ObjectStore>, segid: Segid) -> Option<u64> {
+    object_store
+        .head(&Path::from(segid.object_key()))
+        .await
+        .ok()
+        .map(|meta| meta.size)
+}
+
+/// The committed `FrameLoc` for `(inode, extent)`, or `None` for a hole.
+async fn frameloc_of(fs: &ZeroFS, inode: InodeId, extent: u64) -> Option<FrameLoc> {
+    let codec = KeyCodec::new();
+    fs.db
+        .get_bytes(&codec.extent_key(inode, extent))
+        .await
+        .unwrap()
+        .and_then(|v| FrameLoc::decode(&v))
+}
+
+/// A segment's `(live, total)` counter.
+async fn segcount_of(fs: &ZeroFS, segid: Segid) -> (u64, u64) {
+    let codec = KeyCodec::new();
+    fs.db
+        .get_bytes(&codec.segcount_key(segid.epoch, segid.counter))
+        .await
+        .unwrap()
+        .and_then(|b| KeyCodec::decode_segcount(&b))
+        .unwrap_or((0, 0))
+}
+
+async fn write_bytes(
+    fs: &ZeroFS,
+    auth: &AuthContext,
+    id: InodeId,
+    offset: u64,
+    byte: u8,
+    n: usize,
+) {
+    fs.write(auth, id, offset, &Bytes::from(vec![byte; n]))
+        .await
+        .unwrap();
+}
+
+/// High-entropy (xorshift64) bytes the codec cannot compress, so a reservation's
+/// sealed size — and therefore the hole an abandoned one leaves — stays close to
+/// the plaintext size instead of collapsing to a few dozen bytes.
+fn incompressible(seed: u64, n: usize) -> Bytes {
+    let mut s = seed ^ 0x243F_6A88_85A3_08D3;
+    Bytes::from(
+        (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                (s >> 24) as u8
+            })
+            .collect::<Vec<u8>>(),
+    )
+}
+
+/// A batch AEAD that fails mid-window abandons its reservation: the frame-index
+/// run and byte range are already claimed, so the open segment keeps a zeroed
+/// hole behind a valid length prefix, plus directory entries naming extents
+/// whose committed FrameLocs point elsewhere (that transaction never commits).
+///
+/// The design is deliberate — abandoned frame indices are burned rather than
+/// reused, so no AAD/nonce is ever repeated against a segid — and this pins the
+/// three properties that make it safe, none of which had coverage:
+///
+///  1. Later frames on the same lane keep landing in the same segment at fresh
+///     indices, and every committed frame in it reads back exactly through a
+///     cold process sharing nothing but the object store.
+///  2. Compaction and reclaim resolve liveness by extent key, never by trusting
+///     a directory entry, so the segment drains and is deleted once its live
+///     extents move — even though its directory still names them.
+///  3. The segment counters carry the filled frames only: the abandoned bytes
+///     are physically present in the object but referenced by nothing, so
+///     `total` is a referenced-byte count and not the object's size.
+#[tokio::test]
+async fn test_abandoned_batch_reservation_leaves_a_sound_segment() {
+    let (
+        _scenario,
+        TestSetup {
+            ctx,
+            fs,
+            creds,
+            auth,
+        },
+    ) = TestSetup::new().await;
+
+    let extent = zerofs::fs::EXTENT_SIZE as u64;
+    let (file_id, _) = fs
+        .create(&creds, 0, b"holey.bin", &SetAttributes::default())
+        .await
+        .unwrap();
+
+    // Frame 0: committed before the fault, so a live neighbour sits ahead of
+    // the hole in the same buffer. It is superseded later, which is what makes
+    // the counter assertion distinguish live from total.
+    let stale = incompressible(0xA0, extent as usize);
+    fs.write(&auth, file_id, 0, &stale).await.unwrap();
+    let frame0 = frameloc_of(&fs, file_id, 0).await.expect("extent 0");
+
+    // The fault: one two-extent batch reserves frames 1 and 2, then its AEAD
+    // fails. `1*return` burns on that batch alone, so everything after it is an
+    // ordinary write on the same lane and the same open segment. The write must
+    // fail rather than commit a pointer at the zeroed reservation.
+    fail::cfg(fp::STAGE_BATCH_SEAL_FAIL, "1*return").unwrap();
+    let doomed = incompressible(0xDD, 2 * extent as usize);
+    assert!(
+        fs.write(&auth, file_id, extent, &doomed).await.is_err(),
+        "a batch AEAD failure must fail the write, not commit a zeroed frame"
+    );
+    fail::cfg(fp::STAGE_BATCH_SEAL_FAIL, "off").unwrap();
+
+    // Frame 3 lands on extent 1, which an abandoned directory entry already
+    // names: the adversarial shape, where a stale entry names a *live* extent
+    // whose real frame is elsewhere in this very segment. The batch's other
+    // entry, extent 2, is never written and stays past EOF, so it names an
+    // extent with no key at all.
+    let p1 = incompressible(0xB1, extent as usize);
+    fs.write(&auth, file_id, extent, &p1).await.unwrap();
+    // Frame 4 supersedes extent 0 within the same segment.
+    let p0 = incompressible(0xC3, extent as usize);
+    fs.write(&auth, file_id, 0, &p0).await.unwrap();
+
+    fs.flush_coordinator.flush().await.unwrap();
+
+    let mut locs = Vec::new();
+    for e in [0u64, 1] {
+        locs.push(
+            frameloc_of(&fs, file_id, e)
+                .await
+                .unwrap_or_else(|| panic!("extent {e} lost its FrameLoc")),
+        );
+    }
+    let segid = locs[0].segid;
+    assert!(
+        locs.iter().chain([&frame0]).all(|l| l.segid == segid),
+        "the writes split across segments, so no shared hole is exercised: {locs:?}"
+    );
+    assert_eq!(
+        frameloc_of(&fs, file_id, 2).await,
+        None,
+        "the abandoned batch must not leave a committed pointer behind"
+    );
+
+    // The abandoned indices are burned, never handed out again: frame 0 predates
+    // the fault and the next two committed frames are 3 and 4, with exactly the
+    // failed batch's two indices skipped. Reusing one would repeat an AAD/nonce
+    // against this segid.
+    let mut indices: Vec<u32> = locs.iter().map(|l| l.frame_index).collect();
+    indices.sort_unstable();
+    assert_eq!(
+        (frame0.frame_index, indices),
+        (0, vec![3, 4]),
+        "abandoned frame indices were reused"
+    );
+
+    // The counters carry the filled frames only: `total` credits all three
+    // committed frames and `live` drops the superseded one, and neither counts
+    // the abandoned reservation. The object is physically larger than `total`,
+    // by the hole that reservation zero-extended into it.
+    let live_bytes: u64 = locs.iter().map(|l| l.byte_len as u64).sum();
+    let total_bytes = live_bytes + frame0.byte_len as u64;
+    assert_eq!(
+        segcount_of(&fs, segid).await,
+        (live_bytes, total_bytes),
+        "segment counters must exclude the abandoned reservation's bytes"
+    );
+    let object_len = segment_object_len(&ctx.object_store, segid)
+        .await
+        .expect("the sealed segment must be on the object store");
+    assert!(
+        object_len > total_bytes + 2 * extent,
+        "the sealed object ({object_len}) does not carry two abandoned frames on top \
+         of {total_bytes} counted bytes, so no hole was exercised"
+    );
+
+    // (1) Cold read: a fresh process sharing only the object store decodes every
+    // committed frame out of the segment that straddles the hole.
+    drop(fs);
+    let cold = ctx.restart_fs().await;
+    let report = verify_consistency(&cold).await.unwrap();
+    assert!(report.is_consistent(), "Inconsistent:\n{report}");
+    for (e, want) in [(0u64, &p0), (1, &p1)] {
+        let got = cold
+            .extent_store
+            .read(file_id, e * extent, extent)
+            .await
+            .unwrap_or_else(|err| panic!("extent {e} failed to read cold: {err:?}"));
+        assert_eq!(
+            &got[..],
+            &want[..],
+            "extent {e} decoded wrong across the hole"
+        );
+    }
+
+    // A live segment is not reclaimable, so the drain below is not vacuous.
+    reclaim_now(&cold.extent_store).await.unwrap();
+    assert!(
+        list_segments(&ctx.object_store).await.contains(&segid),
+        "reclaim deleted a segment two extents still point into"
+    );
+
+    // (2) Move every live extent out, then reclaim: the segment drains fully by
+    // key resolution. Its directory still names extents 1 and 2 from the
+    // abandoned batch; if either were taken as a reference the delete would be
+    // blocked forever and the segment would leak.
+    for (e, byte) in [(0u64, 0x11u8), (1, 0x22)] {
+        write_bytes(&cold, &auth, file_id, e * extent, byte, extent as usize).await;
+    }
+    cold.flush_coordinator.flush().await.unwrap();
+    reclaim_now(&cold.extent_store).await.unwrap();
+    assert!(
+        !list_segments(&ctx.object_store).await.contains(&segid),
+        "the abandoned directory entries pinned a dead segment against reclaim"
+    );
+
+    // The relocated data survived the drain.
+    for (e, byte) in [(0u64, 0x11u8), (1, 0x22)] {
+        let got = cold
+            .extent_store
+            .read(file_id, e * extent, extent)
+            .await
+            .unwrap();
+        assert_eq!(
+            &got[..],
+            &vec![byte; extent as usize][..],
+            "extent {e} lost data through the reclaim of the holed segment"
+        );
+    }
+    let report = verify_consistency(&cold).await.unwrap();
+    assert!(
+        report.is_consistent(),
+        "Inconsistent after reclaim:\n{report}"
     );
 }

@@ -36,6 +36,17 @@ fn should_parallel_compress(frame_count: usize) -> bool {
     frame_count >= PARALLEL_COMPRESS_MIN_FRAMES
 }
 
+/// Injectable stand-in for a batch AEAD failure, so tests can abandon a
+/// reservation mid-window without corrupting the codec. See
+/// [`fp::STAGE_BATCH_SEAL_FAIL`]; compiled out entirely without the feature.
+#[cfg(feature = "failpoints")]
+fn batch_seal_failpoint() -> Result<(), crate::segment::SegmentError> {
+    fail_point!(fp::STAGE_BATCH_SEAL_FAIL, |_| Err(
+        crate::segment::SegmentError::Malformed("injected batch AEAD failure")
+    ));
+    Ok(())
+}
+
 pub(super) const TAIL_CACHE_BYTES: usize = 32 * 1024 * 1024;
 
 /// Independent inode-affine append lanes. Four matches the foreground fio
@@ -620,6 +631,8 @@ impl ExtentStore {
                 reservation.first_frame,
                 frames,
             );
+            #[cfg(feature = "failpoints")]
+            let sealed = sealed.and_then(|frames| batch_seal_failpoint().map(|()| frames));
             #[cfg(test)]
             StagePhaseNanos::add(&phase.aead, t_aead);
             // A failed seal abandons the claim: its bytes stay zeroed behind a
