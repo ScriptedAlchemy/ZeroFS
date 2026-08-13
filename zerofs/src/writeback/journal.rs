@@ -807,7 +807,19 @@ impl Journal {
         record_local_publish_phase("directory_fsync", fsync_started.elapsed());
 
         let commit_started = Instant::now();
-        self.commit_record_batch(&records)?;
+        if let Err(error) = self.commit_record_batch(&records) {
+            // Recovery would unlink this container anyway -- the watermark
+            // never reached its last member -- but a live process should not
+            // sit on bytes nothing references until the next open.
+            let cleanup =
+                self.rollback_uncommitted_batch(written.as_deref(), &directories, filesystem);
+            return match cleanup {
+                Ok(()) => Err(error),
+                Err(cleanup) => {
+                    Err(error.context(format!("container cleanup also failed: {cleanup:#}")))
+                }
+            };
+        }
         record_local_publish_phase("record_commit", commit_started.elapsed());
         metrics::counter!("zerofs_writeback_local_publish_batches_total").increment(1);
         metrics::counter!("zerofs_writeback_local_publish_records_total")
@@ -850,7 +862,12 @@ impl Journal {
                     .collect::<Vec<_>>(),
             )
             .context("failed to write container")?;
-            file.sync_all().context("failed to fsync container")?;
+            // fdatasync, not fsync: it still persists the data and the
+            // metadata needed to read it back (size and extents), which is
+            // all a container needs. The link itself is made durable by the
+            // shard directory fsync below, and the inode timestamps a full
+            // fsync would additionally journal are not load bearing here.
+            file.sync_data().context("failed to fsync container")?;
             let written_len = file
                 .metadata()
                 .context("failed to inspect container")?
@@ -2923,9 +2940,7 @@ mod tests {
                 let payload = vec![0x5a_u8; payload_bytes];
                 let verified = VerifiedPayload::new(Bytes::from(payload.clone()));
                 let prebuilt = (1..=records as u64)
-                    .map(|sequence| {
-                        put_record(sequence, &format!("segments/{sequence}"), &payload)
-                    })
+                    .map(|sequence| put_record(sequence, &format!("segments/{sequence}"), &payload))
                     .collect::<Vec<_>>();
 
                 let started = Instant::now();
