@@ -301,6 +301,85 @@ class PerformanceMatrixCellTests(unittest.TestCase):
             after_pass=4,
         )
 
+    def test_post_gc_writeback_lag_is_drained_before_using_the_cell_baseline(
+        self,
+    ) -> None:
+        maintenance = WritebackSnapshot(
+            7203,
+            7203,
+            7201,
+            0,
+            25_463_516,
+            1 << 20,
+            1 << 20,
+            False,
+            False,
+            5,
+            8,
+            16,
+        )
+        drained = replace(
+            maintenance,
+            remote=7203,
+            dirty_ssd_reserved=0,
+        )
+        lifecycle = _MatrixLifecycle(self.config, (drained,))
+        matrix = PerformanceMatrixRunner(
+            self.config,
+            _FioRunner(),
+            lifecycle,  # type: ignore[arg-type]
+        )
+
+        with mock.patch.object(
+            matrix,
+            "_wait_clean_gc",
+            return_value=maintenance,
+        ) as wait:
+            result = matrix._wait_stable_gc_boundary(phase="cell pre-cell")
+
+        self.assertEqual(result, drained)
+        self.assertEqual(result.remote, result.accepted)
+        self.assertEqual(result.dirty_ssd_reserved, 0)
+        self.assertEqual(lifecycle.drain_calls, 1)
+        wait.assert_called_once()
+
+    def test_gc_change_during_post_gc_drain_retries_with_a_fresh_pass(self) -> None:
+        pass_five = WritebackSnapshot(
+            7203, 7203, 7203, 0, 0, 1 << 20, 1 << 20, False, False, 5, 8, 16
+        )
+        changed_during_drain = replace(
+            pass_five,
+            gc_passes=6,
+            gc_batches=9,
+            gc_deleted_bytes=32,
+        )
+        pass_seven = replace(
+            changed_during_drain,
+            gc_passes=7,
+            gc_batches=10,
+            gc_deleted_bytes=48,
+        )
+        lifecycle = _MatrixLifecycle(
+            self.config,
+            (changed_during_drain, pass_seven),
+        )
+        matrix = PerformanceMatrixRunner(
+            self.config,
+            _FioRunner(),
+            lifecycle,  # type: ignore[arg-type]
+        )
+
+        with mock.patch.object(
+            matrix,
+            "_wait_clean_gc",
+            side_effect=(pass_five, pass_seven),
+        ) as wait:
+            result = matrix._wait_stable_gc_boundary(phase="cell pre-cell")
+
+        self.assertEqual(result, pass_seven)
+        self.assertEqual(lifecycle.drain_calls, 2)
+        self.assertEqual(wait.call_count, 2)
+
     def test_cell_uses_exact_direct_fio_and_records_durability_boundaries(self) -> None:
         self.assertIsNotNone(
             PerformanceMatrixRunner, "performance matrix runner is unavailable"
@@ -660,7 +739,7 @@ class PerformanceMatrixOrchestrationTests(unittest.TestCase):
             def _local_device(self) -> tuple[int, int]:
                 return (8, 1)
 
-            def _wait_clean_gc(self) -> WritebackSnapshot:
+            def _wait_clean_gc(self, timeout: float | None = None) -> WritebackSnapshot:
                 gc_waits.append(len(roots) + 1)
                 return outer.snapshot
 
@@ -775,7 +854,7 @@ class PerformanceMatrixOrchestrationTests(unittest.TestCase):
             def _local_device(self) -> tuple[int, int]:
                 return (8, 1)
 
-            def _wait_clean_gc(self) -> WritebackSnapshot:
+            def _wait_clean_gc(self, timeout: float | None = None) -> WritebackSnapshot:
                 events.append("gc-wait")
                 return outer.snapshot
 
@@ -803,8 +882,8 @@ class PerformanceMatrixOrchestrationTests(unittest.TestCase):
             )
 
         self.assertEqual(
-            events[:4],
-            ["syncfs", "drain", "gc-wait", "sampler-start"],
+            events[:6],
+            ["syncfs", "drain", "gc-wait", "drain", "snapshot", "sampler-start"],
         )
         self.assertLess(events.index("sampler-stop"), len(events) - 2)
 
@@ -817,7 +896,7 @@ class PerformanceMatrixOrchestrationTests(unittest.TestCase):
             remote=6194,
             dirty_ssd_reserved=4 << 20,
         )
-        lifecycle = _MatrixLifecycle(self.config, (self.snapshot,))
+        lifecycle = _MatrixLifecycle(self.config, (dirty, self.snapshot))
         outer = self
 
         class RecordingSampler(_StaticSampler):
@@ -828,7 +907,7 @@ class PerformanceMatrixOrchestrationTests(unittest.TestCase):
             def _local_device(self) -> tuple[int, int]:
                 return (8, 1)
 
-            def _wait_clean_gc(self) -> WritebackSnapshot:
+            def _wait_clean_gc(self, timeout: float | None = None) -> WritebackSnapshot:
                 return dirty
 
             def _run_cell(self, **kwargs: Any) -> Any:
@@ -875,7 +954,7 @@ class PerformanceMatrixOrchestrationTests(unittest.TestCase):
             def _local_device(self) -> tuple[int, int]:
                 return (8, 1)
 
-            def _wait_clean_gc(self) -> WritebackSnapshot:
+            def _wait_clean_gc(self, timeout: float | None = None) -> WritebackSnapshot:
                 return outer.snapshot
 
             def _authority(self) -> Any:
@@ -995,7 +1074,7 @@ class PerformanceMatrixOrchestrationTests(unittest.TestCase):
             def _local_device(self) -> tuple[int, int]:
                 return (8, 1)
 
-            def _wait_clean_gc(self) -> WritebackSnapshot:
+            def _wait_clean_gc(self, timeout: float | None = None) -> WritebackSnapshot:
                 return outer.snapshot
 
             def _authority(self) -> Any:

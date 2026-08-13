@@ -4,11 +4,16 @@ import csv
 import json
 import shutil
 import tempfile
+import time
 import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from .benchmark import _MetricSampler, _assert_no_maintenance
+from .benchmark import (
+    BenchmarkContaminatedError,
+    _MetricSampler,
+    _assert_no_maintenance,
+)
 from .config import PilotConfig
 from .lifecycle import PilotLifecycle
 from .metrics import (
@@ -317,13 +322,44 @@ class PerformanceMatrixRunner:
     def _system_io(self, device: tuple[int, int]) -> SystemIoSnapshot:
         return SystemIoSnapshot.capture(self.config.proc_root, root_device=device)
 
-    def _wait_clean_gc(self) -> WritebackSnapshot:
+    def _wait_clean_gc(self, timeout: float | None = None) -> WritebackSnapshot:
         baseline = self.lifecycle.metrics.snapshot().gc_passes
         return wait_for_gc_quiescence(
             self.lifecycle.metrics.snapshot,
-            timeout=self.config.drain_timeout,
+            timeout=self.config.drain_timeout if timeout is None else timeout,
             after_pass=baseline,
         )
+
+    def _wait_stable_gc_boundary(self, *, phase: str) -> WritebackSnapshot:
+        deadline = time.monotonic() + self.config.drain_timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"{phase} GC/drain stabilization timed out")
+            maintenance = self._wait_clean_gc(timeout=remaining)
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"{phase} GC/drain stabilization timed out")
+            self.lifecycle.drain(timeout=remaining)
+            drained = self.lifecycle.metrics.snapshot()
+
+            drain_error: RuntimeError | None = None
+            try:
+                require_drained(drained, phase=phase)
+            except RuntimeError as error:
+                drain_error = error
+            try:
+                _assert_no_maintenance(maintenance, drained)
+            except BenchmarkContaminatedError as error:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"{phase} GC/drain stabilization timed out"
+                    ) from error
+                continue
+            if drain_error is not None:
+                raise drain_error
+            return drained
 
     def _nbd_io(self) -> BlockIoSnapshot:
         return BlockIoSnapshot.capture(
@@ -559,11 +595,7 @@ class PerformanceMatrixRunner:
             # drained exporter sample. Drain only after that boundary so its
             # stable-sample window absorbs the metrics export cadence.
             self.lifecycle.drain()
-            maintenance_before = self._wait_clean_gc()
-            require_drained(
-                maintenance_before,
-                phase=f"{cell.name} pre-cell",
-            )
+            before = self._wait_stable_gc_boundary(phase=f"{cell.name} pre-cell")
             sampler = _MetricSampler(
                 self.lifecycle,
                 metrics_output,
@@ -578,7 +610,7 @@ class PerformanceMatrixRunner:
                 run_root=run_root,
                 fio_output=fio_output,
                 sampler=sampler,
-                maintenance_before=maintenance_before,
+                maintenance_before=before,
             )
         except BaseException as error:
             primary = error
