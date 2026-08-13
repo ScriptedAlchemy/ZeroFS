@@ -2,6 +2,94 @@
 //! open segment, background and synchronous sealing (the durability
 //! barrier), delete/truncate/zero-range staging with segment-counter
 //! debits, and the tail cache for sequential appends.
+//!
+//! # The codec sits on the acknowledgement path
+//!
+//! [`ExtentStore::stage_edits`] compresses and AEAD-seals every frame before
+//! the transaction it stages can commit, and under `ack_mode = memory` that
+//! commit is what the client's write is acknowledged behind. So the cipher is
+//! synchronous with the ACK even though nothing durable depends on it yet.
+//!
+//! What that costs, from `bench_distinct_inode_write_scaling` (release, one
+//! writer, canonical 256 KiB NBD member chunks, incompressible payloads):
+//!
+//! ```text
+//! old_debit  35 us   compress   67 us   protect_ref   1 us
+//! gate_wait   1 us   gate_hold 109 us   aead        278 us
+//! open_lock   0 us   append     10 us   txn_stage    13 us
+//! ```
+//!
+//! 345 us of a 546 us staging call is codec — 63%, and it scales with bytes,
+//! not with the number of writers. At ~1 GB/s per core for compress + seal,
+//! that is the per-stream ceiling the NBD ACK path runs into.
+//!
+//! ## Fanning the codec out does not work at this size
+//!
+//! The obvious move — lower `PARALLEL_CRYPTO_MIN_BYTES` and
+//! [`PARALLEL_COMPRESS_MIN_FRAMES`] so a 256 KiB batch uses more than one core
+//! — was measured and rejected. `bench_batch_seal_crossover` times the same
+//! batch inline and fanned out: 8 frames (257 KiB) costs 273 us inline and
+//! 288 us on rayon, a net loss, and break-even only arrives between 8 and 16
+//! frames. `block_in_place` plus rayon dispatch costs more than the ~33 us per
+//! frame the cipher itself takes. The existing 1 MiB gates are already right;
+//! the win has to come from removing the codec from this path, not spreading
+//! it.
+//!
+//! ## Removing it: plaintext open segments
+//!
+//! The open segment would buffer plaintext frames, and compression plus the
+//! AEAD would move to seal time, where they are already off the ACK path and
+//! already batched past the fan-out threshold (a whole generation is far more
+//! than 1 MiB, so seal-time codec parallelizes well — the regime where the
+//! crossover bench shows 2.3x). Reads of open-segment frames become a memcpy
+//! instead of a decrypt, so the read path gets faster too. This is the
+//! standard LSM arrangement: the memtable holds plaintext, the codec runs when
+//! the memtable is flushed.
+//!
+//! The reason it is not a small change is that a frame's *byte* identity is
+//! currently assigned at stage time and committed immediately.
+//! [`Reservation::claim`] can size a frame's slot only because
+//! [`Compressed::sealed_len`] is known before the AEAD runs, and the
+//! [`FrameLoc`] committed into the extent key carries `byte_offset` and
+//! `byte_len` into the sealed object. With a plaintext buffer neither is known
+//! until seal time, because compression decides them. Everything that reads a
+//! frame by byte range has to change with it:
+//!
+//! * the committed pointer would have to be `(segid, frame_index)` alone, with
+//!   byte ranges resolved from the segment directory at seal time — which
+//!   means extent keys are written before their final value is known, and the
+//!   flush barrier must rewrite or resolve them before the manifest is
+//!   allowed to reference the segment;
+//! * `seg_delta`'s live/total byte accounting, which today credits
+//!   `loc.byte_len` at stage time, has no byte count to credit until the seal
+//!   compresses the frame — so segment-counter credits (and therefore GC's
+//!   liveness ratios and reclaim decisions) would have to move to seal time
+//!   too, while overwrite debits of *older* frames stay where they are;
+//! * [`ExtentStore::read_frame_for_ship`] hands raw `[len][sealed]` bytes to
+//!   replication so a standby can materialize an un-PUT segment. A plaintext
+//!   buffer has no sealed bytes to ship, so HA takeover would need either a
+//!   seal-on-demand for the shipped range or a plaintext ship — and the latter
+//!   is only acceptable if the replication transport's own encryption is
+//!   judged sufficient, which is a separate decision from at-rest framing;
+//! * compaction's relocation path reads still-compressed payloads and rebinds
+//!   their AAD without decompressing; open-generation frames would have no
+//!   compressed form to rebind.
+//!
+//! The durability contract itself is unaffected in principle — the flush
+//! barrier would drain the codec before the manifest, so a durable manifest
+//! still never references un-PUT or un-sealed data, and a volatile ACK still
+//! loses only un-flushed data — but every invariant above is enforced by byte
+//! accounting that would have to be re-derived at a different time. That is
+//! the work, and it is why this is recorded as a design rather than attempted
+//! alongside the transmission-loop change.
+//!
+//! A smaller intermediate step exists: keep compression inline (67 us, and it
+//! is what fixes `sealed_len`) and defer only the AEAD (278 us). The
+//! reservation already sizes slots from the compressed length, so byte
+//! accounting and `FrameLoc` are unchanged; what changes is that the sealed
+//! bytes arrive later than the commit, which `read_frame_for_ship` and the
+//! flush barrier must both account for. That captures roughly half the codec
+//! cost without moving byte identity.
 
 #[cfg(feature = "failpoints")]
 use crate::failpoints::{self as fp, fail_point};
