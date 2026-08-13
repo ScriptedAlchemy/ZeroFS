@@ -1,8 +1,8 @@
 use super::error::{CommandError, CommandResult, NBDError, Result};
 use super::out_of_bounds;
 use super::{
-    NBD_STRIPE_MANIFEST_MAX_BYTES, NBD_STRIPE_MARKER, NBD_STRIPE_MAX_BYTES, NBD_STRIPE_MAX_MEMBERS,
-    NBD_STRIPE_MIN_BYTES, StripeManifest, is_nbd_provision_staging_name,
+    NBD_STRIPE_MANIFEST_MAX_BYTES, NBD_STRIPE_MARKER, StripeManifest,
+    is_nbd_provision_staging_name,
 };
 use crate::fs::ZeroFS;
 use crate::fs::errors::FsError;
@@ -16,7 +16,7 @@ use nbd_proto::{
     NBD_INFO_EXPORT, NBD_REP_ACK, NBD_REP_ERR_INVALID, NBD_REP_ERR_UNKNOWN, NBD_REP_INFO,
     NBD_REP_SERVER, NBDInfoExport, TRANSMISSION_FLAGS,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 use tokio::sync::{OwnedRwLockReadGuard, RwLock};
 use tracing::debug;
@@ -83,38 +83,7 @@ enum NbdBacking {
 fn parse_stripe_manifest(data: &[u8]) -> Result<StripeManifest> {
     let manifest: StripeManifest = serde_json::from_slice(data)
         .map_err(|error| NBDError::Protocol(format!("invalid striped NBD manifest: {error}")))?;
-    if manifest.version != 1 {
-        return Err(NBDError::Protocol(format!(
-            "unsupported striped NBD manifest version {}",
-            manifest.version
-        )));
-    }
-    if manifest.members.len() < 2 || manifest.members.len() > NBD_STRIPE_MAX_MEMBERS {
-        return Err(NBDError::Protocol(format!(
-            "striped NBD requires 2..={NBD_STRIPE_MAX_MEMBERS} members"
-        )));
-    }
-    if !manifest.stripe_bytes.is_power_of_two()
-        || !(NBD_STRIPE_MIN_BYTES..=NBD_STRIPE_MAX_BYTES).contains(&manifest.stripe_bytes)
-    {
-        return Err(NBDError::Protocol(format!(
-            "striped NBD stripe_bytes must be a power of two in {NBD_STRIPE_MIN_BYTES}..={NBD_STRIPE_MAX_BYTES}"
-        )));
-    }
-    let mut unique = HashSet::with_capacity(manifest.members.len());
-    for member in &manifest.members {
-        if member.is_empty()
-            || member == "."
-            || member == ".."
-            || member == NBD_STRIPE_MARKER
-            || member.as_bytes().contains(&b'/')
-            || !unique.insert(member.as_bytes().to_vec())
-        {
-            return Err(NBDError::Protocol(
-                "striped NBD member names must be unique direct children".to_string(),
-            ));
-        }
-    }
+    manifest.validate().map_err(NBDError::Protocol)?;
     Ok(manifest)
 }
 

@@ -33,6 +33,46 @@ pub(crate) struct StripeManifest {
     pub(crate) members: Vec<String>,
 }
 
+impl StripeManifest {
+    /// Stripe-geometry contract shared by CLI provisioning and server-side
+    /// manifest acceptance; both must agree on what a valid layout is.
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        if self.version != 1 {
+            return Err(format!(
+                "unsupported striped NBD manifest version {}",
+                self.version
+            ));
+        }
+        if self.members.len() < 2 || self.members.len() > NBD_STRIPE_MAX_MEMBERS {
+            return Err(format!(
+                "striped NBD requires 2..={NBD_STRIPE_MAX_MEMBERS} members"
+            ));
+        }
+        if !self.stripe_bytes.is_power_of_two()
+            || !(NBD_STRIPE_MIN_BYTES..=NBD_STRIPE_MAX_BYTES).contains(&self.stripe_bytes)
+        {
+            return Err(format!(
+                "striped NBD stripe_bytes must be a power of two in {NBD_STRIPE_MIN_BYTES}..={NBD_STRIPE_MAX_BYTES}"
+            ));
+        }
+        let mut unique = std::collections::HashSet::with_capacity(self.members.len());
+        for member in &self.members {
+            if member.is_empty()
+                || member == "."
+                || member == ".."
+                || member == NBD_STRIPE_MARKER
+                || member.as_bytes().contains(&b'/')
+                || !unique.insert(member.as_str())
+            {
+                return Err(
+                    "striped NBD member names must be unique direct children".to_string(),
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
 fn out_of_bounds(offset: u64, length: u32, device_size: u64) -> bool {
     offset
         .checked_add(length as u64)

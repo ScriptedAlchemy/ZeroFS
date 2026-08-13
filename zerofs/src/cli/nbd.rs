@@ -1,8 +1,6 @@
 use crate::nbd::{
     NBD_PROVISION_STAGING_PREFIX as PROVISION_PREFIX, NBD_STRIPE_MANIFEST_MAX_BYTES,
-    NBD_STRIPE_MARKER as STRIPE_MARKER, NBD_STRIPE_MAX_BYTES as MAX_STRIPE_BYTES,
-    NBD_STRIPE_MAX_MEMBERS, NBD_STRIPE_MIN_BYTES as MIN_STRIPE_BYTES, StripeManifest,
-    is_nbd_provision_staging_name,
+    NBD_STRIPE_MARKER as STRIPE_MARKER, StripeManifest, is_nbd_provision_staging_name,
 };
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -42,16 +40,14 @@ impl StripedLayout {
                 "export name must be a non-empty, non-reserved direct child name of at most 255 bytes"
             );
         }
-        if usize::from(lanes) < 2 || usize::from(lanes) > NBD_STRIPE_MAX_MEMBERS {
-            bail!("lane count must be in 2..={NBD_STRIPE_MAX_MEMBERS}");
+        let members: Vec<String> = (0..lanes).map(|lane| format!("lane-{lane}")).collect();
+        StripeManifest {
+            version: 1,
+            stripe_bytes: stripe_size,
+            members: members.clone(),
         }
-        if !stripe_size.is_power_of_two()
-            || !(MIN_STRIPE_BYTES..=MAX_STRIPE_BYTES).contains(&stripe_size)
-        {
-            bail!(
-                "stripe size must be a power of two between {MIN_STRIPE_BYTES} and {MAX_STRIPE_BYTES} bytes"
-            );
-        }
+        .validate()
+        .map_err(anyhow::Error::msg)?;
         let layout_unit = stripe_size
             .checked_mul(u64::from(lanes))
             .context("lane count times stripe size overflows u64")?;
@@ -61,7 +57,6 @@ impl StripedLayout {
             );
         }
         let member_size = logical_size / u64::from(lanes);
-        let members = (0..lanes).map(|lane| format!("lane-{lane}")).collect();
         Ok(Self {
             export_name,
             logical_size,
