@@ -79,7 +79,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
@@ -214,9 +214,15 @@ impl Drop for JournalWriteGuard<'_> {
     }
 }
 
+/// A validated mutation waiting to join a publication batch.
+///
+/// Payload bytes stay in memory until publication because a record's slice
+/// offset is only known once its batch is assembled. The RAM is already
+/// reserved by the submitter's admission permit, which is held across
+/// publication anyway, so retaining the bytes this long costs no new budget.
 pub(crate) struct PreparedMutation {
     record: MutationRecord,
-    temporary_blob: Option<PathBuf>,
+    payload: Option<VerifiedPayload>,
 }
 
 trait PublicationFilesystem {
@@ -249,11 +255,20 @@ impl PreparedMutation {
         .context("prepared journal mutation size exceeds addressable memory")
     }
 
+    /// Payload bytes this mutation contributes to its batch container. The
+    /// journaler uses it to cap a container's size, which is what bounds both
+    /// the retained RAM and the transient disk overhead of reclamation.
+    pub(crate) fn payload_bytes(&self) -> u64 {
+        self.payload
+            .as_ref()
+            .map_or(0, crate::writeback::payload::VerifiedPayload::byte_len)
+    }
+
     #[cfg(test)]
     pub(crate) fn metadata(record: MutationRecord) -> Self {
         Self {
             record,
-            temporary_blob: None,
+            payload: None,
         }
     }
 }
@@ -608,80 +623,35 @@ impl Journal {
     }
 
     pub fn commit_put(&self, record: MutationRecord, payload: &[u8]) -> Result<MutationRecord> {
-        let payload_sha256 = Sha256::digest(payload).into();
-        let prepared = self.prepare_put_inner(record, payload, payload_sha256)?;
+        let verified = VerifiedPayload::new(bytes::Bytes::copy_from_slice(payload));
+        let prepared = self.prepare_verified_put(record, &verified)?;
         self.publish_prepared(prepared)
     }
 
+    /// Validate a payload mutation and hold its bytes for the next batch.
+    ///
+    /// Preparation deliberately touches no disk. The record's blob reference
+    /// names a slice of its batch's container, and neither the container nor
+    /// the offset exists until the batch is assembled, so the write is the
+    /// publication's job.
     pub(crate) fn prepare_verified_put(
         &self,
         record: MutationRecord,
         payload: &VerifiedPayload,
     ) -> Result<PreparedMutation> {
-        self.prepare_put_inner(record, payload.bytes(), payload.sha256())
-    }
-
-    fn prepare_put_inner(
-        &self,
-        mut record: MutationRecord,
-        payload: &[u8],
-        actual_hash: [u8; 32],
-    ) -> Result<PreparedMutation> {
         self.validate_record_format(&record)?;
         let (payload_len, payload_sha256) = record
             .payload()
             .context("commit_put requires a payload mutation")?;
-        if payload_len != payload.len() as u64 {
+        if payload_len != payload.byte_len() {
             bail!("put payload length does not match mutation record");
         }
-        if actual_hash != payload_sha256 {
+        if payload.sha256() != payload_sha256 {
             bail!("put payload hash does not match mutation record");
-        }
-        let relative = blob_relative_path(record.sequence, record.operation_id);
-        let blob_path = path_to_portable_string(&relative)?;
-        *record
-            .blob_path_mut()
-            .context("payload mutation has no blob path")? = blob_path.clone();
-        let operation_id = record.operation_id;
-        let final_path = checked_join(&self.root, &blob_path)?;
-        let shard = final_path.parent().context("blob path has no parent")?;
-        ensure_owner_directory(shard, true)?;
-
-        let tmp_path = self.root.join("tmp").join(format!("{operation_id}.tmp"));
-        reject_symlink_if_present(&tmp_path, "journal temporary blob")?;
-        let preparation = (|| -> Result<()> {
-            let mut tmp_file = open_owner_file(&tmp_path, false).with_context(|| {
-                format!("failed to create temporary blob {}", tmp_path.display())
-            })?;
-            tmp_file
-                .write_all(payload)
-                .context("failed to write temporary blob")?;
-            tmp_file
-                .sync_all()
-                .context("failed to fsync temporary blob")?;
-            let written_len = tmp_file
-                .metadata()
-                .context("failed to inspect prepared temporary blob")?
-                .len();
-            if written_len != payload_len {
-                bail!(
-                    "prepared temporary blob length mismatch: expected {payload_len}, got {written_len}"
-                );
-            }
-            Ok(())
-        })();
-        if let Err(error) = preparation {
-            let cleanup = self.discard_temporary_blob(&tmp_path);
-            return match cleanup {
-                Ok(()) => Err(error),
-                Err(cleanup) => {
-                    Err(error.context(format!("temporary blob cleanup also failed: {cleanup:#}")))
-                }
-            };
         }
         Ok(PreparedMutation {
             record,
-            temporary_blob: Some(tmp_path),
+            payload: Some(payload.clone()),
         })
     }
 
@@ -692,7 +662,7 @@ impl Journal {
         }
         Ok(PreparedMutation {
             record,
-            temporary_blob: None,
+            payload: None,
         })
     }
 
@@ -737,66 +707,77 @@ impl Journal {
             };
         }
 
-        let mut entries = Vec::with_capacity(prepared.len());
+        let mut records = Vec::with_capacity(prepared.len());
+        let mut payloads = Vec::with_capacity(prepared.len());
         for prepared in prepared {
-            let PreparedMutation {
-                record,
-                temporary_blob,
-            } = prepared;
-            if record.payload().is_some() != temporary_blob.is_some() {
-                let cleanup = temporary_blob
-                    .as_deref()
-                    .map_or(Ok(()), |path| self.discard_temporary_blob(path));
-                let error = anyhow::anyhow!("prepared payload and temporary blob disagree");
-                return match cleanup {
-                    Ok(()) => Err(error),
-                    Err(cleanup) => {
-                        Err(error
-                            .context(format!("prepared blob cleanup also failed: {cleanup:#}")))
-                    }
-                };
+            let PreparedMutation { record, payload } = prepared;
+            if record.payload().is_some() != payload.is_some() {
+                bail!("prepared payload and mutation record disagree");
             }
-            entries.push((record, temporary_blob));
+            if let Some(payload) = payload {
+                payloads.push((records.len(), payload));
+            }
+            records.push(record);
         }
 
-        let pending = entries
-            .iter()
-            .filter_map(|(record, temporary_blob)| {
-                temporary_blob
-                    .as_ref()
-                    .map(|_| (record.operation_id, record.blob_path().map(str::to_owned)))
-            })
-            .map(|(operation_id, blob_path)| {
-                Ok((
-                    operation_id,
-                    blob_path.context("prepared payload mutation has no blob path")?,
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?;
+        // One batch, one container: assign every payload a slice of a single
+        // file named for the batch's contiguous sequence range.
+        let container = if payloads.is_empty() {
+            None
+        } else {
+            let first = records
+                .first()
+                .expect("a non-empty batch has a first record")
+                .sequence;
+            let last = records
+                .last()
+                .expect("a non-empty batch has a last record")
+                .sequence;
+            let relative = path_to_portable_string(&container_relative_path(first, last))?;
+            let mut offset = 0_u64;
+            for (index, payload) in &payloads {
+                let len = payload.byte_len();
+                *records[*index]
+                    .blob_path_mut()
+                    .context("payload mutation has no blob path")? =
+                    BlobRef::format(&relative, offset, len);
+                offset = offset
+                    .checked_add(len)
+                    .context("publication container size overflow")?;
+            }
+            Some(relative)
+        };
+
+        let write_started = Instant::now();
+        let staged = match container.as_deref() {
+            Some(relative) => match self.stage_container(relative, &payloads) {
+                Ok(staged) => Some(staged),
+                Err(error) => return Err(error),
+            },
+            None => None,
+        };
+        record_local_publish_phase("container_write", write_started.elapsed());
+
         let pending_started = Instant::now();
-        let pending_result = self.record_pending_blobs(&pending);
+        let pending_result = self.record_pending_blob(container.as_deref());
         record_local_publish_phase("pending_intent", pending_started.elapsed());
         if let Err(error) = pending_result {
-            let cleanup = self.discard_prepared_entries(&entries);
+            let cleanup = staged
+                .as_deref()
+                .map_or(Ok(()), |path| self.discard_temporary_blob(path));
             return match cleanup {
                 Ok(()) => Err(error),
                 Err(cleanup) => {
-                    Err(error.context(format!("prepared batch cleanup also failed: {cleanup:#}")))
+                    Err(error.context(format!("staged container cleanup also failed: {cleanup:#}")))
                 }
             };
         }
 
-        let mut renamed = Vec::with_capacity(pending.len());
+        let mut renamed = None;
         let mut directories = BTreeSet::new();
         let rename_started = Instant::now();
-        for (record, temporary_blob) in &entries {
-            let Some(tmp_path) = temporary_blob else {
-                continue;
-            };
-            let blob_path = record
-                .blob_path()
-                .context("prepared payload mutation has no blob path")?;
-            let final_path = checked_join(&self.root, blob_path)?;
+        if let (Some(relative), Some(tmp_path)) = (container.as_deref(), staged.as_deref()) {
+            let final_path = checked_join(&self.root, relative)?;
             let directory = final_path
                 .parent()
                 .context("blob path has no parent")?
@@ -808,10 +789,10 @@ impl Journal {
                     final_path.display()
                 ));
                 let cleanup = self.rollback_uncommitted_batch(
-                    &entries,
-                    &renamed,
+                    staged.as_deref(),
+                    None,
                     &directories,
-                    &pending,
+                    container.as_deref(),
                     filesystem,
                 );
                 return match cleanup {
@@ -820,8 +801,8 @@ impl Journal {
                         .context(format!("pending-intent cleanup also failed: {cleanup:#}"))),
                 };
             }
-            renamed.push(final_path);
             directories.insert(directory);
+            renamed = Some(final_path);
         }
         record_local_publish_phase("rename", rename_started.elapsed());
 
@@ -833,10 +814,10 @@ impl Journal {
                     directory.display()
                 ));
                 let cleanup = self.rollback_uncommitted_batch(
-                    &entries,
-                    &renamed,
+                    staged.as_deref(),
+                    renamed.as_deref(),
                     &directories,
-                    &pending,
+                    container.as_deref(),
                     filesystem,
                 );
                 return match cleanup {
@@ -848,12 +829,8 @@ impl Journal {
         }
         record_local_publish_phase("directory_fsync", fsync_started.elapsed());
 
-        let records = entries
-            .into_iter()
-            .map(|(record, _)| record)
-            .collect::<Vec<_>>();
         let commit_started = Instant::now();
-        self.commit_record_batch(&records, &pending)?;
+        self.commit_record_batch(&records, container.as_deref())?;
         record_local_publish_phase("record_commit", commit_started.elapsed());
         metrics::counter!("zerofs_writeback_local_publish_batches_total").increment(1);
         metrics::counter!("zerofs_writeback_local_publish_records_total")
@@ -861,6 +838,66 @@ impl Journal {
         metrics::histogram!("zerofs_writeback_local_publish_batch_records")
             .record(records.len() as f64);
         Ok(records)
+    }
+
+    /// Write one batch's payloads back to back into a staged container and
+    /// fsync it. This is the whole point of the container: N payloads cost one
+    /// sequential write and one fsync instead of N of each.
+    fn stage_container(
+        &self,
+        relative: &str,
+        payloads: &[(usize, VerifiedPayload)],
+    ) -> Result<PathBuf> {
+        let final_path = checked_join(&self.root, relative)?;
+        let shard = final_path.parent().context("blob path has no parent")?;
+        ensure_owner_directory(shard, true)?;
+        let name = final_path
+            .file_name()
+            .context("container path has no file name")?;
+        let tmp_path = self.root.join("tmp").join(name);
+        reject_symlink_if_present(&tmp_path, "journal temporary blob")?;
+
+        let expected_len = payloads
+            .iter()
+            .try_fold(0_u64, |total, (_, payload)| {
+                total.checked_add(payload.byte_len())
+            })
+            .context("publication container size overflow")?;
+        let staging = (|| -> Result<()> {
+            let mut file = open_owner_file(&tmp_path, false).with_context(|| {
+                format!("failed to create staged container {}", tmp_path.display())
+            })?;
+            write_all_vectored(
+                &mut file,
+                &payloads
+                    .iter()
+                    .map(|(_, payload)| payload.bytes())
+                    .collect::<Vec<_>>(),
+            )
+            .context("failed to write staged container")?;
+            file.sync_all()
+                .context("failed to fsync staged container")?;
+            let written_len = file
+                .metadata()
+                .context("failed to inspect staged container")?
+                .len();
+            if written_len != expected_len {
+                bail!(
+                    "staged container length mismatch: expected {expected_len}, got {written_len}"
+                );
+            }
+            Ok(())
+        })();
+        if let Err(error) = staging {
+            let cleanup = self.discard_temporary_blob(&tmp_path);
+            return match cleanup {
+                Ok(()) => Err(error),
+                Err(cleanup) => {
+                    Err(error.context(format!("staged container cleanup also failed: {cleanup:#}")))
+                }
+            };
+        }
+        Ok(tmp_path)
     }
 
     fn discard_prepared_batch(&self, prepared: Vec<PreparedMutation>) -> Result<()> {
@@ -878,52 +915,29 @@ impl Journal {
         }
     }
 
-    fn discard_prepared_entries(
-        &self,
-        entries: &[(MutationRecord, Option<PathBuf>)],
-    ) -> Result<()> {
-        let mut first_error = None;
-        for (_, temporary_blob) in entries {
-            if let Some(path) = temporary_blob
-                && let Err(error) = self.discard_temporary_blob(path)
-                && first_error.is_none()
-            {
-                first_error = Some(error);
-            }
-        }
-        match first_error {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
-    }
-
     fn rollback_uncommitted_batch(
         &self,
-        entries: &[(MutationRecord, Option<PathBuf>)],
-        renamed: &[PathBuf],
+        staged: Option<&Path>,
+        renamed: Option<&Path>,
         directories: &BTreeSet<PathBuf>,
-        pending: &[(Uuid, String)],
+        pending: Option<&str>,
         filesystem: &dyn PublicationFilesystem,
     ) -> Result<()> {
         let mut first_error = None;
         let mut removed_temporary = false;
-        for (_, temporary_blob) in entries {
-            let Some(path) = temporary_blob else {
-                continue;
-            };
+        if let Some(path) = staged {
             match fs::remove_file(path) {
                 Ok(()) => removed_temporary = true,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) if first_error.is_none() => {
+                Err(error) => {
                     first_error = Some(
                         anyhow::Error::new(error)
-                            .context("failed to remove prepared temporary blob"),
+                            .context("failed to remove staged publication container"),
                     );
                 }
-                Err(_) => {}
             }
         }
-        for path in renamed {
+        if let Some(path) = renamed {
             match fs::remove_file(path) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -955,7 +969,7 @@ impl Journal {
         if let Some(error) = first_error {
             return Err(error);
         }
-        self.clear_pending_blobs(pending)
+        self.clear_pending_blob(pending)
     }
 
     fn require_contiguous_local_batch(&self, prepared: &[PreparedMutation]) -> Result<()> {
@@ -981,7 +995,6 @@ impl Journal {
 
     fn require_unique_local_batch_identities(&self, prepared: &[PreparedMutation]) -> Result<()> {
         let mut operation_ids = BTreeSet::new();
-        let mut blob_paths = BTreeSet::new();
         for mutation in prepared {
             if !operation_ids.insert(mutation.record.operation_id) {
                 bail!(
@@ -989,19 +1002,17 @@ impl Journal {
                     mutation.record.operation_id
                 );
             }
-            if let Some(blob_path) = mutation.record.blob_path()
-                && !blob_paths.insert(blob_path)
-            {
-                bail!("local publication batch contains duplicate final blob path {blob_path}");
-            }
         }
         Ok(())
     }
 
-    fn record_pending_blobs(&self, pending: &[(Uuid, String)]) -> Result<()> {
-        if pending.is_empty() {
+    /// Durably note the container about to appear under `blobs/`. A crash
+    /// between the rename and the record commit leaves this note behind, and
+    /// recovery uses it to unlink the orphan.
+    fn record_pending_blob(&self, pending: Option<&str>) -> Result<()> {
+        let Some(relative) = pending else {
             return Ok(());
-        }
+        };
         let _write = self.write_gate.lock();
         let mut transaction = self
             .database
@@ -1014,21 +1025,19 @@ impl Journal {
             let mut table = transaction
                 .open_table(PENDING_BLOBS)
                 .context("failed to open pending blob table")?;
-            for (operation_id, relative) in pending {
-                table
-                    .insert(operation_id.to_string().as_str(), relative.as_bytes())
-                    .context("failed to store pending blob")?;
-            }
+            table
+                .insert(relative, relative.as_bytes())
+                .context("failed to store pending blob")?;
         }
         transaction
             .commit()
             .context("failed to commit pending blob batch")
     }
 
-    fn clear_pending_blobs(&self, pending: &[(Uuid, String)]) -> Result<()> {
-        if pending.is_empty() {
+    fn clear_pending_blob(&self, pending: Option<&str>) -> Result<()> {
+        let Some(relative) = pending else {
             return Ok(());
-        }
+        };
         let _write = self.write_gate.lock();
         let mut transaction = self
             .database
@@ -1041,22 +1050,16 @@ impl Journal {
             let mut table = transaction
                 .open_table(PENDING_BLOBS)
                 .context("failed to open pending blob table")?;
-            for (operation_id, _) in pending {
-                table
-                    .remove(operation_id.to_string().as_str())
-                    .context("failed to clear pending blob")?;
-            }
+            table
+                .remove(relative)
+                .context("failed to clear pending blob")?;
         }
         transaction
             .commit()
             .context("failed to commit pending blob cleanup")
     }
 
-    fn commit_record_batch(
-        &self,
-        records: &[MutationRecord],
-        pending: &[(Uuid, String)],
-    ) -> Result<()> {
+    fn commit_record_batch(&self, records: &[MutationRecord], pending: Option<&str>) -> Result<()> {
         let Some(last) = records.last() else {
             return Ok(());
         };
@@ -1099,15 +1102,13 @@ impl Journal {
                 }
             }
             drop(table);
-            if !pending.is_empty() {
+            if let Some(relative) = pending {
                 let mut pending_table = transaction
                     .open_table(PENDING_BLOBS)
                     .context("failed to open pending blob table")?;
-                for (operation_id, _) in pending {
-                    pending_table
-                        .remove(operation_id.to_string().as_str())
-                        .context("failed to clear pending blob")?;
-                }
+                pending_table
+                    .remove(relative)
+                    .context("failed to clear pending blob")?;
             }
             write_value(&mut meta, LOCAL_SEQ_KEY, &last.sequence)?;
             write_value(&mut meta, LOCAL_BYTES_COMPLETED_KEY, &total_completed)?;
@@ -1117,11 +1118,10 @@ impl Journal {
             .context("failed to commit journal mutation batch")
     }
 
+    /// Preparation writes nothing, so discarding one only drops its bytes.
     pub(crate) fn discard_prepared(&self, prepared: PreparedMutation) -> Result<()> {
-        match prepared.temporary_blob {
-            Some(path) => self.discard_temporary_blob(&path),
-            None => Ok(()),
-        }
+        drop(prepared);
+        Ok(())
     }
 
     fn discard_temporary_blob(&self, path: &Path) -> Result<()> {
@@ -1141,11 +1141,12 @@ impl Journal {
         let record = self
             .mutation(sequence)?
             .with_context(|| format!("journal mutation {sequence} does not exist"))?;
-        let relative = record
+        let reference = record
             .blob_path()
             .with_context(|| format!("journal mutation {sequence} has no blob"))?;
-        let path = checked_join(&self.root, relative)?;
-        read_verified_blob(&path, &record)
+        let reference = BlobRef::parse(reference)?;
+        let path = checked_join(&self.root, reference.relative)?;
+        read_verified_blob(&path, reference.slice, &record)
     }
 
     pub fn mark_remote(&self, sequence: Sequence, result_etag: Option<String>) -> Result<()> {
@@ -1374,19 +1375,36 @@ impl Journal {
         }
         drop(table);
         drop(read);
+        // A container holds one contiguous sequence range, so "every member is
+        // remote-committed" is exactly `last <= through`. The range is in the
+        // container's own name, so no refcount or side table is needed; a
+        // straddling container simply survives until its final member drains.
+        let mut reclaimable = BTreeSet::new();
         for record in &removable {
-            if let Some(relative) = record.blob_path() {
-                let path = checked_join(&self.root, relative)?;
-                match fs::remove_file(&path) {
-                    Ok(()) => {
-                        if let Some(parent) = path.parent() {
-                            sync_directory(parent)?;
-                        }
+            let Some(relative) = record.blob_path() else {
+                continue;
+            };
+            let reference = BlobRef::parse(relative)?;
+            if reference.slice.is_some() {
+                match container_last_sequence(reference.relative) {
+                    Some(last) if last > through => continue,
+                    Some(_) => {}
+                    None => bail!("container blob {relative} does not name a sequence range"),
+                }
+            }
+            reclaimable.insert(reference.relative.to_owned());
+        }
+        for relative in &reclaimable {
+            let path = checked_join(&self.root, relative)?;
+            match fs::remove_file(&path) {
+                Ok(()) => {
+                    if let Some(parent) = path.parent() {
+                        sync_directory(parent)?;
                     }
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => {
-                        return Err(error).context("failed to remove remote-complete blob");
-                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).context("failed to remove remote-complete blob");
                 }
             }
         }
@@ -1448,7 +1466,7 @@ impl Journal {
 
         let pending = self.pending_blobs()?;
         for relative in pending.values() {
-            let path = checked_join(&self.root, relative)?;
+            let path = checked_join(&self.root, BlobRef::parse(relative)?.relative)?;
             match fs::remove_file(&path) {
                 Ok(()) => {
                     if let Some(parent) = path.parent() {
@@ -1496,13 +1514,15 @@ impl Journal {
         let mut pending = BTreeMap::new();
         for entry in table.iter().context("failed to iterate pending blobs")? {
             let (key, value) = entry.context("failed to read pending blob")?;
-            let operation_id = key.value().to_owned();
-            Uuid::parse_str(&operation_id).context("pending blob has an invalid operation UUID")?;
+            // Pre-container journals keyed intents by operation UUID and
+            // containers key them by the container path; only the value is
+            // load bearing, so both forms recover through the same scan.
+            let intent_key = key.value().to_owned();
             let relative = std::str::from_utf8(value.value())
                 .context("pending blob path is not UTF-8")?
                 .to_owned();
-            checked_join(&self.root, &relative)?;
-            pending.insert(operation_id, relative);
+            checked_join(&self.root, BlobRef::parse(&relative)?.relative)?;
+            pending.insert(intent_key, relative);
         }
         Ok(pending)
     }
@@ -1529,8 +1549,9 @@ impl Journal {
                 .checked_add(1)
                 .context("journal sequence overflow")?;
             if let Some(relative) = record.blob_path() {
-                let path = checked_join(&self.root, relative)?;
-                verify_record_blob(&path, record).with_context(|| {
+                let reference = BlobRef::parse(relative)?;
+                let path = checked_join(&self.root, reference.relative)?;
+                verify_record_blob(&path, reference.slice, record).with_context(|| {
                     if path.exists() {
                         format!(
                             "committed blob validation failed for sequence {}",
@@ -1920,6 +1941,99 @@ impl<T: serde::Serialize> SerializeValue for T {
     }
 }
 
+/// The byte range a record occupies inside its batch container.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BlobSlice {
+    offset: u64,
+    len: u64,
+}
+
+/// A parsed `MutationRecord::blob_path`.
+///
+/// Two forms are accepted for the life of the format. Journals written before
+/// batch containers store one whole file per record and carry no slice; those
+/// keep replaying, so a journal may hold both forms side by side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BlobRef<'a> {
+    relative: &'a str,
+    slice: Option<BlobSlice>,
+}
+
+impl<'a> BlobRef<'a> {
+    fn parse(reference: &'a str) -> Result<Self> {
+        let Some((relative, fragment)) = reference.split_once('#') else {
+            return Ok(Self {
+                relative: reference,
+                slice: None,
+            });
+        };
+        let (offset, len) = fragment
+            .split_once('+')
+            .with_context(|| format!("blob reference {reference} has a malformed slice"))?;
+        let offset = offset
+            .parse::<u64>()
+            .with_context(|| format!("blob reference {reference} has a malformed slice offset"))?;
+        let len = len
+            .parse::<u64>()
+            .with_context(|| format!("blob reference {reference} has a malformed slice length"))?;
+        offset
+            .checked_add(len)
+            .with_context(|| format!("blob reference {reference} slice overflows"))?;
+        Ok(Self {
+            relative,
+            slice: Some(BlobSlice { offset, len }),
+        })
+    }
+
+    fn format(relative: &str, offset: u64, len: u64) -> String {
+        format!("{relative}#{offset}+{len}")
+    }
+}
+
+/// One batch, one container, named for the contiguous sequence range it
+/// covers. Sharding on the first sequence's high bits keeps a run of
+/// consecutive batches inside one directory, so publication keeps paying one
+/// directory fsync; encoding the range in the name lets pruning decide
+/// reclamation from the path alone.
+fn container_relative_path(first: Sequence, last: Sequence) -> PathBuf {
+    PathBuf::from("blobs")
+        .join(format!("{:02x}", (first >> 8) & 0xff))
+        .join(format!("{first:016x}-{last:016x}.blobs"))
+}
+
+/// The last sequence a container covers, parsed back out of its file name.
+fn container_last_sequence(relative: &str) -> Option<Sequence> {
+    let name = Path::new(relative).file_name()?.to_str()?;
+    let (_, last) = name.strip_suffix(".blobs")?.split_once('-')?;
+    Sequence::from_str_radix(last, 16).ok()
+}
+
+/// Write every payload in one batch with as few syscalls as the kernel allows.
+///
+/// Empty payloads are dropped first: a vectored write over nothing but empty
+/// buffers reports zero bytes written, which is indistinguishable from a
+/// stalled device, and zero-length records are legal.
+fn write_all_vectored(file: &mut File, payloads: &[&[u8]]) -> std::io::Result<()> {
+    let mut slices = payloads
+        .iter()
+        .filter(|payload| !payload.is_empty())
+        .map(|payload| std::io::IoSlice::new(payload))
+        .collect::<Vec<_>>();
+    let mut cursor = slices.as_mut_slice();
+    while !cursor.is_empty() {
+        let written = file.write_vectored(cursor)?;
+        if written == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "container write made no progress",
+            ));
+        }
+        std::io::IoSlice::advance_slices(&mut cursor, written);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 fn blob_relative_path(sequence: Sequence, operation_id: Uuid) -> PathBuf {
     // Shard on the sequence's high bits so a run of 256 consecutive records
     // shares one directory: a publication batch then pays one directory fsync
@@ -1955,27 +2069,51 @@ fn checked_join(root: &Path, relative: &str) -> Result<PathBuf> {
     Ok(root.join(safe))
 }
 
-fn read_verified_blob(path: &Path, record: &MutationRecord) -> Result<Vec<u8>> {
+fn read_verified_blob(
+    path: &Path,
+    slice: Option<BlobSlice>,
+    record: &MutationRecord,
+) -> Result<Vec<u8>> {
     let (payload_len, payload_sha256) = record
         .payload()
         .context("journal record does not reference a payload blob")?;
-    verify_file_payload(path, payload_len, payload_sha256, true)?
+    verify_file_payload(path, slice, payload_len, payload_sha256, true)?
         .context("verified blob read did not return payload bytes")
 }
 
-fn verify_record_blob(path: &Path, record: &MutationRecord) -> Result<()> {
+fn verify_record_blob(
+    path: &Path,
+    slice: Option<BlobSlice>,
+    record: &MutationRecord,
+) -> Result<()> {
     let (payload_len, payload_sha256) = record
         .payload()
         .context("journal record does not reference a payload blob")?;
-    verify_file_payload(path, payload_len, payload_sha256, false).map(drop)
+    verify_file_payload(path, slice, payload_len, payload_sha256, false).map(drop)
 }
 
+/// Verify (and optionally collect) one record's payload.
+///
+/// Verification is always per record, never per file: a container member is
+/// hashed over exactly its own slice, so a neighbour's bytes can never satisfy
+/// it. A whole-file reference still demands an exact file length, while a
+/// container only requires that it be long enough to hold the slice.
 fn verify_file_payload(
     path: &Path,
+    slice: Option<BlobSlice>,
     expected_len: u64,
     expected_sha256: [u8; 32],
     collect: bool,
 ) -> Result<Option<Vec<u8>>> {
+    let offset = slice.map_or(0, |slice| slice.offset);
+    if let Some(slice) = slice
+        && slice.len != expected_len
+    {
+        bail!("committed blob length mismatch");
+    }
+    let required_len = offset
+        .checked_add(expected_len)
+        .context("committed blob slice overflows")?;
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("missing committed blob {}", path.display()))?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
@@ -1985,7 +2123,12 @@ fn verify_file_payload(
         );
     }
     validate_owner_only(path, &metadata, 0o600)?;
-    if metadata.len() != expected_len {
+    let length_matches = if slice.is_some() {
+        metadata.len() >= required_len
+    } else {
+        metadata.len() == expected_len
+    };
+    if !length_matches {
         bail!("committed blob length mismatch");
     }
 
@@ -1999,8 +2142,12 @@ fn verify_file_payload(
     let opened_metadata = file
         .metadata()
         .with_context(|| format!("failed to inspect open blob {}", path.display()))?;
-    if !opened_metadata.is_file() || opened_metadata.len() != expected_len {
+    if !opened_metadata.is_file() || opened_metadata.len() != metadata.len() {
         bail!("committed blob changed while opening");
+    }
+    if offset > 0 {
+        file.seek(std::io::SeekFrom::Start(offset))
+            .with_context(|| format!("failed to seek blob {}", path.display()))?;
     }
 
     let mut collected = if collect {
@@ -2010,28 +2157,22 @@ fn verify_file_payload(
         None
     };
     let mut hasher = Sha256::new();
-    let mut total = 0_u64;
+    let mut remaining = expected_len;
     let mut buffer = vec![0_u8; 1024 * 1024];
-    loop {
+    while remaining > 0 {
+        let want = usize::try_from(remaining.min(buffer.len() as u64))
+            .context("blob read window overflow")?;
         let read = file
-            .read(&mut buffer)
+            .read(&mut buffer[..want])
             .with_context(|| format!("failed to read blob {}", path.display()))?;
         if read == 0 {
-            break;
-        }
-        total = total
-            .checked_add(read as u64)
-            .context("blob length overflow")?;
-        if total > expected_len {
             bail!("committed blob length mismatch");
         }
+        remaining -= read as u64;
         hasher.update(&buffer[..read]);
         if let Some(bytes) = &mut collected {
             bytes.extend_from_slice(&buffer[..read]);
         }
-    }
-    if total != expected_len {
-        bail!("committed blob length mismatch");
     }
     let actual_sha256: [u8; 32] = hasher.finalize().into();
     if actual_sha256 != expected_sha256 {
@@ -2376,6 +2517,16 @@ mod tests {
         Journal::open(temp.path().join("writeback"), identity(bucket)).unwrap()
     }
 
+    /// The file a record's blob reference names, with any container slice
+    /// suffix stripped.
+    fn blob_file(journal: &Journal, record: &MutationRecord) -> PathBuf {
+        journal.root().join(
+            super::BlobRef::parse(record.blob_path().unwrap())
+                .unwrap()
+                .relative,
+        )
+    }
+
     #[test]
     fn committed_put_reopens_with_verified_blob_and_contiguous_local_watermark() {
         let temp = tempfile::tempdir().unwrap();
@@ -2694,39 +2845,37 @@ mod tests {
         assert!(recovered.snapshot().unwrap().records.is_empty());
     }
 
+    /// Blob references are minted by publication, not carried in from
+    /// preparation, so a stale reference on a prepared record cannot alias
+    /// another member's bytes: the batch overwrites it with its own slice.
     #[test]
-    fn prepared_batch_rejects_duplicate_final_blob_paths_before_publication_and_recovers_cleanly() {
+    fn publication_overwrites_any_blob_reference_a_prepared_record_arrived_with() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("writeback");
         let journal = Journal::open(&root, identity("bucket-a")).unwrap();
         let first_payload = VerifiedPayload::new(Bytes::from_static(b"one"));
         let second_payload = VerifiedPayload::new(Bytes::from_static(b"two"));
-        let first = journal
+        let mut first = journal
             .prepare_verified_put(put_record(1, "segments/1", b"one"), &first_payload)
             .unwrap();
-        let duplicate_path = first.record.blob_path().unwrap().to_owned();
+        *first.record.blob_path_mut().unwrap() = "blobs/00/stale.blob".to_owned();
         let mut second = journal
             .prepare_verified_put(put_record(2, "segments/2", b"two"), &second_payload)
             .unwrap();
-        *second.record.blob_path_mut().unwrap() = duplicate_path.clone();
+        *second.record.blob_path_mut().unwrap() = "blobs/00/stale.blob".to_owned();
 
-        let error = journal.publish_batch(vec![first, second]).unwrap_err();
+        let committed = journal.publish_batch(vec![first, second]).unwrap();
 
-        assert!(
-            format!("{error:#}").contains("duplicate final blob path"),
-            "{error:#}"
-        );
-        assert!(!journal.root().join(duplicate_path).exists());
-        let snapshot = journal.snapshot().unwrap();
-        assert_eq!(snapshot.local_seq, 0);
-        assert_eq!(snapshot.pending_blob_count, 0);
-        assert!(snapshot.records.is_empty());
-        assert_eq!(fs::read_dir(journal.root().join("tmp")).unwrap().count(), 0);
+        assert!(!root.join("blobs/00/stale.blob").exists());
+        assert_ne!(committed[0].blob_path(), committed[1].blob_path());
+        assert_eq!(journal.read_blob(1).unwrap(), b"one");
+        assert_eq!(journal.read_blob(2).unwrap(), b"two");
+        assert_eq!(journal.snapshot().unwrap().pending_blob_count, 0);
         drop(journal);
 
         let recovered = Journal::open(&root, identity("bucket-a")).unwrap();
-        assert_eq!(recovered.progress().unwrap().local_seq, 0);
-        assert_eq!(recovered.snapshot().unwrap().pending_blob_count, 0);
+        assert_eq!(recovered.progress().unwrap().local_seq, 2);
+        assert_eq!(recovered.read_blob(2).unwrap(), b"two");
     }
 
     #[test]
@@ -2751,26 +2900,21 @@ mod tests {
     }
 
     #[test]
-    fn partial_batch_rename_failure_rolls_back_uncommitted_blob_prefix() {
+    fn batch_rename_failure_rolls_back_the_whole_container() {
         let temp = tempfile::tempdir().unwrap();
         let journal = open_temp_journal(&temp, "bucket-a");
-        let first_record = put_record(1, "segments/1", b"one");
-        let second_record = put_record(2, "segments/2", b"two");
-        let first_final = journal
-            .root()
-            .join(blob_relative_path(1, first_record.operation_id));
-        let second_final = journal
-            .root()
-            .join(blob_relative_path(2, second_record.operation_id));
+        // The batch renames one container, so parking a directory on its name
+        // fails the whole batch -- no member can land without the others.
+        let container = journal.root().join(super::container_relative_path(1, 2));
         let first_payload = VerifiedPayload::new(Bytes::from_static(b"one"));
         let second_payload = VerifiedPayload::new(Bytes::from_static(b"two"));
         let first = journal
-            .prepare_verified_put(first_record, &first_payload)
+            .prepare_verified_put(put_record(1, "segments/1", b"one"), &first_payload)
             .unwrap();
         let second = journal
-            .prepare_verified_put(second_record, &second_payload)
+            .prepare_verified_put(put_record(2, "segments/2", b"two"), &second_payload)
             .unwrap();
-        fs::create_dir_all(&second_final).unwrap();
+        fs::create_dir_all(&container).unwrap();
 
         let error = journal.publish_batch(vec![first, second]).unwrap_err();
 
@@ -2778,8 +2922,7 @@ mod tests {
             format!("{error:#}").contains("failed to publish local blob"),
             "{error:#}"
         );
-        assert!(!first_final.exists());
-        assert!(second_final.is_dir());
+        assert!(container.is_dir());
         let snapshot = journal.snapshot().unwrap();
         assert_eq!(snapshot.local_seq, 0);
         assert!(snapshot.records.is_empty());
@@ -2791,28 +2934,21 @@ mod tests {
     fn partial_batch_fsync_failure_keeps_watermark_old_and_rolls_back_blobs() {
         let temp = tempfile::tempdir().unwrap();
         let journal = open_temp_journal(&temp, "bucket-a");
-        let first_record = put_record(1, "segments/1", b"one");
-        let second_record = put_record(2, "segments/2", b"two");
-        let first_final = journal
-            .root()
-            .join(blob_relative_path(1, first_record.operation_id));
-        let second_final = journal
-            .root()
-            .join(blob_relative_path(2, second_record.operation_id));
+        let container = journal.root().join(super::container_relative_path(1, 2));
         let first = journal
             .prepare_verified_put(
-                first_record,
+                put_record(1, "segments/1", b"one"),
                 &VerifiedPayload::new(Bytes::from_static(b"one")),
             )
             .unwrap();
         let second = journal
             .prepare_verified_put(
-                second_record,
+                put_record(2, "segments/2", b"two"),
                 &VerifiedPayload::new(Bytes::from_static(b"two")),
             )
             .unwrap();
-        // Contiguous sequences share one shard directory, so the batch makes
-        // exactly one directory fsync; fail it.
+        // The batch publishes one container into one shard directory, so it
+        // makes exactly one directory fsync; fail it.
         let filesystem = RecordingPublicationFilesystem::new(Some(1));
 
         let error = journal
@@ -2823,8 +2959,7 @@ mod tests {
             format!("{error:#}").contains("injected directory fsync failure"),
             "{error:#}"
         );
-        assert!(!first_final.exists());
-        assert!(!second_final.exists());
+        assert!(!container.exists());
         let snapshot = journal.snapshot().unwrap();
         assert_eq!(snapshot.local_seq, 0);
         assert!(snapshot.records.is_empty());
@@ -3002,7 +3137,9 @@ mod tests {
         let prepared = journal
             .prepare_verified_put(put_record(2, "segments/2", b"payload"), &payload)
             .unwrap();
-        assert_eq!(fs::read_dir(journal.root().join("tmp")).unwrap().count(), 1);
+        // Preparation is pure: a record's container slice is not known until
+        // its batch is assembled, so nothing is staged before publication.
+        assert_eq!(fs::read_dir(journal.root().join("tmp")).unwrap().count(), 0);
 
         let error = journal.publish_prepared(prepared).unwrap_err();
 
@@ -3054,7 +3191,7 @@ mod tests {
         let committed = journal
             .commit_put(put_record(1, "segments/1", b"payload"), b"payload")
             .unwrap();
-        let blob = journal.root().join(committed.blob_path().unwrap());
+        let blob = blob_file(&journal, &committed);
         drop(journal);
         fs::remove_file(blob).unwrap();
 
@@ -3070,7 +3207,7 @@ mod tests {
         let committed = journal
             .commit_put(put_record(1, "segments/1", b"payload"), b"payload")
             .unwrap();
-        let blob = journal.root().join(committed.blob_path().unwrap());
+        let blob = blob_file(&journal, &committed);
         drop(journal);
         fs::write(blob, b"payloae").unwrap();
 
@@ -3088,7 +3225,7 @@ mod tests {
         let committed = journal
             .commit_put(put_record(1, "segments/1", b"good"), b"good")
             .unwrap();
-        let blob = journal.root().join(committed.blob_path().unwrap());
+        let blob = blob_file(&journal, &committed);
         drop(journal);
 
         let reopened = open_temp_journal(&temp, "bucket-a");
@@ -3119,7 +3256,7 @@ mod tests {
         assert_eq!(snapshot.local_seq, 2);
         assert_eq!(snapshot.remote_seq, 2);
         assert!(snapshot.records.is_empty());
-        assert!(!journal.root().join(first.blob_path().unwrap()).exists());
+        assert!(!blob_file(&journal, &first).exists());
     }
 
     #[test]
@@ -3238,9 +3375,8 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let journal = open_temp_journal(&temp, "bucket-a");
         let record = put_record(1, "segments/1", b"payload");
-        let final_path = journal
-            .root()
-            .join(blob_relative_path(1, record.operation_id));
+        // Block the rename by parking a directory on the container's name.
+        let final_path = journal.root().join(super::container_relative_path(1, 1));
         fs::create_dir_all(&final_path).unwrap();
         fs::set_permissions(
             final_path.parent().unwrap(),
@@ -3265,7 +3401,7 @@ mod tests {
         let committed = journal
             .commit_put(put_record(1, "segments/1", b"one"), b"one")
             .unwrap();
-        let blob = journal.root().join(committed.blob_path().unwrap());
+        let blob = blob_file(&journal, &committed);
         journal.mark_remote(1, Some("etag-one".to_owned())).unwrap();
         drop(journal);
 
@@ -3299,7 +3435,7 @@ mod tests {
             );
         }
         assert_eq!(
-            fs::metadata(journal.root().join(committed.blob_path().unwrap()))
+            fs::metadata(blob_file(&journal, &committed))
                 .unwrap()
                 .permissions()
                 .mode()
@@ -3354,5 +3490,413 @@ mod tests {
         let error = Journal::open(temp.path().join("writeback"), identity("bucket-a")).unwrap_err();
 
         assert!(format!("{error:#}").contains("mode 644"), "{error:#}");
+    }
+
+    // --- batch container blobs -------------------------------------------
+
+    fn published_blob_files(journal: &Journal) -> Vec<PathBuf> {
+        let mut files = Vec::new();
+        for shard in fs::read_dir(journal.root().join("blobs")).unwrap() {
+            for blob in fs::read_dir(shard.unwrap().path()).unwrap() {
+                files.push(blob.unwrap().path());
+            }
+        }
+        files.sort();
+        files
+    }
+
+    fn prepare_puts(
+        journal: &Journal,
+        sequences: std::ops::RangeInclusive<u64>,
+    ) -> Vec<super::PreparedMutation> {
+        sequences
+            .map(|sequence| {
+                let payload = format!("payload-{sequence}");
+                let verified = VerifiedPayload::new(Bytes::from(payload.clone().into_bytes()));
+                journal
+                    .prepare_verified_put(
+                        put_record(
+                            sequence,
+                            &format!("segments/{sequence}"),
+                            payload.as_bytes(),
+                        ),
+                        &verified,
+                    )
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn blob_reference_parses_the_container_slice_and_the_legacy_whole_file_form() {
+        let legacy =
+            super::BlobRef::parse("blobs/07/00000000-0000-0000-0000-000000000001.blob").unwrap();
+        assert_eq!(
+            legacy.relative,
+            "blobs/07/00000000-0000-0000-0000-000000000001.blob"
+        );
+        assert_eq!(legacy.slice, None);
+
+        let container =
+            super::BlobRef::parse("blobs/07/0000000000000701-0000000000000740.blobs#4096+128")
+                .unwrap();
+        assert_eq!(
+            container.relative,
+            "blobs/07/0000000000000701-0000000000000740.blobs"
+        );
+        assert_eq!(
+            container.slice,
+            Some(super::BlobSlice {
+                offset: 4096,
+                len: 128
+            })
+        );
+
+        for malformed in [
+            "blobs/07/x.blobs#",
+            "blobs/07/x.blobs#12",
+            "blobs/07/x.blobs#12+",
+            "blobs/07/x.blobs#a+1",
+            "blobs/07/x.blobs#1+2#3",
+        ] {
+            assert!(
+                super::BlobRef::parse(malformed).is_err(),
+                "{malformed} must not parse"
+            );
+        }
+    }
+
+    /// The point of the container: one publication batch writes exactly one
+    /// blob file, no matter how many payload records it carries.
+    #[test]
+    fn publication_batch_packs_every_payload_into_one_container_blob() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = open_temp_journal(&temp, "bucket-a");
+
+        let committed = journal
+            .publish_batch(prepare_puts(&journal, 1..=8))
+            .unwrap();
+
+        let files = published_blob_files(&journal);
+        assert_eq!(
+            files.len(),
+            1,
+            "a batch must publish one container: {files:?}"
+        );
+        assert_eq!(
+            files[0],
+            journal
+                .root()
+                .join("blobs/00/0000000000000001-0000000000000008.blobs"),
+            "the container is named for its contiguous sequence range"
+        );
+        let mut offsets = Vec::new();
+        for record in &committed {
+            let reference = super::BlobRef::parse(record.blob_path().unwrap()).unwrap();
+            assert_eq!(
+                reference.relative,
+                "blobs/00/0000000000000001-0000000000000008.blobs"
+            );
+            offsets.push(reference.slice.unwrap().offset);
+        }
+        let mut sorted = offsets.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            8,
+            "every member needs its own slice: {offsets:?}"
+        );
+        for sequence in 1..=8_u64 {
+            assert_eq!(
+                journal.read_blob(sequence).unwrap(),
+                format!("payload-{sequence}").into_bytes()
+            );
+        }
+        assert_eq!(journal.progress().unwrap().local_seq, 8);
+    }
+
+    /// Metadata-only records carry no payload, so a batch mixing them with
+    /// puts must still land exactly one container holding only the payloads.
+    #[test]
+    fn container_publication_skips_metadata_only_records() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = open_temp_journal(&temp, "bucket-a");
+        let payload = VerifiedPayload::new(Bytes::from_static(b"one"));
+        let first = journal
+            .prepare_verified_put(put_record(1, "segments/1", b"one"), &payload)
+            .unwrap();
+        let second = journal
+            .prepare_metadata(delete_record(2, "obsolete"))
+            .unwrap();
+        let third = journal
+            .prepare_verified_put(
+                put_record(3, "segments/3", b"three"),
+                &VerifiedPayload::new(Bytes::from_static(b"three")),
+            )
+            .unwrap();
+
+        let committed = journal.publish_batch(vec![first, second, third]).unwrap();
+
+        assert_eq!(published_blob_files(&journal).len(), 1);
+        assert_eq!(committed[1].blob_path(), None);
+        assert_eq!(journal.read_blob(1).unwrap(), b"one");
+        assert_eq!(journal.read_blob(3).unwrap(), b"three");
+        let container = journal.root().join(
+            super::BlobRef::parse(committed[0].blob_path().unwrap())
+                .unwrap()
+                .relative,
+        );
+        assert_eq!(
+            fs::metadata(&container).unwrap().len(),
+            8,
+            "the container holds only payload bytes"
+        );
+    }
+
+    /// A batch that crashed between the container rename and the record
+    /// commit leaves an orphan container plus its intent. Recovery must
+    /// delete the orphan and leave the watermark where it was.
+    #[test]
+    fn reopening_deletes_a_container_orphaned_by_a_crash_before_the_record_commit() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("writeback");
+        let journal = Journal::open(&root, identity("bucket-a")).unwrap();
+        journal
+            .publish_batch(prepare_puts(&journal, 1..=2))
+            .unwrap();
+
+        // Reproduce the crash window: the next batch's container is renamed
+        // into place and its intent is durable, but its records never commit.
+        let orphan_relative = "blobs/00/0000000000000003-0000000000000004.blobs";
+        let orphan = root.join(orphan_relative);
+        fs::write(&orphan, b"orphaned-container-bytes").unwrap();
+        fs::set_permissions(&orphan, fs::Permissions::from_mode(0o600)).unwrap();
+        let transaction = journal.database.begin_write().unwrap();
+        {
+            let mut table = transaction.open_table(super::PENDING_BLOBS).unwrap();
+            table
+                .insert(orphan_relative, orphan_relative.as_bytes())
+                .unwrap();
+        }
+        transaction.commit().unwrap();
+        drop(journal);
+
+        let recovered = Journal::open(&root, identity("bucket-a")).unwrap();
+
+        assert!(!orphan.exists(), "the orphaned container must be deleted");
+        let snapshot = recovered.snapshot().unwrap();
+        assert_eq!(snapshot.local_seq, 2);
+        assert_eq!(snapshot.pending_blob_count, 0);
+        assert_eq!(recovered.read_blob(1).unwrap(), b"payload-1");
+        assert_eq!(recovered.read_blob(2).unwrap(), b"payload-2");
+    }
+
+    /// A container torn by a crash mid-write never got renamed, so it is a
+    /// tmp file; recovery wipes it without touching committed containers.
+    #[test]
+    fn reopening_discards_a_partially_written_container_and_keeps_committed_ones() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("writeback");
+        let journal = Journal::open(&root, identity("bucket-a")).unwrap();
+        let committed = journal
+            .publish_batch(prepare_puts(&journal, 1..=3))
+            .unwrap();
+        let container = root.join(
+            super::BlobRef::parse(committed[0].blob_path().unwrap())
+                .unwrap()
+                .relative,
+        );
+        let torn = root.join("tmp/0000000000000004-0000000000000006.blobs");
+        fs::write(&torn, b"half-written").unwrap();
+        drop(journal);
+
+        let recovered = Journal::open(&root, identity("bucket-a")).unwrap();
+
+        assert!(!torn.exists());
+        assert!(container.exists());
+        assert_eq!(recovered.progress().unwrap().local_seq, 3);
+        assert_eq!(recovered.read_blob(2).unwrap(), b"payload-2");
+    }
+
+    /// Journals written before containers store one whole-file blob per
+    /// record. Those references must keep validating, reading, and pruning.
+    #[test]
+    fn a_legacy_per_record_blob_reference_still_validates_reads_and_prunes() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("writeback");
+        let journal = Journal::open(&root, identity("bucket-a")).unwrap();
+
+        // Hand-build the pre-container layout: one whole-file blob per record.
+        let mut record = put_record(1, "segments/1", b"legacy-payload");
+        let legacy_relative =
+            super::path_to_portable_string(&blob_relative_path(1, record.operation_id)).unwrap();
+        *record.blob_path_mut().unwrap() = legacy_relative.clone();
+        let legacy_path = root.join(&legacy_relative);
+        fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
+        fs::set_permissions(
+            legacy_path.parent().unwrap(),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        fs::write(&legacy_path, b"legacy-payload").unwrap();
+        fs::set_permissions(&legacy_path, fs::Permissions::from_mode(0o600)).unwrap();
+        let transaction = journal.database.begin_write().unwrap();
+        {
+            let mut mutations = transaction.open_table(super::MUTATIONS).unwrap();
+            mutations
+                .insert(1_u64, bincode::serialize(&record).unwrap().as_slice())
+                .unwrap();
+            drop(mutations);
+            let mut meta = transaction.open_table(META).unwrap();
+            write_value(&mut meta, super::LOCAL_SEQ_KEY, &1_u64).unwrap();
+            write_value(&mut meta, super::LOCAL_BYTES_COMPLETED_KEY, &14_u64).unwrap();
+        }
+        transaction.commit().unwrap();
+        drop(journal);
+
+        let recovered = Journal::open(&root, identity("bucket-a")).unwrap();
+        assert_eq!(recovered.read_blob(1).unwrap(), b"legacy-payload");
+
+        // A new batch appended after the legacy record uses containers, and
+        // both forms coexist in one journal.
+        let committed = recovered
+            .publish_batch(prepare_puts(&recovered, 2..=3))
+            .unwrap();
+        assert!(committed[0].blob_path().unwrap().contains(".blobs#"));
+        assert_eq!(recovered.read_blob(1).unwrap(), b"legacy-payload");
+        assert_eq!(recovered.read_blob(3).unwrap(), b"payload-3");
+
+        recovered.mark_remote(1, Some("etag-1".to_owned())).unwrap();
+        recovered.remove_remote_prefix(1).unwrap();
+        assert!(
+            !legacy_path.exists(),
+            "a fully drained legacy blob is still pruned per record"
+        );
+        assert_eq!(recovered.read_blob(2).unwrap(), b"payload-2");
+    }
+
+    /// A container is reclaimable only once every member is remote-committed.
+    /// Draining a prefix of its members must not unlink bytes the rest still
+    /// need, and the final member's commit must release the whole file.
+    #[test]
+    fn a_container_is_reclaimed_only_after_its_last_member_is_remote_committed() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = open_temp_journal(&temp, "bucket-a");
+        let committed = journal
+            .publish_batch(prepare_puts(&journal, 1..=4))
+            .unwrap();
+        let container = journal.root().join(
+            super::BlobRef::parse(committed[0].blob_path().unwrap())
+                .unwrap()
+                .relative,
+        );
+
+        for sequence in 1..=3_u64 {
+            journal
+                .mark_remote(sequence, Some(format!("etag-{sequence}")))
+                .unwrap();
+            journal.remove_remote_prefix(sequence).unwrap();
+            assert!(
+                container.exists(),
+                "container unlinked while sequence {} of 4 still needs it",
+                sequence + 1
+            );
+            assert_eq!(
+                journal.read_blob(4).unwrap(),
+                b"payload-4",
+                "an undrained member must stay readable"
+            );
+        }
+
+        journal.mark_remote(4, Some("etag-4".to_owned())).unwrap();
+        journal.remove_remote_prefix(4).unwrap();
+
+        assert!(
+            !container.exists(),
+            "the container must be reclaimed once every member drained"
+        );
+        assert!(published_blob_files(&journal).is_empty());
+    }
+
+    /// Reclaiming on reopen goes through the same watermark rule, and a
+    /// container straddling the remote watermark must survive the scan that
+    /// `Journal::open` runs before it validates recovery state.
+    #[test]
+    fn reopening_keeps_a_container_that_straddles_the_remote_watermark() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("writeback");
+        let journal = Journal::open(&root, identity("bucket-a")).unwrap();
+        let committed = journal
+            .publish_batch(prepare_puts(&journal, 1..=4))
+            .unwrap();
+        let container = root.join(
+            super::BlobRef::parse(committed[0].blob_path().unwrap())
+                .unwrap()
+                .relative,
+        );
+        journal.mark_remote(1, Some("etag-1".to_owned())).unwrap();
+        journal.mark_remote(2, Some("etag-2".to_owned())).unwrap();
+        drop(journal);
+
+        let recovered = Journal::open(&root, identity("bucket-a")).unwrap();
+
+        assert!(container.exists());
+        assert_eq!(recovered.read_blob(3).unwrap(), b"payload-3");
+        assert_eq!(recovered.read_blob(4).unwrap(), b"payload-4");
+        let snapshot = recovered.snapshot().unwrap();
+        assert_eq!(snapshot.remote_seq, 2);
+        assert_eq!(snapshot.local_seq, 4);
+    }
+
+    /// Payload verification is per record, not per file: corrupting one
+    /// member's slice must fail that record without silently reading a
+    /// neighbour's bytes.
+    #[test]
+    fn reopening_rejects_a_corrupt_slice_inside_an_otherwise_valid_container() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("writeback");
+        let journal = Journal::open(&root, identity("bucket-a")).unwrap();
+        let committed = journal
+            .publish_batch(prepare_puts(&journal, 1..=3))
+            .unwrap();
+        let reference = super::BlobRef::parse(committed[1].blob_path().unwrap()).unwrap();
+        let container = root.join(reference.relative);
+        let offset = reference.slice.unwrap().offset as usize;
+        drop(journal);
+        let mut bytes = fs::read(&container).unwrap();
+        bytes[offset] ^= 0xff;
+        fs::write(&container, &bytes).unwrap();
+
+        let error = Journal::open(&root, identity("bucket-a")).unwrap_err();
+
+        assert!(format!("{error:#}").contains("hash mismatch"), "{error:#}");
+    }
+
+    /// A container truncated after publication must be caught by the same
+    /// recovery validation that catches a missing whole-file blob.
+    #[test]
+    fn reopening_rejects_a_truncated_container() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("writeback");
+        let journal = Journal::open(&root, identity("bucket-a")).unwrap();
+        let committed = journal
+            .publish_batch(prepare_puts(&journal, 1..=3))
+            .unwrap();
+        let container = root.join(
+            super::BlobRef::parse(committed[0].blob_path().unwrap())
+                .unwrap()
+                .relative,
+        );
+        drop(journal);
+        let bytes = fs::read(&container).unwrap();
+        fs::write(&container, &bytes[..bytes.len() - 1]).unwrap();
+
+        let error = Journal::open(&root, identity("bucket-a")).unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("length mismatch"),
+            "{error:#}"
+        );
     }
 }

@@ -111,6 +111,13 @@ const DEFAULT_LOCAL_PREPARE_CONCURRENCY: usize = 16;
 // mutations are individually tiny.
 const MAX_LOCAL_PUBLISH_BATCH_RECORDS: usize = 64;
 const MAX_LOCAL_PUBLISH_BATCH_RECORD_BYTES: usize = 16 * 1024 * 1024;
+// One batch publishes as one container blob, so this caps the container. It
+// bounds three things at once: the payload bytes held in RAM across
+// publication, the size of the single sequential write the drain issues, and
+// the transient disk overhead of container reclamation -- a container
+// straddling the remote watermark keeps its already-drained members on disk
+// until its final member drains, and that is at most this many bytes.
+const MAX_LOCAL_PUBLISH_BATCH_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct LocalJournaler {
@@ -552,6 +559,7 @@ async fn run_journaler(
             let mut mutations = Vec::new();
             let mut ownership = Vec::new();
             let mut encoded_record_bytes = 0_usize;
+            let mut container_payload_bytes = 0_u64;
             let mut candidate = Some(next_admitted);
             while let Some(sequence) = candidate {
                 let Some((result, _, _)) = prepared.get(&sequence) else {
@@ -620,12 +628,25 @@ async fn run_journaler(
                 if next_encoded_bytes > MAX_LOCAL_PUBLISH_BATCH_RECORD_BYTES {
                     break;
                 }
+                let payload_bytes = match result {
+                    Ok(mutation) => mutation.payload_bytes(),
+                    Err(_) => unreachable!("preparation errors are handled above"),
+                };
+                let next_payload_bytes = container_payload_bytes.saturating_add(payload_bytes);
+                // A single payload larger than the cap still publishes alone;
+                // the cap only stops a batch from growing past it.
+                if next_payload_bytes > MAX_LOCAL_PUBLISH_BATCH_PAYLOAD_BYTES
+                    && !mutations.is_empty()
+                {
+                    break;
+                }
                 let (result, ram, disk) = prepared
                     .remove(&sequence)
                     .expect("the expected prepared mutation still exists");
                 mutations.push(result.expect("the prepared mutation was checked above"));
                 ownership.push((sequence, ram, disk));
                 encoded_record_bytes = next_encoded_bytes;
+                container_payload_bytes = next_payload_bytes;
                 candidate = sequence.checked_add(1);
             }
             if terminal.is_some() {

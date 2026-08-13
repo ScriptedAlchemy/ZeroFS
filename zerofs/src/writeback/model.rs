@@ -147,7 +147,12 @@ impl MutationRecord {
     /// variable path key. Account for the path, encoded `(sequence, ETag)`
     /// value, both variable-entry offsets, and a full leaf header.
     const REMOTE_VERSION_TABLE_FIXED_BYTES: u64 = 8 + 8 + 4 + 4 + 4;
-    const MAX_BLOB_PATH: &str = "blobs/ff/00000000-0000-0000-0000-000000000000.blob";
+    /// The longest blob reference the journal can mint: a batch container
+    /// slice, `blobs/{shard}/{first:016x}-{last:016x}.blobs#{offset}+{len}`
+    /// with both slice numbers at their `u64::MAX` decimal width. It bounds
+    /// the pre-container whole-file form too, so one constant still covers
+    /// every reservation.
+    const MAX_BLOB_PATH: &str = "blobs/ff/ffffffffffffffff-ffffffffffffffff.blobs#18446744073709551615+18446744073709551615";
     const MAX_LOCAL_ETAG: &str = "wb:ffffffff-ffff-ffff-ffff-ffffffffffff:18446744073709551615";
 
     pub fn blob_path(&self) -> Option<&str> {
