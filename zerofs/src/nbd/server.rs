@@ -710,7 +710,8 @@ mod tests {
     use deku::{DekuContainerRead, DekuContainerWrite};
     use nbd_proto::{
         NBD_EINVAL, NBD_FLAG_C_FIXED_NEWSTYLE, NBD_FLAG_C_NO_ZEROES, NBD_IHAVEOPT,
-        NBD_OPT_EXPORT_NAME, NBD_REQUEST_MAGIC, NBDCommand, NBDRequest, NBDSimpleReply,
+        NBD_OPT_EXPORT_NAME, NBD_REQUEST_HEADER_SIZE, NBD_REQUEST_MAGIC, NBDCommand, NBDRequest,
+        NBDSimpleReply,
     };
     use std::io;
     use std::pin::Pin;
@@ -1394,5 +1395,368 @@ mod tests {
             .expect("FUA write resumed after the stalled WRITE timed out")
             .expect("FUA task did not panic")
             .expect("FUA write and its flush succeeded");
+    }
+
+    /// A single-file export of an arbitrary size, for throughput probes that need
+    /// more room than [`single_file_export`]'s 4 KiB.
+    async fn sized_single_file_export(
+        filesystem: &Arc<ZeroFS>,
+        name: &[u8],
+        size: u64,
+    ) -> crate::fs::inode::InodeId {
+        let credentials = root_credentials();
+        let nbd_dir = match filesystem
+            .mkdir(&credentials, 0, b".nbd", &SetAttributes::default())
+            .await
+        {
+            Ok((id, _)) => id,
+            // Already created by an earlier export in the same filesystem.
+            Err(_) => filesystem
+                .lookup(&credentials, 0, b".nbd")
+                .await
+                .expect("locate .nbd directory"),
+        };
+        let (inode, _) = filesystem
+            .create(&credentials, nbd_dir, name, &SetAttributes::default())
+            .await
+            .expect("create export");
+        filesystem
+            .setattr(
+                &credentials,
+                inode,
+                &SetAttributes {
+                    size: SetSize::Set(size),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("size export");
+        inode
+    }
+
+    fn probe_request(cmd: NBDCommand, cookie: u64, offset: u64, length: u32) -> Vec<u8> {
+        NBDRequest {
+            magic: NBD_REQUEST_MAGIC,
+            flags: 0,
+            cmd_type: cmd,
+            cookie,
+            offset,
+            length,
+        }
+        .to_bytes()
+        .expect("encode probe request")
+    }
+
+    /// Run one `handle_transmission` over a loopback TCP socket, mirroring
+    /// `handle_client_stream`'s split and buffering so the measured path is the
+    /// production one rather than an in-memory shortcut.
+    async fn transmission_over_tcp(
+        filesystem: Arc<ZeroFS>,
+        export_gates: Arc<NbdExportGates>,
+        name: &[u8],
+    ) -> (TcpStream, tokio::task::JoinHandle<()>) {
+        let device = NBDHandler::new(Arc::clone(&filesystem), Arc::clone(&export_gates))
+            .get_device(name)
+            .await
+            .expect("discover probe export");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("loopback address");
+        let client = TcpStream::connect(addr).await.expect("connect loopback");
+        let (server, _) = listener.accept().await.expect("accept loopback");
+        client.set_nodelay(true).expect("client nodelay");
+        server.set_nodelay(true).expect("server nodelay");
+        let task = tokio::spawn(async move {
+            let (reader, writer) = tokio::io::split(server);
+            let mut session = NBDSession::new(
+                tokio::io::BufReader::new(reader),
+                tokio::io::BufWriter::new(writer),
+                filesystem,
+                export_gates,
+                CancellationToken::new(),
+            );
+            let _ = session.handle_transmission(device).await;
+        });
+        (client, task)
+    }
+
+    /// Protocol-floor decomposition for the NBD write ACK path.
+    ///
+    /// Separates three costs that the end-to-end fio number folds together:
+    ///
+    ///   1. What the server spends per request with **zero** storage work
+    ///      (header parse, dispatch, 16-byte reply, socket write + flush). An
+    ///      unadvertised WRITE_ZEROES is rejected before it touches the
+    ///      filesystem, so it isolates exactly this.
+    ///   2. What a real WRITE adds on top: payload transfer plus the storage
+    ///      engine's staging and commit.
+    ///   3. What one TCP connection can do when requests are *pipelined*. The
+    ///      transmission loop is strictly serial — it reads a request, awaits
+    ///      the whole handler, writes the reply, and only then reads the next —
+    ///      so a client that queues N requests on one socket still gets them
+    ///      serviced one at a time. Deep queue depth only pays off across
+    ///      connections, which is what this measures.
+    ///
+    /// Anything the fio round trip costs beyond (1)+(2) is the kernel NBD
+    /// driver, the block layer, XFS, and fio itself — none of it addressable by
+    /// server-side work.
+    ///
+    ///   cargo test --release --lib -- --ignored --nocapture bench_nbd_protocol_floor
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[ignore = "protocol measurement, run explicitly in release"]
+    async fn bench_nbd_protocol_floor() {
+        const EXPORT_BYTES: u64 = 256 * 1024 * 1024;
+        let filesystem = Arc::new(
+            ZeroFS::new_in_memory()
+                .await
+                .expect("create probe filesystem"),
+        );
+        let export_gates = Arc::new(NbdExportGates::default());
+        sized_single_file_export(&filesystem, b"floor-probe", EXPORT_BYTES).await;
+        let (mut client, task) = transmission_over_tcp(
+            Arc::clone(&filesystem),
+            Arc::clone(&export_gates),
+            b"floor-probe",
+        )
+        .await;
+
+        // (1) No-op round trip: the pure protocol + loopback TCP floor.
+        let mut reply = [0u8; 16];
+        let noop_iterations = 4000u64;
+        for i in 0..200 {
+            client
+                .write_all(&probe_request(NBDCommand::WriteZeroes, i, 0, 4096))
+                .await
+                .expect("warm no-op");
+            client
+                .read_exact(&mut reply)
+                .await
+                .expect("warm no-op reply");
+        }
+        let start = std::time::Instant::now();
+        for i in 0..noop_iterations {
+            client
+                .write_all(&probe_request(NBDCommand::WriteZeroes, i, 0, 4096))
+                .await
+                .expect("send no-op");
+            client
+                .read_exact(&mut reply)
+                .await
+                .expect("read no-op reply");
+        }
+        let noop_qd1_us = start.elapsed().as_secs_f64() * 1e6 / noop_iterations as f64;
+
+        // (1b) The same no-op pipelined, so the per-request cost excludes the
+        // round-trip stall and shows the server loop's own dispatch cost.
+        let depth = 64u64;
+        let rounds = 200u64;
+        let start = std::time::Instant::now();
+        for round in 0..rounds {
+            let mut batch = Vec::with_capacity(depth as usize * NBD_REQUEST_HEADER_SIZE);
+            for i in 0..depth {
+                batch.extend_from_slice(&probe_request(
+                    NBDCommand::WriteZeroes,
+                    round * depth + i,
+                    0,
+                    4096,
+                ));
+            }
+            client.write_all(&batch).await.expect("send no-op batch");
+            let mut replies = vec![0u8; depth as usize * 16];
+            client
+                .read_exact(&mut replies)
+                .await
+                .expect("read no-op batch replies");
+        }
+        let noop_pipelined_us = start.elapsed().as_secs_f64() * 1e6 / (rounds * depth) as f64;
+
+        // (2) Real writes at QD1, in place, at the canonical NBD request sizes.
+        let mut write_qd1 = Vec::new();
+        for size in [256 * 1024usize, 1024 * 1024] {
+            let payload = vec![0xa5u8; size];
+            let iterations = (32 * 1024 * 1024 / size) as u64;
+            let slots = EXPORT_BYTES / size as u64;
+            for i in 0..8 {
+                let offset = (i % slots) * size as u64;
+                client
+                    .write_all(&probe_request(NBDCommand::Write, i, offset, size as u32))
+                    .await
+                    .expect("warm write header");
+                client
+                    .write_all(&payload)
+                    .await
+                    .expect("warm write payload");
+                client
+                    .read_exact(&mut reply)
+                    .await
+                    .expect("warm write reply");
+            }
+            let start = std::time::Instant::now();
+            for i in 0..iterations {
+                let offset = (i % slots) * size as u64;
+                client
+                    .write_all(&probe_request(NBDCommand::Write, i, offset, size as u32))
+                    .await
+                    .expect("send write header");
+                client
+                    .write_all(&payload)
+                    .await
+                    .expect("send write payload");
+                client
+                    .read_exact(&mut reply)
+                    .await
+                    .expect("read write reply");
+            }
+            let elapsed = start.elapsed().as_secs_f64();
+            write_qd1.push((
+                size,
+                elapsed * 1e6 / iterations as f64,
+                (iterations as usize * size) as f64 / elapsed / 1e6,
+            ));
+        }
+
+        eprintln!(
+            "nbd protocol floor: no-op QD1 {noop_qd1_us:.1} us/req, \
+             no-op pipelined(depth {depth}) {noop_pipelined_us:.1} us/req"
+        );
+        for (size, us, mbps) in &write_qd1 {
+            eprintln!(
+                "nbd write QD1 {} KiB: {us:.0} us/req, {mbps:.0} MB/s single connection",
+                size / 1024,
+            );
+        }
+
+        // (3) Aggregate across independent connections, which is the only axis
+        // the serial transmission loop leaves open.
+        for connections in [1usize, 2, 4, 8] {
+            let size = 256 * 1024usize;
+            let per_connection = (16 * 1024 * 1024 / size) as u64;
+            let mut sessions = Vec::with_capacity(connections);
+            for c in 0..connections {
+                let name = format!("floor-probe-{connections}-{c}");
+                sized_single_file_export(&filesystem, name.as_bytes(), EXPORT_BYTES).await;
+                sessions.push(
+                    transmission_over_tcp(
+                        Arc::clone(&filesystem),
+                        Arc::clone(&export_gates),
+                        name.as_bytes(),
+                    )
+                    .await,
+                );
+            }
+            let start = std::time::Instant::now();
+            let mut tasks = Vec::with_capacity(connections);
+            for (mut stream, task) in sessions {
+                tasks.push((
+                    tokio::spawn(async move {
+                        let payload = vec![0xa5u8; size];
+                        let mut reply = [0u8; 16];
+                        for i in 0..per_connection {
+                            stream
+                                .write_all(&probe_request(
+                                    NBDCommand::Write,
+                                    i,
+                                    i * size as u64,
+                                    size as u32,
+                                ))
+                                .await
+                                .expect("send scaling write header");
+                            stream
+                                .write_all(&payload)
+                                .await
+                                .expect("send scaling write payload");
+                            stream
+                                .read_exact(&mut reply)
+                                .await
+                                .expect("read scaling write reply");
+                        }
+                        stream
+                    }),
+                    task,
+                ));
+            }
+            for (client_task, _) in tasks {
+                client_task.await.expect("scaling client finished");
+            }
+            let elapsed = start.elapsed().as_secs_f64();
+            eprintln!(
+                "nbd write 256 KiB across {connections} connections: {:.0} MB/s aggregate",
+                (connections as u64 * per_connection) as f64 * size as f64 / elapsed / 1e6,
+            );
+        }
+
+        client
+            .write_all(&probe_request(NBDCommand::Disconnect, 0, 0, 0))
+            .await
+            .expect("send disconnect");
+        let _ = timeout(Duration::from_secs(5), task).await;
+    }
+
+    /// The transmission loop services one connection's requests strictly in
+    /// series: the second request is not even read off the socket until the
+    /// first has replied. This is what caps a single NBD connection at QD1 no
+    /// matter how deep the client queues, and it is the reason deep-queue
+    /// throughput has to come from multiple connections.
+    #[tokio::test]
+    async fn one_connection_services_requests_strictly_in_series() {
+        let filesystem = Arc::new(
+            ZeroFS::new_in_memory()
+                .await
+                .expect("create test filesystem"),
+        );
+        let export_gates = Arc::new(NbdExportGates::default());
+        let device = single_file_export(&filesystem, &export_gates).await;
+        let (server_stream, mut client_stream) = tokio::io::duplex(64 * 1024);
+        let (reader, writer) = tokio::io::split(server_stream);
+        let mut session = NBDSession::new(
+            reader,
+            writer,
+            filesystem,
+            export_gates,
+            CancellationToken::new(),
+        );
+        let session_task = tokio::spawn(async move { session.handle_transmission(device).await });
+
+        // Two independent WRITEs queued back to back, each with its payload, so
+        // the server could in principle overlap them.
+        for cookie in [1u64, 2] {
+            client_stream
+                .write_all(&probe_request(NBDCommand::Write, cookie, 0, 1))
+                .await
+                .expect("send write header");
+            client_stream
+                .write_all(&[0x5a])
+                .await
+                .expect("send write payload");
+        }
+
+        // Replies come back in submission order, one at a time: a pipelining
+        // server would be free to reorder, a serial loop never can.
+        for expected in [1u64, 2] {
+            let mut reply_bytes = [0; 16];
+            timeout(
+                Duration::from_secs(2),
+                client_stream.read_exact(&mut reply_bytes),
+            )
+            .await
+            .expect("server replied")
+            .expect("read reply");
+            let (_, reply) = NBDSimpleReply::from_bytes((&reply_bytes, 0)).expect("decode reply");
+            assert_eq!(
+                reply.cookie, expected,
+                "a serial transmission loop must reply in submission order"
+            );
+        }
+
+        client_stream
+            .write_all(&probe_request(NBDCommand::Disconnect, 0, 0, 0))
+            .await
+            .expect("send disconnect");
+        timeout(Duration::from_secs(2), session_task)
+            .await
+            .expect("server stopped after disconnect")
+            .expect("server task did not panic")
+            .expect("server accepted disconnect");
     }
 }
