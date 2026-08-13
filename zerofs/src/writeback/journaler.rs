@@ -109,7 +109,12 @@ const DEFAULT_LOCAL_PREPARE_CONCURRENCY: usize = 16;
 // mutation metadata retained by one redb transaction without throttling large
 // payload throughput. The record cap separately bounds transaction work when
 // mutations are individually tiny.
-const MAX_LOCAL_PUBLISH_BATCH_RECORDS: usize = 64;
+// A batch's fixed cost is three fsync-class operations regardless of its
+// record count, so this cap is what decides how far that cost amortizes. The
+// payload-byte cap below is the real bound on a batch's latency and size;
+// this one only stops a flood of tiny mutations from making one redb
+// transaction arbitrarily large.
+const MAX_LOCAL_PUBLISH_BATCH_RECORDS: usize = 512;
 const MAX_LOCAL_PUBLISH_BATCH_RECORD_BYTES: usize = 16 * 1024 * 1024;
 // One batch publishes as one container blob, so this caps the container. It
 // bounds three things at once: the payload bytes held in RAM across
@@ -818,7 +823,8 @@ fn current_terminal(barrier: &LocalBarrier) -> Option<LocalBarrierError> {
 mod tests {
     use super::{
         DEFAULT_LOCAL_PREPARE_CONCURRENCY, LocalBarrierError, LocalCommitObserver,
-        LocalJournalSink, LocalJournaler,
+        LocalJournalSink, LocalJournaler, MAX_LOCAL_PUBLISH_BATCH_PAYLOAD_BYTES,
+        MAX_LOCAL_PUBLISH_BATCH_RECORDS,
     };
     use crate::fault_store::FaultStore;
     use crate::writeback::admission::{Admission, AdmissionError, DiskAdmission};
@@ -1073,7 +1079,7 @@ mod tests {
         fn prepare(
             &self,
             record: MutationRecord,
-            _payload: Option<&VerifiedPayload>,
+            payload: Option<&VerifiedPayload>,
         ) -> Result<crate::writeback::journal::PreparedMutation> {
             if record.sequence == 1 {
                 self.head_release
@@ -1085,8 +1091,8 @@ mod tests {
                     .unwrap();
             }
             self.prepared.send(record.sequence).unwrap();
-            Ok(crate::writeback::journal::PreparedMutation::metadata(
-                record,
+            Ok(crate::writeback::journal::PreparedMutation::for_test(
+                record, payload,
             ))
         }
 
@@ -1601,7 +1607,8 @@ mod tests {
 
     #[tokio::test]
     async fn stalled_head_with_many_ready_records_publishes_bounded_batches_without_stalling() {
-        let admission = Admission::new(130);
+        const RECORDS: u64 = MAX_LOCAL_PUBLISH_BATCH_RECORDS as u64 * 2 + 6;
+        let admission = Admission::new(RECORDS);
         let (head_release_tx, head_release_rx) = mpsc::channel();
         let (prepared_tx, mut prepared_rx) = tokio_mpsc::unbounded_channel();
         let sink = Arc::new(HeadBlockingBatchSink {
@@ -1609,22 +1616,23 @@ mod tests {
             prepared: prepared_tx,
             published_batches: Mutex::new(Vec::new()),
         });
+        let queue = RECORDS as usize * 2;
         let journaler = LocalJournaler::start_with_sink_and_observer(
             sink.clone(),
             admission.clone(),
             0,
-            256,
-            256,
+            queue,
+            queue,
             None,
         );
-        for sequence in 1..=130 {
+        for sequence in 1..=RECORDS {
             let ram = admission.reserve(1).await.unwrap().accept();
             journaler
                 .submit_put(put_record(sequence, b"x"), Bytes::from_static(b"x"), ram)
                 .await
                 .unwrap();
         }
-        for _ in 2..=130 {
+        for _ in 2..=RECORDS {
             tokio::time::timeout(Duration::from_secs(2), prepared_rx.recv())
                 .await
                 .expect("later preparation stalled behind the blocked head")
@@ -1633,7 +1641,7 @@ mod tests {
         assert!(sink.published_batches.lock().unwrap().is_empty());
 
         head_release_tx.send(()).unwrap();
-        journaler.barrier().wait_local(130).await.unwrap();
+        journaler.barrier().wait_local(RECORDS).await.unwrap();
 
         assert_eq!(
             sink.published_batches
@@ -1642,9 +1650,72 @@ mod tests {
                 .iter()
                 .map(Vec::len)
                 .collect::<Vec<_>>(),
-            vec![64, 64, 2]
+            vec![
+                MAX_LOCAL_PUBLISH_BATCH_RECORDS,
+                MAX_LOCAL_PUBLISH_BATCH_RECORDS,
+                6
+            ]
         );
         assert_eq!(admission.used_bytes(), 0);
+        journaler.shutdown().await.unwrap();
+    }
+
+    /// A batch's payload bytes are capped independently of its record count,
+    /// because the container is written and fsynced inside the batch's
+    /// critical path and its size is what bounds both that latency and the
+    /// transient disk overhead of container reclamation.
+    #[tokio::test]
+    async fn publication_batches_are_bounded_by_container_payload_bytes() {
+        const PAYLOAD: usize = 8 * 1024 * 1024;
+        let records = (MAX_LOCAL_PUBLISH_BATCH_PAYLOAD_BYTES / PAYLOAD as u64) + 2;
+        let admission = Admission::new(records * PAYLOAD as u64);
+        let (head_release_tx, head_release_rx) = mpsc::channel();
+        let (prepared_tx, mut prepared_rx) = tokio_mpsc::unbounded_channel();
+        let sink = Arc::new(HeadBlockingBatchSink {
+            head_release: Mutex::new(Some(head_release_rx)),
+            prepared: prepared_tx,
+            published_batches: Mutex::new(Vec::new()),
+        });
+        let payload = Bytes::from(vec![0x5a_u8; PAYLOAD]);
+        let queue = records as usize * 2;
+        let journaler = LocalJournaler::start_with_sink_and_observer(
+            sink.clone(),
+            admission.clone(),
+            0,
+            queue,
+            queue,
+            None,
+        );
+        for sequence in 1..=records {
+            let ram = admission.reserve(PAYLOAD as u64).await.unwrap().accept();
+            journaler
+                .submit_put(put_record(sequence, &payload), payload.clone(), ram)
+                .await
+                .unwrap();
+        }
+        for _ in 2..=records {
+            tokio::time::timeout(Duration::from_secs(5), prepared_rx.recv())
+                .await
+                .expect("later preparation stalled behind the blocked head")
+                .unwrap();
+        }
+
+        head_release_tx.send(()).unwrap();
+        journaler.barrier().wait_local(records).await.unwrap();
+
+        let batches = sink
+            .published_batches
+            .lock()
+            .unwrap()
+            .iter()
+            .map(Vec::len)
+            .collect::<Vec<_>>();
+        let cap = (MAX_LOCAL_PUBLISH_BATCH_PAYLOAD_BYTES / PAYLOAD as u64) as usize;
+        assert!(
+            batches.iter().all(|batch| *batch <= cap),
+            "a batch exceeded the container payload cap of {cap} records: {batches:?}"
+        );
+        assert_eq!(batches.iter().sum::<usize>(), records as usize);
         journaler.shutdown().await.unwrap();
     }
 

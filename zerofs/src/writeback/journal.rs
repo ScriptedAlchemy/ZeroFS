@@ -36,22 +36,31 @@
 //! ## Ordering and the durability contract
 //!
 //! A record is ACKed durable only after its bytes AND the metadata naming
-//! them are fsynced. One batch therefore runs:
+//! them are fsynced. One batch therefore runs exactly three fsync-class
+//! operations, whatever its record count:
 //!
-//! 1. write the container to `tmp/`, `fsync` it (payload bytes durable);
-//! 2. commit the `PENDING_BLOBS` intent for the container path
-//!    (`Durability::Immediate`) -- so a crash after step 3 but before step 5
-//!    leaves a note telling recovery to delete the orphan;
-//! 3. `rename` into `blobs/{shard}/`;
-//! 4. `fsync` the shard directory (the name is durable);
-//! 5. commit records, clear the intent, and advance `LOCAL_SEQ_KEY` in one
+//! 1. write the container at its final path and `fsync` it (payload bytes
+//!    durable);
+//! 2. `fsync` the shard directory (the name is durable);
+//! 3. insert the records and advance `LOCAL_SEQ_KEY` in one
 //!    `Durability::Immediate` transaction.
 //!
-//! The batch is atomic: any failure before step 5 rolls the container and the
-//! intent back and leaves `LOCAL_SEQ_KEY` untouched, so the whole batch fails
-//! together and the journal stays replayable. A crash at any point before
-//! step 5 recovers to the pre-batch state, because `recover_local_artifacts`
-//! wipes `tmp/` and deletes every path named by a surviving intent.
+//! The batch is atomic: any failure before step 3 unlinks the container and
+//! leaves `LOCAL_SEQ_KEY` untouched, so the whole batch fails together and the
+//! journal stays replayable.
+//!
+//! There is deliberately no staging rename and no durable pending-blob
+//! intent. Both exist to let recovery tell a finished container from an
+//! interrupted one, and the container's name already answers that: a batch
+//! commits atomically at step 3, so a container is committed exactly when
+//! `last <= LOCAL_SEQ`. `remove_uncommitted_containers` unlinks everything
+//! above the watermark on open -- including a container torn mid-write, which
+//! no record references. Dropping the intent removes a whole
+//! `Durability::Immediate` commit from the batch's critical path.
+//!
+//! `PENDING_BLOBS` survives for journals written before containers: those
+//! recorded a per-record intent, and `recover_local_artifacts` still drains
+//! any surviving rows before scanning by name.
 //!
 //! ## Reclamation
 //!
@@ -226,17 +235,12 @@ pub(crate) struct PreparedMutation {
 }
 
 trait PublicationFilesystem {
-    fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()>;
     fn sync_directory(&self, path: &Path) -> Result<()>;
 }
 
 struct StdPublicationFilesystem;
 
 impl PublicationFilesystem for StdPublicationFilesystem {
-    fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
-        fs::rename(from, to)
-    }
-
     fn sync_directory(&self, path: &Path) -> Result<()> {
         sync_directory(path)
     }
@@ -269,6 +273,17 @@ impl PreparedMutation {
         Self {
             record,
             payload: None,
+        }
+    }
+
+    /// A prepared mutation for sinks that stand in for the journal. It keeps
+    /// the payload so batching decisions that depend on container size behave
+    /// as they do in production.
+    #[cfg(test)]
+    pub(crate) fn for_test(record: MutationRecord, payload: Option<&VerifiedPayload>) -> Self {
+        Self {
+            record,
+            payload: payload.cloned(),
         }
     }
 }
@@ -748,63 +763,28 @@ impl Journal {
             Some(relative)
         };
 
+        // The container is written straight to its final name. It carries the
+        // sequence range it covers, and a batch commits atomically, so a
+        // container is committed exactly when `last <= LOCAL_SEQ`. Recovery
+        // therefore recognises a torn or orphaned container from its name
+        // alone -- which is why publication needs neither a staging rename nor
+        // a durable pending-blob intent, and pays two fewer fsync-class
+        // operations per batch than a stage-then-rename would.
         let write_started = Instant::now();
-        let staged = match container.as_deref() {
-            Some(relative) => match self.stage_container(relative, &payloads) {
-                Ok(staged) => Some(staged),
-                Err(error) => return Err(error),
-            },
+        let written = match container.as_deref() {
+            Some(relative) => Some(self.write_container(relative, &payloads)?),
             None => None,
         };
         record_local_publish_phase("container_write", write_started.elapsed());
 
-        let pending_started = Instant::now();
-        let pending_result = self.record_pending_blob(container.as_deref());
-        record_local_publish_phase("pending_intent", pending_started.elapsed());
-        if let Err(error) = pending_result {
-            let cleanup = staged
-                .as_deref()
-                .map_or(Ok(()), |path| self.discard_temporary_blob(path));
-            return match cleanup {
-                Ok(()) => Err(error),
-                Err(cleanup) => {
-                    Err(error.context(format!("staged container cleanup also failed: {cleanup:#}")))
-                }
-            };
-        }
-
-        let mut renamed = None;
         let mut directories = BTreeSet::new();
-        let rename_started = Instant::now();
-        if let (Some(relative), Some(tmp_path)) = (container.as_deref(), staged.as_deref()) {
-            let final_path = checked_join(&self.root, relative)?;
-            let directory = final_path
-                .parent()
-                .context("blob path has no parent")?
-                .to_path_buf();
-            if let Err(error) = filesystem.rename(tmp_path, &final_path) {
-                let publication = anyhow::Error::new(error).context(format!(
-                    "failed to publish local blob {} to {}",
-                    tmp_path.display(),
-                    final_path.display()
-                ));
-                let cleanup = self.rollback_uncommitted_batch(
-                    staged.as_deref(),
-                    None,
-                    &directories,
-                    container.as_deref(),
-                    filesystem,
-                );
-                return match cleanup {
-                    Ok(()) => Err(publication),
-                    Err(cleanup) => Err(publication
-                        .context(format!("pending-intent cleanup also failed: {cleanup:#}"))),
-                };
-            }
-            directories.insert(directory);
-            renamed = Some(final_path);
+        if let Some(path) = written.as_deref() {
+            directories.insert(
+                path.parent()
+                    .context("blob path has no parent")?
+                    .to_path_buf(),
+            );
         }
-        record_local_publish_phase("rename", rename_started.elapsed());
 
         let fsync_started = Instant::now();
         for directory in &directories {
@@ -813,24 +793,21 @@ impl Journal {
                     "failed to fsync published blob directory {}",
                     directory.display()
                 ));
-                let cleanup = self.rollback_uncommitted_batch(
-                    staged.as_deref(),
-                    renamed.as_deref(),
-                    &directories,
-                    container.as_deref(),
-                    filesystem,
-                );
+                let cleanup =
+                    self.rollback_uncommitted_batch(written.as_deref(), &directories, filesystem);
                 return match cleanup {
                     Ok(()) => Err(publication),
-                    Err(cleanup) => Err(publication
-                        .context(format!("pending-intent cleanup also failed: {cleanup:#}"))),
+                    Err(cleanup) => {
+                        Err(publication
+                            .context(format!("container cleanup also failed: {cleanup:#}")))
+                    }
                 };
             }
         }
         record_local_publish_phase("directory_fsync", fsync_started.elapsed());
 
         let commit_started = Instant::now();
-        self.commit_record_batch(&records, container.as_deref())?;
+        self.commit_record_batch(&records)?;
         record_local_publish_phase("record_commit", commit_started.elapsed());
         metrics::counter!("zerofs_writeback_local_publish_batches_total").increment(1);
         metrics::counter!("zerofs_writeback_local_publish_records_total")
@@ -840,22 +817,18 @@ impl Journal {
         Ok(records)
     }
 
-    /// Write one batch's payloads back to back into a staged container and
-    /// fsync it. This is the whole point of the container: N payloads cost one
+    /// Write one batch's payloads back to back into its container and fsync
+    /// it. This is the whole point of the container: N payloads cost one
     /// sequential write and one fsync instead of N of each.
-    fn stage_container(
+    fn write_container(
         &self,
         relative: &str,
         payloads: &[(usize, VerifiedPayload)],
     ) -> Result<PathBuf> {
-        let final_path = checked_join(&self.root, relative)?;
-        let shard = final_path.parent().context("blob path has no parent")?;
+        let path = checked_join(&self.root, relative)?;
+        let shard = path.parent().context("blob path has no parent")?;
         ensure_owner_directory(shard, true)?;
-        let name = final_path
-            .file_name()
-            .context("container path has no file name")?;
-        let tmp_path = self.root.join("tmp").join(name);
-        reject_symlink_if_present(&tmp_path, "journal temporary blob")?;
+        reject_symlink_if_present(&path, "journal container blob")?;
 
         let expected_len = payloads
             .iter()
@@ -863,10 +836,12 @@ impl Journal {
                 total.checked_add(payload.byte_len())
             })
             .context("publication container size overflow")?;
-        let staging = (|| -> Result<()> {
-            let mut file = open_owner_file(&tmp_path, false).with_context(|| {
-                format!("failed to create staged container {}", tmp_path.display())
-            })?;
+        // Create first, and only arm the cleanup once the file exists: a
+        // failure to create it means there is nothing of ours to unlink, and
+        // whatever occupies the name is not ours to remove.
+        let mut file = open_owner_file(&path, false)
+            .with_context(|| format!("failed to create container {}", path.display()))?;
+        let write = (|| -> Result<()> {
             write_all_vectored(
                 &mut file,
                 &payloads
@@ -874,30 +849,27 @@ impl Journal {
                     .map(|(_, payload)| payload.bytes())
                     .collect::<Vec<_>>(),
             )
-            .context("failed to write staged container")?;
-            file.sync_all()
-                .context("failed to fsync staged container")?;
+            .context("failed to write container")?;
+            file.sync_all().context("failed to fsync container")?;
             let written_len = file
                 .metadata()
-                .context("failed to inspect staged container")?
+                .context("failed to inspect container")?
                 .len();
             if written_len != expected_len {
-                bail!(
-                    "staged container length mismatch: expected {expected_len}, got {written_len}"
-                );
+                bail!("container length mismatch: expected {expected_len}, got {written_len}");
             }
             Ok(())
         })();
-        if let Err(error) = staging {
-            let cleanup = self.discard_temporary_blob(&tmp_path);
+        if let Err(error) = write {
+            let cleanup = self.discard_container(&path);
             return match cleanup {
                 Ok(()) => Err(error),
                 Err(cleanup) => {
-                    Err(error.context(format!("staged container cleanup also failed: {cleanup:#}")))
+                    Err(error.context(format!("container cleanup also failed: {cleanup:#}")))
                 }
             };
         }
-        Ok(tmp_path)
+        Ok(path)
     }
 
     fn discard_prepared_batch(&self, prepared: Vec<PreparedMutation>) -> Result<()> {
@@ -917,44 +889,22 @@ impl Journal {
 
     fn rollback_uncommitted_batch(
         &self,
-        staged: Option<&Path>,
-        renamed: Option<&Path>,
+        written: Option<&Path>,
         directories: &BTreeSet<PathBuf>,
-        pending: Option<&str>,
         filesystem: &dyn PublicationFilesystem,
     ) -> Result<()> {
         let mut first_error = None;
-        let mut removed_temporary = false;
-        if let Some(path) = staged {
+        if let Some(path) = written {
             match fs::remove_file(path) {
-                Ok(()) => removed_temporary = true,
+                Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => {
                     first_error = Some(
                         anyhow::Error::new(error)
-                            .context("failed to remove staged publication container"),
+                            .context("failed to remove uncommitted publication container"),
                     );
                 }
             }
-        }
-        if let Some(path) = renamed {
-            match fs::remove_file(path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) if first_error.is_none() => {
-                    first_error = Some(
-                        anyhow::Error::new(error)
-                            .context("failed to remove uncommitted published blob"),
-                    );
-                }
-                Err(_) => {}
-            }
-        }
-        if removed_temporary
-            && let Err(error) = filesystem.sync_directory(&self.root.join("tmp"))
-            && first_error.is_none()
-        {
-            first_error = Some(error.context("failed to fsync journal tmp directory cleanup"));
         }
         for directory in directories {
             if let Err(error) = filesystem.sync_directory(directory)
@@ -966,10 +916,10 @@ impl Journal {
                 )));
             }
         }
-        if let Some(error) = first_error {
-            return Err(error);
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
         }
-        self.clear_pending_blob(pending)
     }
 
     fn require_contiguous_local_batch(&self, prepared: &[PreparedMutation]) -> Result<()> {
@@ -1006,60 +956,11 @@ impl Journal {
         Ok(())
     }
 
-    /// Durably note the container about to appear under `blobs/`. A crash
-    /// between the rename and the record commit leaves this note behind, and
-    /// recovery uses it to unlink the orphan.
-    fn record_pending_blob(&self, pending: Option<&str>) -> Result<()> {
-        let Some(relative) = pending else {
-            return Ok(());
-        };
-        let _write = self.write_gate.lock();
-        let mut transaction = self
-            .database
-            .begin_write()
-            .context("failed to record pending blob batch")?;
-        transaction
-            .set_durability(Durability::Immediate)
-            .context("failed to set journal durability")?;
-        {
-            let mut table = transaction
-                .open_table(PENDING_BLOBS)
-                .context("failed to open pending blob table")?;
-            table
-                .insert(relative, relative.as_bytes())
-                .context("failed to store pending blob")?;
-        }
-        transaction
-            .commit()
-            .context("failed to commit pending blob batch")
-    }
-
-    fn clear_pending_blob(&self, pending: Option<&str>) -> Result<()> {
-        let Some(relative) = pending else {
-            return Ok(());
-        };
-        let _write = self.write_gate.lock();
-        let mut transaction = self
-            .database
-            .begin_write()
-            .context("failed to clear pending blob batch")?;
-        transaction
-            .set_durability(Durability::Immediate)
-            .context("failed to set journal durability")?;
-        {
-            let mut table = transaction
-                .open_table(PENDING_BLOBS)
-                .context("failed to open pending blob table")?;
-            table
-                .remove(relative)
-                .context("failed to clear pending blob")?;
-        }
-        transaction
-            .commit()
-            .context("failed to commit pending blob cleanup")
-    }
-
-    fn commit_record_batch(&self, records: &[MutationRecord], pending: Option<&str>) -> Result<()> {
+    /// The batch's single durability point. Inserting the records and
+    /// advancing `LOCAL_SEQ_KEY` in one immediate transaction is what makes a
+    /// batch atomic, and what makes `last <= LOCAL_SEQ` a sound test for
+    /// "this container committed".
+    fn commit_record_batch(&self, records: &[MutationRecord]) -> Result<()> {
         let Some(last) = records.last() else {
             return Ok(());
         };
@@ -1102,14 +1003,6 @@ impl Journal {
                 }
             }
             drop(table);
-            if let Some(relative) = pending {
-                let mut pending_table = transaction
-                    .open_table(PENDING_BLOBS)
-                    .context("failed to open pending blob table")?;
-                pending_table
-                    .remove(relative)
-                    .context("failed to clear pending blob")?;
-            }
             write_value(&mut meta, LOCAL_SEQ_KEY, &last.sequence)?;
             write_value(&mut meta, LOCAL_BYTES_COMPLETED_KEY, &total_completed)?;
         }
@@ -1124,11 +1017,14 @@ impl Journal {
         Ok(())
     }
 
-    fn discard_temporary_blob(&self, path: &Path) -> Result<()> {
+    fn discard_container(&self, path: &Path) -> Result<()> {
         match fs::remove_file(path) {
-            Ok(()) => sync_directory(self.root.join("tmp")),
+            Ok(()) => match path.parent() {
+                Some(parent) => sync_directory(parent),
+                None => Ok(()),
+            },
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error).context("failed to remove prepared temporary blob"),
+            Err(error) => Err(error).context("failed to remove uncommitted container"),
         }
     }
 
@@ -1499,6 +1395,52 @@ impl Journal {
             transaction
                 .commit()
                 .context("failed to commit pending cleanup")?;
+        }
+        self.remove_uncommitted_containers()
+    }
+
+    /// Unlink every container a crash left behind.
+    ///
+    /// A batch commits its records and `LOCAL_SEQ_KEY` in one immediate
+    /// transaction, so a container is committed exactly when the local
+    /// watermark has reached its last member. Anything above the watermark was
+    /// interrupted before that commit -- possibly mid-write -- and no record
+    /// references it, so it is unlinked here, before recovery validation would
+    /// reject it as unreferenced.
+    fn remove_uncommitted_containers(&self) -> Result<()> {
+        let local_seq = self.progress()?.local_seq;
+        let mut removed = BTreeSet::new();
+        for shard in
+            fs::read_dir(self.root.join("blobs")).context("failed to scan blob directory")?
+        {
+            let shard = shard.context("failed to read blob shard")?;
+            if !fs::symlink_metadata(shard.path())
+                .context("failed to inspect blob shard")?
+                .is_dir()
+            {
+                continue;
+            }
+            for blob in fs::read_dir(shard.path()).context("failed to scan blob shard")? {
+                let path = blob.context("failed to read blob entry")?.path();
+                let Some(last) = path.to_str().and_then(container_last_sequence) else {
+                    continue;
+                };
+                if last <= local_seq {
+                    continue;
+                }
+                match fs::remove_file(&path) {
+                    Ok(()) => {
+                        removed.insert(shard.path());
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(error).context("failed to remove uncommitted container");
+                    }
+                }
+            }
+        }
+        for shard in removed {
+            sync_directory(shard)?;
         }
         Ok(())
     }
@@ -2378,10 +2320,6 @@ mod tests {
     }
 
     impl PublicationFilesystem for RecordingPublicationFilesystem {
-        fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
-            fs::rename(from, to)
-        }
-
         fn sync_directory(&self, path: &Path) -> anyhow::Result<()> {
             let call = {
                 let mut calls = self.sync_calls.lock().unwrap();
@@ -2900,10 +2838,10 @@ mod tests {
     }
 
     #[test]
-    fn batch_rename_failure_rolls_back_the_whole_container() {
+    fn container_write_failure_fails_the_whole_batch() {
         let temp = tempfile::tempdir().unwrap();
         let journal = open_temp_journal(&temp, "bucket-a");
-        // The batch renames one container, so parking a directory on its name
+        // The batch writes one container, so parking a directory on its name
         // fails the whole batch -- no member can land without the others.
         let container = journal.root().join(super::container_relative_path(1, 2));
         let first_payload = VerifiedPayload::new(Bytes::from_static(b"one"));
@@ -2919,7 +2857,7 @@ mod tests {
         let error = journal.publish_batch(vec![first, second]).unwrap_err();
 
         assert!(
-            format!("{error:#}").contains("failed to publish local blob"),
+            format!("{error:#}").contains("failed to create container"),
             "{error:#}"
         );
         assert!(container.is_dir());
@@ -3371,7 +3309,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_blob_publication_clears_pending_intent_and_temporary_bytes() {
+    fn failed_container_publication_leaves_no_intent_or_stray_bytes() {
         let temp = tempfile::tempdir().unwrap();
         let journal = open_temp_journal(&temp, "bucket-a");
         let record = put_record(1, "segments/1", b"payload");
@@ -3387,7 +3325,7 @@ mod tests {
         let error = journal.commit_put(record, b"payload").unwrap_err();
 
         assert!(
-            format!("{error:#}").contains("failed to publish local blob"),
+            format!("{error:#}").contains("failed to create container"),
             "{error:#}"
         );
         assert_eq!(journal.snapshot().unwrap().pending_blob_count, 0);
@@ -3692,10 +3630,12 @@ mod tests {
         assert_eq!(recovered.read_blob(2).unwrap(), b"payload-2");
     }
 
-    /// A container torn by a crash mid-write never got renamed, so it is a
-    /// tmp file; recovery wipes it without touching committed containers.
+    /// The production crash shape: a container is written straight to its
+    /// final name, so an interrupted batch leaves a possibly-torn file under
+    /// `blobs/` with no intent row anywhere. Its name puts it above the local
+    /// watermark, which is the whole signal recovery needs.
     #[test]
-    fn reopening_discards_a_partially_written_container_and_keeps_committed_ones() {
+    fn reopening_discards_a_partially_written_container_above_the_local_watermark() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("writeback");
         let journal = Journal::open(&root, identity("bucket-a")).unwrap();
@@ -3707,16 +3647,62 @@ mod tests {
                 .unwrap()
                 .relative,
         );
-        let torn = root.join("tmp/0000000000000004-0000000000000006.blobs");
+        let torn = root.join(super::container_relative_path(4, 6));
         fs::write(&torn, b"half-written").unwrap();
+        fs::set_permissions(&torn, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(journal.snapshot().unwrap().pending_blob_count, 0);
         drop(journal);
 
         let recovered = Journal::open(&root, identity("bucket-a")).unwrap();
 
-        assert!(!torn.exists());
+        assert!(!torn.exists(), "the torn container must be unlinked");
         assert!(container.exists());
         assert_eq!(recovered.progress().unwrap().local_seq, 3);
         assert_eq!(recovered.read_blob(2).unwrap(), b"payload-2");
+    }
+
+    /// Publication records no pending-blob intent at all: the container's
+    /// name is the durable evidence, so the batch's critical path carries no
+    /// extra immediate commit.
+    #[test]
+    fn publication_records_no_pending_blob_intent() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = open_temp_journal(&temp, "bucket-a");
+
+        journal
+            .publish_batch(prepare_puts(&journal, 1..=4))
+            .unwrap();
+
+        assert_eq!(journal.snapshot().unwrap().pending_blob_count, 0);
+        assert_eq!(fs::read_dir(journal.root().join("tmp")).unwrap().count(), 0);
+    }
+
+    /// Recovery must not confuse a container that merely reaches the
+    /// watermark with one that overshoots it: the committed batch stays, and
+    /// the interrupted one starting at the very next sequence goes.
+    #[test]
+    fn reopening_keeps_the_container_that_ends_exactly_at_the_local_watermark() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("writeback");
+        let journal = Journal::open(&root, identity("bucket-a")).unwrap();
+        let committed = journal
+            .publish_batch(prepare_puts(&journal, 1..=4))
+            .unwrap();
+        let container = root.join(
+            super::BlobRef::parse(committed[0].blob_path().unwrap())
+                .unwrap()
+                .relative,
+        );
+        let interrupted = root.join(super::container_relative_path(5, 5));
+        fs::write(&interrupted, b"x").unwrap();
+        fs::set_permissions(&interrupted, fs::Permissions::from_mode(0o600)).unwrap();
+        drop(journal);
+
+        let recovered = Journal::open(&root, identity("bucket-a")).unwrap();
+
+        assert!(container.exists(), "the committed container must survive");
+        assert!(!interrupted.exists());
+        assert_eq!(recovered.read_blob(4).unwrap(), b"payload-4");
     }
 
     /// Journals written before containers store one whole-file blob per
