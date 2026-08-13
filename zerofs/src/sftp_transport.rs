@@ -786,6 +786,38 @@ impl OpenSshTransportSession {
             ssh_process: None,
         })
     }
+
+    /// Shared open/write/sync/close chain behind the three write entry points.
+    /// `create` picks the create-and-truncate open used by whole-file writes
+    /// over the write-only open used by ranged writes; `durable` decides
+    /// whether the handle is fsynced before it is closed.
+    async fn write_chunks(
+        &self,
+        path: &std::path::Path,
+        offset: u64,
+        chunks: Vec<Bytes>,
+        create: bool,
+        durable: bool,
+    ) -> Result<(), TransportError> {
+        let sftp = self.sftp.as_ref().expect("open transport owns SFTP client");
+        let opened = if create {
+            sftp.create(path).await
+        } else {
+            let mut options = sftp.options();
+            options.write(true);
+            options.open(path).await
+        };
+        let mut file = opened.map_err(|error| map_sftp_error(path, error))?;
+        write_file_pipelined(&file, path, offset, chunks).await?;
+        if durable {
+            file.sync_all()
+                .await
+                .map_err(|error| map_sftp_error(path, error))?;
+        }
+        file.close()
+            .await
+            .map_err(|error| map_sftp_error(path, error))
+    }
 }
 
 #[async_trait]
@@ -990,18 +1022,7 @@ impl TransportSession for OpenSshTransportSession {
         path: &std::path::Path,
         chunks: Vec<Bytes>,
     ) -> Result<(), TransportError> {
-        let sftp = self.sftp.as_ref().expect("open transport owns SFTP client");
-        let mut file = sftp
-            .create(path)
-            .await
-            .map_err(|error| map_sftp_error(path, error))?;
-        write_file_pipelined(&file, path, 0, chunks).await?;
-        file.sync_all()
-            .await
-            .map_err(|error| map_sftp_error(path, error))?;
-        file.close()
-            .await
-            .map_err(|error| map_sftp_error(path, error))
+        self.write_chunks(path, 0, chunks, true, true).await
     }
 
     async fn write_file_at_durable(
@@ -1010,20 +1031,7 @@ impl TransportSession for OpenSshTransportSession {
         offset: u64,
         chunks: Vec<Bytes>,
     ) -> Result<(), TransportError> {
-        let sftp = self.sftp.as_ref().expect("open transport owns SFTP client");
-        let mut options = sftp.options();
-        options.write(true);
-        let mut file = options
-            .open(path)
-            .await
-            .map_err(|error| map_sftp_error(path, error))?;
-        write_file_pipelined(&file, path, offset, chunks).await?;
-        file.sync_all()
-            .await
-            .map_err(|error| map_sftp_error(path, error))?;
-        file.close()
-            .await
-            .map_err(|error| map_sftp_error(path, error))
+        self.write_chunks(path, offset, chunks, false, true).await
     }
 
     async fn write_file_at(
@@ -1032,17 +1040,7 @@ impl TransportSession for OpenSshTransportSession {
         offset: u64,
         chunks: Vec<Bytes>,
     ) -> Result<(), TransportError> {
-        let sftp = self.sftp.as_ref().expect("open transport owns SFTP client");
-        let mut options = sftp.options();
-        options.write(true);
-        let file = options
-            .open(path)
-            .await
-            .map_err(|error| map_sftp_error(path, error))?;
-        write_file_pipelined(&file, path, offset, chunks).await?;
-        file.close()
-            .await
-            .map_err(|error| map_sftp_error(path, error))
+        self.write_chunks(path, offset, chunks, false, false).await
     }
 
     async fn read_exact(
