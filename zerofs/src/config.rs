@@ -599,9 +599,47 @@ fn redacted_storage_url(raw: &str) -> String {
     url.into()
 }
 
+fn url_scheme(raw: &str) -> Option<&str> {
+    raw.split_once(':').map(|(scheme, _)| scheme)
+}
+
 fn has_sftp_scheme(raw: &str) -> bool {
-    raw.split_once(':')
-        .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("sftp"))
+    url_scheme(raw).is_some_and(|scheme| scheme.eq_ignore_ascii_case("sftp"))
+}
+
+/// What the configured storage backend can do. One table so a backend that
+/// lacks a feature is declared once instead of re-derived from scheme names at
+/// every validation site.
+struct BackendCapabilities {
+    /// Name used in operator-facing "not supported" diagnostics.
+    display_name: &'static str,
+    supports_storage_class: bool,
+    supports_replication: bool,
+}
+
+impl BackendCapabilities {
+    /// Backends we hold no restrictions for: object stores, and any scheme we
+    /// do not recognize (the historical default).
+    fn full(display_name: &'static str) -> Self {
+        Self {
+            display_name,
+            supports_storage_class: true,
+            supports_replication: true,
+        }
+    }
+}
+
+/// Resolve backend capabilities from the storage URL scheme. This is the only
+/// place a scheme name decides what a backend supports.
+fn backend_capabilities(url: &str) -> BackendCapabilities {
+    match url_scheme(url) {
+        Some(scheme) if scheme.eq_ignore_ascii_case("sftp") => BackendCapabilities {
+            display_name: "SFTP",
+            supports_storage_class: false,
+            supports_replication: false,
+        },
+        _ => BackendCapabilities::full("object storage"),
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -1336,16 +1374,24 @@ impl Settings {
     pub fn validate(&self) -> Result<()> {
         self.servers.validate()?;
 
+        // Parse the endpoint first so a malformed SFTP URL still reports the URL
+        // error ahead of any capability diagnostic.
         if self.sftp_endpoint()?.is_some() {
             self.sftp.clone().unwrap_or_default().validate()?;
-            if self.replication.is_some() {
-                anyhow::bail!(
-                    "[replication] is not supported with an SFTP storage backend; use single-node mode"
-                );
-            }
-            if self.storage.storage_class.is_some() {
-                anyhow::bail!("[storage] storage_class is not supported with an SFTP backend");
-            }
+        }
+
+        let backend = backend_capabilities(&self.storage.url);
+        if !backend.supports_replication && self.replication.is_some() {
+            anyhow::bail!(
+                "[replication] is not supported with an {} storage backend; use single-node mode",
+                backend.display_name
+            );
+        }
+        if !backend.supports_storage_class && self.storage.storage_class.is_some() {
+            anyhow::bail!(
+                "[storage] storage_class is not supported with an {} backend",
+                backend.display_name
+            );
         }
 
         if let Some(replication) = &self.replication {
