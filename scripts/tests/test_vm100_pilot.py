@@ -80,7 +80,8 @@ class FakeRunner(Runner):
         self.calls: list[tuple[tuple[str, ...], bool]] = []
         self.active: set[str] = set()
         self.fail_start: str | None = None
-        self.max_write_zeroes_sectors = "0"
+        self.write_zeroes_max_bytes: str | None = None
+        self.max_write_zeroes_sectors: str | None = "0"
 
     def run(
         self,
@@ -105,8 +106,18 @@ class FakeRunner(Runner):
         if (
             args[:1] == ("cat",)
             and args[1].startswith("/sys/block/nbd")
+            and args[1].endswith("/queue/write_zeroes_max_bytes")
+        ):
+            if self.write_zeroes_max_bytes is None:
+                return CompletedProcess(args, 1, "", "No such file")
+            return CompletedProcess(args, 0, self.write_zeroes_max_bytes + "\n", "")
+        if (
+            args[:1] == ("cat",)
+            and args[1].startswith("/sys/block/nbd")
             and args[1].endswith("/queue/max_write_zeroes_sectors")
         ):
+            if self.max_write_zeroes_sectors is None:
+                return CompletedProcess(args, 1, "", "No such file")
             return CompletedProcess(args, 0, self.max_write_zeroes_sectors + "\n", "")
         if args[:1] == ("cat",) and Path(args[1]).is_file():
             return CompletedProcess(args, 0, Path(args[1]).read_text(), "")
@@ -915,6 +926,25 @@ class LifecycleTests(unittest.TestCase):
             self.runner.calls,
         )
 
+    def test_modern_write_zeroes_limit_refuses_configured_device_before_mount(
+        self,
+    ) -> None:
+        config = replace(self.config, nbd_device=Path("/dev/nbd7"))
+        self.runner.write_zeroes_max_bytes = "4294966784"
+        lifecycle = PilotLifecycle(config, self.runner)
+
+        with self.assertRaisesRegex(RuntimeError, r"/dev/nbd7.*4294966784"):
+            lifecycle.start()
+
+        self.assertIn(
+            (("cat", "/sys/block/nbd7/queue/write_zeroes_max_bytes"), False),
+            self.runner.calls,
+        )
+        self.assertNotIn(
+            (("cat", "/sys/block/nbd7/queue/max_write_zeroes_sectors"), False),
+            self.runner.calls,
+        )
+
     def test_storage_client_restart_keeps_the_daemon_running(self) -> None:
         self.runner.active.update(
             (self.config.service, self.config.client_service, self.config.mount_unit)
@@ -1131,6 +1161,9 @@ class FreshResetTests(unittest.TestCase):
                 events.append("activate-fresh-state")
                 return Path("/var/lib/zerofs/nbd-pilot-reset-rollback-test")
 
+            def _reset_nbd_module(self) -> None:
+                events.append("reset-nbd-module")
+
             def _restore_old_state(self, backup: Path) -> None:
                 events.append("restore-old-state")
 
@@ -1170,6 +1203,7 @@ class FreshResetTests(unittest.TestCase):
                 "status",
                 "stage",
                 "stop",
+                "reset-nbd-module",
                 "install-new",
                 "activate-fresh-state",
                 "start-daemon",
@@ -1185,6 +1219,68 @@ class FreshResetTests(unittest.TestCase):
                 "remove-seed",
             ],
         )
+
+    def test_fresh_reset_reloads_nbd_only_after_every_device_is_detached(self) -> None:
+        class ModuleRunner(FakeRunner):
+            def run(
+                self, argv: Sequence[str | Path], **kwargs: Any
+            ) -> CompletedProcess[str]:
+                args = tuple(str(value) for value in argv)
+                self.calls.append((args, bool(kwargs.get("sudo", False))))
+                values = {
+                    ("find", "/sys/block", "-maxdepth", "1", "-type", "l", "-name", "nbd*", "-printf", "%f\n"): "nbd1\nnbd0\n",
+                    ("cat", "/sys/module/nbd/parameters/nbds_max"): "16\n",
+                    ("cat", "/sys/module/nbd/parameters/max_part"): "31\n",
+                    ("cat", "/sys/block/nbd0/size"): "0\n",
+                    ("cat", "/sys/block/nbd1/size"): "0\n",
+                }
+                if args in values:
+                    return CompletedProcess(args, 0, values[args], "")
+                if args in {
+                    ("cat", "/sys/block/nbd0/pid"),
+                    ("cat", "/sys/block/nbd1/pid"),
+                }:
+                    return CompletedProcess(args, 1, "", "No such file")
+                return CompletedProcess(args, 0, "", "")
+
+        runner = ModuleRunner()
+        resetter = FreshResetter(self.config, runner, object())  # type: ignore[arg-type]
+
+        resetter._reset_nbd_module()
+
+        self.assertEqual(
+            runner.calls[-2:],
+            [
+                (("modprobe", "-r", "nbd"), True),
+                (("modprobe", "nbd", "nbds_max=16", "max_part=31"), True),
+            ],
+        )
+
+    def test_fresh_reset_refuses_to_reload_nbd_with_an_attached_device(self) -> None:
+        class AttachedRunner(FakeRunner):
+            def run(
+                self, argv: Sequence[str | Path], **kwargs: Any
+            ) -> CompletedProcess[str]:
+                args = tuple(str(value) for value in argv)
+                self.calls.append((args, bool(kwargs.get("sudo", False))))
+                values = {
+                    ("find", "/sys/block", "-maxdepth", "1", "-type", "l", "-name", "nbd*", "-printf", "%f\n"): "nbd0\n",
+                    ("cat", "/sys/module/nbd/parameters/nbds_max"): "16\n",
+                    ("cat", "/sys/module/nbd/parameters/max_part"): "31\n",
+                    ("cat", "/sys/block/nbd0/size"): "8\n",
+                    ("cat", "/sys/block/nbd0/pid"): "1234\n",
+                }
+                if args in values:
+                    return CompletedProcess(args, 0, values[args], "")
+                return CompletedProcess(args, 0, "", "")
+
+        runner = AttachedRunner()
+        resetter = FreshResetter(self.config, runner, object())  # type: ignore[arg-type]
+
+        with self.assertRaisesRegex(RuntimeError, r"nbd0.*size=8.*pid=1234"):
+            resetter._reset_nbd_module()
+
+        self.assertFalse(any(call[0][:1] == ("modprobe",) for call in runner.calls))
 
     def test_fresh_reset_restores_the_old_stack_after_provision_failure(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "injected provision failure"):

@@ -229,6 +229,69 @@ class FreshResetter:
         self.config.require_reset_state_backup(backup)
         self.runner.run(["rm", "-rf", "--", backup], sudo=True)
 
+    def _reset_nbd_module(self) -> None:
+        parameters: dict[str, int] = {}
+        for name in ("nbds_max", "max_part"):
+            path = Path("/sys/module/nbd/parameters") / name
+            raw = self.runner.run(["cat", path]).stdout.strip()
+            try:
+                value = int(raw)
+            except ValueError as error:
+                raise RuntimeError(f"invalid NBD module parameter {path}: {raw!r}") from error
+            if value < 0 or (name == "nbds_max" and value == 0):
+                raise RuntimeError(f"invalid NBD module parameter {path}: {value}")
+            parameters[name] = value
+
+        output = self.runner.run(
+            [
+                "find",
+                "/sys/block",
+                "-maxdepth",
+                "1",
+                "-type",
+                "l",
+                "-name",
+                "nbd*",
+                "-printf",
+                "%f\n",
+            ]
+        ).stdout
+        devices = sorted(set(output.splitlines()))
+        if not devices or any(re.fullmatch(r"nbd\d+", device) is None for device in devices):
+            raise RuntimeError(f"could not enumerate NBD devices safely: {devices!r}")
+
+        attached: list[str] = []
+        for device in devices:
+            size_path = Path("/sys/block") / device / "size"
+            raw_size = self.runner.run(["cat", size_path]).stdout.strip()
+            try:
+                size = int(raw_size)
+            except ValueError as error:
+                raise RuntimeError(f"invalid NBD size {size_path}: {raw_size!r}") from error
+            pid_result = self.runner.run(
+                ["cat", Path("/sys/block") / device / "pid"], check=False
+            )
+            pid = pid_result.stdout.strip() if pid_result.returncode == 0 else ""
+            if size != 0 or pid not in {"", "0"}:
+                attached.append(f"{device} size={size} pid={pid or 'none'}")
+        if attached:
+            raise RuntimeError(
+                "refusing to reload nbd while a device is attached: "
+                + "; ".join(attached)
+            )
+
+        self.runner.run(["modprobe", "-r", "nbd"], sudo=True, timeout=60)
+        self.runner.run(
+            [
+                "modprobe",
+                "nbd",
+                f"nbds_max={parameters['nbds_max']}",
+                f"max_part={parameters['max_part']}",
+            ],
+            sudo=True,
+            timeout=60,
+        )
+
     def _provision(self) -> None:
         self.runner.run(
             [
@@ -340,6 +403,7 @@ class FreshResetter:
         state_backup: Path | None = None
         try:
             self.lifecycle.stop()
+            self._reset_nbd_module()
             self._install_config_text(new_config)
             state_backup = self._activate_fresh_state()
             self.lifecycle.start_daemon()

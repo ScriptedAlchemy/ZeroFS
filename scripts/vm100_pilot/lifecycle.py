@@ -134,14 +134,22 @@ class PilotLifecycle:
             raise RuntimeError(f"{self.config.mountpoint} remains mounted")
 
     def _verify_write_zeroes_disabled(self) -> None:
-        queue_limit = (
-            Path("/sys/block")
-            / self.config.nbd_device.name
-            / "queue/max_write_zeroes_sectors"
+        queue_dir = (
+            Path("/sys/block") / self.config.nbd_device.name / "queue"
         )
-        result = self.runner.run(["cat", queue_limit], check=False)
-        if result.returncode != 0:
-            raise RuntimeError(f"could not read {queue_limit}")
+        queue_limit: Path | None = None
+        result = None
+        for attribute in ("write_zeroes_max_bytes", "max_write_zeroes_sectors"):
+            candidate = queue_dir / attribute
+            candidate_result = self.runner.run(["cat", candidate], check=False)
+            if candidate_result.returncode == 0:
+                queue_limit = candidate
+                result = candidate_result
+                break
+        if queue_limit is None or result is None:
+            raise RuntimeError(
+                f"could not read a write-zeroes queue limit below {queue_dir}"
+            )
         raw_value = result.stdout.strip()
         try:
             value = int(raw_value)
@@ -152,7 +160,7 @@ class PilotLifecycle:
             ) from error
         if value != 0:
             raise RuntimeError(
-                f"{self.config.nbd_device} reports max_write_zeroes_sectors={value}; "
+                f"{self.config.nbd_device} reports {queue_limit.name}={value}; "
                 f"refusing to mount {self.config.mountpoint}. Either reload the nbd "
                 "module only after every NBD device is unmounted and disconnected, "
                 "or configure a never-used ZEROFS_PILOT_NBD_DEVICE and update the "

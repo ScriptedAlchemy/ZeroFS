@@ -122,8 +122,11 @@ the same Linux NBD device may leave its old queue limits in place. Before
 mounting, verify the configured device reports zero for `WRITE_ZEROES`:
 
 ```bash
-cat /sys/block/nbd0/queue/max_write_zeroes_sectors
+cat /sys/block/nbd0/queue/write_zeroes_max_bytes
 ```
+
+Older kernels may expose the equivalent limit as
+`max_write_zeroes_sectors`; require whichever attribute exists to report zero.
 
 <Warning>
   If the result is nonzero, do not mount it: filesystems such as XFS may issue
