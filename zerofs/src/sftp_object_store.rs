@@ -601,6 +601,17 @@ impl RemoteSession for PooledRemoteSession {
                         tokio::time::sleep(std::time::Duration::from_millis(100 * attempt as u64))
                             .await;
                     }
+                    Err(error) if error.is_pool_closed() => {
+                        // The pool closed mid-retry during shutdown. The
+                        // staging file remains as invisible debris the next
+                        // boot never observes — a warning, not a failed stop.
+                        tracing::warn!(
+                            path = %path.display(),
+                            attempt,
+                            "SFTP staging cleanup remains required because the session pool closed during shutdown"
+                        );
+                        return;
+                    }
                     Err(error) => {
                         pool.record_cleanup_debt(&path, &error);
                         tracing::warn!(
@@ -2162,6 +2173,427 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(state.remove_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[derive(Debug, Default)]
+    struct SleepingRetryState {
+        remove_calls: AtomicUsize,
+        second_attempt_failed: Notify,
+    }
+
+    #[derive(Debug, Clone)]
+    struct SleepingRetryFactory(Arc<SleepingRetryState>);
+
+    #[async_trait]
+    impl SessionFactory for SleepingRetryFactory {
+        async fn open(
+            &self,
+            _force: tokio_util::sync::CancellationToken,
+        ) -> Result<Box<dyn TransportSession>, TransportError> {
+            Ok(Box::new(SleepingRetrySession(self.0.clone())))
+        }
+    }
+
+    #[derive(Debug)]
+    struct SleepingRetrySession(Arc<SleepingRetryState>);
+
+    #[async_trait]
+    impl TransportSession for SleepingRetrySession {
+        fn capabilities(&self) -> SftpCapabilities {
+            SftpCapabilities {
+                fsync: true,
+                hardlink: true,
+                posix_rename: true,
+            }
+        }
+
+        async fn ensure_directory_component(
+            &mut self,
+            _path: &FilePath,
+        ) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        async fn write_file_durable(
+            &mut self,
+            _path: &FilePath,
+            _chunks: Vec<Bytes>,
+        ) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        async fn hard_link(
+            &mut self,
+            _from: &FilePath,
+            _to: &FilePath,
+        ) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        async fn remove_file(&mut self, _path: &FilePath) -> Result<(), TransportError> {
+            let call = self.0.remove_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if call <= 2 {
+                if call == 2 {
+                    self.0.second_attempt_failed.notify_one();
+                }
+                return Err(TransportError::Operation(
+                    "injected transient staging removal failure".to_owned(),
+                ));
+            }
+            Ok(())
+        }
+
+        async fn close(
+            self: Box<Self>,
+            _force: tokio_util::sync::CancellationToken,
+        ) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    /// The vm100 pilot shutdown defect: a staging-cleanup retry that is
+    /// sleeping between attempts holds no session, so nothing in the activity
+    /// drain used to protect it — `fail_closed` landed first, the retry woke
+    /// into a closed pool, and every service stop with pending staged uploads
+    /// exited nonzero. Shutdown must give already-scheduled cleanups a
+    /// bounded window while the pool can still serve them.
+    #[tokio::test]
+    async fn cleanup_retry_sleeping_between_attempts_survives_pool_shutdown() {
+        let state = Arc::new(SleepingRetryState::default());
+        let pool = crate::sftp_transport::SftpSessionPool::new_writable(
+            Arc::new(SleepingRetryFactory(state.clone())),
+            1,
+            1,
+            1,
+        )
+        .await
+        .unwrap();
+        let store = SftpObjectStore::new(pool.clone(), ObjectPath::from("root")).unwrap();
+
+        store
+            .put_opts(
+                &ObjectPath::from("root/object"),
+                PutPayload::from_static(b"payload"),
+                PutOptions::from(PutMode::Create),
+            )
+            .await
+            .expect("hardlink committed even though staging removal keeps failing");
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            state.second_attempt_failed.notified(),
+        )
+        .await
+        .expect("the pool-owned cleanup retry must run its first attempt");
+
+        // The retry task is now sleeping before its final attempt with no
+        // session checked out. Shutdown must let that attempt finish instead
+        // of closing the pool underneath it and reporting a failed stop.
+        pool.shutdown()
+            .await
+            .expect("staging cleanup pending at shutdown must not fail the stop");
+        assert_eq!(
+            state.remove_calls.load(Ordering::SeqCst),
+            3,
+            "the sleeping retry must complete during the shutdown grace window"
+        );
+    }
+
+    /// Once the pool is closed, a cleanup that can no longer run leaves the
+    /// staging file behind as invisible debris. That is a warning, not a
+    /// shutdown failure: the next boot's journal replay publishes through
+    /// fresh staging names, so debris never blocks correctness.
+    #[tokio::test]
+    async fn cleanup_scheduled_after_pool_close_does_not_fail_shutdown() {
+        let state = Arc::new(SleepingRetryState::default());
+        let pool = crate::sftp_transport::SftpSessionPool::new_writable(
+            Arc::new(SleepingRetryFactory(state.clone())),
+            1,
+            1,
+            1,
+        )
+        .await
+        .unwrap();
+        pool.begin_shutdown();
+
+        let session: Arc<dyn RemoteSession> = Arc::new(PooledRemoteSession { pool: pool.clone() });
+        drop(StagingCleanup::new(
+            session,
+            PathBuf::from("root/manifest/.zerofs-staging-torn.manifest-id"),
+        ));
+
+        pool.shutdown()
+            .await
+            .expect("debris left by a post-close cleanup must not fail the stop");
+        assert_eq!(
+            state.remove_calls.load(Ordering::SeqCst),
+            0,
+            "a closed pool must not dial new sessions for cleanup"
+        );
+    }
+
+    #[derive(Debug, Default)]
+    struct SharedRemoteFs {
+        files: Mutex<HashMap<PathBuf, Bytes>>,
+        directories: Mutex<HashSet<PathBuf>>,
+    }
+
+    #[derive(Debug, Clone)]
+    struct SharedRemoteFactory(Arc<SharedRemoteFs>);
+
+    #[async_trait]
+    impl SessionFactory for SharedRemoteFactory {
+        async fn open(
+            &self,
+            _force: tokio_util::sync::CancellationToken,
+        ) -> Result<Box<dyn TransportSession>, TransportError> {
+            Ok(Box::new(SharedRemoteSession(self.0.clone())))
+        }
+    }
+
+    #[derive(Debug)]
+    struct SharedRemoteSession(Arc<SharedRemoteFs>);
+
+    #[async_trait]
+    impl TransportSession for SharedRemoteSession {
+        fn capabilities(&self) -> SftpCapabilities {
+            SftpCapabilities {
+                fsync: true,
+                hardlink: true,
+                posix_rename: true,
+            }
+        }
+
+        async fn read_object(
+            &mut self,
+            path: &FilePath,
+            requested_range: Option<object_store::GetRange>,
+            head: bool,
+        ) -> Result<RemoteObjectRead, TransportError> {
+            let bytes = self
+                .0
+                .files
+                .lock()
+                .unwrap()
+                .get(path)
+                .cloned()
+                .ok_or_else(|| TransportError::NotFound(path.display().to_string()))?;
+            let header = decode_header(&bytes).map_err(|error| {
+                TransportError::CorruptObject(format!("{}: {error}", path.display()))
+            })?;
+            let range = match requested_range {
+                Some(range) => range.as_range(header.logical_len).map_err(|error| {
+                    TransportError::Operation(format!("invalid range: {error}"))
+                })?,
+                None => 0..header.logical_len,
+            };
+            let payload = if head || range.is_empty() {
+                Bytes::new()
+            } else {
+                let start = OBJECT_HEADER_LEN + range.start as usize;
+                let end = OBJECT_HEADER_LEN + range.end as usize;
+                bytes.slice(start..end)
+            };
+            Ok(RemoteObjectRead {
+                header,
+                modified: std::time::SystemTime::now(),
+                range,
+                payload,
+            })
+        }
+
+        async fn list_directory(
+            &mut self,
+            path: &FilePath,
+        ) -> Result<Vec<RemoteDirectoryEntry>, TransportError> {
+            use crate::sftp_transport::RemoteEntryKind;
+            let files = self.0.files.lock().unwrap();
+            let directories = self.0.directories.lock().unwrap();
+            let mut entries = Vec::new();
+            for file in files.keys() {
+                if file.parent() == Some(path) {
+                    entries.push(RemoteDirectoryEntry {
+                        filename: file.file_name().unwrap().into(),
+                        kind: RemoteEntryKind::File,
+                    });
+                }
+            }
+            for directory in directories.iter() {
+                if directory.parent() == Some(path) {
+                    entries.push(RemoteDirectoryEntry {
+                        filename: directory.file_name().unwrap().into(),
+                        kind: RemoteEntryKind::Directory,
+                    });
+                }
+            }
+            Ok(entries)
+        }
+
+        async fn remove_file(&mut self, path: &FilePath) -> Result<(), TransportError> {
+            self.0
+                .files
+                .lock()
+                .unwrap()
+                .remove(path)
+                .map(|_| ())
+                .ok_or_else(|| TransportError::NotFound(path.display().to_string()))
+        }
+
+        async fn ensure_directory_component(
+            &mut self,
+            path: &FilePath,
+        ) -> Result<(), TransportError> {
+            self.0
+                .directories
+                .lock()
+                .unwrap()
+                .insert(path.to_path_buf());
+            Ok(())
+        }
+
+        async fn write_file_durable(
+            &mut self,
+            path: &FilePath,
+            chunks: Vec<Bytes>,
+        ) -> Result<(), TransportError> {
+            let bytes = chunks.into_iter().flatten().collect::<Vec<_>>();
+            self.0
+                .files
+                .lock()
+                .unwrap()
+                .insert(path.to_path_buf(), bytes.into());
+            Ok(())
+        }
+
+        async fn read_exact(
+            &mut self,
+            path: &FilePath,
+            offset: u64,
+            len: usize,
+        ) -> Result<Bytes, TransportError> {
+            let files = self.0.files.lock().unwrap();
+            let bytes = files
+                .get(path)
+                .ok_or_else(|| TransportError::NotFound(path.display().to_string()))?;
+            let start = offset as usize;
+            Ok(bytes.slice(start..start + len))
+        }
+
+        async fn hard_link(
+            &mut self,
+            from: &FilePath,
+            to: &FilePath,
+        ) -> Result<(), TransportError> {
+            let mut files = self.0.files.lock().unwrap();
+            if files.contains_key(to) {
+                return Err(TransportError::AlreadyExists(to.display().to_string()));
+            }
+            let bytes = files
+                .get(from)
+                .cloned()
+                .ok_or_else(|| TransportError::NotFound(from.display().to_string()))?;
+            files.insert(to.to_path_buf(), bytes);
+            Ok(())
+        }
+
+        async fn posix_rename(
+            &mut self,
+            from: &FilePath,
+            to: &FilePath,
+        ) -> Result<(), TransportError> {
+            let mut files = self.0.files.lock().unwrap();
+            let bytes = files
+                .remove(from)
+                .ok_or_else(|| TransportError::NotFound(from.display().to_string()))?;
+            files.insert(to.to_path_buf(), bytes);
+            Ok(())
+        }
+
+        async fn close(
+            self: Box<Self>,
+            _force: tokio_util::sync::CancellationToken,
+        ) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    /// The kill-during-staged-manifest recovery shape from the vm100 pilot: a
+    /// process died after writing a manifest's staging file but before
+    /// publishing it. On the next boot, recovery probes the manifest (and
+    /// caches the miss), the writeback journal republishes it under a fresh
+    /// staging name, and afterwards reads and listings must behave as if the
+    /// torn staging file never existed — the cached miss must not keep
+    /// poisoning reads and the orphan must stay invisible.
+    #[tokio::test]
+    async fn killed_staged_manifest_republishes_and_unpoisons_after_restart() {
+        use futures::TryStreamExt;
+
+        let remote = Arc::new(SharedRemoteFs::default());
+        let target = ObjectPath::from("root/manifest/00000000000000000782.manifest");
+        let orphan = staging_path(
+            FilePath::new("root/manifest/00000000000000000782.manifest"),
+            Uuid::new_v4(),
+        )
+        .unwrap();
+        remote
+            .files
+            .lock()
+            .unwrap()
+            .insert(orphan.clone(), Bytes::from_static(b"torn staged manifest"));
+
+        // "Restart": a fresh pool and store over the same remote filesystem.
+        let pool = crate::sftp_transport::SftpSessionPool::new_writable(
+            Arc::new(SharedRemoteFactory(remote.clone())),
+            2,
+            2,
+            2,
+        )
+        .await
+        .unwrap();
+        let store = SftpObjectStore::new(pool.clone(), ObjectPath::from("root")).unwrap();
+
+        let probe = store.get(&target).await;
+        assert!(
+            matches!(probe, Err(object_store::Error::NotFound { .. })),
+            "recovery's pre-replay probe sees a genuine miss: {probe:?}"
+        );
+
+        store
+            .put_opts(
+                &target,
+                PutPayload::from_static(b"manifest 782"),
+                PutOptions::from(PutMode::Create),
+            )
+            .await
+            .expect("journal replay republishes the manifest despite the orphaned staging file");
+
+        let read = store
+            .get(&target)
+            .await
+            .expect("the pre-replay miss must not stay cached once the manifest is published")
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(read.as_ref(), b"manifest 782");
+
+        let listed: Vec<_> = store
+            .list(Some(&ObjectPath::from("root/manifest")))
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            listed
+                .iter()
+                .map(|meta| meta.location.clone())
+                .collect::<Vec<_>>(),
+            vec![target.clone()],
+            "listings surface only the published manifest, never staging debris"
+        );
+        assert!(
+            remote.files.lock().unwrap().contains_key(&orphan),
+            "the orphan remains as invisible debris until swept"
+        );
+
+        pool.shutdown().await.unwrap();
     }
 
     #[tokio::test]

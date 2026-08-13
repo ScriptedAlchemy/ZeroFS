@@ -50,6 +50,11 @@ const SFTP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const SFTP_IDLE_REAP_INTERVAL: Duration = Duration::from_secs(10);
 const SFTP_IDLE_WARM_FLOOR: usize = 1;
 const SFTP_POOL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(45);
+// How long shutdown lets already-scheduled staging cleanups finish while the
+// pool can still serve them. A cleanup sleeping between retry attempts holds
+// no session, so the activity drain alone would close the pool underneath it
+// and turn ordinary staging debris into a failed service stop.
+const SFTP_SHUTDOWN_CLEANUP_GRACE: Duration = Duration::from_secs(10);
 const SSH_PROCESS_FORCE_REAP_TIMEOUT: Duration = Duration::from_secs(5);
 const SFTP_DIRECTORY_CACHE_MAX_ENTRIES: usize = 64 * 1024;
 
@@ -1258,6 +1263,10 @@ struct PoolInner {
     reaper_shutdown: CancellationToken,
     session_shutdown: CancellationToken,
     tasks: TaskTracker,
+    // Staging-cleanup retries live in their own tracker so shutdown can wait
+    // for exactly them before closing the pool; session-close tasks in
+    // `tasks` keep their original shutdown ordering.
+    cleanup_tasks: TaskTracker,
     runtime: tokio::runtime::Handle,
     shutdown_lock: Mutex<()>,
     shutdown_complete: AtomicBool,
@@ -1543,19 +1552,20 @@ impl SftpSessionPool {
         Ok(())
     }
 
-    pub(crate) fn spawn_cleanup<F>(&self, path: &std::path::Path, future: F) -> bool
+    pub(crate) fn spawn_cleanup<F>(&self, _path: &std::path::Path, future: F) -> bool
     where
         F: std::future::Future<Output = ()> + Send + 'static,
     {
         let _gate = self.inner.activity_gate.lock().unwrap();
         if self.inner.closed.load(Ordering::SeqCst) {
-            self.inner.record_error_message(format!(
-                "SFTP staging cleanup remains required for {} because the session pool is closed",
-                path.display()
-            ));
+            // The staging file stays behind as invisible debris; the next
+            // boot's replay publishes through fresh staging names, so this is
+            // the caller's warning, never a shutdown failure.
             return false;
         }
-        self.inner.tasks.spawn_on(future, &self.inner.runtime);
+        self.inner
+            .cleanup_tasks
+            .spawn_on(future, &self.inner.runtime);
         true
     }
 
@@ -1606,6 +1616,7 @@ impl SftpSessionPool {
                 reaper_shutdown: CancellationToken::new(),
                 session_shutdown: CancellationToken::new(),
                 tasks: TaskTracker::new(),
+                cleanup_tasks: TaskTracker::new(),
                 runtime: tokio::runtime::Handle::current(),
                 shutdown_lock: Mutex::new(()),
                 shutdown_complete: AtomicBool::new(false),
@@ -1694,8 +1705,20 @@ impl SftpSessionPool {
             };
         }
 
-        self.inner.fail_closed();
+        // Give scheduled staging cleanups a bounded window to finish while
+        // checkouts still work. A cleanup retry sleeping between attempts
+        // owns no session, so the activity drain below cannot protect it: the
+        // close would land first and the retry could only fail.
         self.inner.reaper_shutdown.cancel();
+        let quiesce = async {
+            while !self.inner.cleanup_tasks.is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        let grace = Instant::now() + SFTP_SHUTDOWN_CLEANUP_GRACE;
+        let _ = tokio::time::timeout_at(deadline.min(grace), quiesce).await;
+
+        self.inner.fail_closed();
         let inner = self.inner.clone();
         let drain = async move {
             inner.wait_for_activity_drain().await;
@@ -1711,6 +1734,8 @@ impl SftpSessionPool {
             }
             inner.tasks.close();
             inner.tasks.wait().await;
+            inner.cleanup_tasks.close();
+            inner.cleanup_tasks.wait().await;
         };
 
         if tokio::time::timeout_at(deadline, drain).await.is_err() {
@@ -2480,10 +2505,12 @@ mod tests {
         );
         tokio::task::yield_now().await;
         assert_eq!(ran.load(Ordering::SeqCst), 0);
-        assert!(matches!(
-            pool.shutdown().await,
-            Err(TransportError::Close(ref message)) if message.contains("test-staging")
-        ));
+        // The unrunnable cleanup leaves staging debris behind, which is the
+        // caller's warning to log — not a failed shutdown. Every service stop
+        // with pending staged uploads used to exit nonzero through this path.
+        pool.shutdown()
+            .await
+            .expect("staging debris after close must not fail an otherwise clean shutdown");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
