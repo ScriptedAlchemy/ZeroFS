@@ -775,7 +775,7 @@ fn validate_scheduler_window(
             }
             None if record.sequence < first_sequence || record.sequence > durable_frontier => {
                 anyhow::bail!(
-                    "durable writeback journal is missing remote frontier sequence {first_sequence}; found sequence {}",
+                    "durable writeback journal is missing remote frontier sequence {durable_frontier}; found sequence {}",
                     record.sequence
                 );
             }

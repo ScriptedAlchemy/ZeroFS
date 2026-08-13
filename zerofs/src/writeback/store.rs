@@ -235,10 +235,15 @@ impl WritebackObjectStore {
     pub fn status(&self) -> anyhow::Result<WritebackStatus> {
         let progress = self.inner.journal.progress()?;
         let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        // One snapshot for the age: reading the watermark and the record in
+        // separate transactions tears against a concurrent remote commit's
+        // prune. From sequence 0 the first surviving record is the oldest
+        // pending one.
         let oldest_pending_age_ms = self
             .inner
             .journal
-            .pending_from(progress.remote_seq.saturating_add(1), 1)?
+            .pending_window(0, 1)?
+            .records
             .first()
             .map(|record| now.saturating_sub(record.accepted_at_unix_ms))
             .unwrap_or(0);

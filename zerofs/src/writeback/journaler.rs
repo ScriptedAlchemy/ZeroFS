@@ -98,7 +98,13 @@ impl LocalJournalSink for Journal {
     }
 }
 
-const DEFAULT_LOCAL_PREPARE_CONCURRENCY: usize = 4;
+// Each preparation is one blob write + fsync (~1-5ms of device latency, not
+// CPU), so this is the drain's effective fsync queue depth: aggregate
+// throughput is roughly concurrency x payload / fsync latency, and 4 capped
+// the post-ACK durability tail at ~4 payloads per fsync round trip. RAM held
+// by prepared-but-unpublished blobs stays bounded by the submitters'
+// admission permits, not by this constant.
+const DEFAULT_LOCAL_PREPARE_CONCURRENCY: usize = 16;
 // Blob payloads are already external files, so this bounds the serialized
 // mutation metadata retained by one redb transaction without throttling large
 // payload throughput. The record cap separately bounds transaction work when
@@ -1441,10 +1447,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_local_prepare_concurrency_is_bounded_at_four() {
+    async fn default_local_prepare_concurrency_is_bounded() {
+        let cap = DEFAULT_LOCAL_PREPARE_CONCURRENCY as u64;
+        let submitted = cap + 2;
         let admission = Admission::new(64);
         let (journaler, mut entered, release, sink) = blocking_journaler(admission.clone(), None);
-        for sequence in 1..=6 {
+        for sequence in 1..=submitted {
             let ram = admission.reserve(1).await.unwrap().accept();
             journaler
                 .submit_put(put_record(sequence, b"x"), Bytes::from_static(b"x"), ram)
@@ -1453,29 +1461,32 @@ mod tests {
         }
 
         let mut started = Vec::new();
-        for _ in 0..4 {
+        for _ in 0..cap {
             started.push(
                 tokio::time::timeout(Duration::from_millis(250), entered.recv())
                     .await
-                    .expect("four local preparations should start")
+                    .expect("a full wave of local preparations should start")
                     .unwrap(),
             );
         }
         started.sort_unstable();
-        assert_eq!(started, vec![1, 2, 3, 4]);
+        assert_eq!(started, (1..=cap).collect::<Vec<_>>());
         assert!(
             tokio::time::timeout(Duration::from_millis(25), entered.recv())
                 .await
                 .is_err(),
-            "the fifth preparation exceeded the default concurrency cap"
+            "a preparation beyond the default concurrency cap started early"
         );
 
-        for _ in 0..6 {
+        for _ in 0..submitted {
             release.send(()).unwrap();
         }
-        journaler.barrier().wait_local(6).await.unwrap();
-        assert_eq!(sink.prepared_operations.load(Ordering::Relaxed), 6);
-        assert_eq!(sink.prepared_payload_bytes.load(Ordering::Relaxed), 6);
+        journaler.barrier().wait_local(submitted).await.unwrap();
+        assert_eq!(sink.prepared_operations.load(Ordering::Relaxed), submitted);
+        assert_eq!(
+            sink.prepared_payload_bytes.load(Ordering::Relaxed),
+            submitted
+        );
         journaler.shutdown().await.unwrap();
     }
 
@@ -1677,14 +1688,17 @@ mod tests {
             .iter()
             .map(Vec::len)
             .collect::<Vec<_>>();
-        assert_eq!(batches.len(), 2, "{batches:?}");
         assert_eq!(
             batches.iter().sum::<usize>(),
             RECORDS as usize,
             "{batches:?}"
         );
+        // Up to PREPARE_CONCURRENCY finished preparations may still be
+        // uncollected when the parked batch releases, so the exact batch
+        // count is timing-coupled; what matters is that some later batch
+        // exceeds what one preparation wave could supply.
         assert!(
-            batches[1] > PREPARE_CONCURRENCY,
+            batches.iter().max().copied().unwrap_or(0) > PREPARE_CONCURRENCY,
             "publication batches stayed capped at the prepare concurrency: {batches:?}"
         );
         assert_eq!(admission.used_bytes(), 0);
@@ -1698,58 +1712,63 @@ mod tests {
     #[tokio::test]
     #[ignore = "throughput benchmark; needs a real disk and --release"]
     async fn drain_throughput_of_the_post_ack_durability_tail() {
-        const RECORDS: u64 = 2048;
-        const PAYLOAD_BYTES: usize = 64 * 1024;
-        let temp = tempfile::tempdir().unwrap();
-        let journal = Arc::new(
-            Journal::open(
-                temp.path().join("writeback"),
-                JournalIdentity {
-                    format_version: 1,
-                    bucket_id: "bucket-a".to_owned(),
-                    backend_endpoint: "memory://remote".to_owned(),
-                    database_prefix: "zerofs/pilot".to_owned(),
-                    backend_kind: "memory".to_owned(),
-                    encryption_key_identity_sha256: [0x77; 32],
-                },
+        for (payload_bytes, records) in [
+            (64 * 1024_usize, 2048_u64),
+            (256 * 1024, 1024),
+            (1024 * 1024, 512),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let journal = Arc::new(
+                Journal::open(
+                    temp.path().join("writeback"),
+                    JournalIdentity {
+                        format_version: 1,
+                        bucket_id: "bucket-a".to_owned(),
+                        backend_endpoint: "memory://remote".to_owned(),
+                        database_prefix: "zerofs/pilot".to_owned(),
+                        backend_kind: "memory".to_owned(),
+                        encryption_key_identity_sha256: [0x77; 32],
+                    },
+                )
+                .unwrap(),
+            );
+            let payload = Bytes::from(vec![0x5a_u8; payload_bytes]);
+            let total_bytes = records * payload_bytes as u64;
+            let admission = Admission::new(total_bytes);
+            let journaler = LocalJournaler::start_with_observer(
+                journal.clone(),
+                admission.clone(),
+                records as usize,
+                DEFAULT_LOCAL_PREPARE_CONCURRENCY,
+                None,
             )
-            .unwrap(),
-        );
-        let payload = Bytes::from(vec![0x5a_u8; PAYLOAD_BYTES]);
-        let total_bytes = RECORDS * PAYLOAD_BYTES as u64;
-        let admission = Admission::new(total_bytes);
-        let journaler = LocalJournaler::start_with_observer(
-            journal.clone(),
-            admission.clone(),
-            RECORDS as usize,
-            4,
-            None,
-        )
-        .unwrap();
+            .unwrap();
 
-        let started = std::time::Instant::now();
-        for sequence in 1..=RECORDS {
-            let ram = admission
-                .reserve(PAYLOAD_BYTES as u64)
-                .await
-                .unwrap()
-                .accept();
-            journaler
-                .submit_put(put_record(sequence, &payload), payload.clone(), ram)
-                .await
-                .unwrap();
+            let started = std::time::Instant::now();
+            for sequence in 1..=records {
+                let ram = admission
+                    .reserve(payload_bytes as u64)
+                    .await
+                    .unwrap()
+                    .accept();
+                journaler
+                    .submit_put(put_record(sequence, &payload), payload.clone(), ram)
+                    .await
+                    .unwrap();
+            }
+            journaler.barrier().wait_local(records).await.unwrap();
+            let elapsed = started.elapsed();
+
+            println!(
+                "drained {records} x {} KiB records ({:.1} MiB) in {:.3}s = {:.1} MiB/s, {:.0} ops/s",
+                payload_bytes / 1024,
+                total_bytes as f64 / (1024.0 * 1024.0),
+                elapsed.as_secs_f64(),
+                total_bytes as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64(),
+                records as f64 / elapsed.as_secs_f64(),
+            );
+            journaler.shutdown().await.unwrap();
         }
-        journaler.barrier().wait_local(RECORDS).await.unwrap();
-        let elapsed = started.elapsed();
-
-        println!(
-            "drained {RECORDS} records ({:.1} MiB) in {:.3}s = {:.1} MiB/s, {:.0} ops/s",
-            total_bytes as f64 / (1024.0 * 1024.0),
-            elapsed.as_secs_f64(),
-            total_bytes as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64(),
-            RECORDS as f64 / elapsed.as_secs_f64(),
-        );
-        journaler.shutdown().await.unwrap();
     }
 
     #[tokio::test]

@@ -1851,8 +1851,13 @@ impl<T: serde::Serialize> SerializeValue for T {
 }
 
 fn blob_relative_path(sequence: Sequence, operation_id: Uuid) -> PathBuf {
+    // Shard on the sequence's high bits so a run of 256 consecutive records
+    // shares one directory: a publication batch then pays one directory fsync
+    // instead of one per record. (Sharding on the low bits scattered every
+    // batch across N directories.) The path is stored in the record at
+    // prepare time, so journals written under either scheme replay fine.
     PathBuf::from("blobs")
-        .join(format!("{:02x}", sequence & 0xff))
+        .join(format!("{:02x}", (sequence >> 8) & 0xff))
         .join(format!("{operation_id}.blob"))
 }
 
@@ -1985,20 +1990,41 @@ fn ensure_owner_directory(path: &Path, create: bool) -> Result<()> {
         if !create {
             bail!("journal directory {} does not exist", path.display());
         }
-        fs::create_dir(path)
-            .with_context(|| format!("failed to create journal directory {}", path.display()))?;
-        set_owner_only_directory(path)?;
-        if let Some(parent) = path.parent() {
-            sync_directory(parent)?;
+        match fs::create_dir(path) {
+            Ok(()) => {
+                set_owner_only_directory(path)?;
+                if let Some(parent) = path.parent() {
+                    sync_directory(parent)?;
+                }
+            }
+            // Concurrent preparations share a shard directory; losing the
+            // create race to a sibling is success. Convergence happens below.
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to create journal directory {}", path.display())
+                });
+            }
         }
     }
-    let metadata = fs::symlink_metadata(path)
+    let mut metadata = fs::symlink_metadata(path)
         .with_context(|| format!("failed to inspect journal directory {}", path.display()))?;
     if metadata.file_type().is_symlink() {
         bail!("journal directory {} must not be a symlink", path.display());
     }
     if !metadata.is_dir() {
         bail!("journal path {} is not a directory", path.display());
+    }
+    // A sibling that created this directory may not have tightened its
+    // permissions yet (create_dir then chmod is not atomic), and the racer
+    // can observe the window either via EEXIST above or via a bare exists().
+    // With create rights, converge any real directory to owner-only -- chmod
+    // only ever tightens -- then let validation have the final word (a
+    // foreign owner still fails).
+    if create && validate_owner_only(path, &metadata, 0o700).is_err() {
+        set_owner_only_directory(path)?;
+        metadata = fs::symlink_metadata(path)
+            .with_context(|| format!("failed to inspect journal directory {}", path.display()))?;
     }
     validate_owner_only(path, &metadata, 0o700)
 }
@@ -2106,8 +2132,8 @@ fn sync_directory(path: impl AsRef<Path>) -> Result<()> {
 mod tests {
     use super::{
         FENCE_CLASSIFICATION_VERSION, FENCE_CLASSIFICATION_VERSION_KEY, Journal, JournalSnapshot,
-        JournalWriteGate, META, PublicationFilesystem, REMOTE_OBJECT_VERSIONS, read_optional,
-        write_value,
+        JournalWriteGate, META, PublicationFilesystem, REMOTE_OBJECT_VERSIONS, blob_relative_path,
+        read_optional, write_value,
     };
     use crate::writeback::model::{
         FenceClass, JournalIdentity, LocalEtag, MutationKind, MutationMode, MutationRecord,
@@ -2233,6 +2259,47 @@ mod tests {
             0x2000,
             1_786_435_200_000,
         )
+    }
+
+    /// Concurrent preparations of consecutive sequences target the same shard
+    /// directory, so the first-creation path must treat losing the create
+    /// race as success (and still end owner-only).
+    #[test]
+    fn racing_shard_directory_creation_is_not_an_error() {
+        let temp = tempfile::tempdir().unwrap();
+        for round in 0..20 {
+            let shard = temp.path().join(format!("blobs-{round}"));
+            thread::scope(|scope| {
+                let handles: Vec<_> = (0..4)
+                    .map(|_| scope.spawn(|| super::ensure_owner_directory(&shard, true)))
+                    .collect();
+                for handle in handles {
+                    handle.join().unwrap().unwrap();
+                }
+            });
+            let mode = fs::symlink_metadata(&shard).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700, "shard directory must end owner-only");
+        }
+    }
+
+    /// Blob durability pays one directory fsync per unique shard directory in
+    /// a publication batch. Contiguous sequences must therefore share a shard,
+    /// or an N-record batch degenerates to N directory fsyncs.
+    #[test]
+    fn contiguous_batch_blobs_share_a_shard_directory() {
+        let dirs: std::collections::HashSet<PathBuf> = (1000_u64..1064)
+            .map(|seq| {
+                blob_relative_path(seq, uuid::Uuid::from_u128(seq as u128))
+                    .parent()
+                    .expect("blob path has a shard parent")
+                    .to_path_buf()
+            })
+            .collect();
+        assert!(
+            dirs.len() <= 2,
+            "a contiguous 64-record batch fans out to {} shard directories",
+            dirs.len()
+        );
     }
 
     fn open_temp_journal(temp: &TempDir, bucket: &str) -> Journal {
@@ -2621,12 +2688,10 @@ mod tests {
         let second_record = put_record(2, "segments/2", b"two");
         let first_final = journal
             .root()
-            .join("blobs/01")
-            .join(format!("{}.blob", first_record.operation_id));
+            .join(blob_relative_path(1, first_record.operation_id));
         let second_final = journal
             .root()
-            .join("blobs/02")
-            .join(format!("{}.blob", second_record.operation_id));
+            .join(blob_relative_path(2, second_record.operation_id));
         let first_payload = VerifiedPayload::new(Bytes::from_static(b"one"));
         let second_payload = VerifiedPayload::new(Bytes::from_static(b"two"));
         let first = journal
@@ -2660,12 +2725,10 @@ mod tests {
         let second_record = put_record(2, "segments/2", b"two");
         let first_final = journal
             .root()
-            .join("blobs/01")
-            .join(format!("{}.blob", first_record.operation_id));
+            .join(blob_relative_path(1, first_record.operation_id));
         let second_final = journal
             .root()
-            .join("blobs/02")
-            .join(format!("{}.blob", second_record.operation_id));
+            .join(blob_relative_path(2, second_record.operation_id));
         let first = journal
             .prepare_verified_put(
                 first_record,
@@ -2678,7 +2741,9 @@ mod tests {
                 &VerifiedPayload::new(Bytes::from_static(b"two")),
             )
             .unwrap();
-        let filesystem = RecordingPublicationFilesystem::new(Some(2));
+        // Contiguous sequences share one shard directory, so the batch makes
+        // exactly one directory fsync; fail it.
+        let filesystem = RecordingPublicationFilesystem::new(Some(1));
 
         let error = journal
             .publish_batch_with(vec![first, second], &filesystem)
@@ -2742,33 +2807,27 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let journal = open_temp_journal(&temp, "bucket-a");
         let payload = VerifiedPayload::new(Bytes::from_static(b"payload"));
-        let mut prepared = Vec::new();
-        prepared.push(
-            journal
-                .prepare_verified_put(put_record(1, "segments/1", b"payload"), &payload)
-                .unwrap(),
-        );
-        for sequence in 2..257 {
-            prepared.push(
+        // Contiguous sequences shard into one blobs directory, so a batch of
+        // payload blobs must cost exactly one directory fsync, not one each.
+        let prepared: Vec<_> = (1..=4)
+            .map(|sequence| {
                 journal
-                    .prepare_metadata(delete_record(sequence, &format!("obsolete-{sequence}")))
-                    .unwrap(),
-            );
-        }
-        prepared.push(
-            journal
-                .prepare_verified_put(put_record(257, "segments/257", b"payload"), &payload)
-                .unwrap(),
-        );
+                    .prepare_verified_put(
+                        put_record(sequence, &format!("segments/{sequence}"), b"payload"),
+                        &payload,
+                    )
+                    .unwrap()
+            })
+            .collect();
         let filesystem = RecordingPublicationFilesystem::new(None);
 
         journal.publish_batch_with(prepared, &filesystem).unwrap();
 
         assert_eq!(
             *filesystem.sync_calls.lock().unwrap(),
-            vec![journal.root().join("blobs/01")]
+            vec![journal.root().join("blobs/00")]
         );
-        assert_eq!(journal.progress().unwrap().local_seq, 257);
+        assert_eq!(journal.progress().unwrap().local_seq, 4);
     }
 
     #[test]
@@ -3111,8 +3170,7 @@ mod tests {
         let record = put_record(1, "segments/1", b"payload");
         let final_path = journal
             .root()
-            .join("blobs/01")
-            .join(format!("{}.blob", record.operation_id));
+            .join(blob_relative_path(1, record.operation_id));
         fs::create_dir_all(&final_path).unwrap();
         fs::set_permissions(
             final_path.parent().unwrap(),
