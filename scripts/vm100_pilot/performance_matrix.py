@@ -179,6 +179,9 @@ class RunAuthority:
     local_device_major: int
     local_device_minor: int
     local_device_name: str
+    deployed_commit: str
+    running_binary_sha256: str
+    lifecycle_config_sha256: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -238,6 +241,7 @@ class PerformanceMatrixRunner:
         return (*device, snapshot.device)
 
     def _authority(self) -> RunAuthority:
+        status = self.lifecycle.status()
         commit = self.runner.run(
             ["git", "-C", self.config.root, "rev-parse", "HEAD"]
         ).stdout.strip()
@@ -251,6 +255,33 @@ class PerformanceMatrixRunner:
         ).stdout.split()[0]
         if len(config_digest) != 64:
             raise RuntimeError(f"invalid config SHA-256 receipt: {config_digest!r}")
+        deployed_commit = str(status.get("deployed_commit", ""))
+        running_binary_sha256 = str(status.get("running_binary_sha256", ""))
+        lifecycle_config_sha256 = str(status.get("config_sha256", ""))
+        if len(deployed_commit) != 40:
+            raise RuntimeError(
+                f"invalid lifecycle deployed commit receipt: {deployed_commit!r}"
+            )
+        if len(running_binary_sha256) != 64:
+            raise RuntimeError(
+                "invalid lifecycle running binary SHA-256 receipt: "
+                f"{running_binary_sha256!r}"
+            )
+        if len(lifecycle_config_sha256) != 64:
+            raise RuntimeError(
+                "invalid lifecycle config SHA-256 receipt: "
+                f"{lifecycle_config_sha256!r}"
+            )
+        if commit != deployed_commit:
+            raise RuntimeError(
+                "checkout commit does not match deployed commit: "
+                f"checkout={commit}, deployed={deployed_commit}"
+            )
+        if config_digest != lifecycle_config_sha256:
+            raise RuntimeError(
+                "independent config SHA-256 does not match lifecycle config: "
+                f"independent={config_digest}, lifecycle={lifecycle_config_sha256}"
+            )
         nbd_major, nbd_minor, nbd_name = self._nbd_device()
         local_major, local_minor, local_name = self._local_device_identity()
         return RunAuthority(
@@ -265,6 +296,9 @@ class PerformanceMatrixRunner:
             local_device_major=local_major,
             local_device_minor=local_minor,
             local_device_name=local_name,
+            deployed_commit=deployed_commit,
+            running_binary_sha256=running_binary_sha256,
+            lifecycle_config_sha256=lifecycle_config_sha256,
         )
 
     @staticmethod
@@ -278,6 +312,31 @@ class PerformanceMatrixRunner:
         return BlockIoSnapshot.capture(
             self.config.proc_root, device=block_device(self.config.nbd_device)
         )
+
+    @staticmethod
+    def _system_io_through_remote_crossing(
+        sampler: _MetricSampler, remote_timestamp_ns: int
+    ) -> list[SystemIoSnapshot]:
+        crossing_ms = remote_timestamp_ns // 1_000_000
+        snapshots = [
+            SystemIoSnapshot(
+                root_device=str(row[1]),
+                root_read_bytes=int(row[2]),
+                root_write_bytes=int(row[3]),
+                root_busy_ms=int(row[4]),
+                some_avg10=float(row[5]),
+                full_avg10=float(row[6]),
+                some_total_us=int(row[7]),
+                full_total_us=int(row[8]),
+            )
+            for row in sampler.system_io_rows
+            if int(row[0]) <= crossing_ms
+        ]
+        if not snapshots:
+            raise RuntimeError(
+                "system I/O sampler has no sample at the remote target crossing"
+            )
+        return snapshots
 
     @staticmethod
     def _monotonic_ns() -> int:
@@ -397,14 +456,16 @@ class PerformanceMatrixRunner:
                 f"target={accepted.accepted}, remote={remote.remote}"
             )
         nbd_after = self._nbd_io()
-        io_after = self._system_io(local_device)
+        crossing_io = self._system_io_through_remote_crossing(
+            sampler, remote_timestamp_ns
+        )
         self.lifecycle.drain()
         post_drain = self.lifecycle.metrics.snapshot()
         require_drained(post_drain, phase=f"{cell.name} post-cell")
         _assert_no_maintenance(before, post_drain)
 
         elapsed_ms = max(1, round((remote_timestamp_ns - write_start_ns) / 1_000_000))
-        system_samples = [io_before, *sampler.system_io, io_after]
+        system_samples = [io_before, *crossing_io]
         return MatrixCellResult(
             cell=cell,
             total_bytes=total_bytes,
@@ -597,7 +658,6 @@ class PerformanceMatrixRunner:
         cells = matrix_cells(quick=quick)
         for cell in cells:
             self._cell_bytes(cell, total_mib)
-        self.lifecycle.status()
         authority = self._authority()
         scratch_root = self._scratch_root()
         if not scratch_root.is_dir():

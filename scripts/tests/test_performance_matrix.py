@@ -175,14 +175,18 @@ class _SequenceMetrics:
 
 class _MatrixLifecycle:
     def __init__(
-        self, config: PilotConfig, snapshots: Sequence[WritebackSnapshot]
+        self,
+        config: PilotConfig,
+        snapshots: Sequence[WritebackSnapshot],
+        status: Mapping[str, object] | None = None,
     ) -> None:
         self.config = config
         self.metrics = _SequenceMetrics(snapshots)
         self.drain_calls = 0
+        self.status_result = dict(status or {"healthy": True})
 
     def status(self) -> dict[str, object]:
-        return {"healthy": True}
+        return self.status_result
 
     def drain(self, timeout: int | None = None) -> object:
         self.drain_calls += 1
@@ -240,6 +244,7 @@ class _RemoteSampler:
     def __init__(self, remote: WritebackSnapshot, io_sample: SystemIoSnapshot) -> None:
         self.remote = remote
         self.system_io = [io_sample]
+        self.system_io_rows = [(700, *io_sample.to_dict().values())]
         self.targets: list[tuple[int, float]] = []
 
     def wait_for_remote(
@@ -300,7 +305,23 @@ class PerformanceMatrixCellTests(unittest.TestCase):
         final_io = SystemIoSnapshot(
             "sda1", 612, 2_097_352, 210, 2.5, 1.5, 31_000, 10_100
         )
-        sampler = _RemoteSampler(post_drain, replace(zero_io, some_avg10=3.0))
+        crossing_io = replace(
+            final_io,
+            some_avg10=3.0,
+            full_avg10=1.75,
+        )
+        contaminated_io = replace(
+            crossing_io,
+            root_write_bytes=64 << 20,
+            root_busy_ms=20_000,
+            some_avg10=99.0,
+            full_avg10=88.0,
+            some_total_us=900_000,
+            full_total_us=800_000,
+        )
+        sampler = _RemoteSampler(post_drain, crossing_io)
+        sampler.system_io.append(contaminated_io)
+        sampler.system_io_rows.append((900, *contaminated_io.to_dict().values()))
         nbd_before = BlockIoSnapshot("nbd0", 100, 200, 5)
         nbd_after = BlockIoSnapshot("nbd0", 100, (32 << 20) + 200, 405)
 
@@ -366,6 +387,8 @@ class PerformanceMatrixCellTests(unittest.TestCase):
         self.assertEqual(result.nbd_io.write_bytes, 32 << 20)
         self.assertEqual(result.system_io.some_stall_ms, 30.0)
         self.assertEqual(result.system_io.full_stall_ms, 10.0)
+        self.assertEqual(result.system_io.peak_some_avg10, 3.0)
+        self.assertEqual(result.system_io.peak_full_avg10, 1.75)
         self.assertEqual(result.before.accepted, 9)
         self.assertEqual(result.after_fio.accepted, 10)
         self.assertEqual(result.after_syncfs.local, 10)
@@ -512,7 +535,16 @@ class PerformanceMatrixOrchestrationTests(unittest.TestCase):
         authority = AuthorityMatrix(
             config,
             AuthorityRunner(),
-            _MatrixLifecycle(config, (self.snapshot,)),  # type: ignore[arg-type]
+            _MatrixLifecycle(
+                config,
+                (self.snapshot,),
+                status={
+                    "healthy": True,
+                    "deployed_commit": "a" * 40,
+                    "running_binary_sha256": "c" * 64,
+                    "config_sha256": "b" * 64,
+                },
+            ),  # type: ignore[arg-type]
         )._authority()
 
         self.assertEqual(authority.source_commit, "a" * 40)
@@ -526,6 +558,56 @@ class PerformanceMatrixOrchestrationTests(unittest.TestCase):
         self.assertEqual(authority.local_device_major, 8)
         self.assertEqual(authority.local_device_minor, 1)
         self.assertEqual(authority.local_device_name, "sda1")
+        self.assertEqual(authority.deployed_commit, "a" * 40)
+        self.assertEqual(authority.running_binary_sha256, "c" * 64)
+        self.assertEqual(authority.lifecycle_config_sha256, "b" * 64)
+
+    def test_authority_rejects_checkout_that_does_not_match_deployed_commit(
+        self,
+    ) -> None:
+        config_file = Path(self.temp.name) / "pilot.toml"
+        config_file.write_text("[filesystem]\nmax_size_gb = 64\n", encoding="utf-8")
+        config = replace(self.config, config_file=config_file)
+
+        class AuthorityRunner(_FilesystemRunner):
+            def run(
+                self, argv: Sequence[str | Path], **kwargs: Any
+            ) -> CompletedProcess[str]:
+                args = tuple(str(value) for value in argv)
+                if args[:4] == ("git", "-C", str(config.root), "rev-parse"):
+                    return CompletedProcess(args, 0, "a" * 40 + "\n", "")
+                if args[:4] == ("git", "-C", str(config.root), "status"):
+                    return CompletedProcess(args, 0, "", "")
+                if args[:1] == ("sha256sum",):
+                    return CompletedProcess(args, 0, "b" * 64 + "  config\n", "")
+                return super().run(argv, **kwargs)
+
+        lifecycle = _MatrixLifecycle(
+            config,
+            (self.snapshot,),
+            status={
+                "healthy": True,
+                "deployed_commit": "d" * 40,
+                "running_binary_sha256": "c" * 64,
+                "config_sha256": "b" * 64,
+            },
+        )
+
+        class MismatchAuthorityMatrix(
+            PerformanceMatrixRunner  # type: ignore[misc,valid-type]
+        ):
+            def _nbd_device(self) -> tuple[int, int, str]:
+                return (43, 0, "nbd0")
+
+            def _local_device_identity(self) -> tuple[int, int, str]:
+                return (8, 1, "sda1")
+
+        with self.assertRaisesRegex(
+            RuntimeError, "checkout commit.*does not match deployed commit"
+        ):
+            MismatchAuthorityMatrix(
+                config, AuthorityRunner(), lifecycle  # type: ignore[arg-type]
+            )._authority()
 
     def test_quick_run_isolates_cells_and_persists_json_csv_after_measurement(
         self,
@@ -562,6 +644,9 @@ class PerformanceMatrixOrchestrationTests(unittest.TestCase):
                     local_device_major=8,
                     local_device_minor=1,
                     local_device_name="sda1",
+                    deployed_commit="a" * 40,
+                    running_binary_sha256="c" * 64,
+                    lifecycle_config_sha256="b" * 64,
                 )
 
             def _run_cell(self, **kwargs: Any) -> Any:
@@ -602,6 +687,8 @@ class PerformanceMatrixOrchestrationTests(unittest.TestCase):
         self.assertEqual(manifest["status"], "ok")
         self.assertEqual(summary["schema"], 1)
         self.assertEqual(summary["authority"]["source_commit"], "a" * 40)
+        self.assertEqual(summary["authority"]["deployed_commit"], "a" * 40)
+        self.assertEqual(summary["authority"]["running_binary_sha256"], "c" * 64)
         self.assertEqual(manifest["authority"]["config_sha256"], "b" * 64)
         self.assertEqual(summary["cell_count"], 3)
         self.assertEqual(len(summary["cells"]), 3)
@@ -704,6 +791,9 @@ class PerformanceMatrixOrchestrationTests(unittest.TestCase):
                     8,
                     1,
                     "sda1",
+                    "a" * 40,
+                    "c" * 64,
+                    "b" * 64,
                 )
 
             def _run_cell(self, **kwargs: Any) -> Any:
@@ -773,6 +863,9 @@ class PerformanceMatrixOrchestrationTests(unittest.TestCase):
                     8,
                     1,
                     "sda1",
+                    "a" * 40,
+                    "c" * 64,
+                    "b" * 64,
                 )
 
             def _prepare_root(self, run_root: Path) -> None:
@@ -815,6 +908,9 @@ class PerformanceMatrixOrchestrationTests(unittest.TestCase):
                     8,
                     1,
                     "sda1",
+                    "a" * 40,
+                    "c" * 64,
+                    "b" * 64,
                 )
 
             def _run_cell(self, **kwargs: Any) -> Any:
