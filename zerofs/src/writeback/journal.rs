@@ -1247,13 +1247,16 @@ impl Journal {
                         "remote sequence must advance contiguously from {remote_seq} to {expected}, got {sequence}"
                     );
                 }
-                let encoded = mutations
-                    .get(sequence)
-                    .context("failed to read remote mutation")?
-                    .map(|value| value.value().to_vec())
-                    .with_context(|| format!("journal mutation {sequence} does not exist"))?;
-                let mut record: MutationRecord =
-                    bincode::deserialize(&encoded).context("failed to decode remote mutation")?;
+                // Decoded inside its own scope so the read guard is released
+                // before the re-insert below, without copying the row first.
+                let mut record: MutationRecord = {
+                    let stored = mutations
+                        .get(sequence)
+                        .context("failed to read remote mutation")?
+                        .with_context(|| format!("journal mutation {sequence} does not exist"))?;
+                    bincode::deserialize(stored.value())
+                        .context("failed to decode remote mutation")?
+                };
                 let completed_bytes = record.payload().map_or(0, |(payload_len, _)| payload_len);
                 total_completed = total_completed
                     .checked_add(completed_bytes)
@@ -1384,13 +1387,14 @@ impl Journal {
             let mut mutations = transaction
                 .open_table(MUTATIONS)
                 .context("failed to open journal mutations")?;
-            let encoded = mutations
-                .get(sequence)
-                .context("failed to read failed remote mutation")?
-                .map(|value| value.value().to_vec())
-                .with_context(|| format!("journal mutation {sequence} does not exist"))?;
-            let mut record: MutationRecord = bincode::deserialize(&encoded)
-                .context("failed to decode failed remote mutation")?;
+            let mut record: MutationRecord = {
+                let stored = mutations
+                    .get(sequence)
+                    .context("failed to read failed remote mutation")?
+                    .with_context(|| format!("journal mutation {sequence} does not exist"))?;
+                bincode::deserialize(stored.value())
+                    .context("failed to decode failed remote mutation")?
+            };
             record.retry_count = record
                 .retry_count
                 .checked_add(1)
@@ -2018,12 +2022,11 @@ fn read_required<T: serde::de::DeserializeOwned>(
     table: &impl ReadableTable<&'static str, &'static [u8]>,
     key: &str,
 ) -> Result<T> {
-    let bytes = table
+    let value = table
         .get(key)
         .with_context(|| format!("failed to read journal metadata key {key}"))?
-        .map(|value| value.value().to_vec())
         .with_context(|| format!("journal metadata key {key} is missing"))?;
-    bincode::deserialize(&bytes)
+    bincode::deserialize(value.value())
         .with_context(|| format!("failed to decode journal metadata key {key}"))
 }
 
@@ -2031,14 +2034,13 @@ fn read_optional<T: serde::de::DeserializeOwned>(
     table: &impl ReadableTable<&'static str, &'static [u8]>,
     key: &str,
 ) -> Result<Option<T>> {
-    let Some(bytes) = table
+    let Some(value) = table
         .get(key)
         .with_context(|| format!("failed to read journal metadata key {key}"))?
-        .map(|value| value.value().to_vec())
     else {
         return Ok(None);
     };
-    bincode::deserialize(&bytes)
+    bincode::deserialize(value.value())
         .with_context(|| format!("failed to decode journal metadata key {key}"))
         .map(Some)
 }
