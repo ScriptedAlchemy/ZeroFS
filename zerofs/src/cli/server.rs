@@ -1,3 +1,4 @@
+use super::{attach_cleanup_errors, finish_with_sftp_cleanup};
 use crate::checkpoint_manager::CheckpointManager;
 use crate::config::{NbdConfig, NfsConfig, NinePConfig, RpcConfig, Settings};
 use crate::db::SlateDbHandle;
@@ -34,6 +35,7 @@ use tracing::{debug, info};
 const SFTP_FINAL_DATABASE_CLOSE_TIMEOUT: Duration = Duration::from_secs(20);
 const SFTP_FINAL_WORKER_ABORT_TIMEOUT: Duration = Duration::from_secs(5);
 const SERVER_AUTHORITY_FINISH_TIMEOUT: Duration = Duration::from_secs(10);
+const SFTP_CHECKPOINT_POOL_CLEANUP: &str = "Failed to shut down SFTP checkpoint pool";
 
 /// Parse a WAL config into an object store rooted at the full URL path.
 pub(crate) fn parse_wal_object_store(
@@ -85,14 +87,12 @@ async fn resolve_checkpoint_name(settings: &Settings, name: &str) -> Result<uuid
         let wal_object_store = match parse_wal_object_store(wal_config) {
             Ok(store) => store,
             Err(error) => {
-                if let Some(pool) = &sftp_pool
-                    && let Err(cleanup) = pool.shutdown().await
-                {
-                    return Err(error.context(format!(
-                        "SFTP checkpoint pool cleanup also failed: {cleanup}"
-                    )));
-                }
-                return Err(error);
+                return finish_with_sftp_cleanup(
+                    sftp_pool.as_ref(),
+                    SFTP_CHECKPOINT_POOL_CLEANUP,
+                    Err(error),
+                )
+                .await;
             }
         };
         admin_builder = admin_builder.with_wal_object_store(wal_object_store);
@@ -101,26 +101,12 @@ async fn resolve_checkpoint_name(settings: &Settings, name: &str) -> Result<uuid
 
     let checkpoints = admin.list_checkpoints(Some(name)).await;
     drop(admin);
-    let shutdown = match sftp_pool {
-        Some(pool) => pool.shutdown().await,
-        None => Ok(()),
-    };
-    let checkpoints = match (checkpoints, shutdown) {
-        (Ok(checkpoints), Ok(())) => checkpoints,
-        (Ok(_), Err(cleanup)) => {
-            return Err(anyhow::anyhow!(
-                "Failed to shut down SFTP checkpoint pool: {cleanup}"
-            ));
-        }
-        (Err(error), Ok(())) => {
-            return Err(anyhow::anyhow!("Failed to list checkpoints: {error}"));
-        }
-        (Err(error), Err(cleanup)) => {
-            return Err(anyhow::anyhow!(
-                "Failed to list checkpoints: {error}; SFTP checkpoint pool cleanup also failed: {cleanup}"
-            ));
-        }
-    };
+    let checkpoints = finish_with_sftp_cleanup(
+        sftp_pool.as_ref(),
+        SFTP_CHECKPOINT_POOL_CLEANUP,
+        checkpoints.context("Failed to list checkpoints"),
+    )
+    .await?;
 
     checkpoints
         .into_iter()
@@ -462,36 +448,6 @@ impl ServingStopCause {
             Self::LeadershipLost => Some(leadership_lost_error()),
             Self::ListenerFailure(error) => Some(error),
         }
-    }
-}
-
-#[derive(Debug)]
-struct PrimaryErrorWithCleanup {
-    primary: anyhow::Error,
-    cleanup: Vec<anyhow::Error>,
-}
-
-impl std::fmt::Display for PrimaryErrorWithCleanup {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "{:#}", self.primary)?;
-        for error in &self.cleanup {
-            write!(formatter, "; cleanup also failed: {error:#}")?;
-        }
-        Ok(())
-    }
-}
-
-impl std::error::Error for PrimaryErrorWithCleanup {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(self.primary.as_ref())
-    }
-}
-
-fn attach_cleanup_errors(primary: anyhow::Error, cleanup: Vec<anyhow::Error>) -> anyhow::Error {
-    if cleanup.is_empty() {
-        primary
-    } else {
-        anyhow::Error::new(PrimaryErrorWithCleanup { primary, cleanup })
     }
 }
 

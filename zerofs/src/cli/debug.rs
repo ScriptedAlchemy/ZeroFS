@@ -1,4 +1,5 @@
 use crate::block_transformer::ZeroFsBlockTransformer;
+use crate::cli::finish_with_sftp_cleanup;
 use crate::config::Settings;
 use crate::db::SlateDbHandle;
 use crate::fs::CacheConfig;
@@ -230,21 +231,12 @@ pub async fn list_keys(config_path: PathBuf) -> Result<()> {
     }
     .await;
 
-    let shutdown_result = match sftp_pool {
-        Some(pool) => pool
-            .shutdown()
-            .await
-            .context("Failed to shut down SFTP debug pool"),
-        None => Ok(()),
-    };
-    match (command_result, shutdown_result) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(command), Ok(())) => Err(command),
-        (Ok(()), Err(shutdown)) => Err(shutdown),
-        (Err(command), Err(shutdown)) => Err(command.context(format!(
-            "SFTP debug pool shutdown also failed: {shutdown:#}"
-        ))),
-    }
+    finish_with_sftp_cleanup(
+        sftp_pool.as_ref(),
+        "Failed to shut down SFTP debug pool",
+        command_result,
+    )
+    .await
 }
 
 pub async fn reseed_writeback_predecessor(
@@ -294,15 +286,7 @@ pub async fn reseed_writeback_predecessor(
         Ok(())
     }
     .await;
-    if let Some(pool) = sftp_pool
-        && let Err(cleanup) = pool.shutdown().await
-    {
-        return match result {
-            Ok(()) => Err(cleanup.into()),
-            Err(error) => Err(error.context(format!("SFTP cleanup also failed: {cleanup}"))),
-        };
-    }
-    result
+    finish_with_sftp_cleanup(sftp_pool.as_ref(), "Failed to shut down SFTP pool", result).await
 }
 
 #[cfg(test)]

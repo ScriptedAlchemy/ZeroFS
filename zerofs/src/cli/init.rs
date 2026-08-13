@@ -8,6 +8,7 @@
 
 use crate::block_transformer::ZeroFsBlockTransformer;
 use crate::bucket_identity;
+use crate::cli::finish_with_sftp_cleanup;
 use crate::cli::server::{
     DatabaseMode, InitResult, SlateDbOpen, build_slatedb, parse_wal_object_store,
 };
@@ -311,14 +312,12 @@ impl StartupContext {
         match prepared {
             Ok(prepared) => Ok(prepared),
             Err(error) => {
-                if let Some(pool) = cleanup_pool
-                    && let Err(cleanup) = pool.shutdown().await
-                {
-                    return Err(error.context(format!(
-                        "SFTP pool cleanup after initialization failure also failed: {cleanup}"
-                    )));
-                }
-                Err(error)
+                finish_with_sftp_cleanup(
+                    cleanup_pool.as_ref(),
+                    "Failed to shut down SFTP pool after initialization failure",
+                    Err(error),
+                )
+                .await
             }
         }
     }
@@ -1225,14 +1224,12 @@ pub async fn initialize_filesystem(
                     "writeback cleanup after filesystem initialization failure also failed: {cleanup}"
                 )));
             }
-            if let Some(pool) = cleanup_pool
-                && let Err(cleanup) = pool.shutdown().await
-            {
-                return Err(error.context(format!(
-                    "SFTP pool cleanup after filesystem initialization failure also failed: {cleanup}"
-                )));
-            }
-            Err(error)
+            finish_with_sftp_cleanup(
+                cleanup_pool.as_ref(),
+                "Failed to shut down SFTP pool after filesystem initialization failure",
+                Err(error),
+            )
+            .await
         }
     }
 }

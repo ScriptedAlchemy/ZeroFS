@@ -1,5 +1,6 @@
 use crate::config::Settings;
 use crate::rpc::client::RpcClient;
+use crate::sftp_transport::SftpSessionPool;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
@@ -234,6 +235,68 @@ pub async fn connect_rpc_client(config_path: &Path) -> Result<RpcClient> {
     RpcClient::connect_from_config(rpc_config)
         .await
         .context("Failed to connect to RPC server. Is the server running?")
+}
+
+/// An operation's own failure, carrying the cleanup failures that followed it.
+/// The primary error stays the source so `{:#}` reports what actually went
+/// wrong first and treats the cleanup failures as trailing detail.
+#[derive(Debug)]
+struct PrimaryErrorWithCleanup {
+    primary: anyhow::Error,
+    cleanup: Vec<anyhow::Error>,
+}
+
+impl std::fmt::Display for PrimaryErrorWithCleanup {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{:#}", self.primary)?;
+        for error in &self.cleanup {
+            write!(formatter, "; cleanup also failed: {error:#}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for PrimaryErrorWithCleanup {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.primary.as_ref())
+    }
+}
+
+pub(crate) fn attach_cleanup_errors(
+    primary: anyhow::Error,
+    cleanup: Vec<anyhow::Error>,
+) -> anyhow::Error {
+    if cleanup.is_empty() {
+        primary
+    } else {
+        anyhow::Error::new(PrimaryErrorWithCleanup { primary, cleanup })
+    }
+}
+
+/// Shut down an SFTP session pool (when one exists) and fold its cleanup failure
+/// into `result`: the primary error always wins and the cleanup failure rides
+/// along as attached detail, a cleanup-only failure becomes the error, and when
+/// both succeed the value is returned.
+///
+/// `cleanup_context` labels the cleanup failure with the caller's own wording.
+/// Callers that must only clean up on failure keep that shape by calling this
+/// with an already-`Err` result.
+pub(crate) async fn finish_with_sftp_cleanup<T>(
+    pool: Option<&SftpSessionPool>,
+    cleanup_context: &'static str,
+    result: Result<T>,
+) -> Result<T> {
+    let cleanup = match pool {
+        Some(pool) => pool.shutdown().await.context(cleanup_context).err(),
+        None => None,
+    };
+
+    match (result, cleanup) {
+        (Ok(value), None) => Ok(value),
+        (Ok(_), Some(cleanup)) => Err(cleanup),
+        (Err(primary), None) => Err(primary),
+        (Err(primary), Some(cleanup)) => Err(attach_cleanup_errors(primary, vec![cleanup])),
+    }
 }
 
 #[cfg(test)]
