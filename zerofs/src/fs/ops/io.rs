@@ -646,6 +646,36 @@ mod tests {
         assert_eq!(data.as_ref(), b"later");
     }
 
+    /// Sequential in-place overwrite through `fs.write`, the NBD member-chunk
+    /// shape. Run with `--ignored --nocapture`.
+    #[tokio::test]
+    #[ignore = "benchmark"]
+    async fn bench_sequential_in_place_overwrite() {
+        const ITERATIONS: usize = 2_000;
+
+        for chunk_size in [512usize, 4096, 64 * 1024] {
+            let fs = ZeroFS::new_in_memory().await.unwrap();
+            let (file_id, _) = fs
+                .create(&test_creds(), 0, b"bench.img", &SetAttributes::default())
+                .await
+                .unwrap();
+            let auth: AuthContext = (&test_auth()).into();
+            let chunk = Bytes::from(vec![0x5A; chunk_size]);
+            fs.write(&auth, file_id, 0, &chunk).await.unwrap();
+
+            let start = std::time::Instant::now();
+            for _ in 0..ITERATIONS {
+                fs.write(&auth, file_id, 0, &chunk).await.unwrap();
+            }
+            let elapsed = start.elapsed();
+            println!(
+                "in-place overwrite: {ITERATIONS} x {chunk_size}B in {elapsed:?} ({:?}/op, {:.0} ops/s)",
+                elapsed / ITERATIONS as u32,
+                ITERATIONS as f64 / elapsed.as_secs_f64()
+            );
+        }
+    }
+
     #[tokio::test]
     async fn fallocate_retry_does_not_zero_a_later_write() {
         let fs = ZeroFS::new_in_memory().await.unwrap();
