@@ -894,6 +894,20 @@ mod tests {
         prepared: tokio_mpsc::UnboundedSender<u64>,
     }
 
+    /// Records the size of every committed publication batch so throughput
+    /// benchmarks can report how far a batch's fixed cost is amortized.
+    struct BatchSizeObserver {
+        sizes: Arc<Mutex<Vec<usize>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl LocalCommitObserver for BatchSizeObserver {
+        async fn committed_batch(&self, records: &[MutationRecord]) -> Result<()> {
+            self.sizes.lock().unwrap().push(records.len());
+            Ok(())
+        }
+    }
+
     #[derive(Default)]
     struct BlockingObserver {
         entered: Notify,
@@ -1801,6 +1815,14 @@ mod tests {
     /// disk, at the production prepare concurrency. Ignored by default because
     /// it is timing sensitive and does real fsyncs; run it with
     /// `cargo test --release --lib drain_throughput -- --ignored --nocapture`.
+    ///
+    /// Records and payload digests are built before the clock starts. In
+    /// production those SHA-256 passes happen once per payload on the
+    /// submitting task, spread across many concurrent writers; doing them
+    /// inside the timed loop instead measured one core's hash rate (~1.5
+    /// GiB/s, halved by hashing each payload for both the record and the
+    /// verified payload) and capped every result near 500 MiB/s no matter how
+    /// fast the drain got.
     #[tokio::test]
     #[ignore = "throughput benchmark; needs a real disk and --release"]
     async fn drain_throughput_of_the_post_ack_durability_tail() {
@@ -1827,37 +1849,50 @@ mod tests {
             let payload = Bytes::from(vec![0x5a_u8; payload_bytes]);
             let total_bytes = records * payload_bytes as u64;
             let admission = Admission::new(total_bytes);
+            let sizes = Arc::new(Mutex::new(Vec::new()));
             let journaler = LocalJournaler::start_with_observer(
                 journal.clone(),
                 admission.clone(),
                 records as usize,
                 DEFAULT_LOCAL_PREPARE_CONCURRENCY,
-                None,
+                Some(Arc::new(BatchSizeObserver {
+                    sizes: sizes.clone(),
+                })),
             )
             .unwrap();
 
+            let verified = VerifiedPayload::new(payload.clone());
+            let prebuilt = (1..=records)
+                .map(|sequence| put_record(sequence, &payload))
+                .collect::<Vec<_>>();
+
             let started = std::time::Instant::now();
-            for sequence in 1..=records {
+            for record in prebuilt {
                 let ram = admission
                     .reserve(payload_bytes as u64)
                     .await
                     .unwrap()
                     .accept();
                 journaler
-                    .submit_put(put_record(sequence, &payload), payload.clone(), ram)
+                    .submit_verified_put(record, verified.clone(), ram)
                     .await
                     .unwrap();
             }
             journaler.barrier().wait_local(records).await.unwrap();
             let elapsed = started.elapsed();
 
+            let sizes = sizes.lock().unwrap().clone();
             println!(
-                "drained {records} x {} KiB records ({:.1} MiB) in {:.3}s = {:.1} MiB/s, {:.0} ops/s",
+                "drained {records} x {} KiB records ({:.1} MiB) in {:.3}s = {:.1} MiB/s, {:.0} ops/s \
+                 [{} batches, mean {:.1}, max {}]",
                 payload_bytes / 1024,
                 total_bytes as f64 / (1024.0 * 1024.0),
                 elapsed.as_secs_f64(),
                 total_bytes as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64(),
                 records as f64 / elapsed.as_secs_f64(),
+                sizes.len(),
+                records as f64 / sizes.len() as f64,
+                sizes.iter().copied().max().unwrap_or(0),
             );
             journaler.shutdown().await.unwrap();
         }

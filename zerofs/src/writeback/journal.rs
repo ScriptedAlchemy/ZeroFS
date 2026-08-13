@@ -2907,41 +2907,50 @@ mod tests {
     /// How much of the journal's durability cost is fixed per publication
     /// batch rather than per record. Run with
     /// `cargo test --release --lib publication_batch_size_amortizes -- --ignored --nocapture`.
+    ///
+    /// Records are built before the clock starts: constructing one hashes its
+    /// payload, and at these sizes a single core's SHA-256 rate would
+    /// otherwise dominate the measurement instead of the durability path.
     #[test]
     #[ignore = "throughput benchmark; needs a real disk and --release"]
     fn publication_batch_size_amortizes_the_journal_fixed_cost() {
-        const PAYLOAD_BYTES: usize = 64 * 1024;
-        const BATCHES: usize = 16;
-        for batch in [1_usize, 4, 64] {
-            let temp = tempfile::tempdir().unwrap();
-            let journal = open_temp_journal(&temp, "bucket-a");
-            let payload = vec![0x5a_u8; PAYLOAD_BYTES];
-            let verified = VerifiedPayload::new(Bytes::from(payload.clone()));
-            let mut sequence = 1_u64;
-            let started = Instant::now();
-            for _ in 0..BATCHES {
-                let mut prepared = Vec::with_capacity(batch);
-                for _ in 0..batch {
-                    prepared.push(
-                        journal
-                            .prepare_verified_put(
-                                put_record(sequence, &format!("segments/{sequence}"), &payload),
-                                &verified,
-                            )
-                            .unwrap(),
-                    );
-                    sequence += 1;
+        const TOTAL_BYTES: usize = 128 * 1024 * 1024;
+        for payload_bytes in [64 * 1024_usize, 256 * 1024, 1024 * 1024] {
+            for batch in [1_usize, 8, 64, 512] {
+                let records = (TOTAL_BYTES / payload_bytes).min(batch * 64);
+                let temp = tempfile::tempdir().unwrap();
+                let journal = open_temp_journal(&temp, "bucket-a");
+                let payload = vec![0x5a_u8; payload_bytes];
+                let verified = VerifiedPayload::new(Bytes::from(payload.clone()));
+                let prebuilt = (1..=records as u64)
+                    .map(|sequence| {
+                        put_record(sequence, &format!("segments/{sequence}"), &payload)
+                    })
+                    .collect::<Vec<_>>();
+
+                let started = Instant::now();
+                for chunk in prebuilt.chunks(batch) {
+                    let prepared = chunk
+                        .iter()
+                        .map(|record| {
+                            journal
+                                .prepare_verified_put(record.clone(), &verified)
+                                .unwrap()
+                        })
+                        .collect::<Vec<_>>();
+                    journal.publish_batch(prepared).unwrap();
                 }
-                journal.publish_batch(prepared).unwrap();
+                let elapsed = started.elapsed();
+                let total = (records * payload_bytes) as f64 / (1024.0 * 1024.0);
+                println!(
+                    "payload={:>4} KiB batch={batch:>3}: {:.3} ms/record, {:>7.1} MiB/s \
+                     ({records} records, {total:.1} MiB in {:.3}s)",
+                    payload_bytes / 1024,
+                    elapsed.as_secs_f64() * 1000.0 / records as f64,
+                    total / elapsed.as_secs_f64(),
+                    elapsed.as_secs_f64(),
+                );
             }
-            let elapsed = started.elapsed();
-            let records = (BATCHES * batch) as f64;
-            println!(
-                "batch={batch:>2}: {:.3} ms/record, {:.1} MiB/s ({records} records in {:.3}s)",
-                elapsed.as_secs_f64() * 1000.0 / records,
-                records * PAYLOAD_BYTES as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64(),
-                elapsed.as_secs_f64(),
-            );
         }
     }
 
