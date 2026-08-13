@@ -17,7 +17,7 @@ use crate::db::SlateDbHandle;
 use crate::fs::{CacheConfig, ZeroFS};
 use crate::key_management;
 use crate::object_trace::{ObjectTracer, TracingObjectStore};
-use crate::parse_object_store::parse_url_opts_with_sftp;
+use crate::parse_object_store::parse_url_opts;
 use crate::replication::transport::{PromotionSnapshot, ReceiverControl};
 use crate::replication::{LineageProof, PromotionRetryGraceProof, ReplicationParams};
 use crate::storage_class_object_store::with_storage_class;
@@ -142,7 +142,11 @@ impl StartupContext {
         // consumer downstream reads the resolved profile, not the URL.
         let store_profile = settings.store_profile()?;
 
-        let (object_store, path_from_url, sftp_pool) = parse_url_opts_with_sftp(
+        let crate::parse_object_store::ParsedStore {
+            store: object_store,
+            path: path_from_url,
+            sftp_pool,
+        } = parse_url_opts(
             &url.parse().context("Failed to parse storage URL")?,
             env_vars,
             settings.sftp.as_ref(),
@@ -213,7 +217,7 @@ impl StartupContext {
                 if let Some(wal_config) = &settings.wal {
                     info!("Using separate WAL object store: {}", wal_config.url);
                     Some(
-                        parse_wal_object_store(wal_config)
+                        parse_wal_object_store(wal_config).await
                             .context("Failed to connect to WAL object store")?,
                     )
                 } else {

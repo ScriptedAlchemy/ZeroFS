@@ -50,18 +50,21 @@ pub async fn change_password(
 
     let env_vars = settings.cloud_provider_env_vars();
 
-    let (object_store, path_from_url, sftp_pool) =
-        crate::parse_object_store::parse_url_opts_with_sftp(
-            &settings
-                .storage
-                .url
-                .parse::<url::Url>()
-                .map_err(|e| PasswordError::Other(e.to_string()))?,
-            env_vars,
-            settings.sftp.as_ref(),
-        )
-        .await
-        .map_err(|e| PasswordError::Other(e.to_string()))?;
+    let crate::parse_object_store::ParsedStore {
+        store: object_store,
+        path: path_from_url,
+        sftp_pool,
+    } = crate::parse_object_store::parse_url_opts(
+        &settings
+            .storage
+            .url
+            .parse::<url::Url>()
+            .map_err(|e| PasswordError::Other(e.to_string()))?,
+        env_vars,
+        settings.sftp.as_ref(),
+    )
+    .await
+    .map_err(|e| PasswordError::Other(e.to_string()))?;
 
     let object_store = with_storage_class(
         Arc::from(object_store),

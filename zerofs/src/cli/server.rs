@@ -8,7 +8,7 @@ use crate::fs::{CacheConfig, GarbageCollector, ZeroFS};
 use crate::length_checked_object_store::LengthCheckedObjectStore;
 use crate::nbd::{NBDServer, NbdExportGates};
 use crate::object_store_prefetch::PrefetchingObjectStore;
-use crate::parse_object_store::{parse_url_opts, parse_url_opts_with_sftp};
+use crate::parse_object_store::{ParsedStore, parse_url_opts};
 use crate::storage_class_object_store::with_storage_class;
 use crate::task::spawn_named;
 use anyhow::{Context, Result};
@@ -38,11 +38,17 @@ const SERVER_AUTHORITY_FINISH_TIMEOUT: Duration = Duration::from_secs(10);
 const SFTP_CHECKPOINT_POOL_CLEANUP: &str = "Failed to shut down SFTP checkpoint pool";
 
 /// Parse a WAL config into an object store rooted at the full URL path.
-pub(crate) fn parse_wal_object_store(
+pub(crate) async fn parse_wal_object_store(
     wal_config: &crate::config::WalConfig,
 ) -> Result<Arc<dyn object_store::ObjectStore>> {
     let env_vars = wal_config.cloud_provider_env_vars();
-    let (store, path) = parse_url_opts(&wal_config.url.parse()?, env_vars)?;
+    let url: url::Url = wal_config.url.parse()?;
+    // The WAL path has no owner for an SFTP pool's lifecycle; refuse rather
+    // than leak a transport.
+    if url.scheme() == "sftp" {
+        anyhow::bail!("the WAL object store does not support sftp:// URLs");
+    }
+    let ParsedStore { store, path, .. } = parse_url_opts(&url, env_vars, None).await?;
     let path_str: &str = path.as_ref();
     let store: Arc<dyn object_store::ObjectStore> = if path_str.is_empty() {
         Arc::from(store)
@@ -70,7 +76,11 @@ impl DatabaseMode {
 
 async fn resolve_checkpoint_name(settings: &Settings, name: &str) -> Result<uuid::Uuid> {
     let env_vars = settings.cloud_provider_env_vars();
-    let (object_store, path_from_url, sftp_pool) = parse_url_opts_with_sftp(
+    let ParsedStore {
+        store: object_store,
+        path: path_from_url,
+        sftp_pool,
+    } = parse_url_opts(
         &settings.storage.url.parse()?,
         env_vars,
         settings.sftp.as_ref(),
@@ -84,7 +94,7 @@ async fn resolve_checkpoint_name(settings: &Settings, name: &str) -> Result<uuid
 
     let mut admin_builder = AdminBuilder::new(db_path, object_store);
     if let Some(wal_config) = &settings.wal {
-        let wal_object_store = match parse_wal_object_store(wal_config) {
+        let wal_object_store = match parse_wal_object_store(wal_config).await {
             Ok(store) => store,
             Err(error) => {
                 return finish_with_sftp_cleanup(

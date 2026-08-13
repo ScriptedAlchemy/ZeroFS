@@ -5,7 +5,7 @@ use crate::db::SlateDbHandle;
 use crate::fs::CacheConfig;
 use crate::fs::key_codec::{EXTENT_DOMAIN, KeyCodec, KeyPrefix, META_DOMAIN, ParsedKey};
 use crate::key_management;
-use crate::parse_object_store::parse_url_opts_with_sftp;
+use crate::parse_object_store::parse_url_opts;
 use crate::storage_class_object_store::with_storage_class;
 use anyhow::{Context, Result};
 use object_store::ObjectStoreExt;
@@ -109,8 +109,11 @@ pub async fn list_keys(config_path: PathBuf) -> Result<()> {
     };
 
     let env_vars = settings.cloud_provider_env_vars();
-    let (object_store, path_from_url, sftp_pool) =
-        parse_url_opts_with_sftp(&url.parse()?, env_vars, settings.sftp.as_ref()).await?;
+    let crate::parse_object_store::ParsedStore {
+        store: object_store,
+        path: path_from_url,
+        sftp_pool,
+    } = parse_url_opts(&url.parse()?, env_vars, settings.sftp.as_ref()).await?;
     let command_result: Result<()> = async move {
         let object_store = with_storage_class(
             Arc::from(object_store),
@@ -143,7 +146,7 @@ pub async fn list_keys(config_path: PathBuf) -> Result<()> {
 
         let wal_object_store: Option<Arc<dyn object_store::ObjectStore>> =
             if let Some(wal_config) = &settings.wal {
-                Some(super::server::parse_wal_object_store(wal_config)?)
+                Some(super::server::parse_wal_object_store(wal_config).await?)
             } else {
                 None
             };
@@ -255,7 +258,11 @@ pub async fn reseed_writeback_predecessor(
         anyhow::bail!("[writeback] must be enabled in the supplied config");
     }
     let env_vars = settings.cloud_provider_env_vars();
-    let (remote, _, sftp_pool) = parse_url_opts_with_sftp(
+    let crate::parse_object_store::ParsedStore {
+        store: remote,
+        sftp_pool,
+        ..
+    } = parse_url_opts(
         &settings.storage.url.parse()?,
         env_vars,
         settings.sftp.as_ref(),

@@ -48,11 +48,6 @@ pub enum Error {
         source: object_store::path::Error,
     },
 
-    #[error(
-        "SFTP backend transport is not yet wired; startup refused before capability verification (requires fsync@openssh.com and posix-rename@openssh.com)"
-    )]
-    SftpTransportUnavailable,
-
     #[error("Invalid SFTP URL: a host is required")]
     SftpHostRequired,
 
@@ -135,18 +130,6 @@ impl ObjectStoreScheme {
     /// assert_eq!(path.as_ref(), "path/to/my/file");
     /// ```
     pub fn parse(url: &Url) -> Result<(Self, Path), Error> {
-        if url.scheme() == "sftp" {
-            if url.password().is_some() {
-                return Err(Error::SftpPasswordNotAllowed);
-            }
-            if url.host_str().is_none_or(str::is_empty) {
-                return Err(Error::SftpHostRequired);
-            }
-            if url.username().is_empty() {
-                return Err(Error::SftpUsernameRequired);
-            }
-        }
-
         let strip_bucket = || Some(url.path().strip_prefix('/')?.split_once('/')?.1);
 
         let (scheme, path) = match (url.scheme(), url.host_str()) {
@@ -157,7 +140,9 @@ impl ObjectStoreScheme {
             ("az", Some(_)) => (Self::MicrosoftAzure, strip_bucket().unwrap_or_default()),
             ("adl" | "azure" | "abfs" | "abfss", Some(_)) => (Self::MicrosoftAzure, url.path()),
             ("http", Some(_)) => (Self::Http, url.path()),
-            ("sftp", Some(_)) => (Self::Sftp, url.path()),
+            // Hostless sftp URLs still classify as Sftp so the build arm can
+            // report the specific URL-shape error.
+            ("sftp", _) => (Self::Sftp, url.path()),
             ("https", Some(host)) => {
                 if host.ends_with("dfs.core.windows.net")
                     || host.ends_with("blob.core.windows.net")
@@ -183,11 +168,22 @@ impl ObjectStoreScheme {
     }
 }
 
+/// A parsed storage target: the store, the root path within it, and (for
+/// backends with an owned transport, currently SFTP) the session pool whose
+/// shutdown the caller owns.
+#[derive(Debug)]
+pub struct ParsedStore {
+    pub store: Box<dyn ObjectStore>,
+    pub path: Path,
+    pub sftp_pool: Option<crate::sftp_transport::SftpSessionPool>,
+}
+
 /// Create an [`ObjectStore`] based on the provided `url` and options
 ///
 /// This method can be used to create an instance of one of the provided
 /// `ObjectStore` implementations based on the URL scheme (see
-/// [`ObjectStoreScheme`] for more details).
+/// [`ObjectStoreScheme`] for more details). It is the single entry point for
+/// every scheme, including SFTP; `sftp_config` is ignored for other backends.
 ///
 /// For example
 /// * `file:///path/to/my/file` will return a [`LocalFileSystem`] instance
@@ -200,16 +196,15 @@ impl ObjectStoreScheme {
 ///   the options that are read depends on the `url` value. One common pattern
 ///   is to pass configuration information via process variables using
 ///   [`std::env::vars`].
-///
-/// Returns
-/// - An [`ObjectStore`] of the corresponding type
-/// - The [`Path`] into the [`ObjectStore`] of the addressed resource
+/// * `sftp_config`: Transport tuning for `sftp://` URLs; defaults apply when
+///   absent.
 ///
 /// [`AmazonS3`]: https://docs.rs/object_store/0.12.0/object_store/aws/struct.AmazonS3.html
-pub fn parse_url_opts<I, K, V>(
+pub async fn parse_url_opts<I, K, V>(
     url: &Url,
     options: I,
-) -> Result<(Box<dyn ObjectStore>, Path), object_store::Error>
+    sftp_config: Option<&crate::config::SftpConfig>,
+) -> Result<ParsedStore, object_store::Error>
 where
     I: IntoIterator<Item = (K, V)>,
     K: AsRef<str>,
@@ -217,6 +212,10 @@ where
 {
     let (scheme, path) = ObjectStoreScheme::parse(url)?;
     let path = Path::parse(path)?;
+
+    if scheme == ObjectStoreScheme::Sftp {
+        return build_sftp_store(url, path, sftp_config).await;
+    }
 
     let store: Box<dyn ObjectStore> = match scheme {
         // `with_fsync(true)` makes a successful write durable on disk before it
@@ -301,7 +300,7 @@ where
             );
             Box::new(builder.build()?)
         }
-        ObjectStoreScheme::Sftp => return Err(Error::SftpTransportUnavailable.into()),
+        ObjectStoreScheme::Sftp => unreachable!("sftp URLs are built above"),
         s => {
             return Err(object_store::Error::Generic {
                 store: "parse_url",
@@ -310,33 +309,35 @@ where
         }
     };
 
-    Ok((store, path))
+    Ok(ParsedStore {
+        store,
+        path,
+        sftp_pool: None,
+    })
 }
 
-/// Create an object store, including the native async SFTP transport.
-pub async fn parse_url_opts_with_sftp<I, K, V>(
-    url: &Url,
-    options: I,
-    sftp_config: Option<&crate::config::SftpConfig>,
-) -> Result<
-    (
-        Box<dyn ObjectStore>,
-        Path,
-        Option<crate::sftp_transport::SftpSessionPool>,
-    ),
-    object_store::Error,
->
-where
-    I: IntoIterator<Item = (K, V)>,
-    K: AsRef<str>,
-    V: Into<String>,
-{
-    let (scheme, path) = ObjectStoreScheme::parse(url)?;
-    if scheme != ObjectStoreScheme::Sftp {
-        let (store, path) = parse_url_opts(url, options)?;
-        return Ok((store, path, None));
+/// URL-shape rules specific to the SFTP scheme, enforced where the SFTP
+/// store is built so `ObjectStoreScheme::parse` stays table-driven.
+fn validate_sftp_url(url: &Url) -> Result<(), Error> {
+    if url.password().is_some() {
+        return Err(Error::SftpPasswordNotAllowed);
     }
+    if url.host_str().is_none_or(str::is_empty) {
+        return Err(Error::SftpHostRequired);
+    }
+    if url.username().is_empty() {
+        return Err(Error::SftpUsernameRequired);
+    }
+    Ok(())
+}
 
+/// Build the native async SFTP transport, pool, and store.
+async fn build_sftp_store(
+    url: &Url,
+    path: Path,
+    sftp_config: Option<&crate::config::SftpConfig>,
+) -> Result<ParsedStore, object_store::Error> {
+    validate_sftp_url(url)?;
     crate::sftp_object_store::SftpObjectStore::validate_prefix(&path)?;
 
     let config = sftp_config.cloned().unwrap_or_default();
@@ -365,7 +366,11 @@ where
                 source: Box::new(source),
             })?;
     let store = crate::sftp_object_store::SftpObjectStore::new(pool.clone(), path.clone())?;
-    Ok((Box::new(store), path, Some(pool)))
+    Ok(ParsedStore {
+        store: Box::new(store),
+        path,
+        sftp_pool: Some(pool),
+    })
 }
 
 #[cfg(test)]
@@ -531,28 +536,11 @@ mod tests {
         assert_eq!(path, Path::parse("zerofs/v1").unwrap());
     }
 
-    #[test]
-    fn sftp_parser_refuses_to_return_an_unwired_store() {
-        let url = Url::parse("sftp://alice@example.com/data").unwrap();
-
-        let err = parse_url_opts(&url, std::iter::empty::<(&str, &str)>()).unwrap_err();
-        let message = err.to_string();
-
-        assert!(
-            message.contains("transport is not yet wired"),
-            "got: {message}"
-        );
-        assert!(message.contains("fsync@openssh.com"), "got: {message}");
-        assert!(
-            message.contains("posix-rename@openssh.com"),
-            "got: {message}"
-        );
-    }
-
-    #[test]
-    fn sftp_parser_requires_host() {
+    #[tokio::test]
+    async fn sftp_parser_requires_host() {
         let missing_host = Url::parse("sftp:///data").unwrap();
-        let error = parse_url_opts(&missing_host, std::iter::empty::<(&str, &str)>())
+        let error = parse_url_opts(&missing_host, std::iter::empty::<(&str, &str)>(), None)
+            .await
             .unwrap_err()
             .to_string();
         assert_eq!(
@@ -561,10 +549,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn sftp_parser_requires_username() {
+    #[tokio::test]
+    async fn sftp_parser_requires_username() {
         let missing_username = Url::parse("sftp://example.com/data").unwrap();
-        let error = parse_url_opts(&missing_username, std::iter::empty::<(&str, &str)>())
+        let error = parse_url_opts(&missing_username, std::iter::empty::<(&str, &str)>(), None)
+            .await
             .unwrap_err()
             .to_string();
         assert_eq!(
@@ -573,11 +562,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn sftp_parser_rejects_password_without_leaking_it() {
+    #[tokio::test]
+    async fn sftp_parser_rejects_password_without_leaking_it() {
         let secret = "parser-login-secret";
         let password_url = Url::parse(&format!("sftp://alice:{secret}@example.com/data")).unwrap();
-        let error = parse_url_opts(&password_url, std::iter::empty::<(&str, &str)>())
+        let error = parse_url_opts(&password_url, std::iter::empty::<(&str, &str)>(), None)
+            .await
             .unwrap_err()
             .to_string();
         assert!(error.contains("password"), "got: {error}");
