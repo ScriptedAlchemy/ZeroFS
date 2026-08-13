@@ -89,14 +89,21 @@
 //! * [`Journal::commit_staged`] runs step 3. This is the only point at which
 //!   a record becomes ACKable.
 //!
-//! The journaler keeps one batch in each half, so batch N+1's bytes reach the
-//! device while batch N's metadata commits. The durability contract survives
-//! the overlap because it is per record, not global: a record's own container
-//! is fsynced before its own commit, and only its own commit releases
-//! `wait_local`. Ordering survives because exactly one commit runs at a time,
-//! batches enter the commit half in assembly order, and `commit_record_batch`
-//! independently refuses any batch that is not contiguous with the durable
-//! watermark -- so interleaved writes cannot produce interleaved commits.
+//! The journaler runs several batches through these halves at once: bytes for
+//! one batch reach the device while another's metadata commits, and more than
+//! one container may be writing at a time. Concurrency here is not incidental
+//! -- one writer leaves the device short of queue depth, and that deficit is
+//! what made a single serial container slower at large records than the
+//! per-record layout it replaced, which got its parallelism from writing many
+//! small blobs at once.
+//!
+//! The durability contract survives the overlap because it is per record, not
+//! global: a record's own container is fsynced before its own commit, and only
+//! its own commit releases `wait_local`. Ordering survives because exactly one
+//! commit runs at a time, batches enter the commit half in assembly order
+//! rather than completion order, and `commit_record_batch` independently
+//! refuses any batch that is not contiguous with the durable watermark -- so
+//! interleaved writes cannot produce interleaved commits.
 //!
 //! Staging cannot read the watermark to check contiguity, precisely because
 //! it runs ahead of it; it takes the expected first sequence from its caller

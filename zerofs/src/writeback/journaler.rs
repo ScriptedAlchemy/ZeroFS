@@ -6,7 +6,7 @@ use crate::writeback::payload::VerifiedPayload;
 use anyhow::Result as AnyResult;
 use bytes::Bytes;
 use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -175,6 +175,18 @@ const MAX_LOCAL_PUBLISH_BATCH_RECORD_BYTES: usize = 16 * 1024 * 1024;
 // straddling the remote watermark keeps its already-drained members on disk
 // until its final member drains, and that is at most this many bytes.
 const MAX_LOCAL_PUBLISH_BATCH_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
+// How many containers may be written at once. A single writer leaves the
+// device short of queue depth: measured on the target SSD with real (not
+// all-zero) payloads, one writer sustains ~745 MiB/s of durable writes where
+// two reach ~840 and four ~910. Two is where most of that gain lands, and it
+// caps the payload bytes held across publication at two containers.
+const MAX_CONCURRENT_CONTAINER_WRITES: usize = 2;
+// Total batches between assembly and commit. Without this the drain would
+// assemble as fast as records arrive and publish them one or two at a time;
+// letting only one batch queue behind the writers is what makes the backlog
+// accumulate into large containers under load, which is where the container's
+// amortization comes from.
+const MAX_IN_FLIGHT_PUBLICATION_BATCHES: usize = MAX_CONCURRENT_CONTAINER_WRITES + 1;
 
 #[derive(Clone)]
 pub struct LocalJournaler {
@@ -806,9 +818,11 @@ async fn run_journaler(
     // contiguous with the durable watermark. A record is still ACKed only by
     // its own commit completing, which happens strictly after its own
     // container was fsynced.
-    let mut staging: Option<JoinHandle<AnyResult<StagedBatch>>> = None;
-    let mut staging_ownership: BatchOwnership = Vec::new();
-    let mut ready: Option<(StagedBatch, BatchOwnership)> = None;
+    let mut staging: FuturesUnordered<JoinHandle<(Sequence, AnyResult<StagedBatch>)>> =
+        FuturesUnordered::new();
+    let mut staged_ownership: BTreeMap<Sequence, BatchOwnership> = BTreeMap::new();
+    let mut ready: BTreeMap<Sequence, StagedBatch> = BTreeMap::new();
+    let mut commit_order: VecDeque<Sequence> = VecDeque::new();
     let mut committing: Option<JoinHandle<AnyResult<Vec<MutationRecord>>>> = None;
     let mut committing_ownership: BatchOwnership = Vec::new();
 
@@ -825,12 +839,18 @@ async fn run_journaler(
             }
         }
 
-        // Hand the staged batch to the commit half as soon as that half is
-        // free, so the next container write can start behind it.
+        // Commit the oldest staged batch as soon as the commit half is free.
+        // Containers may finish out of order, so the commit slot is fed from
+        // assembly order, never from completion order.
         if terminal.is_none()
             && committing.is_none()
-            && let Some((staged, ownership)) = ready.take()
+            && let Some(first) = commit_order.front().copied()
+            && let Some(staged) = ready.remove(&first)
         {
+            commit_order.pop_front();
+            let ownership = staged_ownership
+                .remove(&first)
+                .expect("a staged batch owns its permits");
             let commit_sink = sink.clone();
             committing = Some(tokio::task::spawn_blocking(move || {
                 commit_sink.commit_staged(staged)
@@ -838,11 +858,22 @@ async fn run_journaler(
             committing_ownership = ownership;
         }
 
-        // Stage the next batch whenever the staging half is free. This is the
-        // overlap: it runs while the previous batch commits.
-        if terminal.is_none() && staging.is_none() && ready.is_none() {
+        // Keep the staging half busy. One container at a time leaves the
+        // device short of queue depth -- a single writer tops out well below
+        // what a few concurrent ones reach -- so more than one batch may be
+        // writing its container at once. They are distinct files over disjoint
+        // sequence ranges, so the writes are independent; only the commits are
+        // ordered.
+        while terminal.is_none()
+            && staging.len() < MAX_CONCURRENT_CONTAINER_WRITES
+            && staging.len() + ready.len() + usize::from(committing.is_some())
+                < MAX_IN_FLIGHT_PUBLICATION_BATCHES
+        {
             match assemble_batch(&mut prepared, next_admitted) {
-                Err(error) => terminal = Some(error),
+                Err(error) => {
+                    terminal = Some(error);
+                    break;
+                }
                 Ok(Some(AssembledBatch {
                     mutations,
                     ownership,
@@ -860,28 +891,32 @@ async fn run_journaler(
                             // impossible successor instead of wrapping.
                             terminal = Some("local journal sequence overflow".to_owned());
                             drop(ownership);
-                            continue;
+                            break;
                         }
                     };
                     let stage_sink = sink.clone();
-                    staging = Some(tokio::task::spawn_blocking(move || {
-                        stage_sink.stage_batch(mutations, expected_first)
+                    staging.push(tokio::task::spawn_blocking(move || {
+                        (
+                            expected_first,
+                            stage_sink.stage_batch(mutations, expected_first),
+                        )
                     }));
-                    staging_ownership = ownership;
+                    staged_ownership.insert(expected_first, ownership);
+                    commit_order.push_back(expected_first);
                 }
-                Ok(None) => {}
+                Ok(None) => break,
             }
         }
 
-        if terminal.is_some() && staging.is_none() && committing.is_none() {
+        if terminal.is_some() && staging.is_empty() && committing.is_none() {
             break;
         }
         if terminal.is_none()
             && input_closed
             && preparations.is_empty()
             && prepared.is_empty()
-            && staging.is_none()
-            && ready.is_none()
+            && staging.is_empty()
+            && ready.is_empty()
             && committing.is_none()
         {
             break;
@@ -907,11 +942,12 @@ async fn run_journaler(
                     terminal = Some(error);
                 }
             }
-            result = join_pipeline_half(&mut staging), if staging.is_some() => {
-                let ownership = std::mem::take(&mut staging_ownership);
+            Some(result) = staging.next(), if !staging.is_empty() => {
                 match result {
-                    Ok(Ok(staged)) => {
-                        let expected = ownership
+                    Ok((first, Ok(staged))) => {
+                        let expected = staged_ownership
+                            .get(&first)
+                            .expect("a staged batch owns its permits")
                             .iter()
                             .map(|(sequence, _, _)| *sequence)
                             .collect::<Vec<_>>();
@@ -922,7 +958,8 @@ async fn run_journaler(
                             // staged something else would release the wrong
                             // ones. Refuse it rather than commit it.
                             let _ = sink.discard_staged(staged);
-                            drop(ownership);
+                            staged_ownership.remove(&first);
+                            commit_order.retain(|queued| *queued != first);
                             if terminal.is_none() {
                                 terminal = Some(format!(
                                     "local journal stager returned sequences {actual:?}, expected {expected:?}"
@@ -933,19 +970,20 @@ async fn run_journaler(
                             // reference them; unlink instead of leaking until
                             // the next open collects it.
                             let _ = sink.discard_staged(staged);
-                            drop(ownership);
+                            staged_ownership.remove(&first);
+                            commit_order.retain(|queued| *queued != first);
                         } else {
-                            ready = Some((staged, ownership));
+                            ready.insert(first, staged);
                         }
                     }
-                    Ok(Err(error)) => {
-                        drop(ownership);
+                    Ok((first, Err(error))) => {
+                        staged_ownership.remove(&first);
+                        commit_order.retain(|queued| *queued != first);
                         if terminal.is_none() {
                             terminal = Some(format!("{error:#}"));
                         }
                     }
                     Err(error) => {
-                        drop(ownership);
                         if terminal.is_none() {
                             terminal = Some(format!("local journal stager panicked: {error}"));
                         }
@@ -991,10 +1029,12 @@ async fn run_journaler(
         }
     }
 
-    if let Some((staged, ownership)) = ready.take() {
+    // Anything staged but never committed is durable bytes nothing will ever
+    // reference. Recovery would collect it from its name, but unlink it now.
+    for (_, staged) in std::mem::take(&mut ready) {
         let _ = sink.discard_staged(staged);
-        drop(ownership);
     }
+    drop(std::mem::take(&mut staged_ownership));
     if let Some(error) = terminal {
         admission.poison(error.clone());
         progress.send_modify(|state| state.terminal_error = Some(error.clone()));
@@ -1112,6 +1152,31 @@ mod tests {
         commit_release: Mutex<Option<mpsc::Receiver<()>>>,
         fail_stage_from: Option<Sequence>,
         staged: tokio_mpsc::UnboundedSender<Vec<Sequence>>,
+        stage_gate_on: Option<Sequence>,
+        stage_entered: Option<tokio_mpsc::UnboundedSender<Sequence>>,
+        stage_release: Mutex<Option<mpsc::Receiver<()>>>,
+    }
+
+    impl PipelineGateSink {
+        fn new(
+            journal: Arc<Journal>,
+            commit_gate_on: Sequence,
+            commit_entered: tokio_mpsc::UnboundedSender<Vec<Sequence>>,
+            commit_release: mpsc::Receiver<()>,
+            staged: tokio_mpsc::UnboundedSender<Vec<Sequence>>,
+        ) -> Self {
+            Self {
+                journal,
+                commit_gate_on,
+                commit_entered,
+                commit_release: Mutex::new(Some(commit_release)),
+                fail_stage_from: None,
+                staged,
+                stage_gate_on: None,
+                stage_entered: None,
+                stage_release: Mutex::new(None),
+            }
+        }
     }
 
     impl LocalJournalSink for PipelineGateSink {
@@ -1143,6 +1208,18 @@ mod tests {
                 // wait for it instead of racing the pipeline.
                 self.staged.send(Vec::new()).unwrap();
                 bail!("injected staging failure at {expected_first}");
+            }
+            if let Some(entered) = &self.stage_entered {
+                entered.send(expected_first).unwrap();
+            }
+            if self.stage_gate_on == Some(expected_first) {
+                self.stage_release
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("stage release gate exists")
+                    .recv()
+                    .unwrap();
             }
             let staged = self.journal.stage_batch(prepared, expected_first)?;
             self.staged.send(staged.sequences()).unwrap();
@@ -2570,14 +2647,13 @@ mod tests {
         let (commit_entered_tx, mut commit_entered) = tokio_mpsc::unbounded_channel();
         let (staged_tx, _staged) = tokio_mpsc::unbounded_channel();
         let (release_tx, release_rx) = mpsc::channel();
-        let sink = Arc::new(PipelineGateSink {
-            journal: journal.clone(),
-            commit_gate_on: 1,
-            commit_entered: commit_entered_tx,
-            commit_release: Mutex::new(Some(release_rx)),
-            fail_stage_from: None,
-            staged: staged_tx,
-        });
+        let sink = Arc::new(PipelineGateSink::new(
+            journal.clone(),
+            1,
+            commit_entered_tx,
+            release_rx,
+            staged_tx,
+        ));
         let admission = Admission::new(64);
         let journaler =
             LocalJournaler::start_with_sink_and_observer(sink, admission.clone(), 0, 8, 8, None);
@@ -2633,14 +2709,13 @@ mod tests {
         let (commit_entered_tx, mut commit_entered) = tokio_mpsc::unbounded_channel();
         let (staged_tx, mut staged) = tokio_mpsc::unbounded_channel();
         let (release_tx, release_rx) = mpsc::channel();
-        let sink = Arc::new(PipelineGateSink {
-            journal: journal.clone(),
-            commit_gate_on: 1,
-            commit_entered: commit_entered_tx,
-            commit_release: Mutex::new(Some(release_rx)),
-            fail_stage_from: None,
-            staged: staged_tx,
-        });
+        let sink = Arc::new(PipelineGateSink::new(
+            journal.clone(),
+            1,
+            commit_entered_tx,
+            release_rx,
+            staged_tx,
+        ));
         let admission = Admission::new(64);
         let journaler =
             LocalJournaler::start_with_sink_and_observer(sink, admission.clone(), 0, 8, 8, None);
@@ -2699,6 +2774,79 @@ mod tests {
         journaler.shutdown().await.unwrap();
     }
 
+    /// Two containers must be able to write at once. A single writer leaves
+    /// the device short of queue depth, which is exactly the deficit that made
+    /// one serial container slower than the per-record layout it replaced at
+    /// large records.
+    #[tokio::test]
+    async fn two_containers_write_concurrently() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = pipeline_journal(&temp);
+        let (commit_entered_tx, _commit_entered) = tokio_mpsc::unbounded_channel();
+        let (staged_tx, _staged) = tokio_mpsc::unbounded_channel();
+        let (stage_entered_tx, mut stage_entered) = tokio_mpsc::unbounded_channel();
+        let (commit_release_tx, commit_release_rx) = mpsc::channel();
+        let (stage_release_tx, stage_release_rx) = mpsc::channel();
+        let sink = Arc::new(PipelineGateSink {
+            // Park the first container mid-write so the second must overlap it.
+            stage_gate_on: Some(1),
+            stage_entered: Some(stage_entered_tx),
+            stage_release: Mutex::new(Some(stage_release_rx)),
+            // Nothing commits until both have entered staging.
+            commit_gate_on: Sequence::MAX,
+            ..PipelineGateSink::new(
+                journal.clone(),
+                Sequence::MAX,
+                commit_entered_tx,
+                commit_release_rx,
+                staged_tx,
+            )
+        });
+        let admission = Admission::new(64);
+        let journaler =
+            LocalJournaler::start_with_sink_and_observer(sink, admission.clone(), 0, 8, 8, None);
+
+        let ram = admission.reserve(7).await.unwrap().accept();
+        let barrier = journaler
+            .submit_put(
+                put_record(1, b"payload"),
+                Bytes::from_static(b"payload"),
+                ram,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), stage_entered.recv())
+                .await
+                .expect("batch 1 never entered staging")
+                .unwrap(),
+            1
+        );
+
+        let ram = admission.reserve(5).await.unwrap().accept();
+        journaler
+            .submit_put(put_record(2, b"again"), Bytes::from_static(b"again"), ram)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), stage_entered.recv())
+                .await
+                .expect("batch 2 did not start writing while batch 1 was still writing")
+                .unwrap(),
+            2,
+            "a second container must be writable while the first is in flight"
+        );
+
+        stage_release_tx.send(()).unwrap();
+        drop(commit_release_tx);
+
+        barrier.wait_local(2).await.unwrap();
+        assert_eq!(journal.read_blob(1).unwrap(), b"payload");
+        assert_eq!(journal.read_blob(2).unwrap(), b"again");
+        journaler.shutdown().await.unwrap();
+    }
+
     /// The fault path the overlap introduces: staging batch 2 fails while
     /// batch 1 is still inside its commit. The in-flight commit must still be
     /// awaited and honoured -- sequence 1 stays durable and ACKable -- while
@@ -2713,12 +2861,8 @@ mod tests {
         let (staged_tx, mut staged) = tokio_mpsc::unbounded_channel();
         let (release_tx, release_rx) = mpsc::channel();
         let sink = Arc::new(PipelineGateSink {
-            journal: journal.clone(),
-            commit_gate_on: 1,
-            commit_entered: commit_entered_tx,
-            commit_release: Mutex::new(Some(release_rx)),
             fail_stage_from: Some(2),
-            staged: staged_tx,
+            ..PipelineGateSink::new(journal.clone(), 1, commit_entered_tx, release_rx, staged_tx)
         });
         let admission = Admission::new(64);
         let journaler =
