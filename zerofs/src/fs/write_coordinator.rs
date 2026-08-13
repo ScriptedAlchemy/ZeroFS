@@ -43,6 +43,10 @@ pub struct WriteCoordinator {
     #[cfg(test)]
     #[allow(dead_code)] // The binary NBD tests consume this; the lib test target does not.
     apply_probe: Arc<std::sync::Mutex<Option<oneshot::Sender<()>>>>,
+    /// Size of every drained commit batch, in apply order.
+    #[cfg(test)]
+    #[allow(dead_code)] // Consumed by lib tests only.
+    batch_sizes: Arc<std::sync::Mutex<Vec<usize>>>,
 }
 
 /// Commit worker dependencies.
@@ -64,6 +68,8 @@ struct WorkerContext {
     extent_store: ExtentStore,
     #[cfg(test)]
     apply_probe: Arc<std::sync::Mutex<Option<oneshot::Sender<()>>>>,
+    #[cfg(test)]
+    batch_sizes: Arc<std::sync::Mutex<Vec<usize>>>,
 }
 
 impl WriteCoordinator {
@@ -87,6 +93,8 @@ impl WriteCoordinator {
         let (sender, receiver) = mpsc::unbounded_channel();
         #[cfg(test)]
         let apply_probe = Arc::new(std::sync::Mutex::new(None));
+        #[cfg(test)]
+        let batch_sizes = Arc::new(std::sync::Mutex::new(Vec::new()));
         let ctx = WorkerContext {
             db,
             inode_store,
@@ -101,12 +109,16 @@ impl WriteCoordinator {
             extent_store,
             #[cfg(test)]
             apply_probe: Arc::clone(&apply_probe),
+            #[cfg(test)]
+            batch_sizes: Arc::clone(&batch_sizes),
         };
         spawn_named("commit-worker", worker_loop(ctx, receiver, initial_counter));
         Self {
             sender,
             #[cfg(test)]
             apply_probe,
+            #[cfg(test)]
+            batch_sizes,
         }
     }
 
@@ -141,6 +153,18 @@ impl WriteCoordinator {
             .replace(reached);
         assert!(previous.is_none(), "an apply probe is already installed");
         receiver
+    }
+
+    /// Size of every commit batch the worker has drained so far, in apply
+    /// order. A wave of concurrent writers that fragments into many singleton
+    /// batches shows up here as a run of 1s.
+    #[cfg(test)]
+    #[allow(dead_code)] // Consumed by lib tests only.
+    pub(crate) fn batch_sizes(&self) -> Vec<usize> {
+        self.batch_sizes
+            .lock()
+            .expect("write coordinator batch-size probe poisoned")
+            .clone()
     }
 
     /// Weak commit handle for data-plane GC and compaction.
@@ -292,6 +316,11 @@ async fn worker_loop(
                 }
             }
         }
+        #[cfg(test)]
+        ctx.batch_sizes
+            .lock()
+            .expect("write coordinator batch-size probe poisoned")
+            .push(batch.len());
 
         let replicating = ctx.replicator.is_some();
         let mut merged = WriteBatch::new();
@@ -692,6 +721,64 @@ mod tests {
             gids: vec![1000],
             groups_complete: true,
         }
+    }
+
+    // One aligned 1 MiB NBD stripe write: four pre-sized member files receive
+    // one 256 KiB chunk each, concurrently, through the shared coordinator.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn presized_member_wave_commits_without_metadata_scans() {
+        let fs = make_fs().await;
+        let member_size = 32 * 1024 * 1024u64;
+        let chunk = 256 * 1024usize;
+        let mut members = Vec::new();
+        for i in 0..4u8 {
+            let (id, _) = fs
+                .create(
+                    &test_creds(),
+                    0,
+                    &[b'm', b'0' + i],
+                    &SetAttributes::default(),
+                )
+                .await
+                .unwrap();
+            // Pre-size to the final length, as provisioning does for members.
+            fs.setattr(
+                &test_creds(),
+                id,
+                &SetAttributes {
+                    size: crate::fs::types::SetSize::Set(member_size),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            members.push(id);
+        }
+
+        let auth = test_auth();
+        let scans_before = fs.db.scan_call_count();
+        let batches_before = fs.write_coordinator.batch_sizes().len();
+        let payload = Bytes::from(vec![7u8; chunk]);
+        let writes = members.iter().map(|id| fs.write(&auth, *id, 0, &payload));
+        for result in futures::future::join_all(writes).await {
+            result.unwrap();
+        }
+        let batches = fs.write_coordinator.batch_sizes()[batches_before..].to_vec();
+        // Today the wave typically fragments into singleton applies (e.g.
+        // [1, 1, 1, 1]); batching is opportunistic, so only the commit total
+        // is deterministic.
+        eprintln!("wave commit batches: {batches:?}");
+        assert_eq!(
+            batches.iter().sum::<usize>(),
+            members.len(),
+            "each member write commits exactly once through the coordinator"
+        );
+        assert_eq!(
+            fs.db.scan_call_count(),
+            scans_before,
+            "a member-chunk wave below pre-sized EOFs must not range-scan \
+             extent metadata"
+        );
     }
 
     #[tokio::test]

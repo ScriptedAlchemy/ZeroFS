@@ -23,6 +23,14 @@ use tracing::error;
 /// this the dispatch overhead outweighs the parallelism.
 const PARALLEL_COMPRESS_MIN_FRAMES: usize = 1024 * 1024 / EXTENT_SIZE;
 
+/// Old-FrameLoc discovery pivot in `stage_edits`: at or below this many
+/// candidate extents, per-key point lookups replace the single range scan.
+/// Bloom filters make lookups of absent keys free, so overwriting holes in a
+/// pre-sized sparse file costs no metadata I/O; a range scan pays read-ahead
+/// in every sorted run regardless. One 1 MiB write spans this many extents,
+/// comfortably above the canonical 256 KiB NBD stripe-member chunk.
+const OLD_DEBIT_POINT_LOOKUPS_MAX: usize = 1024 * 1024 / EXTENT_SIZE;
+
 #[inline]
 fn should_parallel_compress(frame_count: usize) -> bool {
     frame_count >= PARALLEL_COMPRESS_MIN_FRAMES
@@ -212,6 +220,16 @@ impl ExtentStore {
         edits: &[(u64, Option<Bytes>)],
         old_extent_end: u64,
     ) -> Result<(), FsError> {
+        // Extent indices must be unique within one batch (order is free): the
+        // point-lookup path below emits one debit per `edits` entry, so a
+        // duplicated extent would debit the same superseded frame twice.
+        debug_assert!(
+            {
+                let mut seen = HashSet::new();
+                edits.iter().all(|(e, _)| seen.insert(*e))
+            },
+            "stage_edits requires unique extent indices per batch"
+        );
         let mut old_debits: Vec<(Segid, u32)> = Vec::new();
         if let (Some(min), Some(max)) = (
             edits.iter().map(|(e, _)| *e).min(),
@@ -222,31 +240,61 @@ impl ExtentStore {
             // supersede an old FrameLoc. Keep the unaligned old tail in range,
             // but do not make append-only metadata reads for newer extents.
             let scan_end = max.saturating_add(1).min(old_extent_end);
-            let edited: HashSet<u64> = edits
-                .iter()
-                .map(|(e, _)| *e)
-                .filter(|extent| *extent < scan_end)
-                .collect();
-            old_debits.reserve(edited.len());
-            let start_key = self.key_codec.extent_key(id, min);
-            let end_key = self.key_codec.extent_key(id, scan_end);
             #[cfg(test)]
             self.old_extent_scan_ranges
                 .lock()
                 .unwrap()
                 .push((min, scan_end));
-            let mut stream = self
-                .db
-                .scan(start_key..end_key)
-                .await
-                .map_err(|_| FsError::IoError)?;
-            while let Some(result) = stream.next().await {
-                let (key, value) = result.map_err(|_| FsError::IoError)?;
-                if let Some(extent_idx) = self.key_codec.parse_extent_key(&key)
-                    && edited.contains(&extent_idx)
-                    && let Some(loc) = FrameLoc::decode(&value)
-                {
-                    old_debits.push((loc.segid, loc.byte_len));
+            let edited: Vec<u64> = edits
+                .iter()
+                .map(|(e, _)| *e)
+                .filter(|extent| *extent < scan_end)
+                .collect();
+            if edited.len() <= OLD_DEBIT_POINT_LOOKUPS_MAX {
+                // Few candidates: per-key point lookups. SlateDB answers an
+                // absent key from bloom filters, so overwriting holes in a
+                // pre-sized sparse file (the NBD stripe-member shape) needs no
+                // metadata I/O, while a range scan pays iterator setup plus
+                // read-ahead in every sorted run even when the range is empty.
+                let found: Vec<Option<(Segid, u32)>> = stream::iter(edited)
+                    .map(|extent| async move {
+                        let key = self.key_codec.extent_key(id, extent);
+                        let value = self
+                            .db
+                            .get_bytes(&key)
+                            .await
+                            .map_err(|_| FsError::IoError)?;
+                        Ok::<_, FsError>(
+                            value
+                                .and_then(|v| FrameLoc::decode(&v))
+                                .map(|loc| (loc.segid, loc.byte_len)),
+                        )
+                    })
+                    .buffer_unordered(PARALLEL_EXTENT_OPS)
+                    .try_collect()
+                    .await?;
+                old_debits.extend(found.into_iter().flatten());
+            } else {
+                // Wide candidate sets (bulk hole punches, range deletes) keep
+                // the single range scan: one iterator beats thousands of gets
+                // over a dense key range.
+                let edited: HashSet<u64> = edited.into_iter().collect();
+                old_debits.reserve(edited.len());
+                let start_key = self.key_codec.extent_key(id, min);
+                let end_key = self.key_codec.extent_key(id, scan_end);
+                let mut stream = self
+                    .db
+                    .scan(start_key..end_key)
+                    .await
+                    .map_err(|_| FsError::IoError)?;
+                while let Some(result) = stream.next().await {
+                    let (key, value) = result.map_err(|_| FsError::IoError)?;
+                    if let Some(extent_idx) = self.key_codec.parse_extent_key(&key)
+                        && edited.contains(&extent_idx)
+                        && let Some(loc) = FrameLoc::decode(&value)
+                    {
+                        old_debits.push((loc.segid, loc.byte_len));
+                    }
                 }
             }
         }
@@ -1882,7 +1930,7 @@ mod tests {
         assert_eq!(
             store.old_extent_scan_ranges().len(),
             scans_before_append,
-            "an aligned append must not scan extents at or beyond old EOF"
+            "an aligned append must not probe extents at or beyond old EOF"
         );
     }
 
@@ -1922,7 +1970,124 @@ mod tests {
         assert_eq!(
             store.old_extent_scan_ranges().last().copied(),
             Some((1, 2)),
-            "an unaligned append must retain the old tail debit scan only"
+            "an unaligned append must probe only the old tail extent for debits"
         );
+    }
+
+    #[tokio::test]
+    async fn presized_sparse_hole_overwrite_runs_no_metadata_scan() {
+        let (store, db) = make().await;
+        let inode: InodeId = 1;
+        // The production NBD stripe-member shape: the member file is truncated
+        // to its final size before the first write, so the inode reports a
+        // large size while every extent is still an untouched hole.
+        let presized = 128 * 1024 * 1024u64;
+        let chunk = 8 * EXTENT_SIZE; // one canonical 256 KiB member chunk
+
+        let scans_before = db.scan_call_count();
+        let mut txn = db.new_transaction().unwrap();
+        let tu = store
+            .write(
+                &mut txn,
+                inode,
+                0,
+                &Bytes::from(incompressible(1, chunk)),
+                presized,
+            )
+            .await
+            .unwrap();
+        commit(&store, txn).await;
+        store.apply_tail_update(inode, tu);
+        assert_eq!(
+            db.scan_call_count(),
+            scans_before,
+            "a small overwrite below a pre-sized EOF must discover superseded \
+             FrameLocs via point lookups, not a SlateDB range scan"
+        );
+    }
+
+    #[tokio::test]
+    async fn presized_sparse_overwrite_still_debits_superseded_frames() {
+        let (store, db) = make().await;
+        let inode: InodeId = 1;
+        let presized = 128 * 1024 * 1024u64;
+        let chunk = 8 * EXTENT_SIZE;
+
+        let mut txn = db.new_transaction().unwrap();
+        let tu = store
+            .write(
+                &mut txn,
+                inode,
+                0,
+                &Bytes::from(incompressible(1, chunk)),
+                presized,
+            )
+            .await
+            .unwrap();
+        commit(&store, txn).await;
+        store.apply_tail_update(inode, tu);
+        let old_segid = frameloc_of(&store, &db, inode, 0).await.unwrap().segid;
+        let (live_before, total_before) = segcount_pair_of(&store, &db, old_segid).await;
+        assert!(live_before > 0);
+        // Rotate so the overwrite's frames land in a fresh segment and the old
+        // segment's counter isolates the debits.
+        store.seal_open().await.unwrap();
+
+        let mut txn = db.new_transaction().unwrap();
+        let tu = store
+            .write(
+                &mut txn,
+                inode,
+                0,
+                &Bytes::from(incompressible(2, chunk)),
+                presized,
+            )
+            .await
+            .unwrap();
+        commit(&store, txn).await;
+        store.apply_tail_update(inode, tu);
+
+        let (live_after, total_after) = segcount_pair_of(&store, &db, old_segid).await;
+        assert_eq!(
+            total_after, total_before,
+            "total is monotonic, never debited"
+        );
+        assert_eq!(
+            live_after, 0,
+            "a pre-sized overwrite must debit every superseded frame"
+        );
+    }
+
+    // Companion to bench_sequential_write_throughput: the same sequential
+    // stream, but into an inode pre-sized to its final length (the production
+    // NBD stripe-member shape), so every write lands below the reported EOF in
+    // an untouched hole.
+    //   cargo test --release --lib -- --ignored --nocapture bench_presized_sparse
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[ignore = "throughput measurement, run explicitly in release"]
+    async fn bench_presized_sparse_overwrite_throughput() {
+        for (name, chunk) in [("256 KiB", 8 * EXTENT_SIZE), ("1 MiB", 32 * EXTENT_SIZE)] {
+            let (store, db, _object_store) = make_with_compression(CompressionConfig::Lz4).await;
+            let total: usize = 512 * 1024 * 1024;
+            let payload = Bytes::from(incompressible(1, chunk));
+            let scans_before = db.scan_call_count();
+            let start = std::time::Instant::now();
+            for i in 0..(total / chunk) {
+                let mut txn = db.new_transaction().unwrap();
+                let tu = store
+                    .write(&mut txn, 1, (i * chunk) as u64, &payload, total as u64)
+                    .await
+                    .unwrap();
+                commit(&store, txn).await;
+                store.apply_tail_update(1, tu);
+            }
+            let secs = start.elapsed().as_secs_f64();
+            let scans = db.scan_call_count() - scans_before;
+            eprintln!(
+                "engine pre-sized sparse overwrite [lz4, incompressible, {name} ops]: \
+                 {:.0} MB/s, {scans} old-extent scans",
+                total as f64 / secs / 1e6
+            );
+        }
     }
 }

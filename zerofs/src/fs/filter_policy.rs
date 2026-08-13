@@ -7,8 +7,10 @@
 //!
 //! Extents are deliberately not extracted: `scan_prefix(extent_inode_prefix)`
 //! would expand the SST set considered (every SST holding any extent of the
-//! inode), losing more on iterator init than the filter can save. The narrow
-//! `scan(extent(id, start)..extent(id, end+1))` is already optimal.
+//! inode), losing more on iterator init than the filter can save. Extent
+//! lookups use either narrow `scan(extent(id, start)..extent(id, end+1))`
+//! ranges or, on the small-write debit path, whole-key point gets that the
+//! default whole-key bloom answers for absent keys.
 
 use slatedb::filter_policy::{BloomFilterPolicy, FilterPolicy};
 use slatedb::prefix_extractor::{PrefixExtractor, PrefixTarget};

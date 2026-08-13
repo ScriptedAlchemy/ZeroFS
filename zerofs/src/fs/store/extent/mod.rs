@@ -209,7 +209,9 @@ pub struct ExtentStore {
     /// Reclaim/compaction counters and footprint gauges, bridged to Prometheus.
     /// Written only by the segment-GC task (see `reclaim_segments_gated`).
     segment_gc_stats: Arc<SegmentGcStats>,
-    /// Actual old-extent debit scan ranges, for focused write-path tests.
+    /// Old-extent debit candidate windows `(min, end)` consulted by
+    /// `stage_edits` (via point lookups or a range scan), for focused
+    /// write-path tests.
     #[cfg(test)]
     old_extent_scan_ranges: Arc<Mutex<Vec<(u64, u64)>>>,
 }
