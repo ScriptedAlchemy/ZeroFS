@@ -4,6 +4,7 @@ use super::out_of_bounds;
 use crate::fs::ZeroFS;
 use bytes::BytesMut;
 use deku::prelude::*;
+use futures::stream::{self, FuturesUnordered, StreamExt};
 use nbd_proto::*;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -494,91 +495,90 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
         Ok(())
     }
 
+    /// Service the transmission phase, overlapping command execution with the
+    /// arrival of later commands on the same connection.
+    ///
+    /// The socket is still read strictly in order — a request's header and, for
+    /// a WRITE, its payload arrive as one contiguous run of bytes, so there is
+    /// no other way to read them. What used to be serial is *execution*: the
+    /// old loop awaited each handler to completion and wrote its reply before
+    /// looking at the socket again, so one connection was serviced at queue
+    /// depth 1 however deep the client queued. Now a command whose wire bytes
+    /// are fully consumed (see [`AdmittedCommand`]) is moved into `inflight`
+    /// and runs while the next request is being read.
+    ///
+    /// Replies leave in completion order rather than submission order, which
+    /// the protocol allows: every simple reply carries the request's cookie,
+    /// and that is what the client matches on.
+    ///
+    /// Ordering that does matter is unchanged, because it never depended on
+    /// this loop. A WRITE takes its admission guard (`begin_mutation`) while
+    /// still being read here, in request order, and holds it until the write
+    /// completes; FLUSH takes the same gate exclusively. So a FLUSH still waits
+    /// for every write admitted before it, whether that write is mid-payload,
+    /// queued, or executing.
     async fn handle_transmission(&mut self, device: NBDDevice) -> Result<()> {
+        let Self {
+            reader,
+            writer,
+            handler,
+            shutdown,
+            ..
+        } = self;
+        let handler = &*handler;
+        let shutdown = &*shutdown;
+        let device = &device;
+
+        // A stream rather than a future rebuilt each iteration, for two
+        // reasons. It borrows the reader exactly once, and — because
+        // `unfold` parks its in-progress future inside the stream — a
+        // `select!` branch that loses the race drops only the `next()` handle,
+        // never the partially completed read. `read_exact` is not
+        // cancellation-safe, so a half-read header or payload must survive.
+        let mut commands = Box::pin(stream::unfold(
+            (reader, false),
+            move |(reader, stop)| async move {
+                if stop {
+                    return None;
+                }
+                match next_admitted(reader, handler, device, shutdown).await {
+                    Ok(None) => None,
+                    Ok(Some(command)) => Some((Ok(command), (reader, false))),
+                    // Surface the failure, then stop reading this session.
+                    Err(e) => Some((Err(e), (reader, true))),
+                }
+            },
+        ));
+        let mut inflight = FuturesUnordered::new();
+        let mut accepting = true;
+
         loop {
-            let mut request_buf = [0u8; NBD_REQUEST_HEADER_SIZE];
+            // Checked before the stream is polled, so a session that is already
+            // shutting down never touches the socket.
+            if accepting && shutdown.is_cancelled() {
+                debug!("NBD client handler shutting down");
+                accepting = false;
+            }
+            let reading = accepting && inflight.len() < MAX_INFLIGHT_COMMANDS;
+            if !reading && inflight.is_empty() {
+                return Ok(());
+            }
 
             tokio::select! {
                 biased;
-                _ = self.shutdown.cancelled() => {
-                    debug!("NBD client handler shutting down");
-                    return Ok(());
+                Some((cookie, result)) = inflight.next(), if !inflight.is_empty() => {
+                    write_simple_reply(writer, cookie, result).await;
                 }
-                result = self.reader.read_exact(&mut request_buf) => {
-                    result?;
-                }
-            }
-
-            let request = NBDRequest::from_bytes((&request_buf, 0))
-                .map_err(|e| NBDError::Protocol(format!("Invalid request: {e}")))?
-                .1;
-
-            debug!(
-                "NBD command: {:?}, offset={}, length={}",
-                request.cmd_type, request.offset, request.length
-            );
-
-            if request.length > MAX_REQUEST_LENGTH {
-                if request.cmd_type == NBDCommand::Write {
-                    return Err(NBDError::Protocol(format!(
-                        "write length {} exceeds max {MAX_REQUEST_LENGTH}",
-                        request.length
-                    )));
-                }
-                self.send_unit_result(request.cookie, Err(CommandError::InvalidArgument))
-                    .await;
-                continue;
-            }
-
-            let fua = (request.flags & NBD_CMD_FLAG_FUA) != 0;
-
-            match request.cmd_type {
-                NBDCommand::Read => {
-                    let result = self
-                        .handler
-                        .read(&device, request.offset, request.length)
-                        .await;
-                    self.send_read_result(request.cookie, result).await;
-                }
-                NBDCommand::Write => {
-                    let result = self
-                        .read_write_data(&device, request.offset, request.length, fua)
-                        .await;
-                    self.send_unit_result(request.cookie, result).await;
-                }
-                NBDCommand::Disconnect => {
-                    info!("Client disconnecting");
-                    return Ok(());
-                }
-                NBDCommand::Flush => {
-                    let result = self.handler.flush(&device).await;
-                    self.send_unit_result(request.cookie, result).await;
-                }
-                NBDCommand::Trim => {
-                    let result = self
-                        .handler
-                        .trim(&device, request.offset, request.length, fua)
-                        .await;
-                    self.send_unit_result(request.cookie, result).await;
-                }
-                NBDCommand::WriteZeroes => {
-                    self.send_unit_result(request.cookie, Err(CommandError::InvalidArgument))
-                        .await;
-                }
-                NBDCommand::Cache => {
-                    let result = self
-                        .handler
-                        .cache(&device, request.offset, request.length)
-                        .await;
-                    self.send_unit_result(request.cookie, result).await;
-                }
-                NBDCommand::Unknown(cmd) => {
-                    warn!("Unknown NBD command: {}", cmd);
-                    self.send_unit_result(
-                        request.cookie,
-                        Err(super::error::CommandError::InvalidArgument),
-                    )
-                    .await;
+                next = commands.next(), if reading => {
+                    match next {
+                        // Disconnect, or shutdown observed mid-read. Stop
+                        // accepting, then drain what was already admitted.
+                        None => accepting = false,
+                        Some(Err(e)) => return Err(e),
+                        Some(Ok((cookie, command))) => inflight.push(async move {
+                            (cookie, run_admitted(handler, device, command).await)
+                        }),
+                    }
                 }
             }
         }
@@ -595,7 +595,10 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
         }
     }
 
-    /// Read write data from stream and delegate to handler
+    /// Read a WRITE's payload off the stream and run it to completion, the way
+    /// the transmission loop does in two stages. Lets a test drive one write
+    /// against a controlled reader without standing up the whole loop.
+    #[cfg(test)]
     async fn read_write_data(
         &mut self,
         device: &NBDDevice,
@@ -603,99 +606,277 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
         length: u32,
         fua: bool,
     ) -> super::error::CommandResult<()> {
-        // Consume an invalid write's payload to keep the request stream aligned.
-        if out_of_bounds(offset, length, device.size()) {
-            let mut remaining = length as usize;
-            let mut buf = vec![0; remaining.min(DISCARD_CHUNK_SIZE)];
-            while remaining > 0 {
-                let chunk = remaining.min(buf.len());
-                self.reader
-                    .read_exact(&mut buf[..chunk])
+        match admit_write(
+            &mut self.reader,
+            &self.handler,
+            device,
+            offset,
+            length,
+            &self.shutdown,
+        )
+        .await?
+        {
+            None => Ok(()),
+            Some((data, admission)) => {
+                self.handler
+                    .write_admitted(device, offset, &data, fua, admission)
                     .await
-                    .map_err(|_| CommandError::IoError)?;
-                remaining -= chunk;
             }
-            return Err(CommandError::NoSpace);
         }
+    }
+}
 
-        if length == 0 {
-            return Ok(());
+/// In-flight commands allowed per connection. Each queued WRITE holds its
+/// payload, so this bounds per-connection memory; it is deep enough to keep the
+/// storage engine busy while a client's queue drains.
+const MAX_INFLIGHT_COMMANDS: usize = 32;
+
+/// A transmission command that owes the socket nothing further: a WRITE already
+/// carries its payload and its admission guard, an oversized or malformed
+/// request has already had its body discarded. Running one therefore needs only
+/// the handler, which is what lets it overlap with the next request's arrival.
+enum AdmittedCommand {
+    Read {
+        offset: u64,
+        length: u32,
+    },
+    Write {
+        offset: u64,
+        data: bytes::Bytes,
+        fua: bool,
+        admission: tokio::sync::OwnedRwLockReadGuard<()>,
+    },
+    Flush,
+    Trim {
+        offset: u64,
+        length: u32,
+        fua: bool,
+    },
+    Cache {
+        offset: u64,
+        length: u32,
+    },
+    /// Resolved while reading: a zero-length write, or a rejected command.
+    Settled(super::error::CommandResult<()>),
+}
+
+/// Take a WRITE's admission and pull its payload off the wire.
+///
+/// Admission is acquired before the payload arrives, so a FLUSH cannot overtake
+/// a request that has already been accepted. `Ok(None)` is a zero-length write:
+/// nothing to admit and nothing to read.
+async fn admit_write<R>(
+    reader: &mut R,
+    handler: &NBDHandler,
+    device: &NBDDevice,
+    offset: u64,
+    length: u32,
+    shutdown: &CancellationToken,
+) -> super::error::CommandResult<Option<(bytes::Bytes, tokio::sync::OwnedRwLockReadGuard<()>)>>
+where
+    R: AsyncRead + Unpin,
+{
+    // Consume an invalid write's payload to keep the request stream aligned.
+    if out_of_bounds(offset, length, device.size()) {
+        let mut remaining = length as usize;
+        let mut buf = vec![0; remaining.min(DISCARD_CHUNK_SIZE)];
+        while remaining > 0 {
+            let chunk = remaining.min(buf.len());
+            reader
+                .read_exact(&mut buf[..chunk])
+                .await
+                .map_err(|_| CommandError::IoError)?;
+            remaining -= chunk;
         }
+        return Err(CommandError::NoSpace);
+    }
 
-        // Admission starts when the valid WRITE request is accepted, before
-        // its payload arrives. A FLUSH on another NBD connection must not
-        // overtake a request whose body is still in flight.
-        let admission = self.handler.begin_mutation(device).await;
-        let mut data = BytesMut::zeroed(length as usize);
-        tokio::select! {
-            _ = self.shutdown.cancelled() => return Err(CommandError::IoError),
-            result = tokio::time::timeout(
-                WRITE_PAYLOAD_TIMEOUT,
-                self.reader.read_exact(&mut data),
-            ) => {
-                match result {
-                    Ok(read) => {
-                        read.map_err(|_| CommandError::IoError)?;
-                    }
-                    Err(_) => {
-                        // The remainder of a timed-out payload cannot be
-                        // distinguished from a later request. Close this
-                        // session after returning EIO rather than continuing
-                        // on a desynchronized transmission stream.
-                        self.shutdown.cancel();
-                        return Err(CommandError::IoError);
-                    }
+    if length == 0 {
+        return Ok(None);
+    }
+
+    let admission = handler.begin_mutation(device).await;
+    let mut data = BytesMut::zeroed(length as usize);
+    tokio::select! {
+        _ = shutdown.cancelled() => return Err(CommandError::IoError),
+        result = tokio::time::timeout(
+            WRITE_PAYLOAD_TIMEOUT,
+            reader.read_exact(&mut data),
+        ) => {
+            match result {
+                Ok(read) => {
+                    read.map_err(|_| CommandError::IoError)?;
+                }
+                Err(_) => {
+                    // The remainder of a timed-out payload cannot be
+                    // distinguished from a later request. Close this session
+                    // after returning EIO rather than continuing on a
+                    // desynchronized transmission stream.
+                    shutdown.cancel();
+                    return Err(CommandError::IoError);
                 }
             }
         }
+    }
 
-        let data = data.freeze();
-        self.handler
+    Ok(Some((data.freeze(), admission)))
+}
+
+/// Read the next request, consuming everything it owes the stream, and return
+/// it ready to run. `Ok(None)` means stop reading: the client disconnected, or
+/// shutdown became observable before the header arrived.
+async fn next_admitted<R>(
+    reader: &mut R,
+    handler: &NBDHandler,
+    device: &NBDDevice,
+    shutdown: &CancellationToken,
+) -> Result<Option<(u64, AdmittedCommand)>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut request_buf = [0u8; NBD_REQUEST_HEADER_SIZE];
+    tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => {
+            debug!("NBD client handler shutting down");
+            return Ok(None);
+        }
+        result = reader.read_exact(&mut request_buf) => {
+            result?;
+        }
+    }
+
+    let request = NBDRequest::from_bytes((&request_buf, 0))
+        .map_err(|e| NBDError::Protocol(format!("Invalid request: {e}")))?
+        .1;
+
+    debug!(
+        "NBD command: {:?}, offset={}, length={}",
+        request.cmd_type, request.offset, request.length
+    );
+
+    if request.length > MAX_REQUEST_LENGTH {
+        if request.cmd_type == NBDCommand::Write {
+            return Err(NBDError::Protocol(format!(
+                "write length {} exceeds max {MAX_REQUEST_LENGTH}",
+                request.length
+            )));
+        }
+        return Ok(Some((
+            request.cookie,
+            AdmittedCommand::Settled(Err(CommandError::InvalidArgument)),
+        )));
+    }
+
+    let fua = (request.flags & NBD_CMD_FLAG_FUA) != 0;
+    let command = match request.cmd_type {
+        NBDCommand::Read => AdmittedCommand::Read {
+            offset: request.offset,
+            length: request.length,
+        },
+        NBDCommand::Write => {
+            match admit_write(
+                reader,
+                handler,
+                device,
+                request.offset,
+                request.length,
+                shutdown,
+            )
+            .await
+            {
+                Ok(Some((data, admission))) => AdmittedCommand::Write {
+                    offset: request.offset,
+                    data,
+                    fua,
+                    admission,
+                },
+                Ok(None) => AdmittedCommand::Settled(Ok(())),
+                Err(e) => AdmittedCommand::Settled(Err(e)),
+            }
+        }
+        NBDCommand::Disconnect => {
+            info!("Client disconnecting");
+            return Ok(None);
+        }
+        NBDCommand::Flush => AdmittedCommand::Flush,
+        NBDCommand::Trim => AdmittedCommand::Trim {
+            offset: request.offset,
+            length: request.length,
+            fua,
+        },
+        NBDCommand::WriteZeroes => AdmittedCommand::Settled(Err(CommandError::InvalidArgument)),
+        NBDCommand::Cache => AdmittedCommand::Cache {
+            offset: request.offset,
+            length: request.length,
+        },
+        NBDCommand::Unknown(cmd) => {
+            warn!("Unknown NBD command: {}", cmd);
+            AdmittedCommand::Settled(Err(CommandError::InvalidArgument))
+        }
+    };
+    Ok(Some((request.cookie, command)))
+}
+
+/// Run an already-admitted command. Touches no socket, so several may be in
+/// flight at once on one connection.
+async fn run_admitted(
+    handler: &NBDHandler,
+    device: &NBDDevice,
+    command: AdmittedCommand,
+) -> super::error::CommandResult<bytes::Bytes> {
+    let empty = bytes::Bytes::new();
+    match command {
+        AdmittedCommand::Read { offset, length } => handler.read(device, offset, length).await,
+        AdmittedCommand::Write {
+            offset,
+            data,
+            fua,
+            admission,
+        } => handler
             .write_admitted(device, offset, &data, fua, admission)
             .await
-    }
-
-    /// Send read result (with data) as NBD reply
-    async fn send_read_result(
-        &mut self,
-        cookie: u64,
-        result: super::error::CommandResult<bytes::Bytes>,
-    ) {
-        match result {
-            Ok(data) => {
-                if let Err(e) = self.send_simple_reply(cookie, NBD_SUCCESS, &data).await {
-                    debug!("Failed to send reply: {:?}", e);
-                }
-            }
-            Err(e) => {
-                let _ = self.send_simple_reply(cookie, e.to_errno(), &[]).await;
-            }
+            .map(|()| empty),
+        AdmittedCommand::Flush => handler.flush(device).await.map(|()| empty),
+        AdmittedCommand::Trim {
+            offset,
+            length,
+            fua,
+        } => handler
+            .trim(device, offset, length, fua)
+            .await
+            .map(|()| empty),
+        AdmittedCommand::Cache { offset, length } => {
+            handler.cache(device, offset, length).await.map(|()| empty)
         }
+        AdmittedCommand::Settled(result) => result.map(|()| empty),
     }
+}
 
-    /// Send unit result (no data) as NBD reply
-    async fn send_unit_result(&mut self, cookie: u64, result: super::error::CommandResult<()>) {
-        match result {
-            Ok(()) => {
-                if let Err(e) = self.send_simple_reply(cookie, NBD_SUCCESS, &[]).await {
-                    debug!("Failed to send reply: {:?}", e);
-                }
-            }
-            Err(e) => {
-                let _ = self.send_simple_reply(cookie, e.to_errno(), &[]).await;
-            }
-        }
-    }
-
-    async fn send_simple_reply(&mut self, cookie: u64, error: u32, data: &[u8]) -> Result<()> {
-        let reply = NBDSimpleReply::new(cookie, error);
-        let reply_bytes = reply.to_bytes()?;
-        self.writer.write_all(&reply_bytes).await?;
+/// Write one simple reply. A failure here is logged rather than propagated: the
+/// read side will observe the same broken connection and end the session.
+async fn write_simple_reply<W>(
+    writer: &mut W,
+    cookie: u64,
+    result: super::error::CommandResult<bytes::Bytes>,
+) where
+    W: AsyncWrite + Unpin,
+{
+    let (error, data) = match result {
+        Ok(data) => (NBD_SUCCESS, data),
+        Err(e) => (e.to_errno(), bytes::Bytes::new()),
+    };
+    let send = async {
+        let reply_bytes = NBDSimpleReply::new(cookie, error).to_bytes()?;
+        writer.write_all(&reply_bytes).await?;
         if !data.is_empty() {
-            self.writer.write_all(data).await?;
+            writer.write_all(&data).await?;
         }
-        self.writer.flush().await?;
-        Ok(())
+        writer.flush().await?;
+        Ok::<(), NBDError>(())
+    };
+    if let Err(e) = send.await {
+        debug!("Failed to send reply: {:?}", e);
     }
 }
 
@@ -1627,8 +1808,73 @@ mod tests {
             );
         }
 
-        // (3) Aggregate across independent connections, which is the only axis
-        // the serial transmission loop leaves open.
+        // (2b) The same writes queued on ONE connection at increasing depth.
+        // A serial transmission loop reads, runs, and replies to one command
+        // before looking at the socket again, so every depth here collapses to
+        // the QD1 number above; overlapping execution is what makes depth mean
+        // anything on a single connection.
+        for queue_depth in [1usize, 4, 16, 32] {
+            let size = 256 * 1024usize;
+            let iterations = (32 * 1024 * 1024 / size) as u64;
+            let slots = EXPORT_BYTES / size as u64;
+            let name = format!("floor-pipe-{queue_depth}");
+            sized_single_file_export(&filesystem, name.as_bytes(), EXPORT_BYTES).await;
+            let (stream, session) = transmission_over_tcp(
+                Arc::clone(&filesystem),
+                Arc::clone(&export_gates),
+                name.as_bytes(),
+            )
+            .await;
+            let (mut rx, mut tx) = tokio::io::split(stream);
+            // Bounds how many requests are outstanding, so `queue_depth` is the
+            // real in-flight count rather than whatever the socket buffers.
+            let credits = Arc::new(tokio::sync::Semaphore::new(queue_depth));
+            let start = std::time::Instant::now();
+            let sender = {
+                let credits = Arc::clone(&credits);
+                tokio::spawn(async move {
+                    let payload = vec![0xa5u8; size];
+                    for i in 0..iterations {
+                        let permit = Arc::clone(&credits)
+                            .acquire_owned()
+                            .await
+                            .expect("queue credit");
+                        tx.write_all(&probe_request(
+                            NBDCommand::Write,
+                            i,
+                            (i % slots) * size as u64,
+                            size as u32,
+                        ))
+                        .await
+                        .expect("send pipelined header");
+                        tx.write_all(&payload)
+                            .await
+                            .expect("send pipelined payload");
+                        permit.forget();
+                    }
+                    tx
+                })
+            };
+            let mut reply = [0u8; 16];
+            for _ in 0..iterations {
+                rx.read_exact(&mut reply)
+                    .await
+                    .expect("read pipelined reply");
+                credits.add_permits(1);
+            }
+            let elapsed = start.elapsed().as_secs_f64();
+            let mut tx = sender.await.expect("pipelined sender finished");
+            eprintln!(
+                "nbd write 256 KiB one connection at depth {queue_depth:>2}: {:.0} MB/s",
+                (iterations as usize * size) as f64 / elapsed / 1e6,
+            );
+            tx.write_all(&probe_request(NBDCommand::Disconnect, 0, 0, 0))
+                .await
+                .expect("send disconnect");
+            let _ = timeout(Duration::from_secs(5), session).await;
+        }
+
+        // (3) Aggregate across independent connections.
         for connections in [1usize, 2, 4, 8] {
             let size = 256 * 1024usize;
             let per_connection = (16 * 1024 * 1024 / size) as u64;
@@ -1693,13 +1939,16 @@ mod tests {
         let _ = timeout(Duration::from_secs(5), task).await;
     }
 
-    /// The transmission loop services one connection's requests strictly in
-    /// series: the second request is not even read off the socket until the
-    /// first has replied. This is what caps a single NBD connection at QD1 no
-    /// matter how deep the client queues, and it is the reason deep-queue
-    /// throughput has to come from multiple connections.
+    /// Queued commands on one connection execute concurrently rather than one
+    /// after another. A READ of an unwritten region resolves without touching
+    /// the object store, so if the loop still serialized, the second request
+    /// could not be answered until the first write had finished; here both
+    /// replies are outstanding at once.
+    ///
+    /// The observable proof is a reply arriving out of submission order, which
+    /// only a loop with more than one command in flight can produce.
     #[tokio::test]
-    async fn one_connection_services_requests_strictly_in_series() {
+    async fn one_connection_runs_queued_commands_concurrently() {
         let filesystem = Arc::new(
             ZeroFS::new_in_memory()
                 .await
@@ -1707,7 +1956,7 @@ mod tests {
         );
         let export_gates = Arc::new(NbdExportGates::default());
         let device = single_file_export(&filesystem, &export_gates).await;
-        let (server_stream, mut client_stream) = tokio::io::duplex(64 * 1024);
+        let (server_stream, mut client_stream) = tokio::io::duplex(1024 * 1024);
         let (reader, writer) = tokio::io::split(server_stream);
         let mut session = NBDSession::new(
             reader,
@@ -1718,42 +1967,129 @@ mod tests {
         );
         let session_task = tokio::spawn(async move { session.handle_transmission(device).await });
 
-        // Two independent WRITEs queued back to back, each with its payload, so
-        // the server could in principle overlap them.
-        for cookie in [1u64, 2] {
+        // A large WRITE, then several trivial READs behind it. The writes and
+        // reads share no extent, so nothing forces an ordering between them.
+        client_stream
+            .write_all(&probe_request(NBDCommand::Write, 1, 0, 4096))
+            .await
+            .expect("send write header");
+        client_stream
+            .write_all(&vec![0x5a; 4096])
+            .await
+            .expect("send write payload");
+        for cookie in 2..=8u64 {
             client_stream
-                .write_all(&probe_request(NBDCommand::Write, cookie, 0, 1))
+                .write_all(&probe_request(NBDCommand::Read, cookie, 0, 512))
                 .await
-                .expect("send write header");
-            client_stream
-                .write_all(&[0x5a])
-                .await
-                .expect("send write payload");
+                .expect("send read header");
         }
 
-        // Replies come back in submission order, one at a time: a pipelining
-        // server would be free to reorder, a serial loop never can.
-        for expected in [1u64, 2] {
+        let mut order = Vec::new();
+        for _ in 1..=8 {
             let mut reply_bytes = [0; 16];
             timeout(
-                Duration::from_secs(2),
+                Duration::from_secs(5),
                 client_stream.read_exact(&mut reply_bytes),
             )
             .await
             .expect("server replied")
             .expect("read reply");
             let (_, reply) = NBDSimpleReply::from_bytes((&reply_bytes, 0)).expect("decode reply");
-            assert_eq!(
-                reply.cookie, expected,
-                "a serial transmission loop must reply in submission order"
-            );
+            assert_eq!(reply.error, 0, "every queued command succeeded");
+            order.push(reply.cookie);
+            // A READ reply carries its data; drain it before the next header.
+            if reply.cookie != 1 {
+                let mut data = vec![0; 512];
+                timeout(Duration::from_secs(5), client_stream.read_exact(&mut data))
+                    .await
+                    .expect("server sent read data")
+                    .expect("read data");
+            }
         }
+
+        let mut sorted = order.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, (1..=8).collect::<Vec<_>>(), "every cookie replied");
+        assert_ne!(
+            order,
+            (1..=8).collect::<Vec<_>>(),
+            "replies in strict submission order mean the loop never overlapped \
+             two commands; it should service a connection's queue concurrently"
+        );
 
         client_stream
             .write_all(&probe_request(NBDCommand::Disconnect, 0, 0, 0))
             .await
             .expect("send disconnect");
-        timeout(Duration::from_secs(2), session_task)
+        timeout(Duration::from_secs(5), session_task)
+            .await
+            .expect("server stopped after disconnect")
+            .expect("server task did not panic")
+            .expect("server accepted disconnect");
+    }
+
+    /// Concurrency must not weaken the flush barrier. A FLUSH queued behind a
+    /// WRITE on the same connection still covers it, because the write takes
+    /// its admission guard while being read — in request order — and holds it
+    /// until it completes, while FLUSH takes the same gate exclusively.
+    #[tokio::test]
+    async fn a_queued_flush_still_covers_the_write_ahead_of_it() {
+        let filesystem = Arc::new(
+            ZeroFS::new_in_memory()
+                .await
+                .expect("create test filesystem"),
+        );
+        let export_gates = Arc::new(NbdExportGates::default());
+        let device = single_file_export(&filesystem, &export_gates).await;
+        let (server_stream, mut client_stream) = tokio::io::duplex(1024 * 1024);
+        let (reader, writer) = tokio::io::split(server_stream);
+        let mut session = NBDSession::new(
+            reader,
+            writer,
+            filesystem,
+            export_gates,
+            CancellationToken::new(),
+        );
+        let session_task = tokio::spawn(async move { session.handle_transmission(device).await });
+
+        client_stream
+            .write_all(&probe_request(NBDCommand::Write, 1, 0, 4096))
+            .await
+            .expect("send write header");
+        client_stream
+            .write_all(&vec![0xc3; 4096])
+            .await
+            .expect("send write payload");
+        client_stream
+            .write_all(&probe_request(NBDCommand::Flush, 2, 0, 0))
+            .await
+            .expect("send flush");
+
+        let mut seen = Vec::new();
+        for _ in 0..2 {
+            let mut reply_bytes = [0; 16];
+            timeout(
+                Duration::from_secs(5),
+                client_stream.read_exact(&mut reply_bytes),
+            )
+            .await
+            .expect("server replied")
+            .expect("read reply");
+            let (_, reply) = NBDSimpleReply::from_bytes((&reply_bytes, 0)).expect("decode reply");
+            assert_eq!(reply.error, 0, "write and flush both succeeded");
+            seen.push(reply.cookie);
+        }
+        assert_eq!(
+            seen,
+            vec![1, 2],
+            "the flush must not complete before the write it follows"
+        );
+
+        client_stream
+            .write_all(&probe_request(NBDCommand::Disconnect, 0, 0, 0))
+            .await
+            .expect("send disconnect");
+        timeout(Duration::from_secs(5), session_task)
             .await
             .expect("server stopped after disconnect")
             .expect("server task did not panic")
