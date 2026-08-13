@@ -678,6 +678,34 @@ pub(crate) fn seal_compressed_batch(
     first_frame: u32,
     frames: Vec<(u64, u64, Compressed)>,
 ) -> Result<Vec<(u64, u64, Vec<u8>)>, SegmentError> {
+    // Decided before `frames` moves into the rayon closure.
+    let stored: usize = frames.iter().map(|(_, _, c)| c.len()).sum();
+    seal_compressed_batch_with(codec, segid, first_frame, frames, crypto_offload(stored))
+}
+
+/// Whether a run of `stored` bytes is worth fanning across cores. Rayon's
+/// dispatch floor is a few microseconds, so the only question is whether the
+/// cipher work dominates it; `block_in_place` additionally requires the
+/// multi-thread runtime, which is why the flavor is part of the decision.
+fn crypto_offload(stored: usize) -> bool {
+    stored >= PARALLEL_CRYPTO_MIN_BYTES
+        && match tokio::runtime::Handle::try_current() {
+            Ok(h) => h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread,
+            Err(_) => true,
+        }
+}
+
+/// [`seal_compressed_batch`] with the fan-out decision supplied rather than
+/// derived, so the threshold itself can be measured instead of assumed. Both
+/// paths run the same pure `seal_one` over the same frame indices, so their
+/// outputs are identical byte for byte and in the same order.
+fn seal_compressed_batch_with(
+    codec: &FrameCodec,
+    segid: Segid,
+    first_frame: u32,
+    frames: Vec<(u64, u64, Compressed)>,
+    offload: bool,
+) -> Result<Vec<(u64, u64, Vec<u8>)>, SegmentError> {
     let seal_one = |(i, (inode, extent, compressed)): (usize, (u64, u64, Compressed))| {
         let frame_offset =
             u32::try_from(i).map_err(|_| SegmentError::Malformed("frame index overflow"))?;
@@ -690,13 +718,6 @@ pub(crate) fn seal_compressed_batch(
             seal_compressed_frame(codec, segid, frame_index, inode, extent, compressed)?,
         ))
     };
-    let stored: usize = frames.iter().map(|(_, _, c)| c.len()).sum();
-    // Decided before `frames` moves into the rayon closure.
-    let offload = stored >= PARALLEL_CRYPTO_MIN_BYTES
-        && match tokio::runtime::Handle::try_current() {
-            Ok(h) => h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread,
-            Err(_) => true,
-        };
     if !offload {
         return frames.into_iter().enumerate().map(seal_one).collect();
     }
@@ -789,6 +810,53 @@ mod tests {
         for (i, ((ino, ext, body), (_, _, want))) in resealed.iter().zip(&plains).enumerate() {
             let aad = frame_aad(seg_b, i as u32, *ino, *ext);
             assert_eq!(&c.open(body, &aad).unwrap(), want);
+        }
+    }
+
+    /// Where the batch AEAD's fan-out actually starts paying, measured rather
+    /// than assumed. `PARALLEL_CRYPTO_MIN_BYTES` gates it, and the canonical NBD
+    /// stripe-member chunk — 256 KiB, eight 32 KiB frames — sits below that
+    /// gate, so today it seals eight frames one after another on the write ACK
+    /// path. This prints the inline and fanned-out cost of the same batch at
+    /// each size so the gate can be set from the crossover instead of a guess.
+    ///
+    ///   cargo test --release --lib -- --ignored --nocapture bench_batch_seal_crossover
+    #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
+    #[ignore = "throughput measurement, run explicitly in release"]
+    async fn bench_batch_seal_crossover() {
+        let c = FrameCodec::new(&[9u8; 32], SEGMENT_INFO, CompressionConfig::Lz4);
+        let segid = Segid::new(1, 1);
+        for frames_per_batch in [1usize, 2, 4, 8, 16, 32, 64] {
+            let rounds = 200usize;
+            let mut measured = Vec::new();
+            for offload in [false, true] {
+                // Compression is setup, not measurement: build every batch up
+                // front so only the AEAD lands inside the timed region.
+                let batches: Vec<Vec<(u64, u64, Compressed)>> = (0..rounds)
+                    .map(|r| {
+                        (0..frames_per_batch)
+                            .map(|i| {
+                                let plain = incompressible((r * frames_per_batch + i) as u64 + 1);
+                                (7u64, i as u64, c.compress(&plain).unwrap())
+                            })
+                            .collect()
+                    })
+                    .collect();
+                let stored: usize = batches[0].iter().map(|(_, _, p)| p.len()).sum();
+                let start = std::time::Instant::now();
+                for batch in batches {
+                    seal_compressed_batch_with(&c, segid, 0, batch, offload).unwrap();
+                }
+                measured.push((start.elapsed().as_secs_f64() * 1e6 / rounds as f64, stored));
+            }
+            let (inline_us, stored) = measured[0];
+            let (rayon_us, _) = measured[1];
+            eprintln!(
+                "batch seal {frames_per_batch:>2} frames ({:>4} KiB stored): inline \
+                 {inline_us:>7.1} us, rayon {rayon_us:>7.1} us, speedup {:.2}x",
+                stored / 1024,
+                inline_us / rayon_us,
+            );
         }
     }
 
