@@ -13,6 +13,7 @@ from .config import PilotConfig
 from .lifecycle import PilotLifecycle
 from .receipts import RunReceipt
 from .runner import Runner
+from .system_io import prepare_run_root
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,20 +54,12 @@ class WorkloadRunner:
         self.lifecycle = lifecycle
 
     def _prepare_root(self, root: Path) -> None:
-        self.config.require_mount_child(root, ".zerofs-workloads-", "workload root")
-        self.runner.run(
-            [
-                "install",
-                "-d",
-                "-m",
-                "0755",
-                "-o",
-                self.config.user,
-                "-g",
-                self.config.group,
-                root,
-            ],
-            sudo=True,
+        prepare_run_root(
+            self.runner,
+            self.config,
+            root,
+            prefix=".zerofs-workloads-",
+            role="workload root",
         )
 
     def _clone_pinned(self, repository: str, commit: str, destination: Path) -> int:

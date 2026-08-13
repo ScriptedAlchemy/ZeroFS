@@ -24,6 +24,7 @@ from .system_io import (
     SystemIoSummary,
     block_device,
     filesystem_device,
+    prepare_run_root,
     summarize_system_io,
 )
 
@@ -513,22 +514,12 @@ class PerformanceMatrixRunner:
         )
 
     def _prepare_root(self, run_root: Path) -> None:
-        self.config.require_mount_child(
-            run_root, ".zerofs-matrix-", "performance matrix root"
-        )
-        self.runner.run(
-            [
-                "install",
-                "-d",
-                "-m",
-                "0755",
-                "-o",
-                self.config.user,
-                "-g",
-                self.config.group,
-                run_root,
-            ],
-            sudo=True,
+        prepare_run_root(
+            self.runner,
+            self.config,
+            run_root,
+            prefix=".zerofs-matrix-",
+            role="performance matrix root",
         )
 
     def _cleanup_root(self, run_root: Path) -> None:

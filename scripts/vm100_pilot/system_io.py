@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import os
 import stat
+import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
+
+from .config import PilotConfig
+from .runner import Runner
 
 
 def filesystem_device(path: Path) -> tuple[int, int]:
@@ -177,4 +181,54 @@ def summarize_system_io(
         ),
         peak_some_avg10=max(snapshot.some_avg10 for snapshot in snapshots),
         peak_full_avg10=max(snapshot.full_avg10 for snapshot in snapshots),
+    )
+
+
+def install_config_text(
+    runner: Runner, config: PilotConfig, text: str, *, prefix: str
+) -> None:
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        prefix=prefix,
+        dir=config.temp_dir,
+        delete=False,
+    ) as handle:
+        handle.write(text)
+        temporary = Path(handle.name)
+    try:
+        runner.run(
+            [
+                "install",
+                "-o",
+                "root",
+                "-g",
+                "root",
+                "-m",
+                "0600",
+                temporary,
+                config.config_file,
+            ],
+            sudo=True,
+        )
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def prepare_run_root(
+    runner: Runner, config: PilotConfig, run_root: Path, *, prefix: str, role: str
+) -> None:
+    config.require_mount_child(run_root, prefix, role)
+    runner.run(
+        [
+            "install",
+            "-d",
+            "-m",
+            "0755",
+            "-o",
+            config.user,
+            "-g",
+            config.group,
+            run_root,
+        ],
+        sudo=True,
     )

@@ -307,23 +307,25 @@ class PilotConfig:
             )
         return resolved
 
+    def _require_prefixed_child(
+        self, path: Path, base_dir: Path, prefix: str, role: str
+    ) -> Path:
+        resolved = _require_direct_child(path, base_dir, role)
+        if not resolved.name.startswith(prefix):
+            raise ValueError(f"unsafe {role} path: {resolved} lacks prefix {prefix!r}")
+        return resolved
+
     def require_temp_child(self, path: Path, prefix: str) -> Path:
         self.require_temp_dir()
-        resolved = _require_direct_child(path, self.temp_dir, "temporary child")
-        if not resolved.name.startswith(prefix):
-            raise ValueError(
-                f"unsafe temporary child path: {resolved} lacks prefix {prefix!r}"
-            )
-        return resolved
+        return self._require_prefixed_child(
+            path, self.temp_dir, prefix, "temporary child"
+        )
 
     def require_result_child(self, path: Path, prefix: str) -> Path:
         self.require_result_dir()
-        resolved = _require_direct_child(path, self.result_dir, "result child")
-        if not resolved.name.startswith(prefix):
-            raise ValueError(
-                f"unsafe result child path: {resolved} lacks prefix {prefix!r}"
-            )
-        return resolved
+        return self._require_prefixed_child(
+            path, self.result_dir, prefix, "result child"
+        )
 
     def require_mount_child(self, path: Path, prefix: str, role: str) -> Path:
         resolved = _require_direct_child(path, self.mountpoint, role)

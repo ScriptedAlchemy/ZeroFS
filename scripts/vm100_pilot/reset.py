@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import re
-import tempfile
 import tomllib
 import uuid
 from pathlib import Path
@@ -10,6 +9,7 @@ from urllib.parse import urlsplit, urlunsplit
 from .config import PilotConfig
 from .lifecycle import PilotLifecycle
 from .runner import Runner
+from .system_io import install_config_text
 
 
 _REMOTE_PREFIX = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
@@ -76,31 +76,9 @@ class FreshResetter:
         return self.runner.run(["cat", self.config.config_file], sudo=True).stdout
 
     def _install_config_text(self, text: str) -> None:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            prefix="zerofs-pilot-reset-config-",
-            dir=self.config.temp_dir,
-            delete=False,
-        ) as handle:
-            handle.write(text)
-            temporary = Path(handle.name)
-        try:
-            self.runner.run(
-                [
-                    "install",
-                    "-o",
-                    "root",
-                    "-g",
-                    "root",
-                    "-m",
-                    "0600",
-                    temporary,
-                    self.config.config_file,
-                ],
-                sudo=True,
-            )
-        finally:
-            temporary.unlink(missing_ok=True)
+        install_config_text(
+            self.runner, self.config, text, prefix="zerofs-pilot-reset-config-"
+        )
 
     def _backup_config(self) -> Path:
         backup = self.config.config_file.with_name(

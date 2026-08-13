@@ -13,6 +13,7 @@ from typing import Callable, Iterator, Protocol
 from .config import PilotConfig
 from .lifecycle import PilotLifecycle
 from .runner import Runner
+from .system_io import install_config_text
 
 
 _EXPORT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
@@ -197,31 +198,9 @@ class StripedMigrator:
         )
 
     def _install_config_text(self, text: str) -> None:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            prefix="zerofs-pilot-config-",
-            dir=self.config.temp_dir,
-            delete=False,
-        ) as handle:
-            handle.write(text)
-            temporary = Path(handle.name)
-        try:
-            self.runner.run(
-                [
-                    "install",
-                    "-o",
-                    "root",
-                    "-g",
-                    "root",
-                    "-m",
-                    "0600",
-                    temporary,
-                    self.config.config_file,
-                ],
-                sudo=True,
-            )
-        finally:
-            temporary.unlink(missing_ok=True)
+        install_config_text(
+            self.runner, self.config, text, prefix="zerofs-pilot-config-"
+        )
 
     def _provision(self, replacement: str) -> None:
         self.runner.run(

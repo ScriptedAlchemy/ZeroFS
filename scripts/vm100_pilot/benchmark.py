@@ -27,6 +27,7 @@ from .system_io import (
     SystemIoSnapshot,
     block_device,
     filesystem_device,
+    prepare_run_root,
     summarize_system_io,
     verify_page_cache_hit,
 )
@@ -548,20 +549,12 @@ class BenchmarkRunner:
         )
 
     def prepare_root(self, run_root: Path) -> None:
-        self.config.require_mount_child(run_root, ".zerofs-bench-", "benchmark root")
-        self.runner.run(
-            [
-                "install",
-                "-d",
-                "-m",
-                "0755",
-                "-o",
-                self.config.user,
-                "-g",
-                self.config.group,
-                run_root,
-            ],
-            sudo=True,
+        prepare_run_root(
+            self.runner,
+            self.config,
+            run_root,
+            prefix=".zerofs-bench-",
+            role="benchmark root",
         )
 
     def _run_fio(
