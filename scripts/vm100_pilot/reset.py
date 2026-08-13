@@ -91,12 +91,7 @@ class FreshResetter:
         self.runner.run(["rm", "-f", "--", backup], sudo=True)
 
     def _relative_fixture(self, path: Path) -> Path:
-        try:
-            return path.relative_to(self.config.mountpoint)
-        except ValueError as error:
-            raise ValueError(
-                f"pilot fixture must be below {self.config.mountpoint}: {path}"
-            ) from error
+        return self.config.relative_to_mount(path, "pilot fixture")
 
     def _verify_fixtures(self, root: Path) -> dict[str, object]:
         integrity = root / self._relative_fixture(self.config.integrity_file)

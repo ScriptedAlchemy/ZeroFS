@@ -311,12 +311,7 @@ class StripedMigrator:
         return filesystem
 
     def _relative_data_path(self, path: Path) -> Path:
-        try:
-            return path.relative_to(self.config.mountpoint)
-        except ValueError as error:
-            raise ValueError(
-                f"pilot data path must be below {self.config.mountpoint}: {path}"
-            ) from error
+        return self.config.relative_to_mount(path, "pilot data path")
 
     def _copy_and_verify(self) -> dict[str, object]:
         source = f"{self.config.mountpoint}/"

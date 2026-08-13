@@ -333,6 +333,16 @@ class PilotConfig:
             raise ValueError(f"unsafe {role} path: {resolved} lacks prefix {prefix!r}")
         return resolved
 
+    def relative_to_mount(self, path: Path, role: str) -> Path:
+        """Re-root a pilot path under a copy of the mount (a seed or a migration
+        target). ``role`` names the path in the error, e.g. "pilot fixture"."""
+        try:
+            return path.relative_to(self.mountpoint)
+        except ValueError as error:
+            raise ValueError(
+                f"{role} must be below {self.mountpoint}: {path}"
+            ) from error
+
     def require_pilot_state_root(self, path: Path) -> Path:
         configured = _require_direct_child(
             self.pilot_state_root,
