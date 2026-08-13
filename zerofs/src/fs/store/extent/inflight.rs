@@ -81,7 +81,7 @@ struct Entry {
 }
 
 #[derive(Default)]
-pub(crate) struct InflightExtentWrites {
+pub(super) struct InflightExtentWrites {
     inodes: DashMap<InodeId, Vec<Entry>>,
     next_token: AtomicU64,
 }
@@ -90,7 +90,7 @@ impl InflightExtentWrites {
     /// Claim `[start, end]` on `id` until the returned guard drops. Callers
     /// register under the per-inode lock, so registrations for one inode are
     /// ordered by the same lock that orders their submissions.
-    pub(crate) fn register(
+    pub(super) fn register(
         self: &Arc<Self>,
         id: InodeId,
         start: u64,
@@ -116,12 +116,12 @@ impl InflightExtentWrites {
     }
 
     /// Wait until no queued write on `id` overlaps `[start, end]`.
-    pub(crate) async fn wait_for_overlap(&self, id: InodeId, start: u64, end: u64) {
+    pub(super) async fn wait_for_overlap(&self, id: InodeId, start: u64, end: u64) {
         self.wait_matching(id, Some((start, end))).await
     }
 
     /// Wait until no write on `id` is queued at all.
-    pub(crate) async fn wait_for_all(&self, id: InodeId) {
+    pub(super) async fn wait_for_all(&self, id: InodeId) {
         self.wait_matching(id, None).await
     }
 
@@ -152,7 +152,7 @@ impl InflightExtentWrites {
     }
 
     #[cfg(test)]
-    pub(crate) fn queued_ranges(&self, id: InodeId) -> Vec<(u64, u64)> {
+    fn queued_ranges(&self, id: InodeId) -> Vec<(u64, u64)> {
         self.inodes
             .get(&id)
             .map(|entries| entries.iter().map(|e| (e.start, e.end)).collect())

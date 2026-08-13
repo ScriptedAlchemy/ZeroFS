@@ -64,7 +64,7 @@ const EXTENT_LOCATION_ENTRY_OVERHEAD_BYTES: usize = 64;
 /// Split one configured extent-read budget into decoded data and logical
 /// locations. Locations receive one eighth up to a 128 MiB cap; subtraction
 /// keeps every total, including tiny values, strictly conserved.
-pub(crate) fn split_extent_read_budget(total: usize) -> (usize, usize) {
+fn split_extent_read_budget(total: usize) -> (usize, usize) {
     let locations = (total / 8).min(MAX_EXTENT_LOCATION_CACHE_BYTES);
     (total - locations, locations)
 }
