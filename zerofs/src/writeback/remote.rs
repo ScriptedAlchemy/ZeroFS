@@ -1,4 +1,5 @@
 use crate::writeback::admission::{Admission, DiskAdmission};
+use crate::writeback::barrier::{BarrierError, SequenceBarrier, SequenceProgress};
 use crate::writeback::journal::Journal;
 use crate::writeback::journaler::{LocalBarrier, LocalBarrierError};
 use crate::writeback::model::{
@@ -30,15 +31,18 @@ pub enum RemoteBarrierError {
     Remote(String),
 }
 
-#[derive(Debug, Clone)]
-struct RemoteProgress {
-    sequence: Sequence,
-    terminal_error: Option<String>,
-    closed: bool,
+impl BarrierError for RemoteBarrierError {
+    fn closed() -> Self {
+        Self::Closed
+    }
+
+    fn terminal(error: String) -> Self {
+        Self::Remote(error)
+    }
 }
 
 fn publish_terminal(
-    progress: &watch::Sender<RemoteProgress>,
+    progress: &watch::Sender<SequenceProgress>,
     admission: &Admission,
     disk: &DiskAdmission,
     error: impl Into<String>,
@@ -56,28 +60,12 @@ fn publish_terminal(
 
 #[derive(Clone)]
 pub struct RemoteBarrier {
-    progress: watch::Receiver<RemoteProgress>,
+    progress: SequenceBarrier<RemoteBarrierError>,
 }
 
 impl RemoteBarrier {
     pub async fn wait_remote(&self, sequence: Sequence) -> Result<(), RemoteBarrierError> {
-        let mut progress = self.progress.clone();
-        loop {
-            let state = progress.borrow().clone();
-            if state.sequence >= sequence {
-                return Ok(());
-            }
-            if let Some(error) = state.terminal_error {
-                return Err(RemoteBarrierError::Remote(error));
-            }
-            if state.closed {
-                return Err(RemoteBarrierError::Closed);
-            }
-            progress
-                .changed()
-                .await
-                .map_err(|_| RemoteBarrierError::Closed)?;
-        }
+        self.progress.wait(sequence).await
     }
 }
 
@@ -197,7 +185,7 @@ impl RemoteScheduler {
     ) -> anyhow::Result<Self> {
         let (admission, disk) = admissions;
         let journal_progress = journal.progress()?;
-        let (progress_sender, progress) = watch::channel(RemoteProgress {
+        let (progress_sender, progress) = watch::channel(SequenceProgress {
             sequence: journal_progress.remote_seq,
             terminal_error: None,
             closed: false,
@@ -223,7 +211,9 @@ impl RemoteScheduler {
         }));
         Ok(Self {
             inner: Arc::new(RemoteSchedulerInner {
-                barrier: RemoteBarrier { progress },
+                barrier: RemoteBarrier {
+                    progress: SequenceBarrier::new(progress),
+                },
                 activate,
                 stop,
                 shutdown_started: AtomicBool::new(false),
@@ -240,11 +230,11 @@ impl RemoteScheduler {
     }
 
     pub fn terminal_error(&self) -> Option<String> {
-        self.inner.barrier.progress.borrow().terminal_error.clone()
+        self.inner.barrier.progress.snapshot().terminal_error
     }
 
     pub fn check_available(&self) -> Result<(), RemoteBarrierError> {
-        let state = self.inner.barrier.progress.borrow();
+        let state = self.inner.barrier.progress.snapshot();
         if let Some(error) = &state.terminal_error {
             return Err(RemoteBarrierError::Remote(error.clone()));
         }
@@ -315,16 +305,11 @@ async fn drive_remote_shutdown(inner: Arc<RemoteSchedulerInner>) {
 }
 
 fn remote_terminal_or_closed(barrier: &RemoteBarrier) -> RemoteBarrierError {
-    current_remote_terminal(barrier).unwrap_or(RemoteBarrierError::Closed)
+    barrier.progress.terminal_or_closed()
 }
 
 fn current_remote_terminal(barrier: &RemoteBarrier) -> Option<RemoteBarrierError> {
-    barrier
-        .progress
-        .borrow()
-        .terminal_error
-        .clone()
-        .map(RemoteBarrierError::Remote)
+    barrier.progress.current_terminal()
 }
 
 struct RemoteWorker {
@@ -335,7 +320,7 @@ struct RemoteWorker {
     disk: DiskAdmission,
     local: LocalBarrier,
     upload_concurrency: usize,
-    progress: watch::Sender<RemoteProgress>,
+    progress: watch::Sender<SequenceProgress>,
     activation: watch::Receiver<bool>,
     stop: watch::Receiver<bool>,
     #[cfg(test)]
@@ -654,7 +639,7 @@ async fn abort_and_join_remote(active: &mut JoinSet<RemoteOutcome>) {
 fn finish_ordered_commit(
     sequence: Sequence,
     result: anyhow::Result<()>,
-    progress: &watch::Sender<RemoteProgress>,
+    progress: &watch::Sender<SequenceProgress>,
     next: &mut Sequence,
     completed: &mut BTreeMap<Sequence, CompletedRemote>,
 ) -> anyhow::Result<()> {

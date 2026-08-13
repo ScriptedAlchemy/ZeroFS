@@ -1,4 +1,5 @@
 use crate::writeback::admission::{AcceptedAdmission, Admission, DiskPermit};
+use crate::writeback::barrier::{BarrierError, SequenceBarrier, SequenceProgress};
 use crate::writeback::journal::{Journal, PreparedMutation};
 use crate::writeback::model::{MutationRecord, Sequence};
 use crate::writeback::payload::VerifiedPayload;
@@ -28,41 +29,28 @@ pub enum LocalBarrierError {
     LocalDurability(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct LocalProgress {
-    local_seq: Sequence,
-    terminal_error: Option<String>,
-    closed: bool,
+impl BarrierError for LocalBarrierError {
+    fn closed() -> Self {
+        Self::Closed
+    }
+
+    fn terminal(error: String) -> Self {
+        Self::LocalDurability(error)
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct LocalBarrier {
-    progress: watch::Receiver<LocalProgress>,
+    progress: SequenceBarrier<LocalBarrierError>,
 }
 
 impl LocalBarrier {
     pub fn local_sequence(&self) -> Sequence {
-        self.progress.borrow().local_seq
+        self.progress.sequence()
     }
 
     pub async fn wait_local(&self, sequence: Sequence) -> Result<(), LocalBarrierError> {
-        let mut progress = self.progress.clone();
-        loop {
-            let state = progress.borrow().clone();
-            if state.local_seq >= sequence {
-                return Ok(());
-            }
-            if let Some(error) = state.terminal_error {
-                return Err(LocalBarrierError::LocalDurability(error));
-            }
-            if state.closed {
-                return Err(LocalBarrierError::Closed);
-            }
-            progress
-                .changed()
-                .await
-                .map_err(|_| LocalBarrierError::Closed)?;
-        }
+        self.progress.wait(sequence).await
     }
 }
 
@@ -225,8 +213,8 @@ impl LocalJournaler {
         observer: Option<Arc<dyn LocalCommitObserver>>,
     ) -> Self {
         let (sender, receiver) = mpsc::channel(queue_depth.max(1));
-        let (progress_sender, progress) = watch::channel(LocalProgress {
-            local_seq: local_sequence,
+        let (progress_sender, progress) = watch::channel(SequenceProgress {
+            sequence: local_sequence,
             terminal_error: None,
             closed: false,
         });
@@ -247,7 +235,9 @@ impl LocalJournaler {
         Self {
             inner: Arc::new(LocalJournalerInner {
                 sender,
-                barrier: LocalBarrier { progress },
+                barrier: LocalBarrier {
+                    progress: SequenceBarrier::new(progress),
+                },
                 admission_gate: Mutex::new(()),
                 closed: AtomicBool::new(false),
                 join: Mutex::new(Some(join)),
@@ -375,7 +365,7 @@ impl LocalJournaler {
 
     pub async fn shutdown(&self) -> Result<(), LocalBarrierError> {
         let mut completion = self.inner.shutdown_result.subscribe();
-        let mut local_progress = self.inner.barrier.progress.clone();
+        let mut local_progress = self.inner.barrier.progress.watcher();
         let mut local_progress_open = true;
         {
             let _gate = self.inner.admission_gate.lock().await;
@@ -446,7 +436,7 @@ async fn drive_shutdown(inner: Arc<LocalJournalerInner>) {
 async fn run_journaler(
     sink: Arc<dyn LocalJournalSink>,
     mut receiver: mpsc::Receiver<JournalCommand>,
-    progress: watch::Sender<LocalProgress>,
+    progress: watch::Sender<SequenceProgress>,
     local_sequence: Sequence,
     observer: Option<Arc<dyn LocalCommitObserver>>,
     prepare_concurrency: usize,
@@ -629,7 +619,7 @@ async fn run_journaler(
                 break;
             }
             drop(ownership);
-            progress.send_modify(|state| state.local_seq = durable_batch_tail);
+            progress.send_modify(|state| state.sequence = durable_batch_tail);
             next_admitted = match durable_batch_tail.checked_add(1) {
                 Some(next) => next,
                 None => {
@@ -712,16 +702,11 @@ async fn run_journaler(
 }
 
 fn terminal_or_closed(barrier: &LocalBarrier) -> LocalBarrierError {
-    current_terminal(barrier).unwrap_or(LocalBarrierError::Closed)
+    barrier.progress.terminal_or_closed()
 }
 
 fn current_terminal(barrier: &LocalBarrier) -> Option<LocalBarrierError> {
-    barrier
-        .progress
-        .borrow()
-        .terminal_error
-        .clone()
-        .map(LocalBarrierError::LocalDurability)
+    barrier.progress.current_terminal()
 }
 
 #[cfg(test)]
