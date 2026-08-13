@@ -53,10 +53,13 @@ pub struct WritebackConfig {
     pub high_watermark_percent: u8,
     #[serde(default = "default_resume_percent")]
     pub resume_percent: u8,
-    /// Concurrent remote uploads. Defaults to one journal upload per SFTP
-    /// write stream (clamped to a lowered `[sftp] write_concurrency`), so
-    /// remote replay can reach the same aggregate rate as that many parallel
-    /// raw `sftp` transfers.
+    /// Concurrent remote uploads. Defaults conservatively (clamped to
+    /// `[sftp] write_concurrency`) so the pool's total session demand stays
+    /// well inside backend concurrent-connection caps — Hetzner Storage
+    /// Boxes allow around ten per account, stale sessions from a previous
+    /// crash still count until the server reaps them, and reads need
+    /// sessions too. Raise this toward `[sftp] write_concurrency` only when
+    /// the backend's budget accommodates it.
     #[serde(default)]
     pub upload_concurrency: Option<usize>,
     #[serde(default = "default_local_concurrency")]
@@ -192,12 +195,14 @@ const fn default_resume_percent() -> u8 {
     85
 }
 
-// Matches the SFTP transport's default per-direction stream budget
-// (`default_sftp_direction_concurrency`): the raw parallel-`sftp` control
-// measures the link at this many streams, so remote replay defaults to the
-// same fan-out.
+// Deliberately below the SFTP transport's 7-stream write budget: backends
+// cap concurrent SSH sessions per account (Hetzner Storage Boxes ~10), and
+// the pool's uploads share that budget with reads, control traffic, and
+// stale sessions a crashed predecessor left behind. Four upload lanes keep
+// replay pipelined without pressing the cap; deployments with headroom opt
+// into more via `upload_concurrency`.
 const fn default_upload_concurrency() -> usize {
-    7
+    4
 }
 
 const fn default_local_concurrency() -> usize {

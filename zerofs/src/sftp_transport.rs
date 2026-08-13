@@ -55,6 +55,14 @@ const SFTP_POOL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(45);
 // no session, so the activity drain alone would close the pool underneath it
 // and turn ordinary staging debris into a failed service stop.
 const SFTP_SHUTDOWN_CLEANUP_GRACE: Duration = Duration::from_secs(10);
+// Pacing for session dials after a failure. Storage backends cap concurrent
+// SSH sessions per account (Hetzner Storage Boxes around ten) and kill the
+// excess, and stale sessions from a previous crash still count against the
+// cap until the server reaps them. Every retrying caller redialing
+// immediately turns one over-limit moment into a sustained churn storm the
+// server can never shed; a shared backoff lets it drain instead.
+const SFTP_DIAL_BACKOFF_BASE: Duration = Duration::from_millis(100);
+const SFTP_DIAL_BACKOFF_MAX: Duration = Duration::from_secs(5);
 const SSH_PROCESS_FORCE_REAP_TIMEOUT: Duration = Duration::from_secs(5);
 const SFTP_DIRECTORY_CACHE_MAX_ENTRIES: usize = 64 * 1024;
 
@@ -1267,10 +1275,19 @@ struct PoolInner {
     // for exactly them before closing the pool; session-close tasks in
     // `tasks` keep their original shutdown ordering.
     cleanup_tasks: TaskTracker,
+    // One dial at a time, paced by the shared failure backoff below.
+    dial_gate: Mutex<()>,
+    dial_backoff: StdMutex<DialBackoff>,
     runtime: tokio::runtime::Handle,
     shutdown_lock: Mutex<()>,
     shutdown_complete: AtomicBool,
     close_error: StdMutex<Option<String>>,
+}
+
+#[derive(Debug, Default)]
+struct DialBackoff {
+    consecutive_failures: u32,
+    next_allowed: Option<Instant>,
 }
 
 struct FailClosedOnOwnerDrop {
@@ -1617,6 +1634,8 @@ impl SftpSessionPool {
                 session_shutdown: CancellationToken::new(),
                 tasks: TaskTracker::new(),
                 cleanup_tasks: TaskTracker::new(),
+                dial_gate: Mutex::new(()),
+                dial_backoff: StdMutex::new(DialBackoff::default()),
                 runtime: tokio::runtime::Handle::current(),
                 shutdown_lock: Mutex::new(()),
                 shutdown_complete: AtomicBool::new(false),
@@ -1782,6 +1801,44 @@ impl SftpSessionPool {
     }
 
     async fn open_with_permit(
+        &self,
+        permit: OwnedSemaphorePermit,
+    ) -> Result<PhysicalSession, TransportError> {
+        // Serialize dials and pace them behind the shared failure backoff: a
+        // backend at its concurrent-session cap kills excess SSH sessions,
+        // and unpaced parallel redials from every retrying caller turn one
+        // over-limit moment into a sustained churn storm.
+        let _dial_turn = self.inner.dial_gate.lock().await;
+        let next_allowed = self
+            .inner
+            .dial_backoff
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .next_allowed;
+        if let Some(next_allowed) = next_allowed {
+            tokio::time::sleep_until(next_allowed).await;
+        }
+        let result = self.open_with_permit_unpaced(permit).await;
+        let mut backoff = self
+            .inner
+            .dial_backoff
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if result.is_ok() {
+            *backoff = DialBackoff::default();
+        } else {
+            backoff.consecutive_failures = backoff.consecutive_failures.saturating_add(1);
+            let exponent = backoff.consecutive_failures.saturating_sub(1).min(10);
+            let delay = SFTP_DIAL_BACKOFF_BASE
+                .saturating_mul(1_u32 << exponent)
+                .min(SFTP_DIAL_BACKOFF_MAX);
+            backoff.next_allowed = Some(Instant::now() + delay);
+        }
+        drop(backoff);
+        result
+    }
+
+    async fn open_with_permit_unpaced(
         &self,
         permit: OwnedSemaphorePermit,
     ) -> Result<PhysicalSession, TransportError> {
@@ -2165,9 +2222,11 @@ mod tests {
     use async_trait::async_trait;
     use bytes::Bytes;
     use std::fmt;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
     use tokio::sync::Notify;
+    use tokio::time::Instant;
     use tokio_util::sync::CancellationToken;
 
     #[test]
@@ -2462,6 +2521,95 @@ mod tests {
         SftpSessionPool::new_writable(Arc::new(factory), shared, reads, writes)
             .await
             .expect("fully capable writable pool")
+    }
+
+    #[derive(Debug, Default)]
+    struct FlakyDialState {
+        dials: AtomicUsize,
+        fail: AtomicBool,
+    }
+
+    #[derive(Debug, Clone)]
+    struct FlakyDialFactory(Arc<FlakyDialState>);
+
+    #[async_trait]
+    impl SessionFactory for FlakyDialFactory {
+        async fn open(
+            &self,
+            _force: CancellationToken,
+        ) -> Result<Box<dyn TransportSession>, TransportError> {
+            self.0.dials.fetch_add(1, Ordering::SeqCst);
+            if self.0.fail.load(Ordering::SeqCst) {
+                return Err(TransportError::Open(
+                    "injected dial failure: backend session limit exceeded".to_owned(),
+                ));
+            }
+            Ok(Box::new(FlakyDialSession))
+        }
+    }
+
+    #[derive(Debug)]
+    struct FlakyDialSession;
+
+    #[async_trait]
+    impl TransportSession for FlakyDialSession {
+        fn capabilities(&self) -> SftpCapabilities {
+            SftpCapabilities {
+                fsync: true,
+                hardlink: true,
+                posix_rename: true,
+            }
+        }
+
+        async fn close(self: Box<Self>, _force: CancellationToken) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    /// The vm100 pilot death spiral: a Storage Box at its concurrent-session
+    /// cap kills SSH sessions, and every retrying caller redialing
+    /// immediately keeps the account over the cap forever — the daemon loops
+    /// in broken-pipe churn and never binds. Failed dials must back off on a
+    /// shared schedule so the server can shed stale sessions, and one
+    /// successful dial must reset the schedule.
+    #[tokio::test(start_paused = true)]
+    async fn failed_session_dials_back_off_instead_of_storming_the_server() {
+        let state = Arc::new(FlakyDialState::default());
+        let pool =
+            SftpSessionPool::new_writable(Arc::new(FlakyDialFactory(state.clone())), 3, 2, 2)
+                .await
+                .expect("the pool opens its first session while the backend is healthy");
+        assert_eq!(state.dials.load(Ordering::SeqCst), 1);
+
+        state.fail.store(true, Ordering::SeqCst);
+        let _held = pool.checkout(OperationKind::Write).await.unwrap();
+        let paced_from = Instant::now();
+        for _ in 0..5 {
+            let error = pool.checkout(OperationKind::Read).await.unwrap_err();
+            assert!(matches!(error, TransportError::Open(_)), "{error:?}");
+        }
+        assert_eq!(state.dials.load(Ordering::SeqCst), 6);
+        let paced = paced_from.elapsed();
+        assert!(
+            paced >= Duration::from_millis(1500),
+            "five failed dials must be paced by the shared backoff \
+             (100+200+400+800 ms), not fired back to back: {paced:?}"
+        );
+
+        // The backend sheds its stale sessions; the next (paced) dial
+        // succeeds and resets the schedule.
+        state.fail.store(false, Ordering::SeqCst);
+        let _recovered = pool.checkout(OperationKind::Read).await.unwrap();
+        assert_eq!(state.dials.load(Ordering::SeqCst), 7);
+
+        state.fail.store(true, Ordering::SeqCst);
+        let reset_from = Instant::now();
+        pool.checkout(OperationKind::Read).await.unwrap_err();
+        assert_eq!(state.dials.load(Ordering::SeqCst), 8);
+        assert!(
+            reset_from.elapsed() < Duration::from_millis(100),
+            "a successful dial must reset the backoff schedule"
+        );
     }
 
     #[test]

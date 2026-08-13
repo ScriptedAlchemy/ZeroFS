@@ -1765,7 +1765,7 @@ impl Settings {
         toml_string.push_str("# resume_percent = 85\n");
         toml_string.push_str("# local_concurrency = 4\n");
         toml_string.push_str(
-            "# upload_concurrency = 7         # defaults to the [sftp] write_concurrency stream budget\n",
+            "# upload_concurrency = 4         # keep total sessions inside the backend's concurrent-connection cap\n",
         );
         toml_string.push_str("# shutdown_flush = \"local\"       # local | remote\n");
 
@@ -2221,15 +2221,16 @@ min_free_gb = 256.0"#,
             .unwrap();
         // Memory acknowledgement is the point of the tier: bursts land at RAM
         // speed while client flush barriers still force SSD durability. The
-        // default upload concurrency matches the SFTP transport's default
-        // write-stream budget so remote replay can use the whole link.
+        // default upload concurrency stays deliberately below the SFTP
+        // write-stream budget so total session demand keeps clear of backend
+        // concurrent-connection caps.
         assert_eq!(
             writeback.ack_mode,
             crate::writeback::config::AckMode::Memory
         );
         assert_eq!(writeback.disk_bytes, 512_000_000_000);
         assert_eq!(writeback.local_concurrency, 4);
-        assert_eq!(writeback.upload_concurrency, 7);
+        assert_eq!(writeback.upload_concurrency, 4);
     }
 
     #[test]
@@ -2237,7 +2238,7 @@ min_free_gb = 256.0"#,
         let settings = write_and_load(&writeback_sftp_config(
             16.0,
             r#"[sftp]
-write_concurrency = 4
+write_concurrency = 2
 
 [writeback]
 enabled = true
@@ -2253,7 +2254,7 @@ min_free_gb = 256.0"#,
             .unwrap()
             .unwrap();
         assert_eq!(
-            writeback.upload_concurrency, 4,
+            writeback.upload_concurrency, 2,
             "a defaulted upload concurrency must follow a lowered SFTP write budget \
              instead of failing validation"
         );
