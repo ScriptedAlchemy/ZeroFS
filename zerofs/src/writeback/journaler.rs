@@ -14,7 +14,10 @@ use tokio::task::JoinHandle;
 
 #[async_trait::async_trait]
 pub trait LocalCommitObserver: Send + Sync + 'static {
-    async fn committed(&self, sequence: Sequence) -> AnyResult<()>;
+    /// Observe one fully committed publication batch. The records are the
+    /// committed records returned by the journal's publication path, so
+    /// observers must not re-read them from the journal.
+    async fn committed_batch(&self, records: &[MutationRecord]) -> AnyResult<()>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -615,24 +618,17 @@ async fn run_journaler(
                 }
             }
 
-            let mut ownership = ownership.into_iter();
-            while let Some((sequence, ram, _)) = ownership.next() {
-                if let Some(observer) = &observer
-                    && let Err(error) = observer.committed(sequence).await
-                {
-                    let mut retained = retained_ram
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner());
-                    retained.extend(ram);
-                    retained.extend(ownership.filter_map(|(_, ram, _)| ram));
-                    terminal = Some(format!("local commit observer failed: {error:#}"));
-                    break;
-                }
-                drop(ram);
-            }
-            if terminal.is_some() {
+            if let Some(observer) = &observer
+                && let Err(error) = observer.committed_batch(&published).await
+            {
+                let mut retained = retained_ram
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                retained.extend(ownership.into_iter().filter_map(|(_, ram, _)| ram));
+                terminal = Some(format!("local commit observer failed: {error:#}"));
                 break;
             }
+            drop(ownership);
             progress.send_modify(|state| state.local_seq = durable_batch_tail);
             next_admitted = match durable_batch_tail.checked_add(1) {
                 Some(next) => next,
@@ -808,7 +804,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl LocalCommitObserver for BlockingObserver {
-        async fn committed(&self, _sequence: u64) -> Result<()> {
+        async fn committed_batch(&self, _records: &[MutationRecord]) -> Result<()> {
             self.entered.notify_one();
             self.release.notified().await;
             Ok(())
@@ -817,8 +813,8 @@ mod tests {
 
     #[async_trait::async_trait]
     impl LocalCommitObserver for FailingSecondObserver {
-        async fn committed(&self, sequence: u64) -> Result<()> {
-            if sequence == 2 {
+        async fn committed_batch(&self, records: &[MutationRecord]) -> Result<()> {
+            if records.iter().any(|record| record.sequence == 2) {
                 bail!("injected overlay handoff failure")
             }
             Ok(())
@@ -827,12 +823,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl LocalCommitObserver for BlockingSecondOverlayObserver {
-        async fn committed(&self, sequence: u64) -> Result<()> {
-            if sequence == 2 {
+        async fn committed_batch(&self, records: &[MutationRecord]) -> Result<()> {
+            if records.iter().any(|record| record.sequence == 2) {
                 self.entered.notify_one();
                 self.release.notified().await;
             }
-            self.inner.committed(sequence).await
+            self.inner.committed_batch(records).await
         }
     }
 
@@ -1595,8 +1591,8 @@ mod tests {
         assert_eq!(journaler.barrier().local_sequence(), 0);
         assert_eq!(
             admission.used_bytes(),
-            1,
-            "only the RAM for the unobserved durable tail remains owned"
+            2,
+            "the RAM for the unobserved durable batch remains owned"
         );
         assert_eq!(disk.used_bytes(), 2);
         assert!(matches!(

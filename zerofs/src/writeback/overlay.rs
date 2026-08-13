@@ -278,33 +278,52 @@ impl OverlayIndex {
         let committed = journal
             .mutation(sequence)?
             .ok_or_else(|| anyhow::anyhow!("journal sequence {sequence} does not exist"))?;
-        let mut state = self.state.write().await;
-        let mut matched = false;
-        let paths = state
-            .paths_by_sequence
-            .get(&sequence)
-            .cloned()
-            .unwrap_or_default();
-        for path in paths {
-            let Some(versions) = state.entries.get_mut(&path) else {
-                continue;
-            };
-            for entry in versions
-                .iter_mut()
-                .filter(|entry| entry.record.sequence == sequence)
-            {
-                if entry.effect == OverlayEffect::Put {
-                    entry.payload = Some(PayloadLocation::Journal {
-                        journal: journal.clone(),
-                        sequence,
-                    });
-                }
-                entry.record = committed.clone();
-                matched = true;
-            }
+        self.mark_local_batch(std::slice::from_ref(&committed), journal)
+            .await
+    }
+
+    /// Switch every overlay entry of a committed publication batch onto the
+    /// journal payload under a single write-lock acquisition. The committed
+    /// records are supplied by the publication path, so no journal read is
+    /// needed here.
+    pub async fn mark_local_batch(
+        &self,
+        records: &[MutationRecord],
+        journal: Arc<Journal>,
+    ) -> anyhow::Result<()> {
+        if records.is_empty() {
+            return Ok(());
         }
-        if !matched {
-            anyhow::bail!("overlay sequence {sequence} does not exist");
+        let mut state = self.state.write().await;
+        for committed in records {
+            let sequence = committed.sequence;
+            let mut matched = false;
+            let paths = state
+                .paths_by_sequence
+                .get(&sequence)
+                .cloned()
+                .unwrap_or_default();
+            for path in paths {
+                let Some(versions) = state.entries.get_mut(&path) else {
+                    continue;
+                };
+                for entry in versions
+                    .iter_mut()
+                    .filter(|entry| entry.record.sequence == sequence)
+                {
+                    if entry.effect == OverlayEffect::Put {
+                        entry.payload = Some(PayloadLocation::Journal {
+                            journal: journal.clone(),
+                            sequence,
+                        });
+                    }
+                    entry.record = committed.clone();
+                    matched = true;
+                }
+            }
+            if !matched {
+                anyhow::bail!("overlay sequence {sequence} does not exist");
+            }
         }
         Ok(())
     }
@@ -530,9 +549,9 @@ impl OverlayCommitObserver {
 
 #[async_trait::async_trait]
 impl LocalCommitObserver for OverlayCommitObserver {
-    async fn committed(&self, sequence: Sequence) -> anyhow::Result<()> {
+    async fn committed_batch(&self, records: &[MutationRecord]) -> anyhow::Result<()> {
         self.overlay
-            .mark_local(sequence, self.journal.clone())
+            .mark_local_batch(records, self.journal.clone())
             .await
     }
 }
