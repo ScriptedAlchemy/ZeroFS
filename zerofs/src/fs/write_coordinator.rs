@@ -76,18 +76,14 @@ pub struct WriteCoordinator {
     /// pre-write value while the batch is still in flight.
     inode_store: InodeStore,
     #[cfg(test)]
-    #[allow(dead_code)] // The binary NBD tests consume this; the lib test target does not.
     apply_probe: Arc<std::sync::Mutex<Option<oneshot::Sender<()>>>>,
     /// Size of every drained commit batch, in apply order.
     #[cfg(test)]
-    #[allow(dead_code)] // Consumed by lib tests only.
     batch_sizes: Arc<std::sync::Mutex<Vec<usize>>>,
     /// Worker time owned by applies, and the `stage_seg_deltas` share of it.
     #[cfg(test)]
-    #[allow(dead_code)] // Consumed by lib benches only.
     apply_nanos: Arc<std::sync::atomic::AtomicU64>,
     #[cfg(test)]
-    #[allow(dead_code)] // Consumed by lib benches only.
     stage_nanos: Arc<std::sync::atomic::AtomicU64>,
 }
 
@@ -222,7 +218,6 @@ impl WriteCoordinator {
     /// Notify a test immediately before the next non-empty batch waits for its
     /// database write permit.
     #[cfg(test)]
-    #[allow(dead_code)] // The binary NBD tests consume this; the lib test target does not.
     pub(crate) fn probe_next_apply(&self) -> oneshot::Receiver<()> {
         let (reached, receiver) = oneshot::channel();
         let previous = self
@@ -238,7 +233,6 @@ impl WriteCoordinator {
     /// order. A wave of concurrent writers that fragments into many singleton
     /// batches shows up here as a run of 1s.
     #[cfg(test)]
-    #[allow(dead_code)] // Consumed by lib tests only.
     pub(crate) fn batch_sizes(&self) -> Vec<usize> {
         self.batch_sizes
             .lock()
@@ -250,14 +244,12 @@ impl WriteCoordinator {
     /// batch's reply sends. Comparing this with a benchmark's wall clock says
     /// whether the single commit worker is the bottleneck or is mostly idle.
     #[cfg(test)]
-    #[allow(dead_code)] // Consumed by lib benches only.
     pub(crate) fn apply_nanos(&self) -> u64 {
         self.apply_nanos.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The [`stage_seg_deltas`] share of [`Self::apply_nanos`].
     #[cfg(test)]
-    #[allow(dead_code)] // Consumed by lib benches only.
     pub(crate) fn stage_nanos(&self) -> u64 {
         self.stage_nanos.load(std::sync::atomic::Ordering::Relaxed)
     }
