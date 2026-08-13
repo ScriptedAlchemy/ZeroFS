@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
 use tokio::sync::oneshot;
 
@@ -16,36 +17,302 @@ pub enum AdmissionError {
     AccountingUnderflow,
 }
 
-#[derive(Debug, Clone)]
-pub struct Admission {
-    inner: Arc<RamInner>,
+/// Tier-specific behaviour plugged into the shared admission [`Gate`].
+///
+/// The FIFO waiter queue, the wait-registration cancellation guard, the
+/// terminate/poison path, and the grant loop exist exactly once in [`Gate`].
+/// A policy supplies only what genuinely differs between the dirty-RAM and
+/// dirty-SSD tiers: the capacity check, the extra state each tier tracks
+/// (operation counts for RAM, watermark/pause/free-space for SSD), the
+/// accounting hooks run on admit/block/rollback, and the release ladder.
+///
+/// The implementing type doubles as the gate's immutable configuration, so
+/// hooks read their limits from `gate.policy`.
+trait AdmissionPolicy: fmt::Debug + Sized {
+    /// Mutable per-tier state carried alongside the shared `used` counter.
+    type Extra: fmt::Debug + Default;
+    /// Guard handed to an admitted reservation.
+    type Permit: fmt::Debug;
+
+    /// Panic message used when a checked fit is contradicted by the add.
+    const FIT_CHECKED: &'static str;
+
+    /// Recomputes derived state before a fit check. Runs under the state lock.
+    fn refresh(gate: &Gate<Self>, state: &mut GateState<Self>);
+
+    /// Whether `bytes` may be admitted right now.
+    fn fits(gate: &Gate<Self>, state: &GateState<Self>, bytes: u64) -> bool;
+
+    /// Runs after `state.used` grew by an admitted reservation.
+    fn on_admitted(gate: &Gate<Self>, state: &mut GateState<Self>);
+
+    /// Runs when `bytes` cannot be admitted and the caller must queue or wait.
+    fn on_blocked(gate: &Gate<Self>, state: &mut GateState<Self>, bytes: u64);
+
+    /// Runs after `state.used` was rolled back for a grant nobody received.
+    fn on_grant_canceled(gate: &Gate<Self>, state: &mut GateState<Self>);
+
+    /// Releases `bytes`, returning a terminal error when accounting underflows.
+    fn release(
+        gate: &Gate<Self>,
+        state: &mut GateState<Self>,
+        bytes: u64,
+    ) -> Option<AdmissionError>;
+
+    /// Builds the tier's permit guard for a granted reservation.
+    fn permit(gate: &Arc<Gate<Self>>, bytes: u64) -> Self::Permit;
+
+    /// Disarms a permit whose receiver vanished before delivery.
+    fn disarm(permit: &mut Self::Permit);
 }
 
+/// Byte-budget gate shared by both writeback tiers.
 #[derive(Debug)]
-struct RamInner {
+struct Gate<P: AdmissionPolicy> {
     capacity: u64,
-    state: Mutex<RamState>,
-}
-
-#[derive(Debug, Default)]
-struct RamState {
-    used: u64,
-    used_operations: u64,
-    next_waiter: u64,
-    waiters: VecDeque<RamWaiter>,
-    terminal: Option<AdmissionError>,
+    policy: P,
+    state: Mutex<GateState<P>>,
 }
 
 #[derive(Debug)]
-struct RamWaiter {
+struct GateState<P: AdmissionPolicy> {
+    used: u64,
+    next_waiter: u64,
+    waiters: VecDeque<Waiter<P>>,
+    terminal: Option<AdmissionError>,
+    extra: P::Extra,
+}
+
+#[derive(Debug)]
+struct Waiter<P: AdmissionPolicy> {
     id: u64,
     bytes: u64,
-    sender: oneshot::Sender<Result<AdmissionPermit, AdmissionError>>,
+    sender: oneshot::Sender<Result<P::Permit, AdmissionError>>,
+}
+
+impl<P: AdmissionPolicy> Gate<P> {
+    fn new(capacity: u64, policy: P, state: GateState<P>) -> Arc<Self> {
+        Arc::new(Self {
+            capacity,
+            policy,
+            state: Mutex::new(state),
+        })
+    }
+}
+
+impl<P: AdmissionPolicy> GateState<P> {
+    fn new(used: u64, extra: P::Extra) -> Self {
+        Self {
+            used,
+            next_waiter: 0,
+            waiters: VecDeque::new(),
+            terminal: None,
+            extra,
+        }
+    }
+}
+
+impl<P: AdmissionPolicy> Default for GateState<P> {
+    fn default() -> Self {
+        Self::new(0, P::Extra::default())
+    }
+}
+
+/// Cancellation guard: a caller that stops awaiting must leave the FIFO queue
+/// and hand its place to the next waiter that fits.
+struct WaitRegistration<P: AdmissionPolicy> {
+    gate: Arc<Gate<P>>,
+    id: u64,
+    active: bool,
+}
+
+impl<P: AdmissionPolicy> Drop for WaitRegistration<P> {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        {
+            let mut state = lock(&self.gate.state);
+            state.waiters.retain(|waiter| waiter.id != self.id);
+        }
+        grant_waiters(&self.gate);
+    }
+}
+
+/// Reserves `bytes`, queueing in FIFO order behind any existing waiter.
+///
+/// `prepare` runs first under the state lock so a tier can refresh inputs
+/// (the SSD tier's free-space probe) before pause state is recomputed.
+async fn reserve_bytes<P: AdmissionPolicy>(
+    gate: &Arc<Gate<P>>,
+    bytes: u64,
+    prepare: impl FnOnce(&mut GateState<P>),
+) -> Result<P::Permit, AdmissionError> {
+    if bytes > gate.capacity {
+        return Err(AdmissionError::TooLarge {
+            requested: bytes,
+            capacity: gate.capacity,
+        });
+    }
+    let (id, receiver) = {
+        let mut state = lock(&gate.state);
+        prepare(&mut state);
+        P::refresh(gate, &mut state);
+        if let Some(error) = &state.terminal {
+            return Err(error.clone());
+        }
+        if state.waiters.is_empty() && P::fits(gate, &state, bytes) {
+            state.used += bytes;
+            P::on_admitted(gate, &mut state);
+            return Ok(P::permit(gate, bytes));
+        }
+        P::on_blocked(gate, &mut state, bytes);
+        let id = state.next_waiter;
+        state.next_waiter = state.next_waiter.wrapping_add(1);
+        let (sender, receiver) = oneshot::channel();
+        state.waiters.push_back(Waiter { id, bytes, sender });
+        (id, receiver)
+    };
+    let mut registration = WaitRegistration {
+        gate: gate.clone(),
+        id,
+        active: true,
+    };
+    let result = receiver.await.unwrap_or(Err(AdmissionError::Closed));
+    registration.active = false;
+    result
+}
+
+/// Wakes waiters from the front of the queue while the head still fits.
+fn grant_waiters<P: AdmissionPolicy>(gate: &Arc<Gate<P>>) {
+    let mut state = lock(&gate.state);
+    if state.terminal.is_some() {
+        return;
+    }
+    P::refresh(gate, &mut state);
+    while let Some(bytes) = state.waiters.front().map(|waiter| waiter.bytes) {
+        if !P::fits(gate, &state, bytes) {
+            P::on_blocked(gate, &mut state, bytes);
+            break;
+        }
+        let waiter = state.waiters.pop_front().expect("front waiter exists");
+        state.used = state.used.checked_add(waiter.bytes).expect(P::FIT_CHECKED);
+        P::on_admitted(gate, &mut state);
+        let permit = P::permit(gate, waiter.bytes);
+        if let Err(Ok(mut permit)) = waiter.sender.send(Ok(permit)) {
+            P::disarm(&mut permit);
+            state.used -= waiter.bytes;
+            P::on_grant_canceled(gate, &mut state);
+        }
+    }
+}
+
+/// Latches the terminal error once and fails every queued waiter.
+fn terminate<P: AdmissionPolicy>(gate: &Arc<Gate<P>>, error: AdmissionError) {
+    let waiters = {
+        let mut state = lock(&gate.state);
+        if state.terminal.is_some() {
+            return;
+        }
+        state.terminal = Some(error.clone());
+        state.waiters.drain(..).collect::<Vec<_>>()
+    };
+    for waiter in waiters {
+        let _ = waiter.sender.send(Err(error.clone()));
+    }
+}
+
+/// Returns `bytes` to the budget, poisoning the gate if accounting underflows.
+fn release_bytes<P: AdmissionPolicy>(gate: &Arc<Gate<P>>, bytes: u64) {
+    let accounting_error = {
+        let mut state = lock(&gate.state);
+        P::release(gate, &mut state, bytes)
+    };
+    if let Some(error) = accounting_error {
+        terminate(gate, error);
+    } else {
+        grant_waiters(gate);
+    }
+}
+
+#[derive(Debug)]
+struct RamPolicy;
+
+#[derive(Debug, Default)]
+struct RamCounters {
+    used_operations: u64,
+}
+
+impl AdmissionPolicy for RamPolicy {
+    type Extra = RamCounters;
+    type Permit = AdmissionPermit;
+
+    const FIT_CHECKED: &'static str = "RAM admission fit was checked before accounting";
+
+    fn refresh(_gate: &Gate<Self>, _state: &mut GateState<Self>) {}
+
+    fn fits(gate: &Gate<Self>, state: &GateState<Self>, bytes: u64) -> bool {
+        !projected_exceeds(state.used, bytes, gate.capacity)
+    }
+
+    fn on_admitted(_gate: &Gate<Self>, state: &mut GateState<Self>) {
+        state.extra.used_operations += 1;
+    }
+
+    fn on_blocked(_gate: &Gate<Self>, _state: &mut GateState<Self>, _bytes: u64) {}
+
+    fn on_grant_canceled(_gate: &Gate<Self>, state: &mut GateState<Self>) {
+        state.extra.used_operations -= 1;
+    }
+
+    fn release(
+        _gate: &Gate<Self>,
+        state: &mut GateState<Self>,
+        bytes: u64,
+    ) -> Option<AdmissionError> {
+        match (
+            state.used.checked_sub(bytes),
+            state.extra.used_operations.checked_sub(1),
+        ) {
+            (Some(remaining), Some(remaining_operations)) => {
+                state.used = remaining;
+                state.extra.used_operations = remaining_operations;
+                None
+            }
+            (None, _) => {
+                state.used = 0;
+                state.extra.used_operations = 0;
+                Some(AdmissionError::Poisoned(
+                    "dirty RAM accounting underflow".to_owned(),
+                ))
+            }
+            (_, None) => {
+                state.used = 0;
+                state.extra.used_operations = 0;
+                Some(AdmissionError::Poisoned(
+                    "dirty RAM operation accounting underflow".to_owned(),
+                ))
+            }
+        }
+    }
+
+    fn permit(gate: &Arc<Gate<Self>>, bytes: u64) -> AdmissionPermit {
+        AdmissionPermit::new(gate.clone(), bytes)
+    }
+
+    fn disarm(permit: &mut AdmissionPermit) {
+        permit.active = false;
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Admission {
+    inner: Arc<Gate<RamPolicy>>,
 }
 
 #[derive(Debug)]
 pub struct AdmissionPermit {
-    inner: Arc<RamInner>,
+    inner: Arc<Gate<RamPolicy>>,
     bytes: u64,
     active: bool,
 }
@@ -56,44 +323,12 @@ pub struct AcceptedAdmission(AdmissionPermit);
 impl Admission {
     pub fn new(capacity: u64) -> Self {
         Self {
-            inner: Arc::new(RamInner {
-                capacity,
-                state: Mutex::new(RamState::default()),
-            }),
+            inner: Gate::new(capacity, RamPolicy, GateState::default()),
         }
     }
 
     pub async fn reserve(&self, bytes: u64) -> Result<AdmissionPermit, AdmissionError> {
-        if bytes > self.inner.capacity {
-            return Err(AdmissionError::TooLarge {
-                requested: bytes,
-                capacity: self.inner.capacity,
-            });
-        }
-        let receiver = {
-            let mut state = lock(&self.inner.state);
-            if let Some(error) = &state.terminal {
-                return Err(error.clone());
-            }
-            if state.waiters.is_empty() && fits(state.used, bytes, self.inner.capacity) {
-                state.used += bytes;
-                state.used_operations += 1;
-                return Ok(AdmissionPermit::new(self.inner.clone(), bytes));
-            }
-            let id = state.next_waiter;
-            state.next_waiter = state.next_waiter.wrapping_add(1);
-            let (sender, receiver) = oneshot::channel();
-            state.waiters.push_back(RamWaiter { id, bytes, sender });
-            (id, receiver)
-        };
-        let mut registration = RamWaitRegistration {
-            inner: self.inner.clone(),
-            id: receiver.0,
-            active: true,
-        };
-        let result = receiver.1.await.unwrap_or(Err(AdmissionError::Closed));
-        registration.active = false;
-        result
+        reserve_bytes(&self.inner, bytes, |_| {}).await
     }
 
     pub fn used_bytes(&self) -> u64 {
@@ -101,20 +336,20 @@ impl Admission {
     }
 
     pub fn used_operations(&self) -> u64 {
-        lock(&self.inner.state).used_operations
+        lock(&self.inner.state).extra.used_operations
     }
 
     pub fn poison(&self, message: impl Into<String>) {
-        terminate_ram(&self.inner, AdmissionError::Poisoned(message.into()));
+        terminate(&self.inner, AdmissionError::Poisoned(message.into()));
     }
 
     pub fn close(&self) {
-        terminate_ram(&self.inner, AdmissionError::Closed);
+        terminate(&self.inner, AdmissionError::Closed);
     }
 }
 
 impl AdmissionPermit {
-    fn new(inner: Arc<RamInner>, bytes: u64) -> Self {
+    fn new(inner: Arc<Gate<RamPolicy>>, bytes: u64) -> Self {
         Self {
             inner,
             bytes,
@@ -143,139 +378,98 @@ impl Drop for AdmissionPermit {
             return;
         }
         self.active = false;
-        release_ram_bytes(&self.inner, self.bytes);
+        release_bytes(&self.inner, self.bytes);
     }
 }
 
-struct RamWaitRegistration {
-    inner: Arc<RamInner>,
-    id: u64,
-    active: bool,
+#[derive(Debug)]
+struct DiskPolicy {
+    high_bytes: u64,
+    resume_bytes: u64,
+    min_free_bytes: u64,
 }
 
-impl Drop for RamWaitRegistration {
-    fn drop(&mut self) {
-        if !self.active {
-            return;
-        }
+#[derive(Debug, Default)]
+struct DiskGauges {
+    available: u64,
+    paused: bool,
+}
+
+impl AdmissionPolicy for DiskPolicy {
+    type Extra = DiskGauges;
+    type Permit = DiskPermit;
+
+    const FIT_CHECKED: &'static str = "disk admission fit was checked before accounting";
+
+    fn refresh(gate: &Gate<Self>, state: &mut GateState<Self>) {
+        if state.extra.paused
+            && state.used <= gate.policy.resume_bytes
+            && state.extra.available >= gate.policy.min_free_bytes
         {
-            let mut state = lock(&self.inner.state);
-            state.waiters.retain(|waiter| waiter.id != self.id);
+            state.extra.paused = false;
         }
-        grant_ram_waiters(&self.inner);
     }
-}
 
-fn terminate_ram(inner: &Arc<RamInner>, error: AdmissionError) {
-    let waiters = {
-        let mut state = lock(&inner.state);
-        if state.terminal.is_some() {
-            return;
+    fn fits(gate: &Gate<Self>, state: &GateState<Self>, bytes: u64) -> bool {
+        !state.extra.paused
+            && (!projected_exceeds(state.used, bytes, gate.policy.high_bytes)
+                || (state.used == 0 && !projected_exceeds(0, bytes, gate.capacity)))
+            && state.extra.available.saturating_sub(bytes) >= gate.policy.min_free_bytes
+    }
+
+    fn on_admitted(gate: &Gate<Self>, state: &mut GateState<Self>) {
+        if state.used > gate.policy.high_bytes {
+            state.extra.paused = true;
         }
-        state.terminal = Some(error.clone());
-        state.waiters.drain(..).collect::<Vec<_>>()
-    };
-    for waiter in waiters {
-        let _ = waiter.sender.send(Err(error.clone()));
     }
-}
 
-fn release_ram_bytes(inner: &Arc<RamInner>, bytes: u64) {
-    let accounting_error = {
-        let mut state = lock(&inner.state);
-        match (
-            state.used.checked_sub(bytes),
-            state.used_operations.checked_sub(1),
-        ) {
-            (Some(remaining), Some(remaining_operations)) => {
+    fn on_blocked(gate: &Gate<Self>, state: &mut GateState<Self>, bytes: u64) {
+        if projected_exceeds(state.used, bytes, gate.policy.high_bytes) {
+            state.extra.paused = true;
+        }
+    }
+
+    fn on_grant_canceled(gate: &Gate<Self>, state: &mut GateState<Self>) {
+        Self::refresh(gate, state);
+    }
+
+    fn release(
+        gate: &Gate<Self>,
+        state: &mut GateState<Self>,
+        bytes: u64,
+    ) -> Option<AdmissionError> {
+        match state.used.checked_sub(bytes) {
+            Some(remaining) => {
                 state.used = remaining;
-                state.used_operations = remaining_operations;
+                Self::refresh(gate, state);
                 None
             }
-            (None, _) => {
+            None => {
                 state.used = 0;
-                state.used_operations = 0;
                 Some(AdmissionError::Poisoned(
-                    "dirty RAM accounting underflow".to_owned(),
-                ))
-            }
-            (_, None) => {
-                state.used = 0;
-                state.used_operations = 0;
-                Some(AdmissionError::Poisoned(
-                    "dirty RAM operation accounting underflow".to_owned(),
+                    "dirty SSD accounting underflow".to_owned(),
                 ))
             }
         }
-    };
-    if let Some(error) = accounting_error {
-        terminate_ram(inner, error);
-    } else {
-        grant_ram_waiters(inner);
     }
-}
 
-fn grant_ram_waiters(inner: &Arc<RamInner>) {
-    let mut state = lock(&inner.state);
-    if state.terminal.is_some() {
-        return;
+    fn permit(gate: &Arc<Gate<Self>>, bytes: u64) -> DiskPermit {
+        DiskPermit::new(gate.clone(), bytes)
     }
-    loop {
-        let Some(waiter) = state.waiters.front() else {
-            break;
-        };
-        if !fits(state.used, waiter.bytes, inner.capacity) {
-            break;
-        }
-        let waiter = state.waiters.pop_front().expect("front waiter exists");
-        state.used = state
-            .used
-            .checked_add(waiter.bytes)
-            .expect("RAM admission fit was checked before accounting");
-        state.used_operations += 1;
-        let permit = AdmissionPermit::new(inner.clone(), waiter.bytes);
-        if let Err(Ok(mut permit)) = waiter.sender.send(Ok(permit)) {
-            permit.active = false;
-            state.used -= waiter.bytes;
-            state.used_operations -= 1;
-        }
+
+    fn disarm(permit: &mut DiskPermit) {
+        permit.active = false;
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct DiskAdmission {
-    inner: Arc<DiskInner>,
-}
-
-#[derive(Debug)]
-struct DiskInner {
-    capacity: u64,
-    high_bytes: u64,
-    resume_bytes: u64,
-    min_free_bytes: u64,
-    state: Mutex<DiskState>,
-}
-
-#[derive(Debug, Default)]
-struct DiskState {
-    used: u64,
-    available: u64,
-    paused: bool,
-    next_waiter: u64,
-    waiters: VecDeque<DiskWaiter>,
-    terminal: Option<AdmissionError>,
-}
-
-#[derive(Debug)]
-struct DiskWaiter {
-    id: u64,
-    bytes: u64,
-    sender: oneshot::Sender<Result<DiskPermit, AdmissionError>>,
+    inner: Arc<Gate<DiskPolicy>>,
 }
 
 #[derive(Debug)]
 pub struct DiskPermit {
-    inner: Arc<DiskInner>,
+    inner: Arc<Gate<DiskPolicy>>,
     bytes: u64,
     active: bool,
 }
@@ -316,18 +510,22 @@ impl DiskAdmission {
         }
         let high_bytes = percent_bytes(capacity, high_watermark_percent);
         Ok(Self {
-            inner: Arc::new(DiskInner {
+            inner: Gate::new(
                 capacity,
-                high_bytes,
-                resume_bytes: percent_bytes(capacity, resume_percent),
-                min_free_bytes,
-                state: Mutex::new(DiskState {
-                    used: used_bytes,
-                    available: available_filesystem_bytes,
-                    paused: used_bytes > high_bytes || available_filesystem_bytes < min_free_bytes,
-                    ..DiskState::default()
-                }),
-            }),
+                DiskPolicy {
+                    high_bytes,
+                    resume_bytes: percent_bytes(capacity, resume_percent),
+                    min_free_bytes,
+                },
+                GateState::new(
+                    used_bytes,
+                    DiskGauges {
+                        available: available_filesystem_bytes,
+                        paused: used_bytes > high_bytes
+                            || available_filesystem_bytes < min_free_bytes,
+                    },
+                ),
+            ),
         })
     }
 
@@ -336,43 +534,10 @@ impl DiskAdmission {
         bytes: u64,
         available_filesystem_bytes: u64,
     ) -> Result<DiskPermit, AdmissionError> {
-        if bytes > self.inner.capacity {
-            return Err(AdmissionError::TooLarge {
-                requested: bytes,
-                capacity: self.inner.capacity,
-            });
-        }
-        let receiver = {
-            let mut state = lock(&self.inner.state);
-            state.available = available_filesystem_bytes;
-            refresh_disk_pause(&self.inner, &mut state);
-            if let Some(error) = &state.terminal {
-                return Err(error.clone());
-            }
-            if state.waiters.is_empty() && disk_fits(&self.inner, &state, bytes) {
-                state.used += bytes;
-                if state.used > self.inner.high_bytes {
-                    state.paused = true;
-                }
-                return Ok(DiskPermit::new(self.inner.clone(), bytes));
-            }
-            if projected_exceeds(state.used, bytes, self.inner.high_bytes) {
-                state.paused = true;
-            }
-            let id = state.next_waiter;
-            state.next_waiter = state.next_waiter.wrapping_add(1);
-            let (sender, receiver) = oneshot::channel();
-            state.waiters.push_back(DiskWaiter { id, bytes, sender });
-            (id, receiver)
-        };
-        let mut registration = DiskWaitRegistration {
-            inner: self.inner.clone(),
-            id: receiver.0,
-            active: true,
-        };
-        let result = receiver.1.await.unwrap_or(Err(AdmissionError::Closed));
-        registration.active = false;
-        result
+        reserve_bytes(&self.inner, bytes, |state| {
+            state.extra.available = available_filesystem_bytes;
+        })
+        .await
     }
 
     pub fn set_remote_complete(
@@ -386,10 +551,10 @@ impl DiskAdmission {
                 .used
                 .checked_sub(bytes)
                 .ok_or(AdmissionError::AccountingUnderflow)?;
-            state.available = available_filesystem_bytes;
-            refresh_disk_pause(&self.inner, &mut state);
+            state.extra.available = available_filesystem_bytes;
+            DiskPolicy::refresh(&self.inner, &mut state);
         }
-        grant_disk_waiters(&self.inner);
+        grant_waiters(&self.inner);
         Ok(())
     }
 
@@ -399,10 +564,10 @@ impl DiskAdmission {
             if let Some(error) = &state.terminal {
                 return Err(error.clone());
             }
-            state.available = available;
-            refresh_disk_pause(&self.inner, &mut state);
+            state.extra.available = available;
+            DiskPolicy::refresh(&self.inner, &mut state);
         }
-        grant_disk_waiters(&self.inner);
+        grant_waiters(&self.inner);
         Ok(())
     }
 
@@ -411,16 +576,16 @@ impl DiskAdmission {
     }
 
     pub fn poison(&self, message: impl Into<String>) {
-        terminate_disk(&self.inner, AdmissionError::Poisoned(message.into()));
+        terminate(&self.inner, AdmissionError::Poisoned(message.into()));
     }
 
     pub fn close(&self) {
-        terminate_disk(&self.inner, AdmissionError::Closed);
+        terminate(&self.inner, AdmissionError::Closed);
     }
 }
 
 impl DiskPermit {
-    fn new(inner: Arc<DiskInner>, bytes: u64) -> Self {
+    fn new(inner: Arc<Gate<DiskPolicy>>, bytes: u64) -> Self {
         Self {
             inner,
             bytes,
@@ -443,123 +608,12 @@ impl Drop for DiskPermit {
             return;
         }
         self.active = false;
-        release_disk_bytes(&self.inner, self.bytes);
+        release_bytes(&self.inner, self.bytes);
     }
-}
-
-struct DiskWaitRegistration {
-    inner: Arc<DiskInner>,
-    id: u64,
-    active: bool,
-}
-
-impl Drop for DiskWaitRegistration {
-    fn drop(&mut self) {
-        if !self.active {
-            return;
-        }
-        {
-            let mut state = lock(&self.inner.state);
-            state.waiters.retain(|waiter| waiter.id != self.id);
-        }
-        grant_disk_waiters(&self.inner);
-    }
-}
-
-fn grant_disk_waiters(inner: &Arc<DiskInner>) {
-    let mut state = lock(&inner.state);
-    if state.terminal.is_some() {
-        return;
-    }
-    refresh_disk_pause(inner, &mut state);
-    loop {
-        let Some(waiter) = state.waiters.front() else {
-            break;
-        };
-        if !disk_fits(inner, &state, waiter.bytes) {
-            if projected_exceeds(state.used, waiter.bytes, inner.high_bytes) {
-                state.paused = true;
-            }
-            break;
-        }
-        let waiter = state.waiters.pop_front().expect("front waiter exists");
-        state.used = state
-            .used
-            .checked_add(waiter.bytes)
-            .expect("disk admission fit was checked before accounting");
-        if state.used > inner.high_bytes {
-            state.paused = true;
-        }
-        let permit = DiskPermit::new(inner.clone(), waiter.bytes);
-        if let Err(Ok(mut permit)) = waiter.sender.send(Ok(permit)) {
-            permit.active = false;
-            state.used -= waiter.bytes;
-            refresh_disk_pause(inner, &mut state);
-        }
-    }
-}
-
-fn release_disk_bytes(inner: &Arc<DiskInner>, bytes: u64) {
-    let (accounting_error, waiters) = {
-        let mut state = lock(&inner.state);
-        match state.used.checked_sub(bytes) {
-            Some(remaining) => {
-                state.used = remaining;
-                refresh_disk_pause(inner, &mut state);
-                (None, Vec::new())
-            }
-            None => {
-                state.used = 0;
-                let error = AdmissionError::Poisoned("dirty SSD accounting underflow".to_owned());
-                if state.terminal.is_none() {
-                    state.terminal = Some(error.clone());
-                }
-                (Some(error), state.waiters.drain(..).collect::<Vec<_>>())
-            }
-        }
-    };
-    if let Some(error) = accounting_error {
-        for waiter in waiters {
-            let _ = waiter.sender.send(Err(error.clone()));
-        }
-    } else {
-        grant_disk_waiters(inner);
-    }
-}
-
-fn terminate_disk(inner: &Arc<DiskInner>, error: AdmissionError) {
-    let waiters = {
-        let mut state = lock(&inner.state);
-        if state.terminal.is_some() {
-            return;
-        }
-        state.terminal = Some(error.clone());
-        state.waiters.drain(..).collect::<Vec<_>>()
-    };
-    for waiter in waiters {
-        let _ = waiter.sender.send(Err(error.clone()));
-    }
-}
-
-fn refresh_disk_pause(inner: &DiskInner, state: &mut DiskState) {
-    if state.paused && state.used <= inner.resume_bytes && state.available >= inner.min_free_bytes {
-        state.paused = false;
-    }
-}
-
-fn disk_fits(inner: &DiskInner, state: &DiskState, bytes: u64) -> bool {
-    !state.paused
-        && (!projected_exceeds(state.used, bytes, inner.high_bytes)
-            || (state.used == 0 && !projected_exceeds(0, bytes, inner.capacity)))
-        && state.available.saturating_sub(bytes) >= inner.min_free_bytes
 }
 
 fn percent_bytes(capacity: u64, percent: u8) -> u64 {
     ((capacity as u128 * percent as u128) / 100) as u64
-}
-
-fn fits(used: u64, requested: u64, capacity: u64) -> bool {
-    !projected_exceeds(used, requested, capacity)
 }
 
 fn projected_exceeds(used: u64, requested: u64, limit: u64) -> bool {
@@ -575,7 +629,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Admission, AdmissionError, DiskAdmission, DiskWaiter, grant_disk_waiters, lock};
+    use super::{Admission, AdmissionError, DiskAdmission, Waiter, grant_waiters, lock};
     use std::time::Duration;
 
     #[tokio::test]
@@ -618,7 +672,7 @@ mod tests {
     async fn dirty_ram_operation_underflow_poisons_admission() {
         let admission = Admission::new(10);
         let permit = admission.reserve(3).await.unwrap();
-        lock(&admission.inner.state).used_operations = 0;
+        lock(&admission.inner.state).extra.used_operations = 0;
 
         drop(permit);
 
@@ -811,20 +865,20 @@ mod tests {
         let (next_sender, next_receiver) = tokio::sync::oneshot::channel();
         {
             let mut state = lock(&disk.inner.state);
-            state.available = 1_000;
-            state.waiters.push_back(DiskWaiter {
+            state.extra.available = 1_000;
+            state.waiters.push_back(Waiter {
                 id: 0,
                 bytes: 95,
                 sender: canceled_sender,
             });
-            state.waiters.push_back(DiskWaiter {
+            state.waiters.push_back(Waiter {
                 id: 1,
                 bytes: 1,
                 sender: next_sender,
             });
         }
 
-        grant_disk_waiters(&disk.inner);
+        grant_waiters(&disk.inner);
 
         let permit = tokio::time::timeout(Duration::from_secs(1), next_receiver)
             .await
