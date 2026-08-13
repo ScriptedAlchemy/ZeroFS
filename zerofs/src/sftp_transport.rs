@@ -147,8 +147,16 @@ async fn read_file_pipelined(
     len: usize,
 ) -> Result<Bytes, TransportError> {
     let requests = plan_pipelined_reads(offset, len)?;
-    let mut chunks = futures::stream::iter(requests)
-        .map(|request| {
+    // Carve one allocation into the disjoint region each request fills, so
+    // reassembly stitches the regions back together instead of copying them.
+    let mut buffer = BytesMut::zeroed(len);
+    let mut reads = Vec::with_capacity(requests.len());
+    for request in requests {
+        let region = buffer.split_to(request.len);
+        reads.push((request, region));
+    }
+    let mut chunks = futures::stream::iter(reads)
+        .map(|(request, mut region)| {
             let reader = openssh_sftp_client::file::TokioCompatFile::new(file.clone());
             async move {
                 tokio::pin!(reader);
@@ -163,10 +171,9 @@ async fn read_file_pipelined(
                             request.offset
                         ))
                     })?;
-                let mut payload = vec![0_u8; request.len];
                 reader
                     .as_mut()
-                    .read_exact(&mut payload)
+                    .read_exact(&mut region)
                     .await
                     .map_err(|error| {
                         TransportError::Operation(format!(
@@ -175,16 +182,16 @@ async fn read_file_pipelined(
                             request.offset
                         ))
                     })?;
-                Ok::<_, TransportError>((request.index, Bytes::from(payload)))
+                Ok::<_, TransportError>((request.index, region))
             }
         })
         .buffer_unordered(SFTP_READ_REQUEST_CONCURRENCY)
         .try_collect::<Vec<_>>()
         .await?;
     chunks.sort_unstable_by_key(|(index, _)| *index);
-    let mut payload = BytesMut::with_capacity(len);
+    let mut payload = BytesMut::new();
     for (_, chunk) in chunks {
-        payload.extend_from_slice(&chunk);
+        payload.unsplit(chunk);
     }
     Ok(payload.freeze())
 }
@@ -799,14 +806,18 @@ impl TransportSession for OpenSshTransportSession {
         head: bool,
     ) -> Result<RemoteObjectRead, TransportError> {
         let sftp = self.sftp.as_ref().expect("open transport owns SFTP client");
-        let mut file = sftp
+        let file = sftp
             .open(path)
             .await
             .map_err(|error| map_sftp_error(path, error))?;
-        let metadata = file
-            .metadata()
-            .await
-            .map_err(|error| map_sftp_error(path, error))?;
+        // The header always occupies the same fixed prefix, so its read does not
+        // depend on the metadata fetch: issue both round trips together.
+        let mut metadata_file = file.clone();
+        let (metadata, encoded_header) = tokio::join!(
+            metadata_file.metadata(),
+            read_file_pipelined(&file, path, 0, OBJECT_HEADER_LEN),
+        );
+        let metadata = metadata.map_err(|error| map_sftp_error(path, error))?;
         if !metadata.file_type().is_some_and(|kind| kind.is_file()) {
             return Err(TransportError::CorruptObject(format!(
                 "{} is not a regular file",
@@ -820,7 +831,7 @@ impl TransportSession for OpenSshTransportSession {
             TransportError::CorruptObject(format!("{} has no modification time", path.display()))
         })?;
 
-        let encoded_header = read_file_pipelined(&file, path, 0, OBJECT_HEADER_LEN).await?;
+        let encoded_header = encoded_header?;
         let header = decode_header(&encoded_header).map_err(|error| {
             TransportError::CorruptObject(format!("{}: {error}", path.display()))
         })?;
