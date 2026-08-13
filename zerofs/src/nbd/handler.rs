@@ -569,12 +569,24 @@ impl NBDHandler {
                             Ok::<_, CommandError>(parts)
                         }
                     });
-                let mut output = BytesMut::zeroed(length as usize);
-                for parts in try_join_all(reads).await? {
-                    for (logical_offset, data) in parts {
-                        let start = logical_offset as usize;
-                        output[start..start + data.len()].copy_from_slice(&data);
+                let mut parts: Vec<(u64, Bytes)> = try_join_all(reads)
+                    .await?
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                parts.sort_unstable_by_key(|(logical_offset, _)| *logical_offset);
+
+                let mut output = BytesMut::with_capacity(length as usize);
+                let mut expected_offset = 0_u64;
+                for (logical_offset, data) in parts {
+                    if logical_offset != expected_offset {
+                        return Err(CommandError::IoError);
                     }
+                    expected_offset += data.len() as u64;
+                    output.extend_from_slice(&data);
+                }
+                if expected_offset != length as u64 {
+                    return Err(CommandError::IoError);
                 }
                 Ok(output.freeze())
             }
