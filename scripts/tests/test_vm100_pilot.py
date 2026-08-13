@@ -55,6 +55,7 @@ from scripts.vm100_pilot.profile import (
     CanonicalDeployment,
     ProfileRunner,
     _load_phase_windows,
+    _perf_report_argv,
     _phase_report_text,
     _phase_perf_report_argv,
     _perf_record_argv,
@@ -1228,7 +1229,18 @@ class FreshResetTests(unittest.TestCase):
                 args = tuple(str(value) for value in argv)
                 self.calls.append((args, bool(kwargs.get("sudo", False))))
                 values = {
-                    ("find", "/sys/block", "-maxdepth", "1", "-type", "l", "-name", "nbd*", "-printf", "%f\n"): "nbd1\nnbd0\n",
+                    (
+                        "find",
+                        "/sys/block",
+                        "-maxdepth",
+                        "1",
+                        "-type",
+                        "l",
+                        "-name",
+                        "nbd*",
+                        "-printf",
+                        "%f\n",
+                    ): "nbd1\nnbd0\n",
                     ("cat", "/sys/module/nbd/parameters/nbds_max"): "16\n",
                     ("cat", "/sys/module/nbd/parameters/max_part"): "31\n",
                     ("cat", "/sys/block/nbd0/size"): "0\n",
@@ -1264,7 +1276,18 @@ class FreshResetTests(unittest.TestCase):
                 args = tuple(str(value) for value in argv)
                 self.calls.append((args, bool(kwargs.get("sudo", False))))
                 values = {
-                    ("find", "/sys/block", "-maxdepth", "1", "-type", "l", "-name", "nbd*", "-printf", "%f\n"): "nbd0\n",
+                    (
+                        "find",
+                        "/sys/block",
+                        "-maxdepth",
+                        "1",
+                        "-type",
+                        "l",
+                        "-name",
+                        "nbd*",
+                        "-printf",
+                        "%f\n",
+                    ): "nbd0\n",
                     ("cat", "/sys/module/nbd/parameters/nbds_max"): "16\n",
                     ("cat", "/sys/module/nbd/parameters/max_part"): "31\n",
                     ("cat", "/sys/block/nbd0/size"): "8\n",
@@ -1543,6 +1566,46 @@ class BenchmarkTests(unittest.TestCase):
                 ("zerofs_direct_read_hot", True),
             ],
         )
+
+    def test_buffered_read_disables_streaming_fadvise(self) -> None:
+        output = Path(self.temp.name) / "buffered-read.json"
+
+        class FioRunner(FakeRunner):
+            def run(
+                self, argv: Sequence[str | Path], **kwargs: Any
+            ) -> CompletedProcess[str]:
+                args = tuple(str(value) for value in argv)
+                if args[0] == "fio":
+                    self.calls.append((args, bool(kwargs.get("sudo", False))))
+                    output.write_text(
+                        json.dumps(
+                            {"jobs": [{"read": {"io_bytes": 4 << 20, "runtime": 1}}]}
+                        ),
+                        encoding="utf-8",
+                    )
+                    return CompletedProcess(args, 0, "", "")
+                return super().run(argv, **kwargs)
+
+        runner = FioRunner()
+        benchmark = BenchmarkRunner(
+            self.config,
+            runner,
+            self.lifecycle,  # type: ignore[arg-type]
+        )
+
+        benchmark._run_fio(
+            name="buffered",
+            run_root=self.config.mountpoint / ".zerofs-bench-test",
+            per_job_mib=4,
+            jobs=1,
+            output=output,
+            read=True,
+            direct=False,
+        )
+
+        fio_argv = next(call[0] for call in runner.calls if call[0][0] == "fio")
+        self.assertIn("--invalidate=0", fio_argv)
+        self.assertIn("--fadvise_hint=0", fio_argv)
 
     def test_odirect_write_uses_distinct_destructive_filenames(self) -> None:
         output = Path(self.temp.name) / "direct-write.json"
@@ -1887,9 +1950,7 @@ class BenchmarkTests(unittest.TestCase):
             self.lifecycle,  # type: ignore[arg-type]
         )
         with (
-            mock.patch(
-                "scripts.vm100_pilot.benchmark._MetricSampler", FakeSampler
-            ),
+            mock.patch("scripts.vm100_pilot.benchmark._MetricSampler", FakeSampler),
             mock.patch(
                 "scripts.vm100_pilot.benchmark.wait_for_accepted_after",
                 return_value=primary_accepted,
@@ -1906,9 +1967,7 @@ class BenchmarkTests(unittest.TestCase):
         )
         self.assertEqual(direct_calls, 1)
         self.assertEqual(len(fio_outputs), 6)
-        self.assertTrue(
-            all(path.parent.parent == scratch_root for path in fio_outputs)
-        )
+        self.assertTrue(all(path.parent.parent == scratch_root for path in fio_outputs))
         self.assertTrue(
             all(not path.exists() for path in fio_outputs),
             "tmpfs benchmark artifacts must be removed after persistence",
@@ -1916,9 +1975,7 @@ class BenchmarkTests(unittest.TestCase):
         self.assertTrue((Path(result.receipt_dir) / "direct-write-fio.json").is_file())
         self.assertEqual(result.zerofs_nbd_odirect_write_bytes, 4 << 20)
         self.assertEqual(result.zerofs_nbd_odirect_write_service_ack_mibps, 1000.0)
-        self.assertEqual(
-            result.zerofs_nbd_odirect_local_durability_end_to_end_ms, 1
-        )
+        self.assertEqual(result.zerofs_nbd_odirect_local_durability_end_to_end_ms, 1)
         self.assertEqual(
             manifest["zerofs_nbd_odirect_write_barriers"]["accepted_sequence"],
             11,
@@ -1979,9 +2036,7 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(result.user_buffered_page_cache_write_mibps, 10_240.0)
         self.assertEqual(result.zerofs_nbd_odirect_write_service_ack_ms, 400)
         self.assertEqual(result.zerofs_nbd_odirect_write_service_ack_mibps, 2560.0)
-        self.assertEqual(
-            result.zerofs_nbd_odirect_local_durability_tail_mibps, 2275.56
-        )
+        self.assertEqual(result.zerofs_nbd_odirect_local_durability_tail_mibps, 2275.56)
         self.assertEqual(
             result.zerofs_nbd_odirect_local_durability_end_to_end_mibps, 1137.78
         )
@@ -2302,7 +2357,9 @@ class BenchmarkTests(unittest.TestCase):
         cleanup_error = OSError("injected scratch cleanup failure")
         real_rmtree = shutil.rmtree
 
-        def fail_scratch_only(path: str | Path, *args: object, **kwargs: object) -> None:
+        def fail_scratch_only(
+            path: str | Path, *args: object, **kwargs: object
+        ) -> None:
             if Path(path).parent == scratch_root:
                 raise cleanup_error
             real_rmtree(path, *args, **kwargs)  # type: ignore[arg-type]
@@ -2490,6 +2547,16 @@ class ProfileTests(unittest.TestCase):
 
         self.assertEqual(argv[argv.index("--time") + 1], "1.000000001,2.500000009")
         self.assertEqual(argv[-2:], ["-i", Path("/tmp/perf.data")])
+
+    def test_perf_reports_use_flat_symbols_without_rebuilding_callgraphs(self) -> None:
+        aggregate = _perf_report_argv(Path("/tmp/perf.data"))
+        phase = _phase_perf_report_argv(
+            Path("/tmp/perf.data"), 1_000_000_001, 2_500_000_009
+        )
+
+        for argv in (aggregate, phase):
+            self.assertEqual(argv[argv.index("-g") + 1], "none")
+            self.assertEqual(argv[argv.index("--percent-limit") + 1], "0.1")
 
     def test_short_perf_phase_records_insufficient_samples(self) -> None:
         self.assertEqual(

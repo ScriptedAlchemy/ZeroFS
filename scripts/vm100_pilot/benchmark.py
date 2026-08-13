@@ -308,9 +308,7 @@ def calculate_tiers(
         zerofs_nbd_odirect_remote_durability_end_to_end_ms=(
             zerofs_nbd_odirect_remote_durability_end_to_end_ms
         ),
-        zerofs_nbd_odirect_local_encoded_bytes=(
-            zerofs_nbd_odirect_local_encoded_bytes
-        ),
+        zerofs_nbd_odirect_local_encoded_bytes=(zerofs_nbd_odirect_local_encoded_bytes),
         zerofs_nbd_odirect_remote_encoded_bytes=(
             zerofs_nbd_odirect_remote_encoded_bytes
         ),
@@ -603,7 +601,7 @@ class BenchmarkRunner:
         if direct is not None:
             argv.append(f"--direct={int(direct)}")
         if read and direct is False:
-            argv.append("--invalidate=0")
+            argv.extend(("--invalidate=0", "--fadvise_hint=0"))
         self.runner.run(argv, sudo=True, capture=False)
         return FioResult.from_json(output, operation="read" if read else "write")
 
@@ -851,9 +849,7 @@ class BenchmarkRunner:
                     phase="foreground write",
                 )
                 foreground_end = time.monotonic_ns()
-                record_phase(
-                    "user_buffered_page_cache_write", started, foreground_end
-                )
+                record_phase("user_buffered_page_cache_write", started, foreground_end)
                 write_io_after = self._system_io(phase_device)
                 self.runner.run(["sync", "-f", self.config.mountpoint], sudo=True)
                 accepted_after_write = wait_for_accepted_after(
@@ -998,35 +994,35 @@ class BenchmarkRunner:
                 }
 
                 phase_system_io = {
-                        "user_buffered_page_cache_write": phase_io(
-                            write_io_before, write_io_after, started, foreground_end
-                        ),
-                        "local_durability_tail": phase_io(
-                            write_io_after, local_io_after, foreground_end, local_end
-                        ),
-                        "remote_durability_tail": phase_io(
-                            local_io_after, remote_io_after, local_end, remote_end
-                        ),
-                        "buffered_warmup": phase_io(
-                            remote_io_after, warmup_io_after, warmup_start, warmup_end
-                        ),
-                        "page_cache_hot_read": phase_io(
-                            warmup_io_after, hot_io_after, hot_start, hot_end
-                        ),
-                        "direct_warmup": phase_io(
-                            hot_io_after,
-                            direct_warmup_io_after,
-                            direct_pair.warmup_start_ns,
-                            direct_pair.warmup_end_ns,
-                        ),
-                        "direct_read": phase_io(
-                            direct_warmup_io_after,
-                            direct_io_after,
-                            direct_pair.hot_start_ns,
-                            direct_pair.hot_end_ns,
-                        ),
-                        **direct_phase_io,
-                    }
+                    "user_buffered_page_cache_write": phase_io(
+                        write_io_before, write_io_after, started, foreground_end
+                    ),
+                    "local_durability_tail": phase_io(
+                        write_io_after, local_io_after, foreground_end, local_end
+                    ),
+                    "remote_durability_tail": phase_io(
+                        local_io_after, remote_io_after, local_end, remote_end
+                    ),
+                    "buffered_warmup": phase_io(
+                        remote_io_after, warmup_io_after, warmup_start, warmup_end
+                    ),
+                    "page_cache_hot_read": phase_io(
+                        warmup_io_after, hot_io_after, hot_start, hot_end
+                    ),
+                    "direct_warmup": phase_io(
+                        hot_io_after,
+                        direct_warmup_io_after,
+                        direct_pair.warmup_start_ns,
+                        direct_pair.warmup_end_ns,
+                    ),
+                    "direct_read": phase_io(
+                        direct_warmup_io_after,
+                        direct_io_after,
+                        direct_pair.hot_start_ns,
+                        direct_pair.hot_end_ns,
+                    ),
+                    **direct_phase_io,
+                }
                 maintenance_after = self.lifecycle.metrics.snapshot()
                 _assert_no_maintenance(quiescent, maintenance_after)
                 for name, destination in fio_artifacts.items():
@@ -1058,9 +1054,7 @@ class BenchmarkRunner:
                         before.remote_bytes,
                         "buffered-write remote encoded bytes",
                     ),
-                    user_buffered_page_cache_write_ms=millis(
-                        foreground_end, started
-                    ),
+                    user_buffered_page_cache_write_ms=millis(foreground_end, started),
                     local_end_to_end_ms=millis(local_end, started),
                     remote_end_to_end_ms=millis(remote_end, started),
                     local_active_ms=local_active_ms,

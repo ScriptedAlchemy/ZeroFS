@@ -94,6 +94,27 @@ class _PerfControlFifos:
         self.ack_fifo.unlink(missing_ok=True)
 
 
+def _perf_report_argv(
+    perf_data: Path, *, time_range: str | None = None
+) -> list[str | Path]:
+    argv: list[str | Path] = [
+        "perf",
+        "report",
+        "--stdio",
+        "--no-children",
+        "-g",
+        "none",
+        "--percent-limit",
+        "0.1",
+        "--sort",
+        "comm,dso,symbol",
+    ]
+    if time_range is not None:
+        argv.extend(("--time", time_range))
+    argv.extend(("-i", perf_data))
+    return argv
+
+
 def _phase_perf_report_argv(
     perf_data: Path, start_ns: int, end_ns: int
 ) -> list[str | Path]:
@@ -101,21 +122,12 @@ def _phase_perf_report_argv(
         raise ValueError("perf phase must have a positive duration")
     start_seconds, start_fraction = divmod(start_ns, 1_000_000_000)
     end_seconds, end_fraction = divmod(end_ns, 1_000_000_000)
-    time_range = (
-        f"{start_seconds}.{start_fraction:09d},{end_seconds}.{end_fraction:09d}"
-    )
-    return [
-        "perf",
-        "report",
-        "--stdio",
-        "--no-children",
-        "--sort",
-        "comm,dso,symbol",
-        "--time",
-        time_range,
-        "-i",
+    return _perf_report_argv(
         perf_data,
-    ]
+        time_range=(
+            f"{start_seconds}.{start_fraction:09d},{end_seconds}.{end_fraction:09d}"
+        ),
+    )
 
 
 def _phase_report_text(stdout: str, stderr: str, returncode: int) -> str:
@@ -524,19 +536,7 @@ class CollectorGroup:
         self.receipt.path("process-io-after.txt").write_text(after, encoding="utf-8")
         perf_data = self.receipt.directory / "perf.data"
         _require_perf_data(perf_data)
-        report = self.runner.run(
-            [
-                "perf",
-                "report",
-                "--stdio",
-                "--no-children",
-                "--sort",
-                "comm,dso,symbol",
-                "-i",
-                perf_data,
-            ],
-            sudo=True,
-        )
+        report = self.runner.run(_perf_report_argv(perf_data), sudo=True)
         if not report.stdout.strip():
             raise RuntimeError("perf produced an empty aggregate report")
         self.receipt.path("perf-report.txt").write_text(
