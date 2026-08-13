@@ -76,6 +76,28 @@
 //! advances in order, at most one container straddles it at a time, so the
 //! SSD holds at most that many bytes beyond what `dirty_ssd_reserved_bytes`
 //! accounts for.
+//!
+//! ## What is still serial
+//!
+//! Publication is one uninterrupted sequence: write, fsync, fsync, commit.
+//! Nothing else reaches the device while a batch runs, so a batch's cost is
+//! the sum of its parts rather than the maximum. Measured on a 2.4 GiB/s
+//! device, the durability path itself got 1.7x (1 MiB records) to 10x (64
+//! KiB) faster than the per-record layout it replaces -- but the drain as a
+//! whole only tracks that at small records. The layout it replaced wrote and
+//! fsynced each payload separately at a queue depth of
+//! `DEFAULT_LOCAL_PREPARE_CONCURRENCY`, and that overlap hid a large part of
+//! its own cost; at 1 MiB records it hid enough to beat a single serial
+//! container.
+//!
+//! Recovering it means overlapping one batch's fsync and commit with the
+//! next batch's container write. The durability contract allows this -- a
+//! record's own bytes still precede its own commit, and `commit_record_batch`
+//! already refuses any batch that is not contiguous with the watermark, so
+//! commits stay ordered no matter how the writes interleave. It needs
+//! publication split into a staging half (assign the container, write it,
+//! fsync it) and a committing half, with the journaler keeping one batch in
+//! each half. That is the next step, not this one.
 
 use crate::writeback::model::{
     FenceClass, JournalIdentity, MutationKind, MutationRecord, Sequence, classify_mutation_fence,
