@@ -546,8 +546,15 @@ class PerformanceMatrixRunner:
         started = False
         try:
             self._prepare_root(run_root)
-            self.lifecycle.drain()
             self.runner.run(["sync", "-f", self.config.mountpoint], sudo=True)
+            # syncfs can expose previously buffered mount work after an old
+            # drained exporter sample. Drain only after that boundary so its
+            # stable-sample window absorbs the metrics export cadence.
+            self.lifecycle.drain()
+            require_drained(
+                self.lifecycle.metrics.snapshot(),
+                phase=f"{cell.name} pre-cell",
+            )
             sampler = _MetricSampler(
                 self.lifecycle,
                 metrics_output,

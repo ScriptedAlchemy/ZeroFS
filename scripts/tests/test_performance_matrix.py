@@ -704,9 +704,14 @@ class PerformanceMatrixOrchestrationTests(unittest.TestCase):
         self.assertEqual(len(list(receipt.glob("*-system-io.csv"))), 3)
         self.assertGreaterEqual(lifecycle.drain_calls, 3)
 
-    def test_cell_sampler_starts_only_after_pre_cell_drain_and_syncfs(self) -> None:
+    def test_cell_sampler_starts_only_after_syncfs_and_stable_drain(self) -> None:
         events: list[str] = []
         outer = self
+
+        class EventMetrics:
+            def snapshot(self) -> WritebackSnapshot:
+                events.append("snapshot")
+                return outer.snapshot
 
         class EventLifecycle(_MatrixLifecycle):
             def drain(self, timeout: int | None = None) -> object:
@@ -739,6 +744,7 @@ class PerformanceMatrixOrchestrationTests(unittest.TestCase):
                 return outer._result(kwargs["cell"])
 
         lifecycle = EventLifecycle(self.config, (self.snapshot,) * 5)
+        lifecycle.metrics = EventMetrics()  # type: ignore[assignment]
         run_root = self.mount / ".zerofs-matrix-boundary"
         with mock.patch(
             "scripts.vm100_pilot.performance_matrix._MetricSampler", EventSampler
@@ -756,8 +762,53 @@ class PerformanceMatrixOrchestrationTests(unittest.TestCase):
                 system_io_output=self.scratch / "system.csv",
             )
 
-        self.assertEqual(events[:3], ["drain", "syncfs", "sampler-start"])
+        self.assertEqual(events[:4], ["syncfs", "drain", "snapshot", "sampler-start"])
         self.assertLess(events.index("sampler-stop"), len(events) - 2)
+
+    def test_exporter_lag_snapshot_blocks_sampler_after_drain_returns(self) -> None:
+        events: list[str] = []
+        dirty = replace(
+            self.snapshot,
+            accepted=6198,
+            local=6198,
+            remote=6194,
+            dirty_ssd_reserved=4 << 20,
+        )
+        lifecycle = _MatrixLifecycle(self.config, (dirty, self.snapshot))
+        outer = self
+
+        class RecordingSampler(_StaticSampler):
+            def start(self) -> None:
+                events.append("sampler-start")
+
+        class BoundaryMatrix(PerformanceMatrixRunner):  # type: ignore[misc,valid-type]
+            def _local_device(self) -> tuple[int, int]:
+                return (8, 1)
+
+            def _run_cell(self, **kwargs: Any) -> Any:
+                return outer._result(kwargs["cell"])
+
+        with (
+            mock.patch(
+                "scripts.vm100_pilot.performance_matrix._MetricSampler",
+                RecordingSampler,
+            ),
+            self.assertRaisesRegex(RuntimeError, "pre-cell.*not drained"),
+        ):
+            BoundaryMatrix(
+                self.config,
+                _FilesystemRunner(),
+                lifecycle,  # type: ignore[arg-type]
+            )._measure_cell(
+                cell=matrix_cells(quick=True)[0],
+                total_mib=32,
+                run_root=self.mount / ".zerofs-matrix-exporter-lag",
+                fio_output=self.scratch / "fio.json",
+                metrics_output=self.scratch / "metrics.csv",
+                system_io_output=self.scratch / "system.csv",
+            )
+
+        self.assertNotIn("sampler-start", events)
 
     def test_failed_cell_removes_only_scoped_root_and_preserves_failed_manifest(
         self,
