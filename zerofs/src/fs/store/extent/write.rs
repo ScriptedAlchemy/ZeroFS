@@ -82,6 +82,13 @@ pub(super) struct OpenLane {
 /// stay dense and AAD-unique; filled after the batch AEAD, which runs outside
 /// that gate. Concurrent reservations on a lane fill in any order: each one
 /// only ever writes its own disjoint byte range.
+///
+/// The claim-to-fill window in [`ExtentStore::stage_edits`] must stay free of
+/// `.await`: with no suspension point in it, a dropped (cancelled) staging
+/// future cannot strand a reservation and wedge every later rotation on the
+/// lane. Compression and the AEAD are CPU work, so this costs nothing today —
+/// but adding an await between the claim and the fill would need a Drop-based
+/// abandon path instead.
 struct Reservation {
     segid: Segid,
     first_frame: u32,
@@ -2745,7 +2752,9 @@ mod tests {
     }
 
     /// Mean per-staging-batch nanoseconds of every `stage_edits` phase, so a
-    /// flat scaling curve can be attributed instead of guessed at.
+    /// flat scaling curve can be attributed instead of guessed at. The phases
+    /// are sequential, not nested: `gate_hold` is the reservation window alone,
+    /// and everything after it runs off the lane's append gate.
     fn phase_report(store: &ExtentStore) -> String {
         use std::sync::atomic::Ordering::Relaxed;
         let p = &store.stage_phase_nanos;
@@ -2754,8 +2763,8 @@ mod tests {
             |counter: &std::sync::atomic::AtomicU64| counter.load(Relaxed) as f64 / batches / 1e3;
         format!(
             "per-batch us: old_debit {:.0}, compress {:.0}, protect_ref {:.0}, \
-             gate_wait {:.0}, gate_hold {:.0} [aead {:.0}, open_lock {:.0}, \
-             append {:.0}, txn_stage {:.0}, spawn_seal {:.0}]",
+             gate_wait {:.0}, gate_hold(reserve) {:.0}, aead {:.0}, open_lock {:.0}, \
+             append {:.0}, txn_stage {:.0}, spawn_seal {:.0}",
             us(&p.old_debit),
             us(&p.compress),
             us(&p.protect_ref),
