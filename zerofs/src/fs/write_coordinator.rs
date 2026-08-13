@@ -913,15 +913,12 @@ mod tests {
         KeyCodec::new()
     }
 
-    // One aligned 1 MiB NBD stripe write: four pre-sized member files receive
-    // one 256 KiB chunk each, concurrently, through the shared coordinator.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn presized_member_wave_commits_without_metadata_scans() {
-        let fs = make_fs().await;
-        let member_size = 32 * 1024 * 1024u64;
-        let chunk = 256 * 1024usize;
-        let mut members = Vec::new();
-        for i in 0..4u8 {
+    /// `count` member files pre-sized to `size`, the shape NBD provisioning
+    /// leaves behind. Pre-sizing is the point: every later write then lands in
+    /// a hole below EOF rather than extending the file.
+    async fn presized_members(fs: &ZeroFS, count: u8, size: u64) -> Vec<crate::fs::inode::InodeId> {
+        let mut members = Vec::with_capacity(count as usize);
+        for i in 0..count {
             let (id, _) = fs
                 .create(
                     &test_creds(),
@@ -931,12 +928,11 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            // Pre-size to the final length, as provisioning does for members.
             fs.setattr(
                 &test_creds(),
                 id,
                 &SetAttributes {
-                    size: crate::fs::types::SetSize::Set(member_size),
+                    size: crate::fs::types::SetSize::Set(size),
                     ..Default::default()
                 },
             )
@@ -944,6 +940,17 @@ mod tests {
             .unwrap();
             members.push(id);
         }
+        members
+    }
+
+    // One aligned 1 MiB NBD stripe write: four pre-sized member files receive
+    // one 256 KiB chunk each, concurrently, through the shared coordinator.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn presized_member_wave_commits_without_metadata_scans() {
+        let fs = make_fs().await;
+        let member_size = 32 * 1024 * 1024u64;
+        let chunk = 256 * 1024usize;
+        let members = presized_members(&fs, 4, member_size).await;
 
         let auth = test_auth();
         let scans_before = fs.db.scan_call_count();
@@ -1250,29 +1257,7 @@ mod tests {
         for (members_count, lockstep) in [(1usize, true), (4, true), (4, false)] {
             let fs = make_fs().await;
             let member_size = (WAVES * CHUNK) as u64;
-            let mut members = Vec::new();
-            for i in 0..members_count as u8 {
-                let (id, _) = fs
-                    .create(
-                        &test_creds(),
-                        0,
-                        &[b'm', b'0' + i],
-                        &SetAttributes::default(),
-                    )
-                    .await
-                    .unwrap();
-                fs.setattr(
-                    &test_creds(),
-                    id,
-                    &SetAttributes {
-                        size: crate::fs::types::SetSize::Set(member_size),
-                        ..Default::default()
-                    },
-                )
-                .await
-                .unwrap();
-                members.push(id);
-            }
+            let members = presized_members(&fs, members_count as u8, member_size).await;
 
             let auth = test_auth();
             let payload = Bytes::from(vec![7u8; CHUNK]);
