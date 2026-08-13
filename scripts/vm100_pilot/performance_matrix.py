@@ -574,6 +574,37 @@ class PerformanceMatrixRunner:
                 f"performance matrix root remains after cleanup: {run_root}"
             )
 
+    def _lay_out_cell(
+        self,
+        *,
+        cell: MatrixCell,
+        total_mib: int,
+        run_root: Path,
+        output: Path,
+    ) -> None:
+        """Write each cell file at full size before the measured pass.
+
+        An extending O_DIRECT write forces an XFS size-update journal commit per
+        request, and each journal commit issues a flush -- ZeroFS's full
+        durability barrier. An extending pass therefore measures barrier latency
+        rather than the service ACK this matrix compares across block sizes and
+        job counts, and it does so unevenly: the barrier cost per request scales
+        with request count, so small-block cells are penalized hardest and the
+        block-size axis reports the barrier, not the device. Every cell gets a
+        fresh run root, so without this pass every cell extends.
+
+        The caller runs this before its syncfs/drain/GC-quiescence boundary, so
+        the layout writes and any GC they provoke settle outside the measured
+        epoch.
+        """
+        _, per_job_bytes = self._cell_bytes(cell, total_mib)
+        self._run_fio(
+            cell=cell,
+            run_root=run_root,
+            per_job_bytes=per_job_bytes,
+            output=output,
+        )
+
     def _measure_cell(
         self,
         *,
@@ -581,6 +612,7 @@ class PerformanceMatrixRunner:
         total_mib: int,
         run_root: Path,
         fio_output: Path,
+        layout_output: Path,
         metrics_output: Path,
         system_io_output: Path,
     ) -> MatrixCellResult:
@@ -590,6 +622,12 @@ class PerformanceMatrixRunner:
         started = False
         try:
             self._prepare_root(run_root)
+            self._lay_out_cell(
+                cell=cell,
+                total_mib=total_mib,
+                run_root=run_root,
+                output=layout_output,
+            )
             self.runner.run(["sync", "-f", self.config.mountpoint], sudo=True)
             # syncfs can expose previously buffered mount work after an old
             # drained exporter sample. Drain only after that boundary so its
@@ -738,6 +776,7 @@ class PerformanceMatrixRunner:
                             total_mib=total_mib,
                             run_root=run_root,
                             fio_output=scratch / f"{stem}-fio.json",
+                            layout_output=scratch / f"{stem}-layout.json",
                             metrics_output=scratch / f"{stem}-writeback.csv",
                             system_io_output=scratch / f"{stem}-system-io.csv",
                         )

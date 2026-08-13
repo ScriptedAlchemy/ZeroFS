@@ -274,6 +274,67 @@ class PerformanceMatrixCellTests(unittest.TestCase):
             },
         )
 
+    def test_cell_pre_lays_the_measured_files_at_full_size(self) -> None:
+        """The measured O_DIRECT pass must overwrite in place, never extend.
+
+        Every cell gets a fresh run root, so without a pre-lay pass each cell
+        extends its files and measures the per-request XFS size-update journal
+        commit -- a flush, ZeroFS's full durability barrier -- instead of the
+        service ACK. The penalty scales with request count, so it would skew
+        the block-size axis the matrix exists to compare.
+        """
+        self.assertIsNotNone(
+            PerformanceMatrixRunner, "performance matrix runner is unavailable"
+        )
+        runner = _FioRunner()
+        matrix = PerformanceMatrixRunner(  # type: ignore[misc]
+            self.config,
+            runner,
+            object(),  # type: ignore[arg-type]
+        )
+        run_root = self.config.mountpoint / ".zerofs-matrix-layout"
+        run_root.mkdir()
+        cell = matrix_cells(quick=True)[1]
+        _, per_job_bytes = matrix._cell_bytes(cell, 32)
+
+        matrix._lay_out_cell(
+            cell=cell,
+            total_mib=32,
+            run_root=run_root,
+            output=Path(self.temp.name) / "layout.json",
+        )
+        matrix._run_fio(
+            cell=cell,
+            run_root=run_root,
+            per_job_bytes=per_job_bytes,
+            output=Path(self.temp.name) / "measured.json",
+        )
+
+        fio_calls = [args for args, _ in runner.calls if args[0] == "fio"]
+        self.assertEqual(len(fio_calls), 2)
+        geometry = {
+            "--directory",
+            "--filename_format",
+            "--size",
+            "--numjobs",
+            "--bs",
+            "--rw",
+        }
+
+        def shape(argv: tuple[str, ...]) -> set[str]:
+            return {
+                value
+                for value in argv
+                if value.split("=", 1)[0] in geometry
+            }
+
+        # Same files, same size, same block size: the measured pass lands on
+        # fully allocated files.
+        self.assertEqual(shape(fio_calls[0]), shape(fio_calls[1]))
+        self.assertIn(f"--size={per_job_bytes}", fio_calls[0])
+        self.assertIn("--filename_format=matrix.$jobnum", fio_calls[0])
+        self.assertIn(f"--directory={run_root}", fio_calls[0])
+
     def test_clean_gc_wait_targets_a_fresh_pass_after_the_current_baseline(
         self,
     ) -> None:
@@ -815,6 +876,8 @@ class PerformanceMatrixOrchestrationTests(unittest.TestCase):
         self.assertEqual(rows[1]["syncfs_local_tail_ms"], "200")
         self.assertEqual(rows[1]["remote_target_sequence"], "10")
         self.assertEqual(len(list(receipt.glob("*-fio.json"))), 3)
+        # Each cell also archives its unmeasured pre-lay pass.
+        self.assertEqual(len(list(receipt.glob("*-layout.json"))), 3)
         self.assertEqual(len(list(receipt.glob("*-writeback.csv"))), 3)
         self.assertEqual(len(list(receipt.glob("*-system-io.csv"))), 3)
         self.assertGreaterEqual(lifecycle.drain_calls, 3)
@@ -858,6 +921,9 @@ class PerformanceMatrixOrchestrationTests(unittest.TestCase):
                 events.append("gc-wait")
                 return outer.snapshot
 
+            def _lay_out_cell(self, **kwargs: Any) -> None:
+                events.append("layout")
+
             def _run_cell(self, **kwargs: Any) -> Any:
                 Path(kwargs["fio_output"]).write_text("{}\n", encoding="utf-8")
                 return outer._result(kwargs["cell"])
@@ -877,13 +943,24 @@ class PerformanceMatrixOrchestrationTests(unittest.TestCase):
                 total_mib=32,
                 run_root=run_root,
                 fio_output=self.scratch / "fio.json",
+                layout_output=self.scratch / "layout.json",
                 metrics_output=self.scratch / "metrics.csv",
                 system_io_output=self.scratch / "system.csv",
             )
 
+        # The pre-lay pass must precede the syncfs/drain/GC boundary so its
+        # writes and any GC they provoke settle outside the measured epoch.
         self.assertEqual(
-            events[:6],
-            ["syncfs", "drain", "gc-wait", "drain", "snapshot", "sampler-start"],
+            events[:7],
+            [
+                "layout",
+                "syncfs",
+                "drain",
+                "gc-wait",
+                "drain",
+                "snapshot",
+                "sampler-start",
+            ],
         )
         self.assertLess(events.index("sampler-stop"), len(events) - 2)
 
@@ -910,6 +987,9 @@ class PerformanceMatrixOrchestrationTests(unittest.TestCase):
             def _wait_clean_gc(self, timeout: float | None = None) -> WritebackSnapshot:
                 return dirty
 
+            def _lay_out_cell(self, **kwargs: Any) -> None:
+                return None
+
             def _run_cell(self, **kwargs: Any) -> Any:
                 return outer._result(kwargs["cell"])
 
@@ -929,6 +1009,7 @@ class PerformanceMatrixOrchestrationTests(unittest.TestCase):
                 total_mib=32,
                 run_root=self.mount / ".zerofs-matrix-exporter-lag",
                 fio_output=self.scratch / "fio.json",
+                layout_output=self.scratch / "layout.json",
                 metrics_output=self.scratch / "metrics.csv",
                 system_io_output=self.scratch / "system.csv",
             )
