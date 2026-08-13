@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import time
 import tomllib
-import hashlib
 import shutil
 import tempfile
 from dataclasses import dataclass
@@ -12,6 +11,7 @@ from typing import Any
 from .config import PilotConfig
 from .metrics import DrainReceipt, MetricsClient, wait_for_drain
 from .runner import Runner
+from .system_io import file_sha256
 
 
 @dataclass(frozen=True, slots=True)
@@ -234,13 +234,7 @@ class PilotLifecycle:
         self.stop()
         return self.start()
 
-    @staticmethod
-    def _local_sha256(path: Path) -> str:
-        digest = hashlib.sha256()
-        with path.open("rb") as handle:
-            while chunk := handle.read(1024 * 1024):
-                digest.update(chunk)
-        return digest.hexdigest()
+    _local_sha256 = staticmethod(file_sha256)
 
     def deploy_and_start(self) -> dict[str, object]:
         self.require_vm100()

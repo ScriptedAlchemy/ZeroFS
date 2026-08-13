@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import re
@@ -19,6 +18,7 @@ from .config import PilotConfig
 from .lifecycle import PilotLifecycle
 from .receipts import RunReceipt
 from .runner import ManagedProcess, Runner
+from .system_io import file_sha256
 
 
 _GC_CADENCE_KEYS = (
@@ -247,12 +247,7 @@ def rewrite_gc_cadence(text: str, interval_secs: int) -> str:
     return rewritten
 
 
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        while chunk := handle.read(1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
+_sha256 = file_sha256
 
 
 @dataclass(slots=True)
