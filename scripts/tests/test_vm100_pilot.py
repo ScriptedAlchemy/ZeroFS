@@ -2197,6 +2197,18 @@ class BenchmarkTests(unittest.TestCase):
         with self.assertRaisesRegex(BenchmarkContaminatedError, "segment GC"):
             _assert_no_maintenance(before, after)
 
+    def test_benchmark_tolerates_an_idle_gc_scan_inside_the_measured_epoch(
+        self,
+    ) -> None:
+        from scripts.vm100_pilot.benchmark import _assert_no_maintenance
+
+        before = WritebackSnapshot(9, 9, 9, 0, 0, 1, 1, False, False, 4, 8, 10)
+        # A pass ticked and the scanner is momentarily active, but no batches
+        # ran and nothing was deleted: no reclamation work touched the epoch.
+        after = replace(before, gc_passes=5, gc_active=True)
+
+        _assert_no_maintenance(before, after)
+
     def test_gc_quiescence_waits_for_a_fresh_pass_when_requested(self) -> None:
         snapshots = iter(
             (
