@@ -420,12 +420,6 @@ async fn derive_byte_deltas(
     Ok(deltas)
 }
 
-/// Whether the allocation watermark advanced past `last_emitted`, matching the
-/// check the batch itself makes before staging the counter.
-fn counter_staged_for(ctx: &WorkerContext, last_emitted: u64) -> bool {
-    ctx.inode_store.next_id() > last_emitted
-}
-
 async fn worker_loop(
     mut ctx: WorkerContext,
     mut rx: mpsc::UnboundedReceiver<Request>,
@@ -585,9 +579,9 @@ async fn worker_loop(
                 // Undercounting used bytes would relax the quota permanently,
                 // so an unreadable pre-image aborts the batch before it
                 // applies, exactly as an unreadable segment counter does.
-                if counter_staged_for(&ctx, last_emitted_counter) {
-                    ctx.inode_store.allocate();
-                }
+                // Nothing is staged yet at this point -- in particular the
+                // allocation watermark is untouched, so unlike the
+                // `stage_seg_deltas` failure below there is no ID to burn.
                 for reply in replies {
                     let _ = reply.send(Err(e));
                 }
