@@ -6,7 +6,7 @@
 #[cfg(feature = "failpoints")]
 use crate::failpoints::{self as fp, fail_point};
 
-use super::{ExtentStore, PARALLEL_EXTENT_OPS, TailUpdate, ZERO_EXTENT};
+use super::{CachedExtentLocation, ExtentStore, PARALLEL_EXTENT_OPS, TailUpdate, ZERO_EXTENT};
 use crate::db::Transaction;
 use crate::frame_codec::Compressed;
 use crate::fs::inode::InodeId;
@@ -323,6 +323,25 @@ impl ExtentStore {
                 // read-ahead in every sorted run even when the range is empty.
                 let found: Vec<Option<(Segid, u32)>> = stream::iter(edited)
                     .map(|extent| async move {
+                        // Warm path: this store's own committed writes publish
+                        // every extent's location, so overwrites of extents it
+                        // wrote answer the debit from the location cache. The
+                        // database fallback can land on a cold SST block on
+                        // the remote object store, where one fetch costs a
+                        // network round trip on the write ACK path.
+                        if let Some(cached) = self
+                            .extent_location_cache
+                            .get(&(id, extent))
+                            .map_err(|_| FsError::IoError)?
+                        {
+                            return Ok(match cached {
+                                CachedExtentLocation::Hole => None,
+                                CachedExtentLocation::Frame(loc) => Some((loc.segid, loc.byte_len)),
+                            });
+                        }
+                        #[cfg(test)]
+                        self.old_debit_db_lookups
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let key = self.key_codec.extent_key(id, extent);
                         let value = self
                             .db
@@ -2233,6 +2252,53 @@ mod tests {
         assert_eq!(
             store.read(b, 0, EXTENT_SIZE as u64).await.unwrap().as_ref(),
             data.as_ref()
+        );
+    }
+
+    // Overwriting extents this store itself committed must answer old-debit
+    // discovery from the extent-location cache: a database point read can
+    // land on a cold SST block on the remote object store, where one fetch
+    // costs a network round trip on the write ACK path.
+    #[tokio::test]
+    async fn warm_overwrite_debits_from_the_location_cache() {
+        let (store, db) = make().await;
+        let inode: InodeId = 1;
+        let presized = 128 * 1024 * 1024u64;
+        let chunk = 8 * EXTENT_SIZE;
+
+        let mut txn = db.new_transaction().unwrap();
+        let tu = store
+            .write(
+                &mut txn,
+                inode,
+                0,
+                &Bytes::from(incompressible(1, chunk)),
+                presized,
+            )
+            .await
+            .unwrap();
+        commit(&store, txn).await;
+        store.apply_tail_update(inode, tu);
+
+        let db_lookups_before = store.old_debit_db_lookup_count();
+        let mut txn = db.new_transaction().unwrap();
+        let tu = store
+            .write(
+                &mut txn,
+                inode,
+                0,
+                &Bytes::from(incompressible(2, chunk)),
+                presized,
+            )
+            .await
+            .unwrap();
+        commit(&store, txn).await;
+        store.apply_tail_update(inode, tu);
+        assert_eq!(
+            store.old_debit_db_lookup_count(),
+            db_lookups_before,
+            "a warm overwrite must resolve superseded FrameLocs from the \
+             location cache, not database point reads"
         );
     }
 

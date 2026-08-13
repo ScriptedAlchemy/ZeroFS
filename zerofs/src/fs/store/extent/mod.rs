@@ -218,6 +218,10 @@ pub struct ExtentStore {
     /// concurrency benchmarks to attribute serialization.
     #[cfg(test)]
     stage_phase_nanos: Arc<write::StagePhaseNanos>,
+    /// Old-debit discoveries that missed the location cache and fell back to a
+    /// database point read, for focused write-path tests.
+    #[cfg(test)]
+    old_debit_db_lookups: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl ExtentStore {
@@ -311,6 +315,8 @@ impl ExtentStore {
             old_extent_scan_ranges: Arc::new(Mutex::new(Vec::new())),
             #[cfg(test)]
             stage_phase_nanos: Arc::new(write::StagePhaseNanos::default()),
+            #[cfg(test)]
+            old_debit_db_lookups: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -525,6 +531,13 @@ impl ExtentStore {
     #[cfg(test)]
     fn old_extent_scan_ranges(&self) -> Vec<(u64, u64)> {
         self.old_extent_scan_ranges.lock().unwrap().clone()
+    }
+
+    /// Old-debit discoveries that fell back to a database point read.
+    #[cfg(test)]
+    fn old_debit_db_lookup_count(&self) -> u64 {
+        self.old_debit_db_lookups
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
