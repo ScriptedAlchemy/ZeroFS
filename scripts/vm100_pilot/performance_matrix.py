@@ -150,7 +150,7 @@ class MatrixCellResult:
     cell: MatrixCell
     total_bytes: int
     fio: MatrixFioResult
-    maintenance_before: WritebackSnapshot
+    before: WritebackSnapshot
     after_fio: WritebackSnapshot
     accepted: WritebackSnapshot
     after_syncfs: WritebackSnapshot
@@ -170,8 +170,8 @@ class MatrixCellResult:
         return asdict(self)
 
     @property
-    def before(self) -> WritebackSnapshot:
-        return self.maintenance_before
+    def maintenance_before(self) -> WritebackSnapshot:
+        return self.before
 
 
 @dataclass(frozen=True, slots=True)
@@ -487,7 +487,7 @@ class PerformanceMatrixRunner:
             cell=cell,
             total_bytes=total_bytes,
             fio=fio,
-            maintenance_before=before,
+            before=before,
             after_fio=after_fio,
             accepted=accepted,
             after_syncfs=after_syncfs,

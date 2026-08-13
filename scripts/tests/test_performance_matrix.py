@@ -507,7 +507,7 @@ class PerformanceMatrixOrchestrationTests(unittest.TestCase):
             cell=cell,
             total_bytes=32 << 20,
             fio=fio,
-            maintenance_before=self.snapshot,
+            before=self.snapshot,
             after_fio=replace(self.snapshot, accepted=10),
             accepted=replace(self.snapshot, accepted=10, local=10),
             after_syncfs=replace(self.snapshot, accepted=10, local=10),
@@ -726,7 +726,8 @@ class PerformanceMatrixOrchestrationTests(unittest.TestCase):
         self.assertEqual(manifest["authority"]["config_sha256"], "b" * 64)
         self.assertEqual(summary["cell_count"], 3)
         self.assertEqual(len(summary["cells"]), 3)
-        self.assertEqual(summary["cells"][0]["maintenance_before"]["gc_passes"], 4)
+        self.assertEqual(summary["cells"][0]["before"]["gc_passes"], 4)
+        self.assertNotIn("maintenance_before", summary["cells"][0])
         self.assertEqual(len(rows), 3)
         self.assertEqual(rows[1]["block_size"], "1M")
         self.assertEqual(rows[1]["jobs"], "4")
