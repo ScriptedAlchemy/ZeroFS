@@ -1102,9 +1102,19 @@ class FreshResetTests(unittest.TestCase):
         root.mkdir()
         mount = Path(self.temp.name) / "mount"
         mount.mkdir()
+        # The reset flow backs up the pilot config with a real `cp -a`, which the
+        # fake runner executes for real. Keep that inside the temp dir: the default
+        # /etc/zerofs/nbd-pilot.toml is root-owned 0600 on a provisioned VM100, so
+        # leaving it at the default made these tests pass only on machines where
+        # the pilot config happened not to exist.
+        config_file = Path(self.temp.name) / "nbd-pilot.toml"
+        config_file.write_text(
+            '[storage]\nurl = "sftp://pilot@example.test:23/old"\n', encoding="utf-8"
+        )
         self.config = PilotConfig.from_mapping(
             root,
             {
+                "ZEROFS_PILOT_CONFIG": str(config_file),
                 "ZEROFS_PILOT_MOUNTPOINT": str(mount),
                 "ZEROFS_PILOT_INTEGRITY_FILE": str(mount / "integrity"),
                 "ZEROFS_PILOT_METADATA_DIR": str(mount / "metadata"),
