@@ -214,6 +214,10 @@ pub struct ExtentStore {
     /// write-path tests.
     #[cfg(test)]
     old_extent_scan_ranges: Arc<Mutex<Vec<(u64, u64)>>>,
+    /// Per-phase nanosecond totals for `stage_edits`, read by the write-path
+    /// concurrency benchmarks to attribute serialization.
+    #[cfg(test)]
+    stage_phase_nanos: Arc<write::StagePhaseNanos>,
 }
 
 impl ExtentStore {
@@ -305,6 +309,8 @@ impl ExtentStore {
             segment_gc_stats: Arc::new(SegmentGcStats::default()),
             #[cfg(test)]
             old_extent_scan_ranges: Arc::new(Mutex::new(Vec::new())),
+            #[cfg(test)]
+            stage_phase_nanos: Arc::new(write::StagePhaseNanos::default()),
         }
     }
 

@@ -70,6 +70,46 @@ pub(super) struct OpenLane {
     pub(super) open: std::sync::Mutex<OpenSegment>,
 }
 
+/// Nanoseconds spent in each phase of [`ExtentStore::stage_edits`], summed over
+/// every staging call. Concurrency benchmarks read these to attribute
+/// serialization to a phase instead of guessing at it.
+#[cfg(test)]
+#[derive(Default)]
+pub(super) struct StagePhaseNanos {
+    /// Superseded-FrameLoc discovery (point lookups or the range scan).
+    pub(super) old_debit: std::sync::atomic::AtomicU64,
+    /// Compression, deliberately outside every lock.
+    pub(super) compress: std::sync::atomic::AtomicU64,
+    /// Waiting for the extent-ref publication read guard.
+    pub(super) protect_ref: std::sync::atomic::AtomicU64,
+    /// Waiting to enter the lane's append gate.
+    pub(super) gate_wait: std::sync::atomic::AtomicU64,
+    /// Holding the lane's append gate (the per-lane serial section).
+    pub(super) gate_hold: std::sync::atomic::AtomicU64,
+    /// Batch AEAD, currently inside the append gate.
+    pub(super) aead: std::sync::atomic::AtomicU64,
+    /// Blocking on the lane's open-buffer std mutex.
+    pub(super) open_lock_wait: std::sync::atomic::AtomicU64,
+    /// Copying sealed frames into the open buffer under that mutex.
+    pub(super) append: std::sync::atomic::AtomicU64,
+    /// Rotation admission, including the in-flight-seal residency permit.
+    pub(super) spawn_seal: std::sync::atomic::AtomicU64,
+    /// Staging pointers, cache inserts, and segment-counter deltas onto the txn.
+    pub(super) txn_stage: std::sync::atomic::AtomicU64,
+    /// Staging calls that carried at least one frame.
+    pub(super) batches: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(test)]
+impl StagePhaseNanos {
+    fn add(counter: &std::sync::atomic::AtomicU64, since: std::time::Instant) {
+        counter.fetch_add(
+            since.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+}
+
 /// Immutable segment bytes retained until publication succeeds. The owned permit
 /// makes removal from `sealing` the single release point for its RAM budget.
 pub(super) struct SealingGeneration {
@@ -82,6 +122,27 @@ impl ExtentStore {
     pub(super) fn open_lane(&self, id: InodeId) -> &OpenLane {
         let mixed = id ^ (id >> 32);
         &self.open_lanes[(mixed as usize) & (OPEN_SEGMENT_LANES - 1)]
+    }
+
+    /// Lock an append lane for one staging batch. Inode affinity is the fast
+    /// path: an uncontended writer keeps its frames on one lane's segments.
+    /// When the affine gate is held (two hot inodes colliding on a lane, the
+    /// common case for a handful of NBD stripe members), spill to any idle
+    /// lane instead of queueing: colliding writers would interleave frames in
+    /// the shared open segment anyway, so spilling costs no read locality
+    /// while restoring lane parallelism. When every gate is busy, wait on the
+    /// affine one (tokio's FIFO mutex keeps the flush barrier's freeze fair).
+    async fn lock_append_lane(&self, id: InodeId) -> (&OpenLane, tokio::sync::MutexGuard<'_, ()>) {
+        let preferred = self.open_lane(id);
+        if let Ok(guard) = preferred.append_gate.try_lock() {
+            return (preferred, guard);
+        }
+        for lane in self.open_lanes.iter() {
+            if let Ok(guard) = lane.append_gate.try_lock() {
+                return (lane, guard);
+            }
+        }
+        (preferred, preferred.append_gate.lock().await)
     }
 
     fn tail_get(&self, id: InodeId) -> Option<(u64, Bytes)> {
@@ -230,6 +291,10 @@ impl ExtentStore {
             },
             "stage_edits requires unique extent indices per batch"
         );
+        #[cfg(test)]
+        let phase = Arc::clone(&self.stage_phase_nanos);
+        #[cfg(test)]
+        let t_old_debit = std::time::Instant::now();
         let mut old_debits: Vec<(Segid, u32)> = Vec::new();
         if let (Some(min), Some(max)) = (
             edits.iter().map(|(e, _)| *e).min(),
@@ -298,6 +363,10 @@ impl ExtentStore {
                 }
             }
         }
+        #[cfg(test)]
+        StagePhaseNanos::add(&phase.old_debit, t_old_debit);
+        #[cfg(test)]
+        let t_compress = std::time::Instant::now();
         // Compress before taking the open-segment lock: compression is the
         // expensive half of the codec and depends only on the plaintext, while
         // the AEAD binds (segid, frame_index), assigned under the lock. Large
@@ -323,16 +392,33 @@ impl ExtentStore {
                 .collect::<Result<_, _>>()
                 .map_err(|_| FsError::IoError)?
         };
+        #[cfg(test)]
+        StagePhaseNanos::add(&phase.compress, t_compress);
         let has_frames = !compressed.is_empty();
+        #[cfg(test)]
+        if has_frames {
+            phase
+                .batches
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        #[cfg(test)]
+        let t_protect = std::time::Instant::now();
         if has_frames {
             // Must precede FrameLoc assignment under `open`.
             self.protect_extent_ref(txn).await;
         }
+        #[cfg(test)]
+        StagePhaseNanos::add(&phase.protect_ref, t_protect);
         // Keep later writers from appending once this writer discovers that a
         // rotation is due. In particular, this guard stays held while
         // spawn_seal waits for an in-flight-seal permit.
-        let lane = self.open_lane(id);
-        let _append_guard = lane.append_gate.lock().await;
+        #[cfg(test)]
+        let t_gate_wait = std::time::Instant::now();
+        let (lane, _append_guard) = self.lock_append_lane(id).await;
+        #[cfg(test)]
+        StagePhaseNanos::add(&phase.gate_wait, t_gate_wait);
+        #[cfg(test)]
+        let t_gate_hold = std::time::Instant::now();
         let prepared = if has_frames {
             // Reserve the segment identity and contiguous frame-index run under
             // the append gate, but do the batch AEAD without holding the open
@@ -345,6 +431,8 @@ impl ExtentStore {
             if let Some(probe) = &self.before_batch_seal {
                 probe();
             }
+            #[cfg(test)]
+            let t_aead = std::time::Instant::now();
             let mut compressed = compressed.into_iter();
             let frames = edits
                 .iter()
@@ -361,13 +449,21 @@ impl ExtentStore {
             let sealed =
                 crate::segment::seal_compressed_batch(&self.codec, segid, first_frame, frames)
                     .map_err(|_| FsError::IoError)?;
+            #[cfg(test)]
+            StagePhaseNanos::add(&phase.aead, t_aead);
             Some((segid, first_frame, sealed))
         } else {
             None
         };
         let mut locs = Vec::with_capacity(prepared.as_ref().map_or(0, |p| p.2.len()));
         if let Some((segid, first_frame, sealed)) = prepared {
+            #[cfg(test)]
+            let t_open_lock = std::time::Instant::now();
             let mut open = lane.open.lock().unwrap();
+            #[cfg(test)]
+            StagePhaseNanos::add(&phase.open_lock_wait, t_open_lock);
+            #[cfg(test)]
+            let t_append = std::time::Instant::now();
             if open.segid != segid || open.dir.len() as u32 != first_frame {
                 return Err(FsError::IoError);
             }
@@ -391,7 +487,11 @@ impl ExtentStore {
                     extent,
                 });
             }
+            #[cfg(test)]
+            StagePhaseNanos::add(&phase.append, t_append);
         }
+        #[cfg(test)]
+        let t_txn_stage = std::time::Instant::now();
         let mut locs = locs.into_iter();
         for (extent, edit) in edits {
             match edit {
@@ -418,10 +518,18 @@ impl ExtentStore {
             // Overwrite debit of the superseded frame: live only, total untouched.
             self.seg_delta(txn, segid, -(byte_len as i64), 0);
         }
+        #[cfg(test)]
+        StagePhaseNanos::add(&phase.txn_stage, t_txn_stage);
         let over_threshold = lane.open.lock().unwrap().buf.len() >= self.seal_threshold();
         if over_threshold {
+            #[cfg(test)]
+            let t_spawn_seal = std::time::Instant::now();
             self.spawn_seal(lane).await;
+            #[cfg(test)]
+            StagePhaseNanos::add(&phase.spawn_seal, t_spawn_seal);
         }
+        #[cfg(test)]
+        StagePhaseNanos::add(&phase.gate_hold, t_gate_hold);
         Ok(())
     }
 
@@ -2089,5 +2197,145 @@ mod tests {
                 total as f64 / secs / 1e6
             );
         }
+    }
+
+    // Two hot inodes colliding on one affine lane must not serialize behind a
+    // single append gate while other lanes sit idle (the production NBD shape:
+    // four stripe members mapped onto four lanes by inode id usually collide).
+    #[tokio::test]
+    async fn colliding_inodes_spill_to_an_idle_append_lane() {
+        let (store, db) = make().await;
+        let a: InodeId = 1;
+        let b: InodeId = a + OPEN_SEGMENT_LANES as u64;
+        assert!(
+            std::ptr::eq(store.open_lane(a), store.open_lane(b)),
+            "test premise: a and b share an affine lane"
+        );
+
+        // Writer A occupies the shared affine gate, as it does for the whole
+        // AEAD + append window of a staging batch.
+        let gate = store.open_lane(a).append_gate.lock().await;
+
+        // Writer B must spill to an idle lane and complete while A's gate is
+        // still held, instead of queueing behind it.
+        let data = Bytes::from(incompressible(2, EXTENT_SIZE));
+        let mut txn = db.new_transaction().unwrap();
+        let staged = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            store.write(&mut txn, b, 0, &data, 0),
+        )
+        .await
+        .expect("a colliding writer must spill to an idle lane, not queue")
+        .unwrap();
+        drop(gate);
+        commit(&store, txn).await;
+        store.apply_tail_update(b, staged);
+        assert_eq!(
+            store.read(b, 0, EXTENT_SIZE as u64).await.unwrap().as_ref(),
+            data.as_ref()
+        );
+    }
+
+    /// Mean per-staging-batch nanoseconds of every `stage_edits` phase, so a
+    /// flat scaling curve can be attributed instead of guessed at.
+    fn phase_report(store: &ExtentStore) -> String {
+        use std::sync::atomic::Ordering::Relaxed;
+        let p = &store.stage_phase_nanos;
+        let batches = p.batches.load(Relaxed).max(1) as f64;
+        let us =
+            |counter: &std::sync::atomic::AtomicU64| counter.load(Relaxed) as f64 / batches / 1e3;
+        format!(
+            "per-batch us: old_debit {:.0}, compress {:.0}, protect_ref {:.0}, \
+             gate_wait {:.0}, gate_hold {:.0} [aead {:.0}, open_lock {:.0}, \
+             append {:.0}, txn_stage {:.0}, spawn_seal {:.0}]",
+            us(&p.old_debit),
+            us(&p.compress),
+            us(&p.protect_ref),
+            us(&p.gate_wait),
+            us(&p.gate_hold),
+            us(&p.aead),
+            us(&p.open_lock_wait),
+            us(&p.append),
+            us(&p.txn_stage),
+            us(&p.spawn_seal),
+        )
+    }
+
+    /// One scaling point: `writers` independent stripe-member inodes, each
+    /// overwritten with canonical 256 KiB chunks below a pre-sized EOF.
+    async fn run_distinct_inode_scaling(writers: usize, stride: u64, label: &str) {
+        let (store, db, _object_store) = make_with_compression(CompressionConfig::Lz4).await;
+        let chunk = 8 * EXTENT_SIZE; // one canonical 256 KiB member chunk
+        let per_writer = 64 * 1024 * 1024usize;
+        let lanes: HashSet<u64> = (0..writers as u64)
+            .map(|w| (100 + w * stride) & (OPEN_SEGMENT_LANES as u64 - 1))
+            .collect();
+
+        let start = std::time::Instant::now();
+        let mut tasks = Vec::with_capacity(writers);
+        for w in 0..writers as u64 {
+            let store = store.clone();
+            let db = db.clone();
+            tasks.push(crate::task::spawn_named("bench-writer", async move {
+                let inode: InodeId = 100 + w * stride;
+                let payload = Bytes::from(incompressible(w as usize + 1, chunk));
+                let (mut stage_ns, mut commit_ns) = (0u64, 0u64);
+                for i in 0..(per_writer / chunk) {
+                    let mut txn = db.new_transaction().unwrap();
+                    let t0 = std::time::Instant::now();
+                    let tu = store
+                        .write(
+                            &mut txn,
+                            inode,
+                            (i * chunk) as u64,
+                            &payload,
+                            per_writer as u64,
+                        )
+                        .await
+                        .unwrap();
+                    let t1 = std::time::Instant::now();
+                    commit(&store, txn).await;
+                    commit_ns += t1.elapsed().as_nanos() as u64;
+                    stage_ns += (t1 - t0).as_nanos() as u64;
+                    store.apply_tail_update(inode, tu);
+                }
+                (stage_ns, commit_ns)
+            }));
+        }
+        let mut stage_ns = 0u64;
+        let mut commit_ns = 0u64;
+        for task in tasks {
+            let (s, c) = task.await.unwrap();
+            stage_ns += s;
+            commit_ns += c;
+        }
+        let secs = start.elapsed().as_secs_f64();
+        let ops = (writers * (per_writer / chunk)) as f64;
+        eprintln!(
+            "distinct-inode scaling [{label}] writers={writers} lanes={}: {:.0} MB/s aggregate \
+             (mean per write: stage {:.0} us, commit {:.0} us); {}",
+            lanes.len(),
+            (writers * per_writer) as f64 / secs / 1e6,
+            stage_ns as f64 / ops / 1e3,
+            commit_ns as f64 / ops / 1e3,
+            phase_report(&store),
+        );
+    }
+
+    // Cross-inode write scaling for the production NBD stripe shape: several
+    // pre-sized sparse member files overwritten concurrently. Aggregate
+    // throughput should grow with the writer count; a flat curve means a serial
+    // resource in the extent staging path rather than in the commit worker.
+    //   cargo test --release --lib -- --ignored --nocapture bench_distinct_inode
+    #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
+    #[ignore = "throughput measurement, run explicitly in release"]
+    async fn bench_distinct_inode_write_scaling() {
+        for writers in [1usize, 2, 4, 8] {
+            run_distinct_inode_scaling(writers, 1, "consecutive inodes").await;
+        }
+        // Controls: four writers that all hash to one append lane, versus four
+        // that each own a lane. The delta isolates lane collision from the rest
+        // of the path.
+        run_distinct_inode_scaling(4, 4, "one shared lane").await;
     }
 }
