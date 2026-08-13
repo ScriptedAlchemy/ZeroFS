@@ -345,6 +345,11 @@ impl WritebackObjectStore {
             ))
         })?;
         let payload = VerifiedPayload::new(bytes);
+        // Wait for journal-queue capacity before taking the global order lock,
+        // so a full queue cannot convoy unrelated writers behind this one.
+        let slot = self.inner.journaler.reserve_slot().await.map_err(|error| {
+            generic_error(format!("local journal admission failed: {error}"))
+        })?;
         let order_guard = self.inner.admission_order.lock().await;
         let sequence = self.allocate_sequence()?;
         let local_etag = LocalEtag::new(self.inner.incarnation, sequence);
@@ -379,7 +384,7 @@ impl WritebackObjectStore {
         let barrier = match self
             .inner
             .journaler
-            .submit_verified_put_with_disk(record, payload, ram, disk)
+            .submit_reserved(slot, record, Some(payload), Some(ram), Some(disk))
             .await
         {
             Ok(barrier) => barrier,
@@ -424,6 +429,9 @@ impl WritebackObjectStore {
             .map_err(|error| generic_error(format!("dirty SSD admission failed: {error}")))?;
         let lock = self.key_lock(&location);
         let key_guard = lock.lock_owned().await;
+        let slot = self.inner.journaler.reserve_slot().await.map_err(|error| {
+            generic_error(format!("delete journal admission failed: {error}"))
+        })?;
         let order_guard = self.inner.admission_order.lock().await;
         let sequence = self.allocate_sequence()?;
         let kind = MutationKind::Delete;
@@ -452,7 +460,7 @@ impl WritebackObjectStore {
         let barrier = match self
             .inner
             .journaler
-            .submit_metadata_with_disk(record, disk)
+            .submit_reserved(slot, record, None, None, Some(disk))
             .await
         {
             Ok(barrier) => barrier,
@@ -550,6 +558,9 @@ impl WritebackObjectStore {
         }
         let payload = VerifiedPayload::new(bytes);
 
+        let slot = self.inner.journaler.reserve_slot().await.map_err(|error| {
+            generic_error(format!("copy/rename journal admission failed: {error}"))
+        })?;
         let order_guard = self.inner.admission_order.lock().await;
         let sequence = self.allocate_sequence()?;
         let local_etag = LocalEtag::new(self.inner.incarnation, sequence);
@@ -604,7 +615,7 @@ impl WritebackObjectStore {
         let barrier = match self
             .inner
             .journaler
-            .submit_verified_put_with_disk(record, payload, ram, disk)
+            .submit_reserved(slot, record, Some(payload), Some(ram), Some(disk))
             .await
         {
             Ok(barrier) => barrier,

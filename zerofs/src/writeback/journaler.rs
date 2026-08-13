@@ -154,6 +154,15 @@ enum JournalCommand {
     Shutdown(oneshot::Sender<()>),
 }
 
+/// Reserved capacity in the journal queue. Reserving before entering the
+/// store's global admission-order critical section lets a full queue apply
+/// backpressure without stalling unrelated writers behind the order lock;
+/// queue order is still the order of `submit_reserved` calls, not of
+/// reservations.
+pub(crate) struct SubmitSlot {
+    permit: mpsc::OwnedPermit<JournalCommand>,
+}
+
 impl LocalJournaler {
     pub fn start(
         journal: Arc<Journal>,
@@ -319,6 +328,45 @@ impl LocalJournaler {
             })
             .await
             .map_err(|_| terminal_or_closed(&self.inner.barrier))?;
+        Ok(self.inner.barrier.clone())
+    }
+
+    /// Wait for queue capacity without submitting anything yet.
+    pub(crate) async fn reserve_slot(&self) -> Result<SubmitSlot, LocalBarrierError> {
+        if self.inner.closed.load(Ordering::Acquire) {
+            return Err(LocalBarrierError::Closed);
+        }
+        let permit = self
+            .inner
+            .sender
+            .clone()
+            .reserve_owned()
+            .await
+            .map_err(|_| terminal_or_closed(&self.inner.barrier))?;
+        Ok(SubmitSlot { permit })
+    }
+
+    /// Enqueue a mutation into previously reserved capacity. The message is
+    /// queued at this call, so callers serialize submissions in sequence
+    /// order without ever waiting on capacity here.
+    pub(crate) async fn submit_reserved(
+        &self,
+        slot: SubmitSlot,
+        record: MutationRecord,
+        payload: Option<VerifiedPayload>,
+        ram: Option<AcceptedAdmission>,
+        disk: Option<DiskPermit>,
+    ) -> Result<LocalBarrier, LocalBarrierError> {
+        let _gate = self.inner.admission_gate.lock().await;
+        if self.inner.closed.load(Ordering::Acquire) {
+            return Err(LocalBarrierError::Closed);
+        }
+        slot.permit.send(JournalCommand::Mutation {
+            record: Box::new(record),
+            payload,
+            ram,
+            disk,
+        });
         Ok(self.inner.barrier.clone())
     }
 
@@ -1172,6 +1220,49 @@ mod tests {
         observer.release.notify_one();
         barrier.wait_local(1).await.unwrap();
         assert_eq!(admission.used_bytes(), 0);
+        journaler.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reserved_slots_enqueue_in_submission_order_not_reservation_order() {
+        let admission = Admission::new(20);
+        let (journaler, mut entered, release, sink) = blocking_journaler(admission.clone(), None);
+        let first = admission.reserve(3).await.unwrap().accept();
+        let second = admission.reserve(3).await.unwrap().accept();
+
+        // Capacity may be reserved in any order; the queue must follow the
+        // submit_reserved calls, which the store serializes in sequence order
+        // under its admission-order lock.
+        let early = journaler.reserve_slot().await.unwrap();
+        let late = journaler.reserve_slot().await.unwrap();
+        let barrier = journaler
+            .submit_reserved(
+                late,
+                put_record(1, b"one"),
+                Some(VerifiedPayload::new(Bytes::from_static(b"one"))),
+                Some(first),
+                None,
+            )
+            .await
+            .unwrap();
+        journaler
+            .submit_reserved(
+                early,
+                put_record(2, b"two"),
+                Some(VerifiedPayload::new(Bytes::from_static(b"two"))),
+                Some(second),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let mut started = [entered.recv().await.unwrap(), entered.recv().await.unwrap()];
+        started.sort_unstable();
+        assert_eq!(started, [1, 2]);
+        release.send(()).unwrap();
+        release.send(()).unwrap();
+        barrier.wait_local(2).await.unwrap();
+        assert_eq!(*sink.committed.lock().unwrap(), vec![1, 2]);
         journaler.shutdown().await.unwrap();
     }
 
