@@ -50,6 +50,9 @@ struct WritebackStoreInner {
     next_sequence: AtomicU64,
     key_locks: Vec<Arc<Mutex<()>>>,
     admission_order: Mutex<()>,
+    started: std::time::Instant,
+    available_space: AtomicU64,
+    available_space_probed_ms: AtomicU64,
 }
 
 impl std::fmt::Debug for WritebackObjectStore {
@@ -75,6 +78,24 @@ impl std::fmt::Display for WritebackObjectStore {
 impl WritebackStoreInner {
     fn overlay_remote(&self) -> &'static str {
         "remote"
+    }
+
+    /// Free-space probes guard SSD admission but do not need per-operation
+    /// precision; serve a briefly cached value so the write path is not one
+    /// statvfs syscall per mutation.
+    fn available_space(&self) -> object_store::Result<u64> {
+        const PROBE_TTL_MS: u64 = 250;
+        let now_ms = self.started.elapsed().as_millis() as u64;
+        let probed = self.available_space_probed_ms.load(Ordering::Acquire);
+        if probed != 0 && now_ms.saturating_sub(probed) < PROBE_TTL_MS {
+            return Ok(self.available_space.load(Ordering::Acquire));
+        }
+        let available = fs4::available_space(&self.settings.dir)
+            .map_err(|error| generic_error(format!("failed to inspect writeback SSD: {error}")))?;
+        self.available_space.store(available, Ordering::Release);
+        self.available_space_probed_ms
+            .store(now_ms.max(1), Ordering::Release);
+        Ok(available)
     }
 }
 
@@ -172,6 +193,9 @@ impl WritebackObjectStore {
                     .map(|_| Arc::new(Mutex::new(())))
                     .collect(),
                 admission_order: Mutex::new(()),
+                started: std::time::Instant::now(),
+                available_space: AtomicU64::new(0),
+                available_space_probed_ms: AtomicU64::new(0),
             }),
         })
     }
@@ -419,8 +443,7 @@ impl WritebackObjectStore {
         let disk_charge = MutationRecord::metadata_ssd_reservation(&path).map_err(|error| {
             generic_error(format!("failed to size delete journal record: {error}"))
         })?;
-        let available = fs4::available_space(&self.inner.settings.dir)
-            .map_err(|error| generic_error(format!("failed to inspect writeback SSD: {error}")))?;
+        let available = self.inner.available_space()?;
         let disk = self
             .inner
             .disk
@@ -516,9 +539,7 @@ impl WritebackObjectStore {
                 .await
                 .map_err(|error| generic_error(format!("dirty RAM admission failed: {error}")))?
                 .accept();
-            let available = fs4::available_space(&self.inner.settings.dir).map_err(|error| {
-                generic_error(format!("failed to inspect writeback SSD: {error}"))
-            })?;
+            let available = self.inner.available_space()?;
             let disk_charge = MutationRecord::ssd_reservation_estimate(
                 to.as_ref(),
                 Some(from.as_ref()),
@@ -659,8 +680,7 @@ impl ObjectStore for WritebackObjectStore {
             .await
             .map_err(|error| generic_error(format!("dirty RAM admission failed: {error}")))?
             .accept();
-        let available = fs4::available_space(&self.inner.settings.dir)
-            .map_err(|error| generic_error(format!("failed to inspect writeback SSD: {error}")))?;
+        let available = self.inner.available_space()?;
         let disk_charge =
             MutationRecord::ssd_reservation_estimate(location.as_ref(), None, bytes_len).map_err(
                 |error| generic_error(format!("failed to size put journal entry: {error}")),
@@ -1085,8 +1105,7 @@ async fn complete_memory_multipart(
     if assembled.len() != capacity {
         return Err(generic_error("multipart assembled length mismatch"));
     }
-    let available = fs4::available_space(&store.inner.settings.dir)
-        .map_err(|error| generic_error(format!("failed to inspect writeback SSD: {error}")))?;
+    let available = store.inner.available_space()?;
     let disk_charge = MutationRecord::ssd_reservation_estimate(location.as_ref(), None, total_len)
         .map_err(|error| {
             generic_error(format!(
@@ -1127,8 +1146,7 @@ async fn complete_multipart(
         .await
         .map_err(|error| generic_error(format!("dirty RAM admission failed: {error}")))?
         .accept();
-    let available = fs4::available_space(&store.inner.settings.dir)
-        .map_err(|error| generic_error(format!("failed to inspect writeback SSD: {error}")))?;
+    let available = store.inner.available_space()?;
     let disk_charge = MutationRecord::ssd_reservation_estimate(location.as_ref(), None, total_len)
         .map_err(|error| {
             generic_error(format!(
