@@ -823,24 +823,10 @@ impl Journal {
                 container: None,
             });
         }
-        if let Err(error) = self.require_contiguous_local_batch(&prepared, expected_first) {
-            let cleanup = self.discard_prepared_batch(prepared);
-            return match cleanup {
-                Ok(()) => Err(error),
-                Err(cleanup) => {
-                    Err(error.context(format!("prepared batch cleanup also failed: {cleanup:#}")))
-                }
-            };
-        }
-        if let Err(error) = self.require_unique_local_batch_identities(&prepared) {
-            let cleanup = self.discard_prepared_batch(prepared);
-            return match cleanup {
-                Ok(()) => Err(error),
-                Err(cleanup) => {
-                    Err(error.context(format!("prepared batch cleanup also failed: {cleanup:#}")))
-                }
-            };
-        }
+        // Rejecting here only drops `prepared`: preparation writes nothing, so
+        // an unpublished batch owns no disk state to unwind.
+        self.require_contiguous_local_batch(&prepared, expected_first)?;
+        self.require_unique_local_batch_identities(&prepared)?;
 
         let mut records = Vec::with_capacity(prepared.len());
         let mut payloads = Vec::with_capacity(prepared.len());
@@ -917,13 +903,7 @@ impl Journal {
             // unlink it rather than return straight out.
             let Some(parent) = path.parent() else {
                 let error = anyhow::anyhow!("blob path has no parent");
-                let cleanup = self.discard_container(path);
-                return match cleanup {
-                    Ok(()) => Err(error),
-                    Err(cleanup) => {
-                        Err(error.context(format!("container cleanup also failed: {cleanup:#}")))
-                    }
-                };
+                return Err(with_container_cleanup(error, self.discard_container(path)));
             };
             directories.insert(parent.to_path_buf());
         }
@@ -935,15 +915,10 @@ impl Journal {
                     "failed to fsync published blob directory {}",
                     directory.display()
                 ));
-                let cleanup =
-                    self.rollback_uncommitted_batch(written.as_deref(), &directories, filesystem);
-                return match cleanup {
-                    Ok(()) => Err(publication),
-                    Err(cleanup) => {
-                        Err(publication
-                            .context(format!("container cleanup also failed: {cleanup:#}")))
-                    }
-                };
+                return Err(with_container_cleanup(
+                    publication,
+                    self.rollback_uncommitted_batch(written.as_deref(), &directories, filesystem),
+                ));
             }
         }
         record_local_publish_phase("directory_fsync", fsync_started.elapsed());
@@ -974,13 +949,10 @@ impl Journal {
             // Recovery would unlink this container anyway -- the watermark
             // never reached its last member -- but a live process should not
             // sit on bytes nothing references until the next open.
-            let cleanup = self.discard_container_at(container.as_deref());
-            return match cleanup {
-                Ok(()) => Err(error),
-                Err(cleanup) => {
-                    Err(error.context(format!("container cleanup also failed: {cleanup:#}")))
-                }
-            };
+            return Err(with_container_cleanup(
+                error,
+                self.discard_container_at(container.as_deref()),
+            ));
         }
         record_local_publish_phase("record_commit", commit_started.elapsed());
         metrics::counter!("zerofs_writeback_local_publish_batches_total").increment(1);
@@ -1000,7 +972,10 @@ impl Journal {
             StagedBatch::Durable { container, .. } => {
                 self.discard_container_at(container.as_deref())
             }
-            StagedBatch::Unstaged(prepared) => self.discard_prepared_batch(prepared),
+            StagedBatch::Unstaged(prepared) => {
+                drop(prepared);
+                Ok(())
+            }
         }
     }
 
@@ -1060,30 +1035,9 @@ impl Journal {
             Ok(())
         })();
         if let Err(error) = write {
-            let cleanup = self.discard_container(&path);
-            return match cleanup {
-                Ok(()) => Err(error),
-                Err(cleanup) => {
-                    Err(error.context(format!("container cleanup also failed: {cleanup:#}")))
-                }
-            };
+            return Err(with_container_cleanup(error, self.discard_container(&path)));
         }
         Ok(path)
-    }
-
-    fn discard_prepared_batch(&self, prepared: Vec<PreparedMutation>) -> Result<()> {
-        let mut first_error = None;
-        for mutation in prepared {
-            if let Err(error) = self.discard_prepared(mutation)
-                && first_error.is_none()
-            {
-                first_error = Some(error);
-            }
-        }
-        match first_error {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
     }
 
     fn rollback_uncommitted_batch(
@@ -1208,12 +1162,6 @@ impl Journal {
         transaction
             .commit()
             .context("failed to commit journal mutation batch")
-    }
-
-    /// Preparation writes nothing, so discarding one only drops its bytes.
-    pub(crate) fn discard_prepared(&self, prepared: PreparedMutation) -> Result<()> {
-        drop(prepared);
-        Ok(())
     }
 
     fn discard_container(&self, path: &Path) -> Result<()> {
@@ -1811,6 +1759,17 @@ impl Journal {
             }
         }
         Ok(())
+    }
+}
+
+/// Report a publication failure together with the outcome of unlinking the
+/// container it left behind. A cleanup that also failed becomes context on the
+/// original error rather than replacing it: the first failure is the diagnosis,
+/// and the leftover bytes are collected by the next open regardless.
+fn with_container_cleanup(error: anyhow::Error, cleanup: Result<()>) -> anyhow::Error {
+    match cleanup {
+        Ok(()) => error,
+        Err(cleanup) => error.context(format!("container cleanup also failed: {cleanup:#}")),
     }
 }
 
