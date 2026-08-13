@@ -1290,6 +1290,18 @@ fn transport_error(error: crate::sftp_transport::TransportError) -> object_store
         crate::sftp_transport::TransportError::PoolClosed => object_store::Error::NotSupported {
             source: Box::new(crate::sftp_transport::TransportError::PoolClosed),
         },
+        error @ crate::sftp_transport::TransportError::MissingCapability(_) => {
+            object_store::Error::NotSupported {
+                source: Box::new(error),
+            }
+        }
+        error @ (crate::sftp_transport::TransportError::InvalidLimits(_)
+        | crate::sftp_transport::TransportError::CorruptObject(_)) => {
+            object_store::Error::Generic {
+                store: STORE_NAME,
+                source: Box::new(crate::retrying_object_store::PermanentError::new(error)),
+            }
+        }
         error => object_store::Error::Generic {
             store: STORE_NAME,
             source: Box::new(error),
@@ -1349,6 +1361,10 @@ fn publication_error(location: &ObjectPath, error: RemoteError) -> object_store:
             source: source.into(),
         },
         RemoteError::PoolClosed => unreachable!("bare pool-closed errors returned above"),
+        error if !error.is_retryable() => object_store::Error::Generic {
+            store: STORE_NAME,
+            source: Box::new(crate::retrying_object_store::PermanentError::new(error)),
+        },
         error => object_store::Error::Generic {
             store: STORE_NAME,
             source: Box::new(error),
@@ -1366,7 +1382,9 @@ fn generic_error(error: impl Into<String>) -> object_store::Error {
 fn invalid_path_error(error: impl Into<String>) -> object_store::Error {
     object_store::Error::Generic {
         store: STORE_NAME,
-        source: Box::new(RemoteError::InvalidPath(error.into())),
+        source: Box::new(crate::retrying_object_store::PermanentError::new(
+            RemoteError::InvalidPath(error.into()),
+        )),
     }
 }
 
@@ -1442,8 +1460,11 @@ mod tests {
         let object_store::Error::Generic { source, .. } = error else {
             panic!("corruption uses a typed generic source");
         };
-        let preserved = source
-            .downcast_ref::<RemoteError>()
+        let marker = source
+            .downcast_ref::<crate::retrying_object_store::PermanentError>()
+            .expect("terminal remote errors carry the permanent marker");
+        let preserved = std::error::Error::source(marker)
+            .and_then(|inner| inner.downcast_ref::<RemoteError>())
             .expect("RemoteError must not be flattened into a string");
         assert!(matches!(preserved, RemoteError::CorruptObject(_)));
         assert!(!preserved.is_retryable());

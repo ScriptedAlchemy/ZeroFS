@@ -23,6 +23,31 @@ use object_store::{
 
 const RETRY_DELETE_CONCURRENCY: usize = 10;
 
+/// Terminal (never-retryable) backend error with no typed
+/// `object_store::Error` equivalent. Backends wrap such conditions in this
+/// marker before boxing them into `Error::Generic`, so retry classification
+/// needs no backend-specific knowledge.
+#[derive(Debug)]
+pub struct PermanentError(Box<dyn std::error::Error + Send + Sync + 'static>);
+
+impl PermanentError {
+    pub fn new(error: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self(Box::new(error))
+    }
+}
+
+impl std::fmt::Display for PermanentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for PermanentError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
+    }
+}
+
 #[derive(Debug)]
 pub struct RetryingObjectStore {
     inner: Arc<dyn ObjectStore>,
@@ -64,29 +89,22 @@ impl RetryingObjectStore {
                 | object_store::Error::Unauthenticated { .. }
                 | object_store::Error::InvalidPath { .. }
                 | object_store::Error::UnknownConfigurationKey { .. }
-        ) && !Self::has_terminal_typed_source(err)
+        ) && !Self::has_permanent_source(err)
             && !Self::is_unsatisfiable_range(err)
     }
 
-    fn has_terminal_typed_source(err: &object_store::Error) -> bool {
+    fn has_permanent_source(err: &object_store::Error) -> bool {
         let object_store::Error::Generic { source, .. } = err else {
             return false;
         };
-        if let Some(error) = source.downcast_ref::<crate::sftp_transport::TransportError>() {
-            return matches!(
-                error,
-                crate::sftp_transport::TransportError::InvalidLimits(_)
-                    | crate::sftp_transport::TransportError::MissingCapability(_)
-                    | crate::sftp_transport::TransportError::PoolClosed
-                    | crate::sftp_transport::TransportError::NotFound(_)
-                    | crate::sftp_transport::TransportError::PermissionDenied(_)
-                    | crate::sftp_transport::TransportError::AlreadyExists(_)
-                    | crate::sftp_transport::TransportError::CorruptObject(_)
-            );
+        let mut current: Option<&(dyn std::error::Error + 'static)> = Some(source.as_ref());
+        while let Some(error) = current {
+            if error.is::<PermanentError>() {
+                return true;
+            }
+            current = error.source();
         }
-        source
-            .downcast_ref::<crate::sftp_object_store::RemoteError>()
-            .is_some_and(|error| !error.is_retryable())
+        false
     }
 
     /// Detect deterministic ranges beginning at or beyond EOF.
@@ -621,23 +639,39 @@ mod tests {
     }
 
     #[test]
-    fn typed_sftp_corruption_is_not_retryable() {
+    fn permanent_marker_is_not_retryable_and_plain_generic_is() {
         let error = object_store::Error::Generic {
             store: "SFTP",
-            source: Box::new(crate::sftp_transport::TransportError::CorruptObject(
-                "invalid object header".to_owned(),
-            )),
-        };
-
-        assert!(!RetryingObjectStore::should_retry(&error));
-
-        let error = object_store::Error::Generic {
-            store: "SFTP",
-            source: Box::new(crate::sftp_object_store::RemoteError::InvalidPath(
-                "outside configured prefix".to_owned(),
+            source: Box::new(PermanentError::new(
+                crate::sftp_transport::TransportError::CorruptObject(
+                    "invalid object header".to_owned(),
+                ),
             )),
         };
         assert!(!RetryingObjectStore::should_retry(&error));
+
+        // The marker is found anywhere in the source chain, not just at the top.
+        #[derive(Debug, thiserror::Error)]
+        #[error("wrapped: {0}")]
+        struct Wrapper(#[source] PermanentError);
+        let error = object_store::Error::Generic {
+            store: "SFTP",
+            source: Box::new(Wrapper(PermanentError::new(
+                crate::sftp_object_store::RemoteError::InvalidPath(
+                    "outside configured prefix".to_owned(),
+                ),
+            ))),
+        };
+        assert!(!RetryingObjectStore::should_retry(&error));
+
+        // Unmarked generic errors stay transient and retry.
+        let error = object_store::Error::Generic {
+            store: "SFTP",
+            source: Box::new(crate::sftp_transport::TransportError::Operation(
+                "connection reset".to_owned(),
+            )),
+        };
+        assert!(RetryingObjectStore::should_retry(&error));
     }
 
     #[tokio::test]
