@@ -153,21 +153,46 @@ impl ZeroFS {
                 #[cfg(feature = "failpoints")]
                 fail_point!(fp::WRITE_AFTER_EXTENT);
 
-                file.size = new_size;
                 let (now_sec, now_nsec) = get_current_time();
-                file.mtime = now_sec;
-                file.mtime_nsec = now_nsec;
-                file.ctime = now_sec;
-                file.ctime_nsec = now_nsec;
+                // POSIX: writes by a non-owner clear SUID/SGID.
+                let clears_setid =
+                    creds.uid != file.uid && creds.uid != 0 && file.mode & 0o6000 != 0;
 
-                // POSIX: Clear SUID/SGID bits on write by non-owner
-                if creds.uid != file.uid && creds.uid != 0 {
-                    file.mode &= !0o6000;
+                // An in-place overwrite whose durable timestamps already sit in
+                // the current second leaves nothing for a reader to observe:
+                // the size, mode, and the second every protocol reports are
+                // unchanged, and mtime/ctime still carry a value sampled inside
+                // the second this write happened in - the same guarantee a
+                // one-second-granularity filesystem gives, and the granularity
+                // ZeroFS already exposes as the 9P qid version. Republishing
+                // would rewrite two hot keys (the inode and its duplicate
+                // inside the parent's directory entry) for every chunk of an
+                // O_DIRECT overwrite stream, which is the shape NBD members
+                // see. Skipping keeps the returned attributes exactly equal to
+                // the durable ones, so no observer can see a divergence.
+                let republish_metadata = new_size != old_size
+                    || clears_setid
+                    || file.mtime != now_sec
+                    || file.ctime != now_sec;
+
+                if republish_metadata {
+                    file.size = new_size;
+                    file.mtime = now_sec;
+                    file.mtime_nsec = now_nsec;
+                    file.ctime = now_sec;
+                    file.ctime_nsec = now_nsec;
+                    if clears_setid {
+                        file.mode &= !0o6000;
+                    }
                 }
 
-                let parent_name_for_update = file.parent.zip(file.name.clone());
+                let parent_name_for_update = republish_metadata
+                    .then(|| file.parent.zip(file.name.clone()))
+                    .flatten();
 
-                self.inode_store.save(&mut txn, id, &inode)?;
+                if republish_metadata {
+                    self.inode_store.save(&mut txn, id, &inode)?;
+                }
 
                 #[cfg(feature = "failpoints")]
                 fail_point!(fp::WRITE_AFTER_INODE);
@@ -530,8 +555,8 @@ mod tests {
     use std::sync::Arc;
 
     use crate::fs::types::{
-        AuthContext, FallocateMode, FileAttributes, InodeWithId, SetAttributes, SetSize, SetTime,
-        Timestamp,
+        AuthContext, FallocateMode, FileAttributes, InodeWithId, SetAttributes, SetMode, SetSize,
+        SetTime, Timestamp,
     };
     use bytes::Bytes;
 
@@ -644,6 +669,245 @@ mod tests {
         assert_eq!(replayed.mtime, original.mtime);
         let (data, _) = fs.read_file(&auth, file_id, 0, 5).await.unwrap();
         assert_eq!(data.as_ref(), b"later");
+    }
+
+    /// The observable attribute fields a write can change, for comparison
+    /// (`FileAttributes` itself is not `PartialEq`).
+    fn attr_fingerprint(attrs: &FileAttributes) -> (u32, u32, u32, u64, Timestamp, Timestamp) {
+        (
+            attrs.mode,
+            attrs.uid,
+            attrs.gid,
+            attrs.size,
+            attrs.mtime,
+            attrs.ctime,
+        )
+    }
+
+    /// Attributes as a fresh reader would see them, straight from the inode.
+    async fn persisted_attrs(fs: &ZeroFS, id: InodeId) -> FileAttributes {
+        let inode = fs.inode_store.get(id).await.unwrap();
+        InodeWithId { inode: &inode, id }.into()
+    }
+
+    /// Attributes as `readdir` reports them, i.e. from the parent directory
+    /// entry's embedded inode copy.
+    async fn directory_entry_attrs(fs: &ZeroFS, dir: InodeId, name: &[u8]) -> FileAttributes {
+        let auth: AuthContext = (&test_auth()).into();
+        let listing = fs.readdir(&auth, dir, 0, 64).await.unwrap();
+        listing
+            .entries
+            .into_iter()
+            .find(|entry| entry.name == name)
+            .expect("entry present in listing")
+            .attr
+    }
+
+    /// Park until just after a wall-clock second boundary so a short burst of
+    /// writes lands inside one second.
+    async fn wait_for_second_boundary() {
+        let (_, nsec) = get_current_time();
+        let remaining = 1_000_000_000u32.saturating_sub(nsec);
+        tokio::time::sleep(std::time::Duration::from_nanos(
+            u64::from(remaining) + 2_000_000,
+        ))
+        .await;
+    }
+
+    /// The NBD steady state: `O_DIRECT` overwrites that change neither the
+    /// file size nor the second the timestamps fall in. Those writes must not
+    /// republish inode metadata, so the timestamps they report are the ones
+    /// already durable.
+    #[tokio::test]
+    async fn in_place_overwrite_within_one_second_reuses_persisted_timestamps() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let (file_id, _) = fs
+            .create(&test_creds(), 0, b"nbd.img", &SetAttributes::default())
+            .await
+            .unwrap();
+        let auth: AuthContext = (&test_auth()).into();
+
+        // Grow once so every later write is a pure in-place overwrite.
+        fs.write(&auth, file_id, 0, &Bytes::from(vec![0xAA; 4096]))
+            .await
+            .unwrap();
+
+        let (first, second) = loop {
+            wait_for_second_boundary().await;
+            let first = fs
+                .write(&auth, file_id, 0, &Bytes::from(vec![0xBB; 4096]))
+                .await
+                .unwrap();
+            let second = fs
+                .write(&auth, file_id, 0, &Bytes::from(vec![0xCC; 4096]))
+                .await
+                .unwrap();
+            if first.mtime.seconds == second.mtime.seconds {
+                break (first, second);
+            }
+        };
+
+        assert_eq!(
+            first.mtime, second.mtime,
+            "an in-place overwrite inside one second must not republish mtime"
+        );
+        assert_eq!(
+            first.ctime, second.ctime,
+            "an in-place overwrite inside one second must not republish ctime"
+        );
+        assert_eq!(second.size, 4096);
+
+        // What the write returned is exactly what is durable, and the parent
+        // directory entry agrees with it.
+        assert_eq!(
+            attr_fingerprint(&persisted_attrs(&fs, file_id).await),
+            attr_fingerprint(&second)
+        );
+        assert_eq!(
+            attr_fingerprint(&directory_entry_attrs(&fs, 0, b"nbd.img").await),
+            attr_fingerprint(&second)
+        );
+
+        let (data, _) = fs.read_file(&auth, file_id, 0, 4096).await.unwrap();
+        assert_eq!(data.as_ref(), vec![0xCC; 4096].as_slice());
+    }
+
+    /// A write that grows the file changes something a reader can see, so it
+    /// must publish both the inode and the directory entry copy.
+    #[tokio::test]
+    async fn a_growing_write_always_republishes_metadata() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let (file_id, _) = fs
+            .create(&test_creds(), 0, b"growing.txt", &SetAttributes::default())
+            .await
+            .unwrap();
+        let auth: AuthContext = (&test_auth()).into();
+
+        wait_for_second_boundary().await;
+        let first = fs
+            .write(&auth, file_id, 0, &Bytes::from_static(b"abcd"))
+            .await
+            .unwrap();
+        let second = fs
+            .write(&auth, file_id, 0, &Bytes::from_static(b"abcdefgh"))
+            .await
+            .unwrap();
+
+        assert_eq!(second.size, 8);
+        assert_ne!(
+            first.mtime, second.mtime,
+            "a size change must publish a fresh mtime"
+        );
+        assert_eq!(
+            attr_fingerprint(&persisted_attrs(&fs, file_id).await),
+            attr_fingerprint(&second)
+        );
+        assert_eq!(
+            directory_entry_attrs(&fs, 0, b"growing.txt").await.size,
+            8,
+            "readdir must not report a stale size"
+        );
+    }
+
+    /// Once the clock leaves the second the durable timestamps were taken in,
+    /// even a same-size overwrite has to refresh them.
+    #[tokio::test]
+    async fn an_overwrite_in_a_later_second_refreshes_timestamps() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let (file_id, _) = fs
+            .create(&test_creds(), 0, b"stale.img", &SetAttributes::default())
+            .await
+            .unwrap();
+        let auth: AuthContext = (&test_auth()).into();
+        fs.write(&auth, file_id, 0, &Bytes::from_static(b"abcd"))
+            .await
+            .unwrap();
+
+        let (now_sec, _) = get_current_time();
+        let backdated = Timestamp {
+            seconds: now_sec - 60,
+            nanoseconds: 0,
+        };
+        fs.setattr(
+            &test_creds(),
+            file_id,
+            &SetAttributes {
+                mtime: SetTime::SetToClientTime(backdated),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let attrs = fs
+            .write(&auth, file_id, 0, &Bytes::from_static(b"wxyz"))
+            .await
+            .unwrap();
+
+        assert!(
+            attrs.mtime.seconds >= now_sec,
+            "a write in a later second must refresh mtime: {:?}",
+            attrs.mtime
+        );
+        assert_eq!(
+            attr_fingerprint(&persisted_attrs(&fs, file_id).await),
+            attr_fingerprint(&attrs)
+        );
+        assert_eq!(
+            attr_fingerprint(&directory_entry_attrs(&fs, 0, b"stale.img").await),
+            attr_fingerprint(&attrs),
+            "the directory entry copy must be refreshed too"
+        );
+    }
+
+    /// SUID/SGID clearing is a mode change, so it always publishes even when
+    /// the size and timestamp second are unchanged.
+    #[tokio::test]
+    async fn an_in_place_overwrite_still_clears_suid_for_a_non_owner() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let (file_id, _) = fs
+            .create(&test_creds(), 0, b"suid.bin", &SetAttributes::default())
+            .await
+            .unwrap();
+        let owner: AuthContext = (&test_auth()).into();
+        fs.write(&owner, file_id, 0, &Bytes::from_static(b"abcd"))
+            .await
+            .unwrap();
+        fs.setattr(
+            &test_creds(),
+            file_id,
+            &SetAttributes {
+                mode: SetMode::Set(0o6777),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let other = AuthContext {
+            uid: 1001,
+            gid: 1001,
+            ..Default::default()
+        };
+        let attrs = fs
+            .write(&other, file_id, 0, &Bytes::from_static(b"wxyz"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            attrs.mode & 0o6000,
+            0,
+            "a non-owner write must clear SUID/SGID"
+        );
+        assert_eq!(
+            attr_fingerprint(&persisted_attrs(&fs, file_id).await),
+            attr_fingerprint(&attrs)
+        );
+        assert_eq!(
+            directory_entry_attrs(&fs, 0, b"suid.bin").await.mode & 0o6000,
+            0,
+            "the directory entry copy must lose SUID/SGID too"
+        );
     }
 
     /// Sequential in-place overwrite through `fs.write`, the NBD member-chunk
