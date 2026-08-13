@@ -3,8 +3,8 @@ use backon::{ExponentialBuilder, Retryable};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use dashmap::DashSet;
-use futures::StreamExt;
 use futures::stream::{self, BoxStream};
+use futures::{StreamExt, TryStreamExt};
 use object_store::path::{Path as ObjectPath, PathPart};
 use object_store::{
     Attributes, CopyOptions, Extensions, GetOptions, GetResult, GetResultPayload, ListResult,
@@ -435,6 +435,10 @@ impl Drop for StagingCleanup {
 
 const STORE_NAME: &str = "SFTP";
 const SFTP_NEGATIVE_CACHE_MAX_ENTRIES: usize = 16 * 1024;
+// Directory listings need one metadata round trip per child; fan them out so a
+// large directory does not cost thousands of serialized WAN round trips. The
+// pool's own read/metadata admission limit still gates real concurrency.
+const SFTP_LIST_METADATA_CONCURRENCY: usize = 8;
 
 #[derive(Clone)]
 pub struct SftpObjectStore {
@@ -617,6 +621,13 @@ impl RemoteSession for PooledRemoteSession {
     }
 }
 
+/// A directory entry that survived listing filters, resolved into the shape the
+/// callers accumulate.
+enum ListedChild {
+    Directory(ObjectPath),
+    Object(ObjectMeta),
+}
+
 impl SftpObjectStore {
     pub(crate) fn validate_prefix(prefix: &ObjectPath) -> object_store::Result<()> {
         if prefix.is_root() {
@@ -759,6 +770,53 @@ impl SftpObjectStore {
         Ok(object_meta(location.clone(), &object))
     }
 
+    async fn classify_entry(
+        &self,
+        directory: &ObjectPath,
+        entry: crate::sftp_transport::RemoteDirectoryEntry,
+    ) -> object_store::Result<Option<ListedChild>> {
+        let Some(filename) = entry.filename.to_str() else {
+            return Err(generic_error("SFTP listing returned a non-UTF-8 filename"));
+        };
+        if matches!(filename, "." | "..") || is_staging_name(FilePath::new(filename)) {
+            return Ok(None);
+        }
+        let part = PathPart::parse(filename)
+            .map_err(|error| generic_error(format!("invalid SFTP filename: {error}")))?;
+        let child = directory.clone().join(part);
+        match entry.kind {
+            crate::sftp_transport::RemoteEntryKind::Directory => {
+                Ok(Some(ListedChild::Directory(child)))
+            }
+            crate::sftp_transport::RemoteEntryKind::File => {
+                let object = self.metadata(&child).await?;
+                Ok(Some(ListedChild::Object(object)))
+            }
+            crate::sftp_transport::RemoteEntryKind::Symlink => Err(generic_error(format!(
+                "refusing to follow SFTP symlink {child}"
+            ))),
+            crate::sftp_transport::RemoteEntryKind::Other => Err(generic_error(format!(
+                "refusing non-regular SFTP entry {child}"
+            ))),
+        }
+    }
+
+    /// Resolve one directory snapshot into ordered children. Per-entry metadata
+    /// lookups run with bounded concurrency; `buffered` keeps the results in
+    /// listing order and surfaces the first error exactly as a serial `?` would.
+    async fn classify_entries(
+        &self,
+        directory: &ObjectPath,
+        entries: Vec<crate::sftp_transport::RemoteDirectoryEntry>,
+    ) -> object_store::Result<Vec<ListedChild>> {
+        let children: Vec<Option<ListedChild>> = stream::iter(entries)
+            .map(|entry| self.classify_entry(directory, entry))
+            .buffered(SFTP_LIST_METADATA_CONCURRENCY)
+            .try_collect()
+            .await?;
+        Ok(children.into_iter().flatten().collect())
+    }
+
     async fn collect_recursive(&self, prefix: ObjectPath) -> object_store::Result<Vec<ObjectMeta>> {
         self.validate_location(&prefix, true)?;
         let mut pending = vec![prefix];
@@ -776,31 +834,10 @@ impl SftpObjectStore {
                 }
                 Err(error) => return Err(error),
             };
-            for entry in entries {
-                let Some(filename) = entry.filename.to_str() else {
-                    return Err(generic_error("SFTP listing returned a non-UTF-8 filename"));
-                };
-                if matches!(filename, "." | "..") || is_staging_name(FilePath::new(filename)) {
-                    continue;
-                }
-                let part = PathPart::parse(filename)
-                    .map_err(|error| generic_error(format!("invalid SFTP filename: {error}")))?;
-                let child = directory.clone().join(part);
-                match entry.kind {
-                    crate::sftp_transport::RemoteEntryKind::Directory => pending.push(child),
-                    crate::sftp_transport::RemoteEntryKind::File => {
-                        objects.push(self.metadata(&child).await?)
-                    }
-                    crate::sftp_transport::RemoteEntryKind::Symlink => {
-                        return Err(generic_error(format!(
-                            "refusing to follow SFTP symlink {child}"
-                        )));
-                    }
-                    crate::sftp_transport::RemoteEntryKind::Other => {
-                        return Err(generic_error(format!(
-                            "refusing non-regular SFTP entry {child}"
-                        )));
-                    }
+            for child in self.classify_entries(&directory, entries).await? {
+                match child {
+                    ListedChild::Directory(path) => pending.push(path),
+                    ListedChild::Object(object) => objects.push(object),
                 }
             }
         }
@@ -996,33 +1033,12 @@ impl ObjectStore for SftpObjectStore {
         };
         let mut common_prefixes = BTreeSet::new();
         let mut objects = Vec::new();
-        for entry in entries {
-            let Some(filename) = entry.filename.to_str() else {
-                return Err(generic_error("SFTP listing returned a non-UTF-8 filename"));
-            };
-            if matches!(filename, "." | "..") || is_staging_name(FilePath::new(filename)) {
-                continue;
-            }
-            let part = PathPart::parse(filename)
-                .map_err(|error| generic_error(format!("invalid SFTP filename: {error}")))?;
-            let child = directory.clone().join(part);
-            match entry.kind {
-                crate::sftp_transport::RemoteEntryKind::Directory => {
-                    common_prefixes.insert(child);
+        for child in self.classify_entries(&directory, entries).await? {
+            match child {
+                ListedChild::Directory(path) => {
+                    common_prefixes.insert(path);
                 }
-                crate::sftp_transport::RemoteEntryKind::File => {
-                    objects.push(self.metadata(&child).await?);
-                }
-                crate::sftp_transport::RemoteEntryKind::Symlink => {
-                    return Err(generic_error(format!(
-                        "refusing to follow SFTP symlink {child}"
-                    )));
-                }
-                crate::sftp_transport::RemoteEntryKind::Other => {
-                    return Err(generic_error(format!(
-                        "refusing non-regular SFTP entry {child}"
-                    )));
-                }
+                ListedChild::Object(object) => objects.push(object),
             }
         }
         Ok(ListResult {
