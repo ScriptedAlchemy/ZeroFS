@@ -42,6 +42,25 @@ where
         })?
 }
 
+/// Owns the checkout -> bounded request -> lease finish choreography every
+/// pooled SFTP call repeats. Expands to a future yielding the request result
+/// with the lease already finished, so each call site only has to map the one
+/// resulting `TransportError` into its own error type.
+///
+/// This is a macro rather than a generic helper because the request borrows the
+/// lease mutably: a closure-based helper needs `for<'a> FnOnce(&'a mut _) ->
+/// BoxFuture<'a, _>`, which rustc cannot infer for these closures without an
+/// explicit return-type annotation plus a boxed future at every call site.
+macro_rules! with_lease {
+    ($pool:expr, $kind:expr, $operation:literal, |$lease:ident| $request:expr) => {
+        async {
+            let mut $lease = $pool.checkout($kind).await?;
+            let result = bounded_sftp_request($operation, $request).await;
+            finish_lease($lease, result).await
+        }
+    };
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ObjectHeader {
     pub generation: Uuid,
@@ -468,43 +487,39 @@ impl RemoteSession for PooledRemoteSession {
     }
 
     async fn read_exact(&self, path: &FilePath, offset: u64, len: usize) -> RemoteResult<Bytes> {
-        let mut lease = self
-            .pool
-            .checkout(crate::sftp_transport::OperationKind::Read)
-            .await
-            .map_err(remote_transport_error)?;
-        let operation =
-            bounded_sftp_request("SFTP range read", lease.read_exact(path, offset, len)).await;
-        finish_lease(lease, operation)
-            .await
-            .map_err(remote_transport_error)
+        with_lease!(
+            self.pool,
+            crate::sftp_transport::OperationKind::Read,
+            "SFTP range read",
+            |lease| lease.read_exact(path, offset, len)
+        )
+        .await
+        .map_err(remote_transport_error)
     }
 
     async fn write_file_durable(&self, path: &FilePath, chunks: Vec<Bytes>) -> RemoteResult<()> {
-        let mut lease = self
-            .pool
-            .checkout(crate::sftp_transport::OperationKind::Write)
-            .await
-            .map_err(remote_transport_error)?;
-        let operation = bounded_sftp_request("SFTP durable write", async {
-            if let Some(parent) = path.parent() {
-                self.pool.ensure_directory(&mut lease, parent).await?;
-            }
-            match lease.write_file_durable(path, chunks.clone()).await {
-                Err(crate::sftp_transport::TransportError::NotFound(_))
-                    if path.parent().is_some() =>
-                {
-                    let parent = path.parent().expect("parent checked above");
-                    self.pool.repair_directory(&mut lease, parent).await?;
-                    lease.write_file_durable(path, chunks).await
+        with_lease!(
+            self.pool,
+            crate::sftp_transport::OperationKind::Write,
+            "SFTP durable write",
+            |lease| async {
+                if let Some(parent) = path.parent() {
+                    self.pool.ensure_directory(&mut lease, parent).await?;
                 }
-                result => result,
+                match lease.write_file_durable(path, chunks.clone()).await {
+                    Err(crate::sftp_transport::TransportError::NotFound(_))
+                        if path.parent().is_some() =>
+                    {
+                        let parent = path.parent().expect("parent checked above");
+                        self.pool.repair_directory(&mut lease, parent).await?;
+                        lease.write_file_durable(path, chunks).await
+                    }
+                    result => result,
+                }
             }
-        })
-        .await;
-        finish_lease(lease, operation)
-            .await
-            .map_err(remote_transport_error)
+        )
+        .await
+        .map_err(remote_transport_error)
     }
 
     async fn write_file_at_durable(
@@ -513,19 +528,14 @@ impl RemoteSession for PooledRemoteSession {
         offset: u64,
         chunks: Vec<Bytes>,
     ) -> RemoteResult<()> {
-        let mut lease = self
-            .pool
-            .checkout(crate::sftp_transport::OperationKind::Write)
-            .await
-            .map_err(remote_transport_error)?;
-        let operation = bounded_sftp_request(
+        with_lease!(
+            self.pool,
+            crate::sftp_transport::OperationKind::Write,
             "SFTP durable ranged write",
-            lease.write_file_at_durable(path, offset, chunks),
+            |lease| lease.write_file_at_durable(path, offset, chunks)
         )
-        .await;
-        finish_lease(lease, operation)
-            .await
-            .map_err(remote_transport_error)
+        .await
+        .map_err(remote_transport_error)
     }
 
     async fn write_file_at(
@@ -534,56 +544,47 @@ impl RemoteSession for PooledRemoteSession {
         offset: u64,
         chunks: Vec<Bytes>,
     ) -> RemoteResult<()> {
-        let mut lease = self
-            .pool
-            .checkout(crate::sftp_transport::OperationKind::Write)
-            .await
-            .map_err(remote_transport_error)?;
-        let operation = bounded_sftp_request(
+        with_lease!(
+            self.pool,
+            crate::sftp_transport::OperationKind::Write,
             "SFTP ranged write",
-            lease.write_file_at(path, offset, chunks),
+            |lease| lease.write_file_at(path, offset, chunks)
         )
-        .await;
-        finish_lease(lease, operation)
-            .await
-            .map_err(remote_transport_error)
+        .await
+        .map_err(remote_transport_error)
     }
 
     async fn remove_file(&self, path: &FilePath) -> RemoteResult<()> {
-        let mut lease = self
-            .pool
-            .checkout(crate::sftp_transport::OperationKind::Write)
-            .await
-            .map_err(remote_transport_error)?;
-        let operation = bounded_sftp_request("SFTP remove", lease.remove_file(path)).await;
-        finish_lease(lease, operation)
-            .await
-            .map_err(remote_transport_error)
+        with_lease!(
+            self.pool,
+            crate::sftp_transport::OperationKind::Write,
+            "SFTP remove",
+            |lease| lease.remove_file(path)
+        )
+        .await
+        .map_err(remote_transport_error)
     }
 
     async fn hard_link(&self, from: &FilePath, to: &FilePath) -> RemoteResult<()> {
-        let mut lease = self
-            .pool
-            .checkout(crate::sftp_transport::OperationKind::Write)
-            .await
-            .map_err(remote_transport_error)?;
-        let operation = bounded_sftp_request("SFTP hard link", lease.hard_link(from, to)).await;
-        finish_lease(lease, operation)
-            .await
-            .map_err(remote_transport_error)
+        with_lease!(
+            self.pool,
+            crate::sftp_transport::OperationKind::Write,
+            "SFTP hard link",
+            |lease| lease.hard_link(from, to)
+        )
+        .await
+        .map_err(remote_transport_error)
     }
 
     async fn posix_rename(&self, from: &FilePath, to: &FilePath) -> RemoteResult<()> {
-        let mut lease = self
-            .pool
-            .checkout(crate::sftp_transport::OperationKind::Write)
-            .await
-            .map_err(remote_transport_error)?;
-        let operation =
-            bounded_sftp_request("SFTP POSIX rename", lease.posix_rename(from, to)).await;
-        finish_lease(lease, operation)
-            .await
-            .map_err(remote_transport_error)
+        with_lease!(
+            self.pool,
+            crate::sftp_transport::OperationKind::Write,
+            "SFTP POSIX rename",
+            |lease| lease.posix_rename(from, to)
+        )
+        .await
+        .map_err(remote_transport_error)
     }
 
     fn schedule_cleanup(&self, path: PathBuf) {
@@ -715,23 +716,18 @@ impl SftpObjectStore {
                 source: "SFTP object is known absent for this single-owner process".into(),
             });
         }
-        let mut lease = self
-            .pool
-            .checkout(if options.head {
+        let result = with_lease!(
+            self.pool,
+            if options.head {
                 crate::sftp_transport::OperationKind::Metadata
             } else {
                 crate::sftp_transport::OperationKind::Read
-            })
-            .await
-            .map_err(transport_error)?;
-        let operation = bounded_sftp_request(
+            },
             "SFTP object read",
-            lease.read_object(&remote, options.range.clone(), options.head),
+            |lease| lease.read_object(&remote, options.range.clone(), options.head)
         )
-        .await;
-        let result = finish_lease(lease, operation)
-            .await
-            .map_err(transport_error);
+        .await
+        .map_err(transport_error);
         match &result {
             Ok(_) => {
                 self.forget_missing(location);
@@ -749,16 +745,14 @@ impl SftpObjectStore {
         location: &ObjectPath,
     ) -> object_store::Result<Vec<crate::sftp_transport::RemoteDirectoryEntry>> {
         let remote = self.remote_path(location, true)?;
-        let mut lease = self
-            .pool
-            .checkout(crate::sftp_transport::OperationKind::Metadata)
-            .await
-            .map_err(transport_error)?;
-        let operation =
-            bounded_sftp_request("SFTP directory listing", lease.list_directory(&remote)).await;
-        finish_lease(lease, operation)
-            .await
-            .map_err(transport_error)
+        with_lease!(
+            self.pool,
+            crate::sftp_transport::OperationKind::Metadata,
+            "SFTP directory listing",
+            |lease| lease.list_directory(&remote)
+        )
+        .await
+        .map_err(transport_error)
     }
 
     async fn metadata(&self, location: &ObjectPath) -> object_store::Result<ObjectMeta> {
@@ -846,15 +840,14 @@ impl SftpObjectStore {
 
     async fn remove_remote(&self, location: &ObjectPath) -> object_store::Result<()> {
         let remote = self.remote_path(location, false)?;
-        let mut lease = self
-            .pool
-            .checkout(crate::sftp_transport::OperationKind::Write)
-            .await
-            .map_err(transport_error)?;
-        let operation = bounded_sftp_request("SFTP remove", lease.remove_file(&remote)).await;
-        let result = finish_lease(lease, operation)
-            .await
-            .map_err(transport_error);
+        let result = with_lease!(
+            self.pool,
+            crate::sftp_transport::OperationKind::Write,
+            "SFTP remove",
+            |lease| lease.remove_file(&remote)
+        )
+        .await
+        .map_err(transport_error);
         if result.is_ok() || matches!(&result, Err(object_store::Error::NotFound { .. })) {
             self.remember_missing(location);
         }
