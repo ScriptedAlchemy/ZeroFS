@@ -1111,33 +1111,16 @@ mod tests {
     };
     use crate::fault_store::FaultStore;
     use crate::writeback::journal::Journal;
-    use crate::writeback::model::{
-        FenceClass, JournalIdentity, LocalEtag, MutationKind, MutationMode, MutationRecord,
-    };
+    use crate::writeback::model::{FenceClass, JournalIdentity, MutationMode, MutationRecord};
     use bytes::Bytes;
     use futures::future;
     use object_store::memory::InMemory;
     use object_store::{ObjectStore, ObjectStoreExt, PutPayload, PutResult, path::Path};
-    use sha2::{Digest, Sha256};
     use std::sync::Arc;
     use std::time::Duration;
-    use uuid::Uuid;
 
     fn record(sequence: u64, path: &str, fence: FenceClass) -> MutationRecord {
-        MutationRecord {
-            format_version: 1,
-            sequence,
-            operation_id: Uuid::from_u128(sequence as u128),
-            path: path.to_owned(),
-            kind: MutationKind::Delete,
-            local_etag: LocalEtag::new(Uuid::nil(), sequence),
-            accepted_at_unix_ms: sequence,
-            remote_predecessor_etag: None,
-            remote_result_etag: None,
-            fence,
-            retry_count: 0,
-            last_error: None,
-        }
+        crate::writeback::test_util::delete_record(sequence, path, fence, 0, 0)
     }
 
     #[tokio::test]
@@ -1313,26 +1296,15 @@ mod tests {
     }
 
     fn put_record(sequence: u64, path: &str, payload: &[u8]) -> MutationRecord {
-        MutationRecord {
-            format_version: 1,
+        crate::writeback::test_util::put_record(
             sequence,
-            operation_id: Uuid::from_u128(0x1000 + sequence as u128),
-            path: path.to_owned(),
-            kind: MutationKind::Put {
-                mode: MutationMode::Create,
-                expected_visible_version: None,
-                payload_len: payload.len() as u64,
-                payload_sha256: Sha256::digest(payload).into(),
-                blob_path: String::new(),
-            },
-            local_etag: LocalEtag::new(Uuid::nil(), sequence),
-            accepted_at_unix_ms: 1_786_435_200_000 + sequence,
-            remote_predecessor_etag: None,
-            remote_result_etag: None,
-            fence: FenceClass::ImmutableCreate,
-            retry_count: 0,
-            last_error: None,
-        }
+            path,
+            payload,
+            MutationMode::Create,
+            FenceClass::ImmutableCreate,
+            0x1000,
+            1_786_435_200_000,
+        )
     }
 
     fn journal_with_local_records(root: &std::path::Path, count: u64) -> Journal {

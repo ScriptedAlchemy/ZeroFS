@@ -649,9 +649,7 @@ fn generic_error(message: String) -> object_store::Error {
 mod tests {
     use super::{OverlayIndex, VisibleVersion};
     use crate::writeback::journal::Journal;
-    use crate::writeback::model::{
-        FenceClass, JournalIdentity, MutationKind, MutationMode, MutationRecord,
-    };
+    use crate::writeback::model::{FenceClass, JournalIdentity, MutationMode, MutationRecord};
     use async_trait::async_trait;
     use bytes::Bytes;
     use futures::{StreamExt, stream::BoxStream};
@@ -778,9 +776,13 @@ mod tests {
     }
 
     fn delete_record(sequence: u64, path: &str) -> MutationRecord {
-        let mut record = put_record(sequence, path, b"");
-        record.kind = MutationKind::Delete;
-        record
+        crate::writeback::test_util::delete_record(
+            sequence,
+            path,
+            FenceClass::Fence,
+            0x4000,
+            1_786_435_200_000,
+        )
     }
 
     async fn remote_with(entries: &[(&str, &'static [u8])]) -> Arc<dyn ObjectStore> {
