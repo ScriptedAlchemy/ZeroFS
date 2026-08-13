@@ -179,7 +179,9 @@ const MAX_LOCAL_PUBLISH_BATCH_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
 // device short of queue depth: measured on the target SSD with real (not
 // all-zero) payloads, one writer sustains ~745 MiB/s of durable writes where
 // two reach ~840 and four ~910. Two is where most of that gain lands, and it
-// caps the payload bytes held across publication at two containers.
+// caps the payload bytes held across publication at two containers. Raising it
+// to four is worth roughly another 8% at the cost of holding four containers'
+// payloads (256 MiB at the current batch cap) inside the admission budget.
 const MAX_CONCURRENT_CONTAINER_WRITES: usize = 2;
 // Total batches between assembly and commit. Without this the drain would
 // assemble as fast as records arrive and publish them one or two at a time;
@@ -2197,6 +2199,14 @@ mod tests {
     /// GiB/s, halved by hashing each payload for both the record and the
     /// verified payload) and capped every result near 500 MiB/s no matter how
     /// fast the drain got.
+    ///
+    /// When comparing these numbers against a device baseline, do not use
+    /// `dd if=/dev/zero`. The SSD this was tuned on special-cases all-zero
+    /// blocks: the same write loop sustains ~1940 MiB/s of zeros and ~745
+    /// MiB/s of either 0x5a or pseudorandom bytes, so a zero-filled baseline
+    /// overstates the device by ~2.5x and makes a drain running at the device
+    /// ceiling look like it is at 30% of it. The payload here is deliberately
+    /// non-zero for the same reason.
     #[tokio::test]
     #[ignore = "throughput benchmark; needs a real disk and --release"]
     async fn drain_throughput_of_the_post_ack_durability_tail() {
