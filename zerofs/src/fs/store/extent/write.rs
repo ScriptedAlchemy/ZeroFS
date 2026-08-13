@@ -83,6 +83,17 @@ pub(super) struct OpenLane {
 /// that gate. Concurrent reservations on a lane fill in any order: each one
 /// only ever writes its own disjoint byte range.
 ///
+/// Claiming is not free: it zero-extends the buffer by the batch's sealed
+/// size under the gate (~40% of the AEAD's cost), which is what makes an
+/// abandoned reservation read as zeros instead of foreign heap bytes and
+/// lets fills land out of order. The gate hold shrinks about 2x, not to
+/// nothing; a rotation-triggering claim additionally keeps the gate through
+/// its own AEAD, fill, and rotation (1 in N batches, unmeasured by the
+/// gate_hold phase timer). A delete-only batch claims nothing and therefore
+/// never triggers rotation; an over-threshold buffer left behind by an
+/// abandoned rotation is picked up by the next frame-bearing claim or by
+/// the flush barrier.
+///
 /// The claim-to-fill window in [`ExtentStore::stage_edits`] must stay free of
 /// `.await`: with no suspension point in it, a dropped (cancelled) staging
 /// future cannot strand a reservation and wedge every later rotation on the
