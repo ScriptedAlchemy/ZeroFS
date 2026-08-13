@@ -126,29 +126,8 @@ mod tests {
     use super::*;
     use crate::fs::ZeroFS;
     use crate::fs::inode::Inode;
-    use crate::fs::permissions::Credentials;
-    use crate::fs::types::{AuthContext, SetAttributes};
-
-    fn test_creds() -> Credentials {
-        Credentials {
-            uid: 1000,
-            gid: 1000,
-            gid_known: true,
-            groups: [1000; 16],
-            groups_count: 1,
-            groups_complete: true,
-        }
-    }
-
-    fn test_auth() -> AuthContext {
-        AuthContext {
-            uid: 1000,
-            gid: 1000,
-            gid_known: true,
-            gids: vec![1000],
-            groups_complete: true,
-        }
-    }
+    use crate::fs::test_util::{test_auth, test_creds};
+    use crate::fs::types::SetAttributes;
 
     /// Read every stats shard directly from the db, decode it, and sum.
     async fn persisted_shard_totals(fs: &ZeroFS) -> (u64, u64) {

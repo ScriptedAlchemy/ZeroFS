@@ -890,8 +890,8 @@ mod tests {
     use super::*;
     use crate::fs::ZeroFS;
     use crate::fs::inode::{Inode, test_file_inode};
-    use crate::fs::permissions::Credentials;
-    use crate::fs::types::{AuthContext, SetAttributes, SetMode};
+    use crate::fs::test_util::{test_auth, test_creds};
+    use crate::fs::types::{SetAttributes, SetMode};
     use bytes::Bytes;
 
     /// `DST_PANIC_ON_WRITE_ERROR` is process-global, so fatal-path unit tests
@@ -919,27 +919,6 @@ mod tests {
 
     fn codec() -> KeyCodec {
         KeyCodec::new()
-    }
-
-    fn test_creds() -> Credentials {
-        Credentials {
-            uid: 1000,
-            gid: 1000,
-            gid_known: true,
-            groups: [1000; 16],
-            groups_count: 1,
-            groups_complete: true,
-        }
-    }
-
-    fn test_auth() -> AuthContext {
-        AuthContext {
-            uid: 1000,
-            gid: 1000,
-            gid_known: true,
-            gids: vec![1000],
-            groups_complete: true,
-        }
     }
 
     // One aligned 1 MiB NBD stripe write: four pre-sized member files receive
