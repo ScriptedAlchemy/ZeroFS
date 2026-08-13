@@ -152,6 +152,15 @@ impl MutationRecord {
     /// with both slice numbers at their `u64::MAX` decimal width. It bounds
     /// the pre-container whole-file form too, so one constant still covers
     /// every reservation.
+    ///
+    /// This is 90 bytes against the 47 the whole-file form needed, and every
+    /// pending mutation reserves against it whether or not its own reference
+    /// is that long. The 43-byte difference is noise beside any real payload,
+    /// but a metadata-heavy workload reserves per record rather than per byte,
+    /// so its effective dirty-SSD capacity drops by roughly that much per
+    /// pending record. Sizing the constant to the actual reference instead
+    /// would make the reservation depend on which batch a record landed in,
+    /// which is not known at admission.
     const MAX_BLOB_PATH: &str = "blobs/ff/ffffffffffffffff-ffffffffffffffff.blobs#18446744073709551615+18446744073709551615";
     const MAX_LOCAL_ETAG: &str = "wb:ffffffff-ffff-ffff-ffff-ffffffffffff:18446744073709551615";
 

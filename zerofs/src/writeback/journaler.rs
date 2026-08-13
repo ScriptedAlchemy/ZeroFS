@@ -707,6 +707,22 @@ fn assemble_batch(
     }))
 }
 
+/// The terminal error for a drain that can no longer make progress.
+///
+/// Reaching this means the backlog holds a sequence the drain will never
+/// admit, which submission ordering is supposed to make impossible -- so the
+/// message names the sequence it is stuck on and everything left stranded
+/// behind it, because that pair is the whole diagnosis.
+fn stalled_drain_error(
+    next_admitted: Sequence,
+    prepared: &BTreeMap<Sequence, PreparedEntry>,
+) -> String {
+    let stranded = prepared.keys().copied().collect::<Vec<_>>();
+    format!(
+        "local journal drain stalled at sequence {next_admitted} with stranded preparations {stranded:?}"
+    )
+}
+
 /// Await one pipeline half, clearing its slot only once it has resolved.
 ///
 /// Awaiting `&mut JoinHandle` is cancel safe, so losing a `select!` race here
@@ -1022,10 +1038,7 @@ async fn run_journaler(
             // on a fully disabled set of branches.
             else => {
                 if terminal.is_none() {
-                    let stranded = prepared.keys().copied().collect::<Vec<_>>();
-                    terminal = Some(format!(
-                        "local journal drain stalled at sequence {next_admitted} with stranded preparations {stranded:?}"
-                    ));
+                    terminal = Some(stalled_drain_error(next_admitted, &prepared));
                 }
             }
         }
@@ -1088,7 +1101,7 @@ mod tests {
     use object_store::ObjectStoreExt;
     use object_store::memory::InMemory;
     use object_store::path::Path;
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex, mpsc};
     use std::time::Duration;
@@ -2782,6 +2795,143 @@ mod tests {
         assert_eq!(journal.read_blob(1).unwrap(), b"payload");
         assert_eq!(journal.read_blob(2).unwrap(), b"again");
         journaler.shutdown().await.unwrap();
+    }
+
+    /// The drain's last-resort guard. Its branch is unreachable by
+    /// construction -- submission is contiguous and every received sequence
+    /// ends up in `prepared`, so the backlog can never strand one below
+    /// `next_admitted` -- which is exactly why it exists: `select!` panics
+    /// when every branch is disabled, and a panicked journaler task loses the
+    /// terminal error that poisons admission. Cover the diagnosis it reports.
+    #[test]
+    fn a_stalled_drain_names_the_sequence_and_what_is_stranded_behind_it() {
+        let mut prepared: BTreeMap<Sequence, super::PreparedEntry> = BTreeMap::new();
+        for sequence in [7_u64, 9] {
+            prepared.insert(
+                sequence,
+                (
+                    Ok(crate::writeback::journal::PreparedMutation::metadata(
+                        crate::writeback::test_util::delete_record(
+                            sequence,
+                            "obsolete",
+                            FenceClass::Fence,
+                            0x2000,
+                            0,
+                        ),
+                    )),
+                    None,
+                    None,
+                ),
+            );
+        }
+
+        let error = super::stalled_drain_error(6, &prepared);
+
+        assert_eq!(
+            error,
+            "local journal drain stalled at sequence 6 with stranded preparations [7, 9]"
+        );
+        assert_eq!(
+            super::stalled_drain_error(6, &BTreeMap::new()),
+            "local journal drain stalled at sequence 6 with stranded preparations []"
+        );
+    }
+
+    /// `assemble_batch` will happily end a batch on a payload-free record, so
+    /// the production drain really does produce Put-then-Delete batches. Take
+    /// one all the way through the real journaler and the real journal, drain
+    /// it fully, and require that the container is reclaimed and the journal
+    /// reopens -- the shape that used to leak a container permanently and then
+    /// refuse to open at all.
+    #[tokio::test]
+    async fn a_payload_free_tail_batch_drains_and_reopens_through_the_real_journaler() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("writeback");
+        let identity = JournalIdentity {
+            format_version: 1,
+            bucket_id: "bucket-pipeline".to_owned(),
+            backend_endpoint: "sftp://example.com:23".to_owned(),
+            database_prefix: "zerofs/pilot".to_owned(),
+            backend_kind: "sftp".to_owned(),
+            encryption_key_identity_sha256: [0x51; 32],
+        };
+        let journal = Arc::new(Journal::open(&root, identity.clone()).unwrap());
+        let admission = Admission::new(64);
+        let journaler = LocalJournaler::start(journal.clone(), admission.clone(), 8).unwrap();
+
+        let disk = DiskAdmission::new(1_000_000, 95, 85, 1).unwrap();
+        let ram = admission.reserve(7).await.unwrap().accept();
+        journaler
+            .submit_put(
+                put_record(1, b"payload"),
+                Bytes::from_static(b"payload"),
+                ram,
+            )
+            .await
+            .unwrap();
+        let barrier = journaler
+            .submit_metadata_with_disk(
+                crate::writeback::test_util::delete_record(
+                    2,
+                    "obsolete",
+                    FenceClass::Fence,
+                    0x2000,
+                    0,
+                ),
+                disk.reserve(10, 1_000_000).await.unwrap(),
+            )
+            .await
+            .unwrap();
+        barrier.wait_local(2).await.unwrap();
+
+        // Whatever batching the drain chose, every container it published must
+        // be named by a record that references it.
+        let snapshot = journal.snapshot().unwrap();
+        for record in &snapshot.records {
+            let Some(reference) = record.blob_path() else {
+                continue;
+            };
+            let relative = reference.split('#').next().unwrap();
+            let last = relative
+                .rsplit('/')
+                .next()
+                .and_then(|name| name.strip_suffix(".blobs"))
+                .and_then(|stem| stem.split_once('-'))
+                .map(|(_, last)| u64::from_str_radix(last, 16).unwrap())
+                .expect("a container names its sequence range");
+            assert!(
+                snapshot
+                    .records
+                    .iter()
+                    .any(|other| other.sequence == last && other.blob_path().is_some()),
+                "container {relative} is named by a record that does not reference it"
+            );
+        }
+
+        journaler.shutdown().await.unwrap();
+        for sequence in 1..=2 {
+            journal
+                .mark_remote(sequence, Some(format!("etag-{sequence}")))
+                .unwrap();
+            journal.remove_remote_prefix(sequence).unwrap();
+        }
+        let blobs = root.join("blobs");
+        let mut leaked = Vec::new();
+        for shard in std::fs::read_dir(&blobs).unwrap() {
+            for blob in std::fs::read_dir(shard.unwrap().path()).unwrap() {
+                leaked.push(blob.unwrap().path());
+            }
+        }
+        assert!(
+            leaked.is_empty(),
+            "containers leaked after a full drain: {leaked:?}"
+        );
+        drop(journaler);
+        drop(journal);
+
+        let recovered =
+            Journal::open(&root, identity).expect("a fully drained journal must reopen");
+        assert_eq!(recovered.progress().unwrap().remote_seq, 2);
     }
 
     /// Two containers must be able to write at once. A single writer leaves
