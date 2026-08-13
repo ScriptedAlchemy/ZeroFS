@@ -96,7 +96,7 @@ trait LocalJournalSink: Send + Sync + 'static {
         match staged {
             StagedBatch::Unstaged(prepared) => {
                 for mutation in prepared {
-                    self.discard(mutation)?;
+                    self.discard(mutation);
                 }
                 Ok(())
             }
@@ -106,7 +106,14 @@ trait LocalJournalSink: Send + Sync + 'static {
         }
     }
 
-    fn discard(&self, prepared: PreparedMutation) -> AnyResult<()>;
+    /// Drop a prepared mutation that will never publish.
+    ///
+    /// Preparation writes nothing, so this cannot fail: it only releases the
+    /// payload bytes the mutation was holding. It stays on the trait so test
+    /// sinks can observe which sequences the drain abandoned.
+    fn discard(&self, prepared: PreparedMutation) {
+        drop(prepared);
+    }
 }
 
 impl LocalJournalSink for Journal {
@@ -143,10 +150,6 @@ impl LocalJournalSink for Journal {
 
     fn discard_staged(&self, staged: StagedBatch) -> AnyResult<()> {
         Journal::discard_staged(self, staged)
-    }
-
-    fn discard(&self, prepared: PreparedMutation) -> AnyResult<()> {
-        self.discard_prepared(prepared)
     }
 }
 
@@ -1054,12 +1057,12 @@ async fn run_journaler(
         progress.send_modify(|state| state.terminal_error = Some(error.clone()));
         while let Some(result) = preparations.next().await {
             if let Ok((_, Ok(mutation), _, _)) = result {
-                let _ = sink.discard(mutation);
+                sink.discard(mutation);
             }
         }
         for (_, (result, _, _)) in prepared {
             if let Ok(mutation) = result {
-                let _ = sink.discard(mutation);
+                sink.discard(mutation);
             }
         }
     } else {
@@ -1259,10 +1262,6 @@ mod tests {
         fn discard_staged(&self, staged: StagedBatch) -> Result<()> {
             self.journal.discard_staged(staged)
         }
-
-        fn discard(&self, prepared: crate::writeback::journal::PreparedMutation) -> Result<()> {
-            self.journal.discard_prepared(prepared)
-        }
     }
 
     fn pipeline_journal(temp: &tempfile::TempDir) -> Arc<Journal> {
@@ -1377,10 +1376,6 @@ mod tests {
             self.committed.lock().unwrap().push(record.sequence);
             Ok(record)
         }
-
-        fn discard(&self, _prepared: crate::writeback::journal::PreparedMutation) -> Result<()> {
-            Ok(())
-        }
     }
 
     impl LocalJournalSink for ControlledPreparationSink {
@@ -1435,9 +1430,8 @@ mod tests {
                 .collect())
         }
 
-        fn discard(&self, prepared: crate::writeback::journal::PreparedMutation) -> Result<()> {
+        fn discard(&self, prepared: crate::writeback::journal::PreparedMutation) {
             self.discarded.lock().unwrap().push(prepared.sequence());
-            Ok(())
         }
     }
 
@@ -1470,10 +1464,6 @@ mod tests {
             self.publish_entered.send(sequence).unwrap();
             self.publish_release.lock().unwrap().recv().unwrap();
             Ok(put_record(sequence, b"x"))
-        }
-
-        fn discard(&self, _prepared: crate::writeback::journal::PreparedMutation) -> Result<()> {
-            Ok(())
         }
     }
 
@@ -1523,10 +1513,6 @@ mod tests {
                 .into_iter()
                 .map(|sequence| put_record(sequence, b"x"))
                 .collect())
-        }
-
-        fn discard(&self, _prepared: crate::writeback::journal::PreparedMutation) -> Result<()> {
-            Ok(())
         }
     }
 
@@ -1579,10 +1565,6 @@ mod tests {
                 .map(|sequence| put_record(sequence, b"x"))
                 .collect())
         }
-
-        fn discard(&self, _prepared: crate::writeback::journal::PreparedMutation) -> Result<()> {
-            Ok(())
-        }
     }
 
     impl LocalJournalSink for HeadBlockingJournalSink {
@@ -1621,10 +1603,6 @@ mod tests {
             prepared: Vec<crate::writeback::journal::PreparedMutation>,
         ) -> Result<Vec<MutationRecord>> {
             self.journal.publish_batch(prepared)
-        }
-
-        fn discard(&self, prepared: crate::writeback::journal::PreparedMutation) -> Result<()> {
-            self.journal.discard_prepared(prepared)
         }
     }
 
