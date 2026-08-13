@@ -13,6 +13,8 @@
 
 mod compact;
 mod inflight;
+#[cfg(test)]
+mod perf_harness;
 mod read;
 mod reclaim;
 mod select;
