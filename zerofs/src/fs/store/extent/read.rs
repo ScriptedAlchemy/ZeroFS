@@ -10,6 +10,7 @@ use crate::failpoints::{self as fp, fail_point};
 use crate::fs::inode::InodeId;
 use crate::fs::{EXTENT_SIZE, FsError};
 use crate::segment::{FrameLoc, Segid};
+use crate::segment_store::SegmentStoreError;
 use bytes::{Bytes, BytesMut};
 use futures::stream::StreamExt;
 use std::collections::HashMap;
@@ -100,24 +101,8 @@ impl ExtentStore {
         if let Some(frame) = self.decoded_get(id, extent_idx, loc) {
             return Ok(Some(frame));
         }
-        if let Some(mut frames) = self.read_frames_in_ram(
-            loc.segid,
-            loc.byte_offset,
-            loc.byte_len,
-            loc.frame_index,
-            &[(id, extent_idx)],
-        )? {
-            let frame = frames.pop().expect("one frame");
-            Self::validate_extent_frame(id, extent_idx, &frame)?;
-            self.decoded_insert(id, extent_idx, loc, frame.clone());
-            return Ok(Some(frame));
-        }
-        match self.segments.read_extent(loc, id, extent_idx).await {
-            Ok(b) => {
-                Self::validate_extent_frame(id, extent_idx, &b)?;
-                self.decoded_insert(id, extent_idx, loc, b.clone());
-                Ok(Some(b))
-            }
+        match self.fetch_frame(id, extent_idx, loc).await? {
+            Ok(b) => Ok(Some(b)),
             Err(first_err) => {
                 // GC compaction repoints an extent to a freshly-sealed segment and
                 // then deletes the drained source; a read that resolved the old
@@ -132,24 +117,8 @@ impl ExtentStore {
                     .map_err(|_| FsError::IoError)?;
                 match Self::decode_reresolved_extent(id, extent_idx, reresolved.as_ref())? {
                     Some(new_loc) if new_loc.segid != loc.segid => {
-                        if let Some(mut frames) = self.read_frames_in_ram(
-                            new_loc.segid,
-                            new_loc.byte_offset,
-                            new_loc.byte_len,
-                            new_loc.frame_index,
-                            &[(id, extent_idx)],
-                        )? {
-                            let frame = frames.pop().expect("one frame");
-                            Self::validate_extent_frame(id, extent_idx, &frame)?;
-                            self.decoded_insert(id, extent_idx, new_loc, frame.clone());
-                            return Ok(Some(frame));
-                        }
-                        match self.segments.read_extent(new_loc, id, extent_idx).await {
-                            Ok(b) => {
-                                Self::validate_extent_frame(id, extent_idx, &b)?;
-                                self.decoded_insert(id, extent_idx, new_loc, b.clone());
-                                Ok(Some(b))
-                            }
+                        match self.fetch_frame(id, extent_idx, new_loc).await? {
+                            Ok(b) => Ok(Some(b)),
                             Err(e) => {
                                 error!(
                                     "Failed to read frame after repoint retry \
@@ -170,6 +139,42 @@ impl ExtentStore {
                     }
                 }
             }
+        }
+    }
+
+    /// Fetch, validate, and decoded-cache the single frame at `loc` for
+    /// `(id, extent)`. Reads the in-RAM open/sealing buffers first
+    /// (read-your-writes) and falls back to the segment object. The object-read
+    /// failure is handed back as `Ok(Err(..))` rather than logged here, because
+    /// `get` treats it differently on the original location (retry the
+    /// GC-repointed pointer) and on the relocated one (terminal EIO); an
+    /// invalid frame or a corrupt `FrameLoc` is still the immediate `Err(FsError)`
+    /// it has always been.
+    async fn fetch_frame(
+        &self,
+        id: InodeId,
+        extent: u64,
+        loc: FrameLoc,
+    ) -> Result<Result<Bytes, SegmentStoreError>, FsError> {
+        if let Some(mut frames) = self.read_frames_in_ram(
+            loc.segid,
+            loc.byte_offset,
+            loc.byte_len,
+            loc.frame_index,
+            &[(id, extent)],
+        )? {
+            let frame = frames.pop().expect("one frame");
+            Self::validate_extent_frame(id, extent, &frame)?;
+            self.decoded_insert(id, extent, loc, frame.clone());
+            return Ok(Ok(frame));
+        }
+        match self.segments.read_extent(loc, id, extent).await {
+            Ok(b) => {
+                Self::validate_extent_frame(id, extent, &b)?;
+                self.decoded_insert(id, extent, loc, b.clone());
+                Ok(Ok(b))
+            }
+            Err(e) => Ok(Err(e)),
         }
     }
 
