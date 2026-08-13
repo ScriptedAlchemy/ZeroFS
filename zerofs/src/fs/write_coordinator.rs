@@ -3,6 +3,37 @@
 //! The worker merges queued transactions, inode allocation state, usage
 //! counters, segment counters, replication records, and dedup results into one
 //! ordered commit.
+//!
+//! # Why the drain is opportunistic and never waits
+//!
+//! The worker takes one blocking `recv()` and then drains with `try_recv()`
+//! only, so a batch closes the instant the queue is momentarily empty. A wave
+//! of concurrent writers therefore often fragments into singleton applies. That
+//! fragmentation is real but is a symptom, not the cost centre -- measured by
+//! the `bench_lockstep_*` benches in this module against the in-memory backend:
+//!
+//! * Batching does amortize a genuine fixed cost. A one-commit apply costs
+//!   ~18 us (~24 us once it must read a segment counter); a four-commit apply
+//!   costs ~22 us (~50 us with counters), i.e. 3.2x (2.0x) cheaper per commit.
+//! * But in the real `fs::write` path a four-member lockstep wave arrives
+//!   ~155 us apart while an apply takes ~84 us, so the worker drains, applies,
+//!   and goes idle before the next member arrives. It is busy only ~54% of the
+//!   wave; it is not the saturated resource. Aggregate throughput is flat in
+//!   writer count (1 member 1375 MB/s vs 4 members 1695 MB/s), so the writers
+//!   are already queueing behind a serial resource *upstream* of this worker,
+//!   which is exactly what spaces their arrivals out of phase with the applies.
+//! * Closing a 155 us arrival gap requires waiting ~70 us after each apply --
+//!   a timer, which would add that latency to every isolated writer. A
+//!   cooperative `yield_now()` before the drain was measured and does nothing:
+//!   a scheduler turn is two orders of magnitude shorter than the gap, and the
+//!   wave still fragmented into 512 singleton applies out of 512 commits.
+//! * In production the argument is decisive: a 1 MiB NBD wave at the observed
+//!   17.5 MiB/s takes ~57 ms, of which four applies are ~0.3 ms. The commit
+//!   worker is ~99% idle there, so perfect coalescing could return under 1%.
+//!
+//! So the drain stays opportunistic. The coalescing that *is* guaranteed --
+//! everything queued during an in-flight apply lands in one following batch --
+//! is pinned by `commits_queued_during_an_apply_drain_into_one_batch`.
 
 use crate::db::{Db, Transaction};
 use crate::fs::errors::FsError;
@@ -47,6 +78,13 @@ pub struct WriteCoordinator {
     #[cfg(test)]
     #[allow(dead_code)] // Consumed by lib tests only.
     batch_sizes: Arc<std::sync::Mutex<Vec<usize>>>,
+    /// Worker time owned by applies, and the `stage_seg_deltas` share of it.
+    #[cfg(test)]
+    #[allow(dead_code)] // Consumed by lib benches only.
+    apply_nanos: Arc<std::sync::atomic::AtomicU64>,
+    #[cfg(test)]
+    #[allow(dead_code)] // Consumed by lib benches only.
+    stage_nanos: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Commit worker dependencies.
@@ -70,6 +108,10 @@ struct WorkerContext {
     apply_probe: Arc<std::sync::Mutex<Option<oneshot::Sender<()>>>>,
     #[cfg(test)]
     batch_sizes: Arc<std::sync::Mutex<Vec<usize>>>,
+    #[cfg(test)]
+    apply_nanos: Arc<std::sync::atomic::AtomicU64>,
+    #[cfg(test)]
+    stage_nanos: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl WriteCoordinator {
@@ -95,6 +137,10 @@ impl WriteCoordinator {
         let apply_probe = Arc::new(std::sync::Mutex::new(None));
         #[cfg(test)]
         let batch_sizes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        #[cfg(test)]
+        let apply_nanos = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        #[cfg(test)]
+        let stage_nanos = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let ctx = WorkerContext {
             db,
             inode_store,
@@ -111,6 +157,10 @@ impl WriteCoordinator {
             apply_probe: Arc::clone(&apply_probe),
             #[cfg(test)]
             batch_sizes: Arc::clone(&batch_sizes),
+            #[cfg(test)]
+            apply_nanos: Arc::clone(&apply_nanos),
+            #[cfg(test)]
+            stage_nanos: Arc::clone(&stage_nanos),
         };
         spawn_named("commit-worker", worker_loop(ctx, receiver, initial_counter));
         Self {
@@ -119,6 +169,10 @@ impl WriteCoordinator {
             apply_probe,
             #[cfg(test)]
             batch_sizes,
+            #[cfg(test)]
+            apply_nanos,
+            #[cfg(test)]
+            stage_nanos,
         }
     }
 
@@ -165,6 +219,22 @@ impl WriteCoordinator {
             .lock()
             .expect("write coordinator batch-size probe poisoned")
             .clone()
+    }
+
+    /// Total worker time owned by applies: from the end of a drain through the
+    /// batch's reply sends. Comparing this with a benchmark's wall clock says
+    /// whether the single commit worker is the bottleneck or is mostly idle.
+    #[cfg(test)]
+    #[allow(dead_code)] // Consumed by lib benches only.
+    pub(crate) fn apply_nanos(&self) -> u64 {
+        self.apply_nanos.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The [`stage_seg_deltas`] share of [`Self::apply_nanos`].
+    #[cfg(test)]
+    #[allow(dead_code)] // Consumed by lib benches only.
+    pub(crate) fn stage_nanos(&self) -> u64 {
+        self.stage_nanos.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Weak commit handle for data-plane GC and compaction.
@@ -248,6 +318,24 @@ pub(crate) async fn stage_seg_deltas(
     Ok((out, fd))
 }
 
+/// Accumulates one apply's worker time on drop, so the `continue` paths that
+/// abandon a batch are measured alongside the ones that complete it.
+#[cfg(test)]
+struct ApplyTimer {
+    start: std::time::Instant,
+    sink: Arc<std::sync::atomic::AtomicU64>,
+}
+
+#[cfg(test)]
+impl Drop for ApplyTimer {
+    fn drop(&mut self) {
+        self.sink.fetch_add(
+            self.start.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+}
+
 async fn worker_loop(
     mut ctx: WorkerContext,
     mut rx: mpsc::UnboundedReceiver<Request>,
@@ -321,6 +409,11 @@ async fn worker_loop(
             .lock()
             .expect("write coordinator batch-size probe poisoned")
             .push(batch.len());
+        #[cfg(test)]
+        let _apply_timer = ApplyTimer {
+            start: std::time::Instant::now(),
+            sink: Arc::clone(&ctx.apply_nanos),
+        };
 
         let replicating = ctx.replicator.is_some();
         let mut merged = WriteBatch::new();
@@ -415,8 +508,15 @@ async fn worker_loop(
         }
 
         // The commit worker is the sole segment-counter writer.
-        let (seg_abs, footprint_delta) = match stage_seg_deltas(&ctx.db, seg_map, &mut merged).await
-        {
+        #[cfg(test)]
+        let stage_start = std::time::Instant::now();
+        let staged_seg = stage_seg_deltas(&ctx.db, seg_map, &mut merged).await;
+        #[cfg(test)]
+        ctx.stage_nanos.fetch_add(
+            stage_start.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let (seg_abs, footprint_delta) = match staged_seg {
             Ok(v) => v,
             Err(e) => {
                 // A failed staged counter may have advanced the in-memory inode
@@ -977,6 +1077,179 @@ mod tests {
         );
     }
 
+    /// `[(batch size, times drained)]`, ascending by size.
+    fn batch_histogram(sizes: &[usize]) -> Vec<(usize, usize)> {
+        let mut counts: BTreeMap<usize, usize> = BTreeMap::new();
+        for size in sizes {
+            *counts.entry(*size).or_default() += 1;
+        }
+        counts.into_iter().collect()
+    }
+
+    // Lockstep member waves: four writers each issue one 256 KiB member chunk
+    // and every writer waits for all four replies before the next wave. This is
+    // the NBD stripe shape when the client serializes on ACK, and the arrival
+    // pattern where the worker's opportunistic drain has the least opportunity
+    // to coalesce -- the queue is empty every time the worker blocks in recv().
+    //
+    // The free-running arm is the same total work without the per-wave join:
+    // arrivals then overlap the in-flight apply, so fragmentation is expected
+    // to self-correct into multi-commit batches.
+    //   cargo test --release --lib -- --ignored --nocapture bench_lockstep_member_waves
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[ignore = "throughput measurement, run explicitly in release"]
+    async fn bench_lockstep_member_waves() {
+        const WAVES: usize = 128;
+        const CHUNK: usize = 256 * 1024;
+
+        // The one-member lockstep arm is the control: the same per-chunk work
+        // with nothing for the coordinator to serialize against. Comparing its
+        // per-wave time with the four-member arm's prices the coordinator's
+        // serial apply chain.
+        for (members_count, lockstep) in [(1usize, true), (4, true), (4, false)] {
+            let fs = make_fs().await;
+            let member_size = (WAVES * CHUNK) as u64;
+            let mut members = Vec::new();
+            for i in 0..members_count as u8 {
+                let (id, _) = fs
+                    .create(
+                        &test_creds(),
+                        0,
+                        &[b'm', b'0' + i],
+                        &SetAttributes::default(),
+                    )
+                    .await
+                    .unwrap();
+                fs.setattr(
+                    &test_creds(),
+                    id,
+                    &SetAttributes {
+                        size: crate::fs::types::SetSize::Set(member_size),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+                members.push(id);
+            }
+
+            let auth = test_auth();
+            let payload = Bytes::from(vec![7u8; CHUNK]);
+            let batches_before = fs.write_coordinator.batch_sizes().len();
+            let apply_before = fs.write_coordinator.apply_nanos();
+            let stage_before = fs.write_coordinator.stage_nanos();
+            let start = std::time::Instant::now();
+            if lockstep {
+                for wave in 0..WAVES {
+                    let offset = (wave * CHUNK) as u64;
+                    let writes = members
+                        .iter()
+                        .map(|id| fs.write(&auth, *id, offset, &payload));
+                    for result in futures::future::join_all(writes).await {
+                        result.unwrap();
+                    }
+                }
+            } else {
+                let writers = members.iter().map(|id| {
+                    let fs = &fs;
+                    let auth = &auth;
+                    let payload = &payload;
+                    async move {
+                        for wave in 0..WAVES {
+                            fs.write(auth, *id, (wave * CHUNK) as u64, payload)
+                                .await
+                                .unwrap();
+                        }
+                    }
+                });
+                futures::future::join_all(writers).await;
+            }
+            let secs = start.elapsed().as_secs_f64();
+            let batches = fs.write_coordinator.batch_sizes()[batches_before..].to_vec();
+            let commits: usize = batches.iter().sum();
+            let bytes = (WAVES * members_count * CHUNK) as f64;
+            let apply_secs = (fs.write_coordinator.apply_nanos() - apply_before) as f64 / 1e9;
+            let stage_secs = (fs.write_coordinator.stage_nanos() - stage_before) as f64 / 1e9;
+            eprintln!(
+                "{} {members_count}-member waves: {:.0} waves/s ({:.0} us/wave), {:.0} MB/s, \
+                 {} applies for {commits} commits ({:.2} commits/apply), sizes {:?}; \
+                 worker busy {:.0}% ({:.0} us/apply, {:.0} us in stage_seg_deltas)",
+                if lockstep { "lockstep" } else { "free-run" },
+                WAVES as f64 / secs,
+                secs * 1e6 / WAVES as f64,
+                bytes / secs / 1e6,
+                batches.len(),
+                commits as f64 / batches.len() as f64,
+                batch_histogram(&batches),
+                100.0 * apply_secs / secs,
+                apply_secs * 1e6 / batches.len() as f64,
+                stage_secs * 1e6 / batches.len() as f64,
+            );
+        }
+    }
+
+    // Coordinator-only companion to bench_lockstep_member_waves: the same wave
+    // shape with a trivial transaction per writer, so the reported rate is the
+    // coordinator's own per-apply fixed cost with the extent path removed. The
+    // `seg` arm adds one segment-counter delta per commit, which is what makes
+    // an apply read before it writes; the difference between the arms is the
+    // `stage_seg_deltas` share of that fixed cost.
+    //   cargo test --release --lib -- --ignored --nocapture bench_lockstep_commit_waves
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[ignore = "throughput measurement, run explicitly in release"]
+    async fn bench_lockstep_commit_waves() {
+        const WAVES: u64 = 2000;
+
+        // The one-writer arm applies one commit per batch by construction, so
+        // its us/apply is the un-amortized fixed cost of an apply; the
+        // four-writer arm coalesces perfectly and prices the same fixed cost
+        // spread over four commits.
+        for (writers, seg_deltas) in [(1u64, false), (4, false), (1, true), (4, true)] {
+            let fs = make_fs().await;
+            let codec = codec();
+            let batches_before = fs.write_coordinator.batch_sizes().len();
+            let apply_before = fs.write_coordinator.apply_nanos();
+            let start = std::time::Instant::now();
+            for wave in 0..WAVES {
+                let commits = (0..writers).map(|writer| {
+                    let coord = fs.write_coordinator.clone();
+                    let key = codec.extent_key(writer + 1, wave);
+                    // One hot counter per writer, as a writer appending into
+                    // its own active segment would produce.
+                    let seg_key = codec.segcount_key(1, writer);
+                    async move {
+                        let mut txn = Transaction::new();
+                        txn.put_bytes(&key, Bytes::from_static(b"payload"));
+                        if seg_deltas {
+                            txn.add_seg_delta(&seg_key, 7, 7);
+                        }
+                        coord.commit(txn).await
+                    }
+                });
+                for result in futures::future::join_all(commits).await {
+                    result.unwrap();
+                }
+            }
+            let secs = start.elapsed().as_secs_f64();
+            let batches = fs.write_coordinator.batch_sizes()[batches_before..].to_vec();
+            let commits: usize = batches.iter().sum();
+            let apply_secs = (fs.write_coordinator.apply_nanos() - apply_before) as f64 / 1e9;
+            eprintln!(
+                "coordinator-only {writers}-commit waves [{}]: {:.0} waves/s \
+                 ({:.1} us/wave), {} applies for {commits} commits ({:.2} commits/apply); \
+                 worker busy {:.0}%, {:.1} us/apply, {:.1} us/commit",
+                if seg_deltas { "seg" } else { "no-seg" },
+                WAVES as f64 / secs,
+                secs * 1e6 / WAVES as f64,
+                batches.len(),
+                commits as f64 / batches.len() as f64,
+                100.0 * apply_secs / secs,
+                apply_secs * 1e6 / batches.len() as f64,
+                apply_secs * 1e6 / commits as f64,
+            );
+        }
+    }
+
     #[tokio::test]
     async fn commits_single_transaction() {
         let fs = make_fs().await;
@@ -987,6 +1260,67 @@ mod tests {
         fs.write_coordinator.commit(txn).await.unwrap();
         let v = fs.db.get_bytes(&key).await.unwrap();
         assert_eq!(v.as_deref(), Some(&b"value"[..]));
+    }
+
+    // The coalescing guarantee that holds without any timer: commits that queue
+    // while an apply is in flight are drained into one following batch. This is
+    // what makes singleton fragmentation self-correcting once the worker is
+    // saturated, and it is the only coalescing the worker can do without
+    // waiting. See the module header for why no wait was added.
+    #[tokio::test]
+    async fn commits_queued_during_an_apply_drain_into_one_batch() {
+        let fs = make_fs().await;
+        let codec = codec();
+        let batches_before = fs.write_coordinator.batch_sizes().len();
+
+        // Stall the first apply at its write permit, so the rest of the wave
+        // provably arrives while that apply is still in flight.
+        let commit_block = fs.db.flush_barrier().write_owned().await;
+        let apply_reached = fs.write_coordinator.probe_next_apply();
+
+        let mut replies = Vec::new();
+        let (head_reply, head_rx) = oneshot::channel();
+        let mut head = Transaction::new();
+        head.put_bytes(&codec.extent_key(1, 0), Bytes::from_static(b"head"));
+        fs.write_coordinator
+            .sender
+            .send(Request::Commit(head, head_reply))
+            .unwrap();
+        replies.push(head_rx);
+        apply_reached.await.unwrap();
+
+        for i in 1..4u64 {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            let mut txn = Transaction::new();
+            txn.put_bytes(&codec.extent_key(1, i), Bytes::from_static(b"tail"));
+            fs.write_coordinator
+                .sender
+                .send(Request::Commit(txn, reply_tx))
+                .unwrap();
+            replies.push(reply_rx);
+        }
+
+        drop(commit_block);
+        for reply in replies {
+            reply.await.unwrap().unwrap();
+        }
+
+        assert_eq!(
+            fs.write_coordinator.batch_sizes()[batches_before..],
+            [1, 3],
+            "the head commit applies alone; every commit that queued behind it \
+             coalesces into the next batch"
+        );
+        for i in 0..4u64 {
+            assert!(
+                fs.db
+                    .get_bytes(&codec.extent_key(1, i))
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "commit {i} of the coalesced batch is missing"
+            );
+        }
     }
 
     #[tokio::test]
