@@ -274,6 +274,33 @@ class PerformanceMatrixCellTests(unittest.TestCase):
             },
         )
 
+    def test_clean_gc_wait_targets_a_fresh_pass_after_the_current_baseline(
+        self,
+    ) -> None:
+        self.assertTrue(
+            hasattr(PerformanceMatrixRunner, "_wait_clean_gc"),
+            "matrix clean-GC gate is unavailable",
+        )
+        baseline = WritebackSnapshot(9, 9, 9, 0, 0, 1, 1, False, False, 4, 8, 16)
+        quiescent = replace(baseline, gc_passes=5)
+        lifecycle = _MatrixLifecycle(self.config, (baseline,))
+        matrix = PerformanceMatrixRunner(
+            self.config,
+            _FioRunner(),
+            lifecycle,  # type: ignore[arg-type]
+        )
+        with mock.patch(
+            "scripts.vm100_pilot.performance_matrix.wait_for_gc_quiescence",
+            return_value=quiescent,
+        ) as wait:
+            result = matrix._wait_clean_gc()
+        self.assertEqual(result, quiescent)
+        wait.assert_called_once_with(
+            lifecycle.metrics.snapshot,
+            timeout=self.config.drain_timeout,
+            after_pass=4,
+        )
+
     def test_cell_uses_exact_direct_fio_and_records_durability_boundaries(self) -> None:
         self.assertIsNotNone(
             PerformanceMatrixRunner, "performance matrix runner is unavailable"
@@ -298,7 +325,7 @@ class PerformanceMatrixCellTests(unittest.TestCase):
         )
         lifecycle = _MatrixLifecycle(
             self.config,
-            (before, after_fio, accepted, after_syncfs, post_drain),
+            (after_fio, accepted, after_syncfs, post_drain),
         )
         runner = _FioRunner()
         zero_io = SystemIoSnapshot("sda1", 100, 200, 10, 0.1, 0.0, 1_000, 100)
@@ -365,6 +392,7 @@ class PerformanceMatrixCellTests(unittest.TestCase):
                 run_root=run_root,
                 fio_output=output,
                 sampler=sampler,
+                maintenance_before=before,
             )
         except RuntimeError as error:
             self.fail(f"group-reported fio aggregate was rejected: {error}")
@@ -479,7 +507,7 @@ class PerformanceMatrixOrchestrationTests(unittest.TestCase):
             cell=cell,
             total_bytes=32 << 20,
             fio=fio,
-            before=self.snapshot,
+            maintenance_before=self.snapshot,
             after_fio=replace(self.snapshot, accepted=10),
             accepted=replace(self.snapshot, accepted=10, local=10),
             after_syncfs=replace(self.snapshot, accepted=10, local=10),
@@ -617,6 +645,7 @@ class PerformanceMatrixOrchestrationTests(unittest.TestCase):
             "matrix orchestration is unavailable",
         )
         roots: list[Path] = []
+        gc_waits: list[int] = []
         lifecycle = _MatrixLifecycle(
             self.config,
             (self.snapshot,) * 20,
@@ -630,6 +659,10 @@ class PerformanceMatrixOrchestrationTests(unittest.TestCase):
 
             def _local_device(self) -> tuple[int, int]:
                 return (8, 1)
+
+            def _wait_clean_gc(self) -> WritebackSnapshot:
+                gc_waits.append(len(roots) + 1)
+                return outer.snapshot
 
             def _authority(self) -> Any:
                 return matrix_module.RunAuthority(
@@ -679,6 +712,7 @@ class PerformanceMatrixOrchestrationTests(unittest.TestCase):
         with (receipt / "cells.csv").open(newline="", encoding="utf-8") as handle:
             rows = list(csv.DictReader(handle))
         self.assertEqual(len(roots), 3)
+        self.assertEqual(gc_waits, [1, 2, 3])
         self.assertEqual(len(set(roots)), 3)
         self.assertTrue(all(root.parent == self.mount for root in roots))
         self.assertTrue(all(root.name.startswith(".zerofs-matrix-") for root in roots))
@@ -692,6 +726,7 @@ class PerformanceMatrixOrchestrationTests(unittest.TestCase):
         self.assertEqual(manifest["authority"]["config_sha256"], "b" * 64)
         self.assertEqual(summary["cell_count"], 3)
         self.assertEqual(len(summary["cells"]), 3)
+        self.assertEqual(summary["cells"][0]["maintenance_before"]["gc_passes"], 4)
         self.assertEqual(len(rows), 3)
         self.assertEqual(rows[1]["block_size"], "1M")
         self.assertEqual(rows[1]["jobs"], "4")
@@ -739,6 +774,10 @@ class PerformanceMatrixOrchestrationTests(unittest.TestCase):
             def _local_device(self) -> tuple[int, int]:
                 return (8, 1)
 
+            def _wait_clean_gc(self) -> WritebackSnapshot:
+                events.append("gc-wait")
+                return outer.snapshot
+
             def _run_cell(self, **kwargs: Any) -> Any:
                 Path(kwargs["fio_output"]).write_text("{}\n", encoding="utf-8")
                 return outer._result(kwargs["cell"])
@@ -762,7 +801,10 @@ class PerformanceMatrixOrchestrationTests(unittest.TestCase):
                 system_io_output=self.scratch / "system.csv",
             )
 
-        self.assertEqual(events[:4], ["syncfs", "drain", "snapshot", "sampler-start"])
+        self.assertEqual(
+            events[:4],
+            ["syncfs", "drain", "gc-wait", "sampler-start"],
+        )
         self.assertLess(events.index("sampler-stop"), len(events) - 2)
 
     def test_exporter_lag_snapshot_blocks_sampler_after_drain_returns(self) -> None:
@@ -774,7 +816,7 @@ class PerformanceMatrixOrchestrationTests(unittest.TestCase):
             remote=6194,
             dirty_ssd_reserved=4 << 20,
         )
-        lifecycle = _MatrixLifecycle(self.config, (dirty, self.snapshot))
+        lifecycle = _MatrixLifecycle(self.config, (self.snapshot,))
         outer = self
 
         class RecordingSampler(_StaticSampler):
@@ -784,6 +826,9 @@ class PerformanceMatrixOrchestrationTests(unittest.TestCase):
         class BoundaryMatrix(PerformanceMatrixRunner):  # type: ignore[misc,valid-type]
             def _local_device(self) -> tuple[int, int]:
                 return (8, 1)
+
+            def _wait_clean_gc(self) -> WritebackSnapshot:
+                return dirty
 
             def _run_cell(self, **kwargs: Any) -> Any:
                 return outer._result(kwargs["cell"])
@@ -828,6 +873,9 @@ class PerformanceMatrixOrchestrationTests(unittest.TestCase):
 
             def _local_device(self) -> tuple[int, int]:
                 return (8, 1)
+
+            def _wait_clean_gc(self) -> WritebackSnapshot:
+                return outer.snapshot
 
             def _authority(self) -> Any:
                 return matrix_module.RunAuthority(
@@ -945,6 +993,9 @@ class PerformanceMatrixOrchestrationTests(unittest.TestCase):
 
             def _local_device(self) -> tuple[int, int]:
                 return (8, 1)
+
+            def _wait_clean_gc(self) -> WritebackSnapshot:
+                return outer.snapshot
 
             def _authority(self) -> Any:
                 return matrix_module.RunAuthority(

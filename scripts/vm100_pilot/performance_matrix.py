@@ -11,7 +11,11 @@ from pathlib import Path
 from .benchmark import _MetricSampler, _assert_no_maintenance
 from .config import PilotConfig
 from .lifecycle import PilotLifecycle
-from .metrics import WritebackSnapshot, wait_for_accepted_after
+from .metrics import (
+    WritebackSnapshot,
+    wait_for_accepted_after,
+    wait_for_gc_quiescence,
+)
 from .receipts import RunReceipt
 from .runner import Runner
 from .system_io import (
@@ -146,7 +150,7 @@ class MatrixCellResult:
     cell: MatrixCell
     total_bytes: int
     fio: MatrixFioResult
-    before: WritebackSnapshot
+    maintenance_before: WritebackSnapshot
     after_fio: WritebackSnapshot
     accepted: WritebackSnapshot
     after_syncfs: WritebackSnapshot
@@ -164,6 +168,10 @@ class MatrixCellResult:
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
+
+    @property
+    def before(self) -> WritebackSnapshot:
+        return self.maintenance_before
 
 
 @dataclass(frozen=True, slots=True)
@@ -308,6 +316,14 @@ class PerformanceMatrixRunner:
     def _system_io(self, device: tuple[int, int]) -> SystemIoSnapshot:
         return SystemIoSnapshot.capture(self.config.proc_root, root_device=device)
 
+    def _wait_clean_gc(self) -> WritebackSnapshot:
+        baseline = self.lifecycle.metrics.snapshot().gc_passes
+        return wait_for_gc_quiescence(
+            self.lifecycle.metrics.snapshot,
+            timeout=self.config.drain_timeout,
+            after_pass=baseline,
+        )
+
     def _nbd_io(self) -> BlockIoSnapshot:
         return BlockIoSnapshot.capture(
             self.config.proc_root, device=block_device(self.config.nbd_device)
@@ -400,9 +416,10 @@ class PerformanceMatrixRunner:
         run_root: Path,
         fio_output: Path,
         sampler: _MetricSampler,
+        maintenance_before: WritebackSnapshot,
     ) -> MatrixCellResult:
         total_bytes, per_job_bytes = self._cell_bytes(cell, total_mib)
-        before = self.lifecycle.metrics.snapshot()
+        before = maintenance_before
         require_drained(before, phase=f"{cell.name} pre-cell")
         local_device = self._local_device()
         io_before = self._system_io(local_device)
@@ -470,7 +487,7 @@ class PerformanceMatrixRunner:
             cell=cell,
             total_bytes=total_bytes,
             fio=fio,
-            before=before,
+            maintenance_before=before,
             after_fio=after_fio,
             accepted=accepted,
             after_syncfs=after_syncfs,
@@ -551,8 +568,9 @@ class PerformanceMatrixRunner:
             # drained exporter sample. Drain only after that boundary so its
             # stable-sample window absorbs the metrics export cadence.
             self.lifecycle.drain()
+            maintenance_before = self._wait_clean_gc()
             require_drained(
-                self.lifecycle.metrics.snapshot(),
+                maintenance_before,
                 phase=f"{cell.name} pre-cell",
             )
             sampler = _MetricSampler(
@@ -569,6 +587,7 @@ class PerformanceMatrixRunner:
                 run_root=run_root,
                 fio_output=fio_output,
                 sampler=sampler,
+                maintenance_before=maintenance_before,
             )
         except BaseException as error:
             primary = error
