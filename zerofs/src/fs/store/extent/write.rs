@@ -88,6 +88,59 @@ pub(super) struct OpenLane {
     pub(super) fill_barrier: tokio::sync::RwLock<()>,
 }
 
+/// A held append gate, bundled with the lane it belongs to. The two are never
+/// separate values — every constructor takes one lane and locks that lane's own
+/// gate — so a rotation cannot be aimed at a lane other than the one it froze.
+/// Previously the witness was a bare `MutexGuard`, which any lane's guard
+/// satisfied.
+pub(super) struct LaneAppendGuard<'a> {
+    lane: &'a OpenLane,
+    _gate: tokio::sync::MutexGuard<'a, ()>,
+}
+
+impl<'a> LaneAppendGuard<'a> {
+    async fn lock(lane: &'a OpenLane) -> Self {
+        let gate = lane.append_gate.lock().await;
+        Self { lane, _gate: gate }
+    }
+
+    fn try_lock(lane: &'a OpenLane) -> Option<Self> {
+        lane.append_gate
+            .try_lock()
+            .ok()
+            .map(|gate| Self { lane, _gate: gate })
+    }
+
+    /// The lane this gate belongs to. Reborrowed from the lane's own lifetime,
+    /// so it outlives moves of the guard itself.
+    fn lane(&self) -> &'a OpenLane {
+        self.lane
+    }
+}
+
+/// A lane frozen for rotation: its append gate is held, so no further
+/// reservation can be placed, and its fill barrier is held exclusively, so every
+/// reservation already placed has copied its sealed bytes in. Built only from a
+/// [`LaneAppendGuard`], which is what ties both guards and the rotated lane to
+/// one another.
+pub(super) struct LaneFreeze<'a> {
+    lane: &'a OpenLane,
+    _filled: tokio::sync::RwLockWriteGuard<'a, ()>,
+}
+
+impl<'a> LaneFreeze<'a> {
+    /// Waits out reservations already mid-AEAD on the lane; none can be added,
+    /// so the wait is bounded by one batch's AEAD.
+    async fn acquire(appended: &LaneAppendGuard<'a>) -> Self {
+        let lane = appended.lane();
+        let filled = lane.fill_barrier.write().await;
+        Self {
+            lane,
+            _filled: filled,
+        }
+    }
+}
+
 /// A claim on a contiguous frame-index run in one lane's open segment, plus the
 /// byte range backing it. Taken under the lane's append gate so frame indices
 /// stay dense and AAD-unique; filled after the batch AEAD, which runs outside
@@ -270,17 +323,17 @@ impl ExtentStore {
     /// the shared open segment anyway, so spilling costs no read locality
     /// while restoring lane parallelism. When every gate is busy, wait on the
     /// affine one (tokio's FIFO mutex keeps the flush barrier's freeze fair).
-    async fn lock_append_lane(&self, id: InodeId) -> (&OpenLane, tokio::sync::MutexGuard<'_, ()>) {
+    async fn lock_append_lane(&self, id: InodeId) -> LaneAppendGuard<'_> {
         let preferred = self.open_lane(id);
-        if let Ok(guard) = preferred.append_gate.try_lock() {
-            return (preferred, guard);
+        if let Some(guard) = LaneAppendGuard::try_lock(preferred) {
+            return guard;
         }
         for lane in self.open_lanes.iter() {
-            if let Ok(guard) = lane.append_gate.try_lock() {
-                return (lane, guard);
+            if let Some(guard) = LaneAppendGuard::try_lock(lane) {
+                return guard;
             }
         }
-        (preferred, preferred.append_gate.lock().await)
+        LaneAppendGuard::lock(preferred).await
     }
 
     fn tail_get(&self, id: InodeId) -> Option<(u64, Bytes)> {
@@ -568,7 +621,8 @@ impl ExtentStore {
         StagePhaseNanos::add(&phase.protect_ref, t_protect);
         #[cfg(test)]
         let t_gate_wait = std::time::Instant::now();
-        let (lane, append_guard) = self.lock_append_lane(id).await;
+        let append_guard = self.lock_append_lane(id).await;
+        let lane = append_guard.lane();
         #[cfg(test)]
         StagePhaseNanos::add(&phase.gate_wait, t_gate_wait);
         #[cfg(test)]
@@ -694,7 +748,7 @@ impl ExtentStore {
         if let Some(append_guard) = rotate_guard {
             #[cfg(test)]
             let t_spawn_seal = std::time::Instant::now();
-            self.spawn_seal(lane, &append_guard).await;
+            self.spawn_seal(&append_guard).await;
             #[cfg(test)]
             StagePhaseNanos::add(&phase.spawn_seal, t_spawn_seal);
         }
@@ -737,18 +791,17 @@ impl ExtentStore {
 
     /// Finalize a lane's open generation into `sealing` and start a fresh one.
     ///
-    /// `_filled` is the lane's exclusive fill barrier: holding it is what makes
-    /// this sound. It proves every reservation on the lane has copied its
-    /// sealed bytes in, so the buffer is a complete frame stream rather than
-    /// one with holes, and (because the caller also holds the append gate) no
-    /// further reservation can be placed against the generation being sealed.
+    /// `freeze` is what makes this sound, and it names the lane rotated: it
+    /// proves every reservation on that lane has copied its sealed bytes in, so
+    /// the buffer is a complete frame stream rather than one with holes, and
+    /// (because it is built from the lane's append guard) that no further
+    /// reservation can be placed against the generation being sealed.
     fn rotate_sealing_generation(
         &self,
-        lane: &OpenLane,
+        freeze: &LaneFreeze<'_>,
         residency: tokio::sync::OwnedSemaphorePermit,
-        _filled: &tokio::sync::RwLockWriteGuard<'_, ()>,
     ) -> Result<Option<(Segid, Bytes)>, FsError> {
-        let mut open = lane.open.lock().unwrap();
+        let mut open = freeze.lane.open.lock().unwrap();
         if open.dir.is_empty() {
             return Ok(None);
         }
@@ -803,7 +856,7 @@ impl ExtentStore {
             if self.publish_pending_seals().await {
                 return Err(FsError::IoError);
             }
-            append_guards.push(lane.append_gate.lock().await);
+            append_guards.push(LaneAppendGuard::lock(lane).await);
         }
         if self.publish_pending_seals().await {
             return Err(FsError::IoError);
@@ -839,10 +892,16 @@ impl ExtentStore {
                 next_lane += 1;
                 #[cfg(feature = "failpoints")]
                 fail_point!(fp::SEAL_OPEN_FAIL, |_| Err(FsError::IoError));
-                // Every append gate is frozen above, so this only waits out
-                // reservations already mid-AEAD; none can be added.
-                let filled = self.open_lanes[index].fill_barrier.write().await;
-                match self.rotate_sealing_generation(&self.open_lanes[index], residency, &filled) {
+                // `append_guards` is built over `open_lanes` in order, so index
+                // `index` is this lane's own gate; the freeze then rotates the
+                // lane that gate names rather than one addressed separately.
+                let freeze = LaneFreeze::acquire(
+                    &append_guards
+                        .as_ref()
+                        .expect("append gates are held until every lane has rotated")[index],
+                )
+                .await;
+                match self.rotate_sealing_generation(&freeze, residency) {
                     Ok(Some((segid, bytes))) => {
                         let segments = Arc::clone(&self.segments);
                         uploads
@@ -901,18 +960,17 @@ impl ExtentStore {
     /// blocks here (backpressure) instead of growing RAM without bound. The
     /// rotated buffer stays readable via `sealing` until its PUT lands.
     ///
-    /// `_append_guard` must be this lane's gate: it keeps later writers from
-    /// reserving into the generation being rotated, both while this waits for a
-    /// residency permit and while it drains reservations already in flight.
-    async fn spawn_seal(&self, lane: &OpenLane, _append_guard: &tokio::sync::MutexGuard<'_, ()>) {
+    /// `appended` carries both the lane to rotate and its held gate, which keeps
+    /// later writers from reserving into the generation being rotated — both
+    /// while this waits for a residency permit and while it drains reservations
+    /// already in flight.
+    async fn spawn_seal(&self, appended: &LaneAppendGuard<'_>) {
         let residency = match Arc::clone(&self.seal_residency_sem).acquire_owned().await {
             Ok(p) => p,
             Err(_) => return,
         };
-        // Batches that reserved before this gate hold may still be encrypting.
-        // No new one can start, so the wait is bounded by one batch's AEAD.
-        let filled = lane.fill_barrier.write().await;
-        let (segid, _) = match self.rotate_sealing_generation(lane, residency, &filled) {
+        let freeze = LaneFreeze::acquire(appended).await;
+        let (segid, _) = match self.rotate_sealing_generation(&freeze, residency) {
             Ok(Some(generation)) => generation,
             Ok(None) => return,
             Err(e) => {
@@ -920,7 +978,7 @@ impl ExtentStore {
                 return;
             }
         };
-        drop(filled);
+        drop(freeze);
         let segments = self.segments.clone();
         let sealing = self.sealing.clone();
         let upload_sem = self.seal_upload_sem.clone();
