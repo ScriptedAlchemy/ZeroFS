@@ -397,7 +397,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
             NBDError::DeviceNotFound(name_buf.clone())
         })?;
 
-        self.writer.write_all(&device.size.to_be_bytes()).await?;
+        self.writer.write_all(&device.size().to_be_bytes()).await?;
         self.writer
             .write_all(&TRANSMISSION_FLAGS.to_be_bytes())
             .await?;
@@ -542,7 +542,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
                 }
                 NBDCommand::Write => {
                     let result = self
-                        .read_write_data(&device, request.offset, request.length, fua, device.size)
+                        .read_write_data(&device, request.offset, request.length, fua)
                         .await;
                     self.send_unit_result(request.cookie, result).await;
                 }
@@ -568,7 +568,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
                 NBDCommand::Cache => {
                     let result = self
                         .handler
-                        .cache(request.offset, request.length, device.size)
+                        .cache(&device, request.offset, request.length)
                         .await;
                     self.send_unit_result(request.cookie, result).await;
                 }
@@ -602,10 +602,9 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
         offset: u64,
         length: u32,
         fua: bool,
-        device_size: u64,
     ) -> super::error::CommandResult<()> {
         // Consume an invalid write's payload to keep the request stream aligned.
-        if out_of_bounds(offset, length, device_size) {
+        if out_of_bounds(offset, length, device.size()) {
             let mut remaining = length as usize;
             let mut buf = vec![0; remaining.min(DISCARD_CHUNK_SIZE)];
             while remaining > 0 {
@@ -1258,7 +1257,7 @@ mod tests {
         );
         let write_task = tokio::spawn(async move {
             write_session
-                .read_write_data(&write_device, 0, 4096, false, write_device.size)
+                .read_write_data(&write_device, 0, 4096, false)
                 .await
         });
         payload_started_rx
@@ -1310,7 +1309,7 @@ mod tests {
         );
         let write_task = tokio::spawn(async move {
             write_session
-                .read_write_data(&write_device, 0, 4096, false, write_device.size)
+                .read_write_data(&write_device, 0, 4096, false)
                 .await
         });
         payload_started_rx
@@ -1361,7 +1360,7 @@ mod tests {
         );
         let write_task = tokio::spawn(async move {
             write_session
-                .read_write_data(&write_device, 0, 4096, false, write_device.size)
+                .read_write_data(&write_device, 0, 4096, false)
                 .await
         });
         payload_started_rx

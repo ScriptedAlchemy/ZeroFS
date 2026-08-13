@@ -56,9 +56,7 @@ pub enum OptionResult {
 #[derive(Clone)]
 pub struct NBDDevice {
     pub name: Vec<u8>,
-    pub size: u64,
     backing: NbdBacking,
-    trace_inode: u64,
     gate: Arc<RwLock<()>>,
 }
 
@@ -75,6 +73,7 @@ enum NbdBacking {
         size: u64,
     },
     Striped {
+        directory_inode: u64,
         members: Arc<[NbdMember]>,
         stripe_bytes: u64,
     },
@@ -120,6 +119,7 @@ fn map_stripe_chunks(
         NbdBacking::Striped {
             members,
             stripe_bytes,
+            ..
         } => {
             if members.is_empty() || *stripe_bytes == 0 {
                 return Err(CommandError::InvalidArgument);
@@ -173,8 +173,29 @@ impl NBDDevice {
     pub fn info_export(&self) -> NBDInfoExport {
         NBDInfoExport {
             info_type: NBD_INFO_EXPORT,
-            size: self.size,
+            size: self.size(),
             transmission_flags: TRANSMISSION_FLAGS,
+        }
+    }
+
+    /// Size presented to the NBD client, derived from the backing geometry.
+    /// Striped overflow is rejected when the device is resolved.
+    pub fn size(&self) -> u64 {
+        match &self.backing {
+            NbdBacking::Single { size, .. } => *size,
+            NbdBacking::Striped { members, .. } => members
+                .first()
+                .map_or(0, |member| member.size * members.len() as u64),
+        }
+    }
+
+    /// Inode reported to the file-operation tracer for this export.
+    fn trace_inode(&self) -> u64 {
+        match &self.backing {
+            NbdBacking::Single { inode, .. } => *inode,
+            NbdBacking::Striped {
+                directory_inode, ..
+            } => *directory_inode,
         }
     }
 }
@@ -410,12 +431,10 @@ impl NBDHandler {
         match self.filesystem.inode_store.get(device_inode).await? {
             Inode::File(file_inode) => Ok(NBDDevice {
                 name: name.to_vec(),
-                size: file_inode.size,
                 backing: NbdBacking::Single {
                     inode: device_inode,
                     size: file_inode.size,
                 },
-                trace_inode: device_inode,
                 gate: self.export_gates.for_export(name),
             }),
             Inode::Directory(_) => self.resolve_striped_device(name, device_inode).await,
@@ -483,24 +502,23 @@ impl NBDHandler {
                 size,
             });
         }
-        let size = member_size
+        member_size
             .unwrap_or(0)
             .checked_mul(members.len() as u64)
             .ok_or_else(|| NBDError::Protocol("striped NBD size overflow".to_string()))?;
         Ok(NBDDevice {
             name: name.to_vec(),
-            size,
             backing: NbdBacking::Striped {
+                directory_inode,
                 members: members.into(),
                 stripe_bytes: manifest.stripe_bytes,
             },
-            trace_inode: directory_inode,
             gate: self.export_gates.for_export(name),
         })
     }
 
     pub async fn read(&self, device: &NBDDevice, offset: u64, length: u32) -> CommandResult<Bytes> {
-        if out_of_bounds(offset, length, device.size) {
+        if out_of_bounds(offset, length, device.size()) {
             return Err(CommandError::InvalidArgument);
         }
 
@@ -581,7 +599,7 @@ impl NBDHandler {
 
         if offset
             .checked_add(data.len() as u64)
-            .is_none_or(|end| end > device.size)
+            .is_none_or(|end| end > device.size())
         {
             return Err(CommandError::NoSpace);
         }
@@ -633,7 +651,7 @@ impl NBDHandler {
         length: u32,
         fua: bool,
     ) -> CommandResult<()> {
-        if out_of_bounds(offset, length, device.size) {
+        if out_of_bounds(offset, length, device.size()) {
             return Err(CommandError::InvalidArgument);
         }
 
@@ -674,8 +692,8 @@ impl NBDHandler {
         Ok(())
     }
 
-    pub async fn cache(&self, offset: u64, length: u32, device_size: u64) -> CommandResult<()> {
-        if out_of_bounds(offset, length, device_size) {
+    pub async fn cache(&self, device: &NBDDevice, offset: u64, length: u32) -> CommandResult<()> {
+        if out_of_bounds(offset, length, device.size()) {
             return Err(CommandError::InvalidArgument);
         }
         Ok(())
@@ -690,7 +708,7 @@ impl NBDHandler {
 
         self.filesystem.tracer.emit(
             &self.filesystem.inode_store,
-            device.trace_inode,
+            device.trace_inode(),
             FileOperation::Fsync,
         );
 
@@ -860,6 +878,7 @@ mod tests {
     #[test]
     fn striped_mapping_covers_each_logical_byte_once_across_rows() {
         let backing = NbdBacking::Striped {
+            directory_inode: 1,
             members: Arc::from([
                 NbdMember {
                     inode: 10,
@@ -926,7 +945,7 @@ mod tests {
     #[tokio::test]
     async fn striped_export_discovers_and_roundtrips_cross_lane_io() {
         let (_filesystem, handler, device) = striped_export().await;
-        assert_eq!(device.size, 64 * 1024);
+        assert_eq!(device.size(), 64 * 1024);
         let payload = Bytes::from(
             (0..22 * 1024)
                 .map(|index| ((index * 31 + 7) % 251) as u8)

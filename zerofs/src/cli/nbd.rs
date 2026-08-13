@@ -802,7 +802,7 @@ mod tests {
             .get_device(b"vm100")
             .await
             .expect("NBD discovers provisioned export");
-        assert_eq!(device.size, 64 * MIB);
+        assert_eq!(device.size(), 64 * MIB);
 
         let marker = client
             .read("/.nbd/vm100/.zerofs-nbd-stripe-v1")
@@ -934,7 +934,7 @@ mod tests {
         );
         assert!(client.exists(&abandoned).await.unwrap());
         let handler = NBDHandler::new(filesystem, Arc::new(NbdExportGates::default()));
-        assert_eq!(handler.get_device(b"vm100").await.unwrap().size, 64 * MIB);
+        assert_eq!(handler.get_device(b"vm100").await.unwrap().size(), 64 * MIB);
         shutdown.cancel();
     }
 
@@ -970,7 +970,7 @@ mod tests {
             16 * MIB
         );
         let handler = NBDHandler::new(filesystem, Arc::new(NbdExportGates::default()));
-        assert_eq!(handler.get_device(b"vm100").await.unwrap().size, 64 * MIB);
+        assert_eq!(handler.get_device(b"vm100").await.unwrap().size(), 64 * MIB);
         shutdown.cancel();
     }
 
@@ -1001,7 +1001,7 @@ mod tests {
         );
         assert!(client.exists(staging).await.unwrap());
         let handler = NBDHandler::new(filesystem, Arc::new(NbdExportGates::default()));
-        assert_eq!(handler.get_device(b"vm100").await.unwrap().size, 64 * MIB);
+        assert_eq!(handler.get_device(b"vm100").await.unwrap().size(), 64 * MIB);
         shutdown.cancel();
     }
 
@@ -1044,7 +1044,7 @@ mod tests {
             vec!["vm100"]
         );
         let handler = NBDHandler::new(filesystem, Arc::new(NbdExportGates::default()));
-        assert_eq!(handler.get_device(b"vm100").await.unwrap().size, 64 * MIB);
+        assert_eq!(handler.get_device(b"vm100").await.unwrap().size(), 64 * MIB);
         shutdown.cancel();
     }
 
@@ -1078,7 +1078,7 @@ mod tests {
         assert!(client.exists(second).await.unwrap());
         assert!(client.exists(unsafe_partial).await.unwrap());
         let handler = NBDHandler::new(filesystem, Arc::new(NbdExportGates::default()));
-        assert_eq!(handler.get_device(b"vm100").await.unwrap().size, 64 * MIB);
+        assert_eq!(handler.get_device(b"vm100").await.unwrap().size(), 64 * MIB);
         shutdown.cancel();
     }
 
@@ -1164,7 +1164,7 @@ mod tests {
             vec![unsafe_partial.rsplit('/').next().unwrap(), "vm100"]
         );
         let handler = NBDHandler::new(filesystem, Arc::new(NbdExportGates::default()));
-        assert_eq!(handler.get_device(b"vm100").await.unwrap().size, 64 * MIB);
+        assert_eq!(handler.get_device(b"vm100").await.unwrap().size(), 64 * MIB);
         shutdown.cancel();
     }
 
@@ -1283,7 +1283,7 @@ mod tests {
         );
         assert_eq!(client.stat("/.nbd/vm100").await.unwrap().ino, winner_inode);
         let handler = NBDHandler::new(filesystem, Arc::new(NbdExportGates::default()));
-        assert_eq!(handler.get_device(b"vm100").await.unwrap().size, 64 * MIB);
+        assert_eq!(handler.get_device(b"vm100").await.unwrap().size(), 64 * MIB);
         shutdown.cancel();
     }
 
