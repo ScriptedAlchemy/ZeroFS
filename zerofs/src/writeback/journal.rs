@@ -64,18 +64,31 @@
 //!
 //! ## Reclamation
 //!
-//! A container holds one contiguous sequence range, so "every member is
-//! remote-committed" is exactly `last <= remote watermark` -- a watermark
-//! comparison, not a refcount. [`Journal::remove_remote_prefix`] parses `last`
-//! out of the container name and unlinks only fully drained containers.
+//! A container is named for the range of the records that reference it --
+//! its first and last PAYLOAD-BEARING members, not its batch's first and last.
+//! A batch may begin or end with payload-free records (a Put followed by a
+//! Delete is one batch), and naming `last` after one of those would name the
+//! container after a record that holds no reference to it, leaving it
+//! unreachable from the rows reclamation walks.
+//!
+//! With that, "every member is remote-committed" is exactly
+//! `last <= remote watermark` -- a watermark comparison, not a refcount.
+//! [`Journal::remove_remote_prefix`] sweeps the shards its prefix touches and
+//! unlinks by name, so a container is reclaimable even if no surviving row
+//! points at it; [`Journal::reclaim_drained_containers`] does the same across
+//! every shard once per open.
 //!
 //! Transient overhead: a container straddling the remote watermark keeps its
 //! already-drained members on disk until its final member drains. That is
 //! bounded by one container, whose size the journaler caps at
-//! `MAX_LOCAL_PUBLISH_BATCH_PAYLOAD_BYTES`. Because the remote watermark
-//! advances in order, at most one container straddles it at a time, so the
-//! SSD holds at most that many bytes beyond what `dirty_ssd_reserved_bytes`
-//! accounts for.
+//! `MAX_LOCAL_PUBLISH_BATCH_PAYLOAD_BYTES`. The bound still holds now that
+//! names come from payload-bearing members: the remote watermark advances in
+//! order, and container ranges are disjoint and ordered because each batch
+//! covers a contiguous sequence range and its payload members lie inside it.
+//! So at most one container straddles the watermark at a time, and the SSD
+//! holds at most that many bytes beyond what `dirty_ssd_reserved_bytes`
+//! accounts for. Payload-free records between two containers narrow the gap
+//! between their ranges; they never make two ranges overlap.
 //!
 //! ## Two halves, pipelined
 //!
@@ -478,6 +491,7 @@ impl Journal {
         let remote_seq = journal.progress()?.remote_seq;
         if remote_seq > 0 {
             journal.remove_remote_prefix(remote_seq)?;
+            journal.reclaim_drained_containers(remote_seq)?;
         }
         journal.validate_recovery_state()?;
         Ok(journal)
@@ -829,18 +843,32 @@ impl Journal {
             records.push(record);
         }
 
-        // One batch, one container: assign every payload a slice of a single
-        // file named for the batch's contiguous sequence range.
+        // One batch, one container, named for the range of the records that
+        // actually reference it -- NOT the batch's own first and last.
+        //
+        // A batch may end (or begin) with payload-free records: a Put at
+        // sequence 1 followed by a Delete at sequence 2 is one batch, and
+        // naming its container `1-2` would name `last` after a record that
+        // holds no reference to it. Reclamation walks surviving mutation rows
+        // to find the containers they reference, so once the only referencing
+        // record is pruned nothing would ever reach that container again: it
+        // would leak for good, unaccounted by `dirty_ssd_reserved_bytes`, and
+        // then fail `reject_unreferenced_blobs` on every subsequent open.
+        // Naming from the payload-bearing records keeps `last` on a record
+        // that references the container, so the watermark reaching `last`
+        // always finds it.
         let container = if payloads.is_empty() {
             None
         } else {
-            let first = records
+            let first = records[payloads
                 .first()
-                .expect("a non-empty batch has a first record")
+                .expect("a non-empty payload list has a first entry")
+                .0]
                 .sequence;
-            let last = records
+            let last = records[payloads
                 .last()
-                .expect("a non-empty batch has a last record")
+                .expect("a non-empty payload list has a last entry")
+                .0]
                 .sequence;
             let relative = path_to_portable_string(&container_relative_path(first, last))?;
             let mut offset = 0_u64;
@@ -873,11 +901,19 @@ impl Journal {
 
         let mut directories = BTreeSet::new();
         if let Some(path) = written.as_deref() {
-            directories.insert(
-                path.parent()
-                    .context("blob path has no parent")?
-                    .to_path_buf(),
-            );
+            // The container exists on disk from here on, so every exit has to
+            // unlink it rather than return straight out.
+            let Some(parent) = path.parent() else {
+                let error = anyhow::anyhow!("blob path has no parent");
+                let cleanup = self.discard_container(path);
+                return match cleanup {
+                    Ok(()) => Err(error),
+                    Err(cleanup) => {
+                        Err(error.context(format!("container cleanup also failed: {cleanup:#}")))
+                    }
+                };
+            };
+            directories.insert(parent.to_path_buf());
         }
 
         let fsync_started = Instant::now();
@@ -1424,36 +1460,49 @@ impl Journal {
         drop(read);
         // A container holds one contiguous sequence range, so "every member is
         // remote-committed" is exactly `last <= through`. The range is in the
-        // container's own name, so no refcount or side table is needed; a
-        // straddling container simply survives until its final member drains.
-        let mut reclaimable = BTreeSet::new();
+        // container's own name, so reclamation is a watermark comparison
+        // rather than a refcount: the shards this prefix touches are swept by
+        // name, and a straddling container simply survives until its final
+        // member drains. Sweeping by name rather than only unlinking what the
+        // surviving rows point at means a container is reclaimable even if no
+        // row still references it.
+        //
+        // Pre-container journals stored one whole file per record under a name
+        // that encodes no sequence, so those are still unlinked per record.
+        let mut shards = BTreeSet::new();
+        let mut legacy = BTreeSet::new();
         for record in &removable {
             let Some(relative) = record.blob_path() else {
                 continue;
             };
             let reference = BlobRef::parse(relative)?;
+            let path = checked_join(&self.root, reference.relative)?;
+            if let Some(parent) = path.parent() {
+                shards.insert(parent.to_path_buf());
+            }
             if reference.slice.is_some() {
-                match container_last_sequence(reference.relative) {
-                    Some(last) if last > through => continue,
-                    Some(_) => {}
-                    None => bail!("container blob {relative} does not name a sequence range"),
+                if container_last_sequence(reference.relative).is_none() {
+                    bail!("container blob {relative} does not name a sequence range");
                 }
+            } else {
+                legacy.insert(path);
             }
-            reclaimable.insert(reference.relative.to_owned());
         }
-        for relative in &reclaimable {
-            let path = checked_join(&self.root, relative)?;
-            match fs::remove_file(&path) {
-                Ok(()) => {
-                    if let Some(parent) = path.parent() {
-                        sync_directory(parent)?;
-                    }
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(error).context("failed to remove remote-complete blob");
-                }
+        let mut swept = BTreeSet::new();
+        for shard in &shards {
+            for container in drained_containers_in(shard, through)? {
+                remove_blob_file(&container)?;
+                swept.insert(shard.clone());
             }
+        }
+        for path in &legacy {
+            remove_blob_file(path)?;
+            if let Some(parent) = path.parent() {
+                swept.insert(parent.to_path_buf());
+            }
+        }
+        for shard in &swept {
+            sync_directory(shard)?;
         }
 
         let _write = self.write_gate.lock();
@@ -1477,6 +1526,37 @@ impl Journal {
         transaction
             .commit()
             .context("failed to commit journal cleanup")
+    }
+
+    /// Sweep every shard for containers the remote watermark has passed.
+    ///
+    /// `remove_remote_prefix` only sweeps the shards its own prefix points at,
+    /// which is enough while container names are derived from the records that
+    /// reference them. This is the belt to that braces: run once per open, it
+    /// reclaims a fully drained container that nothing points at any more, so
+    /// a stray one costs disk until the next restart instead of failing
+    /// `reject_unreferenced_blobs` and refusing to open the journal at all.
+    fn reclaim_drained_containers(&self, through: Sequence) -> Result<()> {
+        let mut swept = BTreeSet::new();
+        for shard in
+            fs::read_dir(self.root.join("blobs")).context("failed to scan blob directory")?
+        {
+            let shard = shard.context("failed to read blob shard")?.path();
+            if !fs::symlink_metadata(&shard)
+                .context("failed to inspect blob shard")?
+                .is_dir()
+            {
+                continue;
+            }
+            for container in drained_containers_in(&shard, through)? {
+                remove_blob_file(&container)?;
+                swept.insert(shard.clone());
+            }
+        }
+        for shard in &swept {
+            sync_directory(shard)?;
+        }
+        Ok(())
     }
 
     fn validate_record_format(&self, record: &MutationRecord) -> Result<()> {
@@ -2092,6 +2172,35 @@ fn container_relative_path(first: Sequence, last: Sequence) -> PathBuf {
     PathBuf::from("blobs")
         .join(format!("{:02x}", (first >> 8) & 0xff))
         .join(format!("{first:016x}-{last:016x}.blobs"))
+}
+
+/// Every container in one shard directory whose last member is at or below
+/// `through` -- that is, every container nothing needs any more.
+fn drained_containers_in(shard: &Path, through: Sequence) -> Result<Vec<PathBuf>> {
+    let mut drained = Vec::new();
+    let entries = match fs::read_dir(shard) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(drained),
+        Err(error) => return Err(error).context("failed to scan blob shard"),
+    };
+    for entry in entries {
+        let path = entry.context("failed to read blob entry")?.path();
+        let Some(last) = path.to_str().and_then(container_last_sequence) else {
+            continue;
+        };
+        if last <= through {
+            drained.push(path);
+        }
+    }
+    Ok(drained)
+}
+
+fn remove_blob_file(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).context("failed to remove remote-complete blob"),
+    }
 }
 
 /// The last sequence a container covers, parsed back out of its file name.
@@ -3817,6 +3926,155 @@ mod tests {
         assert!(container.exists());
         assert_eq!(recovered.progress().unwrap().local_seq, 3);
         assert_eq!(recovered.read_blob(2).unwrap(), b"payload-2");
+    }
+
+    /// A batch may end with records that hold no payload. The container must
+    /// still be named for the records that reference it, or its `last` names a
+    /// record that never points at it: reclamation walks surviving rows to
+    /// find containers, so once the only referencing record is pruned nothing
+    /// reaches the container again and it leaks for good.
+    #[test]
+    fn a_container_is_named_for_its_payload_bearing_records_not_the_batch() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = open_temp_journal(&temp, "bucket-a");
+        let payload = VerifiedPayload::new(Bytes::from_static(b"one"));
+        let put = journal
+            .prepare_verified_put(put_record(1, "segments/1", b"one"), &payload)
+            .unwrap();
+        let delete = journal
+            .prepare_metadata(delete_record(2, "obsolete"))
+            .unwrap();
+
+        let committed = journal.publish_batch(vec![put, delete]).unwrap();
+
+        let reference = super::BlobRef::parse(committed[0].blob_path().unwrap()).unwrap();
+        assert_eq!(
+            reference.relative, "blobs/00/0000000000000001-0000000000000001.blobs",
+            "the payload-free tail must not extend the container's name"
+        );
+        assert_eq!(
+            super::container_last_sequence(reference.relative),
+            Some(1),
+            "the container's last member must be a record that references it"
+        );
+    }
+
+    /// The same shape, drained to completion: the container must be reclaimed
+    /// and the journal must reopen. Before the name was derived from the
+    /// payload-bearing records, the watermark passed the payload member,
+    /// pruned the only referencing row, and left the container behind -- which
+    /// then failed `reject_unreferenced_blobs` on every later open.
+    #[test]
+    fn a_payload_free_tail_batch_reclaims_its_container_and_reopens_cleanly() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("writeback");
+        let journal = Journal::open(&root, identity("bucket-a")).unwrap();
+        let payload = VerifiedPayload::new(Bytes::from_static(b"one"));
+        let put = journal
+            .prepare_verified_put(put_record(1, "segments/1", b"one"), &payload)
+            .unwrap();
+        let delete = journal
+            .prepare_metadata(delete_record(2, "obsolete"))
+            .unwrap();
+        let committed = journal.publish_batch(vec![put, delete]).unwrap();
+        let container = blob_file(&journal, &committed[0]);
+        assert!(container.exists());
+
+        // Drain both members, one at a time, exactly as the remote scheduler
+        // does: the watermark stops between the payload member and the
+        // payload-free tail.
+        journal.mark_remote(1, Some("etag-1".to_owned())).unwrap();
+        journal.remove_remote_prefix(1).unwrap();
+        assert!(
+            !container.exists(),
+            "the container's last member drained, so it must be reclaimed"
+        );
+        journal.mark_remote(2, None).unwrap();
+        journal.remove_remote_prefix(2).unwrap();
+
+        assert!(published_blob_files(&journal).is_empty());
+        drop(journal);
+
+        let recovered = Journal::open(&root, identity("bucket-a")).unwrap();
+        assert_eq!(recovered.progress().unwrap().remote_seq, 2);
+        assert!(recovered.snapshot().unwrap().records.is_empty());
+        assert!(published_blob_files(&recovered).is_empty());
+    }
+
+    /// A container straddling the remote watermark stays until its own last
+    /// member drains, even when later payload-free records in the same batch
+    /// have not.
+    #[test]
+    fn a_container_survives_a_watermark_that_stops_inside_its_batch() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = open_temp_journal(&temp, "bucket-a");
+        let first = journal
+            .prepare_verified_put(
+                put_record(1, "segments/1", b"one"),
+                &VerifiedPayload::new(Bytes::from_static(b"one")),
+            )
+            .unwrap();
+        let second = journal
+            .prepare_verified_put(
+                put_record(2, "segments/2", b"two"),
+                &VerifiedPayload::new(Bytes::from_static(b"two")),
+            )
+            .unwrap();
+        let tail = journal
+            .prepare_metadata(delete_record(3, "obsolete"))
+            .unwrap();
+        let committed = journal.publish_batch(vec![first, second, tail]).unwrap();
+        let container = blob_file(&journal, &committed[0]);
+
+        journal.mark_remote(1, Some("etag-1".to_owned())).unwrap();
+        journal.remove_remote_prefix(1).unwrap();
+
+        assert!(
+            container.exists(),
+            "sequence 2 still needs the container's bytes"
+        );
+        assert_eq!(journal.read_blob(2).unwrap(), b"two");
+
+        journal.mark_remote(2, Some("etag-2".to_owned())).unwrap();
+        journal.remove_remote_prefix(2).unwrap();
+
+        assert!(
+            !container.exists(),
+            "every payload member drained, so the container must go"
+        );
+        // The payload-free tail is still pending and must not resurrect it.
+        journal.mark_remote(3, None).unwrap();
+        journal.remove_remote_prefix(3).unwrap();
+        assert!(published_blob_files(&journal).is_empty());
+    }
+
+    /// Reclamation is by name, so a fully drained container is collected even
+    /// when no surviving row points at it -- the shape that used to brick
+    /// every subsequent open with "unreferenced committed blob".
+    #[test]
+    fn a_fully_drained_container_no_row_points_at_is_still_reclaimed_on_open() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("writeback");
+        let journal = Journal::open(&root, identity("bucket-a")).unwrap();
+        journal
+            .publish_batch(prepare_puts(&journal, 1..=2))
+            .unwrap();
+        for sequence in 1..=2 {
+            journal
+                .mark_remote(sequence, Some(format!("etag-{sequence}")))
+                .unwrap();
+        }
+        journal.remove_remote_prefix(2).unwrap();
+        // Plant a container that is fully drained but that no row references.
+        let stray = root.join(super::container_relative_path(1, 2));
+        fs::write(&stray, b"stray").unwrap();
+        fs::set_permissions(&stray, fs::Permissions::from_mode(0o600)).unwrap();
+        drop(journal);
+
+        let recovered = Journal::open(&root, identity("bucket-a")).unwrap();
+
+        assert!(!stray.exists(), "a drained container must be swept by name");
+        assert_eq!(recovered.progress().unwrap().remote_seq, 2);
     }
 
     /// Staging makes bytes durable and nothing else. Until the commit half
