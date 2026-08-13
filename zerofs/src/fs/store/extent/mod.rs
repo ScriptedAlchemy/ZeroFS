@@ -12,6 +12,7 @@
 //! so a durable manifest never points at an un-PUT segment.
 
 mod compact;
+mod inflight;
 mod read;
 mod reclaim;
 mod select;
@@ -183,6 +184,10 @@ pub struct ExtentStore {
     /// sequential append splices into it rather than re-decoding the buffered/sealed
     /// frame. Eviction only ever costs a re-fetch.
     tail_cache: Cache<InodeId, (u64, Bytes)>,
+    /// Extent ranges whose write is queued for commit but not yet applied.
+    /// Staging reads resolve against apply-published state, so anything that
+    /// would read one of these ranges waits; see [`inflight`].
+    inflight_writes: Arc<inflight::InflightExtentWrites>,
     /// Validated full-extent plaintext, keyed by immutable physical and logical
     /// frame identity. This is the hot data cache; raw segment parts remain the
     /// persistent/SSD cache beneath it.
@@ -304,6 +309,7 @@ impl ExtentStore {
             gc_round: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             quiescence: Arc::new(Mutex::new((0, 0, Instant::now()))),
             tail_cache,
+            inflight_writes: Arc::new(inflight::InflightExtentWrites::default()),
             decoded_extent_cache,
             extent_location_cache,
             read_ahead,

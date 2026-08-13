@@ -6,6 +6,7 @@
 #[cfg(feature = "failpoints")]
 use crate::failpoints::{self as fp, fail_point};
 
+use super::inflight;
 use super::{CachedExtentLocation, ExtentStore, PARALLEL_EXTENT_OPS, TailUpdate, ZERO_EXTENT};
 use crate::db::Transaction;
 use crate::frame_codec::Compressed;
@@ -346,6 +347,38 @@ impl ExtentStore {
         self.tail_cache.remove(&id);
     }
 
+    /// Inclusive extent range a write at `offset` for `len` bytes touches, or
+    /// `None` for an empty write. Shared by the write path's in-flight
+    /// registration and by [`Self::write`] itself so the two cannot diverge.
+    pub(crate) fn extent_span(offset: u64, len: u64) -> Option<(u64, u64)> {
+        let end_offset = offset.checked_add(len)?;
+        if len == 0 {
+            return None;
+        }
+        Some((
+            offset / EXTENT_SIZE as u64,
+            (end_offset - 1) / EXTENT_SIZE as u64,
+        ))
+    }
+
+    /// Claim `[start, end]` until the returned guard drops, so a later staging
+    /// read of those extents blocks until this write applies. Register under
+    /// the per-inode lock and hold it until the commit reply resolves and
+    /// [`Self::apply_tail_update`] has run.
+    pub(crate) fn register_inflight_write(
+        &self,
+        id: InodeId,
+        start: u64,
+        end: u64,
+    ) -> inflight::InflightWriteGuard {
+        self.inflight_writes.register(id, start, end)
+    }
+
+    /// Wait until no queued write on `id` overlaps `[start, end]`.
+    pub(crate) async fn wait_for_inflight_overlap(&self, id: InodeId, start: u64, end: u64) {
+        self.inflight_writes.wait_for_overlap(id, start, end).await
+    }
+
     /// Apply a `write`'s tail-cache effect. Call only after its commit succeeds.
     pub fn apply_tail_update(&self, id: InodeId, update: TailUpdate) {
         match update {
@@ -434,14 +467,21 @@ impl ExtentStore {
         start: u64,
         end: u64,
     ) -> Result<(), FsError> {
+        // Drain queued writes before touching the tail: one that applies after
+        // this invalidation would republish a tail for an extent this call is
+        // about to delete. It also restores the debit exclusion the comment
+        // below relies on, which the inode lock alone no longer provides once
+        // the write path releases it at submit.
+        self.inflight_writes.wait_for_all(id).await;
         self.tail_invalidate(id);
         if start >= end {
             return Ok(());
         }
         // Debit each removed extent's bytes from its segment's live-byte counter.
         // One forward-map scan (cheaper than a GET per extent); the caller's inode
-        // write lock serialises this read-then-delete against a concurrent write to
-        // the same extent, so no segment is debited twice for one frame.
+        // write lock plus the in-flight drain above serialise this read-then-delete
+        // against a concurrent write to the same extent, so no segment is debited
+        // twice for one frame.
         let start_key = self.key_codec.extent_key(id, start);
         let end_key = self.key_codec.extent_key(id, end);
         let mut stream = self
@@ -1032,6 +1072,14 @@ impl ExtentStore {
         let start_extent = offset / EXTENT_SIZE as u64;
         let end_extent = (end_offset - 1) / EXTENT_SIZE as u64;
 
+        // Everything below reads apply-published state -- the tail cache, the
+        // partially-overwritten extents, and each edited extent's current
+        // FrameLoc -- so it must not run while a queued write owns any of
+        // these extents. Disjoint ranges are unaffected.
+        self.inflight_writes
+            .wait_for_overlap(id, start_extent, end_extent)
+            .await;
+
         let cached = self.tail_get(id);
 
         // Read the existing content of any partially-overwritten extent (full
@@ -1165,6 +1213,9 @@ impl ExtentStore {
             return Ok(());
         }
         let end_offset = offset.checked_add(length).ok_or(FsError::InvalidArgument)?;
+        // Zeroing reads the extents it only partially covers and debits the
+        // frames it supersedes; both must see every queued write on the inode.
+        self.inflight_writes.wait_for_all(id).await;
         self.tail_invalidate(id);
 
         let start_extent = offset / EXTENT_SIZE as u64;
