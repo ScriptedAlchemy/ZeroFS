@@ -1287,15 +1287,18 @@ mod tests {
         shutdown.cancel();
     }
 
-    #[tokio::test]
-    async fn provisioning_rejects_an_oversized_stripe_marker() {
+    /// Grow `marker` one byte past the 4096-byte manifest cap and re-provision.
+    /// The marker names are spelled out by each caller rather than taken from
+    /// the constants: these are on-disk names, and a test that reads them from
+    /// the same constant the code reads would not notice one being renamed.
+    async fn assert_oversized_marker_is_rejected(marker: &str) {
         let (client, _filesystem, shutdown, _directory) = setup().await;
         let layout = StripedLayout::new("vm100", 64 * MIB, 4, MIB).unwrap();
         provision_striped(&client, &layout).await.unwrap();
-        let marker_path = "/.nbd/vm100/.zerofs-nbd-stripe-v1";
-        let mut oversized = client.read(marker_path).await.unwrap().to_vec();
+        let marker_path = format!("/.nbd/vm100/{marker}");
+        let mut oversized = client.read(&marker_path).await.unwrap().to_vec();
         oversized.resize(4097, b' ');
-        client.write(marker_path, &oversized).await.unwrap();
+        client.write(&marker_path, &oversized).await.unwrap();
 
         let error = provision_striped(&client, &layout).await.unwrap_err();
         assert!(error.to_string().contains("too large"), "{error:#}");
@@ -1303,17 +1306,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provisioning_rejects_an_oversized_provision_marker() {
-        let (client, _filesystem, shutdown, _directory) = setup().await;
-        let layout = StripedLayout::new("vm100", 64 * MIB, 4, MIB).unwrap();
-        provision_striped(&client, &layout).await.unwrap();
-        let marker_path = "/.nbd/vm100/.zerofs-nbd-provision-v1";
-        let mut oversized = client.read(marker_path).await.unwrap().to_vec();
-        oversized.resize(4097, b' ');
-        client.write(marker_path, &oversized).await.unwrap();
+    async fn provisioning_rejects_an_oversized_stripe_marker() {
+        assert_oversized_marker_is_rejected(".zerofs-nbd-stripe-v1").await;
+    }
 
-        let error = provision_striped(&client, &layout).await.unwrap_err();
-        assert!(error.to_string().contains("too large"), "{error:#}");
-        shutdown.cancel();
+    #[tokio::test]
+    async fn provisioning_rejects_an_oversized_provision_marker() {
+        assert_oversized_marker_is_rejected(".zerofs-nbd-provision-v1").await;
     }
 }
