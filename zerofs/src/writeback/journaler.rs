@@ -601,6 +601,24 @@ struct AssembledBatch {
     ownership: BatchOwnership,
 }
 
+/// Drop a batch-head preparation that can never publish, releasing the
+/// admission permits it was holding, and hand back its preparation result.
+///
+/// Only the head is ever discarded this way: a fatal record sitting behind
+/// already-accumulated ones is left in place and reconsidered as the head of
+/// the next batch.
+fn take_fatal_head(
+    prepared: &mut BTreeMap<Sequence, PreparedEntry>,
+    sequence: Sequence,
+) -> AnyResult<PreparedMutation> {
+    let (result, ram, disk) = prepared
+        .remove(&sequence)
+        .expect("the fatal preparation still exists");
+    drop(ram);
+    drop(disk);
+    result
+}
+
 /// Take the longest contiguous run of ready preparations that fits one batch.
 ///
 /// A fatal record (failed, unsizeable, or oversized preparation) only becomes
@@ -625,23 +643,16 @@ fn assemble_batch(
             if !mutations.is_empty() {
                 break;
             }
-            let (result, ram, disk) = prepared
-                .remove(&sequence)
-                .expect("the expected failed preparation still exists");
-            drop(ram);
-            drop(disk);
-            let error = match result {
-                Err(error) => error,
-                Ok(_) => unreachable!("the preparation result was checked above"),
+            let Err(error) = take_fatal_head(prepared, sequence) else {
+                unreachable!("the preparation result was checked above")
             };
             return Err(format!("{error:#}"));
         }
         if mutations.len() == MAX_LOCAL_PUBLISH_BATCH_RECORDS {
             break;
         }
-        let mutation = match result {
-            Ok(mutation) => mutation,
-            Err(_) => unreachable!("preparation errors are handled above"),
+        let Ok(mutation) = result else {
+            unreachable!("preparation errors are handled above")
         };
         let mutation_bytes = match mutation.encoded_record_bytes() {
             Ok(bytes) => bytes,
@@ -649,11 +660,7 @@ fn assemble_batch(
                 if !mutations.is_empty() {
                     break;
                 }
-                let (_, ram, disk) = prepared
-                    .remove(&sequence)
-                    .expect("the unsized prepared mutation still exists");
-                drop(ram);
-                drop(disk);
+                drop(take_fatal_head(prepared, sequence));
                 return Err(format!("{error:#}"));
             }
         };
@@ -661,11 +668,7 @@ fn assemble_batch(
             if !mutations.is_empty() {
                 break;
             }
-            let (_, ram, disk) = prepared
-                .remove(&sequence)
-                .expect("the oversized prepared mutation still exists");
-            drop(ram);
-            drop(disk);
+            drop(take_fatal_head(prepared, sequence));
             return Err(format!(
                 "prepared journal mutation {sequence} encodes to {mutation_bytes} bytes, exceeding the {MAX_LOCAL_PUBLISH_BATCH_RECORD_BYTES}-byte local publication batch limit"
             ));
@@ -674,11 +677,7 @@ fn assemble_batch(
             if !mutations.is_empty() {
                 break;
             }
-            let (_, ram, disk) = prepared
-                .remove(&sequence)
-                .expect("the overflowed prepared mutation still exists");
-            drop(ram);
-            drop(disk);
+            drop(take_fatal_head(prepared, sequence));
             return Err("local publication batch byte count overflow".to_owned());
         };
         if next_encoded_bytes > MAX_LOCAL_PUBLISH_BATCH_RECORD_BYTES {
@@ -848,15 +847,10 @@ async fn run_journaler(
 
     loop {
         while terminal.is_none() {
-            match preparations.next().now_or_never() {
-                Some(Some(Ok((sequence, result, ram, disk)))) => {
-                    prepared.insert(sequence, (result, ram, disk));
-                }
-                Some(Some(Err(error))) => {
-                    terminal = Some(format!("local journal preparer panicked: {error}"));
-                }
-                Some(None) | None => break,
-            }
+            let Some(Some(result)) = preparations.next().now_or_never() else {
+                break;
+            };
+            terminal = collect_preparation(result, &mut prepared);
         }
 
         // Commit the oldest staged batch as soon as the commit half is free.
