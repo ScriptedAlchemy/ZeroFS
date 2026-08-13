@@ -976,6 +976,18 @@ async fn run_journaler(
                     terminal = Some(error);
                 }
             }
+            // Both halves idle, nothing preparing, and input closed, yet the
+            // exit checks above did not fire: the backlog holds a sequence the
+            // drain can never reach. Report it rather than let `select!` panic
+            // on a fully disabled set of branches.
+            else => {
+                if terminal.is_none() {
+                    let stranded = prepared.keys().copied().collect::<Vec<_>>();
+                    terminal = Some(format!(
+                        "local journal drain stalled at sequence {next_admitted} with stranded preparations {stranded:?}"
+                    ));
+                }
+            }
         }
     }
 
