@@ -2202,6 +2202,32 @@ class BenchmarkTests(unittest.TestCase):
         with self.assertRaisesRegex(BenchmarkContaminatedError, "segment GC"):
             _assert_no_maintenance(before, after)
 
+    def test_fresh_reset_proceeds_when_the_old_stack_is_unhealthy(self) -> None:
+        from scripts.vm100_pilot.reset import FreshResetter
+
+        # A dead stack is precisely when reset-fresh is needed; the
+        # pre-capture status must record the failure, not abort the reset.
+        captured: dict[str, object] = {}
+
+        class DeadLifecycle:
+            def require_vm100(self) -> None:
+                pass
+
+            def status(self, **_: object) -> dict[str, object]:
+                raise RuntimeError("pilot units are not active: zerofs-nbd-pilot")
+
+        reset = FreshResetter.__new__(FreshResetter)
+        reset.lifecycle = DeadLifecycle()
+
+        def stop_after_capture(*_a: object, **_k: object) -> str:
+            captured["reached"] = True
+            raise SystemExit(0)
+
+        reset._fast_topology = stop_after_capture
+        with self.assertRaises(SystemExit):
+            reset.run(remote_prefix="fresh-x", confirm_destroy_pilot=True)
+        self.assertTrue(captured.get("reached"))
+
     def test_benchmark_tolerates_an_idle_gc_scan_inside_the_measured_epoch(
         self,
     ) -> None:

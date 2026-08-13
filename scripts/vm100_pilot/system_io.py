@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import stat
 import tempfile
@@ -8,6 +9,15 @@ from pathlib import Path
 
 from .config import PilotConfig
 from .runner import Runner
+
+
+def file_sha256(path: Path) -> str:
+    """Hash a local file in 1 MiB chunks, without reading it all into memory."""
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def filesystem_device(path: Path) -> tuple[int, int]:

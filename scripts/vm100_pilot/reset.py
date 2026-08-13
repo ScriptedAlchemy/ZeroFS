@@ -365,7 +365,14 @@ class FreshResetter:
         if not confirm_destroy_pilot:
             raise ValueError("fresh reset requires --confirm-destroy-pilot")
         self.lifecycle.require_vm100()
-        before_status = self.lifecycle.status()
+        try:
+            before_status: dict[str, object] = self.lifecycle.status()
+        except RuntimeError as error:
+            # A fresh reset is the recovery path for a dead or wedged stack
+            # (crashed daemon, poisoned remote store, half-torn NBD device).
+            # Refusing because the old stack is unhealthy would deadlock
+            # recovery; record why it was unhealthy instead.
+            before_status = {"unhealthy": str(error)}
         fast_before = self._fast_topology()
         original_config = self._read_config()
         new_config = rewrite_storage_prefix(original_config, remote_prefix)
