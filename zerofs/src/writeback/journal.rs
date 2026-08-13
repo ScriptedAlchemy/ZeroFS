@@ -221,6 +221,17 @@ pub struct JournalProgress {
     pub remote_retries: u64,
 }
 
+/// A bounded pending-record slice read together with the watermarks it is
+/// consistent with. Reading the watermarks and the records in two transactions
+/// tears: a remote commit landing in between prunes records the earlier
+/// watermark says must still exist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingWindow {
+    pub local_seq: Sequence,
+    pub remote_seq: Sequence,
+    pub records: Vec<MutationRecord>,
+}
+
 impl Journal {
     pub fn open_existing(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
@@ -474,6 +485,43 @@ impl Journal {
         let table = read
             .open_table(MUTATIONS)
             .context("failed to open journal mutations")?;
+        Self::read_pending_range(&table, first_sequence, limit)
+    }
+
+    /// The bounded pending slice plus the watermarks it is consistent with, in
+    /// one read transaction. Callers that validate the slice against a
+    /// watermark must use this instead of `progress` + `pending_from`.
+    pub fn pending_window(&self, first_sequence: Sequence, limit: usize) -> Result<PendingWindow> {
+        let read = self
+            .database
+            .begin_read()
+            .context("failed to read pending journal window")?;
+        let meta = read
+            .open_table(META)
+            .context("failed to open journal metadata")?;
+        let local_seq = read_required::<u64>(&meta, LOCAL_SEQ_KEY)?;
+        let remote_seq = read_required::<u64>(&meta, REMOTE_SEQ_KEY)?;
+        drop(meta);
+        let records = if limit == 0 {
+            Vec::new()
+        } else {
+            let table = read
+                .open_table(MUTATIONS)
+                .context("failed to open journal mutations")?;
+            Self::read_pending_range(&table, first_sequence, limit)?
+        };
+        Ok(PendingWindow {
+            local_seq,
+            remote_seq,
+            records,
+        })
+    }
+
+    fn read_pending_range(
+        table: &impl redb::ReadableTable<Sequence, &'static [u8]>,
+        first_sequence: Sequence,
+        limit: usize,
+    ) -> Result<Vec<MutationRecord>> {
         let mut records = Vec::with_capacity(limit);
         for entry in table
             .range(first_sequence..)
@@ -2646,6 +2694,47 @@ mod tests {
         assert_eq!(snapshot.local_seq, 0);
         assert!(snapshot.records.is_empty());
         assert_eq!(snapshot.pending_blob_count, 0);
+    }
+
+    /// How much of the journal's durability cost is fixed per publication
+    /// batch rather than per record. Run with
+    /// `cargo test --release --lib publication_batch_size_amortizes -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "throughput benchmark; needs a real disk and --release"]
+    fn publication_batch_size_amortizes_the_journal_fixed_cost() {
+        const PAYLOAD_BYTES: usize = 64 * 1024;
+        const BATCHES: usize = 16;
+        for batch in [1_usize, 4, 64] {
+            let temp = tempfile::tempdir().unwrap();
+            let journal = open_temp_journal(&temp, "bucket-a");
+            let payload = vec![0x5a_u8; PAYLOAD_BYTES];
+            let verified = VerifiedPayload::new(Bytes::from(payload.clone()));
+            let mut sequence = 1_u64;
+            let started = Instant::now();
+            for _ in 0..BATCHES {
+                let mut prepared = Vec::with_capacity(batch);
+                for _ in 0..batch {
+                    prepared.push(
+                        journal
+                            .prepare_verified_put(
+                                put_record(sequence, &format!("segments/{sequence}"), &payload),
+                                &verified,
+                            )
+                            .unwrap(),
+                    );
+                    sequence += 1;
+                }
+                journal.publish_batch(prepared).unwrap();
+            }
+            let elapsed = started.elapsed();
+            let records = (BATCHES * batch) as f64;
+            println!(
+                "batch={batch:>2}: {:.3} ms/record, {:.1} MiB/s ({records} records in {:.3}s)",
+                elapsed.as_secs_f64() * 1000.0 / records,
+                records * PAYLOAD_BYTES as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64(),
+                elapsed.as_secs_f64(),
+            );
+        }
     }
 
     #[test]

@@ -433,6 +433,80 @@ async fn drive_shutdown(inner: Arc<LocalJournalerInner>) {
         .send_replace(Some(outcome.unwrap_or(Ok(()))));
 }
 
+type Preparation = (
+    Sequence,
+    AnyResult<PreparedMutation>,
+    Option<AcceptedAdmission>,
+    Option<DiskPermit>,
+);
+type PreparedEntry = (
+    AnyResult<PreparedMutation>,
+    Option<AcceptedAdmission>,
+    Option<DiskPermit>,
+);
+
+/// Files a finished preparation, returning a terminal error if its task died.
+fn collect_preparation(
+    result: Result<Preparation, tokio::task::JoinError>,
+    prepared: &mut BTreeMap<Sequence, PreparedEntry>,
+) -> Option<String> {
+    match result {
+        Ok((sequence, result, ram, disk)) => {
+            prepared.insert(sequence, (result, ram, disk));
+            None
+        }
+        Err(error) => Some(format!("local journal preparer panicked: {error}")),
+    }
+}
+
+/// Admits one queued command, returning a terminal error if it breaks the
+/// contiguous submission order the journal depends on.
+fn accept_journal_command(
+    command: Option<JournalCommand>,
+    sink: &Arc<dyn LocalJournalSink>,
+    preparations: &mut FuturesUnordered<JoinHandle<Preparation>>,
+    next_received: &mut Option<Sequence>,
+    input_closed: &mut bool,
+    shutdown: &mut Option<oneshot::Sender<()>>,
+) -> Option<String> {
+    match command {
+        Some(JournalCommand::Mutation {
+            record,
+            payload,
+            ram,
+            disk,
+        }) => {
+            let record = *record;
+            let sequence = record.sequence;
+            if *next_received != Some(sequence) {
+                let expected = next_received
+                    .map_or_else(|| "after overflow".to_owned(), |value| value.to_string());
+                drop(ram);
+                drop(disk);
+                return Some(format!(
+                    "journal worker expected sequence {expected}, got {sequence}"
+                ));
+            }
+            *next_received = sequence.checked_add(1);
+            let prepare_sink = sink.clone();
+            preparations.push(tokio::task::spawn_blocking(move || {
+                let result = prepare_sink.prepare(record, payload.as_ref());
+                (sequence, result, ram, disk)
+            }));
+            None
+        }
+        Some(JournalCommand::Shutdown(done)) => {
+            *shutdown = Some(done);
+            *input_closed = true;
+            None
+        }
+        None => {
+            *input_closed = true;
+            None
+        }
+    }
+}
+
 async fn run_journaler(
     sink: Arc<dyn LocalJournalSink>,
     mut receiver: mpsc::Receiver<JournalCommand>,
@@ -449,17 +523,6 @@ async fn run_journaler(
     let prepare_concurrency = prepare_concurrency.max(1);
     let mut next_admitted = local_sequence.saturating_add(1);
     let mut next_received = local_sequence.checked_add(1);
-    type Preparation = (
-        Sequence,
-        AnyResult<PreparedMutation>,
-        Option<AcceptedAdmission>,
-        Option<DiskPermit>,
-    );
-    type PreparedEntry = (
-        AnyResult<PreparedMutation>,
-        Option<AcceptedAdmission>,
-        Option<DiskPermit>,
-    );
     let mut preparations: FuturesUnordered<JoinHandle<Preparation>> = FuturesUnordered::new();
     let mut prepared: BTreeMap<Sequence, PreparedEntry> = BTreeMap::new();
     let mut shutdown = None;
@@ -567,22 +630,57 @@ async fn run_journaler(
             }
 
             let publish_sink = sink.clone();
-            let published =
-                match tokio::task::spawn_blocking(move || publish_sink.publish_batch(mutations))
-                    .await
-                {
-                    Ok(Ok(records)) => records,
-                    Ok(Err(error)) => {
-                        drop(ownership);
-                        terminal = Some(format!("{error:#}"));
-                        break;
+            let publish =
+                tokio::task::spawn_blocking(move || publish_sink.publish_batch(mutations));
+            tokio::pin!(publish);
+            // Publication is the journal's fixed cost (blob directory fsyncs
+            // plus the redb commits) and the SSD write pipeline is idle while it
+            // runs. Keep preparing the rest of the backlog across it, otherwise
+            // every batch is capped at `prepare_concurrency` records and the
+            // drain degenerates into one small fsync wave per commit. Faults
+            // raised here are deferred: the batch in flight must always be
+            // awaited to completion so its durability outcome is observed.
+            let mut deferred = None::<String>;
+            let publish_result = loop {
+                tokio::select! {
+                    biased;
+                    result = &mut publish => break result,
+                    Some(result) = preparations.next(), if !preparations.is_empty() => {
+                        if let Some(error) = collect_preparation(result, &mut prepared)
+                            && deferred.is_none()
+                        {
+                            deferred = Some(error);
+                        }
                     }
-                    Err(error) => {
-                        drop(ownership);
-                        terminal = Some(format!("local journal publisher panicked: {error}"));
-                        break;
+                    command = receiver.recv(),
+                        if deferred.is_none()
+                            && !input_closed
+                            && preparations.len() < prepare_concurrency =>
+                    {
+                        deferred = accept_journal_command(
+                            command,
+                            &sink,
+                            &mut preparations,
+                            &mut next_received,
+                            &mut input_closed,
+                            &mut shutdown,
+                        );
                     }
-                };
+                }
+            };
+            let published = match publish_result {
+                Ok(Ok(records)) => records,
+                Ok(Err(error)) => {
+                    drop(ownership);
+                    terminal = Some(format!("{error:#}"));
+                    break;
+                }
+                Err(error) => {
+                    drop(ownership);
+                    terminal = Some(format!("local journal publisher panicked: {error}"));
+                    break;
+                }
+            };
             let expected_sequences = ownership
                 .iter()
                 .map(|(sequence, _, _)| *sequence)
@@ -627,6 +725,10 @@ async fn run_journaler(
                     break;
                 }
             };
+            if let Some(error) = deferred {
+                terminal = Some(error);
+                break;
+            }
         }
 
         if terminal.is_some() {
@@ -638,43 +740,19 @@ async fn run_journaler(
 
         tokio::select! {
             result = preparations.next(), if !preparations.is_empty() => {
-                match result {
-                    Some(Ok((sequence, result, ram, disk))) => {
-                        prepared.insert(sequence, (result, ram, disk));
-                    }
-                    Some(Err(error)) => {
-                        terminal = Some(format!("local journal preparer panicked: {error}"));
-                    }
-                    None => {}
+                if let Some(result) = result {
+                    terminal = collect_preparation(result, &mut prepared);
                 }
             }
             command = receiver.recv(), if !input_closed && preparations.len() < prepare_concurrency => {
-                match command {
-                    Some(JournalCommand::Mutation { record, payload, ram, disk }) => {
-                        let record = *record;
-                        let sequence = record.sequence;
-                        if next_received != Some(sequence) {
-                            terminal = Some(format!(
-                                "journal worker expected sequence {}, got {sequence}",
-                                next_received.map_or_else(|| "after overflow".to_owned(), |value| value.to_string())
-                            ));
-                            drop(ram);
-                            drop(disk);
-                            continue;
-                        }
-                        next_received = sequence.checked_add(1);
-                        let prepare_sink = sink.clone();
-                        preparations.push(tokio::task::spawn_blocking(move || {
-                            let result = prepare_sink.prepare(record, payload.as_ref());
-                            (sequence, result, ram, disk)
-                        }));
-                    }
-                    Some(JournalCommand::Shutdown(done)) => {
-                        shutdown = Some(done);
-                        input_closed = true;
-                    }
-                    None => input_closed = true,
-                }
+                terminal = accept_journal_command(
+                    command,
+                    &sink,
+                    &mut preparations,
+                    &mut next_received,
+                    &mut input_closed,
+                    &mut shutdown,
+                );
             }
         }
     }
@@ -764,6 +842,16 @@ mod tests {
     struct HeadBlockingBatchSink {
         head_release: Mutex<Option<mpsc::Receiver<()>>>,
         prepared: tokio_mpsc::UnboundedSender<u64>,
+        published_batches: Mutex<Vec<Vec<u64>>>,
+    }
+
+    /// Parks the first publication batch so a test can observe what the drain
+    /// loop does with the rest of the backlog while one batch is being made
+    /// durable.
+    struct PublishParkingSink {
+        prepared: tokio_mpsc::UnboundedSender<u64>,
+        publish_entered: tokio_mpsc::UnboundedSender<usize>,
+        publish_release: Mutex<Option<mpsc::Receiver<()>>>,
         published_batches: Mutex<Vec<Vec<u64>>>,
     }
 
@@ -995,6 +1083,61 @@ mod tests {
             self.published_batches
                 .lock()
                 .unwrap()
+                .push(sequences.clone());
+            Ok(sequences
+                .into_iter()
+                .map(|sequence| put_record(sequence, b"x"))
+                .collect())
+        }
+
+        fn discard(&self, _prepared: crate::writeback::journal::PreparedMutation) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    impl LocalJournalSink for PublishParkingSink {
+        fn prepare(
+            &self,
+            record: MutationRecord,
+            _payload: Option<&VerifiedPayload>,
+        ) -> Result<crate::writeback::journal::PreparedMutation> {
+            self.prepared.send(record.sequence).unwrap();
+            Ok(crate::writeback::journal::PreparedMutation::metadata(
+                record,
+            ))
+        }
+
+        fn publish(
+            &self,
+            prepared: crate::writeback::journal::PreparedMutation,
+        ) -> Result<MutationRecord> {
+            self.publish_batch(vec![prepared]).map(|mut records| {
+                records
+                    .pop()
+                    .expect("a single publication returns a record")
+            })
+        }
+
+        fn publish_batch(
+            &self,
+            prepared: Vec<crate::writeback::journal::PreparedMutation>,
+        ) -> Result<Vec<MutationRecord>> {
+            let sequences = prepared
+                .iter()
+                .map(crate::writeback::journal::PreparedMutation::sequence)
+                .collect::<Vec<_>>();
+            self.publish_entered.send(sequences.len()).unwrap();
+            if let Some(release) = self
+                .publish_release
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take()
+            {
+                release.recv().unwrap();
+            }
+            self.published_batches
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
                 .push(sequences.clone());
             Ok(sequences
                 .into_iter()
@@ -1470,6 +1613,142 @@ mod tests {
             vec![64, 64, 2]
         );
         assert_eq!(admission.used_bytes(), 0);
+        journaler.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn publication_keeps_preparing_the_next_batch_instead_of_draining_one_wave_at_a_time() {
+        const RECORDS: u64 = 64;
+        // The production prepare concurrency. With publication blocking the
+        // drain loop, this also becomes the publication batch size, so every
+        // batch pays the journal's fixed fsync + commit cost for four records.
+        const PREPARE_CONCURRENCY: usize = 4;
+        let admission = Admission::new(RECORDS);
+        let (prepared_tx, mut prepared_rx) = tokio_mpsc::unbounded_channel();
+        let (entered_tx, mut entered_rx) = tokio_mpsc::unbounded_channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let sink = Arc::new(PublishParkingSink {
+            prepared: prepared_tx,
+            publish_entered: entered_tx,
+            publish_release: Mutex::new(Some(release_rx)),
+            published_batches: Mutex::new(Vec::new()),
+        });
+        let journaler = LocalJournaler::start_with_sink_and_observer(
+            sink.clone(),
+            admission.clone(),
+            0,
+            RECORDS as usize,
+            PREPARE_CONCURRENCY,
+            None,
+        );
+        for sequence in 1..=RECORDS {
+            let ram = admission.reserve(1).await.unwrap().accept();
+            journaler
+                .submit_put(put_record(sequence, b"x"), Bytes::from_static(b"x"), ram)
+                .await
+                .unwrap();
+        }
+
+        let first_batch = tokio::time::timeout(Duration::from_secs(5), entered_rx.recv())
+            .await
+            .expect("no batch reached publication")
+            .unwrap();
+        assert!(
+            first_batch <= PREPARE_CONCURRENCY,
+            "the first batch cannot exceed the records prepared so far: {first_batch}"
+        );
+
+        // While that batch is parked in publication the SSD write pipeline is
+        // idle, so the drain loop must keep preparing the rest of the backlog.
+        for _ in 1..=RECORDS {
+            tokio::time::timeout(Duration::from_secs(5), prepared_rx.recv())
+                .await
+                .expect("publication stalled preparation of the remaining backlog")
+                .unwrap();
+        }
+
+        release_tx.send(()).unwrap();
+        journaler.barrier().wait_local(RECORDS).await.unwrap();
+
+        let batches = sink
+            .published_batches
+            .lock()
+            .unwrap()
+            .iter()
+            .map(Vec::len)
+            .collect::<Vec<_>>();
+        assert_eq!(batches.len(), 2, "{batches:?}");
+        assert_eq!(
+            batches.iter().sum::<usize>(),
+            RECORDS as usize,
+            "{batches:?}"
+        );
+        assert!(
+            batches[1] > PREPARE_CONCURRENCY,
+            "publication batches stayed capped at the prepare concurrency: {batches:?}"
+        );
+        assert_eq!(admission.used_bytes(), 0);
+        journaler.shutdown().await.unwrap();
+    }
+
+    /// Post-ACK durability drain throughput against a real journal on real
+    /// disk, at the production prepare concurrency. Ignored by default because
+    /// it is timing sensitive and does real fsyncs; run it with
+    /// `cargo test --release --lib drain_throughput -- --ignored --nocapture`.
+    #[tokio::test]
+    #[ignore = "throughput benchmark; needs a real disk and --release"]
+    async fn drain_throughput_of_the_post_ack_durability_tail() {
+        const RECORDS: u64 = 2048;
+        const PAYLOAD_BYTES: usize = 64 * 1024;
+        let temp = tempfile::tempdir().unwrap();
+        let journal = Arc::new(
+            Journal::open(
+                temp.path().join("writeback"),
+                JournalIdentity {
+                    format_version: 1,
+                    bucket_id: "bucket-a".to_owned(),
+                    backend_endpoint: "memory://remote".to_owned(),
+                    database_prefix: "zerofs/pilot".to_owned(),
+                    backend_kind: "memory".to_owned(),
+                    encryption_key_identity_sha256: [0x77; 32],
+                },
+            )
+            .unwrap(),
+        );
+        let payload = Bytes::from(vec![0x5a_u8; PAYLOAD_BYTES]);
+        let total_bytes = RECORDS * PAYLOAD_BYTES as u64;
+        let admission = Admission::new(total_bytes);
+        let journaler = LocalJournaler::start_with_observer(
+            journal.clone(),
+            admission.clone(),
+            RECORDS as usize,
+            4,
+            None,
+        )
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        for sequence in 1..=RECORDS {
+            let ram = admission
+                .reserve(PAYLOAD_BYTES as u64)
+                .await
+                .unwrap()
+                .accept();
+            journaler
+                .submit_put(put_record(sequence, &payload), payload.clone(), ram)
+                .await
+                .unwrap();
+        }
+        journaler.barrier().wait_local(RECORDS).await.unwrap();
+        let elapsed = started.elapsed();
+
+        println!(
+            "drained {RECORDS} records ({:.1} MiB) in {:.3}s = {:.1} MiB/s, {:.0} ops/s",
+            total_bytes as f64 / (1024.0 * 1024.0),
+            elapsed.as_secs_f64(),
+            total_bytes as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64(),
+            RECORDS as f64 / elapsed.as_secs_f64(),
+        );
         journaler.shutdown().await.unwrap();
     }
 

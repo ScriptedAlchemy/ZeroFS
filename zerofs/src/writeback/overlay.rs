@@ -1115,7 +1115,7 @@ mod tests {
     fn test_journal(root: &std::path::Path) -> Arc<Journal> {
         Arc::new(
             Journal::open(
-                root.to_path_buf(),
+                root,
                 JournalIdentity {
                     format_version: 1,
                     bucket_id: "bucket-a".to_owned(),

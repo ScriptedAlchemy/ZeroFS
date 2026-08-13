@@ -339,6 +339,7 @@ type RemoteCommit = BoxFuture<'static, (Sequence, anyhow::Result<()>)>;
 
 struct SchedulerWindow {
     local_seq: Sequence,
+    remote_seq: Sequence,
     records: Vec<MutationRecord>,
 }
 
@@ -734,11 +735,12 @@ fn load_scheduler_window(
     first_sequence: Sequence,
     upload_concurrency: usize,
 ) -> anyhow::Result<SchedulerWindow> {
-    let progress = journal.progress()?;
     let scan_limit = upload_concurrency.saturating_mul(8).max(upload_concurrency);
+    let pending = journal.pending_window(first_sequence, scan_limit)?;
     let window = SchedulerWindow {
-        local_seq: progress.local_seq,
-        records: journal.pending_from(first_sequence, scan_limit)?,
+        local_seq: pending.local_seq,
+        remote_seq: pending.remote_seq,
+        records: pending.records,
     };
     validate_scheduler_window(&window, first_sequence)?;
     Ok(window)
@@ -751,21 +753,44 @@ fn validate_scheduler_window(
     if window.local_seq < first_sequence {
         return Ok(());
     }
-    let mut expected = first_sequence;
+    // `commit_remote` advances the durable remote watermark and then prunes the
+    // records it covers, while the scheduler's own frontier only advances once
+    // `finish_ordered_commit` runs. Any read taken during that gap legitimately
+    // sees the frontier already pruned, so the lowest sequence the journal must
+    // still carry is the first one above the durable watermark. Everything from
+    // there stays strictly contiguous: a hole above the watermark is corruption.
+    let durable_frontier = window
+        .remote_seq
+        .saturating_add(1)
+        .max(first_sequence)
+        .min(window.local_seq.saturating_add(1));
+    let mut expected = None::<Sequence>;
     for record in &window.records {
-        if record.sequence != expected {
-            anyhow::bail!(
-                "durable writeback journal is missing remote frontier sequence {expected}; found sequence {}",
-                record.sequence
-            );
+        match expected {
+            Some(expected) if record.sequence != expected => {
+                anyhow::bail!(
+                    "durable writeback journal is missing remote frontier sequence {expected}; found sequence {}",
+                    record.sequence
+                );
+            }
+            None if record.sequence < first_sequence || record.sequence > durable_frontier => {
+                anyhow::bail!(
+                    "durable writeback journal is missing remote frontier sequence {first_sequence}; found sequence {}",
+                    record.sequence
+                );
+            }
+            _ => {}
         }
-        expected = expected
-            .checked_add(1)
-            .ok_or_else(|| anyhow::anyhow!("remote scheduler sequence overflow"))?;
+        expected = Some(
+            record
+                .sequence
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("remote scheduler sequence overflow"))?,
+        );
     }
-    if window.records.is_empty() {
+    if window.records.is_empty() && durable_frontier <= window.local_seq {
         anyhow::bail!(
-            "durable writeback journal is missing remote frontier sequence {first_sequence}"
+            "durable writeback journal is missing remote frontier sequence {durable_frontier}"
         );
     }
     Ok(())
@@ -1046,14 +1071,18 @@ fn missing_remote_predecessor(
 mod tests {
     use super::{
         CompletedRemote, SchedulerWindow, bounded_remote_operation, collect_pipeline_batch,
-        validate_scheduler_window, verify_existing,
+        load_scheduler_window, validate_scheduler_window, verify_existing,
     };
     use crate::fault_store::FaultStore;
-    use crate::writeback::model::{FenceClass, LocalEtag, MutationKind, MutationRecord};
+    use crate::writeback::journal::Journal;
+    use crate::writeback::model::{
+        FenceClass, JournalIdentity, LocalEtag, MutationKind, MutationMode, MutationRecord,
+    };
     use bytes::Bytes;
     use futures::future;
     use object_store::memory::InMemory;
     use object_store::{ObjectStore, ObjectStoreExt, PutPayload, PutResult, path::Path};
+    use sha2::{Digest, Sha256};
     use std::sync::Arc;
     use std::time::Duration;
     use uuid::Uuid;
@@ -1247,10 +1276,78 @@ mod tests {
         );
     }
 
+    fn put_record(sequence: u64, path: &str, payload: &[u8]) -> MutationRecord {
+        MutationRecord {
+            format_version: 1,
+            sequence,
+            operation_id: Uuid::from_u128(0x1000 + sequence as u128),
+            path: path.to_owned(),
+            kind: MutationKind::Put {
+                mode: MutationMode::Create,
+                expected_visible_version: None,
+                payload_len: payload.len() as u64,
+                payload_sha256: Sha256::digest(payload).into(),
+                blob_path: String::new(),
+            },
+            local_etag: LocalEtag::new(Uuid::nil(), sequence),
+            accepted_at_unix_ms: 1_786_435_200_000 + sequence,
+            remote_predecessor_etag: None,
+            remote_result_etag: None,
+            fence: FenceClass::ImmutableCreate,
+            retry_count: 0,
+            last_error: None,
+        }
+    }
+
+    fn journal_with_local_records(root: &std::path::Path, count: u64) -> Journal {
+        let journal = Journal::open(
+            root.join("writeback"),
+            JournalIdentity {
+                format_version: 1,
+                bucket_id: "bucket-a".to_owned(),
+                backend_endpoint: "memory://remote".to_owned(),
+                database_prefix: "zerofs/pilot".to_owned(),
+                backend_kind: "memory".to_owned(),
+                encryption_key_identity_sha256: [0x77; 32],
+            },
+        )
+        .unwrap();
+        for sequence in 1..=count {
+            journal
+                .commit_put(
+                    put_record(sequence, &format!("segments/{sequence}"), b"payload"),
+                    b"payload",
+                )
+                .unwrap();
+        }
+        journal
+    }
+
+    #[test]
+    fn scheduler_window_tolerates_the_frontier_its_own_commit_already_pruned() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = journal_with_local_records(temp.path(), 3);
+        // `commit_remote` advances the durable watermark and prunes the record
+        // it just uploaded. The scheduler's in-memory frontier only advances
+        // afterwards, in `finish_ordered_commit`, so every journal read taken
+        // while that commit is in flight still carries the pre-commit frontier.
+        journal.mark_remote(1, None).unwrap();
+        journal.remove_remote_prefix(1).unwrap();
+
+        let window = load_scheduler_window(&journal, 1, 4)
+            .expect("a commit that already pruned its own frontier is not journal corruption");
+
+        assert_eq!(
+            window.records.first().map(|record| record.sequence),
+            Some(2)
+        );
+    }
+
     #[test]
     fn scheduler_window_rejects_a_missing_durable_frontier() {
         let window = SchedulerWindow {
             local_seq: 3,
+            remote_seq: 0,
             records: vec![record(2, "segments/2", FenceClass::ImmutableCreate)],
         };
 
@@ -1258,6 +1355,51 @@ mod tests {
             .expect_err("a durable journal gap must fail closed instead of spinning");
 
         assert!(error.to_string().contains("sequence 1"));
+    }
+
+    #[test]
+    fn scheduler_window_rejects_a_durable_gap_above_the_remote_watermark() {
+        // Sequence 1 is legitimately pruned by its own in-flight commit, but the
+        // hole between 2 and 4 is not covered by any watermark: still corruption.
+        let window = SchedulerWindow {
+            local_seq: 4,
+            remote_seq: 1,
+            records: vec![
+                record(2, "segments/2", FenceClass::ImmutableCreate),
+                record(4, "segments/4", FenceClass::ImmutableCreate),
+            ],
+        };
+
+        let error = validate_scheduler_window(&window, 1)
+            .expect_err("a hole above the durable watermark must still fail closed");
+
+        assert!(error.to_string().contains("sequence 3"), "{error}");
+    }
+
+    #[test]
+    fn scheduler_window_rejects_an_empty_journal_below_the_remote_watermark() {
+        let window = SchedulerWindow {
+            local_seq: 4,
+            remote_seq: 1,
+            records: Vec::new(),
+        };
+
+        let error = validate_scheduler_window(&window, 1)
+            .expect_err("a vanished uncommitted backlog must fail closed");
+
+        assert!(error.to_string().contains("sequence 2"), "{error}");
+    }
+
+    #[test]
+    fn scheduler_window_accepts_a_fully_committed_journal() {
+        let window = SchedulerWindow {
+            local_seq: 4,
+            remote_seq: 4,
+            records: Vec::new(),
+        };
+
+        validate_scheduler_window(&window, 1)
+            .expect("a journal whose backlog is fully committed is not corrupt");
     }
 
     #[test]
