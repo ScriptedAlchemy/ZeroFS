@@ -1805,6 +1805,11 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(
             events,
             [
+                # File layout pass: the measured fio below must overwrite
+                # pre-sized files in place, or every extending O_DIRECT write
+                # pays an XFS journal flush (the full durability barrier).
+                "fio",
+                "syncfs",
                 "stable_drain",
                 "syncfs",
                 "snapshot:9:9:9",

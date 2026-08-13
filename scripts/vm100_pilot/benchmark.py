@@ -674,6 +674,24 @@ class BenchmarkRunner:
         phase_device: tuple[int, int],
         sampler: _MetricSampler,
     ) -> DirectWriteTiers:
+        # Lay the target files out at full size before the measured pass: an
+        # extending O_DIRECT write forces an XFS size-update journal commit
+        # per request -- and each journal commit issues a flush, ZeroFS's full
+        # durability barrier -- so an extending pass measures barrier latency
+        # (measured 30x slower), not the service ACK this tier is named for.
+        # Production block consumers (ZFS vdevs, VM images, databases)
+        # overwrite pre-sized files in place.
+        self._run_fio(
+            name="zerofs_nbd_odirect_write_layout",
+            run_root=run_root,
+            filename_format="odirect-write.$jobnum",
+            per_job_mib=per_job_mib,
+            jobs=jobs,
+            output=output.parent / f"layout-{output.name}",
+            read=False,
+            direct=True,
+        )
+        self.runner.run(["sync", "-f", self.config.mountpoint], sudo=True)
         self.lifecycle.drain()
         self.runner.run(["sync", "-f", self.config.mountpoint], sudo=True)
         before = self.lifecycle.metrics.snapshot()
