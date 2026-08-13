@@ -98,7 +98,7 @@ impl PendingInodes {
             owned.push((id, seq));
         }
         PendingInodeGuard {
-            pending: Arc::clone(self),
+            pending: Some(Arc::clone(self)),
             owned,
         }
     }
@@ -113,14 +113,16 @@ impl PendingInodes {
 /// reads back to the read cache, which the apply has already promoted.
 #[must_use = "hold the guard until the commit reply resolves"]
 pub(crate) struct PendingInodeGuard {
-    pending: Arc<PendingInodes>,
+    /// `None` for a transaction that mutates no inode, so the common
+    /// extent-only commit allocates nothing.
+    pending: Option<Arc<PendingInodes>>,
     owned: Vec<(InodeId, u64)>,
 }
 
 impl PendingInodeGuard {
     pub(crate) fn empty() -> Self {
         Self {
-            pending: Arc::new(PendingInodes::default()),
+            pending: None,
             owned: Vec::new(),
         }
     }
@@ -128,12 +130,13 @@ impl PendingInodeGuard {
 
 impl Drop for PendingInodeGuard {
     fn drop(&mut self) {
+        let Some(pending) = &self.pending else {
+            return;
+        };
         for (id, seq) in self.owned.drain(..) {
             // A later submitter that overwrote this slot owns it now; retiring
             // it here would resurrect a superseded value.
-            self.pending
-                .entries
-                .remove_if(&id, |_, entry| entry.seq == seq);
+            pending.entries.remove_if(&id, |_, entry| entry.seq == seq);
         }
     }
 }

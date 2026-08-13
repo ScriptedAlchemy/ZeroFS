@@ -1782,6 +1782,107 @@ mod tests {
         assert_eq!(tail, Bytes::from(vec![b'B'; CHUNK]));
     }
 
+    // Single-inode write latency, the shape the per-inode lock used to cap.
+    //
+    // Both arms write the same total bytes to one file at disjoint,
+    // extent-aligned offsets. The serial arm awaits each write, so it pays
+    // staging plus the full commit round trip every time and is unaffected by
+    // the locking structure. The pipelined arm keeps several writes in flight,
+    // which is only possible while the inode lock is not held across the
+    // commit -- when it is, the concurrent arm collapses onto the serial one.
+    // The gap between the two arms is the lock-hold portion of the latency.
+    //   cargo test --release --lib -- --ignored --nocapture bench_single_inode
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[ignore = "latency measurement, run explicitly in release"]
+    async fn bench_single_inode_write_latency() {
+        const CHUNK: usize = 256 * 1024;
+        const WRITES: usize = 128;
+        const IN_FLIGHT: usize = 8;
+
+        // `files == 1` puts every in-flight write on one inode and so through
+        // one lock; `files == IN_FLIGHT` is the identical workload with the
+        // per-inode lock removed from the picture. Task counts, wave shape and
+        // total bytes are the same in both, so the difference between them is
+        // the per-inode serialisation and nothing else.
+        async fn arm(files: usize, sync_writes: bool) -> (std::time::Duration, u64) {
+            let fs = Arc::new(
+                ZeroFS::new_in_memory_with_sync_writes(sync_writes)
+                    .await
+                    .unwrap(),
+            );
+            let auth: AuthContext = (&test_auth()).into();
+            let mut ids = Vec::with_capacity(files);
+            for index in 0..files {
+                let (id, _) = fs
+                    .create(
+                        &test_creds(),
+                        0,
+                        format!("bench{index}").as_bytes(),
+                        &SetAttributes::default(),
+                    )
+                    .await
+                    .unwrap();
+                ids.push(id);
+            }
+            let payload = Bytes::from(vec![b'Z'; CHUNK]);
+
+            let start = std::time::Instant::now();
+            let mut wave = Vec::with_capacity(IN_FLIGHT);
+            for index in 0..WRITES {
+                let file_id = ids[index % files];
+                // Disjoint, extent-aligned offsets within each file.
+                let at = (index / files * CHUNK) as u64;
+                let task_fs = Arc::clone(&fs);
+                let task_auth = auth.clone();
+                let task_payload = payload.clone();
+                wave.push(tokio::spawn(async move {
+                    task_fs
+                        .write(&task_auth, file_id, at, &task_payload)
+                        .await
+                        .unwrap();
+                }));
+                if wave.len() == IN_FLIGHT {
+                    for task in wave.drain(..) {
+                        task.await.unwrap();
+                    }
+                }
+            }
+            for task in wave {
+                task.await.unwrap();
+            }
+            let elapsed = start.elapsed();
+            let apply_nanos = fs.write_coordinator.apply_nanos();
+            (elapsed, apply_nanos)
+        }
+
+        let report = |label: &str, elapsed: std::time::Duration, apply_nanos: u64| {
+            let bytes = (WRITES * CHUNK) as f64;
+            println!(
+                "{label:>12}: {:>7.0} us/write, {:>7.1} MB/s, commit worker busy {:.0}%",
+                elapsed.as_micros() as f64 / WRITES as f64,
+                bytes / elapsed.as_secs_f64() / 1e6,
+                apply_nanos as f64 / elapsed.as_nanos() as f64 * 100.0,
+            );
+        };
+
+        // Buffered writes reply as soon as the batch is in the memtable, so the
+        // commit round trip is nearly free and staging dominates; durable
+        // writes make the reply wait for a flush, which is the shape the
+        // production config has and the one the inode lock used to hold
+        // across. Both are reported because only the second should move.
+        for (label, sync_writes) in [("buffered", false), ("durable", true)] {
+            let (one_inode, one_apply) = arm(1, sync_writes).await;
+            let (spread, spread_apply) = arm(IN_FLIGHT, sync_writes).await;
+            println!("{label}:");
+            report("one inode", one_inode, one_apply);
+            report("spread", spread, spread_apply);
+            println!(
+                "  one inode reaches {:.0}% of the unlocked rate at {IN_FLIGHT} in flight",
+                spread.as_secs_f64() / one_inode.as_secs_f64() * 100.0
+            );
+        }
+    }
+
     /// Overlapping writers must not pipeline: the second one rebuilds a
     /// partially overwritten extent and debits the frame it supersedes, and
     /// both reads only see state the commit worker publishes at apply.
