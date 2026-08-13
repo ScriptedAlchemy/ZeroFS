@@ -244,6 +244,34 @@ mod tests {
         waiter.await.unwrap();
     }
 
+    /// `lock_inode_settled` is what restores the exclusion the inode lock used
+    /// to imply. Compaction's CAS depends on it: it compares the stored
+    /// FrameLoc against the one it gathered, so a queued overwrite it cannot
+    /// see leaves the comparison equal and the swap reverts the extent to the
+    /// relocated copy of the superseded bytes.
+    #[tokio::test]
+    async fn a_settled_lock_does_not_return_while_a_write_is_queued() {
+        let (store, _db) = super::super::test_util::make().await;
+        let queued = store.register_inflight_write(7, 0, 3);
+
+        let settling = tokio::spawn({
+            let store = store.clone();
+            async move {
+                let _guard = store.lock_inode_settled(7).await;
+            }
+        });
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !settling.is_finished(),
+            "the lock settled while a write was still queued"
+        );
+
+        drop(queued);
+        settling.await.unwrap();
+    }
+
     #[tokio::test]
     async fn a_guard_retires_only_its_own_registration() {
         let registry = Arc::new(InflightExtentWrites::default());

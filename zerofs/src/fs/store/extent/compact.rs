@@ -395,7 +395,10 @@ impl ExtentStore {
                 fail_point!(fp::COMPACT_BETWEEN_REPOINTS);
                 fp::widen(fp::COMPACT_BETWEEN_REPOINTS).await;
             }
-            let _guard = self.lock_manager.acquire(inode).await;
+            // Drains queued writes too: the CAS below reads the stored
+            // FrameLoc from the database, which a submitted-but-unapplied
+            // overwrite has not reached yet.
+            let _guard = self.lock_inode_settled(inode).await;
             let mut txn = self.db.new_transaction()?;
             txn.hold_extent_ref_guard(Arc::clone(&extent_ref_guard));
             let mut any = false;

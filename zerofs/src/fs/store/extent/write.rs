@@ -379,6 +379,26 @@ impl ExtentStore {
         self.inflight_writes.wait_for_overlap(id, start, end).await
     }
 
+    /// Take `inode`'s write lock and drain every queued write on it.
+    ///
+    /// The lock alone used to mean "no unapplied write exists for this inode",
+    /// because the write path held it across its commit. It no longer does, so
+    /// a path that reads this inode's extent state out of the database -- and
+    /// therefore cannot see a queued write -- must drain it explicitly. The
+    /// compaction CAS is the case that makes this mandatory rather than
+    /// merely tidy: it compares the stored FrameLoc against the one it
+    /// gathered, and a queued overwrite leaves the stored value still equal,
+    /// so the swap wins a race it should have lost and reverts the extent to
+    /// the relocated copy of the superseded bytes.
+    pub(crate) async fn lock_inode_settled(
+        &self,
+        inode: InodeId,
+    ) -> crate::fs::lock_manager::KeyedLockGuard<InodeId> {
+        let guard = self.lock_manager.acquire(inode).await;
+        self.inflight_writes.wait_for_all(inode).await;
+        guard
+    }
+
     /// Apply a `write`'s tail-cache effect. Call only after its commit succeeds.
     pub fn apply_tail_update(&self, id: InodeId, update: TailUpdate) {
         match update {
@@ -1266,7 +1286,7 @@ impl ExtentStore {
         start_extent: u64,
         total_extents: u64,
     ) -> Result<(), FsError> {
-        let _guard = self.lock_manager.acquire(inode).await;
+        let _guard = self.lock_inode_settled(inode).await;
         let mut txn = self.db.new_transaction()?;
         self.delete_range(&mut txn, inode, start_extent, total_extents)
             .await?;
