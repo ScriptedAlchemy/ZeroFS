@@ -84,7 +84,19 @@ impl ZeroFS {
 
         let creds = Credentials::from_auth_context(auth);
 
-        let _guard = self.lock_manager.acquire(id).await;
+        // This lock is released at submit rather than at apply (see the commit
+        // block below), so a queued write may still own the extents this one
+        // is about to stage. Draining the overlap first also keeps the ledger
+        // re-check below meaningful: a retry of an in-flight write covers the
+        // same extents, so it waits here and then replays the original result
+        // instead of executing a second time under a fresh mtime.
+        let span = crate::fs::store::ExtentStore::extent_span(offset, data.len() as u64);
+        let guard = self.lock_manager.acquire(id).await;
+        if let Some((start_extent, end_extent)) = span {
+            self.extent_store
+                .wait_for_inflight_overlap(id, start_extent, end_extent)
+                .await;
+        }
         // Direct filesystem callers do not pass through the 9P single-flight,
         // so re-check after waiting for the inode lock.
         if let Some(result) = self.replay_dedup_result(&op_id, DedupResult::into_write)? {
@@ -213,12 +225,30 @@ impl ZeroFS {
                 txn.add_stats_delta(id, stats::size_delta(old_size, new_size), 0);
 
                 let db_write_start = std::time::Instant::now();
-                self.write_coordinator.commit(txn).await?;
+                // Claim this write's extents before the lock goes, so a writer
+                // that would read them waits for the apply even though the
+                // lock no longer makes it.
+                let queued_extents = span.map(|(start_extent, end_extent)| {
+                    self.extent_store
+                        .register_inflight_write(id, start_extent, end_extent)
+                });
+                // Submit under the lock, await outside it. `submit` fixes both
+                // the queue position and the inode the next writer will read,
+                // so the only thing this lock still protected -- the commit
+                // round trip -- is exactly what it stops holding. Successors
+                // now stage while this write is in flight instead of behind it.
+                let pending = self.write_coordinator.submit(txn)?;
+                drop(guard);
+                pending.wait().await?;
                 debug!("DB write took: {:?}", db_write_start.elapsed());
 
                 // Only after the commit is durable: a cache ahead of the store
-                // would splice later writes onto bytes that never landed.
+                // would splice later writes onto bytes that never landed. The
+                // extent claim outlives it, so an overlapping successor cannot
+                // resume between the apply and this publication and read the
+                // superseded tail.
                 self.extent_store.apply_tail_update(id, tail_update);
+                drop(queued_extents);
 
                 #[cfg(feature = "failpoints")]
                 fail_point!(fp::WRITE_AFTER_COMMIT);
@@ -1601,5 +1631,214 @@ mod tests {
         let mut want = vec![b'A'; 1000];
         want[500..600].fill(b'C');
         assert_eq!(head2, want);
+    }
+
+    async fn file_size(fs: &ZeroFS, id: crate::fs::inode::InodeId) -> u64 {
+        match fs.inode_store.get(id).await.unwrap() {
+            Inode::File(file) => file.size,
+            _ => panic!("expected a file inode"),
+        }
+    }
+
+    /// The write path releases its inode lock at submit, so the size a writer
+    /// reads comes from the queued value rather than from the read cache. A
+    /// commit that fails before its apply must retract that value and leave
+    /// the last committed size standing: a successor that read the retracted
+    /// one would compute `max(phantom, its own end)` and drop a real write.
+    #[tokio::test]
+    async fn a_failed_commit_between_two_writes_cannot_shrink_the_file() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let auth: AuthContext = (&test_auth()).into();
+        let (file_id, _) = fs
+            .create(&test_creds(), 0, b"pipelined", &SetAttributes::default())
+            .await
+            .unwrap();
+
+        let first = Bytes::from(vec![b'A'; 64 * 1024]);
+        fs.write(&auth, file_id, 0, &first).await.unwrap();
+        assert_eq!(file_size(&fs, file_id).await, 64 * 1024);
+
+        // Inject a pre-apply failure that also carries an inode mutation for
+        // this file, exactly as a failing write would: an unreadable segment
+        // counter aborts the batch in stage_seg_deltas, before any apply.
+        let codec = crate::fs::key_codec::KeyCodec::new();
+        let poisoned = codec.segcount_key(9, 9);
+        fs.db
+            .put_with_options(
+                &poisoned,
+                b"bogus",
+                &slatedb::config::PutOptions::default(),
+                &slatedb::config::WriteOptions::default(),
+            )
+            .await
+            .unwrap();
+        let mut doomed = fs.db.new_transaction().unwrap();
+        let mut phantom = match fs.inode_store.get(file_id).await.unwrap() {
+            Inode::File(file) => file,
+            _ => panic!("expected a file inode"),
+        };
+        phantom.size = 99;
+        fs.inode_store
+            .save(&mut doomed, file_id, &Inode::File(phantom))
+            .unwrap();
+        doomed.add_seg_delta(&poisoned, 1, 1);
+        fs.write_coordinator.commit(doomed).await.unwrap_err();
+
+        assert_eq!(
+            file_size(&fs, file_id).await,
+            64 * 1024,
+            "a batch that failed before its apply must not leave its inode visible"
+        );
+
+        // A later write below the old EOF must extend nothing and shrink
+        // nothing; it would report 4096 if it had read the retracted size.
+        let second = Bytes::from(vec![b'B'; 4096]);
+        let attrs = fs.write(&auth, file_id, 0, &second).await.unwrap();
+        assert_eq!(
+            attrs.size,
+            64 * 1024,
+            "the write after the failed commit lost the committed size"
+        );
+        assert_eq!(file_size(&fs, file_id).await, 64 * 1024);
+
+        let (head, _) = fs.read_file(&auth, file_id, 0, 4096).await.unwrap();
+        assert_eq!(head, second);
+        let (tail, _) = fs.read_file(&auth, file_id, 60 * 1024, 1024).await.unwrap();
+        assert_eq!(tail, first.slice(0..1024));
+    }
+
+    /// The point of releasing the lock at submit: a second write to the same
+    /// inode stages and queues while the first write is still awaiting its
+    /// commit. Held under the old structure, the first write's lock would keep
+    /// the second one from even reading the inode until the apply finished.
+    #[tokio::test]
+    async fn a_second_write_queues_while_the_first_is_still_committing() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let auth: AuthContext = (&test_auth()).into();
+        let (file_id, _) = fs
+            .create(&test_creds(), 0, b"striped", &SetAttributes::default())
+            .await
+            .unwrap();
+
+        const CHUNK: usize = 256 * 1024;
+        // Stall the first write inside its apply, at the write permit.
+        let stalled_apply = fs.db.flush_barrier().write_owned().await;
+        let apply_reached = fs.write_coordinator.probe_next_apply();
+
+        let first_fs = Arc::clone(&fs);
+        let first_auth = auth.clone();
+        let first = tokio::spawn(async move {
+            first_fs
+                .write(&first_auth, file_id, 0, &Bytes::from(vec![b'A'; CHUNK]))
+                .await
+        });
+        apply_reached.await.unwrap();
+
+        // The first write is submitted and its apply is blocked. Its inode
+        // lock is already gone, so a disjoint second write must be able to run
+        // its whole staging path and queue behind it.
+        let second_fs = Arc::clone(&fs);
+        let second_auth = auth.clone();
+        let second = tokio::spawn(async move {
+            second_fs
+                .write(
+                    &second_auth,
+                    file_id,
+                    CHUNK as u64,
+                    &Bytes::from(vec![b'B'; CHUNK]),
+                )
+                .await
+        });
+
+        // Queueing publishes the second write's inode, which is the observable
+        // proof that it got past the lock, read the first write's size, staged
+        // its extents and submitted -- all while the first commit is in flight.
+        let queued = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if let Some(Some(Inode::File(file))) = fs.inode_store.pending_inode(file_id)
+                    && file.size == 2 * CHUNK as u64
+                {
+                    return file.size;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the second write never queued while the first was committing");
+        assert_eq!(queued, 2 * CHUNK as u64);
+
+        drop(stalled_apply);
+        first.await.unwrap().unwrap();
+        let second_attrs = second.await.unwrap().unwrap();
+
+        assert_eq!(second_attrs.size, 2 * CHUNK as u64);
+        assert_eq!(file_size(&fs, file_id).await, 2 * CHUNK as u64);
+        let (head, _) = fs.read_file(&auth, file_id, 0, CHUNK as u32).await.unwrap();
+        assert_eq!(head, Bytes::from(vec![b'A'; CHUNK]));
+        let (tail, _) = fs
+            .read_file(&auth, file_id, CHUNK as u64, CHUNK as u32)
+            .await
+            .unwrap();
+        assert_eq!(tail, Bytes::from(vec![b'B'; CHUNK]));
+    }
+
+    /// Overlapping writers must not pipeline: the second one rebuilds a
+    /// partially overwritten extent and debits the frame it supersedes, and
+    /// both reads only see state the commit worker publishes at apply.
+    #[tokio::test]
+    async fn an_overlapping_second_write_waits_for_the_first_to_apply() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let auth: AuthContext = (&test_auth()).into();
+        let (file_id, _) = fs
+            .create(&test_creds(), 0, b"overlapping", &SetAttributes::default())
+            .await
+            .unwrap();
+
+        let stalled_apply = fs.db.flush_barrier().write_owned().await;
+        let apply_reached = fs.write_coordinator.probe_next_apply();
+
+        let first_fs = Arc::clone(&fs);
+        let first_auth = auth.clone();
+        let first = tokio::spawn(async move {
+            first_fs
+                .write(&first_auth, file_id, 0, &Bytes::from(vec![b'A'; 8192]))
+                .await
+        });
+        apply_reached.await.unwrap();
+
+        // Starts inside the first write's extent, so it must block until that
+        // write has applied and can be spliced onto.
+        let second_fs = Arc::clone(&fs);
+        let second_auth = auth.clone();
+        let second = tokio::spawn(async move {
+            second_fs
+                .write(&second_auth, file_id, 4096, &Bytes::from(vec![b'B'; 8192]))
+                .await
+        });
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        // Queueing is what a pipelined write would have reached; the second
+        // write grows the file, so its size is distinguishable from the first
+        // write's. Seeing it here would mean it staged against unapplied state.
+        assert_eq!(
+            fs.inode_store
+                .pending_inode(file_id)
+                .and_then(|inode| match inode {
+                    Some(Inode::File(file)) => Some(file.size),
+                    _ => None,
+                }),
+            Some(8192),
+            "an overlapping write must not stage against an unapplied write"
+        );
+
+        drop(stalled_apply);
+        first.await.unwrap().unwrap();
+        second.await.unwrap().unwrap();
+
+        let (data, _) = fs.read_file(&auth, file_id, 0, 12288).await.unwrap();
+        let mut want = vec![b'B'; 12288];
+        want[..4096].fill(b'A');
+        assert_eq!(data, want, "the overlapping write lost the first write");
     }
 }

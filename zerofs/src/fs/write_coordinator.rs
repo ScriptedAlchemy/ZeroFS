@@ -183,18 +183,30 @@ impl WriteCoordinator {
     }
 
     pub async fn commit(&self, txn: Transaction) -> Result<(), FsError> {
-        // Queue this transaction's inode mutations before it enters the queue,
-        // and retire them only once the reply resolves. On success the apply
-        // has already promoted the same values into the read cache; on a
-        // pre-apply failure the cache still holds the last committed value. A
-        // caller may therefore drop its per-inode lock the moment `commit` is
-        // entered without ever exposing a stale inode.
-        let _queued = self.inode_store.install_pending(txn.inode_cache_updates());
+        self.submit(txn)?.wait().await
+    }
+
+    /// Queue `txn` without waiting for it to apply.
+    ///
+    /// Everything order-sensitive happens here, synchronously: the
+    /// transaction's inode mutations are published to the overlay and the
+    /// request takes its place in the queue. A caller holding a per-inode lock
+    /// may therefore drop that lock as soon as this returns and await the
+    /// reply outside it -- apply order for the inode still equals lock order,
+    /// and no reader can observe the pre-write inode in between.
+    ///
+    /// Awaiting `commit` after releasing the lock would give neither
+    /// guarantee: two writers could reach the send in either order.
+    pub(crate) fn submit(&self, txn: Transaction) -> Result<PendingCommit, FsError> {
+        let queued = self.inode_store.install_pending(txn.inode_cache_updates());
         let (reply_tx, reply_rx) = oneshot::channel();
         self.sender
             .send(Request::Commit(txn, reply_tx))
             .map_err(|_| FsError::IoError)?;
-        reply_rx.await.map_err(|_| FsError::IoError)?
+        Ok(PendingCommit {
+            reply: reply_rx,
+            queued,
+        })
     }
 
     /// Wait until every commit submitted before this call has finished,
@@ -256,6 +268,27 @@ impl WriteCoordinator {
             sender: self.sender.downgrade(),
             inode_store: self.inode_store.clone(),
         }
+    }
+}
+
+/// A queued commit awaiting its apply. Holding it keeps the transaction's
+/// inode mutations published, so dropping it without awaiting hands reads back
+/// to the read cache before the apply has promoted anything.
+#[must_use = "a queued commit must be awaited"]
+pub(crate) struct PendingCommit {
+    reply: oneshot::Receiver<Result<(), FsError>>,
+    /// Read only by its own drop: retiring it hands reads back to the cache.
+    #[allow(dead_code)]
+    queued: crate::fs::store::inode::PendingInodeGuard,
+}
+
+impl PendingCommit {
+    pub(crate) async fn wait(self) -> Result<(), FsError> {
+        let result = self.reply.await.map_err(|_| FsError::IoError)?;
+        // `self.queued` drops here: on success the apply has already promoted
+        // these values into the read cache, and on a pre-apply failure the
+        // cache still holds the last committed value.
+        result
     }
 }
 
