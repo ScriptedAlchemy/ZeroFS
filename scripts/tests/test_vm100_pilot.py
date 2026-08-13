@@ -1660,6 +1660,7 @@ class BenchmarkTests(unittest.TestCase):
     def test_odirect_write_captures_accepted_local_and_remote_barriers(self) -> None:
         events: list[str] = []
         before = replace(self.snapshot, accepted=9, local=9, remote=9)
+        still_open = before
         accepted = replace(
             before,
             accepted=10,
@@ -1683,7 +1684,7 @@ class BenchmarkTests(unittest.TestCase):
 
         class SequenceMetrics:
             def __init__(self) -> None:
-                self.snapshots = iter((before, accepted, local))
+                self.snapshots = iter((before, still_open, local))
 
             def snapshot(self) -> WritebackSnapshot:
                 snapshot = next(self.snapshots)
@@ -1808,8 +1809,8 @@ class BenchmarkTests(unittest.TestCase):
                 "syncfs",
                 "snapshot:9:9:9",
                 "fio",
-                "snapshot:10:9:9",
                 "syncfs",
+                "snapshot:9:9:9",
                 "snapshot:10:10:9",
                 "sampled_remote:10:1",
                 "stable_drain",

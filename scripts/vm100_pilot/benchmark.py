@@ -695,18 +695,16 @@ class BenchmarkRunner:
         )
         write_end_ns = time.monotonic_ns()
         write_io_after = self._system_io(phase_device)
-        accepted = self.lifecycle.metrics.snapshot()
-        if accepted.terminal:
-            raise RuntimeError("writeback reported a terminal error")
-        if accepted.accepted <= before.accepted:
-            raise RuntimeError(
-                "ZeroFS NBD O_DIRECT write returned before advancing the "
-                "accepted sequence"
-            )
         local_sync_start_ns = time.monotonic_ns()
         self.runner.run(["sync", "-f", self.config.mountpoint], sudo=True)
         local_end_ns = time.monotonic_ns()
-        local = self.lifecycle.metrics.snapshot()
+        accepted = wait_for_accepted_after(
+            self.lifecycle.metrics.snapshot,
+            previous_sequence=before.accepted,
+            timeout=self.config.drain_timeout,
+            stable_samples=1,
+        )
+        local = accepted
         if local.terminal:
             raise RuntimeError("writeback reported a terminal error")
         if local.local < accepted.accepted:
