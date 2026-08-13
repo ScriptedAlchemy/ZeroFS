@@ -2166,43 +2166,25 @@ mod tests {
     }
 
     fn put_record(sequence: u64, path: &str, payload: &[u8]) -> MutationRecord {
-        MutationRecord {
-            format_version: 1,
+        crate::writeback::test_util::put_record(
             sequence,
-            operation_id: Uuid::from_u128(0x1000 + sequence as u128),
-            path: path.to_owned(),
-            kind: MutationKind::Put {
-                mode: MutationMode::Create,
-                expected_visible_version: None,
-                payload_len: payload.len() as u64,
-                payload_sha256: Sha256::digest(payload).into(),
-                blob_path: String::new(),
-            },
-            local_etag: LocalEtag::new(Uuid::nil(), sequence),
-            accepted_at_unix_ms: 1_786_435_200_000 + sequence,
-            remote_predecessor_etag: None,
-            remote_result_etag: None,
-            fence: FenceClass::ImmutableCreate,
-            retry_count: 0,
-            last_error: None,
-        }
+            path,
+            payload,
+            MutationMode::Create,
+            FenceClass::ImmutableCreate,
+            0x1000,
+            1_786_435_200_000,
+        )
     }
 
     fn delete_record(sequence: u64, path: &str) -> MutationRecord {
-        MutationRecord {
-            format_version: 1,
+        crate::writeback::test_util::delete_record(
             sequence,
-            operation_id: Uuid::from_u128(0x2000 + sequence as u128),
-            path: path.to_owned(),
-            kind: MutationKind::Delete,
-            local_etag: LocalEtag::new(Uuid::nil(), sequence),
-            accepted_at_unix_ms: 1_786_435_200_000 + sequence,
-            remote_predecessor_etag: None,
-            remote_result_etag: None,
-            fence: FenceClass::Fence,
-            retry_count: 0,
-            last_error: None,
-        }
+            path,
+            FenceClass::Fence,
+            0x2000,
+            1_786_435_200_000,
+        )
     }
 
     fn open_temp_journal(temp: &TempDir, bucket: &str) -> Journal {

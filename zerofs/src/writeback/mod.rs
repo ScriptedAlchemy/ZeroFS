@@ -8,6 +8,8 @@ pub mod overlay;
 mod payload;
 pub mod remote;
 pub mod store;
+#[cfg(test)]
+mod test_util;
 
 #[cfg(unix)]
 pub(crate) fn validate_owner_only(

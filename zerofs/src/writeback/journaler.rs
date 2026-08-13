@@ -737,9 +737,7 @@ mod tests {
     use crate::fault_store::FaultStore;
     use crate::writeback::admission::{Admission, AdmissionError, DiskAdmission};
     use crate::writeback::journal::Journal;
-    use crate::writeback::model::{
-        FenceClass, JournalIdentity, LocalEtag, MutationKind, MutationMode, MutationRecord,
-    };
+    use crate::writeback::model::{FenceClass, JournalIdentity, MutationMode, MutationRecord};
     use crate::writeback::overlay::{OverlayCommitObserver, OverlayIndex};
     use crate::writeback::payload::VerifiedPayload;
     use crate::writeback::remote::RemoteScheduler;
@@ -748,14 +746,12 @@ mod tests {
     use object_store::ObjectStoreExt;
     use object_store::memory::InMemory;
     use object_store::path::Path;
-    use sha2::{Digest, Sha256};
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex, mpsc};
     use std::time::Duration;
     use tokio::sync::Notify;
     use tokio::sync::mpsc as tokio_mpsc;
-    use uuid::Uuid;
 
     struct BlockingSink {
         entered: tokio_mpsc::UnboundedSender<u64>,
@@ -1074,26 +1070,15 @@ mod tests {
     }
 
     fn put_record(sequence: u64, payload: &[u8]) -> MutationRecord {
-        MutationRecord {
-            format_version: 1,
+        crate::writeback::test_util::put_record(
             sequence,
-            operation_id: Uuid::from_u128(0x3000 + sequence as u128),
-            path: format!("segments/{sequence}"),
-            kind: MutationKind::Put {
-                mode: MutationMode::Create,
-                expected_visible_version: None,
-                payload_len: payload.len() as u64,
-                payload_sha256: Sha256::digest(payload).into(),
-                blob_path: String::new(),
-            },
-            local_etag: LocalEtag::new(Uuid::nil(), sequence),
-            accepted_at_unix_ms: sequence,
-            remote_predecessor_etag: None,
-            remote_result_etag: None,
-            fence: FenceClass::ImmutableCreate,
-            retry_count: 0,
-            last_error: None,
-        }
+            &format!("segments/{sequence}"),
+            payload,
+            MutationMode::Create,
+            FenceClass::ImmutableCreate,
+            0x3000,
+            0,
+        )
     }
 
     fn blocking_journaler(

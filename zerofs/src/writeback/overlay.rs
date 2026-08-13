@@ -631,7 +631,7 @@ mod tests {
     use super::{OverlayIndex, VisibleVersion};
     use crate::writeback::journal::Journal;
     use crate::writeback::model::{
-        FenceClass, JournalIdentity, LocalEtag, MutationKind, MutationMode, MutationRecord,
+        FenceClass, JournalIdentity, MutationKind, MutationMode, MutationRecord,
     };
     use async_trait::async_trait;
     use bytes::Bytes;
@@ -642,12 +642,10 @@ mod tests {
         CopyOptions, GetOptions, GetRange, GetResult, ListResult, MultipartUpload, ObjectMeta,
         ObjectStore, ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult,
     };
-    use sha2::{Digest, Sha256};
     use std::collections::BTreeMap;
     use std::fmt::{self, Display, Formatter};
     use std::sync::Arc;
     use tokio::sync::Notify;
-    use uuid::Uuid;
 
     #[derive(Debug)]
     struct PausedListStore {
@@ -749,26 +747,15 @@ mod tests {
     }
 
     fn put_record(sequence: u64, path: &str, payload: &[u8]) -> MutationRecord {
-        MutationRecord {
-            format_version: 1,
+        crate::writeback::test_util::put_record(
             sequence,
-            operation_id: Uuid::from_u128(0x4000 + sequence as u128),
-            path: path.to_owned(),
-            kind: MutationKind::Put {
-                mode: MutationMode::Overwrite,
-                expected_visible_version: None,
-                payload_len: payload.len() as u64,
-                payload_sha256: Sha256::digest(payload).into(),
-                blob_path: String::new(),
-            },
-            local_etag: LocalEtag::new(Uuid::nil(), sequence),
-            accepted_at_unix_ms: 1_786_435_200_000 + sequence,
-            remote_predecessor_etag: None,
-            remote_result_etag: None,
-            fence: FenceClass::Fence,
-            retry_count: 0,
-            last_error: None,
-        }
+            path,
+            payload,
+            MutationMode::Overwrite,
+            FenceClass::Fence,
+            0x4000,
+            1_786_435_200_000,
+        )
     }
 
     fn delete_record(sequence: u64, path: &str) -> MutationRecord {
