@@ -19,6 +19,7 @@ from scripts.vm100_pilot.benchmark import BenchmarkRunner  # noqa: E402
 from scripts.vm100_pilot.config import PilotConfig  # noqa: E402
 from scripts.vm100_pilot.lifecycle import PilotLifecycle  # noqa: E402
 from scripts.vm100_pilot.migration import StripedMigrator  # noqa: E402
+from scripts.vm100_pilot.performance_matrix import PerformanceMatrixRunner  # noqa: E402
 from scripts.vm100_pilot.profile import ProfileRunner  # noqa: E402
 from scripts.vm100_pilot.raw_sftp import RawSftpRunner  # noqa: E402
 from scripts.vm100_pilot.reset import FreshResetter  # noqa: E402
@@ -84,6 +85,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     raw.add_argument("--jobs", type=_positive)
     raw.add_argument("--per-job-mib", type=_positive)
+    matrix = subcommands.add_parser(
+        "performance-matrix",
+        help="run an isolated direct-I/O NBD block-size and concurrency matrix",
+    )
+    matrix.add_argument(
+        "--quick",
+        action="store_true",
+        help="run three representative 32 MiB cells instead of the full matrix",
+    )
+    matrix.add_argument(
+        "--total-mib",
+        type=_positive,
+        help="logical MiB written by each cell (default: full 256, quick 32)",
+    )
     iterate = subcommands.add_parser(
         "iterate", help="deploy, benchmark, run workloads, and run raw SFTP"
     )
@@ -143,6 +158,7 @@ def dispatch(args: argparse.Namespace, config: PilotConfig, runner: Runner) -> N
     benchmark = BenchmarkRunner(config, runner, lifecycle)
     workloads = WorkloadRunner(config, runner, lifecycle)
     raw = RawSftpRunner(config, runner, lifecycle)
+    matrix = PerformanceMatrixRunner(config, runner, lifecycle)
     profile = ProfileRunner(config, runner, lifecycle, benchmark)
     migration = StripedMigrator(config, runner, lifecycle)
     resetter = FreshResetter(config, runner, lifecycle)
@@ -189,6 +205,11 @@ def dispatch(args: argparse.Namespace, config: PilotConfig, runner: Runner) -> N
         _emit(workloads.run(delete_jobs=args.delete_jobs))
     elif args.command == "raw-sftp":
         _emit(raw.run(jobs=args.jobs, per_job_mib=args.per_job_mib))
+    elif args.command == "performance-matrix":
+        total_mib = args.total_mib
+        if total_mib is None:
+            total_mib = 32 if args.quick else 256
+        _emit(matrix.run(total_mib=total_mib, quick=args.quick))
     elif args.command == "iterate":
         if args.skip_build:
             deployed = None
