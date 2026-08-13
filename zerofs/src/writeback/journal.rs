@@ -168,6 +168,8 @@ pub struct Journal {
     #[cfg(test)]
     snapshot_calls: AtomicU64,
     #[cfg(test)]
+    remote_watermark_commits: AtomicU64,
+    #[cfg(test)]
     remote_mark_pause: Mutex<Option<std::sync::Arc<RemoteMarkPauseInner>>>,
 }
 
@@ -485,6 +487,8 @@ impl Journal {
             #[cfg(test)]
             snapshot_calls: AtomicU64::new(0),
             #[cfg(test)]
+            remote_watermark_commits: AtomicU64::new(0),
+            #[cfg(test)]
             remote_mark_pause: Mutex::new(None),
         };
         journal.recover_local_artifacts()?;
@@ -580,6 +584,14 @@ impl Journal {
     #[cfg(test)]
     pub(crate) fn snapshot_calls(&self) -> u64 {
         self.snapshot_calls.load(Ordering::Relaxed)
+    }
+
+    /// How many durable remote-watermark transactions this journal has
+    /// committed, batched or not. Lets tests assert that a run of held
+    /// completions drains through one transaction instead of one per record.
+    #[cfg(test)]
+    pub(crate) fn remote_watermark_commit_count(&self) -> u64 {
+        self.remote_watermark_commits.load(Ordering::Relaxed)
     }
 
     #[cfg(test)]
@@ -1233,13 +1245,28 @@ impl Journal {
     }
 
     pub fn mark_remote(&self, sequence: Sequence, result_etag: Option<String>) -> Result<()> {
-        MutationRecord::validate_persisted_version_field(
-            "remote result ETag",
-            result_etag.as_deref(),
-        )?;
+        self.mark_remote_batch(&[(sequence, result_etag)])
+    }
+
+    /// Publish a contiguous run of remote completions through one durable
+    /// transaction. The remote watermark advances to the run's tail and every
+    /// member keeps its own result ETag — identical journal state to marking
+    /// each sequence alone, at one fsync'd commit for the whole run instead of
+    /// one per record (the fixed transaction cost otherwise becomes the remote
+    /// replay throughput ceiling).
+    pub fn mark_remote_batch(&self, completions: &[(Sequence, Option<String>)]) -> Result<()> {
+        if completions.is_empty() {
+            bail!("remote watermark batch must not be empty");
+        }
+        for (_, result_etag) in completions {
+            MutationRecord::validate_persisted_version_field(
+                "remote result ETag",
+                result_etag.as_deref(),
+            )?;
+        }
         let _write = self.write_gate.lock();
         #[cfg(test)]
-        self.wait_if_remote_mark_paused(sequence);
+        self.wait_if_remote_mark_paused(completions[0].0);
         let mut transaction = self
             .database
             .begin_write()
@@ -1253,47 +1280,56 @@ impl Journal {
                 .context("failed to open journal metadata")?;
             let remote_seq = read_required::<u64>(&meta, REMOTE_SEQ_KEY)?;
             let local_seq = read_required::<u64>(&meta, LOCAL_SEQ_KEY)?;
-            let expected = remote_seq
-                .checked_add(1)
-                .context("remote sequence overflow")?;
-            if sequence != expected || sequence > local_seq {
-                bail!(
-                    "remote sequence must advance contiguously from {remote_seq} to {expected}, got {sequence}"
-                );
-            }
             let mut mutations = transaction
                 .open_table(MUTATIONS)
                 .context("failed to open journal mutations")?;
-            let encoded = mutations
-                .get(sequence)
-                .context("failed to read remote mutation")?
-                .map(|value| value.value().to_vec())
-                .with_context(|| format!("journal mutation {sequence} does not exist"))?;
-            let mut record: MutationRecord =
-                bincode::deserialize(&encoded).context("failed to decode remote mutation")?;
-            let completed_bytes = record.payload().map_or(0, |(payload_len, _)| payload_len);
-            let total_completed = read_optional::<u64>(&meta, REMOTE_BYTES_COMPLETED_KEY)?
-                .unwrap_or_default()
-                .checked_add(completed_bytes)
-                .context("remote completed byte counter overflow")?;
-            record.remote_result_etag = result_etag;
-            let encoded =
-                bincode::serialize(&record).context("failed to encode remote mutation")?;
-            mutations
-                .insert(sequence, encoded.as_slice())
-                .context("failed to store remote result")?;
-            drop(mutations);
             let mut versions = transaction
                 .open_table(REMOTE_OBJECT_VERSIONS)
                 .context("failed to open remote object versions")?;
-            apply_remote_object_version(&mut versions, &record)?;
+            let mut total_completed =
+                read_optional::<u64>(&meta, REMOTE_BYTES_COMPLETED_KEY)?.unwrap_or_default();
+            let mut expected = remote_seq;
+            for (sequence, result_etag) in completions {
+                let sequence = *sequence;
+                expected = expected
+                    .checked_add(1)
+                    .context("remote sequence overflow")?;
+                if sequence != expected || sequence > local_seq {
+                    bail!(
+                        "remote sequence must advance contiguously from {remote_seq} to {expected}, got {sequence}"
+                    );
+                }
+                let encoded = mutations
+                    .get(sequence)
+                    .context("failed to read remote mutation")?
+                    .map(|value| value.value().to_vec())
+                    .with_context(|| format!("journal mutation {sequence} does not exist"))?;
+                let mut record: MutationRecord =
+                    bincode::deserialize(&encoded).context("failed to decode remote mutation")?;
+                let completed_bytes = record.payload().map_or(0, |(payload_len, _)| payload_len);
+                total_completed = total_completed
+                    .checked_add(completed_bytes)
+                    .context("remote completed byte counter overflow")?;
+                record.remote_result_etag = result_etag.clone();
+                let encoded =
+                    bincode::serialize(&record).context("failed to encode remote mutation")?;
+                mutations
+                    .insert(sequence, encoded.as_slice())
+                    .context("failed to store remote result")?;
+                apply_remote_object_version(&mut versions, &record)?;
+            }
+            drop(mutations);
             drop(versions);
-            write_value(&mut meta, REMOTE_SEQ_KEY, &sequence)?;
+            write_value(&mut meta, REMOTE_SEQ_KEY, &expected)?;
             write_value(&mut meta, REMOTE_BYTES_COMPLETED_KEY, &total_completed)?;
         }
         transaction
             .commit()
-            .context("failed to commit remote watermark")
+            .context("failed to commit remote watermark")?;
+        #[cfg(test)]
+        self.remote_watermark_commits
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
 
     pub(crate) fn remote_object_etag(
@@ -3212,6 +3248,51 @@ mod tests {
         }
     }
 
+    /// The serial cost of one remote watermark commit cycle: an fsync'd
+    /// `mark_remote` transaction plus an fsync'd `remove_remote_prefix`
+    /// cleanup. When the scheduler paid this once per record, the implied
+    /// MiB/s column was the hard replay throughput ceiling at each payload
+    /// size, independent of how fast the SFTP link is; batched watermark
+    /// commits now amortize it across every held completion in a run, but
+    /// this stays the floor a single-record cadence degrades to. Run with
+    /// `cargo test --release --lib remote_commit_serialization -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "throughput benchmark; needs a real disk and --release"]
+    fn remote_commit_serialization_cost_bounds_replay_throughput() {
+        const RECORDS: u64 = 256;
+        for payload_kib in [64_usize, 256, 1024] {
+            let temp = match std::env::var("ZEROFS_BENCH_DIR") {
+                Ok(dir) => tempfile::tempdir_in(dir).unwrap(),
+                Err(_) => tempfile::tempdir().unwrap(),
+            };
+            let journal = open_temp_journal(&temp, "bucket-a");
+            let payload = vec![0x5a_u8; payload_kib * 1024];
+            for sequence in 1..=RECORDS {
+                journal
+                    .commit_put(
+                        put_record(sequence, &format!("segments/{sequence}"), &payload),
+                        &payload,
+                    )
+                    .unwrap();
+            }
+
+            let started = Instant::now();
+            for sequence in 1..=RECORDS {
+                journal.mark_remote(sequence, None).unwrap();
+                journal.remove_remote_prefix(sequence).unwrap();
+            }
+            let elapsed = started.elapsed();
+            let per_record_ms = elapsed.as_secs_f64() * 1000.0 / RECORDS as f64;
+            let implied_mibps =
+                RECORDS as f64 * (payload_kib as f64 / 1024.0) / elapsed.as_secs_f64();
+            println!(
+                "serial remote commit: payload={payload_kib:>4} KiB {per_record_ms:.3} ms/record \
+                 -> replay ceiling {implied_mibps:>7.1} MiB/s ({RECORDS} records in {:.3}s)",
+                elapsed.as_secs_f64(),
+            );
+        }
+    }
+
     #[test]
     fn prepared_batch_fsyncs_each_unique_blob_directory_once() {
         let temp = tempfile::tempdir().unwrap();
@@ -3462,6 +3543,123 @@ mod tests {
         assert_eq!(snapshot.remote_seq, 2);
         assert!(snapshot.records.is_empty());
         assert!(!blob_file(&journal, &first).exists());
+    }
+
+    /// A contiguous run of remote completions commits through one durable
+    /// transaction: the watermark jumps to the run's tail while every member
+    /// keeps its own result ETag, exactly as if each had been marked alone.
+    #[test]
+    fn remote_batch_mark_publishes_a_contiguous_run_in_one_transaction() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = open_temp_journal(&temp, "bucket-a");
+        for sequence in 1..=3 {
+            journal
+                .commit_put(
+                    put_record(sequence, &format!("segments/{sequence}"), b"payload"),
+                    b"payload",
+                )
+                .unwrap();
+        }
+        // A fence-class overwrite is the record whose result ETag becomes a
+        // CAS predecessor; immutable creates never publish object versions.
+        journal
+            .commit_put(
+                crate::writeback::test_util::put_record(
+                    4,
+                    "manifest/current",
+                    b"payload",
+                    MutationMode::Overwrite,
+                    FenceClass::Fence,
+                    0x1000,
+                    1_786_435_200_000,
+                ),
+                b"payload",
+            )
+            .unwrap();
+        let transactions_before = journal.remote_watermark_commit_count();
+
+        journal
+            .mark_remote_batch(&[
+                (1, Some("etag-one".to_owned())),
+                (2, None),
+                (3, Some("etag-three".to_owned())),
+                (4, Some("etag-manifest".to_owned())),
+            ])
+            .unwrap();
+
+        assert_eq!(
+            journal.remote_watermark_commit_count() - transactions_before,
+            1,
+            "a batched run must pay exactly one durable watermark transaction"
+        );
+        let snapshot = journal.snapshot().unwrap();
+        assert_eq!(snapshot.remote_seq, 4);
+        assert_eq!(snapshot.remote_bytes_completed, 4 * b"payload".len() as u64);
+        assert_eq!(
+            snapshot.records[0].remote_result_etag.as_deref(),
+            Some("etag-one")
+        );
+        assert_eq!(snapshot.records[1].remote_result_etag, None);
+        assert_eq!(
+            snapshot.records[2].remote_result_etag.as_deref(),
+            Some("etag-three")
+        );
+        assert_eq!(
+            journal.remote_object_etag("manifest/current", 4).unwrap(),
+            Some("etag-manifest".to_owned()),
+            "batched marks must still publish per-object CAS predecessors"
+        );
+    }
+
+    /// Batched marks keep the fail-closed contiguity contract: a run that
+    /// does not start at the watermark, skips a sequence, or reaches past the
+    /// local watermark is rejected without any partial advance.
+    #[test]
+    fn remote_batch_mark_rejects_noncontiguous_runs_atomically() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = open_temp_journal(&temp, "bucket-a");
+        for sequence in 1..=3 {
+            journal
+                .commit_put(
+                    put_record(sequence, &format!("segments/{sequence}"), b"payload"),
+                    b"payload",
+                )
+                .unwrap();
+        }
+
+        let wrong_start = journal
+            .mark_remote_batch(&[(2, None), (3, None)])
+            .unwrap_err();
+        assert!(
+            format!("{wrong_start:#}").contains("contiguous"),
+            "{wrong_start:#}"
+        );
+
+        let gap = journal
+            .mark_remote_batch(&[(1, Some("etag-one".to_owned())), (3, None)])
+            .unwrap_err();
+        assert!(format!("{gap:#}").contains("contiguous"), "{gap:#}");
+
+        let above_local = journal
+            .mark_remote_batch(&[(1, None), (2, None), (3, None), (4, None)])
+            .unwrap_err();
+        assert!(
+            format!("{above_local:#}").contains("contiguous"),
+            "{above_local:#}"
+        );
+
+        let empty = journal.mark_remote_batch(&[]).unwrap_err();
+        assert!(format!("{empty:#}").contains("empty"), "{empty:#}");
+
+        assert_eq!(journal.progress().unwrap().remote_seq, 0);
+        assert_eq!(
+            journal.remote_object_etag("segments/1", 1).unwrap(),
+            None,
+            "a rejected batch must not leak any member's result ETag"
+        );
+        journal
+            .mark_remote_batch(&[(1, None), (2, None), (3, None)])
+            .expect("the journal must stay markable after rejected batches");
     }
 
     #[test]

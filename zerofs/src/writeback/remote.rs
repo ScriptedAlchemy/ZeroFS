@@ -645,15 +645,20 @@ fn finish_ordered_commit(
     completed: &mut BTreeMap<Sequence, CompletedRemote>,
 ) -> anyhow::Result<()> {
     result?;
-    let completion = completed.remove(&sequence).ok_or_else(|| {
-        anyhow::anyhow!("completed remote commit {sequence} was no longer tracked")
-    })?;
+    // The committed run is every held completion up to and including the
+    // batch tail; nothing below the frontier can re-enter `completed` while
+    // the commit was in flight because completed sequences are never
+    // re-dispatched.
     let incremented = sequence
         .checked_add(1)
         .ok_or_else(|| anyhow::anyhow!("remote sequence overflow"))?;
+    let retained = completed.split_off(&incremented);
+    let committed = std::mem::replace(completed, retained);
+    if committed.last_key_value().map(|(&last, _)| last) != Some(sequence) {
+        anyhow::bail!("completed remote commit {sequence} was no longer tracked");
+    }
     progress.send_modify(|state| state.sequence = sequence);
     *next = incremented;
-    debug_assert_eq!(completion.record.sequence, sequence);
     Ok(())
 }
 
@@ -753,7 +758,7 @@ fn validate_scheduler_window(
     if window.local_seq < first_sequence {
         return Ok(());
     }
-    // `commit_remote` advances the durable remote watermark and then prunes the
+    // `commit_remote_run` advances the durable remote watermark and then prunes the
     // records it covers, while the scheduler's own frontier only advances once
     // `finish_ordered_commit` runs. Any read taken during that gap legitimately
     // sees the frontier already pruned, so the lowest sequence the journal must
@@ -862,17 +867,36 @@ fn start_ready_commit(
     next: Sequence,
     completed: &BTreeMap<Sequence, CompletedRemote>,
 ) -> Option<RemoteCommit> {
-    let completion = completed.get(&next)?;
-    let record = completion.record.clone();
-    let e_tag = completion.e_tag.clone();
+    completed.get(&next)?;
+    // Every completion contiguous with the frontier commits in one durable
+    // journal transaction. The watermark still advances contiguously — the
+    // run is contiguous by construction — but a burst of held speculative
+    // completions no longer pays one fsync'd transaction per record, which
+    // otherwise becomes the remote replay throughput ceiling.
+    let mut run = Vec::new();
+    let mut expected = next;
+    for (&sequence, completion) in completed.range(next..) {
+        if sequence != expected {
+            break;
+        }
+        run.push((completion.record.clone(), completion.e_tag.clone()));
+        let Some(incremented) = expected.checked_add(1) else {
+            break;
+        };
+        expected = incremented;
+    }
     let journal = Arc::clone(journal);
     let overlay = overlay.clone();
     let disk = disk.clone();
     Some(
         async move {
-            let sequence = record.sequence;
-            let result = commit_remote(&journal, &overlay, &disk, &record, e_tag).await;
-            (sequence, result)
+            let last = run
+                .last()
+                .expect("ready commit run contains the frontier")
+                .0
+                .sequence;
+            let result = commit_remote_run(&journal, &overlay, &disk, &run).await;
+            (last, result)
         }
         .boxed(),
     )
@@ -1007,23 +1031,35 @@ async fn verify_existing(
     })
 }
 
-async fn commit_remote(
+async fn commit_remote_run(
     journal: &Arc<Journal>,
     overlay: &OverlayIndex,
     disk: &DiskAdmission,
-    record: &MutationRecord,
-    e_tag: Option<String>,
+    run: &[(MutationRecord, Option<String>)],
 ) -> anyhow::Result<()> {
-    let sequence = record.sequence;
+    let last = run
+        .last()
+        .ok_or_else(|| anyhow::anyhow!("remote commit run must not be empty"))?
+        .0
+        .sequence;
+    let completions = run
+        .iter()
+        .map(|(record, e_tag)| (record.sequence, e_tag.clone()))
+        .collect::<Vec<_>>();
     let mark_journal = Arc::clone(journal);
-    tokio::task::spawn_blocking(move || mark_journal.mark_remote(sequence, e_tag))
+    tokio::task::spawn_blocking(move || mark_journal.mark_remote_batch(&completions))
         .await
         .map_err(|error| anyhow::anyhow!("remote watermark task failed: {error}"))??;
-    overlay.remove_remote_prefix(record.sequence).await;
-    let charge = record.ssd_reservation_bytes()?;
+    overlay.remove_remote_prefix(last).await;
+    let charge = run.iter().try_fold(0_u64, |total, (record, _)| {
+        let bytes = record.ssd_reservation_bytes()?;
+        total
+            .checked_add(bytes)
+            .ok_or_else(|| anyhow::anyhow!("remote SSD reservation overflow"))
+    })?;
     let cleanup_journal = Arc::clone(journal);
     let available = tokio::task::spawn_blocking(move || -> anyhow::Result<u64> {
-        cleanup_journal.remove_remote_prefix(sequence)?;
+        cleanup_journal.remove_remote_prefix(last)?;
         Ok(fs4::available_space(cleanup_journal.root())?)
     })
     .await
@@ -1327,7 +1363,7 @@ mod tests {
     fn scheduler_window_tolerates_the_frontier_its_own_commit_already_pruned() {
         let temp = tempfile::tempdir().unwrap();
         let journal = journal_with_local_records(temp.path(), 3);
-        // `commit_remote` advances the durable watermark and prunes the record
+        // `commit_remote_run` advances the durable watermark and prunes the run
         // it just uploaded. The scheduler's in-memory frontier only advances
         // afterwards, in `finish_ordered_commit`, so every journal read taken
         // while that commit is in flight still carries the pre-commit frontier.

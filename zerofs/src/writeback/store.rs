@@ -3353,6 +3353,72 @@ mod tests {
         store.shutdown().await.unwrap();
     }
 
+    /// When uploads complete out of order and pile up behind the ordering
+    /// frontier, the scheduler commits the whole contiguous run through one
+    /// durable journal transaction instead of paying one fsync'd transaction
+    /// per record. Releasing the frontier last makes the run deterministic:
+    /// sequences 2..=6 are already held completions by the time sequence 1
+    /// lands, so the drain must be a single batched watermark commit.
+    #[tokio::test]
+    async fn remote_commits_coalesce_held_completions_into_one_watermark_transaction() {
+        let (store, remote, _temp, controls) = test_store_with_controls(true).await;
+        let journal = store.inner.journal.clone();
+        controls.block_puts();
+        let paths = (1_u8..=6)
+            .map(|sequence| {
+                Path::from(format!(
+                    "zerofs/pilot/segments/{sequence:02x}/0000000000000001/{sequence:016x}"
+                ))
+            })
+            .collect::<Vec<_>>();
+        for (index, path) in paths.iter().enumerate() {
+            store
+                .put_opts(
+                    path,
+                    Bytes::from(vec![index as u8 + 1; 1024]).into(),
+                    PutOptions::from(PutMode::Create),
+                )
+                .await
+                .unwrap();
+        }
+        store.wait_local(6).await.unwrap();
+
+        for path in paths[1..].iter().rev() {
+            controls.release_put_path(path.as_ref());
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let published =
+                    futures::future::join_all(paths[1..].iter().map(|path| remote.head(path)))
+                        .await;
+                if published.iter().all(Result::is_ok) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("speculative uploads behind the frontier never completed");
+        assert_eq!(
+            journal.progress().unwrap().remote_seq,
+            0,
+            "no watermark may advance while the ordering frontier is unpublished"
+        );
+        let transactions_before = journal.remote_watermark_commit_count();
+
+        controls.release_put_path(paths[0].as_ref());
+        store.wait_remote(6).await.unwrap();
+
+        assert_eq!(
+            journal.remote_watermark_commit_count() - transactions_before,
+            1,
+            "six held completions must drain through one batched watermark commit"
+        );
+        assert_eq!(journal.progress().unwrap().remote_seq, 6);
+        controls.release_puts();
+        store.shutdown().await.unwrap();
+    }
+
     #[tokio::test]
     async fn remote_replay_keeps_polling_and_refilling_while_ordered_cleanup_is_blocked() {
         let (store, remote, _temp, controls) = test_store_with_controls(true).await;
@@ -4060,5 +4126,393 @@ mod tests {
             attempts <= 3,
             "remote outage caused {attempts} attempts in 400ms"
         );
+    }
+
+    /// An object store that models the SFTP backend's cost shape: a fixed
+    /// number of protocol round trips per operation plus payload transfer at a
+    /// bounded per-stream rate. Concurrent transfers genuinely overlap, so a
+    /// full pipeline reaches `streams x stream_rate` aggregate throughput —
+    /// exactly like the raw `sftp` control's parallel workers.
+    struct ThrottledStore {
+        inner: Arc<InMemory>,
+        rtt: Duration,
+        put_round_trips: u32,
+        stream_bytes_per_sec: f64,
+        stats: Arc<LinkStats>,
+    }
+
+    #[derive(Default)]
+    struct LinkStats {
+        puts: std::sync::atomic::AtomicUsize,
+        payload_bytes: std::sync::atomic::AtomicU64,
+        occupancy: std::sync::Mutex<LinkOccupancy>,
+    }
+
+    struct LinkOccupancy {
+        active: usize,
+        last_change: std::time::Instant,
+        busy_stream_seconds: f64,
+    }
+
+    impl Default for LinkOccupancy {
+        fn default() -> Self {
+            Self {
+                active: 0,
+                last_change: std::time::Instant::now(),
+                busy_stream_seconds: 0.0,
+            }
+        }
+    }
+
+    impl LinkStats {
+        fn enter(&self) {
+            let mut occupancy = self.occupancy.lock().unwrap();
+            let now = std::time::Instant::now();
+            occupancy.busy_stream_seconds +=
+                occupancy.active as f64 * (now - occupancy.last_change).as_secs_f64();
+            occupancy.last_change = now;
+            occupancy.active += 1;
+        }
+
+        fn exit(&self) {
+            let mut occupancy = self.occupancy.lock().unwrap();
+            let now = std::time::Instant::now();
+            occupancy.busy_stream_seconds +=
+                occupancy.active as f64 * (now - occupancy.last_change).as_secs_f64();
+            occupancy.last_change = now;
+            occupancy.active -= 1;
+        }
+
+        fn busy_stream_seconds(&self) -> f64 {
+            let occupancy = self.occupancy.lock().unwrap();
+            occupancy.busy_stream_seconds
+                + occupancy.active as f64
+                    * (std::time::Instant::now() - occupancy.last_change).as_secs_f64()
+        }
+    }
+
+    struct LinkSlot<'stats>(&'stats LinkStats);
+
+    impl<'stats> LinkSlot<'stats> {
+        fn enter(stats: &'stats LinkStats) -> Self {
+            stats.enter();
+            Self(stats)
+        }
+    }
+
+    impl Drop for LinkSlot<'_> {
+        fn drop(&mut self) {
+            self.0.exit();
+        }
+    }
+
+    impl std::fmt::Display for ThrottledStore {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "ThrottledStore({})", self.inner)
+        }
+    }
+
+    impl std::fmt::Debug for ThrottledStore {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "ThrottledStore")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for ThrottledStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: object_store::PutPayload,
+            opts: PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            use std::sync::atomic::Ordering;
+            let len = payload.content_length() as u64;
+            self.stats.puts.fetch_add(1, Ordering::SeqCst);
+            self.stats.payload_bytes.fetch_add(len, Ordering::SeqCst);
+            let _slot = LinkSlot::enter(&self.stats);
+            let transfer = Duration::from_secs_f64(len as f64 / self.stream_bytes_per_sec);
+            tokio::time::sleep(self.rtt * self.put_round_trips + transfer).await;
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            let _slot = LinkSlot::enter(&self.stats);
+            tokio::time::sleep(self.rtt * 2).await;
+            self.inner.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<'static, object_store::Result<Path>>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<Path>> {
+            let rtt = self.rtt;
+            let inner = self.inner.clone();
+            locations
+                .then(move |location| {
+                    let inner = inner.clone();
+                    async move {
+                        let location = location?;
+                        tokio::time::sleep(rtt).await;
+                        inner.delete(&location).await?;
+                        Ok(location)
+                    }
+                })
+                .boxed()
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: CopyOptions,
+        ) -> object_store::Result<()> {
+            tokio::time::sleep(self.rtt * 2).await;
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    fn bench_env<T: std::str::FromStr>(name: &str, default: T) -> T {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(default)
+    }
+
+    /// The three writeback tiers, measured separately: how fast a burst of
+    /// puts acknowledges into dirty RAM (`AckMode::Memory`), how fast the
+    /// local journaler drains that burst to the SSD, and (already covered by
+    /// the throttled-backend bench below) how fast remote replay drains to
+    /// the link. Burst acks should sit far above the SSD drain rate — the
+    /// dirty RAM budget, not the journal pipeline, is meant to be what a
+    /// burst runs into. Run with:
+    /// `cargo test --release -p zerofs --lib bench_writeback_tier_profile -- --ignored --nocapture`
+    ///
+    /// Knobs: ZEROFS_BENCH_TIER_TOTAL_MIB, ZEROFS_BENCH_TIER_PAYLOAD_KIB,
+    /// ZEROFS_BENCH_TIER_WRITERS, ZEROFS_BENCH_LOCAL_CONCURRENCY,
+    /// ZEROFS_BENCH_DIR.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[ignore = "throughput benchmark; needs a real disk and --release"]
+    async fn bench_writeback_tier_profile() {
+        let total_mib: usize = bench_env("ZEROFS_BENCH_TIER_TOTAL_MIB", 2048);
+        let payload_kib: usize = bench_env("ZEROFS_BENCH_TIER_PAYLOAD_KIB", 1024);
+        let writers: usize = bench_env("ZEROFS_BENCH_TIER_WRITERS", 16);
+        let local_concurrency: usize = bench_env("ZEROFS_BENCH_LOCAL_CONCURRENCY", 8);
+        let records = (total_mib * 1024 / payload_kib) as u64;
+
+        let temp = match std::env::var("ZEROFS_BENCH_DIR") {
+            Ok(dir) => tempfile::tempdir_in(dir).unwrap(),
+            Err(_) => tempfile::tempdir().unwrap(),
+        };
+        let journal = Arc::new(
+            Journal::open(
+                temp.path().join("writeback"),
+                JournalIdentity {
+                    format_version: 1,
+                    bucket_id: "bucket-bench".to_owned(),
+                    backend_endpoint: "memory://remote".to_owned(),
+                    database_prefix: "zerofs/pilot".to_owned(),
+                    backend_kind: "memory".to_owned(),
+                    encryption_key_identity_sha256: [0x77; 32],
+                },
+            )
+            .unwrap(),
+        );
+        let settings = WritebackSettings {
+            dir: temp.path().join("writeback"),
+            ack_mode: AckMode::Memory,
+            // The burst must fit in dirty RAM so this measures the ack path,
+            // not RAM-budget backpressure.
+            memory_bytes: (total_mib as u64 + 512) << 20,
+            disk_bytes: 256 << 30,
+            min_free_bytes: 1,
+            high_watermark_percent: 95,
+            resume_percent: 85,
+            upload_concurrency: 7,
+            local_concurrency,
+            shutdown_flush: ShutdownFlush::Local,
+        };
+        let store = WritebackObjectStore::open_paused(Arc::new(InMemory::new()), journal, settings)
+            .await
+            .unwrap();
+
+        let payload = Bytes::from(vec![0x5a_u8; payload_kib * 1024]);
+        let started = std::time::Instant::now();
+        let mut tasks = tokio::task::JoinSet::new();
+        for writer in 0..writers as u64 {
+            let store = store.clone();
+            let payload = payload.clone();
+            tasks.spawn(async move {
+                let mut index = writer;
+                while index < records {
+                    store
+                        .put_opts(
+                            &Path::from(format!(
+                                "zerofs/pilot/segments/{:02x}/0000000000000001/{index:016x}",
+                                index & 0xff
+                            )),
+                            payload.clone().into(),
+                            PutOptions::from(PutMode::Create),
+                        )
+                        .await
+                        .unwrap();
+                    index += writers as u64;
+                }
+            });
+        }
+        while tasks.join_next().await.is_some() {}
+        let acked = started.elapsed();
+
+        store.wait_local(records).await.unwrap();
+        let local_done = started.elapsed();
+
+        let total = total_mib as f64;
+        println!(
+            "tier profile: {records} x {payload_kib} KiB, {writers} writers, \
+             local_concurrency {local_concurrency}: \
+             RAM ack {:.0} MiB/s ({:.3}s), SSD drain {:.0} MiB/s ({:.3}s to local, \
+             {:.3}s after last ack)",
+            total / acked.as_secs_f64(),
+            acked.as_secs_f64(),
+            total / local_done.as_secs_f64(),
+            local_done.as_secs_f64(),
+            (local_done - acked).as_secs_f64(),
+        );
+
+        store.shutdown().await.unwrap();
+    }
+
+    /// Remote replay throughput against a backend that mimics the pilot SFTP
+    /// link (per-op round trips + bounded per-stream rate). The raw `sftp`
+    /// control on vm100 measures ~96 MiB/s over 7 parallel streams, so with
+    /// `upload_concurrency = 7` a fully pipelined scheduler should approach the
+    /// modeled link ceiling; the gap it prints is scheduler-side loss.
+    ///
+    /// Run with:
+    /// `cargo test --release -p zerofs --lib bench_remote_replay -- --ignored --nocapture`
+    ///
+    /// Knobs: ZEROFS_BENCH_RTT_MS, ZEROFS_BENCH_LINK_MIBPS,
+    /// ZEROFS_BENCH_UPLOAD_CONCURRENCY, ZEROFS_BENCH_PUT_RTTS,
+    /// ZEROFS_BENCH_RECORDS, ZEROFS_BENCH_PAYLOAD_KIB, ZEROFS_BENCH_DIR.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "throughput benchmark; needs a real disk and --release"]
+    async fn bench_remote_replay_throughput_against_throttled_backend() {
+        let rtt_ms: f64 = bench_env("ZEROFS_BENCH_RTT_MS", 1.0);
+        let link_mibps: f64 = bench_env("ZEROFS_BENCH_LINK_MIBPS", 96.0);
+        let concurrency: usize = bench_env("ZEROFS_BENCH_UPLOAD_CONCURRENCY", 7);
+        let put_round_trips: u32 = bench_env("ZEROFS_BENCH_PUT_RTTS", 5);
+        let records: u64 = bench_env("ZEROFS_BENCH_RECORDS", 384);
+        let payload_kib: usize = bench_env("ZEROFS_BENCH_PAYLOAD_KIB", 256);
+
+        let bench_dir = std::env::var("ZEROFS_BENCH_DIR").ok();
+        let temp = match &bench_dir {
+            Some(dir) => tempfile::tempdir_in(dir).unwrap(),
+            None => tempfile::tempdir().unwrap(),
+        };
+        let journal = Arc::new(
+            Journal::open(
+                temp.path().join("writeback"),
+                JournalIdentity {
+                    format_version: 1,
+                    bucket_id: "bucket-bench".to_owned(),
+                    backend_endpoint: "memory://remote".to_owned(),
+                    database_prefix: "zerofs/pilot".to_owned(),
+                    backend_kind: "memory".to_owned(),
+                    encryption_key_identity_sha256: [0x77; 32],
+                },
+            )
+            .unwrap(),
+        );
+        let stats = Arc::new(LinkStats::default());
+        let stream_bytes_per_sec = link_mibps * 1024.0 * 1024.0 / concurrency as f64;
+        let remote = Arc::new(ThrottledStore {
+            inner: Arc::new(InMemory::new()),
+            rtt: Duration::from_secs_f64(rtt_ms / 1000.0),
+            put_round_trips,
+            stream_bytes_per_sec,
+            stats: stats.clone(),
+        });
+        let settings = WritebackSettings {
+            dir: temp.path().join("writeback"),
+            ack_mode: AckMode::Memory,
+            memory_bytes: 4 << 30,
+            disk_bytes: 64 << 30,
+            min_free_bytes: 1,
+            high_watermark_percent: 95,
+            resume_percent: 85,
+            upload_concurrency: concurrency,
+            local_concurrency: 8,
+            shutdown_flush: ShutdownFlush::Local,
+        };
+        let store = WritebackObjectStore::open_paused(remote, journal, settings)
+            .await
+            .unwrap();
+
+        let payload = Bytes::from(vec![0x5a_u8; payload_kib * 1024]);
+        for index in 0..records {
+            store
+                .put_opts(
+                    &Path::from(format!(
+                        "zerofs/pilot/segments/{:02x}/0000000000000001/{index:016x}",
+                        index & 0xff
+                    )),
+                    payload.clone().into(),
+                    PutOptions::from(PutMode::Create),
+                )
+                .await
+                .unwrap();
+        }
+        store.wait_local(records).await.unwrap();
+
+        let started = std::time::Instant::now();
+        store.activate_remote().unwrap();
+        store.wait_remote(records).await.unwrap();
+        let elapsed = started.elapsed();
+
+        let total_mib = (records as usize * payload_kib) as f64 / 1024.0;
+        let achieved = total_mib / elapsed.as_secs_f64();
+        let avg_active = stats.busy_stream_seconds() / elapsed.as_secs_f64();
+        // What the modeled link supports with every slot busy end to end.
+        let per_put_seconds = (rtt_ms / 1000.0) * put_round_trips as f64
+            + (payload_kib as f64 * 1024.0) / stream_bytes_per_sec;
+        let ideal = (payload_kib as f64 / 1024.0) * concurrency as f64 / per_put_seconds;
+        println!(
+            "replay: {records} x {payload_kib} KiB via {concurrency} slots \
+             (rtt {rtt_ms}ms x{put_round_trips}, stream {:.1} MiB/s): \
+             {achieved:.1} MiB/s achieved vs {ideal:.1} MiB/s modeled ceiling \
+             ({:.0}%), avg active uploads {avg_active:.2}/{concurrency}, {:.3}s",
+            stream_bytes_per_sec / (1024.0 * 1024.0),
+            achieved / ideal * 100.0,
+            elapsed.as_secs_f64(),
+        );
+
+        store.shutdown().await.unwrap();
     }
 }
