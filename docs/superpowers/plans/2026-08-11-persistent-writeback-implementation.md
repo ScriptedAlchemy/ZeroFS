@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- The feature is disabled by default; enabling it without `ack_mode` defaults to `ssd`.
+- The feature is disabled by default; enabling it without `ack_mode` defaults to `memory` (client flush barriers still force SSD durability).
 - The CT105 pilot explicitly uses `ack_mode = "memory"`, 16 GB dirty RAM, 512 GB dirty SSD, and a 256 GB filesystem free-space reserve.
 - `[writeback].memory_size_gb` is an additional dirty-write budget, independent of `[cache].memory_size_gb`; writeback admission must never consume, resize, evict, or borrow capacity from the clean Foyer read cache.
 - A completed filesystem `fsync` or `sync` must be covered by `local_seq`; it must never acknowledge RAM-only state.

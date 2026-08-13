@@ -150,11 +150,10 @@ impl LocalJournalSink for Journal {
     }
 }
 
-// Each preparation is one blob write + fsync (~1-5ms of device latency, not
-// CPU), so this is the drain's effective fsync queue depth: aggregate
-// throughput is roughly concurrency x payload / fsync latency, and 4 capped
-// the post-ACK durability tail at ~4 payloads per fsync round trip. RAM held
-// by prepared-but-unpublished blobs stays bounded by the submitters'
+// Preparation is validation and encoding only — container staging does the
+// payload IO in `stage_batch` — so this bounds concurrent spawn_blocking
+// validations, which is also the journal queue's dequeue burst. RAM held by
+// prepared-but-unpublished payloads stays bounded by the submitters'
 // admission permits, not by this constant.
 const DEFAULT_LOCAL_PREPARE_CONCURRENCY: usize = 16;
 // Blob payloads are already external files, so this bounds the serialized

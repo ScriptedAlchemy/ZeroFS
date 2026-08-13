@@ -1753,7 +1753,9 @@ impl Settings {
         toml_string.push_str("# [writeback]\n");
         toml_string.push_str("# enabled = true\n");
         toml_string.push_str("# dir = \"/var/cache/zerofs-writeback\"\n");
-        toml_string.push_str("# ack_mode = \"ssd\"              # remote | ssd | memory\n");
+        toml_string.push_str(
+            "# ack_mode = \"memory\"           # memory (default) | ssd | remote; client flushes always reach the SSD journal\n",
+        );
         toml_string.push_str(
             "# memory_size_gb = 16.0          # additional dirty-write RAM; does not consume [cache] memory\n",
         );
@@ -1762,7 +1764,9 @@ impl Settings {
         toml_string.push_str("# high_watermark_percent = 95\n");
         toml_string.push_str("# resume_percent = 85\n");
         toml_string.push_str("# local_concurrency = 4\n");
-        toml_string.push_str("# upload_concurrency = 4\n");
+        toml_string.push_str(
+            "# upload_concurrency = 7         # defaults to the [sftp] write_concurrency stream budget\n",
+        );
         toml_string.push_str("# shutdown_flush = \"local\"       # local | remote\n");
 
         toml_string.push_str("\n# Anonymous telemetry (enabled by default)\n");
@@ -2199,7 +2203,7 @@ encryption_password = "test-password"
     }
 
     #[test]
-    fn writeback_enabled_without_ack_mode_defaults_to_ssd() {
+    fn writeback_enabled_without_ack_mode_defaults_to_memory() {
         let settings = write_and_load(&writeback_sftp_config(
             16.0,
             r#"[writeback]
@@ -2215,9 +2219,44 @@ min_free_gb = 256.0"#,
             .writeback_settings(crate::writeback::config::WritebackAccessMode::ReadWrite)
             .unwrap()
             .unwrap();
-        assert_eq!(writeback.ack_mode, crate::writeback::config::AckMode::Ssd);
+        // Memory acknowledgement is the point of the tier: bursts land at RAM
+        // speed while client flush barriers still force SSD durability. The
+        // default upload concurrency matches the SFTP transport's default
+        // write-stream budget so remote replay can use the whole link.
+        assert_eq!(
+            writeback.ack_mode,
+            crate::writeback::config::AckMode::Memory
+        );
         assert_eq!(writeback.disk_bytes, 512_000_000_000);
         assert_eq!(writeback.local_concurrency, 4);
+        assert_eq!(writeback.upload_concurrency, 7);
+    }
+
+    #[test]
+    fn writeback_default_upload_concurrency_clamps_to_sftp_write_streams() {
+        let settings = write_and_load(&writeback_sftp_config(
+            16.0,
+            r#"[sftp]
+write_concurrency = 4
+
+[writeback]
+enabled = true
+dir = "/var/cache/zerofs-writeback"
+memory_size_gb = 16.0
+disk_size_gb = 512.0
+min_free_gb = 256.0"#,
+        ))
+        .unwrap();
+
+        let writeback = settings
+            .writeback_settings(crate::writeback::config::WritebackAccessMode::ReadWrite)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            writeback.upload_concurrency, 4,
+            "a defaulted upload concurrency must follow a lowered SFTP write budget \
+             instead of failing validation"
+        );
     }
 
     #[test]
@@ -2416,7 +2455,7 @@ min_free_gb = 256.0"#,
         assert!(rendered.contains("# [writeback]"));
         assert!(rendered.contains("# memory_size_gb = 16.0"));
         assert!(rendered.contains("additional dirty-write RAM"));
-        assert!(rendered.contains("# ack_mode = \"ssd\""));
+        assert!(rendered.contains("# ack_mode = \"memory\""));
     }
 
     #[test]

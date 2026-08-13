@@ -6,8 +6,13 @@ use std::path::{Component, Path, PathBuf};
 #[serde(rename_all = "lowercase")]
 pub enum AckMode {
     Remote,
-    #[default]
     Ssd,
+    // Memory acknowledgement is the tier's default contract: bursts land at
+    // RAM speed and stay volatile until they cross the SSD journal — exactly
+    // like an OS page cache — while client flush barriers (fsync/FUA/COMMIT
+    // route through `wait_local_through_accepted`) still force SSD
+    // durability before they return.
+    #[default]
     Memory,
 }
 
@@ -48,8 +53,12 @@ pub struct WritebackConfig {
     pub high_watermark_percent: u8,
     #[serde(default = "default_resume_percent")]
     pub resume_percent: u8,
-    #[serde(default = "default_upload_concurrency")]
-    pub upload_concurrency: usize,
+    /// Concurrent remote uploads. Defaults to one journal upload per SFTP
+    /// write stream (clamped to a lowered `[sftp] write_concurrency`), so
+    /// remote replay can reach the same aggregate rate as that many parallel
+    /// raw `sftp` transfers.
+    #[serde(default)]
+    pub upload_concurrency: Option<usize>,
     #[serde(default = "default_local_concurrency")]
     pub local_concurrency: usize,
     #[serde(default)]
@@ -67,7 +76,7 @@ impl Default for WritebackConfig {
             min_free_gb: 0.0,
             high_watermark_percent: default_high_watermark_percent(),
             resume_percent: default_resume_percent(),
-            upload_concurrency: default_upload_concurrency(),
+            upload_concurrency: None,
             local_concurrency: default_local_concurrency(),
             shutdown_flush: ShutdownFlush::Local,
         }
@@ -135,20 +144,30 @@ impl WritebackConfig {
         {
             bail!("[writeback] requires 0 < resume_percent < high_watermark_percent <= 100");
         }
-        if self.upload_concurrency == 0 {
-            bail!("[writeback] upload_concurrency must be greater than zero");
-        }
         if !(1..=256).contains(&self.local_concurrency) {
             bail!("[writeback] local_concurrency must be between 1 and 256");
         }
-        if let Some(limit) = sftp_write_concurrency
-            && self.upload_concurrency > limit
-        {
-            bail!(
-                "[writeback] upload_concurrency ({}) must not exceed [sftp] write_concurrency ({limit})",
-                self.upload_concurrency
-            );
-        }
+        let upload_concurrency = match self.upload_concurrency {
+            Some(0) => bail!("[writeback] upload_concurrency must be greater than zero"),
+            Some(explicit) => {
+                if let Some(limit) = sftp_write_concurrency
+                    && explicit > limit
+                {
+                    bail!(
+                        "[writeback] upload_concurrency ({explicit}) must not exceed [sftp] write_concurrency ({limit})"
+                    );
+                }
+                explicit
+            }
+            // One upload per SFTP write stream by default; an explicitly
+            // lowered transport budget lowers the default with it instead of
+            // turning into a validation error.
+            None => sftp_write_concurrency
+                .map_or(default_upload_concurrency(), |limit| {
+                    default_upload_concurrency().min(limit)
+                })
+                .max(1),
+        };
 
         Ok(Some(WritebackSettings {
             dir,
@@ -158,7 +177,7 @@ impl WritebackConfig {
             min_free_bytes,
             high_watermark_percent: self.high_watermark_percent,
             resume_percent: self.resume_percent,
-            upload_concurrency: self.upload_concurrency,
+            upload_concurrency,
             local_concurrency: self.local_concurrency,
             shutdown_flush: self.shutdown_flush,
         }))
@@ -173,8 +192,12 @@ const fn default_resume_percent() -> u8 {
     85
 }
 
+// Matches the SFTP transport's default per-direction stream budget
+// (`default_sftp_direction_concurrency`): the raw parallel-`sftp` control
+// measures the link at this many streams, so remote replay defaults to the
+// same fan-out.
 const fn default_upload_concurrency() -> usize {
-    4
+    7
 }
 
 const fn default_local_concurrency() -> usize {

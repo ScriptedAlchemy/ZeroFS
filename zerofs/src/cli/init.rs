@@ -1289,7 +1289,7 @@ mod role_decision_tests {
             min_free_gb: 0.001,
             high_watermark_percent: 95,
             resume_percent: 85,
-            upload_concurrency: 2,
+            upload_concurrency: Some(2),
             local_concurrency: 2,
             shutdown_flush: ShutdownFlush::Local,
         });

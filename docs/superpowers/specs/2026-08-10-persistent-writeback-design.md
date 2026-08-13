@@ -103,7 +103,7 @@ Validation rules:
 - writeback and HA read-write mode are mutually exclusive in the first implementation;
 - the writeback directory must be local, writable, on one filesystem, owned by the ZeroFS service account, and not nested inside Foyer's managed cache directories.
 
-The default remains `enabled = false`. When enabled without an explicit mode, the safe default is `ack_mode = "ssd"`; this deployment explicitly selects `memory`.
+The default remains `enabled = false`. When enabled without an explicit mode, the default is `ack_mode = "memory"`: acknowledgements return at RAM speed while client flush barriers (fsync/FUA/COMMIT) still force SSD durability, matching ordinary volatile write-cache semantics. Deployments that want every acknowledgement SSD-durable select `ssd` explicitly.
 
 ## Durability contract
 
