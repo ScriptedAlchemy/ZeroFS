@@ -217,7 +217,8 @@ impl StartupContext {
                 if let Some(wal_config) = &settings.wal {
                     info!("Using separate WAL object store: {}", wal_config.url);
                     Some(
-                        parse_wal_object_store(wal_config).await
+                        parse_wal_object_store(wal_config)
+                            .await
                             .context("Failed to connect to WAL object store")?,
                     )
                 } else {

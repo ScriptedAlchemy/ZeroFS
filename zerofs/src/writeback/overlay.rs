@@ -83,7 +83,10 @@ impl BlobCache {
         self.total_bytes += bytes.len();
         self.entries.push_back((sequence, bytes));
         while self.total_bytes > BLOB_CACHE_MAX_BYTES {
-            let (_, evicted) = self.entries.pop_front().expect("cached bytes imply entries");
+            let (_, evicted) = self
+                .entries
+                .pop_front()
+                .expect("cached bytes imply entries");
             self.total_bytes -= evicted.len();
         }
     }
@@ -492,15 +495,12 @@ impl OverlayIndex {
                 if let Some(bytes) = self.blob_cache().get(sequence) {
                     return Ok(bytes);
                 }
-                let bytes =
-                    tokio::task::spawn_blocking(move || journal.read_blob(sequence).map(Bytes::from))
-                        .await
-                        .map_err(|error| {
-                            generic_error(format!("journal read task failed: {error}"))
-                        })?
-                        .map_err(|error| {
-                            generic_error(format!("journal blob read failed: {error:#}"))
-                        })?;
+                let bytes = tokio::task::spawn_blocking(move || {
+                    journal.read_blob(sequence).map(Bytes::from)
+                })
+                .await
+                .map_err(|error| generic_error(format!("journal read task failed: {error}")))?
+                .map_err(|error| generic_error(format!("journal blob read failed: {error:#}")))?;
                 self.blob_cache().insert(sequence, bytes.clone());
                 Ok(bytes)
             }

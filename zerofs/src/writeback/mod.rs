@@ -120,7 +120,10 @@ pub(crate) fn validate_owner_only(
         );
     }
     if metadata.uid() != unsafe { libc::geteuid() } {
-        anyhow::bail!("{label} {} is not owned by the service user", path.display());
+        anyhow::bail!(
+            "{label} {} is not owned by the service user",
+            path.display()
+        );
     }
     Ok(())
 }

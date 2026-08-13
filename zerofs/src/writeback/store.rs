@@ -376,9 +376,10 @@ impl WritebackObjectStore {
         let payload = VerifiedPayload::new(bytes);
         // Wait for journal-queue capacity before taking the global order lock,
         // so a full queue cannot convoy unrelated writers behind this one.
-        let slot = self.inner.journaler.reserve_slot().await.map_err(|error| {
-            generic_error(format!("local journal admission failed: {error}"))
-        })?;
+        let slot =
+            self.inner.journaler.reserve_slot().await.map_err(|error| {
+                generic_error(format!("local journal admission failed: {error}"))
+            })?;
         let order_guard = self.inner.admission_order.lock().await;
         let sequence = self.allocate_sequence()?;
         let local_etag = LocalEtag::new(self.inner.incarnation, sequence);
@@ -457,9 +458,10 @@ impl WritebackObjectStore {
             .map_err(|error| generic_error(format!("dirty SSD admission failed: {error}")))?;
         let lock = self.key_lock(&location);
         let key_guard = lock.lock_owned().await;
-        let slot = self.inner.journaler.reserve_slot().await.map_err(|error| {
-            generic_error(format!("delete journal admission failed: {error}"))
-        })?;
+        let slot =
+            self.inner.journaler.reserve_slot().await.map_err(|error| {
+                generic_error(format!("delete journal admission failed: {error}"))
+            })?;
         let order_guard = self.inner.admission_order.lock().await;
         let sequence = self.allocate_sequence()?;
         let kind = MutationKind::Delete;

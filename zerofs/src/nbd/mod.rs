@@ -64,9 +64,7 @@ impl StripeManifest {
                 || member.as_bytes().contains(&b'/')
                 || !unique.insert(member.as_str())
             {
-                return Err(
-                    "striped NBD member names must be unique direct children".to_string(),
-                );
+                return Err("striped NBD member names must be unique direct children".to_string());
             }
         }
         Ok(())

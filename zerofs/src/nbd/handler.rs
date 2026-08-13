@@ -1,8 +1,7 @@
 use super::error::{CommandError, CommandResult, NBDError, Result};
 use super::out_of_bounds;
 use super::{
-    NBD_STRIPE_MANIFEST_MAX_BYTES, NBD_STRIPE_MARKER, StripeManifest,
-    is_nbd_provision_staging_name,
+    NBD_STRIPE_MANIFEST_MAX_BYTES, NBD_STRIPE_MARKER, StripeManifest, is_nbd_provision_staging_name,
 };
 use crate::fs::ZeroFS;
 use crate::fs::errors::FsError;
@@ -569,11 +568,8 @@ impl NBDHandler {
                             Ok::<_, CommandError>(parts)
                         }
                     });
-                let mut parts: Vec<(u64, Bytes)> = try_join_all(reads)
-                    .await?
-                    .into_iter()
-                    .flatten()
-                    .collect();
+                let mut parts: Vec<(u64, Bytes)> =
+                    try_join_all(reads).await?.into_iter().flatten().collect();
                 parts.sort_unstable_by_key(|(logical_offset, _)| *logical_offset);
 
                 let mut output = BytesMut::with_capacity(length as usize);
