@@ -199,11 +199,6 @@ impl OverlayIndex {
         self.install(record, OverlayEffect::Delete, None).await
     }
 
-    pub async fn install_copy(&self, record: MutationRecord, payload: Bytes) -> anyhow::Result<()> {
-        self.install_verified_copy(record, VerifiedPayload::new(payload))
-            .await
-    }
-
     pub(crate) async fn install_verified_copy(
         &self,
         record: MutationRecord,
@@ -219,15 +214,6 @@ impl OverlayIndex {
             Some(PayloadLocation::Memory(payload.into_bytes())),
         )
         .await
-    }
-
-    pub async fn install_rename(
-        &self,
-        record: MutationRecord,
-        payload: Bytes,
-    ) -> anyhow::Result<()> {
-        self.install_verified_rename(record, VerifiedPayload::new(payload))
-            .await
     }
 
     pub(crate) async fn install_verified_rename(
