@@ -64,10 +64,118 @@ pub(super) struct OpenSegment {
 }
 
 /// One independently ordered append stream. Its gate covers frame-index/AAD
-/// assignment through threshold rotation, while other lanes remain concurrent.
+/// *assignment* — the short reservation window — while the batch AEAD that
+/// fills a reservation runs outside it and other lanes remain concurrent.
 pub(super) struct OpenLane {
     pub(super) append_gate: tokio::sync::Mutex<()>,
     pub(super) open: std::sync::Mutex<OpenSegment>,
+    /// Held shared by every [`Reservation`] from the moment it claims a
+    /// frame-index run and byte range until its sealed bytes are copied in.
+    /// A rotation takes it exclusively — always while also holding
+    /// `append_gate`, so no new reservation can start — and therefore never
+    /// seals a segment containing an unfilled hole.
+    pub(super) fill_barrier: tokio::sync::RwLock<()>,
+}
+
+/// A claim on a contiguous frame-index run in one lane's open segment, plus the
+/// byte range backing it. Taken under the lane's append gate so frame indices
+/// stay dense and AAD-unique; filled after the batch AEAD, which runs outside
+/// that gate. Concurrent reservations on a lane fill in any order: each one
+/// only ever writes its own disjoint byte range.
+struct Reservation {
+    segid: Segid,
+    first_frame: u32,
+    /// Byte offset of each frame's length prefix, in frame-index order. The
+    /// sealed body length is fixed at claim time (see [`Compressed::sealed_len`])
+    /// and already written into the prefix, so only bodies remain.
+    offsets: Vec<u64>,
+    /// Sealed body length of each frame, matching `offsets`.
+    lens: Vec<u32>,
+}
+
+impl Reservation {
+    /// Claim space for `frames` — `(extent, sealed body length)` in order — at
+    /// the end of `open`. Caller must hold the lane's append gate and a shared
+    /// `fill_barrier` guard, and keep the latter until [`Self::fill`].
+    ///
+    /// The reserved bytes are zeroed and each frame's length prefix written
+    /// immediately, so the buffer stays a structurally walkable frame stream at
+    /// every instant; only the AEAD bodies are outstanding.
+    fn claim(open: &mut OpenSegment, inode: InodeId, frames: &[(u64, usize)]) -> Self {
+        let segid = open.segid;
+        let first_frame = open.dir.len() as u32;
+        let mut offset = open.buf.len() as u64;
+        let mut offsets = Vec::with_capacity(frames.len());
+        let mut lens = Vec::with_capacity(frames.len());
+        open.dir.reserve(frames.len());
+        for &(extent, sealed_len) in frames {
+            let len = sealed_len as u32;
+            offsets.push(offset);
+            lens.push(len);
+            open.dir.push(DirEntry {
+                byte_offset: offset,
+                len,
+                inode,
+                extent,
+            });
+            offset += crate::segment::LEN_PREFIX as u64 + sealed_len as u64;
+        }
+        open.buf.resize(offset as usize, 0);
+        for (offset, len) in offsets.iter().zip(&lens) {
+            let start = *offset as usize;
+            open.buf[start..start + crate::segment::LEN_PREFIX].copy_from_slice(&len.to_le_bytes());
+        }
+        Self {
+            segid,
+            first_frame,
+            offsets,
+            lens,
+        }
+    }
+
+    /// Copy this batch's sealed bodies into the reserved range and return the
+    /// resulting [`FrameLoc`]s. `sealed` must be the output of
+    /// `seal_compressed_batch` over exactly this claim's frames.
+    fn fill(
+        &self,
+        open: &mut OpenSegment,
+        sealed: &[(u64, u64, Vec<u8>)],
+    ) -> Result<Vec<FrameLoc>, FsError> {
+        // Unreachable: a rotation cannot run while this reservation holds its
+        // shared `fill_barrier` guard, so the lane's segment identity is pinned
+        // for the whole claim-to-fill window. Checked anyway — writing a frame
+        // into the wrong segment's buffer would forge its AAD binding.
+        if open.segid != self.segid || sealed.len() != self.offsets.len() {
+            error!(
+                "reservation for {:?} lost its open segment (now {:?}) or frame count",
+                self.segid, open.segid
+            );
+            return Err(FsError::IoError);
+        }
+        let mut locs = Vec::with_capacity(sealed.len());
+        for (i, (offset, len)) in self.offsets.iter().zip(&self.lens).enumerate() {
+            let body = &sealed[i].2;
+            if body.len() != *len as usize {
+                error!(
+                    "sealed frame {} of {:?} is {} bytes, reserved {}",
+                    self.first_frame + i as u32,
+                    self.segid,
+                    body.len(),
+                    len
+                );
+                return Err(FsError::IoError);
+            }
+            let start = *offset as usize + crate::segment::LEN_PREFIX;
+            open.buf[start..start + body.len()].copy_from_slice(body);
+            locs.push(FrameLoc {
+                segid: self.segid,
+                frame_index: self.first_frame + i as u32,
+                byte_offset: *offset,
+                byte_len: crate::segment::LEN_PREFIX as u32 + len,
+            });
+        }
+        Ok(locs)
+    }
 }
 
 /// Nanoseconds spent in each phase of [`ExtentStore::stage_edits`], summed over
@@ -84,15 +192,16 @@ pub(super) struct StagePhaseNanos {
     pub(super) protect_ref: std::sync::atomic::AtomicU64,
     /// Waiting to enter the lane's append gate.
     pub(super) gate_wait: std::sync::atomic::AtomicU64,
-    /// Holding the lane's append gate (the per-lane serial section).
+    /// Holding the lane's append gate: reserving the frame-index run and byte
+    /// range only (the per-lane serial section).
     pub(super) gate_hold: std::sync::atomic::AtomicU64,
-    /// Batch AEAD, currently inside the append gate.
+    /// Batch AEAD, outside the append gate.
     pub(super) aead: std::sync::atomic::AtomicU64,
-    /// Blocking on the lane's open-buffer std mutex.
+    /// Blocking on the lane's open-buffer std mutex to fill the reservation.
     pub(super) open_lock_wait: std::sync::atomic::AtomicU64,
-    /// Copying sealed frames into the open buffer under that mutex.
+    /// Copying sealed frames into the reserved range under that mutex.
     pub(super) append: std::sync::atomic::AtomicU64,
-    /// Rotation admission, including the in-flight-seal residency permit.
+    /// Rotation admission: the residency permit plus the reservation drain.
     pub(super) spawn_seal: std::sync::atomic::AtomicU64,
     /// Staging pointers, cache inserts, and segment-counter deltas onto the txn.
     pub(super) txn_stage: std::sync::atomic::AtomicU64,
@@ -428,24 +537,46 @@ impl ExtentStore {
         }
         #[cfg(test)]
         StagePhaseNanos::add(&phase.protect_ref, t_protect);
-        // Keep later writers from appending once this writer discovers that a
-        // rotation is due. In particular, this guard stays held while
-        // spawn_seal waits for an in-flight-seal permit.
         #[cfg(test)]
         let t_gate_wait = std::time::Instant::now();
-        let (lane, _append_guard) = self.lock_append_lane(id).await;
+        let (lane, append_guard) = self.lock_append_lane(id).await;
         #[cfg(test)]
         StagePhaseNanos::add(&phase.gate_wait, t_gate_wait);
         #[cfg(test)]
         let t_gate_hold = std::time::Instant::now();
-        let prepared = if has_frames {
-            // Reserve the segment identity and contiguous frame-index run under
-            // the append gate, but do the batch AEAD without holding the open
-            // buffer mutex. `seal_open` takes the same gate before rotation.
-            let (segid, first_frame) = {
-                let open = lane.open.lock().unwrap();
-                (open.segid, open.dir.len() as u32)
+        // Under the gate, claim only what the AAD binds and the buffer layout
+        // owes: segment identity, a dense frame-index run, and the byte range.
+        // The batch AEAD that fills the claim then runs off the gate, so
+        // writers sharing a lane encrypt concurrently. `seal_open` and
+        // `spawn_seal` take the same gate plus the lane's exclusive fill
+        // barrier before rotating, so no rotation observes an unfilled claim.
+        let (reserved, rotate_guard) = if has_frames {
+            let fill_guard = lane.fill_barrier.read().await;
+            let claim: Vec<(u64, usize)> = edits
+                .iter()
+                .filter(|(_, edit)| edit.is_some())
+                .map(|(extent, _)| *extent)
+                .zip(compressed.iter().map(Compressed::sealed_len))
+                .collect();
+            let (reservation, buffered) = {
+                let mut open = lane.open.lock().unwrap();
+                let reservation = Reservation::claim(&mut open, id, &claim);
+                (reservation, open.buf.len())
             };
+            // Whoever's claim first carries the buffer past the threshold owns
+            // the rotation, and keeps the gate until it has rotated: discovery
+            // and rotation stay atomic, and later writers on this lane are held
+            // off exactly as they were before the AEAD moved out of the gate.
+            let rotate = (buffered >= self.seal_threshold()).then_some(append_guard);
+            (Some((reservation, fill_guard)), rotate)
+        } else {
+            drop(append_guard);
+            (None, None)
+        };
+        #[cfg(test)]
+        StagePhaseNanos::add(&phase.gate_hold, t_gate_hold);
+        let mut locs = Vec::new();
+        if let Some((reservation, fill_guard)) = reserved {
             #[cfg(test)]
             if let Some(probe) = &self.before_batch_seal {
                 probe();
@@ -465,17 +596,27 @@ impl ExtentStore {
                     })
                 })
                 .collect();
-            let sealed =
-                crate::segment::seal_compressed_batch(&self.codec, segid, first_frame, frames)
-                    .map_err(|_| FsError::IoError)?;
+            let sealed = crate::segment::seal_compressed_batch(
+                &self.codec,
+                reservation.segid,
+                reservation.first_frame,
+                frames,
+            );
             #[cfg(test)]
             StagePhaseNanos::add(&phase.aead, t_aead);
-            Some((segid, first_frame, sealed))
-        } else {
-            None
-        };
-        let mut locs = Vec::with_capacity(prepared.as_ref().map_or(0, |p| p.2.len()));
-        if let Some((segid, first_frame, sealed)) = prepared {
+            // A failed seal abandons the claim: its bytes stay zeroed behind a
+            // valid length prefix and its directory entries name extents whose
+            // committed FrameLocs point elsewhere (this transaction never
+            // commits), so both compaction and reclaim resolve past them by key.
+            let sealed = sealed.map_err(|e| {
+                error!(
+                    "batch AEAD failed for {:?}: {e}; {} reserved frames left unfilled \
+                     and unreferenced",
+                    reservation.segid,
+                    reservation.offsets.len()
+                );
+                FsError::IoError
+            })?;
             #[cfg(test)]
             let t_open_lock = std::time::Instant::now();
             let mut open = lane.open.lock().unwrap();
@@ -483,31 +624,11 @@ impl ExtentStore {
             StagePhaseNanos::add(&phase.open_lock_wait, t_open_lock);
             #[cfg(test)]
             let t_append = std::time::Instant::now();
-            if open.segid != segid || open.dir.len() as u32 != first_frame {
-                return Err(FsError::IoError);
-            }
-            open.dir.reserve(sealed.len());
-            for (i, (inode, extent, body)) in sealed.into_iter().enumerate() {
-                let byte_offset = open.buf.len() as u64;
-                let len = body.len() as u32;
-                open.buf.extend_from_slice(&len.to_le_bytes());
-                open.buf.extend_from_slice(&body);
-                let loc = FrameLoc {
-                    segid,
-                    frame_index: first_frame + i as u32,
-                    byte_offset,
-                    byte_len: 4 + len,
-                };
-                locs.push(loc);
-                open.dir.push(DirEntry {
-                    byte_offset,
-                    len,
-                    inode,
-                    extent,
-                });
-            }
+            locs = reservation.fill(&mut open, &sealed)?;
             #[cfg(test)]
             StagePhaseNanos::add(&phase.append, t_append);
+            drop(open);
+            drop(fill_guard);
         }
         #[cfg(test)]
         let t_txn_stage = std::time::Instant::now();
@@ -539,16 +660,13 @@ impl ExtentStore {
         }
         #[cfg(test)]
         StagePhaseNanos::add(&phase.txn_stage, t_txn_stage);
-        let over_threshold = lane.open.lock().unwrap().buf.len() >= self.seal_threshold();
-        if over_threshold {
+        if let Some(append_guard) = rotate_guard {
             #[cfg(test)]
             let t_spawn_seal = std::time::Instant::now();
-            self.spawn_seal(lane).await;
+            self.spawn_seal(lane, &append_guard).await;
             #[cfg(test)]
             StagePhaseNanos::add(&phase.spawn_seal, t_spawn_seal);
         }
-        #[cfg(test)]
-        StagePhaseNanos::add(&phase.gate_hold, t_gate_hold);
         Ok(())
     }
 
@@ -586,10 +704,18 @@ impl ExtentStore {
         failed
     }
 
+    /// Finalize a lane's open generation into `sealing` and start a fresh one.
+    ///
+    /// `_filled` is the lane's exclusive fill barrier: holding it is what makes
+    /// this sound. It proves every reservation on the lane has copied its
+    /// sealed bytes in, so the buffer is a complete frame stream rather than
+    /// one with holes, and (because the caller also holds the append gate) no
+    /// further reservation can be placed against the generation being sealed.
     fn rotate_sealing_generation(
         &self,
         lane: &OpenLane,
         residency: tokio::sync::OwnedSemaphorePermit,
+        _filled: &tokio::sync::RwLockWriteGuard<'_, ()>,
     ) -> Result<Option<(Segid, Bytes)>, FsError> {
         let mut open = lane.open.lock().unwrap();
         if open.dir.is_empty() {
@@ -682,7 +808,10 @@ impl ExtentStore {
                 next_lane += 1;
                 #[cfg(feature = "failpoints")]
                 fail_point!(fp::SEAL_OPEN_FAIL, |_| Err(FsError::IoError));
-                match self.rotate_sealing_generation(&self.open_lanes[index], residency) {
+                // Every append gate is frozen above, so this only waits out
+                // reservations already mid-AEAD; none can be added.
+                let filled = self.open_lanes[index].fill_barrier.write().await;
+                match self.rotate_sealing_generation(&self.open_lanes[index], residency, &filled) {
                     Ok(Some((segid, bytes))) => {
                         let segments = Arc::clone(&self.segments);
                         uploads
@@ -740,12 +869,19 @@ impl ExtentStore {
     /// path). Acquires a permit first, so a writer that outruns the object store
     /// blocks here (backpressure) instead of growing RAM without bound. The
     /// rotated buffer stays readable via `sealing` until its PUT lands.
-    async fn spawn_seal(&self, lane: &OpenLane) {
+    ///
+    /// `_append_guard` must be this lane's gate: it keeps later writers from
+    /// reserving into the generation being rotated, both while this waits for a
+    /// residency permit and while it drains reservations already in flight.
+    async fn spawn_seal(&self, lane: &OpenLane, _append_guard: &tokio::sync::MutexGuard<'_, ()>) {
         let residency = match Arc::clone(&self.seal_residency_sem).acquire_owned().await {
             Ok(p) => p,
             Err(_) => return,
         };
-        let (segid, _) = match self.rotate_sealing_generation(lane, residency) {
+        // Batches that reserved before this gate hold may still be encrypting.
+        // No new one can start, so the wait is bounded by one batch's AEAD.
+        let filled = lane.fill_barrier.write().await;
+        let (segid, _) = match self.rotate_sealing_generation(lane, residency, &filled) {
             Ok(Some(generation)) => generation,
             Ok(None) => return,
             Err(e) => {
@@ -753,6 +889,7 @@ impl ExtentStore {
                 return;
             }
         };
+        drop(filled);
         let segments = self.segments.clone();
         let sealing = self.sealing.clone();
         let upload_sem = self.seal_upload_sem.clone();
@@ -2299,6 +2436,311 @@ mod tests {
             db_lookups_before,
             "a warm overwrite must resolve superseded FrameLocs from the \
              location cache, not database point reads"
+        );
+    }
+
+    /// A one-shot blocking latch usable from the synchronous `before_batch_seal`
+    /// probe, which cannot await. Parks a runtime worker thread, so every test
+    /// using it runs on the multi-thread flavor with spare workers.
+    struct Latch {
+        entered: std::sync::atomic::AtomicBool,
+        released: std::sync::Mutex<bool>,
+        wake: std::sync::Condvar,
+    }
+
+    impl Latch {
+        fn new() -> Self {
+            Self {
+                entered: std::sync::atomic::AtomicBool::new(false),
+                released: std::sync::Mutex::new(false),
+                wake: std::sync::Condvar::new(),
+            }
+        }
+
+        fn block(&self) {
+            self.entered
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let mut released = self.released.lock().unwrap();
+            while !*released {
+                released = self.wake.wait(released).unwrap();
+            }
+        }
+
+        fn entered(&self) -> bool {
+            self.entered.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn release(&self) {
+            *self.released.lock().unwrap() = true;
+            self.wake.notify_all();
+        }
+    }
+
+    // The per-lane append gate exists to hand out (segid, frame-index run, byte
+    // range), not to guard the ~300us batch AEAD that follows it. Writers that
+    // share one lane must therefore encrypt concurrently. Pin it by removing
+    // the idle-lane spill (the other gates are held) so every writer really
+    // does contend for one gate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn same_lane_batches_overlap_their_aead() {
+        const WRITERS: u64 = 4;
+        let (mut store, db) = make().await;
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        store.before_batch_seal = Some({
+            let active = Arc::clone(&active);
+            let max_active = Arc::clone(&max_active);
+            Arc::new(move || {
+                // block_in_place hands this worker's remaining tasks to the
+                // other workers. Without it the writer woken by the gate
+                // release sits in this worker's (unstealable) LIFO slot for the
+                // whole sleep, and the test measures tokio, not the gate.
+                tokio::task::block_in_place(|| {
+                    let now = active.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    max_active.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(150));
+                    active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                });
+            })
+        });
+
+        // Every writer's affine lane is lane 0; holding the other three gates
+        // denies `lock_append_lane` its idle-lane spill.
+        let inodes: Vec<InodeId> = (0..WRITERS)
+            .map(|w| 100 + w * OPEN_SEGMENT_LANES as u64)
+            .collect();
+        for inode in &inodes {
+            assert!(
+                std::ptr::eq(store.open_lane(*inode), &store.open_lanes[0]),
+                "test premise: every writer is affine to lane 0"
+            );
+        }
+        let mut held = Vec::new();
+        for lane in store.open_lanes.iter().skip(1) {
+            held.push(lane.append_gate.lock().await);
+        }
+
+        let writes: Vec<_> = inodes
+            .iter()
+            .map(|inode| {
+                let (store, db, inode) = (store.clone(), db.clone(), *inode);
+                crate::task::spawn_named("same-lane-writer", async move {
+                    let mut txn = db.new_transaction().unwrap();
+                    let payload = Bytes::from(incompressible(inode as usize, EXTENT_SIZE));
+                    store
+                        .stage_edits(&mut txn, inode, &[(0, Some(payload))], 0)
+                        .await
+                        .unwrap();
+                    commit(&store, txn).await;
+                })
+            })
+            .collect();
+        for write in writes {
+            write.await.unwrap();
+        }
+        drop(held);
+
+        assert_eq!(
+            max_active.load(std::sync::atomic::Ordering::SeqCst),
+            WRITERS as usize,
+            "batches sharing one append lane serialized their AEAD"
+        );
+
+        // Overlapped AEAD must still land each frame at its reserved index.
+        for inode in &inodes {
+            assert_eq!(
+                store.read(*inode, 0, EXTENT_SIZE as u64).await.unwrap(),
+                Bytes::from(incompressible(*inode as usize, EXTENT_SIZE)),
+            );
+        }
+        store.seal_open().await.unwrap();
+    }
+
+    // A batch that has reserved its byte range but not yet filled it leaves a
+    // hole in the open buffer. Rotation (the flush barrier here) must wait for
+    // that fill instead of sealing the hole into an immutable segment.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn rotation_waits_for_an_in_flight_reservation_instead_of_sealing_a_hole() {
+        let (mut store, db, object_store) = make_with_compression(CompressionConfig::Lz4).await;
+        let inode: InodeId = 5;
+        let seed = Bytes::from(incompressible(11, EXTENT_SIZE));
+        let stalled = Bytes::from(incompressible(22, EXTENT_SIZE));
+
+        let latch = Arc::new(Latch::new());
+        let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        store.before_batch_seal = Some({
+            let latch = Arc::clone(&latch);
+            let armed = Arc::clone(&armed);
+            Arc::new(move || {
+                if armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    latch.block();
+                }
+            })
+        });
+
+        let mut txn = db.new_transaction().unwrap();
+        store.write(&mut txn, inode, 0, &seed, 0).await.unwrap();
+        commit(&store, txn).await;
+        let lane = store.open_lane(inode);
+        let (segid, frames_before) = {
+            let open = lane.open.lock().unwrap();
+            (open.segid, open.dir.len())
+        };
+        assert_eq!(frames_before, 1);
+
+        armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        let writer = crate::task::spawn_named("stalled-writer", {
+            let (store, db, stalled) = (store.clone(), db.clone(), stalled.clone());
+            async move {
+                let mut txn = db.new_transaction().unwrap();
+                store
+                    .write(&mut txn, inode, EXTENT_SIZE as u64, &stalled, 0)
+                    .await
+                    .unwrap();
+                commit(&store, txn).await;
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !latch.entered() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the second batch never reached its AEAD window");
+
+        // The reservation is published (frame index and byte range claimed)
+        // while its bytes are still unwritten: exactly the hole rotation must
+        // not seal. It also proves the gate was released before the AEAD.
+        let (reserved_frames, reserved_segid) = {
+            let open = lane.open.lock().unwrap();
+            (open.dir.len(), open.segid)
+        };
+
+        let mut flush = crate::task::spawn_named("flush", {
+            let store = store.clone();
+            async move { store.seal_open().await }
+        });
+        let sealed_early = tokio::time::timeout(std::time::Duration::from_millis(400), &mut flush)
+            .await
+            .is_ok();
+
+        // Release before asserting: a parked latch would otherwise wedge
+        // runtime shutdown and turn a failure into a hang.
+        latch.release();
+        writer.await.unwrap();
+        flush.await.unwrap().unwrap();
+        assert_eq!(
+            reserved_frames, 2,
+            "the stalled batch did not reserve its frame slot before the AEAD"
+        );
+        assert_eq!(reserved_segid, segid);
+        assert!(
+            !sealed_early,
+            "the flush barrier sealed a segment while a reservation was unfilled"
+        );
+
+        // Cold reader over the published objects: proves the segment on the
+        // object store carries real frame bytes, not a zero hole.
+        let cold = make_store(object_store, db.clone(), CompressionConfig::Lz4, 8);
+        assert_eq!(cold.read(inode, 0, EXTENT_SIZE as u64).await.unwrap(), seed);
+        assert_eq!(
+            cold.read(inode, EXTENT_SIZE as u64, EXTENT_SIZE as u64)
+                .await
+                .unwrap(),
+            stalled
+        );
+    }
+
+    // A reserved-but-unfilled range must never be read back or shipped as if it
+    // held frame bytes. Committed neighbours in the same open segment stay
+    // exact while the hole is open.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn a_reservation_hole_never_leaks_into_reads_or_shipped_frames() {
+        let (mut store, db) = make().await;
+        let inode: InodeId = 5;
+        let seed = Bytes::from(incompressible(33, EXTENT_SIZE));
+
+        let latch = Arc::new(Latch::new());
+        let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        store.before_batch_seal = Some({
+            let latch = Arc::clone(&latch);
+            let armed = Arc::clone(&armed);
+            Arc::new(move || {
+                if armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    latch.block();
+                }
+            })
+        });
+
+        let mut txn = db.new_transaction().unwrap();
+        store.write(&mut txn, inode, 0, &seed, 0).await.unwrap();
+        commit(&store, txn).await;
+        let seed_loc = frameloc_of(&store, &db, inode, 0).await.unwrap();
+
+        armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        let writer = crate::task::spawn_named("stalled-writer", {
+            let (store, db) = (store.clone(), db.clone());
+            async move {
+                let mut txn = db.new_transaction().unwrap();
+                store
+                    .write(
+                        &mut txn,
+                        inode,
+                        EXTENT_SIZE as u64,
+                        &Bytes::from(incompressible(44, EXTENT_SIZE)),
+                        0,
+                    )
+                    .await
+                    .unwrap();
+                commit(&store, txn).await;
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !latch.entered() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the second batch never reached its AEAD window");
+
+        // Force a real decode out of the open buffer, past the plaintext cache.
+        evict_decoded_extents(&store);
+        let read_through_hole = store.read(inode, 0, EXTENT_SIZE as u64).await;
+
+        // The HA ship path reads the same buffer by (segid, offset, len).
+        let key = store.key_codec.extent_key(inode, 0);
+        let enriched = store.enrich_repl_ops(vec![ReplOp::Put(
+            key.clone(),
+            Bytes::copy_from_slice(&seed_loc.encode()),
+        )]);
+        let shipped = match enriched.as_slice() {
+            [ReplOp::PutFrame(shipped_key, _, frame)] if *shipped_key == key => {
+                Some(crate::segment::read_frames_from_region(
+                    &store.codec,
+                    frame,
+                    seed_loc.segid,
+                    seed_loc.frame_index,
+                    &[(inode, 0)],
+                ))
+            }
+            _ => None,
+        };
+
+        // Release before asserting: a parked latch would otherwise wedge
+        // runtime shutdown and turn a failure into a hang.
+        latch.release();
+        writer.await.unwrap();
+        store.seal_open().await.unwrap();
+        assert_eq!(
+            read_through_hole.unwrap(),
+            seed,
+            "a neighbouring reservation hole corrupted a committed frame's read"
+        );
+        assert_eq!(
+            shipped
+                .expect("a resident frame must ship as PutFrame")
+                .expect("a shipped frame must AEAD-verify at its own index"),
+            vec![seed.to_vec()],
         );
     }
 

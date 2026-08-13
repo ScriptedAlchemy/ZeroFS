@@ -26,6 +26,9 @@ use crate::config::CompressionConfig;
 
 const NONCE_SIZE: usize = 24;
 const TAG_SIZE: usize = 16;
+/// Fixed per-frame expansion of [`FrameCodec::seal_compressed`]: the prepended
+/// nonce plus the appended authentication tag. See [`Compressed::sealed_len`].
+pub(crate) const SEALED_FRAME_OVERHEAD: usize = NONCE_SIZE + TAG_SIZE;
 pub(crate) const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 
 #[derive(Debug, thiserror::Error)]
@@ -55,6 +58,18 @@ impl Compressed {
     #[allow(clippy::len_without_is_empty)] // a compressed payload is never empty
     pub fn len(&self) -> usize {
         self.0.len()
+    }
+
+    /// Exact byte length [`FrameCodec::seal_compressed`] will return for this
+    /// payload. The wire format prepends a fixed-size nonce and appends a
+    /// fixed-size tag around a stream cipher, so the sealed size depends only
+    /// on the compressed size — never on the key, the AAD, or the nonce draw.
+    ///
+    /// The extent write path relies on this: it reserves a frame's byte range
+    /// in the open segment buffer under a short lock, then runs the AEAD
+    /// outside that lock and copies the result into the reserved range.
+    pub fn sealed_len(&self) -> usize {
+        self.0.len() + SEALED_FRAME_OVERHEAD
     }
 }
 
@@ -240,6 +255,44 @@ mod tests {
         for c in [&a, &b, &a] {
             let sealed = c.seal(&plain, b"aad").unwrap();
             assert_eq!(c.open(&sealed, b"aad").unwrap(), plain);
+        }
+    }
+
+    // The extent write path reserves each frame's byte range in the open
+    // segment before the AEAD runs, so the sealed size must be a pure function
+    // of the compressed size. Pin it across codecs, sizes, AAD, and repeated
+    // (fresh-nonce) seals: a variable-length sealed frame would silently
+    // corrupt every reservation placed after it.
+    #[test]
+    fn sealed_len_predicts_seal_compressed_output_exactly() {
+        for compression in [
+            CompressionConfig::Lz4,
+            CompressionConfig::Zstd(1),
+            CompressionConfig::Zstd(19),
+        ] {
+            let c = FrameCodec::new(&[9u8; 32], b"t", compression);
+            for size in [0usize, 1, 17, 4096, 65_536] {
+                for fill in [0u8, 0xAB] {
+                    let plain = vec![fill; size];
+                    let compressed = c.compress(&plain).unwrap();
+                    let predicted = compressed.sealed_len();
+                    // Two seals of equal payloads draw different nonces; both
+                    // must land on the same predicted length.
+                    for aad in [b"aad-1".as_slice(), b"".as_slice()] {
+                        let again = c.compress(&plain).unwrap();
+                        assert_eq!(again.len(), compressed.len());
+                        let sealed = c.seal_compressed(again, aad).unwrap();
+                        assert_eq!(
+                            sealed.len(),
+                            predicted,
+                            "sealed length is not predictable for {compression:?} \
+                             at {size} bytes"
+                        );
+                    }
+                    let sealed = c.seal_compressed(compressed, b"aad-1").unwrap();
+                    assert_eq!(c.open(&sealed, b"aad-1").unwrap(), plain);
+                }
+            }
         }
     }
 

@@ -275,6 +275,7 @@ impl ExtentStore {
         let codec = segments.codec();
         let open_lanes = Arc::new(std::array::from_fn(|_| OpenLane {
             append_gate: tokio::sync::Mutex::new(()),
+            fill_barrier: tokio::sync::RwLock::new(()),
             open: Mutex::new(OpenSegment {
                 segid: segments.next_segid(),
                 buf: Vec::with_capacity(seal_threshold),
