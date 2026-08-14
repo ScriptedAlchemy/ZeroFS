@@ -36,6 +36,7 @@ prod_access=nfs
 confirm_replace=
 dry_run=false
 assume_existing=false
+assume_stopped=false
 
 while (($#)); do
   case "$1" in
@@ -58,10 +59,16 @@ while (($#)); do
     --prod-access) prod_access=$2; shift 2 ;;
     --confirm-replace) confirm_replace=$2; shift 2 ;;
     --assume-existing) assume_existing=true; shift ;;
+    --assume-stopped) assume_stopped=true; shift ;;
     --dry-run) dry_run=true; shift ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
+
+if [[ $assume_stopped == true && $dry_run != true ]]; then
+  echo "--assume-stopped is valid only with --dry-run" >&2
+  exit 2
+fi
 
 [[ $ctid =~ ^[1-9][0-9]{2,8}$ ]] || { echo "invalid --ctid" >&2; exit 2; }
 [[ $role == prod || $role == dev ]] || { echo "--role must be prod or dev" >&2; exit 2; }
@@ -131,7 +138,8 @@ ct_exists() {
 
 ct_running() {
   if [[ $dry_run == true ]]; then
-    return 0
+    [[ $assume_stopped != true ]]
+    return
   fi
   [[ $(pct status "$ctid" 2>/dev/null) == "status: running" ]]
 }
@@ -238,6 +246,7 @@ quiesce_prod_share() {
 
 assert_prod_nfs_quiesced() {
   [[ $role == prod ]] || return 0
+  ct_running || return 0
   if [[ $dry_run == true ]]; then
     echo "+ prove no established NFS clients remain on $container_ip:2049"
     return
@@ -282,8 +291,12 @@ if [[ $dry_run == false ]]; then
 fi
 
 had_ct=false
+had_running_ct=false
 if ct_exists; then
   had_ct=true
+  if ct_running; then
+    had_running_ct=true
+  fi
 fi
 previous_release=
 if [[ $dry_run == false && -L $state_root/current ]]; then
@@ -304,7 +317,7 @@ rollback() {
     pct destroy "$ctid" --purge 1 >/dev/null 2>&1
     pct restore "$ctid" "$rollback_backup" --force 1
     pct start "$ctid"
-  elif [[ $had_ct == true ]] && pct config "$ctid" >/dev/null 2>&1; then
+  elif [[ $had_ct == true && $had_running_ct == true ]] && pct config "$ctid" >/dev/null 2>&1; then
     pct start "$ctid" >/dev/null 2>&1
     pct exec "$ctid" -- systemctl restart zerofs-lxc.service >/dev/null 2>&1
     if [[ $role == prod ]]; then
@@ -339,7 +352,7 @@ if [[ $had_ct == true ]]; then
   assert_prod_nfs_quiesced
   assert_server_drained
   assert_prod_nfs_quiesced
-  if [[ $role == prod ]]; then
+  if [[ $role == prod ]] && ct_running; then
     run pct exec "$ctid" -- systemctl stop zerofs-lxc.service
   fi
 fi

@@ -129,6 +129,18 @@ class HostScriptTests(unittest.TestCase):
         )
         self.assertNotIn("smbd.service", result.stdout)
 
+    def test_stopped_prod_recovery_skips_live_quiesce_and_starts_container(
+        self,
+    ) -> None:
+        result = self.run_host(
+            "deploy", "--assume-existing", "--assume-stopped", role="prod"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn(
+            "pct exec 120 -- systemctl stop zerofs-lxc.service", result.stdout
+        )
+        self.assertIn("pct start 120", result.stdout)
+
     def test_listener_proof_rejects_wildcard_webui(self) -> None:
         source = HOST_SCRIPT.read_text()
         self.assertIn("$container_ip:8080", source)
