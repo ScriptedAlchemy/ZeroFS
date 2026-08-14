@@ -461,6 +461,14 @@ def node_version_supported(value: str) -> bool:
     return (major == 20 and minor >= 19) or (major == 22 and minor >= 12) or major > 22
 
 
+def release_rustflags(existing: str) -> str:
+    flags = existing.strip()
+    for required in ("--cfg tokio_unstable", "--cfg io_uring_skip_arch_check"):
+        if required not in flags:
+            flags = f"{flags} {required}".strip()
+    return flags
+
+
 def _build(runner: Runner, root: Path, role: str) -> Path:
     target = root / "target" / "proxmox-lxc"
     if role == "prod":
@@ -511,6 +519,7 @@ def _build(runner: Runner, root: Path, role: str) -> Path:
     ]
     if role == "prod":
         command.extend(["--features", "webui"])
+    os.environ["RUSTFLAGS"] = release_rustflags(os.environ.get("RUSTFLAGS", ""))
     runner.run(command, cwd=root)
     return target / "release" / "zerofs"
 

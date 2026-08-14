@@ -265,6 +265,14 @@ class PlanTests(unittest.TestCase):
         self.assertFalse(deploy.node_version_supported("v20.18.9"))
         self.assertFalse(deploy.node_version_supported("not-node"))
 
+    def test_release_rustflags_enable_named_tasks_and_io_uring(self) -> None:
+        self.assertEqual(
+            deploy.release_rustflags("-C target-cpu=native"),
+            "-C target-cpu=native --cfg tokio_unstable --cfg io_uring_skip_arch_check",
+        )
+        existing = "--cfg tokio_unstable --cfg io_uring_skip_arch_check"
+        self.assertEqual(deploy.release_rustflags(existing), existing)
+
     def test_replace_requires_exact_ctid_confirmation(self) -> None:
         with self.assertRaisesRegex(ValueError, "ZEROFS_CONFIRM_REPLACE=120"):
             deploy.require_replace_confirmation(120, None)
