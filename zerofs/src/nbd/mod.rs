@@ -1,6 +1,7 @@
 pub mod error;
 pub mod handler;
 pub mod server;
+pub(crate) mod volatile_overlay;
 
 pub use handler::NbdExportGates;
 pub use server::NBDServer;

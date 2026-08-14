@@ -218,6 +218,11 @@ unix_socket = "/tmp/zerofs.9p.sock"  # Optional
 [servers.nbd]
 addresses = ["127.0.0.1:10809"]
 unix_socket = "/tmp/zerofs.nbd.sock"  # Optional
+# Safe default: acknowledge after canonical materialization.
+write_ack_mode = "materialized"
+# Opt-in unsafe burst mode instead:
+# write_ack_mode = "volatile_memory"
+# volatile_memory_gb = 8.0
 
 [servers.rpc]
 addresses = ["127.0.0.1:7000"]  # Needed by zerofs checkpoint, flush, monitor, fatrace, otrace

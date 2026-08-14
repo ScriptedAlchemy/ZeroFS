@@ -228,7 +228,19 @@ unix_socket = "/tmp/zerofs.9p.sock"  # Optional
 [servers.nbd]
 addresses = ["0.0.0.0:10809"]
 unix_socket = "/tmp/zerofs.nbd.sock"  # Optional
+write_ack_mode = "materialized"       # Safe default
+# Dangerous, opt-in RAM acknowledgement for high-speed bursts:
+# write_ack_mode = "volatile_memory"
+# volatile_memory_gb = 8.0
 ```
+
+`volatile_memory` replies to an ordinary NBD WRITE once ZeroFS owns the bytes
+in a process-wide bounded RAM overlay. Those acknowledged bytes are lost on a
+process crash or power failure until a FLUSH or FUA request completes. FLUSH
+and FUA wait for canonical materialization and the normal durability barrier.
+The RAM budget is shared by all NBD exports and backpressures writers when it
+fills. This mode requires writable exclusive NBD access: replication, NFS, 9P,
+WebUI, read-only/checkpoint operation, and `ignore_fsync` are rejected.
 
 ### RPC Server
 

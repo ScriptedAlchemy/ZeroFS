@@ -960,6 +960,9 @@ impl ServerConfig {
         {
             anyhow::bail!("[servers.webui] must configure at least one address endpoint");
         }
+        if let Some(nbd) = &self.nbd {
+            nbd.validate()?;
+        }
         Ok(())
     }
 
@@ -1050,7 +1053,26 @@ pub struct NbdConfig {
         default
     )]
     pub unix_socket: Option<PathBuf>,
+    /// Point at which an ordinary NBD WRITE is acknowledged.
+    ///
+    /// `volatile_memory` is intentionally unsafe across process or power loss:
+    /// FLUSH/FUA remain the durability boundary.
+    #[serde(default)]
+    pub write_ack_mode: NbdWriteAckMode,
+    /// Global RAM ceiling for volatile NBD writes, shared by every export.
+    #[serde(default)]
+    pub volatile_memory_gb: f64,
 }
+
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NbdWriteAckMode {
+    #[default]
+    Materialized,
+    VolatileMemory,
+}
+
+const MIN_NBD_VOLATILE_MEMORY_BYTES: u64 = 128 * 1024 * 1024;
 
 impl NbdConfig {
     fn has_endpoint(&self) -> bool {
@@ -1061,6 +1083,37 @@ impl NbdConfig {
                 .unix_socket
                 .as_ref()
                 .is_some_and(|path| !path.as_os_str().is_empty())
+    }
+
+    fn validate(&self) -> Result<()> {
+        match self.write_ack_mode {
+            NbdWriteAckMode::Materialized if self.volatile_memory_gb != 0.0 => anyhow::bail!(
+                "[servers.nbd] volatile_memory_gb is only valid when write_ack_mode = \"volatile_memory\""
+            ),
+            NbdWriteAckMode::VolatileMemory
+                if !self.volatile_memory_gb.is_finite()
+                    || self.volatile_memory_gb * 1_000_000_000.0
+                        < MIN_NBD_VOLATILE_MEMORY_BYTES as f64 =>
+            {
+                anyhow::bail!(
+                    "[servers.nbd] volatile_memory_gb must be finite and hold at least one maximum NBD WRITE ({} bytes) when write_ack_mode = \"volatile_memory\"",
+                    MIN_NBD_VOLATILE_MEMORY_BYTES
+                )
+            }
+            _ => Ok(()),
+        }
+    }
+
+    pub fn volatile_memory_bytes(&self) -> Result<u64> {
+        self.validate()?;
+        if self.write_ack_mode == NbdWriteAckMode::Materialized {
+            return Ok(0);
+        }
+        let bytes = self.volatile_memory_gb * 1_000_000_000.0;
+        if bytes > u64::MAX as f64 {
+            anyhow::bail!("[servers.nbd] volatile_memory_gb exceeds this platform's address space");
+        }
+        Ok(bytes.round() as u64)
     }
 }
 
@@ -1403,6 +1456,36 @@ impl Settings {
         self.writeback_settings(crate::writeback::config::WritebackAccessMode::ReadWrite)?;
 
         if self
+            .servers
+            .nbd
+            .as_ref()
+            .is_some_and(|nbd| nbd.write_ack_mode == NbdWriteAckMode::VolatileMemory)
+        {
+            if self.replication.is_some() {
+                anyhow::bail!(
+                    "[servers.nbd] volatile_memory acknowledgement is not supported with [replication]"
+                );
+            }
+            if self.servers.nfs.is_some()
+                || self.servers.ninep.is_some()
+                || self.servers.webui.is_some()
+            {
+                anyhow::bail!(
+                    "[servers.nbd] volatile_memory acknowledgement requires exclusive NBD access; disable NFS, 9P, and WebUI listeners"
+                );
+            }
+            if self
+                .filesystem
+                .as_ref()
+                .is_some_and(|filesystem| filesystem.ignore_fsync)
+            {
+                anyhow::bail!(
+                    "[servers.nbd] volatile_memory acknowledgement requires functional FLUSH/FUA; [filesystem] ignore_fsync must be false"
+                );
+            }
+        }
+
+        if self
             .writeback
             .as_ref()
             .is_some_and(|writeback| writeback.enabled)
@@ -1566,6 +1649,8 @@ impl Settings {
                 nbd: Some(NbdConfig {
                     addresses: Some(default_nbd_addresses()),
                     unix_socket: Some(PathBuf::from("/tmp/zerofs.nbd.sock")),
+                    write_ack_mode: NbdWriteAckMode::default(),
+                    volatile_memory_gb: 0.0,
                 }),
                 rpc: Some(RpcConfig {
                     addresses: Some(default_rpc_addresses()),
@@ -2104,6 +2189,113 @@ encryption_password = "test"
             "unexpected error: {message}"
         );
         assert!(message.contains("endpoint"), "unexpected error: {message}");
+    }
+
+    #[test]
+    fn nbd_volatile_memory_ack_requires_an_explicit_positive_budget() {
+        let error = write_and_load(
+            r#"
+[cache]
+dir = "/tmp/cache"
+disk_size_gb = 1.0
+
+[storage]
+url = "file:///tmp/data"
+encryption_password = "test"
+
+[servers.nbd]
+addresses = ["127.0.0.1:10809"]
+write_ack_mode = "volatile_memory"
+"#,
+        )
+        .unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("volatile_memory_gb"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn nbd_volatile_memory_ack_normalizes_its_byte_budget() {
+        let settings = write_and_load(
+            r#"
+[cache]
+dir = "/tmp/cache"
+disk_size_gb = 1.0
+
+[storage]
+url = "file:///tmp/data"
+encryption_password = "test"
+
+[servers.nbd]
+addresses = ["127.0.0.1:10809"]
+write_ack_mode = "volatile_memory"
+volatile_memory_gb = 2.0
+"#,
+        )
+        .unwrap();
+
+        let nbd = settings.servers.nbd.as_ref().unwrap();
+        assert_eq!(nbd.write_ack_mode, NbdWriteAckMode::VolatileMemory);
+        assert_eq!(nbd.volatile_memory_bytes().unwrap(), 2_000_000_000);
+    }
+
+    #[test]
+    fn nbd_volatile_memory_budget_must_fit_one_maximum_write() {
+        let error = write_and_load(
+            r#"
+[cache]
+dir = "/tmp/cache"
+disk_size_gb = 1.0
+
+[storage]
+url = "file:///tmp/data"
+encryption_password = "test"
+
+[servers.nbd]
+addresses = ["127.0.0.1:10809"]
+write_ack_mode = "volatile_memory"
+volatile_memory_gb = 0.125
+"#,
+        )
+        .unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("maximum NBD WRITE"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn nbd_volatile_memory_ack_rejects_the_writable_webui() {
+        let error = write_and_load(
+            r#"
+[cache]
+dir = "/tmp/cache"
+disk_size_gb = 1.0
+
+[storage]
+url = "file:///tmp/data"
+encryption_password = "test"
+
+[servers.nbd]
+addresses = ["127.0.0.1:10809"]
+write_ack_mode = "volatile_memory"
+volatile_memory_gb = 1.0
+
+[servers.webui]
+addresses = ["127.0.0.1:8080"]
+uid = 1000
+gid = 1000
+"#,
+        )
+        .unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("WebUI"),
+            "unexpected error: {error:#}"
+        );
     }
 
     #[test]

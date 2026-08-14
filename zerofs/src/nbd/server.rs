@@ -1,5 +1,7 @@
 use super::error::{CommandError, NBDError, Result};
-use super::handler::{NBDDevice, NBDHandler, NbdExportGates, OptionReply, OptionResult};
+use super::handler::{
+    MutationAdmission, NBDDevice, NBDHandler, NbdExportGates, OptionReply, OptionResult,
+};
 use super::out_of_bounds;
 use crate::fs::ZeroFS;
 use bytes::BytesMut;
@@ -400,7 +402,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
 
         self.writer.write_all(&device.size().to_be_bytes()).await?;
         self.writer
-            .write_all(&TRANSMISSION_FLAGS.to_be_bytes())
+            .write_all(&device.transmission_flags().to_be_bytes())
             .await?;
 
         if !self.client_no_zeroes {
@@ -679,7 +681,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
             None => Ok(()),
             Some((data, admission)) => {
                 self.handler
-                    .write_admitted(device, offset, &data, fua, admission)
+                    .write_admitted(device, offset, data, fua, admission)
                     .await
             }
         }
@@ -727,7 +729,7 @@ enum AdmittedCommand {
         offset: u64,
         data: bytes::Bytes,
         fua: bool,
-        admission: tokio::sync::OwnedRwLockReadGuard<()>,
+        admission: MutationAdmission,
     },
     Flush,
     Trim {
@@ -755,22 +757,13 @@ async fn admit_write<R>(
     offset: u64,
     length: u32,
     shutdown: &CancellationToken,
-) -> super::error::CommandResult<Option<(bytes::Bytes, tokio::sync::OwnedRwLockReadGuard<()>)>>
+) -> super::error::CommandResult<Option<(bytes::Bytes, MutationAdmission)>>
 where
     R: AsyncRead + Unpin,
 {
     // Consume an invalid write's payload to keep the request stream aligned.
     if out_of_bounds(offset, length, device.size()) {
-        let mut remaining = length as usize;
-        let mut buf = vec![0; remaining.min(DISCARD_CHUNK_SIZE)];
-        while remaining > 0 {
-            let chunk = remaining.min(buf.len());
-            reader
-                .read_exact(&mut buf[..chunk])
-                .await
-                .map_err(|_| CommandError::IoError)?;
-            remaining -= chunk;
-        }
+        discard_write_payload(reader, length, shutdown).await?;
         return Err(CommandError::NoSpace);
     }
 
@@ -778,7 +771,13 @@ where
         return Ok(None);
     }
 
-    let admission = handler.begin_mutation(device).await;
+    let admission = match handler.begin_mutation(device, length as usize).await {
+        Ok(admission) => admission,
+        Err(error) => {
+            discard_write_payload(reader, length, shutdown).await?;
+            return Err(error);
+        }
+    };
     let mut data = BytesMut::zeroed(length as usize);
     tokio::select! {
         _ = shutdown.cancelled() => return Err(CommandError::IoError),
@@ -788,7 +787,13 @@ where
         ) => {
             match result {
                 Ok(read) => {
-                    read.map_err(|_| CommandError::IoError)?;
+                    if read.is_err() {
+                        // Any short/failed payload read destroys request
+                        // framing just like a timeout. Never parse its tail as
+                        // another NBD header.
+                        shutdown.cancel();
+                        return Err(CommandError::IoError);
+                    }
                 }
                 Err(_) => {
                     // The remainder of a timed-out payload cannot be
@@ -803,6 +808,42 @@ where
     }
 
     Ok(Some((data.freeze(), admission)))
+}
+
+async fn discard_write_payload<R>(
+    reader: &mut R,
+    length: u32,
+    shutdown: &CancellationToken,
+) -> super::error::CommandResult<()>
+where
+    R: AsyncRead + Unpin,
+{
+    let discard = async {
+        let mut remaining = length as usize;
+        let mut buffer = vec![0; remaining.min(DISCARD_CHUNK_SIZE)];
+        while remaining > 0 {
+            let chunk = remaining.min(buffer.len());
+            reader
+                .read_exact(&mut buffer[..chunk])
+                .await
+                .map_err(|_| CommandError::IoError)?;
+            remaining -= chunk;
+        }
+        Ok(())
+    };
+    let result = tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => Err(CommandError::IoError),
+        result = tokio::time::timeout(WRITE_PAYLOAD_TIMEOUT, discard) => {
+            result.unwrap_or(Err(CommandError::IoError))
+        }
+    };
+    if result.is_err() {
+        // A partial discard leaves the next request boundary unknowable. The
+        // only safe recovery is to terminate this client session.
+        shutdown.cancel();
+    }
+    result
 }
 
 /// Read the next request, consuming everything it owes the stream, and return
@@ -947,7 +988,7 @@ async fn run_admitted(
             fua,
             admission,
         } => handler
-            .write_admitted(device, offset, &data, fua, admission)
+            .write_admitted(device, offset, data, fua, admission)
             .await
             .map(|()| empty),
         AdmittedCommand::Flush => handler.flush(device).await.map(|()| empty),
@@ -991,7 +1032,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_INFLIGHT_BYTES, MAX_REQUEST_LENGTH, NBDServer, NBDSession, budget_cost};
+    use super::{
+        CommandError, MAX_INFLIGHT_BYTES, MAX_REQUEST_LENGTH, NBDServer, NBDSession, admit_write,
+        budget_cost,
+    };
     use crate::fs::ZeroFS;
     use crate::fs::permissions::Credentials;
     use crate::fs::types::{SetAttributes, SetSize};
@@ -1779,15 +1823,12 @@ mod tests {
 
         let fua_handler = NBDHandler::new(filesystem, export_gates);
         let fua_task = tokio::spawn(async move {
-            let admission = fua_handler.begin_mutation(&fua_device).await;
+            let payload = Bytes::from(vec![0x33; 4096]);
+            let admission = fua_handler
+                .begin_mutation(&fua_device, payload.len())
+                .await?;
             fua_handler
-                .write_admitted(
-                    &fua_device,
-                    0,
-                    &Bytes::from(vec![0x33; 4096]),
-                    true,
-                    admission,
-                )
+                .write_admitted(&fua_device, 0, payload, true, admission)
                 .await
         });
 
@@ -2392,6 +2433,172 @@ mod tests {
             .expect("server accepted disconnect");
     }
 
+    #[tokio::test]
+    async fn volatile_write_replies_and_reads_from_ram_before_flush_materializes_it() {
+        let filesystem = Arc::new(
+            ZeroFS::new_in_memory()
+                .await
+                .expect("create test filesystem"),
+        );
+        let export_gates = Arc::new(NbdExportGates::new(1024 * 1024));
+        let device = single_file_export(&filesystem, &export_gates).await;
+        let commit_block = filesystem.db.flush_barrier().write_owned().await;
+        let apply_reached = filesystem.write_coordinator.probe_next_apply();
+        let (server_stream, mut client_stream) = tokio::io::duplex(1024 * 1024);
+        let (reader, writer) = tokio::io::split(server_stream);
+        let mut session = NBDSession::new(
+            reader,
+            writer,
+            Arc::clone(&filesystem),
+            Arc::clone(&export_gates),
+            CancellationToken::new(),
+        );
+        let session_task = tokio::spawn(async move { session.handle_transmission(device).await });
+
+        client_stream
+            .write_all(&probe_request(NBDCommand::Write, 1, 0, 4096))
+            .await
+            .expect("send volatile write header");
+        client_stream
+            .write_all(&vec![0x6d; 4096])
+            .await
+            .expect("send volatile write payload");
+        let mut reply_bytes = [0; 16];
+        timeout(
+            Duration::from_secs(1),
+            client_stream.read_exact(&mut reply_bytes),
+        )
+        .await
+        .expect("volatile write ACK arrived before materialization")
+        .expect("read volatile write ACK");
+        let (_, reply) = NBDSimpleReply::from_bytes((&reply_bytes, 0)).expect("decode write ACK");
+        assert_eq!((reply.cookie, reply.error), (1, 0));
+        timeout(Duration::from_secs(2), apply_reached)
+            .await
+            .expect("background materializer reached the blocked coordinator")
+            .expect("coordinator apply probe remained available");
+
+        let reader_handler = NBDHandler::new(Arc::clone(&filesystem), Arc::clone(&export_gates));
+        let reader_device = reader_handler
+            .get_device(b"flush-ordering-test")
+            .await
+            .expect("resolve volatile export through another connection");
+        assert_eq!(
+            reader_handler.read(&reader_device, 0, 4096).await.unwrap(),
+            Bytes::from(vec![0x6d; 4096]),
+            "accepted bytes must be immediately visible from the RAM overlay"
+        );
+
+        client_stream
+            .write_all(&probe_request(NBDCommand::Flush, 2, 0, 0))
+            .await
+            .expect("send durability fence");
+        assert!(
+            timeout(
+                Duration::from_millis(100),
+                client_stream.read_exact(&mut reply_bytes),
+            )
+            .await
+            .is_err(),
+            "FLUSH must not reply while materialization is blocked"
+        );
+
+        drop(commit_block);
+        timeout(
+            Duration::from_secs(5),
+            client_stream.read_exact(&mut reply_bytes),
+        )
+        .await
+        .expect("FLUSH replied after materialization")
+        .expect("read FLUSH reply");
+        let (_, reply) = NBDSimpleReply::from_bytes((&reply_bytes, 0)).expect("decode FLUSH reply");
+        assert_eq!((reply.cookie, reply.error), (2, 0));
+
+        client_stream
+            .write_all(&probe_request(NBDCommand::Disconnect, 0, 0, 0))
+            .await
+            .expect("send disconnect");
+        timeout(Duration::from_secs(5), session_task)
+            .await
+            .expect("session stopped")
+            .expect("session task did not panic")
+            .expect("session accepted disconnect");
+        export_gates.stop_and_drain().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn volatile_fua_write_replies_only_after_materialization_and_flush() {
+        let filesystem = Arc::new(
+            ZeroFS::new_in_memory()
+                .await
+                .expect("create test filesystem"),
+        );
+        let export_gates = Arc::new(NbdExportGates::new(1024 * 1024));
+        let device = single_file_export(&filesystem, &export_gates).await;
+        let commit_block = filesystem.db.flush_barrier().write_owned().await;
+        let apply_reached = filesystem.write_coordinator.probe_next_apply();
+        let (server_stream, mut client_stream) = tokio::io::duplex(1024 * 1024);
+        let (reader, writer) = tokio::io::split(server_stream);
+        let mut session = NBDSession::new(
+            reader,
+            writer,
+            Arc::clone(&filesystem),
+            Arc::clone(&export_gates),
+            CancellationToken::new(),
+        );
+        let session_task = tokio::spawn(async move { session.handle_transmission(device).await });
+
+        let request = NBDRequest {
+            magic: NBD_REQUEST_MAGIC,
+            flags: NBD_CMD_FLAG_FUA,
+            cmd_type: NBDCommand::Write,
+            cookie: 7,
+            offset: 0,
+            length: 4096,
+        }
+        .to_bytes()
+        .expect("encode FUA write");
+        client_stream.write_all(&request).await.unwrap();
+        client_stream.write_all(&vec![0x7a; 4096]).await.unwrap();
+        timeout(Duration::from_secs(2), apply_reached)
+            .await
+            .expect("background materializer reached the blocked coordinator")
+            .expect("coordinator apply probe remained available");
+
+        let mut reply_bytes = [0; 16];
+        assert!(
+            timeout(
+                Duration::from_millis(100),
+                client_stream.read_exact(&mut reply_bytes),
+            )
+            .await
+            .is_err(),
+            "FUA must not acknowledge volatile RAM ownership as durable"
+        );
+
+        drop(commit_block);
+        timeout(
+            Duration::from_secs(5),
+            client_stream.read_exact(&mut reply_bytes),
+        )
+        .await
+        .expect("FUA replied after materialization and flush")
+        .expect("read FUA reply");
+        let (_, reply) = NBDSimpleReply::from_bytes((&reply_bytes, 0)).expect("decode FUA reply");
+        assert_eq!((reply.cookie, reply.error), (7, 0));
+
+        client_stream
+            .write_all(&probe_request(NBDCommand::Disconnect, 0, 0, 0))
+            .await
+            .expect("send disconnect");
+        timeout(Duration::from_secs(5), session_task)
+            .await
+            .expect("session stopped")
+            .expect("session task did not panic")
+            .expect("session accepted disconnect");
+        export_gates.stop_and_drain().await.unwrap();
+    }
+
     /// One command may be as large as `MAX_REQUEST_LENGTH`, which is bigger
     /// than the whole per-connection byte budget. Its credit is clamped to the
     /// budget so it remains admissible on its own instead of waiting forever
@@ -2407,6 +2614,80 @@ mod tests {
         assert!(
             MAX_REQUEST_LENGTH as usize > MAX_INFLIGHT_BYTES,
             "the clamp is only load-bearing while a request can exceed the budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn volatile_admission_rejection_consumes_the_write_body() {
+        let filesystem = Arc::new(
+            ZeroFS::new_in_memory()
+                .await
+                .expect("create test filesystem"),
+        );
+        let export_gates = Arc::new(NbdExportGates::new(4));
+        let device = single_file_export(&filesystem, &export_gates).await;
+        let handler = NBDHandler::new(filesystem, export_gates);
+        let mut wire: &[u8] = b"payloadNEXT";
+
+        let result = admit_write(
+            &mut wire,
+            &handler,
+            &device,
+            0,
+            7,
+            &CancellationToken::new(),
+        )
+        .await;
+
+        assert!(matches!(result, Err(CommandError::NoSpace)));
+        let mut next = [0; 4];
+        wire.read_exact(&mut next)
+            .await
+            .expect("read next header bytes");
+        assert_eq!(&next, b"NEXT", "rejected WRITE body must be consumed");
+    }
+
+    #[tokio::test]
+    async fn failed_rejected_write_discard_closes_the_desynchronized_session() {
+        let filesystem = Arc::new(
+            ZeroFS::new_in_memory()
+                .await
+                .expect("create test filesystem"),
+        );
+        let export_gates = Arc::new(NbdExportGates::new(4));
+        let device = single_file_export(&filesystem, &export_gates).await;
+        let handler = NBDHandler::new(filesystem, export_gates);
+        let shutdown = CancellationToken::new();
+        let mut truncated_body: &[u8] = b"x";
+
+        let result = admit_write(&mut truncated_body, &handler, &device, 4095, 2, &shutdown).await;
+
+        assert!(matches!(result, Err(CommandError::IoError)));
+        assert!(
+            shutdown.is_cancelled(),
+            "an incomplete rejected body leaves framing unknown and must close the session"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_admitted_write_payload_closes_the_desynchronized_session() {
+        let filesystem = Arc::new(
+            ZeroFS::new_in_memory()
+                .await
+                .expect("create test filesystem"),
+        );
+        let export_gates = Arc::new(NbdExportGates::default());
+        let device = single_file_export(&filesystem, &export_gates).await;
+        let handler = NBDHandler::new(filesystem, export_gates);
+        let shutdown = CancellationToken::new();
+        let mut truncated_body: &[u8] = b"x";
+
+        let result = admit_write(&mut truncated_body, &handler, &device, 0, 2, &shutdown).await;
+
+        assert!(matches!(result, Err(CommandError::IoError)));
+        assert!(
+            shutdown.is_cancelled(),
+            "a partial admitted body leaves framing unknown and must close the session"
         );
     }
 

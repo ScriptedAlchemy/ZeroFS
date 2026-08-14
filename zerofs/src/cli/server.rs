@@ -30,7 +30,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 const SFTP_FINAL_DATABASE_CLOSE_TIMEOUT: Duration = Duration::from_secs(20);
 const SFTP_FINAL_WORKER_ABORT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -72,6 +72,18 @@ impl DatabaseMode {
     pub fn is_read_only(&self) -> bool {
         !matches!(self, DatabaseMode::ReadWrite)
     }
+}
+
+fn validate_nbd_database_mode(config: Option<&NbdConfig>, db_mode: DatabaseMode) -> Result<()> {
+    if db_mode.is_read_only()
+        && config
+            .is_some_and(|nbd| nbd.write_ack_mode == crate::config::NbdWriteAckMode::VolatileMemory)
+    {
+        anyhow::bail!(
+            "[servers.nbd] volatile_memory acknowledgement is incompatible with read-only / checkpoint database modes"
+        );
+    }
+    Ok(())
 }
 
 async fn resolve_checkpoint_name(settings: &Settings, name: &str) -> Result<uuid::Uuid> {
@@ -228,13 +240,27 @@ async fn start_nbd_servers(
     fs: Arc<ZeroFS>,
     config: Option<&NbdConfig>,
     shutdown: CancellationToken,
-) -> Vec<JoinHandle<Result<(), std::io::Error>>> {
+) -> anyhow::Result<(
+    Vec<JoinHandle<Result<(), std::io::Error>>>,
+    Option<Arc<NbdExportGates>>,
+)> {
     let config = match config {
         Some(c) => c,
-        None => return Vec::new(),
+        None => return Ok((Vec::new(), None)),
     };
     let mut handles = Vec::new();
-    let export_gates = Arc::new(NbdExportGates::default());
+    let volatile_memory_bytes = config.volatile_memory_bytes()?;
+    let volatile_enabled = volatile_memory_bytes > 0;
+    metrics::gauge!("zerofs_nbd_volatile_memory_enabled").set(f64::from(volatile_enabled));
+    if volatile_enabled {
+        warn!(
+            volatile_memory_bytes,
+            "NBD volatile-memory acknowledgement is enabled: ordinary WRITE replies are unsafe across process or power loss until FLUSH/FUA completes"
+        );
+    } else {
+        info!("NBD materialized write acknowledgement is enabled");
+    }
+    let export_gates = Arc::new(NbdExportGates::new(volatile_memory_bytes));
 
     if let Some(addresses) = &config.addresses {
         for addr in addresses {
@@ -272,7 +298,7 @@ async fn start_nbd_servers(
         }));
     }
 
-    handles
+    Ok((handles, volatile_enabled.then_some(export_gates)))
 }
 
 async fn start_rpc_servers(
@@ -280,13 +306,15 @@ async fn start_rpc_servers(
     checkpoint_manager: Arc<CheckpointManager>,
     fs: Arc<ZeroFS>,
     shutdown: CancellationToken,
+    protect_nbd_exports: bool,
 ) -> Vec<JoinHandle<Result<(), std::io::Error>>> {
     let config = match config {
         Some(c) => c,
         None => return Vec::new(),
     };
 
-    let service = crate::rpc::server::AdminRpcServer::new(checkpoint_manager, fs, shutdown.clone());
+    let service = crate::rpc::server::AdminRpcServer::new(checkpoint_manager, fs, shutdown.clone())
+        .with_nbd_export_protection(protect_nbd_exports);
     let mut handles = Vec::new();
 
     if let Some(addresses) = &config.addresses {
@@ -1162,6 +1190,7 @@ pub async fn run_server(
             ));
         }
     };
+    validate_nbd_database_mode(settings.servers.nbd.as_ref(), db_mode)?;
     let maintenance_runtime = if db_mode.is_read_only() {
         None
     } else {
@@ -1252,12 +1281,12 @@ pub async fn run_server(
             shutdown.clone(),
         );
 
-        let nbd_handles = start_nbd_servers(
+        let (nbd_handles, nbd_runtime_registry) = start_nbd_servers(
             Arc::clone(&fs),
             settings.servers.nbd.as_ref(),
             shutdown.clone(),
         )
-        .await;
+        .await?;
 
         // A read-only admin over the same store for the GC's checkpoint gate; built
         // before the store/path are moved into the checkpoint manager below.
@@ -1306,11 +1335,13 @@ pub async fn run_server(
         }
         #[cfg(feature = "webui")]
         let checkpoint_manager_for_webui = Arc::clone(&checkpoint_manager);
+        let protect_nbd_exports = nbd_runtime_registry.is_some();
         let rpc_handles = start_rpc_servers(
             settings.servers.rpc.as_ref(),
             checkpoint_manager,
             Arc::clone(&fs),
             shutdown.clone(),
+            protect_nbd_exports,
         )
         .await;
 
@@ -1372,7 +1403,8 @@ pub async fn run_server(
                 checkpoint_manager_for_webui,
                 Arc::clone(&fs),
                 shutdown.clone(),
-            );
+            )
+            .with_nbd_export_protection(protect_nbd_exports);
             let webui_lock_manager = Arc::new(crate::ninep::lock_manager::FileLockManager::new());
             crate::webui::start(
                 webui_config,
@@ -1438,6 +1470,14 @@ pub async fn run_server(
         .await;
 
         if stop_cause.is_leadership_lost() {
+            if let Some(registry) = &nbd_runtime_registry {
+                registry.fence_abort();
+                if registry.stop_and_drain().await.is_err() {
+                    tracing::error!(
+                        "volatile NBD workers reported a terminal error while joining after leadership loss"
+                    );
+                }
+            }
             return finish_serving_shutdown(
                 stop_cause,
                 merge_cleanup_results(serving_cleanup_errors, Ok(())),
@@ -1446,6 +1486,21 @@ pub async fn run_server(
 
         let leadership_deposed_after_cleanup = leadership_deposed.clone();
         let cleanup_result: anyhow::Result<()> = async move {
+            let mut volatile_cleanup_error = None;
+            if let Some(registry) = &nbd_runtime_registry {
+                if registry.stop_and_drain().await.is_err() {
+                    volatile_cleanup_error =
+                        Some(anyhow::anyhow!("volatile NBD materialization failed"));
+                }
+                if let Err(error) = fs.client_fsync().await {
+                    let error = anyhow::anyhow!("volatile NBD final flush failed: {error}");
+                    if volatile_cleanup_error.is_none() {
+                        volatile_cleanup_error = Some(error);
+                    } else {
+                        tracing::error!(%error, "additional volatile NBD shutdown failure");
+                    }
+                }
+            }
             info!("Waiting for background tasks to exit...");
             if let Some(gc_handles) = gc_handle {
                 join_or_abort_tasks(
@@ -1622,6 +1677,10 @@ pub async fn run_server(
                 return Err(leadership_lost_error());
             }
 
+            if let Some(error) = volatile_cleanup_error {
+                return Err(error);
+            }
+
             Ok(())
         }
         .await;
@@ -1660,6 +1719,23 @@ pub async fn run_server(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn volatile_nbd_ack_rejects_read_only_database_modes() {
+        let config = NbdConfig {
+            addresses: Some(std::collections::HashSet::new()),
+            unix_socket: None,
+            write_ack_mode: crate::config::NbdWriteAckMode::VolatileMemory,
+            volatile_memory_gb: 1.0,
+        };
+
+        let error = validate_nbd_database_mode(Some(&config), DatabaseMode::ReadOnly).unwrap_err();
+        assert!(
+            error.to_string().contains("read-only / checkpoint"),
+            "unexpected error: {error:#}"
+        );
+        assert!(validate_nbd_database_mode(Some(&config), DatabaseMode::ReadWrite).is_ok());
+    }
 
     #[test]
     fn listener_completion_before_shutdown_is_an_error() {

@@ -1,5 +1,9 @@
 use super::error::{CommandError, CommandResult, NBDError, Result};
 use super::out_of_bounds;
+use super::volatile_overlay::{
+    Materializer, VolatileAdmission, VolatileBudget, VolatileWriteRuntime,
+    WriteChunk as VolatileWriteChunk,
+};
 use super::{
     NBD_STRIPE_MANIFEST_MAX_BYTES, NBD_STRIPE_MARKER, StripeManifest, is_nbd_provision_staging_name,
 };
@@ -10,12 +14,12 @@ use crate::fs::tracing::FileOperation;
 use crate::fs::types::AuthContext;
 use bytes::{Bytes, BytesMut};
 use deku::DekuContainerWrite;
-use futures::future::try_join_all;
+use futures::future::{join_all, try_join_all};
 use nbd_proto::{
-    NBD_INFO_EXPORT, NBD_REP_ACK, NBD_REP_ERR_INVALID, NBD_REP_ERR_UNKNOWN, NBD_REP_INFO,
-    NBD_REP_SERVER, NBDInfoExport, TRANSMISSION_FLAGS,
+    NBD_FLAG_SEND_TRIM, NBD_INFO_EXPORT, NBD_REP_ACK, NBD_REP_ERR_INVALID, NBD_REP_ERR_UNKNOWN,
+    NBD_REP_INFO, NBD_REP_SERVER, NBDInfoExport, TRANSMISSION_FLAGS,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 use tokio::sync::{OwnedRwLockReadGuard, RwLock};
 use tracing::debug;
@@ -56,16 +60,21 @@ pub enum OptionResult {
 pub struct NBDDevice {
     pub name: Vec<u8>,
     backing: NbdBacking,
-    gate: Arc<RwLock<()>>,
+    state: Arc<NbdExportState>,
 }
 
-#[derive(Clone, Debug)]
+pub(crate) struct MutationAdmission {
+    gate: OwnedRwLockReadGuard<()>,
+    volatile: Option<VolatileAdmission>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct NbdMember {
     inode: u64,
     size: u64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum NbdBacking {
     Single {
         inode: u64,
@@ -76,6 +85,18 @@ enum NbdBacking {
         members: Arc<[NbdMember]>,
         stripe_bytes: u64,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ExportIdentity {
+    backing: NbdBacking,
+}
+
+struct NbdExportState {
+    identity: ExportIdentity,
+    gate: Arc<RwLock<()>>,
+    volatile_mode: bool,
+    volatile: Option<Arc<VolatileWriteRuntime>>,
 }
 
 fn parse_stripe_manifest(data: &[u8]) -> Result<StripeManifest> {
@@ -173,7 +194,15 @@ impl NBDDevice {
         NBDInfoExport {
             info_type: NBD_INFO_EXPORT,
             size: self.size(),
-            transmission_flags: TRANSMISSION_FLAGS,
+            transmission_flags: self.transmission_flags(),
+        }
+    }
+
+    pub(crate) fn transmission_flags(&self) -> u16 {
+        if self.state.volatile_mode {
+            TRANSMISSION_FLAGS & !NBD_FLAG_SEND_TRIM
+        } else {
+            TRANSMISSION_FLAGS
         }
     }
 
@@ -199,23 +228,173 @@ impl NBDDevice {
     }
 }
 
-#[derive(Default)]
 pub struct NbdExportGates {
-    gates: StdMutex<HashMap<Vec<u8>, Weak<RwLock<()>>>>,
+    registry: StdMutex<ExportRegistry>,
+    materialized_gates: StdMutex<HashMap<Vec<u8>, Weak<RwLock<()>>>>,
+    volatile_budget: Option<Arc<VolatileBudget>>,
+}
+
+#[derive(Default)]
+struct ExportRegistry {
+    names: HashMap<Vec<u8>, ExportIdentity>,
+    exports: HashMap<ExportIdentity, Arc<NbdExportState>>,
+    inode_owners: HashMap<u64, ExportIdentity>,
+}
+
+impl Default for NbdExportGates {
+    fn default() -> Self {
+        Self::new(0)
+    }
 }
 
 impl NbdExportGates {
-    fn for_export(&self, name: &[u8]) -> Arc<RwLock<()>> {
-        let mut gates = self
-            .gates
+    pub fn new(volatile_memory_bytes: u64) -> Self {
+        Self {
+            registry: StdMutex::new(ExportRegistry::default()),
+            materialized_gates: StdMutex::new(HashMap::new()),
+            volatile_budget: (volatile_memory_bytes > 0)
+                .then(|| VolatileBudget::new(volatile_memory_bytes, 65_536)),
+        }
+    }
+
+    fn for_export(
+        &self,
+        name: &[u8],
+        backing: &NbdBacking,
+        filesystem: &Arc<ZeroFS>,
+    ) -> Result<Arc<NbdExportState>> {
+        let identity = ExportIdentity {
+            backing: backing.clone(),
+        };
+        if self.volatile_budget.is_none() {
+            let mut gates = self
+                .materialized_gates
+                .lock()
+                .expect("NBD materialized export gate registry poisoned");
+            let gate = gates.get(name).and_then(Weak::upgrade).unwrap_or_else(|| {
+                let gate = Arc::new(RwLock::new(()));
+                gates.insert(name.to_vec(), Arc::downgrade(&gate));
+                gate
+            });
+            return Ok(Arc::new(NbdExportState {
+                identity,
+                gate,
+                volatile_mode: false,
+                volatile: None,
+            }));
+        }
+        let mut registry = self
+            .registry
             .lock()
             .expect("NBD export gate registry poisoned");
-        if let Some(gate) = gates.get(name).and_then(Weak::upgrade) {
-            return gate;
+        if let Some(existing) = registry.names.get(name)
+            && existing != &identity
+        {
+            return Err(NBDError::Protocol(format!(
+                "NBD export '{}' changed backing identity while active",
+                String::from_utf8_lossy(name)
+            )));
         }
-        let gate = Arc::new(RwLock::new(()));
-        gates.insert(name.to_vec(), Arc::downgrade(&gate));
-        gate
+        if let Some(state) = registry.exports.get(&identity).cloned() {
+            debug_assert_eq!(state.identity, identity);
+            registry.names.insert(name.to_vec(), identity);
+            return Ok(state);
+        }
+
+        let backing_inodes = backing.inodes();
+        for inode in &backing_inodes {
+            if let Some(owner) = registry.inode_owners.get(inode)
+                && owner != &identity
+            {
+                return Err(NBDError::Protocol(format!(
+                    "NBD backing inode {inode} is already owned by another active export"
+                )));
+            }
+        }
+
+        let volatile = self.volatile_budget.as_ref().map(|budget| {
+            let filesystem = Arc::clone(filesystem);
+            let materializer: Materializer = Arc::new(move |inode, offset, data| {
+                let filesystem = Arc::clone(&filesystem);
+                Box::pin(async move {
+                    let auth = AuthContext::default();
+                    filesystem
+                        .write(&auth, inode, offset, &data)
+                        .await
+                        .map(|_| ())
+                        .map_err(CommandError::from)
+                })
+            });
+            VolatileWriteRuntime::new(Arc::clone(budget), backing_inodes.clone(), materializer)
+        });
+        let state = Arc::new(NbdExportState {
+            identity: identity.clone(),
+            gate: Arc::new(RwLock::new(())),
+            volatile_mode: true,
+            volatile,
+        });
+        for inode in backing_inodes {
+            registry.inode_owners.insert(inode, identity.clone());
+        }
+        registry.names.insert(name.to_vec(), identity.clone());
+        registry.exports.insert(identity, Arc::clone(&state));
+        Ok(state)
+    }
+
+    fn unactivated(&self, backing: &NbdBacking) -> Arc<NbdExportState> {
+        Arc::new(NbdExportState {
+            identity: ExportIdentity {
+                backing: backing.clone(),
+            },
+            gate: Arc::new(RwLock::new(())),
+            volatile_mode: self.volatile_budget.is_some(),
+            volatile: None,
+        })
+    }
+
+    pub(crate) async fn stop_and_drain(&self) -> CommandResult<()> {
+        let runtimes = self.runtimes();
+        for runtime in &runtimes {
+            runtime.stop_admission();
+        }
+        let mut first_error = None;
+        for result in join_all(
+            runtimes
+                .into_iter()
+                .map(|runtime| async move { runtime.shutdown().await }),
+        )
+        .await
+        {
+            if let Err(error) = result {
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    pub(crate) fn fence_abort(&self) {
+        for runtime in self.runtimes() {
+            runtime.fence_abort();
+        }
+    }
+
+    fn runtimes(&self) -> Vec<Arc<VolatileWriteRuntime>> {
+        self.registry
+            .lock()
+            .expect("NBD export gate registry poisoned")
+            .exports
+            .values()
+            .filter_map(|state| state.volatile.clone())
+            .collect()
+    }
+}
+
+impl NbdBacking {
+    fn inodes(&self) -> Vec<u64> {
+        match self {
+            Self::Single { inode, .. } => vec![*inode],
+            Self::Striped { members, .. } => members.iter().map(|member| member.inode).collect(),
+        }
     }
 }
 
@@ -261,7 +440,7 @@ impl NBDHandler {
                     continue;
                 }
 
-                match self.resolve_device(name, entry.fileid).await {
+                match self.resolve_device(name, entry.fileid, false).await {
                     Ok(device) => devices.push(device),
                     Err(error) => {
                         debug!(
@@ -327,7 +506,7 @@ impl NBDHandler {
             name_len
         );
 
-        match self.get_device(name).await {
+        match self.get_device_with_activation(name, false).await {
             Ok(device) => match device.info_export().to_bytes() {
                 Ok(info_bytes) => OptionResult::Continue(vec![
                     OptionReply::new(NBD_REP_INFO, info_bytes),
@@ -408,6 +587,10 @@ impl NBDHandler {
 
     /// Get a specific NBD device by name
     pub async fn get_device(&self, name: &[u8]) -> Result<NBDDevice> {
+        self.get_device_with_activation(name, true).await
+    }
+
+    async fn get_device_with_activation(&self, name: &[u8], activate: bool) -> Result<NBDDevice> {
         let nbd_dir_inode = self.nbd_dir_inode().await?;
 
         let device_inode = self
@@ -420,23 +603,40 @@ impl NBDHandler {
                 e => NBDError::Filesystem(e),
             })?;
 
-        self.resolve_device(name, device_inode).await
+        self.resolve_device(name, device_inode, activate).await
     }
 
-    async fn resolve_device(&self, name: &[u8], device_inode: u64) -> Result<NBDDevice> {
+    async fn resolve_device(
+        &self,
+        name: &[u8],
+        device_inode: u64,
+        activate: bool,
+    ) -> Result<NBDDevice> {
         if is_nbd_provision_staging_name(name) {
             return Err(NBDError::DeviceNotFound(name.to_vec()));
         }
         match self.filesystem.inode_store.get(device_inode).await? {
-            Inode::File(file_inode) => Ok(NBDDevice {
-                name: name.to_vec(),
-                backing: NbdBacking::Single {
+            Inode::File(file_inode) => {
+                let backing = NbdBacking::Single {
                     inode: device_inode,
                     size: file_inode.size,
-                },
-                gate: self.export_gates.for_export(name),
-            }),
-            Inode::Directory(_) => self.resolve_striped_device(name, device_inode).await,
+                };
+                let state = if activate {
+                    self.export_gates
+                        .for_export(name, &backing, &self.filesystem)?
+                } else {
+                    self.export_gates.unactivated(&backing)
+                };
+                Ok(NBDDevice {
+                    name: name.to_vec(),
+                    backing,
+                    state,
+                })
+            }
+            Inode::Directory(_) => {
+                self.resolve_striped_device(name, device_inode, activate)
+                    .await
+            }
             _ => Err(NBDError::Protocol(format!(
                 "NBD device '{}' is neither a regular file nor a striped export directory",
                 String::from_utf8_lossy(name)
@@ -444,7 +644,12 @@ impl NBDHandler {
         }
     }
 
-    async fn resolve_striped_device(&self, name: &[u8], directory_inode: u64) -> Result<NBDDevice> {
+    async fn resolve_striped_device(
+        &self,
+        name: &[u8],
+        directory_inode: u64,
+        activate: bool,
+    ) -> Result<NBDDevice> {
         let marker_inode = self
             .filesystem
             .directory_store
@@ -469,6 +674,7 @@ impl NBDHandler {
             .await?;
         let manifest = parse_stripe_manifest(&manifest_bytes)?;
         let mut members = Vec::with_capacity(manifest.members.len());
+        let mut member_inodes = HashSet::with_capacity(manifest.members.len());
         let mut member_size = None;
         for member_name in &manifest.members {
             let member_inode = self
@@ -485,6 +691,11 @@ impl NBDHandler {
                     )));
                 }
             };
+            if !member_inodes.insert(member_inode) {
+                return Err(NBDError::Protocol(
+                    "striped NBD members must resolve to distinct backing inodes".to_string(),
+                ));
+            }
             if size == 0 || size % manifest.stripe_bytes != 0 {
                 return Err(NBDError::Protocol(format!(
                     "striped NBD member '{member_name}' size must be non-zero and stripe-aligned"
@@ -505,14 +716,21 @@ impl NBDHandler {
             .unwrap_or(0)
             .checked_mul(members.len() as u64)
             .ok_or_else(|| NBDError::Protocol("striped NBD size overflow".to_string()))?;
+        let backing = NbdBacking::Striped {
+            directory_inode,
+            members: members.into(),
+            stripe_bytes: manifest.stripe_bytes,
+        };
+        let state = if activate {
+            self.export_gates
+                .for_export(name, &backing, &self.filesystem)?
+        } else {
+            self.export_gates.unactivated(&backing)
+        };
         Ok(NBDDevice {
             name: name.to_vec(),
-            backing: NbdBacking::Striped {
-                directory_inode,
-                members: members.into(),
-                stripe_bytes: manifest.stripe_bytes,
-            },
-            gate: self.export_gates.for_export(name),
+            backing,
+            state,
         })
     }
 
@@ -525,81 +743,45 @@ impl NBDHandler {
             return Ok(Bytes::new());
         }
 
-        match &device.backing {
-            NbdBacking::Single { inode, .. } => {
-                let auth = AuthContext::default();
-                let (data, _) = self
-                    .filesystem
-                    .read_file(&auth, *inode, offset, length)
-                    .await?;
-                if data.len() != length as usize {
-                    return Err(CommandError::IoError);
-                }
-                Ok(data)
-            }
-            NbdBacking::Striped { members, .. } => {
-                let groups = group_stripe_chunks(
-                    map_stripe_chunks(&device.backing, offset, length as u64)?,
-                    members.len(),
-                );
-                let reads = groups
-                    .into_iter()
-                    .filter(|group| !group.is_empty())
-                    .map(|group| {
-                        let filesystem = Arc::clone(&self.filesystem);
-                        async move {
-                            let auth = AuthContext::default();
-                            let mut parts = Vec::with_capacity(group.len());
-                            for chunk in group {
-                                let (data, _) = filesystem
-                                    .read_file(
-                                        &auth,
-                                        chunk.inode,
-                                        chunk.member_offset,
-                                        chunk.length as u32,
-                                    )
-                                    .await
-                                    .map_err(CommandError::from)?;
-                                if data.len() != chunk.length as usize {
-                                    return Err(CommandError::IoError);
-                                }
-                                parts.push((chunk.logical_offset, data));
-                            }
-                            Ok::<_, CommandError>(parts)
-                        }
-                    });
-                let mut parts: Vec<(u64, Bytes)> =
-                    try_join_all(reads).await?.into_iter().flatten().collect();
-                parts.sort_unstable_by_key(|(logical_offset, _)| *logical_offset);
-
-                let mut output = BytesMut::with_capacity(length as usize);
-                let mut expected_offset = 0_u64;
-                for (logical_offset, data) in parts {
-                    if logical_offset != expected_offset {
-                        return Err(CommandError::IoError);
-                    }
-                    expected_offset += data.len() as u64;
-                    output.extend_from_slice(&data);
-                }
-                if expected_offset != length as u64 {
-                    return Err(CommandError::IoError);
-                }
-                Ok(output.freeze())
-            }
+        if let Some(runtime) = &device.state.volatile {
+            let filesystem = Arc::clone(&self.filesystem);
+            let backing = device.backing.clone();
+            return runtime
+                .read(offset, length as usize, move || {
+                    Box::pin(read_backing(filesystem, backing, offset, length))
+                })
+                .await;
         }
+
+        read_backing(
+            Arc::clone(&self.filesystem),
+            device.backing.clone(),
+            offset,
+            length,
+        )
+        .await
     }
 
-    pub(crate) async fn begin_mutation(&self, device: &NBDDevice) -> OwnedRwLockReadGuard<()> {
-        Arc::clone(&device.gate).read_owned().await
+    pub(crate) async fn begin_mutation(
+        &self,
+        device: &NBDDevice,
+        length: usize,
+    ) -> CommandResult<MutationAdmission> {
+        let gate = Arc::clone(&device.state.gate).read_owned().await;
+        let volatile = match &device.state.volatile {
+            Some(runtime) => Some(runtime.reserve(length).await?),
+            None => None,
+        };
+        Ok(MutationAdmission { gate, volatile })
     }
 
     pub(crate) async fn write_admitted(
         &self,
         device: &NBDDevice,
         offset: u64,
-        data: &Bytes,
+        data: Bytes,
         fua: bool,
-        admission: OwnedRwLockReadGuard<()>,
+        admission: MutationAdmission,
     ) -> CommandResult<()> {
         if data.is_empty() {
             return Ok(());
@@ -612,38 +794,34 @@ impl NBDHandler {
             return Err(CommandError::NoSpace);
         }
 
-        match &device.backing {
-            NbdBacking::Single { inode, .. } => {
-                let auth = AuthContext::default();
-                self.filesystem.write(&auth, *inode, offset, data).await?;
-            }
-            NbdBacking::Striped { members, .. } => {
-                let groups = group_stripe_chunks(
-                    map_stripe_chunks(&device.backing, offset, data.len() as u64)?,
-                    members.len(),
-                );
-                let writes = groups
+        if let Some(runtime) = &device.state.volatile {
+            let volatile = admission.volatile.ok_or(CommandError::IoError)?;
+            let member_count = match &device.backing {
+                NbdBacking::Single { .. } => 1,
+                NbdBacking::Striped { members, .. } => members.len(),
+            };
+            let groups = group_stripe_chunks(
+                map_stripe_chunks(&device.backing, offset, data.len() as u64)?,
+                member_count,
+            )
+            .into_iter()
+            .map(|chunks| {
+                chunks
                     .into_iter()
-                    .filter(|group| !group.is_empty())
-                    .map(|group| {
-                        let filesystem = Arc::clone(&self.filesystem);
-                        let data = data.clone();
-                        async move {
-                            let auth = AuthContext::default();
-                            for chunk in group {
-                                let start = chunk.logical_offset as usize;
-                                let part = data.slice(start..start + chunk.length as usize);
-                                filesystem
-                                    .write(&auth, chunk.inode, chunk.member_offset, &part)
-                                    .await?;
-                            }
-                            Ok::<_, FsError>(())
-                        }
-                    });
-                try_join_all(writes).await?;
-            }
+                    .map(|chunk| VolatileWriteChunk {
+                        inode: chunk.inode,
+                        member_offset: chunk.member_offset,
+                        logical_offset: chunk.logical_offset as usize,
+                        length: chunk.length as usize,
+                    })
+                    .collect()
+            })
+            .collect();
+            runtime.accept_write(volatile, offset, data, groups).await?;
+        } else {
+            write_backing(&self.filesystem, &device.backing, offset, &data).await?;
         }
-        drop(admission);
+        drop(admission.gate);
 
         if fua {
             self.flush(device).await?;
@@ -659,6 +837,11 @@ impl NBDHandler {
         length: u32,
         fua: bool,
     ) -> CommandResult<()> {
+        if device.state.volatile_mode {
+            // Volatile mode deliberately does not advertise TRIM until trim is
+            // represented in the same ordered overlay sequence as WRITE.
+            return Err(CommandError::InvalidArgument);
+        }
         if out_of_bounds(offset, length, device.size()) {
             return Err(CommandError::InvalidArgument);
         }
@@ -667,7 +850,7 @@ impl NBDHandler {
             return Ok(());
         }
 
-        let write_guard = device.gate.read().await;
+        let write_guard = device.state.gate.read().await;
         let groups = group_stripe_chunks(
             map_stripe_chunks(&device.backing, offset, length as u64)?,
             match &device.backing {
@@ -708,7 +891,11 @@ impl NBDHandler {
     }
 
     pub async fn flush(&self, device: &NBDDevice) -> CommandResult<()> {
-        let _flush_guard = device.gate.write().await;
+        let _flush_guard = device.state.gate.write().await;
+        if let Some(runtime) = &device.state.volatile {
+            let target = runtime.accepted_cutoff();
+            runtime.wait_materialized(target).await?;
+        }
         self.filesystem
             .client_fsync()
             .await
@@ -724,6 +911,113 @@ impl NBDHandler {
     }
 }
 
+async fn read_backing(
+    filesystem: Arc<ZeroFS>,
+    backing: NbdBacking,
+    offset: u64,
+    length: u32,
+) -> CommandResult<Bytes> {
+    match &backing {
+        NbdBacking::Single { inode, .. } => {
+            let auth = AuthContext::default();
+            let (data, _) = filesystem.read_file(&auth, *inode, offset, length).await?;
+            if data.len() != length as usize {
+                return Err(CommandError::IoError);
+            }
+            Ok(data)
+        }
+        NbdBacking::Striped { members, .. } => {
+            let groups = group_stripe_chunks(
+                map_stripe_chunks(&backing, offset, length as u64)?,
+                members.len(),
+            );
+            let reads = groups
+                .into_iter()
+                .filter(|group| !group.is_empty())
+                .map(|group| {
+                    let filesystem = Arc::clone(&filesystem);
+                    async move {
+                        let auth = AuthContext::default();
+                        let mut parts = Vec::with_capacity(group.len());
+                        for chunk in group {
+                            let (data, _) = filesystem
+                                .read_file(
+                                    &auth,
+                                    chunk.inode,
+                                    chunk.member_offset,
+                                    chunk.length as u32,
+                                )
+                                .await
+                                .map_err(CommandError::from)?;
+                            if data.len() != chunk.length as usize {
+                                return Err(CommandError::IoError);
+                            }
+                            parts.push((chunk.logical_offset, data));
+                        }
+                        Ok::<_, CommandError>(parts)
+                    }
+                });
+            let mut parts: Vec<(u64, Bytes)> =
+                try_join_all(reads).await?.into_iter().flatten().collect();
+            parts.sort_unstable_by_key(|(logical_offset, _)| *logical_offset);
+
+            let mut output = BytesMut::with_capacity(length as usize);
+            let mut expected_offset = 0_u64;
+            for (logical_offset, data) in parts {
+                if logical_offset != expected_offset {
+                    return Err(CommandError::IoError);
+                }
+                expected_offset += data.len() as u64;
+                output.extend_from_slice(&data);
+            }
+            if expected_offset != length as u64 {
+                return Err(CommandError::IoError);
+            }
+            Ok(output.freeze())
+        }
+    }
+}
+
+async fn write_backing(
+    filesystem: &Arc<ZeroFS>,
+    backing: &NbdBacking,
+    offset: u64,
+    data: &Bytes,
+) -> CommandResult<()> {
+    match backing {
+        NbdBacking::Single { inode, .. } => {
+            let auth = AuthContext::default();
+            filesystem.write(&auth, *inode, offset, data).await?;
+        }
+        NbdBacking::Striped { members, .. } => {
+            let groups = group_stripe_chunks(
+                map_stripe_chunks(backing, offset, data.len() as u64)?,
+                members.len(),
+            );
+            let writes = groups
+                .into_iter()
+                .filter(|group| !group.is_empty())
+                .map(|group| {
+                    let filesystem = Arc::clone(filesystem);
+                    let data = data.clone();
+                    async move {
+                        let auth = AuthContext::default();
+                        for chunk in group {
+                            let start = chunk.logical_offset as usize;
+                            let part = data.slice(start..start + chunk.length as usize);
+                            filesystem
+                                .write(&auth, chunk.inode, chunk.member_offset, &part)
+                                .await?;
+                        }
+                        Ok::<_, FsError>(())
+                    }
+                });
+            try_join_all(writes).await?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -734,7 +1028,11 @@ mod tests {
     use crate::fs::permissions::Credentials;
     use crate::fs::types::{AuthContext, SetAttributes, SetSize};
     use bytes::Bytes;
-    use nbd_proto::{NBD_REP_ACK, NBD_REP_ERR_UNKNOWN, NBD_REP_INFO, NBD_REP_SERVER};
+    use deku::DekuContainerRead;
+    use nbd_proto::{
+        NBD_FLAG_SEND_TRIM, NBD_REP_ACK, NBD_REP_ERR_UNKNOWN, NBD_REP_INFO, NBD_REP_SERVER,
+        NBDInfoExport,
+    };
     use std::sync::Arc;
 
     const PUBLISHED_EXPORT: &[u8] = b"vm100";
@@ -960,9 +1258,12 @@ mod tests {
                 .collect::<Vec<_>>(),
         );
 
-        let admission = handler.begin_mutation(&device).await;
+        let admission = handler
+            .begin_mutation(&device, payload.len())
+            .await
+            .unwrap();
         handler
-            .write_admitted(&device, 2048, &payload, false, admission)
+            .write_admitted(&device, 2048, payload.clone(), false, admission)
             .await
             .expect("write across stripe rows");
         let read_back = handler
@@ -1031,12 +1332,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn materialized_export_can_be_resolved_again_after_resize() {
+        let (filesystem, handler, first, inode) = single_file_export().await;
+        assert_eq!(first.size(), 4096);
+        drop(first);
+        filesystem
+            .setattr(
+                &root_credentials(),
+                inode,
+                &SetAttributes {
+                    size: SetSize::Set(8192),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("resize inactive materialized export");
+
+        let reopened = handler
+            .get_device(b"single-file-test")
+            .await
+            .expect("materialized mode must not freeze stale export geometry");
+        assert_eq!(reopened.size(), 8192);
+    }
+
+    #[tokio::test]
     async fn striped_trim_preserves_unaffected_bytes() {
         let (_filesystem, handler, device) = striped_export().await;
         let payload = Bytes::from(vec![0x5a; 24 * 1024]);
-        let admission = handler.begin_mutation(&device).await;
+        let admission = handler
+            .begin_mutation(&device, payload.len())
+            .await
+            .unwrap();
         handler
-            .write_admitted(&device, 0, &payload, false, admission)
+            .write_admitted(&device, 0, payload.clone(), false, admission)
             .await
             .expect("seed striped export");
 
@@ -1090,6 +1418,79 @@ mod tests {
 
         assert_eq!(devices.len(), DEVICE_COUNT);
         assert!(devices.iter().any(|device| device.name == b"device-1004"));
+    }
+
+    #[tokio::test]
+    async fn volatile_list_does_not_activate_write_runtimes() {
+        let filesystem = Arc::new(
+            ZeroFS::new_in_memory()
+                .await
+                .expect("create test filesystem"),
+        );
+        let credentials = root_credentials();
+        let (nbd_dir, _) = filesystem
+            .mkdir(&credentials, 0, b".nbd", &SetAttributes::default())
+            .await
+            .expect("create .nbd directory");
+        filesystem
+            .create(
+                &credentials,
+                nbd_dir,
+                b"list-only",
+                &SetAttributes::default(),
+            )
+            .await
+            .expect("create list-only export");
+        let gates = Arc::new(NbdExportGates::new(1024 * 1024));
+        let handler = NBDHandler::new(filesystem, Arc::clone(&gates));
+
+        let devices = handler.list_devices().await.expect("list exports");
+
+        assert_eq!(devices.len(), 1);
+        assert!(gates.runtimes().is_empty(), "LIST must not spawn workers");
+    }
+
+    #[tokio::test]
+    async fn volatile_info_advertises_mode_without_activating_a_runtime() {
+        let filesystem = Arc::new(
+            ZeroFS::new_in_memory()
+                .await
+                .expect("create test filesystem"),
+        );
+        let credentials = root_credentials();
+        let (nbd_dir, _) = filesystem
+            .mkdir(&credentials, 0, b".nbd", &SetAttributes::default())
+            .await
+            .expect("create .nbd directory");
+        filesystem
+            .create(
+                &credentials,
+                nbd_dir,
+                b"info-only",
+                &SetAttributes::default(),
+            )
+            .await
+            .expect("create info-only export");
+        let gates = Arc::new(NbdExportGates::new(1024 * 1024));
+        let handler = NBDHandler::new(filesystem, Arc::clone(&gates));
+
+        let replies = match handler.info(&export_option_payload(b"info-only")).await {
+            OptionResult::Continue(replies) => replies,
+            OptionResult::Done(_, _) => panic!("INFO unexpectedly completed negotiation"),
+            OptionResult::Error(error, _) => panic!("INFO failed: {error}"),
+        };
+        let info_reply = replies
+            .iter()
+            .find(|reply| reply.reply_type == NBD_REP_INFO)
+            .expect("INFO export reply");
+        let (_, info) =
+            NBDInfoExport::from_bytes((&info_reply.data, 0)).expect("decode INFO reply");
+
+        assert_eq!(info.transmission_flags & NBD_FLAG_SEND_TRIM, 0);
+        assert!(
+            gates.runtimes().is_empty(),
+            "INFO must not permanently activate write workers"
+        );
     }
 
     #[tokio::test]

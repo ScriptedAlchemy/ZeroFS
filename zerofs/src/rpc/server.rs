@@ -104,6 +104,7 @@ impl JemallocMemStats {
 /// into; a background task deletes its contents (precedent for hidden root
 /// directories: .nbd).
 const TRASH_DIR_NAME: &[u8] = b".zerofs_trash";
+const NBD_DIR_NAME: &[u8] = b".nbd";
 
 /// Root credentials for admin operations: the admin RPC surface is trusted
 /// and operates with full filesystem rights.
@@ -152,6 +153,7 @@ pub struct AdminRpcServer {
     checkpoint_manager: Arc<CheckpointManager>,
     fs: Arc<ZeroFS>,
     shutdown: CancellationToken,
+    protect_nbd_exports: bool,
 }
 
 impl AdminRpcServer {
@@ -164,12 +166,18 @@ impl AdminRpcServer {
             checkpoint_manager,
             fs,
             shutdown,
+            protect_nbd_exports: false,
         };
         // Drain anything a previous run left in the trash (a crash or
         // shutdown between RemoveDirectory and its sweep finishing);
         // otherwise the leftovers sit there until the next RemoveDirectory.
         server.spawn_trash_sweep();
         server
+    }
+
+    pub fn with_nbd_export_protection(mut self, enabled: bool) -> Self {
+        self.protect_nbd_exports = enabled;
+        self
     }
 
     /// Construct a successful response only with current serving authority.
@@ -614,6 +622,11 @@ impl AdminService for AdminRpcServer {
                 String::from_utf8_lossy(TRASH_DIR_NAME)
             )));
         }
+        if self.protect_nbd_exports && components[0] == NBD_DIR_NAME {
+            return Err(Status::invalid_argument(format!(
+                "refusing to remove {path:?}: /.nbd is reserved while volatile NBD acknowledgement is active"
+            )));
+        }
 
         let auth = root_auth();
         let creds = Credentials::from_auth_context(&auth);
@@ -830,10 +843,17 @@ mod tests {
     /// socket, and connect a real client to it. Mirrors the in-process test
     /// pattern from mount.rs (no mocks).
     async fn setup() -> (Arc<ZeroFS>, RpcClient, CancellationToken, tempfile::TempDir) {
+        setup_with_nbd_protection(false).await
+    }
+
+    async fn setup_with_nbd_protection(
+        protect_nbd_exports: bool,
+    ) -> (Arc<ZeroFS>, RpcClient, CancellationToken, tempfile::TempDir) {
         let (fs, checkpoint_manager) = make_fs().await;
 
         let shutdown = CancellationToken::new();
-        let service = AdminRpcServer::new(checkpoint_manager, Arc::clone(&fs), shutdown.clone());
+        let service = AdminRpcServer::new(checkpoint_manager, Arc::clone(&fs), shutdown.clone())
+            .with_nbd_export_protection(protect_nbd_exports);
 
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("admin.sock");
@@ -1181,6 +1201,23 @@ mod tests {
             "unexpected error: {err}"
         );
 
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn volatile_nbd_mode_protects_the_export_namespace_from_admin_removal() {
+        let (_fs, client, shutdown, _dir) = setup_with_nbd_protection(true).await;
+        client
+            .create_directory("/.nbd/export", 0o700, 0, 0)
+            .await
+            .unwrap();
+
+        let error = client.remove_directory("/.nbd/export").await.unwrap_err();
+
+        assert!(
+            error.to_string().contains("reserved"),
+            "unexpected error: {error}"
+        );
         shutdown.cancel();
     }
 }

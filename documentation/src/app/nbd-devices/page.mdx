@@ -21,7 +21,31 @@ Enable a TCP listener, a Unix socket, or both:
 [servers.nbd]
 addresses = ["127.0.0.1:10809"]
 unix_socket = "/tmp/zerofs-nbd.sock"
+write_ack_mode = "materialized"
 ```
+
+The default `materialized` mode keeps the existing conservative acknowledgement
+boundary. For explicitly unsafe, RAM-speed burst acknowledgement, configure:
+
+```toml
+[servers.nbd]
+addresses = ["127.0.0.1:10809"]
+write_ack_mode = "volatile_memory"
+volatile_memory_gb = 8.0
+```
+
+<Warning>
+  In `volatile_memory` mode, a successful ordinary WRITE means the data is in
+  bounded process RAM, not durable. A process crash or power failure loses
+  acknowledged writes that have not crossed FLUSH/FUA. FLUSH and FUA still
+  wait for canonical materialization and local durability. When the RAM budget
+  fills, writes backpressure at the NBD admission boundary.
+</Warning>
+
+Provision exports before enabling `volatile_memory`: the mode requires
+exclusive NBD access and rejects simultaneous NFS, 9P, or WebUI listeners.
+Admin RPC removal of `/.nbd` is also disabled while the mode is active so
+acknowledged bytes cannot target a removed backing inode.
 
 Omit `addresses` when only local Unix-socket access is needed. Start the server after editing the configuration:
 

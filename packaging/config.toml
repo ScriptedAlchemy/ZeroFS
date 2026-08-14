@@ -31,6 +31,11 @@ unix_socket = "/run/zerofs/9p.sock"
 # [servers.nbd]
 # addresses = ["127.0.0.1:10809"]
 # unix_socket = "/run/zerofs/nbd.sock"
+# write_ack_mode = "materialized" # Safe default.
+# Dangerous high-speed burst mode acknowledges ordinary WRITE in bounded RAM;
+# FLUSH/FUA is still the durability boundary:
+# write_ack_mode = "volatile_memory"
+# volatile_memory_gb = 8.0
 
 # AWS S3 / S3-compatible credentials, read from the environment.
 [aws]
