@@ -170,6 +170,8 @@ pub struct Journal {
     #[cfg(test)]
     remote_watermark_commits: AtomicU64,
     #[cfg(test)]
+    local_commit_error_after_durable: AtomicBool,
+    #[cfg(test)]
     remote_mark_pause: Mutex<Option<std::sync::Arc<RemoteMarkPauseInner>>>,
 }
 
@@ -488,6 +490,8 @@ impl Journal {
             snapshot_calls: AtomicU64::new(0),
             #[cfg(test)]
             remote_watermark_commits: AtomicU64::new(0),
+            #[cfg(test)]
+            local_commit_error_after_durable: AtomicBool::new(false),
             #[cfg(test)]
             remote_mark_pause: Mutex::new(None),
         };
@@ -938,22 +942,18 @@ impl Journal {
     /// watermark. This is the point at which the batch's records become
     /// ACKable.
     pub(crate) fn commit_staged(&self, staged: StagedBatch) -> Result<Vec<MutationRecord>> {
-        let StagedBatch::Durable { records, container } = staged else {
+        let StagedBatch::Durable { records, .. } = staged else {
             bail!("commit_staged requires a staged batch");
         };
         if records.is_empty() {
             return Ok(Vec::new());
         }
         let commit_started = Instant::now();
-        if let Err(error) = self.commit_record_batch(&records) {
-            // Recovery would unlink this container anyway -- the watermark
-            // never reached its last member -- but a live process should not
-            // sit on bytes nothing references until the next open.
-            return Err(with_container_cleanup(
-                error,
-                self.discard_container_at(container.as_deref()),
-            ));
-        }
+        // A commit error does not prove the transaction failed: the database
+        // may report an I/O error after its durable header swap. Keep the
+        // container so recovery can use LOCAL_SEQ to distinguish a committed
+        // batch (payload required) from an uncommitted one (payload reclaimed).
+        self.commit_record_batch(&records)?;
         record_local_publish_phase("record_commit", commit_started.elapsed());
         metrics::counter!("zerofs_writeback_local_publish_batches_total").increment(1);
         metrics::counter!("zerofs_writeback_local_publish_records_total")
@@ -1161,7 +1161,15 @@ impl Journal {
         }
         transaction
             .commit()
-            .context("failed to commit journal mutation batch")
+            .context("failed to commit journal mutation batch")?;
+        #[cfg(test)]
+        if self
+            .local_commit_error_after_durable
+            .swap(false, Ordering::AcqRel)
+        {
+            bail!("injected local commit error after durable state");
+        }
+        Ok(())
     }
 
     fn discard_container(&self, path: &Path) -> Result<()> {
@@ -2556,6 +2564,7 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::{Duration, Instant};
@@ -4274,6 +4283,44 @@ mod tests {
         assert_eq!(journal.read_blob(4).unwrap(), b"payload-4");
     }
 
+    /// A database commit error is ambiguous: redb may report an I/O error
+    /// after swapping the primary header, so recovery must use the durable
+    /// watermark rather than eager cleanup to decide whether this container
+    /// committed.
+    #[test]
+    fn ambiguous_commit_error_retains_container_for_recovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("writeback");
+        let journal = Journal::open(&root, identity("bucket-a")).unwrap();
+        let staged = journal
+            .stage_batch(prepare_puts(&journal, 1..=2), 1)
+            .unwrap();
+        let container = root.join(super::container_relative_path(1, 2));
+        journal
+            .local_commit_error_after_durable
+            .store(true, Ordering::Release);
+
+        let error = journal.commit_staged(staged).unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("injected local commit error after durable state"),
+            "{error:#}"
+        );
+        assert_eq!(journal.progress().unwrap().local_seq, 2);
+        assert!(
+            container.exists(),
+            "an ambiguous commit error must not delete a potentially committed container"
+        );
+        assert_eq!(journal.read_blob(1).unwrap(), b"payload-1");
+        assert_eq!(journal.read_blob(2).unwrap(), b"payload-2");
+        drop(journal);
+
+        let recovered = Journal::open(&root, identity("bucket-a")).unwrap();
+        assert_eq!(recovered.progress().unwrap().local_seq, 2);
+        assert_eq!(recovered.read_blob(1).unwrap(), b"payload-1");
+        assert_eq!(recovered.read_blob(2).unwrap(), b"payload-2");
+    }
+
     /// The crash window the pipeline opens: a container is durable, its batch
     /// never committed. Its name puts it above the watermark, so recovery
     /// unlinks it and the committed prefix is untouched.
@@ -4311,8 +4358,9 @@ mod tests {
     /// an early one -- the commit re-validates against the durable watermark,
     /// which is what actually keeps commits ordered.
     #[test]
-    fn committing_a_staged_batch_that_left_a_gap_fails_without_moving_the_watermark() {
+    fn committing_a_staged_batch_that_left_a_gap_is_reclaimed_on_recovery() {
         let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("writeback");
         let journal = open_temp_journal(&temp, "bucket-a");
         journal
             .publish_batch(prepare_puts(&journal, 1..=2))
@@ -4330,8 +4378,16 @@ mod tests {
         assert!(format!("{error:#}").contains("contiguous"), "{error:#}");
         assert_eq!(journal.progress().unwrap().local_seq, 2);
         assert!(
+            container.exists(),
+            "a commit error is ambiguous until recovery reads the durable watermark"
+        );
+        drop(journal);
+
+        let recovered = Journal::open(&root, identity("bucket-a")).unwrap();
+        assert_eq!(recovered.progress().unwrap().local_seq, 2);
+        assert!(
             !container.exists(),
-            "a rejected commit must not leave its container behind"
+            "recovery must reclaim a container above the durable watermark"
         );
     }
 
