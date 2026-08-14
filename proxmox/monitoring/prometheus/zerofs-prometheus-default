@@ -1,0 +1,2 @@
+# Managed by the ZeroFS Proxmox monitoring bundle.
+ARGS="--web.listen-address=127.0.0.1:9090"

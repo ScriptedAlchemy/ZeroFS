@@ -12,7 +12,9 @@ import argparse
 import hashlib
 import ipaddress
 import os
+import re
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -188,9 +190,30 @@ def validate_server_config(
             raise ValueError("prod requires a container-owned 9P Unix socket")
         if _addresses(ninep):
             raise ValueError("prod 9P must be Unix-socket only")
-        for frontend in ("nfs", "webui"):
-            if frontend in servers and servers[frontend] not in (None, {}):
-                raise ValueError("prod permits only the container-owned 9P frontend")
+        nfs = servers.get("nfs")
+        if not isinstance(nfs, dict):
+            raise ValueError("prod requires the private NFS listener")
+        nfs_addresses = _addresses(nfs)
+        if not nfs_addresses:
+            raise ValueError("prod NFS must have a private TCP listener")
+        for address in nfs_addresses:
+            host, port = _split_listener(address)
+            if host != expected_ip or port != 2049:
+                raise ValueError(
+                    "NFS must listen only on the private container address at port 2049"
+                )
+        webui = servers.get("webui")
+        if not isinstance(webui, dict):
+            raise ValueError("prod requires the private WebUI listener")
+        webui_addresses = _addresses(webui)
+        if not webui_addresses:
+            raise ValueError("prod WebUI must have a private TCP listener")
+        for address in webui_addresses:
+            host, port = _split_listener(address)
+            if host != expected_ip or port != 8080:
+                raise ValueError(
+                    "WebUI must listen only on the private container address at port 8080"
+                )
     rpc = servers.get("rpc", {})
     if _addresses(rpc):
         raise ValueError("RPC must be Unix-socket only")
@@ -429,21 +452,66 @@ def _git_receipt(runner: Runner, root: Path) -> tuple[str, bool]:
     return commit or "DRY_RUN_COMMIT", bool(dirty)
 
 
-def _build(runner: Runner, root: Path) -> Path:
+def node_version_supported(value: str) -> bool:
+    match = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", value.strip())
+    if match is None:
+        return False
+    version = tuple(int(component) for component in match.groups())
+    major, minor, _patch = version
+    return (major == 20 and minor >= 19) or (major == 22 and minor >= 12) or major > 22
+
+
+def _build(runner: Runner, root: Path, role: str) -> Path:
     target = root / "target" / "proxmox-lxc"
-    runner.run(
-        [
-            "cargo",
-            "build",
-            "--release",
-            "--locked",
-            "--manifest-path",
-            str(root / "zerofs" / "Cargo.toml"),
-            "--target-dir",
-            str(target),
-        ],
-        cwd=root,
-    )
+    if role == "prod":
+        user_paths = (Path.home() / ".local" / "bin", Path.home() / ".cargo" / "bin")
+        os.environ["PATH"] = os.pathsep.join(
+            [*(str(path) for path in user_paths), os.environ.get("PATH", "")]
+        )
+        required = (
+            "make",
+            "npm",
+            "node",
+            "wasm-pack",
+            "curl",
+            "bsdtar",
+            "unsquashfs",
+            "cpio",
+            "xz",
+            "sha256sum",
+        )
+        if not runner.dry_run:
+            missing = [command for command in required if shutil.which(command) is None]
+            if missing:
+                raise RuntimeError(
+                    "production WebUI build prerequisites are missing: "
+                    + ", ".join(missing)
+                    + "; see proxmox/README.md"
+                )
+            node_version = runner.run(["node", "--version"], capture=True).stdout
+            if not node_version_supported(node_version):
+                raise RuntimeError(
+                    f"production WebUI requires Node 20.19+, 22.12+, or newer; got {node_version.strip()!r}"
+                )
+        runner.run(["make", "webui"], cwd=root)
+        if (
+            not runner.dry_run
+            and not (root / "webui" / "dist" / "index.html").is_file()
+        ):
+            raise RuntimeError("make webui completed without webui/dist/index.html")
+    command = [
+        "cargo",
+        "build",
+        "--release",
+        "--locked",
+        "--manifest-path",
+        str(root / "zerofs" / "Cargo.toml"),
+        "--target-dir",
+        str(target),
+    ]
+    if role == "prod":
+        command.extend(["--features", "webui"])
+    runner.run(command, cwd=root)
     return target / "release" / "zerofs"
 
 
@@ -553,7 +621,7 @@ def _stage_and_run_host(
             (bundle / "hooks" / "zerofs-lxc-hook.sh", "zerofs-lxc-hook.sh"),
             (bundle / "systemd" / "zerofs-lxc.service", "zerofs-lxc.service"),
         )
-        if args.role == "prod":
+        if args.role == "prod" and args.prod_access in {"smb", "both"}:
             files += (
                 (
                     bundle / "systemd" / "zerofs-lxc-mount.service",
@@ -567,7 +635,11 @@ def _stage_and_run_host(
             files += ((args.identity_file, "storage-key"),)
         if args.known_hosts is not None:
             files += ((args.known_hosts, "known_hosts"),)
-        if args.samba_password_file is not None:
+        if (
+            args.role == "prod"
+            and args.prod_access in {"smb", "both"}
+            and args.samba_password_file is not None
+        ):
             files += ((args.samba_password_file, "samba-password"),)
     for path, destination in files:
         runner.run(["scp", "-q", str(path), f"{args.pve_host}:{stage}/{destination}"])
@@ -607,6 +679,8 @@ def _stage_and_run_host(
         release,
         "--samba-user",
         args.samba_user,
+        "--prod-access",
+        args.prod_access,
     ]
     if args.dry_run:
         host_args.append("--dry-run")
@@ -681,6 +755,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--known-hosts", type=Path)
     parser.add_argument("--samba-user", default="zerofs-share")
     parser.add_argument("--samba-password-file", type=Path)
+    parser.add_argument("--prod-access", choices=("nfs", "smb", "both"), default="nfs")
     parser.add_argument("--metrics-url")
     parser.add_argument("--existing-metrics-url")
     parser.add_argument("--drain-timeout", type=int, default=1800)
@@ -718,16 +793,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         require_replace_confirmation(
             args.ctid, os.environ.get("ZEROFS_CONFIRM_REPLACE")
         )
-    if args.role == "prod" and args.action == "deploy" and not args.dry_run:
+    if (
+        args.role == "prod"
+        and args.prod_access in {"smb", "both"}
+        and args.action == "deploy"
+        and not args.dry_run
+    ):
         if args.samba_password_file is None:
-            raise ValueError("prod deploy requires --samba-password-file")
+            raise ValueError("SMB production access requires --samba-password-file")
     if args.skip_existing_drain and args.source_server_unit is not None:
         raise ValueError("cannot skip drain while migrating a source ZeroFS server")
     runner = Runner(args.dry_run)
 
     if args.action == "status":
         units = ["zerofs-lxc.service"]
-        if args.role == "prod":
+        if args.role == "prod" and args.prod_access in {"smb", "both"}:
             units.extend(["zerofs-lxc-mount.service", "smbd.service"])
         runner.run(
             [
@@ -776,7 +856,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     namespace = namespace_id(storage_url, args.role, state_root)
     commit, _dirty = _git_receipt(runner, root)
-    binary = _build(runner, root)
+    binary = _build(runner, root, args.role)
     binary_hash = "DRY_RUN_SHA256" if args.dry_run else sha256(binary)
     release_paths = [args.config]
     release_paths.extend(
@@ -785,14 +865,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.env_file,
             args.identity_file,
             args.known_hosts,
-            args.samba_password_file,
+            (args.samba_password_file if args.prod_access in {"smb", "both"} else None),
         )
         if path is not None
     )
+    release_extras = [binary_hash, args.prod_access]
+    if args.prod_access in {"smb", "both"}:
+        release_extras.append(args.samba_user)
     release = (
         f"{commit[:12]}-DRYRUN"
         if args.dry_run
-        else release_id(commit, release_paths, (binary_hash, args.samba_user))
+        else release_id(commit, release_paths, release_extras)
     )
     _stage_and_run_host(
         runner,

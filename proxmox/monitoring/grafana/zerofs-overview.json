@@ -1,0 +1,146 @@
+{
+  "annotations": {"list": []},
+  "description": "Production ZeroFS durability, payload, error, and segment-GC telemetry.",
+  "editable": false,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "links": [],
+  "panels": [
+    {
+      "datasource": {"type": "prometheus", "uid": "zerofs-prometheus"},
+      "fieldConfig": {"defaults": {"mappings": [{"options": {"0": {"color": "red", "text": "DOWN"}, "1": {"color": "green", "text": "UP"}}, "type": "value"}], "thresholds": {"mode": "absolute", "steps": [{"color": "red"}, {"color": "green", "value": 1}]}}, "overrides": []},
+      "gridPos": {"h": 5, "w": 4, "x": 0, "y": 0},
+      "id": 1,
+      "options": {"colorMode": "background", "graphMode": "none", "justifyMode": "center", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
+      "targets": [{"expr": "up{job=\"zerofs-prod\"}", "legendFormat": "ZeroFS", "refId": "A"}],
+      "title": "Service health",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "zerofs-prometheus"},
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 10, "x": 4, "y": 0},
+      "id": 2,
+      "targets": [
+        {"expr": "zerofs_writeback_accepted_sequence", "legendFormat": "accepted", "refId": "A"},
+        {"expr": "zerofs_writeback_local_sequence", "legendFormat": "local durable", "refId": "B"},
+        {"expr": "zerofs_writeback_remote_sequence", "legendFormat": "remote durable", "refId": "C"}
+      ],
+      "title": "Durability sequences",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "zerofs-prometheus"},
+      "fieldConfig": {"defaults": {"min": 0, "unit": "short"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 10, "x": 14, "y": 0},
+      "id": 3,
+      "targets": [
+        {"expr": "zerofs_writeback_local_lag_operations", "legendFormat": "accepted to local", "refId": "A"},
+        {"expr": "zerofs_writeback_remote_lag_operations", "legendFormat": "accepted to remote", "refId": "B"},
+        {"expr": "zerofs_writeback_ssd_remote_lag_operations", "legendFormat": "local to remote", "refId": "C"}
+      ],
+      "title": "Writeback lag (operations)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "zerofs-prometheus"},
+      "fieldConfig": {"defaults": {"min": 0, "unit": "bytes"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 8},
+      "id": 4,
+      "targets": [
+        {"expr": "zerofs_writeback_dirty_ram_bytes", "legendFormat": "dirty RAM", "refId": "A"},
+        {"expr": "zerofs_writeback_dirty_ram_capacity_bytes", "legendFormat": "RAM capacity", "refId": "B"},
+        {"expr": "zerofs_writeback_dirty_ssd_reserved_bytes", "legendFormat": "dirty SSD", "refId": "C"},
+        {"expr": "zerofs_writeback_dirty_ssd_capacity_bytes", "legendFormat": "SSD capacity", "refId": "D"}
+      ],
+      "title": "Dirty staging tiers",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "zerofs-prometheus"},
+      "fieldConfig": {"defaults": {"min": 0, "unit": "Bps"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 8},
+      "id": 5,
+      "targets": [
+        {"expr": "rate(zerofs_writeback_local_bytes_completed_total[$__rate_interval])", "legendFormat": "local persistence", "refId": "A"},
+        {"expr": "rate(zerofs_writeback_remote_bytes_completed_total[$__rate_interval])", "legendFormat": "remote persistence", "refId": "B"},
+        {"expr": "rate(zerofs_bytes_written_total[$__rate_interval])", "legendFormat": "filesystem writes", "refId": "C"},
+        {"expr": "rate(zerofs_bytes_read_total[$__rate_interval])", "legendFormat": "filesystem reads", "refId": "D"}
+      ],
+      "title": "Payload rates",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "zerofs-prometheus"},
+      "fieldConfig": {"defaults": {"min": 0}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 8},
+      "id": 6,
+      "targets": [
+        {"expr": "rate(zerofs_writeback_retries_total[$__rate_interval])", "legendFormat": "retries/s", "refId": "A"},
+        {"expr": "zerofs_writeback_terminal_error", "legendFormat": "terminal error", "refId": "B"},
+        {"expr": "zerofs_writeback_status_collection_error", "legendFormat": "status collection error", "refId": "C"},
+        {"expr": "zerofs_writeback_oldest_pending_age_seconds", "legendFormat": "oldest pending seconds", "refId": "D"}
+      ],
+      "title": "Retry and terminal state",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "zerofs-prometheus"},
+      "fieldConfig": {"defaults": {"min": 0, "unit": "short"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 16},
+      "id": 7,
+      "targets": [
+        {"expr": "zerofs_segment_gc_active", "legendFormat": "GC active", "refId": "A"},
+        {"expr": "zerofs_segment_gc_saturated", "legendFormat": "GC saturated", "refId": "B"},
+        {"expr": "zerofs_segment_gc_candidate_backlog", "legendFormat": "candidate backlog", "refId": "C"},
+        {"expr": "zerofs_segment_gc_awaiting_delete", "legendFormat": "awaiting delete", "refId": "D"}
+      ],
+      "title": "Segment GC state",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "zerofs-prometheus"},
+      "fieldConfig": {"defaults": {"min": 0, "unit": "Bps"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 16},
+      "id": 8,
+      "targets": [
+        {"expr": "rate(zerofs_segment_gc_deleted_bytes_total[$__rate_interval])", "legendFormat": "deleted", "refId": "A"},
+        {"expr": "rate(zerofs_segment_gc_compaction_freed_bytes_total[$__rate_interval])", "legendFormat": "compaction freed", "refId": "B"}
+      ],
+      "title": "Segment GC payload",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "zerofs-prometheus"},
+      "fieldConfig": {"defaults": {"min": 0, "unit": "bytes"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 16},
+      "id": 9,
+      "targets": [
+        {"expr": "zerofs_segment_live_bytes", "legendFormat": "live", "refId": "A"},
+        {"expr": "zerofs_segment_reclaimable_bytes", "legendFormat": "reclaimable", "refId": "B"},
+        {"expr": "zerofs_jemalloc_resident_bytes", "legendFormat": "resident RAM", "refId": "C"},
+        {"expr": "zerofs_jemalloc_allocated_bytes", "legendFormat": "allocated RAM", "refId": "D"}
+      ],
+      "title": "Storage and cache-adjacent footprint",
+      "type": "timeseries"
+    },
+    {
+      "gridPos": {"h": 3, "w": 24, "x": 0, "y": 24},
+      "id": 10,
+      "options": {"content": "ZeroFS currently exports segment, allocator, and configured writeback-capacity metrics but no explicit clean-cache hit/miss counters. Add those panels when the exporter gains them.", "mode": "markdown"},
+      "title": "Cache metric coverage",
+      "type": "text"
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 39,
+  "tags": ["zerofs", "storage", "production"],
+  "templating": {"list": []},
+  "time": {"from": "now-6h", "to": "now"},
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "ZeroFS Production Overview",
+  "uid": "zerofs-prod-overview",
+  "version": 1,
+  "weekStart": ""
+}

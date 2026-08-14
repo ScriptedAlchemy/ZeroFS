@@ -124,8 +124,16 @@ dir = "/srv/zerofs-persist/state/writeback"
 [servers.ninep]
 unix_socket = "/run/zerofs/9p.sock"
 
+[servers.nfs]
+addresses = ["10.10.10.30:2049"]
+
 [servers.rpc]
 unix_socket = "/run/zerofs/rpc.sock"
+
+[servers.webui]
+addresses = ["10.10.10.30:8080"]
+uid = 0
+gid = 0
 
 [prometheus]
 addresses = ["10.10.10.30:9567"]
@@ -204,6 +212,42 @@ addresses = ["10.10.10.30:9567"]
                 self.write_config(volatile), "10.10.10.30", role="prod"
             )
 
+    def test_prod_webui_requires_exact_private_address_and_port(self) -> None:
+        deploy.validate_server_config(
+            self.write_config(self.prod_config()), "10.10.10.30", role="prod"
+        )
+        for address in ("0.0.0.0:8080", "10.10.10.30:8081", "10.10.10.31:8080"):
+            unsafe = self.prod_config().replace("10.10.10.30:8080", address)
+            with self.subTest(address=address), self.assertRaisesRegex(
+                ValueError, "WebUI.*private container address.*8080"
+            ):
+                deploy.validate_server_config(
+                    self.write_config(unsafe), "10.10.10.30", role="prod"
+                )
+
+    def test_prod_nfs_requires_exact_private_address_and_port(self) -> None:
+        deploy.validate_server_config(
+            self.write_config(self.prod_config()), "10.10.10.30", role="prod"
+        )
+        for address in ("0.0.0.0:2049", "10.10.10.30:2050", "10.10.10.31:2049"):
+            unsafe = self.prod_config().replace("10.10.10.30:2049", address)
+            with self.subTest(address=address), self.assertRaisesRegex(
+                ValueError, "NFS.*private container address.*2049"
+            ):
+                deploy.validate_server_config(
+                    self.write_config(unsafe), "10.10.10.30", role="prod"
+                )
+
+    def test_dev_rejects_webui_even_on_private_address(self) -> None:
+        dev_with_webui = (
+            self.valid_config()
+            + '\n[servers.webui]\naddresses = ["10.10.10.20:8080"]\nuid = 0\ngid = 0\n'
+        )
+        with self.assertRaisesRegex(ValueError, "exclusive NBD"):
+            deploy.validate_server_config(
+                self.write_config(dev_with_webui), "10.10.10.20", role="dev"
+            )
+
     def test_both_roles_cap_sftp_session_fields_at_four(self) -> None:
         too_many = self.prod_config().replace(
             "max_connections = 4", "max_connections = 8"
@@ -215,6 +259,12 @@ addresses = ["10.10.10.30:9567"]
 
 
 class PlanTests(unittest.TestCase):
+    def test_webui_node_version_gate_requires_vite_minimum(self) -> None:
+        self.assertTrue(deploy.node_version_supported("v24.19.0"))
+        self.assertTrue(deploy.node_version_supported("v20.19.0"))
+        self.assertFalse(deploy.node_version_supported("v20.18.9"))
+        self.assertFalse(deploy.node_version_supported("not-node"))
+
     def test_replace_requires_exact_ctid_confirmation(self) -> None:
         with self.assertRaisesRegex(ValueError, "ZEROFS_CONFIRM_REPLACE=120"):
             deploy.require_replace_confirmation(120, None)
@@ -352,9 +402,41 @@ class CliDryRunTests(ConfigValidationTests):
             check=False,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("make webui", result.stdout)
         self.assertIn("host-deploy.sh deploy --role prod", result.stdout)
+        self.assertIn("--features webui", result.stdout)
+        self.assertIn("--prod-access nfs", result.stdout)
         self.assertNotIn("zerofs-lxc-nbd-client.service", result.stdout)
         self.assertNotIn("ubuntu-main bash -se", result.stdout)
+        self.assertNotIn("smb.conf", result.stdout)
+        self.assertNotIn("smbd.service", result.stdout)
+
+    def test_prod_both_access_stages_samba_and_requires_password_on_apply(self) -> None:
+        config = self.write_config(self.prod_config())
+        result = subprocess.run(
+            [
+                "python3",
+                str(MODULE_PATH),
+                "deploy",
+                "--role",
+                "prod",
+                "--prod-access",
+                "both",
+                "--ctid",
+                "130",
+                "--container-ip",
+                "10.10.10.30",
+                "--config",
+                str(config),
+                "--dry-run",
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("smb.conf", result.stdout)
+        self.assertIn("--prod-access both", result.stdout)
 
     def test_remote_namespace_identity_collides_across_roles_but_local_does_not(
         self,

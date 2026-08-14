@@ -6,15 +6,16 @@ roles so production state cannot be reused by a disposable performance test.
 
 | Role | Ownership and access | Acknowledgement | Lifecycle |
 |---|---|---|---|
-| `prod` | LXC owns a local 9P/FUSE mount and exports its `data` directory over private SMB3 | no volatile NBD; writeback waits for SSD | stable CT; drain-safe in-place deploy and rollback only |
+| `prod` | ZeroFS serves native NFS on the private CT address; 9P/FUSE + SMB3 is an optional fallback | no volatile NBD; writeback waits for SSD | stable CT; drain-safe in-place deploy and rollback only |
 | `dev` | VM100 connects directly to the LXC NBD listener with eight native connections | explicit 16 GB `volatile_memory` burst tier | replaceable and cleanable after a full drain |
 
 Both roles use one RFC1918 interface on `vmbr1`. Neither creates a public
-listener. Prometheus uses the container address at port 9567; RPC and production
-9P use Unix sockets. Dev NBD uses only the dev container address at port 10809.
-Production SMB uses only loopback and the production container interface at
-port 445, requires SMB3 encryption/signing and an authenticated user, and allows
-the Proxmox subnet and Tailnet ranges.
+listener. Production NFS, WebUI, and Prometheus bind only the exact container
+address at ports 2049, 8080, and 9567. RPC and production 9P use Unix sockets.
+Dev NBD uses only the dev container address at port 10809. Optional production
+SMB uses only loopback and the production container interface at port 445,
+requires SMB3 encryption/signing and an authenticated user, and allows the
+Proxmox subnet and Tailnet ranges.
 
 ## Persistence and collision guards
 
@@ -39,9 +40,15 @@ identity.
 Production `replace` and `cleanup` are rejected in both coordinator and host
 scripts. An existing production CT is never destroyed by deployment.
 
-## Production ownership requirements
+## Production access and ownership requirements
 
-The production LXC owns the filesystem mount. That requires:
+Native NFS is the default (`--prod-access nfs`) and does not require FUSE,
+Samba, a Samba password, or a container-side filesystem mount. The NFS listener
+is not authenticated; the exact RFC1918 bind plus Proxmox/Tailscale network
+policy is the security boundary. Never port-forward 2049 or 8080.
+
+The optional `--prod-access both` (or legacy `smb`) mode additionally makes the
+production LXC own a 9P/FUSE mount and export it through Samba. That requires:
 
 - Proxmox `features: fuse=1`, added by the host script;
 - `/dev/fuse` access in the unprivileged LXC (provided by that feature);
@@ -60,22 +67,28 @@ journal rather than a volatile acknowledgement tier. Samba can serve both Mac
 and VM100, but the same filesystem must not also be mounted read-write by an NBD
 client.
 
-Mac access should reach private port 445 through a Tailnet subnet route or a
-private Tailscale address. Do not forward SMB, NBD or Prometheus from a public
-interface.
+The WebUI is intentionally unauthenticated and has writable filesystem/admin
+capabilities. It is compiled only for production and binds only
+`http://<container-ip>:8080`; expose it solely through the private Proxmox
+network or an approved Tailnet subnet route. Do not forward NFS, WebUI, SMB,
+NBD, or Prometheus from a public interface.
 
 ## Safe lifecycle
 
-Production in-place deployment first stops Samba, syncs and stops the FUSE
-mount, then requires four stable metrics samples with:
+Production in-place deployment first quiesces an optional active Samba/FUSE
+share and refuses any established NFS session. Unmount every Mac/VM NFS client
+before deployment. It then requires four stable metrics samples with:
 
 - accepted, local and remote sequences equal;
 - dirty RAM and SSD bytes equal to zero;
 - no terminal writeback error.
 
 Only after that drain does it switch the persistent release symlink and restart
-the server, mount and Samba. Failure switches the symlink back and restarts the
-previous services. No production rootfs destruction is available.
+the server plus the access services selected by `--prod-access`. The old server
+is stopped immediately after the second no-NFS-session proof, closing the
+reconnect window while the release changes. Failure
+switches the symlink back and restarts the previously active services. No
+production rootfs destruction is available.
 
 Dev replacement first syncs/unmounts VM100, disconnects its NBD client, and
 requires the same four stable writeback samples plus zero volatile NBD bytes and
@@ -90,6 +103,13 @@ durable before a dev CT is replaced. A missing metric fails closed.
 ## Requirements
 
 - Python 3.11+, Rust and Cargo on the build/control machine.
+- Production WebUI build tools on VM100: Node.js 22/npm, `wasm-pack`, GNU Make,
+  `curl`, `bsdtar` (`libarchive-tools`), `unsquashfs`
+  (`squashfs-tools`), `cpio`, `xz`, and the Rust `wasm32-unknown-unknown`
+  target. Production deploy runs `make webui` before
+  `cargo build --features webui`, prepends `~/.local/bin` and `~/.cargo/bin` to
+  `PATH`, enforces the Vite Node minimum (20.19+, 22.12+, or newer), and fails
+  if `webui/dist/index.html` is absent.
 - SSH aliases for Proxmox and VM100 (defaults `gthost-tor-pve-root` and
   `ubuntu-main`).
 - `pct`, `vzdump`, and a downloaded Debian LXC template on Proxmox.
@@ -122,7 +142,7 @@ namespace and session values no greater than four.
 ## Dry-run production creation or update
 
 Production has no guest NBD lifecycle. It creates the CT when absent and later
-updates it in place:
+updates it in place. Native NFS is the default and needs no Samba secret:
 
 ```bash
 ./proxmox/deploy.sh deploy \
@@ -136,14 +156,38 @@ updates it in place:
   --env-file /secure/zerofs-prod.env \
   --identity-file /secure/storage-key \
   --known-hosts /secure/known_hosts \
-  --samba-user zerofs-share \
-  --samba-password-file /secure/samba-password \
   --dry-run
 ```
 
 Remove `--dry-run` only after checking every resolved host, CTID, address,
-template, namespace and state path. The password file contains one line and is
-never logged or retained in the CT rootfs.
+template, namespace and state path.
+
+For the optional encrypted SMB fallback, add `--prod-access both`,
+`--samba-user zerofs-share`, and
+`--samba-password-file /secure/samba-password`. The password file contains one
+line and is never logged or retained in the CT rootfs.
+
+## macOS native NFS and WebUI
+
+After the production listener proof succeeds and the Mac can route the private
+Proxmox subnet through Tailscale:
+
+```bash
+sudo mkdir -p /Volumes/ZeroFS
+sudo mount_nfs \
+  -o async,nolocks,rsize=1048576,wsize=1048576,tcp,port=2049,mountport=2049,hard \
+  10.10.10.30:/ /Volumes/ZeroFS
+```
+
+Use the actual production CT address in place of `10.10.10.30`. The private
+WebUI is at `http://10.10.10.30:8080` and must never be made public.
+
+ZeroFS NFS reports writes as stable while they are buffered, and tested macOS
+and Linux clients do not issue a durability-producing COMMIT on `fsync`.
+Production `ack_mode = "ssd"` protects the local writeback boundary, but NFS
+`fsync` does **not** prove that the remote SFTP/object-store sequence caught up.
+Use the Grafana remote-lag panels and the drain gate before maintenance; use 9P
+instead when per-call stable-storage semantics are required.
 
 ## Dry-run dev creation, update or replacement
 
@@ -197,9 +241,52 @@ against one backend.
 
 Cleanup leaves the VM disconnected and prints the preserved state path.
 
+## Prometheus and Grafana provisioning
+
+`monitoring/` contains a credential-free Prometheus scrape fragment, a
+loopback-only Prometheus service override, a provisioned Grafana Prometheus
+datasource, and the `ZeroFS Production Overview` dashboard. It does not replace
+or delete the monitoring CT's existing InfluxDB datasource.
+
+The installer defaults to the existing monitoring CT 123 at `10.10.10.53`, but
+both values are explicit options. It validates that the CT owns that private
+address and can reach ZeroFS metrics before changing files. If Prometheus is
+absent, it masks the service first, installs the Debian-family package without
+allowing an interim public listener, then configures it on
+`127.0.0.1:9090`. `promtool` must accept the complete config before either
+service restarts. Prometheus 2.43 or newer is required for
+`scrape_config_files` only when integrating into a pre-existing unmanaged
+Prometheus config; a newly provisioned instance uses a compatible complete
+repo-owned config and is not subject to that import requirement.
+
+Review the non-mutating plan first:
+
+```bash
+python3 proxmox/monitoring/install.py \
+  --monitoring-ctid 123 \
+  --monitoring-ip 10.10.10.53 \
+  --zerofs-ip 10.10.10.30 \
+  --dry-run
+```
+
+After reviewing the resolved CTID and addresses, replace `--dry-run` with the
+explicit `--apply` guard. Existing destination files are copied to a unique
+`/var/lib/zerofs-monitoring-backups/<UTC timestamp>` directory inside the CT.
+Any config, service, listener, or health-check failure restores those exact
+files and prior service state. A newly installed Prometheus package remains
+installed but is stopped and disabled after rollback, avoiding an unsafe
+package purge.
+
+The dashboard shows service health; accepted, local, and remote sequences and
+lags; dirty RAM/SSD use and capacities; filesystem/local/remote payload rates;
+retry, terminal-error, and pending-age state; and segment GC/allocator
+footprints. ZeroFS currently exports no explicit clean-cache hit/miss counters,
+so the dashboard says so rather than inventing a proxy metric.
+
 ## Verification
 
 ```bash
 python3 -m unittest discover -s proxmox/tests -p 'test_*.py'
-shellcheck proxmox/*.sh proxmox/hooks/*.sh proxmox/guest/*.sh
+shellcheck proxmox/*.sh proxmox/hooks/*.sh proxmox/guest/*.sh \
+  proxmox/monitoring/*.sh
 ```

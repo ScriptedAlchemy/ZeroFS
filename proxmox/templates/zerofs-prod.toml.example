@@ -32,8 +32,16 @@ shutdown_flush = "local"
 [servers.ninep]
 unix_socket = "/run/zerofs/9p.sock"
 
+[servers.nfs]
+addresses = ["10.10.10.30:2049"]
+
 [servers.rpc]
 unix_socket = "/run/zerofs/rpc.sock"
+
+[servers.webui]
+addresses = ["10.10.10.30:8080"]
+uid = 0
+gid = 0
 
 [prometheus]
 addresses = ["10.10.10.30:9567"]

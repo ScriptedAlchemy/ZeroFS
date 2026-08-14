@@ -101,13 +101,33 @@ class HostScriptTests(unittest.TestCase):
         self.assertNotIn("rm -rf -- /var/lib/zerofs-lxc/dev-120", result.stdout)
 
     def test_prod_update_quiesces_share_and_never_destroys_container(self) -> None:
-        result = self.run_host("deploy", "--assume-existing", role="prod")
+        result = self.run_host(
+            "deploy", "--assume-existing", "--prod-access", "both", role="prod"
+        )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("systemctl stop smbd.service", result.stdout)
+        self.assertIn("prove no established NFS clients", result.stdout)
+        self.assertIn("systemctl stop zerofs-lxc.service", result.stdout)
         self.assertIn("systemctl stop zerofs-lxc-mount.service", result.stdout)
         self.assertIn("systemctl start zerofs-lxc-mount.service", result.stdout)
         self.assertIn("systemctl start smbd.service", result.stdout)
+        self.assertIn("private 10.10.10.20:8080", result.stdout)
         self.assertNotIn("pct destroy 120", result.stdout)
+
+    def test_default_prod_access_is_native_nfs_without_samba(self) -> None:
+        result = self.run_host("deploy", role="prod")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("private 10.10.10.20:2049", result.stdout)
+        self.assertNotIn(
+            "apt-get install -y --no-install-recommends fuse3 samba", result.stdout
+        )
+        self.assertNotIn("smbd.service", result.stdout)
+
+    def test_listener_proof_rejects_wildcard_webui(self) -> None:
+        source = HOST_SCRIPT.read_text()
+        self.assertIn("$container_ip:8080", source)
+        self.assertIn("$container_ip:2049", source)
+        self.assertRegex(source, r"10809\|9567\|2049\|445\|8080")
 
     def test_prod_rejects_replace_and_cleanup_on_host_too(self) -> None:
         for action in ("replace", "cleanup"):

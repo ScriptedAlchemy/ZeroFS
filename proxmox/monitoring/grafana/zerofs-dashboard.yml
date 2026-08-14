@@ -1,0 +1,14 @@
+apiVersion: 1
+
+providers:
+  - name: ZeroFS
+    orgId: 1
+    folder: ZeroFS
+    folderUid: zerofs
+    type: file
+    disableDeletion: true
+    editable: false
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards/zerofs
+      foldersFromFilesStructure: false

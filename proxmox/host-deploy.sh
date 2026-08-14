@@ -32,6 +32,7 @@ binary_sha=
 namespace_id=
 release_id=
 samba_user=zerofs-share
+prod_access=nfs
 confirm_replace=
 dry_run=false
 assume_existing=false
@@ -54,6 +55,7 @@ while (($#)); do
     --namespace-id) namespace_id=$2; shift 2 ;;
     --release-id) release_id=$2; shift 2 ;;
     --samba-user) samba_user=$2; shift 2 ;;
+    --prod-access) prod_access=$2; shift 2 ;;
     --confirm-replace) confirm_replace=$2; shift 2 ;;
     --assume-existing) assume_existing=true; shift ;;
     --dry-run) dry_run=true; shift ;;
@@ -63,6 +65,14 @@ done
 
 [[ $ctid =~ ^[1-9][0-9]{2,8}$ ]] || { echo "invalid --ctid" >&2; exit 2; }
 [[ $role == prod || $role == dev ]] || { echo "--role must be prod or dev" >&2; exit 2; }
+[[ $prod_access == nfs || $prod_access == smb || $prod_access == both ]] || {
+  echo "--prod-access must be nfs, smb, or both" >&2
+  exit 2
+}
+has_smb=false
+if [[ $role == prod && ( $prod_access == smb || $prod_access == both ) ]]; then
+  has_smb=true
+fi
 [[ $samba_user =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || {
   echo "unsafe Samba user name" >&2
   exit 2
@@ -188,6 +198,10 @@ assert_server_drained() {
   return 1
 }
 
+prod_mount_was_active=false
+prod_smb_was_active=false
+prod_mount_was_enabled=false
+prod_smb_was_enabled=false
 quiesce_prod_share() {
   [[ $role == prod ]] || return 0
   ct_exists || return 0
@@ -195,9 +209,43 @@ quiesce_prod_share() {
   if [[ $dry_run == false ]] && ! pct exec "$ctid" -- systemctl is-active --quiet zerofs-lxc.service; then
     return 0
   fi
-  run pct exec "$ctid" -- systemctl stop smbd.service
-  run pct exec "$ctid" -- sync -f /srv/zerofs-share
-  run pct exec "$ctid" -- systemctl stop zerofs-lxc-mount.service
+  if [[ $dry_run == true ]]; then
+    if [[ $has_smb == true ]]; then
+      run pct exec "$ctid" -- systemctl stop smbd.service
+      run pct exec "$ctid" -- sync -f /srv/zerofs-share
+      run pct exec "$ctid" -- systemctl stop zerofs-lxc-mount.service
+    else
+      echo "+ inspect and quiesce any previously active optional SMB/FUSE share"
+    fi
+    return
+  fi
+  if pct exec "$ctid" -- systemctl is-enabled --quiet smbd.service; then
+    prod_smb_was_enabled=true
+  fi
+  if pct exec "$ctid" -- systemctl is-enabled --quiet zerofs-lxc-mount.service; then
+    prod_mount_was_enabled=true
+  fi
+  if pct exec "$ctid" -- systemctl is-active --quiet smbd.service; then
+    prod_smb_was_active=true
+    run pct exec "$ctid" -- systemctl stop smbd.service
+  fi
+  if pct exec "$ctid" -- systemctl is-active --quiet zerofs-lxc-mount.service; then
+    prod_mount_was_active=true
+    run pct exec "$ctid" -- sync -f /srv/zerofs-share
+    run pct exec "$ctid" -- systemctl stop zerofs-lxc-mount.service
+  fi
+}
+
+assert_prod_nfs_quiesced() {
+  [[ $role == prod ]] || return 0
+  if [[ $dry_run == true ]]; then
+    echo "+ prove no established NFS clients remain on $container_ip:2049"
+    return
+  fi
+  if pct exec "$ctid" -- ss -Hnt state established sport = :2049 | grep -q .; then
+    echo "active NFS client remains; unmount every client before production deploy" >&2
+    return 1
+  fi
 }
 
 graceful_stop() {
@@ -222,7 +270,7 @@ if [[ $dry_run == false ]]; then
   for required in "$stage/zerofs" "$stage/zerofs.toml" "$stage/zerofs-lxc.service" "$stage/zerofs-lxc-hook.sh"; do
     [[ -f $required ]] || { echo "missing staged asset: $required" >&2; exit 1; }
   done
-  if [[ $role == prod ]]; then
+  if [[ $has_smb == true ]]; then
     for required in "$stage/zerofs-lxc-mount.service" "$stage/smb.conf" "$stage/samba-password"; do
       [[ -f $required ]] || { echo "missing staged prod asset: $required" >&2; exit 1; }
     done
@@ -260,7 +308,26 @@ rollback() {
     pct start "$ctid" >/dev/null 2>&1
     pct exec "$ctid" -- systemctl restart zerofs-lxc.service >/dev/null 2>&1
     if [[ $role == prod ]]; then
-      pct exec "$ctid" -- systemctl start zerofs-lxc-mount.service smbd.service >/dev/null 2>&1
+      if [[ $prod_mount_was_enabled == true ]]; then
+        pct exec "$ctid" -- systemctl enable zerofs-lxc-mount.service >/dev/null 2>&1
+      else
+        pct exec "$ctid" -- systemctl disable zerofs-lxc-mount.service >/dev/null 2>&1
+      fi
+      if [[ $prod_smb_was_enabled == true ]]; then
+        pct exec "$ctid" -- systemctl enable smbd.service >/dev/null 2>&1
+      else
+        pct exec "$ctid" -- systemctl disable smbd.service >/dev/null 2>&1
+      fi
+      if [[ $prod_mount_was_active == true ]]; then
+        pct exec "$ctid" -- systemctl start zerofs-lxc-mount.service >/dev/null 2>&1
+      else
+        pct exec "$ctid" -- systemctl stop zerofs-lxc-mount.service >/dev/null 2>&1
+      fi
+      if [[ $prod_smb_was_active == true ]]; then
+        pct exec "$ctid" -- systemctl start smbd.service >/dev/null 2>&1
+      else
+        pct exec "$ctid" -- systemctl stop smbd.service >/dev/null 2>&1
+      fi
     fi
   fi
   exit "$code"
@@ -269,7 +336,12 @@ trap rollback ERR
 
 if [[ $had_ct == true ]]; then
   quiesce_prod_share
+  assert_prod_nfs_quiesced
   assert_server_drained
+  assert_prod_nfs_quiesced
+  if [[ $role == prod ]]; then
+    run pct exec "$ctid" -- systemctl stop zerofs-lxc.service
+  fi
 fi
 
 run install -d -o 100000 -g 100000 -m 0750 "$state_root"
@@ -352,7 +424,7 @@ if ! ct_exists; then
     --startup order=20
 fi
 run pct set "$ctid" --hookscript local:snippets/zerofs-lxc-hook.sh
-if [[ $role == prod ]]; then
+if [[ $has_smb == true ]]; then
   run pct set "$ctid" --features fuse=1
 fi
 if ! ct_running; then
@@ -361,12 +433,12 @@ fi
 
 run pct exec "$ctid" -- apt-get update
 packages=(ca-certificates curl iproute2)
-if [[ $role == prod ]]; then
+if [[ $has_smb == true ]]; then
   packages+=(fuse3 samba)
 fi
 run pct exec "$ctid" -- env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${packages[@]}"
 run pct push "$ctid" "$stage/zerofs-lxc.service" /etc/systemd/system/zerofs-lxc.service --perms 0644
-if [[ $role == prod ]]; then
+if [[ $has_smb == true ]]; then
   run pct exec "$ctid" -- sh -c "grep -qxF user_allow_other /etc/fuse.conf || printf '%s\\n' user_allow_other >>/etc/fuse.conf"
   run pct push "$ctid" "$stage/zerofs-lxc-mount.service" /etc/systemd/system/zerofs-lxc-mount.service --perms 0644
   if [[ $dry_run == false ]]; then
@@ -390,6 +462,10 @@ run pct exec "$ctid" -- systemctl restart zerofs-lxc.service
 
 if [[ $dry_run == true ]]; then
   echo "+ wait up to 180s for private $role listeners and services"
+  if [[ $role == prod ]]; then
+    echo "+ prove NFS listener is private $container_ip:2049"
+    echo "+ prove WebUI listener is private $container_ip:8080 and rejects wildcard/public binds"
+  fi
 else
   deadline=$((SECONDS + 180))
   until pct exec "$ctid" -- systemctl is-active --quiet zerofs-lxc.service \
@@ -402,12 +478,17 @@ else
   done
 fi
 run pct exec "$ctid" -- systemctl is-active --quiet zerofs-lxc.service
-if [[ $role == prod ]]; then
+if [[ $has_smb == true ]]; then
   run pct exec "$ctid" -- systemctl enable zerofs-lxc-mount.service smbd.service
   run pct exec "$ctid" -- systemctl start zerofs-lxc-mount.service
   run pct exec "$ctid" -- systemctl start smbd.service
   run pct exec "$ctid" -- systemctl is-active --quiet zerofs-lxc-mount.service
   run pct exec "$ctid" -- systemctl is-active --quiet smbd.service
+elif [[ $role == prod && $dry_run == false ]]; then
+  # A prior `both` rollout may have left these units installed. Native-NFS mode
+  # must not reactivate the optional SMB/FUSE layer on the next CT boot.
+  pct exec "$ctid" -- sh -c \
+    'systemctl disable --now smbd.service zerofs-lxc-mount.service >/dev/null 2>&1 || true'
 fi
 if [[ $dry_run == false ]]; then
   listeners=$(pct exec "$ctid" -- ss -H -lnt)
@@ -415,9 +496,16 @@ if [[ $dry_run == false ]]; then
   if [[ $role == dev ]]; then
     grep -Fq "$container_ip:10809" <<<"$listeners"
   else
-    grep -Fq "$container_ip:445" <<<"$listeners"
+    grep -Fq "$container_ip:2049" <<<"$listeners"
+    grep -Fq "$container_ip:8080" <<<"$listeners"
+    if [[ $has_smb == true ]]; then
+      grep -Fq "$container_ip:445" <<<"$listeners"
+    elif grep -Eq "(^|[[:space:]])$container_ip:445([[:space:]]|$)" <<<"$listeners"; then
+      echo "SMB remained active in NFS-only mode" >&2
+      false
+    fi
   fi
-  if grep -Eq '(^|[[:space:]])(0\.0\.0\.0|\[::\]):(10809|9567|445)([[:space:]]|$)' <<<"$listeners"; then
+  if grep -Eq '(^|[[:space:]])(0\.0\.0\.0|\[::\]):(10809|9567|2049|445|8080)([[:space:]]|$)' <<<"$listeners"; then
     echo "ZeroFS listener escaped the private container address" >&2
     false
   fi

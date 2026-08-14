@@ -1,0 +1,8 @@
+- job_name: "zerofs-prod"
+  metrics_path: "/metrics"
+  scheme: "http"
+  static_configs:
+    - targets: ["@@ZEROFS_IP@@:9567"]
+      labels:
+        service: "zerofs"
+        role: "prod"

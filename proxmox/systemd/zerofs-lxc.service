@@ -1,5 +1,5 @@
 [Unit]
-Description=ZeroFS private NBD server in Proxmox LXC
+Description=ZeroFS private storage server in Proxmox LXC
 After=network-online.target
 Wants=network-online.target
 
