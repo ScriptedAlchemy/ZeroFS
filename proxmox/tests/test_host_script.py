@@ -67,6 +67,12 @@ class HostScriptTests(unittest.TestCase):
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_hook_accepts_only_role_scoped_persistent_state_roots(self) -> None:
+        source = HOOK.read_text()
+        self.assertIn('"/var/lib/zerofs-lxc/prod-${ctid}"', source)
+        self.assertIn('"/var/lib/zerofs-lxc/dev-${ctid}"', source)
+        self.assertNotIn('expected="/var/lib/zerofs-lxc/${ctid}"', source)
+
     def test_deploy_plan_uses_unprivileged_private_lxc_and_persistent_bind(
         self,
     ) -> None:

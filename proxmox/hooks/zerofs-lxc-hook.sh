@@ -14,11 +14,14 @@ case "$phase" in
     # This file is written only by host-deploy.sh and contains shell-quoted data.
     # shellcheck disable=SC1090
     source "$config"
-    expected="/var/lib/zerofs-lxc/${ctid}"
-    test "${ZEROFS_LXC_STATE_ROOT:-}" = "$expected" || {
-      echo "unexpected ZeroFS persistent state root" >&2
-      exit 1
-    }
+    expected=${ZEROFS_LXC_STATE_ROOT:-}
+    case "$expected" in
+      "/var/lib/zerofs-lxc/prod-${ctid}"|"/var/lib/zerofs-lxc/dev-${ctid}") ;;
+      *)
+        echo "unexpected ZeroFS persistent state root" >&2
+        exit 1
+        ;;
+    esac
     test -f "$expected/.zerofs-lxc-state" || {
       echo "persistent state marker is missing: $expected/.zerofs-lxc-state" >&2
       exit 1
