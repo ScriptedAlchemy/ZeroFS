@@ -511,12 +511,17 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
     /// the protocol allows: every simple reply carries the request's cookie,
     /// and that is what the client matches on.
     ///
-    /// Ordering that does matter is unchanged, because it never depended on
-    /// this loop. A WRITE takes its admission guard (`begin_mutation`) while
-    /// still being read here, in request order, and holds it until the write
-    /// completes; FLUSH takes the same gate exclusively. So a FLUSH still waits
-    /// for every write admitted before it, whether that write is mid-payload,
-    /// queued, or executing.
+    /// Two kinds of concurrency are new here and both are legal. Commands that
+    /// the specification leaves unordered — WRITE against WRITE, TRIM against
+    /// WRITE, READ against either — may now execute simultaneously, so a client
+    /// that needs one to land before another must separate them with FLUSH or
+    /// FUA, exactly as it must against any server that does not serialize.
+    /// What has *not* changed is the ordering the specification does impose,
+    /// because it never lived in this loop: a WRITE takes its admission guard
+    /// (`begin_mutation`) while still being read here, in request order, and
+    /// holds it until the write completes, while FLUSH takes the same gate
+    /// exclusively. A FLUSH therefore still covers every write admitted before
+    /// it, whether that write is mid-payload, queued, or executing.
     async fn handle_transmission(&mut self, device: NBDDevice) -> Result<()> {
         let Self {
             reader,
@@ -529,28 +534,54 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
         let shutdown = &*shutdown;
         let device = &device;
 
-        // A stream rather than a future rebuilt each iteration, for two
-        // reasons. It borrows the reader exactly once, and — because
+        // Commands are capped by count *and* by bytes. A single request may ask
+        // for up to `MAX_REQUEST_LENGTH`, so a count-only cap would let one
+        // connection pin `MAX_INFLIGHT_COMMANDS * MAX_REQUEST_LENGTH` of
+        // payload. Each admitted command holds byte credit from the moment its
+        // payload is read until its reply has been written — reply data is
+        // charged the same way, since a queued READ reply is just as resident.
+        let budget = Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_BYTES));
+        let (reply_tx, reply_rx) = tokio::sync::mpsc::channel::<Reply>(MAX_INFLIGHT_COMMANDS);
+
+        // Streams rather than futures rebuilt each iteration, for two reasons.
+        // Each borrows its half of the socket exactly once, and — because
         // `unfold` parks its in-progress future inside the stream — a
         // `select!` branch that loses the race drops only the `next()` handle,
-        // never the partially completed read. `read_exact` is not
-        // cancellation-safe, so a half-read header or payload must survive.
-        let mut commands = Box::pin(stream::unfold(
-            (reader, false),
-            move |(reader, stop)| async move {
+        // never a partially completed read or write. Neither `read_exact` nor
+        // `write_all` is cancellation-safe.
+        let mut commands = Box::pin(stream::unfold((reader, false), move |(reader, stop)| {
+            let budget = Arc::clone(&budget);
+            async move {
                 if stop {
                     return None;
                 }
-                match next_admitted(reader, handler, device, shutdown).await {
+                match next_admitted(reader, handler, device, shutdown, &budget).await {
                     Ok(None) => None,
                     Ok(Some(command)) => Some((Ok(command), (reader, false))),
                     // Surface the failure, then stop reading this session.
                     Err(e) => Some((Err(e), (reader, true))),
                 }
+            }
+        }));
+        // Replies drain here rather than inline in the loop body. Blocking the
+        // loop on a socket write would stop `inflight` from being polled, and
+        // an unpolled write cannot reach the `drop(admission)` inside
+        // `write_admitted` — so a client that stopped reading would pin
+        // admission guards on a gate shared by every connection to the export,
+        // stalling `flush` and `begin_mutation` fleet-wide.
+        let mut replies = Box::pin(stream::unfold(
+            (writer, reply_rx),
+            |(writer, mut reply_rx)| async move {
+                let (cookie, result, budget) = reply_rx.recv().await?;
+                write_simple_reply(writer, cookie, result).await;
+                // Held until the reply is on the wire, not merely produced.
+                drop(budget);
+                Some(((), (writer, reply_rx)))
             },
         ));
         let mut inflight = FuturesUnordered::new();
         let mut accepting = true;
+        let mut unwritten = 0usize;
 
         loop {
             // Checked before the stream is polled, so a session that is already
@@ -559,24 +590,33 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
                 debug!("NBD client handler shutting down");
                 accepting = false;
             }
-            let reading = accepting && inflight.len() < MAX_INFLIGHT_COMMANDS;
-            if !reading && inflight.is_empty() {
+            let reading = accepting && inflight.len() + unwritten < MAX_INFLIGHT_COMMANDS;
+            if !reading && inflight.is_empty() && unwritten == 0 {
                 return Ok(());
             }
 
             tokio::select! {
                 biased;
-                Some((cookie, result)) = inflight.next(), if !inflight.is_empty() => {
-                    write_simple_reply(writer, cookie, result).await;
+                Some(()) = replies.next(), if unwritten > 0 => {
+                    unwritten -= 1;
+                }
+                Some(reply) = inflight.next(), if !inflight.is_empty() => {
+                    unwritten += 1;
+                    // Capacity equals the in-flight cap and every admitted
+                    // command yields exactly one reply, so this cannot be full.
+                    assert!(
+                        reply_tx.try_send(reply).is_ok(),
+                        "reply channel is sized for the in-flight cap",
+                    );
                 }
                 next = commands.next(), if reading => {
                     match next {
-                        // Disconnect, or shutdown observed mid-read. Stop
-                        // accepting, then drain what was already admitted.
+                        // Disconnect, clean EOF, or shutdown observed mid-read.
+                        // Stop accepting, then drain what was already admitted.
                         None => accepting = false,
                         Some(Err(e)) => return Err(e),
-                        Some(Ok((cookie, command))) => inflight.push(async move {
-                            (cookie, run_admitted(handler, device, command).await)
+                        Some(Ok((cookie, command, budget))) => inflight.push(async move {
+                            (cookie, run_admitted(handler, device, command).await, budget)
                         }),
                     }
                 }
@@ -626,10 +666,32 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
     }
 }
 
-/// In-flight commands allowed per connection. Each queued WRITE holds its
-/// payload, so this bounds per-connection memory; it is deep enough to keep the
-/// storage engine busy while a client's queue drains.
+/// In-flight commands allowed per connection: deep enough to keep the storage
+/// engine busy while a client's queue drains. Memory is bounded by
+/// [`MAX_INFLIGHT_BYTES`], not by this — a request may be as large as
+/// [`MAX_REQUEST_LENGTH`], so a count alone would bound nothing useful.
 const MAX_INFLIGHT_COMMANDS: usize = 32;
+
+/// Payload and reply bytes one connection may hold at once. Credit is taken
+/// before a WRITE's payload is read (or a READ is dispatched) and returned only
+/// once the reply has been written, so it covers both directions. A request
+/// larger than the whole budget is clamped to it, which keeps a single
+/// oversized command admissible instead of deadlocking against its own cap.
+const MAX_INFLIGHT_BYTES: usize = 64 * 1024 * 1024;
+
+/// A finished command waiting to go out: cookie, result, and the byte credit it
+/// still owes until the reply is on the wire.
+type Reply = (
+    u64,
+    super::error::CommandResult<bytes::Bytes>,
+    tokio::sync::OwnedSemaphorePermit,
+);
+
+/// Byte credit a command should hold while in flight, clamped so one oversized
+/// request can still be admitted on its own.
+fn budget_cost(length: u32) -> u32 {
+    length.min(MAX_INFLIGHT_BYTES as u32)
+}
 
 /// A transmission command that owes the socket nothing further: a WRITE already
 /// carries its payload and its admission guard, an oversized or malformed
@@ -730,7 +792,8 @@ async fn next_admitted<R>(
     handler: &NBDHandler,
     device: &NBDDevice,
     shutdown: &CancellationToken,
-) -> Result<Option<(u64, AdmittedCommand)>>
+    budget: &Arc<tokio::sync::Semaphore>,
+) -> Result<Option<(u64, AdmittedCommand, tokio::sync::OwnedSemaphorePermit)>>
 where
     R: AsyncRead + Unpin,
 {
@@ -742,7 +805,23 @@ where
             return Ok(None);
         }
         result = reader.read_exact(&mut request_buf) => {
-            result?;
+            if let Err(e) = result {
+                // A client that closes or resets between requests has simply
+                // gone away. Treat it exactly like NBD_CMD_DISC: stop reading
+                // and let already-admitted commands finish, rather than
+                // abandoning up to `MAX_INFLIGHT_COMMANDS` writes — which for a
+                // striped export could tear a single logical write across its
+                // members mid-`try_join_all`.
+                return match e.kind() {
+                    std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::BrokenPipe => {
+                        debug!("NBD client went away: {:?}", e.kind());
+                        Ok(None)
+                    }
+                    _ => Err(e.into()),
+                };
+            }
         }
     }
 
@@ -755,6 +834,18 @@ where
         request.cmd_type, request.offset, request.length
     );
 
+    // Charged before any payload is read and released only once the reply is
+    // written, so both the request body and the reply body are covered. A
+    // command that carries neither costs nothing but is still count-capped.
+    let cost = match request.cmd_type {
+        NBDCommand::Read | NBDCommand::Write => budget_cost(request.length),
+        _ => 0,
+    };
+    let credit = Arc::clone(budget)
+        .acquire_many_owned(cost)
+        .await
+        .map_err(|_| NBDError::Protocol("connection byte budget closed".into()))?;
+
     if request.length > MAX_REQUEST_LENGTH {
         if request.cmd_type == NBDCommand::Write {
             return Err(NBDError::Protocol(format!(
@@ -765,6 +856,7 @@ where
         return Ok(Some((
             request.cookie,
             AdmittedCommand::Settled(Err(CommandError::InvalidArgument)),
+            credit,
         )));
     }
 
@@ -815,7 +907,7 @@ where
             AdmittedCommand::Settled(Err(CommandError::InvalidArgument))
         }
     };
-    Ok(Some((request.cookie, command)))
+    Ok(Some((request.cookie, command, credit)))
 }
 
 /// Run an already-admitted command. Touches no socket, so several may be in
@@ -882,7 +974,7 @@ async fn write_simple_reply<W>(
 
 #[cfg(test)]
 mod tests {
-    use super::{NBDServer, NBDSession};
+    use super::{MAX_INFLIGHT_BYTES, MAX_REQUEST_LENGTH, NBDServer, NBDSession, budget_cost};
     use crate::fs::ZeroFS;
     use crate::fs::permissions::Credentials;
     use crate::fs::types::{SetAttributes, SetSize};
@@ -931,6 +1023,33 @@ mod tests {
         bytes: Vec<u8>,
         position: usize,
         polls: Arc<AtomicUsize>,
+    }
+
+    /// A writer that never accepts a byte, standing in for a client that
+    /// stopped reading its replies while continuing to hold the connection.
+    struct StalledWriter {
+        stalled: Option<oneshot::Sender<()>>,
+    }
+
+    impl tokio::io::AsyncWrite for StalledWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if let Some(stalled) = self.stalled.take() {
+                let _ = stalled.send(());
+            }
+            Poll::Pending
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
     }
 
     impl AsyncRead for PrebufferedRequest {
@@ -2094,5 +2213,131 @@ mod tests {
             .expect("server stopped after disconnect")
             .expect("server task did not panic")
             .expect("server accepted disconnect");
+    }
+
+    /// One command may be as large as `MAX_REQUEST_LENGTH`, which is bigger
+    /// than the whole per-connection byte budget. Its credit is clamped to the
+    /// budget so it remains admissible on its own instead of waiting forever
+    /// for capacity that cannot exist.
+    #[test]
+    fn an_oversized_request_still_fits_the_connection_byte_budget() {
+        assert_eq!(budget_cost(4096), 4096);
+        assert_eq!(
+            budget_cost(MAX_INFLIGHT_BYTES as u32),
+            MAX_INFLIGHT_BYTES as u32
+        );
+        assert_eq!(budget_cost(MAX_REQUEST_LENGTH), MAX_INFLIGHT_BYTES as u32);
+        assert!(
+            MAX_REQUEST_LENGTH as usize > MAX_INFLIGHT_BYTES,
+            "the clamp is only load-bearing while a request can exceed the budget"
+        );
+    }
+
+    /// A client that stops reading its replies must not pin admission guards.
+    ///
+    /// Replies drain on their own stream, so a blocked socket write leaves
+    /// `inflight` still being polled and every write still reaches the
+    /// `drop(admission)` inside `write_admitted`. If replies were written
+    /// inline in the loop instead, the loop would park in the socket write, the
+    /// second write would never be polled to completion, and its read guard
+    /// would hold the export gate — which is shared by every connection to that
+    /// export — stalling `flush` fleet-wide.
+    #[tokio::test]
+    async fn a_client_that_stops_reading_replies_does_not_stall_flush() {
+        let filesystem = Arc::new(
+            ZeroFS::new_in_memory()
+                .await
+                .expect("create test filesystem"),
+        );
+        let export_gates = Arc::new(NbdExportGates::default());
+        let device = single_file_export(&filesystem, &export_gates).await;
+        let flush_device = NBDHandler::new(Arc::clone(&filesystem), Arc::clone(&export_gates))
+            .get_device(b"flush-ordering-test")
+            .await
+            .expect("open the same export on another connection");
+
+        let mut requests = Vec::new();
+        for cookie in 1..=2u64 {
+            requests.extend_from_slice(&probe_request(NBDCommand::Write, cookie, 0, 512));
+            requests.extend_from_slice(&vec![0x3c; 512]);
+        }
+        let (stalled_tx, stalled_rx) = oneshot::channel();
+        let mut session = NBDSession::new(
+            PrebufferedRequest {
+                bytes: requests,
+                position: 0,
+                polls: Arc::new(AtomicUsize::new(0)),
+            },
+            StalledWriter {
+                stalled: Some(stalled_tx),
+            },
+            Arc::clone(&filesystem),
+            Arc::clone(&export_gates),
+            CancellationToken::new(),
+        );
+        let session_task = tokio::spawn(async move { session.handle_transmission(device).await });
+
+        stalled_rx
+            .await
+            .expect("the session tried to write a reply and blocked");
+
+        let flush_handler = NBDHandler::new(filesystem, export_gates);
+        timeout(Duration::from_secs(5), flush_handler.flush(&flush_device))
+            .await
+            .expect("a stalled reply socket must not hold the export gate")
+            .expect("FLUSH succeeded");
+
+        session_task.abort();
+        let _ = session_task.await;
+    }
+
+    /// An unclean disconnect is not a reason to abandon accepted work. A client
+    /// that vanishes after its request — RST or plain EOF — leaves a write that
+    /// was already admitted, and dropping it mid-flight could tear a striped
+    /// write across its members. The session drains instead, exactly as it does
+    /// for NBD_CMD_DISC.
+    #[tokio::test]
+    async fn a_vanished_client_still_finishes_its_admitted_write() {
+        let filesystem = Arc::new(
+            ZeroFS::new_in_memory()
+                .await
+                .expect("create test filesystem"),
+        );
+        let export_gates = Arc::new(NbdExportGates::default());
+        let device = single_file_export(&filesystem, &export_gates).await;
+        let probe = NBDHandler::new(Arc::clone(&filesystem), Arc::clone(&export_gates))
+            .get_device(b"flush-ordering-test")
+            .await
+            .expect("open the same export to read back");
+
+        // The request is complete, but nothing follows it: the reader reports
+        // EOF where the next header would begin.
+        let mut requests = probe_request(NBDCommand::Write, 1, 0, 512);
+        requests.extend_from_slice(&vec![0xd7; 512]);
+        let mut session = NBDSession::new(
+            PrebufferedRequest {
+                bytes: requests,
+                position: 0,
+                polls: Arc::new(AtomicUsize::new(0)),
+            },
+            tokio::io::sink(),
+            Arc::clone(&filesystem),
+            Arc::clone(&export_gates),
+            CancellationToken::new(),
+        );
+        timeout(Duration::from_secs(5), session.handle_transmission(device))
+            .await
+            .expect("the session ended after its client vanished")
+            .expect("an EOF between requests is a clean end, not a session error");
+
+        let landed = NBDHandler::new(filesystem, export_gates)
+            .read(&probe, 0, 512)
+            .await
+            .expect("read back the admitted write");
+        assert_eq!(
+            landed,
+            Bytes::from(vec![0xd7; 512]),
+            "a write admitted before the client vanished must still land"
+        );
     }
 }
