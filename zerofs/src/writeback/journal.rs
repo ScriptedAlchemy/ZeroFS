@@ -2459,6 +2459,13 @@ fn reject_symlink_if_present(path: &Path, description: &str) -> Result<()> {
 }
 
 fn open_owner_file(path: &Path, allow_existing: bool) -> Result<File> {
+    open_owner_file_with(path, allow_existing, || Ok(()))
+}
+
+fn open_owner_file_with<F>(path: &Path, allow_existing: bool, after_open: F) -> Result<File>
+where
+    F: FnOnce() -> Result<()>,
+{
     let existed = match fs::symlink_metadata(path) {
         Ok(metadata) => {
             if metadata.file_type().is_symlink() {
@@ -2483,11 +2490,27 @@ fn open_owner_file(path: &Path, allow_existing: bool) -> Result<File> {
     #[cfg(unix)]
     options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     let file = options.open(path)?;
-    if !existed {
-        set_owner_only_file(path)?;
+    let setup = (|| -> Result<()> {
+        after_open()?;
+        if !existed {
+            set_owner_only_file(path)?;
+        }
+        let metadata = file.metadata()?;
+        validate_owner_only(path, &metadata, 0o600)
+    })();
+    if let Err(error) = setup {
+        if allow_existing {
+            return Err(error);
+        }
+        drop(file);
+        return match fs::remove_file(path) {
+            Ok(()) => Err(error),
+            Err(cleanup) if cleanup.kind() == std::io::ErrorKind::NotFound => Err(error),
+            Err(cleanup) => Err(error.context(format!(
+                "failed to remove exclusively-created journal file after setup error: {cleanup}"
+            ))),
+        };
     }
-    let metadata = file.metadata()?;
-    validate_owner_only(path, &metadata, 0o600)?;
     Ok(file)
 }
 
@@ -2551,7 +2574,7 @@ mod tests {
     use super::{
         FENCE_CLASSIFICATION_VERSION, FENCE_CLASSIFICATION_VERSION_KEY, Journal, JournalSnapshot,
         JournalWriteGate, META, PublicationFilesystem, REMOTE_OBJECT_VERSIONS, blob_relative_path,
-        read_optional, write_value,
+        open_owner_file_with, read_optional, write_value,
     };
     use crate::writeback::model::{
         FenceClass, JournalIdentity, LocalEtag, MutationKind, MutationMode, MutationRecord,
@@ -3822,6 +3845,26 @@ mod tests {
                 .mode()
                 & 0o777,
             0o600
+        );
+    }
+
+    #[test]
+    fn exclusive_owner_file_setup_failure_removes_the_file_it_created() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("container.blobs");
+
+        let error = open_owner_file_with(&path, false, || {
+            Err(anyhow::anyhow!("injected owner-file setup failure"))
+        })
+        .unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("injected owner-file setup failure"),
+            "{error:#}"
+        );
+        assert!(
+            !path.exists(),
+            "exclusive creation must not leave a file when post-create setup fails"
         );
     }
 
