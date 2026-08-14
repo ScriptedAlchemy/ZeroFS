@@ -46,6 +46,7 @@ verify_sha256 "$ISO" "$ALPINE_SHA256" "alpine-virt-${ALPINE_RELEASE}-x86.iso"
 # Extract kernel and modloop from ISO
 echo "Extracting kernel and modules from ISO..."
 bsdtar -xf "$ISO" -C "$WORK_DIR" --strip-components=1 boot/vmlinuz-virt boot/initramfs-virt boot/modloop-virt
+rm -f "$OUT_DIR/vmlinuz-virt"
 cp "$WORK_DIR/vmlinuz-virt" "$OUT_DIR/vmlinuz-virt"
 
 # Extract busybox + musl from the original initramfs
