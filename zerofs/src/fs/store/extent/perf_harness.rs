@@ -449,13 +449,7 @@ impl ExtentPhase {
                         Some(coordinator) => {
                             let mut txn = db.new_transaction()?;
                             let tail = store
-                                .write(
-                                    &mut txn,
-                                    inode,
-                                    target.offset,
-                                    &payload,
-                                    target.old_size,
-                                )
+                                .write(&mut txn, inode, target.offset, &payload, target.old_size)
                                 .await?;
                             coordinator.commit(txn).await?;
                             store.apply_tail_update(inode, tail);

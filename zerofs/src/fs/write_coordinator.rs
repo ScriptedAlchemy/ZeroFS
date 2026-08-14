@@ -276,11 +276,10 @@ pub(crate) struct PendingCommit {
 
 impl PendingCommit {
     pub(crate) async fn wait(self) -> Result<(), FsError> {
-        let result = self.reply.await.map_err(|_| FsError::IoError)?;
         // `self.queued` drops here: on success the apply has already promoted
         // these values into the read cache, and on a pre-apply failure the
         // cache still holds the last committed value.
-        result
+        self.reply.await.map_err(|_| FsError::IoError)?
     }
 }
 
