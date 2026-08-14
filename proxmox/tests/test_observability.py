@@ -190,6 +190,7 @@ scrape_configs:
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("http://10.10.10.53:3000/api/health", result.stdout)
         self.assertNotIn("http://127.0.0.1:3000/api/health", result.stdout)
+        self.assertIn("retry Grafana health for up to 30 seconds", result.stdout)
 
     def test_dashboard_covers_writeback_throughput_failures_and_gc(self) -> None:
         dashboard = json.loads(

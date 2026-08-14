@@ -71,10 +71,27 @@ run() {
   fi
 }
 
+wait_for_http() {
+  local label=$1
+  local url=$2
+  local attempt
+  echo "+ retry $label health for up to 30 seconds at $url"
+  for ((attempt = 1; attempt <= 30; attempt++)); do
+    if pct exec "$ctid" -- curl --fail --silent --max-time 3 "$url" >/dev/null 2>&1; then
+      return 0
+    fi
+    if ((attempt < 30)); then
+      sleep 1
+    fi
+  done
+  echo "$label health did not become ready at $url" >&2
+  return 1
+}
+
 if [[ $dry_run == true ]]; then
   echo "+ verify CT $ctid owns private address $monitoring_ip"
   echo "+ verify CT can scrape private http://$zerofs_ip:9567/metrics"
-  echo "+ verify Grafana health at $grafana_health_url"
+  echo "+ retry Grafana health for up to 30 seconds at $grafana_health_url"
   echo "+ backup exact destination files under /var/lib/zerofs-monitoring-backups/TIMESTAMP"
   echo "+ provision Prometheus if absent; install assets and bind it to loopback only"
   echo "+ promtool check config, restart services, health-check"
@@ -246,7 +263,7 @@ run pct exec "$ctid" -- systemctl daemon-reload
 run pct exec "$ctid" -- systemctl enable --now prometheus.service
 run pct exec "$ctid" -- systemctl restart prometheus.service
 run pct exec "$ctid" -- systemctl is-active --quiet prometheus.service
-run pct exec "$ctid" -- curl --fail --silent --show-error --max-time 10 http://127.0.0.1:9090/-/ready
+wait_for_http Prometheus http://127.0.0.1:9090/-/ready
 listeners=$(pct exec "$ctid" -- ss -H -lnt)
 grep -Fq '127.0.0.1:9090' <<<"$listeners"
 if grep -Eq '(^|[[:space:]])(0\.0\.0\.0|\[::\]):9090([[:space:]]|$)' <<<"$listeners"; then
@@ -255,7 +272,7 @@ if grep -Eq '(^|[[:space:]])(0\.0\.0\.0|\[::\]):9090([[:space:]]|$)' <<<"$listen
 fi
 run pct exec "$ctid" -- systemctl restart grafana-server.service
 run pct exec "$ctid" -- systemctl is-active --quiet grafana-server.service
-run pct exec "$ctid" -- curl --fail --silent --show-error --max-time 10 "$grafana_health_url"
+wait_for_http Grafana "$grafana_health_url"
 
 echo "monitoring_ctid=$ctid"
 echo "backup=$backup_root"
