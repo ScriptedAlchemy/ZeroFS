@@ -420,7 +420,7 @@ async fn run_remote_scheduler(worker: RemoteWorker) {
                 continue;
             }
         }
-        let window = match coalesce_local_batch(
+        let mut window = match coalesce_local_batch(
             &journal,
             next,
             upload_concurrency,
@@ -437,7 +437,6 @@ async fn run_remote_scheduler(worker: RemoteWorker) {
                 break;
             }
         };
-        let mut window = window;
         let mut active = JoinSet::<RemoteOutcome>::new();
         let mut active_sequences = BTreeSet::new();
         let mut committing = None::<RemoteCommit>;
