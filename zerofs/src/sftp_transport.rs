@@ -223,6 +223,8 @@ pub enum TransportError {
     PoolClosed,
     #[error("remote path not found: {0}")]
     NotFound(String),
+    #[error("unsatisfiable remote object range: {0}")]
+    InvalidRange(String),
     #[error("remote path permission denied: {0}")]
     PermissionDenied(String),
     #[error("remote path already exists: {0}")]
@@ -855,12 +857,40 @@ impl TransportSession for OpenSshTransportSession {
             .open(path)
             .await
             .map_err(|error| map_sftp_error(path, error))?;
-        // The header always occupies the same fixed prefix, so its read does not
-        // depend on the metadata fetch: issue both round trips together.
+        // The header always occupies the same fixed prefix, and a bounded
+        // request's physical offsets do not depend on the object's length
+        // either: header byte X lives at [0, 32) and logical byte Y at
+        // 32 + Y regardless of what the header says. Issue the metadata
+        // fetch, the header read, and (for bounded requests) the payload
+        // read as one round-trip phase; every validation below still runs
+        // before any speculatively read payload is returned, so corrupt
+        // objects are rejected exactly as before — the payload bytes were
+        // merely fetched, never trusted.
+        let speculative_range = match (&requested_range, head) {
+            (Some(object_store::GetRange::Bounded(range)), false) if range.start < range.end => {
+                usize::try_from(range.end - range.start)
+                    .ok()
+                    .and_then(|len| {
+                        (OBJECT_HEADER_LEN as u64)
+                            .checked_add(range.start)
+                            .map(|physical_start| (range.clone(), physical_start, len))
+                    })
+            }
+            _ => None,
+        };
+        let speculative_payload = async {
+            match &speculative_range {
+                Some((_, physical_start, len)) => {
+                    Some(read_file_pipelined(&file, path, *physical_start, *len).await)
+                }
+                None => None,
+            }
+        };
         let mut metadata_file = file.clone();
-        let (metadata, encoded_header) = tokio::join!(
+        let (metadata, encoded_header, speculative_payload) = tokio::join!(
             metadata_file.metadata(),
             read_file_pipelined(&file, path, 0, OBJECT_HEADER_LEN),
+            speculative_payload,
         );
         let metadata = metadata.map_err(|error| map_sftp_error(path, error))?;
         if !metadata.file_type().is_some_and(|kind| kind.is_file()) {
@@ -897,7 +927,7 @@ impl TransportSession for OpenSshTransportSession {
 
         let range = match requested_range {
             Some(range) => range.as_range(header.logical_len).map_err(|error| {
-                TransportError::Operation(format!(
+                TransportError::InvalidRange(format!(
                     "invalid logical range for {}: {error}",
                     path.display()
                 ))
@@ -906,7 +936,15 @@ impl TransportSession for OpenSshTransportSession {
         };
         let payload = if head || range.is_empty() {
             Bytes::new()
+        } else if let (Some(result), Some((requested, _, _))) =
+            (speculative_payload, &speculative_range)
+            && *requested == range
+        {
+            // The validated range is exactly what was speculatively fetched.
+            result?
         } else {
+            // Unbounded request, or the bounded request was clamped by the
+            // object's actual length: fetch the validated range.
             let physical_start = (OBJECT_HEADER_LEN as u64)
                 .checked_add(range.start)
                 .ok_or_else(|| {
@@ -923,9 +961,19 @@ impl TransportSession for OpenSshTransportSession {
             })?;
             read_file_pipelined(&file, path, physical_start, len).await?
         };
-        file.close()
-            .await
-            .map_err(|error| map_sftp_error(path, error))?;
+        // The handle close acknowledges nothing the caller depends on, so it
+        // leaves the critical path; a failure only leaks the handle until the
+        // session closes, which reclaims every handle server-side anyway.
+        let close_path = path.to_path_buf();
+        tokio::spawn(async move {
+            if let Err(error) = file.close().await {
+                tracing::debug!(
+                    path = %close_path.display(),
+                    %error,
+                    "SFTP read handle close failed off the critical path"
+                );
+            }
+        });
         Ok(RemoteObjectRead {
             header,
             modified: modified.as_system_time(),
@@ -3967,6 +4015,47 @@ mod tests {
         assert_eq!(
             large_read.payload.as_ref(),
             &large_payload[7..large_payload.len() - 9]
+        );
+        // A bounded end past the logical length clamps: the speculative
+        // over-read is discarded and the validated range is re-fetched.
+        let clamped = session
+            .read_object(
+                std::path::Path::new("object.bin"),
+                Some(object_store::GetRange::Bounded(6..20)),
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(clamped.range, 6..11);
+        assert_eq!(clamped.payload.as_ref(), b"world");
+        // A bounded start past the logical length is deterministically
+        // unsatisfiable — typed, so no retry layer ever spins on it.
+        let unsatisfiable = session
+            .read_object(
+                std::path::Path::new("object.bin"),
+                Some(object_store::GetRange::Bounded(20..25)),
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(unsatisfiable, TransportError::InvalidRange(_)),
+            "{unsatisfiable:?}"
+        );
+        // Corrupt headers are still rejected before any speculatively read
+        // payload can be returned.
+        std::fs::write(root.path().join("corrupt.bin"), vec![0xff_u8; 64]).unwrap();
+        let corrupt = session
+            .read_object(
+                std::path::Path::new("corrupt.bin"),
+                Some(object_store::GetRange::Bounded(0..8)),
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(corrupt, TransportError::CorruptObject(_)),
+            "{corrupt:?}"
         );
         let entries = session
             .list_directory(std::path::Path::new("."))

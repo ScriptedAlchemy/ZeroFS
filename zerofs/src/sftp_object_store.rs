@@ -1332,6 +1332,12 @@ fn remote_transport_error(error: crate::sftp_transport::TransportError) -> Remot
         crate::sftp_transport::TransportError::CorruptObject(message) => {
             RemoteError::CorruptObject(message)
         }
+        // Deterministically unsatisfiable: the requested range can never
+        // exist for this object, so retrying is pure churn. Typed here so no
+        // retry layer has to sniff provider error text to classify it.
+        crate::sftp_transport::TransportError::InvalidRange(message) => {
+            RemoteError::Precondition(message)
+        }
         crate::sftp_transport::TransportError::MissingCapability(extension) => {
             RemoteError::NotSupported(format!("SFTP server lacks required {extension} extension"))
         }
