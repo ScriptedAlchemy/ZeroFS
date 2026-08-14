@@ -4367,7 +4367,8 @@ mod tests {
             .await;
         assert!(matches!(
             private_response.body,
-            Message::Rlerror(Rlerror { ecode }) if ecode == libc::EOPNOTSUPP as u32
+            Message::Rlerror(Rlerror { ecode })
+                if ecode == crate::ninep::errors::LINUX_EOPNOTSUPP
         ));
         let enveloped_response = handler
             .handle_message_with_op_id(
@@ -4383,7 +4384,8 @@ mod tests {
             .await;
         assert!(matches!(
             enveloped_response.body,
-            Message::Rlerror(Rlerror { ecode }) if ecode == libc::EOPNOTSUPP as u32
+            Message::Rlerror(Rlerror { ecode })
+                if ecode == crate::ninep::errors::LINUX_EOPNOTSUPP
         ));
 
         // The private dialect enables all ZeroFS extensions together.

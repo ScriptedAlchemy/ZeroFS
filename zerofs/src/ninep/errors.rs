@@ -1,5 +1,8 @@
 use crate::fs::errors::FsError;
 
+/// 9P2000.L carries Linux errnos regardless of the server host.
+pub(crate) const LINUX_EOPNOTSUPP: u32 = 95;
+
 #[derive(Debug, Clone, Copy)]
 pub enum P9Error {
     BadFid,
@@ -33,7 +36,7 @@ impl P9Error {
             P9Error::Overflow => libc::EOVERFLOW as u32,
             P9Error::NotADirectory => libc::ENOTDIR as u32,
             P9Error::LockConflict => libc::EAGAIN as u32,
-            P9Error::NotSupported => libc::ENOTSUP as u32,
+            P9Error::NotSupported => LINUX_EOPNOTSUPP,
             P9Error::NotImplemented => libc::ENOSYS as u32,
             P9Error::Fs(e) => e.to_errno(),
         }
