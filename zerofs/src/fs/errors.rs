@@ -1,6 +1,9 @@
 use thiserror::Error;
 use zerofs_nfsserve::nfs::nfsstat3;
 
+/// Protocol consumers carry Linux errnos regardless of the server host.
+const LINUX_ENOTEMPTY: u32 = 39;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum FsError {
     #[error("Permission denied")]
@@ -120,7 +123,7 @@ impl FsError {
             FsError::Exists => libc::EEXIST as u32,
             FsError::InvalidArgument => libc::EINVAL as u32,
             FsError::IoError => libc::EIO as u32,
-            FsError::NotEmpty => libc::ENOTEMPTY as u32,
+            FsError::NotEmpty => LINUX_ENOTEMPTY,
             FsError::TooManyLinks => libc::EMLINK as u32,
             FsError::NoSpace => libc::ENOSPC as u32,
             FsError::IsDirectory => libc::EISDIR as u32,
