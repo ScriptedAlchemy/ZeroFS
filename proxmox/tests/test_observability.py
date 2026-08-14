@@ -92,6 +92,32 @@ class MonitoringInputTests(unittest.TestCase):
 
 
 class MonitoringAssetTests(unittest.TestCase):
+    def test_host_installer_health_checks_grafana_on_validated_private_ip(
+        self,
+    ) -> None:
+        host_installer = ROOT / "monitoring" / "host-install.sh"
+        result = subprocess.run(
+            [
+                "bash",
+                str(host_installer),
+                "--ctid",
+                "123",
+                "--monitoring-ip",
+                "10.10.10.53",
+                "--zerofs-ip",
+                "10.10.10.55",
+                "--stage",
+                "/var/tmp/zerofs-monitoring-123",
+                "--dry-run",
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("http://10.10.10.53:3000/api/health", result.stdout)
+        self.assertNotIn("http://127.0.0.1:3000/api/health", result.stdout)
+
     def test_dashboard_covers_writeback_throughput_failures_and_gc(self) -> None:
         dashboard = json.loads(
             (ROOT / "monitoring" / "grafana" / "zerofs-overview.json").read_text()

@@ -38,6 +38,7 @@ private_ipv4='^10\.[0-9]+\.[0-9]+\.[0-9]+$|^172\.(1[6-9]|2[0-9]|3[01])\.[0-9]+\.
   echo "stage must be exactly /var/tmp/zerofs-monitoring-$ctid" >&2
   exit 2
 }
+grafana_health_url="http://$monitoring_ip:3000/api/health"
 
 assets=(
   zerofs-scrape.yml
@@ -72,6 +73,7 @@ run() {
 if [[ $dry_run == true ]]; then
   echo "+ verify CT $ctid owns private address $monitoring_ip"
   echo "+ verify CT can scrape private http://$zerofs_ip:9567/metrics"
+  echo "+ verify Grafana health at $grafana_health_url"
   echo "+ backup exact destination files under /var/lib/zerofs-monitoring-backups/TIMESTAMP"
   echo "+ provision Prometheus if absent; install assets and bind it to loopback only"
   echo "+ promtool check config, restart services, health-check"
@@ -246,7 +248,7 @@ if grep -Eq '(^|[[:space:]])(0\.0\.0\.0|\[::\]):9090([[:space:]]|$)' <<<"$listen
 fi
 run pct exec "$ctid" -- systemctl restart grafana-server.service
 run pct exec "$ctid" -- systemctl is-active --quiet grafana-server.service
-run pct exec "$ctid" -- curl --fail --silent --show-error --max-time 10 http://127.0.0.1:3000/api/health
+run pct exec "$ctid" -- curl --fail --silent --show-error --max-time 10 "$grafana_health_url"
 
 echo "monitoring_ctid=$ctid"
 echo "backup=$backup_root"
