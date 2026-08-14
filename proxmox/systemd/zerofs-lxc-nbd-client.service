@@ -1,0 +1,19 @@
+[Unit]
+Description=VM native NBD client for private ZeroFS LXC
+After=network-online.target
+Wants=network-online.target
+Before=mnt-zerofs-lxc.mount
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=/etc/zerofs-lxc/client.env
+ExecStartPre=/usr/sbin/modprobe nbd nbds_max=16 max_part=8
+ExecStart=/usr/sbin/nbd-client -N ${ZEROFS_NBD_EXPORT} -C ${ZEROFS_NBD_CONNECTIONS} ${ZEROFS_NBD_HOST} ${ZEROFS_NBD_PORT} ${ZEROFS_NBD_DEVICE}
+ExecStartPost=/usr/local/libexec/zerofs-tune-nbd ${ZEROFS_NBD_DEVICE}
+ExecStop=/usr/sbin/nbd-client -d ${ZEROFS_NBD_DEVICE}
+TimeoutStartSec=60s
+TimeoutStopSec=60s
+
+[Install]
+WantedBy=multi-user.target

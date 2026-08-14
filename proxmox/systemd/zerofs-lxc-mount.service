@@ -1,0 +1,19 @@
+[Unit]
+Description=Container-owned ZeroFS 9P/FUSE mount
+Requires=zerofs-lxc.service
+After=zerofs-lxc.service
+Before=smbd.service
+
+[Service]
+Type=simple
+ExecStartPre=/usr/bin/install -d -m 0755 /srv/zerofs-share
+ExecStart=/srv/zerofs-persist/current/zerofs mount unix:/run/zerofs/9p.sock /srv/zerofs-share --access all --writeback false --relaxed-consistency false
+ExecStartPost=/bin/sh -c 'i=0; until mountpoint -q /srv/zerofs-share; do i=$$((i+1)); test "$$i" -lt 120 || exit 1; sleep 1; done; install -d -o zerofs-share -g zerofs-share -m 0770 /srv/zerofs-share/data'
+ExecStop=/bin/fusermount3 -u /srv/zerofs-share
+Restart=on-failure
+RestartSec=2s
+TimeoutStartSec=120s
+TimeoutStopSec=120s
+
+[Install]
+WantedBy=multi-user.target

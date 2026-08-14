@@ -1,0 +1,25 @@
+[Unit]
+Description=ZeroFS private NBD server in Proxmox LXC
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/srv/zerofs-persist/current/zerofs.env
+ExecStart=/srv/zerofs-persist/current/zerofs run --config /srv/zerofs-persist/current/zerofs.toml
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=120s
+LimitNOFILE=1048576
+OOMScoreAdjust=-500
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/srv/zerofs-persist /run/zerofs
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RuntimeDirectory=zerofs
+RuntimeDirectoryMode=0750
+
+[Install]
+WantedBy=multi-user.target
