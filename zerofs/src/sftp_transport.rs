@@ -1032,12 +1032,7 @@ impl TransportSession for OpenSshTransportSession {
             }
         }
 
-        let stat_started = Instant::now();
-        let metadata = fs.symlink_metadata(path).await;
-        metrics::counter!("zerofs_sftp_directory_stats_total").increment(1);
-        metrics::histogram!("zerofs_sftp_directory_stat_duration_seconds")
-            .record(stat_started.elapsed().as_secs_f64());
-        match metadata {
+        match stat_directory(&mut fs, path).await {
             Ok(metadata) if metadata.file_type().is_some_and(|kind| kind.is_dir()) => Ok(()),
             Ok(_) => Err(TransportError::Operation(format!(
                 "{} exists and is not a directory",
@@ -1058,12 +1053,7 @@ impl TransportSession for OpenSshTransportSession {
                         // Another writer outside this pool can win the mkdir
                         // race. Verify that result instead of turning a valid
                         // directory into a publication failure.
-                        let verify_started = Instant::now();
-                        let verified = fs.symlink_metadata(path).await;
-                        metrics::counter!("zerofs_sftp_directory_stats_total").increment(1);
-                        metrics::histogram!("zerofs_sftp_directory_stat_duration_seconds")
-                            .record(verify_started.elapsed().as_secs_f64());
-                        match verified {
+                        match stat_directory(&mut fs, path).await {
                             Ok(metadata)
                                 if metadata.file_type().is_some_and(|kind| kind.is_dir()) =>
                             {
@@ -1191,6 +1181,20 @@ impl TransportSession for OpenSshTransportSession {
         }
         Ok(())
     }
+}
+
+/// `symlink_metadata` under the shared directory-probe instrumentation, so
+/// every stat this module issues is counted and timed the same way.
+async fn stat_directory(
+    fs: &mut openssh_sftp_client::fs::Fs,
+    path: &std::path::Path,
+) -> Result<openssh_sftp_client::metadata::MetaData, openssh_sftp_client::Error> {
+    let started = Instant::now();
+    let metadata = fs.symlink_metadata(path).await;
+    metrics::counter!("zerofs_sftp_directory_stats_total").increment(1);
+    metrics::histogram!("zerofs_sftp_directory_stat_duration_seconds")
+        .record(started.elapsed().as_secs_f64());
+    metadata
 }
 
 fn map_sftp_error(path: &std::path::Path, error: openssh_sftp_client::Error) -> TransportError {
@@ -1395,10 +1399,7 @@ impl PoolInner {
             return Err(TransportError::PoolClosed);
         }
         self.active.fetch_add(1, Ordering::SeqCst);
-        Ok(PoolActivity {
-            pool: self.clone(),
-            active: true,
-        })
+        Ok(PoolActivity { pool: self.clone() })
     }
 
     fn finish_activity(&self) {
@@ -2013,15 +2014,11 @@ pub struct SessionLease {
 
 struct PoolActivity {
     pool: Arc<PoolInner>,
-    active: bool,
 }
 
 impl Drop for PoolActivity {
     fn drop(&mut self) {
-        if self.active {
-            self.active = false;
-            self.pool.finish_activity();
-        }
+        self.pool.finish_activity();
     }
 }
 
@@ -2034,51 +2031,41 @@ impl fmt::Debug for SessionLease {
 }
 
 impl SessionLease {
+    /// The leased session's transport. A lease owns its physical session from
+    /// checkout until `complete`/`retire`/drop takes it, so every request
+    /// method below can assume it is still present.
+    fn transport(&mut self) -> &mut dyn TransportSession {
+        self.session
+            .as_mut()
+            .expect("lease always owns a session until completion")
+            .transport_mut()
+    }
+
     pub async fn read_object(
         &mut self,
         path: &std::path::Path,
         range: Option<object_store::GetRange>,
         head: bool,
     ) -> Result<RemoteObjectRead, TransportError> {
-        self.session
-            .as_mut()
-            .expect("lease always owns a session until completion")
-            .transport_mut()
-            .read_object(path, range, head)
-            .await
+        self.transport().read_object(path, range, head).await
     }
 
     pub async fn list_directory(
         &mut self,
         path: &std::path::Path,
     ) -> Result<Vec<RemoteDirectoryEntry>, TransportError> {
-        self.session
-            .as_mut()
-            .expect("lease always owns a session until completion")
-            .transport_mut()
-            .list_directory(path)
-            .await
+        self.transport().list_directory(path).await
     }
 
     pub async fn remove_file(&mut self, path: &std::path::Path) -> Result<(), TransportError> {
-        self.session
-            .as_mut()
-            .expect("lease always owns a session until completion")
-            .transport_mut()
-            .remove_file(path)
-            .await
+        self.transport().remove_file(path).await
     }
 
     async fn ensure_directory_component(
         &mut self,
         path: &std::path::Path,
     ) -> Result<(), TransportError> {
-        self.session
-            .as_mut()
-            .expect("lease always owns a session until completion")
-            .transport_mut()
-            .ensure_directory_component(path)
-            .await
+        self.transport().ensure_directory_component(path).await
     }
 
     pub async fn write_file_durable(
@@ -2086,12 +2073,7 @@ impl SessionLease {
         path: &std::path::Path,
         chunks: Vec<Bytes>,
     ) -> Result<(), TransportError> {
-        self.session
-            .as_mut()
-            .expect("lease always owns a session until completion")
-            .transport_mut()
-            .write_file_durable(path, chunks)
-            .await
+        self.transport().write_file_durable(path, chunks).await
     }
 
     pub async fn write_file_at_durable(
@@ -2100,10 +2082,7 @@ impl SessionLease {
         offset: u64,
         chunks: Vec<Bytes>,
     ) -> Result<(), TransportError> {
-        self.session
-            .as_mut()
-            .expect("lease always owns a session until completion")
-            .transport_mut()
+        self.transport()
             .write_file_at_durable(path, offset, chunks)
             .await
     }
@@ -2114,12 +2093,7 @@ impl SessionLease {
         offset: u64,
         chunks: Vec<Bytes>,
     ) -> Result<(), TransportError> {
-        self.session
-            .as_mut()
-            .expect("lease always owns a session until completion")
-            .transport_mut()
-            .write_file_at(path, offset, chunks)
-            .await
+        self.transport().write_file_at(path, offset, chunks).await
     }
 
     pub async fn read_exact(
@@ -2128,12 +2102,7 @@ impl SessionLease {
         offset: u64,
         len: usize,
     ) -> Result<Bytes, TransportError> {
-        self.session
-            .as_mut()
-            .expect("lease always owns a session until completion")
-            .transport_mut()
-            .read_exact(path, offset, len)
-            .await
+        self.transport().read_exact(path, offset, len).await
     }
 
     pub async fn hard_link(
@@ -2141,12 +2110,7 @@ impl SessionLease {
         from: &std::path::Path,
         to: &std::path::Path,
     ) -> Result<(), TransportError> {
-        self.session
-            .as_mut()
-            .expect("lease always owns a session until completion")
-            .transport_mut()
-            .hard_link(from, to)
-            .await
+        self.transport().hard_link(from, to).await
     }
 
     pub async fn posix_rename(
@@ -2154,12 +2118,7 @@ impl SessionLease {
         from: &std::path::Path,
         to: &std::path::Path,
     ) -> Result<(), TransportError> {
-        self.session
-            .as_mut()
-            .expect("lease always owns a session until completion")
-            .transport_mut()
-            .posix_rename(from, to)
-            .await
+        self.transport().posix_rename(from, to).await
     }
 
     pub async fn complete(mut self) -> Result<(), TransportError> {

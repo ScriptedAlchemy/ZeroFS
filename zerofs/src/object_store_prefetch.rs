@@ -1182,9 +1182,6 @@ impl PrefetchingObjectStore {
                 )
             })
             .collect();
-        if parts.is_empty() {
-            return vec![];
-        }
         if let Some(first) = parts.first_mut() {
             first.1.start = usize::try_from(range.start % part_size_u64)
                 .expect("part_size too large for usize");
@@ -1293,6 +1290,8 @@ impl PrefetchingObjectStore {
             .await?;
         let generation = CacheGeneration::from_meta(&get_result.meta, ctx.cache_instance);
         let bytes = get_result.bytes().await?;
+        // Owned copy: a backend may serve this range as a slice of a larger
+        // retained allocation, which a cached part must never pin.
         ctx.parts.insert(
             PartKey::new(location, part_size_bytes, &generation, part_id),
             Bytes::copy_from_slice(&bytes),
