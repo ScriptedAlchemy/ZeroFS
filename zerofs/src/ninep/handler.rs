@@ -2544,7 +2544,7 @@ mod tests {
     use crate::fs::ZeroFS;
     use crate::fs::permissions::Credentials;
     use crate::fs::types::SetAttributes;
-    use libc::{O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY};
+    use libc::{O_RDONLY, O_RDWR, O_WRONLY};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -2853,7 +2853,7 @@ mod tests {
         for (tag, flags) in [
             (3, O_WRONLY as u32),
             (4, O_RDWR as u32),
-            (5, (O_RDONLY | O_TRUNC) as u32),
+            (5, O_RDONLY as u32 | LINUX_O_TRUNC),
         ] {
             let denied = request(&handler, tag, Message::Tlopen(Tlopen { fid: 2, flags })).await;
             assert!(
