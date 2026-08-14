@@ -141,6 +141,13 @@ class HostScriptTests(unittest.TestCase):
         )
         self.assertIn("pct start 120", result.stdout)
 
+    def test_failed_deploy_restores_the_original_stopped_state(self) -> None:
+        source = HOST_SCRIPT.read_text()
+        self.assertRegex(
+            source,
+            r"elif pct config \"\$ctid\" .*; then\n\s+pct stop \"\$ctid\"",
+        )
+
     def test_listener_proof_rejects_wildcard_webui(self) -> None:
         source = HOST_SCRIPT.read_text()
         self.assertIn("$container_ip:8080", source)

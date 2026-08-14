@@ -342,6 +342,8 @@ rollback() {
         pct exec "$ctid" -- systemctl stop smbd.service >/dev/null 2>&1
       fi
     fi
+  elif pct config "$ctid" >/dev/null 2>&1; then
+    pct stop "$ctid" --skiplock 1 >/dev/null 2>&1
   fi
   exit "$code"
 }
