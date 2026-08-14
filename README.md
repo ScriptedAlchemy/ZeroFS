@@ -236,6 +236,12 @@ secret_access_key = "${AWS_SECRET_ACCESS_KEY}"
 # conditional_put = "redis://localhost:6379"  # For stores without conditional-put support
 ```
 
+> **TODO — shared volatile acknowledgements:** `volatile_memory` currently accelerates NBD only,
+> and ZeroFS rejects simultaneous writable NFS, 9P, or Web UI access in that mode to preserve
+> ordering and read coherence. Move the bounded RAM overlay, metadata visibility, flush cutoffs,
+> failure propagation, and shutdown draining into the shared filesystem mutation layer before
+> enabling equivalent opt-in unsafe acknowledgements for the other writable frontends.
+
 ### Backends
 
 ```toml
