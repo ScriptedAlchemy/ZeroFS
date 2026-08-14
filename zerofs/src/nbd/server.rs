@@ -538,8 +538,9 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
         // for up to `MAX_REQUEST_LENGTH`, so a count-only cap would let one
         // connection pin `MAX_INFLIGHT_COMMANDS * MAX_REQUEST_LENGTH` of
         // payload. Each admitted command holds byte credit from the moment its
-        // payload is read until its reply has been written — reply data is
-        // charged the same way, since a queued READ reply is just as resident.
+        // payload is read until its reply has been written, or deliberately
+        // discarded after a terminal writer failure. Reply data is charged the
+        // same way, since a queued READ reply is just as resident.
         let budget = Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_BYTES));
         let (reply_tx, reply_rx) = tokio::sync::mpsc::channel::<Reply>(MAX_INFLIGHT_COMMANDS);
 
@@ -570,18 +571,27 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
         // admission guards on a gate shared by every connection to the export,
         // stalling `flush` and `begin_mutation` fleet-wide.
         let mut replies = Box::pin(stream::unfold(
-            (writer, reply_rx),
-            |(writer, mut reply_rx)| async move {
+            (writer, reply_rx, false),
+            |(writer, mut reply_rx, writer_failed)| async move {
                 let (cookie, result, budget) = reply_rx.recv().await?;
-                write_simple_reply(writer, cookie, result).await;
+                let outcome = if writer_failed {
+                    // The outbound half is irrecoverable. Continue draining
+                    // completed commands so their byte credit and admission
+                    // ownership are released, but never touch it again.
+                    Ok(())
+                } else {
+                    write_simple_reply(writer, cookie, result).await
+                };
                 // Held until the reply is on the wire, not merely produced.
                 drop(budget);
-                Some(((), (writer, reply_rx)))
+                let writer_failed = writer_failed || outcome.is_err();
+                Some((outcome, (writer, reply_rx, writer_failed)))
             },
         ));
         let mut inflight = FuturesUnordered::new();
         let mut accepting = true;
         let mut unwritten = 0usize;
+        let mut terminal_error = None;
 
         loop {
             // Checked before the stream is polled, so a session that is already
@@ -592,13 +602,20 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
             }
             let reading = accepting && inflight.len() + unwritten < MAX_INFLIGHT_COMMANDS;
             if !reading && inflight.is_empty() && unwritten == 0 {
-                return Ok(());
+                return match terminal_error {
+                    Some(error) => Err(error),
+                    None => Ok(()),
+                };
             }
 
             tokio::select! {
                 biased;
-                Some(()) = replies.next(), if unwritten > 0 => {
+                Some(result) = replies.next(), if unwritten > 0 => {
                     unwritten -= 1;
+                    if let Err(error) = result {
+                        accepting = false;
+                        terminal_error.get_or_insert(error);
+                    }
                 }
                 Some(reply) = inflight.next(), if !inflight.is_empty() => {
                     unwritten += 1;
@@ -614,7 +631,10 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
                         // Disconnect, clean EOF, or shutdown observed mid-read.
                         // Stop accepting, then drain what was already admitted.
                         None => accepting = false,
-                        Some(Err(e)) => return Err(e),
+                        Some(Err(error)) => {
+                            accepting = false;
+                            terminal_error.get_or_insert(error);
+                        }
                         Some(Ok((cookie, command, budget))) => inflight.push(async move {
                             (cookie, run_admitted(handler, device, command).await, budget)
                         }),
@@ -674,13 +694,14 @@ const MAX_INFLIGHT_COMMANDS: usize = 32;
 
 /// Payload and reply bytes one connection may hold at once. Credit is taken
 /// before a WRITE's payload is read (or a READ is dispatched) and returned only
-/// once the reply has been written, so it covers both directions. A request
-/// larger than the whole budget is clamped to it, which keeps a single
-/// oversized command admissible instead of deadlocking against its own cap.
+/// once the reply has been written or deliberately discarded after a terminal
+/// writer failure, so it covers both directions. A request larger than the
+/// whole budget is clamped to it, which keeps a single oversized command
+/// admissible instead of deadlocking against its own cap.
 const MAX_INFLIGHT_BYTES: usize = 64 * 1024 * 1024;
 
 /// A finished command waiting to go out: cookie, result, and the byte credit it
-/// still owes until the reply is on the wire.
+/// still owes until the reply is written or terminally discarded.
 type Reply = (
     u64,
     super::error::CommandResult<bytes::Bytes>,
@@ -945,31 +966,27 @@ async fn run_admitted(
     }
 }
 
-/// Write one simple reply. A failure here is logged rather than propagated: the
-/// read side will observe the same broken connection and end the session.
+/// Write one simple reply. The caller owns failure policy because the socket's
+/// read half may remain healthy after its write half is irrecoverably broken.
 async fn write_simple_reply<W>(
     writer: &mut W,
     cookie: u64,
     result: super::error::CommandResult<bytes::Bytes>,
-) where
+) -> Result<()>
+where
     W: AsyncWrite + Unpin,
 {
     let (error, data) = match result {
         Ok(data) => (NBD_SUCCESS, data),
         Err(e) => (e.to_errno(), bytes::Bytes::new()),
     };
-    let send = async {
-        let reply_bytes = NBDSimpleReply::new(cookie, error).to_bytes()?;
-        writer.write_all(&reply_bytes).await?;
-        if !data.is_empty() {
-            writer.write_all(&data).await?;
-        }
-        writer.flush().await?;
-        Ok::<(), NBDError>(())
-    };
-    if let Err(e) = send.await {
-        debug!("Failed to send reply: {:?}", e);
+    let reply_bytes = NBDSimpleReply::new(cookie, error).to_bytes()?;
+    writer.write_all(&reply_bytes).await?;
+    if !data.is_empty() {
+        writer.write_all(&data).await?;
     }
+    writer.flush().await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -989,7 +1006,7 @@ mod tests {
     use std::io;
     use std::pin::Pin;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::task::{Context, Poll};
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
     use tokio::net::{TcpStream, UnixStream};
@@ -1034,6 +1051,27 @@ mod tests {
         stalled: Option<oneshot::Sender<()>>,
     }
 
+    /// Supplies one complete request, then exposes whether the transmission
+    /// loop tries to consume any later request after its reply writer fails.
+    struct RequestThenWriterFailure {
+        first: Vec<u8>,
+        tail: Vec<u8>,
+        position: usize,
+        writer_failed: Arc<AtomicBool>,
+        tail_delivered: Arc<AtomicUsize>,
+    }
+
+    struct FailingWriter {
+        failed: Arc<AtomicBool>,
+        polls: Arc<AtomicUsize>,
+    }
+
+    struct RequestThenReadError {
+        bytes: Vec<u8>,
+        position: usize,
+        kind: io::ErrorKind,
+    }
+
     impl tokio::io::AsyncWrite for StalledWriter {
         fn poll_write(
             mut self: Pin<&mut Self>,
@@ -1055,6 +1093,29 @@ mod tests {
         }
     }
 
+    impl tokio::io::AsyncWrite for FailingWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.polls.fetch_add(1, Ordering::Relaxed);
+            self.failed.store(true, Ordering::Release);
+            Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "injected reply failure",
+            )))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
     impl AsyncRead for PrebufferedRequest {
         fn poll_read(
             mut self: Pin<&mut Self>,
@@ -1068,6 +1129,49 @@ mod tests {
             self.position += length;
             self.delivered.fetch_add(length, Ordering::Relaxed);
             Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncRead for RequestThenWriterFailure {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if self.position < self.first.len() {
+                let remaining = &self.first[self.position..];
+                let length = remaining.len().min(buf.remaining());
+                buf.put_slice(&remaining[..length]);
+                self.position += length;
+                return Poll::Ready(Ok(()));
+            }
+            if !self.writer_failed.load(Ordering::Acquire) {
+                return Poll::Pending;
+            }
+            let tail_position = self.position - self.first.len();
+            let remaining = &self.tail[tail_position..];
+            let length = remaining.len().min(buf.remaining());
+            buf.put_slice(&remaining[..length]);
+            self.position += length;
+            self.tail_delivered.fetch_add(length, Ordering::Relaxed);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncRead for RequestThenReadError {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if self.position < self.bytes.len() {
+                let remaining = &self.bytes[self.position..];
+                let length = remaining.len().min(buf.remaining());
+                buf.put_slice(&remaining[..length]);
+                self.position += length;
+                return Poll::Ready(Ok(()));
+            }
+            Poll::Ready(Err(io::Error::new(self.kind, "injected read failure")))
         }
     }
 
@@ -1799,9 +1903,9 @@ mod tests {
     ///   3. What one TCP connection does as its queue deepens, and what
     ///      several connections do in aggregate. The transmission loop
     ///      overlaps execution, so depth on a single connection buys real
-    ///      concurrency; the barrier-free and FUA arms bracket that, since a
-    ///      write that must be durable before it is acknowledged cannot
-    ///      overlap the writes it follows.
+    ///      concurrency; the barrier-free and FUA arms bracket that. FUA may
+    ///      still overlap pre-flush write work, but its exclusive flush gate
+    ///      serializes durability cutoffs and can cover later admitted writes.
     ///
     /// Anything the fio round trip costs beyond (1)+(2) is the kernel NBD
     /// driver, the block layer, XFS, and fio itself — none of it addressable by
@@ -1998,13 +2102,14 @@ mod tests {
         }
 
         // (2c) The same depth sweep with every write carrying FUA. A FUA write
-        // is acknowledged only once it is durable, and `flush` takes the export
-        // gate exclusively — so it waits on every write admitted before it.
-        // Depth cannot help here, and reporting only the barrier-free number
-        // above would overstate what a journalling filesystem actually sees.
+        // is acknowledged only once its exclusive flush completes. Later
+        // writes may already have acquired shared admission and can therefore
+        // overlap before the flush gate, or be swept into that cutoff; this arm
+        // measures the actual implementation instead of assuming depth is
+        // useless. Use enough requests to fill even the QD32 case repeatedly.
         for queue_depth in [1usize, 4, 32] {
             let size = 256 * 1024usize;
-            let iterations = (4 * 1024 * 1024 / size) as u64;
+            let iterations = (32 * 1024 * 1024 / size) as u64;
             let slots = EXPORT_BYTES / size as u64;
             let name = format!("floor-fua-{queue_depth}");
             sized_single_file_export(&filesystem, name.as_bytes(), EXPORT_BYTES).await;
@@ -2360,19 +2465,34 @@ mod tests {
         stalled_rx
             .await
             .expect("the session produced a reply and blocked writing it");
-        // Give a wedged admission path every chance to keep reading.
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        let requests_at_budget = MAX_INFLIGHT_BYTES / CHUNK;
+        let full_budget_consumed =
+            MAX_INFLIGHT_BYTES + requests_at_budget * NBD_REQUEST_HEADER_SIZE;
+        timeout(Duration::from_secs(5), async {
+            while delivered.load(Ordering::Relaxed) < full_budget_consumed {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("admission reached the byte budget");
 
         let consumed = delivered.load(Ordering::Relaxed);
         assert!(
-            consumed < total,
-            "admission read all {total} bytes ({consumed}) despite a {} MiB budget \
-             and no reply ever draining; the byte budget is not gating",
-            MAX_INFLIGHT_BYTES / (1024 * 1024),
+            consumed >= full_budget_consumed,
+            "admission stopped at {consumed} bytes before filling its {} MiB budget \
+             ({full_budget_consumed} bytes including admitted headers)",
+            MAX_INFLIGHT_BYTES / (1024 * 1024)
         );
         assert!(
-            consumed >= CHUNK,
-            "admission stalled before even one write was read ({consumed} bytes)"
+            consumed <= full_budget_consumed + NBD_REQUEST_HEADER_SIZE,
+            "admission consumed {consumed} bytes after its {} MiB budget was full; \
+             at most the next request header ({}) may be read",
+            MAX_INFLIGHT_BYTES / (1024 * 1024),
+            full_budget_consumed + NBD_REQUEST_HEADER_SIZE,
+        );
+        assert!(
+            consumed < total,
+            "the source must contain work beyond the budget"
         );
 
         session_task.abort();
@@ -2486,6 +2606,215 @@ mod tests {
             landed,
             Bytes::from(vec![0xd7; 512]),
             "a write admitted before the client vanished must still land"
+        );
+    }
+
+    #[tokio::test]
+    async fn reply_failure_stops_admission_and_returns_the_writer_error() {
+        let filesystem = Arc::new(
+            ZeroFS::new_in_memory()
+                .await
+                .expect("create test filesystem"),
+        );
+        let export_gates = Arc::new(NbdExportGates::default());
+        let device = single_file_export(&filesystem, &export_gates).await;
+
+        let mut first = probe_request(NBDCommand::Write, 1, 0, 512);
+        first.extend_from_slice(&vec![0xa7; 512]);
+        let mut tail = probe_request(NBDCommand::Write, 2, 512, 512);
+        tail.extend_from_slice(&vec![0xb8; 512]);
+        let writer_failed = Arc::new(AtomicBool::new(false));
+        let tail_delivered = Arc::new(AtomicUsize::new(0));
+        let mut session = NBDSession::new(
+            RequestThenWriterFailure {
+                first,
+                tail,
+                position: 0,
+                writer_failed: Arc::clone(&writer_failed),
+                tail_delivered: Arc::clone(&tail_delivered),
+            },
+            FailingWriter {
+                failed: writer_failed,
+                polls: Arc::new(AtomicUsize::new(0)),
+            },
+            Arc::clone(&filesystem),
+            Arc::clone(&export_gates),
+            CancellationToken::new(),
+        );
+
+        let error = timeout(Duration::from_secs(5), session.handle_transmission(device))
+            .await
+            .expect("session stopped after reply failure")
+            .expect_err("reply failure must fail the session");
+        assert!(
+            error.to_string().contains("injected reply failure"),
+            "the original writer error must be returned: {error}"
+        );
+        assert_eq!(
+            tail_delivered.load(Ordering::Relaxed),
+            0,
+            "no later request may be consumed after the reply path fails"
+        );
+
+        let handler = NBDHandler::new(filesystem, export_gates);
+        let probe = handler
+            .get_device(b"flush-ordering-test")
+            .await
+            .expect("reopen export after failed reply");
+        assert_eq!(
+            handler
+                .read(&probe, 0, 512)
+                .await
+                .expect("read landed write"),
+            Bytes::from(vec![0xa7; 512]),
+            "the command admitted before the reply failure must finish"
+        );
+        timeout(Duration::from_secs(2), handler.flush(&probe))
+            .await
+            .expect("reply failure released the export gate")
+            .expect("flush after reply failure succeeded");
+    }
+
+    #[tokio::test]
+    async fn reply_failure_drains_every_command_admitted_before_it() {
+        let filesystem = Arc::new(
+            ZeroFS::new_in_memory()
+                .await
+                .expect("create test filesystem"),
+        );
+        let export_gates = Arc::new(NbdExportGates::default());
+        let device = single_file_export(&filesystem, &export_gates).await;
+        let commit_block = filesystem.db.flush_barrier().write_owned().await;
+
+        let mut requests = Vec::new();
+        for (cookie, offset, byte) in [(1, 0, 0x51), (2, 512, 0x62)] {
+            requests.extend_from_slice(&probe_request(NBDCommand::Write, cookie, offset, 512));
+            requests.extend_from_slice(&vec![byte; 512]);
+        }
+        let total = requests.len();
+        let delivered = Arc::new(AtomicUsize::new(0));
+        let writer_failed = Arc::new(AtomicBool::new(false));
+        let writer_polls = Arc::new(AtomicUsize::new(0));
+        let mut session = NBDSession::new(
+            PrebufferedRequest {
+                bytes: requests,
+                position: 0,
+                polls: Arc::new(AtomicUsize::new(0)),
+                delivered: Arc::clone(&delivered),
+            },
+            FailingWriter {
+                failed: writer_failed,
+                polls: Arc::clone(&writer_polls),
+            },
+            Arc::clone(&filesystem),
+            Arc::clone(&export_gates),
+            CancellationToken::new(),
+        );
+        let session_task = tokio::spawn(async move { session.handle_transmission(device).await });
+
+        timeout(Duration::from_secs(2), async {
+            while delivered.load(Ordering::Relaxed) < total {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both requests were admitted before their commits resumed");
+        drop(commit_block);
+
+        let error = timeout(Duration::from_secs(5), session_task)
+            .await
+            .expect("session drained after reply failure")
+            .expect("session task did not panic")
+            .expect_err("reply failure must fail the session");
+        assert!(
+            error.to_string().contains("injected reply failure"),
+            "the original writer error must be returned: {error}"
+        );
+        assert_eq!(
+            writer_polls.load(Ordering::Relaxed),
+            1,
+            "the irrecoverably broken writer must never be touched again"
+        );
+
+        let handler = NBDHandler::new(filesystem, export_gates);
+        let probe = handler
+            .get_device(b"flush-ordering-test")
+            .await
+            .expect("reopen export after failed reply");
+        assert_eq!(
+            handler
+                .read(&probe, 0, 1024)
+                .await
+                .expect("read both writes"),
+            Bytes::from([vec![0x51; 512], vec![0x62; 512]].concat()),
+            "every write admitted before the reply failure must finish"
+        );
+        timeout(Duration::from_secs(2), handler.flush(&probe))
+            .await
+            .expect("reply failure released every export guard")
+            .expect("flush after reply failure succeeded");
+    }
+
+    #[tokio::test]
+    async fn terminal_read_error_waits_for_an_admitted_write_before_returning() {
+        let filesystem = Arc::new(
+            ZeroFS::new_in_memory()
+                .await
+                .expect("create test filesystem"),
+        );
+        let export_gates = Arc::new(NbdExportGates::default());
+        let device = single_file_export(&filesystem, &export_gates).await;
+        let commit_block = filesystem.db.flush_barrier().write_owned().await;
+        let apply_reached = filesystem.write_coordinator.probe_next_apply();
+
+        let mut request = probe_request(NBDCommand::Write, 1, 0, 512);
+        request.extend_from_slice(&vec![0xc9; 512]);
+        let mut session = NBDSession::new(
+            RequestThenReadError {
+                bytes: request,
+                position: 0,
+                kind: io::ErrorKind::TimedOut,
+            },
+            tokio::io::sink(),
+            Arc::clone(&filesystem),
+            Arc::clone(&export_gates),
+            CancellationToken::new(),
+        );
+        let mut session_task =
+            tokio::spawn(async move { session.handle_transmission(device).await });
+
+        timeout(Duration::from_secs(2), apply_reached)
+            .await
+            .expect("write reached the blocked apply")
+            .expect("apply probe remained installed");
+        assert!(
+            !session_task.is_finished(),
+            "the terminal read error must not abandon an admitted write"
+        );
+
+        drop(commit_block);
+        let error = timeout(Duration::from_secs(5), &mut session_task)
+            .await
+            .expect("session returned after admitted work drained")
+            .expect("session task did not panic")
+            .expect_err("the terminal read error must be preserved");
+        assert!(
+            error.to_string().contains("injected read failure"),
+            "the original read error must be returned: {error}"
+        );
+
+        let handler = NBDHandler::new(filesystem, export_gates);
+        let probe = handler
+            .get_device(b"flush-ordering-test")
+            .await
+            .expect("reopen export after read failure");
+        assert_eq!(
+            handler
+                .read(&probe, 0, 512)
+                .await
+                .expect("read landed write"),
+            Bytes::from(vec![0xc9; 512]),
+            "the command admitted before the read failure must finish"
         );
     }
 }
