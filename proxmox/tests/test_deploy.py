@@ -225,6 +225,16 @@ addresses = ["10.10.10.30:9567"]
                     self.write_config(unsafe), "10.10.10.30", role="prod"
                 )
 
+    def test_prod_webui_requires_numeric_uid_and_gid(self) -> None:
+        for field in ("uid", "gid"):
+            incomplete = self.prod_config().replace(f"{field} = 0\n", "")
+            with self.subTest(field=field), self.assertRaisesRegex(
+                ValueError, f"WebUI.*{field}"
+            ):
+                deploy.validate_server_config(
+                    self.write_config(incomplete), "10.10.10.30", role="prod"
+                )
+
     def test_prod_nfs_requires_exact_private_address_and_port(self) -> None:
         deploy.validate_server_config(
             self.write_config(self.prod_config()), "10.10.10.30", role="prod"

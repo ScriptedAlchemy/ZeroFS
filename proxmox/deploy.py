@@ -214,6 +214,14 @@ def validate_server_config(
                 raise ValueError(
                     "WebUI must listen only on the private container address at port 8080"
                 )
+        for identity_field in ("uid", "gid"):
+            identity = webui.get(identity_field)
+            if (
+                not isinstance(identity, int)
+                or isinstance(identity, bool)
+                or not 0 <= identity <= 0xFFFF_FFFF
+            ):
+                raise ValueError(f"WebUI requires a numeric {identity_field}")
     rpc = servers.get("rpc", {})
     if _addresses(rpc):
         raise ValueError("RPC must be Unix-socket only")
