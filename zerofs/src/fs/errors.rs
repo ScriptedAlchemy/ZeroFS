@@ -1,9 +1,6 @@
 use thiserror::Error;
 use zerofs_nfsserve::nfs::nfsstat3;
 
-/// Protocol consumers carry Linux errnos regardless of the server host.
-const LINUX_ENOTEMPTY: u32 = 39;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum FsError {
     #[error("Permission denied")]
@@ -117,29 +114,29 @@ impl FsError {
 
     pub fn to_errno(self) -> u32 {
         match self {
-            FsError::PermissionDenied => libc::EACCES as u32,
-            FsError::OperationNotPermitted => libc::EPERM as u32,
-            FsError::NotFound => libc::ENOENT as u32,
-            FsError::Exists => libc::EEXIST as u32,
-            FsError::InvalidArgument => libc::EINVAL as u32,
-            FsError::IoError => libc::EIO as u32,
-            FsError::NotEmpty => LINUX_ENOTEMPTY,
-            FsError::TooManyLinks => libc::EMLINK as u32,
-            FsError::NoSpace => libc::ENOSPC as u32,
-            FsError::IsDirectory => libc::EISDIR as u32,
-            FsError::NotDirectory => libc::ENOTDIR as u32,
-            FsError::NameTooLong => libc::ENAMETOOLONG as u32,
-            FsError::NotSupported => libc::ENOSYS as u32,
-            FsError::StaleHandle => libc::ESTALE as u32,
-            FsError::InvalidData => libc::EIO as u32,
-            FsError::ReadOnlyFilesystem => libc::EROFS as u32,
+            FsError::PermissionDenied => crate::linux_errno::EACCES,
+            FsError::OperationNotPermitted => crate::linux_errno::EPERM,
+            FsError::NotFound => crate::linux_errno::ENOENT,
+            FsError::Exists => crate::linux_errno::EEXIST,
+            FsError::InvalidArgument => crate::linux_errno::EINVAL,
+            FsError::IoError => crate::linux_errno::EIO,
+            FsError::NotEmpty => crate::linux_errno::ENOTEMPTY,
+            FsError::TooManyLinks => crate::linux_errno::EMLINK,
+            FsError::NoSpace => crate::linux_errno::ENOSPC,
+            FsError::IsDirectory => crate::linux_errno::EISDIR,
+            FsError::NotDirectory => crate::linux_errno::ENOTDIR,
+            FsError::NameTooLong => crate::linux_errno::ENAMETOOLONG,
+            FsError::NotSupported => crate::linux_errno::ENOSYS,
+            FsError::StaleHandle => crate::linux_errno::ESTALE,
+            FsError::InvalidData => crate::linux_errno::EIO,
+            FsError::ReadOnlyFilesystem => crate::linux_errno::EROFS,
             // A distinct signal (not EIO) so a failover-aware 9P client re-probes
             // the node set for the current leader and resends, instead of failing.
             FsError::LeaderLeaseExpired => ninep_proto::P9_ENOTLEADER,
             // The private CLEAN failover signal is selected only by the 9P
             // handler, which can also preserve FIRST/RETRY semantics. Other
             // errno consumers must see an ordinary I/O failure.
-            FsError::LeaderRejectedBeforeApply => libc::EIO as u32,
+            FsError::LeaderRejectedBeforeApply => crate::linux_errno::EIO,
             FsError::ShuttingDown => ninep_proto::P9_ENOTLEADER,
         }
     }
@@ -157,5 +154,32 @@ mod tests {
             FsError::from_db_error(&anyhow::anyhow!("storage failed")),
             FsError::IoError
         );
+    }
+
+    #[test]
+    fn filesystem_errnos_use_the_linux_wire_abi() {
+        for (error, expected) in [
+            (FsError::PermissionDenied, 13),
+            (FsError::OperationNotPermitted, 1),
+            (FsError::NotFound, 2),
+            (FsError::Exists, 17),
+            (FsError::InvalidArgument, 22),
+            (FsError::IoError, 5),
+            (FsError::NotEmpty, 39),
+            (FsError::TooManyLinks, 31),
+            (FsError::NoSpace, 28),
+            (FsError::IsDirectory, 21),
+            (FsError::NotDirectory, 20),
+            (FsError::NameTooLong, 36),
+            (FsError::NotSupported, 38),
+            (FsError::StaleHandle, 116),
+            (FsError::InvalidData, 5),
+            (FsError::ReadOnlyFilesystem, 30),
+            (FsError::LeaderLeaseExpired, ninep_proto::P9_ENOTLEADER),
+            (FsError::LeaderRejectedBeforeApply, 5),
+            (FsError::ShuttingDown, ninep_proto::P9_ENOTLEADER),
+        ] {
+            assert_eq!(error.to_errno(), expected, "{error:?}");
+        }
     }
 }

@@ -2796,7 +2796,7 @@ mod tests {
             )
             .await
             .body,
-            Message::Rlerror(Rlerror { ecode }) if ecode == libc::EINVAL as u32
+            Message::Rlerror(Rlerror { ecode }) if ecode == crate::linux_errno::EINVAL
         ));
 
         expect_walk(&handler, 12, 1, 7, &[b"denied"]).await;
@@ -2811,7 +2811,7 @@ mod tests {
             )
             .await
             .body,
-            Message::Rlerror(Rlerror { ecode }) if ecode == libc::EACCES as u32
+            Message::Rlerror(Rlerror { ecode }) if ecode == crate::linux_errno::EACCES
         ));
 
         expect_walk(&handler, 14, 1, 8, &[b"other-readable"]).await;
@@ -2859,7 +2859,7 @@ mod tests {
             assert!(
                 matches!(
                     denied.body,
-                    Message::Rlerror(Rlerror { ecode }) if ecode == libc::EACCES as u32
+                    Message::Rlerror(Rlerror { ecode }) if ecode == crate::linux_errno::EACCES
                 ),
                 "flags {flags:#x} unexpectedly opened a read-only inode: {:?}",
                 denied.body
@@ -2881,7 +2881,7 @@ mod tests {
         .await;
         assert!(matches!(
             invalid.body,
-            Message::Rlerror(Rlerror { ecode }) if ecode == libc::EINVAL as u32
+            Message::Rlerror(Rlerror { ecode }) if ecode == crate::linux_errno::EINVAL
         ));
 
         let allowed = request(
@@ -2974,7 +2974,7 @@ mod tests {
         .await;
         assert!(matches!(
             denied_open.body,
-            Message::Rlerror(Rlerror { ecode }) if ecode == libc::EACCES as u32
+            Message::Rlerror(Rlerror { ecode }) if ecode == crate::linux_errno::EACCES
         ));
         assert!(handler.get_fid(3).is_err());
 
@@ -2991,7 +2991,7 @@ mod tests {
         .await;
         assert!(matches!(
             denied_open_read.body,
-            Message::Rlerror(Rlerror { ecode }) if ecode == libc::EACCES as u32
+            Message::Rlerror(Rlerror { ecode }) if ecode == crate::linux_errno::EACCES
         ));
         assert!(handler.get_fid(4).is_err());
 
@@ -3068,7 +3068,7 @@ mod tests {
         .await;
         assert!(matches!(
             denied.body,
-            Message::Rlerror(Rlerror { ecode }) if ecode == libc::EACCES as u32
+            Message::Rlerror(Rlerror { ecode }) if ecode == crate::linux_errno::EACCES
         ));
         assert!(handler.get_fid(3).is_err());
 
@@ -3218,7 +3218,7 @@ mod tests {
             )
             .await
             .body,
-            Message::Rlerror(Rlerror { ecode }) if ecode == libc::EACCES as u32
+            Message::Rlerror(Rlerror { ecode }) if ecode == crate::linux_errno::EACCES
         ));
     }
 
@@ -3318,7 +3318,7 @@ mod tests {
         .await;
         assert!(matches!(
             bad_write.body,
-            Message::Rlerror(Rlerror { ecode }) if ecode == libc::EBADF as u32
+            Message::Rlerror(Rlerror { ecode }) if ecode == crate::linux_errno::EBADF
         ));
 
         let bad_fallocate = request(
@@ -3334,7 +3334,7 @@ mod tests {
         .await;
         assert!(matches!(
             bad_fallocate.body,
-            Message::Rlerror(Rlerror { ecode }) if ecode == libc::EBADF as u32
+            Message::Rlerror(Rlerror { ecode }) if ecode == crate::linux_errno::EBADF
         ));
 
         let mut read_only_truncate = blank_setattr(2, SETATTR_SIZE);
@@ -3342,7 +3342,7 @@ mod tests {
         let denied = request(&handler, 9, Message::Tsetattrattr(read_only_truncate)).await;
         assert!(matches!(
             denied.body,
-            Message::Rlerror(Rlerror { ecode }) if ecode == libc::EBADF as u32
+            Message::Rlerror(Rlerror { ecode }) if ecode == crate::linux_errno::EBADF
         ));
 
         let mut path_truncate = blank_setattr(4, SETATTR_SIZE);
@@ -3350,7 +3350,7 @@ mod tests {
         let denied = request(&handler, 10, Message::Tsetattr(path_truncate)).await;
         assert!(matches!(
             denied.body,
-            Message::Rlerror(Rlerror { ecode }) if ecode == libc::EACCES as u32
+            Message::Rlerror(Rlerror { ecode }) if ecode == crate::linux_errno::EACCES
         ));
 
         let mut opened_truncate = blank_setattr(3, SETATTR_SIZE);
@@ -3375,7 +3375,7 @@ mod tests {
         .await;
         assert!(matches!(
             bad_read.body,
-            Message::Rlerror(Rlerror { ecode }) if ecode == libc::EBADF as u32
+            Message::Rlerror(Rlerror { ecode }) if ecode == crate::linux_errno::EBADF
         ));
 
         assert!(matches!(
@@ -3456,7 +3456,7 @@ mod tests {
                 Err(P9Error::Overflow)
             ));
         }
-        assert_eq!(P9Error::Overflow.to_errno(), libc::EOVERFLOW as u32);
+        assert_eq!(P9Error::Overflow.to_errno(), crate::linux_errno::EOVERFLOW);
     }
 
     #[tokio::test]
@@ -3541,7 +3541,7 @@ mod tests {
             )
             .await;
             match response.body {
-                Message::Rlerror(error) => assert_eq!(error.ecode, libc::EINVAL as u32),
+                Message::Rlerror(error) => assert_eq!(error.ecode, crate::linux_errno::EINVAL),
                 other => panic!("expected EINVAL Rlerror, got {other:?}"),
             }
         }
@@ -3549,7 +3549,7 @@ mod tests {
         for (tag, name) in [(4, b"bad-major".as_slice()), (5, b"bad-minor".as_slice())] {
             let response = walk_fid(&handler, tag, 1, tag as u32 + 10, &[name]).await;
             match response.body {
-                Message::Rlerror(error) => assert_eq!(error.ecode, libc::ENOENT as u32),
+                Message::Rlerror(error) => assert_eq!(error.ecode, crate::linux_errno::ENOENT),
                 other => panic!("rejected device was created: {other:?}"),
             }
         }
@@ -3596,7 +3596,7 @@ mod tests {
         .await;
         assert!(matches!(
             response.body,
-            Message::Rlerror(Rlerror { ecode }) if ecode == libc::EOVERFLOW as u32
+            Message::Rlerror(Rlerror { ecode }) if ecode == crate::linux_errno::EOVERFLOW
         ));
     }
 
@@ -3906,7 +3906,7 @@ mod tests {
             .await;
         assert!(matches!(
             denied.body,
-            Message::Rlerror(Rlerror { ecode }) if ecode == libc::EBADF as u32
+            Message::Rlerror(Rlerror { ecode }) if ecode == crate::linux_errno::EBADF
         ));
 
         let malformed = handler
@@ -3918,7 +3918,7 @@ mod tests {
             .await;
         assert!(matches!(
             malformed.body,
-            Message::Rlerror(Rlerror { ecode }) if ecode == libc::EINVAL as u32
+            Message::Rlerror(Rlerror { ecode }) if ecode == crate::linux_errno::EINVAL
         ));
 
         let updated = handler
@@ -3952,7 +3952,7 @@ mod tests {
             .await;
         assert!(matches!(
             standard.body,
-            Message::Rlerror(Rlerror { ecode }) if ecode == libc::EINVAL as u32
+            Message::Rlerror(Rlerror { ecode }) if ecode == crate::linux_errno::EINVAL
         ));
 
         let mut bad_nsec = blank_setattr(1, SETATTR_ATIME | SETATTR_ATIME_SET);
@@ -3962,7 +3962,7 @@ mod tests {
             .await;
         assert!(matches!(
             compound.body,
-            Message::Rlerror(Rlerror { ecode }) if ecode == libc::EINVAL as u32
+            Message::Rlerror(Rlerror { ecode }) if ecode == crate::linux_errno::EINVAL
         ));
     }
 
@@ -3970,7 +3970,7 @@ mod tests {
     fn only_proven_unapplied_deposal_stays_clean_after_lease_loss() {
         assert_eq!(
             FsError::LeaderRejectedBeforeApply.to_errno(),
-            libc::EIO as u32,
+            crate::linux_errno::EIO,
             "the private CLEAN code must not leak through generic errno consumers"
         );
         assert_eq!(
@@ -3983,7 +3983,7 @@ mod tests {
         );
         assert_eq!(
             post_dispatch_errno(P9Error::Fs(FsError::IoError), true),
-            libc::EIO as u32
+            crate::linux_errno::EIO
         );
     }
 
@@ -4071,12 +4071,12 @@ mod tests {
             .await;
         assert!(matches!(
             first.body,
-            Message::Rlerror(Rlerror { ecode }) if ecode == libc::EBADF as u32
+            Message::Rlerror(Rlerror { ecode }) if ecode == crate::linux_errno::EBADF
         ));
         assert!(matches!(
             fs.dedup.get(&op_id),
             Some(crate::dedup::DedupResult::Error { errno })
-                if errno == libc::EBADF as u32
+                if errno == crate::linux_errno::EBADF
         ));
 
         // The fid becomes valid only after the recorded `EBADF` result.
@@ -4099,7 +4099,7 @@ mod tests {
             .await;
         assert!(matches!(
             retry.body,
-            Message::Rlerror(Rlerror { ecode }) if ecode == libc::EBADF as u32
+            Message::Rlerror(Rlerror { ecode }) if ecode == crate::linux_errno::EBADF
         ));
         assert!(matches!(
             fs.lookup(&test_creds(), 0, b"must-stay-absent").await,
@@ -4239,7 +4239,7 @@ mod tests {
             .await;
         assert!(matches!(
             unlink.body,
-            Message::Rlerror(Rlerror { ecode }) if ecode == libc::EINVAL as u32
+            Message::Rlerror(Rlerror { ecode }) if ecode == crate::linux_errno::EINVAL
         ));
         assert!(fs.lookup(&test_creds(), 0, b"kept").await.is_ok());
     }
@@ -4368,7 +4368,7 @@ mod tests {
         assert!(matches!(
             private_response.body,
             Message::Rlerror(Rlerror { ecode })
-                if ecode == crate::ninep::errors::LINUX_EOPNOTSUPP
+                if ecode == crate::linux_errno::EOPNOTSUPP
         ));
         let enveloped_response = handler
             .handle_message_with_op_id(
@@ -4385,7 +4385,7 @@ mod tests {
         assert!(matches!(
             enveloped_response.body,
             Message::Rlerror(Rlerror { ecode })
-                if ecode == crate::ninep::errors::LINUX_EOPNOTSUPP
+                if ecode == crate::linux_errno::EOPNOTSUPP
         ));
 
         // The private dialect enables all ZeroFS extensions together.
@@ -4491,7 +4491,7 @@ mod tests {
 
         match &invalid_resp.body {
             Message::Rlerror(rerror) => {
-                assert_eq!(rerror.ecode, libc::EBADF as u32);
+                assert_eq!(rerror.ecode, crate::linux_errno::EBADF);
             }
             _ => panic!("Expected Rlerror, got {:?}", invalid_resp.body),
         }
@@ -4998,7 +4998,7 @@ mod tests {
             .await;
         assert!(matches!(
             unknown.body,
-            Message::Rlerror(Rlerror { ecode }) if ecode == libc::EINVAL as u32
+            Message::Rlerror(Rlerror { ecode }) if ecode == crate::linux_errno::EINVAL
         ));
 
         let file_as_directory = handler
@@ -5013,7 +5013,7 @@ mod tests {
             .await;
         assert!(matches!(
             file_as_directory.body,
-            Message::Rlerror(Rlerror { ecode }) if ecode == libc::ENOTDIR as u32
+            Message::Rlerror(Rlerror { ecode }) if ecode == crate::linux_errno::ENOTDIR
         ));
 
         let directory_as_file = handler
@@ -5028,7 +5028,7 @@ mod tests {
             .await;
         assert!(matches!(
             directory_as_file.body,
-            Message::Rlerror(Rlerror { ecode }) if ecode == libc::EISDIR as u32
+            Message::Rlerror(Rlerror { ecode }) if ecode == crate::linux_errno::EISDIR
         ));
 
         assert!(fs.lookup(&test_creds(), 0, b"file").await.is_ok());
@@ -5127,7 +5127,7 @@ mod tests {
         .await;
         assert!(matches!(
             stale,
-            Message::Rlerror(Rlerror { ecode }) if ecode == libc::ESTALE as u32
+            Message::Rlerror(Rlerror { ecode }) if ecode == crate::linux_errno::ESTALE
         ));
         assert_eq!(fs.open_handle_count(file_id), 1);
 
@@ -5203,13 +5203,13 @@ mod tests {
         let handler = zerofs_handler(&fs).await;
         assert!(matches!(
             rebind(&handler, 1, 1, file_id, 0, 0).await,
-            Message::Rlerror(Rlerror { ecode }) if ecode == libc::EACCES as u32
+            Message::Rlerror(Rlerror { ecode }) if ecode == crate::linux_errno::EACCES
         ));
 
         let replay = zerofs_handler(&fs).await;
         assert!(matches!(
             rebind(&replay, 2, 1, file_id, 0, P9_REBIND_REPLAY).await,
-            Message::Rlerror(Rlerror { ecode }) if ecode == libc::ESTALE as u32
+            Message::Rlerror(Rlerror { ecode }) if ecode == crate::linux_errno::ESTALE
         ));
         assert!(replay.get_fid(1).is_err());
     }
@@ -5240,7 +5240,7 @@ mod tests {
         let manual = zerofs_handler(&fs).await;
         assert!(matches!(
             rebind(&manual, 1, 1, attach_root, attach_root, 0).await,
-            Message::Rlerror(Rlerror { ecode }) if ecode == libc::EACCES as u32
+            Message::Rlerror(Rlerror { ecode }) if ecode == crate::linux_errno::EACCES
         ));
 
         let replay = zerofs_handler(&fs).await;
@@ -5254,7 +5254,7 @@ mod tests {
                 P9_REBIND_REPLAY,
             )
             .await,
-            Message::Rlerror(Rlerror { ecode }) if ecode == libc::ESTALE as u32
+            Message::Rlerror(Rlerror { ecode }) if ecode == crate::linux_errno::ESTALE
         ));
         assert!(replay.get_fid(1).is_err());
     }
@@ -5311,7 +5311,7 @@ mod tests {
             let reconnect = zerofs_handler(&fs).await;
             assert!(matches!(
                 rebind(&reconnect, tag, 1, file_id, tenant_id, flags).await,
-                Message::Rlerror(Rlerror { ecode }) if ecode == libc::ESTALE as u32
+                Message::Rlerror(Rlerror { ecode }) if ecode == crate::linux_errno::ESTALE
             ));
             assert!(reconnect.get_fid(1).is_err());
         }
@@ -5368,7 +5368,7 @@ mod tests {
                 P9_REBIND_REPLAY | P9_REBIND_OPENED,
             )
             .await,
-            Message::Rlerror(Rlerror { ecode }) if ecode == libc::ESTALE as u32
+            Message::Rlerror(Rlerror { ecode }) if ecode == crate::linux_errno::ESTALE
         ));
         assert!(promoted.get_fid(1).is_err());
         assert_eq!(fs.open_handle_count(file_id), 0);
@@ -5398,7 +5398,7 @@ mod tests {
             let stale = rebind(&handler, tag, tag.into(), root_id, root_id, flags).await;
             assert!(matches!(
                 stale,
-                Message::Rlerror(Rlerror { ecode }) if ecode == libc::ESTALE as u32
+                Message::Rlerror(Rlerror { ecode }) if ecode == crate::linux_errno::ESTALE
             ));
         }
         assert_eq!(
@@ -5410,7 +5410,7 @@ mod tests {
         let denied = rebind(&handler, 3, 3, root_id, root_id, 0).await;
         assert!(matches!(
             denied,
-            Message::Rlerror(Rlerror { ecode }) if ecode == libc::EACCES as u32
+            Message::Rlerror(Rlerror { ecode }) if ecode == crate::linux_errno::EACCES
         ));
 
         drop(old_pin);
@@ -5430,7 +5430,7 @@ mod tests {
         let invalid = rebind(&handler, 1, 1, file_id, 0, P9_REBIND_OPENED).await;
         assert!(matches!(
             invalid,
-            Message::Rlerror(Rlerror { ecode }) if ecode == libc::EINVAL as u32
+            Message::Rlerror(Rlerror { ecode }) if ecode == crate::linux_errno::EINVAL
         ));
         assert_eq!(fs.open_handle_count(file_id), 0);
 
@@ -5580,7 +5580,7 @@ mod tests {
             };
             assert!(matches!(
                 reopen.body,
-                Message::Rlerror(Rlerror { ecode }) if ecode == libc::ESTALE as u32
+                Message::Rlerror(Rlerror { ecode }) if ecode == crate::linux_errno::ESTALE
             ));
             assert_eq!(
                 fs.open_handle_count(file_id),
@@ -5634,7 +5634,7 @@ mod tests {
         // A subtree attach still has to prove membership it cannot prove here.
         assert!(matches!(
             rebind(&handler, 2, 2, file_id, dir_id, 0).await,
-            Message::Rlerror(Rlerror { ecode }) if ecode == libc::EACCES as u32
+            Message::Rlerror(Rlerror { ecode }) if ecode == crate::linux_errno::EACCES
         ));
 
         // Removing one alias leaves the surviving inode in the same lazy
@@ -5651,7 +5651,7 @@ mod tests {
         ));
         assert!(matches!(
             rebind(&handler, 4, 4, file_id, dir_id, 0).await,
-            Message::Rlerror(Rlerror { ecode }) if ecode == libc::EACCES as u32
+            Message::Rlerror(Rlerror { ecode }) if ecode == crate::linux_errno::EACCES
         ));
 
         // The parentless exception still requires search access at the global
@@ -5678,12 +5678,12 @@ mod tests {
 
         assert!(matches!(
             rebind(&handler, 5, 5, file_id, 0, 0).await,
-            Message::Rlerror(Rlerror { ecode }) if ecode == libc::EACCES as u32
+            Message::Rlerror(Rlerror { ecode }) if ecode == crate::linux_errno::EACCES
         ));
         let replay = zerofs_handler(&fs).await;
         assert!(matches!(
             rebind(&replay, 6, 1, file_id, 0, P9_REBIND_REPLAY).await,
-            Message::Rlerror(Rlerror { ecode }) if ecode == libc::ESTALE as u32
+            Message::Rlerror(Rlerror { ecode }) if ecode == crate::linux_errno::ESTALE
         ));
     }
 
@@ -5737,7 +5737,7 @@ mod tests {
         .await;
         assert!(matches!(
             clone_denied.body,
-            Message::Rlerror(Rlerror { ecode }) if ecode == libc::EACCES as u32
+            Message::Rlerror(Rlerror { ecode }) if ecode == crate::linux_errno::EACCES
         ));
         assert!(handler.get_fid(2).is_err());
 
@@ -5754,7 +5754,7 @@ mod tests {
         assert!(
             matches!(
                 replayed.body,
-                Message::Rlerror(Rlerror { ecode }) if ecode == libc::ESTALE as u32
+                Message::Rlerror(Rlerror { ecode }) if ecode == crate::linux_errno::ESTALE
             ),
             "replay OPENED bypassed DAC: {:?}",
             replayed.body
@@ -5794,7 +5794,7 @@ mod tests {
         )
         .await;
         assert!(
-            matches!(denied.body, Message::Rlerror(Rlerror { ecode }) if ecode == libc::EACCES as u32),
+            matches!(denied.body, Message::Rlerror(Rlerror { ecode }) if ecode == crate::linux_errno::EACCES),
             "unauthorized open succeeded: {:?}",
             denied.body
         );
