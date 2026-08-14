@@ -982,9 +982,9 @@ mod tests {
     use bytes::Bytes;
     use deku::{DekuContainerRead, DekuContainerWrite};
     use nbd_proto::{
-        NBD_EINVAL, NBD_FLAG_C_FIXED_NEWSTYLE, NBD_FLAG_C_NO_ZEROES, NBD_IHAVEOPT,
-        NBD_OPT_EXPORT_NAME, NBD_REQUEST_HEADER_SIZE, NBD_REQUEST_MAGIC, NBDCommand, NBDRequest,
-        NBDSimpleReply,
+        NBD_CMD_FLAG_FUA, NBD_EINVAL, NBD_FLAG_C_FIXED_NEWSTYLE, NBD_FLAG_C_NO_ZEROES,
+        NBD_IHAVEOPT, NBD_OPT_EXPORT_NAME, NBD_REQUEST_HEADER_SIZE, NBD_REQUEST_MAGIC, NBDCommand,
+        NBDRequest, NBDSimpleReply,
     };
     use std::io;
     use std::pin::Pin;
@@ -1023,6 +1023,9 @@ mod tests {
         bytes: Vec<u8>,
         position: usize,
         polls: Arc<AtomicUsize>,
+        /// Bytes actually consumed by the session, so a test can see the read
+        /// side stop when admission runs out of byte credit.
+        delivered: Arc<AtomicUsize>,
     }
 
     /// A writer that never accepts a byte, standing in for a client that
@@ -1063,6 +1066,7 @@ mod tests {
             let length = remaining.len().min(buf.remaining());
             buf.put_slice(&remaining[..length]);
             self.position += length;
+            self.delivered.fetch_add(length, Ordering::Relaxed);
             Poll::Ready(Ok(()))
         }
     }
@@ -1446,6 +1450,7 @@ mod tests {
                     bytes: request.clone(),
                     position: 0,
                     polls: Arc::clone(&polls),
+                    delivered: Arc::new(AtomicUsize::new(0)),
                 },
                 tokio::io::sink(),
                 Arc::clone(&filesystem),
@@ -1791,12 +1796,12 @@ mod tests {
     ///      filesystem, so it isolates exactly this.
     ///   2. What a real WRITE adds on top: payload transfer plus the storage
     ///      engine's staging and commit.
-    ///   3. What one TCP connection can do when requests are *pipelined*. The
-    ///      transmission loop is strictly serial — it reads a request, awaits
-    ///      the whole handler, writes the reply, and only then reads the next —
-    ///      so a client that queues N requests on one socket still gets them
-    ///      serviced one at a time. Deep queue depth only pays off across
-    ///      connections, which is what this measures.
+    ///   3. What one TCP connection does as its queue deepens, and what
+    ///      several connections do in aggregate. The transmission loop
+    ///      overlaps execution, so depth on a single connection buys real
+    ///      concurrency; the barrier-free and FUA arms bracket that, since a
+    ///      write that must be durable before it is acknowledged cannot
+    ///      overlap the writes it follows.
     ///
     /// Anything the fio round trip costs beyond (1)+(2) is the kernel NBD
     /// driver, the block layer, XFS, and fio itself — none of it addressable by
@@ -1928,10 +1933,9 @@ mod tests {
         }
 
         // (2b) The same writes queued on ONE connection at increasing depth.
-        // A serial transmission loop reads, runs, and replies to one command
-        // before looking at the socket again, so every depth here collapses to
-        // the QD1 number above; overlapping execution is what makes depth mean
-        // anything on a single connection.
+        // Before the loop overlapped execution every depth here collapsed onto
+        // the QD1 number above, because one command was read, run, and replied
+        // to before the socket was looked at again.
         for queue_depth in [1usize, 4, 16, 32] {
             let size = 256 * 1024usize;
             let iterations = (32 * 1024 * 1024 / size) as u64;
@@ -1985,6 +1989,70 @@ mod tests {
             let mut tx = sender.await.expect("pipelined sender finished");
             eprintln!(
                 "nbd write 256 KiB one connection at depth {queue_depth:>2}: {:.0} MB/s",
+                (iterations as usize * size) as f64 / elapsed / 1e6,
+            );
+            tx.write_all(&probe_request(NBDCommand::Disconnect, 0, 0, 0))
+                .await
+                .expect("send disconnect");
+            let _ = timeout(Duration::from_secs(5), session).await;
+        }
+
+        // (2c) The same depth sweep with every write carrying FUA. A FUA write
+        // is acknowledged only once it is durable, and `flush` takes the export
+        // gate exclusively — so it waits on every write admitted before it.
+        // Depth cannot help here, and reporting only the barrier-free number
+        // above would overstate what a journalling filesystem actually sees.
+        for queue_depth in [1usize, 4, 32] {
+            let size = 256 * 1024usize;
+            let iterations = (4 * 1024 * 1024 / size) as u64;
+            let slots = EXPORT_BYTES / size as u64;
+            let name = format!("floor-fua-{queue_depth}");
+            sized_single_file_export(&filesystem, name.as_bytes(), EXPORT_BYTES).await;
+            let (stream, session) = transmission_over_tcp(
+                Arc::clone(&filesystem),
+                Arc::clone(&export_gates),
+                name.as_bytes(),
+            )
+            .await;
+            let (mut rx, mut tx) = tokio::io::split(stream);
+            let credits = Arc::new(tokio::sync::Semaphore::new(queue_depth));
+            let start = std::time::Instant::now();
+            let sender = {
+                let credits = Arc::clone(&credits);
+                tokio::spawn(async move {
+                    let payload = vec![0xa5u8; size];
+                    for i in 0..iterations {
+                        let permit = Arc::clone(&credits)
+                            .acquire_owned()
+                            .await
+                            .expect("queue credit");
+                        let mut request = NBDRequest {
+                            magic: NBD_REQUEST_MAGIC,
+                            flags: NBD_CMD_FLAG_FUA,
+                            cmd_type: NBDCommand::Write,
+                            cookie: i,
+                            offset: (i % slots) * size as u64,
+                            length: size as u32,
+                        }
+                        .to_bytes()
+                        .expect("encode FUA write");
+                        request.truncate(NBD_REQUEST_HEADER_SIZE);
+                        tx.write_all(&request).await.expect("send FUA header");
+                        tx.write_all(&payload).await.expect("send FUA payload");
+                        permit.forget();
+                    }
+                    tx
+                })
+            };
+            let mut reply = [0u8; 16];
+            for _ in 0..iterations {
+                rx.read_exact(&mut reply).await.expect("read FUA reply");
+                credits.add_permits(1);
+            }
+            let elapsed = start.elapsed().as_secs_f64();
+            let mut tx = sender.await.expect("FUA sender finished");
+            eprintln!(
+                "nbd FUA write 256 KiB one connection at depth {queue_depth:>2}: {:.0} MB/s",
                 (iterations as usize * size) as f64 / elapsed / 1e6,
             );
             tx.write_all(&probe_request(NBDCommand::Disconnect, 0, 0, 0))
@@ -2086,8 +2154,12 @@ mod tests {
         );
         let session_task = tokio::spawn(async move { session.handle_transmission(device).await });
 
-        // A large WRITE, then several trivial READs behind it. The writes and
-        // reads share no extent, so nothing forces an ordering between them.
+        // A WRITE, then several READs of the same region behind it. They
+        // overlap exactly, which is the point: the specification orders a READ
+        // against a WRITE only across a FLUSH or FUA boundary, so with neither
+        // present the server is free to run them together and reply in any
+        // order. Each READ therefore returns either the old or the new bytes,
+        // and the test asserts only that all eight complete.
         client_stream
             .write_all(&probe_request(NBDCommand::Write, 1, 0, 4096))
             .await
@@ -2233,6 +2305,80 @@ mod tests {
         );
     }
 
+    /// The byte budget must actually gate admission, not merely be computed.
+    ///
+    /// Twenty 4 MiB writes are 80 MiB of payload against a 64 MiB budget, and
+    /// twenty commands against a cap of `MAX_INFLIGHT_COMMANDS` (32) — so the
+    /// count cap cannot be what stops this. With replies stalled, no credit is
+    /// ever returned, and the read side must stop consuming requests partway
+    /// through rather than buffering all 80 MiB.
+    #[tokio::test]
+    async fn admission_stops_reading_once_the_byte_budget_is_spent() {
+        const CHUNK: usize = 4 * 1024 * 1024;
+        const WRITES: usize = 20;
+        let filesystem = Arc::new(
+            ZeroFS::new_in_memory()
+                .await
+                .expect("create test filesystem"),
+        );
+        let export_gates = Arc::new(NbdExportGates::default());
+        sized_single_file_export(&filesystem, b"budget-probe", (CHUNK * WRITES) as u64).await;
+
+        let mut requests = Vec::with_capacity(WRITES * (CHUNK + 32));
+        for i in 0..WRITES {
+            requests.extend_from_slice(&probe_request(
+                NBDCommand::Write,
+                i as u64,
+                (i * CHUNK) as u64,
+                CHUNK as u32,
+            ));
+            requests.extend_from_slice(&vec![0x6b; CHUNK]);
+        }
+        let total = requests.len();
+        let delivered = Arc::new(AtomicUsize::new(0));
+        let (stalled_tx, stalled_rx) = oneshot::channel();
+        let mut session = NBDSession::new(
+            PrebufferedRequest {
+                bytes: requests,
+                position: 0,
+                polls: Arc::new(AtomicUsize::new(0)),
+                delivered: Arc::clone(&delivered),
+            },
+            StalledWriter {
+                stalled: Some(stalled_tx),
+            },
+            Arc::clone(&filesystem),
+            Arc::clone(&export_gates),
+            CancellationToken::new(),
+        );
+        let device = NBDHandler::new(Arc::clone(&filesystem), Arc::clone(&export_gates))
+            .get_device(b"budget-probe")
+            .await
+            .expect("discover budget export");
+        let session_task = tokio::spawn(async move { session.handle_transmission(device).await });
+
+        stalled_rx
+            .await
+            .expect("the session produced a reply and blocked writing it");
+        // Give a wedged admission path every chance to keep reading.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let consumed = delivered.load(Ordering::Relaxed);
+        assert!(
+            consumed < total,
+            "admission read all {total} bytes ({consumed}) despite a {} MiB budget \
+             and no reply ever draining; the byte budget is not gating",
+            MAX_INFLIGHT_BYTES / (1024 * 1024),
+        );
+        assert!(
+            consumed >= CHUNK,
+            "admission stalled before even one write was read ({consumed} bytes)"
+        );
+
+        session_task.abort();
+        let _ = session_task.await;
+    }
+
     /// A client that stops reading its replies must not pin admission guards.
     ///
     /// Replies drain on their own stream, so a blocked socket write leaves
@@ -2267,6 +2413,7 @@ mod tests {
                 bytes: requests,
                 position: 0,
                 polls: Arc::new(AtomicUsize::new(0)),
+                delivered: Arc::new(AtomicUsize::new(0)),
             },
             StalledWriter {
                 stalled: Some(stalled_tx),
@@ -2319,6 +2466,7 @@ mod tests {
                 bytes: requests,
                 position: 0,
                 polls: Arc::new(AtomicUsize::new(0)),
+                delivered: Arc::new(AtomicUsize::new(0)),
             },
             tokio::io::sink(),
             Arc::clone(&filesystem),
