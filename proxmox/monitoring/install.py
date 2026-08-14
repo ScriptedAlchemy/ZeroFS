@@ -106,6 +106,7 @@ def render_assets(args: argparse.Namespace, destination: Path) -> list[Path]:
         ROOT / "grafana" / "zerofs-dashboard.yml",
         ROOT / "grafana" / "zerofs-overview.json",
         ROOT / "prometheus" / "zerofs-prometheus-default",
+        ROOT / "merge-prometheus-config.py",
         ROOT / "host-install.sh",
     ):
         target = destination / source.name
@@ -177,6 +178,12 @@ def install(args: argparse.Namespace) -> None:
             )
         finally:
             names = [f"{stage}/{asset.name}" for asset in assets]
+            names.extend(
+                (
+                    f"{stage}/existing-prometheus.yml",
+                    f"{stage}/merged-prometheus.yml",
+                )
+            )
             cleanup = "set -e; rm -f -- " + " ".join(names) + f"; rmdir {stage}"
             run(
                 ["ssh", "-o", "BatchMode=yes", args.pve_host, "bash", "-se"],

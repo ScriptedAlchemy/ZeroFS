@@ -47,6 +47,7 @@ assets=(
   zerofs-dashboard.yml
   zerofs-overview.json
   zerofs-prometheus-default
+  merge-prometheus-config.py
 )
 if [[ $dry_run == false ]]; then
   [[ $EUID -eq 0 ]] || { echo "host installation requires root" >&2; exit 1; }
@@ -212,8 +213,14 @@ elif pct exec "$ctid" -- grep -Eq '^[[:space:]]*scrape_config_files:' /etc/prome
     false
   }
 else
-  run pct exec "$ctid" -- sh -c \
-    "printf '\\nscrape_config_files:\\n  - /etc/prometheus/scrape.d/*.yml\\n' >> /etc/prometheus/prometheus.yml"
+  existing_config="$stage/existing-prometheus.yml"
+  merged_config="$stage/merged-prometheus.yml"
+  run pct pull "$ctid" /etc/prometheus/prometheus.yml "$existing_config"
+  run python3 "$stage/merge-prometheus-config.py" \
+    --existing "$existing_config" \
+    --job "$stage/zerofs-scrape.yml" \
+    --output "$merged_config"
+  run pct push "$ctid" "$merged_config" /etc/prometheus/prometheus.yml --perms 0644
 fi
 
 run pct push "$ctid" "$stage/zerofs-scrape.yml" /etc/prometheus/scrape.d/zerofs-prod.yml --perms 0644

@@ -11,6 +11,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).parents[1]
 INSTALLER = ROOT / "monitoring" / "install.py"
+PROMETHEUS_MERGER = ROOT / "monitoring" / "merge-prometheus-config.py"
 SPEC = importlib.util.spec_from_file_location("zerofs_monitoring_install", INSTALLER)
 assert SPEC is not None and SPEC.loader is not None
 monitoring = importlib.util.module_from_spec(SPEC)
@@ -92,6 +93,78 @@ class MonitoringInputTests(unittest.TestCase):
 
 
 class MonitoringAssetTests(unittest.TestCase):
+    def test_existing_prometheus_config_is_augmented_without_fragment_includes(
+        self,
+    ) -> None:
+        existing = """\
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: [localhost:9090]
+  - job_name: node
+    static_configs:
+      - targets: [localhost:9100]
+"""
+        zerofs_job = """\
+- job_name: "zerofs-prod"
+  metrics_path: "/metrics"
+  static_configs:
+    - targets: ["10.10.10.55:9567"]
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            existing_path = root / "prometheus.yml"
+            job_path = root / "zerofs-prod.yml"
+            output_path = root / "combined.yml"
+            second_output_path = root / "combined-again.yml"
+            existing_path.write_text(existing)
+            job_path.write_text(zerofs_job)
+
+            result = subprocess.run(
+                [
+                    "python3",
+                    str(PROMETHEUS_MERGER),
+                    "--existing",
+                    str(existing_path),
+                    "--job",
+                    str(job_path),
+                    "--output",
+                    str(output_path),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            combined = output_path.read_text()
+            self.assertIn("job_name: prometheus", combined)
+            self.assertIn("job_name: node", combined)
+            self.assertEqual(combined.count('job_name: "zerofs-prod"'), 1)
+            self.assertNotIn("scrape_config_files", combined)
+            self.assertIn('    - targets: ["10.10.10.55:9567"]', combined)
+
+            second_result = subprocess.run(
+                [
+                    "python3",
+                    str(PROMETHEUS_MERGER),
+                    "--existing",
+                    str(output_path),
+                    "--job",
+                    str(job_path),
+                    "--output",
+                    str(second_output_path),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(second_result.returncode, 0, second_result.stderr)
+            self.assertEqual(second_output_path.read_text(), combined)
+
     def test_host_installer_health_checks_grafana_on_validated_private_ip(
         self,
     ) -> None:
