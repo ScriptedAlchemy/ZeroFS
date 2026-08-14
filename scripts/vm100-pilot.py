@@ -22,6 +22,7 @@ from scripts.vm100_pilot.migration import StripedMigrator  # noqa: E402
 from scripts.vm100_pilot.performance_matrix import PerformanceMatrixRunner  # noqa: E402
 from scripts.vm100_pilot.profile import ProfileRunner  # noqa: E402
 from scripts.vm100_pilot.raw_sftp import RawSftpRunner  # noqa: E402
+from scripts.vm100_pilot.real_world_matrix import RealWorldMatrixRunner  # noqa: E402
 from scripts.vm100_pilot.reset import FreshResetter  # noqa: E402
 from scripts.vm100_pilot.runner import Runner  # noqa: E402
 from scripts.vm100_pilot.workloads import WorkloadRunner  # noqa: E402
@@ -99,6 +100,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=_positive,
         help="logical MiB written by each cell (default: full 256, quick 32)",
     )
+    real_world = subcommands.add_parser(
+        "real-world-matrix",
+        help="run file-shape, allocation, data-pattern, and durability scenarios",
+    )
+    real_world.add_argument(
+        "--quick",
+        action="store_true",
+        help="run the bounded representative suite without 1 GiB cells",
+    )
     iterate = subcommands.add_parser(
         "iterate", help="deploy, benchmark, run workloads, and run raw SFTP"
     )
@@ -159,6 +169,7 @@ def dispatch(args: argparse.Namespace, config: PilotConfig, runner: Runner) -> N
     workloads = WorkloadRunner(config, runner, lifecycle)
     raw = RawSftpRunner(config, runner, lifecycle)
     matrix = PerformanceMatrixRunner(config, runner, lifecycle)
+    real_world = RealWorldMatrixRunner(config, runner, lifecycle)
     profile = ProfileRunner(config, runner, lifecycle, benchmark)
     migration = StripedMigrator(config, runner, lifecycle)
     resetter = FreshResetter(config, runner, lifecycle)
@@ -210,6 +221,8 @@ def dispatch(args: argparse.Namespace, config: PilotConfig, runner: Runner) -> N
         if total_mib is None:
             total_mib = 32 if args.quick else 256
         _emit(matrix.run(total_mib=total_mib, quick=args.quick))
+    elif args.command == "real-world-matrix":
+        _emit(real_world.run(quick=args.quick))
     elif args.command == "iterate":
         if args.skip_build:
             deployed = None
