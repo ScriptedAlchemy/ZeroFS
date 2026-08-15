@@ -28,6 +28,7 @@ libc = "0.2"
 tokio = { version = "1.52", features = ["rt", "net", "io-util", "time"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 socket2 = { version = "0.6", features = ["all"] }
+tokio-tungstenite = { version = "0.26.2", default-features = false, features = ["connect", "handshake"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 gloo-timers = { version = "0.3", features = ["futures"] }

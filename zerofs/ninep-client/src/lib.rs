@@ -54,6 +54,8 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 mod linux;
+#[cfg(not(target_arch = "wasm32"))]
+mod native_web_transport;
 mod runtime;
 #[cfg(target_arch = "wasm32")]
 mod web_transport;
@@ -247,8 +249,8 @@ pub enum Target {
     TcpHost(String),
     #[cfg(not(target_arch = "wasm32"))]
     Unix(PathBuf),
-    /// A browser WebSocket carrying one complete 9P frame per binary message.
-    #[cfg(target_arch = "wasm32")]
+    /// A WebSocket carrying one complete 9P frame per binary message. Native
+    /// clients accept private `ws://`; browsers also support `wss://`.
     WebSocket(String),
 }
 
@@ -323,6 +325,12 @@ impl std::str::FromStr for Target {
 
         #[cfg(not(target_arch = "wasm32"))]
         {
+            if spec.starts_with("ws://") {
+                return Ok(Self::WebSocket(spec.into()));
+            }
+            if spec.starts_with("wss://") {
+                return Err("native clients require a private ws:// target".into());
+            }
             if let Some(path) = spec.strip_prefix("unix:") {
                 return Ok(Self::Unix(path.strip_prefix("//").unwrap_or(path).into()));
             }
@@ -351,6 +359,10 @@ mod target_parse_tests {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let cases = [
+                (
+                    "ws://node-a:8080/ws/9p",
+                    r#"WebSocket("ws://node-a:8080/ws/9p")"#,
+                ),
                 ("unix:///run/z.sock", r#"Unix("/run/z.sock")"#),
                 ("./z.sock", r#"Unix("./z.sock")"#),
                 ("tcp://127.0.0.1:6000", "Tcp(127.0.0.1:6000)"),
@@ -369,6 +381,7 @@ mod target_parse_tests {
                 ),
                 r#"[TcpHost("retired.invalid:5564"), TcpHost("leader.example:6000")]"#
             );
+            assert!("wss://node-a/9p".parse::<Target>().is_err());
         }
 
         #[cfg(target_arch = "wasm32")]
@@ -655,8 +668,7 @@ impl NinePClient {
             .map_err(|e| std::io::Error::other(e.to_string()))
     }
 
-    /// Connect to 9P over a browser WebSocket.
-    #[cfg(target_arch = "wasm32")]
+    /// Connect to 9P over a WebSocket.
     pub async fn connect_websocket(url: &str, requested_msize: u32) -> ClientResult<Arc<Self>> {
         Self::connect(vec![Target::WebSocket(url.to_string())], requested_msize).await
     }
@@ -736,6 +748,10 @@ impl NinePClient {
             #[cfg(target_arch = "wasm32")]
             DialedTransport::WebSocket(io) => {
                 web_transport::spawn(io, writer_rx, Arc::clone(&conn), reconnect_notify);
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            DialedTransport::WebSocket(io) => {
+                native_web_transport::spawn(io, writer_rx, Arc::clone(&conn), reconnect_notify);
             }
         }
 
@@ -2742,6 +2758,8 @@ enum DialedTransport {
     },
     #[cfg(target_arch = "wasm32")]
     WebSocket(web_transport::WebSocketIo),
+    #[cfg(not(target_arch = "wasm32"))]
+    WebSocket(native_web_transport::WebSocketIo),
 }
 
 /// Open a connection to the target. Native sockets are byte streams and are
@@ -2781,6 +2799,10 @@ async fn dial(target: &Target) -> ClientResult<DialedTransport> {
         Target::WebSocket(url) => web_transport::connect(url)
             .await
             .map(DialedTransport::WebSocket),
+        #[cfg(not(target_arch = "wasm32"))]
+        Target::WebSocket(url) => native_web_transport::connect(url)
+            .await
+            .map(DialedTransport::WebSocket),
     }
 }
 
@@ -2802,8 +2824,10 @@ fn configure_tcp(stream: TcpStream) -> ClientResult<DialedTransport> {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod target_dial_tests {
     use super::*;
+    use futures::{SinkExt, StreamExt};
     use tokio::io::AsyncReadExt;
     use tokio::net::TcpListener;
+    use tokio_tungstenite::tungstenite::Message as WebSocketMessage;
 
     async fn recv_message(stream: &mut TcpStream) -> P9Message {
         let mut size = [0u8; P9_SIZE_FIELD_LEN];
@@ -2824,6 +2848,64 @@ mod target_dial_tests {
             .write_all(&P9Message::new(tag, body).to_bytes().unwrap())
             .await
             .unwrap();
+    }
+
+    async fn websocket_exchange(
+        socket: &mut tokio_tungstenite::WebSocketStream<TcpStream>,
+        response: impl FnOnce(P9Message) -> P9Message,
+    ) {
+        let frame = match socket.next().await.unwrap().unwrap() {
+            WebSocketMessage::Binary(frame) => frame,
+            other => panic!("expected a binary 9P frame, got {other:?}"),
+        };
+        let request = P9Message::from_bytes((&frame, 0)).unwrap().1;
+        socket
+            .send(WebSocketMessage::Binary(
+                response(request).to_bytes().unwrap().into(),
+            ))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_websocket_negotiates_private_zerofs_dialect() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let url = format!("ws://{}/ws/9p", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            websocket_exchange(&mut socket, |request| {
+                assert!(matches!(request.body, Message::Tversion(_)));
+                P9Message::new(
+                    request.tag,
+                    Message::Rversion(Rversion {
+                        msize: 64 * 1024,
+                        version: P9String::new(VERSION_9P2000L_ZEROFS.to_vec()),
+                    }),
+                )
+            })
+            .await;
+            websocket_exchange(&mut socket, |request| {
+                assert!(matches!(request.body, Message::Tgetlineage(_)));
+                P9Message::new(
+                    request.tag,
+                    Message::Rgetlineage(Rgetlineage {
+                        token: 7,
+                        writer_epoch: 11,
+                    }),
+                )
+            })
+            .await;
+        });
+
+        let client = NinePClient::connect_websocket(&url, 64 * 1024)
+            .await
+            .unwrap();
+        let stats = client.traffic_stats();
+        assert!(stats.bytes_sent > 0);
+        assert!(stats.bytes_received > 0);
+        assert_eq!(stats.operations, 2);
+        server.await.unwrap();
     }
 
     #[tokio::test]
