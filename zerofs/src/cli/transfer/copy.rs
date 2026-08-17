@@ -143,22 +143,22 @@ async fn stream_upload(
             bail!("upload cancelled");
         }
         let wanted = (planned.size - offset).min(chunk_size as u64) as usize;
-        let read = local
-            .read(&mut buffer[..wanted])
-            .await
-            .with_context(|| format!("read local source {}", planned.source.display()))?;
-        if read == 0 {
-            bail!(
-                "local source changed while uploading: {}",
-                planned.source.display()
-            );
+        if let Err(error) = local.read_exact(&mut buffer[..wanted]).await {
+            if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                bail!(
+                    "local source changed while uploading: {}",
+                    planned.source.display()
+                );
+            }
+            return Err(error)
+                .with_context(|| format!("read local source {}", planned.source.display()));
         }
         remote
-            .write_at(offset, &buffer[..read])
+            .write_at(offset, &buffer[..wanted])
             .await
             .with_context(|| format!("write remote destination at offset {offset}"))?;
-        offset += read as u64;
-        progress.advance(read as u64);
+        offset += wanted as u64;
+        progress.advance(wanted as u64);
     }
     let mut extra = [0u8; 1];
     if local

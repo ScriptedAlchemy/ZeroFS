@@ -15,10 +15,22 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
-use zerofs_client::{Client, FileType, ZeroFsError};
+use zerofs_client::{Client, ConnectOptions, FileType, ZeroFsError};
 
 const DELETE_CONCURRENCY: usize = 8;
 const CLIENT_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+const TRANSFER_MSIZE: u32 = 9 * 1024 * 1024;
+
+async fn connect_transfer_client(target: &str) -> std::result::Result<Arc<Client>, ZeroFsError> {
+    Client::connect_with(
+        target,
+        ConnectOptions {
+            msize: TRANSFER_MSIZE,
+            ..ConnectOptions::default()
+        },
+    )
+    .await
+}
 
 pub(crate) async fn run_upload(
     target: &str,
@@ -32,7 +44,7 @@ pub(crate) async fn run_upload(
     let plan = tokio::task::spawn_blocking(move || scan_local(&source))
         .await
         .context("local transfer scan task failed")??;
-    let client = Client::connect(target)
+    let client = connect_transfer_client(target)
         .await
         .with_context(|| format!("connect to 9P target {target}"))?;
     let progress = Progress::new("upload", plan.total_bytes, plan.files.len());
@@ -59,7 +71,7 @@ pub(crate) async fn run_download(
     if jobs == 0 {
         bail!("download jobs must be at least 1");
     }
-    let client = Client::connect(target)
+    let client = connect_transfer_client(target)
         .await
         .with_context(|| format!("connect to 9P target {target}"))?;
     let plan = match scan_remote(&client, &source).await {
@@ -406,7 +418,10 @@ fn file_destination(root: &Path, file: &plan::PlannedFile) -> PathBuf {
 mod tests {
     use super::plan::{scan_local, scan_remote};
     use super::progress::{DeleteProgress, Progress};
-    use super::{close_client, execute_delete, execute_download, execute_upload};
+    use super::{
+        TRANSFER_MSIZE, close_client, connect_transfer_client, execute_delete, execute_download,
+        execute_upload,
+    };
     use crate::fs::ZeroFS;
     use crate::ninep::NinePServer;
     use std::fs;
@@ -426,12 +441,21 @@ mod tests {
         tokio::spawn(async move { server.start(server_shutdown).await.unwrap() });
         let target = format!("unix:{}", socket.display());
         for _ in 0..100 {
-            if let Ok(client) = Client::connect(&target).await {
+            if let Ok(client) = connect_transfer_client(&target).await {
                 return (client, shutdown, temp);
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         panic!("test 9P client did not connect");
+    }
+
+    #[tokio::test]
+    async fn transfer_client_negotiates_nine_mibibyte_messages() {
+        let (client, shutdown, _temp) = remote_client().await;
+
+        assert_eq!(client.capabilities().msize, TRANSFER_MSIZE);
+        close_client(&client).await.unwrap();
+        shutdown.cancel();
     }
 
     async fn quiesced_fids(client: &Client) -> usize {
