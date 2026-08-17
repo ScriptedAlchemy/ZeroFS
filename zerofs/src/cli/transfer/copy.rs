@@ -142,7 +142,7 @@ async fn stream_upload(
         if cancellation.is_cancelled() {
             bail!("upload cancelled");
         }
-        let wanted = usize::try_from((planned.size - offset).min(chunk_size as u64)).unwrap();
+        let wanted = (planned.size - offset).min(chunk_size as u64) as usize;
         let read = local
             .read(&mut buffer[..wanted])
             .await

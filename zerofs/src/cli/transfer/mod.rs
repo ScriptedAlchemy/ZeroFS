@@ -5,6 +5,7 @@ mod progress;
 use self::copy::{download_file, upload_file};
 use self::plan::{TransferPlan, scan_local, scan_remote};
 use self::progress::{DeleteProgress, Progress};
+use crate::cli::attach_cleanup_errors;
 use anyhow::{Context, Result, bail};
 use futures::StreamExt;
 use std::future::Future;
@@ -12,10 +13,12 @@ use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use zerofs_client::{Client, FileType, ZeroFsError};
 
 const DELETE_CONCURRENCY: usize = 8;
+const CLIENT_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(crate) async fn run_upload(
     target: &str,
@@ -26,21 +29,14 @@ pub(crate) async fn run_upload(
     if jobs == 0 {
         bail!("upload jobs must be at least 1");
     }
-    let plan_source = source.clone();
-    let plan = tokio::task::spawn_blocking(move || scan_local(&plan_source))
+    let plan = tokio::task::spawn_blocking(move || scan_local(&source))
         .await
         .context("local transfer scan task failed")??;
     let client = Client::connect(target)
         .await
         .with_context(|| format!("connect to 9P target {target}"))?;
     let progress = Progress::new("upload", plan.total_bytes, plan.files.len());
-    let cancellation = CancellationToken::new();
-    let signal_cancellation = cancellation.clone();
-    let signal = tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            signal_cancellation.cancel();
-        }
-    });
+    let (cancellation, signal) = cancellation_on_ctrl_c();
     let result = execute_upload(
         Arc::clone(&client),
         plan,
@@ -51,8 +47,7 @@ pub(crate) async fn run_upload(
     )
     .await;
     signal.abort();
-    client.close().await;
-    result
+    finish_client(&client, result).await
 }
 
 pub(crate) async fn run_download(
@@ -67,15 +62,12 @@ pub(crate) async fn run_download(
     let client = Client::connect(target)
         .await
         .with_context(|| format!("connect to 9P target {target}"))?;
-    let plan = scan_remote(&client, &source).await?;
+    let plan = match scan_remote(&client, &source).await {
+        Ok(plan) => plan,
+        Err(error) => return finish_client(&client, Err(error)).await,
+    };
     let progress = Progress::new("download", plan.total_bytes, plan.files.len());
-    let cancellation = CancellationToken::new();
-    let signal_cancellation = cancellation.clone();
-    let signal = tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            signal_cancellation.cancel();
-        }
-    });
+    let (cancellation, signal) = cancellation_on_ctrl_c();
     let result = execute_download(
         Arc::clone(&client),
         plan,
@@ -86,21 +78,14 @@ pub(crate) async fn run_download(
     )
     .await;
     signal.abort();
-    client.close().await;
-    result
+    finish_client(&client, result).await
 }
 
 pub(crate) async fn run_delete(target: &str, path: PathBuf) -> Result<()> {
     let client = Client::connect(target)
         .await
         .with_context(|| format!("connect to 9P target {target}"))?;
-    let cancellation = CancellationToken::new();
-    let signal_cancellation = cancellation.clone();
-    let signal = tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            signal_cancellation.cancel();
-        }
-    });
+    let (cancellation, signal) = cancellation_on_ctrl_c();
     let result = execute_delete(
         Arc::clone(&client),
         &path,
@@ -109,8 +94,40 @@ pub(crate) async fn run_delete(target: &str, path: PathBuf) -> Result<()> {
     )
     .await;
     signal.abort();
+    finish_client(&client, result).await.map(|_| ())
+}
+
+async fn finish_client<T>(client: &Client, result: Result<T>) -> Result<T> {
+    let cleanup = close_client(client).await.err();
+    match (result, cleanup) {
+        (Ok(value), None) => Ok(value),
+        (Ok(_), Some(cleanup)) => Err(cleanup),
+        (Err(primary), None) => Err(primary),
+        (Err(primary), Some(cleanup)) => Err(attach_cleanup_errors(primary, vec![cleanup])),
+    }
+}
+
+fn cancellation_on_ctrl_c() -> (CancellationToken, tokio::task::JoinHandle<()>) {
+    let cancellation = CancellationToken::new();
+    let signal_cancellation = cancellation.clone();
+    let signal = tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            signal_cancellation.cancel();
+        }
+    });
+    (cancellation, signal)
+}
+
+async fn close_client(client: &Client) -> Result<()> {
+    // `close` queues clunks; keep the short-lived CLI runtime alive for their replies.
     client.close().await;
-    result.map(|_| ())
+    tokio::time::timeout(CLIENT_CLOSE_TIMEOUT, async {
+        while client.outstanding_fids() != 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .context("timed out waiting for 9P client cleanup")
 }
 
 async fn execute_upload(
@@ -148,9 +165,10 @@ async fn execute_upload(
 
     let file_count = plan.files.len();
     let batch_cancellation = cancellation.child_token();
+    // Settle every active mutation instead of dropping in-flight writes on the first error.
     let results = futures::stream::iter(plan.files.into_iter().map(|file| {
         let client = Arc::clone(&client);
-        let target = destination.join(&file.relative);
+        let target = file_destination(destination, &file);
         let progress = progress.clone();
         let cancellation = batch_cancellation.clone();
         async move {
@@ -206,9 +224,10 @@ async fn execute_download(
     }
 
     let batch_cancellation = cancellation.child_token();
+    // Settle every active read before returning the first error.
     let results = futures::stream::iter(plan.files.into_iter().map(|file| {
         let client = Arc::clone(&client);
-        let target = destination.join(&file.relative);
+        let target = file_destination(destination, &file);
         let progress = progress.clone();
         let cancellation = batch_cancellation.clone();
         async move {
@@ -238,10 +257,17 @@ async fn execute_delete(
     progress: DeleteProgress,
     cancellation: CancellationToken,
 ) -> Result<u64> {
-    if !path
-        .components()
-        .any(|component| matches!(component, std::path::Component::Normal(_)))
-    {
+    let mut has_name = false;
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(_) => has_name = true,
+            std::path::Component::ParentDir => {
+                bail!("refusing to remove a path containing '..'")
+            }
+            _ => {}
+        }
+    }
+    if !has_name {
         bail!("refusing to remove the 9P attach root");
     }
     let result = async {
@@ -305,6 +331,7 @@ fn delete_directory_contents(
             .read_dir(&directory)
             .await
             .with_context(|| format!("read remote directory {}", directory.display()))?;
+        // Settle every active unlink before reporting the first failed entry.
         let results = futures::stream::iter(entries.into_iter().map(|entry| {
             let client = Arc::clone(&client);
             let child = directory.join(std::ffi::OsString::from_vec(entry.name_bytes));
@@ -372,11 +399,19 @@ async fn create_directory(client: &Client, path: &Path) -> Result<()> {
     }
 }
 
+fn file_destination(root: &Path, file: &plan::PlannedFile) -> PathBuf {
+    if file.relative.as_os_str().is_empty() {
+        root.to_path_buf()
+    } else {
+        root.join(&file.relative)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::plan::{scan_local, scan_remote};
     use super::progress::{DeleteProgress, Progress};
-    use super::{execute_delete, execute_download, execute_upload};
+    use super::{close_client, execute_delete, execute_download, execute_upload};
     use crate::fs::ZeroFS;
     use crate::ninep::NinePServer;
     use std::fs;
@@ -550,6 +585,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn single_file_transfers_use_the_exact_destination_path() {
+        let (client, _shutdown, local) = remote_client().await;
+        let source = local.path().join("source.bin");
+        fs::write(&source, b"payload").unwrap();
+        let upload_plan = scan_local(&source).unwrap();
+        execute_upload(
+            Arc::clone(&client),
+            upload_plan,
+            Path::new("/uploaded.bin"),
+            1,
+            Progress::new("upload", 7, 1),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(&client.read("/uploaded.bin").await.unwrap()[..], b"payload");
+
+        let download_plan = scan_remote(&client, Path::new("/uploaded.bin"))
+            .await
+            .unwrap();
+        let destination = local.path().join("destination.bin");
+
+        execute_download(
+            Arc::clone(&client),
+            download_plan,
+            &destination,
+            1,
+            Progress::new("download", 7, 1),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(fs::read(destination).unwrap(), b"payload");
+    }
+
+    #[tokio::test]
     async fn cancelled_download_preserves_the_existing_destination() {
         let (client, _shutdown, local) = remote_client().await;
         client.write("/source.bin", b"replacement").await.unwrap();
@@ -629,21 +701,34 @@ mod tests {
     #[tokio::test]
     async fn rm_refuses_the_attach_root() {
         let (client, _shutdown, _local) = remote_client().await;
+        client.create_dir_all("/nested", 0o755).await.unwrap();
         client.write("/keep.txt", b"keep").await.unwrap();
 
-        let error = execute_delete(
-            Arc::clone(&client),
-            Path::new("/"),
-            DeleteProgress::new(),
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap_err();
+        for root_alias in ["/", "/nested/.."] {
+            let error = execute_delete(
+                Arc::clone(&client),
+                Path::new(root_alias),
+                DeleteProgress::new(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
 
-        assert!(
-            error.to_string().contains("refusing to remove"),
-            "{error:#}"
-        );
+            assert!(
+                error.to_string().contains("refusing to remove"),
+                "{root_alias}: {error:#}"
+            );
+        }
         assert_eq!(&client.read("/keep.txt").await.unwrap()[..], b"keep");
+    }
+
+    #[tokio::test]
+    async fn cli_close_waits_for_all_fid_replies() {
+        let (client, _shutdown, _local) = remote_client().await;
+        client.write("/file.txt", b"payload").await.unwrap();
+
+        close_client(&client).await.unwrap();
+
+        assert_eq!(client.outstanding_fids(), 0);
     }
 }

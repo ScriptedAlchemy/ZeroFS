@@ -46,15 +46,7 @@ pub(super) fn scan_local(source: &Path) -> Result<TransferPlan> {
         total_bytes: 0,
     };
     scan_local_directory(source, source, &mut plan)?;
-    plan.directories.sort_by(|left, right| {
-        left.components()
-            .count()
-            .cmp(&right.components().count())
-            .then_with(|| left.cmp(right))
-    });
-    plan.files
-        .sort_by(|left, right| left.relative.cmp(&right.relative));
-    Ok(plan)
+    Ok(sort_plan(plan))
 }
 
 fn scan_local_directory(root: &Path, directory: &Path, plan: &mut TransferPlan) -> Result<()> {
@@ -161,6 +153,10 @@ async fn scan_remote_directory(client: &Client, root: &Path) -> Result<TransferP
         }
     }
 
+    Ok(sort_plan(plan))
+}
+
+fn sort_plan(mut plan: TransferPlan) -> TransferPlan {
     plan.directories.sort_by(|left, right| {
         left.components()
             .count()
@@ -169,7 +165,7 @@ async fn scan_remote_directory(client: &Client, root: &Path) -> Result<TransferP
     });
     plan.files
         .sort_by(|left, right| left.relative.cmp(&right.relative));
-    Ok(plan)
+    plan
 }
 
 #[cfg(test)]
