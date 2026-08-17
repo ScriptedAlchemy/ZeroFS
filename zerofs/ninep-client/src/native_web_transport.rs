@@ -1,6 +1,5 @@
 use crate::runtime;
 use crate::{ClientError, ClientResult, Conn};
-use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -69,7 +68,7 @@ pub(super) fn spawn(
                 next = reader.next() => next,
             };
             match next {
-                Some(Ok(Message::Binary(frame))) => conn.deliver(Bytes::from(frame)),
+                Some(Ok(Message::Binary(frame))) => conn.deliver(frame),
                 Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
                 Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
                 Some(Ok(_)) => {

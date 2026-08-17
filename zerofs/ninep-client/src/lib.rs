@@ -751,7 +751,7 @@ impl NinePClient {
             }
             #[cfg(not(target_arch = "wasm32"))]
             DialedTransport::WebSocket(io) => {
-                native_web_transport::spawn(io, writer_rx, Arc::clone(&conn), reconnect_notify);
+                native_web_transport::spawn(*io, writer_rx, Arc::clone(&conn), reconnect_notify);
             }
         }
 
@@ -2759,7 +2759,7 @@ enum DialedTransport {
     #[cfg(target_arch = "wasm32")]
     WebSocket(web_transport::WebSocketIo),
     #[cfg(not(target_arch = "wasm32"))]
-    WebSocket(native_web_transport::WebSocketIo),
+    WebSocket(Box<native_web_transport::WebSocketIo>),
 }
 
 /// Open a connection to the target. Native sockets are byte streams and are
@@ -2802,6 +2802,7 @@ async fn dial(target: &Target) -> ClientResult<DialedTransport> {
         #[cfg(not(target_arch = "wasm32"))]
         Target::WebSocket(url) => native_web_transport::connect(url)
             .await
+            .map(Box::new)
             .map(DialedTransport::WebSocket),
     }
 }
