@@ -88,6 +88,40 @@ $EDITOR zerofs.toml    # Set S3 credentials
 zerofs run -c zerofs.toml
 ```
 
+### Direct file transfers (no mount)
+
+The `zerofs` binary can copy files and directory trees directly through an
+existing 9P endpoint:
+
+```bash
+# Upload a file or the contents of a directory tree
+zerofs upload 127.0.0.1:5564 ./Audiobooks /Audiobooks
+
+# Download a file or directory tree
+zerofs download 127.0.0.1:5564 /Audiobooks ./Audiobooks
+
+# Recursively remove a file or directory tree (permanent; no prompt)
+zerofs rm 127.0.0.1:5564 /old-audiobooks
+```
+
+Targets may be TCP (`host:port` or `tcp://host:port`), a Unix socket
+(`unix:/path/to/socket`), or the Web UI's private native WebSocket endpoint
+(`ws://host:8080/ws/9p`). Native clients currently accept `ws://`, not `wss://`.
+No filesystem mount or server configuration change is required.
+
+Uploads and downloads use 8 concurrent files by default; pass `--jobs N` to
+change that limit. Each file is streamed in negotiated 9P-sized chunks and the
+CLI shows aggregate bytes, rate, ETA, completed-file count, and the current
+path. A hidden sibling temporary file is atomically renamed only after the
+individual file is complete, so completed files appear one by one while the
+rest of a large batch continues. Directory copies preserve empty directories
+and existing unrelated entries at the destination.
+
+`zerofs rm` follows the Web UI's recursive delete model: it lists each directory
+once and removes up to 8 sibling entries concurrently. It refuses to remove the
+9P attach root and reports any failed deletion instead of silently claiming
+success.
+
 ## Native Linux kernel client
 
 [`kernel/`](kernel/) contains an out-of-tree VFS module that speaks the private
