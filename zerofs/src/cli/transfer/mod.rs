@@ -2,15 +2,20 @@ mod copy;
 mod plan;
 mod progress;
 
-use self::copy::upload_file;
-use self::plan::{TransferPlan, scan_local};
-use self::progress::Progress;
+use self::copy::{download_file, upload_file};
+use self::plan::{TransferPlan, scan_local, scan_remote};
+use self::progress::{DeleteProgress, Progress};
 use anyhow::{Context, Result, bail};
 use futures::StreamExt;
+use std::future::Future;
+use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
-use zerofs_client::{Client, ZeroFsError};
+use zerofs_client::{Client, FileType, ZeroFsError};
+
+const DELETE_CONCURRENCY: usize = 8;
 
 pub(crate) async fn run_upload(
     target: &str,
@@ -50,6 +55,64 @@ pub(crate) async fn run_upload(
     result
 }
 
+pub(crate) async fn run_download(
+    target: &str,
+    source: PathBuf,
+    destination: PathBuf,
+    jobs: usize,
+) -> Result<()> {
+    if jobs == 0 {
+        bail!("download jobs must be at least 1");
+    }
+    let client = Client::connect(target)
+        .await
+        .with_context(|| format!("connect to 9P target {target}"))?;
+    let plan = scan_remote(&client, &source).await?;
+    let progress = Progress::new("download", plan.total_bytes, plan.files.len());
+    let cancellation = CancellationToken::new();
+    let signal_cancellation = cancellation.clone();
+    let signal = tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            signal_cancellation.cancel();
+        }
+    });
+    let result = execute_download(
+        Arc::clone(&client),
+        plan,
+        &destination,
+        jobs,
+        progress,
+        cancellation,
+    )
+    .await;
+    signal.abort();
+    client.close().await;
+    result
+}
+
+pub(crate) async fn run_delete(target: &str, path: PathBuf) -> Result<()> {
+    let client = Client::connect(target)
+        .await
+        .with_context(|| format!("connect to 9P target {target}"))?;
+    let cancellation = CancellationToken::new();
+    let signal_cancellation = cancellation.clone();
+    let signal = tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            signal_cancellation.cancel();
+        }
+    });
+    let result = execute_delete(
+        Arc::clone(&client),
+        &path,
+        DeleteProgress::new(),
+        cancellation,
+    )
+    .await;
+    signal.abort();
+    client.close().await;
+    result.map(|_| ())
+}
+
 async fn execute_upload(
     client: Arc<Client>,
     plan: TransferPlan,
@@ -58,6 +121,9 @@ async fn execute_upload(
     progress: Progress,
     cancellation: CancellationToken,
 ) -> Result<()> {
+    if jobs == 0 {
+        bail!("upload jobs must be at least 1");
+    }
     if plan.source_is_dir {
         client
             .create_dir_all(destination, 0o755)
@@ -112,6 +178,180 @@ async fn execute_upload(
     Ok(())
 }
 
+async fn execute_download(
+    client: Arc<Client>,
+    plan: TransferPlan,
+    destination: &Path,
+    jobs: usize,
+    progress: Progress,
+    cancellation: CancellationToken,
+) -> Result<()> {
+    if jobs == 0 {
+        bail!("download jobs must be at least 1");
+    }
+    if plan.source_is_dir {
+        for relative in &plan.directories {
+            if cancellation.is_cancelled() {
+                bail!("download cancelled");
+            }
+            let directory = destination.join(relative);
+            tokio::fs::create_dir_all(&directory)
+                .await
+                .with_context(|| format!("create local directory {}", directory.display()))?;
+        }
+    } else if let Some(parent) = destination.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("create local parent directory {}", parent.display()))?;
+    }
+
+    let batch_cancellation = cancellation.child_token();
+    let results = futures::stream::iter(plan.files.into_iter().map(|file| {
+        let client = Arc::clone(&client);
+        let target = destination.join(&file.relative);
+        let progress = progress.clone();
+        let cancellation = batch_cancellation.clone();
+        async move {
+            let result = download_file(client, file, target, progress, cancellation.clone()).await;
+            if result.is_err() {
+                cancellation.cancel();
+            }
+            result
+        }
+    }))
+    .buffer_unordered(jobs)
+    .collect::<Vec<_>>()
+    .await;
+    if let Some(error) = results.into_iter().find_map(Result::err) {
+        return Err(error);
+    }
+    if cancellation.is_cancelled() {
+        bail!("download cancelled");
+    }
+    progress.finish();
+    Ok(())
+}
+
+async fn execute_delete(
+    client: Arc<Client>,
+    path: &Path,
+    progress: DeleteProgress,
+    cancellation: CancellationToken,
+) -> Result<u64> {
+    if !path
+        .components()
+        .any(|component| matches!(component, std::path::Component::Normal(_)))
+    {
+        bail!("refusing to remove the 9P attach root");
+    }
+    let result = async {
+        if cancellation.is_cancelled() {
+            bail!("delete cancelled");
+        }
+        let metadata = client
+            .stat(path)
+            .await
+            .with_context(|| format!("inspect remote path {}", path.display()))?;
+        let deleted = if metadata.file_type == FileType::Dir {
+            let children = delete_directory_contents(
+                Arc::clone(&client),
+                path.to_path_buf(),
+                progress.clone(),
+                cancellation.clone(),
+            )
+            .await?;
+            if cancellation.is_cancelled() {
+                bail!("delete cancelled");
+            }
+            client
+                .remove_dir(path)
+                .await
+                .with_context(|| format!("remove remote directory {}", path.display()))?;
+            progress.deleted(path);
+            children + 1
+        } else {
+            client
+                .remove_file(path)
+                .await
+                .with_context(|| format!("remove remote file {}", path.display()))?;
+            progress.deleted(path);
+            1
+        };
+        Ok(deleted)
+    }
+    .await;
+    match result {
+        Ok(deleted) => {
+            progress.finish();
+            Ok(deleted)
+        }
+        Err(error) => {
+            progress.abandon();
+            Err(error)
+        }
+    }
+}
+
+type DeleteFuture = Pin<Box<dyn Future<Output = Result<u64>> + Send>>;
+
+fn delete_directory_contents(
+    client: Arc<Client>,
+    directory: PathBuf,
+    progress: DeleteProgress,
+    cancellation: CancellationToken,
+) -> DeleteFuture {
+    Box::pin(async move {
+        let entries = client
+            .read_dir(&directory)
+            .await
+            .with_context(|| format!("read remote directory {}", directory.display()))?;
+        let results = futures::stream::iter(entries.into_iter().map(|entry| {
+            let client = Arc::clone(&client);
+            let child = directory.join(std::ffi::OsString::from_vec(entry.name_bytes));
+            let progress = progress.clone();
+            let cancellation = cancellation.clone();
+            async move {
+                if cancellation.is_cancelled() {
+                    bail!("delete cancelled");
+                }
+                let descendants = if entry.file_type == FileType::Dir {
+                    let descendants = delete_directory_contents(
+                        Arc::clone(&client),
+                        child.clone(),
+                        progress.clone(),
+                        cancellation.clone(),
+                    )
+                    .await?;
+                    if cancellation.is_cancelled() {
+                        bail!("delete cancelled");
+                    }
+                    client
+                        .remove_dir(&child)
+                        .await
+                        .with_context(|| format!("remove remote directory {}", child.display()))?;
+                    descendants
+                } else {
+                    client
+                        .remove_file(&child)
+                        .await
+                        .with_context(|| format!("remove remote file {}", child.display()))?;
+                    0
+                };
+                progress.deleted(&child);
+                Ok(descendants + 1)
+            }
+        }))
+        .buffer_unordered(DELETE_CONCURRENCY)
+        .collect::<Vec<Result<u64>>>()
+        .await;
+        results.into_iter().try_fold(0u64, |total, result| {
+            total
+                .checked_add(result?)
+                .context("deleted entry count exceeds u64")
+        })
+    })
+}
+
 async fn create_directory(client: &Client, path: &Path) -> Result<()> {
     match client.create_dir(path, 0o755).await {
         Ok(_) => Ok(()),
@@ -134,9 +374,9 @@ async fn create_directory(client: &Client, path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::execute_upload;
-    use super::plan::scan_local;
-    use super::progress::Progress;
+    use super::plan::{scan_local, scan_remote};
+    use super::progress::{DeleteProgress, Progress};
+    use super::{execute_delete, execute_download, execute_upload};
     use crate::fs::ZeroFS;
     use crate::ninep::NinePServer;
     use std::fs;
@@ -259,5 +499,151 @@ mod tests {
             b"complete"
         );
         assert!(client.metadata("/dest/z-fails.txt").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn download_streams_nested_files_and_preserves_unrelated_entries() {
+        let (client, _shutdown, local) = remote_client().await;
+        client
+            .create_dir_all("/source/nested/empty", 0o755)
+            .await
+            .unwrap();
+        let chunk = client.capabilities().max_read_chunk as usize;
+        let payload: Vec<u8> = (0..(chunk * 3 + 17)).map(|i| (i % 239) as u8).collect();
+        client
+            .write("/source/nested/big.bin", &payload)
+            .await
+            .unwrap();
+        let plan = scan_remote(&client, Path::new("/source")).await.unwrap();
+        let destination = local.path().join("download");
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(destination.join("keep.txt"), b"keep").unwrap();
+        let baseline_fids = quiesced_fids(&client).await;
+
+        execute_download(
+            Arc::clone(&client),
+            plan,
+            &destination,
+            8,
+            Progress::new("download", payload.len() as u64, 1),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            fs::read(destination.join("nested/big.bin")).unwrap(),
+            payload
+        );
+        assert_eq!(fs::read(destination.join("keep.txt")).unwrap(), b"keep");
+        assert!(destination.join("nested/empty").is_dir());
+        assert!(
+            fs::read_dir(destination.join("nested"))
+                .unwrap()
+                .all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".zerofs-"))
+        );
+        assert_eq!(quiesced_fids(&client).await, baseline_fids);
+    }
+
+    #[tokio::test]
+    async fn cancelled_download_preserves_the_existing_destination() {
+        let (client, _shutdown, local) = remote_client().await;
+        client.write("/source.bin", b"replacement").await.unwrap();
+        let plan = scan_remote(&client, Path::new("/source.bin"))
+            .await
+            .unwrap();
+        let destination = local.path().join("destination.bin");
+        fs::write(&destination, b"original").unwrap();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        let error = execute_download(
+            Arc::clone(&client),
+            plan,
+            &destination,
+            1,
+            Progress::new("download", 11, 1),
+            cancellation,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("download cancelled"),
+            "{error:#}"
+        );
+        assert_eq!(fs::read(&destination).unwrap(), b"original");
+        assert!(fs::read_dir(local.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".zerofs-")
+        }));
+    }
+
+    #[tokio::test]
+    async fn rm_removes_files_and_browser_style_directory_trees() {
+        let (client, _shutdown, _local) = remote_client().await;
+        client
+            .create_dir_all("/remove/nested/empty", 0o755)
+            .await
+            .unwrap();
+        client.write("/remove/a.txt", b"a").await.unwrap();
+        client.write("/remove/nested/b.txt", b"b").await.unwrap();
+        client.write("/single.txt", b"single").await.unwrap();
+        client.write("/keep.txt", b"keep").await.unwrap();
+        let baseline_fids = quiesced_fids(&client).await;
+
+        let deleted = execute_delete(
+            Arc::clone(&client),
+            Path::new("/remove"),
+            DeleteProgress::new(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(deleted, 5);
+        assert!(client.stat("/remove").await.is_err());
+        assert_eq!(
+            execute_delete(
+                Arc::clone(&client),
+                Path::new("/single.txt"),
+                DeleteProgress::new(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        assert!(client.stat("/single.txt").await.is_err());
+        assert_eq!(&client.read("/keep.txt").await.unwrap()[..], b"keep");
+        assert_eq!(quiesced_fids(&client).await, baseline_fids);
+    }
+
+    #[tokio::test]
+    async fn rm_refuses_the_attach_root() {
+        let (client, _shutdown, _local) = remote_client().await;
+        client.write("/keep.txt", b"keep").await.unwrap();
+
+        let error = execute_delete(
+            Arc::clone(&client),
+            Path::new("/"),
+            DeleteProgress::new(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("refusing to remove"),
+            "{error:#}"
+        );
+        assert_eq!(&client.read("/keep.txt").await.unwrap()[..], b"keep");
     }
 }

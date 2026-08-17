@@ -39,6 +39,25 @@ pub enum Commands {
         #[arg(long, default_value_t = 8, value_parser = parse_transfer_jobs)]
         jobs: usize,
     },
+    /// Download a file or directory directly over ZeroFS 9P
+    Download {
+        /// 9P server address: host[:port], tcp://host:port, unix:/path, or ws:// URL
+        target: String,
+        /// File or directory in ZeroFS to download
+        source: PathBuf,
+        /// Exact local destination path
+        destination: PathBuf,
+        /// Number of files to transfer concurrently
+        #[arg(long, default_value_t = 8, value_parser = parse_transfer_jobs)]
+        jobs: usize,
+    },
+    /// Remove a file or directory tree directly over ZeroFS 9P
+    Rm {
+        /// 9P server address: host[:port], tcp://host:port, unix:/path, or ws:// URL
+        target: String,
+        /// File or directory tree in ZeroFS to remove
+        path: PathBuf,
+    },
     /// Generate a default configuration file
     Init {
         /// Output path for the config file, or "-" to write to stdout
@@ -388,5 +407,50 @@ mod tests {
         assert_eq!(source, PathBuf::from("./Audiobooks"));
         assert_eq!(destination, PathBuf::from("/Audiobooks"));
         assert_eq!(jobs, 4);
+    }
+
+    #[test]
+    fn download_command_parses_direct_transfer_arguments() {
+        let cli = Cli::try_parse_from([
+            "zerofs",
+            "download",
+            "tcp://server:5564",
+            "/Audiobooks",
+            "./Audiobooks",
+            "--jobs",
+            "3",
+        ])
+        .unwrap();
+
+        let Commands::Download {
+            target,
+            source,
+            destination,
+            jobs,
+        } = cli.command
+        else {
+            panic!("expected download command");
+        };
+        assert_eq!(target, "tcp://server:5564");
+        assert_eq!(source, PathBuf::from("/Audiobooks"));
+        assert_eq!(destination, PathBuf::from("./Audiobooks"));
+        assert_eq!(jobs, 3);
+    }
+
+    #[test]
+    fn rm_command_parses_recursive_remove_arguments() {
+        let cli = Cli::try_parse_from([
+            "zerofs",
+            "rm",
+            "unix:/run/zerofs/9p.sock",
+            "/old-audiobooks",
+        ])
+        .unwrap();
+
+        let Commands::Rm { target, path } = cli.command else {
+            panic!("expected rm command");
+        };
+        assert_eq!(target, "unix:/run/zerofs/9p.sock");
+        assert_eq!(path, PathBuf::from("/old-audiobooks"));
     }
 }

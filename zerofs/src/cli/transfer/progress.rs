@@ -81,6 +81,42 @@ impl Progress {
     }
 }
 
+#[derive(Clone)]
+pub(super) struct DeleteProgress {
+    bar: ProgressBar,
+}
+
+impl DeleteProgress {
+    pub(super) fn new() -> Self {
+        let bar = ProgressBar::new_spinner();
+        bar.set_style(
+            ProgressStyle::with_template("{prefix} {spinner} {pos} entries {msg}")
+                .expect("static delete progress template is valid"),
+        );
+        bar.set_prefix("delete");
+        Self { bar }
+    }
+
+    pub(super) fn deleted(&self, path: &Path) {
+        self.bar.inc(1);
+        self.bar.set_message(path.display().to_string());
+    }
+
+    pub(super) fn finish(&self) {
+        let deleted = self.bar.position();
+        let noun = if deleted == 1 { "entry" } else { "entries" };
+        self.bar
+            .finish_with_message(format!("{deleted} {noun} removed"));
+        if self.bar.is_hidden() {
+            eprintln!("delete complete: {deleted} {noun} removed");
+        }
+    }
+
+    pub(super) fn abandon(&self) {
+        self.bar.abandon_with_message("delete stopped");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::Progress;
