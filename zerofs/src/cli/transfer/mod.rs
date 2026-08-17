@@ -119,15 +119,10 @@ fn cancellation_on_ctrl_c() -> (CancellationToken, tokio::task::JoinHandle<()>) 
 }
 
 async fn close_client(client: &Client) -> Result<()> {
-    // `close` queues clunks; keep the short-lived CLI runtime alive for their replies.
     client.close().await;
-    tokio::time::timeout(CLIENT_CLOSE_TIMEOUT, async {
-        while client.outstanding_fids() != 0 {
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-    })
-    .await
-    .context("timed out waiting for 9P client cleanup")
+    tokio::time::timeout(CLIENT_CLOSE_TIMEOUT, client.wait_for_cleanup())
+        .await
+        .context("timed out waiting for 9P client cleanup")
 }
 
 async fn execute_upload(

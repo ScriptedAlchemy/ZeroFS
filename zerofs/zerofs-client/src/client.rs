@@ -167,6 +167,12 @@ impl Client {
         self.session.enqueue_clunk(self.session.root_fid);
     }
 
+    /// Wait until every fid cleanup queued before this call has received its
+    /// server reply. Handles dropped afterward are not included.
+    pub async fn wait_for_cleanup(&self) {
+        self.session.wait_for_cleanup().await;
+    }
+
     /// Read the entire file into memory. Returns [`Bytes`]: a whole file that
     /// fits in one round trip comes back with no copy.
     pub async fn read(&self, path: impl AsRef<Path>) -> Result<Bytes, ZeroFsError> {
