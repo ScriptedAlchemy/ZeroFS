@@ -15,6 +15,8 @@ pub mod nbd;
 pub mod otrace;
 pub mod password;
 pub mod server;
+#[cfg(test)]
+mod transfer;
 
 #[derive(Parser)]
 #[command(name = "zerofs")]
