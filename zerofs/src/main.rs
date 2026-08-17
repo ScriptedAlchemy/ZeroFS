@@ -76,6 +76,14 @@ async fn async_main() -> Result<()> {
     let cli = cli::Cli::parse_args();
 
     match cli.command {
+        cli::Commands::Upload {
+            target,
+            source,
+            destination,
+            jobs,
+        } => {
+            cli::transfer::run_upload(&target, source, destination, jobs).await?;
+        }
         cli::Commands::Init { path } => {
             if path.to_str() == Some("-") {
                 // Write the config to stdout so it can be piped or redirected, e.g.:
