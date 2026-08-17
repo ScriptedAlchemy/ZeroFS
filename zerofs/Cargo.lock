@@ -6547,6 +6547,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-stream",
+ "tokio-tungstenite 0.26.2",
  "tonic 0.14.5",
  "tonic-prost",
  "tonic-prost-build",
@@ -6559,7 +6560,6 @@ dependencies = [
 name = "zerofs-ffi"
 version = "0.2.0"
 dependencies = [
- "libc",
  "thiserror 2.0.19",
  "tokio",
  "uniffi",

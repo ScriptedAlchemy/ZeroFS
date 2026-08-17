@@ -276,13 +276,13 @@ async fn segment_reachable(gateway: &str) -> bool {
         return false;
     };
     match target {
-        ninep_client::Target::Unix(path) => tokio::net::UnixStream::connect(path).await.map(drop),
-        ninep_client::Target::Tcp(addr) => tokio::net::TcpStream::connect(addr).await.map(drop),
+        ninep_client::Target::Unix(path) => tokio::net::UnixStream::connect(path).await.is_ok(),
+        ninep_client::Target::Tcp(addr) => tokio::net::TcpStream::connect(addr).await.is_ok(),
         ninep_client::Target::TcpHost(endpoint) => {
-            tokio::net::TcpStream::connect(endpoint).await.map(drop)
+            tokio::net::TcpStream::connect(endpoint).await.is_ok()
         }
+        ninep_client::Target::WebSocket(url) => tokio_tungstenite::connect_async(url).await.is_ok(),
     }
-    .is_ok()
 }
 
 /// Classify a publish target without issuing a syscall that can hang on a
@@ -803,5 +803,31 @@ mod tests {
         // Both down, or no address at all, is unreachable.
         assert!(!gateway_reachable(&format!("{dead_addr},{dead_addr}")).await);
         assert!(!gateway_reachable("").await);
+    }
+
+    #[tokio::test]
+    async fn gateway_reachable_handles_websocket() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/ws/9p", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio_tungstenite::accept_async(stream).await.unwrap();
+        });
+
+        assert!(gateway_reachable(&url).await);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn gateway_reachable_requires_websocket_upgrade() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/ws/9p", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            drop(stream);
+        });
+
+        assert!(!gateway_reachable(&url).await);
+        server.await.unwrap();
     }
 }

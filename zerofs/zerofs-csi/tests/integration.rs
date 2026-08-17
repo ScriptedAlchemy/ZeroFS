@@ -1,5 +1,5 @@
 //! Integration tests against a real zerofs server: a `zerofs run` child with
-//! file:// storage and unix sockets in a temp dir, the real CSI services
+//! memory-backed storage and unix sockets in a temp dir, the real CSI services
 //! served over a unix socket, and a real 9P client verifying what the
 //! controller did to the gateway filesystem. No mocks.
 
@@ -55,8 +55,9 @@ fn zerofs_binary() -> PathBuf {
     candidate
 }
 
-/// A real zerofs server child process backed by file:// storage in a temp
-/// dir, exposing 9P and the admin RPC on unix sockets.
+/// A real zerofs server child process backed by the production in-memory store,
+/// exposing 9P and the admin RPC on unix sockets. These tests exercise CSI and
+/// 9P integration, not persistence or durability.
 struct TestServer {
     child: Child,
     dir: tempfile::TempDir,
@@ -95,7 +96,7 @@ dir = "{cache}"
 disk_size_gb = 1.0
 
 [storage]
-url = "file://{data}"
+url = "memory:///csi-integration-test"
 encryption_password = "csi-integration-test"
 
 [servers]
@@ -110,7 +111,6 @@ unix_socket = "{rpc}"
 enabled = false
 "#,
         cache = dir.path().join("cache").display(),
-        data = dir.path().join("data").display(),
         ninep = ninep_sock.display(),
         rpc = rpc_sock.display(),
     );
