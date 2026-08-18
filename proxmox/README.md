@@ -186,6 +186,12 @@ WebUI is at `http://10.10.10.30:8080` and must never be made public.
 VM100 has exactly one persistent ZeroFS mount: the direct read-write NFSv3/TCP
 file namespace at `/mnt/zerofs-files`. The NFS client uses hard mounts, 1 MiB
 read/write requests, a one-second attribute cache, and `_netdev`.
+Each deploy renders this unit's `What=` source from its validated private
+container address (for example, `10.10.10.20:/` for dev or `10.10.10.30:/` for
+prod), disables any installed legacy raw/bindfs/normalizer units, and fails if
+a legacy raw or guard mount remains active. It then reloads and restarts the
+direct unit before requiring the mounted source, NFS filesystem type, and `rw`
+option.
 
 Install the one persistent direct NFS mount:
 

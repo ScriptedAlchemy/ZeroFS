@@ -18,6 +18,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import tomllib
 import urllib.parse
@@ -28,6 +29,16 @@ from typing import Sequence
 
 VM_NFS_MOUNT_UNIT = r"mnt-zerofs\x2dfiles.mount"
 VM_NFS_MOUNTPOINT = "/mnt/zerofs-files"
+VM_NFS_TEMPLATE_SOURCE = "10.10.10.55:/"
+VM_LEGACY_NAMESPACE_UNITS = (
+    r"mnt-zerofs\x2dfiles\x2draw.mount",
+    r"mnt-zerofs\x2dfiles\x2draw-.nbd.mount",
+    "zerofs-shared-namespace-permissions.service",
+)
+VM_LEGACY_NAMESPACE_MOUNTS = (
+    "/mnt/zerofs-files-raw/.nbd",
+    "/mnt/zerofs-files-raw",
+)
 RFC1918_NETWORKS = tuple(
     ipaddress.ip_network(value)
     for value in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
@@ -759,28 +770,84 @@ def _stage_and_run_host(
         )
 
 
+def render_vm_nfs_mount(template: str, container_ip: str) -> str:
+    address = ipaddress.ip_address(container_ip)
+    if not is_rfc1918(address):
+        raise ValueError("VM NFS mount source must be RFC1918 private space")
+    if template.count(f"What={VM_NFS_TEMPLATE_SOURCE}") != 1:
+        raise ValueError("VM NFS mount template must contain one canonical source")
+    return template.replace(
+        f"What={VM_NFS_TEMPLATE_SOURCE}", f"What={address}:/", 1
+    )
+
+
 def _provision_vm_nfs_mount(runner: Runner, args: argparse.Namespace) -> None:
     bundle = Path(__file__).resolve().parent
     source = f"/tmp/{VM_NFS_MOUNT_UNIT}"
     destination = f"/etc/systemd/system/{VM_NFS_MOUNT_UNIT}"
-    runner.run(
-        [
-            "scp",
-            "-q",
-            str(bundle / "systemd" / VM_NFS_MOUNT_UNIT),
-            f"{args.vm_host}:/tmp/",
-        ]
+    template = (bundle / "systemd" / VM_NFS_MOUNT_UNIT).read_text()
+    rendered = render_vm_nfs_mount(template, args.container_ip)
+    legacy_units = " ".join(shlex.quote(unit) for unit in VM_LEGACY_NAMESPACE_UNITS)
+    legacy_mounts = " ".join(
+        shlex.quote(mountpoint) for mountpoint in VM_LEGACY_NAMESPACE_MOUNTS
     )
     script = f"""set -euo pipefail
+unit_loaded() {{
+  test "$(systemctl show -p LoadState --value "$1" 2>/dev/null || true)" != not-found
+}}
+for legacy_unit in {legacy_units}; do
+  if unit_loaded "$legacy_unit"; then
+    sudo systemctl disable --now "$legacy_unit"
+    if systemctl is-enabled --quiet "$legacy_unit"; then
+      echo "legacy namespace unit remains enabled: $legacy_unit" >&2
+      exit 1
+    fi
+    test "$(systemctl is-active "$legacy_unit" 2>/dev/null || true)" != active
+  fi
+done
+for legacy_mount in {legacy_mounts}; do
+  if findmnt -rn -M "$legacy_mount" >/dev/null 2>&1; then
+    echo "legacy namespace mount remains active: $legacy_mount" >&2
+    exit 1
+  fi
+done
+if unit_loaded {shlex.quote(VM_NFS_MOUNT_UNIT)}; then
+  sudo systemctl disable --now {shlex.quote(VM_NFS_MOUNT_UNIT)}
+fi
+if findmnt -rn -M {shlex.quote(VM_NFS_MOUNTPOINT)} >/dev/null 2>&1; then
+  echo 'file namespace mount remained active after unit retirement' >&2
+  exit 1
+fi
 sudo install -d -m 0755 {shlex.quote(VM_NFS_MOUNTPOINT)} /etc/systemd/system
 sudo install -m 0644 {shlex.quote(source)} {shlex.quote(destination)}
 sudo systemctl daemon-reload
 sudo systemctl enable --now {shlex.quote(VM_NFS_MOUNT_UNIT)}
+sudo systemctl restart {shlex.quote(VM_NFS_MOUNT_UNIT)}
+systemctl is-enabled --quiet {shlex.quote(VM_NFS_MOUNT_UNIT)}
 systemctl is-active --quiet {shlex.quote(VM_NFS_MOUNT_UNIT)}
-findmnt -rn -M {shlex.quote(VM_NFS_MOUNTPOINT)}
+mount_record=$(findmnt -rn -M {shlex.quote(VM_NFS_MOUNTPOINT)} -o SOURCE,FSTYPE,OPTIONS)
+mount_source=${{mount_record%% *}}
+mount_details=${{mount_record#* }}
+mount_fstype=${{mount_details%% *}}
+mount_options=${{mount_details#* }}
+test "$mount_source" = "{args.container_ip}:/"
+case "$mount_fstype" in
+  nfs|nfs4) ;;
+  *) echo "unexpected VM NFS filesystem type: $mount_fstype" >&2; exit 1 ;;
+esac
+case ",$mount_options," in
+  *,rw,*) ;;
+  *) echo 'VM NFS mount is not read-write' >&2; exit 1 ;;
+esac
 rm -f {shlex.quote(source)}
 """
-    _ssh(runner, args.vm_host, script)
+    with tempfile.TemporaryDirectory(prefix="zerofs-vm-nfs-") as directory:
+        rendered_path = Path(directory) / VM_NFS_MOUNT_UNIT
+        rendered_path.write_text(rendered)
+        runner.run(
+            ["scp", "-q", str(rendered_path), f"{args.vm_host}:{source}"]
+        )
+        _ssh(runner, args.vm_host, script)
 
 
 def build_parser() -> argparse.ArgumentParser:

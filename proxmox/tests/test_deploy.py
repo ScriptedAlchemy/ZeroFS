@@ -47,6 +47,29 @@ zerofs_writeback_terminal_error 0
 
 
 class SystemdTemplateTests(unittest.TestCase):
+    def test_vm_nfs_mount_render_uses_the_requested_container_address(self) -> None:
+        template = (
+            Path(__file__).parents[1]
+            / "systemd"
+            / r"mnt-zerofs\x2dfiles.mount"
+        ).read_text()
+        renderer = getattr(deploy, "render_vm_nfs_mount", None)
+        if renderer is None:
+            self.fail("VM NFS mount renderer is missing")
+
+        for container_ip in ("10.10.10.20", "10.10.10.30"):
+            with self.subTest(container_ip=container_ip):
+                rendered = renderer(template, container_ip)
+                self.assertIn(f"What={container_ip}:/", rendered)
+                self.assertNotIn("What=10.10.10.55:/", rendered)
+                self.assertIn("Where=/mnt/zerofs-files", rendered)
+                self.assertIn("Type=nfs", rendered)
+                self.assertIn(
+                    "Options=rw,noatime,hard,vers=3,proto=tcp,nolock,port=2049,"
+                    "mountport=2049,rsize=1048576,wsize=1048576,actimeo=1,_netdev",
+                    rendered,
+                )
+
     def test_vm100_has_only_the_direct_persistent_nfs_mount(self) -> None:
         unit = (
             Path(__file__).parents[1]
@@ -394,7 +417,7 @@ class PlanTests(unittest.TestCase):
 
 class CliDryRunTests(ConfigValidationTests):
     def assert_direct_nfs_mount_is_provisioned(
-        self, result: subprocess.CompletedProcess[str]
+        self, result: subprocess.CompletedProcess[str], container_ip: str
     ) -> None:
         self.assertIn("ubuntu-main bash -se", result.stdout)
         self.assertIn(r"mnt-zerofs\x2dfiles.mount", result.stdout)
@@ -405,7 +428,36 @@ class CliDryRunTests(ConfigValidationTests):
             r"systemctl is-active --quiet 'mnt-zerofs\x2dfiles.mount'",
             result.stdout,
         )
+        self.assertIn(
+            r"systemctl restart 'mnt-zerofs\x2dfiles.mount'", result.stdout
+        )
+        self.assertIn(
+            r"systemctl is-enabled --quiet 'mnt-zerofs\x2dfiles.mount'",
+            result.stdout,
+        )
+        self.assertIn(
+            r"systemctl disable --now 'mnt-zerofs\x2dfiles.mount'", result.stdout
+        )
         self.assertIn("findmnt -rn -M /mnt/zerofs-files", result.stdout)
+        self.assertIn(f'test "$mount_source" = "{container_ip}:/"', result.stdout)
+        self.assertIn('case "$mount_fstype" in', result.stdout)
+        self.assertIn('case ",$mount_options," in', result.stdout)
+        for legacy_unit in (
+            r"mnt-zerofs\x2dfiles\x2draw.mount",
+            r"mnt-zerofs\x2dfiles\x2draw-.nbd.mount",
+            "zerofs-shared-namespace-permissions.service",
+        ):
+            with self.subTest(legacy_unit=legacy_unit):
+                self.assertIn(legacy_unit, result.stdout)
+        self.assertIn('systemctl disable --now "$legacy_unit"', result.stdout)
+        self.assertIn('systemctl is-enabled --quiet "$legacy_unit"', result.stdout)
+        for legacy_mount in (
+            "/mnt/zerofs-files-raw/.nbd",
+            "/mnt/zerofs-files-raw",
+        ):
+            with self.subTest(legacy_mount=legacy_mount):
+                self.assertIn(legacy_mount, result.stdout)
+        self.assertIn('findmnt -rn -M "$legacy_mount"', result.stdout)
 
     def run_cli(
         self,
@@ -443,7 +495,7 @@ class CliDryRunTests(ConfigValidationTests):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("cargo build --release --locked", result.stdout)
         self.assertIn("host-deploy.sh deploy", result.stdout)
-        self.assert_direct_nfs_mount_is_provisioned(result)
+        self.assert_direct_nfs_mount_is_provisioned(result, "10.10.10.20")
         self.assertNotIn("nbd-client", result.stdout)
         self.assertNotIn("/mnt/zerofs-lxc", result.stdout)
         self.assertNotIn("mkfs", result.stdout)
@@ -515,7 +567,7 @@ class CliDryRunTests(ConfigValidationTests):
         self.assertIn("host-deploy.sh deploy --role prod", result.stdout)
         self.assertIn("--features webui", result.stdout)
         self.assertIn("--prod-access nfs", result.stdout)
-        self.assert_direct_nfs_mount_is_provisioned(result)
+        self.assert_direct_nfs_mount_is_provisioned(result, "10.10.10.30")
         self.assertNotIn("zerofs-lxc-nbd-client.service", result.stdout)
         self.assertNotIn("smb.conf", result.stdout)
         self.assertNotIn("smbd.service", result.stdout)
