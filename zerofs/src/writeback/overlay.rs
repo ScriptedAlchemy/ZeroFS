@@ -384,6 +384,12 @@ impl OverlayIndex {
         }
     }
 
+    pub(crate) async fn has_visible_local_object(&self, location: &Path) -> bool {
+        self.visible_entry(location)
+            .await
+            .is_some_and(|entry| matches!(entry.effect, OverlayEffect::Put))
+    }
+
     pub async fn get(&self, location: &Path) -> object_store::Result<GetResult> {
         self.get_opts(location, GetOptions::default()).await
     }

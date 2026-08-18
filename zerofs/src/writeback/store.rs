@@ -1,3 +1,4 @@
+use crate::segment_store::GeneratedSegmentCreate;
 use crate::writeback::admission::{Admission, DiskAdmission};
 use crate::writeback::config::{AckMode, WritebackSettings};
 use crate::writeback::journal::Journal;
@@ -348,8 +349,18 @@ impl WritebackObjectStore {
     ) -> object_store::Result<PutResult> {
         let lock = self.key_lock(&location);
         let key_guard = lock.lock_owned().await;
+        let trusted_segment_create = options.extensions.get::<GeneratedSegmentCreate>().is_some();
         let (mode, expected_visible_version, predecessor) = match &options.mode {
             PutMode::Overwrite => (MutationMode::Overwrite, None, None),
+            PutMode::Create if trusted_segment_create => {
+                if self.inner.overlay.has_visible_local_object(&location).await {
+                    return Err(object_store::Error::AlreadyExists {
+                        path: location.to_string(),
+                        source: "overlay-visible object already exists".into(),
+                    });
+                }
+                (MutationMode::Create, None, None)
+            }
             mode => {
                 let visible = self.inner.overlay.visible_version(&location).await?;
                 validate_put_mode(&location, mode, visible)?
@@ -1412,7 +1423,11 @@ fn generic_error(message: impl Into<String>) -> object_store::Error {
 #[cfg(test)]
 mod tests {
     use super::WritebackObjectStore;
+    use crate::config::CompressionConfig;
     use crate::fault_store::{FaultControls, FaultStore};
+    use crate::frame_codec::FrameCodec;
+    use crate::segment::SEGMENT_INFO;
+    use crate::segment_store::SegmentStore;
     use crate::writeback::config::{AckMode, ShutdownFlush, WritebackSettings};
     use crate::writeback::journal::Journal;
     use crate::writeback::model::{
@@ -1424,6 +1439,7 @@ mod tests {
     use futures::{StreamExt, stream};
     use object_store::memory::InMemory;
     use object_store::path::Path;
+    use object_store::prefix::PrefixStore;
     use object_store::{
         CopyMode, CopyOptions, ObjectStore, ObjectStoreExt, PutMode, PutOptions, RenameOptions,
         RenameTargetMode, UpdateVersion,
@@ -3270,6 +3286,79 @@ mod tests {
             concurrent,
             "remote replay never reached four concurrent puts"
         );
+    }
+
+    #[tokio::test]
+    async fn segment_store_seals_fill_the_configured_remote_upload_slots() {
+        let (store, _remote, _temp, controls) = test_store_with_controls(true).await;
+        controls.block_puts();
+        let writeback: Arc<dyn ObjectStore> = Arc::new(store.clone());
+        let prefixed: Arc<dyn ObjectStore> =
+            Arc::new(PrefixStore::new(writeback, Path::from("zerofs/pilot")));
+        let segments = Arc::new(SegmentStore::new(
+            prefixed,
+            FrameCodec::new(&[1u8; 32], SEGMENT_INFO, CompressionConfig::Lz4),
+            7,
+            None,
+        ));
+
+        let seals = (0..4).map(|index| {
+            let segments = segments.clone();
+            async move {
+                let segid = segments.next_segid();
+                segments
+                    .put_segment(segid, Bytes::from(vec![index; 1024]))
+                    .await
+                    .unwrap();
+            }
+        });
+        futures::future::join_all(seals).await;
+        store.wait_local(4).await.unwrap();
+
+        let concurrent = tokio::time::timeout(Duration::from_secs(2), async {
+            while controls.max_active_puts() < 4 {
+                controls.put_activity().notified().await;
+            }
+        })
+        .await
+        .is_ok();
+        controls.release_puts();
+        store.wait_remote(4).await.unwrap();
+        store.shutdown().await.unwrap();
+
+        assert!(
+            concurrent,
+            "the production segment path never filled four remote upload slots"
+        );
+    }
+
+    #[tokio::test]
+    async fn generated_segment_create_does_not_wait_for_remote_head() {
+        let (store, _remote, _temp, controls) = test_store_with_controls(true).await;
+        controls.block_heads();
+        let writeback: Arc<dyn ObjectStore> = Arc::new(store.clone());
+        let prefixed: Arc<dyn ObjectStore> =
+            Arc::new(PrefixStore::new(writeback, Path::from("zerofs/pilot")));
+        let segments = SegmentStore::new(
+            prefixed,
+            FrameCodec::new(&[1u8; 32], SEGMENT_INFO, CompressionConfig::Lz4),
+            7,
+            None,
+        );
+
+        let accepted = tokio::time::timeout(
+            Duration::from_secs(1),
+            segments.put_segment(segments.next_segid(), Bytes::from_static(b"segment")),
+        )
+        .await;
+        controls.release_heads();
+        store.wait_local(1).await.unwrap();
+        store.shutdown().await.unwrap();
+
+        accepted
+            .expect("local admission waited for a remote HEAD")
+            .expect("generated segment create failed");
+        assert_eq!(controls.head_count(), 0);
     }
 
     #[tokio::test]
