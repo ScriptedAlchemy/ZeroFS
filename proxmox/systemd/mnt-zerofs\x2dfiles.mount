@@ -1,7 +1,7 @@
 [Unit]
 Description=ZeroFS file namespace mapped for VM100 and macOS ownership
-Requires=mnt-zerofs\x2dfiles\x2draw-.nbd.mount
-After=mnt-zerofs\x2dfiles\x2draw-.nbd.mount
+Requires=zerofs-shared-namespace-permissions.service
+After=zerofs-shared-namespace-permissions.service
 
 [Mount]
 What=/mnt/zerofs-files-raw

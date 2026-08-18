@@ -93,7 +93,8 @@ class SystemdTemplateTests(unittest.TestCase):
             / "systemd"
             / r"mnt-zerofs\x2dfiles.mount"
         ).read_text()
-        self.assertIn(r"Requires=mnt-zerofs\x2dfiles\x2draw-.nbd.mount", view_unit)
+        self.assertIn("Requires=zerofs-shared-namespace-permissions.service", view_unit)
+        self.assertIn("After=zerofs-shared-namespace-permissions.service", view_unit)
         self.assertIn("What=/mnt/zerofs-files-raw", view_unit)
         self.assertIn("Where=/mnt/zerofs-files", view_unit)
         self.assertIn("Type=fuse.bindfs", view_unit)
@@ -104,6 +105,65 @@ class SystemdTemplateTests(unittest.TestCase):
         self.assertIn("chgrp-ignore", view_unit)
         self.assertIn("chmod-ignore", view_unit)
         self.assertIn("WantedBy=remote-fs.target", view_unit)
+
+        permissions_unit = (
+            Path(__file__).parents[1]
+            / "systemd"
+            / "zerofs-shared-namespace-permissions.service"
+        ).read_text()
+        self.assertIn(r"Requires=mnt-zerofs\x2dfiles\x2draw-.nbd.mount", permissions_unit)
+        self.assertIn(r"After=mnt-zerofs\x2dfiles\x2draw-.nbd.mount", permissions_unit)
+        self.assertIn("Before=mnt-zerofs\\x2dfiles.mount", permissions_unit)
+        self.assertIn(
+            "ExecStart=/usr/local/libexec/zerofs-normalize-shared-namespace",
+            permissions_unit,
+        )
+        self.assertIn("Type=oneshot", permissions_unit)
+        self.assertIn("RemainAfterExit=yes", permissions_unit)
+
+    def test_shared_namespace_normalizer_preserves_nbd_and_normalizes_ordinary_entries(
+        self,
+    ) -> None:
+        script = (
+            Path(__file__).parents[1]
+            / "guest"
+            / "normalize-shared-namespace.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            "zerofs_normalize_shared_namespace", script
+        )
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            root.chmod(0o755)
+            ordinary = root / "ordinary"
+            ordinary.mkdir(mode=0o755)
+            private_file = ordinary / "private.bin"
+            private_file.write_bytes(b"ordinary")
+            private_file.chmod(0o600)
+            executable = ordinary / "tool"
+            executable.write_bytes(b"tool")
+            executable.chmod(0o700)
+            nbd = root / ".nbd"
+            nbd.mkdir(mode=0o755)
+            nbd_lane = nbd / "lane-0"
+            nbd_lane.write_bytes(b"do not touch")
+            nbd_lane.chmod(0o600)
+
+            module.normalize_namespace(root, uid=os.getuid(), gid=os.getgid())
+
+            self.assertEqual(root.stat().st_mode & 0o777, 0o775)
+            self.assertEqual(ordinary.stat().st_mode & 0o777, 0o775)
+            self.assertEqual(private_file.stat().st_mode & 0o777, 0o660)
+            self.assertEqual(executable.stat().st_mode & 0o777, 0o770)
+            self.assertEqual(private_file.stat().st_uid, os.getuid())
+            self.assertEqual(private_file.stat().st_gid, os.getgid())
+            self.assertEqual(nbd.stat().st_mode & 0o777, 0o755)
+            self.assertEqual(nbd_lane.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(nbd_lane.read_bytes(), b"do not touch")
 
 
 class ConfigValidationTests(unittest.TestCase):

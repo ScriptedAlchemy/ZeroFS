@@ -198,6 +198,11 @@ Because the normal namespace also exposes the live NBD lanes below `.nbd`,
 read-only before the mapped view starts. The one-second NFS attribute cache
 keeps Mac and iPhone uploads visible without using 9P on VM100.
 
+`zerofs-shared-namespace-permissions.service` then verifies both mount
+boundaries and normalizes only the ordinary namespace to UID/GID `501:20`
+with owner/group write access. It fails closed unless the raw namespace is the
+expected read-write NFS export and `.nbd` is a separate read-only mount.
+
 Install the mount without changing the existing NBD units:
 
 ```bash
@@ -212,9 +217,17 @@ sudo install -m 0644 \
 sudo install -m 0644 \
   'proxmox/systemd/mnt-zerofs\x2dfiles\x2draw-.nbd.mount' \
   '/etc/systemd/system/mnt-zerofs\x2dfiles\x2draw-.nbd.mount'
+sudo install -d -m 0755 /usr/local/libexec
+sudo install -m 0755 \
+  proxmox/guest/normalize-shared-namespace.py \
+  /usr/local/libexec/zerofs-normalize-shared-namespace
+sudo install -m 0644 \
+  proxmox/systemd/zerofs-shared-namespace-permissions.service \
+  /etc/systemd/system/zerofs-shared-namespace-permissions.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now 'mnt-zerofs\x2dfiles\x2draw.mount'
 sudo systemctl enable --now 'mnt-zerofs\x2dfiles\x2draw-.nbd.mount'
+sudo systemctl start zerofs-shared-namespace-permissions.service
 sudo systemctl enable --now 'mnt-zerofs\x2dfiles.mount'
 ```
 
