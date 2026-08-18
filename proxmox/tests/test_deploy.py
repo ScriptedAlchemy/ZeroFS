@@ -57,36 +57,53 @@ class SystemdTemplateTests(unittest.TestCase):
         self.assertIn("-persist -timeout 600", unit)
 
     def test_file_namespace_mount_is_persistent_and_independent_from_nbd(self) -> None:
-        unit = (
+        raw_unit = (
             Path(__file__).parents[1]
             / "systemd"
-            / r"mnt-zerofs\x2dfiles.mount"
+            / r"mnt-zerofs\x2dfiles\x2draw.mount"
         ).read_text()
 
-        self.assertIn("What=10.10.10.55:/", unit)
-        self.assertIn("Where=/mnt/zerofs-files", unit)
-        self.assertIn("Type=nfs", unit)
-        self.assertIn("vers=3", unit)
-        self.assertIn("proto=tcp", unit)
-        self.assertIn("hard", unit)
-        self.assertIn("rw", unit)
-        self.assertIn("actimeo=1", unit)
-        self.assertIn("_netdev", unit)
-        self.assertIn("WantedBy=remote-fs.target", unit)
-        self.assertNotIn("zerofs-lxc-nbd-client.service", unit)
+        self.assertIn("What=10.10.10.55:/", raw_unit)
+        self.assertIn("Where=/mnt/zerofs-files-raw", raw_unit)
+        self.assertIn("Type=nfs", raw_unit)
+        self.assertIn("vers=3", raw_unit)
+        self.assertIn("proto=tcp", raw_unit)
+        self.assertIn("hard", raw_unit)
+        self.assertIn("rw", raw_unit)
+        self.assertIn("actimeo=1", raw_unit)
+        self.assertIn("_netdev", raw_unit)
+        self.assertIn("WantedBy=remote-fs.target", raw_unit)
+        self.assertNotIn("zerofs-lxc-nbd-client.service", raw_unit)
 
         nbd_guard = (
             Path(__file__).parents[1]
             / "systemd"
-            / r"mnt-zerofs\x2dfiles-.nbd.mount"
+            / r"mnt-zerofs\x2dfiles\x2draw-.nbd.mount"
         ).read_text()
-        self.assertIn(r"Requires=mnt-zerofs\x2dfiles.mount", nbd_guard)
-        self.assertIn("What=/mnt/zerofs-files/.nbd", nbd_guard)
-        self.assertIn("Where=/mnt/zerofs-files/.nbd", nbd_guard)
+        self.assertIn(r"Requires=mnt-zerofs\x2dfiles\x2draw.mount", nbd_guard)
+        self.assertIn("What=/mnt/zerofs-files-raw/.nbd", nbd_guard)
+        self.assertIn("Where=/mnt/zerofs-files-raw/.nbd", nbd_guard)
         self.assertIn("bind", nbd_guard)
         self.assertIn("ro", nbd_guard)
         self.assertIn("_netdev", nbd_guard)
         self.assertIn("WantedBy=remote-fs.target", nbd_guard)
+
+        view_unit = (
+            Path(__file__).parents[1]
+            / "systemd"
+            / r"mnt-zerofs\x2dfiles.mount"
+        ).read_text()
+        self.assertIn(r"Requires=mnt-zerofs\x2dfiles\x2draw-.nbd.mount", view_unit)
+        self.assertIn("What=/mnt/zerofs-files-raw", view_unit)
+        self.assertIn("Where=/mnt/zerofs-files", view_unit)
+        self.assertIn("Type=fuse.bindfs", view_unit)
+        self.assertIn("mirror=zack", view_unit)
+        self.assertIn("create-for-user=501", view_unit)
+        self.assertIn("create-for-group=20", view_unit)
+        self.assertIn("chown-ignore", view_unit)
+        self.assertIn("chgrp-ignore", view_unit)
+        self.assertIn("chmod-ignore", view_unit)
+        self.assertIn("WantedBy=remote-fs.target", view_unit)
 
 
 class ConfigValidationTests(unittest.TestCase):

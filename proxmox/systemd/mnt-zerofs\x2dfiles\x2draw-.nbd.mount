@@ -1,11 +1,11 @@
 [Unit]
 Description=Protect live ZeroFS NBD lane files from file-namespace writes
-Requires=mnt-zerofs\x2dfiles.mount
-After=mnt-zerofs\x2dfiles.mount
+Requires=mnt-zerofs\x2dfiles\x2draw.mount
+After=mnt-zerofs\x2dfiles\x2draw.mount
 
 [Mount]
-What=/mnt/zerofs-files/.nbd
-Where=/mnt/zerofs-files/.nbd
+What=/mnt/zerofs-files-raw/.nbd
+Where=/mnt/zerofs-files-raw/.nbd
 Type=none
 Options=bind,ro,nosuid,nodev,noexec,_netdev
 TimeoutSec=30s
