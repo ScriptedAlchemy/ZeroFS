@@ -570,6 +570,23 @@ async fn close_semantics_and_handle_independence() {
 }
 
 #[tokio::test]
+async fn cleanup_barrier_waits_for_preceding_clunks() {
+    let (fs, _shutdown, _dir) = setup().await;
+    fs.write("/file.txt", b"payload").await.unwrap();
+    let file = fs
+        .open("/file.txt", OpenOptions::read_only())
+        .await
+        .unwrap();
+    file.close().await;
+    drop(file);
+
+    fs.close().await;
+    fs.wait_for_cleanup().await;
+
+    assert_eq!(fs.outstanding_fids(), 0);
+}
+
+#[tokio::test]
 async fn cancelled_futures_leak_nothing() {
     let (fs, _shutdown, _dir) = setup().await;
 

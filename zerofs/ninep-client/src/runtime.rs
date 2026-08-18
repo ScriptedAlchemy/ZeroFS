@@ -13,6 +13,11 @@ impl Clock {
     pub(crate) fn elapsed_millis(&self) -> u64 {
         self.0.elapsed().as_millis() as u64
     }
+
+    #[cfg(test)]
+    pub(crate) fn ago(duration: Duration) -> Self {
+        Self(std::time::Instant::now() - duration)
+    }
 }
 
 #[cfg(target_arch = "wasm32")]

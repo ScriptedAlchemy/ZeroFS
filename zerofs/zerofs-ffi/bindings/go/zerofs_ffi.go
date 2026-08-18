@@ -4584,12 +4584,12 @@ func (self ZeroFsErrorClosed) Is(target error) bool {
 	return target == ErrZeroFsErrorClosed
 }
 
-// The initial connection or attach failed.
+// Connection setup or an established connection failed.
 type ZeroFsErrorConnectFailed struct {
 	Message string
 }
 
-// The initial connection or attach failed.
+// Connection setup or an established connection failed.
 func NewZeroFsErrorConnectFailed(
 	message string,
 ) *ZeroFsError {

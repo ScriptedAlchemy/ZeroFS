@@ -88,6 +88,67 @@ $EDITOR zerofs.toml    # Set S3 credentials
 zerofs run -c zerofs.toml
 ```
 
+### Direct file transfers (no mount)
+
+The `zerofs` binary can copy or remove files and directory trees directly
+through an existing 9P endpoint:
+
+```bash
+# Upload a file or the contents of a directory tree
+zerofs upload 127.0.0.1:5564 ./Audiobooks /Audiobooks
+
+# Download a file or directory tree
+zerofs download 127.0.0.1:5564 /Audiobooks ./Audiobooks
+
+# Recursively remove a file or directory tree (permanent; no prompt)
+zerofs rm 127.0.0.1:5564 /old-audiobooks
+```
+
+Targets may be TCP (`host:port` or `tcp://host:port`), a comma-separated set of
+high-availability targets, a Unix socket (`unix:/path/to/socket`), or the Web
+UI's private native WebSocket endpoint (`ws://host:8080/ws/9p`). Native clients
+currently accept `ws://`, not `wss://`. No filesystem mount or server
+configuration change is required.
+
+The source root maps exactly to the destination argument. Directory copies
+preserve empty directories and unrelated destination entries. Uploads and
+downloads use 8 concurrent files by default; pass `--jobs N` to change that
+limit. Each worker requests a 9 MiB 9P message size, uses the server-negotiated
+maximum payload, and keeps chunks within one file sequential. The CLI shows
+aggregate bytes, rate, ETA, completed-file count, and active paths.
+
+Connection loss during an individual 9P mutation is replayed by the client with
+the same operation ID. If a connection, stale-handle, leader, or retry-later
+(`EAGAIN`) error still reaches the transfer layer, the CLI removes that
+attempt's private temporary file and restarts only that file, up to three total
+attempts. A cleanup failure is terminal so an abandoned temporary file can
+never be hidden by a successful retry. Each retry is printed without corrupting
+the live progress bars. An exhausted or permanent file error is reported
+immediately; the remaining files continue, and the command exits nonzero with
+the complete failure list after the queue is settled.
+
+Ctrl-C stops scheduling new files and lets in-flight 9P operations settle
+before cleanup; while it waits it restates every ten seconds what is still
+settling, and it exits nonzero without printing completion. A second Ctrl-C
+exits immediately with status 130 and can leave a hidden `.zerofs-*.tmp` file
+behind, because the cleanup that removes it needs the same server that is not
+answering.
+
+An upload writes a hidden sibling temporary file, atomically renames it into
+visibility after all chunks arrive, and then verifies durability through the
+still-open file handle. It reports the file complete only after that sync
+succeeds; if sync fails, the renamed file may be visible without verified
+durability. A download syncs its local temporary file before renaming it over
+the destination. Completed files remain published, but transfers do not resume
+partial files across process restarts or split one file into parallel ranges.
+Symlinks and other special source entries are rejected rather than followed.
+
+`zerofs rm` follows the Web UI's recursive delete model: it lists and validates
+each directory once, then removes entries deepest-first with at most 8 remote
+operations active across the traversal. It refuses to remove the 9P attach
+root, does not prompt, and reports any failed deletion instead of silently
+claiming success.
+
 ## Native Linux kernel client
 
 [`kernel/`](kernel/) contains an out-of-tree VFS module that speaks the private

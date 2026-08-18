@@ -37,6 +37,46 @@ struct AppState {
     ws_drain: TaskTracker,
 }
 
+#[cfg(test)]
+#[derive(Clone)]
+struct CountedTestState {
+    app: AppState,
+    connections: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(test)]
+async fn counted_test_ws_upgrade(
+    ws: WebSocketUpgrade,
+    State(state): State<CountedTestState>,
+) -> impl IntoResponse {
+    state
+        .connections
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let drain_guard = state.app.ws_drain.token();
+    ws.on_upgrade(move |socket| handle_9p_ws(socket, state.app, drain_guard))
+}
+
+#[cfg(test)]
+pub(crate) fn test_9p_websocket_router(
+    filesystem: Arc<ZeroFS>,
+    connections: Arc<std::sync::atomic::AtomicUsize>,
+) -> Router {
+    let state = CountedTestState {
+        app: AppState {
+            filesystem,
+            lock_manager: Arc::new(FileLockManager::new()),
+            uid: 0,
+            gid: 0,
+            shutdown: CancellationToken::new(),
+            ws_drain: TaskTracker::new(),
+        },
+        connections,
+    };
+    Router::new()
+        .route("/ws/9p", get(counted_test_ws_upgrade))
+        .with_state(state)
+}
+
 const WS_DRAIN_TIMEOUT: std::time::Duration = crate::replication::RESPONSE_DRAIN_TIMEOUT;
 
 async fn ws_9p_upgrade(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {

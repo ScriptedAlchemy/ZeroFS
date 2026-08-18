@@ -15,6 +15,7 @@ pub mod nbd;
 pub mod otrace;
 pub mod password;
 pub mod server;
+pub(crate) mod transfer;
 
 #[derive(Parser)]
 #[command(name = "zerofs")]
@@ -26,6 +27,37 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
+    /// Upload a file or directory directly over ZeroFS 9P
+    Upload {
+        /// 9P server address: host[:port], tcp://host:port, unix:/path, or ws:// URL
+        target: String,
+        /// Local file or directory to upload
+        source: PathBuf,
+        /// Exact destination path in ZeroFS
+        destination: PathBuf,
+        /// Number of files to transfer concurrently
+        #[arg(long, default_value_t = 8, value_parser = parse_transfer_jobs)]
+        jobs: usize,
+    },
+    /// Download a file or directory directly over ZeroFS 9P
+    Download {
+        /// 9P server address: host[:port], tcp://host:port, unix:/path, or ws:// URL
+        target: String,
+        /// File or directory in ZeroFS to download
+        source: PathBuf,
+        /// Exact local destination path
+        destination: PathBuf,
+        /// Number of files to transfer concurrently
+        #[arg(long, default_value_t = 8, value_parser = parse_transfer_jobs)]
+        jobs: usize,
+    },
+    /// Remove a file or directory tree directly over ZeroFS 9P
+    Rm {
+        /// 9P server address: host[:port], tcp://host:port, unix:/path, or ws:// URL
+        target: String,
+        /// File or directory tree in ZeroFS to remove
+        path: PathBuf,
+    },
     /// Generate a default configuration file
     Init {
         /// Output path for the config file, or "-" to write to stdout
@@ -135,6 +167,17 @@ pub enum Commands {
         #[arg(long)]
         aname: Option<String>,
     },
+}
+
+fn parse_transfer_jobs(value: &str) -> std::result::Result<usize, String> {
+    let jobs = value
+        .parse::<usize>()
+        .map_err(|_| "jobs must be a positive integer".to_owned())?;
+    if jobs == 0 {
+        Err("jobs must be at least 1".to_owned())
+    } else {
+        Ok(jobs)
+    }
 }
 
 #[derive(Subcommand)]
@@ -273,6 +316,12 @@ pub(crate) fn attach_cleanup_errors(
     }
 }
 
+pub(crate) fn has_attached_cleanup_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<PrimaryErrorWithCleanup>().is_some())
+}
+
 /// Shut down an SFTP session pool (when one exists) and fold its cleanup failure
 /// into `result`: the primary error always wins and the cleanup failure rides
 /// along as attached detail, a cleanup-only failure becomes the error, and when
@@ -303,6 +352,7 @@ pub(crate) async fn finish_with_sftp_cleanup<T>(
 mod tests {
     use super::{Cli, Commands, NbdCommands};
     use clap::Parser;
+    use std::path::PathBuf;
 
     #[test]
     fn striped_nbd_provision_command_has_operational_defaults() {
@@ -335,5 +385,78 @@ mod tests {
         assert_eq!(size, 64 * 1024 * 1024 * 1024);
         assert_eq!(lanes, 4);
         assert_eq!(stripe_size, 256 * 1024);
+    }
+
+    #[test]
+    fn upload_command_parses_direct_transfer_arguments() {
+        let cli = Cli::try_parse_from([
+            "zerofs",
+            "upload",
+            "ws://server:8080/ws/9p",
+            "./Audiobooks",
+            "/Audiobooks",
+            "--jobs",
+            "4",
+        ])
+        .unwrap();
+
+        let Commands::Upload {
+            target,
+            source,
+            destination,
+            jobs,
+        } = cli.command
+        else {
+            panic!("expected upload command");
+        };
+        assert_eq!(target, "ws://server:8080/ws/9p");
+        assert_eq!(source, PathBuf::from("./Audiobooks"));
+        assert_eq!(destination, PathBuf::from("/Audiobooks"));
+        assert_eq!(jobs, 4);
+    }
+
+    #[test]
+    fn download_command_parses_direct_transfer_arguments() {
+        let cli = Cli::try_parse_from([
+            "zerofs",
+            "download",
+            "tcp://server:5564",
+            "/Audiobooks",
+            "./Audiobooks",
+            "--jobs",
+            "3",
+        ])
+        .unwrap();
+
+        let Commands::Download {
+            target,
+            source,
+            destination,
+            jobs,
+        } = cli.command
+        else {
+            panic!("expected download command");
+        };
+        assert_eq!(target, "tcp://server:5564");
+        assert_eq!(source, PathBuf::from("/Audiobooks"));
+        assert_eq!(destination, PathBuf::from("./Audiobooks"));
+        assert_eq!(jobs, 3);
+    }
+
+    #[test]
+    fn rm_command_parses_recursive_remove_arguments() {
+        let cli = Cli::try_parse_from([
+            "zerofs",
+            "rm",
+            "unix:/run/zerofs/9p.sock",
+            "/old-audiobooks",
+        ])
+        .unwrap();
+
+        let Commands::Rm { target, path } = cli.command else {
+            panic!("expected rm command");
+        };
+        assert_eq!(target, "unix:/run/zerofs/9p.sock");
+        assert_eq!(path, PathBuf::from("/old-audiobooks"));
     }
 }

@@ -6,7 +6,7 @@ use ninep_client::{NinePClient, SetattrBuilder, SetattrTime};
 use ninep_proto::{GETATTR_ALL, Stat};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 /// Maximum `Twalk` components per request.
 const MAX_WELEM: usize = 16;
@@ -17,19 +17,31 @@ pub(crate) struct Session {
     /// Group assigned to everything created through this session.
     pub(crate) gid: u32,
     pub(crate) closed: AtomicBool,
-    clunk_tx: mpsc::UnboundedSender<u32>,
+    clunk_tx: mpsc::UnboundedSender<JanitorCommand>,
+}
+
+enum JanitorCommand {
+    Clunk(u32),
+    Barrier(oneshot::Sender<()>),
 }
 
 impl Session {
     /// Wraps an attached connection and starts background fid cleanup.
     pub(crate) fn new(client: Arc<NinePClient>, root_fid: u32, gid: u32) -> Arc<Self> {
-        let (clunk_tx, mut rx) = mpsc::unbounded_channel::<u32>();
+        let (clunk_tx, mut rx) = mpsc::unbounded_channel::<JanitorCommand>();
         let janitor_client = Arc::clone(&client);
         crate::runtime::spawn(async move {
-            while let Some(fid) = rx.recv().await {
-                // Recycle only after clunk settlement prevents aliasing.
-                let _ = janitor_client.clunk(fid).await;
-                janitor_client.free_fid(fid);
+            while let Some(command) = rx.recv().await {
+                match command {
+                    JanitorCommand::Clunk(fid) => {
+                        // Recycle only after clunk settlement prevents aliasing.
+                        let _ = janitor_client.clunk(fid).await;
+                        janitor_client.free_fid(fid);
+                    }
+                    JanitorCommand::Barrier(done) => {
+                        let _ = done.send(());
+                    }
+                }
             }
         });
         Arc::new(Self {
@@ -51,7 +63,15 @@ impl Session {
 
     /// Hand a fid to the janitor for a background clunk and recycle.
     pub(crate) fn enqueue_clunk(&self, fid: u32) {
-        let _ = self.clunk_tx.send(fid);
+        let _ = self.clunk_tx.send(JanitorCommand::Clunk(fid));
+    }
+
+    /// Wait until the janitor settles everything queued before this call.
+    pub(crate) async fn wait_for_cleanup(&self) {
+        let (done, wait) = oneshot::channel();
+        if self.clunk_tx.send(JanitorCommand::Barrier(done)).is_ok() {
+            let _ = wait.await;
+        }
     }
 
     /// Allocates a fid with cancellation cleanup installed before any await.

@@ -53,12 +53,16 @@ use tokio_util::codec::LengthDelimitedCodec;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+#[cfg(any(test, target_arch = "wasm32"))]
+mod buffered_send;
 mod linux;
 #[cfg(not(target_arch = "wasm32"))]
 mod native_web_transport;
 mod runtime;
 #[cfg(target_arch = "wasm32")]
 mod web_transport;
+#[cfg(not(target_arch = "wasm32"))]
+mod write_progress;
 
 /// The 9P "no tag" sentinel. We never allocate it for a normal request.
 const NOTAG: u16 = 0xFFFF;
@@ -71,11 +75,18 @@ const RECONNECT_BACKOFF_MAX: Duration = Duration::from_millis(500);
 /// Per-target dial and negotiation timeout.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 /// Reply timeout before liveness checks begin.
+///
+/// A reply wait has no aggregate deadline. Each expiry only asks whether the
+/// connection is still provably live; a live peer extends the wait so a slow
+/// bulk operation is never aborted for exceeding a fixed ceiling. The cost of
+/// that policy is deliberate: a peer that answers liveness probes but never
+/// answers one request keeps that request pending until the caller drops the
+/// future or the process exits. Callers that need a bound impose it themselves.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 /// Maximum age of a decoded frame accepted as proof of liveness.
 const LIVENESS_WINDOW: Duration = Duration::from_secs(3);
-/// Additional reply windows allowed while the connection remains live.
-const MAX_LIVENESS_EXTRA_WINDOWS: u32 = 7;
+/// Maximum time a transport may make no forward write progress.
+const SEND_STALL_TIMEOUT: Duration = MUTATION_RETRY_HORIZON;
 
 const _: () = assert!(
     LIVENESS_WINDOW.as_nanos() < REQUEST_TIMEOUT.as_nanos(),
@@ -423,7 +434,7 @@ mod target_parse_tests {
 
 /// One transport and its reader/writer tasks.
 struct Conn {
-    writer_tx: mpsc::Sender<Vec<u8>>,
+    writer_tx: mpsc::Sender<OutboundFrame>,
     pending: DashMap<u16, oneshot::Sender<Bytes>>,
     tag_ctr: AtomicU16,
     /// Durability lineage returned by `Tgetlineage`.
@@ -497,6 +508,24 @@ impl Conn {
     fn connection_lost(&self, reconnect: &Notify) {
         self.shutdown();
         reconnect.notify_waiters();
+    }
+}
+
+struct OutboundFrame {
+    bytes: Vec<u8>,
+    sent: oneshot::Sender<()>,
+}
+
+impl OutboundFrame {
+    fn new(bytes: Vec<u8>) -> (Self, oneshot::Receiver<()>) {
+        let (sent, received) = oneshot::channel();
+        (Self { bytes, sent }, received)
+    }
+
+    #[cfg(test)]
+    fn acknowledge(self) -> Vec<u8> {
+        let _ = self.sent.send(());
+        self.bytes
     }
 }
 
@@ -718,7 +747,7 @@ impl NinePClient {
         msize_mismatch_warned: Arc<AtomicBool>,
     ) -> ClientResult<(Arc<Conn>, u32)> {
         let transport = dial(target).await?;
-        let (writer_tx, writer_rx) = mpsc::channel::<Vec<u8>>(P9_CHANNEL_SIZE);
+        let (writer_tx, writer_rx) = mpsc::channel::<OutboundFrame>(P9_CHANNEL_SIZE);
         let conn = Arc::new(Conn {
             writer_tx,
             pending: DashMap::new(),
@@ -751,7 +780,7 @@ impl NinePClient {
             }
             #[cfg(not(target_arch = "wasm32"))]
             DialedTransport::WebSocket(io) => {
-                native_web_transport::spawn(io, writer_rx, Arc::clone(&conn), reconnect_notify);
+                native_web_transport::spawn(*io, writer_rx, Arc::clone(&conn), reconnect_notify);
             }
         }
 
@@ -1413,7 +1442,7 @@ impl NinePClient {
             // Frames after the first possible dispatch carry RETRY.
             let has_op_id = op_id != [0u8; 16];
             let connection_epoch = conn.writer_epoch.load(Ordering::Relaxed);
-            let (op_flags, ()) =
+            let (op_flags, mut sent) =
                 attempt.dispatch_frame(has_op_id, connection_epoch, |op_flags, origin_epoch| {
                     let bytes = P9Message::new_with_op_id_flags_and_origin(
                         tag,
@@ -1426,33 +1455,44 @@ impl NinePClient {
                     .map_err(ClientError::Codec)?;
 
                     // Registration-to-enqueue has no cancellation point.
+                    let (frame, sent) = OutboundFrame::new(bytes);
                     pending.mark_dispatched();
                     if let Some(dispatched_conn) = stateful_dispatched_conn {
                         *dispatched_conn.lock().unwrap() = Some(Arc::clone(&conn));
                     }
-                    permit.send(bytes);
-                    Ok(())
+                    permit.send(frame);
+                    Ok(sent)
                 })?;
-            // Preserve the in-flight request while bounded liveness checks succeed.
-            let mut extra_windows = 0u32;
-            let frame = loop {
-                match runtime::timeout(REQUEST_TIMEOUT, &mut orx).await {
-                    Ok(Ok(frame)) => break frame,
-                    Ok(Err(_)) => {
-                        // Lost the reply to a drop: wait for reconnect and resend.
-                        runtime::yield_now().await;
-                        continue 'resend;
-                    }
-                    Err(_) => {
-                        if extra_windows < MAX_LIVENESS_EXTRA_WINDOWS
-                            && Self::conn_alive(&conn).await
-                        {
-                            extra_windows += 1;
-                            continue;
+            let early_response = match Self::wait_for_send_or_response(&mut sent, &mut orx).await {
+                Ok(response) => response,
+                Err(_) => {
+                    runtime::yield_now().await;
+                    continue 'resend;
+                }
+            };
+            // Start reply liveness only after the transport finished sending.
+            let frame = if let Some(frame) = early_response {
+                frame
+            } else {
+                loop {
+                    match runtime::timeout(REQUEST_TIMEOUT, &mut orx).await {
+                        Ok(Ok(frame)) => break frame,
+                        Ok(Err(_)) => {
+                            // Lost the reply to a drop: wait for reconnect and resend.
+                            runtime::yield_now().await;
+                            continue 'resend;
                         }
-                        self.force_reprobe(&conn);
-                        runtime::yield_now().await;
-                        continue 'resend;
+                        Err(_) => {
+                            // A provably live peer extends the wait instead of
+                            // retiring a healthy connection. See REQUEST_TIMEOUT
+                            // for why this loop has no aggregate ceiling.
+                            if Self::conn_alive(&conn).await {
+                                continue;
+                            }
+                            self.force_reprobe(&conn);
+                            runtime::yield_now().await;
+                            continue 'resend;
+                        }
                     }
                 }
             };
@@ -1593,6 +1633,20 @@ impl NinePClient {
         Self::send_raw_at_tag(conn, None, body).await
     }
 
+    /// Waits until the writer flushes a request or an early response proves it was sent.
+    async fn wait_for_send_or_response(
+        sent: &mut oneshot::Receiver<()>,
+        response: &mut oneshot::Receiver<Bytes>,
+    ) -> ClientResult<Option<Bytes>> {
+        tokio::select! {
+            biased;
+            response = response => response.map(Some).map_err(|_| ClientError::Disconnected),
+            sent = sent => {
+                sent.map(|()| None).map_err(|_| ClientError::Disconnected)
+            }
+        }
+    }
+
     /// Sends on a specific connection with an allocated or exact tag.
     async fn send_raw_at_tag(
         conn: &Conn,
@@ -1608,7 +1662,7 @@ impl NinePClient {
             drop(permit);
             return Err(ClientError::Disconnected);
         }
-        let (otx, orx) = oneshot::channel();
+        let (otx, mut orx) = oneshot::channel();
         let tag = match exact_tag {
             Some(tag) => Self::register_tag(conn, tag, otx)
                 .map_err(|_| ClientError::Unexpected("raw tag already registered"))?,
@@ -1634,10 +1688,14 @@ impl NinePClient {
             Ok(b) => b,
             Err(e) => return Err(ClientError::Codec(e)),
         };
+        let (frame, mut sent) = OutboundFrame::new(bytes);
         pending.mark_dispatched();
-        permit.send(bytes);
-        let frame = orx.await.map_err(|_| ClientError::Disconnected)?;
-        let msg = P9Message::from_owned_bytes_ctx(frame, false).map_err(ClientError::Codec)?;
+        permit.send(frame);
+        let response = match Self::wait_for_send_or_response(&mut sent, &mut orx).await? {
+            Some(response) => response,
+            None => orx.await.map_err(|_| ClientError::Disconnected)?,
+        };
+        let msg = P9Message::from_owned_bytes_ctx(response, false).map_err(ClientError::Codec)?;
         if msg.tag != tag {
             return Err(ClientError::Unexpected("response tag"));
         }
@@ -2759,7 +2817,7 @@ enum DialedTransport {
     #[cfg(target_arch = "wasm32")]
     WebSocket(web_transport::WebSocketIo),
     #[cfg(not(target_arch = "wasm32"))]
-    WebSocket(native_web_transport::WebSocketIo),
+    WebSocket(Box<native_web_transport::WebSocketIo>),
 }
 
 /// Open a connection to the target. Native sockets are byte streams and are
@@ -2802,23 +2860,29 @@ async fn dial(target: &Target) -> ClientResult<DialedTransport> {
         #[cfg(not(target_arch = "wasm32"))]
         Target::WebSocket(url) => native_web_transport::connect(url)
             .await
+            .map(Box::new)
             .map(DialedTransport::WebSocket),
     }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 fn configure_tcp(stream: TcpStream) -> ClientResult<DialedTransport> {
-    stream.set_nodelay(true).ok();
-    let keepalive = socket2::TcpKeepalive::new()
-        .with_time(Duration::from_secs(45))
-        .with_interval(Duration::from_secs(15))
-        .with_retries(4);
-    let _ = socket2::SockRef::from(&stream).set_tcp_keepalive(&keepalive);
+    configure_tcp_socket(&stream);
     let (r, w) = stream.into_split();
     Ok(DialedTransport::Native {
         read: Box::new(r),
         write: Box::new(w),
     })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn configure_tcp_socket(stream: &TcpStream) {
+    stream.set_nodelay(true).ok();
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(Duration::from_secs(45))
+        .with_interval(Duration::from_secs(15))
+        .with_retries(4);
+    let _ = socket2::SockRef::from(stream).set_tcp_keepalive(&keepalive);
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -2867,10 +2931,7 @@ mod target_dial_tests {
             .unwrap();
     }
 
-    #[tokio::test]
-    async fn native_websocket_negotiates_private_zerofs_dialect() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-        let url = format!("ws://{}/ws/9p", listener.local_addr().unwrap());
+    async fn assert_native_websocket_negotiates(listener: TcpListener, url: String) {
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
@@ -2906,6 +2967,22 @@ mod target_dial_tests {
         assert!(stats.bytes_received > 0);
         assert_eq!(stats.operations, 2);
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_websocket_negotiates_private_zerofs_dialect() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let url = format!("ws://{}/ws/9p", listener.local_addr().unwrap());
+        assert_native_websocket_negotiates(listener, url).await;
+    }
+
+    #[tokio::test]
+    async fn native_websocket_accepts_bracketed_ipv6_urls() {
+        let Ok(listener) = TcpListener::bind(("::1", 0)).await else {
+            return;
+        };
+        let url = format!("ws://{}/ws/9p", listener.local_addr().unwrap());
+        assert_native_websocket_negotiates(listener, url).await;
     }
 
     #[tokio::test]
@@ -3042,11 +3119,12 @@ async fn query_lineage_token(conn: &Conn) -> ClientResult<()> {
 #[cfg(not(target_arch = "wasm32"))]
 fn spawn_writer(
     write: Box<dyn AsyncWrite + Unpin + Send>,
-    mut rx: mpsc::Receiver<Vec<u8>>,
+    mut rx: mpsc::Receiver<OutboundFrame>,
     conn: Arc<Conn>,
     reconnect: Arc<Notify>,
 ) {
     runtime::spawn(async move {
+        let (write, progress) = write_progress::TrackedIo::new(write);
         let mut writer = tokio::io::BufWriter::with_capacity(64 * 1024, write);
         loop {
             tokio::select! {
@@ -3055,28 +3133,55 @@ fn spawn_writer(
                 _ = conn.writer_shutdown.notified() => break,
                 maybe = rx.recv() => {
                     let Some(frame) = maybe else { break };
-                    conn.counters.bytes_sent.fetch_add(frame.len() as u64, Ordering::Relaxed);
+                    let mut acknowledgements = Vec::new();
+                    conn.counters.bytes_sent.fetch_add(frame.bytes.len() as u64, Ordering::Relaxed);
                     conn.counters.operations.fetch_add(1, Ordering::Relaxed);
-                    if writer.write_all(&frame).await.is_err() {
-                        conn.shutdown();
+                    let wrote = matches!(
+                        write_progress::wait_for_write(
+                            writer.write_all(&frame.bytes),
+                            &progress,
+                            &conn.writer_shutdown,
+                        ).await,
+                        write_progress::WriteOutcome::Completed(Ok(())),
+                    );
+                    if !wrote {
                         break;
                     }
+                    acknowledgements.push(frame.sent);
                     let mut failed = false;
                     while let Ok(more) = rx.try_recv() {
-                        conn.counters.bytes_sent.fetch_add(more.len() as u64, Ordering::Relaxed);
+                        conn.counters.bytes_sent.fetch_add(more.bytes.len() as u64, Ordering::Relaxed);
                         conn.counters.operations.fetch_add(1, Ordering::Relaxed);
-                        if writer.write_all(&more).await.is_err() {
+                        let wrote = matches!(
+                            write_progress::wait_for_write(
+                                writer.write_all(&more.bytes),
+                                &progress,
+                                &conn.writer_shutdown,
+                            ).await,
+                            write_progress::WriteOutcome::Completed(Ok(())),
+                        );
+                        if !wrote {
                             failed = true;
                             break;
                         }
+                        acknowledgements.push(more.sent);
                     }
                     if failed {
-                        conn.shutdown();
                         break;
                     }
-                    if writer.flush().await.is_err() {
-                        conn.shutdown();
+                    let flushed = matches!(
+                        write_progress::wait_for_write(
+                            writer.flush(),
+                            &progress,
+                            &conn.writer_shutdown,
+                        ).await,
+                        write_progress::WriteOutcome::Completed(Ok(())),
+                    );
+                    if !flushed {
                         break;
+                    }
+                    for acknowledgement in acknowledgements {
+                        let _ = acknowledgement.send(());
                     }
                 }
             }
@@ -3275,7 +3380,12 @@ mod durability_tracking_tests {
 }
 
 #[cfg(test)]
-fn test_conn_with_receiver() -> (Arc<Conn>, mpsc::Receiver<Vec<u8>>) {
+fn test_conn_with_receiver() -> (Arc<Conn>, mpsc::Receiver<OutboundFrame>) {
+    test_conn_with_receiver_at(runtime::Clock::now())
+}
+
+#[cfg(test)]
+fn test_conn_with_receiver_at(base: runtime::Clock) -> (Arc<Conn>, mpsc::Receiver<OutboundFrame>) {
     let (writer_tx, rx) = mpsc::channel(1);
     let conn = Arc::new(Conn {
         writer_tx,
@@ -3284,7 +3394,7 @@ fn test_conn_with_receiver() -> (Arc<Conn>, mpsc::Receiver<Vec<u8>>) {
         lineage_token: AtomicU64::new(0),
         writer_epoch: AtomicU64::new(0),
         dead: AtomicBool::new(false),
-        base: runtime::Clock::now(),
+        base,
         last_alive: AtomicU64::new(0),
         probe_lock: tokio::sync::Mutex::new(()),
         writer_shutdown: Notify::new(),
@@ -3298,7 +3408,7 @@ fn test_conn_with_receiver() -> (Arc<Conn>, mpsc::Receiver<Vec<u8>>) {
 mod session_transition_tests {
     use super::*;
 
-    type TestRequests = mpsc::Receiver<Vec<u8>>;
+    type TestRequests = mpsc::Receiver<OutboundFrame>;
     const REPLAY: u8 = P9_REBIND_REPLAY;
     const OPEN_REPLAY: u8 = REPLAY | P9_REBIND_OPENED;
 
@@ -3330,7 +3440,7 @@ mod session_transition_tests {
         requests
             .recv()
             .await
-            .map(|frame| P9Message::from_bytes((&frame, 0)).unwrap().1)
+            .map(|frame| P9Message::from_bytes((&frame.acknowledge(), 0)).unwrap().1)
     }
 
     async fn recv_request(requests: &mut TestRequests, description: &str) -> P9Message {
@@ -3338,7 +3448,7 @@ mod session_transition_tests {
     }
 
     async fn recv_op_request(requests: &mut TestRequests, description: &str) -> P9Message {
-        let frame = requests.recv().await.expect(description);
+        let frame = requests.recv().await.expect(description).acknowledge();
         P9Message::from_bytes_ctx(&frame, true).unwrap()
     }
 
@@ -4511,7 +4621,8 @@ mod session_transition_tests {
         let first_frame = tokio::time::timeout(Duration::from_secs(1), old_requests.recv())
             .await
             .expect("FIRST request was not queued")
-            .expect("old request channel closed");
+            .expect("old request channel closed")
+            .acknowledge();
         let first = P9Message::from_bytes_ctx(&first_frame, true).unwrap();
         let op_id = first.op_id;
         assert_ne!(op_id, [0u8; 16]);
@@ -4538,7 +4649,8 @@ mod session_transition_tests {
         let rerouted_frame = tokio::time::timeout(Duration::from_secs(1), new_requests.recv())
             .await
             .expect("request was not rerouted")
-            .expect("replacement request channel closed");
+            .expect("replacement request channel closed")
+            .acknowledge();
         let rerouted = P9Message::from_bytes_ctx(&rerouted_frame, true).unwrap();
         assert_eq!(rerouted.op_id, op_id);
         assert_eq!(
@@ -4790,7 +4902,7 @@ mod session_transition_tests {
     async fn cancelling_stateful_create_before_enqueue_keeps_connection_live() {
         let (conn, _requests) = test_conn_with_receiver();
         conn.writer_tx
-            .send(vec![0])
+            .send(OutboundFrame::new(vec![0]).0)
             .await
             .expect("test writer queue should accept its first frame");
         let client = test_client(Arc::clone(&conn));
@@ -4824,7 +4936,8 @@ mod session_transition_tests {
         let first_frame = tokio::time::timeout(Duration::from_secs(1), requests.recv())
             .await
             .expect("request was not queued")
-            .expect("request channel closed");
+            .expect("request channel closed")
+            .acknowledge();
         let first = P9Message::from_bytes_ctx(&first_frame, true).unwrap();
         assert_eq!(conn.pending.len(), 1);
         request.abort();
@@ -4841,7 +4954,8 @@ mod session_transition_tests {
         let second_frame = tokio::time::timeout(Duration::from_secs(1), requests.recv())
             .await
             .expect("second request was not queued")
-            .expect("request channel closed");
+            .expect("request channel closed")
+            .acknowledge();
         let second = P9Message::from_bytes_ctx(&second_frame, true).unwrap();
         assert_ne!(second.tag, first.tag);
 
@@ -4857,11 +4971,182 @@ mod session_transition_tests {
         assert!(conn.pending.is_empty());
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn reply_timeout_starts_after_transport_send_completion() {
+        let (conn, mut requests) = test_conn_with_receiver_at(runtime::Clock::ago(LIVENESS_WINDOW));
+        let client = test_client(Arc::clone(&conn));
+        let request_client = Arc::clone(&client);
+        let request = tokio::spawn(async move { request_client.write(7, 0, b"payload").await });
+
+        let frame = requests.recv().await.expect("request was not queued");
+
+        for _ in 0..=7 {
+            tokio::time::advance(REQUEST_TIMEOUT).await;
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !conn.dead.load(Ordering::Acquire),
+            "a frame still being sent must not trigger connection replay"
+        );
+        assert!(
+            !request.is_finished(),
+            "the request must remain pending until the transport completes the send"
+        );
+
+        frame.acknowledge();
+        tokio::task::yield_now().await;
+        tokio::time::advance(REQUEST_TIMEOUT + Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        let probe = requests
+            .recv()
+            .await
+            .expect("reply liveness probe did not start after send completion")
+            .acknowledge();
+        assert!(matches!(
+            P9Message::from_bytes_ctx(&probe, true).unwrap().body,
+            Message::Tgetlineage(_)
+        ));
+
+        request.abort();
+        let _ = request.await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn healthy_liveness_probes_allow_a_late_reply() {
+        let (conn, mut requests) = test_conn_with_receiver_at(runtime::Clock::ago(LIVENESS_WINDOW));
+        let client = test_client(Arc::clone(&conn));
+        let request_client = Arc::clone(&client);
+        let request = tokio::spawn(async move { request_client.write(7, 0, b"payload").await });
+
+        let write = recv_op_request(&mut requests, "write request").await;
+        assert!(matches!(write.body, Message::Twrite(_)));
+        tokio::task::yield_now().await;
+
+        // Nine successful probes carry this request beyond the old 64-second
+        // aggregate reply ceiling while every individual wait remains bounded.
+        for probe_number in 1..=9 {
+            // `Clock` is deliberately real-time on native targets; make the
+            // synthetic connection stale before advancing Tokio's paused clock.
+            conn.last_alive.store(0, Ordering::Relaxed);
+            tokio::time::advance(REQUEST_TIMEOUT + Duration::from_millis(1)).await;
+            tokio::task::yield_now().await;
+            assert!(
+                !conn.dead.load(Ordering::Acquire),
+                "connection retired before liveness probe {probe_number}"
+            );
+            let probe = requests
+                .recv()
+                .await
+                .expect("request channel closed")
+                .acknowledge();
+            let probe = P9Message::from_bytes_ctx(&probe, true).unwrap();
+            assert!(matches!(probe.body, Message::Tgetlineage(_)));
+            reply(
+                &conn,
+                probe.tag,
+                Message::Rgetlineage(Rgetlineage {
+                    token: 1,
+                    writer_epoch: 1,
+                }),
+            );
+            for _ in 0..3 {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        reply(
+            &conn,
+            write.tag,
+            Message::Rwrite(Rwrite {
+                count: b"payload".len() as u32,
+            }),
+        );
+        assert_eq!(request.await.unwrap().unwrap(), b"payload".len() as u64);
+        assert!(!conn.dead.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn ready_response_wins_over_dropped_send_ack() {
+        let expected = Bytes::from_static(b"response");
+
+        for _ in 0..128 {
+            let (sent_tx, mut sent) = oneshot::channel();
+            let (response_tx, mut response) = oneshot::channel();
+            drop(sent_tx);
+            response_tx.send(expected.clone()).unwrap();
+
+            assert_eq!(
+                NinePClient::wait_for_send_or_response(&mut sent, &mut response)
+                    .await
+                    .unwrap(),
+                Some(expected.clone()),
+                "a delivered response is authoritative even when the writer fails afterward"
+            );
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test(start_paused = true)]
+    async fn stalled_tcp_send_retires_the_connection() {
+        let (conn, requests) = test_conn_with_receiver();
+        let reconnect = Arc::new(Notify::new());
+        let (writer, _peer_that_never_reads) = tokio::io::duplex(1);
+        spawn_writer(Box::new(writer), requests, Arc::clone(&conn), reconnect);
+
+        let (frame, sent) = OutboundFrame::new(vec![0; 64 * 1024 + 1]);
+        conn.writer_tx.send(frame).await.unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::advance(MUTATION_RETRY_HORIZON).await;
+        tokio::task::yield_now().await;
+
+        assert!(
+            conn.dead.load(Ordering::Acquire),
+            "a transport with no write progress must not hang the session forever"
+        );
+        assert!(sent.await.is_err());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test(start_paused = true)]
+    async fn slow_tcp_progress_refreshes_the_stall_budget() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (stream, mut peer) = tokio::io::duplex(1);
+        let (mut stream, progress) = write_progress::TrackedIo::new(stream);
+        let shutdown = Arc::new(Notify::new());
+        let writer_shutdown = Arc::clone(&shutdown);
+        let send = tokio::spawn(async move {
+            write_progress::wait_for_write(
+                stream.write_all(b"abc"),
+                &progress,
+                writer_shutdown.as_ref(),
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+
+        let almost_stalled = SEND_STALL_TIMEOUT - Duration::from_secs(1);
+        tokio::time::advance(almost_stalled).await;
+        let mut byte = [0];
+        peer.read_exact(&mut byte).await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(!send.is_finished());
+
+        tokio::time::advance(almost_stalled).await;
+        peer.read_exact(&mut byte).await.unwrap();
+        tokio::task::yield_now().await;
+
+        assert!(matches!(
+            send.await.unwrap(),
+            write_progress::WriteOutcome::Completed(Ok(()))
+        ));
+    }
+
     #[tokio::test]
     async fn cancelling_before_writer_capacity_does_not_register_a_tag() {
         let (conn, _requests) = test_conn_with_receiver();
         conn.writer_tx
-            .send(vec![0])
+            .send(OutboundFrame::new(vec![0]).0)
             .await
             .expect("test writer queue should accept its first frame");
 

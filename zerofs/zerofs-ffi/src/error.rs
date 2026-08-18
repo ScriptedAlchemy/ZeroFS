@@ -69,7 +69,7 @@ pub enum ZeroFsError {
     /// Handle or client used after `close()` (EBADF).
     #[error("handle is closed")]
     Closed,
-    /// The initial connection or attach failed.
+    /// Connection setup or an established connection failed.
     #[error("connection failed: {message}")]
     ConnectFailed {
         /// What failed during connect/attach.
@@ -116,22 +116,22 @@ impl ZeroFsError {
     /// Linux errno for this error (mirrors the Rust client's `to_errno`).
     pub fn to_errno(&self) -> i32 {
         match self {
-            Self::NotFound { .. } => libc::ENOENT,
-            Self::PermissionDenied { .. } => libc::EACCES,
-            Self::NotPermitted { .. } => libc::EPERM,
-            Self::AlreadyExists { .. } => libc::EEXIST,
-            Self::NotADirectory { .. } => libc::ENOTDIR,
-            Self::IsADirectory { .. } => libc::EISDIR,
-            Self::DirectoryNotEmpty { .. } => libc::ENOTEMPTY,
-            Self::NameTooLong { .. } => libc::ENAMETOOLONG,
-            Self::InvalidArgument { .. } => libc::EINVAL,
-            Self::TooManySymlinks { .. } => libc::ELOOP,
-            Self::Closed => libc::EBADF,
-            Self::ConnectFailed { .. } => libc::EIO,
+            Self::NotFound { .. } => 2,
+            Self::PermissionDenied { .. } => 13,
+            Self::NotPermitted { .. } => 1,
+            Self::AlreadyExists { .. } => 17,
+            Self::NotADirectory { .. } => 20,
+            Self::IsADirectory { .. } => 21,
+            Self::DirectoryNotEmpty { .. } => 39,
+            Self::NameTooLong { .. } => 36,
+            Self::InvalidArgument { .. } => 22,
+            Self::TooManySymlinks { .. } => 40,
+            Self::Closed => 9,
+            Self::ConnectFailed { .. } => 5,
             Self::NotLeader { .. } => 108,
-            Self::Stale { .. } => libc::ESTALE,
+            Self::Stale { .. } => 116,
             Self::Io { errno, .. } => *errno,
-            Self::Protocol { .. } => libc::EIO,
+            Self::Protocol { .. } => 5,
         }
     }
 }
@@ -195,7 +195,7 @@ mod tests {
             C::Stale { path: p() },
             // A distinct errno checks the `Io` passthrough, not a fixed mapping.
             C::Io {
-                errno: libc::EXDEV,
+                errno: 18,
                 path: p(),
                 message: m(),
             },

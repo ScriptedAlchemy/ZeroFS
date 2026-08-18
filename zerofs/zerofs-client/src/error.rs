@@ -63,9 +63,9 @@ pub enum ZeroFsError {
     },
     /// Handle or client used after `close()`.
     Closed,
-    /// Initial connection, negotiation, or attach failure.
+    /// Connection, negotiation, or attach failure.
     ConnectFailed {
-        /// What failed during connect/attach.
+        /// What failed during connection setup or use.
         message: String,
     },
     /// The target is no longer the HA leader (`P9_ENOTLEADER`).
@@ -196,6 +196,9 @@ impl ZeroFsError {
     pub(crate) fn from_client(e: &ClientError, path: &str) -> Self {
         match e {
             ClientError::Errno(code) => Self::from_errno(*code as i32, path),
+            ClientError::Disconnected => Self::ConnectFailed {
+                message: format!("{path}: {e}"),
+            },
             other => Self::Protocol {
                 message: format!("{path}: {other}"),
             },
@@ -211,5 +214,19 @@ pub(crate) trait ClientResultExt<T> {
 impl<T> ClientResultExt<T> for Result<T, ClientError> {
     fn ctx(self, path: &str) -> Result<T, ZeroFsError> {
         self.map_err(|e| ZeroFsError::from_client(&e, path))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disconnected_transport_maps_to_the_retryable_connection_surface() {
+        assert!(matches!(
+            ZeroFsError::from_client(&ClientError::Disconnected, "/book.m4b"),
+            ZeroFsError::ConnectFailed { message }
+                if message == "/book.m4b: 9P connection lost"
+        ));
     }
 }

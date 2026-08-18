@@ -1,5 +1,6 @@
+use crate::buffered_send::BufferedSendQueue;
 use crate::runtime::{self, sleep};
-use crate::{ClientError, ClientResult, Conn};
+use crate::{ClientError, ClientResult, Conn, OutboundFrame, SEND_STALL_TIMEOUT};
 use bytes::Bytes;
 use js_sys::{ArrayBuffer, Uint8Array};
 use std::cell::RefCell;
@@ -12,6 +13,7 @@ use wasm_bindgen::closure::Closure;
 use web_sys::{BinaryType, Event, MessageEvent, WebSocket};
 
 const MAX_BUFFERED_BYTES: u32 = 4 * 1024 * 1024;
+const BUFFER_POLL_INTERVAL: Duration = Duration::from_millis(2);
 
 pub(super) struct WebSocketIo {
     socket: WebSocket,
@@ -97,7 +99,7 @@ pub(super) async fn connect(url: &str) -> ClientResult<WebSocketIo> {
 
 pub(super) fn spawn(
     io: WebSocketIo,
-    mut outgoing: mpsc::Receiver<Vec<u8>>,
+    mut outgoing: mpsc::Receiver<OutboundFrame>,
     conn: Arc<Conn>,
     reconnect: Arc<Notify>,
 ) {
@@ -105,34 +107,49 @@ pub(super) fn spawn(
     let writer_conn = Arc::clone(&conn);
     let writer_reconnect = Arc::clone(&reconnect);
     runtime::spawn(async move {
+        let mut pending = BufferedSendQueue::default();
+        let mut observed_buffered = 0u64;
+        let mut last_progress = runtime::Clock::now();
         loop {
-            let frame = tokio::select! {
+            if writer_socket.ready_state() != WebSocket::OPEN {
+                break;
+            }
+
+            let buffered = u64::from(writer_socket.buffered_amount());
+            if buffered < observed_buffered {
+                last_progress = runtime::Clock::now();
+            }
+            observed_buffered = buffered;
+            pending.acknowledge_drained(buffered);
+            if pending.is_empty() {
+                last_progress = runtime::Clock::now();
+            } else if last_progress.elapsed_millis() >= SEND_STALL_TIMEOUT.as_millis() as u64 {
+                break;
+            }
+
+            let can_send = writer_socket.buffered_amount() <= MAX_BUFFERED_BYTES;
+            tokio::select! {
                 biased;
                 _ = writer_conn.writer_shutdown.notified() => return,
-                frame = outgoing.recv() => frame,
-            };
-            let Some(frame) = frame else { return };
-            while writer_socket.buffered_amount() > MAX_BUFFERED_BYTES {
-                if writer_socket.ready_state() != WebSocket::OPEN {
+                frame = outgoing.recv(), if can_send => {
+                    let Some(frame) = frame else { break };
+                    let frame_len = frame.bytes.len() as u64;
+                    writer_conn.counters.bytes_sent.fetch_add(
+                        frame_len,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                     writer_conn
-                        .dead
-                        .store(true, std::sync::atomic::Ordering::Release);
-                    writer_conn.reader_shutdown.notify_one();
-                    writer_reconnect.notify_waiters();
-                    return;
+                        .counters
+                        .operations
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if writer_socket.send_with_u8_array(&frame.bytes).is_err() {
+                        break;
+                    }
+                    pending.push(frame_len, frame.sent);
+                    observed_buffered = u64::from(writer_socket.buffered_amount());
+                    pending.acknowledge_drained(observed_buffered);
                 }
-                sleep(Duration::from_millis(2)).await;
-            }
-            writer_conn
-                .counters
-                .bytes_sent
-                .fetch_add(frame.len() as u64, std::sync::atomic::Ordering::Relaxed);
-            writer_conn
-                .counters
-                .operations
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if writer_socket.send_with_u8_array(&frame).is_err() {
-                break;
+                _ = sleep(BUFFER_POLL_INTERVAL) => {}
             }
         }
         writer_conn
