@@ -105,15 +105,23 @@ directory type conflict fails before that item is copied.
 For each planned file, the client:
 
 1. creates the destination parent directories if needed;
-2. creates a unique `.zerofs-<uuid>.tmp` file in the destination directory with
+2. when `--resume` is set, skips a final regular destination file whose byte
+   length matches the planned source; hidden temporary files never qualify;
+3. creates a unique `.zerofs-<uuid>.tmp` file in the destination directory with
    create-new semantics;
-3. reads the local file into a reusable buffer capped by the negotiated maximum
+4. reads the local file into a reusable buffer capped by the negotiated maximum
    9P write payload;
-4. writes each buffer at its absolute offset with `File::write_at`;
-5. updates aggregate progress after each acknowledged chunk;
-6. renames the temporary file over the exact destination path;
-7. syncs that file through its still-open fid; and
-8. reports the file complete only after the sync succeeds.
+5. writes each buffer at its absolute offset with `File::write_at`;
+6. updates aggregate progress after each acknowledged chunk;
+7. renames the temporary file over the exact destination path;
+8. syncs that file through its still-open fid; and
+9. reports the file complete only after the sync succeeds.
+
+Resume is opt-in and size-based so a repeated directory upload can avoid
+replacing already materialized files without downloading them. It does not
+prove content equality: two regular files with equal byte lengths are treated
+as a match. Missing, different-length, and non-regular destinations follow the
+normal upload or existing type-conflict path. The default remains overwrite.
 
 Directory uploads run up to eight file copies concurrently by default. This
 matches the browser's useful acceleration model: files are parallel, while the
@@ -214,6 +222,8 @@ The focused test set currently covers:
   narrow-terminal layout;
 - real single-file and nested-tree upload/download with exact byte comparison,
   exact destination paths, and preservation of unrelated entries;
+- size-based upload resume for single files and nested trees, including
+  different-length replacement and local-source revalidation before a skip;
 - cancellation before download publication and visibility of files completed
   before another file fails;
 - rollback of failed-attempt byte progress, bounded transient file retries, and
@@ -240,5 +250,6 @@ Acceptance requires:
    completion before durability/finalization succeeds.
 
 Prebuilt macOS packaging, signing, notarization, native `wss://`, within-file
-parallel ranges, restart resume, bidirectional synchronization, checksum-based
-skip logic, and destination mirroring are outside this first release.
+parallel ranges, partial-file byte-offset restart resume, bidirectional
+synchronization, checksum-based skip logic, and destination mirroring are
+outside this first release.

@@ -13,6 +13,7 @@ pub(super) async fn upload_file(
     client: Arc<Client>,
     planned: PlannedFile,
     destination: PathBuf,
+    resume: bool,
     progress: Progress,
     cancellation: CancellationToken,
 ) -> Result<()> {
@@ -25,6 +26,11 @@ pub(super) async fn upload_file(
                 "remote destination is a directory: {}",
                 destination.display()
             )
+        }
+        Ok(metadata) if resume && metadata.is_file() && metadata.size == planned.size => {
+            drop(open_local_source(&planned).await?);
+            progress.skip_file(progress_path(&planned), planned.size);
+            return Ok(());
         }
         Ok(_) | Err(zerofs_client::ZeroFsError::NotFound { .. }) => {}
         Err(error) => {
@@ -174,22 +180,7 @@ async fn stream_upload(
     progress: &FileProgress,
     cancellation: &CancellationToken,
 ) -> Result<()> {
-    let mut options = tokio::fs::OpenOptions::new();
-    options.read(true).custom_flags(libc::O_NOFOLLOW);
-    let mut local = options
-        .open(&planned.source)
-        .await
-        .with_context(|| format!("open local source {}", planned.source.display()))?;
-    let metadata = local
-        .metadata()
-        .await
-        .with_context(|| format!("inspect local source {}", planned.source.display()))?;
-    if !metadata.is_file() || metadata.len() != planned.size {
-        bail!(
-            "local source changed while uploading: {}",
-            planned.source.display()
-        );
-    }
+    let mut local = open_local_source(planned).await?;
     let buffer_size = planned.size.min(chunk_size as u64).max(1) as usize;
     let mut buffer = vec![0; buffer_size];
     let mut offset = 0u64;
@@ -228,6 +219,26 @@ async fn stream_upload(
         );
     }
     Ok(())
+}
+
+async fn open_local_source(planned: &PlannedFile) -> Result<tokio::fs::File> {
+    let mut options = tokio::fs::OpenOptions::new();
+    options.read(true).custom_flags(libc::O_NOFOLLOW);
+    let local = options
+        .open(&planned.source)
+        .await
+        .with_context(|| format!("open local source {}", planned.source.display()))?;
+    let metadata = local
+        .metadata()
+        .await
+        .with_context(|| format!("inspect local source {}", planned.source.display()))?;
+    if !metadata.is_file() || metadata.len() != planned.size {
+        bail!(
+            "local source changed while uploading: {}",
+            planned.source.display()
+        );
+    }
+    Ok(local)
 }
 
 async fn stream_download(

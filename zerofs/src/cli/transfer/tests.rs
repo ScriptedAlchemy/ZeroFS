@@ -19,6 +19,8 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use zerofs_client::Client;
 
+mod resume;
+
 async fn remote_client() -> (Arc<Client>, CancellationToken, tempfile::TempDir) {
     let filesystem = Arc::new(ZeroFS::new_in_memory().await.unwrap());
     let temp = tempfile::tempdir().unwrap();
@@ -356,9 +358,15 @@ async fn upload_jobs_use_bounded_independent_websocket_sessions() {
     fs::write(source.join("two.bin"), b"two").unwrap();
     fs::write(source.join("three.bin"), b"three").unwrap();
 
-    run_upload(&format!("ws://{address}/ws/9p"), source, "/dest".into(), 3)
-        .await
-        .unwrap();
+    run_upload(
+        &format!("ws://{address}/ws/9p"),
+        source,
+        "/dest".into(),
+        3,
+        false,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(connections.load(Ordering::Relaxed), 3);
     server.abort();
@@ -383,6 +391,7 @@ async fn upload_streams_each_chunk_once_and_releases_temporary_resources() {
         std::slice::from_ref(&client),
         plan,
         Path::new("/dest"),
+        false,
         progress,
         CancellationToken::new(),
     )
@@ -432,6 +441,7 @@ async fn completed_files_are_visible_before_the_rest_of_the_batch_finishes() {
         std::slice::from_ref(&client),
         plan,
         Path::new("/dest"),
+        false,
         Progress::new("upload", 15, 2),
         CancellationToken::new(),
     )
@@ -506,6 +516,7 @@ async fn single_file_transfers_use_the_exact_destination_path() {
         std::slice::from_ref(&client),
         upload_plan,
         Path::new("/uploaded.bin"),
+        false,
         Progress::new("upload", 7, 1),
         CancellationToken::new(),
     )
@@ -579,6 +590,7 @@ async fn file_directory_conflicts_fail_before_copying_bytes() {
         std::slice::from_ref(&client),
         scan_local(&source).unwrap(),
         Path::new("/occupied"),
+        false,
         upload_progress.clone(),
         CancellationToken::new(),
     )
@@ -649,6 +661,7 @@ async fn upload_does_not_follow_a_source_replaced_by_a_symlink_after_planning() 
             total_bytes: size,
         },
         Path::new("/uploaded.m4b"),
+        false,
         Progress::new("upload", size, 1),
         CancellationToken::new(),
     )
@@ -925,6 +938,7 @@ async fn cancellation_during_empty_directory_sync_never_prints_completion() {
                 total_bytes: 0,
             },
             Path::new("/empty"),
+            false,
             Progress::new("upload", 0, 0),
             task_cancellation,
         )

@@ -87,14 +87,23 @@ impl Progress {
         ));
     }
 
+    pub(super) fn skip_file(&self, path: &Path, size: u64) {
+        self.bar.inc(size);
+        self.record_file(path, "skipped");
+    }
+
     fn finish_file(&self, path: &Path) {
+        self.record_file(path, "complete");
+    }
+
+    fn record_file(&self, path: &Path, status: &str) {
         let mut completed = self.completed_files.lock().unwrap();
         *completed += 1;
         let completed = *completed;
         self.set_file_message(completed);
         if self.bar.is_hidden() {
             eprintln!(
-                "{} file {completed}/{} complete: {}",
+                "{} file {completed}/{} {status}: {}",
                 self.direction,
                 self.total_files,
                 path.display()

@@ -97,6 +97,9 @@ through an existing 9P endpoint:
 # Upload a file or the contents of a directory tree
 zerofs upload 127.0.0.1:5564 ./Audiobooks /Audiobooks
 
+# Repeat an upload without replacing materialized same-size files
+zerofs upload 127.0.0.1:5564 ./Audiobooks /Audiobooks --resume
+
 # Download a file or directory tree
 zerofs download 127.0.0.1:5564 /Audiobooks ./Audiobooks
 
@@ -116,6 +119,14 @@ downloads use 8 concurrent files by default; pass `--jobs N` to change that
 limit. Each worker requests a 9 MiB 9P message size, uses the server-negotiated
 maximum payload, and keeps chunks within one file sequential. The CLI shows
 aggregate bytes, rate, ETA, completed-file count, and active paths.
+
+Upload `--resume` checks each final destination path before copying it. A final
+regular file with the same byte length as its local source is reported as
+skipped; missing and different-length files use the normal upload path. Hidden
+`.zerofs-*.tmp` files never qualify. This is a deliberately cheap restart aid,
+not a content checksum: same-length but different bytes are considered already
+materialized. Without `--resume`, uploads retain their normal overwrite
+behavior.
 
 Connection loss during an individual 9P mutation is replayed by the client with
 the same operation ID. If a connection, stale-handle, leader, or retry-later
@@ -139,8 +150,9 @@ visibility after all chunks arrive, and then verifies durability through the
 still-open file handle. It reports the file complete only after that sync
 succeeds; if sync fails, the renamed file may be visible without verified
 durability. A download syncs its local temporary file before renaming it over
-the destination. Completed files remain published, but transfers do not resume
-partial files across process restarts or split one file into parallel ranges.
+the destination. Completed files remain published. `upload --resume` can skip
+materialized same-length final files, but transfers do not continue a partial
+file from its last byte or split one file into parallel ranges.
 Symlinks and other special source entries are rejected rather than followed.
 
 `zerofs rm` follows the Web UI's recursive delete model: it lists and validates

@@ -374,7 +374,7 @@ strict Clippy plus the `wasm32-unknown-unknown` compile gate.
 
 - [ ] **Step 1: Write the README command contract**
 
-Add a `Direct transfers (no mount)` subsection documenting all three commands, Unix/TCP/HA/`ws://` target examples, exact-root copy semantics, explicit recursive removal, overwrite-without-delete behavior during copies, progress fields, rename-before-sync durability behavior, the requested 9 MiB message size and server-negotiated payload, the eight-job default and `--jobs`, and exclusions for `wss://`, special source entries, restart resume, and within-file multipart ranges.
+Add a `Direct transfers (no mount)` subsection documenting all three commands, Unix/TCP/HA/`ws://` target examples, exact-root copy semantics, explicit recursive removal, overwrite-without-delete behavior during copies, progress fields, rename-before-sync durability behavior, the requested 9 MiB message size and server-negotiated payload, the eight-job default and `--jobs`, size-based `upload --resume` for materialized final files, and exclusions for `wss://`, special source entries, partial-file byte-offset resume, and within-file multipart ranges.
 
 - [ ] **Step 2: Run formatting and focused verification**
 

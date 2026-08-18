@@ -40,6 +40,7 @@ pub(crate) async fn run_upload(
     source: PathBuf,
     destination: PathBuf,
     jobs: usize,
+    resume: bool,
 ) -> Result<()> {
     if jobs == 0 {
         bail!("upload jobs must be at least 1");
@@ -55,7 +56,14 @@ pub(crate) async fn run_upload(
     let (cancellation, signal) = cancellation_on_ctrl_c();
     let notice_progress = progress.clone();
     let result = with_settling_notices(
-        execute_upload(&clients, plan, &destination, progress, cancellation.clone()),
+        execute_upload(
+            &clients,
+            plan,
+            &destination,
+            resume,
+            progress,
+            cancellation.clone(),
+        ),
         cancellation,
         move |waited| notice_progress.settling(waited),
     )
@@ -319,6 +327,7 @@ async fn execute_upload(
     clients: &[Arc<Client>],
     plan: TransferPlan,
     destination: &Path,
+    resume: bool,
     progress: Progress,
     cancellation: CancellationToken,
 ) -> Result<()> {
@@ -355,7 +364,14 @@ async fn execute_upload(
         cancellation.child_token(),
         move |client, file, cancellation| {
             let target = file_destination(&destination, &file);
-            upload_file(client, file, target, worker_progress.clone(), cancellation)
+            upload_file(
+                client,
+                file,
+                target,
+                resume,
+                worker_progress.clone(),
+                cancellation,
+            )
         },
     )
     .await?;

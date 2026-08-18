@@ -81,8 +81,9 @@ async fn async_main() -> Result<()> {
             source,
             destination,
             jobs,
+            resume,
         } => {
-            cli::transfer::run_upload(&target, source, destination, jobs).await?;
+            cli::transfer::run_upload(&target, source, destination, jobs, resume).await?;
         }
         cli::Commands::Download {
             target,
