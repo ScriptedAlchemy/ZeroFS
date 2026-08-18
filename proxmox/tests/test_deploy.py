@@ -47,16 +47,7 @@ zerofs_writeback_terminal_error 0
 
 
 class SystemdTemplateTests(unittest.TestCase):
-    def test_nbd_client_reconnects_after_a_transient_server_restart(self) -> None:
-        unit = (
-            Path(__file__).parents[1]
-            / "systemd"
-            / "zerofs-lxc-nbd-client.service"
-        ).read_text()
-
-        self.assertIn("-persist -timeout 600", unit)
-
-    def test_file_namespace_mount_is_persistent_and_independent_from_nbd(self) -> None:
+    def test_vm100_has_only_the_direct_persistent_nfs_mount(self) -> None:
         unit = (
             Path(__file__).parents[1]
             / "systemd"
@@ -74,20 +65,15 @@ class SystemdTemplateTests(unittest.TestCase):
         self.assertIn("WantedBy=remote-fs.target", unit)
         self.assertNotIn("zerofs-lxc-nbd-client.service", unit)
 
-        nbd_unit = (
-            Path(__file__).parents[1] / "systemd" / "mnt-zerofs-lxc.mount"
-        ).read_text()
-        self.assertIn("What=/dev/nbd0", nbd_unit)
-        self.assertIn("Where=/mnt/zerofs-lxc", nbd_unit)
-        self.assertIn("Type=xfs", nbd_unit)
-        self.assertIn("Options=rw,noatime,nodiscard", nbd_unit)
-
         root = Path(__file__).parents[1]
         for obsolete in (
             Path("systemd") / r"mnt-zerofs\x2dfiles\x2draw.mount",
             Path("systemd") / r"mnt-zerofs\x2dfiles\x2draw-.nbd.mount",
             Path("systemd") / "zerofs-shared-namespace-permissions.service",
+            Path("systemd") / "zerofs-lxc-nbd-client.service",
+            Path("systemd") / "mnt-zerofs-lxc.mount",
             Path("guest") / "normalize-shared-namespace.py",
+            Path("guest") / "tune-nbd.sh",
         ):
             with self.subTest(obsolete=obsolete):
                 self.assertFalse((root / obsolete).exists())
@@ -435,7 +421,7 @@ class CliDryRunTests(ConfigValidationTests):
             check=False,
         )
 
-    def test_deploy_dry_run_prints_build_stage_and_reconnect_without_running_them(
+    def test_deploy_dry_run_prints_build_and_stage_without_vm_nbd_actions(
         self,
     ) -> None:
         config = self.write_config(self.valid_config())
@@ -443,7 +429,9 @@ class CliDryRunTests(ConfigValidationTests):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("cargo build --release --locked", result.stdout)
         self.assertIn("host-deploy.sh deploy", result.stdout)
-        self.assertIn("systemctl start zerofs-lxc-nbd-client.service", result.stdout)
+        self.assertNotIn("ubuntu-main bash -se", result.stdout)
+        self.assertNotIn("nbd-client", result.stdout)
+        self.assertNotIn("/mnt/zerofs-lxc", result.stdout)
         self.assertNotIn("mkfs", result.stdout)
 
     def test_cleanup_dry_run_keeps_persistent_state(self) -> None:
@@ -576,7 +564,7 @@ class CliDryRunTests(ConfigValidationTests):
             deploy.release_id(commit, [second]),
         )
 
-    def test_migration_can_quiesce_old_units_without_overwriting_them(self) -> None:
+    def test_migration_quiesces_legacy_nbd_without_restoring_it(self) -> None:
         config = self.write_config(self.valid_config())
         result = self.run_cli(
             "deploy",
@@ -598,11 +586,12 @@ class CliDryRunTests(ConfigValidationTests):
         self.assertIn("systemctl stop mnt-storagebox-nbd-pilot.mount", result.stdout)
         self.assertIn("systemctl stop zerofs-nbd-client.service", result.stdout)
         self.assertIn("systemctl stop zerofs-nbd-pilot.service", result.stdout)
-        self.assertIn(
-            "install -m 0644 /tmp/zerofs-lxc-nbd-client.service "
-            "/etc/systemd/system/zerofs-lxc-nbd-client.service",
+        self.assertNotIn(
+            "install -m 0644 /tmp/zerofs-lxc-nbd-client.service",
             result.stdout,
         )
+        self.assertNotIn("systemctl start zerofs-lxc-nbd-client.service", result.stdout)
+        self.assertNotIn("systemctl start mnt-zerofs-lxc.mount", result.stdout)
 
 
 if __name__ == "__main__":

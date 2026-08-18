@@ -91,9 +91,9 @@ reconnect window while the release changes. Failure
 switches the symlink back and restarts the previously active services. No
 production rootfs destruction is available.
 
-Dev replacement first syncs/unmounts VM100, disconnects its NBD client, and
-requires the same four stable writeback samples plus zero volatile NBD bytes and
-operations. The Proxmox host repeats the gate before shutdown. Destructive dev
+Dev replacement requires the same four stable writeback samples plus zero
+volatile NBD bytes and operations. The Proxmox host repeats the gate before
+shutdown. It never connects or mounts an NBD device on VM100. Destructive dev
 replacement requires the exact CTID confirmation and takes a `vzdump` rollback
 backup. Dev cleanup destroys only the rootfs and preserves its role-specific
 state directory and namespace registry.
@@ -116,8 +116,8 @@ durable before a dev CT is replaced. A missing metric fails closed.
 - `pct`, `vzdump`, and a downloaded Debian LXC template on Proxmox.
 - Proxmox `local` storage configured for `snippets` so it can hold
   `local:snippets/zerofs-lxc-hook.sh`.
-- For dev: `nbd-client`, XFS and systemd on VM100, plus an existing named NBD
-  export. The bundle never runs `mkfs`, creates an export, or changes its size.
+- NFS client support (`nfs-common`) and systemd on VM100. The bundle never
+  connects, mounts, or configures an NBD device on VM100.
 
 ## Templates and resource sizing
 
@@ -183,15 +183,11 @@ sudo mount_nfs \
 Use the actual production CT address in place of `10.10.10.30`. The private
 WebUI is at `http://10.10.10.30:8080` and must never be made public.
 
-VM100 can keep the production NBD/XFS volume mounted at `/mnt/zerofs-lxc`
-while separately mounting the normal ZeroFS file namespace at
-`/mnt/zerofs-files`. These are independent read-write mountpoints: XFS over
-the existing NBD client for the LXC volume, and a direct NFSv3/TCP mount for the
-shared file namespace. The NFS client uses hard mounts, 1 MiB read/write
-requests, a one-second attribute cache, and `_netdev` so it remains independent
-from the NBD client lifecycle.
+VM100 has exactly one persistent ZeroFS mount: the direct read-write NFSv3/TCP
+file namespace at `/mnt/zerofs-files`. The NFS client uses hard mounts, 1 MiB
+read/write requests, a one-second attribute cache, and `_netdev`.
 
-Install the direct NFS mount without changing the existing NBD units:
+Install the one persistent direct NFS mount:
 
 ```bash
 sudo install -d -m 0755 /mnt/zerofs-files
@@ -202,9 +198,40 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now 'mnt-zerofs\x2dfiles.mount'
 ```
 
-The result is two independent VM100 mountpoints: read-write XFS over NBD at
-`/mnt/zerofs-lxc`, and the read-write shared file tree at
-`/mnt/zerofs-files` over the production NFSv3 export.
+The result is one persistent VM100 ZeroFS mount: the read-write shared file tree
+at `/mnt/zerofs-files` over the production NFSv3 export.
+
+### One-time retirement of a legacy VM100 NBD mount
+
+For an already-installed NBD/XFS pilot, first complete the existing drain and
+data-safety gate. Keep the remote NBD export data until its separately approved
+retention decision; this retirement does not delete it. Then stop and disable
+the legacy consumer, confirm its filesystem is no longer mounted, disconnect
+the device, remove the locally installed units, and reload systemd:
+
+```bash
+sudo systemctl disable --now mnt-zerofs-lxc.mount zerofs-lxc-nbd-client.service
+if findmnt -rn -M /mnt/zerofs-lxc >/dev/null; then
+  sudo sync -f /mnt/zerofs-lxc
+  sudo umount /mnt/zerofs-lxc
+fi
+if test -s /sys/class/block/nbd0/pid; then
+  sudo nbd-client -d /dev/nbd0
+fi
+sudo rm -f /etc/systemd/system/mnt-zerofs-lxc.mount \
+  /etc/systemd/system/zerofs-lxc-nbd-client.service \
+  /usr/local/libexec/zerofs-tune-nbd /etc/zerofs-lxc/client.env
+sudo systemctl daemon-reload
+! systemctl is-enabled mnt-zerofs-lxc.mount
+! systemctl is-enabled zerofs-lxc-nbd-client.service
+! findmnt -rn -M /mnt/zerofs-lxc
+test ! -s /sys/class/block/nbd0/pid
+```
+
+The deploy path never installs, enables, starts, or mounts these NBD artifacts.
+It accepts `--source-client-unit`, `--source-mount-unit`, and
+`--source-mountpoint` only as an explicit, one-way legacy-quiescing set during a
+migration; it does not reconnect the retired device.
 
 ZeroFS NFS reports writes as stable while they are buffered, and tested macOS
 and Linux clients do not issue a durability-producing COMMIT on `fsync`.

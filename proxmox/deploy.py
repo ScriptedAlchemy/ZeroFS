@@ -3,7 +3,8 @@
 
 The coordinator runs on the ZeroFS build machine (VM100 in the documented
 deployment).  Proxmox mutations are delegated to ``host-deploy.sh`` only after
-the NBD consumer is quiesced and every volatile/writeback tier is drained.
+an explicitly named legacy NBD consumer is quiesced and every
+volatile/writeback tier is drained.
 """
 
 from __future__ import annotations
@@ -25,10 +26,6 @@ from pathlib import Path
 from typing import Sequence
 
 
-TARGET_CLIENT_UNIT = "zerofs-lxc-nbd-client.service"
-TARGET_MOUNT_UNIT = "mnt-zerofs-lxc.mount"
-TARGET_MOUNTPOINT = "/mnt/zerofs-lxc"
-TARGET_NBD_DEVICE = "/dev/nbd0"
 RFC1918_NETWORKS = tuple(
     ipaddress.ip_network(value)
     for value in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
@@ -584,6 +581,22 @@ fi
     _ssh(runner, args.vm_host, script)
 
 
+def _has_legacy_nbd_source(args: argparse.Namespace) -> bool:
+    source = (
+        args.source_client_unit,
+        args.source_mount_unit,
+        args.source_mountpoint,
+    )
+    if not any(source):
+        return False
+    if not all(source):
+        raise ValueError(
+            "legacy NBD quiescing requires --source-client-unit, "
+            "--source-mount-unit, and --source-mountpoint together"
+        )
+    return True
+
+
 def _wait_remote_drain(runner: Runner, args: argparse.Namespace) -> None:
     if args.skip_existing_drain:
         return
@@ -734,42 +747,6 @@ def _stage_and_run_host(
         )
 
 
-def _reconnect_guest(runner: Runner, args: argparse.Namespace) -> None:
-    script = f"""set -euo pipefail
-sudo install -d -m 0755 /etc/zerofs-lxc /etc/systemd/system
-sudo install -d -m 0755 /usr/local/libexec
-sudo tee /etc/zerofs-lxc/client.env >/dev/null <<'EOF'
-ZEROFS_NBD_HOST={args.container_ip}
-ZEROFS_NBD_PORT={args.nbd_port}
-ZEROFS_NBD_EXPORT={args.nbd_export}
-ZEROFS_NBD_CONNECTIONS={args.connections}
-ZEROFS_NBD_DEVICE={TARGET_NBD_DEVICE}
-EOF
-sudo install -m 0644 /tmp/zerofs-lxc-nbd-client.service /etc/systemd/system/{TARGET_CLIENT_UNIT}
-sudo install -m 0644 /tmp/mnt-zerofs-lxc.mount /etc/systemd/system/{TARGET_MOUNT_UNIT}
-sudo install -m 0755 /tmp/tune-nbd.sh /usr/local/libexec/zerofs-tune-nbd
-sudo systemctl daemon-reload
-sudo systemctl start {TARGET_CLIENT_UNIT}
-sudo systemctl start {TARGET_MOUNT_UNIT}
-systemctl is-active --quiet {TARGET_CLIENT_UNIT}
-systemctl is-active --quiet {TARGET_MOUNT_UNIT}
-findmnt -rn -M {TARGET_MOUNTPOINT}
-rm -f /tmp/zerofs-lxc-nbd-client.service /tmp/mnt-zerofs-lxc.mount /tmp/tune-nbd.sh
-"""
-    bundle = Path(__file__).resolve().parent
-    runner.run(
-        [
-            "scp",
-            "-q",
-            str(bundle / "systemd" / "zerofs-lxc-nbd-client.service"),
-            str(bundle / "systemd" / "mnt-zerofs-lxc.mount"),
-            str(bundle / "guest" / "tune-nbd.sh"),
-            f"{args.vm_host}:/tmp/",
-        ]
-    )
-    _ssh(runner, args.vm_host, script)
-
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("deploy", "replace", "cleanup", "status"))
@@ -798,13 +775,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--existing-metrics-url")
     parser.add_argument("--drain-timeout", type=int, default=1800)
     parser.add_argument("--skip-existing-drain", action="store_true")
-    parser.add_argument("--source-client-unit", default=TARGET_CLIENT_UNIT)
-    parser.add_argument("--source-mount-unit", default=TARGET_MOUNT_UNIT)
-    parser.add_argument("--source-mountpoint", default=TARGET_MOUNTPOINT)
+    parser.add_argument("--source-client-unit")
+    parser.add_argument("--source-mount-unit")
+    parser.add_argument("--source-mountpoint")
     parser.add_argument("--source-server-unit")
-    parser.add_argument("--nbd-port", type=int, default=10809)
-    parser.add_argument("--nbd-export", default="vm100-pilot-64g")
-    parser.add_argument("--connections", type=int, default=8)
     parser.add_argument("--dry-run", action="store_true")
     return parser
 
@@ -841,6 +815,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise ValueError("SMB production access requires --samba-password-file")
     if args.skip_existing_drain and args.source_server_unit is not None:
         raise ValueError("cannot skip drain while migrating a source ZeroFS server")
+    legacy_nbd_source = _has_legacy_nbd_source(args)
     runner = Runner(args.dry_run)
 
     if args.action == "status":
@@ -866,7 +841,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     if args.role == "dev":
-        _quiesce_guest(runner, args)
+        if legacy_nbd_source:
+            _quiesce_guest(runner, args)
         _wait_remote_drain(runner, args)
         _stop_source_server(runner, args)
 
@@ -924,8 +900,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         namespace,
         release,
     )
-    if args.role == "dev":
-        _reconnect_guest(runner, args)
     print(f"deployed_commit={commit}")
     print(f"binary_sha256={binary_hash}")
     print(f"metrics_url={args.metrics_url}")

@@ -56,7 +56,6 @@ class HostScriptTests(unittest.TestCase):
             HOST_SCRIPT,
             HOOK,
             ROOT / "deploy.sh",
-            ROOT / "guest" / "tune-nbd.sh",
         ):
             with self.subTest(path=path):
                 result = subprocess.run(
