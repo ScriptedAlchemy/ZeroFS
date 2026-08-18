@@ -30,20 +30,25 @@
 Before executing any task in this plan, define this function in the same shell. Every filtered Cargo test command below uses it; raw filtered `cargo test` is not an acceptable substitute.
 
 ```bash
-cargo_test_nonzero() {
+cargo_test_nonzero() (
+  set -o pipefail
   filter="$1"
   shift
   safe_filter="${filter//[^A-Za-z0-9]/_}"
   list_log="${TMPDIR:-/tmp}/zerofs-${safe_filter}-list.log"
   run_log="${TMPDIR:-/tmp}/zerofs-${safe_filter}-run.log"
-  command cargo test "$@" -- --list | tee "$list_log"
-  grep -F "$filter" "$list_log"
-  command cargo test "$@" "$filter" -- --nocapture 2>&1 | tee "$run_log"
+  if ! command cargo test "$@" -- --list 2>&1 | tee "$list_log"; then
+    exit 1
+  fi
+  test "$(grep -Fc "$filter" "$list_log")" -gt 0
+  if ! command cargo test "$@" "$filter" -- --nocapture 2>&1 | tee "$run_log"; then
+    exit 1
+  fi
   grep -Eq 'test result: ok\. [1-9][0-9]* passed' "$run_log"
-}
+)
 ```
 
-The list grep proves the filter exists; the result assertion proves it executed at least one test. Exact ignored tests additionally use `--exact` and assert exactly one pass.
+The subshell scopes `pipefail`; either Cargo or `tee` failing makes the helper fail before selection/result checks. The list count proves the filter exists, and the result assertion proves it executed at least one passing test. Exact ignored tests additionally use `--exact` and assert exactly one pass.
 
 ---
 
@@ -1020,23 +1025,24 @@ pub struct CommitResult {
 
 #[async_trait::async_trait]
 pub trait NFSFileSystem: Send + Sync {
-    fn get_write_verf(&self) -> writeverf3;
-
     async fn write(
         &self,
-        file_id: &fileid3,
+        auth: &AuthContext,
+        id: fileid3,
         offset: u64,
         data: &[u8],
     ) -> Result<fattr3, nfsstat3>;
 
     async fn write_with_context(
         &self,
-        _context: &WriteRequestContext,
-        file_id: &fileid3,
+        context: &WriteRequestContext,
+        auth: &AuthContext,
+        id: fileid3,
         offset: u64,
         data: &[u8],
     ) -> Result<WriteResult, nfsstat3> {
-        let attributes = self.write(file_id, offset, data).await?;
+        let _ = context;
+        let attributes = self.write(auth, id, offset, data).await?;
         Ok(WriteResult {
             attributes,
             committed: stable_how::FILE_SYNC,
@@ -1046,26 +1052,35 @@ pub trait NFSFileSystem: Send + Sync {
 
     async fn commit(
         &self,
-        file_id: &fileid3,
-        offset: u64,
-        count: u32,
-    ) -> Result<writeverf3, nfsstat3>;
+        _auth: &AuthContext,
+        _fileid: fileid3,
+        _offset: u64,
+        _count: u32,
+    ) -> Result<writeverf3, nfsstat3> {
+        Ok(self.get_write_verf())
+    }
 
     async fn commit_with_context(
         &self,
-        _context: &CommitRequestContext,
-        file_id: &fileid3,
+        context: &CommitRequestContext,
+        auth: &AuthContext,
+        fileid: fileid3,
         offset: u64,
         count: u32,
     ) -> Result<CommitResult, nfsstat3> {
+        let _ = context;
         Ok(CommitResult {
-            verifier: self.commit(file_id, offset, count).await?,
+            verifier: self.commit(auth, fileid, offset, count).await?,
         })
+    }
+
+    fn get_write_verf(&self) -> writeverf3 {
+        [0u8; NFS3_WRITEVERFSIZE as usize]
     }
 }
 ```
 
-The existing `write`, `commit`, and `get_write_verf` receiver and argument shapes remain source-compatible. The two contextual methods are additive defaults that delegate once to the legacy method; no handler calls both paths. The WRITE handler constructs `WriteRequestContext`, and the COMMIT handler constructs `CommitRequestContext` while keeping file ID/offset/count as method arguments. Test that the server mints a fresh `connection_incarnation` per accepted transport, address reuse after reconnect changes it, XID/stability reach the VFS, returned committed/verifier reach the wire, invalid stable-how returns garbage args, COMMIT forwards XID/range, default delegation calls each legacy method exactly once, and legacy trait implementors still compile.
+This is the relevant additive excerpt; every unrelated upstream trait method remains unchanged. The existing `write` keeps `auth: &AuthContext` and by-value `id: fileid3`. The existing `commit` keeps `auth: &AuthContext`, by-value `fileid3`, offset/count, and its default delegation to `get_write_verf`; `get_write_verf` keeps its zero-verifier default. The two contextual methods add context without weakening or replacing those defaults, forward the same auth reference and by-value file ID exactly once, and delegate once to the legacy method; no handler calls both paths. The WRITE handler constructs `WriteRequestContext`, and the COMMIT handler constructs `CommitRequestContext`, then passes decoded auth plus the original by-value file ID/offset/count. Test that the server mints a fresh `connection_incarnation` per accepted transport, address reuse after reconnect changes it, XID/stability/auth reach the VFS, returned committed/verifier reach the wire, invalid stable-how returns garbage args, COMMIT forwards auth/XID/range, default delegation calls each legacy method exactly once, a legacy implementor that omits `commit` and `get_write_verf` still receives the existing defaults, and all legacy trait implementors still compile.
 
 - [ ] **Step 2: Implement and validate the additive API**
 

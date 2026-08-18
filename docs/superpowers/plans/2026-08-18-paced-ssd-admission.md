@@ -27,20 +27,25 @@
 Before executing any task in this plan, define this function in the same shell. Every filtered Cargo test command below uses it; raw filtered `cargo test` is not an acceptable substitute.
 
 ```bash
-cargo_test_nonzero() {
+cargo_test_nonzero() (
+  set -o pipefail
   filter="$1"
   shift
   safe_filter="${filter//[^A-Za-z0-9]/_}"
   list_log="${TMPDIR:-/tmp}/zerofs-${safe_filter}-list.log"
   run_log="${TMPDIR:-/tmp}/zerofs-${safe_filter}-run.log"
-  command cargo test "$@" -- --list | tee "$list_log"
-  grep -F "$filter" "$list_log"
-  command cargo test "$@" "$filter" -- --nocapture 2>&1 | tee "$run_log"
+  if ! command cargo test "$@" -- --list 2>&1 | tee "$list_log"; then
+    exit 1
+  fi
+  test "$(grep -Fc "$filter" "$list_log")" -gt 0
+  if ! command cargo test "$@" "$filter" -- --nocapture 2>&1 | tee "$run_log"; then
+    exit 1
+  fi
   grep -Eq 'test result: ok\. [1-9][0-9]* passed' "$run_log"
-}
+)
 ```
 
-The list grep proves the filter exists; the result assertion proves it executed at least one test. Exact ignored tests additionally use `--exact` and assert exactly one pass.
+The subshell scopes `pipefail`; either Cargo or `tee` failing makes the helper fail before selection/result checks. The list count proves the filter exists, and the result assertion proves it executed at least one passing test. Exact ignored tests additionally use `--exact` and assert exactly one pass.
 
 ---
 
@@ -360,7 +365,8 @@ pub(crate) fn promote_multipart(
 
 ```bash
 cd /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback/zerofs
-cargo test -p zerofs --lib --locked -- --list | tee /tmp/zerofs-multipart-tests.list
+cargo test -p zerofs --lib --locked -- --list > /tmp/zerofs-multipart-tests.list
+cat /tmp/zerofs-multipart-tests.list
 grep -Fx 'writeback::multipart_reservation::tests::memory_part_is_reserved_before_buffer_copy: test' /tmp/zerofs-multipart-tests.list
 grep -Fx 'writeback::multipart_reservation::tests::parallel_memory_parts_share_global_cap: test' /tmp/zerofs-multipart-tests.list
 grep -Fx 'writeback::multipart_reservation::tests::ssd_part_is_reserved_before_staging_file_create: test' /tmp/zerofs-multipart-tests.list
@@ -372,10 +378,8 @@ grep -Fx 'writeback::multipart_reservation::tests::ram_promotion_succeeds_with_z
 grep -Fx 'writeback::multipart_reservation::tests::ssd_promotion_succeeds_with_zero_spare_headroom: test' /tmp/zerofs-multipart-tests.list
 grep -F 'writeback::store::tests::' /tmp/zerofs-multipart-tests.list
 test "$(grep -Fc 'writeback::store::tests::' /tmp/zerofs-multipart-tests.list)" -gt 0
-cargo test -p zerofs writeback::multipart_reservation::tests --locked -- --nocapture 2>&1 | tee /tmp/zerofs-multipart-tests.run
-grep -Eq 'test result: ok\. [1-9][0-9]* passed' /tmp/zerofs-multipart-tests.run
-cargo test -p zerofs writeback::store::tests --locked -- --nocapture 2>&1 | tee /tmp/zerofs-multipart-store.run
-grep -Eq 'test result: ok\. [1-9][0-9]* passed' /tmp/zerofs-multipart-store.run
+cargo_test_nonzero 'writeback::multipart_reservation::tests' -p zerofs --locked
+cargo_test_nonzero 'writeback::store::tests' -p zerofs --locked
 cargo fmt --all -- --check
 git diff --check
 ```
