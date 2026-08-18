@@ -17,7 +17,7 @@ segment_size_mib = 32
 read_cache_part_size_kib = 1024
 
 [filesystem]
-max_size_gb = 5000.0
+max_size_gb = 6000.0
 ignore_fsync = false
 
 [writeback]
@@ -31,6 +31,11 @@ shutdown_flush = "local"
 
 [servers.ninep]
 unix_socket = "/run/zerofs/9p.sock"
+
+[servers.nbd]
+addresses = ["10.10.10.30:10809"]
+unix_socket = "/run/zerofs/nbd.sock"
+write_ack_mode = "materialized"
 
 [servers.nfs]
 addresses = ["10.10.10.30:2049"]

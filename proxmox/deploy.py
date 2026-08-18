@@ -180,8 +180,22 @@ def validate_server_config(
                     "volatile acknowledgement requires exclusive NBD access"
                 )
     else:
-        if servers.get("nbd") not in (None, {}):
-            raise ValueError("prod must use container-owned 9P, not an NBD listener")
+        nbd = servers.get("nbd")
+        if not isinstance(nbd, dict):
+            raise ValueError("prod requires the private NBD listener")
+        nbd_addresses = _addresses(nbd)
+        if not nbd_addresses:
+            raise ValueError("prod NBD must have a private TCP listener")
+        for address in nbd_addresses:
+            host, port = _split_listener(address)
+            if host != expected_ip or port != 10809:
+                raise ValueError(
+                    "prod NBD must listen only on the private container address at port 10809"
+                )
+        if nbd.get("unix_socket") != "/run/zerofs/nbd.sock":
+            raise ValueError("prod requires the container-owned NBD Unix socket")
+        if nbd.get("write_ack_mode") != "materialized":
+            raise ValueError('prod NBD write_ack_mode must be "materialized"')
         ninep = servers.get("ninep")
         if (
             not isinstance(ninep, dict)

@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 
@@ -124,6 +125,11 @@ dir = "/srv/zerofs-persist/state/writeback"
 [servers.ninep]
 unix_socket = "/run/zerofs/9p.sock"
 
+[servers.nbd]
+addresses = ["10.10.10.30:10809"]
+unix_socket = "/run/zerofs/nbd.sock"
+write_ack_mode = "materialized"
+
 [servers.nfs]
 addresses = ["10.10.10.30:2049"]
 
@@ -197,20 +203,45 @@ addresses = ["10.10.10.30:9567"]
             deploy.validate_server_config(config, "10.10.10.20", memory_mb=65536)
         deploy.validate_server_config(config, "10.10.10.20", memory_mb=98304)
 
-    def test_prod_role_requires_container_owned_ninep_and_nonvolatile_ack(self) -> None:
+    def test_prod_role_allows_only_private_materialized_nbd(self) -> None:
         config = self.write_config(self.prod_config())
         deploy.validate_server_config(
             config, "10.10.10.30", memory_mb=98304, role="prod"
         )
-        volatile = self.prod_config().replace(
-            '[servers.ninep]\nunix_socket = "/run/zerofs/9p.sock"',
-            '[servers.nbd]\naddresses = ["10.10.10.30:10809"]\n'
-            'write_ack_mode = "volatile_memory"\nvolatile_memory_gb = 16.0',
+        for unsafe, message in (
+            (
+                self.prod_config().replace(
+                    'write_ack_mode = "materialized"',
+                    'write_ack_mode = "volatile_memory"\nvolatile_memory_gb = 16.0',
+                ),
+                "materialized",
+            ),
+            (
+                self.prod_config().replace(
+                    'addresses = ["10.10.10.30:10809"]',
+                    'addresses = ["0.0.0.0:10809"]',
+                ),
+                "private container address",
+            ),
+        ):
+            with self.subTest(message=message), self.assertRaisesRegex(
+                ValueError, message
+            ):
+                deploy.validate_server_config(
+                    self.write_config(unsafe), "10.10.10.30", role="prod"
+                )
+
+    def test_prod_template_can_host_a_five_tib_nbd_export(self) -> None:
+        template = Path(__file__).parents[1] / "templates/zerofs-prod.toml.example"
+        deploy.validate_server_config(
+            template, "10.10.10.30", memory_mb=98304, role="prod"
         )
-        with self.assertRaisesRegex(ValueError, "prod.*9P"):
-            deploy.validate_server_config(
-                self.write_config(volatile), "10.10.10.30", role="prod"
-            )
+        with template.open("rb") as handle:
+            settings = tomllib.load(handle)
+        self.assertGreater(
+            settings["filesystem"]["max_size_gb"] * 1_000_000_000,
+            5 * 1024**4,
+        )
 
     def test_prod_webui_requires_exact_private_address_and_port(self) -> None:
         deploy.validate_server_config(
