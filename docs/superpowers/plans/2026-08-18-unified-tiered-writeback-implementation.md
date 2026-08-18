@@ -21,7 +21,8 @@
 - Every implementation task starts with a named focused RED test, ends with non-vacuous focused GREEN tests, formatting/diff checks, independent review, and one exact-file commit.
 - Commit commands name every file. Never stage broad directories. Never edit the approved spec as part of implementation; any amendment is a separate reviewed documentation task.
 - Portable unit/build/lint/model/WebUI/WASM gates may run on macOS. Real Linux protocol, mount, filesystem, block-device, crash-process, and performance proof runs only on Ubuntu from the exact pushed SHA.
-- Every real resource is UUID-unique and ledgered. Never use CT198, VM100 production mounts, production prefixes/exports, or active devices.
+- Every real resource is UUID-unique and ledgered. The immutable ledger/cleanup receipts live in a UUID control root separate from the disposable UUID resource root; cleanup removes the resource root while preserving its external authority until receipts are archived and the control root is finalized. Never use CT198, VM100 production mounts, production prefixes/exports, or active devices.
+- Every real Ubuntu slice follows RED, implementation, portable GREEN, exact commit/review, push, fail-closed synchronization to that commit's literal 40-hex SHA, then Linux proof. Every corrective commit repeats the same synchronization before proof reruns.
 - No fake protocol, mock-only acceptance, in-memory substitute, zero-test filter, or disconnected layer may be presented as integrated proof.
 
 ## Enforceable Review Limits
@@ -126,7 +127,7 @@ Record SHA, branch, porcelain, commands, and results. Ignored failover/performan
 - [ ] Materialized mode remains the generated/runtime default; volatile mode is explicitly lossy before the completed local floor and durable afterward.
 - [ ] At/below the completed local floor all state is complete/consistent; above it only the explicitly permitted canonical striped-NBD member prefix may survive, with no torn metadata/namespace claim.
 - [ ] Every filtered test was listed first or replaced by a complete module gate; no zero-test result is accepted.
-- [ ] Every ledger has two successful idempotent cleanup calls plus `assert-clean`; no temporary mount, device, process, listener, socket, pool/filesystem, backend prefix, directory, or secondary worktree remains.
+- [ ] Every external ledger has two successful idempotent cleanup calls plus `assert-clean`; its control root is removed only after ledger/receipts are hash-verified in `/fast/zerofs-tiered-receipts/$RUN_UUID`; no temporary mount, device, process, listener, socket, pool/filesystem, backend prefix, resource/control directory, or secondary worktree remains.
 - [ ] Simplify, deslop, branch-scope, low-value-churn, TraceDecay code-health/Hawk, thermonuclear correctness/security, and thermonuclear maintainability reviews have no unresolved P0/P1/P2.
 - [ ] `develop` is fast-forwarded, pushed, and clean at the reviewed SHA.
 - [ ] Ubuntu `/fast/projects/ZeroFS` passed clean-porcelain, exact-branch, expected-old/new-SHA, no-active-job, and ancestry checks before fast-forward; it equals pushed `develop` and is clean afterward.

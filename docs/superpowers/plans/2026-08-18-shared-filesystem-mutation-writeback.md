@@ -25,6 +25,26 @@
 - Review limits: facade/config glue 250 production lines; types 300; each admission/progress/durability/request-cache/fence module 400; overlay/materializer 600 each; an async worker loop 150; a function 100; source plus inline tests 1000, after which tests move to a separate test module.
 - Each task starts with named RED tests, runs the exact GREEN gate, stages only its exact file fence, and creates one self-contained commit.
 
+## Non-Vacuous Filtered Cargo Gates
+
+Before executing any task in this plan, define this function in the same shell. Every filtered Cargo test command below uses it; raw filtered `cargo test` is not an acceptable substitute.
+
+```bash
+cargo_test_nonzero() {
+  filter="$1"
+  shift
+  safe_filter="${filter//[^A-Za-z0-9]/_}"
+  list_log="${TMPDIR:-/tmp}/zerofs-${safe_filter}-list.log"
+  run_log="${TMPDIR:-/tmp}/zerofs-${safe_filter}-run.log"
+  command cargo test "$@" -- --list | tee "$list_log"
+  grep -F "$filter" "$list_log"
+  command cargo test "$@" "$filter" -- --nocapture 2>&1 | tee "$run_log"
+  grep -Eq 'test result: ok\. [1-9][0-9]* passed' "$run_log"
+}
+```
+
+The list grep proves the filter exists; the result assertion proves it executed at least one test. Exact ignored tests additionally use `--exact` and assert exactly one pass.
+
 ---
 
 ### Task A1: Extract Coordination Primitives Without Behavior Change
@@ -48,7 +68,7 @@ Move the current FIFO, cancellation, capacity-refresh, blocked-transition, grant
 
 ```bash
 cd /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback/zerofs
-cargo test -p zerofs coordination:: --locked -- --nocapture
+cargo_test_nonzero 'coordination::' -p zerofs --locked
 ```
 
 Expected RED: imports fail until the existing implementations move.
@@ -61,10 +81,10 @@ Move the existing queue, policy hooks, waiter/grant guards, permits, and sequenc
 
 ```bash
 cd /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback/zerofs
-cargo test -p zerofs coordination:: --locked -- --nocapture
-cargo test -p zerofs writeback::admission::tests --locked -- --nocapture
-cargo test -p zerofs writeback::journaler::tests --locked -- --nocapture
-cargo test -p zerofs writeback::remote::tests --locked -- --nocapture
+cargo_test_nonzero 'coordination::' -p zerofs --locked
+cargo_test_nonzero 'writeback::admission::tests' -p zerofs --locked
+cargo_test_nonzero 'writeback::journaler::tests' -p zerofs --locked
+cargo_test_nonzero 'writeback::remote::tests' -p zerofs --locked
 cargo fmt --all -- --check
 git diff --check
 ```
@@ -107,7 +127,7 @@ pub(crate) enum FilesystemWriteAckSource {
 
 ```bash
 cd /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback/zerofs
-cargo test -p zerofs config::tests::filesystem_write_ack --locked -- --nocapture
+cargo_test_nonzero 'config::tests::filesystem_write_ack' -p zerofs --locked
 ```
 
 Expected RED: the mutation module and normalized source/target types do not exist.
@@ -144,8 +164,8 @@ Resolve `client_durability_target` once: any enabled object writeback is `LocalS
 
 ```bash
 cd /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback/zerofs
-cargo test -p zerofs config::tests --locked -- --nocapture
-cargo test -p zerofs cli::server::tests::volatile --locked -- --nocapture
+cargo_test_nonzero 'config::tests' -p zerofs --locked
+cargo_test_nonzero 'cli::server::tests::volatile' -p zerofs --locked
 cargo fmt --all -- --check
 git diff --check
 git add zerofs/src/fs/mutation/mod.rs zerofs/src/fs/mutation/config.rs zerofs/src/fs/mod.rs zerofs/src/config.rs zerofs/src/cli/server.rs
@@ -186,7 +206,7 @@ pub(crate) async fn apply_prepared_batch(
 
 ```bash
 cd /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback/zerofs
-cargo test -p zerofs fs::ops::write::tests --locked -- --nocapture
+cargo_test_nonzero 'fs::ops::write::tests' -p zerofs --locked
 ```
 
 Expected RED: extracted types and entry points are absent.
@@ -199,9 +219,9 @@ Preparation owns dedup checks, sorted inode-lock acquisition, overlap waits, aut
 
 ```bash
 cd /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback/zerofs
-cargo test -p zerofs fs::ops::write::tests --locked -- --nocapture
-cargo test -p zerofs fs::ops::io::tests --locked -- --nocapture
-cargo test -p zerofs fs::store::extent::inflight::tests --locked -- --nocapture
+cargo_test_nonzero 'fs::ops::write::tests' -p zerofs --locked
+cargo_test_nonzero 'fs::ops::io::tests' -p zerofs --locked
+cargo_test_nonzero 'fs::store::extent::inflight::tests' -p zerofs --locked
 cargo fmt --all -- --check
 git diff --check
 git add zerofs/src/fs/ops/write.rs zerofs/src/fs/mutation/types.rs zerofs/src/fs/ops/io.rs zerofs/src/fs/ops/mod.rs zerofs/src/fs/mod.rs zerofs/src/fs/boot.rs
@@ -253,11 +273,11 @@ CAS-reserve growth against committed plus pending visible size. Drop rolls back 
 
 ```bash
 cd /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback/zerofs
-cargo test -p zerofs fs::quota::tests --locked -- --nocapture
-cargo test -p zerofs fs::ops::write::tests --locked -- --nocapture
-cargo test -p zerofs fs::ops::setattr::tests --locked -- --nocapture
-cargo test -p zerofs fs::ops::remove::tests --locked -- --nocapture
-cargo test -p zerofs fs::handle::tests --locked -- --nocapture
+cargo_test_nonzero 'fs::quota::tests' -p zerofs --locked
+cargo_test_nonzero 'fs::ops::write::tests' -p zerofs --locked
+cargo_test_nonzero 'fs::ops::setattr::tests' -p zerofs --locked
+cargo_test_nonzero 'fs::ops::remove::tests' -p zerofs --locked
+cargo_test_nonzero 'fs::handle::tests' -p zerofs --locked
 cargo fmt --all -- --check
 git diff --check
 git add zerofs/src/fs/quota.rs zerofs/src/fs/mutation/types.rs zerofs/src/fs/ops/write.rs zerofs/src/fs/ops/setattr.rs zerofs/src/fs/ops/remove.rs zerofs/src/fs/handle.rs zerofs/src/fs/mod.rs
@@ -274,7 +294,7 @@ git commit -m "refactor(fs): transfer prepared write quota ownership"
 - Modify: `zerofs/src/fs/mutation/mod.rs`
 
 **Interfaces:**
-- Produces: `RequestIdentity`, `RequestFingerprint`, `RequestLookup`, `RequestCache`, `PendingRequest`, and `RetainedRequest`.
+- Produces: `RequestIdentity`, `RequestFingerprint`, `RequestLookup`, `RequestCache`, `PendingRequest`, `AcceptedRequest`, and `RetainedRequest`.
 - Consumes: protocol connection/session incarnations, operation IDs/handles/XIDs, payload/auth/durability fingerprints, operation cap, and canonical dedup.
 
 - [ ] **Step 1: Write RED identity and cache tests**
@@ -294,6 +314,19 @@ pub(crate) enum RequestIdentity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct RequestFingerprint([u8; 32]);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RequestLifetime {
+    CanonicalDedup,
+    ReplayWindow(std::time::Duration),
+    InFlightOnly,
+    OneShot,
+}
+
+pub(crate) struct RequestOperationSlot {
+    cache: std::sync::Weak<RequestCacheInner>,
+    active: bool,
+}
+
 pub(crate) enum RequestLookup {
     Vacant(RequestVacancy),
     Joined(std::sync::Arc<RetainedRequest>),
@@ -303,7 +336,68 @@ pub(crate) enum RequestLookup {
 
 pub(crate) struct RequestCache {
     max_entries: usize,
-    state: std::sync::Mutex<RequestCacheState>,
+    inner: std::sync::Arc<RequestCacheInner>,
+}
+
+pub(crate) struct RequestVacancy {
+    cache: std::sync::Arc<RequestCacheInner>,
+    identity: RequestIdentity,
+    fingerprint: RequestFingerprint,
+    lifetime: RequestLifetime,
+    operation_slot: Option<RequestOperationSlot>,
+}
+
+pub(crate) struct PendingRequest {
+    cache: std::sync::Arc<RequestCacheInner>,
+    identity: RequestIdentity,
+    fingerprint: RequestFingerprint,
+    lifetime: RequestLifetime,
+    operation_slot: Option<RequestOperationSlot>,
+    state: PendingRequestState,
+}
+
+pub(crate) struct AcceptedRequest {
+    cache: std::sync::Arc<RequestCacheInner>,
+    identity: RequestIdentity,
+    operation_slot: Option<RequestOperationSlot>,
+}
+
+impl RequestVacancy {
+    pub(crate) fn begin_pending(mut self) -> PendingRequest {
+        self.cache.mark_pending(&self.identity);
+        PendingRequest {
+            cache: std::sync::Arc::clone(&self.cache),
+            identity: self.identity.clone(),
+            fingerprint: self.fingerprint,
+            lifetime: self.lifetime,
+            operation_slot: self.operation_slot.take(),
+            state: PendingRequestState::Preparing,
+        }
+    }
+}
+
+impl PendingRequest {
+    pub(crate) fn accept(mut self) -> AcceptedRequest {
+        self.state = PendingRequestState::Accepted;
+        AcceptedRequest {
+            cache: std::sync::Arc::clone(&self.cache),
+            identity: self.identity.clone(),
+            operation_slot: self.operation_slot.take(),
+        }
+    }
+
+    pub(crate) fn fail(
+        self,
+        error: FsError,
+    ) -> std::sync::Arc<RetainedRequest> {
+        let cache = std::sync::Arc::clone(&self.cache);
+        cache.retain_failure(self, error)
+    }
+
+    pub(crate) fn cancel(self) {
+        let cache = std::sync::Arc::clone(&self.cache);
+        cache.remove_pending_and_release_slot(self);
+    }
 }
 
 impl RequestCache {
@@ -315,19 +409,23 @@ impl RequestCache {
     ) -> Result<RequestLookup, RequestCacheError>;
     pub(crate) fn complete(
         &self,
-        pending: PendingRequest,
+        accepted: AcceptedRequest,
         result: Result<PreparedBatchResult, FsError>,
     ) -> std::sync::Arc<RetainedRequest>;
 }
 ```
 
-NFS identity always includes a server-minted transport `connection_incarnation`; client address is part of the fingerprint, not a substitute for the incarnation. Reusing an address after reconnect cannot join old work.
+`lookup_or_reserve` performs join/fingerprint/pressure handling before any raw admission call. `Vacant` already owns exactly one cache operation slot. `RequestOperationSlot::drop` releases its operation charge when `active`; the sole transfer path moves it without disarming into the next owner, and retained completion disarms it only when the cache entry assumes the bounded charge. `RequestVacancy::begin_pending(self)` consumes the vacancy and moves that same slot into `PendingRequest`; it does not allocate a second slot. Dropping an unconsumed vacancy or calling `PendingRequest::cancel` removes the provisional entry and releases the slot. `PendingRequest::fail` atomically publishes the retained failure and transfers the slot to its bounded replay lifetime; expiry/removal of that retained failure releases the slot exactly once. `PendingRequest::accept` is the only accepted transition: it consumes the pending owner and moves the same slot into `AcceptedRequest`; `RequestCache::complete` consumes that accepted owner and retains the final result. A joined lookup never reaches raw admission. NFS identity always includes a server-minted transport `connection_incarnation`; client address is part of the fingerprint, not a substitute for the incarnation. Reusing an address after reconnect cannot join old work.
 
-- [ ] **Step 2: Run GREEN and commit**
+- [ ] **Step 2: Implement vacancy-to-pending ownership**
+
+Insert the vacancy while holding the cache-state mutex, move its single operation slot through `begin_pending`, and make every cancellation/error/drop path remove or retain the entry exactly once. A lookup that returns `Joined` returns the retained shared result immediately and cannot call `RawMutationBudget::acquire`.
+
+- [ ] **Step 3: Run GREEN and commit**
 
 ```bash
 cd /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback/zerofs
-cargo test -p zerofs fs::mutation::request_cache::tests --locked -- --nocapture
+cargo_test_nonzero 'fs::mutation::request_cache::tests' -p zerofs --locked
 cargo clippy -p zerofs --lib --locked -- -D warnings
 cargo fmt --all -- --check
 git diff --check
@@ -346,12 +444,12 @@ git commit -m "feat(mutation): add bounded protocol request replay"
 - Modify: `zerofs/src/fs/mutation/mod.rs`
 
 **Interfaces:**
-- Produces: `RawMutationBudget`, `RawMutationPermit`, `PreparationGuard`, `ConflictKey`, `ConflictScope`, `MutationIncarnation`, `MutationCutoff`, and `MutationProgress`.
+- Produces: `RawMutationBudget`, `RawMutationPermit`, `PreparationGuard`, `PreparationAbort`, `ConflictKey`, `ConflictScope`, `MutationIncarnation`, `MutationCutoff`, and `MutationProgress`.
 - Consumes: shared coordination primitives, request vacancies, byte/op settings, and terminal state.
 
 - [ ] **Step 1: Write RED admission/progress tests**
 
-Name tests `permit_is_acquired_before_payload_copy`, `cancelled_waiter_rolls_back_bytes_and_ops`, `race_winner_releases_unused_permit`, `guard_must_publish_or_abort`, `gate_close_waits_pre_cutoff_guards`, `guard_holds_no_canonical_lock`, `out_of_order_completion_advances_gap_free_prefix`, and `terminal_wakes_all_waiters`.
+Name tests `permit_is_acquired_before_payload_copy`, `cancelled_waiter_rolls_back_bytes_and_ops`, `race_winner_releases_unused_permit`, `guard_must_publish_or_abort`, `guard_failure_retains_result_and_releases_raw_permit`, `guard_cancellation_removes_request_and_releases_slot`, `gate_close_waits_pre_cutoff_guards`, `guard_holds_no_canonical_lock`, `out_of_order_completion_advances_gap_free_prefix`, and `terminal_wakes_all_waiters`.
 
 ```rust
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -379,23 +477,48 @@ pub(crate) struct PreparationGuard {
     state: PreparationState,
 }
 
+pub(crate) struct AcceptedMutation {
+    request: AcceptedRequest,
+    batch: PreparedWriteBatch,
+    raw_permit: RawMutationPermit,
+    cutoff: MutationCutoff,
+}
+
+pub(crate) enum PreparationAbort {
+    RequestFailure(FsError),
+    TransportCancellation,
+}
+
+impl PreparationGuard {
+    pub(crate) fn new(
+        gate: std::sync::Arc<PreparationGate>,
+        scope: ConflictScope,
+        raw_permit: RawMutationPermit,
+        request: PendingRequest,
+    ) -> Result<Self, MutationError>;
+}
+
 impl PreparationGuard {
     pub(crate) fn publish(
         self,
         batch: PreparedWriteBatch,
     ) -> Result<AcceptedMutation, MutationError>;
-    pub(crate) fn abort(self, error: FsError) -> Result<(), MutationError>;
+    pub(crate) fn abort(self, disposition: PreparationAbort) -> Result<(), MutationError>;
 }
 ```
 
-This is the only preparation guard; there is no separate `PreparationLease`. It is acquired before canonical locks, may carry raw/request ownership, is counted by the conflict gate, and is consumed by publish or abort. Gate quiescence waits guards without holding canonical locks.
+This is the only preparation guard; there is no separate `PreparationLease`. Only `RequestLookup::Vacant(vacancy) -> vacancy.begin_pending() -> RawMutationBudget::acquire -> PreparationGuard::new` reaches admission. `PreparationGuard::new` consumes the exact `PendingRequest` from Task A5 and the exact raw permit; construction failure calls `PendingRequest::cancel` and drops the permit. `publish` calls the sole `PendingRequest::accept` transition and moves the resulting `AcceptedRequest`, batch, permit ownership, and cutoff into `AcceptedMutation`. Materialization/reply completion passes that same `AcceptedRequest` to `RequestCache::complete`. `abort(PreparationAbort::RequestFailure(error))` calls `PendingRequest::fail(error)` and retains the deterministic failed result; `abort(PreparationAbort::TransportCancellation)` calls `PendingRequest::cancel` and removes the provisional entry. Both abort paths release the raw permit exactly once, and cancellation releases the request operation slot exactly once. The guard is acquired before canonical locks, is counted by the conflict gate, and is consumed by publish or abort. Gate quiescence waits guards without holding canonical locks.
 
-- [ ] **Step 2: Run GREEN and commit**
+- [ ] **Step 2: Implement admission and contiguous progress**
+
+Acquire byte/op ownership cancellation-safely, compose it with the pending cache entry through `PreparationGuard::new`, and publish accepted/materialized gap-free prefixes through the typed sequence barrier. Close and poison wake admission, preparation, and progress waiters without fabricating a successful request result.
+
+- [ ] **Step 3: Run GREEN and commit**
 
 ```bash
 cd /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback/zerofs
-cargo test -p zerofs fs::mutation::admission::tests --locked -- --nocapture
-cargo test -p zerofs fs::mutation::progress::tests --locked -- --nocapture
+cargo_test_nonzero 'fs::mutation::admission::tests' -p zerofs --locked
+cargo_test_nonzero 'fs::mutation::progress::tests' -p zerofs --locked
 cargo fmt --all -- --check
 git diff --check
 git add zerofs/src/fs/mutation/admission.rs zerofs/src/fs/mutation/progress.rs zerofs/src/fs/mutation/types.rs zerofs/src/fs/mutation/mod.rs
@@ -439,9 +562,9 @@ pub(crate) struct VisibleFileSnapshot {
 
 ```bash
 cd /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback/zerofs
-cargo test -p zerofs fs::mutation::data_overlay::tests --locked -- --nocapture
-cargo test -p zerofs fs::ops::io::tests --locked -- --nocapture
-cargo test -p zerofs fs::ops::lookup::tests --locked -- --nocapture
+cargo_test_nonzero 'fs::mutation::data_overlay::tests' -p zerofs --locked
+cargo_test_nonzero 'fs::ops::io::tests' -p zerofs --locked
+cargo_test_nonzero 'fs::ops::lookup::tests' -p zerofs --locked
 cargo fmt --all -- --check
 git diff --check
 git add zerofs/src/fs/mutation/data_overlay.rs zerofs/src/fs/mutation/mod.rs zerofs/src/fs/ops/io.rs zerofs/src/fs/ops/lookup.rs zerofs/src/fs/mod.rs
@@ -474,9 +597,9 @@ Start only after `Arc<ZeroFS>` exists, via `Weak<ZeroFS>` or cycle-free `WriteAp
 
 ```bash
 cd /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback/zerofs
-cargo test -p zerofs fs::mutation::materializer::tests --locked -- --nocapture
-cargo test -p zerofs fs::mutation::progress::tests --locked -- --nocapture
-cargo test -p zerofs fs::ops::write::tests --locked -- --nocapture
+cargo_test_nonzero 'fs::mutation::materializer::tests' -p zerofs --locked
+cargo_test_nonzero 'fs::mutation::progress::tests' -p zerofs --locked
+cargo_test_nonzero 'fs::ops::write::tests' -p zerofs --locked
 cargo fmt --all -- --check
 git diff --check
 git add zerofs/src/fs/mutation/materializer.rs zerofs/src/fs/mutation/mod.rs zerofs/src/fs/boot.rs zerofs/src/cli/init.rs
@@ -515,7 +638,7 @@ Close conflicting preparation admission, wait every pre-closure guard to publish
 
 ```bash
 cd /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback/zerofs
-cargo test -p zerofs fs::mutation::fence::tests --locked -- --nocapture
+cargo_test_nonzero 'fs::mutation::fence::tests' -p zerofs --locked
 cargo fmt --all -- --check
 git diff --check
 git add zerofs/src/fs/mutation/fence.rs zerofs/src/fs/mutation/admission.rs zerofs/src/fs/mutation/mod.rs
@@ -551,12 +674,12 @@ Each operation calculates resolved inode/directory scope, acquires the fence, th
 
 ```bash
 cd /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback/zerofs
-cargo test -p zerofs fs::ops::create::tests --locked -- --nocapture
-cargo test -p zerofs fs::ops::setattr::tests --locked -- --nocapture
-cargo test -p zerofs fs::ops::remove::tests --locked -- --nocapture
-cargo test -p zerofs fs::ops::rename::tests --locked -- --nocapture
-cargo test -p zerofs fs::ops::link::tests --locked -- --nocapture
-cargo test -p zerofs fs::handle::tests --locked -- --nocapture
+cargo_test_nonzero 'fs::ops::create::tests' -p zerofs --locked
+cargo_test_nonzero 'fs::ops::setattr::tests' -p zerofs --locked
+cargo_test_nonzero 'fs::ops::remove::tests' -p zerofs --locked
+cargo_test_nonzero 'fs::ops::rename::tests' -p zerofs --locked
+cargo_test_nonzero 'fs::ops::link::tests' -p zerofs --locked
+cargo_test_nonzero 'fs::handle::tests' -p zerofs --locked
 cargo fmt --all -- --check
 git diff --check
 git add zerofs/src/fs/ops/create.rs zerofs/src/fs/ops/setattr.rs zerofs/src/fs/ops/remove.rs zerofs/src/fs/ops/rename.rs zerofs/src/fs/ops/link.rs zerofs/src/fs/ops/io.rs zerofs/src/fs/handle.rs
@@ -586,6 +709,15 @@ Name tests for seal+DB ordering, object capture while barrier is held, release b
 pub(crate) enum DurabilityTarget {
     LocalSsd,
     RemoteBackend,
+}
+
+impl From<ClientDurabilityTarget> for DurabilityTarget {
+    fn from(target: ClientDurabilityTarget) -> Self {
+        match target {
+            ClientDurabilityTarget::LocalSsd => Self::LocalSsd,
+            ClientDurabilityTarget::RemoteBackend => Self::RemoteBackend,
+        }
+    }
 }
 
 pub(crate) enum ObjectCoverage {
@@ -627,15 +759,15 @@ pub(crate) async fn durable_through(
 
 - [ ] **Step 2: Implement ordered capture**
 
-Materialize cutoff before taking the DB barrier; while holding it, seal segments, flush metadata, and capture conservative object coverage; release it before waiting local SSD or remote backend. Protocols pass normalized `ClientDurabilityTarget` through `DurabilityTarget` rather than choosing SSD themselves.
+Materialize cutoff before taking the DB barrier; while holding it, seal segments, flush metadata, and capture conservative object coverage; release it before waiting local SSD or remote backend. This `From<ClientDurabilityTarget>` implementation is the only conversion or match on the configured client target. Protocols call `.into()` and never choose SSD or remote themselves.
 
 - [ ] **Step 3: Run GREEN and commit**
 
 ```bash
 cd /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback/zerofs
-cargo test -p zerofs fs::mutation::durability::tests --locked -- --nocapture
-cargo test -p zerofs fs::flush_coordinator::tests --locked -- --nocapture
-cargo test -p zerofs writeback::store::tests --locked -- --nocapture
+cargo_test_nonzero 'fs::mutation::durability::tests' -p zerofs --locked
+cargo_test_nonzero 'fs::flush_coordinator::tests' -p zerofs --locked
+cargo_test_nonzero 'writeback::store::tests' -p zerofs --locked
 cargo fmt --all -- --check
 git diff --check
 git add zerofs/src/fs/mutation/durability.rs zerofs/src/fs/flush_coordinator.rs zerofs/src/writeback/store.rs zerofs/src/fs/mutation/mod.rs
@@ -692,10 +824,10 @@ Cancellation and deadline expiration keep lifecycle ownership alive and report t
 
 ```bash
 cd /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback/zerofs
-cargo test -p zerofs cli::server::mutation_lifecycle::tests --locked -- --nocapture
-cargo test -p zerofs cli::server::tests --locked -- --nocapture
-cargo test -p zerofs fs::boot::tests --locked -- --nocapture
-cargo test -p zerofs writeback::store::tests --locked -- --nocapture
+cargo_test_nonzero 'cli::server::mutation_lifecycle::tests' -p zerofs --locked
+cargo_test_nonzero 'cli::server::tests' -p zerofs --locked
+cargo_test_nonzero 'fs::boot::tests' -p zerofs --locked
+cargo_test_nonzero 'writeback::store::tests' -p zerofs --locked
 cargo fmt --all -- --check
 git diff --check
 git add zerofs/src/cli/server/mutation_lifecycle.rs zerofs/src/cli/server.rs zerofs/src/fs/boot.rs zerofs/src/fs/mutation/mod.rs zerofs/src/writeback/store.rs
@@ -728,8 +860,8 @@ Register `(connection_incarnation, request.cookie)` before payload copy, acquire
 
 ```bash
 cd /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback/zerofs
-cargo test -p zerofs nbd::handler::tests --locked -- --nocapture
-cargo test -p zerofs nbd::server::tests --locked -- --nocapture
+cargo_test_nonzero 'nbd::handler::tests' -p zerofs --locked
+cargo_test_nonzero 'nbd::server::tests' -p zerofs --locked
 cargo test -p nbd-proto --locked
 cargo fmt --all -- --check
 git diff --check
@@ -752,16 +884,32 @@ git commit -m "feat(nbd): compose shared prepared write batches"
 - Produces: no NBD-local volatile queue, drain owner, terminal state, or exclusivity rule.
 - Consumes: shared equivalents proven in Tasks A6-A13.
 
-- [ ] **Step 1: Port every old-overlay test to its shared owner**
+- [ ] **Step 1: Add RED retirement tests and prove the old filter exists**
 
-Admission tests move to `fs::mutation::admission`, overlay tests to `data_overlay`, ordering tests to `materializer`, and terminal/close tests to `progress`/lifecycle. Run the old module filter once and record that it still selects tests before deletion.
+Add `nbd_uses_no_protocol_local_overlay_owner` and `legacy_nbd_inputs_normalize_without_exclusivity` while the old module still exists; they fail until old construction/drain/exclusivity wiring is removed. Admission tests move to `fs::mutation::admission`, overlay tests to `data_overlay`, ordering tests to `materializer`, and terminal/close tests to `progress`/lifecycle. Before deletion, run the exact list/filter gate:
+
+```bash
+cd /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback/zerofs
+set -o pipefail
+cargo test -p zerofs --lib --locked -- --list | tee /tmp/zerofs-old-overlay-tests.list
+grep -Fx 'nbd::tests::nbd_uses_no_protocol_local_overlay_owner: test' /tmp/zerofs-old-overlay-tests.list
+grep -Fx 'config::tests::legacy_nbd_inputs_normalize_without_exclusivity: test' /tmp/zerofs-old-overlay-tests.list
+if cargo test -p zerofs nbd::tests::nbd_uses_no_protocol_local_overlay_owner --locked -- --exact --nocapture 2>&1 | tee /tmp/zerofs-old-overlay-red.run; then exit 1; fi
+grep -Eq 'test result: FAILED\. 0 passed; 1 failed' /tmp/zerofs-old-overlay-red.run
+if cargo test -p zerofs config::tests::legacy_nbd_inputs_normalize_without_exclusivity --locked -- --exact --nocapture 2>&1 | tee /tmp/zerofs-old-exclusivity-red.run; then exit 1; fi
+grep -Eq 'test result: FAILED\. 0 passed; 1 failed' /tmp/zerofs-old-exclusivity-red.run
+grep -F 'nbd::volatile_overlay::tests::' /tmp/zerofs-old-overlay-tests.list
+test "$(grep -Fc 'nbd::volatile_overlay::tests::' /tmp/zerofs-old-overlay-tests.list)" -gt 0
+cargo test -p zerofs nbd::volatile_overlay::tests:: --locked -- --nocapture 2>&1 | tee /tmp/zerofs-old-overlay-tests.run
+grep -Eq 'test result: ok\. [1-9][0-9]* passed' /tmp/zerofs-old-overlay-tests.run
+```
 
 - [ ] **Step 2: Delete only after the shared module gate is green**
 
 ```bash
 cd /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback/zerofs
-cargo test -p zerofs fs::mutation:: --locked -- --nocapture
-cargo test -p zerofs nbd:: --locked -- --nocapture
+cargo_test_nonzero 'fs::mutation::' -p zerofs --locked
+cargo_test_nonzero 'nbd::' -p zerofs --locked
 cargo fmt --all -- --check
 git diff --check
 git add zerofs/src/nbd/volatile_overlay.rs zerofs/src/nbd/mod.rs zerofs/src/nbd/server.rs zerofs/src/cli/server.rs zerofs/src/config.rs
@@ -799,15 +947,18 @@ Name tests for 9P request identity/reconnect, `Tfsync` and `Tfsyncdur`, direct u
 ```bash
 cd /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback/zerofs
 cargo test -p ninep-proto --locked
-cargo test -p ninep-client durability_tracking_tests --locked -- --nocapture
-cargo test -p zerofs ninep::handler::tests --locked -- --nocapture
-cargo test -p zerofs --features webui rpc::server::tests --locked -- --nocapture
-cargo test -p zerofs --features webui cli::transfer::tests --locked -- --nocapture
+cargo_test_nonzero 'durability_tracking_tests' -p ninep-client --locked
+cargo_test_nonzero 'ninep::handler::tests' -p zerofs --locked
+cargo_test_nonzero 'rpc::server::tests' -p zerofs --features webui --locked
+cargo_test_nonzero 'cli::transfer::tests' -p zerofs --features webui --locked
 cargo check -p ninep-client --target wasm32-unknown-unknown --locked
 cd /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback
 make webui
 cd zerofs
-cargo test -p zerofs --features webui webui::tests::wasm_client_smoke --locked -- --ignored --nocapture
+cargo test -p zerofs --features webui --locked -- --list | tee /tmp/zerofs-wasm-smoke.list
+grep -Fx 'webui::tests::wasm_client_smoke: test' /tmp/zerofs-wasm-smoke.list
+cargo test -p zerofs --features webui webui::tests::wasm_client_smoke --locked -- --ignored --exact --nocapture 2>&1 | tee /tmp/zerofs-wasm-smoke.run
+grep -Eq 'test result: ok\. 1 passed' /tmp/zerofs-wasm-smoke.run
 cargo fmt --all -- --check
 git diff --check
 ```
@@ -815,7 +966,7 @@ git diff --check
 - [ ] **Step 4: Commit the exact fence**
 
 ```bash
-git add zerofs/ninep-proto/src/protocol.rs zerofs/ninep-client/src/lib.rs zerofs/src/ninep/handler.rs zerofs/src/fs/boot.rs zerofs/src/cli/transfer/copy.rs zerofs/src/cli/transfer/tests.rs zerofs/src/rpc/server.rs zerofs/src/webui.rs zerofs/Cargo.lock
+git add zerofs/ninep-proto/src/protocol.rs zerofs/ninep-client/src/lib.rs zerofs/src/ninep/handler.rs zerofs/src/fs/boot.rs zerofs/src/cli/transfer/copy.rs zerofs/src/cli/transfer/tests.rs zerofs/src/rpc/server.rs zerofs/src/webui.rs
 git commit -m "feat: compose shared writes through 9p rpc and webui"
 ```
 
@@ -833,7 +984,7 @@ git commit -m "feat: compose shared writes through 9p rpc and webui"
 - The `ScriptedAlchemy/nfsserve` dependency worktree is explicitly exempt from the single-ZeroFS-worktree rule.
 - Root is the one landing owner for both repositories.
 - Upstream base is exactly `d61b08456ae66108666978e29524a47d2209f68d`.
-- Create branch `codex/zerofs-write-context` from that base in a newly inventoried clean worktree; record absolute path, branch, exact HEAD, `git status --short`, and `git diff --name-only` before edits.
+- Create branch `codex/zerofs-write-context` from that base in the exact dependency worktree `/Volumes/bigssd/projects/nfsserve/.worktrees/zerofs-write-context`; record that path, branch, exact HEAD, `git status --short`, and `git diff --name-only` before edits.
 
 **Interfaces:**
 - Produces: additive `RpcRequestContext`, `WriteRequestContext`, `WriteResult`, `write_with_context`, and `commit_with_context` without breaking legacy implementors.
@@ -858,9 +1009,63 @@ pub struct WriteResult {
     pub committed: stable_how,
     pub verifier: writeverf3,
 }
+
+pub struct CommitRequestContext {
+    pub rpc: RpcRequestContext,
+}
+
+pub struct CommitResult {
+    pub verifier: writeverf3,
+}
+
+#[async_trait::async_trait]
+pub trait NFSFileSystem: Send + Sync {
+    fn get_write_verf(&self) -> writeverf3;
+
+    async fn write(
+        &self,
+        file_id: &fileid3,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<fattr3, nfsstat3>;
+
+    async fn write_with_context(
+        &self,
+        _context: &WriteRequestContext,
+        file_id: &fileid3,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<WriteResult, nfsstat3> {
+        let attributes = self.write(file_id, offset, data).await?;
+        Ok(WriteResult {
+            attributes,
+            committed: stable_how::FILE_SYNC,
+            verifier: self.get_write_verf(),
+        })
+    }
+
+    async fn commit(
+        &self,
+        file_id: &fileid3,
+        offset: u64,
+        count: u32,
+    ) -> Result<writeverf3, nfsstat3>;
+
+    async fn commit_with_context(
+        &self,
+        _context: &CommitRequestContext,
+        file_id: &fileid3,
+        offset: u64,
+        count: u32,
+    ) -> Result<CommitResult, nfsstat3> {
+        Ok(CommitResult {
+            verifier: self.commit(file_id, offset, count).await?,
+        })
+    }
+}
 ```
 
-Test that the server mints a fresh `connection_incarnation` per accepted transport, address reuse after reconnect changes it, XID/stability reach the VFS, returned committed/verifier reach the wire, invalid stable-how returns garbage args, COMMIT forwards XID/range, and legacy trait implementors still compile.
+The existing `write`, `commit`, and `get_write_verf` receiver and argument shapes remain source-compatible. The two contextual methods are additive defaults that delegate once to the legacy method; no handler calls both paths. The WRITE handler constructs `WriteRequestContext`, and the COMMIT handler constructs `CommitRequestContext` while keeping file ID/offset/count as method arguments. Test that the server mints a fresh `connection_incarnation` per accepted transport, address reuse after reconnect changes it, XID/stability reach the VFS, returned committed/verifier reach the wire, invalid stable-how returns garbage args, COMMIT forwards XID/range, default delegation calls each legacy method exactly once, and legacy trait implementors still compile.
 
 - [ ] **Step 2: Implement and validate the additive API**
 
@@ -911,8 +1116,8 @@ Pin `ScriptedAlchemy/nfsserve` by repository URL plus exact `rev = "${NFS_CONTEX
 
 ```bash
 cd /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback/zerofs
-cargo test -p zerofs nfs::tests --locked -- --nocapture
-cargo test -p zerofs cli::server::tests --locked -- --nocapture
+cargo_test_nonzero 'nfs::tests' -p zerofs --locked
+cargo_test_nonzero 'cli::server::tests' -p zerofs --locked
 cargo test --workspace --all-targets --locked
 cargo fmt --all -- --check
 git diff --check

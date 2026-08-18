@@ -18,9 +18,30 @@
 - macOS runs portable Rust/build/lint/model/WebUI/WASM tests only. Real Linux protocols, mounts, devices, filesystems, process crashes, and benchmarks run on Ubuntu only.
 - The Ubuntu proof checkout is `/fast/projects/ZeroFS-unified-tiered-writeback`; `/fast/projects/ZeroFS` remains the clean `develop` checkout until final fast-forward.
 - Never touch CT198, VM100 production mounts, production Storage Box prefixes/exports, or an active NBD device.
-- Every process, port, mount, device, filesystem/pool name, object prefix, state directory, scratch directory, and checkout is unique and recorded in one UUID resource ledger.
+- Every process, port, mount, device, filesystem/pool name, object prefix, state directory, scratch directory, and tool checkout is unique and recorded in one UUID resource ledger.
+- The immutable ledger and cleanup receipts live in `CONTROL_ROOT=/var/tmp/zerofs-tiered-control-$RUN_UUID`; disposable processes, mounts, devices, data, scratch, and tool checkouts live in the separate `RESOURCE_ROOT=/var/tmp/zerofs-tiered-resources-$RUN_UUID`. Cleanup never deletes its own authority.
 - Cleanup is idempotent after success, failure, partial setup, cancellation, supervisor cancellation, and crash.
 - Keep failure receipts; remove only exact ledger-owned resources.
+
+## Required Promotion Before Every Real Ubuntu Slice
+
+Every real Linux slice, including a rerun after any corrective commit, executes this order with no exceptions: RED evidence; implementation; portable GREEN; exact-file commit and review; push; fail-closed isolated Ubuntu synchronization to that commit's 40-hex SHA; then real Linux proof. From the local feature worktree:
+
+```bash
+cd /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback
+test -z "$(git status --porcelain=v1)"
+test "$(git branch --show-current)" = codex/unified-tiered-writeback
+SLICE_SHA="$(git rev-parse HEAD^{commit})"
+test "${#SLICE_SHA}" = 40
+git show --stat --oneline "$SLICE_SHA"
+git push origin "$SLICE_SHA:refs/heads/codex/unified-tiered-writeback"
+test "$(git ls-remote origin refs/heads/codex/unified-tiered-writeback | awk '{print $1}')" = "$SLICE_SHA"
+ssh ubuntu-main "cd /fast/projects/ZeroFS && git fetch origin codex/unified-tiered-writeback && test \"\$(git rev-parse origin/codex/unified-tiered-writeback)\" = '$SLICE_SHA'"
+ssh ubuntu-main "test -d /fast/projects/ZeroFS-unified-tiered-writeback || (cd /fast/projects/ZeroFS && git worktree add --detach /fast/projects/ZeroFS-unified-tiered-writeback '$SLICE_SHA')"
+ssh ubuntu-main "cd /fast/projects/ZeroFS-unified-tiered-writeback && test -z \"\$(git status --porcelain=v1)\" && python3 scripts/tiered-writeback-e2e.py assert-source-idle --source-root /fast/projects/ZeroFS-unified-tiered-writeback && git switch --detach '$SLICE_SHA' && test \"\$(git rev-parse HEAD)\" = '$SLICE_SHA' && test -z \"\$(git status --porcelain=v1)\""
+```
+
+The slice receipt records the literal expanded `SLICE_SHA` before any Ubuntu command. A Linux-discovered failure returns to RED/implementation/portable GREEN/commit/review, creates a new literal `SLICE_SHA`, and repeats this full block before the failed Linux command is rerun.
 
 ---
 
@@ -36,7 +57,7 @@
 - Modify: `zerofs/tests/dst/checks.rs`
 
 **Interfaces:**
-- Produces: volatile-ack index, completed local durability floor, remote durability floor, per-striped-batch canonical member progress, and shutdown crash windows.
+- Produces: incarnation-bound volatile acknowledgement cutoff, local/remote durability floors, typed striped-batch canonical member progress, and shutdown crash windows.
 - Consumes: mutation/object receipts, typed incarnations, and isolated restart model.
 
 - [ ] **Step 1: Register RED crash points**
@@ -44,17 +65,36 @@
 Add named failpoints before/after overlay publish, volatile reply, materializer dispatch, each striped member apply, overlay retirement, seal, metadata flush, local receipt, remote publish, watermark/cleanup, each metadata fence stage, and each shutdown phase.
 
 ```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct BatchIdentity {
+    pub(crate) mutation_incarnation: MutationIncarnation,
+    pub(crate) sequence: u64,
+}
+
+pub(crate) struct CrashDurabilityFloor {
+    pub(crate) mutation: MutationCutoff,
+    pub(crate) object: ObjectCoverage,
+    pub(crate) target: DurabilityTarget,
+}
+
+pub(crate) struct CanonicalMemberPrefix {
+    pub(crate) batch: BatchIdentity,
+    pub(crate) completed_members: u32,
+    pub(crate) total_members: u32,
+}
+
 pub(crate) struct CrashDurabilityModel {
-    pub(crate) volatile_acked_through: u64,
-    pub(crate) local_durable_through: u64,
-    pub(crate) remote_durable_through: u64,
-    pub(crate) striped_canonical_members: std::collections::BTreeMap<u64, usize>,
+    pub(crate) volatile_acked_through: Option<MutationCutoff>,
+    pub(crate) local_durable_floor: Option<CrashDurabilityFloor>,
+    pub(crate) remote_durable_floor: Option<CrashDurabilityFloor>,
+    pub(crate) striped_canonical_members:
+        std::collections::BTreeMap<BatchIdentity, CanonicalMemberPrefix>,
 }
 ```
 
 - [ ] **Step 2: Encode the exact invariant**
 
-Every mutation at or below `local_durable_through` must recover completely with consistent data, attributes, quota, metadata, namespace, and all striped members. Above that floor, ordinary state may be absent; a striped NBD batch may expose only the canonical member prefix recorded before the crash. That prefix must contain whole canonical members in stripe order and may not create torn metadata, a premature logical completion/namespace claim, a resurrected unlink, or stale prepared attributes.
+Cutoffs are comparable only when their typed mutation or journal incarnation matches. A restart creates new incarnations; no raw sequence or map key can collide with an old process. Every mutation covered by `local_durable_floor.mutation` and `local_durable_floor.object` must recover completely with consistent data, attributes, quota, metadata, namespace, and all striped members. Above that typed floor, ordinary state may be absent; a striped NBD batch may expose only its `CanonicalMemberPrefix`. That prefix contains whole members in stripe order and may not create torn metadata, a premature logical completion/namespace claim, a resurrected unlink, or stale prepared attributes.
 
 - [ ] **Step 3: Run portable failpoint/DST gates and commit**
 
@@ -85,7 +125,7 @@ git commit -m "test: model volatile mutation crash durability"
 - Create: `scripts/tests/test_tiered_writeback_e2e.py`
 
 **Interfaces:**
-- Produces: `setup`, `run`, `cleanup --ledger`, `assert-clean --ledger`, and `assert-source-idle` commands plus JSON receipts.
+- Produces: `setup`, `run`, `cleanup --ledger`, `assert-clean --ledger`, `archive-control`, and `assert-source-idle` commands plus JSON receipts.
 - Consumes: exact ZeroFS binary/config SHA, Ubuntu sudo, unused UUID-owned resources, disposable backend namespace, and real client binaries.
 
 - [ ] **Step 1: Write dependency-free safety RED tests**
@@ -95,12 +135,16 @@ import unittest
 
 class ResourceLedgerTests(unittest.TestCase):
     def test_cleanup_rejects_non_uuid_root(self):
-        ledger = ResourceLedger(run_id="not-a-uuid", run_root="/var/tmp/test")
+        ledger = ResourceLedger(
+            run_id="not-a-uuid",
+            control_root="/var/tmp/control",
+            resource_root="/var/tmp/resources",
+        )
         with self.assertRaises(UnsafeCleanupTarget):
             ledger.validate_cleanup_scope()
 ```
 
-Name tests for rejecting `/`, `/mnt`, `/var/tmp`, workspace roots, CT198/production strings, unowned PIDs/devices/mounts/ports, missing dual ack flags, receipt omission, partial setup, primary-plus-cleanup errors, idempotent cleanup, and supervisor cancellation.
+Name tests for rejecting `/`, `/mnt`, `/var/tmp`, equal/nested control and resource roots, workspace roots, CT198/production strings, unowned PIDs/devices/mounts/ports, missing dual ack flags, receipt omission, partial setup, primary-plus-cleanup errors, cleanup preserving ledger authority, repeated cleanup after resource-root deletion, final receipt archiving, and supervisor cancellation.
 
 ```bash
 cd /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback
@@ -118,11 +162,13 @@ Every `setup` and `run` command requires both:
 --object-ack-mode memory|ssd|remote
 ```
 
-The JSON receipt records both fields, source HEAD, binary/config hashes, UUID/root, exact PIDs, ports, devices, mounts, pool/filesystem names, backend prefix, scenario, manifest, durability floors, terminal state, commands, exit status, and cleanup status. `cleanup --ledger PATH` removes only ledger-owned resources and succeeds when repeated. `assert-clean --ledger PATH` fails if any recorded process/listener/mount/device/pool/prefix/path remains. `assert-source-idle --source-root PATH` inspects `/proc/*/cwd` and fails for active `cargo`, `rustc`, test, or harness jobs rooted at PATH.
+For UUID `RUN_UUID`, setup requires `CONTROL_ROOT=/var/tmp/zerofs-tiered-control-$RUN_UUID`, `RESOURCE_ROOT=/var/tmp/zerofs-tiered-resources-$RUN_UUID`, `LEDGER=$CONTROL_ROOT/ledger.json`, and `RECEIPT_ROOT=$CONTROL_ROOT/receipts`; control and resource roots must be disjoint siblings. Identity/config fields in the ledger are immutable and every later event is hash-chained append-only. The JSON receipt records both ack fields, source HEAD, binary/config hashes, both roots, exact PIDs, ports, devices, mounts, pool/filesystem names, backend prefix, tool checkout revisions, scenario, manifest, typed durability floors, terminal state, commands, exit status, and cleanup status. `cleanup --ledger PATH` removes only entries under `RESOURCE_ROOT` and succeeds after that root is already absent. `assert-clean --ledger PATH` continues to read the external ledger and fails if any recorded process/listener/mount/device/pool/prefix/resource path remains; it never requires the control root to be absent. `archive-control --ledger PATH --archive-root /fast/zerofs-tiered-receipts` copies ledger/receipts to `/fast/zerofs-tiered-receipts/$RUN_UUID`, verifies hashes, and only then removes `CONTROL_ROOT`. `assert-source-idle --source-root PATH` inspects `/proc/*/cwd` and fails for active `cargo`, `rustc`, test, or harness jobs rooted at PATH.
 
 - [ ] **Step 3: Implement real shipping entry points**
 
 NFS uses a hard NFSv3 kernel mount and actual WRITE/COMMIT; 9P uses both v9fs and native client plus actual Twrite/Tfsync; NBD uses `nbd-client`, a disposable device, XFS/ZFS, WRITE/FUA/FLUSH; RPC uses the actual Unix/TCP gRPC client/server; WebUI uses the real gRPC-Web/WebSocket/9P route and generated WASM client. Internal Rust calls may instrument failpoints but never replace these acceptance legs.
+
+`linux_suites.py` creates tool checkouts only under `RESOURCE_ROOT/tools` and pins xfstests `1ae822c1c2e2364e966085cee3ce4a97b2500241`, pjdfstest `85a8aea9e685999ef0540392fd80535f873d7ff7`, and pjdfstest_nfs `7d3d7cb0cdc5d39eedd995771bc1d4b3dabf31ab`. Kernel scenarios download only `https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.18.tar.xz` and require SHA-256 `9106a4605da9e31ff17659d958782b815f9591ab308d03b0ee21aad6c7dced4b` before extraction. These rules apply equally to focused C4 runs and C8's final scenario reruns.
 
 - [ ] **Step 4: Run portable harness gates and commit**
 
@@ -141,32 +187,42 @@ git commit -m "test: add real tiered writeback Linux harness"
 
 **Files:**
 - Modify only after a real RED receipt: the smallest harness or production file owning the failure
-- Receipt: UUID run root outside Git
+- Receipt: UUID external control root outside Git
 
 **Interfaces:**
 - Produces: real simultaneous admission, pending-read, cross-adapter durability, and WebUI/RPC receipts.
 - Consumes: exact pushed feature SHA and isolated Ubuntu checkout.
 
-- [ ] **Step 1: Create the isolated checkout and UUID ledger**
+- [ ] **Step 1: Review, push, and synchronize the committed harness SHA**
 
 ```bash
 cd /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback
-git push -u origin codex/unified-tiered-writeback
-ssh ubuntu-main 'cd /fast/projects/ZeroFS && test -z "$(git status --porcelain=v1)" && git fetch origin codex/unified-tiered-writeback && test ! -e /fast/projects/ZeroFS-unified-tiered-writeback && git worktree add /fast/projects/ZeroFS-unified-tiered-writeback origin/codex/unified-tiered-writeback'
-ssh ubuntu-main 'cd /fast/projects/ZeroFS-unified-tiered-writeback && test "$(git rev-parse HEAD)" = "$(git rev-parse origin/codex/unified-tiered-writeback)" && test -z "$(git status --porcelain=v1)"'
+test -z "$(git status --porcelain=v1)"
+SLICE_SHA="$(git rev-parse HEAD^{commit})"; test "${#SLICE_SHA}" = 40
+git show --stat --oneline "$SLICE_SHA"
+git push origin "$SLICE_SHA:refs/heads/codex/unified-tiered-writeback"
+test "$(git ls-remote origin refs/heads/codex/unified-tiered-writeback | awk '{print $1}')" = "$SLICE_SHA"
+ssh ubuntu-main "cd /fast/projects/ZeroFS && git fetch origin codex/unified-tiered-writeback && test \"\$(git rev-parse origin/codex/unified-tiered-writeback)\" = '$SLICE_SHA'"
+ssh ubuntu-main "test -d /fast/projects/ZeroFS-unified-tiered-writeback || (cd /fast/projects/ZeroFS && git worktree add --detach /fast/projects/ZeroFS-unified-tiered-writeback '$SLICE_SHA')"
+ssh ubuntu-main "cd /fast/projects/ZeroFS-unified-tiered-writeback && test -z \"\$(git status --porcelain=v1)\" && python3 scripts/tiered-writeback-e2e.py assert-source-idle --source-root /fast/projects/ZeroFS-unified-tiered-writeback && git switch --detach '$SLICE_SHA' && test \"\$(git rev-parse HEAD)\" = '$SLICE_SHA'"
 ```
 
-On Ubuntu:
+- [ ] **Step 2: Create external control authority and disposable resources**
+
+On Ubuntu, record the expanded `SLICE_SHA` in the ledger:
 
 ```bash
 cd /fast/projects/ZeroFS-unified-tiered-writeback
+SLICE_SHA="$(git rev-parse origin/codex/unified-tiered-writeback^{commit})"
+test "$(git rev-parse HEAD)" = "$SLICE_SHA"
 RUN_UUID="$(python3 -c 'import uuid; print(uuid.uuid4())')"
-RUN_ROOT="/var/tmp/zerofs-tiered-${RUN_UUID}"
-LEDGER="${RUN_ROOT}/ledger.json"
-sudo python3 scripts/tiered-writeback-e2e.py setup --ledger "$LEDGER" --filesystem-ack-mode volatile_memory --object-ack-mode memory
+CONTROL_ROOT="/var/tmp/zerofs-tiered-control-${RUN_UUID}"
+RESOURCE_ROOT="/var/tmp/zerofs-tiered-resources-${RUN_UUID}"
+LEDGER="${CONTROL_ROOT}/ledger.json"
+sudo python3 scripts/tiered-writeback-e2e.py setup --ledger "$LEDGER" --control-root "$CONTROL_ROOT" --resource-root "$RESOURCE_ROOT" --source-sha "$SLICE_SHA" --filesystem-ack-mode volatile_memory --object-ack-mode memory
 ```
 
-- [ ] **Step 2: Run the exact volatile shipping scenarios**
+- [ ] **Step 3: Run the exact volatile shipping scenarios**
 
 Each command uses real NBD/NFS/9P/WebUI/RPC clients and appends a receipt carrying both flags:
 
@@ -181,14 +237,16 @@ sudo python3 scripts/tiered-writeback-e2e.py run --ledger "$LEDGER" --filesystem
 
 The same-backing-inode scenario provisions an NBD member as a normal ZeroFS inode reachable by the direct namespace, pauses canonical materialization, writes through the live NBD server, and reads that exact inode through mounted NFS and 9P. It does not claim guest-XFS namespace unification.
 
-- [ ] **Step 3: Run materialized/object-target controls**
+- [ ] **Step 4: Run materialized/object-target controls**
 
 ```bash
 sudo python3 scripts/tiered-writeback-e2e.py cleanup --ledger "$LEDGER"
+sudo python3 scripts/tiered-writeback-e2e.py cleanup --ledger "$LEDGER"
 sudo python3 scripts/tiered-writeback-e2e.py assert-clean --ledger "$LEDGER"
-RUN_UUID="$(python3 -c 'import uuid; print(uuid.uuid4())')"; RUN_ROOT="/var/tmp/zerofs-tiered-${RUN_UUID}"; LEDGER="${RUN_ROOT}/ledger.json"
-sudo python3 scripts/tiered-writeback-e2e.py setup --ledger "$LEDGER" --filesystem-ack-mode materialized --object-ack-mode ssd
+RUN_UUID="$(python3 -c 'import uuid; print(uuid.uuid4())')"; CONTROL_ROOT="/var/tmp/zerofs-tiered-control-${RUN_UUID}"; RESOURCE_ROOT="/var/tmp/zerofs-tiered-resources-${RUN_UUID}"; LEDGER="${CONTROL_ROOT}/ledger.json"
+sudo python3 scripts/tiered-writeback-e2e.py setup --ledger "$LEDGER" --control-root "$CONTROL_ROOT" --resource-root "$RESOURCE_ROOT" --source-sha "$SLICE_SHA" --filesystem-ack-mode materialized --object-ack-mode ssd
 sudo python3 scripts/tiered-writeback-e2e.py run --ledger "$LEDGER" --filesystem-ack-mode materialized --object-ack-mode ssd --scenario protocol-materialized-control
+sudo python3 scripts/tiered-writeback-e2e.py cleanup --ledger "$LEDGER"
 sudo python3 scripts/tiered-writeback-e2e.py cleanup --ledger "$LEDGER"
 sudo python3 scripts/tiered-writeback-e2e.py assert-clean --ledger "$LEDGER"
 ```
@@ -196,9 +254,10 @@ sudo python3 scripts/tiered-writeback-e2e.py assert-clean --ledger "$LEDGER"
 Run the remote object-ack control under a new matching ledger:
 
 ```bash
-RUN_UUID="$(python3 -c 'import uuid; print(uuid.uuid4())')"; RUN_ROOT="/var/tmp/zerofs-tiered-${RUN_UUID}"; LEDGER="${RUN_ROOT}/ledger.json"
-sudo python3 scripts/tiered-writeback-e2e.py setup --ledger "$LEDGER" --filesystem-ack-mode materialized --object-ack-mode remote
+RUN_UUID="$(python3 -c 'import uuid; print(uuid.uuid4())')"; CONTROL_ROOT="/var/tmp/zerofs-tiered-control-${RUN_UUID}"; RESOURCE_ROOT="/var/tmp/zerofs-tiered-resources-${RUN_UUID}"; LEDGER="${CONTROL_ROOT}/ledger.json"
+sudo python3 scripts/tiered-writeback-e2e.py setup --ledger "$LEDGER" --control-root "$CONTROL_ROOT" --resource-root "$RESOURCE_ROOT" --source-sha "$SLICE_SHA" --filesystem-ack-mode materialized --object-ack-mode remote
 sudo python3 scripts/tiered-writeback-e2e.py run --ledger "$LEDGER" --filesystem-ack-mode materialized --object-ack-mode remote --scenario protocol-durability-target-control
+sudo python3 scripts/tiered-writeback-e2e.py cleanup --ledger "$LEDGER"
 sudo python3 scripts/tiered-writeback-e2e.py cleanup --ledger "$LEDGER"
 sudo python3 scripts/tiered-writeback-e2e.py assert-clean --ledger "$LEDGER"
 ```
@@ -211,69 +270,111 @@ Ordinary object acknowledgement policy must not alter protocol barrier semantics
 
 **Files:**
 - Modify only after real failure: `scripts/tiered_writeback_e2e/linux_suites.py` or the owning production source
-- Receipt: UUID run roots outside Git
+- Receipt: UUID external control roots outside Git
 
 **Interfaces:**
 - Produces: xfstests, pjdfstest, kernel compile, stress-ng, XFS-over-NBD, and ZFS-over-NBD receipts.
 - Consumes: harness setup with both ack flags and ledger-generated paths/devices/names.
 
-Before each scenario in this task, create a fresh ledger exactly as in Task C3 and run `setup` with `--filesystem-ack-mode volatile_memory --object-ack-mode ssd`. After the scenario, run `cleanup --ledger` twice and `assert-clean --ledger` before rebinding `RUN_UUID`, `RUN_ROOT`, and `LEDGER` for the next scenario.
+- [ ] **Step 1: Synchronize the literal reviewed SHA and create ledger-owned tool checkouts**
 
-- [ ] **Step 1: Run NFS and 9P xfstests using existing workflow commands**
-
-For each new ledger, `linux_suites.py` writes ledger-specific `local.config` and excludes, then executes exactly:
+Run the required promotion block, then on Ubuntu create a new external control root and disposable resource root. Tool sources are never shared through `/tmp`:
 
 ```bash
-cd /tmp/xfstests
-sudo ./check -g quick -E "$RUN_ROOT/xfstests-nfs.excludes"
-sudo env HOST_OPTIONS="$RUN_ROOT/local.9p.strict.config" RESULT_BASE="$RUN_ROOT/results-9p-strict" ./check generic/732
+cd /fast/projects/ZeroFS-unified-tiered-writeback
+SLICE_SHA="$(git rev-parse origin/codex/unified-tiered-writeback^{commit})"
+test "$(git rev-parse HEAD)" = "$SLICE_SHA"
+RUN_UUID="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+CONTROL_ROOT="/var/tmp/zerofs-tiered-control-${RUN_UUID}"
+RESOURCE_ROOT="/var/tmp/zerofs-tiered-resources-${RUN_UUID}"
+LEDGER="${CONTROL_ROOT}/ledger.json"
+sudo python3 scripts/tiered-writeback-e2e.py setup --ledger "$LEDGER" --control-root "$CONTROL_ROOT" --resource-root "$RESOURCE_ROOT" --source-sha "$SLICE_SHA" --filesystem-ack-mode volatile_memory --object-ack-mode ssd
+git clone --no-checkout https://github.com/Barre/xfstests.git "$RESOURCE_ROOT/tools/xfstests"
+git -C "$RESOURCE_ROOT/tools/xfstests" checkout --detach 1ae822c1c2e2364e966085cee3ce4a97b2500241
+git clone --no-checkout https://github.com/pjd/pjdfstest.git "$RESOURCE_ROOT/tools/pjdfstest"
+git -C "$RESOURCE_ROOT/tools/pjdfstest" checkout --detach 85a8aea9e685999ef0540392fd80535f873d7ff7
+git clone --no-checkout https://github.com/Barre/pjdfstest_nfs.git "$RESOURCE_ROOT/tools/pjdfstest-nfs"
+git -C "$RESOURCE_ROOT/tools/pjdfstest-nfs" checkout --detach 7d3d7cb0cdc5d39eedd995771bc1d4b3dabf31ab
+test "$(git -C "$RESOURCE_ROOT/tools/xfstests" rev-parse HEAD)" = 1ae822c1c2e2364e966085cee3ce4a97b2500241
+test "$(git -C "$RESOURCE_ROOT/tools/pjdfstest" rev-parse HEAD)" = 85a8aea9e685999ef0540392fd80535f873d7ff7
+test "$(git -C "$RESOURCE_ROOT/tools/pjdfstest-nfs" rev-parse HEAD)" = 7d3d7cb0cdc5d39eedd995771bc1d4b3dabf31ab
+make -C "$RESOURCE_ROOT/tools/xfstests" -j"$(nproc)"
+make -C "$RESOURCE_ROOT/tools/pjdfstest" -j"$(nproc)"
+(cd "$RESOURCE_ROOT/tools/pjdfstest-nfs" && autoreconf -fvi && ./configure && make -j"$(nproc)")
 ```
 
-Invoke it with both flags:
+- [ ] **Step 2: Run NFS quick, 9P quick, and strict generic/732 xfstests**
+
+`linux_suites.py` writes ledger-owned configs/excludes/results. The harness executes these exact commands:
 
 ```bash
-sudo python3 scripts/tiered-writeback-e2e.py run --ledger "$LEDGER" --filesystem-ack-mode volatile_memory --object-ack-mode ssd --scenario xfstests-nfs-quick
-sudo python3 scripts/tiered-writeback-e2e.py run --ledger "$LEDGER" --filesystem-ack-mode volatile_memory --object-ack-mode ssd --scenario xfstests-ninep-quick-and-strict
+cd "$RESOURCE_ROOT/tools/xfstests"
+sudo env HOST_OPTIONS="$RESOURCE_ROOT/config/xfstests-nfs.config" RESULT_BASE="$RESOURCE_ROOT/results/xfstests-nfs" ./check -g quick -E "$RESOURCE_ROOT/config/xfstests-nfs.excludes"
+sudo env HOST_OPTIONS="$RESOURCE_ROOT/config/xfstests-9p.config" RESULT_BASE="$RESOURCE_ROOT/results/xfstests-9p" ./check -g quick -E "$RESOURCE_ROOT/config/xfstests-9p.excludes"
+sudo env HOST_OPTIONS="$RESOURCE_ROOT/config/xfstests-9p-strict.config" RESULT_BASE="$RESOURCE_ROOT/results/xfstests-9p-strict" ./check generic/732
+sudo python3 /fast/projects/ZeroFS-unified-tiered-writeback/scripts/tiered-writeback-e2e.py run --ledger "$LEDGER" --filesystem-ack-mode volatile_memory --object-ack-mode ssd --scenario xfstests-nfs-quick
+sudo python3 /fast/projects/ZeroFS-unified-tiered-writeback/scripts/tiered-writeback-e2e.py run --ledger "$LEDGER" --filesystem-ack-mode volatile_memory --object-ack-mode ssd --scenario xfstests-ninep-quick-and-strict
 ```
 
-- [ ] **Step 2: Run pjdfstest and stress-ng exactly**
+- [ ] **Step 3: Run both NFS and 9P pjdfstest plus stress-ng**
 
-The harness executes in the ledger-owned 9P/NFS mount:
+The NFS leg follows `.github/workflows/pjdfstest.yml`; the 9P leg follows `.github/workflows/pjdfstest-9p.yml`:
 
 ```bash
-find /tmp/pjdfstest/tests -name '*.t' -type f | sort > "$RUN_ROOT/pjdfstest-all.txt"
-grep -v -f /fast/projects/ZeroFS-unified-tiered-writeback/.github/.pjdfstest-9p-exclude "$RUN_ROOT/pjdfstest-all.txt" > "$RUN_ROOT/pjdfstest-run.txt"
-sudo prove -rv $(cat "$RUN_ROOT/pjdfstest-run.txt")
+find "$RESOURCE_ROOT/tools/pjdfstest-nfs/tests" -name '*.t' -type f | sort > "$RESOURCE_ROOT/results/pjdfstest-nfs-all.txt"
+grep -v -f /fast/projects/ZeroFS-unified-tiered-writeback/.github/.pjdfstest-nfs-exclude "$RESOURCE_ROOT/results/pjdfstest-nfs-all.txt" > "$RESOURCE_ROOT/results/pjdfstest-nfs-run.txt"
+cd "$RESOURCE_ROOT/mounts/nfs/pjdfstest_test"
+sudo prove -rv $(cat "$RESOURCE_ROOT/results/pjdfstest-nfs-run.txt")
+find "$RESOURCE_ROOT/tools/pjdfstest/tests" -name '*.t' -type f | sort > "$RESOURCE_ROOT/results/pjdfstest-9p-all.txt"
+grep -v -f /fast/projects/ZeroFS-unified-tiered-writeback/.github/.pjdfstest-9p-exclude "$RESOURCE_ROOT/results/pjdfstest-9p-all.txt" > "$RESOURCE_ROOT/results/pjdfstest-9p-run.txt"
+cd "$RESOURCE_ROOT/mounts/ninep/pjdfstest_test"
+sudo prove -rv $(cat "$RESOURCE_ROOT/results/pjdfstest-9p-run.txt")
 sudo stress-ng --job /fast/projects/ZeroFS-unified-tiered-writeback/.github/stress-ng-filesystem.job
+sudo python3 /fast/projects/ZeroFS-unified-tiered-writeback/scripts/tiered-writeback-e2e.py run --ledger "$LEDGER" --filesystem-ack-mode volatile_memory --object-ack-mode ssd --scenario pjdfstest-nfs
+sudo python3 /fast/projects/ZeroFS-unified-tiered-writeback/scripts/tiered-writeback-e2e.py run --ledger "$LEDGER" --filesystem-ack-mode volatile_memory --object-ack-mode ssd --scenario pjdfstest-ninep
+sudo python3 /fast/projects/ZeroFS-unified-tiered-writeback/scripts/tiered-writeback-e2e.py run --ledger "$LEDGER" --filesystem-ack-mode volatile_memory --object-ack-mode ssd --scenario stress-ng-nfs-ninep
 ```
 
+- [ ] **Step 4: Compile the literal pinned kernel archive over NFS and 9P**
+
+The archive is exactly `https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.18.tar.xz` with SHA-256 `9106a4605da9e31ff17659d958782b815f9591ab308d03b0ee21aad6c7dced4b`:
+
 ```bash
-sudo python3 scripts/tiered-writeback-e2e.py run --ledger "$LEDGER" --filesystem-ack-mode volatile_memory --object-ack-mode ssd --scenario pjdfstest-ninep
-sudo python3 scripts/tiered-writeback-e2e.py run --ledger "$LEDGER" --filesystem-ack-mode volatile_memory --object-ack-mode ssd --scenario stress-ng-nfs-ninep
+curl --fail --location --retry 5 --output "$RESOURCE_ROOT/downloads/linux-6.18.tar.xz" https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.18.tar.xz
+printf '%s  %s\n' 9106a4605da9e31ff17659d958782b815f9591ab308d03b0ee21aad6c7dced4b "$RESOURCE_ROOT/downloads/linux-6.18.tar.xz" | sha256sum --check
+tar -C "$RESOURCE_ROOT/mounts/nfs" -xf "$RESOURCE_ROOT/downloads/linux-6.18.tar.xz"
+tar -C "$RESOURCE_ROOT/mounts/ninep" -xf "$RESOURCE_ROOT/downloads/linux-6.18.tar.xz"
+make -C "$RESOURCE_ROOT/mounts/nfs/linux-6.18" O="$RESOURCE_ROOT/mounts/nfs/linux-6.18-build" tinyconfig
+make -C "$RESOURCE_ROOT/mounts/nfs/linux-6.18" O="$RESOURCE_ROOT/mounts/nfs/linux-6.18-build" -j"$(nproc)" vmlinux
+test -s "$RESOURCE_ROOT/mounts/nfs/linux-6.18-build/vmlinux"
+make -C "$RESOURCE_ROOT/mounts/ninep/linux-6.18" O="$RESOURCE_ROOT/mounts/ninep/linux-6.18-build" tinyconfig
+make -C "$RESOURCE_ROOT/mounts/ninep/linux-6.18" O="$RESOURCE_ROOT/mounts/ninep/linux-6.18-build" -j"$(nproc)" vmlinux
+test -s "$RESOURCE_ROOT/mounts/ninep/linux-6.18-build/vmlinux"
+sudo python3 /fast/projects/ZeroFS-unified-tiered-writeback/scripts/tiered-writeback-e2e.py run --ledger "$LEDGER" --filesystem-ack-mode volatile_memory --object-ack-mode ssd --scenario kernel-compile-nfs
+sudo python3 /fast/projects/ZeroFS-unified-tiered-writeback/scripts/tiered-writeback-e2e.py run --ledger "$LEDGER" --filesystem-ack-mode volatile_memory --object-ack-mode ssd --scenario kernel-compile-ninep
+sudo python3 /fast/projects/ZeroFS-unified-tiered-writeback/scripts/tiered-writeback-e2e.py cleanup --ledger "$LEDGER"
+sudo python3 /fast/projects/ZeroFS-unified-tiered-writeback/scripts/tiered-writeback-e2e.py cleanup --ledger "$LEDGER"
+sudo python3 /fast/projects/ZeroFS-unified-tiered-writeback/scripts/tiered-writeback-e2e.py assert-clean --ledger "$LEDGER"
 ```
 
-- [ ] **Step 3: Compile a pinned kernel over NFS and 9P**
-
-The harness downloads `linux-7.2-rc1.tar.gz`, verifies the ledger-recorded SHA-256, extracts inside each ledger mount, and runs exactly:
+- [ ] **Step 5: Run XFS-over-NBD from a fresh setup/cleanup ledger**
 
 ```bash
-make -C "$KERNEL_SOURCE" O="$KERNEL_BUILD" tinyconfig
-make -C "$KERNEL_SOURCE" O="$KERNEL_BUILD" -j"$(nproc)" vmlinux
-test -s "$KERNEL_BUILD/vmlinux"
-```
-
-```bash
-sudo python3 scripts/tiered-writeback-e2e.py run --ledger "$LEDGER" --filesystem-ack-mode volatile_memory --object-ack-mode ssd --scenario kernel-compile-nfs
-sudo python3 scripts/tiered-writeback-e2e.py run --ledger "$LEDGER" --filesystem-ack-mode volatile_memory --object-ack-mode ssd --scenario kernel-compile-ninep
-```
-
-- [ ] **Step 4: Run XFS and ZFS over the exact ledger NBD device**
-
-The XFS scenario executes `mkfs.xfs -f -L "$LEDGER_XFS_LABEL" "$LEDGER_NBD_DEVICE"`, mounts it at the ledger path, writes deterministic files, `sync`, unmounts, disconnects/reconnects the same export, runs `xfs_repair -n`, remounts, and verifies the SHA-256 manifest. The ZFS scenario executes `zpool create "$LEDGER_ZPOOL" "$LEDGER_NBD_DEVICE"`, `zfs create "$LEDGER_ZPOOL/data"`, writes/checksums, `zpool sync`, exports, reconnects, imports, scrubs, and verifies.
-
-```bash
+RUN_UUID="$(python3 -c 'import uuid; print(uuid.uuid4())')"; CONTROL_ROOT="/var/tmp/zerofs-tiered-control-${RUN_UUID}"; RESOURCE_ROOT="/var/tmp/zerofs-tiered-resources-${RUN_UUID}"; LEDGER="${CONTROL_ROOT}/ledger.json"
+sudo python3 scripts/tiered-writeback-e2e.py setup --ledger "$LEDGER" --control-root "$CONTROL_ROOT" --resource-root "$RESOURCE_ROOT" --source-sha "$SLICE_SHA" --filesystem-ack-mode volatile_memory --object-ack-mode ssd
 sudo python3 scripts/tiered-writeback-e2e.py run --ledger "$LEDGER" --filesystem-ack-mode volatile_memory --object-ack-mode ssd --scenario xfs-over-nbd-restart
+sudo python3 scripts/tiered-writeback-e2e.py cleanup --ledger "$LEDGER"
+sudo python3 scripts/tiered-writeback-e2e.py cleanup --ledger "$LEDGER"
+sudo python3 scripts/tiered-writeback-e2e.py assert-clean --ledger "$LEDGER"
+```
+
+- [ ] **Step 6: Run ZFS-over-NBD from a different fresh setup/cleanup ledger**
+
+```bash
+RUN_UUID="$(python3 -c 'import uuid; print(uuid.uuid4())')"; CONTROL_ROOT="/var/tmp/zerofs-tiered-control-${RUN_UUID}"; RESOURCE_ROOT="/var/tmp/zerofs-tiered-resources-${RUN_UUID}"; LEDGER="${CONTROL_ROOT}/ledger.json"
+sudo python3 scripts/tiered-writeback-e2e.py setup --ledger "$LEDGER" --control-root "$CONTROL_ROOT" --resource-root "$RESOURCE_ROOT" --source-sha "$SLICE_SHA" --filesystem-ack-mode volatile_memory --object-ack-mode ssd
 sudo python3 scripts/tiered-writeback-e2e.py run --ledger "$LEDGER" --filesystem-ack-mode volatile_memory --object-ack-mode ssd --scenario zfs-over-nbd-restart
+sudo python3 scripts/tiered-writeback-e2e.py cleanup --ledger "$LEDGER"
 sudo python3 scripts/tiered-writeback-e2e.py cleanup --ledger "$LEDGER"
 sudo python3 scripts/tiered-writeback-e2e.py assert-clean --ledger "$LEDGER"
 ```
@@ -287,6 +388,7 @@ No command in this task runs on macOS.
 **Files:**
 - Modify: `.github/workflows/xfstests-nfs.yml`
 - Modify: `.github/workflows/xfstests-9p.yml`
+- Modify: `.github/workflows/pjdfstest.yml`
 - Modify: `.github/workflows/pjdfstest-9p.yml`
 - Modify: `.github/workflows/kernel-compile-nfs.yml`
 - Modify: `.github/workflows/kernel-compile-9p.yml`
@@ -301,7 +403,7 @@ No command in this task runs on macOS.
 
 - [ ] **Step 1: Add RED static workflow tests**
 
-Use `unittest` to parse workflow text and require both ack flags, a unique ledger, `cleanup --ledger` under `always()`, `assert-clean --ledger`, unchanged materialized control, runner-owned device checks, and no CT198/production target.
+Use `unittest` to parse workflow text and require both ack flags, disjoint UUID control/resource roots, the ledger under the control root, `cleanup --ledger` under `always()`, repeated cleanup, `assert-clean --ledger`, unchanged materialized control, runner-owned device checks, and no CT198/production target.
 
 - [ ] **Step 2: Add minimal matrix legs and validate**
 
@@ -310,7 +412,7 @@ cd /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback
 actionlint .github/workflows/*.yml
 python3 -m unittest discover -s scripts/tests -p 'test_*.py' -v
 git diff --check
-git add .github/workflows/xfstests-nfs.yml .github/workflows/xfstests-9p.yml .github/workflows/pjdfstest-9p.yml .github/workflows/kernel-compile-nfs.yml .github/workflows/kernel-compile-9p.yml .github/workflows/stress-ng.yml .github/workflows/zfs-test.yml .github/workflows/xfs-nbd.yml scripts/tests/test_tiered_writeback_e2e.py
+git add .github/workflows/xfstests-nfs.yml .github/workflows/xfstests-9p.yml .github/workflows/pjdfstest.yml .github/workflows/pjdfstest-9p.yml .github/workflows/kernel-compile-nfs.yml .github/workflows/kernel-compile-9p.yml .github/workflows/stress-ng.yml .github/workflows/zfs-test.yml .github/workflows/xfs-nbd.yml scripts/tests/test_tiered_writeback_e2e.py
 git commit -m "ci: exercise tiered writeback Linux protocols"
 ```
 
@@ -332,23 +434,7 @@ git commit -m "ci: exercise tiered writeback Linux protocols"
 
 For each boundary, assert complete/consistent recovery at and below the completed local floor. Above it, allow only the explicit canonical striped-member prefix from Task C1 and forbid torn metadata/namespace/logical-completion claims. Remote receipts must survive deleting the exact ledger-owned local state before reopen.
 
-- [ ] **Step 2: Run the real Ubuntu crash modes**
-
-Each command below uses its own newly created ledger. Its preceding `setup` command uses the same filesystem/object ack pair shown on that command; after the run, execute `cleanup --ledger` twice and `assert-clean --ledger` before creating the next ledger.
-
-```bash
-cd /fast/projects/ZeroFS-unified-tiered-writeback
-sudo python3 scripts/tiered-writeback-e2e.py run --ledger "$LEDGER" --filesystem-ack-mode volatile_memory --object-ack-mode memory --scenario crash-boundary-matrix
-sudo python3 scripts/tiered-writeback-e2e.py run --ledger "$LEDGER" --filesystem-ack-mode volatile_memory --object-ack-mode ssd --scenario local-receipt-restart
-sudo python3 scripts/tiered-writeback-e2e.py run --ledger "$LEDGER" --filesystem-ack-mode volatile_memory --object-ack-mode remote --scenario remote-receipt-clean-cache-restart
-sudo python3 scripts/tiered-writeback-e2e.py run --ledger "$LEDGER" --filesystem-ack-mode volatile_memory --object-ack-mode ssd --scenario terminal-fanout-and-shutdown-timeout
-cd zerofs
-cargo test -p zerofs --test failover_e2e --locked -- --ignored --nocapture
-```
-
-Supervisor cancellation must interrupt the harness during setup, workload, crash/restart, and cleanup; the signal handler invokes idempotent cleanup and the test then runs `assert-clean --ledger`.
-
-- [ ] **Step 3: Run portable regressions and commit exact files**
+- [ ] **Step 2: Run RED before implementation**
 
 ```bash
 cd /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback/zerofs
@@ -356,10 +442,80 @@ cargo test -p zerofs --test writeback_recovery --locked -- --nocapture
 cargo test -p zerofs --test writeback_faults --locked -- --nocapture
 cd ..
 python3 -m unittest discover -s scripts/tests -p 'test_*.py' -v
+```
+
+Expected RED: the new typed crash assertions, supervisor-cancellation cleanup, or named crash modes are absent.
+
+- [ ] **Step 3: Implement the crash harness and deterministic regressions**
+
+Add typed-incarnation assertions to both Rust test targets, implement exact failpoint/process-stop boundaries in `crash.py`, and add standard-library unit tests that verify each mode records both ack flags, literal source SHA, external ledger authority, typed floors, primary failure, and cleanup outcome. The supervisor-cancellation test interrupts setup, workload, restart, and cleanup independently and then proves repeated cleanup plus `assert-clean` from the surviving control root.
+
+- [ ] **Step 4: Run portable GREEN**
+
+```bash
+cd /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback/zerofs
+cargo test -p zerofs --test writeback_recovery --locked -- --nocapture
+cargo test -p zerofs --test writeback_faults --locked -- --nocapture
+cd ..
+python3 -m compileall -q scripts/tiered_writeback_e2e scripts/tiered-writeback-e2e.py
+python3 -m unittest discover -s scripts/tests -p 'test_*.py' -v
 git diff --check
+```
+
+- [ ] **Step 5: Commit exact files and review the commit**
+
+```bash
+cd /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback
 git add zerofs/tests/writeback_recovery.rs zerofs/tests/writeback_faults.rs scripts/tiered_writeback_e2e/crash.py scripts/tests/test_tiered_writeback_e2e.py
 git commit -m "test: prove tiered writeback crash recovery"
+CRASH_SHA="$(git rev-parse HEAD^{commit})"; test "${#CRASH_SHA}" = 40
+test "$(git diff-tree --no-commit-id --name-only -r "$CRASH_SHA" | sort | tr '\n' ' ')" = "scripts/tests/test_tiered_writeback_e2e.py scripts/tiered_writeback_e2e/crash.py zerofs/tests/writeback_faults.rs zerofs/tests/writeback_recovery.rs "
+git show --check "$CRASH_SHA"
+test -z "$(git status --porcelain=v1)"
 ```
+
+- [ ] **Step 6: Push and fail-closed synchronize the literal crash SHA**
+
+```bash
+cd /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback
+git push origin "$CRASH_SHA:refs/heads/codex/unified-tiered-writeback"
+test "$(git ls-remote origin refs/heads/codex/unified-tiered-writeback | awk '{print $1}')" = "$CRASH_SHA"
+ssh ubuntu-main "cd /fast/projects/ZeroFS && git fetch origin codex/unified-tiered-writeback && test \"\$(git rev-parse origin/codex/unified-tiered-writeback)\" = '$CRASH_SHA'"
+ssh ubuntu-main "cd /fast/projects/ZeroFS-unified-tiered-writeback && test -z \"\$(git status --porcelain=v1)\" && python3 scripts/tiered-writeback-e2e.py assert-source-idle --source-root /fast/projects/ZeroFS-unified-tiered-writeback && git switch --detach '$CRASH_SHA' && test \"\$(git rev-parse HEAD)\" = '$CRASH_SHA'"
+```
+
+- [ ] **Step 7: Run real Ubuntu proof only from `CRASH_SHA`**
+
+Each invocation below creates its own external control root and disposable resource root:
+
+```bash
+cd /fast/projects/ZeroFS-unified-tiered-writeback
+CRASH_SHA="$(git rev-parse origin/codex/unified-tiered-writeback^{commit})"
+test "$(git rev-parse HEAD)" = "$CRASH_SHA"
+run_crash_scenario() {
+  object_mode="$1"; scenario="$2"
+  RUN_UUID="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+  CONTROL_ROOT="/var/tmp/zerofs-tiered-control-${RUN_UUID}"
+  RESOURCE_ROOT="/var/tmp/zerofs-tiered-resources-${RUN_UUID}"
+  LEDGER="${CONTROL_ROOT}/ledger.json"
+  sudo python3 scripts/tiered-writeback-e2e.py setup --ledger "$LEDGER" --control-root "$CONTROL_ROOT" --resource-root "$RESOURCE_ROOT" --source-sha "$CRASH_SHA" --filesystem-ack-mode volatile_memory --object-ack-mode "$object_mode"
+  sudo python3 scripts/tiered-writeback-e2e.py run --ledger "$LEDGER" --filesystem-ack-mode volatile_memory --object-ack-mode "$object_mode" --scenario "$scenario"
+  sudo python3 scripts/tiered-writeback-e2e.py cleanup --ledger "$LEDGER"
+  sudo python3 scripts/tiered-writeback-e2e.py cleanup --ledger "$LEDGER"
+  sudo python3 scripts/tiered-writeback-e2e.py assert-clean --ledger "$LEDGER"
+}
+run_crash_scenario memory crash-boundary-matrix
+run_crash_scenario ssd local-receipt-restart
+run_crash_scenario remote remote-receipt-clean-cache-restart
+run_crash_scenario ssd terminal-fanout-and-shutdown-timeout
+cd zerofs
+cargo test -p zerofs --test failover_e2e --locked -- --list --ignored | tee "$CONTROL_ROOT/failover-tests.list"
+test "$(grep -Ec ': test$' "$CONTROL_ROOT/failover-tests.list")" -gt 0
+cargo test -p zerofs --test failover_e2e --locked -- --ignored --nocapture 2>&1 | tee "$CONTROL_ROOT/failover-tests.run"
+grep -Eq 'test result: ok\. [1-9][0-9]* passed' "$CONTROL_ROOT/failover-tests.run"
+```
+
+Any Linux-discovered defect starts a new RED/GREEN corrective commit. It must be reviewed, pushed, and synchronized to its new literal 40-hex SHA by Step 6 before any Linux proof command is rerun; no dirty Ubuntu checkout is patched in place.
 
 ---
 
@@ -367,53 +523,86 @@ git commit -m "test: prove tiered writeback crash recovery"
 
 **Files:**
 - Modify only after a real RED: existing mutation/writeback benchmark instrumentation
-- Receipt: UUID Ubuntu run root outside Git
+- Receipt: UUID Ubuntu external control root outside Git
 
 **Interfaces:**
 - Produces: separate foreground RAM-ack, local SSD cutoff, paced remote-drain, and remote flush throughput/latency with integrity.
 - Consumes: ledger `local_ssd_scratch`, incompressible payloads, disposable backend, exact metrics, and both ack flags.
 
-- [ ] **Step 1: Derive and validate scratch from the ledger**
+- [ ] **Step 1: Review, push, and synchronize the latest literal SHA**
+
+Run the required promotion block after the most recent committed/reviewed slice. On Ubuntu, prove the isolated checkout is clean and exactly equal to expanded `SLICE_SHA` before allocating benchmark resources.
+
+- [ ] **Step 2: Create external control authority and derive owned scratch**
 
 ```bash
 cd /fast/projects/ZeroFS-unified-tiered-writeback
+SLICE_SHA="$(git rev-parse origin/codex/unified-tiered-writeback^{commit})"
+test "$(git rev-parse HEAD)" = "$SLICE_SHA"
+RUN_UUID="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+CONTROL_ROOT="/var/tmp/zerofs-tiered-control-${RUN_UUID}"
+RESOURCE_ROOT="/var/tmp/zerofs-tiered-resources-${RUN_UUID}"
+LEDGER="${CONTROL_ROOT}/ledger.json"
+sudo python3 scripts/tiered-writeback-e2e.py setup --ledger "$LEDGER" --control-root "$CONTROL_ROOT" --resource-root "$RESOURCE_ROOT" --source-sha "$SLICE_SHA" --filesystem-ack-mode volatile_memory --object-ack-mode ssd
 BENCH_SCRATCH="$(python3 scripts/tiered-writeback-e2e.py ledger-value --ledger "$LEDGER" --key local_ssd_scratch)"
 python3 scripts/tiered-writeback-e2e.py validate-owned-path --ledger "$LEDGER" --path "$BENCH_SCRATCH"
 cd zerofs
 ```
 
-- [ ] **Step 2: List exact ignored benchmarks and reject zero selection**
+- [ ] **Step 3: List exact ignored benchmarks and reject zero selection**
 
 ```bash
-cargo test --release -p zerofs --lib --locked -- --list | tee "$RUN_ROOT/rust-bench-tests.list"
-grep -F 'writeback::store::tests::bench_writeback_tier_profile' "$RUN_ROOT/rust-bench-tests.list"
-grep -F 'writeback::journaler::tests::drain_throughput_of_the_post_ack_durability_tail' "$RUN_ROOT/rust-bench-tests.list"
-grep -F 'writeback::store::tests::bench_remote_replay_throughput_against_throttled_backend' "$RUN_ROOT/rust-bench-tests.list"
-grep -F 'writeback::journal::tests::publication_batch_size_amortizes_the_journal_fixed_cost' "$RUN_ROOT/rust-bench-tests.list"
-grep -F 'writeback::journal::tests::remote_commit_serialization_cost_bounds_replay_throughput' "$RUN_ROOT/rust-bench-tests.list"
+cargo test --release -p zerofs --lib --locked -- --list | tee "$CONTROL_ROOT/rust-bench-tests.list"
+grep -F 'writeback::store::tests::bench_writeback_tier_profile' "$CONTROL_ROOT/rust-bench-tests.list"
+grep -F 'writeback::journaler::tests::drain_throughput_of_the_post_ack_durability_tail' "$CONTROL_ROOT/rust-bench-tests.list"
+grep -F 'writeback::store::tests::bench_remote_replay_throughput_against_throttled_backend' "$CONTROL_ROOT/rust-bench-tests.list"
+grep -F 'writeback::journal::tests::publication_batch_size_amortizes_the_journal_fixed_cost' "$CONTROL_ROOT/rust-bench-tests.list"
+grep -F 'writeback::journal::tests::remote_commit_serialization_cost_bounds_replay_throughput' "$CONTROL_ROOT/rust-bench-tests.list"
 ```
 
-- [ ] **Step 3: Run every exact benchmark name**
+- [ ] **Step 4: Run every exact benchmark name**
 
 ```bash
-ZEROFS_BENCH_DIR="$BENCH_SCRATCH/tier-profile" cargo test --release -p zerofs --lib --locked writeback::store::tests::bench_writeback_tier_profile -- --ignored --exact --nocapture
-ZEROFS_BENCH_DIR="$BENCH_SCRATCH/drain" cargo test --release -p zerofs --lib --locked writeback::journaler::tests::drain_throughput_of_the_post_ack_durability_tail -- --ignored --exact --nocapture
-ZEROFS_BENCH_DIR="$BENCH_SCRATCH/remote-replay" cargo test --release -p zerofs --lib --locked writeback::store::tests::bench_remote_replay_throughput_against_throttled_backend -- --ignored --exact --nocapture
-ZEROFS_BENCH_DIR="$BENCH_SCRATCH/publication-batch" cargo test --release -p zerofs --lib --locked writeback::journal::tests::publication_batch_size_amortizes_the_journal_fixed_cost -- --ignored --exact --nocapture
-ZEROFS_BENCH_DIR="$BENCH_SCRATCH/remote-commit" cargo test --release -p zerofs --lib --locked writeback::journal::tests::remote_commit_serialization_cost_bounds_replay_throughput -- --ignored --exact --nocapture
+ZEROFS_BENCH_DIR="$BENCH_SCRATCH/tier-profile" cargo test --release -p zerofs --lib --locked writeback::store::tests::bench_writeback_tier_profile -- --ignored --exact --nocapture 2>&1 | tee "$CONTROL_ROOT/bench-tier-profile.run"
+grep -Eq 'test result: ok\. 1 passed' "$CONTROL_ROOT/bench-tier-profile.run"
+ZEROFS_BENCH_DIR="$BENCH_SCRATCH/drain" cargo test --release -p zerofs --lib --locked writeback::journaler::tests::drain_throughput_of_the_post_ack_durability_tail -- --ignored --exact --nocapture 2>&1 | tee "$CONTROL_ROOT/bench-drain.run"
+grep -Eq 'test result: ok\. 1 passed' "$CONTROL_ROOT/bench-drain.run"
+ZEROFS_BENCH_DIR="$BENCH_SCRATCH/remote-replay" cargo test --release -p zerofs --lib --locked writeback::store::tests::bench_remote_replay_throughput_against_throttled_backend -- --ignored --exact --nocapture 2>&1 | tee "$CONTROL_ROOT/bench-remote-replay.run"
+grep -Eq 'test result: ok\. 1 passed' "$CONTROL_ROOT/bench-remote-replay.run"
+ZEROFS_BENCH_DIR="$BENCH_SCRATCH/publication-batch" cargo test --release -p zerofs --lib --locked writeback::journal::tests::publication_batch_size_amortizes_the_journal_fixed_cost -- --ignored --exact --nocapture 2>&1 | tee "$CONTROL_ROOT/bench-publication-batch.run"
+grep -Eq 'test result: ok\. 1 passed' "$CONTROL_ROOT/bench-publication-batch.run"
+ZEROFS_BENCH_DIR="$BENCH_SCRATCH/remote-commit" cargo test --release -p zerofs --lib --locked writeback::journal::tests::remote_commit_serialization_cost_bounds_replay_throughput -- --ignored --exact --nocapture 2>&1 | tee "$CONTROL_ROOT/bench-remote-commit.run"
+grep -Eq 'test result: ok\. 1 passed' "$CONTROL_ROOT/bench-remote-commit.run"
+cd /fast/projects/ZeroFS-unified-tiered-writeback
+sudo python3 scripts/tiered-writeback-e2e.py cleanup --ledger "$LEDGER"
+sudo python3 scripts/tiered-writeback-e2e.py cleanup --ledger "$LEDGER"
+sudo python3 scripts/tiered-writeback-e2e.py assert-clean --ledger "$LEDGER"
 ```
 
 Each command must report exactly one executed test; any zero-test or multi-test receipt is rejected.
 
-- [ ] **Step 4: Run real protocol benchmarks and integrity gates**
+- [ ] **Step 5: Run real protocol benchmarks and integrity gates**
 
-Each benchmark command uses a separate ledger whose `setup` command has the same two ack flags; cleanup and `assert-clean` complete before the next ledger is created.
+Each benchmark command uses a separate ledger whose `setup` command has the same two ack flags; cleanup twice and `assert-clean` complete before the next ledger is created.
 
 ```bash
 cd /fast/projects/ZeroFS-unified-tiered-writeback
-sudo python3 scripts/tiered-writeback-e2e.py run --ledger "$LEDGER" --filesystem-ack-mode volatile_memory --object-ack-mode memory --scenario benchmark-ram-ack
-sudo python3 scripts/tiered-writeback-e2e.py run --ledger "$LEDGER" --filesystem-ack-mode volatile_memory --object-ack-mode ssd --scenario benchmark-local-ssd
-sudo python3 scripts/tiered-writeback-e2e.py run --ledger "$LEDGER" --filesystem-ack-mode volatile_memory --object-ack-mode remote --scenario benchmark-paced-remote
+SLICE_SHA="$(git rev-parse origin/codex/unified-tiered-writeback^{commit})"
+run_benchmark_scenario() {
+  object_mode="$1"; scenario="$2"
+  RUN_UUID="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+  CONTROL_ROOT="/var/tmp/zerofs-tiered-control-${RUN_UUID}"
+  RESOURCE_ROOT="/var/tmp/zerofs-tiered-resources-${RUN_UUID}"
+  LEDGER="${CONTROL_ROOT}/ledger.json"
+  sudo python3 scripts/tiered-writeback-e2e.py setup --ledger "$LEDGER" --control-root "$CONTROL_ROOT" --resource-root "$RESOURCE_ROOT" --source-sha "$SLICE_SHA" --filesystem-ack-mode volatile_memory --object-ack-mode "$object_mode"
+  sudo python3 scripts/tiered-writeback-e2e.py run --ledger "$LEDGER" --filesystem-ack-mode volatile_memory --object-ack-mode "$object_mode" --scenario "$scenario"
+  sudo python3 scripts/tiered-writeback-e2e.py cleanup --ledger "$LEDGER"
+  sudo python3 scripts/tiered-writeback-e2e.py cleanup --ledger "$LEDGER"
+  sudo python3 scripts/tiered-writeback-e2e.py assert-clean --ledger "$LEDGER"
+}
+run_benchmark_scenario memory benchmark-ram-ack
+run_benchmark_scenario ssd benchmark-local-ssd
+run_benchmark_scenario remote benchmark-paced-remote
 ```
 
 Every receipt includes size/SHA-256/readback, mutation/object floors, dirty tiers, terminal state, CPU/RAM/local allocation, remote rate, and cleanup. Performance without integrity and durability is rejected.
@@ -452,7 +641,10 @@ find proxmox -type f -name '*.sh' -exec shellcheck {} +
 actionlint .github/workflows/*.yml
 make webui
 cd zerofs
-cargo test -p zerofs --features webui webui::tests::wasm_client_smoke --locked -- --ignored --nocapture
+cargo test -p zerofs --features webui --locked -- --list | tee /tmp/zerofs-final-wasm-smoke.list
+grep -Fx 'webui::tests::wasm_client_smoke: test' /tmp/zerofs-final-wasm-smoke.list
+cargo test -p zerofs --features webui webui::tests::wasm_client_smoke --locked -- --ignored --exact --nocapture 2>&1 | tee /tmp/zerofs-final-wasm-smoke.run
+grep -Eq 'test result: ok\. 1 passed' /tmp/zerofs-final-wasm-smoke.run
 cd ..
 git diff --check origin/develop...HEAD
 ```
@@ -469,7 +661,79 @@ cargo run --locked -- run --list
 
 - [ ] **Step 2: Run Linux-only gates on the exact pushed SHA**
 
-On Ubuntu `/fast/projects/ZeroFS-unified-tiered-writeback`, prove HEAD equals `origin/codex/unified-tiered-writeback` and porcelain is clean, then run the full workspace/failpoint/DST/ignored failover tests and every Task C3-C7 harness scenario. No Linux mount/device proof runs on Mac.
+After Step 1 and all review fixes are committed, run the required promotion block and record `FINAL_PROOF_SHA=$SLICE_SHA`. Then execute on Ubuntu:
+
+```bash
+cd /fast/projects/ZeroFS-unified-tiered-writeback
+FINAL_PROOF_SHA="$(git rev-parse origin/codex/unified-tiered-writeback^{commit})"
+test "$(git rev-parse HEAD)" = "$FINAL_PROOF_SHA"
+test -z "$(git status --porcelain=v1)"
+cd zerofs
+cargo build --workspace --locked
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --all-targets --locked
+cargo clippy -p zerofs --features failpoints --tests --locked -- -D warnings
+cargo test -p zerofs --features failpoints --test failpoints --locked -- --nocapture
+RUSTFLAGS="--cfg dst --cfg tokio_unstable --cfg io_uring_skip_arch_check" cargo clippy -p zerofs --features failpoints --test dst --locked -- -D warnings
+RUSTFLAGS="--cfg dst --cfg tokio_unstable --cfg io_uring_skip_arch_check" cargo test -p zerofs --features failpoints --test dst --locked -- --nocapture
+cargo test -p zerofs --test failover_e2e --locked -- --list --ignored | tee /tmp/zerofs-final-failover.list
+test "$(grep -Ec ': test$' /tmp/zerofs-final-failover.list)" -gt 0
+cargo test -p zerofs --test failover_e2e --locked -- --ignored --nocapture 2>&1 | tee /tmp/zerofs-final-failover.run
+grep -Eq 'test result: ok\. [1-9][0-9]* passed' /tmp/zerofs-final-failover.run
+cargo test -p zerofs-client --all-features --locked
+cargo check -p ninep-client --target wasm32-unknown-unknown --locked
+cd ..
+python3 -m compileall -q scripts proxmox
+python3 -m unittest discover -s scripts/tests -p 'test_*.py' -v
+python3 -m unittest discover -s proxmox/tests -p 'test_*.py' -v
+find proxmox -type f -name '*.sh' -exec shellcheck {} +
+actionlint .github/workflows/*.yml
+```
+
+Run every real harness scenario from its own external control/resource roots:
+
+```bash
+cd /fast/projects/ZeroFS-unified-tiered-writeback
+run_final_scenario() {
+  filesystem_mode="$1"; object_mode="$2"; scenario="$3"
+  RUN_UUID="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+  CONTROL_ROOT="/var/tmp/zerofs-tiered-control-${RUN_UUID}"
+  RESOURCE_ROOT="/var/tmp/zerofs-tiered-resources-${RUN_UUID}"
+  LEDGER="${CONTROL_ROOT}/ledger.json"
+  sudo python3 scripts/tiered-writeback-e2e.py setup --ledger "$LEDGER" --control-root "$CONTROL_ROOT" --resource-root "$RESOURCE_ROOT" --source-sha "$FINAL_PROOF_SHA" --filesystem-ack-mode "$filesystem_mode" --object-ack-mode "$object_mode"
+  sudo python3 scripts/tiered-writeback-e2e.py run --ledger "$LEDGER" --filesystem-ack-mode "$filesystem_mode" --object-ack-mode "$object_mode" --scenario "$scenario"
+  sudo python3 scripts/tiered-writeback-e2e.py cleanup --ledger "$LEDGER"
+  sudo python3 scripts/tiered-writeback-e2e.py cleanup --ledger "$LEDGER"
+  sudo python3 scripts/tiered-writeback-e2e.py assert-clean --ledger "$LEDGER"
+}
+run_final_scenario volatile_memory memory global-admission-nbd-nfs-ninep
+run_final_scenario volatile_memory memory cross-adapter-pending-read-same-backing-inode
+run_final_scenario volatile_memory memory nfs-commit-covers-prior-nbd
+run_final_scenario volatile_memory memory ninep-fsync-covers-prior-nfs
+run_final_scenario volatile_memory memory nbd-flush-covers-prior-ninep
+run_final_scenario volatile_memory memory webui-rpc-production-path
+run_final_scenario materialized ssd protocol-materialized-control
+run_final_scenario materialized remote protocol-durability-target-control
+run_final_scenario volatile_memory ssd xfstests-nfs-quick
+run_final_scenario volatile_memory ssd xfstests-ninep-quick-and-strict
+run_final_scenario volatile_memory ssd pjdfstest-nfs
+run_final_scenario volatile_memory ssd pjdfstest-ninep
+run_final_scenario volatile_memory ssd stress-ng-nfs-ninep
+run_final_scenario volatile_memory ssd kernel-compile-nfs
+run_final_scenario volatile_memory ssd kernel-compile-ninep
+run_final_scenario volatile_memory ssd xfs-over-nbd-restart
+run_final_scenario volatile_memory ssd zfs-over-nbd-restart
+run_final_scenario volatile_memory memory crash-boundary-matrix
+run_final_scenario volatile_memory ssd local-receipt-restart
+run_final_scenario volatile_memory remote remote-receipt-clean-cache-restart
+run_final_scenario volatile_memory ssd terminal-fanout-and-shutdown-timeout
+run_final_scenario volatile_memory memory benchmark-ram-ack
+run_final_scenario volatile_memory ssd benchmark-local-ssd
+run_final_scenario volatile_memory remote benchmark-paced-remote
+```
+
+No command in this step runs on macOS. Any correction repeats portable GREEN, exact commit/review, push, literal-SHA synchronization, and this affected Linux command.
 
 - [ ] **Step 3: Perform the requirement-to-evidence and cleanup audits**
 
@@ -494,19 +758,53 @@ For every ledger:
 sudo python3 scripts/tiered-writeback-e2e.py cleanup --ledger "$LEDGER"
 sudo python3 scripts/tiered-writeback-e2e.py cleanup --ledger "$LEDGER"
 sudo python3 scripts/tiered-writeback-e2e.py assert-clean --ledger "$LEDGER"
+RUN_UUID="$(python3 scripts/tiered-writeback-e2e.py ledger-value --ledger "$LEDGER" --key run_uuid)"
+sudo python3 scripts/tiered-writeback-e2e.py archive-control --ledger "$LEDGER" --archive-root /fast/zerofs-tiered-receipts
+test ! -e "/var/tmp/zerofs-tiered-control-${RUN_UUID}"
+test -s "/fast/zerofs-tiered-receipts/${RUN_UUID}/ledger.json"
 ```
 
-Prove no UUID-owned mount/device/pool/filesystem/process/listener/socket/prefix/root remains. Prove no active build/test/harness job exists before touching checkouts. Remove the separate `nfsserve` worktree only after its immutable pushed revision is pinned and its worktree is clean.
+Prove no UUID-owned mount/device/pool/filesystem/process/listener/socket/prefix/resource/control root remains. The preserved receipt archive is evidence, not a live test resource. Prove no active build/test/harness job exists before touching checkouts. Remove the separate `nfsserve` worktree only after its immutable pushed revision is pinned and its worktree is clean.
+
+```bash
+test -z "$(git -C /Volumes/bigssd/projects/nfsserve/.worktrees/zerofs-write-context status --porcelain=v1)"
+git -C /Volumes/bigssd/projects/nfsserve worktree remove /Volumes/bigssd/projects/nfsserve/.worktrees/zerofs-write-context
+git -C /Volumes/bigssd/projects/nfsserve worktree prune
+git -C /Volumes/bigssd/projects/nfsserve worktree list --porcelain
+test ! -e /Volumes/bigssd/projects/nfsserve/.worktrees/zerofs-write-context
+```
 
 - [ ] **Step 2: Final review and merge/push `develop`**
 
-Root records `FEATURE_SHA`, fetches, proves clean porcelain and `origin/develop` ancestry, reruns the complete final gate if history was rewritten, then fast-forwards local `develop` and pushes it. Record `EXPECTED_OLD_SHA` and pushed `EXPECTED_NEW_SHA`.
+From the clean primary checkout, fast-forward and push with exact checks:
+
+```bash
+cd /Volumes/bigssd/projects/ZeroFS
+test -z "$(git status --porcelain=v1)"
+test "$(git branch --show-current)" = develop
+EXPECTED_OLD_SHA="$(git rev-parse HEAD^{commit})"; test "${#EXPECTED_OLD_SHA}" = 40
+FEATURE_SHA="$(git -C /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback rev-parse HEAD^{commit})"; test "${#FEATURE_SHA}" = 40
+git fetch origin develop codex/unified-tiered-writeback
+test "$(git rev-parse origin/codex/unified-tiered-writeback)" = "$FEATURE_SHA"
+test "$(git rev-parse origin/develop)" = "$EXPECTED_OLD_SHA"
+git merge-base --is-ancestor "$EXPECTED_OLD_SHA" "$FEATURE_SHA"
+git merge --ff-only "$FEATURE_SHA"
+EXPECTED_NEW_SHA="$(git rev-parse HEAD^{commit})"
+test "$EXPECTED_NEW_SHA" = "$FEATURE_SHA"
+git push origin "$EXPECTED_NEW_SHA:refs/heads/develop"
+test "$(git ls-remote origin refs/heads/develop | awk '{print $1}')" = "$EXPECTED_NEW_SHA"
+test -z "$(git status --porcelain=v1)"
+```
 
 - [ ] **Step 3: Fail-closed Ubuntu fast-forward**
 
-Before the command, substitute the recorded literal SHAs for `EXPECTED_OLD_SHA` and `EXPECTED_NEW_SHA`. On Ubuntu:
+Pass the two recorded SHAs from the local primary-checkout shell into one fail-closed Ubuntu command:
 
 ```bash
+cd /Volumes/bigssd/projects/ZeroFS
+test "${#EXPECTED_OLD_SHA}" = 40
+test "${#EXPECTED_NEW_SHA}" = 40
+ssh ubuntu-main "EXPECTED_OLD_SHA='$EXPECTED_OLD_SHA' EXPECTED_NEW_SHA='$EXPECTED_NEW_SHA' bash -se" <<'REMOTE'
 cd /fast/projects/ZeroFS
 test -z "$(git status --porcelain=v1)"
 test "$(git branch --show-current)" = develop
@@ -518,6 +816,7 @@ git merge-base --is-ancestor "$EXPECTED_OLD_SHA" "$EXPECTED_NEW_SHA"
 git merge --ff-only "$EXPECTED_NEW_SHA"
 test "$(git rev-parse HEAD)" = "$EXPECTED_NEW_SHA"
 test -z "$(git status --porcelain=v1)"
+REMOTE
 ```
 
 Any dirty path, wrong branch/SHA, active job, or failed ancestry check stops without changing the checkout.
@@ -534,3 +833,13 @@ git worktree list --porcelain
 ```
 
 Then Root removes only `/Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback`, prunes, and lists local worktrees. The completion receipt explicitly proves no feature deployment/restart occurred on CT198 after the already recorded operational exception; it does not falsely claim CT198 was never restarted.
+
+```bash
+cd /Volumes/bigssd/projects/ZeroFS
+test -z "$(git -C /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback status --porcelain=v1)"
+git worktree remove /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback
+git worktree prune
+git worktree list --porcelain
+test ! -e /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback
+test -z "$(git status --porcelain=v1)"
+```
