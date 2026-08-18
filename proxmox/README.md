@@ -185,57 +185,26 @@ WebUI is at `http://10.10.10.30:8080` and must never be made public.
 
 VM100 can keep the production NBD/XFS volume mounted at `/mnt/zerofs-lxc`
 while separately mounting the normal ZeroFS file namespace at
-`/mnt/zerofs-files`. The raw NFSv3 mount is kept at
-`/mnt/zerofs-files-raw`; `bindfs` presents it at `/mnt/zerofs-files` with
-VM100's `zack` user mirrored as the owner. Files created from VM100 are stored
-as macOS UID/GID `501:20`, so both machines can read, update, rename, and remove
-the same files even though their local user IDs differ. Chown, chgrp, and chmod
-requests through the mapped view are ignored so a client cannot accidentally
-break that shared identity contract.
+`/mnt/zerofs-files`. These are independent read-write mountpoints: XFS over
+the existing NBD client for the LXC volume, and a direct NFSv3/TCP mount for the
+shared file namespace. The NFS client uses hard mounts, 1 MiB read/write
+requests, a one-second attribute cache, and `_netdev` so it remains independent
+from the NBD client lifecycle.
 
-Because the normal namespace also exposes the live NBD lanes below `.nbd`,
-`mnt-zerofs\x2dfiles\x2draw-.nbd.mount` overlays the raw control directory
-read-only before the mapped view starts. The one-second NFS attribute cache
-keeps Mac and iPhone uploads visible without using 9P on VM100.
-
-`zerofs-shared-namespace-permissions.service` then verifies both mount
-boundaries and normalizes only the ordinary namespace to UID/GID `501:20`
-with owner/group write access. It fails closed unless the raw namespace is the
-expected read-write NFS export and `.nbd` is a separate read-only mount.
-
-Install the mount without changing the existing NBD units:
+Install the direct NFS mount without changing the existing NBD units:
 
 ```bash
-sudo apt-get install -y bindfs
-sudo install -d -m 0755 /mnt/zerofs-files-raw /mnt/zerofs-files
-sudo install -m 0644 \
-  'proxmox/systemd/mnt-zerofs\x2dfiles\x2draw.mount' \
-  '/etc/systemd/system/mnt-zerofs\x2dfiles\x2draw.mount'
+sudo install -d -m 0755 /mnt/zerofs-files
 sudo install -m 0644 \
   'proxmox/systemd/mnt-zerofs\x2dfiles.mount' \
   '/etc/systemd/system/mnt-zerofs\x2dfiles.mount'
-sudo install -m 0644 \
-  'proxmox/systemd/mnt-zerofs\x2dfiles\x2draw-.nbd.mount' \
-  '/etc/systemd/system/mnt-zerofs\x2dfiles\x2draw-.nbd.mount'
-sudo install -d -m 0755 /usr/local/libexec
-sudo install -m 0755 \
-  proxmox/guest/normalize-shared-namespace.py \
-  /usr/local/libexec/zerofs-normalize-shared-namespace
-sudo install -m 0644 \
-  proxmox/systemd/zerofs-shared-namespace-permissions.service \
-  /etc/systemd/system/zerofs-shared-namespace-permissions.service
 sudo systemctl daemon-reload
-sudo systemctl enable --now 'mnt-zerofs\x2dfiles\x2draw.mount'
-sudo systemctl enable --now 'mnt-zerofs\x2dfiles\x2draw-.nbd.mount'
-sudo systemctl start zerofs-shared-namespace-permissions.service
 sudo systemctl enable --now 'mnt-zerofs\x2dfiles.mount'
 ```
 
 The result is two independent VM100 mountpoints: read-write XFS over NBD at
 `/mnt/zerofs-lxc`, and the read-write shared file tree at
-`/mnt/zerofs-files`, with only `/mnt/zerofs-files/.nbd` protected read-only.
-The raw NFS mount is an implementation detail; normal VM100 file operations
-must use the mapped `/mnt/zerofs-files` path.
+`/mnt/zerofs-files` over the production NFSv3 export.
 
 ZeroFS NFS reports writes as stable while they are buffered, and tested macOS
 and Linux clients do not issue a durability-producing COMMIT on `fsync`.

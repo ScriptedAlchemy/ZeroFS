@@ -7,7 +7,7 @@ After=zerofs-lxc-nbd-client.service
 What=/dev/nbd0
 Where=/mnt/zerofs-lxc
 Type=xfs
-Options=noatime,nodiscard
+Options=rw,noatime,nodiscard
 TimeoutSec=60s
 
 [Install]

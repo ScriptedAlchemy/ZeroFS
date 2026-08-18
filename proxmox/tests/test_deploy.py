@@ -57,113 +57,40 @@ class SystemdTemplateTests(unittest.TestCase):
         self.assertIn("-persist -timeout 600", unit)
 
     def test_file_namespace_mount_is_persistent_and_independent_from_nbd(self) -> None:
-        raw_unit = (
-            Path(__file__).parents[1]
-            / "systemd"
-            / r"mnt-zerofs\x2dfiles\x2draw.mount"
-        ).read_text()
-
-        self.assertIn("What=10.10.10.55:/", raw_unit)
-        self.assertIn("Where=/mnt/zerofs-files-raw", raw_unit)
-        self.assertIn("Type=nfs", raw_unit)
-        self.assertIn("vers=3", raw_unit)
-        self.assertIn("proto=tcp", raw_unit)
-        self.assertIn("hard", raw_unit)
-        self.assertIn("rw", raw_unit)
-        self.assertIn("actimeo=1", raw_unit)
-        self.assertIn("_netdev", raw_unit)
-        self.assertIn("WantedBy=remote-fs.target", raw_unit)
-        self.assertNotIn("zerofs-lxc-nbd-client.service", raw_unit)
-
-        nbd_guard = (
-            Path(__file__).parents[1]
-            / "systemd"
-            / r"mnt-zerofs\x2dfiles\x2draw-.nbd.mount"
-        ).read_text()
-        self.assertIn(r"Requires=mnt-zerofs\x2dfiles\x2draw.mount", nbd_guard)
-        self.assertIn("What=/mnt/zerofs-files-raw/.nbd", nbd_guard)
-        self.assertIn("Where=/mnt/zerofs-files-raw/.nbd", nbd_guard)
-        self.assertIn("bind", nbd_guard)
-        self.assertIn("ro", nbd_guard)
-        self.assertIn("_netdev", nbd_guard)
-        self.assertIn("WantedBy=remote-fs.target", nbd_guard)
-
-        view_unit = (
+        unit = (
             Path(__file__).parents[1]
             / "systemd"
             / r"mnt-zerofs\x2dfiles.mount"
         ).read_text()
-        self.assertIn("Requires=zerofs-shared-namespace-permissions.service", view_unit)
-        self.assertIn("After=zerofs-shared-namespace-permissions.service", view_unit)
-        self.assertIn("What=/mnt/zerofs-files-raw", view_unit)
-        self.assertIn("Where=/mnt/zerofs-files", view_unit)
-        self.assertIn("Type=fuse.bindfs", view_unit)
-        self.assertIn("mirror=zack", view_unit)
-        self.assertIn("create-for-user=501", view_unit)
-        self.assertIn("create-for-group=20", view_unit)
-        self.assertIn("chown-ignore", view_unit)
-        self.assertIn("chgrp-ignore", view_unit)
-        self.assertIn("chmod-ignore", view_unit)
-        self.assertIn("WantedBy=remote-fs.target", view_unit)
 
-        permissions_unit = (
-            Path(__file__).parents[1]
-            / "systemd"
-            / "zerofs-shared-namespace-permissions.service"
-        ).read_text()
-        self.assertIn(r"Requires=mnt-zerofs\x2dfiles\x2draw-.nbd.mount", permissions_unit)
-        self.assertIn(r"After=mnt-zerofs\x2dfiles\x2draw-.nbd.mount", permissions_unit)
-        self.assertIn("Before=mnt-zerofs\\x2dfiles.mount", permissions_unit)
+        self.assertIn("What=10.10.10.55:/", unit)
+        self.assertIn("Where=/mnt/zerofs-files", unit)
+        self.assertIn("Type=nfs", unit)
         self.assertIn(
-            "ExecStart=/usr/local/libexec/zerofs-normalize-shared-namespace",
-            permissions_unit,
+            "Options=rw,noatime,hard,vers=3,proto=tcp,nolock,port=2049,"
+            "mountport=2049,rsize=1048576,wsize=1048576,actimeo=1,_netdev",
+            unit,
         )
-        self.assertIn("Type=oneshot", permissions_unit)
-        self.assertIn("RemainAfterExit=yes", permissions_unit)
+        self.assertIn("WantedBy=remote-fs.target", unit)
+        self.assertNotIn("zerofs-lxc-nbd-client.service", unit)
 
-    def test_shared_namespace_normalizer_preserves_nbd_and_normalizes_ordinary_entries(
-        self,
-    ) -> None:
-        script = (
-            Path(__file__).parents[1]
-            / "guest"
-            / "normalize-shared-namespace.py"
-        )
-        spec = importlib.util.spec_from_file_location(
-            "zerofs_normalize_shared_namespace", script
-        )
-        assert spec is not None and spec.loader is not None
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        nbd_unit = (
+            Path(__file__).parents[1] / "systemd" / "mnt-zerofs-lxc.mount"
+        ).read_text()
+        self.assertIn("What=/dev/nbd0", nbd_unit)
+        self.assertIn("Where=/mnt/zerofs-lxc", nbd_unit)
+        self.assertIn("Type=xfs", nbd_unit)
+        self.assertIn("Options=rw,noatime,nodiscard", nbd_unit)
 
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            root.chmod(0o755)
-            ordinary = root / "ordinary"
-            ordinary.mkdir(mode=0o755)
-            private_file = ordinary / "private.bin"
-            private_file.write_bytes(b"ordinary")
-            private_file.chmod(0o600)
-            executable = ordinary / "tool"
-            executable.write_bytes(b"tool")
-            executable.chmod(0o700)
-            nbd = root / ".nbd"
-            nbd.mkdir(mode=0o755)
-            nbd_lane = nbd / "lane-0"
-            nbd_lane.write_bytes(b"do not touch")
-            nbd_lane.chmod(0o600)
-
-            module.normalize_namespace(root, uid=os.getuid(), gid=os.getgid())
-
-            self.assertEqual(root.stat().st_mode & 0o777, 0o775)
-            self.assertEqual(ordinary.stat().st_mode & 0o777, 0o775)
-            self.assertEqual(private_file.stat().st_mode & 0o777, 0o660)
-            self.assertEqual(executable.stat().st_mode & 0o777, 0o770)
-            self.assertEqual(private_file.stat().st_uid, os.getuid())
-            self.assertEqual(private_file.stat().st_gid, os.getgid())
-            self.assertEqual(nbd.stat().st_mode & 0o777, 0o755)
-            self.assertEqual(nbd_lane.stat().st_mode & 0o777, 0o600)
-            self.assertEqual(nbd_lane.read_bytes(), b"do not touch")
+        root = Path(__file__).parents[1]
+        for obsolete in (
+            Path("systemd") / r"mnt-zerofs\x2dfiles\x2draw.mount",
+            Path("systemd") / r"mnt-zerofs\x2dfiles\x2draw-.nbd.mount",
+            Path("systemd") / "zerofs-shared-namespace-permissions.service",
+            Path("guest") / "normalize-shared-namespace.py",
+        ):
+            with self.subTest(obsolete=obsolete):
+                self.assertFalse((root / obsolete).exists())
 
 
 class ConfigValidationTests(unittest.TestCase):

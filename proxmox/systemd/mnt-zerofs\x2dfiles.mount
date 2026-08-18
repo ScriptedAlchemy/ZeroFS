@@ -1,14 +1,14 @@
 [Unit]
-Description=ZeroFS file namespace mapped for VM100 and macOS ownership
-Requires=zerofs-shared-namespace-permissions.service
-After=zerofs-shared-namespace-permissions.service
+Description=ZeroFS file namespace from the private production LXC
+After=network-online.target
+Wants=network-online.target
 
 [Mount]
-What=/mnt/zerofs-files-raw
+What=10.10.10.55:/
 Where=/mnt/zerofs-files
-Type=fuse.bindfs
-Options=mirror=zack,create-for-user=501,create-for-group=20,chown-ignore,chgrp-ignore,chmod-ignore,_netdev
-TimeoutSec=30s
+Type=nfs
+Options=rw,noatime,hard,vers=3,proto=tcp,nolock,port=2049,mountport=2049,rsize=1048576,wsize=1048576,actimeo=1,_netdev
+TimeoutSec=120s
 
 [Install]
 WantedBy=remote-fs.target
