@@ -479,6 +479,8 @@ if [[ $dry_run == true ]]; then
   echo "+ wait up to 180s for private $role listeners and services"
   if [[ $role == prod ]]; then
     echo "+ prove NFS listener is private $container_ip:2049"
+    echo "+ prove 9P listener is private $container_ip:5564"
+    echo "+ prove NBD listener is private $container_ip:10809"
     echo "+ prove WebUI listener is private $container_ip:8080 and rejects wildcard/public binds"
   fi
 else
@@ -512,6 +514,8 @@ if [[ $dry_run == false ]]; then
     grep -Fq "$container_ip:10809" <<<"$listeners"
   else
     grep -Fq "$container_ip:2049" <<<"$listeners"
+    grep -Fq "$container_ip:5564" <<<"$listeners"
+    grep -Fq "$container_ip:10809" <<<"$listeners"
     grep -Fq "$container_ip:8080" <<<"$listeners"
     if [[ $has_smb == true ]]; then
       grep -Fq "$container_ip:445" <<<"$listeners"
@@ -520,7 +524,7 @@ if [[ $dry_run == false ]]; then
       false
     fi
   fi
-  if grep -Eq '(^|[[:space:]])(0\.0\.0\.0|\[::\]):(10809|9567|2049|445|8080)([[:space:]]|$)' <<<"$listeners"; then
+  if grep -Eq '(^|[[:space:]])(0\.0\.0\.0|\[::\]):(10809|9567|2049|5564|445|8080)([[:space:]]|$)' <<<"$listeners"; then
     echo "ZeroFS listener escaped the private container address" >&2
     false
   fi

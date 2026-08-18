@@ -148,11 +148,13 @@ class HostScriptTests(unittest.TestCase):
             r"elif pct config \"\$ctid\" .*; then\n\s+pct stop \"\$ctid\"",
         )
 
-    def test_listener_proof_rejects_wildcard_webui(self) -> None:
+    def test_listener_proof_covers_every_private_production_api(self) -> None:
         source = HOST_SCRIPT.read_text()
         self.assertIn("$container_ip:8080", source)
         self.assertIn("$container_ip:2049", source)
-        self.assertRegex(source, r"10809\|9567\|2049\|445\|8080")
+        self.assertIn("$container_ip:5564", source)
+        self.assertIn("$container_ip:10809", source)
+        self.assertRegex(source, r"10809\|9567\|2049\|5564\|445\|8080")
 
     def test_prod_rejects_replace_and_cleanup_on_host_too(self) -> None:
         for action in ("replace", "cleanup"):
