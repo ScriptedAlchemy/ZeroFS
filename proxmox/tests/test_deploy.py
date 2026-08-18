@@ -46,6 +46,17 @@ zerofs_writeback_terminal_error 0
             deploy.parse_drain_state("zerofs_writeback_terminal_error 0\n")
 
 
+class SystemdTemplateTests(unittest.TestCase):
+    def test_nbd_client_reconnects_after_a_transient_server_restart(self) -> None:
+        unit = (
+            Path(__file__).parents[1]
+            / "systemd"
+            / "zerofs-lxc-nbd-client.service"
+        ).read_text()
+
+        self.assertIn("-persist -timeout 600", unit)
+
+
 class ConfigValidationTests(unittest.TestCase):
     def write_config(self, text: str) -> Path:
         handle = tempfile.NamedTemporaryFile(mode="w", suffix=".toml", delete=False)
