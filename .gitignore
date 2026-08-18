@@ -1,4 +1,5 @@
 target
+.worktrees/
 /mnt
 /cache
 bench/bench_workspace
