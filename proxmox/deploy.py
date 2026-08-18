@@ -26,6 +26,8 @@ from pathlib import Path
 from typing import Sequence
 
 
+VM_NFS_MOUNT_UNIT = r"mnt-zerofs\x2dfiles.mount"
+VM_NFS_MOUNTPOINT = "/mnt/zerofs-files"
 RFC1918_NETWORKS = tuple(
     ipaddress.ip_network(value)
     for value in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
@@ -563,14 +565,24 @@ if findmnt -rn -M {shlex.quote(args.source_mountpoint)} >/dev/null 2>&1; then
   sudo sync -f {shlex.quote(args.source_mountpoint)}
 fi
 if unit_loaded {shlex.quote(args.source_mount_unit)}; then
-  sudo systemctl stop {shlex.quote(args.source_mount_unit)}
+  sudo systemctl disable --now {shlex.quote(args.source_mount_unit)}
+  if systemctl is-enabled --quiet {shlex.quote(args.source_mount_unit)}; then
+    echo 'legacy NBD mount remains enabled; refusing reboot persistence' >&2
+    exit 1
+  fi
+  test "$(systemctl is-active {shlex.quote(args.source_mount_unit)} 2>/dev/null || true)" != active
 fi
 if findmnt -rn -M {shlex.quote(args.source_mountpoint)} >/dev/null 2>&1; then
   echo 'mount remained active; refusing to disconnect NBD' >&2
   exit 1
 fi
 if unit_loaded {shlex.quote(args.source_client_unit)}; then
-  sudo systemctl stop {shlex.quote(args.source_client_unit)}
+  sudo systemctl disable --now {shlex.quote(args.source_client_unit)}
+  if systemctl is-enabled --quiet {shlex.quote(args.source_client_unit)}; then
+    echo 'legacy NBD client remains enabled; refusing reboot persistence' >&2
+    exit 1
+  fi
+  test "$(systemctl is-active {shlex.quote(args.source_client_unit)} 2>/dev/null || true)" != active
 fi
 nbd_pid=$(cat /sys/class/block/nbd0/pid 2>/dev/null || true)
 if test -n "$nbd_pid"; then
@@ -747,6 +759,30 @@ def _stage_and_run_host(
         )
 
 
+def _provision_vm_nfs_mount(runner: Runner, args: argparse.Namespace) -> None:
+    bundle = Path(__file__).resolve().parent
+    source = f"/tmp/{VM_NFS_MOUNT_UNIT}"
+    destination = f"/etc/systemd/system/{VM_NFS_MOUNT_UNIT}"
+    runner.run(
+        [
+            "scp",
+            "-q",
+            str(bundle / "systemd" / VM_NFS_MOUNT_UNIT),
+            f"{args.vm_host}:/tmp/",
+        ]
+    )
+    script = f"""set -euo pipefail
+sudo install -d -m 0755 {shlex.quote(VM_NFS_MOUNTPOINT)} /etc/systemd/system
+sudo install -m 0644 {shlex.quote(source)} {shlex.quote(destination)}
+sudo systemctl daemon-reload
+sudo systemctl enable --now {shlex.quote(VM_NFS_MOUNT_UNIT)}
+systemctl is-active --quiet {shlex.quote(VM_NFS_MOUNT_UNIT)}
+findmnt -rn -M {shlex.quote(VM_NFS_MOUNTPOINT)}
+rm -f {shlex.quote(source)}
+"""
+    _ssh(runner, args.vm_host, script)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("deploy", "replace", "cleanup", "status"))
@@ -900,6 +936,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         namespace,
         release,
     )
+    _provision_vm_nfs_mount(runner, args)
     print(f"deployed_commit={commit}")
     print(f"binary_sha256={binary_hash}")
     print(f"metrics_url={args.metrics_url}")

@@ -7,7 +7,7 @@ roles so production state cannot be reused by a disposable performance test.
 | Role | Ownership and access | Acknowledgement | Lifecycle |
 |---|---|---|---|
 | `prod` | ZeroFS serves native NFS on the private CT address; 9P/FUSE + SMB3 is an optional fallback | no volatile NBD; writeback waits for SSD | stable CT; drain-safe in-place deploy and rollback only |
-| `dev` | VM100 connects directly to the LXC NBD listener with eight native connections | explicit 16 GB `volatile_memory` burst tier | replaceable and cleanable after a full drain |
+| `dev` | VM100 uses the same direct private NFSv3 mount as production | explicit 16 GB `volatile_memory` burst tier | replaceable and cleanable after a full drain |
 
 Both roles use one RFC1918 interface on `vmbr1`. Neither creates a public
 listener. Production NFS, 9P, WebUI, Prometheus, and NBD bind only the exact

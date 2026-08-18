@@ -393,6 +393,20 @@ class PlanTests(unittest.TestCase):
 
 
 class CliDryRunTests(ConfigValidationTests):
+    def assert_direct_nfs_mount_is_provisioned(
+        self, result: subprocess.CompletedProcess[str]
+    ) -> None:
+        self.assertIn("ubuntu-main bash -se", result.stdout)
+        self.assertIn(r"mnt-zerofs\x2dfiles.mount", result.stdout)
+        self.assertIn(
+            r"systemctl enable --now 'mnt-zerofs\x2dfiles.mount'", result.stdout
+        )
+        self.assertIn(
+            r"systemctl is-active --quiet 'mnt-zerofs\x2dfiles.mount'",
+            result.stdout,
+        )
+        self.assertIn("findmnt -rn -M /mnt/zerofs-files", result.stdout)
+
     def run_cli(
         self,
         *extra: str,
@@ -429,7 +443,7 @@ class CliDryRunTests(ConfigValidationTests):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("cargo build --release --locked", result.stdout)
         self.assertIn("host-deploy.sh deploy", result.stdout)
-        self.assertNotIn("ubuntu-main bash -se", result.stdout)
+        self.assert_direct_nfs_mount_is_provisioned(result)
         self.assertNotIn("nbd-client", result.stdout)
         self.assertNotIn("/mnt/zerofs-lxc", result.stdout)
         self.assertNotIn("mkfs", result.stdout)
@@ -475,7 +489,7 @@ class CliDryRunTests(ConfigValidationTests):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("prod", result.stderr)
 
-    def test_prod_deploy_is_container_owned_and_does_not_touch_vm_nbd(self) -> None:
+    def test_prod_deploy_provisions_direct_vm_nfs_and_no_vm_nbd(self) -> None:
         config = self.write_config(self.prod_config())
         result = subprocess.run(
             [
@@ -501,8 +515,8 @@ class CliDryRunTests(ConfigValidationTests):
         self.assertIn("host-deploy.sh deploy --role prod", result.stdout)
         self.assertIn("--features webui", result.stdout)
         self.assertIn("--prod-access nfs", result.stdout)
+        self.assert_direct_nfs_mount_is_provisioned(result)
         self.assertNotIn("zerofs-lxc-nbd-client.service", result.stdout)
-        self.assertNotIn("ubuntu-main bash -se", result.stdout)
         self.assertNotIn("smb.conf", result.stdout)
         self.assertNotIn("smbd.service", result.stdout)
 
@@ -583,8 +597,20 @@ class CliDryRunTests(ConfigValidationTests):
             skip_existing=False,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("systemctl stop mnt-storagebox-nbd-pilot.mount", result.stdout)
-        self.assertIn("systemctl stop zerofs-nbd-client.service", result.stdout)
+        self.assertIn(
+            "systemctl disable --now mnt-storagebox-nbd-pilot.mount", result.stdout
+        )
+        self.assertIn(
+            "systemctl disable --now zerofs-nbd-client.service", result.stdout
+        )
+        self.assertIn(
+            "systemctl is-enabled --quiet mnt-storagebox-nbd-pilot.mount",
+            result.stdout,
+        )
+        self.assertIn(
+            "systemctl is-enabled --quiet zerofs-nbd-client.service",
+            result.stdout,
+        )
         self.assertIn("systemctl stop zerofs-nbd-pilot.service", result.stdout)
         self.assertNotIn(
             "install -m 0644 /tmp/zerofs-lxc-nbd-client.service",
@@ -592,6 +618,12 @@ class CliDryRunTests(ConfigValidationTests):
         )
         self.assertNotIn("systemctl start zerofs-lxc-nbd-client.service", result.stdout)
         self.assertNotIn("systemctl start mnt-zerofs-lxc.mount", result.stdout)
+        self.assertNotIn(
+            "systemctl enable --now mnt-storagebox-nbd-pilot.mount", result.stdout
+        )
+        self.assertNotIn(
+            "systemctl enable --now zerofs-nbd-client.service", result.stdout
+        )
 
 
 if __name__ == "__main__":
