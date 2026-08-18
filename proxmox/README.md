@@ -10,8 +10,9 @@ roles so production state cannot be reused by a disposable performance test.
 | `dev` | VM100 connects directly to the LXC NBD listener with eight native connections | explicit 16 GB `volatile_memory` burst tier | replaceable and cleanable after a full drain |
 
 Both roles use one RFC1918 interface on `vmbr1`. Neither creates a public
-listener. Production NFS, WebUI, and Prometheus bind only the exact container
-address at ports 2049, 8080, and 9567. RPC and production 9P use Unix sockets.
+listener. Production NFS, 9P, WebUI, Prometheus, and NBD bind only the exact
+container address at ports 2049, 5564, 8080, 9567, and 10809. RPC uses only a
+Unix socket; production 9P and NBD also expose container-owned Unix sockets.
 Dev NBD uses only the dev container address at port 10809. Optional production
 SMB uses only loopback and the production container interface at port 445,
 requires SMB3 encryption/signing and an authenticated user, and allows the
@@ -70,8 +71,8 @@ client.
 The WebUI is intentionally unauthenticated and has writable filesystem/admin
 capabilities. It is compiled only for production and binds only
 `http://<container-ip>:8080`; expose it solely through the private Proxmox
-network or an approved Tailnet subnet route. Do not forward NFS, WebUI, SMB,
-NBD, or Prometheus from a public interface.
+network or an approved Tailnet subnet route. Do not forward NFS, 9P, WebUI,
+SMB, NBD, or Prometheus from a public interface.
 
 ## Safe lifecycle
 

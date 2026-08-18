@@ -123,6 +123,7 @@ min_free_gb = 32.0
 dir = "/srv/zerofs-persist/state/writeback"
 
 [servers.ninep]
+addresses = ["10.10.10.30:5564"]
 unix_socket = "/run/zerofs/9p.sock"
 
 [servers.nbd]
@@ -242,6 +243,16 @@ addresses = ["10.10.10.30:9567"]
             settings["filesystem"]["max_size_gb"] * 1_000_000_000,
             5 * 1024**4,
         )
+
+    def test_prod_ninep_requires_exact_private_address_and_port(self) -> None:
+        for address in ("0.0.0.0:5564", "10.10.10.30:5565", "10.10.10.31:5564"):
+            unsafe = self.prod_config().replace("10.10.10.30:5564", address)
+            with self.subTest(address=address), self.assertRaisesRegex(
+                ValueError, "9P must listen only"
+            ):
+                deploy.validate_server_config(
+                    self.write_config(unsafe), "10.10.10.30", role="prod"
+                )
 
     def test_prod_webui_requires_exact_private_address_and_port(self) -> None:
         deploy.validate_server_config(

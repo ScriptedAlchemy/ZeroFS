@@ -202,8 +202,15 @@ def validate_server_config(
             or ninep.get("unix_socket") != "/run/zerofs/9p.sock"
         ):
             raise ValueError("prod requires a container-owned 9P Unix socket")
-        if _addresses(ninep):
-            raise ValueError("prod 9P must be Unix-socket only")
+        ninep_addresses = _addresses(ninep)
+        if not ninep_addresses:
+            raise ValueError("prod 9P must have a private TCP listener")
+        for address in ninep_addresses:
+            host, port = _split_listener(address)
+            if host != expected_ip or port != 5564:
+                raise ValueError(
+                    "9P must listen only on the private container address at port 5564"
+                )
         nfs = servers.get("nfs")
         if not isinstance(nfs, dict):
             raise ValueError("prod requires the private NFS listener")

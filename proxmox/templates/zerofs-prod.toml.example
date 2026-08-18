@@ -30,6 +30,7 @@ dir = "/srv/zerofs-persist/state/writeback"
 shutdown_flush = "local"
 
 [servers.ninep]
+addresses = ["10.10.10.30:5564"]
 unix_socket = "/run/zerofs/9p.sock"
 
 [servers.nbd]
