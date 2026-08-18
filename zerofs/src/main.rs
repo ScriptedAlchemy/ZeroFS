@@ -6,6 +6,7 @@ mod bucket_identity;
 mod checkpoint_manager;
 mod cli;
 mod config;
+mod coordination;
 mod db;
 mod dedup;
 mod frame_codec;
