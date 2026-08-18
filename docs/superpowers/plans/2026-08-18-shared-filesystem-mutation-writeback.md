@@ -1024,7 +1024,7 @@ pub struct CommitResult {
 }
 
 #[async_trait::async_trait]
-pub trait NFSFileSystem: Send + Sync {
+pub trait NFSFileSystem: Sync {
     async fn write(
         &self,
         auth: &AuthContext,
@@ -1080,7 +1080,7 @@ pub trait NFSFileSystem: Send + Sync {
 }
 ```
 
-This is the relevant additive excerpt; every unrelated upstream trait method remains unchanged. The existing `write` keeps `auth: &AuthContext` and by-value `id: fileid3`. The existing `commit` keeps `auth: &AuthContext`, by-value `fileid3`, offset/count, and its default delegation to `get_write_verf`; `get_write_verf` keeps its zero-verifier default. The two contextual methods add context without weakening or replacing those defaults, forward the same auth reference and by-value file ID exactly once, and delegate once to the legacy method; no handler calls both paths. The WRITE handler constructs `WriteRequestContext`, and the COMMIT handler constructs `CommitRequestContext`, then passes decoded auth plus the original by-value file ID/offset/count. Test that the server mints a fresh `connection_incarnation` per accepted transport, address reuse after reconnect changes it, XID/stability/auth reach the VFS, returned committed/verifier reach the wire, invalid stable-how returns garbage args, COMMIT forwards auth/XID/range, default delegation calls each legacy method exactly once, a legacy implementor that omits `commit` and `get_write_verf` still receives the existing defaults, and all legacy trait implementors still compile.
+This is the relevant additive excerpt; every unrelated upstream trait method remains unchanged. The trait bound remains exactly `Sync`; the additive API must not impose a new `Send` bound. The existing `write` keeps `auth: &AuthContext` and by-value `id: fileid3`. The existing `commit` keeps `auth: &AuthContext`, by-value `fileid3`, offset/count, and its default delegation to `get_write_verf`; `get_write_verf` keeps its zero-verifier default. The two contextual methods add context without weakening or replacing those defaults, forward the same auth reference and by-value file ID exactly once, and delegate once to the legacy method; no handler calls both paths. The WRITE handler constructs `WriteRequestContext`, and the COMMIT handler constructs `CommitRequestContext`, then passes decoded auth plus the original by-value file ID/offset/count. Test that the server mints a fresh `connection_incarnation` per accepted transport, address reuse after reconnect changes it, XID/stability/auth reach the VFS, returned committed/verifier reach the wire, invalid stable-how returns garbage args, COMMIT forwards auth/XID/range, default delegation calls each legacy method exactly once, a `Sync` but non-`Send` legacy implementor compiles, a legacy implementor that omits `commit` and `get_write_verf` still receives the existing defaults, and all legacy trait implementors still compile.
 
 - [ ] **Step 2: Implement and validate the additive API**
 
