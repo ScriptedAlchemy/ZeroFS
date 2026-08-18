@@ -8,6 +8,7 @@ use self::progress::{DeleteProgress, Progress};
 use crate::cli::{attach_cleanup_errors, has_attached_cleanup_error};
 use anyhow::{Context, Result, bail};
 use futures::StreamExt;
+use ninep_proto::{P9_OP_ENVELOPE_LEN, P9_TWRITE_HDR};
 use std::collections::VecDeque;
 use std::future::Future;
 use std::os::unix::ffi::OsStringExt;
@@ -18,7 +19,9 @@ use tokio_util::sync::CancellationToken;
 use zerofs_client::{Client, ConnectOptions, FileType, ZeroFsError};
 
 const CLIENT_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
-const TRANSFER_MSIZE: u32 = 9 * 1024 * 1024;
+const TRANSFER_WRITE_PAYLOAD: u32 = 9 * 1024 * 1024;
+const TRANSFER_MSIZE: u32 = TRANSFER_WRITE_PAYLOAD + P9_TWRITE_HDR + P9_OP_ENVELOPE_LEN as u32;
+const UPLOAD_CONNECTIONS_PER_WORKER: usize = 2;
 const FILE_TRANSFER_ATTEMPTS: usize = 3;
 const LINUX_EAGAIN: i32 = 11;
 /// How long cancelled work may settle before the CLI restates what it waits on.
@@ -40,6 +43,7 @@ pub(crate) async fn run_upload(
     source: PathBuf,
     destination: PathBuf,
     jobs: usize,
+    resume: bool,
 ) -> Result<()> {
     if jobs == 0 {
         bail!("upload jobs must be at least 1");
@@ -50,12 +54,25 @@ pub(crate) async fn run_upload(
     let client = connect_transfer_client(target)
         .await
         .with_context(|| format!("connect to 9P target {target}"))?;
-    let clients = connect_workers(target, client, jobs.min(plan.files.len().max(1))).await?;
+    let worker_count = jobs.min(plan.files.len().max(1));
+    let clients =
+        connect_workers(target, client, worker_count * UPLOAD_CONNECTIONS_PER_WORKER).await?;
+    let workers = clients
+        .chunks_exact(UPLOAD_CONNECTIONS_PER_WORKER)
+        .map(UploadWorker::new)
+        .collect::<Vec<_>>();
     let progress = Progress::new("upload", plan.total_bytes, plan.files.len());
     let (cancellation, signal) = cancellation_on_ctrl_c();
     let notice_progress = progress.clone();
     let result = with_settling_notices(
-        execute_upload(&clients, plan, &destination, progress, cancellation.clone()),
+        execute_upload(
+            &workers,
+            plan,
+            &destination,
+            resume,
+            progress,
+            cancellation.clone(),
+        ),
         cancellation,
         move |waited| notice_progress.settling(waited),
     )
@@ -161,6 +178,29 @@ async fn connect_workers(
     Ok(clients)
 }
 
+#[derive(Clone)]
+struct UploadWorker {
+    clients: Vec<Arc<Client>>,
+}
+
+impl UploadWorker {
+    fn new(clients: &[Arc<Client>]) -> Self {
+        Self {
+            clients: clients.to_vec(),
+        }
+    }
+
+    fn primary(&self) -> &Arc<Client> {
+        self.clients
+            .first()
+            .expect("an upload worker always has a primary client")
+    }
+
+    fn clients(&self) -> &[Arc<Client>] {
+        &self.clients
+    }
+}
+
 fn cancellation_on_ctrl_c() -> (CancellationToken, tokio::task::JoinHandle<()>) {
     let cancellation = CancellationToken::new();
     let signal_cancellation = cancellation.clone();
@@ -210,22 +250,23 @@ async fn close_client(client: &Client) -> Result<()> {
         .context("timed out waiting for 9P client cleanup")
 }
 
-async fn run_file_workers<F, Fut>(
-    clients: &[Arc<Client>],
+async fn run_file_workers<W, F, Fut>(
+    workers: &[W],
     files: Vec<PlannedFile>,
     progress: Progress,
     cancellation: CancellationToken,
     transfer: F,
 ) -> Result<()>
 where
-    F: Fn(Arc<Client>, PlannedFile, CancellationToken) -> Fut + Clone,
+    W: Clone,
+    F: Fn(W, PlannedFile, CancellationToken, usize) -> Fut + Clone,
     Fut: Future<Output = Result<()>>,
 {
     let file_count = files.len();
     let queue = Arc::new(tokio::sync::Mutex::new(VecDeque::from(files)));
     // Settle every active transfer instead of dropping in-flight I/O on the first error.
-    let workers = futures::future::join_all(clients.iter().take(file_count).map(|client| {
-        let client = Arc::clone(client);
+    let workers = futures::future::join_all(workers.iter().take(file_count).map(|worker| {
+        let worker = worker.clone();
         let queue = Arc::clone(&queue);
         let cancellation = cancellation.clone();
         let progress = progress.clone();
@@ -244,7 +285,14 @@ where
                 let mut attempts = 0;
                 loop {
                     attempts += 1;
-                    match transfer(Arc::clone(&client), file.clone(), cancellation.clone()).await {
+                    match transfer(
+                        worker.clone(),
+                        file.clone(),
+                        cancellation.clone(),
+                        attempts,
+                    )
+                    .await
+                    {
                         Ok(()) => break,
                         Err(error)
                             if !cancellation.is_cancelled()
@@ -316,13 +364,17 @@ fn is_retryable_transfer_error(error: &anyhow::Error) -> bool {
 }
 
 async fn execute_upload(
-    clients: &[Arc<Client>],
+    workers: &[UploadWorker],
     plan: TransferPlan,
     destination: &Path,
+    resume: bool,
     progress: Progress,
     cancellation: CancellationToken,
 ) -> Result<()> {
-    let client = clients.first().context("upload requires a 9P client")?;
+    let client = workers
+        .first()
+        .context("upload requires a 9P client")?
+        .primary();
     if plan.source_is_dir {
         client
             .create_dir_all(destination, 0o755)
@@ -349,13 +401,20 @@ async fn execute_upload(
     let destination = destination.to_path_buf();
     let worker_progress = progress.clone();
     run_file_workers(
-        clients,
+        workers,
         plan.files,
         progress.clone(),
         cancellation.child_token(),
-        move |client, file, cancellation| {
+        move |worker, file, cancellation, attempt| {
             let target = file_destination(&destination, &file);
-            upload_file(client, file, target, worker_progress.clone(), cancellation)
+            upload_file(
+                worker,
+                file,
+                target,
+                resume_enabled_for_attempt(resume, attempt),
+                worker_progress.clone(),
+                cancellation,
+            )
         },
     )
     .await?;
@@ -371,6 +430,10 @@ async fn execute_upload(
     }
     progress.finish();
     Ok(())
+}
+
+fn resume_enabled_for_attempt(resume: bool, attempt: usize) -> bool {
+    resume && attempt == 1
 }
 
 async fn execute_download(
@@ -407,7 +470,7 @@ async fn execute_download(
         plan.files,
         progress.clone(),
         cancellation.child_token(),
-        move |client, file, cancellation| {
+        move |client, file, cancellation, _attempt| {
             let target = file_destination(&destination, &file);
             download_file(client, file, target, worker_progress.clone(), cancellation)
         },

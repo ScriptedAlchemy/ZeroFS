@@ -35,9 +35,12 @@ pub enum Commands {
         source: PathBuf,
         /// Exact destination path in ZeroFS
         destination: PathBuf,
-        /// Number of files to transfer concurrently
+        /// Concurrent files; each upload job uses up to two 9P sessions and 36 MiB of buffers
         #[arg(long, default_value_t = 8, value_parser = parse_transfer_jobs)]
         jobs: usize,
+        /// Skip final regular files whose remote byte length matches the source
+        #[arg(long)]
+        resume: bool,
     },
     /// Download a file or directory directly over ZeroFS 9P
     Download {
@@ -405,6 +408,7 @@ mod tests {
             source,
             destination,
             jobs,
+            resume,
         } = cli.command
         else {
             panic!("expected upload command");
@@ -413,6 +417,25 @@ mod tests {
         assert_eq!(source, PathBuf::from("./Audiobooks"));
         assert_eq!(destination, PathBuf::from("/Audiobooks"));
         assert_eq!(jobs, 4);
+        assert!(!resume);
+    }
+
+    #[test]
+    fn upload_command_accepts_resume() {
+        let cli = Cli::try_parse_from([
+            "zerofs",
+            "upload",
+            "ws://server:8080/ws/9p",
+            "./Audiobooks",
+            "/Audiobooks",
+            "--resume",
+        ])
+        .unwrap();
+
+        let Commands::Upload { resume, .. } = cli.command else {
+            panic!("expected upload command");
+        };
+        assert!(resume);
     }
 
     #[test]

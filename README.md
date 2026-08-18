@@ -97,6 +97,9 @@ through an existing 9P endpoint:
 # Upload a file or the contents of a directory tree
 zerofs upload 127.0.0.1:5564 ./Audiobooks /Audiobooks
 
+# Repeat an upload without replacing materialized same-size files
+zerofs upload 127.0.0.1:5564 ./Audiobooks /Audiobooks --resume
+
 # Download a file or directory tree
 zerofs download 127.0.0.1:5564 /Audiobooks ./Audiobooks
 
@@ -113,15 +116,29 @@ configuration change is required.
 The source root maps exactly to the destination argument. Directory copies
 preserve empty directories and unrelated destination entries. Uploads and
 downloads use 8 concurrent files by default; pass `--jobs N` to change that
-limit. Each worker requests a 9 MiB 9P message size, uses the server-negotiated
-maximum payload, and keeps chunks within one file sequential. The CLI shows
-aggregate bytes, rate, ETA, completed-file count, and active paths.
+limit. Each upload worker owns two persistent 9P sessions and keeps at most two
+positioned writes active on each session, for four extent-aligned chunks per
+file. Each chunk uses the server-negotiated maximum up to a 9 MiB payload. The
+default upload bound is therefore 16 sessions and about 288 MiB of chunk
+buffers when all eight files are at least 36 MiB; higher `--jobs` values raise
+both bounds. Downloads use one session per worker. The CLI shows aggregate
+bytes, rate, ETA, completed-file count, and active paths.
+
+Upload `--resume` checks each final destination path before copying it. A final
+regular file with the same byte length as its local source is reported as
+skipped; missing and different-length files use the normal upload path. Hidden
+`.zerofs-*.tmp` files never qualify. This is a deliberately cheap restart aid,
+not a content checksum: same-length but different bytes are considered already
+materialized. Without `--resume`, uploads retain their normal overwrite
+behavior.
 
 Connection loss during an individual 9P mutation is replayed by the client with
 the same operation ID. If a connection, stale-handle, leader, or retry-later
 (`EAGAIN`) error still reaches the transfer layer, the CLI removes that
 attempt's private temporary file and restarts only that file, up to three total
-attempts. A cleanup failure is terminal so an abandoned temporary file can
+attempts. The size-based resume check applies only to the first attempt; a retry
+always rewrites the file so an earlier unverified publication cannot be skipped.
+A cleanup failure is terminal so an abandoned temporary file can
 never be hidden by a successful retry. Each retry is printed without corrupting
 the live progress bars. An exhausted or permanent file error is reported
 immediately; the remaining files continue, and the command exits nonzero with
@@ -135,12 +152,15 @@ behind, because the cleanup that removes it needs the same server that is not
 answering.
 
 An upload writes a hidden sibling temporary file, atomically renames it into
-visibility after all chunks arrive, and then verifies durability through the
-still-open file handle. It reports the file complete only after that sync
-succeeds; if sync fails, the renamed file may be visible without verified
-durability. A download syncs its local temporary file before renaming it over
-the destination. Completed files remain published, but transfers do not resume
-partial files across process restarts or split one file into parallel ranges.
+visibility after every upload session has verified its acknowledged writes,
+and then runs a filesystem-wide sync to verify the published namespace change.
+It reports the file complete only after those barriers succeed; if the final
+sync fails, the renamed file may be visible without verified durability. A
+download syncs its local temporary file before renaming it over the destination.
+Completed files remain published. `upload --resume` can skip materialized
+same-length final files, but transfers do not continue a partial file from its
+last byte or persist multipart state across runs. Upload range fan-out is
+bounded to two sessions and four in-flight writes per file.
 Symlinks and other special source entries are rejected rather than followed.
 
 `zerofs rm` follows the Web UI's recursive delete model: it lists and validates

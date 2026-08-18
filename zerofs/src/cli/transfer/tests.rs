@@ -3,8 +3,9 @@ use super::progress::{DeleteProgress, Progress};
 #[cfg(feature = "webui")]
 use super::run_upload;
 use super::{
-    SETTLE_NOTICE_INTERVAL, TRANSFER_MSIZE, close_client, connect_transfer_client, execute_delete,
-    execute_download, execute_upload, run_file_workers, with_settling_notices,
+    SETTLE_NOTICE_INTERVAL, TRANSFER_MSIZE, UploadWorker, close_client, connect_transfer_client,
+    execute_delete, execute_download, execute_upload, resume_enabled_for_attempt, run_file_workers,
+    with_settling_notices,
 };
 use crate::cli::attach_cleanup_errors;
 use crate::fs::ZeroFS;
@@ -19,18 +20,31 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use zerofs_client::Client;
 
+mod resume;
+mod throughput;
+
 async fn remote_client() -> (Arc<Client>, CancellationToken, tempfile::TempDir) {
+    let (client, shutdown, temp, _) = remote_client_with_filesystem().await;
+    (client, shutdown, temp)
+}
+
+async fn remote_client_with_filesystem() -> (
+    Arc<Client>,
+    CancellationToken,
+    tempfile::TempDir,
+    Arc<ZeroFS>,
+) {
     let filesystem = Arc::new(ZeroFS::new_in_memory().await.unwrap());
     let temp = tempfile::tempdir().unwrap();
     let socket = temp.path().join("transfer.9p.sock");
-    let server = NinePServer::new_unix(filesystem, socket.clone());
+    let server = NinePServer::new_unix(Arc::clone(&filesystem), socket.clone());
     let shutdown = CancellationToken::new();
     let server_shutdown = shutdown.clone();
     tokio::spawn(async move { server.start(server_shutdown).await.unwrap() });
     let target = format!("unix:{}", socket.display());
     for _ in 0..100 {
         if let Ok(client) = connect_transfer_client(&target).await {
-            return (client, shutdown, temp);
+            return (client, shutdown, temp, filesystem);
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -38,9 +52,10 @@ async fn remote_client() -> (Arc<Client>, CancellationToken, tempfile::TempDir) 
 }
 
 #[tokio::test]
-async fn transfer_clients_negotiate_nine_mibibyte_messages() {
+async fn transfer_clients_negotiate_nine_mibibyte_write_payloads() {
     let (client, _shutdown, _local) = remote_client().await;
     assert_eq!(client.capabilities().msize, TRANSFER_MSIZE);
+    assert_eq!(client.capabilities().max_write_chunk, 9 * 1024 * 1024);
 }
 
 async fn quiesced_fids(client: &Client) -> usize {
@@ -54,6 +69,13 @@ async fn quiesced_fids(client: &Client) -> usize {
         previous = current;
     }
     previous
+}
+
+fn upload_workers(clients: &[Arc<Client>]) -> Vec<UploadWorker> {
+    clients
+        .iter()
+        .map(|client| UploadWorker::new(std::slice::from_ref(client)))
+        .collect()
 }
 
 #[tokio::test]
@@ -85,7 +107,7 @@ async fn file_failures_do_not_cancel_remaining_files() {
         files,
         Progress::new("upload", 3, 3),
         CancellationToken::new(),
-        move |_client, file, _cancellation| {
+        move |_client, file, _cancellation, _attempt| {
             let calls = Arc::clone(&transfer_calls);
             async move {
                 calls.fetch_add(1, Ordering::Relaxed);
@@ -123,7 +145,7 @@ async fn cleanup_failure_is_terminal_instead_of_being_hidden_by_a_retry() {
         files,
         Progress::new("upload", 1, 1),
         CancellationToken::new(),
-        move |_client, _file, _cancellation| {
+        move |_client, _file, _cancellation, _attempt| {
             let attempt = transfer_calls.fetch_add(1, Ordering::Relaxed);
             async move {
                 if attempt == 0 {
@@ -160,16 +182,20 @@ async fn transient_file_failure_is_retried_from_the_file_boundary() {
     }];
     let calls = Arc::new(AtomicUsize::new(0));
     let transfer_calls = Arc::clone(&calls);
+    let attempts = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let transfer_attempts = Arc::clone(&attempts);
 
     run_file_workers(
         &clients,
         files,
         Progress::new("upload", 1, 1),
         CancellationToken::new(),
-        move |_client, _file, _cancellation| {
-            let attempt = transfer_calls.fetch_add(1, Ordering::Relaxed);
+        move |_client, _file, _cancellation, attempt| {
+            let call = transfer_calls.fetch_add(1, Ordering::Relaxed);
+            let transfer_attempts = Arc::clone(&transfer_attempts);
             async move {
-                if attempt < 2 {
+                transfer_attempts.lock().await.push(attempt);
+                if call < 2 {
                     return Err(zerofs_client::ZeroFsError::Stale {
                         path: "book.m4b".into(),
                     }
@@ -183,6 +209,7 @@ async fn transient_file_failure_is_retried_from_the_file_boundary() {
     .unwrap();
 
     assert_eq!(calls.load(Ordering::Relaxed), 3);
+    assert_eq!(&*attempts.lock().await, &[1, 2, 3]);
 }
 
 #[tokio::test(start_paused = true)]
@@ -202,7 +229,7 @@ async fn connection_loss_is_retried_from_the_file_boundary() {
         files,
         Progress::new("upload", 1, 1),
         CancellationToken::new(),
-        move |_client, _file, _cancellation| {
+        move |_client, _file, _cancellation, _attempt| {
             let attempt = transfer_calls.fetch_add(1, Ordering::Relaxed);
             async move {
                 if attempt == 0 {
@@ -238,7 +265,7 @@ async fn retry_later_io_failure_is_retried_from_the_file_boundary() {
         files,
         Progress::new("upload", 1, 1),
         CancellationToken::new(),
-        move |_client, _file, _cancellation| {
+        move |_client, _file, _cancellation, _attempt| {
             let attempt = transfer_calls.fetch_add(1, Ordering::Relaxed);
             async move {
                 if attempt == 0 {
@@ -278,7 +305,7 @@ async fn cancellation_during_retry_backoff_is_reported_as_cancellation() {
             }],
             Progress::new("upload", 1, 1),
             task_cancellation,
-            move |_client, _file, _cancellation| {
+            move |_client, _file, _cancellation, _attempt| {
                 transfer_calls.fetch_add(1, Ordering::Relaxed);
                 async move {
                     Err(zerofs_client::ZeroFsError::Stale {
@@ -320,7 +347,7 @@ async fn permanent_io_failure_is_not_retried() {
         files,
         Progress::new("upload", 1, 1),
         CancellationToken::new(),
-        move |_client, _file, _cancellation| {
+        move |_client, _file, _cancellation, _attempt| {
             transfer_calls.fetch_add(1, Ordering::Relaxed);
             async move {
                 Err(zerofs_client::ZeroFsError::Io {
@@ -341,7 +368,7 @@ async fn permanent_io_failure_is_not_retried() {
 
 #[cfg(feature = "webui")]
 #[tokio::test]
-async fn upload_jobs_use_bounded_independent_websocket_sessions() {
+async fn upload_jobs_use_two_bounded_sessions_per_file_worker() {
     let filesystem = Arc::new(ZeroFS::new_in_memory().await.unwrap());
     let connections = Arc::new(AtomicUsize::new(0));
     let app = crate::webui::test_9p_websocket_router(filesystem, Arc::clone(&connections));
@@ -356,11 +383,17 @@ async fn upload_jobs_use_bounded_independent_websocket_sessions() {
     fs::write(source.join("two.bin"), b"two").unwrap();
     fs::write(source.join("three.bin"), b"three").unwrap();
 
-    run_upload(&format!("ws://{address}/ws/9p"), source, "/dest".into(), 3)
-        .await
-        .unwrap();
+    run_upload(
+        &format!("ws://{address}/ws/9p"),
+        source,
+        "/dest".into(),
+        3,
+        false,
+    )
+    .await
+    .unwrap();
 
-    assert_eq!(connections.load(Ordering::Relaxed), 3);
+    assert_eq!(connections.load(Ordering::Relaxed), 6);
     server.abort();
 }
 
@@ -380,9 +413,10 @@ async fn upload_streams_each_chunk_once_and_releases_temporary_resources() {
     let progress = Progress::new("upload", plan.total_bytes, plan.files.len());
 
     execute_upload(
-        std::slice::from_ref(&client),
+        &upload_workers(std::slice::from_ref(&client)),
         plan,
         Path::new("/dest"),
+        false,
         progress,
         CancellationToken::new(),
     )
@@ -412,7 +446,7 @@ async fn upload_streams_each_chunk_once_and_releases_temporary_resources() {
     );
     assert_eq!(quiesced_fids(&client).await, baseline_fids);
     assert!(
-        operations_after - operations_before <= 25,
+        operations_after - operations_before <= 26,
         "upload used too many 9P operations: {}",
         operations_after - operations_before
     );
@@ -429,9 +463,10 @@ async fn completed_files_are_visible_before_the_rest_of_the_batch_finishes() {
     fs::remove_file(source.join("z-fails.txt")).unwrap();
 
     let error = execute_upload(
-        std::slice::from_ref(&client),
+        &upload_workers(std::slice::from_ref(&client)),
         plan,
         Path::new("/dest"),
+        false,
         Progress::new("upload", 15, 2),
         CancellationToken::new(),
     )
@@ -503,9 +538,10 @@ async fn single_file_transfers_use_the_exact_destination_path() {
     fs::write(&source, b"payload").unwrap();
     let upload_plan = scan_local(&source).unwrap();
     execute_upload(
-        std::slice::from_ref(&client),
+        &upload_workers(std::slice::from_ref(&client)),
         upload_plan,
         Path::new("/uploaded.bin"),
+        false,
         Progress::new("upload", 7, 1),
         CancellationToken::new(),
     )
@@ -576,9 +612,10 @@ async fn file_directory_conflicts_fail_before_copying_bytes() {
     let upload_progress = Progress::new("upload", 7, 1);
 
     let upload_error = execute_upload(
-        std::slice::from_ref(&client),
+        &upload_workers(std::slice::from_ref(&client)),
         scan_local(&source).unwrap(),
         Path::new("/occupied"),
+        false,
         upload_progress.clone(),
         CancellationToken::new(),
     )
@@ -637,7 +674,7 @@ async fn upload_does_not_follow_a_source_replaced_by_a_symlink_after_planning() 
     let clients = vec![client.clone()];
 
     let error = execute_upload(
-        &clients,
+        &upload_workers(&clients),
         TransferPlan {
             source_is_dir: false,
             directories: Vec::new(),
@@ -649,6 +686,7 @@ async fn upload_does_not_follow_a_source_replaced_by_a_symlink_after_planning() 
             total_bytes: size,
         },
         Path::new("/uploaded.m4b"),
+        false,
         Progress::new("upload", size, 1),
         CancellationToken::new(),
     )
@@ -917,7 +955,7 @@ async fn cancellation_during_empty_directory_sync_never_prints_completion() {
     let task_cancellation = cancellation.clone();
     let task = tokio::spawn(async move {
         execute_upload(
-            &[client],
+            &upload_workers(&[client]),
             TransferPlan {
                 source_is_dir: true,
                 directories: vec![Path::new("").to_path_buf()],
@@ -925,6 +963,7 @@ async fn cancellation_during_empty_directory_sync_never_prints_completion() {
                 total_bytes: 0,
             },
             Path::new("/empty"),
+            false,
             Progress::new("upload", 0, 0),
             task_cancellation,
         )

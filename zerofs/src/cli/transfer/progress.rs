@@ -87,14 +87,24 @@ impl Progress {
         ));
     }
 
+    pub(super) fn skip_file(&self, path: &Path, size: u64) {
+        self.bar.inc(size);
+        self.bar.reset_eta();
+        self.record_file(path, "skipped");
+    }
+
     fn finish_file(&self, path: &Path) {
+        self.record_file(path, "complete");
+    }
+
+    fn record_file(&self, path: &Path, status: &str) {
         let mut completed = self.completed_files.lock().unwrap();
         *completed += 1;
         let completed = *completed;
         self.set_file_message(completed);
         if self.bar.is_hidden() {
             eprintln!(
-                "{} file {completed}/{} complete: {}",
+                "{} file {completed}/{} {status}: {}",
                 self.direction,
                 self.total_files,
                 path.display()
@@ -177,6 +187,7 @@ impl Drop for FileProgress {
     fn drop(&mut self) {
         if !self.committed {
             self.progress.bar.dec(self.bar.position());
+            self.progress.bar.reset_eta();
         }
         self.progress.multi.remove(&self.bar);
     }
@@ -305,6 +316,25 @@ mod tests {
 
         assert_eq!(progress.bar.position(), 0);
         assert_eq!(progress.bar.message(), "files 0/1");
+    }
+
+    #[test]
+    fn failed_file_attempt_does_not_inflate_upload_rate() {
+        let progress = Progress::new("upload", 1024, 1);
+        let file = progress.start_file(Path::new("book.m4b"), 1024);
+        file.advance(512);
+        drop(file);
+
+        assert_eq!(progress.bar.per_sec(), 0.0);
+    }
+
+    #[test]
+    fn skipped_bytes_do_not_inflate_upload_rate() {
+        let progress = Progress::new("upload", 1024, 1);
+        progress.skip_file(Path::new("book.m4b"), 1024);
+
+        assert_eq!(progress.bar.position(), 1024);
+        assert_eq!(progress.bar.per_sec(), 0.0);
     }
 
     #[test]

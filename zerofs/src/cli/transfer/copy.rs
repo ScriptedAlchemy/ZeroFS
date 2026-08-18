@@ -1,21 +1,27 @@
+use super::UploadWorker;
 use super::plan::PlannedFile;
 use super::progress::{FileProgress, Progress};
 use crate::cli::attach_cleanup_errors;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
+use futures::stream::{FuturesUnordered, StreamExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-use zerofs_client::{Client, OpenOptions};
+use zerofs_client::{Client, File, OpenOptions};
+
+const UPLOAD_PIPELINE_DEPTH_PER_CONNECTION: usize = 2;
 
 pub(super) async fn upload_file(
-    client: Arc<Client>,
+    worker: UploadWorker,
     planned: PlannedFile,
     destination: PathBuf,
+    resume: bool,
     progress: Progress,
     cancellation: CancellationToken,
 ) -> Result<()> {
+    let client = worker.primary();
     if cancellation.is_cancelled() {
         bail!("upload cancelled");
     }
@@ -26,6 +32,11 @@ pub(super) async fn upload_file(
                 destination.display()
             )
         }
+        Ok(metadata) if resume && metadata.is_file() && metadata.size == planned.size => {
+            drop(open_local_source(&planned).await?);
+            progress.skip_file(progress_path(&planned), planned.size);
+            return Ok(());
+        }
         Ok(_) | Err(zerofs_client::ZeroFsError::NotFound { .. }) => {}
         Err(error) => {
             return Err(error)
@@ -34,15 +45,34 @@ pub(super) async fn upload_file(
     }
     let file_progress = progress.start_file(progress_path(&planned), planned.size);
     let temp = temporary_sibling(&destination)?;
-    let remote = client
+    let primary_remote = client
         .open(
             &temp,
             OpenOptions::write_only().create_new(true).mode(0o644),
         )
         .await
         .with_context(|| format!("create remote temporary file {}", temp.display()))?;
+    let mut remotes = vec![primary_remote];
+    for (index, stream_client) in worker.clients().iter().enumerate().skip(1) {
+        match stream_client
+            .open(&temp, OpenOptions::write_only())
+            .await
+            .with_context(|| {
+                format!(
+                    "open remote temporary file {} for upload stream {}",
+                    temp.display(),
+                    index + 1
+                )
+            }) {
+            Ok(remote) => remotes.push(remote),
+            Err(primary) => {
+                close_remote_files(&remotes).await;
+                return Err(cleanup_remote_temp(client, &temp, primary).await);
+            }
+        }
+    }
     let result = stream_upload(
-        &remote,
+        &remotes,
         &planned,
         client.capabilities().max_write_chunk.max(1) as usize,
         &file_progress,
@@ -57,9 +87,19 @@ pub(super) async fn upload_file(
         )
     });
     if let Err(primary) = result {
-        remote.close().await;
-        return Err(cleanup_remote_temp(&client, &temp, primary).await);
+        close_remote_files(&remotes).await;
+        return Err(cleanup_remote_temp(client, &temp, primary).await);
     }
+    if let Err(primary) = sync_remote_files(&remotes).await {
+        close_remote_files(&remotes).await;
+        return Err(cleanup_remote_temp(client, &temp, primary).await);
+    }
+    if cancellation.is_cancelled() {
+        close_remote_files(&remotes).await;
+        return Err(cleanup_remote_temp(client, &temp, anyhow!("upload cancelled")).await);
+    }
+    close_remote_files(&remotes[1..]).await;
+    let remote = &remotes[0];
     if let Err(primary) = client.rename(&temp, &destination).await.with_context(|| {
         format!(
             "publish remote file {} as {}",
@@ -68,12 +108,12 @@ pub(super) async fn upload_file(
         )
     }) {
         remote.close().await;
-        return Err(cleanup_remote_temp(&client, &temp, primary).await);
+        return Err(cleanup_remote_temp(client, &temp, primary).await);
     }
-    let sync = remote
-        .sync_all()
+    let sync = client
+        .sync()
         .await
-        .with_context(|| format!("sync remote file {}", destination.display()));
+        .with_context(|| format!("sync published remote file {}", destination.display()));
     remote.close().await;
     sync?;
     file_progress.finish();
@@ -167,53 +207,86 @@ pub(super) async fn download_file(
     Ok(())
 }
 
-async fn stream_upload(
-    remote: &zerofs_client::File,
+pub(super) async fn stream_upload(
+    remotes: &[Arc<File>],
     planned: &PlannedFile,
     chunk_size: usize,
     progress: &FileProgress,
     cancellation: &CancellationToken,
 ) -> Result<()> {
-    let mut options = tokio::fs::OpenOptions::new();
-    options.read(true).custom_flags(libc::O_NOFOLLOW);
-    let mut local = options
-        .open(&planned.source)
-        .await
-        .with_context(|| format!("open local source {}", planned.source.display()))?;
-    let metadata = local
-        .metadata()
-        .await
-        .with_context(|| format!("inspect local source {}", planned.source.display()))?;
-    if !metadata.is_file() || metadata.len() != planned.size {
-        bail!(
-            "local source changed while uploading: {}",
-            planned.source.display()
-        );
+    if remotes.is_empty() {
+        bail!("upload requires at least one remote file handle");
     }
+    let mut local = open_local_source(planned).await?;
     let buffer_size = planned.size.min(chunk_size as u64).max(1) as usize;
-    let mut buffer = vec![0; buffer_size];
+    let mut buffers = (0..UPLOAD_PIPELINE_DEPTH_PER_CONNECTION * remotes.len())
+        .map(|_| vec![0; buffer_size])
+        .collect::<Vec<_>>();
+    let mut writes = FuturesUnordered::new();
+    let mut in_flight = vec![0usize; remotes.len()];
+    let mut first_error = None;
     let mut offset = 0u64;
-    while offset < planned.size {
-        if cancellation.is_cancelled() {
-            bail!("upload cancelled");
+    let mut next_remote = 0usize;
+    while first_error.is_none() && offset < planned.size {
+        if buffers.is_empty() {
+            let (remote_index, buffer, result) = writes.next().await.expect("full upload pipeline");
+            in_flight[remote_index] -= 1;
+            buffers.push(buffer);
+            match result {
+                Ok(written) => progress.advance(written as u64),
+                Err(error) => first_error = Some(error),
+            }
+            continue;
         }
+        if cancellation.is_cancelled() {
+            first_error = Some(anyhow::anyhow!("upload cancelled"));
+            break;
+        }
+        let mut buffer = buffers.pop().expect("non-empty upload buffer pool");
         let wanted = (planned.size - offset).min(chunk_size as u64) as usize;
         if let Err(error) = local.read_exact(&mut buffer[..wanted]).await {
             if error.kind() == std::io::ErrorKind::UnexpectedEof {
-                bail!(
+                first_error = Some(anyhow::anyhow!(
                     "local source changed while uploading: {}",
                     planned.source.display()
+                ));
+            } else {
+                first_error = Some(
+                    anyhow::Error::new(error)
+                        .context(format!("read local source {}", planned.source.display())),
                 );
             }
-            return Err(error)
-                .with_context(|| format!("read local source {}", planned.source.display()));
+            buffers.push(buffer);
+            break;
         }
-        remote
-            .write_at(offset, &buffer[..wanted])
-            .await
-            .with_context(|| format!("write remote destination at offset {offset}"))?;
+        let remote_index = (0..remotes.len())
+            .map(|step| (next_remote + step) % remotes.len())
+            .find(|&index| in_flight[index] < UPLOAD_PIPELINE_DEPTH_PER_CONNECTION)
+            .expect("an available upload buffer implies an available remote slot");
+        writes.push(write_upload_chunk(
+            remote_index,
+            Arc::clone(&remotes[remote_index]),
+            offset,
+            buffer,
+            wanted,
+        ));
+        in_flight[remote_index] += 1;
+        next_remote = (remote_index + 1) % remotes.len();
         offset += wanted as u64;
-        progress.advance(wanted as u64);
+    }
+    while let Some((remote_index, _buffer, result)) = writes.next().await {
+        in_flight[remote_index] -= 1;
+        match result {
+            Ok(written) => progress.advance(written as u64),
+            Err(error) if first_error.is_none() => first_error = Some(error),
+            Err(_) => {}
+        }
+    }
+    if let Some(error) = first_error {
+        return Err(error);
+    }
+    if cancellation.is_cancelled() {
+        bail!("upload cancelled");
     }
     let mut extra = [0u8; 1];
     if local
@@ -228,6 +301,52 @@ async fn stream_upload(
         );
     }
     Ok(())
+}
+
+async fn close_remote_files(remotes: &[Arc<File>]) {
+    futures::future::join_all(remotes.iter().map(|remote| remote.close())).await;
+}
+
+pub(super) async fn sync_remote_files(remotes: &[Arc<File>]) -> Result<()> {
+    for result in futures::future::join_all(remotes.iter().map(|remote| remote.sync_all())).await {
+        result?;
+    }
+    Ok(())
+}
+
+async fn write_upload_chunk(
+    remote_index: usize,
+    remote: Arc<File>,
+    offset: u64,
+    buffer: Vec<u8>,
+    length: usize,
+) -> (usize, Vec<u8>, Result<usize>) {
+    let result = remote
+        .write_at(offset, &buffer[..length])
+        .await
+        .with_context(|| format!("write remote destination at offset {offset}"))
+        .map(|()| length);
+    (remote_index, buffer, result)
+}
+
+async fn open_local_source(planned: &PlannedFile) -> Result<tokio::fs::File> {
+    let mut options = tokio::fs::OpenOptions::new();
+    options.read(true).custom_flags(libc::O_NOFOLLOW);
+    let local = options
+        .open(&planned.source)
+        .await
+        .with_context(|| format!("open local source {}", planned.source.display()))?;
+    let metadata = local
+        .metadata()
+        .await
+        .with_context(|| format!("inspect local source {}", planned.source.display()))?;
+    if !metadata.is_file() || metadata.len() != planned.size {
+        bail!(
+            "local source changed while uploading: {}",
+            planned.source.display()
+        );
+    }
+    Ok(local)
 }
 
 async fn stream_download(

@@ -75,8 +75,9 @@ The implementation reuses these production paths:
 - the current native WebSocket transport already present in `ninep-client`;
 - the browser uploader's create-new temporary file, chunked write, and rename
   sequence; and
-- the browser uploader's bounded concurrency model across files, with one
-  reusable 9P session per CLI worker so concurrent file syncs are isolated.
+- the browser uploader's bounded concurrency model across files, extended with
+  two reusable 9P sessions per upload worker so high-latency writes can overlap.
+  Download workers retain one reusable session.
 
 The terminal renderer is the only UI-specific addition. It uses Indicatif's
 `MultiProgress` for one aggregate bar plus the active per-file bars.
@@ -105,28 +106,46 @@ directory type conflict fails before that item is copied.
 For each planned file, the client:
 
 1. creates the destination parent directories if needed;
-2. creates a unique `.zerofs-<uuid>.tmp` file in the destination directory with
+2. when `--resume` is set, skips a final regular destination file whose byte
+   length matches the planned source; hidden temporary files never qualify;
+3. creates a unique `.zerofs-<uuid>.tmp` file in the destination directory with
    create-new semantics;
-3. reads the local file into a reusable buffer capped by the negotiated maximum
+4. opens the same private temporary file through both of the worker's sessions;
+5. reads the local file into reusable buffers capped by the negotiated maximum
    9P write payload;
-4. writes each buffer at its absolute offset with `File::write_at`;
-5. updates aggregate progress after each acknowledged chunk;
-6. renames the temporary file over the exact destination path;
-7. syncs that file through its still-open fid; and
-8. reports the file complete only after the sync succeeds.
+6. writes each buffer at its absolute offset with `File::write_at`, with at most
+   two active writes on either session;
+7. updates aggregate progress after each acknowledged chunk;
+8. verifies each session's acknowledged-write lineage through its open fid;
+9. renames the temporary file over the exact destination path;
+10. runs the primary client's filesystem-wide sync to verify the namespace
+    publication; and
+11. reports the file complete only after every durability barrier succeeds.
 
-Directory uploads run up to eight file copies concurrently by default. This
-matches the browser's useful acceleration model: files are parallel, while the
-chunks within one file remain sequential. Each worker owns one reusable client
-session, capped by the requested job count. The CLI requests a 9 MiB message
-size and uses the server-negotiated maximum payload without adding a separate multipart
-server API or within-file range fan-out.
+Resume is opt-in and size-based so a repeated directory upload can avoid
+replacing already materialized files without downloading them. It does not
+prove content equality: two regular files with equal byte lengths are treated
+as a match. Missing, different-length, and non-regular destinations follow the
+normal upload or existing type-conflict path. The default remains overwrite.
 
-Rename makes a fully written file visible; the following per-file sync verifies
-its durability before the CLI calls it complete. Empty-directory-only uploads
-use `Client::sync()` to durably publish their namespace changes. A connection,
+Directory uploads run up to eight file copies concurrently by default. Each
+upload worker owns two reusable client sessions, capped at twice the requested
+job count. Each session keeps at most two extent-aligned writes active, so one
+file has at most four chunks in flight and the server can stage disjoint ranges
+across high-latency acknowledgements. At the default eight jobs, the uploader
+uses at most 16 sessions and about 288 MiB of chunk buffers when every active
+file is large enough; higher job counts increase both bounds. The CLI requests
+a 9 MiB write payload plus 9P framing and obeys any smaller server-negotiated
+maximum, so this needs no new server API or persistent multipart state.
+
+Each session verifies its own acknowledged writes before publication. Rename
+makes the fully written file visible; the following filesystem-wide sync
+verifies the namespace change before the CLI calls it complete. Empty-directory-
+only uploads use the same `Client::sync()` durability endpoint. A connection,
 stale-handle, leader, or retry-later (`EAGAIN`) failure restarts that file from
-a new private temporary path. An exhausted or permanent file failure is
+a new private temporary path. Resume eligibility is evaluated only on the first
+attempt; retries always rewrite and re-verify the destination. An exhausted or
+permanent file failure is
 recorded while the remaining queue continues; the command reports every failed
 file and exits nonzero after all scheduled work settles. A sync failure states
 that the renamed file may be visible but its durability was not verified.
@@ -214,6 +233,8 @@ The focused test set currently covers:
   narrow-terminal layout;
 - real single-file and nested-tree upload/download with exact byte comparison,
   exact destination paths, and preservation of unrelated entries;
+- size-based upload resume for single files and nested trees, including
+  different-length replacement and local-source revalidation before a skip;
 - cancellation before download publication and visibility of files completed
   before another file fails;
 - rollback of failed-attempt byte progress, bounded transient file retries, and
@@ -239,6 +260,7 @@ Acceptance requires:
 4. observed terminal output reports real byte movement and does not claim
    completion before durability/finalization succeeds.
 
-Prebuilt macOS packaging, signing, notarization, native `wss://`, within-file
-parallel ranges, restart resume, bidirectional synchronization, checksum-based
-skip logic, and destination mirroring are outside this first release.
+Prebuilt macOS packaging, signing, notarization, native `wss://`, unbounded or
+persisted within-file range fan-out, partial-file byte-offset restart resume,
+bidirectional synchronization, checksum-based skip logic, and destination
+mirroring are outside this first release.

@@ -6,7 +6,7 @@
 
 **Architecture:** Add `zerofs upload`, `zerofs download`, and `zerofs rm` to the existing Clap command tree. A focused transfer module scans copy sources into exact-root plans, streams regular files through `zerofs-client` with browser-style temporary files and bounded file concurrency, recursively removes an explicitly selected remote path, and reports terminal progress. Tests exercise pure planning/output units plus real operations through an in-process ZeroFS 9P server.
 
-**Final implementation note:** The completed CLI uses one reusable 9P session per bounded worker, requests a 9 MiB message size and uses the server-negotiated maximum payload, renames each fully written upload into visibility, and syncs it before marking it complete. Empty-directory-only uploads retain a final `Client::sync()`. Prompt-free recursive `rm` refuses the attach root. Transport hardening acknowledges actual socket sends before starting reply liveness, retains bounded write-stall detection, and keeps a slow request alive while the server remains responsive. Connection, stale-handle, leader, and retry-later (`EAGAIN`) file errors restart only that file from a new private temp up to three total attempts; cleanup failures are terminal, and exhausted files are reported while the remaining queue continues. These decisions supersede the original single-client, batch-wide `Client::sync()`, fail-fast scheduling, and upload/download-only steps below.
+**Final implementation note:** The completed CLI uses two reusable 9P sessions per bounded upload worker (one per download worker), requests an extent-aligned 9 MiB write payload plus protocol framing, and keeps two positioned writes active on each upload session while obeying any smaller server-negotiated maximum. Each session verifies its acknowledged writes before rename, and a filesystem-wide sync verifies publication before completion. Empty-directory-only uploads retain a final `Client::sync()`. Prompt-free recursive `rm` refuses the attach root. Transport hardening acknowledges actual socket sends before starting reply liveness, retains bounded write-stall detection, and keeps a slow request alive while the server remains responsive. Connection, stale-handle, leader, and retry-later (`EAGAIN`) file errors restart only that file from a new private temp up to three total attempts; cleanup failures are terminal, and exhausted files are reported while the remaining queue continues. These decisions supersede the original single-client, sequential-write, batch-wide `Client::sync()`, fail-fast scheduling, and upload/download-only steps below.
 
 **Tech Stack:** Rust 2024, Clap, Tokio, futures, tokio-util cancellation, Indicatif, uuid, `zerofs-client`, the in-tree ZeroFS 9P test server.
 
@@ -19,9 +19,9 @@
 - Recursively remove only the explicitly selected remote path, without a prompt, and refuse the 9P attach root.
 - Map the source root exactly to the destination argument.
 - Overwrite matching files during copies but never delete unrelated destination entries.
-- Request a 9 MiB 9P message size and stream the server-negotiated payload chunks; do not load a whole file or directory archive into memory.
-- Default to eight concurrent files, allow `--jobs N` to change that limit, and keep chunks within one file sequential.
-- Upload completion requires rename followed by a successful per-file `File::sync_all()`; empty-directory-only uploads use `Client::sync()`.
+- Request an extent-aligned 9 MiB write payload plus 9P framing and stream server-negotiated chunks; do not load a whole file or directory archive into memory.
+- Default to eight concurrent files, allow `--jobs N` to change that limit, and keep at most two writes active per upload session (four per file across two sessions).
+- Upload completion requires every session to verify its writes, followed by rename and a successful filesystem-wide `Client::sync()`; empty-directory-only uploads use the same sync endpoint.
 - Download publication requires local `sync_all` followed by rename.
 - Do not resume partial transfers across process restarts.
 - Replay interrupted 9P mutations with their original operation ID; retry a
@@ -374,7 +374,7 @@ strict Clippy plus the `wasm32-unknown-unknown` compile gate.
 
 - [ ] **Step 1: Write the README command contract**
 
-Add a `Direct transfers (no mount)` subsection documenting all three commands, Unix/TCP/HA/`ws://` target examples, exact-root copy semantics, explicit recursive removal, overwrite-without-delete behavior during copies, progress fields, rename-before-sync durability behavior, the requested 9 MiB message size and server-negotiated payload, the eight-job default and `--jobs`, and exclusions for `wss://`, special source entries, restart resume, and within-file multipart ranges.
+Add a `Direct transfers (no mount)` subsection documenting all three commands, Unix/TCP/HA/`ws://` target examples, exact-root copy semantics, explicit recursive removal, overwrite-without-delete behavior during copies, progress fields, per-session write verification before rename and filesystem sync after rename, the requested 9 MiB message size and server-negotiated payload, the eight-job default and `--jobs`, two upload sessions with two active writes each, size-based `upload --resume` for materialized final files, and exclusions for `wss://`, special source entries, partial-file byte-offset resume, and persisted multipart state.
 
 - [ ] **Step 2: Run formatting and focused verification**
 
