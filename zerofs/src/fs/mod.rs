@@ -15,6 +15,7 @@ pub mod write_coordinator;
 
 mod boot;
 mod handle;
+pub(crate) mod mutation;
 mod ops;
 #[cfg(test)]
 mod test_util;
