@@ -183,6 +183,33 @@ sudo mount_nfs \
 Use the actual production CT address in place of `10.10.10.30`. The private
 WebUI is at `http://10.10.10.30:8080` and must never be made public.
 
+VM100 can keep the production NBD/XFS volume mounted at `/mnt/zerofs-lxc`
+while separately mounting the normal ZeroFS file namespace at
+`/mnt/zerofs-files`. The tracked `mnt-zerofs\x2dfiles.mount` unit uses NFSv3
+and is read-write for ordinary files. Because the normal namespace also exposes
+the live NBD lanes below `.nbd`, `mnt-zerofs\x2dfiles-.nbd.mount` overlays that
+one control directory with a read-only bind mount. The one-second attribute
+cache keeps Mac and iPhone uploads visible without using 9P on VM100.
+
+Install the mount without changing the existing NBD units:
+
+```bash
+sudo install -d -m 0755 /mnt/zerofs-files
+sudo install -m 0644 \
+  'proxmox/systemd/mnt-zerofs\x2dfiles.mount' \
+  '/etc/systemd/system/mnt-zerofs\x2dfiles.mount'
+sudo install -m 0644 \
+  'proxmox/systemd/mnt-zerofs\x2dfiles-.nbd.mount' \
+  '/etc/systemd/system/mnt-zerofs\x2dfiles-.nbd.mount'
+sudo systemctl daemon-reload
+sudo systemctl enable --now 'mnt-zerofs\x2dfiles.mount'
+sudo systemctl enable --now 'mnt-zerofs\x2dfiles-.nbd.mount'
+```
+
+The result is two independent VM100 mountpoints: read-write XFS over NBD at
+`/mnt/zerofs-lxc`, and the read-write shared file tree at
+`/mnt/zerofs-files`, with only `/mnt/zerofs-files/.nbd` protected read-only.
+
 ZeroFS NFS reports writes as stable while they are buffered, and tested macOS
 and Linux clients do not issue a durability-producing COMMIT on `fsync`.
 Production `ack_mode = "ssd"` protects the local writeback boundary, but NFS
