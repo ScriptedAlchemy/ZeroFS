@@ -1007,6 +1007,16 @@ pub struct NfsConfig {
         default
     )]
     pub addresses: Option<HashSet<SocketAddr>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shared_identity: Option<NfsSharedIdentity>,
+}
+
+/// Optional all-client identity for an NFS export.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct NfsSharedIdentity {
+    pub uid: u32,
+    pub gid: u32,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -1641,6 +1651,7 @@ impl Settings {
             servers: ServerConfig {
                 nfs: Some(NfsConfig {
                     addresses: Some(default_nfs_addresses()),
+                    shared_identity: None,
                 }),
                 ninep: Some(NinePConfig {
                     addresses: Some(default_9p_addresses()),
@@ -3470,6 +3481,78 @@ addresses = ["${ZEROFS_TEST_PROM_ADDR}"]
         assert!(nfs.contains(&"0.0.0.0:2049".parse().unwrap()));
         let prom = settings.prometheus.unwrap().addresses;
         assert!(prom.contains(&"0.0.0.0:9091".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_nfs_shared_identity_is_opt_in_and_preserves_configured_ids() {
+        let configured = r#"
+[cache]
+dir = "/tmp/cache"
+disk_size_gb = 1.0
+
+[storage]
+url = "s3://bucket/data"
+encryption_password = "test"
+
+[servers.nfs]
+addresses = ["127.0.0.1:2049"]
+
+[servers.nfs.shared_identity]
+uid = 501
+gid = 20
+"#;
+        let shared_identity = write_and_load(configured)
+            .unwrap()
+            .servers
+            .nfs
+            .unwrap()
+            .shared_identity
+            .unwrap();
+        assert_eq!(shared_identity.uid, 501);
+        assert_eq!(shared_identity.gid, 20);
+
+        let default = r#"
+[cache]
+dir = "/tmp/cache"
+disk_size_gb = 1.0
+
+[storage]
+url = "s3://bucket/data"
+encryption_password = "test"
+
+[servers.nfs]
+addresses = ["127.0.0.1:2049"]
+"#;
+        assert!(
+            write_and_load(default)
+                .unwrap()
+                .servers
+                .nfs
+                .unwrap()
+                .shared_identity
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_nfs_shared_identity_requires_both_ids() {
+        let incomplete = r#"
+[cache]
+dir = "/tmp/cache"
+disk_size_gb = 1.0
+
+[storage]
+url = "s3://bucket/data"
+encryption_password = "test"
+
+[servers.nfs]
+addresses = ["127.0.0.1:2049"]
+
+[servers.nfs.shared_identity]
+uid = 501
+"#;
+        let error = format!("{:#}", write_and_load(incomplete).unwrap_err());
+        assert!(error.contains("missing field `gid`"), "got: {error}");
     }
 
     // Expansion runs on the whole string before it is parsed, so a variable can

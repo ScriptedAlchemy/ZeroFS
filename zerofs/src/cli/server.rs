@@ -154,8 +154,15 @@ async fn start_nfs_servers(
             let fs_clone = Arc::clone(&fs);
             let addr = *addr;
             let shutdown_clone = shutdown.clone();
+            let shared_identity = config.shared_identity;
             handles.push(spawn_named("nfs-server", async move {
-                match crate::nfs::start_nfs_server_with_config(fs_clone, addr, shutdown_clone).await
+                match crate::nfs::start_nfs_server_with_config(
+                    fs_clone,
+                    addr,
+                    shutdown_clone,
+                    shared_identity,
+                )
+                .await
                 {
                     Ok(()) => Ok(()),
                     Err(e) => Err(std::io::Error::other(e.to_string())),

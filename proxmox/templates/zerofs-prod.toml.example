@@ -41,13 +41,17 @@ write_ack_mode = "materialized"
 [servers.nfs]
 addresses = ["10.10.10.30:2049"]
 
+[servers.nfs.shared_identity]
+uid = 501
+gid = 20
+
 [servers.rpc]
 unix_socket = "/run/zerofs/rpc.sock"
 
 [servers.webui]
 addresses = ["10.10.10.30:8080"]
-uid = 0
-gid = 0
+uid = 501
+gid = 20
 
 [prometheus]
 addresses = ["10.10.10.30:9567"]

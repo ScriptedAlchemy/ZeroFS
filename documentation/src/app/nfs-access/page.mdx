@@ -23,12 +23,11 @@ zerofs run --config zerofs.toml
 ```
 
 <Warning>
-  NFS traffic is neither authenticated nor encrypted. The server trusts the numeric
-  UID and GID supplied by the client, then applies POSIX owner, group, and mode-bit
-  checks to that identity. A client that can reach the endpoint can assert another
-  identity, so POSIX permissions are not a network security boundary. Bind to
-  localhost by default; otherwise restrict the endpoint with a private network,
-  firewall, or authenticated tunnel.
+  NFS traffic is neither authenticated nor encrypted. By default, the server trusts
+  the numeric identity supplied by the client. With `shared_identity`, it instead
+  treats every client as the configured identity. Neither mode makes POSIX
+  permissions a network security boundary. Bind to localhost by default; otherwise
+  restrict the endpoint with a private network, firewall, or authenticated tunnel.
 </Warning>
 
 ## Mount the filesystem
@@ -77,7 +76,6 @@ The operating system supplies defaults for transfer size, caching, timeouts, and
 | Option | Trade-off |
 | --- | --- |
 | `rsize=<bytes>`, `wsize=<bytes>` | Request transfer sizes. The client and server negotiate the effective values. |
-| `actimeo=<seconds>` | Keeps attributes cached longer, reducing requests but extending the period in which another client's metadata changes may be stale. |
 | `hard` | Keeps retrying after a server or network interruption. This is normally appropriate for a writable filesystem. |
 | `soft` | Returns an I/O error after retries are exhausted. Applications must handle errors from transient stalls; do not use it as a generic performance option. |
 | `timeo=<value>`, `retrans=<count>` | Control retry timing. Units and exact behavior vary by operating system. |
@@ -85,6 +83,30 @@ The operating system supplies defaults for transfer size, caching, timeouts, and
 ## Permissions and multiple clients
 
 NFS sends numeric user and group IDs rather than account names. Keep UID and GID assignments consistent across clients that share files. A permission error can be diagnosed with `id`, `ls -ln`, and the mode bits on every directory in the path.
+
+For a trusted shared export where clients have different local numeric IDs,
+configure one identity for the whole NFS listener:
+
+```toml
+[servers.nfs]
+addresses = ["10.0.0.5:2049"]
+
+[servers.nfs.shared_identity]
+uid = 501
+gid = 20
+```
+
+Both values are required. Every NFS request, including one from client-side
+root, then runs as UID 501 and GID 20 with no supplementary groups. Files and
+directories created over NFS are forced to that owner even if a client requests
+another UID or GID. Later NFS chown and chgrp requests are ignored, while other
+attribute changes such as chmod and truncate still apply. Existing tree
+ownership is not scanned or rewritten.
+
+This setting deliberately removes per-client identity separation: every client
+that can reach the listener receives the same filesystem authority. Restrict
+the endpoint to the intended private clients. Leave `shared_identity` absent to
+preserve the normal client-supplied numeric identities.
 
 To accept remote clients, bind the listener to a private address instead of localhost:
 
@@ -106,7 +128,7 @@ Add an `_netdev` entry to `/etc/fstab` so boot ordering treats the mount as netw
 ## Limitations
 
 - **No file-locking protocol**: ZeroFS does not implement the NFS locking protocols. `fcntl` byte-range locking is available through the [native kernel client](/kernel-client), stock v9fs, and `zerofs mount`; applications that need locks should mount over 9P. See [File locking](/9p-access#file-locking).
-- **Numeric identities**: NFS uses numeric UIDs and GIDs, not usernames.
+- **Numeric identities**: NFS uses numeric UIDs and GIDs, not usernames; the optional shared identity deliberately maps them to one configured pair.
 - **Client caching**: Concurrent clients may briefly observe stale attributes or data according to their mount settings.
 - **fsync**: NFS COMMIT semantics allow fsync to return before data reaches stable storage. Over 9P, fsync returns only after data reaches stable storage.
 

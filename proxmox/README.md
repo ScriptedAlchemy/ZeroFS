@@ -48,6 +48,15 @@ Samba, a Samba password, or a container-side filesystem mount. The NFS listener
 is not authenticated; the exact RFC1918 bind plus Proxmox/Tailscale network
 policy is the security boundary. Never port-forward 2049 or 8080.
 
+The production template configures `[servers.nfs.shared_identity]` as UID 501
+and GID 20 and runs the WebUI with the same identity. Every NFS client,
+including root, therefore acts as that shared owner; creation requests cannot
+select another owner and later NFS chown/chgrp requests are ignored. This lets
+the Mac and VM100 use the same direct NFS namespace even when their local
+numeric users differ. It deliberately removes per-client identity separation,
+so the private-network restriction is mandatory. Deployment validates the
+exact `501:20` pair and does not scan or normalize the existing tree.
+
 The optional `--prod-access both` (or legacy `smb`) mode additionally makes the
 production LXC own a 9P/FUSE mount and export it through Samba. That requires:
 
@@ -174,38 +183,43 @@ After the production listener proof succeeds and the Mac can route the private
 Proxmox subnet through Tailscale:
 
 ```bash
+ZEROFS_CT_IP=10.10.10.55  # Set this to the actual production CT address.
 sudo mkdir -p /Volumes/ZeroFS
 sudo mount_nfs \
   -o async,nolocks,rsize=1048576,wsize=1048576,tcp,port=2049,mountport=2049,hard \
-  10.10.10.30:/ /Volumes/ZeroFS
+  "${ZEROFS_CT_IP}:/" /Volumes/ZeroFS
 ```
 
-Use the actual production CT address in place of `10.10.10.30`. The private
-WebUI is at `http://10.10.10.30:8080` and must never be made public.
+The private WebUI is at `http://${ZEROFS_CT_IP}:8080` and must never be made
+public.
 
 VM100 has exactly one persistent ZeroFS mount: the direct read-write NFSv3/TCP
 file namespace at `/mnt/zerofs-files`. The NFS client uses hard mounts, 1 MiB
 read/write requests, a one-second attribute cache, and `_netdev`.
 Each deploy renders this unit's `What=` source from its validated private
-container address (for example, `10.10.10.20:/` for dev or `10.10.10.30:/` for
-prod), disables any installed legacy raw/bindfs/normalizer units, and fails if
-a legacy raw or guard mount remains active. It then reloads and restarts the
-direct unit before requiring the mounted source, NFS filesystem type, and `rw`
-option.
+container address (for example, `10.10.10.30:/` for dev or the current
+production `10.10.10.55:/`). It safely retires the exact legacy
+`/mnt/zerofs-lxc` mount,
+`zerofs-lxc-nbd-client.service`, and `/dev/nbd0` only after syncing and proving
+the mount is the recognized legacy device. It also disables installed legacy
+raw/bindfs/normalizer units and fails if a legacy raw or guard mount remains
+active. It then reloads and restarts the direct unit before requiring the
+mounted source, the exact NFSv3 `nfs` filesystem type, and the `rw` option.
 
-Install the one persistent direct NFS mount:
+The deploy command above installs and renders the one persistent direct NFS
+mount. Do not copy the tracked unit verbatim: its `What=` line is only an
+example placeholder. After deployment, verify the actual source, filesystem
+type, and options:
 
 ```bash
-sudo install -d -m 0755 /mnt/zerofs-files
-sudo install -m 0644 \
-  'proxmox/systemd/mnt-zerofs\x2dfiles.mount' \
-  '/etc/systemd/system/mnt-zerofs\x2dfiles.mount'
-sudo systemctl daemon-reload
-sudo systemctl enable --now 'mnt-zerofs\x2dfiles.mount'
+findmnt -rn -M /mnt/zerofs-files -o SOURCE,FSTYPE,OPTIONS
+# Required: <actual-CT-IP>:/ nfs and an rw option.
 ```
 
 The result is one persistent VM100 ZeroFS mount: the read-write shared file tree
-at `/mnt/zerofs-files` over the production NFSv3 export.
+at `/mnt/zerofs-files` over the production NFSv3 export. No bindfs layer,
+second raw mount, ownership normalizer, `.nbd` guard, or persistent VM NBD
+client participates in this path.
 
 ### One-time retirement of a legacy VM100 NBD mount
 
@@ -216,11 +230,15 @@ the legacy consumer, confirm its filesystem is no longer mounted, disconnect
 the device, remove the locally installed units, and reload systemd:
 
 ```bash
-sudo systemctl disable --now mnt-zerofs-lxc.mount zerofs-lxc-nbd-client.service
 if findmnt -rn -M /mnt/zerofs-lxc >/dev/null; then
+  test "$(findmnt -nro SOURCE -M /mnt/zerofs-lxc)" = /dev/nbd0
   sudo sync -f /mnt/zerofs-lxc
+fi
+sudo systemctl disable --now mnt-zerofs-lxc.mount
+if findmnt -rn -M /mnt/zerofs-lxc >/dev/null; then
   sudo umount /mnt/zerofs-lxc
 fi
+sudo systemctl disable --now zerofs-lxc-nbd-client.service
 if test -s /sys/class/block/nbd0/pid; then
   sudo nbd-client -d /dev/nbd0
 fi

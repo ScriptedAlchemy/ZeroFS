@@ -29,7 +29,11 @@ from typing import Sequence
 
 VM_NFS_MOUNT_UNIT = r"mnt-zerofs\x2dfiles.mount"
 VM_NFS_MOUNTPOINT = "/mnt/zerofs-files"
-VM_NFS_TEMPLATE_SOURCE = "10.10.10.55:/"
+VM_NFS_TEMPLATE_SOURCE = "10.10.10.30:/"
+VM_LEGACY_NBD_MOUNT_UNIT = "mnt-zerofs-lxc.mount"
+VM_LEGACY_NBD_CLIENT_UNIT = "zerofs-lxc-nbd-client.service"
+VM_LEGACY_NBD_MOUNTPOINT = "/mnt/zerofs-lxc"
+VM_LEGACY_NBD_DEVICE = "/dev/nbd0"
 VM_LEGACY_NAMESPACE_UNITS = (
     r"mnt-zerofs\x2dfiles\x2draw.mount",
     r"mnt-zerofs\x2dfiles\x2draw-.nbd.mount",
@@ -233,6 +237,8 @@ def validate_server_config(
                 raise ValueError(
                     "NFS must listen only on the private container address at port 2049"
                 )
+        if nfs.get("shared_identity") != {"uid": 501, "gid": 20}:
+            raise ValueError("NFS shared_identity must use uid 501 and gid 20")
         webui = servers.get("webui")
         if not isinstance(webui, dict):
             raise ValueError("prod requires the private WebUI listener")
@@ -245,14 +251,8 @@ def validate_server_config(
                 raise ValueError(
                     "WebUI must listen only on the private container address at port 8080"
                 )
-        for identity_field in ("uid", "gid"):
-            identity = webui.get(identity_field)
-            if (
-                not isinstance(identity, int)
-                or isinstance(identity, bool)
-                or not 0 <= identity <= 0xFFFF_FFFF
-            ):
-                raise ValueError(f"WebUI requires a numeric {identity_field}")
+        if webui.get("uid") != 501 or webui.get("gid") != 20:
+            raise ValueError("WebUI must use shared namespace identity uid 501 and gid 20")
     rpc = servers.get("rpc", {})
     if _addresses(rpc):
         raise ValueError("RPC must be Unix-socket only")
@@ -795,6 +795,68 @@ def _provision_vm_nfs_mount(runner: Runner, args: argparse.Namespace) -> None:
 unit_loaded() {{
   test "$(systemctl show -p LoadState --value "$1" 2>/dev/null || true)" != not-found
 }}
+legacy_nbd_owned=0
+if systemctl is-active --quiet {shlex.quote(VM_LEGACY_NBD_CLIENT_UNIT)}; then
+  legacy_nbd_owned=1
+fi
+if findmnt -rn -M {shlex.quote(VM_LEGACY_NBD_MOUNTPOINT)} >/dev/null 2>&1; then
+  legacy_nbd_source=$(findmnt -nro SOURCE -M {shlex.quote(VM_LEGACY_NBD_MOUNTPOINT)})
+  if test "$legacy_nbd_source" != {shlex.quote(VM_LEGACY_NBD_DEVICE)}; then
+    echo "refusing to retire unexpected legacy mount source: $legacy_nbd_source" >&2
+    exit 1
+  fi
+  legacy_nbd_owned=1
+  sudo sync -f {shlex.quote(VM_LEGACY_NBD_MOUNTPOINT)}
+fi
+if unit_loaded {shlex.quote(VM_LEGACY_NBD_MOUNT_UNIT)}; then
+  sudo systemctl disable --now {shlex.quote(VM_LEGACY_NBD_MOUNT_UNIT)}
+  if systemctl is-enabled --quiet {shlex.quote(VM_LEGACY_NBD_MOUNT_UNIT)}; then
+    echo 'legacy NBD mount remains enabled' >&2
+    exit 1
+  fi
+  test "$(systemctl is-active {shlex.quote(VM_LEGACY_NBD_MOUNT_UNIT)} 2>/dev/null || true)" != active
+fi
+if findmnt -rn -M {shlex.quote(VM_LEGACY_NBD_MOUNTPOINT)} >/dev/null 2>&1; then
+  sudo umount {shlex.quote(VM_LEGACY_NBD_MOUNTPOINT)}
+fi
+if findmnt -rn -M {shlex.quote(VM_LEGACY_NBD_MOUNTPOINT)} >/dev/null 2>&1; then
+  echo 'legacy NBD mount remains active; refusing device disconnect' >&2
+  exit 1
+fi
+if unit_loaded {shlex.quote(VM_LEGACY_NBD_CLIENT_UNIT)}; then
+  sudo systemctl disable --now {shlex.quote(VM_LEGACY_NBD_CLIENT_UNIT)}
+  if systemctl is-enabled --quiet {shlex.quote(VM_LEGACY_NBD_CLIENT_UNIT)}; then
+    echo 'legacy NBD client remains enabled' >&2
+    exit 1
+  fi
+  test "$(systemctl is-active {shlex.quote(VM_LEGACY_NBD_CLIENT_UNIT)} 2>/dev/null || true)" != active
+fi
+legacy_nbd_pid=$(cat /sys/class/block/nbd0/pid 2>/dev/null || true)
+if test -n "$legacy_nbd_pid"; then
+  if test "$legacy_nbd_owned" != 1; then
+    echo 'nbd0 is connected without recognized legacy ZeroFS state; refusing disconnect' >&2
+    exit 1
+  fi
+  if ! command -v nbd-client >/dev/null 2>&1; then
+    echo 'nbd-client is required to disconnect the recognized legacy device' >&2
+    exit 1
+  fi
+  sudo nbd-client -d {shlex.quote(VM_LEGACY_NBD_DEVICE)}
+fi
+if test -s /sys/class/block/nbd0/pid; then
+  echo 'legacy nbd0 remains connected' >&2
+  exit 1
+fi
+sudo rm -f \
+  /etc/systemd/system/{shlex.quote(VM_LEGACY_NBD_MOUNT_UNIT)} \
+  /etc/systemd/system/{shlex.quote(VM_LEGACY_NBD_CLIENT_UNIT)} \
+  /usr/local/libexec/zerofs-tune-nbd \
+  /etc/zerofs-lxc/client.env
+sudo systemctl daemon-reload
+if unit_loaded {shlex.quote(VM_LEGACY_NBD_MOUNT_UNIT)} || unit_loaded {shlex.quote(VM_LEGACY_NBD_CLIENT_UNIT)}; then
+  echo 'legacy NBD units remain installed after retirement' >&2
+  exit 1
+fi
 for legacy_unit in {legacy_units}; do
   if unit_loaded "$legacy_unit"; then
     sudo systemctl disable --now "$legacy_unit"
@@ -831,10 +893,7 @@ mount_details=${{mount_record#* }}
 mount_fstype=${{mount_details%% *}}
 mount_options=${{mount_details#* }}
 test "$mount_source" = "{args.container_ip}:/"
-case "$mount_fstype" in
-  nfs|nfs4) ;;
-  *) echo "unexpected VM NFS filesystem type: $mount_fstype" >&2; exit 1 ;;
-esac
+test "$mount_fstype" = nfs
 case ",$mount_options," in
   *,rw,*) ;;
   *) echo 'VM NFS mount is not read-write' >&2; exit 1 ;;

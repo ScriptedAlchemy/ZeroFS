@@ -57,11 +57,12 @@ class SystemdTemplateTests(unittest.TestCase):
         if renderer is None:
             self.fail("VM NFS mount renderer is missing")
 
-        for container_ip in ("10.10.10.20", "10.10.10.30"):
+        for container_ip in ("10.10.10.30", "10.10.10.55"):
             with self.subTest(container_ip=container_ip):
                 rendered = renderer(template, container_ip)
                 self.assertIn(f"What={container_ip}:/", rendered)
-                self.assertNotIn("What=10.10.10.55:/", rendered)
+                if container_ip != "10.10.10.30":
+                    self.assertNotIn("What=10.10.10.30:/", rendered)
                 self.assertIn("Where=/mnt/zerofs-files", rendered)
                 self.assertIn("Type=nfs", rendered)
                 self.assertIn(
@@ -77,7 +78,7 @@ class SystemdTemplateTests(unittest.TestCase):
             / r"mnt-zerofs\x2dfiles.mount"
         ).read_text()
 
-        self.assertIn("What=10.10.10.55:/", unit)
+        self.assertIn("What=10.10.10.30:/", unit)
         self.assertIn("Where=/mnt/zerofs-files", unit)
         self.assertIn("Type=nfs", unit)
         self.assertIn(
@@ -190,13 +191,17 @@ write_ack_mode = "materialized"
 [servers.nfs]
 addresses = ["10.10.10.30:2049"]
 
+[servers.nfs.shared_identity]
+uid = 501
+gid = 20
+
 [servers.rpc]
 unix_socket = "/run/zerofs/rpc.sock"
 
 [servers.webui]
 addresses = ["10.10.10.30:8080"]
-uid = 0
-gid = 0
+uid = 501
+gid = 20
 
 [prometheus]
 addresses = ["10.10.10.30:9567"]
@@ -324,8 +329,14 @@ addresses = ["10.10.10.30:9567"]
                 )
 
     def test_prod_webui_requires_numeric_uid_and_gid(self) -> None:
-        for field in ("uid", "gid"):
-            incomplete = self.prod_config().replace(f"{field} = 0\n", "")
+        for field, value in (("uid", 501), ("gid", 20)):
+            webui = (
+                '[servers.webui]\naddresses = ["10.10.10.30:8080"]\n'
+                "uid = 501\ngid = 20\n"
+            )
+            incomplete = self.prod_config().replace(
+                webui, webui.replace(f"{field} = {value}\n", "")
+            )
             with self.subTest(field=field), self.assertRaisesRegex(
                 ValueError, f"WebUI.*{field}"
             ):
@@ -342,6 +353,39 @@ addresses = ["10.10.10.30:9567"]
             with self.subTest(address=address), self.assertRaisesRegex(
                 ValueError, "NFS.*private container address.*2049"
             ):
+                deploy.validate_server_config(
+                    self.write_config(unsafe), "10.10.10.30", role="prod"
+                )
+
+    def test_prod_requires_one_shared_namespace_identity(self) -> None:
+        valid = self.prod_config()
+        for label, unsafe, message in (
+            (
+                "nfs uid",
+                valid.replace(
+                    "[servers.nfs.shared_identity]\nuid = 501\ngid = 20",
+                    "[servers.nfs.shared_identity]\nuid = 502\ngid = 20",
+                ),
+                "NFS shared_identity.*501.*20",
+            ),
+            (
+                "nfs gid",
+                valid.replace(
+                    "[servers.nfs.shared_identity]\nuid = 501\ngid = 20",
+                    "[servers.nfs.shared_identity]\nuid = 501\ngid = 21",
+                ),
+                "NFS shared_identity.*501.*20",
+            ),
+            (
+                "webui uid",
+                valid.replace(
+                    "[servers.webui]\naddresses = [\"10.10.10.30:8080\"]\nuid = 501\ngid = 20",
+                    "[servers.webui]\naddresses = [\"10.10.10.30:8080\"]\nuid = 0\ngid = 20",
+                ),
+                "WebUI.*501.*20",
+            ),
+        ):
+            with self.subTest(label=label), self.assertRaisesRegex(ValueError, message):
                 deploy.validate_server_config(
                     self.write_config(unsafe), "10.10.10.30", role="prod"
                 )
@@ -440,7 +484,6 @@ class CliDryRunTests(ConfigValidationTests):
         )
         self.assertIn("findmnt -rn -M /mnt/zerofs-files", result.stdout)
         self.assertIn(f'test "$mount_source" = "{container_ip}:/"', result.stdout)
-        self.assertIn('case "$mount_fstype" in', result.stdout)
         self.assertIn('case ",$mount_options," in', result.stdout)
         for legacy_unit in (
             r"mnt-zerofs\x2dfiles\x2draw.mount",
@@ -458,6 +501,24 @@ class CliDryRunTests(ConfigValidationTests):
             with self.subTest(legacy_mount=legacy_mount):
                 self.assertIn(legacy_mount, result.stdout)
         self.assertIn('findmnt -rn -M "$legacy_mount"', result.stdout)
+        self.assertIn("mnt-zerofs-lxc.mount", result.stdout)
+        self.assertIn("zerofs-lxc-nbd-client.service", result.stdout)
+        self.assertIn("/mnt/zerofs-lxc", result.stdout)
+        self.assertIn("/sys/class/block/nbd0/pid", result.stdout)
+        self.assertIn("nbd-client -d /dev/nbd0", result.stdout)
+        self.assertIn("umount /mnt/zerofs-lxc", result.stdout)
+        self.assertIn("findmnt -nro SOURCE -M /mnt/zerofs-lxc", result.stdout)
+        self.assertIn(
+            "refusing to retire unexpected legacy mount source", result.stdout
+        )
+        self.assertIn(
+            "nbd0 is connected without recognized legacy ZeroFS state",
+            result.stdout,
+        )
+        self.assertIn("/usr/local/libexec/zerofs-tune-nbd", result.stdout)
+        self.assertIn("/etc/zerofs-lxc/client.env", result.stdout)
+        self.assertIn('test "$mount_fstype" = nfs', result.stdout)
+        self.assertNotIn("nfs|nfs4", result.stdout)
 
     def run_cli(
         self,
@@ -487,7 +548,7 @@ class CliDryRunTests(ConfigValidationTests):
             check=False,
         )
 
-    def test_deploy_dry_run_prints_build_and_stage_without_vm_nbd_actions(
+    def test_deploy_dry_run_provisions_nfs_and_only_retires_legacy_vm_nbd(
         self,
     ) -> None:
         config = self.write_config(self.valid_config())
@@ -496,8 +557,6 @@ class CliDryRunTests(ConfigValidationTests):
         self.assertIn("cargo build --release --locked", result.stdout)
         self.assertIn("host-deploy.sh deploy", result.stdout)
         self.assert_direct_nfs_mount_is_provisioned(result, "10.10.10.20")
-        self.assertNotIn("nbd-client", result.stdout)
-        self.assertNotIn("/mnt/zerofs-lxc", result.stdout)
         self.assertNotIn("mkfs", result.stdout)
 
     def test_cleanup_dry_run_keeps_persistent_state(self) -> None:
@@ -541,8 +600,10 @@ class CliDryRunTests(ConfigValidationTests):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("prod", result.stderr)
 
-    def test_prod_deploy_provisions_direct_vm_nfs_and_no_vm_nbd(self) -> None:
-        config = self.write_config(self.prod_config())
+    def test_prod_deploy_provisions_nfs_and_retires_legacy_vm_nbd(self) -> None:
+        config = self.write_config(
+            self.prod_config().replace("10.10.10.30", "10.10.10.55")
+        )
         result = subprocess.run(
             [
                 "python3",
@@ -553,7 +614,7 @@ class CliDryRunTests(ConfigValidationTests):
                 "--ctid",
                 "130",
                 "--container-ip",
-                "10.10.10.30",
+                "10.10.10.55",
                 "--config",
                 str(config),
                 "--dry-run",
@@ -567,8 +628,7 @@ class CliDryRunTests(ConfigValidationTests):
         self.assertIn("host-deploy.sh deploy --role prod", result.stdout)
         self.assertIn("--features webui", result.stdout)
         self.assertIn("--prod-access nfs", result.stdout)
-        self.assert_direct_nfs_mount_is_provisioned(result, "10.10.10.30")
-        self.assertNotIn("zerofs-lxc-nbd-client.service", result.stdout)
+        self.assert_direct_nfs_mount_is_provisioned(result, "10.10.10.55")
         self.assertNotIn("smb.conf", result.stdout)
         self.assertNotIn("smbd.service", result.stdout)
 

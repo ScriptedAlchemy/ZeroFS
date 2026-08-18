@@ -1,8 +1,9 @@
+use crate::config::NfsSharedIdentity;
 use crate::fs::ZeroFS;
 use crate::fs::inode::Inode;
 use crate::fs::permissions::Credentials;
 use crate::fs::tracing::FileOperation;
-use crate::fs::types::{FileType, InodeWithId, SetAttributes};
+use crate::fs::types::{AuthContext, FileType, InodeWithId, SetAttributes, SetGid, SetUid};
 use async_trait::async_trait;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -21,11 +22,51 @@ use zerofs_nfsserve::vfs::{AuthContext as NfsAuthContext, NFSFileSystem, VFSCapa
 #[derive(Clone)]
 pub struct NFSAdapter {
     fs: Arc<ZeroFS>,
+    shared_identity: Option<NfsSharedIdentity>,
 }
 
 impl NFSAdapter {
     pub fn new(fs: Arc<ZeroFS>) -> Self {
-        Self { fs }
+        Self {
+            fs,
+            shared_identity: None,
+        }
+    }
+
+    fn with_shared_identity(mut self, shared_identity: Option<NfsSharedIdentity>) -> Self {
+        self.shared_identity = shared_identity;
+        self
+    }
+
+    fn auth_context(&self, auth: &NfsAuthContext) -> AuthContext {
+        match self.shared_identity {
+            Some(identity) => AuthContext {
+                uid: identity.uid,
+                gid: identity.gid,
+                gid_known: true,
+                gids: Vec::new(),
+                groups_complete: true,
+            },
+            None => auth.into(),
+        }
+    }
+
+    fn create_attributes(&self, attr: sattr3) -> SetAttributes {
+        let mut attr = SetAttributes::from(attr);
+        if let Some(identity) = self.shared_identity {
+            attr.uid = SetUid::Set(identity.uid);
+            attr.gid = SetGid::Set(identity.gid);
+        }
+        attr
+    }
+
+    fn setattr_attributes(&self, attr: sattr3) -> SetAttributes {
+        let mut attr = SetAttributes::from(attr);
+        if self.shared_identity.is_some() {
+            attr.uid = SetUid::NoChange;
+            attr.gid = SetGid::NoChange;
+        }
+        attr
     }
 }
 
@@ -51,7 +92,7 @@ impl NFSFileSystem for NFSAdapter {
             String::from_utf8_lossy(filename)
         );
 
-        let auth_ctx: crate::fs::types::AuthContext = auth.into();
+        let auth_ctx = self.auth_context(auth);
         let creds = Credentials::from_auth_context(&auth_ctx);
 
         let inode_id = self.fs.lookup(&creds, dirid, filename).await?;
@@ -72,7 +113,7 @@ impl NFSFileSystem for NFSAdapter {
         count: u32,
     ) -> Result<(Vec<u8>, bool), nfsstat3> {
         debug!("read called: id={}, offset={}, count={}", id, offset, count);
-        let auth_ctx: crate::fs::types::AuthContext = auth.into();
+        let auth_ctx = self.auth_context(auth);
         self.fs
             .read_file(&auth_ctx, id, offset, count)
             .await
@@ -94,7 +135,7 @@ impl NFSFileSystem for NFSAdapter {
             offset
         );
 
-        let auth_ctx: crate::fs::types::AuthContext = auth.into();
+        let auth_ctx = self.auth_context(auth);
         let data_bytes = bytes::Bytes::copy_from_slice(data);
         let file_attrs: crate::fs::types::FileAttributes =
             self.fs.write(&auth_ctx, id, offset, &data_bytes).await?;
@@ -114,9 +155,9 @@ impl NFSFileSystem for NFSAdapter {
             String::from_utf8_lossy(filename)
         );
 
-        let auth_ctx: crate::fs::types::AuthContext = auth.into();
+        let auth_ctx = self.auth_context(auth);
         let creds = Credentials::from_auth_context(&auth_ctx);
-        let fs_attr = SetAttributes::from(attr);
+        let fs_attr = self.create_attributes(attr);
 
         let (id, file_attrs): (u64, crate::fs::types::FileAttributes) =
             self.fs.create(&creds, dirid, filename, &fs_attr).await?;
@@ -135,10 +176,8 @@ impl NFSFileSystem for NFSAdapter {
             dirid, filename
         );
 
-        let id = self
-            .fs
-            .create_exclusive(&auth.into(), dirid, filename)
-            .await?;
+        let auth_ctx = self.auth_context(auth);
+        let id = self.fs.create_exclusive(&auth_ctx, dirid, filename).await?;
 
         Ok(id)
     }
@@ -156,9 +195,9 @@ impl NFSFileSystem for NFSAdapter {
             String::from_utf8_lossy(dirname)
         );
 
-        let auth_ctx: crate::fs::types::AuthContext = auth.into();
+        let auth_ctx = self.auth_context(auth);
         let creds = Credentials::from_auth_context(&auth_ctx);
-        let fs_attr = SetAttributes::from(*attr);
+        let fs_attr = self.create_attributes(*attr);
         let (id, file_attrs): (u64, crate::fs::types::FileAttributes) =
             self.fs.mkdir(&creds, dirid, dirname, &fs_attr).await?;
         Ok((id, (&file_attrs).into()))
@@ -172,7 +211,7 @@ impl NFSFileSystem for NFSAdapter {
     ) -> Result<(), nfsstat3> {
         debug!("remove called: dirid={}, filename={:?}", dirid, filename);
 
-        let auth_ctx: crate::fs::types::AuthContext = auth.into();
+        let auth_ctx = self.auth_context(auth);
         Ok(self.fs.remove(&auth_ctx, dirid, filename).await?)
     }
 
@@ -189,14 +228,9 @@ impl NFSFileSystem for NFSAdapter {
             from_dirid, to_dirid
         );
 
+        let auth_ctx = self.auth_context(auth);
         self.fs
-            .rename(
-                &auth.into(),
-                from_dirid,
-                from_filename,
-                to_dirid,
-                to_filename,
-            )
+            .rename(&auth_ctx, from_dirid, from_filename, to_dirid, to_filename)
             .await
             .map_err(|e| e.into())
     }
@@ -213,9 +247,10 @@ impl NFSFileSystem for NFSAdapter {
             dirid, start_after, max_entries
         );
 
+        let auth_ctx = self.auth_context(auth);
         let result = self
             .fs
-            .readdir(&auth.into(), dirid, start_after, max_entries)
+            .readdir(&auth_ctx, dirid, start_after, max_entries)
             .await?;
 
         Ok(zerofs_nfsserve::vfs::ReadDirResult {
@@ -241,9 +276,9 @@ impl NFSFileSystem for NFSAdapter {
     ) -> Result<fattr3, nfsstat3> {
         debug!("setattr called: id={}, setattr={:?}", id, setattr);
 
-        let auth_ctx: crate::fs::types::AuthContext = auth.into();
+        let auth_ctx = self.auth_context(auth);
         let creds = Credentials::from_auth_context(&auth_ctx);
-        let fs_attr = SetAttributes::from(setattr);
+        let fs_attr = self.setattr_attributes(setattr);
         let file_attrs = self.fs.setattr(&creds, id, &fs_attr).await?;
         Ok((&file_attrs).into())
     }
@@ -261,9 +296,9 @@ impl NFSFileSystem for NFSAdapter {
             dirid, linkname, symlink
         );
 
-        let auth_ctx: crate::fs::types::AuthContext = auth.into();
+        let auth_ctx = self.auth_context(auth);
         let creds = Credentials::from_auth_context(&auth_ctx);
-        let fs_attr = SetAttributes::from(*attr);
+        let fs_attr = self.create_attributes(*attr);
         let (id, file_attrs) = self
             .fs
             .symlink(&creds, dirid, &linkname.0, &symlink.0, &fs_attr)
@@ -303,9 +338,9 @@ impl NFSFileSystem for NFSAdapter {
             _ => None,
         };
 
-        let auth_ctx: crate::fs::types::AuthContext = auth.into();
+        let auth_ctx = self.auth_context(auth);
         let creds = Credentials::from_auth_context(&auth_ctx);
-        let fs_attr = SetAttributes::from(*attr);
+        let fs_attr = self.create_attributes(*attr);
         let fs_type = FileType::from(ftype);
         let (id, file_attrs) = self
             .fs
@@ -327,9 +362,10 @@ impl NFSFileSystem for NFSAdapter {
             fileid, linkdirid, linkname
         );
 
+        let auth_ctx = self.auth_context(auth);
         Ok(self
             .fs
-            .link(&auth.into(), fileid, linkdirid, &linkname.0)
+            .link(&auth_ctx, fileid, linkdirid, &linkname.0)
             .await?)
     }
 
@@ -440,8 +476,9 @@ pub async fn start_nfs_server_with_config(
     filesystem: Arc<ZeroFS>,
     socket: SocketAddr,
     shutdown: CancellationToken,
+    shared_identity: Option<NfsSharedIdentity>,
 ) -> anyhow::Result<()> {
-    let adapter = NFSAdapter::new(filesystem);
+    let adapter = NFSAdapter::new(filesystem).with_shared_identity(shared_identity);
     let listener = NFSTcpListener::bind(socket, adapter)
         .await
         .map_err(|e| crate::net_util::tcp_bind_error("NFS", socket, &e))?;
@@ -455,6 +492,7 @@ pub async fn start_nfs_server_with_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::NfsSharedIdentity;
     use crate::test_helpers::test_helpers_mod::{filename, test_auth};
     use zerofs_nfsserve::nfs::{
         ftype3, nfspath3, nfsstat3, sattr3, set_atime, set_gid3, set_mode3, set_mtime, set_size3,
@@ -468,6 +506,96 @@ mod tests {
 
         assert_eq!(adapter.root_dir(), 0);
         assert!(matches!(adapter.capabilities(), VFSCapabilities::ReadWrite));
+    }
+
+    #[tokio::test]
+    async fn test_shared_identity_allows_cross_client_mutation_and_ownership() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let default_adapter = NFSAdapter::new(Arc::clone(&fs));
+        let shared_adapter =
+            NFSAdapter::new(fs).with_shared_identity(Some(NfsSharedIdentity { uid: 501, gid: 20 }));
+        let mac_auth = NfsAuthContext {
+            uid: 501,
+            gid: 20,
+            gids: Vec::new(),
+        };
+        let vm_auth = NfsAuthContext {
+            uid: 1000,
+            gid: 1000,
+            gids: Vec::new(),
+        };
+        let owner_only = sattr3 {
+            mode: set_mode3::mode(0o600),
+            uid: set_uid3::uid(9001),
+            gid: set_gid3::gid(9002),
+            ..sattr3::default()
+        };
+
+        let (mac_file, attrs) = shared_adapter
+            .create(&mac_auth, 0, &filename(b"mac-owned"), owner_only)
+            .await
+            .unwrap();
+        assert_eq!((attrs.uid, attrs.gid, attrs.mode), (501, 20, 0o600));
+
+        assert!(matches!(
+            default_adapter
+                .write(&vm_auth, mac_file, 0, b"denied")
+                .await
+                .unwrap_err(),
+            nfsstat3::NFS3ERR_ACCES
+        ));
+        assert!(matches!(
+            default_adapter
+                .setattr(
+                    &vm_auth,
+                    mac_file,
+                    sattr3 {
+                        mode: set_mode3::mode(0o660),
+                        uid: set_uid3::uid(9001),
+                        gid: set_gid3::gid(9002),
+                        ..sattr3::default()
+                    },
+                )
+                .await
+                .unwrap_err(),
+            nfsstat3::NFS3ERR_PERM
+        ));
+
+        shared_adapter
+            .write(&vm_auth, mac_file, 0, b"shared")
+            .await
+            .unwrap();
+        let attrs = shared_adapter
+            .setattr(
+                &vm_auth,
+                mac_file,
+                sattr3 {
+                    mode: set_mode3::mode(0o660),
+                    uid: set_uid3::uid(9001),
+                    gid: set_gid3::gid(9002),
+                    ..sattr3::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!((attrs.uid, attrs.gid, attrs.mode), (501, 20, 0o660));
+
+        let (_, attrs) = shared_adapter
+            .create(&vm_auth, 0, &filename(b"vm-created"), sattr3::default())
+            .await
+            .unwrap();
+        assert_eq!((attrs.uid, attrs.gid), (501, 20));
+
+        let root_auth = NfsAuthContext {
+            uid: 0,
+            gid: 0,
+            gids: vec![20],
+        };
+        let (_, attrs) = shared_adapter
+            .create(&root_auth, 0, &filename(b"root-created"), sattr3::default())
+            .await
+            .unwrap();
+        assert_eq!((attrs.uid, attrs.gid), (501, 20));
     }
 
     #[tokio::test]

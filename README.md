@@ -291,6 +291,11 @@ compression = "zstd-3"  # Optional: "zstd-{1-22}" (default "zstd-3") or "lz4"
 
 [servers.nfs]
 addresses = ["127.0.0.1:2049"]
+# Optional: make every NFS client act as one POSIX identity.
+# Keep this off unless the listener is restricted to trusted clients.
+# [servers.nfs.shared_identity]
+# uid = 501
+# gid = 20
 
 [servers.ninep]
 addresses = ["127.0.0.1:5564"]
@@ -372,6 +377,9 @@ mount -t 9p -o trans=unix,version=9p2000.L,cache=mmap,access=user /tmp/zerofs.9p
 ### NFS
 
 ZeroFS reports NFS writes as stable while they are buffered; tested clients (macOS, Linux) do not send COMMIT on fsync. Use a 9P mount where fsync durability matters.
+By default, NFS preserves each client's numeric UID and GID. An optional
+`[servers.nfs.shared_identity]` table squashes every client, including root, to
+one configured identity for a trusted shared export; see [NFS access](https://www.zerofs.net/nfs-access).
 
 ```bash
 # macOS

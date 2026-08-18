@@ -210,9 +210,21 @@ Omitting `addresses` starts no TCP listener; there is no implicit `127.0.0.1` bi
 ```toml
 [servers.nfs]
 addresses = ["0.0.0.0:2049"]
+
+# Optional all-client identity for a trusted shared export.
+[servers.nfs.shared_identity]
+uid = 501
+gid = 20
 ```
 
-NFS is TCP-only: `[servers.nfs]` accepts only `addresses` and has no `unix_socket` key.
+NFS is TCP-only and has no `unix_socket` key. By default, ZeroFS applies POSIX
+permissions to the numeric UID, primary GID, and supplementary groups supplied
+by each NFS client. When `shared_identity` is present, both `uid` and `gid` are
+required and every client, including root, acts as that one identity. Creation
+requests cannot override the configured owner, and later NFS chown/chgrp
+requests are ignored. This mode removes per-client identity separation; use it
+only on a private listener restricted to trusted clients. It does not rewrite
+ownership or permissions on existing files.
 
 ### 9P Server
 
