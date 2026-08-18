@@ -1,3 +1,7 @@
+/// Writeback dirty-RAM and dirty-SSD admission.
+///
+/// RAM and SSD policy owners live in this module. The shared FIFO gate lives
+/// in `crate::coordination::admission`.
 pub mod admission;
 /// Shared durability-barrier primitive.
 ///
