@@ -25,6 +25,7 @@ pub mod model;
 pub mod overlay;
 mod payload;
 pub mod remote;
+pub(crate) mod space_sample;
 pub mod store;
 #[cfg(test)]
 mod test_util;

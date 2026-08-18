@@ -1,6 +1,7 @@
 use crate::writeback::config::WritebackSettings;
 use crate::writeback::journal::Journal;
 use crate::writeback::model::JournalIdentity;
+use crate::writeback::space_sample::PhysicalSpaceSampler;
 use crate::writeback::store::WritebackObjectStore;
 use object_store::ObjectStore;
 use std::fs;
@@ -12,6 +13,7 @@ use std::sync::Arc;
 pub struct AttachedWriteback {
     pub store: Arc<dyn ObjectStore>,
     pub lifecycle: WritebackObjectStore,
+    pub(crate) space: Arc<PhysicalSpaceSampler>,
 }
 
 /// Recover the local overlay while leaving remote replay paused.
@@ -31,6 +33,8 @@ pub async fn attach(
     settings.dir = settings.dir.join(namespace);
     let journal = Arc::new(Journal::open(&settings.dir, identity)?);
     let recovery = journal.progress()?;
+    let space = Arc::new(PhysicalSpaceSampler::new(settings.dir.clone()));
+    let _ = space.sample().await?;
     let lifecycle = WritebackObjectStore::open_paused(remote, journal, settings).await?;
     if recovery.remote_seq < recovery.local_seq {
         tracing::info!(
@@ -43,6 +47,7 @@ pub async fn attach(
     Ok(AttachedWriteback {
         store: Arc::new(lifecycle.clone()),
         lifecycle,
+        space,
     })
 }
 
@@ -498,5 +503,46 @@ mod tests {
             fs::metadata(&base).unwrap().permissions().mode() & 0o777,
             0o755
         );
+    }
+
+    #[tokio::test]
+    async fn attachment_samples_the_namespaced_writeback_filesystem() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("dirty");
+        let settings = WritebackSettings {
+            dir: base.clone(),
+            ack_mode: AckMode::Memory,
+            memory_bytes: 1,
+            disk_bytes: 1,
+            min_free_bytes: 1,
+            high_watermark_percent: 95,
+            resume_percent: 85,
+            upload_concurrency: 1,
+            local_concurrency: 4,
+            shutdown_flush: ShutdownFlush::Local,
+        };
+        let identity = JournalIdentity {
+            format_version: 1,
+            bucket_id: "bucket-space".to_owned(),
+            backend_endpoint: "sftp://storage.example:23".to_owned(),
+            database_prefix: "zerofs/space".to_owned(),
+            backend_kind: "sftp".to_owned(),
+            encryption_key_identity_sha256: [0x70; 32],
+        };
+
+        let attached = super::attach(
+            Arc::new(InMemory::new()),
+            settings,
+            identity,
+            "bucket_space",
+        )
+        .await
+        .unwrap();
+        let namespaced = base.join("bucket_space");
+        assert_eq!(attached.space.writeback_dir(), namespaced.as_path());
+        assert_eq!(attached.space.latest_generation(), 1);
+        let sample = attached.space.sample().await.unwrap();
+        assert_eq!(sample.generation, 2);
+        attached.lifecycle.shutdown().await.unwrap();
     }
 }
