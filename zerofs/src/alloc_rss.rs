@@ -5,9 +5,23 @@
 //! grows resident+retained on top of an already-full 64 GiB floor. The
 //! envelope is the admission ceiling: weighter stays length, RSS is the cap.
 
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
+
+use tikv_jemalloc_ctl::{epoch, stats};
 
 static RSS_CAP_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Envelope reads are throttled: the admission gate runs per cached 128 KiB
+/// part, and a jemalloc epoch advance takes the allocator's global stats
+/// mutex. RSS moves on millisecond timescales; per-part precision buys
+/// nothing.
+const SAMPLE_INTERVAL_MS: u64 = 100;
+
+static CACHED_ENVELOPE: AtomicU64 = AtomicU64::new(0);
+/// `now_ms()` of the last jemalloc sample; `0` means never sampled.
+static LAST_SAMPLE_MS: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(test)]
 thread_local! {
@@ -24,36 +38,63 @@ pub fn rss_cap_bytes() -> u64 {
     RSS_CAP_BYTES.load(Ordering::Relaxed)
 }
 
-fn advance_epoch() -> bool {
-    tikv_jemalloc_ctl::epoch::mib()
-        .and_then(|e| e.advance())
-        .is_ok()
+fn now_ms() -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    // +1 so a real timestamp is never 0 (the "never sampled" sentinel).
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64 + 1
 }
 
-/// jemalloc `stats.resident` after an epoch advance. `0` if jemalloc is
-/// unavailable (lib unit tests without the global allocator).
-pub fn jemalloc_resident() -> u64 {
-    if !advance_epoch() {
-        return 0;
-    }
-    tikv_jemalloc_ctl::stats::resident::read().unwrap_or(0) as u64
-}
-
-/// jemalloc `stats.retained` after an epoch advance.
-pub fn jemalloc_retained() -> u64 {
-    if !advance_epoch() {
-        return 0;
-    }
-    tikv_jemalloc_ctl::stats::retained::read().unwrap_or(0) as u64
-}
-
-/// Resident + retained, or the test override.
+/// Resident + retained (or the test override), refreshed from jemalloc at
+/// most every [`SAMPLE_INTERVAL_MS`]; between samples this is atomic loads
+/// only. `0` if jemalloc is unavailable (lib unit tests without the global
+/// allocator).
 pub fn jemalloc_rss_envelope() -> u64 {
     #[cfg(test)]
     if let Some(v) = TEST_ENVELOPE.with(|c| c.get()) {
         return v;
     }
-    jemalloc_resident().saturating_add(jemalloc_retained())
+    let now = now_ms();
+    let last = LAST_SAMPLE_MS.load(Ordering::Relaxed);
+    let fresh = last != 0 && now.saturating_sub(last) < SAMPLE_INTERVAL_MS;
+    // The CAS elects one sampler per interval; losers use the cached value
+    // (one sample old at worst) instead of queueing on jemalloc's mutex.
+    if fresh
+        || LAST_SAMPLE_MS
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+    {
+        return CACHED_ENVELOPE.load(Ordering::Relaxed);
+    }
+    let envelope = read_envelope();
+    CACHED_ENVELOPE.store(envelope, Ordering::Relaxed);
+    envelope
+}
+
+/// One epoch advance, then both stats: a coherent snapshot paying the
+/// mallctl lock once, unlike per-stat advances.
+fn read_envelope() -> u64 {
+    struct Mibs {
+        epoch: tikv_jemalloc_ctl::epoch_mib,
+        resident: stats::resident_mib,
+        retained: stats::retained_mib,
+    }
+    static MIBS: OnceLock<Option<Mibs>> = OnceLock::new();
+    let mibs = MIBS.get_or_init(|| {
+        Some(Mibs {
+            epoch: epoch::mib().ok()?,
+            resident: stats::resident::mib().ok()?,
+            retained: stats::retained::mib().ok()?,
+        })
+    });
+    let Some(mibs) = mibs else {
+        return 0;
+    };
+    if mibs.epoch.advance().is_err() {
+        return 0;
+    }
+    let resident = mibs.resident.read().unwrap_or(0) as u64;
+    let retained = mibs.retained.read().unwrap_or(0) as u64;
+    resident.saturating_add(retained)
 }
 
 pub fn over_rss_cap() -> bool {
