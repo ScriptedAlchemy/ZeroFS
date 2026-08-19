@@ -748,6 +748,18 @@ class VmNfsCoordinatorTests(unittest.TestCase):
                 )
             return subprocess.CompletedProcess(command, 0, stdout, "")
 
+        def run_remote_shell(self, host: str, script: str) -> str | None:
+            rendered = f"locked-shell {host}\n{script}"
+            self.calls.append(rendered)
+            if self.fail_token and self.fail_token in rendered:
+                raise RuntimeError(f"injected {self.fail_token}")
+            if "reconcile-zerofs-nfs.sh preflight " in rendered:
+                return (
+                    "ZEROFS_SHARED_NAMESPACE_V1 verified=1 objects=9 "
+                    "wrong_owner=0 first_uid=-1 first_gid=-1 reason=ok\n"
+                )
+            return ""
+
     def args(self) -> SimpleNamespace:
         return SimpleNamespace(
             vm_host="ubuntu-main",
@@ -798,6 +810,33 @@ class VmNfsCoordinatorTests(unittest.TestCase):
             ["recover", "prepare", "quiesce", "reconcile", "commit"],
         )
 
+    def test_every_mutating_vm_command_runs_inside_the_lock_session(self) -> None:
+        runner = self.RecordingRunner()
+
+        self.transaction_runner()(
+            runner,
+            self.args(),
+            "0123456789ab-cccccccccccccccc",
+            lambda: None,
+            lambda: None,
+            lambda: None,
+            lambda: None,
+        )
+
+        direct_vm_ssh = [
+            call
+            for call in runner.calls
+            if call.startswith("ssh -o BatchMode=yes ubuntu-main")
+        ]
+        self.assertEqual(direct_vm_ssh, [])
+        self.assertTrue(
+            any(
+                call.startswith("locked-shell ubuntu-main")
+                and "reconcile-zerofs-nfs.sh reconcile " in call
+                for call in runner.calls
+            )
+        )
+
     def test_absent_initial_mount_is_proven_after_bootstrap_not_fabricated(
         self,
     ) -> None:
@@ -806,19 +845,16 @@ class VmNfsCoordinatorTests(unittest.TestCase):
                 super().__init__()
                 inner_self.preflights = 0
 
-            def run(inner_self, command, **kwargs):
-                result = super().run(command, **kwargs)
-                rendered = deploy.shell_join(command)
+            def run_remote_shell(inner_self, host, script):
+                result = super().run_remote_shell(host, script)
+                rendered = script
                 if "reconcile-zerofs-nfs.sh preflight " in rendered:
                     inner_self.preflights += 1
                     if inner_self.preflights == 1:
-                        return subprocess.CompletedProcess(
-                            command,
-                            0,
+                        return (
                             "ZEROFS_SHARED_NAMESPACE_V1 verified=0 objects=0 "
                             "wrong_owner=0 first_uid=-1 first_gid=-1 "
-                            "reason=mount_unavailable\n",
-                            "",
+                            "reason=mount_unavailable\n"
                         )
                 return result
 
@@ -902,11 +938,10 @@ class VmNfsCoordinatorTests(unittest.TestCase):
         trace: list[str] = []
 
         class TraceRunner(self.RecordingRunner):
-            def run(inner_self, command, **kwargs):
-                input_text = kwargs.get("input_text")
-                if input_text and "vm_nfs_transition.py rollback " in input_text:
+            def run_remote_shell(inner_self, host, script):
+                if "vm_nfs_transition.py rollback " in script:
                     trace.append("vm-rollback")
-                return super().run(command, **kwargs)
+                return super().run_remote_shell(host, script)
 
         runner = TraceRunner("vm_nfs_transition.py reconcile ")
         with self.assertRaisesRegex(RuntimeError, "injected"):
@@ -965,6 +1000,21 @@ class VmNfsCoordinatorTests(unittest.TestCase):
 
 
 class DeploymentLockTests(unittest.TestCase):
+    def test_lock_owner_executes_remote_commands_and_reports_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            lock = Path(directory) / "coordinator.lock"
+            holder = "flock() { return 0; }; " + deploy._remote_lock_holder(str(lock))
+            lease = deploy._FlockLease(["bash", "-c", holder], dry_run=False)
+
+            with lease:
+                self.assertEqual(
+                    lease.execute("printf 'inside-lock\\n'"), "inside-lock\n"
+                )
+                with self.assertRaisesRegex(
+                    RuntimeError, "locked remote command exited 17"
+                ):
+                    lease.execute("printf 'failed\\n'; exit 17")
+
     def test_nonblocking_flock_rejects_a_concurrent_coordinator(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             lock = Path(directory) / "coordinator.lock"

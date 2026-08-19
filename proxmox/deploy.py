@@ -10,6 +10,7 @@ volatile/writeback tier is drained.
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
 import hashlib
 import ipaddress
@@ -583,11 +584,49 @@ class _FlockLease:
         if returncode != 0:
             raise RuntimeError(f"deployment lock process exited {returncode}")
 
+    def execute(self, script: str) -> str:
+        process = self.process
+        if process is None or process.poll() is not None:
+            raise RuntimeError("deployment lock lease was lost")
+        assert process.stdin is not None and process.stdout is not None
+        token = hashlib.sha256(os.urandom(32)).hexdigest()
+        payload = base64.b64encode(script.encode()).decode()
+        process.stdin.write(f"{token} {payload}\n")
+        process.stdin.flush()
+        output: list[str] = []
+        marker = f"__ZEROFS_LOCK_RESULT__ {token} "
+        while True:
+            line = process.stdout.readline()
+            if not line:
+                raise RuntimeError("deployment lock lease was lost during command")
+            if line.startswith(marker):
+                status = int(line.removeprefix(marker).strip())
+                text = "".join(output)
+                if status != 0:
+                    raise RuntimeError(
+                        f"locked remote command exited {status}: {text.strip()}"
+                    )
+                return text
+            output.append(line)
+
+
+def _remote_lock_holder(path: str) -> str:
+    return (
+        f"exec 9>{shlex.quote(path)}; "
+        "flock -n 9 || exit 75; printf 'LOCKED\\n'; "
+        "while IFS=' ' read -r token payload; do "
+        "set +e; output=$(printf '%s' \"$payload\" | base64 -d | bash -se 2>&1); "
+        'status=$?; set -e; test -z "$output" || printf \'%s\\n\' "$output"; '
+        'printf \'__ZEROFS_LOCK_RESULT__ %s %s\\n\' "$token" "$status"; '
+        "done"
+    )
+
 
 class Runner:
     def __init__(self, dry_run: bool) -> None:
         self.dry_run = dry_run
         self._active_leases: list[_FlockLease] = []
+        self._remote_leases: dict[str, _FlockLease] = {}
 
     def _assert_leases_held(self) -> None:
         if self.dry_run:
@@ -634,10 +673,7 @@ class Runner:
         )
         with contextlib.ExitStack() as stack:
             for host, path, sudo in locks:
-                lock_script = (
-                    f"exec 9>{shlex.quote(path)}; "
-                    "flock -n 9 || exit 75; printf 'LOCKED\\n'; cat >/dev/null"
-                )
+                lock_script = _remote_lock_holder(path)
                 remote = (
                     f"sudo bash -c {shlex.quote(lock_script)}"
                     if sudo
@@ -657,7 +693,17 @@ class Runner:
                 lease = stack.enter_context(_FlockLease(command, dry_run=self.dry_run))
                 self._active_leases.append(lease)
                 stack.callback(self._active_leases.remove, lease)
+                self._remote_leases[host] = lease
+                stack.callback(self._remote_leases.pop, host)
             yield
+
+    def run_remote_shell(self, host: str, script: str) -> str | None:
+        if self.dry_run:
+            return None
+        lease = self._remote_leases.get(host)
+        if lease is None:
+            return None
+        return lease.execute(script)
 
 
 def sha256(path: Path) -> str:
@@ -755,7 +801,20 @@ def _build(runner: Runner, root: Path, role: str) -> Path:
 
 
 def _ssh(runner: Runner, host: str, script: str) -> None:
+    if runner.run_remote_shell(host, script) is not None:
+        return
     runner.run(["ssh", "-o", "BatchMode=yes", host, "bash", "-se"], input_text=script)
+
+
+def _ssh_capture(runner: Runner, host: str, script: str) -> str:
+    locked = runner.run_remote_shell(host, script)
+    if locked is not None:
+        return locked
+    return runner.run(
+        ["ssh", "-o", "BatchMode=yes", host, "bash", "-se"],
+        input_text=script,
+        capture=True,
+    ).stdout
 
 
 def _quiesce_guest(runner: Runner, args: argparse.Namespace) -> None:
@@ -1077,19 +1136,18 @@ def _run_ownership_migration(runner: Runner, args: argparse.Namespace) -> None:
                 f"set -euo pipefail\ninstall -d -m 0700 {shlex.quote(remote_stage)}\n",
             )
             runner.run(["scp", "-q", str(helper), f"{args.vm_host}:{remote_helper}"])
-            runner.run(
-                [
-                    "ssh",
-                    "-o",
-                    "BatchMode=yes",
-                    args.vm_host,
-                    "sudo",
-                    "bash",
-                    remote_helper,
-                    mode,
-                    f"{args.container_ip}:/",
-                    *([OWNERSHIP_REPAIR_CONFIRMATION] if mode == "repair" else []),
-                ]
+            command = [
+                "sudo",
+                "bash",
+                remote_helper,
+                mode,
+                f"{args.container_ip}:/",
+                *([OWNERSHIP_REPAIR_CONFIRMATION] if mode == "repair" else []),
+            ]
+            _ssh(
+                runner,
+                args.vm_host,
+                f"set -euo pipefail\n{shell_join(command)}\n",
             )
         finally:
             _ssh(
@@ -1146,10 +1204,6 @@ def _run_prod_vm_nfs_transaction(
 
     def guest_action(name: str) -> str:
         command = [
-            "ssh",
-            "-o",
-            "BatchMode=yes",
-            args.vm_host,
             "sudo",
             "bash",
             remote_guest_reconciler,
@@ -1158,7 +1212,11 @@ def _run_prod_vm_nfs_transaction(
         ]
         if name == "reconcile":
             command.append(remote_unit)
-        return runner.run(command, capture=True).stdout
+        return _ssh_capture(
+            runner,
+            args.vm_host,
+            f"set -euo pipefail\n{shell_join(command)}\n",
+        )
 
     with runner.remote_deployment_locks(args):
         try:
