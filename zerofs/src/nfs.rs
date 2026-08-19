@@ -1,21 +1,53 @@
 use crate::config::NfsSharedIdentity;
 use crate::fs::ZeroFS;
 use crate::fs::inode::Inode;
+use crate::fs::mutation::durability::DurabilityTarget;
+use crate::fs::mutation::overlay::IdentifiedWrite;
+use crate::fs::mutation::types::{RequestIdentity, RequestLifetime};
 use crate::fs::permissions::Credentials;
 use crate::fs::tracing::FileOperation;
 use crate::fs::types::{AuthContext, FileType, InodeWithId, SetAttributes, SetGid, SetUid};
 use async_trait::async_trait;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 use zerofs::fs::EXTENT_SIZE;
 use zerofs_nfsserve::nfs::{
     FSF_CANSETTIME, FSF_HOMOGENEOUS, FSF_LINK, FSF_SYMLINK, fattr3, fileid3, filename3, fsinfo3,
-    fsstat3, ftype3, nfspath3, nfsstat3, nfstime3, post_op_attr, sattr3, specdata3, writeverf3,
+    fsstat3, ftype3, nfspath3, nfsstat3, nfstime3, post_op_attr, sattr3, specdata3, stable_how,
+    writeverf3,
 };
 use zerofs_nfsserve::tcp::{NFSTcp, NFSTcpListener};
-use zerofs_nfsserve::vfs::{AuthContext as NfsAuthContext, NFSFileSystem, VFSCapabilities};
+use zerofs_nfsserve::vfs::{
+    AuthContext as NfsAuthContext, CommitRequestContext, CommitResult, NFSFileSystem,
+    VFSCapabilities, WriteRequestContext, WriteResult,
+};
+
+const NFS_REPLAY_WINDOW: Duration = Duration::from_secs(60);
+
+#[derive(Clone, Copy)]
+pub(crate) struct NfsServiceIdentity {
+    server_incarnation: uuid::Uuid,
+    write_verifier: writeverf3,
+}
+
+impl NfsServiceIdentity {
+    pub(crate) fn new() -> Self {
+        let server_incarnation = uuid::Uuid::new_v4();
+        let write_verifier = loop {
+            let candidate = rand::random::<writeverf3>();
+            if candidate != [0; 8] {
+                break candidate;
+            }
+        };
+        Self {
+            server_incarnation,
+            write_verifier,
+        }
+    }
+}
 
 /// Adapter struct that implements the NFS trait for ZeroFS.
 /// This prevents accidental direct calls to NFS trait methods on ZeroFS.
@@ -23,14 +55,23 @@ use zerofs_nfsserve::vfs::{AuthContext as NfsAuthContext, NFSFileSystem, VFSCapa
 pub struct NFSAdapter {
     fs: Arc<ZeroFS>,
     shared_identity: Option<NfsSharedIdentity>,
+    service_identity: NfsServiceIdentity,
 }
 
 impl NFSAdapter {
     pub fn new(fs: Arc<ZeroFS>) -> Self {
+        Self::with_service_identity(fs, NfsServiceIdentity::new())
+    }
+
+    pub(crate) fn with_service_identity(
+        fs: Arc<ZeroFS>,
+        service_identity: NfsServiceIdentity,
+    ) -> Self {
         fs.install_volatile_overlay();
         Self {
             fs,
             shared_identity: None,
+            service_identity,
         }
     }
 
@@ -68,6 +109,38 @@ impl NFSAdapter {
             attr.gid = SetGid::NoChange;
         }
         attr
+    }
+
+    fn write_fingerprint_context(&self, context: &WriteRequestContext) -> Vec<u8> {
+        let target: DurabilityTarget = self.fs.write_ack.client_durability_target.into();
+        let client_addr = context.rpc.client_addr.as_bytes();
+        let target = format!("{target:?}");
+        let mut encoded = Vec::with_capacity(client_addr.len() + target.len() + 32);
+        encoded.extend_from_slice(b"nfs3-write-v1");
+        encoded.extend_from_slice(&(client_addr.len() as u64).to_le_bytes());
+        encoded.extend_from_slice(client_addr);
+        encoded.extend_from_slice(&(context.requested_stability as u32).to_le_bytes());
+        encoded.extend_from_slice(&(target.len() as u64).to_le_bytes());
+        encoded.extend_from_slice(target.as_bytes());
+        encoded
+    }
+
+    async fn commit_current_cutoff(&self, fileid: fileid3) -> Result<writeverf3, nfsstat3> {
+        let cutoff = self.fs.capture_mutation_cutoff();
+        match self.fs.wait_mutation_durability(cutoff).await {
+            Ok(()) => {
+                debug!("commit successful for file {fileid}");
+                self.fs
+                    .tracer
+                    .emit(&self.fs.inode_store, fileid, FileOperation::Fsync);
+                Ok(self.service_identity.write_verifier)
+            }
+            Err(fs_error) => {
+                let nfsstat: nfsstat3 = fs_error.into();
+                tracing::error!("commit failed for file {fileid}: {nfsstat:?}");
+                Err(nfsstat)
+            }
+        }
     }
 }
 
@@ -143,6 +216,60 @@ impl NFSFileSystem for NFSAdapter {
             .write_ack(&auth_ctx, id, offset, &data_bytes)
             .await?;
         Ok((&file_attrs).into())
+    }
+
+    async fn write_with_context(
+        &self,
+        context: &WriteRequestContext,
+        auth: &NfsAuthContext,
+        id: fileid3,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<WriteResult, nfsstat3> {
+        debug!(
+            xid = context.rpc.xid,
+            connection_incarnation = context.rpc.connection_incarnation,
+            requested_stability = ?context.requested_stability,
+            data_len = data.len(),
+            inode = id,
+            offset,
+            "processing contextual NFS WRITE",
+        );
+
+        let auth_ctx = self.auth_context(auth);
+        let data = bytes::Bytes::copy_from_slice(data);
+        let fingerprint_context = self.write_fingerprint_context(context);
+        let receipt = self
+            .fs
+            .write_ack_identified(IdentifiedWrite {
+                auth: &auth_ctx,
+                id,
+                offset,
+                data: &data,
+                op_id: [0; 16],
+                check_permissions: true,
+                identity: RequestIdentity::Nfs {
+                    server_incarnation: self.service_identity.server_incarnation,
+                    connection_incarnation: context.rpc.connection_incarnation,
+                    xid: context.rpc.xid,
+                },
+                request_lifetime: RequestLifetime::ReplayWindow(NFS_REPLAY_WINDOW),
+                fingerprint_context: &fingerprint_context,
+            })
+            .await?;
+
+        let committed = match context.requested_stability {
+            stable_how::UNSTABLE => stable_how::UNSTABLE,
+            stable_how::DATA_SYNC | stable_how::FILE_SYNC => {
+                self.fs.wait_mutation_durability(receipt.cutoff).await?;
+                stable_how::FILE_SYNC
+            }
+        };
+        Ok(WriteResult {
+            attributes: (&receipt.attrs).into(),
+            committed,
+            verifier: self.service_identity.write_verifier,
+        })
     }
 
     async fn create(
@@ -385,21 +512,32 @@ impl NFSFileSystem for NFSAdapter {
             offset,
             count
         );
+        self.commit_current_cutoff(fileid).await
+    }
 
-        match self.fs.wait_inode_durability(fileid).await {
-            Ok(_) => {
-                debug!("commit successful for file {}", fileid);
-                self.fs
-                    .tracer
-                    .emit(&self.fs.inode_store, fileid, FileOperation::Fsync);
-                Ok(self.serverid())
-            }
-            Err(fs_error) => {
-                let nfsstat: nfsstat3 = fs_error.into();
-                tracing::error!("commit failed for file {}: {:?}", fileid, nfsstat);
-                Err(nfsstat)
-            }
-        }
+    async fn commit_with_context(
+        &self,
+        context: &CommitRequestContext,
+        _auth: &NfsAuthContext,
+        fileid: fileid3,
+        offset: u64,
+        count: u32,
+    ) -> Result<CommitResult, nfsstat3> {
+        debug!(
+            xid = context.rpc.xid,
+            connection_incarnation = context.rpc.connection_incarnation,
+            fileid,
+            offset,
+            count,
+            "processing contextual NFS COMMIT",
+        );
+        Ok(CommitResult {
+            verifier: self.commit_current_cutoff(fileid).await?,
+        })
+    }
+
+    fn get_write_verf(&self) -> writeverf3 {
+        self.service_identity.write_verifier
     }
 
     async fn fsinfo(&self, auth: &NfsAuthContext, id: fileid3) -> Result<fsinfo3, nfsstat3> {
@@ -481,7 +619,25 @@ pub async fn start_nfs_server_with_config(
     shutdown: CancellationToken,
     shared_identity: Option<NfsSharedIdentity>,
 ) -> anyhow::Result<()> {
-    let adapter = NFSAdapter::new(filesystem).with_shared_identity(shared_identity);
+    start_nfs_server_with_service_identity(
+        filesystem,
+        socket,
+        shutdown,
+        shared_identity,
+        NfsServiceIdentity::new(),
+    )
+    .await
+}
+
+pub(crate) async fn start_nfs_server_with_service_identity(
+    filesystem: Arc<ZeroFS>,
+    socket: SocketAddr,
+    shutdown: CancellationToken,
+    shared_identity: Option<NfsSharedIdentity>,
+    service_identity: NfsServiceIdentity,
+) -> anyhow::Result<()> {
+    let adapter = NFSAdapter::with_service_identity(filesystem, service_identity)
+        .with_shared_identity(shared_identity);
     let listener = NFSTcpListener::bind(socket, adapter)
         .await
         .map_err(|e| crate::net_util::tcp_bind_error("NFS", socket, &e))?;
@@ -491,6 +647,10 @@ pub async fn start_nfs_server_with_config(
     listener.handle_with_shutdown(shutdown).await?;
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "nfs/typed_durability_tests.rs"]
+mod tests_typed_durability;
 
 #[cfg(test)]
 mod tests {
