@@ -719,6 +719,13 @@ then sustains replacement/GC overlap while concurrently running a hard NFSv3 wri
 with delayed replies/retransmits, native 9P and WebUI requests, segment sealing, and GC. Sample
 `memory.current`, `memory.events`, allocator metrics, every resident owner, protocol
 in-flight bytes/ops, cache replacement, and GC working bytes at one-second resolution.
+OS RSS and cgroup current are the physical authorities. Record jemalloc allocated,
+resident, and retained separately; retained is virtual address space and is never added
+to resident or used alone to trigger admission. Include a retained-only growth/purge
+leg that raises `stats.retained` without a matching RSS/cgroup increase and prove it
+does not create false permanent over-cap or poison. The GC overlap includes one full
+1,024-frame sparse/interleaved candidate and requires at most 32 memory+durable scans,
+no per-frame point-read fanout, and bounded scan working memory.
 Before the first process starts, the immutable ledger records these fixed thresholds:
 `cgroup_high_event_delta_max=8`, `reconciliation_error_bytes_max=268435456`, and
 `unowned_residual_bytes_max=2147483648`. They cannot be supplied by scenario output,
@@ -814,6 +821,10 @@ Name dependency-free RED tests that reject:
   being substituted for resident-memory proof;
 - missing pre-run cgroup thresholds, a post-run threshold mutation, `high` delta above
   eight, reconciliation error above 256 MiB, or unowned residual above 2 GiB;
+- physical residency computed as jemalloc resident plus retained, retained-only growth
+  causing backpressure, or a mismatch with OS RSS/cgroup current;
+- a sparse/interleaved full segment issuing more than 32 verification scans or scaling
+  maintenance memory with all 2,048 would-be point reads;
 - an HPN result without exact executable identity, a direction label, or per-session
   byte evidence;
 - an HPN suite without the pinned `LTESTS` inventory, with an exclusion other than
@@ -830,7 +841,9 @@ The memory suite names
 `test_memory_thresholds_must_be_fixed_before_run`,
 `test_high_event_delta_above_eight_is_rejected`,
 `test_reconciliation_error_above_256_mib_is_rejected`, and
-`test_unowned_residual_above_2_gib_is_rejected`. The SFTP suite names
+`test_unowned_residual_above_2_gib_is_rejected`,
+`test_retained_virtual_bytes_are_not_physical_rss`, and
+`test_sparse_interleaved_segment_scan_count_is_bounded`. The SFTP suite names
 `test_missing_executable_identity_is_rejected`,
 `test_hpn_inventory_and_single_exclusion_are_required`,
 `test_hpn_timeout_must_reap_process_group`,
@@ -962,11 +975,13 @@ The existing historical NBD/raw-SFTP scripts remain developer controls, not fina
 Commit C7, review/push it, synchronize the literal SHA to Ubuntu, then run
 `sftp-stock-vs-hpn-download`, `sftp-stock-vs-hpn-upload`, and
 `zerofs-sftp-session-scaling` through `supervise`. A decision receipt records paired
-median/MAD bands and two typed booleans: `decision.hpn_receive_winner` and
-`decision.zerofs_upload_gap`. Both may be true. When both are false, the receipt must
-also prove HPN parity and ZeroFS parity with its same-session raw control before stock
-is retained. A true HPN flag executes Step 2; a true upload-gap flag executes Step 3;
-both true executes both steps.
+median/MAD bands and typed booleans `decision.hpn_receive_winner`,
+`decision.zerofs_upload_gap_detected`, and `decision.zerofs_upload_gap_resolved`. An
+initial gap executes Step 3 and requires the final authority to set `resolved=true`,
+record the 40-hex correction SHA, and point to the manifest-covered complete A/B rerun
+receipt. HPN win and initial upload gap may both be true, so both corrections execute.
+When no gap was detected, the receipt still proves ZeroFS parity with its same-session
+raw control and records `resolved=true` before stock is retained.
 
 A missing/inconclusive decision reruns the A/B; it cannot select stock by default.
 The raw upload control requests SFTP fsync (`sftp -f`) and uses the same number of
@@ -1186,9 +1201,17 @@ test -s "$C7B_DECISION_LEDGER"
 C7B_DECISION_RECEIPT="$(python3 scripts/tiered-writeback-e2e.py ledger-value --ledger "$C7B_DECISION_LEDGER" --key decision_receipt)"
 python3 scripts/tiered-writeback-e2e.py validate-owned-path --ledger "$C7B_DECISION_LEDGER" --path "$C7B_DECISION_RECEIPT" --kind archived-receipt
 HPN_RECEIVE_WINNER="$(python3 scripts/tiered-writeback-e2e.py ledger-value --ledger "$C7B_DECISION_LEDGER" --key decision.hpn_receive_winner)"
-ZEROFS_UPLOAD_GAP="$(python3 scripts/tiered-writeback-e2e.py ledger-value --ledger "$C7B_DECISION_LEDGER" --key decision.zerofs_upload_gap)"
+ZEROFS_UPLOAD_GAP_DETECTED="$(python3 scripts/tiered-writeback-e2e.py ledger-value --ledger "$C7B_DECISION_LEDGER" --key decision.zerofs_upload_gap_detected)"
+ZEROFS_UPLOAD_GAP_RESOLVED="$(python3 scripts/tiered-writeback-e2e.py ledger-value --ledger "$C7B_DECISION_LEDGER" --key decision.zerofs_upload_gap_resolved)"
 case "$HPN_RECEIVE_WINNER" in true|false) ;; *) exit 1 ;; esac
-case "$ZEROFS_UPLOAD_GAP" in true|false) ;; *) exit 1 ;; esac
+case "$ZEROFS_UPLOAD_GAP_DETECTED" in true|false) ;; *) exit 1 ;; esac
+test "$ZEROFS_UPLOAD_GAP_RESOLVED" = true
+if test "$ZEROFS_UPLOAD_GAP_DETECTED" = true; then
+  ZEROFS_UPLOAD_CORRECTION_SHA="$(python3 scripts/tiered-writeback-e2e.py ledger-value --ledger "$C7B_DECISION_LEDGER" --key decision.upload_correction_sha)"
+  test "${#ZEROFS_UPLOAD_CORRECTION_SHA}" = 40
+  ZEROFS_UPLOAD_RERUN_RECEIPT="$(python3 scripts/tiered-writeback-e2e.py ledger-value --ledger "$C7B_DECISION_LEDGER" --key decision.upload_rerun_receipt)"
+  python3 scripts/tiered-writeback-e2e.py validate-owned-path --ledger "$C7B_DECISION_LEDGER" --path "$ZEROFS_UPLOAD_RERUN_RECEIPT" --kind archived-receipt
+fi
 if test "$HPN_RECEIVE_WINNER" = true; then
   run_final_scenario materialized remote hpn-package-winner
 fi

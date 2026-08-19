@@ -38,7 +38,10 @@ the process-local 9P replay identities, so a retried mutation correctly failed c
 as `EOPIDSTALE`. This proves that successful RAM-to-SSD drain and payload-only cache
 limits are not a server-resident-memory safety proof. The implementation must account
 for cache metadata and replacement overlap, allocator overhead, protocol request
-bodies, maintenance working sets, and explicit headroom before production reuse.
+bodies, maintenance working sets, and explicit headroom before production reuse. The
+incident metric also overcounted physical memory by summing jemalloc `resident` and
+`retained`; retained virtual mappings are diagnostic, not physical RSS. OS RSS and
+cgroup `memory.current` remain the physical authorities.
 
 The namespaces remain deliberately separate. An XFS filesystem inside an NBD
 export is not the same namespace as ZeroFS files served directly over NFS or 9P.
@@ -376,7 +379,11 @@ All canonical writes are write-no-allocate for the clean decoded read cache.
 Pending reads remain coherent through the mutation overlay and canonical store, but a
 chunked NFS rsync cannot fill the clean read cache. Subsequent reads populate the
 cache normally. Segment GC and compaction group adjacent source ranges into bounded
-sequential scans and use explicit no-admit/no-fill reads. Any later write-admission or maintenance-cache
+sequential scans and use explicit no-admit/no-fill reads. Reclaim verification also
+batches sparse/interleaved forward keys: a full 1,024-frame segment uses no more than
+16 fixed 64-key batches and two streaming views, for at most 32 scans rather than
+2,048 point reads. Scan/decode errors and either view retaining a reference fail closed.
+Any later write-admission or maintenance-cache
 exception requires its own bounded policy and measured RED/GREEN proof.
 
 The coordinator maintains an interval overlay per inode. Reads merge the newest
@@ -614,7 +621,8 @@ Metrics and status expose at least:
 - charged payload and estimated overhead/replacement bytes for each cache owner;
 - protocol in-flight bytes/ops/waiters by bounded protocol class;
 - GC/compaction working bytes and no-admit read counts;
-- allocator allocated/resident/retained bytes;
+- allocator allocated/resident/retained bytes, with retained labeled virtual and never
+  added to resident as physical pressure; OS RSS/cgroup current are reported separately;
 - selected SFTP executable identity, per-direction physical sessions, request depth,
   session waits, and per-session/aggregate bytes;
 - logical read bytes, resolved extent/run fanout, active backend read lanes,
@@ -668,7 +676,10 @@ Implementation follows strict RED/GREEN slices. The required proof matrix includ
     stays below the effective limit by the configured reserve, records at setup the
     immutable limits `high delta <= 8`, reconciliation error `<= 256 MiB`, and unowned
     residual `<= 2 GiB`, reconciles owned, baseline, and residual residency within
-    those limits, and records zero cgroup `oom`/`oom_kill` deltas.
+    those limits, records zero cgroup `oom`/`oom_kill` deltas, and proves retained-only
+    virtual growth cannot create false physical over-cap/backpressure. The same soak
+    verifies a sparse/interleaved 1,024-frame reclaim candidate stays within 32 scans
+    and bounded maintenance memory.
 18. stock OpenSSH versus pinned HPN versus ZeroFS SFTP A/Bs for upload and download at
     one and configured-many sessions. Each cell records executable identity, RTT,
     TCP window/retransmits, SFTP depth, lane utilization, exact bytes, SHA-256, and
@@ -752,10 +763,12 @@ If pinned HPN wins a receiving path, allow the explicitly configured absolute bi
 and land its immutable packaging/deployment selection without replacing system SSH.
 If upload remains below its raw same-session control, land the measured request-depth
 or physical-session scheduling correction and rerun the A/B. A benchmark-only binary
-or dormant selector is not completion. The receive-win and upload-gap results are
-independent typed flags in one validated archived decision receipt, so their combined
-outcome executes both corrections and cannot be replaced by a free-form environment
-value. Receiver-window evidence alone cannot justify an upload claim.
+or dormant selector is not completion. The receive-win, upload-gap-detected, and
+upload-gap-resolved results are independent typed fields in one validated archived
+decision receipt. A detected gap requires its correction SHA and complete-rerun receipt,
+and the final resolved flag must be true; the combined outcome executes both corrections
+and cannot be replaced by a free-form environment value. Receiver-window evidence alone
+cannot justify an upload claim.
 
 ### Phase 4: Repository and Linux proof
 
