@@ -152,14 +152,17 @@ run() {
 }
 
 assert_managed_state_child() {
-  local path=$1 expected_uid=$2 expected_gid=$3 expected_mode=${4#0} actual
+  local path=$1 expected_uid=$2 expected_gid=$3 expected_mode=${4#0}
+  local compatible_mode=${5:-} actual
+  compatible_mode=${compatible_mode#0}
   if [[ -L $path || ( -e $path && ! -d $path ) ]]; then
     echo "unsafe managed state child (expected directory, never a symlink): $path" >&2
     return 1
   fi
   [[ -e $path ]] || return 0
   actual=$(stat -c '%u:%g:%a' -- "$path")
-  if [[ $actual != "$expected_uid:$expected_gid:$expected_mode" ]]; then
+  if [[ $actual != "$expected_uid:$expected_gid:$expected_mode" \
+    && ( -z $compatible_mode || $actual != "$expected_uid:$expected_gid:$compatible_mode" ) ]]; then
     echo "unsafe managed state child ownership/mode: $path ($actual)" >&2
     return 1
   fi
@@ -184,7 +187,7 @@ prepare_managed_state_tree() {
     fi
     assert_managed_state_child "$state_root/releases" 0 0 0755
     assert_managed_state_child "$state_root/receipts" 0 0 0755
-    assert_managed_state_child "$state_root/rollback" 0 0 0755
+    assert_managed_state_child "$state_root/rollback" 0 0 0700 0755
     assert_managed_state_child "$state_root/deployment-transaction" 0 0 0700
     assert_managed_state_child "$state_root/state" 100000 100000 0750
     assert_managed_state_child "$state_root/cache" 100000 100000 0750
@@ -1094,7 +1097,8 @@ if [[ $dry_run == false ]]; then
   fi
   printf '%s\n' "$expected_marker" >"$marker"
 fi
-run install -d -o 0 -g 0 -m 0755 "$state_root/releases" "$state_root/receipts" "$state_root/rollback"
+run install -d -o 0 -g 0 -m 0755 "$state_root/releases" "$state_root/receipts"
+run install -d -o 0 -g 0 -m 0700 "$state_root/rollback"
 run install -d -o 100000 -g 100000 -m 0750 "$state_root/state" "$state_root/cache"
 if [[ $role == dev ]]; then
   run install -d -o 100000 -g 100000 -m 0750 "$state_root/backend-dev"
