@@ -600,7 +600,7 @@ mod tests {
     fn fingerprint_auth_or_stability_mismatch_is_rejected() {
         let cache = RequestCache::new(8);
         let identity = RequestIdentity::NineP {
-            session_incarnation: 1,
+            origin_epoch: 1,
             operation_id: [9; 16],
         };
         let pending = expect_vacant(

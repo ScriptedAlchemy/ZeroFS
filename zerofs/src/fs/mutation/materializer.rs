@@ -5,6 +5,7 @@
 //! has been applied. The first post-ack failure poisons progress and
 //! freezes the overlay so clients keep the last coherent view.
 
+use crate::dedup::AcceptedWriteLifecycle;
 use crate::fs::ZeroFS;
 use crate::fs::mutation::overlay::FilesystemVolatileOverlay;
 use crate::fs::mutation::progress::MutationProgress;
@@ -38,6 +39,7 @@ enum LaneJob {
     Apply {
         cutoff: MutationCutoff,
         batch: PreparedWriteBatch,
+        accepted_write: Option<AcceptedWriteLifecycle>,
         reply: oneshot::Sender<Result<(), MutationError>>,
     },
     Hold {
@@ -126,6 +128,25 @@ impl Materializer {
         cutoff: MutationCutoff,
         batch: PreparedWriteBatch,
     ) -> Result<(), MutationError> {
+        self.dispatch_through_owned(cutoff, batch, None).await
+    }
+
+    pub(crate) async fn dispatch_accepted_through(
+        self: &Arc<Self>,
+        cutoff: MutationCutoff,
+        batch: PreparedWriteBatch,
+        accepted_write: AcceptedWriteLifecycle,
+    ) -> Result<(), MutationError> {
+        self.dispatch_through_owned(cutoff, batch, Some(accepted_write))
+            .await
+    }
+
+    async fn dispatch_through_owned(
+        self: &Arc<Self>,
+        cutoff: MutationCutoff,
+        batch: PreparedWriteBatch,
+        accepted_write: Option<AcceptedWriteLifecycle>,
+    ) -> Result<(), MutationError> {
         if cutoff.mutation_incarnation != self.inner.incarnation {
             return Err(MutationError::StaleIncarnation);
         }
@@ -144,6 +165,9 @@ impl Materializer {
         }
         if inodes.is_empty() {
             self.record_success(cutoff)?;
+            if let Some(accepted_write) = accepted_write {
+                accepted_write.finish(true);
+            }
             return Ok(());
         }
 
@@ -154,6 +178,7 @@ impl Materializer {
                 .send(LaneJob::Apply {
                     cutoff,
                     batch,
+                    accepted_write,
                     reply: reply_tx,
                 })
                 .map_err(|_| self.poison("inode worker dropped"))?;
@@ -205,7 +230,7 @@ impl Materializer {
                 .map_err(|_| self.poison("inode worker dropped"))?;
         }
 
-        let result = self.apply_caught(cutoff, batch).await;
+        let result = self.apply_caught(cutoff, batch, accepted_write).await;
         for (_, release) in holds {
             let _ = release.send(());
         }
@@ -272,16 +297,21 @@ impl Materializer {
         &self,
         cutoff: MutationCutoff,
         batch: PreparedWriteBatch,
+        accepted_write: Option<AcceptedWriteLifecycle>,
     ) -> Result<(), MutationError> {
         let apply = AssertUnwindSafe(self.apply_batch(cutoff, batch)).catch_unwind();
-        match apply.await {
+        let result = match apply.await {
             Ok(Ok(())) => self.record_success(cutoff),
             Ok(Err(error)) => {
                 let message = error.to_string();
                 Err(self.poison(message))
             }
             Err(_) => Err(self.poison("materializer worker panicked")),
+        };
+        if let Some(accepted_write) = accepted_write {
+            accepted_write.finish(result.is_ok());
         }
+        result
     }
 
     async fn apply_batch(
@@ -333,9 +363,12 @@ fn spawn_lane(
                 LaneJob::Apply {
                     cutoff,
                     batch,
+                    accepted_write,
                     reply,
                 } => {
-                    let result = materializer.apply_caught(cutoff, batch).await;
+                    let result = materializer
+                        .apply_caught(cutoff, batch, accepted_write)
+                        .await;
                     let _ = reply.send(result);
                 }
                 LaneJob::Hold { acquired, release } => {
@@ -424,6 +457,32 @@ mod tests {
         batch
     }
 
+    async fn prepare_with_op_id(
+        fs: &ZeroFS,
+        auth: AuthContext,
+        id: u64,
+        data: &'static [u8],
+        op_id: crate::dedup::OpId,
+    ) -> PreparedWriteBatch {
+        let mut batch = prepare_write(
+            &fs.write_prepare_context(),
+            PrepareWriteRequest {
+                members: vec![PrepareWriteMember {
+                    id,
+                    offset: 0,
+                    data: Bytes::from_static(data),
+                }],
+                auth,
+                op_id,
+                check_permissions: true,
+            },
+        )
+        .await
+        .unwrap();
+        batch.guards = None;
+        batch
+    }
+
     async fn prepare_striped(
         fs: &ZeroFS,
         auth: AuthContext,
@@ -503,6 +562,112 @@ mod tests {
             *order.lock().unwrap(),
             vec![("start", 1), ("end", 1), ("start", 2), ("end", 2)]
         );
+        materializer.stop().await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_dispatch_waiter_does_not_abandon_accepted_write_lifecycle() {
+        let (fs, auth) = filesystem().await;
+        let inode = create_file(&fs, &auth, b"cancelled-waiter.txt").await;
+        let op_id = [0x71; 16];
+        let fingerprint = [0x19; 32];
+        let accepted_write = fs.dedup.begin_accepted_write(
+            crate::dedup::DedupEntry {
+                op_id,
+                result: crate::dedup::DedupResult::Write {
+                    attrs: crate::fs::types::FileAttributes::default(),
+                },
+            },
+            fingerprint,
+            4,
+        );
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let hook: ApplyHook = {
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            Arc::new(move |_cutoff, _batch| {
+                let entered = Arc::clone(&entered);
+                let release = Arc::clone(&release);
+                Box::pin(async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    Ok(())
+                })
+            })
+        };
+        let incarnation = MutationIncarnation::new();
+        let materializer = Materializer::start_with_hook(
+            incarnation,
+            Arc::downgrade(&fs),
+            fs.volatile_overlay.get().cloned(),
+            Some(hook),
+        );
+        let waiter = tokio::spawn({
+            let materializer = Arc::clone(&materializer);
+            let batch = prepare_with_op_id(&fs, auth, inode, b"data", op_id).await;
+            async move {
+                materializer
+                    .dispatch_accepted_through(cutoff(incarnation, 1), batch, accepted_write)
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        assert!(fs.dedup.accepted_write_pending(&op_id));
+
+        release.notify_one();
+        materializer
+            .progress()
+            .wait_materialized(cutoff(incarnation, 1))
+            .await
+            .unwrap();
+        assert!(!fs.dedup.accepted_write_pending(&op_id));
+        assert_eq!(
+            fs.dedup.replay_write(&op_id, fingerprint),
+            Some(crate::dedup::WriteReplay::Match { count: 4 })
+        );
+        materializer.stop().await;
+    }
+
+    #[tokio::test]
+    async fn failed_materializer_job_retracts_accepted_write_result() {
+        let (fs, auth) = filesystem().await;
+        let inode = create_file(&fs, &auth, b"failed-job.txt").await;
+        let op_id = [0x72; 16];
+        let fingerprint = [0x29; 32];
+        let accepted_write = fs.dedup.begin_accepted_write(
+            crate::dedup::DedupEntry {
+                op_id,
+                result: crate::dedup::DedupResult::Write {
+                    attrs: crate::fs::types::FileAttributes::default(),
+                },
+            },
+            fingerprint,
+            4,
+        );
+        let hook: ApplyHook = Arc::new(move |_cutoff, _batch| {
+            Box::pin(async move { Err(MutationError::Poisoned("injected failure".into())) })
+        });
+        let incarnation = MutationIncarnation::new();
+        let materializer = Materializer::start_with_hook(
+            incarnation,
+            Arc::downgrade(&fs),
+            fs.volatile_overlay.get().cloned(),
+            Some(hook),
+        );
+        let batch = prepare_with_op_id(&fs, auth, inode, b"data", op_id).await;
+        assert!(
+            materializer
+                .dispatch_accepted_through(cutoff(incarnation, 1), batch, accepted_write)
+                .await
+                .is_err()
+        );
+        assert!(!fs.dedup.accepted_write_pending(&op_id));
+        assert_eq!(fs.dedup.replay_write(&op_id, fingerprint), None);
         materializer.stop().await;
     }
 

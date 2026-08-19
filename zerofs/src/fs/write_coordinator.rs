@@ -64,7 +64,11 @@ type Reply = oneshot::Sender<Result<(), FsError>>;
 // Boxing `Commit` would add an allocation to the hot path.
 #[allow(clippy::large_enum_variant)]
 enum Request {
-    Commit(Transaction, Reply),
+    Commit(
+        Transaction,
+        Option<crate::dedup::PendingWriteRequest>,
+        Reply,
+    ),
     Barrier(Reply),
 }
 
@@ -194,10 +198,26 @@ impl WriteCoordinator {
     /// Awaiting `commit` after releasing the lock would give neither
     /// guarantee: two writers could reach the send in either order.
     pub(crate) fn submit(&self, txn: Transaction) -> Result<PendingCommit, FsError> {
+        self.submit_owned(txn, None)
+    }
+
+    pub(crate) fn submit_with_write_request(
+        &self,
+        txn: Transaction,
+        pending_write_request: crate::dedup::PendingWriteRequest,
+    ) -> Result<PendingCommit, FsError> {
+        self.submit_owned(txn, Some(pending_write_request))
+    }
+
+    fn submit_owned(
+        &self,
+        txn: Transaction,
+        pending_write_request: Option<crate::dedup::PendingWriteRequest>,
+    ) -> Result<PendingCommit, FsError> {
         let queued = self.inode_store.install_pending(txn.inode_cache_updates());
         let (reply_tx, reply_rx) = oneshot::channel();
         self.sender
-            .send(Request::Commit(txn, reply_tx))
+            .send(Request::Commit(txn, pending_write_request, reply_tx))
             .map_err(|_| FsError::IoError)?;
         Ok(PendingCommit {
             reply: reply_rx,
@@ -297,7 +317,7 @@ impl WeakWriteCoordinator {
         let _queued = self.inode_store.install_pending(txn.inode_cache_updates());
         let (reply_tx, reply_rx) = oneshot::channel();
         sender
-            .send(Request::Commit(txn, reply_tx))
+            .send(Request::Commit(txn, None, reply_tx))
             .map_err(|_| FsError::IoError)?;
         reply_rx.await.map_err(|_| FsError::IoError)?
     }
@@ -461,18 +481,22 @@ async fn worker_loop(
                 commit
             }
         };
-        let (txn, reply) = match first {
-            Request::Commit(txn, reply) => (txn, reply),
+        let (txn, pending_write_request, reply) = match first {
+            Request::Commit(txn, pending_write_request, reply) => {
+                (txn, pending_write_request, reply)
+            }
             Request::Barrier(reply) => {
                 let _ = reply.send(Ok(()));
                 continue;
             }
         };
-        let mut batch = vec![(txn, reply)];
+        let mut batch = vec![(txn, pending_write_request, reply)];
         let mut barrier_reply = None;
         while let Ok(msg) = rx.try_recv() {
             match msg {
-                Request::Commit(txn, reply) => batch.push((txn, reply)),
+                Request::Commit(txn, pending_write_request, reply) => {
+                    batch.push((txn, pending_write_request, reply));
+                }
                 Request::Barrier(reply) => {
                     barrier_reply = Some(reply);
                     break;
@@ -506,14 +530,29 @@ async fn worker_loop(
         > = HashMap::new();
         let mut shard_deltas: HashMap<usize, (i64, i64)> = HashMap::new();
         let mut seg_map: HashMap<bytes::Bytes, (i64, i64)> = HashMap::new();
-        let mut batch_dedup_entries: Vec<crate::dedup::DedupEntry> = Vec::new();
-        for (mut txn, reply) in batch {
+        let mut batch_dedup_entries: Vec<(
+            crate::dedup::DedupEntry,
+            Option<crate::dedup::PendingWriteRequest>,
+        )> = Vec::new();
+        // Replay metadata is carried beside its exact canonical transaction.
+        // It never depends on caller-owned cache state after queue submission.
+        let mut invalid_write_request = false;
+        for (mut txn, pending_write_request, reply) in batch {
             if let Some(guard) = txn.take_extent_ref_guard() {
                 extent_ref_guards.push(guard);
             }
             any_ops |= !txn.is_empty();
-            if let Some(entry) = txn.take_dedup_entry() {
-                batch_dedup_entries.push(entry);
+            match (txn.take_dedup_entry(), pending_write_request) {
+                (Some(entry), Some(request)) if entry.op_id == request.op_id() => {
+                    batch_dedup_entries.push((entry, Some(request)));
+                }
+                (Some(entry), None) => batch_dedup_entries.push((entry, None)),
+                (Some(entry), Some(_)) => {
+                    invalid_write_request = true;
+                    batch_dedup_entries.push((entry, None));
+                }
+                (None, Some(_)) => invalid_write_request = true,
+                (None, None) => {}
             }
             for (inode_id, inode) in txn.take_inode_cache_updates() {
                 inode_cache_updates.insert(inode_id, inode);
@@ -546,6 +585,16 @@ async fn worker_loop(
                 txn.apply_to(&mut merged);
             }
             replies.push(reply);
+        }
+
+        if invalid_write_request {
+            for reply in replies {
+                let _ = reply.send(Err(FsError::InvalidData));
+            }
+            if let Some(reply) = barrier_reply {
+                let _ = reply.send(Err(FsError::InvalidData));
+            }
+            continue;
         }
 
         // The byte dimension is derived here, against what this batch is about
@@ -657,6 +706,11 @@ async fn worker_loop(
             repl_ops = ctx.extent_store.enrich_repl_ops(repl_ops);
         }
 
+        let replicated_dedup_entries: Vec<_> = batch_dedup_entries
+            .iter()
+            .map(|(entry, _)| entry.clone())
+            .collect();
+
         // Dedup-only outcomes follow the same ordered replication path.
         let has_logical_work = any_ops || !batch_dedup_entries.is_empty();
 
@@ -665,7 +719,7 @@ async fn worker_loop(
         let mut deposed = false;
         let mut apply_permit = match (has_logical_work, ctx.replicator.as_mut()) {
             (true, Some(repl)) => loop {
-                match repl.ship(&repl_ops, &batch_dedup_entries).await {
+                match repl.ship(&repl_ops, &replicated_dedup_entries).await {
                     ShipOutcome::Apply(permit) => break Some(permit),
                     ShipOutcome::NeedsBaseFlush(required) => {
                         let through = required.through().get();
@@ -827,8 +881,13 @@ async fn worker_loop(
             local_applied = true;
         }
         if local_applied {
-            for entry in batch_dedup_entries {
-                ctx.dedup.record_entry(entry);
+            for (entry, request) in batch_dedup_entries {
+                match request {
+                    Some(request) => {
+                        ctx.dedup.record_entry_with_pending_write(entry, request);
+                    }
+                    None => ctx.dedup.record_entry(entry),
+                }
             }
         }
 
@@ -1409,7 +1468,7 @@ mod tests {
         head.put_bytes(&codec.extent_key(1, 0), Bytes::from_static(b"head"));
         fs.write_coordinator
             .sender
-            .send(Request::Commit(head, head_reply))
+            .send(Request::Commit(head, None, head_reply))
             .unwrap();
         replies.push(head_rx);
         apply_reached.await.unwrap();
@@ -1420,7 +1479,7 @@ mod tests {
             txn.put_bytes(&codec.extent_key(1, i), Bytes::from_static(b"tail"));
             fs.write_coordinator
                 .sender
-                .send(Request::Commit(txn, reply_tx))
+                .send(Request::Commit(txn, None, reply_tx))
                 .unwrap();
             replies.push(reply_rx);
         }
@@ -1525,7 +1584,7 @@ mod tests {
         let (reply_tx, _reply_rx) = oneshot::channel();
         fs.write_coordinator
             .sender
-            .send(Request::Commit(txn, reply_tx))
+            .send(Request::Commit(txn, None, reply_tx))
             .unwrap();
         fs.write_coordinator.barrier().await.unwrap();
 
