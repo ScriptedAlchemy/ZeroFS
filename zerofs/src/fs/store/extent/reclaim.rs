@@ -15,6 +15,7 @@ use crate::fs::key_codec::KeyCodec;
 use crate::fs::metrics::SegmentGcPass;
 use crate::segment::{DirEntry, FrameLoc, Segid};
 use crate::segment_store::SegmentStoreError;
+use anyhow::Context;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures::Stream;
@@ -24,7 +25,7 @@ use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 /// Compaction thresholds. A live segment is a candidate when *fragmented*
 /// (live bytes below this percent of total) or *small* (below
@@ -1002,7 +1003,10 @@ impl ExtentStore {
         let mut dir = match self.segments.read_directory(segid, false).await {
             Ok(d) => d,
             Err(SegmentStoreError::NotFound) => return SegmentDeadVerdict::ObjectAbsent,
-            Err(_) => return SegmentDeadVerdict::Keep,
+            Err(error) => {
+                warn!("segment {segid:?} directory read failed; keeping: {error:#}");
+                return SegmentDeadVerdict::Keep;
+            }
         };
         dir.sort_unstable_by_key(dir_entry_key);
         dir.dedup_by_key(|entry| dir_entry_key(entry));
@@ -1012,7 +1016,10 @@ impl ExtentStore {
         match self.directory_still_referenced(segid, &dir).await {
             Ok(true) => SegmentDeadVerdict::Keep,
             Ok(false) => SegmentDeadVerdict::Reclaim,
-            Err(()) => SegmentDeadVerdict::Keep,
+            Err(error) => {
+                warn!("segment {segid:?} verify failed; keeping: {error:#}");
+                SegmentDeadVerdict::Keep
+            }
         }
     }
 
@@ -1023,10 +1030,9 @@ impl ExtentStore {
         &self,
         segid: Segid,
         want: &[DirEntry],
-    ) -> Result<bool, ()> {
-        let Some(ranges) = extent_scan_ranges(&self.key_codec, want) else {
-            return Err(());
-        };
+    ) -> anyhow::Result<bool> {
+        let ranges = extent_scan_ranges(&self.key_codec, want)
+            .context("unrepresentable extent verification range")?;
         for durable in [false, true] {
             for range in &ranges {
                 if self
@@ -1053,7 +1059,7 @@ impl ExtentStore {
         range: std::ops::Range<Bytes>,
         durable: bool,
         limits: VerifyPageLimits,
-    ) -> Result<bool, ()> {
+    ) -> anyhow::Result<bool> {
         if range.start >= range.end {
             return Ok(false);
         }
@@ -1062,7 +1068,12 @@ impl ExtentStore {
         } else {
             self.db.scan_bounded(range).await
         }
-        .map_err(|_| ())?;
+        .with_context(|| {
+            format!(
+                "failed to start {} extent verification scan",
+                if durable { "durable" } else { "memory" }
+            )
+        })?;
         self.inspect_extent_stream(segid, want, stream, limits)
             .await
     }
@@ -1073,17 +1084,23 @@ impl ExtentStore {
         want: &[DirEntry],
         mut stream: ExtentScanStream<'_>,
         limits: VerifyPageLimits,
-    ) -> Result<bool, ()> {
+    ) -> anyhow::Result<bool> {
         let mut budget = VerifyPageBudget::default();
         let mut want_index = None;
         while let Some(item) = stream.next().await {
-            let (key, val) = item.map_err(|_| ())?;
+            let (key, val) = item.context("extent scan item")?;
             if budget.full(limits) {
                 budget = VerifyPageBudget::default();
             }
             if budget.charge(&key, &val, limits).is_err() {
                 budget = VerifyPageBudget::default();
-                budget.charge(&key, &val, limits)?;
+                budget.charge(&key, &val, limits).map_err(|()| {
+                    anyhow::anyhow!(
+                        "extent scan row exceeds page budget (key {} bytes, value {} bytes)",
+                        key.len(),
+                        val.len()
+                    )
+                })?;
             }
 
             if let Some(logical) = self.key_codec.parse_extent_key_full(&key) {
@@ -1097,7 +1114,11 @@ impl ExtentStore {
                     match FrameLoc::decode(&val) {
                         Some(loc) if loc.segid == segid => return Ok(true),
                         Some(_) => {}
-                        None => return Err(()),
+                        None => anyhow::bail!(
+                            "undecodable FrameLoc at inode {} extent {}",
+                            logical.0,
+                            logical.1
+                        ),
                     }
                 }
             }
@@ -1239,17 +1260,45 @@ mod tests {
             "injected scan item failure"
         ))]));
 
+        let error = store
+            .inspect_extent_stream(
+                Segid::new(7, 1),
+                &[test_dir_entry(1, 0)],
+                stream,
+                VERIFY_PAGE_LIMITS,
+            )
+            .await
+            .unwrap_err();
+        let report = format!("{error:?}");
         assert!(
-            store
-                .inspect_extent_stream(
-                    Segid::new(7, 1),
-                    &[test_dir_entry(1, 0)],
-                    stream,
-                    VERIFY_PAGE_LIMITS,
-                )
-                .await
-                .is_err(),
-            "a mid-stream database error must fail closed"
+            report.contains("extent scan item") && report.contains("injected scan item failure"),
+            "a mid-stream failure must retain its operation and source: {report}"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_malformed_wanted_row_reports_its_logical_location() {
+        let (store, _db) = make().await;
+        let inode = 7;
+        let extent = 42;
+        let stream: ExtentScanStream<'_> = Box::pin(futures::stream::iter([Ok((
+            store.key_codec.extent_key(inode, extent),
+            Bytes::from_static(b"not-a-frame-location"),
+        ))]));
+
+        let error = store
+            .inspect_extent_stream(
+                Segid::new(7, 1),
+                &[test_dir_entry(inode, extent)],
+                stream,
+                VERIFY_PAGE_LIMITS,
+            )
+            .await
+            .unwrap_err();
+        let report = format!("{error:?}");
+        assert!(
+            report.contains("undecodable FrameLoc at inode 7 extent 42"),
+            "the decode failure must identify its logical location: {report}"
         );
     }
 
@@ -1356,9 +1405,11 @@ mod tests {
         let memory_before = db.scan_call_count();
         let durable_before = db.durable_scan_call_count();
         let points_before = db.point_read_call_count();
-        assert_eq!(
-            store.directory_still_referenced(target, &want).await,
-            Ok(true),
+        assert!(
+            matches!(
+                store.directory_still_referenced(target, &want).await,
+                Ok(true)
+            ),
             "the final sparse memory reference must fail closed"
         );
         assert!(
@@ -1428,9 +1479,11 @@ mod tests {
         let memory_before = db.scan_call_count();
         let durable_before = db.durable_scan_call_count();
         let points_before = db.point_read_call_count();
-        assert_eq!(
-            store.directory_still_referenced(target, &want).await,
-            Ok(true),
+        assert!(
+            matches!(
+                store.directory_still_referenced(target, &want).await,
+                Ok(true)
+            ),
             "a reference masked only in memory must remain visible durably and fail closed"
         );
         assert!(
@@ -1519,9 +1572,11 @@ mod tests {
         let memory_before = db.scan_call_count();
         let durable_before = db.durable_scan_call_count();
         let points_before = db.point_read_call_count();
-        assert_eq!(
-            store.directory_still_referenced(segid, &want).await,
-            Ok(false),
+        assert!(
+            matches!(
+                store.directory_still_referenced(segid, &want).await,
+                Ok(false)
+            ),
             "both views must prove the full directory unreferenced"
         );
         let memory_scans = db.scan_call_count() - memory_before;
