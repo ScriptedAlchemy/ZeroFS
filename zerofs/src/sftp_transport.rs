@@ -134,7 +134,7 @@ const SFTP_DIRECTORY_CACHE_MAX_ENTRIES: usize = 64 * 1024;
 /// concurrent operations sharing one connection hide the WAN RTT instead of
 /// serializing on it; the cap keeps one session's request window and remote
 /// handle usage bounded.
-const SFTP_SESSION_MAX_CONCURRENT_OPS: usize = 16;
+pub(crate) const SFTP_SESSION_MAX_CONCURRENT_OPS: usize = 16;
 
 /// Concurrent metadata operations admitted across the pool. Metadata requests
 /// move no payload, so their cost is one WAN round trip each; without a

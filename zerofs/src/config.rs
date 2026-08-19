@@ -349,13 +349,23 @@ impl SftpConfig {
                 Self::MAX_ACCOUNT_CONNECTIONS
             );
         }
+        // The pool can place at most SFTP_SESSION_MAX_CONCURRENT_OPS
+        // operations per connection, so bound per-direction concurrency by
+        // the configured pool size here instead of failing at pool
+        // construction.
+        let concurrency_ceiling = (self.max_connections
+            * crate::sftp_transport::SFTP_SESSION_MAX_CONCURRENT_OPS)
+            .min(Self::MAX_DIRECTION_CONCURRENCY);
         for (name, value) in [
             ("read_concurrency", self.read_concurrency),
             ("write_concurrency", self.write_concurrency),
         ] {
-            if !(1..=Self::MAX_DIRECTION_CONCURRENCY).contains(&value) {
+            if !(1..=concurrency_ceiling).contains(&value) {
                 anyhow::bail!(
-                    "[sftp] {name} must be between 1 and {}",
+                    "[sftp] {name} must be between 1 and {concurrency_ceiling} \
+                     ({} operations per connection across max_connections = {}, capped at {})",
+                    crate::sftp_transport::SFTP_SESSION_MAX_CONCURRENT_OPS,
+                    self.max_connections,
                     Self::MAX_DIRECTION_CONCURRENCY
                 );
             }
@@ -3430,6 +3440,16 @@ known_hosts = "${ZEROFS_TEST_KNOWN_HOSTS}""#,
             ("read_concurrency = 65", "read_concurrency"),
             ("write_concurrency = 0", "write_concurrency"),
             ("write_concurrency = 65", "write_concurrency"),
+            // Concurrency beyond what the configured connections can place
+            // (16 multiplexed operations each) fails at load time.
+            (
+                "max_connections = 2\nwrite_concurrency = 33",
+                "write_concurrency",
+            ),
+            (
+                "max_connections = 1\nread_concurrency = 17",
+                "read_concurrency",
+            ),
         ];
 
         for (limits, expected) in invalid {
