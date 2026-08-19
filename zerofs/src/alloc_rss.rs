@@ -8,6 +8,8 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use tikv_jemalloc_ctl::{epoch, stats};
+
 static RSS_CAP_BYTES: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(test)]
@@ -95,6 +97,39 @@ pub fn over_rss_cap_of(cap: u64) -> bool {
 pub fn purge_arenas() {
     // `()` is zero-sized, so this is mallctl with newlen=0: a command.
     let _ = unsafe { tikv_jemalloc_ctl::raw::write::<()>(b"arena.*.purge\0", ()) };
+}
+
+/// Snapshot of jemalloc memory statistics, for the RPC status surface and
+/// Prometheus. One epoch advance, then every stat, so the values are fresh
+/// and mutually coherent. Cold-path (scrapes and status calls); the hot
+/// admission gate uses the throttled [`jemalloc_rss_envelope`] instead.
+#[derive(Clone, Copy, Default)]
+pub struct JemallocMemStats {
+    /// Bytes actively allocated by the application.
+    pub allocated: u64,
+    /// Bytes in physically resident pages mapped by the allocator.
+    pub resident: u64,
+    /// Bytes in active pages mapped by the allocator.
+    pub mapped: u64,
+    /// Bytes in virtual memory mappings retained for future reuse.
+    pub retained: u64,
+    /// Bytes dedicated to allocator metadata.
+    pub metadata: u64,
+}
+
+impl JemallocMemStats {
+    pub fn read() -> Self {
+        if epoch::mib().and_then(|e| e.advance()).is_err() {
+            return Self::default();
+        }
+        Self {
+            allocated: stats::allocated::read().unwrap_or(0) as u64,
+            resident: stats::resident::read().unwrap_or(0) as u64,
+            mapped: stats::mapped::read().unwrap_or(0) as u64,
+            retained: stats::retained::read().unwrap_or(0) as u64,
+            metadata: stats::metadata::read().unwrap_or(0) as u64,
+        }
+    }
 }
 
 #[cfg(test)]

@@ -61,44 +61,10 @@ where
     );
     Box::pin(output)
 }
-use tikv_jemalloc_ctl::{epoch as jemalloc_epoch, stats as jemalloc_stats};
+use crate::alloc_rss::JemallocMemStats;
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status};
 use tracing::{info, warn};
-
-/// Snapshot of jemalloc memory statistics.
-#[derive(Clone, Copy, Default)]
-pub struct JemallocMemStats {
-    /// Bytes actively allocated by the application.
-    pub allocated: u64,
-    /// Bytes in physically resident pages mapped by the allocator.
-    pub resident: u64,
-    /// Bytes in active pages mapped by the allocator.
-    pub mapped: u64,
-    /// Bytes in virtual memory mappings retained for future reuse.
-    pub retained: u64,
-    /// Bytes dedicated to allocator metadata.
-    pub metadata: u64,
-}
-
-impl JemallocMemStats {
-    /// Read current jemalloc stats. Advances the epoch first so the values
-    /// are fresh.
-    pub fn read() -> Self {
-        // Advance the epoch to refresh cached stats
-        if jemalloc_epoch::mib().and_then(|e| e.advance()).is_err() {
-            return Self::default();
-        }
-
-        Self {
-            allocated: jemalloc_stats::allocated::read().unwrap_or(0) as u64,
-            resident: jemalloc_stats::resident::read().unwrap_or(0) as u64,
-            mapped: jemalloc_stats::mapped::read().unwrap_or(0) as u64,
-            retained: jemalloc_stats::retained::read().unwrap_or(0) as u64,
-            metadata: jemalloc_stats::metadata::read().unwrap_or(0) as u64,
-        }
-    }
-}
 
 /// Directory at the filesystem root that RemoveDirectory renames victims
 /// into; a background task deletes its contents (precedent for hidden root
