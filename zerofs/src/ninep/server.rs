@@ -12,7 +12,7 @@ use futures::stream::FuturesUnordered;
 use ninep_proto::{
     DekuBytes, Message, P9_CHANNEL_SIZE, P9_COUNT_FIELD_LEN, P9_DEBUG_BUFFER_SIZE, P9_HEADER_SIZE,
     P9_MAX_MSIZE, P9_MIN_MESSAGE_SIZE, P9_OP_ENVELOPE_LEN, P9_OP_FLAG_RETRY, P9_OP_ID_LEN,
-    P9_SIZE_FIELD_LEN, P9Message, Rlerror, T_WRITE, Twrite,
+    P9_SIZE_FIELD_LEN, P9Message, Rlerror, T_WRITE, Twrite, message_type,
 };
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -1134,10 +1134,16 @@ fn shallow_epoch_zero_retry_write(
 }
 
 fn possible_response_bytes(type_byte: u8) -> usize {
-    if type_byte == T_WRITE {
-        P9_RWRITE_MAX_SIZE
-    } else {
-        P9_MAX_MSIZE as usize
+    match type_byte {
+        T_WRITE => P9_RWRITE_MAX_SIZE,
+        // Large read-like handlers retain their source payload while the
+        // protocol encoder materializes the wire response. Charge both live
+        // buffers; the process-wide byte semaphore remains the hard bound.
+        message_type::TREAD
+        | message_type::TREADDIR
+        | message_type::TLOPENATREAD
+        | message_type::TREADDIRATTR => 2 * P9_MAX_MSIZE as usize,
+        _ => P9_MAX_MSIZE as usize,
     }
 }
 
@@ -1456,6 +1462,15 @@ mod tests {
         );
         drop(frame);
         drop(admitted);
+    }
+
+    #[test]
+    fn large_read_response_reserves_source_and_serialized_buffers() {
+        assert_eq!(
+            possible_response_bytes(message_type::TREAD),
+            2 * P9_MAX_MSIZE as usize,
+            "a large read retains its source payload while serializing the wire response"
+        );
     }
 
     #[tokio::test]
