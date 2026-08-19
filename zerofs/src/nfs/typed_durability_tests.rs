@@ -293,18 +293,20 @@ async fn open_writeback_fs(
     let fs = Arc::new(fs);
     fs.install_volatile_overlay();
     fs.start_materializer();
-    writeback
-        .activate_remote()
-        .expect("activate real writeback replay");
     (fs, writeback)
 }
 
 async fn close_writeback_fs(
     fs: &Arc<ZeroFS>,
     writeback: crate::writeback::store::WritebackObjectStore,
+    remote: bool,
 ) {
     use crate::fs::mutation::durability::ObjectCoverage;
 
+    fs.write_coordinator
+        .barrier()
+        .await
+        .expect("drain the canonical commit worker before close");
     fs.stop_new_mutation_admission();
     let cutoff = crate::fs::mutation::closed_admission_cutoff(fs);
     fs.materialize_through_cutoff(cutoff)
@@ -326,12 +328,34 @@ async fn close_writeback_fs(
     } = coverage
     {
         writeback
-            .wait_coverage(journal_incarnation.as_uuid(), sequence, true)
+            .wait_coverage(journal_incarnation.as_uuid(), sequence, remote)
             .await
-            .expect("wait final remote object coverage");
+            .expect("wait final writeback coverage");
     }
     fs.stop_mutation_workers().await;
     writeback.shutdown().await.expect("shutdown SSD writeback");
+}
+
+async fn wait_for_journal_lock_release(lock_path: &std::path::Path) {
+    use fs4::fs_std::FileExt;
+    use std::fs::OpenOptions;
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let lock = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(lock_path)
+                .expect("open writeback journal lock");
+            if FileExt::try_lock_exclusive(&lock).expect("probe writeback journal lock") {
+                FileExt::unlock(&lock).expect("release writeback journal lock probe");
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("closed writeback owners did not release the journal lock");
 }
 
 async fn volatile_adapter(name: &[u8]) -> (Arc<ZeroFS>, NFSAdapter, fileid3) {
@@ -738,16 +762,18 @@ async fn shipping_tcp_write_commit_survive_writeback_restart_with_new_verifier()
     drop(client);
     shutdown.cancel();
     server.await.expect("shipping NFS server task panicked");
-    close_writeback_fs(&fs, writeback).await;
-    drop(fs);
+    close_writeback_fs(&fs, writeback, false).await;
+    match Arc::try_unwrap(fs) {
+        Ok(fs) => drop(fs),
+        Err(fs) => panic!(
+            "closed filesystem retained {} strong owners",
+            Arc::strong_count(&fs)
+        ),
+    }
+    wait_for_journal_lock_release(&base.join("nfs_shipping_test").join("LOCK")).await;
 
-    let (recovered, recovered_writeback) = open_writeback_fs(
-        Arc::clone(&remote),
-        settings,
-        identity,
-        "nfs_shipping_restart",
-    )
-    .await;
+    let (recovered, recovered_writeback) =
+        open_writeback_fs(Arc::clone(&remote), settings, identity, "nfs_shipping_test").await;
     let auth = AuthContext {
         uid: 0,
         gid: 0,
@@ -760,6 +786,9 @@ async fn shipping_tcp_write_commit_survive_writeback_restart_with_new_verifier()
         .await
         .expect("read NFS bytes after SSD recovery");
     assert_eq!(bytes.as_ref(), payload);
+    recovered_writeback
+        .activate_remote()
+        .expect("activate recovered writeback replay");
 
     let restarted =
         NFSAdapter::with_service_identity(Arc::clone(&recovered), NfsServiceIdentity::new());
@@ -786,7 +815,7 @@ async fn shipping_tcp_write_commit_survive_writeback_restart_with_new_verifier()
     drop(client);
     shutdown.cancel();
     server.await.expect("restarted NFS server task panicked");
-    close_writeback_fs(&recovered, recovered_writeback).await;
+    close_writeback_fs(&recovered, recovered_writeback, true).await;
 }
 
 #[tokio::test]
