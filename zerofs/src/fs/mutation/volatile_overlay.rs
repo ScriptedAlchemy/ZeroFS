@@ -26,7 +26,7 @@ use bytes::{Bytes, BytesMut};
 use futures::{FutureExt, future::BoxFuture};
 use std::collections::{BTreeMap, BTreeSet};
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 use tokio::sync::{Notify, RwLock, mpsc};
@@ -182,7 +182,37 @@ pub(crate) struct VolatileAdmission {
 struct OverlayEntry {
     offset: u64,
     data: Bytes,
+    visibility: Arc<WriteVisibility>,
     _permit: BudgetPermit,
+}
+
+/// One atomic visibility decision shared by every member of a logical write.
+/// Staged runtime entries can materialize or roll back, but reads do not
+/// observe any member until this token is published once for the whole write.
+pub(crate) struct WriteVisibility {
+    published: AtomicBool,
+}
+
+impl WriteVisibility {
+    pub(crate) fn staged() -> Arc<Self> {
+        Arc::new(Self {
+            published: AtomicBool::new(false),
+        })
+    }
+
+    pub(crate) fn published() -> Arc<Self> {
+        Arc::new(Self {
+            published: AtomicBool::new(true),
+        })
+    }
+
+    pub(crate) fn publish(&self) {
+        self.published.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn is_published(&self) -> bool {
+        self.published.load(Ordering::Acquire)
+    }
 }
 
 struct State {
@@ -446,6 +476,37 @@ impl VolatileWriteRuntime {
         data: Bytes,
         groups: Vec<Vec<WriteChunk>>,
     ) -> OverlayResult<u64> {
+        self.accept_write_with_visibility(
+            admission,
+            offset,
+            data,
+            groups,
+            WriteVisibility::published(),
+        )
+        .await
+    }
+
+    pub(crate) async fn accept_staged_write(
+        &self,
+        admission: VolatileAdmission,
+        offset: u64,
+        data: Bytes,
+        groups: Vec<Vec<WriteChunk>>,
+        visibility: Arc<WriteVisibility>,
+    ) -> OverlayResult<u64> {
+        self.accept_write_with_visibility(admission, offset, data, groups, visibility)
+            .await
+    }
+
+    async fn accept_write_with_visibility(
+        &self,
+        admission: VolatileAdmission,
+        offset: u64,
+        data: Bytes,
+        groups: Vec<Vec<WriteChunk>>,
+        visibility: Arc<WriteVisibility>,
+    ) -> OverlayResult<u64> {
+        let record_accepted = visibility.is_published();
         if admission.permit.bytes != data.len() as u64 {
             return Err(OverlayError::InvalidArgument);
         }
@@ -467,6 +528,7 @@ impl VolatileWriteRuntime {
         let entry = Arc::new(OverlayEntry {
             offset,
             data,
+            visibility,
             _permit: admission.permit,
         });
         state.next_sequence = sequence;
@@ -492,8 +554,9 @@ impl VolatileWriteRuntime {
             return Err(OverlayError::IoError);
         }
         self.changed.notify_waiters();
-        metrics::counter!("zerofs_nbd_volatile_writes_accepted_total").increment(1);
-        metrics::counter!("zerofs_nbd_volatile_bytes_accepted_total").increment(accepted_bytes);
+        if record_accepted {
+            record_published_staged_writes(accepted_bytes, 1);
+        }
         Ok(sequence)
     }
 
@@ -529,6 +592,22 @@ impl VolatileWriteRuntime {
                 _ = changed => {}
                 _ = budget_changed => {}
             }
+        }
+    }
+
+    /// Wait until an unacknowledged entry has been retired or its runtime has
+    /// reached a terminal state. Used only to finish rollback before returning
+    /// a failed multi-member acceptance.
+    pub(crate) async fn wait_released(&self, sequence: u64) {
+        loop {
+            let changed = self.changed.notified();
+            {
+                let state = self.state.lock().expect("volatile runtime poisoned");
+                if !state.entries.contains_key(&sequence) || state.terminal.is_some() {
+                    return;
+                }
+            }
+            changed.await;
         }
     }
 
@@ -667,7 +746,9 @@ impl VolatileWriteRuntime {
                 }
                 state.materialized_through += 1;
                 let retired = state.materialized_through;
-                if let Some(entry) = state.entries.remove(&retired) {
+                if let Some(entry) = state.entries.remove(&retired)
+                    && entry.visibility.is_published()
+                {
                     released_operations += 1;
                     released_bytes += entry.data.len() as u64;
                 }
@@ -689,9 +770,15 @@ impl VolatileWriteRuntime {
             .expect("volatile runtime poisoned")
             .entries
             .values()
+            .filter(|entry| entry.visibility.is_published())
             .cloned()
             .collect()
     }
+}
+
+pub(crate) fn record_published_staged_writes(bytes: u64, operations: u64) {
+    metrics::counter!("zerofs_nbd_volatile_writes_accepted_total").increment(operations);
+    metrics::counter!("zerofs_nbd_volatile_bytes_accepted_total").increment(bytes);
 }
 
 fn valid_write_groups(data: &Bytes, groups: &[Vec<WriteChunk>], lane_inodes: &[u64]) -> bool {

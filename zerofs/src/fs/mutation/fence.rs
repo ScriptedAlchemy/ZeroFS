@@ -9,8 +9,9 @@ use crate::fs::ZeroFS;
 use crate::fs::errors::FsError;
 #[cfg(test)]
 use crate::fs::inode::InodeId;
-use crate::fs::mutation::admission::PreparationGate;
+use crate::fs::mutation::admission::{PreparationGate, RawMutationBudget};
 use crate::fs::mutation::progress::MutationProgress;
+use crate::fs::mutation::request_cache::RequestCache;
 use crate::fs::mutation::types::{ConflictKey, ConflictScope, MutationCutoff, MutationError};
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -19,11 +20,27 @@ use std::sync::Arc;
 pub(crate) struct MutationCoordinator {
     gate: Arc<PreparationGate>,
     progress: MutationProgress,
+    request_cache: RequestCache,
+    raw_budget: RawMutationBudget,
 }
 
 impl MutationCoordinator {
     pub(crate) fn new(gate: Arc<PreparationGate>, progress: MutationProgress) -> Arc<Self> {
-        Arc::new(Self { gate, progress })
+        Self::new_with_limits(gate, progress, u64::MAX, 1024)
+    }
+
+    pub(crate) fn new_with_limits(
+        gate: Arc<PreparationGate>,
+        progress: MutationProgress,
+        max_bytes: u64,
+        max_operations: u64,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            gate,
+            progress,
+            request_cache: RequestCache::new(max_operations.min(usize::MAX as u64) as usize),
+            raw_budget: RawMutationBudget::new(max_bytes, max_operations),
+        })
     }
 
     pub(crate) fn gate(&self) -> Arc<PreparationGate> {
@@ -32,6 +49,20 @@ impl MutationCoordinator {
 
     pub(crate) fn progress(&self) -> MutationProgress {
         self.progress.clone()
+    }
+
+    pub(crate) fn request_cache(&self) -> RequestCache {
+        self.request_cache.clone()
+    }
+
+    pub(crate) fn raw_budget(&self) -> RawMutationBudget {
+        self.raw_budget.clone()
+    }
+
+    pub(crate) fn poison(&self, message: impl Into<String>) {
+        let message = message.into();
+        self.gate.poison(message.clone());
+        self.progress.poison(message);
     }
 
     pub(crate) async fn materialization_fence(

@@ -17,6 +17,8 @@ pub(crate) mod durability;
 pub(crate) mod fence;
 pub(crate) mod materializer;
 pub(crate) mod overlay;
+mod overlay_dispatch;
+mod overlay_helpers;
 pub(crate) mod progress;
 pub(crate) mod volatile_overlay;
 
