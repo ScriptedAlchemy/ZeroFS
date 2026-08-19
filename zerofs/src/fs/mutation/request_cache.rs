@@ -9,7 +9,7 @@ use crate::fs::errors::FsError;
 use crate::fs::mutation::types::{
     PreparedBatchResult, RequestFingerprint, RequestIdentity, RequestLifetime,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Instant;
@@ -86,6 +86,11 @@ struct RequestCacheInner {
 
 struct CacheState {
     entries: HashMap<RequestIdentity, CacheEntry>,
+    /// Completed replay-window entries in completion order. Drives O(1)
+    /// amortized expiry and oldest-first eviction under capacity pressure.
+    /// Items can go stale (entry replaced or already removed); consumers
+    /// verify against the live entry's deadline before evicting.
+    expiry_queue: VecDeque<(Instant, RequestIdentity)>,
     used_slots: usize,
     closed: bool,
 }
@@ -271,6 +276,7 @@ impl RequestCache {
                 max_entries: max_entries.max(1),
                 state: Mutex::new(CacheState {
                     entries: HashMap::new(),
+                    expiry_queue: VecDeque::new(),
                     used_slots: 0,
                     closed: false,
                 }),
@@ -322,7 +328,7 @@ impl RequestCacheInner {
         if state.closed {
             return Err(RequestCacheError::Closed);
         }
-        self.evict_expired(&mut state);
+        Self::evict_expired(&mut state);
         if let Some(entry) = state.entries.get(&identity) {
             return Ok(if *existingfingerprint(entry) == fingerprint {
                 RequestLookup::Joined(Arc::clone(retained_of(entry)))
@@ -330,8 +336,16 @@ impl RequestCacheInner {
                 RequestLookup::FingerprintMismatch
             });
         }
-        if state.entries.len() >= self.max_entries || state.used_slots >= self.max_entries {
-            return Ok(RequestLookup::Backpressured);
+        // At capacity, prefer shrinking the completed replay window over
+        // refusing the write: retained completions exist to absorb client
+        // retransmits, not to gate new admissions. Only when every entry is
+        // in flight (or canonical dedup) does the caller see backpressure —
+        // otherwise the 60s replay window caps sustained write throughput
+        // at max_entries per window regardless of hardware.
+        while state.entries.len() >= self.max_entries || state.used_slots >= self.max_entries {
+            if !Self::evict_oldest_completed(&mut state) {
+                return Ok(RequestLookup::Backpressured);
+            }
         }
         state.used_slots += 1;
         let slot = RequestOperationSlot {
@@ -457,6 +471,9 @@ impl RequestCacheInner {
                     slot.disarm();
                 }
                 let mut state = lock(&self.state);
+                if let Some(deadline) = expires_at {
+                    state.expiry_queue.push_back((deadline, identity.clone()));
+                }
                 state.entries.insert(
                     identity.clone(),
                     CacheEntry::Retained {
@@ -470,26 +487,57 @@ impl RequestCacheInner {
         retained
     }
 
-    fn evict_expired(&self, state: &mut CacheState) {
+    fn evict_expired(state: &mut CacheState) {
         let now = Instant::now();
-        let mut released = Vec::new();
-        state.entries.retain(|_, entry| match entry {
-            CacheEntry::Pending { .. } => true,
-            CacheEntry::Retained {
-                expires_at, slot, ..
-            } => {
-                let expired = expires_at.is_some_and(|deadline| deadline <= now);
-                if expired && let Some(mut owned) = slot.take() {
-                    if owned.active {
-                        state.used_slots = state.used_slots.saturating_sub(1);
-                        owned.disarm();
-                    }
-                    released.push(owned);
-                }
-                !expired
+        while let Some((deadline, _)) = state.expiry_queue.front() {
+            if *deadline > now {
+                break;
             }
-        });
-        drop(released);
+            let (deadline, identity) = state.expiry_queue.pop_front().expect("front checked");
+            Self::remove_completed_if_current(state, &identity, deadline);
+        }
+    }
+
+    /// Evict the oldest completed replay entry to admit a new write —
+    /// standard bounded-DRC behavior: the replay window shrinks under
+    /// pressure instead of refusing writes. Pending (in-flight) and
+    /// canonical-dedup entries are never evicted. Returns false when no
+    /// completed entry remains.
+    fn evict_oldest_completed(state: &mut CacheState) -> bool {
+        while let Some((deadline, identity)) = state.expiry_queue.pop_front() {
+            if Self::remove_completed_if_current(state, &identity, deadline) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Remove `identity` only if it is still the completed entry this queue
+    /// item was created for; a retransmit-turned-new-request may have
+    /// replaced it since. Releases the entry's operation slot.
+    fn remove_completed_if_current(
+        state: &mut CacheState,
+        identity: &RequestIdentity,
+        deadline: Instant,
+    ) -> bool {
+        match state.entries.get(identity) {
+            Some(CacheEntry::Retained {
+                expires_at: Some(current),
+                ..
+            }) if *current == deadline => {}
+            _ => return false,
+        }
+        if let Some(CacheEntry::Retained {
+            slot: Some(mut owned),
+            ..
+        }) = state.entries.remove(identity)
+        {
+            if owned.active {
+                state.used_slots = state.used_slots.saturating_sub(1);
+                owned.disarm();
+            }
+        }
+        true
     }
 
     fn release_slot(&self) {
@@ -687,7 +735,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_pressure_returns_backpressure() {
+    fn completed_replay_entry_is_evicted_to_admit_a_new_write() {
         let cache = RequestCache::new(1);
         let pending = expect_vacant(
             cache
@@ -696,6 +744,43 @@ mod tests {
                     fingerprint(1),
                     RequestLifetime::ReplayWindow(Duration::from_secs(60)),
                 )
+                .unwrap(),
+        )
+        .begin_pending();
+        cache.complete(pending.accept(), Ok(result()));
+        assert_eq!(cache.used_slots(), 1);
+        // A completed replay entry must not backpressure new writes: the
+        // oldest completed entry is evicted (shrinking the replay window)
+        // and the new write is admitted.
+        let admitted = cache
+            .lookup_or_reserve(nbd(2), fingerprint(2), RequestLifetime::InFlightOnly)
+            .unwrap();
+        assert!(matches!(admitted, RequestLookup::Vacant(_)));
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.used_slots(), 1);
+        // The evicted completion no longer joins; a retransmit re-executes.
+        drop(admitted);
+        let retransmit = cache
+            .lookup_or_reserve(
+                nbd(1),
+                fingerprint(1),
+                RequestLifetime::ReplayWindow(Duration::from_secs(60)),
+            )
+            .unwrap();
+        assert!(matches!(retransmit, RequestLookup::Vacant(_)));
+        drop(retransmit);
+    }
+
+    #[test]
+    fn canonical_dedup_entries_are_never_evicted_under_pressure() {
+        let cache = RequestCache::new(1);
+        let identity = RequestIdentity::DirectTagged {
+            caller_incarnation: Uuid::nil(),
+            operation_id: 7,
+        };
+        let pending = expect_vacant(
+            cache
+                .lookup_or_reserve(identity, fingerprint(1), RequestLifetime::CanonicalDedup)
                 .unwrap(),
         )
         .begin_pending();

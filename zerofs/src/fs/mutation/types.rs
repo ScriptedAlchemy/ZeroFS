@@ -185,6 +185,8 @@ pub(crate) enum MutationError {
     Poisoned(String),
     #[error("mutation requires {requested} bytes but the volatile budget is {capacity} bytes")]
     TooLarge { requested: u64, capacity: u64 },
+    #[error("mutation admission is at operation capacity")]
+    Backpressure,
     #[error("mutation cutoff belongs to a stale mutation incarnation")]
     StaleIncarnation,
 }

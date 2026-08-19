@@ -174,7 +174,7 @@ impl Materializer {
         if inodes.len() == 1 {
             let inode = *inodes.iter().next().expect("one inode");
             let (reply_tx, reply_rx) = oneshot::channel();
-            self.lane(inode)
+            self.lane(inode)?
                 .send(LaneJob::Apply {
                     cutoff,
                     batch,
@@ -204,7 +204,7 @@ impl Materializer {
                 let is_first = holds.is_empty();
                 let (acquired_tx, acquired_rx) = oneshot::channel();
                 let (release_tx, release_rx) = oneshot::channel();
-                self.lane(*inode)
+                self.lane(*inode)?
                     .send(LaneJob::Hold {
                         acquired: acquired_tx,
                         release: release_rx,
@@ -258,16 +258,25 @@ impl Materializer {
         }
     }
 
-    fn lane(self: &Arc<Self>, inode: u64) -> mpsc::UnboundedSender<LaneJob> {
+    fn lane(
+        self: &Arc<Self>,
+        inode: u64,
+    ) -> Result<mpsc::UnboundedSender<LaneJob>, MutationError> {
         let mut lanes = lock(&self.inner.lanes);
+        // Re-checked under the lanes lock: stop() drains this map after
+        // setting `closed`, so a dispatch that passed the earlier closed
+        // check must not repopulate it with a worker stop() never joins.
+        if *lock(&self.inner.closed) {
+            return Err(MutationError::Closed);
+        }
         if let Some(sender) = lanes.get(&inode) {
-            return sender.clone();
+            return Ok(sender.clone());
         }
         let (sender, receiver) = mpsc::unbounded_channel();
         let worker = spawn_lane(Arc::clone(self), receiver);
         lock(&self.inner.workers).push(worker);
         lanes.insert(inode, sender.clone());
-        sender
+        Ok(sender)
     }
 
     #[cfg(test)]

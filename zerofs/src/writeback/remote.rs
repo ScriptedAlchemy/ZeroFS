@@ -826,6 +826,14 @@ async fn drain_remote_multipart_cleanup(
                         active.spawn(async move {
                             match tokio::time::timeout(REMOTE_OPERATION_TIMEOUT, upload.abort()).await {
                                 Ok(Ok(())) => Ok(()),
+                                // A cleanup abort can chase a first attempt whose
+                                // reply was lost after the remote already resolved
+                                // the upload (e.g. a timed-out complete() that
+                                // succeeded server-side). "No such upload" proves
+                                // nothing is left to clean; terminally poisoning
+                                // the store over an already-resolved handle would
+                                // turn that benign race into an outage.
+                                Ok(Err(object_store::Error::NotFound { .. })) => Ok(()),
                                 Ok(Err(error)) => Err(error.to_string()),
                                 Err(_) => Err(format!(
                                     "timed out after {:.3}s",
@@ -1377,6 +1385,13 @@ async fn stream_record_to_remote(
         }
     }
 
+    // Known gap: unlike the single-put path, whose Create/Update mode is
+    // enforced atomically by the backend, multipart emulates the precondition
+    // with this HEAD followed by an unconditional complete(). A concurrent
+    // writer (realistically a not-yet-fenced stale incarnation during
+    // failover) landing between the two is silently clobbered. Incarnation
+    // checks in remote_put_mode shrink the window; closing it needs backend
+    // support for conditional multipart completion.
     if let Some(existing) =
         reconcile_precondition(remote.as_ref(), &journal, record, target, mode).await?
     {

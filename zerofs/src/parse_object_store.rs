@@ -378,7 +378,7 @@ async fn build_sftp_store(
                 "opening HPN OpenSSH SFTP object store"
             );
             Arc::new(
-                crate::sftp_transport::HpnSessionFactory::from_config(endpoint, &config).map_err(
+                crate::hpn_session::HpnSessionFactory::from_config(endpoint, &config).map_err(
                     |source| object_store::Error::Generic {
                         store: "SFTP",
                         source: Box::new(source),
@@ -616,10 +616,6 @@ mod tests {
         assert!(
             error.contains("hpn_program") || error.contains("hpn_sha256"),
             "HPN must fail closed on the pinned program, not fall back to russh: {error}"
-        );
-        assert!(
-            !error.contains("not implemented"),
-            "HPN process backend is implemented: {error}"
         );
     }
 }

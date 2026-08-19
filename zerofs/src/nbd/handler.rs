@@ -997,9 +997,12 @@ fn nbd_write_scope(
 fn mutation_command_error(error: MutationError) -> CommandError {
     match error {
         MutationError::TooLarge { .. } => CommandError::NoSpace,
-        MutationError::Closed | MutationError::Poisoned(_) | MutationError::StaleIncarnation => {
-            CommandError::IoError
-        }
+        // NBD has no retryable errno; transient admission pressure must not
+        // masquerade as ENOSPC, which block-layer clients treat as disk-full.
+        MutationError::Backpressure
+        | MutationError::Closed
+        | MutationError::Poisoned(_)
+        | MutationError::StaleIncarnation => CommandError::IoError,
     }
 }
 

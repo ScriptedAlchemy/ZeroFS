@@ -110,6 +110,7 @@ impl DurabilityError {
             MutationError::StaleIncarnation => Self::StaleMutationIncarnation,
             MutationError::Closed => Self::Closed,
             MutationError::TooLarge { .. } => Self::Materialization(FsError::NoSpace),
+            MutationError::Backpressure => Self::Materialization(FsError::RetryLater),
             MutationError::Poisoned(_) => Self::Materialization(FsError::IoError),
         }
     }

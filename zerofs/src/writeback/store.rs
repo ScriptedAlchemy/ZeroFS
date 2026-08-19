@@ -1214,6 +1214,18 @@ impl MultipartUpload for WritebackMultipartUpload {
                     ))
                 });
             }
+            // Memory-mode parts hold their RAM admission until complete()/
+            // abort(), so an object whose parts exceed the gate's capacity
+            // would wait on bytes only its own completion can free -- a
+            // self-deadlock that also wedges every writer queued behind it
+            // on the FIFO gate. Fail fast instead.
+            if self.memory_parts && total > self.store.inner.settings.memory_bytes {
+                return Box::pin(async {
+                    Err(generic_error(
+                        "multipart object exceeds the dirty RAM budget",
+                    ))
+                });
+            }
             let index = state.parts.len();
             state.parts.push(MultipartPart {
                 len,
@@ -3968,11 +3980,48 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("capacity is 4 bytes"));
+        // The aggregate RAM-budget guard rejects before the gate is even
+        // asked, which also means no buffer copy happened.
+        assert!(
+            error.to_string().contains("exceeds the dirty RAM budget"),
+            "unexpected admission error: {error}"
+        );
         assert_eq!(store.inner.admission.used_bytes(), 0);
         assert_eq!(store.inner.admission.used_operations(), 0);
         assert!(!store.inner.settings.dir.join("tmp/multipart").exists());
         upload.abort().await.unwrap();
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn memory_multipart_over_ram_budget_fails_fast_instead_of_self_deadlocking() {
+        let (store, _remote, _temp) =
+            test_store_with_resource_limits(AckMode::Memory, 8, 1_000_000, 100).await;
+        let mut upload = store
+            .put_multipart(&Path::from("memory-over-budget"))
+            .await
+            .unwrap();
+        upload
+            .put_part(Bytes::from(vec![0x5a; 5]).into())
+            .await
+            .unwrap();
+
+        // The second part fits the gate individually but pushes the object's
+        // held total past it; without the aggregate check it would wait on
+        // bytes only its own upload's completion can free.
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            upload.put_part(Bytes::from(vec![0x5b; 5]).into()),
+        )
+        .await
+        .expect("over-budget part must fail fast, not wait on its own bytes")
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("exceeds the dirty RAM budget"),
+            "unexpected error: {error}"
+        );
+        upload.abort().await.unwrap();
+        assert_eq!(store.inner.admission.used_bytes(), 0);
         store.shutdown().await.unwrap();
     }
 

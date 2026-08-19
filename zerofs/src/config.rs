@@ -478,12 +478,7 @@ pub(crate) fn validate_pinned_hpn_program(program: &Path, expected_sha256: &str)
 }
 
 fn parse_configured_sha256(value: &str) -> Result<String> {
-    let trimmed = value.trim();
-    let hex = trimmed
-        .strip_prefix("sha256:")
-        .or_else(|| trimmed.strip_prefix("SHA256:"))
-        .unwrap_or(trimmed)
-        .trim();
+    let hex = value.trim();
     if hex.len() != 64 || !hex.as_bytes().iter().all(u8::is_ascii_hexdigit) {
         anyhow::bail!("[sftp] hpn_sha256 must be a 64-character SHA-256 hex digest");
     }
@@ -3730,7 +3725,7 @@ known_hosts = "${ZEROFS_TEST_KNOWN_HOSTS}""#,
         let serialized = toml::to_string(&sftp).unwrap();
         assert!(
             serialized.contains("transport = \"hpn_openssh\""),
-            "serde must emit Zack's transport name: {serialized}"
+            "serde must emit the configured transport name: {serialized}"
         );
         assert!(
             !serialized.contains("hpn_open_ssh"),
