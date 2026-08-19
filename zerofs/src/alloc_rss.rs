@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static RSS_CAP_BYTES: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(test)]
-pub(crate) static RSS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static TEST_RSS_CAP_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[cfg(test)]
 thread_local! {
@@ -30,6 +30,28 @@ pub fn set_rss_cap_bytes(cap: u64) {
 
 pub fn rss_cap_bytes() -> u64 {
     RSS_CAP_BYTES.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+pub(crate) struct TestRssCapGuard {
+    previous: u64,
+    _lock: tokio::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl Drop for TestRssCapGuard {
+    fn drop(&mut self) {
+        set_rss_cap_bytes(self.previous);
+    }
+}
+
+#[cfg(test)]
+pub(crate) async fn lock_test_rss_cap() -> TestRssCapGuard {
+    let lock = TEST_RSS_CAP_LOCK.lock().await;
+    TestRssCapGuard {
+        previous: rss_cap_bytes(),
+        _lock: lock,
+    }
 }
 
 fn advance_epoch() -> bool {
@@ -95,11 +117,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn retained_virtual_mappings_do_not_count_as_resident_pressure() {
-        let _lock = RSS_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    #[tokio::test]
+    async fn retained_virtual_mappings_do_not_count_as_resident_pressure() {
+        let _rss_cap_guard = lock_test_rss_cap().await;
         let _reset = Reset;
         TEST_ALLOCATOR_STATS.with(|stats| stats.set(Some((2 * GIB, 80 * GIB))));
         set_rss_cap_bytes(8 * GIB);
@@ -111,11 +131,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn validated_service_envelope_allows_full_clean_cache_plus_overhead() {
-        let _lock = RSS_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    #[tokio::test]
+    async fn validated_service_envelope_allows_full_clean_cache_plus_overhead() {
+        let _rss_cap_guard = lock_test_rss_cap().await;
         let _reset = Reset;
         set_rss_cap_bytes(88 * GIB);
         TEST_ALLOCATOR_STATS.with(|stats| stats.set(Some((70 * GIB, 30 * GIB))));
@@ -128,11 +146,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn validated_service_envelope_trips_before_its_hard_limit() {
-        let _lock = RSS_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    #[tokio::test]
+    async fn validated_service_envelope_trips_before_its_hard_limit() {
+        let _rss_cap_guard = lock_test_rss_cap().await;
         let _reset = Reset;
         set_rss_cap_bytes(56 * GIB);
         TEST_ALLOCATOR_STATS.with(|stats| stats.set(Some((57 * GIB, 80 * GIB))));
@@ -142,5 +158,14 @@ mod tests {
             over_rss_cap(),
             "resident usage above the validated service cap must fail closed"
         );
+    }
+
+    #[tokio::test]
+    async fn test_cap_guard_restores_previous_value() {
+        let guard = super::lock_test_rss_cap().await;
+        let previous = guard.previous;
+        super::set_rss_cap_bytes(previous.wrapping_add(1));
+        drop(guard);
+        assert_eq!(super::rss_cap_bytes(), previous);
     }
 }
