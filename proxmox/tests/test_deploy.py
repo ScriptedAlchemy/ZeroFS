@@ -857,6 +857,28 @@ class VmNfsCoordinatorTests(unittest.TestCase):
             )
         )
 
+    def test_vm_transition_stages_files_inside_the_root_lock_session(self) -> None:
+        runner = self.RecordingRunner()
+
+        self.transaction_runner()(
+            runner,
+            self.args(),
+            "0123456789ab-cccccccccccccccc",
+            lambda: None,
+            lambda: None,
+            lambda: None,
+            lambda: None,
+        )
+
+        direct_scp = [call for call in runner.calls if call.startswith("scp -q ")]
+        self.assertEqual(direct_scp, [])
+        locked_staging = [
+            call
+            for call in runner.calls
+            if call.startswith("locked-shell ubuntu-main") and "base64 -d >" in call
+        ]
+        self.assertEqual(len(locked_staging), 3)
+
     def test_absent_initial_mount_is_proven_after_bootstrap_not_fabricated(
         self,
     ) -> None:

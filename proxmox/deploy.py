@@ -841,6 +841,28 @@ def _ssh_capture(runner: Runner, host: str, script: str) -> str:
     ).stdout
 
 
+def _stage_remote_file(
+    runner: Runner, host: str, local_path: Path, remote_path: str
+) -> None:
+    if runner.dry_run:
+        runner.run(["scp", "-q", str(local_path), f"{host}:{remote_path}"])
+        return
+    encoded = base64.b64encode(local_path.read_bytes()).decode("ascii")
+    remote = shlex.quote(remote_path)
+    temporary = shlex.quote(f"{remote_path}.tmp")
+    _ssh(
+        runner,
+        host,
+        f"""set -euo pipefail
+trap 'rm -f -- {temporary}' EXIT
+printf '%s' {shlex.quote(encoded)} | base64 -d > {temporary}
+chmod 0600 {temporary}
+mv -f -- {temporary} {remote}
+trap - EXIT
+""",
+    )
+
+
 def _quiesce_guest(runner: Runner, args: argparse.Namespace) -> None:
     script = f"""set -euo pipefail
 unit_loaded() {{
@@ -1172,7 +1194,7 @@ def _run_ownership_migration(runner: Runner, args: argparse.Namespace) -> None:
                 args.vm_host,
                 f"set -euo pipefail\ninstall -d -m 0700 {shlex.quote(remote_stage)}\n",
             )
-            runner.run(["scp", "-q", str(helper), f"{args.vm_host}:{remote_helper}"])
+            _stage_remote_file(runner, args.vm_host, helper, remote_helper)
             command = [
                 "sudo",
                 "bash",
@@ -1288,26 +1310,17 @@ def _run_prod_vm_nfs_transaction(
                 args.vm_host,
                 f"set -euo pipefail\ninstall -d -m 0700 {shlex.quote(remote_stage)}\n",
             )
-            runner.run(["scp", "-q", str(helper), f"{args.vm_host}:{remote_helper}"])
-            runner.run(
-                [
-                    "scp",
-                    "-q",
-                    str(guest_reconciler),
-                    f"{args.vm_host}:{remote_guest_reconciler}",
-                ]
+            _stage_remote_file(runner, args.vm_host, helper, remote_helper)
+            _stage_remote_file(
+                runner,
+                args.vm_host,
+                guest_reconciler,
+                remote_guest_reconciler,
             )
             with tempfile.TemporaryDirectory(prefix="zerofs-vm-nfs-") as directory:
                 rendered_path = Path(directory) / VM_NFS_MOUNT_UNIT
                 rendered_path.write_text(rendered)
-                runner.run(
-                    [
-                        "scp",
-                        "-q",
-                        str(rendered_path),
-                        f"{args.vm_host}:{remote_unit}",
-                    ]
-                )
+                _stage_remote_file(runner, args.vm_host, rendered_path, remote_unit)
             status_output = action_output("status")
             status = (
                 json.loads(status_output)
