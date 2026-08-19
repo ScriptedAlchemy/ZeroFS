@@ -1001,6 +1001,7 @@ mod tests {
                 release: Notify::new(),
                 cancelled: Arc::new(AtomicBool::new(false)),
                 aborted: Arc::new(AtomicBool::new(false)),
+                saw_generated_segment_create: AtomicBool::new(false),
             })
         }
 
