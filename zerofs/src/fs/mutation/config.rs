@@ -151,7 +151,9 @@ impl FilesystemWriteAckRequest {
     /// `[servers.nbd]` form: legacy-only selects volatile, both forms must
     /// agree exactly, and a legacy materialized default never vetoes an
     /// explicit shared setting.
-    fn mode_source_and_budget(&self) -> Result<(FilesystemWriteAckMode, FilesystemWriteAckSource, f64)> {
+    fn mode_source_and_budget(
+        &self,
+    ) -> Result<(FilesystemWriteAckMode, FilesystemWriteAckSource, f64)> {
         match (self.configured_mode, self.legacy_nbd_volatile) {
             (None, false) => Ok((
                 FilesystemWriteAckMode::Materialized,
@@ -163,7 +165,11 @@ impl FilesystemWriteAckRequest {
                 FilesystemWriteAckSource::LegacyNbd,
                 self.legacy_nbd_volatile_memory_gb,
             )),
-            (Some(mode), false) => Ok((mode, FilesystemWriteAckSource::Filesystem, self.volatile_memory_gb)),
+            (Some(mode), false) => Ok((
+                mode,
+                FilesystemWriteAckSource::Filesystem,
+                self.volatile_memory_gb,
+            )),
             (Some(FilesystemWriteAckMode::VolatileMemory), true) => {
                 if self.volatile_memory_gb != self.legacy_nbd_volatile_memory_gb {
                     bail!(

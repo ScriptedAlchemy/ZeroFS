@@ -6,3 +6,5 @@
 //! admission and overlay runtime lands in follow-up work.
 
 pub(crate) mod config;
+
+pub(crate) mod types;
