@@ -275,7 +275,28 @@ fn walk_user_path(path: &Path, create: bool) -> Result<Option<Arc<OwnedFd>>> {
             .map_err(anyhow::Error::new)
             .with_context(|| format!("open local destination anchor {start}"))?,
     );
-    walk_components(root, path.components(), create, false, path)
+    let normalized = normalize_macos_root_alias(path);
+    walk_components(root, normalized.components(), create, false, path)
+}
+
+#[cfg(target_os = "macos")]
+fn normalize_macos_root_alias(path: &Path) -> PathBuf {
+    for (alias, canonical) in [
+        (Path::new("/var"), Path::new("/private/var")),
+        (Path::new("/tmp"), Path::new("/private/tmp")),
+        (Path::new("/etc"), Path::new("/private/etc")),
+        (Path::new("/home"), Path::new("/System/Volumes/Data/home")),
+    ] {
+        if let Ok(remainder) = path.strip_prefix(alias) {
+            return canonical.join(remainder);
+        }
+    }
+    path.to_path_buf()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn normalize_macos_root_alias(path: &Path) -> PathBuf {
+    path.to_path_buf()
 }
 
 fn walk_relative(root: Arc<OwnedFd>, path: &Path, create: bool) -> Result<Option<Arc<OwnedFd>>> {
