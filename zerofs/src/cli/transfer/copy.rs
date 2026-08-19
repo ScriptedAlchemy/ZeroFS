@@ -363,10 +363,13 @@ async fn stream_download(
             bail!("download cancelled");
         }
         let wanted = (planned.size - offset).min(u64::from(chunk_size)) as u32;
-        let chunk = remote
-            .read_at(offset, wanted)
-            .await
-            .with_context(|| format!("read remote source at offset {offset}"))?;
+        let chunk = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => bail!("download cancelled"),
+            result = remote.read_at(offset, wanted) => {
+                result.with_context(|| format!("read remote source at offset {offset}"))?
+            }
+        };
         if chunk.is_empty() {
             break;
         }
@@ -383,12 +386,14 @@ async fn stream_download(
             planned.source.display()
         );
     }
-    if !remote
-        .read_at(offset, 1)
-        .await
-        .with_context(|| format!("check remote source length at offset {offset}"))?
-        .is_empty()
-    {
+    let trailing = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => bail!("download cancelled"),
+        result = remote.read_at(offset, 1) => {
+            result.with_context(|| format!("check remote source length at offset {offset}"))?
+        }
+    };
+    if !trailing.is_empty() {
         bail!(
             "remote source changed while downloading: {}",
             planned.source.display()
