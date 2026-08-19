@@ -9,6 +9,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import uuid
+from dataclasses import replace
 from pathlib import Path
 from subprocess import CompletedProcess
 from typing import Any, Mapping, Sequence
@@ -55,7 +57,7 @@ from scripts.tiered_writeback_e2e.lifecycle import (
     SourceBusyError,
     assert_source_idle,
 )
-from scripts.tiered_writeback_e2e import linux_suites
+from scripts.tiered_writeback_e2e import linux_suites, protocols
 from scripts.tiered_writeback_e2e.protocols import ScenarioContext
 from scripts.vm100_pilot.runner import Runner
 
@@ -98,6 +100,7 @@ class FakeRunner(Runner):
         super().__init__(base_env={})
         self.calls: list[tuple[tuple[str, ...], bool]] = []
         self.failures: dict[tuple[str, ...], BaseException] = {}
+        self.next_pid = 4242
 
     def run(
         self,
@@ -118,6 +121,10 @@ class FakeRunner(Runner):
                 raise error
         if args[0] == "git" and "rev-parse" in args:
             return CompletedProcess(args, 0, "a" * 40 + "\n", "")
+        if args[:3] == ("systemctl", "show", "--property=MainPID"):
+            pid = self.next_pid
+            self.next_pid += 1
+            return CompletedProcess(args, 0, f"{pid}\n", "")
         return CompletedProcess(args, 0, "", "")
 
 
@@ -125,6 +132,8 @@ class FakeProbes:
     """Live-state probes backed by plain sets instead of the running system."""
 
     def __init__(self) -> None:
+        self.active_units: set[str] = set()
+        self.unit_pids: dict[str, int] = {}
         self.alive_pids: set[int] = set()
         self.listening_ports: set[int] = set()
         self.active_mounts: set[str] = set()
@@ -133,6 +142,12 @@ class FakeProbes:
 
     def process_alive(self, pid: int) -> bool:
         return pid in self.alive_pids
+
+    def unit_active(self, unit: str) -> bool:
+        return unit in self.active_units
+
+    def process_belongs_to_unit(self, pid: int, unit: str) -> bool:
+        return self.unit_pids.get(unit) == pid
 
     def port_listening(self, port: int) -> bool:
         return port in self.listening_ports
@@ -350,7 +365,8 @@ class ResourceLedgerTests(HarnessCase):
 
     def test_events_are_hash_chained_and_tamper_evident(self) -> None:
         config, ledger = self.make_ledger()
-        ledger.record_resource("process", 4321, unit=None)
+        ledger.record_resource("unit", config.unit_name)
+        ledger.record_resource("process", 4321, unit=config.unit_name)
         ledger.record_release("process", 4321)
         document = json.loads(config.ledger_path.read_text())
         document["events"][0]["payload"]["value"] = 1
@@ -389,14 +405,25 @@ class ResourceLedgerTests(HarnessCase):
         with self.assertRaises(UnownedResourceError):
             ledger.record_resource("path", "/var/tmp/other")
         ledger.record_resource("pool", f"zerofs-tiered-{RUN_UUID}")
+        with self.assertRaises(UnownedResourceError):
+            ledger.record_resource("process", 4321)
         _ = config
 
     def test_acting_on_an_unrecorded_resource_is_rejected(self) -> None:
-        _, ledger = self.make_ledger()
+        config, ledger = self.make_ledger()
         with self.assertRaises(UnownedResourceError):
             ledger.require_owned("process", 999)
-        ledger.record_resource("process", 999)
+        ledger.record_resource("unit", config.unit_name)
+        ledger.record_resource("process", 999, unit=config.unit_name)
         ledger.require_owned("process", 999)
+
+    def test_released_resource_is_not_active(self) -> None:
+        _, ledger = self.make_ledger()
+        ledger.record_resource("device", "/dev/nbd7")
+        ledger.require_active("device", "/dev/nbd7")
+        ledger.record_release("device", "/dev/nbd7")
+        with self.assertRaises(UnownedResourceError):
+            ledger.require_active("device", "/dev/nbd7")
 
     def test_releases_reduce_the_outstanding_set(self) -> None:
         _, ledger = self.make_ledger()
@@ -407,10 +434,31 @@ class ResourceLedgerTests(HarnessCase):
             {(kind, value) for kind, value, _ in ledger.outstanding()},
         )
 
+    def test_release_then_reacquire_restores_cleanup_ownership(self) -> None:
+        _, ledger = self.make_ledger()
+        ledger.record_resource("listener", 12049, generation=1)
+        ledger.record_release("listener", 12049)
+        ledger.record_resource("listener", 12049, generation=2)
+        self.assertEqual(
+            [entry for entry in ledger.outstanding() if entry[0] == "listener"],
+            [("listener", 12049, {"generation": 2})],
+        )
+
+    def test_duplicate_active_acquire_and_release_are_rejected(self) -> None:
+        _, ledger = self.make_ledger()
+        ledger.record_resource("listener", 12049)
+        with self.assertRaises(UnownedResourceError):
+            ledger.record_resource("listener", 12049)
+        ledger.record_release("listener", 12049)
+        with self.assertRaises(UnownedResourceError):
+            ledger.record_release("listener", 12049)
+
     def test_ledger_value_reads_dotted_keys(self) -> None:
         config, ledger = self.make_ledger()
         self.assertEqual(ledger.value("identity.run_uuid"), RUN_UUID)
-        self.assertEqual(ledger.value("identity.control_root"), str(config.control_root))
+        self.assertEqual(
+            ledger.value("identity.control_root"), str(config.control_root)
+        )
         self.assertEqual(ledger.value("events.0.kind"), "acquire")
         with self.assertRaises(KeyError):
             ledger.value("identity.missing")
@@ -437,9 +485,7 @@ class SetupTests(HarnessCase):
         self.assertEqual(receipt["control_root"], str(config.control_root))
         self.assertEqual(receipt["resource_root"], str(config.resource_root))
         self.assertEqual(receipt["backend_prefix"], config.backend_prefix)
-        self.assertEqual(
-            receipt["tool_revisions"], dict(linux_suites.PINNED_REVISIONS)
-        )
+        self.assertEqual(receipt["tool_revisions"], dict(linux_suites.PINNED_REVISIONS))
         self.assertEqual(receipt["status"], "ok")
         self.assertIn(
             (("git", "-C", str(config.source_root), "rev-parse", "HEAD"), False),
@@ -452,9 +498,7 @@ class SetupTests(HarnessCase):
         config.control_root.mkdir(parents=True)
         config.receipt_root.write_text("blocker", encoding="utf-8")
         with self.assertRaises(SetupError):
-            lifecycle.setup(
-                zerofs_binary=self.binary, zerofs_config=self.zerofs_config
-            )
+            lifecycle.setup(zerofs_binary=self.binary, zerofs_config=self.zerofs_config)
         ledger = ResourceLedger.load(config.ledger_path)
         self.assertIn("setup-failed", [event["kind"] for event in ledger.events])
 
@@ -463,9 +507,7 @@ class SetupTests(HarnessCase):
         lifecycle, _, probes = self.make_lifecycle(config)
         config.resource_root.write_text("blocker", encoding="utf-8")
         with self.assertRaises(SetupError):
-            lifecycle.setup(
-                zerofs_binary=self.binary, zerofs_config=self.zerofs_config
-            )
+            lifecycle.setup(zerofs_binary=self.binary, zerofs_config=self.zerofs_config)
         ledger = ResourceLedger.load(config.ledger_path)
         self.assertIn("setup-failed", [event["kind"] for event in ledger.events])
         lifecycle.cleanup(ledger)
@@ -478,12 +520,19 @@ class SetupTests(HarnessCase):
         lifecycle, _, _ = self.make_lifecycle(config)
         lifecycle.setup(zerofs_binary=self.binary, zerofs_config=self.zerofs_config)
         with self.assertRaises(SetupError):
-            lifecycle.setup(
-                zerofs_binary=self.binary, zerofs_config=self.zerofs_config
-            )
+            lifecycle.setup(zerofs_binary=self.binary, zerofs_config=self.zerofs_config)
 
 
 class CleanupTests(HarnessCase):
+    def test_cleanup_does_not_stop_a_unit_that_was_never_created(self) -> None:
+        config = self.make_config()
+        lifecycle, runner, _, ledger = self.setup_run(config)
+        ledger.record_resource("unit", config.unit_name)
+        lifecycle.cleanup(ledger)
+        self.assertNotIn(
+            (("systemctl", "stop", config.unit_name), True), runner.calls
+        )
+
     def test_cleanup_removes_only_resource_root_entries(self) -> None:
         config = self.make_config()
         lifecycle, _, _, ledger = self.setup_run(config)
@@ -519,12 +568,15 @@ class CleanupTests(HarnessCase):
         lifecycle, runner, probes, ledger = self.setup_run(config)
         mountpoint = config.resource_root / "mnt" / "nfs"
         pool = f"zerofs-tiered-{RUN_UUID}"
-        ledger.record_resource("process", 4242)
+        ledger.record_resource("unit", config.unit_name)
+        ledger.record_resource("process", 4242, unit=config.unit_name)
         ledger.record_resource("listener", 12049)
         ledger.record_resource("mount", str(mountpoint))
         ledger.record_resource("device", "/dev/nbd7")
         ledger.record_resource("pool", pool)
-        probes.alive_pids.add(4242)
+        probes.alive_pids.add(4242)  # PID was reused by an unrelated process.
+        probes.active_units.add(config.unit_name)
+        probes.unit_pids[config.unit_name] = 99999
         probes.active_mounts.add(str(mountpoint))
         probes.attached_devices.add("/dev/nbd7")
         probes.pools.add(pool)
@@ -533,7 +585,8 @@ class CleanupTests(HarnessCase):
         self.assertIn(("zpool", "destroy", pool), commands)
         self.assertIn(("nbd-client", "-d", "/dev/nbd7"), commands)
         self.assertIn(("umount", str(mountpoint)), commands)
-        self.assertIn(("kill", "-9", "4242"), commands)
+        self.assertNotIn(("kill", "-9", "4242"), commands)
+        self.assertIn(("systemctl", "stop", config.unit_name), commands)
         reloaded = ResourceLedger.load(config.ledger_path)
         self.assertEqual(reloaded.outstanding(), [])
 
@@ -564,9 +617,11 @@ class AssertCleanTests(HarnessCase):
     def test_assert_clean_fails_when_a_recorded_resource_remains(self) -> None:
         config = self.make_config()
         lifecycle, _, probes, ledger = self.setup_run(config)
-        ledger.record_resource("process", 4242)
+        ledger.record_resource("unit", config.unit_name)
+        ledger.record_resource("process", 4242, unit=config.unit_name)
         lifecycle.cleanup(ledger)
-        probes.alive_pids.add(4242)
+        probes.active_units.add(config.unit_name)
+        probes.unit_pids[config.unit_name] = 4242
         with self.assertRaisesRegex(ResidualResourceError, "4242"):
             lifecycle.assert_clean(ResourceLedger.load(config.ledger_path))
 
@@ -685,6 +740,7 @@ class ScenarioPlanTests(HarnessCase):
                 self.assertEqual(plan.name, name)
                 self.assertTrue(plan.steps)
                 self.assertTrue(plan.durability_floors)
+                self.assertTrue(plan.requires_observed_durability)
                 for floor in plan.durability_floors:
                     self.assertIsInstance(floor, DurabilityFloor)
 
@@ -716,22 +772,29 @@ class ScenarioPlanTests(HarnessCase):
         options = mount[mount.index("-o") + 1]
         self.assertIn("trans=tcp", options)
         self.assertIn("version=9p2000.L", options)
-        self.assertTrue(
-            any(argv[0] == "dd" and "conv=fsync" in argv for argv in steps)
-        )
+        self.assertTrue(any(argv[0] == "dd" and "conv=fsync" in argv for argv in steps))
 
     def test_nbd_leg_connects_flushes_and_disconnects(self) -> None:
         steps = self.steps_for("nbd-flush-covers-prior-ninep")
         self.assertTrue(any(argv[0] == "nbd-client" for argv in steps))
-        self.assertTrue(
-            any(argv[:2] == ("blockdev", "--flushbufs") for argv in steps)
-        )
+        self.assertTrue(any(argv[:2] == ("blockdev", "--flushbufs") for argv in steps))
         self.assertIn(("nbd-client", "-d", "/dev/nbd7"), steps)
 
-    def test_webui_rpc_path_uses_real_grpc_and_websocket_clients(self) -> None:
+    def test_webui_rpc_path_mutates_rpc_and_moves_bytes_over_websocket(self) -> None:
         steps = self.steps_for("webui-rpc-production-path")
-        self.assertTrue(any(argv[0] == "grpcurl" for argv in steps))
-        self.assertTrue(any(argv[0] == "websocat" for argv in steps))
+        rpc_methods = {argv[-1] for argv in steps if argv[0] == "grpcurl"}
+        self.assertIn("zerofs.admin.AdminService/CreateDirectory", rpc_methods)
+        self.assertIn("zerofs.admin.AdminService/Flush", rpc_methods)
+        self.assertIn("zerofs.admin.AdminService/RemoveDirectory", rpc_methods)
+        self.assertFalse(any(argv[-1] == "list" for argv in steps))
+        uploads = [argv for argv in steps if len(argv) > 1 and argv[1] == "upload"]
+        downloads = [argv for argv in steps if len(argv) > 1 and argv[1] == "download"]
+        self.assertEqual(len(uploads), 1)
+        self.assertEqual(len(downloads), 1)
+        self.assertIn("/ws/9p", uploads[0][2])
+        self.assertIn("/ws/9p", downloads[0][2])
+        self.assertTrue(any(argv[0] == "cmp" for argv in steps))
+        self.assertFalse(any(argv[0] == "websocat" for argv in steps))
 
     def test_benchmark_scenarios_require_a_matching_object_ack_mode(self) -> None:
         for name, required in (
@@ -774,9 +837,69 @@ class ScenarioPlanTests(HarnessCase):
                         f"{name}: {argv} does not target the run-scoped unit",
                     )
 
+    def test_every_systemd_launch_captures_a_real_pid_and_owns_its_unit(self) -> None:
+        config = self.make_config()
+        for name in sorted(CONTRACT_SCENARIOS):
+            with self.subTest(scenario=name):
+                object_ = {
+                    "benchmark-ram-ack": "memory",
+                    "benchmark-local-ssd": "ssd",
+                }.get(name, "remote")
+                plan = SCENARIOS[name](self.context(object_=object_))
+                for step in plan.steps:
+                    if step.argv[0] != "systemd-run":
+                        continue
+                    self.assertEqual(step.capture_main_pid_unit, config.unit_name)
+                    self.assertIn(
+                        ("unit", config.unit_name),
+                        {(resource.kind, resource.value) for resource in step.acquires},
+                    )
+
+    def test_crash_plans_ledger_mount_pool_device_and_listener_lifecycles(self) -> None:
+        xfs = SCENARIOS["xfs-over-nbd-restart"](self.context())
+        zfs = SCENARIOS["zfs-over-nbd-restart"](self.context())
+        matrix = SCENARIOS["crash-boundary-matrix"](self.context())
+        self.assertTrue(
+            any(
+                resource.kind == "mount"
+                for step in xfs.steps
+                for resource in step.acquires
+            )
+        )
+        self.assertTrue(
+            any(
+                resource.kind == "pool"
+                for step in zfs.steps
+                for resource in step.acquires
+            )
+        )
+        self.assertTrue(
+            any(
+                resource.kind == "device"
+                for step in xfs.steps
+                for resource in step.requires
+            )
+        )
+        self.assertTrue(
+            any(
+                resource.kind == "listener"
+                for step in matrix.steps
+                for resource in step.acquires
+            )
+        )
+
+    def test_webui_plan_admits_the_missing_browser_wasm_and_grpc_web_leg(self) -> None:
+        plan = SCENARIOS["webui-rpc-production-path"](self.context())
+        self.assertTrue(plan.acceptance_gaps)
+        rendered = " ".join(plan.acceptance_gaps).lower()
+        self.assertIn("wasm", rendered)
+        self.assertIn("grpc-web", rendered)
+
     def test_plans_only_touch_owned_mountpoints(self) -> None:
         config = self.make_config()
-        for name in sorted(CONTRACT_SCENARIOS - {"benchmark-ram-ack", "benchmark-local-ssd"}):
+        for name in sorted(
+            CONTRACT_SCENARIOS - {"benchmark-ram-ack", "benchmark-local-ssd"}
+        ):
             plan = SCENARIOS[name](self.context())
             for step in plan.steps:
                 if step.argv[0] in ("mount.nfs",):
@@ -869,6 +992,30 @@ class LinuxSuiteTests(HarnessCase):
 
 
 class RunScenarioTests(HarnessCase):
+    def run_unit_plan(
+        self,
+        lifecycle: HarnessLifecycle,
+        ledger: ResourceLedger,
+        scenario: str,
+    ) -> dict[str, Any]:
+        builder = SCENARIOS[scenario]
+
+        def without_frontier_gate(context: ScenarioContext):
+            return replace(
+                builder(context),
+                requires_observed_durability=False,
+                acceptance_gaps=(),
+            )
+
+        with mock.patch.dict(SCENARIOS, {scenario: without_frontier_gate}):
+            return lifecycle.run_scenario(
+                ledger,
+                scenario,
+                zerofs_binary=self.binary,
+                zerofs_config=self.zerofs_config,
+                plan_only=False,
+            )
+
     def test_plan_only_run_writes_a_receipt_with_the_manifest(self) -> None:
         config = self.make_config()
         lifecycle, _, _, ledger = self.setup_run(config)
@@ -882,11 +1029,38 @@ class RunScenarioTests(HarnessCase):
         receipt = json.loads(Path(summary["receipt"]).read_text())
         self.assertEqual(receipt["scenario"], "global-admission-nbd-nfs-ninep")
         self.assertEqual(receipt["terminal_state"], "planned")
-        self.assertEqual(receipt["exit_status"], 0)
+        self.assertIsNone(receipt["exit_status"])
+        self.assertEqual(receipt["status"], "planned")
         self.assertTrue(receipt["manifest"]["steps"])
-        self.assertTrue(receipt["durability_floors"])
+        self.assertTrue(receipt["manifest"]["expected_durability"])
+        self.assertEqual(receipt["durability_floors"], [])
         for field in REQUIRED_RECEIPT_FIELDS:
             self.assertIn(field, receipt, field)
+
+    def test_c3_refuses_to_convert_ack_flags_into_observed_frontiers(self) -> None:
+        config = self.make_config(filesystem="volatile_memory", object_="memory")
+        lifecycle, runner, _, ledger = self.setup_run(config)
+        with self.assertRaisesRegex(LifecycleError, "browser WASM"):
+            lifecycle.run_scenario(
+                ledger,
+                "webui-rpc-production-path",
+                zerofs_binary=self.binary,
+                zerofs_config=self.zerofs_config,
+                plan_only=False,
+            )
+        self.assertFalse(
+            any(args[0] in ("grpcurl", "websocat") for args, _ in runner.calls)
+        )
+        receipts = sorted(config.receipt_root.rglob("manifest.json"))
+        payloads = [json.loads(path.read_text()) for path in receipts]
+        payload = next(
+            candidate
+            for candidate in payloads
+            if candidate.get("scenario") == "webui-rpc-production-path"
+        )
+        self.assertEqual(payload["durability_floors"], [])
+        self.assertEqual(payload["terminal_state"], "failed")
+        self.assertEqual(payload["cleanup_status"], "ok")
 
     def test_execution_requires_linux(self) -> None:
         config = self.make_config()
@@ -932,13 +1106,7 @@ class RunScenarioTests(HarnessCase):
 
         with mock.patch.object(lifecycle, "cleanup", side_effect=failing_cleanup):
             with self.assertRaises(PrimaryAndCleanupError) as caught:
-                lifecycle.run_scenario(
-                    ledger,
-                    "global-admission-nbd-nfs-ninep",
-                    zerofs_binary=self.binary,
-                    zerofs_config=self.zerofs_config,
-                    plan_only=False,
-                )
+                self.run_unit_plan(lifecycle, ledger, "benchmark-paced-remote")
         self.assertIn("injected primary failure", str(caught.exception))
         self.assertIn("injected cleanup failure", str(caught.exception))
         receipt = json.loads(Path(caught.exception.receipt).read_text())
@@ -952,13 +1120,7 @@ class RunScenarioTests(HarnessCase):
         lifecycle, runner, _, ledger = self.setup_run(config)
         runner.failures[("mount.nfs",)] = RuntimeError("injected primary failure")
         with self.assertRaisesRegex(RuntimeError, "injected primary failure"):
-            lifecycle.run_scenario(
-                ledger,
-                "global-admission-nbd-nfs-ninep",
-                zerofs_binary=self.binary,
-                zerofs_config=self.zerofs_config,
-                plan_only=False,
-            )
+            self.run_unit_plan(lifecycle, ledger, "benchmark-paced-remote")
         self.assertFalse(config.resource_root.exists())
 
     def test_supervisor_cancellation_is_recorded_and_cleaned_up(self) -> None:
@@ -966,13 +1128,7 @@ class RunScenarioTests(HarnessCase):
         lifecycle, runner, _, ledger = self.setup_run(config)
         runner.failures[("mount.nfs",)] = KeyboardInterrupt()
         with self.assertRaises(KeyboardInterrupt):
-            lifecycle.run_scenario(
-                ledger,
-                "global-admission-nbd-nfs-ninep",
-                zerofs_binary=self.binary,
-                zerofs_config=self.zerofs_config,
-                plan_only=False,
-            )
+            self.run_unit_plan(lifecycle, ledger, "benchmark-paced-remote")
         receipts = sorted(config.receipt_root.rglob("manifest.json"))
         payloads = [json.loads(path.read_text()) for path in receipts]
         cancelled = [
@@ -987,21 +1143,71 @@ class RunScenarioTests(HarnessCase):
     def test_successful_execution_records_commands_and_exit_status(self) -> None:
         config = self.make_config()
         lifecycle, runner, _, ledger = self.setup_run(config)
-        summary = lifecycle.run_scenario(
-            ledger,
-            "webui-rpc-production-path",
-            zerofs_binary=self.binary,
-            zerofs_config=self.zerofs_config,
-            plan_only=False,
-        )
+        summary = self.run_unit_plan(lifecycle, ledger, "benchmark-paced-remote")
         receipt = json.loads(Path(summary["receipt"]).read_text())
         self.assertEqual(receipt["terminal_state"], "completed")
         self.assertEqual(receipt["exit_status"], 0)
         self.assertTrue(receipt["commands"])
         executed = [tuple(command) for command in receipt["commands"]]
         self.assertEqual(
-            executed, [args for args, _ in runner.calls[len(runner.calls) - len(executed):]]
+            executed,
+            [args for args, _ in runner.calls[len(runner.calls) - len(executed) :]],
         )
+        reloaded = ResourceLedger.load(config.ledger_path)
+        acquired = {(kind, str(value)) for kind, value, _ in reloaded.resources()}
+        self.assertIn(("unit", config.unit_name), acquired)
+        self.assertIn(("process", "4242"), acquired)
+        self.assertEqual(receipt["pids"], [4242])
+        self.assertEqual(receipt["units"], [config.unit_name])
+        self.assertIn(("listener", str(protocols.NFS_PORT)), acquired)
+        self.assertNotIn(
+            "process",
+            {kind for kind, _, _ in reloaded.outstanding()},
+        )
+        self.assertNotIn(
+            "listener",
+            {kind for kind, _, _ in reloaded.outstanding()},
+        )
+
+    def test_crash_restart_reacquires_the_run_scoped_process(self) -> None:
+        config = self.make_config()
+        lifecycle, _, _, ledger = self.setup_run(config)
+        summary = self.run_unit_plan(lifecycle, ledger, "local-receipt-restart")
+        self.assertEqual(summary["terminal_state"], "completed")
+        reloaded = ResourceLedger.load(config.ledger_path)
+        process_acquires = [
+            value for kind, value, _ in reloaded.resources() if kind == "process"
+        ]
+        self.assertEqual(process_acquires, [4242, 4243])
+        unit_acquires = [
+            value for kind, value, _ in reloaded.resources() if kind == "unit"
+        ]
+        self.assertEqual(unit_acquires, [config.unit_name, config.unit_name])
+        self.assertNotIn(
+            "process",
+            {kind for kind, _, _ in reloaded.outstanding()},
+        )
+
+    def test_every_crash_plan_balances_its_runtime_resources(self) -> None:
+        for scenario in (
+            "xfs-over-nbd-restart",
+            "zfs-over-nbd-restart",
+            "crash-boundary-matrix",
+            "local-receipt-restart",
+            "remote-receipt-clean-cache-restart",
+            "terminal-fanout-and-shutdown-timeout",
+        ):
+            with self.subTest(scenario=scenario):
+                config = self.make_config(run_uuid=str(uuid.uuid4()))
+                lifecycle, _, _, ledger = self.setup_run(config)
+                self.run_unit_plan(lifecycle, ledger, scenario)
+                active_kinds = {
+                    kind
+                    for kind, _, _ in ResourceLedger.load(
+                        config.ledger_path
+                    ).outstanding()
+                }
+                self.assertEqual(active_kinds, {"path", "prefix"})
 
 
 class IntegrityHelperTests(HarnessCase):
@@ -1271,9 +1477,7 @@ class WorkflowContractTests(unittest.TestCase):
                 while parts[-1].endswith("\\"):
                     index += 1
                     parts.append(lines[index].strip())
-                commands.append(
-                    " ".join(part.rstrip("\\").strip() for part in parts)
-                )
+                commands.append(" ".join(part.rstrip("\\").strip() for part in parts))
             index += 1
         return commands
 
