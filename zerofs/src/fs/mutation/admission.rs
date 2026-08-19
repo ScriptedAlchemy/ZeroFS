@@ -547,6 +547,7 @@ mod tests {
                         ..FileAttributes::default()
                     },
                 )],
+                cutoff: None,
             },
         )
     }
@@ -635,6 +636,7 @@ mod tests {
             owner.accept(),
             Ok(PreparedBatchResult {
                 members: vec![(1, FileAttributes::default())],
+                cutoff: None,
             }),
         );
         waiter.await.unwrap().unwrap();
@@ -672,6 +674,7 @@ mod tests {
             request,
             Ok(PreparedBatchResult {
                 members: vec![(1, FileAttributes::default())],
+                cutoff: None,
             }),
         );
         drop(permit);

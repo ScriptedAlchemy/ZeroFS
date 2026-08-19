@@ -1,6 +1,7 @@
 use super::error::{CommandError, NBDError, Result};
 use super::handler::{
-    MutationAdmission, NBDDevice, NBDHandler, NbdExportGates, OptionReply, OptionResult,
+    MutationAdmission, NBDDevice, NBDHandler, NbdExportGates, NbdMutationRequest, OptionReply,
+    OptionResult,
 };
 use super::out_of_bounds;
 use crate::fs::ZeroFS;
@@ -8,8 +9,9 @@ use bytes::BytesMut;
 use deku::prelude::*;
 use futures::stream::{self, FuturesUnordered, StreamExt};
 use nbd_proto::*;
+use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{TcpListener, UnixListener};
@@ -27,6 +29,38 @@ const CLIENT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const WRITE_PAYLOAD_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(test)]
 const WRITE_PAYLOAD_TIMEOUT: Duration = Duration::from_millis(100);
+
+#[derive(Clone, Default)]
+struct ActiveHandles {
+    handles: Arc<Mutex<HashSet<u64>>>,
+}
+
+impl ActiveHandles {
+    fn reserve(&self, handle: u64) -> std::result::Result<ActiveHandle, ()> {
+        let mut handles = self.handles.lock().expect("active NBD handles poisoned");
+        if !handles.insert(handle) {
+            return Err(());
+        }
+        Ok(ActiveHandle {
+            handles: Arc::clone(&self.handles),
+            handle,
+        })
+    }
+}
+
+struct ActiveHandle {
+    handles: Arc<Mutex<HashSet<u64>>>,
+    handle: u64,
+}
+
+impl Drop for ActiveHandle {
+    fn drop(&mut self) {
+        self.handles
+            .lock()
+            .expect("active NBD handles poisoned")
+            .remove(&self.handle);
+    }
+}
 
 pub enum Transport {
     Tcp(SocketAddr),
@@ -544,6 +578,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
         // discarded after a terminal writer failure. Reply data is charged the
         // same way, since a queued READ reply is just as resident.
         let budget = Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_BYTES));
+        let active_handles = ActiveHandles::default();
         let (reply_tx, reply_rx) = tokio::sync::mpsc::channel::<Reply>(MAX_INFLIGHT_COMMANDS);
 
         // Streams rather than futures rebuilt each iteration, for two reasons.
@@ -554,11 +589,14 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
         // `write_all` is cancellation-safe.
         let mut commands = Box::pin(stream::unfold((reader, false), move |(reader, stop)| {
             let budget = Arc::clone(&budget);
+            let active_handles = active_handles.clone();
             async move {
                 if stop {
                     return None;
                 }
-                match next_admitted(reader, handler, device, shutdown, &budget).await {
+                match next_admitted(reader, handler, device, shutdown, &budget, &active_handles)
+                    .await
+                {
                     Ok(None) => None,
                     Ok(Some(command)) => Some((Ok(command), (reader, false))),
                     // Surface the failure, then stop reading this session.
@@ -575,7 +613,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
         let mut replies = Box::pin(stream::unfold(
             (writer, reply_rx, false),
             |(writer, mut reply_rx, writer_failed)| async move {
-                let (cookie, result, budget) = reply_rx.recv().await?;
+                let (cookie, result, budget, active_handle) = reply_rx.recv().await?;
                 let outcome = if writer_failed {
                     // The outbound half is irrecoverable. Continue draining
                     // completed commands so their byte credit and admission
@@ -586,6 +624,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
                 };
                 // Held until the reply is on the wire, not merely produced.
                 drop(budget);
+                drop(active_handle);
                 let writer_failed = writer_failed || outcome.is_err();
                 Some((outcome, (writer, reply_rx, writer_failed)))
             },
@@ -637,8 +676,13 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
                             accepting = false;
                             terminal_error.get_or_insert(error);
                         }
-                        Some(Ok((cookie, command, budget))) => inflight.push(async move {
-                            (cookie, run_admitted(handler, device, command).await, budget)
+                        Some(Ok((cookie, command, budget, active_handle))) => inflight.push(async move {
+                            (
+                                cookie,
+                                run_admitted(handler, device, command).await,
+                                budget,
+                                active_handle,
+                            )
                         }),
                     }
                 }
@@ -674,6 +718,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
             device,
             offset,
             length,
+            fua,
             &self.shutdown,
         )
         .await?
@@ -708,6 +753,7 @@ type Reply = (
     u64,
     super::error::CommandResult<bytes::Bytes>,
     tokio::sync::OwnedSemaphorePermit,
+    Option<ActiveHandle>,
 );
 
 /// Byte credit a command should hold while in flight, clamped so one oversized
@@ -756,6 +802,7 @@ async fn admit_write<R>(
     device: &NBDDevice,
     offset: u64,
     length: u32,
+    fua: bool,
     shutdown: &CancellationToken,
 ) -> super::error::CommandResult<Option<(bytes::Bytes, MutationAdmission)>>
 where
@@ -771,7 +818,19 @@ where
         return Ok(None);
     }
 
-    let admission = match handler.begin_mutation(device, length as usize).await {
+    let begin = handler.begin_mutation(
+        device,
+        NbdMutationRequest {
+            offset,
+            length: length as usize,
+            fua,
+        },
+    );
+    let admission = match tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => return Err(CommandError::IoError),
+        result = begin => result,
+    } {
         Ok(admission) => admission,
         Err(error) => {
             discard_write_payload(reader, length, shutdown).await?;
@@ -855,7 +914,15 @@ async fn next_admitted<R>(
     device: &NBDDevice,
     shutdown: &CancellationToken,
     budget: &Arc<tokio::sync::Semaphore>,
-) -> Result<Option<(u64, AdmittedCommand, tokio::sync::OwnedSemaphorePermit)>>
+    active_handles: &ActiveHandles,
+) -> Result<
+    Option<(
+        u64,
+        AdmittedCommand,
+        tokio::sync::OwnedSemaphorePermit,
+        Option<ActiveHandle>,
+    )>,
+>
 where
     R: AsyncRead + Unpin,
 {
@@ -896,6 +963,31 @@ where
         request.cmd_type, request.offset, request.length
     );
 
+    let active_handle = match active_handles.reserve(request.cookie) {
+        Ok(active_handle) => active_handle,
+        Err(()) => {
+            if request.cmd_type == NBDCommand::Write {
+                discard_write_payload(reader, request.length, shutdown)
+                    .await
+                    .map_err(|_| {
+                        NBDError::Protocol(
+                            "failed to drain colliding NBD WRITE payload".to_string(),
+                        )
+                    })?;
+            }
+            let credit = Arc::clone(budget)
+                .acquire_many_owned(0)
+                .await
+                .map_err(|_| NBDError::Protocol("connection byte budget closed".into()))?;
+            return Ok(Some((
+                request.cookie,
+                AdmittedCommand::Settled(Err(CommandError::InvalidArgument)),
+                credit,
+                None,
+            )));
+        }
+    };
+
     // Charged before any payload is read and released only once the reply is
     // written, so both the request body and the reply body are covered. A
     // command that carries neither costs nothing but is still count-capped.
@@ -919,6 +1011,7 @@ where
             request.cookie,
             AdmittedCommand::Settled(Err(CommandError::InvalidArgument)),
             credit,
+            Some(active_handle),
         )));
     }
 
@@ -935,6 +1028,7 @@ where
                 device,
                 request.offset,
                 request.length,
+                fua,
                 shutdown,
             )
             .await
@@ -969,7 +1063,7 @@ where
             AdmittedCommand::Settled(Err(CommandError::InvalidArgument))
         }
     };
-    Ok(Some((request.cookie, command, credit)))
+    Ok(Some((request.cookie, command, credit, Some(active_handle))))
 }
 
 /// Run an already-admitted command. Touches no socket, so several may be in
@@ -1039,7 +1133,7 @@ mod tests {
     use crate::fs::ZeroFS;
     use crate::fs::permissions::Credentials;
     use crate::fs::types::{SetAttributes, SetSize};
-    use crate::nbd::handler::{NBDHandler, NbdExportGates};
+    use crate::nbd::handler::{NBDHandler, NbdExportGates, NbdMutationRequest};
     use bytes::Bytes;
     use deku::{DekuContainerRead, DekuContainerWrite};
     use nbd_proto::{
@@ -1825,7 +1919,14 @@ mod tests {
         let fua_task = tokio::spawn(async move {
             let payload = Bytes::from(vec![0x33; 4096]);
             let admission = fua_handler
-                .begin_mutation(&fua_device, payload.len())
+                .begin_mutation(
+                    &fua_device,
+                    NbdMutationRequest {
+                        offset: 0,
+                        length: payload.len(),
+                        fua: true,
+                    },
+                )
                 .await?;
             fua_handler
                 .write_admitted(&fua_device, 0, payload, true, admission)
@@ -2492,6 +2593,7 @@ mod tests {
         .expect("read volatile write ACK");
         let (_, reply) = NBDSimpleReply::from_bytes((&reply_bytes, 0)).expect("decode write ACK");
         assert_eq!((reply.cookie, reply.error), (1, 0));
+
         timeout(Duration::from_secs(2), apply_reached)
             .await
             .expect("background materializer reached the blocked coordinator")
@@ -2509,6 +2611,24 @@ mod tests {
         );
 
         client_stream
+            .write_all(&probe_request(NBDCommand::Write, 1, 0, 4096))
+            .await
+            .expect("reuse cookie after its reply");
+        client_stream
+            .write_all(&vec![0x7e; 4096])
+            .await
+            .expect("send reused-cookie payload");
+        assert!(
+            timeout(
+                Duration::from_millis(100),
+                client_stream.read_exact(&mut reply_bytes),
+            )
+            .await
+            .is_err(),
+            "legal cookie reuse must not be rejected while the prior materialization is blocked"
+        );
+
+        client_stream
             .write_all(&probe_request(NBDCommand::Flush, 2, 0, 0))
             .await
             .expect("send durability fence");
@@ -2523,20 +2643,111 @@ mod tests {
         );
 
         drop(commit_block);
-        timeout(
-            Duration::from_secs(5),
-            client_stream.read_exact(&mut reply_bytes),
-        )
-        .await
-        .expect("FLUSH replied after materialization")
-        .expect("read FLUSH reply");
-        let (_, reply) = NBDSimpleReply::from_bytes((&reply_bytes, 0)).expect("decode FLUSH reply");
-        assert_eq!((reply.cookie, reply.error), (2, 0));
+        let mut replies = Vec::new();
+        for _ in 0..2 {
+            timeout(
+                Duration::from_secs(5),
+                client_stream.read_exact(&mut reply_bytes),
+            )
+            .await
+            .expect("WRITE and FLUSH replied after materialization")
+            .expect("read post-materialization reply");
+            let (_, reply) =
+                NBDSimpleReply::from_bytes((&reply_bytes, 0)).expect("decode simple reply");
+            replies.push((reply.cookie, reply.error));
+        }
+        replies.sort_unstable();
+        assert_eq!(replies, vec![(1, 0), (2, 0)]);
 
         client_stream
             .write_all(&probe_request(NBDCommand::Disconnect, 0, 0, 0))
             .await
             .expect("send disconnect");
+        timeout(Duration::from_secs(5), session_task)
+            .await
+            .expect("session stopped")
+            .expect("session task did not panic")
+            .expect("session accepted disconnect");
+        export_gates.stop_and_drain().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn materialized_duplicate_active_cookie_is_rejected_and_its_body_is_drained() {
+        let filesystem = Arc::new(ZeroFS::new_in_memory().await.expect("create filesystem"));
+        let export_gates = Arc::new(NbdExportGates::default());
+        let device = single_file_export(&filesystem, &export_gates).await;
+        let commit_block = filesystem.db.flush_barrier().write_owned().await;
+        let apply_reached = filesystem.write_coordinator.probe_next_apply();
+        let (server_stream, mut client_stream) = tokio::io::duplex(1024 * 1024);
+        let (reader, writer) = tokio::io::split(server_stream);
+        let mut session = NBDSession::new(
+            reader,
+            writer,
+            Arc::clone(&filesystem),
+            Arc::clone(&export_gates),
+            CancellationToken::new(),
+        );
+        let session_task = tokio::spawn(async move { session.handle_transmission(device).await });
+
+        client_stream
+            .write_all(&probe_request(NBDCommand::Write, 9, 0, 4096))
+            .await
+            .unwrap();
+        client_stream.write_all(&vec![0x31; 4096]).await.unwrap();
+        timeout(Duration::from_secs(2), apply_reached)
+            .await
+            .expect("first write reached canonical apply")
+            .expect("apply probe remained available");
+        client_stream
+            .write_all(&probe_request(NBDCommand::Write, 9, 0, 4096))
+            .await
+            .unwrap();
+        client_stream.write_all(&vec![0x62; 4096]).await.unwrap();
+
+        let mut reply_bytes = [0; 16];
+        timeout(
+            Duration::from_secs(1),
+            client_stream.read_exact(&mut reply_bytes),
+        )
+        .await
+        .expect("duplicate active cookie rejected before first write completes")
+        .expect("read collision reply");
+        let (_, collision) =
+            NBDSimpleReply::from_bytes((&reply_bytes, 0)).expect("decode collision reply");
+        assert_eq!(collision.cookie, 9);
+        assert_ne!(collision.error, 0);
+
+        drop(commit_block);
+        timeout(
+            Duration::from_secs(5),
+            client_stream.read_exact(&mut reply_bytes),
+        )
+        .await
+        .expect("first write replied after canonical apply")
+        .expect("read first reply");
+        let (_, first) = NBDSimpleReply::from_bytes((&reply_bytes, 0)).expect("decode first reply");
+        assert_eq!((first.cookie, first.error), (9, 0));
+
+        client_stream
+            .write_all(&probe_request(NBDCommand::Read, 10, 0, 4096))
+            .await
+            .expect("send request after rejected payload");
+        let mut read_reply = vec![0; 16 + 4096];
+        timeout(
+            Duration::from_secs(5),
+            client_stream.read_exact(&mut read_reply),
+        )
+        .await
+        .expect("stream remained aligned after collision body drain")
+        .expect("read data reply");
+        let (_, reply) = NBDSimpleReply::from_bytes((&read_reply[..16], 0)).unwrap();
+        assert_eq!((reply.cookie, reply.error), (10, 0));
+        assert_eq!(&read_reply[16..], &[0x31; 4096]);
+
+        client_stream
+            .write_all(&probe_request(NBDCommand::Disconnect, 0, 0, 0))
+            .await
+            .unwrap();
         timeout(Duration::from_secs(5), session_task)
             .await
             .expect("session stopped")
@@ -2644,6 +2855,7 @@ mod tests {
             &device,
             0,
             7,
+            false,
             &CancellationToken::new(),
         )
         .await;
@@ -2664,7 +2876,16 @@ mod tests {
         let shutdown = CancellationToken::new();
         let mut truncated_body: &[u8] = b"x";
 
-        let result = admit_write(&mut truncated_body, &handler, &device, 4095, 2, &shutdown).await;
+        let result = admit_write(
+            &mut truncated_body,
+            &handler,
+            &device,
+            4095,
+            2,
+            false,
+            &shutdown,
+        )
+        .await;
 
         assert!(matches!(result, Err(CommandError::IoError)));
         assert!(
@@ -2686,7 +2907,16 @@ mod tests {
         let shutdown = CancellationToken::new();
         let mut truncated_body: &[u8] = b"x";
 
-        let result = admit_write(&mut truncated_body, &handler, &device, 0, 2, &shutdown).await;
+        let result = admit_write(
+            &mut truncated_body,
+            &handler,
+            &device,
+            0,
+            2,
+            false,
+            &shutdown,
+        )
+        .await;
 
         assert!(matches!(result, Err(CommandError::IoError)));
         assert!(

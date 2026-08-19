@@ -8,7 +8,8 @@
 use crate::fs::ZeroFS;
 use crate::fs::errors::FsError;
 use crate::fs::inode::InodeId;
-use crate::fs::mutation::durability::DurabilityTarget;
+use crate::fs::mutation::durability::{DurabilityReceipt, DurabilityTarget};
+use crate::fs::mutation::types::MutationCutoff;
 
 impl ZeroFS {
     /// Barrier used by NFS COMMIT, 9P `Tfsync`/`Tfsyncdur`, and NBD FLUSH.
@@ -19,14 +20,16 @@ impl ZeroFS {
         if let Some(overlay) = self.volatile_overlay.get() {
             overlay.wait_all().await.map_err(|_| FsError::IoError)?;
         }
-        self.durable_to_configured_target().await
+        self.durable_to_configured_target(self.capture_mutation_cutoff())
+            .await
     }
 
     pub(crate) async fn wait_inode_durability(&self, id: InodeId) -> Result<(), FsError> {
         if let Some(overlay) = self.volatile_overlay.get() {
             overlay.wait_inode(id).await.map_err(|_| FsError::IoError)?;
         }
-        self.durable_to_configured_target().await
+        self.durable_to_configured_target(self.capture_mutation_cutoff())
+            .await
     }
 
     /// FUA-style wait: cover every backing inode of one logical write, then
@@ -40,14 +43,38 @@ impl ZeroFS {
                     .map_err(|_| FsError::IoError)?;
             }
         }
-        self.durable_to_configured_target().await
+        self.durable_to_configured_target(self.capture_mutation_cutoff())
+            .await
     }
 
-    async fn durable_to_configured_target(&self) -> Result<(), FsError> {
+    /// FUA-style durability for the exact accepted mutation. A later writer
+    /// cannot extend this wait by racing a new global cutoff capture.
+    pub(crate) async fn wait_mutation_durability(
+        &self,
+        cutoff: MutationCutoff,
+    ) -> Result<(), FsError> {
+        self.durable_to_configured_target(cutoff).await
+    }
+
+    /// Administrative flush is an explicit remote-backend barrier. It is not
+    /// a client `fsync`, so neither the configured client target nor
+    /// `ignore_fsync` may weaken it.
+    pub(crate) async fn administrative_remote_durability(
+        &self,
+    ) -> Result<DurabilityReceipt, FsError> {
+        self.flush_coordinator
+            .durable_through(
+                self.capture_mutation_cutoff(),
+                DurabilityTarget::RemoteBackend,
+            )
+            .await
+            .map_err(FsError::from)
+    }
+
+    async fn durable_to_configured_target(&self, cutoff: MutationCutoff) -> Result<(), FsError> {
         if self.ignore_fsync {
             return Ok(());
         }
-        let cutoff = self.capture_mutation_cutoff();
         let target = DurabilityTarget::from(self.write_ack.client_durability_target);
         self.flush_coordinator
             .durable_through(cutoff, target)

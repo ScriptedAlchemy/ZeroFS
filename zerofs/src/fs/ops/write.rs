@@ -285,7 +285,10 @@ fn replayed_batch(
         .collect();
     Ok(Some(PreparedWriteBatch::replayed(
         request.op_id,
-        PreparedBatchResult { members },
+        PreparedBatchResult {
+            members,
+            cutoff: None,
+        },
     )))
 }
 
@@ -414,6 +417,7 @@ pub(crate) async fn apply_prepared_batch(
             .iter()
             .map(|member| (member.id, member.post_attrs.clone()))
             .collect(),
+        cutoff: None,
     })
 }
 
@@ -427,6 +431,7 @@ async fn empty_batch_result(
             .iter()
             .map(|member| (member.id, member.post_attrs.clone()))
             .collect(),
+        cutoff: None,
     };
     if crate::dedup::has_op_id(&batch.op_id) {
         let mut txn = fs.db.new_transaction()?;
