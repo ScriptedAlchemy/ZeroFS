@@ -380,10 +380,12 @@ Pending reads remain coherent through the mutation overlay and canonical store, 
 chunked NFS rsync cannot fill the clean read cache. Subsequent reads populate the
 cache normally. Segment GC and compaction group adjacent source ranges into bounded
 sequential scans and use explicit no-admit/no-fill reads. Reclaim verification also
-batches sparse/interleaved forward keys: a full 1,024-frame segment uses no more than
-16 fixed 64-key batches and two streaming views, for at most 32 scans rather than
-2,048 point reads. Across both views it may inspect at most 4,096 rows and 64 MiB of
-encoded key/value bytes; exhausting either budget returns `Keep`. Scan/decode errors
+batches sparse/interleaved forward keys: a real maximum 256 MiB compacted segment has
+approximately 8,192 32 KiB frames and uses 16 fixed 512-key batches plus two streaming
+views, for at most 32 scans rather than about 16,384 point reads. The desired keys
+occupy about 16,384 two-view rows; a fixed fourfold ceiling permits at most 65,536
+scanned rows including bounded gap overhead, while encoded key/value bytes remain
+capped at 64 MiB. Exhausting either budget returns `Keep`. Scan/decode errors
 and either view retaining a reference fail closed. Focused acceptance lists and runs
 both exact reclaim tests with nonzero selection; a raw Cargo zero-test success is not
 evidence.
@@ -682,8 +684,9 @@ Implementation follows strict RED/GREEN slices. The required proof matrix includ
     residual `<= 2 GiB`, reconciles owned, baseline, and residual residency within
     those limits, records zero cgroup `oom`/`oom_kill` deltas, and proves retained-only
     virtual growth cannot create false physical over-cap/backpressure. The same soak
-    verifies a sparse/interleaved 1,024-frame reclaim candidate stays within 32 scans
-    and bounded maintenance memory.
+    verifies a real sparse/interleaved maximum 256 MiB/~8,192-frame reclaim candidate
+    stays within 32 scans, 65,536 rows, 64 MiB encoded bytes, and bounded maintenance
+    memory.
 18. stock OpenSSH versus pinned HPN versus ZeroFS SFTP A/Bs for upload and download at
     one and configured-many sessions. Each cell records executable identity, RTT,
     TCP window/retransmits, SFTP depth, lane utilization, exact bytes, SHA-256, and
