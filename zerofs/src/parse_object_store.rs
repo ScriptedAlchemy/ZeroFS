@@ -349,7 +349,15 @@ async fn build_sftp_store(
         port: url.port().unwrap_or(22),
         username: url.username().to_owned(),
     };
-    let factory = crate::sftp_transport::OpenSshSessionFactory::new(
+    tracing::info!(
+        host = %endpoint.host,
+        port = endpoint.port,
+        window_size = crate::sftp_transport::RUSSH_WINDOW_SIZE,
+        maximum_packet_size = crate::sftp_transport::RUSSH_MAXIMUM_PACKET_SIZE,
+        max_concurrent_writes = crate::sftp_transport::RUSSH_SFTP_MAX_CONCURRENT_WRITES,
+        "opening russh SFTP object store"
+    );
+    let factory = crate::sftp_transport::RusshSessionFactory::new(
         endpoint,
         config.identity_file.clone(),
         config.known_hosts.clone(),

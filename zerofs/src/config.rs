@@ -1959,7 +1959,7 @@ impl Settings {
         toml_string.push_str("# resume_percent = 85\n");
         toml_string.push_str("# local_concurrency = 4\n");
         toml_string.push_str(
-            "# upload_concurrency = 4         # keep total sessions inside the backend's concurrent-connection cap\n",
+            "# upload_concurrency = 4         # generic default; SFTP auto-defaults to 7 and pipelines 64 requests per session\n",
         );
         toml_string.push_str("# shutdown_flush = \"local\"       # local | remote\n");
 
@@ -2554,16 +2554,16 @@ min_free_gb = 256.0"#,
             .unwrap();
         // Memory acknowledgement is the point of the tier: bursts land at RAM
         // speed while client flush barriers still force SSD durability. The
-        // default upload concurrency stays deliberately below the SFTP
-        // write-stream budget so total session demand keeps clear of backend
-        // concurrent-connection caps.
+        // default upload concurrency fills the SFTP write-stream budget.
+        // Per-session WRITE pipelining is 64; the leftover default of 4
+        // upload lanes is not preserved.
         assert_eq!(
             writeback.ack_mode,
             crate::writeback::config::AckMode::Memory
         );
         assert_eq!(writeback.disk_bytes, 512_000_000_000);
         assert_eq!(writeback.local_concurrency, 4);
-        assert_eq!(writeback.upload_concurrency, 4);
+        assert_eq!(writeback.upload_concurrency, 7);
     }
 
     #[test]
@@ -2809,6 +2809,16 @@ min_free_gb = 256.0"#,
         assert_eq!(endpoint.host, "example.com");
         assert_eq!(endpoint.username, "alice");
         assert_eq!(endpoint.port, 22);
+
+        let rendered = Settings::render_default_config().unwrap();
+        assert!(
+            rendered.contains("# identity_file = \"${HOME}/.ssh/id_ed25519\""),
+            "generated config must document native key auth"
+        );
+        assert!(
+            !rendered.contains("ssh_program"),
+            "native russh transport must not advertise an OpenSSH wrapper"
+        );
     }
 
     #[test]

@@ -31,6 +31,7 @@ mod redis_conditional_store;
 mod replication;
 mod retrying_object_store;
 mod rpc;
+mod russh_session;
 mod segment;
 mod segment_extractor;
 mod segment_store;
