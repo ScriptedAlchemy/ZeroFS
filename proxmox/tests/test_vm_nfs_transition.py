@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import importlib.util
 import json
 import os
@@ -110,6 +111,12 @@ class VmNfsTransitionTests(unittest.TestCase):
             forbidden_units=("zerofs-lxc-nbd-client.service",),
             forbidden_mounts=(root / "mnt" / "zerofs-files-raw",),
         )
+        self.identity = transition.DeploymentIdentity(
+            ctid=198,
+            release="0123456789ab-cccccccccccccccc",
+            source="10.10.10.55:/",
+            pve_host="pve",
+        )
 
     @staticmethod
     def unit(source: str) -> str:
@@ -122,7 +129,9 @@ class VmNfsTransitionTests(unittest.TestCase):
         self.system.enabled = True
         self.system.active = True
         self.system.mount = self.system.record("10.10.10.55:/")
-        self.manager.prepare(self.staged, self.transaction, "10.10.10.55:/")
+        self.manager.prepare(
+            self.staged, self.transaction, "10.10.10.55:/", self.identity
+        )
 
         self.manager.reconcile(self.transaction)
 
@@ -142,7 +151,9 @@ class VmNfsTransitionTests(unittest.TestCase):
         self.system.active = True
         self.system.mount = self.system.record("10.10.10.55:/")
         self.mountpoint.mkdir(parents=True)
-        self.manager.prepare(self.staged, self.transaction, "10.10.10.55:/")
+        self.manager.prepare(
+            self.staged, self.transaction, "10.10.10.55:/", self.identity
+        )
 
         self.manager.quiesce(self.transaction)
         self.manager.reconcile(self.transaction)
@@ -165,7 +176,9 @@ class VmNfsTransitionTests(unittest.TestCase):
         self.system.active = True
         self.system.mount = self.system.record("10.10.10.55:/")
         self.mountpoint.mkdir(parents=True)
-        self.manager.prepare(self.staged, self.transaction, "10.10.10.55:/")
+        self.manager.prepare(
+            self.staged, self.transaction, "10.10.10.55:/", self.identity
+        )
         self.manager.quiesce(self.transaction)
         self.system.fail_command = "start"
 
@@ -181,7 +194,9 @@ class VmNfsTransitionTests(unittest.TestCase):
 
     def test_rollback_removes_mountpoint_created_for_a_prior_absent_state(self) -> None:
         self.staged.write_text(self.unit("10.10.10.55:/"))
-        self.manager.prepare(self.staged, self.transaction, "10.10.10.55:/")
+        self.manager.prepare(
+            self.staged, self.transaction, "10.10.10.55:/", self.identity
+        )
         self.manager.reconcile(self.transaction)
         self.assertTrue(self.mountpoint.is_dir())
 
@@ -199,7 +214,9 @@ class VmNfsTransitionTests(unittest.TestCase):
         self.manager.unit_path = self.unit_path
         self.system.unit_path = self.unit_path
         self.staged.write_text(self.unit("10.10.10.55:/"))
-        self.manager.prepare(self.staged, self.transaction, "10.10.10.55:/")
+        self.manager.prepare(
+            self.staged, self.transaction, "10.10.10.55:/", self.identity
+        )
         self.manager.reconcile(self.transaction)
 
         with mock.patch.object(
@@ -212,7 +229,9 @@ class VmNfsTransitionTests(unittest.TestCase):
     def test_reconcile_fails_closed_when_legacy_mount_or_unit_exists(self) -> None:
         desired = self.unit("10.10.10.55:/")
         self.staged.write_text(desired)
-        self.manager.prepare(self.staged, self.transaction, "10.10.10.55:/")
+        self.manager.prepare(
+            self.staged, self.transaction, "10.10.10.55:/", self.identity
+        )
 
         self.system.loaded_units.add("zerofs-lxc-nbd-client.service")
         with self.assertRaisesRegex(RuntimeError, "legacy.*unit"):
@@ -234,14 +253,18 @@ class VmNfsTransitionTests(unittest.TestCase):
             fstype="nfs",
             options=("rw", "hard", "vers=4.2"),
         )
-        self.manager.prepare(self.staged, self.transaction, "10.10.10.55:/")
+        self.manager.prepare(
+            self.staged, self.transaction, "10.10.10.55:/", self.identity
+        )
 
         with self.assertRaisesRegex(RuntimeError, "nfs v3 rw"):
             self.manager.reconcile(self.transaction)
 
     def test_commit_removes_only_the_owned_transaction(self) -> None:
         self.staged.write_text(self.unit("10.10.10.55:/"))
-        self.manager.prepare(self.staged, self.transaction, "10.10.10.55:/")
+        self.manager.prepare(
+            self.staged, self.transaction, "10.10.10.55:/", self.identity
+        )
         sibling = self.transaction.parent / "unowned"
         sibling.mkdir()
 
@@ -260,7 +283,9 @@ class VmNfsTransitionTests(unittest.TestCase):
         self.system.enabled = True
         self.system.active = True
         self.system.mount = self.system.record("10.10.10.55:/")
-        self.manager.prepare(self.staged, self.transaction, "10.10.10.55:/")
+        self.manager.prepare(
+            self.staged, self.transaction, "10.10.10.55:/", self.identity
+        )
         self.manager.quiesce(self.transaction)
 
         recover = getattr(self.manager, "recover", None)
@@ -276,7 +301,9 @@ class VmNfsTransitionTests(unittest.TestCase):
     def test_transaction_persists_each_completed_phase_atomically(self) -> None:
         self.staged.write_text(self.unit("10.10.10.55:/"))
 
-        self.manager.prepare(self.staged, self.transaction, "10.10.10.55:/")
+        self.manager.prepare(
+            self.staged, self.transaction, "10.10.10.55:/", self.identity
+        )
         self.assertEqual(
             json.loads((self.transaction / "state.json").read_text())["phase"],
             "prepared",
@@ -304,7 +331,9 @@ class VmNfsTransitionTests(unittest.TestCase):
         self.staged.write_text(self.unit("10.10.10.55:/"))
         real_fsync = os.fsync
         with mock.patch.object(transition.os, "fsync", wraps=real_fsync) as fsync:
-            self.manager.prepare(self.staged, self.transaction, "10.10.10.55:/")
+            self.manager.prepare(
+                self.staged, self.transaction, "10.10.10.55:/", self.identity
+            )
             prepare_calls = fsync.call_count
             self.assertGreaterEqual(prepare_calls, 3)
 
@@ -317,7 +346,9 @@ class VmNfsTransitionTests(unittest.TestCase):
 
     def test_recover_fails_closed_on_unknown_transaction_phase(self) -> None:
         self.staged.write_text(self.unit("10.10.10.55:/"))
-        self.manager.prepare(self.staged, self.transaction, "10.10.10.55:/")
+        self.manager.prepare(
+            self.staged, self.transaction, "10.10.10.55:/", self.identity
+        )
         state_path = self.transaction / "state.json"
         state = json.loads(state_path.read_text())
         state["phase"] = "alien"
@@ -331,7 +362,9 @@ class VmNfsTransitionTests(unittest.TestCase):
     def test_decided_commit_recovery_never_rolls_the_mount_back(self) -> None:
         desired = self.unit("10.10.10.55:/")
         self.staged.write_text(desired)
-        self.manager.prepare(self.staged, self.transaction, "10.10.10.55:/")
+        self.manager.prepare(
+            self.staged, self.transaction, "10.10.10.55:/", self.identity
+        )
         self.manager.reconcile(self.transaction)
         self.manager.decide_commit(self.transaction)
 
@@ -342,6 +375,28 @@ class VmNfsTransitionTests(unittest.TestCase):
         self.assertFalse(self.transaction.exists())
         self.assertEqual(self.unit_path.read_text(), desired)
         self.assertTrue(self.system.active)
+
+    def test_transaction_persists_the_exact_deployment_identity(self) -> None:
+        desired = self.unit("10.10.10.55:/")
+        self.staged.write_text(desired)
+        identity = transition.DeploymentIdentity(
+            ctid=198,
+            release="0123456789ab-cccccccccccccccc",
+            source="10.10.10.55:/",
+            pve_host="pve",
+        )
+
+        self.manager.prepare(
+            self.staged,
+            self.transaction,
+            "10.10.10.55:/",
+            deployment=identity,
+        )
+
+        self.assertEqual(
+            self.manager.status(self.transaction)["deployment"],
+            dataclasses.asdict(identity),
+        )
 
     def test_source_validation_accepts_only_rfc1918_root_exports(self) -> None:
         self.assertEqual(
@@ -361,7 +416,9 @@ class VmNfsTransitionTests(unittest.TestCase):
         self.staged.write_text(self.unit("10.10.10.44:/"))
 
         with self.assertRaisesRegex(RuntimeError, "expected NFS source"):
-            self.manager.prepare(self.staged, self.transaction, "10.10.10.55:/")
+            self.manager.prepare(
+                self.staged, self.transaction, "10.10.10.55:/", self.identity
+            )
 
         self.assertFalse(self.transaction.exists())
 
@@ -371,7 +428,9 @@ class VmNfsTransitionTests(unittest.TestCase):
         self.system.mount = self.system.record("10.10.10.44:/")
 
         with self.assertRaisesRegex(RuntimeError, "live VM NFS source"):
-            self.manager.prepare(self.staged, self.transaction, "10.10.10.55:/")
+            self.manager.prepare(
+                self.staged, self.transaction, "10.10.10.55:/", self.identity
+            )
 
         self.assertTrue(self.system.active)
         self.assertEqual(self.system.mount.source, "10.10.10.44:/")
@@ -416,6 +475,7 @@ WantedBy=remote-fs.target
             self.staged,
             self.transaction,
             "10.10.10.55:/",
+            self.identity,
             allow_legacy_bindfs=True,
         )
         self.manager.quiesce(self.transaction)
@@ -448,6 +508,7 @@ WantedBy=remote-fs.target
                 self.staged,
                 self.transaction,
                 "10.10.10.55:/",
+                self.identity,
                 allow_legacy_bindfs=True,
             )
 

@@ -72,6 +72,14 @@ class MountRecord:
     options: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class DeploymentIdentity:
+    ctid: int
+    release: str
+    source: str
+    pve_host: str
+
+
 class System(Protocol):
     def is_enabled(self, unit: str) -> bool:
         ...
@@ -213,6 +221,18 @@ class Transition:
                 f"invalid VM NFS transaction phase in {transaction}: "
                 f"{state.get('phase')!r}"
             )
+        deployment = state.get("deployment")
+        if (
+            not isinstance(deployment, dict)
+            or set(deployment) != {"ctid", "release", "source", "pve_host"}
+            or not isinstance(deployment.get("ctid"), int)
+            or deployment["ctid"] <= 0
+            or not all(
+                isinstance(deployment.get(field), str) and deployment[field]
+                for field in ("release", "source", "pve_host")
+            )
+        ):
+            raise RuntimeError(f"invalid deployment identity in {transaction}")
         return state
 
     def _set_phase(self, transaction: Path, phase: str) -> None:
@@ -324,6 +344,7 @@ class Transition:
         staged_unit: Path,
         transaction: Path,
         expected_source: str,
+        deployment: DeploymentIdentity,
         *,
         allow_legacy_bindfs: bool = False,
     ) -> None:
@@ -334,6 +355,10 @@ class Transition:
         if staged_unit.read_text().splitlines().count(f"What={expected_source}") != 1:
             raise RuntimeError(
                 f"staged VM NFS unit does not contain expected NFS source {expected_source}"
+            )
+        if deployment.source != expected_source:
+            raise RuntimeError(
+                "deployment identity source does not match expected source"
             )
         mount = self.system.mount_record(self.mountpoint)
         if (
@@ -385,6 +410,7 @@ class Transition:
             ]
             state = {
                 "phase": "prepared",
+                "deployment": dataclasses.asdict(deployment),
                 "expected_source": expected_source,
                 "unit_existed": unit_existed,
                 "enabled": self.system.is_enabled(UNIT_NAME),
@@ -626,6 +652,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--transaction", required=True)
     parser.add_argument("--staged-unit")
     parser.add_argument("--expected-source")
+    parser.add_argument("--deployment-ctid", type=int)
+    parser.add_argument("--deployment-release")
+    parser.add_argument("--deployment-pve-host")
     parser.add_argument("--allow-legacy-bindfs", action="store_true")
     return parser
 
@@ -639,12 +668,27 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.action == "recover":
         manager.recover(transaction)
     elif args.action == "prepare":
-        if args.staged_unit is None or args.expected_source is None:
-            raise ValueError("prepare requires --staged-unit and --expected-source")
+        if (
+            args.staged_unit is None
+            or args.expected_source is None
+            or args.deployment_ctid is None
+            or args.deployment_release is None
+            or args.deployment_pve_host is None
+        ):
+            raise ValueError(
+                "prepare requires staged unit and full deployment identity"
+            )
+        source = _private_nfs_source(args.expected_source)
         manager.prepare(
             Path(args.staged_unit),
             transaction,
-            _private_nfs_source(args.expected_source),
+            source,
+            DeploymentIdentity(
+                ctid=args.deployment_ctid,
+                release=args.deployment_release,
+                source=source,
+                pve_host=args.deployment_pve_host,
+            ),
             allow_legacy_bindfs=args.allow_legacy_bindfs,
         )
     elif args.action == "quiesce":

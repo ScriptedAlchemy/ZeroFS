@@ -781,6 +781,7 @@ class VmNfsCoordinatorTests(unittest.TestCase):
     def args(self) -> SimpleNamespace:
         return SimpleNamespace(
             vm_host="ubuntu-main",
+            pve_host="pve",
             ctid=198,
             container_ip="10.10.10.55",
         )
@@ -1114,7 +1115,12 @@ class VmNfsCoordinatorTests(unittest.TestCase):
         class DecidedRunner(self.RecordingRunner):
             def run_remote_shell(inner_self, host, script):
                 if "vm_nfs_transition.py status " in script:
-                    return '{"phase":"commit_decided"}\n'
+                    return (
+                        '{"phase":"commit_decided","deployment":'
+                        '{"ctid":198,"pve_host":"pve",'
+                        '"release":"0123456789ab-cccccccccccccccc",'
+                        '"source":"10.10.10.55:/"}}\n'
+                    )
                 return super().run_remote_shell(host, script)
 
         runner = DecidedRunner()
@@ -1122,7 +1128,7 @@ class VmNfsCoordinatorTests(unittest.TestCase):
         self.transaction_runner()(
             runner,
             self.args(),
-            "new-release-does-not-matter",
+            "0123456789ab-cccccccccccccccc",
             lambda: self.fail("activation must not repeat"),
             lambda: events.append("finalize-host"),
             lambda: self.fail("decided commit must not roll back"),
@@ -1131,6 +1137,34 @@ class VmNfsCoordinatorTests(unittest.TestCase):
 
         self.assertEqual(events, ["finalize-host"])
         self.assertEqual(self.actions(runner.calls), ["commit"])
+
+    def test_retry_rejects_a_decided_commit_for_another_deployment(self) -> None:
+        class OtherDeploymentRunner(self.RecordingRunner):
+            def run_remote_shell(inner_self, host, script):
+                if "vm_nfs_transition.py status " in script:
+                    return (
+                        '{"phase":"commit_decided","deployment":'
+                        '{"ctid":198,"pve_host":"pve",'
+                        '"release":"older-release",'
+                        '"source":"10.10.10.55:/"}}\n'
+                    )
+                return super().run_remote_shell(host, script)
+
+        runner = OtherDeploymentRunner()
+        events: list[str] = []
+        with self.assertRaisesRegex(RuntimeError, "belongs to another deployment"):
+            self.transaction_runner()(
+                runner,
+                self.args(),
+                "0123456789ab-cccccccccccccccc",
+                lambda: self.fail("activation must not run"),
+                lambda: events.append("finalize-host"),
+                lambda: self.fail("rollback must not run"),
+                lambda: self.fail("host recovery must not run"),
+            )
+
+        self.assertEqual(events, [])
+        self.assertEqual(self.actions(runner.calls), [])
 
     def test_ambiguous_commit_decision_failure_is_never_compensated(self) -> None:
         runner = self.RecordingRunner("vm_nfs_transition.py decide ")

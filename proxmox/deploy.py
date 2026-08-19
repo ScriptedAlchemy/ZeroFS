@@ -1231,6 +1231,12 @@ def _run_prod_vm_nfs_transaction(
     ownership_requires_post_mount_proof = False
     legacy_bindfs = False
     failure: BaseException | None = None
+    requested_deployment = {
+        "ctid": args.ctid,
+        "release": release,
+        "source": f"{args.container_ip}:/",
+        "pve_host": args.pve_host,
+    }
 
     def action(name: str, *extra: str) -> None:
         command = [
@@ -1309,6 +1315,12 @@ def _run_prod_vm_nfs_transaction(
                 else {"phase": "absent"}
             )
             if status.get("phase") == "commit_decided":
+                if status.get("deployment") != requested_deployment:
+                    raise RuntimeError(
+                        "durable VM commit decision belongs to another deployment; "
+                        f"recorded={status.get('deployment')!r}, "
+                        f"requested={requested_deployment!r}"
+                    )
                 commit_host()
                 action("commit")
                 return
@@ -1335,6 +1347,12 @@ def _run_prod_vm_nfs_transaction(
                 remote_unit,
                 "--expected-source",
                 f"{args.container_ip}:/",
+                "--deployment-ctid",
+                str(args.ctid),
+                "--deployment-release",
+                release,
+                "--deployment-pve-host",
+                args.pve_host,
             ]
             if legacy_bindfs:
                 prepare_args.append("--allow-legacy-bindfs")
