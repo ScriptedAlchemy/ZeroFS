@@ -57,6 +57,10 @@ it does not merge those namespaces.
    never claim RAM-only writes survived a crash.
 10. Prove the behavior through cross-protocol, failpoint, restart, filesystem, and
     performance tests before merging or deploying it.
+11. Keep logically sequential reads from becoming one-backend-RTT-per-segment-run:
+    independent immutable runs are fetched with bounded concurrency, and NFS, 9P,
+    and NBD read throughput is proved against paired raw-direction controls and
+    cache-state-matched ZeroFS protocol controls.
 
 ## Non-goals
 
@@ -483,6 +487,10 @@ Metrics and status expose at least:
 - NFS stability class counts;
 - terminal failure state and cause class;
 - shutdown phase and incomplete target.
+- logical read bytes, resolved extent/run fanout, active backend read lanes,
+  requested-versus-fetched bytes, and backend wait/latency. Isolated benchmark
+  receipts additionally prove cache source from process/cache roots plus local-device
+  and network counters rather than inventing an unavailable cache-tier label.
 
 Capacity reporting distinguishes logical namespace size, physically allocated local
 bytes, object-store live bytes, and sparse virtual-device geometry. Sparse NBD file
@@ -517,10 +525,29 @@ Implementation follows strict RED/GREEN slices. The required proof matrix includ
     the existing ZFS-over-NBD matrix where applicable;
 15. controlled performance comparisons separating foreground RAM acknowledgement,
     local SSD barrier, and remote backend flush.
+16. a real Ubuntu read matrix over raw SFTP, kernel NFSv3, native 9P, and
+    NBD/XFS, separating remote-cold, clean-SSD, and clean-RAM state and sweeping
+    concurrency through the configured read-session ceiling. The matrix records
+    negotiated request sizes, outstanding requests, extent-run fanout, active
+    backend lanes, cache/network/disk evidence, exact bytes, and SHA-256 readback.
 
 Performance acceptance requires integrity and durability checks, not just throughput:
 size, checksum, protocol-visible readback, restart behavior, local barrier, remote
 barrier, and zero leaked reservations or temporary objects.
+
+Read performance is judged against paired controls, not a historical absolute rate.
+Repeated materialized A/A controls establish a median plus MAD noise band. A candidate
+may not regress median throughput, p95 latency, requests per logical GiB, or scaling
+outside that band. Active read lanes must rise with independent demand until the
+configured pool or an evidenced extent-run limit is reached; an unexplained one-lane
+result fails. A control whose variance exceeds its acceptance band is inconclusive and
+must be rerun, never counted as a pass.
+
+Cache-state names require server-side proof. `fio --invalidate=1` proves only that the
+Linux client page cache was invalidated. Remote-cold requires a fresh process and empty
+clean-cache roots plus positive remote payload reads; clean-SSD requires zero remote
+payload reads and positive local-cache device reads after a restart that clears RAM;
+clean-RAM requires zero local-device and remote payload reads for the scored ranges.
 
 ## Implementation phases and rollout
 
@@ -544,6 +571,17 @@ atomically harden physical reserve and multipart accounting, expose typed downst
 capacity snapshots, and prove the old emergency watermarks still fail safe. This
 phase is independently benchmarked and can be reverted without removing shared
 mutation correctness.
+
+### Phase 3B: Bounded read fanout and matched protocol benchmarks
+
+Plan logically sequential extent runs before fetching and issue independent immutable
+segment reads with bounded ordered concurrency. Preserve output order, cache identity,
+stale-location re-resolution, nomination/crossing accounting, and exact bytes. Reuse
+the maintained VM100 fio/hash/raw-SFTP benchmark primitives in the UUID-ledgered Ubuntu
+harness, but replace its NBD-only lifecycle and client-page-cache-only “cold” claim with
+real NFS/9P/NBD entry points and proven server cache states. Further NFS framing/copy
+work requires a separate measured RED after this shared read fix; it is not assumed in
+advance.
 
 ### Phase 4: Repository and Linux proof
 

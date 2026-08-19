@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Deliver, prove, integrate, and clean up one bounded volatile mutation/durability layer shared by NBD, NFS, 9P, WebUI/RPC, and direct callers, followed by smooth SSD-to-remote pacing.
+**Goal:** Deliver, prove, integrate, and clean up one bounded volatile mutation/durability layer shared by NBD, NFS, 9P, WebUI/RPC, and direct callers, followed by smooth SSD-to-remote pacing and bounded cache-state-proved read fanout.
 
-**Architecture:** Plan A builds the prepared-mutation layer and composes every shipping adapter around one durability/lifecycle authority. Plan B separately hardens exact SSD/multipart ownership and adds ordered cleanup credit pacing. Plan C proves the result on portable macOS gates and real UUID-isolated Ubuntu protocol/filesystem/device/crash/performance gates before reviewed merge and fail-closed checkout synchronization.
+**Architecture:** Plan A builds the prepared-mutation layer, composes every shipping adapter around one durability/lifecycle authority, and removes protocol-visible one-run-at-a-time read serialization. Plan B separately hardens exact SSD/multipart ownership and adds ordered cleanup credit pacing. Plan C proves the result on portable macOS gates and real UUID-isolated Ubuntu protocol/filesystem/device/crash/performance gates before reviewed merge and fail-closed checkout synchronization.
 
 **Tech Stack:** Rust 2024, Tokio, SlateDB, existing ZeroFS writeback/SFTP, NBD, NFSv3, 9P2000.L, gRPC-Web/WebSocket WebUI, Python 3 `unittest`, Linux NFS/v9fs/nbd-client, XFS/ZFS, xfstests, pjdfstest, stress-ng, Cargo, Git worktrees.
 
@@ -68,6 +68,7 @@ Plan A — shared filesystem mutation and protocol durability
   -> A16 additive nfsserve fork API
   -> A17 ZeroFS NFS composition
   -> A18 metrics/status/docs
+  -> A19 bounded fragmented-read fanout
              |
              v
 Plan B — paced SSD admission
@@ -122,8 +123,10 @@ Record SHA, branch, porcelain, commands, and results. Ignored failover/performan
 
 - [ ] A requirement-to-evidence audit maps every approved-spec requirement to task, commit SHA, exact command, host/CWD, dual ack flags where applicable, receipt, and result.
 - [ ] Plan A is complete and green: all adapters use one coordinator/durability target/lifecycle owner and `nbd/volatile_overlay.rs` is absent.
+- [ ] Fragmented logically sequential reads fetch independent immutable segment runs with bounded ordered concurrency while contiguous reads remain one ranged GET and exact bytes/order are preserved.
 - [ ] Plan B is complete and green: physical sampling, SSD reservation, release credit, and multipart promotion each have one owner, with no acknowledgement-semantic change.
 - [ ] Plan C proves real simultaneous NBD/NFS/9P admission, same-backing-inode pending reads, every cross-adapter barrier, WebUI/RPC production paths, crash/restart, Linux filesystems, integrity, and paced performance.
+- [ ] Plan C proves cache-state-matched raw SFTP/NFS/9P/NBD read throughput with true remote-cold, clean-SSD, and clean-RAM evidence; historical client-page-cache-only “cold” numbers are not acceptance.
 - [ ] Materialized mode remains the generated/runtime default; volatile mode is explicitly lossy before the completed local floor and durable afterward.
 - [ ] At/below the completed local floor all state is complete/consistent; above it only the explicitly permitted canonical striped-NBD member prefix may survive, with no torn metadata/namespace claim.
 - [ ] Every filtered test was listed first or replaced by a complete module gate; no zero-test result is accepted.
@@ -143,4 +146,5 @@ Plan C specifies every CWD and exact command. The non-negotiable families are:
 - `python3 -m compileall`, both `unittest discover` trees, Proxmox `shellcheck`, and `actionlint`;
 - standalone `bench/` fmt, strict Clippy, debug/release build, and CLI benchmark list;
 - real Ubuntu dual-ack protocol, WebUI/RPC, xfstests, pjdfstest, kernel compile, stress-ng, XFS/ZFS-over-NBD, failover, crash, and benchmark receipts;
+- the ledgered read matrix over raw SFTP, kernel NFS, native 9P, and NBD/XFS with concurrency, cache, active-lane, exact-byte, and SHA-256 receipts;
 - final diff/evidence/cleanup/quality reviews, merge/push, fail-closed Ubuntu fast-forward, and secondary-worktree removal.
