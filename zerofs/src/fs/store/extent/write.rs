@@ -101,7 +101,7 @@ use crate::frame_codec::Compressed;
 use crate::fs::inode::InodeId;
 use crate::fs::{EXTENT_SIZE, FsError};
 use crate::replication::ReplOp;
-use crate::segment::{DirEntry, FrameLoc, Segid};
+use crate::segment::{DirEntry, FrameLoc, Segid, SegmentFormatLimits};
 use bytes::{Bytes, BytesMut};
 use futures::stream::{self, FuturesUnordered, StreamExt, TryStreamExt};
 use std::collections::{HashMap, HashSet};
@@ -253,6 +253,7 @@ impl<'a> LaneFreeze<'a> {
 /// lane. Compression and the AEAD are CPU work, so this costs nothing today —
 /// but adding an await between the claim and the fill would need a Drop-based
 /// abandon path instead.
+#[derive(Debug)]
 struct Reservation {
     segid: Segid,
     first_frame: u32,
@@ -272,36 +273,87 @@ impl Reservation {
     /// The reserved bytes are zeroed and each frame's length prefix written
     /// immediately, so the buffer stays a structurally walkable frame stream at
     /// every instant; only the AEAD bodies are outstanding.
-    fn claim(open: &mut OpenSegment, inode: InodeId, frames: &[(u64, usize)]) -> Self {
+    fn claim(
+        open: &mut OpenSegment,
+        inode: InodeId,
+        frames: &[(u64, usize)],
+    ) -> Result<Self, crate::segment::SegmentError> {
+        Self::claim_with_limits(open, inode, frames, SegmentFormatLimits::WIRE)
+    }
+
+    fn claim_with_limits(
+        open: &mut OpenSegment,
+        inode: InodeId,
+        frames: &[(u64, usize)],
+        limits: SegmentFormatLimits,
+    ) -> Result<Self, crate::segment::SegmentError> {
         let segid = open.segid;
-        let first_frame = open.dir.len() as u32;
-        let mut offset = open.buf.len() as u64;
-        let mut offsets = Vec::with_capacity(frames.len());
-        let mut lens = Vec::with_capacity(frames.len());
-        open.dir.reserve(frames.len());
+        let final_frame_count = open.dir.len().checked_add(frames.len()).ok_or(
+            crate::segment::SegmentError::Malformed("segment frame count"),
+        )?;
+        let first_frame =
+            crate::segment::checked_frame_run_start(open.dir.len(), frames.len(), limits)?;
+        crate::segment::checked_directory_plaintext_len(final_frame_count, limits)?;
+        let mut offset = u64::try_from(open.buf.len())
+            .map_err(|_| crate::segment::SegmentError::Malformed("segment byte offset"))?;
+        let mut offsets = Vec::new();
+        offsets.try_reserve_exact(frames.len()).map_err(|_| {
+            crate::segment::SegmentError::Malformed("frame offset allocation failed")
+        })?;
+        let mut lens = Vec::new();
+        lens.try_reserve_exact(frames.len()).map_err(|_| {
+            crate::segment::SegmentError::Malformed("frame length allocation failed")
+        })?;
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(frames.len())
+            .map_err(|_| crate::segment::SegmentError::Malformed("directory allocation failed"))?;
         for &(extent, sealed_len) in frames {
-            let len = sealed_len as u32;
+            let len = crate::segment::checked_frame_body_len(sealed_len, limits)?;
             offsets.push(offset);
             lens.push(len);
-            open.dir.push(DirEntry {
+            entries.push(DirEntry {
                 byte_offset: offset,
                 len,
                 inode,
                 extent,
             });
-            offset += crate::segment::LEN_PREFIX as u64 + sealed_len as u64;
+            let stored_len = crate::segment::LEN_PREFIX.checked_add(sealed_len).ok_or(
+                crate::segment::SegmentError::Malformed("segment byte length"),
+            )?;
+            let stored_len = u64::try_from(stored_len)
+                .map_err(|_| crate::segment::SegmentError::Malformed("segment byte length"))?;
+            offset =
+                offset
+                    .checked_add(stored_len)
+                    .ok_or(crate::segment::SegmentError::Malformed(
+                        "segment byte length",
+                    ))?;
         }
-        open.buf.resize(offset as usize, 0);
+        let final_len = usize::try_from(offset)
+            .map_err(|_| crate::segment::SegmentError::Malformed("segment byte length"))?;
+        let growth = final_len.checked_sub(open.buf.len()).ok_or(
+            crate::segment::SegmentError::Malformed("segment byte length"),
+        )?;
+        open.dir.try_reserve_exact(entries.len()).map_err(|_| {
+            crate::segment::SegmentError::Malformed("segment directory allocation failed")
+        })?;
+        open.buf.try_reserve_exact(growth).map_err(|_| {
+            crate::segment::SegmentError::Malformed("segment frame allocation failed")
+        })?;
+        open.dir.extend(entries);
+        open.buf.resize(final_len, 0);
         for (offset, len) in offsets.iter().zip(&lens) {
-            let start = *offset as usize;
+            let start = usize::try_from(*offset)
+                .map_err(|_| crate::segment::SegmentError::Malformed("segment byte offset"))?;
             open.buf[start..start + crate::segment::LEN_PREFIX].copy_from_slice(&len.to_le_bytes());
         }
-        Self {
+        Ok(Self {
             segid,
             first_frame,
             offsets,
             lens,
-        }
+        })
     }
 
     /// Copy this batch's sealed bodies into the reserved range and return the
@@ -323,26 +375,38 @@ impl Reservation {
             );
             return Err(FsError::IoError);
         }
-        let mut locs = Vec::with_capacity(sealed.len());
+        let mut locs = Vec::new();
+        locs.try_reserve_exact(sealed.len())
+            .map_err(|_| FsError::IoError)?;
         for (i, (offset, len)) in self.offsets.iter().zip(&self.lens).enumerate() {
+            let frame_index =
+                crate::segment::checked_frame_index(self.first_frame, i, SegmentFormatLimits::WIRE)
+                    .map_err(|_| FsError::IoError)?;
             let body = &sealed[i].2;
             if body.len() != *len as usize {
                 error!(
                     "sealed frame {} of {:?} is {} bytes, reserved {}",
-                    self.first_frame + i as u32,
+                    frame_index,
                     self.segid,
                     body.len(),
                     len
                 );
                 return Err(FsError::IoError);
             }
-            let start = *offset as usize + crate::segment::LEN_PREFIX;
+            let start = usize::try_from(*offset)
+                .map_err(|_| FsError::IoError)?
+                .checked_add(crate::segment::LEN_PREFIX)
+                .ok_or(FsError::IoError)?;
             open.buf[start..start + body.len()].copy_from_slice(body);
             locs.push(FrameLoc {
                 segid: self.segid,
-                frame_index: self.first_frame + i as u32,
+                frame_index,
                 byte_offset: *offset,
-                byte_len: crate::segment::LEN_PREFIX as u32 + len,
+                byte_len: crate::segment::checked_stored_frame_len(
+                    crate::segment::LEN_PREFIX as u64 + *len as u64,
+                    SegmentFormatLimits::WIRE,
+                )
+                .map_err(|_| FsError::IoError)?,
             });
         }
         Ok(locs)
@@ -791,7 +855,10 @@ impl ExtentStore {
                 .collect();
             let (reservation, buffered) = {
                 let mut open = lane.open.lock().unwrap();
-                let reservation = Reservation::claim(&mut open, id, &claim);
+                let reservation = Reservation::claim(&mut open, id, &claim).map_err(|e| {
+                    error!("segment reservation rejected for inode {id}: {e}");
+                    FsError::IoError
+                })?;
                 (reservation, open.buf.len())
             };
             // Whoever's claim first carries the buffer past the threshold owns
@@ -949,27 +1016,48 @@ impl ExtentStore {
         freeze: &LaneFreeze<'_>,
         residency: tokio::sync::OwnedSemaphorePermit,
     ) -> Result<Option<(Segid, Bytes)>, FsError> {
+        self.rotate_sealing_generation_with_limits(freeze, residency, SegmentFormatLimits::WIRE)
+    }
+
+    fn rotate_sealing_generation_with_limits(
+        &self,
+        freeze: &LaneFreeze<'_>,
+        residency: tokio::sync::OwnedSemaphorePermit,
+        limits: SegmentFormatLimits,
+    ) -> Result<Option<(Segid, Bytes)>, FsError> {
         let mut open = freeze.lane.open.lock().unwrap();
         if open.dir.is_empty() {
             return Ok(None);
         }
         let segid = open.segid;
-        let sealed_dir = crate::segment::seal_directory(&self.codec, segid, &open.dir)
+        let sealed_dir =
+            crate::segment::seal_directory_with_limits(&self.codec, segid, &open.dir, limits)
+                .map_err(|_| FsError::IoError)?;
+        let frame_count = open.dir.len();
+        let prepared = crate::segment::prepare_segment_assembly(
+            &mut open.buf,
+            frame_count,
+            &sealed_dir,
+            limits,
+        )
+        .map_err(|_| FsError::IoError)?;
+        let mut replacement = Vec::new();
+        replacement
+            .try_reserve_exact(self.seal_threshold())
             .map_err(|_| FsError::IoError)?;
-        let k = open.dir.len() as u32;
-        let buf = std::mem::replace(&mut open.buf, Vec::with_capacity(self.seal_threshold()));
+        let buf = std::mem::replace(&mut open.buf, replacement);
         open.dir.clear();
         open.segid = self.segments.next_segid();
         debug_assert_ne!(
             open.segid, segid,
             "rotated open segid must differ from the sealed one"
         );
-        let bytes = Bytes::from(crate::segment::assemble_segment(
+        let bytes = Bytes::from(crate::segment::assemble_prepared_segment(
             segid,
             buf,
-            k,
             &sealed_dir,
             segid.counter,
+            prepared,
         ));
         let replaced = self.sealing.lock().unwrap().insert(
             segid,
@@ -1414,6 +1502,152 @@ mod tests {
             })
             .collect();
         (delete_keys, cache_deletes)
+    }
+
+    #[test]
+    fn reservation_rejects_unrepresentable_batch_without_mutating_open_segment() {
+        let mut open = OpenSegment {
+            segid: Segid::new(7, 9),
+            buf: vec![4, 0, 0, 0, 1, 2, 3, 4],
+            dir: vec![DirEntry {
+                byte_offset: 0,
+                len: 4,
+                inode: 1,
+                extent: 0,
+            }],
+        };
+        let before_buf = open.buf.clone();
+        let before_dir = open.dir.clone();
+
+        let err = Reservation::claim_with_limits(
+            &mut open,
+            1,
+            &[(1, 57)],
+            crate::segment::SegmentFormatLimits::with_u32_max(60),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            crate::segment::SegmentError::Malformed("stored frame length")
+        ));
+        assert_eq!(open.buf, before_buf);
+        assert_eq!(open.dir, before_dir);
+    }
+
+    #[test]
+    fn reservation_rejects_unrepresentable_directory_without_mutating_open_segment() {
+        let mut open = OpenSegment {
+            segid: Segid::new(7, 9),
+            buf: vec![4, 0, 0, 0, 1, 2, 3, 4],
+            dir: vec![DirEntry {
+                byte_offset: 0,
+                len: 4,
+                inode: 1,
+                extent: 0,
+            }],
+        };
+        let before_buf = open.buf.clone();
+        let before_dir = open.dir.clone();
+
+        let err = Reservation::claim_with_limits(
+            &mut open,
+            1,
+            &[(1, 46)],
+            crate::segment::SegmentFormatLimits::with_u32_max(50),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            crate::segment::SegmentError::Malformed("directory plaintext length")
+        ));
+        assert_eq!(open.buf, before_buf);
+        assert_eq!(open.dir, before_dir);
+    }
+
+    #[tokio::test]
+    async fn rotation_rejects_unrepresentable_directory_without_taking_or_publishing_buffer() {
+        let (_store, db) = make().await;
+        let object_store = Arc::new(InMemory::new());
+        let store = make_store(object_store.clone(), db, CompressionConfig::Lz4, 7);
+        let lane = store.open_lane(1);
+        let before = {
+            let mut open = lane.open.lock().unwrap();
+            open.buf = vec![4, 0, 0, 0, 1, 2, 3, 4];
+            open.dir = vec![DirEntry {
+                byte_offset: 0,
+                len: 4,
+                inode: 1,
+                extent: 0,
+            }];
+            (open.segid, open.buf.clone(), open.dir.clone())
+        };
+        let append = LaneAppendGuard::lock(lane).await;
+        let freeze = LaneFreeze::acquire(&append).await;
+        let residency = Arc::clone(&store.seal_residency_sem)
+            .acquire_owned()
+            .await
+            .unwrap();
+
+        let err = store
+            .rotate_sealing_generation_with_limits(
+                &freeze,
+                residency,
+                crate::segment::SegmentFormatLimits::with_u32_max(0),
+            )
+            .unwrap_err();
+
+        assert!(matches!(err, FsError::IoError));
+        {
+            let open = lane.open.lock().unwrap();
+            assert_eq!((open.segid, open.buf.clone(), open.dir.clone()), before);
+        }
+        assert!(store.sealing.lock().unwrap().is_empty());
+        assert!(
+            object_store
+                .list(Some(&slatedb::object_store::path::Path::from("segments")))
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap()
+                .is_empty(),
+            "a failed rotation must not publish any object"
+        );
+    }
+
+    #[tokio::test]
+    async fn rotation_rejects_replacement_allocation_without_taking_buffer() {
+        let (_store, db) = make().await;
+        let object_store = Arc::new(InMemory::new());
+        let mut store = make_store(object_store, db, CompressionConfig::Lz4, 7);
+        store.seal_threshold = usize::MAX;
+        let lane = store.open_lane(1);
+        let before = {
+            let mut open = lane.open.lock().unwrap();
+            open.buf = vec![4, 0, 0, 0, 1, 2, 3, 4];
+            open.dir = vec![DirEntry {
+                byte_offset: 0,
+                len: 4,
+                inode: 1,
+                extent: 0,
+            }];
+            (open.segid, open.buf.clone(), open.dir.clone())
+        };
+        let append = LaneAppendGuard::lock(lane).await;
+        let freeze = LaneFreeze::acquire(&append).await;
+        let residency = Arc::clone(&store.seal_residency_sem)
+            .acquire_owned()
+            .await
+            .unwrap();
+
+        let err = store
+            .rotate_sealing_generation(&freeze, residency)
+            .unwrap_err();
+
+        assert!(matches!(err, FsError::IoError));
+        let open = lane.open.lock().unwrap();
+        assert_eq!((open.segid, open.buf.clone(), open.dir.clone()), before);
+        assert!(store.sealing.lock().unwrap().is_empty());
     }
 
     async fn four_dirty_lanes(max_inflight_seals: usize) -> (ExtentStore, Arc<FaultControls>) {
