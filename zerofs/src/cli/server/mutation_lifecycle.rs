@@ -8,7 +8,6 @@ use crate::fs::mutation::types::MutationCutoff;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 use tokio::sync::Notify;
 use tokio::time::Instant;
 
@@ -583,6 +582,7 @@ mod tests {
     use crate::fs::mutation::durability::JournalIncarnation;
     use crate::fs::mutation::types::MutationIncarnation;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
     use uuid::Uuid;
 
     fn cutoff(sequence: u64) -> MutationCutoff {

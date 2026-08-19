@@ -494,7 +494,7 @@ async fn unix_ninep_standard_and_verified_fsync_wait_for_real_remote_writeback()
             fid,
             b"typed-durability",
             (libc::O_RDWR | libc::O_CREAT) as u32,
-            u32::from(libc::S_IFREG | 0o644),
+            libc::S_IFREG | 0o644,
             0,
         )
         .await
