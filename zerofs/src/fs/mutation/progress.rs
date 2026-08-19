@@ -90,6 +90,7 @@ impl MutationProgress {
             return Err(MutationError::StaleIncarnation);
         }
         loop {
+            let notified = self.inner.notify.notified();
             {
                 let state = lock(&self.inner.state);
                 if let Some(error) = &state.terminal {
@@ -99,7 +100,7 @@ impl MutationProgress {
                     return Ok(());
                 }
             }
-            self.inner.notify.notified().await;
+            notified.await;
         }
     }
 }

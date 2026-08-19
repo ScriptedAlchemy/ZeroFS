@@ -316,6 +316,7 @@ impl PreparationGate {
 
     pub(crate) async fn wait_closed(&self, scope: &ConflictScope) -> Result<(), MutationError> {
         loop {
+            let notified = self.notify.notified();
             {
                 let state = lock(&self.state);
                 if let Some(error) = &state.terminal {
@@ -326,7 +327,7 @@ impl PreparationGate {
                     return Ok(());
                 }
             }
-            self.notify.notified().await;
+            notified.await;
         }
     }
 
@@ -335,9 +336,24 @@ impl PreparationGate {
         self.wait_closed(scope).await
     }
 
-    fn mark_published(&self, sequence: u64) {
-        let mut state = lock(&self.state);
-        state.published_through = state.published_through.max(sequence);
+    fn publish(&self, id: u64) -> Result<u64, MutationError> {
+        let result = {
+            let mut state = lock(&self.state);
+            if state.active.remove(&id).is_none() {
+                Err(MutationError::Closed)
+            } else if let Some(error) = &state.terminal {
+                Err(error.clone())
+            } else if let Some(sequence) = state.published_through.checked_add(1) {
+                state.published_through = sequence;
+                Ok(sequence)
+            } else {
+                let error = MutationError::Poisoned("mutation sequence exhausted".into());
+                state.terminal = Some(error.clone());
+                Err(error)
+            }
+        };
+        self.notify.notify_waiters();
+        result
     }
 
     fn register(&self, scope: ConflictScope) -> Result<u64, MutationError> {
@@ -435,12 +451,11 @@ impl PreparationGuard {
         self.state = PreparationState::Consumed;
         let request = self.request.take().expect("open guard owns a request");
         let raw_permit = self.raw_permit.take().expect("open guard owns a permit");
+        let sequence = self.gate.publish(self.id)?;
         let cutoff = MutationCutoff {
             mutation_incarnation: self.gate.incarnation(),
-            sequence: self.id,
+            sequence,
         };
-        self.gate.mark_published(self.id);
-        self.gate.unregister(self.id);
         Ok(AcceptedMutation {
             request: request.accept(),
             batch,
@@ -685,6 +700,60 @@ mod tests {
         )
         .unwrap();
         drop(guard);
+        assert_eq!(gate.active_guards(), 0);
+        assert_eq!(budget.used_bytes(), 0);
+        assert_eq!(budget.used_operations(), 0);
+        assert_eq!(cache.used_slots(), 0);
+    }
+
+    #[tokio::test]
+    async fn aborted_guard_does_not_leave_published_sequence_hole() {
+        let budget = RawMutationBudget::new(16, 8);
+        let cache = RequestCache::new(8);
+        let gate = PreparationGate::new(MutationIncarnation::new());
+
+        PreparationGuard::new(
+            Arc::clone(&gate),
+            scope(1),
+            budget.acquire(4).await.unwrap(),
+            pending(&cache, 1, RequestLifetime::InFlightOnly),
+        )
+        .unwrap()
+        .abort(PreparationAbort::TransportCancellation)
+        .unwrap();
+
+        let accepted = PreparationGuard::new(
+            Arc::clone(&gate),
+            scope(1),
+            budget.acquire(4).await.unwrap(),
+            pending(&cache, 2, RequestLifetime::InFlightOnly),
+        )
+        .unwrap()
+        .publish(batch())
+        .unwrap();
+
+        assert_eq!(accepted.cutoff().sequence, 1);
+        assert_eq!(gate.published_through(), 1);
+    }
+
+    #[tokio::test]
+    async fn poison_during_publish_releases_active_guard() {
+        let budget = RawMutationBudget::new(16, 8);
+        let cache = RequestCache::new(8);
+        let gate = PreparationGate::new(MutationIncarnation::new());
+        let guard = PreparationGuard::new(
+            Arc::clone(&gate),
+            scope(1),
+            budget.acquire(4).await.unwrap(),
+            pending(&cache, 1, RequestLifetime::InFlightOnly),
+        )
+        .unwrap();
+        gate.poison("journal failed");
+
+        assert!(matches!(
+            guard.publish(batch()),
+            Err(MutationError::Poisoned(_))
+        ));
         assert_eq!(gate.active_guards(), 0);
         assert_eq!(budget.used_bytes(), 0);
         assert_eq!(budget.used_operations(), 0);
