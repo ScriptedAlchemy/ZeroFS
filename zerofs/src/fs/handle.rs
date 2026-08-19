@@ -7,6 +7,7 @@ use fp::fail_point;
 
 use crate::fs::errors::FsError;
 use crate::fs::inode::{Inode, InodeId};
+use crate::fs::mutation::types::{ConflictKey, ConflictScope};
 use crate::fs::{EXTENT_SIZE, SMALL_FILE_TOMBSTONE_THRESHOLD, ZeroFS};
 use ::tracing::{error, warn};
 use dashmap::DashMap;
@@ -154,6 +155,16 @@ impl ZeroFS {
         #[cfg(feature = "failpoints")]
         fail_point!(fp::RECLAIM_BEFORE_LOCK);
 
+        let _fence = match self
+            .fence_metadata(ConflictScope::single(ConflictKey::Inode(id)))
+            .await
+        {
+            Ok(fence) => fence,
+            Err(error) => {
+                error!("Deferred reclaim fence of inode {} failed: {:?}", id, error);
+                return;
+            }
+        };
         let _guard = self.lock_manager.acquire(id).await;
 
         if self.open_handle_count(id) > 0 {
@@ -773,5 +784,33 @@ mod tests {
         // The remaining link still works after closing the handle.
         fs.handle_closed(file_id).await;
         assert!(fs.inode_store.get(file_id).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn pending_write_drains_before_last_clunk_without_holding_canonical_lock() {
+        use crate::fs::mutation::types::{ConflictKey, ConflictScope};
+        use std::sync::Arc;
+
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        fs.start_materializer();
+        let file_id = make_file(&fs, b"fenced-clunk.txt", b"payload").await;
+        fs.open_handle_inc(file_id);
+        fs.remove(&(&test_auth()).into(), 0, b"fenced-clunk.txt")
+            .await
+            .unwrap();
+        assert!(orphan_ids(&fs).await.contains(&file_id));
+
+        fs.assert_pending_write_drains_without_canonical_lock(
+            ConflictScope::single(ConflictKey::Inode(file_id)),
+            file_id,
+            {
+                let fs = Arc::clone(&fs);
+                async move {
+                    fs.handle_closed(file_id).await;
+                }
+            },
+        )
+        .await;
+        wait_for_inode_gone(&fs, file_id).await;
     }
 }

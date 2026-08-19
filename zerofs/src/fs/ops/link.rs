@@ -8,6 +8,7 @@ use fp::fail_point;
 use crate::dedup::DedupResult;
 use crate::fs::errors::FsError;
 use crate::fs::inode::{Inode, InodeAttrs, InodeId, SymlinkInode};
+use crate::fs::mutation::types::{ConflictKey, ConflictScope};
 use crate::fs::permissions::{AccessMode, Credentials, check_access};
 use crate::fs::store::inode::MAX_HARDLINKS_PER_INODE;
 use crate::fs::tracing::FileOperation;
@@ -56,6 +57,9 @@ impl ZeroFS {
             target
         );
 
+        let _fence = self
+            .fence_metadata(ConflictScope::single(ConflictKey::Directory(dirid)))
+            .await?;
         let _guard = self.lock_manager.acquire(dirid).await;
         // Direct filesystem callers do not pass through the 9P single-flight.
         if let Some(result) = self.replay_dedup_result(&op_id, DedupResult::into_symlink)? {
@@ -227,6 +231,12 @@ impl ZeroFS {
             fileid, linkdirid, linkname_str
         );
 
+        let _fence = self
+            .fence_metadata(ConflictScope::new([
+                ConflictKey::Directory(linkdirid),
+                ConflictKey::Inode(fileid),
+            ]))
+            .await?;
         let _guards = self
             .lock_manager
             .acquire_multi(vec![fileid, linkdirid])
@@ -826,5 +836,43 @@ mod tests {
             }
             _ => panic!("Expected file inode"),
         }
+    }
+
+    #[tokio::test]
+    async fn pending_write_drains_before_hardlink_without_holding_canonical_lock() {
+        use crate::fs::mutation::types::{ConflictKey, ConflictScope};
+        use std::sync::Arc;
+
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        fs.start_materializer();
+        let (file_id, _) = fs
+            .create(
+                &test_creds(),
+                0,
+                b"fenced-link-src.txt",
+                &SetAttributes::default(),
+            )
+            .await
+            .unwrap();
+
+        fs.assert_pending_write_drains_without_canonical_lock(
+            ConflictScope::new([ConflictKey::Directory(0), ConflictKey::Inode(file_id)]),
+            file_id,
+            {
+                let fs = Arc::clone(&fs);
+                async move {
+                    fs.link(&(&test_auth()).into(), file_id, 0, b"fenced-link-dst.txt")
+                        .await
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            fs.directory_store
+                .exists(0, b"fenced-link-dst.txt")
+                .await
+                .unwrap()
+        );
     }
 }

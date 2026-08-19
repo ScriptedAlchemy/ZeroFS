@@ -118,6 +118,24 @@ pub struct ZeroFS {
     /// When set, a client `fsync`/COMMIT returns without forcing a flush to object
     /// storage; semi-sync replication is relied on for durability. See `client_fsync`.
     pub ignore_fsync: bool,
+    /// Resolved acknowledgement contract. Adapters consume this; they must
+    /// not re-read raw `[filesystem]` / `[servers.nbd]` fields.
+    pub(crate) write_ack: crate::fs::mutation::config::FilesystemWriteAckSettings,
+    /// Process-wide volatile overlay. Installed once the filesystem is in an
+    /// `Arc` and `write_ack` is `volatile_memory`.
+    pub(crate) volatile_overlay: std::sync::Arc<
+        std::sync::OnceLock<
+            std::sync::Arc<crate::fs::mutation::overlay::FilesystemVolatileOverlay>,
+        >,
+    >,
+    /// Ordered canonical apply workers for accepted volatile batches.
+    pub(crate) materializer: std::sync::Arc<
+        std::sync::OnceLock<std::sync::Arc<crate::fs::mutation::materializer::Materializer>>,
+    >,
+    /// Shared preparation gate plus materialization progress for metadata fences.
+    pub(crate) mutation_coordinator: std::sync::Arc<
+        std::sync::OnceLock<std::sync::Arc<crate::fs::mutation::fence::MutationCoordinator>>,
+    >,
     /// Durability lineage token (see `client_fsync_verified`). Identifies the current
     /// unbroken durable lineage; set once at bring-up, constant for this process's life.
     /// A ZeroFS client carries it, and a verified fsync succeeds only while it is

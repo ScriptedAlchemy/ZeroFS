@@ -62,6 +62,7 @@ pub(crate) enum RequestLookup {
     Backpressured,
 }
 
+#[derive(Clone)]
 pub(crate) struct RequestCache {
     inner: Arc<RequestCacheInner>,
 }
@@ -119,7 +120,7 @@ pub(crate) struct AcceptedRequest {
     identity: RequestIdentity,
     lifetime: RequestLifetime,
     operation_slot: Option<RequestOperationSlot>,
-    retained: Arc<RetainedRequest>,
+    completed: bool,
 }
 
 /// Shared in-flight or completed result. Joiners wait here instead of
@@ -194,7 +195,7 @@ impl Drop for RequestVacancy {
             return;
         }
         self.consumed = true;
-        self.cache.remove_provisional(&self.identity);
+        self.cache.cancel_pending(&self.identity, FsError::IoError);
     }
 }
 
@@ -210,7 +211,7 @@ impl PendingRequest {
             identity: self.identity.clone(),
             lifetime: self.lifetime,
             operation_slot: self.operation_slot.take(),
-            retained: Arc::clone(&self.retained),
+            completed: false,
         }
     }
 
@@ -224,7 +225,7 @@ impl PendingRequest {
     pub(crate) fn cancel(mut self) {
         self.state = PendingRequestState::Terminal;
         let _slot = self.operation_slot.take();
-        self.cache.remove_pending_and_release_slot(&self.identity);
+        self.cache.cancel_pending(&self.identity, FsError::IoError);
     }
 }
 
@@ -238,7 +239,16 @@ impl Drop for PendingRequest {
         }
         self.state = PendingRequestState::Terminal;
         let _slot = self.operation_slot.take();
-        self.cache.remove_pending_and_release_slot(&self.identity);
+        self.cache.cancel_pending(&self.identity, FsError::IoError);
+    }
+}
+
+impl Drop for AcceptedRequest {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        self.cache.cancel_pending(&self.identity, FsError::IoError);
     }
 }
 
@@ -355,23 +365,20 @@ impl RequestCacheInner {
         }
     }
 
-    fn remove_provisional(self: &Arc<Self>, identity: &RequestIdentity) {
-        let mut state = lock(&self.state);
-        if matches!(
-            state.entries.get(identity),
-            Some(CacheEntry::Pending { .. })
-        ) {
-            state.entries.remove(identity);
-        }
-    }
-
-    fn remove_pending_and_release_slot(self: &Arc<Self>, identity: &RequestIdentity) {
-        let mut state = lock(&self.state);
-        if matches!(
-            state.entries.get(identity),
-            Some(CacheEntry::Pending { .. })
-        ) {
-            state.entries.remove(identity);
+    fn cancel_pending(self: &Arc<Self>, identity: &RequestIdentity, error: FsError) {
+        let retained = {
+            let mut state = lock(&self.state);
+            match state.entries.remove(identity) {
+                Some(CacheEntry::Pending { retained, .. }) => Some(retained),
+                Some(entry) => {
+                    state.entries.insert(identity.clone(), entry);
+                    None
+                }
+                None => None,
+            }
+        };
+        if let Some(retained) = retained {
+            retained.publish(Err(error));
         }
     }
 
@@ -391,6 +398,7 @@ impl RequestCacheInner {
         result: Result<PreparedBatchResult, FsError>,
     ) -> Arc<RetainedRequest> {
         let slot = accepted.operation_slot.take();
+        accepted.completed = true;
         self.finish(&accepted.identity, accepted.lifetime, slot, result)
     }
 
@@ -700,6 +708,58 @@ mod tests {
             .unwrap();
         assert!(matches!(again, RequestLookup::Vacant(_)));
         drop(again);
+    }
+
+    #[test]
+    fn dropped_accepted_request_releases_pending_entry_and_slot() {
+        let cache = RequestCache::new(1);
+        let accepted = expect_vacant(
+            cache
+                .lookup_or_reserve(nbd(1), fingerprint(1), RequestLifetime::InFlightOnly)
+                .unwrap(),
+        )
+        .begin_pending()
+        .accept();
+        assert_eq!(cache.used_slots(), 1);
+
+        drop(accepted);
+
+        assert_eq!(cache.used_slots(), 0);
+        assert_eq!(cache.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn dropped_accepted_request_wakes_existing_joiner_with_error() {
+        let cache = RequestCache::new(1);
+        let identity = nbd(1);
+        let accepted = expect_vacant(
+            cache
+                .lookup_or_reserve(
+                    identity.clone(),
+                    fingerprint(1),
+                    RequestLifetime::InFlightOnly,
+                )
+                .unwrap(),
+        )
+        .begin_pending()
+        .accept();
+        let joined = match cache
+            .lookup_or_reserve(identity, fingerprint(1), RequestLifetime::InFlightOnly)
+            .unwrap()
+        {
+            RequestLookup::Joined(retained) => retained,
+            other => panic!("expected join, got {other:?}"),
+        };
+        let waiter = tokio::spawn(async move { joined.wait().await });
+
+        drop(accepted);
+
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), waiter).await,
+            Ok(Ok(Err(FsError::IoError)))
+        ));
+        assert_eq!(cache.used_slots(), 0);
+        assert_eq!(cache.len(), 0);
     }
 
     #[test]

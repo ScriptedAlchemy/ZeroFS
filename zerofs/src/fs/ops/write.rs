@@ -209,12 +209,12 @@ pub(crate) async fn prepare_write(
         let Inode::File(file) = &mut inode else {
             return Err(FsError::IsDirectory);
         };
-        let old_size = file.size;
+        let old_size = fs.overlay_visible_size(member.id, file.size);
         let end_offset = member
             .offset
             .checked_add(member.data.len() as u64)
             .ok_or(FsError::InvalidArgument)?;
-        let new_size = std::cmp::max(file.size, end_offset);
+        let new_size = std::cmp::max(old_size, end_offset);
 
         let mut quota = None;
         if new_size > old_size {
@@ -368,6 +368,12 @@ pub(crate) async fn apply_prepared_batch(
     let pending = fs.write_coordinator.submit(txn)?;
     batch.guards = None;
     pending.wait().await?;
+    for member in &batch.members {
+        if let Some(reservation) = &member.quota {
+            reservation.accept();
+            reservation.canonical();
+        }
+    }
     debug!("DB write took: {:?}", db_write_start.elapsed());
 
     for (id, tail_update) in tail_updates {
@@ -400,13 +406,6 @@ pub(crate) async fn apply_prepared_batch(
                 length: member.data.len() as u64,
             },
         );
-    }
-
-    for member in &batch.members {
-        if let Some(reservation) = &member.quota {
-            reservation.accept();
-            reservation.canonical();
-        }
     }
 
     Ok(PreparedBatchResult {

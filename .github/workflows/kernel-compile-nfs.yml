@@ -159,3 +159,123 @@ jobs:
             kill $(cat /tmp/zerofs.pid) || true
           fi
           pkill -f "zerofs run -c zerofs-ci.toml" || true
+
+  kernel-compile-nfs-tiered:
+    name: Compile Linux Kernel on NFS (tiered volatile_memory+ssd)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nfs-common build-essential libncurses-dev bison flex libssl-dev libelf-dev bc xz-utils
+
+      - name: Fetch the prebuilt ZeroFS binary
+        uses: actions/download-artifact@v4
+        with:
+          name: zerofs-ci-bin
+          path: zerofs/target/ci
+      - run: chmod +x zerofs/target/ci/zerofs
+
+      - name: Start MinIO
+        run: |
+          docker run -d \
+            --name minio \
+            -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio server /data
+
+          # Wait for MinIO to be ready
+          for i in {1..30}; do
+            if curl -f http://localhost:9000/minio/health/live; then
+              echo "MinIO is ready"
+              break
+            fi
+            sleep 1
+          done
+
+          # Install mc (MinIO client)
+          wget https://dl.min.io/client/mc/release/linux-amd64/mc
+          chmod +x mc
+          ./mc alias set myminio http://localhost:9000 minioadmin minioadmin
+          ./mc mb myminio/zerofs-test || true
+
+      - name: Prepare the tiered run roots
+        run: |
+          RUN_UUID=$(python3 -c "import uuid; print(uuid.uuid4())")
+          CONTROL_ROOT="/var/tmp/zerofs-tiered-control-${RUN_UUID}"
+          RESOURCE_ROOT="/var/tmp/zerofs-tiered-resources-${RUN_UUID}"
+          {
+            echo "RUN_UUID=${RUN_UUID}"
+            echo "CONTROL_ROOT=${CONTROL_ROOT}"
+            echo "RESOURCE_ROOT=${RESOURCE_ROOT}"
+            echo "LEDGER=${CONTROL_ROOT}/ledger.json"
+          } >> "$GITHUB_ENV"
+
+      - name: Write the tiered ZeroFS config
+        run: |
+          cat > /tmp/zerofs-tiered.toml << EOF
+          [cache]
+          dir = "${RESOURCE_ROOT}/run/cache"
+          disk_size_gb = 5.0
+          memory_size_gb = 1.0
+
+          [storage]
+          url = "s3://zerofs-test/zerofs-tiered/${RUN_UUID}"
+          encryption_password = "test-password-123"
+
+          [filesystem]
+          write_ack_mode = "volatile_memory"
+          volatile_memory_gb = 1.0
+
+          [writeback]
+          enabled = true
+          dir = "${RESOURCE_ROOT}/run/writeback"
+          ack_mode = "ssd"
+          memory_size_gb = 1.0
+          disk_size_gb = 8.0
+
+          [servers.nfs]
+          addresses = ["127.0.0.1:12049"]
+
+          [aws]
+          access_key_id = "minioadmin"
+          secret_access_key = "minioadmin"
+          endpoint = "http://localhost:9000"
+          allow_http = "true"
+
+          [telemetry]
+          enabled = false
+          EOF
+
+      - name: Set up the tiered harness run
+        run: |
+          python3 scripts/tiered-writeback-e2e.py setup \
+            --run-uuid "$RUN_UUID" \
+            --filesystem-ack-mode volatile_memory \
+            --object-ack-mode ssd \
+            --zerofs-binary "$GITHUB_WORKSPACE/zerofs/target/ci/zerofs" \
+            --zerofs-config /tmp/zerofs-tiered.toml
+          mkdir -p "${RESOURCE_ROOT}/run/cache" "${RESOURCE_ROOT}/run/writeback"
+
+      - name: Run the tiered kernel-compile scenario
+        run: |
+          python3 scripts/tiered-writeback-e2e.py run \
+            --ledger "$LEDGER" \
+            --scenario kernel-compile-nfs \
+            --filesystem-ack-mode volatile_memory \
+            --object-ack-mode ssd \
+            --zerofs-binary "$GITHUB_WORKSPACE/zerofs/target/ci/zerofs" \
+            --zerofs-config /tmp/zerofs-tiered.toml
+
+      - name: Clean up the tiered run
+        if: always()
+        run: |
+          if [ -f "$LEDGER" ]; then
+            python3 scripts/tiered-writeback-e2e.py cleanup --ledger "$LEDGER"
+            python3 scripts/tiered-writeback-e2e.py cleanup --ledger "$LEDGER"
+            python3 scripts/tiered-writeback-e2e.py assert-clean --ledger "$LEDGER"
+          fi

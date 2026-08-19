@@ -1,4 +1,4 @@
-//! Opt-in volatile NBD write acknowledgement.
+//! Shared volatile write acknowledgement overlay.
 //!
 //! WRITE owns the payload in a bounded process-wide RAM pool, publishes it to
 //! the read overlay, and only then replies.  Per-member workers materialize the
@@ -6,12 +6,27 @@
 //! the captured sequence before entering the existing filesystem durability
 //! barrier.
 
-use super::error::{CommandError, CommandResult};
+use crate::fs::errors::FsError;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OverlayError {
+    InvalidArgument,
+    IoError,
+    NoSpace,
+}
+
+impl From<FsError> for OverlayError {
+    fn from(_: FsError) -> Self {
+        Self::IoError
+    }
+}
+
+pub(crate) type OverlayResult<T> = Result<T, OverlayError>;
 use bytes::{Bytes, BytesMut};
 use futures::{FutureExt, future::BoxFuture};
 use std::collections::{BTreeMap, BTreeSet};
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 use tokio::sync::{Notify, RwLock, mpsc};
@@ -19,7 +34,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 pub(crate) type Materializer =
-    Arc<dyn Fn(u64, u64, Bytes) -> BoxFuture<'static, CommandResult<()>> + Send + Sync + 'static>;
+    Arc<dyn Fn(u64, u64, Bytes) -> BoxFuture<'static, OverlayResult<()>> + Send + Sync + 'static>;
 
 const GRACEFUL_DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -70,16 +85,16 @@ impl VolatileBudget {
         budget
     }
 
-    async fn reserve(self: &Arc<Self>, bytes: u64) -> CommandResult<BudgetPermit> {
+    async fn reserve(self: &Arc<Self>, bytes: u64) -> OverlayResult<BudgetPermit> {
         if bytes > self.max_bytes {
-            return Err(CommandError::NoSpace);
+            return Err(OverlayError::NoSpace);
         }
         loop {
             let changed = self.changed.notified();
             {
                 let mut state = self.state.lock().expect("volatile budget poisoned");
                 if state.terminal {
-                    return Err(CommandError::IoError);
+                    return Err(OverlayError::IoError);
                 }
                 if state.used_bytes.saturating_add(bytes) <= self.max_bytes
                     && state.used_operations < self.max_operations
@@ -167,7 +182,37 @@ pub(crate) struct VolatileAdmission {
 struct OverlayEntry {
     offset: u64,
     data: Bytes,
+    visibility: Arc<WriteVisibility>,
     _permit: BudgetPermit,
+}
+
+/// One atomic visibility decision shared by every member of a logical write.
+/// Staged runtime entries can materialize or roll back, but reads do not
+/// observe any member until this token is published once for the whole write.
+pub(crate) struct WriteVisibility {
+    published: AtomicBool,
+}
+
+impl WriteVisibility {
+    pub(crate) fn staged() -> Arc<Self> {
+        Arc::new(Self {
+            published: AtomicBool::new(false),
+        })
+    }
+
+    pub(crate) fn published() -> Arc<Self> {
+        Arc::new(Self {
+            published: AtomicBool::new(true),
+        })
+    }
+
+    pub(crate) fn publish(&self) {
+        self.published.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn is_published(&self) -> bool {
+        self.published.load(Ordering::Acquire)
+    }
 }
 
 struct State {
@@ -176,7 +221,7 @@ struct State {
     materialized_through: u64,
     completed: BTreeSet<u64>,
     entries: BTreeMap<u64, Arc<OverlayEntry>>,
-    terminal: Option<(u64, CommandError)>,
+    terminal: Option<(u64, OverlayError)>,
 }
 
 struct LogicalWrite {
@@ -301,7 +346,7 @@ impl VolatileWriteRuntime {
                                     break;
                                 }
                                 Err(_) => {
-                                    result = Err(CommandError::IoError);
+                                    result = Err(OverlayError::IoError);
                                     break;
                                 }
                             }
@@ -320,7 +365,7 @@ impl VolatileWriteRuntime {
                 if outcome.is_err()
                     && let Some(runtime) = worker_runtime.upgrade()
                 {
-                    runtime.fail(runtime.accepted_cutoff(), CommandError::IoError);
+                    runtime.fail(runtime.accepted_cutoff(), OverlayError::IoError);
                 }
             });
             runtime
@@ -379,7 +424,7 @@ impl VolatileWriteRuntime {
                             })
                             .is_err()
                         {
-                            runtime.fail(write.sequence, CommandError::IoError);
+                            runtime.fail(write.sequence, OverlayError::IoError);
                             return;
                         }
                     }
@@ -390,7 +435,7 @@ impl VolatileWriteRuntime {
             if outcome.is_err()
                 && let Some(runtime) = dispatcher_runtime.upgrade()
             {
-                runtime.fail(runtime.accepted_cutoff(), CommandError::IoError);
+                runtime.fail(runtime.accepted_cutoff(), OverlayError::IoError);
             }
         });
         runtime
@@ -404,18 +449,18 @@ impl VolatileWriteRuntime {
         runtime
     }
 
-    pub(crate) async fn reserve(&self, bytes: usize) -> CommandResult<VolatileAdmission> {
+    pub(crate) async fn reserve(&self, bytes: usize) -> OverlayResult<VolatileAdmission> {
         loop {
             let changed = self.changed.notified();
             if self.terminal().is_some() || !self.is_accepting() {
-                return Err(CommandError::IoError);
+                return Err(OverlayError::IoError);
             }
             tokio::select! {
                 permit = self.budget.reserve(bytes as u64) => {
                     let permit = permit?;
                     if self.terminal().is_some() || !self.is_accepting() {
                         drop(permit);
-                        return Err(CommandError::IoError);
+                        return Err(OverlayError::IoError);
                     }
                     return Ok(VolatileAdmission { permit });
                 }
@@ -430,28 +475,60 @@ impl VolatileWriteRuntime {
         offset: u64,
         data: Bytes,
         groups: Vec<Vec<WriteChunk>>,
-    ) -> CommandResult<u64> {
+    ) -> OverlayResult<u64> {
+        self.accept_write_with_visibility(
+            admission,
+            offset,
+            data,
+            groups,
+            WriteVisibility::published(),
+        )
+        .await
+    }
+
+    pub(crate) async fn accept_staged_write(
+        &self,
+        admission: VolatileAdmission,
+        offset: u64,
+        data: Bytes,
+        groups: Vec<Vec<WriteChunk>>,
+        visibility: Arc<WriteVisibility>,
+    ) -> OverlayResult<u64> {
+        self.accept_write_with_visibility(admission, offset, data, groups, visibility)
+            .await
+    }
+
+    async fn accept_write_with_visibility(
+        &self,
+        admission: VolatileAdmission,
+        offset: u64,
+        data: Bytes,
+        groups: Vec<Vec<WriteChunk>>,
+        visibility: Arc<WriteVisibility>,
+    ) -> OverlayResult<u64> {
+        let record_accepted = visibility.is_published();
         if admission.permit.bytes != data.len() as u64 {
-            return Err(CommandError::InvalidArgument);
+            return Err(OverlayError::InvalidArgument);
         }
         if !valid_write_groups(&data, &groups, &self.lane_inodes) {
-            return Err(CommandError::InvalidArgument);
+            return Err(OverlayError::InvalidArgument);
         }
         if self.budget.is_terminal() {
-            return Err(CommandError::IoError);
+            return Err(OverlayError::IoError);
         }
         let mut state = self.state.lock().expect("volatile runtime poisoned");
         if state.terminal.is_some() || !state.accepting {
-            return Err(CommandError::IoError);
+            return Err(OverlayError::IoError);
         }
         let sequence = state
             .next_sequence
             .checked_add(1)
-            .ok_or(CommandError::IoError)?;
+            .ok_or(OverlayError::IoError)?;
         let accepted_bytes = data.len() as u64;
         let entry = Arc::new(OverlayEntry {
             offset,
             data,
+            visibility,
             _permit: admission.permit,
         });
         state.next_sequence = sequence;
@@ -465,20 +542,21 @@ impl VolatileWriteRuntime {
             })
             .is_err()
         {
-            state.terminal = Some((sequence, CommandError::IoError));
+            state.terminal = Some((sequence, OverlayError::IoError));
             drop(state);
             self.changed.notify_waiters();
             self.budget.changed.notify_waiters();
-            return Err(CommandError::IoError);
+            return Err(OverlayError::IoError);
         }
         drop(state);
         if self.budget.is_terminal() {
-            self.fail(sequence, CommandError::IoError);
-            return Err(CommandError::IoError);
+            self.fail(sequence, OverlayError::IoError);
+            return Err(OverlayError::IoError);
         }
         self.changed.notify_waiters();
-        metrics::counter!("zerofs_nbd_volatile_writes_accepted_total").increment(1);
-        metrics::counter!("zerofs_nbd_volatile_bytes_accepted_total").increment(accepted_bytes);
+        if record_accepted {
+            record_published_staged_writes(accepted_bytes, 1);
+        }
         Ok(sequence)
     }
 
@@ -489,14 +567,22 @@ impl VolatileWriteRuntime {
             .next_sequence
     }
 
-    pub(crate) async fn wait_materialized(&self, target: u64) -> CommandResult<()> {
+    pub(crate) fn dirty_end(&self) -> u64 {
+        self.snapshot()
+            .iter()
+            .map(|entry| entry.offset.saturating_add(entry.data.len() as u64))
+            .max()
+            .unwrap_or(0)
+    }
+
+    pub(crate) async fn wait_materialized(&self, target: u64) -> OverlayResult<()> {
         loop {
             let changed = self.changed.notified();
             let budget_changed = self.budget.changed.notified();
             {
                 let state = self.state.lock().expect("volatile runtime poisoned");
                 if state.terminal.is_some() || self.budget.is_terminal() {
-                    return Err(CommandError::IoError);
+                    return Err(OverlayError::IoError);
                 }
                 if state.materialized_through >= target {
                     return Ok(());
@@ -509,13 +595,29 @@ impl VolatileWriteRuntime {
         }
     }
 
-    async fn wait_materialized_locally(&self, target: u64) -> CommandResult<()> {
+    /// Wait until an unacknowledged entry has been retired or its runtime has
+    /// reached a terminal state. Used only to finish rollback before returning
+    /// a failed multi-member acceptance.
+    pub(crate) async fn wait_released(&self, sequence: u64) {
+        loop {
+            let changed = self.changed.notified();
+            {
+                let state = self.state.lock().expect("volatile runtime poisoned");
+                if !state.entries.contains_key(&sequence) || state.terminal.is_some() {
+                    return;
+                }
+            }
+            changed.await;
+        }
+    }
+
+    async fn wait_materialized_locally(&self, target: u64) -> OverlayResult<()> {
         loop {
             let changed = self.changed.notified();
             {
                 let state = self.state.lock().expect("volatile runtime poisoned");
                 if state.terminal.is_some() {
-                    return Err(CommandError::IoError);
+                    return Err(OverlayError::IoError);
                 }
                 if state.materialized_through >= target {
                     return Ok(());
@@ -525,13 +627,10 @@ impl VolatileWriteRuntime {
         }
     }
 
-    pub(crate) async fn read<F>(&self, offset: u64, length: usize, base: F) -> CommandResult<Bytes>
+    pub(crate) async fn read<F>(&self, offset: u64, length: usize, base: F) -> OverlayResult<Bytes>
     where
-        F: FnOnce() -> BoxFuture<'static, CommandResult<Bytes>>,
+        F: FnOnce() -> BoxFuture<'static, OverlayResult<Bytes>>,
     {
-        if self.terminal().is_some() || self.budget.is_terminal() {
-            return Err(CommandError::IoError);
-        }
         let _retirement = self.retirement.read().await;
         let first = self.snapshot();
         if let Some(data) = fully_covered(offset, length, &first) {
@@ -539,12 +638,13 @@ impl VolatileWriteRuntime {
         }
 
         let mut output = BytesMut::from(base().await?.as_ref());
-        if self.terminal().is_some() || self.budget.is_terminal() {
-            return Err(CommandError::IoError);
-        }
         if output.len() != length {
-            return Err(CommandError::IoError);
+            return Err(OverlayError::IoError);
         }
+        // Terminal state stops admission and durability progress, but accepted
+        // entries stay pinned. Overlaying that frozen logical view over the
+        // canonical read preserves the last coherent bytes after a partial or
+        // failed materialization instead of turning every read into EIO.
         // Snapshot after the canonical read while retirement remains pinned.
         // Any write that could have partially changed the base is therefore
         // still present here in its complete logical form.
@@ -566,14 +666,14 @@ impl VolatileWriteRuntime {
 
     pub(crate) fn fence_abort(&self) {
         let sequence = self.accepted_cutoff().saturating_add(1);
-        self.fail(sequence, CommandError::IoError);
+        self.fail(sequence, OverlayError::IoError);
     }
 
-    pub(crate) async fn shutdown(&self) -> CommandResult<()> {
+    pub(crate) async fn shutdown(&self) -> OverlayResult<()> {
         self.shutdown_with_timeout(GRACEFUL_DRAIN_TIMEOUT).await
     }
 
-    async fn shutdown_with_timeout(&self, timeout: Duration) -> CommandResult<()> {
+    async fn shutdown_with_timeout(&self, timeout: Duration) -> OverlayResult<()> {
         let cutoff = self.stop_admission();
         // A terminal failure is service-wide for new requests and client
         // fences, but already-acknowledged writes in otherwise healthy
@@ -583,8 +683,8 @@ impl VolatileWriteRuntime {
             match tokio::time::timeout(timeout, self.wait_materialized_locally(cutoff)).await {
                 Ok(result) => result,
                 Err(_) => {
-                    self.fail(cutoff, CommandError::IoError);
-                    Err(CommandError::IoError)
+                    self.fail(cutoff, OverlayError::IoError);
+                    Err(OverlayError::IoError)
                 }
             };
         self.task_shutdown.cancel();
@@ -596,8 +696,8 @@ impl VolatileWriteRuntime {
             .unwrap_or_default();
         for handle in handles {
             if handle.await.is_err() {
-                self.fail(cutoff, CommandError::IoError);
-                result = Err(CommandError::IoError);
+                self.fail(cutoff, OverlayError::IoError);
+                result = Err(OverlayError::IoError);
             }
         }
         result
@@ -610,14 +710,14 @@ impl VolatileWriteRuntime {
             .accepting
     }
 
-    fn terminal(&self) -> Option<(u64, CommandError)> {
+    fn terminal(&self) -> Option<(u64, OverlayError)> {
         self.state
             .lock()
             .expect("volatile runtime poisoned")
             .terminal
     }
 
-    fn fail(&self, sequence: u64, error: CommandError) {
+    fn fail(&self, sequence: u64, error: OverlayError) {
         let mut state = self.state.lock().expect("volatile runtime poisoned");
         state.accepting = false;
         state.terminal.get_or_insert((sequence, error));
@@ -644,7 +744,9 @@ impl VolatileWriteRuntime {
                 }
                 state.materialized_through += 1;
                 let retired = state.materialized_through;
-                if let Some(entry) = state.entries.remove(&retired) {
+                if let Some(entry) = state.entries.remove(&retired)
+                    && entry.visibility.is_published()
+                {
                     released_operations += 1;
                     released_bytes += entry.data.len() as u64;
                 }
@@ -666,9 +768,15 @@ impl VolatileWriteRuntime {
             .expect("volatile runtime poisoned")
             .entries
             .values()
+            .filter(|entry| entry.visibility.is_published())
             .cloned()
             .collect()
     }
+}
+
+pub(crate) fn record_published_staged_writes(bytes: u64, operations: u64) {
+    metrics::counter!("zerofs_nbd_volatile_writes_accepted_total").increment(operations);
+    metrics::counter!("zerofs_nbd_volatile_bytes_accepted_total").increment(bytes);
 }
 
 fn valid_write_groups(data: &Bytes, groups: &[Vec<WriteChunk>], lane_inodes: &[u64]) -> bool {
@@ -948,7 +1056,7 @@ mod tests {
             .await
             .expect("stopped admission must wake the budget waiter")
             .expect("budget waiter task");
-        assert!(matches!(result, Err(super::CommandError::IoError)));
+        assert!(matches!(result, Err(super::OverlayError::IoError)));
         release.notify_waiters();
     }
 
@@ -972,7 +1080,7 @@ mod tests {
             )
             .await;
 
-        assert!(matches!(result, Err(super::CommandError::InvalidArgument)));
+        assert!(matches!(result, Err(super::OverlayError::InvalidArgument)));
         assert_eq!(runtime.accepted_cutoff(), 0);
         assert_eq!(budget.used_bytes(), 0);
     }
@@ -997,7 +1105,7 @@ mod tests {
             )
             .await;
 
-        assert!(matches!(result, Err(super::CommandError::InvalidArgument)));
+        assert!(matches!(result, Err(super::OverlayError::InvalidArgument)));
         assert_eq!(runtime.accepted_cutoff(), 0);
         assert_eq!(budget.used_bytes(), 0);
     }
@@ -1015,7 +1123,7 @@ mod tests {
                 async move {
                     entered.notify_one();
                     fail.notified().await;
-                    Err(super::CommandError::IoError)
+                    Err(super::OverlayError::IoError)
                 }
                 .boxed()
             })
@@ -1042,7 +1150,7 @@ mod tests {
             .await
             .expect("shared terminal budget must wake every export waiter")
             .expect("budget waiter task");
-        assert!(matches!(result, Err(super::CommandError::IoError)));
+        assert!(matches!(result, Err(super::OverlayError::IoError)));
     }
 
     #[tokio::test]
@@ -1058,7 +1166,7 @@ mod tests {
                 async move {
                     first_entered.notify_one();
                     fail_first.notified().await;
-                    Err(super::CommandError::IoError)
+                    Err(super::OverlayError::IoError)
                 }
                 .boxed()
             })
@@ -1119,7 +1227,7 @@ mod tests {
             .await
             .expect("shared terminal failure must wake every export flush waiter")
             .expect("flush waiter task");
-        assert!(matches!(result, Err(super::CommandError::IoError)));
+        assert!(matches!(result, Err(super::OverlayError::IoError)));
 
         hold_second.notify_waiters();
         let _ = first
@@ -1139,7 +1247,7 @@ mod tests {
                 let fail_first = Arc::clone(&fail_first);
                 async move {
                     fail_first.notified().await;
-                    Err(super::CommandError::IoError)
+                    Err(super::OverlayError::IoError)
                 }
                 .boxed()
             })
@@ -1306,7 +1414,7 @@ mod tests {
         let result = tokio::time::timeout(Duration::from_millis(250), runtime.wait_materialized(1))
             .await
             .expect("worker panic must wake the durability fence");
-        assert!(matches!(result, Err(super::CommandError::IoError)));
+        assert!(matches!(result, Err(super::OverlayError::IoError)));
         assert_eq!(runtime.accepted_cutoff(), 1);
     }
 
@@ -1338,7 +1446,7 @@ mod tests {
         let result = tokio::time::timeout(Duration::from_millis(250), runtime.shutdown())
             .await
             .expect("fencing must cancel and join a blocked materializer");
-        assert!(matches!(result, Err(super::CommandError::IoError)));
+        assert!(matches!(result, Err(super::OverlayError::IoError)));
     }
 
     #[tokio::test]
@@ -1368,7 +1476,7 @@ mod tests {
         let result = runtime
             .shutdown_with_timeout(Duration::from_millis(25))
             .await;
-        assert!(matches!(result, Err(super::CommandError::IoError)));
+        assert!(matches!(result, Err(super::OverlayError::IoError)));
     }
 
     #[tokio::test]
@@ -1380,7 +1488,7 @@ mod tests {
                 let fail = Arc::clone(&fail);
                 async move {
                     fail.notified().await;
-                    Err(super::CommandError::IoError)
+                    Err(super::OverlayError::IoError)
                 }
                 .boxed()
             })
@@ -1422,17 +1530,17 @@ mod tests {
                 }]],
             )
             .await;
-        assert!(matches!(result, Err(super::CommandError::IoError)));
+        assert!(matches!(result, Err(super::OverlayError::IoError)));
         assert!(matches!(
             second.wait_materialized(0).await,
-            Err(super::CommandError::IoError)
+            Err(super::OverlayError::IoError)
         ));
     }
 
     #[tokio::test]
-    async fn terminal_materialization_failure_makes_subsequent_reads_fail_closed() {
+    async fn terminal_materialization_failure_retains_acknowledged_read_view() {
         let materialize: Materializer =
-            Arc::new(|_, _, _| async { Err(super::CommandError::IoError) }.boxed());
+            Arc::new(|_, _, _| async { Err(super::OverlayError::IoError) }.boxed());
         let runtime =
             VolatileWriteRuntime::new(VolatileBudget::new(4096, 16), vec![7], materialize);
         let admission = runtime.reserve(4).await.unwrap();
@@ -1444,8 +1552,39 @@ mod tests {
 
         let result = runtime
             .read(0, 4, || async { Ok(Bytes::from_static(b"base")) }.boxed())
-            .await;
-        assert!(matches!(result, Err(super::CommandError::IoError)));
+            .await
+            .unwrap();
+        assert_eq!(result, Bytes::from_static(b"data"));
+    }
+
+    #[tokio::test]
+    async fn terminal_partial_read_merges_frozen_overlay_over_canonical_base() {
+        let materialize: Materializer =
+            Arc::new(|_, _, _| async { Err(super::OverlayError::IoError) }.boxed());
+        let runtime =
+            VolatileWriteRuntime::new(VolatileBudget::new(4096, 16), vec![7], materialize);
+        let admission = runtime.reserve(2).await.unwrap();
+        runtime
+            .accept_write(
+                admission,
+                1,
+                Bytes::from_static(b"XX"),
+                vec![vec![WriteChunk {
+                    inode: 7,
+                    member_offset: 1,
+                    logical_offset: 0,
+                    length: 2,
+                }]],
+            )
+            .await
+            .unwrap();
+        runtime.wait_materialized(1).await.unwrap_err();
+
+        let result = runtime
+            .read(0, 4, || async { Ok(Bytes::from_static(b"base")) }.boxed())
+            .await
+            .unwrap();
+        assert_eq!(result, Bytes::from_static(b"bXXe"));
     }
 
     #[tokio::test]

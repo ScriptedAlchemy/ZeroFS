@@ -254,6 +254,11 @@ impl ZeroFS {
             flush_coordinator,
             write_coordinator,
             ignore_fsync,
+            write_ack: crate::fs::mutation::config::FilesystemWriteAckSettings::materialized_direct(
+            ),
+            volatile_overlay: std::sync::Arc::new(std::sync::OnceLock::new()),
+            materializer: std::sync::Arc::new(std::sync::OnceLock::new()),
+            mutation_coordinator: std::sync::Arc::new(std::sync::OnceLock::new()),
             lineage_token,
             serving_writer_epoch,
             max_bytes,
@@ -314,6 +319,61 @@ impl ZeroFS {
         Ok(token)
     }
 
+    /// Reject new mutation admission. Used by the sole shutdown owner.
+    pub(crate) fn stop_new_mutation_admission(&self) {
+        if let Some(coordinator) = self.mutation_coordinator.get() {
+            coordinator.gate().poison("server shutting down");
+        }
+    }
+
+    /// Capture the final published mutation cutoff after admission is closed.
+    pub(crate) fn capture_mutation_cutoff(&self) -> crate::fs::mutation::types::MutationCutoff {
+        use crate::fs::mutation::types::{MutationCutoff, MutationIncarnation};
+        let sequence = self
+            .mutation_coordinator
+            .get()
+            .map(|coordinator| coordinator.gate().published_through())
+            .unwrap_or(0);
+        let mutation_incarnation = self
+            .materializer
+            .get()
+            .map(|materializer| materializer.incarnation())
+            .unwrap_or_else(MutationIncarnation::new);
+        MutationCutoff {
+            mutation_incarnation,
+            sequence,
+        }
+    }
+
+    pub(crate) async fn materialize_through_cutoff(
+        &self,
+        cutoff: crate::fs::mutation::types::MutationCutoff,
+    ) -> Result<(), crate::fs::errors::FsError> {
+        if let Some(overlay) = self.volatile_overlay.get() {
+            overlay
+                .wait_all()
+                .await
+                .map_err(|_| crate::fs::errors::FsError::IoError)?;
+        }
+        if let Some(materializer) = self.materializer.get() {
+            materializer
+                .progress()
+                .wait_materialized(cutoff)
+                .await
+                .map_err(|_| crate::fs::errors::FsError::IoError)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn stop_mutation_workers(&self) {
+        if let Some(materializer) = self.materializer.get() {
+            materializer.stop().await;
+        }
+        if let Some(overlay) = self.volatile_overlay.get() {
+            let _ = overlay.shutdown().await;
+        }
+    }
+
     /// Client durability barrier (9P `Tfsync`, NFS COMMIT, NBD flush). A no-op when
     /// `ignore_fsync` is set.
     pub async fn client_fsync(&self) -> Result<(), crate::fs::errors::FsError> {
@@ -321,6 +381,22 @@ impl ZeroFS {
             return Ok(());
         }
         self.flush_coordinator.flush().await
+    }
+
+    /// Seal, flush, and close the canonical database. The caller must already
+    /// hold the filesystem flush barrier so close-emitted objects can be
+    /// captured before it is released.
+    pub(crate) async fn close_canonical_database(&self) -> Result<(), crate::fs::errors::FsError> {
+        self.extent_store.seal_open().await?;
+        self.db
+            .flush()
+            .await
+            .map_err(|_| crate::fs::errors::FsError::IoError)?;
+        self.db.mark_closing();
+        self.db
+            .close()
+            .await
+            .map_err(|_| crate::fs::errors::FsError::IoError)
     }
 
     /// Flush and verify the client's oldest unflushed-write lineage token.
@@ -332,7 +408,7 @@ impl ZeroFS {
         if self.ignore_fsync {
             return Ok(());
         }
-        self.flush_coordinator.flush().await?;
+        self.wait_configured_durability().await?;
         if client_token == 0 || client_token == self.lineage_token {
             Ok(())
         } else {
@@ -463,6 +539,17 @@ mod tests {
         fs.client_fsync_verified(fs.lineage_token.wrapping_add(1))
             .await
             .expect("the explicit ignore_fsync opt-out bypasses lineage verification");
+    }
+
+    #[tokio::test]
+    async fn mutation_lifecycle_helpers_stop_cleanly() {
+        let fs = std::sync::Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        fs.start_materializer();
+        fs.stop_new_mutation_admission();
+        let cutoff = fs.capture_mutation_cutoff();
+        assert_eq!(cutoff.sequence, 0);
+        fs.materialize_through_cutoff(cutoff).await.unwrap();
+        fs.stop_mutation_workers().await;
     }
 
     #[tokio::test]
@@ -602,5 +689,37 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn close_canonical_database_seals_and_closes() {
+        let fs = super::ZeroFS::new_in_memory().await.unwrap();
+        let _ = fs.flush_coordinator.stop_worker().await;
+        let _barrier = fs.db.flush_barrier().write_owned().await;
+        fs.close_canonical_database()
+            .await
+            .expect("canonical seal+flush+close should succeed once");
+    }
+
     // === Tests from operations.rs ===
+}
+
+#[cfg(test)]
+mod write_ack_retention_tests {
+    use crate::fs::mutation::config::{
+        ClientDurabilityTarget, FilesystemWriteAckMode, FilesystemWriteAckSource,
+    };
+
+    #[tokio::test]
+    async fn in_memory_filesystem_keeps_resolved_write_ack_settings() {
+        let fs = super::ZeroFS::new_in_memory().await.unwrap();
+        assert_eq!(fs.write_ack.mode, FilesystemWriteAckMode::Materialized);
+        assert_eq!(
+            fs.write_ack.source,
+            FilesystemWriteAckSource::DefaultMaterialized
+        );
+        assert_eq!(
+            fs.write_ack.client_durability_target,
+            ClientDurabilityTarget::RemoteBackend
+        );
+        assert_eq!(fs.write_ack.volatile_memory_bytes, 0);
+    }
 }

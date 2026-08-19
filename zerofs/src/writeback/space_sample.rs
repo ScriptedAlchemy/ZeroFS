@@ -21,6 +21,7 @@ pub(crate) struct PhysicalSpaceSampler {
     writeback_dir: PathBuf,
     next_generation: AtomicU64,
     latest_generation: AtomicU64,
+    latest_available: AtomicU64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -41,6 +42,7 @@ impl PhysicalSpaceSampler {
             writeback_dir: writeback_dir.into(),
             next_generation: AtomicU64::new(1),
             latest_generation: AtomicU64::new(0),
+            latest_available: AtomicU64::new(0),
         }
     }
 
@@ -50,6 +52,19 @@ impl PhysicalSpaceSampler {
 
     pub(crate) fn latest_generation(&self) -> u64 {
         self.latest_generation.load(Ordering::Acquire)
+    }
+
+    /// Last successful probe, if any. Never invents a generation.
+    pub(crate) fn latest_sample(&self) -> Option<PhysicalSpaceSample> {
+        let generation = self.latest_generation();
+        if generation == 0 {
+            None
+        } else {
+            Some(PhysicalSpaceSample {
+                generation,
+                available_bytes: self.latest_available.load(Ordering::Acquire),
+            })
+        }
     }
 
     /// Probe the canonical writeback directory and publish the next generation.
@@ -69,6 +84,8 @@ impl PhysicalSpaceSampler {
             })?;
         let generation = self.next_generation.fetch_add(1, Ordering::AcqRel);
         publish_latest(&self.latest_generation, generation);
+        self.latest_available
+            .store(available_bytes, Ordering::Release);
         Ok(PhysicalSpaceSample {
             generation,
             available_bytes,
