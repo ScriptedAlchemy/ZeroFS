@@ -16,7 +16,6 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::sync::CancellationToken;
@@ -25,6 +24,8 @@ use tokio_util::sync::CancellationToken;
 use std::io;
 #[cfg(test)]
 use std::pin::Pin;
+#[cfg(test)]
+use std::sync::atomic::Ordering;
 #[cfg(test)]
 use std::task::{Context, Poll};
 #[cfg(test)]
@@ -612,11 +613,12 @@ impl RusshTransportSession {
             .map_err(|error| map_sftp_error(path, error))?;
         let handle = opened.handle;
         let result = write_handle_pipelined(sftp, &handle, path, offset, chunks, self.limits).await;
-        if durable && result.is_ok() {
-            if let Err(error) = sftp.fsync(handle.as_str()).await {
-                let _ = sftp.close(handle.clone()).await;
-                return Err(map_sftp_error(path, error));
-            }
+        if durable
+            && result.is_ok()
+            && let Err(error) = sftp.fsync(handle.as_str()).await
+        {
+            let _ = sftp.close(handle.clone()).await;
+            return Err(map_sftp_error(path, error));
         }
         let close = sftp
             .close(handle)
@@ -1667,24 +1669,26 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
             )
             .unwrap();
 
-            let mut server_config = russh::server::Config::default();
-            server_config.window_size = RUSSH_WINDOW_SIZE;
-            server_config.maximum_packet_size = RUSSH_MAXIMUM_PACKET_SIZE;
-            server_config.channel_buffer_size = RUSSH_CHANNEL_BUFFER_SIZE;
-            server_config.inactivity_timeout = None;
-            server_config.nodelay = true;
-            server_config.auth_rejection_time = Duration::from_secs(0);
-            server_config.auth_rejection_time_initial = Some(Duration::from_secs(0));
-            server_config.keys = vec![server_key];
-            server_config.preferred = russh::Preferred {
-                cipher: Cow::Borrowed(&[
-                    russh::cipher::AES_256_GCM,
-                    russh::cipher::AES_128_GCM,
-                    russh::cipher::AES_256_CTR,
-                    russh::cipher::AES_192_CTR,
-                    russh::cipher::AES_128_CTR,
-                ]),
-                ..russh::Preferred::DEFAULT
+            let server_config = russh::server::Config {
+                window_size: RUSSH_WINDOW_SIZE,
+                maximum_packet_size: RUSSH_MAXIMUM_PACKET_SIZE,
+                channel_buffer_size: RUSSH_CHANNEL_BUFFER_SIZE,
+                inactivity_timeout: None,
+                nodelay: true,
+                auth_rejection_time: Duration::from_secs(0),
+                auth_rejection_time_initial: Some(Duration::from_secs(0)),
+                keys: vec![server_key],
+                preferred: russh::Preferred {
+                    cipher: Cow::Borrowed(&[
+                        russh::cipher::AES_256_GCM,
+                        russh::cipher::AES_128_GCM,
+                        russh::cipher::AES_256_CTR,
+                        russh::cipher::AES_192_CTR,
+                        russh::cipher::AES_128_CTR,
+                    ]),
+                    ..russh::Preferred::DEFAULT
+                },
+                ..russh::server::Config::default()
             };
             let server_config = std::sync::Arc::new(server_config);
 
@@ -1882,8 +1886,10 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
         ) -> Result<FileAttributes, russh_sftp::protocol::StatusCode> {
             let meta = std::fs::symlink_metadata(path)
                 .map_err(|_| russh_sftp::protocol::StatusCode::NoSuchFile)?;
-            let mut attrs = FileAttributes::default();
-            attrs.size = Some(meta.len());
+            let mut attrs = FileAttributes {
+                size: Some(meta.len()),
+                ..FileAttributes::default()
+            };
             if meta.is_dir() {
                 attrs.set_dir(true);
             } else if meta.is_file() {
@@ -1893,10 +1899,9 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
             }
             if !self.omit_mtime
                 && let Ok(modified) = meta.modified()
+                && let Ok(secs) = modified.duration_since(std::time::UNIX_EPOCH)
             {
-                if let Ok(secs) = modified.duration_since(std::time::UNIX_EPOCH) {
-                    attrs.mtime = Some(secs.as_secs() as u32);
-                }
+                attrs.mtime = Some(secs.as_secs() as u32);
             }
             Ok(attrs)
         }
