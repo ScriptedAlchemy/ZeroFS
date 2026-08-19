@@ -171,9 +171,9 @@ pub struct Settings {
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeConfig {
-    /// Explicit hard process-memory envelope in decimal GB. The effective
-    /// startup limit is the smaller of this value and any finite cgroup-v2
-    /// `memory.max` visible to the process.
+    /// Administrator-declared ZeroFS-dedicated memory envelope in decimal GB.
+    /// Use this when a container namespace hides the dedicated service limit.
+    /// A shared parent cgroup is only a ceiling and cannot supply this budget.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub memory_limit_gb: Option<f64>,
 }

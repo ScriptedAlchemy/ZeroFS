@@ -55,16 +55,16 @@ See [Caching](/caching) for how the two budgets are split between the tiers.
 
 ## Runtime Memory Envelope
 
-Linux servers discover their effective cgroup-v2 `memory.max` at startup. Container runtimes can hide an outer cgroup limit from the process; set an explicit fallback in that case:
+Linux servers discover a finite `memory.max` on their current cgroup at startup. That limit must belong to the ZeroFS service; a shared ancestor is only a ceiling and is never treated as process-owned capacity. Container runtimes can hide a dedicated service limit from the process; declare that administrator-assigned envelope explicitly in that case:
 
 ```toml
 [runtime]
 memory_limit_gb = 96.0
 ```
 
-`memory_limit_gb` is a decimal-GB hard envelope, like the other `*_gb` settings. When both values are available, ZeroFS uses the smaller of the configured fallback and the finite cgroup limit.
+`memory_limit_gb` is a decimal-GB ZeroFS-dedicated envelope, like the other `*_gb` settings. When both it and a current-cgroup limit are available, ZeroFS uses the smaller dedicated value. A finite shared ancestor may reject a declared budget that cannot fit, but it cannot authorize startup by itself. If only a shared ancestor is visible and no dedicated value is configured, startup fails closed. Platforms without cgroup v2 retain compatibility by logging that admission is unavailable unless `runtime.memory_limit_gb` is configured.
 
-Before opening the storage backend or starting listeners, ZeroFS checks the resolved clean-cache, object-writeback, and volatile-write budgets against that envelope. The guard reserves an additional 50% of the clean-cache capacity for transient cache, GC, and allocator residency, plus up to 8 GiB (or 25% of a smaller envelope) for the rest of the process. Startup fails closed when the total does not fit. If neither a finite cgroup limit nor `runtime.memory_limit_gb` is available, ZeroFS logs that it cannot enforce the startup memory budget.
+Before opening the storage backend or starting listeners, ZeroFS checks the resolved clean-cache, object-writeback, and volatile-write budgets against that envelope. The defense-in-depth admission guard also reserves 32 GiB for the unmodeled excess residency reproduced during the production incident and 8 GiB for GC, protocol companions, and the rest of the process. These conservative policy reserves do not prove every NFS, GC, prefetch, or allocator path is bounded; startup fails closed when the modeled tiers plus both reserves do not fit.
 
 ## Storage Backends
 

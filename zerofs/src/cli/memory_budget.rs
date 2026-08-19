@@ -1,11 +1,15 @@
 use crate::config::Settings;
 use crate::writeback::config::WritebackAccessMode;
 use anyhow::{Context, Result, bail};
+use std::ffi::OsString;
 use std::io::ErrorKind;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 
 const GIB: u64 = 1024 * 1024 * 1024;
-const FIXED_PROCESS_HEADROOM_BYTES: u64 = 8 * GIB;
+const UNMODELED_RESIDENCY_RESERVE_BYTES: u64 = 32 * GIB;
+const COMPANION_PROCESS_RESERVE_BYTES: u64 = 8 * GIB;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct StartupMemoryTiers {
@@ -48,6 +52,12 @@ pub(crate) struct MemoryEnvelope {
     pub(crate) source: PathBuf,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CgroupMemoryLimits {
+    pub(crate) dedicated: Option<MemoryEnvelope>,
+    pub(crate) shared_ceiling: Option<MemoryEnvelope>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MemoryBudgetReceipt {
     pub(crate) required_bytes: u64,
@@ -61,9 +71,9 @@ pub(crate) fn validate_server_startup(
     let tiers = StartupMemoryTiers::from_settings(settings, volatile_write_bytes)?;
     let detected = detect_process_cgroup_v2_memory_limit()?;
     let configured = settings.runtime_memory_limit_bytes()?;
-    let Some(envelope) = select_memory_limit(detected, configured) else {
+    let Some(envelope) = select_memory_limit(detected, configured)? else {
         tracing::warn!(
-            "no finite cgroup-v2 memory.max or [runtime] memory_limit_gb; startup memory budget cannot be enforced"
+            "no cgroup-v2 memory ceiling or [runtime] memory_limit_gb; startup memory defense-in-depth admission is unavailable"
         );
         return Ok(None);
     };
@@ -73,8 +83,10 @@ pub(crate) fn validate_server_startup(
         hard_limit_bytes = envelope.hard_limit_bytes,
         required_bytes = receipt.required_bytes,
         remaining_bytes = receipt.remaining_bytes,
+        unmodeled_residency_reserve_bytes = UNMODELED_RESIDENCY_RESERVE_BYTES,
+        companion_process_reserve_bytes = COMPANION_PROCESS_RESERVE_BYTES,
         source,
-        "startup memory budget accepted"
+        "startup memory defense-in-depth admission passed"
     );
     Ok(Some(receipt))
 }
@@ -84,25 +96,24 @@ pub(crate) fn validate_memory_budget(
     hard_limit_bytes: u64,
     source: &str,
 ) -> Result<MemoryBudgetReceipt> {
-    // The clean-cache capacity counts payload, not the transient duplicate
-    // residency incurred by eviction, GC and allocator bookkeeping. Reserve
-    // half of that payload ceiling plus a fixed process allowance. This policy
-    // rejects the production incident's 64 GB + 4 GB tiers under 96 GiB while
-    // retaining a useful 48 GB cache at that limit.
-    let transient_clean_headroom = tiers.clean_cache_bytes / 2;
-    let fixed_process_headroom = FIXED_PROCESS_HEADROOM_BYTES.min(hard_limit_bytes / 4);
+    // The production OOM reproduced roughly 28.6 GiB of residency above the
+    // charged cache/writeback tiers. Round that unmodeled excess up to 32 GiB,
+    // then retain a separate 8 GiB allowance for GC, protocol companions and
+    // the rest of the process. These are conservative admission reserves, not
+    // proofs that every allocation path is bounded.
     let required_bytes = tiers
         .clean_cache_bytes
         .checked_add(tiers.object_writeback_bytes)
         .and_then(|total| total.checked_add(tiers.volatile_write_bytes))
-        .and_then(|total| total.checked_add(transient_clean_headroom))
-        .and_then(|total| total.checked_add(fixed_process_headroom))
+        .and_then(|total| total.checked_add(UNMODELED_RESIDENCY_RESERVE_BYTES))
+        .and_then(|total| total.checked_add(COMPANION_PROCESS_RESERVE_BYTES))
         .context("startup memory budget overflowed")?;
     if required_bytes > hard_limit_bytes {
         bail!(
-            "unsafe startup memory budget: {:.2} GB clean cache + {:.2} GB object writeback + \
-             {:.2} GB volatile writes require {:.2} GiB including transient and process \
-             headroom, above the {:.2} GiB hard limit from {source}",
+            "startup memory admission rejected: {:.2} GB clean cache + {:.2} GB object writeback + \
+             {:.2} GB volatile writes + 32.00 GiB observed-unmodeled reserve + 8.00 GiB \
+             companion/process reserve require {:.2} GiB, above the {:.2} GiB hard limit \
+             from {source}",
             decimal_gb(tiers.clean_cache_bytes),
             decimal_gb(tiers.object_writeback_bytes),
             decimal_gb(tiers.volatile_write_bytes),
@@ -117,27 +128,47 @@ pub(crate) fn validate_memory_budget(
 }
 
 pub(crate) fn select_memory_limit(
-    detected: Option<MemoryEnvelope>,
+    detected: CgroupMemoryLimits,
     configured_bytes: Option<u64>,
-) -> Option<MemoryEnvelope> {
+) -> Result<Option<MemoryEnvelope>> {
     let configured = configured_bytes.map(|hard_limit_bytes| MemoryEnvelope {
         hard_limit_bytes,
         source: PathBuf::from("[runtime] memory_limit_gb"),
     });
-    match (detected, configured) {
-        (Some(detected), Some(configured)) => Some(
+    let dedicated = match (detected.dedicated, configured) {
+        (Some(detected), Some(configured)) => {
             if detected.hard_limit_bytes <= configured.hard_limit_bytes {
                 detected
             } else {
                 configured
-            },
+            }
+        }
+        (Some(detected), None) => detected,
+        (None, Some(configured)) => configured,
+        (None, None) if detected.shared_ceiling.is_some() => bail!(
+            "no dedicated memory envelope: the visible memory.max belongs to a shared ancestor; \
+             configure a finite limit on the ZeroFS service cgroup or set [runtime] \
+             memory_limit_gb to its dedicated limit"
         ),
-        (Some(detected), None) => Some(detected),
-        (None, configured) => configured,
+        (None, None) => return Ok(None),
+    };
+    if let Some(shared) = detected.shared_ceiling
+        && dedicated.hard_limit_bytes > shared.hard_limit_bytes
+    {
+        bail!(
+            "dedicated ZeroFS memory envelope {} bytes from {} exceeds the shared ancestor \
+             ceiling {} bytes at {}; lower the dedicated limit instead of budgeting the \
+             shared parent as process capacity",
+            dedicated.hard_limit_bytes,
+            dedicated.source.display(),
+            shared.hard_limit_bytes,
+            shared.source.display(),
+        );
     }
+    Ok(Some(dedicated))
 }
 
-fn detect_process_cgroup_v2_memory_limit() -> Result<Option<MemoryEnvelope>> {
+fn detect_process_cgroup_v2_memory_limit() -> Result<CgroupMemoryLimits> {
     detect_cgroup_v2_memory_limit(
         Path::new("/proc/self/cgroup"),
         Path::new("/proc/self/mountinfo"),
@@ -147,28 +178,33 @@ fn detect_process_cgroup_v2_memory_limit() -> Result<Option<MemoryEnvelope>> {
 pub(crate) fn detect_cgroup_v2_memory_limit(
     proc_cgroup: &Path,
     mountinfo: &Path,
-) -> Result<Option<MemoryEnvelope>> {
-    let cgroup = match std::fs::read_to_string(proc_cgroup) {
+) -> Result<CgroupMemoryLimits> {
+    let cgroup = match std::fs::read(proc_cgroup) {
         Ok(value) => value,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            return Ok(CgroupMemoryLimits::default());
+        }
         Err(error) => {
             return Err(error).with_context(|| format!("reading {}", proc_cgroup.display()));
         }
     };
-    let mountinfo = match std::fs::read_to_string(mountinfo) {
+    let mountinfo = match std::fs::read(mountinfo) {
         Ok(value) => value,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            return Ok(CgroupMemoryLimits::default());
+        }
         Err(error) => return Err(error).context("reading cgroup mountinfo"),
     };
     let mounts = parse_cgroup2_mounts(&mountinfo)?;
     if mounts.is_empty() {
-        return Ok(None);
+        return Ok(CgroupMemoryLimits::default());
     }
     let current = parse_unified_cgroup(&cgroup)?;
     let Some((mountpoint, mut path)) = select_cgroup2_mount(&current, &mounts) else {
-        return Ok(None);
+        return Ok(CgroupMemoryLimits::default());
     };
-    let mut limiting: Option<MemoryEnvelope> = None;
+    let mut limits = CgroupMemoryLimits::default();
+    let mut is_current = true;
     loop {
         let limit_path = path.join("memory.max");
         match std::fs::read_to_string(&limit_path) {
@@ -181,11 +217,16 @@ pub(crate) fn detect_cgroup_v2_memory_limit(
                             limit_path.display()
                         )
                     })?;
-                    if limiting
+                    let slot = if is_current {
+                        &mut limits.dedicated
+                    } else {
+                        &mut limits.shared_ceiling
+                    };
+                    if slot
                         .as_ref()
                         .is_none_or(|current| hard_limit_bytes < current.hard_limit_bytes)
                     {
-                        limiting = Some(MemoryEnvelope {
+                        *slot = Some(MemoryEnvelope {
                             hard_limit_bytes,
                             source: limit_path,
                         });
@@ -205,29 +246,33 @@ pub(crate) fn detect_cgroup_v2_memory_limit(
             .filter(|parent| parent.starts_with(&mountpoint))
             .context("cgroup path escaped its cgroup2 mount")?
             .to_path_buf();
+        is_current = false;
     }
-    Ok(limiting)
+    Ok(limits)
 }
 
-fn parse_unified_cgroup(contents: &str) -> Result<PathBuf> {
-    for line in contents.lines() {
-        let mut fields = line.splitn(3, ':');
-        if fields.next() == Some("0") && fields.next() == Some("") {
+fn parse_unified_cgroup(contents: &[u8]) -> Result<PathBuf> {
+    for line in contents.split(|byte| *byte == b'\n') {
+        let mut fields = line.splitn(3, |byte| *byte == b':');
+        if fields.next() == Some(b"0".as_slice()) && fields.next() == Some(b"".as_slice()) {
             let path = fields.next().context("cgroup-v2 entry has no path")?;
-            return Ok(PathBuf::from(path));
+            return Ok(PathBuf::from(os_string_from_bytes(path.to_vec())?));
         }
     }
     bail!("/proc/self/cgroup contains no unified cgroup-v2 entry")
 }
 
-fn parse_cgroup2_mounts(contents: &str) -> Result<Vec<(PathBuf, PathBuf)>> {
+fn parse_cgroup2_mounts(contents: &[u8]) -> Result<Vec<(PathBuf, PathBuf)>> {
     let mut mounts = Vec::new();
-    for line in contents.lines() {
-        let fields: Vec<_> = line.split_whitespace().collect();
-        let Some(separator) = fields.iter().position(|field| *field == "-") else {
+    for line in contents.split(|byte| *byte == b'\n') {
+        let fields: Vec<_> = line
+            .split(|byte| *byte == b' ')
+            .filter(|field| !field.is_empty())
+            .collect();
+        let Some(separator) = fields.iter().position(|field| *field == b"-") else {
             continue;
         };
-        if fields.get(separator + 1) != Some(&"cgroup2") {
+        if fields.get(separator + 1).copied() != Some(b"cgroup2".as_slice()) {
             continue;
         }
         let root = fields
@@ -273,27 +318,42 @@ fn select_cgroup2_mount(
         })
 }
 
-fn unescape_mountinfo(value: &str) -> Result<String> {
-    let mut output = String::with_capacity(value.len());
-    let bytes = value.as_bytes();
+fn unescape_mountinfo(value: &[u8]) -> Result<OsString> {
+    let mut output = Vec::with_capacity(value.len());
     let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'\\' {
-            let octal = bytes
+    while index < value.len() {
+        if value[index] == b'\\' {
+            let octal = value
                 .get(index + 1..index + 4)
                 .context("truncated mountinfo escape")?;
             if !octal.iter().all(u8::is_ascii_digit) || octal.iter().any(|byte| *byte > b'7') {
-                bail!("invalid mountinfo escape in {value:?}");
+                bail!(
+                    "invalid mountinfo escape in {:?}",
+                    String::from_utf8_lossy(value)
+                );
             }
-            let decoded = (octal[0] - b'0') * 64 + (octal[1] - b'0') * 8 + octal[2] - b'0';
-            output.push(char::from(decoded));
+            let decoded = (octal[0] - b'0') * 64 + (octal[1] - b'0') * 8 + (octal[2] - b'0');
+            output.push(decoded);
             index += 4;
         } else {
-            output.push(char::from(bytes[index]));
+            output.push(value[index]);
             index += 1;
         }
     }
-    Ok(output)
+    os_string_from_bytes(output)
+}
+
+fn os_string_from_bytes(value: Vec<u8>) -> Result<OsString> {
+    #[cfg(unix)]
+    {
+        Ok(OsString::from_vec(value))
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(String::from_utf8(value)
+            .context("Linux cgroup path is not valid UTF-8 on this platform")?
+            .into())
+    }
 }
 
 fn decimal_gb_to_bytes(name: &str, value: f64) -> Result<u64> {
@@ -335,6 +395,14 @@ mod tests {
         let message = format!("{error:#}");
         assert!(message.contains("64.00 GB clean cache"), "{message}");
         assert!(message.contains("4.00 GB object writeback"), "{message}");
+        assert!(
+            message.contains("32.00 GiB observed-unmodeled reserve"),
+            "{message}"
+        );
+        assert!(
+            message.contains("8.00 GiB companion/process reserve"),
+            "{message}"
+        );
         assert!(message.contains("96.00 GiB hard limit"), "{message}");
     }
 
@@ -348,8 +416,8 @@ mod tests {
 
         let receipt = validate_memory_budget(tiers, 96 * GIB, "test cgroup").unwrap();
 
-        assert_eq!(receipt.required_bytes, 84_589_934_592);
-        assert_eq!(receipt.remaining_bytes, 18_489_280_512);
+        assert_eq!(receipt.required_bytes, 94_949_672_960);
+        assert_eq!(receipt.remaining_bytes, 8_129_542_144);
     }
 
     #[test]
@@ -366,7 +434,34 @@ mod tests {
     }
 
     #[test]
-    fn cgroup_discovery_uses_finite_parent_when_service_is_unlimited() {
+    fn small_envelope_does_not_shrink_policy_reserves_into_acceptance() {
+        let tiers = StartupMemoryTiers {
+            clean_cache_bytes: 1,
+            object_writeback_bytes: 0,
+            volatile_write_bytes: 0,
+        };
+
+        let error = validate_memory_budget(tiers, 39 * GIB, "test cgroup").unwrap_err();
+
+        assert!(format!("{error:#}").contains("40.00 GiB"));
+    }
+
+    #[test]
+    fn volatile_writes_are_additive_to_fixed_policy_reserves() {
+        let tiers = StartupMemoryTiers {
+            clean_cache_bytes: 0,
+            object_writeback_bytes: 0,
+            volatile_write_bytes: 7 * GIB,
+        };
+
+        let receipt = validate_memory_budget(tiers, 48 * GIB, "test cgroup").unwrap();
+
+        assert_eq!(receipt.required_bytes, 47 * GIB);
+        assert_eq!(receipt.remaining_bytes, GIB);
+    }
+
+    #[test]
+    fn shared_parent_limit_is_not_treated_as_process_capacity() {
         let temp = tempfile::tempdir().unwrap();
         let cgroup_mount = temp.path().join("cgroup");
         let service = cgroup_mount.join("system.slice/zerofs.service");
@@ -390,14 +485,26 @@ mod tests {
         )
         .unwrap();
 
-        let envelope = detect_cgroup_v2_memory_limit(&proc_cgroup, &mountinfo)
+        let detected = detect_cgroup_v2_memory_limit(&proc_cgroup, &mountinfo).unwrap();
+        assert_eq!(detected.dedicated, None);
+        assert_eq!(
+            detected
+                .shared_ceiling
+                .as_ref()
+                .map(|limit| limit.hard_limit_bytes),
+            Some(103_079_215_104)
+        );
+
+        let error = select_memory_limit(detected.clone(), None).unwrap_err();
+        assert!(format!("{error:#}").contains("dedicated memory envelope"));
+
+        let configured = select_memory_limit(detected, Some(64 * GIB))
             .unwrap()
             .unwrap();
-
-        assert_eq!(envelope.hard_limit_bytes, 103_079_215_104);
+        assert_eq!(configured.hard_limit_bytes, 64 * GIB);
         assert_eq!(
-            envelope.source,
-            cgroup_mount.join("system.slice/memory.max")
+            configured.source,
+            PathBuf::from("[runtime] memory_limit_gb")
         );
     }
 
@@ -419,7 +526,9 @@ mod tests {
         .unwrap();
 
         let detected = detect_cgroup_v2_memory_limit(&proc_cgroup, &mountinfo).unwrap();
-        let envelope = select_memory_limit(detected, Some(96_000_000_000)).unwrap();
+        let envelope = select_memory_limit(detected, Some(96_000_000_000))
+            .unwrap()
+            .unwrap();
 
         assert_eq!(envelope.hard_limit_bytes, 96_000_000_000);
         assert_eq!(envelope.source, PathBuf::from("[runtime] memory_limit_gb"));
@@ -443,9 +552,8 @@ mod tests {
         )
         .unwrap();
 
-        let envelope = detect_cgroup_v2_memory_limit(&proc_cgroup, &mountinfo)
-            .unwrap()
-            .unwrap();
+        let limits = detect_cgroup_v2_memory_limit(&proc_cgroup, &mountinfo).unwrap();
+        let envelope = limits.dedicated.unwrap();
 
         assert_eq!(envelope.hard_limit_bytes, 103_079_215_104);
         assert_eq!(envelope.source, cgroup_mount.join("memory.max"));
@@ -485,12 +593,63 @@ mod tests {
 
         let detected = detect_cgroup_v2_memory_limit(&proc_cgroup, &mountinfo).unwrap();
 
-        assert_eq!(detected, None);
+        assert_eq!(detected, CgroupMemoryLimits::default());
+        assert_eq!(select_memory_limit(detected, None).unwrap(), None);
+    }
+
+    #[test]
+    fn mountinfo_octal_escapes_preserve_non_ascii_path_bytes() {
+        let decoded = unescape_mountinfo(br"/sys/fs/cgroup/caf\303\251").unwrap();
+
+        assert_eq!(decoded, OsString::from("/sys/fs/cgroup/café"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mountinfo_octal_escapes_preserve_non_utf8_path_bytes() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let decoded = unescape_mountinfo(br"/sys/fs/cgroup/raw-\377").unwrap();
+
+        assert_eq!(decoded.as_os_str().as_bytes(), b"/sys/fs/cgroup/raw-\xff");
+    }
+
+    #[test]
+    fn mountinfo_octal_escapes_decode_linux_separator_bytes() {
+        let decoded = unescape_mountinfo(br"space\040tab\011line\012slash\134").unwrap();
+
+        assert_eq!(decoded, OsString::from("space tab\tline\nslash\\"));
+        for invalid in [br"bad\".as_slice(), br"bad\08x", br"bad\999"] {
+            assert!(unescape_mountinfo(invalid).is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mount_selection_joins_non_utf8_paths_without_loss() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+        let root = PathBuf::from(OsString::from_vec(b"/service-\xff".to_vec()));
+        let mount = PathBuf::from(OsString::from_vec(b"/sys/cgroup-\xfe".to_vec()));
+        let current = root.join("zerofs");
+
+        let selected = select_cgroup2_mount(&current, &[(root, mount.clone())]).unwrap();
+
+        assert_eq!(
+            selected.0.as_os_str().as_bytes(),
+            mount.as_os_str().as_bytes()
+        );
+        assert_eq!(
+            selected.1.as_os_str().as_bytes(),
+            b"/sys/cgroup-\xfe/zerofs"
+        );
     }
 
     #[test]
     fn configured_limit_is_used_when_cgroup_namespace_hides_the_outer_limit() {
-        let selected = select_memory_limit(None, Some(96_000_000_000)).unwrap();
+        let selected = select_memory_limit(CgroupMemoryLimits::default(), Some(96_000_000_000))
+            .unwrap()
+            .unwrap();
 
         assert_eq!(selected.hard_limit_bytes, 96_000_000_000);
         assert_eq!(
@@ -502,19 +661,62 @@ mod tests {
     #[test]
     fn finite_cgroup_limit_wins_over_a_larger_configured_fallback() {
         let selected = select_memory_limit(
-            Some(MemoryEnvelope {
-                hard_limit_bytes: 80_000_000_000,
-                source: "/sys/fs/cgroup/memory.max".into(),
-            }),
+            CgroupMemoryLimits {
+                dedicated: Some(MemoryEnvelope {
+                    hard_limit_bytes: 80_000_000_000,
+                    source: "/sys/fs/cgroup/memory.max".into(),
+                }),
+                shared_ceiling: None,
+            },
             Some(96_000_000_000),
         )
         .unwrap();
+        let selected = selected.unwrap();
 
         assert_eq!(selected.hard_limit_bytes, 80_000_000_000);
         assert_eq!(
             selected.source,
             std::path::PathBuf::from("/sys/fs/cgroup/memory.max")
         );
+    }
+
+    #[test]
+    fn shared_ceiling_can_reject_but_never_authorize_a_budget() {
+        let limits = CgroupMemoryLimits {
+            dedicated: Some(MemoryEnvelope {
+                hard_limit_bytes: 96 * GIB,
+                source: "/sys/fs/cgroup/zerofs/memory.max".into(),
+            }),
+            shared_ceiling: Some(MemoryEnvelope {
+                hard_limit_bytes: 80 * GIB,
+                source: "/sys/fs/cgroup/memory.max".into(),
+            }),
+        };
+
+        let error = select_memory_limit(limits.clone(), None).unwrap_err();
+        assert!(format!("{error:#}").contains("shared ancestor ceiling"));
+
+        let selected = select_memory_limit(limits, Some(64 * GIB))
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.hard_limit_bytes, 64 * GIB);
+        assert_eq!(selected.source, PathBuf::from("[runtime] memory_limit_gb"));
+    }
+
+    #[test]
+    fn configured_budget_above_shared_ceiling_is_rejected_not_lowered() {
+        let limits = CgroupMemoryLimits {
+            dedicated: None,
+            shared_ceiling: Some(MemoryEnvelope {
+                hard_limit_bytes: 48 * GIB,
+                source: "/sys/fs/cgroup/memory.max".into(),
+            }),
+        };
+
+        let error = select_memory_limit(limits, Some(64 * GIB)).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("shared ancestor ceiling"), "{message}");
+        assert!(!message.contains("accepted"), "{message}");
     }
 
     #[test]
