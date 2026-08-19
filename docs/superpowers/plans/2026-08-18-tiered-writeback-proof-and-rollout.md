@@ -848,20 +848,15 @@ Run the paired read benchmark separately because the candidate must consume the
 immutable materialized-control receipt:
 
 ```bash
-READ_PAIR_UUID="$(python3 -c 'import uuid; print(uuid.uuid4())')"
-READ_PAIR_ROOT="/var/tmp/zerofs-tiered-read-pair-${READ_PAIR_UUID}"
-install -d -m 0700 "$READ_PAIR_ROOT"
 READ_CONTROL_UUID="$(python3 -c 'import uuid; print(uuid.uuid4())')"
 READ_CONTROL_ROOT="/var/tmp/zerofs-tiered-control-${READ_CONTROL_UUID}"
 READ_CONTROL_RESOURCES="/var/tmp/zerofs-tiered-resources-${READ_CONTROL_UUID}"
 READ_CONTROL_LEDGER="${READ_CONTROL_ROOT}/ledger.json"
 sudo python3 scripts/tiered-writeback-e2e.py setup --ledger "$READ_CONTROL_LEDGER" --control-root "$READ_CONTROL_ROOT" --resource-root "$READ_CONTROL_RESOURCES" --source-sha "$FINAL_PROOF_SHA" --filesystem-ack-mode materialized --object-ack-mode ssd
 sudo python3 scripts/tiered-writeback-e2e.py run --ledger "$READ_CONTROL_LEDGER" --filesystem-ack-mode materialized --object-ack-mode ssd --scenario benchmark-read-throughput
-MATERIALIZED_SOURCE_RECEIPT="$(python3 scripts/tiered-writeback-e2e.py ledger-value --ledger "$READ_CONTROL_LEDGER" --key latest_receipt)"
-test -s "$MATERIALIZED_SOURCE_RECEIPT"
-MATERIALIZED_RECEIPT="$READ_PAIR_ROOT/materialized-control.json"
-install -m 0600 "$MATERIALIZED_SOURCE_RECEIPT" "$MATERIALIZED_RECEIPT"
-test "$(sha256sum "$MATERIALIZED_SOURCE_RECEIPT" | awk '{print $1}')" = "$(sha256sum "$MATERIALIZED_RECEIPT" | awk '{print $1}')"
+MATERIALIZED_RECEIPT="$(python3 scripts/tiered-writeback-e2e.py ledger-value --ledger "$READ_CONTROL_LEDGER" --key latest_receipt)"
+test -s "$MATERIALIZED_RECEIPT"
+case "$MATERIALIZED_RECEIPT" in "$READ_CONTROL_ROOT"/*) ;; *) exit 1 ;; esac
 sudo python3 scripts/tiered-writeback-e2e.py cleanup --ledger "$READ_CONTROL_LEDGER"
 sudo python3 scripts/tiered-writeback-e2e.py cleanup --ledger "$READ_CONTROL_LEDGER"
 sudo python3 scripts/tiered-writeback-e2e.py assert-clean --ledger "$READ_CONTROL_LEDGER"
@@ -875,9 +870,10 @@ sudo python3 scripts/tiered-writeback-e2e.py run --ledger "$READ_CANDIDATE_LEDGE
 sudo python3 scripts/tiered-writeback-e2e.py cleanup --ledger "$READ_CANDIDATE_LEDGER"
 sudo python3 scripts/tiered-writeback-e2e.py cleanup --ledger "$READ_CANDIDATE_LEDGER"
 sudo python3 scripts/tiered-writeback-e2e.py assert-clean --ledger "$READ_CANDIDATE_LEDGER"
-rm "$MATERIALIZED_RECEIPT"
-rmdir "$READ_PAIR_ROOT"
-test ! -e "$READ_PAIR_ROOT"
+sudo python3 scripts/tiered-writeback-e2e.py archive-control --ledger "$READ_CANDIDATE_LEDGER" --archive-root /fast/zerofs-tiered-receipts
+sudo python3 scripts/tiered-writeback-e2e.py archive-control --ledger "$READ_CONTROL_LEDGER" --archive-root /fast/zerofs-tiered-receipts
+test ! -e "$READ_CANDIDATE_ROOT"
+test ! -e "$READ_CONTROL_ROOT"
 ```
 
 No command in this step runs on macOS. Any correction repeats portable GREEN, exact commit/review, push, literal-SHA synchronization, and this affected Linux command.
