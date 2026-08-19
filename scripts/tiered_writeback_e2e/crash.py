@@ -132,6 +132,7 @@ def _crash_boundary_matrix(context: ScenarioContext) -> ScenarioPlan:
                         f"--unit={unit}",
                         f"--setenv=ZEROFS_FAILPOINT={boundary}",
                         str(context.zerofs_binary),
+                        "run",
                         "--config",
                         str(context.zerofs_config),
                     ),

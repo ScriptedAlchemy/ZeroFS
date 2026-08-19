@@ -688,6 +688,15 @@ class ScenarioPlanTests(HarnessCase):
                 for floor in plan.durability_floors:
                     self.assertIsInstance(floor, DurabilityFloor)
 
+    def test_server_launch_uses_the_run_subcommand(self) -> None:
+        steps = self.steps_for("nfs-commit-covers-prior-nbd")
+        launch = next(argv for argv in steps if argv[0] == "systemd-run")
+        binary_index = launch.index(str(self.binary))
+        self.assertEqual(
+            launch[binary_index : binary_index + 3],
+            (str(self.binary), "run", "--config"),
+        )
+
     def test_nfs_leg_uses_a_hard_v3_mount_with_a_real_commit(self) -> None:
         config = self.make_config()
         steps = self.steps_for("nfs-commit-covers-prior-nbd")

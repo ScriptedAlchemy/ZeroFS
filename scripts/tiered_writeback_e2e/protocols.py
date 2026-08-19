@@ -78,6 +78,7 @@ def server_steps(context: ScenarioContext) -> tuple[Step, ...]:
                 "--collect",
                 f"--unit={unit}",
                 str(context.zerofs_binary),
+                "run",
                 "--config",
                 str(context.zerofs_config),
             ),
