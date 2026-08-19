@@ -1,4 +1,6 @@
-use crate::writeback::admission::{Admission, DiskAdmission};
+use crate::writeback::admission::Admission;
+use crate::writeback::reservation::{SsdAdmission, SsdReservationRequest};
+use crate::writeback::space_sample::PhysicalSpaceSampler;
 use crate::writeback::barrier::{BarrierError, SequenceBarrier, SequenceProgress};
 use crate::writeback::journal::Journal;
 use crate::writeback::journaler::{LocalBarrier, LocalBarrierError};
@@ -50,14 +52,14 @@ impl BarrierError for RemoteBarrierError {
 fn publish_terminal(
     progress: &watch::Sender<SequenceProgress>,
     admission: &Admission,
-    disk: &DiskAdmission,
+    ssd: &SsdAdmission,
     error: impl Into<String>,
     closed: bool,
 ) {
     let error = error.into();
     tracing::error!(error = %error, "remote writeback scheduler entered terminal state");
     admission.poison(error.clone());
-    disk.poison(error.clone());
+    ssd.poison(error.clone());
     progress.send_modify(|state| {
         state.terminal_error = Some(error.clone());
         state.closed |= closed;
@@ -145,12 +147,13 @@ impl std::fmt::Debug for RemoteScheduler {
 }
 
 impl RemoteScheduler {
-    pub fn start(
+    pub(crate) fn start(
         remote: Arc<dyn ObjectStore>,
         journal: Arc<Journal>,
         overlay: OverlayIndex,
         admission: Admission,
-        disk: DiskAdmission,
+        ssd: Arc<SsdAdmission>,
+        space: Arc<PhysicalSpaceSampler>,
         local: LocalBarrier,
         upload_concurrency: usize,
     ) -> anyhow::Result<Self> {
@@ -158,19 +161,20 @@ impl RemoteScheduler {
             remote,
             journal,
             overlay,
-            (admission, disk),
+            (admission, ssd, space),
             local,
             upload_concurrency,
             true,
         )
     }
 
-    pub fn start_paused(
+    pub(crate) fn start_paused(
         remote: Arc<dyn ObjectStore>,
         journal: Arc<Journal>,
         overlay: OverlayIndex,
         admission: Admission,
-        disk: DiskAdmission,
+        ssd: Arc<SsdAdmission>,
+        space: Arc<PhysicalSpaceSampler>,
         local: LocalBarrier,
         upload_concurrency: usize,
     ) -> anyhow::Result<Self> {
@@ -178,7 +182,7 @@ impl RemoteScheduler {
             remote,
             journal,
             overlay,
-            (admission, disk),
+            (admission, ssd, space),
             local,
             upload_concurrency,
             false,
@@ -189,12 +193,12 @@ impl RemoteScheduler {
         remote: Arc<dyn ObjectStore>,
         journal: Arc<Journal>,
         overlay: OverlayIndex,
-        admissions: (Admission, DiskAdmission),
+        admissions: (Admission, Arc<SsdAdmission>, Arc<PhysicalSpaceSampler>),
         local: LocalBarrier,
         upload_concurrency: usize,
         active: bool,
     ) -> anyhow::Result<Self> {
-        let (admission, disk) = admissions;
+        let (admission, ssd, space) = admissions;
         let snapshot = journal.snapshot()?;
         let journal_progress = journal.progress()?;
         let (progress_sender, progress) = watch::channel(SequenceProgress {
@@ -213,7 +217,8 @@ impl RemoteScheduler {
             journal,
             overlay,
             admission,
-            disk,
+            ssd,
+            space,
             local,
             upload_concurrency: upload_concurrency.max(1),
             progress: progress_sender,
@@ -331,7 +336,8 @@ struct RemoteWorker {
     journal: Arc<Journal>,
     overlay: OverlayIndex,
     admission: Admission,
-    disk: DiskAdmission,
+    ssd: Arc<SsdAdmission>,
+    space: Arc<PhysicalSpaceSampler>,
     local: LocalBarrier,
     upload_concurrency: usize,
     progress: watch::Sender<SequenceProgress>,
@@ -376,7 +382,8 @@ async fn run_remote_scheduler(worker: RemoteWorker) {
         journal,
         overlay,
         admission,
-        disk,
+        ssd,
+        space,
         local,
         upload_concurrency,
         progress,
@@ -422,7 +429,7 @@ async fn run_remote_scheduler(worker: RemoteWorker) {
             result = local_wait => {
                 if let Err(error) = result {
                     if !matches!(error, LocalBarrierError::Closed) {
-                        publish_terminal(&progress, &admission, &disk, error.to_string(), false);
+                        publish_terminal(&progress, &admission, &ssd, error.to_string(), false);
                     }
                     break;
                 }
@@ -447,7 +454,7 @@ async fn run_remote_scheduler(worker: RemoteWorker) {
             Ok(Some(window)) => window,
             Ok(None) => break,
             Err(error) => {
-                publish_terminal(&progress, &admission, &disk, format!("{error:#}"), false);
+                publish_terminal(&progress, &admission, &ssd, format!("{error:#}"), false);
                 break;
             }
         };
@@ -470,7 +477,7 @@ async fn run_remote_scheduler(worker: RemoteWorker) {
                 }
             }
             if committing.is_none() && terminal_error.is_none() {
-                committing = start_ready_commit(&journal, &overlay, &disk, next, &completed);
+                committing = start_ready_commit(&journal, &overlay, &ssd, &space, next, &completed);
             }
             if !retry && terminal_error.is_none() {
                 let batch = collect_pipeline_batch(
@@ -495,7 +502,7 @@ async fn run_remote_scheduler(worker: RemoteWorker) {
             }
             if active.is_empty() && committing.is_none() {
                 if let Some(error) = terminal_error {
-                    publish_terminal(&progress, &admission, &disk, error, true);
+                    publish_terminal(&progress, &admission, &ssd, error, true);
                     return;
                 }
                 break;
@@ -533,7 +540,7 @@ async fn run_remote_scheduler(worker: RemoteWorker) {
                             }
                         }
                         if let Some(error) = shutdown_error {
-                            publish_terminal(&progress, &admission, &disk, error, true);
+                            publish_terminal(&progress, &admission, &ssd, error, true);
                         }
                         break 'scheduler;
                     }
@@ -876,7 +883,8 @@ fn collect_pipeline_batch(
 fn start_ready_commit(
     journal: &Arc<Journal>,
     overlay: &OverlayIndex,
-    disk: &DiskAdmission,
+    ssd: &Arc<SsdAdmission>,
+    space: &Arc<PhysicalSpaceSampler>,
     next: Sequence,
     completed: &BTreeMap<Sequence, CompletedRemote>,
 ) -> Option<RemoteCommit> {
@@ -900,7 +908,8 @@ fn start_ready_commit(
     }
     let journal = Arc::clone(journal);
     let overlay = overlay.clone();
-    let disk = disk.clone();
+    let ssd = Arc::clone(ssd);
+    let space = Arc::clone(space);
     Some(
         async move {
             let last = run
@@ -908,7 +917,7 @@ fn start_ready_commit(
                 .expect("ready commit run contains the frontier")
                 .0
                 .sequence;
-            let result = commit_remote_run(&journal, &overlay, &disk, &run).await;
+            let result = commit_remote_run(&journal, &overlay, &ssd, &space, &run).await;
             (last, result)
         }
         .boxed(),
@@ -1057,7 +1066,8 @@ async fn verify_existing(
 async fn commit_remote_run(
     journal: &Arc<Journal>,
     overlay: &OverlayIndex,
-    disk: &DiskAdmission,
+    ssd: &SsdAdmission,
+    space: &PhysicalSpaceSampler,
     run: &[(MutationRecord, Option<String>)],
 ) -> anyhow::Result<()> {
     let last = run
@@ -1074,20 +1084,18 @@ async fn commit_remote_run(
         .await
         .map_err(|error| anyhow::anyhow!("remote watermark task failed: {error}"))??;
     overlay.remove_remote_prefix(last).await;
-    let charge = run.iter().try_fold(0_u64, |total, (record, _)| {
-        let bytes = record.ssd_reservation_bytes()?;
-        total
-            .checked_add(bytes)
-            .ok_or_else(|| anyhow::anyhow!("remote SSD reservation overflow"))
-    })?;
+    let requests = run
+        .iter()
+        .map(|(record, _)| SsdReservationRequest::from_pending_record(record))
+        .collect::<Result<Vec<_>, _>>()?;
     let cleanup_journal = Arc::clone(journal);
-    let available = tokio::task::spawn_blocking(move || -> anyhow::Result<u64> {
-        cleanup_journal.remove_remote_prefix(last)?;
-        Ok(fs4::available_space(cleanup_journal.root())?)
-    })
-    .await
-    .map_err(|error| anyhow::anyhow!("remote cleanup task failed: {error}"))??;
-    disk.set_remote_complete(charge, available)?;
+    tokio::task::spawn_blocking(move || cleanup_journal.remove_remote_prefix(last))
+        .await
+        .map_err(|error| anyhow::anyhow!("remote cleanup task failed: {error}"))??;
+    let sample = space.sample().await?;
+    for request in requests {
+        ssd.release_remote(request, sample)?;
+    }
     Ok(())
 }
 

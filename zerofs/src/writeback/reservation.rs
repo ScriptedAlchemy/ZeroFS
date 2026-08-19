@@ -368,6 +368,27 @@ impl SsdAdmission {
     pub(crate) fn force_release(&self, request: SsdReservationRequest) {
         self.inner.release(request);
     }
+
+    /// Release a locally committed reservation after remote cleanup.
+    ///
+    /// Observes `sample` first so waiters see the post-cleanup free space.
+    /// The charge stays held if the sampler generation is stale or admission
+    /// is already terminal.
+    pub(crate) fn release_remote(
+        &self,
+        request: SsdReservationRequest,
+        sample: PhysicalSpaceSample,
+    ) -> Result<(), ReservationError> {
+        {
+            let mut state = lock(&self.inner.state);
+            self.inner.observe_locked(&mut state, sample)?;
+            if let Some(error) = &state.terminal {
+                return Err(error.clone());
+            }
+        }
+        self.inner.release(request);
+        Ok(())
+    }
 }
 impl SsdAdmissionInner {
     fn observe_locked(
