@@ -113,6 +113,7 @@ pub struct NinePServer {
     filesystem: Arc<ZeroFS>,
     transport: Transport,
     lock_manager: Arc<FileLockManager>,
+    credential_override: Option<(u32, u32)>,
 }
 
 impl NinePServer {
@@ -121,6 +122,7 @@ impl NinePServer {
             filesystem,
             transport: Transport::Tcp(addr),
             lock_manager: Arc::new(FileLockManager::new()),
+            credential_override: None,
         }
     }
 
@@ -129,7 +131,14 @@ impl NinePServer {
             filesystem,
             transport: Transport::Unix(path),
             lock_manager: Arc::new(FileLockManager::new()),
+            credential_override: None,
         }
+    }
+
+    /// Override client-provided credentials for a shared writable namespace.
+    pub fn with_credential_override(mut self, uid: u32, gid: u32) -> Self {
+        self.credential_override = Some((uid, gid));
+        self
     }
 
     fn spawn_client_handler<R, W>(
@@ -145,6 +154,7 @@ impl NinePServer {
     {
         let filesystem = Arc::clone(&self.filesystem);
         let lock_manager = Arc::clone(&self.lock_manager);
+        let credential_override = self.credential_override;
         let client_shutdown = shutdown.child_token();
 
         AbortOnDropHandle::new(spawn_named("9p-client", async move {
@@ -153,6 +163,7 @@ impl NinePServer {
                 write_stream,
                 filesystem,
                 lock_manager,
+                credential_override,
                 client_shutdown,
             )
             .await
@@ -429,13 +440,18 @@ async fn handle_client_stream<R, W>(
     write_stream: W,
     filesystem: Arc<ZeroFS>,
     lock_manager: Arc<FileLockManager>,
+    credential_override: Option<(u32, u32)>,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let handler = Arc::new(NinePHandler::new(Arc::clone(&filesystem), lock_manager));
+    let mut handler = NinePHandler::new(Arc::clone(&filesystem), lock_manager);
+    if let Some((uid, gid)) = credential_override {
+        handler = handler.with_credential_override(uid, gid);
+    }
+    let handler = Arc::new(handler);
 
     let (tx, rx) = mpsc::channel::<(u16, Vec<u8>)>(P9_CHANNEL_SIZE);
     let connection_shutdown = shutdown.child_token();
@@ -945,6 +961,15 @@ mod tests {
             Arc::new(FileLockManager::new()),
         ));
         (filesystem, handler)
+    }
+
+    #[tokio::test]
+    async fn server_builder_carries_shared_identity_to_client_handlers() {
+        let filesystem = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let server = NinePServer::new(filesystem, "127.0.0.1:0".parse().unwrap())
+            .with_credential_override(501, 20);
+
+        assert_eq!(server.credential_override, Some((501, 20)));
     }
 
     async fn negotiate(handler: &NinePHandler) {

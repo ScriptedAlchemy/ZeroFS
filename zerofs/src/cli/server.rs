@@ -188,7 +188,11 @@ fn start_ninep_servers(
     if let Some(addresses) = &config.addresses {
         for addr in addresses {
             info!("Starting 9P server on {}", addr);
-            let ninep_tcp_server = crate::ninep::NinePServer::new(Arc::clone(&fs), *addr);
+            let mut ninep_tcp_server = crate::ninep::NinePServer::new(Arc::clone(&fs), *addr);
+            if let Some(identity) = config.shared_identity {
+                ninep_tcp_server =
+                    ninep_tcp_server.with_credential_override(identity.uid, identity.gid);
+            }
             let shutdown_clone = shutdown.clone();
             handles.push(spawn_named("9p-server", async move {
                 ninep_tcp_server.start(shutdown_clone).await
@@ -202,8 +206,12 @@ fn start_ninep_servers(
             socket_path.display()
         );
         let ninep_unix_fs = Arc::clone(&fs);
-        let ninep_unix_server =
+        let mut ninep_unix_server =
             crate::ninep::NinePServer::new_unix(ninep_unix_fs, socket_path.clone());
+        if let Some(identity) = config.shared_identity {
+            ninep_unix_server =
+                ninep_unix_server.with_credential_override(identity.uid, identity.gid);
+        }
         let shutdown_clone = shutdown.clone();
         handles.push(spawn_named("9p-unix-server", async move {
             ninep_unix_server.start(shutdown_clone).await
