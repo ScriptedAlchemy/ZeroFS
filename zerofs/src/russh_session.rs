@@ -628,6 +628,74 @@ async fn close_ssh_handle(
     }
 }
 
+async fn connect_ssh_handle(
+    endpoint: &crate::config::SftpEndpoint,
+    known_hosts: &Path,
+    force: &CancellationToken,
+) -> Result<client::Handle<StrictHostKey>, TransportError> {
+    let socket = tokio::select! {
+        biased;
+        _ = force.cancelled() => return Err(TransportError::PoolClosed),
+        result = tokio::net::TcpStream::connect((endpoint.host.as_str(), endpoint.port)) => {
+            result.map_err(|error| {
+                TransportError::Open(format!(
+                    "TCP connect to {}:{} failed: {error}",
+                    endpoint.host, endpoint.port
+                ))
+            })?
+        }
+    };
+    let config = Arc::new(russh_client_config());
+    if config.nodelay
+        && let Err(error) = socket.set_nodelay(true)
+    {
+        tracing::warn!(%error, "failed to enable TCP_NODELAY for russh");
+    }
+    let std_socket = socket.into_std().map_err(|error| {
+        TransportError::Open(format!("failed to retain ownership of SSH socket: {error}"))
+    })?;
+    let abort_socket = std_socket.try_clone().map_err(|error| {
+        TransportError::Open(format!(
+            "failed to duplicate SSH socket for cancellation: {error}"
+        ))
+    })?;
+    let socket = tokio::net::TcpStream::from_std(std_socket).map_err(|error| {
+        TransportError::Open(format!(
+            "failed to restore asynchronous SSH socket: {error}"
+        ))
+    })?;
+    let handler = StrictHostKey {
+        host: endpoint.host.clone(),
+        port: endpoint.port,
+        known_hosts: known_hosts.to_path_buf(),
+    };
+    let connecting = client::connect_stream(config, socket, handler);
+    tokio::pin!(connecting);
+    tokio::select! {
+        result = &mut connecting => result.map_err(|error| {
+            TransportError::Open(format!(
+                "russh connect to {}:{} failed: {error}",
+                endpoint.host, endpoint.port
+            ))
+        }),
+        _ = force.cancelled() => {
+            if let Err(error) = abort_socket.shutdown(std::net::Shutdown::Both) {
+                tracing::warn!(%error, "failed to shut down cancelled SSH socket");
+            }
+            match connecting.await {
+                Ok(handle) => {
+                    let cleanup_force = CancellationToken::new();
+                    close_ssh_handle(handle, &cleanup_force).await?;
+                }
+                Err(error) => {
+                    tracing::debug!(%error, "cancelled SSH connection terminated during handshake");
+                }
+            }
+            Err(TransportError::PoolClosed)
+        }
+    }
+}
+
 #[async_trait]
 impl SessionFactory for RusshSessionFactory {
     async fn open(
@@ -638,25 +706,7 @@ impl SessionFactory for RusshSessionFactory {
             return Err(TransportError::PoolClosed);
         }
 
-        let handler = StrictHostKey {
-            host: self.endpoint.host.clone(),
-            port: self.endpoint.port,
-            known_hosts: self.known_hosts.clone(),
-        };
-        let mut handle = tokio::select! {
-            biased;
-            _ = force.cancelled() => return Err(TransportError::PoolClosed),
-            result = client::connect(
-                Arc::new(russh_client_config()),
-                (self.endpoint.host.as_str(), self.endpoint.port),
-                handler,
-            ) => result.map_err(|error| {
-                    TransportError::Open(format!(
-                        "russh connect to {}:{} failed: {error}",
-                        self.endpoint.host, self.endpoint.port
-                    ))
-                })?,
-        };
+        let mut handle = connect_ssh_handle(&self.endpoint, &self.known_hosts, &force).await?;
         let session = {
             let session = async {
                 let hash = if self.identity_key.algorithm().is_rsa() {
@@ -1642,6 +1692,71 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
             .await
             .expect_err("unknown host keys must fail closed");
         assert!(matches!(error, TransportError::Open(_)), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn russh_cancelled_stalled_kex_closes_the_pre_handle_tcp_runner() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let banner_sent = Arc::new(tokio::sync::Notify::new());
+        let server_active = active.clone();
+        let server_banner_sent = banner_sent.clone();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            server_active.fetch_add(1, Ordering::SeqCst);
+            socket.write_all(b"SSH-2.0-stalled-kex\r\n").await.unwrap();
+            server_banner_sent.notify_one();
+            let mut buffer = [0; 1024];
+            loop {
+                match socket.read(&mut buffer).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+            server_active.fetch_sub(1, Ordering::SeqCst);
+        });
+
+        let root = tempfile::tempdir().unwrap();
+        let identity = root.path().join("identity");
+        let known_hosts = root.path().join("known_hosts");
+        std::fs::write(&identity, CLIENT_KEY).unwrap();
+        std::fs::write(&known_hosts, "").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&identity, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let factory = RusshSessionFactory::new(
+            crate::config::SftpEndpoint {
+                host: "127.0.0.1".to_owned(),
+                port: address.port(),
+                username: "zerofs".to_owned(),
+            },
+            identity,
+            known_hosts,
+        )
+        .unwrap();
+        let force = CancellationToken::new();
+        let cancel_force = force.clone();
+        let cancel = async {
+            banner_sent.notified().await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            cancel_force.cancel();
+        };
+
+        let (result, ()) = tokio::join!(factory.open(force), cancel);
+
+        assert!(matches!(result, Err(TransportError::PoolClosed)));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while active.load(Ordering::SeqCst) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled KEX must not detach a live TCP/session runner");
     }
 
     #[tokio::test]
