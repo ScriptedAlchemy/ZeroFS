@@ -494,73 +494,131 @@ enum WindowPlan {
     Covered,
 }
 
-fn admit_part(
-    parts: &HybridCache<PartKey, Bytes>,
-    part_counts: &Cache<Path, usize>,
-    location: &Path,
-    part_size_bytes: usize,
-    generation: &CacheGeneration,
-    part_id: PartId,
-    bytes: Bytes,
-) {
-    if alloc_rss::over_rss_cap() {
-        return;
+impl FetchCtx {
+    /// Insert one part, unless the RSS envelope is over the admission cap.
+    fn admit_part(
+        &self,
+        location: &Path,
+        generation: &CacheGeneration,
+        part_id: PartId,
+        bytes: Bytes,
+    ) {
+        if alloc_rss::over_rss_cap() {
+            return;
+        }
+        self.parts.insert(
+            PartKey::new(location, self.part_size_bytes, generation, part_id),
+            bytes,
+        );
     }
-    parts.insert(
-        PartKey::new(location, part_size_bytes, generation, part_id),
-        bytes,
-    );
-    let n = part_id + 1;
-    let cur = part_counts.get(location).map(|e| *e.value()).unwrap_or(0);
-    if n > cur {
-        part_counts.insert(location.clone(), n);
-    }
-}
 
-fn evict_location_parts(
-    parts: &HybridCache<PartKey, Bytes>,
-    heads: &Cache<Path, Arc<CachedHead>>,
-    generations: &Cache<Path, CacheGeneration>,
-    access_tracker: &Cache<Path, Arc<Mutex<AccessHistory>>>,
-    part_counts: &Cache<Path, usize>,
-    part_size_bytes: usize,
-    cache_instance: uuid::Uuid,
-    location: &Path,
-) {
-    let from_counts = part_counts.get(location).map(|e| *e.value()).unwrap_or(0);
-    let from_head = heads
-        .get(location)
-        .map(|e| e.value().meta.size.div_ceil(part_size_bytes as u64) as usize)
-        .unwrap_or(0);
-    let generation = generations
-        .get(location)
-        .map(|e| e.value().clone())
-        .or_else(|| {
-            heads
-                .get(location)
-                .map(|e| CacheGeneration::from_meta(&e.value().meta, cache_instance))
-        });
-    let from_gen = match &generation {
-        Some(CacheGeneration::Unversioned { size, .. }) => {
-            size.div_ceil(part_size_bytes as u64) as usize
-        }
-        _ => 0,
-    };
-    let n = from_counts.max(from_head).max(from_gen);
-    if let Some(generation) = generation {
-        for part_id in 0..n {
-            parts.remove(&PartKey::new(
-                location,
-                part_size_bytes,
-                &generation,
-                part_id,
-            ));
+    /// Record that `location` has at least `n` parts, so evict can form
+    /// PartKeys later. Called once per admitted batch, not per part.
+    fn note_parts(&self, location: &Path, n: usize) {
+        let cur = self
+            .part_counts
+            .get(location)
+            .map(|e| *e.value())
+            .unwrap_or(0);
+        if n > cur {
+            self.part_counts.insert(location.clone(), n);
         }
     }
-    heads.remove(location);
-    generations.remove(location);
-    access_tracker.remove(location);
-    part_counts.remove(location);
+
+    /// Drop every cached part for `location` plus heads / generations /
+    /// access_tracker. Called from delete so a reclaim that only drops
+    /// heads cannot keep charging foyer for the dead 32 MiB parts.
+    fn evict_location(&self, location: &Path) {
+        let from_counts = self
+            .part_counts
+            .get(location)
+            .map(|e| *e.value())
+            .unwrap_or(0);
+        let head = self.heads.get(location);
+        let from_head = head
+            .as_ref()
+            .map(|e| e.value().meta.size.div_ceil(self.part_size_bytes as u64) as usize)
+            .unwrap_or(0);
+        let generation = self
+            .generations
+            .get(location)
+            .map(|e| e.value().clone())
+            .or_else(|| {
+                head.as_ref()
+                    .map(|e| CacheGeneration::from_meta(&e.value().meta, self.cache_instance))
+            });
+        let from_gen = match &generation {
+            Some(CacheGeneration::Unversioned { size, .. }) => {
+                size.div_ceil(self.part_size_bytes as u64) as usize
+            }
+            _ => 0,
+        };
+        let n = from_counts.max(from_head).max(from_gen);
+        if let Some(generation) = generation {
+            for part_id in 0..n {
+                self.parts.remove(&PartKey::new(
+                    location,
+                    self.part_size_bytes,
+                    &generation,
+                    part_id,
+                ));
+            }
+        }
+        self.heads.remove(location);
+        self.generations.remove(location);
+        self.access_tracker.remove(location);
+        self.part_counts.remove(location);
+    }
+
+    async fn save_parts_stream<S>(
+        &self,
+        location: &Path,
+        generation: &CacheGeneration,
+        mut stream: S,
+        start_part_number: PartId,
+        mut skip: usize,
+    ) -> object_store::Result<()>
+    where
+        S: stream::Stream<Item = Result<Bytes, object_store::Error>> + Unpin,
+    {
+        let mut buffer = BytesMut::new();
+        let mut part_number = start_part_number;
+        while let Some(chunk) = stream.next().await {
+            let mut chunk = chunk?;
+            if skip > 0 {
+                let n = skip.min(chunk.len());
+                chunk = chunk.slice(n..);
+                skip -= n;
+                if chunk.is_empty() {
+                    continue;
+                }
+            }
+            buffer.extend_from_slice(&chunk);
+            while buffer.len() >= self.part_size_bytes {
+                let to_write = buffer.split_to(self.part_size_bytes);
+                self.admit_part(
+                    location,
+                    generation,
+                    part_number,
+                    Bytes::copy_from_slice(&to_write),
+                );
+                part_number += 1;
+            }
+        }
+        if !buffer.is_empty() {
+            self.admit_part(
+                location,
+                generation,
+                part_number,
+                Bytes::copy_from_slice(&buffer),
+            );
+            part_number += 1;
+        }
+        if part_number > start_part_number {
+            self.note_parts(location, part_number);
+        }
+        Ok(())
+    }
 }
 
 impl PrefetchingObjectStore {
@@ -720,55 +778,11 @@ impl PrefetchingObjectStore {
         self.generations.remove(location);
     }
 
-    /// Drop every cached part for `location` plus heads / generations /
-    /// access_tracker. Called from delete so a reclaim that only drops
-    /// heads cannot keep charging foyer for the dead 32 MiB parts.
-    pub fn evict_location(&self, location: &Path) {
-        evict_location_parts(
-            &self.parts,
-            &self.heads,
-            &self.generations,
-            &self.access_tracker,
-            &self.part_counts,
-            self.part_size_bytes,
-            self.cache_instance,
-            location,
-        );
-    }
-
-    /// Backend GET that does not `save_get_result`, `read_part`, or
-    /// `spawn_async_prefetch`. GC/compaction use this (or `SkipPartsCache`).
-    pub async fn get_opts_uncached(
-        &self,
-        location: &Path,
-        options: GetOptions,
-    ) -> object_store::Result<GetResult> {
-        self.inner.get_opts(location, options).await
-    }
-
-    /// ObjectStore delete that evicts first so a failed backend delete
-    /// still uncharges the user cache.
-    pub async fn delete(&self, location: &Path) -> object_store::Result<()> {
-        self.evict_location(location);
-        object_store::ObjectStoreExt::delete(&*self.inner, location).await
-    }
-
-    fn admit_part(
-        &self,
-        location: &Path,
-        generation: &CacheGeneration,
-        part_id: PartId,
-        bytes: Bytes,
-    ) {
-        admit_part(
-            &self.parts,
-            &self.part_counts,
-            location,
-            self.part_size_bytes,
-            generation,
-            part_id,
-            bytes,
-        );
+    /// See [`FetchCtx::evict_location`]. Production deletes evict via the
+    /// `delete_stream` override.
+    #[cfg(test)]
+    fn evict_location(&self, location: &Path) {
+        self.ctx().evict_location(location);
     }
 
     fn record_access(&self, location: &Path, offset: u64, len: u64) -> RecordDecision {
@@ -1201,71 +1215,9 @@ impl PrefetchingObjectStore {
             .try_into()
             .expect("part number exceeds usize");
         let stream = result.into_stream();
-        Self::save_parts_stream(
-            &self.parts,
-            &self.part_counts,
-            self.part_size_bytes,
-            location,
-            &generation,
-            stream,
-            start_part,
-            skip as usize,
-        )
-        .await
-    }
-
-    async fn save_parts_stream<S>(
-        parts: &HybridCache<PartKey, Bytes>,
-        part_counts: &Cache<Path, usize>,
-        part_size_bytes: usize,
-        location: &Path,
-        generation: &CacheGeneration,
-        mut stream: S,
-        start_part_number: PartId,
-        mut skip: usize,
-    ) -> object_store::Result<()>
-    where
-        S: stream::Stream<Item = Result<Bytes, object_store::Error>> + Unpin,
-    {
-        let mut buffer = BytesMut::new();
-        let mut part_number = start_part_number;
-        while let Some(chunk) = stream.next().await {
-            let mut chunk = chunk?;
-            if skip > 0 {
-                let n = skip.min(chunk.len());
-                chunk = chunk.slice(n..);
-                skip -= n;
-                if chunk.is_empty() {
-                    continue;
-                }
-            }
-            buffer.extend_from_slice(&chunk);
-            while buffer.len() >= part_size_bytes {
-                let to_write = buffer.split_to(part_size_bytes);
-                admit_part(
-                    parts,
-                    part_counts,
-                    location,
-                    part_size_bytes,
-                    generation,
-                    part_number,
-                    Bytes::copy_from_slice(&to_write),
-                );
-                part_number += 1;
-            }
-        }
-        if !buffer.is_empty() {
-            admit_part(
-                parts,
-                part_counts,
-                location,
-                part_size_bytes,
-                generation,
-                part_number,
-                Bytes::copy_from_slice(&buffer),
-            );
-        }
-        Ok(())
+        self.ctx()
+            .save_parts_stream(location, &generation, stream, start_part, skip as usize)
+            .await
     }
 
     /// Populate the parts cache from a just-uploaded object's bytes. Inserts
@@ -1296,6 +1248,7 @@ impl PrefetchingObjectStore {
         };
         self.generations
             .insert(location.clone(), generation.clone());
+        let ctx = self.ctx();
         let ps = self.part_size_bytes;
         let mut off = 0usize;
         let mut part_id: PartId = 0;
@@ -1305,7 +1258,7 @@ impl PrefetchingObjectStore {
             // source allocation (a 256 MiB sealed segment) alive while any
             // one part survives in the cache, and the weigher only sees the
             // slice length. That was the multi-GB RSS retention bug.
-            self.admit_part(
+            ctx.admit_part(
                 location,
                 &generation,
                 part_id,
@@ -1313,6 +1266,9 @@ impl PrefetchingObjectStore {
             );
             off = end;
             part_id += 1;
+        }
+        if part_id > 0 {
+            ctx.note_parts(location, part_id);
         }
     }
 
@@ -1442,15 +1398,13 @@ impl PrefetchingObjectStore {
         let bytes = get_result.bytes().await?;
         // Owned copy: a backend may serve this range as a slice of a larger
         // retained allocation, which a cached part must never pin.
-        admit_part(
-            &ctx.parts,
-            &ctx.part_counts,
+        ctx.admit_part(
             location,
-            part_size_bytes,
             &generation,
             part_id,
             Bytes::copy_from_slice(&bytes),
         );
+        ctx.note_parts(location, part_id + 1);
         let end = range_in_part.end.min(bytes.len());
         let start = range_in_part.start.min(end);
         Ok(bytes.slice(start..end))
@@ -1504,23 +1458,21 @@ impl PrefetchingObjectStore {
                 .unwrap()
                 .note_fetch(fetch_offset, actual_end);
         }
-        for i in 0..window_parts {
+        let fetched_parts = all_bytes.len().div_ceil(part_size_bytes).min(window_parts);
+        for i in 0..fetched_parts {
             let start = i * part_size_bytes;
-            if start >= all_bytes.len() {
-                break;
-            }
             let end = ((i + 1) * part_size_bytes).min(all_bytes.len());
             // Owned copy: a slice would pin the whole window allocation for
             // as long as any one part survives in the cache.
-            admit_part(
-                &ctx.parts,
-                &ctx.part_counts,
+            ctx.admit_part(
                 &location,
-                part_size_bytes,
                 &generation,
                 fetch_start + i,
                 Bytes::copy_from_slice(&all_bytes[start..end]),
             );
+        }
+        if fetched_parts > 0 {
+            ctx.note_parts(&location, fetch_start + fetched_parts);
         }
         Ok((fetch_start, all_bytes))
     }
@@ -1627,7 +1579,9 @@ impl ObjectStore for PrefetchingObjectStore {
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
         if options.extensions.get::<SkipPartsCache>().is_some() {
-            return self.get_opts_uncached(location, options).await;
+            // Straight to the backend: no save_get_result, read_part, or
+            // spawn_async_prefetch.
+            return self.inner.get_opts(location, options).await;
         }
         self.cached_get_opts(location, options).await
     }
@@ -1660,27 +1614,12 @@ impl ObjectStore for PrefetchingObjectStore {
         &self,
         locations: BoxStream<'static, object_store::Result<Path>>,
     ) -> BoxStream<'static, object_store::Result<Path>> {
-        let parts = self.parts.clone();
-        let heads = self.heads.clone();
-        let generations = self.generations.clone();
-        let access_tracker = self.access_tracker.clone();
-        let part_counts = self.part_counts.clone();
-        let part_size_bytes = self.part_size_bytes;
-        let cache_instance = self.cache_instance;
+        let ctx = self.ctx();
         self.inner
             .delete_stream(locations)
             .map(move |res| {
                 if let Ok(path) = &res {
-                    evict_location_parts(
-                        &parts,
-                        &heads,
-                        &generations,
-                        &access_tracker,
-                        &part_counts,
-                        part_size_bytes,
-                        cache_instance,
-                        path,
-                    );
+                    ctx.evict_location(path);
                 }
                 res
             })
@@ -4265,17 +4204,6 @@ mod tests {
         store.evict_location(&path);
         assert!(store.cached_part(&path, 0).await.is_none());
 
-        let result = store
-            .get_opts_uncached(&path, GetOptions::default())
-            .await
-            .unwrap();
-        let got = result.bytes().await.unwrap();
-        assert_eq!(&got[..], &payload[..]);
-        assert!(
-            store.cached_part(&path, 0).await.is_none(),
-            "uncached GET must not save_get_result / insert parts"
-        );
-
         let mut skip = GetOptions::default();
         skip.extensions.insert(SkipPartsCache);
         let result = store.get_opts(&path, skip).await.unwrap();
@@ -4283,7 +4211,7 @@ mod tests {
         assert_eq!(&got[..], &payload[..]);
         assert!(
             store.cached_part(&path, 0).await.is_none(),
-            "SkipPartsCache must take the uncached path"
+            "SkipPartsCache must not save_get_result / insert parts"
         );
     }
 
@@ -4295,9 +4223,8 @@ mod tests {
         let path = Path::from("over-cap");
         let payload = vec![3u8; 64 * 1024];
         store.put(&path, payload.into()).await.unwrap();
-        // write-through would have inserted part 0 if admission allowed it.
-        // No head after put-only; use generations+part_counts via evict path:
-        // cached_part needs a head, so do a GET (also gated) and assert empty.
+        // `cached_part` needs a head, so issue a GET (whose part inserts are
+        // also cap-gated) and assert nothing was admitted.
         let _ = store.get(&path).await.unwrap().bytes().await.unwrap();
         assert!(
             store.cached_part(&path, 0).await.is_none(),
