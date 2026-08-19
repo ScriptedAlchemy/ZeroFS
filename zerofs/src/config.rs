@@ -138,6 +138,10 @@ pub struct Settings {
     pub cache: CacheConfig,
     pub storage: StorageConfig,
     pub servers: ServerConfig,
+    /// Process-level resource limits used when container namespaces hide the
+    /// parent cgroup envelope.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub runtime: Option<RuntimeConfig>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub filesystem: Option<FilesystemConfig>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -166,6 +170,16 @@ pub struct Settings {
     /// HA replication. Absent means single-node (non-replicated behavior).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub replication: Option<ReplicationConfig>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeConfig {
+    /// Administrator-declared ZeroFS-dedicated memory envelope in decimal GB.
+    /// Use this when a container namespace hides the dedicated service limit.
+    /// A shared parent cgroup is only a ceiling and cannot supply this budget.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub memory_limit_gb: Option<f64>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -1434,6 +1448,24 @@ impl Settings {
             .unwrap_or_default()
     }
 
+    pub fn runtime_memory_limit_bytes(&self) -> Result<Option<u64>> {
+        let Some(value) = self
+            .runtime
+            .as_ref()
+            .and_then(|runtime| runtime.memory_limit_gb)
+        else {
+            return Ok(None);
+        };
+        if !value.is_finite() || value <= 0.0 {
+            anyhow::bail!("[runtime] memory_limit_gb must be a finite positive number");
+        }
+        let bytes = value * 1_000_000_000.0;
+        if bytes > u64::MAX as f64 {
+            anyhow::bail!("[runtime] memory_limit_gb is too large");
+        }
+        Ok(Some(bytes.round() as u64))
+    }
+
     pub fn from_file(config_path: impl AsRef<std::path::Path>) -> Result<Self> {
         let path = config_path.as_ref();
         let content = fs::read_to_string(path)
@@ -1454,6 +1486,7 @@ impl Settings {
     /// Cross-section validation applied after deserialization.
     pub fn validate(&self) -> Result<()> {
         self.servers.validate()?;
+        self.runtime_memory_limit_bytes()?;
 
         // Parse the endpoint first so a malformed SFTP URL still reports the URL
         // error ahead of any capability diagnostic.
@@ -1737,6 +1770,7 @@ impl Settings {
                     gid: 1000,
                 }),
             },
+            runtime: None,
             filesystem: None,
             lsm: None,
             gc: None,
@@ -2467,6 +2501,38 @@ encryption_password = "test-password"
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn runtime_memory_limit_is_an_explicit_decimal_gb_fallback() {
+        let config = writeback_sftp_config(1.0, "").replace(
+            "[storage]",
+            "[runtime]\nmemory_limit_gb = 96.0\n\n[storage]",
+        );
+
+        let settings = write_and_load(&config).unwrap();
+
+        assert_eq!(
+            settings.runtime_memory_limit_bytes().unwrap(),
+            Some(96_000_000_000)
+        );
+    }
+
+    #[test]
+    fn runtime_memory_limit_rejects_non_finite_and_non_positive_values() {
+        for value in ["0.0", "-1.0", "nan", "inf"] {
+            let config = writeback_sftp_config(1.0, "").replace(
+                "[storage]",
+                &format!("[runtime]\nmemory_limit_gb = {value}\n\n[storage]"),
+            );
+
+            let error = write_and_load(&config).unwrap_err();
+
+            assert!(
+                format!("{error:#}").contains("memory_limit_gb must be a finite positive number"),
+                "unexpected error for {value}: {error:#}"
+            );
+        }
     }
 
     #[test]

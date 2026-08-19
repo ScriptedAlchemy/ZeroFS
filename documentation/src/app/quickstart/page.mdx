@@ -71,11 +71,13 @@ Keep that process running. The first start creates the filesystem metadata at th
 
 ## Mount the Filesystem
 
-Open another terminal. On Linux, use the [native kernel client](/kernel-client) when a package is available for your kernel. Install the matching package before using the first command below. The bundled FUSE client works without the ZeroFS kernel module. macOS and Linux can also use NFS.
+Open another terminal. The bundled FUSE client works on Linux without a ZeroFS
+kernel module. Build and load the module from source before using the native
+kernel-client command below. macOS and Linux can also use NFS.
 
 <CodeGroup>
 
-```bash {{ title: 'Linux (native kernel client)' }}
+```bash {{ title: 'Linux (native source build)' }}
 sudo mkdir -p /mnt/zerofs
 sudo mount -t zerofs \
   -o consistency=relaxed,msize=10485760 \
@@ -103,7 +105,12 @@ sudo mount -t nfs \
 
 </CodeGroup>
 
-The native client is an out-of-tree module distributed for specific kernels; see [Native kernel client](/kernel-client) for compatibility and installation. The FUSE command stays in the foreground; press `Ctrl+C` to unmount. For stock v9fs, Unix sockets, or FUSE client controls, see [9P file access](/9p-access). For NFS mount behavior and limitations, see [NFS file access](/nfs-access).
+The native client is an out-of-tree module built from source for the running
+kernel; see [Native kernel client](/kernel-client) for requirements and
+installation. The FUSE command stays in the foreground; press `Ctrl+C` to
+unmount. For stock v9fs, Unix sockets, or FUSE client controls, see [9P file
+access](/9p-access). For NFS mount behavior and limitations, see [NFS file
+access](/nfs-access).
 
 ## Verify the Mount
 

@@ -1,4 +1,5 @@
 use super::{attach_cleanup_errors, finish_with_sftp_cleanup};
+use crate::cache_metrics::{CacheMetrics, FoyerMetricsRegistry};
 use crate::checkpoint_manager::CheckpointManager;
 use crate::config::{NbdConfig, NfsConfig, NinePConfig, RpcConfig, Settings};
 use crate::db::SlateDbHandle;
@@ -7,6 +8,7 @@ use crate::fs::types::SetAttributes;
 use crate::fs::{CacheConfig, GarbageCollector, ZeroFS};
 use crate::length_checked_object_store::LengthCheckedObjectStore;
 use crate::nbd::{NBDServer, NbdExportGates};
+use crate::ninep::server::P9AcceptedWorkTracker;
 use crate::object_store_prefetch::PrefetchingObjectStore;
 use crate::parse_object_store::{ParsedStore, parse_url_opts};
 use crate::storage_class_object_store::with_storage_class;
@@ -188,6 +190,7 @@ fn start_ninep_servers(
     fs: Arc<ZeroFS>,
     config: Option<&NinePConfig>,
     shutdown: CancellationToken,
+    accepted_work: P9AcceptedWorkTracker,
 ) -> Vec<JoinHandle<Result<(), std::io::Error>>> {
     let config = match config {
         Some(c) => c,
@@ -200,8 +203,11 @@ fn start_ninep_servers(
             info!("Starting 9P server on {}", addr);
             let ninep_tcp_server = crate::ninep::NinePServer::new(Arc::clone(&fs), *addr);
             let shutdown_clone = shutdown.clone();
+            let accepted_work = accepted_work.clone();
             handles.push(spawn_named("9p-server", async move {
-                ninep_tcp_server.start(shutdown_clone).await
+                ninep_tcp_server
+                    .start_with_accepted_work(shutdown_clone, accepted_work)
+                    .await
             }));
         }
     }
@@ -215,8 +221,11 @@ fn start_ninep_servers(
         let ninep_unix_server =
             crate::ninep::NinePServer::new_unix(ninep_unix_fs, socket_path.clone());
         let shutdown_clone = shutdown.clone();
+        let accepted_work = accepted_work.clone();
         handles.push(spawn_named("9p-unix-server", async move {
-            ninep_unix_server.start(shutdown_clone).await
+            ninep_unix_server
+                .start_with_accepted_work(shutdown_clone, accepted_work)
+                .await
         }));
     }
 
@@ -635,6 +644,10 @@ async fn drain_server_handles_for_stop(
                 retain_listener_failure(&mut cause, &mut cleanup_errors, error);
             }
         }
+        cleanup_errors.push(anyhow::anyhow!(
+            "server listener shutdown exceeded the {}s response-drain grace",
+            crate::replication::RESPONSE_DRAIN_TIMEOUT.as_secs()
+        ));
     }
 
     (cause, cleanup_errors)
@@ -679,7 +692,11 @@ pub(crate) async fn build_block_hybrid(
     memory_bytes: usize,
     disk_bytes: usize,
     foyer_handle: &tokio::runtime::Handle,
-) -> Result<Arc<FoyerHybridCache>> {
+    metrics: FoyerMetricsRegistry,
+) -> Result<(
+    Arc<FoyerHybridCache>,
+    foyer::HybridCache<slatedb::db_cache::CachedKey, slatedb::db_cache::CachedEntry>,
+)> {
     tokio::fs::create_dir_all(hybrid_cache_root)
         .await
         .with_context(|| {
@@ -691,6 +708,7 @@ pub(crate) async fn build_block_hybrid(
 
     let hybrid = HybridCacheBuilder::new()
         .with_name("zerofs-slatedb-hybrid")
+        .with_metrics_registry(Box::new(metrics))
         .memory(memory_bytes)
         .with_eviction_config(S3FifoConfig::default())
         .with_weighter(|_, v: &slatedb::db_cache::CachedEntry| v.size())
@@ -709,7 +727,10 @@ pub(crate) async fn build_block_hybrid(
         .build()
         .await
         .map_err(|e| foyer_build_error("foyer hybrid build failed", e))?;
-    Ok(Arc::new(FoyerHybridCache::new_with_cache(hybrid)))
+    Ok((
+        Arc::new(FoyerHybridCache::new_with_cache(hybrid.clone())),
+        hybrid,
+    ))
 }
 
 /// Block size of the parts disk cache: foyer's eviction/reclaim unit, and the
@@ -741,6 +762,7 @@ pub(crate) async fn build_parts_hybrid(
     memory_bytes: usize,
     disk_bytes: usize,
     foyer_handle: &tokio::runtime::Handle,
+    metrics: FoyerMetricsRegistry,
 ) -> Result<foyer::HybridCache<crate::object_store_prefetch::PartKey, bytes::Bytes>> {
     use crate::object_store_prefetch::PartKey;
     use bytes::Bytes;
@@ -754,6 +776,7 @@ pub(crate) async fn build_parts_hybrid(
 
     HybridCacheBuilder::new()
         .with_name("zerofs-object-prefetch-parts")
+        .with_metrics_registry(Box::new(metrics))
         .memory(memory_bytes)
         .with_eviction_config(S3FifoConfig::default())
         .with_weighter(|_: &PartKey, v: &Bytes| v.len())
@@ -818,6 +841,7 @@ pub(crate) fn split_memory_budget(total_memory_bytes: usize) -> (usize, usize, u
 pub struct SlateDbOpen {
     pub data: SlateDbHandle,
     pub metrics_recorder: Option<Arc<DefaultMetricsRecorder>>,
+    pub cache_metrics: Arc<CacheMetrics>,
     /// The raw-parts prefetch cache, returned so the segment store reuses it
     /// (one budget; segment objects and SST objects share it, keyed by path).
     pub parts_cache: foyer::HybridCache<crate::object_store_prefetch::PartKey, bytes::Bytes>,
@@ -847,6 +871,22 @@ fn shared_maintenance_runtime() -> &'static tokio::runtime::Handle {
 const BARRIER_CONTROLLED_L0_SST_SIZE_BYTES: usize = usize::MAX - 1;
 const BARRIER_CONTROLLED_MAX_UNFLUSHED_BYTES: usize = usize::MAX;
 
+fn select_rss_pressure_cap(installed_cap: u64, clean_cache_fallback: u64) -> u64 {
+    if installed_cap == 0 {
+        clean_cache_fallback
+    } else {
+        installed_cap
+    }
+}
+
+fn install_validated_rss_cap(
+    memory_budget: Option<&crate::cli::memory_budget::MemoryBudgetReceipt>,
+) {
+    if let Some(memory_budget) = memory_budget {
+        crate::alloc_rss::set_rss_cap_bytes(memory_budget.rss_pressure_cap_bytes);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn build_slatedb(
     object_store: Arc<dyn object_store::ObjectStore>,
@@ -858,6 +898,9 @@ pub async fn build_slatedb(
     wal_object_store: Option<Arc<dyn object_store::ObjectStore>>,
     replication: Option<&crate::replication::ReplicationParams>,
 ) -> Result<SlateDbOpen> {
+    #[cfg(test)]
+    let _rss_cap_guard = crate::alloc_rss::lock_test_rss_cap().await;
+
     let total_disk_cache_gb = cache_config.max_cache_size_gb;
     let total_memory_cache_gb = cache_config.memory_cache_size_gb.unwrap_or(0.25);
 
@@ -970,11 +1013,13 @@ pub async fn build_slatedb(
     let maintenance_runtime = shared_maintenance_runtime().clone();
 
     let hybrid_cache_root = cache_config.root_folder.join("hybrid_cache");
-    let cache = build_block_hybrid(
+    let foyer_metrics = FoyerMetricsRegistry::default();
+    let (cache, block_cache_metrics) = build_block_hybrid(
         &hybrid_cache_root,
         hybrid_memory_bytes,
         hybrid_disk_bytes,
         &maintenance_runtime,
+        foyer_metrics.clone(),
     )
     .await?;
 
@@ -983,8 +1028,14 @@ pub async fn build_slatedb(
         parts_memory_bytes,
         parts_disk_bytes,
         &maintenance_runtime,
+        foyer_metrics.clone(),
     )
     .await?;
+    let cache_metrics = Arc::new(CacheMetrics::new(
+        parts_cache.clone(),
+        block_cache_metrics,
+        foyer_metrics,
+    ));
 
     // Length-check the store before the data-db prefetch wrapper is layered on;
     // the compactor uses the length-checked store directly (no prefetch cache).
@@ -993,10 +1044,19 @@ pub async fn build_slatedb(
     let compactor_object_store = object_store.clone();
     let wal_object_store = wal_object_store
         .map(|s| Arc::new(LengthCheckedObjectStore::new(s)) as Arc<dyn object_store::ObjectStore>);
-    crate::alloc_rss::set_rss_cap_bytes(total_memory_bytes as u64);
+    let installed_cap = crate::alloc_rss::rss_cap_bytes();
+    let rss_pressure_cap_bytes = select_rss_pressure_cap(installed_cap, total_memory_bytes as u64);
+    if installed_cap == 0 {
+        crate::alloc_rss::set_rss_cap_bytes(rss_pressure_cap_bytes);
+    }
+    info!(
+        "Resident-memory pressure cap: {} MB (configured clean cache: {} MB)",
+        rss_pressure_cap_bytes / 1_000_000,
+        total_memory_bytes / 1_000_000,
+    );
     let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(
         PrefetchingObjectStore::new(object_store, parts_cache.clone())
-            .with_admission_cap(total_memory_bytes as u64),
+            .with_admission_cap(rss_pressure_cap_bytes),
     );
 
     let db_path = Path::from(db_path);
@@ -1068,6 +1128,7 @@ pub async fn build_slatedb(
             Ok(SlateDbOpen {
                 data: SlateDbHandle::ReadWrite(slatedb),
                 metrics_recorder: Some(metrics_recorder),
+                cache_metrics: cache_metrics.clone(),
                 parts_cache: parts_cache.clone(),
                 decoded_extent_memory_bytes,
             })
@@ -1076,6 +1137,7 @@ pub async fn build_slatedb(
             info!("Opening database in read-only mode");
 
             let mut reader_builder = DbReader::builder(db_path, object_store)
+                .with_db_cache(cache)
                 .with_block_transformer(block_transformer)
                 .with_filter_policies(crate::fs::filter_policy::filter_policies())
                 .with_segment_extractor(Arc::new(crate::segment_extractor::ZeroFsSegmentExtractor));
@@ -1092,6 +1154,7 @@ pub async fn build_slatedb(
             Ok(SlateDbOpen {
                 data: SlateDbHandle::ReadOnly(ArcSwap::new(reader)),
                 metrics_recorder: None,
+                cache_metrics: cache_metrics.clone(),
                 parts_cache: parts_cache.clone(),
                 decoded_extent_memory_bytes,
             })
@@ -1101,6 +1164,7 @@ pub async fn build_slatedb(
 
             let mut reader_builder = DbReader::builder(db_path, object_store)
                 .with_reader_mode(DbReaderMode::Checkpoint(checkpoint_id))
+                .with_db_cache(cache)
                 .with_block_transformer(block_transformer)
                 .with_filter_policies(crate::fs::filter_policy::filter_policies())
                 .with_segment_extractor(Arc::new(crate::segment_extractor::ZeroFsSegmentExtractor));
@@ -1117,6 +1181,7 @@ pub async fn build_slatedb(
             Ok(SlateDbOpen {
                 data: SlateDbHandle::ReadOnly(ArcSwap::new(reader)),
                 metrics_recorder: None,
+                cache_metrics,
                 parts_cache: parts_cache.clone(),
                 decoded_extent_memory_bytes,
             })
@@ -1129,6 +1194,7 @@ pub struct InitResult {
     pub object_store: Arc<dyn object_store::ObjectStore>,
     pub writeback: Option<crate::writeback::store::WritebackObjectStore>,
     pub sftp_pool: Option<crate::sftp_transport::SftpSessionPool>,
+    pub cache_metrics: Arc<CacheMetrics>,
     pub wal_object_store: Option<Arc<dyn object_store::ObjectStore>>,
     pub db_path: String,
     pub db_handle: SlateDbHandle,
@@ -1186,12 +1252,8 @@ pub async fn run_server(
 
     info!("ZeroFS v{}", env!("CARGO_PKG_VERSION"));
 
-    let settings = Settings::from_file(&config_path)
-        .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
-    settings
-        .servers
-        .require_listener_endpoint()
-        .context("Invalid [servers] configuration")?;
+    let (settings, memory_budget) = load_and_validate_server_settings(&config_path)?;
+    install_validated_rss_cap(memory_budget.as_ref());
 
     let db_mode = match (read_only, &checkpoint_name) {
         (false, None) => DatabaseMode::ReadWrite,
@@ -1240,6 +1302,7 @@ pub async fn run_server(
             .as_ref()
             .map_or_else(CancellationToken::new, |authority| authority.loss_token());
         let shutdown = leadership_deposed.child_token();
+        let p9_accepted_work = P9AcceptedWorkTracker::new();
 
         // Do not start listeners after authority was revoked during initialization.
         if leadership_deposed.is_cancelled() {
@@ -1270,6 +1333,7 @@ pub async fn run_server(
                     global_stats: Arc::clone(&fs.global_stats),
                     segment_gc_stats: fs.extent_store.segment_gc_stats(),
                     dedup: Arc::clone(&fs.dedup),
+                    cache_metrics: init_result.cache_metrics.clone(),
                     slatedb_registry,
                     writeback: writeback_for_metrics,
                 },
@@ -1307,6 +1371,7 @@ pub async fn run_server(
             Arc::clone(&fs),
             settings.servers.ninep.as_ref(),
             shutdown.clone(),
+            p9_accepted_work.clone(),
         );
 
         let (nbd_handles, nbd_runtime_registry) = start_nbd_servers(
@@ -1440,6 +1505,7 @@ pub async fn run_server(
                 webui_lock_manager,
                 webui_rpc_service,
                 shutdown.clone(),
+                p9_accepted_work.clone(),
             )
         } else {
             Vec::new()
@@ -1489,6 +1555,7 @@ pub async fn run_server(
 
         info!("Cancelling all servers and background tasks...");
         shutdown.cancel();
+        p9_accepted_work.stop_accepting();
         info!("Waiting for servers to exit...");
         let (stop_cause, serving_cleanup_errors) = drain_server_handles_for_stop(
             stop_cause,
@@ -1496,6 +1563,8 @@ pub async fn run_server(
             &leadership_deposed,
         )
         .await;
+        info!("Waiting for accepted 9P work to settle...");
+        p9_accepted_work.wait().await;
 
         if stop_cause.is_leadership_lost() {
             if let Some(registry) = &nbd_runtime_registry {
@@ -1744,9 +1813,236 @@ pub async fn run_server(
     result
 }
 
+fn load_and_validate_server_settings(
+    config_path: &std::path::Path,
+) -> Result<(Settings, Option<super::memory_budget::MemoryBudgetReceipt>)> {
+    let settings = Settings::from_file(config_path)
+        .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
+    settings
+        .servers
+        .require_listener_endpoint()
+        .context("Invalid [servers] configuration")?;
+    let volatile_write_bytes = settings
+        .servers
+        .nbd
+        .as_ref()
+        .map(crate::config::NbdConfig::volatile_memory_bytes)
+        .transpose()?
+        .unwrap_or(0);
+    let memory_budget =
+        super::memory_budget::validate_server_startup(&settings, volatile_write_bytes)
+            .context("Invalid startup memory budget")?;
+    Ok((settings, memory_budget))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    enum ReaderModeUnderTest {
+        ReadOnly,
+        Checkpoint,
+    }
+
+    fn mode_cache_probe_key() -> bytes::Bytes {
+        crate::fs::key_codec::KeyCodec::new().inode_key(1)
+    }
+
+    async fn seeded_mode_cache_store() -> (
+        Arc<dyn object_store::ObjectStore>,
+        Arc<dyn BlockTransformer>,
+        uuid::Uuid,
+    ) {
+        use slatedb::config::{CheckpointOptions, CheckpointScope, PutOptions, WriteOptions};
+
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let transformer: Arc<dyn BlockTransformer> =
+            crate::block_transformer::ZeroFsBlockTransformer::new_arc(
+                &[7; 32],
+                crate::config::CompressionConfig::default(),
+            );
+        let db = DbBuilder::new(Path::from("mode-cache-test"), store.clone())
+            .with_settings(slatedb::config::Settings {
+                wal_enabled: false,
+                compactor_options: None,
+                ..Default::default()
+            })
+            .with_sst_block_size(slatedb::SstBlockSize::Block32Kib)
+            .with_block_transformer(transformer.clone())
+            .with_filter_policies(crate::fs::filter_policy::filter_policies())
+            .with_segment_extractor(Arc::new(crate::segment_extractor::ZeroFsSegmentExtractor))
+            .build()
+            .await
+            .expect("seed database");
+        db.put_with_options(
+            mode_cache_probe_key(),
+            vec![3; 64 * 1024],
+            &PutOptions::default(),
+            &WriteOptions {
+                await_durable: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("write probe");
+        db.flush().await.expect("flush probe");
+        let checkpoint = db
+            .create_checkpoint(CheckpointScope::Durable, &CheckpointOptions::default())
+            .await
+            .expect("create checkpoint");
+        db.close().await.expect("close seed database");
+
+        (store, transformer, checkpoint.id)
+    }
+
+    async fn assert_mode_exports_attached_decoded_cache(mode: ReaderModeUnderTest) {
+        let (store, transformer, checkpoint_id) = seeded_mode_cache_store().await;
+        let mode = match mode {
+            ReaderModeUnderTest::ReadOnly => DatabaseMode::ReadOnly,
+            ReaderModeUnderTest::Checkpoint => DatabaseMode::Checkpoint(checkpoint_id),
+        };
+        let cache_root = tempfile::tempdir().expect("cache root");
+        let opened = build_slatedb(
+            store,
+            &crate::fs::CacheConfig {
+                root_folder: cache_root.path().to_owned(),
+                max_cache_size_gb: 0.0,
+                memory_cache_size_gb: Some(0.064),
+            },
+            "mode-cache-test".to_owned(),
+            mode,
+            None,
+            transformer,
+            None,
+            None,
+        )
+        .await
+        .expect("open reader mode");
+        let reader = match &opened.data {
+            SlateDbHandle::ReadOnly(reader) => reader.load_full(),
+            SlateDbHandle::ReadWrite(_) => panic!("reader mode opened a writer"),
+        };
+
+        assert_eq!(
+            reader
+                .get(mode_cache_probe_key())
+                .await
+                .expect("read probe"),
+            Some(bytes::Bytes::from(vec![3; 64 * 1024]))
+        );
+        let snapshot = opened.cache_metrics.snapshot();
+        assert!(
+            snapshot.decoded_blocks.entries > 0,
+            "decoded-block metrics must observe the cache used by the reader: {snapshot:?}"
+        );
+
+        reader.close().await.expect("close reader");
+        opened.parts_cache.close().await.expect("close parts cache");
+    }
+
+    #[tokio::test]
+    async fn read_only_open_exports_its_attached_decoded_cache() {
+        assert_mode_exports_attached_decoded_cache(ReaderModeUnderTest::ReadOnly).await;
+    }
+
+    #[tokio::test]
+    async fn checkpoint_open_exports_its_attached_decoded_cache() {
+        assert_mode_exports_attached_decoded_cache(ReaderModeUnderTest::Checkpoint).await;
+    }
+
+    #[tokio::test]
+    async fn validated_rss_cap_survives_startup_and_cache_build_selection() {
+        struct ResetRss;
+        impl Drop for ResetRss {
+            fn drop(&mut self) {
+                crate::alloc_rss::set_test_rss_envelope(None);
+                crate::alloc_rss::set_rss_cap_bytes(0);
+            }
+        }
+
+        let _rss_cap_guard = crate::alloc_rss::lock_test_rss_cap().await;
+        let _reset = ResetRss;
+        let gib = 1024 * 1024 * 1024;
+        let validated_service_cap = 56 * gib;
+        let configured_clean_cache = 64 * gib;
+        let receipt = crate::cli::memory_budget::MemoryBudgetReceipt {
+            hard_limit_bytes: 96 * gib,
+            required_bytes: 88 * gib,
+            remaining_bytes: 8 * gib,
+            rss_pressure_cap_bytes: validated_service_cap,
+        };
+
+        crate::alloc_rss::set_rss_cap_bytes(0);
+        install_validated_rss_cap(Some(&receipt));
+        let installed_cap = crate::alloc_rss::rss_cap_bytes();
+        assert_eq!(
+            installed_cap, validated_service_cap,
+            "server startup must install the validated receipt cap"
+        );
+
+        assert_eq!(
+            select_rss_pressure_cap(installed_cap, configured_clean_cache),
+            validated_service_cap,
+            "build_slatedb must preserve the startup-validated service envelope"
+        );
+        assert_eq!(
+            select_rss_pressure_cap(0, configured_clean_cache),
+            configured_clean_cache,
+            "standalone callers without a validated envelope retain the cache fallback"
+        );
+
+        crate::alloc_rss::set_test_rss_envelope(Some(validated_service_cap));
+        assert!(
+            crate::alloc_rss::over_rss_cap(),
+            "GC's process-wide brake must consume the installed receipt cap"
+        );
+        assert!(
+            crate::alloc_rss::over_rss_cap_of(select_rss_pressure_cap(
+                installed_cap,
+                configured_clean_cache,
+            )),
+            "prefetch admission must consume the same selected cap"
+        );
+    }
+
+    #[test]
+    fn unsafe_budget_fails_before_the_file_backend_is_opened() {
+        let temp = tempfile::tempdir().unwrap();
+        let backend = temp.path().join("backend-must-not-exist");
+        let config = temp.path().join("zerofs.toml");
+        std::fs::write(
+            &config,
+            format!(
+                r#"[cache]
+dir = {cache:?}
+disk_size_gb = 1.0
+memory_size_gb = 64.0
+
+[runtime]
+memory_limit_gb = 96.0
+
+[storage]
+url = {storage:?}
+encryption_password = "test-password"
+
+[servers.nfs]
+addresses = ["127.0.0.1:20490"]
+"#,
+                cache = temp.path().join("cache").display().to_string(),
+                storage = format!("file://{}", backend.display()),
+            ),
+        )
+        .unwrap();
+
+        let error = load_and_validate_server_settings(&config).unwrap_err();
+
+        assert!(format!("{error:#}").contains("Invalid startup memory budget"));
+        assert!(
+            !backend.exists(),
+            "memory guard reached backend initialization"
+        );
+    }
 
     #[test]
     fn volatile_nbd_ack_rejects_read_only_database_modes() {
@@ -1857,13 +2153,17 @@ min_free_gb = 256.0
             started.elapsed(),
             crate::replication::RESPONSE_DRAIN_TIMEOUT
         );
-        assert!(cleanup.is_empty(), "unexpected secondary failure");
+        assert_eq!(cleanup.len(), 1, "missing listener-timeout context");
+        assert!(cleanup[0].to_string().contains("shutdown exceeded"));
         let sibling_dropped = tokio::time::timeout(Duration::from_secs(1), alive_rx).await;
         assert!(
             matches!(sibling_dropped, Ok(Err(_))),
             "stuck sibling listener was not aborted and joined"
         );
-        let message = format!("{:#}", finish_serving_shutdown(cause, Ok(())).unwrap_err());
+        let message = format!(
+            "{:#}",
+            finish_serving_shutdown(cause, merge_cleanup_results(cleanup, Ok(()))).unwrap_err()
+        );
         assert!(
             message.contains("primary listener failure"),
             "unexpected primary error: {message}"
@@ -1950,7 +2250,7 @@ min_free_gb = 256.0
     }
 
     #[tokio::test(start_paused = true)]
-    async fn signal_shutdown_aborts_and_joins_a_stuck_listener_after_grace() {
+    async fn signal_shutdown_reports_a_stuck_listener_after_grace() {
         let (alive_tx, alive_rx) = tokio::sync::oneshot::channel::<()>();
         let stuck = tokio::spawn(async move {
             let _alive = alive_tx;
@@ -1976,7 +2276,9 @@ min_free_gb = 256.0
         );
         assert!(handles.is_empty(), "listener handle was not joined");
         assert!(alive_rx.await.is_err(), "stuck listener was not aborted");
-        finish_serving_shutdown(drained.0, merge_cleanup_results(drained.1, Ok(()))).unwrap();
+        let error = finish_serving_shutdown(drained.0, merge_cleanup_results(drained.1, Ok(())))
+            .unwrap_err();
+        assert!(error.to_string().contains("shutdown exceeded"));
     }
 
     #[tokio::test(start_paused = true)]
@@ -2086,7 +2388,7 @@ min_free_gb = 256.0
             started.elapsed(),
             crate::replication::RESPONSE_DRAIN_TIMEOUT
         );
-        assert!(cleanup.is_empty(), "unexpected listener cleanup error");
+        assert_eq!(cleanup.len(), 1, "missing listener-timeout context");
         assert!(alive_rx.await.is_err(), "stuck listener was not joined");
         let message = format!("{:#}", finish_serving_shutdown(cause, Ok(())).unwrap_err());
         assert!(message.starts_with("HA writer was fenced or superseded"));
@@ -2281,9 +2583,11 @@ min_free_gb = 256.0
                 64 * 1024 * 1024,
                 512 * 1024 * 1024,
                 &tokio::runtime::Handle::current(),
+                FoyerMetricsRegistry::default(),
             )
             .await
             .expect("foyer hybrid")
+            .0
         }
 
         // Open a writer over `store` with the same segment/filter/block config the

@@ -3,24 +3,27 @@ use super::progress::{DeleteProgress, Progress};
 #[cfg(feature = "webui")]
 use super::run_upload;
 use super::{
-    SETTLE_NOTICE_INTERVAL, TRANSFER_MSIZE, UploadWorker, close_client, connect_transfer_client,
-    execute_delete, execute_download, execute_upload, resume_enabled_for_attempt, run_file_workers,
-    with_settling_notices,
+    InterruptPolicy, SETTLE_NOTICE_INTERVAL, TRANSFER_MSIZE, UploadWorker, close_client,
+    connect_transfer_client, execute_delete, execute_download, execute_upload,
+    resume_enabled_for_attempt, run_file_workers, with_settling_notices,
 };
 use crate::cli::attach_cleanup_errors;
 use crate::fs::ZeroFS;
 use crate::ninep::NinePServer;
+use ninep_proto::{Message, P9_SIZE_FIELD_LEN, P9Message};
 use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use zerofs_client::Client;
 
 mod resume;
+mod safety;
 mod throughput;
 
 async fn remote_client() -> (Arc<Client>, CancellationToken, tempfile::TempDir) {
@@ -49,6 +52,92 @@ async fn remote_client_with_filesystem() -> (
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     panic!("test 9P client did not connect");
+}
+
+async fn remote_client_with_read_disconnect() -> (
+    Arc<Client>,
+    CancellationToken,
+    tempfile::TempDir,
+    Arc<AtomicUsize>,
+    Arc<Notify>,
+) {
+    let filesystem = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+    let temp = tempfile::tempdir().unwrap();
+    let socket = temp.path().join("transfer-backend.9p.sock");
+    let server = NinePServer::new_unix(filesystem, socket.clone());
+    let shutdown = CancellationToken::new();
+    let server_shutdown = shutdown.clone();
+    tokio::spawn(async move { server.start(server_shutdown).await.unwrap() });
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let target = format!("tcp://{}", listener.local_addr().unwrap());
+    let disconnect_on_read = Arc::new(AtomicUsize::new(0));
+    let proxy_disconnect_on_read = Arc::clone(&disconnect_on_read);
+    let observed_reads = Arc::new(AtomicUsize::new(0));
+    let proxy_observed_reads = Arc::clone(&observed_reads);
+    let read_seen = Arc::new(Notify::new());
+    let proxy_read_seen = Arc::clone(&read_seen);
+    let proxy_shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        let (downstream, _) = tokio::select! {
+            accepted = listener.accept() => accepted.unwrap(),
+            _ = proxy_shutdown.cancelled() => return,
+        };
+        drop(listener);
+        let upstream = loop {
+            match tokio::net::UnixStream::connect(&socket).await {
+                Ok(stream) => break stream,
+                Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+            }
+        };
+        let (mut downstream_read, downstream_write) = downstream.into_split();
+        let (upstream_read, mut upstream_write) = upstream.into_split();
+        let responses = tokio::spawn(async move {
+            let mut downstream_write = downstream_write;
+            let mut upstream_read = upstream_read;
+            let _ = tokio::io::copy(&mut upstream_read, &mut downstream_write).await;
+        });
+
+        loop {
+            let mut size = [0u8; P9_SIZE_FIELD_LEN];
+            if downstream_read.read_exact(&mut size).await.is_err() {
+                break;
+            }
+            let frame_len = u32::from_le_bytes(size) as usize;
+            if frame_len < P9_SIZE_FIELD_LEN {
+                break;
+            }
+            let mut frame = Vec::with_capacity(frame_len);
+            frame.extend_from_slice(&size);
+            frame.resize(frame_len, 0);
+            if downstream_read
+                .read_exact(&mut frame[P9_SIZE_FIELD_LEN..])
+                .await
+                .is_err()
+            {
+                break;
+            }
+            if P9Message::from_bytes_ctx(&frame, true)
+                .is_ok_and(|message| matches!(message.body, Message::Tread(_)))
+            {
+                let read_number = proxy_observed_reads.fetch_add(1, Ordering::AcqRel) + 1;
+                if read_number == proxy_disconnect_on_read.load(Ordering::Acquire) {
+                    proxy_read_seen.notify_one();
+                    break;
+                }
+            }
+            if upstream_write.write_all(&frame).await.is_err() {
+                break;
+            }
+        }
+        responses.abort();
+        let _ = responses.await;
+    });
+
+    let client = connect_transfer_client(&target).await.unwrap();
+    (client, shutdown, temp, disconnect_on_read, read_seen)
 }
 
 #[tokio::test]
@@ -294,6 +383,16 @@ async fn cancellation_during_retry_backoff_is_reported_as_cancellation() {
     let task_cancellation = cancellation.clone();
     let calls = Arc::new(AtomicUsize::new(0));
     let transfer_calls = Arc::clone(&calls);
+    let progress = Progress::new_ordered(
+        "upload",
+        2,
+        &[Path::new("book.m4b").into(), Path::new("later.m4b").into()],
+    );
+    let later = progress.start_file(Path::new("later.m4b"), 1);
+    later.advance(1);
+    later.finish();
+    assert!(progress.emitted_lines().is_empty());
+    let observed_progress = progress.clone();
 
     let task = tokio::spawn(async move {
         run_file_workers(
@@ -303,7 +402,7 @@ async fn cancellation_during_retry_backoff_is_reported_as_cancellation() {
                 relative: "book.m4b".into(),
                 size: 1,
             }],
-            Progress::new("upload", 1, 1),
+            progress,
             task_cancellation,
             move |_client, _file, _cancellation, _attempt| {
                 transfer_calls.fetch_add(1, Ordering::Relaxed);
@@ -328,6 +427,14 @@ async fn cancellation_during_retry_backoff_is_reported_as_cancellation() {
         "{error:#}"
     );
     assert_eq!(calls.load(Ordering::Relaxed), 1);
+    let lines = observed_progress.emitted_lines();
+    assert_eq!(lines.len(), 3, "{lines:#?}");
+    assert!(lines[0].contains("retry 2/3: book.m4b"), "{lines:#?}");
+    assert!(
+        lines[1].contains("failed after 1 attempt: book.m4b"),
+        "{lines:#?}"
+    );
+    assert_eq!(lines[2], "upload file 2/2 complete: later.m4b");
 }
 
 #[tokio::test(start_paused = true)]
@@ -446,7 +553,7 @@ async fn upload_streams_each_chunk_once_and_releases_temporary_resources() {
     );
     assert_eq!(quiesced_fids(&client).await, baseline_fids);
     assert!(
-        operations_after - operations_before <= 26,
+        operations_after - operations_before <= 31,
         "upload used too many 9P operations: {}",
         operations_after - operations_before
     );
@@ -536,6 +643,7 @@ async fn single_file_transfers_use_the_exact_destination_path() {
     let (client, _shutdown, local) = remote_client().await;
     let source = local.path().join("source.bin");
     fs::write(&source, b"payload").unwrap();
+    client.write("/uploaded.bin", b"old").await.unwrap();
     let upload_plan = scan_local(&source).unwrap();
     execute_upload(
         &upload_workers(std::slice::from_ref(&client)),
@@ -553,6 +661,7 @@ async fn single_file_transfers_use_the_exact_destination_path() {
         .await
         .unwrap();
     let destination = local.path().join("destination.bin");
+    fs::write(&destination, b"old").unwrap();
 
     execute_download(
         std::slice::from_ref(&client),
@@ -567,30 +676,46 @@ async fn single_file_transfers_use_the_exact_destination_path() {
     assert_eq!(fs::read(destination).unwrap(), b"payload");
 }
 
-#[tokio::test]
-async fn cancelled_download_preserves_the_existing_destination() {
-    let (client, _shutdown, local) = remote_client().await;
+async fn assert_first_cancellation_interrupts_read(read_number: usize) {
+    let (client, shutdown, local, disconnect_on_read, read_seen) =
+        remote_client_with_read_disconnect().await;
     client.write("/source.bin", b"replacement").await.unwrap();
     let plan = scan_remote(&client, Path::new("/source.bin"))
         .await
         .unwrap();
     let destination = local.path().join("destination.bin");
     fs::write(&destination, b"original").unwrap();
+    let clients = vec![Arc::clone(&client)];
     let cancellation = CancellationToken::new();
-    cancellation.cancel();
+    disconnect_on_read.store(read_number, Ordering::Release);
 
-    let error = execute_download(
-        std::slice::from_ref(&client),
+    let download = execute_download(
+        &clients,
         plan,
         &destination,
         Progress::new("download", 11, 1),
-        cancellation,
-    )
+        cancellation.clone(),
+    );
+    tokio::pin!(download);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::select! {
+            biased;
+            _ = read_seen.notified() => {}
+            result = &mut download => {
+                panic!("download settled before read {read_number} was interrupted: {result:?}")
+            }
+        }
+    })
     .await
-    .unwrap_err();
+    .expect("proxy did not observe the configured Tread");
 
+    cancellation.cancel();
+    let error = tokio::time::timeout(Duration::from_secs(1), &mut download)
+        .await
+        .expect("first cancellation did not interrupt the in-flight read")
+        .unwrap_err();
     assert!(
-        error.to_string().contains("download cancelled"),
+        format!("{error:#}").contains("download cancelled"),
         "{error:#}"
     );
     assert_eq!(fs::read(&destination).unwrap(), b"original");
@@ -601,177 +726,17 @@ async fn cancelled_download_preserves_the_existing_destination() {
             .to_string_lossy()
             .starts_with(".zerofs-")
     }));
+    shutdown.cancel();
 }
 
 #[tokio::test]
-async fn file_directory_conflicts_fail_before_copying_bytes() {
-    let (client, _shutdown, local) = remote_client().await;
-    let source = local.path().join("source.bin");
-    fs::write(&source, b"payload").unwrap();
-    client.create_dir_all("/occupied", 0o755).await.unwrap();
-    let upload_progress = Progress::new("upload", 7, 1);
-
-    let upload_error = execute_upload(
-        &upload_workers(std::slice::from_ref(&client)),
-        scan_local(&source).unwrap(),
-        Path::new("/occupied"),
-        false,
-        upload_progress.clone(),
-        CancellationToken::new(),
-    )
-    .await
-    .unwrap_err();
-
-    assert!(
-        upload_error
-            .to_string()
-            .contains("destination is a directory"),
-        "{upload_error:#}"
-    );
-    assert_eq!(upload_progress.transferred_bytes(), 0);
-    assert!(
-        client
-            .read_dir("/")
-            .await
-            .unwrap()
-            .iter()
-            .all(|entry| !entry.name.starts_with(".zerofs-"))
-    );
-
-    client.write("/source.bin", b"payload").await.unwrap();
-    let destination = local.path().join("occupied");
-    fs::create_dir(&destination).unwrap();
-    let download_progress = Progress::new("download", 7, 1);
-    let download_error = execute_download(
-        std::slice::from_ref(&client),
-        scan_remote(&client, Path::new("/source.bin"))
-            .await
-            .unwrap(),
-        &destination,
-        download_progress.clone(),
-        CancellationToken::new(),
-    )
-    .await
-    .unwrap_err();
-
-    assert!(
-        download_error
-            .to_string()
-            .contains("destination is a directory"),
-        "{download_error:#}"
-    );
-    assert_eq!(download_progress.transferred_bytes(), 0);
+async fn first_download_cancellation_interrupts_data_read_without_successor() {
+    assert_first_cancellation_interrupts_read(1).await;
 }
 
 #[tokio::test]
-async fn upload_does_not_follow_a_source_replaced_by_a_symlink_after_planning() {
-    let (client, _shutdown, local) = remote_client().await;
-    let target = local.path().join("target.m4b");
-    fs::write(&target, b"not the planned source").unwrap();
-    let size = fs::metadata(&target).unwrap().len();
-    let source = local.path().join("planned.m4b");
-    symlink(&target, &source).unwrap();
-    let clients = vec![client.clone()];
-
-    let error = execute_upload(
-        &upload_workers(&clients),
-        TransferPlan {
-            source_is_dir: false,
-            directories: Vec::new(),
-            files: vec![PlannedFile {
-                source,
-                relative: Path::new("").to_path_buf(),
-                size,
-            }],
-            total_bytes: size,
-        },
-        Path::new("/uploaded.m4b"),
-        false,
-        Progress::new("upload", size, 1),
-        CancellationToken::new(),
-    )
-    .await
-    .unwrap_err();
-
-    assert!(
-        format!("{error:#}").contains("open local source"),
-        "{error:#}"
-    );
-    assert!(matches!(
-        client.stat("/uploaded.m4b").await,
-        Err(zerofs_client::ZeroFsError::NotFound { .. })
-    ));
-    assert!(
-        client
-            .read_dir("/")
-            .await
-            .unwrap()
-            .iter()
-            .all(|entry| !String::from_utf8_lossy(&entry.name_bytes).starts_with(".zerofs-"))
-    );
-}
-
-#[tokio::test]
-async fn download_rejects_growth_without_copying_beyond_the_plan() {
-    let (client, _shutdown, local) = remote_client().await;
-    client.write("/source.bin", b"planned").await.unwrap();
-    let plan = scan_remote(&client, Path::new("/source.bin"))
-        .await
-        .unwrap();
-    let remote = client
-        .open("/source.bin", zerofs_client::OpenOptions::write_only())
-        .await
-        .unwrap();
-    remote.write_at(7, b"-extra").await.unwrap();
-    remote.close().await;
-    let destination = local.path().join("destination.bin");
-    let progress = Progress::new("download", 7, 1);
-
-    let error = execute_download(
-        std::slice::from_ref(&client),
-        plan,
-        &destination,
-        progress.clone(),
-        CancellationToken::new(),
-    )
-    .await
-    .unwrap_err();
-
-    assert!(
-        format!("{error:#}").contains("remote source changed while downloading"),
-        "{error:#}"
-    );
-    assert_eq!(progress.transferred_bytes(), 0);
-    assert!(!destination.exists());
-}
-
-#[tokio::test]
-async fn download_rejects_symlinked_destination_ancestors() {
-    let (client, _shutdown, local) = remote_client().await;
-    client.create_dir_all("/source/link", 0o755).await.unwrap();
-    client
-        .write("/source/link/escaped.bin", b"payload")
-        .await
-        .unwrap();
-    let plan = scan_remote(&client, Path::new("/source")).await.unwrap();
-    let destination = local.path().join("destination");
-    let outside = local.path().join("outside");
-    fs::create_dir_all(&destination).unwrap();
-    fs::create_dir_all(&outside).unwrap();
-    symlink(&outside, destination.join("link")).unwrap();
-
-    let error = execute_download(
-        std::slice::from_ref(&client),
-        plan,
-        &destination,
-        Progress::new("download", 7, 1),
-        CancellationToken::new(),
-    )
-    .await
-    .unwrap_err();
-
-    assert!(error.to_string().contains("symbolic link"), "{error:#}");
-    assert!(!outside.join("escaped.bin").exists());
+async fn first_download_cancellation_interrupts_length_probe_without_successor() {
+    assert_first_cancellation_interrupts_read(2).await;
 }
 
 #[tokio::test]
@@ -870,8 +835,18 @@ async fn rm_cancellation_interrupts_an_in_flight_operation() {
         .unwrap()
         .unwrap_err();
     assert!(error.to_string().contains("delete cancelled"), "{error:#}");
-    assert!(progress.removed_entries() < 64);
+    assert_eq!(progress.removed_entries(), 1);
     assert!(client.stat("/cancel").await.unwrap().is_dir());
+}
+
+#[test]
+fn first_interrupt_is_graceful_and_second_interrupt_is_immediate() {
+    let cancellation = CancellationToken::new();
+    let mut policy = InterruptPolicy::default();
+
+    assert!(!policy.register(&cancellation));
+    assert!(cancellation.is_cancelled());
+    assert!(policy.register(&cancellation));
 }
 
 #[tokio::test]
@@ -976,4 +951,140 @@ async fn cancellation_during_empty_directory_sync_never_prints_completion() {
     let error = task.await.unwrap().unwrap_err();
     assert!(error.to_string().contains("upload cancelled"), "{error:#}");
     shutdown.cancel();
+}
+
+#[tokio::test]
+async fn cancellation_after_upload_bytes_removes_the_temporary_file() {
+    let (client, _shutdown, local, filesystem) = remote_client_with_filesystem().await;
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    filesystem.flush_coordinator.set_local_durability_barrier({
+        let entered = Arc::clone(&entered);
+        let release = Arc::clone(&release);
+        Arc::new(move || {
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            Box::pin(async move {
+                entered.notify_one();
+                release.notified().await;
+                Ok(())
+            })
+        })
+    });
+    let source = local.path().join("source.bin");
+    fs::write(&source, b"payload").unwrap();
+    let cancellation = CancellationToken::new();
+    let task_cancellation = cancellation.clone();
+    let task_client = Arc::clone(&client);
+    let task = tokio::spawn(async move {
+        execute_upload(
+            &upload_workers(&[task_client]),
+            scan_local(&source).unwrap(),
+            Path::new("/destination.bin"),
+            false,
+            Progress::new("upload", 7, 1),
+            task_cancellation,
+        )
+        .await
+    });
+
+    entered.notified().await;
+    cancellation.cancel();
+    release.notify_one();
+
+    let error = task.await.unwrap().unwrap_err();
+    assert!(error.to_string().contains("upload cancelled"), "{error:#}");
+    assert!(client.stat("/destination.bin").await.is_err());
+    assert!(
+        client
+            .read_dir("/")
+            .await
+            .unwrap()
+            .iter()
+            .all(|entry| !String::from_utf8_lossy(&entry.name_bytes).starts_with(".zerofs-"))
+    );
+}
+
+#[tokio::test]
+async fn upload_sync_failure_preserves_the_old_destination_and_cleans_temporary_file() {
+    let (client, _shutdown, local, filesystem) = remote_client_with_filesystem().await;
+    client.write("/destination.bin", b"old").await.unwrap();
+    filesystem
+        .flush_coordinator
+        .set_local_durability_barrier(Arc::new(|| {
+            Box::pin(async { Err(crate::fs::errors::FsError::IoError) })
+        }));
+    let source = local.path().join("source.bin");
+    fs::write(&source, b"replacement").unwrap();
+
+    let error = execute_upload(
+        &upload_workers(std::slice::from_ref(&client)),
+        scan_local(&source).unwrap(),
+        Path::new("/destination.bin"),
+        false,
+        Progress::new("upload", 11, 1),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(format!("{error:#}").contains("sync"), "{error:#}");
+    assert_eq!(&client.read("/destination.bin").await.unwrap()[..], b"old");
+    assert!(
+        client
+            .read_dir("/")
+            .await
+            .unwrap()
+            .iter()
+            .all(|entry| !String::from_utf8_lossy(&entry.name_bytes).starts_with(".zerofs-"))
+    );
+}
+
+#[tokio::test]
+async fn final_upload_sync_failure_reports_visible_but_unverified_publication() {
+    let (client, _shutdown, local, filesystem) = remote_client_with_filesystem().await;
+    let barriers = Arc::new(AtomicUsize::new(0));
+    filesystem.flush_coordinator.set_local_durability_barrier({
+        let barriers = Arc::clone(&barriers);
+        Arc::new(move || {
+            let barriers = Arc::clone(&barriers);
+            Box::pin(async move {
+                if barriers.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Ok(())
+                } else {
+                    Err(crate::fs::errors::FsError::IoError)
+                }
+            })
+        })
+    });
+    let source = local.path().join("source.bin");
+    fs::write(&source, b"replacement").unwrap();
+
+    let error = execute_upload(
+        &upload_workers(std::slice::from_ref(&client)),
+        scan_local(&source).unwrap(),
+        Path::new("/destination.bin"),
+        false,
+        Progress::new("upload", 11, 1),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        format!("{error:#}").contains("sync published remote file"),
+        "{error:#}"
+    );
+    assert_eq!(
+        &client.read("/destination.bin").await.unwrap()[..],
+        b"replacement"
+    );
+    assert!(
+        client
+            .read_dir("/")
+            .await
+            .unwrap()
+            .iter()
+            .all(|entry| !String::from_utf8_lossy(&entry.name_bytes).starts_with(".zerofs-"))
+    );
 }

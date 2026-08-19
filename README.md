@@ -28,7 +28,7 @@ ZeroFS differentiates itself from other "filesystem on S3" projects by:
 
 | | |
 |---|---|
-| **File access** | NFS and 9P servers. Use the native kernel client when an exact package is available or `zerofs mount` as a fallback. |
+| **File access** | NFS and 9P servers. Use the native kernel client after building it from source, or use the bundled `zerofs mount` client without a kernel module. |
 | **Block access** | NBD devices with TRIM. FLUSH and FUA on WRITE/TRIM use the configured ZeroFS client-flush barrier; with persistent writeback, that barrier is the local journal rather than remote publication. |
 | **Encryption** | Extents are encrypted with XChaCha20-Poly1305. Data key wrapped via Argon2id. |
 | **Compression** | zstd or lz4, before encryption. Codec changeable at any time without migration. |
@@ -121,8 +121,11 @@ positioned writes active on each session, for four extent-aligned chunks per
 file. Each chunk uses the server-negotiated maximum up to a 9 MiB payload. The
 default upload bound is therefore 16 sessions and about 288 MiB of chunk
 buffers when all eight files are at least 36 MiB; higher `--jobs` values raise
-both bounds. Downloads use one session per worker. The CLI shows aggregate
-bytes, rate, ETA, completed-file count, and active paths.
+both bounds. Downloads use one session per worker. Active-file bars show
+acknowledged bytes, rate, and ETA. The aggregate advances only when a file is
+successfully published or size-skipped, so it is monotonic across retries.
+Non-interactive completion and retry events are emitted in deterministic
+planned-file order.
 
 Upload `--resume` checks each final destination path before copying it. A final
 regular file with the same byte length as its local source is reported as
@@ -157,17 +160,29 @@ and then runs a filesystem-wide sync to verify the published namespace change.
 It reports the file complete only after those barriers succeed; if the final
 sync fails, the renamed file may be visible without verified durability. A
 download syncs its local temporary file before renaming it over the destination.
+Before any bulk copy begins, upload and download preflight every planned final
+path for file/directory conflicts. A download opens every existing destination
+ancestor without following symlinks, creates missing directories relative to
+held directory handles, and creates, removes, and renames its temporary file
+relative to the held destination-parent handle. An ancestor pathname exchanged
+for a symlink therefore cannot redirect publication outside the selected tree.
+The downloader requests exactly the remaining planned bytes and then probes one
+additional byte at the planned EOF; truncation or growth fails without replacing
+the destination. Cleanup is mandatory on every pre-publication failure, and a
+cleanup failure is itself terminal.
 Completed files remain published. `upload --resume` can skip materialized
 same-length final files, but transfers do not continue a partial file from its
 last byte or persist multipart state across runs. Upload range fan-out is
-bounded to two sessions and four in-flight writes per file.
-Symlinks and other special source entries are rejected rather than followed.
+bounded to two sessions and four in-flight writes per file. Source scans reject
+symlinks and other special entries. The upload file open also uses `O_NOFOLLOW`
+for the final source component and revalidates its regular-file type and planned
+length before reading, then probes one byte past the planned EOF.
 
 `zerofs rm` follows the Web UI's recursive delete model: it lists and validates
-each directory once, then removes entries deepest-first with at most 8 remote
-operations active across the traversal. It refuses to remove the 9P attach
-root, does not prompt, and reports any failed deletion instead of silently
-claiming success.
+each directory once, then removes entries deepest-first, one mutation at a time,
+checking cancellation between irreversible mutations. It refuses to remove the
+9P attach root, does not prompt, and reports any failed deletion instead of
+silently claiming success.
 
 ## Native Linux kernel client
 
@@ -356,7 +371,7 @@ sudo mount -t zerofs 127.0.0.1:5564 /mnt/zerofs
 sudo mount -t zerofs /tmp/zerofs.9p.sock /mnt/zerofs
 ```
 
-Exact-kernel packages, compatibility, and mount options:
+Source-build requirements, compatibility, and mount options:
 [native kernel client](https://www.zerofs.net/kernel-client).
 
 ### `zerofs mount` (FUSE fallback)

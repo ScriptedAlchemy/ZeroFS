@@ -1,4 +1,5 @@
 use super::UploadWorker;
+use super::local_destination::LocalFileTarget;
 use super::plan::PlannedFile;
 use super::progress::{FileProgress, Progress};
 use crate::cli::attach_cleanup_errors;
@@ -123,49 +124,29 @@ pub(super) async fn upload_file(
 pub(super) async fn download_file(
     client: Arc<Client>,
     planned: PlannedFile,
-    destination: PathBuf,
+    destination: LocalFileTarget,
     progress: Progress,
     cancellation: CancellationToken,
 ) -> Result<()> {
     if cancellation.is_cancelled() {
         bail!("download cancelled");
     }
-    match tokio::fs::symlink_metadata(&destination).await {
-        Ok(metadata) if metadata.is_dir() => {
-            bail!(
-                "local destination is a directory: {}",
-                destination.display()
-            )
-        }
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("inspect local destination {}", destination.display()));
-        }
-    }
     let file_progress = progress.start_file(progress_path(&planned), planned.size);
-    let temp = temporary_sibling(&destination)?;
     let remote = client
         .open(&planned.source, OpenOptions::read_only())
         .await
         .with_context(|| format!("open remote source {}", planned.source.display()))?;
-    let local = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp)
-        .await;
-    let mut local = match local {
-        Ok(local) => local,
+    let temporary = destination.create_temporary();
+    let mut temporary = match temporary {
+        Ok(temporary) => temporary,
         Err(error) => {
             remote.close().await;
-            return Err(error)
-                .with_context(|| format!("create local temporary file {}", temp.display()));
+            return Err(error);
         }
     };
     let result = stream_download(
         &remote,
-        &mut local,
+        &mut temporary.file,
         &planned,
         client.capabilities().max_read_chunk.max(1),
         &file_progress,
@@ -176,32 +157,30 @@ pub(super) async fn download_file(
         format!(
             "download {} to {}",
             planned.source.display(),
-            destination.display()
+            destination.path().display()
         )
     });
     remote.close().await;
     let result = match result {
-        Ok(()) => local
+        Ok(()) => temporary
+            .file
             .sync_all()
             .await
-            .with_context(|| format!("sync local temporary file {}", temp.display())),
+            .with_context(|| format!("sync local temporary file {}", temporary.path.display())),
         Err(error) => Err(error),
     };
-    drop(local);
+    let result = match result {
+        Ok(()) if cancellation.is_cancelled() => Err(anyhow!("download cancelled")),
+        other => other,
+    };
+    let temp_name = temporary.name;
+    let temp_path = temporary.path;
+    drop(temporary.file);
     if let Err(primary) = result {
-        return Err(cleanup_local_temp(&temp, primary).await);
+        return Err(destination.cleanup_temporary(&temp_name, &temp_path, primary));
     }
-    if let Err(primary) = tokio::fs::rename(&temp, &destination)
-        .await
-        .with_context(|| {
-            format!(
-                "publish local file {} as {}",
-                temp.display(),
-                destination.display()
-            )
-        })
-    {
-        return Err(cleanup_local_temp(&temp, primary).await);
+    if let Err(primary) = destination.publish_temporary(&temp_name, &temp_path) {
+        return Err(destination.cleanup_temporary(&temp_name, &temp_path, primary));
     }
     file_progress.finish();
     Ok(())
@@ -218,7 +197,7 @@ pub(super) async fn stream_upload(
         bail!("upload requires at least one remote file handle");
     }
     let mut local = open_local_source(planned).await?;
-    let buffer_size = planned.size.min(chunk_size as u64).max(1) as usize;
+    let buffer_size = upload_buffer_size(planned.size, chunk_size);
     let mut buffers = (0..UPLOAD_PIPELINE_DEPTH_PER_CONNECTION * remotes.len())
         .map(|_| vec![0; buffer_size])
         .collect::<Vec<_>>();
@@ -308,8 +287,15 @@ async fn close_remote_files(remotes: &[Arc<File>]) {
 }
 
 pub(super) async fn sync_remote_files(remotes: &[Arc<File>]) -> Result<()> {
-    for result in futures::future::join_all(remotes.iter().map(|remote| remote.sync_all())).await {
-        result?;
+    for (index, result) in futures::future::join_all(
+        remotes
+            .iter()
+            .enumerate()
+            .map(|(index, remote)| async move { (index, remote.sync_all().await) }),
+    )
+    .await
+    {
+        result.with_context(|| format!("sync remote upload stream {}", index + 1))?;
     }
     Ok(())
 }
@@ -363,10 +349,19 @@ async fn stream_download(
             bail!("download cancelled");
         }
         let wanted = (planned.size - offset).min(u64::from(chunk_size)) as u32;
-        let chunk = remote
-            .read_at(offset, wanted)
-            .await
-            .with_context(|| format!("read remote source at offset {offset}"))?;
+        let chunk = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => bail!("download cancelled"),
+            result = remote.read_at(offset, wanted) => {
+                result.with_context(|| format!("read remote source at offset {offset}"))?
+            }
+        };
+        if chunk.len() > wanted as usize {
+            bail!(
+                "remote source returned more than the planned read size: {}",
+                planned.source.display()
+            );
+        }
         if chunk.is_empty() {
             break;
         }
@@ -383,12 +378,14 @@ async fn stream_download(
             planned.source.display()
         );
     }
-    if !remote
-        .read_at(offset, 1)
-        .await
-        .with_context(|| format!("check remote source length at offset {offset}"))?
-        .is_empty()
-    {
+    let trailing = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => bail!("download cancelled"),
+        result = remote.read_at(offset, 1) => {
+            result.with_context(|| format!("check remote source length at offset {offset}"))?
+        }
+    };
+    if !trailing.is_empty() {
         bail!(
             "remote source changed while downloading: {}",
             planned.source.display()
@@ -412,6 +409,10 @@ fn progress_path(planned: &PlannedFile) -> &Path {
     }
 }
 
+fn upload_buffer_size(file_size: u64, chunk_size: usize) -> usize {
+    file_size.min(chunk_size as u64) as usize
+}
+
 async fn cleanup_remote_temp(
     client: &Client,
     temp: &Path,
@@ -427,12 +428,14 @@ async fn cleanup_remote_temp(
     attach_cleanup_errors(primary, cleanup)
 }
 
-async fn cleanup_local_temp(temp: &Path, primary: anyhow::Error) -> anyhow::Error {
-    let cleanup = tokio::fs::remove_file(temp)
-        .await
-        .with_context(|| format!("remove local temporary file {}", temp.display()))
-        .err()
-        .into_iter()
-        .collect();
-    attach_cleanup_errors(primary, cleanup)
+#[cfg(test)]
+mod tests {
+    use super::upload_buffer_size;
+
+    #[test]
+    fn upload_buffers_never_exceed_the_file_or_remaining_chunk() {
+        assert_eq!(upload_buffer_size(0, 9 * 1024 * 1024), 0);
+        assert_eq!(upload_buffer_size(7, 9 * 1024 * 1024), 7);
+        assert_eq!(upload_buffer_size(20, 8), 8);
+    }
 }

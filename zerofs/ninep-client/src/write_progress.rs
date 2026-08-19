@@ -84,13 +84,15 @@ pub(crate) enum WriteOutcome<T> {
     Stalled,
 }
 
-pub(crate) async fn wait_for_write<F>(
+pub(crate) async fn wait_for_write<F, P>(
     future: F,
     progress: &WriteProgress,
     shutdown: &Notify,
+    mut on_progress: P,
 ) -> WriteOutcome<F::Output>
 where
     F: Future,
+    P: FnMut(),
 {
     enum Event<T> {
         Completed(T),
@@ -116,7 +118,10 @@ where
         match event {
             Ok(Event::Completed(result)) => return WriteOutcome::Completed(result),
             Ok(Event::Shutdown) => return WriteOutcome::Shutdown,
-            Ok(Event::Advanced) => continue,
+            Ok(Event::Advanced) => {
+                on_progress();
+                continue;
+            }
             Err(_) => return WriteOutcome::Stalled,
         }
     }
