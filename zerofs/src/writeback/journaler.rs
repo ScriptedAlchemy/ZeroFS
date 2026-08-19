@@ -674,7 +674,11 @@ fn accept_journal_command(
 }
 
 /// The admission permits a batch owns, released when it commits.
-type BatchOwnership = Vec<(Sequence, Option<AcceptedAdmission>, Option<SsdReservationToken>)>;
+type BatchOwnership = Vec<(
+    Sequence,
+    Option<AcceptedAdmission>,
+    Option<SsdReservationToken>,
+)>;
 
 struct AssembledBatch {
     mutations: Vec<PreparedMutation>,
@@ -820,7 +824,6 @@ async fn join_pipeline_half<T>(
         None => std::future::pending().await,
     }
 }
-
 
 async fn transition_ssd_tokens(
     ownership: &mut BatchOwnership,
@@ -1208,7 +1211,11 @@ mod tests {
         SsdAdmission::new(capacity, 1 << 20, 95, 85, min_free).unwrap()
     }
 
-    async fn reserve_ssd(ssd: &SsdAdmission, bytes: u64, available: u64) -> crate::writeback::reservation::SsdReservationToken {
+    async fn reserve_ssd(
+        ssd: &SsdAdmission,
+        bytes: u64,
+        available: u64,
+    ) -> crate::writeback::reservation::SsdReservationToken {
         ssd.reserve(
             SsdReservationRequest {
                 ssd_reservation_bytes: bytes,
@@ -2604,12 +2611,8 @@ mod tests {
                 .await
                 .unwrap()
                 .accept();
-            let disk_permit = reserve_ssd(
-                &disk,
-                record.ssd_reservation_bytes().unwrap(),
-                1_000_000,
-            )
-            .await;
+            let disk_permit =
+                reserve_ssd(&disk, record.ssd_reservation_bytes().unwrap(), 1_000_000).await;
             journaler
                 .submit_put_with_disk(record, Bytes::copy_from_slice(payload), ram, disk_permit)
                 .await
