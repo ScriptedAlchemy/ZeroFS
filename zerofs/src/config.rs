@@ -1214,6 +1214,131 @@ pub struct PrometheusConfig {
         deserialize_with = "deserialize_expandable_socket_addrs"
     )]
     pub addresses: HashSet<SocketAddr>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub benchmark_authority: Option<BenchmarkAuthorityConfig>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BenchmarkAdapter {
+    Nfs,
+    Ninep,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct BenchmarkAuthorityConfig {
+    pub adapter: BenchmarkAdapter,
+    #[serde(deserialize_with = "deserialize_expandable_string")]
+    pub export_id: String,
+    #[serde(deserialize_with = "deserialize_expandable_path")]
+    pub tls_certificate: PathBuf,
+    #[serde(deserialize_with = "deserialize_expandable_path")]
+    pub tls_private_key: PathBuf,
+}
+
+impl BenchmarkAuthorityConfig {
+    pub(crate) fn validate_label(value: &str, role: &str) -> Result<()> {
+        if value.is_empty()
+            || !value.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'/' | b'-')
+            })
+        {
+            anyhow::bail!("[prometheus.benchmark_authority] {role} must match [A-Za-z0-9._:/-]+");
+        }
+        Ok(())
+    }
+
+    fn validate(&self, prometheus: &PrometheusConfig, servers: &ServerConfig) -> Result<()> {
+        Self::validate_label(&self.export_id, "export_id")?;
+        if prometheus.addresses.len() != 1 {
+            anyhow::bail!(
+                "[prometheus.benchmark_authority] requires exactly one Prometheus address"
+            );
+        }
+        for (role, path) in [
+            ("tls_certificate", &self.tls_certificate),
+            ("tls_private_key", &self.tls_private_key),
+        ] {
+            if !path.is_absolute() {
+                anyhow::bail!("[prometheus.benchmark_authority] {role} must be an absolute path");
+            }
+        }
+        if self.tls_certificate == self.tls_private_key {
+            anyhow::bail!(
+                "[prometheus.benchmark_authority] tls_certificate and tls_private_key must be different files"
+            );
+        }
+
+        if servers.nbd.is_some() || servers.webui.is_some() {
+            anyhow::bail!(
+                "[prometheus.benchmark_authority] requires one isolated NFS or 9P export; disable NBD and WebUI exports"
+            );
+        }
+
+        match self.adapter {
+            BenchmarkAdapter::Nfs => self.validate_nfs(servers),
+            BenchmarkAdapter::Ninep => self.validate_ninep(servers),
+        }
+    }
+
+    fn validate_nfs(&self, servers: &ServerConfig) -> Result<()> {
+        if servers.ninep.is_some() {
+            anyhow::bail!(
+                "[prometheus.benchmark_authority] requires an isolated NFS export; disable 9P"
+            );
+        }
+        let addresses = servers
+            .nfs
+            .as_ref()
+            .and_then(|config| config.addresses.as_ref())
+            .filter(|addresses| addresses.len() == 1)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "[prometheus.benchmark_authority] requires exactly one NFS endpoint"
+                )
+            })?;
+        let address = addresses.iter().next().expect("checked one NFS address");
+        let IpAddr::V4(ip) = address.ip() else {
+            anyhow::bail!(
+                "[prometheus.benchmark_authority] NFS authority requires one IPv4 endpoint"
+            );
+        };
+        if ip.is_unspecified() {
+            anyhow::bail!(
+                "[prometheus.benchmark_authority] NFS authority cannot derive a source from a wildcard endpoint"
+            );
+        }
+        let expected = format!("{ip}:/");
+        if self.export_id != expected {
+            anyhow::bail!(
+                "[prometheus.benchmark_authority] export_id must exactly match the NFS source {expected}"
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_ninep(&self, servers: &ServerConfig) -> Result<()> {
+        if servers.nfs.is_some() {
+            anyhow::bail!(
+                "[prometheus.benchmark_authority] requires an isolated 9P export; disable NFS"
+            );
+        }
+        let ninep = servers.ninep.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "[prometheus.benchmark_authority] selected 9P but [servers.ninep] is missing"
+            )
+        })?;
+        let endpoint_count = ninep
+            .addresses
+            .as_ref()
+            .map_or(0, HashSet::len)
+            .saturating_add(usize::from(ninep.unix_socket.is_some()));
+        if endpoint_count != 1 {
+            anyhow::bail!("[prometheus.benchmark_authority] requires exactly one 9P endpoint");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -1490,6 +1615,13 @@ impl Settings {
     pub fn validate(&self) -> Result<()> {
         self.servers.validate()?;
         self.runtime_memory_limit_bytes()?;
+        if let Some(prometheus) = &self.prometheus
+            && let Some(authority) = &prometheus.benchmark_authority
+        {
+            authority
+                .validate(prometheus, &self.servers)
+                .context("Invalid [prometheus.benchmark_authority] configuration")?;
+        }
 
         // Parse the endpoint first so a malformed SFTP URL still reports the URL
         // error ahead of any capability diagnostic.
@@ -1904,6 +2036,18 @@ impl Settings {
         toml_string.push_str("# Exposes filesystem, LSM, and cache metrics in Prometheus format\n");
         toml_string.push_str("\n# [prometheus]\n");
         toml_string.push_str("# addresses = [\"127.0.0.1:9091\"]\n");
+        toml_string.push_str("#\n");
+        toml_string.push_str(
+            "# Benchmark authority mode is TLS-only and supports one isolated NFS or 9P export.\n",
+        );
+        toml_string.push_str("# export_id must exactly match `findmnt -nro SOURCE -M <mountpoint>` on the benchmark host.\n");
+        toml_string.push_str("# [prometheus.benchmark_authority]\n");
+        toml_string.push_str("# adapter = \"nfs\"\n");
+        toml_string.push_str("# export_id = \"10.10.10.30:/\"\n");
+        toml_string.push_str("# tls_certificate = \"/etc/zerofs/metrics.crt\"\n");
+        toml_string.push_str(
+            "# tls_private_key = \"/etc/zerofs/metrics.key\"  # Must deny group/world access.\n",
+        );
 
         toml_string.push_str("\n# Optional Azure settings can be added to [azure] section\n");
 
@@ -3643,6 +3787,142 @@ addresses = ["${ZEROFS_TEST_PROM_ADDR}"]
         assert!(nfs.contains(&"0.0.0.0:2049".parse().unwrap()));
         let prom = settings.prometheus.unwrap().addresses;
         assert!(prom.contains(&"0.0.0.0:9091".parse().unwrap()));
+    }
+
+    #[test]
+    fn benchmark_authority_valid_single_nfs_source_loads() {
+        let content = r#"
+[cache]
+dir = "/tmp/cache"
+disk_size_gb = 1.0
+
+[storage]
+url = "s3://bucket/data"
+encryption_password = "test"
+
+[servers.nfs]
+addresses = ["10.10.10.30:2049"]
+
+[prometheus]
+addresses = ["10.10.10.30:9567"]
+
+[prometheus.benchmark_authority]
+adapter = "nfs"
+export_id = "10.10.10.30:/"
+tls_certificate = "/etc/zerofs/metrics.crt"
+tls_private_key = "/etc/zerofs/metrics.key"
+"#;
+
+        let authority = write_and_load(content)
+            .unwrap()
+            .prometheus
+            .unwrap()
+            .benchmark_authority
+            .unwrap();
+        assert_eq!(authority.adapter, BenchmarkAdapter::Nfs);
+        assert_eq!(authority.export_id, "10.10.10.30:/");
+        assert_eq!(
+            authority.tls_certificate,
+            PathBuf::from("/etc/zerofs/metrics.crt")
+        );
+        assert_eq!(
+            authority.tls_private_key,
+            PathBuf::from("/etc/zerofs/metrics.key")
+        );
+    }
+
+    #[test]
+    fn benchmark_authority_rejects_invalid_label_bytes() {
+        for invalid in [
+            "",
+            "host:/?query=1",
+            "user@host:/",
+            "host:/#fragment",
+            "host:/ with-space",
+            "host:/\nother",
+        ] {
+            let error = BenchmarkAuthorityConfig::validate_label(invalid, "export_id")
+                .expect_err("invalid authority label must fail");
+            assert!(
+                error.to_string().contains("[A-Za-z0-9._:/-]+"),
+                "unexpected error for {invalid:?}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn benchmark_authority_rejects_non_isolated_or_mismatched_nfs_exports() {
+        let valid = r#"
+[cache]
+dir = "/tmp/cache"
+disk_size_gb = 1.0
+
+[storage]
+url = "s3://bucket/data"
+encryption_password = "test"
+
+[servers.nfs]
+addresses = ["10.10.10.30:2049"]
+
+[prometheus]
+addresses = ["10.10.10.30:9567"]
+
+[prometheus.benchmark_authority]
+adapter = "nfs"
+export_id = "10.10.10.30:/"
+tls_certificate = "/etc/zerofs/metrics.crt"
+tls_private_key = "/etc/zerofs/metrics.key"
+"#;
+
+        for (name, content, expected) in [
+            (
+                "mismatched source",
+                valid.replace(
+                    "export_id = \"10.10.10.30:/\"",
+                    "export_id = \"10.10.10.31:/\"",
+                ),
+                "must exactly match the NFS source",
+            ),
+            (
+                "multiple NFS endpoints",
+                valid.replace(
+                    "addresses = [\"10.10.10.30:2049\"]",
+                    "addresses = [\"10.10.10.30:2049\", \"10.10.10.31:2049\"]",
+                ),
+                "exactly one NFS endpoint",
+            ),
+            (
+                "additional 9P export",
+                valid.replace(
+                    "[prometheus]",
+                    "[servers.ninep]\naddresses = [\"10.10.10.30:5564\"]\n\n[prometheus]",
+                ),
+                "isolated NFS export",
+            ),
+            (
+                "multiple metrics listeners",
+                valid.replace(
+                    "addresses = [\"10.10.10.30:9567\"]",
+                    "addresses = [\"10.10.10.30:9567\", \"127.0.0.1:9567\"]",
+                ),
+                "exactly one Prometheus address",
+            ),
+            (
+                "relative certificate",
+                valid.replace(
+                    "tls_certificate = \"/etc/zerofs/metrics.crt\"",
+                    "tls_certificate = \"metrics.crt\"",
+                ),
+                "tls_certificate must be an absolute path",
+            ),
+        ] {
+            let error = write_and_load(&content).expect_err(name);
+            let message = format!("{error:#}");
+            assert!(
+                message.contains(expected),
+                "unexpected {name} error: {message}"
+            );
+        }
     }
 
     #[test]

@@ -59,6 +59,23 @@ struct StartupContext {
     store_profile: crate::config::StoreProfile,
 }
 
+async fn resolve_startup_bucket_identity(
+    settings: &Settings,
+    object_store: &Arc<dyn object_store::ObjectStore>,
+    db_path: &str,
+) -> Result<bucket_identity::BucketIdentity> {
+    let authority_enabled = settings
+        .prometheus
+        .as_ref()
+        .and_then(|prometheus| prometheus.benchmark_authority.as_ref())
+        .is_some();
+    if authority_enabled {
+        bucket_identity::BucketIdentity::load(object_store, db_path).await
+    } else {
+        bucket_identity::BucketIdentity::get_or_create(object_store, db_path).await
+    }
+}
+
 /// Receiver handles carried through role election and takeover reconciliation.
 struct HaReceiver {
     control: ReceiverControl,
@@ -172,10 +189,9 @@ impl StartupContext {
             info!("Cache Size: {} GB", cache_config.max_cache_size_gb);
 
             info!("Checking bucket identity...");
-            let bucket =
-                bucket_identity::BucketIdentity::get_or_create(&object_store, &actual_db_path)
-                    .await
-                    .context("Failed to resolve bucket identity")?;
+            let bucket = resolve_startup_bucket_identity(settings, &object_store, &actual_db_path)
+                .await
+                .context("Failed to resolve bucket identity")?;
 
             let cache_config = CacheConfig {
                 root_folder: cache_config.root_folder.join(bucket.cache_directory_name()),
@@ -1295,8 +1311,14 @@ fn canonical_backend_endpoint(settings: &Settings, url: &url::Url) -> Result<Str
 
 #[cfg(test)]
 mod role_decision_tests {
-    use super::{DatabaseMode, ImmediateRoleDecision, StartupContext, immediate_role_decision};
-    use crate::config::{CompressionConfig, ReplicationRole};
+    use super::{
+        DatabaseMode, ImmediateRoleDecision, StartupContext, immediate_role_decision,
+        resolve_startup_bucket_identity,
+    };
+    use crate::config::{
+        BenchmarkAdapter, BenchmarkAuthorityConfig, CompressionConfig, PrometheusConfig,
+        ReplicationRole,
+    };
     use crate::fault_store::FaultStore;
     use crate::replication::ReplicationParams;
     use crate::writeback::config::{AckMode, ShutdownFlush, WritebackConfig};
@@ -1314,6 +1336,36 @@ mod role_decision_tests {
             Some(ImmediateRoleDecision::FollowActivePeer)
         );
         assert_eq!(immediate_role_decision(false, false), None);
+    }
+
+    #[tokio::test]
+    async fn benchmark_authority_startup_requires_an_existing_bucket_identity_without_creating_it()
+    {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let mut settings = crate::config::Settings::generate_default();
+        settings.prometheus = Some(PrometheusConfig {
+            addresses: std::iter::once("127.0.0.1:0".parse().unwrap()).collect(),
+            benchmark_authority: Some(BenchmarkAuthorityConfig {
+                adapter: BenchmarkAdapter::Nfs,
+                export_id: "127.0.0.1:/".to_owned(),
+                tls_certificate: "/nonexistent/metrics.crt".into(),
+                tls_private_key: "/nonexistent/metrics.key".into(),
+            }),
+        });
+
+        let error = resolve_startup_bucket_identity(&settings, &store, "data")
+            .await
+            .unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("missing durable bucket identity"),
+            "unexpected error: {error:#}"
+        );
+        let marker = Path::from("data").join(".zerofs_bucket_id");
+        assert!(matches!(
+            store.get(&marker).await,
+            Err(object_store::Error::NotFound { .. })
+        ));
     }
 
     #[tokio::test]
