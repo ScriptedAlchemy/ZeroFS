@@ -8,6 +8,7 @@ from dataclasses import replace
 from pathlib import Path
 from subprocess import CompletedProcess
 from typing import Mapping, Sequence
+from unittest import mock
 
 from scripts.vm100_pilot.config import PilotConfig
 from scripts.vm100_pilot.metrics import WritebackSnapshot
@@ -18,9 +19,9 @@ from scripts.vm100_pilot.protocol_matrix import (
 )
 from scripts.vm100_pilot.runner import Runner
 from scripts.vm100_pilot.scenarios import (
-    ScenarioDefinition,
+    ProtocolScenario,
     WorkloadDefinition,
-    require_scenario,
+    require_protocol_scenario,
 )
 
 
@@ -55,6 +56,7 @@ class Lifecycle:
     def __init__(self, snapshots: list[WritebackSnapshot]) -> None:
         self.metrics = SnapshotSource(snapshots)
         self.drain_calls = 0
+        self.metrics_endpoint = "http://10.10.10.55:9567/metrics"
 
     def status(self) -> dict[str, object]:
         return {"healthy": True}
@@ -81,6 +83,7 @@ class ProtocolAuthorityTests(unittest.TestCase):
             "ZEROFS_BENCH_NFS_MOUNTPOINT": str(self.root),
             "ZEROFS_BENCH_NFS_ENDPOINT": "zerofs.internal:/",
             "ZEROFS_BENCH_NFS_MOUNT_OPTIONS": "rw,hard,vers=3",
+            "ZEROFS_BENCH_NFS_METRICS_URL": "http://10.10.10.55:9567/metrics",
         }
 
         with self.assertRaisesRegex(ValueError, "literal IP"):
@@ -93,6 +96,7 @@ class ProtocolAuthorityTests(unittest.TestCase):
                 "ZEROFS_BENCH_NFS_MOUNTPOINT": str(self.root),
                 "ZEROFS_BENCH_NFS_ENDPOINT": "10.10.10.55:/",
                 "ZEROFS_BENCH_NFS_MOUNT_OPTIONS": "rw,hard,vers=3",
+                "ZEROFS_BENCH_NFS_METRICS_URL": "http://10.10.10.55:9567/metrics",
             },
         )
         runner = AuthorityRunner(
@@ -129,6 +133,20 @@ class ProtocolAuthorityTests(unittest.TestCase):
         with self.assertRaisesRegex(ScenarioUnavailableError, "source mismatch"):
             authority.verify(mismatch)
 
+    def test_metrics_authority_must_match_the_nfs_server(self) -> None:
+        with self.assertRaisesRegex(ValueError, "same literal server IP"):
+            ProtocolAuthority.from_mapping(
+                "nfs",
+                {
+                    "ZEROFS_BENCH_NFS_MOUNTPOINT": str(self.root),
+                    "ZEROFS_BENCH_NFS_ENDPOINT": "10.10.10.55:/",
+                    "ZEROFS_BENCH_NFS_MOUNT_OPTIONS": "rw,hard,vers=3",
+                    "ZEROFS_BENCH_NFS_METRICS_URL": (
+                        "http://10.10.10.99:9567/metrics"
+                    ),
+                },
+            )
+
 
 class ProtocolMatrixTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -154,15 +172,11 @@ class ProtocolMatrixTests(unittest.TestCase):
         self.config.temp_dir.mkdir()
 
     def test_real_small_transfer_has_exact_sha_cutoffs_and_double_cleanup(self) -> None:
-        scenario = ScenarioDefinition(
+        scenario = ProtocolScenario(
             name="protocol-matrix-nfs-test",
-            kind="protocol-matrix",
             protocol="nfs",
             description="small real transfer",
             workloads=(WorkloadDefinition("small", 4096, "test-pattern"),),
-            required_authority=("mountpoint", "endpoint", "mount_options"),
-            cutoffs=("foreground_close", "fsync_or_commit", "local", "remote"),
-            sha256_required=True,
         )
         authority = ProtocolAuthority.from_mapping(
             "nfs",
@@ -170,6 +184,7 @@ class ProtocolMatrixTests(unittest.TestCase):
                 "ZEROFS_BENCH_NFS_MOUNTPOINT": str(self.protocol_root),
                 "ZEROFS_BENCH_NFS_ENDPOINT": "10.10.10.55:/",
                 "ZEROFS_BENCH_NFS_MOUNT_OPTIONS": "rw,hard,vers=3",
+                "ZEROFS_BENCH_NFS_METRICS_URL": "http://10.10.10.55:9567/metrics",
             },
         )
         findmnt = AuthorityRunner(
@@ -208,6 +223,10 @@ class ProtocolMatrixTests(unittest.TestCase):
         self.assertGreater(workload.fsync_or_commit_ns, 0)
         self.assertGreater(workload.local_cutoff_ns, 0)
         self.assertGreater(workload.remote_cutoff_ns, 0)
+        self.assertGreaterEqual(
+            workload.stable_remote_drain_ns,
+            workload.remote_cutoff_ns,
+        )
         self.assertEqual(result.cleanup.attempts, 2)
         self.assertTrue(result.cleanup.asserted_clean)
         self.assertEqual(list(self.protocol_root.iterdir()), [])
@@ -215,9 +234,59 @@ class ProtocolMatrixTests(unittest.TestCase):
 
     def test_registry_protocol_scenarios_are_not_noops(self) -> None:
         for name in ("protocol-matrix-nfs", "protocol-matrix-9p"):
-            scenario = require_scenario(name)
+            scenario = require_protocol_scenario(name)
             self.assertGreater(sum(item.bytes for item in scenario.workloads), 0)
             self.assertTrue(scenario.sha256_required)
+
+    def test_partial_root_creation_failure_is_cleaned(self) -> None:
+        scenario = ProtocolScenario(
+            name="protocol-matrix-nfs-test",
+            protocol="nfs",
+            description="small real transfer",
+            workloads=(WorkloadDefinition("small", 4096, "test-pattern"),),
+        )
+        authority = ProtocolAuthority.from_mapping(
+            "nfs",
+            {
+                "ZEROFS_BENCH_NFS_MOUNTPOINT": str(self.protocol_root),
+                "ZEROFS_BENCH_NFS_ENDPOINT": "10.10.10.55:/",
+                "ZEROFS_BENCH_NFS_MOUNT_OPTIONS": "rw,hard,vers=3",
+                "ZEROFS_BENCH_NFS_METRICS_URL": "http://10.10.10.55:9567/metrics",
+            },
+        )
+        findmnt = AuthorityRunner(
+            {
+                "filesystems": [
+                    {
+                        "target": str(self.protocol_root),
+                        "source": "10.10.10.55:/",
+                        "fstype": "nfs",
+                        "options": "rw,hard,vers=3",
+                    }
+                ]
+            }
+        )
+        before = WritebackSnapshot(10, 10, 10, 0, 0, 100, 100, False)
+        lifecycle = Lifecycle([before])
+        runner = ProtocolMatrixRunner(
+            self.config,
+            findmnt,
+            lifecycle,  # type: ignore[arg-type]
+        )
+        original_mkdir = Path.mkdir
+
+        def fail_scratch(path: Path, *args: object, **kwargs: object) -> None:
+            if path.parent == self.config.temp_dir and path.name.startswith(
+                "zerofs-protocol-bench-"
+            ):
+                raise OSError("injected scratch mkdir failure")
+            original_mkdir(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "mkdir", new=fail_scratch):
+            with self.assertRaisesRegex(OSError, "injected scratch mkdir failure"):
+                runner.run(scenario, authority)
+
+        self.assertEqual(list(self.protocol_root.iterdir()), [])
 
 
 if __name__ == "__main__":

@@ -68,9 +68,15 @@ from scripts.vm100_pilot.system_io import (
     summarize_system_io,
     verify_page_cache_hit,
 )
-from scripts.vm100_pilot.raw_sftp import RawSftpRunner, SftpEndpoint
+from scripts.vm100_pilot.raw_sftp import (
+    RawSftpRunner,
+    SftpEndpoint,
+    SftpEndpointAuthority,
+    SshBinaryIdentity,
+)
 from scripts.vm100_pilot.receipts import RunReceipt
 from scripts.vm100_pilot.runner import CommandError, ManagedProcess, Runner
+from scripts.vm100_pilot.scenarios import RawSftpScenario
 from scripts.vm100_pilot.workloads import WorkloadRunner
 import scripts.vm100_pilot.profile as profile_module
 
@@ -312,7 +318,6 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(config.client_service, "zerofs-nbd-client.service")
         self.assertEqual(config.mountpoint, Path("/mnt/storagebox-nbd-pilot"))
         self.assertEqual(config.expected_ack_mode, "memory")
-        self.assertEqual(config.raw_sftp_jobs, 7)
         self.assertEqual(config.build_target, Path("/var/tmp/zerofs-build-target"))
         self.assertNotIn(Path("/fast"), config.build_target.parents)
         self.assertEqual(config.nbd_export, "vm100-pilot-64g")
@@ -3038,9 +3043,44 @@ class WorkloadEngineTests(unittest.TestCase):
 
     def test_raw_failure_restores_stack_and_removes_scratch(self) -> None:
         class FailingRaw(RawSftpRunner):
+            def _identify_binaries(
+                self, stock_ssh: Path, hpn_ssh: Path
+            ) -> tuple[SshBinaryIdentity, SshBinaryIdentity]:
+                del stock_ssh, hpn_ssh
+                return (
+                    SshBinaryIdentity("/stock/ssh", "OpenSSH_stock", "a" * 64),
+                    SshBinaryIdentity("/hpn/ssh", "OpenSSH_hpn", "b" * 64),
+                )
+
+            def _create_sources(
+                self,
+                scratch: Path,
+                *,
+                jobs: int,
+                per_job_bytes: int,
+            ) -> list[Path]:
+                paths = [scratch / f"source-{index}.bin" for index in range(jobs)]
+                for path in paths:
+                    path.write_bytes(b"x" * per_job_bytes)
+                return paths
+
             def _endpoint(self) -> SftpEndpoint:
                 return SftpEndpoint(
                     "user", "example.invalid", 23, Path("/key"), Path("/known")
+                )
+
+            def _endpoint_authority(
+                self, endpoint: SftpEndpoint
+            ) -> SftpEndpointAuthority:
+                return SftpEndpointAuthority(
+                    endpoint.user,
+                    endpoint.host,
+                    endpoint.port,
+                    endpoint.prefix,
+                    "/key",
+                    "/known",
+                    "c" * 64,
+                    "strict-pinned-known-hosts",
                 )
 
             def _run_batch(
@@ -3052,8 +3092,21 @@ class WorkloadEngineTests(unittest.TestCase):
                 raise RuntimeError("injected raw transfer failure")
 
         raw = FailingRaw(self.config, self.runner, self.lifecycle)  # type: ignore[arg-type]
+        scenario = RawSftpScenario(
+            "raw-sftp-test",
+            "failure-path SFTP control",
+            jobs=2,
+            per_job_bytes=1_048_576,
+            buffer_bytes=1_048_576,
+            request_depth=128,
+            repetitions=4,
+        )
         with self.assertRaisesRegex(RuntimeError, "injected raw transfer failure"):
-            raw.run(jobs=2, per_job_mib=1)
+            raw.run(
+                scenario,
+                stock_ssh=Path("/stock/ssh"),
+                hpn_ssh=Path("/hpn/ssh"),
+            )
         self.assertEqual(self.lifecycle.stop_calls, 1)
         self.assertEqual(self.lifecycle.start_calls, 1)
         self.assertEqual(list(self.config.temp_dir.iterdir()), [])

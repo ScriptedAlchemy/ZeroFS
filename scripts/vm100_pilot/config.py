@@ -108,8 +108,6 @@ class PilotConfig:
     rust_repo: str
     rust_commit: str
     delete_jobs: int
-    raw_sftp_jobs: int
-    raw_sftp_per_job_mib: int
     nbd_export: str
     replacement_export: str
     nbd_size_gib: int
@@ -226,8 +224,6 @@ class PilotConfig:
                 "af60c2de9d85e7f3d81c78601669468cf02dabab",
             ),
             delete_jobs=_integer(values, "ZEROFS_DELETE_JOBS", 4),
-            raw_sftp_jobs=_integer(values, "ZEROFS_RAW_SFTP_JOBS", 7),
-            raw_sftp_per_job_mib=_integer(values, "ZEROFS_RAW_SFTP_PER_JOB_MIB", 128),
             nbd_export=values.get("ZEROFS_PILOT_NBD_EXPORT", "vm100-pilot-64g"),
             replacement_export=values.get(
                 "ZEROFS_PILOT_REPLACEMENT_EXPORT", "vm100-pilot-64g-v3"

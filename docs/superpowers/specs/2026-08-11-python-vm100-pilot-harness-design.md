@@ -83,7 +83,17 @@ A `finally` block always stops collectors, generates the text call-graph report,
 
 ### Raw SFTP control
 
-The control stops ZeroFS to avoid account-session contention, creates seven 128 MiB incompressible files, runs seven matched OpenSSH SFTP upload/download workers with the same packet/request settings, removes remote and local artifacts, and restores the canonical stack in `finally`. Worker failures do not strand siblings.
+The control requires explicit stock and HPN SSH executable paths, records each
+absolute path, version, and SHA-256, and uses the selected executable through
+OpenSSH SFTP's `-S` option. It stops the isolated pilot ZeroFS service to avoid
+account-session contention, creates four 128 MiB incompressible files, and runs
+counterbalanced repeated stock/HPN upload and download trials with identical
+jobs, bytes, buffer size, and request depth. Downloads are materialized and
+SHA-256 checked against the shared sources. Receipts distinguish each SFTP
+process's close acknowledgement from remote durability, which this control does
+not measure. UUID-owned remote and local artifacts are cleaned twice, asserted
+absent, and the canonical stack is restored in `finally`. Worker failures do
+not strand siblings.
 
 ### Real workloads
 
@@ -110,7 +120,7 @@ The Linux acceptance gate on VM100 is:
 4. canonical restoration and status validation;
 5. full 1 GiB benchmark;
 6. pinned npm/Cargo workloads;
-7. seven-session raw SFTP control;
+7. four-session counterbalanced stock/HPN raw SFTP control;
 8. no leftover benchmark directories, collectors, profiling targets, raw files, mounts, or stopped canonical services.
 
 ## Removal and documentation

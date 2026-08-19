@@ -8,19 +8,22 @@ import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable, Mapping
+from urllib.parse import urlsplit
 
 from .config import PilotConfig
-from .lifecycle import PilotLifecycle
+from .memory_envelope import MemoryEnvelopeSession
 from .metrics import (
     WritebackSnapshot,
     wait_for_accepted_after,
     wait_for_local,
     wait_for_remote,
 )
+from .owned_resources import assert_absent, remove_empty_directory, unlink_file
 from .receipts import RunReceipt
 from .runner import Runner
-from .scenarios import ScenarioDefinition
+from .scenarios import ProtocolScenario
 from .system_io import file_sha256
+from .writeback_observer import WritebackObserver
 
 
 class ScenarioUnavailableError(RuntimeError):
@@ -52,6 +55,7 @@ class ProtocolAuthority:
     mountpoint: Path
     endpoint: str
     mount_options: tuple[str, ...]
+    metrics_url: str
 
     @classmethod
     def from_mapping(
@@ -65,15 +69,20 @@ class ProtocolAuthority:
         mountpoint = values.get(f"{prefix}_MOUNTPOINT", "").strip()
         endpoint = values.get(f"{prefix}_ENDPOINT", "").strip()
         options = values.get(f"{prefix}_MOUNT_OPTIONS", "").strip()
-        if not mountpoint or not endpoint or not options:
+        metrics_url = values.get(f"{prefix}_METRICS_URL", "").strip()
+        if not mountpoint or not endpoint or not options or not metrics_url:
             label = "NFS" if protocol == "nfs" else "9P"
             raise ScenarioUnavailableError(
                 f"{label} benchmark unavailable: set {prefix}_MOUNTPOINT, "
-                f"{prefix}_ENDPOINT, and {prefix}_MOUNT_OPTIONS explicitly"
+                f"{prefix}_ENDPOINT, {prefix}_MOUNT_OPTIONS, and "
+                f"{prefix}_METRICS_URL explicitly"
             )
         root = Path(mountpoint)
         if not root.is_absolute():
             raise ValueError(f"{protocol} mountpoint must be absolute: {root}")
+        metrics = urlsplit(metrics_url)
+        if metrics.scheme not in {"http", "https"} or not metrics.hostname:
+            raise ValueError(f"invalid ZeroFS metrics endpoint: {metrics_url!r}")
         if protocol == "nfs":
             host = _nfs_host(endpoint)
             try:
@@ -83,11 +92,22 @@ class ProtocolAuthority:
                     "NFS benchmark endpoint must use a literal IP; mutable host "
                     f"aliases are not authority: {endpoint!r}"
                 ) from error
+            if metrics.hostname != host:
+                raise ValueError(
+                    "NFS mount and metrics authority must use the same literal "
+                    f"server IP: mount={host!r}, metrics={metrics.hostname!r}"
+                )
+        elif metrics.hostname not in {"127.0.0.1", "::1"}:
+            raise ValueError(
+                "9P benchmark metrics must use explicit loopback authority for "
+                f"the local server: {metrics.hostname!r}"
+            )
         return cls(
             protocol=protocol,
             mountpoint=root.resolve(strict=False),
             endpoint=endpoint,
             mount_options=_options(options),
+            metrics_url=metrics_url,
         )
 
     def verify(self, runner: Runner) -> dict[str, object]:
@@ -145,6 +165,7 @@ class ProtocolAuthority:
             "fstype": filesystem,
             "options": list(mounted_options),
             "required_options": list(self.mount_options),
+            "metrics_url": self.metrics_url,
         }
 
     def require_run_root(self, path: Path) -> Path:
@@ -171,6 +192,7 @@ class ProtocolWorkloadResult:
     fsync_or_commit_ns: int
     local_cutoff_ns: int
     remote_cutoff_ns: int
+    stable_remote_drain_ns: int
     readback_ns: int
     foreground_mibps: float
     readback_mibps: float
@@ -194,6 +216,7 @@ class ProtocolMatrixResult:
     authority: dict[str, object]
     total_bytes: int
     workloads: tuple[ProtocolWorkloadResult, ...]
+    memory_envelope: dict[str, object] | None
     cleanup: CleanupEvidence
     receipt_dir: str
 
@@ -206,14 +229,16 @@ class ProtocolMatrixRunner:
         self,
         config: PilotConfig,
         runner: Runner,
-        lifecycle: PilotLifecycle,
+        observer: WritebackObserver,
         *,
         random_bytes: Callable[[int], bytes] = os.urandom,
+        memory_session: MemoryEnvelopeSession | None = None,
     ) -> None:
         self.config = config
         self.runner = runner
-        self.lifecycle = lifecycle
+        self.observer = observer
         self.random_bytes = random_bytes
+        self.memory_session = memory_session
 
     def _create_source(self, path: Path, byte_count: int) -> None:
         remaining = byte_count
@@ -278,36 +303,34 @@ class ProtocolMatrixRunner:
     @staticmethod
     def _cleanup_once(files: list[Path], directories: list[Path]) -> None:
         for path in files:
-            path.unlink(missing_ok=True)
+            unlink_file(path)
         for path in directories:
-            if path.exists():
-                path.rmdir()
+            remove_empty_directory(path)
 
     @staticmethod
     def _assert_clean(resources: list[Path]) -> None:
-        remaining = [str(path) for path in resources if path.exists()]
-        if remaining:
-            raise RuntimeError(f"protocol benchmark cleanup incomplete: {remaining}")
+        assert_absent(resources)
 
     def run(
         self,
-        scenario: ScenarioDefinition,
+        scenario: ProtocolScenario,
         authority: ProtocolAuthority,
     ) -> ProtocolMatrixResult:
-        if scenario.kind != "protocol-matrix" or scenario.protocol is None:
-            raise ValueError(f"not a protocol-matrix scenario: {scenario.name}")
         if scenario.protocol != authority.protocol:
             raise ValueError(
                 f"scenario protocol {scenario.protocol} does not match authority "
                 f"{authority.protocol}"
             )
+        if self.observer.metrics_endpoint != authority.metrics_url:
+            raise ValueError(
+                "protocol mount and writeback observer metrics authority differ: "
+                f"mount={authority.metrics_url!r}, "
+                f"observer={self.observer.metrics_endpoint!r}"
+            )
         total_bytes = sum(workload.bytes for workload in scenario.workloads)
         if total_bytes <= 0:
             raise ValueError(f"scenario {scenario.name!r} has no byte-moving work")
 
-        self.lifecycle.status()
-        self.lifecycle.drain()
-        authority_receipt = authority.verify(self.runner)
         receipt = RunReceipt.start(self.config, scenario.name)
         run_id = uuid.uuid4().hex
         run_root = authority.require_run_root(
@@ -315,8 +338,6 @@ class ProtocolMatrixRunner:
         )
         scratch = self.config.temp_dir / f"zerofs-protocol-bench-{run_id}"
         self.config.require_temp_child(scratch, "zerofs-protocol-bench-")
-        run_root.mkdir(mode=0o700)
-        scratch.mkdir(mode=0o700)
         files: list[Path] = []
         directories = [run_root, scratch]
         resources: list[Path] = [run_root, scratch]
@@ -325,13 +346,42 @@ class ProtocolMatrixRunner:
         ledger = receipt.path("cleanup-ledger.json")
         results: list[ProtocolWorkloadResult] = []
         primary: BaseException | None = None
+        memory_envelope: dict[str, object] | None = None
+        authority_receipt: dict[str, object] = {}
 
         with receipt:
             receipt.record("scenario", scenario.to_dict())
-            receipt.record("authority", authority_receipt)
+            receipt.record(
+                "requested_authority",
+                {
+                    "protocol": authority.protocol,
+                    "mountpoint": str(authority.mountpoint),
+                    "endpoint": authority.endpoint,
+                    "mount_options": list(authority.mount_options),
+                    "metrics_url": authority.metrics_url,
+                },
+            )
+            receipt.record(
+                "requested_observer",
+                {"metrics_endpoint": self.observer.metrics_endpoint},
+            )
             try:
+                if self.memory_session is not None:
+                    self.memory_session.attach_artifact(
+                        receipt.path("memory-envelope.json")
+                    )
+                    if not self.memory_session.samples:
+                        self.memory_session.begin()
+                observer_status = self.observer.status()
+                receipt.record("writeback_observer", observer_status)
+                self.observer.drain()
+                authority_receipt = authority.verify(self.runner)
+                receipt.record("authority", authority_receipt)
+                self._write_ledger(ledger, resources, attempts, asserted_clean)
+                run_root.mkdir(mode=0o700)
+                scratch.mkdir(mode=0o700)
                 for index, workload in enumerate(scenario.workloads):
-                    self.lifecycle.drain()
+                    self.observer.drain()
                     source = scratch / f"source-{index}.bin"
                     destination = run_root / f"payload-{index}.bin"
                     files.extend((destination, source))
@@ -339,27 +389,44 @@ class ProtocolMatrixRunner:
                     self._write_ledger(ledger, resources, attempts, asserted_clean)
                     self._create_source(source, workload.bytes)
                     source_sha256 = file_sha256(source)
-                    before = self.lifecycle.metrics.snapshot()
+                    before = self.observer.metrics.snapshot()
                     write_started = time.monotonic_ns()
                     foreground_ns = self._copy_without_barrier(source, destination)
+                    if self.memory_session is not None:
+                        self.memory_session.sample(
+                            f"foreground_close:{workload.name}"
+                        )
                     accepted = wait_for_accepted_after(
-                        self.lifecycle.metrics.snapshot,
+                        self.observer.metrics.snapshot,
                         previous_sequence=before.accepted,
                         timeout=self.config.drain_timeout,
                     )
                     fsync_ns = self._fsync(destination)
+                    if self.memory_session is not None:
+                        self.memory_session.sample(
+                            f"fsync_or_commit:{workload.name}"
+                        )
                     local = wait_for_local(
-                        self.lifecycle.metrics.snapshot,
+                        self.observer.metrics.snapshot,
                         target_sequence=accepted.accepted,
                         timeout=self.config.drain_timeout,
                     )
                     local_cutoff_ns = max(1, time.monotonic_ns() - write_started)
+                    if self.memory_session is not None:
+                        self.memory_session.sample(f"local:{workload.name}")
                     remote = wait_for_remote(
-                        self.lifecycle.metrics.snapshot,
+                        self.observer.metrics.snapshot,
                         target_sequence=accepted.accepted,
                         timeout=self.config.drain_timeout,
                     )
                     remote_cutoff_ns = max(1, time.monotonic_ns() - write_started)
+                    self.observer.drain()
+                    stable_remote_drain_ns = max(
+                        remote_cutoff_ns,
+                        time.monotonic_ns() - write_started,
+                    )
+                    if self.memory_session is not None:
+                        self.memory_session.sample(f"remote:{workload.name}")
                     if destination.stat().st_size != workload.bytes:
                         raise RuntimeError(
                             f"protocol write byte count mismatch for {workload.name}: "
@@ -385,6 +452,7 @@ class ProtocolMatrixRunner:
                             fsync_or_commit_ns=fsync_ns,
                             local_cutoff_ns=local_cutoff_ns,
                             remote_cutoff_ns=remote_cutoff_ns,
+                            stable_remote_drain_ns=stable_remote_drain_ns,
                             readback_ns=readback_ns,
                             foreground_mibps=self._rate(workload.bytes, foreground_ns),
                             readback_mibps=self._rate(workload.bytes, readback_ns),
@@ -396,7 +464,7 @@ class ProtocolMatrixRunner:
                     )
                     destination.unlink()
                     source.unlink()
-                self.lifecycle.drain()
+                self.observer.drain()
             except BaseException as error:
                 primary = error
                 raise
@@ -415,6 +483,13 @@ class ProtocolMatrixRunner:
                 except BaseException as error:
                     cleanup_errors.append(error)
                 self._write_ledger(ledger, resources, attempts, asserted_clean)
+                if self.memory_session is not None:
+                    try:
+                        memory_envelope = self.memory_session.finish_after_cleanup(
+                            require_complete=primary is None and not cleanup_errors
+                        ).to_dict()
+                    except BaseException as error:
+                        cleanup_errors.append(error)
                 if cleanup_errors:
                     detail = "; ".join(str(error) for error in cleanup_errors)
                     if primary is not None:
@@ -433,6 +508,7 @@ class ProtocolMatrixRunner:
             authority=authority_receipt,
             total_bytes=total_bytes,
             workloads=tuple(results),
+            memory_envelope=memory_envelope,
             cleanup=cleanup,
             receipt_dir=str(receipt.directory),
         )
