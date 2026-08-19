@@ -1336,6 +1336,24 @@ EoKHvFGzOKXUl8wiz1GPAAAAEXplcm9mcy1vdGhlci10ZXN0AQIDBA==
     }
 
     #[tokio::test]
+    async fn russh_factory_rejects_an_unconfigured_client_key() {
+        let env = Loopback::start().await;
+        std::fs::write(&env.identity, OTHER_KEY.as_bytes()).unwrap();
+        let factory = RusshSessionFactory::new(
+            env.endpoint.clone(),
+            env.identity.clone(),
+            env.known_hosts.clone(),
+        )
+        .unwrap();
+
+        let error = factory
+            .open(CancellationToken::new())
+            .await
+            .expect_err("the server must reject a client key it did not configure");
+        assert!(matches!(error, TransportError::Open(_)), "{error:?}");
+    }
+
+    #[tokio::test]
     async fn russh_loopback_pipelines_writes_and_reads_with_hpn_windows() {
         let env = Loopback::start().await;
         let factory = RusshSessionFactory::new(
