@@ -1,4 +1,5 @@
 use super::{attach_cleanup_errors, finish_with_sftp_cleanup};
+use crate::cache_metrics::{CacheMetrics, FoyerMetricsRegistry};
 use crate::checkpoint_manager::CheckpointManager;
 use crate::config::{NbdConfig, NfsConfig, NinePConfig, RpcConfig, Settings};
 use crate::db::SlateDbHandle;
@@ -669,7 +670,11 @@ pub(crate) async fn build_block_hybrid(
     memory_bytes: usize,
     disk_bytes: usize,
     foyer_handle: &tokio::runtime::Handle,
-) -> Result<Arc<FoyerHybridCache>> {
+    metrics: FoyerMetricsRegistry,
+) -> Result<(
+    Arc<FoyerHybridCache>,
+    foyer::HybridCache<slatedb::db_cache::CachedKey, slatedb::db_cache::CachedEntry>,
+)> {
     tokio::fs::create_dir_all(hybrid_cache_root)
         .await
         .with_context(|| {
@@ -681,6 +686,7 @@ pub(crate) async fn build_block_hybrid(
 
     let hybrid = HybridCacheBuilder::new()
         .with_name("zerofs-slatedb-hybrid")
+        .with_metrics_registry(Box::new(metrics))
         .memory(memory_bytes)
         .with_eviction_config(S3FifoConfig::default())
         .with_weighter(|_, v: &slatedb::db_cache::CachedEntry| v.size())
@@ -699,7 +705,10 @@ pub(crate) async fn build_block_hybrid(
         .build()
         .await
         .map_err(|e| foyer_build_error("foyer hybrid build failed", e))?;
-    Ok(Arc::new(FoyerHybridCache::new_with_cache(hybrid)))
+    Ok((
+        Arc::new(FoyerHybridCache::new_with_cache(hybrid.clone())),
+        hybrid,
+    ))
 }
 
 /// Block size of the parts disk cache: foyer's eviction/reclaim unit, and the
@@ -731,6 +740,7 @@ pub(crate) async fn build_parts_hybrid(
     memory_bytes: usize,
     disk_bytes: usize,
     foyer_handle: &tokio::runtime::Handle,
+    metrics: FoyerMetricsRegistry,
 ) -> Result<foyer::HybridCache<crate::object_store_prefetch::PartKey, bytes::Bytes>> {
     use crate::object_store_prefetch::PartKey;
     use bytes::Bytes;
@@ -744,6 +754,7 @@ pub(crate) async fn build_parts_hybrid(
 
     HybridCacheBuilder::new()
         .with_name("zerofs-object-prefetch-parts")
+        .with_metrics_registry(Box::new(metrics))
         .memory(memory_bytes)
         .with_eviction_config(S3FifoConfig::default())
         .with_weighter(|_: &PartKey, v: &Bytes| v.len())
@@ -808,6 +819,7 @@ pub(crate) fn split_memory_budget(total_memory_bytes: usize) -> (usize, usize, u
 pub struct SlateDbOpen {
     pub data: SlateDbHandle,
     pub metrics_recorder: Option<Arc<DefaultMetricsRecorder>>,
+    pub cache_metrics: Arc<CacheMetrics>,
     /// The raw-parts prefetch cache, returned so the segment store reuses it
     /// (one budget; segment objects and SST objects share it, keyed by path).
     pub parts_cache: foyer::HybridCache<crate::object_store_prefetch::PartKey, bytes::Bytes>,
@@ -960,11 +972,13 @@ pub async fn build_slatedb(
     let maintenance_runtime = shared_maintenance_runtime().clone();
 
     let hybrid_cache_root = cache_config.root_folder.join("hybrid_cache");
-    let cache = build_block_hybrid(
+    let foyer_metrics = FoyerMetricsRegistry::default();
+    let (cache, block_cache_metrics) = build_block_hybrid(
         &hybrid_cache_root,
         hybrid_memory_bytes,
         hybrid_disk_bytes,
         &maintenance_runtime,
+        foyer_metrics.clone(),
     )
     .await?;
 
@@ -973,8 +987,14 @@ pub async fn build_slatedb(
         parts_memory_bytes,
         parts_disk_bytes,
         &maintenance_runtime,
+        foyer_metrics.clone(),
     )
     .await?;
+    let cache_metrics = Arc::new(CacheMetrics::new(
+        parts_cache.clone(),
+        block_cache_metrics,
+        foyer_metrics,
+    ));
 
     // Length-check the store before the data-db prefetch wrapper is layered on;
     // the compactor uses the length-checked store directly (no prefetch cache).
@@ -1058,6 +1078,7 @@ pub async fn build_slatedb(
             Ok(SlateDbOpen {
                 data: SlateDbHandle::ReadWrite(slatedb),
                 metrics_recorder: Some(metrics_recorder),
+                cache_metrics: cache_metrics.clone(),
                 parts_cache: parts_cache.clone(),
                 decoded_extent_memory_bytes,
             })
@@ -1082,6 +1103,7 @@ pub async fn build_slatedb(
             Ok(SlateDbOpen {
                 data: SlateDbHandle::ReadOnly(ArcSwap::new(reader)),
                 metrics_recorder: None,
+                cache_metrics: cache_metrics.clone(),
                 parts_cache: parts_cache.clone(),
                 decoded_extent_memory_bytes,
             })
@@ -1107,6 +1129,7 @@ pub async fn build_slatedb(
             Ok(SlateDbOpen {
                 data: SlateDbHandle::ReadOnly(ArcSwap::new(reader)),
                 metrics_recorder: None,
+                cache_metrics,
                 parts_cache: parts_cache.clone(),
                 decoded_extent_memory_bytes,
             })
@@ -1119,6 +1142,7 @@ pub struct InitResult {
     pub object_store: Arc<dyn object_store::ObjectStore>,
     pub writeback: Option<crate::writeback::store::WritebackObjectStore>,
     pub sftp_pool: Option<crate::sftp_transport::SftpSessionPool>,
+    pub cache_metrics: Arc<CacheMetrics>,
     pub wal_object_store: Option<Arc<dyn object_store::ObjectStore>>,
     pub db_path: String,
     pub db_handle: SlateDbHandle,
@@ -1250,6 +1274,7 @@ pub async fn run_server(
                     global_stats: Arc::clone(&fs.global_stats),
                     segment_gc_stats: fs.extent_store.segment_gc_stats(),
                     dedup: Arc::clone(&fs.dedup),
+                    cache_metrics: init_result.cache_metrics.clone(),
                     slatedb_registry,
                     writeback: writeback_for_metrics,
                 },
@@ -2215,9 +2240,11 @@ mod tests {
                 64 * 1024 * 1024,
                 512 * 1024 * 1024,
                 &tokio::runtime::Handle::current(),
+                FoyerMetricsRegistry::default(),
             )
             .await
             .expect("foyer hybrid")
+            .0
         }
 
         // Open a writer over `store` with the same segment/filter/block config the

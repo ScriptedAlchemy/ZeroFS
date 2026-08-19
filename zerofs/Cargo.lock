@@ -6476,6 +6476,7 @@ dependencies = [
  "lz4_flex",
  "metrics",
  "metrics-exporter-prometheus",
+ "mixtrics",
  "nbd-proto",
  "ninep-client",
  "ninep-proto",
