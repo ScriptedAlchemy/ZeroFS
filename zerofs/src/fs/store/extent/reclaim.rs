@@ -8,7 +8,7 @@ use crate::failpoints::{self as fp, fail_point};
 #[cfg(test)]
 use super::select::MAX_COMPACT_BYTES_PER_ROUND;
 use super::select::{ColdCtx, HotChain, SegStat, chain_components, live_permille, select_round};
-use super::{ExtentStore, PARALLEL_EXTENT_OPS, human_bytes};
+use super::{ExtentStore, human_bytes};
 use crate::fs::FsError;
 use crate::fs::inode::InodeId;
 use crate::fs::key_codec::KeyCodec;
@@ -17,7 +17,7 @@ use crate::segment::{FrameLoc, Segid};
 use crate::segment_store::SegmentStoreError;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use futures::stream::{self, StreamExt};
+use futures::stream::StreamExt;
 use slatedb::config::WriteOptions;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::Ordering;
@@ -935,53 +935,133 @@ impl ExtentStore {
     }
 
     /// Confirm a segment the counter calls dead truly holds no live-referenced
-    /// frame, by reading its directory and checking each named extent against the
-    /// forward map. Fail-closed: a read error, or any frame the forward map still
-    /// points here, returns [`SegmentDeadVerdict::Keep`]. Sound because an eligible
-    /// segment can never regain a reference, so the verdict is permanent.
+    /// frame, by reading its directory (uncached) and scanning the forward map
+    /// in inode-grouped ranges. Fail-closed: a read/scan error, or any frame
+    /// the forward map still points here, returns [SegmentDeadVerdict::Keep].
     ///
-    /// Each pointer is checked in both the in-memory and the durable view: the
-    /// delete is irreversible, and a reference can hide from either view alone —
-    /// a committed-but-unflushed reference exists only in memory, while a durable
-    /// reference is masked in memory by an unflushed overwrite (the undercount
-    /// case this verify exists to catch, where a crash after the delete would
-    /// leave the durable pointer dangling).
+    /// Both the in-memory and durable views are scanned. A committed-but-unflushed
+    /// reference exists only in memory; a durable reference can be masked in
+    /// memory by an unflushed overwrite. Either view pointing here keeps the
+    /// segment. This replaces a 20-wide dual get_bytes/get_bytes_durable per
+    /// unique directory extent, which OOM-d reclaim on a full foyer floor.
     async fn verify_segment_reclaimable(&self, segid: Segid) -> SegmentDeadVerdict {
-        let dir = match self.segments.read_directory(segid).await {
+        let dir = match self.segments.read_directory(segid, false).await {
             Ok(d) => d,
             Err(SegmentStoreError::NotFound) => return SegmentDeadVerdict::ObjectAbsent,
-            // Transient read error: fail-closed, keep the segment.
             Err(_) => return SegmentDeadVerdict::Keep,
         };
-        // Unique extents the directory names (an extent can recur across
-        // rewrites). Ordered so the lookup fan-out issues deterministically.
         let want: BTreeSet<(InodeId, u64)> = dir.iter().map(|e| (e.inode, e.extent)).collect();
-        // A FrameLoc pointing here in either view means the segment is live; a
-        // point-read error is treated as still-referenced (fail-closed).
-        let points_here = |enc: Result<Option<Bytes>, anyhow::Error>| match enc {
-            Ok(Some(enc)) => FrameLoc::decode(&enc).is_some_and(|loc| loc.segid == segid),
-            Ok(None) => false,
-            Err(_) => true,
-        };
-        let still_referenced = stream::iter(want)
-            .map(|(inode, extent)| {
-                let store = self.clone();
-                async move {
-                    let key = store.key_codec.extent_key(inode, extent);
-                    points_here(store.db.get_bytes(&key).await)
-                        || points_here(store.db.get_bytes_durable(&key).await)
-                }
-            })
-            .buffer_unordered(PARALLEL_EXTENT_OPS)
-            .any(|referenced| async move { referenced })
-            .await;
-        if still_referenced {
-            SegmentDeadVerdict::Keep
-        } else {
-            SegmentDeadVerdict::Reclaim
+        if want.is_empty() {
+            return SegmentDeadVerdict::Reclaim;
+        }
+        match self.directory_still_referenced(segid, &want).await {
+            Ok(true) => SegmentDeadVerdict::Keep,
+            Ok(false) => SegmentDeadVerdict::Reclaim,
+            Err(()) => SegmentDeadVerdict::Keep,
         }
     }
+
+    /// `Ok(true)` if any wanted extent still points at `segid` in memory or
+    /// durable view. `Err` on an unbounded range or a scan/decode error
+    /// (fail-closed: do not delete).
+    async fn directory_still_referenced(
+        &self,
+        segid: Segid,
+        want: &BTreeSet<(InodeId, u64)>,
+    ) -> Result<bool, ()> {
+        for (inode, start, last) in inode_extent_runs(want) {
+            let Some((start_key, end_key)) = extent_scan_bounds(&self.key_codec, inode, start, last) else {
+                return Err(());
+            };
+            if self
+                .scan_extent_run_points_here(segid, want, start_key.clone()..end_key.clone(), false)
+                .await?
+            {
+                return Ok(true);
+            }
+            if self
+                .scan_extent_run_points_here(segid, want, start_key..end_key, true)
+                .await?
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    async fn scan_extent_run_points_here(
+        &self,
+        segid: Segid,
+        want: &BTreeSet<(InodeId, u64)>,
+        range: std::ops::Range<Bytes>,
+        durable: bool,
+    ) -> Result<bool, ()> {
+        let stream = if durable {
+            self.db.scan_durable(range).await
+        } else {
+            self.db.scan(range).await
+        }
+        .map_err(|_| ())?;
+        futures::pin_mut!(stream);
+        while let Some(item) = StreamExt::next(&mut stream).await {
+            let (key, val) = item.map_err(|_| ())?;
+            let Some((inode, extent)) = self.key_codec.parse_extent_key_full(&key) else {
+                continue;
+            };
+            if !want.contains(&(inode, extent)) {
+                continue;
+            }
+            match FrameLoc::decode(&val) {
+                Some(loc) if loc.segid == segid => return Ok(true),
+                Some(_) => {}
+                None => return Err(()),
+            }
+        }
+        Ok(false)
+    }
 }
+
+/// Consecutive (inode, extent) runs, each (`inode`, first, last inclusive).
+fn inode_extent_runs(want: &BTreeSet<(InodeId, u64)>) -> Vec<(InodeId, u64, u64)> {
+    let mut runs = Vec::new();
+    let mut iter = want.iter();
+    let Some(&(inode, extent)) = iter.next() else {
+        return runs;
+    };
+    let mut cur_inode = inode;
+    let mut start = extent;
+    let mut last = extent;
+    for &(inode, extent) in iter {
+        if inode == cur_inode && extent == last.saturating_add(1) && last < u64::MAX {
+            last = extent;
+            continue;
+        }
+        runs.push((cur_inode, start, last));
+        cur_inode = inode;
+        start = extent;
+        last = extent;
+    }
+    runs.push((cur_inode, start, last));
+    runs
+}
+
+fn extent_scan_bounds(
+    key_codec: &KeyCodec,
+    inode: InodeId,
+    start: u64,
+    last_inclusive: u64,
+) -> Option<(Bytes, Bytes)> {
+    let start_key = key_codec.extent_key(inode, start);
+    let end_key = if last_inclusive < u64::MAX {
+        key_codec.extent_key(inode, last_inclusive + 1)
+    } else if inode < u64::MAX {
+        key_codec.extent_key(inode + 1, 0)
+    } else {
+        return None;
+    };
+    Some((start_key, end_key))
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -1024,6 +1104,37 @@ mod tests {
         );
         assert_eq!(store.segments.list_segments().await.unwrap().len(), 1);
         assert_eq!(store.read(1, 0, 1000).await.unwrap().as_ref(), &[1u8; 1000]);
+    }
+
+    #[tokio::test]
+    async fn verify_uses_inode_grouped_scans_not_per_frame_point_reads() {
+        let (store, db) = make().await;
+        let mut model = Vec::new();
+        for i in 0..16u64 {
+            write_and_check(
+                &store,
+                &db,
+                &mut model,
+                i * EXTENT_SIZE,
+                &[1u8; 1000],
+            )
+            .await;
+        }
+        store.seal_open().await.unwrap();
+        let seg = frameloc_of(&store, &db, 1, 0).await.unwrap().segid;
+        let scans_before = db.scan_call_count();
+        let verdict = store.verify_segment_reclaimable(seg).await;
+        assert!(
+            matches!(verdict, SegmentDeadVerdict::Keep),
+            "live extents must fail-closed keep the segment"
+        );
+        let scans = db.scan_call_count() - scans_before;
+        // One inode, one consecutive run: one Memory scan. scan_durable is not
+        // counted. This must not look like 16 (or 32) per-frame point reads.
+        assert_eq!(
+            scans, 1,
+            "verify must issue a bounded grouped scan, not a point-read per frame"
+        );
     }
 
     /// A transaction may append a frame before its FrameLoc/counter commit.
