@@ -7,35 +7,53 @@
 
 use crate::fs::ZeroFS;
 use crate::fs::errors::FsError;
-use crate::fs::mutation::config::ClientDurabilityTarget;
+use crate::fs::inode::InodeId;
+use crate::fs::mutation::durability::DurabilityTarget;
 
 impl ZeroFS {
     /// Barrier used by NFS COMMIT, 9P `Tfsync`/`Tfsyncdur`, and NBD FLUSH.
     ///
-    /// The resolved [`ClientDurabilityTarget`] is the only durability choice:
-    /// adapters must not hard-code SSD. Both targets currently share the
-    /// filesystem flush coordinator (SlateDB + optional local writeback hook).
-    /// Direct backends without writeback flush to the remote object store
-    /// through that coordinator.
+    /// Adapters convert the resolved client target with `.into()` and never
+    /// choose SSD or remote themselves.
     pub(crate) async fn wait_configured_durability(&self) -> Result<(), FsError> {
         if let Some(overlay) = self.volatile_overlay.get() {
             overlay.wait_all().await.map_err(|_| FsError::IoError)?;
         }
-        match self.write_ack.client_durability_target {
-            ClientDurabilityTarget::LocalSsd | ClientDurabilityTarget::RemoteBackend => {
-                self.client_fsync().await
-            }
-        }
+        self.durable_to_configured_target().await
     }
 
-    pub(crate) async fn wait_inode_durability(
-        &self,
-        id: crate::fs::inode::InodeId,
-    ) -> Result<(), FsError> {
+    pub(crate) async fn wait_inode_durability(&self, id: InodeId) -> Result<(), FsError> {
         if let Some(overlay) = self.volatile_overlay.get() {
             overlay.wait_inode(id).await.map_err(|_| FsError::IoError)?;
         }
-        self.client_fsync().await
+        self.durable_to_configured_target().await
+    }
+
+    /// FUA-style wait: cover every backing inode of one logical write, then
+    /// take the normalized durability target once.
+    pub(crate) async fn wait_inodes_durability(&self, ids: &[InodeId]) -> Result<(), FsError> {
+        if let Some(overlay) = self.volatile_overlay.get() {
+            for id in ids {
+                overlay
+                    .wait_inode(*id)
+                    .await
+                    .map_err(|_| FsError::IoError)?;
+            }
+        }
+        self.durable_to_configured_target().await
+    }
+
+    async fn durable_to_configured_target(&self) -> Result<(), FsError> {
+        if self.ignore_fsync {
+            return Ok(());
+        }
+        let cutoff = self.capture_mutation_cutoff();
+        let target = DurabilityTarget::from(self.write_ack.client_durability_target);
+        self.flush_coordinator
+            .durable_through(cutoff, target)
+            .await
+            .map(|_| ())
+            .map_err(FsError::from)
     }
 }
 

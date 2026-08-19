@@ -28,6 +28,7 @@ pub(crate) struct FilesystemVolatileOverlay {
     latest_attrs: Mutex<HashMap<u64, FileAttributes>>,
     frozen: AtomicBool,
     materializer_sequence: AtomicU64,
+    accepted_batches: AtomicU64,
     fs: Weak<ZeroFS>,
 }
 
@@ -40,6 +41,7 @@ impl FilesystemVolatileOverlay {
             latest_attrs: Mutex::new(HashMap::new()),
             frozen: AtomicBool::new(false),
             materializer_sequence: AtomicU64::new(0),
+            accepted_batches: AtomicU64::new(0),
             fs,
         })
     }
@@ -71,10 +73,10 @@ impl FilesystemVolatileOverlay {
     ) -> OverlayResult<()> {
         let mut batch = {
             let mut pending = self.pending.lock().expect("filesystem overlay poisoned");
-            pending
-                .get_mut(&inode)
-                .and_then(VecDeque::pop_front)
-                .ok_or(OverlayError::IoError)?
+            match pending.get_mut(&inode).and_then(VecDeque::pop_front) {
+                Some(batch) => batch,
+                None => return Ok(()),
+            }
         };
         let Some(fs) = self.fs.upgrade() else {
             return Err(OverlayError::IoError);
@@ -214,6 +216,7 @@ impl FilesystemVolatileOverlay {
             .await
         {
             Ok(sequence) => {
+                self.accepted_batches.fetch_add(1, Ordering::Relaxed);
                 // The write is now readable from the overlay. Release prepare
                 // locks so the next write on this inode can prepare.
                 let mut pending = self.pending.lock().expect("filesystem overlay poisoned");
@@ -235,6 +238,83 @@ impl FilesystemVolatileOverlay {
                 Err(error)
             }
         }
+    }
+
+    /// Publish every member of one logical write under a single pending batch.
+    /// Visibility is accepted per inode; canonical apply happens once.
+    pub(crate) async fn accept_batch(
+        self: &Arc<Self>,
+        admissions: Vec<VolatileAdmission>,
+        batch: PreparedWriteBatch,
+    ) -> OverlayResult<u64> {
+        if self.is_frozen() {
+            return Err(OverlayError::IoError);
+        }
+        if batch.members.is_empty() || admissions.len() != batch.members.len() {
+            return Err(OverlayError::InvalidArgument);
+        }
+        let first_id = batch.members[0].id;
+        let members: Vec<_> = batch
+            .members
+            .iter()
+            .map(|member| {
+                (
+                    member.id,
+                    member.offset,
+                    member.data.clone(),
+                    member.post_attrs.clone(),
+                )
+            })
+            .collect();
+        {
+            let mut pending = self.pending.lock().expect("filesystem overlay poisoned");
+            pending.entry(first_id).or_default().push_back(batch);
+        }
+        let mut sequence = 0;
+        for (admission, (id, offset, data, attrs)) in admissions.into_iter().zip(members) {
+            self.latest_attrs
+                .lock()
+                .expect("filesystem overlay poisoned")
+                .insert(id, attrs);
+            let groups = vec![vec![WriteChunk {
+                inode: id,
+                member_offset: offset,
+                logical_offset: 0,
+                length: data.len(),
+            }]];
+            match self
+                .runtime(id)
+                .accept_write(admission, offset, data, groups)
+                .await
+            {
+                Ok(accepted) => {
+                    sequence = accepted;
+                    let mut pending = self.pending.lock().expect("filesystem overlay poisoned");
+                    if let Some(queue) = pending.get_mut(&first_id) {
+                        for queued in queue.iter_mut() {
+                            queued.guards = None;
+                        }
+                    }
+                }
+                Err(error) => {
+                    let mut pending = self.pending.lock().expect("filesystem overlay poisoned");
+                    if let Some(queue) = pending.get_mut(&first_id) {
+                        queue.pop_back();
+                        if queue.is_empty() {
+                            pending.remove(&first_id);
+                        }
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        self.accepted_batches.fetch_add(1, Ordering::Relaxed);
+        Ok(sequence)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn accepted_batch_count(&self) -> u64 {
+        self.accepted_batches.load(Ordering::Relaxed)
     }
 
     pub(crate) async fn read(
@@ -324,6 +404,19 @@ impl ZeroFS {
         );
         let _ = self.materializer.set(materializer);
         let _ = self.mutation_coordinator.set(coordinator);
+        let fs = Arc::downgrade(self);
+        self.flush_coordinator
+            .set_materialize(std::sync::Arc::new(move |cutoff| {
+                let fs = fs.clone();
+                Box::pin(async move {
+                    let Some(fs) = fs.upgrade() else {
+                        return Err(crate::fs::mutation::durability::DurabilityError::Closed);
+                    };
+                    fs.materialize_through_cutoff(cutoff)
+                        .await
+                        .map_err(crate::fs::mutation::durability::DurabilityError::Materialization)
+                })
+            }));
     }
 
     pub(crate) fn volatile_budget(&self) -> Option<Arc<VolatileBudget>> {
@@ -371,6 +464,61 @@ impl ZeroFS {
     ) -> Result<FileAttributes, FsError> {
         self.write_ack_idempotent(auth, id, offset, data, [0u8; 16], true)
             .await
+    }
+
+    /// One prepared/accepted batch for a logical write that spans one or more
+    /// backing inodes (NBD striped WRITE).
+    pub(crate) async fn write_ack_batch(
+        &self,
+        auth: &AuthContext,
+        members: Vec<PrepareWriteMember>,
+    ) -> Result<FileAttributes, FsError> {
+        if members.is_empty() {
+            return Err(FsError::InvalidArgument);
+        }
+        if members.len() == 1 {
+            let member = &members[0];
+            return self
+                .write_ack(auth, member.id, member.offset, &member.data)
+                .await;
+        }
+        let request = PrepareWriteRequest {
+            members,
+            auth: auth.clone(),
+            op_id: [0u8; 16],
+            check_permissions: true,
+        };
+        let Some(overlay) = self.volatile_overlay.get().cloned() else {
+            let mut batch = prepare_write(&self.write_prepare_context(), request).await?;
+            let result = apply_prepared_batch(&self.write_apply_context(), &mut batch).await?;
+            return Ok(result.primary_attrs());
+        };
+        let mut admissions = Vec::with_capacity(request.members.len());
+        for member in &request.members {
+            admissions.push(
+                overlay
+                    .reserve(member.id, member.data.len())
+                    .await
+                    .map_err(overlay_fs_error)?,
+            );
+        }
+        let batch = prepare_write(&self.write_prepare_context(), request).await?;
+        let attrs = batch
+            .replayed
+            .as_ref()
+            .map(|result| result.primary_attrs())
+            .or_else(|| {
+                batch
+                    .members
+                    .first()
+                    .map(|member| member.post_attrs.clone())
+            })
+            .expect("prepared batch has attributes");
+        overlay
+            .accept_batch(admissions, batch)
+            .await
+            .map_err(overlay_fs_error)?;
+        Ok(attrs)
     }
 
     pub(crate) async fn write_ack_opened_idempotent(

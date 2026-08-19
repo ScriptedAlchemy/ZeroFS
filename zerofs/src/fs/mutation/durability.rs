@@ -115,6 +115,18 @@ impl DurabilityError {
     }
 }
 
+impl From<DurabilityError> for FsError {
+    fn from(error: DurabilityError) -> Self {
+        match error {
+            DurabilityError::StaleMutationIncarnation
+            | DurabilityError::StaleJournalIncarnation => FsError::StaleHandle,
+            DurabilityError::Closed => FsError::ShuttingDown,
+            DurabilityError::Materialization(error) => error,
+            DurabilityError::FilesystemFlush(_) | DurabilityError::Object(_) => FsError::IoError,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

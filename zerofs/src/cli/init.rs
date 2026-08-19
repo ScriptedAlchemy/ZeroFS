@@ -1136,9 +1136,10 @@ impl ReconciledDb {
             .context("Invalid filesystem write-acknowledgement configuration")?;
 
         if let Some(writeback) = writeback.clone() {
+            let barrier_store = writeback.clone();
             fs.flush_coordinator
                 .set_local_durability_barrier(Arc::new(move || {
-                    let writeback = writeback.clone();
+                    let writeback = barrier_store.clone();
                     Box::pin(async move {
                         writeback
                             .wait_local_through_accepted()
@@ -1149,6 +1150,33 @@ impl ReconciledDb {
                                 );
                                 crate::fs::errors::FsError::IoError
                             })
+                    })
+                }));
+            let captured = writeback.clone();
+            fs.flush_coordinator
+                .set_object_capture(std::sync::Arc::new(move || captured.object_coverage()));
+            let waited = writeback.clone();
+            fs.flush_coordinator
+                .set_object_wait(std::sync::Arc::new(move |coverage, target| {
+                    let writeback = waited.clone();
+                    Box::pin(async move {
+                        use crate::fs::mutation::durability::{
+                            DurabilityError, DurabilityTarget, ObjectCoverage,
+                        };
+                        match coverage {
+                            ObjectCoverage::DirectRemote => Ok(()),
+                            ObjectCoverage::Writeback {
+                                journal_incarnation,
+                                sequence,
+                            } => writeback
+                                .wait_coverage(
+                                    journal_incarnation.as_uuid(),
+                                    sequence,
+                                    matches!(target, DurabilityTarget::RemoteBackend),
+                                )
+                                .await
+                                .map_err(DurabilityError::Object),
+                        }
                     })
                 }));
         }
