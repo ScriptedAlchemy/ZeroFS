@@ -20,6 +20,7 @@ mod nbd;
 mod net_util;
 mod nfs;
 mod ninep;
+mod alloc_rss;
 mod object_store_prefetch;
 mod object_trace;
 mod parse_object_store;

@@ -10,6 +10,7 @@ pub mod length_checked_object_store;
 #[allow(dead_code)]
 mod linux_errno;
 pub mod metadata_digest;
+pub mod alloc_rss;
 pub mod object_store_prefetch;
 pub mod object_trace;
 pub mod replication;
