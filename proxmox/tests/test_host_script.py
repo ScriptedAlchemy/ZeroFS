@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -71,6 +72,55 @@ class HostScriptTests(unittest.TestCase):
             capture_output=True,
             check=False,
         )
+
+    def test_recover_accepts_an_interrupted_older_release_transaction(self) -> None:
+        source = HOST_SCRIPT.read_text()
+        functions = source[
+            source.index("control_host_transaction() {") : source.index(
+                "assert_server_drained() {"
+            )
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transaction = root / "deployment-transaction"
+            transaction.mkdir()
+            (transaction / "state.env").write_text(
+                "saved_had_ct=false\n"
+                "saved_had_running_ct=false\n"
+                "saved_prod_mount_was_active=false\n"
+                "saved_prod_smb_was_active=false\n"
+                "saved_prod_mount_was_enabled=false\n"
+                "saved_prod_smb_was_enabled=false\n"
+                "saved_release_id=older-release\n"
+            )
+            (transaction / "previous-release").write_text("\n")
+            (transaction / "phase").write_text("quiesced\n")
+            script = f"""set -euo pipefail
+dry_run=false
+action=recover
+deployment_transaction={transaction}
+state_root={root}
+release_id=new-release
+ctid=198
+ct_resource_snapshot=
+ct_resources_mutated=false
+previous_release=
+ct_exists() {{ return 1; }}
+ct_running() {{ return 1; }}
+restore_ct_resources() {{ return 0; }}
+pct() {{ :; }}
+{functions}
+control_host_transaction
+"""
+            result = subprocess.run(
+                ["bash", "-c", script],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(transaction.exists())
 
     def test_shell_assets_parse(self) -> None:
         for path in (

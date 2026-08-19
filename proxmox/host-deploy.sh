@@ -536,7 +536,6 @@ control_host_transaction() {
     sync -f "$state_root"
     return 0
   fi
-  action=rollback
   [[ -f $deployment_transaction/state.env && -f $deployment_transaction/previous-release && -f $deployment_transaction/phase ]] || {
     echo "incomplete deployment transaction: $deployment_transaction" >&2
     return 1
@@ -548,6 +547,7 @@ control_host_transaction() {
     echo "deployment transaction belongs to release $saved_release_id" >&2
     return 1
   fi
+  action=rollback
   previous_release=$(<"$deployment_transaction/previous-release")
   if ct_exists && ct_running; then
     pct stop "$ctid" --skiplock 1
