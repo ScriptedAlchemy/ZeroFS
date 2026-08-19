@@ -825,7 +825,9 @@ impl ExtentStore {
             nominations_dropped: nom_dropped,
             hot_seams: hot_pairs.len() as u64,
         });
-        crate::alloc_rss::purge_arenas();
+        if should_purge_after_reclaim(deleted, frames_relocated, crate::alloc_rss::over_rss_cap()) {
+            crate::alloc_rss::purge_arenas();
+        }
         Ok(PassOutcome {
             deleted,
             relocated: frames_relocated,
@@ -1127,6 +1129,10 @@ impl ExtentStore {
     }
 }
 
+fn should_purge_after_reclaim(deleted: usize, relocated: usize, over_rss_cap: bool) -> bool {
+    deleted > 0 || relocated > 0 || over_rss_cap
+}
+
 fn dir_entry_key(entry: &DirEntry) -> (InodeId, u64) {
     (entry.inode, entry.extent)
 }
@@ -1216,6 +1222,14 @@ mod tests {
     use slatedb::object_store::{ObjectStore, path::Path};
     use slatedb::{BlockTransformer, DbBuilder};
     use std::sync::Arc;
+
+    #[test]
+    fn arena_purge_is_reserved_for_reclaim_or_active_pressure() {
+        assert!(!should_purge_after_reclaim(0, 0, false));
+        assert!(should_purge_after_reclaim(1, 0, false));
+        assert!(should_purge_after_reclaim(0, 1, false));
+        assert!(should_purge_after_reclaim(0, 0, true));
+    }
 
     #[test]
     fn verify_page_accepts_exact_row_and_byte_boundaries() {
