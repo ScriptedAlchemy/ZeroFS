@@ -4,18 +4,19 @@ use crate::sftp_transport::{
     TransportSession,
 };
 use async_trait::async_trait;
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Bytes, BytesMut};
 use futures::{StreamExt, TryStreamExt};
-use russh::keys::{PrivateKeyWithHashAlg, load_secret_key};
-use russh::{ChannelMsg, client};
-use russh_sftp::client::rawsession::RawSftpSession;
+use russh::client;
+use russh::keys::{Algorithm, EcdsaCurve, HashAlg, PrivateKeyWithHashAlg, load_secret_key};
+use russh_sftp::client::rawsession::{Limits as SftpLimits, RawSftpSession};
 use russh_sftp::extensions::HardlinkExtension;
 use russh_sftp::protocol::{FileAttributes, OpenFlags, StatusCode};
 use std::borrow::Cow;
 use std::fmt;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::sync::CancellationToken;
@@ -34,7 +35,7 @@ pub const RUSSH_WINDOW_SIZE: u32 = 16 * 1024 * 1024;
 /// russh channel_buffer_size is an mpsc *message* depth, not bytes.
 /// 1024 slots covers a 16 MiB window of 256 KiB packets plus control messages.
 pub const RUSSH_CHANNEL_BUFFER_SIZE: usize = 1024;
-/// 256 KiB SSH packets. russh's default 32 KiB is the ACK-per-write trap's cousin.
+/// 256 KiB SSH packets.
 pub const RUSSH_MAXIMUM_PACKET_SIZE: u32 = 256 * 1024;
 /// russh-sftp 2.4 packet cap. Must match the SSH maximum packet size.
 pub const RUSSH_SFTP_MAX_PACKET_LEN: u32 = 256 * 1024;
@@ -45,7 +46,6 @@ const SFTP_WRITE_PACKET_SIZE: usize = 255 * 1024;
 const SFTP_READ_PACKET_SIZE: usize = 255 * 1024;
 const SFTP_WRITE_REQUEST_CONCURRENCY: usize = RUSSH_SFTP_MAX_CONCURRENT_WRITES;
 const SFTP_READ_REQUEST_CONCURRENCY: usize = RUSSH_SFTP_MAX_CONCURRENT_WRITES;
-const SFTP_SESSION_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
 const POSIX_RENAME: &str = "posix-rename@openssh.com";
 const FSYNC: &str = "fsync@openssh.com";
 const HARDLINK: &str = "hardlink@openssh.com";
@@ -64,12 +64,18 @@ struct PipelinedRead {
 fn plan_pipelined_writes(
     initial_offset: u64,
     chunks: Vec<Bytes>,
+    packet_size: usize,
 ) -> Result<Vec<PipelinedWrite>, TransportError> {
+    if packet_size == 0 {
+        return Err(TransportError::Operation(
+            "SFTP write packet size is zero".to_owned(),
+        ));
+    }
     let mut offset = initial_offset;
     let mut requests = Vec::new();
     for mut chunk in chunks {
         while !chunk.is_empty() {
-            let len = chunk.len().min(SFTP_WRITE_PACKET_SIZE);
+            let len = chunk.len().min(packet_size);
             let payload = chunk.split_to(len);
             requests.push(PipelinedWrite { offset, payload });
             offset = offset.checked_add(len as u64).ok_or_else(|| {
@@ -83,12 +89,18 @@ fn plan_pipelined_writes(
 fn plan_pipelined_reads(
     initial_offset: u64,
     len: usize,
+    packet_size: usize,
 ) -> Result<Vec<PipelinedRead>, TransportError> {
+    if packet_size == 0 {
+        return Err(TransportError::Operation(
+            "SFTP read packet size is zero".to_owned(),
+        ));
+    }
     let mut offset = initial_offset;
     let mut remaining = len;
-    let mut requests = Vec::with_capacity(len.div_ceil(SFTP_READ_PACKET_SIZE));
+    let mut requests = Vec::with_capacity(len.div_ceil(packet_size));
     while remaining != 0 {
-        let request_len = remaining.min(SFTP_READ_PACKET_SIZE);
+        let request_len = remaining.min(packet_size);
         requests.push(PipelinedRead {
             index: requests.len(),
             offset,
@@ -102,12 +114,55 @@ fn plan_pipelined_reads(
     Ok(requests)
 }
 
+fn transfer_request_len(
+    preferred: usize,
+    operation_limit: Option<u64>,
+    packet_limit: Option<u64>,
+    handle_len: usize,
+) -> Result<usize, TransportError> {
+    // Reserve 64 bytes of SFTP request framing besides the handle.
+    let framing = handle_len
+        .checked_add(64)
+        .ok_or_else(|| TransportError::Operation("SFTP handle length overflow".to_owned()))?;
+    let packet_payload = packet_limit.map(|limit| limit.saturating_sub(framing as u64));
+    let limit = [Some(preferred as u64), operation_limit, packet_payload]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(preferred as u64);
+    let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+    if limit == 0 {
+        return Err(TransportError::Operation(
+            "SFTP server negotiated a zero-byte transfer limit".to_owned(),
+        ));
+    }
+    Ok(limit)
+}
+
 pub fn russh_client_config() -> client::Config {
     client::Config {
         window_size: RUSSH_WINDOW_SIZE,
         maximum_packet_size: RUSSH_MAXIMUM_PACKET_SIZE,
         channel_buffer_size: RUSSH_CHANNEL_BUFFER_SIZE,
         preferred: russh::Preferred {
+            key: Cow::Borrowed(&[
+                Algorithm::Ed25519,
+                Algorithm::Ecdsa {
+                    curve: EcdsaCurve::NistP256,
+                },
+                Algorithm::Ecdsa {
+                    curve: EcdsaCurve::NistP384,
+                },
+                Algorithm::Ecdsa {
+                    curve: EcdsaCurve::NistP521,
+                },
+                Algorithm::Rsa {
+                    hash: Some(HashAlg::Sha512),
+                },
+                Algorithm::Rsa {
+                    hash: Some(HashAlg::Sha256),
+                },
+            ]),
             cipher: Cow::Borrowed(&[
                 russh::cipher::AES_256_GCM,
                 russh::cipher::AES_128_GCM,
@@ -117,9 +172,7 @@ pub fn russh_client_config() -> client::Config {
             ]),
             ..russh::Preferred::DEFAULT
         },
-        // The session pool owns idle lifetime. A russh inactivity timeout
-        // would murder warm connections sitting in the idle queue.
-        inactivity_timeout: None,
+        inactivity_timeout: None, // pool owns idle lifetime
         keepalive_interval: Some(Duration::from_secs(30)),
         keepalive_max: 3,
         nodelay: true,
@@ -247,10 +300,11 @@ impl client::Handler for StrictHostKey {
 pub struct RusshSessionFactory {
     endpoint: crate::config::SftpEndpoint,
     identity_file: PathBuf,
+    identity_key: Arc<russh::keys::PrivateKey>,
     known_hosts: PathBuf,
 }
 
-/// Historical name kept so object-store tests and call sites fold onto russh.
+/// Historical test-only name retained while existing integration tests move to russh.
 #[cfg(test)]
 #[allow(dead_code)]
 pub type OpenSshSessionFactory = RusshSessionFactory;
@@ -261,9 +315,53 @@ impl RusshSessionFactory {
         identity_file: PathBuf,
         known_hosts: PathBuf,
     ) -> Result<Self, TransportError> {
+        let identity_metadata = fs::metadata(&identity_file).map_err(|error| {
+            TransportError::Open(format!(
+                "[sftp] identity_file {} is unavailable: {error}",
+                identity_file.display()
+            ))
+        })?;
+        if !identity_metadata.is_file() {
+            return Err(TransportError::Open(format!(
+                "[sftp] identity_file {} is not a regular file",
+                identity_file.display()
+            )));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mode = identity_metadata.permissions().mode();
+            if mode & 0o077 != 0 {
+                return Err(TransportError::Open(format!(
+                    "[sftp] identity_file {} permissions are too open: {:04o}; expected 0600 or stricter",
+                    identity_file.display(),
+                    mode & 0o7777
+                )));
+            }
+        }
+        let identity_key = load_secret_key(&identity_file, None).map_err(|error| {
+            TransportError::Open(format!(
+                "[sftp] identity_file {} is not an unencrypted OpenSSH private key: {error}",
+                identity_file.display()
+            ))
+        })?;
+        let known_hosts_metadata = fs::metadata(&known_hosts).map_err(|error| {
+            TransportError::Open(format!(
+                "[sftp] known_hosts {} is unavailable: {error}",
+                known_hosts.display()
+            ))
+        })?;
+        if !known_hosts_metadata.is_file() {
+            return Err(TransportError::Open(format!(
+                "[sftp] known_hosts {} is not a regular file",
+                known_hosts.display()
+            )));
+        }
         Ok(Self {
             endpoint,
             identity_file,
+            identity_key: Arc::new(identity_key),
             known_hosts,
         })
     }
@@ -282,7 +380,32 @@ impl fmt::Debug for RusshSessionFactory {
     }
 }
 
-async fn handshake_sftp<S>(stream: S) -> Result<(RawSftpSession, SftpCapabilities), TransportError>
+async fn authenticate_identity(
+    handle: &mut client::Handle<StrictHostKey>,
+    username: &str,
+    identity_file: &Path,
+    identity_key: Arc<russh::keys::PrivateKey>,
+    hash: Option<HashAlg>,
+) -> Result<(), TransportError> {
+    let authenticated = handle
+        .authenticate_publickey(username, PrivateKeyWithHashAlg::new(identity_key, hash))
+        .await
+        .map_err(|error| {
+            TransportError::Open(format!("public-key authentication failed: {error}"))
+        })?;
+    if authenticated.success() {
+        Ok(())
+    } else {
+        Err(TransportError::Open(format!(
+            "public-key authentication rejected for {}",
+            identity_file.display()
+        )))
+    }
+}
+
+async fn handshake_sftp<S>(
+    stream: S,
+) -> Result<(RawSftpSession, SftpCapabilities, SftpLimits), TransportError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -291,11 +414,18 @@ where
         .init()
         .await
         .map_err(|error| TransportError::Open(format!("SFTP handshake failed: {error}")))?;
-    if has_extension(&version, russh_sftp::extensions::LIMITS) {
-        if let Ok(limits) = raw.limits().await {
-            raw.set_limits(russh_sftp::client::rawsession::Limits::from(limits));
+    let limits = if has_extension(&version, russh_sftp::extensions::LIMITS) {
+        match raw.limits().await {
+            Ok(limits) => SftpLimits::from(limits),
+            Err(error) => {
+                tracing::warn!(%error, "SFTP server advertised limits but the query failed");
+                SftpLimits::default()
+            }
         }
-    }
+    } else {
+        SftpLimits::default()
+    };
+    raw.set_limits(limits);
     Ok((
         raw,
         SftpCapabilities {
@@ -303,6 +433,7 @@ where
             hardlink: has_extension(&version, HARDLINK),
             posix_rename: has_extension(&version, POSIX_RENAME),
         },
+        limits,
     ))
 }
 
@@ -317,12 +448,6 @@ impl SessionFactory for RusshSessionFactory {
         }
 
         let connect = async {
-            let key = load_secret_key(&self.identity_file, None).map_err(|error| {
-                TransportError::Open(format!(
-                    "failed to load identity {}: {error}",
-                    self.identity_file.display()
-                ))
-            })?;
             let handler = StrictHostKey {
                 host: self.endpoint.host.clone(),
                 port: self.endpoint.port,
@@ -340,26 +465,25 @@ impl SessionFactory for RusshSessionFactory {
                     self.endpoint.host, self.endpoint.port
                 ))
             })?;
-            let hash = handle
-                .best_supported_rsa_hash()
-                .await
-                .map_err(|error| TransportError::Open(format!("RSA hash probe failed: {error}")))?
-                .flatten();
-            let authenticated = handle
-                .authenticate_publickey(
-                    self.endpoint.username.as_str(),
-                    PrivateKeyWithHashAlg::new(Arc::new(key), hash),
-                )
-                .await
-                .map_err(|error| {
-                    TransportError::Open(format!("public-key authentication failed: {error}"))
-                })?;
-            if !authenticated.success() {
-                return Err(TransportError::Open(format!(
-                    "public-key authentication rejected by {}:{}",
-                    self.endpoint.host, self.endpoint.port
-                )));
-            }
+            let hash = if self.identity_key.algorithm().is_rsa() {
+                handle
+                    .best_supported_rsa_hash()
+                    .await
+                    .map_err(|error| {
+                        TransportError::Open(format!("RSA hash probe failed: {error}"))
+                    })?
+                    .flatten()
+            } else {
+                None
+            };
+            authenticate_identity(
+                &mut handle,
+                self.endpoint.username.as_str(),
+                &self.identity_file,
+                self.identity_key.clone(),
+                hash,
+            )
+            .await?;
 
             let channel = handle.channel_open_session().await.map_err(|error| {
                 TransportError::Open(format!("failed to open SSH session channel: {error}"))
@@ -370,7 +494,7 @@ impl SessionFactory for RusshSessionFactory {
                 .map_err(|error| {
                     TransportError::Open(format!("failed to start SFTP subsystem: {error}"))
                 })?;
-            let (sftp, capabilities) = handshake_sftp(channel.into_stream()).await?;
+            let (sftp, capabilities, limits) = handshake_sftp(channel.into_stream()).await?;
             tracing::info!(
                 host = %self.endpoint.host,
                 port = self.endpoint.port,
@@ -386,7 +510,7 @@ impl SessionFactory for RusshSessionFactory {
                 handle: Some(handle),
                 sftp: Some(sftp),
                 capabilities,
-                scp_disabled: AtomicBool::new(false),
+                limits,
                 force: force.clone(),
             }) as Box<dyn TransportSession>)
         };
@@ -394,12 +518,6 @@ impl SessionFactory for RusshSessionFactory {
         tokio::select! {
             result = connect => result,
             _ = force.cancelled() => Err(TransportError::PoolClosed),
-            _ = tokio::time::sleep(SFTP_SESSION_OPEN_TIMEOUT) => Err(TransportError::Open(
-                format!(
-                    "russh SFTP open to {}:{} timed out",
-                    self.endpoint.host, self.endpoint.port
-                ),
-            )),
         }
     }
 }
@@ -408,11 +526,11 @@ pub struct RusshTransportSession {
     handle: Option<client::Handle<StrictHostKey>>,
     sftp: Option<RawSftpSession>,
     capabilities: SftpCapabilities,
-    scp_disabled: AtomicBool,
+    limits: SftpLimits,
     force: CancellationToken,
 }
 
-/// Historical name kept so local sftp-server tests fold onto russh-sftp.
+/// Historical test-only name retained while existing integration tests move to russh-sftp.
 #[cfg(test)]
 pub type OpenSshTransportSession = RusshTransportSession;
 
@@ -441,7 +559,7 @@ impl RusshTransportSession {
         W: AsyncWrite + Unpin + Send + 'static,
         R: AsyncRead + Unpin + Send + 'static,
     {
-        let (sftp, capabilities) = handshake_sftp(Duplex {
+        let (sftp, capabilities, limits) = handshake_sftp(Duplex {
             reader: stdout,
             writer: stdin,
         })
@@ -450,7 +568,7 @@ impl RusshTransportSession {
             handle: None,
             sftp: Some(sftp),
             capabilities,
-            scp_disabled: AtomicBool::new(true),
+            limits,
             force: CancellationToken::new(),
         })
     }
@@ -469,28 +587,6 @@ impl RusshTransportSession {
         create: bool,
         durable: bool,
     ) -> Result<(), TransportError> {
-        if create
-            && offset == 0
-            && self.handle.is_some()
-            && !self.scp_disabled.load(Ordering::Relaxed)
-        {
-            match self.write_file_via_scp(path, &chunks).await {
-                Ok(()) => {
-                    if durable {
-                        self.fsync_path(path).await?;
-                    }
-                    return Ok(());
-                }
-                Err(error) => {
-                    tracing::debug!(
-                        path = %path.display(),
-                        %error,
-                        "SCP bulk write unavailable; falling back to pipelined SFTP"
-                    );
-                    self.scp_disabled.store(true, Ordering::Relaxed);
-                }
-            }
-        }
         self.write_file_via_sftp(path, offset, chunks, create, durable)
             .await
     }
@@ -515,7 +611,7 @@ impl RusshTransportSession {
             .await
             .map_err(|error| map_sftp_error(path, error))?;
         let handle = opened.handle;
-        let result = write_handle_pipelined(sftp, &handle, path, offset, chunks).await;
+        let result = write_handle_pipelined(sftp, &handle, path, offset, chunks, self.limits).await;
         if durable && result.is_ok() {
             if let Err(error) = sftp.fsync(handle.as_str()).await {
                 let _ = sftp.close(handle.clone()).await;
@@ -527,156 +623,6 @@ impl RusshTransportSession {
             .await
             .map_err(|error| map_sftp_error(path, error));
         result.and(close.map(|_| ()))
-    }
-
-    async fn fsync_path(&self, path: &Path) -> Result<(), TransportError> {
-        let sftp = self.sftp()?;
-        let remote = sftp_path(path)?;
-        let opened = sftp
-            .open(remote, OpenFlags::WRITE, FileAttributes::default())
-            .await
-            .map_err(|error| map_sftp_error(path, error))?;
-        let handle = opened.handle;
-        let sync = sftp
-            .fsync(handle.as_str())
-            .await
-            .map_err(|error| map_sftp_error(path, error));
-        let close = sftp
-            .close(handle)
-            .await
-            .map_err(|error| map_sftp_error(path, error));
-        sync.and(close.map(|_| ()))
-    }
-
-    async fn write_file_via_scp(
-        &self,
-        path: &Path,
-        chunks: &[Bytes],
-    ) -> Result<(), TransportError> {
-        let handle = self
-            .handle
-            .as_ref()
-            .ok_or_else(|| TransportError::Operation("SCP requires a russh handle".to_owned()))?;
-        let remote = sftp_path(path)?;
-        let file_name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| {
-                TransportError::Operation(format!("SCP target {} has no file name", path.display()))
-            })?;
-        let size = chunks.iter().try_fold(0u64, |acc, chunk| {
-            acc.checked_add(chunk.len() as u64)
-                .ok_or_else(|| TransportError::Operation("SCP payload length overflow".to_owned()))
-        })?;
-        let command = scp_sink_command(&remote)?;
-        let mut channel = handle.channel_open_session().await.map_err(|error| {
-            TransportError::Operation(format!("failed to open SCP channel: {error}"))
-        })?;
-        channel
-            .exec(true, command.as_str())
-            .await
-            .map_err(|error| TransportError::Operation(format!("SCP exec failed: {error}")))?;
-        scp_expect_ok(&mut channel, path).await?;
-        let header = Bytes::from(format!("C0644 {size} {file_name}\n"));
-        channel.data_bytes(header).await.map_err(|error| {
-            TransportError::Operation(format!("SCP header send failed: {error}"))
-        })?;
-        scp_expect_ok(&mut channel, path).await?;
-        for chunk in chunks {
-            for piece in chunk.chunks(RUSSH_MAXIMUM_PACKET_SIZE as usize) {
-                channel.data_bytes(piece.to_vec()).await.map_err(|error| {
-                    TransportError::Operation(format!("SCP data send failed: {error}"))
-                })?;
-            }
-        }
-        channel
-            .data_bytes(Bytes::from_static(&[0]))
-            .await
-            .map_err(|error| {
-                TransportError::Operation(format!("SCP trailer send failed: {error}"))
-            })?;
-        scp_expect_ok(&mut channel, path).await?;
-        channel
-            .eof()
-            .await
-            .map_err(|error| TransportError::Operation(format!("SCP eof failed: {error}")))?;
-        channel
-            .close()
-            .await
-            .map_err(|error| TransportError::Operation(format!("SCP close failed: {error}")))?;
-        Ok(())
-    }
-}
-
-fn scp_sink_command(remote: &str) -> Result<String, TransportError> {
-    if remote
-        .as_bytes()
-        .iter()
-        .any(|byte| matches!(byte, 0 | b'\n' | b'\r'))
-    {
-        return Err(TransportError::Operation(
-            "SCP path contains a control character".to_owned(),
-        ));
-    }
-    Ok(format!("scp -t -- {}", shell_single_quote(remote)))
-}
-
-fn shell_single_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
-}
-
-async fn scp_expect_ok(
-    channel: &mut russh::Channel<client::Msg>,
-    path: &Path,
-) -> Result<(), TransportError> {
-    let mut pending = BytesMut::new();
-    loop {
-        match channel.wait().await {
-            Some(ChannelMsg::Data { ref data }) => {
-                pending.extend_from_slice(data);
-                if pending.is_empty() {
-                    continue;
-                }
-                match pending[0] {
-                    0 => {
-                        pending.advance(1);
-                        return Ok(());
-                    }
-                    1 | 2 => {
-                        let message = String::from_utf8_lossy(&pending[1..]).trim().to_owned();
-                        return Err(TransportError::Operation(format!(
-                            "SCP rejected {}: {message}",
-                            path.display()
-                        )));
-                    }
-                    _ => {
-                        return Err(TransportError::Operation(format!(
-                            "SCP produced an unexpected status for {}",
-                            path.display()
-                        )));
-                    }
-                }
-            }
-            Some(ChannelMsg::Failure) => {
-                return Err(TransportError::Operation(format!(
-                    "SCP exec rejected for {}",
-                    path.display()
-                )));
-            }
-            Some(ChannelMsg::ExitStatus { exit_status }) if exit_status != 0 => {
-                return Err(TransportError::Operation(format!(
-                    "SCP exited {exit_status} for {}",
-                    path.display()
-                )));
-            }
-            Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => {
-                return Err(TransportError::Operation(format!(
-                    "SCP channel closed before an ACK for {}",
-                    path.display()
-                )));
-            }
-            Some(ChannelMsg::Success) | Some(_) => {}
-        }
     }
 }
 
@@ -692,8 +638,15 @@ async fn write_handle_pipelined(
     path: &Path,
     offset: u64,
     chunks: Vec<Bytes>,
+    limits: SftpLimits,
 ) -> Result<(), TransportError> {
-    let requests = plan_pipelined_writes(offset, chunks)?;
+    let packet_size = transfer_request_len(
+        SFTP_WRITE_PACKET_SIZE,
+        limits.write_len,
+        limits.packet_len,
+        handle.len(),
+    )?;
+    let requests = plan_pipelined_writes(offset, chunks, packet_size)?;
     futures::stream::iter(requests)
         .map(|request| {
             let handle = handle.to_owned();
@@ -726,8 +679,15 @@ async fn read_handle_pipelined(
     path: &Path,
     offset: u64,
     len: usize,
+    limits: SftpLimits,
 ) -> Result<Bytes, TransportError> {
-    let requests = plan_pipelined_reads(offset, len)?;
+    let packet_size = transfer_request_len(
+        SFTP_READ_PACKET_SIZE,
+        limits.read_len,
+        limits.packet_len,
+        handle.len(),
+    )?;
+    let requests = plan_pipelined_reads(offset, len, packet_size)?;
     let mut buffer = BytesMut::zeroed(len);
     let mut reads = Vec::with_capacity(requests.len());
     for request in requests {
@@ -738,26 +698,33 @@ async fn read_handle_pipelined(
         .map(|(request, mut region)| {
             let handle = handle.to_owned();
             async move {
-                let data = sftp
-                    .read(handle, request.offset, request.len as u32)
-                    .await
-                    .map_err(|error| {
-                        TransportError::Operation(format!(
-                            "short read from {} at {}: {error}",
-                            path.display(),
-                            request.offset
-                        ))
+                let mut received = 0;
+                while received < request.len {
+                    let remaining = request.len - received;
+                    let offset = request.offset.checked_add(received as u64).ok_or_else(|| {
+                        TransportError::Operation("SFTP read offset overflow".to_owned())
                     })?;
-                if data.data.len() != request.len {
-                    return Err(TransportError::Operation(format!(
-                        "short read from {} at {}: got {} want {}",
-                        path.display(),
-                        request.offset,
-                        data.data.len(),
-                        request.len
-                    )));
+                    let data = sftp
+                        .read(handle.clone(), offset, remaining as u32)
+                        .await
+                        .map_err(|error| {
+                            TransportError::Operation(format!(
+                                "short read from {} at {}: {error}",
+                                path.display(),
+                                offset
+                            ))
+                        })?;
+                    let len = data.data.len();
+                    if len == 0 || len > remaining {
+                        return Err(TransportError::Operation(format!(
+                            "short read from {} at {}: got {len} bytes with {remaining} remaining",
+                            path.display(),
+                            offset
+                        )));
+                    }
+                    region[received..received + len].copy_from_slice(&data.data);
+                    received += len;
                 }
-                region.copy_from_slice(&data.data);
                 Ok::<_, TransportError>((request.index, region))
             }
         })
@@ -821,15 +788,16 @@ impl TransportSession for RusshTransportSession {
         };
         let speculative_payload = async {
             match &speculative_range {
-                Some((_, physical_start, len)) => {
-                    Some(read_handle_pipelined(sftp, &handle, path, *physical_start, *len).await)
-                }
+                Some((_, physical_start, len)) => Some(
+                    read_handle_pipelined(sftp, &handle, path, *physical_start, *len, self.limits)
+                        .await,
+                ),
                 None => None,
             }
         };
         let (metadata, encoded_header, speculative_payload) = tokio::join!(
             sftp.fstat(handle.as_str()),
-            read_handle_pipelined(sftp, &handle, path, 0, OBJECT_HEADER_LEN),
+            read_handle_pipelined(sftp, &handle, path, 0, OBJECT_HEADER_LEN, self.limits),
             speculative_payload,
         );
         let metadata = metadata.map_err(|error| map_sftp_error(path, error))?.attrs;
@@ -917,7 +885,8 @@ impl TransportSession for RusshTransportSession {
                     path.display()
                 ))
             })?;
-            match read_handle_pipelined(sftp, &handle, path, physical_start, len).await {
+            match read_handle_pipelined(sftp, &handle, path, physical_start, len, self.limits).await
+            {
                 Ok(payload) => payload,
                 Err(error) => {
                     let _ = sftp.close(handle.clone()).await;
@@ -1082,7 +1051,7 @@ impl TransportSession for RusshTransportSession {
             .await
             .map_err(|error| map_sftp_error(path, error))?;
         let handle = opened.handle;
-        let bytes = read_handle_pipelined(sftp, &handle, path, offset, len).await;
+        let bytes = read_handle_pipelined(sftp, &handle, path, offset, len, self.limits).await;
         let close = sftp
             .close(handle)
             .await
@@ -1138,16 +1107,28 @@ impl TransportSession for RusshTransportSession {
         if let Some(sftp) = self.sftp.take() {
             let _ = sftp.close_session();
         }
-        if let Some(handle) = self.handle.take() {
+        if let Some(mut handle) = self.handle.take() {
             let disconnect = handle.disconnect(russh::Disconnect::ByApplication, "", "");
-            tokio::select! {
+            let queued = tokio::select! {
                 result = disconnect => {
                     if let Err(error) = result {
                         tracing::warn!(%error, "russh disconnect failed after SFTP close");
                     }
+                    true
                 }
-                _ = force.cancelled() => {}
-                _ = self.force.cancelled() => {}
+                _ = force.cancelled() => false,
+                _ = self.force.cancelled() => false,
+            };
+            if queued {
+                tokio::select! {
+                    result = &mut handle => {
+                        if let Err(error) = result {
+                            tracing::warn!(%error, "russh connection task failed during close");
+                        }
+                    }
+                    _ = force.cancelled() => {}
+                    _ = self.force.cancelled() => {}
+                }
             }
         }
         Ok(())
@@ -1181,6 +1162,15 @@ QyNTUxOQAAACCRi+8XRj8Tq1Or1mR02iOEWRKCh7xRszil1JfMIs9RjwAAAJhxG/RDcRv0
 QwAAAAtzc2gtZWQyNTUxOQAAACCRi+8XRj8Tq1Or1mR02iOEWRKCh7xRszil1JfMIs9Rjw
 AAAEAB9KRIf/0YJRj8Atj1eLnGRkrHutd6JDXafNflsuUDDJGL7xdGPxOrU6vWZHTaI4RZ
 EoKHvFGzOKXUl8wiz1GPAAAAEXplcm9mcy1vdGhlci10ZXN0AQIDBA==
+-----END OPENSSH PRIVATE KEY-----
+"#;
+    const ENCRYPTED_KEY: &str = r#"-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAACmFlczI1Ni1jdHIAAAAGYmNyeXB0AAAAGAAAABBA6hrXpS
+LPoPaV7M7G9DtaAAAAGAAAAAEAAAAzAAAAC3NzaC1lZDI1NTE5AAAAIC3aUS9vD1G77q+1
+0WpfmDRbafRtG5Ry+YTGXiQynPOsAAAAoG12ZqxPoDsGoR9DwynbDlcIfoCqrOE13219I1
+bcxvi0nQxL+AqlsH6Ws1XeGzQJI43NujzRhKle1UUAIW5yIX9Hu5Nzjmc/L58QMyNVejCl
+qCqH6hiJAS8PQ2MVjb9TYJ9ujM5FIr0Goy2X3x+HX0oExG56xthfBD0pkUwXWdiD451TLR
+SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
 -----END OPENSSH PRIVATE KEY-----
 "#;
 
@@ -1223,6 +1213,14 @@ EoKHvFGzOKXUl8wiz1GPAAAAEXplcm9mcy1vdGhlci10ZXN0AQIDBA==
                     || cipher.as_ref() == "none"
                     || cipher.as_ref() == "clear")
         );
+        assert!(
+            !config.preferred.key.iter().any(|algorithm| matches!(
+                algorithm,
+                russh::keys::Algorithm::Dsa | russh::keys::Algorithm::Rsa { hash: None }
+            )),
+            "host-key negotiation must exclude DSA and SHA-1 ssh-rsa: {:?}",
+            config.preferred.key
+        );
     }
 
     #[test]
@@ -1232,28 +1230,14 @@ EoKHvFGzOKXUl8wiz1GPAAAAEXplcm9mcy1vdGhlci10ZXN0AQIDBA==
         assert_eq!(config.max_concurrent_writes, 64);
         assert_ne!(
             config.max_concurrent_writes,
-            russh_sftp::client::Config::default().max_concurrent_writes,
-            "must not preserve the leftover default of 8 (or 4)"
+            russh_sftp::client::Config::default().max_concurrent_writes
         );
-    }
-
-    #[test]
-    fn scp_sink_command_quotes_the_remote_path() {
-        assert_eq!(
-            scp_sink_command("/data/object.bin").unwrap(),
-            "scp -t -- '/data/object.bin'"
-        );
-        assert_eq!(
-            scp_sink_command("/data/o'bject.bin").unwrap(),
-            "scp -t -- '/data/o'\\''bject.bin'"
-        );
-        assert!(scp_sink_command("/data/bad\npath").is_err());
     }
 
     #[test]
     fn pipelined_write_plan_uses_255kib_packets_not_ack_per_byte() {
         let payload = Bytes::from(vec![0u8; SFTP_WRITE_PACKET_SIZE * 64 + 17]);
-        let plan = plan_pipelined_writes(0, vec![payload]).unwrap();
+        let plan = plan_pipelined_writes(0, vec![payload], SFTP_WRITE_PACKET_SIZE).unwrap();
         assert_eq!(plan.len(), 65);
         assert!(
             plan.iter()
@@ -1269,22 +1253,64 @@ EoKHvFGzOKXUl8wiz1GPAAAAEXplcm9mcy1vdGhlci10ZXN0AQIDBA==
 
     #[test]
     fn pipelined_read_plan_matches_the_write_window() {
-        let plan = plan_pipelined_reads(0, SFTP_READ_PACKET_SIZE * 3).unwrap();
+        let plan =
+            plan_pipelined_reads(0, SFTP_READ_PACKET_SIZE * 3, SFTP_READ_PACKET_SIZE).unwrap();
         assert_eq!(plan.len(), 3);
         assert_eq!(plan[2].offset, (SFTP_READ_PACKET_SIZE * 2) as u64);
         assert_eq!(SFTP_READ_REQUEST_CONCURRENCY, 64);
     }
 
     #[test]
+    fn negotiated_transfer_lengths_obey_every_server_limit() {
+        let limits = russh_sftp::client::rawsession::Limits {
+            packet_len: Some(64 * 1024),
+            read_len: Some(48 * 1024),
+            write_len: Some(32 * 1024),
+            open_handles: None,
+        };
+        let handle_len = 40;
+
+        let read_len = transfer_request_len(
+            SFTP_READ_PACKET_SIZE,
+            limits.read_len,
+            limits.packet_len,
+            handle_len,
+        )
+        .unwrap();
+        let write_len = transfer_request_len(
+            SFTP_WRITE_PACKET_SIZE,
+            limits.write_len,
+            limits.packet_len,
+            handle_len,
+        )
+        .unwrap();
+
+        assert!(read_len <= 48 * 1024);
+        assert!(write_len <= 32 * 1024);
+        assert!(read_len + handle_len + 64 <= 64 * 1024);
+        assert!(write_len + handle_len + 64 <= 64 * 1024);
+    }
+
+    #[test]
     fn factory_debug_redacts_the_username() {
+        let root = tempfile::tempdir().unwrap();
+        let identity = root.path().join("identity");
+        let known_hosts = root.path().join("known_hosts");
+        std::fs::write(&identity, CLIENT_KEY).unwrap();
+        std::fs::write(&known_hosts, "").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&identity, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
         let factory = RusshSessionFactory::new(
             crate::config::SftpEndpoint {
                 host: "storage.example.test".to_owned(),
                 port: 2222,
                 username: "account-secret-name".to_owned(),
             },
-            "/tmp/id-ed25519".into(),
-            "/tmp/known-hosts".into(),
+            identity,
+            known_hosts,
         )
         .unwrap();
         let debug = format!("{factory:?}");
@@ -1292,6 +1318,74 @@ EoKHvFGzOKXUl8wiz1GPAAAAEXplcm9mcy1vdGhlci10ZXN0AQIDBA==
         assert!(debug.contains("2222"));
         assert!(debug.contains("16777216"));
         assert!(!debug.contains("account-secret-name"));
+    }
+
+    #[test]
+    fn factory_rejects_a_missing_configured_identity_before_network_dial() {
+        let root = tempfile::tempdir().unwrap();
+        let known_hosts = root.path().join("known_hosts");
+        std::fs::write(&known_hosts, "").unwrap();
+        let error = RusshSessionFactory::new(
+            crate::config::SftpEndpoint {
+                host: "127.0.0.1".to_owned(),
+                port: 1,
+                username: "zerofs".to_owned(),
+            },
+            root.path().join("missing-identity"),
+            known_hosts,
+        )
+        .expect_err("a missing configured identity must fail before network startup");
+
+        assert!(error.to_string().contains("identity_file"));
+    }
+
+    #[test]
+    fn factory_rejects_missing_known_hosts_before_network_dial() {
+        let root = tempfile::tempdir().unwrap();
+        let identity = root.path().join("identity");
+        std::fs::write(&identity, CLIENT_KEY).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&identity, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let error = RusshSessionFactory::new(
+            crate::config::SftpEndpoint {
+                host: "127.0.0.1".to_owned(),
+                port: 1,
+                username: "zerofs".to_owned(),
+            },
+            identity,
+            root.path().join("missing-known-hosts"),
+        )
+        .expect_err("missing known_hosts must fail before network startup");
+
+        assert!(error.to_string().contains("known_hosts"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn factory_rejects_a_group_readable_private_key() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let identity = root.path().join("identity");
+        let known_hosts = root.path().join("known_hosts");
+        std::fs::write(&identity, CLIENT_KEY).unwrap();
+        std::fs::write(&known_hosts, "").unwrap();
+        std::fs::set_permissions(&identity, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let error = RusshSessionFactory::new(
+            crate::config::SftpEndpoint {
+                host: "127.0.0.1".to_owned(),
+                port: 1,
+                username: "zerofs".to_owned(),
+            },
+            identity,
+            known_hosts,
+        )
+        .expect_err("group-readable private keys must fail closed");
+
+        assert!(error.to_string().contains("permissions"));
     }
 
     #[tokio::test]
@@ -1384,14 +1478,16 @@ EoKHvFGzOKXUl8wiz1GPAAAAEXplcm9mcy1vdGhlci10ZXN0AQIDBA==
             .write_file_durable(std::path::Path::new("bulk.bin"), vec![payload.clone()])
             .await
             .unwrap();
+        assert_eq!(
+            env.exec_requests.load(Ordering::SeqCst),
+            0,
+            "production writes must remain entirely within the SFTP namespace"
+        );
         let elapsed = started.elapsed();
         let peak = CLIENT_WRITE_PEAK.load(Ordering::SeqCst);
         assert!(
             peak >= 16,
             "client must pipeline WRITE requests; peak in-flight={peak} elapsed={elapsed:?}"
-        );
-        eprintln!(
-            "russh client WRITE pipeline: peak_in_flight={peak} packets={packets} elapsed={elapsed:?}"
         );
         let read = session
             .read_exact(std::path::Path::new("bulk.bin"), 0, payload.len())
@@ -1426,10 +1522,78 @@ EoKHvFGzOKXUl8wiz1GPAAAAEXplcm9mcy1vdGhlci10ZXN0AQIDBA==
                 && entry.kind == crate::sftp_transport::RemoteEntryKind::File
         }));
         session.close(CancellationToken::new()).await.unwrap();
-        eprintln!(
-            "russh loopback pipelined write: peak_in_flight={peak} elapsed={elapsed:?} bytes={}",
-            payload.len()
-        );
+    }
+
+    #[tokio::test]
+    async fn russh_loopback_reassembles_short_sftp_read_replies() {
+        let env = Loopback::start_with_read_cap(Some(32 * 1024)).await;
+        let factory = RusshSessionFactory::new(
+            env.endpoint.clone(),
+            env.identity.clone(),
+            env.known_hosts.clone(),
+        )
+        .unwrap();
+        let mut session = factory.open(CancellationToken::new()).await.unwrap();
+        let payload = Bytes::from(vec![0xa5; SFTP_READ_PACKET_SIZE + 17]);
+
+        session
+            .write_file_durable(
+                std::path::Path::new("short-read.bin"),
+                vec![payload.clone()],
+            )
+            .await
+            .unwrap();
+        let read = session
+            .read_exact(std::path::Path::new("short-read.bin"), 0, payload.len())
+            .await
+            .unwrap();
+
+        assert_eq!(read, payload);
+        session.close(CancellationToken::new()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn russh_close_waits_for_the_ssh_connection_to_terminate() {
+        let env = Loopback::start().await;
+        let factory = RusshSessionFactory::new(
+            env.endpoint.clone(),
+            env.identity.clone(),
+            env.known_hosts.clone(),
+        )
+        .unwrap();
+        let session = factory.open(CancellationToken::new()).await.unwrap();
+        assert_eq!(env.active_connections.load(Ordering::SeqCst), 1);
+
+        session.close(CancellationToken::new()).await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while env.active_connections.load(Ordering::SeqCst) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the remote SSH handler must terminate after close returns");
+    }
+
+    #[tokio::test]
+    async fn russh_factory_rejects_an_encrypted_identity_without_a_passphrase() {
+        let env = Loopback::start().await;
+        std::fs::write(&env.identity, ENCRYPTED_KEY.as_bytes()).unwrap();
+        let error = RusshSessionFactory::new(
+            env.endpoint.clone(),
+            env.identity.clone(),
+            env.known_hosts.clone(),
+        )
+        .expect_err("encrypted identities must fail before network startup");
+        match error {
+            TransportError::Open(message) => {
+                assert!(
+                    message.contains("identity_file"),
+                    "failure must name the invalid configured identity: {message}"
+                );
+            }
+            other => panic!("expected Open error, got {other:?}"),
+        }
     }
 
     struct Loopback {
@@ -1439,10 +1603,20 @@ EoKHvFGzOKXUl8wiz1GPAAAAEXplcm9mcy1vdGhlci10ZXN0AQIDBA==
         known_hosts: PathBuf,
         _inflight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         _peak: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        exec_requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        active_connections: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl Loopback {
         async fn start() -> Self {
+            Self::start_with(None).await
+        }
+
+        async fn start_with_read_cap(read_cap: Option<usize>) -> Self {
+            Self::start_with(read_cap).await
+        }
+
+        async fn start_with(read_cap: Option<usize>) -> Self {
             use russh::server::{Auth, Msg, Server, Session};
             use russh::{Channel, ChannelId};
             use std::net::SocketAddr;
@@ -1456,6 +1630,12 @@ EoKHvFGzOKXUl8wiz1GPAAAAEXplcm9mcy1vdGhlci10ZXN0AQIDBA==
 
             let client_key = russh::keys::PrivateKey::from_openssh(CLIENT_KEY).unwrap();
             std::fs::write(&identity, CLIENT_KEY.as_bytes()).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&identity, std::fs::Permissions::from_mode(0o600))
+                    .unwrap();
+            }
             let client_public = client_key.public_key().clone();
 
             let server_key = russh::keys::PrivateKey::from_openssh(SERVER_KEY).unwrap();
@@ -1463,6 +1643,8 @@ EoKHvFGzOKXUl8wiz1GPAAAAEXplcm9mcy1vdGhlci10ZXN0AQIDBA==
 
             let inflight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let peak = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let exec_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let active_connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
@@ -1499,8 +1681,11 @@ EoKHvFGzOKXUl8wiz1GPAAAAEXplcm9mcy1vdGhlci10ZXN0AQIDBA==
             struct ServerState {
                 fs_root: PathBuf,
                 client_public: russh::keys::PublicKey,
+                read_cap: Option<usize>,
                 inflight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
                 peak: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+                exec_requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+                active_connections: std::sync::Arc<std::sync::atomic::AtomicUsize>,
             }
 
             struct SshSession {
@@ -1513,12 +1698,19 @@ EoKHvFGzOKXUl8wiz1GPAAAAEXplcm9mcy1vdGhlci10ZXN0AQIDBA==
             impl russh::server::Server for ServerState {
                 type Handler = SshSession;
                 fn new_client(&mut self, _: Option<SocketAddr>) -> Self::Handler {
+                    self.active_connections.fetch_add(1, Ordering::SeqCst);
                     SshSession {
                         state: self.clone(),
                         channels: std::sync::Arc::new(tokio::sync::Mutex::new(
                             std::collections::HashMap::new(),
                         )),
                     }
+                }
+            }
+
+            impl Drop for SshSession {
+                fn drop(&mut self) {
+                    self.state.active_connections.fetch_sub(1, Ordering::SeqCst);
                 }
             }
 
@@ -1571,6 +1763,7 @@ EoKHvFGzOKXUl8wiz1GPAAAAEXplcm9mcy1vdGhlci10ZXN0AQIDBA==
                     session.channel_success(channel_id)?;
                     let sftp = FsSftp {
                         root: self.state.fs_root.clone(),
+                        read_cap: self.state.read_cap,
                         files: std::collections::HashMap::new(),
                         dirs: std::collections::HashMap::new(),
                         next: 1,
@@ -1589,9 +1782,7 @@ EoKHvFGzOKXUl8wiz1GPAAAAEXplcm9mcy1vdGhlci10ZXN0AQIDBA==
                     _data: &[u8],
                     session: &mut Session,
                 ) -> Result<(), Self::Error> {
-                    // Loopback has no scp(1). Fail fast so durable writes
-                    // measure the pipelined SFTP path instead of hanging
-                    // on a want-reply exec.
+                    self.state.exec_requests.fetch_add(1, Ordering::SeqCst);
                     session.channel_failure(channel_id)?;
                     Ok(())
                 }
@@ -1600,8 +1791,11 @@ EoKHvFGzOKXUl8wiz1GPAAAAEXplcm9mcy1vdGhlci10ZXN0AQIDBA==
             let mut server = ServerState {
                 fs_root: fs_root.clone(),
                 client_public,
+                read_cap,
                 inflight: inflight.clone(),
                 peak: peak.clone(),
+                exec_requests: exec_requests.clone(),
+                active_connections: active_connections.clone(),
             };
             tokio::spawn(async move {
                 loop {
@@ -1632,6 +1826,8 @@ EoKHvFGzOKXUl8wiz1GPAAAAEXplcm9mcy1vdGhlci10ZXN0AQIDBA==
                 known_hosts,
                 _inflight: inflight,
                 _peak: peak,
+                exec_requests,
+                active_connections,
             }
         }
     }
@@ -1642,6 +1838,7 @@ EoKHvFGzOKXUl8wiz1GPAAAAEXplcm9mcy1vdGhlci10ZXN0AQIDBA==
 
     struct FsSftp {
         root: PathBuf,
+        read_cap: Option<usize>,
         files: std::collections::HashMap<String, Opened>,
         dirs: std::collections::HashMap<String, std::vec::IntoIter<std::fs::DirEntry>>,
         next: u64,
@@ -1761,7 +1958,8 @@ EoKHvFGzOKXUl8wiz1GPAAAAEXplcm9mcy1vdGhlci10ZXN0AQIDBA==
             let mut file = std::fs::File::open(path).map_err(|_| StatusCode::Failure)?;
             file.seek(SeekFrom::Start(offset))
                 .map_err(|_| StatusCode::Failure)?;
-            let mut buf = vec![0; len as usize];
+            let requested = usize::try_from(len).map_err(|_| StatusCode::Failure)?;
+            let mut buf = vec![0; self.read_cap.map_or(requested, |cap| requested.min(cap))];
             let n = file.read(&mut buf).map_err(|_| StatusCode::Failure)?;
             buf.truncate(n);
             Ok(russh_sftp::protocol::Data { id, data: buf })
