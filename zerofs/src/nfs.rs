@@ -126,6 +126,14 @@ impl NFSAdapter {
     }
 
     async fn commit_current_cutoff(&self, fileid: fileid3) -> Result<writeverf3, nfsstat3> {
+        if self.fs.ignore_fsync {
+            tracing::error!(
+                fileid,
+                "rejecting NFS COMMIT because ignore_fsync disables durability barriers"
+            );
+            return Err(nfsstat3::NFS3ERR_NOTSUPP);
+        }
+
         let cutoff = self.fs.capture_mutation_cutoff();
         match self.fs.wait_mutation_durability(cutoff).await {
             Ok(()) => {
@@ -260,6 +268,9 @@ impl NFSFileSystem for NFSAdapter {
 
         let committed = match context.requested_stability {
             stable_how::UNSTABLE => stable_how::UNSTABLE,
+            stable_how::DATA_SYNC | stable_how::FILE_SYNC if self.fs.ignore_fsync => {
+                stable_how::UNSTABLE
+            }
             stable_how::DATA_SYNC | stable_how::FILE_SYNC => {
                 self.fs.wait_mutation_durability(receipt.cutoff).await?;
                 stable_how::FILE_SYNC
@@ -636,6 +647,12 @@ pub(crate) async fn start_nfs_server_with_service_identity(
     shared_identity: Option<NfsSharedIdentity>,
     service_identity: NfsServiceIdentity,
 ) -> anyhow::Result<()> {
+    if filesystem.ignore_fsync {
+        anyhow::bail!(
+            "NFS cannot start with filesystem.ignore_fsync=true because stable WRITE and COMMIT require functional durability barriers"
+        );
+    }
+
     let adapter = NFSAdapter::with_service_identity(filesystem, service_identity)
         .with_shared_identity(shared_identity);
     let listener = NFSTcpListener::bind(socket, adapter)
