@@ -1,3 +1,7 @@
+use crate::fs::mutation::config::{
+    FilesystemWriteAckMode, FilesystemWriteAckRequest, FilesystemWriteAckSettings,
+    NBD_MAX_WRITE_BYTES, NFS_MAX_WRITE_BYTES, NINEP_MAX_WRITE_BYTES, WEBUI_MAX_WRITE_BYTES,
+};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de, ser::SerializeStruct};
 use std::collections::HashSet;
@@ -657,6 +661,20 @@ pub struct FilesystemConfig {
     /// lost if both nodes (or a standalone node) die before a background flush.
     #[serde(default)]
     pub ignore_fsync: bool,
+    /// Point at which an ordinary write on any protocol is acknowledged.
+    /// Omission selects `materialized`. `volatile_memory` is intentionally
+    /// unsafe across process or power loss: explicit flush barriers remain
+    /// the durability boundary. Supersedes the deprecated
+    /// `[servers.nbd] write_ack_mode`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub(crate) write_ack_mode: Option<FilesystemWriteAckMode>,
+    /// Global RAM ceiling for volatile writes, shared by every protocol.
+    /// Required (finite, positive) when `write_ack_mode = "volatile_memory"`.
+    #[serde(default)]
+    pub(crate) volatile_memory_gb: f64,
+    /// In-flight volatile operation cap; omission selects the default.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub(crate) volatile_max_operations: Option<usize>,
 }
 
 impl FilesystemConfig {
@@ -1563,6 +1581,52 @@ impl Settings {
             access_mode,
             self.replication.is_some(),
         )
+    }
+
+    /// Resolve the shared write-acknowledgement contract once, merging the
+    /// authoritative `[filesystem]` form with the deprecated `[servers.nbd]`
+    /// volatile fields. Every protocol adapter consumes the result.
+    pub(crate) fn filesystem_write_ack_settings(
+        &self,
+        access_mode: crate::writeback::config::WritebackAccessMode,
+    ) -> Result<FilesystemWriteAckSettings> {
+        let filesystem = self.filesystem.as_ref();
+        let nbd = self.servers.nbd.as_ref();
+        FilesystemWriteAckRequest {
+            configured_mode: filesystem.and_then(|fs| fs.write_ack_mode),
+            volatile_memory_gb: filesystem.map_or(0.0, |fs| fs.volatile_memory_gb),
+            volatile_max_operations: filesystem.and_then(|fs| fs.volatile_max_operations),
+            legacy_nbd_volatile: nbd
+                .is_some_and(|nbd| nbd.write_ack_mode == NbdWriteAckMode::VolatileMemory),
+            legacy_nbd_volatile_memory_gb: nbd.map_or(0.0, |nbd| nbd.volatile_memory_gb),
+            writeback_enabled: self
+                .writeback
+                .as_ref()
+                .is_some_and(|writeback| writeback.enabled),
+            replication_enabled: self.replication.is_some(),
+            ignore_fsync: filesystem.is_some_and(|fs| fs.ignore_fsync),
+            read_write_server: access_mode
+                == crate::writeback::config::WritebackAccessMode::ReadWrite,
+            largest_enabled_protocol_write: self.largest_enabled_protocol_write(),
+        }
+        .resolve()
+    }
+
+    /// Largest maximum write among the enabled write protocols, as
+    /// `(protocol name, bytes)`. The volatile RAM budget must hold at least
+    /// one such write or admission could deadlock on a single request.
+    fn largest_enabled_protocol_write(&self) -> Option<(&'static str, u64)> {
+        let servers = &self.servers;
+        [
+            ("NBD", servers.nbd.is_some(), NBD_MAX_WRITE_BYTES),
+            ("9P", servers.ninep.is_some(), NINEP_MAX_WRITE_BYTES),
+            ("WebUI", servers.webui.is_some(), WEBUI_MAX_WRITE_BYTES),
+            ("NFS", servers.nfs.is_some(), NFS_MAX_WRITE_BYTES),
+        ]
+        .into_iter()
+        .filter(|(_, enabled, _)| *enabled)
+        .map(|(name, _, bytes)| (name, bytes))
+        .max_by_key(|(_, bytes)| *bytes)
     }
 
     /// Data-plane tuning for the configured backend. SFTP publishes its own
@@ -3629,5 +3693,481 @@ addresses = ["${ZEROFS_TEST_BAD_ADDR}"]
                 .unwrap()
                 .contains(&"127.0.0.1:2049".parse().unwrap())
         );
+    }
+
+    use crate::fs::mutation::config::{
+        ClientDurabilityTarget, DEFAULT_VOLATILE_MAX_OPERATIONS, FilesystemWriteAckMode,
+        FilesystemWriteAckSource, MAX_VOLATILE_MAX_OPERATIONS,
+    };
+    use crate::writeback::config::WritebackAccessMode;
+
+    /// Parse without running `Settings::validate`, so the resolver's own
+    /// diagnostics are observable even where an unrelated cross-section rule
+    /// (the legacy NBD exclusivity rule, writeback/ignore_fsync) fires first
+    /// during `from_file`.
+    fn parse_settings(sections: &str) -> Settings {
+        toml::from_str(&format!(
+            r#"
+[cache]
+dir = "/tmp/cache"
+disk_size_gb = 1.0
+
+[storage]
+url = "file:///tmp/data"
+encryption_password = "test"
+
+[servers]
+
+{sections}
+"#
+        ))
+        .unwrap()
+    }
+
+    const ENABLED_WRITEBACK: &str = r#"
+[writeback]
+enabled = true
+dir = "/var/cache/zerofs-writeback"
+memory_size_gb = 16.0
+disk_size_gb = 512.0
+min_free_gb = 256.0
+"#;
+
+    fn resolve_write_ack(
+        sections: &str,
+    ) -> Result<crate::fs::mutation::config::FilesystemWriteAckSettings> {
+        parse_settings(sections).filesystem_write_ack_settings(WritebackAccessMode::ReadWrite)
+    }
+
+    #[test]
+    fn filesystem_write_ack_defaults_to_materialized_when_omitted() {
+        let ack = resolve_write_ack(
+            r#"[servers.nfs]
+addresses = ["127.0.0.1:2049"]"#,
+        )
+        .unwrap();
+
+        assert_eq!(ack.mode, FilesystemWriteAckMode::Materialized);
+        assert_eq!(ack.source, FilesystemWriteAckSource::DefaultMaterialized);
+        assert_eq!(ack.volatile_memory_bytes, 0);
+        assert_eq!(ack.volatile_max_operations, DEFAULT_VOLATILE_MAX_OPERATIONS);
+        assert_eq!(
+            ack.client_durability_target,
+            ClientDurabilityTarget::RemoteBackend
+        );
+    }
+
+    #[test]
+    fn filesystem_write_ack_explicit_materialized_reports_filesystem_source() {
+        let ack = resolve_write_ack(
+            r#"[servers.nfs]
+addresses = ["127.0.0.1:2049"]
+
+[filesystem]
+write_ack_mode = "materialized""#,
+        )
+        .unwrap();
+
+        assert_eq!(ack.mode, FilesystemWriteAckMode::Materialized);
+        assert_eq!(ack.source, FilesystemWriteAckSource::Filesystem);
+        assert_eq!(
+            ack.client_durability_target,
+            ClientDurabilityTarget::RemoteBackend
+        );
+    }
+
+    #[test]
+    fn filesystem_write_ack_materialized_with_writeback_targets_local_ssd() {
+        let ack = resolve_write_ack(&format!(
+            r#"[servers.nfs]
+addresses = ["127.0.0.1:2049"]
+{ENABLED_WRITEBACK}"#
+        ))
+        .unwrap();
+
+        assert_eq!(ack.mode, FilesystemWriteAckMode::Materialized);
+        assert_eq!(
+            ack.client_durability_target,
+            ClientDurabilityTarget::LocalSsd
+        );
+    }
+
+    #[test]
+    fn filesystem_write_ack_explicit_volatile_normalizes_budget() {
+        let ack = resolve_write_ack(&format!(
+            r#"[servers.nfs]
+addresses = ["127.0.0.1:2049"]
+
+[filesystem]
+write_ack_mode = "volatile_memory"
+volatile_memory_gb = 2.0
+{ENABLED_WRITEBACK}"#
+        ))
+        .unwrap();
+
+        assert_eq!(ack.mode, FilesystemWriteAckMode::VolatileMemory);
+        assert_eq!(ack.source, FilesystemWriteAckSource::Filesystem);
+        assert_eq!(ack.volatile_memory_bytes, 2_000_000_000);
+        assert_eq!(ack.volatile_max_operations, DEFAULT_VOLATILE_MAX_OPERATIONS);
+        assert_eq!(
+            ack.client_durability_target,
+            ClientDurabilityTarget::LocalSsd
+        );
+    }
+
+    #[test]
+    fn filesystem_write_ack_volatile_op_cap_is_positive_and_bounded() {
+        let explicit = resolve_write_ack(&format!(
+            r#"[servers.nfs]
+addresses = ["127.0.0.1:2049"]
+
+[filesystem]
+write_ack_mode = "volatile_memory"
+volatile_memory_gb = 2.0
+volatile_max_operations = 1024
+{ENABLED_WRITEBACK}"#
+        ))
+        .unwrap();
+        assert_eq!(explicit.volatile_max_operations, 1024);
+
+        for invalid in [0usize, MAX_VOLATILE_MAX_OPERATIONS + 1] {
+            let error = resolve_write_ack(&format!(
+                r#"[servers.nfs]
+addresses = ["127.0.0.1:2049"]
+
+[filesystem]
+write_ack_mode = "volatile_memory"
+volatile_memory_gb = 2.0
+volatile_max_operations = {invalid}
+{ENABLED_WRITEBACK}"#
+            ))
+            .unwrap_err();
+            assert!(
+                format!("{error:#}").contains("volatile_max_operations"),
+                "unexpected error for {invalid}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn filesystem_write_ack_legacy_nbd_only_normalizes_to_shared_volatile() {
+        let ack = resolve_write_ack(&format!(
+            r#"[servers.nbd]
+addresses = ["127.0.0.1:10809"]
+write_ack_mode = "volatile_memory"
+volatile_memory_gb = 2.0
+{ENABLED_WRITEBACK}"#
+        ))
+        .unwrap();
+
+        assert_eq!(ack.mode, FilesystemWriteAckMode::VolatileMemory);
+        assert_eq!(ack.source, FilesystemWriteAckSource::LegacyNbd);
+        assert_eq!(ack.volatile_memory_bytes, 2_000_000_000);
+        assert_eq!(
+            ack.client_durability_target,
+            ClientDurabilityTarget::LocalSsd
+        );
+    }
+
+    #[test]
+    fn filesystem_write_ack_matching_dual_forms_normalize_once() {
+        let ack = resolve_write_ack(&format!(
+            r#"[servers.nbd]
+addresses = ["127.0.0.1:10809"]
+write_ack_mode = "volatile_memory"
+volatile_memory_gb = 2.0
+
+[filesystem]
+write_ack_mode = "volatile_memory"
+volatile_memory_gb = 2.0
+{ENABLED_WRITEBACK}"#
+        ))
+        .unwrap();
+
+        assert_eq!(ack.mode, FilesystemWriteAckMode::VolatileMemory);
+        assert_eq!(
+            ack.source,
+            FilesystemWriteAckSource::MatchingFilesystemAndLegacyNbd
+        );
+        assert_eq!(ack.volatile_memory_bytes, 2_000_000_000);
+    }
+
+    #[test]
+    fn filesystem_write_ack_conflicting_dual_budgets_fail() {
+        let error = resolve_write_ack(&format!(
+            r#"[servers.nbd]
+addresses = ["127.0.0.1:10809"]
+write_ack_mode = "volatile_memory"
+volatile_memory_gb = 1.0
+
+[filesystem]
+write_ack_mode = "volatile_memory"
+volatile_memory_gb = 2.0
+{ENABLED_WRITEBACK}"#
+        ))
+        .unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("must agree exactly"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn filesystem_write_ack_conflicting_dual_modes_fail() {
+        let error = resolve_write_ack(&format!(
+            r#"[servers.nbd]
+addresses = ["127.0.0.1:10809"]
+write_ack_mode = "volatile_memory"
+volatile_memory_gb = 2.0
+
+[filesystem]
+write_ack_mode = "materialized"
+{ENABLED_WRITEBACK}"#
+        ))
+        .unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("conflicts"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn filesystem_write_ack_legacy_materialized_defers_to_explicit_setting() {
+        // A legacy NBD section left at its materialized default must not
+        // veto (or dilute the source of) an explicitly configured shared
+        // setting.
+        let ack = resolve_write_ack(&format!(
+            r#"[servers.nbd]
+addresses = ["127.0.0.1:10809"]
+
+[filesystem]
+write_ack_mode = "volatile_memory"
+volatile_memory_gb = 2.0
+{ENABLED_WRITEBACK}"#
+        ))
+        .unwrap();
+
+        assert_eq!(ack.mode, FilesystemWriteAckMode::VolatileMemory);
+        assert_eq!(ack.source, FilesystemWriteAckSource::Filesystem);
+    }
+
+    #[test]
+    fn filesystem_write_ack_rejects_invalid_budgets() {
+        for budget in ["0.0", "-1.0", "inf", "nan"] {
+            let error = resolve_write_ack(&format!(
+                r#"[servers.nfs]
+addresses = ["127.0.0.1:2049"]
+
+[filesystem]
+write_ack_mode = "volatile_memory"
+volatile_memory_gb = {budget}
+{ENABLED_WRITEBACK}"#
+            ))
+            .unwrap_err();
+            assert!(
+                format!("{error:#}").contains("volatile_memory_gb"),
+                "unexpected error for {budget}: {error:#}"
+            );
+        }
+
+        // A budget without volatile mode is a configuration mistake, exactly
+        // like the legacy NBD rule.
+        let error = resolve_write_ack(
+            r#"[servers.nfs]
+addresses = ["127.0.0.1:2049"]
+
+[filesystem]
+write_ack_mode = "materialized"
+volatile_memory_gb = 1.0"#,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("only valid"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn filesystem_write_ack_volatile_requires_enabled_writeback() {
+        for writeback in ["", "[writeback]\nenabled = false"] {
+            let error = resolve_write_ack(&format!(
+                r#"[servers.nfs]
+addresses = ["127.0.0.1:2049"]
+
+[filesystem]
+write_ack_mode = "volatile_memory"
+volatile_memory_gb = 2.0
+
+{writeback}"#
+            ))
+            .unwrap_err();
+            assert!(
+                format!("{error:#}").contains("writeback"),
+                "unexpected error: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn filesystem_write_ack_volatile_requires_a_read_write_server() {
+        let settings = parse_settings(&format!(
+            r#"[servers.nfs]
+addresses = ["127.0.0.1:2049"]
+
+[filesystem]
+write_ack_mode = "volatile_memory"
+volatile_memory_gb = 2.0
+{ENABLED_WRITEBACK}"#
+        ));
+
+        for mode in [
+            WritebackAccessMode::ReadOnly,
+            WritebackAccessMode::Checkpoint,
+        ] {
+            let error = settings.filesystem_write_ack_settings(mode).unwrap_err();
+            assert!(
+                format!("{error:#}").contains("read-write"),
+                "unexpected error: {error:#}"
+            );
+        }
+        settings
+            .filesystem_write_ack_settings(WritebackAccessMode::ReadWrite)
+            .unwrap();
+    }
+
+    #[test]
+    fn filesystem_write_ack_volatile_rejects_replication() {
+        let error = resolve_write_ack(&format!(
+            r#"[servers.nfs]
+addresses = ["127.0.0.1:2049"]
+
+[filesystem]
+write_ack_mode = "volatile_memory"
+volatile_memory_gb = 2.0
+{ENABLED_WRITEBACK}
+[replication]
+node_id = "node-a"
+role = "leader""#
+        ))
+        .unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("[replication]"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn filesystem_write_ack_volatile_rejects_ignore_fsync() {
+        let error = resolve_write_ack(&format!(
+            r#"[servers.nfs]
+addresses = ["127.0.0.1:2049"]
+
+[filesystem]
+write_ack_mode = "volatile_memory"
+volatile_memory_gb = 2.0
+ignore_fsync = true
+{ENABLED_WRITEBACK}"#
+        ))
+        .unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("ignore_fsync"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn filesystem_write_ack_volatile_budget_must_hold_largest_protocol_write() {
+        // 0.05 GB < the 128 MiB maximum NBD WRITE.
+        let error = resolve_write_ack(&format!(
+            r#"[servers.nbd]
+addresses = ["127.0.0.1:10809"]
+
+[filesystem]
+write_ack_mode = "volatile_memory"
+volatile_memory_gb = 0.05
+{ENABLED_WRITEBACK}"#
+        ))
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("NBD"),
+            "unexpected error: {error:#}"
+        );
+
+        // 0.005 GB < the 10 MiB maximum 9P message.
+        let error = resolve_write_ack(&format!(
+            r#"[servers.ninep]
+addresses = ["127.0.0.1:5564"]
+
+[filesystem]
+write_ack_mode = "volatile_memory"
+volatile_memory_gb = 0.005
+{ENABLED_WRITEBACK}"#
+        ))
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("9P"),
+            "unexpected error: {error:#}"
+        );
+
+        // 0.002 GB >= the 1 MiB NFS wtmax: small budgets are fine when every
+        // enabled protocol's maximum write fits.
+        resolve_write_ack(&format!(
+            r#"[servers.nfs]
+addresses = ["127.0.0.1:2049"]
+
+[filesystem]
+write_ack_mode = "volatile_memory"
+volatile_memory_gb = 0.002
+{ENABLED_WRITEBACK}"#
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn filesystem_write_ack_generated_config_selects_materialized() {
+        let ack = Settings::generate_default()
+            .filesystem_write_ack_settings(WritebackAccessMode::ReadWrite)
+            .unwrap();
+        assert_eq!(ack.mode, FilesystemWriteAckMode::Materialized);
+        assert_eq!(ack.source, FilesystemWriteAckSource::DefaultMaterialized);
+
+        let rendered = Settings::render_default_config().unwrap();
+        assert!(
+            rendered.contains("write_ack_mode = \"materialized\""),
+            "generated config no longer shows the materialized default"
+        );
+    }
+
+    #[test]
+    fn filesystem_write_ack_valid_volatile_config_loads_from_file() {
+        let settings = write_and_load(&format!(
+            r#"
+[cache]
+dir = "/tmp/cache"
+disk_size_gb = 1.0
+
+[storage]
+url = "file:///tmp/data"
+encryption_password = "test"
+
+[servers.nfs]
+addresses = ["127.0.0.1:2049"]
+
+[filesystem]
+write_ack_mode = "volatile_memory"
+volatile_memory_gb = 2.0
+{ENABLED_WRITEBACK}"#
+        ))
+        .unwrap();
+
+        let ack = settings
+            .filesystem_write_ack_settings(WritebackAccessMode::ReadWrite)
+            .unwrap();
+        assert_eq!(ack.mode, FilesystemWriteAckMode::VolatileMemory);
+        assert_eq!(ack.volatile_memory_bytes, 2_000_000_000);
     }
 }

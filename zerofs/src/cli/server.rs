@@ -74,6 +74,16 @@ impl DatabaseMode {
     }
 }
 
+/// Access mode used to resolve the shared write-acknowledgement contract:
+/// volatile acknowledgement requires a read-write single-writer server.
+fn write_ack_access_mode(db_mode: DatabaseMode) -> crate::writeback::config::WritebackAccessMode {
+    match db_mode {
+        DatabaseMode::ReadWrite => crate::writeback::config::WritebackAccessMode::ReadWrite,
+        DatabaseMode::ReadOnly => crate::writeback::config::WritebackAccessMode::ReadOnly,
+        DatabaseMode::Checkpoint(_) => crate::writeback::config::WritebackAccessMode::Checkpoint,
+    }
+}
+
 fn validate_nbd_database_mode(config: Option<&NbdConfig>, db_mode: DatabaseMode) -> Result<()> {
     if db_mode.is_read_only()
         && config
@@ -1198,6 +1208,16 @@ pub async fn run_server(
         }
     };
     validate_nbd_database_mode(settings.servers.nbd.as_ref(), db_mode)?;
+    let write_ack = settings
+        .filesystem_write_ack_settings(write_ack_access_mode(db_mode))
+        .context("Invalid filesystem write-acknowledgement configuration")?;
+    if write_ack.mode == crate::fs::mutation::config::FilesystemWriteAckMode::VolatileMemory {
+        warn!(
+            volatile_memory_bytes = write_ack.volatile_memory_bytes,
+            volatile_max_operations = write_ack.volatile_max_operations,
+            "volatile-memory write acknowledgement is enabled: ordinary writes are unsafe across process or power loss until a flush barrier completes"
+        );
+    }
     let maintenance_runtime = if db_mode.is_read_only() {
         None
     } else {
@@ -1742,6 +1762,52 @@ mod tests {
             "unexpected error: {error:#}"
         );
         assert!(validate_nbd_database_mode(Some(&config), DatabaseMode::ReadWrite).is_ok());
+    }
+
+    #[test]
+    fn volatile_filesystem_ack_rejects_read_only_database_modes() {
+        let settings: Settings = toml::from_str(
+            r#"
+[cache]
+dir = "/tmp/cache"
+disk_size_gb = 1.0
+
+[storage]
+url = "file:///tmp/data"
+encryption_password = "test"
+
+[servers.nfs]
+addresses = ["127.0.0.1:2049"]
+
+[filesystem]
+write_ack_mode = "volatile_memory"
+volatile_memory_gb = 2.0
+
+[writeback]
+enabled = true
+dir = "/var/cache/zerofs-writeback"
+memory_size_gb = 16.0
+disk_size_gb = 512.0
+min_free_gb = 256.0
+"#,
+        )
+        .unwrap();
+
+        for db_mode in [
+            DatabaseMode::ReadOnly,
+            DatabaseMode::Checkpoint(uuid::Uuid::nil()),
+        ] {
+            let error = settings
+                .filesystem_write_ack_settings(write_ack_access_mode(db_mode))
+                .unwrap_err();
+            assert!(
+                format!("{error:#}").contains("read-write"),
+                "unexpected error: {error:#}"
+            );
+        }
+        settings
+            .filesystem_write_ack_settings(write_ack_access_mode(DatabaseMode::ReadWrite))
+            .unwrap();
     }
 
     #[test]
