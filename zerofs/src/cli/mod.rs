@@ -10,6 +10,7 @@ pub mod debug;
 pub mod fatrace;
 pub mod flush;
 mod init;
+mod memory_budget;
 pub mod monitor;
 pub mod nbd;
 pub mod otrace;
