@@ -758,7 +758,7 @@ impl ZeroFS {
             RequestLookup::Vacant(vacancy) => vacancy.begin_pending(),
             RequestLookup::Joined(retained) => return Ok(retained.wait().await?.primary_attrs()),
             RequestLookup::FingerprintMismatch => return Err(FsError::InvalidArgument),
-            RequestLookup::Backpressured => return Err(FsError::NoSpace),
+            RequestLookup::Backpressured => return Err(FsError::RetryLater),
         };
         let raw_bytes = request.members.iter().try_fold(0_u64, |total, member| {
             total.checked_add(member.data.len() as u64)
@@ -964,7 +964,7 @@ impl ZeroFS {
                 });
             }
             RequestLookup::FingerprintMismatch => return Err(FsError::InvalidArgument),
-            RequestLookup::Backpressured => return Err(FsError::NoSpace),
+            RequestLookup::Backpressured => return Err(FsError::RetryLater),
         };
         let raw_permit = coordinator
             .raw_budget()
@@ -1411,6 +1411,63 @@ mod tests {
         assert_eq!(coordinator.raw_budget().used_bytes(), 0);
         assert_eq!(coordinator.raw_budget().used_operations(), 0);
         assert_eq!(coordinator.request_cache().used_slots(), 0);
+    }
+
+    #[tokio::test]
+    async fn request_cache_pressure_is_retry_later_even_for_zero_length_write() {
+        let mut fs = ZeroFS::new_in_memory().await.unwrap();
+        fs.write_ack = FilesystemWriteAckSettings {
+            volatile_max_operations: 1,
+            ..volatile_settings()
+        };
+        let fs = Arc::new(fs);
+        fs.install_volatile_overlay();
+
+        let auth = crate::fs::types::AuthContext::from(&test_creds());
+        let file = fs
+            .create_exclusive(&auth, 0, b"cache-pressure.txt")
+            .await
+            .unwrap();
+        let coordinator = fs.mutation_coordinator.get().expect("coordinator");
+        let held = match coordinator
+            .request_cache()
+            .lookup_or_reserve(
+                RequestIdentity::Nbd {
+                    connection_incarnation: 7,
+                    handle: 1,
+                },
+                RequestFingerprint::from_parts(&[b"held"]),
+                RequestLifetime::InFlightOnly,
+            )
+            .unwrap()
+        {
+            RequestLookup::Vacant(vacancy) => vacancy.begin_pending(),
+            other => panic!("expected vacant request slot, got {other:?}"),
+        };
+
+        for (xid, data) in [(11, Bytes::new()), (12, Bytes::from_static(b"data"))] {
+            let result = fs
+                .write_ack_identified(IdentifiedWrite {
+                    auth: &auth,
+                    id: file,
+                    offset: 0,
+                    data: &data,
+                    op_id: [0; 16],
+                    check_permissions: true,
+                    identity: RequestIdentity::Nfs {
+                        server_incarnation: uuid::Uuid::nil(),
+                        connection_incarnation: 3,
+                        xid,
+                    },
+                    request_lifetime: RequestLifetime::InFlightOnly,
+                    fingerprint_context: b"nfs-write",
+                })
+                .await;
+            assert!(matches!(result, Err(FsError::RetryLater)));
+        }
+        assert_eq!(coordinator.raw_budget().used_bytes(), 0);
+        assert_eq!(coordinator.gate().active_guards(), 0);
+        held.cancel();
     }
 
     #[tokio::test]

@@ -21,6 +21,8 @@ pub enum FsError {
     TooManyLinks,
     #[error("No space left")]
     NoSpace,
+    #[error("Server is temporarily backpressured; retry later")]
+    RetryLater,
     #[error("Is a directory")]
     IsDirectory,
     #[error("Not a directory")]
@@ -65,6 +67,7 @@ impl From<FsError> for nfsstat3 {
             FsError::NotEmpty => nfsstat3::NFS3ERR_NOTEMPTY,
             FsError::TooManyLinks => nfsstat3::NFS3ERR_MLINK,
             FsError::NoSpace => nfsstat3::NFS3ERR_NOSPC,
+            FsError::RetryLater => nfsstat3::NFS3ERR_JUKEBOX,
             FsError::IsDirectory => nfsstat3::NFS3ERR_ISDIR,
             FsError::NotDirectory => nfsstat3::NFS3ERR_NOTDIR,
             FsError::NameTooLong => nfsstat3::NFS3ERR_NAMETOOLONG,
@@ -91,6 +94,7 @@ impl From<nfsstat3> for FsError {
             nfsstat3::NFS3ERR_NOTEMPTY => FsError::NotEmpty,
             nfsstat3::NFS3ERR_MLINK => FsError::TooManyLinks,
             nfsstat3::NFS3ERR_NOSPC | nfsstat3::NFS3ERR_DQUOT => FsError::NoSpace,
+            nfsstat3::NFS3ERR_JUKEBOX => FsError::RetryLater,
             nfsstat3::NFS3ERR_ISDIR => FsError::IsDirectory,
             nfsstat3::NFS3ERR_NOTDIR => FsError::NotDirectory,
             nfsstat3::NFS3ERR_NAMETOOLONG => FsError::NameTooLong,
@@ -123,6 +127,7 @@ impl FsError {
             FsError::NotEmpty => crate::linux_errno::ENOTEMPTY,
             FsError::TooManyLinks => crate::linux_errno::EMLINK,
             FsError::NoSpace => crate::linux_errno::ENOSPC,
+            FsError::RetryLater => crate::linux_errno::EAGAIN,
             FsError::IsDirectory => crate::linux_errno::EISDIR,
             FsError::NotDirectory => crate::linux_errno::ENOTDIR,
             FsError::NameTooLong => crate::linux_errno::ENAMETOOLONG,
@@ -168,6 +173,7 @@ mod tests {
             (FsError::NotEmpty, 39),
             (FsError::TooManyLinks, 31),
             (FsError::NoSpace, 28),
+            (FsError::RetryLater, 11),
             (FsError::IsDirectory, 21),
             (FsError::NotDirectory, 20),
             (FsError::NameTooLong, 36),
