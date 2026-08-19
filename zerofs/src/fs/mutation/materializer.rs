@@ -17,6 +17,10 @@ use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
+#[cfg(test)]
+use std::sync::Condvar;
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -49,8 +53,19 @@ struct MaterializerInner {
     overlay: Weak<FilesystemVolatileOverlay>,
     apply_hook: Option<ApplyHook>,
     lanes: Mutex<HashMap<u64, mpsc::UnboundedSender<LaneJob>>>,
+    hold_enqueue: Mutex<()>,
     workers: Mutex<Vec<JoinHandle<()>>>,
     closed: Mutex<bool>,
+    #[cfg(test)]
+    hold_enqueue_interleave: HoldEnqueueInterleave,
+}
+
+#[cfg(test)]
+struct HoldEnqueueInterleave {
+    enabled: AtomicBool,
+    arrivals: AtomicUsize,
+    second_attempted: Mutex<bool>,
+    changed: Condvar,
 }
 
 /// Owns per-inode worker loops that apply accepted batches in order.
@@ -84,8 +99,16 @@ impl Materializer {
                     .unwrap_or_else(Weak::<FilesystemVolatileOverlay>::new),
                 apply_hook,
                 lanes: Mutex::new(HashMap::new()),
+                hold_enqueue: Mutex::new(()),
                 workers: Mutex::new(Vec::new()),
                 closed: Mutex::new(false),
+                #[cfg(test)]
+                hold_enqueue_interleave: HoldEnqueueInterleave {
+                    enabled: AtomicBool::new(false),
+                    arrivals: AtomicUsize::new(0),
+                    second_attempted: Mutex::new(false),
+                    changed: Condvar::new(),
+                },
             }),
         })
     }
@@ -144,16 +167,35 @@ impl Materializer {
         }
 
         let mut holds = Vec::with_capacity(inodes.len());
-        for inode in &inodes {
-            let (acquired_tx, acquired_rx) = oneshot::channel();
-            let (release_tx, release_rx) = oneshot::channel();
-            self.lane(*inode)
-                .send(LaneJob::Hold {
-                    acquired: acquired_tx,
-                    release: release_rx,
-                })
-                .map_err(|_| self.poison("inode worker dropped"))?;
-            holds.push((acquired_rx, release_tx));
+        #[cfg(test)]
+        let interleave_position = self.hold_enqueue_interleave_position_for_test();
+        {
+            // All lanes must observe multi-inode batches in one global order.
+            // Hold only this synchronous enqueue lock; the potentially slow
+            // acquisition and apply phases remain concurrent.
+            let _enqueue = lock(&self.inner.hold_enqueue);
+            for (_index, inode) in inodes.iter().enumerate() {
+                let (acquired_tx, acquired_rx) = oneshot::channel();
+                let (release_tx, release_rx) = oneshot::channel();
+                self.lane(*inode)
+                    .send(LaneJob::Hold {
+                        acquired: acquired_tx,
+                        release: release_rx,
+                    })
+                    .map_err(|_| self.poison("inode worker dropped"))?;
+                holds.push((acquired_rx, release_tx));
+                #[cfg(test)]
+                if _index == 0 && interleave_position == Some(0) {
+                    let attempted = lock(&self.inner.hold_enqueue_interleave.second_attempted);
+                    drop(
+                        self.inner
+                            .hold_enqueue_interleave
+                            .changed
+                            .wait_while(attempted, |attempted| !*attempted)
+                            .unwrap_or_else(|error| error.into_inner()),
+                    );
+                }
+            }
         }
         for (acquired, _) in &mut holds {
             acquired
@@ -199,6 +241,29 @@ impl Materializer {
         lock(&self.inner.workers).push(worker);
         lanes.insert(inode, sender.clone());
         sender
+    }
+
+    #[cfg(test)]
+    fn interleave_next_hold_enqueues_for_test(&self) {
+        let interleave = &self.inner.hold_enqueue_interleave;
+        *lock(&interleave.second_attempted) = false;
+        interleave.arrivals.store(0, Ordering::Release);
+        interleave.enabled.store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    fn hold_enqueue_interleave_position_for_test(&self) -> Option<usize> {
+        let interleave = &self.inner.hold_enqueue_interleave;
+        if !interleave.enabled.load(Ordering::Acquire) {
+            return None;
+        }
+        let position = interleave.arrivals.fetch_add(1, Ordering::AcqRel);
+        if position == 1 {
+            interleave.enabled.store(false, Ordering::Release);
+            *lock(&interleave.second_attempted) = true;
+            interleave.changed.notify_all();
+        }
+        Some(position)
     }
 
     async fn apply_caught(
@@ -529,6 +594,53 @@ mod tests {
         assert_eq!(seen.len(), 1, "striped batch is one apply");
         assert_eq!(seen[0].len(), 2);
         assert_eq!(materializer.progress().materialized_through(), 1);
+        materializer.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn overlapping_striped_batches_cannot_split_lane_holds() {
+        let (fs, auth) = filesystem().await;
+        let first_id = create_file(&fs, &auth, b"overlap0.bin").await;
+        let second_id = create_file(&fs, &auth, b"overlap1.bin").await;
+        let incarnation = MutationIncarnation::new();
+        let hook: ApplyHook = Arc::new(|_cutoff, _batch| Box::pin(async { Ok(()) }));
+        let materializer =
+            Materializer::start_with_hook(incarnation, Arc::downgrade(&fs), None, Some(hook));
+        let mut first_batch = prepare_striped(&fs, auth.clone(), first_id, second_id).await;
+        first_batch.guards = None;
+        let mut second_batch = prepare_striped(&fs, auth, first_id, second_id).await;
+        second_batch.guards = None;
+        materializer.interleave_next_hold_enqueues_for_test();
+        let start = Arc::new(tokio::sync::Barrier::new(3));
+
+        let first = tokio::spawn({
+            let materializer = Arc::clone(&materializer);
+            let start = Arc::clone(&start);
+            async move {
+                start.wait().await;
+                materializer
+                    .dispatch_through(cutoff(incarnation, 1), first_batch)
+                    .await
+            }
+        });
+        let second = tokio::spawn({
+            let materializer = Arc::clone(&materializer);
+            let start = Arc::clone(&start);
+            async move {
+                start.wait().await;
+                materializer
+                    .dispatch_through(cutoff(incarnation, 2), second_batch)
+                    .await
+            }
+        });
+        start.wait().await;
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            first.await.unwrap().unwrap();
+            second.await.unwrap().unwrap();
+        })
+        .await
+        .expect("overlapping striped batches split their inode holds and deadlocked");
         materializer.stop().await;
     }
 
