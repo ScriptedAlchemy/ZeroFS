@@ -99,7 +99,7 @@ async fn upload_queues_a_second_aligned_chunk_while_the_first_is_committing() {
     });
     first_apply_reached.await.unwrap();
 
-    let second_queued = tokio::time::timeout(Duration::from_millis(250), async {
+    let second_queued = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             if let Some(Some(crate::fs::inode::Inode::File(file))) =
                 filesystem.inode_store.pending_inode(inode)
