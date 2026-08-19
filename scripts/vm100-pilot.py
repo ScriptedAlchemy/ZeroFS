@@ -25,6 +25,7 @@ from scripts.vm100_pilot.raw_sftp import RawSftpRunner  # noqa: E402
 from scripts.vm100_pilot.real_world_matrix import RealWorldMatrixRunner  # noqa: E402
 from scripts.vm100_pilot.reset import FreshResetter  # noqa: E402
 from scripts.vm100_pilot.runner import Runner  # noqa: E402
+from scripts.vm100_pilot.scenarios import list_scenarios  # noqa: E402
 from scripts.vm100_pilot.workloads import WorkloadRunner  # noqa: E402
 
 
@@ -40,6 +41,10 @@ def build_parser() -> argparse.ArgumentParser:
         description="Build, deploy, profile, and benchmark the VM100 ZeroFS NBD pilot"
     )
     subcommands = parser.add_subparsers(dest="command", required=True)
+    subcommands.add_parser(
+        "list-scenarios",
+        help="list the immutable registry of real benchmark scenarios",
+    )
     setup = subcommands.add_parser("setup", help="build, deploy, and start the pilot")
     setup.add_argument(
         "--skip-build",
@@ -149,7 +154,16 @@ def _emit(value: object) -> None:
     print(json.dumps(value, indent=2, sort_keys=True, default=str))
 
 
-def dispatch(args: argparse.Namespace, config: PilotConfig, runner: Runner) -> None:
+def dispatch(
+    args: argparse.Namespace,
+    config: PilotConfig | None,
+    runner: Runner | None,
+) -> None:
+    if args.command == "list-scenarios":
+        _emit([scenario.to_dict() for scenario in list_scenarios()])
+        return
+    if config is None or runner is None:
+        raise RuntimeError(f"{args.command} requires a configured VM100 runner")
     runner.run(
         [
             "install",
@@ -252,6 +266,9 @@ def dispatch(args: argparse.Namespace, config: PilotConfig, runner: Runner) -> N
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.command == "list-scenarios":
+        dispatch(args, None, None)
+        return 0
     config = PilotConfig.from_environment(ROOT)
     try:
         with operation_lock(config.lock_file):
