@@ -332,7 +332,9 @@ async fn close_writeback_fs(
             .await
             .expect("wait final writeback coverage");
     }
-    fs.stop_mutation_workers().await;
+    fs.stop_mutation_workers()
+        .await
+        .expect("stop mutation workers before writeback shutdown");
     writeback.shutdown().await.expect("shutdown SSD writeback");
 }
 
