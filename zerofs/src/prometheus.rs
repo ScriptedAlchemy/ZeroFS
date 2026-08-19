@@ -87,7 +87,7 @@ pub fn start(
         let server_handle = handle.clone();
         let server_shutdown = shutdown.clone();
         handles.push(spawn_named("prometheus-http", async move {
-            serve_metrics(addr, server_handle, server_shutdown).await;
+            serve_metrics(addr, server_handle, None, server_shutdown).await;
         }));
     }
 
@@ -147,11 +147,36 @@ pub fn start(
 
 type HttpResponse = hyper::Response<http_body_util::Full<bytes::Bytes>>;
 
+fn render_metrics(
+    metrics_handle: &PrometheusHandle,
+    authority: Option<&BenchmarkAuthority>,
+) -> String {
+    let mut rendered = metrics_handle.render();
+    if let Some(authority) = authority {
+        if !rendered.is_empty() && !rendered.ends_with('\n') {
+            rendered.push('\n');
+        }
+        use std::fmt::Write;
+        writeln!(
+            rendered,
+            "zerofs_benchmark_authority_info{{server_instance_id=\"{}\",filesystem_id=\"{}\",export_id=\"{}\"}} 1",
+            authority.server_instance_id, authority.filesystem_id, authority.export_id
+        )
+        .expect("writing metrics to a String cannot fail");
+    }
+    rendered
+}
+
 fn handle_request(
     req: hyper::Request<impl hyper::body::Body>,
     metrics_handle: &PrometheusHandle,
+    authority: Option<&BenchmarkAuthority>,
 ) -> HttpResponse {
-    if req.uri().path() != "/metrics" {
+    let canonical_authority_request = authority.is_none()
+        || (req.method() == hyper::Method::GET
+            && req.uri().query().is_none()
+            && !req.headers().contains_key(hyper::header::AUTHORIZATION));
+    if req.uri().path() != "/metrics" || !canonical_authority_request {
         return hyper::Response::builder()
             .status(404)
             .body(http_body_util::Full::new(bytes::Bytes::from("Not Found")))
@@ -161,12 +186,17 @@ fn handle_request(
     hyper::Response::builder()
         .header("content-type", "text/plain; version=0.0.4; charset=utf-8")
         .body(http_body_util::Full::new(bytes::Bytes::from(
-            metrics_handle.render(),
+            render_metrics(metrics_handle, authority),
         )))
         .unwrap()
 }
 
-async fn serve_metrics(addr: SocketAddr, handle: PrometheusHandle, shutdown: CancellationToken) {
+async fn serve_metrics(
+    addr: SocketAddr,
+    handle: PrometheusHandle,
+    authority: Option<BenchmarkAuthority>,
+    shutdown: CancellationToken,
+) {
     let listener = match tokio::net::TcpListener::bind(addr).await {
         Ok(l) => l,
         Err(e) => {
@@ -187,10 +217,11 @@ async fn serve_metrics(addr: SocketAddr, handle: PrometheusHandle, shutdown: Can
                     }
                 };
                 let handle = handle.clone();
+                let authority = authority.clone();
                 tokio::spawn(async move {
                     let service = hyper::service::service_fn(move |req| {
                         std::future::ready(Ok::<_, std::convert::Infallible>(
-                            handle_request(req, &handle),
+                            handle_request(req, &handle, authority.as_ref()),
                         ))
                     });
                     let io = hyper_util::rt::TokioIo::new(stream);
@@ -465,6 +496,127 @@ mod tests {
         assert_ne!(first.server_instance_id, second.server_instance_id);
         assert_eq!(first.filesystem_id, second.filesystem_id);
         assert_eq!(first.export_id, second.export_id);
+    }
+
+    fn benchmark_authority_fixture() -> BenchmarkAuthority {
+        BenchmarkAuthority::compose(
+            "10.10.10.30:/",
+            uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap(),
+            Some("2be254ef917b4ff8a2c547b873709aef"),
+        )
+        .unwrap()
+    }
+
+    fn sample_count(text: &str, metric: &str) -> usize {
+        text.lines()
+            .filter(|line| {
+                !line.starts_with('#')
+                    && line
+                        .split_once(['{', ' '])
+                        .is_some_and(|(name, _)| name == metric)
+            })
+            .count()
+    }
+
+    #[test]
+    fn benchmark_authority_response_emits_exactly_one_tuple_without_relabeling_metrics() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            metrics::counter!("zerofs_bytes_read_total").absolute(7);
+        });
+        let authority = benchmark_authority_fixture();
+
+        let first = super::render_metrics(&handle, Some(&authority));
+        let second = super::render_metrics(&handle, Some(&authority));
+
+        let expected = concat!(
+            "zerofs_benchmark_authority_info{",
+            "server_instance_id=\"2be254ef917b4ff8a2c547b873709aef\",",
+            "filesystem_id=\"550e8400-e29b-41d4-a716-446655440000\",",
+            "export_id=\"10.10.10.30:/\"} 1"
+        );
+        for body in [&first, &second] {
+            assert_eq!(sample_count(body, "zerofs_benchmark_authority_info"), 1);
+            assert!(body.lines().any(|line| line == expected), "body:\n{body}");
+            assert!(body.contains("zerofs_bytes_read_total 7"), "body:\n{body}");
+            assert!(!body.contains("zerofs_bytes_read_total{"), "body:\n{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn benchmark_authority_response_accepts_only_canonical_unauthenticated_get() {
+        use http_body_util::BodyExt;
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let authority = benchmark_authority_fixture();
+        let canonical = hyper::Request::builder()
+            .method(hyper::Method::GET)
+            .uri("/metrics")
+            .body(http_body_util::Empty::<bytes::Bytes>::new())
+            .unwrap();
+        let response = super::handle_request(canonical, &handle, Some(&authority));
+        assert_eq!(response.status(), hyper::StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            sample_count(
+                std::str::from_utf8(&body).unwrap(),
+                "zerofs_benchmark_authority_info"
+            ),
+            1
+        );
+
+        for request in [
+            hyper::Request::builder()
+                .method(hyper::Method::POST)
+                .uri("/metrics"),
+            hyper::Request::builder()
+                .method(hyper::Method::GET)
+                .uri("/metrics?x=1"),
+            hyper::Request::builder()
+                .method(hyper::Method::GET)
+                .uri("/metrics/"),
+            hyper::Request::builder()
+                .method(hyper::Method::GET)
+                .uri("/"),
+            hyper::Request::builder()
+                .method(hyper::Method::GET)
+                .uri("/metrics")
+                .header(hyper::header::AUTHORIZATION, "Bearer secret"),
+        ] {
+            let response = super::handle_request(
+                request
+                    .body(http_body_util::Empty::<bytes::Bytes>::new())
+                    .unwrap(),
+                &handle,
+                Some(&authority),
+            );
+            assert_ne!(response.status(), hyper::StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(
+                sample_count(
+                    std::str::from_utf8(&body).unwrap(),
+                    "zerofs_benchmark_authority_info"
+                ),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn benchmark_authority_response_disabled_preserves_legacy_path_behavior() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let legacy_post = hyper::Request::builder()
+            .method(hyper::Method::POST)
+            .uri("/metrics")
+            .body(http_body_util::Empty::<bytes::Bytes>::new())
+            .unwrap();
+
+        let response = super::handle_request(legacy_post, &handle, None);
+
+        assert_eq!(response.status(), hyper::StatusCode::OK);
     }
 
     #[test]
