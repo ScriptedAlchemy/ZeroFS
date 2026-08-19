@@ -2,12 +2,12 @@ name: Benchmark Suite Rust
 
 on:
   push:
-    branches: ["main"]
+    branches: ["main", "develop"]
     paths:
       - "bench/**"
       - ".github/workflows/bench.yml"
   pull_request:
-    branches: ["main"]
+    branches: ["main", "develop"]
     paths:
       - "bench/**"
       - ".github/workflows/bench.yml"

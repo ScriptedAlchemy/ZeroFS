@@ -12,9 +12,9 @@ name: ci
 # bench, webui, publish-client.
 on:
   push:
-    branches: ["main"]
+    branches: ["main", "develop"]
   pull_request:
-    branches: ["main"]
+    branches: ["main", "develop"]
   workflow_dispatch:
 
 permissions:

@@ -3,7 +3,7 @@ name: fuzz
 on:
   # Short smoke on relevant PRs, plus a longer nightly run.
   pull_request:
-    branches: ["main"]
+    branches: ["main", "develop"]
     paths:
       - "zerofs/ninep-proto/**"
       - "zerofs/nbd-proto/**"
