@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import contextlib
+import hashlib
 import os
 import subprocess
 import sys
@@ -590,6 +591,70 @@ class PlanTests(unittest.TestCase):
         self.assertIn("ZEROFS_NBD_DEVICE=/dev/nbd0", source)
         self.assertIn("What=${expected_source}", source)
         subprocess.run(["bash", "-n", str(script)], check=True)
+
+    def test_guest_reconciler_accepts_only_exact_shipped_legacy_units(self) -> None:
+        script = Path(__file__).parents[1] / "guest/reconcile-zerofs-nfs.sh"
+        source = script.read_text()
+        fixtures = {
+            "99015e0989c4fda8c9377fd1c2e062890c2d83c4c3673ad3415d552d8e73ecdf": """[Unit]
+Description=ZeroFS XFS volume from private LXC NBD server
+Requires=zerofs-lxc-nbd-client.service
+After=zerofs-lxc-nbd-client.service
+
+[Mount]
+What=/dev/nbd0
+Where=/mnt/zerofs-lxc
+Type=xfs
+Options=rw,noatime,nodiscard
+TimeoutSec=60s
+
+[Install]
+WantedBy=multi-user.target
+""",
+            "013e9481f2bf7e0ba66f4dbc60bba64937da88293f7f3732c0e62c7cb2c5b33d": """[Unit]
+Description=ZeroFS file namespace mapped for VM100 and macOS ownership
+Requires=mnt-zerofs\\x2dfiles\\x2draw-.nbd.mount
+After=mnt-zerofs\\x2dfiles\\x2draw-.nbd.mount
+
+[Mount]
+What=/mnt/zerofs-files-raw
+Where=/mnt/zerofs-files
+Type=fuse.bindfs
+Options=mirror=zack,create-for-user=501,create-for-group=20,chown-ignore,chgrp-ignore,chmod-ignore,_netdev
+TimeoutSec=30s
+
+[Install]
+WantedBy=remote-fs.target
+""",
+            "9a0e6e3501a971c13b5d5ad7e609cc92989f83c197821f0c09596a02c3cbeac2": """[Unit]
+Description=ZeroFS file namespace mapped for VM100 and macOS ownership
+Requires=zerofs-shared-namespace-permissions.service
+After=zerofs-shared-namespace-permissions.service
+
+[Mount]
+What=/mnt/zerofs-files-raw
+Where=/mnt/zerofs-files
+Type=fuse.bindfs
+Options=mirror=zack,create-for-user=501,create-for-group=20,chown-ignore,chgrp-ignore,chmod-ignore,_netdev
+TimeoutSec=30s
+
+[Install]
+WantedBy=remote-fs.target
+""",
+        }
+        for expected, fixture in fixtures.items():
+            with self.subTest(expected=expected):
+                self.assertEqual(hashlib.sha256(fixture.encode()).hexdigest(), expected)
+                self.assertIn(expected, source)
+                altered = fixture.replace("[Mount]", "[Mount]\nWhere=/tmp/escape", 1)
+                self.assertNotIn(hashlib.sha256(altered.encode()).hexdigest(), source)
+        for label in (
+            "legacy raw namespace unit contains unexpected directives",
+            "legacy raw NBD guard unit",
+            "legacy exposed NBD guard unit",
+            "legacy namespace permissions service",
+        ):
+            self.assertIn(label, source)
 
     def test_webui_node_version_gate_requires_vite_minimum(self) -> None:
         self.assertTrue(deploy.node_version_supported("v24.19.0"))
