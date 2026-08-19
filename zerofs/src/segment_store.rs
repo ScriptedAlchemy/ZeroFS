@@ -226,15 +226,19 @@ impl SegmentStore {
         limits: SegmentFormatLimits,
     ) -> Result<Vec<(InodeId, u64, FrameLoc)>> {
         crate::segment::checked_segment_frame_count(frames.len(), limits)?;
+        crate::segment::checked_directory_plaintext_len(frames.len(), limits)?;
+        for (_, _, compressed) in &frames {
+            crate::segment::checked_frame_body_len(compressed.sealed_len(), limits)?;
+        }
         let segid = self.next_segid();
         let sealed = seal_compressed_batch(&self.codec, segid, 0, frames)?;
         let mut builder = SegmentBuilder::with_limits(&self.codec, segid, limits);
         let mut locs = Vec::new();
         locs.try_reserve_exact(sealed.len())
-            .map_err(|_| SegmentError::Allocation("segment frame locations"))?;
+            .map_err(|_| SegmentError::Malformed("segment location allocation failed"))?;
         for (id, extent, body) in sealed {
             let byte_offset = builder.byte_len();
-            let frame_index = builder.append_sealed(id, extent, &body)?;
+            let frame_index = builder.try_append_sealed(id, extent, &body)?;
             let byte_len =
                 crate::segment::checked_stored_frame_len(builder.byte_len() - byte_offset, limits)?;
             locs.push((
@@ -686,7 +690,64 @@ mod tests {
 
         assert!(matches!(
             err,
-            SegmentStoreError::Segment(SegmentError::FormatLimit("segment frame count"))
+            SegmentStoreError::Segment(SegmentError::Malformed("segment frame count"))
+        ));
+        assert_eq!(store.counter.load(Ordering::Relaxed), 0);
+        assert!(
+            os.list(Some(&Path::from("segments")))
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap()
+                .is_empty(),
+            "a rejected segment must not publish any object"
+        );
+    }
+
+    #[tokio::test]
+    async fn seal_rejects_frame_length_before_allocating_id_or_publishing() {
+        let os = Arc::new(InMemory::new());
+        let codec = FrameCodec::new(&[1u8; 32], SEGMENT_INFO, CompressionConfig::Lz4);
+        let store = SegmentStore::new(os.clone(), codec, 5, None);
+        let frames = vec![(1, 0, store.codec.compress(b"a").unwrap())];
+
+        let err = store
+            .seal_compressed_with_limits(frames, SegmentFormatLimits::with_u32_max(32))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            SegmentStoreError::Segment(SegmentError::Malformed("stored frame length"))
+        ));
+        assert_eq!(store.counter.load(Ordering::Relaxed), 0);
+        assert!(
+            os.list(Some(&Path::from("segments")))
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap()
+                .is_empty(),
+            "a rejected segment must not publish any object"
+        );
+    }
+
+    #[tokio::test]
+    async fn seal_rejects_directory_plaintext_before_allocating_id_or_publishing() {
+        let os = Arc::new(InMemory::new());
+        let codec = FrameCodec::new(&[1u8; 32], SEGMENT_INFO, CompressionConfig::Lz4);
+        let store = SegmentStore::new(os.clone(), codec, 5, None);
+        let frames = vec![
+            (1, 0, store.codec.compress(b"a").unwrap()),
+            (1, 1, store.codec.compress(b"b").unwrap()),
+        ];
+
+        let err = store
+            .seal_compressed_with_limits(frames, SegmentFormatLimits::with_u32_max(50))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            SegmentStoreError::Segment(SegmentError::Malformed("directory plaintext length"))
         ));
         assert_eq!(store.counter.load(Ordering::Relaxed), 0);
         assert!(

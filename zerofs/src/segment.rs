@@ -161,10 +161,6 @@ pub enum SegmentError {
     CrcMismatch { stored: u32, computed: u32 },
     #[error("malformed segment: {0}")]
     Malformed(&'static str),
-    #[error("segment format limit exceeded: {0}")]
-    FormatLimit(&'static str),
-    #[error("segment allocation failed: {0}")]
-    Allocation(&'static str),
     #[error("segment footer segid {found:?} does not match requested key {expected:?}")]
     SegidMismatch { expected: Segid, found: Segid },
     #[error(transparent)]
@@ -197,9 +193,9 @@ fn checked_wire_u32(
     field: &'static str,
 ) -> Result<u32, SegmentError> {
     if value > limits.u32_max {
-        return Err(SegmentError::FormatLimit(field));
+        return Err(SegmentError::Malformed(field));
     }
-    u32::try_from(value).map_err(|_| SegmentError::FormatLimit(field))
+    u32::try_from(value).map_err(|_| SegmentError::Malformed(field))
 }
 
 fn checked_frame_count(
@@ -209,7 +205,7 @@ fn checked_frame_count(
 ) -> Result<u32, SegmentError> {
     let total = current
         .checked_add(additional)
-        .ok_or(SegmentError::FormatLimit("segment frame count"))?;
+        .ok_or(SegmentError::Malformed("segment frame count"))?;
     checked_wire_u32(total, limits, "segment frame count")
 }
 
@@ -220,12 +216,23 @@ pub(crate) fn checked_segment_frame_count(
     checked_frame_count(0, count, limits)
 }
 
+pub(crate) fn checked_directory_plaintext_len(
+    entry_count: usize,
+    limits: SegmentFormatLimits,
+) -> Result<usize, SegmentError> {
+    let plain_len = entry_count
+        .checked_mul(DIR_ENTRY_LEN)
+        .ok_or(SegmentError::Malformed("directory plaintext length"))?;
+    checked_wire_u32(plain_len, limits, "directory plaintext length")?;
+    Ok(plain_len)
+}
+
 pub(crate) fn checked_stored_frame_len(
     stored_len: u64,
     limits: SegmentFormatLimits,
 ) -> Result<u32, SegmentError> {
-    let stored_len = usize::try_from(stored_len)
-        .map_err(|_| SegmentError::FormatLimit("stored frame length"))?;
+    let stored_len =
+        usize::try_from(stored_len).map_err(|_| SegmentError::Malformed("stored frame length"))?;
     checked_wire_u32(stored_len, limits, "stored frame length")
 }
 
@@ -254,9 +261,9 @@ pub(crate) fn checked_frame_index(
     let offset = checked_wire_u32(offset, limits, "frame index")?;
     let index = first
         .checked_add(offset)
-        .ok_or(SegmentError::FormatLimit("frame index"))?;
+        .ok_or(SegmentError::Malformed("frame index"))?;
     if index as usize > limits.u32_max {
-        return Err(SegmentError::FormatLimit("frame index"));
+        return Err(SegmentError::Malformed("frame index"));
     }
     Ok(index)
 }
@@ -268,9 +275,9 @@ pub(crate) fn checked_frame_body_len(
     let body_len = checked_wire_u32(body_len, limits, "stored frame length")?;
     let stored_len = body_len
         .checked_add(LEN_PREFIX as u32)
-        .ok_or(SegmentError::FormatLimit("stored frame length"))?;
+        .ok_or(SegmentError::Malformed("stored frame length"))?;
     if stored_len as usize > limits.u32_max {
-        return Err(SegmentError::FormatLimit("stored frame length"));
+        return Err(SegmentError::Malformed("stored frame length"));
     }
     Ok(body_len)
 }
@@ -351,13 +358,20 @@ impl<'a> SegmentBuilder<'a> {
             extent,
             plaintext,
         )?;
-        self.append_sealed(inode, extent, &sealed)
+        self.try_append_sealed(inode, extent, &sealed)
     }
 
     /// Append a frame body sealed under this builder's segid and the index
     /// this append assigns (`dir.len()`); a batch pre-sealed by
     /// [`seal_compressed_batch`] knows both upfront.
-    pub fn append_sealed(
+    pub fn append_sealed(&mut self, inode: u64, extent: u64, sealed: &[u8]) -> u32 {
+        self.try_append_sealed(inode, extent, sealed)
+            .expect("sealed frame must fit the segment wire format")
+    }
+
+    /// Fallible form of [`Self::append_sealed`] for production writers. It
+    /// rejects wire-width or allocation failure before changing the builder.
+    pub fn try_append_sealed(
         &mut self,
         inode: u64,
         extent: u64,
@@ -366,16 +380,16 @@ impl<'a> SegmentBuilder<'a> {
         let frame_index = checked_append_frame_index(self.dir.len(), self.limits)?;
         let len = checked_frame_body_len(sealed.len(), self.limits)?;
         let byte_offset = u64::try_from(self.buf.len())
-            .map_err(|_| SegmentError::FormatLimit("segment byte offset"))?;
+            .map_err(|_| SegmentError::Malformed("segment byte offset"))?;
         let additional = LEN_PREFIX
             .checked_add(sealed.len())
-            .ok_or(SegmentError::FormatLimit("segment byte length"))?;
+            .ok_or(SegmentError::Malformed("segment byte length"))?;
         self.buf
             .try_reserve_exact(additional)
-            .map_err(|_| SegmentError::Allocation("segment frame"))?;
+            .map_err(|_| SegmentError::Malformed("segment frame allocation failed"))?;
         self.dir
             .try_reserve_exact(1)
-            .map_err(|_| SegmentError::Allocation("segment directory entry"))?;
+            .map_err(|_| SegmentError::Malformed("segment directory allocation failed"))?;
         self.buf.extend_from_slice(&len.to_le_bytes());
         self.buf.extend_from_slice(sealed);
         self.dir.push(DirEntry {
@@ -465,15 +479,11 @@ pub(crate) fn seal_directory_with_limits(
     limits: SegmentFormatLimits,
 ) -> Result<Vec<u8>, SegmentError> {
     let k = checked_wire_u32(dir.len(), limits, "segment frame count")?;
-    let plain_len = dir
-        .len()
-        .checked_mul(DIR_ENTRY_LEN)
-        .ok_or(SegmentError::FormatLimit("directory plaintext length"))?;
-    checked_wire_u32(plain_len, limits, "directory plaintext length")?;
+    let plain_len = checked_directory_plaintext_len(dir.len(), limits)?;
     let mut dir_plain = Vec::new();
     dir_plain
         .try_reserve_exact(plain_len)
-        .map_err(|_| SegmentError::Allocation("segment directory"))?;
+        .map_err(|_| SegmentError::Malformed("segment directory allocation failed"))?;
     for e in dir {
         dir_plain.extend_from_slice(&e.byte_offset.to_le_bytes());
         dir_plain.extend_from_slice(&e.len.to_le_bytes());
@@ -504,18 +514,18 @@ pub(crate) fn prepare_segment_assembly(
     let dir_len = checked_wire_u32(sealed_dir.len(), limits, "sealed directory length")?;
     let dir_offset_usize = buf.len();
     let dir_offset = u64::try_from(dir_offset_usize)
-        .map_err(|_| SegmentError::FormatLimit("segment byte offset"))?;
+        .map_err(|_| SegmentError::Malformed("segment byte offset"))?;
     let additional = sealed_dir
         .len()
         .checked_add(FOOTER_LEN)
-        .ok_or(SegmentError::FormatLimit("segment total length"))?;
+        .ok_or(SegmentError::Malformed("segment total length"))?;
     let total_len_usize = dir_offset_usize
         .checked_add(additional)
-        .ok_or(SegmentError::FormatLimit("segment total length"))?;
+        .ok_or(SegmentError::Malformed("segment total length"))?;
     let total_len = u64::try_from(total_len_usize)
-        .map_err(|_| SegmentError::FormatLimit("segment total length"))?;
+        .map_err(|_| SegmentError::Malformed("segment total length"))?;
     buf.try_reserve_exact(additional)
-        .map_err(|_| SegmentError::Allocation("segment metadata tail"))?;
+        .map_err(|_| SegmentError::Malformed("segment metadata allocation failed"))?;
     Ok(PreparedSegmentAssembly {
         k,
         dir_offset,
@@ -977,17 +987,17 @@ mod tests {
         assert_eq!(checked_wire_u32(8, limits, "test field").unwrap(), 8);
         assert!(matches!(
             checked_wire_u32(9, limits, "test field"),
-            Err(SegmentError::FormatLimit("test field"))
+            Err(SegmentError::Malformed("test field"))
         ));
         assert_eq!(checked_frame_index(6, 2, limits).unwrap(), 8);
         assert!(matches!(
             checked_frame_index(7, 2, limits),
-            Err(SegmentError::FormatLimit("frame index"))
+            Err(SegmentError::Malformed("frame index"))
         ));
         assert_eq!(checked_frame_body_len(4, limits).unwrap(), 4);
         assert!(matches!(
             checked_frame_body_len(5, limits),
-            Err(SegmentError::FormatLimit("stored frame length"))
+            Err(SegmentError::Malformed("stored frame length"))
         ));
     }
 
@@ -997,24 +1007,24 @@ mod tests {
         let mut builder =
             SegmentBuilder::with_limits(&c, Segid::new(1, 1), SegmentFormatLimits::with_u32_max(8));
 
-        assert_eq!(builder.append_sealed(1, 0, &[1; 4]).unwrap(), 0);
+        assert_eq!(builder.append_sealed(1, 0, &[1; 4]), 0);
         let before_buf = builder.buf.clone();
         let before_dir = builder.dir.clone();
         assert!(matches!(
-            builder.append_sealed(1, 1, &[2; 5]),
-            Err(SegmentError::FormatLimit("stored frame length"))
+            builder.try_append_sealed(1, 1, &[2; 5]),
+            Err(SegmentError::Malformed("stored frame length"))
         ));
         assert_eq!(builder.buf, before_buf);
         assert_eq!(builder.dir, before_dir);
 
         for extent in 1..8 {
-            builder.append_sealed(1, extent, &[]).unwrap();
+            builder.append_sealed(1, extent, &[]);
         }
         let before_buf = builder.buf.clone();
         let before_dir = builder.dir.clone();
         assert!(matches!(
-            builder.append_sealed(1, 8, &[]),
-            Err(SegmentError::FormatLimit("segment frame count"))
+            builder.try_append_sealed(1, 8, &[]),
+            Err(SegmentError::Malformed("segment frame count"))
         ));
         assert_eq!(builder.buf, before_buf);
         assert_eq!(builder.dir, before_dir);
@@ -1035,7 +1045,7 @@ mod tests {
 
         assert!(matches!(
             err,
-            SegmentError::FormatLimit("sealed directory length")
+            SegmentError::Malformed("sealed directory length")
         ));
         assert_eq!(frame_bytes, before);
     }
@@ -1068,8 +1078,51 @@ mod tests {
 
         assert!(matches!(
             err,
-            SegmentError::FormatLimit("directory plaintext length")
+            SegmentError::Malformed("directory plaintext length")
         ));
+    }
+
+    #[test]
+    fn directory_rejects_unrepresentable_sealed_output() {
+        let c = codec();
+        let entry = [DirEntry {
+            byte_offset: 0,
+            len: 1,
+            inode: 1,
+            extent: 0,
+        }];
+
+        let err = seal_directory_with_limits(
+            &c,
+            Segid::new(1, 1),
+            &entry,
+            SegmentFormatLimits::with_u32_max(DIR_ENTRY_LEN),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            SegmentError::Malformed("sealed directory length")
+        ));
+    }
+
+    #[test]
+    fn read_span_rejects_frame_index_overflow() {
+        let region = [0u8; 2 * LEN_PREFIX];
+        let err = parse_spans(&region, u32::MAX, &[(1, 0), (1, 1)]).unwrap_err();
+        assert!(matches!(err, SegmentError::Malformed("frame index")));
+    }
+
+    #[test]
+    fn compressed_batch_rejects_frame_index_overflow() {
+        let c = codec();
+        let frames = vec![
+            (1, 0, c.compress(b"a").unwrap()),
+            (1, 1, c.compress(b"b").unwrap()),
+        ];
+
+        let err = seal_compressed_batch(&c, Segid::new(1, 1), u32::MAX, frames).unwrap_err();
+        assert!(matches!(err, SegmentError::Malformed("frame index")));
     }
 
     // A run past PARALLEL_CRYPTO_MIN_BYTES decodes on rayon and must roundtrip with
@@ -1116,7 +1169,7 @@ mod tests {
         let sealed = seal_compressed_batch(&c, seg_a, 0, batch).unwrap();
         let mut b = SegmentBuilder::new(&c, seg_a);
         for (ino, ext, body) in &sealed {
-            b.append_sealed(*ino, *ext, body).unwrap();
+            b.append_sealed(*ino, *ext, body);
         }
         let raw = b.finish(10).unwrap();
         let seg = Segment::parse(Bytes::from(raw.clone())).unwrap();

@@ -291,18 +291,19 @@ impl Reservation {
         let first_frame =
             crate::segment::checked_frame_run_start(open.dir.len(), frames.len(), limits)?;
         let mut offset = u64::try_from(open.buf.len())
-            .map_err(|_| crate::segment::SegmentError::FormatLimit("segment byte offset"))?;
+            .map_err(|_| crate::segment::SegmentError::Malformed("segment byte offset"))?;
         let mut offsets = Vec::new();
-        offsets
-            .try_reserve_exact(frames.len())
-            .map_err(|_| crate::segment::SegmentError::Allocation("frame offsets"))?;
+        offsets.try_reserve_exact(frames.len()).map_err(|_| {
+            crate::segment::SegmentError::Malformed("frame offset allocation failed")
+        })?;
         let mut lens = Vec::new();
-        lens.try_reserve_exact(frames.len())
-            .map_err(|_| crate::segment::SegmentError::Allocation("frame lengths"))?;
+        lens.try_reserve_exact(frames.len()).map_err(|_| {
+            crate::segment::SegmentError::Malformed("frame length allocation failed")
+        })?;
         let mut entries = Vec::new();
         entries
             .try_reserve_exact(frames.len())
-            .map_err(|_| crate::segment::SegmentError::Allocation("directory entries"))?;
+            .map_err(|_| crate::segment::SegmentError::Malformed("directory allocation failed"))?;
         for &(extent, sealed_len) in frames {
             let len = crate::segment::checked_frame_body_len(sealed_len, limits)?;
             offsets.push(offset);
@@ -314,33 +315,33 @@ impl Reservation {
                 extent,
             });
             let stored_len = crate::segment::LEN_PREFIX.checked_add(sealed_len).ok_or(
-                crate::segment::SegmentError::FormatLimit("segment byte length"),
+                crate::segment::SegmentError::Malformed("segment byte length"),
             )?;
             let stored_len = u64::try_from(stored_len)
-                .map_err(|_| crate::segment::SegmentError::FormatLimit("segment byte length"))?;
+                .map_err(|_| crate::segment::SegmentError::Malformed("segment byte length"))?;
             offset =
                 offset
                     .checked_add(stored_len)
-                    .ok_or(crate::segment::SegmentError::FormatLimit(
+                    .ok_or(crate::segment::SegmentError::Malformed(
                         "segment byte length",
                     ))?;
         }
         let final_len = usize::try_from(offset)
-            .map_err(|_| crate::segment::SegmentError::FormatLimit("segment byte length"))?;
+            .map_err(|_| crate::segment::SegmentError::Malformed("segment byte length"))?;
         let growth = final_len.checked_sub(open.buf.len()).ok_or(
-            crate::segment::SegmentError::FormatLimit("segment byte length"),
+            crate::segment::SegmentError::Malformed("segment byte length"),
         )?;
-        open.dir
-            .try_reserve_exact(entries.len())
-            .map_err(|_| crate::segment::SegmentError::Allocation("segment directory entries"))?;
-        open.buf
-            .try_reserve_exact(growth)
-            .map_err(|_| crate::segment::SegmentError::Allocation("segment frame reservation"))?;
+        open.dir.try_reserve_exact(entries.len()).map_err(|_| {
+            crate::segment::SegmentError::Malformed("segment directory allocation failed")
+        })?;
+        open.buf.try_reserve_exact(growth).map_err(|_| {
+            crate::segment::SegmentError::Malformed("segment frame allocation failed")
+        })?;
         open.dir.extend(entries);
         open.buf.resize(final_len, 0);
         for (offset, len) in offsets.iter().zip(&lens) {
             let start = usize::try_from(*offset)
-                .map_err(|_| crate::segment::SegmentError::FormatLimit("segment byte offset"))?;
+                .map_err(|_| crate::segment::SegmentError::Malformed("segment byte offset"))?;
             open.buf[start..start + crate::segment::LEN_PREFIX].copy_from_slice(&len.to_le_bytes());
         }
         Ok(Self {
@@ -1036,7 +1037,11 @@ impl ExtentStore {
             limits,
         )
         .map_err(|_| FsError::IoError)?;
-        let buf = std::mem::replace(&mut open.buf, Vec::with_capacity(self.seal_threshold()));
+        let mut replacement = Vec::new();
+        replacement
+            .try_reserve_exact(self.seal_threshold())
+            .map_err(|_| FsError::IoError)?;
+        let buf = std::mem::replace(&mut open.buf, replacement);
         open.dir.clear();
         open.segid = self.segments.next_segid();
         debug_assert_ne!(
@@ -1520,7 +1525,7 @@ mod tests {
 
         assert!(matches!(
             err,
-            crate::segment::SegmentError::FormatLimit("stored frame length")
+            crate::segment::SegmentError::Malformed("stored frame length")
         ));
         assert_eq!(open.buf, before_buf);
         assert_eq!(open.dir, before_dir);
@@ -1573,6 +1578,41 @@ mod tests {
                 .is_empty(),
             "a failed rotation must not publish any object"
         );
+    }
+
+    #[tokio::test]
+    async fn rotation_rejects_replacement_allocation_without_taking_buffer() {
+        let (_store, db) = make().await;
+        let object_store = Arc::new(InMemory::new());
+        let mut store = make_store(object_store, db, CompressionConfig::Lz4, 7);
+        store.seal_threshold = usize::MAX;
+        let lane = store.open_lane(1);
+        let before = {
+            let mut open = lane.open.lock().unwrap();
+            open.buf = vec![4, 0, 0, 0, 1, 2, 3, 4];
+            open.dir = vec![DirEntry {
+                byte_offset: 0,
+                len: 4,
+                inode: 1,
+                extent: 0,
+            }];
+            (open.segid, open.buf.clone(), open.dir.clone())
+        };
+        let append = LaneAppendGuard::lock(lane).await;
+        let freeze = LaneFreeze::acquire(&append).await;
+        let residency = Arc::clone(&store.seal_residency_sem)
+            .acquire_owned()
+            .await
+            .unwrap();
+
+        let err = store
+            .rotate_sealing_generation(&freeze, residency)
+            .unwrap_err();
+
+        assert!(matches!(err, FsError::IoError));
+        let open = lane.open.lock().unwrap();
+        assert_eq!((open.segid, open.buf.clone(), open.dir.clone()), before);
+        assert!(store.sealing.lock().unwrap().is_empty());
     }
 
     async fn four_dirty_lanes(max_inflight_seals: usize) -> (ExtentStore, Arc<FaultControls>) {
