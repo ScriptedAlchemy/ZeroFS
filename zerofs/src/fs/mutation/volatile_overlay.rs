@@ -504,6 +504,14 @@ impl VolatileWriteRuntime {
             .next_sequence
     }
 
+    pub(crate) fn dirty_end(&self) -> u64 {
+        self.snapshot()
+            .iter()
+            .map(|entry| entry.offset.saturating_add(entry.data.len() as u64))
+            .max()
+            .unwrap_or(0)
+    }
+
     pub(crate) async fn wait_materialized(&self, target: u64) -> OverlayResult<()> {
         loop {
             let changed = self.changed.notified();

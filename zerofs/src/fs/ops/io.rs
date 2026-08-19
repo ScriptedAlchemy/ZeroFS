@@ -26,7 +26,7 @@ impl ZeroFS {
         offset: u64,
         count: u32,
     ) -> Result<(Bytes, bool), FsError> {
-        self.read_file_inner(Some(auth), id, offset, count).await
+        self.read_file_visible(Some(auth), id, offset, count).await
     }
 
     /// Read through a fid whose read access was already authorized at open.
@@ -37,10 +37,10 @@ impl ZeroFS {
         offset: u64,
         count: u32,
     ) -> Result<(Bytes, bool), FsError> {
-        self.read_file_inner(None, id, offset, count).await
+        self.read_file_visible(None, id, offset, count).await
     }
 
-    async fn read_file_inner(
+    pub(crate) async fn read_file_inner_canonical(
         &self,
         auth: Option<&AuthContext>,
         id: InodeId,

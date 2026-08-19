@@ -209,12 +209,12 @@ pub(crate) async fn prepare_write(
         let Inode::File(file) = &mut inode else {
             return Err(FsError::IsDirectory);
         };
-        let old_size = file.size;
+        let old_size = fs.overlay_visible_size(member.id, file.size);
         let end_offset = member
             .offset
             .checked_add(member.data.len() as u64)
             .ok_or(FsError::InvalidArgument)?;
-        let new_size = std::cmp::max(file.size, end_offset);
+        let new_size = std::cmp::max(old_size, end_offset);
 
         let mut quota = None;
         if new_size > old_size {
