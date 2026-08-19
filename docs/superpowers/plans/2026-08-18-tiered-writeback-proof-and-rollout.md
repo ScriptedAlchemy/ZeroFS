@@ -18,6 +18,7 @@
 - macOS runs portable Rust/build/lint/model/WebUI/WASM tests only. Real Linux protocols, mounts, devices, filesystems, process crashes, and benchmarks run on Ubuntu only.
 - The Ubuntu proof checkout is `/fast/projects/ZeroFS-unified-tiered-writeback`; `/fast/projects/ZeroFS` remains the clean `develop` checkout until final fast-forward.
 - Never touch CT198, VM100 production mounts, production Storage Box prefixes/exports, or an active NBD device.
+- VM100 remains NFS-only for the shared Mac/Linux namespace. Every NBD/XFS/ZFS leg uses a disposable UUID-owned Ubuntu device and is removed by ledger cleanup; no NBD client or mount is installed on VM100 by this rollout.
 - Every process, port, mount, device, filesystem/pool name, object prefix, state directory, scratch directory, and tool checkout is unique and recorded in one UUID resource ledger.
 - The immutable ledger and cleanup receipts live in `CONTROL_ROOT=/var/tmp/zerofs-tiered-control-$RUN_UUID`; disposable processes, mounts, devices, data, scratch, and tool checkouts live in the separate `RESOURCE_ROOT=/var/tmp/zerofs-tiered-resources-$RUN_UUID`. Cleanup never deletes its own authority.
 - Cleanup is idempotent after success, failure, partial setup, cancellation, supervisor cancellation, and crash.
@@ -617,9 +618,14 @@ run_benchmark_scenario() {
 run_benchmark_scenario memory benchmark-ram-ack
 run_benchmark_scenario ssd benchmark-local-ssd
 run_benchmark_scenario remote benchmark-paced-remote
+run_benchmark_scenario ssd benchmark-4gib-foreground-isolation
+run_benchmark_scenario ssd benchmark-100gib-ram-to-ssd-transition
+run_benchmark_scenario ssd benchmark-ssd-pressure-to-remote-pacing
 ```
 
-Every receipt includes size/SHA-256/readback, mutation/object floors, dirty tiers, terminal state, CPU/RAM/local allocation, remote rate, and cleanup. Performance without integrity and durability is rejected.
+The production-shaped scenarios configure 16 GB shared dirty-write RAM, 64 GB clean read cache, a 1 TB local SSD tier split into the configured clean-cache and durable journal/staging budgets, and a 5 TB-class export without counting sparse virtual geometry as remote physical use. The 4 GiB leg must remain on RAM/local SSD and reject any unexplained collapse to remote rate. The 100 GiB leg records the RAM-to-SSD transition and concurrent remote drain. The pressure leg preconditions only its disposable SSD ledger resources near the configured dirty limit, then proves each ordered remote cleanup admits incremental foreground work without a 95-to-85-percent pause.
+
+Each scenario records same-host durable local control and durability-matched same-endpoint raw SFTP control results. The production targets are approximately 800-900 MB/s local SSD and 70-100 MB/s raw SFTP; acceptance is paired to the measured control so a slower external path is diagnosed rather than concealed. Every receipt includes size/SHA-256/readback, mutation/object floors, dirty tiers, tier-transition timestamps, terminal state, CPU/RAM/local allocation, remote rate, and cleanup. Performance without integrity and durability is rejected.
 
 - [ ] **Step 6: Refactor the maintained read primitives and add RED gates**
 
@@ -842,6 +848,9 @@ run_final_scenario volatile_memory ssd terminal-fanout-and-shutdown-timeout
 run_final_scenario volatile_memory memory benchmark-ram-ack
 run_final_scenario volatile_memory ssd benchmark-local-ssd
 run_final_scenario volatile_memory remote benchmark-paced-remote
+run_final_scenario volatile_memory ssd benchmark-4gib-foreground-isolation
+run_final_scenario volatile_memory ssd benchmark-100gib-ram-to-ssd-transition
+run_final_scenario volatile_memory ssd benchmark-ssd-pressure-to-remote-pacing
 ```
 
 Run the paired read benchmark separately because the candidate must consume the
