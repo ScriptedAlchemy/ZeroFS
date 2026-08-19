@@ -8,6 +8,7 @@ use fp::fail_point;
 use crate::dedup::DedupResult;
 use crate::fs::errors::FsError;
 use crate::fs::inode::{Inode, InodeAttrs, InodeId};
+use crate::fs::mutation::types::{ConflictKey, ConflictScope};
 use crate::fs::permissions::{
     AccessMode, Credentials, can_set_times, check_access, check_ownership, validate_mode,
 };
@@ -142,6 +143,9 @@ impl ZeroFS {
             creds.gid,
             &creds.groups[..creds.groups_count]
         );
+        let _fence = self
+            .fence_metadata(ConflictScope::single(ConflictKey::Inode(id)))
+            .await?;
         let _guard = self.lock_manager.acquire(id).await;
         // A same-id call may have completed while this one waited for the inode
         // lock (direct filesystem callers do not pass through the 9P single-flight).
@@ -222,14 +226,13 @@ impl ZeroFS {
 
         match &mut inode {
             Inode::File(file) => {
+                let mut growth_reservation = None;
                 let size_change = if let SetSize::Set(new_size) = setattr.size {
                     let old_size = file.size;
                     if new_size != old_size {
                         if new_size > old_size {
                             let size_increase = new_size - old_size;
-                            let reservation = self.quota.reserve(size_increase)?;
-                            reservation.accept();
-                            reservation.canonical();
+                            growth_reservation = Some(self.quota.reserve(size_increase)?);
                         }
 
                         file.size = new_size;
@@ -351,6 +354,13 @@ impl ZeroFS {
                     );
 
                     self.write_coordinator.commit(txn).await?;
+
+                    if let Some(reservation) = growth_reservation {
+                        reservation.accept();
+                        reservation.canonical();
+                    } else if new_size < old_size {
+                        self.quota.release_committed(old_size - new_size);
+                    }
 
                     #[cfg(feature = "failpoints")]
                     fail_point!(fp::TRUNCATE_AFTER_COMMIT);
@@ -959,5 +969,122 @@ mod tests {
         assert_eq!(current.gid, 3002);
         assert_eq!(current.atime, later_atime);
         assert_eq!(current.mtime, later_mtime);
+    }
+
+    #[tokio::test]
+    async fn grow_holds_quota_provisional_until_commit() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let (file_id, _) = fs
+            .create(
+                &test_creds(),
+                0,
+                b"grow-quota.txt",
+                &SetAttributes::default(),
+            )
+            .await
+            .unwrap();
+        let before = fs.quota.committed_bytes();
+        let grown = fs
+            .setattr(
+                &test_creds(),
+                file_id,
+                &SetAttributes {
+                    size: SetSize::Set(4_096),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(grown.size, 4_096);
+        assert_eq!(fs.quota.committed_bytes(), before + 4_096);
+        assert_eq!(fs.quota.pending_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn shrink_releases_quota_only_after_commit() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let (file_id, _) = fs
+            .create(
+                &test_creds(),
+                0,
+                b"shrink-quota.txt",
+                &SetAttributes::default(),
+            )
+            .await
+            .unwrap();
+        fs.setattr(
+            &test_creds(),
+            file_id,
+            &SetAttributes {
+                size: SetSize::Set(4_096),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let after_grow = fs.quota.committed_bytes();
+        let shrunk = fs
+            .setattr(
+                &test_creds(),
+                file_id,
+                &SetAttributes {
+                    size: SetSize::Set(1_024),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(shrunk.size, 1_024);
+        assert_eq!(fs.quota.committed_bytes(), after_grow - 3_072);
+        assert_eq!(fs.quota.pending_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn pending_write_drains_before_truncate_without_holding_canonical_lock() {
+        use crate::fs::mutation::types::{ConflictKey, ConflictScope};
+        use std::sync::Arc;
+
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        fs.start_materializer();
+        let (file_id, _) = fs
+            .create(
+                &test_creds(),
+                0,
+                b"fenced-trunc.txt",
+                &SetAttributes::default(),
+            )
+            .await
+            .unwrap();
+        fs.write(
+            &(&test_auth()).into(),
+            file_id,
+            0,
+            &Bytes::from_static(b"abcdef"),
+        )
+        .await
+        .unwrap();
+
+        let attrs = fs
+            .assert_pending_write_drains_without_canonical_lock(
+                ConflictScope::single(ConflictKey::Inode(file_id)),
+                file_id,
+                {
+                    let fs = Arc::clone(&fs);
+                    async move {
+                        fs.setattr(
+                            &test_creds(),
+                            file_id,
+                            &SetAttributes {
+                                size: SetSize::Set(2),
+                                ..SetAttributes::default()
+                            },
+                        )
+                        .await
+                    }
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(attrs.size, 2);
     }
 }

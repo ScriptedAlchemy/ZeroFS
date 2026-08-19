@@ -8,6 +8,7 @@ use fp::fail_point;
 use crate::dedup::DedupResult;
 use crate::fs::errors::FsError;
 use crate::fs::inode::{Inode, InodeId};
+use crate::fs::mutation::types::{ConflictKey, ConflictScope};
 use crate::fs::permissions::{AccessMode, Credentials, check_access, check_sticky_bit_delete};
 use crate::fs::tracing::FileOperation;
 use crate::fs::types::AuthContext;
@@ -112,6 +113,12 @@ impl ZeroFS {
             }
         };
 
+        let _fence = self
+            .fence_metadata(ConflictScope::new([
+                ConflictKey::Directory(dirid),
+                ConflictKey::Inode(file_id),
+            ]))
+            .await?;
         let _guards = self.lock_manager.acquire_multi(vec![dirid, file_id]).await;
 
         // Recheck replay state after waiting for inode locks.
@@ -364,10 +371,11 @@ impl ZeroFS {
                 }
 
                 self.write_coordinator.commit(txn).await?;
-                if !deferred && original_nlink <= 1 {
-                    if let crate::fs::inode::Inode::File(file) = &file_inode {
-                        self.quota.release_committed(file.size);
-                    }
+                if !deferred
+                    && original_nlink <= 1
+                    && let crate::fs::inode::Inode::File(file) = &file_inode
+                {
+                    self.quota.release_committed(file.size);
                 }
 
                 if deferred {
@@ -571,5 +579,43 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(fs.dedup.get(&op_id), Some(DedupResult::Remove)));
+    }
+
+    #[tokio::test]
+    async fn pending_write_drains_before_unlink_without_holding_canonical_lock() {
+        use crate::fs::mutation::types::{ConflictKey, ConflictScope};
+        use std::sync::Arc;
+
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        fs.start_materializer();
+        let (file_id, _) = fs
+            .create(
+                &test_creds(),
+                0,
+                b"fenced-unlink.txt",
+                &SetAttributes::default(),
+            )
+            .await
+            .unwrap();
+
+        fs.assert_pending_write_drains_without_canonical_lock(
+            ConflictScope::new([ConflictKey::Directory(0), ConflictKey::Inode(file_id)]),
+            file_id,
+            {
+                let fs = Arc::clone(&fs);
+                async move {
+                    fs.remove(&(&test_auth()).into(), 0, b"fenced-unlink.txt")
+                        .await
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            !fs.directory_store
+                .exists(0, b"fenced-unlink.txt")
+                .await
+                .unwrap()
+        );
     }
 }

@@ -10,10 +10,15 @@ volatile/writeback tier is drained.
 from __future__ import annotations
 
 import argparse
+import base64
+import contextlib
 import hashlib
 import ipaddress
+import json
+import math
 import os
 import re
+import selectors
 import shlex
 import shutil
 import subprocess
@@ -24,29 +29,39 @@ import tomllib
 import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Iterator, Sequence
+
+try:
+    from proxmox import nfs_mount
+except ModuleNotFoundError:
+    import nfs_mount
+
+LegacyNbdState = nfs_mount.LegacyNbdState
+SharedNamespaceOwnershipReceipt = nfs_mount.SharedNamespaceOwnershipReceipt
+parse_shared_namespace_ownership_receipt = (
+    nfs_mount.parse_shared_namespace_ownership_receipt
+)
+plan_legacy_nbd_retirement = nfs_mount.plan_legacy_nbd_retirement
+validate_shared_namespace_ownership = nfs_mount.validate_shared_namespace_ownership
 
 
 VM_NFS_MOUNT_UNIT = r"mnt-zerofs\x2dfiles.mount"
-VM_NFS_MOUNTPOINT = "/mnt/zerofs-files"
 VM_NFS_TEMPLATE_SOURCE = "10.10.10.30:/"
-VM_LEGACY_NBD_MOUNT_UNIT = "mnt-zerofs-lxc.mount"
-VM_LEGACY_NBD_CLIENT_UNIT = "zerofs-lxc-nbd-client.service"
-VM_LEGACY_NBD_MOUNTPOINT = "/mnt/zerofs-lxc"
-VM_LEGACY_NBD_DEVICE = "/dev/nbd0"
-VM_LEGACY_NAMESPACE_UNITS = (
-    r"mnt-zerofs\x2dfiles\x2draw.mount",
-    r"mnt-zerofs\x2dfiles\x2draw-.nbd.mount",
-    "zerofs-shared-namespace-permissions.service",
-)
-VM_LEGACY_NAMESPACE_MOUNTS = (
-    "/mnt/zerofs-files-raw/.nbd",
-    "/mnt/zerofs-files-raw",
-)
+DEV_LEGACY_NBD_CLIENT_UNIT = "zerofs-nbd-client.service"
+DEV_LEGACY_NBD_MOUNT_UNIT = "mnt-storagebox-nbd-pilot.mount"
+DEV_LEGACY_NBD_MOUNTPOINT = "/mnt/storagebox-nbd-pilot"
+DEV_LEGACY_NBD_SERVER_UNIT = "zerofs-nbd-pilot.service"
+DEV_LEGACY_NBD_DEVICE = "/dev/nbd0"
+OWNERSHIP_REPAIR_CONFIRMATION = "501:20"
 RFC1918_NETWORKS = tuple(
     ipaddress.ip_network(value)
     for value in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
 )
+DECIMAL_GB = 1_000_000_000
+MIB = 1024 * 1024
+GIB = 1024 * MIB
+PROD_UNIFIED_VOLATILE_MEMORY_GB = 16.0
+PROD_FIXED_MEMORY_RESERVE_BYTES = 40 * GIB
 
 
 def is_rfc1918(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
@@ -144,6 +159,25 @@ def _split_listener(
         ) from error
 
 
+def _posix_identity(
+    section: dict[str, object], label: str, *, nested: bool
+) -> tuple[int, int]:
+    value: object = section.get("shared_identity") if nested else section
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} must configure numeric uid and gid")
+    uid, gid = value.get("uid"), value.get("gid")
+    if (
+        not isinstance(uid, int)
+        or isinstance(uid, bool)
+        or not isinstance(gid, int)
+        or isinstance(gid, bool)
+        or uid < 0
+        or gid < 0
+    ):
+        raise ValueError(f"{label} must configure non-negative numeric uid and gid")
+    return uid, gid
+
+
 def validate_server_config(
     path: Path,
     container_ip: str,
@@ -237,8 +271,6 @@ def validate_server_config(
                 raise ValueError(
                     "NFS must listen only on the private container address at port 2049"
                 )
-        if nfs.get("shared_identity") != {"uid": 501, "gid": 20}:
-            raise ValueError("NFS shared_identity must use uid 501 and gid 20")
         webui = servers.get("webui")
         if not isinstance(webui, dict):
             raise ValueError("prod requires the private WebUI listener")
@@ -251,8 +283,19 @@ def validate_server_config(
                 raise ValueError(
                     "WebUI must listen only on the private container address at port 8080"
                 )
-        if webui.get("uid") != 501 or webui.get("gid") != 20:
-            raise ValueError("WebUI must use shared namespace identity uid 501 and gid 20")
+        identities = {
+            _posix_identity(nfs, "NFS shared_identity", nested=True),
+            _posix_identity(ninep, "9P shared_identity", nested=True),
+            _posix_identity(webui, "WebUI", nested=False),
+        }
+        if len(identities) != 1:
+            raise ValueError(
+                "writable production frontends must use one shared identity"
+            )
+        if identities != {(501, 20)}:
+            raise ValueError(
+                "writable production frontends must use uid 501 and gid 20"
+            )
     rpc = servers.get("rpc", {})
     if _addresses(rpc):
         raise ValueError("RPC must be Unix-socket only")
@@ -292,6 +335,46 @@ def validate_server_config(
         "/srv/zerofs-persist/cache"
     ):
         raise ValueError("[cache] dir must be below /srv/zerofs-persist/cache")
+    if role == "prod":
+        if cache.get("memory_size_gb") != 32.0:
+            raise ValueError("production clean cache memory_size_gb must be 32.0 GB")
+        if writeback.get("memory_size_gb") != 4.0:
+            raise ValueError("production writeback memory_size_gb must be 4.0 GB")
+        runtime = settings.get("runtime")
+        if not isinstance(runtime, dict) or "memory_limit_gb" not in runtime:
+            raise ValueError("production [runtime] memory_limit_gb is required")
+        runtime_gb = runtime["memory_limit_gb"]
+        if (
+            not isinstance(runtime_gb, (int, float))
+            or isinstance(runtime_gb, bool)
+            or not math.isfinite(runtime_gb)
+            or runtime_gb <= 0
+        ):
+            raise ValueError(
+                "production [runtime] memory_limit_gb must be finite and positive"
+            )
+        runtime_bytes = int(runtime_gb * DECIMAL_GB)
+        minimum_runtime_bytes = (
+            int(
+                (
+                    cache["memory_size_gb"]
+                    + writeback["memory_size_gb"]
+                    + PROD_UNIFIED_VOLATILE_MEMORY_GB
+                )
+                * DECIMAL_GB
+            )
+            + PROD_FIXED_MEMORY_RESERVE_BYTES
+        )
+        if runtime_bytes < minimum_runtime_bytes:
+            raise ValueError(
+                "production [runtime] memory_limit_gb does not cover the 16.0 GB "
+                "unified volatile budget and 40 GiB safety reserves"
+            )
+        if memory_mb is not None and runtime_bytes > memory_mb * MIB:
+            raise ValueError(
+                f"production [runtime] memory_limit_gb exceeds container memory "
+                f"{memory_mb} MiB"
+            )
     if memory_mb is not None:
         ram_values = (
             cache.get("memory_size_gb", 0),
@@ -321,6 +404,29 @@ def validate_server_config(
             if not isinstance(value, int) or not 1 <= value <= 4:
                 raise ValueError(f"SFTP {field} must be between one and four")
     return storage_url
+
+
+def render_nfs_bootstrap_config(source: str) -> str:
+    excluded = ("servers.ninep", "servers.nbd", "servers.webui")
+    rendered: list[str] = []
+    keep = True
+    for line in source.splitlines(keepends=True):
+        match = re.match(r"^\s*\[([^]]+)]\s*(?:#.*)?$", line)
+        if match:
+            table = match.group(1)
+            keep = not any(
+                table == prefix or table.startswith(f"{prefix}.") for prefix in excluded
+            )
+        if keep:
+            rendered.append(line)
+    result = "".join(rendered)
+    parsed = tomllib.loads(result)
+    servers = parsed.get("servers")
+    if not isinstance(servers, dict) or set(servers) != {"nfs", "rpc"}:
+        raise ValueError("NFS bootstrap config must contain only NFS and RPC servers")
+    if "prometheus" not in parsed:
+        raise ValueError("NFS bootstrap config requires Prometheus health checks")
+    return result
 
 
 def require_replace_confirmation(ctid: int, confirmation: str | None) -> None:
@@ -395,6 +501,7 @@ def build_host_plan(
     state_root: Path,
     memory_mb: int,
     rootfs: str,
+    cores: int = 8,
 ) -> list[list[str]]:
     if action not in {"deploy", "replace", "cleanup"}:
         raise ValueError(f"unsupported host action: {action}")
@@ -419,6 +526,10 @@ def build_host_plan(
                     "1",
                     "--memory",
                     str(memory_mb),
+                    "--cores",
+                    str(cores),
+                    "--swap",
+                    "0",
                     "--rootfs",
                     rootfs,
                     "--net0",
@@ -427,6 +538,8 @@ def build_host_plan(
                     f"{state_root},mp=/srv/zerofs-persist",
                     "--onboot",
                     "1",
+                    "--startup",
+                    "order=20",
                 ],
             ]
         )
@@ -440,9 +553,111 @@ def build_host_plan(
     return plan
 
 
+class _FlockLease:
+    def __init__(self, command: Sequence[str], *, dry_run: bool) -> None:
+        self.command = list(command)
+        self.dry_run = dry_run
+        self.process: subprocess.Popen[str] | None = None
+
+    def __enter__(self) -> _FlockLease:
+        print(f"+ acquire-lock {shell_join(self.command)}")
+        if self.dry_run:
+            return self
+        process = subprocess.Popen(
+            self.command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        self.process = process
+        assert process.stdout is not None
+        selector = selectors.DefaultSelector()
+        selector.register(process.stdout, selectors.EVENT_READ)
+        try:
+            ready = selector.select(timeout=15)
+        finally:
+            selector.close()
+        if ready and process.stdout.readline().strip() == "LOCKED":
+            return self
+        try:
+            _stdout, stderr = process.communicate(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.terminate()
+            _stdout, stderr = process.communicate(timeout=2)
+        raise RuntimeError(
+            "another ZeroFS deployment owns the deployment lock"
+            + (f": {stderr.strip()}" if stderr.strip() else "")
+        )
+
+    def __exit__(self, *_exc: object) -> None:
+        if self.process is None:
+            return
+        process = self.process
+        if process.stdin is not None:
+            process.stdin.close()
+        try:
+            returncode = process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.terminate()
+            returncode = process.wait(timeout=5)
+        if process.stdout is not None:
+            process.stdout.close()
+        if process.stderr is not None:
+            process.stderr.close()
+        if returncode != 0:
+            raise RuntimeError(f"deployment lock process exited {returncode}")
+
+    def execute(self, script: str) -> str:
+        process = self.process
+        if process is None or process.poll() is not None:
+            raise RuntimeError("deployment lock lease was lost")
+        assert process.stdin is not None and process.stdout is not None
+        token = hashlib.sha256(os.urandom(32)).hexdigest()
+        payload = base64.b64encode(script.encode()).decode()
+        process.stdin.write(f"{token} {payload}\n")
+        process.stdin.flush()
+        output: list[str] = []
+        marker = f"__ZEROFS_LOCK_RESULT__ {token} "
+        while True:
+            line = process.stdout.readline()
+            if not line:
+                raise RuntimeError("deployment lock lease was lost during command")
+            if line.startswith(marker):
+                status = int(line.removeprefix(marker).strip())
+                text = "".join(output)
+                if status != 0:
+                    raise RuntimeError(
+                        f"locked remote command exited {status}: {text.strip()}"
+                    )
+                return text
+            output.append(line)
+
+
+def _remote_lock_holder(path: str) -> str:
+    return (
+        f"exec 9>{shlex.quote(path)}; "
+        "flock -n 9 || exit 75; printf 'LOCKED\\n'; "
+        "while IFS=' ' read -r token payload; do "
+        "set +e; output=$(printf '%s' \"$payload\" | base64 -d | bash -se 2>&1); "
+        'status=$?; set -e; test -z "$output" || printf \'%s\\n\' "$output"; '
+        'printf \'__ZEROFS_LOCK_RESULT__ %s %s\\n\' "$token" "$status"; '
+        "done"
+    )
+
+
 class Runner:
     def __init__(self, dry_run: bool) -> None:
         self.dry_run = dry_run
+        self._active_leases: list[_FlockLease] = []
+        self._remote_leases: dict[str, _FlockLease] = {}
+
+    def _assert_leases_held(self) -> None:
+        if self.dry_run:
+            return
+        for lease in self._active_leases:
+            if lease.process is None or lease.process.poll() is not None:
+                raise RuntimeError("deployment lock lease was lost")
 
     def run(
         self,
@@ -459,7 +674,8 @@ class Runner:
                 for line in input_text.rstrip().splitlines():
                     print(f"  | {line}")
             return subprocess.CompletedProcess(command, 0, "", "")
-        return subprocess.run(
+        self._assert_leases_held()
+        result = subprocess.run(
             list(command),
             cwd=cwd,
             check=True,
@@ -467,6 +683,51 @@ class Runner:
             input=input_text,
             capture_output=capture,
         )
+        self._assert_leases_held()
+        return result
+
+    @contextlib.contextmanager
+    def remote_deployment_locks(self, args: argparse.Namespace) -> Iterator[None]:
+        locks = (
+            (
+                args.vm_host,
+                "/run/lock/zerofs-vm-nfs-global.coordinator.lock",
+                True,
+            ),
+        )
+        with contextlib.ExitStack() as stack:
+            for host, path, sudo in locks:
+                lock_script = _remote_lock_holder(path)
+                remote = (
+                    f"sudo bash -c {shlex.quote(lock_script)}"
+                    if sudo
+                    else f"bash -c {shlex.quote(lock_script)}"
+                )
+                command = [
+                    "ssh",
+                    "-o",
+                    "BatchMode=yes",
+                    "-o",
+                    "ServerAliveInterval=15",
+                    "-o",
+                    "ServerAliveCountMax=3",
+                    host,
+                    remote,
+                ]
+                lease = stack.enter_context(_FlockLease(command, dry_run=self.dry_run))
+                self._active_leases.append(lease)
+                stack.callback(self._active_leases.remove, lease)
+                self._remote_leases[host] = lease
+                stack.callback(self._remote_leases.pop, host)
+            yield
+
+    def run_remote_shell(self, host: str, script: str) -> str | None:
+        if self.dry_run:
+            return None
+        lease = self._remote_leases.get(host)
+        if lease is None:
+            return None
+        return lease.execute(script)
 
 
 def sha256(path: Path) -> str:
@@ -564,7 +825,20 @@ def _build(runner: Runner, root: Path, role: str) -> Path:
 
 
 def _ssh(runner: Runner, host: str, script: str) -> None:
+    if runner.run_remote_shell(host, script) is not None:
+        return
     runner.run(["ssh", "-o", "BatchMode=yes", host, "bash", "-se"], input_text=script)
+
+
+def _ssh_capture(runner: Runner, host: str, script: str) -> str:
+    locked = runner.run_remote_shell(host, script)
+    if locked is not None:
+        return locked
+    return runner.run(
+        ["ssh", "-o", "BatchMode=yes", host, "bash", "-se"],
+        input_text=script,
+        capture=True,
+    ).stdout
 
 
 def _quiesce_guest(runner: Runner, args: argparse.Namespace) -> None:
@@ -573,6 +847,11 @@ unit_loaded() {{
   test "$(systemctl show -p LoadState --value "$1" 2>/dev/null || true)" != not-found
 }}
 if findmnt -rn -M {shlex.quote(args.source_mountpoint)} >/dev/null 2>&1; then
+  source_device=$(findmnt -nro SOURCE -M {shlex.quote(args.source_mountpoint)})
+  if test "$source_device" != {shlex.quote(DEV_LEGACY_NBD_DEVICE)}; then
+    echo "unexpected legacy NBD mount source: $source_device" >&2
+    exit 1
+  fi
   sudo sync -f {shlex.quote(args.source_mountpoint)}
 fi
 if unit_loaded {shlex.quote(args.source_mount_unit)}; then
@@ -609,13 +888,24 @@ def _has_legacy_nbd_source(args: argparse.Namespace) -> bool:
         args.source_client_unit,
         args.source_mount_unit,
         args.source_mountpoint,
+        args.source_server_unit,
     )
     if not any(source):
         return False
     if not all(source):
         raise ValueError(
-            "legacy NBD quiescing requires --source-client-unit, "
-            "--source-mount-unit, and --source-mountpoint together"
+            "legacy NBD quiescing requires all four --source-* options together"
+        )
+    expected = (
+        DEV_LEGACY_NBD_CLIENT_UNIT,
+        DEV_LEGACY_NBD_MOUNT_UNIT,
+        DEV_LEGACY_NBD_MOUNTPOINT,
+        DEV_LEGACY_NBD_SERVER_UNIT,
+    )
+    if args.role != "dev" or source != expected:
+        raise ValueError(
+            "--source-* may target only the documented legacy NBD pilot; "
+            "production NFS units and mountpoints are never migration sources"
         )
     return True
 
@@ -676,6 +966,10 @@ def _stage_and_run_host(
     binary_hash: str,
     namespace: str,
     release: str,
+    *,
+    defer_commit: bool = False,
+    config_path: Path | None = None,
+    maintenance_nfs_only: bool = False,
 ) -> None:
     bundle = Path(__file__).resolve().parent
     stage = f"/var/tmp/zerofs-lxc-deploy-{args.ctid}-{commit[:12]}"
@@ -690,7 +984,7 @@ def _stage_and_run_host(
     else:
         files = (
             (binary, "zerofs"),
-            (args.config, "zerofs.toml"),
+            (config_path or args.config, "zerofs.toml"),
             (bundle / "host-deploy.sh", "host-deploy.sh"),
             (bundle / "hooks" / "zerofs-lxc-hook.sh", "zerofs-lxc-hook.sh"),
             (bundle / "systemd" / "zerofs-lxc.service", "zerofs-lxc.service"),
@@ -758,6 +1052,10 @@ def _stage_and_run_host(
     ]
     if args.dry_run:
         host_args.append("--dry-run")
+    if defer_commit:
+        host_args.append("--defer-commit")
+    if maintenance_nfs_only:
+        host_args.append("--maintenance-nfs-only")
     if args.action == "replace":
         host_args.extend(["--confirm-replace", str(args.ctid)])
     try:
@@ -770,148 +1068,372 @@ def _stage_and_run_host(
         )
 
 
+def _run_host_deployment_control(
+    runner: Runner,
+    args: argparse.Namespace,
+    action: str,
+    commit: str,
+    binary_hash: str,
+    namespace: str,
+    release: str,
+) -> None:
+    if action not in {"promote", "finalize", "commit", "rollback", "recover"}:
+        raise ValueError(f"invalid host deployment control: {action}")
+    bundle = Path(__file__).resolve().parent
+    stage = f"/var/tmp/zerofs-lxc-control-{args.ctid}-{release}"
+    remote_script = f"{stage}/host-deploy.sh"
+    _ssh(
+        runner,
+        args.pve_host,
+        f"set -euo pipefail\ninstall -d -m 0700 {shlex.quote(stage)}\n",
+    )
+    try:
+        runner.run(
+            [
+                "scp",
+                "-q",
+                str(bundle / "host-deploy.sh"),
+                f"{args.pve_host}:{remote_script}",
+            ]
+        )
+        if action == "promote":
+            runner.run(
+                [
+                    "scp",
+                    "-q",
+                    str(args.config),
+                    f"{args.pve_host}:{stage}/zerofs.toml",
+                ]
+            )
+        host_args = [
+            "bash",
+            remote_script,
+            action,
+            "--role",
+            "prod",
+            "--ctid",
+            str(args.ctid),
+            "--container-ip",
+            args.container_ip,
+            "--bridge",
+            args.bridge,
+            "--gateway",
+            args.gateway,
+            "--template",
+            args.template,
+            "--rootfs",
+            args.rootfs,
+            "--memory-mb",
+            str(args.memory_mb),
+            "--cores",
+            str(args.cores),
+            "--state-root",
+            args.state_root,
+            "--stage",
+            stage,
+            "--commit",
+            commit,
+            "--sha256",
+            binary_hash,
+            "--namespace-id",
+            namespace,
+            "--release-id",
+            release,
+            "--samba-user",
+            args.samba_user,
+            "--prod-access",
+            args.prod_access,
+        ]
+        if args.dry_run:
+            host_args.append("--dry-run")
+        runner.run(["ssh", "-o", "BatchMode=yes", args.pve_host, *host_args])
+    finally:
+        _ssh(
+            runner,
+            args.pve_host,
+            f"set -euo pipefail\nrm -rf -- {shlex.quote(stage)}\n",
+        )
+
+
+def _run_ownership_migration(runner: Runner, args: argparse.Namespace) -> None:
+    bundle = Path(__file__).resolve().parent
+    helper = bundle / "guest" / "repair-zerofs-ownership.sh"
+    remote_stage = f"/tmp/zerofs-ownership-{args.ctid}"
+    remote_helper = f"{remote_stage}/repair-zerofs-ownership.sh"
+    mode = (
+        "inventory"
+        if args.dry_run or args.action == "ownership-inventory"
+        else "repair"
+    )
+    with runner.remote_deployment_locks(args):
+        try:
+            _ssh(
+                runner,
+                args.vm_host,
+                f"set -euo pipefail\ninstall -d -m 0700 {shlex.quote(remote_stage)}\n",
+            )
+            runner.run(["scp", "-q", str(helper), f"{args.vm_host}:{remote_helper}"])
+            command = [
+                "sudo",
+                "bash",
+                remote_helper,
+                mode,
+                f"{args.container_ip}:/",
+                *([OWNERSHIP_REPAIR_CONFIRMATION] if mode == "repair" else []),
+            ]
+            _ssh(
+                runner,
+                args.vm_host,
+                f"set -euo pipefail\n{shell_join(command)}\n",
+            )
+        finally:
+            _ssh(
+                runner,
+                args.vm_host,
+                f"set -euo pipefail\nrm -rf -- {shlex.quote(remote_stage)}\n",
+            )
+
+
 def render_vm_nfs_mount(template: str, container_ip: str) -> str:
     address = ipaddress.ip_address(container_ip)
     if not is_rfc1918(address):
         raise ValueError("VM NFS mount source must be RFC1918 private space")
     if template.count(f"What={VM_NFS_TEMPLATE_SOURCE}") != 1:
         raise ValueError("VM NFS mount template must contain one canonical source")
-    return template.replace(
-        f"What={VM_NFS_TEMPLATE_SOURCE}", f"What={address}:/", 1
-    )
+    return template.replace(f"What={VM_NFS_TEMPLATE_SOURCE}", f"What={address}:/", 1)
 
 
-def _provision_vm_nfs_mount(runner: Runner, args: argparse.Namespace) -> None:
+def _run_prod_vm_nfs_transaction(
+    runner: Runner,
+    args: argparse.Namespace,
+    release: str,
+    activate_host: Callable[[], None],
+    commit_host: Callable[[], None],
+    rollback_host: Callable[[], None],
+    recover_host: Callable[[], None],
+    *,
+    activate_maintenance: Callable[[], None] | None = None,
+    promote_host: Callable[[], None] | None = None,
+) -> None:
     bundle = Path(__file__).resolve().parent
-    source = f"/tmp/{VM_NFS_MOUNT_UNIT}"
-    destination = f"/etc/systemd/system/{VM_NFS_MOUNT_UNIT}"
+    helper = bundle / "vm_nfs_transition.py"
+    guest_reconciler = bundle / "guest" / "reconcile-zerofs-nfs.sh"
     template = (bundle / "systemd" / VM_NFS_MOUNT_UNIT).read_text()
     rendered = render_vm_nfs_mount(template, args.container_ip)
-    legacy_units = " ".join(shlex.quote(unit) for unit in VM_LEGACY_NAMESPACE_UNITS)
-    legacy_mounts = " ".join(
-        shlex.quote(mountpoint) for mountpoint in VM_LEGACY_NAMESPACE_MOUNTS
-    )
-    script = f"""set -euo pipefail
-unit_loaded() {{
-  test "$(systemctl show -p LoadState --value "$1" 2>/dev/null || true)" != not-found
-}}
-legacy_nbd_owned=0
-if systemctl is-active --quiet {shlex.quote(VM_LEGACY_NBD_CLIENT_UNIT)}; then
-  legacy_nbd_owned=1
-fi
-if findmnt -rn -M {shlex.quote(VM_LEGACY_NBD_MOUNTPOINT)} >/dev/null 2>&1; then
-  legacy_nbd_source=$(findmnt -nro SOURCE -M {shlex.quote(VM_LEGACY_NBD_MOUNTPOINT)})
-  if test "$legacy_nbd_source" != {shlex.quote(VM_LEGACY_NBD_DEVICE)}; then
-    echo "refusing to retire unexpected legacy mount source: $legacy_nbd_source" >&2
-    exit 1
-  fi
-  legacy_nbd_owned=1
-  sudo sync -f {shlex.quote(VM_LEGACY_NBD_MOUNTPOINT)}
-fi
-if unit_loaded {shlex.quote(VM_LEGACY_NBD_MOUNT_UNIT)}; then
-  sudo systemctl disable --now {shlex.quote(VM_LEGACY_NBD_MOUNT_UNIT)}
-  if systemctl is-enabled --quiet {shlex.quote(VM_LEGACY_NBD_MOUNT_UNIT)}; then
-    echo 'legacy NBD mount remains enabled' >&2
-    exit 1
-  fi
-  test "$(systemctl is-active {shlex.quote(VM_LEGACY_NBD_MOUNT_UNIT)} 2>/dev/null || true)" != active
-fi
-if findmnt -rn -M {shlex.quote(VM_LEGACY_NBD_MOUNTPOINT)} >/dev/null 2>&1; then
-  sudo umount {shlex.quote(VM_LEGACY_NBD_MOUNTPOINT)}
-fi
-if findmnt -rn -M {shlex.quote(VM_LEGACY_NBD_MOUNTPOINT)} >/dev/null 2>&1; then
-  echo 'legacy NBD mount remains active; refusing device disconnect' >&2
-  exit 1
-fi
-if unit_loaded {shlex.quote(VM_LEGACY_NBD_CLIENT_UNIT)}; then
-  sudo systemctl disable --now {shlex.quote(VM_LEGACY_NBD_CLIENT_UNIT)}
-  if systemctl is-enabled --quiet {shlex.quote(VM_LEGACY_NBD_CLIENT_UNIT)}; then
-    echo 'legacy NBD client remains enabled' >&2
-    exit 1
-  fi
-  test "$(systemctl is-active {shlex.quote(VM_LEGACY_NBD_CLIENT_UNIT)} 2>/dev/null || true)" != active
-fi
-legacy_nbd_pid=$(cat /sys/class/block/nbd0/pid 2>/dev/null || true)
-if test -n "$legacy_nbd_pid"; then
-  if test "$legacy_nbd_owned" != 1; then
-    echo 'nbd0 is connected without recognized legacy ZeroFS state; refusing disconnect' >&2
-    exit 1
-  fi
-  if ! command -v nbd-client >/dev/null 2>&1; then
-    echo 'nbd-client is required to disconnect the recognized legacy device' >&2
-    exit 1
-  fi
-  sudo nbd-client -d {shlex.quote(VM_LEGACY_NBD_DEVICE)}
-fi
-if test -s /sys/class/block/nbd0/pid; then
-  echo 'legacy nbd0 remains connected' >&2
-  exit 1
-fi
-sudo rm -f \
-  /etc/systemd/system/{shlex.quote(VM_LEGACY_NBD_MOUNT_UNIT)} \
-  /etc/systemd/system/{shlex.quote(VM_LEGACY_NBD_CLIENT_UNIT)} \
-  /usr/local/libexec/zerofs-tune-nbd \
-  /etc/zerofs-lxc/client.env
-sudo systemctl daemon-reload
-if unit_loaded {shlex.quote(VM_LEGACY_NBD_MOUNT_UNIT)} || unit_loaded {shlex.quote(VM_LEGACY_NBD_CLIENT_UNIT)}; then
-  echo 'legacy NBD units remain installed after retirement' >&2
-  exit 1
-fi
-for legacy_unit in {legacy_units}; do
-  if unit_loaded "$legacy_unit"; then
-    sudo systemctl disable --now "$legacy_unit"
-    if systemctl is-enabled --quiet "$legacy_unit"; then
-      echo "legacy namespace unit remains enabled: $legacy_unit" >&2
-      exit 1
-    fi
-    test "$(systemctl is-active "$legacy_unit" 2>/dev/null || true)" != active
-  fi
-done
-for legacy_mount in {legacy_mounts}; do
-  if findmnt -rn -M "$legacy_mount" >/dev/null 2>&1; then
-    echo "legacy namespace mount remains active: $legacy_mount" >&2
-    exit 1
-  fi
-done
-if unit_loaded {shlex.quote(VM_NFS_MOUNT_UNIT)}; then
-  sudo systemctl disable --now {shlex.quote(VM_NFS_MOUNT_UNIT)}
-fi
-if findmnt -rn -M {shlex.quote(VM_NFS_MOUNTPOINT)} >/dev/null 2>&1; then
-  echo 'file namespace mount remained active after unit retirement' >&2
-  exit 1
-fi
-sudo install -d -m 0755 {shlex.quote(VM_NFS_MOUNTPOINT)} /etc/systemd/system
-sudo install -m 0644 {shlex.quote(source)} {shlex.quote(destination)}
-sudo systemctl daemon-reload
-sudo systemctl enable --now {shlex.quote(VM_NFS_MOUNT_UNIT)}
-sudo systemctl restart {shlex.quote(VM_NFS_MOUNT_UNIT)}
-systemctl is-enabled --quiet {shlex.quote(VM_NFS_MOUNT_UNIT)}
-systemctl is-active --quiet {shlex.quote(VM_NFS_MOUNT_UNIT)}
-mount_record=$(findmnt -rn -M {shlex.quote(VM_NFS_MOUNTPOINT)} -o SOURCE,FSTYPE,OPTIONS)
-mount_source=${{mount_record%% *}}
-mount_details=${{mount_record#* }}
-mount_fstype=${{mount_details%% *}}
-mount_options=${{mount_details#* }}
-test "$mount_source" = "{args.container_ip}:/"
-test "$mount_fstype" = nfs
-case ",$mount_options," in
-  *,rw,*) ;;
-  *) echo 'VM NFS mount is not read-write' >&2; exit 1 ;;
-esac
-rm -f {shlex.quote(source)}
-"""
-    with tempfile.TemporaryDirectory(prefix="zerofs-vm-nfs-") as directory:
-        rendered_path = Path(directory) / VM_NFS_MOUNT_UNIT
-        rendered_path.write_text(rendered)
-        runner.run(
-            ["scp", "-q", str(rendered_path), f"{args.vm_host}:{source}"]
+    remote_stage = f"/tmp/zerofs-vm-nfs-{args.ctid}-{release}"
+    transaction = "/var/lib/zerofs-deploy/transactions/active"
+    remote_helper = f"{remote_stage}/vm_nfs_transition.py"
+    remote_guest_reconciler = f"{remote_stage}/reconcile-zerofs-nfs.sh"
+    remote_unit = f"{remote_stage}/{VM_NFS_MOUNT_UNIT}"
+    prepared = False
+    host_activated = False
+    commit_decision_attempted = False
+    ownership_requires_post_mount_proof = False
+    legacy_bindfs = False
+    failure: BaseException | None = None
+    requested_deployment = {
+        "ctid": args.ctid,
+        "release": release,
+        "source": f"{args.container_ip}:/",
+        "pve_host": args.pve_host,
+    }
+
+    def action(name: str, *extra: str) -> None:
+        command = [
+            "sudo",
+            "python3",
+            remote_helper,
+            name,
+            "--transaction",
+            transaction,
+            *extra,
+        ]
+        _ssh(runner, args.vm_host, f"set -euo pipefail\n{shell_join(command)}\n")
+
+    def action_output(name: str) -> str:
+        command = [
+            "sudo",
+            "python3",
+            remote_helper,
+            name,
+            "--transaction",
+            transaction,
+        ]
+        return _ssh_capture(
+            runner,
+            args.vm_host,
+            f"set -euo pipefail\n{shell_join(command)}\n",
         )
-        _ssh(runner, args.vm_host, script)
+
+    def guest_action(name: str) -> str:
+        command = [
+            "sudo",
+            "bash",
+            remote_guest_reconciler,
+            name,
+            f"{args.container_ip}:/",
+        ]
+        if name == "reconcile":
+            command.append(remote_unit)
+        return _ssh_capture(
+            runner,
+            args.vm_host,
+            f"set -euo pipefail\n{shell_join(command)}\n",
+        )
+
+    with runner.remote_deployment_locks(args):
+        try:
+            _ssh(
+                runner,
+                args.vm_host,
+                f"set -euo pipefail\ninstall -d -m 0700 {shlex.quote(remote_stage)}\n",
+            )
+            runner.run(["scp", "-q", str(helper), f"{args.vm_host}:{remote_helper}"])
+            runner.run(
+                [
+                    "scp",
+                    "-q",
+                    str(guest_reconciler),
+                    f"{args.vm_host}:{remote_guest_reconciler}",
+                ]
+            )
+            with tempfile.TemporaryDirectory(prefix="zerofs-vm-nfs-") as directory:
+                rendered_path = Path(directory) / VM_NFS_MOUNT_UNIT
+                rendered_path.write_text(rendered)
+                runner.run(
+                    [
+                        "scp",
+                        "-q",
+                        str(rendered_path),
+                        f"{args.vm_host}:{remote_unit}",
+                    ]
+                )
+            status_output = action_output("status")
+            status = (
+                json.loads(status_output)
+                if status_output.strip()
+                else {"phase": "absent"}
+            )
+            if status.get("phase") == "commit_decided":
+                if status.get("deployment") != requested_deployment:
+                    raise RuntimeError(
+                        "durable VM commit decision belongs to another deployment; "
+                        f"recorded={status.get('deployment')!r}, "
+                        f"requested={requested_deployment!r}"
+                    )
+                commit_host()
+                action("commit")
+                return
+            recover_host()
+            action("recover")
+            receipt_output = guest_action("preflight")
+            if not runner.dry_run:
+                receipt = parse_shared_namespace_ownership_receipt(receipt_output)
+                if not receipt.verified and receipt.reason in {
+                    "mount_unavailable",
+                    "legacy_topology",
+                }:
+                    ownership_requires_post_mount_proof = True
+                    legacy_bindfs = receipt.reason == "legacy_topology"
+                else:
+                    validate_shared_namespace_ownership(receipt)
+            else:
+                print(
+                    "+ if the managed mount is initially unavailable, repeat the "
+                    "ownership proof after the new server is mounted"
+                )
+            prepare_args = [
+                "--staged-unit",
+                remote_unit,
+                "--expected-source",
+                f"{args.container_ip}:/",
+                "--deployment-ctid",
+                str(args.ctid),
+                "--deployment-release",
+                release,
+                "--deployment-pve-host",
+                args.pve_host,
+            ]
+            if legacy_bindfs:
+                prepare_args.append("--allow-legacy-bindfs")
+            action("prepare", *prepare_args)
+            prepared = True
+            action("quiesce")
+            if ownership_requires_post_mount_proof:
+                if activate_maintenance is None or promote_host is None:
+                    raise RuntimeError(
+                        "bootstrap ownership proof requires NFS-only activation and promotion"
+                    )
+                activate_maintenance()
+            else:
+                activate_host()
+            host_activated = True
+            guest_action("reconcile")
+            action("reconcile")
+            if ownership_requires_post_mount_proof:
+                validate_shared_namespace_ownership(
+                    parse_shared_namespace_ownership_receipt(guest_action("preflight"))
+                )
+                action("quiesce")
+                promote_host()
+                guest_action("reconcile")
+                action("reconcile")
+            commit_decision_attempted = True
+            action("decide")
+            commit_host()
+            host_activated = False
+            action("commit")
+            prepared = False
+        except BaseException as error:
+            failure = error
+            if commit_decision_attempted:
+                error.add_note(
+                    "commit decision may be durable; retry deployment to recover or finish"
+                )
+            elif prepared:
+                if host_activated:
+                    try:
+                        rollback_host()
+                        host_activated = False
+                    except BaseException as host_rollback_error:
+                        error.add_note(
+                            f"host rollback also failed; VM remains quiesced: "
+                            f"{host_rollback_error}"
+                        )
+                if not host_activated:
+                    try:
+                        action("rollback")
+                        action("commit")
+                        prepared = False
+                    except BaseException as rollback_error:
+                        error.add_note(f"VM NFS rollback also failed: {rollback_error}")
+            raise
+        finally:
+            try:
+                _ssh(
+                    runner,
+                    args.vm_host,
+                    f"set -euo pipefail\nrm -rf -- {shlex.quote(remote_stage)}\n",
+                )
+            except BaseException as cleanup_error:
+                if failure is None:
+                    raise
+                failure.add_note(f"VM NFS staging cleanup also failed: {cleanup_error}")
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("deploy", "replace", "cleanup", "status"))
+    parser.add_argument(
+        "action",
+        choices=(
+            "deploy",
+            "replace",
+            "cleanup",
+            "status",
+            "ownership-inventory",
+            "ownership-repair",
+        ),
+    )
     parser.add_argument("--role", choices=("prod", "dev"), required=True)
     parser.add_argument("--pve-host", default="gthost-tor-pve-root")
     parser.add_argument("--vm-host", default="ubuntu-main")
@@ -942,6 +1464,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--source-mountpoint")
     parser.add_argument("--source-server-unit")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--confirm-ownership-repair")
     return parser
 
 
@@ -963,6 +1486,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ValueError(
             "prod supports drain-safe in-place deploy only; replace and cleanup are dev-only"
         )
+    if args.action.startswith("ownership-") and args.role != "prod":
+        raise ValueError("ownership migration is valid only for production")
+    if args.action == "ownership-repair" and not args.dry_run:
+        if args.confirm_ownership_repair != OWNERSHIP_REPAIR_CONFIRMATION:
+            raise ValueError(
+                "ownership repair requires --confirm-ownership-repair 501:20"
+            )
+        if (
+            os.environ.get("ZEROFS_CONFIRM_OWNERSHIP_REPAIR")
+            != OWNERSHIP_REPAIR_CONFIRMATION
+        ):
+            raise ValueError(
+                "ownership repair requires ZEROFS_CONFIRM_OWNERSHIP_REPAIR=501:20"
+            )
     if args.action == "replace":
         require_replace_confirmation(
             args.ctid, os.environ.get("ZEROFS_CONFIRM_REPLACE")
@@ -979,6 +1516,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ValueError("cannot skip drain while migrating a source ZeroFS server")
     legacy_nbd_source = _has_legacy_nbd_source(args)
     runner = Runner(args.dry_run)
+
+    if args.action.startswith("ownership-"):
+        _run_ownership_migration(runner, args)
+        return 0
 
     if args.action == "status":
         units = ["zerofs-lxc.service"]
@@ -1053,16 +1594,61 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.dry_run
         else release_id(commit, release_paths, release_extras)
     )
-    _stage_and_run_host(
-        runner,
-        args,
-        binary,
-        commit,
-        binary_hash,
-        namespace,
-        release,
-    )
-    _provision_vm_nfs_mount(runner, args)
+
+    def activate_host() -> None:
+        _stage_and_run_host(
+            runner,
+            args,
+            binary,
+            commit,
+            binary_hash,
+            namespace,
+            release,
+            defer_commit=args.role == "prod",
+        )
+
+    def activate_maintenance() -> None:
+        with tempfile.TemporaryDirectory(prefix="zerofs-nfs-bootstrap-") as directory:
+            bootstrap = Path(directory) / "zerofs.toml"
+            bootstrap.write_text(render_nfs_bootstrap_config(args.config.read_text()))
+            _stage_and_run_host(
+                runner,
+                args,
+                binary,
+                commit,
+                binary_hash,
+                namespace,
+                release,
+                defer_commit=True,
+                config_path=bootstrap,
+                maintenance_nfs_only=True,
+            )
+
+    def control_host(action: str) -> None:
+        _run_host_deployment_control(
+            runner,
+            args,
+            action,
+            commit,
+            binary_hash,
+            namespace,
+            release,
+        )
+
+    if args.role == "prod":
+        _run_prod_vm_nfs_transaction(
+            runner,
+            args,
+            release,
+            activate_host,
+            lambda: control_host("finalize"),
+            lambda: control_host("rollback"),
+            lambda: control_host("recover"),
+            activate_maintenance=activate_maintenance,
+            promote_host=lambda: control_host("promote"),
+        )
+    else:
+        activate_host()
     print(f"deployed_commit={commit}")
     print(f"binary_sha256={binary_hash}")
     print(f"metrics_url={args.metrics_url}")

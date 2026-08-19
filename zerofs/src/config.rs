@@ -1066,6 +1066,9 @@ pub struct NinePConfig {
         default
     )]
     pub unix_socket: Option<PathBuf>,
+    /// Optional all-client identity for a shared writable namespace.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shared_identity: Option<NfsSharedIdentity>,
 }
 
 impl NinePConfig {
@@ -1659,14 +1662,6 @@ impl Settings {
                     "[servers.nbd] volatile_memory acknowledgement is not supported with [replication]"
                 );
             }
-            if self.servers.nfs.is_some()
-                || self.servers.ninep.is_some()
-                || self.servers.webui.is_some()
-            {
-                anyhow::bail!(
-                    "[servers.nbd] volatile_memory acknowledgement requires exclusive NBD access; disable NFS, 9P, and WebUI listeners"
-                );
-            }
             if self
                 .filesystem
                 .as_ref()
@@ -1885,6 +1880,7 @@ impl Settings {
                 ninep: Some(NinePConfig {
                     addresses: Some(default_9p_addresses()),
                     unix_socket: Some(PathBuf::from("/tmp/zerofs.9p.sock")),
+                    shared_identity: None,
                 }),
                 nbd: Some(NbdConfig {
                     addresses: Some(default_nbd_addresses()),
@@ -2521,8 +2517,8 @@ volatile_memory_gb = 0.125
     }
 
     #[test]
-    fn nbd_volatile_memory_ack_rejects_the_writable_webui() {
-        let error = write_and_load(
+    fn nbd_volatile_memory_ack_allows_nfs_ninep_and_webui() {
+        let settings = write_and_load(
             r#"
 [cache]
 dir = "/tmp/cache"
@@ -2537,18 +2533,22 @@ addresses = ["127.0.0.1:10809"]
 write_ack_mode = "volatile_memory"
 volatile_memory_gb = 1.0
 
+[servers.nfs]
+addresses = ["127.0.0.1:2049"]
+
+[servers.ninep]
+addresses = ["127.0.0.1:5564"]
+
 [servers.webui]
 addresses = ["127.0.0.1:8080"]
 uid = 1000
 gid = 1000
 "#,
         )
-        .unwrap_err();
-
-        assert!(
-            format!("{error:#}").contains("WebUI"),
-            "unexpected error: {error:#}"
-        );
+        .expect("volatile acknowledgement must be able to run with NFS, 9P, and WebUI");
+        assert!(settings.servers.nfs.is_some());
+        assert!(settings.servers.ninep.is_some());
+        assert!(settings.servers.webui.is_some());
     }
 
     #[test]
@@ -2660,6 +2660,28 @@ encryption_password = "test-password"
             settings.runtime_memory_limit_bytes().unwrap(),
             Some(96_000_000_000)
         );
+    }
+
+    #[test]
+    fn proxmox_production_template_is_loadable_by_shipping_settings() {
+        let template_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../proxmox/templates/zerofs-prod.toml.example");
+        let template = std::fs::read_to_string(&template_path)
+            .unwrap()
+            .replace("${ZEROFS_STORAGE_PASSWORD}", "test-password");
+
+        let settings = write_and_load(&template).unwrap();
+
+        assert_eq!(
+            settings.runtime_memory_limit_bytes().unwrap(),
+            Some(96_000_000_000)
+        );
+        let nfs_identity = settings.servers.nfs.unwrap().shared_identity.unwrap();
+        let ninep_identity = settings.servers.ninep.unwrap().shared_identity.unwrap();
+        let webui = settings.servers.webui.unwrap();
+        assert_eq!((nfs_identity.uid, nfs_identity.gid), (501, 20));
+        assert_eq!((ninep_identity.uid, ninep_identity.gid), (501, 20));
+        assert_eq!((webui.uid, webui.gid), (501, 20));
     }
 
     #[test]
@@ -4223,6 +4245,28 @@ volatile_memory_gb = 2.0
             ack.client_durability_target,
             ClientDurabilityTarget::LocalSsd
         );
+    }
+
+    #[test]
+    fn legacy_nbd_inputs_normalize_without_exclusivity() {
+        let ack = resolve_write_ack(&format!(
+            r#"[servers.nbd]
+addresses = ["127.0.0.1:10809"]
+write_ack_mode = "volatile_memory"
+volatile_memory_gb = 2.0
+
+[servers.nfs]
+addresses = ["127.0.0.1:2049"]
+
+[servers.ninep]
+addresses = ["127.0.0.1:5564"]
+{ENABLED_WRITEBACK}"#
+        ))
+        .unwrap();
+
+        assert_eq!(ack.mode, FilesystemWriteAckMode::VolatileMemory);
+        assert_eq!(ack.source, FilesystemWriteAckSource::LegacyNbd);
+        assert_eq!(ack.volatile_memory_bytes, 2_000_000_000);
     }
 
     #[test]

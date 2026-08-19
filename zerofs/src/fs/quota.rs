@@ -37,18 +37,22 @@ impl QuotaReservationState {
     }
 }
 
+#[derive(Debug)]
 struct QuotaCounters {
     committed: u64,
     pending: u64,
+    poisoned: Option<&'static str>,
 }
 
 /// Visible logical-size budget shared by every write protocol.
+#[derive(Debug)]
 pub(crate) struct LogicalQuota {
     max_bytes: u64,
     inner: Mutex<QuotaCounters>,
 }
 
 /// One growth claim. Drop releases only while [`QuotaReservationState::Provisional`].
+#[derive(Debug)]
 pub(crate) struct ProvisionalQuotaReservation {
     quota: Arc<LogicalQuota>,
     bytes: u64,
@@ -62,6 +66,7 @@ impl LogicalQuota {
             inner: Mutex::new(QuotaCounters {
                 committed,
                 pending: 0,
+                poisoned: None,
             }),
         })
     }
@@ -71,9 +76,25 @@ impl LogicalQuota {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, QuotaCounters> {
-        self.inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.inner.lock().expect("logical quota mutex poisoned")
+    }
+
+    fn poison(inner: &mut QuotaCounters, reason: &'static str) {
+        if inner.poisoned.is_none() {
+            inner.poisoned = Some(reason);
+        }
+    }
+
+    fn ensure_healthy(inner: &QuotaCounters) -> Result<(), FsError> {
+        if inner.poisoned.is_some() {
+            Err(FsError::IoError)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(crate) fn is_poisoned(&self) -> bool {
+        self.lock().poisoned.is_some()
     }
 
     pub(crate) fn committed_bytes(&self) -> u64 {
@@ -85,8 +106,14 @@ impl LogicalQuota {
     }
 
     pub(crate) fn visible_bytes(&self) -> u64 {
-        let inner = self.lock();
-        inner.committed.saturating_add(inner.pending)
+        let mut inner = self.lock();
+        match inner.committed.checked_add(inner.pending) {
+            Some(visible) => visible,
+            None => {
+                Self::poison(&mut inner, "visible size overflow");
+                u64::MAX
+            }
+        }
     }
 
     /// CAS-reserve `bytes` of growth against committed plus pending visible size.
@@ -94,20 +121,41 @@ impl LogicalQuota {
         self: &Arc<Self>,
         bytes: u64,
     ) -> Result<ProvisionalQuotaReservation, FsError> {
-        if bytes == 0 {
-            return Ok(ProvisionalQuotaReservation {
-                quota: Arc::clone(self),
-                bytes: 0,
-                state: AtomicU8::new(STATE_PROVISIONAL),
-            });
-        }
         {
             let mut inner = self.lock();
-            let visible = inner.committed.saturating_add(inner.pending);
-            if visible.saturating_add(bytes) > self.max_bytes {
+            Self::ensure_healthy(&inner)?;
+            if bytes == 0 {
+                drop(inner);
+                return Ok(ProvisionalQuotaReservation {
+                    quota: Arc::clone(self),
+                    bytes: 0,
+                    state: AtomicU8::new(STATE_PROVISIONAL),
+                });
+            }
+            let visible = match inner.committed.checked_add(inner.pending) {
+                Some(visible) => visible,
+                None => {
+                    Self::poison(&mut inner, "visible size overflow");
+                    return Err(FsError::IoError);
+                }
+            };
+            let next = match visible.checked_add(bytes) {
+                Some(next) => next,
+                None => {
+                    Self::poison(&mut inner, "reservation overflow");
+                    return Err(FsError::IoError);
+                }
+            };
+            if next > self.max_bytes {
                 return Err(FsError::NoSpace);
             }
-            inner.pending = inner.pending.saturating_add(bytes);
+            inner.pending = match inner.pending.checked_add(bytes) {
+                Some(pending) => pending,
+                None => {
+                    Self::poison(&mut inner, "pending overflow");
+                    return Err(FsError::IoError);
+                }
+            };
         }
         Ok(ProvisionalQuotaReservation {
             quota: Arc::clone(self),
@@ -122,7 +170,13 @@ impl LogicalQuota {
             return;
         }
         let mut inner = self.lock();
-        inner.committed = inner.committed.saturating_sub(bytes);
+        if inner.poisoned.is_some() {
+            return;
+        }
+        match inner.committed.checked_sub(bytes) {
+            Some(committed) => inner.committed = committed,
+            None => Self::poison(&mut inner, "committed underflow"),
+        }
     }
 
     fn release_pending(&self, bytes: u64) {
@@ -130,7 +184,13 @@ impl LogicalQuota {
             return;
         }
         let mut inner = self.lock();
-        inner.pending = inner.pending.saturating_sub(bytes);
+        if inner.poisoned.is_some() {
+            return;
+        }
+        match inner.pending.checked_sub(bytes) {
+            Some(pending) => inner.pending = pending,
+            None => Self::poison(&mut inner, "pending underflow"),
+        }
     }
 
     fn transfer_to_committed(&self, bytes: u64) {
@@ -138,8 +198,19 @@ impl LogicalQuota {
             return;
         }
         let mut inner = self.lock();
-        inner.pending = inner.pending.saturating_sub(bytes);
-        inner.committed = inner.committed.saturating_add(bytes);
+        if inner.poisoned.is_some() {
+            return;
+        }
+        match (
+            inner.pending.checked_sub(bytes),
+            inner.committed.checked_add(bytes),
+        ) {
+            (Some(pending), Some(committed)) => {
+                inner.pending = pending;
+                inner.committed = committed;
+            }
+            _ => Self::poison(&mut inner, "canonical transfer overflow or underflow"),
+        }
     }
 }
 
@@ -299,5 +370,23 @@ mod tests {
         assert_eq!(quota.visible_bytes(), 25);
         let _held = quota.reserve(55).unwrap();
         assert_eq!(quota.visible_bytes(), 80);
+    }
+
+    #[test]
+    fn overflow_poisons_quota() {
+        let quota = LogicalQuota::new(u64::MAX, u64::MAX);
+        assert_eq!(quota.reserve(1).unwrap_err(), FsError::IoError);
+        assert!(quota.is_poisoned());
+        assert_eq!(quota.reserve(0).unwrap_err(), FsError::IoError);
+        assert_eq!(quota.reserve(1).unwrap_err(), FsError::IoError);
+    }
+
+    #[test]
+    fn underflow_poisons_quota() {
+        let quota = LogicalQuota::new(80, 40);
+        quota.release_committed(41);
+        assert!(quota.is_poisoned());
+        assert_eq!(quota.reserve(1).unwrap_err(), FsError::IoError);
+        assert_eq!(quota.committed_bytes(), 40);
     }
 }

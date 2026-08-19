@@ -10,6 +10,7 @@ use crate::fs::errors::FsError;
 use crate::fs::inode::{
     DirectoryInode, FileInode, Inode, InodeId, MAX_DEVICE_MAJOR, MAX_DEVICE_MINOR, SpecialInode,
 };
+use crate::fs::mutation::types::{ConflictKey, ConflictScope};
 use crate::fs::permissions::{AccessMode, Credentials, check_access, validate_mode};
 #[cfg(test)]
 use crate::fs::store::directory::COOKIE_FIRST_ENTRY;
@@ -62,6 +63,9 @@ impl ZeroFS {
             String::from_utf8_lossy(name)
         );
 
+        let _fence = self
+            .fence_metadata(ConflictScope::single(ConflictKey::Directory(dirid)))
+            .await?;
         let _guard = self.lock_manager.acquire(dirid).await;
         // Direct filesystem callers do not pass through the 9P single-flight.
         if let Some(result) = self.replay_dedup_result(&op_id, DedupResult::into_create)? {
@@ -253,6 +257,9 @@ impl ZeroFS {
             String::from_utf8_lossy(name)
         );
 
+        let _fence = self
+            .fence_metadata(ConflictScope::single(ConflictKey::Directory(dirid)))
+            .await?;
         let _guard = self.lock_manager.acquire(dirid).await;
         // Direct filesystem callers do not pass through the 9P single-flight.
         if let Some(result) = self.replay_dedup_result(&op_id, DedupResult::into_mkdir)? {
@@ -463,6 +470,9 @@ impl ZeroFS {
             ftype
         );
 
+        let _fence = self
+            .fence_metadata(ConflictScope::single(ConflictKey::Directory(dirid)))
+            .await?;
         let _guard = self.lock_manager.acquire(dirid).await;
         // Direct filesystem callers do not pass through the 9P single-flight.
         if let Some(result) = self.replay_dedup_result(&op_id, DedupResult::into_mknod)? {
@@ -849,6 +859,41 @@ mod tests {
         assert_eq!(
             fattr.mtime.seconds, 1234567890,
             "Custom mtime should be applied"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_write_drains_before_create_without_holding_canonical_lock() {
+        use crate::fs::mutation::types::{ConflictKey, ConflictScope};
+        use std::sync::Arc;
+
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        fs.start_materializer();
+        let result = fs
+            .assert_pending_write_drains_without_canonical_lock(
+                ConflictScope::single(ConflictKey::Directory(0)),
+                0,
+                {
+                    let fs = Arc::clone(&fs);
+                    async move {
+                        fs.create(
+                            &test_creds(),
+                            0,
+                            b"fenced-create.txt",
+                            &SetAttributes::default(),
+                        )
+                        .await
+                    }
+                },
+            )
+            .await
+            .unwrap();
+        assert_ne!(result.0, 0);
+        assert!(
+            fs.directory_store
+                .exists(0, b"fenced-create.txt")
+                .await
+                .unwrap()
         );
     }
 }

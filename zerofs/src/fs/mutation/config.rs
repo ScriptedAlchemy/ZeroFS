@@ -49,6 +49,19 @@ pub(crate) struct FilesystemWriteAckSettings {
     pub(crate) client_durability_target: ClientDurabilityTarget,
 }
 
+impl FilesystemWriteAckSettings {
+    /// In-memory / test default: materialized acknowledgement, no writeback.
+    pub(crate) fn materialized_direct() -> Self {
+        Self {
+            mode: FilesystemWriteAckMode::Materialized,
+            volatile_memory_bytes: 0,
+            volatile_max_operations: DEFAULT_VOLATILE_MAX_OPERATIONS,
+            source: FilesystemWriteAckSource::DefaultMaterialized,
+            client_durability_target: ClientDurabilityTarget::RemoteBackend,
+        }
+    }
+}
+
 /// Default in-flight volatile operation cap.
 pub(crate) const DEFAULT_VOLATILE_MAX_OPERATIONS: usize = 65536;
 /// Upper bound on the operation cap: beyond this the per-operation

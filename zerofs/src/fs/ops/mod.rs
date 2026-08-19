@@ -13,7 +13,7 @@ mod lookup;
 mod remove;
 mod rename;
 mod setattr;
-mod write;
+pub(crate) mod write;
 
 impl ZeroFS {
     /// Decode a cached result as the operation's expected variant.

@@ -2433,14 +2433,33 @@ mod tests {
             .expect("server accepted disconnect");
     }
 
+    fn volatile_ack(bytes: u64) -> crate::fs::mutation::config::FilesystemWriteAckSettings {
+        crate::fs::mutation::config::FilesystemWriteAckSettings {
+            mode: crate::fs::mutation::config::FilesystemWriteAckMode::VolatileMemory,
+            volatile_memory_bytes: bytes,
+            volatile_max_operations: 1024,
+            source: crate::fs::mutation::config::FilesystemWriteAckSource::Filesystem,
+            client_durability_target: crate::fs::mutation::config::ClientDurabilityTarget::LocalSsd,
+        }
+    }
+
+    async fn volatile_filesystem(bytes: u64) -> (Arc<ZeroFS>, Arc<NbdExportGates>) {
+        let mut filesystem = ZeroFS::new_in_memory()
+            .await
+            .expect("create test filesystem");
+        filesystem.write_ack = volatile_ack(bytes);
+        let filesystem = Arc::new(filesystem);
+        filesystem.install_volatile_overlay();
+        let gates = Arc::new(match filesystem.volatile_budget() {
+            Some(budget) => NbdExportGates::with_budget(Some(budget)),
+            None => NbdExportGates::new(bytes),
+        });
+        (filesystem, gates)
+    }
+
     #[tokio::test]
     async fn volatile_write_replies_and_reads_from_ram_before_flush_materializes_it() {
-        let filesystem = Arc::new(
-            ZeroFS::new_in_memory()
-                .await
-                .expect("create test filesystem"),
-        );
-        let export_gates = Arc::new(NbdExportGates::new(1024 * 1024));
+        let (filesystem, export_gates) = volatile_filesystem(1024 * 1024).await;
         let device = single_file_export(&filesystem, &export_gates).await;
         let commit_block = filesystem.db.flush_barrier().write_owned().await;
         let apply_reached = filesystem.write_coordinator.probe_next_apply();
@@ -2528,12 +2547,7 @@ mod tests {
 
     #[tokio::test]
     async fn volatile_fua_write_replies_only_after_materialization_and_flush() {
-        let filesystem = Arc::new(
-            ZeroFS::new_in_memory()
-                .await
-                .expect("create test filesystem"),
-        );
-        let export_gates = Arc::new(NbdExportGates::new(1024 * 1024));
+        let (filesystem, export_gates) = volatile_filesystem(1024 * 1024).await;
         let device = single_file_export(&filesystem, &export_gates).await;
         let commit_block = filesystem.db.flush_barrier().write_owned().await;
         let apply_reached = filesystem.write_coordinator.probe_next_apply();
@@ -2619,12 +2633,7 @@ mod tests {
 
     #[tokio::test]
     async fn volatile_admission_rejection_consumes_the_write_body() {
-        let filesystem = Arc::new(
-            ZeroFS::new_in_memory()
-                .await
-                .expect("create test filesystem"),
-        );
-        let export_gates = Arc::new(NbdExportGates::new(4));
+        let (filesystem, export_gates) = volatile_filesystem(4).await;
         let device = single_file_export(&filesystem, &export_gates).await;
         let handler = NBDHandler::new(filesystem, export_gates);
         let mut wire: &[u8] = b"payloadNEXT";
@@ -2649,12 +2658,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_rejected_write_discard_closes_the_desynchronized_session() {
-        let filesystem = Arc::new(
-            ZeroFS::new_in_memory()
-                .await
-                .expect("create test filesystem"),
-        );
-        let export_gates = Arc::new(NbdExportGates::new(4));
+        let (filesystem, export_gates) = volatile_filesystem(4).await;
         let device = single_file_export(&filesystem, &export_gates).await;
         let handler = NBDHandler::new(filesystem, export_gates);
         let shutdown = CancellationToken::new();

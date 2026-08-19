@@ -103,6 +103,7 @@ pub struct NinePServer {
     filesystem: Arc<ZeroFS>,
     transport: Transport,
     lock_manager: Arc<FileLockManager>,
+    credential_override: Option<(u32, u32)>,
 }
 
 impl NinePServer {
@@ -111,6 +112,7 @@ impl NinePServer {
             filesystem,
             transport: Transport::Tcp(addr),
             lock_manager: Arc::new(FileLockManager::new()),
+            credential_override: None,
         }
     }
 
@@ -119,7 +121,14 @@ impl NinePServer {
             filesystem,
             transport: Transport::Unix(path),
             lock_manager: Arc::new(FileLockManager::new()),
+            credential_override: None,
         }
+    }
+
+    /// Override client-provided credentials for a shared writable namespace.
+    pub fn with_credential_override(mut self, uid: u32, gid: u32) -> Self {
+        self.credential_override = Some((uid, gid));
+        self
     }
 
     fn spawn_client_handler<R, W>(
@@ -136,6 +145,7 @@ impl NinePServer {
     {
         let filesystem = Arc::clone(&self.filesystem);
         let lock_manager = Arc::clone(&self.lock_manager);
+        let credential_override = self.credential_override;
         let client_shutdown = shutdown.child_token();
 
         AbortOnDropHandle::new(spawn_named("9p-client", async move {
@@ -144,6 +154,7 @@ impl NinePServer {
                 write_stream,
                 filesystem,
                 lock_manager,
+                credential_override,
                 client_shutdown,
                 session,
             )
@@ -299,6 +310,7 @@ impl NinePServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fs::inode::Inode;
     use crate::fs::permissions::Credentials;
     use crate::ninep::handler::SessionReleaseGuard;
     use crate::ninep::lock_manager::FileLock;
@@ -945,6 +957,131 @@ mod tests {
             Arc::new(FileLockManager::new()),
         ));
         (filesystem, handler)
+    }
+
+    #[tokio::test]
+    async fn server_builder_carries_shared_identity_to_client_handlers() {
+        let filesystem = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let server = NinePServer::new(filesystem, "127.0.0.1:0".parse().unwrap())
+            .with_credential_override(501, 20);
+
+        assert_eq!(server.credential_override, Some((501, 20)));
+    }
+
+    async fn exchange_client_frame(
+        client: &mut tokio::io::DuplexStream,
+        request: Vec<u8>,
+    ) -> P9Message {
+        client.write_all(&request).await.unwrap();
+        let mut size = [0_u8; P9_SIZE_FIELD_LEN];
+        client.read_exact(&mut size).await.unwrap();
+        let total = u32::from_le_bytes(size) as usize;
+        let mut response = Vec::with_capacity(total);
+        response.extend_from_slice(&size);
+        response.resize(total, 0);
+        client
+            .read_exact(&mut response[P9_SIZE_FIELD_LEN..])
+            .await
+            .unwrap();
+        decode(&response)
+    }
+
+    async fn exchange_client_message(
+        client: &mut tokio::io::DuplexStream,
+        tag: u16,
+        body: Message,
+    ) -> P9Message {
+        exchange_client_frame(client, P9Message::new(tag, body).to_bytes().unwrap()).await
+    }
+
+    #[tokio::test]
+    async fn spawned_client_handler_applies_shared_identity_to_mutations() {
+        let filesystem = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let server = NinePServer::new(Arc::clone(&filesystem), "127.0.0.1:0".parse().unwrap())
+            .with_credential_override(501, 20);
+        let (mut client, server_stream) = tokio::io::duplex(4096);
+        let (read_stream, write_stream) = tokio::io::split(server_stream);
+        let shutdown = CancellationToken::new();
+        let accepted_work = P9AcceptedWorkTracker::new();
+        let task = server.spawn_client_handler(
+            read_stream,
+            write_stream,
+            &shutdown,
+            "shared-identity-test".to_string(),
+            P9SessionAdmission {
+                transport: P9GlobalAdmission::shared().try_admit_transport().unwrap(),
+                transport_label: "test",
+                accepted_work: accepted_work.clone(),
+            },
+        );
+
+        let version = exchange_client_message(
+            &mut client,
+            0,
+            Message::Tversion(Tversion {
+                msize: super::super::handler::DEFAULT_MSIZE,
+                version: P9String::new(VERSION_9P2000L_ZEROFS.to_vec()),
+            }),
+        )
+        .await;
+        assert!(matches!(version.body, Message::Rversion(_)));
+        let attach = exchange_client_message(
+            &mut client,
+            1,
+            Message::Tattach(Tattach {
+                fid: 1,
+                afid: u32::MAX,
+                uname: P9String::new(b"untrusted-client".to_vec()),
+                aname: P9String::new(b"/".to_vec()),
+                n_uname: 9_000,
+            }),
+        )
+        .await;
+        assert!(matches!(attach.body, Message::Rattach(_)));
+        let mkdir = exchange_client_frame(
+            &mut client,
+            P9Message::new_with_op_id(
+                2,
+                [0x51; P9_OP_ID_LEN],
+                Message::Tmkdir(Tmkdir {
+                    dfid: 1,
+                    name: P9String::new(b"shared-owner".to_vec()),
+                    mode: 0o755,
+                    gid: 9_000,
+                }),
+            )
+            .to_bytes_ctx(true)
+            .unwrap(),
+        )
+        .await;
+        assert!(
+            matches!(mkdir.body, Message::Rmkdir(_)),
+            "shared-identity mkdir failed: {:?}",
+            mkdir.body
+        );
+
+        let root = Credentials {
+            uid: 0,
+            gid: 0,
+            gid_known: true,
+            groups: [0; 16],
+            groups_count: 0,
+            groups_complete: true,
+        };
+        let inode_id = filesystem.lookup(&root, 0, b"shared-owner").await.unwrap();
+        let Inode::Directory(inode) = filesystem.inode_store.get(inode_id).await.unwrap() else {
+            panic!("shared-owner must be a directory");
+        };
+        assert_eq!((inode.uid, inode.gid), (501, 20));
+
+        shutdown.cancel();
+        drop(client);
+        tokio::time::timeout(TEST_TIMEOUT, task)
+            .await
+            .expect("client handler shutdown")
+            .unwrap();
+        accepted_work.stop_accepting();
+        accepted_work.wait().await;
     }
 
     async fn negotiate(handler: &NinePHandler) {

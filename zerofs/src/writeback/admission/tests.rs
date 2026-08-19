@@ -1,4 +1,4 @@
-use super::{Admission, AdmissionError, DiskAdmission};
+use super::{Admission, AdmissionError};
 
 #[tokio::test]
 async fn reservation_larger_than_the_dirty_ram_budget_fails_immediately() {
@@ -14,13 +14,6 @@ async fn reservation_larger_than_the_dirty_ram_budget_fails_immediately() {
         }
     );
     assert_eq!(admission.used_bytes(), 0);
-}
-
-#[test]
-fn disk_gate_restores_pending_blob_bytes_before_accepting_new_writes() {
-    let disk = DiskAdmission::with_used(100, 90, 70, 10, 80, 1_000).unwrap();
-
-    assert_eq!(disk.used_bytes(), 80);
 }
 
 use crate::writeback::reservation::{
@@ -178,7 +171,7 @@ async fn checked_underflow_and_overflow_poison_admission() {
         50,
         10,
         [request(u64::MAX, 0, 1), request(1, 0, 1)],
-        sample(1, 1_000),
+        Some(sample(1, 1_000)),
     )
     .unwrap_err();
     assert!(
@@ -264,7 +257,7 @@ async fn recovery_seeds_exact_pending_bytes_and_operations() {
         70,
         10,
         [request(40, 12, 1), request(25, 8, 2)],
-        sample(7, 500),
+        Some(sample(7, 500)),
     )
     .unwrap();
     let snapshot = admission.snapshot();

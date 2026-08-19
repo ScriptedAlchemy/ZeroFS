@@ -7,7 +7,7 @@ roles so production state cannot be reused by a disposable performance test.
 | Role | Ownership and access | Acknowledgement | Lifecycle |
 |---|---|---|---|
 | `prod` | ZeroFS serves native NFS on the private CT address; 9P/FUSE + SMB3 is an optional fallback | no volatile NBD; writeback waits for SSD | stable CT; drain-safe in-place deploy and rollback only |
-| `dev` | VM100 uses the same direct private NFSv3 mount as production | explicit 16 GB `volatile_memory` burst tier | replaceable and cleanable after a full drain |
+| `dev` | isolated NBD-only endpoint; never stages, quiesces, or reconciles VM100 NFS | explicit 16 GB `volatile_memory` burst tier | replaceable and cleanable after a full drain |
 
 Both roles use one RFC1918 interface on `vmbr1`. Neither creates a public
 listener. Production NFS, 9P, WebUI, Prometheus, and NBD bind only the exact
@@ -48,14 +48,41 @@ Samba, a Samba password, or a container-side filesystem mount. The NFS listener
 is not authenticated; the exact RFC1918 bind plus Proxmox/Tailscale network
 policy is the security boundary. Never port-forward 2049 or 8080.
 
-The production template configures `[servers.nfs.shared_identity]` as UID 501
-and GID 20 and runs the WebUI with the same identity. Every NFS client,
+The production template configures NFS and 9P `shared_identity` as UID 501 and
+GID 20 and runs the WebUI with the same identity. Every NFS and 9P client,
 including root, therefore acts as that shared owner; creation requests cannot
 select another owner and later NFS chown/chgrp requests are ignored. This lets
 the Mac and VM100 use the same direct NFS namespace even when their local
 numeric users differ. It deliberately removes per-client identity separation,
-so the private-network restriction is mandatory. Deployment validates the
-exact `501:20` pair and does not scan or normalize the existing tree.
+so the private-network restriction is mandatory. Deployment requires numeric
+identity parity across all three writable frontends. Before quiescing an
+existing managed NFS mount, it recursively scans the mounted namespace without
+crossing filesystems and excludes `.nbd`. The fail-closed receipt must say
+`ZEROFS_SHARED_NAMESPACE_V1 verified=1 objects=<nonzero> wrong_owner=0 ...`.
+Deployment never changes ownership automatically; a rejected receipt prints
+the manual `chown 501:20` remediation and the receipt required for retry.
+
+For an existing tree, inventory first without mutation:
+
+```bash
+./proxmox/deploy.sh ownership-inventory --role prod --ctid 198 \
+  --container-ip 10.10.10.55 --dry-run
+```
+
+The live inventory omits `--dry-run`. If repair is required, review that
+inventory, then explicitly confirm the fixed target twice:
+
+```bash
+ZEROFS_CONFIRM_OWNERSHIP_REPAIR=501:20 \
+  ./proxmox/deploy.sh ownership-repair --role prod --ctid 198 \
+  --container-ip 10.10.10.55 --confirm-ownership-repair 501:20
+```
+
+Repair is resumable and idempotent: it visits only wrong-owner objects, uses
+`-xdev`, prunes `.nbd`, and changes symlink ownership without following the
+target. A converged scan is atomically retained at
+`/var/lib/zerofs-deploy/ownership-receipts/shared-501-20.receipt`; normal deploy
+still requires a fresh successful recursive receipt before quiescing.
 
 The optional `--prod-access both` (or legacy `smb`) mode additionally makes the
 production LXC own a 9P/FUSE mount and export it through Samba. That requires:
@@ -85,24 +112,51 @@ SMB, NBD, or Prometheus from a public interface.
 
 ## Safe lifecycle
 
-Production in-place deployment first quiesces an optional active Samba/FUSE
-share and refuses any established NFS session. Unmount every Mac/VM NFS client
-before deployment. It then requires four stable metrics samples with:
+Production in-place deployment holds a root-owned global Proxmox deployment
+lock and a root-owned global VM100 transition lock. It recovers any crash-left host/VM transaction,
+validates the ownership receipt, then records VM100's direct-NFS unit,
+enablement, activity, and live mount record in a root-owned transaction. It
+quiesces that one mount before changing the container. Unmount the Mac NFS
+client before deployment; the coordinator handles VM100. The host also
+quiesces an optional active Samba/FUSE share and refuses any remaining
+established NFS session. It then requires four stable metrics samples with:
 
 - accepted, local and remote sequences equal;
 - dirty RAM and SSD bytes equal to zero;
 - no terminal writeback error.
 
-Only after that drain does it switch the persistent release symlink and restart
+When VM100 has no direct mount yet, or has a recognized legacy bindfs topology,
+the host first activates a private NFS-and-metrics-only configuration. VM100
+mounts that namespace and produces the real recursive ownership receipt before
+the coordinator unmounts it again and promotes the full 9P/NBD/WebUI and
+optional SMB access profile. Optional SMB assets are staged during maintenance
+but are not started until promotion.
+
+Only after the drain does deployment switch the persistent release symlink and restart
 the server plus the access services selected by `--prod-access`. The old server
 is stopped immediately after the second no-NFS-session proof, closing the
-reconnect window while the release changes. Failure
-switches the symlink back and restarts the previously active services. No
-production rootfs destruction is available.
+reconnect window while the release changes. Failure switches the symlink back
+and restarts the previously active services. The coordinator then restores
+VM100's exact prior unit contents, enablement, and mounted source. Staging
+fails before quiescing, while failures during quiesce, host deployment, or
+reconcile invoke rollback. The host-owned state root and its release,
+transaction, receipt, and `current` names are not writable by container root;
+only the `state`, `cache`, and dev backend directories are CT-owned. The exact
+prior config is included in the durable rollback transaction, including when a
+maintenance bootstrap reuses an existing release identifier. Host activation remains uncommitted until the VM
+mount is proven; reconcile failure compensates the host release and resources
+before restoring the VM mount. Durable phase state makes a retry recover a
+crash-left transaction. Before either participant deletes recovery state, VM100
+persists the authoritative commit decision. A retry finishes a decided host/VM
+commit and rolls back only a transaction that never reached that decision.
+Incomplete compensation leaves the CT stopped and preserves its transaction
+and resource snapshot for another recovery attempt. Success removes only its owned transaction and staging
+directory. No production rootfs destruction is available.
 
 Dev replacement requires the same four stable writeback samples plus zero
 volatile NBD bytes and operations. The Proxmox host repeats the gate before
-shutdown. It never connects or mounts an NBD device on VM100. Destructive dev
+shutdown. A dev action never touches VM100's production NFS unit and never
+connects or mounts an NBD device on VM100. Destructive dev
 replacement requires the exact CTID confirmation and takes a `vzdump` rollback
 backup. Dev cleanup destroys only the rootfs and preserves its role-specific
 state directory and namespace registry.
@@ -139,11 +193,16 @@ cp proxmox/templates/zerofs.env.example /secure/zerofs-prod.env
 chmod 600 /secure/zerofs-prod.env
 ```
 
-Production defaults to a 1 TB clean disk cache, 64 GB clean read RAM, 4 GB
-writeback RAM staging and a 64 GB SSD journal. Dev defaults to a smaller clean
-cache, 4 GB staging and a 16 GB volatile NBD tier. The LXC limit defaults to 96
-GiB because a 64 GB read cache, 4 GB staging tier and process overhead do not fit
-safely in a 64 GiB cgroup. Config validation rejects an undersized limit.
+Production defaults to a 1 TB clean disk cache, 32.0 decimal GB of clean read
+RAM, a distinct 4.0 decimal GB writeback staging tier, and a 64 GB SSD journal.
+`[runtime] memory_limit_gb = 96.0` declares the dedicated ZeroFS envelope; it
+is not another cache. Validation reserves room for the eventual 16.0 GB
+unified volatile tier plus the memory guard's 32 GiB unmodeled-residency and 8
+GiB process/companion allowances. It converts Proxmox `--memory-mb` from MiB
+to bytes and rejects a runtime envelope larger than the CT limit. The default
+CT remains 98304 MiB (96 GiB), which is larger than the 96.0 decimal-GB ZeroFS
+envelope and leaves the difference for the container. Dev keeps its smaller
+clean cache, separate 4 GB staging tier, and 16 GB volatile NBD tier.
 
 Every SFTP session field is capped at four in both roles. The dev template uses
 a role-local `file://` backend by default; enabling SFTP requires a distinct URL
@@ -196,15 +255,21 @@ public.
 VM100 has exactly one persistent ZeroFS mount: the direct read-write NFSv3/TCP
 file namespace at `/mnt/zerofs-files`. The NFS client uses hard mounts, 1 MiB
 read/write requests, a one-second attribute cache, and `_netdev`.
-Each deploy renders this unit's `What=` source from its validated private
-container address (for example, `10.10.10.30:/` for dev or the current
-production `10.10.10.55:/`). It safely retires the exact legacy
-`/mnt/zerofs-lxc` mount,
-`zerofs-lxc-nbd-client.service`, and `/dev/nbd0` only after syncing and proving
-the mount is the recognized legacy device. It also disables installed legacy
-raw/bindfs/normalizer units and fails if a legacy raw or guard mount remains
-active. It then reloads and restarts the direct unit before requiring the
-mounted source, the exact NFSv3 `nfs` filesystem type, and the `rw` option.
+Only a production deploy renders this unit's `What=` source from its validated
+private container address. Dev NBD-only deploys do not stage or invoke the VM
+NFS transition helper. Reconcile changes the unit only when its bytes differ,
+enables or starts it only when needed, and requires the exact source, NFSv3
+`nfs` type, and `rw` option. A direct reconcile against an already-correct
+unit and live mount performs no systemd mutation.
+
+During reconciliation, recognized legacy NBD/raw-namespace topology is retired
+automatically in strict order: sync the expected `/dev/nbd0` mount; disable both
+known mount-unit spellings; unmount it; disable the known client; disconnect
+only a device proven owned by that client or mount; then remove only known
+artifacts. Raw namespace units, mounts, permissions service, and known
+normalizer artifact are also retired. Unknown mount sources, units, and
+unowned connected devices fail closed. The helper never reconnects NBD or
+recreates a second mount.
 
 The deploy command above installs and renders the one persistent direct NFS
 mount. Do not copy the tracked unit verbatim: its `What=` line is only an
@@ -221,38 +286,8 @@ at `/mnt/zerofs-files` over the production NFSv3 export. No bindfs layer,
 second raw mount, ownership normalizer, `.nbd` guard, or persistent VM NBD
 client participates in this path.
 
-### One-time retirement of a legacy VM100 NBD mount
-
-For an already-installed NBD/XFS pilot, first complete the existing drain and
-data-safety gate. Keep the remote NBD export data until its separately approved
-retention decision; this retirement does not delete it. Then stop and disable
-the legacy consumer, confirm its filesystem is no longer mounted, disconnect
-the device, remove the locally installed units, and reload systemd:
-
-```bash
-if findmnt -rn -M /mnt/zerofs-lxc >/dev/null; then
-  test "$(findmnt -nro SOURCE -M /mnt/zerofs-lxc)" = /dev/nbd0
-  sudo sync -f /mnt/zerofs-lxc
-fi
-sudo systemctl disable --now mnt-zerofs-lxc.mount
-if findmnt -rn -M /mnt/zerofs-lxc >/dev/null; then
-  sudo umount /mnt/zerofs-lxc
-fi
-sudo systemctl disable --now zerofs-lxc-nbd-client.service
-if test -s /sys/class/block/nbd0/pid; then
-  sudo nbd-client -d /dev/nbd0
-fi
-sudo rm -f /etc/systemd/system/mnt-zerofs-lxc.mount \
-  /etc/systemd/system/zerofs-lxc-nbd-client.service \
-  /usr/local/libexec/zerofs-tune-nbd /etc/zerofs-lxc/client.env
-sudo systemctl daemon-reload
-! systemctl is-enabled mnt-zerofs-lxc.mount
-! systemctl is-enabled zerofs-lxc-nbd-client.service
-! findmnt -rn -M /mnt/zerofs-lxc
-test ! -s /sys/class/block/nbd0/pid
-```
-
-The deploy path never installs, enables, starts, or mounts these NBD artifacts.
+The deploy path never installs, enables, starts, mounts, or silently restores
+retired NBD artifacts and never deletes remote NBD export data.
 It accepts `--source-client-unit`, `--source-mount-unit`, and
 `--source-mountpoint` only as an explicit, one-way legacy-quiescing set during a
 migration; it does not reconnect the retired device.
@@ -314,7 +349,15 @@ against one backend.
   --role dev --ctid 120 --container-ip 10.10.10.20 --dry-run
 ```
 
-Cleanup leaves the VM disconnected and prints the preserved state path.
+Dev cleanup prints the preserved state path and leaves VM100's production NFS
+mount untouched.
+
+For both roles, an existing CT's requested cores, memory, swap, on-boot flag,
+startup order, private `net0`, and persistent `mp0` binding are validated on
+every deploy. Only mismatched fields are reconciled; unrequested network and
+mount options are preserved. The original `pct config` is captured before the
+first change and restored if a later deployment step fails. A correct existing
+CT is not restarted merely to restate the same resource values.
 
 ## Prometheus and Grafana provisioning
 
@@ -362,6 +405,7 @@ so the dashboard says so rather than inventing a proxy metric.
 
 ```bash
 python3 -m unittest discover -s proxmox/tests -p 'test_*.py'
-shellcheck proxmox/*.sh proxmox/hooks/*.sh proxmox/guest/*.sh \
-  proxmox/monitoring/*.sh
+python3 -m py_compile proxmox/deploy.py proxmox/nfs_mount.py proxmox/vm_nfs_transition.py
+bash -n proxmox/*.sh proxmox/guest/*.sh proxmox/hooks/*.sh proxmox/monitoring/*.sh
+shellcheck proxmox/*.sh proxmox/guest/*.sh proxmox/hooks/*.sh proxmox/monitoring/*.sh
 ```

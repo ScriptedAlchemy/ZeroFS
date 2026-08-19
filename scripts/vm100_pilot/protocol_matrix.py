@@ -9,13 +9,13 @@ from dataclasses import asdict, dataclass
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Callable, Mapping
-from urllib.parse import urlsplit
 
 from .config import PilotConfig
 from .memory_envelope import MemoryEnvelopeSession
 from .metrics import (
     MetricsAuthorityIdentity,
     WritebackSnapshot,
+    validate_metrics_url,
     wait_for_accepted_after,
     wait_for_local,
     wait_for_remote,
@@ -106,22 +106,12 @@ class ProtocolAuthority:
         if not root.is_absolute():
             raise ValueError(f"{protocol} mountpoint must be absolute: {root}")
         try:
-            metrics = urlsplit(metrics_url)
+            metrics = validate_metrics_url(metrics_url)
         except ValueError:
-            raise ValueError("invalid ZeroFS metrics endpoint") from None
-        if (
-            metrics.scheme != "https"
-            or not metrics.hostname
-            or metrics.username is not None
-            or metrics.password is not None
-            or bool(metrics.query)
-            or bool(metrics.fragment)
-            or metrics.path != "/metrics"
-        ):
             raise ValueError(
                 "ZeroFS metrics endpoint must be credential-free HTTPS without "
                 "query or fragment"
-            )
+            ) from None
         if protocol == "nfs":
             host = _nfs_host(endpoint)
             try:
