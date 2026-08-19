@@ -81,7 +81,10 @@ it does not merge those namespaces.
 13. Bound aggregate server-resident memory before owned protocol payload copies,
     including cache overhead/replacement, raw-parts buffers, segment/compaction work,
     request replay, dirty tiers, and a configured reserve below the effective cgroup
-    or process limit. A zero dirty-RAM gauge is never sufficient memory evidence.
+    or process limit. Before a scored process starts, freeze the cgroup-high-event,
+    accounting-error, and unowned-residual tolerances in the run ledger; a result may
+    not derive or relax them from its observed peak. A zero dirty-RAM gauge is never
+    sufficient memory evidence.
 14. Prove and remove the SSH/SFTP per-stream ceiling separately for each direction.
     A pinned HPN OpenSSH client may be selected by ZeroFS only after a real stock/HPN
     A/B wins; receiver-window gains must not be misreported as an upload fix.
@@ -115,6 +118,11 @@ The production-shaped acceptance profile is:
   Receipts distinguish receive-window, SFTP request-depth, and session-utilization
   limits. HPN is promoted only for a repeatable winning direction and ZeroFS retains
   stock behavior by default.
+- any pinned HPN candidate must pass a supervisor-bounded upstream suite with a
+  recorded nonzero test inventory and focused transfer/rekey/SFTP tests. The only
+  permitted upstream exclusion is the pinned tree's `dynamic-forward` regression,
+  whose background multiplexed client is outside the bulk-transfer package proof;
+  every test process group is terminated and reaped on deadline.
 - ordinary epoch/counter-unique immutable segment objects use create-only publication,
   not overwrite ordering fences. An unexpected name collision fails closed. The real
   SegmentStore-to-writeback path, not a create-only synthetic scheduler fixture, must
@@ -227,7 +235,7 @@ resident_reserve_gb = 16.0
 [sftp]
 # Optional absolute executable used for the owned SFTP ssh child. Omission keeps
 # the existing stock `ssh` lookup. No arbitrary argument string is accepted.
-# ssh_program = "/opt/zerofs/hpn-ssh/e2dfa0cea55d93747f4c68b4a2b134d6fbe0db06/bin/ssh"
+# ssh_program = "/opt/zerofs/hpn-ssh/e2dfa0cea55d93747f4c68b4a2b134d6fbe0db06/bin/hpnssh"
 ```
 
 `[filesystem].write_ack_mode` controls when a filesystem write may return:
@@ -657,12 +665,19 @@ Implementation follows strict RED/GREEN slices. The required proof matrix includ
     96 GiB/no-swap incident envelope must reject the incompatible 64+16 GiB profile
     before serving, and a full-scale 128 GiB/no-swap soak must fill the 64 GiB clean
     cache, exercise the 16 GiB volatile tier, then sustain replacement/GC overlap. It
-    stays below the effective limit by the configured reserve, reconciles owned,
-    baseline, and residual residency, and records zero cgroup `oom`/`oom_kill` deltas.
+    stays below the effective limit by the configured reserve, records at setup the
+    immutable limits `high delta <= 8`, reconciliation error `<= 256 MiB`, and unowned
+    residual `<= 2 GiB`, reconciles owned, baseline, and residual residency within
+    those limits, and records zero cgroup `oom`/`oom_kill` deltas.
 18. stock OpenSSH versus pinned HPN versus ZeroFS SFTP A/Bs for upload and download at
     one and configured-many sessions. Each cell records executable identity, RTT,
     TCP window/retransmits, SFTP depth, lane utilization, exact bytes, SHA-256, and
     durability; all temporary processes and remote prefixes are ledger-cleaned.
+19. a harness-supervision matrix proving setup, every composite primary substep,
+    timeout, double cleanup, and `assert-clean` preserve their independent statuses;
+    a later success never masks the first primary failure. Ledger scalar/path access
+    is allowlisted and traversal-safe, and NBD receipts store immutable machine
+    identity separately from the controller-reachable SSH target validated to it.
 
 Performance acceptance requires integrity and durability checks, not just throughput:
 size, checksum, protocol-visible readback, restart behavior, local barrier, remote
@@ -737,8 +752,10 @@ If pinned HPN wins a receiving path, allow the explicitly configured absolute bi
 and land its immutable packaging/deployment selection without replacing system SSH.
 If upload remains below its raw same-session control, land the measured request-depth
 or physical-session scheduling correction and rerun the A/B. A benchmark-only binary
-or dormant selector is not completion. Receiver-window evidence alone cannot justify
-an upload claim.
+or dormant selector is not completion. The receive-win and upload-gap results are
+independent typed flags in one validated archived decision receipt, so their combined
+outcome executes both corrections and cannot be replaced by a free-form environment
+value. Receiver-window evidence alone cannot justify an upload claim.
 
 ### Phase 4: Repository and Linux proof
 
