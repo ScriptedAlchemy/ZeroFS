@@ -480,6 +480,19 @@ def require_replace_confirmation(ctid: int, confirmation: str | None) -> None:
         )
 
 
+def require_local_durable_upgrade_confirmation(
+    ctid: int, flag: str | None, environment: str | None
+) -> None:
+    if flag != str(ctid):
+        raise ValueError(
+            f"local-durable upgrade requires --confirm-local-durable-upgrade {ctid}"
+        )
+    if environment != str(ctid):
+        raise ValueError(
+            f"local-durable upgrade requires ZEROFS_CONFIRM_LOCAL_DURABLE_UPGRADE={ctid}"
+        )
+
+
 def validate_state_root(value: str, ctid: int, role: str) -> Path:
     path = Path(value)
     expected = Path("/var/lib/zerofs-lxc") / f"{role}-{ctid}"
@@ -1122,6 +1135,8 @@ def _stage_and_run_host(
     ]
     if args.hpn_sha256 is not None:
         host_args.extend(["--hpn-sha256", args.hpn_sha256])
+    if args.local_durable_upgrade:
+        host_args.append("--local-durable-upgrade")
     if args.dry_run:
         host_args.append("--dry-run")
     if defer_commit:
@@ -1533,6 +1548,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--source-server-unit")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--confirm-ownership-repair")
+    parser.add_argument("--local-durable-upgrade", action="store_true")
+    parser.add_argument("--confirm-local-durable-upgrade")
     return parser
 
 
@@ -1572,6 +1589,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.action == "replace":
         require_replace_confirmation(
             args.ctid, os.environ.get("ZEROFS_CONFIRM_REPLACE")
+        )
+    if args.local_durable_upgrade:
+        if args.role != "prod" or args.action != "deploy":
+            raise ValueError(
+                "local-durable upgrade is valid only for production deploy"
+            )
+        require_local_durable_upgrade_confirmation(
+            args.ctid,
+            args.confirm_local_durable_upgrade,
+            os.environ.get("ZEROFS_CONFIRM_LOCAL_DURABLE_UPGRADE"),
         )
     if (
         args.role == "prod"
@@ -1658,6 +1685,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         if path is not None
     )
     release_extras = [binary_hash, args.prod_access]
+    if args.local_durable_upgrade:
+        release_extras.append("local-durable-upgrade")
     if args.hpn_sha256 is not None:
         release_extras.append(args.hpn_sha256)
     if args.prod_access in {"smb", "both"}:

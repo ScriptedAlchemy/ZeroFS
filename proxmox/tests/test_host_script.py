@@ -488,6 +488,76 @@ cat "$counter"
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "4")
 
+    def test_local_durable_upgrade_accepts_only_clean_local_recovery_state(
+        self,
+    ) -> None:
+        major = int(
+            subprocess.run(
+                ["bash", "-c", 'printf %s "${BASH_VERSINFO[0]}"'],
+                text=True,
+                capture_output=True,
+                check=True,
+            ).stdout
+        )
+        if major < 4:
+            self.skipTest("host drain parser requires the Linux Bash runtime")
+        source = HOST_SCRIPT.read_text()
+        function = source[
+            source.index("assert_server_drained() {") : source.index(
+                "capture_prod_share_state() {"
+            )
+        ]
+        body = """zerofs_writeback_accepted_sequence 12
+zerofs_writeback_local_sequence 12
+zerofs_writeback_remote_sequence 7
+zerofs_writeback_dirty_ram_bytes 0
+zerofs_writeback_dirty_ssd_reserved_bytes 4096
+zerofs_writeback_terminal_error 0
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            metrics = Path(directory) / "metrics"
+            metrics.write_text(body)
+            script = f"""set -euo pipefail
+role=prod
+dry_run=false
+container_ip=10.10.10.55
+ctid=198
+drain_timeout=10
+local_durable_upgrade=true
+ct_running() {{ return 0; }}
+sleep() {{ :; }}
+curl() {{ cat {metrics}; }}
+{function}
+assert_server_drained
+"""
+            accepted = subprocess.run(
+                ["bash", "-c", script], text=True, capture_output=True, check=False
+            )
+            rejected = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    script.replace(
+                        "local_durable_upgrade=true", "local_durable_upgrade=false"
+                    ),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        self.assertNotEqual(rejected.returncode, 0)
+
+    def test_local_durable_dry_run_plans_same_journal_recovery_gate(self) -> None:
+        result = self.run_host(
+            "deploy",
+            "--defer-commit",
+            "--local-durable-upgrade",
+            role="prod",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("unchanged persistent writeback directory", result.stdout)
+
     def test_prod_deferred_deploy_has_explicit_commit_and_rollback_controls(
         self,
     ) -> None:

@@ -125,6 +125,17 @@ established NFS session. It then requires four stable metrics samples with:
 - dirty RAM and SSD bytes equal to zero;
 - no terminal writeback error.
 
+The default remains a complete remote drain. A production upgrade whose sole
+purpose is to replace a slow remote transport may instead use
+`--local-durable-upgrade --confirm-local-durable-upgrade CTID` together with
+`ZEROFS_CONFIRM_LOCAL_DURABLE_UPGRADE=CTID`. This exception still requires four
+stable samples with accepted equal to local, zero dirty RAM, and no terminal
+error. It also requires the existing and staged releases to use exactly
+`/srv/zerofs-persist/state/writeback`; the new server must recover the retained
+SSD journal before serving clients. Remote lag and dirty SSD may remain only for
+this explicitly confirmed upgrade, and rollback returns to the prior release
+against the same journal.
+
 When VM100 has no direct mount yet, or has a recognized legacy bindfs topology,
 the host first activates a private NFS-and-metrics-only configuration. VM100
 mounts that namespace and produces the real recursive ownership receipt before
