@@ -206,6 +206,7 @@ control_host_transaction
         source = HOST_SCRIPT.read_text()
 
         self.assertIn('install -d -o 0 -g 100000 -m 0750 "$state_root"', source)
+        self.assertNotIn('install -d -m 0700 "$state_root"', source)
         self.assertNotIn('install -d -o 100000 -g 100000 -m 0750 "$state_root"', source)
         self.assertIn('"$temporary_transaction/previous-config"', source)
         self.assertIn('"$temporary_transaction/previous-receipt"', source)
@@ -222,6 +223,35 @@ control_host_transaction
             source,
         )
         self.assertNotIn('"$state_root/current/zerofs.toml"', source)
+
+    def test_state_tree_rejects_a_poisoned_preupgrade_child_symlink(self) -> None:
+        source = HOST_SCRIPT.read_text()
+        functions = source[
+            source.index("assert_managed_state_child() {") : source.index(
+                "assert_server_drained() {"
+            )
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            outside = root / "outside"
+            outside.mkdir()
+            (root / "releases").symlink_to(outside, target_is_directory=True)
+            script = f"""set -euo pipefail
+dry_run=true
+state_root={root}
+{functions}
+assert_managed_state_child "$state_root/releases" 0 0 0755
+"""
+            result = subprocess.run(
+                ["bash", "-c", script],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("unsafe managed state child", result.stderr)
+            self.assertEqual(list(outside.iterdir()), [])
 
     def test_deploy_plan_uses_unprivileged_private_lxc_and_persistent_bind(
         self,

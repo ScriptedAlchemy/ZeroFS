@@ -151,6 +151,71 @@ run() {
   fi
 }
 
+assert_managed_state_child() {
+  local path=$1 expected_uid=$2 expected_gid=$3 expected_mode=${4#0} actual
+  if [[ -L $path || ( -e $path && ! -d $path ) ]]; then
+    echo "unsafe managed state child (expected directory, never a symlink): $path" >&2
+    return 1
+  fi
+  [[ -e $path ]] || return 0
+  actual=$(stat -c '%u:%g:%a' -- "$path")
+  if [[ $actual != "$expected_uid:$expected_gid:$expected_mode" ]]; then
+    echo "unsafe managed state child ownership/mode: $path ($actual)" >&2
+    return 1
+  fi
+}
+
+prepare_managed_state_tree() {
+  if [[ $dry_run == true ]]; then
+    echo "+ validate the persistent state root and every managed immediate child"
+    echo "+ install -d -o 0 -g 100000 -m 0750 $state_root"
+    return 0
+  fi
+  if [[ -L $state_root || ( -e $state_root && ! -d $state_root ) ]]; then
+    echo "unsafe persistent state root (expected directory, never a symlink): $state_root" >&2
+    return 1
+  fi
+  if [[ -d $state_root ]]; then
+    local root_state
+    root_state=$(stat -c '%u:%g:%a' -- "$state_root")
+    if [[ $root_state != "0:100000:750" && $root_state != "100000:100000:750" ]]; then
+      echo "unsafe persistent state root ownership/mode: $state_root ($root_state)" >&2
+      return 1
+    fi
+    assert_managed_state_child "$state_root/releases" 0 0 0755
+    assert_managed_state_child "$state_root/receipts" 0 0 0755
+    assert_managed_state_child "$state_root/rollback" 0 0 0755
+    assert_managed_state_child "$state_root/deployment-transaction" 0 0 0700
+    assert_managed_state_child "$state_root/state" 100000 100000 0750
+    assert_managed_state_child "$state_root/cache" 100000 100000 0750
+    assert_managed_state_child "$state_root/backend-dev" 100000 100000 0750
+    local child name
+    while IFS= read -r child; do
+      name=${child##*/}
+      case $name in
+        releases|receipts|rollback|deployment-transaction|state|cache|backend-dev) ;;
+        current)
+          [[ -L $child ]] || {
+            echo "unsafe managed state child (current must be a symlink): $child" >&2
+            return 1
+          }
+          ;;
+        .zerofs-lxc-state)
+          [[ -f $child && ! -L $child && $(stat -c '%u:%g' -- "$child") == 0:0 ]] || {
+            echo "unsafe managed state marker: $child" >&2
+            return 1
+          }
+          ;;
+        *)
+          echo "unknown immediate child in persistent state root: $child" >&2
+          return 1
+          ;;
+      esac
+    done < <(find -P "$state_root" -mindepth 1 -maxdepth 1 -print)
+  fi
+  install -d -o 0 -g 100000 -m 0750 "$state_root"
+}
+
 if [[ $dry_run == false ]]; then
   [[ $EUID -eq 0 ]] || { echo "host deployment requires root" >&2; exit 1; }
   command -v pct >/dev/null
@@ -162,6 +227,8 @@ if [[ $dry_run == false ]]; then
 else
   echo "+ acquire exclusive host lock /run/lock/zerofs-lxc-deploy-global.lock"
 fi
+
+prepare_managed_state_tree
 
 ct_exists() {
   if [[ $dry_run == true ]]; then
@@ -450,7 +517,6 @@ persist_host_transaction() {
     echo "deployment transaction already exists: $deployment_transaction" >&2
     return 1
   }
-  install -d -m 0700 "$state_root"
   local temporary_transaction="$state_root/.deployment-transaction.$$"
   [[ ! -e $temporary_transaction ]] || return 1
   install -d -m 0700 "$temporary_transaction"
@@ -886,8 +952,6 @@ if [[ $dry_run == false ]]; then
   }
 fi
 
-run install -d -o 0 -g 100000 -m 0750 "$state_root"
-
 had_ct=false
 had_running_ct=false
 if ct_exists; then
@@ -1021,7 +1085,6 @@ set_host_transaction_phase quiesced
 
 reconcile_ct_resources
 
-run install -d -o 0 -g 100000 -m 0750 "$state_root"
 if [[ $dry_run == false ]]; then
   marker="$state_root/.zerofs-lxc-state"
   expected_marker="$role:$ctid:$namespace_id"
