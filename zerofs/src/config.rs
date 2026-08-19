@@ -1066,6 +1066,9 @@ pub struct NinePConfig {
         default
     )]
     pub unix_socket: Option<PathBuf>,
+    /// Optional all-client identity for a shared writable namespace.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shared_identity: Option<NfsSharedIdentity>,
 }
 
 impl NinePConfig {
@@ -1745,6 +1748,7 @@ impl Settings {
                 ninep: Some(NinePConfig {
                     addresses: Some(default_9p_addresses()),
                     unix_socket: Some(PathBuf::from("/tmp/zerofs.9p.sock")),
+                    shared_identity: None,
                 }),
                 nbd: Some(NbdConfig {
                     addresses: Some(default_nbd_addresses()),
@@ -2512,6 +2516,28 @@ encryption_password = "test-password"
             settings.runtime_memory_limit_bytes().unwrap(),
             Some(96_000_000_000)
         );
+    }
+
+    #[test]
+    fn proxmox_production_template_is_loadable_by_shipping_settings() {
+        let template_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../proxmox/templates/zerofs-prod.toml.example");
+        let template = std::fs::read_to_string(&template_path)
+            .unwrap()
+            .replace("${ZEROFS_STORAGE_PASSWORD}", "test-password");
+
+        let settings = write_and_load(&template).unwrap();
+
+        assert_eq!(
+            settings.runtime_memory_limit_bytes().unwrap(),
+            Some(96_000_000_000)
+        );
+        let nfs_identity = settings.servers.nfs.unwrap().shared_identity.unwrap();
+        let ninep_identity = settings.servers.ninep.unwrap().shared_identity.unwrap();
+        let webui = settings.servers.webui.unwrap();
+        assert_eq!((nfs_identity.uid, nfs_identity.gid), (501, 20));
+        assert_eq!((ninep_identity.uid, ninep_identity.gid), (501, 20));
+        assert_eq!((webui.uid, webui.gid), (501, 20));
     }
 
     #[test]

@@ -1,7 +1,10 @@
 [cache]
 dir = "/srv/zerofs-persist/cache"
 disk_size_gb = 1000.0
-memory_size_gb = 64.0
+memory_size_gb = 32.0
+
+[runtime]
+memory_limit_gb = 96.0
 
 [storage]
 url = "sftp://storage-user@storage-host.example/data/zerofs-prod"
@@ -32,6 +35,10 @@ shutdown_flush = "local"
 [servers.ninep]
 addresses = ["10.10.10.30:5564"]
 unix_socket = "/run/zerofs/9p.sock"
+
+[servers.ninep.shared_identity]
+uid = 501
+gid = 20
 
 [servers.nbd]
 addresses = ["10.10.10.30:10809"]

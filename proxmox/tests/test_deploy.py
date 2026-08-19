@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import importlib.util
+import contextlib
+import hashlib
 import os
 import subprocess
 import sys
@@ -8,6 +10,7 @@ import tempfile
 import tomllib
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 
 MODULE_PATH = Path(__file__).parents[1] / "deploy.py"
@@ -49,9 +52,7 @@ zerofs_writeback_terminal_error 0
 class SystemdTemplateTests(unittest.TestCase):
     def test_vm_nfs_mount_render_uses_the_requested_container_address(self) -> None:
         template = (
-            Path(__file__).parents[1]
-            / "systemd"
-            / r"mnt-zerofs\x2dfiles.mount"
+            Path(__file__).parents[1] / "systemd" / r"mnt-zerofs\x2dfiles.mount"
         ).read_text()
         renderer = getattr(deploy, "render_vm_nfs_mount", None)
         if renderer is None:
@@ -73,9 +74,7 @@ class SystemdTemplateTests(unittest.TestCase):
 
     def test_vm100_has_only_the_direct_persistent_nfs_mount(self) -> None:
         unit = (
-            Path(__file__).parents[1]
-            / "systemd"
-            / r"mnt-zerofs\x2dfiles.mount"
+            Path(__file__).parents[1] / "systemd" / r"mnt-zerofs\x2dfiles.mount"
         ).read_text()
 
         self.assertIn("What=10.10.10.30:/", unit)
@@ -156,7 +155,10 @@ addresses = ["10.10.10.20:9567"]
 [cache]
 dir = "/srv/zerofs-persist/cache"
 disk_size_gb = 1000.0
-memory_size_gb = 64.0
+memory_size_gb = 32.0
+
+[runtime]
+memory_limit_gb = 96.0
 
 [storage]
 url = "sftp://example.invalid/data/zerofs-prod"
@@ -182,6 +184,10 @@ dir = "/srv/zerofs-persist/state/writeback"
 [servers.ninep]
 addresses = ["10.10.10.30:5564"]
 unix_socket = "/run/zerofs/9p.sock"
+
+[servers.ninep.shared_identity]
+uid = 501
+gid = 20
 
 [servers.nbd]
 addresses = ["10.10.10.30:10809"]
@@ -211,6 +217,16 @@ addresses = ["10.10.10.30:9567"]
         deploy.validate_server_config(
             self.write_config(self.valid_config()), "10.10.10.20"
         )
+
+    def test_bootstrap_config_exposes_only_nfs_rpc_and_metrics(self) -> None:
+        rendered = deploy.render_nfs_bootstrap_config(self.prod_config())
+        config = tomllib.loads(rendered)
+
+        self.assertEqual(set(config["servers"]), {"nfs", "rpc"})
+        self.assertEqual(
+            config["servers"]["nfs"]["shared_identity"], {"uid": 501, "gid": 20}
+        )
+        self.assertEqual(config["prometheus"]["addresses"], ["10.10.10.30:9567"])
 
     def test_public_listener_is_rejected(self) -> None:
         config = self.valid_config().replace('"10.10.10.20:10809"', '"0.0.0.0:10809"')
@@ -305,6 +321,77 @@ addresses = ["10.10.10.30:9567"]
             5 * 1024**4,
         )
 
+    def test_prod_enforces_bounded_clean_cache_and_distinct_writeback_ram(
+        self,
+    ) -> None:
+        valid = self.prod_config()
+        deploy.validate_server_config(
+            self.write_config(valid), "10.10.10.30", memory_mb=98304, role="prod"
+        )
+
+        for label, unsafe, message in (
+            (
+                "oversized clean cache",
+                valid.replace("memory_size_gb = 32.0", "memory_size_gb = 64.0", 1),
+                "clean cache memory_size_gb must be 32.0",
+            ),
+            (
+                "writeback RAM merged into clean cache budget",
+                valid.replace("memory_size_gb = 4.0", "memory_size_gb = 32.0", 1),
+                "writeback memory_size_gb must be 4.0",
+            ),
+        ):
+            with self.subTest(label=label), self.assertRaisesRegex(ValueError, message):
+                deploy.validate_server_config(
+                    self.write_config(unsafe),
+                    "10.10.10.30",
+                    memory_mb=98304,
+                    role="prod",
+                )
+
+    def test_prod_runtime_envelope_covers_unified_volatile_budget_and_reserves(
+        self,
+    ) -> None:
+        valid = self.prod_config()
+        deploy.validate_server_config(
+            self.write_config(valid), "10.10.10.30", memory_mb=98304, role="prod"
+        )
+
+        for label, unsafe, message in (
+            (
+                "missing dedicated envelope",
+                valid.replace("[runtime]\nmemory_limit_gb = 96.0\n\n", ""),
+                "runtime.*memory_limit_gb.*required",
+            ),
+            (
+                "envelope omits unified volatile and reserves",
+                valid.replace("memory_limit_gb = 96.0", "memory_limit_gb = 80.0"),
+                "unified volatile.*reserves",
+            ),
+            (
+                "decimal envelope exceeds MiB CT limit",
+                valid.replace("memory_limit_gb = 96.0", "memory_limit_gb = 103.1"),
+                "exceeds.*container.*98304 MiB",
+            ),
+        ):
+            with self.subTest(label=label), self.assertRaisesRegex(ValueError, message):
+                deploy.validate_server_config(
+                    self.write_config(unsafe),
+                    "10.10.10.30",
+                    memory_mb=98304,
+                    role="prod",
+                )
+
+        at_ct_limit = valid.replace(
+            "memory_limit_gb = 96.0", "memory_limit_gb = 103.079215104"
+        )
+        deploy.validate_server_config(
+            self.write_config(at_ct_limit),
+            "10.10.10.30",
+            memory_mb=98304,
+            role="prod",
+        )
+
     def test_prod_ninep_requires_exact_private_address_and_port(self) -> None:
         for address in ("0.0.0.0:5564", "10.10.10.30:5565", "10.10.10.31:5564"):
             unsafe = self.prod_config().replace("10.10.10.30:5564", address)
@@ -359,14 +446,13 @@ addresses = ["10.10.10.30:9567"]
 
     def test_prod_requires_one_shared_namespace_identity(self) -> None:
         valid = self.prod_config()
-        for label, unsafe, message in (
+        for label, unsafe in (
             (
                 "nfs uid",
                 valid.replace(
                     "[servers.nfs.shared_identity]\nuid = 501\ngid = 20",
                     "[servers.nfs.shared_identity]\nuid = 502\ngid = 20",
                 ),
-                "NFS shared_identity.*501.*20",
             ),
             (
                 "nfs gid",
@@ -374,21 +460,34 @@ addresses = ["10.10.10.30:9567"]
                     "[servers.nfs.shared_identity]\nuid = 501\ngid = 20",
                     "[servers.nfs.shared_identity]\nuid = 501\ngid = 21",
                 ),
-                "NFS shared_identity.*501.*20",
+            ),
+            (
+                "ninep uid",
+                valid.replace(
+                    "[servers.ninep.shared_identity]\nuid = 501\ngid = 20",
+                    "[servers.ninep.shared_identity]\nuid = 1000\ngid = 20",
+                ),
             ),
             (
                 "webui uid",
                 valid.replace(
-                    "[servers.webui]\naddresses = [\"10.10.10.30:8080\"]\nuid = 501\ngid = 20",
-                    "[servers.webui]\naddresses = [\"10.10.10.30:8080\"]\nuid = 0\ngid = 20",
+                    '[servers.webui]\naddresses = ["10.10.10.30:8080"]\nuid = 501\ngid = 20',
+                    '[servers.webui]\naddresses = ["10.10.10.30:8080"]\nuid = 0\ngid = 20',
                 ),
-                "WebUI.*501.*20",
             ),
         ):
-            with self.subTest(label=label), self.assertRaisesRegex(ValueError, message):
+            with self.subTest(label=label), self.assertRaisesRegex(
+                ValueError, "writable production frontends must use one shared identity"
+            ):
                 deploy.validate_server_config(
                     self.write_config(unsafe), "10.10.10.30", role="prod"
                 )
+
+        all_root = valid.replace("uid = 501\ngid = 20", "uid = 0\ngid = 0")
+        with self.assertRaisesRegex(ValueError, "uid 501 and gid 20"):
+            deploy.validate_server_config(
+                self.write_config(all_root), "10.10.10.30", role="prod"
+            )
 
     def test_dev_rejects_webui_even_on_private_address(self) -> None:
         dev_with_webui = (
@@ -411,6 +510,170 @@ addresses = ["10.10.10.30:9567"]
 
 
 class PlanTests(unittest.TestCase):
+    def test_legacy_nbd_retirement_plan_has_safe_order_and_owned_device(self) -> None:
+        plan = deploy.plan_legacy_nbd_retirement(
+            deploy.LegacyNbdState(
+                loaded_mount_units=frozenset(
+                    {r"mnt-zerofs\x2dlxc.mount", "mnt-zerofs-lxc.mount"}
+                ),
+                client_loaded=True,
+                client_active=True,
+                mount_source="/dev/nbd0",
+                device_connected=True,
+            )
+        )
+        self.assertEqual(
+            plan.actions,
+            (
+                "sync:/mnt/zerofs-lxc",
+                r"disable:mnt-zerofs\x2dlxc.mount",
+                "disable:mnt-zerofs-lxc.mount",
+                "unmount:/mnt/zerofs-lxc",
+                "disable:zerofs-lxc-nbd-client.service",
+                "disconnect:/dev/nbd0",
+                "remove-obsolete-artifacts",
+            ),
+        )
+
+    def test_legacy_nbd_retirement_refuses_unknown_source_or_owner(self) -> None:
+        with self.assertRaisesRegex(ValueError, "unexpected legacy mount source"):
+            deploy.plan_legacy_nbd_retirement(
+                deploy.LegacyNbdState(
+                    loaded_mount_units=frozenset(),
+                    client_loaded=False,
+                    client_active=False,
+                    mount_source="/dev/sdz",
+                    device_connected=False,
+                )
+            )
+        with self.assertRaisesRegex(ValueError, "without recognized legacy"):
+            deploy.plan_legacy_nbd_retirement(
+                deploy.LegacyNbdState(
+                    loaded_mount_units=frozenset(),
+                    client_loaded=False,
+                    client_active=False,
+                    mount_source=None,
+                    device_connected=True,
+                )
+            )
+
+    def test_shared_namespace_receipt_rejects_wrong_or_unverified_ownership(
+        self,
+    ) -> None:
+        for output, message in (
+            (
+                "ZEROFS_SHARED_NAMESPACE_V1 verified=1 objects=224 wrong_owner=1 "
+                "first_uid=0 first_gid=0 reason=ok",
+                "wrong_owner=1.*chown --no-dereference 501:20.*wrong_owner=0",
+            ),
+            (
+                "ZEROFS_SHARED_NAMESPACE_V1 verified=0 objects=0 wrong_owner=0 "
+                "first_uid=-1 first_gid=-1 reason=mount_unavailable",
+                "verified=0.*mount_unavailable",
+            ),
+        ):
+            with self.subTest(output=output), self.assertRaisesRegex(
+                ValueError, message
+            ):
+                deploy.validate_shared_namespace_ownership(
+                    deploy.parse_shared_namespace_ownership_receipt(output)
+                )
+        with self.assertRaisesRegex(ValueError, "chown --no-dereference 501:20"):
+            deploy.validate_shared_namespace_ownership(
+                deploy.SharedNamespaceOwnershipReceipt(
+                    objects=2, wrong_owner=1, first_uid=0, first_gid=0
+                )
+            )
+
+    def test_guest_nfs_reconciler_has_recursive_fail_closed_preflight(self) -> None:
+        script = Path(__file__).parents[1] / "guest/reconcile-zerofs-nfs.sh"
+        source = script.read_text()
+        self.assertIn("ZEROFS_SHARED_NAMESPACE_V1", source)
+        self.assertIn('"$mountpoint/.nbd" -prune', source)
+        self.assertIn("wrong_owner", source)
+        self.assertIn("cmp -s", source)
+        self.assertIn("! legacy_state_present", source)
+        self.assertIn("ZeroFS NFS mount already reconciled", source)
+        self.assertIn(r"mnt-zerofs\x2dlxc.mount", source)
+        self.assertIn("/usr/local/libexec/zerofs-normalize-shared-namespace", source)
+        self.assertIn("assert_file_hash", source)
+        self.assertIn("assert_unit_fragment", source)
+        self.assertIn("ZEROFS_NBD_DEVICE=/dev/nbd0", source)
+        self.assertIn("ZEROFS_NBD_EXPORT=vm100-pilot-64g", source)
+        self.assertIn("ZEROFS_NBD_CONNECTIONS=8", source)
+        self.assertIn("legacy NBD client environment is not canonical", source)
+        self.assertIn('rmdir -- "$legacy_mount"', source)
+        self.assertNotIn(
+            '"${legacy_namespace_artifacts[@]}" "${legacy_namespace_mounts[@]}"',
+            source,
+        )
+        self.assertIn("What=${expected_source}", source)
+        subprocess.run(["bash", "-n", str(script)], check=True)
+
+    def test_guest_reconciler_accepts_only_exact_shipped_legacy_units(self) -> None:
+        script = Path(__file__).parents[1] / "guest/reconcile-zerofs-nfs.sh"
+        source = script.read_text()
+        fixtures = {
+            "99015e0989c4fda8c9377fd1c2e062890c2d83c4c3673ad3415d552d8e73ecdf": """[Unit]
+Description=ZeroFS XFS volume from private LXC NBD server
+Requires=zerofs-lxc-nbd-client.service
+After=zerofs-lxc-nbd-client.service
+
+[Mount]
+What=/dev/nbd0
+Where=/mnt/zerofs-lxc
+Type=xfs
+Options=rw,noatime,nodiscard
+TimeoutSec=60s
+
+[Install]
+WantedBy=multi-user.target
+""",
+            "013e9481f2bf7e0ba66f4dbc60bba64937da88293f7f3732c0e62c7cb2c5b33d": """[Unit]
+Description=ZeroFS file namespace mapped for VM100 and macOS ownership
+Requires=mnt-zerofs\\x2dfiles\\x2draw-.nbd.mount
+After=mnt-zerofs\\x2dfiles\\x2draw-.nbd.mount
+
+[Mount]
+What=/mnt/zerofs-files-raw
+Where=/mnt/zerofs-files
+Type=fuse.bindfs
+Options=mirror=zack,create-for-user=501,create-for-group=20,chown-ignore,chgrp-ignore,chmod-ignore,_netdev
+TimeoutSec=30s
+
+[Install]
+WantedBy=remote-fs.target
+""",
+            "9a0e6e3501a971c13b5d5ad7e609cc92989f83c197821f0c09596a02c3cbeac2": """[Unit]
+Description=ZeroFS file namespace mapped for VM100 and macOS ownership
+Requires=zerofs-shared-namespace-permissions.service
+After=zerofs-shared-namespace-permissions.service
+
+[Mount]
+What=/mnt/zerofs-files-raw
+Where=/mnt/zerofs-files
+Type=fuse.bindfs
+Options=mirror=zack,create-for-user=501,create-for-group=20,chown-ignore,chgrp-ignore,chmod-ignore,_netdev
+TimeoutSec=30s
+
+[Install]
+WantedBy=remote-fs.target
+""",
+        }
+        for expected, fixture in fixtures.items():
+            with self.subTest(expected=expected):
+                self.assertEqual(hashlib.sha256(fixture.encode()).hexdigest(), expected)
+                self.assertIn(expected, source)
+                altered = fixture.replace("[Mount]", "[Mount]\nWhere=/tmp/escape", 1)
+                self.assertNotIn(hashlib.sha256(altered.encode()).hexdigest(), source)
+        for label in (
+            "legacy raw namespace unit contains unexpected directives",
+            "legacy raw NBD guard unit",
+            "legacy exposed NBD guard unit",
+            "legacy namespace permissions service",
+        ):
+            self.assertIn(label, source)
+
     def test_webui_node_version_gate_requires_vite_minimum(self) -> None:
         self.assertTrue(deploy.node_version_supported("v24.19.0"))
         self.assertTrue(deploy.node_version_supported("v20.19.0"))
@@ -455,8 +718,576 @@ class PlanTests(unittest.TestCase):
         self.assertIn("ip=10.10.10.20/24", rendered)
         self.assertIn("gw=10.10.10.1", rendered)
         self.assertIn("mp=/srv/zerofs-persist", rendered)
+        self.assertIn("--cores 8", rendered)
+        self.assertIn("--memory 65536", rendered)
+        self.assertIn("--swap 0", rendered)
+        self.assertIn("--onboot 1", rendered)
+        self.assertIn("--startup order=20", rendered)
         self.assertNotIn("mkfs", rendered)
         self.assertNotIn("0.0.0.0", rendered)
+
+
+class VmNfsCoordinatorTests(unittest.TestCase):
+    class RecordingRunner:
+        dry_run = False
+
+        def __init__(self, fail_token: str | None = None) -> None:
+            self.fail_token = fail_token
+            self.calls: list[str] = []
+
+        @contextlib.contextmanager
+        def remote_deployment_locks(self, args):
+            self.calls.append("lock vm:global")
+            try:
+                yield
+            finally:
+                self.calls.append("unlock vm:global")
+
+        def run(
+            self,
+            command: list[str],
+            *,
+            cwd: Path | None = None,
+            capture: bool = False,
+            input_text: str | None = None,
+        ) -> subprocess.CompletedProcess[str]:
+            del cwd, capture
+            rendered = deploy.shell_join(command)
+            if input_text:
+                rendered += "\n" + input_text
+            self.calls.append(rendered)
+            if self.fail_token and self.fail_token in rendered:
+                raise RuntimeError(f"injected {self.fail_token}")
+            stdout = ""
+            if "reconcile-zerofs-nfs.sh preflight " in rendered:
+                stdout = (
+                    "ZEROFS_SHARED_NAMESPACE_V1 verified=1 objects=9 "
+                    "wrong_owner=0 first_uid=-1 first_gid=-1 reason=ok\n"
+                )
+            return subprocess.CompletedProcess(command, 0, stdout, "")
+
+        def run_remote_shell(self, host: str, script: str) -> str | None:
+            rendered = f"locked-shell {host}\n{script}"
+            self.calls.append(rendered)
+            if self.fail_token and self.fail_token in rendered:
+                raise RuntimeError(f"injected {self.fail_token}")
+            if "reconcile-zerofs-nfs.sh preflight " in rendered:
+                return (
+                    "ZEROFS_SHARED_NAMESPACE_V1 verified=1 objects=9 "
+                    "wrong_owner=0 first_uid=-1 first_gid=-1 reason=ok\n"
+                )
+            return ""
+
+    def args(self) -> SimpleNamespace:
+        return SimpleNamespace(
+            vm_host="ubuntu-main",
+            pve_host="pve",
+            ctid=198,
+            container_ip="10.10.10.55",
+        )
+
+    def transaction_runner(self):
+        transaction = getattr(deploy, "_run_prod_vm_nfs_transaction", None)
+        self.assertIsNotNone(transaction, "production VM NFS transaction is missing")
+        return transaction
+
+    @staticmethod
+    def actions(calls: list[str]) -> list[str]:
+        found: list[str] = []
+        for call in calls:
+            for action in (
+                "recover",
+                "prepare",
+                "quiesce",
+                "reconcile",
+                "decide",
+                "rollback",
+                "commit",
+            ):
+                if f"vm_nfs_transition.py {action} " in call:
+                    found.append(action)
+        return found
+
+    def test_prod_nfs_transition_wraps_host_deploy_transactionally(self) -> None:
+        runner = self.RecordingRunner()
+        host_events: list[str] = []
+
+        self.transaction_runner()(
+            runner,
+            self.args(),
+            "0123456789ab-cccccccccccccccc",
+            lambda: host_events.append("activated"),
+            lambda: host_events.append("committed"),
+            lambda: host_events.append("rolled-back"),
+            lambda: host_events.append("recovered"),
+        )
+
+        self.assertEqual(host_events, ["recovered", "activated", "committed"])
+        self.assertEqual(runner.calls[0], "lock vm:global")
+        self.assertEqual(runner.calls[-1], "unlock vm:global")
+        self.assertEqual(
+            self.actions(runner.calls),
+            ["recover", "prepare", "quiesce", "reconcile", "decide", "commit"],
+        )
+
+    def test_every_mutating_vm_command_runs_inside_the_lock_session(self) -> None:
+        runner = self.RecordingRunner()
+
+        self.transaction_runner()(
+            runner,
+            self.args(),
+            "0123456789ab-cccccccccccccccc",
+            lambda: None,
+            lambda: None,
+            lambda: None,
+            lambda: None,
+        )
+
+        direct_vm_ssh = [
+            call
+            for call in runner.calls
+            if call.startswith("ssh -o BatchMode=yes ubuntu-main")
+        ]
+        self.assertEqual(direct_vm_ssh, [])
+        self.assertTrue(
+            any(
+                call.startswith("locked-shell ubuntu-main")
+                and "reconcile-zerofs-nfs.sh reconcile " in call
+                for call in runner.calls
+            )
+        )
+
+    def test_absent_initial_mount_is_proven_after_bootstrap_not_fabricated(
+        self,
+    ) -> None:
+        class BootstrapRunner(self.RecordingRunner):
+            def __init__(inner_self):
+                super().__init__()
+                inner_self.preflights = 0
+
+            def run_remote_shell(inner_self, host, script):
+                result = super().run_remote_shell(host, script)
+                rendered = script
+                if "reconcile-zerofs-nfs.sh preflight " in rendered:
+                    inner_self.preflights += 1
+                    if inner_self.preflights == 1:
+                        return (
+                            "ZEROFS_SHARED_NAMESPACE_V1 verified=0 objects=0 "
+                            "wrong_owner=0 first_uid=-1 first_gid=-1 "
+                            "reason=mount_unavailable\n"
+                        )
+                return result
+
+        runner = BootstrapRunner()
+        events: list[str] = []
+        self.transaction_runner()(
+            runner,
+            self.args(),
+            "0123456789ab-cccccccccccccccc",
+            lambda: self.fail("full activation must wait for ownership proof"),
+            lambda: events.append("commit"),
+            lambda: events.append("rollback"),
+            lambda: events.append("recover"),
+            activate_maintenance=lambda: events.append("maintenance"),
+            promote_host=lambda: events.append("promote"),
+        )
+
+        self.assertEqual(runner.preflights, 2)
+        self.assertEqual(events, ["recover", "maintenance", "promote", "commit"])
+        self.assertEqual(
+            self.actions(runner.calls),
+            [
+                "recover",
+                "prepare",
+                "quiesce",
+                "reconcile",
+                "quiesce",
+                "reconcile",
+                "decide",
+                "commit",
+            ],
+        )
+
+    def test_recognized_legacy_bindfs_uses_the_transactional_bootstrap_path(
+        self,
+    ) -> None:
+        class LegacyRunner(self.RecordingRunner):
+            def run_remote_shell(inner_self, host, script):
+                if "reconcile-zerofs-nfs.sh preflight " in script:
+                    if not hasattr(inner_self, "preflighted"):
+                        inner_self.preflighted = True
+                        return (
+                            "ZEROFS_SHARED_NAMESPACE_V1 verified=0 objects=0 "
+                            "wrong_owner=0 first_uid=-1 first_gid=-1 "
+                            "reason=legacy_topology\n"
+                        )
+                return super().run_remote_shell(host, script)
+
+        runner = LegacyRunner()
+        events: list[str] = []
+        self.transaction_runner()(
+            runner,
+            self.args(),
+            "0123456789ab-cccccccccccccccc",
+            lambda: self.fail("legacy cutover requires maintenance activation"),
+            lambda: events.append("commit"),
+            lambda: events.append("rollback"),
+            lambda: events.append("recover"),
+            activate_maintenance=lambda: events.append("maintenance"),
+            promote_host=lambda: events.append("promote"),
+        )
+
+        prepare = next(
+            call for call in runner.calls if "vm_nfs_transition.py prepare " in call
+        )
+        self.assertIn("--allow-legacy-bindfs", prepare)
+        self.assertEqual(events, ["recover", "maintenance", "promote", "commit"])
+
+    def test_bootstrap_promotion_failure_restores_host_before_vm(self) -> None:
+        trace: list[str] = []
+
+        class BootstrapRunner(self.RecordingRunner):
+            def __init__(inner_self):
+                super().__init__()
+                inner_self.preflights = 0
+
+            def run_remote_shell(inner_self, host, script):
+                result = super().run_remote_shell(host, script)
+                if "vm_nfs_transition.py rollback " in script:
+                    trace.append("vm-rollback")
+                if "reconcile-zerofs-nfs.sh preflight " in script:
+                    inner_self.preflights += 1
+                    if inner_self.preflights == 1:
+                        return (
+                            "ZEROFS_SHARED_NAMESPACE_V1 verified=0 objects=0 "
+                            "wrong_owner=0 first_uid=-1 first_gid=-1 "
+                            "reason=mount_unavailable\n"
+                        )
+                return result
+
+        runner = BootstrapRunner()
+        with self.assertRaisesRegex(RuntimeError, "promotion failed"):
+            self.transaction_runner()(
+                runner,
+                self.args(),
+                "0123456789ab-cccccccccccccccc",
+                lambda: self.fail("full activation must not run"),
+                lambda: self.fail("host commit must not run"),
+                lambda: trace.append("host-rollback"),
+                lambda: trace.append("host-recover"),
+                activate_maintenance=lambda: trace.append("maintenance"),
+                promote_host=lambda: (_ for _ in ()).throw(
+                    RuntimeError("promotion failed")
+                ),
+            )
+
+        self.assertEqual(
+            trace,
+            ["host-recover", "maintenance", "host-rollback", "vm-rollback"],
+        )
+
+    def test_prod_nfs_transition_rolls_back_each_mutating_failure_phase(self) -> None:
+        runner = self.RecordingRunner("vm_nfs_transition.py prepare ")
+        with self.assertRaisesRegex(RuntimeError, "injected"):
+            self.transaction_runner()(
+                runner,
+                self.args(),
+                "0123456789ab-cccccccccccccccc",
+                lambda: self.fail("host deploy must not run"),
+                lambda: self.fail("host commit must not run"),
+                lambda: self.fail("host rollback must not run"),
+                lambda: None,
+            )
+        self.assertEqual(self.actions(runner.calls), ["recover", "prepare"])
+
+        for phase in ("quiesce", "reconcile"):
+            with self.subTest(phase=phase):
+                runner = self.RecordingRunner(f"vm_nfs_transition.py {phase} ")
+                with self.assertRaisesRegex(RuntimeError, "injected"):
+                    self.transaction_runner()(
+                        runner,
+                        self.args(),
+                        "0123456789ab-cccccccccccccccc",
+                        lambda: None,
+                        lambda: None,
+                        lambda: None,
+                        lambda: None,
+                    )
+                self.assertEqual(
+                    self.actions(runner.calls)[-2:], ["rollback", "commit"]
+                )
+
+        runner = self.RecordingRunner()
+        with self.assertRaisesRegex(RuntimeError, "injected host deploy"):
+            self.transaction_runner()(
+                runner,
+                self.args(),
+                "0123456789ab-cccccccccccccccc",
+                lambda: (_ for _ in ()).throw(RuntimeError("injected host deploy")),
+                lambda: self.fail("host commit must not run"),
+                lambda: self.fail("host rollback must not run"),
+                lambda: None,
+            )
+        self.assertEqual(
+            self.actions(runner.calls),
+            ["recover", "prepare", "quiesce", "rollback", "commit"],
+        )
+
+    def test_prod_nfs_staging_failure_does_not_quiesce_or_reconcile(self) -> None:
+        runner = self.RecordingRunner("vm_nfs_transition.py")
+        with self.assertRaisesRegex(RuntimeError, "injected"):
+            self.transaction_runner()(
+                runner,
+                self.args(),
+                "0123456789ab-cccccccccccccccc",
+                lambda: self.fail("host deploy must not run"),
+                lambda: self.fail("host commit must not run"),
+                lambda: self.fail("host rollback must not run"),
+                lambda: None,
+            )
+        self.assertEqual(self.actions(runner.calls), [])
+
+    def test_reconcile_failure_compensates_host_before_vm_rollback(self) -> None:
+        trace: list[str] = []
+
+        class TraceRunner(self.RecordingRunner):
+            def run_remote_shell(inner_self, host, script):
+                if "vm_nfs_transition.py rollback " in script:
+                    trace.append("vm-rollback")
+                return super().run_remote_shell(host, script)
+
+        runner = TraceRunner("vm_nfs_transition.py reconcile ")
+        with self.assertRaisesRegex(RuntimeError, "injected"):
+            self.transaction_runner()(
+                runner,
+                self.args(),
+                "0123456789ab-cccccccccccccccc",
+                lambda: trace.append("host-activate"),
+                lambda: trace.append("host-commit"),
+                lambda: trace.append("host-rollback"),
+                lambda: trace.append("host-recover"),
+            )
+
+        self.assertEqual(
+            trace,
+            ["host-recover", "host-activate", "host-rollback", "vm-rollback"],
+        )
+
+    def test_host_rollback_failure_preserves_quiesced_vm_transaction(self) -> None:
+        runner = self.RecordingRunner("vm_nfs_transition.py reconcile ")
+        with self.assertRaisesRegex(RuntimeError, "injected") as caught:
+            self.transaction_runner()(
+                runner,
+                self.args(),
+                "0123456789ab-cccccccccccccccc",
+                lambda: None,
+                lambda: self.fail("host commit must not run"),
+                lambda: (_ for _ in ()).throw(RuntimeError("host rollback failed")),
+                lambda: None,
+            )
+
+        self.assertIn(
+            "host rollback also failed", "\n".join(caught.exception.__notes__)
+        )
+        self.assertNotIn("rollback", self.actions(runner.calls))
+
+    def test_host_commit_failure_keeps_reconciled_vm_and_transaction_token(
+        self,
+    ) -> None:
+        runner = self.RecordingRunner()
+        with self.assertRaisesRegex(RuntimeError, "host commit failed"):
+            self.transaction_runner()(
+                runner,
+                self.args(),
+                "0123456789ab-cccccccccccccccc",
+                lambda: None,
+                lambda: (_ for _ in ()).throw(RuntimeError("host commit failed")),
+                lambda: self.fail("host rollback must not run after VM commit"),
+                lambda: None,
+            )
+
+        self.assertEqual(
+            self.actions(runner.calls),
+            ["recover", "prepare", "quiesce", "reconcile", "decide"],
+        )
+
+    def test_retry_finishes_a_decided_commit_without_rollback(self) -> None:
+        class DecidedRunner(self.RecordingRunner):
+            def run_remote_shell(inner_self, host, script):
+                if "vm_nfs_transition.py status " in script:
+                    return (
+                        '{"phase":"commit_decided","deployment":'
+                        '{"ctid":198,"pve_host":"pve",'
+                        '"release":"0123456789ab-cccccccccccccccc",'
+                        '"source":"10.10.10.55:/"}}\n'
+                    )
+                return super().run_remote_shell(host, script)
+
+        runner = DecidedRunner()
+        events: list[str] = []
+        self.transaction_runner()(
+            runner,
+            self.args(),
+            "0123456789ab-cccccccccccccccc",
+            lambda: self.fail("activation must not repeat"),
+            lambda: events.append("finalize-host"),
+            lambda: self.fail("decided commit must not roll back"),
+            lambda: self.fail("decided commit must not run host rollback recovery"),
+        )
+
+        self.assertEqual(events, ["finalize-host"])
+        self.assertEqual(self.actions(runner.calls), ["commit"])
+
+    def test_retry_rejects_a_decided_commit_for_another_deployment(self) -> None:
+        class OtherDeploymentRunner(self.RecordingRunner):
+            def run_remote_shell(inner_self, host, script):
+                if "vm_nfs_transition.py status " in script:
+                    return (
+                        '{"phase":"commit_decided","deployment":'
+                        '{"ctid":198,"pve_host":"pve",'
+                        '"release":"older-release",'
+                        '"source":"10.10.10.55:/"}}\n'
+                    )
+                return super().run_remote_shell(host, script)
+
+        runner = OtherDeploymentRunner()
+        events: list[str] = []
+        with self.assertRaisesRegex(RuntimeError, "belongs to another deployment"):
+            self.transaction_runner()(
+                runner,
+                self.args(),
+                "0123456789ab-cccccccccccccccc",
+                lambda: self.fail("activation must not run"),
+                lambda: events.append("finalize-host"),
+                lambda: self.fail("rollback must not run"),
+                lambda: self.fail("host recovery must not run"),
+            )
+
+        self.assertEqual(events, [])
+        self.assertEqual(self.actions(runner.calls), [])
+
+    def test_ambiguous_commit_decision_failure_is_never_compensated(self) -> None:
+        runner = self.RecordingRunner("vm_nfs_transition.py decide ")
+        with self.assertRaisesRegex(RuntimeError, "injected") as caught:
+            self.transaction_runner()(
+                runner,
+                self.args(),
+                "0123456789ab-cccccccccccccccc",
+                lambda: None,
+                lambda: self.fail("host finalization must not run"),
+                lambda: self.fail("ambiguous decision must not roll back host"),
+                lambda: None,
+            )
+
+        self.assertIn("may be durable", "\n".join(caught.exception.__notes__))
+        self.assertNotIn("rollback", self.actions(runner.calls))
+
+
+class DeploymentLockTests(unittest.TestCase):
+    def test_lock_owner_executes_remote_commands_and_reports_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            lock = Path(directory) / "coordinator.lock"
+            holder = "flock() { return 0; }; " + deploy._remote_lock_holder(str(lock))
+            lease = deploy._FlockLease(["bash", "-c", holder], dry_run=False)
+
+            with lease:
+                self.assertEqual(
+                    lease.execute("printf 'inside-lock\\n'"), "inside-lock\n"
+                )
+                with self.assertRaisesRegex(
+                    RuntimeError, "locked remote command exited 17"
+                ):
+                    lease.execute("printf 'failed\\n'; exit 17")
+
+    def test_nonblocking_flock_rejects_a_concurrent_coordinator(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            lock = Path(directory) / "coordinator.lock"
+            script = """
+import fcntl
+import sys
+handle = open(sys.argv[1], "w")
+try:
+    fcntl.lockf(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    raise SystemExit(75)
+print("LOCKED", flush=True)
+sys.stdin.read()
+"""
+            command = [sys.executable, "-u", "-c", script, str(lock)]
+            first = deploy._FlockLease(command, dry_run=False)
+            second = deploy._FlockLease(command, dry_run=False)
+
+            with first:
+                with self.assertRaisesRegex(RuntimeError, "another ZeroFS deployment"):
+                    second.__enter__()
+
+    def test_runner_fences_commands_after_a_lock_lease_is_lost(self) -> None:
+        runner = deploy.Runner(dry_run=False)
+        dead_process = SimpleNamespace(poll=lambda: 75)
+        runner._active_leases.append(SimpleNamespace(process=dead_process))
+
+        with self.assertRaisesRegex(RuntimeError, "lock lease was lost"):
+            runner.run(["/usr/bin/true"])
+
+
+class OwnershipMigrationTests(unittest.TestCase):
+    def run_cli(self, action: str, *extra: str, env=None):
+        return subprocess.run(
+            [
+                sys.executable,
+                str(MODULE_PATH),
+                action,
+                "--role",
+                "prod",
+                "--ctid",
+                "198",
+                "--container-ip",
+                "10.10.10.55",
+                *extra,
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+            env={**os.environ, **(env or {})},
+        )
+
+    def test_dry_run_inventory_is_non_mutating_and_uses_the_fixed_target(self) -> None:
+        result = self.run_cli("ownership-inventory", "--dry-run")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("repair-zerofs-ownership.sh inventory", result.stdout)
+        self.assertIn("10.10.10.55:/", result.stdout)
+        self.assertNotIn("repair-zerofs-ownership.sh repair", result.stdout)
+
+        repair_plan = self.run_cli("ownership-repair", "--dry-run")
+        self.assertEqual(repair_plan.returncode, 0, repair_plan.stderr)
+        self.assertIn("repair-zerofs-ownership.sh inventory", repair_plan.stdout)
+
+    def test_live_repair_requires_matching_flag_and_environment_confirmation(
+        self,
+    ) -> None:
+        missing = self.run_cli("ownership-repair")
+        self.assertNotEqual(missing.returncode, 0)
+        self.assertIn("501:20", missing.stderr)
+
+        flag_only = self.run_cli(
+            "ownership-repair", "--confirm-ownership-repair", "501:20"
+        )
+        self.assertNotEqual(flag_only.returncode, 0)
+        self.assertIn("ZEROFS_CONFIRM_OWNERSHIP_REPAIR", flag_only.stderr)
+
+    def test_repair_script_is_resumable_and_does_not_follow_or_cross(self) -> None:
+        script = Path(__file__).parents[1] / "guest/repair-zerofs-ownership.sh"
+        source = script.read_text()
+        self.assertIn("-xdev", source)
+        self.assertIn('"$mountpoint/.nbd" -prune', source)
+        self.assertIn("chown --no-dereference", source)
+        self.assertIn("repair requires exact confirmation 501:20", source)
+        self.assertIn('! -uid "$target_uid" -o ! -gid "$target_gid"', source)
+        self.assertIn("durable_receipt=", source)
+        self.assertIn("mv -f --", source)
+        self.assertIn('sync -f "$temporary"', source)
+        self.assertIn("os.fsync", source)
+        subprocess.run(["bash", "-n", str(script)], check=True)
 
 
 class CliDryRunTests(ConfigValidationTests):
@@ -465,60 +1296,24 @@ class CliDryRunTests(ConfigValidationTests):
     ) -> None:
         self.assertIn("ubuntu-main bash -se", result.stdout)
         self.assertIn(r"mnt-zerofs\x2dfiles.mount", result.stdout)
-        self.assertIn(
-            r"systemctl enable --now 'mnt-zerofs\x2dfiles.mount'", result.stdout
+        self.assertIn("vm_nfs_transition.py", result.stdout)
+        self.assertIn("reconcile-zerofs-nfs.sh", result.stdout)
+        ordered = [
+            result.stdout.index(f"vm_nfs_transition.py {action}")
+            for action in ("recover", "prepare", "quiesce", "reconcile", "commit")
+        ]
+        self.assertEqual(ordered, sorted(ordered))
+        self.assertIn(f"--expected-source {container_ip}:/", result.stdout)
+        self.assertLess(
+            result.stdout.index(f"reconcile-zerofs-nfs.sh preflight {container_ip}:/"),
+            result.stdout.index("vm_nfs_transition.py quiesce"),
         )
-        self.assertIn(
-            r"systemctl is-active --quiet 'mnt-zerofs\x2dfiles.mount'",
-            result.stdout,
+        self.assertLess(
+            result.stdout.index("host-deploy.sh deploy --role prod"),
+            result.stdout.index(f"reconcile-zerofs-nfs.sh reconcile {container_ip}:/"),
         )
-        self.assertIn(
-            r"systemctl restart 'mnt-zerofs\x2dfiles.mount'", result.stdout
-        )
-        self.assertIn(
-            r"systemctl is-enabled --quiet 'mnt-zerofs\x2dfiles.mount'",
-            result.stdout,
-        )
-        self.assertIn(
-            r"systemctl disable --now 'mnt-zerofs\x2dfiles.mount'", result.stdout
-        )
-        self.assertIn("findmnt -rn -M /mnt/zerofs-files", result.stdout)
-        self.assertIn(f'test "$mount_source" = "{container_ip}:/"', result.stdout)
-        self.assertIn('case ",$mount_options," in', result.stdout)
-        for legacy_unit in (
-            r"mnt-zerofs\x2dfiles\x2draw.mount",
-            r"mnt-zerofs\x2dfiles\x2draw-.nbd.mount",
-            "zerofs-shared-namespace-permissions.service",
-        ):
-            with self.subTest(legacy_unit=legacy_unit):
-                self.assertIn(legacy_unit, result.stdout)
-        self.assertIn('systemctl disable --now "$legacy_unit"', result.stdout)
-        self.assertIn('systemctl is-enabled --quiet "$legacy_unit"', result.stdout)
-        for legacy_mount in (
-            "/mnt/zerofs-files-raw/.nbd",
-            "/mnt/zerofs-files-raw",
-        ):
-            with self.subTest(legacy_mount=legacy_mount):
-                self.assertIn(legacy_mount, result.stdout)
-        self.assertIn('findmnt -rn -M "$legacy_mount"', result.stdout)
-        self.assertIn("mnt-zerofs-lxc.mount", result.stdout)
-        self.assertIn("zerofs-lxc-nbd-client.service", result.stdout)
-        self.assertIn("/mnt/zerofs-lxc", result.stdout)
-        self.assertIn("/sys/class/block/nbd0/pid", result.stdout)
-        self.assertIn("nbd-client -d /dev/nbd0", result.stdout)
-        self.assertIn("umount /mnt/zerofs-lxc", result.stdout)
-        self.assertIn("findmnt -nro SOURCE -M /mnt/zerofs-lxc", result.stdout)
-        self.assertIn(
-            "refusing to retire unexpected legacy mount source", result.stdout
-        )
-        self.assertIn(
-            "nbd0 is connected without recognized legacy ZeroFS state",
-            result.stdout,
-        )
-        self.assertIn("/usr/local/libexec/zerofs-tune-nbd", result.stdout)
-        self.assertIn("/etc/zerofs-lxc/client.env", result.stdout)
-        self.assertIn('test "$mount_fstype" = nfs', result.stdout)
-        self.assertNotIn("nfs|nfs4", result.stdout)
+        self.assertNotIn("bindfs", result.stdout)
+        self.assertNotIn("nbd-client -d", result.stdout)
 
     def run_cli(
         self,
@@ -548,15 +1343,15 @@ class CliDryRunTests(ConfigValidationTests):
             check=False,
         )
 
-    def test_deploy_dry_run_provisions_nfs_and_only_retires_legacy_vm_nbd(
-        self,
-    ) -> None:
+    def test_dev_nbd_deploy_never_stages_or_reconciles_vm_nfs(self) -> None:
         config = self.write_config(self.valid_config())
         result = self.run_cli("deploy", "--config", str(config))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("cargo build --release --locked", result.stdout)
         self.assertIn("host-deploy.sh deploy", result.stdout)
-        self.assert_direct_nfs_mount_is_provisioned(result, "10.10.10.20")
+        self.assertNotIn("ubuntu-main", result.stdout)
+        self.assertNotIn(r"mnt-zerofs\x2dfiles.mount", result.stdout)
+        self.assertNotIn("/mnt/zerofs-files", result.stdout)
         self.assertNotIn("mkfs", result.stdout)
 
     def test_cleanup_dry_run_keeps_persistent_state(self) -> None:
@@ -600,7 +1395,9 @@ class CliDryRunTests(ConfigValidationTests):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("prod", result.stderr)
 
-    def test_prod_deploy_provisions_nfs_and_retires_legacy_vm_nbd(self) -> None:
+    def test_prod_deploy_transactionally_reconciles_the_single_vm_nfs_mount(
+        self,
+    ) -> None:
         config = self.write_config(
             self.prod_config().replace("10.10.10.30", "10.10.10.55")
         )
@@ -626,6 +1423,11 @@ class CliDryRunTests(ConfigValidationTests):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("make webui", result.stdout)
         self.assertIn("host-deploy.sh deploy --role prod", result.stdout)
+        self.assertIn("--defer-commit", result.stdout)
+        self.assertIn("zerofs-vm-nfs-global.coordinator.lock", result.stdout)
+        self.assertNotIn("--coordinator-lock-held", result.stdout)
+        self.assertIn("host-deploy.sh finalize --role prod", result.stdout)
+        self.assertNotIn("host-deploy.sh rollback --role prod", result.stdout)
         self.assertIn("--features webui", result.stdout)
         self.assertIn("--prod-access nfs", result.stdout)
         self.assert_direct_nfs_mount_is_provisioned(result, "10.10.10.55")
@@ -724,6 +1526,8 @@ class CliDryRunTests(ConfigValidationTests):
             result.stdout,
         )
         self.assertIn("systemctl stop zerofs-nbd-pilot.service", result.stdout)
+        self.assertIn("findmnt -nro SOURCE -M /mnt/storagebox-nbd-pilot", result.stdout)
+        self.assertIn("unexpected legacy NBD mount source", result.stdout)
         self.assertNotIn(
             "install -m 0644 /tmp/zerofs-lxc-nbd-client.service",
             result.stdout,
@@ -736,6 +1540,26 @@ class CliDryRunTests(ConfigValidationTests):
         self.assertNotIn(
             "systemctl enable --now zerofs-nbd-client.service", result.stdout
         )
+
+    def test_dev_migration_rejects_the_production_nfs_unit_and_mount(self) -> None:
+        config = self.write_config(self.valid_config())
+        result = self.run_cli(
+            "deploy",
+            "--config",
+            str(config),
+            "--source-client-unit",
+            "mnt-zerofs\\x2dfiles.mount",
+            "--source-mount-unit",
+            "mnt-zerofs\\x2dfiles.mount",
+            "--source-mountpoint",
+            "/mnt/zerofs-files",
+            "--source-server-unit",
+            "zerofs-lxc.service",
+            skip_existing=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("documented legacy NBD pilot", result.stderr)
+        self.assertNotIn("systemctl disable", result.stdout)
 
 
 if __name__ == "__main__":
