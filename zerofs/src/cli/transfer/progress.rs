@@ -1,4 +1,5 @@
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -9,20 +10,63 @@ pub(super) struct Progress {
     multi: MultiProgress,
     bar: ProgressBar,
     direction: &'static str,
-    completed_files: Arc<Mutex<usize>>,
+    state: Arc<Mutex<ProgressState>>,
     total_files: usize,
 }
 
+#[derive(Default)]
+struct ProgressState {
+    completed_files: usize,
+    path_order: HashMap<PathBuf, usize>,
+    next_dynamic_order: usize,
+    next_emit_order: usize,
+    pending_events: BTreeMap<usize, Vec<String>>,
+    terminal_orders: BTreeSet<usize>,
+    emitted_lines: Vec<String>,
+}
+
 impl Progress {
+    #[cfg(test)]
     pub(super) fn new(direction: &'static str, total_bytes: u64, total_files: usize) -> Self {
-        Self::with_multi(MultiProgress::new(), direction, total_bytes, total_files)
+        Self::with_multi_ordered(
+            MultiProgress::new(),
+            direction,
+            total_bytes,
+            total_files,
+            &[],
+        )
     }
 
+    pub(super) fn new_ordered(
+        direction: &'static str,
+        total_bytes: u64,
+        paths: &[PathBuf],
+    ) -> Self {
+        Self::with_multi_ordered(
+            MultiProgress::new(),
+            direction,
+            total_bytes,
+            paths.len(),
+            paths,
+        )
+    }
+
+    #[cfg(test)]
     fn with_multi(
         multi: MultiProgress,
         direction: &'static str,
         total_bytes: u64,
         total_files: usize,
+    ) -> Self {
+        Self::with_multi_ordered(multi, direction, total_bytes, total_files, &[])
+    }
+
+    fn with_multi_ordered(
+        multi: MultiProgress,
+        direction: &'static str,
+        total_bytes: u64,
+        total_files: usize,
+        paths: &[PathBuf],
     ) -> Self {
         let bar = ProgressBar::with_draw_target(Some(total_bytes), ProgressDrawTarget::hidden());
         bar.set_style(
@@ -36,16 +80,28 @@ impl Progress {
         bar.set_prefix(direction);
         bar.set_message(format!("files 0/{total_files}"));
         let bar = multi.add(bar);
+        let path_order = paths
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(order, path)| (path, order))
+            .collect();
         Self {
             multi,
             bar,
             direction,
-            completed_files: Arc::new(Mutex::new(0)),
+            state: Arc::new(Mutex::new(ProgressState {
+                path_order,
+                next_dynamic_order: paths.len(),
+                ..ProgressState::default()
+            })),
             total_files,
         }
     }
 
     pub(super) fn start_file(&self, path: &Path, size: u64) -> FileProgress {
+        self.order_for(path);
+        self.bar.tick();
         let bar = ProgressBar::with_draw_target(Some(size), ProgressDrawTarget::hidden());
         bar.set_style(
             ProgressStyle::with_template(
@@ -60,7 +116,6 @@ impl Progress {
             progress: self.clone(),
             bar: self.multi.add(bar),
             path: path.to_path_buf(),
-            committed: false,
         }
     }
 
@@ -71,20 +126,28 @@ impl Progress {
         max_attempts: usize,
         error: &anyhow::Error,
     ) {
-        self.print_line(format!(
-            "{} retry {next_attempt}/{max_attempts}: {}: {error:#}",
-            self.direction,
-            path.display()
-        ));
+        self.queue_file_event(
+            path,
+            format!(
+                "{} retry {next_attempt}/{max_attempts}: {}: {error:#}",
+                self.direction,
+                path.display()
+            ),
+            false,
+        );
     }
 
     pub(super) fn fail_file(&self, path: &Path, attempts: usize, error: &anyhow::Error) {
-        self.print_line(format!(
-            "{} failed after {attempts} attempt{}: {}: {error:#}",
-            self.direction,
-            if attempts == 1 { "" } else { "s" },
-            path.display()
-        ));
+        self.queue_file_event(
+            path,
+            format!(
+                "{} failed after {attempts} attempt{}: {}: {error:#}",
+                self.direction,
+                if attempts == 1 { "" } else { "s" },
+                path.display()
+            ),
+            true,
+        );
     }
 
     pub(super) fn skip_file(&self, path: &Path, size: u64) {
@@ -93,21 +156,32 @@ impl Progress {
         self.record_file(path, "skipped");
     }
 
-    fn finish_file(&self, path: &Path) {
+    fn finish_file(&self, path: &Path, bytes: u64) {
+        self.bar.inc(bytes);
+        self.bar.reset_eta();
         self.record_file(path, "complete");
     }
 
     fn record_file(&self, path: &Path, status: &str) {
-        let mut completed = self.completed_files.lock().unwrap();
-        *completed += 1;
-        let completed = *completed;
-        self.set_file_message(completed);
+        let order = {
+            let mut state = self.state.lock().unwrap();
+            state.completed_files += 1;
+            let completed = state.completed_files;
+            let order = Self::order_for_locked(&mut state, path);
+            self.set_file_message(completed);
+            order
+        };
         if self.bar.is_hidden() {
-            eprintln!(
-                "{} file {completed}/{} {status}: {}",
-                self.direction,
-                self.total_files,
-                path.display()
+            self.queue_event_at(
+                order,
+                format!(
+                    "{} file {}/{} {status}: {}",
+                    self.direction,
+                    order + 1,
+                    self.total_files,
+                    path.display()
+                ),
+                true,
             );
         }
     }
@@ -131,7 +205,7 @@ impl Progress {
     pub(super) fn finish(&self) {
         self.bar.finish_with_message(format!(
             "files {}/{} complete",
-            *self.completed_files.lock().unwrap(),
+            self.state.lock().unwrap().completed_files,
             self.total_files
         ));
         if self.bar.is_hidden() {
@@ -151,15 +225,74 @@ impl Progress {
 
     fn print_line(&self, message: String) {
         if self.bar.is_hidden() {
+            self.state
+                .lock()
+                .unwrap()
+                .emitted_lines
+                .push(message.clone());
             eprintln!("{message}");
         } else {
             let _ = self.multi.println(message);
         }
     }
 
+    fn queue_file_event(&self, path: &Path, message: String, terminal: bool) {
+        let order = self.order_for(path);
+        self.queue_event_at(order, message, terminal);
+    }
+
+    fn queue_event_at(&self, order: usize, message: String, terminal: bool) {
+        if !self.bar.is_hidden() {
+            let _ = self.multi.println(message);
+            return;
+        }
+        let ready = {
+            let mut state = self.state.lock().unwrap();
+            state.pending_events.entry(order).or_default().push(message);
+            if terminal {
+                state.terminal_orders.insert(order);
+            }
+            let mut ready = Vec::new();
+            loop {
+                let next = state.next_emit_order;
+                if !state.terminal_orders.remove(&next) {
+                    break;
+                }
+                if let Some(events) = state.pending_events.remove(&next) {
+                    ready.extend(events);
+                }
+                state.next_emit_order += 1;
+            }
+            state.emitted_lines.extend(ready.iter().cloned());
+            ready
+        };
+        for line in ready {
+            eprintln!("{line}");
+        }
+    }
+
+    fn order_for(&self, path: &Path) -> usize {
+        Self::order_for_locked(&mut self.state.lock().unwrap(), path)
+    }
+
+    fn order_for_locked(state: &mut ProgressState, path: &Path) -> usize {
+        if let Some(order) = state.path_order.get(path) {
+            return *order;
+        }
+        let order = state.next_dynamic_order;
+        state.next_dynamic_order += 1;
+        state.path_order.insert(path.to_path_buf(), order);
+        order
+    }
+
     #[cfg(test)]
     pub(super) fn transferred_bytes(&self) -> u64 {
         self.bar.position()
+    }
+
+    #[cfg(test)]
+    fn emitted_lines(&self) -> Vec<String> {
+        self.state.lock().unwrap().emitted_lines.clone()
     }
 }
 
@@ -167,28 +300,22 @@ pub(super) struct FileProgress {
     progress: Progress,
     bar: ProgressBar,
     path: PathBuf,
-    committed: bool,
 }
 
 impl FileProgress {
     pub(super) fn advance(&self, bytes: u64) {
-        self.progress.bar.inc(bytes);
         self.bar.inc(bytes);
     }
 
-    pub(super) fn finish(mut self) {
-        self.committed = true;
+    pub(super) fn finish(self) {
+        let bytes = self.bar.position();
         self.progress.multi.remove(&self.bar);
-        self.progress.finish_file(&self.path);
+        self.progress.finish_file(&self.path, bytes);
     }
 }
 
 impl Drop for FileProgress {
     fn drop(&mut self) {
-        if !self.committed {
-            self.progress.bar.dec(self.bar.position());
-            self.progress.bar.reset_eta();
-        }
         self.progress.multi.remove(&self.bar);
     }
 }
@@ -304,7 +431,7 @@ mod tests {
         assert_eq!(second.bar.position(), 512);
         assert_eq!(second.bar.length(), Some(2048));
         assert_eq!(second.bar.message(), "second.m4b");
-        assert_eq!(progress.bar.position(), 768);
+        assert_eq!(progress.bar.position(), 0);
     }
 
     #[test]
@@ -431,5 +558,33 @@ mod tests {
 
             assert_eq!(progress.bar.message(), "files 2/2");
         }
+    }
+
+    #[test]
+    fn non_tty_file_events_are_emitted_in_planned_order() {
+        let progress = Progress::new_ordered(
+            "upload",
+            2,
+            &[
+                Path::new("first.m4b").into(),
+                Path::new("second.m4b").into(),
+            ],
+        );
+        let first = progress.start_file(Path::new("first.m4b"), 1);
+        let second = progress.start_file(Path::new("second.m4b"), 1);
+
+        second.advance(1);
+        second.finish();
+        assert!(progress.emitted_lines().is_empty());
+
+        first.advance(1);
+        first.finish();
+        assert_eq!(
+            progress.emitted_lines(),
+            [
+                "upload file 1/2 complete: first.m4b",
+                "upload file 2/2 complete: second.m4b"
+            ]
+        );
     }
 }

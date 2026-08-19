@@ -1,8 +1,10 @@
 mod copy;
+mod local_destination;
 mod plan;
 mod progress;
 
 use self::copy::{download_file, upload_file};
+use self::local_destination::PreparedDownload;
 use self::plan::{PlannedFile, TransferPlan, scan_local, scan_remote, validate_remote_child_name};
 use self::progress::{DeleteProgress, Progress};
 use crate::cli::{attach_cleanup_errors, has_attached_cleanup_error};
@@ -61,7 +63,7 @@ pub(crate) async fn run_upload(
         .chunks_exact(UPLOAD_CONNECTIONS_PER_WORKER)
         .map(UploadWorker::new)
         .collect::<Vec<_>>();
-    let progress = Progress::new("upload", plan.total_bytes, plan.files.len());
+    let progress = Progress::new_ordered("upload", plan.total_bytes, &progress_paths(&plan));
     let (cancellation, signal) = cancellation_on_ctrl_c();
     let notice_progress = progress.clone();
     let result = with_settling_notices(
@@ -98,7 +100,7 @@ pub(crate) async fn run_download(
         Err(error) => return finish_client(&client, Err(error)).await,
     };
     let clients = connect_workers(target, client, jobs.min(plan.files.len().max(1))).await?;
-    let progress = Progress::new("download", plan.total_bytes, plan.files.len());
+    let progress = Progress::new_ordered("download", plan.total_bytes, &progress_paths(&plan));
     let (cancellation, signal) = cancellation_on_ctrl_c();
     let notice_progress = progress.clone();
     let result = with_settling_notices(
@@ -205,14 +207,32 @@ fn cancellation_on_ctrl_c() -> (CancellationToken, tokio::task::JoinHandle<()>) 
     let cancellation = CancellationToken::new();
     let signal_cancellation = cancellation.clone();
     let signal = tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            signal_cancellation.cancel();
-            if tokio::signal::ctrl_c().await.is_ok() {
+        let mut policy = InterruptPolicy::default();
+        while tokio::signal::ctrl_c().await.is_ok() {
+            if policy.register(&signal_cancellation) {
                 std::process::exit(130);
             }
         }
     });
     (cancellation, signal)
+}
+
+#[derive(Default)]
+struct InterruptPolicy {
+    interrupted: bool,
+}
+
+impl InterruptPolicy {
+    /// Returns `true` when the caller must perform the explicit emergency exit.
+    fn register(&mut self, cancellation: &CancellationToken) -> bool {
+        if self.interrupted {
+            true
+        } else {
+            self.interrupted = true;
+            cancellation.cancel();
+            false
+        }
+    }
 }
 
 /// Repeats a settling notice for as long as cancelled work stays in flight.
@@ -375,6 +395,10 @@ async fn execute_upload(
         .first()
         .context("upload requires a 9P client")?
         .primary();
+    preflight_upload_destination(client, &plan, destination).await?;
+    if cancellation.is_cancelled() {
+        bail!("upload cancelled");
+    }
     if plan.source_is_dir {
         client
             .create_dir_all(destination, 0o755)
@@ -446,24 +470,21 @@ async fn execute_download(
     if clients.is_empty() {
         bail!("download requires a 9P client");
     }
-    if plan.source_is_dir {
-        for relative in &plan.directories {
-            if cancellation.is_cancelled() {
-                bail!("download cancelled");
-            }
-            let directory = destination.join(relative);
-            reject_symlinked_download_directory(&directory).await?;
-            tokio::fs::create_dir_all(&directory)
-                .await
-                .with_context(|| format!("create local directory {}", directory.display()))?;
-        }
-    } else if let Some(parent) = destination.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .with_context(|| format!("create local parent directory {}", parent.display()))?;
+    if cancellation.is_cancelled() {
+        bail!("download cancelled");
+    }
+    let prepared_plan = plan.clone();
+    let prepared_destination = destination.to_path_buf();
+    let prepare_cancellation = cancellation.clone();
+    let prepared = tokio::task::spawn_blocking(move || {
+        PreparedDownload::prepare(&prepared_plan, &prepared_destination, &prepare_cancellation)
+    })
+    .await
+    .context("local destination preflight task failed")??;
+    if cancellation.is_cancelled() {
+        bail!("download cancelled");
     }
 
-    let destination = destination.to_path_buf();
     let worker_progress = progress.clone();
     run_file_workers(
         clients,
@@ -471,8 +492,12 @@ async fn execute_download(
         progress.clone(),
         cancellation.child_token(),
         move |client, file, cancellation, _attempt| {
-            let target = file_destination(&destination, &file);
-            download_file(client, file, target, worker_progress.clone(), cancellation)
+            let prepared = prepared.clone();
+            let progress = worker_progress.clone();
+            async move {
+                let target = prepared.target(&file)?;
+                download_file(client, file, target, progress, cancellation).await
+            }
         },
     )
     .await?;
@@ -480,6 +505,60 @@ async fn execute_download(
         bail!("download cancelled");
     }
     progress.finish();
+    Ok(())
+}
+
+async fn preflight_upload_destination(
+    client: &Client,
+    plan: &TransferPlan,
+    destination: &Path,
+) -> Result<()> {
+    let mut targets = Vec::with_capacity(plan.directories.len() + plan.files.len());
+    if plan.source_is_dir {
+        targets.push((destination.to_path_buf(), true));
+        targets.extend(
+            plan.directories
+                .iter()
+                .filter(|relative| !relative.as_os_str().is_empty())
+                .map(|relative| (destination.join(relative), true)),
+        );
+        targets.extend(
+            plan.files
+                .iter()
+                .map(|file| (file_destination(destination, file), false)),
+        );
+    } else {
+        targets.push((destination.to_path_buf(), false));
+    }
+
+    let results = futures::stream::iter(targets.into_iter().enumerate())
+        .map(|(order, (path, expects_directory))| async move {
+            let result = match client.stat(&path).await {
+                Ok(metadata) if expects_directory && !metadata.is_dir() => Err(anyhow::anyhow!(
+                    "remote destination is not a directory: {}",
+                    path.display()
+                )),
+                Ok(metadata) if !expects_directory && metadata.is_dir() => Err(anyhow::anyhow!(
+                    "remote destination is a directory: {}",
+                    path.display()
+                )),
+                Ok(_) | Err(ZeroFsError::NotFound { .. }) => Ok(()),
+                Err(error) => Err(anyhow::Error::from(error)
+                    .context(format!("inspect remote destination {}", path.display()))),
+            };
+            (order, result)
+        })
+        .buffer_unordered(32)
+        .collect::<Vec<_>>()
+        .await;
+    let mut errors = results
+        .into_iter()
+        .filter_map(|(order, result)| result.err().map(|error| (order, error)))
+        .collect::<Vec<_>>();
+    errors.sort_by_key(|(order, _)| *order);
+    if let Some((_, error)) = errors.into_iter().next() {
+        return Err(error);
+    }
     Ok(())
 }
 
@@ -593,48 +672,29 @@ async fn delete_level(
     progress: DeleteProgress,
     cancellation: CancellationToken,
 ) -> Result<()> {
-    let results = futures::stream::iter(entries)
-        .map(|entry| {
-            let client = Arc::clone(&client);
-            let progress = progress.clone();
-            let cancellation = cancellation.clone();
-            async move {
-                if cancellation.is_cancelled() {
-                    return Ok(());
-                }
-                match entry.file_type {
-                    FileType::Dir => client.remove_dir(&entry.path).await.with_context(|| {
-                        format!("remove remote directory {}", entry.path.display())
-                    })?,
-                    _ => client
-                        .remove_file(&entry.path)
-                        .await
-                        .with_context(|| format!("remove remote file {}", entry.path.display()))?,
-                }
-                progress.removed(&entry.path);
-                Ok(())
-            }
-        })
-        .buffer_unordered(8)
-        .collect::<Vec<Result<()>>>()
-        .await;
-    let mut errors = results
-        .into_iter()
-        .filter_map(Result::err)
-        .collect::<Vec<_>>();
-    match errors.len() {
-        0 => Ok(()),
-        1 => Err(errors.remove(0)),
-        count => {
-            let details = errors
-                .iter()
-                .enumerate()
-                .map(|(index, error)| format!("  {}. {error:#}", index + 1))
-                .collect::<Vec<_>>()
-                .join("\n");
-            bail!("{count} delete operations failed:\n{details}")
+    for entry in entries {
+        if cancellation.is_cancelled() {
+            bail!("delete cancelled");
+        }
+        match entry.file_type {
+            FileType::Dir => client
+                .remove_dir(&entry.path)
+                .await
+                .with_context(|| format!("remove remote directory {}", entry.path.display()))?,
+            _ => client
+                .remove_file(&entry.path)
+                .await
+                .with_context(|| format!("remove remote file {}", entry.path.display()))?,
+        }
+        progress.removed(&entry.path);
+        // Give signal handling a deterministic cancellation point between
+        // irreversible mutations, then check before issuing the next one.
+        tokio::task::yield_now().await;
+        if cancellation.is_cancelled() {
+            bail!("delete cancelled");
         }
     }
+    Ok(())
 }
 
 async fn create_directory(client: &Client, path: &Path) -> Result<()> {
@@ -665,19 +725,17 @@ fn file_destination(root: &Path, file: &plan::PlannedFile) -> PathBuf {
     }
 }
 
-async fn reject_symlinked_download_directory(path: &Path) -> Result<()> {
-    match tokio::fs::symlink_metadata(path).await {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            bail!(
-                "local destination contains a symbolic link: {}",
-                path.display()
-            )
-        }
-        Ok(_) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error)
-            .with_context(|| format!("inspect local destination directory {}", path.display())),
-    }
+fn progress_paths(plan: &TransferPlan) -> Vec<PathBuf> {
+    plan.files
+        .iter()
+        .map(|file| {
+            if file.relative.as_os_str().is_empty() {
+                file.source.clone()
+            } else {
+                file.relative.clone()
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]

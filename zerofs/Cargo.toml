@@ -121,6 +121,7 @@ crc32c = "0.6"
 comfy-table = "7.1"
 num-format = "0.4"
 libc = "0.2"
+rustix = { version = "1.1.4", features = ["fs"] }
 dashmap = "6.1"
 uuid = { version = "1.17", features = ["v4", "serde"] }
 toml = "0.9"
