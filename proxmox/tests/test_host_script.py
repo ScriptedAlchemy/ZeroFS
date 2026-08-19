@@ -200,6 +200,24 @@ control_host_transaction
         self.assertIn("/run/lock/zerofs-lxc-deploy-global.lock", source)
         self.assertNotIn("/run/lock/zerofs-lxc-$ctid.coordinator.lock", source)
 
+    def test_state_root_and_prior_release_are_host_owned_and_rollback_safe(
+        self,
+    ) -> None:
+        source = HOST_SCRIPT.read_text()
+
+        self.assertIn('install -d -o 0 -g 100000 -m 0750 "$state_root"', source)
+        self.assertNotIn('install -d -o 100000 -g 100000 -m 0750 "$state_root"', source)
+        self.assertIn('"$temporary_transaction/previous-config"', source)
+        self.assertIn(
+            '"$deployment_transaction/previous-config" "$state_root/$previous_release/zerofs.toml"',
+            source,
+        )
+        self.assertIn(
+            'promoted_config="$state_root/releases/$saved_release_id/zerofs.toml"',
+            source,
+        )
+        self.assertNotIn('"$state_root/current/zerofs.toml"', source)
+
     def test_deploy_plan_uses_unprivileged_private_lxc_and_persistent_bind(
         self,
     ) -> None:
@@ -268,11 +286,13 @@ control_host_transaction
             source.index("rollback() {") : source.index("trap rollback ERR")
         ]
         self.assertIn("assert_ct_resource_snapshot", source)
-        self.assertRegex(
-            rollback,
-            r"if ! restore_ct_resources; then[\s\S]+preserving \$ct_resource_snapshot[\s\S]+exit 125",
+        self.assertIn("rollback_failed=true", rollback)
+        self.assertIn("recovery transaction preserved", rollback)
+        self.assertIn("if [[ $rollback_failed == true ]]; then", rollback)
+        self.assertLess(
+            rollback.index("recovery transaction preserved"),
+            rollback.index('rm -rf -- "$deployment_transaction"'),
         )
-        self.assertLess(rollback.index("exit 125"), rollback.index('pct start "$ctid"'))
 
     def test_replace_backs_up_original_ct_before_applying_new_resources(self) -> None:
         result = self.run_host(
@@ -411,12 +431,35 @@ control_host_transaction
         self.assertNotIn("prove WebUI listener", result.stdout)
         self.assertIn("persist host deployment phase maintenance", result.stdout)
 
+    def test_maintenance_stages_both_access_without_starting_smb(self) -> None:
+        result = self.run_host(
+            "deploy",
+            "--defer-commit",
+            "--maintenance-nfs-only",
+            "--prod-access",
+            "both",
+            role="prod",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("apt-get install -y --no-install-recommends", result.stdout)
+        self.assertIn("fuse3 samba", result.stdout)
+        self.assertIn("zerofs-lxc-mount.service", result.stdout)
+        self.assertNotIn("systemctl start smbd.service", result.stdout)
+        self.assertIn("persist host deployment phase maintenance", result.stdout)
+
     def test_promote_requires_the_deferred_production_transaction(self) -> None:
         result = self.run_host("promote", role="prod")
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("promote host deployment transaction", result.stdout)
         self.assertIn("prove full private production listeners", result.stdout)
+
+    def test_finalize_is_the_idempotent_commit_recovery_action(self) -> None:
+        result = self.run_host("finalize", role="prod")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("finalize host deployment transaction", result.stdout)
 
     def test_default_prod_access_is_native_nfs_without_samba(self) -> None:
         result = self.run_host("deploy", role="prod")
@@ -443,7 +486,7 @@ control_host_transaction
         source = HOST_SCRIPT.read_text()
         self.assertRegex(
             source,
-            r"elif pct config \"\$ctid\" .*; then\n\s+pct stop \"\$ctid\"",
+            r"elif pct config \"\$ctid\" .*; then\n\s+rollback_try pct stop \"\$ctid\"",
         )
 
     def test_listener_proof_covers_every_private_production_api(self) -> None:

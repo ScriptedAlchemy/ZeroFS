@@ -328,6 +328,21 @@ class VmNfsTransitionTests(unittest.TestCase):
 
         self.assertTrue(self.transaction.exists())
 
+    def test_decided_commit_recovery_never_rolls_the_mount_back(self) -> None:
+        desired = self.unit("10.10.10.55:/")
+        self.staged.write_text(desired)
+        self.manager.prepare(self.staged, self.transaction, "10.10.10.55:/")
+        self.manager.reconcile(self.transaction)
+        self.manager.decide_commit(self.transaction)
+
+        status = self.manager.status(self.transaction)
+        self.assertEqual(status["phase"], "commit_decided")
+        self.manager.recover(self.transaction)
+
+        self.assertFalse(self.transaction.exists())
+        self.assertEqual(self.unit_path.read_text(), desired)
+        self.assertTrue(self.system.active)
+
     def test_source_validation_accepts_only_rfc1918_root_exports(self) -> None:
         self.assertEqual(
             transition._private_nfs_source("10.10.10.55:/"), "10.10.10.55:/"

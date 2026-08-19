@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: host-deploy.sh deploy|replace|cleanup|promote|commit|rollback|recover [options]
+Usage: host-deploy.sh deploy|replace|cleanup|promote|finalize|commit|rollback|recover [options]
 
 This script runs on a Proxmox VE host. It never removes the persistent state
 bind mount. `replace` additionally requires --confirm-replace CTID.
@@ -12,7 +12,7 @@ EOF
 
 action=${1:-}
 case "$action" in
-  deploy|replace|cleanup|promote|commit|rollback|recover) shift ;;
+  deploy|replace|cleanup|promote|finalize|commit|rollback|recover) shift ;;
   *) usage >&2; exit 2 ;;
 esac
 
@@ -81,10 +81,12 @@ fi
   echo "--prod-access must be nfs, smb, or both" >&2
   exit 2
 }
-has_smb=false
+stage_smb=false
 if [[ $role == prod && ( $prod_access == smb || $prod_access == both ) ]]; then
-  has_smb=true
+  stage_smb=true
 fi
+has_smb=$stage_smb
+[[ $maintenance_nfs_only == true ]] && has_smb=false
 [[ $samba_user =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || {
   echo "unsafe Samba user name" >&2
   exit 2
@@ -107,11 +109,11 @@ if [[ $defer_commit == true && ! ( $role == prod && $action == deploy ) ]]; then
   echo "--defer-commit is valid only for production deploy" >&2
   exit 2
 fi
-if [[ $maintenance_nfs_only == true && ! ( $role == prod && $action == deploy && $defer_commit == true && $prod_access == nfs ) ]]; then
-  echo "--maintenance-nfs-only requires a deferred native-NFS production deploy" >&2
+if [[ $maintenance_nfs_only == true && ! ( $role == prod && $action == deploy && $defer_commit == true ) ]]; then
+  echo "--maintenance-nfs-only requires a deferred production deploy" >&2
   exit 2
 fi
-if [[ $action == promote || $action == commit || $action == rollback || $action == recover ]] && [[ $role != prod ]]; then
+if [[ $action == promote || $action == finalize || $action == commit || $action == rollback || $action == recover ]] && [[ $role != prod ]]; then
   echo "$action controls only a production deployment transaction" >&2
   exit 2
 fi
@@ -264,7 +266,7 @@ desired_mp0() {
 
 desired_features() {
   local value=$1
-  if [[ $has_smb == true ]]; then
+  if [[ $stage_smb == true ]]; then
     value=$(csv_set_field "$value" fuse 1)
   fi
   printf '%s\n' "$value"
@@ -349,7 +351,7 @@ assert_ct_resources() {
   [[ $(csv_field "$current_mp" mp 2>/dev/null || true) == /srv/zerofs-persist ]] || valid=false
   [[ $(csv_field "$current_mp" ro 2>/dev/null || true) != 1 ]] || valid=false
   [[ $(config_value "$config" hookscript 2>/dev/null || true) == local:snippets/zerofs-lxc-hook.sh ]] || valid=false
-  if [[ $has_smb == true ]]; then
+  if [[ $stage_smb == true ]]; then
     current=$(config_value "$config" features 2>/dev/null || true)
     [[ $(csv_field "$current" fuse 2>/dev/null || true) == 1 ]] || valid=false
   fi
@@ -387,7 +389,7 @@ reconcile_ct_resources() {
   [[ $current == "$(desired_mp0 "$current")" ]] || changed=true
   current=$(config_value "$config" hookscript 2>/dev/null || true)
   [[ $current == local:snippets/zerofs-lxc-hook.sh ]] || changed=true
-  if [[ $has_smb == true ]]; then
+  if [[ $stage_smb == true ]]; then
     current=$(config_value "$config" features 2>/dev/null || true)
     [[ $current == "$(desired_features "$current")" ]] || changed=true
   fi
@@ -428,7 +430,7 @@ reconcile_ct_resources() {
   if [[ $current != local:snippets/zerofs-lxc-hook.sh ]]; then
     run pct set "$ctid" --hookscript local:snippets/zerofs-lxc-hook.sh
   fi
-  if [[ $has_smb == true ]]; then
+  if [[ $stage_smb == true ]]; then
     current=$(config_value "$config" features 2>/dev/null || true)
     value=$(desired_features "$current")
     if [[ $current != "$value" ]]; then
@@ -455,6 +457,9 @@ persist_host_transaction() {
   if [[ -n $ct_resource_snapshot ]]; then
     install -m 0600 "$ct_resource_snapshot" "$temporary_transaction/ct-resources"
   fi
+  if [[ -n ${previous_config:-} ]]; then
+    install -m 0600 "$previous_config" "$temporary_transaction/previous-config"
+  fi
   printf '%s\n' "$previous_release" >"$temporary_transaction/previous-release"
   {
     printf 'saved_had_ct=%q\n' "$had_ct"
@@ -472,6 +477,7 @@ persist_host_transaction() {
   sync -f "$temporary_transaction/state.env"
   sync -f "$temporary_transaction/phase"
   [[ ! -e $temporary_transaction/ct-resources ]] || sync -f "$temporary_transaction/ct-resources"
+  [[ ! -e $temporary_transaction/previous-config ]] || sync -f "$temporary_transaction/previous-config"
   sync -f "$temporary_transaction"
   mv -- "$temporary_transaction" "$deployment_transaction"
   sync -f "$state_root"
@@ -495,22 +501,30 @@ restore_saved_prod_services() {
   if [[ $saved_prod_mount_was_enabled == true ]]; then
     pct exec "$ctid" -- systemctl enable zerofs-lxc-mount.service
   else
-    pct exec "$ctid" -- systemctl disable zerofs-lxc-mount.service >/dev/null 2>&1 || true
+    # shellcheck disable=SC2016
+    pct exec "$ctid" -- sh -c \
+      'test "$(systemctl show -p LoadState --value zerofs-lxc-mount.service)" = not-found || systemctl disable zerofs-lxc-mount.service'
   fi
   if [[ $saved_prod_smb_was_enabled == true ]]; then
     pct exec "$ctid" -- systemctl enable smbd.service
   else
-    pct exec "$ctid" -- systemctl disable smbd.service >/dev/null 2>&1 || true
+    # shellcheck disable=SC2016
+    pct exec "$ctid" -- sh -c \
+      'test "$(systemctl show -p LoadState --value smbd.service)" = not-found || systemctl disable smbd.service'
   fi
   if [[ $saved_prod_mount_was_active == true ]]; then
     pct exec "$ctid" -- systemctl start zerofs-lxc-mount.service
   else
-    pct exec "$ctid" -- systemctl stop zerofs-lxc-mount.service >/dev/null 2>&1 || true
+    # shellcheck disable=SC2016
+    pct exec "$ctid" -- sh -c \
+      'test "$(systemctl show -p LoadState --value zerofs-lxc-mount.service)" = not-found || systemctl stop zerofs-lxc-mount.service'
   fi
   if [[ $saved_prod_smb_was_active == true ]]; then
     pct exec "$ctid" -- systemctl start smbd.service
   else
-    pct exec "$ctid" -- systemctl stop smbd.service >/dev/null 2>&1 || true
+    # shellcheck disable=SC2016
+    pct exec "$ctid" -- sh -c \
+      'test "$(systemctl show -p LoadState --value smbd.service)" = not-found || systemctl stop smbd.service'
   fi
 }
 
@@ -588,7 +602,7 @@ control_host_transaction() {
     fi
     return 0
   fi
-  if [[ $action == recover && ! -d $deployment_transaction ]]; then
+  if [[ ( $action == recover || $action == finalize ) && ! -d $deployment_transaction ]]; then
     return 0
   fi
   [[ -d $deployment_transaction ]] || {
@@ -602,12 +616,12 @@ control_host_transaction() {
   # The transaction is root-created mode 0700; shell quoting was applied when written.
   # shellcheck disable=SC1091
   source "$deployment_transaction/state.env"
-  if [[ $action != recover && $saved_release_id != "$release_id" ]]; then
+  if [[ $action != recover && $action != finalize && $saved_release_id != "$release_id" ]]; then
     echo "deployment transaction belongs to release $saved_release_id" >&2
     return 1
   fi
   phase=$(<"$deployment_transaction/phase")
-  if [[ $action == commit ]]; then
+  if [[ $action == commit || $action == finalize ]]; then
     [[ $phase == activated ]] || {
       echo "deployment transaction is not activated: $phase" >&2
       return 1
@@ -627,10 +641,23 @@ control_host_transaction() {
     }
     assert_prod_nfs_quiesced
     set_host_transaction_phase promoting
-    install -o 100000 -g 100000 -m 0600 "$stage/zerofs.toml" "$state_root/current/zerofs.toml"
-    sync -f "$state_root/current/zerofs.toml"
+    [[ $saved_release_id =~ ^[0-9a-f]{12}-[A-Za-z0-9]{6,32}$ ]] || {
+      echo "transaction release identifier is invalid" >&2
+      return 1
+    }
+    promoted_config="$state_root/releases/$saved_release_id/zerofs.toml"
+    [[ -d $state_root/releases/$saved_release_id && ! -L $state_root/releases/$saved_release_id ]] || return 1
+    install -o 100000 -g 100000 -m 0600 "$stage/zerofs.toml" "$promoted_config"
+    sync -f "$promoted_config"
     pct exec "$ctid" -- systemctl restart zerofs-lxc.service
     wait_for_zerofs
+    if [[ $stage_smb == true ]]; then
+      pct exec "$ctid" -- systemctl enable zerofs-lxc-mount.service smbd.service
+      pct exec "$ctid" -- systemctl start zerofs-lxc-mount.service
+      pct exec "$ctid" -- systemctl start smbd.service
+      pct exec "$ctid" -- systemctl is-active --quiet zerofs-lxc-mount.service
+      pct exec "$ctid" -- systemctl is-active --quiet smbd.service
+    fi
     assert_runtime_listeners full
     config_sha=$(sha256sum "$stage/zerofs.toml" | awk '{print $1}')
     receipt="$state_root/receipts/$release_id"
@@ -654,6 +681,12 @@ control_host_transaction() {
     pct stop "$ctid" --skiplock 1
   fi
   if [[ -n $previous_release ]]; then
+    if [[ -f $deployment_transaction/previous-config ]]; then
+      [[ $previous_release =~ ^releases/[0-9a-f]{12}-[A-Za-z0-9]{6,32}$ ]] || return 1
+      install -o 100000 -g 100000 -m 0600 \
+        "$deployment_transaction/previous-config" "$state_root/$previous_release/zerofs.toml"
+      sync -f "$state_root/$previous_release/zerofs.toml"
+    fi
     ln -sfn "$previous_release" "$state_root/current"
   else
     rm -f -- "$state_root/current"
@@ -663,9 +696,15 @@ control_host_transaction() {
     ct_resources_mutated=true
     restore_ct_resources
     if [[ $saved_had_running_ct == true ]]; then
-      pct start "$ctid"
-      pct exec "$ctid" -- systemctl restart zerofs-lxc.service
-      restore_saved_prod_services
+      if ! {
+        pct start "$ctid" &&
+          pct exec "$ctid" -- systemctl restart zerofs-lxc.service &&
+          restore_saved_prod_services
+      }; then
+        pct stop "$ctid" --skiplock 1 >/dev/null 2>&1 || true
+        echo "host recovery compensation failed; CT stopped and transaction preserved" >&2
+        return 125
+      fi
     fi
   elif ct_exists; then
     pct stop "$ctid" --skiplock 1 >/dev/null 2>&1 || true
@@ -807,7 +846,7 @@ graceful_stop() {
   fi
 }
 
-if [[ $action == promote || $action == commit || $action == rollback || $action == recover ]]; then
+if [[ $action == promote || $action == finalize || $action == commit || $action == rollback || $action == recover ]]; then
   control_host_transaction
   exit 0
 fi
@@ -827,7 +866,7 @@ if [[ $dry_run == false ]]; then
   for required in "$stage/zerofs" "$stage/zerofs.toml" "$stage/zerofs-lxc.service" "$stage/zerofs-lxc-hook.sh"; do
     [[ -f $required ]] || { echo "missing staged asset: $required" >&2; exit 1; }
   done
-  if [[ $has_smb == true ]]; then
+  if [[ $stage_smb == true ]]; then
     for required in "$stage/zerofs-lxc-mount.service" "$stage/smb.conf" "$stage/samba-password"; do
       [[ -f $required ]] || { echo "missing staged prod asset: $required" >&2; exit 1; }
     done
@@ -838,6 +877,8 @@ if [[ $dry_run == false ]]; then
   }
 fi
 
+run install -d -o 0 -g 100000 -m 0750 "$state_root"
+
 had_ct=false
 had_running_ct=false
 if ct_exists; then
@@ -847,65 +888,98 @@ if ct_exists; then
   fi
 fi
 previous_release=
+previous_config=
 if [[ $dry_run == false && -L $state_root/current ]]; then
   previous_release=$(readlink "$state_root/current")
+  [[ $previous_release =~ ^releases/[0-9a-f]{12}-[A-Za-z0-9]{6,32}$ ]] || {
+    echo "current release symlink is not canonical: $previous_release" >&2
+    exit 1
+  }
+  previous_config="$state_root/$previous_release/zerofs.toml"
+  [[ -f $previous_config && ! -L $state_root/$previous_release ]] || {
+    echo "current release config is not a canonical regular file" >&2
+    exit 1
+  }
 fi
 capture_ct_resources
 rollback_backup=
 
 rollback() {
-  local code=$?
+  local code=$? rollback_failed=false
   trap - ERR
   set +e
+  rollback_try() {
+    if ! "$@"; then
+      echo "rollback step failed: $*" >&2
+      rollback_failed=true
+    fi
+  }
   echo "rollback: deployment failed; restoring the last runnable container/release" >&2
   if [[ -n $previous_release ]]; then
-    ln -sfn "$previous_release" "$state_root/current"
+    if [[ -f $deployment_transaction/previous-config ]]; then
+      rollback_try install -o 100000 -g 100000 -m 0600 \
+        "$deployment_transaction/previous-config" "$state_root/$previous_release/zerofs.toml"
+      rollback_try sync -f "$state_root/$previous_release/zerofs.toml"
+    fi
+    rollback_try ln -sfn "$previous_release" "$state_root/current"
   fi
   if [[ $ct_resources_mutated == true ]] && pct config "$ctid" >/dev/null 2>&1 && ct_running; then
-    pct stop "$ctid" --skiplock 1 >/dev/null 2>&1
+    rollback_try pct stop "$ctid" --skiplock 1 >/dev/null 2>&1
   fi
   if ! restore_ct_resources; then
     echo "rollback failed to verify original CT resources; leaving CT stopped and preserving $ct_resource_snapshot" >&2
-    exit 125
+    rollback_failed=true
   fi
-  if [[ -n $rollback_backup ]]; then
-    pct stop "$ctid" --skiplock 1 >/dev/null 2>&1
-    pct destroy "$ctid" --purge 1 >/dev/null 2>&1
-    pct restore "$ctid" "$rollback_backup" --force 1
-    pct start "$ctid"
+  if [[ $rollback_failed == false && -n $rollback_backup ]]; then
+    rollback_try pct stop "$ctid" --skiplock 1 >/dev/null 2>&1
+    rollback_try pct destroy "$ctid" --purge 1 >/dev/null 2>&1
+    rollback_try pct restore "$ctid" "$rollback_backup" --force 1
+    [[ $rollback_failed == true ]] || rollback_try pct start "$ctid"
   elif [[ $had_ct == true && $had_running_ct == true ]] && pct config "$ctid" >/dev/null 2>&1; then
-    pct start "$ctid" >/dev/null 2>&1
-    pct exec "$ctid" -- systemctl restart zerofs-lxc.service >/dev/null 2>&1
-    if [[ $role == prod ]]; then
+    if [[ $rollback_failed == false ]]; then
+      rollback_try pct start "$ctid" >/dev/null 2>&1
+      [[ $rollback_failed == true ]] || \
+        rollback_try pct exec "$ctid" -- systemctl restart zerofs-lxc.service >/dev/null 2>&1
+    fi
+    if [[ $role == prod && $rollback_failed == false ]]; then
       if [[ $prod_mount_was_enabled == true ]]; then
-        pct exec "$ctid" -- systemctl enable zerofs-lxc-mount.service >/dev/null 2>&1
+        rollback_try pct exec "$ctid" -- systemctl enable zerofs-lxc-mount.service >/dev/null 2>&1
       else
-        pct exec "$ctid" -- systemctl disable zerofs-lxc-mount.service >/dev/null 2>&1
+        rollback_try pct exec "$ctid" -- systemctl disable zerofs-lxc-mount.service >/dev/null 2>&1
       fi
       if [[ $prod_smb_was_enabled == true ]]; then
-        pct exec "$ctid" -- systemctl enable smbd.service >/dev/null 2>&1
+        rollback_try pct exec "$ctid" -- systemctl enable smbd.service >/dev/null 2>&1
       else
-        pct exec "$ctid" -- systemctl disable smbd.service >/dev/null 2>&1
+        rollback_try pct exec "$ctid" -- systemctl disable smbd.service >/dev/null 2>&1
       fi
       if [[ $prod_mount_was_active == true ]]; then
-        pct exec "$ctid" -- systemctl start zerofs-lxc-mount.service >/dev/null 2>&1
+        rollback_try pct exec "$ctid" -- systemctl start zerofs-lxc-mount.service >/dev/null 2>&1
       else
-        pct exec "$ctid" -- systemctl stop zerofs-lxc-mount.service >/dev/null 2>&1
+        rollback_try pct exec "$ctid" -- systemctl stop zerofs-lxc-mount.service >/dev/null 2>&1
       fi
       if [[ $prod_smb_was_active == true ]]; then
-        pct exec "$ctid" -- systemctl start smbd.service >/dev/null 2>&1
+        rollback_try pct exec "$ctid" -- systemctl start smbd.service >/dev/null 2>&1
       else
-        pct exec "$ctid" -- systemctl stop smbd.service >/dev/null 2>&1
+        rollback_try pct exec "$ctid" -- systemctl stop smbd.service >/dev/null 2>&1
       fi
     fi
   elif pct config "$ctid" >/dev/null 2>&1; then
-    pct stop "$ctid" --skiplock 1 >/dev/null 2>&1
+    rollback_try pct stop "$ctid" --skiplock 1 >/dev/null 2>&1
+  fi
+  if [[ $rollback_failed == true ]]; then
+    pct stop "$ctid" --skiplock 1 >/dev/null 2>&1 || true
+    echo "rollback compensation incomplete; CT left stopped and recovery transaction preserved" >&2
+    exit 125
   fi
   if [[ $defer_commit == true && -d $deployment_transaction ]]; then
-    rm -rf -- "$deployment_transaction"
-    sync -f "$state_root"
+    rollback_try rm -rf -- "$deployment_transaction"
+    rollback_try sync -f "$state_root"
   fi
-  [[ -z $ct_resource_snapshot ]] || rm -f -- "$ct_resource_snapshot"
+  [[ -z $ct_resource_snapshot ]] || rollback_try rm -f -- "$ct_resource_snapshot"
+  if [[ $rollback_failed == true ]]; then
+    echo "rollback cleanup incomplete; recovery artifacts preserved" >&2
+    exit 125
+  fi
   exit "$code"
 }
 trap rollback ERR
@@ -926,7 +1000,7 @@ set_host_transaction_phase quiesced
 
 reconcile_ct_resources
 
-run install -d -o 100000 -g 100000 -m 0750 "$state_root"
+run install -d -o 0 -g 100000 -m 0750 "$state_root"
 if [[ $dry_run == false ]]; then
   marker="$state_root/.zerofs-lxc-state"
   expected_marker="$role:$ctid:$namespace_id"
@@ -936,13 +1010,13 @@ if [[ $dry_run == false ]]; then
   fi
   printf '%s\n' "$expected_marker" >"$marker"
 fi
-run install -d -m 0755 "$state_root/releases" "$state_root/receipts" "$state_root/rollback"
+run install -d -o 0 -g 0 -m 0755 "$state_root/releases" "$state_root/receipts" "$state_root/rollback"
 run install -d -o 100000 -g 100000 -m 0750 "$state_root/state" "$state_root/cache"
 if [[ $role == dev ]]; then
   run install -d -o 100000 -g 100000 -m 0750 "$state_root/backend-dev"
 fi
 release="$state_root/releases/$release_id"
-run install -d -m 0755 "$release"
+run install -d -o 0 -g 0 -m 0755 "$release"
 run install -m 0755 "$stage/zerofs" "$release/zerofs"
 run install -o 100000 -g 100000 -m 0600 "$stage/zerofs.toml" "$release/zerofs.toml"
 if [[ $dry_run == false && -f $stage/zerofs.env ]]; then
@@ -1016,7 +1090,7 @@ fi
 if [[ $current != local:snippets/zerofs-lxc-hook.sh ]]; then
   run pct set "$ctid" --hookscript local:snippets/zerofs-lxc-hook.sh
 fi
-if [[ $has_smb == true ]]; then
+if [[ $stage_smb == true ]]; then
   if [[ $dry_run == true ]]; then
     current=
   else
@@ -1034,12 +1108,12 @@ fi
 
 run pct exec "$ctid" -- apt-get update
 packages=(ca-certificates curl iproute2)
-if [[ $has_smb == true ]]; then
+if [[ $stage_smb == true ]]; then
   packages+=(fuse3 samba)
 fi
 run pct exec "$ctid" -- env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${packages[@]}"
 run pct push "$ctid" "$stage/zerofs-lxc.service" /etc/systemd/system/zerofs-lxc.service --perms 0644
-if [[ $has_smb == true ]]; then
+if [[ $stage_smb == true ]]; then
   run pct exec "$ctid" -- sh -c "grep -qxF user_allow_other /etc/fuse.conf || printf '%s\\n' user_allow_other >>/etc/fuse.conf"
   run pct push "$ctid" "$stage/zerofs-lxc-mount.service" /etc/systemd/system/zerofs-lxc-mount.service --perms 0644
   if [[ $dry_run == false ]]; then

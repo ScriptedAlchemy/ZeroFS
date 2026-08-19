@@ -39,7 +39,9 @@ RFC1918_NETWORKS = tuple(
     ipaddress.ip_network(value)
     for value in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
 )
-TRANSACTION_PHASES = frozenset({"prepared", "quiesced", "reconciled", "rolled_back"})
+TRANSACTION_PHASES = frozenset(
+    {"prepared", "quiesced", "reconciled", "commit_decided", "rolled_back"}
+)
 LEGACY_BINDFS_HASHES = frozenset(
     {
         "013e9481f2bf7e0ba66f4dbc60bba64937da88293f7f3732c0e62c7cb2c5b33d",
@@ -561,10 +563,24 @@ class Transition:
         shutil.rmtree(transaction)
         self._fsync_directory(transaction.parent)
 
+    def decide_commit(self, transaction: Path) -> None:
+        state = self._load(transaction)
+        if state["phase"] != "reconciled":
+            raise RuntimeError("VM NFS transaction is not reconciled for commit")
+        self._set_phase(transaction, "commit_decided")
+
+    def status(self, transaction: Path) -> dict[str, object]:
+        if not transaction.exists():
+            return {"phase": "absent"}
+        return self._load(transaction)
+
     def recover(self, transaction: Path) -> None:
         if not transaction.exists():
             return
         state = self._load(transaction)
+        if state["phase"] == "commit_decided":
+            self.commit(transaction)
+            return
         if state["phase"] != "rolled_back":
             self.rollback(transaction)
         self.commit(transaction)
@@ -603,6 +619,8 @@ def build_parser() -> argparse.ArgumentParser:
             "reconcile",
             "rollback",
             "commit",
+            "decide",
+            "status",
         ),
     )
     parser.add_argument("--transaction", required=True)
@@ -635,6 +653,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         manager.reconcile(transaction)
     elif args.action == "rollback":
         manager.rollback(transaction)
+    elif args.action == "decide":
+        manager.decide_commit(transaction)
+    elif args.action == "status":
+        print(json.dumps(manager.status(transaction), sort_keys=True))
     else:
         manager.commit(transaction)
     return 0

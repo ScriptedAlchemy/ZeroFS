@@ -599,6 +599,14 @@ class PlanTests(unittest.TestCase):
         self.assertIn("assert_file_hash", source)
         self.assertIn("assert_unit_fragment", source)
         self.assertIn("ZEROFS_NBD_DEVICE=/dev/nbd0", source)
+        self.assertIn("ZEROFS_NBD_EXPORT=vm100-pilot-64g", source)
+        self.assertIn("ZEROFS_NBD_CONNECTIONS=8", source)
+        self.assertIn("legacy NBD client environment is not canonical", source)
+        self.assertIn('rmdir -- "$legacy_mount"', source)
+        self.assertNotIn(
+            '"${legacy_namespace_artifacts[@]}" "${legacy_namespace_mounts[@]}"',
+            source,
+        )
         self.assertIn("What=${expected_source}", source)
         subprocess.run(["bash", "-n", str(script)], check=True)
 
@@ -791,6 +799,7 @@ class VmNfsCoordinatorTests(unittest.TestCase):
                 "prepare",
                 "quiesce",
                 "reconcile",
+                "decide",
                 "rollback",
                 "commit",
             ):
@@ -817,7 +826,7 @@ class VmNfsCoordinatorTests(unittest.TestCase):
         self.assertEqual(runner.calls[-1], "unlock vm:global")
         self.assertEqual(
             self.actions(runner.calls),
-            ["recover", "prepare", "quiesce", "reconcile", "commit"],
+            ["recover", "prepare", "quiesce", "reconcile", "decide", "commit"],
         )
 
     def test_every_mutating_vm_command_runs_inside_the_lock_session(self) -> None:
@@ -893,6 +902,7 @@ class VmNfsCoordinatorTests(unittest.TestCase):
                 "reconcile",
                 "quiesce",
                 "reconcile",
+                "decide",
                 "commit",
             ],
         )
@@ -1097,8 +1107,46 @@ class VmNfsCoordinatorTests(unittest.TestCase):
 
         self.assertEqual(
             self.actions(runner.calls),
-            ["recover", "prepare", "quiesce", "reconcile", "commit"],
+            ["recover", "prepare", "quiesce", "reconcile", "decide"],
         )
+
+    def test_retry_finishes_a_decided_commit_without_rollback(self) -> None:
+        class DecidedRunner(self.RecordingRunner):
+            def run_remote_shell(inner_self, host, script):
+                if "vm_nfs_transition.py status " in script:
+                    return '{"phase":"commit_decided"}\n'
+                return super().run_remote_shell(host, script)
+
+        runner = DecidedRunner()
+        events: list[str] = []
+        self.transaction_runner()(
+            runner,
+            self.args(),
+            "new-release-does-not-matter",
+            lambda: self.fail("activation must not repeat"),
+            lambda: events.append("finalize-host"),
+            lambda: self.fail("decided commit must not roll back"),
+            lambda: self.fail("decided commit must not run host rollback recovery"),
+        )
+
+        self.assertEqual(events, ["finalize-host"])
+        self.assertEqual(self.actions(runner.calls), ["commit"])
+
+    def test_ambiguous_commit_decision_failure_is_never_compensated(self) -> None:
+        runner = self.RecordingRunner("vm_nfs_transition.py decide ")
+        with self.assertRaisesRegex(RuntimeError, "injected") as caught:
+            self.transaction_runner()(
+                runner,
+                self.args(),
+                "0123456789ab-cccccccccccccccc",
+                lambda: None,
+                lambda: self.fail("host finalization must not run"),
+                lambda: self.fail("ambiguous decision must not roll back host"),
+                lambda: None,
+            )
+
+        self.assertIn("may be durable", "\n".join(caught.exception.__notes__))
+        self.assertNotIn("rollback", self.actions(runner.calls))
 
 
 class DeploymentLockTests(unittest.TestCase):
@@ -1344,7 +1392,7 @@ class CliDryRunTests(ConfigValidationTests):
         self.assertIn("--defer-commit", result.stdout)
         self.assertIn("zerofs-vm-nfs-global.coordinator.lock", result.stdout)
         self.assertNotIn("--coordinator-lock-held", result.stdout)
-        self.assertIn("host-deploy.sh commit --role prod", result.stdout)
+        self.assertIn("host-deploy.sh finalize --role prod", result.stdout)
         self.assertNotIn("host-deploy.sh rollback --role prod", result.stdout)
         self.assertIn("--features webui", result.stdout)
         self.assertIn("--prod-access nfs", result.stdout)

@@ -14,6 +14,7 @@ import base64
 import contextlib
 import hashlib
 import ipaddress
+import json
 import math
 import os
 import re
@@ -1076,7 +1077,7 @@ def _run_host_deployment_control(
     namespace: str,
     release: str,
 ) -> None:
-    if action not in {"promote", "commit", "rollback", "recover"}:
+    if action not in {"promote", "finalize", "commit", "rollback", "recover"}:
         raise ValueError(f"invalid host deployment control: {action}")
     bundle = Path(__file__).resolve().parent
     stage = f"/var/tmp/zerofs-lxc-control-{args.ctid}-{release}"
@@ -1226,6 +1227,7 @@ def _run_prod_vm_nfs_transaction(
     remote_unit = f"{remote_stage}/{VM_NFS_MOUNT_UNIT}"
     prepared = False
     host_activated = False
+    commit_decision_attempted = False
     ownership_requires_post_mount_proof = False
     legacy_bindfs = False
     failure: BaseException | None = None
@@ -1241,6 +1243,21 @@ def _run_prod_vm_nfs_transaction(
             *extra,
         ]
         _ssh(runner, args.vm_host, f"set -euo pipefail\n{shell_join(command)}\n")
+
+    def action_output(name: str) -> str:
+        command = [
+            "sudo",
+            "python3",
+            remote_helper,
+            name,
+            "--transaction",
+            transaction,
+        ]
+        return _ssh_capture(
+            runner,
+            args.vm_host,
+            f"set -euo pipefail\n{shell_join(command)}\n",
+        )
 
     def guest_action(name: str) -> str:
         command = [
@@ -1285,6 +1302,16 @@ def _run_prod_vm_nfs_transaction(
                         f"{args.vm_host}:{remote_unit}",
                     ]
                 )
+            status_output = action_output("status")
+            status = (
+                json.loads(status_output)
+                if status_output.strip()
+                else {"phase": "absent"}
+            )
+            if status.get("phase") == "commit_decided":
+                commit_host()
+                action("commit")
+                return
             recover_host()
             action("recover")
             receipt_output = guest_action("preflight")
@@ -1333,13 +1360,19 @@ def _run_prod_vm_nfs_transaction(
                 promote_host()
                 guest_action("reconcile")
                 action("reconcile")
-            action("commit")
-            prepared = False
+            commit_decision_attempted = True
+            action("decide")
             commit_host()
             host_activated = False
+            action("commit")
+            prepared = False
         except BaseException as error:
             failure = error
-            if prepared:
+            if commit_decision_attempted:
+                error.add_note(
+                    "commit decision may be durable; retry deployment to recover or finish"
+                )
+            elif prepared:
                 if host_activated:
                     try:
                         rollback_host()
@@ -1590,7 +1623,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args,
             release,
             activate_host,
-            lambda: control_host("commit"),
+            lambda: control_host("finalize"),
             lambda: control_host("rollback"),
             lambda: control_host("recover"),
             activate_maintenance=activate_maintenance,

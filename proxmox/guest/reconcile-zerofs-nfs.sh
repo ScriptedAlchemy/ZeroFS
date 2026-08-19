@@ -148,14 +148,24 @@ preflight() {
 }
 
 retire_legacy_nbd() {
-  local owned=0 source pid unit path client_known=0
+  local owned=0 source pid unit path client_known=0 actual_env expected_env
+  if [[ -e /etc/zerofs-lxc/client.env ]]; then
+    [[ -f /etc/zerofs-lxc/client.env ]] || die 'legacy NBD client environment is not a regular file'
+    expected_env=$(printf '%s\n' \
+      "ZEROFS_NBD_HOST=${expected_source%:/}" \
+      'ZEROFS_NBD_PORT=10809' \
+      'ZEROFS_NBD_EXPORT=vm100-pilot-64g' \
+      'ZEROFS_NBD_CONNECTIONS=8' \
+      'ZEROFS_NBD_DEVICE=/dev/nbd0' | LC_ALL=C sort)
+    actual_env=$(LC_ALL=C sort /etc/zerofs-lxc/client.env)
+    [[ $actual_env == "$expected_env" ]] || \
+      die 'legacy NBD client environment is not canonical'
+  fi
   path=/etc/systemd/system/zerofs-lxc-nbd-client.service
   if unit_loaded "$legacy_client_unit" || [[ -e $path ]]; then
     unit_loaded "$legacy_client_unit" && assert_unit_fragment "$legacy_client_unit" "$path"
     assert_file_hash "$path" "$legacy_client_hash" 'legacy NBD client unit'
     [[ -f /etc/zerofs-lxc/client.env ]] || die 'legacy NBD client environment is missing'
-    grep -Fqx 'ZEROFS_NBD_DEVICE=/dev/nbd0' /etc/zerofs-lxc/client.env || \
-      die 'legacy NBD client environment does not own /dev/nbd0'
     client_known=1
   fi
   if systemctl is-active --quiet "$legacy_client_unit"; then
@@ -263,6 +273,9 @@ retire_legacy_namespace() {
   for legacy_mount in "${legacy_namespace_mounts[@]}"; do
     ! findmnt -rn -M "$legacy_mount" >/dev/null 2>&1 || \
       die "legacy namespace mount remains active: $legacy_mount"
+    if [[ -d $legacy_mount ]]; then
+      rmdir -- "$legacy_mount" || die "legacy namespace mountpoint is not empty: $legacy_mount"
+    fi
   done
   rm -f -- "${legacy_namespace_artifacts[@]}"
 }
@@ -271,8 +284,7 @@ legacy_state_present() {
   local item
   [[ -s /sys/class/block/nbd0/pid ]] && return 0
   findmnt -rn -M "$legacy_mountpoint" >/dev/null 2>&1 && return 0
-  for item in "${legacy_nbd_artifacts[@]}" "${legacy_namespace_artifacts[@]}" \
-    "${legacy_namespace_mounts[@]}"; do
+  for item in "${legacy_nbd_artifacts[@]}" "${legacy_namespace_artifacts[@]}"; do
     [[ -e $item ]] && return 0
   done
   for item in "${legacy_mount_units[@]}" "$legacy_client_unit" \
