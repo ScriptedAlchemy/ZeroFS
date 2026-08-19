@@ -1220,7 +1220,7 @@ Name tests:
 
 Use a latency-gated, peak-concurrency-counting real `ObjectStore` test seam behind the production extent/segment path. Build a logically sequential file whose adjacent extents occupy at least eight independent segment runs. Before releasing any GET, require at least two and at most `PARALLEL_EXTENT_OPS` backend reads to have started. Verify exact bytes and the exact run count. Current code is RED because `read_range` awaits each on-store run before starting the next.
 
-List every fully qualified test first, then run each exact test against the pre-fix implementation and require a failing exit. A missing test or zero selected tests fails the RED gate.
+List every fully qualified test first. Run the two concurrency assertions against the pre-fix implementation and require a failing exit. Run the four order/fallback/cleanup controls against the pre-fix implementation and require an exact pass; they protect existing behavior and are not artificial REDs. A missing test or zero selected tests fails either gate.
 
 ```bash
 cd /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback/zerofs
@@ -1228,17 +1228,22 @@ READ_TEST_PREFIX='fs::store::extent::read::tests::'
 cargo test -p zerofs --locked -- --list 2>&1 | tee "${TMPDIR:-/tmp}/zerofs-read-red-list.log"
 for name in \
   one_fragmented_read_fetches_independent_runs_concurrently \
-  fragmented_read_concurrency_is_bounded \
-  fragmented_read_preserves_logical_output_order \
-  contiguous_control_remains_one_ranged_get \
-  stale_location_fallback_remains_correct_under_concurrency \
-  failed_fragmented_read_releases_every_fetch_permit
+  fragmented_read_concurrency_is_bounded
 do
   grep -F "${READ_TEST_PREFIX}${name}: test" "${TMPDIR:-/tmp}/zerofs-read-red-list.log"
   if cargo test -p zerofs --locked "${READ_TEST_PREFIX}${name}" -- --exact --nocapture; then
     echo "expected RED but ${name} passed" >&2
     exit 1
   fi
+done
+for name in \
+  fragmented_read_preserves_logical_output_order \
+  contiguous_control_remains_one_ranged_get \
+  stale_location_fallback_remains_correct_under_concurrency \
+  failed_fragmented_read_releases_every_fetch_permit
+do
+  grep -F "${READ_TEST_PREFIX}${name}: test" "${TMPDIR:-/tmp}/zerofs-read-red-list.log"
+  cargo_test_nonzero "${READ_TEST_PREFIX}${name}" -p zerofs --locked
 done
 ```
 
