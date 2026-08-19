@@ -1,4 +1,4 @@
-use crate::segment_store::GeneratedSegmentCreate;
+use crate::segment_store::{ConditionalMultipartCreate, GeneratedSegmentCreate};
 use crate::writeback::admission::{Admission, DiskAdmission};
 use crate::writeback::config::{AckMode, WritebackSettings};
 use crate::writeback::journal::Journal;
@@ -723,6 +723,11 @@ impl ObjectStore for WritebackObjectStore {
         options: PutMultipartOptions,
     ) -> object_store::Result<Box<dyn MultipartUpload>> {
         self.ensure_writable()?;
+        if options.extensions.get::<GeneratedSegmentCreate>().is_some()
+            && let Some(context) = options.extensions.get::<ConditionalMultipartCreate>()
+        {
+            context.acknowledge();
+        }
         let memory_parts = self.inner.settings.ack_mode == AckMode::Memory;
         let staging = if memory_parts {
             None
@@ -1100,6 +1105,20 @@ impl Drop for WritebackMultipartUpload {
     }
 }
 
+fn multipart_put_options(options: PutMultipartOptions) -> PutOptions {
+    let mode = if options.extensions.get::<GeneratedSegmentCreate>().is_some() {
+        PutMode::Create
+    } else {
+        PutMode::Overwrite
+    };
+    PutOptions {
+        mode,
+        tags: options.tags,
+        attributes: options.attributes,
+        extensions: options.extensions,
+    }
+}
+
 async fn complete_memory_multipart(
     store: WritebackObjectStore,
     location: Path,
@@ -1136,12 +1155,7 @@ async fn complete_memory_multipart(
         .reserve(disk_charge, available)
         .await
         .map_err(|error| generic_error(format!("dirty SSD admission failed: {error}")))?;
-    let put_options = PutOptions {
-        mode: PutMode::Overwrite,
-        tags: options.tags,
-        attributes: options.attributes,
-        extensions: options.extensions,
-    };
+    let put_options = multipart_put_options(options);
     store
         .clone()
         .owned_put(location, Bytes::from(assembled), put_options, ram, disk)
@@ -1184,12 +1198,7 @@ async fn complete_multipart(
     .await
     .map_err(|error| generic_error(format!("multipart assembly task failed: {error}")))?
     .map_err(|error| generic_error(format!("multipart assembly failed: {error}")))?;
-    let put_options = PutOptions {
-        mode: PutMode::Overwrite,
-        tags: options.tags,
-        attributes: options.attributes,
-        extensions: options.extensions,
-    };
+    let put_options = multipart_put_options(options);
     let owned = store.clone();
     let result = tokio::spawn(async move {
         owned
@@ -1426,8 +1435,8 @@ mod tests {
     use crate::config::CompressionConfig;
     use crate::fault_store::{FaultControls, FaultStore};
     use crate::frame_codec::FrameCodec;
-    use crate::segment::SEGMENT_INFO;
-    use crate::segment_store::SegmentStore;
+    use crate::segment::{SEGMENT_INFO, Segid};
+    use crate::segment_store::{GeneratedSegmentCreate, SegmentStore};
     use crate::writeback::config::{AckMode, ShutdownFlush, WritebackSettings};
     use crate::writeback::journal::Journal;
     use crate::writeback::model::{
@@ -1441,8 +1450,8 @@ mod tests {
     use object_store::path::Path;
     use object_store::prefix::PrefixStore;
     use object_store::{
-        CopyMode, CopyOptions, ObjectStore, ObjectStoreExt, PutMode, PutOptions, RenameOptions,
-        RenameTargetMode, UpdateVersion,
+        CopyMode, CopyOptions, ObjectStore, ObjectStoreExt, PutMode, PutMultipartOptions,
+        PutOptions, RenameOptions, RenameTargetMode, UpdateVersion,
     };
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -1567,6 +1576,76 @@ mod tests {
             FenceClass::ImmutableCreate,
             "persisted encoded path components must be parsed without double encoding"
         );
+    }
+
+    #[tokio::test]
+    async fn generated_segment_multipart_is_journaled_as_an_immutable_create() {
+        let (store, _remote, _temp) = test_store().await;
+        let path = Path::from("zerofs/pilot/segments/02/0000000000000001/0000000000000002");
+        let mut options = PutMultipartOptions::default();
+        options.extensions.insert(GeneratedSegmentCreate);
+        let mut upload = store.put_multipart_opts(&path, options).await.unwrap();
+        upload
+            .put_part(Bytes::from_static(b"part one").into())
+            .await
+            .unwrap();
+        upload
+            .put_part(Bytes::from_static(b"part two").into())
+            .await
+            .unwrap();
+        upload.complete().await.unwrap();
+        store.wait_local(1).await.unwrap();
+
+        let records = store.inner.journal.snapshot().unwrap().records;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].fence, FenceClass::ImmutableCreate);
+        assert!(matches!(
+            records[0].kind,
+            MutationKind::Put {
+                mode: MutationMode::Create,
+                ..
+            }
+        ));
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn generated_segment_multipart_preserves_a_conflicting_remote_object() {
+        let (store, remote, _temp, _controls) =
+            test_store_with_options(false, AckMode::Remote, ShutdownFlush::Remote).await;
+        let segid = Segid::new(5, 0);
+        let remote_path = Path::from(format!("zerofs/pilot/{}", segid.object_key()));
+        let existing = Bytes::from(vec![1u8; 64 * 1024 * 1024]);
+        remote
+            .put(&remote_path, existing.clone().into())
+            .await
+            .unwrap();
+        let prefixed: Arc<dyn ObjectStore> = Arc::new(PrefixStore::new(
+            Arc::new(store.clone()),
+            Path::from("zerofs/pilot"),
+        ));
+        let segments = SegmentStore::new(
+            prefixed,
+            FrameCodec::new(&[1u8; 32], SEGMENT_INFO, CompressionConfig::Lz4),
+            5,
+            None,
+        );
+
+        segments
+            .put_segment(segid, Bytes::from(vec![2u8; 64 * 1024 * 1024]))
+            .await
+            .expect_err("remote immutable-key collision must remain fatal");
+        assert_eq!(
+            remote
+                .get(&remote_path)
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap(),
+            existing
+        );
+        let _ = store.shutdown().await;
     }
 
     #[tokio::test]
