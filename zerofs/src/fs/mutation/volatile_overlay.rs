@@ -631,9 +631,6 @@ impl VolatileWriteRuntime {
     where
         F: FnOnce() -> BoxFuture<'static, OverlayResult<Bytes>>,
     {
-        if self.terminal().is_some() || self.budget.is_terminal() {
-            return Err(OverlayError::IoError);
-        }
         let _retirement = self.retirement.read().await;
         let first = self.snapshot();
         if let Some(data) = fully_covered(offset, length, &first) {
@@ -641,12 +638,13 @@ impl VolatileWriteRuntime {
         }
 
         let mut output = BytesMut::from(base().await?.as_ref());
-        if self.terminal().is_some() || self.budget.is_terminal() {
-            return Err(OverlayError::IoError);
-        }
         if output.len() != length {
             return Err(OverlayError::IoError);
         }
+        // Terminal state stops admission and durability progress, but accepted
+        // entries stay pinned. Overlaying that frozen logical view over the
+        // canonical read preserves the last coherent bytes after a partial or
+        // failed materialization instead of turning every read into EIO.
         // Snapshot after the canonical read while retirement remains pinned.
         // Any write that could have partially changed the base is therefore
         // still present here in its complete logical form.
@@ -1540,7 +1538,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_materialization_failure_makes_subsequent_reads_fail_closed() {
+    async fn terminal_materialization_failure_retains_acknowledged_read_view() {
         let materialize: Materializer =
             Arc::new(|_, _, _| async { Err(super::OverlayError::IoError) }.boxed());
         let runtime =
@@ -1554,8 +1552,39 @@ mod tests {
 
         let result = runtime
             .read(0, 4, || async { Ok(Bytes::from_static(b"base")) }.boxed())
-            .await;
-        assert!(matches!(result, Err(super::OverlayError::IoError)));
+            .await
+            .unwrap();
+        assert_eq!(result, Bytes::from_static(b"data"));
+    }
+
+    #[tokio::test]
+    async fn terminal_partial_read_merges_frozen_overlay_over_canonical_base() {
+        let materialize: Materializer =
+            Arc::new(|_, _, _| async { Err(super::OverlayError::IoError) }.boxed());
+        let runtime =
+            VolatileWriteRuntime::new(VolatileBudget::new(4096, 16), vec![7], materialize);
+        let admission = runtime.reserve(2).await.unwrap();
+        runtime
+            .accept_write(
+                admission,
+                1,
+                Bytes::from_static(b"XX"),
+                vec![vec![WriteChunk {
+                    inode: 7,
+                    member_offset: 1,
+                    logical_offset: 0,
+                    length: 2,
+                }]],
+            )
+            .await
+            .unwrap();
+        runtime.wait_materialized(1).await.unwrap_err();
+
+        let result = runtime
+            .read(0, 4, || async { Ok(Bytes::from_static(b"base")) }.boxed())
+            .await
+            .unwrap();
+        assert_eq!(result, Bytes::from_static(b"bXXe"));
     }
 
     #[tokio::test]
