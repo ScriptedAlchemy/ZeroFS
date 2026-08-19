@@ -1308,6 +1308,8 @@ pub async fn run_server(
             _ => None,
         };
 
+        fs.install_volatile_overlay();
+
         let nfs_handles = start_nfs_servers(
             Arc::clone(&fs),
             settings.servers.nfs.as_ref(),

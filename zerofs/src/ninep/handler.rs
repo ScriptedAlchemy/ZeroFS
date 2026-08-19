@@ -2197,7 +2197,7 @@ impl NinePHandler {
         let fid = self.get_fid(tf.fid)?;
         let fid_path = fid.path.clone();
 
-        self.filesystem.wait_configured_durability().await?;
+        self.filesystem.wait_inode_durability(fid.inode_id).await?;
 
         {
             let path = if fid_path.is_empty() {

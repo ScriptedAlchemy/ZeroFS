@@ -110,6 +110,7 @@ impl ZeroFS {
             id, offset, length
         );
 
+        self.quiesce_overlay_inode(id).await?;
         let _guard = self.lock_manager.acquire(id).await;
         let inode = self.inode_store.get(id).await?;
         let creds = Credentials::from_auth_context(auth);
@@ -203,6 +204,7 @@ impl ZeroFS {
         }
         let end = offset.checked_add(length).ok_or(FsError::InvalidArgument)?;
 
+        self.quiesce_overlay_inode(id).await?;
         let _guard = self.lock_manager.acquire(id).await;
         // Direct filesystem callers do not pass through the 9P single-flight.
         if let Some(result) = self.replay_dedup_result(&op_id, DedupResult::into_fallocate)? {

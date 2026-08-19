@@ -142,6 +142,7 @@ impl ZeroFS {
             creds.gid,
             &creds.groups[..creds.groups_count]
         );
+        self.quiesce_overlay_inode(id).await?;
         let _guard = self.lock_manager.acquire(id).await;
         // A same-id call may have completed while this one waited for the inode
         // lock (direct filesystem callers do not pass through the 9P single-flight).
