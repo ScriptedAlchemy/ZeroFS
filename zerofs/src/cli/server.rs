@@ -983,10 +983,17 @@ pub async fn build_slatedb(
     let compactor_object_store = object_store.clone();
     let wal_object_store = wal_object_store
         .map(|s| Arc::new(LengthCheckedObjectStore::new(s)) as Arc<dyn object_store::ObjectStore>);
-    crate::alloc_rss::set_rss_cap_bytes(total_memory_bytes as u64);
+    let rss_pressure_cap_bytes = match crate::alloc_rss::rss_cap_bytes() {
+        0 => {
+            let clean_cache_fallback = total_memory_bytes as u64;
+            crate::alloc_rss::set_rss_cap_bytes(clean_cache_fallback);
+            clean_cache_fallback
+        }
+        validated_cap => validated_cap,
+    };
     let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(
         PrefetchingObjectStore::new(object_store, parts_cache.clone())
-            .with_admission_cap(total_memory_bytes as u64),
+            .with_admission_cap(rss_pressure_cap_bytes),
     );
 
     let db_path = Path::from(db_path);
@@ -1176,7 +1183,10 @@ pub async fn run_server(
 
     info!("ZeroFS v{}", env!("CARGO_PKG_VERSION"));
 
-    let settings = load_and_validate_server_settings(&config_path)?;
+    let (settings, memory_budget) = load_and_validate_server_settings(&config_path)?;
+    if let Some(memory_budget) = memory_budget {
+        crate::alloc_rss::set_rss_cap_bytes(memory_budget.rss_pressure_cap_bytes);
+    }
 
     let db_mode = match (read_only, &checkpoint_name) {
         (false, None) => DatabaseMode::ReadWrite,
@@ -1719,7 +1729,9 @@ pub async fn run_server(
     result
 }
 
-fn load_and_validate_server_settings(config_path: &std::path::Path) -> Result<Settings> {
+fn load_and_validate_server_settings(
+    config_path: &std::path::Path,
+) -> Result<(Settings, Option<super::memory_budget::MemoryBudgetReceipt>)> {
     let settings = Settings::from_file(config_path)
         .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
     settings
@@ -1733,9 +1745,10 @@ fn load_and_validate_server_settings(config_path: &std::path::Path) -> Result<Se
         .map(crate::config::NbdConfig::volatile_memory_bytes)
         .transpose()?
         .unwrap_or(0);
-    super::memory_budget::validate_server_startup(&settings, volatile_write_bytes)
-        .context("Invalid startup memory budget")?;
-    Ok(settings)
+    let memory_budget =
+        super::memory_budget::validate_server_startup(&settings, volatile_write_bytes)
+            .context("Invalid startup memory budget")?;
+    Ok((settings, memory_budget))
 }
 
 #[cfg(test)]

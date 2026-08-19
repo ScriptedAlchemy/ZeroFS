@@ -60,8 +60,10 @@ pub(crate) struct CgroupMemoryLimits {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MemoryBudgetReceipt {
+    pub(crate) hard_limit_bytes: u64,
     pub(crate) required_bytes: u64,
     pub(crate) remaining_bytes: u64,
+    pub(crate) rss_pressure_cap_bytes: u64,
 }
 
 pub(crate) fn validate_server_startup(
@@ -83,6 +85,7 @@ pub(crate) fn validate_server_startup(
         hard_limit_bytes = envelope.hard_limit_bytes,
         required_bytes = receipt.required_bytes,
         remaining_bytes = receipt.remaining_bytes,
+        rss_pressure_cap_bytes = receipt.rss_pressure_cap_bytes,
         unmodeled_residency_reserve_bytes = UNMODELED_RESIDENCY_RESERVE_BYTES,
         companion_process_reserve_bytes = COMPANION_PROCESS_RESERVE_BYTES,
         source,
@@ -121,9 +124,15 @@ pub(crate) fn validate_memory_budget(
             gib(hard_limit_bytes),
         );
     }
+    let rss_pressure_cap_bytes = hard_limit_bytes
+        .checked_sub(UNMODELED_RESIDENCY_RESERVE_BYTES)
+        .and_then(|cap| cap.checked_sub(COMPANION_PROCESS_RESERVE_BYTES))
+        .context("startup memory envelope is smaller than its fixed policy reserves")?;
     Ok(MemoryBudgetReceipt {
+        hard_limit_bytes,
         required_bytes,
         remaining_bytes: hard_limit_bytes - required_bytes,
+        rss_pressure_cap_bytes,
     })
 }
 
@@ -416,8 +425,10 @@ mod tests {
 
         let receipt = validate_memory_budget(tiers, 96 * GIB, "test cgroup").unwrap();
 
+        assert_eq!(receipt.hard_limit_bytes, 96 * GIB);
         assert_eq!(receipt.required_bytes, 94_949_672_960);
         assert_eq!(receipt.remaining_bytes, 8_129_542_144);
+        assert_eq!(receipt.rss_pressure_cap_bytes, 56 * GIB);
     }
 
     #[test]
@@ -458,6 +469,7 @@ mod tests {
 
         assert_eq!(receipt.required_bytes, 47 * GIB);
         assert_eq!(receipt.remaining_bytes, GIB);
+        assert_eq!(receipt.rss_pressure_cap_bytes, 8 * GIB);
     }
 
     #[test]
