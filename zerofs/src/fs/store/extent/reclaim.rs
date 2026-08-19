@@ -68,8 +68,12 @@ const MAX_SEGMENT_DELETES_PER_PASS: usize = 1024;
 /// One directory verify checks both the memory and durable views. Consecutive
 /// extents stay in one narrow range; highly sparse/interleaved directories
 /// coalesce their runs so a legal full segment cannot fan out into thousands
-/// of backend requests.
-const MAX_VERIFY_SCAN_RANGES: usize = 32;
+/// of backend requests. The shared row/byte budget also bounds unrelated keys
+/// streamed through gaps widened by that coalescing.
+const MAX_VERIFY_SCANS: usize = 32;
+const MAX_VERIFY_SCAN_RANGES: usize = MAX_VERIFY_SCANS / 2;
+const MAX_VERIFY_ROWS: usize = 4096;
+const MAX_VERIFY_ENCODED_BYTES: usize = 64 * 1024 * 1024;
 
 /// Orphan-sweep age floor: an uncounted segment object must have been PUT at
 /// least this long ago before it is deletable. Guards the window where an
@@ -89,6 +93,26 @@ enum SegmentDeadVerdict {
     ObjectAbsent,
     /// A live frame still points here, or a transient read error: keep (fail-closed).
     Keep,
+}
+
+#[derive(Default)]
+struct VerifyScanBudget {
+    rows: usize,
+    encoded_bytes: usize,
+}
+
+impl VerifyScanBudget {
+    fn charge(&mut self, key: &Bytes, value: &Bytes) -> Result<(), ()> {
+        let encoded_bytes = key.len().checked_add(value.len()).ok_or(())?;
+        let next_rows = self.rows.checked_add(1).ok_or(())?;
+        let next_encoded_bytes = self.encoded_bytes.checked_add(encoded_bytes).ok_or(())?;
+        if next_rows > MAX_VERIFY_ROWS || next_encoded_bytes > MAX_VERIFY_ENCODED_BYTES {
+            return Err(());
+        }
+        self.rows = next_rows;
+        self.encoded_bytes = next_encoded_bytes;
+        Ok(())
+    }
 }
 
 /// What one reclaim pass did and whether it left actionable work behind —
@@ -979,15 +1003,16 @@ impl ExtentStore {
         let Some(ranges) = extent_scan_ranges(&self.key_codec, want) else {
             return Err(());
         };
+        let mut budget = VerifyScanBudget::default();
         for range in ranges {
             if self
-                .scan_extent_run_points_here(segid, want, range.clone(), false)
+                .scan_extent_run_points_here(segid, want, range.clone(), false, &mut budget)
                 .await?
             {
                 return Ok(true);
             }
             if self
-                .scan_extent_run_points_here(segid, want, range, true)
+                .scan_extent_run_points_here(segid, want, range, true, &mut budget)
                 .await?
             {
                 return Ok(true);
@@ -1002,6 +1027,7 @@ impl ExtentStore {
         want: &BTreeSet<(InodeId, u64)>,
         range: std::ops::Range<Bytes>,
         durable: bool,
+        budget: &mut VerifyScanBudget,
     ) -> Result<bool, ()> {
         let stream = if durable {
             self.db.scan_durable(range).await
@@ -1012,6 +1038,7 @@ impl ExtentStore {
         futures::pin_mut!(stream);
         while let Some(item) = StreamExt::next(&mut stream).await {
             let (key, val) = item.map_err(|_| ())?;
+            budget.charge(&key, &val)?;
             let Some((inode, extent)) = self.key_codec.parse_extent_key_full(&key) else {
                 continue;
             };
@@ -1204,12 +1231,10 @@ mod tests {
             "the final sparse memory reference must fail closed"
         );
         assert!(
-            db.scan_call_count() - memory_before <= MAX_VERIFY_SCAN_RANGES as u64,
-            "memory verification scans must stay bounded for 1,024 sparse/interleaved frames"
-        );
-        assert!(
-            db.durable_scan_call_count() - durable_before <= MAX_VERIFY_SCAN_RANGES as u64,
-            "durable verification scans must stay bounded for 1,024 sparse/interleaved frames"
+            (db.scan_call_count() - memory_before)
+                + (db.durable_scan_call_count() - durable_before)
+                <= 32,
+            "combined memory+durable scans must stay bounded for 1,024 sparse/interleaved frames"
         );
         assert_eq!(
             db.point_read_call_count() - points_before,
@@ -1277,17 +1302,88 @@ mod tests {
             "a reference masked only in memory must remain visible durably and fail closed"
         );
         assert!(
-            db.scan_call_count() - memory_before <= MAX_VERIFY_SCAN_RANGES as u64,
-            "memory verification scans must stay bounded before the durable fallback"
-        );
-        assert!(
-            db.durable_scan_call_count() - durable_before <= MAX_VERIFY_SCAN_RANGES as u64,
-            "durable verification scans must stay bounded for a final stale reference"
+            (db.scan_call_count() - memory_before)
+                + (db.durable_scan_call_count() - durable_before)
+                <= 32,
+            "combined memory+durable scans must stay bounded for a final stale reference"
         );
         assert_eq!(
             db.point_read_call_count() - points_before,
             0,
             "durable verification must never regress to per-frame point reads"
+        );
+    }
+
+    async fn dead_sparse_segment_with_gap_rows(
+        gap_rows: impl IntoIterator<Item = (u64, Bytes)>,
+    ) -> (ExtentStore, Segid) {
+        let (writer, db, object_store) = make_with_compression(CompressionConfig::Lz4).await;
+        let frames: Vec<_> = (0..17u64)
+            .map(|slot| (1, slot * 10_000, Bytes::from_static(b"x")))
+            .collect();
+        let locs = writer.segments.seal(&frames).await.unwrap();
+        let segid = locs[0].2.segid;
+        let total = locs.iter().map(|(_, _, loc)| u64::from(loc.byte_len)).sum();
+
+        // Restart at a newer epoch so the sealed segment is eligible for the
+        // fast reclaim pass, then make its counter durably dead. The gap rows
+        // are unrelated extents that a coalesced directory range must stream
+        // past before it can prove the segment unreferenced.
+        let store = make_store(object_store, db.clone(), CompressionConfig::Lz4, 8);
+        let mut txn = db.new_transaction().unwrap();
+        txn.put_bytes(
+            &store.key_codec.segcount_key(segid.epoch, segid.counter),
+            KeyCodec::encode_segcount(0, total),
+        );
+        for (extent, value) in gap_rows {
+            txn.put_bytes(&store.key_codec.extent_key(1, extent), value);
+        }
+        commit(&store, txn).await;
+        (store, segid)
+    }
+
+    #[tokio::test]
+    async fn directory_verify_row_budget_exhaustion_keeps_segment_and_blocks_delete() {
+        let other = Segid::new(99, 1);
+        let rows = (1..=4097u64).map(|extent| {
+            (
+                extent,
+                test_frame_loc(other, u32::try_from(extent).unwrap()),
+            )
+        });
+        let (store, segid) = dead_sparse_segment_with_gap_rows(rows).await;
+
+        let (deleted, _) = store.reclaim_segments(Utc::now(), None).await.unwrap();
+
+        assert_eq!(deleted, 0, "row-budget exhaustion must fail closed");
+        assert!(
+            store
+                .segments
+                .list_segments()
+                .await
+                .unwrap()
+                .contains(&segid),
+            "a verification budget failure must never delete the segment"
+        );
+    }
+
+    #[tokio::test]
+    async fn directory_verify_byte_budget_exhaustion_keeps_segment_and_blocks_delete() {
+        let encoded = Bytes::from(vec![0x5a; 1024 * 1024]);
+        let rows = (1..=65u64).map(|extent| (extent, encoded.clone()));
+        let (store, segid) = dead_sparse_segment_with_gap_rows(rows).await;
+
+        let (deleted, _) = store.reclaim_segments(Utc::now(), None).await.unwrap();
+
+        assert_eq!(deleted, 0, "byte-budget exhaustion must fail closed");
+        assert!(
+            store
+                .segments
+                .list_segments()
+                .await
+                .unwrap()
+                .contains(&segid),
+            "a verification budget failure must never delete the segment"
         );
     }
 
