@@ -370,10 +370,10 @@ async fn kill_and_reap(
     stderr_task: Option<JoinHandle<()>>,
 ) -> Result<(), TransportError> {
     kill_process_group(&child);
-    if let Err(error) = child.start_kill() {
-        if error.kind() != io::ErrorKind::InvalidInput {
-            tracing::warn!(%error, "failed to signal HPN-SSH child");
-        }
+    if let Err(error) = child.start_kill()
+        && error.kind() != io::ErrorKind::InvalidInput
+    {
+        tracing::warn!(%error, "failed to signal HPN-SSH child");
     }
     match child.wait().await {
         Ok(_) => {
