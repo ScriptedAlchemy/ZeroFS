@@ -61,13 +61,71 @@ type SegBase = (bytes::Bytes, (i64, i64), (u64, u64));
 
 type Reply = oneshot::Sender<Result<(), FsError>>;
 
+#[derive(Default)]
+pub(crate) enum CommitOwnership {
+    #[default]
+    None,
+    Dedup(crate::dedup::PendingWriteRequest),
+    Materialized(crate::fs::mutation::materialized_replay::MaterializedReplayCompletion),
+}
+
+#[derive(Default)]
+pub(crate) enum CommitSettlement {
+    #[default]
+    None,
+    Write(crate::fs::ops::write::PostCommitSettlement),
+}
+
+struct CommitReply {
+    reply: Reply,
+    queued_inode: crate::fs::store::inode::PendingInodeGuard,
+    settlement: CommitSettlement,
+    materialized_replay:
+        Option<crate::fs::mutation::materialized_replay::MaterializedReplayCompletion>,
+}
+
+impl CommitReply {
+    fn new(
+        reply: Reply,
+        queued_inode: crate::fs::store::inode::PendingInodeGuard,
+        settlement: CommitSettlement,
+        materialized_replay: Option<
+            crate::fs::mutation::materialized_replay::MaterializedReplayCompletion,
+        >,
+    ) -> Self {
+        Self {
+            reply,
+            queued_inode,
+            settlement,
+            materialized_replay,
+        }
+    }
+
+    fn send(self, result: Result<(), FsError>) {
+        let Self {
+            reply,
+            queued_inode,
+            settlement,
+            materialized_replay,
+        } = self;
+        if let CommitSettlement::Write(settlement) = settlement {
+            settlement.finish(result);
+        }
+        drop(queued_inode);
+        if let Some(completion) = materialized_replay {
+            completion.finish(result);
+        }
+        let _ = reply.send(result);
+    }
+}
+
 // Boxing `Commit` would add an allocation to the hot path.
 #[allow(clippy::large_enum_variant)]
 enum Request {
     Commit(
         Transaction,
         Option<crate::dedup::PendingWriteRequest>,
-        Reply,
+        CommitReply,
     ),
     Barrier(Reply),
 }
@@ -198,31 +256,30 @@ impl WriteCoordinator {
     /// Awaiting `commit` after releasing the lock would give neither
     /// guarantee: two writers could reach the send in either order.
     pub(crate) fn submit(&self, txn: Transaction) -> Result<PendingCommit, FsError> {
-        self.submit_owned(txn, None)
+        self.submit_owned(txn, CommitOwnership::None, CommitSettlement::None)
     }
 
-    pub(crate) fn submit_with_write_request(
+    pub(crate) fn submit_owned(
         &self,
         txn: Transaction,
-        pending_write_request: crate::dedup::PendingWriteRequest,
+        ownership: CommitOwnership,
+        settlement: CommitSettlement,
     ) -> Result<PendingCommit, FsError> {
-        self.submit_owned(txn, Some(pending_write_request))
-    }
-
-    fn submit_owned(
-        &self,
-        txn: Transaction,
-        pending_write_request: Option<crate::dedup::PendingWriteRequest>,
-    ) -> Result<PendingCommit, FsError> {
-        let queued = self.inode_store.install_pending(txn.inode_cache_updates());
+        let (pending_write_request, materialized_replay) = match ownership {
+            CommitOwnership::None => (None, None),
+            CommitOwnership::Dedup(request) => (Some(request), None),
+            CommitOwnership::Materialized(completion) => (None, Some(completion)),
+        };
+        let queued_inode = self.inode_store.install_pending(txn.inode_cache_updates());
         let (reply_tx, reply_rx) = oneshot::channel();
         self.sender
-            .send(Request::Commit(txn, pending_write_request, reply_tx))
+            .send(Request::Commit(
+                txn,
+                pending_write_request,
+                CommitReply::new(reply_tx, queued_inode, settlement, materialized_replay),
+            ))
             .map_err(|_| FsError::IoError)?;
-        Ok(PendingCommit {
-            reply: reply_rx,
-            queued,
-        })
+        Ok(PendingCommit { reply: reply_rx })
     }
 
     /// Wait until every commit submitted before this call has finished,
@@ -283,15 +340,11 @@ impl WriteCoordinator {
     }
 }
 
-/// A queued commit awaiting its apply. Holding it keeps the transaction's
-/// inode mutations published, so dropping it without awaiting hands reads back
-/// to the read cache before the apply has promoted anything.
+/// A queued commit awaiting its apply. All canonical settlement ownership lives
+/// in the worker; dropping this response future cannot retract queued state.
 #[must_use = "a queued commit must be awaited"]
 pub(crate) struct PendingCommit {
     reply: oneshot::Receiver<Result<(), FsError>>,
-    /// Read only by its own drop: retiring it hands reads back to the cache.
-    #[allow(dead_code)]
-    queued: crate::fs::store::inode::PendingInodeGuard,
 }
 
 impl PendingCommit {
@@ -314,10 +367,14 @@ impl WeakWriteCoordinator {
     pub async fn commit(&self, txn: Transaction) -> Result<(), FsError> {
         let sender = self.sender.upgrade().ok_or(FsError::IoError)?;
         // Same submit-time queueing as the strong handle; see there.
-        let _queued = self.inode_store.install_pending(txn.inode_cache_updates());
+        let queued_inode = self.inode_store.install_pending(txn.inode_cache_updates());
         let (reply_tx, reply_rx) = oneshot::channel();
         sender
-            .send(Request::Commit(txn, None, reply_tx))
+            .send(Request::Commit(
+                txn,
+                None,
+                CommitReply::new(reply_tx, queued_inode, CommitSettlement::None, None),
+            ))
             .map_err(|_| FsError::IoError)?;
         reply_rx.await.map_err(|_| FsError::IoError)?
     }
@@ -1466,9 +1523,14 @@ mod tests {
         let (head_reply, head_rx) = oneshot::channel();
         let mut head = Transaction::new();
         head.put_bytes(&codec.extent_key(1, 0), Bytes::from_static(b"head"));
+        let head_queued = fs.inode_store.install_pending(head.inode_cache_updates());
         fs.write_coordinator
             .sender
-            .send(Request::Commit(head, None, head_reply))
+            .send(Request::Commit(
+                head,
+                None,
+                CommitReply::new(head_reply, head_queued, CommitSettlement::None, None),
+            ))
             .unwrap();
         replies.push(head_rx);
         apply_reached.await.unwrap();
@@ -1477,9 +1539,14 @@ mod tests {
             let (reply_tx, reply_rx) = oneshot::channel();
             let mut txn = Transaction::new();
             txn.put_bytes(&codec.extent_key(1, i), Bytes::from_static(b"tail"));
+            let queued = fs.inode_store.install_pending(txn.inode_cache_updates());
             fs.write_coordinator
                 .sender
-                .send(Request::Commit(txn, None, reply_tx))
+                .send(Request::Commit(
+                    txn,
+                    None,
+                    CommitReply::new(reply_tx, queued, CommitSettlement::None, None),
+                ))
                 .unwrap();
             replies.push(reply_rx);
         }
@@ -1582,9 +1649,14 @@ mod tests {
         // Queue the commit without awaiting its own reply. The barrier must not
         // complete until the worker has both applied it and published gauges.
         let (reply_tx, _reply_rx) = oneshot::channel();
+        let queued = fs.inode_store.install_pending(txn.inode_cache_updates());
         fs.write_coordinator
             .sender
-            .send(Request::Commit(txn, None, reply_tx))
+            .send(Request::Commit(
+                txn,
+                None,
+                CommitReply::new(reply_tx, queued, CommitSettlement::None, None),
+            ))
             .unwrap();
         fs.write_coordinator.barrier().await.unwrap();
 
