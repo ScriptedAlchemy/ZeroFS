@@ -1118,14 +1118,10 @@ impl TransportSession for OpenSshTransportSession {
         to: &std::path::Path,
     ) -> Result<(), TransportError> {
         let sftp = self.sftp.as_ref().expect("open transport owns SFTP client");
-        match sftp.fs().hard_link(from, to).await {
-            Ok(()) => Ok(()),
-            Err(openssh_sftp_client::Error::SftpError(
-                openssh_sftp_client::error::SftpErrorKind::Failure,
-                _,
-            )) => Err(TransportError::AlreadyExists(to.display().to_string())),
-            Err(error) => Err(map_sftp_error(to, error)),
-        }
+        sftp.fs()
+            .hard_link(from, to)
+            .await
+            .map_err(|error| map_sftp_error(to, error))
     }
 
     async fn posix_rename(
