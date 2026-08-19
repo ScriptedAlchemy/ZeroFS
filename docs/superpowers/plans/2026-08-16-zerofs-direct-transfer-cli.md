@@ -4,9 +4,9 @@
 
 **Goal:** Add real, progress-reporting recursive upload, download, and removal commands to the existing `zerofs` binary using the production 9P client without mounting or changing the server.
 
-**Architecture:** Add `zerofs upload`, `zerofs download`, and `zerofs rm` to the existing Clap command tree. A focused transfer module scans copy sources into exact-root plans, streams regular files through `zerofs-client` with browser-style temporary files and bounded file concurrency, recursively removes an explicitly selected remote path, and reports terminal progress. Tests exercise pure planning/output units plus real operations through an in-process ZeroFS 9P server.
+**Architecture:** Add `zerofs upload`, `zerofs download`, and `zerofs rm` to the existing Clap command tree. A focused transfer module scans copy sources into exact-root plans, streams regular files through `zerofs-client` with browser-style temporary files and bounded file concurrency, recursively removes an explicitly selected remote path one mutation at a time with cancellation checks, and reports terminal progress. Tests exercise pure planning/output units plus real operations through an in-process ZeroFS 9P server.
 
-**Final implementation note:** The completed CLI uses two reusable 9P sessions per bounded upload worker (one per download worker), requests an extent-aligned 9 MiB write payload plus protocol framing, and keeps two positioned writes active on each upload session while obeying any smaller server-negotiated maximum. Each session verifies its acknowledged writes before rename, and a filesystem-wide sync verifies publication before completion. Empty-directory-only uploads retain a final `Client::sync()`. Prompt-free recursive `rm` refuses the attach root. Transport hardening acknowledges actual socket sends before starting reply liveness, retains bounded write-stall detection, and keeps a slow request alive while the server remains responsive. Connection, stale-handle, leader, and retry-later (`EAGAIN`) file errors restart only that file from a new private temp up to three total attempts; cleanup failures are terminal, and exhausted files are reported while the remaining queue continues. These decisions supersede the original single-client, sequential-write, batch-wide `Client::sync()`, fail-fast scheduling, and upload/download-only steps below.
+**Final implementation note:** The completed CLI uses two reusable 9P sessions per bounded upload worker (one per download worker), requests an extent-aligned 9 MiB write payload plus protocol framing, and keeps two positioned writes active on each upload session while obeying any smaller server-negotiated maximum. Each session verifies its acknowledged writes before rename, and a filesystem-wide sync verifies publication before completion. Empty-directory-only uploads retain a final `Client::sync()`. Prompt-free recursive `rm` refuses the attach root and mutates one deepest-first entry at a time so cancellation is observed between mutations. Downloads preflight the whole plan, walk local destination ancestors with no-follow directory handles, perform temp create/cleanup/rename relative to the held parent, request exactly the planned bytes, and probe one byte at EOF. During transfer execution, the first Ctrl-C drains and cleans up; the second exits immediately with status 130 and may strand a hidden temp. Aggregate progress is monotonic committed/skipped work, while non-TTY events are emitted in deterministic plan order. Transport hardening acknowledges actual socket sends before starting reply liveness, retains bounded write-stall detection, and keeps a slow request alive while the server remains responsive. Connection, stale-handle, leader, or retry-later (`EAGAIN`) file errors restart only that file from a new private temp up to three total attempts; cleanup failures are terminal, and exhausted files are reported while the remaining queue continues. These decisions supersede the original single-client, sequential-write, batch-wide `Client::sync()`, fail-fast scheduling, path-based local publication, concurrent removal, and upload/download-only steps below.
 
 **Tech Stack:** Rust 2024, Clap, Tokio, futures, tokio-util cancellation, Indicatif, uuid, `zerofs-client`, the in-tree ZeroFS 9P test server.
 
@@ -38,11 +38,11 @@
 
 - Modify `zerofs/src/cli/mod.rs`: declare upload, download, and removal commands and their arguments.
 - Modify `zerofs/src/main.rs`: dispatch upload, download, and removal through the existing Tokio runtime.
-- Create `zerofs/src/cli/transfer/mod.rs`: public runners, cancellation, bounded scheduling and removal, final durability, and error aggregation.
+- Create `zerofs/src/cli/transfer/mod.rs`: public runners, cancellation, bounded file scheduling, sequential removal, final durability, and error aggregation.
 - Create `zerofs/src/cli/transfer/tests.rs`: real 9P integration and transfer orchestration tests, mounted by `transfer/mod.rs` under `cfg(test)`.
 - Create `zerofs/src/cli/transfer/plan.rs`: exact-root local and remote tree scanning and type-conflict validation.
 - Create `zerofs/src/cli/transfer/copy.rs`: one-file upload/download loops, temporary-file creation, rename, and cleanup.
-- Create `zerofs/src/cli/transfer/progress.rs`: aggregate state, TTY rendering, stable non-TTY events, rate, percentage, and ETA formatting.
+- Create `zerofs/src/cli/transfer/progress.rs`: aggregate state, TTY rendering, deterministic planned-order non-TTY events, rate, percentage, and ETA formatting.
 - Modify `README.md`: document direct transfers, target forms, examples, overwrite behavior, and limitations.
 
 ### Task 1: Exact-Root Transfer Plans
@@ -215,14 +215,15 @@ Create remote temporary files beside the final path using:
 OpenOptions::write_only().create_new(true).mode(0o644)
 ```
 
-Read the local Tokio file into one reusable `Vec<u8>` capped by `max_write_chunk`, call `write_at` sequentially, update progress only after each acknowledged write, rename the temporary path over the exact destination, and close the handle in every outcome. Before rename, errors and cancellation remove the temporary path best-effort and include cleanup failure in the returned error.
+Read the local Tokio file into bounded reusable buffers capped by the remaining file length and `max_write_chunk`; zero-length files allocate zero-length buffers. Pipeline at most two `write_at` calls per session, update active-file progress only after acknowledged writes, verify every session, rename the temporary path over the exact destination, and close handles in every outcome. Before rename, errors and cancellation always attempt to remove the temporary path and include cleanup failure in the returned error.
 
-Create at most `min(jobs, file_count)` reusable 9P clients. Each worker dequeues
-one file at a time and keeps that file's chunks sequential. After writing a
-file, rename it into visibility, sync through the still-open file handle, and
-only then mark it complete. Settle every active worker before aggregating
-errors. An empty-directory-only upload uses `Client::sync()` for its final
-durability barrier.
+Create two reusable 9P clients per bounded file worker. Each worker dequeues one
+file at a time and pipelines at most two positioned writes on each session.
+After writing a file, verify every session's acknowledged-write lineage, rename
+it into visibility, run the filesystem-wide sync, and only then mark it
+complete. Settle every active worker before aggregating errors. An
+empty-directory-only upload uses `Client::sync()` for its final durability
+barrier.
 
 - [ ] **Step 4: Run upload and existing client tests and verify GREEN**
 
@@ -276,8 +277,9 @@ Add a real-server test that creates `/source/root.bin`, `/source/nested/child.bi
 
 Add progress tests for Indicatif-backed aggregate and active-file bars. Require
 percentage, transferred/total units, rate, ETA, and file counts on interactive
-terminals; completed file bars must disappear, and non-TTY completion events
-must remain line-oriented.
+terminals; completed file bars must disappear, aggregate committed/skipped work
+must never regress across retries, and non-TTY completion events must remain
+line-oriented in deterministic planned-file order.
 
 - [ ] **Step 2: Run download/progress tests and verify RED**
 
@@ -313,9 +315,9 @@ pub(super) async fn download_file(
 ) -> anyhow::Result<()>;
 ```
 
-Open the remote file once, create a unique local temp beside the destination with `create_new`, loop `read_at(offset, chunk_size)`, write each chunk with Tokio `write_all`, and advance progress only after the local write succeeds. Call local `sync_all`, close, and rename over the exact destination. Remove the temp best-effort on failure or cancellation.
+Preflight every planned final type before copying. Open each existing local destination ancestor with no-follow directory-handle operations, create missing directories with `mkdirat`, and create a unique local temp with `openat(O_EXCL|O_NOFOLLOW)` on the held destination-parent handle. Read exactly the remaining planned bytes, reject oversized replies, probe one byte at planned EOF, write each chunk with Tokio `write_all`, and advance active-file progress only after the local write succeeds. Call local `sync_all`, close, and publish with `renameat` on the held parent. Always attempt `unlinkat` cleanup on failure or cancellation; cleanup failure is terminal.
 
-Implement bounded concurrent download scheduling using the same eight-job default. Use Indicatif `MultiProgress` for one aggregate bar plus the active file bars. For non-TTY stderr, print one stable line per completed file and one final summary. Install a Ctrl-C task that cancels a shared token, stops new scheduling, lets in-flight calls settle, performs cleanup, and returns nonzero.
+Implement bounded concurrent download scheduling using the same eight-job default. Use Indicatif `MultiProgress` for one monotonic committed/skipped aggregate bar plus active file bars. For non-TTY stderr, print file events in deterministic planned order and one final summary. Install a Ctrl-C task whose first signal cancels a shared token, stops new scheduling, lets in-flight calls settle, performs cleanup, and returns nonzero; a second signal is an explicit immediate exit 130 that can strand an in-flight hidden temp.
 
 Remove each file bar after publication/finalization and call aggregate `finish()` only after every relevant sync and rename succeeds.
 
