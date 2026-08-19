@@ -122,6 +122,57 @@ control_host_transaction
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertFalse(transaction.exists())
 
+    def test_commit_rejects_a_transaction_that_is_not_fully_activated(self) -> None:
+        source = HOST_SCRIPT.read_text()
+        functions = source[
+            source.index("set_host_transaction_phase() {") : source.index(
+                "assert_server_drained() {"
+            )
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transaction = root / "deployment-transaction"
+            transaction.mkdir()
+            (transaction / "state.env").write_text(
+                "saved_had_ct=false\n"
+                "saved_had_running_ct=false\n"
+                "saved_prod_mount_was_active=false\n"
+                "saved_prod_smb_was_active=false\n"
+                "saved_prod_mount_was_enabled=false\n"
+                "saved_prod_smb_was_enabled=false\n"
+                "saved_release_id=current-release\n"
+            )
+            (transaction / "previous-release").write_text("\n")
+            (transaction / "phase").write_text("maintenance\n")
+            script = f"""set -euo pipefail
+dry_run=false
+action=commit
+defer_commit=false
+deployment_transaction={transaction}
+state_root={root}
+release_id=current-release
+ctid=198
+ct_resource_snapshot=
+ct_resources_mutated=false
+previous_release=
+ct_exists() {{ return 1; }}
+ct_running() {{ return 1; }}
+restore_ct_resources() {{ return 0; }}
+pct() {{ :; }}
+{functions}
+control_host_transaction
+"""
+            rejected = subprocess.run(
+                ["bash", "-c", script],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("not activated", rejected.stderr)
+            self.assertTrue(transaction.exists())
+
     def test_shell_assets_parse(self) -> None:
         for path in (
             HOST_SCRIPT,
@@ -142,6 +193,12 @@ control_host_transaction
         self.assertIn('"/var/lib/zerofs-lxc/prod-${ctid}"', source)
         self.assertIn('"/var/lib/zerofs-lxc/dev-${ctid}"', source)
         self.assertNotIn('expected="/var/lib/zerofs-lxc/${ctid}"', source)
+
+    def test_host_lock_is_global_for_shared_pve_resources(self) -> None:
+        source = HOST_SCRIPT.read_text()
+
+        self.assertIn("/run/lock/zerofs-lxc-deploy-global.lock", source)
+        self.assertNotIn("/run/lock/zerofs-lxc-$ctid.coordinator.lock", source)
 
     def test_deploy_plan_uses_unprivileged_private_lxc_and_persistent_bind(
         self,
@@ -337,6 +394,29 @@ control_host_transaction
             with self.subTest(action=action):
                 result = self.run_host(action, role="dev")
                 self.assertNotEqual(result.returncode, 0)
+
+    def test_maintenance_activation_exposes_only_nfs_and_metrics(self) -> None:
+        result = self.run_host(
+            "deploy",
+            "--defer-commit",
+            "--maintenance-nfs-only",
+            role="prod",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("prove maintenance NFS listener", result.stdout)
+        self.assertIn("10.10.10.20:2049", result.stdout)
+        self.assertNotIn("prove 9P listener", result.stdout)
+        self.assertNotIn("prove NBD listener", result.stdout)
+        self.assertNotIn("prove WebUI listener", result.stdout)
+        self.assertIn("persist host deployment phase maintenance", result.stdout)
+
+    def test_promote_requires_the_deferred_production_transaction(self) -> None:
+        result = self.run_host("promote", role="prod")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("promote host deployment transaction", result.stdout)
+        self.assertIn("prove full private production listeners", result.stdout)
 
     def test_default_prod_access_is_native_nfs_without_samba(self) -> None:
         result = self.run_host("deploy", role="prod")

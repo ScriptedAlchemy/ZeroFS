@@ -218,6 +218,16 @@ addresses = ["10.10.10.30:9567"]
             self.write_config(self.valid_config()), "10.10.10.20"
         )
 
+    def test_bootstrap_config_exposes_only_nfs_rpc_and_metrics(self) -> None:
+        rendered = deploy.render_nfs_bootstrap_config(self.prod_config())
+        config = tomllib.loads(rendered)
+
+        self.assertEqual(set(config["servers"]), {"nfs", "rpc"})
+        self.assertEqual(
+            config["servers"]["nfs"]["shared_identity"], {"uid": 501, "gid": 20}
+        )
+        self.assertEqual(config["prometheus"]["addresses"], ["10.10.10.30:9567"])
+
     def test_public_listener_is_rejected(self) -> None:
         config = self.valid_config().replace('"10.10.10.20:10809"', '"0.0.0.0:10809"')
         with self.assertRaisesRegex(ValueError, "private container address"):
@@ -864,14 +874,106 @@ class VmNfsCoordinatorTests(unittest.TestCase):
             runner,
             self.args(),
             "0123456789ab-cccccccccccccccc",
-            lambda: events.append("activate"),
+            lambda: self.fail("full activation must wait for ownership proof"),
             lambda: events.append("commit"),
             lambda: events.append("rollback"),
             lambda: events.append("recover"),
+            activate_maintenance=lambda: events.append("maintenance"),
+            promote_host=lambda: events.append("promote"),
         )
 
         self.assertEqual(runner.preflights, 2)
-        self.assertEqual(events, ["recover", "activate", "commit"])
+        self.assertEqual(events, ["recover", "maintenance", "promote", "commit"])
+        self.assertEqual(
+            self.actions(runner.calls),
+            [
+                "recover",
+                "prepare",
+                "quiesce",
+                "reconcile",
+                "quiesce",
+                "reconcile",
+                "commit",
+            ],
+        )
+
+    def test_recognized_legacy_bindfs_uses_the_transactional_bootstrap_path(
+        self,
+    ) -> None:
+        class LegacyRunner(self.RecordingRunner):
+            def run_remote_shell(inner_self, host, script):
+                if "reconcile-zerofs-nfs.sh preflight " in script:
+                    if not hasattr(inner_self, "preflighted"):
+                        inner_self.preflighted = True
+                        return (
+                            "ZEROFS_SHARED_NAMESPACE_V1 verified=0 objects=0 "
+                            "wrong_owner=0 first_uid=-1 first_gid=-1 "
+                            "reason=legacy_topology\n"
+                        )
+                return super().run_remote_shell(host, script)
+
+        runner = LegacyRunner()
+        events: list[str] = []
+        self.transaction_runner()(
+            runner,
+            self.args(),
+            "0123456789ab-cccccccccccccccc",
+            lambda: self.fail("legacy cutover requires maintenance activation"),
+            lambda: events.append("commit"),
+            lambda: events.append("rollback"),
+            lambda: events.append("recover"),
+            activate_maintenance=lambda: events.append("maintenance"),
+            promote_host=lambda: events.append("promote"),
+        )
+
+        prepare = next(
+            call for call in runner.calls if "vm_nfs_transition.py prepare " in call
+        )
+        self.assertIn("--allow-legacy-bindfs", prepare)
+        self.assertEqual(events, ["recover", "maintenance", "promote", "commit"])
+
+    def test_bootstrap_promotion_failure_restores_host_before_vm(self) -> None:
+        trace: list[str] = []
+
+        class BootstrapRunner(self.RecordingRunner):
+            def __init__(inner_self):
+                super().__init__()
+                inner_self.preflights = 0
+
+            def run_remote_shell(inner_self, host, script):
+                result = super().run_remote_shell(host, script)
+                if "vm_nfs_transition.py rollback " in script:
+                    trace.append("vm-rollback")
+                if "reconcile-zerofs-nfs.sh preflight " in script:
+                    inner_self.preflights += 1
+                    if inner_self.preflights == 1:
+                        return (
+                            "ZEROFS_SHARED_NAMESPACE_V1 verified=0 objects=0 "
+                            "wrong_owner=0 first_uid=-1 first_gid=-1 "
+                            "reason=mount_unavailable\n"
+                        )
+                return result
+
+        runner = BootstrapRunner()
+        with self.assertRaisesRegex(RuntimeError, "promotion failed"):
+            self.transaction_runner()(
+                runner,
+                self.args(),
+                "0123456789ab-cccccccccccccccc",
+                lambda: self.fail("full activation must not run"),
+                lambda: self.fail("host commit must not run"),
+                lambda: trace.append("host-rollback"),
+                lambda: trace.append("host-recover"),
+                activate_maintenance=lambda: trace.append("maintenance"),
+                promote_host=lambda: (_ for _ in ()).throw(
+                    RuntimeError("promotion failed")
+                ),
+            )
+
+        self.assertEqual(
+            trace,
+            ["host-recover", "maintenance", "host-rollback", "vm-rollback"],
+        )
 
     def test_prod_nfs_transition_rolls_back_each_mutating_failure_phase(self) -> None:
         runner = self.RecordingRunner("vm_nfs_transition.py prepare ")

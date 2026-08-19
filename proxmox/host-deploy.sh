@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: host-deploy.sh deploy|replace|cleanup|commit|rollback|recover [options]
+Usage: host-deploy.sh deploy|replace|cleanup|promote|commit|rollback|recover [options]
 
 This script runs on a Proxmox VE host. It never removes the persistent state
 bind mount. `replace` additionally requires --confirm-replace CTID.
@@ -12,7 +12,7 @@ EOF
 
 action=${1:-}
 case "$action" in
-  deploy|replace|cleanup|commit|rollback|recover) shift ;;
+  deploy|replace|cleanup|promote|commit|rollback|recover) shift ;;
   *) usage >&2; exit 2 ;;
 esac
 
@@ -39,6 +39,7 @@ assume_existing=false
 assume_stopped=false
 dry_run_ct_destroyed=false
 defer_commit=false
+maintenance_nfs_only=false
 
 while (($#)); do
   case "$1" in
@@ -63,6 +64,7 @@ while (($#)); do
     --assume-existing) assume_existing=true; shift ;;
     --assume-stopped) assume_stopped=true; shift ;;
     --defer-commit) defer_commit=true; shift ;;
+    --maintenance-nfs-only) maintenance_nfs_only=true; shift ;;
     --dry-run) dry_run=true; shift ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
@@ -105,7 +107,11 @@ if [[ $defer_commit == true && ! ( $role == prod && $action == deploy ) ]]; then
   echo "--defer-commit is valid only for production deploy" >&2
   exit 2
 fi
-if [[ $action == commit || $action == rollback || $action == recover ]] && [[ $role != prod ]]; then
+if [[ $maintenance_nfs_only == true && ! ( $role == prod && $action == deploy && $defer_commit == true && $prod_access == nfs ) ]]; then
+  echo "--maintenance-nfs-only requires a deferred native-NFS production deploy" >&2
+  exit 2
+fi
+if [[ $action == promote || $action == commit || $action == rollback || $action == recover ]] && [[ $role != prod ]]; then
   echo "$action controls only a production deployment transaction" >&2
   exit 2
 fi
@@ -149,10 +155,10 @@ if [[ $dry_run == false ]]; then
   command -v pveversion >/dev/null
   command -v flock >/dev/null
   pveversion >/dev/null
-  exec 8>"/run/lock/zerofs-lxc-$ctid.coordinator.lock"
-  flock -n 8 || { echo "another deployment owns CT $ctid" >&2; exit 75; }
+  exec 8>"/run/lock/zerofs-lxc-deploy-global.lock"
+  flock -n 8 || { echo "another ZeroFS host deployment is active" >&2; exit 75; }
 else
-  echo "+ acquire exclusive host lock /run/lock/zerofs-lxc-$ctid.coordinator.lock"
+  echo "+ acquire exclusive host lock /run/lock/zerofs-lxc-deploy-global.lock"
 fi
 
 ct_exists() {
@@ -472,7 +478,7 @@ persist_host_transaction() {
 }
 
 set_host_transaction_phase() {
-  [[ $defer_commit == true ]] || return 0
+  [[ $defer_commit == true || -d $deployment_transaction ]] || return 0
   local phase=$1 temporary="$deployment_transaction/.phase.$$"
   if [[ $dry_run == true ]]; then
     echo "+ persist host deployment phase $phase"
@@ -516,11 +522,69 @@ saved_prod_mount_was_enabled=false
 saved_prod_smb_was_enabled=false
 saved_release_id=
 
+wait_for_zerofs() {
+  if [[ $dry_run == true ]]; then
+    echo "+ wait up to 180s for private $role listeners and services"
+    return 0
+  fi
+  local deadline=$((SECONDS + 180))
+  until pct exec "$ctid" -- systemctl is-active --quiet zerofs-lxc.service \
+    && curl --fail --silent --show-error --max-time 5 "http://$container_ip:9567/metrics" >/dev/null; do
+    ((SECONDS < deadline)) || {
+      pct exec "$ctid" -- journalctl -u zerofs-lxc.service --no-pager -n 100 >&2
+      return 1
+    }
+    sleep 1
+  done
+}
+
+assert_runtime_listeners() {
+  local profile=$1 listeners
+  if [[ $dry_run == true ]]; then
+    if [[ $profile == maintenance ]]; then
+      echo "+ prove maintenance NFS listener is private $container_ip:2049"
+      echo "+ reject 9P, NBD, WebUI, SMB, wildcard, and public listeners"
+    else
+      echo "+ prove full private production listeners"
+      echo "+ prove NFS listener is private $container_ip:2049"
+      echo "+ prove 9P listener is private $container_ip:5564"
+      echo "+ prove NBD listener is private $container_ip:10809"
+      echo "+ prove WebUI listener is private $container_ip:8080 and rejects wildcard/public binds"
+    fi
+    return 0
+  fi
+  listeners=$(pct exec "$ctid" -- ss -H -lnt)
+  grep -Fq "$container_ip:9567" <<<"$listeners"
+  grep -Fq "$container_ip:2049" <<<"$listeners"
+  if [[ $profile == maintenance ]]; then
+    if grep -Eq '(^|[[:space:]])[^[:space:]]*:(5564|10809|8080|445)([[:space:]]|$)' <<<"$listeners"; then
+      echo "non-NFS production listener escaped maintenance mode" >&2
+      return 1
+    fi
+  else
+    grep -Fq "$container_ip:5564" <<<"$listeners"
+    grep -Fq "$container_ip:10809" <<<"$listeners"
+    grep -Fq "$container_ip:8080" <<<"$listeners"
+    if [[ $has_smb == true ]]; then
+      grep -Fq "$container_ip:445" <<<"$listeners"
+    elif grep -Eq "(^|[[:space:]])$container_ip:445([[:space:]]|$)" <<<"$listeners"; then
+      echo "SMB remained active in NFS-only mode" >&2
+      return 1
+    fi
+  fi
+  if grep -Eq '(^|[[:space:]])(0\.0\.0\.0|\[::\]):(10809|9567|2049|5564|445|8080)([[:space:]]|$)' <<<"$listeners"; then
+    echo "ZeroFS listener escaped the private container address" >&2
+    return 1
+  fi
+}
+
 control_host_transaction() {
   if [[ $dry_run == true ]]; then
     echo "+ $action host deployment transaction $deployment_transaction"
     if [[ $action == rollback ]]; then
       echo "+ restore previous release and exact CT resources before restarting services"
+    elif [[ $action == promote ]]; then
+      echo "+ prove full private production listeners"
     fi
     return 0
   fi
@@ -531,11 +595,6 @@ control_host_transaction() {
     echo "missing deployment transaction: $deployment_transaction" >&2
     return 1
   }
-  if [[ $action == commit ]]; then
-    rm -rf -- "$deployment_transaction"
-    sync -f "$state_root"
-    return 0
-  fi
   [[ -f $deployment_transaction/state.env && -f $deployment_transaction/previous-release && -f $deployment_transaction/phase ]] || {
     echo "incomplete deployment transaction: $deployment_transaction" >&2
     return 1
@@ -546,6 +605,48 @@ control_host_transaction() {
   if [[ $action != recover && $saved_release_id != "$release_id" ]]; then
     echo "deployment transaction belongs to release $saved_release_id" >&2
     return 1
+  fi
+  phase=$(<"$deployment_transaction/phase")
+  if [[ $action == commit ]]; then
+    [[ $phase == activated ]] || {
+      echo "deployment transaction is not activated: $phase" >&2
+      return 1
+    }
+    rm -rf -- "$deployment_transaction"
+    sync -f "$state_root"
+    return 0
+  fi
+  if [[ $action == promote ]]; then
+    [[ $phase == maintenance ]] || {
+      echo "deployment transaction is not in maintenance mode: $phase" >&2
+      return 1
+    }
+    [[ -f $stage/zerofs.toml ]] || {
+      echo "promotion requires staged full zerofs.toml" >&2
+      return 1
+    }
+    assert_prod_nfs_quiesced
+    set_host_transaction_phase promoting
+    install -o 100000 -g 100000 -m 0600 "$stage/zerofs.toml" "$state_root/current/zerofs.toml"
+    sync -f "$state_root/current/zerofs.toml"
+    pct exec "$ctid" -- systemctl restart zerofs-lxc.service
+    wait_for_zerofs
+    assert_runtime_listeners full
+    config_sha=$(sha256sum "$stage/zerofs.toml" | awk '{print $1}')
+    receipt="$state_root/receipts/$release_id"
+    temporary_receipt="$receipt.promote.$$"
+    awk -v value="$config_sha" '
+      BEGIN { replaced=0 }
+      /^config_sha256=/ { print "config_sha256=" value; replaced=1; next }
+      { print }
+      END { if (!replaced) print "config_sha256=" value }
+    ' "$receipt" >"$temporary_receipt"
+    chmod 0600 "$temporary_receipt"
+    sync -f "$temporary_receipt"
+    mv -f -- "$temporary_receipt" "$receipt"
+    sync -f "$state_root/receipts"
+    set_host_transaction_phase activated
+    return 0
   fi
   action=rollback
   previous_release=$(<"$deployment_transaction/previous-release")
@@ -706,7 +807,7 @@ graceful_stop() {
   fi
 }
 
-if [[ $action == commit || $action == rollback || $action == recover ]]; then
+if [[ $action == promote || $action == commit || $action == rollback || $action == recover ]]; then
   control_host_transaction
   exit 0
 fi
@@ -960,25 +1061,7 @@ run pct exec "$ctid" -- systemctl daemon-reload
 run pct exec "$ctid" -- systemctl enable zerofs-lxc.service
 run pct exec "$ctid" -- systemctl restart zerofs-lxc.service
 
-if [[ $dry_run == true ]]; then
-  echo "+ wait up to 180s for private $role listeners and services"
-  if [[ $role == prod ]]; then
-    echo "+ prove NFS listener is private $container_ip:2049"
-    echo "+ prove 9P listener is private $container_ip:5564"
-    echo "+ prove NBD listener is private $container_ip:10809"
-    echo "+ prove WebUI listener is private $container_ip:8080 and rejects wildcard/public binds"
-  fi
-else
-  deadline=$((SECONDS + 180))
-  until pct exec "$ctid" -- systemctl is-active --quiet zerofs-lxc.service \
-    && curl --fail --silent --show-error --max-time 5 "http://$container_ip:9567/metrics" >/dev/null; do
-    ((SECONDS < deadline)) || {
-      pct exec "$ctid" -- journalctl -u zerofs-lxc.service --no-pager -n 100 >&2
-      false
-    }
-    sleep 1
-  done
-fi
+wait_for_zerofs
 run pct exec "$ctid" -- systemctl is-active --quiet zerofs-lxc.service
 if [[ $has_smb == true ]]; then
   run pct exec "$ctid" -- systemctl enable zerofs-lxc-mount.service smbd.service
@@ -992,27 +1075,22 @@ elif [[ $role == prod && $dry_run == false ]]; then
   pct exec "$ctid" -- sh -c \
     'systemctl disable --now smbd.service zerofs-lxc-mount.service >/dev/null 2>&1 || true'
 fi
-if [[ $dry_run == false ]]; then
+if [[ $role == prod ]]; then
+  if [[ $maintenance_nfs_only == true ]]; then
+    assert_runtime_listeners maintenance
+  else
+    assert_runtime_listeners full
+  fi
+elif [[ $dry_run == false ]]; then
   listeners=$(pct exec "$ctid" -- ss -H -lnt)
   grep -Fq "$container_ip:9567" <<<"$listeners"
-  if [[ $role == dev ]]; then
-    grep -Fq "$container_ip:10809" <<<"$listeners"
-  else
-    grep -Fq "$container_ip:2049" <<<"$listeners"
-    grep -Fq "$container_ip:5564" <<<"$listeners"
-    grep -Fq "$container_ip:10809" <<<"$listeners"
-    grep -Fq "$container_ip:8080" <<<"$listeners"
-    if [[ $has_smb == true ]]; then
-      grep -Fq "$container_ip:445" <<<"$listeners"
-    elif grep -Eq "(^|[[:space:]])$container_ip:445([[:space:]]|$)" <<<"$listeners"; then
-      echo "SMB remained active in NFS-only mode" >&2
-      false
-    fi
-  fi
-  if grep -Eq '(^|[[:space:]])(0\.0\.0\.0|\[::\]):(10809|9567|2049|5564|445|8080)([[:space:]]|$)' <<<"$listeners"; then
+  grep -Fq "$container_ip:10809" <<<"$listeners"
+  if grep -Eq '(^|[[:space:]])(0\.0\.0\.0|\[::\]):(10809|9567)([[:space:]]|$)' <<<"$listeners"; then
     echo "ZeroFS listener escaped the private container address" >&2
     false
   fi
+fi
+if [[ $dry_run == false ]]; then
   running_sha=$(pct exec "$ctid" -- sha256sum /srv/zerofs-persist/current/zerofs | awk '{print $1}')
   [[ $running_sha == "$binary_sha" ]]
 fi
@@ -1021,7 +1099,11 @@ echo "deployed_commit=$commit"
 echo "binary_sha256=$binary_sha"
 echo "persistent_state=$state_root"
 if [[ $defer_commit == true ]]; then
-  set_host_transaction_phase activated
+  if [[ $maintenance_nfs_only == true ]]; then
+    set_host_transaction_phase maintenance
+  else
+    set_host_transaction_phase activated
+  fi
   echo "deferred_transaction=$deployment_transaction"
 fi
 [[ -z $ct_resource_snapshot ]] || rm -f -- "$ct_resource_snapshot"

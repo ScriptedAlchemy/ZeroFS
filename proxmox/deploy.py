@@ -405,6 +405,29 @@ def validate_server_config(
     return storage_url
 
 
+def render_nfs_bootstrap_config(source: str) -> str:
+    excluded = ("servers.ninep", "servers.nbd", "servers.webui")
+    rendered: list[str] = []
+    keep = True
+    for line in source.splitlines(keepends=True):
+        match = re.match(r"^\s*\[([^]]+)]\s*(?:#.*)?$", line)
+        if match:
+            table = match.group(1)
+            keep = not any(
+                table == prefix or table.startswith(f"{prefix}.") for prefix in excluded
+            )
+        if keep:
+            rendered.append(line)
+    result = "".join(rendered)
+    parsed = tomllib.loads(result)
+    servers = parsed.get("servers")
+    if not isinstance(servers, dict) or set(servers) != {"nfs", "rpc"}:
+        raise ValueError("NFS bootstrap config must contain only NFS and RPC servers")
+    if "prometheus" not in parsed:
+        raise ValueError("NFS bootstrap config requires Prometheus health checks")
+    return result
+
+
 def require_replace_confirmation(ctid: int, confirmation: str | None) -> None:
     if confirmation != str(ctid):
         raise ValueError(
@@ -944,6 +967,8 @@ def _stage_and_run_host(
     release: str,
     *,
     defer_commit: bool = False,
+    config_path: Path | None = None,
+    maintenance_nfs_only: bool = False,
 ) -> None:
     bundle = Path(__file__).resolve().parent
     stage = f"/var/tmp/zerofs-lxc-deploy-{args.ctid}-{commit[:12]}"
@@ -958,7 +983,7 @@ def _stage_and_run_host(
     else:
         files = (
             (binary, "zerofs"),
-            (args.config, "zerofs.toml"),
+            (config_path or args.config, "zerofs.toml"),
             (bundle / "host-deploy.sh", "host-deploy.sh"),
             (bundle / "hooks" / "zerofs-lxc-hook.sh", "zerofs-lxc-hook.sh"),
             (bundle / "systemd" / "zerofs-lxc.service", "zerofs-lxc.service"),
@@ -1028,6 +1053,8 @@ def _stage_and_run_host(
         host_args.append("--dry-run")
     if defer_commit:
         host_args.append("--defer-commit")
+    if maintenance_nfs_only:
+        host_args.append("--maintenance-nfs-only")
     if args.action == "replace":
         host_args.extend(["--confirm-replace", str(args.ctid)])
     try:
@@ -1049,7 +1076,7 @@ def _run_host_deployment_control(
     namespace: str,
     release: str,
 ) -> None:
-    if action not in {"commit", "rollback", "recover"}:
+    if action not in {"promote", "commit", "rollback", "recover"}:
         raise ValueError(f"invalid host deployment control: {action}")
     bundle = Path(__file__).resolve().parent
     stage = f"/var/tmp/zerofs-lxc-control-{args.ctid}-{release}"
@@ -1068,6 +1095,15 @@ def _run_host_deployment_control(
                 f"{args.pve_host}:{remote_script}",
             ]
         )
+        if action == "promote":
+            runner.run(
+                [
+                    "scp",
+                    "-q",
+                    str(args.config),
+                    f"{args.pve_host}:{stage}/zerofs.toml",
+                ]
+            )
         host_args = [
             "bash",
             remote_script,
@@ -1174,6 +1210,9 @@ def _run_prod_vm_nfs_transaction(
     commit_host: Callable[[], None],
     rollback_host: Callable[[], None],
     recover_host: Callable[[], None],
+    *,
+    activate_maintenance: Callable[[], None] | None = None,
+    promote_host: Callable[[], None] | None = None,
 ) -> None:
     bundle = Path(__file__).resolve().parent
     helper = bundle / "vm_nfs_transition.py"
@@ -1188,6 +1227,7 @@ def _run_prod_vm_nfs_transaction(
     prepared = False
     host_activated = False
     ownership_requires_post_mount_proof = False
+    legacy_bindfs = False
     failure: BaseException | None = None
 
     def action(name: str, *extra: str) -> None:
@@ -1250,8 +1290,12 @@ def _run_prod_vm_nfs_transaction(
             receipt_output = guest_action("preflight")
             if not runner.dry_run:
                 receipt = parse_shared_namespace_ownership_receipt(receipt_output)
-                if not receipt.verified and receipt.reason == "mount_unavailable":
+                if not receipt.verified and receipt.reason in {
+                    "mount_unavailable",
+                    "legacy_topology",
+                }:
                     ownership_requires_post_mount_proof = True
+                    legacy_bindfs = receipt.reason == "legacy_topology"
                 else:
                     validate_shared_namespace_ownership(receipt)
             else:
@@ -1259,23 +1303,36 @@ def _run_prod_vm_nfs_transaction(
                     "+ if the managed mount is initially unavailable, repeat the "
                     "ownership proof after the new server is mounted"
                 )
-            action(
-                "prepare",
+            prepare_args = [
                 "--staged-unit",
                 remote_unit,
                 "--expected-source",
                 f"{args.container_ip}:/",
-            )
+            ]
+            if legacy_bindfs:
+                prepare_args.append("--allow-legacy-bindfs")
+            action("prepare", *prepare_args)
             prepared = True
             action("quiesce")
-            activate_host()
+            if ownership_requires_post_mount_proof:
+                if activate_maintenance is None or promote_host is None:
+                    raise RuntimeError(
+                        "bootstrap ownership proof requires NFS-only activation and promotion"
+                    )
+                activate_maintenance()
+            else:
+                activate_host()
             host_activated = True
             guest_action("reconcile")
+            action("reconcile")
             if ownership_requires_post_mount_proof:
                 validate_shared_namespace_ownership(
                     parse_shared_namespace_ownership_receipt(guest_action("preflight"))
                 )
-            action("reconcile")
+                action("quiesce")
+                promote_host()
+                guest_action("reconcile")
+                action("reconcile")
             action("commit")
             prepared = False
             commit_host()
@@ -1499,6 +1556,23 @@ def main(argv: Sequence[str] | None = None) -> int:
             defer_commit=args.role == "prod",
         )
 
+    def activate_maintenance() -> None:
+        with tempfile.TemporaryDirectory(prefix="zerofs-nfs-bootstrap-") as directory:
+            bootstrap = Path(directory) / "zerofs.toml"
+            bootstrap.write_text(render_nfs_bootstrap_config(args.config.read_text()))
+            _stage_and_run_host(
+                runner,
+                args,
+                binary,
+                commit,
+                binary_hash,
+                namespace,
+                release,
+                defer_commit=True,
+                config_path=bootstrap,
+                maintenance_nfs_only=True,
+            )
+
     def control_host(action: str) -> None:
         _run_host_deployment_control(
             runner,
@@ -1519,6 +1593,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             lambda: control_host("commit"),
             lambda: control_host("rollback"),
             lambda: control_host("recover"),
+            activate_maintenance=activate_maintenance,
+            promote_host=lambda: control_host("promote"),
         )
     else:
         activate_host()
