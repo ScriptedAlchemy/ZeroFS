@@ -498,7 +498,11 @@ async fn shipping_scheduler_terminally_drains_cleanup_failure_without_retry() {
     assert!(
         error
             .to_string()
-            .contains("multipart cancellation cleanup failed")
+            .contains("remote multipart cleanup failed")
+            && error
+                .to_string()
+                .contains("injected multipart abort failure"),
+        "unexpected terminal error: {error}"
     );
     let shutdown = tokio::time::timeout(Duration::from_secs(3), scheduler.shutdown())
         .await
@@ -507,7 +511,11 @@ async fn shipping_scheduler_terminally_drains_cleanup_failure_without_retry() {
     assert!(
         shutdown
             .to_string()
-            .contains("multipart cancellation cleanup failed")
+            .contains("remote multipart cleanup failed")
+            && shutdown
+                .to_string()
+                .contains("injected multipart abort failure"),
+        "unexpected shutdown error: {shutdown}"
     );
     assert_eq!(store.multipart_calls.load(Ordering::SeqCst), 2);
     assert_eq!(failed_aborts.load(Ordering::SeqCst), 2);
