@@ -329,7 +329,10 @@ impl Default for SftpConfig {
 
 impl SftpConfig {
     pub const MAX_ACCOUNT_CONNECTIONS: usize = 8;
-    pub const MAX_DIRECTION_CONCURRENCY: usize = 7;
+    // Operations multiplex onto pooled connections, so per-direction
+    // concurrency may exceed max_connections; the transport still caps how
+    // many operations share one connection.
+    pub const MAX_DIRECTION_CONCURRENCY: usize = 64;
 
     fn validate(&self) -> Result<()> {
         if self.identity_file.to_string_lossy().trim().is_empty() {
@@ -354,12 +357,6 @@ impl SftpConfig {
                 anyhow::bail!(
                     "[sftp] {name} must be between 1 and {}",
                     Self::MAX_DIRECTION_CONCURRENCY
-                );
-            }
-            if value > self.max_connections {
-                anyhow::bail!(
-                    "[sftp] {name} ({value}) must not exceed max_connections ({})",
-                    self.max_connections
                 );
             }
         }
@@ -412,7 +409,10 @@ impl SftpConfig {
     pub fn data_profile(&self) -> SftpDataProfile {
         SftpDataProfile {
             segment_size_bytes: self.segment_size_mib * 1024 * 1024,
-            max_inflight_seals: self.write_concurrency,
+            // Each in-flight seal buffers a full segment; cap the coupling to
+            // write_concurrency so raising SFTP operation concurrency does
+            // not silently multiply segment-buffer memory.
+            max_inflight_seals: self.write_concurrency.min(8),
             read_cache_part_size_bytes: self.read_cache_part_size_kib * 1024,
             read_fetch_window_min_bytes: self.read_cache_part_size_kib * 1024,
             read_fetch_window_max_bytes: self.segment_size_mib * 1024 * 1024,

@@ -129,6 +129,20 @@ const SFTP_SHUTDOWN_CLEANUP_GRACE: Duration = Duration::from_secs(10);
 const SFTP_DIAL_BACKOFF_BASE: Duration = Duration::from_millis(100);
 const SFTP_DIAL_BACKOFF_MAX: Duration = Duration::from_secs(5);
 const SFTP_DIRECTORY_CACHE_MAX_ENTRIES: usize = 64 * 1024;
+/// Maximum operations multiplexed onto one SSH session. The SFTP layer
+/// pipelines up to 64 outstanding requests per session, so a handful of
+/// concurrent operations sharing one connection hide the WAN RTT instead of
+/// serializing on it; the cap keeps one session's request window and remote
+/// handle usage bounded.
+const SFTP_SESSION_MAX_CONCURRENT_OPS: usize = 16;
+
+/// Concurrent metadata operations admitted across the pool. Metadata requests
+/// move no payload, so their cost is one WAN round trip each; without a
+/// budget of their own a GC or cleanup storm of single-round-trip calls
+/// would either starve or be starved by bulk transfers.
+fn metadata_admission_limit(connections: usize) -> usize {
+    (connections * 8).min(64)
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum TransportError {
@@ -182,7 +196,7 @@ pub struct RemoteObjectRead {
 pub trait TransportSession: fmt::Debug + Send + Sync + 'static {
     fn capabilities(&self) -> SftpCapabilities;
     async fn read_object(
-        &mut self,
+        &self,
         _path: &std::path::Path,
         _range: Option<object_store::GetRange>,
         _head: bool,
@@ -192,20 +206,20 @@ pub trait TransportSession: fmt::Debug + Send + Sync + 'static {
         ))
     }
     async fn list_directory(
-        &mut self,
+        &self,
         _path: &std::path::Path,
     ) -> Result<Vec<RemoteDirectoryEntry>, TransportError> {
         Err(TransportError::Operation(
             "list_directory is not implemented by this session".to_owned(),
         ))
     }
-    async fn remove_file(&mut self, _path: &std::path::Path) -> Result<(), TransportError> {
+    async fn remove_file(&self, _path: &std::path::Path) -> Result<(), TransportError> {
         Err(TransportError::Operation(
             "remove_file is not implemented by this session".to_owned(),
         ))
     }
     async fn ensure_directory_component(
-        &mut self,
+        &self,
         _path: &std::path::Path,
     ) -> Result<(), TransportError> {
         Err(TransportError::Operation(
@@ -213,7 +227,7 @@ pub trait TransportSession: fmt::Debug + Send + Sync + 'static {
         ))
     }
     async fn write_file_durable(
-        &mut self,
+        &self,
         _path: &std::path::Path,
         _chunks: Vec<Bytes>,
     ) -> Result<(), TransportError> {
@@ -222,7 +236,7 @@ pub trait TransportSession: fmt::Debug + Send + Sync + 'static {
         ))
     }
     async fn write_file_at_durable(
-        &mut self,
+        &self,
         _path: &std::path::Path,
         _offset: u64,
         _chunks: Vec<Bytes>,
@@ -232,7 +246,7 @@ pub trait TransportSession: fmt::Debug + Send + Sync + 'static {
         ))
     }
     async fn write_file_at(
-        &mut self,
+        &self,
         _path: &std::path::Path,
         _offset: u64,
         _chunks: Vec<Bytes>,
@@ -242,7 +256,7 @@ pub trait TransportSession: fmt::Debug + Send + Sync + 'static {
         ))
     }
     async fn read_exact(
-        &mut self,
+        &self,
         _path: &std::path::Path,
         _offset: u64,
         _len: usize,
@@ -252,7 +266,7 @@ pub trait TransportSession: fmt::Debug + Send + Sync + 'static {
         ))
     }
     async fn hard_link(
-        &mut self,
+        &self,
         _from: &std::path::Path,
         _to: &std::path::Path,
     ) -> Result<(), TransportError> {
@@ -261,7 +275,7 @@ pub trait TransportSession: fmt::Debug + Send + Sync + 'static {
         ))
     }
     async fn posix_rename(
-        &mut self,
+        &self,
         _from: &std::path::Path,
         _to: &std::path::Path,
     ) -> Result<(), TransportError> {
@@ -269,7 +283,7 @@ pub trait TransportSession: fmt::Debug + Send + Sync + 'static {
             "posix_rename is not implemented by this session".to_owned(),
         ))
     }
-    async fn close(self: Box<Self>, force: CancellationToken) -> Result<(), TransportError>;
+    async fn close(&self, force: CancellationToken) -> Result<(), TransportError>;
 }
 
 #[async_trait]
@@ -286,9 +300,10 @@ struct FairAdmission {
 }
 
 struct AdmissionInner {
-    shared_limit: usize,
+    total_limit: usize,
     read_limit: usize,
     write_limit: usize,
+    metadata_limit: usize,
     next_id: AtomicU64,
     state: StdMutex<AdmissionState>,
 }
@@ -297,8 +312,15 @@ struct AdmissionInner {
 struct AdmissionState {
     active_reads: usize,
     active_writes: usize,
+    active_metadata: usize,
     waiters: VecDeque<AdmissionWaiter>,
     closed: bool,
+}
+
+impl AdmissionState {
+    fn active_total(&self) -> usize {
+        self.active_reads + self.active_writes + self.active_metadata
+    }
 }
 
 struct AdmissionWaiter {
@@ -314,12 +336,18 @@ struct OperationAdmission {
 }
 
 impl FairAdmission {
-    fn new(shared_limit: usize, read_limit: usize, write_limit: usize) -> Self {
+    fn new(
+        total_limit: usize,
+        read_limit: usize,
+        write_limit: usize,
+        metadata_limit: usize,
+    ) -> Self {
         Self {
             inner: Arc::new(AdmissionInner {
-                shared_limit,
+                total_limit,
                 read_limit,
                 write_limit,
+                metadata_limit,
                 next_id: AtomicU64::new(0),
                 state: StdMutex::new(AdmissionState::default()),
             }),
@@ -353,7 +381,7 @@ impl FairAdmission {
         if state.closed {
             return;
         }
-        while state.active_reads + state.active_writes < self.inner.shared_limit {
+        while state.active_total() < self.inner.total_limit {
             let writes_waiting = state
                 .waiters
                 .iter()
@@ -362,7 +390,7 @@ impl FairAdmission {
             // writes up to their configured ceiling when that ceiling reserves
             // shared capacity for reads. Once writeback empties, reads
             // immediately expand to their own configured ceiling.
-            let write_reserves_opposite_slot = self.inner.write_limit < self.inner.shared_limit;
+            let write_reserves_opposite_slot = self.inner.write_limit < self.inner.total_limit;
             let preferred_write = (writes_waiting && write_reserves_opposite_slot).then(|| {
                 state.waiters.iter().position(|waiter| {
                     waiter.kind == OperationKind::Write && self.can_admit(state, waiter.kind)
@@ -393,10 +421,9 @@ impl FairAdmission {
 
     fn can_admit(&self, state: &AdmissionState, kind: OperationKind) -> bool {
         let (active, configured_limit) = match kind {
-            OperationKind::Read | OperationKind::Metadata => {
-                (state.active_reads, self.inner.read_limit)
-            }
+            OperationKind::Read => (state.active_reads, self.inner.read_limit),
             OperationKind::Write => (state.active_writes, self.inner.write_limit),
+            OperationKind::Metadata => (state.active_metadata, self.inner.metadata_limit),
         };
         active < configured_limit
     }
@@ -429,15 +456,17 @@ impl FairAdmission {
 
 fn increment_active(state: &mut AdmissionState, kind: OperationKind) {
     match kind {
-        OperationKind::Read | OperationKind::Metadata => state.active_reads += 1,
+        OperationKind::Read => state.active_reads += 1,
         OperationKind::Write => state.active_writes += 1,
+        OperationKind::Metadata => state.active_metadata += 1,
     }
 }
 
 fn decrement_active(state: &mut AdmissionState, kind: OperationKind) {
     match kind {
-        OperationKind::Read | OperationKind::Metadata => state.active_reads -= 1,
+        OperationKind::Read => state.active_reads -= 1,
         OperationKind::Write => state.active_writes -= 1,
+        OperationKind::Metadata => state.active_metadata -= 1,
     }
 }
 
@@ -464,59 +493,46 @@ impl Drop for OperationAdmission {
     }
 }
 
-struct PhysicalSession {
-    transport: Option<Box<dyn TransportSession>>,
-    lifetime: Option<OwnedSemaphorePermit>,
-    idle_since: Instant,
-    pool: Weak<PoolInner>,
+/// One SSH connection shared by up to [`SFTP_SESSION_MAX_CONCURRENT_OPS`]
+/// concurrent operations. The underlying transport pipelines independent
+/// requests, so sharing multiplies small-operation throughput per connection
+/// instead of serializing every operation on one WAN round trip at a time.
+struct SharedSession {
+    transport: Arc<dyn TransportSession>,
+    // Dropped only after the transport finished closing, so a redial cannot
+    // race the remote server still counting the old session against its cap.
+    lifetime: StdMutex<Option<OwnedSemaphorePermit>>,
+    active_ops: AtomicUsize,
+    active_writes: AtomicUsize,
+    broken: AtomicBool,
+    // Whoever swaps this to true owns the close; releases and reapers race
+    // for it once a session must go away.
+    closing: AtomicBool,
+    idle_since: StdMutex<Instant>,
 }
 
-impl PhysicalSession {
-    fn take_parts(&mut self) -> (Box<dyn TransportSession>, OwnedSemaphorePermit) {
-        (
-            self.transport
-                .take()
-                .expect("physical session transport is taken exactly once"),
-            self.lifetime
-                .take()
-                .expect("physical session permit is taken exactly once"),
-        )
-    }
-
-    fn transport(&self) -> &dyn TransportSession {
-        self.transport
-            .as_deref()
-            .expect("leased physical session owns its transport")
-    }
-
-    fn transport_mut(&mut self) -> &mut dyn TransportSession {
-        self.transport
-            .as_deref_mut()
-            .expect("leased physical session owns its transport")
-    }
-}
-
-impl Drop for PhysicalSession {
-    fn drop(&mut self) {
-        let (Some(transport), Some(lifetime)) = (self.transport.take(), self.lifetime.take())
-        else {
-            return;
-        };
-        let Some(pool) = self.pool.upgrade() else {
-            drop(transport);
-            drop(lifetime);
-            return;
-        };
-        if tokio::runtime::Handle::try_current().is_ok() {
-            let cleanup_pool = pool.clone();
-            pool.tasks.spawn(async move {
-                let _ = cleanup_pool.close_parts(transport, lifetime).await;
-            });
-        } else {
-            pool.fail_closed();
-            drop(transport);
-            drop(lifetime);
+impl SharedSession {
+    fn new(transport: Arc<dyn TransportSession>, lifetime: OwnedSemaphorePermit) -> Self {
+        Self {
+            transport,
+            lifetime: StdMutex::new(Some(lifetime)),
+            active_ops: AtomicUsize::new(0),
+            active_writes: AtomicUsize::new(0),
+            broken: AtomicBool::new(false),
+            closing: AtomicBool::new(false),
+            idle_since: StdMutex::new(Instant::now()),
         }
+    }
+
+    fn take_lifetime(&self) -> Option<OwnedSemaphorePermit> {
+        self.lifetime.lock().unwrap().take()
+    }
+
+    fn claim(&self, kind: OperationKind) {
+        if kind == OperationKind::Write {
+            self.active_writes.fetch_add(1, Ordering::SeqCst);
+        }
+        self.active_ops.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -565,8 +581,8 @@ struct PoolInner {
     factory: Arc<dyn SessionFactory>,
     shared: Arc<Semaphore>,
     admission: FairAdmission,
-    idle: Mutex<VecDeque<PhysicalSession>>,
-    idle_available: Notify,
+    roster: StdMutex<Vec<Arc<SharedSession>>>,
+    roster_changed: Notify,
     directories: DirectoryCache,
     writable: bool,
     closed: AtomicBool,
@@ -628,22 +644,101 @@ impl PoolInner {
         self.session_shutdown.cancel();
         self.admission.close();
         self.shared.close();
-        self.idle_available.notify_waiters();
-        if tokio::runtime::Handle::try_current().is_ok() {
-            let pool = self.clone();
-            self.tasks.spawn(async move {
-                let idle = {
-                    let mut idle = pool.idle.lock().await;
-                    idle.drain(..).collect::<Vec<_>>()
-                };
-                for session in idle {
-                    let cleanup_pool = pool.clone();
-                    pool.tasks.spawn(async move {
-                        let _ = cleanup_pool.close_session(session).await;
-                    });
-                }
-            });
+        self.roster_changed.notify_waiters();
+        // Sessions with operations still in flight close when their last
+        // release observes the closed pool.
+        self.close_departing_sessions(self.drain_unused_sessions());
+    }
+
+    /// Removes every roster session that has no operation in flight and
+    /// returns them for closing.
+    fn drain_unused_sessions(self: &Arc<Self>) -> Vec<Arc<SharedSession>> {
+        let mut roster = self.roster.lock().unwrap();
+        let mut departing = Vec::new();
+        roster.retain(|session| {
+            if session.active_ops.load(Ordering::SeqCst) == 0 {
+                departing.push(session.clone());
+                false
+            } else {
+                true
+            }
+        });
+        departing
+    }
+
+    fn close_departing_sessions(self: &Arc<Self>, departing: Vec<Arc<SharedSession>>) {
+        if departing.is_empty() {
+            return;
         }
+        if tokio::runtime::Handle::try_current().is_ok() {
+            for session in departing {
+                let pool = self.clone();
+                self.tasks.spawn(async move {
+                    let _ = pool.close_shared_session(session).await;
+                });
+            }
+        } else {
+            // No runtime to run the graceful close; dropping the transport
+            // still tears the connection down via its Drop.
+            for session in departing {
+                if !session.closing.swap(true, Ordering::SeqCst) {
+                    drop(session.take_lifetime());
+                }
+            }
+        }
+    }
+
+    /// Closes a session removed from the roster. Exactly one caller wins the
+    /// `closing` flag; late duplicates (a release racing the reaper) are
+    /// no-ops.
+    async fn close_shared_session(
+        self: &Arc<Self>,
+        session: Arc<SharedSession>,
+    ) -> Result<(), TransportError> {
+        if session.closing.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
+        let lifetime = session.take_lifetime();
+        let result = self.close_owned(session.transport.clone(), lifetime).await;
+        self.roster_changed.notify_waiters();
+        result
+    }
+
+    /// Called when a lease finishes with its session. Broken sessions leave
+    /// the roster immediately so no new operation lands on them; the close
+    /// itself waits for the last in-flight operation.
+    fn release_session(self: &Arc<Self>, session: &Arc<SharedSession>, kind: OperationKind) {
+        if kind == OperationKind::Write {
+            session.active_writes.fetch_sub(1, Ordering::SeqCst);
+        }
+        let remaining = session.active_ops.fetch_sub(1, Ordering::SeqCst) - 1;
+        let broken = session.broken.load(Ordering::SeqCst);
+        if broken {
+            self.remove_from_roster(session);
+        }
+        if remaining == 0 {
+            *session.idle_since.lock().unwrap() = Instant::now();
+            if broken || self.closed.load(Ordering::SeqCst) {
+                self.remove_from_roster(session);
+                if tokio::runtime::Handle::try_current().is_ok() {
+                    let pool = self.clone();
+                    let session = session.clone();
+                    self.tasks.spawn(async move {
+                        let _ = pool.close_shared_session(session).await;
+                    });
+                } else if !session.closing.swap(true, Ordering::SeqCst) {
+                    self.fail_closed();
+                    drop(session.take_lifetime());
+                }
+                return;
+            }
+        }
+        self.roster_changed.notify_waiters();
+    }
+
+    fn remove_from_roster(&self, session: &Arc<SharedSession>) {
+        let mut roster = self.roster.lock().unwrap();
+        roster.retain(|entry| !Arc::ptr_eq(entry, session));
     }
 
     fn register_activity(self: &Arc<Self>) -> Result<PoolActivity, TransportError> {
@@ -692,24 +787,16 @@ impl PoolInner {
         }
     }
 
-    async fn close_parts(
-        self: &Arc<Self>,
-        transport: Box<dyn TransportSession>,
-        lifetime: OwnedSemaphorePermit,
-    ) -> Result<(), TransportError> {
-        self.close_owned(transport, Some(lifetime)).await
-    }
-
     async fn close_transport(
         self: &Arc<Self>,
-        transport: Box<dyn TransportSession>,
+        transport: Arc<dyn TransportSession>,
     ) -> Result<(), TransportError> {
         self.close_owned(transport, None).await
     }
 
     async fn close_owned(
         self: &Arc<Self>,
-        transport: Box<dyn TransportSession>,
+        transport: Arc<dyn TransportSession>,
         lifetime: Option<OwnedSemaphorePermit>,
     ) -> Result<(), TransportError> {
         let (sender, receiver) = oneshot::channel();
@@ -770,33 +857,30 @@ impl PoolInner {
         }
     }
 
-    async fn close_session(
-        self: &Arc<Self>,
-        mut session: PhysicalSession,
-    ) -> Result<(), TransportError> {
-        let (transport, lifetime) = session.take_parts();
-        self.close_parts(transport, lifetime).await
-    }
-
     async fn reap_expired_idle(self: &Arc<Self>) {
         let expired = {
             let now = Instant::now();
-            let mut idle = self.idle.lock().await;
+            let mut roster = self.roster.lock().unwrap();
             let mut expired = Vec::new();
-            while idle.len() > SFTP_IDLE_WARM_FLOOR
-                && idle.front().is_some_and(|session| {
-                    now.saturating_duration_since(session.idle_since) >= SFTP_IDLE_TIMEOUT
-                })
-            {
-                expired.push(idle.pop_front().expect("idle front checked above"));
-            }
+            let mut retained = roster.len();
+            roster.retain(|session| {
+                let expirable = retained > SFTP_IDLE_WARM_FLOOR
+                    && session.active_ops.load(Ordering::SeqCst) == 0
+                    && now.saturating_duration_since(*session.idle_since.lock().unwrap())
+                        >= SFTP_IDLE_TIMEOUT;
+                if expirable {
+                    retained -= 1;
+                    expired.push(session.clone());
+                }
+                !expirable
+            });
             expired
         };
 
         for session in expired {
             let inner = self.clone();
             self.tasks.spawn(async move {
-                let _ = inner.close_session(session).await;
+                let _ = inner.close_shared_session(session).await;
             });
         }
     }
@@ -923,9 +1007,14 @@ impl SftpSessionPool {
             inner: Arc::new(PoolInner {
                 factory,
                 shared: Arc::new(Semaphore::new(shared)),
-                admission: FairAdmission::new(shared, reads, writes),
-                idle: Mutex::new(VecDeque::new()),
-                idle_available: Notify::new(),
+                admission: FairAdmission::new(
+                    shared * SFTP_SESSION_MAX_CONCURRENT_OPS,
+                    reads,
+                    writes,
+                    metadata_admission_limit(shared),
+                ),
+                roster: StdMutex::new(Vec::new()),
+                roster_changed: Notify::new(),
                 directories: DirectoryCache::default(),
                 writable: true,
                 closed: AtomicBool::new(false),
@@ -946,7 +1035,7 @@ impl SftpSessionPool {
         };
 
         let session = pool.open_physical().await?;
-        pool.inner.idle.lock().await.push_back(session);
+        pool.inner.roster.lock().unwrap().push(session);
         pool.start_idle_reaper();
         Ok(pool)
     }
@@ -977,15 +1066,14 @@ impl SftpSessionPool {
                 "shared sessions must be between 1 and 8".to_owned(),
             ));
         }
+        // Operations multiplex onto shared sessions, so per-kind concurrency
+        // may exceed the connection count; the per-session cap still bounds
+        // what one connection carries.
+        let concurrency_ceiling = shared * SFTP_SESSION_MAX_CONCURRENT_OPS;
         for (name, value) in [("read", reads), ("write", writes)] {
-            if !(1..=7).contains(&value) {
+            if value == 0 || value > concurrency_ceiling {
                 return Err(TransportError::InvalidLimits(format!(
-                    "{name} sessions must be between 1 and 7"
-                )));
-            }
-            if value > shared {
-                return Err(TransportError::InvalidLimits(format!(
-                    "{name} sessions must not exceed shared sessions"
+                    "{name} concurrency must be between 1 and {concurrency_ceiling}"
                 )));
             }
         }
@@ -996,10 +1084,11 @@ impl SftpSessionPool {
         let admission = self.inner.admission.acquire(kind).await?;
         let activity = self.inner.register_activity()?;
 
-        let session = self.checkout_physical().await?;
+        let session = self.acquire_session(kind).await?;
         Ok(SessionLease {
             pool: self.inner.clone(),
             session: Some(session),
+            kind,
             admission: Some(admission),
             activity: Some(activity),
         })
@@ -1043,16 +1132,9 @@ impl SftpSessionPool {
         let inner = self.inner.clone();
         let drain = async move {
             inner.wait_for_activity_drain().await;
-            let idle = {
-                let mut idle = inner.idle.lock().await;
-                idle.drain(..).collect::<Vec<_>>()
-            };
-            for session in idle {
-                let cleanup_pool = inner.clone();
-                inner.tasks.spawn(async move {
-                    let _ = cleanup_pool.close_session(session).await;
-                });
-            }
+            // After the activity drain no operation is in flight, so this
+            // removes every remaining session.
+            inner.close_departing_sessions(inner.drain_unused_sessions());
             inner.tasks.close();
             inner.tasks.wait().await;
             inner.cleanup_tasks.close();
@@ -1072,26 +1154,106 @@ impl SftpSessionPool {
         }
     }
 
-    async fn checkout_physical(&self) -> Result<PhysicalSession, TransportError> {
+    /// Places one operation on a session. Prefers a fully idle session, then
+    /// dials a new connection while capacity remains, and only then stacks
+    /// the operation onto the least-loaded session below the per-session cap
+    /// so bulk transfers spread across connections before they share one.
+    async fn acquire_session(
+        &self,
+        kind: OperationKind,
+    ) -> Result<Arc<SharedSession>, TransportError> {
+        enum Placement {
+            Use(Arc<SharedSession>),
+            Dial(OwnedSemaphorePermit),
+            Wait,
+        }
         loop {
-            let idle_available = self.inner.idle_available.notified();
-            tokio::pin!(idle_available);
-            if let Some(session) = self.inner.idle.lock().await.pop_front() {
-                return Ok(session);
-            }
-
-            tokio::select! {
-                biased;
-                permit = self.inner.shared.clone().acquire_owned() => {
-                    let permit = permit.map_err(|_| TransportError::PoolClosed)?;
-                    return self.open_with_permit(permit).await;
+            let changed = self.inner.roster_changed.notified();
+            tokio::pin!(changed);
+            let placement = {
+                let roster = self.inner.roster.lock().unwrap();
+                if self.inner.closed.load(Ordering::SeqCst) {
+                    return Err(TransportError::PoolClosed);
                 }
-                () = &mut idle_available => {}
+                let candidate = roster
+                    .iter()
+                    .filter(|session| {
+                        !session.broken.load(Ordering::SeqCst)
+                            && session.active_ops.load(Ordering::SeqCst)
+                                < SFTP_SESSION_MAX_CONCURRENT_OPS
+                    })
+                    .min_by_key(|session| {
+                        let ops = session.active_ops.load(Ordering::SeqCst);
+                        match kind {
+                            OperationKind::Write => {
+                                (session.active_writes.load(Ordering::SeqCst), ops)
+                            }
+                            OperationKind::Read | OperationKind::Metadata => (ops, 0),
+                        }
+                    })
+                    .cloned();
+                match candidate {
+                    Some(session) if session.active_ops.load(Ordering::SeqCst) == 0 => {
+                        session.claim(kind);
+                        Placement::Use(session)
+                    }
+                    other => match self.inner.shared.clone().try_acquire_owned() {
+                        Ok(permit) => Placement::Dial(permit),
+                        Err(tokio::sync::TryAcquireError::Closed) => {
+                            return Err(TransportError::PoolClosed);
+                        }
+                        Err(tokio::sync::TryAcquireError::NoPermits) => match other {
+                            Some(session) => {
+                                session.claim(kind);
+                                Placement::Use(session)
+                            }
+                            None => Placement::Wait,
+                        },
+                    },
+                }
+            };
+            match placement {
+                Placement::Use(session) => return Ok(session),
+                Placement::Dial(permit) => {
+                    match self.open_with_permit(permit).await {
+                        Ok(session) => {
+                            session.claim(kind);
+                            self.inner.roster.lock().unwrap().push(session.clone());
+                            self.inner.roster_changed.notify_waiters();
+                            return Ok(session);
+                        }
+                        Err(error) => {
+                            // A busy session can still serve this operation;
+                            // only fail when nothing can carry it.
+                            let fallback = {
+                                let roster = self.inner.roster.lock().unwrap();
+                                let candidate = roster
+                                    .iter()
+                                    .filter(|session| {
+                                        !session.broken.load(Ordering::SeqCst)
+                                            && session.active_ops.load(Ordering::SeqCst)
+                                                < SFTP_SESSION_MAX_CONCURRENT_OPS
+                                    })
+                                    .min_by_key(|session| session.active_ops.load(Ordering::SeqCst))
+                                    .cloned();
+                                if let Some(session) = &candidate {
+                                    session.claim(kind);
+                                }
+                                candidate
+                            };
+                            match fallback {
+                                Some(session) => return Ok(session),
+                                None => return Err(error),
+                            }
+                        }
+                    }
+                }
+                Placement::Wait => changed.await,
             }
         }
     }
 
-    async fn open_physical(&self) -> Result<PhysicalSession, TransportError> {
+    async fn open_physical(&self) -> Result<Arc<SharedSession>, TransportError> {
         let permit = self
             .inner
             .shared
@@ -1105,7 +1267,7 @@ impl SftpSessionPool {
     async fn open_with_permit(
         &self,
         permit: OwnedSemaphorePermit,
-    ) -> Result<PhysicalSession, TransportError> {
+    ) -> Result<Arc<SharedSession>, TransportError> {
         // Serialize dials and pace them behind the shared failure backoff: a
         // backend at its concurrent-session cap kills excess SSH sessions,
         // and unpaced parallel redials from every retrying caller turn one
@@ -1143,7 +1305,7 @@ impl SftpSessionPool {
     async fn open_with_permit_unpaced(
         &self,
         permit: OwnedSemaphorePermit,
-    ) -> Result<PhysicalSession, TransportError> {
+    ) -> Result<Arc<SharedSession>, TransportError> {
         let inner = self.inner.clone();
         let factory = inner.factory.clone();
         let writable = inner.writable;
@@ -1157,14 +1319,10 @@ impl SftpSessionPool {
             tokio::pin!(opening);
             let result = tokio::select! {
                 result = &mut opening => result.map(|transport| {
-                    let session = PhysicalSession {
-                        transport: Some(transport),
-                        lifetime: permit.take(),
-                        idle_since: Instant::now(),
-                        pool: Arc::downgrade(&owner_pool),
-                    };
-                    debug_assert!(session.lifetime.is_some());
-                    session
+                    Arc::new(SharedSession::new(
+                        Arc::from(transport),
+                        permit.take().expect("open permit is taken exactly once"),
+                    ))
                 }),
                 _ = tokio::time::sleep(SFTP_SESSION_OPEN_TIMEOUT) => {
                     owner_pool.fail_closed();
@@ -1176,7 +1334,7 @@ impl SftpSessionPool {
                     force.cancel();
                     match opening.await {
                         Ok(transport) => {
-                            let _ = owner_pool.close_transport(transport).await;
+                            let _ = owner_pool.close_transport(Arc::from(transport)).await;
                         }
                         Err(error @ TransportError::Close(_)) => {
                             tracing::error!(%error, "SFTP opener cleanup failed after open timeout");
@@ -1198,7 +1356,7 @@ impl SftpSessionPool {
             }
             fail_closed_on_drop.disarm();
             if let Err(Ok(session)) = sender.send(result) {
-                let _ = owner_pool.close_session(session).await;
+                let _ = owner_pool.close_shared_session(session).await;
             }
         });
         let session = match receiver.await {
@@ -1210,9 +1368,9 @@ impl SftpSessionPool {
             }
         };
         if writable
-            && let Err(error) = require_publication_capabilities(session.transport().capabilities())
+            && let Err(error) = require_publication_capabilities(session.transport.capabilities())
         {
-            match self.inner.close_session(session).await {
+            match self.inner.close_shared_session(session).await {
                 Ok(()) => return Err(error),
                 Err(cleanup) => {
                     self.inner.fail_closed();
@@ -1260,7 +1418,8 @@ pub enum LeaseFinishError<E> {
 
 pub struct SessionLease {
     pool: Arc<PoolInner>,
-    session: Option<PhysicalSession>,
+    session: Option<Arc<SharedSession>>,
+    kind: OperationKind,
     admission: Option<OperationAdmission>,
     activity: Option<PoolActivity>,
 }
@@ -1284,14 +1443,15 @@ impl fmt::Debug for SessionLease {
 }
 
 impl SessionLease {
-    /// The leased session's transport. A lease owns its physical session from
-    /// checkout until `complete`/`retire`/drop takes it, so every request
-    /// method below can assume it is still present.
-    fn transport(&mut self) -> &mut dyn TransportSession {
+    /// The leased session's transport. A lease holds a claim on its shared
+    /// session from checkout until `complete`/`retire`/drop releases it, so
+    /// every request method below can assume it is still present.
+    fn transport(&mut self) -> &dyn TransportSession {
         self.session
-            .as_mut()
+            .as_ref()
             .expect("lease always owns a session until completion")
-            .transport_mut()
+            .transport
+            .as_ref()
     }
 
     pub async fn read_object(
@@ -1379,27 +1539,10 @@ impl SessionLease {
             .session
             .take()
             .expect("lease always owns a session until completion");
-        let pool = self.pool.clone();
-        let admission = self.admission.take();
-        let activity = self.activity.take();
-        let returning = self.pool.tasks.spawn(async move {
-            let mut idle = pool.idle.lock().await;
-            if pool.closed.load(Ordering::SeqCst) {
-                drop(idle);
-                let _ = pool.close_session(session).await;
-            } else {
-                let mut session = session;
-                session.idle_since = Instant::now();
-                idle.push_back(session);
-                drop(idle);
-                pool.idle_available.notify_one();
-            }
-            drop(admission);
-            drop(activity);
-        });
-        returning
-            .await
-            .map_err(|_| TransportError::Close("SFTP return task failed".to_owned()))
+        self.pool.release_session(&session, self.kind);
+        drop(self.admission.take());
+        drop(self.activity.take());
+        Ok(())
     }
 
     pub async fn retire(mut self) -> Result<(), TransportError> {
@@ -1407,18 +1550,26 @@ impl SessionLease {
             .session
             .take()
             .expect("lease always owns a session until retirement");
-        let admission = self.admission.take();
-        let activity = self.activity.take();
+        // Marking the session broken removes it from placement; the close
+        // itself happens once the last concurrent operation releases it. Only
+        // the last release observes and reports the close outcome.
+        session.broken.store(true, Ordering::SeqCst);
         let pool = self.pool.clone();
-        let cleanup = self.pool.tasks.spawn(async move {
-            let result = pool.close_session(session).await;
-            drop(admission);
-            drop(activity);
-            result
-        });
-        cleanup
-            .await
-            .map_err(|_| TransportError::Close("SFTP retirement task failed".to_owned()))?
+        let kind = self.kind;
+        if kind == OperationKind::Write {
+            session.active_writes.fetch_sub(1, Ordering::SeqCst);
+        }
+        pool.remove_from_roster(&session);
+        let remaining = session.active_ops.fetch_sub(1, Ordering::SeqCst) - 1;
+        let result = if remaining == 0 {
+            pool.close_shared_session(session).await
+        } else {
+            Ok(())
+        };
+        pool.roster_changed.notify_waiters();
+        drop(self.admission.take());
+        drop(self.activity.take());
+        result
     }
 
     #[cfg(test)]
@@ -1449,22 +1600,13 @@ impl Drop for SessionLease {
         let Some(session) = self.session.take() else {
             return;
         };
-        let admission = self.admission.take();
-        let activity = self.activity.take();
-        let pool = self.pool.clone();
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            drop(runtime);
-            self.pool.tasks.spawn(async move {
-                let _ = pool.close_session(session).await;
-                drop(admission);
-                drop(activity);
-            });
-        } else {
-            pool.fail_closed();
-            drop(session);
-            drop(admission);
-            drop(activity);
-        }
+        // A lease dropped without `complete` abandoned its operation mid
+        // flight; the session's protocol state is ambiguous, so it must not
+        // serve new operations.
+        session.broken.store(true, Ordering::SeqCst);
+        self.pool.release_session(&session, self.kind);
+        drop(self.admission.take());
+        drop(self.activity.take());
     }
 }
 
@@ -1677,7 +1819,8 @@ mod tests {
             }
         }
 
-        async fn close(self: Box<Self>, _force: CancellationToken) -> Result<(), TransportError> {
+        async fn close(
+            &self, _force: CancellationToken) -> Result<(), TransportError> {
             Ok(())
         }
     }
@@ -1722,7 +1865,8 @@ mod tests {
             }
         }
 
-        async fn close(self: Box<Self>, force: CancellationToken) -> Result<(), TransportError> {
+        async fn close(
+            &self, force: CancellationToken) -> Result<(), TransportError> {
             force.cancelled().await;
             self.state.force_seen.notify_one();
             self.state.allow_cleanup.notified().await;
@@ -1746,7 +1890,8 @@ mod tests {
             self.capabilities
         }
 
-        async fn close(self: Box<Self>, _force: CancellationToken) -> Result<(), TransportError> {
+        async fn close(
+            &self, _force: CancellationToken) -> Result<(), TransportError> {
             if self.state.block_close.load(Ordering::SeqCst) != 0 {
                 self.state
                     .close_started_count
@@ -1819,7 +1964,8 @@ mod tests {
             }
         }
 
-        async fn close(self: Box<Self>, _force: CancellationToken) -> Result<(), TransportError> {
+        async fn close(
+            &self, _force: CancellationToken) -> Result<(), TransportError> {
             Ok(())
         }
     }
@@ -2042,7 +2188,7 @@ mod tests {
 
     #[tokio::test]
     async fn queued_writes_reclaim_read_slots_until_the_pool_reaches_seven_one() {
-        let admission = super::FairAdmission::new(8, 7, 7);
+        let admission = super::FairAdmission::new(8, 7, 7, 8);
         let mut held_reads = Vec::new();
         for _ in 0..7 {
             held_reads.push(admission.acquire(OperationKind::Read).await.unwrap());
@@ -2101,7 +2247,7 @@ mod tests {
 
     #[tokio::test]
     async fn queued_metadata_reserves_read_capacity_during_writeback_drain() {
-        let admission = super::FairAdmission::new(8, 7, 7);
+        let admission = super::FairAdmission::new(8, 7, 7, 8);
         let mut held_writes = Vec::new();
         for _ in 0..7 {
             held_writes.push(admission.acquire(OperationKind::Write).await.unwrap());
@@ -2144,7 +2290,7 @@ mod tests {
 
     #[tokio::test]
     async fn canceling_the_opposite_waiter_restores_idle_direction_burst_capacity() {
-        let admission = super::FairAdmission::new(8, 7, 7);
+        let admission = super::FairAdmission::new(8, 7, 7, 8);
         let mut held_writes = Vec::new();
         for _ in 0..7 {
             held_writes.push(admission.acquire(OperationKind::Write).await.unwrap());
@@ -2184,7 +2330,7 @@ mod tests {
 
     #[tokio::test]
     async fn cross_direction_waiters_stay_fifo_without_a_reserved_slot() {
-        let admission = super::FairAdmission::new(1, 1, 1);
+        let admission = super::FairAdmission::new(1, 1, 1, 1);
         let held = admission.acquire(OperationKind::Read).await.unwrap();
         let order = Arc::new(Mutex::new(Vec::new()));
         let mut tasks = Vec::new();
@@ -2307,28 +2453,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn canceled_complete_returns_session_before_releasing_admission() {
+    async fn concurrent_operations_multiplex_onto_one_connection() {
         let factory = RecordingFactory::fully_capable();
-        let pool = Arc::new(pool(factory.clone(), 1, 1, 1).await);
-        let lease = pool.checkout(OperationKind::Read).await.unwrap();
-        let idle_guard = pool.inner.idle.lock().await;
-        let completing = tokio::spawn(async move { lease.complete().await });
-        tokio::task::yield_now().await;
-        completing.abort();
-        assert!(completing.await.unwrap_err().is_cancelled());
-        drop(idle_guard);
-
-        tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            pool.checkout(OperationKind::Read),
-        )
-        .await
-        .expect("session return completes after caller cancellation")
-        .unwrap()
-        .complete()
-        .await
-        .unwrap();
+        let pool = Arc::new(pool(factory.clone(), 1, 4, 4).await);
+        let mut leases = Vec::new();
+        for _ in 0..4 {
+            leases.push(
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    pool.checkout(OperationKind::Read),
+                )
+                .await
+                .expect("operations beyond the connection count share the session")
+                .unwrap(),
+            );
+        }
         assert_eq!(factory.dials(), 1);
+        for lease in leases {
+            lease.complete().await.unwrap();
+        }
+        pool.checkout(OperationKind::Read)
+            .await
+            .unwrap()
+            .complete()
+            .await
+            .unwrap();
+        assert_eq!(
+            factory.dials(),
+            1,
+            "sessions released by multiplexed leases are reused"
+        );
     }
 
     #[tokio::test]
@@ -2431,17 +2585,17 @@ mod tests {
         let pool = Arc::new(pool(factory.clone(), 1, 1, 1).await);
         let session = pool
             .inner
-            .idle
+            .roster
             .lock()
-            .await
-            .pop_front()
+            .unwrap()
+            .pop()
             .expect("constructor leaves one warm session");
         factory.state.block_close.store(1, Ordering::SeqCst);
         factory.state.panic_close.store(1, Ordering::SeqCst);
 
         let closing = tokio::spawn({
             let pool = pool.clone();
-            async move { pool.inner.close_session(session).await }
+            async move { pool.inner.close_shared_session(session).await }
         });
         tokio::time::timeout(
             std::time::Duration::from_secs(1),
