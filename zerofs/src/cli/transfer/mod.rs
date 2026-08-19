@@ -305,13 +305,8 @@ where
                 let mut attempts = 0;
                 loop {
                     attempts += 1;
-                    match transfer(
-                        worker.clone(),
-                        file.clone(),
-                        cancellation.clone(),
-                        attempts,
-                    )
-                    .await
+                    match transfer(worker.clone(), file.clone(), cancellation.clone(), attempts)
+                        .await
                     {
                         Ok(()) => break,
                         Err(error)
@@ -327,7 +322,11 @@ where
                             );
                             tokio::select! {
                                 _ = cancellation.cancelled() => {
-                                    errors.push(error.context("transfer cancelled while waiting to retry"));
+                                    let error = error.context(
+                                        "transfer cancelled while waiting to retry",
+                                    );
+                                    progress.fail_file(&path, attempts, &error);
+                                    errors.push(error);
                                     return errors;
                                 }
                                 _ = tokio::time::sleep(Duration::from_secs(attempts as u64)) => {}

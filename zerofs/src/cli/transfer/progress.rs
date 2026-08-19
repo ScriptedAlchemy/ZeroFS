@@ -22,6 +22,7 @@ struct ProgressState {
     next_emit_order: usize,
     pending_events: BTreeMap<usize, Vec<String>>,
     terminal_orders: BTreeSet<usize>,
+    #[cfg(test)]
     emitted_lines: Vec<String>,
 }
 
@@ -225,6 +226,7 @@ impl Progress {
 
     fn print_line(&self, message: String) {
         if self.bar.is_hidden() {
+            #[cfg(test)]
             self.state
                 .lock()
                 .unwrap()
@@ -263,6 +265,7 @@ impl Progress {
                 }
                 state.next_emit_order += 1;
             }
+            #[cfg(test)]
             state.emitted_lines.extend(ready.iter().cloned());
             ready
         };
@@ -291,7 +294,7 @@ impl Progress {
     }
 
     #[cfg(test)]
-    fn emitted_lines(&self) -> Vec<String> {
+    pub(super) fn emitted_lines(&self) -> Vec<String> {
         self.state.lock().unwrap().emitted_lines.clone()
     }
 }
