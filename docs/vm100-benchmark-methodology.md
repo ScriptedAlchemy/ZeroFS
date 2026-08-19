@@ -69,6 +69,9 @@ metrics URL. Metrics URLs must use HTTPS with normal certificate validation;
 plain HTTP is unavailable because an identity label on an unauthenticated
 response cannot bind durability evidence. Address equality is not enough to
 attribute durability evidence.
+URL userinfo, query strings, and fragments are rejected so credentials cannot
+enter a persistent manifest. Authentication belongs in transport configuration,
+not in serializable benchmark authority.
 The harness also requires an exact match between three configured identity
 values and exactly one server-emitted series:
 
@@ -100,12 +103,16 @@ ZEROFS_BENCH_9P_MOUNT_OPTIONS=rw,trans=unix,access=client \
 ZEROFS_BENCH_9P_METRICS_URL=https://127.0.0.1:9567/metrics \
 ZEROFS_BENCH_9P_METRICS_INSTANCE_ID=instance-uuid \
 ZEROFS_BENCH_9P_METRICS_FILESYSTEM_ID=filesystem-uuid \
-ZEROFS_BENCH_9P_METRICS_EXPORT_ID=9p-test-root \
+ZEROFS_BENCH_9P_METRICS_EXPORT_ID=zerofs-test \
 python3 scripts/vm100-pilot.py protocol-matrix --protocol 9p
 ```
 
 These examples are configuration shapes, not evidence that either mount is
 available. The preflight check is authoritative at runtime.
+The maintained 9P matrix is local Unix transport only: `trans=unix` is required,
+and the server-emitted export ID must exactly equal the observed `findmnt`
+source. Remote TCP 9P is unavailable rather than paired with unrelated loopback
+metrics.
 
 ## Matched protocol workload
 
@@ -262,3 +269,9 @@ Unit tests exercise registry rejection, authority matching, real local byte/SHA
 operations, counterbalancing, SFTP orchestration, memory parsing and ceilings,
 failure restoration, and cleanup ledgers. Unit tests do not mount devices, run
 live network benchmarks, or start/stop production ZeroFS.
+
+The canonical `MetricsClient` used by legacy drain, benchmark, profile,
+performance-matrix, and real-world-matrix paths applies the same HTTPS and
+per-response identity rule. With no configured expected identity it pins the
+first authenticated server/filesystem/export tuple for the process and rejects
+every later drift; an identity-free response always fails.

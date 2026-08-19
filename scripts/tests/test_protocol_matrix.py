@@ -161,7 +161,7 @@ class ProtocolAuthorityTests(unittest.TestCase):
             authority.metrics_identity,
             MetricsAuthorityIdentity("instance-a", "filesystem-a", "nfs-root"),
         )
-        with self.assertRaisesRegex(ValueError, "invalid ZeroFS metrics endpoint"):
+        with self.assertRaisesRegex(ValueError, "credential-free HTTPS"):
             ProtocolAuthority.from_mapping(
                 "nfs",
                 values
@@ -189,6 +189,48 @@ class ProtocolAuthorityTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "identity mismatch"):
                 client.snapshot()
         fetch.assert_called_once_with()
+
+        client = MetricsClient("https://10.10.10.55/metrics")
+        with mock.patch.object(
+            client,
+            "_fetch",
+            side_effect=(metrics_text(expected), metrics_text(wrong)),
+        ):
+            self.assertEqual(client.snapshot().accepted, 3)
+            with self.assertRaisesRegex(ValueError, "identity mismatch"):
+                client.snapshot()
+
+        identity_free = MetricsClient("https://10.10.10.55/metrics")
+        with mock.patch.object(
+            identity_free,
+            "_fetch",
+            return_value="zerofs_writeback_accepted_sequence 7\n",
+        ):
+            with self.assertRaisesRegex(ValueError, "exactly one"):
+                identity_free.snapshot()
+
+    def test_9p_authority_requires_unix_transport_and_source_bound_export(self) -> None:
+        base = {
+            "ZEROFS_BENCH_9P_MOUNTPOINT": str(self.root),
+            "ZEROFS_BENCH_9P_ENDPOINT": "zerofs-test",
+            "ZEROFS_BENCH_9P_MOUNT_OPTIONS": "rw,trans=unix,access=client",
+            "ZEROFS_BENCH_9P_METRICS_URL": "https://127.0.0.1:9567/metrics",
+            "ZEROFS_BENCH_9P_METRICS_INSTANCE_ID": "instance-a",
+            "ZEROFS_BENCH_9P_METRICS_FILESYSTEM_ID": "filesystem-a",
+            "ZEROFS_BENCH_9P_METRICS_EXPORT_ID": "zerofs-test",
+        }
+        authority = ProtocolAuthority.from_mapping("9p", base)
+        self.assertEqual(authority.endpoint, "zerofs-test")
+        with self.assertRaisesRegex(ScenarioUnavailableError, "trans=unix"):
+            ProtocolAuthority.from_mapping(
+                "9p",
+                base | {"ZEROFS_BENCH_9P_MOUNT_OPTIONS": "rw,trans=tcp"},
+            )
+        with self.assertRaisesRegex(ScenarioUnavailableError, "export ID"):
+            ProtocolAuthority.from_mapping(
+                "9p",
+                base | {"ZEROFS_BENCH_9P_METRICS_EXPORT_ID": "other-export"},
+            )
 
     def test_nfs_authority_rejects_mutable_host_aliases(self) -> None:
         values = {
@@ -306,6 +348,31 @@ class ProtocolMatrixTests(unittest.TestCase):
         payload = json.loads(manifests[0].read_text(encoding="utf-8"))
         self.assertEqual(payload["status"], "failed")
         self.assertNotIn("METRICS_INSTANCE_ID=", payload.get("error", ""))
+
+    def test_metrics_url_credentials_never_enter_failed_manifest(self) -> None:
+        module = load_cli()
+        args = module.build_parser().parse_args(
+            ["protocol-matrix", "--protocol", "nfs"]
+        )
+        values = {
+            "ZEROFS_BENCH_NFS_MOUNTPOINT": str(self.protocol_root),
+            "ZEROFS_BENCH_NFS_ENDPOINT": "10.10.10.55:/",
+            "ZEROFS_BENCH_NFS_MOUNT_OPTIONS": "rw,hard,vers=3",
+            "ZEROFS_BENCH_NFS_METRICS_URL": (
+                "https://10.10.10.55:9567/metrics?token=REVIEW_SECRET_MARKER"
+            ),
+            "ZEROFS_BENCH_NFS_METRICS_INSTANCE_ID": "instance-a",
+            "ZEROFS_BENCH_NFS_METRICS_FILESYSTEM_ID": "filesystem-a",
+            "ZEROFS_BENCH_NFS_METRICS_EXPORT_ID": "nfs-root",
+        }
+        with mock.patch.dict("os.environ", values, clear=True):
+            with self.assertRaisesRegex(ValueError, "credential-free HTTPS"):
+                module._run_protocol_matrix(args, self.config, Runner(base_env={}))
+
+        manifests = list(self.config.result_dir.glob("*/manifest.json"))
+        self.assertEqual(len(manifests), 1)
+        text = manifests[0].read_text(encoding="utf-8")
+        self.assertNotIn("REVIEW_SECRET_MARKER", text)
 
     def test_real_small_transfer_has_exact_sha_cutoffs_and_double_cleanup(self) -> None:
         scenario = ProtocolScenario(

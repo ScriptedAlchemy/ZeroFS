@@ -100,9 +100,22 @@ class ProtocolAuthority:
         root = Path(mountpoint)
         if not root.is_absolute():
             raise ValueError(f"{protocol} mountpoint must be absolute: {root}")
-        metrics = urlsplit(metrics_url)
-        if metrics.scheme != "https" or not metrics.hostname:
-            raise ValueError(f"invalid ZeroFS metrics endpoint: {metrics_url!r}")
+        try:
+            metrics = urlsplit(metrics_url)
+        except ValueError:
+            raise ValueError("invalid ZeroFS metrics endpoint") from None
+        if (
+            metrics.scheme != "https"
+            or not metrics.hostname
+            or metrics.username is not None
+            or metrics.password is not None
+            or bool(metrics.query)
+            or bool(metrics.fragment)
+        ):
+            raise ValueError(
+                "ZeroFS metrics endpoint must be credential-free HTTPS without "
+                "query or fragment"
+            )
         if protocol == "nfs":
             host = _nfs_host(endpoint)
             try:
@@ -122,11 +135,20 @@ class ProtocolAuthority:
                 "9P benchmark metrics must use explicit loopback authority for "
                 f"the local server: {metrics.hostname!r}"
             )
+        parsed_options = _options(options)
+        if protocol == "9p" and (
+            "trans=unix" not in parsed_options
+            or identity_values["export_id"] != endpoint
+        ):
+            raise ScenarioUnavailableError(
+                "9P benchmark unavailable: require trans=unix and an export ID "
+                "equal to the exact local findmnt source"
+            )
         return cls(
             protocol=protocol,
             mountpoint=root.resolve(strict=False),
             endpoint=endpoint,
-            mount_options=_options(options),
+            mount_options=parsed_options,
             metrics_url=metrics_url,
             metrics_identity=MetricsAuthorityIdentity(**identity_values),
         )

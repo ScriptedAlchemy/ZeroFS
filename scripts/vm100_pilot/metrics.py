@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import re
+import threading
 import time
 import urllib.request
-import re
 from dataclasses import asdict, dataclass
 from typing import Callable
+from urllib.parse import urlsplit
 
 
 class TerminalWritebackError(RuntimeError):
@@ -160,34 +162,47 @@ class MetricsClient:
         expected_identity: MetricsAuthorityIdentity | None = None,
         timeout: float = 5.0,
     ) -> None:
+        parsed = urlsplit(url)
+        if (
+            parsed.scheme != "https"
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or bool(parsed.query)
+            or bool(parsed.fragment)
+        ):
+            raise ValueError(
+                "metrics URL must be credential-free HTTPS without query or fragment"
+            )
         self.url = url
         self.expected_identity = expected_identity
         self.timeout = timeout
+        self._identity_lock = threading.Lock()
 
     def _fetch(self) -> str:
         with urllib.request.urlopen(self.url, timeout=self.timeout) as response:
             return response.read().decode("utf-8")
 
-    def snapshot(self) -> WritebackSnapshot:
-        text = self._fetch()
-        if self.expected_identity is not None:
-            actual = MetricsAuthorityIdentity.parse(text)
-            if actual != self.expected_identity:
+    def _validate_identity(self, text: str) -> MetricsAuthorityIdentity:
+        actual = MetricsAuthorityIdentity.parse(text)
+        with self._identity_lock:
+            if self.expected_identity is None:
+                self.expected_identity = actual
+            elif actual != self.expected_identity:
                 raise ValueError(
-                    "ZeroFS metrics identity mismatch in snapshot: "
+                    "ZeroFS metrics identity mismatch: "
                     f"expected={asdict(self.expected_identity)}, "
                     f"actual={asdict(actual)}"
                 )
+        return actual
+
+    def snapshot(self) -> WritebackSnapshot:
+        text = self._fetch()
+        self._validate_identity(text)
         return WritebackSnapshot.parse(text)
 
     def identity(self) -> MetricsAuthorityIdentity:
-        actual = MetricsAuthorityIdentity.parse(self._fetch())
-        if self.expected_identity is not None and actual != self.expected_identity:
-            raise ValueError(
-                "ZeroFS metrics identity mismatch: "
-                f"expected={asdict(self.expected_identity)}, actual={asdict(actual)}"
-            )
-        return actual
+        return self._validate_identity(self._fetch())
 
 
 def wait_for_gc_quiescence(

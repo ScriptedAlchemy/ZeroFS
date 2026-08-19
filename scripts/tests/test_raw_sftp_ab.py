@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import signal
 import shlex
 import tempfile
 import time
@@ -91,13 +92,15 @@ class RawSftpAbTests(unittest.TestCase):
                 self.process = self
                 self.argv = ("sftp",)
                 self.terminated = False
+                self.returncode: int | None = None
 
-            def poll(self) -> None:
-                return None
+            def poll(self) -> int | None:
+                return self.returncode
 
-            def terminate(self, timeout: float = 10.0) -> None:
-                del timeout
+            def signal_group(self, signal_number: int) -> None:
                 self.terminated = True
+                if signal_number == signal.SIGKILL:
+                    self.returncode = -signal_number
 
         class SpawnRunner:
             def __init__(self) -> None:
@@ -148,8 +151,8 @@ class RawSftpAbTests(unittest.TestCase):
             def poll(self) -> int | None:
                 return self.returncode
 
-            def terminate(self, timeout: float = 10.0) -> None:
-                del timeout
+            def signal_group(self, signal_number: int) -> None:
+                del signal_number
                 if self.terminate_error:
                     raise RuntimeError(self.terminate_error)
                 self.returncode = -15
@@ -192,9 +195,10 @@ class RawSftpAbTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.process = self
                 self.argv = ("sudo", "sftp")
-                self.returncode = -15
+                self.returncode: int | None = None
                 self.terminated = False
                 self.communicate_calls = 0
+                self.signal_error = ""
 
             def communicate(self, timeout: float | None = None) -> tuple[str, str]:
                 self.communicate_calls += 1
@@ -204,9 +208,14 @@ class RawSftpAbTests(unittest.TestCase):
                     raise TimeoutExpired(self.argv, timeout)
                 return "", ""
 
-            def terminate(self, timeout: float = 10.0) -> None:
-                del timeout
+            def poll(self) -> int | None:
+                return self.returncode
+
+            def signal_group(self, signal_number: int) -> None:
+                if self.signal_error:
+                    raise RuntimeError(self.signal_error)
                 self.terminated = True
+                self.returncode = -signal_number
 
         process = NeverCommand()
         runner = unittest.mock.Mock()
@@ -225,6 +234,16 @@ class RawSftpAbTests(unittest.TestCase):
 
         self.assertTrue(process.terminated)
         self.assertEqual(process.communicate_calls, 2)
+
+        failed_shutdown = NeverCommand()
+        failed_shutdown.signal_error = "TERMINATION_REAP_MARKER"
+        runner.spawn.return_value = failed_shutdown
+        with self.assertRaisesRegex(TimeoutError, "deadline") as raised:
+            raw._run_batch(endpoint, batch, Path("/ssh"), buffer_bytes=1, request_depth=1)
+        self.assertIn(
+            "TERMINATION_REAP_MARKER",
+            " ".join(raised.exception.__notes__),
+        )
 
     def test_counterbalanced_order_repeats_each_variant_equally(self) -> None:
         self.assertEqual(

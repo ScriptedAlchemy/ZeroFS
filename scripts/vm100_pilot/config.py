@@ -171,7 +171,7 @@ class PilotConfig:
             ),
             mountpoint=mountpoint,
             metrics_url=values.get(
-                "ZEROFS_PILOT_METRICS_URL", "http://127.0.0.1:19567/metrics"
+                "ZEROFS_PILOT_METRICS_URL", "https://127.0.0.1:19567/metrics"
             ),
             integrity_file=Path(
                 values.get(

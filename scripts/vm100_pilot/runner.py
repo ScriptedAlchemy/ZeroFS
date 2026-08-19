@@ -23,6 +23,9 @@ class ManagedProcess:
     process: subprocess.Popen[str]
     argv: tuple[str, ...]
 
+    def signal_group(self, signal_number: int) -> None:
+        os.killpg(self.process.pid, signal_number)
+
     def terminate(self, timeout: float = 10.0) -> None:
         if self.process.poll() is not None:
             return

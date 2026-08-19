@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import shlex
 import time
 import tomllib
@@ -19,6 +20,56 @@ from .receipts import RunReceipt
 from .runner import CommandError, ManagedProcess, Runner
 from .scenarios import RawSftpScenario
 from .system_io import file_sha256
+
+
+def _stop_process_groups(
+    processes: list[ManagedProcess],
+    *,
+    timeout: float,
+    primary: BaseException | None,
+) -> BaseException | None:
+    active = [process for process in processes if process.process.poll() is None]
+    if not active:
+        return primary
+    errors: list[str] = []
+    started = time.monotonic()
+    final_deadline = started + max(0.02, timeout)
+    term_deadline = started + max(0.01, timeout / 2)
+
+    for process in active:
+        try:
+            process.signal_group(signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except BaseException as error:
+            errors.append(f"TERM {' '.join(process.argv)}: {error}")
+    while time.monotonic() < term_deadline:
+        active = [process for process in active if process.process.poll() is None]
+        if not active:
+            break
+        time.sleep(0.01)
+
+    for process in active:
+        try:
+            process.signal_group(signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except BaseException as error:
+            errors.append(f"KILL {' '.join(process.argv)}: {error}")
+    while time.monotonic() < final_deadline:
+        active = [process for process in active if process.process.poll() is None]
+        if not active:
+            break
+        time.sleep(0.01)
+    for process in active:
+        errors.append(f"process group remained alive: {' '.join(process.argv)}")
+
+    if errors:
+        detail = "raw SFTP process-group shutdown failed: " + "; ".join(errors)
+        if primary is None:
+            return RuntimeError(detail)
+        primary.add_note(detail)
+    return primary
 
 
 @dataclass(frozen=True, slots=True)
@@ -529,15 +580,23 @@ class RawSftpRunner:
         try:
             stdout, stderr = managed.process.communicate(timeout=self.command_timeout)
         except TimeoutExpired as error:
-            managed.terminate()
-            managed.process.communicate()
-            raise TimeoutError(
+            failure = TimeoutError(
                 f"raw SFTP command exceeded {self.command_timeout}s deadline: "
                 f"{' '.join(managed.argv)}"
-            ) from error
-        except BaseException:
-            managed.terminate()
-            managed.process.communicate()
+            )
+            failure.__cause__ = error
+            _stop_process_groups(
+                [managed], timeout=self.command_timeout, primary=failure
+            )
+            if managed.process.poll() is not None:
+                managed.process.communicate()
+            raise failure
+        except BaseException as error:
+            _stop_process_groups(
+                [managed], timeout=self.command_timeout, primary=error
+            )
+            if managed.process.poll() is not None:
+                managed.process.communicate()
             raise
         completed = CompletedProcess(
             managed.argv,
@@ -610,25 +669,13 @@ class RawSftpRunner:
                 if pending:
                     time.sleep(0.01)
         finally:
-            termination_errors: list[BaseException] = []
-            termination_deadline = time.monotonic() + min(self.phase_timeout, 10.0)
-            for _, process, _, _ in processes:
-                if process.process.poll() is None:
-                    try:
-                        remaining = max(0.01, termination_deadline - time.monotonic())
-                        process.terminate(timeout=remaining)
-                    except BaseException as error:
-                        termination_errors.append(error)
+            failure = _stop_process_groups(
+                [process for _, process, _, _ in processes],
+                timeout=min(self.phase_timeout, 10.0),
+                primary=failure,
+            )
             for _, _, handle, _ in processes:
                 handle.close()
-            if termination_errors:
-                detail = "raw SFTP process-group termination failed: " + "; ".join(
-                    str(error) for error in termination_errors
-                )
-                if failure is None:
-                    failure = RuntimeError(detail)
-                else:
-                    failure.add_note(detail)
         if failure is not None:
             raise failure
         if len(finished) != len(batches):
