@@ -13,11 +13,6 @@ use std::path::{Path, PathBuf};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::sync::CancellationToken;
 
-use std::io;
-use std::pin::Pin;
-use std::task::{Context, Poll};
-use tokio::io::ReadBuf;
-
 #[cfg(test)]
 use std::sync::atomic::Ordering;
 
@@ -302,42 +297,6 @@ fn map_sftp_close_error(path: &Path, error: russh_sftp::client::error::Error) ->
     TransportError::Close(format!("{}: {error}", path.display()))
 }
 
-pub(crate) struct Duplex<R, W> {
-    pub(crate) reader: R,
-    pub(crate) writer: W,
-}
-
-impl<R: AsyncRead + Unpin, W: Unpin> AsyncRead for Duplex<R, W> {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.reader).poll_read(cx, buf)
-    }
-}
-
-impl<R: Unpin, W: AsyncWrite + Unpin> AsyncWrite for Duplex<R, W> {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<Result<usize, io::Error>> {
-        Pin::new(&mut self.writer).poll_write(cx, buf)
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
-        Pin::new(&mut self.writer).poll_flush(cx)
-    }
-
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), io::Error>> {
-        Pin::new(&mut self.writer).poll_shutdown(cx)
-    }
-}
-
 pub(crate) async fn handshake_sftp<S>(
     stream: S,
 ) -> Result<(RawSftpSession, SftpCapabilities, SftpLimits), TransportError>
@@ -428,16 +387,12 @@ impl SftpProtocolSession {
     }
 
     #[cfg(test)]
-    pub async fn from_streams<W, R>(stdin: W, stdout: R) -> Result<Self, TransportError>
+    pub(crate) async fn from_streams<W, R>(stdin: W, stdout: R) -> Result<Self, TransportError>
     where
         W: AsyncWrite + Unpin + Send + 'static,
         R: AsyncRead + Unpin + Send + 'static,
     {
-        let (sftp, capabilities, limits) = handshake_sftp(Duplex {
-            reader: stdout,
-            writer: stdin,
-        })
-        .await?;
+        let (sftp, capabilities, limits) = handshake_sftp(tokio::io::join(stdout, stdin)).await?;
         Ok(Self::new(
             sftp,
             capabilities,

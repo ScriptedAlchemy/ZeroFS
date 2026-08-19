@@ -14,7 +14,6 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
-pub use crate::hpn_session::HpnSessionFactory;
 pub use crate::russh_session::{
     RUSSH_MAXIMUM_PACKET_SIZE, RUSSH_SFTP_MAX_CONCURRENT_WRITES, RUSSH_WINDOW_SIZE,
     RusshSessionFactory,

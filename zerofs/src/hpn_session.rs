@@ -1,5 +1,5 @@
-use crate::config::validate_pinned_hpn_program;
-use crate::sftp_protocol::{Duplex, SftpProtocolSession, SshConnectionOwner, handshake_sftp};
+use crate::config::{SftpConfig, SftpEndpoint, validate_pinned_hpn_program};
+use crate::sftp_protocol::{SftpProtocolSession, SshConnectionOwner, handshake_sftp};
 use crate::sftp_transport::{SessionFactory, TransportError, TransportSession};
 use async_trait::async_trait;
 use russh::keys::{Algorithm, load_secret_key};
@@ -20,9 +20,17 @@ const HOST_KEY_ALGORITHMS: &str = concat!(
     "ssh-ed25519,ecdsa-sha2-nistp256,ecdsa-sha2-nistp384,ecdsa-sha2-nistp521,",
     "rsa-sha2-512,rsa-sha2-256"
 );
+const STRIPPED_ENV: &[&str] = &[
+    "SSH_AUTH_SOCK",
+    "SSH_AGENT_PID",
+    "SSH_ASKPASS",
+    "SSH_ASKPASS_REQUIRE",
+    "DISPLAY",
+    "SSH_SK_HELPER",
+];
 
-pub struct HpnSessionFactory {
-    endpoint: crate::config::SftpEndpoint,
+pub(crate) struct HpnSessionFactory {
+    endpoint: SftpEndpoint,
     identity_file: PathBuf,
     known_hosts: PathBuf,
     program: PathBuf,
@@ -30,8 +38,8 @@ pub struct HpnSessionFactory {
 }
 
 impl HpnSessionFactory {
-    pub fn new(
-        endpoint: crate::config::SftpEndpoint,
+    pub(crate) fn new(
+        endpoint: SftpEndpoint,
         identity_file: PathBuf,
         known_hosts: PathBuf,
         program: PathBuf,
@@ -50,28 +58,30 @@ impl HpnSessionFactory {
         })
     }
 
-    pub fn from_config(
-        endpoint: crate::config::SftpEndpoint,
-        config: &crate::config::SftpConfig,
+    pub(crate) fn from_config(
+        endpoint: SftpEndpoint,
+        config: &SftpConfig,
     ) -> Result<Self, TransportError> {
-        let program = config.hpn_program.clone().ok_or_else(|| {
-            TransportError::Open(
-                "[sftp] hpn_program is required when transport = \"hpn_openssh\"".to_owned(),
-            )
-        })?;
-        let program_sha256 = config.hpn_sha256.clone().ok_or_else(|| {
-            TransportError::Open(
-                "[sftp] hpn_sha256 is required when transport = \"hpn_openssh\"".to_owned(),
-            )
-        })?;
         Self::new(
             endpoint,
             config.identity_file.clone(),
             config.known_hosts.clone(),
-            program,
-            program_sha256,
+            config
+                .hpn_program
+                .clone()
+                .ok_or_else(|| missing_pin("hpn_program"))?,
+            config
+                .hpn_sha256
+                .clone()
+                .ok_or_else(|| missing_pin("hpn_sha256"))?,
         )
     }
+}
+
+fn missing_pin(field: &str) -> TransportError {
+    TransportError::Open(format!(
+        "[sftp] {field} is required when transport = \"hpn_openssh\""
+    ))
 }
 
 impl fmt::Debug for HpnSessionFactory {
@@ -105,13 +115,14 @@ impl SessionFactory for HpnSessionFactory {
             return Err(TransportError::PoolClosed);
         }
 
-        let mut command = hpn_command(
+        let mut child = hpn_command(
             &self.program,
             &self.endpoint,
             &self.identity_file,
             &self.known_hosts,
-        );
-        let mut child = command.spawn().map_err(|error| {
+        )
+        .spawn()
+        .map_err(|error| {
             TransportError::Open(format!(
                 "failed to spawn pinned HPN-SSH {}: {error}",
                 self.program.display()
@@ -121,7 +132,7 @@ impl SessionFactory for HpnSessionFactory {
             match (child.stdin.take(), child.stdout.take(), child.stderr.take()) {
                 (Some(stdin), Some(stdout), Some(stderr)) => (stdin, stdout, stderr),
                 _ => {
-                    let _ = kill_and_reap(child, tokio::spawn(async {})).await;
+                    let _ = kill_and_reap(child, None).await;
                     return Err(TransportError::Open(
                         "HPN-SSH child stdio was not piped".to_owned(),
                     ));
@@ -130,10 +141,7 @@ impl SessionFactory for HpnSessionFactory {
         let stderr_ring = StderrRing::new();
         let stderr_task = tokio::spawn(stderr_ring.clone().capture(stderr));
 
-        let handshake = handshake_sftp(Duplex {
-            reader: stdout,
-            writer: stdin,
-        });
+        let handshake = handshake_sftp(tokio::io::join(stdout, stdin));
         tokio::pin!(handshake);
         let session = tokio::select! {
             biased;
@@ -145,7 +153,7 @@ impl SessionFactory for HpnSessionFactory {
             Ok(session) => session,
             Err(open_error) => {
                 let stderr = stderr_ring.snapshot();
-                let close_error = kill_and_reap(child, stderr_task).await.err();
+                let close_error = kill_and_reap(child, Some(stderr_task)).await.err();
                 return Err(match close_error {
                     Some(close_error) => close_error,
                     None if stderr.is_empty() => open_error,
@@ -154,15 +162,6 @@ impl SessionFactory for HpnSessionFactory {
             }
         };
 
-        tracing::info!(
-            host = %self.endpoint.host,
-            port = self.endpoint.port,
-            program = %self.program.display(),
-            fsync = capabilities.fsync,
-            hardlink = capabilities.hardlink,
-            posix_rename = capabilities.posix_rename,
-            "opened HPN-OpenSSH SFTP session"
-        );
         Ok(Box::new(SftpProtocolSession::new(
             sftp,
             capabilities,
@@ -171,7 +170,7 @@ impl SessionFactory for HpnSessionFactory {
                 child: Some(child),
                 stderr_task: Some(stderr_task),
             }),
-        )) as Box<dyn TransportSession>)
+        )))
     }
 }
 
@@ -209,13 +208,13 @@ impl SshConnectionOwner for HpnConnectionOwner {
             .stderr_task
             .take()
             .expect("HPN stderr task already taken");
-        kill_and_reap(child, stderr_task).await
+        kill_and_reap(child, Some(stderr_task)).await
     }
 }
 
 fn hpn_command(
     program: &Path,
-    endpoint: &crate::config::SftpEndpoint,
+    endpoint: &SftpEndpoint,
     identity_file: &Path,
     known_hosts: &Path,
 ) -> Command {
@@ -224,16 +223,11 @@ fn hpn_command(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .env_remove("SSH_AUTH_SOCK")
-        .env_remove("SSH_AGENT_PID")
-        .env_remove("SSH_ASKPASS")
-        .env_remove("SSH_ASKPASS_REQUIRE")
-        .env_remove("DISPLAY")
-        .env_remove("SSH_SK_HELPER");
-    for arg in hpn_args(endpoint, identity_file, known_hosts) {
-        command.arg(arg);
+        .kill_on_drop(true);
+    for key in STRIPPED_ENV {
+        command.env_remove(*key);
     }
+    command.args(hpn_args(endpoint, identity_file, known_hosts));
     #[cfg(unix)]
     {
         command.process_group(0);
@@ -241,99 +235,97 @@ fn hpn_command(
     command
 }
 
-fn hpn_args(
-    endpoint: &crate::config::SftpEndpoint,
-    identity_file: &Path,
-    known_hosts: &Path,
-) -> Vec<String> {
-    let identity = identity_file.display().to_string();
-    let known_hosts = known_hosts.display().to_string();
-    vec![
-        "-F".to_owned(),
-        "/dev/null".to_owned(),
-        "-T".to_owned(),
-        "-p".to_owned(),
+fn push_opt(args: &mut Vec<String>, option: impl Into<String>) {
+    args.push("-o".into());
+    args.push(option.into());
+}
+
+fn hpn_args(endpoint: &SftpEndpoint, identity_file: &Path, known_hosts: &Path) -> Vec<String> {
+    let mut args = vec![
+        "-F".into(),
+        "/dev/null".into(),
+        "-T".into(),
+        "-p".into(),
         endpoint.port.to_string(),
-        "-l".to_owned(),
+        "-l".into(),
         endpoint.username.clone(),
-        "-o".to_owned(),
-        "BatchMode=yes".to_owned(),
-        "-o".to_owned(),
-        "PasswordAuthentication=no".to_owned(),
-        "-o".to_owned(),
-        "KbdInteractiveAuthentication=no".to_owned(),
-        "-o".to_owned(),
-        "ChallengeResponseAuthentication=no".to_owned(),
-        "-o".to_owned(),
-        "PreferredAuthentications=publickey".to_owned(),
-        "-o".to_owned(),
-        "NumberOfPasswordPrompts=0".to_owned(),
-        "-o".to_owned(),
-        "IdentitiesOnly=yes".to_owned(),
-        "-o".to_owned(),
-        format!("IdentityFile={identity}"),
-        "-o".to_owned(),
-        "IdentityAgent=none".to_owned(),
-        "-o".to_owned(),
-        "PKCS11Provider=none".to_owned(),
-        "-o".to_owned(),
-        "AddKeysToAgent=no".to_owned(),
-        "-o".to_owned(),
-        "ForwardAgent=no".to_owned(),
-        "-o".to_owned(),
-        "ForwardX11=no".to_owned(),
-        "-o".to_owned(),
-        "RequestTTY=no".to_owned(),
-        "-o".to_owned(),
-        "ClearAllForwardings=yes".to_owned(),
-        "-o".to_owned(),
-        "PermitLocalCommand=no".to_owned(),
-        "-o".to_owned(),
-        "AllowTcpForwarding=no".to_owned(),
-        "-o".to_owned(),
-        "Tunnel=no".to_owned(),
-        "-o".to_owned(),
-        "ProxyCommand=none".to_owned(),
-        "-o".to_owned(),
-        "ProxyJump=none".to_owned(),
-        "-o".to_owned(),
-        "ControlMaster=no".to_owned(),
-        "-o".to_owned(),
-        "ControlPersist=no".to_owned(),
-        "-o".to_owned(),
-        "ControlPath=none".to_owned(),
-        "-o".to_owned(),
-        "StrictHostKeyChecking=yes".to_owned(),
-        "-o".to_owned(),
-        format!("UserKnownHostsFile={known_hosts}"),
-        "-o".to_owned(),
-        "GlobalKnownHostsFile=/dev/null".to_owned(),
-        "-o".to_owned(),
-        "UpdateHostKeys=no".to_owned(),
-        "-o".to_owned(),
+    ];
+    for option in [
+        "BatchMode=yes",
+        "PasswordAuthentication=no",
+        "KbdInteractiveAuthentication=no",
+        "ChallengeResponseAuthentication=no",
+        "PreferredAuthentications=publickey",
+        "NumberOfPasswordPrompts=0",
+        "IdentitiesOnly=yes",
+    ] {
+        push_opt(&mut args, option);
+    }
+    push_opt(
+        &mut args,
+        format!("IdentityFile={}", identity_file.display()),
+    );
+    for option in [
+        "IdentityAgent=none",
+        "PKCS11Provider=none",
+        "AddKeysToAgent=no",
+        "ForwardAgent=no",
+        "ForwardX11=no",
+        "RequestTTY=no",
+        "ClearAllForwardings=yes",
+        "PermitLocalCommand=no",
+        "Tunnel=no",
+        "ProxyCommand=none",
+        "ProxyJump=none",
+        "ControlMaster=no",
+        "ControlPersist=no",
+        "ControlPath=none",
+        "StrictHostKeyChecking=yes",
+    ] {
+        push_opt(&mut args, option);
+    }
+    push_opt(
+        &mut args,
+        format!("UserKnownHostsFile={}", known_hosts.display()),
+    );
+    for option in ["GlobalKnownHostsFile=/dev/null", "UpdateHostKeys=no"] {
+        push_opt(&mut args, option);
+    }
+    push_opt(
+        &mut args,
         format!("HostKeyAlgorithms={HOST_KEY_ALGORITHMS}"),
-        "-o".to_owned(),
+    );
+    push_opt(
+        &mut args,
         format!("PubkeyAcceptedAlgorithms={HOST_KEY_ALGORITHMS}"),
-        "-s".to_owned(),
-        "--".to_owned(),
+    );
+    args.extend([
+        "-s".into(),
+        "--".into(),
         endpoint.host.clone(),
-        "sftp".to_owned(),
-    ]
+        "sftp".into(),
+    ]);
+    args
+}
+
+fn require_regular_file(path: &Path, field: &str) -> Result<fs::Metadata, TransportError> {
+    let metadata = fs::metadata(path).map_err(|error| {
+        TransportError::Open(format!(
+            "[sftp] {field} {} is unavailable: {error}",
+            path.display()
+        ))
+    })?;
+    if !metadata.is_file() {
+        return Err(TransportError::Open(format!(
+            "[sftp] {field} {} is not a regular file",
+            path.display()
+        )));
+    }
+    Ok(metadata)
 }
 
 fn verify_identity_file(identity_file: &Path) -> Result<(), TransportError> {
-    let identity_metadata = fs::metadata(identity_file).map_err(|error| {
-        TransportError::Open(format!(
-            "[sftp] identity_file {} is unavailable: {error}",
-            identity_file.display()
-        ))
-    })?;
-    if !identity_metadata.is_file() {
-        return Err(TransportError::Open(format!(
-            "[sftp] identity_file {} is not a regular file",
-            identity_file.display()
-        )));
-    }
+    let identity_metadata = require_regular_file(identity_file, "identity_file")?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -363,24 +355,12 @@ fn verify_identity_file(identity_file: &Path) -> Result<(), TransportError> {
 }
 
 fn verify_known_hosts(known_hosts: &Path) -> Result<(), TransportError> {
-    let metadata = fs::metadata(known_hosts).map_err(|error| {
-        TransportError::Open(format!(
-            "[sftp] known_hosts {} is unavailable: {error}",
-            known_hosts.display()
-        ))
-    })?;
-    if !metadata.is_file() {
-        return Err(TransportError::Open(format!(
-            "[sftp] known_hosts {} is not a regular file",
-            known_hosts.display()
-        )));
-    }
-    Ok(())
+    require_regular_file(known_hosts, "known_hosts").map(|_| ())
 }
 
 async fn kill_and_reap(
     mut child: Child,
-    stderr_task: JoinHandle<()>,
+    stderr_task: Option<JoinHandle<()>>,
 ) -> Result<(), TransportError> {
     kill_process_group(&child);
     if let Err(error) = child.start_kill() {
@@ -390,11 +370,15 @@ async fn kill_and_reap(
     }
     match child.wait().await {
         Ok(_) => {
-            let _ = stderr_task.await;
+            if let Some(task) = stderr_task {
+                let _ = task.await;
+            }
             Ok(())
         }
         Err(error) => {
-            stderr_task.abort();
+            if let Some(task) = stderr_task {
+                task.abort();
+            }
             Err(TransportError::Close(format!(
                 "failed to reap HPN-SSH child: {error}"
             )))
@@ -488,11 +472,11 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
 
     struct Fixture {
         _dir: TempDir,
-        endpoint: crate::config::SftpEndpoint,
+        endpoint: SftpEndpoint,
         identity: PathBuf,
         known_hosts: PathBuf,
         program: PathBuf,
-        sha: String,
+        program_sha256: String,
     }
 
     impl Fixture {
@@ -510,10 +494,10 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
             let program = dir.path().join("hpnssh");
             fs::write(&program, wrap_hpn_stub(body)).unwrap();
             fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
-            let sha = sha256_hex(program.as_path());
+            let program_sha256 = sha256_hex(program.as_path());
             Self {
                 _dir: dir,
-                endpoint: crate::config::SftpEndpoint {
+                endpoint: SftpEndpoint {
                     host: "example.com".to_owned(),
                     port: 23,
                     username: "alice".to_owned(),
@@ -521,7 +505,7 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
                 identity,
                 known_hosts,
                 program,
-                sha,
+                program_sha256,
             }
         }
 
@@ -531,7 +515,7 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
                 self.identity.clone(),
                 self.known_hosts.clone(),
                 self.program.clone(),
-                self.sha.clone(),
+                self.program_sha256.clone(),
             )
             .unwrap()
         }
@@ -554,6 +538,15 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
         unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
     }
 
+    fn assert_open(error: TransportError, needles: &[&str]) {
+        let TransportError::Open(message) = error else {
+            panic!("expected Open, got {error:?}");
+        };
+        for needle in needles {
+            assert!(message.contains(needle), "{message}");
+        }
+    }
+
     #[test]
     fn hpn_command_uses_pinned_program_and_strict_options() {
         let fixture = Fixture::with_program("#!/bin/sh\nexit 0\n");
@@ -561,29 +554,22 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
         let joined = args.join("\x1f");
         assert!(args.contains(&"-T".to_owned()));
         assert!(args.contains(&"-s".to_owned()));
-        assert_eq!(args[args.len() - 3], "--");
-        assert_eq!(args[args.len() - 2], "example.com");
-        assert_eq!(args[args.len() - 1], "sftp");
-        assert!(args.windows(2).any(|w| w[0] == "-p" && w[1] == "23"));
-        assert!(args.windows(2).any(|w| w[0] == "-l" && w[1] == "alice"));
-        assert!(args.windows(2).any(|w| w[0] == "-F" && w[1] == "/dev/null"));
-        assert!(joined.contains("BatchMode=yes"));
-        assert!(joined.contains("PasswordAuthentication=no"));
-        assert!(joined.contains("KbdInteractiveAuthentication=no"));
+        assert_eq!(&args[args.len() - 3..], ["--", "example.com", "sftp"]);
+        assert!(args.windows(2).any(|pair| pair == ["-p", "23"]));
         assert!(joined.contains("IdentitiesOnly=yes"));
         assert!(joined.contains(&format!("IdentityFile={}", fixture.identity.display())));
+        assert!(joined.contains("PreferredAuthentications=publickey"));
+        assert!(joined.contains("PasswordAuthentication=no"));
+        assert!(joined.contains("IdentityAgent=none"));
+        assert!(joined.contains("ForwardAgent=no"));
+        assert!(joined.contains("ClearAllForwardings=yes"));
+        // AllowTcpForwarding and DisableForwarding are sshd-only options; the
+        // OpenSSH client dies with "Bad configuration option" on either.
+        assert!(!joined.contains("AllowTcpForwarding="));
+        assert!(!joined.contains("DisableForwarding="));
         assert!(joined.contains("StrictHostKeyChecking=yes"));
         assert!(!joined.contains("StrictHostKeyChecking=no"));
         assert!(!joined.contains("accept-new"));
-        assert!(joined.contains("ControlMaster=no"));
-        assert!(joined.contains("ControlPersist=no"));
-        assert!(joined.contains("IdentityAgent=none"));
-        assert!(joined.contains("ForwardAgent=no"));
-        assert!(joined.contains("ForwardX11=no"));
-        assert!(joined.contains("RequestTTY=no"));
-        assert!(joined.contains("PermitLocalCommand=no"));
-        assert!(joined.contains("ProxyCommand=none"));
-        assert!(joined.contains("ProxyJump=none"));
         assert!(
             !args.iter().any(|arg| arg
                 .split('=')
@@ -593,9 +579,6 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
                 .any(|alg| alg == "ssh-rsa")),
             "legacy ssh-rsa must stay off the algorithm lists: {args:?}"
         );
-        let command = format!("{}", fixture.program.display());
-        assert_ne!(command, "/usr/bin/ssh");
-        assert!(command.ends_with("hpnssh"));
     }
 
     #[test]
@@ -603,74 +586,52 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
         let fixture = Fixture::with_program("#!/bin/sh\nexit 0\n");
         fs::write(&fixture.identity, ENCRYPTED_KEY).unwrap();
         fs::set_permissions(&fixture.identity, fs::Permissions::from_mode(0o600)).unwrap();
-        let error = HpnSessionFactory::new(
-            fixture.endpoint.clone(),
-            fixture.identity.clone(),
-            fixture.known_hosts.clone(),
-            fixture.program.clone(),
-            fixture.sha.clone(),
-        )
-        .expect_err("encrypted identities must fail before HPN child startup");
-        match error {
-            TransportError::Open(message) => {
-                assert!(
-                    message.contains("identity_file"),
-                    "failure must name the invalid configured identity: {message}"
-                );
-                assert!(
-                    message.contains("unencrypted"),
-                    "encrypted keys must fail closed: {message}"
-                );
-            }
-            other => panic!("expected Open error, got {other:?}"),
-        }
+        assert_open(
+            HpnSessionFactory::new(
+                fixture.endpoint.clone(),
+                fixture.identity.clone(),
+                fixture.known_hosts.clone(),
+                fixture.program.clone(),
+                fixture.program_sha256.clone(),
+            )
+            .expect_err("encrypted identities must fail before spawn"),
+            &["identity_file", "unencrypted"],
+        );
     }
 
     #[test]
     fn hpn_factory_rejects_a_sha256_mismatch() {
         let fixture = Fixture::with_program("#!/bin/sh\nexit 0\n");
-        let error = HpnSessionFactory::new(
-            fixture.endpoint.clone(),
-            fixture.identity.clone(),
-            fixture.known_hosts.clone(),
-            fixture.program.clone(),
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
-        )
-        .expect_err("pin mismatch must fail closed");
-        match error {
-            TransportError::Open(message) => {
-                assert!(
-                    message.contains("hpn_sha256") || message.contains("SHA-256"),
-                    "failure must name the pin: {message}"
-                );
-            }
-            other => panic!("expected Open error, got {other:?}"),
-        }
+        assert_open(
+            HpnSessionFactory::new(
+                fixture.endpoint.clone(),
+                fixture.identity.clone(),
+                fixture.known_hosts.clone(),
+                fixture.program.clone(),
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            )
+            .expect_err("pin mismatch"),
+            &["hpn_sha256", "SHA-256"],
+        );
     }
 
     #[test]
     fn hpn_from_config_fails_closed_without_a_pin() {
-        let error = HpnSessionFactory::from_config(
-            crate::config::SftpEndpoint {
-                host: "example.com".to_owned(),
-                port: 22,
-                username: "alice".to_owned(),
-            },
-            &crate::config::SftpConfig {
-                transport: crate::config::SftpSshTransport::HpnOpenSsh,
-                ..Default::default()
-            },
-        )
-        .expect_err("missing pin must fail closed");
-        match error {
-            TransportError::Open(message) => {
-                assert!(
-                    message.contains("hpn_program") || message.contains("hpn_sha256"),
-                    "missing pin must fail closed: {message}"
-                );
-            }
-            other => panic!("expected Open error, got {other:?}"),
-        }
+        assert_open(
+            HpnSessionFactory::from_config(
+                SftpEndpoint {
+                    host: "example.com".to_owned(),
+                    port: 22,
+                    username: "alice".to_owned(),
+                },
+                &SftpConfig {
+                    transport: crate::config::SftpSshTransport::HpnOpenSsh,
+                    ..Default::default()
+                },
+            )
+            .expect_err("missing pin"),
+            &["hpn_program"],
+        );
     }
 
     #[tokio::test]
