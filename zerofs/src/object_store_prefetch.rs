@@ -497,6 +497,7 @@ enum WindowPlan {
     Covered,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn admit_part(
     parts: &HybridCache<PartKey, Bytes>,
     part_counts: &Cache<Path, usize>,
@@ -521,6 +522,7 @@ fn admit_part(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn evict_location_parts(
     parts: &HybridCache<PartKey, Bytes>,
     heads: &Cache<Path, Arc<CachedHead>>,
@@ -736,6 +738,10 @@ impl PrefetchingObjectStore {
     /// Drop every cached part for `location` plus heads / generations /
     /// access_tracker. Called from delete so a reclaim that only drops
     /// heads cannot keep charging foyer for the dead 32 MiB parts.
+    ///
+    /// Only exercised through `delete` and tests today; the binary target
+    /// (which re-declares these modules) would otherwise flag it dead.
+    #[allow(dead_code)]
     pub fn evict_location(&self, location: &Path) {
         evict_location_parts(
             &self.parts,
@@ -761,6 +767,9 @@ impl PrefetchingObjectStore {
 
     /// ObjectStore delete that evicts first so a failed backend delete
     /// still uncharges the user cache.
+    ///
+    /// Part of the lib public API; unused inside the binary target.
+    #[allow(dead_code)]
     pub async fn delete(&self, location: &Path) -> object_store::Result<()> {
         self.evict_location(location);
         object_store::ObjectStoreExt::delete(&*self.inner, location).await
@@ -1229,6 +1238,7 @@ impl PrefetchingObjectStore {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn save_parts_stream<S>(
         parts: &HybridCache<PartKey, Bytes>,
         part_counts: &Cache<Path, usize>,
