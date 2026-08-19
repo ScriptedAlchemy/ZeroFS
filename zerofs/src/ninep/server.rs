@@ -17,12 +17,11 @@ use ninep_proto::{
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, UnixListener};
 #[cfg(test)]
 use tokio::sync::oneshot;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
-use tokio_util::codec::LengthDelimitedCodec;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::{AbortOnDropHandle, TaskTracker};
 use tracing::{debug, error, info, warn};
@@ -71,6 +70,7 @@ pub(crate) struct P9GlobalAdmission {
     bytes: Arc<Semaphore>,
     requests: Arc<Semaphore>,
     transports: Arc<Semaphore>,
+    receive_bytes: Arc<Semaphore>,
     byte_limit: usize,
     request_limit: usize,
     transport_limit: usize,
@@ -93,20 +93,38 @@ impl P9GlobalAdmission {
             bytes: Arc::new(Semaphore::new(byte_limit)),
             requests: Arc::new(Semaphore::new(request_limit)),
             transports: Arc::new(Semaphore::new(transport_limit)),
+            receive_bytes: Arc::new(Semaphore::new(transport_limit * P9_MAX_MSIZE as usize)),
             byte_limit,
             request_limit,
             transport_limit,
         }
     }
 
-    pub(crate) async fn admit_transport(self: &Arc<Self>) -> anyhow::Result<P9TransportPermit> {
+    pub(crate) fn try_admit_transport(self: &Arc<Self>) -> anyhow::Result<P9TransportPermit> {
         metrics::gauge!("zerofs_p9_transport_session_capacity").set(self.transport_limit as f64);
         metrics::gauge!("zerofs_p9_memory_bound_bytes").set(DOCUMENTED_P9_MEMORY_BOUND as f64);
-        let waiting = P9TransportWaitMetricGuard::new();
-        let permit = Arc::clone(&self.transports).acquire_owned().await?;
-        drop(waiting);
+        let permit = Arc::clone(&self.transports)
+            .try_acquire_owned()
+            .map_err(|_| anyhow::anyhow!("9P transport capacity exhausted"))?;
         metrics::gauge!("zerofs_p9_active_sessions").increment(1.0);
         Ok(P9TransportPermit { _permit: permit })
+    }
+
+    pub(crate) async fn admit_receive(
+        self: &Arc<Self>,
+        shutdown: &CancellationToken,
+    ) -> anyhow::Result<P9ReceivePermit> {
+        let permits = P9_MAX_MSIZE;
+        let permit = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => anyhow::bail!("9P receive cancelled by shutdown"),
+            result = Arc::clone(&self.receive_bytes).acquire_many_owned(permits) => result?,
+        };
+        metrics::gauge!("zerofs_p9_receive_reserved_bytes").increment(f64::from(permits));
+        Ok(P9ReceivePermit {
+            _permit: permit,
+            reserved_bytes: permits as usize,
+        })
     }
 
     pub(crate) fn connection(self: &Arc<Self>) -> P9ConnectionAdmission {
@@ -158,6 +176,8 @@ impl P9GlobalAdmission {
             reserved_bytes: self.byte_limit - self.bytes.available_permits(),
             active_requests: self.request_limit - self.requests.available_permits(),
             active_transports: self.transport_limit - self.transports.available_permits(),
+            receive_reserved_bytes: self.transport_limit * P9_MAX_MSIZE as usize
+                - self.receive_bytes.available_permits(),
         }
     }
 }
@@ -168,6 +188,7 @@ struct P9AdmissionSnapshot {
     reserved_bytes: usize,
     active_requests: usize,
     active_transports: usize,
+    receive_reserved_bytes: usize,
 }
 
 pub(crate) struct P9TransportPermit {
@@ -180,18 +201,14 @@ impl Drop for P9TransportPermit {
     }
 }
 
-struct P9TransportWaitMetricGuard;
-
-impl P9TransportWaitMetricGuard {
-    fn new() -> Self {
-        metrics::gauge!("zerofs_p9_transport_session_waiters").increment(1.0);
-        Self
-    }
+pub(crate) struct P9ReceivePermit {
+    _permit: OwnedSemaphorePermit,
+    reserved_bytes: usize,
 }
 
-impl Drop for P9TransportWaitMetricGuard {
+impl Drop for P9ReceivePermit {
     fn drop(&mut self) {
-        metrics::gauge!("zerofs_p9_transport_session_waiters").decrement(1.0);
+        metrics::gauge!("zerofs_p9_receive_reserved_bytes").decrement(self.reserved_bytes as f64);
     }
 }
 
@@ -204,10 +221,25 @@ pub(crate) struct P9ConnectionAdmission {
 }
 
 impl P9ConnectionAdmission {
+    #[cfg(test)]
     async fn admit_request(
         &self,
         request_bytes: usize,
         possible_response_bytes: usize,
+    ) -> anyhow::Result<P9AdmissionPermit> {
+        self.admit_request_or_shutdown(
+            request_bytes,
+            possible_response_bytes,
+            &CancellationToken::new(),
+        )
+        .await
+    }
+
+    async fn admit_request_or_shutdown(
+        &self,
+        request_bytes: usize,
+        possible_response_bytes: usize,
+        shutdown: &CancellationToken,
     ) -> anyhow::Result<P9AdmissionPermit> {
         let reserved_bytes = request_bytes
             .checked_add(possible_response_bytes)
@@ -221,12 +253,14 @@ impl P9ConnectionAdmission {
         // Take the process-wide task slot first. Otherwise an unbounded number
         // of reconnecting sessions could each hold a full frame while queued
         // behind this semaphore on their independent connection-local slots.
-        let global_request = Arc::clone(&self.global.requests).acquire_owned().await?;
-        let local_request = Arc::clone(&self.requests).acquire_owned().await?;
-        let local_bytes = Arc::clone(&self.bytes).acquire_many_owned(permits).await?;
-        let global_bytes = Arc::clone(&self.global.bytes)
-            .acquire_many_owned(permits)
-            .await?;
+        let global_request =
+            acquire_owned_or_shutdown(Arc::clone(&self.global.requests), 1, shutdown).await?;
+        let local_request =
+            acquire_owned_or_shutdown(Arc::clone(&self.requests), 1, shutdown).await?;
+        let local_bytes =
+            acquire_owned_or_shutdown(Arc::clone(&self.bytes), permits, shutdown).await?;
+        let global_bytes =
+            acquire_owned_or_shutdown(Arc::clone(&self.global.bytes), permits, shutdown).await?;
 
         metrics::gauge!("zerofs_p9_inflight_reserved_bytes").increment(reserved_bytes as f64);
         metrics::gauge!("zerofs_p9_inflight_requests").increment(1.0);
@@ -237,6 +271,18 @@ impl P9ConnectionAdmission {
             _global_bytes: global_bytes,
             reserved_bytes,
         })
+    }
+}
+
+async fn acquire_owned_or_shutdown(
+    semaphore: Arc<Semaphore>,
+    permits: u32,
+    shutdown: &CancellationToken,
+) -> anyhow::Result<OwnedSemaphorePermit> {
+    tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => anyhow::bail!("9P admission cancelled by shutdown"),
+        result = semaphore.acquire_many_owned(permits) => Ok(result?),
     }
 }
 
@@ -303,8 +349,22 @@ pub(crate) async fn settle_request_tasks(requests: TaskTracker) {
         return;
     }
     metrics::counter!("zerofs_p9_post_disconnect_requests_total").increment(settling as u64);
-    let _settling_metric = P9SettlingMetricGuard::new();
-    requests.wait().await;
+    let settling_metric = P9SettlingMetricGuard::new();
+    if tokio::time::timeout(CLIENT_DRAIN_TIMEOUT, requests.wait())
+        .await
+        .is_ok()
+    {
+        return;
+    }
+
+    // Accepted mutation work retains its handler and admission permits. Do not
+    // abort it merely to let a disconnected session retire; continue settling
+    // in the server runtime after the connection task returns.
+    metrics::counter!("zerofs_p9_detached_settlements_total").increment(1);
+    drop(spawn_named("9p-request-settlement", async move {
+        let _settling_metric = settling_metric;
+        requests.wait().await;
+    }));
 }
 
 /// Whether a serialized response requires serving authority.
@@ -391,6 +451,7 @@ impl NinePServer {
         write_stream: W,
         shutdown: &CancellationToken,
         client_name: String,
+        transport: P9TransportPermit,
     ) -> AbortOnDropHandle<()>
     where
         R: AsyncRead + Unpin + Send + 'static,
@@ -407,6 +468,7 @@ impl NinePServer {
                 filesystem,
                 lock_manager,
                 client_shutdown,
+                transport,
             )
             .await
             {
@@ -447,6 +509,13 @@ impl NinePServer {
                                 warn!("Failed to configure 9P TCP client {peer_addr}: {e}");
                                 continue;
                             }
+                            let transport = match P9GlobalAdmission::shared().try_admit_transport() {
+                                Ok(transport) => transport,
+                                Err(error) => {
+                                    warn!("Rejecting 9P TCP client {peer_addr}: {error}");
+                                    continue;
+                                }
+                            };
                             let (read_half, write_half) = stream.into_split();
                             clients.push(
                                 self.spawn_client_handler(
@@ -454,6 +523,7 @@ impl NinePServer {
                                     write_half,
                                     &clients_shutdown,
                                     peer_addr.to_string(),
+                                    transport,
                                 ),
                             );
                         }
@@ -489,6 +559,13 @@ impl NinePServer {
                                 Err(e) => break Err(e),
                             };
                             info!("9P client connected via Unix socket");
+                            let transport = match P9GlobalAdmission::shared().try_admit_transport() {
+                                Ok(transport) => transport,
+                                Err(error) => {
+                                    warn!("Rejecting 9P Unix client: {error}");
+                                    continue;
+                                }
+                            };
                             let (read_half, write_half) = stream.into_split();
                             clients.push(
                                 self.spawn_client_handler(
@@ -496,6 +573,7 @@ impl NinePServer {
                                     write_half,
                                     &clients_shutdown,
                                     "unix".to_string(),
+                                    transport,
                                 ),
                             );
                         }
@@ -688,14 +766,12 @@ async fn handle_client_stream<R, W>(
     filesystem: Arc<ZeroFS>,
     lock_manager: Arc<FileLockManager>,
     shutdown: CancellationToken,
+    _transport: P9TransportPermit,
 ) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    // Acquire before constructing the decoder or polling the transport. A
-    // waiting connection therefore cannot retain an uncharged protocol frame.
-    let _transport = P9GlobalAdmission::shared().admit_transport().await?;
     let handler = Arc::new(NinePHandler::new(Arc::clone(&filesystem), lock_manager));
     let admission = P9GlobalAdmission::shared().connection();
     let requests = TaskTracker::new();
@@ -1077,6 +1153,7 @@ pub(crate) async fn dispatch_9p_frame(
     inflight: &InflightRegistry,
     admission: &P9ConnectionAdmission,
     requests: &TaskTracker,
+    shutdown: &CancellationToken,
 ) -> anyhow::Result<()> {
     if frame.len() < P9_MIN_MESSAGE_SIZE as usize {
         error!("Message too short: {} bytes", frame.len());
@@ -1091,7 +1168,7 @@ pub(crate) async fn dispatch_9p_frame(
     // before detaching request work. Bulk writes have a fixed-size Rwrite;
     // other requests retain the full negotiated-response allowance.
     let admission = admission
-        .admit_request(frame.len(), possible_response_bytes(type_byte))
+        .admit_request_or_shutdown(frame.len(), possible_response_bytes(type_byte), shutdown)
         .await?;
 
     let tag = u16::from_le_bytes([frame[5], frame[6]]);
@@ -1222,7 +1299,7 @@ pub(crate) async fn dispatch_9p_frame(
 
 async fn handle_client_loop<R>(
     handler: Arc<NinePHandler>,
-    read_stream: R,
+    mut read_stream: R,
     tx: mpsc::Sender<P9Response>,
     shutdown: CancellationToken,
     admission: &P9ConnectionAdmission,
@@ -1233,40 +1310,57 @@ where
 {
     let inflight = InflightRegistry::default();
 
-    let codec = LengthDelimitedCodec::builder()
-        .little_endian()
-        .length_field_offset(0)
-        .length_field_length(P9_SIZE_FIELD_LEN)
-        .length_adjustment(0)
-        .num_skip(0)
-        .max_frame_length(P9_MAX_MSIZE as usize)
-        .new_read(read_stream);
-
-    tokio::pin!(codec);
-
     loop {
-        let full_buf = tokio::select! {
-            biased;
-            _ = shutdown.cancelled() => {
-                debug!("9P client handler shutting down");
-                return Ok(());
-            }
-            result = codec.next() => {
-                match result {
-                    Some(Ok(buf)) => buf.freeze(),
-                    Some(Err(e)) => {
-                        return Err(e.into());
-                    }
-                    None => {
-                        debug!("Client disconnected");
-                        return Ok(());
-                    }
-                }
-            }
+        // Hold a maximum-frame receive credit before polling the transport.
+        // The exact reader below never allocates a replacement decode buffer.
+        let receive = admission.global.admit_receive(&shutdown).await?;
+        let Some(full_buf) = read_9p_frame(&mut read_stream, &shutdown).await? else {
+            debug!("Client disconnected");
+            return Ok(());
         };
 
-        dispatch_9p_frame(full_buf, &handler, &tx, &inflight, admission, requests).await?;
+        dispatch_9p_frame(
+            full_buf, &handler, &tx, &inflight, admission, requests, &shutdown,
+        )
+        .await?;
+        drop(receive);
     }
+}
+
+async fn read_9p_frame<R>(
+    reader: &mut R,
+    shutdown: &CancellationToken,
+) -> anyhow::Result<Option<Bytes>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut header = [0u8; P9_SIZE_FIELD_LEN];
+    let header_result = tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => return Ok(None),
+        result = reader.read_exact(&mut header) => result,
+    };
+    if let Err(error) = header_result {
+        return if error.kind() == std::io::ErrorKind::UnexpectedEof {
+            Ok(None)
+        } else {
+            Err(error.into())
+        };
+    }
+
+    let frame_len = u32::from_le_bytes(header) as usize;
+    if frame_len < P9_MIN_MESSAGE_SIZE as usize || frame_len > P9_MAX_MSIZE as usize {
+        anyhow::bail!("invalid 9P frame length {frame_len}");
+    }
+    let mut frame = Vec::with_capacity(frame_len);
+    frame.extend_from_slice(&header);
+    frame.resize(frame_len, 0);
+    tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => return Ok(None),
+        result = reader.read_exact(&mut frame[P9_SIZE_FIELD_LEN..]) => { result?; }
+    }
+    Ok(Some(Bytes::from(frame)))
 }
 
 #[cfg(test)]
@@ -1290,21 +1384,22 @@ mod tests {
     #[tokio::test]
     async fn transport_receive_envelope_bounds_reconnect_frames() {
         const TEST_TRANSPORTS: usize = GLOBAL_TRANSPORT_SESSIONS;
-        let global = P9GlobalAdmission::for_test_with_transports(32, 4, TEST_TRANSPORTS);
+        let global = P9GlobalAdmission::for_test_with_transports(
+            GLOBAL_INFLIGHT_MEMORY,
+            GLOBAL_INFLIGHT_REQUESTS,
+            TEST_TRANSPORTS,
+        );
         let mut admitted = Vec::new();
         for _ in 0..TEST_TRANSPORTS {
-            admitted.push(global.admit_transport().await.unwrap());
+            admitted.push(global.try_admit_transport().unwrap());
         }
 
-        let mut reconnects = (0..128)
-            .map(|_| global.admit_transport())
-            .collect::<FuturesUnordered<_>>();
-        assert!(
-            tokio::time::timeout(QUIET_TIMEOUT, reconnects.next())
-                .await
-                .is_err(),
-            "128 concurrent reconnects must wait before frame receive"
-        );
+        for _ in 0..128 {
+            assert!(
+                global.try_admit_transport().is_err(),
+                "excess reconnects must be rejected before handler spawn or WebSocket upgrade"
+            );
+        }
         assert_eq!(global.snapshot().active_transports, TEST_TRANSPORTS);
         assert!(
             global.transport_limit >= 32,
@@ -1317,9 +1412,50 @@ mod tests {
             "the admitted budget plus one maximum frame per transport is the documented bound"
         );
 
-        drop(reconnects);
         drop(admitted);
         assert_eq!(global.snapshot().active_transports, 0);
+    }
+
+    #[tokio::test]
+    async fn exact_reader_transfers_a_max_frame_from_receive_to_request_credit() {
+        let global = P9GlobalAdmission::for_test_with_transports(
+            P9_MAX_MSIZE as usize + P9_RWRITE_MAX_SIZE,
+            1,
+            1,
+        );
+        let _transport = global.try_admit_transport().unwrap();
+        let connection = global.connection_for_test(P9_MAX_MSIZE as usize + P9_RWRITE_MAX_SIZE, 1);
+        let shutdown = CancellationToken::new();
+        let receive = global.admit_receive(&shutdown).await.unwrap();
+        let (mut client, mut server) = tokio::io::duplex(P9_MAX_MSIZE as usize + 1);
+        let mut encoded = vec![0; P9_MAX_MSIZE as usize];
+        encoded[..P9_SIZE_FIELD_LEN].copy_from_slice(&P9_MAX_MSIZE.to_le_bytes());
+        let writer = tokio::spawn(async move { client.write_all(&encoded).await });
+
+        let frame = read_9p_frame(&mut server, &shutdown)
+            .await
+            .unwrap()
+            .expect("maximum frame");
+        writer.await.unwrap().unwrap();
+        assert_eq!(frame.len(), P9_MAX_MSIZE as usize);
+        assert_eq!(
+            global.snapshot().receive_reserved_bytes,
+            P9_MAX_MSIZE as usize,
+            "the complete frame allocation must remain covered by receive credit"
+        );
+
+        let admitted = connection
+            .admit_request(frame.len(), P9_RWRITE_MAX_SIZE)
+            .await
+            .unwrap();
+        drop(receive);
+        assert_eq!(global.snapshot().receive_reserved_bytes, 0);
+        assert_eq!(
+            global.snapshot().reserved_bytes,
+            P9_MAX_MSIZE as usize + P9_RWRITE_MAX_SIZE
+        );
+        drop(frame);
+        drop(admitted);
     }
 
     #[tokio::test]
@@ -1396,6 +1532,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shutdown_cancels_blocked_request_admission_without_leaking_permits() {
+        let global = P9GlobalAdmission::for_test(8, 2);
+        let first_connection = global.connection_for_test(8, 1);
+        let blocked_connection = global.connection_for_test(8, 1);
+        let first = first_connection.admit_request(8, 0).await.unwrap();
+        let shutdown = CancellationToken::new();
+        let blocked_shutdown = shutdown.clone();
+        let blocked = tokio::spawn(async move {
+            blocked_connection
+                .admit_request_or_shutdown(1, 0, &blocked_shutdown)
+                .await
+        });
+        tokio::task::yield_now().await;
+        shutdown.cancel();
+
+        assert!(
+            tokio::time::timeout(TEST_TIMEOUT, blocked)
+                .await
+                .expect("shutdown-aware admission must return")
+                .unwrap()
+                .is_err()
+        );
+        drop(first);
+        assert_eq!(
+            global.snapshot(),
+            P9AdmissionSnapshot {
+                reserved_bytes: 0,
+                active_requests: 0,
+                active_transports: 0,
+                receive_reserved_bytes: 0,
+            }
+        );
+    }
+
+    #[tokio::test]
     async fn request_task_limit_bounds_tiny_frames() {
         let global = P9GlobalAdmission::for_test(128, 1);
         let connection = global.connection_for_test(128, 1);
@@ -1462,6 +1633,7 @@ mod tests {
                 reserved_bytes: 0,
                 active_requests: 0,
                 active_transports: 0,
+                receive_reserved_bytes: 0,
             },
             "transport completion must release both byte and request permits once"
         );
@@ -1490,6 +1662,7 @@ mod tests {
                 reserved_bytes: 16,
                 active_requests: 2,
                 active_transports: 0,
+                receive_reserved_bytes: 0,
             }
         );
     }
@@ -1528,6 +1701,7 @@ mod tests {
                 reserved_bytes: 0,
                 active_requests: 0,
                 active_transports: 0,
+                receive_reserved_bytes: 0,
             }
         );
     }
@@ -1553,6 +1727,35 @@ mod tests {
         tokio::time::timeout(TEST_TIMEOUT, settlement)
             .await
             .expect("settled requests must release the disconnected session")
+            .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timed_out_settlement_keeps_accepted_work_alive_after_connection_return() {
+        let requests = TaskTracker::new();
+        let release = Arc::new(Notify::new());
+        let task_release = Arc::clone(&release);
+        let (finished_tx, mut finished_rx) = oneshot::channel();
+        requests.spawn(async move {
+            task_release.notified().await;
+            let _ = finished_tx.send(());
+        });
+
+        let settlement = tokio::spawn(settle_request_tasks(requests));
+        tokio::task::yield_now().await;
+        tokio::time::advance(CLIENT_DRAIN_TIMEOUT + Duration::from_millis(1)).await;
+        settlement
+            .await
+            .expect("connection settlement must return after its bound");
+        assert!(
+            finished_rx.try_recv().is_err(),
+            "accepted work must not be aborted at the connection deadline"
+        );
+
+        release.notify_waiters();
+        tokio::time::timeout(TEST_TIMEOUT, finished_rx)
+            .await
+            .expect("detached accepted work must finish in the server runtime")
             .unwrap();
     }
 
@@ -1626,9 +1829,17 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(1);
         let inflight = InflightRegistry::default();
 
-        dispatch_9p_frame(frame, &handler, &tx, &inflight, &admission, &requests)
-            .await
-            .unwrap();
+        dispatch_9p_frame(
+            frame,
+            &handler,
+            &tx,
+            &inflight,
+            &admission,
+            &requests,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
         tokio::time::timeout(TEST_TIMEOUT, dropped_rx)
             .await
             .expect("retry payload allocation must be dropped while the first remains in flight")
@@ -1684,6 +1895,7 @@ mod tests {
             &InflightRegistry::default(),
             &admission,
             &requests,
+            &CancellationToken::new(),
         )
         .await
         .unwrap();
@@ -1812,6 +2024,7 @@ mod tests {
                 &self.inflight,
                 &self.admission,
                 &self.requests,
+                &CancellationToken::new(),
             )
             .await
             .unwrap();
@@ -2074,6 +2287,31 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn listener_shutdown_completes_with_an_idle_accepted_client() {
+        let filesystem = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("ninep-shutdown.sock");
+        let server = NinePServer::new_unix(filesystem, socket.clone());
+        let shutdown = CancellationToken::new();
+        let server_shutdown = shutdown.clone();
+        let task = tokio::spawn(async move { server.start(server_shutdown).await });
+
+        let client = loop {
+            match tokio::net::UnixStream::connect(&socket).await {
+                Ok(client) => break client,
+                Err(_) => tokio::task::yield_now().await,
+            }
+        };
+        shutdown.cancel();
+        tokio::time::timeout(TEST_TIMEOUT, task)
+            .await
+            .expect("listener and accepted client must stop after shutdown")
+            .unwrap()
+            .unwrap();
+        drop(client);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn timed_join_aborts_and_awaits_the_task_before_returning() {
         let (started_tx, started_rx) = oneshot::channel();
@@ -2287,6 +2525,7 @@ mod tests {
             &inflight,
             &admission,
             &requests,
+            &CancellationToken::new(),
         )
         .await
         .unwrap();

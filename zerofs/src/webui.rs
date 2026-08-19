@@ -57,10 +57,10 @@ async fn counted_test_ws_upgrade(
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let drain_guard = state.app.ws_drain.token();
     let transport = P9GlobalAdmission::shared()
-        .admit_transport()
-        .await
+        .try_admit_transport()
         .expect("test WebSocket transport admission");
-    ws.on_upgrade(move |socket| handle_9p_ws(socket, state.app, drain_guard, transport))
+    configure_9p_ws(ws)
+        .on_upgrade(move |socket| handle_9p_ws(socket, state.app, drain_guard, transport))
 }
 
 #[cfg(test)]
@@ -86,10 +86,15 @@ pub(crate) fn test_9p_websocket_router(
 
 const WS_DRAIN_TIMEOUT: std::time::Duration = crate::replication::RESPONSE_DRAIN_TIMEOUT;
 
+fn configure_9p_ws(ws: WebSocketUpgrade) -> WebSocketUpgrade {
+    ws.max_message_size(ninep_proto::P9_MAX_MSIZE as usize)
+        .max_frame_size(ninep_proto::P9_MAX_MSIZE as usize)
+}
+
 async fn ws_9p_upgrade(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
     // Gate before completing the upgrade so a queued client cannot deliver a
     // full WebSocket frame outside the process receive envelope.
-    let transport = match P9GlobalAdmission::shared().admit_transport().await {
+    let transport = match P9GlobalAdmission::shared().try_admit_transport() {
         Ok(transport) => transport,
         Err(error) => {
             error!("9P WebSocket transport admission failed: {error}");
@@ -98,7 +103,8 @@ async fn ws_9p_upgrade(ws: WebSocketUpgrade, State(state): State<AppState>) -> i
     };
     // Register the session before returning the upgrade response.
     let drain_guard = state.ws_drain.token();
-    ws.on_upgrade(move |socket| handle_9p_ws(socket, state, drain_guard, transport))
+    configure_9p_ws(ws)
+        .on_upgrade(move |socket| handle_9p_ws(socket, state, drain_guard, transport))
         .into_response()
 }
 
@@ -154,6 +160,16 @@ async fn handle_9p_ws(
 
     use futures::StreamExt;
     loop {
+        let receive = match P9GlobalAdmission::shared()
+            .admit_receive(&state.shutdown)
+            .await
+        {
+            Ok(receive) => receive,
+            Err(error) => {
+                debug!("9P WebSocket receive admission ended: {error}");
+                break;
+            }
+        };
         let next = tokio::select! {
             biased;
             _ = state.shutdown.cancelled() => {
@@ -168,8 +184,16 @@ async fn handle_9p_ws(
         };
         match next {
             Some(Ok(WsMessage::Binary(data))) => {
-                if let Err(e) =
-                    dispatch_9p_frame(data, &handler, &tx, &inflight, &admission, &requests).await
+                if let Err(e) = dispatch_9p_frame(
+                    data,
+                    &handler,
+                    &tx,
+                    &inflight,
+                    &admission,
+                    &requests,
+                    &state.shutdown,
+                )
+                .await
                 {
                     error!("9P WebSocket dispatch error: {}", e);
                     break;
@@ -185,6 +209,7 @@ async fn handle_9p_ws(
             }
             _ => {} // ping/pong/text ignored
         }
+        drop(receive);
     }
 
     // Disconnect before awaiting request tasks to block late resource installs.
@@ -340,6 +365,7 @@ mod tests {
     use axum::http::StatusCode;
     use axum::routing::post;
     use std::process::Stdio;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[derive(Clone)]
     struct SmokeState {
@@ -356,10 +382,9 @@ mod tests {
         let connection_closed = state.connection_closed.clone();
         let drain_guard = state.app.ws_drain.token();
         let transport = P9GlobalAdmission::shared()
-            .admit_transport()
-            .await
+            .try_admit_transport()
             .expect("smoke WebSocket transport admission");
-        ws.on_upgrade(move |socket| async move {
+        configure_9p_ws(ws).on_upgrade(move |socket| async move {
             tokio::select! {
                 _ = handle_9p_ws(socket, state.app, drain_guard, transport) => {}
                 _ = connection_shutdown.cancelled() => {}
@@ -381,6 +406,71 @@ mod tests {
             Ok(()) => StatusCode::NO_CONTENT,
             Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
+    }
+
+    #[tokio::test]
+    async fn websocket_rejects_messages_above_the_p9_limit() {
+        let filesystem = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let app = Router::new()
+            .route("/ws/9p", get(ws_9p_upgrade))
+            .with_state(AppState {
+                filesystem,
+                lock_manager: Arc::new(FileLockManager::new()),
+                uid: 0,
+                gid: 0,
+                shutdown: CancellationToken::new(),
+                ws_drain: TaskTracker::new(),
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+        client
+            .write_all(
+                format!(
+                    "GET /ws/9p HTTP/1.1\r\nHost: {address}\r\nUpgrade: websocket\r\n\
+                     Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+                     Sec-WebSocket-Version: 13\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut handshake = Vec::new();
+        loop {
+            let mut byte = [0];
+            client.read_exact(&mut byte).await.unwrap();
+            handshake.push(byte[0]);
+            if handshake.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+        assert!(handshake.starts_with(b"HTTP/1.1 101"));
+
+        // A masked binary frame whose declared payload is one byte above the
+        // P9 transport limit. Sending only its header proves the WebSocket
+        // layer rejects the frame from its declared length, before buffering
+        // a body outside the global receive envelope.
+        let oversize = u64::from(ninep_proto::P9_MAX_MSIZE) + 1;
+        let mut frame_header = vec![0x82, 0xff];
+        frame_header.extend_from_slice(&oversize.to_be_bytes());
+        frame_header.extend_from_slice(&[0; 4]);
+        client.write_all(&frame_header).await.unwrap();
+
+        let mut response = [0; 2];
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.read(&mut response),
+        )
+        .await
+        .expect("oversize WebSocket must be closed promptly")
+        .unwrap();
+        assert!(
+            read == 0 || response[0] & 0x0f == 0x08,
+            "oversize frame produced a non-close WebSocket response: {response:?}"
+        );
+        server.abort();
+        let _ = server.await;
     }
 
     /// Browser-runtime smoke test requiring generated wasm output and Node 22.
