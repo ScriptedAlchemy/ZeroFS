@@ -42,12 +42,18 @@ test "${#SLICE_SHA}" = 40
 git show --stat --oneline "$SLICE_SHA"
 git push origin "$SLICE_SHA:refs/heads/codex/unified-tiered-writeback"
 test "$(git ls-remote origin refs/heads/codex/unified-tiered-writeback | awk '{print $1}')" = "$SLICE_SHA"
+CONTROLLER_TARGET_RECEIPT="$(python3 scripts/tiered-writeback-e2e.py verify-controller-target --controller-ssh-target ubuntu-main --expected-host-key-sha256 "${ZEROFS_VM100_HOST_KEY_SHA256:?}" --format target-token)"
+case "$CONTROLLER_TARGET_RECEIPT" in ''|*[!A-Za-z0-9_-]*) exit 1 ;; esac
 ssh ubuntu-main "cd /fast/projects/ZeroFS && git fetch origin codex/unified-tiered-writeback && test \"\$(git rev-parse origin/codex/unified-tiered-writeback)\" = '$SLICE_SHA'"
 ssh ubuntu-main "test -d /fast/projects/ZeroFS-unified-tiered-writeback || (cd /fast/projects/ZeroFS && git worktree add --detach /fast/projects/ZeroFS-unified-tiered-writeback '$SLICE_SHA')"
 ssh ubuntu-main "cd /fast/projects/ZeroFS-unified-tiered-writeback && test -z \"\$(git status --porcelain=v1)\" && python3 scripts/tiered-writeback-e2e.py assert-source-idle --source-root /fast/projects/ZeroFS-unified-tiered-writeback && git switch --detach '$SLICE_SHA' && test \"\$(git rev-parse HEAD)\" = '$SLICE_SHA' && test -z \"\$(git status --porcelain=v1)\""
 ```
 
-The slice receipt records the literal expanded `SLICE_SHA` before any Ubuntu command. A Linux-discovered failure returns to RED/implementation/portable GREEN/commit/review, creates a new literal `SLICE_SHA`, and repeats this full block before the failed Linux command is rerun.
+The controller passes `CONTROLLER_TARGET_RECEIPT` into every later `ubuntu-main`
+remote shell; it is never inferred from Ubuntu's hostname. The slice receipt records
+the literal expanded `SLICE_SHA` before any Ubuntu command. A Linux-discovered failure
+returns to RED/implementation/portable GREEN/commit/review, creates a new literal
+`SLICE_SHA`, and repeats this full block before the failed Linux command is rerun.
 
 ---
 
@@ -132,7 +138,7 @@ git commit -m "test: model volatile mutation crash durability"
 - Create: `scripts/tests/test_tiered_writeback_e2e.py`
 
 **Interfaces:**
-- Produces: `setup`, `list-scenarios`, `verify-proof-host`, `run`, `supervise`, `cleanup --ledger`, `assert-clean --ledger`, `ledger-value`, `validate-owned-path`, `archive-control`, `list-ledgers --campaign`, and `assert-source-idle` commands plus JSON receipts.
+- Produces: `setup`, `list-scenarios`, `verify-controller-target`, `verify-proof-host`, `run`, `supervise`, `cleanup --ledger`, `assert-clean --ledger`, `ledger-value`, `validate-owned-path`, `archive-control`, `list-ledgers --campaign`, and `assert-source-idle` commands plus JSON receipts.
 - Consumes: exact ZeroFS binary/config SHA, Ubuntu sudo, unused UUID-owned resources, disposable backend namespace, and real client binaries.
 
 - [ ] **Step 1: Write dependency-free safety RED tests**
@@ -162,6 +168,7 @@ The lifecycle/API suite names
 `test_validate_owned_path_rejects_symlink_escape`,
 `test_validate_archived_receipt_requires_campaign_manifest`,
 `test_list_ledgers_requires_one_archived_decision_authority`, and
+`test_list_ledgers_rejects_host_derived_or_unvalidated_controller_target`,
 `test_controller_target_must_resolve_to_immutable_identity`. Each supervisor test
 injects the failure, asserts the returned status and separate ledger fields, then
 asserts both cleanup attempts and `assert-clean` ran.
@@ -210,8 +217,12 @@ live receipt under `CONTROL_ROOT`, or an archived receipt whose hash and origina
 control-relative path match the campaign archive manifest. Callers select
 `--kind resource|receipt|archived-receipt`.
 
-`list-ledgers --campaign codex-unified-tiered-writeback` reads the persistent run index
-and emits each host/ledger pair once; `--decision-authority c7b --archived
+`list-ledgers --campaign codex-unified-tiered-writeback` reads the persistent run index.
+`--format controller-target-ledger-tsv` loads each ledger, verifies its target receipt
+against the live/archive manifest, validates the normalized target schema, and emits
+exactly `normalized_target<TAB>ledger`. It rejects a hostname copied from the index,
+caller, current machine, or SSH discovery host when no manifest-covered target receipt
+exists. `--decision-authority c7b --archived
 --require-one --format ledger-path` returns exactly one manifest-validated C7B decision
 ledger or fails. `archive-control` copies ledger/receipts to
 `/fast/zerofs-tiered-receipts/$RUN_UUID`, verifies hashes, marks the run-index entry
@@ -232,6 +243,14 @@ fingerprint of `/etc/ssh/ssh_host_ed25519_key.pub`, and rereads `/etc/machine-id
 `/etc/zerofs-proxmox-vmid`; every byte must match. It records identity and controller
 target separately. A target rename creates a new target receipt but never changes the
 machine identity.
+
+For non-NBD hosts, `verify-controller-target --controller-ssh-target TARGET
+--expected-host-key-sha256 SHA256 --format target-token` emits the same canonical
+target receipt without a VMID identity claim. Every `supervise` invocation requires
+`--controller-ssh-target-receipt`; setup validates canonical form and host-key binding,
+stores the normalized target separately from local hostname, and adds the receipt hash
+to the manifest before allocating resources. The NBD proof-host target receipt remains
+additionally bound to its immutable identity token as specified above.
 
 `scenarios.py` owns one immutable `SCENARIOS: dict[str, ScenarioHandler]`. The CLI
 `list-scenarios` prints sorted names and `run` rejects an unknown name or a registry
@@ -274,6 +293,7 @@ EXPECTED_SCENARIOS = {
     "sftp-stock-vs-hpn-download",
     "sftp-stock-vs-hpn-upload",
     "zerofs-sftp-session-scaling",
+    "sftp-transport-decision",
     "hpn-package-winner",
 }
 ```
@@ -294,7 +314,7 @@ cd /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback
 python3 -m compileall -q scripts/tiered_writeback_e2e scripts/tiered-writeback-e2e.py
 python3 -m unittest discover -s scripts/tests -p 'test_*.py' -v
 python3 scripts/tiered-writeback-e2e.py list-scenarios > "${TMPDIR:-/tmp}/zerofs-scenarios.list"
-test "$(wc -l < "${TMPDIR:-/tmp}/zerofs-scenarios.list" | tr -d ' ')" -eq 35
+test "$(wc -l < "${TMPDIR:-/tmp}/zerofs-scenarios.list" | tr -d ' ')" -eq 36
 git diff --check
 git add scripts/tiered-writeback-e2e.py scripts/tiered_writeback_e2e/__init__.py scripts/tiered_writeback_e2e/config.py scripts/tiered_writeback_e2e/resources.py scripts/tiered_writeback_e2e/lifecycle.py scripts/tiered_writeback_e2e/protocols.py scripts/tiered_writeback_e2e/integrity.py scripts/tiered_writeback_e2e/crash.py scripts/tiered_writeback_e2e/linux_suites.py scripts/tiered_writeback_e2e/scenarios.py scripts/tests/test_tiered_writeback_e2e.py
 git commit -m "test: add real tiered writeback Linux harness"
@@ -440,7 +460,7 @@ run_c4() {
   control_root="/var/tmp/zerofs-tiered-control-${run_uuid}"
   resource_root="/var/tmp/zerofs-tiered-resources-${run_uuid}"
   ledger="${control_root}/ledger.json"
-  sudo python3 scripts/tiered-writeback-e2e.py supervise --ledger "$ledger" --control-root "$control_root" --resource-root "$resource_root" --source-sha "$SLICE_SHA" --filesystem-ack-mode volatile_memory --object-ack-mode ssd --scenario "$scenario"
+  sudo python3 scripts/tiered-writeback-e2e.py supervise --ledger "$ledger" --control-root "$control_root" --resource-root "$resource_root" --source-sha "$SLICE_SHA" --controller-ssh-target-receipt "${CONTROLLER_TARGET_RECEIPT:?}" --filesystem-ack-mode volatile_memory --object-ack-mode ssd --scenario "$scenario"
 }
 run_c4 xfstests-nfs-quick
 run_c4 xfstests-ninep-quick-and-strict
@@ -598,7 +618,7 @@ run_crash_scenario() {
   CONTROL_ROOT="/var/tmp/zerofs-tiered-control-${RUN_UUID}"
   RESOURCE_ROOT="/var/tmp/zerofs-tiered-resources-${RUN_UUID}"
   LEDGER="${CONTROL_ROOT}/ledger.json"
-  sudo python3 scripts/tiered-writeback-e2e.py supervise --ledger "$LEDGER" --control-root "$CONTROL_ROOT" --resource-root "$RESOURCE_ROOT" --source-sha "$CRASH_SHA" --filesystem-ack-mode volatile_memory --object-ack-mode "$object_mode" --scenario "$scenario"
+  sudo python3 scripts/tiered-writeback-e2e.py supervise --ledger "$LEDGER" --control-root "$CONTROL_ROOT" --resource-root "$RESOURCE_ROOT" --source-sha "$CRASH_SHA" --controller-ssh-target-receipt "${CONTROLLER_TARGET_RECEIPT:?}" --filesystem-ack-mode volatile_memory --object-ack-mode "$object_mode" --scenario "$scenario"
 }
 run_crash_scenario memory crash-boundary-matrix
 run_crash_scenario ssd local-receipt-restart
@@ -675,7 +695,7 @@ run_uuid="$(python3 -c 'import uuid; print(uuid.uuid4())')"
 control_root="/var/tmp/zerofs-tiered-control-${run_uuid}"
 resource_root="/var/tmp/zerofs-tiered-resources-${run_uuid}"
 ledger="${control_root}/ledger.json"
-sudo python3 scripts/tiered-writeback-e2e.py supervise --ledger "$ledger" --control-root "$control_root" --resource-root "$resource_root" --source-sha "$SLICE_SHA" --filesystem-ack-mode volatile_memory --object-ack-mode ssd --scenario rust-tier-microbenchmarks
+sudo python3 scripts/tiered-writeback-e2e.py supervise --ledger "$ledger" --control-root "$control_root" --resource-root "$resource_root" --source-sha "$SLICE_SHA" --controller-ssh-target-receipt "${CONTROLLER_TARGET_RECEIPT:?}" --filesystem-ack-mode volatile_memory --object-ack-mode ssd --scenario rust-tier-microbenchmarks
 ```
 
 The supervisor owns cancellation and cleanup if listing, scratch validation, any Rust
@@ -695,7 +715,7 @@ run_benchmark_scenario() {
   CONTROL_ROOT="/var/tmp/zerofs-tiered-control-${RUN_UUID}"
   RESOURCE_ROOT="/var/tmp/zerofs-tiered-resources-${RUN_UUID}"
   LEDGER="${CONTROL_ROOT}/ledger.json"
-  sudo python3 scripts/tiered-writeback-e2e.py supervise --ledger "$LEDGER" --control-root "$CONTROL_ROOT" --resource-root "$RESOURCE_ROOT" --source-sha "$SLICE_SHA" --filesystem-ack-mode volatile_memory --object-ack-mode "$object_mode" --scenario "$scenario"
+  sudo python3 scripts/tiered-writeback-e2e.py supervise --ledger "$LEDGER" --control-root "$CONTROL_ROOT" --resource-root "$RESOURCE_ROOT" --source-sha "$SLICE_SHA" --controller-ssh-target-receipt "${CONTROLLER_TARGET_RECEIPT:?}" --filesystem-ack-mode volatile_memory --object-ack-mode "$object_mode" --scenario "$scenario"
 }
 run_benchmark_scenario memory benchmark-ram-ack
 run_benchmark_scenario ssd benchmark-local-ssd
@@ -727,7 +747,9 @@ to resident or used alone to trigger admission. Include a retained-only growth/p
 leg that raises `stats.retained` without a matching RSS/cgroup increase and prove it
 does not create false permanent over-cap or poison. The GC overlap includes one full
 1,024-frame sparse/interleaved candidate and requires at most 32 memory+durable scans,
-no per-frame point-read fanout, and bounded scan working memory.
+at most 4,096 scanned rows and 64 MiB encoded key/value bytes, no per-frame point-read
+fanout, and bounded scan working memory. Budget exhaustion must stop and fail closed to
+`Keep`.
 Before the first process starts, the immutable ledger records these fixed thresholds:
 `cgroup_high_event_delta_max=8`, `reconciliation_error_bytes_max=268435456`, and
 `unowned_residual_bytes_max=2147483648`. They cannot be supplied by scenario output,
@@ -826,13 +848,16 @@ Name dependency-free RED tests that reject:
 - physical residency computed as jemalloc resident plus retained, retained-only growth
   causing backpressure, or a mismatch with OS RSS/cgroup current;
 - a sparse/interleaved full segment issuing more than 32 verification scans or scaling
-  maintenance memory with all 2,048 would-be point reads;
+  beyond 4,096 rows/64 MiB encoded bytes, or scaling maintenance memory with all 2,048
+  would-be point reads;
 - an HPN result without exact executable identity, a direction label, or per-session
   byte evidence;
 - an HPN suite without the pinned `LTESTS` inventory, with an exclusion other than
   `dynamic-forward`, with zero remaining tests, without all six focused transport
   receipts, or without TERM/KILL/reap evidence after a deadline;
 - an upload improvement attributed only to a larger client receive window;
+- a decision authority composed from separate ledgers, mixed source SHAs, stale
+  receipts, fewer than all three SFTP measurements, or receipt-only/no-client work;
 - a global SSH/PATH/update-alternatives mutation or a surviving HPN build/install root.
 
 The memory suite names
@@ -845,12 +870,14 @@ The memory suite names
 `test_reconciliation_error_above_256_mib_is_rejected`, and
 `test_unowned_residual_above_2_gib_is_rejected`,
 `test_retained_virtual_bytes_are_not_physical_rss`, and
-`test_sparse_interleaved_segment_scan_count_is_bounded`. The SFTP suite names
+`test_sparse_interleaved_segment_scan_calls_rows_and_bytes_are_bounded`. The SFTP suite names
 `test_missing_executable_identity_is_rejected`,
 `test_hpn_inventory_and_single_exclusion_are_required`,
 `test_hpn_timeout_must_reap_process_group`,
 `test_upload_cannot_claim_receive_window_only`,
 `test_each_configured_session_must_carry_bytes`, and
+`test_decision_handler_runs_all_three_current_sha_measurements`,
+`test_decision_rejects_mixed_or_stale_measurements`,
 `test_cleanup_removes_hpn_and_remote_prefix`.
 
 ```bash
@@ -883,9 +910,22 @@ Expected RED: the read, resident-memory, and SFTP scenario modules do not exist.
 
 Implement concrete `memory-envelope-nfs-retransmit-gc`,
 `sftp-stock-vs-hpn-download`, `sftp-stock-vs-hpn-upload`, and
-`zerofs-sftp-session-scaling` handlers and register them in C2's `SCENARIOS` map.
+`zerofs-sftp-session-scaling` handlers plus the composite
+`sftp-transport-decision` handler and register them in C2's `SCENARIOS` map.
 Each handler must launch its real clients/processes and produce its typed receipt; a
 handler that only validates arguments or writes a receipt fails the registry contract.
+
+`sftp-transport-decision` is the sole decision-authority producer. Inside one
+`supervise` ledger and one source SHA, it creates one frozen incompressible fixture and
+invokes the same real measurement functions used by the three focused scenarios in
+this exact order: stock-versus-HPN download, stock-versus-HPN durability-matched upload,
+then ZeroFS session scaling. It does not read another ledger or accept arbitrary
+measurement receipt paths. Its typed receipt embeds all three measurement receipts,
+requires each `source_sha` to equal the supervising ledger SHA, records exact bytes,
+hashes, durability, per-session evidence and paired noise bands, then emits the HPN and
+current upload-gap decision fields. A subprocess-free/receipt-only composite handler,
+mixed SHA, missing cell, stale timestamp, or non-success measurement fails before an
+authority receipt is written.
 
 For configured usable read-session ceiling `P`, sweep concurrency
 `{1, ceil(P/2), P, P+1}` over one frozen incompressible fixture manifest. On VM100,
@@ -974,16 +1014,26 @@ The existing historical NBD/raw-SFTP scripts remain developer controls, not fina
 
 - [ ] **Step 1: Promote and run the first real A/B**
 
-Commit C7, review/push it, synchronize the literal SHA to Ubuntu, then run
-`sftp-stock-vs-hpn-download`, `sftp-stock-vs-hpn-upload`, and
-`zerofs-sftp-session-scaling` through `supervise`. A decision receipt records paired
-median/MAD bands and typed booleans `decision.hpn_receive_winner`,
-`decision.zerofs_upload_gap_detected`, and `decision.zerofs_upload_gap_resolved`. An
-initial gap executes Step 3 and requires the final authority to set `resolved=true`,
-record the 40-hex correction SHA, and point to the manifest-covered complete A/B rerun
-receipt. HPN win and initial upload gap may both be true, so both corrections execute.
-When no gap was detected, the receipt still proves ZeroFS parity with its same-session
-raw control and records `resolved=true` before stock is retained.
+Commit C7, review/push it, synchronize the literal SHA to Ubuntu, then run only the
+registered `sftp-transport-decision` composite through `supervise`. The three focused
+scenario names remain diagnostic entry points; their separate ledgers can never be
+combined into a decision authority. The composite receipt records paired median/MAD
+bands and typed booleans `decision.hpn_receive_winner` and
+`decision.zerofs_upload_gap_current`. A current gap executes Step 3. HPN win and an
+upload gap may both be true, so both corrections execute. When no gap exists, the same
+receipt proves ZeroFS parity with its same-session raw control before stock is retained.
+
+```bash
+set -euo pipefail
+run_uuid="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+control_root="/var/tmp/zerofs-tiered-control-${run_uuid}"
+resource_root="/var/tmp/zerofs-tiered-resources-${run_uuid}"
+decision_ledger="${control_root}/ledger.json"
+sudo python3 scripts/tiered-writeback-e2e.py supervise --ledger "$decision_ledger" --control-root "$control_root" --resource-root "$resource_root" --source-sha "$SLICE_SHA" --controller-ssh-target-receipt "${CONTROLLER_TARGET_RECEIPT:?}" --filesystem-ack-mode volatile_memory --object-ack-mode remote --scenario sftp-transport-decision
+decision_receipt="$(python3 scripts/tiered-writeback-e2e.py ledger-value --ledger "$decision_ledger" --key decision_receipt)"
+python3 scripts/tiered-writeback-e2e.py validate-owned-path --ledger "$decision_ledger" --path "$decision_receipt" --kind receipt
+test "$(python3 scripts/tiered-writeback-e2e.py ledger-value --ledger "$decision_ledger" --receipt "$decision_receipt" --key source_sha)" = "$SLICE_SHA"
+```
 
 A missing/inconclusive decision reruns the A/B; it cannot select stock by default.
 The raw upload control requests SFTP fsync (`sftp -f`) and uses the same number of
@@ -1024,6 +1074,9 @@ per-session request depth may a separate RED add bounded
 `[sftp].max_inflight_requests_per_session`. Do not change segment geometry, connection
 count, and request depth simultaneously. Rerun focused SFTP tests, workspace tests,
 then the complete three-scenario A/B from a new literal pushed SHA.
+The rerun is the same `sftp-transport-decision` composite under one fresh supervisor
+ledger at the new SHA, not three independent `supervise` calls. It must report
+`decision.zerofs_upload_gap_current=false` before C7B can complete.
 
 - [ ] **Step 4: Commit the conditional exact fence and rerun Plan A/C7 gates**
 
@@ -1058,19 +1111,20 @@ run_uuid="$(python3 -c 'import uuid; print(uuid.uuid4())')"
 control_root="/var/tmp/zerofs-tiered-control-${run_uuid}"
 resource_root="/var/tmp/zerofs-tiered-resources-${run_uuid}"
 ledger="${control_root}/ledger.json"
-sudo python3 scripts/tiered-writeback-e2e.py supervise --ledger "$ledger" --control-root "$control_root" --resource-root "$resource_root" --source-sha "$SLICE_SHA" --filesystem-ack-mode materialized --object-ack-mode remote --scenario hpn-package-winner
+sudo python3 scripts/tiered-writeback-e2e.py supervise --ledger "$ledger" --control-root "$control_root" --resource-root "$resource_root" --source-sha "$SLICE_SHA" --controller-ssh-target-receipt "${CONTROLLER_TARGET_RECEIPT:?}" --filesystem-ack-mode materialized --object-ack-mode remote --scenario hpn-package-winner
 ```
 
 Stage only files selected by the typed decision receipt and commit `perf(sftp): land
 the measured transport result`. Review, push, synchronize the new literal SHA, and
-rerun all three A/B scenarios. A packaged winner must show ZeroFS actually spawning
+rerun the composite decision scenario with `--decision-authority c7b`. A packaged winner must show ZeroFS actually spawning
 the ledger-staged pinned executable in the isolated Ubuntu receipt; installation under
 `/srv` remains deferred to a separately approved deployment. A dormant selector, benchmark-
 only HPN binary, or unrepeated upload tuning does not complete C7B.
 
-The final three-scenario rerun writes its typed flags and receipt path into one ledger
-tagged `decision_authority=c7b`. Validate that live receipt with `validate-owned-path
---kind receipt`, then run `archive-control`; the campaign index must contain exactly one
+The final composite rerun writes all three current-SHA measurements, typed flags, and
+receipt path into one ledger tagged `decision_authority=c7b`. Validate that live receipt with `validate-owned-path
+--kind receipt`, require its `source_sha` to equal the synchronized correction SHA and
+`decision.zerofs_upload_gap_current=false`, then run `archive-control`; the campaign index must contain exactly one
 successful archived C7B authority after superseded decision ledgers are retained as
 non-authoritative history. C8 discovers this authority through `list-ledgers`, never a
 free-form decision environment value.
@@ -1170,7 +1224,7 @@ run_final_scenario() {
   CONTROL_ROOT="/var/tmp/zerofs-tiered-control-${RUN_UUID}"
   RESOURCE_ROOT="/var/tmp/zerofs-tiered-resources-${RUN_UUID}"
   LEDGER="${CONTROL_ROOT}/ledger.json"
-  sudo python3 scripts/tiered-writeback-e2e.py supervise --ledger "$LEDGER" --control-root "$CONTROL_ROOT" --resource-root "$RESOURCE_ROOT" --source-sha "$FINAL_PROOF_SHA" --filesystem-ack-mode "$filesystem_mode" --object-ack-mode "$object_mode" --scenario "$scenario"
+  sudo python3 scripts/tiered-writeback-e2e.py supervise --ledger "$LEDGER" --control-root "$CONTROL_ROOT" --resource-root "$RESOURCE_ROOT" --source-sha "$FINAL_PROOF_SHA" --controller-ssh-target-receipt "${CONTROLLER_TARGET_RECEIPT:?}" --filesystem-ack-mode "$filesystem_mode" --object-ack-mode "$object_mode" --scenario "$scenario"
 }
 run_final_scenario volatile_memory memory ninep-fsync-covers-prior-nfs
 run_final_scenario volatile_memory memory webui-rpc-production-path
@@ -1195,36 +1249,26 @@ run_final_scenario volatile_memory ssd benchmark-100gib-ram-to-ssd-transition
 run_final_scenario volatile_memory ssd benchmark-ssd-pressure-to-remote-pacing
 run_final_scenario volatile_memory ssd rust-tier-microbenchmarks
 run_final_scenario volatile_memory ssd memory-envelope-nfs-retransmit-gc
-run_final_scenario volatile_memory remote sftp-stock-vs-hpn-download
-run_final_scenario volatile_memory remote sftp-stock-vs-hpn-upload
-run_final_scenario volatile_memory remote zerofs-sftp-session-scaling
-C7B_DECISION_LEDGER="$(python3 scripts/tiered-writeback-e2e.py list-ledgers --campaign codex-unified-tiered-writeback --decision-authority c7b --archived --require-one --format ledger-path)"
-test -s "$C7B_DECISION_LEDGER"
-C7B_DECISION_RECEIPT="$(python3 scripts/tiered-writeback-e2e.py ledger-value --ledger "$C7B_DECISION_LEDGER" --key decision_receipt)"
-python3 scripts/tiered-writeback-e2e.py validate-owned-path --ledger "$C7B_DECISION_LEDGER" --path "$C7B_DECISION_RECEIPT" --kind archived-receipt
-HPN_RECEIVE_WINNER="$(python3 scripts/tiered-writeback-e2e.py ledger-value --ledger "$C7B_DECISION_LEDGER" --key decision.hpn_receive_winner)"
-ZEROFS_UPLOAD_GAP_DETECTED="$(python3 scripts/tiered-writeback-e2e.py ledger-value --ledger "$C7B_DECISION_LEDGER" --key decision.zerofs_upload_gap_detected)"
-ZEROFS_UPLOAD_GAP_RESOLVED="$(python3 scripts/tiered-writeback-e2e.py ledger-value --ledger "$C7B_DECISION_LEDGER" --key decision.zerofs_upload_gap_resolved)"
+FINAL_SFTP_UUID="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+FINAL_SFTP_CONTROL="/var/tmp/zerofs-tiered-control-${FINAL_SFTP_UUID}"
+FINAL_SFTP_RESOURCES="/var/tmp/zerofs-tiered-resources-${FINAL_SFTP_UUID}"
+FINAL_SFTP_LEDGER="${FINAL_SFTP_CONTROL}/ledger.json"
+sudo python3 scripts/tiered-writeback-e2e.py supervise --ledger "$FINAL_SFTP_LEDGER" --control-root "$FINAL_SFTP_CONTROL" --resource-root "$FINAL_SFTP_RESOURCES" --source-sha "$FINAL_PROOF_SHA" --controller-ssh-target-receipt "${CONTROLLER_TARGET_RECEIPT:?}" --filesystem-ack-mode volatile_memory --object-ack-mode remote --scenario sftp-transport-decision --decision-authority final-c8
+FINAL_SFTP_RECEIPT="$(python3 scripts/tiered-writeback-e2e.py ledger-value --ledger "$FINAL_SFTP_LEDGER" --key decision_receipt)"
+python3 scripts/tiered-writeback-e2e.py validate-owned-path --ledger "$FINAL_SFTP_LEDGER" --path "$FINAL_SFTP_RECEIPT" --kind receipt
+test "$(python3 scripts/tiered-writeback-e2e.py ledger-value --ledger "$FINAL_SFTP_LEDGER" --receipt "$FINAL_SFTP_RECEIPT" --key source_sha)" = "$FINAL_PROOF_SHA"
+test "$(python3 scripts/tiered-writeback-e2e.py ledger-value --ledger "$FINAL_SFTP_LEDGER" --receipt "$FINAL_SFTP_RECEIPT" --key measurements.sftp_stock_vs_hpn_download)" = true
+test "$(python3 scripts/tiered-writeback-e2e.py ledger-value --ledger "$FINAL_SFTP_LEDGER" --receipt "$FINAL_SFTP_RECEIPT" --key measurements.sftp_stock_vs_hpn_upload)" = true
+test "$(python3 scripts/tiered-writeback-e2e.py ledger-value --ledger "$FINAL_SFTP_LEDGER" --receipt "$FINAL_SFTP_RECEIPT" --key measurements.zerofs_sftp_session_scaling)" = true
+test "$(python3 scripts/tiered-writeback-e2e.py ledger-value --ledger "$FINAL_SFTP_LEDGER" --receipt "$FINAL_SFTP_RECEIPT" --key success)" = true
+test "$(python3 scripts/tiered-writeback-e2e.py ledger-value --ledger "$FINAL_SFTP_LEDGER" --receipt "$FINAL_SFTP_RECEIPT" --key decision.zerofs_upload_gap_current)" = false
+HPN_RECEIVE_WINNER="$(python3 scripts/tiered-writeback-e2e.py ledger-value --ledger "$FINAL_SFTP_LEDGER" --receipt "$FINAL_SFTP_RECEIPT" --key decision.hpn_receive_winner)"
 case "$HPN_RECEIVE_WINNER" in true|false) ;; *) exit 1 ;; esac
-case "$ZEROFS_UPLOAD_GAP_DETECTED" in true|false) ;; *) exit 1 ;; esac
-test "$ZEROFS_UPLOAD_GAP_RESOLVED" = true
-if test "$ZEROFS_UPLOAD_GAP_DETECTED" = true; then
-  ZEROFS_UPLOAD_CORRECTION_SHA="$(python3 scripts/tiered-writeback-e2e.py ledger-value --ledger "$C7B_DECISION_LEDGER" --key decision.upload_correction_sha)"
-  printf '%s\n' "$ZEROFS_UPLOAD_CORRECTION_SHA" | grep -Eq '^[0-9a-f]{40}$'
-  git cat-file -e "${ZEROFS_UPLOAD_CORRECTION_SHA}^{commit}"
-  git merge-base --is-ancestor "$ZEROFS_UPLOAD_CORRECTION_SHA" "$FINAL_PROOF_SHA"
-  ZEROFS_UPLOAD_RERUN_RECEIPT="$(python3 scripts/tiered-writeback-e2e.py ledger-value --ledger "$C7B_DECISION_LEDGER" --key decision.upload_rerun_receipt)"
-  python3 scripts/tiered-writeback-e2e.py validate-owned-path --ledger "$C7B_DECISION_LEDGER" --path "$ZEROFS_UPLOAD_RERUN_RECEIPT" --kind archived-receipt
-  test "$(python3 scripts/tiered-writeback-e2e.py ledger-value --ledger "$C7B_DECISION_LEDGER" --receipt "$ZEROFS_UPLOAD_RERUN_RECEIPT" --key source_sha)" = "$ZEROFS_UPLOAD_CORRECTION_SHA"
-  test "$(python3 scripts/tiered-writeback-e2e.py ledger-value --ledger "$C7B_DECISION_LEDGER" --receipt "$ZEROFS_UPLOAD_RERUN_RECEIPT" --key scenarios.sftp_stock_vs_hpn_download)" = true
-  test "$(python3 scripts/tiered-writeback-e2e.py ledger-value --ledger "$C7B_DECISION_LEDGER" --receipt "$ZEROFS_UPLOAD_RERUN_RECEIPT" --key scenarios.sftp_stock_vs_hpn_upload)" = true
-  test "$(python3 scripts/tiered-writeback-e2e.py ledger-value --ledger "$C7B_DECISION_LEDGER" --receipt "$ZEROFS_UPLOAD_RERUN_RECEIPT" --key scenarios.zerofs_sftp_session_scaling)" = true
-  test "$(python3 scripts/tiered-writeback-e2e.py ledger-value --ledger "$C7B_DECISION_LEDGER" --receipt "$ZEROFS_UPLOAD_RERUN_RECEIPT" --key success)" = true
-  test "$(python3 scripts/tiered-writeback-e2e.py ledger-value --ledger "$C7B_DECISION_LEDGER" --receipt "$ZEROFS_UPLOAD_RERUN_RECEIPT" --key zerofs_upload_parity_resolved)" = true
-fi
 if test "$HPN_RECEIVE_WINNER" = true; then
   run_final_scenario materialized remote hpn-package-winner
 fi
+sudo python3 scripts/tiered-writeback-e2e.py archive-control --ledger "$FINAL_SFTP_LEDGER" --archive-root /fast/zerofs-tiered-receipts
+test ! -e "$FINAL_SFTP_CONTROL"
 ```
 
 Run `global-admission-nbd-nfs-ninep`,
@@ -1243,7 +1287,7 @@ READ_CONTROL_UUID="$(python3 -c 'import uuid; print(uuid.uuid4())')"
 READ_CONTROL_ROOT="/var/tmp/zerofs-tiered-control-${READ_CONTROL_UUID}"
 READ_CONTROL_RESOURCES="/var/tmp/zerofs-tiered-resources-${READ_CONTROL_UUID}"
 READ_CONTROL_LEDGER="${READ_CONTROL_ROOT}/ledger.json"
-sudo python3 scripts/tiered-writeback-e2e.py supervise --ledger "$READ_CONTROL_LEDGER" --control-root "$READ_CONTROL_ROOT" --resource-root "$READ_CONTROL_RESOURCES" --source-sha "$FINAL_PROOF_SHA" --filesystem-ack-mode materialized --object-ack-mode ssd --scenario benchmark-read-throughput
+sudo python3 scripts/tiered-writeback-e2e.py supervise --ledger "$READ_CONTROL_LEDGER" --control-root "$READ_CONTROL_ROOT" --resource-root "$READ_CONTROL_RESOURCES" --source-sha "$FINAL_PROOF_SHA" --controller-ssh-target-receipt "${CONTROLLER_TARGET_RECEIPT:?}" --filesystem-ack-mode materialized --object-ack-mode ssd --scenario benchmark-read-throughput
 MATERIALIZED_RECEIPT="$(python3 scripts/tiered-writeback-e2e.py ledger-value --ledger "$READ_CONTROL_LEDGER" --key latest_receipt)"
 python3 scripts/tiered-writeback-e2e.py validate-owned-path --ledger "$READ_CONTROL_LEDGER" --path "$MATERIALIZED_RECEIPT" --kind receipt
 test -s "$MATERIALIZED_RECEIPT"
@@ -1252,7 +1296,7 @@ READ_CANDIDATE_UUID="$(python3 -c 'import uuid; print(uuid.uuid4())')"
 READ_CANDIDATE_ROOT="/var/tmp/zerofs-tiered-control-${READ_CANDIDATE_UUID}"
 READ_CANDIDATE_RESOURCES="/var/tmp/zerofs-tiered-resources-${READ_CANDIDATE_UUID}"
 READ_CANDIDATE_LEDGER="${READ_CANDIDATE_ROOT}/ledger.json"
-sudo python3 scripts/tiered-writeback-e2e.py supervise --ledger "$READ_CANDIDATE_LEDGER" --control-root "$READ_CANDIDATE_ROOT" --resource-root "$READ_CANDIDATE_RESOURCES" --source-sha "$FINAL_PROOF_SHA" --filesystem-ack-mode volatile_memory --object-ack-mode ssd --scenario benchmark-read-throughput --control-receipt "$MATERIALIZED_RECEIPT"
+sudo python3 scripts/tiered-writeback-e2e.py supervise --ledger "$READ_CANDIDATE_LEDGER" --control-root "$READ_CANDIDATE_ROOT" --resource-root "$READ_CANDIDATE_RESOURCES" --source-sha "$FINAL_PROOF_SHA" --controller-ssh-target-receipt "${CONTROLLER_TARGET_RECEIPT:?}" --filesystem-ack-mode volatile_memory --object-ack-mode ssd --scenario benchmark-read-throughput --control-receipt "$MATERIALIZED_RECEIPT"
 sudo python3 scripts/tiered-writeback-e2e.py archive-control --ledger "$READ_CANDIDATE_LEDGER" --archive-root /fast/zerofs-tiered-receipts
 sudo python3 scripts/tiered-writeback-e2e.py archive-control --ledger "$READ_CONTROL_LEDGER" --archive-root /fast/zerofs-tiered-receipts
 test ! -e "$READ_CANDIDATE_ROOT"
@@ -1313,21 +1357,26 @@ Run simplify, deslop, branch-scope-audit, low-value-churn-audit, TraceDecay code
 - [ ] **Step 1: Run idempotent cleanup and global ownership audit**
 
 Enumerate every ledger from the append-only run index rather than shell history. The
-command emits `host<TAB>ledger`; for each row, run the following block on that exact
-host. The archived index must contain no unarchived entry before merge:
+command emits exactly `controller_target<TAB>ledger`; `controller_target` comes only
+from the manifest-covered target receipt's `normalized_target`, never the machine
+hostname, discovery host, loop variable, or index row. A missing/invalid target receipt
+fails enumeration. For each row, run the following block on that validated target. The
+archived index must contain no unarchived entry before merge:
 
 ```bash
 : > "/tmp/zerofs-ledgers-${FINAL_PROOF_SHA}.tsv"
 for proof_host in ubuntu-main "$ZEROFS_NBD_PROOF_HOST"
 do
-  ssh "$proof_host" "cd /fast/projects/ZeroFS-unified-tiered-writeback && python3 scripts/tiered-writeback-e2e.py list-ledgers --campaign codex-unified-tiered-writeback --format host-tsv" >> "/tmp/zerofs-ledgers-${FINAL_PROOF_SHA}.tsv"
+  ssh "$proof_host" "cd /fast/projects/ZeroFS-unified-tiered-writeback && python3 scripts/tiered-writeback-e2e.py list-ledgers --campaign codex-unified-tiered-writeback --format controller-target-ledger-tsv" >> "/tmp/zerofs-ledgers-${FINAL_PROOF_SHA}.tsv"
 done
 sort -u -o "/tmp/zerofs-ledgers-${FINAL_PROOF_SHA}.tsv" "/tmp/zerofs-ledgers-${FINAL_PROOF_SHA}.tsv"
 test -s "/tmp/zerofs-ledgers-${FINAL_PROOF_SHA}.tsv"
-while IFS="$(printf '\t')" read -r ledger_host ledger_path
+while IFS="$(printf '\t')" read -r controller_target ledger_path
 do
-  test -n "$ledger_host" && test -n "$ledger_path"
-  ssh "$ledger_host" "LEDGER='$ledger_path' bash -seuo pipefail" <<'REMOTE'
+  test -n "$controller_target"
+  test -n "$ledger_path"
+  case "$controller_target" in -*|*[!A-Za-z0-9._:@-]*) exit 1 ;; esac
+  ssh "$controller_target" "LEDGER='$ledger_path' bash -seuo pipefail" <<'REMOTE'
 cd /fast/projects/ZeroFS-unified-tiered-writeback
 sudo python3 scripts/tiered-writeback-e2e.py cleanup --ledger "$LEDGER"
 sudo python3 scripts/tiered-writeback-e2e.py cleanup --ledger "$LEDGER"
