@@ -7603,7 +7603,7 @@ dependencies = [
 [[package]]
 name = "zerofs_nfsserve"
 version = "0.20.0"
-source = "git+https://github.com/ScriptedAlchemy/nfsserve.git?rev=b0709d0ca03c53287d0d74dcead1e49e207e09a3#b0709d0ca03c53287d0d74dcead1e49e207e09a3"
+source = "git+https://github.com/ScriptedAlchemy/nfsserve.git?rev=0c19924faa3b09041d198d167785a7de80ea48b5#0c19924faa3b09041d198d167785a7de80ea48b5"
 dependencies = [
  "anyhow",
  "async-trait",

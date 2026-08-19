@@ -161,6 +161,7 @@ async fn start_nfs_servers(
         Some(c) => c,
         None => return Vec::new(),
     };
+    let service_identity = crate::nfs::NfsServiceIdentity::new();
     let mut handles = Vec::new();
 
     if let Some(addresses) = &config.addresses {
@@ -171,11 +172,12 @@ async fn start_nfs_servers(
             let shutdown_clone = shutdown.clone();
             let shared_identity = config.shared_identity;
             handles.push(spawn_named("nfs-server", async move {
-                match crate::nfs::start_nfs_server_with_config(
+                match crate::nfs::start_nfs_server_with_service_identity(
                     fs_clone,
                     addr,
                     shutdown_clone,
                     shared_identity,
+                    service_identity,
                 )
                 .await
                 {
