@@ -149,6 +149,8 @@ pub enum TransportError {
     #[error("remote path permission denied: {0}")]
     PermissionDenied(String),
     #[error("remote path already exists: {0}")]
+    // WIP on develop: landed but not constructed in the binary crate graph yet.
+    #[allow(dead_code)]
     AlreadyExists(String),
     #[error("SFTP operation failed: {0}")]
     Operation(String),

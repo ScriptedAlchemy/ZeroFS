@@ -14,7 +14,11 @@ use std::sync::Arc;
 pub struct AttachedWriteback {
     pub store: Arc<dyn ObjectStore>,
     pub lifecycle: WritebackObjectStore,
+    // WIP on develop: landed but not wired yet.
+    #[allow(dead_code)]
     pub(crate) space: Arc<PhysicalSpaceSampler>,
+    // WIP on develop: landed but not wired yet.
+    #[allow(dead_code)]
     pub(crate) ssd: Arc<SsdAdmission>,
 }
 

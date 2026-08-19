@@ -30,6 +30,8 @@ use crate::fs::ZeroFS;
 use crate::fs::mutation::types::MutationCutoff;
 
 /// Capture the final published mutation cutoff after admission has stopped.
+// WIP on develop: landed but not wired into shutdown yet.
+#[allow(dead_code)]
 pub(crate) fn closed_admission_cutoff(fs: &ZeroFS) -> MutationCutoff {
     fs.capture_mutation_cutoff()
 }

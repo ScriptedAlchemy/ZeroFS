@@ -243,6 +243,8 @@ impl NBDDevice {
 pub struct NbdExportGates {
     registry: StdMutex<ExportRegistry>,
     materialized_gates: StdMutex<HashMap<Vec<u8>, Weak<RwLock<()>>>>,
+    // WIP on develop: landed but not wired yet.
+    #[allow(dead_code)]
     volatile_budget: Option<Arc<VolatileBudget>>,
 }
 

@@ -5,6 +5,9 @@
 //! through these methods instead of hard-coding SSD or taking a side-channel
 //! copy of the configuration.
 
+// WIP on develop: landed but not fully wired into every protocol yet.
+#![allow(dead_code)]
+
 use crate::fs::ZeroFS;
 use crate::fs::errors::FsError;
 use crate::fs::inode::InodeId;

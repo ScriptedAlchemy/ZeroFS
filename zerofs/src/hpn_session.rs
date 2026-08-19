@@ -15,11 +15,15 @@ use tokio::process::{Child, Command};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+// WIP on develop: HPN factory landed but not wired into transport selection yet.
+#[allow(dead_code)]
 const STDERR_RING_BYTES: usize = 8 * 1024;
+#[allow(dead_code)]
 const HOST_KEY_ALGORITHMS: &str = concat!(
     "ssh-ed25519,ecdsa-sha2-nistp256,ecdsa-sha2-nistp384,ecdsa-sha2-nistp521,",
     "rsa-sha2-512,rsa-sha2-256"
 );
+#[allow(dead_code)]
 const STRIPPED_ENV: &[&str] = &[
     "SSH_AUTH_SOCK",
     "SSH_AGENT_PID",
@@ -29,6 +33,8 @@ const STRIPPED_ENV: &[&str] = &[
     "SSH_SK_HELPER",
 ];
 
+// WIP on develop: HPN factory landed but not wired into transport selection yet.
+#[allow(dead_code)]
 pub(crate) struct HpnSessionFactory {
     endpoint: SftpEndpoint,
     identity_file: PathBuf,
@@ -37,6 +43,8 @@ pub(crate) struct HpnSessionFactory {
     program_sha256: String,
 }
 
+// WIP on develop: HPN factory landed but not wired into transport selection yet.
+#[allow(dead_code)]
 impl HpnSessionFactory {
     pub(crate) fn new(
         endpoint: SftpEndpoint,
@@ -78,6 +86,7 @@ impl HpnSessionFactory {
     }
 }
 
+#[allow(dead_code)]
 fn missing_pin(field: &str) -> TransportError {
     TransportError::Open(format!(
         "[sftp] {field} is required when transport = \"hpn_openssh\""
@@ -174,6 +183,7 @@ impl SessionFactory for HpnSessionFactory {
     }
 }
 
+#[allow(dead_code)]
 struct HpnConnectionOwner {
     child: Option<Child>,
     stderr_task: Option<JoinHandle<()>>,
@@ -212,6 +222,7 @@ impl SshConnectionOwner for HpnConnectionOwner {
     }
 }
 
+#[allow(dead_code)]
 fn hpn_command(
     program: &Path,
     endpoint: &SftpEndpoint,
@@ -235,11 +246,13 @@ fn hpn_command(
     command
 }
 
+#[allow(dead_code)]
 fn push_opt(args: &mut Vec<String>, option: impl Into<String>) {
     args.push("-o".into());
     args.push(option.into());
 }
 
+#[allow(dead_code)]
 fn hpn_args(endpoint: &SftpEndpoint, identity_file: &Path, known_hosts: &Path) -> Vec<String> {
     let mut args = vec![
         "-F".into(),
@@ -305,6 +318,7 @@ fn hpn_args(endpoint: &SftpEndpoint, identity_file: &Path, known_hosts: &Path) -
     args
 }
 
+#[allow(dead_code)]
 fn require_regular_file(path: &Path, field: &str) -> Result<fs::Metadata, TransportError> {
     let metadata = fs::metadata(path).map_err(|error| {
         TransportError::Open(format!(
@@ -321,6 +335,7 @@ fn require_regular_file(path: &Path, field: &str) -> Result<fs::Metadata, Transp
     Ok(metadata)
 }
 
+#[allow(dead_code)]
 fn openssh_config_path(path: &Path) -> String {
     let escaped = path
         .display()
@@ -331,6 +346,7 @@ fn openssh_config_path(path: &Path) -> String {
     format!("\"{escaped}\"")
 }
 
+#[allow(dead_code)]
 fn verify_identity_file(identity_file: &Path) -> Result<(), TransportError> {
     let identity_metadata = require_regular_file(identity_file, "identity_file")?;
     #[cfg(unix)]
@@ -361,10 +377,12 @@ fn verify_identity_file(identity_file: &Path) -> Result<(), TransportError> {
     }
 }
 
+#[allow(dead_code)]
 fn verify_known_hosts(known_hosts: &Path) -> Result<(), TransportError> {
     require_regular_file(known_hosts, "known_hosts").map(|_| ())
 }
 
+#[allow(dead_code)]
 async fn kill_and_reap(
     mut child: Child,
     stderr_task: Option<JoinHandle<()>>,
@@ -393,6 +411,7 @@ async fn kill_and_reap(
     }
 }
 
+#[allow(dead_code)]
 fn kill_process_group(child: &Child) {
     #[cfg(unix)]
     if let Some(pid) = child.id() {
@@ -407,10 +426,12 @@ fn kill_process_group(child: &Child) {
 }
 
 #[derive(Clone)]
+#[allow(dead_code)]
 struct StderrRing {
     bytes: Arc<Mutex<VecDeque<u8>>>,
 }
 
+#[allow(dead_code)]
 impl StderrRing {
     fn new() -> Self {
         Self {
@@ -698,12 +719,11 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
         let stderr_task = tokio::spawn(ring.capture(stderr));
         let leader = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                if let Ok(text) = fs::read_to_string(&leader_file) {
-                    if let Ok(pid) = text.parse::<u32>() {
-                        if process_exists(pid) {
-                            return pid;
-                        }
-                    }
+                if let Ok(text) = fs::read_to_string(&leader_file)
+                    && let Ok(pid) = text.parse::<u32>()
+                    && process_exists(pid)
+                {
+                    return pid;
                 }
                 tokio::task::yield_now().await;
             }
@@ -712,12 +732,11 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
         .expect("leader pid");
         let member = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                if let Ok(text) = fs::read_to_string(&member_file) {
-                    if let Ok(pid) = text.parse::<u32>() {
-                        if process_exists(pid) {
-                            return pid;
-                        }
-                    }
+                if let Ok(text) = fs::read_to_string(&member_file)
+                    && let Ok(pid) = text.parse::<u32>()
+                    && process_exists(pid)
+                {
+                    return pid;
                 }
                 tokio::task::yield_now().await;
             }
@@ -763,10 +782,10 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
 
         let pid = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                if let Ok(text) = fs::read_to_string(&pid_file) {
-                    if let Ok(pid) = text.parse::<u32>() {
-                        return pid;
-                    }
+                if let Ok(text) = fs::read_to_string(&pid_file)
+                    && let Ok(pid) = text.parse::<u32>()
+                {
+                    return pid;
                 }
                 tokio::task::yield_now().await;
             }

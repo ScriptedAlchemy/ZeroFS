@@ -1,5 +1,8 @@
 //! Raw mutation admission and preparation quiescence.
 
+// WIP on develop: landed but not fully wired into every protocol yet.
+#![allow(dead_code)]
+
 use crate::fs::errors::FsError;
 use crate::fs::mutation::request_cache::{AcceptedRequest, PendingRequest};
 use crate::fs::mutation::types::{

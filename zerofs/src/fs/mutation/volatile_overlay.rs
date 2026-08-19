@@ -6,6 +6,9 @@
 //! the captured sequence before entering the existing filesystem durability
 //! barrier.
 
+// WIP on develop: landed but not fully wired into every protocol yet.
+#![allow(dead_code)]
+
 use crate::fs::errors::FsError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

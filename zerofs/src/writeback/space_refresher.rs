@@ -32,6 +32,8 @@ impl SpaceRefresher {
         })
     }
 
+    // WIP on develop: landed but not wired yet.
+    #[allow(dead_code)]
     pub(crate) async fn stop(&self) {
         self.shutdown().await;
     }

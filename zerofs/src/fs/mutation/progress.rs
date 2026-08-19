@@ -1,5 +1,8 @@
 //! Gap-free mutation materialization progress.
 
+// WIP on develop: landed but not fully wired into every protocol yet.
+#![allow(dead_code)]
+
 use crate::fs::mutation::types::{MutationCutoff, MutationError, MutationIncarnation};
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, MutexGuard};

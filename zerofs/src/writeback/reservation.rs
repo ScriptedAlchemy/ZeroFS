@@ -92,6 +92,8 @@ impl SsdReservationToken {
         self.request
     }
 
+    // WIP on develop: landed but not wired yet.
+    #[allow(dead_code)]
     pub(crate) fn state(&self) -> ReservationState {
         self.state
     }
@@ -181,6 +183,8 @@ impl Drop for WaitRegistration {
     }
 }
 impl SsdAdmission {
+    // WIP on develop: landed but not wired yet.
+    #[allow(dead_code)]
     pub(crate) fn new(
         capacity_bytes: u64,
         max_operations: u64,
@@ -512,10 +516,14 @@ impl SsdAdmission {
         lock(&self.inner.state).used_ssd_bytes
     }
 
+    // WIP on develop: landed but not wired yet.
+    #[allow(dead_code)]
     pub(crate) fn used_operations(&self) -> u64 {
         lock(&self.inner.state).used_operations
     }
 
+    // WIP on develop: landed but not wired yet.
+    #[allow(dead_code)]
     pub(crate) fn outstanding_physical_claims(&self) -> u64 {
         lock(&self.inner.state).outstanding_physical_claims
     }
@@ -534,14 +542,20 @@ impl SsdAdmission {
         self.inner.release(request);
     }
 
+    // WIP on develop: landed but not wired yet.
+    #[allow(dead_code)]
     pub(crate) fn mode(&self) -> SsdAdmissionMode {
         lock(&self.inner.state).pacing.mode()
     }
 
+    // WIP on develop: landed but not wired yet.
+    #[allow(dead_code)]
     pub(crate) fn credit_bytes(&self) -> u64 {
         lock(&self.inner.state).pacing.credit_bytes()
     }
 
+    // WIP on develop: landed but not wired yet.
+    #[allow(dead_code)]
     pub(crate) fn credit_ops(&self) -> u64 {
         lock(&self.inner.state).pacing.credit_ops()
     }
@@ -550,6 +564,8 @@ impl SsdAdmission {
         Arc::clone(&self.inner.physical_waiters)
     }
 
+    // WIP on develop: landed but not wired yet.
+    #[allow(dead_code)]
     pub(crate) fn min_free_waiters_changed(&self) -> impl std::future::Future<Output = ()> + '_ {
         self.inner.physical_waiters.notified()
     }
@@ -875,11 +891,19 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// Durable local ownership after a reservation has been committed to the journal.
 #[derive(Debug)]
 pub(crate) struct CommittedSsdReservation {
+    // WIP on develop: landed but not wired yet.
+    #[allow(dead_code)]
     request: SsdReservationRequest,
+    // WIP on develop: landed but not wired yet.
+    #[allow(dead_code)]
     physical_bytes: u64,
+    // WIP on develop: landed but not wired yet.
+    #[allow(dead_code)]
     sample: PhysicalSpaceSample,
 }
 
+// WIP on develop: landed but not wired yet.
+#[allow(dead_code)]
 impl CommittedSsdReservation {
     pub(crate) fn request(&self) -> SsdReservationRequest {
         self.request
@@ -1005,6 +1029,8 @@ pub(crate) fn commit_batch_local(
     Ok(committed)
 }
 
+// WIP on develop: landed but not wired yet.
+#[allow(dead_code)]
 impl CommittedSsdReservation {
     pub(crate) fn commit_local(
         self,

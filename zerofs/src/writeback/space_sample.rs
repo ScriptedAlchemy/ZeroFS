@@ -33,6 +33,8 @@ pub(crate) enum SpaceSampleError {
         source: io::Error,
     },
     #[error("writeback space sample generation {sample} is stale; latest is {latest}")]
+    // WIP on develop: landed but not wired yet.
+    #[allow(dead_code)]
     Stale { sample: u64, latest: u64 },
 }
 
@@ -46,6 +48,8 @@ impl PhysicalSpaceSampler {
         }
     }
 
+    // WIP on develop: landed but not wired yet.
+    #[allow(dead_code)]
     pub(crate) fn writeback_dir(&self) -> &Path {
         &self.writeback_dir
     }
@@ -92,6 +96,8 @@ impl PhysicalSpaceSampler {
         })
     }
 
+    // WIP on develop: landed but not wired yet.
+    #[allow(dead_code)]
     pub(crate) fn reject_stale(
         &self,
         sample: PhysicalSpaceSample,

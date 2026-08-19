@@ -5,6 +5,9 @@
 //! has been applied. The first post-ack failure poisons progress and
 //! freezes the overlay so clients keep the last coherent view.
 
+// WIP on develop: landed but not fully wired into every protocol yet.
+#![allow(dead_code)]
+
 use crate::dedup::AcceptedWriteLifecycle;
 use crate::fs::ZeroFS;
 use crate::fs::mutation::overlay::FilesystemVolatileOverlay;
@@ -35,6 +38,7 @@ pub(crate) type ApplyHook = Arc<
         + Sync,
 >;
 
+#[allow(clippy::large_enum_variant)]
 enum LaneJob {
     Apply {
         cutoff: MutationCutoff,

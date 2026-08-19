@@ -52,6 +52,8 @@ impl FlushReceipt {
 
 enum Request {
     Flush(Reply),
+    // WIP on develop: landed but not wired into shutdown yet.
+    #[allow(dead_code)]
     Close(Reply),
 }
 
@@ -206,10 +208,14 @@ impl FlushCoordinator {
         let _ = self.materialize_hook.set(hook);
     }
 
+    // WIP on develop: landed but not wired yet.
+    #[allow(dead_code)]
     pub(crate) fn set_object_capture(&self, hook: CaptureHook) {
         let _ = self.object_capture.set(hook);
     }
 
+    // WIP on develop: landed but not wired yet.
+    #[allow(dead_code)]
     pub(crate) fn set_object_wait(&self, hook: ObjectWaitHook) {
         let _ = self.object_wait.set(hook);
     }
@@ -306,6 +312,8 @@ impl FlushCoordinator {
 
     /// Seal, flush, and close under one barrier write lock. On error, the
     /// caller must exit without closing the database separately.
+    // WIP on develop: landed but not wired into shutdown yet.
+    #[allow(dead_code)]
     pub async fn close(&self) -> Result<(), FsError> {
         let (tx, rx) = oneshot::channel();
 
@@ -317,6 +325,8 @@ impl FlushCoordinator {
         joined.and(reply)
     }
 
+    // WIP on develop: landed but not wired into shutdown yet.
+    #[allow(dead_code)]
     async fn join_worker(&self) -> Result<(), FsError> {
         let mut worker = self.worker.lock().await;
         let Some(handle) = worker.as_mut() else {

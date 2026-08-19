@@ -5,6 +5,9 @@
 //! inode locks, and reopens admission on drop. It promises visibility
 //! order only, never SSD durability.
 
+// WIP on develop: landed but not fully wired into every protocol yet.
+#![allow(dead_code)]
+
 use crate::fs::ZeroFS;
 use crate::fs::errors::FsError;
 #[cfg(test)]

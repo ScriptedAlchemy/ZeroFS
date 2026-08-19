@@ -489,12 +489,13 @@ async fn unix_ninep_standard_and_verified_fsync_wait_for_real_remote_writeback()
     client.attach(1, NOFID, "root", "", 0).await.unwrap();
     let fid = client.alloc_fid();
     client.walk(1, fid, &[]).await.unwrap();
+    // useless_conversion on Linux only: S_IFREG is u16 on macOS, u32 on Linux.
+    #[allow(clippy::useless_conversion)]
     client
         .lcreate(
             fid,
             b"typed-durability",
             (libc::O_RDWR | libc::O_CREAT) as u32,
-            // u32::from: S_IFREG is u16 on macOS, u32 on Linux.
             u32::from(libc::S_IFREG) | 0o644,
             0,
         )

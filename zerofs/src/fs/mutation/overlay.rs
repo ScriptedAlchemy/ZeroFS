@@ -5,6 +5,9 @@
 //! getattr before the canonical apply finishes. Protocol adapters call
 //! [`ZeroFS::write_ack`] and [`ZeroFS::wait_configured_durability`].
 
+// WIP on develop: landed but not fully wired into every protocol yet.
+#![allow(dead_code)]
+
 use super::admission::{PreparationAbort, PreparationGuard};
 use super::overlay_dispatch::PendingDispatch;
 use super::overlay_helpers::{direct_write_fingerprint, mutation_fs_error, overlay_fs_error};

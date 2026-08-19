@@ -5,6 +5,9 @@
 //! Application consumes those exact attributes and payloads; it does not
 //! re-decide timestamps, set-id bits, or post-write size.
 
+// WIP on develop: landed but not fully wired into every protocol yet.
+#![allow(dead_code)]
+
 use crate::dedup::OpId;
 use crate::fs::inode::{Inode, InodeId};
 use crate::fs::lock_manager::MultiLockGuard;

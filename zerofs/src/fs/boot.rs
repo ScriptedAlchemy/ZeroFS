@@ -323,6 +323,8 @@ impl ZeroFS {
     }
 
     /// Reject new mutation admission. Used by the sole shutdown owner.
+    // WIP on develop: landed but not wired into shutdown yet.
+    #[allow(dead_code)]
     pub(crate) fn stop_new_mutation_admission(&self) {
         self.materialized_request_cache.close();
         if let Some(coordinator) = self.mutation_coordinator.get() {
@@ -369,6 +371,8 @@ impl ZeroFS {
         Ok(())
     }
 
+    // WIP on develop: landed but not wired into shutdown yet.
+    #[allow(dead_code)]
     pub(crate) async fn stop_mutation_workers(&self) -> Result<(), crate::fs::errors::FsError> {
         if let Some(materializer) = self.materializer.get() {
             materializer.stop().await;
@@ -397,6 +401,8 @@ impl ZeroFS {
     /// Seal, flush, and close the canonical database. The caller must already
     /// hold the filesystem flush barrier so close-emitted objects can be
     /// captured before it is released.
+    // WIP on develop: landed but not wired into shutdown yet.
+    #[allow(dead_code)]
     pub(crate) async fn close_canonical_database(&self) -> Result<(), crate::fs::errors::FsError> {
         self.extent_store.seal_open().await?;
         self.db

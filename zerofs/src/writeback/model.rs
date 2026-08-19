@@ -413,6 +413,8 @@ impl LocalEtag {
         Some((Uuid::parse_str(incarnation).ok()?, sequence.parse().ok()?))
     }
 
+    // WIP on develop: landed but not wired yet.
+    #[allow(dead_code)]
     pub(crate) fn sequence_from_str(value: &str) -> Option<Sequence> {
         Self::parse(value).map(|(_, sequence)| sequence)
     }

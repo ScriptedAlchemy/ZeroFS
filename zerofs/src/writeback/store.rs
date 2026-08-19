@@ -73,8 +73,14 @@ struct WritebackStoreInner {
     next_sequence: AtomicU64,
     key_locks: Vec<Arc<Mutex<()>>>,
     admission_order: Mutex<()>,
+    // WIP on develop: landed but not wired yet.
+    #[allow(dead_code)]
     started: std::time::Instant,
+    // WIP on develop: landed but not wired yet.
+    #[allow(dead_code)]
     available_space: AtomicU64,
+    // WIP on develop: landed but not wired yet.
+    #[allow(dead_code)]
     available_space_probed_ms: AtomicU64,
     stopped: AtomicBool,
     #[cfg(test)]
@@ -116,6 +122,8 @@ impl WritebackStoreInner {
     /// Free-space probes guard SSD admission but do not need per-operation
     /// precision; serve a briefly cached value so the write path is not one
     /// statvfs syscall per mutation.
+    // WIP on develop: landed but not wired yet.
+    #[allow(dead_code)]
     fn available_space(&self) -> object_store::Result<u64> {
         const PROBE_TTL_MS: u64 = 250;
         let now_ms = self.started.elapsed().as_millis() as u64;
@@ -158,6 +166,8 @@ impl WritebackObjectStore {
     }
 
     /// Open a recovered overlay without allowing the remote view to advance.
+    // WIP on develop: landed but not wired yet.
+    #[allow(dead_code)]
     pub(crate) async fn open_paused(
         remote: Arc<dyn ObjectStore>,
         journal: Arc<Journal>,
@@ -331,6 +341,8 @@ impl WritebackObjectStore {
         self.inner.remote.barrier().wait_remote(sequence).await
     }
 
+    // WIP on develop: landed but not wired yet.
+    #[allow(dead_code)]
     pub(crate) fn journal_incarnation(&self) -> uuid::Uuid {
         self.inner.incarnation
     }
@@ -338,12 +350,16 @@ impl WritebackObjectStore {
     /// Conservative newest accepted sequence. Callers capture this while the
     /// filesystem flush barrier is held so later object mutations cannot commit
     /// without being included.
+    // WIP on develop: landed but not wired yet.
+    #[allow(dead_code)]
     pub(crate) fn accepted_sequence(&self) -> crate::writeback::model::Sequence {
         self.inner.next_sequence.load(Ordering::Acquire)
     }
 
     /// Conservative object coverage after database close, including objects
     /// emitted by close itself.
+    // WIP on develop: landed but not wired yet.
+    #[allow(dead_code)]
     pub(crate) fn object_coverage(&self) -> crate::fs::mutation::durability::ObjectCoverage {
         crate::fs::mutation::durability::ObjectCoverage::Writeback {
             journal_incarnation: crate::fs::mutation::durability::JournalIncarnation::new(
@@ -375,6 +391,8 @@ impl WritebackObjectStore {
         self.wait_remote(sequence).await
     }
 
+    // WIP on develop: landed but not wired yet.
+    #[allow(dead_code)]
     pub(crate) async fn wait_coverage(
         &self,
         journal_incarnation: uuid::Uuid,
@@ -392,10 +410,14 @@ impl WritebackObjectStore {
         }
     }
 
+    // WIP on develop: landed but not wired yet.
+    #[allow(dead_code)]
     pub(crate) fn space_sampler(&self) -> &Arc<PhysicalSpaceSampler> {
         &self.inner.space
     }
 
+    // WIP on develop: landed but not wired yet.
+    #[allow(dead_code)]
     pub(crate) fn ssd_admission(&self) -> &Arc<SsdAdmission> {
         &self.inner.ssd
     }

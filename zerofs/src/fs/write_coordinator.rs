@@ -70,6 +70,7 @@ pub(crate) enum CommitOwnership {
 }
 
 #[derive(Default)]
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum CommitSettlement {
     #[default]
     None,

@@ -1973,6 +1973,8 @@ impl Settings {
     /// Resolve the shared write-acknowledgement contract once, merging the
     /// authoritative `[filesystem]` form with the deprecated `[servers.nbd]`
     /// volatile fields. Every protocol adapter consumes the result.
+    // WIP on develop: landed but not wired into every protocol yet.
+    #[allow(dead_code)]
     pub(crate) fn filesystem_write_ack_settings(
         &self,
         access_mode: crate::writeback::config::WritebackAccessMode,
@@ -2002,6 +2004,8 @@ impl Settings {
     /// Largest maximum write among the enabled write protocols, as
     /// `(protocol name, bytes)`. The volatile RAM budget must hold at least
     /// one such write or admission could deadlock on a single request.
+    // WIP on develop: landed but not wired into every protocol yet.
+    #[allow(dead_code)]
     fn largest_enabled_protocol_write(&self) -> Option<(&'static str, u64)> {
         let servers = &self.servers;
         [

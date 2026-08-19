@@ -6,6 +6,9 @@
 //! authoritative form; the legacy `[servers.nbd]` volatile fields are
 //! deprecated migration inputs that must agree exactly when both are present.
 
+// WIP on develop: landed but not fully wired into every protocol yet.
+#![allow(dead_code)]
+
 use anyhow::{Result, bail};
 
 /// Point at which an ordinary client write is acknowledged.

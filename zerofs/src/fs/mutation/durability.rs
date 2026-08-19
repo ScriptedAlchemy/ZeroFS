@@ -5,6 +5,9 @@
 //! after mutation materialization, conservative object capture, and the
 //! requested local or remote wait all succeed.
 
+// WIP on develop: landed but not fully wired into every protocol yet.
+#![allow(dead_code)]
+
 use crate::fs::errors::FsError;
 use crate::fs::mutation::config::ClientDurabilityTarget;
 use crate::fs::mutation::types::MutationCutoff;

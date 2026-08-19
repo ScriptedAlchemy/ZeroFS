@@ -317,6 +317,8 @@ pub struct SegmentBuilder<'a> {
 }
 
 impl<'a> SegmentBuilder<'a> {
+    // Exercised by tests; unused in the binary crate graph.
+    #[allow(dead_code)]
     pub fn new(codec: &'a FrameCodec, segid: Segid) -> Self {
         Self::with_limits(codec, segid, SegmentFormatLimits::WIRE)
     }
@@ -364,6 +366,8 @@ impl<'a> SegmentBuilder<'a> {
     /// Append a frame body sealed under this builder's segid and the index
     /// this append assigns (`dir.len()`); a batch pre-sealed by
     /// [`seal_compressed_batch`] knows both upfront.
+    // Exercised by tests; unused in the binary crate graph.
+    #[allow(dead_code)]
     pub fn append_sealed(&mut self, inode: u64, extent: u64, sealed: &[u8]) -> u32 {
         self.try_append_sealed(inode, extent, sealed)
             .expect("sealed frame must fit the segment wire format")

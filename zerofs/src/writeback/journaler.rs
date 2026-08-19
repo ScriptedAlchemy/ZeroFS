@@ -346,6 +346,8 @@ impl LocalJournaler {
         )
     }
 
+    // WIP on develop: landed but not wired yet.
+    #[allow(dead_code)]
     fn start_with_sink_and_observer(
         sink: Arc<dyn LocalJournalSink>,
         admission: Admission,
@@ -367,6 +369,7 @@ impl LocalJournaler {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn start_with_sink_observer_space(
         sink: Arc<dyn LocalJournalSink>,
         admission: Admission,
@@ -439,6 +442,8 @@ impl LocalJournaler {
             .await
     }
 
+    // WIP on develop: landed but not wired yet.
+    #[allow(dead_code)]
     pub(crate) async fn submit_put_with_disk(
         &self,
         record: MutationRecord,
@@ -450,6 +455,8 @@ impl LocalJournaler {
             .await
     }
 
+    // WIP on develop: landed but not wired yet.
+    #[allow(dead_code)]
     pub(crate) async fn submit_verified_put_with_disk(
         &self,
         record: MutationRecord,
@@ -461,6 +468,8 @@ impl LocalJournaler {
             .await
     }
 
+    // WIP on develop: landed but not wired yet.
+    #[allow(dead_code)]
     pub(crate) async fn submit_metadata_with_disk(
         &self,
         record: MutationRecord,

@@ -59,6 +59,8 @@ pub struct NFSAdapter {
 }
 
 impl NFSAdapter {
+    // Exercised by tests; unused in the binary crate graph.
+    #[allow(dead_code)]
     pub fn new(fs: Arc<ZeroFS>) -> Self {
         Self::with_service_identity(fs, NfsServiceIdentity::new())
     }
@@ -624,6 +626,8 @@ impl NFSFileSystem for NFSAdapter {
     }
 }
 
+// WIP on develop: landed but not wired into the binary crate graph yet.
+#[allow(dead_code)]
 pub async fn start_nfs_server_with_config(
     filesystem: Arc<ZeroFS>,
     socket: SocketAddr,
