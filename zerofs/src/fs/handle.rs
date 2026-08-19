@@ -197,6 +197,7 @@ impl ZeroFS {
                 txn.add_inode_count_delta(id, -1);
                 self.orphan_store.remove(&mut txn, id);
                 self.write_coordinator.commit(txn).await?;
+                self.quota.release_committed(file.size);
                 self.stats.files_deleted.fetch_add(1, Ordering::Relaxed);
                 Ok(())
             }

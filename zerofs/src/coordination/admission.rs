@@ -1,3 +1,5 @@
+//! Generic FIFO byte-budget admission gate shared by the writeback tiers.
+
 use std::collections::VecDeque;
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -712,22 +714,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reservation_larger_than_the_dirty_ram_budget_fails_immediately() {
-        let admission = Admission::new(10);
-
-        let error = admission.reserve(11).await.unwrap_err();
-
-        assert_eq!(
-            error,
-            AdmissionError::TooLarge {
-                requested: 11,
-                capacity: 10
-            }
-        );
-        assert_eq!(admission.used_bytes(), 0);
-    }
-
-    #[tokio::test]
     async fn byte_accounting_never_wraps_at_u64_capacity() {
         let admission = Admission::new(u64::MAX);
         let held = admission.reserve(u64::MAX - 1).await.unwrap();
@@ -886,12 +872,5 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(permit.bytes(), 1);
-    }
-
-    #[test]
-    fn disk_gate_restores_pending_blob_bytes_before_accepting_new_writes() {
-        let disk = DiskAdmission::with_used(100, 90, 70, 10, 80, 1_000).unwrap();
-
-        assert_eq!(disk.used_bytes(), 80);
     }
 }

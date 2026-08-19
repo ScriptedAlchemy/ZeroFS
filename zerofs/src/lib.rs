@@ -1,5 +1,6 @@
 pub mod block_transformer;
 pub mod config;
+mod coordination;
 pub mod db;
 pub mod dedup;
 pub mod frame_codec;

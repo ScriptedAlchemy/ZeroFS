@@ -387,6 +387,21 @@ pub struct JournalSnapshot {
     pub pending_blob_count: u64,
 }
 
+impl JournalSnapshot {
+    pub(crate) fn pending_ssd_reservations(
+        &self,
+    ) -> Result<Vec<crate::writeback::reservation::SsdReservationRequest>> {
+        self.records
+            .iter()
+            .filter(|record| record.sequence > self.remote_seq)
+            .map(|record| {
+                crate::writeback::reservation::SsdReservationRequest::from_pending_record(record)
+                    .map_err(|error| anyhow::anyhow!(error))
+            })
+            .collect()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JournalProgress {
     pub local_seq: Sequence,
@@ -656,6 +671,12 @@ impl Journal {
                 .unwrap_or_default(),
             remote_retries: read_optional::<u64>(&meta, REMOTE_RETRIES_KEY)?.unwrap_or_default(),
         })
+    }
+
+    pub(crate) fn pending_ssd_reservations(
+        &self,
+    ) -> Result<Vec<crate::writeback::reservation::SsdReservationRequest>> {
+        self.snapshot()?.pending_ssd_reservations()
     }
 
     pub fn pending_from(
@@ -4676,5 +4697,34 @@ mod tests {
             format!("{error:#}").contains("length mismatch"),
             "{error:#}"
         );
+    }
+
+    #[test]
+    fn recovery_seeds_exact_bytes_and_operations() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = open_temp_journal(&temp, "bucket-a");
+        let put = journal
+            .commit_put(put_record(1, "segments/1", b"abc"), b"abc")
+            .unwrap();
+        let delete = journal
+            .commit_metadata(delete_record(2, "segments/2"))
+            .unwrap();
+
+        let pending = journal.pending_ssd_reservations().unwrap();
+        assert_eq!(pending.len(), 2);
+        assert_eq!(
+            pending[0].ssd_reservation_bytes,
+            put.ssd_reservation_bytes().unwrap()
+        );
+        assert_eq!(
+            pending[0].physical_reservation_bytes,
+            put.ssd_reservation_bytes().unwrap()
+        );
+        assert_eq!(pending[0].operations, 1);
+        assert_eq!(
+            pending[1].ssd_reservation_bytes,
+            delete.ssd_reservation_bytes().unwrap()
+        );
+        assert_eq!(pending[1].operations, 1);
     }
 }
