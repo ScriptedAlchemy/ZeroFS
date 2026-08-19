@@ -415,6 +415,10 @@ pub struct Db {
     /// Focused read-path observation point: counts logical range scans.
     #[cfg(test)]
     scan_calls: AtomicU64,
+    #[cfg(test)]
+    durable_scan_calls: AtomicU64,
+    #[cfg(test)]
+    point_read_calls: AtomicU64,
 }
 
 /// Admission to one database write while holding the flush barrier's read side.
@@ -455,6 +459,10 @@ impl Db {
             closing: AtomicBool::new(false),
             #[cfg(test)]
             scan_calls: AtomicU64::new(0),
+            #[cfg(test)]
+            durable_scan_calls: AtomicU64::new(0),
+            #[cfg(test)]
+            point_read_calls: AtomicU64::new(0),
         }
     }
 
@@ -468,6 +476,10 @@ impl Db {
             closing: AtomicBool::new(false),
             #[cfg(test)]
             scan_calls: AtomicU64::new(0),
+            #[cfg(test)]
+            durable_scan_calls: AtomicU64::new(0),
+            #[cfg(test)]
+            point_read_calls: AtomicU64::new(0),
         }
     }
 
@@ -595,11 +607,6 @@ impl Db {
         Ok(result)
     }
 
-    /// Point read seeing only object-storage-durable data.
-    pub async fn get_bytes_durable(&self, key: &Bytes) -> Result<Option<Bytes>> {
-        self.get_bytes_at(key, DurabilityLevel::Remote).await
-    }
-
     async fn get_bytes_at(
         &self,
         key: &Bytes,
@@ -619,6 +626,8 @@ impl Db {
         key: &Bytes,
         durability_filter: DurabilityLevel,
     ) -> Result<Option<Bytes>> {
+        #[cfg(test)]
+        self.point_read_calls.fetch_add(1, Ordering::Relaxed);
         let read_options = ReadOptions {
             durability_filter,
             cache_blocks: true,
@@ -649,11 +658,23 @@ impl Db {
         self.scan_calls.load(Ordering::Relaxed)
     }
 
+    #[cfg(test)]
+    pub(crate) fn durable_scan_call_count(&self) -> u64 {
+        self.durable_scan_calls.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn point_read_call_count(&self) -> u64 {
+        self.point_read_calls.load(Ordering::Relaxed)
+    }
+
     /// Scan seeing only object-storage-durable data.
     pub async fn scan_durable<R: slatedb::ByteRangeBounds + Send>(
         &self,
         range: R,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<(Bytes, Bytes)>> + Send + '_>>> {
+        #[cfg(test)]
+        self.durable_scan_calls.fetch_add(1, Ordering::Relaxed);
         self.scan_at(range, DurabilityLevel::Remote).await
     }
 
