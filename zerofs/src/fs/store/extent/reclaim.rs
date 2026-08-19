@@ -1763,9 +1763,11 @@ mod tests {
 
     #[tokio::test]
     async fn directory_verify_keeps_reference_on_final_durable_page() {
+        const UNRELATED_ROWS: u64 = 70_000;
         let target = Segid::new(7, super::super::write::OPEN_SEGMENT_LANES as u64);
         let other = Segid::new(99, 1);
-        let rows = (1..70_000u64)
+        assert!(UNRELATED_ROWS as usize > MAX_VERIFY_PAGE_ROWS);
+        let rows = (1..UNRELATED_ROWS)
             .map(|extent| (extent, test_frame_loc(other, extent as u32)))
             .chain(std::iter::once((1_000_000, test_frame_loc(target, 1))));
         let (store, db, segid) = dead_sparse_segment_with_gap_rows(rows).await;
@@ -1786,9 +1788,10 @@ mod tests {
             store.verify_segment_reclaimable(segid).await,
             SegmentDeadVerdict::Keep
         ));
-        assert!(
-            db.durable_scan_call_count() - durable_before >= 2,
-            "the stale durable reference must live beyond the first physical page"
+        assert_eq!(
+            db.durable_scan_call_count() - durable_before,
+            1,
+            "the stale durable reference beyond the first consumer page must stay in one source scan"
         );
         assert!(
             store
