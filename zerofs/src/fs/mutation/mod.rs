@@ -7,4 +7,5 @@
 
 pub(crate) mod config;
 
+pub(crate) mod request_cache;
 pub(crate) mod types;

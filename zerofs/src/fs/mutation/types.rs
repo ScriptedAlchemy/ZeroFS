@@ -89,3 +89,59 @@ impl PreparedBatchResult {
             .expect("prepared batch result has at least one member")
     }
 }
+
+/// Protocol-scoped identity for request replay and collision detection.
+///
+/// NFS always includes a server-minted transport `connection_incarnation`.
+/// Client address is a fingerprint input, never a substitute for that
+/// incarnation, so reconnect address reuse cannot join old work.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum RequestIdentity {
+    NineP {
+        session_incarnation: u64,
+        operation_id: u64,
+    },
+    Nfs {
+        server_incarnation: uuid::Uuid,
+        connection_incarnation: u64,
+        xid: u32,
+    },
+    Nbd {
+        connection_incarnation: u64,
+        handle: u64,
+    },
+    DirectTagged {
+        caller_incarnation: uuid::Uuid,
+        operation_id: u128,
+    },
+    DirectOneShot(uuid::Uuid),
+}
+
+/// Hash of payload, auth, requested stability, durability, and (for NFS)
+/// client address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct RequestFingerprint([u8; 32]);
+
+impl RequestFingerprint {
+    pub(crate) fn from_parts(parts: &[&[u8]]) -> Self {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        for part in parts {
+            hasher.update(part);
+        }
+        Self(hasher.finalize().into())
+    }
+
+    pub(crate) fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+}
+
+/// How long a completed request may occupy the replay cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RequestLifetime {
+    CanonicalDedup,
+    ReplayWindow(std::time::Duration),
+    InFlightOnly,
+    OneShot,
+}
