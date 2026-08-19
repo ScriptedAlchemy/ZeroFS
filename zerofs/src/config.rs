@@ -572,7 +572,10 @@ const fn default_sftp_max_connections() -> usize {
 }
 
 const fn default_sftp_direction_concurrency() -> usize {
-    SftpConfig::MAX_DIRECTION_CONCURRENCY
+    // Concurrent operations per direction, multiplexed across pooled
+    // connections. Two per default connection hides the WAN round trip on
+    // small objects without letting bulk transfers oversubscribe memory.
+    16
 }
 
 const fn default_sftp_segment_size_mib() -> usize {
@@ -2313,8 +2316,8 @@ impl Settings {
             "# hpn_sha256 = \"...\"             # SHA-256 of that binary; required for hpn_openssh\n",
         );
         toml_string.push_str("# max_connections = 8\n");
-        toml_string.push_str("# read_concurrency = 7\n");
-        toml_string.push_str("# write_concurrency = 7\n");
+        toml_string.push_str("# read_concurrency = 16\n");
+        toml_string.push_str("# write_concurrency = 16\n");
         toml_string.push_str("# segment_size_mib = 32\n");
         toml_string.push_str("# read_cache_part_size_kib = 1024\n");
 
@@ -2334,7 +2337,7 @@ impl Settings {
         toml_string.push_str("# resume_percent = 85\n");
         toml_string.push_str("# local_concurrency = 4\n");
         toml_string.push_str(
-            "# upload_concurrency = 4         # generic default; SFTP auto-defaults to 7 and pipelines 64 requests per session\n",
+            "# upload_concurrency = 4         # generic default; SFTP auto-defaults to 8 lanes multiplexed over pooled sessions\n",
         );
         toml_string.push_str("# shutdown_flush = \"local\"       # local | remote\n");
 
@@ -2965,7 +2968,7 @@ min_free_gb = 256.0"#,
         );
         assert_eq!(writeback.disk_bytes, 512_000_000_000);
         assert_eq!(writeback.local_concurrency, 4);
-        assert_eq!(writeback.upload_concurrency, 7);
+        assert_eq!(writeback.upload_concurrency, 8);
     }
 
     #[test]
@@ -3202,8 +3205,8 @@ min_free_gb = 256.0"#,
         assert!(sftp.identity_file.ends_with(".ssh/id_ed25519"));
         assert!(sftp.known_hosts.ends_with(".ssh/known_hosts"));
         assert_eq!(sftp.max_connections, 8);
-        assert_eq!(sftp.read_concurrency, 7);
-        assert_eq!(sftp.write_concurrency, 7);
+        assert_eq!(sftp.read_concurrency, 16);
+        assert_eq!(sftp.write_concurrency, 16);
         assert_eq!(sftp.segment_size_mib, 32);
         assert_eq!(sftp.read_cache_part_size_kib, 1024);
         assert_eq!(sftp.transport, SftpSshTransport::Russh);
@@ -3424,17 +3427,9 @@ known_hosts = "${ZEROFS_TEST_KNOWN_HOSTS}""#,
             ("max_connections = 0", "max_connections"),
             ("max_connections = 9", "max_connections"),
             ("read_concurrency = 0", "read_concurrency"),
-            ("read_concurrency = 8", "read_concurrency"),
+            ("read_concurrency = 65", "read_concurrency"),
             ("write_concurrency = 0", "write_concurrency"),
-            ("write_concurrency = 8", "write_concurrency"),
-            (
-                "max_connections = 4\nread_concurrency = 5",
-                "read_concurrency",
-            ),
-            (
-                "max_connections = 4\nread_concurrency = 4\nwrite_concurrency = 5",
-                "write_concurrency",
-            ),
+            ("write_concurrency = 65", "write_concurrency"),
         ];
 
         for (limits, expected) in invalid {
@@ -3445,6 +3440,16 @@ known_hosts = "${ZEROFS_TEST_KNOWN_HOSTS}""#,
             );
             assert!(err.contains(expected), "limits {limits:?}: got {err}");
         }
+
+        // Operations multiplex onto shared connections, so per-direction
+        // concurrency above max_connections is valid.
+        let extra = "[sftp]\nknown_hosts = \"/tmp/known_hosts\"\n\
+                     max_connections = 4\nread_concurrency = 8\nwrite_concurrency = 16";
+        let settings =
+            write_and_load(&sftp_config("sftp://alice@example.com/data", extra)).unwrap();
+        let sftp = settings.sftp.as_ref().unwrap();
+        assert_eq!(sftp.read_concurrency, 8);
+        assert_eq!(sftp.write_concurrency, 16);
     }
 
     #[test]
