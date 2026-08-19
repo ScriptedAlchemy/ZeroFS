@@ -21,6 +21,7 @@ from .metrics import (
     wait_for_accepted_after,
     wait_for_gc_quiescence,
 )
+from .owned_resources import atomic_write_json
 from .receipts import RunReceipt
 from .runner import Runner
 from .system_io import (
@@ -728,10 +729,7 @@ class PerformanceMatrixRunner:
             destination = receipt.path(source.name)
             shutil.copy2(source, destination)
         summary = receipt.path("summary.json")
-        summary.write_text(
-            json.dumps(result.to_dict(), indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
+        atomic_write_json(summary, result.to_dict())
         rows = [self._csv_row(cell) for cell in result.cells]
         cells_csv = receipt.path("cells.csv")
         with cells_csv.open("w", newline="", encoding="utf-8") as handle:

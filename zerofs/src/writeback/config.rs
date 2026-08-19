@@ -53,13 +53,9 @@ pub struct WritebackConfig {
     pub high_watermark_percent: u8,
     #[serde(default = "default_resume_percent")]
     pub resume_percent: u8,
-    /// Concurrent remote uploads. Defaults conservatively (clamped to
-    /// `[sftp] write_concurrency`) so the pool's total session demand stays
-    /// well inside backend concurrent-connection caps — Hetzner Storage
-    /// Boxes allow around ten per account, stale sessions from a previous
-    /// crash still count until the server reaps them, and reads need
-    /// sessions too. Raise this toward `[sftp] write_concurrency` only when
-    /// the backend's budget accommodates it.
+    /// Concurrent remote uploads. Defaults to four for generic backends. SFTP
+    /// defaults to seven, clamped to `[sftp] write_concurrency`, so its default
+    /// eight-session pool retains one lane for reads and control traffic.
     #[serde(default)]
     pub upload_concurrency: Option<usize>,
     #[serde(default = "default_local_concurrency")]
@@ -162,14 +158,12 @@ impl WritebackConfig {
                 }
                 explicit
             }
-            // One upload per SFTP write stream by default; an explicitly
-            // lowered transport budget lowers the default with it instead of
-            // turning into a validation error.
-            None => sftp_write_concurrency
-                .map_or(default_upload_concurrency(), |limit| {
-                    default_upload_concurrency().min(limit)
-                })
-                .max(1),
+            // SFTP has its own stream-aware default. Other backends retain the
+            // conservative generic default instead of inheriting SFTP tuning.
+            None => match sftp_write_concurrency {
+                Some(limit) => default_sftp_upload_concurrency().min(limit).max(1),
+                None => default_upload_concurrency(),
+            },
         };
 
         Ok(Some(WritebackSettings {
@@ -195,14 +189,15 @@ const fn default_resume_percent() -> u8 {
     85
 }
 
-// Deliberately below the SFTP transport's 7-stream write budget: backends
-// cap concurrent SSH sessions per account (Hetzner Storage Boxes ~10), and
-// the pool's uploads share that budget with reads, control traffic, and
-// stale sessions a crashed predecessor left behind. Four upload lanes keep
-// replay pipelined without pressing the cap; deployments with headroom opt
-// into more via `upload_concurrency`.
+// Conservative default shared by non-SFTP backends.
 const fn default_upload_concurrency() -> usize {
     4
+}
+
+// Fill the SFTP write-stream budget. Per-session russh-sftp pipelines 64 WRITE
+// requests; seven lanes remain below the default eight-session pool budget.
+const fn default_sftp_upload_concurrency() -> usize {
+    7
 }
 
 const fn default_local_concurrency() -> usize {
@@ -248,4 +243,38 @@ fn normalize_absolute_path(path: &Path, name: &str) -> Result<PathBuf> {
             }
         })
         .with_context(|| format!("failed to normalize {name}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn enabled_writeback() -> WritebackConfig {
+        WritebackConfig {
+            enabled: true,
+            dir: std::env::temp_dir().join("zerofs-writeback-default-test"),
+            memory_size_gb: 1.0,
+            disk_size_gb: 1.0,
+            min_free_gb: 1.0,
+            ..WritebackConfig::default()
+        }
+    }
+
+    #[test]
+    fn default_upload_lanes_are_backend_aware() {
+        let config = enabled_writeback();
+        let clean_cache = std::env::temp_dir().join("zerofs-clean-cache-default-test");
+
+        let generic = config
+            .normalize(&clean_cache, None, WritebackAccessMode::ReadWrite, false)
+            .unwrap()
+            .unwrap();
+        let sftp = config
+            .normalize(&clean_cache, Some(8), WritebackAccessMode::ReadWrite, false)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(generic.upload_concurrency, 4);
+        assert_eq!(sftp.upload_concurrency, 7);
+    }
 }
