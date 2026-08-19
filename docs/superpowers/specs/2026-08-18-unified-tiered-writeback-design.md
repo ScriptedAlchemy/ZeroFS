@@ -382,7 +382,9 @@ cache normally. Segment GC and compaction group adjacent source ranges into boun
 sequential scans and use explicit no-admit/no-fill reads. Reclaim verification also
 batches sparse/interleaved forward keys: a full 1,024-frame segment uses no more than
 16 fixed 64-key batches and two streaming views, for at most 32 scans rather than
-2,048 point reads. Scan/decode errors and either view retaining a reference fail closed.
+2,048 point reads. Across both views it may inspect at most 4,096 rows and 64 MiB of
+encoded key/value bytes; exhausting either budget returns `Keep`. Scan/decode errors
+and either view retaining a reference fail closed.
 Any later write-admission or maintenance-cache
 exception requires its own bounded policy and measured RED/GREEN proof.
 
@@ -683,7 +685,10 @@ Implementation follows strict RED/GREEN slices. The required proof matrix includ
 18. stock OpenSSH versus pinned HPN versus ZeroFS SFTP A/Bs for upload and download at
     one and configured-many sessions. Each cell records executable identity, RTT,
     TCP window/retransmits, SFTP depth, lane utilization, exact bytes, SHA-256, and
-    durability; all temporary processes and remote prefixes are ledger-cleaned.
+    durability; all temporary processes and remote prefixes are ledger-cleaned. One
+    registered composite runs all three measurement families in one supervisor ledger
+    at one source SHA and is the only decision-authority producer; final proof reruns
+    that composite at `FINAL_PROOF_SHA` and consumes only its fresh receipt.
 19. a harness-supervision matrix proving setup, every composite primary substep,
     timeout, double cleanup, and `assert-clean` preserve their independent statuses;
     a later success never masks the first primary failure. Ledger scalar/path access
@@ -763,13 +768,12 @@ If pinned HPN wins a receiving path, allow the explicitly configured absolute bi
 and land its immutable packaging/deployment selection without replacing system SSH.
 If upload remains below its raw same-session control, land the measured request-depth
 or physical-session scheduling correction and rerun the A/B. A benchmark-only binary
-or dormant selector is not completion. The receive-win, upload-gap-detected, and
-upload-gap-resolved results are independent typed fields in one validated archived
-decision receipt. A detected gap requires its correction SHA and complete-rerun receipt,
-and the final resolved flag must be true. The correction is a real lowercase 40-hex
-commit ancestral to the final proof SHA, and the manifest-covered rerun receipt proves
-download A/B, upload A/B, and ZeroFS session scaling all succeeded at that commit with
-resolved upload parity; the combined outcome executes both corrections
+or dormant selector is not completion. The receive-win and current-upload-gap results
+are typed fields emitted only after one composite runs download A/B, upload A/B, and
+ZeroFS session scaling in one supervisor ledger at one source SHA. After any correction,
+rerun the same composite; final proof runs it again at `FINAL_PROOF_SHA` and requires
+the fresh receipt's current upload gap to be false. Separate or stale ledgers cannot be
+assembled into authority; a combined HPN win and upload gap executes both corrections
 and cannot be replaced by a free-form environment value. Receiver-window evidence alone
 cannot justify an upload claim.
 
@@ -778,6 +782,11 @@ cannot justify an upload claim.
 Run the full repository and thermonuclear quality gates, then isolated Linux protocol,
 crash, filesystem, and performance matrices. Merge and push `develop`; fast-forward
 the clean Ubuntu source checkout.
+
+Cleanup routing is ledger authority too: every remote run carries a controller-validated
+target receipt, and global cleanup emits only manifest-validated
+`normalized_target<TAB>ledger` rows. A remote hostname or enumeration-loop value never
+substitutes for that target receipt.
 
 - Do not deploy or restart CT198 during this feature implementation, proof, merge, or
   source-synchronization plan. The 2026-08-19 automatic post-OOM service restart is an

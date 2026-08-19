@@ -1339,6 +1339,7 @@ Add exact tests:
 - `compaction_reads_do_not_admit_raw_parts_or_decoded_cache`
 - `compaction_groups_adjacent_source_runs_under_one_bounded_scan`
 - `sparse_interleaved_full_segment_uses_at_most_thirty_two_verification_scans`
+- `reclaim_scan_row_or_byte_budget_exhaustion_fails_closed`
 - `cache_weigher_includes_key_entry_and_allocator_slack`
 - `dirty_ram_zero_does_not_satisfy_resident_headroom`
 - `physical_residency_does_not_sum_jemalloc_resident_and_retained`
@@ -1353,6 +1354,9 @@ length only, every canonical write calls `decoded_insert`, and compaction reads 
 the cache-admitting segment path. The reclaim fixture contains a full 1,024-frame
 segment whose `(inode, extent)` keys are deliberately sparse and interleaved, so
 maximal-consecutive-run grouping would still issue 2,048 memory/durable point reads.
+The fixture also counts every scanned row and encoded byte; an adversarial fixture
+places unrelated rows between desired keys and must stop at the fixed budget and return
+`Keep` rather than continue scanning.
 
 ```bash
 cd /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback/zerofs
@@ -1379,6 +1383,12 @@ cargo test -p zerofs --locked -- --list 2>&1 | tee "${TMPDIR:-/tmp}/zerofs-recla
 grep -F "${RECLAIM_RED}: test" "${TMPDIR:-/tmp}/zerofs-reclaim-red-list.log"
 if cargo test -p zerofs --locked "$RECLAIM_RED" -- --exact --nocapture; then
   echo "expected reclaim scan-bound RED but ${RECLAIM_RED} passed" >&2
+  exit 1
+fi
+RECLAIM_BUDGET_RED='fs::store::extent::reclaim::tests::reclaim_scan_row_or_byte_budget_exhaustion_fails_closed'
+grep -F "${RECLAIM_BUDGET_RED}: test" "${TMPDIR:-/tmp}/zerofs-reclaim-red-list.log"
+if cargo test -p zerofs --locked "$RECLAIM_BUDGET_RED" -- --exact --nocapture; then
+  echo "expected reclaim row/byte-budget RED but ${RECLAIM_BUDGET_RED} passed" >&2
   exit 1
 fi
 ```
@@ -1484,7 +1494,9 @@ pending-read coherence remains owned by the shared mutation overlay until canoni
 state is visible. GC/compaction uses fixed batches of at most 64 sorted forward-map keys;
 each batch is merge-checked by one streaming memory-view scan and one durable-view scan,
 so a full 1,024-frame segment issues at most 32 scans even when every key is sparse or
-interleaved. It never falls back to one point read per frame; absent forward keys mean
+interleaved. Across both views, one candidate may scan at most 4,096 rows and 64 MiB of
+encoded key/value bytes. Exceeding either fixed budget stops immediately and returns
+`Keep`; it never falls back to one point read per frame. Absent forward keys mean
 dead frames as today, while any decode error, scan error, or reference to the segment
 fails closed to `Keep`. The scans
 use `NoAdmit` for decoded and raw-part caches. Cache weighers include key size, entry/container overhead,
@@ -1521,6 +1533,8 @@ cargo_test_nonzero 'segment_store::tests' -p zerofs --locked
 cargo_test_nonzero 'writeback::store::tests' -p zerofs --locked
 cargo_test_nonzero 'writeback::journaler::tests' -p zerofs --locked
 cargo_test_nonzero 'config::tests' -p zerofs --locked
+cargo test -p zerofs --locked fs::store::extent::reclaim::tests::sparse_interleaved_full_segment_uses_at_most_thirty_two_verification_scans -- --exact --nocapture
+cargo test -p zerofs --locked fs::store::extent::reclaim::tests::reclaim_scan_row_or_byte_budget_exhaustion_fails_closed -- --exact --nocapture
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --all-targets --locked
