@@ -595,11 +595,6 @@ impl Db {
         Ok(result)
     }
 
-    /// Point read seeing only object-storage-durable data.
-    pub async fn get_bytes_durable(&self, key: &Bytes) -> Result<Option<Bytes>> {
-        self.get_bytes_at(key, DurabilityLevel::Remote).await
-    }
-
     async fn get_bytes_at(
         &self,
         key: &Bytes,

@@ -15,6 +15,7 @@ use crate::fs::key_codec::KeyCodec;
 use crate::fs::metrics::SegmentGcPass;
 use crate::segment::{FrameLoc, Segid};
 use crate::segment_store::SegmentStoreError;
+use anyhow::Context;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures::stream::StreamExt;
@@ -22,7 +23,7 @@ use slatedb::config::WriteOptions;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 /// Compaction thresholds. A live segment is a candidate when *fragmented*
 /// (live bytes below this percent of total) or *small* (below
@@ -771,7 +772,12 @@ impl ExtentStore {
             nominations_dropped: nom_dropped,
             hot_seams: hot_pairs.len() as u64,
         });
-        crate::alloc_rss::purge_arenas();
+        // Purge only when the pass freed something (or RSS is over the cap):
+        // an idle pass at the 5s fast cadence must not stall foreground
+        // allocation with an all-arena walk that frees nothing.
+        if deleted > 0 || frames_relocated > 0 || crate::alloc_rss::over_rss_cap() {
+            crate::alloc_rss::purge_arenas();
+        }
         Ok(PassOutcome {
             deleted,
             relocated: frames_relocated,
@@ -952,13 +958,13 @@ impl ExtentStore {
             Err(_) => return SegmentDeadVerdict::Keep,
         };
         let want: BTreeSet<(InodeId, u64)> = dir.iter().map(|e| (e.inode, e.extent)).collect();
-        if want.is_empty() {
-            return SegmentDeadVerdict::Reclaim;
-        }
         match self.directory_still_referenced(segid, &want).await {
             Ok(true) => SegmentDeadVerdict::Keep,
             Ok(false) => SegmentDeadVerdict::Reclaim,
-            Err(()) => SegmentDeadVerdict::Keep,
+            Err(e) => {
+                warn!("segment {segid:?} verify fail-closed, keeping: {e:#}");
+                SegmentDeadVerdict::Keep
+            }
         }
     }
 
@@ -969,23 +975,21 @@ impl ExtentStore {
         &self,
         segid: Segid,
         want: &BTreeSet<(InodeId, u64)>,
-    ) -> Result<bool, ()> {
+    ) -> anyhow::Result<bool> {
         for (inode, start, last) in inode_extent_runs(want) {
-            let Some((start_key, end_key)) =
-                extent_scan_bounds(&self.key_codec, inode, start, last)
-            else {
-                return Err(());
-            };
-            if self
-                .scan_extent_run_points_here(segid, want, start_key.clone()..end_key.clone(), false)
-                .await?
-            {
-                return Ok(true);
-            }
-            if self
-                .scan_extent_run_points_here(segid, want, start_key..end_key, true)
-                .await?
-            {
+            let (start_key, end_key) = extent_scan_bounds(&self.key_codec, inode, start, last)
+                .context("unbounded extent scan range")?;
+            // The two views are independent; scan them concurrently.
+            let (in_memory, in_durable) = futures::join!(
+                self.scan_extent_run_points_here(
+                    segid,
+                    want,
+                    start_key.clone()..end_key.clone(),
+                    false
+                ),
+                self.scan_extent_run_points_here(segid, want, start_key..end_key, true),
+            );
+            if in_memory? || in_durable? {
                 return Ok(true);
             }
         }
@@ -998,16 +1002,16 @@ impl ExtentStore {
         want: &BTreeSet<(InodeId, u64)>,
         range: std::ops::Range<Bytes>,
         durable: bool,
-    ) -> Result<bool, ()> {
+    ) -> anyhow::Result<bool> {
         let stream = if durable {
             self.db.scan_durable(range).await
         } else {
             self.db.scan(range).await
         }
-        .map_err(|_| ())?;
+        .context("extent scan failed to start")?;
         futures::pin_mut!(stream);
         while let Some(item) = StreamExt::next(&mut stream).await {
-            let (key, val) = item.map_err(|_| ())?;
+            let (key, val) = item.context("extent scan item")?;
             let Some((inode, extent)) = self.key_codec.parse_extent_key_full(&key) else {
                 continue;
             };
@@ -1017,14 +1021,20 @@ impl ExtentStore {
             match FrameLoc::decode(&val) {
                 Some(loc) if loc.segid == segid => return Ok(true),
                 Some(_) => {}
-                None => return Err(()),
+                None => anyhow::bail!("undecodable FrameLoc at inode {inode} extent {extent}"),
             }
         }
         Ok(false)
     }
 }
 
-/// Consecutive (inode, extent) runs, each (`inode`, first, last inclusive).
+/// Extents of one inode this far apart or closer share a scan: iterating a
+/// few absent keys is cheaper than a fresh SlateDB scan per fragment
+/// (compaction outputs interleave inodes and scatter extents).
+const MAX_RUN_GAP: u64 = 64;
+
+/// Per-inode (inode, extent) runs, each (`inode`, first, last inclusive),
+/// merging gaps up to [`MAX_RUN_GAP`].
 fn inode_extent_runs(want: &BTreeSet<(InodeId, u64)>) -> Vec<(InodeId, u64, u64)> {
     let mut runs = Vec::new();
     let mut iter = want.iter();
@@ -1035,7 +1045,8 @@ fn inode_extent_runs(want: &BTreeSet<(InodeId, u64)>) -> Vec<(InodeId, u64, u64)
     let mut start = extent;
     let mut last = extent;
     for &(inode, extent) in iter {
-        if inode == cur_inode && extent == last.saturating_add(1) && last < u64::MAX {
+        // Set order guarantees `extent > last` within an inode.
+        if inode == cur_inode && extent.saturating_sub(last) <= MAX_RUN_GAP {
             last = extent;
             continue;
         }
@@ -1055,6 +1066,8 @@ fn extent_scan_bounds(
     last_inclusive: u64,
 ) -> Option<(Bytes, Bytes)> {
     let start_key = key_codec.extent_key(inode, start);
+    // u64::MAX indices are unreachable for real extents (index =
+    // offset / EXTENT_SIZE); fail closed anyway rather than wrap.
     let end_key = if last_inclusive < u64::MAX {
         key_codec.extent_key(inode, last_inclusive + 1)
     } else if inode < u64::MAX {
