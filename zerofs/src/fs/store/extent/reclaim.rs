@@ -1355,13 +1355,39 @@ mod tests {
         commit(&store, txn).await;
         db.flush().await.unwrap();
 
+        let want: BTreeSet<_> = locs
+            .iter()
+            .map(|(inode, logical_extent, _)| (*inode, *logical_extent))
+            .collect();
         let memory_before = db.scan_call_count();
         let durable_before = db.durable_scan_call_count();
         let points_before = db.point_read_call_count();
-        let (deleted, _) = store.reclaim_segments(Utc::now(), None).await.unwrap();
+        assert_eq!(
+            store.directory_still_referenced(segid, &want).await,
+            Ok(false),
+            "both views must prove the full directory unreferenced"
+        );
         let memory_scans = db.scan_call_count() - memory_before;
         let durable_scans = db.durable_scan_call_count() - durable_before;
+        assert!(
+            memory_scans > 0,
+            "directory verification must scan the current memory view"
+        );
+        assert!(
+            durable_scans > 0,
+            "directory verification must also scan the durable view"
+        );
+        assert!(
+            memory_scans + durable_scans <= MAX_VERIFY_SCANS as u64,
+            "full-size verification must honor the combined scan budget"
+        );
+        assert_eq!(
+            db.point_read_call_count() - points_before,
+            0,
+            "full-size verification must not regress to per-frame point reads"
+        );
 
+        let (deleted, _) = store.reclaim_segments(Utc::now(), None).await.unwrap();
         assert_eq!(
             deleted, 1,
             "a dead full-size segment must remain reclaimable"
@@ -1374,23 +1400,6 @@ mod tests {
                 .unwrap()
                 .contains(&segid),
             "the verified dead full-size segment must be deleted"
-        );
-        assert!(
-            memory_scans > 0,
-            "reclaim must verify the current memory view"
-        );
-        assert!(
-            durable_scans > 0,
-            "reclaim must also verify the durable view"
-        );
-        assert!(
-            memory_scans + durable_scans <= MAX_VERIFY_SCANS,
-            "full-size verification must honor the combined scan budget"
-        );
-        assert_eq!(
-            db.point_read_call_count() - points_before,
-            0,
-            "full-size verification must not regress to per-frame point reads"
         );
     }
 
