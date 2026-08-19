@@ -28,7 +28,12 @@ def validate_metrics_url(url: str) -> SplitResult:
         raise ValueError(
             "metrics URL must be credential-free HTTPS without query or fragment"
         )
-    parsed = urlsplit(url)
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        raise ValueError(
+            "metrics URL must be credential-free HTTPS without query or fragment"
+        ) from None
     if (
         parsed.scheme != "https"
         or not parsed.hostname

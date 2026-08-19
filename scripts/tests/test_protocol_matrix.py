@@ -191,6 +191,14 @@ class ProtocolAuthorityTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "credential-free HTTPS"):
                     MetricsClient(delimited["ZEROFS_BENCH_NFS_METRICS_URL"])
 
+        malformed = (
+            "https://user:REVIEW_SECRET_MARKER＠10.10.10.55:9567/metrics"
+        )
+        with self.assertRaisesRegex(ValueError, "credential-free HTTPS") as raised:
+            MetricsClient(malformed)
+        self.assertNotIn("REVIEW_SECRET_MARKER", str(raised.exception))
+        self.assertIsNone(raised.exception.__cause__)
+
     def test_metrics_identity_requires_one_exact_server_emitted_series(self) -> None:
         identity = MetricsAuthorityIdentity.parse(
             'zerofs_benchmark_authority_info{export_id="nfs-root",'
