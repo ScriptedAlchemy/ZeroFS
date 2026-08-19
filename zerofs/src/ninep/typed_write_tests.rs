@@ -335,8 +335,17 @@ async fn private_framed_reconnect_retry_replays_typed_write_result() {
             ))
             .await;
         let first_reply = first.receive().await;
-        assert!(matches!(first_reply.body, Message::Rwrite(_)));
+        assert!(matches!(
+            first_reply.body,
+            Message::Rwrite(response) if response.count == payload.len() as u32
+        ));
         wait_for_slots(&request_cache, 0).await;
+        let overlay = fs
+            .volatile_overlay
+            .get()
+            .expect("volatile filesystem installed the overlay");
+        let accepted_batches = overlay.accepted_batch_count();
+        assert_eq!(accepted_batches, 1);
         drop(first);
 
         let mut retry = FramedNinePClient::connect(&socket).await;
@@ -358,7 +367,15 @@ async fn private_framed_reconnect_retry_replays_typed_write_result() {
             ))
             .await;
         let retry_reply = retry.receive().await;
-        assert!(matches!(retry_reply.body, Message::Rwrite(_)));
+        assert!(matches!(
+            retry_reply.body,
+            Message::Rwrite(response) if response.count == payload.len() as u32
+        ));
+        assert_eq!(
+            overlay.accepted_batch_count(),
+            accepted_batches,
+            "a reconnect RETRY must not publish a second staged write"
+        );
         stop_server(retry, shutdown, server_task, &fs).await;
         request_cache
     };

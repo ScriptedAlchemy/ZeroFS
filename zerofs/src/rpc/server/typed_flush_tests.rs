@@ -3,23 +3,28 @@ use super::*;
 use crate::block_transformer::ZeroFsBlockTransformer;
 use crate::config::CompressionConfig;
 use crate::db::SlateDbHandle;
-use crate::ninep::NinePServer;
 use crate::fs::mutation::config::{
     ClientDurabilityTarget, FilesystemWriteAckMode, FilesystemWriteAckSettings,
     FilesystemWriteAckSource,
 };
 use crate::fs::mutation::durability::{DurabilityError, DurabilityTarget};
+use crate::ninep::NinePServer;
 use crate::writeback::config::{AckMode, ShutdownFlush, WritebackSettings};
 use crate::writeback::model::JournalIdentity;
 use crate::writeback::store::WritebackObjectStore;
 use bytes::Bytes;
 use futures::TryStreamExt;
 use ninep_client::{NOFID, NinePClient};
+use ninep_proto::{
+    Message, P9Message, P9String, Tattach, Tfsync, Tlopen, Tversion, Twalk, VERSION_9P2000L,
+};
 use object_store::ObjectStore;
 use object_store::local::LocalFileSystem;
 use slatedb::DbBuilder;
 use slatedb::object_store::path::Path as DbPath;
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::UnixStream;
 use tokio::sync::{Notify, mpsc};
 
 fn volatile_write_ack_settings() -> FilesystemWriteAckSettings {
@@ -386,8 +391,89 @@ async fn connect_ninep_with_retry(socket: &std::path::Path) -> Arc<NinePClient> 
     panic!("production 9P client never connected to Unix server");
 }
 
+struct StandardNinePClient {
+    stream: UnixStream,
+}
+
+impl StandardNinePClient {
+    async fn connect(socket: &std::path::Path) -> Self {
+        for _ in 0..100 {
+            if let Ok(stream) = UnixStream::connect(socket).await {
+                return Self { stream };
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("standard 9P client never connected to Unix server");
+    }
+
+    async fn send(&mut self, tag: u16, body: Message) -> P9Message {
+        self.stream
+            .write_all(&P9Message::new(tag, body).to_bytes_ctx(false).unwrap())
+            .await
+            .unwrap();
+        let mut size = [0u8; 4];
+        self.stream.read_exact(&mut size).await.unwrap();
+        let size = u32::from_le_bytes(size) as usize;
+        assert!(size >= 7, "server returned undersized 9P frame");
+        let mut frame = vec![0u8; size];
+        frame[..4].copy_from_slice(&(size as u32).to_le_bytes());
+        self.stream.read_exact(&mut frame[4..]).await.unwrap();
+        P9Message::from_owned_bytes_ctx(Bytes::from(frame), false).unwrap()
+    }
+
+    async fn open(socket: &std::path::Path, name: &[u8]) -> Self {
+        let mut client = Self::connect(socket).await;
+        let version = client
+            .send(
+                u16::MAX,
+                Message::Tversion(Tversion {
+                    msize: 256 * 1024,
+                    version: P9String::new(VERSION_9P2000L.to_vec()),
+                }),
+            )
+            .await;
+        assert!(matches!(version.body, Message::Rversion(_)));
+        let attach = client
+            .send(
+                1,
+                Message::Tattach(Tattach {
+                    fid: 1,
+                    afid: u32::MAX,
+                    uname: P9String::new(b"root".to_vec()),
+                    aname: P9String::new(Vec::new()),
+                    n_uname: 0,
+                }),
+            )
+            .await;
+        assert!(matches!(attach.body, Message::Rattach(_)));
+        let walk = client
+            .send(
+                2,
+                Message::Twalk(Twalk {
+                    fid: 1,
+                    newfid: 2,
+                    nwname: 1,
+                    wnames: vec![P9String::new(name.to_vec())],
+                }),
+            )
+            .await;
+        assert!(matches!(walk.body, Message::Rwalk(_)));
+        let open = client
+            .send(
+                3,
+                Message::Tlopen(Tlopen {
+                    fid: 2,
+                    flags: libc::O_RDWR as u32,
+                }),
+            )
+            .await;
+        assert!(matches!(open.body, Message::Rlopen(_)));
+        client
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn unix_ninep_verified_fsync_waits_for_real_remote_writeback() {
+async fn unix_ninep_standard_and_verified_fsync_wait_for_real_remote_writeback() {
     let (fs, checkpoint_manager, writeback, remote, mut coverage_rx, temp) =
         real_writeback_fs(false, ClientDurabilityTarget::RemoteBackend).await;
     let shutdown = CancellationToken::new();
@@ -419,29 +505,47 @@ async fn unix_ninep_verified_fsync_waits_for_real_remote_writeback() {
     let expected_cutoff = fs.capture_mutation_cutoff();
     assert!(expected_cutoff.sequence > 0);
 
-    let mut fsync = tokio::spawn({
+    let standard = StandardNinePClient::open(&socket, b"typed-durability").await;
+    let mut verified_fsync = tokio::spawn({
         let client = Arc::clone(&client);
         async move { client.fsync(fid, 0).await }
     });
-    let (coverage, target) = tokio::time::timeout(Duration::from_secs(5), coverage_rx.recv())
-        .await
-        .expect("9P verified fsync did not capture object coverage")
-        .expect("9P object-coverage observer closed");
-    assert_eq!(target, DurabilityTarget::RemoteBackend);
-    let captured_sequence = match coverage {
-        crate::fs::mutation::durability::ObjectCoverage::Writeback {
-            journal_incarnation,
-            sequence,
-        } => {
-            assert_eq!(
-                journal_incarnation.as_uuid(),
-                writeback.journal_incarnation()
-            );
-            assert!(sequence > 0);
-            sequence
-        }
-        other => panic!("9P fsync captured non-writeback coverage: {other:?}"),
-    };
+    let mut standard_fsync = tokio::spawn(async move {
+        let mut standard = standard;
+        let response = standard
+            .send(
+                30,
+                Message::Tfsync(Tfsync {
+                    fid: 2,
+                    datasync: 0,
+                }),
+            )
+            .await;
+        (standard, response)
+    });
+    let mut captured_sequence = 0;
+    for _ in 0..2 {
+        let (coverage, target) = tokio::time::timeout(Duration::from_secs(5), coverage_rx.recv())
+            .await
+            .expect("9P fsync did not capture object coverage")
+            .expect("9P object-coverage observer closed");
+        assert_eq!(target, DurabilityTarget::RemoteBackend);
+        let sequence = match coverage {
+            crate::fs::mutation::durability::ObjectCoverage::Writeback {
+                journal_incarnation,
+                sequence,
+            } => {
+                assert_eq!(
+                    journal_incarnation.as_uuid(),
+                    writeback.journal_incarnation()
+                );
+                assert!(sequence > 0);
+                sequence
+            }
+            other => panic!("9P fsync captured non-writeback coverage: {other:?}"),
+        };
+        captured_sequence = captured_sequence.max(sequence);
+    }
     let locally_durable = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let status = writeback.status().unwrap();
@@ -455,8 +559,12 @@ async fn unix_ninep_verified_fsync_waits_for_real_remote_writeback() {
     .expect("real SSD journal did not cross the 9P coverage cutoff");
     assert_eq!(locally_durable.remote_seq, 0);
     assert!(
-        !fsync.is_finished(),
+        !verified_fsync.is_finished(),
         "9P verified fsync returned while remote replay was paused"
+    );
+    assert!(
+        !standard_fsync.is_finished(),
+        "standard 9P fsync returned while remote replay was paused"
     );
     assert!(
         fs.materializer
@@ -468,11 +576,16 @@ async fn unix_ninep_verified_fsync_waits_for_real_remote_writeback() {
     );
 
     writeback.activate_remote().unwrap();
-    tokio::time::timeout(Duration::from_secs(10), &mut fsync)
+    tokio::time::timeout(Duration::from_secs(10), &mut verified_fsync)
         .await
         .expect("9P verified fsync did not resume after remote replay")
         .expect("9P verified fsync task panicked")
         .expect("9P verified fsync failed");
+    let (standard, standard_reply) = tokio::time::timeout(Duration::from_secs(10), &mut standard_fsync)
+        .await
+        .expect("standard 9P fsync did not resume after remote replay")
+        .expect("standard 9P fsync task panicked");
+    assert!(matches!(standard_reply.body, Message::Rfsync(_)));
     let remote_status = writeback.status().unwrap();
     assert!(remote_status.remote_seq >= captured_sequence);
     assert_eq!(client.read(fid, 0, payload.len() as u32).await.unwrap(), payload);
@@ -483,6 +596,7 @@ async fn unix_ninep_verified_fsync_waits_for_real_remote_writeback() {
         .expect("local filesystem remote listing failed");
     assert!(!remote_objects.is_empty(), "9P remote backend stayed empty");
 
+    drop(standard);
     client.clunk(fid).await.unwrap();
     client.free_fid(fid);
     drop(client);
