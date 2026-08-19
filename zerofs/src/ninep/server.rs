@@ -1307,11 +1307,12 @@ mod tests {
         );
         assert_eq!(global.snapshot().active_transports, TEST_TRANSPORTS);
         assert!(
-            GLOBAL_TRANSPORT_SESSIONS >= 32,
+            global.transport_limit >= 32,
             "the envelope must retain room for sixteen idle Mesh and sixteen upload sessions"
         );
+        let documented_bound = global.byte_limit + global.transport_limit * P9_MAX_MSIZE as usize;
         assert_eq!(
-            DOCUMENTED_P9_MEMORY_BOUND,
+            documented_bound,
             1024 * 1024 * 1024,
             "the admitted budget plus one maximum frame per transport is the documented bound"
         );
