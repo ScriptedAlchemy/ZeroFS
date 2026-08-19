@@ -2,7 +2,7 @@ name: WebUI
 
 on:
   push:
-    branches: ["main"]
+    branches: ["main", "develop"]
     paths:
       - "webui/**"
       - "zerofs/ninep-client/**"
@@ -15,7 +15,7 @@ on:
       - "zerofs/proto/**"
       - "Makefile"
   pull_request:
-    branches: ["main"]
+    branches: ["main", "develop"]
     paths:
       - "webui/**"
       - "zerofs/ninep-client/**"
