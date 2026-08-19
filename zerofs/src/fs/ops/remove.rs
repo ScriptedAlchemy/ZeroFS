@@ -371,10 +371,11 @@ impl ZeroFS {
                 }
 
                 self.write_coordinator.commit(txn).await?;
-                if !deferred && original_nlink <= 1 {
-                    if let crate::fs::inode::Inode::File(file) = &file_inode {
-                        self.quota.release_committed(file.size);
-                    }
+                if !deferred
+                    && original_nlink <= 1
+                    && let crate::fs::inode::Inode::File(file) = &file_inode
+                {
+                    self.quota.release_committed(file.size);
                 }
 
                 if deferred {

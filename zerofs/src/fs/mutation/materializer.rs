@@ -96,7 +96,7 @@ impl Materializer {
                 fs,
                 overlay: overlay
                     .map(|overlay| Arc::downgrade(&overlay))
-                    .unwrap_or_else(Weak::<FilesystemVolatileOverlay>::new),
+                    .unwrap_or_default(),
                 apply_hook,
                 lanes: Mutex::new(HashMap::new()),
                 hold_enqueue: Mutex::new(()),
@@ -174,7 +174,9 @@ impl Materializer {
             // Hold only this synchronous enqueue lock; the potentially slow
             // acquisition and apply phases remain concurrent.
             let _enqueue = lock(&self.inner.hold_enqueue);
-            for (_index, inode) in inodes.iter().enumerate() {
+            for inode in &inodes {
+                #[cfg(test)]
+                let is_first = holds.is_empty();
                 let (acquired_tx, acquired_rx) = oneshot::channel();
                 let (release_tx, release_rx) = oneshot::channel();
                 self.lane(*inode)
@@ -185,7 +187,7 @@ impl Materializer {
                     .map_err(|_| self.poison("inode worker dropped"))?;
                 holds.push((acquired_rx, release_tx));
                 #[cfg(test)]
-                if _index == 0 && interleave_position == Some(0) {
+                if is_first && interleave_position == Some(0) {
                     let attempted = lock(&self.inner.hold_enqueue_interleave.second_attempted);
                     drop(
                         self.inner
