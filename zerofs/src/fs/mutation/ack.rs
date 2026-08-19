@@ -35,7 +35,7 @@ impl ZeroFS {
         if let Some(overlay) = self.volatile_overlay.get() {
             overlay.wait_inode(id).await.map_err(|_| FsError::IoError)?;
         }
-        self.wait_configured_durability().await
+        self.client_fsync().await
     }
 }
 
