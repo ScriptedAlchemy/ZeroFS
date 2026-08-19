@@ -45,6 +45,7 @@ pub(crate) fn direct_write_fingerprint(
 pub(super) fn mutation_fs_error(error: MutationError) -> FsError {
     match error {
         MutationError::TooLarge { .. } => FsError::NoSpace,
+        MutationError::Backpressure => FsError::RetryLater,
         MutationError::StaleIncarnation => FsError::StaleHandle,
         MutationError::Closed | MutationError::Poisoned(_) => FsError::IoError,
     }
