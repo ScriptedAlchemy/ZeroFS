@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 import json
 import tempfile
+import traceback
 import unittest
 import io
 from contextlib import redirect_stderr
@@ -186,6 +187,15 @@ class ProtocolAuthorityTests(unittest.TestCase):
         self.assertEqual(identity.server_instance_id, "instance-a")
         with self.assertRaisesRegex(ValueError, "exactly one"):
             MetricsAuthorityIdentity.parse("zerofs_writeback_accepted_sequence 3\n")
+
+        with self.assertRaisesRegex(ValueError, "invalid writeback metric value") as raised:
+            WritebackSnapshot.parse(
+                "zerofs_writeback_accepted_sequence REVIEW_SECRET_MARKER\n"
+            )
+        self.assertNotIn(
+            "REVIEW_SECRET_MARKER",
+            "".join(traceback.format_exception(raised.exception)),
+        )
 
     def test_every_snapshot_rejects_identity_drift_in_the_same_response(self) -> None:
         expected = MetricsAuthorityIdentity("instance-a", "filesystem-a", "nfs-root")

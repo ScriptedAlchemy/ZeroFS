@@ -115,8 +115,8 @@ class WritebackSnapshot:
                 continue
             try:
                 found[_METRICS[parts[0]]] = int(float(parts[1]))
-            except ValueError as error:
-                raise ValueError("invalid writeback metric value") from error
+            except ValueError:
+                raise ValueError("invalid writeback metric value") from None
         required = set(_METRICS.values()) - {"gc_active"}
         missing = sorted(required - found.keys())
         if missing:
