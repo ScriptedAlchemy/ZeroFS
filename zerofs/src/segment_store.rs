@@ -152,15 +152,13 @@ impl SegmentStore {
         let path = Path::from(segid.object_key());
         if bytes.len() < SEAL_PART_SIZE {
             self.put_segment_create(&path, &bytes).await?;
-        } else {
-            if let SegmentPublication::Multipart(result) =
-                self.put_segment_multipart(&path, &bytes).await?
-            {
-                // True multipart bypasses the object-store wrapper's single-PUT
-                // write-through, so only this outcome needs the explicit hook.
-                if let Some(warm) = &self.warm {
-                    warm(&path, bytes, &result);
-                }
+        } else if let SegmentPublication::Multipart(result) =
+            self.put_segment_multipart(&path, &bytes).await?
+        {
+            // True multipart bypasses the object-store wrapper's single-PUT
+            // write-through, so only this outcome needs the explicit hook.
+            if let Some(warm) = &self.warm {
+                warm(&path, bytes, &result);
             }
         }
         Ok(())
