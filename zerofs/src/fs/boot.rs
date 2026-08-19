@@ -254,6 +254,7 @@ impl ZeroFS {
             flush_coordinator,
             write_coordinator,
             ignore_fsync,
+            write_ack: crate::fs::mutation::config::FilesystemWriteAckSettings::materialized_direct(),
             lineage_token,
             serving_writer_epoch,
             max_bytes,
@@ -603,4 +604,27 @@ mod tests {
     }
 
     // === Tests from operations.rs ===
+}
+
+
+#[cfg(test)]
+mod write_ack_retention_tests {
+    use crate::fs::mutation::config::{
+        ClientDurabilityTarget, FilesystemWriteAckMode, FilesystemWriteAckSource,
+    };
+
+    #[tokio::test]
+    async fn in_memory_filesystem_keeps_resolved_write_ack_settings() {
+        let fs = super::ZeroFS::new_in_memory().await.unwrap();
+        assert_eq!(fs.write_ack.mode, FilesystemWriteAckMode::Materialized);
+        assert_eq!(
+            fs.write_ack.source,
+            FilesystemWriteAckSource::DefaultMaterialized
+        );
+        assert_eq!(
+            fs.write_ack.client_durability_target,
+            ClientDurabilityTarget::RemoteBackend
+        );
+        assert_eq!(fs.write_ack.volatile_memory_bytes, 0);
+    }
 }

@@ -253,9 +253,19 @@ async fn ensure_nbd_directory(fs: &Arc<ZeroFS>) -> Result<()> {
     Ok(())
 }
 
+fn nbd_volatile_budget(write_ack: crate::fs::mutation::config::FilesystemWriteAckSettings) -> u64 {
+    match write_ack.mode {
+        crate::fs::mutation::config::FilesystemWriteAckMode::VolatileMemory => {
+            write_ack.volatile_memory_bytes
+        }
+        crate::fs::mutation::config::FilesystemWriteAckMode::Materialized => 0,
+    }
+}
+
 async fn start_nbd_servers(
     fs: Arc<ZeroFS>,
     config: Option<&NbdConfig>,
+    write_ack: crate::fs::mutation::config::FilesystemWriteAckSettings,
     shutdown: CancellationToken,
 ) -> anyhow::Result<(
     Vec<JoinHandle<Result<(), std::io::Error>>>,
@@ -266,7 +276,7 @@ async fn start_nbd_servers(
         None => return Ok((Vec::new(), None)),
     };
     let mut handles = Vec::new();
-    let volatile_memory_bytes = config.volatile_memory_bytes()?;
+    let volatile_memory_bytes = nbd_volatile_budget(write_ack);
     let volatile_enabled = volatile_memory_bytes > 0;
     metrics::gauge!("zerofs_nbd_volatile_memory_enabled").set(f64::from(volatile_enabled));
     if volatile_enabled {
@@ -1311,6 +1321,7 @@ pub async fn run_server(
         let (nbd_handles, nbd_runtime_registry) = start_nbd_servers(
             Arc::clone(&fs),
             settings.servers.nbd.as_ref(),
+            write_ack,
             shutdown.clone(),
         )
         .await?;
@@ -1808,6 +1819,50 @@ min_free_gb = 256.0
         settings
             .filesystem_write_ack_settings(write_ack_access_mode(DatabaseMode::ReadWrite))
             .unwrap();
+    }
+
+    #[test]
+    fn nbd_uses_resolved_filesystem_write_ack_budget() {
+        let settings: Settings = toml::from_str(
+            r#"
+[cache]
+dir = "/tmp/cache"
+disk_size_gb = 1.0
+
+[storage]
+url = "file:///tmp/data"
+encryption_password = "test"
+
+[servers.nbd]
+addresses = ["127.0.0.1:10809"]
+
+[filesystem]
+write_ack_mode = "volatile_memory"
+volatile_memory_gb = 2.0
+
+[writeback]
+enabled = true
+dir = "/var/cache/zerofs-writeback"
+memory_size_gb = 16.0
+disk_size_gb = 512.0
+min_free_gb = 256.0
+"#,
+        )
+        .unwrap();
+        let write_ack = settings
+            .filesystem_write_ack_settings(write_ack_access_mode(DatabaseMode::ReadWrite))
+            .unwrap();
+        assert_eq!(
+            nbd_volatile_budget(write_ack),
+            write_ack.volatile_memory_bytes
+        );
+        assert!(nbd_volatile_budget(write_ack) > 0);
+        let nbd = settings.servers.nbd.as_ref().unwrap();
+        assert_eq!(
+            nbd.write_ack_mode,
+            crate::config::NbdWriteAckMode::Materialized
+        );
+        assert_eq!(nbd.volatile_memory_bytes().unwrap(), 0);
     }
 
     #[test]

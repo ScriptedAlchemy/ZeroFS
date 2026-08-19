@@ -118,6 +118,9 @@ pub struct ZeroFS {
     /// When set, a client `fsync`/COMMIT returns without forcing a flush to object
     /// storage; semi-sync replication is relied on for durability. See `client_fsync`.
     pub ignore_fsync: bool,
+    /// Resolved acknowledgement contract. Adapters consume this; they must
+    /// not re-read raw `[filesystem]` / `[servers.nbd]` fields.
+    pub(crate) write_ack: crate::fs::mutation::config::FilesystemWriteAckSettings,
     /// Durability lineage token (see `client_fsync_verified`). Identifies the current
     /// unbroken durable lineage; set once at bring-up, constant for this process's life.
     /// A ZeroFS client carries it, and a verified fsync succeeds only while it is

@@ -1106,7 +1106,7 @@ impl ReconciledDb {
         };
 
         let db_handle = slatedb.clone();
-        let fs = ZeroFS::new_with_slatedb_and_lease(
+        let mut fs = ZeroFS::new_with_slatedb_and_lease(
             slatedb,
             settings.max_bytes(),
             metrics_recorder,
@@ -1124,6 +1124,14 @@ impl ReconciledDb {
         )
         .await
         .context("Failed to initialize filesystem")?;
+        let access_mode = match db_mode {
+            DatabaseMode::ReadWrite => crate::writeback::config::WritebackAccessMode::ReadWrite,
+            DatabaseMode::ReadOnly => crate::writeback::config::WritebackAccessMode::ReadOnly,
+            DatabaseMode::Checkpoint(_) => crate::writeback::config::WritebackAccessMode::Checkpoint,
+        };
+        fs.write_ack = settings
+            .filesystem_write_ack_settings(access_mode)
+            .context("Invalid filesystem write-acknowledgement configuration")?;
 
         if let Some(writeback) = writeback.clone() {
             fs.flush_coordinator
