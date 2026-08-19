@@ -9,6 +9,7 @@ pub mod length_checked_object_store;
 // The library target does not compile the 9P server, so its 9P-only entries
 // are intentionally unused here; the binary target consumes the full table.
 pub mod alloc_rss;
+mod hpn_session;
 #[allow(dead_code)]
 mod linux_errno;
 pub mod metadata_digest;
@@ -21,6 +22,7 @@ pub mod segment;
 pub mod segment_extractor;
 pub mod segment_store;
 pub mod sftp_object_store;
+mod sftp_protocol;
 pub mod sftp_transport;
 pub mod storage_class_object_store;
 pub mod task;

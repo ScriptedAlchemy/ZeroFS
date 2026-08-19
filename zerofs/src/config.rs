@@ -4,11 +4,14 @@ use crate::fs::mutation::config::{
 };
 use anyhow::{Context, Result};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de, ser::SerializeStruct};
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::fmt;
 use std::fs;
 use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 /// Compression algorithm configuration for extent data.
 /// Supports lz4 and zstd.
@@ -182,7 +185,25 @@ pub struct RuntimeConfig {
     pub memory_limit_gb: Option<f64>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+/// SSH implementation that carries the SFTP protocol session.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SftpSshTransport {
+    /// In-process russh client. Historical default when `transport` is omitted.
+    #[default]
+    Russh,
+    /// Pinned HPN-SSH `hpnssh` process transport.
+    #[serde(rename = "hpn_openssh")]
+    HpnOpenSsh,
+}
+
+impl SftpSshTransport {
+    fn is_russh(&self) -> bool {
+        matches!(self, Self::Russh)
+    }
+}
+
+#[derive(Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct SftpConfig {
     /// Private key used for non-interactive public-key authentication.
@@ -215,6 +236,37 @@ pub struct SftpConfig {
     /// still bounds random-read amplification.
     #[serde(default = "default_sftp_read_cache_part_size_kib")]
     pub read_cache_part_size_kib: usize,
+    /// SSH implementation that carries the SFTP protocol session.
+    #[serde(default, skip_serializing_if = "SftpSshTransport::is_russh")]
+    pub transport: SftpSshTransport,
+    /// Absolute path to the pinned HPN-SSH program. Required for `hpn_openssh`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_expandable_path"
+    )]
+    pub hpn_program: Option<PathBuf>,
+    /// Hex-encoded SHA-256 of the canonicalized `hpn_program` file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hpn_sha256: Option<String>,
+}
+
+impl fmt::Debug for SftpConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SftpConfig")
+            .field("transport", &self.transport)
+            .field("hpn_program", &self.hpn_program)
+            .field("hpn_sha256", &self.hpn_sha256)
+            .field("identity_file", &"[REDACTED]")
+            .field("known_hosts", &self.known_hosts)
+            .field("max_connections", &self.max_connections)
+            .field("read_concurrency", &self.read_concurrency)
+            .field("write_concurrency", &self.write_concurrency)
+            .field("segment_size_mib", &self.segment_size_mib)
+            .field("read_cache_part_size_kib", &self.read_cache_part_size_kib)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -268,6 +320,9 @@ impl Default for SftpConfig {
             write_concurrency: default_sftp_direction_concurrency(),
             segment_size_mib: default_sftp_segment_size_mib(),
             read_cache_part_size_kib: default_sftp_read_cache_part_size_kib(),
+            transport: SftpSshTransport::Russh,
+            hpn_program: None,
+            hpn_sha256: None,
         }
     }
 }
@@ -318,7 +373,40 @@ impl SftpConfig {
                 "[sftp] read_cache_part_size_kib must be a power of two between 256 and 8192"
             );
         }
+        self.validate_transport()?;
         Ok(())
+    }
+
+    fn validate_transport(&self) -> Result<()> {
+        match self.transport {
+            SftpSshTransport::Russh => {
+                if self.hpn_program.is_some() || self.hpn_sha256.is_some() {
+                    anyhow::bail!(
+                        "[sftp] hpn_program and hpn_sha256 are only valid when transport = \"hpn_openssh\""
+                    );
+                }
+                Ok(())
+            }
+            SftpSshTransport::HpnOpenSsh => {
+                let program = self
+                    .hpn_program
+                    .as_ref()
+                    .filter(|path| !path.as_os_str().is_empty());
+                let sha = self
+                    .hpn_sha256
+                    .as_ref()
+                    .filter(|value| !value.trim().is_empty());
+                let Some(program) = program else {
+                    anyhow::bail!(
+                        "[sftp] hpn_program is required when transport = \"hpn_openssh\""
+                    );
+                };
+                let Some(sha) = sha else {
+                    anyhow::bail!("[sftp] hpn_sha256 is required when transport = \"hpn_openssh\"");
+                };
+                validate_pinned_hpn_program(program, sha)
+            }
+        }
     }
 
     pub fn data_profile(&self) -> SftpDataProfile {
@@ -330,6 +418,145 @@ impl SftpConfig {
             read_fetch_window_max_bytes: self.segment_size_mib * 1024 * 1024,
         }
     }
+}
+
+const HPN_VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+pub(crate) fn validate_pinned_hpn_program(program: &Path, expected_sha256: &str) -> Result<()> {
+    if !program.is_absolute() {
+        anyhow::bail!("[sftp] hpn_program must be an absolute path to a pinned hpnssh executable");
+    }
+
+    let metadata = fs::symlink_metadata(program)
+        .with_context(|| format!("[sftp] hpn_program {} is unavailable", program.display()))?;
+    if metadata.file_type().is_symlink() {
+        anyhow::bail!(
+            "[sftp] hpn_program {} must not be a symlink",
+            program.display()
+        );
+    }
+    if !metadata.is_file() {
+        anyhow::bail!(
+            "[sftp] hpn_program {} must be a regular file",
+            program.display()
+        );
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mode = metadata.permissions().mode();
+        if mode & 0o111 == 0 {
+            anyhow::bail!(
+                "[sftp] hpn_program {} must be executable",
+                program.display()
+            );
+        }
+        if mode & 0o022 != 0 {
+            anyhow::bail!(
+                "[sftp] hpn_program {} must not be group- or world-writable (mode {:04o})",
+                program.display(),
+                mode & 0o7777
+            );
+        }
+    }
+
+    let canonical = fs::canonicalize(program).with_context(|| {
+        format!(
+            "[sftp] hpn_program {} could not be canonicalized",
+            program.display()
+        )
+    })?;
+    let actual = sha256_hex_file(&canonical)?;
+    let expected = parse_configured_sha256(expected_sha256)?;
+    if actual != expected {
+        anyhow::bail!("[sftp] hpn_program SHA-256 {actual} does not match hpn_sha256 {expected}");
+    }
+
+    probe_hpn_version(&canonical)
+}
+
+fn parse_configured_sha256(value: &str) -> Result<String> {
+    let hex = value.trim();
+    if hex.len() != 64 || !hex.as_bytes().iter().all(u8::is_ascii_hexdigit) {
+        anyhow::bail!("[sftp] hpn_sha256 must be a 64-character SHA-256 hex digest");
+    }
+    Ok(hex.to_ascii_lowercase())
+}
+
+fn sha256_hex_file(path: &Path) -> Result<String> {
+    let mut file = fs::File::open(path)
+        .with_context(|| format!("[sftp] hpn_program {} could not be read", path.display()))?;
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut file, &mut hasher)
+        .with_context(|| format!("[sftp] hpn_program {} could not be hashed", path.display()))?;
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn probe_hpn_version(program: &Path) -> Result<()> {
+    let mut child = Command::new(program)
+        .arg("-V")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| {
+            format!(
+                "[sftp] hpn_program {} could not be executed",
+                program.display()
+            )
+        })?;
+
+    let deadline = Instant::now() + HPN_VERSION_PROBE_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                anyhow::bail!(
+                    "[sftp] hpn_program {} -V timed out after {}ms",
+                    program.display(),
+                    HPN_VERSION_PROBE_TIMEOUT.as_millis()
+                );
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(error) => {
+                let _ = child.kill();
+                anyhow::bail!(
+                    "[sftp] hpn_program {} -V failed: {error}",
+                    program.display()
+                );
+            }
+        }
+    }
+
+    let output = child
+        .wait_with_output()
+        .with_context(|| format!("[sftp] hpn_program {} -V failed", program.display()))?;
+    if !output.status.success() {
+        match output.status.code() {
+            Some(code) => anyhow::bail!(
+                "[sftp] hpn_program {} -V exited with status {code}",
+                program.display()
+            ),
+            None => anyhow::bail!(
+                "[sftp] hpn_program {} -V did not exit successfully",
+                program.display()
+            ),
+        }
+    }
+    let mut reported = String::new();
+    reported.push_str(&String::from_utf8_lossy(&output.stdout));
+    reported.push_str(&String::from_utf8_lossy(&output.stderr));
+    if !reported.contains("_hpn") {
+        anyhow::bail!(
+            "[sftp] hpn_program {} did not report HPN-SSH provenance (`_hpn`) from -V",
+            program.display()
+        );
+    }
+    Ok(())
 }
 
 fn default_sftp_known_hosts() -> PathBuf {
@@ -2077,6 +2304,14 @@ impl Settings {
         toml_string.push_str("# [sftp]\n");
         toml_string.push_str("# identity_file = \"${HOME}/.ssh/id_ed25519\"\n");
         toml_string.push_str("# known_hosts = \"${HOME}/.ssh/known_hosts\"\n");
+        toml_string
+            .push_str("# transport = \"russh\"            # russh (default) | hpn_openssh\n");
+        toml_string.push_str(
+            "# hpn_program = \"/usr/local/bin/hpnssh\"  # required for hpn_openssh; absolute pinned binary\n",
+        );
+        toml_string.push_str(
+            "# hpn_sha256 = \"...\"             # SHA-256 of that binary; required for hpn_openssh\n",
+        );
         toml_string.push_str("# max_connections = 8\n");
         toml_string.push_str("# read_concurrency = 7\n");
         toml_string.push_str("# write_concurrency = 7\n");
@@ -2177,8 +2412,9 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
     use std::env;
-    use tempfile::NamedTempFile;
+    use tempfile::{NamedTempFile, TempDir};
 
     #[test]
     fn test_env_var_expansion() {
@@ -2970,6 +3206,9 @@ min_free_gb = 256.0"#,
         assert_eq!(sftp.write_concurrency, 7);
         assert_eq!(sftp.segment_size_mib, 32);
         assert_eq!(sftp.read_cache_part_size_kib, 1024);
+        assert_eq!(sftp.transport, SftpSshTransport::Russh);
+        assert!(sftp.hpn_program.is_none());
+        assert!(sftp.hpn_sha256.is_none());
 
         let endpoint = settings.sftp_endpoint().unwrap().expect("SFTP endpoint");
         assert_eq!(endpoint.host, "example.com");
@@ -2984,6 +3223,18 @@ min_free_gb = 256.0"#,
         assert!(
             !rendered.contains("ssh_program"),
             "native russh transport must not advertise an OpenSSH wrapper"
+        );
+        assert!(
+            rendered.contains("# transport = \"russh\""),
+            "generated config must document the pinned HPN transport knob"
+        );
+        assert!(
+            rendered.contains("# hpn_program = \"/usr/local/bin/hpnssh\""),
+            "generated config must document the pinned hpnssh path"
+        );
+        assert!(
+            rendered.contains("hpn_openssh") && rendered.contains("# hpn_sha256"),
+            "generated config must document transport = \"hpn_openssh\" pinning"
         );
     }
 
@@ -3211,6 +3462,304 @@ known_hosts = "${ZEROFS_TEST_KNOWN_HOSTS}""#,
                 write_and_load(&sftp_config("sftp://alice@example.com/data", extra)).unwrap_err()
             );
             assert!(err.contains(expected), "got: {err}");
+        }
+    }
+
+    fn pinned_hpn_stub(dir: &std::path::Path, version_line: &str) -> (PathBuf, String) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let program = dir.join("hpnssh");
+        std::fs::write(
+            &program,
+            format!("#!/bin/sh\nprintf '%s\\n' {version_line:?} >&2\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let digest = Sha256::digest(std::fs::read(&program).unwrap());
+        (program, format!("{digest:x}"))
+    }
+
+    fn hpn_sftp_extra(program: &std::path::Path, sha: &str) -> String {
+        format!(
+            "[sftp]\ntransport = \"hpn_openssh\"\nhpn_program = {program:?}\nhpn_sha256 = {sha:?}\n"
+        )
+    }
+
+    #[test]
+    fn sftp_omitted_transport_stays_russh_and_round_trips_without_hpn_fields() {
+        let settings = write_and_load(&sftp_config("sftp://alice@example.com/data", "")).unwrap();
+        let sftp = settings.sftp.as_ref().unwrap();
+        assert_eq!(sftp.transport, SftpSshTransport::Russh);
+
+        let serialized = toml::to_string(&settings).unwrap();
+        assert!(
+            !serialized.contains("transport"),
+            "default russh must stay omitted: {serialized}"
+        );
+        assert!(
+            !serialized.contains("hpn_program"),
+            "default config must omit hpn_program: {serialized}"
+        );
+        assert!(
+            !serialized.contains("hpn_sha256"),
+            "default config must omit hpn_sha256: {serialized}"
+        );
+
+        let reparsed: Settings = toml::from_str(&serialized).unwrap();
+        assert_eq!(reparsed.sftp.unwrap().transport, SftpSshTransport::Russh);
+    }
+
+    #[test]
+    fn sftp_parses_explicit_russh_transport() {
+        let settings = write_and_load(&sftp_config(
+            "sftp://alice@example.com/data",
+            "[sftp]\ntransport = \"russh\"\n",
+        ))
+        .unwrap();
+        assert_eq!(settings.sftp.unwrap().transport, SftpSshTransport::Russh);
+    }
+
+    #[test]
+    fn sftp_rejects_unknown_transport_and_ssh_transport_alias() {
+        for extra in [
+            "[sftp]\ntransport = \"openssh\"\n",
+            "[sftp]\nssh_transport = \"hpn_openssh\"\n",
+            "[sftp]\nssh_program = \"/usr/bin/ssh\"\n",
+        ] {
+            let err = format!(
+                "{:#}",
+                write_and_load(&sftp_config("sftp://alice@example.com/data", extra)).unwrap_err()
+            );
+            assert!(
+                err.contains("unknown field")
+                    || err.contains("unknown variant")
+                    || err.contains("did not match any variant"),
+                "got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn sftp_rejects_hpn_fields_when_transport_is_russh() {
+        let dir = TempDir::new().unwrap();
+        let (program, sha) = pinned_hpn_stub(dir.path(), "OpenSSH_9.0_hpn14v15");
+        for extra in [
+            format!("[sftp]\nhpn_program = {program:?}\n"),
+            format!("[sftp]\nhpn_sha256 = {sha:?}\n"),
+            format!(
+                "[sftp]\ntransport = \"russh\"\nhpn_program = {program:?}\nhpn_sha256 = {sha:?}\n"
+            ),
+        ] {
+            let err = format!(
+                "{:#}",
+                write_and_load(&sftp_config("sftp://alice@example.com/data", &extra)).unwrap_err()
+            );
+            assert!(
+                err.contains("hpn_program") || err.contains("hpn_sha256"),
+                "got: {err}"
+            );
+            assert!(err.contains("hpn_openssh"), "got: {err}");
+        }
+    }
+
+    #[test]
+    fn sftp_hpn_transport_requires_program_and_sha256() {
+        for extra in [
+            "[sftp]\ntransport = \"hpn_openssh\"\n",
+            "[sftp]\ntransport = \"hpn_openssh\"\nhpn_program = \"/usr/local/bin/hpnssh\"\n",
+            "[sftp]\ntransport = \"hpn_openssh\"\nhpn_sha256 = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n",
+        ] {
+            let err = format!(
+                "{:#}",
+                write_and_load(&sftp_config("sftp://alice@example.com/data", extra)).unwrap_err()
+            );
+            assert!(
+                err.contains("hpn_program") || err.contains("hpn_sha256"),
+                "got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn sftp_hpn_program_must_be_absolute_regular_executable() {
+        let dir = TempDir::new().unwrap();
+        let (program, sha) = pinned_hpn_stub(dir.path(), "OpenSSH_9.0_hpn14v15");
+
+        let relative = format!(
+            "[sftp]\ntransport = \"hpn_openssh\"\nhpn_program = \"hpnssh\"\nhpn_sha256 = {sha:?}\n"
+        );
+        let err = format!(
+            "{:#}",
+            write_and_load(&sftp_config("sftp://alice@example.com/data", &relative)).unwrap_err()
+        );
+        assert!(err.contains("absolute"), "got: {err}");
+
+        let missing = format!(
+            "[sftp]\ntransport = \"hpn_openssh\"\nhpn_program = \"/tmp/zerofs-missing-hpnssh\"\nhpn_sha256 = {sha:?}\n"
+        );
+        let err = format!(
+            "{:#}",
+            write_and_load(&sftp_config("sftp://alice@example.com/data", &missing)).unwrap_err()
+        );
+        assert!(err.contains("unavailable"), "got: {err}");
+
+        let link = dir.path().join("hpnssh.link");
+        std::os::unix::fs::symlink(&program, &link).unwrap();
+        let extra = hpn_sftp_extra(&link, &sha);
+        let err = format!(
+            "{:#}",
+            write_and_load(&sftp_config("sftp://alice@example.com/data", &extra)).unwrap_err()
+        );
+        assert!(err.contains("symlink"), "got: {err}");
+    }
+
+    #[test]
+    fn sftp_hpn_program_rejects_group_or_world_writable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let (program, sha) = pinned_hpn_stub(dir.path(), "OpenSSH_9.0_hpn14v15");
+        for mode in [0o775, 0o757, 0o777] {
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(mode)).unwrap();
+            let extra = hpn_sftp_extra(&program, &sha);
+            let err = format!(
+                "{:#}",
+                write_and_load(&sftp_config("sftp://alice@example.com/data", &extra)).unwrap_err()
+            );
+            assert!(
+                err.contains("writable"),
+                "mode {mode:o} should be rejected: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn sftp_hpn_program_requires_matching_sha256_and_hpn_provenance() {
+        let dir = TempDir::new().unwrap();
+        let (program, sha) = pinned_hpn_stub(dir.path(), "OpenSSH_9.0_hpn14v15");
+
+        let mismatch = hpn_sftp_extra(
+            &program,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        );
+        let err = format!(
+            "{:#}",
+            write_and_load(&sftp_config("sftp://alice@example.com/data", &mismatch)).unwrap_err()
+        );
+        assert!(err.contains("SHA-256"), "got: {err}");
+        assert!(err.contains(&sha), "got: {err}");
+
+        let (plain, plain_sha) = pinned_hpn_stub(dir.path(), "OpenSSH_9.0p1");
+        let extra = hpn_sftp_extra(&plain, &plain_sha);
+        let err = format!(
+            "{:#}",
+            write_and_load(&sftp_config("sftp://alice@example.com/data", &extra)).unwrap_err()
+        );
+        assert!(
+            err.contains("_hpn") || err.contains("provenance"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn sftp_hpn_version_probe_requires_successful_exit() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let program = dir.path().join("hpnssh");
+        std::fs::write(
+            &program,
+            "#!/bin/sh\nprintf '%s\\n' 'OpenSSH_9.0_hpn14v15' >&2\nexit 17\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let sha = format!("{:x}", Sha256::digest(std::fs::read(&program).unwrap()));
+        let extra = hpn_sftp_extra(&program, &sha);
+
+        let error = format!(
+            "{:#}",
+            write_and_load(&sftp_config("sftp://alice@example.com/data", &extra)).unwrap_err()
+        );
+        assert!(error.contains("status 17"), "got: {error}");
+    }
+
+    #[test]
+    fn sftp_hpn_version_probe_is_deadline_bounded() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let program = dir.path().join("hpnssh");
+        std::fs::write(&program, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let sha = format!("{:x}", Sha256::digest(std::fs::read(&program).unwrap()));
+        let extra = hpn_sftp_extra(&program, &sha);
+        let err = format!(
+            "{:#}",
+            write_and_load(&sftp_config("sftp://alice@example.com/data", &extra)).unwrap_err()
+        );
+        assert!(err.contains("timed out"), "got: {err}");
+    }
+
+    #[test]
+    fn sftp_hpn_accepts_pinned_binary_and_keeps_private_key_out_of_errors() {
+        let dir = TempDir::new().unwrap();
+        let secret = "hpn-test-secret-key-bytes-do-not-leak";
+        let identity = dir.path().join("id_ed25519");
+        std::fs::write(
+            &identity,
+            format!(
+                "-----BEGIN OPENSSH PRIVATE KEY-----\n{secret}\n-----END OPENSSH PRIVATE KEY-----\n"
+            ),
+        )
+        .unwrap();
+        let (program, sha) = pinned_hpn_stub(dir.path(), "OpenSSH_9.0_hpn14v15");
+        let extra = format!(
+            "[sftp]\nidentity_file = {identity:?}\ntransport = \"hpn_openssh\"\nhpn_program = {program:?}\nhpn_sha256 = {sha:?}\n"
+        );
+        let settings =
+            write_and_load(&sftp_config("sftp://alice@example.com/data", &extra)).unwrap();
+        let sftp = settings.sftp.unwrap();
+        assert_eq!(sftp.transport, SftpSshTransport::HpnOpenSsh);
+        assert_eq!(sftp.hpn_program.as_deref(), Some(program.as_path()));
+        assert_eq!(sftp.hpn_sha256.as_deref(), Some(sha.as_str()));
+        let serialized = toml::to_string(&sftp).unwrap();
+        assert!(
+            serialized.contains("transport = \"hpn_openssh\""),
+            "serde must emit the configured transport name: {serialized}"
+        );
+        assert!(
+            !serialized.contains("hpn_open_ssh"),
+            "must not emit serde's default snake_case split: {serialized}"
+        );
+        let debug_sftp = format!("{sftp:?}");
+        assert!(
+            debug_sftp.contains("[REDACTED]"),
+            "identity_file must be redacted in Debug: {debug_sftp}"
+        );
+        assert!(
+            !debug_sftp.contains(secret),
+            "private key leaked in Debug: {debug_sftp}"
+        );
+        assert!(
+            !debug_sftp.contains("BEGIN OPENSSH PRIVATE KEY"),
+            "private key leaked in Debug: {debug_sftp}"
+        );
+
+        let (plain, plain_sha) = pinned_hpn_stub(dir.path(), "OpenSSH_9.0p1");
+        let extra = format!(
+            "[sftp]\nidentity_file = {identity:?}\ntransport = \"hpn_openssh\"\nhpn_program = {plain:?}\nhpn_sha256 = {plain_sha:?}\n"
+        );
+        let err = format!(
+            "{:#?}",
+            write_and_load(&sftp_config("sftp://alice@example.com/data", &extra)).unwrap_err()
+        );
+        let debug = format!("{err:?}");
+        for rendered in [&err, &debug] {
+            assert!(!rendered.contains(secret), "private key leaked: {rendered}");
+            assert!(
+                !rendered.contains("BEGIN OPENSSH PRIVATE KEY"),
+                "private key leaked: {rendered}"
+            );
         }
     }
 

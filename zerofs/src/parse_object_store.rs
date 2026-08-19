@@ -349,30 +349,50 @@ async fn build_sftp_store(
         port: url.port().unwrap_or(22),
         username: url.username().to_owned(),
     };
-    tracing::info!(
-        host = %endpoint.host,
-        port = endpoint.port,
-        window_size = crate::sftp_transport::RUSSH_WINDOW_SIZE,
-        maximum_packet_size = crate::sftp_transport::RUSSH_MAXIMUM_PACKET_SIZE,
-        max_concurrent_writes = crate::sftp_transport::RUSSH_SFTP_MAX_CONCURRENT_WRITES,
-        "opening russh SFTP object store"
-    );
-    let factory = crate::sftp_transport::RusshSessionFactory::new(
-        endpoint,
-        config.identity_file.clone(),
-        config.known_hosts.clone(),
-    )
-    .map_err(|source| object_store::Error::Generic {
-        store: "SFTP",
-        source: Box::new(source),
-    })?;
-    let pool =
-        crate::sftp_transport::SftpSessionPool::from_config_writable(Arc::new(factory), &config)
-            .await
-            .map_err(|source| object_store::Error::Generic {
-                store: "SFTP",
-                source: Box::new(source),
-            })?;
+    let factory: Arc<dyn crate::sftp_transport::SessionFactory> = match config.transport {
+        crate::config::SftpSshTransport::Russh => {
+            tracing::info!(
+                host = %endpoint.host,
+                port = endpoint.port,
+                window_size = crate::sftp_transport::RUSSH_WINDOW_SIZE,
+                maximum_packet_size = crate::sftp_transport::RUSSH_MAXIMUM_PACKET_SIZE,
+                max_concurrent_writes = crate::sftp_transport::RUSSH_SFTP_MAX_CONCURRENT_WRITES,
+                "opening russh SFTP object store"
+            );
+            Arc::new(
+                crate::sftp_transport::RusshSessionFactory::new(
+                    endpoint,
+                    config.identity_file.clone(),
+                    config.known_hosts.clone(),
+                )
+                .map_err(|source| object_store::Error::Generic {
+                    store: "SFTP",
+                    source: Box::new(source),
+                })?,
+            )
+        }
+        crate::config::SftpSshTransport::HpnOpenSsh => {
+            tracing::info!(
+                host = %endpoint.host,
+                port = endpoint.port,
+                "opening HPN OpenSSH SFTP object store"
+            );
+            Arc::new(
+                crate::hpn_session::HpnSessionFactory::from_config(endpoint, &config).map_err(
+                    |source| object_store::Error::Generic {
+                        store: "SFTP",
+                        source: Box::new(source),
+                    },
+                )?,
+            )
+        }
+    };
+    let pool = crate::sftp_transport::SftpSessionPool::from_config_writable(factory, &config)
+        .await
+        .map_err(|source| object_store::Error::Generic {
+            store: "SFTP",
+            source: Box::new(source),
+        })?;
     let store = crate::sftp_object_store::SftpObjectStore::new(pool.clone(), path.clone())?;
     Ok(ParsedStore {
         store: Box::new(store),
@@ -580,5 +600,22 @@ mod tests {
             .to_string();
         assert!(error.contains("password"), "got: {error}");
         assert!(!error.contains(secret), "password leaked in error: {error}");
+    }
+
+    #[tokio::test]
+    async fn sftp_parser_constructs_hpn_factory_instead_of_russh_fallback() {
+        let url = Url::parse("sftp://alice@example.com/data").unwrap();
+        let config = crate::config::SftpConfig {
+            transport: crate::config::SftpSshTransport::HpnOpenSsh,
+            ..Default::default()
+        };
+        let error = parse_url_opts(&url, std::iter::empty::<(&str, &str)>(), Some(&config))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("hpn_program") || error.contains("hpn_sha256"),
+            "HPN must fail closed on the pinned program, not fall back to russh: {error}"
+        );
     }
 }
