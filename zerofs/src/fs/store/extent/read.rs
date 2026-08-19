@@ -4,7 +4,7 @@
 //! crossing pairs).
 
 use super::select::{NOMINATE_MIN_FANOUT, NOMINATE_PER_CALL_CAP, PAIR_BUMPS_PER_CALL, PairStats};
-use super::{CachedExtentLocation, ExtentStore, ZERO_EXTENT};
+use super::{CachedExtentLocation, ExtentStore, PARALLEL_EXTENT_OPS, ZERO_EXTENT};
 #[cfg(feature = "failpoints")]
 use crate::failpoints::{self as fp, fail_point};
 use crate::fs::inode::InodeId;
@@ -13,10 +13,11 @@ use crate::segment::{FrameLoc, Segid};
 use crate::segment_store::SegmentStoreError;
 use bytes::{Bytes, BytesMut};
 use futures::stream::StreamExt;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
+use tokio::sync::Semaphore;
 use tracing::error;
 
 /// Logical (file-offset) read-ahead distance for a confirmed-sequential
@@ -432,11 +433,8 @@ impl ExtentStore {
             })
             .collect();
 
-        // Assemble, coalescing each maximal run of extents that are contiguous in
-        // one segment (consecutive frame index + adjacent byte range) into a
-        // single ranged GET. This is the read-amplification win: a region written
-        // together reads back in one GET instead of one-per-extent.
-        let mut result = BytesMut::with_capacity(length as usize);
+        // Coalesce maximal same-segment runs first. Serve decoded/open-buffer
+        // hits immediately; fetch independent on-store runs concurrently.
         let slice = |c: u64| -> (usize, usize) {
             let cs = if c == start_extent { start_offset } else { 0 };
             let ce = if c == end_extent {
@@ -446,18 +444,18 @@ impl ExtentStore {
             };
             (cs, ce)
         };
+        let mut pieces: Vec<PlannedPiece> = Vec::new();
         let mut nominate: Vec<Segid> = Vec::new();
-        // Seams this read paid. `prev_nonram` = (segid, end extent) of the
-        // previous on-store run; holes and RAM runs break adjacency.
         let mut crossings: Vec<(Segid, Segid)> = Vec::new();
         let mut prev_nonram: Option<(Segid, u64)> = None;
         let track = is_demand && self.nominations_enabled.load(Ordering::Relaxed);
         let mut extent = start_extent;
         while extent <= end_extent {
             let Some(first) = loc_map.get(&extent).copied() else {
-                // Hole: this extent contributes zeros.
                 let (cs, ce) = slice(extent);
-                result.extend_from_slice(&ZERO_EXTENT[cs..ce]);
+                pieces.push(PlannedPiece::Bytes(Bytes::copy_from_slice(
+                    &ZERO_EXTENT[cs..ce],
+                )));
                 prev_nonram = None;
                 extent += 1;
                 continue;
@@ -481,17 +479,19 @@ impl ExtentStore {
                     _ => break,
                 }
             }
-            // Serve the run from RAM (open or in-flight sealing buffer); else GET.
             let cached_frames: Option<Vec<Bytes>> = (0..n)
                 .map(|i| {
                     let idx = extent + i;
                     self.decoded_get(id, idx, loc_map[&idx])
                 })
                 .collect();
-            let frames = match cached_frames {
+            match cached_frames {
                 Some(frames) => {
                     prev_nonram = None;
-                    Some(frames)
+                    pieces.push(PlannedPiece::Ready {
+                        start_extent: extent,
+                        frames,
+                    });
                 }
                 None => match self.read_frames_in_ram(
                     first.segid,
@@ -500,21 +500,20 @@ impl ExtentStore {
                     first.frame_index,
                     &slots,
                 )? {
-                    Some(f) => {
+                    Some(frames) => {
                         prev_nonram = None;
-                        Some(f)
+                        pieces.push(PlannedPiece::Ready {
+                            start_extent: extent,
+                            frames,
+                        });
                     }
                     None => {
-                        // Non-RAM ⇒ PUT complete ⇒ directory durably readable:
-                        // safe to nominate.
                         if track {
                             if nominate.len() < NOMINATE_PER_CALL_CAP
                                 && !nominate.contains(&first.segid)
                             {
                                 nominate.push(first.segid);
                             }
-                            // A seam: adjacent file data split across objects, or
-                            // (same segid) scattered within one (a self-pair).
                             if let Some((prev_segid, prev_end)) = prev_nonram
                                 && prev_end == extent
                                 && crossings.len() < PAIR_BUMPS_PER_CALL
@@ -526,61 +525,130 @@ impl ExtentStore {
                             }
                         }
                         prev_nonram = Some((first.segid, extent + n));
-                        #[cfg(feature = "failpoints")]
-                        {
-                            fail_point!(fp::READ_AFTER_RESOLVE_BEFORE_FETCH);
-                            fp::widen(fp::READ_AFTER_RESOLVE_BEFORE_FETCH).await;
-                        }
-                        // A GET error is swallowed: a compaction repoint+delete can 404
-                        // this run's segment out from under us. Fall back to per-extent
-                        // reads via `get`, which re-resolves each FrameLoc.
-                        self.segments
-                            .read_run(
-                                first.segid,
-                                first.byte_offset,
-                                total_len as u32,
-                                first.frame_index,
-                                &slots,
-                            )
-                            .await
-                            .ok()
+                        pieces.push(PlannedPiece::OnStore(OnStoreRun {
+                            start_extent: extent,
+                            first,
+                            total_len: total_len as u32,
+                            slots,
+                        }));
                     }
                 },
-            };
+            }
+            extent += n;
+        }
+
+        let mut recorder = metrics::ReadRunRecorder::new(length, end_extent - start_extent + 1);
+        let unique: HashSet<Segid> = pieces
+            .iter()
+            .filter_map(|piece| match piece {
+                PlannedPiece::OnStore(run) => Some(run.first.segid),
+                _ => None,
+            })
+            .collect();
+        let on_store_runs = pieces
+            .iter()
+            .filter(|piece| matches!(piece, PlannedPiece::OnStore(_)))
+            .count() as u64;
+        let on_store_bytes = pieces
+            .iter()
+            .map(|piece| match piece {
+                PlannedPiece::OnStore(run) => run.total_len as u64,
+                _ => 0,
+            })
+            .sum();
+        recorder.record_plan(
+            pieces.len() as u64,
+            unique.len() as u64,
+            on_store_runs,
+            on_store_bytes,
+        );
+        let recorder = Arc::new(recorder);
+
+        #[cfg(feature = "failpoints")]
+        {
+            fail_point!(fp::READ_AFTER_RESOLVE_BEFORE_FETCH);
+            fp::widen(fp::READ_AFTER_RESOLVE_BEFORE_FETCH).await;
+        }
+
+        let pending: Vec<(usize, OnStoreRun)> = pieces
+            .iter()
+            .enumerate()
+            .filter_map(|(index, piece)| match piece {
+                PlannedPiece::OnStore(run) => Some((index, run.clone())),
+                _ => None,
+            })
+            .collect();
+        let permits = Arc::new(Semaphore::new(PARALLEL_EXTENT_OPS));
+        let fetched = futures::stream::iter(pending)
+            .map(|(index, run)| {
+                let permits = Arc::clone(&permits);
+                let recorder = Arc::clone(&recorder);
+                async move {
+                    let _permit = permits
+                        .acquire_owned()
+                        .await
+                        .expect("read-run semaphore is never closed");
+                    let _guard = recorder.enter_fetch();
+                    let frames = self.fetch_on_store_run(&run).await;
+                    (index, frames)
+                }
+            })
+            .buffer_unordered(PARALLEL_EXTENT_OPS)
+            .collect::<Vec<_>>()
+            .await;
+
+        let mut fetched_frames = HashMap::new();
+        let mut fetch_error = None;
+        for (index, frames) in fetched {
             match frames {
-                Some(frames) => {
+                Ok(frames) => {
+                    fetched_frames.insert(index, frames);
+                }
+                Err(error) if fetch_error.is_none() => fetch_error = Some(error),
+                Err(_) => {}
+            }
+        }
+        recorder.finish();
+        if let Some(error) = fetch_error {
+            return Err(error);
+        }
+
+        let mut result = BytesMut::with_capacity(length as usize);
+        for (index, piece) in pieces.into_iter().enumerate() {
+            match piece {
+                PlannedPiece::Bytes(bytes) => result.extend_from_slice(&bytes),
+                PlannedPiece::Ready {
+                    start_extent: run_start,
+                    frames,
+                } => {
                     for (i, frame) in frames.iter().enumerate() {
-                        let idx = extent + i as u64;
+                        let idx = run_start + i as u64;
                         Self::validate_extent_frame(id, idx, frame)?;
                         self.decoded_insert(id, idx, loc_map[&idx], frame.clone());
                         let (cs, ce) = slice(idx);
                         result.extend_from_slice(&frame[cs..ce]);
                     }
                 }
-                None => {
-                    for (i, (fid, fext)) in slots.iter().enumerate() {
-                        let idx = extent + i as u64;
-                        let data = match self.get(*fid, *fext).await? {
-                            Some(d) => d,
-                            None => Bytes::from_static(ZERO_EXTENT),
-                        };
+                PlannedPiece::OnStore(run) => {
+                    let frames = fetched_frames
+                        .remove(&index)
+                        .expect("every on-store run was fetched");
+                    for (i, frame) in frames.iter().enumerate() {
+                        let idx = run.start_extent + i as u64;
+                        Self::validate_extent_frame(id, idx, frame)?;
+                        self.decoded_insert(id, idx, loc_map[&idx], frame.clone());
                         let (cs, ce) = slice(idx);
-                        result.extend_from_slice(&data[cs..ce]);
+                        result.extend_from_slice(&frame[cs..ce]);
                     }
                 }
             }
-            extent += n;
         }
-        // Fan-out is the read-amplification signal; pushed as a set so one
-        // pass co-packs what was co-read.
         if nominate.len() >= NOMINATE_MIN_FANOUT {
             let mut noms = self.nominations.lock().unwrap();
             for segid in nominate {
                 noms.push(segid);
             }
         }
-        // Recorded below the nomination floor too: the pair itself is the
-        // fan-out; once per pass regardless of read rate.
         if !crossings.is_empty() {
             let round = self.gc_round.load(Ordering::Relaxed);
             let now = Instant::now();
@@ -591,471 +659,36 @@ impl ExtentStore {
         }
         Ok(result.freeze())
     }
+
+    async fn fetch_on_store_run(&self, run: &OnStoreRun) -> Result<Vec<Bytes>, FsError> {
+        match self
+            .segments
+            .read_run(
+                run.first.segid,
+                run.first.byte_offset,
+                run.total_len,
+                run.first.frame_index,
+                &run.slots,
+            )
+            .await
+        {
+            Ok(frames) => Ok(frames),
+            Err(_) => {
+                let mut frames = Vec::with_capacity(run.slots.len());
+                for (fid, fext) in &run.slots {
+                    frames.push(match self.get(*fid, *fext).await? {
+                        Some(data) => data,
+                        None => Bytes::from_static(ZERO_EXTENT),
+                    });
+                }
+                Ok(frames)
+            }
+        }
+    }
 }
+
+mod metrics;
+use metrics::{OnStoreRun, PlannedPiece};
 
 #[cfg(test)]
-mod tests {
-    use super::super::test_util::*;
-    use super::*;
-    use crate::config::CompressionConfig;
-    use slatedb::config::{PutOptions, WriteOptions};
-
-    #[tokio::test]
-    async fn contiguous_multiextent_read_is_one_ranged_get() {
-        let (writer, db, object_store) = make_with_compression(CompressionConfig::Lz4).await;
-        let mut model = Vec::new();
-        // Four extents in ONE write -> one segment, frames contiguous.
-        write_and_check(&writer, &db, &mut model, 0, &vec![1u8; 4 * EXTENT_SIZE]).await;
-        writer.seal_open().await.unwrap();
-        let store = make_store(object_store, db, CompressionConfig::Lz4, 8);
-
-        let before = store.segments.read_calls();
-        let got = store.read(1, 0, 4 * EXTENT_SIZE as u64).await.unwrap();
-        let gets = store.segments.read_calls() - before;
-
-        assert_eq!(got.len(), 4 * EXTENT_SIZE);
-        assert_eq!(got.as_ref(), model.as_slice());
-        assert_eq!(
-            gets, 1,
-            "a contiguous 4-extent read must coalesce into one ranged GET"
-        );
-    }
-
-    #[tokio::test]
-    async fn repeated_contiguous_read_reuses_decoded_extents() {
-        let (writer, db, object_store) = make_with_compression(CompressionConfig::Lz4).await;
-        for extent in 0..4u64 {
-            write_extent(&writer, &db, extent, &[extent as u8 + 1; EXTENT_SIZE]).await;
-        }
-        writer.seal_open().await.unwrap();
-        let store = make_store(object_store, db.clone(), CompressionConfig::Lz4, 8);
-
-        let before = store.segments.read_calls();
-        let scans_before = db.scan_call_count();
-        let first = store.read(1, 0, 4 * EXTENT_SIZE as u64).await.unwrap();
-        let after_first = store.segments.read_calls();
-        let scans_after_first = db.scan_call_count();
-        let second = store.read(1, 0, 4 * EXTENT_SIZE as u64).await.unwrap();
-        let after_second = store.segments.read_calls();
-        let scans_after_second = db.scan_call_count();
-
-        assert_eq!(first, second);
-        assert_eq!(after_first - before, 1, "the first read fetches the run");
-        assert_eq!(
-            after_second - after_first,
-            0,
-            "validated plaintext should be reused without another segment fetch"
-        );
-        assert_eq!(
-            scans_after_first - scans_before,
-            1,
-            "the first read resolves the logical extent map once"
-        );
-        assert_eq!(
-            scans_after_second - scans_after_first,
-            0,
-            "a repeated read must reuse committed FrameLocs without another metadata scan"
-        );
-    }
-
-    #[tokio::test]
-    async fn committed_write_is_read_ready_after_seal() {
-        let (store, db) = make().await;
-        let expected = Bytes::from(vec![0x5a; EXTENT_SIZE]);
-        write_extent(&store, &db, 0, &expected).await;
-        store.seal_open().await.unwrap();
-
-        let before = store.segments.read_calls();
-        let actual = store.read(1, 0, EXTENT_SIZE as u64).await.unwrap();
-
-        assert_eq!(actual, expected);
-        assert_eq!(
-            store.segments.read_calls() - before,
-            0,
-            "freshly written plaintext should already be in the clean extent cache"
-        );
-    }
-
-    #[tokio::test]
-    async fn committed_overwrite_and_delete_refresh_the_logical_extent_map() {
-        let (store, db) = make().await;
-        write_extent(&store, &db, 0, &[0x11; EXTENT_SIZE]).await;
-        write_extent(&store, &db, 1, &[0x22; EXTENT_SIZE]).await;
-
-        let mut overwrite = db.new_transaction().unwrap();
-        store
-            .write(
-                &mut overwrite,
-                1,
-                0,
-                &Bytes::from(vec![0x33; EXTENT_SIZE]),
-                2 * EXTENT_SIZE as u64,
-            )
-            .await
-            .unwrap();
-        commit(&store, overwrite).await;
-
-        let before_overwrite_read = db.scan_call_count();
-        let got = store.read(1, 0, 2 * EXTENT_SIZE as u64).await.unwrap();
-        assert_eq!(&got[..EXTENT_SIZE], &[0x33; EXTENT_SIZE]);
-        assert_eq!(&got[EXTENT_SIZE..], &[0x22; EXTENT_SIZE]);
-        assert_eq!(db.scan_call_count(), before_overwrite_read);
-
-        let mut delete = db.new_transaction().unwrap();
-        store.delete_range(&mut delete, 1, 1, 2).await.unwrap();
-        commit(&store, delete).await;
-
-        let before_delete_read = db.scan_call_count();
-        let got = store.read(1, 0, 2 * EXTENT_SIZE as u64).await.unwrap();
-        assert_eq!(&got[..EXTENT_SIZE], &[0x33; EXTENT_SIZE]);
-        assert_eq!(&got[EXTENT_SIZE..], ZERO_EXTENT);
-        assert_eq!(db.scan_call_count(), before_delete_read);
-    }
-
-    #[tokio::test]
-    async fn failed_commit_never_publishes_its_staged_frameloc() {
-        let (store, db) = make().await;
-        write_extent(&store, &db, 0, &[0x11; EXTENT_SIZE]).await;
-        write_extent(&store, &db, 1, &[0x22; EXTENT_SIZE]).await;
-        let old_loc = frameloc_of(&store, &db, 1, 0).await.unwrap();
-        let segcount = store
-            .key_codec
-            .segcount_key(old_loc.segid.epoch, old_loc.segid.counter);
-        db.put_with_options(
-            &segcount,
-            b"bogus",
-            &PutOptions::default(),
-            &WriteOptions::default(),
-        )
-        .await
-        .unwrap();
-
-        let mut failed = db.new_transaction().unwrap();
-        store
-            .write(
-                &mut failed,
-                1,
-                0,
-                &Bytes::from(vec![0x99; EXTENT_SIZE]),
-                2 * EXTENT_SIZE as u64,
-            )
-            .await
-            .unwrap();
-        assert!(store.commit_via_coordinator(failed).await.is_err());
-
-        let before = db.scan_call_count();
-        let got = store.read(1, 0, 2 * EXTENT_SIZE as u64).await.unwrap();
-        assert_eq!(&got[..EXTENT_SIZE], &[0x11; EXTENT_SIZE]);
-        assert_eq!(&got[EXTENT_SIZE..], &[0x22; EXTENT_SIZE]);
-        assert_eq!(db.scan_call_count(), before);
-    }
-
-    #[tokio::test]
-    async fn uncommitted_write_through_entry_cannot_shadow_current_extent() {
-        let (store, db) = make().await;
-        let committed = Bytes::from(vec![0x11; EXTENT_SIZE]);
-        write_extent(&store, &db, 0, &committed).await;
-
-        let mut aborted = db.new_transaction().unwrap();
-        store
-            .write(
-                &mut aborted,
-                1,
-                0,
-                &Bytes::from(vec![0x22; EXTENT_SIZE]),
-                EXTENT_SIZE as u64,
-            )
-            .await
-            .unwrap();
-        drop(aborted);
-
-        assert_eq!(
-            store.read(1, 0, EXTENT_SIZE as u64).await.unwrap(),
-            committed,
-            "only the FrameLoc selected by committed metadata may hit the cache"
-        );
-    }
-
-    // A stored FrameLoc whose byte range lies outside the open buffer (a torn or
-    // corrupt LSM value — any 32-byte value decodes) must surface as EIO, not an
-    // out-of-range panic that poisons the open-segment lock for every later writer.
-    #[tokio::test]
-    async fn corrupt_frameloc_into_open_segment_is_eio_not_panic() {
-        let (store, db) = make().await;
-        let mut model = Vec::new();
-        write_and_check(&store, &db, &mut model, 0, &[1u8; 100]).await;
-
-        // Fabricate a pointer at the current open segment with an impossible range.
-        let bogus = FrameLoc {
-            segid: store.open_lane(1).open.lock().unwrap().segid,
-            frame_index: 0,
-            byte_offset: 1 << 40,
-            byte_len: 4096,
-        };
-        let key = store.key_codec.extent_key(1, 5);
-        let mut txn = db.new_transaction().unwrap();
-        txn.put_bytes(&key, Bytes::copy_from_slice(&bogus.encode()));
-        commit(&store, txn).await;
-
-        assert!(matches!(store.get(1, 5).await, Err(FsError::IoError)));
-        // The open-segment lock survived (not poisoned): writes still work.
-        write_and_check(&store, &db, &mut model, 0, &[2u8; 100]).await;
-    }
-
-    // A corrupt extent value inside a multi-extent scan is the same EIO as the
-    // single-extent path — skipping it would serve that extent as fabricated
-    // zeros while a single-extent read of the same key errors.
-    #[tokio::test]
-    async fn multi_extent_read_of_a_corrupt_value_is_eio_not_zeros() {
-        let (store, db) = make().await;
-
-        // Plant a torn (undecodable) value at extent 1, then read across
-        // extents 0..=2 so the ranged-scan path (not `get`) resolves it.
-        let key = store.key_codec.extent_key(1, 1);
-        let mut txn = db.new_transaction().unwrap();
-        txn.put_bytes(&key, Bytes::from_static(&[0u8; FrameLoc::ENCODED_LEN - 1]));
-        commit(&store, txn).await;
-
-        let r = store.read_range(1, 0, 3 * EXTENT_SIZE as u64, true).await;
-        assert!(matches!(r, Err(FsError::IoError)));
-    }
-
-    // In `get`'s GC-repoint retry, a re-resolved value that fails to decode is the
-    // same corrupt-value EIO as the primary path — treating it like an absent key
-    // would fabricate a hole of zeros from a torn LSM value.
-    #[test]
-    fn reresolve_distinguishes_a_hole_from_a_corrupt_value() {
-        // Absent: a concurrent truncate/unlink made the extent a genuine hole.
-        assert!(matches!(
-            ExtentStore::decode_reresolved_extent(1, 0, None),
-            Ok(None)
-        ));
-        // Present but undecodable (torn/truncated): EIO, never a hole.
-        let torn = Bytes::from_static(&[0u8; FrameLoc::ENCODED_LEN - 1]);
-        assert!(matches!(
-            ExtentStore::decode_reresolved_extent(1, 0, Some(&torn)),
-            Err(FsError::IoError)
-        ));
-        // A decodable value passes through for the segid comparison.
-        let loc = FrameLoc {
-            segid: Segid::new(1, 2),
-            frame_index: 3,
-            byte_offset: 4,
-            byte_len: 5,
-        };
-        let enc = Bytes::copy_from_slice(&loc.encode());
-        assert_eq!(
-            ExtentStore::decode_reresolved_extent(1, 0, Some(&enc)).unwrap(),
-            Some(loc)
-        );
-    }
-
-    #[tokio::test]
-    async fn crossings_count_seams_not_reads_and_holes_break_adjacency() {
-        let (writer, db, object_store) = make_with_compression(CompressionConfig::Lz4).await;
-        // Segments A (extents 0-1), B (2-3), C (4-5), all sealed.
-        for extent in 0..6u64 {
-            write_extent(&writer, &db, extent, &[extent as u8 + 1; EXTENT_SIZE]).await;
-            if extent % 2 == 1 {
-                writer.seal_open().await.unwrap();
-            }
-        }
-        let a = frameloc_of(&writer, &db, 1, 0).await.unwrap().segid;
-        let b = frameloc_of(&writer, &db, 1, 2).await.unwrap().segid;
-        let c = frameloc_of(&writer, &db, 1, 4).await.unwrap().segid;
-        let store = make_store(object_store, db, CompressionConfig::Lz4, 8);
-        store.enable_nominations();
-
-        // One pass over A|B|C pays each seam once; re-reading in the same GC
-        // round adds nothing (burst reads are not episodes).
-        store.read(1, 0, 6 * EXTENT_SIZE as u64).await.unwrap();
-        store.read(1, 0, 6 * EXTENT_SIZE as u64).await.unwrap();
-        {
-            let stats = store.pair_stats.lock().unwrap();
-            assert_eq!(stats.map.len(), 2);
-            assert_eq!(stats.map[&PairStats::key(a, b)].count, 1);
-            assert_eq!(stats.map[&PairStats::key(b, c)].count, 1);
-        }
-
-        // A hole between two segments is not a seam: the data isn't adjacent.
-        let (writer2, db2, object_store2) = make_with_compression(CompressionConfig::Lz4).await;
-        for extent in 0..2u64 {
-            write_extent(&writer2, &db2, extent, &[1u8; EXTENT_SIZE]).await;
-        }
-        writer2.seal_open().await.unwrap();
-        for extent in 3..5u64 {
-            // Writing extent 3 with the file at 2 extents leaves extent 2 a hole.
-            let mut txn = db2.new_transaction().unwrap();
-            let tu = writer2
-                .write(
-                    &mut txn,
-                    1,
-                    extent * EXTENT_SIZE as u64,
-                    &Bytes::from(vec![2u8; EXTENT_SIZE]),
-                    2 * EXTENT_SIZE as u64,
-                )
-                .await
-                .unwrap();
-            commit(&writer2, txn).await;
-            writer2.apply_tail_update(1, tu);
-        }
-        writer2.seal_open().await.unwrap();
-        let store2 = make_store(object_store2, db2, CompressionConfig::Lz4, 8);
-        store2.enable_nominations();
-        store2.read(1, 0, 5 * EXTENT_SIZE as u64).await.unwrap();
-        assert!(store2.pair_stats.lock().unwrap().map.is_empty());
-    }
-
-    #[tokio::test]
-    async fn reads_nominate_only_enabled_fanned_out_and_on_store_segments() {
-        let (writer, db, object_store) = make_with_compression(CompressionConfig::Lz4).await;
-        // Segment A holds extents 0-1, segment B extents 2-3.
-        for extent in 0..4u64 {
-            write_extent(&writer, &db, extent, &[extent as u8 + 1; EXTENT_SIZE]).await;
-            if extent % 2 == 1 {
-                writer.seal_open().await.unwrap();
-            }
-        }
-        let seg_a = frameloc_of(&writer, &db, 1, 0).await.unwrap().segid;
-        let seg_b = frameloc_of(&writer, &db, 1, 2).await.unwrap().segid;
-
-        // Disabled (replica / pre-GC shape): a fanned-out read tracks nothing.
-        let disabled = make_store(object_store.clone(), db.clone(), CompressionConfig::Lz4, 8);
-        disabled.read(1, 0, 4 * EXTENT_SIZE as u64).await.unwrap();
-        assert!(disabled.nominations.lock().unwrap().set.is_empty());
-
-        // A read served by one segment is below the fan-out floor.
-        let below_floor = make_store(object_store.clone(), db.clone(), CompressionConfig::Lz4, 9);
-        below_floor.enable_nominations();
-        below_floor
-            .read(1, 0, 2 * EXTENT_SIZE as u64)
-            .await
-            .unwrap();
-        assert!(below_floor.nominations.lock().unwrap().set.is_empty());
-
-        // A read fanning out across both nominates both; re-reading dedups.
-        let store = make_store(object_store.clone(), db.clone(), CompressionConfig::Lz4, 10);
-        store.enable_nominations();
-        store.read(1, 0, 4 * EXTENT_SIZE as u64).await.unwrap();
-        store.read(1, 0, 4 * EXTENT_SIZE as u64).await.unwrap();
-        {
-            let noms = store.nominations.lock().unwrap();
-            assert_eq!(noms.set.len(), 2);
-            assert!(noms.set.contains(&seg_a) && noms.set.contains(&seg_b));
-        }
-
-        // RAM-served runs never count: extents 4-5 live in the open buffer, so
-        // a read across B + open is one on-store segment — below the fan-out
-        // floor (RAM runs cost no GETs, so the read isn't suffering).
-        let ram_store = make_store(object_store.clone(), db.clone(), CompressionConfig::Lz4, 11);
-        ram_store.enable_nominations();
-        for extent in 4..6u64 {
-            write_extent(&ram_store, &db, extent, &[extent as u8 + 1; EXTENT_SIZE]).await;
-        }
-        ram_store
-            .read(1, 2 * EXTENT_SIZE as u64, 4 * EXTENT_SIZE as u64)
-            .await
-            .unwrap();
-        assert!(ram_store.nominations.lock().unwrap().set.is_empty());
-
-        // A read across A + B + open clears the floor on the two on-store
-        // segments and still never nominates the open segid.
-        let fanout_store = make_store(object_store, db.clone(), CompressionConfig::Lz4, 12);
-        fanout_store.enable_nominations();
-        for extent in 4..6u64 {
-            write_extent(&fanout_store, &db, extent, &[extent as u8 + 1; EXTENT_SIZE]).await;
-        }
-        fanout_store
-            .read(1, 0, 6 * EXTENT_SIZE as u64)
-            .await
-            .unwrap();
-        {
-            let open_segid = fanout_store.open_lane(1).open.lock().unwrap().segid;
-            let noms = fanout_store.nominations.lock().unwrap();
-            assert_eq!(noms.set.len(), 2);
-            assert!(noms.set.contains(&seg_a) && noms.set.contains(&seg_b));
-            assert!(!noms.set.contains(&open_segid));
-        }
-    }
-
-    #[tokio::test]
-    async fn per_call_cap_bounds_nominations() {
-        let (writer, db, object_store) = make_with_compression(CompressionConfig::Lz4).await;
-        // More single-extent segments than the per-call cap.
-        let n = NOMINATE_PER_CALL_CAP as u64 + 2;
-        for extent in 0..n {
-            write_extent(&writer, &db, extent, &[1u8; EXTENT_SIZE]).await;
-            writer.seal_open().await.unwrap();
-        }
-        let store = make_store(object_store, db, CompressionConfig::Lz4, 8);
-        store.enable_nominations();
-        store.read(1, 0, n * EXTENT_SIZE as u64).await.unwrap();
-        assert_eq!(
-            store.nominations.lock().unwrap().set.len(),
-            NOMINATE_PER_CALL_CAP
-        );
-    }
-
-    #[test]
-    fn read_ahead_planner() {
-        let w = READ_AHEAD_WINDOW_BYTES;
-        // First read of a stream: unconfirmed, no prefetch.
-        let (s, p) = plan_read_ahead((0, 0, 0), 0, 1000);
-        assert_eq!(s, (1000, 1000, 1));
-        assert_eq!(p, None);
-        // Second sequential read: confirmed -> prefetch a window ahead.
-        let (s, p) = plan_read_ahead(s, 1000, 1000);
-        assert_eq!(s, (2000, 2000 + w, 2));
-        assert_eq!(p, Some((2000, 2000 + w)));
-        // Still deep in the buffered-ahead: no new prefetch.
-        let (s, p) = plan_read_ahead(s, 2000, 1000);
-        assert_eq!(s, (3000, 2000 + w, 3));
-        assert_eq!(p, None);
-        // A non-contiguous jump resets to unconfirmed.
-        let (s, p) = plan_read_ahead(s, 5_000_000, 1000);
-        assert_eq!(s, (5_001_000, 5_001_000, 1));
-        assert_eq!(p, None);
-        // Less than half a window buffered ahead -> refill.
-        let low = (2000 + w / 2 + 1, 2000 + w, 9);
-        let (_, p) = plan_read_ahead(low, 2000 + w / 2 + 1, 100);
-        assert!(
-            p.is_some(),
-            "refills when under half a window remains ahead"
-        );
-    }
-
-    #[tokio::test]
-    async fn read_ahead_spawns_only_on_confirmed_sequential() {
-        let (store, _db) = make().await;
-        // First read of a stream: nothing spawned (could be a one-off).
-        assert!(store.trigger_read_ahead(1, 0, 1000).is_none());
-        // Second sequential read: a read-ahead task is spawned.
-        let h = store.trigger_read_ahead(1, 1000, 1000);
-        assert!(h.is_some(), "confirmed sequential -> read-ahead");
-        h.unwrap().await.unwrap();
-        // A non-contiguous jump: nothing spawned.
-        assert!(store.trigger_read_ahead(1, 9_000_000, 1000).is_none());
-    }
-
-    #[tokio::test]
-    async fn read_ahead_skip_at_cap_keeps_coverage_honest() {
-        let (store, _db) = make().await;
-        // Hold every permit so the planned prefetch is skipped at the cap.
-        let held: Vec<_> = (0..READ_AHEAD_MAX_CONCURRENT)
-            .map(|_| Arc::clone(&store.prefetch_sem).try_acquire_owned().unwrap())
-            .collect();
-        assert!(store.trigger_read_ahead(1, 0, 1000).is_none());
-        assert!(
-            store.trigger_read_ahead(1, 1000, 1000).is_none(),
-            "at the cap -> skip"
-        );
-        // The skip must not count the window as covered: `prefetched_to`
-        // stays at the read end, so the next read re-plans.
-        let (_, prefetched_to, _) = store.read_ahead.get(&1).map(|e| *e).unwrap();
-        assert_eq!(prefetched_to, 2000, "skipped window recorded as covered");
-        drop(held);
-        let h = store.trigger_read_ahead(1, 2000, 1000);
-        assert!(h.is_some(), "freed permit -> the next read re-triggers");
-        h.unwrap().await.unwrap();
-    }
-}
+mod tests;
