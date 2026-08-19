@@ -21,7 +21,7 @@
 - The 2026-08-19 CT198 OOM/systemd restart is evidence only. No setup, run, cleanup, merge, source-sync, or corrective task deploys or restarts CT198.
 - VM100 remains NFS-only for the shared Mac/Linux namespace. Every NBD/XFS/ZFS leg uses a disposable UUID-owned Ubuntu device and is removed by ledger cleanup; no NBD client or mount is installed on VM100 by this rollout.
 - `ubuntu-main` is VM100 and may run isolated user-space/NFS/9P/cgroup tests without touching `/mnt/zerofs-files`; it never runs an NBD scenario. NBD/XFS/ZFS requires an explicit `ZEROFS_NBD_PROOF_HOST` that is neither `ubuntu-main`, VM100, nor CT198. An absent or forbidden host skips nothing and fails the NBD gate closed.
-- An alias denylist is insufficient proof-host identity. Before any NBD worktree or device command, `verify-proof-host` separately validates a controller-reachable SSH target and pins the machine's immutable SSH host-key SHA-256, exact `/etc/machine-id`, and provisioned `/etc/zerofs-proxmox-vmid`; it compares them with live VM100 and CT198 machine IDs and requires the expected VMID to be neither 100 nor 198. Every NBD ledger retains both the immutable machine-identity receipt and the separately validated controller SSH target; neither may substitute for the other.
+- An alias denylist is insufficient proof-host identity. Before any NBD worktree or device command, `verify-proof-host` separately validates a controller-reachable SSH target and pins the machine's immutable SSH host-key SHA-256, exact `/etc/machine-id`, and provisioned `/etc/zerofs-proxmox-vmid`; it compares them with controller-owned, independently verified VM100 and CT198 identity receipts and requires the expected VMID to be neither 100 nor 198. The receipt paths and pinned SHA-256 digests arrive as `ZEROFS_VM100_IDENTITY_RECEIPT`, `ZEROFS_VM100_IDENTITY_RECEIPT_SHA256`, `ZEROFS_CT198_IDENTITY_RECEIPT`, and `ZEROFS_CT198_IDENTITY_RECEIPT_SHA256`. This rollout never connects to CT198 to refresh or validate those receipts. Every NBD ledger retains both the immutable machine-identity receipt and the separately validated controller SSH target; neither may substitute for the other.
 - Every process, port, mount, device, cgroup/scope, changed sysfs value, SSH executable/source/build/install root, filesystem/pool name, object prefix/temp object, cache/state directory, scratch directory, and tool checkout is unique and recorded in one UUID resource ledger.
 - The immutable ledger and cleanup receipts live in `CONTROL_ROOT=/var/tmp/zerofs-tiered-control-$RUN_UUID`; disposable processes, mounts, devices, data, scratch, and tool checkouts live in the separate `RESOURCE_ROOT=/var/tmp/zerofs-tiered-resources-$RUN_UUID`. Cleanup never deletes its own authority.
 - Cleanup is idempotent after success, failure, partial setup, cancellation, supervisor cancellation, and crash.
@@ -44,9 +44,18 @@ git push origin "$SLICE_SHA:refs/heads/codex/unified-tiered-writeback"
 test "$(git ls-remote origin refs/heads/codex/unified-tiered-writeback | awk '{print $1}')" = "$SLICE_SHA"
 CONTROLLER_TARGET_RECEIPT="$(python3 scripts/tiered-writeback-e2e.py verify-controller-target --controller-ssh-target ubuntu-main --expected-host-key-sha256 "${ZEROFS_VM100_HOST_KEY_SHA256:?}" --format target-token)"
 case "$CONTROLLER_TARGET_RECEIPT" in ''|*[!A-Za-z0-9_-]*) exit 1 ;; esac
-ssh ubuntu-main "cd /fast/projects/ZeroFS && git fetch origin codex/unified-tiered-writeback && test \"\$(git rev-parse origin/codex/unified-tiered-writeback)\" = '$SLICE_SHA'"
-ssh ubuntu-main "test -d /fast/projects/ZeroFS-unified-tiered-writeback || (cd /fast/projects/ZeroFS && git worktree add --detach /fast/projects/ZeroFS-unified-tiered-writeback '$SLICE_SHA')"
-ssh ubuntu-main "cd /fast/projects/ZeroFS-unified-tiered-writeback && test -z \"\$(git status --porcelain=v1)\" && python3 scripts/tiered-writeback-e2e.py assert-source-idle --source-root /fast/projects/ZeroFS-unified-tiered-writeback && git switch --detach '$SLICE_SHA' && test \"\$(git rev-parse HEAD)\" = '$SLICE_SHA' && test -z \"\$(git status --porcelain=v1)\""
+ssh ubuntu-main "SLICE_SHA='$SLICE_SHA' CONTROLLER_TARGET_RECEIPT='$CONTROLLER_TARGET_RECEIPT' bash -seuo pipefail" <<'REMOTE'
+cd /fast/projects/ZeroFS
+git fetch origin codex/unified-tiered-writeback
+test "$(git rev-parse origin/codex/unified-tiered-writeback)" = "$SLICE_SHA"
+test -d /fast/projects/ZeroFS-unified-tiered-writeback || git worktree add --detach /fast/projects/ZeroFS-unified-tiered-writeback "$SLICE_SHA"
+cd /fast/projects/ZeroFS-unified-tiered-writeback
+test -z "$(git status --porcelain=v1)"
+python3 scripts/tiered-writeback-e2e.py assert-source-idle --source-root /fast/projects/ZeroFS-unified-tiered-writeback
+git switch --detach "$SLICE_SHA"
+test "$(git rev-parse HEAD)" = "$SLICE_SHA"
+test -z "$(git status --porcelain=v1)"
+REMOTE
 ```
 
 The controller passes `CONTROLLER_TARGET_RECEIPT` into every later `ubuntu-main`
@@ -138,7 +147,7 @@ git commit -m "test: model volatile mutation crash durability"
 - Create: `scripts/tests/test_tiered_writeback_e2e.py`
 
 **Interfaces:**
-- Produces: `setup`, `list-scenarios`, `verify-controller-target`, `verify-proof-host`, `run`, `supervise`, `cleanup --ledger`, `assert-clean --ledger`, `ledger-value`, `validate-owned-path`, `archive-control`, `list-ledgers --campaign`, and `assert-source-idle` commands plus JSON receipts.
+- Produces: `setup`, `list-scenarios`, `verify-controller-target`, `validate-recorded-host-identity`, `verify-proof-host`, `run`, `supervise`, `cleanup --ledger`, `assert-clean --ledger`, `ledger-value`, `validate-owned-path`, `archive-control`, `list-ledgers --campaign`, and `assert-source-idle` commands plus JSON receipts.
 - Consumes: exact ZeroFS binary/config SHA, Ubuntu sudo, unused UUID-owned resources, disposable backend namespace, and real client binaries.
 
 - [ ] **Step 1: Write dependency-free safety RED tests**
@@ -169,7 +178,10 @@ The lifecycle/API suite names
 `test_validate_archived_receipt_requires_campaign_manifest`,
 `test_list_ledgers_requires_one_archived_decision_authority`, and
 `test_list_ledgers_rejects_host_derived_or_unvalidated_controller_target`,
-`test_controller_target_must_resolve_to_immutable_identity`. Each supervisor test
+`test_controller_target_must_resolve_to_immutable_identity`,
+`test_recorded_host_identity_requires_pinned_digest_role_and_vmid`,
+`test_recorded_host_identity_rejects_live_ct198_refresh`, and
+`test_every_ubuntu_remote_block_receives_validated_target_token`. Each supervisor test
 injects the failure, asserts the returned status and separate ledger fields, then
 asserts both cleanup attempts and `assert-clean` ran.
 
@@ -251,6 +263,24 @@ target receipt without a VMID identity claim. Every `supervise` invocation requi
 stores the normalized target separately from local hostname, and adds the receipt hash
 to the manifest before allocating resources. The NBD proof-host target receipt remains
 additionally bound to its immutable identity token as specified above.
+
+`validate-recorded-host-identity --receipt PATH --expected-sha256 HEX
+--expected-role vm100|ct198 --expected-proxmox-vmid 100|198 --format machine-id`
+accepts only a regular controller-local file whose exact bytes match the lowercase
+64-hex digest. It validates canonical JSON schema
+`{role,host_key_algorithm,host_key_sha256,machine_id,proxmox_vmid,observed_at,
+independent_evidence_sha256}`, rejects symlinks, duplicate/unknown fields, role/VMID
+mismatch, invalid machine IDs, and any command/source field that names a live shell or
+container refresh. The receipt is prior evidence only: this rollout neither creates nor
+refreshes it. The command emits only the validated machine ID. The harness source and
+tests contain no live CT198 access path.
+
+Every controller-to-`ubuntu-main` recipe creates a fresh `target-token` with
+`verify-controller-target`, rejects characters outside `[A-Za-z0-9_-]`, and passes it
+as the literal `CONTROLLER_TARGET_RECEIPT` environment value on the same quoted SSH
+command that starts a single-quoted heredoc. Remote recipes never inherit, infer, or
+reconstruct the token, and tests parse every documented Ubuntu command block to prove
+the explicit transport is present before any `setup`, `run`, or `supervise` call.
 
 `scenarios.py` owns one immutable `SCENARIOS: dict[str, ScenarioHandler]`. The CLI
 `list-scenarios` prints sorted names and `run` rejects an unknown name or a registry
@@ -345,8 +375,8 @@ SLICE_SHA="$(git rev-parse HEAD^{commit})"
 test "${#SLICE_SHA}" = 40
 test -n "${ZEROFS_NBD_PROOF_HOST:-}"
 case "$ZEROFS_NBD_PROOF_HOST" in ubuntu-main|vm100|100.125.144.4|ct198|10.10.10.55|100.108.226.83) exit 1 ;; esac
-VM100_MACHINE_ID="$(ssh ubuntu-main 'cat /etc/machine-id')"
-CT198_MACHINE_ID="$(ssh root@100.108.226.83 'pct exec 198 -- cat /etc/machine-id')"
+VM100_MACHINE_ID="$(python3 scripts/tiered-writeback-e2e.py validate-recorded-host-identity --receipt "${ZEROFS_VM100_IDENTITY_RECEIPT:?}" --expected-sha256 "${ZEROFS_VM100_IDENTITY_RECEIPT_SHA256:?}" --expected-role vm100 --expected-proxmox-vmid 100 --format machine-id)"
+CT198_MACHINE_ID="$(python3 scripts/tiered-writeback-e2e.py validate-recorded-host-identity --receipt "${ZEROFS_CT198_IDENTITY_RECEIPT:?}" --expected-sha256 "${ZEROFS_CT198_IDENTITY_RECEIPT_SHA256:?}" --expected-role ct198 --expected-proxmox-vmid 198 --format machine-id)"
 NBD_PROOF_IDENTITY_TOKEN="$(python3 scripts/tiered-writeback-e2e.py verify-proof-host --controller-ssh-target "$ZEROFS_NBD_PROOF_HOST" --expected-host-key-sha256 "$ZEROFS_NBD_PROOF_HOST_KEY_SHA256" --expected-machine-id "$ZEROFS_NBD_PROOF_MACHINE_ID" --expected-proxmox-vmid "$ZEROFS_NBD_PROOF_VMID" --forbid-machine-id "$VM100_MACHINE_ID" --forbid-machine-id "$CT198_MACHINE_ID" --forbid-proxmox-vmid 100 --forbid-proxmox-vmid 198 --format identity-token)"
 NBD_PROOF_TARGET_TOKEN="$(python3 scripts/tiered-writeback-e2e.py verify-proof-host --controller-ssh-target "$ZEROFS_NBD_PROOF_HOST" --expected-host-key-sha256 "$ZEROFS_NBD_PROOF_HOST_KEY_SHA256" --expected-machine-id "$ZEROFS_NBD_PROOF_MACHINE_ID" --expected-proxmox-vmid "$ZEROFS_NBD_PROOF_VMID" --forbid-machine-id "$VM100_MACHINE_ID" --forbid-machine-id "$CT198_MACHINE_ID" --forbid-proxmox-vmid 100 --forbid-proxmox-vmid 198 --format target-token)"
 case "$NBD_PROOF_IDENTITY_TOKEN" in ''|*[!A-Za-z0-9_-]*) exit 1 ;; esac
@@ -447,12 +477,17 @@ suite resources outside `supervise`. It pins xfstests
 
 - [ ] **Step 2: Run every NFS/9P workflow through the tested supervisor**
 
-On `ubuntu-main`, which remains NFS/9P-only, run:
+From the controller, run the NFS/9P-only body on `ubuntu-main` with the validated
+target token transported on the same SSH invocation:
 
 ```bash
 set -euo pipefail
+cd /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback
+SLICE_SHA="$(git rev-parse HEAD^{commit})"
+CONTROLLER_TARGET_RECEIPT="$(python3 scripts/tiered-writeback-e2e.py verify-controller-target --controller-ssh-target ubuntu-main --expected-host-key-sha256 "${ZEROFS_VM100_HOST_KEY_SHA256:?}" --format target-token)"
+case "$CONTROLLER_TARGET_RECEIPT" in ''|*[!A-Za-z0-9_-]*) exit 1 ;; esac
+ssh ubuntu-main "SLICE_SHA='$SLICE_SHA' CONTROLLER_TARGET_RECEIPT='$CONTROLLER_TARGET_RECEIPT' bash -seuo pipefail" <<'REMOTE'
 cd /fast/projects/ZeroFS-unified-tiered-writeback
-SLICE_SHA="$(git rev-parse origin/codex/unified-tiered-writeback^{commit})"
 test "$(git rev-parse HEAD)" = "$SLICE_SHA"
 run_c4() {
   scenario="$1"
@@ -469,6 +504,7 @@ run_c4 pjdfstest-ninep
 run_c4 stress-ng-nfs-ninep
 run_c4 kernel-compile-nfs
 run_c4 kernel-compile-ninep
+REMOTE
 ```
 
 Each registered handler records its nonzero test inventory before execution. The NFS
@@ -599,8 +635,18 @@ test -z "$(git status --porcelain=v1)"
 cd /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback
 git push origin "$CRASH_SHA:refs/heads/codex/unified-tiered-writeback"
 test "$(git ls-remote origin refs/heads/codex/unified-tiered-writeback | awk '{print $1}')" = "$CRASH_SHA"
-ssh ubuntu-main "cd /fast/projects/ZeroFS && git fetch origin codex/unified-tiered-writeback && test \"\$(git rev-parse origin/codex/unified-tiered-writeback)\" = '$CRASH_SHA'"
-ssh ubuntu-main "cd /fast/projects/ZeroFS-unified-tiered-writeback && test -z \"\$(git status --porcelain=v1)\" && python3 scripts/tiered-writeback-e2e.py assert-source-idle --source-root /fast/projects/ZeroFS-unified-tiered-writeback && git switch --detach '$CRASH_SHA' && test \"\$(git rev-parse HEAD)\" = '$CRASH_SHA'"
+CONTROLLER_TARGET_RECEIPT="$(python3 scripts/tiered-writeback-e2e.py verify-controller-target --controller-ssh-target ubuntu-main --expected-host-key-sha256 "${ZEROFS_VM100_HOST_KEY_SHA256:?}" --format target-token)"
+case "$CONTROLLER_TARGET_RECEIPT" in ''|*[!A-Za-z0-9_-]*) exit 1 ;; esac
+ssh ubuntu-main "CRASH_SHA='$CRASH_SHA' CONTROLLER_TARGET_RECEIPT='$CONTROLLER_TARGET_RECEIPT' bash -seuo pipefail" <<'REMOTE'
+cd /fast/projects/ZeroFS
+git fetch origin codex/unified-tiered-writeback
+test "$(git rev-parse origin/codex/unified-tiered-writeback)" = "$CRASH_SHA"
+cd /fast/projects/ZeroFS-unified-tiered-writeback
+test -z "$(git status --porcelain=v1)"
+python3 scripts/tiered-writeback-e2e.py assert-source-idle --source-root /fast/projects/ZeroFS-unified-tiered-writeback
+git switch --detach "$CRASH_SHA"
+test "$(git rev-parse HEAD)" = "$CRASH_SHA"
+REMOTE
 ```
 
 - [ ] **Step 7: Run real Ubuntu proof only from `CRASH_SHA`**
@@ -609,8 +655,12 @@ Each invocation below creates its own external control root and disposable resou
 
 ```bash
 set -euo pipefail
+cd /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback
+CRASH_SHA="$(git rev-parse HEAD^{commit})"
+CONTROLLER_TARGET_RECEIPT="$(python3 scripts/tiered-writeback-e2e.py verify-controller-target --controller-ssh-target ubuntu-main --expected-host-key-sha256 "${ZEROFS_VM100_HOST_KEY_SHA256:?}" --format target-token)"
+case "$CONTROLLER_TARGET_RECEIPT" in ''|*[!A-Za-z0-9_-]*) exit 1 ;; esac
+ssh ubuntu-main "CRASH_SHA='$CRASH_SHA' CONTROLLER_TARGET_RECEIPT='$CONTROLLER_TARGET_RECEIPT' bash -seuo pipefail" <<'REMOTE'
 cd /fast/projects/ZeroFS-unified-tiered-writeback
-CRASH_SHA="$(git rev-parse origin/codex/unified-tiered-writeback^{commit})"
 test "$(git rev-parse HEAD)" = "$CRASH_SHA"
 run_crash_scenario() {
   object_mode="$1"; scenario="$2"
@@ -629,6 +679,7 @@ cargo test -p zerofs --test failover_e2e --locked -- --list --ignored | tee "$CO
 test "$(grep -Ec ': test$' "$CONTROL_ROOT/failover-tests.list")" -gt 0
 cargo test -p zerofs --test failover_e2e --locked -- --ignored --nocapture 2>&1 | tee "$CONTROL_ROOT/failover-tests.run"
 grep -Eq 'test result: ok\. [1-9][0-9]* passed' "$CONTROL_ROOT/failover-tests.run"
+REMOTE
 ```
 
 Any Linux-discovered defect starts a new RED/GREEN corrective commit. It must be reviewed, pushed, and synchronized to its new literal 40-hex SHA by Step 6 before any Linux proof command is rerun; no dirty Ubuntu checkout is patched in place.
@@ -689,13 +740,19 @@ Run it only through `supervise`:
 
 ```bash
 set -euo pipefail
+cd /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback
+SLICE_SHA="$(git rev-parse HEAD^{commit})"
+CONTROLLER_TARGET_RECEIPT="$(python3 scripts/tiered-writeback-e2e.py verify-controller-target --controller-ssh-target ubuntu-main --expected-host-key-sha256 "${ZEROFS_VM100_HOST_KEY_SHA256:?}" --format target-token)"
+case "$CONTROLLER_TARGET_RECEIPT" in ''|*[!A-Za-z0-9_-]*) exit 1 ;; esac
+ssh ubuntu-main "SLICE_SHA='$SLICE_SHA' CONTROLLER_TARGET_RECEIPT='$CONTROLLER_TARGET_RECEIPT' bash -seuo pipefail" <<'REMOTE'
 cd /fast/projects/ZeroFS-unified-tiered-writeback
-SLICE_SHA="$(git rev-parse origin/codex/unified-tiered-writeback^{commit})"
+test "$(git rev-parse HEAD)" = "$SLICE_SHA"
 run_uuid="$(python3 -c 'import uuid; print(uuid.uuid4())')"
 control_root="/var/tmp/zerofs-tiered-control-${run_uuid}"
 resource_root="/var/tmp/zerofs-tiered-resources-${run_uuid}"
 ledger="${control_root}/ledger.json"
 sudo python3 scripts/tiered-writeback-e2e.py supervise --ledger "$ledger" --control-root "$control_root" --resource-root "$resource_root" --source-sha "$SLICE_SHA" --controller-ssh-target-receipt "${CONTROLLER_TARGET_RECEIPT:?}" --filesystem-ack-mode volatile_memory --object-ack-mode ssd --scenario rust-tier-microbenchmarks
+REMOTE
 ```
 
 The supervisor owns cancellation and cleanup if listing, scratch validation, any Rust
@@ -707,8 +764,13 @@ Each benchmark command uses a separate ledger whose `setup` command has the same
 
 ```bash
 set -euo pipefail
+cd /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback
+SLICE_SHA="$(git rev-parse HEAD^{commit})"
+CONTROLLER_TARGET_RECEIPT="$(python3 scripts/tiered-writeback-e2e.py verify-controller-target --controller-ssh-target ubuntu-main --expected-host-key-sha256 "${ZEROFS_VM100_HOST_KEY_SHA256:?}" --format target-token)"
+case "$CONTROLLER_TARGET_RECEIPT" in ''|*[!A-Za-z0-9_-]*) exit 1 ;; esac
+ssh ubuntu-main "SLICE_SHA='$SLICE_SHA' CONTROLLER_TARGET_RECEIPT='$CONTROLLER_TARGET_RECEIPT' bash -seuo pipefail" <<'REMOTE'
 cd /fast/projects/ZeroFS-unified-tiered-writeback
-SLICE_SHA="$(git rev-parse origin/codex/unified-tiered-writeback^{commit})"
+test "$(git rev-parse HEAD)" = "$SLICE_SHA"
 run_benchmark_scenario() {
   object_mode="$1"; scenario="$2"
   RUN_UUID="$(python3 -c 'import uuid; print(uuid.uuid4())')"
@@ -723,6 +785,7 @@ run_benchmark_scenario remote benchmark-paced-remote
 run_benchmark_scenario ssd benchmark-4gib-foreground-isolation
 run_benchmark_scenario ssd benchmark-100gib-ram-to-ssd-transition
 run_benchmark_scenario ssd benchmark-ssd-pressure-to-remote-pacing
+REMOTE
 ```
 
 The production-shaped scenarios configure 16 GB shared dirty-write RAM, 64 GB clean read cache, a 1 TB local SSD tier split into the configured clean-cache and durable journal/staging budgets, and a 5 TB-class export without counting sparse virtual geometry as remote physical use. The 4 GiB leg must remain on RAM/local SSD and reject any unexplained collapse to remote rate. The 100 GiB leg records the RAM-to-SSD transition and concurrent remote drain. The pressure leg preconditions only its disposable SSD ledger resources near the configured dirty limit, then proves each ordered remote cleanup admits incremental foreground work without a 95-to-85-percent pause.
@@ -1099,6 +1162,13 @@ receipt proves ZeroFS parity with its same-session raw control before stock is r
 
 ```bash
 set -euo pipefail
+cd /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback
+SLICE_SHA="$(git rev-parse HEAD^{commit})"
+CONTROLLER_TARGET_RECEIPT="$(python3 scripts/tiered-writeback-e2e.py verify-controller-target --controller-ssh-target ubuntu-main --expected-host-key-sha256 "${ZEROFS_VM100_HOST_KEY_SHA256:?}" --format target-token)"
+case "$CONTROLLER_TARGET_RECEIPT" in ''|*[!A-Za-z0-9_-]*) exit 1 ;; esac
+ssh ubuntu-main "SLICE_SHA='$SLICE_SHA' CONTROLLER_TARGET_RECEIPT='$CONTROLLER_TARGET_RECEIPT' bash -seuo pipefail" <<'REMOTE'
+cd /fast/projects/ZeroFS-unified-tiered-writeback
+test "$(git rev-parse HEAD)" = "$SLICE_SHA"
 run_uuid="$(python3 -c 'import uuid; print(uuid.uuid4())')"
 control_root="/var/tmp/zerofs-tiered-control-${run_uuid}"
 resource_root="/var/tmp/zerofs-tiered-resources-${run_uuid}"
@@ -1107,6 +1177,7 @@ sudo python3 scripts/tiered-writeback-e2e.py supervise --ledger "$decision_ledge
 decision_receipt="$(python3 scripts/tiered-writeback-e2e.py ledger-value --ledger "$decision_ledger" --key decision_receipt)"
 python3 scripts/tiered-writeback-e2e.py validate-owned-path --ledger "$decision_ledger" --path "$decision_receipt" --kind receipt
 test "$(python3 scripts/tiered-writeback-e2e.py ledger-value --ledger "$decision_ledger" --receipt "$decision_receipt" --key source_sha)" = "$SLICE_SHA"
+REMOTE
 ```
 
 A missing/inconclusive decision reruns the A/B; it cannot select stock by default.
@@ -1181,11 +1252,19 @@ C7, and records the package digest. The caller uses only `supervise`:
 
 ```bash
 set -euo pipefail
+cd /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback
+SLICE_SHA="$(git rev-parse HEAD^{commit})"
+CONTROLLER_TARGET_RECEIPT="$(python3 scripts/tiered-writeback-e2e.py verify-controller-target --controller-ssh-target ubuntu-main --expected-host-key-sha256 "${ZEROFS_VM100_HOST_KEY_SHA256:?}" --format target-token)"
+case "$CONTROLLER_TARGET_RECEIPT" in ''|*[!A-Za-z0-9_-]*) exit 1 ;; esac
+ssh ubuntu-main "SLICE_SHA='$SLICE_SHA' CONTROLLER_TARGET_RECEIPT='$CONTROLLER_TARGET_RECEIPT' bash -seuo pipefail" <<'REMOTE'
+cd /fast/projects/ZeroFS-unified-tiered-writeback
+test "$(git rev-parse HEAD)" = "$SLICE_SHA"
 run_uuid="$(python3 -c 'import uuid; print(uuid.uuid4())')"
 control_root="/var/tmp/zerofs-tiered-control-${run_uuid}"
 resource_root="/var/tmp/zerofs-tiered-resources-${run_uuid}"
 ledger="${control_root}/ledger.json"
 sudo python3 scripts/tiered-writeback-e2e.py supervise --ledger "$ledger" --control-root "$control_root" --resource-root "$resource_root" --source-sha "$SLICE_SHA" --controller-ssh-target-receipt "${CONTROLLER_TARGET_RECEIPT:?}" --filesystem-ack-mode materialized --object-ack-mode remote --scenario hpn-package-winner
+REMOTE
 ```
 
 Stage only files selected by the typed decision receipt and commit `perf(sftp): land
@@ -1257,11 +1336,18 @@ cargo run --locked -- run --list
 
 - [ ] **Step 2: Run Linux-only gates on the exact pushed SHA**
 
-After Step 1 and all review fixes are committed, run the required promotion block and record `FINAL_PROOF_SHA=$SLICE_SHA`. Then execute on Ubuntu:
+After Step 1 and all review fixes are committed, run the required promotion block and
+record `FINAL_PROOF_SHA=$SLICE_SHA`. From the controller, transport a newly validated
+target token into the Ubuntu gate:
 
 ```bash
+set -euo pipefail
+cd /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback
+FINAL_PROOF_SHA="$(git rev-parse HEAD^{commit})"
+CONTROLLER_TARGET_RECEIPT="$(python3 scripts/tiered-writeback-e2e.py verify-controller-target --controller-ssh-target ubuntu-main --expected-host-key-sha256 "${ZEROFS_VM100_HOST_KEY_SHA256:?}" --format target-token)"
+case "$CONTROLLER_TARGET_RECEIPT" in ''|*[!A-Za-z0-9_-]*) exit 1 ;; esac
+ssh ubuntu-main "FINAL_PROOF_SHA='$FINAL_PROOF_SHA' CONTROLLER_TARGET_RECEIPT='$CONTROLLER_TARGET_RECEIPT' bash -seuo pipefail" <<'REMOTE'
 cd /fast/projects/ZeroFS-unified-tiered-writeback
-FINAL_PROOF_SHA="$(git rev-parse origin/codex/unified-tiered-writeback^{commit})"
 test "$(git rev-parse HEAD)" = "$FINAL_PROOF_SHA"
 test -z "$(git status --porcelain=v1)"
 cd zerofs
@@ -1285,13 +1371,20 @@ python3 -m unittest discover -s scripts/tests -p 'test_*.py' -v
 python3 -m unittest discover -s proxmox/tests -p 'test_*.py' -v
 find proxmox -type f -name '*.sh' -exec shellcheck {} +
 actionlint .github/workflows/*.yml
+REMOTE
 ```
 
 Run every real harness scenario from its own external control/resource roots:
 
 ```bash
 set -euo pipefail
+cd /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback
+FINAL_PROOF_SHA="$(git rev-parse HEAD^{commit})"
+CONTROLLER_TARGET_RECEIPT="$(python3 scripts/tiered-writeback-e2e.py verify-controller-target --controller-ssh-target ubuntu-main --expected-host-key-sha256 "${ZEROFS_VM100_HOST_KEY_SHA256:?}" --format target-token)"
+case "$CONTROLLER_TARGET_RECEIPT" in ''|*[!A-Za-z0-9_-]*) exit 1 ;; esac
+ssh ubuntu-main "FINAL_PROOF_SHA='$FINAL_PROOF_SHA' CONTROLLER_TARGET_RECEIPT='$CONTROLLER_TARGET_RECEIPT' bash -seuo pipefail" <<'REMOTE'
 cd /fast/projects/ZeroFS-unified-tiered-writeback
+test "$(git rev-parse HEAD)" = "$FINAL_PROOF_SHA"
 run_final_scenario() {
   filesystem_mode="$1"; object_mode="$2"; scenario="$3"
   RUN_UUID="$(python3 -c 'import uuid; print(uuid.uuid4())')"
@@ -1343,6 +1436,7 @@ if test "$HPN_RECEIVE_WINNER" = true; then
 fi
 sudo python3 scripts/tiered-writeback-e2e.py archive-control --ledger "$FINAL_SFTP_LEDGER" --archive-root /fast/zerofs-tiered-receipts
 test ! -e "$FINAL_SFTP_CONTROL"
+REMOTE
 ```
 
 Run `global-admission-nbd-nfs-ninep`,
@@ -1357,6 +1451,14 @@ Run the paired read benchmark separately because the candidate must consume the
 immutable materialized-control receipt:
 
 ```bash
+set -euo pipefail
+cd /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback
+FINAL_PROOF_SHA="$(git rev-parse HEAD^{commit})"
+CONTROLLER_TARGET_RECEIPT="$(python3 scripts/tiered-writeback-e2e.py verify-controller-target --controller-ssh-target ubuntu-main --expected-host-key-sha256 "${ZEROFS_VM100_HOST_KEY_SHA256:?}" --format target-token)"
+case "$CONTROLLER_TARGET_RECEIPT" in ''|*[!A-Za-z0-9_-]*) exit 1 ;; esac
+ssh ubuntu-main "FINAL_PROOF_SHA='$FINAL_PROOF_SHA' CONTROLLER_TARGET_RECEIPT='$CONTROLLER_TARGET_RECEIPT' bash -seuo pipefail" <<'REMOTE'
+cd /fast/projects/ZeroFS-unified-tiered-writeback
+test "$(git rev-parse HEAD)" = "$FINAL_PROOF_SHA"
 READ_CONTROL_UUID="$(python3 -c 'import uuid; print(uuid.uuid4())')"
 READ_CONTROL_ROOT="/var/tmp/zerofs-tiered-control-${READ_CONTROL_UUID}"
 READ_CONTROL_RESOURCES="/var/tmp/zerofs-tiered-resources-${READ_CONTROL_UUID}"
@@ -1375,6 +1477,7 @@ sudo python3 scripts/tiered-writeback-e2e.py archive-control --ledger "$READ_CAN
 sudo python3 scripts/tiered-writeback-e2e.py archive-control --ledger "$READ_CONTROL_LEDGER" --archive-root /fast/zerofs-tiered-receipts
 test ! -e "$READ_CANDIDATE_ROOT"
 test ! -e "$READ_CONTROL_ROOT"
+REMOTE
 ```
 
 Run the NBD/XFS read pair only on the separate proof host:
@@ -1382,8 +1485,8 @@ Run the NBD/XFS read pair only on the separate proof host:
 ```bash
 test -n "${ZEROFS_NBD_PROOF_HOST:-}"
 case "$ZEROFS_NBD_PROOF_HOST" in ubuntu-main|vm100|100.125.144.4|ct198|10.10.10.55|100.108.226.83) exit 1 ;; esac
-VM100_MACHINE_ID="$(ssh ubuntu-main 'cat /etc/machine-id')"
-CT198_MACHINE_ID="$(ssh root@100.108.226.83 'pct exec 198 -- cat /etc/machine-id')"
+VM100_MACHINE_ID="$(python3 scripts/tiered-writeback-e2e.py validate-recorded-host-identity --receipt "${ZEROFS_VM100_IDENTITY_RECEIPT:?}" --expected-sha256 "${ZEROFS_VM100_IDENTITY_RECEIPT_SHA256:?}" --expected-role vm100 --expected-proxmox-vmid 100 --format machine-id)"
+CT198_MACHINE_ID="$(python3 scripts/tiered-writeback-e2e.py validate-recorded-host-identity --receipt "${ZEROFS_CT198_IDENTITY_RECEIPT:?}" --expected-sha256 "${ZEROFS_CT198_IDENTITY_RECEIPT_SHA256:?}" --expected-role ct198 --expected-proxmox-vmid 198 --format machine-id)"
 NBD_PROOF_IDENTITY_TOKEN="$(python3 scripts/tiered-writeback-e2e.py verify-proof-host --controller-ssh-target "$ZEROFS_NBD_PROOF_HOST" --expected-host-key-sha256 "$ZEROFS_NBD_PROOF_HOST_KEY_SHA256" --expected-machine-id "$ZEROFS_NBD_PROOF_MACHINE_ID" --expected-proxmox-vmid "$ZEROFS_NBD_PROOF_VMID" --forbid-machine-id "$VM100_MACHINE_ID" --forbid-machine-id "$CT198_MACHINE_ID" --forbid-proxmox-vmid 100 --forbid-proxmox-vmid 198 --format identity-token)"
 NBD_PROOF_TARGET_TOKEN="$(python3 scripts/tiered-writeback-e2e.py verify-proof-host --controller-ssh-target "$ZEROFS_NBD_PROOF_HOST" --expected-host-key-sha256 "$ZEROFS_NBD_PROOF_HOST_KEY_SHA256" --expected-machine-id "$ZEROFS_NBD_PROOF_MACHINE_ID" --expected-proxmox-vmid "$ZEROFS_NBD_PROOF_VMID" --forbid-machine-id "$VM100_MACHINE_ID" --forbid-machine-id "$CT198_MACHINE_ID" --forbid-proxmox-vmid 100 --forbid-proxmox-vmid 198 --format target-token)"
 case "$NBD_PROOF_IDENTITY_TOKEN" in ''|*[!A-Za-z0-9_-]*) exit 1 ;; esac
@@ -1516,7 +1619,9 @@ Pass the two recorded SHAs from the local primary-checkout shell into one fail-c
 cd /Volumes/bigssd/projects/ZeroFS
 test "${#EXPECTED_OLD_SHA}" = 40
 test "${#EXPECTED_NEW_SHA}" = 40
-ssh ubuntu-main "EXPECTED_OLD_SHA='$EXPECTED_OLD_SHA' EXPECTED_NEW_SHA='$EXPECTED_NEW_SHA' bash -seuo pipefail" <<'REMOTE'
+CONTROLLER_TARGET_RECEIPT="$(python3 scripts/tiered-writeback-e2e.py verify-controller-target --controller-ssh-target ubuntu-main --expected-host-key-sha256 "${ZEROFS_VM100_HOST_KEY_SHA256:?}" --format target-token)"
+case "$CONTROLLER_TARGET_RECEIPT" in ''|*[!A-Za-z0-9_-]*) exit 1 ;; esac
+ssh ubuntu-main "EXPECTED_OLD_SHA='$EXPECTED_OLD_SHA' EXPECTED_NEW_SHA='$EXPECTED_NEW_SHA' CONTROLLER_TARGET_RECEIPT='$CONTROLLER_TARGET_RECEIPT' bash -seuo pipefail" <<'REMOTE'
 cd /fast/projects/ZeroFS
 test -z "$(git status --porcelain=v1)"
 test "$(git branch --show-current)" = develop
@@ -1538,10 +1643,16 @@ Any dirty path, wrong branch/SHA, active job, or failed ancestry check stops wit
 After all ledgers are clean and Ubuntu `develop` matches the pushed SHA:
 
 ```bash
+set -euo pipefail
+cd /Volumes/bigssd/projects/ZeroFS
+CONTROLLER_TARGET_RECEIPT="$(python3 scripts/tiered-writeback-e2e.py verify-controller-target --controller-ssh-target ubuntu-main --expected-host-key-sha256 "${ZEROFS_VM100_HOST_KEY_SHA256:?}" --format target-token)"
+case "$CONTROLLER_TARGET_RECEIPT" in ''|*[!A-Za-z0-9_-]*) exit 1 ;; esac
+ssh ubuntu-main "CONTROLLER_TARGET_RECEIPT='$CONTROLLER_TARGET_RECEIPT' bash -seuo pipefail" <<'REMOTE'
 cd /fast/projects/ZeroFS
 git worktree remove /fast/projects/ZeroFS-unified-tiered-writeback
 git worktree prune
 git worktree list --porcelain
+REMOTE
 ```
 
 Then Root removes only `/Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback`, prunes, and lists local worktrees. The completion receipt records the authorized historical deployment and the later automatic post-OOM restart, then explicitly proves no task in this feature plan deployed or restarted CT198 afterward; it does not falsely claim CT198 was never restarted.
@@ -1572,5 +1683,10 @@ git worktree remove /Volumes/bigssd/projects/ZeroFS/.worktrees/read-throughput-p
 git worktree prune
 git worktree list --porcelain
 test ! -e /Volumes/bigssd/projects/ZeroFS/.worktrees/read-throughput-plan
-ssh ubuntu-main 'cd /fast/projects/ZeroFS && git worktree list --porcelain'
+CONTROLLER_TARGET_RECEIPT="$(python3 scripts/tiered-writeback-e2e.py verify-controller-target --controller-ssh-target ubuntu-main --expected-host-key-sha256 "${ZEROFS_VM100_HOST_KEY_SHA256:?}" --format target-token)"
+case "$CONTROLLER_TARGET_RECEIPT" in ''|*[!A-Za-z0-9_-]*) exit 1 ;; esac
+ssh ubuntu-main "CONTROLLER_TARGET_RECEIPT='$CONTROLLER_TARGET_RECEIPT' bash -seuo pipefail" <<'REMOTE'
+cd /fast/projects/ZeroFS
+git worktree list --porcelain
+REMOTE
 ```
