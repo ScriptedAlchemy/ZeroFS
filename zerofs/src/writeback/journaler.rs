@@ -691,7 +691,10 @@ fn accept_journal_command(
             *next_received = sequence.checked_add(1);
             let prepare_sink = sink.clone();
             preparations.push(tokio::task::spawn_blocking(move || {
-                let result = prepare_sink.prepare(record, payload.as_ref());
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    prepare_sink.prepare(record, payload.as_ref())
+                }))
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("local journal preparer panicked")));
                 (
                     sequence,
                     result,
@@ -1330,15 +1333,54 @@ async fn run_journaler(
     if let Some(error) = terminal {
         admission.poison(error.clone());
         progress.send_modify(|state| state.terminal_error = Some(error.clone()));
-        while let Some(result) = preparations.next().await {
-            if let Ok((_, Ok(mutation), _)) = result {
-                sink.discard(mutation);
+        let mut terminal_ownership = Vec::new();
+        receiver.close();
+        while let Some(command) = receiver.recv().await {
+            match command {
+                JournalCommand::Mutation {
+                    record,
+                    payload,
+                    ram,
+                    disk,
+                    multipart_cleanup,
+                } => {
+                    drop(payload);
+                    terminal_ownership.push(MutationOwnership {
+                        sequence: record.sequence,
+                        _ram: ram,
+                        disk,
+                        multipart_cleanup,
+                    });
+                }
+                JournalCommand::Shutdown(done) => {
+                    if shutdown.is_none() {
+                        shutdown = Some(done);
+                    } else {
+                        let _ = done.send(());
+                    }
+                }
             }
         }
-        for (_, (result, _)) in prepared {
+        while let Some(result) = preparations.next().await {
+            if let Ok((_, prepared, ownership)) = result {
+                if let Ok(mutation) = prepared {
+                    sink.discard(mutation);
+                }
+                terminal_ownership.push(ownership);
+            }
+        }
+        for (_, (result, ownership)) in prepared {
             if let Ok(mutation) = result {
                 sink.discard(mutation);
             }
+            terminal_ownership.push(ownership);
+        }
+        if let Some(cleanup_error) =
+            cleanup_uncommitted_ownership(terminal_ownership, space.as_deref()).await
+        {
+            progress.send_modify(|state| {
+                state.terminal_error = Some(format!("{error}; {cleanup_error}"));
+            });
         }
     } else {
         admission.close();
@@ -1470,6 +1512,9 @@ mod tests {
     struct PipelineGateSink {
         journal: Arc<Journal>,
         fail_prepare_on: Option<Sequence>,
+        panic_prepare_on: Option<Sequence>,
+        prepare_entered: Option<tokio_mpsc::UnboundedSender<Sequence>>,
+        fail_prepare_release: Mutex<Option<mpsc::Receiver<()>>>,
         commit_gate_on: Sequence,
         commit_entered: tokio_mpsc::UnboundedSender<Vec<Sequence>>,
         commit_release: Mutex<Option<mpsc::Receiver<()>>>,
@@ -1491,6 +1536,9 @@ mod tests {
             Self {
                 journal,
                 fail_prepare_on: None,
+                panic_prepare_on: None,
+                prepare_entered: None,
+                fail_prepare_release: Mutex::new(None),
                 commit_gate_on,
                 commit_entered,
                 commit_release: Mutex::new(Some(commit_release)),
@@ -1509,8 +1557,17 @@ mod tests {
             record: MutationRecord,
             payload: Option<&VerifiedPayload>,
         ) -> Result<crate::writeback::journal::PreparedMutation> {
+            if let Some(entered) = &self.prepare_entered {
+                entered.send(record.sequence).unwrap();
+            }
             if self.fail_prepare_on == Some(record.sequence) {
+                if let Some(release) = self.fail_prepare_release.lock().unwrap().take() {
+                    release.recv().unwrap();
+                }
                 bail!("injected preparation failure at {}", record.sequence);
+            }
+            if self.panic_prepare_on == Some(record.sequence) {
+                panic!("injected preparation panic at {}", record.sequence);
             }
             match payload {
                 Some(payload) => self.journal.prepare_verified_put(record, payload),
@@ -1702,8 +1759,7 @@ mod tests {
         journaler.shutdown().await.unwrap();
     }
 
-    #[tokio::test]
-    async fn fatal_preparation_failure_cleans_multipart_staging_before_releasing_claims() {
+    async fn assert_fatal_preparation_cleans_multipart(panic: bool) {
         let temp = tempfile::tempdir().unwrap();
         let journal = pipeline_journal(&temp);
         let space = Arc::new(PhysicalSpaceSampler::new(journal.root().to_path_buf()));
@@ -1730,7 +1786,8 @@ mod tests {
         let (staged_tx, _staged) = tokio_mpsc::unbounded_channel();
         let (_release_tx, release_rx) = mpsc::channel();
         let sink = Arc::new(PipelineGateSink {
-            fail_prepare_on: Some(1),
+            fail_prepare_on: (!panic).then_some(1),
+            panic_prepare_on: panic.then_some(1),
             ..PipelineGateSink::new(
                 journal,
                 Sequence::MAX,
@@ -1756,12 +1813,118 @@ mod tests {
             .await
             .unwrap();
         let error = barrier.wait_local(1).await.unwrap_err();
-        assert!(error.to_string().contains("injected preparation failure"));
+        let expected = if panic {
+            "local journal preparer panicked"
+        } else {
+            "injected preparation failure"
+        };
+        assert!(error.to_string().contains(expected));
         assert!(!staging.exists());
         assert_eq!(ssd.used_bytes(), 0);
         assert_eq!(ssd.used_operations(), 0);
         assert_eq!(ssd.outstanding_physical_claims(), 0);
         journaler.shutdown().await.unwrap_err();
+    }
+
+    #[tokio::test]
+    async fn fatal_preparation_failure_cleans_multipart_staging_before_releasing_claims() {
+        assert_fatal_preparation_cleans_multipart(false).await;
+    }
+
+    #[tokio::test]
+    async fn preparation_panic_keeps_multipart_ownership_recoverable_for_sampled_cleanup() {
+        assert_fatal_preparation_cleans_multipart(true).await;
+    }
+
+    #[tokio::test]
+    async fn terminal_preparation_failure_sample_cleans_every_later_multipart_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = pipeline_journal(&temp);
+        let space = Arc::new(PhysicalSpaceSampler::new(journal.root().to_path_buf()));
+        let sample = space.sample().await.unwrap();
+        let ssd =
+            SsdAdmission::recover(1_000_000, 100, 95, 85, 1, std::iter::empty(), Some(sample))
+                .unwrap();
+        let mut submissions = Vec::new();
+        for sequence in 1..=3 {
+            let record = put_record(sequence, b"payload");
+            let journal_bytes = record.ssd_reservation_bytes().unwrap();
+            let reservation =
+                SsdMultipartPartReservation::reserve(&ssd, 7, journal_bytes, 1, sample)
+                    .await
+                    .unwrap();
+            let staging = temp.path().join(format!("multipart-{sequence}"));
+            std::fs::create_dir(&staging).unwrap();
+            let staged_payload = staging.join("payload.staged");
+            std::fs::write(&staged_payload, b"payload").unwrap();
+            let verified = VerifiedPayload::from_staged_file(staged_payload, 7).unwrap();
+            let promoted =
+                promote_multipart(MultipartReservationSet::Ssd(vec![reservation])).unwrap();
+            let MutationReservation::Ssd(mutation) = promoted.mutation else {
+                panic!("expected SSD multipart promotion")
+            };
+            let (disk, cleanup) = mutation.into_owned(staging.clone());
+            submissions.push((record, verified, disk, cleanup, staging));
+        }
+        let (prepare_entered_tx, mut prepare_entered) = tokio_mpsc::unbounded_channel();
+        let (failure_release_tx, failure_release_rx) = mpsc::channel();
+        let (commit_entered_tx, _commit_entered) = tokio_mpsc::unbounded_channel();
+        let (staged_tx, _staged) = tokio_mpsc::unbounded_channel();
+        let (_commit_release_tx, commit_release_rx) = mpsc::channel();
+        let sink = Arc::new(PipelineGateSink {
+            fail_prepare_on: Some(1),
+            prepare_entered: Some(prepare_entered_tx),
+            fail_prepare_release: Mutex::new(Some(failure_release_rx)),
+            ..PipelineGateSink::new(
+                journal,
+                Sequence::MAX,
+                commit_entered_tx,
+                commit_release_rx,
+                staged_tx,
+            )
+        });
+        let admission = Admission::new(64);
+        let journaler = LocalJournaler::start_with_sink_observer_space(
+            sink,
+            admission,
+            0,
+            uuid::Uuid::nil(),
+            8,
+            2,
+            None,
+            Some(space),
+        );
+        let mut barrier = None;
+        let mut staging_paths = Vec::new();
+        for (record, verified, disk, cleanup, staging) in submissions {
+            barrier = Some(
+                journaler
+                    .submit(record, Some(verified), None, Some(disk), Some(cleanup))
+                    .await
+                    .unwrap(),
+            );
+            staging_paths.push(staging);
+        }
+        let mut entered = vec![prepare_entered.recv().await.unwrap()];
+        entered.push(prepare_entered.recv().await.unwrap());
+        entered.sort_unstable();
+        assert_eq!(entered, vec![1, 2]);
+        failure_release_tx.send(()).unwrap();
+
+        let barrier = barrier.unwrap();
+        barrier.wait_local(3).await.unwrap_err();
+        journaler.shutdown().await.unwrap_err();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !barrier.progress.snapshot().closed {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("terminal journaler did not finish draining multipart ownership");
+        assert!(staging_paths.iter().all(|path| !path.exists()));
+        assert_eq!(ssd.used_bytes(), 0);
+        assert_eq!(ssd.used_operations(), 0);
+        assert_eq!(ssd.outstanding_physical_claims(), 0);
     }
 
     impl LocalJournalSink for BlockingSink {

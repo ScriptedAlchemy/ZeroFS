@@ -9,6 +9,7 @@ use object_store::{
 use std::fmt::{Display, Formatter};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::Notify;
 
 #[derive(Debug)]
@@ -110,6 +111,24 @@ struct BlockingAbortUpload {
     aborts: Arc<AtomicUsize>,
     entered: Arc<Notify>,
     release: Arc<Notify>,
+}
+
+#[derive(Debug)]
+struct FailingAbortUpload;
+
+#[async_trait]
+impl MultipartUpload for FailingAbortUpload {
+    fn put_part(&mut self, _data: PutPayload) -> UploadPart {
+        panic!("cleanup-only test never uploads a part")
+    }
+
+    async fn complete(&mut self) -> object_store::Result<PutResult> {
+        panic!("cleanup-only test never completes the upload")
+    }
+
+    async fn abort(&mut self) -> object_store::Result<()> {
+        Err(generic_error("injected multipart abort failure"))
+    }
 }
 
 #[async_trait]
@@ -228,7 +247,8 @@ async fn remote_replay_at_the_window_boundary_keeps_atomic_put_semantics() {
 #[tokio::test]
 async fn multipart_owner_cancellation_is_drained_by_the_tracked_cleanup_worker() {
     let (cleanup_sender, cleanup_receiver) = mpsc::unbounded_channel();
-    let cleanup_worker = tokio::spawn(drain_remote_multipart_cleanup(cleanup_receiver, 1));
+    let (failure, mut failure_receiver) = watch::channel(None);
+    let cleanup_worker = tokio::spawn(drain_remote_multipart_cleanup(cleanup_receiver, 1, failure));
     let aborts = Arc::new(AtomicUsize::new(0));
     let entered = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
@@ -247,5 +267,31 @@ async fn multipart_owner_cancellation_is_drained_by_the_tracked_cleanup_worker()
     assert!(!cleanup_worker.is_finished());
     release.notify_one();
     cleanup_worker.await.unwrap().unwrap();
+    assert!(failure_receiver.borrow_and_update().is_none());
     assert_eq!(aborts.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn multipart_abort_failure_is_published_while_cleanup_input_remains_live() {
+    let (cleanup_sender, cleanup_receiver) = mpsc::unbounded_channel();
+    let (failure, mut failure_receiver) = watch::channel(None);
+    let cleanup_worker = tokio::spawn(drain_remote_multipart_cleanup(cleanup_receiver, 1, failure));
+    drop(RemoteMultipartOwner::new(
+        Box::new(FailingAbortUpload),
+        cleanup_sender.clone(),
+    ));
+
+    tokio::time::timeout(Duration::from_secs(1), failure_receiver.changed())
+        .await
+        .expect("cleanup failure was not published while the input remained live")
+        .unwrap();
+    assert!(
+        failure_receiver
+            .borrow_and_update()
+            .as_deref()
+            .is_some_and(|error| error.contains("injected multipart abort failure"))
+    );
+    assert!(!cleanup_worker.is_finished());
+    drop(cleanup_sender);
+    assert!(cleanup_worker.await.unwrap().is_err());
 }

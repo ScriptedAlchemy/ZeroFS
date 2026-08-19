@@ -424,15 +424,21 @@ async fn run_remote_scheduler(worker: RemoteWorker) {
     }
     let mut next = progress.borrow().sequence.saturating_add(1);
     let (cleanup_sender, cleanup_receiver) = mpsc::unbounded_channel();
+    let (cleanup_failure_sender, mut cleanup_failure) = watch::channel(None::<String>);
     let cleanup_worker = tokio::spawn(drain_remote_multipart_cleanup(
         cleanup_receiver,
         upload_concurrency,
+        cleanup_failure_sender,
     ));
     // A new burst gets one coalescing window. Once its local tail is known, do
     // not make each intervening manifest fence pay that delay again.
     let mut known_local_tail = progress.borrow().sequence;
     let mut completed = BTreeMap::<Sequence, CompletedRemote>::new();
     'scheduler: loop {
+        if let Some(error) = cleanup_failure.borrow().clone() {
+            publish_terminal(&progress, &admission, &ssd, error, true);
+            break;
+        }
         if *stop.borrow() {
             break;
         }
@@ -449,6 +455,15 @@ async fn run_remote_scheduler(worker: RemoteWorker) {
             changed = stop.changed() => {
                 if changed.is_err() || *stop.borrow() {
                     break;
+                }
+                continue;
+            }
+            changed = cleanup_failure.changed() => {
+                if changed.is_ok()
+                    && let Some(error) = cleanup_failure.borrow().clone()
+                {
+                    publish_terminal(&progress, &admission, &ssd, error, true);
+                    break 'scheduler;
                 }
                 continue;
             }
@@ -563,6 +578,15 @@ async fn run_remote_scheduler(worker: RemoteWorker) {
                     }
                     continue;
                 },
+                changed = cleanup_failure.changed() => {
+                    if changed.is_ok()
+                        && let Some(error) = cleanup_failure.borrow().clone()
+                    {
+                        terminal_error = Some(error);
+                        active.abort_all();
+                    }
+                    continue;
+                },
             };
             let (record, result) = match event {
                 SchedulerEvent::Commit((sequence, result)) => {
@@ -663,6 +687,14 @@ async fn run_remote_scheduler(worker: RemoteWorker) {
                         break;
                     }
                 }
+                changed = cleanup_failure.changed() => {
+                    if changed.is_ok()
+                        && let Some(error) = cleanup_failure.borrow().clone()
+                    {
+                        publish_terminal(&progress, &admission, &ssd, error, true);
+                        break 'scheduler;
+                    }
+                }
             }
         }
     }
@@ -686,6 +718,7 @@ async fn run_remote_scheduler(worker: RemoteWorker) {
 async fn drain_remote_multipart_cleanup(
     mut receiver: mpsc::UnboundedReceiver<Box<dyn MultipartUpload>>,
     cleanup_concurrency: usize,
+    failure: watch::Sender<Option<String>>,
 ) -> Result<(), String> {
     let mut active = JoinSet::new();
     let mut input_closed = false;
@@ -721,7 +754,12 @@ async fn drain_remote_multipart_cleanup(
                 };
                 if let Some(error) = error {
                     tracing::error!(%error, "remote multipart cancellation cleanup failed");
-                    first_error.get_or_insert(error);
+                    if first_error.is_none() {
+                        failure.send_replace(Some(format!(
+                            "remote multipart cancellation cleanup failed: {error}"
+                        )));
+                        first_error = Some(error);
+                    }
                 }
             }
         }
@@ -736,7 +774,8 @@ async fn apply_record_with_tracked_cleanup(
     record: MutationRecord,
 ) -> object_store::Result<PutResult> {
     let (cleanup_sender, cleanup_receiver) = mpsc::unbounded_channel();
-    let cleanup_worker = tokio::spawn(drain_remote_multipart_cleanup(cleanup_receiver, 1));
+    let (failure, _) = watch::channel(None);
+    let cleanup_worker = tokio::spawn(drain_remote_multipart_cleanup(cleanup_receiver, 1, failure));
     let result = apply_record(remote, journal, record, cleanup_sender.clone()).await;
     drop(cleanup_sender);
     cleanup_worker
@@ -1137,7 +1176,7 @@ async fn stream_record_to_remote(
     cleanup_sender: RemoteCleanupSender,
 ) -> object_store::Result<PutResult> {
     if let Some(existing) =
-        reconcile_precondition(remote.as_ref(), journal.as_ref(), record, target, mode).await?
+        reconcile_precondition(remote.as_ref(), &journal, record, target, mode).await?
     {
         return Ok(existing);
     }
@@ -1168,10 +1207,10 @@ async fn stream_record_to_remote(
         return match result {
             Ok(result) => Ok(result),
             Err(object_store::Error::AlreadyExists { .. }) if matches!(mode, PutMode::Create) => {
-                verify_existing(remote.as_ref(), journal.as_ref(), record, target).await
+                verify_existing(remote.as_ref(), &journal, record, target).await
             }
             Err(object_store::Error::Precondition { .. }) if matches!(mode, PutMode::Update(_)) => {
-                verify_existing(remote.as_ref(), journal.as_ref(), record, target).await
+                verify_existing(remote.as_ref(), &journal, record, target).await
             }
             Err(error) => Err(error),
         };
@@ -1221,7 +1260,7 @@ async fn stream_record_to_remote(
     }
 
     if let Some(existing) =
-        reconcile_precondition(remote.as_ref(), journal.as_ref(), record, target, mode).await?
+        reconcile_precondition(remote.as_ref(), &journal, record, target, mode).await?
     {
         bounded_remote_step(record, "multipart precondition abort", owner.abort()).await?;
         return Ok(existing);
@@ -1263,7 +1302,7 @@ where
 
 async fn reconcile_precondition(
     remote: &dyn ObjectStore,
-    journal: &Journal,
+    journal: &Arc<Journal>,
     record: &MutationRecord,
     target: &Path,
     mode: &PutMode,
@@ -1363,14 +1402,16 @@ fn expected_visible_version(record: &MutationRecord) -> Option<&str> {
 
 async fn verify_existing(
     remote: &dyn ObjectStore,
-    journal: &Journal,
+    journal: &Arc<Journal>,
     record: &MutationRecord,
     target: &Path,
 ) -> object_store::Result<PutResult> {
     let meta = bounded_remote_step(record, "reconciliation head", remote.head(target)).await?;
     let sequence = record.sequence;
-    let blob = journal
-        .open_verified_blob(sequence)
+    let blob_journal = Arc::clone(journal);
+    let blob = tokio::task::spawn_blocking(move || blob_journal.open_verified_blob(sequence))
+        .await
+        .map_err(|error| generic_error(format!("journal open task failed: {error}")))?
         .map_err(|error| generic_error(format!("journal blob open failed: {error:#}")))?;
     if meta.size != blob.len() {
         return Err(object_store::Error::AlreadyExists {
@@ -1552,7 +1593,7 @@ mod tests {
             .unwrap();
         let (remote, controls) = FaultStore::new(inner);
         let temp = tempfile::tempdir().unwrap();
-        let journal = journal_with_local_records(temp.path(), 0);
+        let journal = Arc::new(journal_with_local_records(temp.path(), 0));
         let record = put_record(1, target.as_ref(), &expected);
         journal.commit_put(record.clone(), &expected).unwrap();
 
