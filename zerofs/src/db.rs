@@ -595,15 +595,6 @@ impl Db {
         Ok(result)
     }
 
-    /// Point read seeing only object-storage-durable data.
-    ///
-    /// No longer called since GC reclaim switched to grouped durable scans,
-    /// but kept as public API for durability-filtered point reads.
-    #[allow(dead_code)]
-    pub async fn get_bytes_durable(&self, key: &Bytes) -> Result<Option<Bytes>> {
-        self.get_bytes_at(key, DurabilityLevel::Remote).await
-    }
-
     async fn get_bytes_at(
         &self,
         key: &Bytes,

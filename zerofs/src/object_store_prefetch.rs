@@ -831,17 +831,6 @@ impl PrefetchingObjectStore {
         self.generations.remove(location);
     }
 
-    /// Drop every cached part for `location` plus heads / generations /
-    /// access_tracker. Called from delete so a reclaim that only drops
-    /// heads cannot keep charging foyer for the dead 32 MiB parts.
-    ///
-    /// Only exercised through `delete` and tests today; the binary target
-    /// (which re-declares these modules) would otherwise flag it dead.
-    #[allow(dead_code)]
-    pub fn evict_location(&self, location: &Path) {
-        self.eviction_ctx().evict_location(location);
-    }
-
     /// Backend GET that does not `save_get_result`, `read_part`, or
     /// `spawn_async_prefetch`. GC/compaction use this (or `SkipPartsCache`).
     pub async fn get_opts_uncached(
@@ -850,16 +839,6 @@ impl PrefetchingObjectStore {
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
         self.inner.get_opts(location, options).await
-    }
-
-    /// ObjectStore delete that evicts first so a failed backend delete
-    /// still uncharges the user cache.
-    ///
-    /// Part of the lib public API; unused inside the binary target.
-    #[allow(dead_code)]
-    pub async fn delete(&self, location: &Path) -> object_store::Result<()> {
-        self.evict_location(location);
-        object_store::ObjectStoreExt::delete(&*self.inner, location).await
     }
 
     fn admit_part(
@@ -4282,7 +4261,7 @@ mod tests {
         let path = Path::from("skip-cache");
         let payload = vec![9u8; 64 * 1024];
         store.put(&path, payload.clone().into()).await.unwrap();
-        store.evict_location(&path);
+        store.eviction_ctx().evict_location(&path);
         assert!(store.cached_part(&path, 0).await.is_none());
 
         let result = store
