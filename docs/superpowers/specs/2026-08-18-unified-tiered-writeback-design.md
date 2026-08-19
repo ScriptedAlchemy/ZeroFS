@@ -384,7 +384,8 @@ sequential scans and use explicit no-admit/no-fill reads.
 Segment cardinality is defined from the stored wire geometry, never from plaintext
 size. Version 1 stores compressed+AEAD frames plus four-byte prefixes in the frame
 region, then one compressed+sealed directory of 28 plaintext bytes per row, then a
-64-byte footer whose `k`, frame index, and `dir_len` fields are `u32`. The 256 MiB seal
+64-byte footer whose `k` and `dir_len` fields are `u32`. Each per-frame `FrameLoc` and
+frame AAD carry their own checked `u32` frame index. The 256 MiB seal
 threshold applies only to the stored frame region. Valid current segments can therefore
 contain roughly 4.07 million highly compressed extents before the threshold, plus a
 crossing-batch overshoot; the current internal writer has no universal batch bound. A
