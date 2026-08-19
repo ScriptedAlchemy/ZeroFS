@@ -128,19 +128,21 @@ use crate::writeback::model::{
 };
 use crate::writeback::payload::VerifiedPayload;
 use anyhow::{Context, Result, bail};
+use bytes::Bytes;
 use fs4::fs_std::FileExt;
+use futures::{StreamExt, stream, stream::BoxStream};
 use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, Write};
+use std::io::{Read, Seek};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -1033,14 +1035,11 @@ impl Journal {
         let mut file = open_owner_file(&path, false)
             .with_context(|| format!("failed to create container {}", path.display()))?;
         let write = (|| -> Result<()> {
-            write_all_vectored(
-                &mut file,
-                &payloads
-                    .iter()
-                    .map(|(_, payload)| payload.bytes())
-                    .collect::<Vec<_>>(),
-            )
-            .context("failed to write container")?;
+            for (_, payload) in payloads {
+                payload
+                    .write_to(&mut file)
+                    .context("failed to stream payload into container")?;
+            }
             // fdatasync, not fsync: it still persists the data and the
             // metadata needed to read it back (size and extents), which is
             // all a container needs. The link itself is made durable by the
@@ -1211,6 +1210,19 @@ impl Journal {
     }
 
     pub fn read_blob(&self, sequence: Sequence) -> Result<Vec<u8>> {
+        let blob = self.open_verified_blob(sequence)?;
+        let capacity = usize::try_from(blob.len).context("blob is too large to read")?;
+        let mut collected = Vec::with_capacity(capacity);
+        let mut file = blob.file.lock().expect("verified blob file lock poisoned");
+        file.seek(std::io::SeekFrom::Start(blob.offset))?;
+        (&mut *file).take(blob.len).read_to_end(&mut collected)?;
+        if collected.len() as u64 != blob.len {
+            bail!("committed blob length mismatch");
+        }
+        Ok(collected)
+    }
+
+    pub(crate) fn open_verified_blob(&self, sequence: Sequence) -> Result<VerifiedBlob> {
         let record = self
             .mutation(sequence)?
             .with_context(|| format!("journal mutation {sequence} does not exist"))?;
@@ -1219,7 +1231,7 @@ impl Journal {
             .with_context(|| format!("journal mutation {sequence} has no blob"))?;
         let reference = BlobRef::parse(reference)?;
         let path = checked_join(&self.root, reference.relative)?;
-        read_verified_blob(&path, reference.slice, &record)
+        open_verified_blob(&path, reference.slice, &record)
     }
 
     pub fn mark_remote(&self, sequence: Sequence, result_etag: Option<String>) -> Result<()> {
@@ -2165,6 +2177,106 @@ struct BlobSlice {
     len: u64,
 }
 
+#[derive(Clone)]
+pub(crate) struct VerifiedBlob {
+    file: Arc<Mutex<File>>,
+    offset: u64,
+    len: u64,
+    sha256: [u8; 32],
+}
+
+impl VerifiedBlob {
+    pub(crate) fn len(&self) -> u64 {
+        self.len
+    }
+
+    pub(crate) fn range_stream(
+        &self,
+        range: std::ops::Range<u64>,
+        chunk_bytes: usize,
+    ) -> Result<BoxStream<'static, Result<Bytes>>> {
+        if range.start > range.end || range.end > self.len {
+            bail!("verified blob range is outside the payload");
+        }
+        if chunk_bytes == 0 {
+            bail!("verified blob stream chunk size must be nonzero");
+        }
+        let state = VerifiedBlobCursor {
+            file: Arc::clone(&self.file),
+            absolute: self
+                .offset
+                .checked_add(range.start)
+                .context("verified blob range offset overflow")?,
+            remaining: range.end - range.start,
+            chunk_bytes,
+            hasher: (range.start == 0 && range.end == self.len).then(Sha256::new),
+            expected_sha256: self.sha256,
+        };
+        Ok(stream::try_unfold(state, |mut state| async move {
+            if state.remaining == 0 {
+                if let Some(hasher) = state.hasher.take() {
+                    let actual: [u8; 32] = hasher.finalize().into();
+                    if actual != state.expected_sha256 {
+                        bail!("committed blob changed while streaming");
+                    }
+                }
+                return Ok(None);
+            }
+            let wanted = state.remaining.min(state.chunk_bytes as u64) as usize;
+            let file = Arc::clone(&state.file);
+            let absolute = state.absolute;
+            let bytes = tokio::task::spawn_blocking(move || {
+                let mut file = file
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("verified blob file lock poisoned"))?;
+                file.seek(std::io::SeekFrom::Start(absolute))?;
+                let mut bytes = vec![0; wanted];
+                let mut read = 0usize;
+                while read < wanted {
+                    let count = file.read(&mut bytes[read..])?;
+                    if count == 0 {
+                        break;
+                    }
+                    read += count;
+                }
+                bytes.truncate(read);
+                Ok::<_, anyhow::Error>(Bytes::from(bytes))
+            })
+            .await
+            .context("verified blob stream task failed")??;
+            if bytes.is_empty() {
+                bail!("committed blob length mismatch");
+            }
+            state.absolute = state
+                .absolute
+                .checked_add(bytes.len() as u64)
+                .context("verified blob stream offset overflow")?;
+            state.remaining -= bytes.len() as u64;
+            if let Some(hasher) = &mut state.hasher {
+                hasher.update(&bytes);
+                if state.remaining == 0 {
+                    let actual: [u8; 32] = hasher.clone().finalize().into();
+                    if actual != state.expected_sha256 {
+                        bail!("committed blob changed while streaming");
+                    }
+                    state.hasher = None;
+                }
+            }
+            Ok(Some((bytes, state)))
+        })
+        .boxed())
+    }
+}
+
+struct VerifiedBlobCursor {
+    file: Arc<Mutex<File>>,
+    absolute: u64,
+    remaining: u64,
+    chunk_bytes: usize,
+    hasher: Option<Sha256>,
+    expected_sha256: [u8; 32],
+}
+
 /// A parsed `MutationRecord::blob_path`.
 ///
 /// Two forms are accepted for the life of the format. Journals written before
@@ -2254,31 +2366,6 @@ fn container_last_sequence(relative: &str) -> Option<Sequence> {
     Sequence::from_str_radix(last, 16).ok()
 }
 
-/// Write every payload in one batch with as few syscalls as the kernel allows.
-///
-/// Empty payloads are dropped first: a vectored write over nothing but empty
-/// buffers reports zero bytes written, which is indistinguishable from a
-/// stalled device, and zero-length records are legal.
-fn write_all_vectored(file: &mut File, payloads: &[&[u8]]) -> std::io::Result<()> {
-    let mut slices = payloads
-        .iter()
-        .filter(|payload| !payload.is_empty())
-        .map(|payload| std::io::IoSlice::new(payload))
-        .collect::<Vec<_>>();
-    let mut cursor = slices.as_mut_slice();
-    while !cursor.is_empty() {
-        let written = file.write_vectored(cursor)?;
-        if written == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::WriteZero,
-                "container write made no progress",
-            ));
-        }
-        std::io::IoSlice::advance_slices(&mut cursor, written);
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 fn blob_relative_path(sequence: Sequence, operation_id: Uuid) -> PathBuf {
     // Shard on the sequence's high bits so a run of 256 consecutive records
@@ -2315,16 +2402,21 @@ fn checked_join(root: &Path, relative: &str) -> Result<PathBuf> {
     Ok(root.join(safe))
 }
 
-fn read_verified_blob(
+fn open_verified_blob(
     path: &Path,
     slice: Option<BlobSlice>,
     record: &MutationRecord,
-) -> Result<Vec<u8>> {
+) -> Result<VerifiedBlob> {
     let (payload_len, payload_sha256) = record
         .payload()
         .context("journal record does not reference a payload blob")?;
-    verify_file_payload(path, slice, payload_len, payload_sha256, true)?
-        .context("verified blob read did not return payload bytes")
+    let (file, offset) = verify_file_payload(path, slice, payload_len, payload_sha256)?;
+    Ok(VerifiedBlob {
+        file: Arc::new(Mutex::new(file)),
+        offset,
+        len: payload_len,
+        sha256: payload_sha256,
+    })
 }
 
 fn verify_record_blob(
@@ -2335,7 +2427,7 @@ fn verify_record_blob(
     let (payload_len, payload_sha256) = record
         .payload()
         .context("journal record does not reference a payload blob")?;
-    verify_file_payload(path, slice, payload_len, payload_sha256, false).map(drop)
+    verify_file_payload(path, slice, payload_len, payload_sha256).map(drop)
 }
 
 /// Verify (and optionally collect) one record's payload.
@@ -2349,8 +2441,7 @@ fn verify_file_payload(
     slice: Option<BlobSlice>,
     expected_len: u64,
     expected_sha256: [u8; 32],
-    collect: bool,
-) -> Result<Option<Vec<u8>>> {
+) -> Result<(File, u64)> {
     let offset = slice.map_or(0, |slice| slice.offset);
     if let Some(slice) = slice
         && slice.len != expected_len
@@ -2396,12 +2487,6 @@ fn verify_file_payload(
             .with_context(|| format!("failed to seek blob {}", path.display()))?;
     }
 
-    let mut collected = if collect {
-        let capacity = usize::try_from(expected_len).context("blob is too large to read")?;
-        Some(Vec::with_capacity(capacity))
-    } else {
-        None
-    };
     let mut hasher = Sha256::new();
     let mut remaining = expected_len;
     let mut buffer = vec![0_u8; 1024 * 1024];
@@ -2416,15 +2501,12 @@ fn verify_file_payload(
         }
         remaining -= read as u64;
         hasher.update(&buffer[..read]);
-        if let Some(bytes) = &mut collected {
-            bytes.extend_from_slice(&buffer[..read]);
-        }
     }
     let actual_sha256: [u8; 32] = hasher.finalize().into();
     if actual_sha256 != expected_sha256 {
         bail!("committed blob hash mismatch");
     }
-    Ok(collected)
+    Ok((file, offset))
 }
 
 fn ensure_journal_root(root: &Path) -> Result<()> {
@@ -2620,6 +2702,7 @@ mod tests {
     };
     use crate::writeback::payload::VerifiedPayload;
     use bytes::Bytes;
+    use futures::StreamExt;
     use redb::ReadableDatabase;
     use sha2::{Digest, Sha256};
     use std::fs;
@@ -3013,19 +3096,13 @@ mod tests {
         let first_payload = VerifiedPayload::new(Bytes::from_static(b"one"));
         let third_payload = VerifiedPayload::new(Bytes::from_static(b"three"));
         let first = journal
-            .prepare_verified_put(
-                put_record(1, "segments/1", first_payload.bytes()),
-                &first_payload,
-            )
+            .prepare_verified_put(put_record(1, "segments/1", b"one"), &first_payload)
             .unwrap();
         let second = journal
             .prepare_metadata(delete_record(2, "obsolete"))
             .unwrap();
         let third = journal
-            .prepare_verified_put(
-                put_record(3, "segments/3", third_payload.bytes()),
-                &third_payload,
-            )
+            .prepare_verified_put(put_record(3, "segments/3", b"three"), &third_payload)
             .unwrap();
 
         let committed = journal.publish_batch(vec![first, second, third]).unwrap();
@@ -4076,6 +4153,55 @@ mod tests {
             );
         }
         assert_eq!(journal.progress().unwrap().local_seq, 8);
+    }
+
+    #[tokio::test]
+    async fn verified_blob_stream_reads_only_its_container_slice_in_bounded_chunks() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = open_temp_journal(&temp, "bucket-a");
+        let committed = journal
+            .publish_batch(prepare_puts(&journal, 1..=2))
+            .unwrap();
+        let second = format!("payload-{}", 2).into_bytes();
+        let blob = journal.open_verified_blob(2).unwrap();
+        let mut stream = blob.range_stream(0..blob.len(), 3).unwrap();
+        let mut chunks = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            chunks.push(chunk.unwrap());
+        }
+        assert!(chunks.iter().all(|chunk| chunk.len() <= 3));
+        assert_eq!(chunks.concat(), second);
+
+        let first_ref = super::BlobRef::parse(committed[0].blob_path().unwrap()).unwrap();
+        let first_slice = first_ref.slice.unwrap();
+        let container = journal.root().join(first_ref.relative);
+        let file = fs::OpenOptions::new().write(true).open(container).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileExt;
+            file.write_at(b"X", first_slice.offset).unwrap();
+        }
+        #[cfg(not(unix))]
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut file = file;
+            file.seek(SeekFrom::Start(first_slice.offset)).unwrap();
+            file.write_all(b"X").unwrap();
+        }
+        assert_eq!(journal.read_blob(2).unwrap(), second);
+        assert!(journal.open_verified_blob(1).is_err());
+    }
+
+    #[tokio::test]
+    async fn verified_blob_stream_verifies_zero_length_payload() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = open_temp_journal(&temp, "bucket-a");
+        journal
+            .commit_put(put_record(1, "segments/empty", b""), b"")
+            .unwrap();
+        let blob = journal.open_verified_blob(1).unwrap();
+        assert_eq!(blob.len(), 0);
+        assert!(blob.range_stream(0..0, 3).unwrap().next().await.is_none());
     }
 
     /// Metadata-only records carry no payload, so a batch mixing them with

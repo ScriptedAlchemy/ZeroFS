@@ -25,7 +25,7 @@ pub enum VisibleVersion {
 
 #[derive(Clone)]
 enum PayloadLocation {
-    Memory(Bytes),
+    Pending(VerifiedPayload),
     Journal {
         journal: Arc<Journal>,
         sequence: Sequence,
@@ -52,6 +52,7 @@ struct OverlayState {
 }
 
 const BLOB_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
+const BLOB_CACHE_INLINE_MAX_BYTES: u64 = 1024 * 1024;
 
 /// Bounded cache of fully verified spilled blobs. A journal blob is read and
 /// SHA-256-verified as a whole, so without this every ranged read of the same
@@ -187,7 +188,7 @@ impl OverlayIndex {
         self.install(
             record,
             OverlayEffect::Put,
-            Some(PayloadLocation::Memory(payload.into_bytes())),
+            Some(PayloadLocation::Pending(payload)),
         )
         .await
     }
@@ -216,7 +217,7 @@ impl OverlayIndex {
         self.install(
             record,
             OverlayEffect::Put,
-            Some(PayloadLocation::Memory(payload.into_bytes())),
+            Some(PayloadLocation::Pending(payload)),
         )
         .await
     }
@@ -247,7 +248,7 @@ impl OverlayIndex {
             target,
             record.clone(),
             OverlayEffect::Put,
-            Some(PayloadLocation::Memory(payload.into_bytes())),
+            Some(PayloadLocation::Pending(payload)),
         )?;
         if let Err(error) = install_locked(
             &mut state,
@@ -426,15 +427,51 @@ impl OverlayIndex {
                 .map_err(|source| generic_error(format!("invalid get range: {source}")))?,
             None => 0..meta.size,
         };
-        let body = if options.head {
-            Bytes::new()
+        let payload = if options.head {
+            GetResultPayload::Stream(stream::once(async { Ok(Bytes::new()) }).boxed())
+        } else if let PayloadLocation::Pending(verified) = &payload {
+            let byte_range = range.start as usize..range.end as usize;
+            if let Some(body) = verified.memory_range(byte_range) {
+                GetResultPayload::Stream(stream::once(async move { Ok(body) }).boxed())
+            } else {
+                let stream = verified
+                    .staged_range(range.clone())
+                    .ok_or_else(|| {
+                        generic_error("pending payload source is unavailable".to_owned())
+                    })?
+                    .map_err(|error| {
+                        generic_error(format!("staged payload range read failed: {error}"))
+                    })
+                    .boxed();
+                GetResultPayload::Stream(stream)
+            }
+        } else if matches!(payload, PayloadLocation::Journal { .. })
+            && meta.size > BLOB_CACHE_INLINE_MAX_BYTES
+        {
+            let PayloadLocation::Journal { journal, sequence } = payload else {
+                unreachable!("journal payload was matched above")
+            };
+            let blob = tokio::task::spawn_blocking(move || journal.open_verified_blob(sequence))
+                .await
+                .map_err(|error| generic_error(format!("journal open task failed: {error}")))?
+                .map_err(|error| generic_error(format!("journal blob open failed: {error:#}")))?;
+            let stream = blob
+                .range_stream(range.clone(), 1024 * 1024)
+                .map_err(|error| generic_error(format!("journal blob range failed: {error:#}")))?
+                .map_err(|error| {
+                    generic_error(format!("journal blob range read failed: {error:#}"))
+                })
+                .boxed();
+            GetResultPayload::Stream(stream)
         } else {
-            self.load_payload(payload)
+            let body = self
+                .load_payload(payload)
                 .await?
-                .slice(range.start as usize..range.end as usize)
+                .slice(range.start as usize..range.end as usize);
+            GetResultPayload::Stream(stream::once(async move { Ok(body) }).boxed())
         };
         Ok(GetResult {
-            payload: GetResultPayload::Stream(stream::once(async move { Ok(body) }).boxed()),
+            payload,
             meta,
             range,
             attributes: Attributes::new(),
@@ -504,7 +541,11 @@ impl OverlayIndex {
 
     async fn load_payload(&self, payload: PayloadLocation) -> object_store::Result<Bytes> {
         match payload {
-            PayloadLocation::Memory(bytes) => Ok(bytes),
+            PayloadLocation::Pending(payload) => payload
+                .memory_range(0..payload.byte_len() as usize)
+                .ok_or_else(|| {
+                    generic_error("staged payload requires ranged file access".to_owned())
+                }),
             PayloadLocation::Journal { journal, sequence } => {
                 if let Some(bytes) = self.blob_cache().get(sequence) {
                     return Ok(bytes);
@@ -664,6 +705,7 @@ mod tests {
     use super::{OverlayIndex, VisibleVersion};
     use crate::writeback::journal::Journal;
     use crate::writeback::model::{FenceClass, JournalIdentity, MutationMode, MutationRecord};
+    use crate::writeback::payload::VerifiedPayload;
     use async_trait::async_trait;
     use bytes::Bytes;
     use futures::{StreamExt, stream::BoxStream};
@@ -1007,6 +1049,69 @@ mod tests {
                 .is_err()
         );
         assert_eq!(overlay.head(&Path::from("object")).await.unwrap().size, 10);
+    }
+
+    #[tokio::test]
+    async fn staged_pending_payload_serves_ranges_until_local_publication() {
+        let temp = tempfile::tempdir().unwrap();
+        let staged = temp.path().join("payload.staged");
+        std::fs::write(&staged, b"0123456789").unwrap();
+        let payload = VerifiedPayload::from_staged_file(staged.clone(), 10).unwrap();
+        let record = put_record(1, "staged-object", b"0123456789");
+        let overlay = OverlayIndex::new(remote_with(&[]).await);
+        overlay
+            .install_verified_memory(record.clone(), payload)
+            .await
+            .unwrap();
+
+        let ranged = overlay
+            .get_opts(
+                &Path::from("staged-object"),
+                GetOptions {
+                    range: Some(GetRange::Bounded(2..6)),
+                    ..GetOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(ranged.bytes().await.unwrap(), Bytes::from_static(b"2345"));
+        let suffix = overlay
+            .get_opts(
+                &Path::from("staged-object"),
+                GetOptions {
+                    range: Some(GetRange::Suffix(3)),
+                    ..GetOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(suffix.bytes().await.unwrap(), Bytes::from_static(b"789"));
+        assert_eq!(
+            overlay
+                .head(&Path::from("staged-object"))
+                .await
+                .unwrap()
+                .size,
+            10
+        );
+
+        let journal = test_journal(&temp.path().join("journal"));
+        let committed = journal.commit_put(record, b"0123456789").unwrap();
+        overlay
+            .mark_local(committed.sequence, journal)
+            .await
+            .unwrap();
+        std::fs::remove_file(staged).unwrap();
+        assert_eq!(
+            overlay
+                .get(&Path::from("staged-object"))
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap(),
+            Bytes::from_static(b"0123456789")
+        );
     }
 
     #[tokio::test]

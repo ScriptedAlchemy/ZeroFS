@@ -21,6 +21,7 @@ pub mod config;
 pub mod journal;
 pub mod journaler;
 pub mod model;
+pub(crate) mod multipart_reservation;
 pub mod overlay;
 pub(crate) mod pacing;
 mod payload;

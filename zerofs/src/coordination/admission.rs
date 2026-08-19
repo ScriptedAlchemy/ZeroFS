@@ -348,6 +348,61 @@ impl Admission {
     pub fn close(&self) {
         terminate(&self.inner, AdmissionError::Closed);
     }
+
+    /// Merge already-charged multipart shares without releasing, refitting,
+    /// or reacquiring RAM capacity.
+    pub(crate) fn merge_accepted(
+        &self,
+        mut shares: Vec<AcceptedAdmission>,
+    ) -> Result<AcceptedAdmission, AdmissionError> {
+        if shares.is_empty() {
+            return Err(AdmissionError::InvalidConfiguration(
+                "multipart RAM promotion requires at least one share",
+            ));
+        }
+        if shares
+            .iter()
+            .any(|share| !share.0.active || !Arc::ptr_eq(&share.0.inner, &self.inner))
+        {
+            return Err(AdmissionError::InvalidConfiguration(
+                "multipart RAM shares must belong to one admission gate",
+            ));
+        }
+        let Some(bytes) = shares
+            .iter()
+            .try_fold(0_u64, |total, share| total.checked_add(share.bytes()))
+        else {
+            let error =
+                AdmissionError::Poisoned("multipart RAM promotion byte overflow".to_owned());
+            terminate(&self.inner, error.clone());
+            return Err(error);
+        };
+        let accounting_mismatch = {
+            let mut state = lock(&self.inner.state);
+            if let Some(error) = &state.terminal {
+                return Err(error.clone());
+            }
+            if state.used < bytes || state.extra.used_operations < shares.len() as u64 {
+                true
+            } else {
+                state.extra.used_operations -= shares.len() as u64 - 1;
+                for share in &mut shares {
+                    share.0.active = false;
+                }
+                false
+            }
+        };
+        if accounting_mismatch {
+            let error =
+                AdmissionError::Poisoned("multipart RAM promotion accounting mismatch".to_owned());
+            terminate(&self.inner, error.clone());
+            return Err(error);
+        }
+        Ok(AcceptedAdmission(AdmissionPermit::new(
+            Arc::clone(&self.inner),
+            bytes,
+        )))
+    }
 }
 
 impl AdmissionPermit {
