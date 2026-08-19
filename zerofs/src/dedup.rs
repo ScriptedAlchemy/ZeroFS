@@ -271,6 +271,29 @@ struct TimedResult {
     expires_at: Instant,
     /// Active replay guards that extend this result past expiry.
     replay_pins: usize,
+    write_request: Option<WriteRequestReplay>,
+    /// An early volatile ACK published this result, but canonical apply has
+    /// not completed yet. Expiry cannot remove the result in this state: the
+    /// materializer must finish the original absolute replay window rather
+    /// than allowing a second operation to reuse the ID mid-apply.
+    materialization_pending: bool,
+    /// A failed materialization retracts the optimistic result immediately.
+    /// The entry remains only while already-issued replay guards are pinned,
+    /// so their drops can balance the replay-pin counters.
+    retracted: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct WriteRequestReplay {
+    fingerprint: [u8; 32],
+    count: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WriteReplay {
+    Match { count: u32 },
+    FingerprintMismatch,
+    Legacy,
 }
 
 struct InodeProtection {
@@ -280,8 +303,13 @@ struct InodeProtection {
 }
 
 enum OpState {
-    Applying(Arc<Notify>),
+    Applying(ApplyingState),
     Complete(TimedResult),
+}
+
+struct ApplyingState {
+    notify: Arc<Notify>,
+    owners: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -304,6 +332,24 @@ enum Admission {
 }
 
 impl Inner {
+    fn release_applying_owner(&mut self, op_id: &OpId, claim: &Arc<Notify>) {
+        let remove = match self.entries.get_mut(op_id) {
+            Some(OpState::Applying(applying)) if Arc::ptr_eq(&applying.notify, claim) => {
+                debug_assert!(applying.owners != 0);
+                applying.owners -= 1;
+                applying.owners == 0
+            }
+            _ => false,
+        };
+        if remove {
+            let Some(OpState::Applying(applying)) = self.entries.remove(op_id) else {
+                unreachable!("checked applying state disappeared under one lock")
+            };
+            self.inflight_ids -= 1;
+            applying.notify.notify_waiters();
+        }
+    }
+
     fn protect_result_inode(&mut self, result: &DedupResult, expires_at: Instant) {
         if let Some(inode_id) = result.replay_inode() {
             let protection = self
@@ -344,7 +390,9 @@ impl Inner {
         let removable = matches!(
             self.entries.get(op_id),
             Some(OpState::Complete(entry))
-                if entry.expires_at <= now && entry.replay_pins == 0
+                if entry.expires_at <= now
+                    && entry.replay_pins == 0
+                    && !entry.materialization_pending
         );
         if removable {
             self.remove_result(op_id)
@@ -468,7 +516,9 @@ impl DedupCache {
             let removable = matches!(
                 inner.entries.get(&expiry.op_id),
                 Some(OpState::Complete(entry))
-                    if entry.expires_at == expiry.expires_at && entry.replay_pins == 0
+                    if entry.expires_at == expiry.expires_at
+                        && entry.replay_pins == 0
+                        && !entry.materialization_pending
             );
             if removable {
                 reclaim.extend(inner.remove_result(&expiry.op_id));
@@ -509,6 +559,9 @@ impl DedupCache {
 
         match inner.entries.get_mut(&op_id) {
             Some(OpState::Complete(result)) => {
+                if result.retracted {
+                    return Admission::UnseenRetry;
+                }
                 if result.expires_at <= now {
                     return Admission::UnseenRetry;
                 }
@@ -523,9 +576,9 @@ impl DedupCache {
                     cache: Arc::clone(self),
                 });
             }
-            Some(OpState::Applying(notify)) => {
+            Some(OpState::Applying(applying)) => {
                 // Register under the state lock to avoid a lost notification.
-                let mut notified = Box::pin(Arc::clone(notify).notified_owned());
+                let mut notified = Box::pin(Arc::clone(&applying.notify).notified_owned());
                 notified.as_mut().enable();
                 return Admission::InFlight(notified);
             }
@@ -544,9 +597,13 @@ impl DedupCache {
         }
 
         let claim = Arc::new(Notify::new());
-        inner
-            .entries
-            .insert(op_id, OpState::Applying(Arc::clone(&claim)));
+        inner.entries.insert(
+            op_id,
+            OpState::Applying(ApplyingState {
+                notify: Arc::clone(&claim),
+                owners: 1,
+            }),
+        );
         inner.inflight_ids += 1;
         Admission::Admitted(DedupGuard {
             op_id,
@@ -628,6 +685,89 @@ impl DedupCache {
     /// Publish a committed entry and return its retention deadline.
     /// Duplicate publication does not extend the original deadline.
     pub(crate) fn record_entry_with_expiry(&self, entry: DedupEntry) -> Option<Instant> {
+        self.record_entry_with_write_request(entry, None, false)
+    }
+
+    pub(crate) fn record_accepted_write_entry(
+        &self,
+        entry: DedupEntry,
+        fingerprint: [u8; 32],
+        count: u32,
+    ) -> Option<Instant> {
+        self.record_entry_with_write_request(
+            entry,
+            Some(WriteRequestReplay { fingerprint, count }),
+            true,
+        )
+    }
+
+    pub(crate) fn begin_accepted_write(
+        self: &Arc<Self>,
+        entry: DedupEntry,
+        fingerprint: [u8; 32],
+        count: u32,
+    ) -> AcceptedWriteLifecycle {
+        let op_id = entry.op_id;
+        self.record_accepted_write_entry(entry, fingerprint, count);
+        AcceptedWriteLifecycle {
+            cache: Arc::clone(self),
+            op_id,
+            finished: false,
+        }
+    }
+
+    pub(crate) fn record_materialized_write_entry(
+        &self,
+        entry: DedupEntry,
+        fingerprint: [u8; 32],
+        count: u32,
+    ) -> Option<Instant> {
+        self.record_entry_with_write_request(
+            entry,
+            Some(WriteRequestReplay { fingerprint, count }),
+            false,
+        )
+    }
+
+    pub(crate) fn stage_write_request(
+        self: &Arc<Self>,
+        op_id: OpId,
+        fingerprint: [u8; 32],
+        count: u32,
+    ) -> PendingWriteRequest {
+        let claim = {
+            let mut inner = self.inner.lock().unwrap();
+            match inner.entries.get_mut(&op_id) {
+                Some(OpState::Applying(applying)) => {
+                    applying.owners += 1;
+                    Some(Arc::clone(&applying.notify))
+                }
+                _ => None,
+            }
+        };
+        PendingWriteRequest {
+            cache: Arc::clone(self),
+            op_id,
+            request: WriteRequestReplay { fingerprint, count },
+            claim,
+        }
+    }
+
+    pub(crate) fn record_entry_with_pending_write(
+        &self,
+        entry: DedupEntry,
+        pending: PendingWriteRequest,
+    ) -> Option<Instant> {
+        debug_assert_eq!(entry.op_id, pending.op_id);
+        self.record_entry_with_write_request(entry, Some(pending.request), false)
+    }
+
+    fn record_entry_with_write_request(
+        &self,
+        entry: DedupEntry,
+        write_request: Option<WriteRequestReplay>,
+        materialization_pending: bool,
+    ) -> Option<Instant> {
         let DedupEntry { op_id, result } = entry;
         if !has_op_id(&op_id) {
             return None;
@@ -636,7 +776,10 @@ impl DedupCache {
         let now = (self.now)();
         let reclaim = inner.remove_target_if_expired_and_unpinned(&op_id, now);
         self.notify_reclaim(reclaim);
-        if let Some(OpState::Complete(existing)) = inner.entries.get(&op_id) {
+        if let Some(OpState::Complete(existing)) = inner.entries.get_mut(&op_id) {
+            if existing.write_request.is_none() {
+                existing.write_request = write_request;
+            }
             return Some(existing.expires_at);
         }
 
@@ -648,16 +791,94 @@ impl DedupCache {
                 value: result,
                 expires_at,
                 replay_pins: 0,
+                write_request,
+                materialization_pending,
+                retracted: false,
             }),
         );
         self.expiry_tx
             .send(ScheduledExpiry { op_id, expires_at })
             .expect("dedup expiry receiver must live as long as its cache");
-        if let Some(OpState::Applying(notify)) = previous {
+        if let Some(OpState::Applying(applying)) = previous {
             inner.inflight_ids -= 1;
-            notify.notify_waiters();
+            applying.notify.notify_waiters();
         }
         Some(expires_at)
+    }
+
+    /// Finish an early volatile write result without extending its original
+    /// replay deadline. A failed materialization retracts the optimistic
+    /// in-memory result; a successful one makes the original deadline
+    /// collectible immediately if it elapsed while apply was blocked.
+    pub(crate) fn finish_accepted_write(&self, op_id: &OpId, materialized: bool) {
+        if !has_op_id(op_id) {
+            return;
+        }
+        let now = (self.now)();
+        let mut inner = self.inner.lock().unwrap();
+        let pending = matches!(
+            inner.entries.get(op_id),
+            Some(OpState::Complete(entry)) if entry.materialization_pending
+        );
+        if !pending {
+            return;
+        }
+        if !materialized {
+            let remove = if let Some(OpState::Complete(entry)) = inner.entries.get_mut(op_id) {
+                entry.materialization_pending = false;
+                entry.retracted = true;
+                entry.expires_at = now;
+                entry.replay_pins == 0
+            } else {
+                false
+            };
+            let reclaim = remove.then(|| inner.remove_result(op_id)).flatten();
+            drop(inner);
+            self.notify_reclaim(reclaim);
+            return;
+        }
+        let remove = if let Some(OpState::Complete(entry)) = inner.entries.get_mut(op_id) {
+            entry.materialization_pending = false;
+            entry.expires_at <= now && entry.replay_pins == 0
+        } else {
+            false
+        };
+        let reclaim = remove.then(|| inner.remove_result(op_id)).flatten();
+        drop(inner);
+        self.notify_reclaim(reclaim);
+    }
+
+    pub(crate) fn replay_write(&self, op_id: &OpId, fingerprint: [u8; 32]) -> Option<WriteReplay> {
+        if !has_op_id(op_id) {
+            return None;
+        }
+        let mut inner = self.inner.lock().unwrap();
+        let reclaim = inner.remove_target_if_expired_and_unpinned(op_id, (self.now)());
+        self.notify_reclaim(reclaim);
+        let OpState::Complete(entry) = inner.entries.get(op_id)? else {
+            return None;
+        };
+        if entry.retracted {
+            return None;
+        }
+        if !matches!(entry.value, DedupResult::Write { .. }) {
+            return None;
+        }
+        Some(match entry.write_request {
+            Some(request) if request.fingerprint == fingerprint => WriteReplay::Match {
+                count: request.count,
+            },
+            Some(_) => WriteReplay::FingerprintMismatch,
+            None => WriteReplay::Legacy,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn accepted_write_pending(&self, op_id: &OpId) -> bool {
+        matches!(
+            self.inner.lock().unwrap().entries.get(op_id),
+            Some(OpState::Complete(entry)) if entry.materialization_pending
+        )
     }
 
     pub fn record_entry(&self, entry: DedupEntry) {
@@ -752,20 +973,60 @@ pub struct DedupGuard {
     cache: Arc<DedupCache>,
 }
 
+pub(crate) struct PendingWriteRequest {
+    cache: Arc<DedupCache>,
+    op_id: OpId,
+    request: WriteRequestReplay,
+    claim: Option<Arc<Notify>>,
+}
+
+impl PendingWriteRequest {
+    pub(crate) fn op_id(&self) -> OpId {
+        self.op_id
+    }
+}
+
+impl Drop for PendingWriteRequest {
+    fn drop(&mut self) {
+        let Some(claim) = &self.claim else {
+            return;
+        };
+        self.cache
+            .inner
+            .lock()
+            .unwrap()
+            .release_applying_owner(&self.op_id, claim);
+    }
+}
+
+pub(crate) struct AcceptedWriteLifecycle {
+    cache: Arc<DedupCache>,
+    op_id: OpId,
+    finished: bool,
+}
+
+impl AcceptedWriteLifecycle {
+    pub(crate) fn finish(mut self, materialized: bool) {
+        self.cache.finish_accepted_write(&self.op_id, materialized);
+        self.finished = true;
+    }
+}
+
+impl Drop for AcceptedWriteLifecycle {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.cache.finish_accepted_write(&self.op_id, false);
+        }
+    }
+}
+
 impl Drop for DedupGuard {
     fn drop(&mut self) {
         let now = (self.cache.now)();
         let mut inner = self.cache.inner.lock().unwrap();
         let mut reclaim = None;
         if let Some(claim) = &self.claim {
-            let owns_claim = inner.entries.get(&self.op_id).is_some_and(
-                |state| matches!(state, OpState::Applying(current) if Arc::ptr_eq(current, claim)),
-            );
-            if owns_claim && let Some(OpState::Applying(notify)) = inner.entries.remove(&self.op_id)
-            {
-                inner.inflight_ids -= 1;
-                notify.notify_waiters();
-            }
+            inner.release_applying_owner(&self.op_id, claim);
         } else {
             let (last_pin, remove_expired) = match inner.entries.get_mut(&self.op_id) {
                 Some(OpState::Complete(result)) if result.replay_pins != 0 => {
@@ -880,6 +1141,136 @@ mod tests {
             "a seen op returns its cached result"
         );
         assert!(cache.get(&id(2)).is_none());
+    }
+
+    #[test]
+    fn write_replay_metadata_matches_collisions_and_expires_with_one_deadline() {
+        let (cache, clock) = manual_cache();
+        cache.record_materialized_write_entry(
+            DedupEntry {
+                op_id: id(1),
+                result: DedupResult::Write {
+                    attrs: FileAttributes::default(),
+                },
+            },
+            [7; 32],
+            19,
+        );
+        assert_eq!(
+            cache.replay_write(&id(1), [7; 32]),
+            Some(WriteReplay::Match { count: 19 })
+        );
+        assert_eq!(
+            cache.replay_write(&id(1), [8; 32]),
+            Some(WriteReplay::FingerprintMismatch)
+        );
+
+        clock.store(10, Ordering::SeqCst);
+        assert_eq!(cache.replay_write(&id(1), [7; 32]), None);
+        assert_stats(&cache, (0, 0, 0));
+    }
+
+    #[test]
+    fn accepted_write_keeps_one_absolute_deadline_while_materialization_is_blocked() {
+        let (cache, clock) = manual_cache();
+        let op_id = id(1);
+        let entry = DedupEntry {
+            op_id,
+            result: DedupResult::Write {
+                attrs: FileAttributes::default(),
+            },
+        };
+        let deadline = cache
+            .record_accepted_write_entry(entry.clone(), [7; 32], 19)
+            .unwrap();
+
+        clock.store(10, Ordering::SeqCst);
+        assert_eq!(
+            cache.replay_write(&op_id, [7; 32]),
+            Some(WriteReplay::Match { count: 19 })
+        );
+        assert_eq!(cache.record_entry_with_expiry(entry), Some(deadline));
+        assert_eq!(
+            cache.replay_write(&op_id, [7; 32]),
+            Some(WriteReplay::Match { count: 19 })
+        );
+
+        cache.finish_accepted_write(&op_id, true);
+        assert_eq!(cache.replay_write(&op_id, [7; 32]), None);
+        assert_stats(&cache, (0, 0, 0));
+    }
+
+    #[test]
+    fn failed_accepted_write_retracts_optimistic_replay_result() {
+        let (cache, _) = manual_cache();
+        let op_id = id(1);
+        cache.record_accepted_write_entry(
+            DedupEntry {
+                op_id,
+                result: DedupResult::Write {
+                    attrs: FileAttributes::default(),
+                },
+            },
+            [7; 32],
+            19,
+        );
+        cache.finish_accepted_write(&op_id, false);
+        assert_eq!(cache.replay_write(&op_id, [7; 32]), None);
+        assert_stats(&cache, (0, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn failed_accepted_write_balances_an_existing_replay_pin() {
+        let (cache, _) = manual_cache();
+        let op_id = id(1);
+        cache.record_accepted_write_entry(
+            DedupEntry {
+                op_id,
+                result: DedupResult::Write {
+                    attrs: FileAttributes::default(),
+                },
+            },
+            [7; 32],
+            19,
+        );
+        let replay_guard = cache.begin(op_id, false).await.unwrap().unwrap();
+        assert_stats(&cache, (1, 0, 1));
+
+        cache.finish_accepted_write(&op_id, false);
+        assert_eq!(cache.replay_write(&op_id, [7; 32]), None);
+        assert_stats(&cache, (1, 0, 1));
+
+        drop(replay_guard);
+        assert_stats(&cache, (0, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn staged_write_metadata_is_atomic_with_complete_publication() {
+        let (cache, _) = manual_cache();
+        let op_id = id(1);
+        let initial = cache.begin(op_id, false).await.unwrap().unwrap();
+        let pending = cache.stage_write_request(op_id, [7; 32], 19);
+        drop(initial);
+        assert_stats(&cache, (0, 1, 0));
+
+        cache.record_entry_with_pending_write(
+            DedupEntry {
+                op_id,
+                result: DedupResult::Write {
+                    attrs: FileAttributes::default(),
+                },
+            },
+            pending,
+        );
+
+        assert_eq!(
+            cache.replay_write(&op_id, [7; 32]),
+            Some(WriteReplay::Match { count: 19 })
+        );
+        assert_eq!(
+            cache.replay_write(&op_id, [8; 32]),
+            Some(WriteReplay::FingerprintMismatch)
+        );
     }
 
     #[test]

@@ -57,6 +57,11 @@ pub(crate) struct PreparedWriteBatch {
     pub(crate) members: Vec<PreparedWriteMember>,
     pub(crate) replayed: Option<PreparedBatchResult>,
     pub(crate) guards: Option<MultiLockGuard<InodeId>>,
+    /// Protocol replay metadata staged before canonical application. Once the
+    /// transaction is queued, ownership moves into the commit worker so
+    /// canceling the caller cannot erase metadata for a commit that still
+    /// completes.
+    pub(crate) pending_write_request: Option<crate::dedup::PendingWriteRequest>,
 }
 
 /// One result boundary for the whole batch.
@@ -74,6 +79,7 @@ impl PreparedWriteBatch {
             members: Vec::new(),
             replayed: Some(result),
             guards: None,
+            pending_write_request: None,
         }
     }
 
@@ -104,7 +110,7 @@ impl PreparedBatchResult {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum RequestIdentity {
     NineP {
-        session_incarnation: u64,
+        origin_epoch: u64,
         operation_id: crate::dedup::OpId,
     },
     Nfs {
@@ -141,6 +147,10 @@ impl RequestFingerprint {
 
     pub(crate) fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)
+    }
+
+    pub(crate) fn into_bytes(self) -> [u8; 32] {
+        self.0
     }
 }
 

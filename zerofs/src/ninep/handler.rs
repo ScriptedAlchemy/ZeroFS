@@ -4,6 +4,8 @@ use super::lock_manager::{FileLock, FileLockManager, LockGuard};
 use crate::failpoints as fp;
 use crate::fs::errors::FsError;
 use crate::fs::inode::{Inode, InodeAttrs, InodeId, MAX_DEVICE_MAJOR, MAX_DEVICE_MINOR};
+use crate::fs::mutation::overlay::IdentifiedWrite;
+use crate::fs::mutation::types::{RequestIdentity, RequestLifetime};
 use crate::fs::permissions::{AccessMode, Credentials, check_access};
 use crate::fs::tracing::FileOperation;
 use crate::fs::types::{
@@ -20,6 +22,52 @@ use std::collections::hash_map::Entry;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use tracing::debug;
+
+#[cfg(test)]
+struct SuccessTerminalPause {
+    reached: tokio::sync::oneshot::Sender<()>,
+    resume: tokio::sync::oneshot::Receiver<()>,
+}
+
+#[cfg(test)]
+static SUCCESS_TERMINAL_PAUSES: std::sync::LazyLock<
+    Mutex<HashMap<crate::dedup::OpId, SuccessTerminalPause>>,
+> = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+pub(super) fn pause_success_terminal_dedup(
+    op_id: crate::dedup::OpId,
+) -> (
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let (reached, reached_rx) = tokio::sync::oneshot::channel();
+    let (resume, resume_rx) = tokio::sync::oneshot::channel();
+    let previous = SUCCESS_TERMINAL_PAUSES
+        .lock()
+        .expect("success terminal pause registry poisoned")
+        .insert(
+            op_id,
+            SuccessTerminalPause {
+                reached,
+                resume: resume_rx,
+            },
+        );
+    assert!(previous.is_none(), "success terminal pause already armed");
+    (reached_rx, resume)
+}
+
+#[cfg(test)]
+async fn wait_at_success_terminal_pause(op_id: crate::dedup::OpId) {
+    let pause = SUCCESS_TERMINAL_PAUSES
+        .lock()
+        .expect("success terminal pause registry poisoned")
+        .remove(&op_id);
+    if let Some(pause) = pause {
+        let _ = pause.reached.send(());
+        let _ = pause.resume.await;
+    }
+}
 
 pub const DEFAULT_MSIZE: u32 = 256 * 1024;
 
@@ -84,6 +132,25 @@ fn is_terminal_dedup_error(error: P9Error) -> bool {
                 | FsError::ShuttingDown,
         )
     )
+}
+
+/// The layer that owns the successful operation's terminal dedup result.
+/// Writes publish a typed `Write` result at their exact acceptance/commit
+/// boundary; the generic handler must never replace a retracted write with
+/// the untyped `Applied` fallback.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SuccessDedupOwner {
+    Handler,
+    Operation,
+}
+
+impl SuccessDedupOwner {
+    fn for_message(message: &Message) -> Self {
+        match message {
+            Message::Twrite(_) => Self::Operation,
+            _ => Self::Handler,
+        }
+    }
 }
 
 /// Upper bound on the number of parent-pointer hops an aname membership walk
@@ -515,6 +582,20 @@ impl NinePHandler {
         Ok(())
     }
 
+    async fn ensure_success_terminal_dedup_result(
+        &self,
+        op_id: crate::dedup::OpId,
+        owner: SuccessDedupOwner,
+    ) -> P9Result<()> {
+        match owner {
+            SuccessDedupOwner::Operation => Ok(()),
+            SuccessDedupOwner::Handler => {
+                self.ensure_terminal_dedup_result(op_id, crate::dedup::DedupResult::Applied)
+                    .await
+            }
+        }
+    }
+
     /// Returns the effective GID for a create-type operation. When a credential
     /// override is active, the server-configured GID is used instead of
     /// whatever the client sent.
@@ -712,7 +793,6 @@ impl NinePHandler {
             };
             return P9Message::new(tag, Message::Rlerror(Rlerror { ecode }));
         }
-
         // The receive path discards an epoch-zero RETRY's Twrite payload while
         // it joins the original attempt. Once admission has waited for that
         // attempt, replay the typed result without consulting the reconnecting
@@ -732,6 +812,7 @@ impl NinePHandler {
                 ),
             };
         }
+        let success_dedup_owner = SuccessDedupOwner::for_message(&msg);
         let result = match msg {
             Message::Tversion(tv) => self.version(tv).await,
             Message::Tattach(ta) => self.attach(ta).await,
@@ -739,7 +820,7 @@ impl NinePHandler {
             Message::Tlopen(tl) => self.lopen(tl).await,
             Message::Tlcreate(tc) => self.lcreate(tc, op_id).await,
             Message::Tread(tr) => self.read(tr).await,
-            Message::Twrite(tw) => self.write(tw, op_id).await,
+            Message::Twrite(tw) => self.write(tw, op_id, op_origin_epoch).await,
             Message::Tclunk(tc) => Ok(self.clunk(tc).await),
             Message::Treaddir(tr) => self.readdir(tr).await,
             Message::Tgetattr(tg) => self.getattr(tg).await,
@@ -778,13 +859,17 @@ impl NinePHandler {
 
         // Publish terminal outcomes before releasing single-flight ownership.
         let result = match result {
-            Ok(body) => match self
-                .ensure_terminal_dedup_result(op_id, crate::dedup::DedupResult::Applied)
-                .await
-            {
-                Ok(()) => Ok(body),
-                Err(error) => Err(error),
-            },
+            Ok(body) => {
+                #[cfg(test)]
+                wait_at_success_terminal_pause(op_id).await;
+                match self
+                    .ensure_success_terminal_dedup_result(op_id, success_dedup_owner)
+                    .await
+                {
+                    Ok(()) => Ok(body),
+                    Err(error) => Err(error),
+                }
+            }
             Err(error)
                 if self.filesystem.db.permits_successful_response()
                     && is_terminal_dedup_error(error) =>
@@ -1748,7 +1833,12 @@ impl NinePHandler {
         }))
     }
 
-    async fn write(&self, tw: Twrite, op_id: crate::dedup::OpId) -> P9Result<Message> {
+    async fn write(
+        &self,
+        tw: Twrite,
+        op_id: crate::dedup::OpId,
+        op_origin_epoch: u64,
+    ) -> P9Result<Message> {
         let fid_entry = self.get_fid(tw.fid)?;
 
         if !fid_allows_write(&fid_entry) {
@@ -1766,20 +1856,70 @@ impl NinePHandler {
         );
 
         let auth = AuthContext::from(&fid_entry.creds);
-        let data_len = tw.data.len();
+        let data_len = u32::try_from(tw.data.len()).map_err(|_| P9Error::InvalidArgument)?;
         let data = Bytes::from(tw.data);
-
-        self.filesystem
-            .write_ack_opened_idempotent(&auth, fid_entry.inode_id, tw.offset, &data, op_id)
+        let fingerprint = crate::fs::mutation::overlay_helpers::direct_write_fingerprint(
+            &auth,
+            fid_entry.inode_id,
+            tw.offset,
+            &data,
+            op_id,
+            false,
+            b"9p-twrite-opened",
+        );
+        match self
+            .filesystem
+            .dedup
+            .replay_write(&op_id, fingerprint.into_bytes())
+        {
+            Some(crate::dedup::WriteReplay::Match { count }) => {
+                return Ok(Message::Rwrite(Rwrite { count }));
+            }
+            Some(crate::dedup::WriteReplay::FingerprintMismatch) => {
+                return Err(P9Error::InvalidArgument);
+            }
+            Some(crate::dedup::WriteReplay::Legacy) => {
+                return Ok(Message::Rwrite(Rwrite { count: data_len }));
+            }
+            None => {}
+        }
+        let (identity, request_lifetime) = if crate::dedup::has_op_id(&op_id) {
+            (
+                RequestIdentity::NineP {
+                    origin_epoch: op_origin_epoch,
+                    operation_id: op_id,
+                },
+                RequestLifetime::InFlightOnly,
+            )
+        } else {
+            (
+                RequestIdentity::DirectOneShot(uuid::Uuid::new_v4()),
+                RequestLifetime::OneShot,
+            )
+        };
+        let _receipt = self
+            .filesystem
+            .write_ack_identified(IdentifiedWrite {
+                auth: &auth,
+                id: fid_entry.inode_id,
+                offset: tw.offset,
+                data: &data,
+                op_id,
+                check_permissions: false,
+                identity,
+                // The protocol ledger owns completed replay metadata. This
+                // cache joins only concurrent work, so completed writes do not
+                // consume live mutation-admission slots.
+                request_lifetime,
+                fingerprint_context: b"9p-twrite-opened",
+            })
             .await
             .inspect_err(|&e| {
                 debug!("write: failed with error: {:?}", e);
             })?;
 
         debug!("write: succeeded");
-        Ok(Message::Rwrite(Rwrite {
-            count: data_len as u32,
-        }))
+        Ok(Message::Rwrite(Rwrite { count: data_len }))
     }
 
     async fn getattr(&self, tg: Tgetattr) -> P9Result<Message> {

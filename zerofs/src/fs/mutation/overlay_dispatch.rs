@@ -14,6 +14,7 @@ use tokio_util::sync::CancellationToken;
 pub(crate) struct PendingDispatch {
     remaining_members: AtomicUsize,
     accepted: Mutex<Option<oneshot::Receiver<AcceptedMutation>>>,
+    accepted_write: Mutex<Option<crate::dedup::AcceptedWriteLifecycle>>,
     result: Mutex<Option<OverlayResult<()>>>,
     changed: Notify,
     cancelled: CancellationToken,
@@ -62,6 +63,7 @@ impl PendingDispatch {
         Arc::new(Self {
             remaining_members: AtomicUsize::new(member_count),
             accepted: Mutex::new(Some(accepted)),
+            accepted_write: Mutex::new(None),
             result: Mutex::new(None),
             changed: Notify::new(),
             cancelled: CancellationToken::new(),
@@ -98,7 +100,23 @@ impl PendingDispatch {
             .lock()
             .expect("pending dispatch poisoned")
             .take();
+        self.accepted_write
+            .lock()
+            .expect("pending dispatch poisoned")
+            .take();
         self.set_result(Ok(()));
+    }
+
+    pub(crate) fn install_accepted_write(
+        &self,
+        accepted_write: crate::dedup::AcceptedWriteLifecycle,
+    ) {
+        let previous = self
+            .accepted_write
+            .lock()
+            .expect("pending dispatch poisoned")
+            .replace(accepted_write);
+        debug_assert!(previous.is_none());
     }
 
     fn set_result(&self, result: OverlayResult<()>) {
@@ -123,6 +141,11 @@ impl PendingDispatch {
             accepted = receiver => accepted.map_err(|_| OverlayError::IoError)?,
         };
         let (request, batch, raw_permit, cutoff) = accepted.into_parts();
+        let accepted_write = self
+            .accepted_write
+            .lock()
+            .expect("pending dispatch poisoned")
+            .take();
         let reply = prepared_batch_result(&batch).with_cutoff(cutoff);
         let coordinator = fs
             .mutation_coordinator
@@ -133,9 +156,14 @@ impl PendingDispatch {
             coordinator: Arc::clone(&coordinator),
             armed: true,
         };
-        let result = match fs.materializer.get() {
-            Some(materializer) => materializer.dispatch_through(cutoff, batch).await,
-            None => Err(MutationError::Closed),
+        let result = match (fs.materializer.get(), accepted_write) {
+            (Some(materializer), Some(accepted_write)) => {
+                materializer
+                    .dispatch_accepted_through(cutoff, batch, accepted_write)
+                    .await
+            }
+            (Some(materializer), None) => materializer.dispatch_through(cutoff, batch).await,
+            (None, _) => Err(MutationError::Closed),
         };
         coordinator.request_cache().complete(
             request,
