@@ -10,6 +10,7 @@ use metrics::{counter, gauge};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use slatedb_common::metrics::{DefaultMetricsRecorder, MetricValue};
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tokio::task::JoinHandle;
@@ -50,6 +51,29 @@ impl BenchmarkAuthority {
             export_id,
         })
     }
+
+    pub async fn load(
+        export_id: &str,
+        object_store: &Arc<dyn object_store::ObjectStore>,
+        db_path: &str,
+        invocation_id: Option<&str>,
+    ) -> anyhow::Result<Self> {
+        let filesystem_id = crate::bucket_identity::BucketIdentity::load(object_store, db_path)
+            .await?
+            .id();
+        Self::compose(export_id, filesystem_id, invocation_id)
+    }
+}
+
+pub fn systemd_invocation_id() -> anyhow::Result<Option<String>> {
+    let Some(value) = std::env::var_os("INVOCATION_ID") else {
+        return Ok(None);
+    };
+    value.into_string().map(Some).map_err(|_| {
+        anyhow::anyhow!(
+            "systemd INVOCATION_ID is not valid Unicode and cannot identify benchmark metrics"
+        )
+    })
 }
 
 /// Start the Prometheus metrics exporter.
@@ -67,11 +91,13 @@ pub struct CollectorSources {
     pub writeback: Option<WritebackObjectStore>,
 }
 
-pub fn start(
+pub async fn start(
     config: &PrometheusConfig,
     sources: CollectorSources,
+    authority: Option<BenchmarkAuthority>,
     shutdown: CancellationToken,
-) -> Vec<JoinHandle<()>> {
+) -> anyhow::Result<Vec<JoinHandle<()>>> {
+    let prepared_authority = prepare_authority_server(config, authority).await?;
     let recorder = PrometheusBuilder::new().build_recorder();
     let handle = recorder.handle();
 
@@ -79,16 +105,47 @@ pub fn start(
 
     let mut handles = Vec::new();
 
-    for &addr in &config.addresses {
-        tracing::info!(
-            "Prometheus metrics server listening on http://{}/metrics",
-            addr
-        );
-        let server_handle = handle.clone();
-        let server_shutdown = shutdown.clone();
-        handles.push(spawn_named("prometheus-http", async move {
-            serve_metrics(addr, server_handle, None, server_shutdown).await;
-        }));
+    if let Some(prepared) = prepared_authority {
+        let PreparedAuthorityServer {
+            listeners,
+            tls,
+            authority,
+        } = prepared;
+        for listener in listeners {
+            let address = listener
+                .local_addr()
+                .expect("bound benchmark authority listener has a local address");
+            tracing::info!(
+                "Benchmark authority metrics server listening on https://{}/metrics",
+                address
+            );
+            let server_handle = handle.clone();
+            let server_shutdown = shutdown.clone();
+            let server_authority = authority.clone();
+            let tls = Arc::clone(&tls);
+            handles.push(spawn_named("prometheus-https-authority", async move {
+                serve_tls_metrics(
+                    listener,
+                    server_handle,
+                    server_authority,
+                    tls,
+                    server_shutdown,
+                )
+                .await;
+            }));
+        }
+    } else {
+        for &addr in &config.addresses {
+            tracing::info!(
+                "Prometheus metrics server listening on http://{}/metrics",
+                addr
+            );
+            let server_handle = handle.clone();
+            let server_shutdown = shutdown.clone();
+            handles.push(spawn_named("prometheus-http", async move {
+                serve_metrics(addr, server_handle, None, server_shutdown).await;
+            }));
+        }
     }
 
     let CollectorSources {
@@ -142,7 +199,49 @@ pub fn start(
         }
     }));
 
-    handles
+    Ok(handles)
+}
+
+struct PreparedAuthorityServer {
+    listeners: Vec<tokio::net::TcpListener>,
+    tls: Arc<rustls::ServerConfig>,
+    authority: BenchmarkAuthority,
+}
+
+async fn prepare_authority_server(
+    config: &PrometheusConfig,
+    authority: Option<BenchmarkAuthority>,
+) -> anyhow::Result<Option<PreparedAuthorityServer>> {
+    use anyhow::Context;
+
+    let authority_config = match (&config.benchmark_authority, authority) {
+        (None, None) => return Ok(None),
+        (None, Some(_)) => {
+            anyhow::bail!(
+                "benchmark authority identity was supplied while authority mode is disabled"
+            )
+        }
+        (Some(_), None) => {
+            anyhow::bail!("benchmark authority is enabled but its identity is missing")
+        }
+        (Some(authority_config), Some(authority)) => (authority_config, authority),
+    };
+    let tls = load_tls_config(authority_config.0)?;
+    let mut listeners = Vec::with_capacity(config.addresses.len());
+    for address in &config.addresses {
+        listeners.push(
+            tokio::net::TcpListener::bind(address)
+                .await
+                .with_context(|| {
+                    format!("failed to bind benchmark authority metrics at {address}")
+                })?,
+        );
+    }
+    Ok(Some(PreparedAuthorityServer {
+        listeners,
+        tls,
+        authority: authority_config.1,
+    }))
 }
 
 type HttpResponse = hyper::Response<http_body_util::Full<bytes::Bytes>>;
@@ -191,6 +290,78 @@ fn handle_request(
         .unwrap()
 }
 
+fn load_tls_config(
+    config: &crate::config::BenchmarkAuthorityConfig,
+) -> anyhow::Result<Arc<rustls::ServerConfig>> {
+    use anyhow::Context;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+
+    fn require_regular_file(path: &Path, role: &str) -> anyhow::Result<std::fs::Metadata> {
+        let metadata = std::fs::metadata(path).with_context(|| {
+            format!(
+                "failed to read benchmark authority {role} {}",
+                path.display()
+            )
+        })?;
+        if !metadata.is_file() {
+            anyhow::bail!(
+                "benchmark authority {role} must be a regular file: {}",
+                path.display()
+            );
+        }
+        Ok(metadata)
+    }
+
+    require_regular_file(&config.tls_certificate, "TLS certificate")?;
+    let private_key_metadata = require_regular_file(&config.tls_private_key, "TLS private key")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = private_key_metadata.permissions().mode();
+        if mode & 0o077 != 0 {
+            anyhow::bail!(
+                "benchmark authority TLS private key permissions must deny group/world access: {} has mode {:04o}",
+                config.tls_private_key.display(),
+                mode & 0o7777
+            );
+        }
+    }
+
+    let certificates = CertificateDer::pem_file_iter(&config.tls_certificate)
+        .with_context(|| {
+            format!(
+                "failed to open benchmark authority TLS certificate {}",
+                config.tls_certificate.display()
+            )
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .with_context(|| {
+            format!(
+                "failed to parse benchmark authority TLS certificate chain {}",
+                config.tls_certificate.display()
+            )
+        })?;
+    if certificates.is_empty() {
+        anyhow::bail!(
+            "benchmark authority TLS certificate chain is empty: {}",
+            config.tls_certificate.display()
+        );
+    }
+    let private_key = PrivateKeyDer::from_pem_file(&config.tls_private_key).with_context(|| {
+        format!(
+            "failed to parse benchmark authority TLS private key {}",
+            config.tls_private_key.display()
+        )
+    })?;
+
+    let mut tls = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certificates, private_key)
+        .context("benchmark authority TLS private key does not match certificate chain")?;
+    tls.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(Arc::new(tls))
+}
+
 async fn serve_metrics(
     addr: SocketAddr,
     handle: PrometheusHandle,
@@ -228,6 +399,56 @@ async fn serve_metrics(
                     let _ = hyper::server::conn::http1::Builder::new()
                         .serve_connection(io, service)
                         .await;
+                });
+            }
+        }
+    }
+}
+
+async fn serve_tls_metrics(
+    listener: tokio::net::TcpListener,
+    handle: PrometheusHandle,
+    authority: BenchmarkAuthority,
+    tls: Arc<rustls::ServerConfig>,
+    shutdown: CancellationToken,
+) {
+    let acceptor = tokio_rustls::TlsAcceptor::from(tls);
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => break,
+            result = listener.accept() => {
+                let (stream, peer) = match result {
+                    Ok(connection) => connection,
+                    Err(error) => {
+                        tracing::debug!(%error, "benchmark authority metrics accept error");
+                        continue;
+                    }
+                };
+                let acceptor = acceptor.clone();
+                let handle = handle.clone();
+                let authority = authority.clone();
+                tokio::spawn(async move {
+                    let stream = match acceptor.accept(stream).await {
+                        Ok(stream) => stream,
+                        Err(error) => {
+                            tracing::debug!(%peer, %error, "benchmark authority TLS handshake failed");
+                            return;
+                        }
+                    };
+                    let service = hyper::service::service_fn(move |request| {
+                        std::future::ready(Ok::<_, std::convert::Infallible>(handle_request(
+                            request,
+                            &handle,
+                            Some(&authority),
+                        )))
+                    });
+                    let io = hyper_util::rt::TokioIo::new(stream);
+                    if let Err(error) = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(io, service)
+                        .await
+                    {
+                        tracing::debug!(%peer, %error, "benchmark authority HTTP connection failed");
+                    }
                 });
             }
         }
@@ -443,7 +664,9 @@ mod tests {
         CacheMetrics, CacheMetricsSnapshot, CacheTierSnapshot, FoyerMetricsRegistry,
         build_test_cache,
     };
+    use crate::config::{BenchmarkAdapter, BenchmarkAuthorityConfig, PrometheusConfig};
     use crate::writeback::model::WritebackStatus;
+    use std::sync::Arc;
 
     #[test]
     fn writeback_metrics_refresh_fast_enough_for_durability_tier_measurement() {
@@ -617,6 +840,235 @@ mod tests {
         let response = super::handle_request(legacy_post, &handle, None);
 
         assert_eq!(response.status(), hyper::StatusCode::OK);
+    }
+
+    #[cfg(unix)]
+    fn generate_benchmark_authority_tls_material() -> (String, String) {
+        let rcgen::CertifiedKey { cert, signing_key } = rcgen::generate_simple_self_signed(vec![
+            "localhost".to_owned(),
+            "127.0.0.1".to_owned(),
+        ])
+        .unwrap();
+        (cert.pem(), signing_key.serialize_pem())
+    }
+
+    #[cfg(unix)]
+    fn benchmark_authority_tls_fixture(
+        certificate: &str,
+        private_key: &str,
+        private_key_mode: u32,
+    ) -> (tempfile::TempDir, BenchmarkAuthorityConfig) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let certificate_path = directory.path().join("metrics.crt");
+        let private_key_path = directory.path().join("metrics.key");
+        std::fs::write(&certificate_path, certificate).unwrap();
+        std::fs::write(&private_key_path, private_key).unwrap();
+        std::fs::set_permissions(
+            &private_key_path,
+            std::fs::Permissions::from_mode(private_key_mode),
+        )
+        .unwrap();
+        (
+            directory,
+            BenchmarkAuthorityConfig {
+                adapter: BenchmarkAdapter::Nfs,
+                export_id: "127.0.0.1:/".to_owned(),
+                tls_certificate: certificate_path,
+                tls_private_key: private_key_path,
+            },
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn benchmark_authority_tls_loads_matching_secure_material() {
+        let (certificate, private_key) = generate_benchmark_authority_tls_material();
+        let (_directory, config) =
+            benchmark_authority_tls_fixture(&certificate, &private_key, 0o600);
+
+        super::load_tls_config(&config).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn benchmark_authority_tls_rejects_insecure_or_invalid_material() {
+        let (certificate, private_key) = generate_benchmark_authority_tls_material();
+        let (_directory, config) =
+            benchmark_authority_tls_fixture(&certificate, &private_key, 0o644);
+        let error = super::load_tls_config(&config).expect_err("world-readable key");
+        assert!(
+            format!("{error:#}").contains("private key permissions"),
+            "unexpected permissions error: {error:#}"
+        );
+
+        let (_directory, config) = benchmark_authority_tls_fixture("", &private_key, 0o600);
+        let error = super::load_tls_config(&config).expect_err("empty certificate");
+        assert!(
+            format!("{error:#}").contains("certificate chain"),
+            "unexpected certificate error: {error:#}"
+        );
+
+        let (_, other_private_key) = generate_benchmark_authority_tls_material();
+        let (_directory, config) =
+            benchmark_authority_tls_fixture(&certificate, &other_private_key, 0o600);
+        let error = super::load_tls_config(&config).expect_err("mismatched private key");
+        assert!(
+            format!("{error:#}").contains("does not match"),
+            "unexpected mismatch error: {error:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn benchmark_authority_tls_listener_serves_https_and_refuses_plaintext() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (certificate_pem, private_key) = generate_benchmark_authority_tls_material();
+        let (_directory, config) =
+            benchmark_authority_tls_fixture(&certificate_pem, &private_key, 0o600);
+        let tls = super::load_tls_config(&config).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let authority = benchmark_authority_fixture();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let server_shutdown = shutdown.clone();
+        let server = tokio::spawn(super::serve_tls_metrics(
+            listener,
+            handle,
+            authority,
+            tls,
+            server_shutdown,
+        ));
+
+        let certificate = reqwest::tls::Certificate::from_pem(certificate_pem.as_bytes()).unwrap();
+        let client = reqwest::Client::builder()
+            .https_only(true)
+            .redirect(reqwest::redirect::Policy::none())
+            .add_root_certificate(certificate)
+            .build()
+            .unwrap();
+        let response = client
+            .get(format!("https://127.0.0.1:{}/metrics", address.port()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let body = response.text().await.unwrap();
+        assert_eq!(sample_count(&body, "zerofs_benchmark_authority_info"), 1);
+
+        let mut plaintext = tokio::net::TcpStream::connect(address).await.unwrap();
+        plaintext
+            .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        plaintext.shutdown().await.unwrap();
+        let mut received = Vec::new();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            plaintext.read_to_end(&mut received),
+        )
+        .await;
+        assert!(
+            !received
+                .windows(b"zerofs_benchmark_authority_info".len())
+                .any(|window| window == b"zerofs_benchmark_authority_info"),
+            "plaintext request exposed metrics"
+        );
+
+        shutdown.cancel();
+        server.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn benchmark_authority_startup_requires_identity_and_prebinds_tls_address() {
+        let (certificate, private_key) = generate_benchmark_authority_tls_material();
+        let (_directory, authority_config) =
+            benchmark_authority_tls_fixture(&certificate, &private_key, 0o600);
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = probe.local_addr().unwrap();
+        drop(probe);
+        let config = PrometheusConfig {
+            addresses: std::iter::once(address).collect(),
+            benchmark_authority: Some(authority_config),
+        };
+
+        let missing = match super::prepare_authority_server(&config, None).await {
+            Err(error) => error,
+            Ok(_) => panic!("missing authority identity must fail startup"),
+        };
+        assert!(
+            format!("{missing:#}").contains("identity is missing"),
+            "unexpected error: {missing:#}"
+        );
+
+        let prepared =
+            super::prepare_authority_server(&config, Some(benchmark_authority_fixture()))
+                .await
+                .unwrap()
+                .expect("authority mode must prepare a TLS listener");
+        assert_eq!(prepared.listeners.len(), 1);
+        assert_eq!(prepared.listeners[0].local_addr().unwrap(), address);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn benchmark_authority_startup_fails_when_tls_address_is_occupied() {
+        let (certificate, private_key) = generate_benchmark_authority_tls_material();
+        let (_directory, authority_config) =
+            benchmark_authority_tls_fixture(&certificate, &private_key, 0o600);
+        let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = PrometheusConfig {
+            addresses: std::iter::once(occupied.local_addr().unwrap()).collect(),
+            benchmark_authority: Some(authority_config),
+        };
+
+        let error =
+            match super::prepare_authority_server(&config, Some(benchmark_authority_fixture()))
+                .await
+            {
+                Err(error) => error,
+                Ok(_) => panic!("occupied authority address must fail startup"),
+            };
+
+        assert!(
+            format!("{error:#}").contains("failed to bind benchmark authority metrics"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn benchmark_authority_startup_loads_durable_filesystem_identity() {
+        use slatedb::object_store::{ObjectStore, ObjectStoreExt, path::Path};
+
+        let store: Arc<dyn ObjectStore> = Arc::new(slatedb::object_store::memory::InMemory::new());
+        let filesystem_id = uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        store
+            .put(
+                &Path::from("data").join(".zerofs_bucket_id"),
+                filesystem_id.to_string().into(),
+            )
+            .await
+            .unwrap();
+
+        let authority = BenchmarkAuthority::load(
+            "10.10.10.30:/",
+            &store,
+            "data",
+            Some("2be254ef917b4ff8a2c547b873709aef"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(authority.filesystem_id, filesystem_id.to_string());
+        assert_eq!(
+            authority.server_instance_id,
+            "2be254ef917b4ff8a2c547b873709aef"
+        );
     }
 
     #[test]

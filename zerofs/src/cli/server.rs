@@ -1259,6 +1259,25 @@ pub async fn run_server(
     let sftp_pool = init_result.sftp_pool.clone();
     let sftp_pool_for_close = sftp_pool.clone();
     let server_result: anyhow::Result<()> = async move {
+        let prometheus_authority = if let Some(authority_config) = settings
+            .prometheus
+            .as_ref()
+            .and_then(|prometheus| prometheus.benchmark_authority.as_ref())
+        {
+            let invocation_id = crate::prometheus::systemd_invocation_id()?;
+            Some(
+                crate::prometheus::BenchmarkAuthority::load(
+                    &authority_config.export_id,
+                    &init_result.object_store,
+                    &init_result.db_path,
+                    invocation_id.as_deref(),
+                )
+                .await
+                .context("Failed to compose benchmark metrics authority")?,
+            )
+        } else {
+            None
+        };
         let fs = init_result.fs;
         let authority = init_result.authority;
         let leadership_deposed = authority
@@ -1280,12 +1299,6 @@ pub async fn run_server(
         let mut sigterm =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
-        let telemetry_handle = crate::telemetry::start_periodic_reporting(
-            &settings,
-            Arc::clone(&fs.global_stats),
-            shutdown.clone(),
-        );
-
         let prometheus_handles = if let Some(ref prometheus_config) = settings.prometheus {
             let slatedb_registry = fs.db.slatedb_metrics();
             crate::prometheus::start(
@@ -1299,11 +1312,20 @@ pub async fn run_server(
                     slatedb_registry,
                     writeback: writeback_for_metrics,
                 },
+                prometheus_authority,
                 shutdown.clone(),
             )
+            .await
+            .context("Failed to start Prometheus metrics exporter")?
         } else {
             Vec::new()
         };
+
+        let telemetry_handle = crate::telemetry::start_periodic_reporting(
+            &settings,
+            Arc::clone(&fs.global_stats),
+            shutdown.clone(),
+        );
 
         // Metadata compaction digest: at most one line per interval, only when
         // compaction ran, plus a crossing-only L0 backlog warning. Summarizes the

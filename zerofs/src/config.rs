@@ -1976,6 +1976,18 @@ impl Settings {
         toml_string.push_str("# Exposes filesystem, LSM, and cache metrics in Prometheus format\n");
         toml_string.push_str("\n# [prometheus]\n");
         toml_string.push_str("# addresses = [\"127.0.0.1:9091\"]\n");
+        toml_string.push_str("#\n");
+        toml_string.push_str(
+            "# Benchmark authority mode is TLS-only and supports one isolated NFS or 9P export.\n",
+        );
+        toml_string.push_str("# export_id must exactly match `findmnt -nro SOURCE -M <mountpoint>` on the benchmark host.\n");
+        toml_string.push_str("# [prometheus.benchmark_authority]\n");
+        toml_string.push_str("# adapter = \"nfs\"\n");
+        toml_string.push_str("# export_id = \"10.10.10.30:/\"\n");
+        toml_string.push_str("# tls_certificate = \"/etc/zerofs/metrics.crt\"\n");
+        toml_string.push_str(
+            "# tls_private_key = \"/etc/zerofs/metrics.key\"  # Must deny group/world access.\n",
+        );
 
         toml_string.push_str("\n# Optional Azure settings can be added to [azure] section\n");
 
