@@ -336,6 +336,18 @@ impl NbdExportGates {
     }
 
     pub(crate) async fn stop_and_drain(&self) -> CommandResult<()> {
+        let states = {
+            let registry = self
+                .registry
+                .lock()
+                .expect("NBD export gate registry poisoned");
+            registry.exports.values().cloned().collect::<Vec<_>>()
+        };
+        let mut exclusive = Vec::with_capacity(states.len());
+        for state in &states {
+            exclusive.push(state.gate.write().await);
+        }
+        drop(exclusive);
         Ok(())
     }
 
