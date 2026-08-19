@@ -745,12 +745,14 @@ OS RSS and cgroup current are the physical authorities. Record jemalloc allocate
 resident, and retained separately; retained is virtual address space and is never added
 to resident or used alone to trigger admission. Include a retained-only growth/purge
 leg that raises `stats.retained` without a matching RSS/cgroup increase and prove it
-does not create false permanent over-cap or poison. The GC overlap includes one full
-1,024-frame sparse/interleaved candidate and requires at most 32 memory+durable scans,
-at most 4,096 scanned rows and 64 MiB encoded key/value bytes, no per-frame point-read
+does not create false permanent over-cap or poison. The GC overlap includes one real
+maximum 256 MiB compacted segment with approximately 8,192 sparse/interleaved 32 KiB
+frames and requires at most 32 memory+durable scans, at most 65,536 scanned rows and
+64 MiB encoded key/value bytes, no per-frame point-read
 fanout, and bounded scan working memory. Budget exhaustion must stop and fail closed to
 `Keep`. Both focused GREEN tests use the fully qualified `cargo_test_nonzero` helper;
-a zero-selection Cargo success is rejected.
+a zero-selection Cargo success is rejected. The receipt records and requires exactly
+268,435,456 logical payload bytes and 8,192 candidate frames before scoring the scan.
 Before the first process starts, the immutable ledger records these fixed thresholds:
 `cgroup_high_event_delta_max=8`, `reconciliation_error_bytes_max=268435456`, and
 `unowned_residual_bytes_max=2147483648`. They cannot be supplied by scenario output,
@@ -848,9 +850,9 @@ Name dependency-free RED tests that reject:
   eight, reconciliation error above 256 MiB, or unowned residual above 2 GiB;
 - physical residency computed as jemalloc resident plus retained, retained-only growth
   causing backpressure, or a mismatch with OS RSS/cgroup current;
-- a sparse/interleaved full segment issuing more than 32 verification scans or scaling
-  beyond 4,096 rows/64 MiB encoded bytes, or scaling maintenance memory with all 2,048
-  would-be point reads;
+- a sparse/interleaved maximum 256 MiB/~8,192-frame segment issuing more than 32
+  verification scans or scaling beyond 65,536 rows/64 MiB encoded bytes, or scaling
+  maintenance memory with all ~16,384 would-be two-view point reads;
 - an HPN result without exact executable identity, a direction label, or per-session
   byte evidence;
 - an HPN suite without the pinned `LTESTS` inventory, with an exclusion other than
