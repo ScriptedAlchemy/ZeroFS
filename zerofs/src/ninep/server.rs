@@ -10,9 +10,9 @@ use dashmap::mapref::entry::Entry;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use ninep_proto::{
-    DekuBytes, Message, P9_CHANNEL_SIZE, P9_DEBUG_BUFFER_SIZE, P9_HEADER_SIZE, P9_MAX_MSIZE,
-    P9_MIN_MESSAGE_SIZE, P9_OP_ENVELOPE_LEN, P9_OP_FLAG_RETRY, P9_OP_ID_LEN, P9_SIZE_FIELD_LEN,
-    P9Message, Rlerror, T_WRITE, Twrite,
+    DekuBytes, Message, P9_CHANNEL_SIZE, P9_COUNT_FIELD_LEN, P9_DEBUG_BUFFER_SIZE, P9_HEADER_SIZE,
+    P9_MAX_MSIZE, P9_MIN_MESSAGE_SIZE, P9_OP_ENVELOPE_LEN, P9_OP_FLAG_RETRY, P9_OP_ID_LEN,
+    P9_SIZE_FIELD_LEN, P9Message, Rlerror, T_WRITE, Twrite,
 };
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -40,11 +40,18 @@ const TVERSION_TYPE: u8 = 100;
 const TCLUNK_TYPE: u8 = 120;
 const RESPONSE_BUFFER_CAPACITY: usize = 64 * 1024;
 /// Process-wide protocol memory available to requests and their possible replies.
-const GLOBAL_INFLIGHT_MEMORY: usize = 256 * 1024 * 1024;
+const GLOBAL_INFLIGHT_MEMORY: usize = 384 * 1024 * 1024;
 /// One connection cannot consume more than a quarter of the process budget.
 const CONNECTION_INFLIGHT_MEMORY: usize = 64 * 1024 * 1024;
 const GLOBAL_INFLIGHT_REQUESTS: usize = 64;
 const CONNECTION_INFLIGHT_REQUESTS: usize = 16;
+/// Active transports allowed to receive a frame before byte admission.
+/// This leaves room for the expected sixteen idle Mesh sessions and the
+/// default uploader's sixteen connections while bounding reconnect storms.
+const GLOBAL_TRANSPORT_SESSIONS: usize = 64;
+const MAX_PRE_ADMISSION_MEMORY: usize = GLOBAL_TRANSPORT_SESSIONS * P9_MAX_MSIZE as usize;
+const DOCUMENTED_P9_MEMORY_BOUND: usize = GLOBAL_INFLIGHT_MEMORY + MAX_PRE_ADMISSION_MEMORY;
+const P9_RWRITE_MAX_SIZE: usize = P9_HEADER_SIZE + P9_COUNT_FIELD_LEN;
 /// Bounded response drain after connection retirement.
 const CLIENT_DRAIN_TIMEOUT: std::time::Duration = crate::replication::RESPONSE_DRAIN_TIMEOUT;
 /// TCP keepalive idle interval.
@@ -63,24 +70,43 @@ const TCP_USER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30)
 pub(crate) struct P9GlobalAdmission {
     bytes: Arc<Semaphore>,
     requests: Arc<Semaphore>,
+    transports: Arc<Semaphore>,
     byte_limit: usize,
     request_limit: usize,
+    transport_limit: usize,
 }
 
 impl P9GlobalAdmission {
     pub(crate) fn shared() -> &'static Arc<Self> {
         static ADMISSION: OnceLock<Arc<P9GlobalAdmission>> = OnceLock::new();
-        ADMISSION
-            .get_or_init(|| Arc::new(Self::new(GLOBAL_INFLIGHT_MEMORY, GLOBAL_INFLIGHT_REQUESTS)))
+        ADMISSION.get_or_init(|| {
+            Arc::new(Self::new(
+                GLOBAL_INFLIGHT_MEMORY,
+                GLOBAL_INFLIGHT_REQUESTS,
+                GLOBAL_TRANSPORT_SESSIONS,
+            ))
+        })
     }
 
-    fn new(byte_limit: usize, request_limit: usize) -> Self {
+    fn new(byte_limit: usize, request_limit: usize, transport_limit: usize) -> Self {
         Self {
             bytes: Arc::new(Semaphore::new(byte_limit)),
             requests: Arc::new(Semaphore::new(request_limit)),
+            transports: Arc::new(Semaphore::new(transport_limit)),
             byte_limit,
             request_limit,
+            transport_limit,
         }
+    }
+
+    pub(crate) async fn admit_transport(self: &Arc<Self>) -> anyhow::Result<P9TransportPermit> {
+        metrics::gauge!("zerofs_p9_transport_session_capacity").set(self.transport_limit as f64);
+        metrics::gauge!("zerofs_p9_memory_bound_bytes").set(DOCUMENTED_P9_MEMORY_BOUND as f64);
+        let waiting = P9TransportWaitMetricGuard::new();
+        let permit = Arc::clone(&self.transports).acquire_owned().await?;
+        drop(waiting);
+        metrics::gauge!("zerofs_p9_active_sessions").increment(1.0);
+        Ok(P9TransportPermit { _permit: permit })
     }
 
     pub(crate) fn connection(self: &Arc<Self>) -> P9ConnectionAdmission {
@@ -96,7 +122,20 @@ impl P9GlobalAdmission {
 
     #[cfg(test)]
     fn for_test(byte_limit: usize, request_limit: usize) -> Arc<Self> {
-        Arc::new(Self::new(byte_limit, request_limit))
+        Arc::new(Self::new(
+            byte_limit,
+            request_limit,
+            GLOBAL_TRANSPORT_SESSIONS,
+        ))
+    }
+
+    #[cfg(test)]
+    fn for_test_with_transports(
+        byte_limit: usize,
+        request_limit: usize,
+        transport_limit: usize,
+    ) -> Arc<Self> {
+        Arc::new(Self::new(byte_limit, request_limit, transport_limit))
     }
 
     #[cfg(test)]
@@ -118,6 +157,7 @@ impl P9GlobalAdmission {
         P9AdmissionSnapshot {
             reserved_bytes: self.byte_limit - self.bytes.available_permits(),
             active_requests: self.request_limit - self.requests.available_permits(),
+            active_transports: self.transport_limit - self.transports.available_permits(),
         }
     }
 }
@@ -127,6 +167,32 @@ impl P9GlobalAdmission {
 struct P9AdmissionSnapshot {
     reserved_bytes: usize,
     active_requests: usize,
+    active_transports: usize,
+}
+
+pub(crate) struct P9TransportPermit {
+    _permit: OwnedSemaphorePermit,
+}
+
+impl Drop for P9TransportPermit {
+    fn drop(&mut self) {
+        metrics::gauge!("zerofs_p9_active_sessions").decrement(1.0);
+    }
+}
+
+struct P9TransportWaitMetricGuard;
+
+impl P9TransportWaitMetricGuard {
+    fn new() -> Self {
+        metrics::gauge!("zerofs_p9_transport_session_waiters").increment(1.0);
+        Self
+    }
+}
+
+impl Drop for P9TransportWaitMetricGuard {
+    fn drop(&mut self) {
+        metrics::gauge!("zerofs_p9_transport_session_waiters").decrement(1.0);
+    }
 }
 
 #[derive(Clone)]
@@ -212,21 +278,6 @@ impl P9Response {
     fn into_parts(self) -> (u16, Vec<u8>) {
         let (tag, bytes, _admission) = self.into_guarded_parts();
         (tag, bytes)
-    }
-}
-
-pub(crate) struct P9SessionMetricGuard;
-
-impl P9SessionMetricGuard {
-    pub(crate) fn new() -> Self {
-        metrics::gauge!("zerofs_p9_active_sessions").increment(1.0);
-        Self
-    }
-}
-
-impl Drop for P9SessionMetricGuard {
-    fn drop(&mut self) {
-        metrics::gauge!("zerofs_p9_active_sessions").decrement(1.0);
     }
 }
 
@@ -642,7 +693,9 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let _session_metric = P9SessionMetricGuard::new();
+    // Acquire before constructing the decoder or polling the transport. A
+    // waiting connection therefore cannot retain an uncharged protocol frame.
+    let _transport = P9GlobalAdmission::shared().admit_transport().await?;
     let handler = Arc::new(NinePHandler::new(Arc::clone(&filesystem), lock_manager));
     let admission = P9GlobalAdmission::shared().connection();
     let requests = TaskTracker::new();
@@ -1004,6 +1057,14 @@ fn shallow_epoch_zero_retry_write(
     ))
 }
 
+fn possible_response_bytes(type_byte: u8) -> usize {
+    if type_byte == T_WRITE {
+        P9_RWRITE_MAX_SIZE
+    } else {
+        P9_MAX_MSIZE as usize
+    }
+}
+
 /// Dispatch a single 9P frame buffer. Shared between TCP (via LengthDelimitedCodec)
 /// and WebSocket transports.
 ///
@@ -1025,14 +1086,14 @@ pub(crate) async fn dispatch_9p_frame(
         anyhow::bail!("9P message exceeds maximum negotiated size");
     }
 
-    // Reserve both the received allocation and the largest response it could
-    // produce before detaching request work. The response keeps this permit
-    // until its final transport flush or drop.
+    let type_byte = frame[4];
+    // Reserve the received allocation and a conservative type-specific reply
+    // before detaching request work. Bulk writes have a fixed-size Rwrite;
+    // other requests retain the full negotiated-response allowance.
     let admission = admission
-        .admit_request(frame.len(), P9_MAX_MSIZE as usize)
+        .admit_request(frame.len(), possible_response_bytes(type_byte))
         .await?;
 
-    let type_byte = frame[4];
     let tag = u16::from_le_bytes([frame[5], frame[6]]);
     let zerofs_protocol = handler.zerofs_protocol_enabled();
     let metadata = inspect_frame_metadata(&frame, zerofs_protocol);
@@ -1227,6 +1288,72 @@ mod tests {
     const QUIET_TIMEOUT: Duration = Duration::from_millis(20);
 
     #[tokio::test]
+    async fn transport_receive_envelope_bounds_reconnect_frames() {
+        const TEST_TRANSPORTS: usize = GLOBAL_TRANSPORT_SESSIONS;
+        let global = P9GlobalAdmission::for_test_with_transports(32, 4, TEST_TRANSPORTS);
+        let mut admitted = Vec::new();
+        for _ in 0..TEST_TRANSPORTS {
+            admitted.push(global.admit_transport().await.unwrap());
+        }
+
+        let mut reconnects = (0..128)
+            .map(|_| global.admit_transport())
+            .collect::<FuturesUnordered<_>>();
+        assert!(
+            tokio::time::timeout(QUIET_TIMEOUT, reconnects.next())
+                .await
+                .is_err(),
+            "128 concurrent reconnects must wait before frame receive"
+        );
+        assert_eq!(global.snapshot().active_transports, TEST_TRANSPORTS);
+        assert!(
+            GLOBAL_TRANSPORT_SESSIONS >= 32,
+            "the envelope must retain room for sixteen idle Mesh and sixteen upload sessions"
+        );
+        assert_eq!(
+            DOCUMENTED_P9_MEMORY_BOUND,
+            1024 * 1024 * 1024,
+            "the admitted budget plus one maximum frame per transport is the documented bound"
+        );
+
+        drop(reconnects);
+        drop(admitted);
+        assert_eq!(global.snapshot().active_transports, 0);
+    }
+
+    #[tokio::test]
+    async fn default_upload_pipeline_fits_the_global_byte_budget() {
+        const DEFAULT_CONNECTIONS: usize = 16;
+        const PIPELINE_PER_CONNECTION: usize = 2;
+        const CHUNK_BYTES: usize = 9 * 1024 * 1024;
+        const TWRITE_FRAME_BYTES: usize =
+            CHUNK_BYTES + P9_HEADER_SIZE + P9_OP_ENVELOPE_LEN + 4 + 8 + P9_COUNT_FIELD_LEN;
+
+        let global = P9GlobalAdmission::for_test(GLOBAL_INFLIGHT_MEMORY, GLOBAL_INFLIGHT_REQUESTS);
+        let connections = (0..DEFAULT_CONNECTIONS)
+            .map(|_| {
+                global.connection_for_test(CONNECTION_INFLIGHT_MEMORY, CONNECTION_INFLIGHT_REQUESTS)
+            })
+            .collect::<Vec<_>>();
+        let mut admitted = Vec::new();
+        for connection in &connections {
+            for _ in 0..PIPELINE_PER_CONNECTION {
+                admitted.push(
+                    connection
+                        .admit_request(TWRITE_FRAME_BYTES, possible_response_bytes(T_WRITE))
+                        .await
+                        .unwrap(),
+                );
+            }
+        }
+
+        assert_eq!(admitted.len(), 32);
+        assert!(global.snapshot().reserved_bytes < GLOBAL_INFLIGHT_MEMORY);
+        drop(admitted);
+        assert_eq!(global.snapshot().reserved_bytes, 0);
+    }
+
+    #[tokio::test]
     async fn connection_request_bytes_apply_backpressure_before_dispatch() {
         let global = P9GlobalAdmission::for_test(16, 4);
         let connection = global.connection_for_test(8, 4);
@@ -1333,6 +1460,7 @@ mod tests {
             P9AdmissionSnapshot {
                 reserved_bytes: 0,
                 active_requests: 0,
+                active_transports: 0,
             },
             "transport completion must release both byte and request permits once"
         );
@@ -1360,6 +1488,7 @@ mod tests {
             P9AdmissionSnapshot {
                 reserved_bytes: 16,
                 active_requests: 2,
+                active_transports: 0,
             }
         );
     }
@@ -1397,6 +1526,7 @@ mod tests {
             P9AdmissionSnapshot {
                 reserved_bytes: 0,
                 active_requests: 0,
+                active_transports: 0,
             }
         );
     }
@@ -1444,6 +1574,35 @@ mod tests {
         }
     }
 
+    fn tracked_retry_write_frame(
+        tag: u16,
+        op_id: [u8; P9_OP_ID_LEN],
+        count: usize,
+    ) -> (Bytes, oneshot::Receiver<()>) {
+        let encoded = P9Message::new_with_op_id_flags_and_origin(
+            tag,
+            op_id,
+            P9_OP_FLAG_RETRY,
+            0,
+            Message::Twrite(Twrite {
+                fid: u32::MAX,
+                offset: 0,
+                count: count as u32,
+                data: DekuBytes::from(Bytes::from(vec![0x5a; count])),
+            }),
+        )
+        .to_bytes_ctx(true)
+        .unwrap();
+        let (dropped_tx, dropped_rx) = oneshot::channel();
+        (
+            Bytes::from_owner(DropTrackedFrame {
+                bytes: encoded,
+                dropped: Some(dropped_tx),
+            }),
+            dropped_rx,
+        )
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn duplicate_write_retry_drops_payload_before_waiting_for_first() {
         let filesystem = Arc::new(ZeroFS::new_in_memory().await.unwrap());
@@ -1458,25 +1617,7 @@ mod tests {
             .dedup
             .reserve_initial(op_id)
             .expect("reserve the original mutation");
-        let encoded = P9Message::new_with_op_id_flags_and_origin(
-            7,
-            op_id,
-            ninep_proto::P9_OP_FLAG_RETRY,
-            0,
-            Message::Twrite(Twrite {
-                fid: 1,
-                offset: 0,
-                count: 1024 * 1024,
-                data: ninep_proto::DekuBytes::from(Bytes::from(vec![0x5a; 1024 * 1024])),
-            }),
-        )
-        .to_bytes_ctx(true)
-        .unwrap();
-        let (dropped_tx, dropped_rx) = oneshot::channel();
-        let frame = Bytes::from_owner(DropTrackedFrame {
-            bytes: encoded,
-            dropped: Some(dropped_tx),
-        });
+        let (frame, dropped_rx) = tracked_retry_write_frame(7, op_id, 1024 * 1024);
         let reserved = frame.len() + P9_MAX_MSIZE as usize;
         let global = P9GlobalAdmission::for_test(reserved, 1);
         let admission = global.connection_for_test(reserved, 1);
@@ -1492,15 +1633,78 @@ mod tests {
             .expect("retry payload allocation must be dropped while the first remains in flight")
             .unwrap();
 
+        filesystem.dedup.record_entry(crate::dedup::DedupEntry {
+            op_id,
+            result: crate::dedup::DedupResult::Write {
+                attrs: crate::fs::types::FileAttributes::default(),
+            },
+        });
         drop(first);
         let response = tokio::time::timeout(TEST_TIMEOUT, rx.recv())
             .await
-            .expect("retry must settle after the first retires")
+            .expect("retry must replay after the first completes")
             .expect("response channel");
         let (_, response_bytes) = response.into_parts();
         let response = decode(&response_bytes);
         assert!(matches!(
             response.body,
+            Message::Rwrite(ninep_proto::Rwrite { count }) if count == 1024 * 1024
+        ));
+
+        requests.close();
+        requests.wait().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shallow_write_retry_rejects_a_mismatched_completed_result() {
+        let filesystem = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let handler = Arc::new(NinePHandler::new(
+            Arc::clone(&filesystem),
+            Arc::new(FileLockManager::new()),
+        ));
+        negotiate(&handler).await;
+
+        let op_id = [0x73; 16];
+        let first = filesystem
+            .dedup
+            .reserve_initial(op_id)
+            .expect("reserve the original mutation");
+        let (frame, dropped_rx) = tracked_retry_write_frame(8, op_id, 64 * 1024);
+        let reserved = frame.len() + P9_MAX_MSIZE as usize;
+        let global = P9GlobalAdmission::for_test(reserved, 1);
+        let admission = global.connection_for_test(reserved, 1);
+        let requests = TaskTracker::new();
+        let (tx, mut rx) = mpsc::channel(1);
+
+        dispatch_9p_frame(
+            frame,
+            &handler,
+            &tx,
+            &InflightRegistry::default(),
+            &admission,
+            &requests,
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(TEST_TIMEOUT, dropped_rx)
+            .await
+            .expect("mismatched retry payload must still be released before joining")
+            .unwrap();
+
+        filesystem.dedup.record_entry(crate::dedup::DedupEntry {
+            op_id,
+            result: crate::dedup::DedupResult::Mkdir {
+                inode_id: 0,
+                attrs: crate::fs::types::FileAttributes::default(),
+            },
+        });
+        drop(first);
+        let response = tokio::time::timeout(TEST_TIMEOUT, rx.recv())
+            .await
+            .expect("mismatched retry response")
+            .expect("response channel");
+        assert!(matches!(
+            decode(&response.into_parts().1).body,
             Message::Rlerror(Rlerror {
                 ecode: ninep_proto::P9_EOPIDSTALE
             })

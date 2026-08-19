@@ -3,7 +3,7 @@ use crate::fs::ZeroFS;
 use crate::ninep::handler::{NinePHandler, SessionReleaseGuard};
 use crate::ninep::lock_manager::FileLockManager;
 use crate::ninep::server::{
-    InflightRegistry, P9GlobalAdmission, P9Response, P9SessionMetricGuard, dispatch_9p_frame,
+    InflightRegistry, P9GlobalAdmission, P9Response, P9TransportPermit, dispatch_9p_frame,
     response_may_be_emitted, settle_request_tasks,
 };
 use crate::rpc::proto;
@@ -56,7 +56,11 @@ async fn counted_test_ws_upgrade(
         .connections
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let drain_guard = state.app.ws_drain.token();
-    ws.on_upgrade(move |socket| handle_9p_ws(socket, state.app, drain_guard))
+    let transport = P9GlobalAdmission::shared()
+        .admit_transport()
+        .await
+        .expect("test WebSocket transport admission");
+    ws.on_upgrade(move |socket| handle_9p_ws(socket, state.app, drain_guard, transport))
 }
 
 #[cfg(test)]
@@ -83,13 +87,27 @@ pub(crate) fn test_9p_websocket_router(
 const WS_DRAIN_TIMEOUT: std::time::Duration = crate::replication::RESPONSE_DRAIN_TIMEOUT;
 
 async fn ws_9p_upgrade(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
+    // Gate before completing the upgrade so a queued client cannot deliver a
+    // full WebSocket frame outside the process receive envelope.
+    let transport = match P9GlobalAdmission::shared().admit_transport().await {
+        Ok(transport) => transport,
+        Err(error) => {
+            error!("9P WebSocket transport admission failed: {error}");
+            return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    };
     // Register the session before returning the upgrade response.
     let drain_guard = state.ws_drain.token();
-    ws.on_upgrade(move |socket| handle_9p_ws(socket, state, drain_guard))
+    ws.on_upgrade(move |socket| handle_9p_ws(socket, state, drain_guard, transport))
+        .into_response()
 }
 
-async fn handle_9p_ws(socket: WebSocket, state: AppState, _drain_guard: TaskTrackerToken) {
-    let _session_metric = P9SessionMetricGuard::new();
+async fn handle_9p_ws(
+    socket: WebSocket,
+    state: AppState,
+    _drain_guard: TaskTrackerToken,
+    _transport: P9TransportPermit,
+) {
     let response_db = Arc::clone(&state.filesystem.db);
     let handler = Arc::new(
         NinePHandler::new(
@@ -337,9 +355,13 @@ mod tests {
         let connection_shutdown = state.connections.lock().unwrap().clone();
         let connection_closed = state.connection_closed.clone();
         let drain_guard = state.app.ws_drain.token();
+        let transport = P9GlobalAdmission::shared()
+            .admit_transport()
+            .await
+            .expect("smoke WebSocket transport admission");
         ws.on_upgrade(move |socket| async move {
             tokio::select! {
-                _ = handle_9p_ws(socket, state.app, drain_guard) => {}
+                _ = handle_9p_ws(socket, state.app, drain_guard, transport) => {}
                 _ = connection_shutdown.cancelled() => {}
             }
             connection_closed.notify_one();
