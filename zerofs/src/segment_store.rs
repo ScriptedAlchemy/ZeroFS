@@ -13,8 +13,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
 use slatedb::object_store::{
-    GetOptions, GetRange, MultipartUpload, ObjectStore, ObjectStoreExt, PutMode, PutOptions,
-    path::Path,
+    GetOptions, GetRange, MultipartUpload, ObjectStore, ObjectStoreExt, PutMode,
+    PutMultipartOptions, PutOptions, path::Path,
 };
 
 use crate::frame_codec::{Compressed, FrameCodec};
@@ -149,9 +149,11 @@ impl SegmentStore {
         path: &Path,
         bytes: &Bytes,
     ) -> Result<slatedb::object_store::PutResult> {
+        let mut options = PutMultipartOptions::default();
+        options.extensions.insert(GeneratedSegmentCreate);
         let mut upload = self
             .object_store
-            .put_multipart(path)
+            .put_multipart_opts(path, options)
             .await
             .map_err(|e| SegmentStoreError::ObjectStore(e.to_string()))?;
         // Parts run as spawned tasks, so upload progress never waits on this
@@ -704,6 +706,7 @@ mod tests {
         fail_put: bool,
         fail_after_create: AtomicBool,
         aborted: Arc<AtomicBool>,
+        saw_generated_segment_create: AtomicBool,
     }
 
     impl MultipartFaultStore {
@@ -717,6 +720,7 @@ mod tests {
                     fail_put: false,
                     fail_after_create: AtomicBool::new(false),
                     aborted: aborted.clone(),
+                    saw_generated_segment_create: AtomicBool::new(false),
                 }),
                 aborted,
             )
@@ -730,6 +734,7 @@ mod tests {
                 fail_put: !fail_after_create,
                 fail_after_create: AtomicBool::new(fail_after_create),
                 aborted: Arc::new(AtomicBool::new(false)),
+                saw_generated_segment_create: AtomicBool::new(false),
             })
         }
 
@@ -804,6 +809,10 @@ mod tests {
             location: &Path,
             opts: PutMultipartOptions,
         ) -> OsResult<Box<dyn MultipartUpload>> {
+            self.saw_generated_segment_create.store(
+                opts.extensions.get::<GeneratedSegmentCreate>().is_some(),
+                Ordering::SeqCst,
+            );
             let inner = self.inner.put_multipart_opts(location, opts).await?;
             Ok(Box::new(FaultUpload {
                 inner,
@@ -1041,6 +1050,24 @@ mod tests {
             .await
             .expect_err("a 40 MiB seal must use the injected single-PUT path");
         assert!(error.to_string().contains("injected object-store fault"));
+    }
+
+    #[tokio::test]
+    async fn multipart_segment_publication_carries_the_generated_create_marker() {
+        let (os, _aborted) = MultipartFaultStore::new(None, false);
+        let codec = FrameCodec::new(&[1u8; 32], SEGMENT_INFO, CompressionConfig::Lz4);
+        let store = SegmentStore::new(os.clone(), codec, 5, None);
+        let path = Path::from(store.next_segid().object_key());
+
+        store
+            .put_segment_multipart(&path, &Bytes::from_static(b"multipart segment"))
+            .await
+            .unwrap();
+
+        assert!(
+            os.saw_generated_segment_create.load(Ordering::SeqCst),
+            "multipart segment publication lost its immutable-create marker"
+        );
     }
 
     // A part failing mid-multipart must abort the upload on the way out: an
