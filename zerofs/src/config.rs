@@ -540,6 +540,18 @@ fn probe_hpn_version(program: &Path) -> Result<()> {
     let output = child
         .wait_with_output()
         .with_context(|| format!("[sftp] hpn_program {} -V failed", program.display()))?;
+    if !output.status.success() {
+        match output.status.code() {
+            Some(code) => anyhow::bail!(
+                "[sftp] hpn_program {} -V exited with status {code}",
+                program.display()
+            ),
+            None => anyhow::bail!(
+                "[sftp] hpn_program {} -V did not exit successfully",
+                program.display()
+            ),
+        }
+    }
     let mut reported = String::new();
     reported.push_str(&String::from_utf8_lossy(&output.stdout));
     reported.push_str(&String::from_utf8_lossy(&output.stderr));
@@ -3652,6 +3664,28 @@ known_hosts = "${ZEROFS_TEST_KNOWN_HOSTS}""#,
             err.contains("_hpn") || err.contains("provenance"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn sftp_hpn_version_probe_requires_successful_exit() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let program = dir.path().join("hpnssh");
+        std::fs::write(
+            &program,
+            "#!/bin/sh\nprintf '%s\\n' 'OpenSSH_9.0_hpn14v15' >&2\nexit 17\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let sha = format!("{:x}", Sha256::digest(std::fs::read(&program).unwrap()));
+        let extra = hpn_sftp_extra(&program, &sha);
+
+        let error = format!(
+            "{:#}",
+            write_and_load(&sftp_config("sftp://alice@example.com/data", &extra)).unwrap_err()
+        );
+        assert!(error.contains("status 17"), "got: {error}");
     }
 
     #[test]

@@ -247,7 +247,7 @@ fn hpn_args(
     known_hosts: &Path,
 ) -> Vec<String> {
     let identity = identity_file.display().to_string();
-    let known_hosts = known_hosts.display().to_string();
+    let known_hosts = openssh_config_path(known_hosts);
     vec![
         "-F".to_owned(),
         "/dev/null".to_owned(),
@@ -270,8 +270,8 @@ fn hpn_args(
         "NumberOfPasswordPrompts=0".to_owned(),
         "-o".to_owned(),
         "IdentitiesOnly=yes".to_owned(),
-        "-o".to_owned(),
-        format!("IdentityFile={identity}"),
+        "-i".to_owned(),
+        identity,
         "-o".to_owned(),
         "IdentityAgent=none".to_owned(),
         "-o".to_owned(),
@@ -288,8 +288,6 @@ fn hpn_args(
         "ClearAllForwardings=yes".to_owned(),
         "-o".to_owned(),
         "PermitLocalCommand=no".to_owned(),
-        "-o".to_owned(),
-        "AllowTcpForwarding=no".to_owned(),
         "-o".to_owned(),
         "Tunnel=no".to_owned(),
         "-o".to_owned(),
@@ -319,6 +317,16 @@ fn hpn_args(
         endpoint.host.clone(),
         "sftp".to_owned(),
     ]
+}
+
+fn openssh_config_path(path: &Path) -> String {
+    let escaped = path
+        .display()
+        .to_string()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('%', "%%");
+    format!("\"{escaped}\"")
 }
 
 fn verify_identity_file(identity_file: &Path) -> Result<(), TransportError> {
@@ -571,7 +579,9 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
         assert!(joined.contains("PasswordAuthentication=no"));
         assert!(joined.contains("KbdInteractiveAuthentication=no"));
         assert!(joined.contains("IdentitiesOnly=yes"));
-        assert!(joined.contains(&format!("IdentityFile={}", fixture.identity.display())));
+        assert!(args.windows(2).any(|pair| {
+            pair[0] == "-i" && pair[1] == fixture.identity.to_string_lossy().as_ref()
+        }));
         assert!(joined.contains("StrictHostKeyChecking=yes"));
         assert!(!joined.contains("StrictHostKeyChecking=no"));
         assert!(!joined.contains("accept-new"));
@@ -579,6 +589,8 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
         assert!(joined.contains("ControlPersist=no"));
         assert!(joined.contains("IdentityAgent=none"));
         assert!(joined.contains("ForwardAgent=no"));
+        assert!(!joined.contains("AllowTcpForwarding="));
+        assert!(!joined.contains("DisableForwarding="));
         assert!(joined.contains("ForwardX11=no"));
         assert!(joined.contains("RequestTTY=no"));
         assert!(joined.contains("PermitLocalCommand=no"));
@@ -596,6 +608,28 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
         let command = format!("{}", fixture.program.display());
         assert_ne!(command, "/usr/bin/ssh");
         assert!(command.ends_with("hpnssh"));
+    }
+
+    #[test]
+    fn hpn_command_preserves_paths_with_spaces() {
+        let endpoint = crate::config::SftpEndpoint {
+            host: "example.com".to_owned(),
+            port: 23,
+            username: "alice".to_owned(),
+        };
+        let identity = PathBuf::from("/tmp/identity key");
+        let known_hosts = PathBuf::from("/tmp/known hosts");
+
+        let args = hpn_args(&endpoint, &identity, &known_hosts);
+
+        assert!(
+            args.windows(2)
+                .any(|pair| { pair[0] == "-i" && pair[1] == identity.to_string_lossy().as_ref() })
+        );
+        assert!(
+            args.iter()
+                .any(|arg| { arg == &format!("UserKnownHostsFile=\"{}\"", known_hosts.display()) })
+        );
     }
 
     #[test]
