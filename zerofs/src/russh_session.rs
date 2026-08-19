@@ -1290,15 +1290,10 @@ impl TransportSession for RusshTransportSession {
 
     async fn hard_link(&mut self, from: &Path, to: &Path) -> Result<(), TransportError> {
         let sftp = self.sftp()?;
-        match sftp.hardlink(sftp_path(from)?, sftp_path(to)?).await {
-            Ok(_) => Ok(()),
-            Err(russh_sftp::client::error::Error::Status(status))
-                if status.status_code == StatusCode::Failure =>
-            {
-                Err(TransportError::AlreadyExists(to.display().to_string()))
-            }
-            Err(error) => Err(map_sftp_error(to, error)),
-        }
+        sftp.hardlink(sftp_path(from)?, sftp_path(to)?)
+            .await
+            .map(|_| ())
+            .map_err(|error| map_sftp_error(to, error))
     }
 
     async fn posix_rename(&mut self, from: &Path, to: &Path) -> Result<(), TransportError> {

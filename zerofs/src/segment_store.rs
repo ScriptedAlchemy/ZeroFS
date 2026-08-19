@@ -8,13 +8,13 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
 use slatedb::object_store::{
     GetOptions, GetRange, MultipartUpload, ObjectStore, ObjectStoreExt, PutMode,
-    PutMultipartOptions, PutOptions, path::Path,
+    PutMultipartOptions, PutOptions, PutResult, path::Path,
 };
 
 use crate::frame_codec::{Compressed, FrameCodec};
@@ -32,6 +32,30 @@ use crate::segment::{
 #[derive(Clone, Debug)]
 pub(crate) struct GeneratedSegmentCreate;
 
+/// Requests the authoritative backend view when reconciling an ambiguous
+/// segment create. Writeback must bypass its attempted local overlay payload.
+#[derive(Clone, Debug)]
+pub(crate) struct AuthoritativeSegmentRead;
+
+/// Handshake for backends that can publish a multipart upload atomically with
+/// create-only semantics. Backends that consume [`GeneratedSegmentCreate`]
+/// acknowledge this context before returning the upload handle. An ignored
+/// extension is never treated as support.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ConditionalMultipartCreate {
+    acknowledged: Arc<AtomicBool>,
+}
+
+impl ConditionalMultipartCreate {
+    pub(crate) fn acknowledge(&self) {
+        self.acknowledged.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn is_acknowledged(&self) -> bool {
+        self.acknowledged.load(Ordering::Acquire)
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SegmentStoreError {
     #[error("segment object store error: {0}")]
@@ -46,6 +70,12 @@ pub enum SegmentStoreError {
 }
 
 type Result<T> = std::result::Result<T, SegmentStoreError>;
+
+#[derive(Debug)]
+enum SegmentPublication {
+    Multipart(PutResult),
+    SingleFallback,
+}
 
 /// Concurrent per-shard LIST chains inside [`SegmentStore::list_segments_stream`].
 /// Bounds in-flight LIST requests and, with them, how much listing a retrying
@@ -121,21 +151,86 @@ impl SegmentStore {
         // instead of serializing 256 MiB on one stream.
         let path = Path::from(segid.object_key());
         if bytes.len() < SEAL_PART_SIZE {
-            let mut options = PutOptions::from(PutMode::Create);
-            options.extensions.insert(GeneratedSegmentCreate);
-            self.object_store
-                .put_opts(&path, bytes.clone().into(), options)
-                .await
-                .map_err(|e| SegmentStoreError::ObjectStore(e.to_string()))?;
-        } else {
-            let result = self.put_segment_multipart(&path, &bytes).await?;
-            // Multipart bypasses the object-store wrapper's single-PUT
-            // write-through, so only this path needs the explicit warm hook.
+            self.put_segment_create(&path, &bytes).await?;
+        } else if let SegmentPublication::Multipart(result) =
+            self.put_segment_multipart(&path, &bytes).await?
+        {
+            // True multipart bypasses the object-store wrapper's single-PUT
+            // write-through, so only this outcome needs the explicit hook.
             if let Some(warm) = &self.warm {
                 warm(&path, bytes, &result);
             }
         }
         Ok(())
+    }
+
+    async fn put_segment_create(&self, path: &Path, bytes: &Bytes) -> Result<PutResult> {
+        let mut options = PutOptions::from(PutMode::Create);
+        options.extensions.insert(GeneratedSegmentCreate);
+        match self
+            .object_store
+            .put_opts(path, bytes.clone().into(), options)
+            .await
+        {
+            Ok(result) => Ok(result),
+            // A create whose success response was lost can return either a
+            // transport error or AlreadyExists on a lower-layer retry. Exact
+            // readback is the only safe way to reconcile either response.
+            Err(error) => match self.verify_existing_segment_bytes(path, bytes).await {
+                Ok(result) => Ok(result),
+                Err(conflict)
+                    if matches!(error, slatedb::object_store::Error::AlreadyExists { .. }) =>
+                {
+                    Err(conflict)
+                }
+                Err(_) => Err(SegmentStoreError::ObjectStore(error.to_string())),
+            },
+        }
+    }
+
+    /// Read back an object after an ambiguous create result and confirm it
+    /// holds exactly `bytes`. Identical bytes make the create idempotent (its
+    /// effect landed on an earlier attempt); anything else stays an error so
+    /// an immutable key is never silently reused.
+    async fn verify_existing_segment_bytes(&self, path: &Path, bytes: &Bytes) -> Result<PutResult> {
+        let mut options = GetOptions {
+            range: (!bytes.is_empty()).then(|| GetRange::Bounded(0..bytes.len() as u64)),
+            ..Default::default()
+        };
+        options
+            .extensions
+            .insert(crate::object_store_prefetch::SkipPartsCache);
+        options.extensions.insert(AuthoritativeSegmentRead);
+        let result = self
+            .object_store
+            .get_opts(path, options)
+            .await
+            .map_err(|e| {
+                SegmentStoreError::ObjectStore(format!(
+                    "segment create conflicted and readback failed for {path}: {e}"
+                ))
+            })?;
+        if result.meta.size != bytes.len() as u64 {
+            return Err(SegmentStoreError::ObjectStore(format!(
+                "segment create conflicted with different existing contents at {path}"
+            )));
+        }
+        let meta = result.meta.clone();
+        let existing = result.bytes().await.map_err(|e| {
+            SegmentStoreError::ObjectStore(format!(
+                "segment create conflicted and readback failed for {path}: {e}"
+            ))
+        })?;
+        if existing != *bytes {
+            return Err(SegmentStoreError::ObjectStore(format!(
+                "segment create conflicted with different existing contents at {path}"
+            )));
+        }
+        Ok(PutResult {
+            e_tag: meta.e_tag,
+            version: meta.version,
+            extensions: Default::default(),
+        })
     }
 
     /// Multipart PUT of `bytes` in `SEAL_PART_SIZE` parts, at most
@@ -148,18 +243,46 @@ impl SegmentStore {
         &self,
         path: &Path,
         bytes: &Bytes,
-    ) -> Result<slatedb::object_store::PutResult> {
+    ) -> Result<SegmentPublication> {
+        let capability = ConditionalMultipartCreate::default();
         let mut options = PutMultipartOptions::default();
         options.extensions.insert(GeneratedSegmentCreate);
-        let mut upload = self
-            .object_store
-            .put_multipart_opts(path, options)
-            .await
-            .map_err(|e| SegmentStoreError::ObjectStore(e.to_string()))?;
+        options.extensions.insert(capability.clone());
+        let upload = match self.object_store.put_multipart_opts(path, options).await {
+            Ok(upload) => upload,
+            Err(slatedb::object_store::Error::NotSupported { .. }) => {
+                self.put_segment_create(path, bytes).await?;
+                return Ok(SegmentPublication::SingleFallback);
+            }
+            Err(error) => return Err(SegmentStoreError::ObjectStore(error.to_string())),
+        };
+        if capability.is_acknowledged() {
+            return self
+                .complete_segment_upload(path, bytes, upload, true)
+                .await
+                .map(SegmentPublication::Multipart);
+        }
+
+        abort_segment_upload(upload).await.map_err(|error| {
+            SegmentStoreError::ObjectStore(format!(
+                "backend ignored conditional multipart create and probe cleanup failed for {path}: {error}"
+            ))
+        })?;
+        self.put_segment_create(path, bytes).await?;
+        Ok(SegmentPublication::SingleFallback)
+    }
+
+    async fn complete_segment_upload(
+        &self,
+        path: &Path,
+        bytes: &Bytes,
+        mut upload: Box<dyn MultipartUpload>,
+        reconcile_completion: bool,
+    ) -> Result<PutResult> {
         // Parts run as spawned tasks, so upload progress never waits on this
         // future being polled.
         let mut parts = tokio::task::JoinSet::new();
-        let uploaded = async {
+        let parts_result = async {
             let mut rest = bytes.clone();
             while !rest.is_empty() {
                 while parts.len() >= SEAL_UPLOAD_CONCURRENCY {
@@ -175,17 +298,33 @@ impl SegmentStore {
             while let Some(part) = parts.join_next().await {
                 part.expect("part upload panicked")?;
             }
-            upload.complete().await
+            Ok::<(), slatedb::object_store::Error>(())
         }
         .await;
-        match uploaded {
+        if let Err(error) = parts_result {
+            parts.shutdown().await;
+            if let Err(abort_err) = abort_segment_upload(upload).await {
+                tracing::warn!("segment seal: aborting failed upload of {path}: {abort_err}");
+            }
+            return Err(SegmentStoreError::ObjectStore(error.to_string()));
+        }
+
+        match upload.complete().await {
             Ok(result) => Ok(result),
             Err(e) => {
-                // Best-effort cleanup: surface the seal error even if the abort
-                // itself fails (leaving the parts to the backend's lifecycle rule).
-                parts.shutdown().await;
-                if let Err(abort_err) = upload.abort().await {
+                if let Err(abort_err) = abort_segment_upload(upload).await {
                     tracing::warn!("segment seal: aborting failed upload of {path}: {abort_err}");
+                }
+                if reconcile_completion {
+                    match self.verify_existing_segment_bytes(path, bytes).await {
+                        Ok(result) => return Ok(result),
+                        Err(conflict)
+                            if matches!(e, slatedb::object_store::Error::AlreadyExists { .. }) =>
+                        {
+                            return Err(conflict);
+                        }
+                        Err(_) => {}
+                    }
                 }
                 Err(SegmentStoreError::ObjectStore(e.to_string()))
             }
@@ -361,6 +500,17 @@ impl SegmentStore {
             .await
             .map_err(|e| SegmentStoreError::ObjectStore(e.to_string()))
     }
+}
+
+async fn abort_segment_upload(
+    mut upload: Box<dyn MultipartUpload>,
+) -> slatedb::object_store::Result<()> {
+    tokio::spawn(async move { upload.abort().await })
+        .await
+        .map_err(|error| slatedb::object_store::Error::Generic {
+            store: "SegmentStore",
+            source: format!("multipart abort task failed: {error}").into(),
+        })?
 }
 
 /// GC/maintenance primitives.
@@ -665,13 +815,15 @@ mod tests {
         CopyOptions, GetResult, ListResult, ObjectMeta, PutMultipartOptions, PutOptions,
         PutPayload, PutResult, Result as OsResult, UploadPart,
     };
-    use std::sync::atomic::AtomicBool;
     use tokio::sync::Notify;
 
     fn store() -> SegmentStore {
         let os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let codec = FrameCodec::new(&[1u8; 32], SEGMENT_INFO, CompressionConfig::Lz4);
-        SegmentStore::new(os, codec, 5, None)
+        SegmentStore::new(os, codec(), 5, None)
+    }
+
+    fn codec() -> FrameCodec {
+        FrameCodec::new(&[1u8; 32], SEGMENT_INFO, CompressionConfig::Lz4)
     }
 
     #[tokio::test]
@@ -808,6 +960,10 @@ mod tests {
         fail_complete: bool,
         fail_put: bool,
         fail_after_create: AtomicBool,
+        gate_create: AtomicBool,
+        entered: Notify,
+        release: Notify,
+        cancelled: Arc<AtomicBool>,
         aborted: Arc<AtomicBool>,
         saw_generated_segment_create: AtomicBool,
     }
@@ -822,6 +978,10 @@ mod tests {
                     fail_complete,
                     fail_put: false,
                     fail_after_create: AtomicBool::new(false),
+                    gate_create: AtomicBool::new(false),
+                    entered: Notify::new(),
+                    release: Notify::new(),
+                    cancelled: Arc::new(AtomicBool::new(false)),
                     aborted: aborted.clone(),
                     saw_generated_segment_create: AtomicBool::new(false),
                 }),
@@ -836,6 +996,25 @@ mod tests {
                 fail_complete: false,
                 fail_put: !fail_after_create,
                 fail_after_create: AtomicBool::new(fail_after_create),
+                gate_create: AtomicBool::new(false),
+                entered: Notify::new(),
+                release: Notify::new(),
+                cancelled: Arc::new(AtomicBool::new(false)),
+                aborted: Arc::new(AtomicBool::new(false)),
+            })
+        }
+
+        fn with_cancelled_create() -> Arc<Self> {
+            Arc::new(Self {
+                inner: Arc::new(InMemory::new()),
+                fail_part: None,
+                fail_complete: false,
+                fail_put: false,
+                fail_after_create: AtomicBool::new(false),
+                gate_create: AtomicBool::new(true),
+                entered: Notify::new(),
+                release: Notify::new(),
+                cancelled: Arc::new(AtomicBool::new(false)),
                 aborted: Arc::new(AtomicBool::new(false)),
                 saw_generated_segment_create: AtomicBool::new(false),
             })
@@ -852,6 +1031,19 @@ mod tests {
     impl std::fmt::Display for MultipartFaultStore {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             write!(f, "MultipartFaultStore({})", self.inner)
+        }
+    }
+
+    struct CancellationGuard {
+        cancelled: Arc<AtomicBool>,
+        armed: bool,
+    }
+
+    impl Drop for CancellationGuard {
+        fn drop(&mut self) {
+            if self.armed {
+                self.cancelled.store(true, Ordering::SeqCst);
+            }
         }
     }
 
@@ -896,10 +1088,19 @@ mod tests {
             payload: PutPayload,
             opts: PutOptions,
         ) -> OsResult<PutResult> {
+            let is_create = matches!(&opts.mode, PutMode::Create);
+            if is_create && self.gate_create.swap(false, Ordering::SeqCst) {
+                let mut guard = CancellationGuard {
+                    cancelled: self.cancelled.clone(),
+                    armed: true,
+                };
+                self.entered.notify_one();
+                self.release.notified().await;
+                guard.armed = false;
+            }
             if self.fail_put {
                 return Err(Self::injected());
             }
-            let is_create = matches!(&opts.mode, PutMode::Create);
             let result = self.inner.put_opts(location, payload, opts).await?;
             if is_create && self.fail_after_create.swap(false, Ordering::SeqCst) {
                 return Err(Self::injected());
@@ -1082,6 +1283,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn multipart_fallback_does_not_repeat_the_store_write_through_warm() {
+        let os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let warms = Arc::new(AtomicU64::new(0));
+        let observed = warms.clone();
+        let warm: SegmentWarmHook = Arc::new(move |_, _, _| {
+            observed.fetch_add(1, Ordering::Relaxed);
+        });
+        let store = SegmentStore::new(os, codec(), 5, Some(warm));
+
+        store
+            .put_segment(store.next_segid(), Bytes::from(vec![7u8; SEAL_PART_SIZE]))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            warms.load(Ordering::Relaxed),
+            0,
+            "an unacknowledged multipart probe falls back to single-PUT write-through"
+        );
+    }
+
+    #[tokio::test]
     async fn single_put_segment_refuses_to_overwrite_an_existing_segment() {
         let os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let codec = FrameCodec::new(&[1u8; 32], SEGMENT_INFO, CompressionConfig::Lz4);
@@ -1100,6 +1323,167 @@ mod tests {
 
         let stored = os.get(&path).await.unwrap().bytes().await.unwrap();
         assert_eq!(stored, Bytes::from_static(b"first segment"));
+    }
+
+    #[tokio::test]
+    async fn single_put_reconciles_only_exact_existing_bytes() {
+        for (existing, wanted, succeeds) in [
+            (b"".as_slice(), b"".as_slice(), true),
+            (b"exact".as_slice(), b"exact".as_slice(), true),
+            (b"other".as_slice(), b"exact".as_slice(), false),
+            (b"exac".as_slice(), b"exact".as_slice(), false),
+            (b"exact!".as_slice(), b"exact".as_slice(), false),
+        ] {
+            let os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            let store = SegmentStore::new(os.clone(), codec(), 5, None);
+            let segid = store.next_segid();
+            let path = Path::from(segid.object_key());
+            os.put(&path, Bytes::copy_from_slice(existing).into())
+                .await
+                .unwrap();
+
+            assert_eq!(
+                store
+                    .put_segment(segid, Bytes::copy_from_slice(wanted))
+                    .await
+                    .is_ok(),
+                succeeds,
+                "existing length {}, wanted length {}",
+                existing.len(),
+                wanted.len()
+            );
+            assert_eq!(
+                os.get(&path).await.unwrap().bytes().await.unwrap(),
+                Bytes::copy_from_slice(existing)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn multipart_reconciles_only_exact_existing_bytes() {
+        for (existing, wanted, succeeds) in [
+            (b"".as_slice(), b"".as_slice(), true),
+            (b"exact".as_slice(), b"exact".as_slice(), true),
+            (b"other".as_slice(), b"exact".as_slice(), false),
+            (b"exac".as_slice(), b"exact".as_slice(), false),
+            (b"exact!".as_slice(), b"exact".as_slice(), false),
+        ] {
+            let os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            let store = SegmentStore::new(os.clone(), codec(), 5, None);
+            let path = Path::from(store.next_segid().object_key());
+            os.put(&path, Bytes::copy_from_slice(existing).into())
+                .await
+                .unwrap();
+
+            assert_eq!(
+                store
+                    .put_segment_multipart(&path, &Bytes::copy_from_slice(wanted))
+                    .await
+                    .is_ok(),
+                succeeds,
+                "existing length {}, wanted length {}",
+                existing.len(),
+                wanted.len()
+            );
+            assert_eq!(
+                os.get(&path).await.unwrap().bytes().await.unwrap(),
+                Bytes::copy_from_slice(existing)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn immutable_create_is_preserved_below_at_and_above_multipart_boundary() {
+        for size in [SEAL_PART_SIZE - 1, SEAL_PART_SIZE, SEAL_PART_SIZE + 1] {
+            let os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            let store = SegmentStore::new(os.clone(), codec(), 5, None);
+            let segid = store.next_segid();
+            let path = Path::from(segid.object_key());
+            let existing = Bytes::from(vec![1u8; size]);
+            os.put(&path, existing.clone().into()).await.unwrap();
+
+            store
+                .put_segment(segid, Bytes::from(vec![2u8; size]))
+                .await
+                .expect_err("an existing immutable segment must win at every size boundary");
+            assert_eq!(
+                os.get(&path).await.unwrap().bytes().await.unwrap(),
+                existing
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_multipart_can_retry_without_overwrite_or_staging_residue() {
+        let backend = MultipartFaultStore::with_cancelled_create();
+        let object_store: Arc<dyn ObjectStore> = backend.clone();
+        let store = Arc::new(SegmentStore::new(object_store.clone(), codec(), 5, None));
+        let path = Path::from(store.next_segid().object_key());
+        let wanted = Bytes::from_static(b"retry after cancellation");
+        let task = {
+            let store = store.clone();
+            let path = path.clone();
+            let wanted = wanted.clone();
+            tokio::spawn(async move { store.put_segment_multipart(&path, &wanted).await })
+        };
+
+        backend.entered.notified().await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(backend.cancelled.load(Ordering::SeqCst));
+        assert!(matches!(
+            object_store.head(&path).await,
+            Err(slatedb::object_store::Error::NotFound { .. })
+        ));
+
+        store.put_segment_multipart(&path, &wanted).await.unwrap();
+        assert_eq!(
+            object_store
+                .get(&path)
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap(),
+            wanted
+        );
+        assert!(
+            object_store
+                .list(None)
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap()
+                .iter()
+                .all(|meta| !meta.location.as_ref().contains(".zerofs-multipart-"))
+        );
+    }
+
+    #[tokio::test]
+    async fn lost_conditional_multipart_publish_response_is_reconciled_and_retryable() {
+        let backend = MultipartFaultStore::with_create_failure(true);
+        let object_store: Arc<dyn ObjectStore> = backend;
+        let store = SegmentStore::new(object_store.clone(), codec(), 5, None);
+        let path = Path::from(store.next_segid().object_key());
+        let wanted = Bytes::from_static(b"multipart publish with a lost response");
+
+        store
+            .put_segment_multipart(&path, &wanted)
+            .await
+            .expect("exact readback must reconcile a lost conditional-create response");
+        store
+            .put_segment_multipart(&path, &wanted)
+            .await
+            .expect("retry must reconcile the already-published exact bytes");
+        assert_eq!(
+            object_store
+                .get(&path)
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap(),
+            wanted
+        );
     }
 
     #[tokio::test]
@@ -1195,10 +1579,12 @@ mod tests {
     #[tokio::test]
     async fn failed_multipart_part_aborts_the_upload() {
         let (os, aborted) = MultipartFaultStore::new(Some(1), false);
-        let codec = FrameCodec::new(&[1u8; 32], SEGMENT_INFO, CompressionConfig::Lz4);
-        let store = SegmentStore::new(os, codec, 5, None);
+        let store = SegmentStore::new(os.clone(), codec(), 5, None);
+        let path = Path::from(store.next_segid().object_key());
+        let upload = os.put_multipart(&path).await.unwrap();
+        let bytes = noise(1, 2 * SEAL_PART_SIZE + 1024);
         let res = store
-            .put_segment(store.next_segid(), noise(1, 2 * SEAL_PART_SIZE + 1024))
+            .complete_segment_upload(&path, &bytes, upload, false)
             .await;
         assert!(res.is_err(), "the seal error must surface");
         assert!(
@@ -1212,10 +1598,12 @@ mod tests {
     #[tokio::test]
     async fn failed_multipart_complete_aborts_the_upload() {
         let (os, aborted) = MultipartFaultStore::new(None, true);
-        let codec = FrameCodec::new(&[1u8; 32], SEGMENT_INFO, CompressionConfig::Lz4);
-        let store = SegmentStore::new(os, codec, 5, None);
+        let store = SegmentStore::new(os.clone(), codec(), 5, None);
+        let path = Path::from(store.next_segid().object_key());
+        let upload = os.put_multipart(&path).await.unwrap();
+        let bytes = noise(1, 2 * SEAL_PART_SIZE + 1024);
         let res = store
-            .put_segment(store.next_segid(), noise(1, 2 * SEAL_PART_SIZE + 1024))
+            .complete_segment_upload(&path, &bytes, upload, false)
             .await;
         assert!(res.is_err(), "the seal error must surface");
         assert!(

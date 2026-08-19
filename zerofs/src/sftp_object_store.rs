@@ -20,7 +20,10 @@ use std::sync::{Arc, LazyLock, Mutex as StdMutex, Weak};
 use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
+use crate::segment_store::{ConditionalMultipartCreate, GeneratedSegmentCreate};
+
 pub const OBJECT_HEADER_LEN: usize = 32;
+const CREATE_RECONCILIATION_CHUNK_SIZE: u64 = 8 * 1024 * 1024;
 const OBJECT_HEADER_MAGIC: &[u8; 8] = b"ZEROFS\x01\0";
 const SFTP_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
 const SFTP_STAGING_CLEANUP_ATTEMPTS: usize = 3;
@@ -314,7 +317,9 @@ pub async fn publish_payload(
     if mode == PublicationMode::Create {
         let publication = match session.hard_link(&staging, target).await {
             Ok(()) => Ok(()),
-            Err(error) => reconcile_publication(&session, target, header, error).await,
+            Err(error) => {
+                reconcile_create_publication(&session, target, &staging, header, error).await
+            }
         };
         return match publication {
             Ok(()) => Ok(PublicationOutcome {
@@ -390,6 +395,56 @@ async fn reconcile_publication(
     match observed {
         Ok(found) if found == expected => Ok(()),
         Ok(_) | Err(RemoteError::NotFound(_)) => Err(error),
+        Err(read_error) => Err(read_error),
+    }
+}
+
+async fn reconcile_create_publication(
+    session: &Arc<dyn RemoteSession>,
+    target: &FilePath,
+    staging: &FilePath,
+    expected: ObjectHeader,
+    error: RemoteError,
+) -> RemoteResult<()> {
+    if !error.is_ambiguous() {
+        return Err(error);
+    }
+    let matches_staging = (|| async {
+        let bytes = session.read_exact(target, 0, OBJECT_HEADER_LEN).await?;
+        let observed = decode_header(&bytes).map_err(RemoteError::CorruptObject)?;
+        if observed != expected {
+            return Ok(false);
+        }
+
+        let mut logical_offset = 0;
+        while logical_offset < expected.logical_len {
+            let len = (expected.logical_len - logical_offset).min(CREATE_RECONCILIATION_CHUNK_SIZE)
+                as usize;
+            let physical_offset = OBJECT_HEADER_LEN as u64 + logical_offset;
+            let (target_bytes, staging_bytes) = tokio::try_join!(
+                session.read_exact(target, physical_offset, len),
+                session.read_exact(staging, physical_offset, len),
+            )?;
+            if target_bytes != staging_bytes {
+                return Ok(false);
+            }
+            logical_offset += len as u64;
+        }
+        Ok(true)
+    })
+    .retry(
+        ExponentialBuilder::default()
+            .without_max_times()
+            .with_min_delay(std::time::Duration::from_millis(100))
+            .with_max_delay(std::time::Duration::from_secs(1)),
+    )
+    .when(RemoteError::is_retryable)
+    .await;
+
+    match matches_staging {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(RemoteError::AlreadyExists(target.display().to_string())),
+        Err(RemoteError::NotFound(_)) => Err(error),
         Err(read_error) => Err(read_error),
     }
 }
@@ -940,8 +995,13 @@ impl ObjectStore for SftpObjectStore {
     async fn put_multipart_opts(
         &self,
         location: &ObjectPath,
-        _opts: PutMultipartOptions,
+        opts: PutMultipartOptions,
     ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        let mode = if opts.extensions.get::<GeneratedSegmentCreate>().is_some() {
+            MultipartPublicationMode::Create
+        } else {
+            MultipartPublicationMode::Overwrite
+        };
         let target = self.remote_path(location, false)?;
         self.forget_missing(location);
         let session: Arc<dyn RemoteSession> = Arc::new(PooledRemoteSession {
@@ -952,9 +1012,15 @@ impl ObjectStore for SftpObjectStore {
             location.clone(),
             target,
             self.known_missing.clone(),
+            mode,
         )
         .await
         .map_err(|error| publication_error(location, error))?;
+        if mode == MultipartPublicationMode::Create
+            && let Some(context) = opts.extensions.get::<ConditionalMultipartCreate>()
+        {
+            context.acknowledge();
+        }
         Ok(Box::new(upload))
     }
 
@@ -1071,7 +1137,23 @@ struct SftpMultipartUpload {
     generation: Uuid,
     state: Arc<StdMutex<SftpMultipartState>>,
     known_missing: Arc<DashSet<String>>,
+    mode: MultipartPublicationMode,
     terminal: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MultipartPublicationMode {
+    Create,
+    Overwrite,
+}
+
+impl MultipartPublicationMode {
+    fn publication_mode(self) -> PublicationMode {
+        match self {
+            Self::Create => PublicationMode::Create,
+            Self::Overwrite => PublicationMode::Overwrite,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1086,8 +1168,9 @@ impl SftpMultipartUpload {
         location: ObjectPath,
         target: PathBuf,
         known_missing: Arc<DashSet<String>>,
+        mode: MultipartPublicationMode,
     ) -> RemoteResult<Self> {
-        validate_publication_capabilities(session.capabilities(), PublicationMode::Overwrite)
+        validate_publication_capabilities(session.capabilities(), mode.publication_mode())
             .map_err(|extension| {
                 RemoteError::NotSupported(format!(
                     "SFTP server lacks required {extension} extension"
@@ -1095,17 +1178,24 @@ impl SftpMultipartUpload {
             })?;
         let generation = Uuid::new_v4();
         let staging = staging_path(&target, generation).map_err(RemoteError::InvalidPath)?;
-        let mut cleanup = StagingCleanup::new(session.clone(), staging.clone());
         let placeholder = encode_header(ObjectHeader {
             generation,
             logical_len: 0,
         });
-        if let Err(error) = session
-            .write_file_durable(&staging, vec![Bytes::copy_from_slice(&placeholder)])
-            .await
-        {
-            return Err(failure_with_cleanup(&mut cleanup, error).await);
-        }
+        let prepare_session = session.clone();
+        let prepare_staging = staging.clone();
+        let mut cleanup = tokio::spawn(async move {
+            let mut cleanup = StagingCleanup::new(prepare_session.clone(), prepare_staging.clone());
+            if let Err(error) = prepare_session
+                .write_file_durable(&prepare_staging, vec![Bytes::copy_from_slice(&placeholder)])
+                .await
+            {
+                return Err(failure_with_cleanup(&mut cleanup, error).await);
+            }
+            Ok(cleanup)
+        })
+        .await
+        .map_err(|error| RemoteError::Other(format!("multipart staging task failed: {error}")))??;
         cleanup.disarm();
         Ok(Self {
             session,
@@ -1115,6 +1205,7 @@ impl SftpMultipartUpload {
             generation,
             state: Arc::new(StdMutex::new(SftpMultipartState::default())),
             known_missing,
+            mode,
             terminal: false,
         })
     }
@@ -1200,12 +1291,40 @@ impl MultipartUpload for SftpMultipartUpload {
             )
             .await
             .map_err(|error| publication_error(&self.location, error))?;
-        let publication = match self.session.posix_rename(&staging, &self.target).await {
-            Ok(()) => Ok(()),
-            Err(error) => reconcile_publication(&self.session, &self.target, header, error).await,
+        let publication = match self.mode {
+            MultipartPublicationMode::Create => {
+                match self.session.hard_link(&staging, &self.target).await {
+                    Ok(()) => Ok(()),
+                    Err(error) => {
+                        reconcile_create_publication(
+                            &self.session,
+                            &self.target,
+                            &staging,
+                            header,
+                            error,
+                        )
+                        .await
+                    }
+                }
+            }
+            MultipartPublicationMode::Overwrite => {
+                match self.session.posix_rename(&staging, &self.target).await {
+                    Ok(()) => Ok(()),
+                    Err(error) => {
+                        reconcile_publication(&self.session, &self.target, header, error).await
+                    }
+                }
+            }
         };
         publication.map_err(|error| publication_error(&self.location, error))?;
         self.terminal = true;
+        if self.mode == MultipartPublicationMode::Create
+            && let Err(error) = self.session.remove_file(&staging).await
+            && !matches!(error, RemoteError::NotFound(_))
+        {
+            tracing::warn!(%error, "SFTP multipart create committed with staging cleanup debt");
+            self.session.schedule_cleanup(staging);
+        }
         self.staging = None;
         self.known_missing.remove(self.location.as_ref());
         Ok(PutResult {
@@ -1264,7 +1383,6 @@ async fn finish_lease<T>(
                 error,
                 crate::sftp_transport::TransportError::NotFound(_)
                     | crate::sftp_transport::TransportError::PermissionDenied(_)
-                    | crate::sftp_transport::TransportError::AlreadyExists(_)
                     | crate::sftp_transport::TransportError::CorruptObject(_)
             );
             let cleanup = if reusable {
@@ -1290,12 +1408,6 @@ fn transport_error(error: crate::sftp_transport::TransportError) -> object_store
             object_store::Error::PermissionDenied {
                 path,
                 source: "SFTP server denied access".into(),
-            }
-        }
-        crate::sftp_transport::TransportError::AlreadyExists(path) => {
-            object_store::Error::AlreadyExists {
-                path,
-                source: "SFTP server reported that the path already exists".into(),
             }
         }
         crate::sftp_transport::TransportError::PoolClosed => object_store::Error::NotSupported {
@@ -1325,9 +1437,6 @@ fn remote_transport_error(error: crate::sftp_transport::TransportError) -> Remot
         crate::sftp_transport::TransportError::NotFound(path) => RemoteError::NotFound(path),
         crate::sftp_transport::TransportError::PermissionDenied(path) => {
             RemoteError::PermissionDenied(path)
-        }
-        crate::sftp_transport::TransportError::AlreadyExists(path) => {
-            RemoteError::AlreadyExists(path)
         }
         crate::sftp_transport::TransportError::CorruptObject(message) => {
             RemoteError::CorruptObject(message)
@@ -1422,7 +1531,7 @@ mod tests {
     use object_store::ObjectStoreExt;
     use std::collections::{HashMap, HashSet};
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::sync::{Barrier, Notify};
 
@@ -2491,7 +2600,10 @@ mod tests {
         ) -> Result<(), TransportError> {
             let mut files = self.0.files.lock().unwrap();
             if files.contains_key(to) {
-                return Err(TransportError::AlreadyExists(to.display().to_string()));
+                return Err(TransportError::Operation(format!(
+                    "hard link target already exists: {}",
+                    to.display()
+                )));
             }
             let bytes = files
                 .get(from)
@@ -2885,6 +2997,7 @@ mod tests {
     struct LostReplySession {
         inner: RecordingSession,
         replace_target_header: bool,
+        replace_target_payload: bool,
         corrupt_target_header: bool,
         transient_read_call: Option<usize>,
         read_calls: AtomicUsize,
@@ -2895,6 +3008,7 @@ mod tests {
             Self {
                 inner: RecordingSession::new(),
                 replace_target_header: false,
+                replace_target_payload: false,
                 corrupt_target_header: false,
                 transient_read_call: None,
                 read_calls: AtomicUsize::new(0),
@@ -2912,9 +3026,17 @@ mod tests {
             Self {
                 inner: RecordingSession::new(),
                 replace_target_header: true,
+                replace_target_payload: false,
                 corrupt_target_header: false,
                 transient_read_call: None,
                 read_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn matching_header_with_different_payload() -> Self {
+            Self {
+                replace_target_payload: true,
+                ..Self::matching()
             }
         }
 
@@ -2922,6 +3044,7 @@ mod tests {
             Self {
                 inner: RecordingSession::new(),
                 replace_target_header: false,
+                replace_target_payload: false,
                 corrupt_target_header: true,
                 transient_read_call: None,
                 read_calls: AtomicUsize::new(0),
@@ -2929,11 +3052,20 @@ mod tests {
         }
 
         fn maybe_replace_target(&self, target: &FilePath) {
-            if !self.replace_target_header && !self.corrupt_target_header {
+            if !self.replace_target_header
+                && !self.replace_target_payload
+                && !self.corrupt_target_header
+            {
                 return;
             }
             let mut files = self.inner.files.lock().unwrap();
             let bytes = files.get_mut(target).expect("publication created target");
+            if self.replace_target_payload {
+                let mut replacement = bytes.to_vec();
+                replacement[OBJECT_HEADER_LEN] ^= 0xff;
+                *bytes = replacement.into();
+                return;
+            }
             let mut replacement = if self.corrupt_target_header {
                 vec![0; OBJECT_HEADER_LEN]
             } else {
@@ -2958,6 +3090,8 @@ mod tests {
         max_part_writes_in_flight: AtomicUsize,
         part_writes: AtomicUsize,
         durable_writes: AtomicUsize,
+        lose_hardlink_reply: AtomicBool,
+        corrupt_hardlink_target: AtomicBool,
     }
 
     impl ParallelMultipartSession {
@@ -2969,7 +3103,83 @@ mod tests {
                 max_part_writes_in_flight: AtomicUsize::new(0),
                 part_writes: AtomicUsize::new(0),
                 durable_writes: AtomicUsize::new(0),
+                lose_hardlink_reply: AtomicBool::new(false),
+                corrupt_hardlink_target: AtomicBool::new(false),
             }
+        }
+
+        fn with_lost_hardlink_reply() -> Self {
+            Self {
+                lose_hardlink_reply: AtomicBool::new(true),
+                ..Self::new()
+            }
+        }
+
+        fn with_lost_hardlink_reply_and_corrupt_target() -> Self {
+            Self {
+                lose_hardlink_reply: AtomicBool::new(true),
+                corrupt_hardlink_target: AtomicBool::new(true),
+                ..Self::new()
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct DelayedBeginSession {
+        inner: RecordingSession,
+        entered: Notify,
+        release: Notify,
+    }
+
+    impl DelayedBeginSession {
+        fn new() -> Self {
+            Self {
+                inner: RecordingSession::new(),
+                entered: Notify::new(),
+                release: Notify::new(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl RemoteSession for DelayedBeginSession {
+        fn capabilities(&self) -> SftpCapabilities {
+            self.inner.capabilities()
+        }
+
+        async fn read_exact(
+            &self,
+            path: &FilePath,
+            offset: u64,
+            len: usize,
+        ) -> RemoteResult<Bytes> {
+            self.inner.read_exact(path, offset, len).await
+        }
+
+        async fn write_file_durable(
+            &self,
+            path: &FilePath,
+            chunks: Vec<Bytes>,
+        ) -> RemoteResult<()> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            self.inner.write_file_durable(path, chunks).await
+        }
+
+        async fn remove_file(&self, path: &FilePath) -> RemoteResult<()> {
+            self.inner.remove_file(path).await
+        }
+
+        async fn hard_link(&self, from: &FilePath, to: &FilePath) -> RemoteResult<()> {
+            self.inner.hard_link(from, to).await
+        }
+
+        async fn posix_rename(&self, from: &FilePath, to: &FilePath) -> RemoteResult<()> {
+            self.inner.posix_rename(from, to).await
+        }
+
+        fn schedule_cleanup(&self, path: PathBuf) {
+            self.inner.schedule_cleanup(path);
         }
     }
 
@@ -3076,11 +3286,23 @@ mod tests {
 
         async fn hard_link(&self, from: &FilePath, to: &FilePath) -> RemoteResult<()> {
             let mut files = self.files.lock().unwrap();
+            if files.contains_key(to) {
+                return Err(RemoteError::AlreadyExists(to.display().to_string()));
+            }
             let bytes = files
                 .get(from)
                 .cloned()
                 .ok_or_else(|| RemoteError::NotFound(from.display().to_string()))?;
             files.insert(to.to_path_buf(), bytes);
+            if self.lose_hardlink_reply.swap(false, Ordering::SeqCst) {
+                if self.corrupt_hardlink_target.swap(false, Ordering::SeqCst) {
+                    let target = files.get_mut(to).expect("hardlink target inserted");
+                    let mut replacement = target.to_vec();
+                    replacement[OBJECT_HEADER_LEN] ^= 0xff;
+                    *target = replacement.into();
+                }
+                return Err(RemoteError::Other("publication reply lost".to_owned()));
+            }
             Ok(())
         }
 
@@ -3108,6 +3330,7 @@ mod tests {
             location,
             target.to_path_buf(),
             Arc::new(DashSet::new()),
+            MultipartPublicationMode::Overwrite,
         )
         .await
         .unwrap();
@@ -3143,14 +3366,147 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelled_multipart_begin_cleans_a_late_staging_write() {
+        let session = Arc::new(DelayedBeginSession::new());
+        let task = {
+            let session = session.clone();
+            tokio::spawn(async move {
+                SftpMultipartUpload::begin(
+                    session,
+                    ObjectPath::from("zerofs/v1/cancelled-begin.bin"),
+                    PathBuf::from("zerofs/v1/cancelled-begin.bin"),
+                    Arc::new(DashSet::new()),
+                    MultipartPublicationMode::Overwrite,
+                )
+                .await
+            })
+        };
+        session.entered.notified().await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        session.release.notify_one();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if session.inner.scheduled_cleanups.load(Ordering::SeqCst) == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("late staging write was not cleaned after begin cancellation");
+        assert!(session.inner.files.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn conditional_multipart_create_preserves_an_existing_target() {
+        let session = Arc::new(ParallelMultipartSession::new());
+        let location = ObjectPath::from("zerofs/v1/immutable.bin");
+        let target = PathBuf::from("zerofs/v1/immutable.bin");
+        let existing_header = ObjectHeader {
+            generation: Uuid::new_v4(),
+            logical_len: 8,
+        };
+        let mut existing = encode_header(existing_header).to_vec();
+        existing.extend_from_slice(b"existing");
+        session
+            .files
+            .lock()
+            .unwrap()
+            .insert(target.clone(), Bytes::copy_from_slice(&existing));
+        let mut upload = SftpMultipartUpload::begin(
+            session.clone(),
+            location,
+            target.clone(),
+            Arc::new(DashSet::new()),
+            MultipartPublicationMode::Create,
+        )
+        .await
+        .unwrap();
+        let first = upload.put_part(PutPayload::from_static(b"replace"));
+        let second = upload.put_part(PutPayload::from_static(b"ment"));
+        futures::future::try_join(first, second).await.unwrap();
+
+        let error = upload.complete().await.unwrap_err();
+        assert!(matches!(error, object_store::Error::AlreadyExists { .. }));
+        upload.abort().await.unwrap();
+        assert_eq!(
+            session.files.lock().unwrap().get(&target).unwrap().as_ref(),
+            existing
+        );
+    }
+
+    #[tokio::test]
+    async fn conditional_multipart_create_reconciles_a_lost_publish_response() {
+        let session = Arc::new(ParallelMultipartSession::with_lost_hardlink_reply());
+        let location = ObjectPath::from("zerofs/v1/lost-reply.bin");
+        let target = PathBuf::from("zerofs/v1/lost-reply.bin");
+        let mut upload = SftpMultipartUpload::begin(
+            session.clone(),
+            location,
+            target.clone(),
+            Arc::new(DashSet::new()),
+            MultipartPublicationMode::Create,
+        )
+        .await
+        .unwrap();
+        let first = upload.put_part(PutPayload::from_static(b"hello "));
+        let second = upload.put_part(PutPayload::from_static(b"world"));
+        futures::future::try_join(first, second).await.unwrap();
+
+        upload.complete().await.unwrap();
+        let published = session.files.lock().unwrap().get(&target).cloned().unwrap();
+        assert_eq!(&published[OBJECT_HEADER_LEN..], b"hello world");
+        assert!(
+            session
+                .files
+                .lock()
+                .unwrap()
+                .keys()
+                .all(|path| !is_staging_name(path.file_name().unwrap().as_ref()))
+        );
+    }
+
+    #[tokio::test]
+    async fn conditional_multipart_create_rejects_matching_header_with_different_payload() {
+        let session =
+            Arc::new(ParallelMultipartSession::with_lost_hardlink_reply_and_corrupt_target());
+        let location = ObjectPath::from("zerofs/v1/corrupt-lost-reply.bin");
+        let target = PathBuf::from("zerofs/v1/corrupt-lost-reply.bin");
+        let mut upload = SftpMultipartUpload::begin(
+            session,
+            location,
+            target,
+            Arc::new(DashSet::new()),
+            MultipartPublicationMode::Create,
+        )
+        .await
+        .unwrap();
+        let first = upload.put_part(PutPayload::from_static(b"immutable "));
+        let second = upload.put_part(PutPayload::from_static(b"multipart"));
+        futures::future::try_join(first, second).await.unwrap();
+
+        assert!(matches!(
+            upload.complete().await.unwrap_err(),
+            object_store::Error::AlreadyExists { .. }
+        ));
+    }
+
+    #[tokio::test]
     async fn failed_multipart_abort_keeps_staging_armed_for_retry() {
         let session = Arc::new(RecordingSession::with_remove_failure());
         let location = ObjectPath::from("zerofs/v1/abort.bin");
         let target = PathBuf::from("zerofs/v1/abort.bin");
-        let mut upload =
-            SftpMultipartUpload::begin(session, location, target, Arc::new(DashSet::new()))
-                .await
-                .unwrap();
+        let mut upload = SftpMultipartUpload::begin(
+            session,
+            location,
+            target,
+            Arc::new(DashSet::new()),
+            MultipartPublicationMode::Overwrite,
+        )
+        .await
+        .unwrap();
 
         upload.abort().await.expect_err("forced removal must fail");
 
@@ -3201,9 +3557,15 @@ mod tests {
         let location = ObjectPath::from("zerofs/v1/failed-begin.bin");
         let target = PathBuf::from("zerofs/v1/failed-begin.bin");
 
-        let error = SftpMultipartUpload::begin(session, location, target, Arc::new(DashSet::new()))
-            .await
-            .expect_err("failed initiation must report both write failure and cleanup debt");
+        let error = SftpMultipartUpload::begin(
+            session,
+            location,
+            target,
+            Arc::new(DashSet::new()),
+            MultipartPublicationMode::Overwrite,
+        )
+        .await
+        .expect_err("failed initiation must report both write failure and cleanup debt");
 
         match error {
             RemoteError::CleanupRequired { operation, debt } => {
@@ -3221,7 +3583,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lost_publication_reply_reconciles_matching_target_header() {
+    async fn lost_publication_reply_reconciles_matching_object() {
         for mode in [PublicationMode::Create, PublicationMode::Overwrite] {
             let session = Arc::new(LostReplySession::matching());
             let target = FilePath::new("/objects/segment.bin");
@@ -3254,10 +3616,22 @@ mod tests {
         .await
         .expect_err("a different target generation cannot reconcile this publication");
 
-        assert!(matches!(
-            error,
-            RemoteError::Other(ref message) if message == "publication reply lost"
-        ));
+        assert!(matches!(error, RemoteError::AlreadyExists(_)));
+    }
+
+    #[tokio::test]
+    async fn create_lost_reply_rejects_matching_header_with_different_payload() {
+        let error = publish_payload(
+            Arc::new(LostReplySession::matching_header_with_different_payload()),
+            FilePath::new("/objects/segment.bin"),
+            vec![Bytes::from_static(b"payload")],
+            PublicationMode::Create,
+            None,
+        )
+        .await
+        .expect_err("matching metadata cannot reconcile different object bytes");
+
+        assert!(matches!(error, RemoteError::AlreadyExists(_)));
     }
 
     #[tokio::test]
@@ -3274,7 +3648,7 @@ mod tests {
         .await
         .expect("create reconciliation must retain its committed generation");
         assert_eq!(created.header.logical_len, 6);
-        assert_eq!(create.read_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(create.read_calls.load(Ordering::SeqCst), 4);
 
         let update = Arc::new(LostReplySession::matching_after_transient_read(2));
         let target = FilePath::new("/objects/update.bin");
@@ -4198,6 +4572,52 @@ mod tests {
                 .unwrap()
                 .as_ref(),
             b"hello multipart"
+        );
+
+        let conditional_location = ObjectPath::from("zerofs/v1/multipart-create.bin");
+        let capability = ConditionalMultipartCreate::default();
+        let mut options = PutMultipartOptions::default();
+        options.extensions.insert(GeneratedSegmentCreate);
+        options.extensions.insert(capability.clone());
+        let mut conditional = store
+            .put_multipart_opts(&conditional_location, options)
+            .await
+            .unwrap();
+        assert!(capability.is_acknowledged());
+        let first_part = conditional.put_part(PutPayload::from_static(b"immutable "));
+        let second_part = conditional.put_part(PutPayload::from_static(b"multipart"));
+        futures::future::try_join(first_part, second_part)
+            .await
+            .unwrap();
+        conditional.complete().await.unwrap();
+
+        let capability = ConditionalMultipartCreate::default();
+        let mut options = PutMultipartOptions::default();
+        options.extensions.insert(GeneratedSegmentCreate);
+        options.extensions.insert(capability.clone());
+        let mut conflicting = store
+            .put_multipart_opts(&conditional_location, options)
+            .await
+            .unwrap();
+        assert!(capability.is_acknowledged());
+        conflicting
+            .put_part(PutPayload::from_static(b"replacement"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            conflicting.complete().await.unwrap_err(),
+            object_store::Error::AlreadyExists { .. }
+        ));
+        assert_eq!(
+            store
+                .get(&conditional_location)
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap()
+                .as_ref(),
+            b"immutable multipart"
         );
     }
 }

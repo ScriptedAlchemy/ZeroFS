@@ -1,4 +1,6 @@
-use crate::segment_store::GeneratedSegmentCreate;
+use crate::segment_store::{
+    AuthoritativeSegmentRead, ConditionalMultipartCreate, GeneratedSegmentCreate,
+};
 use crate::writeback::admission::Admission;
 use crate::writeback::config::{AckMode, WritebackSettings};
 use crate::writeback::journal::Journal;
@@ -837,6 +839,11 @@ impl ObjectStore for WritebackObjectStore {
         options: PutMultipartOptions,
     ) -> object_store::Result<Box<dyn MultipartUpload>> {
         self.ensure_writable()?;
+        if options.extensions.get::<GeneratedSegmentCreate>().is_some()
+            && let Some(context) = options.extensions.get::<ConditionalMultipartCreate>()
+        {
+            context.acknowledge();
+        }
         let memory_parts = self.inner.settings.ack_mode == AckMode::Memory;
         let staging = if memory_parts {
             None
@@ -864,6 +871,13 @@ impl ObjectStore for WritebackObjectStore {
         location: &Path,
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
+        if options
+            .extensions
+            .get::<AuthoritativeSegmentRead>()
+            .is_some()
+        {
+            return self.inner.overlay.get_remote_opts(location, options).await;
+        }
         self.inner.overlay.get_opts(location, options).await
     }
 
@@ -1559,7 +1573,7 @@ mod tests {
     use crate::config::CompressionConfig;
     use crate::fault_store::{FaultControls, FaultStore};
     use crate::frame_codec::FrameCodec;
-    use crate::segment::SEGMENT_INFO;
+    use crate::segment::{SEGMENT_INFO, Segid};
     use crate::segment_store::{GeneratedSegmentCreate, SegmentStore};
     use crate::writeback::config::{AckMode, ShutdownFlush, WritebackSettings};
     use crate::writeback::journal::Journal;
@@ -1789,6 +1803,61 @@ mod tests {
         store.shutdown().await.unwrap();
     }
 
+    async fn assert_generated_segment_preserves_remote_collision(size: usize) {
+        let capacity = (size as u64).saturating_mul(2).max(4 * 1024 * 1024);
+        let (store, remote, _temp, _controls) = test_store_with_capacities(
+            true,
+            AckMode::Remote,
+            ShutdownFlush::Remote,
+            capacity,
+            capacity,
+        )
+        .await;
+        let segid = Segid::new(5, 0);
+        let remote_path = Path::from(format!("zerofs/pilot/{}", segid.object_key()));
+        let existing = Bytes::from(vec![1u8; size]);
+        remote
+            .put(&remote_path, existing.clone().into())
+            .await
+            .unwrap();
+        let prefixed: Arc<dyn ObjectStore> = Arc::new(PrefixStore::new(
+            Arc::new(store.clone()),
+            Path::from("zerofs/pilot"),
+        ));
+        let segments = SegmentStore::new(
+            prefixed,
+            FrameCodec::new(&[1u8; 32], SEGMENT_INFO, CompressionConfig::Lz4),
+            5,
+            None,
+        );
+
+        segments
+            .put_segment(segid, Bytes::from(vec![2u8; size]))
+            .await
+            .expect_err("remote immutable-key collision must remain fatal");
+        assert_eq!(
+            remote
+                .get(&remote_path)
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap(),
+            existing
+        );
+        let _ = store.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn generated_segment_single_put_preserves_a_conflicting_remote_object() {
+        assert_generated_segment_preserves_remote_collision(1024).await;
+    }
+
+    #[tokio::test]
+    async fn generated_segment_multipart_preserves_a_conflicting_remote_object() {
+        assert_generated_segment_preserves_remote_collision(64 * 1024 * 1024).await;
+    }
+
     #[tokio::test]
     async fn only_explicit_safe_put_create_records_are_immutable() {
         let (store, remote, _temp) = test_store().await;
@@ -1917,6 +1986,21 @@ mod tests {
         tempfile::TempDir,
         Arc<FaultControls>,
     ) {
+        test_store_with_capacities(enabled, ack_mode, shutdown_flush, 1_000_000, disk_bytes).await
+    }
+
+    async fn test_store_with_capacities(
+        enabled: bool,
+        ack_mode: AckMode,
+        shutdown_flush: ShutdownFlush,
+        memory_bytes: u64,
+        disk_bytes: u64,
+    ) -> (
+        WritebackObjectStore,
+        Arc<InMemory>,
+        tempfile::TempDir,
+        Arc<FaultControls>,
+    ) {
         let temp = tempfile::tempdir().unwrap();
         let journal = Arc::new(
             Journal::open(
@@ -1938,7 +2022,7 @@ mod tests {
         let settings = WritebackSettings {
             dir: temp.path().join("writeback"),
             ack_mode,
-            memory_bytes: 1_000_000,
+            memory_bytes,
             disk_bytes,
             min_free_bytes: 1,
             high_watermark_percent: 95,

@@ -123,7 +123,8 @@
 //! as an early check and leaves the authoritative one to the commit.
 
 use crate::writeback::model::{
-    FenceClass, JournalIdentity, MutationKind, MutationRecord, Sequence, classify_mutation_fence,
+    FenceClass, JournalIdentity, MutationKind, MutationMode, MutationRecord, Sequence,
+    classify_mutation_fence, is_canonical_segment_path,
 };
 use crate::writeback::payload::VerifiedPayload;
 use anyhow::{Context, Result, bail};
@@ -157,7 +158,7 @@ const REMOTE_SEQ_KEY: &str = "remote_seq";
 const REMOTE_BYTES_COMPLETED_KEY: &str = "remote_bytes_completed";
 const REMOTE_RETRIES_KEY: &str = "remote_retries";
 const FENCE_CLASSIFICATION_VERSION_KEY: &str = "fence_classification_version";
-const FENCE_CLASSIFICATION_VERSION: u32 = 1;
+const FENCE_CLASSIFICATION_VERSION: u32 = 2;
 
 pub struct Journal {
     root: PathBuf,
@@ -1860,13 +1861,15 @@ fn initialize_or_validate_identity(database: &Database, expected: &JournalIdenti
         .context("failed to commit journal identity")
 }
 
-/// Re-derive persisted fence classes before any recovery path can use them.
+/// Normalize persisted immutable-segment contracts before recovery can use them.
 ///
 /// Version-1 journals serialized `FenceClass` while classification was based
 /// on a loose path heuristic, so an overwrite, copy, or malformed key could be
-/// recovered as `ImmutableCreate`. This durable migration uses the persisted
-/// mutation kind and the journal identity's database prefix as the authority.
-/// The marker and rewrites share one immediate transaction so replay and
+/// recovered as `ImmutableCreate`. Version 2 also upgrades pending canonical
+/// segment PUTs written by the old multipart path from overwrite to create;
+/// segment keys are immutable, and replaying such a record as overwrite could
+/// replace a newer writer's object. Completed records retain their historical
+/// mode. The marker and rewrites share one immediate transaction so replay and
 /// remote-version backfill never observe a partially normalized journal.
 fn normalize_mutation_fences(database: &Database, identity: &JournalIdentity) -> Result<()> {
     let mut transaction = database
@@ -1875,11 +1878,14 @@ fn normalize_mutation_fences(database: &Database, identity: &JournalIdentity) ->
     transaction
         .set_durability(Durability::Immediate)
         .context("failed to set fence classification migration durability")?;
-    let existing_version = {
+    let (existing_version, remote_seq) = {
         let meta = transaction
             .open_table(META)
             .context("failed to open journal metadata for fence classification migration")?;
-        read_optional::<u32>(&meta, FENCE_CLASSIFICATION_VERSION_KEY)?
+        (
+            read_optional::<u32>(&meta, FENCE_CLASSIFICATION_VERSION_KEY)?,
+            read_required::<u64>(&meta, REMOTE_SEQ_KEY)?,
+        )
     };
     if let Some(existing_version) = existing_version {
         if existing_version == FENCE_CLASSIFICATION_VERSION {
@@ -1913,10 +1919,22 @@ fn normalize_mutation_fences(database: &Database, identity: &JournalIdentity) ->
                     identity.format_version
                 );
             }
+            let mut changed = false;
+            if sequence.value() > remote_seq
+                && is_canonical_segment_path(&record.path, &identity.database_prefix)
+                && let MutationKind::Put { mode, .. } = &mut record.kind
+                && *mode == MutationMode::Overwrite
+            {
+                *mode = MutationMode::Create;
+                changed = true;
+            }
             let expected =
                 classify_mutation_fence(&record.path, &record.kind, &identity.database_prefix);
             if record.fence != expected {
                 record.fence = expected;
+                changed = true;
+            }
+            if changed {
                 rewritten.push((sequence.value(), bincode::serialize(&record)?));
             }
         }
@@ -2840,12 +2858,12 @@ mod tests {
             )
             .unwrap();
 
-        // Simulate a journal created before fence-classification migrations
-        // were versioned, regardless of which implementation created this fixture.
+        // Simulate a version-1 journal whose multipart segment PUT was still
+        // persisted as an overwrite.
         let transaction = journal.database.begin_write().unwrap();
         {
             let mut meta = transaction.open_table(META).unwrap();
-            meta.remove(FENCE_CLASSIFICATION_VERSION_KEY).unwrap();
+            write_value(&mut meta, FENCE_CLASSIFICATION_VERSION_KEY, &1_u32).unwrap();
         }
         transaction.commit().unwrap();
         drop(journal);
@@ -2858,12 +2876,19 @@ mod tests {
                 .map(|record| record.fence)
                 .collect::<Vec<_>>(),
             vec![
-                FenceClass::Fence,
+                FenceClass::ImmutableCreate,
                 FenceClass::Fence,
                 FenceClass::Fence,
                 FenceClass::ImmutableCreate,
             ]
         );
+        assert!(matches!(
+            pending[0].kind,
+            MutationKind::Put {
+                mode: MutationMode::Create,
+                ..
+            }
+        ));
         assert!(pending.iter().all(|record| record.format_version == 1));
         let read = reopened.database.begin_read().unwrap();
         let meta = read.open_table(META).unwrap();
@@ -2884,7 +2909,7 @@ mod tests {
                 .map(|record| record.fence)
                 .collect::<Vec<_>>(),
             vec![
-                FenceClass::Fence,
+                FenceClass::ImmutableCreate,
                 FenceClass::Fence,
                 FenceClass::Fence,
                 FenceClass::ImmutableCreate,
