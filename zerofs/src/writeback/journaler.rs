@@ -734,12 +734,15 @@ struct AssembledBatch {
 fn take_fatal_head(
     prepared: &mut BTreeMap<Sequence, PreparedEntry>,
     sequence: Sequence,
-) -> AnyResult<PreparedMutation> {
-    let (result, ownership) = prepared
+) -> PreparedEntry {
+    prepared
         .remove(&sequence)
-        .expect("the fatal preparation still exists");
-    drop(ownership);
-    result
+        .expect("the fatal preparation still exists")
+}
+
+struct AssemblyError {
+    message: String,
+    ownership: BatchOwnership,
 }
 
 /// Take the longest contiguous run of ready preparations that fits one batch.
@@ -751,7 +754,7 @@ fn take_fatal_head(
 fn assemble_batch(
     prepared: &mut BTreeMap<Sequence, PreparedEntry>,
     next_admitted: Sequence,
-) -> Result<Option<AssembledBatch>, String> {
+) -> Result<Option<AssembledBatch>, AssemblyError> {
     let mut mutations = Vec::new();
     let mut ownership: BatchOwnership = Vec::new();
     let mut encoded_record_bytes = 0_usize;
@@ -766,10 +769,13 @@ fn assemble_batch(
             if !mutations.is_empty() {
                 break;
             }
-            let Err(error) = take_fatal_head(prepared, sequence) else {
+            let (Err(error), fatal_ownership) = take_fatal_head(prepared, sequence) else {
                 unreachable!("the preparation result was checked above")
             };
-            return Err(format!("{error:#}"));
+            return Err(AssemblyError {
+                message: format!("{error:#}"),
+                ownership: vec![fatal_ownership],
+            });
         }
         if mutations.len() == MAX_LOCAL_PUBLISH_BATCH_RECORDS {
             break;
@@ -783,25 +789,34 @@ fn assemble_batch(
                 if !mutations.is_empty() {
                     break;
                 }
-                drop(take_fatal_head(prepared, sequence));
-                return Err(format!("{error:#}"));
+                let (_, fatal_ownership) = take_fatal_head(prepared, sequence);
+                return Err(AssemblyError {
+                    message: format!("{error:#}"),
+                    ownership: vec![fatal_ownership],
+                });
             }
         };
         if mutation_bytes > MAX_LOCAL_PUBLISH_BATCH_RECORD_BYTES {
             if !mutations.is_empty() {
                 break;
             }
-            drop(take_fatal_head(prepared, sequence));
-            return Err(format!(
-                "prepared journal mutation {sequence} encodes to {mutation_bytes} bytes, exceeding the {MAX_LOCAL_PUBLISH_BATCH_RECORD_BYTES}-byte local publication batch limit"
-            ));
+            let (_, fatal_ownership) = take_fatal_head(prepared, sequence);
+            return Err(AssemblyError {
+                message: format!(
+                    "prepared journal mutation {sequence} encodes to {mutation_bytes} bytes, exceeding the {MAX_LOCAL_PUBLISH_BATCH_RECORD_BYTES}-byte local publication batch limit"
+                ),
+                ownership: vec![fatal_ownership],
+            });
         }
         let Some(next_encoded_bytes) = encoded_record_bytes.checked_add(mutation_bytes) else {
             if !mutations.is_empty() {
                 break;
             }
-            drop(take_fatal_head(prepared, sequence));
-            return Err("local publication batch byte count overflow".to_owned());
+            let (_, fatal_ownership) = take_fatal_head(prepared, sequence);
+            return Err(AssemblyError {
+                message: "local publication batch byte count overflow".to_owned(),
+                ownership: vec![fatal_ownership],
+            });
         };
         if next_encoded_bytes > MAX_LOCAL_PUBLISH_BATCH_RECORD_BYTES {
             break;
@@ -1115,7 +1130,13 @@ async fn run_journaler(
         {
             match assemble_batch(&mut prepared, next_admitted) {
                 Err(error) => {
-                    terminal = Some(error);
+                    let cleanup_error =
+                        cleanup_uncommitted_ownership(error.ownership, space.as_deref()).await;
+                    let mut message = error.message;
+                    if let Some(error) = cleanup_error {
+                        message.push_str(&format!("; {error}"));
+                    }
+                    terminal = Some(message);
                     break;
                 }
                 Ok(Some(AssembledBatch {
@@ -1448,6 +1469,7 @@ mod tests {
     /// staging of the batch that starts at a chosen sequence.
     struct PipelineGateSink {
         journal: Arc<Journal>,
+        fail_prepare_on: Option<Sequence>,
         commit_gate_on: Sequence,
         commit_entered: tokio_mpsc::UnboundedSender<Vec<Sequence>>,
         commit_release: Mutex<Option<mpsc::Receiver<()>>>,
@@ -1468,6 +1490,7 @@ mod tests {
         ) -> Self {
             Self {
                 journal,
+                fail_prepare_on: None,
                 commit_gate_on,
                 commit_entered,
                 commit_release: Mutex::new(Some(commit_release)),
@@ -1486,6 +1509,9 @@ mod tests {
             record: MutationRecord,
             payload: Option<&VerifiedPayload>,
         ) -> Result<crate::writeback::journal::PreparedMutation> {
+            if self.fail_prepare_on == Some(record.sequence) {
+                bail!("injected preparation failure at {}", record.sequence);
+            }
             match payload {
                 Some(payload) => self.journal.prepare_verified_put(record, payload),
                 None => self.journal.prepare_metadata(record),
@@ -1674,6 +1700,68 @@ mod tests {
         assert_eq!(ssd.used_bytes(), journal_bytes);
         assert_eq!(ssd.used_operations(), 1);
         journaler.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fatal_preparation_failure_cleans_multipart_staging_before_releasing_claims() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = pipeline_journal(&temp);
+        let space = Arc::new(PhysicalSpaceSampler::new(journal.root().to_path_buf()));
+        let sample = space.sample().await.unwrap();
+        let ssd =
+            SsdAdmission::recover(1_000_000, 100, 95, 85, 1, std::iter::empty(), Some(sample))
+                .unwrap();
+        let record = put_record(1, b"payload");
+        let journal_bytes = record.ssd_reservation_bytes().unwrap();
+        let reservation = SsdMultipartPartReservation::reserve(&ssd, 7, journal_bytes, 1, sample)
+            .await
+            .unwrap();
+        let staging = temp.path().join("multipart-failed-prepare");
+        std::fs::create_dir(&staging).unwrap();
+        let staged_payload = staging.join("payload.staged");
+        std::fs::write(&staged_payload, b"payload").unwrap();
+        let verified = VerifiedPayload::from_staged_file(staged_payload, 7).unwrap();
+        let promoted = promote_multipart(MultipartReservationSet::Ssd(vec![reservation])).unwrap();
+        let MutationReservation::Ssd(mutation) = promoted.mutation else {
+            panic!("expected SSD multipart promotion")
+        };
+        let (disk, cleanup) = mutation.into_owned(staging.clone());
+        let (commit_entered_tx, _commit_entered) = tokio_mpsc::unbounded_channel();
+        let (staged_tx, _staged) = tokio_mpsc::unbounded_channel();
+        let (_release_tx, release_rx) = mpsc::channel();
+        let sink = Arc::new(PipelineGateSink {
+            fail_prepare_on: Some(1),
+            ..PipelineGateSink::new(
+                journal,
+                Sequence::MAX,
+                commit_entered_tx,
+                release_rx,
+                staged_tx,
+            )
+        });
+        let admission = Admission::new(64);
+        let journaler = LocalJournaler::start_with_sink_observer_space(
+            sink,
+            admission,
+            0,
+            uuid::Uuid::nil(),
+            8,
+            1,
+            None,
+            Some(space),
+        );
+
+        let barrier = journaler
+            .submit(record, Some(verified), None, Some(disk), Some(cleanup))
+            .await
+            .unwrap();
+        let error = barrier.wait_local(1).await.unwrap_err();
+        assert!(error.to_string().contains("injected preparation failure"));
+        assert!(!staging.exists());
+        assert_eq!(ssd.used_bytes(), 0);
+        assert_eq!(ssd.used_operations(), 0);
+        assert_eq!(ssd.outstanding_physical_claims(), 0);
+        journaler.shutdown().await.unwrap_err();
     }
 
     impl LocalJournalSink for BlockingSink {
@@ -3679,7 +3767,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_watermark_waits_for_reservation_transition() {
+    async fn local_watermark_uses_the_newer_observed_space_sample() {
         use crate::writeback::reservation::{SsdAdmission, SsdReservationRequest};
         use crate::writeback::space_sample::PhysicalSpaceSample;
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -3700,7 +3788,7 @@ mod tests {
             .await
             .unwrap();
         let published = AtomicBool::new(false);
-        let err = super::transition_reservations_then_publish_local(
+        let (committed, ()) = super::transition_reservations_then_publish_local(
             vec![token],
             &[12],
             PhysicalSpaceSample {
@@ -3709,12 +3797,9 @@ mod tests {
             },
             || published.store(true, Ordering::SeqCst),
         )
-        .unwrap_err();
-        assert!(matches!(
-            err,
-            crate::writeback::reservation::ReservationError::StaleSample { .. }
-        ));
-        assert!(!published.load(Ordering::SeqCst));
+        .unwrap();
+        assert!(published.load(Ordering::SeqCst));
+        assert_eq!(committed[0].sample().generation, 1);
         assert_eq!(admission.used_bytes(), 20);
     }
 
@@ -3757,10 +3842,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sample_failure_retains_ownership_and_poison() {
-        use crate::writeback::reservation::{
-            ReservationError, SsdAdmission, SsdReservationRequest,
-        };
+    async fn stale_transition_sample_uses_newer_observation_without_poison() {
+        use crate::writeback::reservation::{SsdAdmission, SsdReservationRequest};
         use crate::writeback::space_sample::PhysicalSpaceSample;
 
         let admission = SsdAdmission::new(1_000, 8, 100, 50, 10).unwrap();
@@ -3778,7 +3861,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let error = token
+        let committed = token
             .commit_local(
                 12,
                 PhysicalSpaceSample {
@@ -3786,8 +3869,8 @@ mod tests {
                     available_bytes: 1_000,
                 },
             )
-            .unwrap_err();
-        assert!(matches!(error, ReservationError::StaleSample { .. }));
+            .unwrap();
+        assert_eq!(committed.sample().generation, 2);
         assert_eq!(admission.used_bytes(), 20);
         let next = admission
             .reserve(
@@ -3802,8 +3885,8 @@ mod tests {
                 },
             )
             .await
-            .unwrap_err();
-        assert!(matches!(next, ReservationError::Poisoned(_)));
+            .unwrap();
+        drop(next);
     }
 
     #[tokio::test]

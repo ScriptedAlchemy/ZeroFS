@@ -9,6 +9,7 @@ use object_store::{
 use std::fmt::{Display, Formatter};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use tokio::sync::Notify;
 
 #[derive(Debug)]
 struct RecordingMultipartStore {
@@ -104,6 +105,31 @@ impl MultipartUpload for RecordingUpload {
     }
 }
 
+#[derive(Debug)]
+struct BlockingAbortUpload {
+    aborts: Arc<AtomicUsize>,
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+#[async_trait]
+impl MultipartUpload for BlockingAbortUpload {
+    fn put_part(&mut self, _data: PutPayload) -> UploadPart {
+        panic!("cleanup-only test never uploads a part")
+    }
+
+    async fn complete(&mut self) -> object_store::Result<PutResult> {
+        panic!("cleanup-only test never completes the upload")
+    }
+
+    async fn abort(&mut self) -> object_store::Result<()> {
+        self.aborts.fetch_add(1, Ordering::SeqCst);
+        self.entered.notify_one();
+        self.release.notified().await;
+        Ok(())
+    }
+}
+
 fn identity() -> JournalIdentity {
     JournalIdentity {
         format_version: 1,
@@ -139,7 +165,7 @@ async fn remote_replay_streams_payload_larger_than_the_window_in_bounded_parts()
         part_sizes: Arc::new(Mutex::new(Vec::new())),
     });
 
-    apply_record(store.clone(), Arc::clone(&journal), record)
+    apply_record_with_tracked_cleanup(store.clone(), Arc::clone(&journal), record)
         .await
         .unwrap();
 
@@ -178,7 +204,7 @@ async fn remote_replay_at_the_window_boundary_keeps_atomic_put_semantics() {
         part_sizes: Arc::new(Mutex::new(Vec::new())),
     });
 
-    apply_record(store.clone(), Arc::clone(&journal), record)
+    apply_record_with_tracked_cleanup(store.clone(), Arc::clone(&journal), record)
         .await
         .unwrap();
 
@@ -197,4 +223,29 @@ async fn remote_replay_at_the_window_boundary_keeps_atomic_put_semantics() {
             .as_ref(),
         payload.as_slice()
     );
+}
+
+#[tokio::test]
+async fn multipart_owner_cancellation_is_drained_by_the_tracked_cleanup_worker() {
+    let (cleanup_sender, cleanup_receiver) = mpsc::unbounded_channel();
+    let cleanup_worker = tokio::spawn(drain_remote_multipart_cleanup(cleanup_receiver, 1));
+    let aborts = Arc::new(AtomicUsize::new(0));
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let owner = RemoteMultipartOwner::new(
+        Box::new(BlockingAbortUpload {
+            aborts: Arc::clone(&aborts),
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        }),
+        cleanup_sender.clone(),
+    );
+
+    drop(owner);
+    drop(cleanup_sender);
+    entered.notified().await;
+    assert!(!cleanup_worker.is_finished());
+    release.notify_one();
+    cleanup_worker.await.unwrap().unwrap();
+    assert_eq!(aborts.load(Ordering::SeqCst), 1);
 }
