@@ -227,14 +227,9 @@ impl ZeroFS {
                     if new_size != old_size {
                         if new_size > old_size {
                             let size_increase = new_size - old_size;
-                            let (used_bytes, _) = self.global_stats.get_totals();
-                            if used_bytes.saturating_add(size_increase) > self.max_bytes {
-                                debug!(
-                                    "Setattr size change would exceed quota: used={}, increase={}, max={}",
-                                    used_bytes, size_increase, self.max_bytes
-                                );
-                                return Err(FsError::NoSpace);
-                            }
+                            let reservation = self.quota.reserve(size_increase)?;
+                            reservation.accept();
+                            reservation.canonical();
                         }
 
                         file.size = new_size;

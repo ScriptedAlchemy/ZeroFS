@@ -1,23 +1,26 @@
-use crate::sftp_object_store::{OBJECT_HEADER_LEN, ObjectHeader, SftpCapabilities, decode_header};
+use crate::sftp_object_store::{ObjectHeader, SftpCapabilities};
 use async_trait::async_trait;
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use dashmap::DashMap;
-use futures::{StreamExt, TryStreamExt};
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
-use std::io::Write;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::{Duration, SystemTime};
-#[cfg(test)]
-use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
+
+pub use crate::russh_session::{
+    RUSSH_MAXIMUM_PACKET_SIZE, RUSSH_SFTP_MAX_CONCURRENT_WRITES, RUSSH_WINDOW_SIZE,
+    RusshSessionFactory,
+};
+
+#[cfg(test)]
+pub use crate::russh_session::OpenSshTransportSession;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OperationKind {
@@ -26,52 +29,35 @@ pub enum OperationKind {
     Metadata,
 }
 
+#[cfg(test)]
 /// Match the largest safe OpenSSH SFTP v3 payload used by the proven rclone
 /// path. The client still clips a request if a server negotiates a lower limit.
 const SFTP_WRITE_PACKET_SIZE: usize = 255 * 1024;
 
+#[cfg(test)]
 /// Maximum outstanding WRITE requests on one leased SFTP session. A 64-request
 /// window hides the Storage Box WAN RTT without consuming more TCP sessions.
 const SFTP_WRITE_REQUEST_CONCURRENCY: usize = 64;
 
+#[cfg(test)]
 /// Match the write-side request size so sequential prefetch windows use the
 /// same proven Storage Box packet shape in both directions.
 const SFTP_READ_PACKET_SIZE: usize = 255 * 1024;
 
+#[cfg(test)]
 /// Maximum outstanding READ requests on one leased SFTP session. ZeroFS ramps
 /// sequential cache windows to 8 MiB; issuing their packets together hides the
 /// WAN RTT while preserving the shared physical-session limit.
 const SFTP_READ_REQUEST_CONCURRENCY: usize = 64;
 
-const SFTP_SESSION_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
-const SFTP_SESSION_CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
-const SFTP_SESSION_FORCE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
-const SFTP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
-const SFTP_IDLE_REAP_INTERVAL: Duration = Duration::from_secs(10);
-const SFTP_IDLE_WARM_FLOOR: usize = 1;
-const SFTP_POOL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(45);
-// How long shutdown lets already-scheduled staging cleanups finish while the
-// pool can still serve them. A cleanup sleeping between retry attempts holds
-// no session, so the activity drain alone would close the pool underneath it
-// and turn ordinary staging debris into a failed service stop.
-const SFTP_SHUTDOWN_CLEANUP_GRACE: Duration = Duration::from_secs(10);
-// Pacing for session dials after a failure. Storage backends cap concurrent
-// SSH sessions per account (Hetzner Storage Boxes around ten) and kill the
-// excess, and stale sessions from a previous crash still count against the
-// cap until the server reaps them. Every retrying caller redialing
-// immediately turns one over-limit moment into a sustained churn storm the
-// server can never shed; a shared backoff lets it drain instead.
-const SFTP_DIAL_BACKOFF_BASE: Duration = Duration::from_millis(100);
-const SFTP_DIAL_BACKOFF_MAX: Duration = Duration::from_secs(5);
-const SSH_PROCESS_FORCE_REAP_TIMEOUT: Duration = Duration::from_secs(5);
-const SFTP_DIRECTORY_CACHE_MAX_ENTRIES: usize = 64 * 1024;
-
+#[cfg(test)]
 #[derive(Debug)]
 struct PipelinedWrite {
     offset: u64,
     payload: Bytes,
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 struct PipelinedRead {
     index: usize,
@@ -79,6 +65,7 @@ struct PipelinedRead {
     len: usize,
 }
 
+#[cfg(test)]
 fn plan_pipelined_reads(
     initial_offset: u64,
     len: usize,
@@ -101,6 +88,7 @@ fn plan_pipelined_reads(
     Ok(requests)
 }
 
+#[cfg(test)]
 fn plan_pipelined_writes(
     initial_offset: u64,
     chunks: Vec<Bytes>,
@@ -120,94 +108,27 @@ fn plan_pipelined_writes(
     Ok(requests)
 }
 
-async fn write_file_pipelined(
-    file: &openssh_sftp_client::file::File,
-    path: &std::path::Path,
-    offset: u64,
-    chunks: Vec<Bytes>,
-) -> Result<(), TransportError> {
-    let requests = plan_pipelined_writes(offset, chunks)?;
-    futures::stream::iter(requests)
-        .map(|request| {
-            let mut writer = file.clone();
-            async move {
-                writer
-                    .seek(SeekFrom::Start(request.offset))
-                    .await
-                    .map_err(|error| {
-                        TransportError::Operation(format!(
-                            "failed to seek {} to {}: {error}",
-                            path.display(),
-                            request.offset
-                        ))
-                    })?;
-                writer
-                    .write_all(&request.payload)
-                    .await
-                    .map_err(|error| map_sftp_error(path, error))
-            }
-        })
-        .buffer_unordered(SFTP_WRITE_REQUEST_CONCURRENCY)
-        .try_collect::<Vec<_>>()
-        .await?;
-    Ok(())
-}
-
-async fn read_file_pipelined(
-    file: &openssh_sftp_client::file::File,
-    path: &std::path::Path,
-    offset: u64,
-    len: usize,
-) -> Result<Bytes, TransportError> {
-    let requests = plan_pipelined_reads(offset, len)?;
-    // Carve one allocation into the disjoint region each request fills, so
-    // reassembly stitches the regions back together instead of copying them.
-    let mut buffer = BytesMut::zeroed(len);
-    let mut reads = Vec::with_capacity(requests.len());
-    for request in requests {
-        let region = buffer.split_to(request.len);
-        reads.push((request, region));
-    }
-    let mut chunks = futures::stream::iter(reads)
-        .map(|(request, mut region)| {
-            let reader = openssh_sftp_client::file::TokioCompatFile::new(file.clone());
-            async move {
-                tokio::pin!(reader);
-                reader
-                    .as_mut()
-                    .seek(SeekFrom::Start(request.offset))
-                    .await
-                    .map_err(|error| {
-                        TransportError::Operation(format!(
-                            "failed to seek {} to {}: {error}",
-                            path.display(),
-                            request.offset
-                        ))
-                    })?;
-                reader
-                    .as_mut()
-                    .read_exact(&mut region)
-                    .await
-                    .map_err(|error| {
-                        TransportError::Operation(format!(
-                            "short read from {} at {}: {error}",
-                            path.display(),
-                            request.offset
-                        ))
-                    })?;
-                Ok::<_, TransportError>((request.index, region))
-            }
-        })
-        .buffer_unordered(SFTP_READ_REQUEST_CONCURRENCY)
-        .try_collect::<Vec<_>>()
-        .await?;
-    chunks.sort_unstable_by_key(|(index, _)| *index);
-    let mut payload = BytesMut::new();
-    for (_, chunk) in chunks {
-        payload.unsplit(chunk);
-    }
-    Ok(payload.freeze())
-}
+const SFTP_SESSION_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
+const SFTP_SESSION_CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
+const SFTP_SESSION_FORCE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+const SFTP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const SFTP_IDLE_REAP_INTERVAL: Duration = Duration::from_secs(10);
+const SFTP_IDLE_WARM_FLOOR: usize = 1;
+const SFTP_POOL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(45);
+// How long shutdown lets already-scheduled staging cleanups finish while the
+// pool can still serve them. A cleanup sleeping between retry attempts holds
+// no session, so the activity drain alone would close the pool underneath it
+// and turn ordinary staging debris into a failed service stop.
+const SFTP_SHUTDOWN_CLEANUP_GRACE: Duration = Duration::from_secs(10);
+// Pacing for session dials after a failure. Storage backends cap concurrent
+// SSH sessions per account (Hetzner Storage Boxes around ten) and kill the
+// excess, and stale sessions from a previous crash still count against the
+// cap until the server reaps them. Every retrying caller redialing
+// immediately turns one over-limit moment into a sustained churn storm the
+// server can never shed; a shared backoff lets it drain instead.
+const SFTP_DIAL_BACKOFF_BASE: Duration = Duration::from_millis(100);
+const SFTP_DIAL_BACKOFF_MAX: Duration = Duration::from_secs(5);
+const SFTP_DIRECTORY_CACHE_MAX_ENTRIES: usize = 64 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum TransportError {
@@ -540,674 +461,6 @@ impl Drop for OperationAdmission {
             self.active = false;
             self.admission.release(self.kind);
         }
-    }
-}
-
-pub struct OpenSshSessionFactory {
-    endpoint: crate::config::SftpEndpoint,
-    identity_file: PathBuf,
-    known_hosts: PathBuf,
-    authentication_config: Arc<tempfile::NamedTempFile>,
-}
-
-impl OpenSshSessionFactory {
-    pub fn new(
-        endpoint: crate::config::SftpEndpoint,
-        identity_file: PathBuf,
-        known_hosts: PathBuf,
-    ) -> Result<Self, TransportError> {
-        let mut authentication_config = tempfile::Builder::new()
-            .prefix("zerofs-ssh-")
-            .suffix(".conf")
-            .tempfile()
-            .map_err(|_| TransportError::Open("could not create SSH policy file".to_owned()))?;
-        authentication_config
-            .write_all(
-                b"Host *\n\
-                  BatchMode yes\n\
-                  PasswordAuthentication no\n\
-                  KbdInteractiveAuthentication no\n\
-                  ChallengeResponseAuthentication no\n\
-                  PreferredAuthentications publickey\n\
-                  PubkeyAuthentication yes\n\
-                  ConnectTimeout 20\n\
-                  ConnectionAttempts 1\n\
-                  ServerAliveInterval 30\n\
-                  ServerAliveCountMax 3\n\
-                  ControlMaster no\n\
-                  ControlPersist no\n",
-            )
-            .map_err(|_| TransportError::Open("could not write SSH policy file".to_owned()))?;
-        authentication_config
-            .flush()
-            .map_err(|_| TransportError::Open("could not flush SSH policy file".to_owned()))?;
-        Ok(Self {
-            endpoint,
-            identity_file,
-            known_hosts,
-            authentication_config: Arc::new(authentication_config),
-        })
-    }
-}
-
-impl fmt::Debug for OpenSshSessionFactory {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("OpenSshSessionFactory")
-            .field("host", &self.endpoint.host)
-            .field("port", &self.endpoint.port)
-            .field("known_hosts", &self.known_hosts)
-            .finish_non_exhaustive()
-    }
-}
-
-async fn force_reap_ssh_process(child: &mut tokio::process::Child) -> Result<(), String> {
-    // The direct ssh child is the physical session. Unlike an OpenSSH
-    // ControlMaster, it cannot daemonize away from this owned process handle.
-    // start_kill followed by wait gives positive local-process death evidence
-    // before the pool may reuse the lifetime permit.
-    let kill_error = child.start_kill().err().map(|error| error.to_string());
-    match tokio::time::timeout(SSH_PROCESS_FORCE_REAP_TIMEOUT, child.wait()).await {
-        Ok(Ok(_)) => Ok(()),
-        Ok(Err(error)) => Err(match kill_error {
-            Some(kill_error) => {
-                format!("could not kill SSH process: {kill_error}; could not reap it: {error}")
-            }
-            None => format!("could not reap SSH process: {error}"),
-        }),
-        Err(_) => Err(match kill_error {
-            Some(kill_error) => format!(
-                "could not kill SSH process: {kill_error}; process was not reaped within {}s",
-                SSH_PROCESS_FORCE_REAP_TIMEOUT.as_secs()
-            ),
-            None => format!(
-                "SSH process was killed but not reaped within {}s",
-                SSH_PROCESS_FORCE_REAP_TIMEOUT.as_secs()
-            ),
-        }),
-    }
-}
-
-async fn supervise_ssh_process(
-    mut child: tokio::process::Child,
-    force: CancellationToken,
-) -> Result<(), String> {
-    tokio::select! {
-        result = child.wait() => result.map(|_| ()).map_err(|error| error.to_string()),
-        _ = force.cancelled() => force_reap_ssh_process(&mut child).await,
-    }
-}
-
-#[async_trait]
-impl SessionFactory for OpenSshSessionFactory {
-    async fn open(
-        &self,
-        force: CancellationToken,
-    ) -> Result<Box<dyn TransportSession>, TransportError> {
-        // One owned, foreground ssh process is one physical pool session. Do
-        // not use OpenSSH multiplexing here: its daemonized ControlMaster is
-        // outside Tokio's process ownership and cannot be reliably reaped on a
-        // lifecycle deadline.
-        if force.is_cancelled() {
-            return Err(TransportError::PoolClosed);
-        }
-
-        let mut command = tokio::process::Command::new("ssh");
-        command
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .arg("-F")
-            .arg(self.authentication_config.path())
-            .arg("-o")
-            .arg("StrictHostKeyChecking=yes")
-            .arg("-o")
-            .arg(format!("UserKnownHostsFile={}", self.known_hosts.display()))
-            .arg("-o")
-            .arg("IdentitiesOnly=yes")
-            .arg("-i")
-            .arg(&self.identity_file)
-            .arg("-p")
-            .arg(self.endpoint.port.to_string())
-            .arg("-l")
-            .arg(&self.endpoint.username)
-            .arg("-T")
-            .arg("-s")
-            .arg("--")
-            .arg(&self.endpoint.host)
-            .arg("sftp");
-
-        let mut child = command.spawn().map_err(|_| {
-            TransportError::Open(format!(
-                "OpenSSH SFTP process for {}:{} failed to start",
-                self.endpoint.host, self.endpoint.port
-            ))
-        })?;
-        let stdin = match child.stdin.take() {
-            Some(stdin) => stdin,
-            None => {
-                let cleanup = force_reap_ssh_process(&mut child).await;
-                return match cleanup {
-                    Ok(()) => Err(TransportError::Open(
-                        "OpenSSH SFTP process has no stdin".to_owned(),
-                    )),
-                    Err(cleanup) => {
-                        tracing::error!(%cleanup, "failed to reap OpenSSH process with no stdin");
-                        Err(TransportError::PoolClosed)
-                    }
-                };
-            }
-        };
-        let stdout = match child.stdout.take() {
-            Some(stdout) => stdout,
-            None => {
-                drop(stdin);
-                let cleanup = force_reap_ssh_process(&mut child).await;
-                return match cleanup {
-                    Ok(()) => Err(TransportError::Open(
-                        "OpenSSH SFTP process has no stdout".to_owned(),
-                    )),
-                    Err(cleanup) => {
-                        tracing::error!(%cleanup, "failed to reap OpenSSH process with no stdout");
-                        Err(TransportError::PoolClosed)
-                    }
-                };
-            }
-        };
-        let mut handshake = Box::pin(openssh_sftp_client::Sftp::new(
-            stdin,
-            stdout,
-            openssh_sftp_client::SftpOptions::default(),
-        ));
-        let sftp = tokio::select! {
-            result = &mut handshake => result,
-            _ = force.cancelled() => {
-                drop(handshake);
-                if let Err(cleanup) = force_reap_ssh_process(&mut child).await {
-                    return Err(TransportError::Close(format!(
-                        "OpenSSH process cleanup after SFTP open timeout failed: {cleanup}"
-                    )));
-                }
-                return Err(TransportError::PoolClosed);
-            }
-        };
-        let sftp = match sftp {
-            Ok(sftp) => sftp,
-            Err(_) => {
-                let error = TransportError::Open(format!(
-                    "SFTP handshake with {}:{} failed",
-                    self.endpoint.host, self.endpoint.port
-                ));
-                if let Err(cleanup) = force_reap_ssh_process(&mut child).await {
-                    return Err(TransportError::Close(format!(
-                        "OpenSSH process cleanup after SFTP handshake failure failed: {cleanup}"
-                    )));
-                }
-                return Err(error);
-            }
-        };
-        let process_force = force.clone();
-        let process_owner =
-            tokio::spawn(async move { supervise_ssh_process(child, process_force).await });
-        Ok(Box::new(OpenSshTransportSession {
-            sftp: Some(sftp),
-            ssh_force: force,
-            ssh_process: Some(process_owner),
-        }))
-    }
-}
-
-pub struct OpenSshTransportSession {
-    sftp: Option<openssh_sftp_client::Sftp>,
-    ssh_force: CancellationToken,
-    ssh_process: Option<tokio::task::JoinHandle<Result<(), String>>>,
-}
-
-impl fmt::Debug for OpenSshTransportSession {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("OpenSshTransportSession")
-            .finish_non_exhaustive()
-    }
-}
-
-impl Drop for OpenSshTransportSession {
-    fn drop(&mut self) {
-        // The process owner holds and reaps the direct ssh child. Cancellation
-        // here is the last-resort path for a session dropped outside the pool's
-        // awaited close protocol.
-        self.ssh_force.cancel();
-    }
-}
-
-impl OpenSshTransportSession {
-    #[cfg(test)]
-    pub async fn from_streams<W, R>(stdin: W, stdout: R) -> Result<Self, TransportError>
-    where
-        W: AsyncWrite + Send + 'static,
-        R: AsyncRead + Send + 'static,
-    {
-        let sftp = openssh_sftp_client::Sftp::new(
-            stdin,
-            stdout,
-            openssh_sftp_client::SftpOptions::default(),
-        )
-        .await
-        .map_err(|_| TransportError::Open("SFTP stream handshake failed".to_owned()))?;
-        Ok(Self {
-            sftp: Some(sftp),
-            ssh_force: CancellationToken::new(),
-            ssh_process: None,
-        })
-    }
-
-    /// Shared open/write/sync/close chain behind the three write entry points.
-    /// `create` picks the create-and-truncate open used by whole-file writes
-    /// over the write-only open used by ranged writes; `durable` decides
-    /// whether the handle is fsynced before it is closed.
-    async fn write_chunks(
-        &self,
-        path: &std::path::Path,
-        offset: u64,
-        chunks: Vec<Bytes>,
-        create: bool,
-        durable: bool,
-    ) -> Result<(), TransportError> {
-        let sftp = self.sftp.as_ref().expect("open transport owns SFTP client");
-        let opened = if create {
-            sftp.create(path).await
-        } else {
-            let mut options = sftp.options();
-            options.write(true);
-            options.open(path).await
-        };
-        let mut file = opened.map_err(|error| map_sftp_error(path, error))?;
-        write_file_pipelined(&file, path, offset, chunks).await?;
-        if durable {
-            file.sync_all()
-                .await
-                .map_err(|error| map_sftp_error(path, error))?;
-        }
-        file.close()
-            .await
-            .map_err(|error| map_sftp_error(path, error))
-    }
-}
-
-#[async_trait]
-impl TransportSession for OpenSshTransportSession {
-    fn capabilities(&self) -> SftpCapabilities {
-        let sftp = self.sftp.as_ref().expect("open transport owns SFTP client");
-        SftpCapabilities {
-            fsync: sftp.support_fsync(),
-            hardlink: sftp.support_hardlink(),
-            posix_rename: sftp.support_posix_rename(),
-        }
-    }
-
-    async fn read_object(
-        &mut self,
-        path: &std::path::Path,
-        requested_range: Option<object_store::GetRange>,
-        head: bool,
-    ) -> Result<RemoteObjectRead, TransportError> {
-        let sftp = self.sftp.as_ref().expect("open transport owns SFTP client");
-        let file = sftp
-            .open(path)
-            .await
-            .map_err(|error| map_sftp_error(path, error))?;
-        // The header always occupies the same fixed prefix, and a bounded
-        // request's physical offsets do not depend on the object's length
-        // either: header byte X lives at [0, 32) and logical byte Y at
-        // 32 + Y regardless of what the header says. Issue the metadata
-        // fetch, the header read, and (for bounded requests) the payload
-        // read as one round-trip phase; every validation below still runs
-        // before any speculatively read payload is returned, so corrupt
-        // objects are rejected exactly as before — the payload bytes were
-        // merely fetched, never trusted.
-        let speculative_range = match (&requested_range, head) {
-            (Some(object_store::GetRange::Bounded(range)), false) if range.start < range.end => {
-                usize::try_from(range.end - range.start)
-                    .ok()
-                    .and_then(|len| {
-                        (OBJECT_HEADER_LEN as u64)
-                            .checked_add(range.start)
-                            .map(|physical_start| (range.clone(), physical_start, len))
-                    })
-            }
-            _ => None,
-        };
-        let speculative_payload = async {
-            match &speculative_range {
-                Some((_, physical_start, len)) => {
-                    Some(read_file_pipelined(&file, path, *physical_start, *len).await)
-                }
-                None => None,
-            }
-        };
-        let mut metadata_file = file.clone();
-        let (metadata, encoded_header, speculative_payload) = tokio::join!(
-            metadata_file.metadata(),
-            read_file_pipelined(&file, path, 0, OBJECT_HEADER_LEN),
-            speculative_payload,
-        );
-        let metadata = metadata.map_err(|error| map_sftp_error(path, error))?;
-        if !metadata.file_type().is_some_and(|kind| kind.is_file()) {
-            return Err(TransportError::CorruptObject(format!(
-                "{} is not a regular file",
-                path.display()
-            )));
-        }
-        let physical_len = metadata.len().ok_or_else(|| {
-            TransportError::CorruptObject(format!("{} has no physical length", path.display()))
-        })?;
-        let modified = metadata.modified().ok_or_else(|| {
-            TransportError::CorruptObject(format!("{} has no modification time", path.display()))
-        })?;
-
-        let encoded_header = encoded_header?;
-        let header = decode_header(&encoded_header).map_err(|error| {
-            TransportError::CorruptObject(format!("{}: {error}", path.display()))
-        })?;
-        let expected_physical_len = (OBJECT_HEADER_LEN as u64)
-            .checked_add(header.logical_len)
-            .ok_or_else(|| {
-                TransportError::CorruptObject(format!(
-                    "{} logical length overflows its physical representation",
-                    path.display()
-                ))
-            })?;
-        if physical_len != expected_physical_len {
-            return Err(TransportError::CorruptObject(format!(
-                "{} physical length {physical_len} does not match expected {expected_physical_len}",
-                path.display()
-            )));
-        }
-
-        let range = match requested_range {
-            Some(range) => range.as_range(header.logical_len).map_err(|error| {
-                TransportError::InvalidRange(format!(
-                    "invalid logical range for {}: {error}",
-                    path.display()
-                ))
-            })?,
-            None => 0..header.logical_len,
-        };
-        let payload = if head || range.is_empty() {
-            Bytes::new()
-        } else if let (Some(result), Some((requested, _, _))) =
-            (speculative_payload, &speculative_range)
-            && *requested == range
-        {
-            // The validated range is exactly what was speculatively fetched.
-            result?
-        } else {
-            // Unbounded request, or the bounded request was clamped by the
-            // object's actual length: fetch the validated range.
-            let physical_start = (OBJECT_HEADER_LEN as u64)
-                .checked_add(range.start)
-                .ok_or_else(|| {
-                    TransportError::CorruptObject(format!(
-                        "{} physical read offset overflow",
-                        path.display()
-                    ))
-                })?;
-            let len: usize = (range.end - range.start).try_into().map_err(|_| {
-                TransportError::Operation(format!(
-                    "requested range for {} does not fit memory",
-                    path.display()
-                ))
-            })?;
-            read_file_pipelined(&file, path, physical_start, len).await?
-        };
-        // The handle close acknowledges nothing the caller depends on, so it
-        // leaves the critical path; a failure only leaks the handle until the
-        // session closes, which reclaims every handle server-side anyway.
-        let close_path = path.to_path_buf();
-        tokio::spawn(async move {
-            if let Err(error) = file.close().await {
-                tracing::debug!(
-                    path = %close_path.display(),
-                    %error,
-                    "SFTP read handle close failed off the critical path"
-                );
-            }
-        });
-        Ok(RemoteObjectRead {
-            header,
-            modified: modified.as_system_time(),
-            range,
-            payload,
-        })
-    }
-
-    async fn list_directory(
-        &mut self,
-        path: &std::path::Path,
-    ) -> Result<Vec<RemoteDirectoryEntry>, TransportError> {
-        let sftp = self.sftp.as_ref().expect("open transport owns SFTP client");
-        let mut fs = sftp.fs();
-        let directory = fs
-            .open_dir(path)
-            .await
-            .map_err(|error| map_sftp_error(path, error))?;
-        let entries = directory.read_dir();
-        tokio::pin!(entries);
-        let mut result = Vec::new();
-        while let Some(entry) = entries.as_mut().next().await {
-            let entry = entry.map_err(|error| map_sftp_error(path, error))?;
-            let filename = entry.filename().to_path_buf();
-            let kind = match entry.file_type() {
-                Some(kind) if kind.is_file() => RemoteEntryKind::File,
-                Some(kind) if kind.is_dir() => RemoteEntryKind::Directory,
-                Some(kind) if kind.is_symlink() => RemoteEntryKind::Symlink,
-                _ => RemoteEntryKind::Other,
-            };
-            result.push(RemoteDirectoryEntry { filename, kind });
-        }
-        Ok(result)
-    }
-
-    async fn remove_file(&mut self, path: &std::path::Path) -> Result<(), TransportError> {
-        let sftp = self.sftp.as_ref().expect("open transport owns SFTP client");
-        sftp.fs()
-            .remove_file(path)
-            .await
-            .map_err(|error| map_sftp_error(path, error))
-    }
-
-    async fn ensure_directory_component(
-        &mut self,
-        path: &std::path::Path,
-    ) -> Result<(), TransportError> {
-        let sftp = self.sftp.as_ref().expect("open transport owns SFTP client");
-        let mut fs = sftp.fs();
-        for component in path.components() {
-            if !matches!(component, std::path::Component::Normal(_)) {
-                return Err(TransportError::Operation(format!(
-                    "unsafe directory path {}",
-                    path.display()
-                )));
-            }
-        }
-
-        match stat_directory(&mut fs, path).await {
-            Ok(metadata) if metadata.file_type().is_some_and(|kind| kind.is_dir()) => Ok(()),
-            Ok(_) => Err(TransportError::Operation(format!(
-                "{} exists and is not a directory",
-                path.display()
-            ))),
-            Err(openssh_sftp_client::Error::SftpError(
-                openssh_sftp_client::error::SftpErrorKind::NoSuchFile,
-                _,
-            )) => {
-                let mkdir_started = Instant::now();
-                let created = fs.create_dir(path).await;
-                metrics::counter!("zerofs_sftp_directory_mkdirs_total").increment(1);
-                metrics::histogram!("zerofs_sftp_directory_mkdir_duration_seconds")
-                    .record(mkdir_started.elapsed().as_secs_f64());
-                match created {
-                    Ok(()) => Ok(()),
-                    Err(create_error) => {
-                        // Another writer outside this pool can win the mkdir
-                        // race. Verify that result instead of turning a valid
-                        // directory into a publication failure.
-                        match stat_directory(&mut fs, path).await {
-                            Ok(metadata)
-                                if metadata.file_type().is_some_and(|kind| kind.is_dir()) =>
-                            {
-                                Ok(())
-                            }
-                            _ => Err(map_sftp_error(path, create_error)),
-                        }
-                    }
-                }
-            }
-            Err(error) => Err(map_sftp_error(path, error)),
-        }
-    }
-
-    async fn write_file_durable(
-        &mut self,
-        path: &std::path::Path,
-        chunks: Vec<Bytes>,
-    ) -> Result<(), TransportError> {
-        self.write_chunks(path, 0, chunks, true, true).await
-    }
-
-    async fn write_file_at_durable(
-        &mut self,
-        path: &std::path::Path,
-        offset: u64,
-        chunks: Vec<Bytes>,
-    ) -> Result<(), TransportError> {
-        self.write_chunks(path, offset, chunks, false, true).await
-    }
-
-    async fn write_file_at(
-        &mut self,
-        path: &std::path::Path,
-        offset: u64,
-        chunks: Vec<Bytes>,
-    ) -> Result<(), TransportError> {
-        self.write_chunks(path, offset, chunks, false, false).await
-    }
-
-    async fn read_exact(
-        &mut self,
-        path: &std::path::Path,
-        offset: u64,
-        len: usize,
-    ) -> Result<Bytes, TransportError> {
-        let sftp = self.sftp.as_ref().expect("open transport owns SFTP client");
-        let file = sftp
-            .open(path)
-            .await
-            .map_err(|error| map_sftp_error(path, error))?;
-        let bytes = read_file_pipelined(&file, path, offset, len).await?;
-        file.close()
-            .await
-            .map_err(|error| map_sftp_error(path, error))?;
-        Ok(bytes)
-    }
-
-    async fn hard_link(
-        &mut self,
-        from: &std::path::Path,
-        to: &std::path::Path,
-    ) -> Result<(), TransportError> {
-        let sftp = self.sftp.as_ref().expect("open transport owns SFTP client");
-        match sftp.fs().hard_link(from, to).await {
-            Ok(()) => Ok(()),
-            Err(openssh_sftp_client::Error::SftpError(
-                openssh_sftp_client::error::SftpErrorKind::Failure,
-                _,
-            )) => Err(TransportError::AlreadyExists(to.display().to_string())),
-            Err(error) => Err(map_sftp_error(to, error)),
-        }
-    }
-
-    async fn posix_rename(
-        &mut self,
-        from: &std::path::Path,
-        to: &std::path::Path,
-    ) -> Result<(), TransportError> {
-        let sftp = self.sftp.as_ref().expect("open transport owns SFTP client");
-        if !sftp.support_posix_rename() {
-            return Err(TransportError::MissingCapability(
-                "posix-rename@openssh.com",
-            ));
-        }
-        sftp.fs()
-            .rename(from, to)
-            .await
-            .map_err(|error| map_sftp_error(to, error))
-    }
-
-    async fn close(mut self: Box<Self>, force: CancellationToken) -> Result<(), TransportError> {
-        let sftp = self.sftp.take().expect("open transport owns SFTP client");
-        let mut graceful = Box::pin(sftp.close());
-        let graceful_result = tokio::select! {
-            result = &mut graceful => Some(result),
-            _ = force.cancelled() => None,
-            _ = self.ssh_force.cancelled() => None,
-        };
-        drop(graceful);
-
-        self.ssh_force.cancel();
-        if let Some(process_owner) = self.ssh_process.take() {
-            match process_owner.await {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    return Err(TransportError::Close(format!(
-                        "OpenSSH SFTP process did not terminate: {error}"
-                    )));
-                }
-                Err(error) => {
-                    return Err(TransportError::Close(format!(
-                        "OpenSSH SFTP process owner failed: {error}"
-                    )));
-                }
-            }
-        }
-
-        if let Some(Err(error)) = graceful_result {
-            tracing::warn!(%error, "SFTP protocol shutdown failed after the SSH process exited");
-        } else if graceful_result.is_none() {
-            tracing::warn!(
-                "SFTP protocol shutdown exceeded its deadline; the SSH process was killed and reaped"
-            );
-        }
-        Ok(())
-    }
-}
-
-/// `symlink_metadata` under the shared directory-probe instrumentation, so
-/// every stat this module issues is counted and timed the same way.
-async fn stat_directory(
-    fs: &mut openssh_sftp_client::fs::Fs,
-    path: &std::path::Path,
-) -> Result<openssh_sftp_client::metadata::MetaData, openssh_sftp_client::Error> {
-    let started = Instant::now();
-    let metadata = fs.symlink_metadata(path).await;
-    metrics::counter!("zerofs_sftp_directory_stats_total").increment(1);
-    metrics::histogram!("zerofs_sftp_directory_stat_duration_seconds")
-        .record(started.elapsed().as_secs_f64());
-    metadata
-}
-
-fn map_sftp_error(path: &std::path::Path, error: openssh_sftp_client::Error) -> TransportError {
-    match error {
-        openssh_sftp_client::Error::SftpError(
-            openssh_sftp_client::error::SftpErrorKind::NoSuchFile,
-            _,
-        ) => TransportError::NotFound(path.display().to_string()),
-        openssh_sftp_client::Error::SftpError(
-            openssh_sftp_client::error::SftpErrorKind::PermDenied,
-            _,
-        ) => TransportError::PermissionDenied(path.display().to_string()),
-        error => TransportError::Operation(format!("{}: {error}", path.display())),
     }
 }
 
@@ -2218,13 +1471,11 @@ impl Drop for SessionLease {
 #[cfg(test)]
 mod tests {
     use super::{
-        LeaseFinishError, OpenSshSessionFactory, OpenSshTransportSession, OperationKind,
-        RemoteEntryKind, SFTP_READ_PACKET_SIZE, SFTP_READ_REQUEST_CONCURRENCY,
-        SFTP_WRITE_PACKET_SIZE, SFTP_WRITE_REQUEST_CONCURRENCY, SessionDisposition, SessionFactory,
-        SftpSessionPool, TransportError, TransportSession, plan_pipelined_reads,
-        plan_pipelined_writes, supervise_ssh_process,
+        LeaseFinishError, OpenSshTransportSession, OperationKind, RemoteEntryKind,
+        SFTP_READ_PACKET_SIZE, SFTP_READ_REQUEST_CONCURRENCY, SFTP_WRITE_PACKET_SIZE,
+        SFTP_WRITE_REQUEST_CONCURRENCY, SessionDisposition, SessionFactory, SftpSessionPool,
+        TransportError, TransportSession, plan_pipelined_reads, plan_pipelined_writes,
     };
-    use crate::config::SftpEndpoint;
     use crate::sftp_object_store::{ObjectHeader, SftpCapabilities, encode_header};
     use async_trait::async_trait;
     use bytes::Bytes;
@@ -3827,73 +3078,6 @@ mod tests {
             .expect("shutdown finishes after the active lease returns")
             .unwrap()
             .unwrap();
-    }
-
-    #[test]
-    fn openssh_factory_debug_redacts_the_username() {
-        let factory = OpenSshSessionFactory::new(
-            SftpEndpoint {
-                host: "storage.example.test".to_owned(),
-                port: 2222,
-                username: "account-secret-name".to_owned(),
-            },
-            "/tmp/id-ed25519".into(),
-            "/tmp/known-hosts".into(),
-        )
-        .unwrap();
-
-        let debug = format!("{factory:?}");
-        assert!(debug.contains("storage.example.test"));
-        assert!(debug.contains("2222"));
-        assert!(!debug.contains("account-secret-name"));
-    }
-
-    #[test]
-    fn openssh_factory_effective_policy_bounds_connect_and_dead_peer_detection() {
-        let factory = OpenSshSessionFactory::new(
-            SftpEndpoint {
-                host: "storage.example.test".to_owned(),
-                port: 2222,
-                username: "account-name".to_owned(),
-            },
-            "/tmp/id-ed25519".into(),
-            "/tmp/known-hosts".into(),
-        )
-        .unwrap();
-
-        let output = std::process::Command::new("ssh")
-            .args(["-G", "-F"])
-            .arg(factory.authentication_config.path())
-            .arg("storage.example.test")
-            .output()
-            .expect("local ssh client evaluates the generated policy");
-        assert!(output.status.success());
-        let policy = String::from_utf8(output.stdout).unwrap();
-
-        assert!(policy.lines().any(|line| line == "connecttimeout 20"));
-        assert!(policy.lines().any(|line| line == "batchmode yes"));
-        assert!(policy.lines().any(|line| line == "serveraliveinterval 30"));
-        assert!(policy.lines().any(|line| line == "serveralivecountmax 3"));
-        assert!(policy.lines().any(|line| line == "controlmaster false"));
-        assert!(policy.lines().any(|line| line == "controlpersist no"));
-    }
-
-    #[tokio::test]
-    async fn terminal_force_kills_and_reaps_the_owned_ssh_process() {
-        let child = tokio::process::Command::new("sleep")
-            .arg("60")
-            .kill_on_drop(true)
-            .spawn()
-            .expect("spawn local stand-in for the owned ssh process");
-        let force = CancellationToken::new();
-        let owner = tokio::spawn(supervise_ssh_process(child, force.clone()));
-
-        force.cancel();
-        tokio::time::timeout(std::time::Duration::from_secs(1), owner)
-            .await
-            .expect("forced process owner terminates within its deadline")
-            .expect("process owner task does not panic")
-            .expect("owned process is positively reaped");
     }
 
     #[tokio::test]

@@ -3,6 +3,10 @@ use crate::writeback::barrier::{BarrierError, SequenceBarrier, SequenceProgress}
 use crate::writeback::journal::{Journal, PreparedMutation, StagedBatch};
 use crate::writeback::model::{MutationRecord, Sequence};
 use crate::writeback::payload::VerifiedPayload;
+use crate::writeback::reservation::{
+    CommittedSsdReservation, ReservationError, SsdReservationToken, commit_batch_local,
+};
+use crate::writeback::space_sample::PhysicalSpaceSample;
 use anyhow::Result as AnyResult;
 use bytes::Bytes;
 use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
@@ -12,6 +16,20 @@ use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
+
+#[allow(dead_code)]
+pub(crate) fn transition_reservations_then_publish_local<F, T>(
+    tokens: Vec<SsdReservationToken>,
+    physical_bytes: &[u64],
+    sample: PhysicalSpaceSample,
+    publish_watermark: F,
+) -> Result<(Vec<CommittedSsdReservation>, T), ReservationError>
+where
+    F: FnOnce() -> T,
+{
+    let committed = commit_batch_local(tokens, physical_bytes, sample)?;
+    Ok((committed, publish_watermark()))
+}
 
 #[async_trait::async_trait]
 pub trait LocalCommitObserver: Send + Sync + 'static {
@@ -1092,6 +1110,10 @@ mod tests {
     use crate::writeback::overlay::{OverlayCommitObserver, OverlayIndex};
     use crate::writeback::payload::VerifiedPayload;
     use crate::writeback::remote::RemoteScheduler;
+    use crate::writeback::reservation::{
+        CommittedSsdReservation, ReservationError, SsdReservationToken, commit_batch_local,
+    };
+    use crate::writeback::space_sample::PhysicalSpaceSample;
     use anyhow::{Result, bail};
     use bytes::Bytes;
     use object_store::ObjectStoreExt;
@@ -3211,5 +3233,204 @@ mod tests {
             journaler.shutdown().await,
             Err(LocalBarrierError::LocalDurability(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn local_watermark_waits_for_reservation_transition() {
+        use crate::writeback::reservation::{SsdAdmission, SsdReservationRequest};
+        use crate::writeback::space_sample::PhysicalSpaceSample;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let admission = SsdAdmission::new(1_000, 8, 100, 50, 10).unwrap();
+        let token = admission
+            .reserve(
+                SsdReservationRequest {
+                    ssd_reservation_bytes: 20,
+                    physical_reservation_bytes: 12,
+                    operations: 1,
+                },
+                PhysicalSpaceSample {
+                    generation: 1,
+                    available_bytes: 1_000,
+                },
+            )
+            .await
+            .unwrap();
+        let published = AtomicBool::new(false);
+        let err = super::transition_reservations_then_publish_local(
+            vec![token],
+            &[12],
+            PhysicalSpaceSample {
+                generation: 0,
+                available_bytes: 1_000,
+            },
+            || published.store(true, Ordering::SeqCst),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::writeback::reservation::ReservationError::StaleSample { .. }
+        ));
+        assert!(!published.load(Ordering::SeqCst));
+        assert_eq!(admission.used_bytes(), 20);
+    }
+
+    #[tokio::test]
+    async fn batch_uses_one_fresh_sample() {
+        use crate::writeback::reservation::{SsdAdmission, SsdReservationRequest};
+        use crate::writeback::space_sample::PhysicalSpaceSample;
+
+        let admission = SsdAdmission::new(1_000, 8, 100, 50, 10).unwrap();
+        let sample = PhysicalSpaceSample {
+            generation: 4,
+            available_bytes: 2_000,
+        };
+        let mut tokens = Vec::new();
+        for bytes in [10_u64, 15] {
+            tokens.push(
+                admission
+                    .reserve(
+                        SsdReservationRequest {
+                            ssd_reservation_bytes: bytes,
+                            physical_reservation_bytes: bytes,
+                            operations: 1,
+                        },
+                        PhysicalSpaceSample {
+                            generation: 3,
+                            available_bytes: 2_000,
+                        },
+                    )
+                    .await
+                    .unwrap(),
+            );
+        }
+        let (committed, generation) =
+            super::transition_reservations_then_publish_local(tokens, &[10, 15], sample, || {
+                sample.generation
+            })
+            .unwrap();
+        assert_eq!(generation, 4);
+        assert!(committed.iter().all(|item| item.sample() == sample));
+    }
+
+    #[tokio::test]
+    async fn sample_failure_retains_ownership_and_poison() {
+        use crate::writeback::reservation::{
+            ReservationError, SsdAdmission, SsdReservationRequest,
+        };
+        use crate::writeback::space_sample::PhysicalSpaceSample;
+
+        let admission = SsdAdmission::new(1_000, 8, 100, 50, 10).unwrap();
+        let token = admission
+            .reserve(
+                SsdReservationRequest {
+                    ssd_reservation_bytes: 20,
+                    physical_reservation_bytes: 12,
+                    operations: 1,
+                },
+                PhysicalSpaceSample {
+                    generation: 2,
+                    available_bytes: 1_000,
+                },
+            )
+            .await
+            .unwrap();
+        let error = token
+            .commit_local(
+                12,
+                PhysicalSpaceSample {
+                    generation: 1,
+                    available_bytes: 1_000,
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(error, ReservationError::StaleSample { .. }));
+        assert_eq!(admission.used_bytes(), 20);
+        let next = admission
+            .reserve(
+                SsdReservationRequest {
+                    ssd_reservation_bytes: 1,
+                    physical_reservation_bytes: 1,
+                    operations: 1,
+                },
+                PhysicalSpaceSample {
+                    generation: 3,
+                    available_bytes: 1_000,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(next, ReservationError::Poisoned(_)));
+    }
+
+    #[tokio::test]
+    async fn token_cannot_commit_or_release_twice() {
+        use crate::writeback::reservation::{
+            ReservationError, SsdAdmission, SsdReservationRequest,
+        };
+        use crate::writeback::space_sample::PhysicalSpaceSample;
+
+        let admission = SsdAdmission::new(1_000, 8, 100, 50, 10).unwrap();
+        let token = admission
+            .reserve(
+                SsdReservationRequest {
+                    ssd_reservation_bytes: 8,
+                    physical_reservation_bytes: 8,
+                    operations: 1,
+                },
+                PhysicalSpaceSample {
+                    generation: 1,
+                    available_bytes: 1_000,
+                },
+            )
+            .await
+            .unwrap();
+        let committed = token
+            .commit_local(
+                8,
+                PhysicalSpaceSample {
+                    generation: 1,
+                    available_bytes: 1_000,
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            committed.commit_local(
+                8,
+                PhysicalSpaceSample {
+                    generation: 2,
+                    available_bytes: 1_000,
+                },
+            ),
+            Err(ReservationError::Poisoned(_))
+        ));
+        let token = admission
+            .reserve(
+                SsdReservationRequest {
+                    ssd_reservation_bytes: 9,
+                    physical_reservation_bytes: 9,
+                    operations: 1,
+                },
+                PhysicalSpaceSample {
+                    generation: 2,
+                    available_bytes: 1_000,
+                },
+            )
+            .await
+            .unwrap();
+        let committed = token
+            .commit_local(
+                9,
+                PhysicalSpaceSample {
+                    generation: 2,
+                    available_bytes: 1_000,
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            committed.release(),
+            Err(ReservationError::Poisoned(_))
+        ));
+        assert_eq!(admission.used_bytes(), 17);
     }
 }

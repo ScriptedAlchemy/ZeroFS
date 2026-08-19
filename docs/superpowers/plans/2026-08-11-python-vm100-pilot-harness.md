@@ -368,7 +368,7 @@ Run:
 ```bash
 ssh ubuntu-main 'cd /fast/projects/ZeroFS && python3 scripts/vm100-pilot.py benchmark --total-mib 1024 --jobs 4'
 ssh ubuntu-main 'cd /fast/projects/ZeroFS && python3 scripts/vm100-pilot.py workloads'
-ssh ubuntu-main 'cd /fast/projects/ZeroFS && python3 scripts/vm100-pilot.py raw-sftp --jobs 7 --per-job-mib 128'
+ssh ubuntu-main 'cd /fast/projects/ZeroFS && python3 scripts/vm100-pilot.py raw-sftp --stock-ssh /usr/bin/ssh --hpn-ssh /home/zack/.local/opt/hpnssh/e2dfa0cea55d93747f4c68b4a2b134d6fbe0db06/bin/hpnssh'
 ```
 
 Expected: persistent receipts for every phase and canonical restoration after raw control.

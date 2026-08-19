@@ -8,6 +8,7 @@ use crate::fs::types::SetAttributes;
 use crate::fs::{CacheConfig, GarbageCollector, ZeroFS};
 use crate::length_checked_object_store::LengthCheckedObjectStore;
 use crate::nbd::{NBDServer, NbdExportGates};
+use crate::ninep::server::P9AcceptedWorkTracker;
 use crate::object_store_prefetch::PrefetchingObjectStore;
 use crate::parse_object_store::{ParsedStore, parse_url_opts};
 use crate::storage_class_object_store::with_storage_class;
@@ -72,6 +73,16 @@ pub enum DatabaseMode {
 impl DatabaseMode {
     pub fn is_read_only(&self) -> bool {
         !matches!(self, DatabaseMode::ReadWrite)
+    }
+}
+
+/// Access mode used to resolve the shared write-acknowledgement contract:
+/// volatile acknowledgement requires a read-write single-writer server.
+fn write_ack_access_mode(db_mode: DatabaseMode) -> crate::writeback::config::WritebackAccessMode {
+    match db_mode {
+        DatabaseMode::ReadWrite => crate::writeback::config::WritebackAccessMode::ReadWrite,
+        DatabaseMode::ReadOnly => crate::writeback::config::WritebackAccessMode::ReadOnly,
+        DatabaseMode::Checkpoint(_) => crate::writeback::config::WritebackAccessMode::Checkpoint,
     }
 }
 
@@ -179,6 +190,7 @@ fn start_ninep_servers(
     fs: Arc<ZeroFS>,
     config: Option<&NinePConfig>,
     shutdown: CancellationToken,
+    accepted_work: P9AcceptedWorkTracker,
 ) -> Vec<JoinHandle<Result<(), std::io::Error>>> {
     let config = match config {
         Some(c) => c,
@@ -191,8 +203,11 @@ fn start_ninep_servers(
             info!("Starting 9P server on {}", addr);
             let ninep_tcp_server = crate::ninep::NinePServer::new(Arc::clone(&fs), *addr);
             let shutdown_clone = shutdown.clone();
+            let accepted_work = accepted_work.clone();
             handles.push(spawn_named("9p-server", async move {
-                ninep_tcp_server.start(shutdown_clone).await
+                ninep_tcp_server
+                    .start_with_accepted_work(shutdown_clone, accepted_work)
+                    .await
             }));
         }
     }
@@ -206,8 +221,11 @@ fn start_ninep_servers(
         let ninep_unix_server =
             crate::ninep::NinePServer::new_unix(ninep_unix_fs, socket_path.clone());
         let shutdown_clone = shutdown.clone();
+        let accepted_work = accepted_work.clone();
         handles.push(spawn_named("9p-unix-server", async move {
-            ninep_unix_server.start(shutdown_clone).await
+            ninep_unix_server
+                .start_with_accepted_work(shutdown_clone, accepted_work)
+                .await
         }));
     }
 
@@ -626,6 +644,10 @@ async fn drain_server_handles_for_stop(
                 retain_listener_failure(&mut cause, &mut cleanup_errors, error);
             }
         }
+        cleanup_errors.push(anyhow::anyhow!(
+            "server listener shutdown exceeded the {}s response-drain grace",
+            crate::replication::RESPONSE_DRAIN_TIMEOUT.as_secs()
+        ));
     }
 
     (cause, cleanup_errors)
@@ -876,6 +898,9 @@ pub async fn build_slatedb(
     wal_object_store: Option<Arc<dyn object_store::ObjectStore>>,
     replication: Option<&crate::replication::ReplicationParams>,
 ) -> Result<SlateDbOpen> {
+    #[cfg(test)]
+    let _rss_cap_guard = crate::alloc_rss::lock_test_rss_cap().await;
+
     let total_disk_cache_gb = cache_config.max_cache_size_gb;
     let total_memory_cache_gb = cache_config.memory_cache_size_gb.unwrap_or(0.25);
 
@@ -1112,6 +1137,7 @@ pub async fn build_slatedb(
             info!("Opening database in read-only mode");
 
             let mut reader_builder = DbReader::builder(db_path, object_store)
+                .with_db_cache(cache)
                 .with_block_transformer(block_transformer)
                 .with_filter_policies(crate::fs::filter_policy::filter_policies())
                 .with_segment_extractor(Arc::new(crate::segment_extractor::ZeroFsSegmentExtractor));
@@ -1138,6 +1164,7 @@ pub async fn build_slatedb(
 
             let mut reader_builder = DbReader::builder(db_path, object_store)
                 .with_reader_mode(DbReaderMode::Checkpoint(checkpoint_id))
+                .with_db_cache(cache)
                 .with_block_transformer(block_transformer)
                 .with_filter_policies(crate::fs::filter_policy::filter_policies())
                 .with_segment_extractor(Arc::new(crate::segment_extractor::ZeroFsSegmentExtractor));
@@ -1244,6 +1271,16 @@ pub async fn run_server(
         }
     };
     validate_nbd_database_mode(settings.servers.nbd.as_ref(), db_mode)?;
+    let write_ack = settings
+        .filesystem_write_ack_settings(write_ack_access_mode(db_mode))
+        .context("Invalid filesystem write-acknowledgement configuration")?;
+    if write_ack.mode == crate::fs::mutation::config::FilesystemWriteAckMode::VolatileMemory {
+        warn!(
+            volatile_memory_bytes = write_ack.volatile_memory_bytes,
+            volatile_max_operations = write_ack.volatile_max_operations,
+            "volatile-memory write acknowledgement is enabled: ordinary writes are unsafe across process or power loss until a flush barrier completes"
+        );
+    }
     let maintenance_runtime = if db_mode.is_read_only() {
         None
     } else {
@@ -1284,6 +1321,7 @@ pub async fn run_server(
             .as_ref()
             .map_or_else(CancellationToken::new, |authority| authority.loss_token());
         let shutdown = leadership_deposed.child_token();
+        let p9_accepted_work = P9AcceptedWorkTracker::new();
 
         // Do not start listeners after authority was revoked during initialization.
         if leadership_deposed.is_cancelled() {
@@ -1355,6 +1393,7 @@ pub async fn run_server(
             Arc::clone(&fs),
             settings.servers.ninep.as_ref(),
             shutdown.clone(),
+            p9_accepted_work.clone(),
         );
 
         let (nbd_handles, nbd_runtime_registry) = start_nbd_servers(
@@ -1488,6 +1527,7 @@ pub async fn run_server(
                 webui_lock_manager,
                 webui_rpc_service,
                 shutdown.clone(),
+                p9_accepted_work.clone(),
             )
         } else {
             Vec::new()
@@ -1537,6 +1577,7 @@ pub async fn run_server(
 
         info!("Cancelling all servers and background tasks...");
         shutdown.cancel();
+        p9_accepted_work.stop_accepting();
         info!("Waiting for servers to exit...");
         let (stop_cause, serving_cleanup_errors) = drain_server_handles_for_stop(
             stop_cause,
@@ -1544,6 +1585,8 @@ pub async fn run_server(
             &leadership_deposed,
         )
         .await;
+        info!("Waiting for accepted 9P work to settle...");
+        p9_accepted_work.wait().await;
 
         if stop_cause.is_leadership_lost() {
             if let Some(registry) = &nbd_runtime_registry {
@@ -1818,8 +1861,120 @@ fn load_and_validate_server_settings(
 mod tests {
     use super::*;
 
-    #[test]
-    fn validated_rss_cap_survives_startup_and_cache_build_selection() {
+    enum ReaderModeUnderTest {
+        ReadOnly,
+        Checkpoint,
+    }
+
+    fn mode_cache_probe_key() -> bytes::Bytes {
+        crate::fs::key_codec::KeyCodec::new().inode_key(1)
+    }
+
+    async fn seeded_mode_cache_store() -> (
+        Arc<dyn object_store::ObjectStore>,
+        Arc<dyn BlockTransformer>,
+        uuid::Uuid,
+    ) {
+        use slatedb::config::{CheckpointOptions, CheckpointScope, PutOptions, WriteOptions};
+
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let transformer: Arc<dyn BlockTransformer> =
+            crate::block_transformer::ZeroFsBlockTransformer::new_arc(
+                &[7; 32],
+                crate::config::CompressionConfig::default(),
+            );
+        let db = DbBuilder::new(Path::from("mode-cache-test"), store.clone())
+            .with_settings(slatedb::config::Settings {
+                wal_enabled: false,
+                compactor_options: None,
+                ..Default::default()
+            })
+            .with_sst_block_size(slatedb::SstBlockSize::Block32Kib)
+            .with_block_transformer(transformer.clone())
+            .with_filter_policies(crate::fs::filter_policy::filter_policies())
+            .with_segment_extractor(Arc::new(crate::segment_extractor::ZeroFsSegmentExtractor))
+            .build()
+            .await
+            .expect("seed database");
+        db.put_with_options(
+            mode_cache_probe_key(),
+            vec![3; 64 * 1024],
+            &PutOptions::default(),
+            &WriteOptions {
+                await_durable: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("write probe");
+        db.flush().await.expect("flush probe");
+        let checkpoint = db
+            .create_checkpoint(CheckpointScope::Durable, &CheckpointOptions::default())
+            .await
+            .expect("create checkpoint");
+        db.close().await.expect("close seed database");
+
+        (store, transformer, checkpoint.id)
+    }
+
+    async fn assert_mode_exports_attached_decoded_cache(mode: ReaderModeUnderTest) {
+        let (store, transformer, checkpoint_id) = seeded_mode_cache_store().await;
+        let mode = match mode {
+            ReaderModeUnderTest::ReadOnly => DatabaseMode::ReadOnly,
+            ReaderModeUnderTest::Checkpoint => DatabaseMode::Checkpoint(checkpoint_id),
+        };
+        let cache_root = tempfile::tempdir().expect("cache root");
+        let opened = build_slatedb(
+            store,
+            &crate::fs::CacheConfig {
+                root_folder: cache_root.path().to_owned(),
+                max_cache_size_gb: 0.0,
+                memory_cache_size_gb: Some(0.064),
+            },
+            "mode-cache-test".to_owned(),
+            mode,
+            None,
+            transformer,
+            None,
+            None,
+        )
+        .await
+        .expect("open reader mode");
+        let reader = match &opened.data {
+            SlateDbHandle::ReadOnly(reader) => reader.load_full(),
+            SlateDbHandle::ReadWrite(_) => panic!("reader mode opened a writer"),
+        };
+
+        assert_eq!(
+            reader
+                .get(mode_cache_probe_key())
+                .await
+                .expect("read probe"),
+            Some(bytes::Bytes::from(vec![3; 64 * 1024]))
+        );
+        let snapshot = opened.cache_metrics.snapshot();
+        assert!(
+            snapshot.decoded_blocks.entries > 0,
+            "decoded-block metrics must observe the cache used by the reader: {snapshot:?}"
+        );
+
+        reader.close().await.expect("close reader");
+        opened.parts_cache.close().await.expect("close parts cache");
+    }
+
+    #[tokio::test]
+    async fn read_only_open_exports_its_attached_decoded_cache() {
+        assert_mode_exports_attached_decoded_cache(ReaderModeUnderTest::ReadOnly).await;
+    }
+
+    #[tokio::test]
+    async fn checkpoint_open_exports_its_attached_decoded_cache() {
+        assert_mode_exports_attached_decoded_cache(ReaderModeUnderTest::Checkpoint).await;
+    }
+
+    #[tokio::test]
+    async fn validated_rss_cap_survives_startup_and_cache_build_selection() {
         struct ResetRss;
         impl Drop for ResetRss {
             fn drop(&mut self) {
@@ -1828,9 +1983,7 @@ mod tests {
             }
         }
 
-        let _lock = crate::alloc_rss::RSS_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _rss_cap_guard = crate::alloc_rss::lock_test_rss_cap().await;
         let _reset = ResetRss;
         let gib = 1024 * 1024 * 1024;
         let validated_service_cap = 56 * gib;
@@ -1931,6 +2084,52 @@ addresses = ["127.0.0.1:20490"]
     }
 
     #[test]
+    fn volatile_filesystem_ack_rejects_read_only_database_modes() {
+        let settings: Settings = toml::from_str(
+            r#"
+[cache]
+dir = "/tmp/cache"
+disk_size_gb = 1.0
+
+[storage]
+url = "file:///tmp/data"
+encryption_password = "test"
+
+[servers.nfs]
+addresses = ["127.0.0.1:2049"]
+
+[filesystem]
+write_ack_mode = "volatile_memory"
+volatile_memory_gb = 2.0
+
+[writeback]
+enabled = true
+dir = "/var/cache/zerofs-writeback"
+memory_size_gb = 16.0
+disk_size_gb = 512.0
+min_free_gb = 256.0
+"#,
+        )
+        .unwrap();
+
+        for db_mode in [
+            DatabaseMode::ReadOnly,
+            DatabaseMode::Checkpoint(uuid::Uuid::nil()),
+        ] {
+            let error = settings
+                .filesystem_write_ack_settings(write_ack_access_mode(db_mode))
+                .unwrap_err();
+            assert!(
+                format!("{error:#}").contains("read-write"),
+                "unexpected error: {error:#}"
+            );
+        }
+        settings
+            .filesystem_write_ack_settings(write_ack_access_mode(DatabaseMode::ReadWrite))
+            .unwrap();
+    }
+
+    #[test]
     fn listener_completion_before_shutdown_is_an_error() {
         let error = listener_exit_error(Ok(Ok(())), true).unwrap();
         assert!(
@@ -1976,13 +2175,17 @@ addresses = ["127.0.0.1:20490"]
             started.elapsed(),
             crate::replication::RESPONSE_DRAIN_TIMEOUT
         );
-        assert!(cleanup.is_empty(), "unexpected secondary failure");
+        assert_eq!(cleanup.len(), 1, "missing listener-timeout context");
+        assert!(cleanup[0].to_string().contains("shutdown exceeded"));
         let sibling_dropped = tokio::time::timeout(Duration::from_secs(1), alive_rx).await;
         assert!(
             matches!(sibling_dropped, Ok(Err(_))),
             "stuck sibling listener was not aborted and joined"
         );
-        let message = format!("{:#}", finish_serving_shutdown(cause, Ok(())).unwrap_err());
+        let message = format!(
+            "{:#}",
+            finish_serving_shutdown(cause, merge_cleanup_results(cleanup, Ok(()))).unwrap_err()
+        );
         assert!(
             message.contains("primary listener failure"),
             "unexpected primary error: {message}"
@@ -2069,7 +2272,7 @@ addresses = ["127.0.0.1:20490"]
     }
 
     #[tokio::test(start_paused = true)]
-    async fn signal_shutdown_aborts_and_joins_a_stuck_listener_after_grace() {
+    async fn signal_shutdown_reports_a_stuck_listener_after_grace() {
         let (alive_tx, alive_rx) = tokio::sync::oneshot::channel::<()>();
         let stuck = tokio::spawn(async move {
             let _alive = alive_tx;
@@ -2095,7 +2298,9 @@ addresses = ["127.0.0.1:20490"]
         );
         assert!(handles.is_empty(), "listener handle was not joined");
         assert!(alive_rx.await.is_err(), "stuck listener was not aborted");
-        finish_serving_shutdown(drained.0, merge_cleanup_results(drained.1, Ok(()))).unwrap();
+        let error = finish_serving_shutdown(drained.0, merge_cleanup_results(drained.1, Ok(())))
+            .unwrap_err();
+        assert!(error.to_string().contains("shutdown exceeded"));
     }
 
     #[tokio::test(start_paused = true)]
@@ -2205,7 +2410,7 @@ addresses = ["127.0.0.1:20490"]
             started.elapsed(),
             crate::replication::RESPONSE_DRAIN_TIMEOUT
         );
-        assert!(cleanup.is_empty(), "unexpected listener cleanup error");
+        assert_eq!(cleanup.len(), 1, "missing listener-timeout context");
         assert!(alive_rx.await.is_err(), "stuck listener was not joined");
         let message = format!("{:#}", finish_serving_shutdown(cause, Ok(())).unwrap_err());
         assert!(message.starts_with("HA writer was fenced or superseded"));

@@ -16,6 +16,7 @@ from typing import IO, Protocol
 from .benchmark import BenchmarkResult, BenchmarkRunner
 from .config import PilotConfig
 from .lifecycle import PilotLifecycle
+from .owned_resources import atomic_write_json
 from .receipts import RunReceipt
 from .runner import ManagedProcess, Runner
 from .system_io import file_sha256
@@ -756,17 +757,12 @@ class ProfileRunner:
             benchmark=benchmark_result.to_dict(),
             canonical_binary_restored=restored,
         )
-        receipt.path("summary.json").write_text(
-            json.dumps(
-                {
+        atomic_write_json(
+            receipt.path("summary.json"),
+            {
                     "receipt_dir": result.receipt_dir,
                     "benchmark": result.benchmark,
                     "canonical_binary_restored": result.canonical_binary_restored,
                 },
-                indent=2,
-                sort_keys=True,
-            )
-            + "\n",
-            encoding="utf-8",
         )
         return result

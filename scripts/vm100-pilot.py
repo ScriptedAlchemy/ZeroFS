@@ -18,14 +18,32 @@ if str(ROOT) not in sys.path:
 from scripts.vm100_pilot.benchmark import BenchmarkRunner  # noqa: E402
 from scripts.vm100_pilot.config import PilotConfig  # noqa: E402
 from scripts.vm100_pilot.lifecycle import PilotLifecycle  # noqa: E402
+from scripts.vm100_pilot.memory_envelope import (  # noqa: E402
+    MemoryEnvelopeAuthority,
+    MemoryEnvelopeSession,
+)
+from scripts.vm100_pilot.metrics import MetricsClient  # noqa: E402
+from scripts.vm100_pilot.owned_resources import atomic_write_json  # noqa: E402
 from scripts.vm100_pilot.migration import StripedMigrator  # noqa: E402
 from scripts.vm100_pilot.performance_matrix import PerformanceMatrixRunner  # noqa: E402
 from scripts.vm100_pilot.profile import ProfileRunner  # noqa: E402
+from scripts.vm100_pilot.protocol_matrix import (  # noqa: E402
+    ProtocolAuthority,
+    ProtocolMatrixRunner,
+)
 from scripts.vm100_pilot.raw_sftp import RawSftpRunner  # noqa: E402
+from scripts.vm100_pilot.receipts import RunReceipt  # noqa: E402
 from scripts.vm100_pilot.real_world_matrix import RealWorldMatrixRunner  # noqa: E402
 from scripts.vm100_pilot.reset import FreshResetter  # noqa: E402
 from scripts.vm100_pilot.runner import Runner  # noqa: E402
+from scripts.vm100_pilot.scenarios import (  # noqa: E402
+    list_scenarios,
+    require_memory_scenario,
+    require_protocol_scenario,
+    require_raw_sftp_scenario,
+)
 from scripts.vm100_pilot.workloads import WorkloadRunner  # noqa: E402
+from scripts.vm100_pilot.writeback_observer import WritebackObserver  # noqa: E402
 
 
 def _positive(value: str) -> int:
@@ -35,11 +53,20 @@ def _positive(value: str) -> int:
     return parsed
 
 
+def _add_sftp_ab_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--stock-ssh", type=Path, required=True)
+    parser.add_argument("--hpn-ssh", type=Path, required=True)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Build, deploy, profile, and benchmark the VM100 ZeroFS NBD pilot"
     )
     subcommands = parser.add_subparsers(dest="command", required=True)
+    subcommands.add_parser(
+        "list-scenarios",
+        help="list the immutable registry of real benchmark scenarios",
+    )
     setup = subcommands.add_parser("setup", help="build, deploy, and start the pilot")
     setup.add_argument(
         "--skip-build",
@@ -84,8 +111,7 @@ def build_parser() -> argparse.ArgumentParser:
     raw = subcommands.add_parser(
         "raw-sftp", help="measure the matched direct SFTP control"
     )
-    raw.add_argument("--jobs", type=_positive)
-    raw.add_argument("--per-job-mib", type=_positive)
+    _add_sftp_ab_arguments(raw)
     matrix = subcommands.add_parser(
         "performance-matrix",
         help="run an isolated direct-I/O NBD block-size and concurrency matrix",
@@ -109,13 +135,25 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="run the bounded representative suite without 1 GiB cells",
     )
+    protocol = subcommands.add_parser(
+        "protocol-matrix",
+        help="run the registered NFS or 9P shared-namespace matrix",
+    )
+    protocol.add_argument("--protocol", choices=("nfs", "9p"), required=True)
+    protocol.add_argument(
+        "--memory-envelope",
+        action="store_true",
+        help="enforce the registered fixed cgroup/process memory envelope",
+    )
     iterate = subcommands.add_parser(
         "iterate", help="deploy, benchmark, run workloads, and run raw SFTP"
     )
     iterate.add_argument("--skip-build", action="store_true")
-    subcommands.add_parser(
+    _add_sftp_ab_arguments(iterate)
+    all_command = subcommands.add_parser(
         "all", help="run benchmark, workloads, and raw SFTP without deployment"
     )
+    _add_sftp_ab_arguments(all_command)
     return parser
 
 
@@ -149,7 +187,64 @@ def _emit(value: object) -> None:
     print(json.dumps(value, indent=2, sort_keys=True, default=str))
 
 
-def dispatch(args: argparse.Namespace, config: PilotConfig, runner: Runner) -> None:
+def _run_protocol_matrix(
+    args: argparse.Namespace,
+    config: PilotConfig,
+    runner: Runner,
+) -> object:
+    receipt = RunReceipt.start(config, f"protocol-matrix-{args.protocol}")
+    with receipt:
+        receipt.record("requested_protocol", args.protocol)
+        receipt.record("memory_envelope_requested", bool(args.memory_envelope))
+        scenario = require_protocol_scenario(f"protocol-matrix-{args.protocol}")
+        receipt.record("scenario", scenario.to_dict())
+        atomic_write_json(
+            receipt.path("cleanup-ledger.json"),
+            {
+                    "schema": 1,
+                    "resources": [],
+                    "cleanup_attempts": 0,
+                    "asserted_clean": True,
+                    "state": "preflight-no-resources",
+                },
+        )
+        authority = ProtocolAuthority.from_mapping(args.protocol, os.environ)
+        observer = WritebackObserver(
+            MetricsClient(authority.metrics_url, authority.metrics_identity),
+            config.drain_timeout,
+            authority.metrics_url,
+        )
+        memory_session = None
+        if args.memory_envelope:
+            memory_scenario = require_memory_scenario("memory-envelope")
+            memory_authority = MemoryEnvelopeAuthority.from_mapping(os.environ)
+            memory_session = MemoryEnvelopeSession.prepare(
+                memory_authority,
+                runner,
+                observer,
+                memory_scenario,
+            )
+        return ProtocolMatrixRunner(
+            config,
+            runner,
+            observer,
+            memory_session=memory_session,
+        ).run(scenario, authority, receipt=receipt)
+
+
+def dispatch(
+    args: argparse.Namespace,
+    config: PilotConfig | None,
+    runner: Runner | None,
+) -> None:
+    if args.command == "list-scenarios":
+        _emit([scenario.to_dict() for scenario in list_scenarios()])
+        return
+    if config is None or runner is None:
+        raise RuntimeError(f"{args.command} requires a configured VM100 runner")
+    if args.command == "protocol-matrix":
+        _emit(_run_protocol_matrix(args, config, runner))
+        return
     runner.run(
         [
             "install",
@@ -215,7 +310,14 @@ def dispatch(args: argparse.Namespace, config: PilotConfig, runner: Runner) -> N
     elif args.command == "workloads":
         _emit(workloads.run(delete_jobs=args.delete_jobs))
     elif args.command == "raw-sftp":
-        _emit(raw.run(jobs=args.jobs, per_job_mib=args.per_job_mib))
+        raw_scenario = require_raw_sftp_scenario("raw-sftp-stock-hpn")
+        _emit(
+            raw.run(
+                raw_scenario,
+                stock_ssh=args.stock_ssh,
+                hpn_ssh=args.hpn_ssh,
+            )
+        )
     elif args.command == "performance-matrix":
         total_mib = args.total_mib
         if total_mib is None:
@@ -235,7 +337,11 @@ def dispatch(args: argparse.Namespace, config: PilotConfig, runner: Runner) -> N
                 "deployed": deployed,
                 "benchmark": benchmark.run().to_dict(),
                 "workloads": workloads.run().to_dict(),
-                "raw_sftp": raw.run().to_dict(),
+                "raw_sftp": raw.run(
+                    require_raw_sftp_scenario("raw-sftp-stock-hpn"),
+                    stock_ssh=args.stock_ssh,
+                    hpn_ssh=args.hpn_ssh,
+                ).to_dict(),
             }
         )
     elif args.command == "all":
@@ -243,7 +349,11 @@ def dispatch(args: argparse.Namespace, config: PilotConfig, runner: Runner) -> N
             {
                 "benchmark": benchmark.run().to_dict(),
                 "workloads": workloads.run().to_dict(),
-                "raw_sftp": raw.run().to_dict(),
+                "raw_sftp": raw.run(
+                    require_raw_sftp_scenario("raw-sftp-stock-hpn"),
+                    stock_ssh=args.stock_ssh,
+                    hpn_ssh=args.hpn_ssh,
+                ).to_dict(),
             }
         )
     else:  # pragma: no cover - argparse enforces this boundary.
@@ -252,8 +362,23 @@ def dispatch(args: argparse.Namespace, config: PilotConfig, runner: Runner) -> N
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    config = PilotConfig.from_environment(ROOT)
+    if args.command == "list-scenarios":
+        dispatch(args, None, None)
+        return 0
     try:
+        if args.command == "protocol-matrix":
+            allowed = {
+                "ZEROFS_PILOT_RESULT_DIR",
+                "ZEROFS_PILOT_TMP_DIR",
+                "ZEROFS_PILOT_LOCK_FILE",
+                "ZEROFS_PILOT_DRAIN_TIMEOUT",
+            }
+            config = PilotConfig.from_mapping(
+                ROOT,
+                {key: value for key, value in os.environ.items() if key in allowed},
+            )
+        else:
+            config = PilotConfig.from_environment(ROOT)
         with operation_lock(config.lock_file):
             dispatch(args, config, Runner())
     except BaseException as error:

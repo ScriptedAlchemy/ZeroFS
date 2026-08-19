@@ -1,13 +1,75 @@
 from __future__ import annotations
 
+import re
+import threading
 import time
 import urllib.request
 from dataclasses import asdict, dataclass
 from typing import Callable
+from urllib.parse import urlsplit
 
 
 class TerminalWritebackError(RuntimeError):
     pass
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request: object, *args: object) -> None:
+        del request, args
+        return None
+
+
+_AUTHORITY_METRIC = "zerofs_benchmark_authority_info"
+_AUTHORITY_LABEL = re.compile(r'([a-z_]+)="([A-Za-z0-9._:/-]+)"\Z')
+
+
+@dataclass(frozen=True, slots=True)
+class MetricsAuthorityIdentity:
+    server_instance_id: str
+    filesystem_id: str
+    export_id: str
+
+    def __post_init__(self) -> None:
+        for name, value in asdict(self).items():
+            if not value or not re.fullmatch(r"[A-Za-z0-9._:/-]+", value):
+                raise ValueError(f"invalid metrics authority field: {name}")
+
+    @classmethod
+    def parse(cls, text: str) -> "MetricsAuthorityIdentity":
+        matches: list[MetricsAuthorityIdentity] = []
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line.startswith(f"{_AUTHORITY_METRIC}{{"):
+                continue
+            series, separator, value = line.rpartition(" ")
+            if not separator or value != "1":
+                raise ValueError(f"invalid {_AUTHORITY_METRIC} sample structure")
+            prefix = f"{_AUTHORITY_METRIC}{{"
+            if not series.endswith("}"):
+                raise ValueError(f"invalid {_AUTHORITY_METRIC} series structure")
+            labels: dict[str, str] = {}
+            for token in series[len(prefix) : -1].split(","):
+                match = _AUTHORITY_LABEL.fullmatch(token)
+                if match is None or match.group(1) in labels:
+                    raise ValueError(f"invalid {_AUTHORITY_METRIC} label structure")
+                labels[match.group(1)] = match.group(2)
+            expected = {"server_instance_id", "filesystem_id", "export_id"}
+            if set(labels) != expected:
+                raise ValueError(
+                    f"invalid {_AUTHORITY_METRIC} labels: {sorted(labels)}"
+                )
+            matches.append(
+                cls(
+                    labels["server_instance_id"],
+                    labels["filesystem_id"],
+                    labels["export_id"],
+                )
+            )
+        if len(matches) != 1:
+            raise ValueError(
+                f"expected exactly one {_AUTHORITY_METRIC} sample, found {len(matches)}"
+            )
+        return matches[0]
 
 
 _METRICS = {
@@ -53,8 +115,8 @@ class WritebackSnapshot:
                 continue
             try:
                 found[_METRICS[parts[0]]] = int(float(parts[1]))
-            except ValueError as error:
-                raise ValueError(f"invalid writeback metric: {line}") from error
+            except ValueError:
+                raise ValueError("invalid writeback metric value") from None
         required = set(_METRICS.values()) - {"gc_active"}
         missing = sorted(required - found.keys())
         if missing:
@@ -96,14 +158,57 @@ class DrainReceipt:
 
 
 class MetricsClient:
-    def __init__(self, url: str, timeout: float = 5.0) -> None:
+    def __init__(
+        self,
+        url: str,
+        expected_identity: MetricsAuthorityIdentity | None = None,
+        timeout: float = 5.0,
+    ) -> None:
+        parsed = urlsplit(url)
+        if (
+            parsed.scheme != "https"
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or bool(parsed.query)
+            or bool(parsed.fragment)
+            or parsed.path != "/metrics"
+        ):
+            raise ValueError(
+                "metrics URL must be credential-free HTTPS without query or fragment"
+            )
         self.url = url
+        self.expected_identity = expected_identity
         self.timeout = timeout
+        self._identity_lock = threading.Lock()
+        self._opener = urllib.request.build_opener(_NoRedirectHandler)
+
+    def _fetch(self) -> str:
+        with self._opener.open(self.url, timeout=self.timeout) as response:
+            if response.geturl() != self.url:
+                raise ValueError("metrics response URL differs from pinned endpoint")
+            return response.read().decode("utf-8")
+
+    def _validate_identity(self, text: str) -> MetricsAuthorityIdentity:
+        actual = MetricsAuthorityIdentity.parse(text)
+        with self._identity_lock:
+            if self.expected_identity is None:
+                self.expected_identity = actual
+            elif actual != self.expected_identity:
+                raise ValueError(
+                    "ZeroFS metrics identity mismatch: "
+                    f"expected={asdict(self.expected_identity)}, "
+                    f"actual={asdict(actual)}"
+                )
+        return actual
 
     def snapshot(self) -> WritebackSnapshot:
-        with urllib.request.urlopen(self.url, timeout=self.timeout) as response:
-            text = response.read().decode("utf-8")
+        text = self._fetch()
+        self._validate_identity(text)
         return WritebackSnapshot.parse(text)
+
+    def identity(self) -> MetricsAuthorityIdentity:
+        return self._validate_identity(self._fetch())
 
 
 def wait_for_gc_quiescence(
@@ -205,6 +310,30 @@ def wait_for_local(
         if monotonic() - started >= timeout:
             raise TimeoutError(
                 f"writeback did not reach local sequence {target_sequence} within "
+                f"{timeout}s; last={current.to_dict()}"
+            )
+        sleep(interval)
+
+
+def wait_for_remote(
+    snapshot: Callable[[], WritebackSnapshot],
+    *,
+    target_sequence: int,
+    timeout: float,
+    interval: float = 0.05,
+    monotonic: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+) -> WritebackSnapshot:
+    started = monotonic()
+    while True:
+        current = snapshot()
+        if current.terminal:
+            raise TerminalWritebackError("writeback reported a terminal error")
+        if current.remote >= target_sequence:
+            return current
+        if monotonic() - started >= timeout:
+            raise TimeoutError(
+                f"writeback did not reach remote sequence {target_sequence} within "
                 f"{timeout}s; last={current.to_dict()}"
             )
         sleep(interval)

@@ -656,6 +656,7 @@ class RealWorldMatrixCliTests(unittest.TestCase):
         config.user = "tester"
         config.group = "tester"
         config.result_dir = "/var/tmp/real-world-matrix-test-results"
+        config.metrics_url = "https://127.0.0.1:19567/metrics"
         runner = mock.Mock()
         runner.run.return_value = CompletedProcess(("install",), 0, "", "")
         with (
