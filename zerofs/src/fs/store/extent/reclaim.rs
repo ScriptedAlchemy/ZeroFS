@@ -70,9 +70,9 @@ const MAX_SEGMENT_DELETES_PER_PASS: usize = 1024;
 /// One directory verify checks both the memory and durable views. Consecutive
 /// extents stay in one narrow range; highly sparse/interleaved directories
 /// coalesce their runs so a legal full segment has at most 32 logical scans.
-/// Each logical scan is physically paged: page memory/work is bounded, while
-/// valid directories and unrelated rows in coalesced gaps always make forward
-/// progress instead of becoming a permanent liveness cap.
+/// Each logical scan is consumed in bounded pages without reopening its source
+/// iterator: page memory/work is bounded, while valid directories and unrelated
+/// rows in coalesced gaps always make forward progress.
 const MAX_VERIFY_LOGICAL_SCANS: usize = 32;
 const MAX_VERIFY_SCAN_RANGES: usize = MAX_VERIFY_LOGICAL_SCANS / 2;
 const MAX_VERIFY_PAGE_ROWS: usize = 65_536;
@@ -136,23 +136,6 @@ impl VerifyPageBudget {
     fn full(&self, limits: VerifyPageLimits) -> bool {
         self.rows >= limits.rows || self.encoded_bytes >= limits.encoded_bytes
     }
-}
-
-enum VerifyPageResult {
-    Complete,
-    ContinueAfter(Bytes),
-    Referenced,
-}
-
-fn advance_verify_cursor(resume_after: &mut Option<Bytes>, next: Bytes) -> Result<(), ()> {
-    if resume_after
-        .as_ref()
-        .is_some_and(|previous| next <= *previous)
-    {
-        return Err(());
-    }
-    *resume_after = Some(next);
-    Ok(())
 }
 
 /// What one reclaim pass did and whether it left actionable work behind —
@@ -1034,8 +1017,8 @@ impl ExtentStore {
     }
 
     /// `Ok(true)` if any wanted extent still points at `segid` in memory or
-    /// durable view. `Err` on an unrepresentable range end, oversized row,
-    /// invalid continuation, or scan/decode error (fail-closed: do not delete).
+    /// durable view. `Err` on an unrepresentable range end, oversized row, or
+    /// scan/decode error (fail-closed: do not delete).
     async fn directory_still_referenced(
         &self,
         segid: Segid,
@@ -1071,79 +1054,37 @@ impl ExtentStore {
         durable: bool,
         limits: VerifyPageLimits,
     ) -> Result<bool, ()> {
-        let mut resume_after = None;
-        loop {
-            match self
-                .scan_extent_page_points_here(
-                    segid,
-                    want,
-                    range.clone(),
-                    resume_after.as_ref(),
-                    durable,
-                    limits,
-                )
-                .await?
-            {
-                VerifyPageResult::Complete => return Ok(false),
-                VerifyPageResult::Referenced => return Ok(true),
-                VerifyPageResult::ContinueAfter(key) => {
-                    advance_verify_cursor(&mut resume_after, key)?;
-                }
-            }
-        }
-    }
-
-    async fn scan_extent_page_points_here(
-        &self,
-        segid: Segid,
-        want: &[DirEntry],
-        range: std::ops::Range<Bytes>,
-        resume_after: Option<&Bytes>,
-        durable: bool,
-        limits: VerifyPageLimits,
-    ) -> Result<VerifyPageResult, ()> {
-        let start = resume_after.cloned().unwrap_or_else(|| range.start.clone());
-        if start >= range.end {
-            return Ok(VerifyPageResult::Complete);
+        if range.start >= range.end {
+            return Ok(false);
         }
         let stream = if durable {
-            self.db.scan_durable(start..range.end).await
+            self.db.scan_durable_bounded(range).await
         } else {
-            self.db.scan(start..range.end).await
+            self.db.scan_bounded(range).await
         }
         .map_err(|_| ())?;
-        self.inspect_extent_page_stream(segid, want, stream, resume_after, limits)
+        self.inspect_extent_stream(segid, want, stream, limits)
             .await
     }
 
-    async fn inspect_extent_page_stream(
+    async fn inspect_extent_stream(
         &self,
         segid: Segid,
         want: &[DirEntry],
         mut stream: ExtentScanStream<'_>,
-        resume_after: Option<&Bytes>,
         limits: VerifyPageLimits,
-    ) -> Result<VerifyPageResult, ()> {
+    ) -> Result<bool, ()> {
         let mut budget = VerifyPageBudget::default();
-        let mut last_processed = None;
         let mut want_index = None;
         while let Some(item) = stream.next().await {
             let (key, val) = item.map_err(|_| ())?;
-            if let Some(resume) = resume_after {
-                if key < *resume {
-                    return Err(());
-                }
-                if key == *resume {
-                    continue;
-                }
+            if budget.full(limits) {
+                budget = VerifyPageBudget::default();
             }
             if budget.charge(&key, &val, limits).is_err() {
-                return match last_processed {
-                    Some(key) => Ok(VerifyPageResult::ContinueAfter(key)),
-                    None => Err(()),
-                };
+                budget = VerifyPageBudget::default();
+                budget.charge(&key, &val, limits)?;
             }
-            last_processed = Some(key.clone());
 
             if let Some(logical) = self.key_codec.parse_extent_key_full(&key) {
                 let index = want_index.get_or_insert_with(|| {
@@ -1154,22 +1095,14 @@ impl ExtentStore {
                 }
                 if want.get(*index).map(dir_entry_key) == Some(logical) {
                     match FrameLoc::decode(&val) {
-                        Some(loc) if loc.segid == segid => {
-                            return Ok(VerifyPageResult::Referenced);
-                        }
+                        Some(loc) if loc.segid == segid => return Ok(true),
                         Some(_) => {}
                         None => return Err(()),
                     }
                 }
             }
-
-            if budget.full(limits) {
-                return last_processed
-                    .map(VerifyPageResult::ContinueAfter)
-                    .ok_or(());
-            }
         }
-        Ok(VerifyPageResult::Complete)
+        Ok(false)
     }
 }
 
@@ -1291,12 +1224,7 @@ mod tests {
     }
 
     #[test]
-    fn verify_cursor_and_unrepresentable_end_fail_closed() {
-        let mut cursor = None;
-        advance_verify_cursor(&mut cursor, Bytes::from_static(b"b")).unwrap();
-        assert!(advance_verify_cursor(&mut cursor, Bytes::from_static(b"b")).is_err());
-        assert!(advance_verify_cursor(&mut cursor, Bytes::from_static(b"a")).is_err());
-
+    fn unrepresentable_end_fails_closed() {
         let codec = KeyCodec::new();
         assert!(
             extent_scan_ranges(&codec, &[test_dir_entry(u64::MAX, u64::MAX)]).is_none(),
@@ -1313,11 +1241,10 @@ mod tests {
 
         assert!(
             store
-                .inspect_extent_page_stream(
+                .inspect_extent_stream(
                     Segid::new(7, 1),
                     &[test_dir_entry(1, 0)],
                     stream,
-                    None,
                     VERIFY_PAGE_LIMITS,
                 )
                 .await
@@ -1686,8 +1613,16 @@ mod tests {
             store.verify_segment_reclaimable(segid).await,
             SegmentDeadVerdict::Reclaim
         ));
-        assert!(db.scan_call_count() - memory_before >= 2);
-        assert!(db.durable_scan_call_count() - durable_before >= 2);
+        assert_eq!(
+            db.scan_call_count() - memory_before,
+            1,
+            "consumer page boundaries must stay inside one source scan"
+        );
+        assert_eq!(
+            db.durable_scan_call_count() - durable_before,
+            1,
+            "durable page boundaries must stay inside one source scan"
+        );
         assert_eq!(db.point_read_call_count() - points_before, 0);
 
         let (deleted, _) = store.reclaim_segments(Utc::now(), None).await.unwrap();
@@ -1765,9 +1700,10 @@ mod tests {
         let (deleted, _) = store.reclaim_segments(Utc::now(), None).await.unwrap();
 
         assert_eq!(deleted, 1, "page boundaries must not become a liveness cap");
-        assert!(
-            db.scan_call_count() + db.durable_scan_call_count() - scans_before > 19,
-            "row + 1 must exceed the fixture's 18 logical scans plus the segcount scan"
+        assert_eq!(
+            db.scan_call_count() + db.durable_scan_call_count() - scans_before,
+            19,
+            "nine logical ranges per view plus the segcount scan must not reopen at page bounds"
         );
         assert!(
             !store
@@ -1790,9 +1726,10 @@ mod tests {
         let (deleted, _) = store.reclaim_segments(Utc::now(), None).await.unwrap();
 
         assert_eq!(deleted, 1, "byte pages must make forward progress");
-        assert!(
-            db.scan_call_count() + db.durable_scan_call_count() - scans_before > 19,
-            "byte + 1 must exceed the fixture's 18 logical scans plus the segcount scan"
+        assert_eq!(
+            db.scan_call_count() + db.durable_scan_call_count() - scans_before,
+            19,
+            "nine logical ranges per view plus the segcount scan must not reopen at page bounds"
         );
         assert!(
             !store

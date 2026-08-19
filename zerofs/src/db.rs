@@ -678,6 +678,65 @@ impl Db {
         self.scan_at(range, DurabilityLevel::Remote).await
     }
 
+    /// Uncached, single-fetch scan for memory-sensitive maintenance paths.
+    ///
+    /// Unlike [`Self::scan`], the returned stream owns the SlateDB iterator
+    /// directly instead of pumping it through a spawned forwarding task. A
+    /// caller that finishes or drops the stream therefore drops its iterator
+    /// directly. Read-ahead is limited to one block per fetch, with one fetch
+    /// task per SST; callers separately bound decoded rows and bytes.
+    pub(crate) async fn scan_bounded<R: slatedb::ByteRangeBounds + Send>(
+        &self,
+        range: R,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<(Bytes, Bytes)>> + Send + '_>>> {
+        #[cfg(test)]
+        self.scan_calls.fetch_add(1, Ordering::Relaxed);
+        self.scan_bounded_at(range, DurabilityLevel::Memory).await
+    }
+
+    /// Durable counterpart of [`Self::scan_bounded`].
+    pub(crate) async fn scan_durable_bounded<R: slatedb::ByteRangeBounds + Send>(
+        &self,
+        range: R,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<(Bytes, Bytes)>> + Send + '_>>> {
+        #[cfg(test)]
+        self.durable_scan_calls.fetch_add(1, Ordering::Relaxed);
+        self.scan_bounded_at(range, DurabilityLevel::Remote).await
+    }
+
+    async fn scan_bounded_at<R: slatedb::ByteRangeBounds + Send>(
+        &self,
+        range: R,
+        durability_filter: DurabilityLevel,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<(Bytes, Bytes)>> + Send + '_>>> {
+        self.check_lease()?;
+        let scan_options = ScanOptions {
+            durability_filter,
+            read_ahead_bytes: 1,
+            cache_blocks: false,
+            max_fetch_tasks: 1,
+            ..Default::default()
+        };
+
+        let iter = match &self.inner {
+            SlateDbHandle::ReadWrite(db) => db.scan_with_options(range, &scan_options).await?,
+            SlateDbHandle::ReadOnly(reader_swap) => {
+                let reader = reader_swap.load();
+                reader.scan_with_options(range, &scan_options).await?
+            }
+        };
+
+        Ok(Box::pin(futures::stream::try_unfold(
+            iter,
+            |mut iter| async move {
+                match iter.next().await? {
+                    Some(kv) => Ok(Some(((kv.key, kv.value), iter))),
+                    None => Ok(None),
+                }
+            },
+        )))
+    }
+
     async fn scan_at<R: slatedb::ByteRangeBounds + Send>(
         &self,
         range: R,
