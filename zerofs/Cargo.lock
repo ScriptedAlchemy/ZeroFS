@@ -6590,9 +6590,8 @@ dependencies = [
 
 [[package]]
 name = "zerofs_nfsserve"
-version = "0.19.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8ab1054157974adae5bd04fa88fb189be0a4d8846e29c9cd7653cf48ab1fa418"
+version = "0.20.0"
+source = "git+https://github.com/ScriptedAlchemy/nfsserve.git?rev=b0709d0ca03c53287d0d74dcead1e49e207e09a3#b0709d0ca03c53287d0d74dcead1e49e207e09a3"
 dependencies = [
  "anyhow",
  "async-trait",
