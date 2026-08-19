@@ -207,9 +207,7 @@ control_host_transaction
 
         self.assertIn('install -d -o 0 -g 100000 -m 0750 "$state_root"', source)
         self.assertNotIn('install -d -m 0700 "$state_root"', source)
-        self.assertIn(
-            'install -d -o 0 -g 0 -m 0700 "$state_root/rollback"', source
-        )
+        self.assertIn('install -d -o 0 -g 0 -m 0700 "$state_root/rollback"', source)
         self.assertNotIn('install -d -o 100000 -g 100000 -m 0750 "$state_root"', source)
         self.assertIn('"$temporary_transaction/previous-config"', source)
         self.assertIn('"$temporary_transaction/previous-receipt"', source)
