@@ -370,7 +370,9 @@ async fn unix_admin_flush_waits_for_real_remote_writeback() {
         .expect("admin RPC server task panicked")
         .expect("admin RPC server failed");
     fs.stop_new_mutation_admission();
-    fs.stop_mutation_workers().await;
+    fs.stop_mutation_workers()
+        .await
+        .expect("mutation workers did not stop cleanly");
     fs.flush_coordinator.close().await.unwrap();
     writeback.shutdown().await.unwrap();
     let cleanup_root = temp.path().to_path_buf();
@@ -607,7 +609,9 @@ async fn unix_ninep_standard_and_verified_fsync_wait_for_real_remote_writeback()
         .expect("9P server task panicked")
         .expect("9P server failed");
     fs.stop_new_mutation_admission();
-    fs.stop_mutation_workers().await;
+    fs.stop_mutation_workers()
+        .await
+        .expect("mutation workers did not stop cleanly");
     fs.flush_coordinator.close().await.unwrap();
     writeback.shutdown().await.unwrap();
     let cleanup_root = temp.path().to_path_buf();
