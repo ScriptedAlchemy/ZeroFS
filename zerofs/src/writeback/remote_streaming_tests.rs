@@ -134,6 +134,29 @@ impl MultipartUpload for FailingAbortUpload {
     }
 }
 
+/// Abort replies "no such upload": the remote already resolved the handle
+/// (e.g. a timed-out complete() that succeeded server-side).
+#[derive(Debug)]
+struct ResolvedAbortUpload;
+
+#[async_trait]
+impl MultipartUpload for ResolvedAbortUpload {
+    fn put_part(&mut self, _data: PutPayload) -> UploadPart {
+        panic!("cleanup-only test never uploads a part")
+    }
+
+    async fn complete(&mut self) -> object_store::Result<PutResult> {
+        panic!("cleanup-only test never completes the upload")
+    }
+
+    async fn abort(&mut self) -> object_store::Result<()> {
+        Err(object_store::Error::NotFound {
+            path: "resolved-upload".to_owned(),
+            source: "no such upload".into(),
+        })
+    }
+}
+
 #[derive(Debug)]
 struct FailedPartAndAbortUpload {
     aborts: Arc<AtomicUsize>,
@@ -399,6 +422,30 @@ async fn multipart_owner_cancellation_is_drained_by_the_tracked_cleanup_worker()
     cleanup_worker.await.unwrap().unwrap();
     assert!(failure_receiver.borrow_and_update().is_none());
     assert_eq!(aborts.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn cleanup_abort_of_an_already_resolved_upload_is_not_terminal() {
+    let cleanup_state = RemoteCleanupState::new();
+    let mut failure_receiver = cleanup_state.failure.subscribe();
+    let (cleanup_sender, cleanup_receiver) = mpsc::channel(1);
+    let cleanup_worker = tokio::spawn(drain_remote_multipart_cleanup(
+        cleanup_receiver,
+        1,
+        Arc::clone(&cleanup_state),
+    ));
+    drop(RemoteMultipartOwner::new(
+        Box::new(ResolvedAbortUpload),
+        cleanup_sender.clone(),
+        cleanup_state,
+    ));
+
+    drop(cleanup_sender);
+    cleanup_worker.await.unwrap().unwrap();
+    assert!(
+        failure_receiver.borrow_and_update().is_none(),
+        "an already-resolved upload must not poison the store"
+    );
 }
 
 #[tokio::test]
