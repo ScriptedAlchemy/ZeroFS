@@ -7,7 +7,7 @@
 //! not resident physical memory.
 
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 use tikv_jemalloc_ctl::{epoch, stats};
@@ -133,8 +133,42 @@ pub fn over_rss_cap() -> bool {
     over_rss_cap_of(rss_cap_bytes())
 }
 
+/// Once the brake trips it holds until the envelope falls below
+/// [`RESUME_PERMILLE`] of the cap, so an envelope hovering at the boundary
+/// doesn't flap admission on and off at every sample.
+const RESUME_PERMILLE: u128 = 950;
+
+struct Hysteresis {
+    over: AtomicBool,
+}
+
+impl Hysteresis {
+    const fn new() -> Self {
+        Self {
+            over: AtomicBool::new(false),
+        }
+    }
+
+    fn check(&self, cap: u64, envelope: u64) -> bool {
+        let over = if envelope >= cap {
+            true
+        } else if (envelope as u128) * 1000 < (cap as u128) * RESUME_PERMILLE {
+            false
+        } else {
+            // In the band between resume and trip: hold the previous verdict.
+            return self.over.load(Ordering::Relaxed);
+        };
+        self.over.store(over, Ordering::Relaxed);
+        over
+    }
+}
+
+// One latch shared by every gate: the GC brake and the parts-admission caps
+// are installed from the same validated pressure cap at startup.
+static PRESSURE: Hysteresis = Hysteresis::new();
+
 pub fn over_rss_cap_of(cap: u64) -> bool {
-    cap > 0 && jemalloc_rss_envelope() >= cap
+    cap > 0 && PRESSURE.check(cap, jemalloc_rss_envelope())
 }
 
 /// `mallctl("arena.*.purge")` -- return unused dirty pages to the OS.
@@ -237,6 +271,18 @@ mod tests {
             over_rss_cap(),
             "resident usage above the validated service cap must fail closed"
         );
+    }
+
+    #[test]
+    fn hysteresis_holds_between_resume_and_trip() {
+        let gate = Hysteresis::new();
+        let cap = 1000;
+        assert!(!gate.check(cap, 940), "below resume: admitting");
+        assert!(!gate.check(cap, 990), "band while untripped: still admitting");
+        assert!(gate.check(cap, 1000), "at cap: tripped");
+        assert!(gate.check(cap, 990), "band while tripped: still braking");
+        assert!(!gate.check(cap, 949), "below resume: released");
+        assert!(!gate.check(cap, 990), "band after release: admitting");
     }
 
     #[tokio::test]
