@@ -6,7 +6,7 @@ import time
 import urllib.request
 from dataclasses import asdict, dataclass
 from typing import Callable
-from urllib.parse import urlsplit
+from urllib.parse import SplitResult, urlsplit
 
 
 class TerminalWritebackError(RuntimeError):
@@ -21,6 +21,25 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
 
 _AUTHORITY_METRIC = "zerofs_benchmark_authority_info"
 _AUTHORITY_LABEL = re.compile(r'([a-z_]+)="([A-Za-z0-9._:/-]+)"\Z')
+
+
+def validate_metrics_url(url: str) -> SplitResult:
+    if "?" in url or "#" in url:
+        raise ValueError(
+            "metrics URL must be credential-free HTTPS without query or fragment"
+        )
+    parsed = urlsplit(url)
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path != "/metrics"
+    ):
+        raise ValueError(
+            "metrics URL must be credential-free HTTPS without query or fragment"
+        )
+    return parsed
 
 
 @dataclass(frozen=True, slots=True)
@@ -164,19 +183,7 @@ class MetricsClient:
         expected_identity: MetricsAuthorityIdentity | None = None,
         timeout: float = 5.0,
     ) -> None:
-        parsed = urlsplit(url)
-        if (
-            parsed.scheme != "https"
-            or not parsed.hostname
-            or parsed.username is not None
-            or parsed.password is not None
-            or bool(parsed.query)
-            or bool(parsed.fragment)
-            or parsed.path != "/metrics"
-        ):
-            raise ValueError(
-                "metrics URL must be credential-free HTTPS without query or fragment"
-            )
+        validate_metrics_url(url)
         self.url = url
         self.expected_identity = expected_identity
         self.timeout = timeout
