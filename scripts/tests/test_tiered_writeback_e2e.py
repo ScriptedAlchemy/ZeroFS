@@ -133,6 +133,7 @@ class FakeProbes:
 
     def __init__(self) -> None:
         self.active_units: set[str] = set()
+        self.unit_pids: dict[str, int] = {}
         self.alive_pids: set[int] = set()
         self.listening_ports: set[int] = set()
         self.active_mounts: set[str] = set()
@@ -144,6 +145,9 @@ class FakeProbes:
 
     def unit_active(self, unit: str) -> bool:
         return unit in self.active_units
+
+    def process_belongs_to_unit(self, pid: int, unit: str) -> bool:
+        return self.unit_pids.get(unit) == pid
 
     def port_listening(self, port: int) -> bool:
         return port in self.listening_ports
@@ -361,7 +365,8 @@ class ResourceLedgerTests(HarnessCase):
 
     def test_events_are_hash_chained_and_tamper_evident(self) -> None:
         config, ledger = self.make_ledger()
-        ledger.record_resource("process", 4321, unit=None)
+        ledger.record_resource("unit", config.unit_name)
+        ledger.record_resource("process", 4321, unit=config.unit_name)
         ledger.record_release("process", 4321)
         document = json.loads(config.ledger_path.read_text())
         document["events"][0]["payload"]["value"] = 1
@@ -400,13 +405,16 @@ class ResourceLedgerTests(HarnessCase):
         with self.assertRaises(UnownedResourceError):
             ledger.record_resource("path", "/var/tmp/other")
         ledger.record_resource("pool", f"zerofs-tiered-{RUN_UUID}")
+        with self.assertRaises(UnownedResourceError):
+            ledger.record_resource("process", 4321)
         _ = config
 
     def test_acting_on_an_unrecorded_resource_is_rejected(self) -> None:
-        _, ledger = self.make_ledger()
+        config, ledger = self.make_ledger()
         with self.assertRaises(UnownedResourceError):
             ledger.require_owned("process", 999)
-        ledger.record_resource("process", 999)
+        ledger.record_resource("unit", config.unit_name)
+        ledger.record_resource("process", 999, unit=config.unit_name)
         ledger.require_owned("process", 999)
 
     def test_released_resource_is_not_active(self) -> None:
@@ -516,6 +524,15 @@ class SetupTests(HarnessCase):
 
 
 class CleanupTests(HarnessCase):
+    def test_cleanup_does_not_stop_a_unit_that_was_never_created(self) -> None:
+        config = self.make_config()
+        lifecycle, runner, _, ledger = self.setup_run(config)
+        ledger.record_resource("unit", config.unit_name)
+        lifecycle.cleanup(ledger)
+        self.assertNotIn(
+            (("systemctl", "stop", config.unit_name), True), runner.calls
+        )
+
     def test_cleanup_removes_only_resource_root_entries(self) -> None:
         config = self.make_config()
         lifecycle, _, _, ledger = self.setup_run(config)
@@ -551,14 +568,15 @@ class CleanupTests(HarnessCase):
         lifecycle, runner, probes, ledger = self.setup_run(config)
         mountpoint = config.resource_root / "mnt" / "nfs"
         pool = f"zerofs-tiered-{RUN_UUID}"
-        ledger.record_resource("process", 4242)
         ledger.record_resource("unit", config.unit_name)
+        ledger.record_resource("process", 4242, unit=config.unit_name)
         ledger.record_resource("listener", 12049)
         ledger.record_resource("mount", str(mountpoint))
         ledger.record_resource("device", "/dev/nbd7")
         ledger.record_resource("pool", pool)
-        probes.alive_pids.add(4242)
+        probes.alive_pids.add(4242)  # PID was reused by an unrelated process.
         probes.active_units.add(config.unit_name)
+        probes.unit_pids[config.unit_name] = 99999
         probes.active_mounts.add(str(mountpoint))
         probes.attached_devices.add("/dev/nbd7")
         probes.pools.add(pool)
@@ -567,7 +585,7 @@ class CleanupTests(HarnessCase):
         self.assertIn(("zpool", "destroy", pool), commands)
         self.assertIn(("nbd-client", "-d", "/dev/nbd7"), commands)
         self.assertIn(("umount", str(mountpoint)), commands)
-        self.assertIn(("kill", "-9", "4242"), commands)
+        self.assertNotIn(("kill", "-9", "4242"), commands)
         self.assertIn(("systemctl", "stop", config.unit_name), commands)
         reloaded = ResourceLedger.load(config.ledger_path)
         self.assertEqual(reloaded.outstanding(), [])
@@ -599,9 +617,11 @@ class AssertCleanTests(HarnessCase):
     def test_assert_clean_fails_when_a_recorded_resource_remains(self) -> None:
         config = self.make_config()
         lifecycle, _, probes, ledger = self.setup_run(config)
-        ledger.record_resource("process", 4242)
+        ledger.record_resource("unit", config.unit_name)
+        ledger.record_resource("process", 4242, unit=config.unit_name)
         lifecycle.cleanup(ledger)
-        probes.alive_pids.add(4242)
+        probes.active_units.add(config.unit_name)
+        probes.unit_pids[config.unit_name] = 4242
         with self.assertRaisesRegex(ResidualResourceError, "4242"):
             lifecycle.assert_clean(ResourceLedger.load(config.ledger_path))
 

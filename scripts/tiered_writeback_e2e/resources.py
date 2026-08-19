@@ -250,6 +250,15 @@ class ResourceLedger:
 
     def record_resource(self, kind: str, value: Any, **details: Any) -> None:
         validated = self._validate_resource(kind, value)
+        if kind == "process":
+            unit = self._validate_resource("unit", details.get("unit"))
+            if ("unit", str(unit)) not in {
+                (active_kind, str(active_value))
+                for active_kind, active_value, _ in self.outstanding()
+            }:
+                raise UnownedResourceError(
+                    f"process {validated!r} has no active unit authority {unit!r}"
+                )
         key = (kind, str(validated))
         if any(
             (owned_kind, str(owned_value)) == key

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -209,13 +210,22 @@ class Probes:
         self.runner = runner
 
     def _succeeds(self, argv: list[str]) -> bool:
-        return self.runner.run(argv, check=False).returncode == 0
+        return self.runner.run(argv, check=False, timeout=5.0).returncode == 0
 
     def process_alive(self, pid: int) -> bool:
         return self._succeeds(["kill", "-0", str(pid)])
 
     def unit_active(self, unit: str) -> bool:
         return self._succeeds(["systemctl", "is-active", "--quiet", unit])
+
+    def process_belongs_to_unit(self, pid: int, unit: str) -> bool:
+        result = self.runner.run(
+            ["systemctl", "show", "--property=MainPID", "--value", unit],
+            check=False,
+            timeout=5.0,
+        )
+        raw_pid = result.stdout.strip()
+        return result.returncode == 0 and raw_pid.isdecimal() and int(raw_pid) == pid
 
     def port_listening(self, port: int) -> bool:
         return self._succeeds(["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN"])
@@ -333,10 +343,15 @@ class HarnessLifecycle:
         self, kind: str, value: Any, details: dict[str, Any], scope: Path
     ) -> None:
         if kind == "process":
-            if self.probes.process_alive(value):
-                self.runner.run(["kill", "-9", str(value)], sudo=True)
+            # Numeric PIDs are receipt evidence only. The UUID-scoped unit is
+            # the sole destructive authority, preventing PID-reuse kills.
+            if not isinstance(details.get("unit"), str):
+                raise CleanupError(f"process {value} has no unit authority")
         elif kind == "unit":
-            self.runner.run(["systemctl", "stop", str(value)], sudo=True)
+            if self.probes.unit_active(str(value)):
+                self.runner.run(
+                    ["systemctl", "stop", str(value)], sudo=True, timeout=10.0
+                )
         elif kind == "mount":
             mountpoint = str(validate_owned_path(Path(str(value)), scope))
             if self.probes.mount_active(mountpoint):
@@ -388,9 +403,12 @@ class HarnessLifecycle:
             "errors": errors,
         }
 
-    def _probe(self, kind: str, value: Any) -> bool:
+    def _probe(self, kind: str, value: Any, details: dict[str, Any]) -> bool:
         if kind == "process":
-            return self.probes.process_alive(value)
+            unit = details.get("unit")
+            return isinstance(unit, str) and self.probes.process_belongs_to_unit(
+                value, unit
+            )
         if kind == "unit":
             return self.probes.unit_active(str(value))
         if kind == "listener":
@@ -412,9 +430,9 @@ class HarnessLifecycle:
             for kind, value, _ in ledger.outstanding()
         ]
         checked = 0
-        for kind, value, _ in ledger.resources():
+        for kind, value, details in ledger.resources():
             checked += 1
-            if self._probe(kind, value):
+            if self._probe(kind, value, details):
                 failures.append(f"recorded {kind} {value} still present")
         if failures:
             raise ResidualResourceError("; ".join(failures))
@@ -532,10 +550,22 @@ class HarnessLifecycle:
                     for attempt in range(20):
                         commands.append(pid_command)
                         receipt.record("commands", commands)
-                        result = self.runner.run(pid_command, sudo=True, check=False)
-                        raw_pid = result.stdout.strip()
+                        try:
+                            result = self.runner.run(
+                                pid_command,
+                                sudo=True,
+                                check=False,
+                                timeout=1.0,
+                            )
+                        except subprocess.TimeoutExpired:
+                            result = None
+                        if result is None:
+                            raw_pid = ""
+                        else:
+                            raw_pid = result.stdout.strip()
                         if (
-                            result.returncode == 0
+                            result is not None
+                            and result.returncode == 0
                             and raw_pid.isdecimal()
                             and int(raw_pid) > 0
                         ):
