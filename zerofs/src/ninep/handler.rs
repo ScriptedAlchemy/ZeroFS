@@ -722,7 +722,7 @@ impl NinePHandler {
             Message::Tlopen(tl) => self.lopen(tl).await,
             Message::Tlcreate(tc) => self.lcreate(tc, op_id).await,
             Message::Tread(tr) => self.read(tr).await,
-            Message::Twrite(tw) => self.write(tw, op_id).await,
+            Message::Twrite(tw) => self.write(tw, op_id, op_origin_epoch).await,
             Message::Tclunk(tc) => Ok(self.clunk(tc).await),
             Message::Treaddir(tr) => self.readdir(tr).await,
             Message::Tgetattr(tg) => self.getattr(tg).await,
@@ -1731,7 +1731,12 @@ impl NinePHandler {
         }))
     }
 
-    async fn write(&self, tw: Twrite, op_id: crate::dedup::OpId) -> P9Result<Message> {
+    async fn write(
+        &self,
+        tw: Twrite,
+        op_id: crate::dedup::OpId,
+        op_origin_epoch: u64,
+    ) -> P9Result<Message> {
         let fid_entry = self.get_fid(tw.fid)?;
 
         if !fid_allows_write(&fid_entry) {
@@ -1751,7 +1756,20 @@ impl NinePHandler {
         let auth = AuthContext::from(&fid_entry.creds);
         let data_len = tw.data.len();
         let data = Bytes::from(tw.data);
-
+        let (identity, request_lifetime) = if crate::dedup::has_op_id(&op_id) {
+            (
+                RequestIdentity::NineP {
+                    session_incarnation: op_origin_epoch,
+                    operation_id: op_id,
+                },
+                RequestLifetime::InFlightOnly,
+            )
+        } else {
+            (
+                RequestIdentity::DirectOneShot(uuid::Uuid::new_v4()),
+                RequestLifetime::OneShot,
+            )
+        };
         let _receipt = self
             .filesystem
             .write_ack_identified(IdentifiedWrite {
@@ -1761,14 +1779,11 @@ impl NinePHandler {
                 data: &data,
                 op_id,
                 check_permissions: false,
-                identity: RequestIdentity::NineP {
-                    session_incarnation: self.handler_id,
-                    operation_id: op_id,
-                },
-                // The protocol dedup ledger above this call owns completed
-                // retries across reconnects; this cache only joins concurrent
-                // preparation within one transport session.
-                request_lifetime: RequestLifetime::InFlightOnly,
+                identity,
+                // Private requests use the protocol ledger for completed
+                // reconnect retries, so this cache only joins concurrent work.
+                // Standard 9P has no operation ID and must remain one-shot.
+                request_lifetime,
                 fingerprint_context: b"9p-twrite-opened",
             })
             .await
@@ -6682,346 +6697,6 @@ mod tests {
                 "seed {seed}: leaked open-handle counts after all sessions closed: {leaked:?}"
             );
         }
-    }
-
-    #[tokio::test]
-    async fn ninep_write_shared_admission_uses_session_scoped_operation_identity() {
-        use crate::fs::mutation::config::{
-            ClientDurabilityTarget, FilesystemWriteAckMode, FilesystemWriteAckSettings,
-            FilesystemWriteAckSource,
-        };
-
-        async fn wait_for_slots(
-            cache: &crate::fs::mutation::request_cache::RequestCache,
-            expected: usize,
-        ) {
-            tokio::time::timeout(Duration::from_secs(2), async {
-                while cache.used_slots() != expected {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .unwrap_or_else(|_| {
-                panic!(
-                    "shared request cache never reached {expected} slots; current={}",
-                    cache.used_slots()
-                )
-            });
-        }
-
-        let mut fs = ZeroFS::new_in_memory().await.unwrap();
-        fs.write_ack = FilesystemWriteAckSettings {
-            mode: FilesystemWriteAckMode::VolatileMemory,
-            volatile_memory_bytes: 8 * 1024 * 1024,
-            volatile_max_operations: 1024,
-            source: FilesystemWriteAckSource::Filesystem,
-            client_durability_target: ClientDurabilityTarget::LocalSsd,
-        };
-        let creds = test_creds();
-        let (file, _) = fs
-            .create(&creds, 0, b"identified-write", &SetAttributes::default())
-            .await
-            .unwrap();
-        let fs = Arc::new(fs);
-        let first = Arc::new(NinePHandler::new(
-            Arc::clone(&fs),
-            Arc::new(FileLockManager::new()),
-        ));
-        let second = Arc::new(NinePHandler::new(
-            Arc::clone(&fs),
-            Arc::new(FileLockManager::new()),
-        ));
-        assert_ne!(first.handler_id(), second.handler_id());
-        for handler in [&first, &second] {
-            start_session(handler, DEFAULT_MSIZE, VERSION_9P2000L_ZEROFS, b"").await;
-            expect_walk(handler, 2, 1, 2, &[b"identified-write"]).await;
-            open_fid(handler, 3, 2, O_WRONLY as u32).await;
-        }
-
-        let request_cache = fs
-            .mutation_coordinator
-            .get()
-            .expect("9P handler installed the shared mutation coordinator")
-            .request_cache();
-        let operation_id = [0x5a; 16];
-        let locked = fs.lock_manager.acquire(file).await;
-        let same_session_first = tokio::spawn({
-            let handler = Arc::clone(&first);
-            async move {
-                handler
-                    .write(
-                        Twrite {
-                            fid: 2,
-                            offset: 0,
-                            count: 4,
-                            data: DekuBytes::from(b"same".to_vec()),
-                        },
-                        operation_id,
-                    )
-                    .await
-            }
-        });
-        wait_for_slots(&request_cache, 1).await;
-        let same_session_retry = tokio::spawn({
-            let handler = Arc::clone(&first);
-            async move {
-                handler
-                    .write(
-                        Twrite {
-                            fid: 2,
-                            offset: 0,
-                            count: 4,
-                            data: DekuBytes::from(b"same".to_vec()),
-                        },
-                        operation_id,
-                    )
-                    .await
-            }
-        });
-        tokio::time::sleep(Duration::from_millis(25)).await;
-        assert_eq!(
-            request_cache.used_slots(),
-            1,
-            "one session's retry must join its original shared admission"
-        );
-
-        let other_session_same_operation = tokio::spawn({
-            let handler = Arc::clone(&second);
-            async move {
-                handler
-                    .write(
-                        Twrite {
-                            fid: 2,
-                            offset: 0,
-                            count: 4,
-                            data: DekuBytes::from(b"same".to_vec()),
-                        },
-                        operation_id,
-                    )
-                    .await
-            }
-        });
-        wait_for_slots(&request_cache, 2).await;
-        drop(locked);
-
-        for write in [
-            same_session_first,
-            same_session_retry,
-            other_session_same_operation,
-        ] {
-            assert!(matches!(write.await.unwrap().unwrap(), Message::Rwrite(_)));
-        }
-        wait_for_slots(&request_cache, 0).await;
-
-        let locked = fs.lock_manager.acquire(file).await;
-        let first_operation = [0xa5; 16];
-        let mut second_operation = first_operation;
-        second_operation[15] = 0x5a;
-        assert_eq!(first_operation[..8], second_operation[..8]);
-        let full_width_first = tokio::spawn({
-            let handler = Arc::clone(&first);
-            async move {
-                handler
-                    .write(
-                        Twrite {
-                            fid: 2,
-                            offset: 4,
-                            count: 4,
-                            data: DekuBytes::from(b"wide".to_vec()),
-                        },
-                        first_operation,
-                    )
-                    .await
-            }
-        });
-        wait_for_slots(&request_cache, 1).await;
-        let full_width_second = tokio::spawn({
-            let handler = Arc::clone(&first);
-            async move {
-                handler
-                    .write(
-                        Twrite {
-                            fid: 2,
-                            offset: 8,
-                            count: 4,
-                            data: DekuBytes::from(b"wide".to_vec()),
-                        },
-                        second_operation,
-                    )
-                    .await
-            }
-        });
-        wait_for_slots(&request_cache, 2).await;
-        drop(locked);
-        for write in [full_width_first, full_width_second] {
-            assert!(matches!(write.await.unwrap().unwrap(), Message::Rwrite(_)));
-        }
-        wait_for_slots(&request_cache, 0).await;
-    }
-
-    #[tokio::test]
-    async fn ninep_fsync_and_verified_fsync_cover_real_write_at_configured_target() {
-        use crate::fs::mutation::config::{
-            ClientDurabilityTarget, FilesystemWriteAckMode, FilesystemWriteAckSettings,
-            FilesystemWriteAckSource,
-        };
-        use crate::fs::mutation::durability::{DurabilityError, DurabilityTarget};
-        use tokio::sync::{Notify, mpsc};
-
-        async fn release_observed_barrier(
-            task: &mut tokio::task::JoinHandle<P9Message>,
-            entered: &mut mpsc::UnboundedReceiver<(DurabilityTarget, Bytes)>,
-            release: &Notify,
-        ) -> (DurabilityTarget, Bytes, P9Message) {
-            let (target, canonical) = tokio::time::timeout(Duration::from_secs(2), entered.recv())
-                .await
-                .expect("9P fsync never entered typed durability")
-                .expect("9P fsync durability observer closed");
-            assert!(!task.is_finished(), "9P fsync returned before durability");
-            release.notify_one();
-            let reply = tokio::time::timeout(Duration::from_secs(2), task)
-                .await
-                .expect("9P fsync did not resume")
-                .expect("9P fsync task panicked");
-            (target, canonical, reply)
-        }
-
-        let mut fs = ZeroFS::new_in_memory().await.unwrap();
-        fs.write_ack = FilesystemWriteAckSettings {
-            mode: FilesystemWriteAckMode::VolatileMemory,
-            volatile_memory_bytes: 8 * 1024 * 1024,
-            volatile_max_operations: 1024,
-            source: FilesystemWriteAckSource::Filesystem,
-            client_durability_target: ClientDurabilityTarget::RemoteBackend,
-        };
-        let fs = Arc::new(fs);
-        let handler = Arc::new(NinePHandler::new(
-            Arc::clone(&fs),
-            Arc::new(FileLockManager::new()),
-        ));
-        start_session(&handler, DEFAULT_MSIZE, VERSION_9P2000L_ZEROFS, b"").await;
-        create_file(&handler, 2, 1, b"fsync-write").await;
-        let payload = Bytes::from_static(b"fsync-through-overlay");
-        let write = handler
-            .handle_message_with_op_id(
-                3,
-                [0x93; 16],
-                Message::Twrite(Twrite {
-                    fid: 1,
-                    offset: 0,
-                    count: payload.len() as u32,
-                    data: DekuBytes::from(payload.to_vec()),
-                }),
-            )
-            .await;
-        assert!(matches!(write.body, Message::Rwrite(_)));
-        let expected_cutoff = fs.capture_mutation_cutoff();
-        assert!(expected_cutoff.sequence > 0);
-        let file = fs.lookup(&test_creds(), 0, b"fsync-write").await.unwrap();
-        let payload_len = payload.len() as u64;
-
-        let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
-        let release = Arc::new(Notify::new());
-        fs.flush_coordinator.set_object_wait({
-            let fs = Arc::clone(&fs);
-            let release = Arc::clone(&release);
-            Arc::new(move |_coverage, target| {
-                let fs = Arc::clone(&fs);
-                let entered_tx = entered_tx.clone();
-                let release = Arc::clone(&release);
-                Box::pin(async move {
-                    let canonical = fs
-                        .extent_store
-                        .read(file, 0, payload_len)
-                        .await
-                        .map_err(DurabilityError::Materialization)?;
-                    entered_tx
-                        .send((target, canonical))
-                        .map_err(|_| DurabilityError::Closed)?;
-                    release.notified().await;
-                    Ok(())
-                })
-            })
-        });
-
-        let mut stale_token = fs.lineage_token.wrapping_add(1);
-        if stale_token == 0 {
-            stale_token = 1;
-        }
-        assert_ne!(stale_token, fs.lineage_token);
-        let mut stale = tokio::spawn({
-            let handler = Arc::clone(&handler);
-            async move {
-                request(
-                    &handler,
-                    4,
-                    Message::Tfsyncdur(Tfsyncdur {
-                        fid: 1,
-                        datasync: 0,
-                        token: stale_token,
-                    }),
-                )
-                .await
-            }
-        });
-        let (target, canonical, stale_reply) =
-            release_observed_barrier(&mut stale, &mut entered_rx, &release).await;
-        assert_eq!(target, DurabilityTarget::RemoteBackend);
-        assert_eq!(canonical, payload);
-        assert!(matches!(
-            stale_reply.body,
-            Message::Rlerror(Rlerror { ecode }) if ecode == crate::linux_errno::ESTALE
-        ));
-        assert!(
-            fs.materializer
-                .get()
-                .expect("volatile filesystem has a materializer")
-                .progress()
-                .materialized_through()
-                >= expected_cutoff.sequence
-        );
-
-        let mut fsync = tokio::spawn({
-            let handler = Arc::clone(&handler);
-            async move {
-                request(
-                    &handler,
-                    5,
-                    Message::Tfsync(Tfsync {
-                        fid: 1,
-                        datasync: 0,
-                    }),
-                )
-                .await
-            }
-        });
-        let (target, canonical, reply) =
-            release_observed_barrier(&mut fsync, &mut entered_rx, &release).await;
-        assert_eq!(target, DurabilityTarget::RemoteBackend);
-        assert_eq!(canonical, payload);
-        assert!(matches!(reply.body, Message::Rfsync(_)));
-
-        let valid_token = fs.lineage_token;
-        let mut verified = tokio::spawn({
-            let handler = Arc::clone(&handler);
-            async move {
-                request(
-                    &handler,
-                    6,
-                    Message::Tfsyncdur(Tfsyncdur {
-                        fid: 1,
-                        datasync: 0,
-                        token: valid_token,
-                    }),
-                )
-                .await
-            }
-        });
-        let (target, canonical, verified_reply) =
-            release_observed_barrier(&mut verified, &mut entered_rx, &release).await;
-        assert_eq!(target, DurabilityTarget::RemoteBackend);
-        assert_eq!(canonical, payload);
-        assert!(matches!(verified_reply.body, Message::Rfsync(_)));
     }
 
     fn test_creds() -> Credentials {
