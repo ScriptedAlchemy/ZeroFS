@@ -123,10 +123,22 @@ impl SegmentStore {
         if bytes.len() < SEAL_PART_SIZE {
             let mut options = PutOptions::from(PutMode::Create);
             options.extensions.insert(GeneratedSegmentCreate);
-            self.object_store
+            match self
+                .object_store
                 .put_opts(&path, bytes.clone().into(), options)
                 .await
-                .map_err(|e| SegmentStoreError::ObjectStore(e.to_string()))?;
+            {
+                Ok(_) => {}
+                // A create whose success response was lost gets retried by a
+                // layer below and then conflicts with its own already-applied
+                // effect. The key is epoch/counter-unique to this seal, so
+                // identical bytes mean this seal's PUT landed; different bytes
+                // are a genuine immutable-key collision and stay fatal.
+                Err(slatedb::object_store::Error::AlreadyExists { .. }) => {
+                    self.verify_existing_segment_bytes(&path, &bytes).await?;
+                }
+                Err(e) => return Err(SegmentStoreError::ObjectStore(e.to_string())),
+            }
         } else {
             let result = self.put_segment_multipart(&path, &bytes).await?;
             // Multipart bypasses the object-store wrapper's single-PUT
@@ -134,6 +146,27 @@ impl SegmentStore {
             if let Some(warm) = &self.warm {
                 warm(&path, bytes, &result);
             }
+        }
+        Ok(())
+    }
+
+    /// Read back an object that answered a create with `AlreadyExists` and
+    /// confirm it holds exactly `bytes`. Identical bytes make the conflicting
+    /// create idempotent (its effect landed on an earlier attempt); anything
+    /// else stays an error so an immutable key is never silently reused.
+    async fn verify_existing_segment_bytes(&self, path: &Path, bytes: &Bytes) -> Result<()> {
+        let existing = self
+            .get_object_range(path, 0..bytes.len() as u64 + 1, false)
+            .await
+            .map_err(|e| {
+                SegmentStoreError::ObjectStore(format!(
+                    "segment create conflicted and readback failed for {path}: {e}"
+                ))
+            })?;
+        if existing != *bytes {
+            return Err(SegmentStoreError::ObjectStore(format!(
+                "segment create conflicted with different existing contents at {path}"
+            )));
         }
         Ok(())
     }
