@@ -10,21 +10,21 @@ use dashmap::mapref::entry::Entry;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use ninep_proto::{
-    Message, P9_CHANNEL_SIZE, P9_DEBUG_BUFFER_SIZE, P9_HEADER_SIZE, P9_MAX_MSIZE,
-    P9_MIN_MESSAGE_SIZE, P9_OP_ENVELOPE_LEN, P9_OP_ID_LEN, P9_SIZE_FIELD_LEN, P9Message, Rlerror,
-    T_WRITE,
+    DekuBytes, Message, P9_CHANNEL_SIZE, P9_DEBUG_BUFFER_SIZE, P9_HEADER_SIZE, P9_MAX_MSIZE,
+    P9_MIN_MESSAGE_SIZE, P9_OP_ENVELOPE_LEN, P9_OP_FLAG_RETRY, P9_OP_ID_LEN, P9_SIZE_FIELD_LEN,
+    P9Message, Rlerror, T_WRITE, Twrite,
 };
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, UnixListener};
-use tokio::sync::mpsc;
 #[cfg(test)]
 use tokio::sync::oneshot;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_util::codec::LengthDelimitedCodec;
 use tokio_util::sync::CancellationToken;
-use tokio_util::task::AbortOnDropHandle;
+use tokio_util::task::{AbortOnDropHandle, TaskTracker};
 use tracing::{debug, error, info, warn};
 
 /// 9P message type byte for Tflush. Kept here so the reader can recognise a
@@ -39,6 +39,12 @@ const TVERSION_TYPE: u8 = 100;
 /// 9P type for `Tclunk`, a receive-order barrier for its fid.
 const TCLUNK_TYPE: u8 = 120;
 const RESPONSE_BUFFER_CAPACITY: usize = 64 * 1024;
+/// Process-wide protocol memory available to requests and their possible replies.
+const GLOBAL_INFLIGHT_MEMORY: usize = 256 * 1024 * 1024;
+/// One connection cannot consume more than a quarter of the process budget.
+const CONNECTION_INFLIGHT_MEMORY: usize = 64 * 1024 * 1024;
+const GLOBAL_INFLIGHT_REQUESTS: usize = 64;
+const CONNECTION_INFLIGHT_REQUESTS: usize = 16;
 /// Bounded response drain after connection retirement.
 const CLIENT_DRAIN_TIMEOUT: std::time::Duration = crate::replication::RESPONSE_DRAIN_TIMEOUT;
 /// TCP keepalive idle interval.
@@ -53,6 +59,199 @@ const TCP_KEEPALIVE_RETRIES: u32 = 4;
     target_os = "linux"
 ))]
 const TCP_USER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+pub(crate) struct P9GlobalAdmission {
+    bytes: Arc<Semaphore>,
+    requests: Arc<Semaphore>,
+    byte_limit: usize,
+    request_limit: usize,
+}
+
+impl P9GlobalAdmission {
+    pub(crate) fn shared() -> &'static Arc<Self> {
+        static ADMISSION: OnceLock<Arc<P9GlobalAdmission>> = OnceLock::new();
+        ADMISSION
+            .get_or_init(|| Arc::new(Self::new(GLOBAL_INFLIGHT_MEMORY, GLOBAL_INFLIGHT_REQUESTS)))
+    }
+
+    fn new(byte_limit: usize, request_limit: usize) -> Self {
+        Self {
+            bytes: Arc::new(Semaphore::new(byte_limit)),
+            requests: Arc::new(Semaphore::new(request_limit)),
+            byte_limit,
+            request_limit,
+        }
+    }
+
+    pub(crate) fn connection(self: &Arc<Self>) -> P9ConnectionAdmission {
+        metrics::gauge!("zerofs_p9_inflight_memory_capacity_bytes").set(self.byte_limit as f64);
+        metrics::gauge!("zerofs_p9_inflight_request_capacity").set(self.request_limit as f64);
+        P9ConnectionAdmission {
+            global: Arc::clone(self),
+            bytes: Arc::new(Semaphore::new(CONNECTION_INFLIGHT_MEMORY)),
+            requests: Arc::new(Semaphore::new(CONNECTION_INFLIGHT_REQUESTS)),
+            byte_limit: CONNECTION_INFLIGHT_MEMORY,
+        }
+    }
+
+    #[cfg(test)]
+    fn for_test(byte_limit: usize, request_limit: usize) -> Arc<Self> {
+        Arc::new(Self::new(byte_limit, request_limit))
+    }
+
+    #[cfg(test)]
+    fn connection_for_test(
+        self: &Arc<Self>,
+        byte_limit: usize,
+        request_limit: usize,
+    ) -> P9ConnectionAdmission {
+        P9ConnectionAdmission {
+            global: Arc::clone(self),
+            bytes: Arc::new(Semaphore::new(byte_limit)),
+            requests: Arc::new(Semaphore::new(request_limit)),
+            byte_limit,
+        }
+    }
+
+    #[cfg(test)]
+    fn snapshot(&self) -> P9AdmissionSnapshot {
+        P9AdmissionSnapshot {
+            reserved_bytes: self.byte_limit - self.bytes.available_permits(),
+            active_requests: self.request_limit - self.requests.available_permits(),
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+struct P9AdmissionSnapshot {
+    reserved_bytes: usize,
+    active_requests: usize,
+}
+
+#[derive(Clone)]
+pub(crate) struct P9ConnectionAdmission {
+    global: Arc<P9GlobalAdmission>,
+    bytes: Arc<Semaphore>,
+    requests: Arc<Semaphore>,
+    byte_limit: usize,
+}
+
+impl P9ConnectionAdmission {
+    async fn admit_request(
+        &self,
+        request_bytes: usize,
+        possible_response_bytes: usize,
+    ) -> anyhow::Result<P9AdmissionPermit> {
+        let reserved_bytes = request_bytes
+            .checked_add(possible_response_bytes)
+            .ok_or_else(|| anyhow::anyhow!("9P request memory reservation overflow"))?;
+        if reserved_bytes > self.byte_limit || reserved_bytes > self.global.byte_limit {
+            anyhow::bail!("9P request requires {reserved_bytes} bytes, above the admission limit");
+        }
+        let permits = u32::try_from(reserved_bytes)
+            .map_err(|_| anyhow::anyhow!("9P request memory reservation exceeds u32"))?;
+
+        let local_request = Arc::clone(&self.requests).acquire_owned().await?;
+        let global_request = Arc::clone(&self.global.requests).acquire_owned().await?;
+        let local_bytes = Arc::clone(&self.bytes).acquire_many_owned(permits).await?;
+        let global_bytes = Arc::clone(&self.global.bytes)
+            .acquire_many_owned(permits)
+            .await?;
+
+        metrics::gauge!("zerofs_p9_inflight_reserved_bytes").increment(reserved_bytes as f64);
+        metrics::gauge!("zerofs_p9_inflight_requests").increment(1.0);
+        Ok(P9AdmissionPermit {
+            _local_request: local_request,
+            _global_request: global_request,
+            _local_bytes: local_bytes,
+            _global_bytes: global_bytes,
+            reserved_bytes,
+        })
+    }
+}
+
+pub(crate) struct P9AdmissionPermit {
+    _local_request: OwnedSemaphorePermit,
+    _global_request: OwnedSemaphorePermit,
+    _local_bytes: OwnedSemaphorePermit,
+    _global_bytes: OwnedSemaphorePermit,
+    reserved_bytes: usize,
+}
+
+impl Drop for P9AdmissionPermit {
+    fn drop(&mut self) {
+        metrics::gauge!("zerofs_p9_inflight_reserved_bytes").decrement(self.reserved_bytes as f64);
+        metrics::gauge!("zerofs_p9_inflight_requests").decrement(1.0);
+    }
+}
+
+pub(crate) struct P9Response {
+    tag: u16,
+    bytes: Vec<u8>,
+    _admission: P9AdmissionPermit,
+}
+
+impl P9Response {
+    fn new(tag: u16, bytes: Vec<u8>, admission: P9AdmissionPermit) -> Self {
+        Self {
+            tag,
+            bytes,
+            _admission: admission,
+        }
+    }
+
+    pub(crate) fn into_guarded_parts(self) -> (u16, Vec<u8>, P9AdmissionPermit) {
+        (self.tag, self.bytes, self._admission)
+    }
+
+    #[cfg(test)]
+    fn into_parts(self) -> (u16, Vec<u8>) {
+        let (tag, bytes, _admission) = self.into_guarded_parts();
+        (tag, bytes)
+    }
+}
+
+pub(crate) struct P9SessionMetricGuard;
+
+impl P9SessionMetricGuard {
+    pub(crate) fn new() -> Self {
+        metrics::gauge!("zerofs_p9_active_sessions").increment(1.0);
+        Self
+    }
+}
+
+impl Drop for P9SessionMetricGuard {
+    fn drop(&mut self) {
+        metrics::gauge!("zerofs_p9_active_sessions").decrement(1.0);
+    }
+}
+
+struct P9SettlingMetricGuard;
+
+impl P9SettlingMetricGuard {
+    fn new() -> Self {
+        metrics::gauge!("zerofs_p9_sessions_settling_requests").increment(1.0);
+        Self
+    }
+}
+
+impl Drop for P9SettlingMetricGuard {
+    fn drop(&mut self) {
+        metrics::gauge!("zerofs_p9_sessions_settling_requests").decrement(1.0);
+    }
+}
+
+pub(crate) async fn settle_request_tasks(requests: TaskTracker) {
+    requests.close();
+    let settling = requests.len();
+    if settling == 0 {
+        return;
+    }
+    metrics::counter!("zerofs_p9_post_disconnect_requests_total").increment(settling as u64);
+    let _settling_metric = P9SettlingMetricGuard::new();
+    requests.wait().await;
+}
 
 /// Whether a serialized response requires serving authority.
 /// Standard and private 9P frames store the type byte at offset four.
@@ -301,7 +500,7 @@ impl ResponseAuthority {
 
 fn spawn_response_writer<W>(
     write_stream: W,
-    mut rx: mpsc::Receiver<(u16, Vec<u8>)>,
+    mut rx: mpsc::Receiver<P9Response>,
     authority: ResponseAuthority,
     connection_shutdown: CancellationToken,
 ) -> AbortOnDropHandle<()>
@@ -325,7 +524,7 @@ where
             let second = match rx.try_recv() {
                 Ok(more) => more,
                 Err(_) => {
-                    let (tag, response_bytes) = first;
+                    let (tag, response_bytes, admission) = first.into_guarded_parts();
                     let requires_authority = response_requires_serving_authority(&response_bytes);
                     if requires_authority && !authority.may_emit(&response_bytes) {
                         warn!(
@@ -365,6 +564,7 @@ where
                         error!("Failed to flush response for tag {}: {}", tag, e);
                         return;
                     }
+                    drop(admission);
                     continue;
                 }
             };
@@ -380,7 +580,10 @@ where
 
             let mut buffered_authority_gated_success = false;
             let mut dropped_authority_gated_success = false;
-            for (tag, response_bytes) in batch {
+            let mut admissions = Vec::with_capacity(batch.len());
+            for response in batch {
+                let (tag, response_bytes, admission) = response.into_guarded_parts();
+                admissions.push(admission);
                 let requires_authority = response_requires_serving_authority(&response_bytes);
                 if requires_authority && !authority.may_emit(&response_bytes) {
                     warn!(
@@ -417,6 +620,7 @@ where
                 error!("Failed to flush writer: {}", e);
                 return;
             }
+            drop(admissions);
             if dropped_authority_gated_success {
                 return;
             }
@@ -435,9 +639,12 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
+    let _session_metric = P9SessionMetricGuard::new();
     let handler = Arc::new(NinePHandler::new(Arc::clone(&filesystem), lock_manager));
+    let admission = P9GlobalAdmission::shared().connection();
+    let requests = TaskTracker::new();
 
-    let (tx, rx) = mpsc::channel::<(u16, Vec<u8>)>(P9_CHANNEL_SIZE);
+    let (tx, rx) = mpsc::channel::<P9Response>(P9_CHANNEL_SIZE);
     let connection_shutdown = shutdown.child_token();
     let writer_task = spawn_response_writer(
         write_stream,
@@ -449,14 +656,28 @@ where
     // Retire resource guards and locks before draining received requests.
     let mut release_guard = SessionReleaseGuard::new(Arc::clone(&handler));
 
-    let result = handle_client_loop(handler, read_stream, tx, connection_shutdown).await;
+    let result = handle_client_loop(
+        handler,
+        read_stream,
+        tx,
+        connection_shutdown,
+        &admission,
+        &requests,
+    )
+    .await;
     release_guard.release();
 
     match join_with_timeout(writer_task, CLIENT_DRAIN_TIMEOUT).await {
         Some(Ok(())) => {}
         Some(Err(e)) => warn!("9P writer task failed: {e}"),
-        None => warn!("timed out draining 9P client responses; writer aborted"),
+        None => {
+            metrics::counter!("zerofs_p9_response_drain_timeouts_total", "transport" => "tcp")
+                .increment(1);
+            warn!("timed out draining 9P client responses; writer aborted");
+        }
     }
+
+    settle_request_tasks(requests).await;
 
     result
 }
@@ -646,19 +867,26 @@ impl Drop for RequestLease {
 
 /// Reserve response capacity, enqueue the terminal response, then retire its tag.
 async fn enqueue_terminal_response(
-    tx: &mpsc::Sender<(u16, Vec<u8>)>,
+    tx: &mpsc::Sender<P9Response>,
     response_bytes: Vec<u8>,
     request_lease: &RequestLease,
+    admission: P9AdmissionPermit,
 ) -> Result<(), mpsc::error::SendError<()>> {
     let permit = tx.reserve().await?;
-    request_lease.publish_terminal_response(|| permit.send((request_lease.tag, response_bytes)));
+    request_lease.publish_terminal_response(|| {
+        permit.send(P9Response::new(
+            request_lease.tag,
+            response_bytes,
+            admission,
+        ))
+    });
     Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct ShallowFrameMetadata {
     fids: FidFootprint,
-    received_op: Option<([u8; P9_OP_ID_LEN], u8)>,
+    received_op: Option<([u8; P9_OP_ID_LEN], u8, u64)>,
 }
 
 fn read_u32_at(bytes: &[u8], offset: usize) -> Option<u32> {
@@ -718,7 +946,13 @@ fn inspect_frame_metadata(frame: &[u8], zerofs_protocol: bool) -> ShallowFrameMe
     let received_op = if carries_op && frame.len() >= body_offset {
         let mut op_id = [0; P9_OP_ID_LEN];
         op_id.copy_from_slice(&frame[P9_HEADER_SIZE..P9_HEADER_SIZE + P9_OP_ID_LEN]);
-        Some((op_id, frame[P9_HEADER_SIZE + P9_OP_ID_LEN]))
+        let origin_offset = P9_HEADER_SIZE + P9_OP_ID_LEN + 1;
+        let origin_epoch = u64::from_le_bytes(
+            frame[origin_offset..origin_offset + 8]
+                .try_into()
+                .expect("validated operation envelope"),
+        );
+        Some((op_id, frame[P9_HEADER_SIZE + P9_OP_ID_LEN], origin_epoch))
     } else {
         None
     };
@@ -731,26 +965,75 @@ fn inspect_frame_metadata(frame: &[u8], zerofs_protocol: bool) -> ShallowFrameMe
     }
 }
 
+/// Decode only the fixed Twrite prefix for an epoch-zero RETRY. Such a retry
+/// can only replay the durable result of its original request, so retaining its
+/// bulk payload while waiting is unnecessary. Non-zero epochs keep the full
+/// payload because promotion grace may allow them to become the applier.
+fn shallow_epoch_zero_retry_write(
+    frame: &[u8],
+    metadata: ShallowFrameMetadata,
+) -> Option<P9Message> {
+    let (op_id, op_flags, origin_epoch) = metadata.received_op?;
+    if frame.get(4) != Some(&T_WRITE) || op_flags & P9_OP_FLAG_RETRY == 0 || origin_epoch != 0 {
+        return None;
+    }
+
+    let body_offset = P9_HEADER_SIZE + P9_OP_ENVELOPE_LEN;
+    let body = frame.get(body_offset..)?;
+    let fid = read_u32_at(body, 0)?;
+    let offset = u64::from_le_bytes(body.get(4..12)?.try_into().ok()?);
+    let count = read_u32_at(body, 12)?;
+    let payload_end = 16usize.checked_add(count as usize)?;
+    body.get(..payload_end)?;
+    let tag = u16::from_le_bytes(frame.get(5..7)?.try_into().ok()?);
+
+    Some(P9Message::new_with_op_id_flags_and_origin(
+        tag,
+        op_id,
+        op_flags,
+        origin_epoch,
+        Message::Twrite(Twrite {
+            fid,
+            offset,
+            count,
+            data: DekuBytes::from(Bytes::new()),
+        }),
+    ))
+}
+
 /// Dispatch a single 9P frame buffer. Shared between TCP (via LengthDelimitedCodec)
 /// and WebSocket transports.
 ///
 /// Reserve receive-time dedup state before task detachment. Full decoding runs
 /// in the detached task.
-pub(crate) fn dispatch_9p_frame(
+pub(crate) async fn dispatch_9p_frame(
     frame: Bytes,
     handler: &Arc<NinePHandler>,
-    tx: &mpsc::Sender<(u16, Vec<u8>)>,
+    tx: &mpsc::Sender<P9Response>,
     inflight: &InflightRegistry,
+    admission: &P9ConnectionAdmission,
+    requests: &TaskTracker,
 ) -> anyhow::Result<()> {
     if frame.len() < P9_MIN_MESSAGE_SIZE as usize {
         error!("Message too short: {} bytes", frame.len());
         return Err(anyhow::anyhow!("Message too short"));
     }
+    if frame.len() > P9_MAX_MSIZE as usize {
+        anyhow::bail!("9P message exceeds maximum negotiated size");
+    }
+
+    // Reserve both the received allocation and the largest response it could
+    // produce before detaching request work. The response keeps this permit
+    // until its final transport flush or drop.
+    let admission = admission
+        .admit_request(frame.len(), P9_MAX_MSIZE as usize)
+        .await?;
 
     let type_byte = frame[4];
     let tag = u16::from_le_bytes([frame[5], frame[6]]);
     let zerofs_protocol = handler.zerofs_protocol_enabled();
     let metadata = inspect_frame_metadata(&frame, zerofs_protocol);
+    let shallow_retry = shallow_epoch_zero_retry_write(&frame, metadata);
 
     // Capture `oldtag` before any yield or tag reuse.
     let (flush_oldtag, flush_waiters, request_lease, prior_waiters) = if type_byte == TFLUSH_TYPE {
@@ -779,17 +1062,21 @@ pub(crate) fn dispatch_9p_frame(
     };
 
     // Reserve a FIRST envelope before EOF can admit a replacement RETRY.
-    let received_guard = metadata.received_op.and_then(|(op_id, op_flags)| {
-        handler.try_reserve_received_first(op_id, op_flags, type_byte)
-    });
+    let received_guard = metadata
+        .received_op
+        .and_then(|(op_id, op_flags, _origin_epoch)| {
+            handler.try_reserve_received_first(op_id, op_flags, type_byte)
+        });
 
     let handler = Arc::clone(handler);
     let tx = tx.clone();
 
-    spawn_named("9p-request", async move {
+    let request = requests.track_future(async move {
         // Only Twrite has an inbound bulk payload worth retaining. Other
         // requests keep the regular decoder and the original error diagnostics.
-        let parsed = if type_byte == T_WRITE {
+        let parsed = if let Some(parsed) = shallow_retry {
+            Ok(parsed)
+        } else if type_byte == T_WRITE {
             P9Message::from_owned_bytes_ctx(frame.clone(), zerofs_protocol)
         } else {
             P9Message::from_bytes_ctx(&frame, zerofs_protocol)
@@ -852,7 +1139,8 @@ pub(crate) fn dispatch_9p_frame(
 
         match response_bytes {
             Some(response_bytes) => {
-                if let Err(e) = enqueue_terminal_response(&tx, response_bytes, &request_lease).await
+                if let Err(e) =
+                    enqueue_terminal_response(&tx, response_bytes, &request_lease, admission).await
                 {
                     warn!("Failed to send response for tag {}: {}", tag, e);
                 }
@@ -864,14 +1152,17 @@ pub(crate) fn dispatch_9p_frame(
 
         drop(request_lease);
     });
+    drop(spawn_named("9p-request", request));
     Ok(())
 }
 
 async fn handle_client_loop<R>(
     handler: Arc<NinePHandler>,
     read_stream: R,
-    tx: mpsc::Sender<(u16, Vec<u8>)>,
+    tx: mpsc::Sender<P9Response>,
     shutdown: CancellationToken,
+    admission: &P9ConnectionAdmission,
+    requests: &TaskTracker,
 ) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin,
@@ -910,7 +1201,7 @@ where
             }
         };
 
-        dispatch_9p_frame(full_buf, &handler, &tx, &inflight)?;
+        dispatch_9p_frame(full_buf, &handler, &tx, &inflight, admission, requests).await?;
     }
 }
 
@@ -926,9 +1217,258 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::io::AsyncReadExt;
+    use tokio::sync::Notify;
+    use tokio_util::task::TaskTracker;
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(1);
     const QUIET_TIMEOUT: Duration = Duration::from_millis(20);
+
+    #[tokio::test]
+    async fn connection_request_bytes_apply_backpressure_before_dispatch() {
+        let global = P9GlobalAdmission::for_test(16, 4);
+        let connection = global.connection_for_test(8, 4);
+        let first = connection.admit_request(5, 3).await.unwrap();
+
+        assert!(
+            tokio::time::timeout(QUIET_TIMEOUT, connection.admit_request(1, 0))
+                .await
+                .is_err(),
+            "request and possible response bytes must share the local budget"
+        );
+
+        drop(first);
+        tokio::time::timeout(TEST_TIMEOUT, connection.admit_request(1, 0))
+            .await
+            .expect("released request bytes must unblock the connection")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn global_request_bytes_apply_backpressure_across_connections() {
+        let global = P9GlobalAdmission::for_test(8, 4);
+        let first_connection = global.connection_for_test(8, 4);
+        let second_connection = global.connection_for_test(8, 4);
+        let first = first_connection.admit_request(5, 3).await.unwrap();
+
+        assert!(
+            tokio::time::timeout(QUIET_TIMEOUT, second_connection.admit_request(1, 0))
+                .await
+                .is_err(),
+            "connections must share the process request-byte budget"
+        );
+
+        drop(first);
+        tokio::time::timeout(TEST_TIMEOUT, second_connection.admit_request(1, 0))
+            .await
+            .expect("released global bytes must unblock another connection")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn request_task_limit_bounds_tiny_frames() {
+        let global = P9GlobalAdmission::for_test(128, 1);
+        let connection = global.connection_for_test(128, 1);
+        let first = connection.admit_request(1, 0).await.unwrap();
+
+        assert!(
+            tokio::time::timeout(QUIET_TIMEOUT, connection.admit_request(1, 0))
+                .await
+                .is_err(),
+            "small frames must not bypass the request-task bound"
+        );
+
+        drop(first);
+        tokio::time::timeout(TEST_TIMEOUT, connection.admit_request(1, 0))
+            .await
+            .expect("released task capacity must admit the next frame")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn queued_response_holds_byte_admission_until_consumed() {
+        let global = P9GlobalAdmission::for_test(8, 4);
+        let connection = global.connection_for_test(8, 4);
+        let admitted = connection.admit_request(1, 7).await.unwrap();
+        let response = P9Response::new(7, vec![0; 7], admitted);
+
+        assert!(
+            tokio::time::timeout(QUIET_TIMEOUT, connection.admit_request(1, 0))
+                .await
+                .is_err(),
+            "queued response bytes must remain charged until the writer consumes them"
+        );
+
+        drop(response);
+        tokio::time::timeout(TEST_TIMEOUT, connection.admit_request(1, 0))
+            .await
+            .expect("consuming a response must release its byte charge")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn response_flush_releases_admission_exactly_once() {
+        let global = P9GlobalAdmission::for_test(32, 1);
+        let connection = global.connection_for_test(32, 1);
+        let admitted = connection.admit_request(8, 8).await.unwrap();
+        let response = P9Response::new(7, vec![0; 8], admitted);
+        let (tx, rx) = mpsc::channel(1);
+        tx.send(response).await.unwrap();
+        drop(tx);
+        let (mut client, server) = tokio::io::duplex(64);
+        let writer = spawn_response_writer(
+            server,
+            rx,
+            ResponseAuthority::always(),
+            CancellationToken::new(),
+        );
+
+        drain_writer(writer, "response writer must flush").await;
+        let mut bytes = [0; 8];
+        client.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(
+            global.snapshot(),
+            P9AdmissionSnapshot {
+                reserved_bytes: 0,
+                active_requests: 0,
+            },
+            "transport completion must release both byte and request permits once"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconnect_storm_cannot_exceed_the_global_budget() {
+        let global = P9GlobalAdmission::for_test(16, 2);
+        let connections = (0..32)
+            .map(|_| global.connection_for_test(8, 1))
+            .collect::<Vec<_>>();
+        let mut admitted = Vec::new();
+
+        for connection in &connections {
+            if let Ok(Ok(permit)) =
+                tokio::time::timeout(Duration::from_millis(1), connection.admit_request(5, 3)).await
+            {
+                admitted.push(permit);
+            }
+        }
+
+        assert_eq!(admitted.len(), 2);
+        assert_eq!(
+            global.snapshot(),
+            P9AdmissionSnapshot {
+                reserved_bytes: 16,
+                active_requests: 2,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn disconnect_settlement_waits_for_tracked_requests() {
+        let requests = TaskTracker::new();
+        let release = Arc::new(Notify::new());
+        let task_release = Arc::clone(&release);
+        requests.spawn(async move {
+            task_release.notified().await;
+        });
+
+        let mut settlement = tokio::spawn(settle_request_tasks(requests));
+        assert!(
+            tokio::time::timeout(QUIET_TIMEOUT, &mut settlement)
+                .await
+                .is_err(),
+            "disconnect settlement must keep accepted request work alive"
+        );
+
+        release.notify_waiters();
+        tokio::time::timeout(TEST_TIMEOUT, settlement)
+            .await
+            .expect("settled requests must release the disconnected session")
+            .unwrap();
+    }
+
+    struct DropTrackedFrame {
+        bytes: Vec<u8>,
+        dropped: Option<oneshot::Sender<()>>,
+    }
+
+    impl AsRef<[u8]> for DropTrackedFrame {
+        fn as_ref(&self) -> &[u8] {
+            &self.bytes
+        }
+    }
+
+    impl Drop for DropTrackedFrame {
+        fn drop(&mut self) {
+            if let Some(dropped) = self.dropped.take() {
+                let _ = dropped.send(());
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn duplicate_write_retry_drops_payload_before_waiting_for_first() {
+        let filesystem = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let handler = Arc::new(NinePHandler::new(
+            Arc::clone(&filesystem),
+            Arc::new(FileLockManager::new()),
+        ));
+        negotiate(&handler).await;
+
+        let op_id = [0x72; 16];
+        let first = filesystem
+            .dedup
+            .reserve_initial(op_id)
+            .expect("reserve the original mutation");
+        let encoded = P9Message::new_with_op_id_flags_and_origin(
+            7,
+            op_id,
+            ninep_proto::P9_OP_FLAG_RETRY,
+            0,
+            Message::Twrite(Twrite {
+                fid: 1,
+                offset: 0,
+                count: 1024 * 1024,
+                data: ninep_proto::DekuBytes::from(Bytes::from(vec![0x5a; 1024 * 1024])),
+            }),
+        )
+        .to_bytes_ctx(true)
+        .unwrap();
+        let (dropped_tx, dropped_rx) = oneshot::channel();
+        let frame = Bytes::from_owner(DropTrackedFrame {
+            bytes: encoded,
+            dropped: Some(dropped_tx),
+        });
+        let reserved = frame.len() + P9_MAX_MSIZE as usize;
+        let global = P9GlobalAdmission::for_test(reserved, 1);
+        let admission = global.connection_for_test(reserved, 1);
+        let requests = TaskTracker::new();
+        let (tx, mut rx) = mpsc::channel(1);
+        let inflight = InflightRegistry::default();
+
+        dispatch_9p_frame(frame, &handler, &tx, &inflight, &admission, &requests)
+            .await
+            .unwrap();
+        tokio::time::timeout(TEST_TIMEOUT, dropped_rx)
+            .await
+            .expect("retry payload allocation must be dropped while the first remains in flight")
+            .unwrap();
+
+        drop(first);
+        let response = tokio::time::timeout(TEST_TIMEOUT, rx.recv())
+            .await
+            .expect("retry must settle after the first retires")
+            .expect("response channel");
+        let (_, response_bytes) = response.into_parts();
+        let response = decode(&response_bytes);
+        assert!(matches!(
+            response.body,
+            Message::Rlerror(Rlerror {
+                ecode: ninep_proto::P9_EOPIDSTALE
+            })
+        ));
+
+        requests.close();
+        requests.wait().await;
+    }
 
     fn frame(tag: u16, body: Message) -> Bytes {
         Bytes::from(P9Message::new(tag, body).to_bytes().unwrap())
@@ -988,19 +1528,25 @@ mod tests {
 
     struct DispatchFixture {
         handler: Arc<NinePHandler>,
-        tx: mpsc::Sender<(u16, Vec<u8>)>,
-        rx: mpsc::Receiver<(u16, Vec<u8>)>,
+        tx: mpsc::Sender<P9Response>,
+        rx: mpsc::Receiver<P9Response>,
         inflight: InflightRegistry,
+        admission: P9ConnectionAdmission,
+        requests: TaskTracker,
     }
 
     impl DispatchFixture {
         fn new(handler: Arc<NinePHandler>, capacity: usize) -> Self {
             let (tx, rx) = mpsc::channel(capacity);
+            let byte_limit = P9_MAX_MSIZE as usize * 64;
+            let global = P9GlobalAdmission::for_test(byte_limit, 64);
             Self {
                 handler,
                 tx,
                 rx,
                 inflight: InflightRegistry::default(),
+                admission: global.connection_for_test(byte_limit, 64),
+                requests: TaskTracker::new(),
             }
         }
 
@@ -1009,19 +1555,29 @@ mod tests {
             Self::new(handler, capacity)
         }
 
-        fn dispatch(&self, tag: u16, body: Message) {
-            self.dispatch_frame(frame(tag, body));
+        async fn dispatch(&self, tag: u16, body: Message) {
+            self.dispatch_frame(frame(tag, body)).await;
         }
 
-        fn dispatch_frame(&self, bytes: Bytes) {
-            dispatch_9p_frame(bytes, &self.handler, &self.tx, &self.inflight).unwrap();
+        async fn dispatch_frame(&self, bytes: Bytes) {
+            dispatch_9p_frame(
+                bytes,
+                &self.handler,
+                &self.tx,
+                &self.inflight,
+                &self.admission,
+                &self.requests,
+            )
+            .await
+            .unwrap();
         }
 
         async fn recv(&mut self, context: &str) -> (u16, P9Message) {
-            let (tag, bytes) = tokio::time::timeout(TEST_TIMEOUT, self.rx.recv())
+            let response = tokio::time::timeout(TEST_TIMEOUT, self.rx.recv())
                 .await
                 .expect(context)
                 .expect("response channel");
+            let (tag, bytes) = response.into_parts();
             (tag, decode(&bytes))
         }
 
@@ -1064,14 +1620,30 @@ mod tests {
             .expect("writer task");
     }
 
-    fn response_queue<const N: usize>(
+    async fn response_queue<const N: usize>(
         responses: [(u16, Vec<u8>); N],
-    ) -> mpsc::Receiver<(u16, Vec<u8>)> {
+    ) -> mpsc::Receiver<P9Response> {
         let (tx, rx) = mpsc::channel(N);
-        for response in responses {
-            tx.try_send(response).unwrap();
+        let byte_limit = responses
+            .iter()
+            .map(|(_, bytes)| bytes.len())
+            .sum::<usize>()
+            .max(1);
+        let global = P9GlobalAdmission::for_test(byte_limit, N.max(1));
+        let admission = global.connection_for_test(byte_limit, N.max(1));
+        for (tag, bytes) in responses {
+            let permit = admission.admit_request(0, bytes.len()).await.unwrap();
+            tx.try_send(P9Response::new(tag, bytes, permit)).unwrap();
         }
         rx
+    }
+
+    async fn test_response(tag: u16, bytes: Vec<u8>) -> P9Response {
+        let byte_limit = bytes.len().max(1);
+        let global = P9GlobalAdmission::for_test(byte_limit, 1);
+        let admission = global.connection_for_test(byte_limit, 1);
+        let permit = admission.admit_request(0, bytes.len()).await.unwrap();
+        P9Response::new(tag, bytes, permit)
     }
 
     fn not_leader(tag: u16) -> Vec<u8> {
@@ -1103,8 +1675,9 @@ mod tests {
                 newfid: 2,
                 flags: libc::O_RDONLY as u32,
             }),
-        );
-        io.dispatch(followup_tag, followup);
+        )
+        .await;
+        io.dispatch(followup_tag, followup).await;
         io.expect_quiet(quiet_message).await;
         drop(inode_lock);
 
@@ -1286,7 +1859,7 @@ mod tests {
         let response = frame(21, Message::Rflush(Rflush)).to_vec();
         let writer = spawn_response_writer(
             buffered_server,
-            response_queue([(21, response.clone())]),
+            response_queue([(21, response.clone())]).await,
             ResponseAuthority::always(),
             CancellationToken::new(),
         );
@@ -1320,7 +1893,7 @@ mod tests {
         let second = not_leader(32);
         let writer = spawn_response_writer(
             counted_server,
-            response_queue([(31, first.clone()), (32, second.clone())]),
+            response_queue([(31, first.clone()), (32, second.clone())]).await,
             ResponseAuthority::always(),
             CancellationToken::new(),
         );
@@ -1348,7 +1921,7 @@ mod tests {
         assert!(matches!(completed.body, Message::Rflush(Rflush)));
         let completed_bytes = completed.to_bytes().unwrap();
         let (mut client, server) = tokio::io::duplex(4096);
-        let rx = response_queue([(41, completed_bytes)]);
+        let rx = response_queue([(41, completed_bytes)]).await;
         lease.revoke();
 
         let connection_shutdown = CancellationToken::new();
@@ -1372,7 +1945,7 @@ mod tests {
         let (mut client, server) = tokio::io::duplex(4096);
         let writer = spawn_response_writer(
             server,
-            response_queue([(42, error_bytes.clone())]),
+            response_queue([(42, error_bytes.clone())]).await,
             ResponseAuthority::from_database(Arc::clone(&filesystem.db)),
             CancellationToken::new(),
         );
@@ -1414,7 +1987,8 @@ mod tests {
                 (51, first_error.clone()),
                 (52, buffered_success),
                 (53, trailing_error),
-            ]),
+            ])
+            .await,
             ResponseAuthority::from_database(Arc::clone(&filesystem.db)),
             CancellationToken::new(),
         );
@@ -1455,9 +2029,22 @@ mod tests {
             .unwrap();
         let (tx, _rx) = mpsc::channel(2);
         let inflight = InflightRegistry::default();
+        let byte_limit = P9_MAX_MSIZE as usize * 2;
+        let global = P9GlobalAdmission::for_test(byte_limit, 2);
+        let admission = global.connection_for_test(byte_limit, 2);
+        let requests = TaskTracker::new();
 
         // The current-thread runtime leaves the received FIRST task unpolled.
-        dispatch_9p_frame(Bytes::from(first), &old, &tx, &inflight).unwrap();
+        dispatch_9p_frame(
+            Bytes::from(first),
+            &old,
+            &tx,
+            &inflight,
+            &admission,
+            &requests,
+        )
+        .await
+        .unwrap();
         old.close_for_disconnect();
 
         // RETRY must wait for the received FIRST and replay its mkdir result.
@@ -1539,7 +2126,7 @@ mod tests {
             connection_shutdown.clone(),
         );
 
-        tx.send((21, vec![1, 2, 3]))
+        tx.send(test_response(21, vec![1, 2, 3]).await)
             .await
             .expect("response enqueue");
         tokio::time::timeout(TEST_TIMEOUT, connection_shutdown.cancelled())
@@ -1639,9 +2226,17 @@ mod tests {
         let original_waiter = inflight.waiter(7).expect("original request");
         let response = vec![1, 2, 3];
         let (tx, mut rx) = mpsc::channel(1);
-        tx.send((99, vec![0])).await.unwrap();
+        tx.send(test_response(99, vec![0]).await).await.unwrap();
+        let global = P9GlobalAdmission::for_test(response.len(), 1);
+        let admission = global.connection_for_test(response.len(), 1);
+        let response_admission = admission.admit_request(0, response.len()).await.unwrap();
 
-        let mut enqueue = Box::pin(enqueue_terminal_response(&tx, response.clone(), &original));
+        let mut enqueue = Box::pin(enqueue_terminal_response(
+            &tx,
+            response.clone(),
+            &original,
+            response_admission,
+        ));
         tokio::select! {
             biased;
             result = &mut enqueue => panic!("full response queue accepted a send: {result:?}"),
@@ -1651,14 +2246,14 @@ mod tests {
             inflight.register(7, FidFootprint::None).is_err(),
             "queue backpressure must keep the tag occupied until capacity is reserved"
         );
-        assert_eq!(rx.recv().await.unwrap(), (99, vec![0]));
+        assert_eq!(rx.recv().await.unwrap().into_parts(), (99, vec![0]));
 
         tokio::time::timeout(TEST_TIMEOUT, &mut enqueue)
             .await
             .expect("response enqueue")
             .unwrap();
         drop(enqueue);
-        assert_eq!(rx.recv().await.unwrap(), (7, response));
+        assert_eq!(rx.recv().await.unwrap().into_parts(), (7, response));
 
         let replacement = inflight
             .register(7, FidFootprint::None)
@@ -1692,10 +2287,21 @@ mod tests {
         let (mut client, server) = tokio::io::duplex(4096);
         client.write_all(&input).await.unwrap();
         let (tx, _rx) = mpsc::channel(2);
+        let byte_limit = P9_MAX_MSIZE as usize * 4;
+        let global = P9GlobalAdmission::for_test(byte_limit, 4);
+        let admission = global.connection_for_test(byte_limit, 4);
+        let requests = TaskTracker::new();
 
-        let error = handle_client_loop(handler, server, tx, CancellationToken::new())
-            .await
-            .expect_err("duplicate tag must terminate the reader");
+        let error = handle_client_loop(
+            handler,
+            server,
+            tx,
+            CancellationToken::new(),
+            &admission,
+            &requests,
+        )
+        .await
+        .expect_err("duplicate tag must terminate the reader");
         assert!(error.to_string().contains("reused in-flight 9P tag 7"));
 
         let mut byte = [0];
@@ -1794,7 +2400,7 @@ mod tests {
             inspect_frame_metadata(&frame, true),
             ShallowFrameMetadata {
                 fids: FidFootprint::One(42),
-                received_op: Some((op_id, 0)),
+                received_op: Some((op_id, 0, 0)),
             }
         );
     }
@@ -1817,7 +2423,7 @@ mod tests {
         .unwrap();
 
         let mut io = DispatchFixture::new(handler, 1);
-        io.dispatch_frame(Bytes::from(frame));
+        io.dispatch_frame(Bytes::from(frame)).await;
         assert!(matches!(
             io.recv("malformed request response").await.1.body,
             Message::Rlerror(_)
@@ -1913,7 +2519,8 @@ mod tests {
     async fn tflush_captures_its_target_before_dispatch_returns() {
         let mut io = DispatchFixture::in_memory(2).await;
         let target_lease = io.inflight.register(20, FidFootprint::None).unwrap();
-        io.dispatch(21, Message::Tflush(Tflush { oldtag: 20 }));
+        io.dispatch(21, Message::Tflush(Tflush { oldtag: 20 }))
+            .await;
         io.expect_quiet("Rflush must wait for the captured target generation")
             .await;
         drop(target_lease);
@@ -1927,7 +2534,8 @@ mod tests {
         let target_lease = io.inflight.register(20, FidFootprint::None).unwrap();
 
         for tag in [21, 22] {
-            io.dispatch(tag, Message::Tflush(Tflush { oldtag: 20 }));
+            io.dispatch(tag, Message::Tflush(Tflush { oldtag: 20 }))
+                .await;
         }
 
         io.expect_quiet("both flushes must wait for the same target generation")
@@ -1945,8 +2553,10 @@ mod tests {
     async fn flushing_a_flush_waits_for_its_response() {
         let mut io = DispatchFixture::in_memory(2).await;
         let target_lease = io.inflight.register(20, FidFootprint::None).unwrap();
-        io.dispatch(21, Message::Tflush(Tflush { oldtag: 20 }));
-        io.dispatch(22, Message::Tflush(Tflush { oldtag: 21 }));
+        io.dispatch(21, Message::Tflush(Tflush { oldtag: 20 }))
+            .await;
+        io.dispatch(22, Message::Tflush(Tflush { oldtag: 21 }))
+            .await;
         io.expect_quiet("the second flush must observe the first flush as in flight")
             .await;
         drop(target_lease);
@@ -1959,7 +2569,8 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn flush_of_an_unknown_tag_responds_immediately() {
         let mut io = DispatchFixture::in_memory(1).await;
-        io.dispatch(21, Message::Tflush(Tflush { oldtag: 20 }));
+        io.dispatch(21, Message::Tflush(Tflush { oldtag: 20 }))
+            .await;
 
         assert_eq!(io.recv_flush("immediate flush response").await, 21);
     }
@@ -1977,7 +2588,7 @@ mod tests {
 
         let mut io = DispatchFixture::new(handler, 2);
         let target_lease = io.inflight.register(20, FidFootprint::None).unwrap();
-        io.dispatch_frame(Bytes::from(frame));
+        io.dispatch_frame(Bytes::from(frame)).await;
 
         drop(target_lease);
         io.recv_flush("flush response").await;
@@ -2010,8 +2621,9 @@ mod tests {
                 newfid: 2,
                 flags: libc::O_RDONLY as u32,
             }),
-        );
-        io.dispatch(11, Message::Tclunk(Tclunk { fid: 3 }));
+        )
+        .await;
+        io.dispatch(11, Message::Tclunk(Tclunk { fid: 3 })).await;
 
         let (tag, clunk) = io.recv("unrelated clunk response").await;
         assert_eq!(tag, 11);
@@ -2044,7 +2656,8 @@ mod tests {
                 fid: 2,
                 request_mask: GETATTR_ALL,
             }),
-        );
+        )
+        .await;
         assert!(matches!(
             io.recv("getattr response").await.1.body,
             Message::Rlerror(_)

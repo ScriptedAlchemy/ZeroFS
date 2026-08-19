@@ -2,7 +2,10 @@ use crate::config::WebUIConfig;
 use crate::fs::ZeroFS;
 use crate::ninep::handler::{NinePHandler, SessionReleaseGuard};
 use crate::ninep::lock_manager::FileLockManager;
-use crate::ninep::server::{InflightRegistry, dispatch_9p_frame, response_may_be_emitted};
+use crate::ninep::server::{
+    InflightRegistry, P9GlobalAdmission, P9Response, P9SessionMetricGuard, dispatch_9p_frame,
+    response_may_be_emitted, settle_request_tasks,
+};
 use crate::rpc::proto;
 use crate::rpc::server::AdminRpcServer;
 use crate::task::spawn_named;
@@ -86,6 +89,7 @@ async fn ws_9p_upgrade(ws: WebSocketUpgrade, State(state): State<AppState>) -> i
 }
 
 async fn handle_9p_ws(socket: WebSocket, state: AppState, _drain_guard: TaskTrackerToken) {
+    let _session_metric = P9SessionMetricGuard::new();
     let response_db = Arc::clone(&state.filesystem.db);
     let handler = Arc::new(
         NinePHandler::new(
@@ -96,8 +100,10 @@ async fn handle_9p_ws(socket: WebSocket, state: AppState, _drain_guard: TaskTrac
     );
     let mut release_guard = SessionReleaseGuard::new(Arc::clone(&handler));
     let inflight = InflightRegistry::default();
+    let admission = P9GlobalAdmission::shared().connection();
+    let requests = TaskTracker::new();
 
-    let (tx, mut rx) = mpsc::channel::<(u16, Vec<u8>)>(P9_CHANNEL_SIZE);
+    let (tx, mut rx) = mpsc::channel::<P9Response>(P9_CHANNEL_SIZE);
 
     // Writer task: sends response bytes as WS binary messages
     let (mut ws_tx, mut ws_rx) = socket.split();
@@ -107,7 +113,8 @@ async fn handle_9p_ws(socket: WebSocket, state: AppState, _drain_guard: TaskTrac
     // Abort on early exit; normal teardown drains responses for a bounded interval.
     let mut writer = AbortOnDropHandle::new(spawn_named("9p-ws-writer", async move {
         use futures::SinkExt;
-        while let Some((tag, response_bytes)) = rx.recv().await {
+        while let Some(response) = rx.recv().await {
+            let (tag, response_bytes, admission) = response.into_guarded_parts();
             if !response_may_be_emitted(&response_db, &response_bytes) {
                 warn!(
                     "Dropping successful WebSocket 9P response for tag {tag} after serving \
@@ -123,6 +130,7 @@ async fn handle_9p_ws(socket: WebSocket, state: AppState, _drain_guard: TaskTrac
             {
                 break;
             }
+            drop(admission);
         }
     }));
 
@@ -142,7 +150,9 @@ async fn handle_9p_ws(socket: WebSocket, state: AppState, _drain_guard: TaskTrac
         };
         match next {
             Some(Ok(WsMessage::Binary(data))) => {
-                if let Err(e) = dispatch_9p_frame(data, &handler, &tx, &inflight) {
+                if let Err(e) =
+                    dispatch_9p_frame(data, &handler, &tx, &inflight, &admission, &requests).await
+                {
                     error!("9P WebSocket dispatch error: {}", e);
                     break;
                 }
@@ -169,10 +179,16 @@ async fn handle_9p_ws(socket: WebSocket, state: AppState, _drain_guard: TaskTrac
         .await
         .is_err()
     {
+        metrics::counter!(
+            "zerofs_p9_response_drain_timeouts_total",
+            "transport" => "websocket"
+        )
+        .increment(1);
         writer.abort();
         let _ = writer.await;
         tracing::warn!("timed out draining 9P WebSocket responses during shutdown");
     }
+    settle_request_tasks(requests).await;
 }
 
 fn content_type(path: &str) -> &'static str {

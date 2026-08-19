@@ -1729,6 +1729,14 @@ impl NinePHandler {
     }
 
     async fn write(&self, tw: Twrite, op_id: crate::dedup::OpId) -> P9Result<Message> {
+        let declared_len = tw.count as usize;
+        if tw.data.len() != declared_len && self.filesystem.dedup.get(&op_id).is_none() {
+            // The server may shallow-decode an epoch-zero RETRY without its
+            // bulk payload. Such a request is replay-only: if its original
+            // result is no longer present, fail closed instead of applying an
+            // empty or truncated write.
+            return Err(FsError::StaleHandle.into());
+        }
         let fid_entry = self.get_fid(tw.fid)?;
 
         if !fid_allows_write(&fid_entry) {
@@ -1746,7 +1754,6 @@ impl NinePHandler {
         );
 
         let auth = AuthContext::from(&fid_entry.creds);
-        let data_len = tw.data.len();
         let data = Bytes::from(tw.data);
 
         self.filesystem
@@ -1757,9 +1764,7 @@ impl NinePHandler {
             })?;
 
         debug!("write: succeeded");
-        Ok(Message::Rwrite(Rwrite {
-            count: data_len as u32,
-        }))
+        Ok(Message::Rwrite(Rwrite { count: tw.count }))
     }
 
     async fn getattr(&self, tg: Tgetattr) -> P9Result<Message> {
