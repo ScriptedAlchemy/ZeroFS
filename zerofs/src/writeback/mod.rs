@@ -1,6 +1,6 @@
 /// Writeback dirty-RAM and dirty-SSD admission.
 ///
-/// RAM and SSD policy owners live in this module. The shared FIFO gate lives
+/// RAM admission lives in this module. SSD ownership lives in `reservation`. The shared FIFO gate lives
 /// in `crate::coordination::admission`.
 pub mod admission;
 /// Shared durability-barrier primitive.
@@ -10,8 +10,7 @@ pub mod admission;
 /// only the error vocabulary differs, and that is supplied by
 /// [`barrier::BarrierError`].
 ///
-/// The implementation lives in `crate::coordination::sequence`; this module
-/// re-exports the old paths until call sites migrate.
+/// The implementation lives in `crate::coordination::sequence`.
 pub(crate) mod barrier {
     pub(crate) use crate::coordination::sequence::{
         BarrierError, SequenceBarrier, SequenceProgress,
