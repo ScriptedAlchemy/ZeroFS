@@ -771,6 +771,7 @@ impl ExtentStore {
             nominations_dropped: nom_dropped,
             hot_seams: hot_pairs.len() as u64,
         });
+        crate::alloc_rss::purge_arenas();
         Ok(PassOutcome {
             deleted,
             relocated: frames_relocated,
