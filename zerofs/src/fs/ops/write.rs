@@ -368,6 +368,12 @@ pub(crate) async fn apply_prepared_batch(
     let pending = fs.write_coordinator.submit(txn)?;
     batch.guards = None;
     pending.wait().await?;
+    for member in &batch.members {
+        if let Some(reservation) = &member.quota {
+            reservation.accept();
+            reservation.canonical();
+        }
+    }
     debug!("DB write took: {:?}", db_write_start.elapsed());
 
     for (id, tail_update) in tail_updates {
@@ -400,13 +406,6 @@ pub(crate) async fn apply_prepared_batch(
                 length: member.data.len() as u64,
             },
         );
-    }
-
-    for member in &batch.members {
-        if let Some(reservation) = &member.quota {
-            reservation.accept();
-            reservation.canonical();
-        }
     }
 
     Ok(PreparedBatchResult {
