@@ -1,6 +1,6 @@
 use super::error::{CommandError, CommandResult, NBDError, Result};
 use super::out_of_bounds;
-use super::volatile_overlay::{
+use crate::fs::mutation::volatile_overlay::{
     Materializer, VolatileAdmission, VolatileBudget, VolatileWriteRuntime,
     WriteChunk as VolatileWriteChunk,
 };
