@@ -646,7 +646,7 @@ async fn worker_loop(
 
         if invalid_write_request {
             for reply in replies {
-                let _ = reply.send(Err(FsError::InvalidData));
+                reply.send(Err(FsError::InvalidData));
             }
             if let Some(reply) = barrier_reply {
                 let _ = reply.send(Err(FsError::InvalidData));
@@ -680,7 +680,7 @@ async fn worker_loop(
                 // allocation watermark is untouched, so unlike the
                 // `stage_seg_deltas` failure below there is no ID to burn.
                 for reply in replies {
-                    let _ = reply.send(Err(e));
+                    reply.send(Err(e));
                 }
                 if let Some(reply) = barrier_reply {
                     let _ = reply.send(Err(e));
@@ -741,7 +741,7 @@ async fn worker_loop(
                     ctx.inode_store.allocate();
                 }
                 for reply in replies {
-                    let _ = reply.send(Err(e));
+                    reply.send(Err(e));
                 }
                 if let Some(reply) = barrier_reply {
                     let _ = reply.send(Err(e));
@@ -819,7 +819,7 @@ async fn worker_loop(
                 ctx.inode_store.allocate();
             }
             for reply in replies {
-                let _ = reply.send(Err(FsError::LeaderRejectedBeforeApply));
+                reply.send(Err(FsError::LeaderRejectedBeforeApply));
             }
             if let Some(reply) = barrier_reply {
                 let _ = reply.send(Err(FsError::LeaderRejectedBeforeApply));
@@ -984,7 +984,7 @@ async fn worker_loop(
             ctx.inode_store.allocate();
         }
         for reply in replies {
-            let _ = reply.send(result);
+            reply.send(result);
         }
         if let Some(reply) = barrier_reply {
             let _ = reply.send(result);

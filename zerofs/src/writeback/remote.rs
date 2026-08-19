@@ -1524,8 +1524,7 @@ async fn verify_existing(
     let mut offset = 0u64;
     while offset < blob.len() {
         let end = offset
-            .checked_add(REMOTE_STREAM_CHUNK_BYTES as u64)
-            .unwrap_or(u64::MAX)
+            .saturating_add(REMOTE_STREAM_CHUNK_BYTES as u64)
             .min(blob.len());
         let options = GetOptions {
             if_match: meta.e_tag.clone(),
