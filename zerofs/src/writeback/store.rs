@@ -29,7 +29,7 @@ use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path as FilePath, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{Mutex, Notify, OwnedMutexGuard};
 use uuid::Uuid;
@@ -68,6 +68,7 @@ struct WritebackStoreInner {
     started: std::time::Instant,
     available_space: AtomicU64,
     available_space_probed_ms: AtomicU64,
+    stopped: AtomicBool,
 }
 
 impl std::fmt::Debug for WritebackObjectStore {
@@ -240,6 +241,7 @@ impl WritebackObjectStore {
                 started: std::time::Instant::now(),
                 available_space: AtomicU64::new(sample.available_bytes),
                 available_space_probed_ms: AtomicU64::new(1),
+                stopped: AtomicBool::new(false),
             }),
         })
     }
@@ -273,6 +275,17 @@ impl WritebackObjectStore {
         self.inner.next_sequence.load(Ordering::Acquire)
     }
 
+    /// Conservative object coverage after database close, including objects
+    /// emitted by close itself.
+    pub(crate) fn object_coverage(&self) -> crate::fs::mutation::durability::ObjectCoverage {
+        crate::fs::mutation::durability::ObjectCoverage::Writeback {
+            journal_incarnation: crate::fs::mutation::durability::JournalIncarnation::new(
+                self.journal_incarnation(),
+            ),
+            sequence: self.accepted_sequence(),
+        }
+    }
+
     pub(crate) async fn wait_local_coverage(
         &self,
         journal_incarnation: uuid::Uuid,
@@ -293,6 +306,23 @@ impl WritebackObjectStore {
             return Err(RemoteBarrierError::StaleIncarnation);
         }
         self.wait_remote(sequence).await
+    }
+
+    pub(crate) async fn wait_coverage(
+        &self,
+        journal_incarnation: uuid::Uuid,
+        sequence: crate::writeback::model::Sequence,
+        remote: bool,
+    ) -> Result<(), WritebackError> {
+        if remote {
+            self.wait_remote_coverage(journal_incarnation, sequence)
+                .await
+                .map_err(WritebackError::from)
+        } else {
+            self.wait_local_coverage(journal_incarnation, sequence)
+                .await
+                .map_err(WritebackError::from)
+        }
     }
 
     pub(crate) fn space_sampler(&self) -> &Arc<PhysicalSpaceSampler> {
@@ -356,6 +386,14 @@ impl WritebackObjectStore {
     }
 
     pub async fn shutdown(&self) -> Result<(), LocalBarrierError> {
+        if self
+            .inner
+            .stopped
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Ok(());
+        }
         match self.inner.settings.shutdown_flush {
             crate::writeback::config::ShutdownFlush::Local => {
                 self.inner.remote.shutdown().await.map_err(|error| {
@@ -4712,6 +4750,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn object_coverage_includes_the_accepted_sequence() {
+        let (store, _, _temp) = test_store().await;
+        store
+            .put(
+                &Path::from("zerofs/pilot/close-coverage"),
+                Bytes::from_static(b"close").into(),
+            )
+            .await
+            .unwrap();
+        let coverage = store.object_coverage();
+        match coverage {
+            crate::fs::mutation::durability::ObjectCoverage::Writeback {
+                journal_incarnation,
+                sequence,
+            } => {
+                assert_eq!(journal_incarnation.as_uuid(), store.journal_incarnation());
+                assert_eq!(sequence, store.accepted_sequence());
+                assert!(sequence >= 1);
+            }
+            other => panic!("expected writeback coverage, got {other:?}"),
+        }
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn coverage_wait_uses_the_captured_accepted_sequence() {
         let (store, _, _temp) = test_store().await;
         store
@@ -4731,6 +4794,13 @@ mod tests {
             .wait_local_coverage(incarnation, sequence)
             .await
             .unwrap();
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_is_idempotent_after_the_first_owner_joins() {
+        let (store, _, _temp) = test_store().await;
+        store.shutdown().await.unwrap();
         store.shutdown().await.unwrap();
     }
 }

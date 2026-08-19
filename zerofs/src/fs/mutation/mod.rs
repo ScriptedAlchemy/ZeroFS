@@ -5,10 +5,10 @@
 //! write-acknowledgement contract, [`request_cache`] the protocol replay
 //! cache, [`admission`] the raw byte/operation budget and preparation
 //! quiescence gate, [`progress`] the gap-free materialization barrier,
-//! [`volatile_overlay`] the bounded RAM overlay runtime, [`overlay`]
-//! the filesystem-facing overlay manager, and [`materializer`] the
-//! ordered canonical apply workers, and [`fence`] deadlock-safe
-//! conflict fences.
+//! [`durability`] typed local/remote receipts, [`volatile_overlay`] the
+//! bounded RAM overlay runtime, [`overlay`] the filesystem-facing overlay
+//! manager, [`materializer`] the ordered canonical apply workers, and
+//! [`fence`] deadlock-safe conflict fences.
 
 pub(crate) mod ack;
 pub(crate) mod admission;
@@ -22,3 +22,11 @@ pub(crate) mod volatile_overlay;
 
 pub(crate) mod request_cache;
 pub(crate) mod types;
+
+use crate::fs::ZeroFS;
+use crate::fs::mutation::types::MutationCutoff;
+
+/// Capture the final published mutation cutoff after admission has stopped.
+pub(crate) fn closed_admission_cutoff(fs: &ZeroFS) -> MutationCutoff {
+    fs.capture_mutation_cutoff()
+}

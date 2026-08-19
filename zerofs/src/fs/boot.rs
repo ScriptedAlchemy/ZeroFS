@@ -319,6 +319,61 @@ impl ZeroFS {
         Ok(token)
     }
 
+    /// Reject new mutation admission. Used by the sole shutdown owner.
+    pub(crate) fn stop_new_mutation_admission(&self) {
+        if let Some(coordinator) = self.mutation_coordinator.get() {
+            coordinator.gate().poison("server shutting down");
+        }
+    }
+
+    /// Capture the final published mutation cutoff after admission is closed.
+    pub(crate) fn capture_mutation_cutoff(&self) -> crate::fs::mutation::types::MutationCutoff {
+        use crate::fs::mutation::types::{MutationCutoff, MutationIncarnation};
+        let sequence = self
+            .mutation_coordinator
+            .get()
+            .map(|coordinator| coordinator.gate().published_through())
+            .unwrap_or(0);
+        let mutation_incarnation = self
+            .materializer
+            .get()
+            .map(|materializer| materializer.incarnation())
+            .unwrap_or_else(MutationIncarnation::new);
+        MutationCutoff {
+            mutation_incarnation,
+            sequence,
+        }
+    }
+
+    pub(crate) async fn materialize_through_cutoff(
+        &self,
+        cutoff: crate::fs::mutation::types::MutationCutoff,
+    ) -> Result<(), crate::fs::errors::FsError> {
+        if let Some(overlay) = self.volatile_overlay.get() {
+            overlay
+                .wait_all()
+                .await
+                .map_err(|_| crate::fs::errors::FsError::IoError)?;
+        }
+        if let Some(materializer) = self.materializer.get() {
+            materializer
+                .progress()
+                .wait_materialized(cutoff)
+                .await
+                .map_err(|_| crate::fs::errors::FsError::IoError)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn stop_mutation_workers(&self) {
+        if let Some(materializer) = self.materializer.get() {
+            materializer.stop().await;
+        }
+        if let Some(overlay) = self.volatile_overlay.get() {
+            let _ = overlay.shutdown().await;
+        }
+    }
+
     /// Client durability barrier (9P `Tfsync`, NFS COMMIT, NBD flush). A no-op when
     /// `ignore_fsync` is set.
     pub async fn client_fsync(&self) -> Result<(), crate::fs::errors::FsError> {
@@ -326,6 +381,22 @@ impl ZeroFS {
             return Ok(());
         }
         self.flush_coordinator.flush().await
+    }
+
+    /// Seal, flush, and close the canonical database. The caller must already
+    /// hold the filesystem flush barrier so close-emitted objects can be
+    /// captured before it is released.
+    pub(crate) async fn close_canonical_database(&self) -> Result<(), crate::fs::errors::FsError> {
+        self.extent_store.seal_open().await?;
+        self.db
+            .flush()
+            .await
+            .map_err(|_| crate::fs::errors::FsError::IoError)?;
+        self.db.mark_closing();
+        self.db
+            .close()
+            .await
+            .map_err(|_| crate::fs::errors::FsError::IoError)
     }
 
     /// Flush and verify the client's oldest unflushed-write lineage token.
@@ -471,6 +542,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mutation_lifecycle_helpers_stop_cleanly() {
+        let fs = std::sync::Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        fs.start_materializer();
+        fs.stop_new_mutation_admission();
+        let cutoff = fs.capture_mutation_cutoff();
+        assert_eq!(cutoff.sequence, 0);
+        fs.materialize_through_cutoff(cutoff).await.unwrap();
+        fs.stop_mutation_workers().await;
+    }
+
+    #[tokio::test]
     async fn client_fsync_waits_for_configured_local_durability_barrier() {
         let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
         let entered = Arc::new(Notify::new());
@@ -605,6 +687,14 @@ mod tests {
             result.is_err(),
             "new_transaction should fail in read-only mode"
         );
+    }
+
+    #[tokio::test]
+    async fn close_canonical_database_seals_and_closes() {
+        let fs = super::ZeroFS::new_in_memory().await.unwrap();
+        fs.close_canonical_database()
+            .await
+            .expect("canonical seal+flush+close should succeed once");
     }
 
     // === Tests from operations.rs ===

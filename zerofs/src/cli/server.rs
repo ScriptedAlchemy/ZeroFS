@@ -32,6 +32,9 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+mod mutation_lifecycle;
+use mutation_lifecycle::{LifecycleOwners, MutationLifecycle};
+
 const SFTP_FINAL_DATABASE_CLOSE_TIMEOUT: Duration = Duration::from_secs(20);
 const SFTP_FINAL_WORKER_ABORT_TIMEOUT: Duration = Duration::from_secs(5);
 const SERVER_AUTHORITY_FINISH_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1243,8 +1246,11 @@ pub async fn run_server(
     let writeback_for_shutdown = init_result.writeback.clone();
     let writeback_for_metrics = init_result.writeback.clone();
     let writeback_for_checkpoints = init_result.writeback.clone();
+    let writeback_for_lifecycle = writeback_for_shutdown.clone();
     let sftp_pool = init_result.sftp_pool.clone();
     let sftp_pool_for_close = sftp_pool.clone();
+    let lifecycle_completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let lifecycle_completed_after = std::sync::Arc::clone(&lifecycle_completed);
     let server_result: anyhow::Result<()> = async move {
         let fs = init_result.fs;
         let authority = init_result.authority;
@@ -1586,114 +1592,30 @@ pub async fn run_server(
                 return Err(leadership_lost_error());
             }
             info!("Performing final flush and closing database...");
-            if db_mode.is_read_only() {
-                let close_result = if let Some(sftp_pool) = &sftp_pool_for_close {
-                    let db = Arc::clone(&fs.db);
-                    let mut close_owner = tokio::spawn(async move { db.close().await });
-                    match tokio::time::timeout(SFTP_FINAL_DATABASE_CLOSE_TIMEOUT, &mut close_owner)
-                        .await
-                    {
-                        Ok(result) => result.map_err(|error| {
-                            anyhow::anyhow!("read-only database close owner failed: {error}")
-                        })?,
-                        Err(_) => {
-                            sftp_pool.begin_shutdown();
-                            match tokio::time::timeout(
-                                SFTP_FINAL_DATABASE_CLOSE_TIMEOUT,
-                                &mut close_owner,
-                            )
-                            .await
-                            {
-                                Ok(result) => result.map_err(|error| {
-                                    anyhow::anyhow!(
-                                        "read-only database close owner failed after SFTP shutdown began: {error}"
-                                    )
-                                })?,
-                                Err(_) => {
-                                    close_owner.abort();
-                                    let _ = close_owner.await;
-                                    return Err(anyhow::anyhow!(
-                                        "SFTP-backed database close did not finish within {}s after terminal pool shutdown began",
-                                        SFTP_FINAL_DATABASE_CLOSE_TIMEOUT.as_secs()
-                                    ));
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    fs.db.close().await
-                };
-                if let Err(e) = close_result {
-                    tracing::error!("Database close failed: {:?}", e);
-                    return Err(e);
+            let lifecycle = MutationLifecycle::new(LifecycleOwners::for_process(
+                shutdown.clone(),
+                mutation_lifecycle::DispatchedCalls::new(),
+                Arc::clone(&fs),
+                writeback_for_lifecycle.clone(),
+                sftp_pool_for_close.clone(),
+                db_mode.is_read_only(),
+            ));
+            let target = crate::fs::mutation::durability::DurabilityTarget::from(
+                fs.write_ack.client_durability_target,
+            );
+            let deadline =
+                tokio::time::Instant::now() + SFTP_FINAL_DATABASE_CLOSE_TIMEOUT.saturating_mul(2);
+            tokio::select! {
+                biased;
+                _ = leadership_deposed.cancelled() => {
+                    abort_final_flush_after_leadership_loss(&fs).await;
+                    return Err(leadership_lost_error());
                 }
-            } else {
-                let close_result = if let Some(sftp_pool) = &sftp_pool_for_close {
-                    let mut closing = Box::pin(fs.flush_coordinator.close());
-                    tokio::select! {
-                        biased;
-                        _ = leadership_deposed.cancelled() => {
-                            drop(closing);
-                            abort_final_flush_after_leadership_loss(&fs).await;
-                            return Err(leadership_lost_error());
-                        }
-                        result = tokio::time::timeout(
-                            SFTP_FINAL_DATABASE_CLOSE_TIMEOUT,
-                            &mut closing,
-                        ) => match result {
-                            Ok(result) => result,
-                            Err(_) => {
-                                sftp_pool.begin_shutdown();
-                                match tokio::time::timeout(
-                                    SFTP_FINAL_DATABASE_CLOSE_TIMEOUT,
-                                    &mut closing,
-                                ).await {
-                                    Ok(result) => result,
-                                    Err(_) => {
-                                        drop(closing);
-                                        tokio::time::timeout(
-                                            SFTP_FINAL_WORKER_ABORT_TIMEOUT,
-                                            fs.flush_coordinator.abort_close_worker(),
-                                        )
-                                        .await
-                                        .map_err(|_| {
-                                            anyhow::anyhow!(
-                                                "timed out aborting the SFTP-backed final flush worker after {}s",
-                                                SFTP_FINAL_WORKER_ABORT_TIMEOUT.as_secs()
-                                            )
-                                        })?
-                                        .map_err(|error| {
-                                            anyhow::anyhow!(
-                                                "failed to abort the SFTP-backed final flush worker: {error:?}"
-                                            )
-                                        })?;
-                                        return Err(anyhow::anyhow!(
-                                            "SFTP-backed final flush+close did not finish within {}s after terminal pool shutdown began",
-                                            SFTP_FINAL_DATABASE_CLOSE_TIMEOUT.as_secs()
-                                        ));
-                                    }
-                                }
-                            }
-                        },
-                    }
-                } else {
-                    let mut closing = Box::pin(fs.flush_coordinator.close());
-                    tokio::select! {
-                        biased;
-                        _ = leadership_deposed.cancelled() => {
-                            drop(closing);
-                            abort_final_flush_after_leadership_loss(&fs).await;
-                            return Err(leadership_lost_error());
-                        }
-                        result = &mut closing => result,
-                    }
-                };
-                if let Err(e) = close_result {
-                    // `db.close()` may flush metadata, so it is unsafe after seal failure.
-                    tracing::error!(
-                        "Final flush+close failed ({e:?}); exiting without a separate database close"
-                    );
-                    return Err(anyhow::anyhow!("Final flush+close failed: {e:?}"));
+                result = Arc::clone(&lifecycle).close(deadline, target) => {
+                    let _receipt = result.map_err(|error| {
+                        anyhow::anyhow!("unified writeback close failed: {error}")
+                    })?;
+                    lifecycle_completed.store(true, std::sync::atomic::Ordering::SeqCst);
                 }
             }
 
@@ -1735,21 +1657,30 @@ pub async fn run_server(
     }
     .await;
 
-    let writeback_shutdown = match writeback_for_shutdown {
-        Some(writeback) => writeback
-            .shutdown()
-            .await
-            .context("Failed to shut down persistent writeback"),
-        None => Ok(()),
-    };
-    let sftp_shutdown = match sftp_pool {
-        Some(pool) => {
-            info!("Waiting for SFTP sessions and lifecycle tasks to exit...");
-            pool.shutdown()
+    let writeback_shutdown = if lifecycle_completed_after.load(std::sync::atomic::Ordering::SeqCst)
+    {
+        Ok(())
+    } else {
+        match writeback_for_shutdown {
+            Some(writeback) => writeback
+                .shutdown()
                 .await
-                .context("Failed to shut down SFTP session pool")
+                .context("Failed to shut down persistent writeback"),
+            None => Ok(()),
         }
-        None => Ok(()),
+    };
+    let sftp_shutdown = if lifecycle_completed_after.load(std::sync::atomic::Ordering::SeqCst) {
+        Ok(())
+    } else {
+        match sftp_pool {
+            Some(pool) => {
+                info!("Waiting for SFTP sessions and lifecycle tasks to exit...");
+                pool.shutdown()
+                    .await
+                    .context("Failed to shut down SFTP session pool")
+            }
+            None => Ok(()),
+        }
     };
     let result = finish_process_shutdown(server_result, writeback_shutdown, sftp_shutdown);
     if result.is_ok() {

@@ -103,6 +103,16 @@ impl DurabilityError {
             error => Self::Object(WritebackError::Remote(error)),
         }
     }
+
+    pub(crate) fn from_materialization(error: crate::fs::mutation::types::MutationError) -> Self {
+        use crate::fs::mutation::types::MutationError;
+        match error {
+            MutationError::StaleIncarnation => Self::StaleMutationIncarnation,
+            MutationError::Closed => Self::Closed,
+            MutationError::TooLarge { .. } => Self::Materialization(FsError::NoSpace),
+            MutationError::Poisoned(_) => Self::Materialization(FsError::IoError),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -134,6 +144,18 @@ mod tests {
         let fs = ZeroFS::new_in_memory().await.unwrap();
         let coordinator = FlushCoordinator::new(Arc::clone(&fs.db));
         (fs, coordinator)
+    }
+
+    #[test]
+    fn journal_incarnation_is_distinct_from_mutation_incarnation() {
+        let id = Uuid::nil();
+        assert_eq!(JournalIncarnation::new(id).as_uuid(), id);
+        assert!(matches!(
+            DurabilityError::from_materialization(
+                crate::fs::mutation::types::MutationError::Poisoned("apply failed".into())
+            ),
+            DurabilityError::Materialization(FsError::IoError)
+        ));
     }
 
     #[test]
