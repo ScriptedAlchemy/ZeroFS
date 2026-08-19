@@ -535,6 +535,7 @@ Any Linux-discovered defect starts a new RED/GREEN corrective commit. It must be
 - Modify: `scripts/tests/test_real_world_matrix.py`
 - Modify: `scripts/tests/test_vm100_pilot.py`
 - Modify: `scripts/tests/test_tiered_writeback_e2e.py`
+- Create: `scripts/tests/test_read_throughput_benchmark.py`
 - Modify only after a real RED: production read instrumentation owning the observed failure
 - Receipt: UUID Ubuntu external control root outside Git
 
@@ -635,10 +636,21 @@ Name dependency-free RED tests that reject:
 - short or corrupted reads;
 - internal/mock adapters substituted for kernel NFS, native 9P, `nbd-client`, or OpenSSH SFTP;
 - unexplained one-lane execution, request explosion, dirty state, or incomplete cleanup being counted as a performance pass.
+- failure-path NFS BDI cleanup that does not restore the exact recorded original value.
 
 ```bash
 cd /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback
-python3 -m unittest discover -s scripts/tests -p 'test_*.py' -v
+set -o pipefail
+READ_TEST_LOG="${TMPDIR:-/tmp}/zerofs-read-throughput-red.log"
+if python3 -m unittest discover -s scripts/tests -p 'test_read_throughput_benchmark.py' -v 2>&1 | tee "$READ_TEST_LOG"; then
+  echo 'expected read-throughput RED suite to fail before implementation' >&2
+  exit 1
+fi
+grep -Eq '^Ran [1-9][0-9]* tests? in ' "$READ_TEST_LOG"
+grep -F 'test_missing_benchmark_read_throughput_scenario_is_rejected' "$READ_TEST_LOG"
+grep -F 'test_incomplete_protocol_cache_concurrency_matrix_is_rejected' "$READ_TEST_LOG"
+grep -F 'test_client_page_cache_cannot_masquerade_as_server_ram' "$READ_TEST_LOG"
+grep -F 'test_failed_nfs_readahead_cell_restores_recorded_original' "$READ_TEST_LOG"
 ```
 
 Expected RED: the scenario and shared benchmark module do not exist.
@@ -667,7 +679,7 @@ For the historical seven usable read sessions this is `1,4,7,8`. The harness cal
 For the UUID-isolated NFS mount only, run a diagnostic readahead A/B at the recorded
 kernel default and a larger value derived from the negotiated `rsize`/measured latency.
 Ledger the exact BDI path and original value, restore it in unconditional cleanup, and
-never mutate VM100's production NFS BDI. This A/B distinguishes client RPC depth from
+make both `cleanup` and `assert-clean` reread that exact sysfs path and require byte-for-byte equality with the ledgered original. The dedicated failure-path test kills a scored cell after changing readahead and proves cleanup still restores it. Never mutate VM100's production NFS BDI. This A/B distinguishes client RPC depth from
 shared ZeroFS run serialization; it does not silently turn a host sysctl into the
 product fix.
 
@@ -675,7 +687,7 @@ Cache state must be proven exactly:
 
 - **remote-cold:** fresh UUID process/cache/state roots, zero RAM/SSD clean-cache coverage before the scored read, and positive remote payload reads;
 - **clean-SSD:** populate cold once, prove dirty tiers zero, restart to clear RAM while preserving SSD cache, then require positive local-cache reads and zero remote payload reads;
-- **clean-RAM:** pre-resident exact ranges, then require zero local-device and zero remote payload reads.
+- **clean-RAM:** warm the exact server ranges, invalidate the isolated Linux client cache after the warmup, then require a positive exact NFS READ-byte, 9P Tread-byte, or NBD/server-logical-byte delta for the scored cell while local-device and remote payload reads remain zero. A zero protocol/server-byte delta is a client-cache hit and fails classification.
 
 `fio --invalidate=1` is recorded only as Linux client-page-cache invalidation and never as proof of a ZeroFS-cold server.
 
@@ -688,17 +700,21 @@ Every cell additionally requires exact bytes, protocol-visible SHA-256, unchange
 ```bash
 cd /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback
 python3 -m compileall -q scripts/benchmarking scripts/tiered_writeback_e2e scripts/vm100_pilot scripts/tiered-writeback-e2e.py scripts/vm100-pilot.py
+set -o pipefail
+READ_TEST_LOG="${TMPDIR:-/tmp}/zerofs-read-throughput-green.log"
+python3 -m unittest discover -s scripts/tests -p 'test_read_throughput_benchmark.py' -v 2>&1 | tee "$READ_TEST_LOG"
+grep -Eq '^Ran [1-9][0-9]* tests? in ' "$READ_TEST_LOG"
+grep -F 'test_missing_benchmark_read_throughput_scenario_is_rejected' "$READ_TEST_LOG"
+grep -F 'test_incomplete_protocol_cache_concurrency_matrix_is_rejected' "$READ_TEST_LOG"
+grep -F 'test_client_page_cache_cannot_masquerade_as_server_ram' "$READ_TEST_LOG"
+grep -F 'test_failed_nfs_readahead_cell_restores_recorded_original' "$READ_TEST_LOG"
 python3 -m unittest discover -s scripts/tests -p 'test_*.py' -v
 git diff --check
-git add scripts/benchmarking/__init__.py scripts/benchmarking/read_matrix.py scripts/benchmarking/raw_sftp.py scripts/tiered_writeback_e2e/read_benchmark.py scripts/tiered_writeback_e2e/protocols.py scripts/tiered_writeback_e2e/integrity.py scripts/tiered_writeback_e2e/resources.py scripts/tiered-writeback-e2e.py scripts/vm100_pilot/real_world_matrix.py scripts/vm100_pilot/raw_sftp.py scripts/tests/test_real_world_matrix.py scripts/tests/test_vm100_pilot.py scripts/tests/test_tiered_writeback_e2e.py
+git add scripts/benchmarking/__init__.py scripts/benchmarking/read_matrix.py scripts/benchmarking/raw_sftp.py scripts/tiered_writeback_e2e/read_benchmark.py scripts/tiered_writeback_e2e/protocols.py scripts/tiered_writeback_e2e/integrity.py scripts/tiered_writeback_e2e/resources.py scripts/tiered-writeback-e2e.py scripts/vm100_pilot/real_world_matrix.py scripts/vm100_pilot/raw_sftp.py scripts/tests/test_real_world_matrix.py scripts/tests/test_vm100_pilot.py scripts/tests/test_tiered_writeback_e2e.py scripts/tests/test_read_throughput_benchmark.py
 git commit -m "bench: compare cache-matched protocol reads"
 ```
 
-After review/push/synchronization, run:
-
-```bash
-sudo python3 scripts/tiered-writeback-e2e.py run --ledger "$LEDGER" --filesystem-ack-mode volatile_memory --object-ack-mode ssd --scenario benchmark-read-throughput --control-receipt "$MATERIALIZED_RECEIPT"
-```
+Do not run a post-commit read benchmark from C7: its setup ledgers have already been cleaned and it owns no surviving materialized-control receipt. C8 is the sole execution authority for the paired read benchmark and creates fresh control and candidate ledgers after review, push, and literal-SHA synchronization.
 
 The existing historical NBD/raw-SFTP scripts remain developer controls, not final acceptance authority. No previously reported NFS/9P number is accepted unless reproduced by this committed ledgered runner.
 
@@ -832,14 +848,20 @@ Run the paired read benchmark separately because the candidate must consume the
 immutable materialized-control receipt:
 
 ```bash
+READ_PAIR_UUID="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+READ_PAIR_ROOT="/var/tmp/zerofs-tiered-read-pair-${READ_PAIR_UUID}"
+install -d -m 0700 "$READ_PAIR_ROOT"
 READ_CONTROL_UUID="$(python3 -c 'import uuid; print(uuid.uuid4())')"
 READ_CONTROL_ROOT="/var/tmp/zerofs-tiered-control-${READ_CONTROL_UUID}"
 READ_CONTROL_RESOURCES="/var/tmp/zerofs-tiered-resources-${READ_CONTROL_UUID}"
 READ_CONTROL_LEDGER="${READ_CONTROL_ROOT}/ledger.json"
 sudo python3 scripts/tiered-writeback-e2e.py setup --ledger "$READ_CONTROL_LEDGER" --control-root "$READ_CONTROL_ROOT" --resource-root "$READ_CONTROL_RESOURCES" --source-sha "$FINAL_PROOF_SHA" --filesystem-ack-mode materialized --object-ack-mode ssd
 sudo python3 scripts/tiered-writeback-e2e.py run --ledger "$READ_CONTROL_LEDGER" --filesystem-ack-mode materialized --object-ack-mode ssd --scenario benchmark-read-throughput
-MATERIALIZED_RECEIPT="$(python3 scripts/tiered-writeback-e2e.py ledger-value --ledger "$READ_CONTROL_LEDGER" --key latest_receipt)"
-test -s "$MATERIALIZED_RECEIPT"
+MATERIALIZED_SOURCE_RECEIPT="$(python3 scripts/tiered-writeback-e2e.py ledger-value --ledger "$READ_CONTROL_LEDGER" --key latest_receipt)"
+test -s "$MATERIALIZED_SOURCE_RECEIPT"
+MATERIALIZED_RECEIPT="$READ_PAIR_ROOT/materialized-control.json"
+install -m 0600 "$MATERIALIZED_SOURCE_RECEIPT" "$MATERIALIZED_RECEIPT"
+test "$(sha256sum "$MATERIALIZED_SOURCE_RECEIPT" | awk '{print $1}')" = "$(sha256sum "$MATERIALIZED_RECEIPT" | awk '{print $1}')"
 sudo python3 scripts/tiered-writeback-e2e.py cleanup --ledger "$READ_CONTROL_LEDGER"
 sudo python3 scripts/tiered-writeback-e2e.py cleanup --ledger "$READ_CONTROL_LEDGER"
 sudo python3 scripts/tiered-writeback-e2e.py assert-clean --ledger "$READ_CONTROL_LEDGER"
@@ -853,6 +875,9 @@ sudo python3 scripts/tiered-writeback-e2e.py run --ledger "$READ_CANDIDATE_LEDGE
 sudo python3 scripts/tiered-writeback-e2e.py cleanup --ledger "$READ_CANDIDATE_LEDGER"
 sudo python3 scripts/tiered-writeback-e2e.py cleanup --ledger "$READ_CANDIDATE_LEDGER"
 sudo python3 scripts/tiered-writeback-e2e.py assert-clean --ledger "$READ_CANDIDATE_LEDGER"
+rm "$MATERIALIZED_RECEIPT"
+rmdir "$READ_PAIR_ROOT"
+test ! -e "$READ_PAIR_ROOT"
 ```
 
 No command in this step runs on macOS. Any correction repeats portable GREEN, exact commit/review, push, literal-SHA synchronization, and this affected Linux command.

@@ -1166,7 +1166,7 @@ Cover accepted/materialized sequence and lag, raw bytes/ops/age, active material
 
 Subscribe to lifecycle state and snapshots. Document materialized default, explicit RAM-loss boundary, protocol durability semantics, namespace separation, legacy migration, sizing, metrics, and explicit remote flush. Do not edit the approved spec.
 
-- [ ] **Step 3: Run Plan A gate and commit**
+- [ ] **Step 3: Run the pre-read composition gate and commit**
 
 ```bash
 cd /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback/zerofs
@@ -1188,6 +1188,7 @@ Expected: the old NBD overlay is absent; generated config remains materialized; 
 
 **Files:**
 - Modify: `zerofs/src/fs/store/extent/read.rs`
+- Create: `zerofs/src/fs/store/extent/read/run_fetch.rs`
 - Create: `zerofs/src/fs/store/extent/read/tests.rs`
 - Create: `zerofs/src/fs/store/extent/read/metrics.rs`
 
@@ -1195,9 +1196,9 @@ Expected: the old NBD overlay is absent; generated config remains materialized; 
 - Produces: an ordered read-run plan, bounded concurrent fetch of independent immutable on-store segment runs, and bounded-cardinality logical/read-run utilization metrics.
 - Consumes: the existing extent-location range scan, decoded/open-buffer fast paths, `SegmentStore::read_run`, stale-location re-resolution, nomination/crossing accounting, and the existing `PARALLEL_EXTENT_OPS` bound.
 
-- [ ] **Step 1: Split the existing tests without behavior change**
+- [ ] **Step 1: Split the existing tests and production worker without behavior change**
 
-Move the inline `read.rs` test module to `read/tests.rs` before adding behavior. Keep production below 600 lines and source plus tests below 1000 lines per file. Run the complete existing module gate and require a nonzero pass count.
+Move the inline `read.rs` test module to `read/tests.rs` before adding behavior. Extract the existing maximal-run planning and run-fetch control flow from the current `read_range` body into `read/run_fetch.rs`; `read_range` remains a facade that performs validation, delegates planning/fetch, and assembles the result. No async function may exceed 100 lines, `read.rs` and `run_fetch.rs` must each remain below 600 production lines, and source plus tests remain below 1000 lines per file. Run the complete existing module gate and require a nonzero pass count.
 
 ```bash
 cd /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback/zerofs
@@ -1219,6 +1220,28 @@ Name tests:
 
 Use a latency-gated, peak-concurrency-counting real `ObjectStore` test seam behind the production extent/segment path. Build a logically sequential file whose adjacent extents occupy at least eight independent segment runs. Before releasing any GET, require at least two and at most `PARALLEL_EXTENT_OPS` backend reads to have started. Verify exact bytes and the exact run count. Current code is RED because `read_range` awaits each on-store run before starting the next.
 
+List every fully qualified test first, then run each exact test against the pre-fix implementation and require a failing exit. A missing test or zero selected tests fails the RED gate.
+
+```bash
+cd /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback/zerofs
+READ_TEST_PREFIX='fs::store::extent::read::tests::'
+cargo test -p zerofs --locked -- --list 2>&1 | tee "${TMPDIR:-/tmp}/zerofs-read-red-list.log"
+for name in \
+  one_fragmented_read_fetches_independent_runs_concurrently \
+  fragmented_read_concurrency_is_bounded \
+  fragmented_read_preserves_logical_output_order \
+  contiguous_control_remains_one_ranged_get \
+  stale_location_fallback_remains_correct_under_concurrency \
+  failed_fragmented_read_releases_every_fetch_permit
+do
+  grep -F "${READ_TEST_PREFIX}${name}: test" "${TMPDIR:-/tmp}/zerofs-read-red-list.log"
+  if cargo test -p zerofs --locked "${READ_TEST_PREFIX}${name}" -- --exact --nocapture; then
+    echo "expected RED but ${name} passed" >&2
+    exit 1
+  fi
+done
+```
+
 - [ ] **Step 3: Implement the minimum shared read fix**
 
 Resolve and coalesce the existing maximal runs first. Serve decoded/open-buffer runs through their current fast paths. Fetch independent immutable on-store runs with bounded ordered concurrency, then assemble results in logical order. Preserve:
@@ -1239,17 +1262,30 @@ internals.
 
 Do not change NFS framing, SFTP packet geometry, cache policy, write acknowledgement, durability, or object layout in this task. Further NFS copy/framing work requires a separate measured RED after this shared fix.
 
-- [ ] **Step 4: Run GREEN, parity, and exact-fence commit**
+- [ ] **Step 4: Run exact GREEN, the final Plan A/workspace gate, and exact-fence commit**
 
 ```bash
 cd /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback/zerofs
+READ_TEST_PREFIX='fs::store::extent::read::tests::'
+for name in \
+  one_fragmented_read_fetches_independent_runs_concurrently \
+  fragmented_read_concurrency_is_bounded \
+  fragmented_read_preserves_logical_output_order \
+  contiguous_control_remains_one_ranged_get \
+  stale_location_fallback_remains_correct_under_concurrency \
+  failed_fragmented_read_releases_every_fetch_permit
+do
+  cargo_test_nonzero "${READ_TEST_PREFIX}${name}" -p zerofs --locked
+done
 cargo_test_nonzero 'fs::store::extent::read::tests' -p zerofs --locked
 cargo_test_nonzero 'fs::ops::io::tests' -p zerofs --locked
 cargo_test_nonzero 'segment_store::tests' -p zerofs --locked
-cargo clippy -p zerofs --lib --locked -- -D warnings
 cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --all-targets --locked
+cargo check -p ninep-client --target wasm32-unknown-unknown --locked
 git diff --check
-git add zerofs/src/fs/store/extent/read.rs zerofs/src/fs/store/extent/read/tests.rs zerofs/src/fs/store/extent/read/metrics.rs
+git add zerofs/src/fs/store/extent/read.rs zerofs/src/fs/store/extent/read/run_fetch.rs zerofs/src/fs/store/extent/read/tests.rs zerofs/src/fs/store/extent/read/metrics.rs
 git commit -m "perf(read): pipeline fragmented segment runs"
 ```
 

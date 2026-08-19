@@ -67,8 +67,7 @@ Plan A — shared filesystem mutation and protocol durability
   -> A15 9P/direct/RPC/WebUI composition
   -> A16 additive nfsserve fork API
   -> A17 ZeroFS NFS composition
-  -> A18 metrics/status/docs
-  -> A19 bounded fragmented-read fanout
+  -> A18 metrics/status/docs and pre-read composition gate
              |
              v
 Plan B — paced SSD admission
@@ -79,6 +78,10 @@ Plan B — paced SSD admission
   -> B5 paced credits + physical refresher
   -> B6 atomic multipart reservation promotion
   -> B7 pacing metrics/docs
+             |
+             v
+Plan A read extension — after pacing ownership is stable
+ A19 bounded fragmented-read fanout + final Plan A/workspace gate
              |
              v
 Plan C — proof, cleanup, quality, and integration
