@@ -265,7 +265,9 @@ impl SegmentStore {
         first_frame: u32,
         slots: &[(InodeId, u64)],
     ) -> Result<Vec<Bytes>> {
-        let region = self.read_run_region(segid, byte_offset, byte_len).await?;
+        let region = self
+            .read_run_region(segid, byte_offset, byte_len, true)
+            .await?;
         let frames = crate::segment::read_frames_from_region(
             &self.codec,
             &region,
@@ -285,8 +287,11 @@ impl SegmentStore {
         byte_len: u32,
         first_frame: u32,
         slots: &[(InodeId, u64)],
+        cache: bool,
     ) -> Result<Vec<Compressed>> {
-        let region = self.read_run_region(segid, byte_offset, byte_len).await?;
+        let region = self
+            .read_run_region(segid, byte_offset, byte_len, cache)
+            .await?;
         Ok(crate::segment::read_compressed_frames_from_region(
             &self.codec,
             &region,
@@ -303,15 +308,39 @@ impl SegmentStore {
         segid: Segid,
         byte_offset: u64,
         byte_len: u32,
+        cache: bool,
     ) -> Result<Bytes> {
         let path = Path::from(segid.object_key());
         let region = self
-            .object_store
-            .get_range(&path, byte_offset..byte_offset + byte_len as u64)
-            .await
-            .map_err(|e| SegmentStoreError::ObjectStore(e.to_string()))?;
+            .get_object_range(&path, byte_offset..byte_offset + byte_len as u64, cache)
+            .await?;
         self.read_calls.fetch_add(1, Ordering::Relaxed);
         Ok(region)
+    }
+
+    async fn get_object_range(
+        &self,
+        path: &Path,
+        range: std::ops::Range<u64>,
+        cache: bool,
+    ) -> Result<Bytes> {
+        let mut opts = GetOptions {
+            range: Some(GetRange::Bounded(range)),
+            ..Default::default()
+        };
+        if !cache {
+            opts.extensions
+                .insert(crate::object_store_prefetch::SkipPartsCache);
+        }
+        let result = self
+            .object_store
+            .get_opts(path, opts)
+            .await
+            .map_err(|e| SegmentStoreError::ObjectStore(e.to_string()))?;
+        result
+            .bytes()
+            .await
+            .map_err(|e| SegmentStoreError::ObjectStore(e.to_string()))
     }
 }
 
@@ -375,19 +404,22 @@ impl SegmentStore {
 
     /// Read and decrypt a segment's reverse-map directory (which frame backs
     /// which logical block), for the coalescer.
-    pub async fn read_directory(&self, segid: Segid) -> Result<Vec<DirEntry>> {
+    pub async fn read_directory(&self, segid: Segid, cache: bool) -> Result<Vec<DirEntry>> {
         let path = Path::from(segid.object_key());
         // Fetch just the footer (last FOOTER_LEN bytes) to locate the directory,
         // then a ranged GET of the directory itself — never the whole object.
+        let mut footer_opts = GetOptions {
+            range: Some(GetRange::Suffix(crate::segment::FOOTER_LEN as u64)),
+            ..Default::default()
+        };
+        if !cache {
+            footer_opts
+                .extensions
+                .insert(crate::object_store_prefetch::SkipPartsCache);
+        }
         let footer_res = self
             .object_store
-            .get_opts(
-                &path,
-                GetOptions {
-                    range: Some(GetRange::Suffix(crate::segment::FOOTER_LEN as u64)),
-                    ..Default::default()
-                },
-            )
+            .get_opts(&path, footer_opts)
             .await
             .map_err(|e| match e {
                 slatedb::object_store::Error::NotFound { .. } => SegmentStoreError::NotFound,
@@ -410,13 +442,12 @@ impl SegmentStore {
             .into());
         }
         let dir_bytes = self
-            .object_store
-            .get_range(
+            .get_object_range(
                 &path,
                 meta.dir_offset..meta.dir_offset + meta.dir_len as u64,
+                cache,
             )
-            .await
-            .map_err(|e| SegmentStoreError::ObjectStore(e.to_string()))?;
+            .await?;
         Ok(crate::segment::decode_directory(
             &self.codec,
             &dir_bytes,

@@ -8,6 +8,7 @@ pub mod fs;
 pub mod length_checked_object_store;
 // The library target does not compile the 9P server, so its 9P-only entries
 // are intentionally unused here; the binary target consumes the full table.
+pub mod alloc_rss;
 #[allow(dead_code)]
 mod linux_errno;
 pub mod metadata_digest;
