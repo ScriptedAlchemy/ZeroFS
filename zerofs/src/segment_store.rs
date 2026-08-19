@@ -20,7 +20,7 @@ use slatedb::object_store::{
 use crate::frame_codec::{Compressed, FrameCodec};
 use crate::fs::inode::InodeId;
 use crate::segment::{
-    DirEntry, FOOTER_LEN, FrameLoc, LEN_PREFIX, Segid, SegmentBuilder, SegmentError,
+    DirEntry, FOOTER_LEN, FooterMeta, FrameLoc, LEN_PREFIX, Segid, SegmentBuilder, SegmentError,
     SegmentFormatLimits, seal_compressed_batch,
 };
 
@@ -575,47 +575,8 @@ impl SegmentStore {
     /// which logical block), for the coalescer. GC/compaction-only, so the
     /// reads bypass the user parts cache.
     pub async fn read_directory(&self, segid: Segid) -> Result<Vec<DirEntry>> {
-        let path = Path::from(segid.object_key());
-        // Fetch just the footer (last FOOTER_LEN bytes) to locate the directory,
-        // then a ranged GET of the directory itself — never the whole object.
-        let mut footer_opts = GetOptions {
-            range: Some(GetRange::Suffix(crate::segment::FOOTER_LEN as u64)),
-            ..Default::default()
-        };
-        footer_opts
-            .extensions
-            .insert(crate::object_store_prefetch::SkipPartsCache);
-        let footer_res = self
-            .object_store
-            .get_opts(&path, footer_opts)
-            .await
-            .map_err(|e| match e {
-                slatedb::object_store::Error::NotFound { .. } => SegmentStoreError::NotFound,
-                other => SegmentStoreError::ObjectStore(other.to_string()),
-            })?;
-        let object_size = footer_res.meta.size;
-        let footer = footer_res
-            .bytes()
-            .await
-            .map_err(|e| SegmentStoreError::ObjectStore(e.to_string()))?;
-        let meta = crate::segment::parse_footer(&footer, object_size)?;
-        // Defense-in-depth: a misdirected read returning a different
-        // (self-consistent) segment would feed the wrong directory into the
-        // coalescer.
-        if meta.segid != segid {
-            return Err(crate::segment::SegmentError::SegidMismatch {
-                expected: segid,
-                found: meta.segid,
-            }
-            .into());
-        }
-        let dir_bytes = self
-            .get_object_range(
-                &path,
-                meta.dir_offset..meta.dir_offset + meta.dir_len as u64,
-                false,
-            )
-            .await?;
+        let (footer, meta, dir_bytes) =
+            fetch_footer_and_dir_bytes(&self.object_store, segid).await?;
         Ok(crate::segment::decode_directory(
             &self.codec,
             &dir_bytes,
@@ -623,6 +584,64 @@ impl SegmentStore {
             &meta,
         )?)
     }
+}
+
+/// Fetch a segment's footer (suffix GET) and its directory (ranged GET) —
+/// never the whole object — verifying the footer names `segid` before the
+/// directory offset is trusted. Maintenance/verify-only, so both reads bypass
+/// the user parts cache. Footer NotFound maps to
+/// [`SegmentStoreError::NotFound`].
+async fn fetch_footer_and_dir_bytes(
+    object_store: &Arc<dyn ObjectStore>,
+    segid: Segid,
+) -> Result<(Bytes, FooterMeta, Bytes)> {
+    let path = Path::from(segid.object_key());
+    let mut footer_opts = GetOptions {
+        range: Some(GetRange::Suffix(FOOTER_LEN as u64)),
+        ..Default::default()
+    };
+    footer_opts
+        .extensions
+        .insert(crate::object_store_prefetch::SkipPartsCache);
+    let footer_res = object_store
+        .get_opts(&path, footer_opts)
+        .await
+        .map_err(|e| match e {
+            slatedb::object_store::Error::NotFound { .. } => SegmentStoreError::NotFound,
+            other => SegmentStoreError::ObjectStore(other.to_string()),
+        })?;
+    let object_size = footer_res.meta.size;
+    let footer = footer_res
+        .bytes()
+        .await
+        .map_err(|e| SegmentStoreError::ObjectStore(e.to_string()))?;
+    let meta = crate::segment::parse_footer(&footer, object_size)?;
+    // Defense-in-depth: a misdirected read returning a different
+    // (self-consistent) segment would feed the wrong directory to the caller.
+    if meta.segid != segid {
+        return Err(SegmentError::SegidMismatch {
+            expected: segid,
+            found: meta.segid,
+        }
+        .into());
+    }
+    let mut dir_opts = GetOptions {
+        range: Some(GetRange::Bounded(
+            meta.dir_offset..meta.dir_offset + meta.dir_len as u64,
+        )),
+        ..Default::default()
+    };
+    dir_opts
+        .extensions
+        .insert(crate::object_store_prefetch::SkipPartsCache);
+    let dir_bytes = object_store
+        .get_opts(&path, dir_opts)
+        .await
+        .map_err(|e| SegmentStoreError::ObjectStore(e.to_string()))?
+        .bytes()
+        .await
+        .map_err(|e| SegmentStoreError::ObjectStore(e.to_string()))?;
+    Ok((footer, meta, dir_bytes))
 }
 
 /// A shipped frame, for the HA standby to rebuild an un-PUT segment on takeover.
@@ -646,36 +665,7 @@ async fn verify_existing_recon_segment(
     frames: &[ReconFrame],
 ) -> Result<()> {
     let path = Path::from(segid.object_key());
-    let footer_result = object_store
-        .get_opts(
-            &path,
-            GetOptions {
-                range: Some(GetRange::Suffix(FOOTER_LEN as u64)),
-                ..Default::default()
-            },
-        )
-        .await
-        .map_err(|e| SegmentStoreError::ObjectStore(e.to_string()))?;
-    let object_size = footer_result.meta.size;
-    let footer = footer_result
-        .bytes()
-        .await
-        .map_err(|e| SegmentStoreError::ObjectStore(e.to_string()))?;
-    let meta = crate::segment::parse_footer(&footer, object_size)?;
-    if meta.segid != segid {
-        return Err(SegmentError::SegidMismatch {
-            expected: segid,
-            found: meta.segid,
-        }
-        .into());
-    }
-    let dir_bytes = object_store
-        .get_range(
-            &path,
-            meta.dir_offset..meta.dir_offset + meta.dir_len as u64,
-        )
-        .await
-        .map_err(|e| SegmentStoreError::ObjectStore(e.to_string()))?;
+    let (footer, meta, dir_bytes) = fetch_footer_and_dir_bytes(object_store, segid).await?;
     let dir: HashSet<_> = crate::segment::decode_directory(codec, &dir_bytes, &footer, &meta)?
         .into_iter()
         .map(|entry| (entry.byte_offset, entry.len, entry.inode, entry.extent))

@@ -278,7 +278,10 @@ mod tests {
         let gate = Hysteresis::new();
         let cap = 1000;
         assert!(!gate.check(cap, 940), "below resume: admitting");
-        assert!(!gate.check(cap, 990), "band while untripped: still admitting");
+        assert!(
+            !gate.check(cap, 990),
+            "band while untripped: still admitting"
+        );
         assert!(gate.check(cap, 1000), "at cap: tripped");
         assert!(gate.check(cap, 990), "band while tripped: still braking");
         assert!(!gate.check(cap, 949), "below resume: released");
