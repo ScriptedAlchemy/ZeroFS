@@ -121,7 +121,7 @@ For each planned file, the client:
 6. writes each buffer at its absolute offset with `File::write_at`, with at most
    two active writes on either session;
 7. updates the active file bar after each acknowledged chunk and advances the
-   monotonic aggregate only when that file is durably published;
+   monotonic aggregate only when that file is successfully published;
 8. verifies each session's acknowledged-write lineage through its open fid;
 9. renames the temporary file over the exact destination path;
 10. runs the primary client's filesystem-wide sync to verify the namespace
@@ -196,7 +196,7 @@ aggregate bar plus one bar for each active file:
 - completed and total file count.
 
 An active per-file byte counter advances only after the corresponding
-destination write succeeds. The aggregate accounts only durably published or
+destination write succeeds. The aggregate accounts only successfully published or
 size-skipped files, never moves backward across retries, and excludes skipped
 bytes from transfer-rate calculation. A per-file bar remains active through
 publication and durability, then disappears before the aggregate completed-file

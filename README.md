@@ -123,7 +123,7 @@ default upload bound is therefore 16 sessions and about 288 MiB of chunk
 buffers when all eight files are at least 36 MiB; higher `--jobs` values raise
 both bounds. Downloads use one session per worker. Active-file bars show
 acknowledged bytes, rate, and ETA. The aggregate advances only when a file is
-durably published or size-skipped, so it is monotonic across retries.
+successfully published or size-skipped, so it is monotonic across retries.
 Non-interactive completion and retry events are emitted in deterministic
 planned-file order.
 
