@@ -72,7 +72,11 @@ const MAX_SEGMENT_DELETES_PER_PASS: usize = 1024;
 /// streamed through gaps widened by that coalescing.
 const MAX_VERIFY_SCANS: usize = 32;
 const MAX_VERIFY_SCAN_RANGES: usize = MAX_VERIFY_SCANS / 2;
-const MAX_VERIFY_ROWS: usize = 4096;
+// A full 256 MiB segment contains 8,192 32 KiB extent frames. Verification
+// reads both memory and durable views, so 16,384 wanted rows are legitimate.
+// Leave another 3x that amount for unrelated rows inside coalesced sparse gaps,
+// while retaining a finite fail-closed ceiling.
+const MAX_VERIFY_ROWS: usize = 65_536;
 const MAX_VERIFY_ENCODED_BYTES: usize = 64 * 1024 * 1024;
 
 /// Orphan-sweep age floor: an uncounted segment object must have been PUT at
@@ -1314,6 +1318,82 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn full_256mib_directory_reclaims_after_memory_and_durable_verification() {
+        const FULL_SEGMENT_FRAMES: usize = (256 * 1024 * 1024) / EXTENT_SIZE;
+        let (writer, db, object_store) = make_with_compression(CompressionConfig::Lz4).await;
+        let extent = Bytes::from(vec![0x5a; EXTENT_SIZE]);
+        let frames: Vec<_> = (0..FULL_SEGMENT_FRAMES as u64)
+            .map(|slot| (1, slot, extent.clone()))
+            .collect();
+        assert_eq!(
+            frames.len(),
+            8192,
+            "fixture must cover a full 256 MiB segment"
+        );
+        let locs = writer.segments.seal(&frames).await.unwrap();
+        let segid = locs[0].2.segid;
+        let total = locs.iter().map(|(_, _, loc)| u64::from(loc.byte_len)).sum();
+
+        // Restart at a newer epoch, mark the sealed segment dead, and point all
+        // of its logical extents at another segment in a durable commit. The
+        // verifier must scan both views without mistaking the supported full
+        // directory for budget exhaustion.
+        let store = make_store(object_store, db.clone(), CompressionConfig::Lz4, 8);
+        let other = Segid::new(99, 2);
+        let mut txn = db.new_transaction().unwrap();
+        txn.put_bytes(
+            &store.key_codec.segcount_key(segid.epoch, segid.counter),
+            KeyCodec::encode_segcount(0, total),
+        );
+        for (frame_index, (_, logical_extent, _)) in locs.iter().enumerate() {
+            txn.put_bytes(
+                &store.key_codec.extent_key(1, *logical_extent),
+                test_frame_loc(other, frame_index as u32),
+            );
+        }
+        commit(&store, txn).await;
+        db.flush().await.unwrap();
+
+        let memory_before = db.scan_call_count();
+        let durable_before = db.durable_scan_call_count();
+        let points_before = db.point_read_call_count();
+        let (deleted, _) = store.reclaim_segments(Utc::now(), None).await.unwrap();
+        let memory_scans = db.scan_call_count() - memory_before;
+        let durable_scans = db.durable_scan_call_count() - durable_before;
+
+        assert_eq!(
+            deleted, 1,
+            "a dead full-size segment must remain reclaimable"
+        );
+        assert!(
+            !store
+                .segments
+                .list_segments()
+                .await
+                .unwrap()
+                .contains(&segid),
+            "the verified dead full-size segment must be deleted"
+        );
+        assert!(
+            memory_scans > 0,
+            "reclaim must verify the current memory view"
+        );
+        assert!(
+            durable_scans > 0,
+            "reclaim must also verify the durable view"
+        );
+        assert!(
+            memory_scans + durable_scans <= MAX_VERIFY_SCANS,
+            "full-size verification must honor the combined scan budget"
+        );
+        assert_eq!(
+            db.point_read_call_count() - points_before,
+            0,
+            "full-size verification must not regress to per-frame point reads"
+        );
+    }
+
     async fn dead_sparse_segment_with_gap_rows(
         gap_rows: impl IntoIterator<Item = (u64, Bytes)>,
     ) -> (ExtentStore, Segid) {
@@ -1345,7 +1425,7 @@ mod tests {
     #[tokio::test]
     async fn directory_verify_row_budget_exhaustion_keeps_segment_and_blocks_delete() {
         let other = Segid::new(99, 1);
-        let rows = (1..=4097u64).map(|extent| {
+        let rows = (1..=65_537u64).map(|extent| {
             (
                 extent,
                 test_frame_loc(other, u32::try_from(extent).unwrap()),
