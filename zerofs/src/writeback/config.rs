@@ -195,14 +195,12 @@ const fn default_resume_percent() -> u8 {
     85
 }
 
-// Deliberately below the SFTP transport's 7-stream write budget: backends
-// cap concurrent SSH sessions per account (Hetzner Storage Boxes ~10), and
-// the pool's uploads share that budget with reads, control traffic, and
-// stale sessions a crashed predecessor left behind. Four upload lanes keep
-// replay pipelined without pressing the cap; deployments with headroom opt
-// into more via `upload_concurrency`.
+// Fill the SFTP write-stream budget. Per-session russh-sftp now pipelines 64
+// WRITE requests, so the leftover default of 4 upload lanes was leaving
+// remote publication idle. Seven lanes still sit under the 8-session account
+// cap and leave one slot for reads/control.
 const fn default_upload_concurrency() -> usize {
-    4
+    7
 }
 
 const fn default_local_concurrency() -> usize {

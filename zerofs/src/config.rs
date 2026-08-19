@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::fmt;
 use std::fs;
 use std::net::{IpAddr, SocketAddr};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// Compression algorithm configuration for extent data.
 /// Supports lz4 and zstd.
@@ -167,10 +167,6 @@ pub struct Settings {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct SftpConfig {
-    /// OpenSSH-compatible client executable. The default resolves stock `ssh`
-    /// through `PATH`; an override must be an absolute, pinned executable.
-    #[serde(default = "default_sftp_ssh_program")]
-    pub ssh_program: PathBuf,
     /// Private key used for non-interactive public-key authentication.
     #[serde(
         default = "default_sftp_identity_file",
@@ -247,7 +243,6 @@ impl From<SftpDataProfile> for StoreProfile {
 impl Default for SftpConfig {
     fn default() -> Self {
         Self {
-            ssh_program: default_sftp_ssh_program(),
             identity_file: default_sftp_identity_file(),
             known_hosts: default_sftp_known_hosts(),
             max_connections: default_sftp_max_connections(),
@@ -264,11 +259,6 @@ impl SftpConfig {
     pub const MAX_DIRECTION_CONCURRENCY: usize = 7;
 
     fn validate(&self) -> Result<()> {
-        if self.ssh_program != Path::new("ssh") && !self.ssh_program.is_absolute() {
-            anyhow::bail!(
-                "[sftp] ssh_program must be the default `ssh` or an absolute executable path"
-            );
-        }
         if self.identity_file.to_string_lossy().trim().is_empty() {
             anyhow::bail!("[sftp] identity_file must name a private SSH key");
         }
@@ -322,10 +312,6 @@ impl SftpConfig {
             read_fetch_window_max_bytes: self.segment_size_mib * 1024 * 1024,
         }
     }
-}
-
-fn default_sftp_ssh_program() -> PathBuf {
-    PathBuf::from("ssh")
 }
 
 fn default_sftp_known_hosts() -> PathBuf {
@@ -1851,9 +1837,6 @@ impl Settings {
         toml_string
             .push_str("# Passwords in SFTP URLs are rejected; use SSH key authentication.\n");
         toml_string.push_str("# [sftp]\n");
-        toml_string.push_str(
-            "# ssh_program = \"/absolute/path/to/ssh\"  # Optional OpenSSH-compatible client\n",
-        );
         toml_string.push_str("# identity_file = \"${HOME}/.ssh/id_ed25519\"\n");
         toml_string.push_str("# known_hosts = \"${HOME}/.ssh/known_hosts\"\n");
         toml_string.push_str("# max_connections = 8\n");
@@ -1878,7 +1861,7 @@ impl Settings {
         toml_string.push_str("# resume_percent = 85\n");
         toml_string.push_str("# local_concurrency = 4\n");
         toml_string.push_str(
-            "# upload_concurrency = 4         # keep total sessions inside the backend's concurrent-connection cap\n",
+            "# upload_concurrency = 7         # fill the SFTP write-stream budget; per-session writes pipeline to 64\n",
         );
         toml_string.push_str("# shutdown_flush = \"local\"       # local | remote\n");
 
@@ -2441,16 +2424,16 @@ min_free_gb = 256.0"#,
             .unwrap();
         // Memory acknowledgement is the point of the tier: bursts land at RAM
         // speed while client flush barriers still force SSD durability. The
-        // default upload concurrency stays deliberately below the SFTP
-        // write-stream budget so total session demand keeps clear of backend
-        // concurrent-connection caps.
+        // default upload concurrency fills the SFTP write-stream budget.
+        // Per-session WRITE pipelining is 64; the leftover default of 4
+        // upload lanes is not preserved.
         assert_eq!(
             writeback.ack_mode,
             crate::writeback::config::AckMode::Memory
         );
         assert_eq!(writeback.disk_bytes, 512_000_000_000);
         assert_eq!(writeback.local_concurrency, 4);
-        assert_eq!(writeback.upload_concurrency, 4);
+        assert_eq!(writeback.upload_concurrency, 7);
     }
 
     #[test]
@@ -2684,7 +2667,6 @@ min_free_gb = 256.0"#,
         let settings = write_and_load(&sftp_config("sftp://alice@example.com/data", "")).unwrap();
         let sftp = settings.sftp.as_ref().expect("effective SFTP defaults");
 
-        assert_eq!(sftp.ssh_program, PathBuf::from("ssh"));
         assert!(sftp.identity_file.ends_with(".ssh/id_ed25519"));
         assert!(sftp.known_hosts.ends_with(".ssh/known_hosts"));
         assert_eq!(sftp.max_connections, 8);
@@ -2699,22 +2681,13 @@ min_free_gb = 256.0"#,
         assert_eq!(endpoint.port, 22);
 
         let rendered = Settings::render_default_config().unwrap();
-        assert!(rendered.contains("# ssh_program = \"/absolute/path/to/ssh\""));
-    }
-
-    #[test]
-    fn sftp_accepts_an_absolute_openssh_compatible_program() {
-        let settings = write_and_load(&sftp_config(
-            "sftp://alice@example.com/data",
-            r#"[sftp]
-ssh_program = "/opt/hpnssh/bin/hpnssh"
-known_hosts = "/tmp/known_hosts""#,
-        ))
-        .unwrap();
-
-        assert_eq!(
-            settings.sftp.unwrap().ssh_program,
-            PathBuf::from("/opt/hpnssh/bin/hpnssh")
+        assert!(
+            rendered.contains("# identity_file = \"${HOME}/.ssh/id_ed25519\""),
+            "generated config must document native key auth"
+        );
+        assert!(
+            !rendered.contains("ssh_program"),
+            "native russh transport must not advertise an OpenSSH wrapper"
         );
     }
 
@@ -2924,16 +2897,6 @@ known_hosts = "${ZEROFS_TEST_KNOWN_HOSTS}""#,
                 write_and_load(&sftp_config("sftp://alice@example.com/data", &extra)).unwrap_err()
             );
             assert!(err.contains(expected), "limits {limits:?}: got {err}");
-        }
-    }
-
-    #[test]
-    fn sftp_rejects_empty_or_relative_ssh_program() {
-        for program in ["", "hpnssh"] {
-            let extra = format!("[sftp]\nssh_program = {program:?}");
-            let error =
-                write_and_load(&sftp_config("sftp://alice@example.com/data", &extra)).unwrap_err();
-            assert!(error.to_string().contains("ssh_program"));
         }
     }
 
