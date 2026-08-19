@@ -53,13 +53,9 @@ pub struct WritebackConfig {
     pub high_watermark_percent: u8,
     #[serde(default = "default_resume_percent")]
     pub resume_percent: u8,
-    /// Concurrent remote uploads. Defaults conservatively (clamped to
-    /// `[sftp] write_concurrency`) so the pool's total session demand stays
-    /// well inside backend concurrent-connection caps — Hetzner Storage
-    /// Boxes allow around ten per account, stale sessions from a previous
-    /// crash still count until the server reaps them, and reads need
-    /// sessions too. Raise this toward `[sftp] write_concurrency` only when
-    /// the backend's budget accommodates it.
+    /// Concurrent remote uploads. Defaults to four for generic backends. SFTP
+    /// defaults to seven, clamped to `[sftp] write_concurrency`, so its default
+    /// eight-session pool retains one lane for reads and control traffic.
     #[serde(default)]
     pub upload_concurrency: Option<usize>,
     #[serde(default = "default_local_concurrency")]

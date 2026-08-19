@@ -140,6 +140,16 @@ fn transfer_request_len(
     Ok(limit)
 }
 
+fn finish_raw_handle<T>(
+    operation: Result<T, TransportError>,
+    close: Result<(), TransportError>,
+) -> Result<T, TransportError> {
+    match close {
+        Err(close_error) => Err(close_error),
+        Ok(()) => operation,
+    }
+}
+
 pub fn russh_client_config() -> client::Config {
     client::Config {
         window_size: RUSSH_WINDOW_SIZE,
@@ -186,6 +196,128 @@ pub fn russh_sftp_config() -> russh_sftp::client::Config {
         max_packet_len: RUSSH_SFTP_MAX_PACKET_LEN,
         max_concurrent_writes: RUSSH_SFTP_MAX_CONCURRENT_WRITES,
         request_timeout_secs: 60,
+    }
+}
+
+struct BoundedSftpStream<S> {
+    inner: S,
+    max_packet_len: u32,
+    prefix: [u8; 4],
+    prefix_len: usize,
+    prefix_emitted: usize,
+    payload_remaining: usize,
+}
+
+impl<S> BoundedSftpStream<S> {
+    fn new(inner: S, max_packet_len: u32) -> Self {
+        Self {
+            inner,
+            max_packet_len,
+            prefix: [0; 4],
+            prefix_len: 0,
+            prefix_emitted: 0,
+            payload_remaining: 0,
+        }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for BoundedSftpStream<S> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if buf.remaining() == 0 {
+            return std::task::Poll::Ready(Ok(()));
+        }
+
+        if self.prefix_emitted == self.prefix.len() && self.payload_remaining == 0 {
+            self.prefix_len = 0;
+            self.prefix_emitted = 0;
+        }
+
+        while self.prefix_len < self.prefix.len() {
+            let Self {
+                inner,
+                prefix,
+                prefix_len,
+                ..
+            } = &mut *self;
+            let mut prefix_buf = tokio::io::ReadBuf::new(&mut prefix[*prefix_len..]);
+            match std::pin::Pin::new(inner).poll_read(cx, &mut prefix_buf) {
+                std::task::Poll::Pending => return std::task::Poll::Pending,
+                std::task::Poll::Ready(Err(error)) => return std::task::Poll::Ready(Err(error)),
+                std::task::Poll::Ready(Ok(())) => {
+                    let read = prefix_buf.filled().len();
+                    if read == 0 {
+                        return std::task::Poll::Ready(Ok(()));
+                    }
+                    *prefix_len += read;
+                }
+            }
+        }
+
+        if self.prefix_emitted == 0 {
+            let packet_len = u32::from_be_bytes(self.prefix);
+            if packet_len > self.max_packet_len {
+                return std::task::Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "SFTP packet length {packet_len} exceeds limit {}",
+                        self.max_packet_len
+                    ),
+                )));
+            }
+            self.payload_remaining = packet_len as usize;
+        }
+
+        if self.prefix_emitted < self.prefix.len() {
+            let available = &self.prefix[self.prefix_emitted..];
+            let emitted = available.len().min(buf.remaining());
+            buf.put_slice(&available[..emitted]);
+            self.prefix_emitted += emitted;
+            return std::task::Poll::Ready(Ok(()));
+        }
+
+        let read_limit = self.payload_remaining.min(buf.remaining());
+        let mut limited = buf.take(read_limit);
+        match std::pin::Pin::new(&mut self.inner).poll_read(cx, &mut limited) {
+            std::task::Poll::Pending => std::task::Poll::Pending,
+            std::task::Poll::Ready(Err(error)) => std::task::Poll::Ready(Err(error)),
+            std::task::Poll::Ready(Ok(())) => {
+                let read = limited.filled().len();
+                // `limited` borrows the unfilled portion of `buf`; a successful
+                // AsyncRead initialized exactly the bytes it reports as filled.
+                unsafe { buf.assume_init(read) };
+                buf.advance(read);
+                self.payload_remaining -= read;
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for BoundedSftpStream<S> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
 
@@ -404,25 +536,39 @@ async fn authenticate_identity(
     }
 }
 
+fn select_rsa_auth_hash(
+    server_support: Option<Option<HashAlg>>,
+) -> Result<HashAlg, TransportError> {
+    match server_support {
+        Some(Some(hash)) => Ok(hash),
+        // RFC 8308 extension info is optional. Optimistically try the strongest
+        // SHA-2 signature when it is absent; authentication will fail closed if
+        // the server does not support it.
+        None => Ok(HashAlg::Sha512),
+        Some(None) => Err(TransportError::Open(
+            "server advertises only legacy SHA-1 ssh-rsa user authentication".to_owned(),
+        )),
+    }
+}
+
 async fn handshake_sftp<S>(
     stream: S,
 ) -> Result<(RawSftpSession, SftpCapabilities, SftpLimits), TransportError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let mut raw = RawSftpSession::new_with_config(stream, russh_sftp_config());
+    let bounded = BoundedSftpStream::new(stream, RUSSH_SFTP_MAX_PACKET_LEN);
+    let mut raw = RawSftpSession::new_with_config(bounded, russh_sftp_config());
     let version = raw
         .init()
         .await
         .map_err(|error| TransportError::Open(format!("SFTP handshake failed: {error}")))?;
     let limits = if has_extension(&version, russh_sftp::extensions::LIMITS) {
-        match raw.limits().await {
-            Ok(limits) => SftpLimits::from(limits),
-            Err(error) => {
-                tracing::warn!(%error, "SFTP server advertised limits but the query failed");
-                SftpLimits::default()
-            }
-        }
+        SftpLimits::from(raw.limits().await.map_err(|error| {
+            TransportError::Open(format!(
+                "SFTP server advertised limits but the query failed: {error}"
+            ))
+        })?)
     } else {
         SftpLimits::default()
     };
@@ -467,13 +613,11 @@ impl SessionFactory for RusshSessionFactory {
                 ))
             })?;
             let hash = if self.identity_key.algorithm().is_rsa() {
-                handle
-                    .best_supported_rsa_hash()
-                    .await
-                    .map_err(|error| {
+                Some(select_rsa_auth_hash(
+                    handle.best_supported_rsa_hash().await.map_err(|error| {
                         TransportError::Open(format!("RSA hash probe failed: {error}"))
-                    })?
-                    .flatten()
+                    })?,
+                )?)
             } else {
                 None
             };
@@ -512,7 +656,6 @@ impl SessionFactory for RusshSessionFactory {
                 sftp: Some(sftp),
                 capabilities,
                 limits,
-                force: force.clone(),
             }) as Box<dyn TransportSession>)
         };
 
@@ -528,7 +671,6 @@ pub struct RusshTransportSession {
     sftp: Option<RawSftpSession>,
     capabilities: SftpCapabilities,
     limits: SftpLimits,
-    force: CancellationToken,
 }
 
 /// Historical test-only name retained while existing integration tests move to russh-sftp.
@@ -546,7 +688,6 @@ impl fmt::Debug for RusshTransportSession {
 
 impl Drop for RusshTransportSession {
     fn drop(&mut self) {
-        self.force.cancel();
         if let Some(sftp) = self.sftp.take() {
             let _ = sftp.close_session();
         }
@@ -570,7 +711,6 @@ impl RusshTransportSession {
             sftp: Some(sftp),
             capabilities,
             limits,
-            force: CancellationToken::new(),
         })
     }
 
@@ -612,19 +752,22 @@ impl RusshTransportSession {
             .await
             .map_err(|error| map_sftp_error(path, error))?;
         let handle = opened.handle;
-        let result = write_handle_pipelined(sftp, &handle, path, offset, chunks, self.limits).await;
-        if durable
-            && result.is_ok()
-            && let Err(error) = sftp.fsync(handle.as_str()).await
-        {
-            let _ = sftp.close(handle.clone()).await;
-            return Err(map_sftp_error(path, error));
+        let operation = async {
+            write_handle_pipelined(sftp, &handle, path, offset, chunks, self.limits).await?;
+            if durable {
+                sftp.fsync(handle.as_str())
+                    .await
+                    .map_err(|error| map_sftp_error(path, error))?;
+            }
+            Ok(())
         }
+        .await;
         let close = sftp
             .close(handle)
             .await
-            .map_err(|error| map_sftp_error(path, error));
-        result.and(close.map(|_| ()))
+            .map_err(|error| map_sftp_error(path, error))
+            .map(|_| ());
+        finish_raw_handle(operation, close)
     }
 }
 
@@ -881,10 +1024,7 @@ impl TransportSession for RusshTransportSession {
             .close(handle)
             .await
             .map_err(|error| map_sftp_error(path, error));
-        match (result, close) {
-            (_, Err(close_error)) => Err(close_error),
-            (result, Ok(_)) => result,
-        }
+        finish_raw_handle(result, close.map(|_| ()))
     }
 
     async fn list_directory(
@@ -898,44 +1038,47 @@ impl TransportSession for RusshTransportSession {
             .await
             .map_err(|error| map_sftp_error(path, error))?;
         let handle = opened.handle;
-        let mut result = Vec::new();
-        loop {
-            match sftp.readdir(handle.as_str()).await {
-                Ok(name) => {
-                    for file in name.files {
-                        if file.filename == "." || file.filename == ".." {
-                            continue;
+        let operation = async {
+            let mut result = Vec::new();
+            loop {
+                match sftp.readdir(handle.as_str()).await {
+                    Ok(name) => {
+                        for file in name.files {
+                            if file.filename == "." || file.filename == ".." {
+                                continue;
+                            }
+                            let kind = if file.attrs.is_regular() {
+                                RemoteEntryKind::File
+                            } else if file.attrs.is_dir() {
+                                RemoteEntryKind::Directory
+                            } else if file.attrs.is_symlink() {
+                                RemoteEntryKind::Symlink
+                            } else {
+                                RemoteEntryKind::Other
+                            };
+                            result.push(RemoteDirectoryEntry {
+                                filename: PathBuf::from(file.filename),
+                                kind,
+                            });
                         }
-                        let kind = if file.attrs.is_regular() {
-                            RemoteEntryKind::File
-                        } else if file.attrs.is_dir() {
-                            RemoteEntryKind::Directory
-                        } else if file.attrs.is_symlink() {
-                            RemoteEntryKind::Symlink
-                        } else {
-                            RemoteEntryKind::Other
-                        };
-                        result.push(RemoteDirectoryEntry {
-                            filename: PathBuf::from(file.filename),
-                            kind,
-                        });
                     }
-                }
-                Err(russh_sftp::client::error::Error::Status(status))
-                    if status.status_code == StatusCode::Eof =>
-                {
-                    break;
-                }
-                Err(error) => {
-                    let _ = sftp.close(handle.clone()).await;
-                    return Err(map_sftp_error(path, error));
+                    Err(russh_sftp::client::error::Error::Status(status))
+                        if status.status_code == StatusCode::Eof =>
+                    {
+                        break;
+                    }
+                    Err(error) => return Err(map_sftp_error(path, error)),
                 }
             }
+            Ok(result)
         }
-        sftp.close(handle)
+        .await;
+        let close = sftp
+            .close(handle)
             .await
-            .map_err(|error| map_sftp_error(path, error))?;
-        Ok(result)
+            .map_err(|error| map_sftp_error(path, error))
+            .map(|_| ());
+        finish_raw_handle(operation, close)
     }
 
     async fn remove_file(&mut self, path: &Path) -> Result<(), TransportError> {
@@ -1029,9 +1172,9 @@ impl TransportSession for RusshTransportSession {
         let close = sftp
             .close(handle)
             .await
-            .map_err(|error| map_sftp_error(path, error));
-        close?;
-        bytes
+            .map_err(|error| map_sftp_error(path, error))
+            .map(|_| ());
+        finish_raw_handle(bytes, close)
     }
 
     async fn hard_link(&mut self, from: &Path, to: &Path) -> Result<(), TransportError> {
@@ -1083,25 +1226,30 @@ impl TransportSession for RusshTransportSession {
         }
         if let Some(mut handle) = self.handle.take() {
             let disconnect = handle.disconnect(russh::Disconnect::ByApplication, "", "");
-            let queued = tokio::select! {
+            tokio::select! {
+                biased;
+                _ = force.cancelled() => {
+                    return Err(TransportError::Close(
+                        "russh disconnect was cancelled before it could be queued".to_owned()
+                    ));
+                }
                 result = disconnect => {
                     if let Err(error) = result {
                         tracing::warn!(%error, "russh disconnect failed after SFTP close");
                     }
-                    true
                 }
-                _ = force.cancelled() => false,
-                _ = self.force.cancelled() => false,
-            };
-            if queued {
-                tokio::select! {
-                    result = &mut handle => {
-                        if let Err(error) = result {
-                            tracing::warn!(%error, "russh connection task failed during close");
-                        }
+            }
+            tokio::select! {
+                biased;
+                _ = force.cancelled() => {
+                    return Err(TransportError::Close(
+                        "russh connection did not terminate before forced cleanup".to_owned()
+                    ));
+                }
+                result = &mut handle => {
+                    if let Err(error) = result {
+                        tracing::warn!(%error, "russh connection task failed during close");
                     }
-                    _ = force.cancelled() => {}
-                    _ = self.force.cancelled() => {}
                 }
             }
         }
@@ -1206,6 +1354,74 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
             config.max_concurrent_writes,
             russh_sftp::client::Config::default().max_concurrent_writes
         );
+    }
+
+    #[tokio::test]
+    async fn bounded_sftp_stream_rejects_oversized_length_before_forwarding_it() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (mut peer, stream) = tokio::io::duplex(16);
+        peer.write_u32(RUSSH_SFTP_MAX_PACKET_LEN + 1).await.unwrap();
+        let mut bounded = BoundedSftpStream::new(stream, RUSSH_SFTP_MAX_PACKET_LEN);
+
+        let error = bounded
+            .read_u32()
+            .await
+            .expect_err("oversized length must be rejected before downstream allocation");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("exceeds limit"));
+    }
+
+    #[tokio::test]
+    async fn bounded_sftp_stream_preserves_valid_packet_boundaries() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (mut peer, stream) = tokio::io::duplex(32);
+        peer.write_all(&[0, 0, 0, 3, b'a', b'b', b'c', 0, 0, 0, 2, b'd', b'e'])
+            .await
+            .unwrap();
+        let mut bounded = BoundedSftpStream::new(stream, 3);
+
+        assert_eq!(bounded.read_u32().await.unwrap(), 3);
+        let mut first = [0; 3];
+        bounded.read_exact(&mut first).await.unwrap();
+        assert_eq!(&first, b"abc");
+        assert_eq!(bounded.read_u32().await.unwrap(), 2);
+        let mut second = [0; 2];
+        bounded.read_exact(&mut second).await.unwrap();
+        assert_eq!(&second, b"de");
+    }
+
+    #[test]
+    fn rsa_user_auth_never_selects_legacy_sha1() {
+        assert_eq!(
+            select_rsa_auth_hash(Some(Some(HashAlg::Sha512))).unwrap(),
+            HashAlg::Sha512
+        );
+        assert_eq!(
+            select_rsa_auth_hash(Some(Some(HashAlg::Sha256))).unwrap(),
+            HashAlg::Sha256
+        );
+        assert_eq!(
+            select_rsa_auth_hash(None).unwrap(),
+            HashAlg::Sha512,
+            "servers without EXT_INFO should get a safe optimistic SHA-512 attempt"
+        );
+        let error = select_rsa_auth_hash(Some(None))
+            .expect_err("a server advertising only legacy ssh-rsa must fail closed");
+        assert!(error.to_string().contains("SHA-1"));
+    }
+
+    #[test]
+    fn raw_handle_close_failure_overrides_reusable_operation_errors() {
+        let error = finish_raw_handle::<()>(
+            Err(TransportError::NotFound("object".to_owned())),
+            Err(TransportError::Close("handle close failed".to_owned())),
+        )
+        .expect_err("a failed CLOSE must retire the physical session");
+
+        assert!(matches!(error, TransportError::Close(_)), "{error:?}");
     }
 
     #[test]
@@ -1550,6 +1766,52 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
     }
 
     #[tokio::test]
+    async fn russh_close_awaits_connection_after_pool_shutdown_token_is_cancelled() {
+        let env = Loopback::start().await;
+        let factory = RusshSessionFactory::new(
+            env.endpoint.clone(),
+            env.identity.clone(),
+            env.known_hosts.clone(),
+        )
+        .unwrap();
+        let pool_shutdown = CancellationToken::new();
+        let session = factory.open(pool_shutdown.clone()).await.unwrap();
+        assert_eq!(env.active_connections.load(Ordering::SeqCst), 1);
+        pool_shutdown.cancel();
+
+        session.close(CancellationToken::new()).await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while env.active_connections.load(Ordering::SeqCst) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("pool shutdown must terminate the SSH connection");
+    }
+
+    #[tokio::test]
+    async fn russh_forced_close_never_reports_success() {
+        let env = Loopback::start().await;
+        let factory = RusshSessionFactory::new(
+            env.endpoint.clone(),
+            env.identity.clone(),
+            env.known_hosts.clone(),
+        )
+        .unwrap();
+        let session = factory.open(CancellationToken::new()).await.unwrap();
+        let force = CancellationToken::new();
+        force.cancel();
+
+        let error = session
+            .close(force)
+            .await
+            .expect_err("forced cleanup must fail closed instead of releasing capacity");
+
+        assert!(matches!(error, TransportError::Close(_)), "{error:?}");
+    }
+
+    #[tokio::test]
     async fn russh_factory_rejects_an_encrypted_identity_without_a_passphrase() {
         let env = Loopback::start().await;
         std::fs::write(&env.identity, ENCRYPTED_KEY.as_bytes()).unwrap();
@@ -1568,6 +1830,25 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
             }
             other => panic!("expected Open error, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn russh_factory_rejects_an_advertised_limits_query_failure() {
+        let env = Loopback::start_with_broken_limits().await;
+        let factory = RusshSessionFactory::new(
+            env.endpoint.clone(),
+            env.identity.clone(),
+            env.known_hosts.clone(),
+        )
+        .unwrap();
+
+        let error = factory
+            .open(CancellationToken::new())
+            .await
+            .expect_err("a failed advertised limits query must retire the session");
+
+        assert!(matches!(error, TransportError::Open(_)), "{error:?}");
+        assert!(error.to_string().contains("limits"), "{error:?}");
     }
 
     #[tokio::test]
@@ -1617,18 +1898,26 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
 
     impl Loopback {
         async fn start() -> Self {
-            Self::start_with(None, false).await
+            Self::start_with(None, false, false).await
         }
 
         async fn start_with_read_cap(read_cap: Option<usize>) -> Self {
-            Self::start_with(read_cap, false).await
+            Self::start_with(read_cap, false, false).await
         }
 
         async fn start_without_mtime() -> Self {
-            Self::start_with(None, true).await
+            Self::start_with(None, true, false).await
         }
 
-        async fn start_with(read_cap: Option<usize>, omit_mtime: bool) -> Self {
+        async fn start_with_broken_limits() -> Self {
+            Self::start_with(None, false, true).await
+        }
+
+        async fn start_with(
+            read_cap: Option<usize>,
+            omit_mtime: bool,
+            advertise_broken_limits: bool,
+        ) -> Self {
             use russh::server::{Auth, Msg, Server, Session};
             use russh::{Channel, ChannelId};
             use std::net::SocketAddr;
@@ -1698,6 +1987,7 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
                 client_public: russh::keys::PublicKey,
                 read_cap: Option<usize>,
                 omit_mtime: bool,
+                advertise_broken_limits: bool,
                 inflight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
                 peak: std::sync::Arc<std::sync::atomic::AtomicUsize>,
                 exec_requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -1782,6 +2072,7 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
                         root: self.state.fs_root.clone(),
                         read_cap: self.state.read_cap,
                         omit_mtime: self.state.omit_mtime,
+                        advertise_broken_limits: self.state.advertise_broken_limits,
                         files: std::collections::HashMap::new(),
                         dirs: std::collections::HashMap::new(),
                         next: 1,
@@ -1812,6 +2103,7 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
                 client_public,
                 read_cap,
                 omit_mtime,
+                advertise_broken_limits,
                 inflight: inflight.clone(),
                 peak: peak.clone(),
                 exec_requests: exec_requests.clone(),
@@ -1862,6 +2154,7 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
         root: PathBuf,
         read_cap: Option<usize>,
         omit_mtime: bool,
+        advertise_broken_limits: bool,
         files: std::collections::HashMap<String, Opened>,
         dirs: std::collections::HashMap<String, std::vec::IntoIter<std::fs::DirEntry>>,
         next: u64,
@@ -1944,6 +2237,11 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
             version
                 .extensions
                 .insert(POSIX_RENAME.to_owned(), "1".to_owned());
+            if self.advertise_broken_limits {
+                version
+                    .extensions
+                    .insert(russh_sftp::extensions::LIMITS.to_owned(), "1".to_owned());
+            }
             Ok(version)
         }
 

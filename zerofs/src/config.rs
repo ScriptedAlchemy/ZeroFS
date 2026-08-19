@@ -1861,7 +1861,7 @@ impl Settings {
         toml_string.push_str("# resume_percent = 85\n");
         toml_string.push_str("# local_concurrency = 4\n");
         toml_string.push_str(
-            "# upload_concurrency = 7         # fill the SFTP write-stream budget; per-session writes pipeline to 64\n",
+            "# upload_concurrency = 4         # generic default; SFTP auto-defaults to 7 and pipelines 64 requests per session\n",
         );
         toml_string.push_str("# shutdown_flush = \"local\"       # local | remote\n");
 
