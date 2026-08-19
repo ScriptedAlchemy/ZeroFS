@@ -1127,7 +1127,9 @@ impl ReconciledDb {
         let access_mode = match db_mode {
             DatabaseMode::ReadWrite => crate::writeback::config::WritebackAccessMode::ReadWrite,
             DatabaseMode::ReadOnly => crate::writeback::config::WritebackAccessMode::ReadOnly,
-            DatabaseMode::Checkpoint(_) => crate::writeback::config::WritebackAccessMode::Checkpoint,
+            DatabaseMode::Checkpoint(_) => {
+                crate::writeback::config::WritebackAccessMode::Checkpoint
+            }
         };
         fs.write_ack = settings
             .filesystem_write_ack_settings(access_mode)
@@ -1152,6 +1154,8 @@ impl ReconciledDb {
         }
 
         let fs = Arc::new(fs);
+        fs.install_volatile_overlay();
+        fs.start_materializer();
         if let Some(writeback) = &writeback {
             writeback.activate_remote().context(
                 "Failed to activate persistent writeback after filesystem initialization",

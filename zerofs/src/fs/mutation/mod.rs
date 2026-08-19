@@ -5,12 +5,14 @@
 //! write-acknowledgement contract, [`request_cache`] the protocol replay
 //! cache, [`admission`] the raw byte/operation budget and preparation
 //! quiescence gate, [`progress`] the gap-free materialization barrier,
-//! [`volatile_overlay`] the bounded RAM overlay runtime, and [`overlay`]
-//! the filesystem-facing overlay manager.
+//! [`volatile_overlay`] the bounded RAM overlay runtime, [`overlay`]
+//! the filesystem-facing overlay manager, and [`materializer`] the
+//! ordered canonical apply workers.
 
 pub(crate) mod ack;
 pub(crate) mod admission;
 pub(crate) mod config;
+pub(crate) mod materializer;
 pub(crate) mod overlay;
 pub(crate) mod progress;
 pub(crate) mod volatile_overlay;

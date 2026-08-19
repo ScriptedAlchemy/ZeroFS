@@ -128,6 +128,10 @@ pub struct ZeroFS {
             std::sync::Arc<crate::fs::mutation::overlay::FilesystemVolatileOverlay>,
         >,
     >,
+    /// Ordered canonical apply workers for accepted volatile batches.
+    pub(crate) materializer: std::sync::Arc<
+        std::sync::OnceLock<std::sync::Arc<crate::fs::mutation::materializer::Materializer>>,
+    >,
     /// Durability lineage token (see `client_fsync_verified`). Identifies the current
     /// unbroken durable lineage; set once at bring-up, constant for this process's life.
     /// A ZeroFS client carries it, and a verified fsync succeeds only while it is

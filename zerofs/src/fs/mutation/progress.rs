@@ -42,6 +42,13 @@ impl MutationProgress {
         lock(&self.inner.state).materialized_through
     }
 
+    pub(crate) fn check(&self) -> Result<(), MutationError> {
+        match &lock(&self.inner.state).terminal {
+            Some(error) => Err(error.clone()),
+            None => Ok(()),
+        }
+    }
+
     pub(crate) fn poison(&self, message: impl Into<String>) {
         {
             let mut state = lock(&self.inner.state);

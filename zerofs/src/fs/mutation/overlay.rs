@@ -18,6 +18,7 @@ use crate::fs::ops::write::{apply_prepared_batch, prepare_write};
 use crate::fs::types::{AuthContext, FileAttributes};
 use bytes::Bytes;
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 pub(crate) struct FilesystemVolatileOverlay {
@@ -25,6 +26,8 @@ pub(crate) struct FilesystemVolatileOverlay {
     runtimes: Mutex<HashMap<u64, Arc<VolatileWriteRuntime>>>,
     pending: Mutex<HashMap<u64, VecDeque<PreparedWriteBatch>>>,
     latest_attrs: Mutex<HashMap<u64, FileAttributes>>,
+    frozen: AtomicBool,
+    materializer_sequence: AtomicU64,
     fs: Weak<ZeroFS>,
 }
 
@@ -35,6 +38,8 @@ impl FilesystemVolatileOverlay {
             runtimes: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             latest_attrs: Mutex::new(HashMap::new()),
+            frozen: AtomicBool::new(false),
+            materializer_sequence: AtomicU64::new(0),
             fs,
         })
     }
@@ -61,41 +66,55 @@ impl FilesystemVolatileOverlay {
     async fn materialize(
         self: Arc<Self>,
         inode: u64,
-        offset: u64,
-        data: Bytes,
+        _offset: u64,
+        _data: Bytes,
     ) -> OverlayResult<()> {
-        let batch = {
+        let mut batch = {
             let mut pending = self.pending.lock().expect("filesystem overlay poisoned");
-            pending.get_mut(&inode).and_then(VecDeque::pop_front)
+            pending
+                .get_mut(&inode)
+                .and_then(VecDeque::pop_front)
+                .ok_or(OverlayError::IoError)?
         };
-        if let Some(mut batch) = batch {
-            let Some(fs) = self.fs.upgrade() else {
-                return Err(OverlayError::IoError);
-            };
-            apply_prepared_batch(&fs.write_apply_context(), &mut batch)
-                .await
-                .map(|_| ())?;
-            let remaining = {
-                let runtimes = self.runtimes.lock().expect("filesystem overlay poisoned");
-                runtimes
-                    .get(&inode)
-                    .map(|runtime| runtime.dirty_end())
-                    .unwrap_or(0)
-            };
-            if remaining == 0 {
-                self.latest_attrs
-                    .lock()
-                    .expect("filesystem overlay poisoned")
-                    .remove(&inode);
-            }
-            return Ok(());
-        }
         let Some(fs) = self.fs.upgrade() else {
             return Err(OverlayError::IoError);
         };
-        fs.write(&AuthContext::default(), inode, offset, &data)
+        if let Some(materializer) = fs.materializer.get() {
+            let sequence = self.materializer_sequence.fetch_add(1, Ordering::Relaxed) + 1;
+            let cutoff = crate::fs::mutation::types::MutationCutoff {
+                mutation_incarnation: materializer.incarnation(),
+                sequence,
+            };
+            materializer
+                .dispatch_through(cutoff, batch)
+                .await
+                .map_err(|_| OverlayError::IoError)?;
+            return Ok(());
+        }
+        // Accept drops the prepare locks once the write is overlay-visible.
+        // Re-acquire them so apply cannot race setattr/unlink on the same inode.
+        let _apply_guards = if batch.guards.is_none() {
+            let ids = batch.members.iter().map(|member| member.id).collect();
+            Some(fs.lock_manager.acquire_multi(ids).await)
+        } else {
+            None
+        };
+        apply_prepared_batch(&fs.write_apply_context(), &mut batch)
             .await
             .map(|_| ())?;
+        let remaining = {
+            let runtimes = self.runtimes.lock().expect("filesystem overlay poisoned");
+            runtimes
+                .get(&inode)
+                .map(|runtime| runtime.dirty_end())
+                .unwrap_or(0)
+        };
+        if remaining == 0 {
+            self.latest_attrs
+                .lock()
+                .expect("filesystem overlay poisoned")
+                .remove(&inode);
+        }
         Ok(())
     }
 
@@ -138,6 +157,30 @@ impl FilesystemVolatileOverlay {
         self.runtime(inode).reserve(bytes).await
     }
 
+    pub(crate) fn preview_attrs(&self, inode: u64, attrs: FileAttributes) {
+        self.latest_attrs
+            .lock()
+            .expect("filesystem overlay poisoned")
+            .insert(inode, attrs);
+    }
+
+    pub(crate) fn retire_inode(&self, inode: u64) {
+        // Pending batches are owned by the apply worker that popped them.
+        // Only drop the preview attributes once canonical apply owns the bytes.
+        self.latest_attrs
+            .lock()
+            .expect("filesystem overlay poisoned")
+            .remove(&inode);
+    }
+
+    pub(crate) fn freeze_terminal(&self) {
+        self.frozen.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn is_frozen(&self) -> bool {
+        self.frozen.load(Ordering::Acquire)
+    }
+
     pub(crate) async fn accept(
         self: &Arc<Self>,
         inode: u64,
@@ -147,6 +190,9 @@ impl FilesystemVolatileOverlay {
         attrs: FileAttributes,
         batch: PreparedWriteBatch,
     ) -> OverlayResult<u64> {
+        if self.is_frozen() {
+            return Err(OverlayError::IoError);
+        }
         let length = data.len();
         let groups = vec![vec![WriteChunk {
             inode,
@@ -167,7 +213,17 @@ impl FilesystemVolatileOverlay {
             .accept_write(admission, offset, data, groups)
             .await
         {
-            Ok(sequence) => Ok(sequence),
+            Ok(sequence) => {
+                // The write is now readable from the overlay. Release prepare
+                // locks so the next write on this inode can prepare.
+                let mut pending = self.pending.lock().expect("filesystem overlay poisoned");
+                if let Some(queue) = pending.get_mut(&inode) {
+                    for queued in queue.iter_mut() {
+                        queued.guards = None;
+                    }
+                }
+                Ok(sequence)
+            }
             Err(error) => {
                 let mut pending = self.pending.lock().expect("filesystem overlay poisoned");
                 if let Some(queue) = pending.get_mut(&inode) {
@@ -252,6 +308,18 @@ impl ZeroFS {
             self.write_ack.volatile_max_operations,
             Arc::downgrade(self),
         ));
+        self.start_materializer();
+    }
+
+    /// Start owned apply workers once the filesystem is in an `Arc`.
+    pub fn start_materializer(self: &Arc<Self>) {
+        let _ = self
+            .materializer
+            .set(super::materializer::Materializer::start(
+                super::types::MutationIncarnation::new(),
+                Arc::downgrade(self),
+                self.volatile_overlay.get().cloned(),
+            ));
     }
 
     pub(crate) fn volatile_budget(&self) -> Option<Arc<VolatileBudget>> {
@@ -263,6 +331,21 @@ impl ZeroFS {
             .get()
             .map(|overlay| overlay.visible_size(id, canonical))
             .unwrap_or(canonical)
+    }
+
+    pub(crate) fn overlay_is_dirty(&self, id: InodeId) -> bool {
+        self.volatile_overlay
+            .get()
+            .is_some_and(|overlay| overlay.visible_size(id, 0) > 0)
+    }
+
+    /// Drain acknowledged overlay writes for `id` so a later canonical
+    /// mutation (setattr/trim/unlink) cannot race the materializer.
+    pub(crate) async fn quiesce_overlay_inode(&self, id: InodeId) -> Result<(), FsError> {
+        if let Some(overlay) = self.volatile_overlay.get() {
+            overlay.wait_inode(id).await.map_err(overlay_fs_error)?;
+        }
+        Ok(())
     }
 
     pub(crate) async fn visible_inode(&self, id: InodeId) -> Result<Inode, FsError> {
@@ -333,7 +416,7 @@ impl ZeroFS {
             op_id,
             check_permissions,
         };
-        let mut batch = prepare_write(&self.write_prepare_context(), request).await?;
+        let batch = prepare_write(&self.write_prepare_context(), request).await?;
         let attrs = batch
             .replayed
             .as_ref()
@@ -345,7 +428,6 @@ impl ZeroFS {
                     .map(|member| member.post_attrs.clone())
             })
             .expect("prepared batch has attributes");
-        batch.guards = None;
         overlay
             .accept(id, admission, offset, data.clone(), attrs.clone(), batch)
             .await
@@ -477,6 +559,34 @@ mod tests {
         fs.wait_configured_durability().await.unwrap();
         let (data, eof) = fs.read_file(&auth, file, 0, 32).await.unwrap();
         assert_eq!(data.as_ref(), b"hello-overlay");
+        assert!(eof);
+    }
+
+    #[tokio::test]
+    async fn sequential_write_acks_extend_visible_size() {
+        let mut fs = ZeroFS::new_in_memory().await.unwrap();
+        fs.write_ack = volatile_settings();
+        let fs = Arc::new(fs);
+        fs.install_volatile_overlay();
+
+        let auth = crate::fs::types::AuthContext::from(&test_creds());
+        let file = fs.create_exclusive(&auth, 0, b"seq.txt").await.unwrap();
+        fs.write_ack(&auth, file, 0, &Bytes::from_static(b"abc"))
+            .await
+            .unwrap();
+        let attrs = fs
+            .write_ack(&auth, file, 3, &Bytes::from_static(b"def"))
+            .await
+            .unwrap();
+        assert_eq!(attrs.size, 6);
+
+        let (data, eof) = fs.read_file(&auth, file, 0, 32).await.unwrap();
+        assert_eq!(data.as_ref(), b"abcdef");
+        assert!(eof);
+
+        fs.wait_inode_durability(file).await.unwrap();
+        let (data, eof) = fs.read_file(&auth, file, 0, 32).await.unwrap();
+        assert_eq!(data.as_ref(), b"abcdef");
         assert!(eof);
     }
 }

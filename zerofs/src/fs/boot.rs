@@ -257,6 +257,7 @@ impl ZeroFS {
             write_ack: crate::fs::mutation::config::FilesystemWriteAckSettings::materialized_direct(
             ),
             volatile_overlay: std::sync::Arc::new(std::sync::OnceLock::new()),
+            materializer: std::sync::Arc::new(std::sync::OnceLock::new()),
             lineage_token,
             serving_writer_epoch,
             max_bytes,
