@@ -927,10 +927,18 @@ assert_prod_nfs_quiesced() {
     echo "+ prove no established NFS clients remain on $container_ip:2049"
     return
   fi
-  if pct exec "$ctid" -- ss -Hnt state established sport = :2049 | grep -q .; then
-    echo "active NFS client remains; unmount every client before production deploy" >&2
-    return 1
-  fi
+  local deadline=$((SECONDS + 60)) stable=0
+  while ((SECONDS < deadline)); do
+    if pct exec "$ctid" -- ss -Hnt state established sport = :2049 | grep -q .; then
+      stable=0
+    else
+      stable=$((stable + 1))
+      ((stable >= 2)) && return 0
+    fi
+    sleep 1
+  done
+  echo "active NFS client remains after 60 seconds; unmount every client before production deploy" >&2
+  return 1
 }
 
 graceful_stop() {
