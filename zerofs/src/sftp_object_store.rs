@@ -1354,7 +1354,6 @@ async fn finish_lease<T>(
                 error,
                 crate::sftp_transport::TransportError::NotFound(_)
                     | crate::sftp_transport::TransportError::PermissionDenied(_)
-                    | crate::sftp_transport::TransportError::AlreadyExists(_)
                     | crate::sftp_transport::TransportError::CorruptObject(_)
             );
             let cleanup = if reusable {
@@ -1380,12 +1379,6 @@ fn transport_error(error: crate::sftp_transport::TransportError) -> object_store
             object_store::Error::PermissionDenied {
                 path,
                 source: "SFTP server denied access".into(),
-            }
-        }
-        crate::sftp_transport::TransportError::AlreadyExists(path) => {
-            object_store::Error::AlreadyExists {
-                path,
-                source: "SFTP server reported that the path already exists".into(),
             }
         }
         crate::sftp_transport::TransportError::PoolClosed => object_store::Error::NotSupported {
@@ -1415,9 +1408,6 @@ fn remote_transport_error(error: crate::sftp_transport::TransportError) -> Remot
         crate::sftp_transport::TransportError::NotFound(path) => RemoteError::NotFound(path),
         crate::sftp_transport::TransportError::PermissionDenied(path) => {
             RemoteError::PermissionDenied(path)
-        }
-        crate::sftp_transport::TransportError::AlreadyExists(path) => {
-            RemoteError::AlreadyExists(path)
         }
         crate::sftp_transport::TransportError::CorruptObject(message) => {
             RemoteError::CorruptObject(message)
@@ -2581,7 +2571,10 @@ mod tests {
         ) -> Result<(), TransportError> {
             let mut files = self.0.files.lock().unwrap();
             if files.contains_key(to) {
-                return Err(TransportError::AlreadyExists(to.display().to_string()));
+                return Err(TransportError::Operation(format!(
+                    "hard link target already exists: {}",
+                    to.display()
+                )));
             }
             let bytes = files
                 .get(from)

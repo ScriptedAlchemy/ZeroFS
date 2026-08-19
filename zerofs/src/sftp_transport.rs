@@ -227,8 +227,6 @@ pub enum TransportError {
     InvalidRange(String),
     #[error("remote path permission denied: {0}")]
     PermissionDenied(String),
-    #[error("remote path already exists: {0}")]
-    AlreadyExists(String),
     #[error("SFTP operation failed: {0}")]
     Operation(String),
     #[error("remote object is corrupt: {0}")]
