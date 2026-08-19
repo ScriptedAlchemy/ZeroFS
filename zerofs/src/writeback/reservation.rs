@@ -166,10 +166,7 @@ impl SsdAdmission {
             resume_percent,
             min_free_bytes,
             std::iter::empty(),
-            PhysicalSpaceSample {
-                generation: 0,
-                available_bytes: 0,
-            },
+            None,
         )
     }
 
@@ -181,7 +178,7 @@ impl SsdAdmission {
         resume_percent: u8,
         min_free_bytes: u64,
         pending: impl IntoIterator<Item = SsdReservationRequest>,
-        sample: PhysicalSpaceSample,
+        sample: Option<PhysicalSpaceSample>,
     ) -> Result<Self, ReservationError> {
         if capacity_bytes == 0
             || max_operations == 0
@@ -231,15 +228,17 @@ impl SsdAdmission {
                     used_ssd_bytes,
                     used_operations,
                     outstanding_physical_claims,
-                    available_bytes: sample.available_bytes,
-                    sample_generation: sample.generation,
+                    available_bytes: sample.map(|s| s.available_bytes).unwrap_or(0),
+                    sample_generation: sample.map(|s| s.generation).unwrap_or(0),
                     paused: used_ssd_bytes > high_bytes
-                        || !physical_headroom(
-                            sample.available_bytes,
-                            outstanding_physical_claims,
-                            0,
-                            min_free_bytes,
-                        ),
+                        || sample.is_some_and(|s| {
+                            !physical_headroom(
+                                s.available_bytes,
+                                outstanding_physical_claims,
+                                0,
+                                min_free_bytes,
+                            )
+                        }),
                     next_waiter: 0,
                     waiters: VecDeque::new(),
                     terminal: None,
@@ -428,20 +427,36 @@ impl SsdAdmissionInner {
         state: &mut SsdState,
         request: SsdReservationRequest,
     ) -> Result<(), ReservationError> {
-        let used_ssd_bytes = state
+        let used_ssd_bytes = match state
             .used_ssd_bytes
             .checked_add(request.ssd_reservation_bytes)
-            .ok_or_else(|| ReservationError::Poisoned("SSD reservation byte overflow".into()))?;
-        let used_operations = state
-            .used_operations
-            .checked_add(request.operations)
-            .ok_or_else(|| {
-                ReservationError::Poisoned("SSD reservation operation overflow".into())
-            })?;
-        let outstanding_physical_claims = state
+        {
+            Some(bytes) => bytes,
+            None => {
+                let error = ReservationError::Poisoned("SSD reservation byte overflow".into());
+                state.terminal = Some(error.clone());
+                return Err(error);
+            }
+        };
+        let used_operations = match state.used_operations.checked_add(request.operations) {
+            Some(operations) => operations,
+            None => {
+                let error = ReservationError::Poisoned("SSD reservation operation overflow".into());
+                state.terminal = Some(error.clone());
+                return Err(error);
+            }
+        };
+        let outstanding_physical_claims = match state
             .outstanding_physical_claims
             .checked_add(request.physical_reservation_bytes)
-            .ok_or_else(|| ReservationError::Poisoned("SSD physical-claim overflow".into()))?;
+        {
+            Some(physical) => physical,
+            None => {
+                let error = ReservationError::Poisoned("SSD physical-claim overflow".into());
+                state.terminal = Some(error.clone());
+                return Err(error);
+            }
+        };
         state.used_ssd_bytes = used_ssd_bytes;
         state.used_operations = used_operations;
         state.outstanding_physical_claims = outstanding_physical_claims;
@@ -477,14 +492,9 @@ impl SsdAdmissionInner {
                     self.refresh(&mut state);
                     None
                 }
-                _ => {
-                    state.used_ssd_bytes = 0;
-                    state.used_operations = 0;
-                    state.outstanding_physical_claims = 0;
-                    Some(ReservationError::Poisoned(
-                        "SSD reservation accounting underflow".into(),
-                    ))
-                }
+                _ => Some(ReservationError::Poisoned(
+                    "SSD reservation accounting underflow".into(),
+                )),
             }
         };
         if let Some(error) = poison {
@@ -541,12 +551,15 @@ impl SsdAdmissionInner {
                         self.refresh(&mut state);
                     }
                     _ => {
-                        state.used_ssd_bytes = 0;
-                        state.used_operations = 0;
-                        state.outstanding_physical_claims = 0;
-                        state.terminal = Some(ReservationError::Poisoned(
+                        let error = ReservationError::Poisoned(
                             "SSD reservation accounting underflow".into(),
-                        ));
+                        );
+                        state.terminal = Some(error.clone());
+                        let waiters = state.waiters.drain(..).collect::<Vec<_>>();
+                        drop(state);
+                        for leftover in waiters {
+                            let _ = leftover.sender.send(Err(error.clone()));
+                        }
                         return;
                     }
                 }

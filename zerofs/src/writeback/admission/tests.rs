@@ -178,7 +178,7 @@ async fn checked_underflow_and_overflow_poison_admission() {
         50,
         10,
         [request(u64::MAX, 0, 1), request(1, 0, 1)],
-        sample(1, 1_000),
+        Some(sample(1, 1_000)),
     )
     .unwrap_err();
     assert!(
@@ -264,7 +264,7 @@ async fn recovery_seeds_exact_pending_bytes_and_operations() {
         70,
         10,
         [request(40, 12, 1), request(25, 8, 2)],
-        sample(7, 500),
+        Some(sample(7, 500)),
     )
     .unwrap();
     let snapshot = admission.snapshot();

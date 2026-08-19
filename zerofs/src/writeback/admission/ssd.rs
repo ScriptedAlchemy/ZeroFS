@@ -1,7 +1,8 @@
-//! Dirty-SSD admission policy.
+//! Dirty-SSD admission policy owner.
 //!
-//! Legacy watermark admission remains [`DiskAdmission`]. Exact
-//! byte/operation/physical-claim reservations live in
-//! [`crate::writeback::reservation`].
+//! [`SsdAdmission`] is the live byte/operation/physical-claim owner.
+//! [`DiskAdmission`] remains the legacy watermark adapter used by the
+//! current journaler/remote permit path until paced credits replace it.
 
 pub use crate::coordination::admission::{DiskAdmission, DiskPermit};
+pub(crate) use crate::writeback::reservation::SsdAdmission;

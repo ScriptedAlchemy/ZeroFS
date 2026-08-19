@@ -9,6 +9,8 @@ use crate::writeback::model::{
 use crate::writeback::overlay::{OverlayCommitObserver, OverlayIndex, VisibleVersion};
 use crate::writeback::payload::VerifiedPayload;
 use crate::writeback::remote::{RemoteBarrierError, RemoteScheduler};
+use crate::writeback::reservation::SsdAdmission;
+use crate::writeback::space_sample::PhysicalSpaceSampler;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::BoxStream;
@@ -44,6 +46,8 @@ struct WritebackStoreInner {
     overlay: OverlayIndex,
     admission: Admission,
     disk: DiskAdmission,
+    space: Arc<PhysicalSpaceSampler>,
+    ssd: Arc<SsdAdmission>,
     journaler: LocalJournaler,
     remote: RemoteScheduler,
     database_prefix: String,
@@ -91,12 +95,15 @@ impl WritebackStoreInner {
         if probed != 0 && now_ms.saturating_sub(probed) < PROBE_TTL_MS {
             return Ok(self.available_space.load(Ordering::Acquire));
         }
-        let available = fs4::available_space(&self.settings.dir)
-            .map_err(|error| generic_error(format!("failed to inspect writeback SSD: {error}")))?;
-        self.available_space.store(available, Ordering::Release);
+        let sample = self
+            .space
+            .latest_sample()
+            .ok_or_else(|| generic_error("writeback SSD has no physical-space sample"))?;
+        self.available_space
+            .store(sample.available_bytes, Ordering::Release);
         self.available_space_probed_ms
             .store(now_ms.max(1), Ordering::Release);
-        Ok(available)
+        Ok(sample.available_bytes)
     }
 }
 
@@ -106,7 +113,7 @@ impl WritebackObjectStore {
         journal: Arc<Journal>,
         settings: WritebackSettings,
     ) -> anyhow::Result<Self> {
-        Self::open_with_remote_state(remote, journal, settings, true).await
+        Self::open_with_remote_state(remote, journal, settings, true, None).await
     }
 
     /// Open a recovered overlay without allowing the remote view to advance.
@@ -115,7 +122,17 @@ impl WritebackObjectStore {
         journal: Arc<Journal>,
         settings: WritebackSettings,
     ) -> anyhow::Result<Self> {
-        Self::open_with_remote_state(remote, journal, settings, false).await
+        Self::open_with_remote_state(remote, journal, settings, false, None).await
+    }
+
+    pub(crate) async fn open_paused_with_owners(
+        remote: Arc<dyn ObjectStore>,
+        journal: Arc<Journal>,
+        settings: WritebackSettings,
+        space: Arc<PhysicalSpaceSampler>,
+        ssd: Arc<SsdAdmission>,
+    ) -> anyhow::Result<Self> {
+        Self::open_with_remote_state(remote, journal, settings, false, Some((space, ssd))).await
     }
 
     async fn open_with_remote_state(
@@ -123,25 +140,44 @@ impl WritebackObjectStore {
         journal: Arc<Journal>,
         settings: WritebackSettings,
         remote_active: bool,
+        owners: Option<(Arc<PhysicalSpaceSampler>, Arc<SsdAdmission>)>,
     ) -> anyhow::Result<Self> {
         if settings.memory_bytes == 0 {
             anyhow::bail!("writeback requires a positive independent dirty RAM budget");
         }
         let snapshot = journal.snapshot()?;
         let database_prefix = snapshot.identity.database_prefix.clone();
-        let available = fs4::available_space(&settings.dir)?;
+        let (space, ssd, sample) = match owners {
+            Some((space, ssd)) => {
+                let sample = space.latest_sample().ok_or_else(|| {
+                    anyhow::anyhow!("writeback SSD has no physical-space sample")
+                })?;
+                (space, ssd, sample)
+            }
+            None => {
+                let space = Arc::new(PhysicalSpaceSampler::new(settings.dir.clone()));
+                let sample = space.sample().await?;
+                let pending = journal.pending_ssd_reservations()?;
+                let ssd = Arc::new(SsdAdmission::recover(
+                    settings.disk_bytes,
+                    1 << 20,
+                    settings.high_watermark_percent,
+                    settings.resume_percent,
+                    settings.min_free_bytes,
+                    pending,
+                    Some(sample),
+                )?);
+                (space, ssd, sample)
+            }
+        };
         let admission = Admission::new(settings.memory_bytes);
-        let dirty_ssd_reserved_bytes = snapshot
-            .dirty_blob_bytes
-            .checked_add(snapshot.dirty_metadata_reserved_bytes)
-            .ok_or_else(|| anyhow::anyhow!("dirty journal SSD byte count overflow"))?;
         let disk = DiskAdmission::with_used(
             settings.disk_bytes,
             settings.high_watermark_percent,
             settings.resume_percent,
             settings.min_free_bytes,
-            dirty_ssd_reserved_bytes,
-            available,
+            ssd.used_bytes(),
+            sample.available_bytes,
         )?;
         let overlay = OverlayIndex::recover(remote.clone(), journal.clone()).await?;
         let observer = Arc::new(OverlayCommitObserver::new(overlay.clone(), journal.clone()));
@@ -185,6 +221,8 @@ impl WritebackObjectStore {
                 overlay,
                 admission,
                 disk,
+                space,
+                ssd,
                 journaler,
                 remote,
                 database_prefix,
@@ -195,8 +233,8 @@ impl WritebackObjectStore {
                     .collect(),
                 admission_order: Mutex::new(()),
                 started: std::time::Instant::now(),
-                available_space: AtomicU64::new(0),
-                available_space_probed_ms: AtomicU64::new(0),
+                available_space: AtomicU64::new(sample.available_bytes),
+                available_space_probed_ms: AtomicU64::new(1),
             }),
         })
     }
@@ -217,6 +255,14 @@ impl WritebackObjectStore {
 
     pub async fn wait_remote(&self, sequence: u64) -> Result<(), RemoteBarrierError> {
         self.inner.remote.barrier().wait_remote(sequence).await
+    }
+
+    pub(crate) fn space_sampler(&self) -> &Arc<PhysicalSpaceSampler> {
+        &self.inner.space
+    }
+
+    pub(crate) fn ssd_admission(&self) -> &Arc<SsdAdmission> {
+        &self.inner.ssd
     }
 
     /// Start remote writeback after callers have finished opening over the
