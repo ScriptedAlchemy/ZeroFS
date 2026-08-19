@@ -148,9 +148,9 @@ impl WritebackObjectStore {
         let database_prefix = snapshot.identity.database_prefix.clone();
         let (space, ssd, sample) = match owners {
             Some((space, ssd)) => {
-                let sample = space.latest_sample().ok_or_else(|| {
-                    anyhow::anyhow!("writeback SSD has no physical-space sample")
-                })?;
+                let sample = space
+                    .latest_sample()
+                    .ok_or_else(|| anyhow::anyhow!("writeback SSD has no physical-space sample"))?;
                 (space, ssd, sample)
             }
             None => {
@@ -390,9 +390,12 @@ impl WritebackObjectStore {
         ram: crate::writeback::admission::AcceptedAdmission,
         disk: Option<SsdReservationToken>,
     ) -> object_store::Result<PutResult> {
-        let disk_charge =
-            MutationRecord::ssd_reservation_estimate(location.as_ref(), None, bytes.len() as u64)
-                .map_err(|error| generic_error(format!("failed to size put journal entry: {error}")))?;
+        let disk_charge = MutationRecord::ssd_reservation_estimate(
+            location.as_ref(),
+            None,
+            bytes.len() as u64,
+        )
+        .map_err(|error| generic_error(format!("failed to size put journal entry: {error}")))?;
         let disk = match disk {
             Some(disk) => disk,
             None => self.reserve_ssd(disk_charge).await?,
@@ -1165,7 +1168,13 @@ async fn complete_memory_multipart(
     };
     store
         .clone()
-        .owned_put(location, Bytes::from(assembled), put_options, ram, Some(disk))
+        .owned_put(
+            location,
+            Bytes::from(assembled),
+            put_options,
+            ram,
+            Some(disk),
+        )
         .await
 }
 
@@ -3068,7 +3077,7 @@ mod tests {
             let payload = payload.clone();
             async move {
                 store
-                    .owned_put(target, payload, PutOptions::default(), ram, disk)
+                    .owned_put(target, payload, PutOptions::default(), ram, Some(disk))
                     .await
             }
         });
