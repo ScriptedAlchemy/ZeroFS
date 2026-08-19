@@ -23,6 +23,7 @@ use uuid::Uuid;
 use crate::segment_store::{ConditionalMultipartCreate, GeneratedSegmentCreate};
 
 pub const OBJECT_HEADER_LEN: usize = 32;
+const CREATE_RECONCILIATION_CHUNK_SIZE: u64 = 8 * 1024 * 1024;
 const OBJECT_HEADER_MAGIC: &[u8; 8] = b"ZEROFS\x01\0";
 const SFTP_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
 const SFTP_STAGING_CLEANUP_ATTEMPTS: usize = 3;
@@ -316,7 +317,9 @@ pub async fn publish_payload(
     if mode == PublicationMode::Create {
         let publication = match session.hard_link(&staging, target).await {
             Ok(()) => Ok(()),
-            Err(error) => reconcile_create_publication(&session, target, header, error).await,
+            Err(error) => {
+                reconcile_create_publication(&session, target, &staging, header, error).await
+            }
         };
         return match publication {
             Ok(()) => Ok(PublicationOutcome {
@@ -399,15 +402,35 @@ async fn reconcile_publication(
 async fn reconcile_create_publication(
     session: &Arc<dyn RemoteSession>,
     target: &FilePath,
+    staging: &FilePath,
     expected: ObjectHeader,
     error: RemoteError,
 ) -> RemoteResult<()> {
     if !error.is_ambiguous() {
         return Err(error);
     }
-    let observed = (|| async {
+    let matches_staging = (|| async {
         let bytes = session.read_exact(target, 0, OBJECT_HEADER_LEN).await?;
-        decode_header(&bytes).map_err(RemoteError::CorruptObject)
+        let observed = decode_header(&bytes).map_err(RemoteError::CorruptObject)?;
+        if observed != expected {
+            return Ok(false);
+        }
+
+        let mut logical_offset = 0;
+        while logical_offset < expected.logical_len {
+            let len = (expected.logical_len - logical_offset).min(CREATE_RECONCILIATION_CHUNK_SIZE)
+                as usize;
+            let physical_offset = OBJECT_HEADER_LEN as u64 + logical_offset;
+            let (target_bytes, staging_bytes) = tokio::try_join!(
+                session.read_exact(target, physical_offset, len),
+                session.read_exact(staging, physical_offset, len),
+            )?;
+            if target_bytes != staging_bytes {
+                return Ok(false);
+            }
+            logical_offset += len as u64;
+        }
+        Ok(true)
     })
     .retry(
         ExponentialBuilder::default()
@@ -418,9 +441,9 @@ async fn reconcile_create_publication(
     .when(RemoteError::is_retryable)
     .await;
 
-    match observed {
-        Ok(found) if found == expected => Ok(()),
-        Ok(_) => Err(RemoteError::AlreadyExists(target.display().to_string())),
+    match matches_staging {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(RemoteError::AlreadyExists(target.display().to_string())),
         Err(RemoteError::NotFound(_)) => Err(error),
         Err(read_error) => Err(read_error),
     }
@@ -1273,8 +1296,14 @@ impl MultipartUpload for SftpMultipartUpload {
                 match self.session.hard_link(&staging, &self.target).await {
                     Ok(()) => Ok(()),
                     Err(error) => {
-                        reconcile_create_publication(&self.session, &self.target, header, error)
-                            .await
+                        reconcile_create_publication(
+                            &self.session,
+                            &self.target,
+                            &staging,
+                            header,
+                            error,
+                        )
+                        .await
                     }
                 }
             }
@@ -2968,6 +2997,7 @@ mod tests {
     struct LostReplySession {
         inner: RecordingSession,
         replace_target_header: bool,
+        replace_target_payload: bool,
         corrupt_target_header: bool,
         transient_read_call: Option<usize>,
         read_calls: AtomicUsize,
@@ -2978,6 +3008,7 @@ mod tests {
             Self {
                 inner: RecordingSession::new(),
                 replace_target_header: false,
+                replace_target_payload: false,
                 corrupt_target_header: false,
                 transient_read_call: None,
                 read_calls: AtomicUsize::new(0),
@@ -2995,9 +3026,17 @@ mod tests {
             Self {
                 inner: RecordingSession::new(),
                 replace_target_header: true,
+                replace_target_payload: false,
                 corrupt_target_header: false,
                 transient_read_call: None,
                 read_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn matching_header_with_different_payload() -> Self {
+            Self {
+                replace_target_payload: true,
+                ..Self::matching()
             }
         }
 
@@ -3005,6 +3044,7 @@ mod tests {
             Self {
                 inner: RecordingSession::new(),
                 replace_target_header: false,
+                replace_target_payload: false,
                 corrupt_target_header: true,
                 transient_read_call: None,
                 read_calls: AtomicUsize::new(0),
@@ -3012,11 +3052,20 @@ mod tests {
         }
 
         fn maybe_replace_target(&self, target: &FilePath) {
-            if !self.replace_target_header && !self.corrupt_target_header {
+            if !self.replace_target_header
+                && !self.replace_target_payload
+                && !self.corrupt_target_header
+            {
                 return;
             }
             let mut files = self.inner.files.lock().unwrap();
             let bytes = files.get_mut(target).expect("publication created target");
+            if self.replace_target_payload {
+                let mut replacement = bytes.to_vec();
+                replacement[OBJECT_HEADER_LEN] ^= 0xff;
+                *bytes = replacement.into();
+                return;
+            }
             let mut replacement = if self.corrupt_target_header {
                 vec![0; OBJECT_HEADER_LEN]
             } else {
@@ -3042,6 +3091,7 @@ mod tests {
         part_writes: AtomicUsize,
         durable_writes: AtomicUsize,
         lose_hardlink_reply: AtomicBool,
+        corrupt_hardlink_target: AtomicBool,
     }
 
     impl ParallelMultipartSession {
@@ -3054,12 +3104,21 @@ mod tests {
                 part_writes: AtomicUsize::new(0),
                 durable_writes: AtomicUsize::new(0),
                 lose_hardlink_reply: AtomicBool::new(false),
+                corrupt_hardlink_target: AtomicBool::new(false),
             }
         }
 
         fn with_lost_hardlink_reply() -> Self {
             Self {
                 lose_hardlink_reply: AtomicBool::new(true),
+                ..Self::new()
+            }
+        }
+
+        fn with_lost_hardlink_reply_and_corrupt_target() -> Self {
+            Self {
+                lose_hardlink_reply: AtomicBool::new(true),
+                corrupt_hardlink_target: AtomicBool::new(true),
                 ..Self::new()
             }
         }
@@ -3236,6 +3295,12 @@ mod tests {
                 .ok_or_else(|| RemoteError::NotFound(from.display().to_string()))?;
             files.insert(to.to_path_buf(), bytes);
             if self.lose_hardlink_reply.swap(false, Ordering::SeqCst) {
+                if self.corrupt_hardlink_target.swap(false, Ordering::SeqCst) {
+                    let target = files.get_mut(to).expect("hardlink target inserted");
+                    let mut replacement = target.to_vec();
+                    replacement[OBJECT_HEADER_LEN] ^= 0xff;
+                    *target = replacement.into();
+                }
                 return Err(RemoteError::Other("publication reply lost".to_owned()));
             }
             Ok(())
@@ -3404,6 +3469,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conditional_multipart_create_rejects_matching_header_with_different_payload() {
+        let session =
+            Arc::new(ParallelMultipartSession::with_lost_hardlink_reply_and_corrupt_target());
+        let location = ObjectPath::from("zerofs/v1/corrupt-lost-reply.bin");
+        let target = PathBuf::from("zerofs/v1/corrupt-lost-reply.bin");
+        let mut upload = SftpMultipartUpload::begin(
+            session,
+            location,
+            target,
+            Arc::new(DashSet::new()),
+            MultipartPublicationMode::Create,
+        )
+        .await
+        .unwrap();
+        let first = upload.put_part(PutPayload::from_static(b"immutable "));
+        let second = upload.put_part(PutPayload::from_static(b"multipart"));
+        futures::future::try_join(first, second).await.unwrap();
+
+        assert!(matches!(
+            upload.complete().await.unwrap_err(),
+            object_store::Error::AlreadyExists { .. }
+        ));
+    }
+
+    #[tokio::test]
     async fn failed_multipart_abort_keeps_staging_armed_for_retry() {
         let session = Arc::new(RecordingSession::with_remove_failure());
         let location = ObjectPath::from("zerofs/v1/abort.bin");
@@ -3493,7 +3583,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lost_publication_reply_reconciles_matching_target_header() {
+    async fn lost_publication_reply_reconciles_matching_object() {
         for mode in [PublicationMode::Create, PublicationMode::Overwrite] {
             let session = Arc::new(LostReplySession::matching());
             let target = FilePath::new("/objects/segment.bin");
@@ -3530,6 +3620,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_lost_reply_rejects_matching_header_with_different_payload() {
+        let error = publish_payload(
+            Arc::new(LostReplySession::matching_header_with_different_payload()),
+            FilePath::new("/objects/segment.bin"),
+            vec![Bytes::from_static(b"payload")],
+            PublicationMode::Create,
+            None,
+        )
+        .await
+        .expect_err("matching metadata cannot reconcile different object bytes");
+
+        assert!(matches!(error, RemoteError::AlreadyExists(_)));
+    }
+
+    #[tokio::test]
     async fn lost_publication_reply_retries_reconciliation_with_the_original_header() {
         let create = Arc::new(LostReplySession::matching_after_transient_read(1));
         let target = FilePath::new("/objects/create.bin");
@@ -3543,7 +3648,7 @@ mod tests {
         .await
         .expect("create reconciliation must retain its committed generation");
         assert_eq!(created.header.logical_len, 6);
-        assert_eq!(create.read_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(create.read_calls.load(Ordering::SeqCst), 4);
 
         let update = Arc::new(LostReplySession::matching_after_transient_read(2));
         let target = FilePath::new("/objects/update.bin");
