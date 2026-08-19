@@ -1111,7 +1111,7 @@ mod tests {
     async fn verify_uses_inode_grouped_scans_not_per_frame_point_reads() {
         let (store, db) = make().await;
         let mut model = Vec::new();
-        for i in 0..16u64 {
+        for i in 0..16usize {
             write_and_check(
                 &store,
                 &db,
