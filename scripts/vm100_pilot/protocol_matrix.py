@@ -6,6 +6,7 @@ import os
 import time
 import uuid
 from dataclasses import asdict, dataclass
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Callable, Mapping
 from urllib.parse import urlsplit
@@ -100,7 +101,7 @@ class ProtocolAuthority:
         if not root.is_absolute():
             raise ValueError(f"{protocol} mountpoint must be absolute: {root}")
         metrics = urlsplit(metrics_url)
-        if metrics.scheme not in {"http", "https"} or not metrics.hostname:
+        if metrics.scheme != "https" or not metrics.hostname:
             raise ValueError(f"invalid ZeroFS metrics endpoint: {metrics_url!r}")
         if protocol == "nfs":
             host = _nfs_host(endpoint)
@@ -269,14 +270,14 @@ class ProtocolWorkloadExecutor:
         self.owner._write_ledger(self.ledger, self.resources, 0, False)
         self.owner._create_source(source, workload.bytes)
         source_sha256 = file_sha256(source)
-        before = observer.metrics.snapshot()
+        before = observer.snapshot()
         write_started = time.monotonic_ns()
         foreground_ns = self.owner._copy_without_barrier(source, destination)
         memory = self.owner.memory_session
         if memory is not None:
             memory.sample(f"foreground_close:{workload.name}")
         accepted = wait_for_accepted_after(
-            observer.metrics.snapshot,
+            observer.snapshot,
             previous_sequence=before.accepted,
             timeout=self.owner.config.drain_timeout,
         )
@@ -284,7 +285,7 @@ class ProtocolWorkloadExecutor:
         if memory is not None:
             memory.sample(f"fsync_or_commit:{workload.name}")
         local = wait_for_local(
-            observer.metrics.snapshot,
+            observer.snapshot,
             target_sequence=accepted.accepted,
             timeout=self.owner.config.drain_timeout,
         )
@@ -292,7 +293,7 @@ class ProtocolWorkloadExecutor:
         if memory is not None:
             memory.sample(f"local:{workload.name}")
         remote = wait_for_remote(
-            observer.metrics.snapshot,
+            observer.snapshot,
             target_sequence=accepted.accepted,
             timeout=self.owner.config.drain_timeout,
         )
@@ -434,6 +435,8 @@ class ProtocolMatrixRunner:
         self,
         scenario: ProtocolScenario,
         authority: ProtocolAuthority,
+        *,
+        receipt: RunReceipt | None = None,
     ) -> ProtocolMatrixResult:
         if scenario.protocol != authority.protocol:
             raise ValueError(
@@ -450,7 +453,8 @@ class ProtocolMatrixRunner:
         if total_bytes <= 0:
             raise ValueError(f"scenario {scenario.name!r} has no byte-moving work")
 
-        receipt = RunReceipt.start(self.config, scenario.name)
+        owns_receipt = receipt is None
+        receipt = receipt or RunReceipt.start(self.config, scenario.name)
         run_id = uuid.uuid4().hex
         run_root = authority.mountpoint / f".zerofs-protocol-bench-{run_id}"
         scratch = self.config.temp_dir / f"zerofs-protocol-bench-{run_id}"
@@ -465,7 +469,7 @@ class ProtocolMatrixRunner:
         memory_envelope: dict[str, object] | None = None
         authority_receipt: dict[str, object] = {}
 
-        with receipt:
+        with receipt if owns_receipt else nullcontext(receipt):
             receipt.record("scenario", scenario.to_dict())
             receipt.record(
                 "requested_authority",

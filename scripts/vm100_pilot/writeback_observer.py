@@ -38,9 +38,12 @@ class WritebackObserver:
     def identity(self) -> MetricsAuthorityIdentity:
         return self.metrics.identity()
 
+    def snapshot(self) -> WritebackSnapshot:
+        return self.metrics.snapshot()
+
     def drain(self, timeout: float | None = None) -> dict[str, object]:
         receipt: DrainReceipt = wait_for_drain(
-            self.metrics.snapshot,
+            self.snapshot,
             timeout=self.drain_timeout if timeout is None else timeout,
         )
         return asdict(receipt)

@@ -31,6 +31,7 @@ from scripts.vm100_pilot.protocol_matrix import (  # noqa: E402
     ProtocolMatrixRunner,
 )
 from scripts.vm100_pilot.raw_sftp import RawSftpRunner  # noqa: E402
+from scripts.vm100_pilot.receipts import RunReceipt  # noqa: E402
 from scripts.vm100_pilot.real_world_matrix import RealWorldMatrixRunner  # noqa: E402
 from scripts.vm100_pilot.reset import FreshResetter  # noqa: E402
 from scripts.vm100_pilot.runner import Runner  # noqa: E402
@@ -185,6 +186,40 @@ def _emit(value: object) -> None:
     print(json.dumps(value, indent=2, sort_keys=True, default=str))
 
 
+def _run_protocol_matrix(
+    args: argparse.Namespace,
+    config: PilotConfig,
+    runner: Runner,
+) -> object:
+    receipt = RunReceipt.start(config, f"protocol-matrix-{args.protocol}")
+    with receipt:
+        receipt.record("requested_protocol", args.protocol)
+        receipt.record("memory_envelope_requested", bool(args.memory_envelope))
+        scenario = require_protocol_scenario(f"protocol-matrix-{args.protocol}")
+        authority = ProtocolAuthority.from_mapping(args.protocol, os.environ)
+        observer = WritebackObserver(
+            MetricsClient(authority.metrics_url, authority.metrics_identity),
+            config.drain_timeout,
+            authority.metrics_url,
+        )
+        memory_session = None
+        if args.memory_envelope:
+            memory_scenario = require_memory_scenario("memory-envelope")
+            memory_authority = MemoryEnvelopeAuthority.from_mapping(os.environ)
+            memory_session = MemoryEnvelopeSession.prepare(
+                memory_authority,
+                runner,
+                observer,
+                memory_scenario,
+            )
+        return ProtocolMatrixRunner(
+            config,
+            runner,
+            observer,
+            memory_session=memory_session,
+        ).run(scenario, authority, receipt=receipt)
+
+
 def dispatch(
     args: argparse.Namespace,
     config: PilotConfig | None,
@@ -276,31 +311,7 @@ def dispatch(
     elif args.command == "real-world-matrix":
         _emit(real_world.run(quick=args.quick))
     elif args.command == "protocol-matrix":
-        scenario = require_protocol_scenario(f"protocol-matrix-{args.protocol}")
-        authority = ProtocolAuthority.from_mapping(args.protocol, os.environ)
-        observer = WritebackObserver(
-            MetricsClient(authority.metrics_url),
-            config.drain_timeout,
-            authority.metrics_url,
-        )
-        memory_session = None
-        if args.memory_envelope:
-            memory_scenario = require_memory_scenario("memory-envelope")
-            memory_authority = MemoryEnvelopeAuthority.from_mapping(os.environ)
-            memory_session = MemoryEnvelopeSession.prepare(
-                memory_authority,
-                runner,
-                observer.metrics,
-                memory_scenario,
-            )
-        _emit(
-            ProtocolMatrixRunner(
-                config,
-                runner,
-                observer,
-                memory_session=memory_session,
-            ).run(scenario, authority)
-        )
+        _emit(_run_protocol_matrix(args, config, runner))
     elif args.command == "iterate":
         if args.skip_build:
             deployed = None

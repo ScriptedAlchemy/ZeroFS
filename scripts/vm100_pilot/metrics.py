@@ -154,8 +154,14 @@ class DrainReceipt:
 
 
 class MetricsClient:
-    def __init__(self, url: str, timeout: float = 5.0) -> None:
+    def __init__(
+        self,
+        url: str,
+        expected_identity: MetricsAuthorityIdentity | None = None,
+        timeout: float = 5.0,
+    ) -> None:
         self.url = url
+        self.expected_identity = expected_identity
         self.timeout = timeout
 
     def _fetch(self) -> str:
@@ -163,10 +169,25 @@ class MetricsClient:
             return response.read().decode("utf-8")
 
     def snapshot(self) -> WritebackSnapshot:
-        return WritebackSnapshot.parse(self._fetch())
+        text = self._fetch()
+        if self.expected_identity is not None:
+            actual = MetricsAuthorityIdentity.parse(text)
+            if actual != self.expected_identity:
+                raise ValueError(
+                    "ZeroFS metrics identity mismatch in snapshot: "
+                    f"expected={asdict(self.expected_identity)}, "
+                    f"actual={asdict(actual)}"
+                )
+        return WritebackSnapshot.parse(text)
 
     def identity(self) -> MetricsAuthorityIdentity:
-        return MetricsAuthorityIdentity.parse(self._fetch())
+        actual = MetricsAuthorityIdentity.parse(self._fetch())
+        if self.expected_identity is not None and actual != self.expected_identity:
+            raise ValueError(
+                "ZeroFS metrics identity mismatch: "
+                f"expected={asdict(self.expected_identity)}, actual={asdict(actual)}"
+            )
+        return actual
 
 
 def wait_for_gc_quiescence(

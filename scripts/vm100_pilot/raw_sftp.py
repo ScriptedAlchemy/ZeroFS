@@ -611,19 +611,24 @@ class RawSftpRunner:
                     time.sleep(0.01)
         finally:
             termination_errors: list[BaseException] = []
+            termination_deadline = time.monotonic() + min(self.phase_timeout, 10.0)
             for _, process, _, _ in processes:
                 if process.process.poll() is None:
                     try:
-                        process.terminate()
+                        remaining = max(0.01, termination_deadline - time.monotonic())
+                        process.terminate(timeout=remaining)
                     except BaseException as error:
                         termination_errors.append(error)
             for _, _, handle, _ in processes:
                 handle.close()
-            if termination_errors and failure is None:
-                failure = RuntimeError(
-                    "raw SFTP process-group termination failed: "
-                    + "; ".join(str(error) for error in termination_errors)
+            if termination_errors:
+                detail = "raw SFTP process-group termination failed: " + "; ".join(
+                    str(error) for error in termination_errors
                 )
+                if failure is None:
+                    failure = RuntimeError(detail)
+                else:
+                    failure.add_note(detail)
         if failure is not None:
             raise failure
         if len(finished) != len(batches):

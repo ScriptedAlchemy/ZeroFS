@@ -65,7 +65,10 @@ mounted options. Use the exact 9P source reported by `findmnt`; a missing 9P
 mount is an honest unavailable result, not permission to create a local
 substitute. NFS metrics must use the same literal server IP as the mount source.
 The supported 9P scenario is explicitly local and therefore requires a loopback
-metrics URL. Address equality is not enough to attribute durability evidence.
+metrics URL. Metrics URLs must use HTTPS with normal certificate validation;
+plain HTTP is unavailable because an identity label on an unauthenticated
+response cannot bind durability evidence. Address equality is not enough to
+attribute durability evidence.
 The harness also requires an exact match between three configured identity
 values and exactly one server-emitted series:
 
@@ -85,7 +88,7 @@ Example against deliberately prepared test mounts:
 ZEROFS_BENCH_NFS_MOUNTPOINT=/mnt/zerofs-test-nfs \
 ZEROFS_BENCH_NFS_ENDPOINT=192.0.2.10:/test \
 ZEROFS_BENCH_NFS_MOUNT_OPTIONS=rw,hard,vers=3,proto=tcp \
-ZEROFS_BENCH_NFS_METRICS_URL=http://192.0.2.10:9567/metrics \
+ZEROFS_BENCH_NFS_METRICS_URL=https://192.0.2.10:9567/metrics \
 ZEROFS_BENCH_NFS_METRICS_INSTANCE_ID=instance-uuid \
 ZEROFS_BENCH_NFS_METRICS_FILESYSTEM_ID=filesystem-uuid \
 ZEROFS_BENCH_NFS_METRICS_EXPORT_ID=nfs-test-root \
@@ -94,7 +97,7 @@ python3 scripts/vm100-pilot.py protocol-matrix --protocol nfs
 ZEROFS_BENCH_9P_MOUNTPOINT=/mnt/zerofs-test-9p \
 ZEROFS_BENCH_9P_ENDPOINT=zerofs-test \
 ZEROFS_BENCH_9P_MOUNT_OPTIONS=rw,trans=unix,access=client \
-ZEROFS_BENCH_9P_METRICS_URL=http://127.0.0.1:9567/metrics \
+ZEROFS_BENCH_9P_METRICS_URL=https://127.0.0.1:9567/metrics \
 ZEROFS_BENCH_9P_METRICS_INSTANCE_ID=instance-uuid \
 ZEROFS_BENCH_9P_METRICS_FILESYSTEM_ID=filesystem-uuid \
 ZEROFS_BENCH_9P_METRICS_EXPORT_ID=9p-test-root \

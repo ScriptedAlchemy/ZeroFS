@@ -137,6 +137,56 @@ class RawSftpAbTests(unittest.TestCase):
         self.assertTrue(runner.processes)
         self.assertTrue(all(process.terminated for process in runner.processes))
 
+    def test_worker_failure_preserves_process_group_termination_failure(self) -> None:
+        class Process:
+            def __init__(self, returncode: int | None, terminate_error: str = "") -> None:
+                self.process = self
+                self.argv = ("sftp",)
+                self.returncode = returncode
+                self.terminate_error = terminate_error
+
+            def poll(self) -> int | None:
+                return self.returncode
+
+            def terminate(self, timeout: float = 10.0) -> None:
+                del timeout
+                if self.terminate_error:
+                    raise RuntimeError(self.terminate_error)
+                self.returncode = -15
+
+        class SpawnRunner:
+            def __init__(self) -> None:
+                self.processes = [Process(7), Process(None, "cannot reap worker")]
+
+            def spawn(self, *args: object, **kwargs: object) -> Process:
+                del args, kwargs
+                return self.processes.pop(0)
+
+        raw = object.__new__(RawSftpRunner)
+        raw.runner = SpawnRunner()
+        raw.phase_timeout = 1
+        scratch = Path(self.temp.name)
+        batches = [scratch / "a.batch", scratch / "b.batch"]
+        logs = [scratch / "a.log", scratch / "b.log"]
+        for batch in batches:
+            batch.write_text("quit\n", encoding="utf-8")
+        endpoint = SftpEndpoint(
+            "alice", "203.0.113.10", 22, Path("/key"), Path("/known"), "/"
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "worker failed") as raised:
+            raw._parallel_batches(
+                endpoint,
+                batches,
+                logs,
+                Path("/ssh"),
+                buffer_bytes=1,
+                request_depth=1,
+                bytes_per_session=1,
+            )
+
+        self.assertIn("cannot reap worker", " ".join(raised.exception.__notes__))
+
     def test_metadata_deadline_terminates_its_process_group(self) -> None:
         class NeverCommand:
             def __init__(self) -> None:

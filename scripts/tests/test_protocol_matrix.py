@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import tempfile
 import unittest
@@ -11,7 +12,11 @@ from typing import Mapping, Sequence
 from unittest import mock
 
 from scripts.vm100_pilot.config import PilotConfig
-from scripts.vm100_pilot.metrics import MetricsAuthorityIdentity, WritebackSnapshot
+from scripts.vm100_pilot.metrics import (
+    MetricsAuthorityIdentity,
+    MetricsClient,
+    WritebackSnapshot,
+)
 from scripts.vm100_pilot.protocol_matrix import (
     ProtocolAuthority,
     ProtocolMatrixRunner,
@@ -23,6 +28,42 @@ from scripts.vm100_pilot.scenarios import (
     WorkloadDefinition,
     require_protocol_scenario,
 )
+
+
+ROOT = Path(__file__).resolve().parents[2]
+
+
+def load_cli() -> object:
+    spec = importlib.util.spec_from_file_location(
+        "vm100_pilot_cli_protocol", ROOT / "scripts" / "vm100-pilot.py"
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def metrics_text(identity: MetricsAuthorityIdentity, accepted: int = 3) -> str:
+    return "\n".join(
+        (
+            "zerofs_benchmark_authority_info{"
+            f'export_id="{identity.export_id}",'
+            f'filesystem_id="{identity.filesystem_id}",'
+            f'server_instance_id="{identity.server_instance_id}"'
+            "} 1",
+            f"zerofs_writeback_accepted_sequence {accepted}",
+            f"zerofs_writeback_local_sequence {accepted}",
+            f"zerofs_writeback_remote_sequence {accepted}",
+            "zerofs_writeback_dirty_ram_bytes 0",
+            "zerofs_writeback_dirty_ssd_reserved_bytes 0",
+            "zerofs_writeback_local_bytes_completed_total 1",
+            "zerofs_writeback_remote_bytes_completed_total 1",
+            "zerofs_writeback_terminal_error 0",
+            "zerofs_segment_gc_passes_total 1",
+            "zerofs_segment_gc_batches_total 1",
+            "zerofs_segment_gc_deleted_bytes_total 0",
+        )
+    )
 
 
 class AuthorityRunner(Runner):
@@ -72,13 +113,16 @@ class Lifecycle:
             or MetricsAuthorityIdentity("instance-a", "filesystem-a", "nfs-root"),
         )
         self.drain_calls = 0
-        self.metrics_endpoint = "http://10.10.10.55:9567/metrics"
+        self.metrics_endpoint = "https://10.10.10.55:9567/metrics"
 
     def status(self) -> dict[str, object]:
         return {"healthy": True}
 
     def identity(self) -> MetricsAuthorityIdentity:
         return self.metrics.identity()
+
+    def snapshot(self) -> WritebackSnapshot:
+        return self.metrics.snapshot()
 
     def drain(self, timeout: float | None = None) -> dict[str, object]:
         del timeout
@@ -102,7 +146,7 @@ class ProtocolAuthorityTests(unittest.TestCase):
             "ZEROFS_BENCH_NFS_MOUNTPOINT": str(self.root),
             "ZEROFS_BENCH_NFS_ENDPOINT": "10.10.10.55:/",
             "ZEROFS_BENCH_NFS_MOUNT_OPTIONS": "rw,hard,vers=3",
-            "ZEROFS_BENCH_NFS_METRICS_URL": "http://10.10.10.55:9567/metrics",
+            "ZEROFS_BENCH_NFS_METRICS_URL": "https://10.10.10.55:9567/metrics",
         }
         with self.assertRaisesRegex(ScenarioUnavailableError, "METRICS_INSTANCE_ID"):
             ProtocolAuthority.from_mapping("nfs", values)
@@ -117,6 +161,16 @@ class ProtocolAuthorityTests(unittest.TestCase):
             authority.metrics_identity,
             MetricsAuthorityIdentity("instance-a", "filesystem-a", "nfs-root"),
         )
+        with self.assertRaisesRegex(ValueError, "invalid ZeroFS metrics endpoint"):
+            ProtocolAuthority.from_mapping(
+                "nfs",
+                values
+                | {
+                    "ZEROFS_BENCH_NFS_METRICS_URL": (
+                        "http://10.10.10.55:9567/metrics"
+                    )
+                },
+            )
 
     def test_metrics_identity_requires_one_exact_server_emitted_series(self) -> None:
         identity = MetricsAuthorityIdentity.parse(
@@ -127,12 +181,21 @@ class ProtocolAuthorityTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "exactly one"):
             MetricsAuthorityIdentity.parse("zerofs_writeback_accepted_sequence 3\n")
 
+    def test_every_snapshot_rejects_identity_drift_in_the_same_response(self) -> None:
+        expected = MetricsAuthorityIdentity("instance-a", "filesystem-a", "nfs-root")
+        wrong = MetricsAuthorityIdentity("instance-b", "filesystem-a", "nfs-root")
+        client = MetricsClient("https://10.10.10.55/metrics", expected)
+        with mock.patch.object(client, "_fetch", return_value=metrics_text(wrong)) as fetch:
+            with self.assertRaisesRegex(ValueError, "identity mismatch"):
+                client.snapshot()
+        fetch.assert_called_once_with()
+
     def test_nfs_authority_rejects_mutable_host_aliases(self) -> None:
         values = {
             "ZEROFS_BENCH_NFS_MOUNTPOINT": str(self.root),
             "ZEROFS_BENCH_NFS_ENDPOINT": "zerofs.internal:/",
             "ZEROFS_BENCH_NFS_MOUNT_OPTIONS": "rw,hard,vers=3",
-            "ZEROFS_BENCH_NFS_METRICS_URL": "http://10.10.10.55:9567/metrics",
+            "ZEROFS_BENCH_NFS_METRICS_URL": "https://10.10.10.55:9567/metrics",
             "ZEROFS_BENCH_NFS_METRICS_INSTANCE_ID": "instance-a",
             "ZEROFS_BENCH_NFS_METRICS_FILESYSTEM_ID": "filesystem-a",
             "ZEROFS_BENCH_NFS_METRICS_EXPORT_ID": "nfs-root",
@@ -148,7 +211,7 @@ class ProtocolAuthorityTests(unittest.TestCase):
                 "ZEROFS_BENCH_NFS_MOUNTPOINT": str(self.root),
                 "ZEROFS_BENCH_NFS_ENDPOINT": "10.10.10.55:/",
                 "ZEROFS_BENCH_NFS_MOUNT_OPTIONS": "rw,hard,vers=3",
-                "ZEROFS_BENCH_NFS_METRICS_URL": "http://10.10.10.55:9567/metrics",
+                "ZEROFS_BENCH_NFS_METRICS_URL": "https://10.10.10.55:9567/metrics",
                 "ZEROFS_BENCH_NFS_METRICS_INSTANCE_ID": "instance-a",
                 "ZEROFS_BENCH_NFS_METRICS_FILESYSTEM_ID": "filesystem-a",
                 "ZEROFS_BENCH_NFS_METRICS_EXPORT_ID": "nfs-root",
@@ -197,7 +260,7 @@ class ProtocolAuthorityTests(unittest.TestCase):
                     "ZEROFS_BENCH_NFS_ENDPOINT": "10.10.10.55:/",
                     "ZEROFS_BENCH_NFS_MOUNT_OPTIONS": "rw,hard,vers=3",
                     "ZEROFS_BENCH_NFS_METRICS_URL": (
-                        "http://10.10.10.99:9567/metrics"
+                        "https://10.10.10.99:9567/metrics"
                     ),
                     "ZEROFS_BENCH_NFS_METRICS_INSTANCE_ID": "instance-a",
                     "ZEROFS_BENCH_NFS_METRICS_FILESYSTEM_ID": "filesystem-a",
@@ -229,6 +292,21 @@ class ProtocolMatrixTests(unittest.TestCase):
         )
         self.config.temp_dir.mkdir()
 
+    def test_unavailable_protocol_authority_still_writes_failed_manifest(self) -> None:
+        module = load_cli()
+        args = module.build_parser().parse_args(
+            ["protocol-matrix", "--protocol", "nfs"]
+        )
+        with mock.patch.dict("os.environ", {}, clear=True):
+            with self.assertRaisesRegex(ScenarioUnavailableError, "unavailable"):
+                module._run_protocol_matrix(args, self.config, Runner(base_env={}))
+
+        manifests = list(self.config.result_dir.glob("*/manifest.json"))
+        self.assertEqual(len(manifests), 1)
+        payload = json.loads(manifests[0].read_text(encoding="utf-8"))
+        self.assertEqual(payload["status"], "failed")
+        self.assertNotIn("METRICS_INSTANCE_ID=", payload.get("error", ""))
+
     def test_real_small_transfer_has_exact_sha_cutoffs_and_double_cleanup(self) -> None:
         scenario = ProtocolScenario(
             name="protocol-matrix-nfs-test",
@@ -242,7 +320,7 @@ class ProtocolMatrixTests(unittest.TestCase):
                 "ZEROFS_BENCH_NFS_MOUNTPOINT": str(self.protocol_root),
                 "ZEROFS_BENCH_NFS_ENDPOINT": "10.10.10.55:/",
                 "ZEROFS_BENCH_NFS_MOUNT_OPTIONS": "rw,hard,vers=3",
-                "ZEROFS_BENCH_NFS_METRICS_URL": "http://10.10.10.55:9567/metrics",
+                "ZEROFS_BENCH_NFS_METRICS_URL": "https://10.10.10.55:9567/metrics",
                 "ZEROFS_BENCH_NFS_METRICS_INSTANCE_ID": "instance-a",
                 "ZEROFS_BENCH_NFS_METRICS_FILESYSTEM_ID": "filesystem-a",
                 "ZEROFS_BENCH_NFS_METRICS_EXPORT_ID": "nfs-root",
@@ -313,7 +391,7 @@ class ProtocolMatrixTests(unittest.TestCase):
                 "ZEROFS_BENCH_NFS_MOUNTPOINT": str(self.protocol_root),
                 "ZEROFS_BENCH_NFS_ENDPOINT": "10.10.10.55:/",
                 "ZEROFS_BENCH_NFS_MOUNT_OPTIONS": "rw,hard,vers=3",
-                "ZEROFS_BENCH_NFS_METRICS_URL": "http://10.10.10.55:9567/metrics",
+                "ZEROFS_BENCH_NFS_METRICS_URL": "https://10.10.10.55:9567/metrics",
                 "ZEROFS_BENCH_NFS_METRICS_INSTANCE_ID": "instance-a",
                 "ZEROFS_BENCH_NFS_METRICS_FILESYSTEM_ID": "filesystem-a",
                 "ZEROFS_BENCH_NFS_METRICS_EXPORT_ID": "nfs-root",
@@ -366,7 +444,7 @@ class ProtocolMatrixTests(unittest.TestCase):
                 "ZEROFS_BENCH_NFS_MOUNTPOINT": str(self.protocol_root),
                 "ZEROFS_BENCH_NFS_ENDPOINT": "10.10.10.55:/",
                 "ZEROFS_BENCH_NFS_MOUNT_OPTIONS": "rw,hard,vers=3",
-                "ZEROFS_BENCH_NFS_METRICS_URL": "http://10.10.10.55:9567/metrics",
+                "ZEROFS_BENCH_NFS_METRICS_URL": "https://10.10.10.55:9567/metrics",
                 "ZEROFS_BENCH_NFS_METRICS_INSTANCE_ID": "instance-a",
                 "ZEROFS_BENCH_NFS_METRICS_FILESYSTEM_ID": "filesystem-a",
                 "ZEROFS_BENCH_NFS_METRICS_EXPORT_ID": "nfs-root",
