@@ -3,6 +3,8 @@ from __future__ import annotations
 from .protocols import (
     NBD_DEVICE,
     NBD_PORT,
+    NFS_PORT,
+    ResourceOwnership,
     ScenarioBuilder,
     ScenarioContext,
     ScenarioPlan,
@@ -24,8 +26,10 @@ from .integrity import floors_for
 CRASH_BOUNDARIES = ("pre-journal", "post-journal-pre-remote", "post-remote")
 
 
-def _restart_cycle(context: ScenarioContext) -> tuple[Step, ...]:
-    return server_crash_steps(context) + server_steps(context)
+def _restart_cycle(
+    context: ScenarioContext, listeners: tuple[ResourceOwnership, ...]
+) -> tuple[Step, ...]:
+    return server_crash_steps(context, listeners) + server_steps(context, listeners)
 
 
 def _verify_step(description: str, path: str) -> Step:
@@ -36,34 +40,74 @@ def _xfs_over_nbd_restart(context: ScenarioContext) -> ScenarioPlan:
     config = context.config
     mountpoint = _mountpoint(config, "xfs")
     proof = mountpoint / "xfs-restart-proof.bin"
+    listeners = (ResourceOwnership("listener", NBD_PORT),)
     steps = (
-        server_steps(context)
+        server_steps(context, listeners)
         + nbd_connect_steps(config)
         + (
-            Step("format XFS on the disposable device", ("mkfs.xfs", "-f", NBD_DEVICE), sudo=True),
-            Step("create the XFS mountpoint", ("mkdir", "-p", str(mountpoint))),
-            Step("mount XFS", ("mount", NBD_DEVICE, str(mountpoint)), sudo=True),
             Step(
-                "write and fsync a durability proof",
-                ("dd", "if=/dev/urandom", f"of={proof}", "bs=1M", "count=8", "conv=fsync"),
+                "format XFS on the disposable device",
+                ("mkfs.xfs", "-f", NBD_DEVICE),
                 sudo=True,
             ),
-            Step("unmount XFS before the crash", ("umount", str(mountpoint)), sudo=True),
+            Step("create the XFS mountpoint", ("mkdir", "-p", str(mountpoint))),
+            Step(
+                "mount XFS",
+                ("mount", NBD_DEVICE, str(mountpoint)),
+                sudo=True,
+                acquires=(ResourceOwnership("mount", str(mountpoint)),),
+            ),
+            Step(
+                "write and fsync a durability proof",
+                (
+                    "dd",
+                    "if=/dev/urandom",
+                    f"of={proof}",
+                    "bs=1M",
+                    "count=8",
+                    "conv=fsync",
+                ),
+                sudo=True,
+            ),
+            Step(
+                "unmount XFS before the crash",
+                ("umount", str(mountpoint)),
+                sudo=True,
+                releases=(ResourceOwnership("mount", str(mountpoint)),),
+            ),
         )
-        + _restart_cycle(context)
+        + _restart_cycle(context, listeners)
         + (
             Step(
                 "reattach the device after restart",
-                ("nbd-client", "127.0.0.1", str(NBD_PORT), NBD_DEVICE, "-name", config.unit_name),
+                (
+                    "nbd-client",
+                    "127.0.0.1",
+                    str(NBD_PORT),
+                    NBD_DEVICE,
+                    "-name",
+                    config.unit_name,
+                ),
                 sudo=True,
+                requires=(ResourceOwnership("device", NBD_DEVICE),),
             ),
             Step("check XFS after crash", ("xfs_repair", "-n", NBD_DEVICE), sudo=True),
-            Step("remount XFS", ("mount", NBD_DEVICE, str(mountpoint)), sudo=True),
+            Step(
+                "remount XFS",
+                ("mount", NBD_DEVICE, str(mountpoint)),
+                sudo=True,
+                acquires=(ResourceOwnership("mount", str(mountpoint)),),
+            ),
             _verify_step("verify the durability proof survived", str(proof)),
-            Step("unmount XFS", ("umount", str(mountpoint)), sudo=True),
+            Step(
+                "unmount XFS",
+                ("umount", str(mountpoint)),
+                sudo=True,
+                releases=(ResourceOwnership("mount", str(mountpoint)),),
+            ),
         )
         + nbd_disconnect_steps(config)
-        + server_stop_steps(context)
+        + server_stop_steps(context, listeners)
     )
     return ScenarioPlan(
         name="xfs-over-nbd-restart",
@@ -77,36 +121,65 @@ def _zfs_over_nbd_restart(context: ScenarioContext) -> ScenarioPlan:
     config = context.config
     pool = f"zerofs-tiered-{config.run_uuid}"
     proof = f"/{pool}/zfs-restart-proof.bin"
+    listeners = (ResourceOwnership("listener", NBD_PORT),)
     steps = (
-        server_steps(context)
+        server_steps(context, listeners)
         + nbd_connect_steps(config)
         + (
             Step(
                 "create the disposable run-scoped zpool",
                 ("zpool", "create", "-f", pool, NBD_DEVICE),
                 sudo=True,
+                acquires=(ResourceOwnership("pool", pool),),
             ),
             Step(
                 "write and sync a durability proof onto ZFS",
-                ("dd", "if=/dev/urandom", f"of={proof}", "bs=1M", "count=8", "conv=fsync"),
+                (
+                    "dd",
+                    "if=/dev/urandom",
+                    f"of={proof}",
+                    "bs=1M",
+                    "count=8",
+                    "conv=fsync",
+                ),
                 sudo=True,
             ),
-            Step("export the pool before the crash", ("zpool", "export", pool), sudo=True),
+            Step(
+                "export the pool before the crash", ("zpool", "export", pool), sudo=True
+            ),
         )
-        + _restart_cycle(context)
+        + _restart_cycle(context, listeners)
         + (
             Step(
                 "reattach the device after restart",
-                ("nbd-client", "127.0.0.1", str(NBD_PORT), NBD_DEVICE, "-name", config.unit_name),
+                (
+                    "nbd-client",
+                    "127.0.0.1",
+                    str(NBD_PORT),
+                    NBD_DEVICE,
+                    "-name",
+                    config.unit_name,
+                ),
                 sudo=True,
+                requires=(ResourceOwnership("device", NBD_DEVICE),),
             ),
-            Step("import the pool after crash", ("zpool", "import", pool), sudo=True),
+            Step(
+                "import the pool after crash",
+                ("zpool", "import", pool),
+                sudo=True,
+                requires=(ResourceOwnership("pool", pool),),
+            ),
             Step("scrub the pool", ("zpool", "scrub", "-w", pool), sudo=True),
             _verify_step("verify the durability proof survived", proof),
-            Step("destroy the disposable pool", ("zpool", "destroy", pool), sudo=True),
+            Step(
+                "destroy the disposable pool",
+                ("zpool", "destroy", pool),
+                sudo=True,
+                releases=(ResourceOwnership("pool", pool),),
+            ),
         )
         + nbd_disconnect_steps(config)
-        + server_stop_steps(context)
+        + server_stop_steps(context, listeners)
     )
     return ScenarioPlan(
         name="zfs-over-nbd-restart",
@@ -119,6 +192,7 @@ def _zfs_over_nbd_restart(context: ScenarioContext) -> ScenarioPlan:
 def _crash_boundary_matrix(context: ScenarioContext) -> ScenarioPlan:
     config = context.config
     unit = config.unit_name
+    listeners = (ResourceOwnership("listener", NFS_PORT),)
     steps: list[Step] = []
     for boundary in CRASH_BOUNDARIES:
         proof = f"boundary-{boundary}.bin"
@@ -137,14 +211,16 @@ def _crash_boundary_matrix(context: ScenarioContext) -> ScenarioPlan:
                         str(context.zerofs_config),
                     ),
                     sudo=True,
+                    acquires=(ResourceOwnership("unit", unit),) + listeners,
+                    capture_main_pid_unit=unit,
                 ),
                 Step("wait for protocol listeners", ("sleep", "3")),
             )
         )
         steps.extend(nfs_mount_steps(config))
         steps.extend(nfs_write_commit_steps(config, proof))
-        steps.extend(server_crash_steps(context))
-        steps.extend(server_steps(context))
+        steps.extend(server_crash_steps(context, listeners))
+        steps.extend(server_steps(context, listeners))
         steps.append(
             _verify_step(
                 f"verify durability across the {boundary} boundary",
@@ -152,7 +228,7 @@ def _crash_boundary_matrix(context: ScenarioContext) -> ScenarioPlan:
             )
         )
         steps.extend(nfs_unmount_steps(config))
-        steps.extend(server_stop_steps(context))
+        steps.extend(server_stop_steps(context, listeners))
     return ScenarioPlan(
         name="crash-boundary-matrix",
         legs=("nfs",),
@@ -164,12 +240,13 @@ def _crash_boundary_matrix(context: ScenarioContext) -> ScenarioPlan:
 def _local_receipt_restart(context: ScenarioContext) -> ScenarioPlan:
     config = context.config
     proof = "local-receipt-proof.bin"
+    listeners = (ResourceOwnership("listener", NFS_PORT),)
     steps = (
-        server_steps(context)
+        server_steps(context, listeners)
         + nfs_mount_steps(config)
         + nfs_write_commit_steps(config, proof)
         + nfs_unmount_steps(config)
-        + _restart_cycle(context)
+        + _restart_cycle(context, listeners)
         + nfs_mount_steps(config)
         + (
             _verify_step(
@@ -178,7 +255,7 @@ def _local_receipt_restart(context: ScenarioContext) -> ScenarioPlan:
             ),
         )
         + nfs_unmount_steps(config)
-        + server_stop_steps(context)
+        + server_stop_steps(context, listeners)
     )
     return ScenarioPlan(
         name="local-receipt-restart",
@@ -192,12 +269,13 @@ def _remote_receipt_clean_cache_restart(context: ScenarioContext) -> ScenarioPla
     config = context.config
     proof = "remote-receipt-proof.bin"
     cache = config.resource_root / "cache"
+    listeners = (ResourceOwnership("listener", NFS_PORT),)
     steps = (
-        server_steps(context)
+        server_steps(context, listeners)
         + nfs_mount_steps(config)
         + nfs_write_commit_steps(config, proof)
         + nfs_unmount_steps(config)
-        + server_crash_steps(context)
+        + server_crash_steps(context, listeners)
         + (
             Step(
                 "wipe the local cache so only the remote receipt remains",
@@ -205,7 +283,7 @@ def _remote_receipt_clean_cache_restart(context: ScenarioContext) -> ScenarioPla
                 sudo=True,
             ),
         )
-        + server_steps(context)
+        + server_steps(context, listeners)
         + nfs_mount_steps(config)
         + (
             _verify_step(
@@ -214,7 +292,7 @@ def _remote_receipt_clean_cache_restart(context: ScenarioContext) -> ScenarioPla
             ),
         )
         + nfs_unmount_steps(config)
-        + server_stop_steps(context)
+        + server_stop_steps(context, listeners)
     )
     return ScenarioPlan(
         name="remote-receipt-clean-cache-restart",
@@ -227,8 +305,9 @@ def _remote_receipt_clean_cache_restart(context: ScenarioContext) -> ScenarioPla
 def _terminal_fanout_and_shutdown_timeout(context: ScenarioContext) -> ScenarioPlan:
     config = context.config
     unit = config.unit_name
+    listeners = (ResourceOwnership("listener", NFS_PORT),)
     steps = (
-        server_steps(context)
+        server_steps(context, listeners)
         + nfs_mount_steps(config)
         + (
             Step(
@@ -244,12 +323,8 @@ def _terminal_fanout_and_shutdown_timeout(context: ScenarioContext) -> ScenarioP
             ),
         )
         + nfs_unmount_steps(config)
+        + server_stop_steps(context, listeners)
         + (
-            Step(
-                "stop with the shutdown timeout armed",
-                ("systemctl", "stop", unit),
-                sudo=True,
-            ),
             Step(
                 "collect the terminal fanout from the unit journal",
                 ("journalctl", "-u", unit, "--no-pager"),

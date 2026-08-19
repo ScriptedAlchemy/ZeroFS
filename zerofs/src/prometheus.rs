@@ -4,6 +4,8 @@ use crate::fs::metrics::{FileSystemStats, SegmentGcStats};
 use crate::fs::stats::FileSystemGlobalStats;
 use crate::task::spawn_named;
 use crate::writeback::model::WritebackStatus;
+use crate::writeback::pacing::SsdAdmissionMode;
+use crate::writeback::reservation::SsdAdmissionSnapshot;
 use crate::writeback::store::WritebackObjectStore;
 use metrics::{counter, gauge};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
@@ -266,7 +268,8 @@ fn collect_writeback_stats(writeback: Option<&WritebackObjectStore>) {
     match writeback.status() {
         Ok(status) => {
             gauge!("zerofs_writeback_status_collection_error").set(0.0);
-            record_writeback_status(&status);
+            let ssd = writeback.ssd_admission().snapshot();
+            record_writeback_status(&status, Some(&ssd));
         }
         Err(error) => {
             gauge!("zerofs_writeback_status_collection_error").set(1.0);
@@ -275,7 +278,7 @@ fn collect_writeback_stats(writeback: Option<&WritebackObjectStore>) {
     }
 }
 
-fn record_writeback_status(status: &WritebackStatus) {
+fn record_writeback_status(status: &WritebackStatus, ssd_admission: Option<&SsdAdmissionSnapshot>) {
     gauge!("zerofs_writeback_dirty_ram_bytes").set(status.dirty_ram_bytes as f64);
     gauge!("zerofs_writeback_dirty_ram_capacity_bytes").set(status.dirty_ram_capacity_bytes as f64);
     gauge!("zerofs_writeback_dirty_ram_operations").set(status.dirty_ram_operations as f64);
@@ -300,6 +303,17 @@ fn record_writeback_status(status: &WritebackStatus) {
         .absolute(status.remote_operations_completed);
     counter!("zerofs_writeback_retries_total").absolute(status.retries);
     gauge!("zerofs_writeback_terminal_error").set(f64::from(status.terminal_error.is_some()));
+    if let Some(ssd) = ssd_admission {
+        gauge!("zerofs_writeback_ssd_admission_paced")
+            .set(f64::from(ssd.mode == SsdAdmissionMode::Paced));
+        gauge!("zerofs_writeback_ssd_admitted_operations").set(ssd.used_operations as f64);
+        gauge!("zerofs_writeback_ssd_outstanding_physical_claim_bytes")
+            .set(ssd.outstanding_physical_claims as f64);
+        gauge!("zerofs_writeback_ssd_available_bytes").set(ssd.available_bytes as f64);
+        gauge!("zerofs_writeback_ssd_sampler_generation").set(ssd.sample_generation as f64);
+        gauge!("zerofs_writeback_ssd_release_credit_bytes").set(ssd.credit_bytes as f64);
+        gauge!("zerofs_writeback_ssd_release_credit_operations").set(ssd.credit_ops as f64);
+    }
 }
 
 /// Export name for a metadata-engine metric: the engine registers under
@@ -339,6 +353,9 @@ fn collect_lsm_stats(recorder: &DefaultMetricsRecorder) {
 mod tests {
     use super::{WRITEBACK_COLLECT_INTERVAL, lsm_export_name, record_writeback_status};
     use crate::writeback::model::WritebackStatus;
+    use crate::writeback::pacing::SsdReleaseCredit;
+    use crate::writeback::reservation::{SsdAdmission, SsdReservationRequest};
+    use crate::writeback::space_sample::PhysicalSpaceSample;
 
     #[test]
     fn writeback_metrics_refresh_fast_enough_for_durability_tier_measurement() {
@@ -381,8 +398,32 @@ mod tests {
             retries: 2,
             terminal_error: Some("remote unavailable".to_owned()),
         };
+        let ssd_admission = SsdAdmission::recover(
+            3,
+            10,
+            66,
+            33,
+            0,
+            [SsdReservationRequest {
+                ssd_reservation_bytes: 3,
+                physical_reservation_bytes: 13,
+                operations: 2,
+            }],
+            Some(PhysicalSpaceSample {
+                generation: 21,
+                available_bytes: 89,
+            }),
+        )
+        .unwrap();
+        ssd_admission
+            .apply_release_credit(SsdReleaseCredit {
+                ssd_reservation_bytes: 34,
+                operations: 5,
+            })
+            .unwrap();
+        let ssd = ssd_admission.snapshot();
 
-        record_writeback_status(&status);
+        record_writeback_status(&status, Some(&ssd));
         let rendered = handle.render();
         for expected in [
             "zerofs_writeback_dirty_ram_bytes 4",
@@ -396,6 +437,13 @@ mod tests {
             "zerofs_writeback_remote_bytes_completed_total 7",
             "zerofs_writeback_retries_total 2",
             "zerofs_writeback_terminal_error 1",
+            "zerofs_writeback_ssd_admission_paced 1",
+            "zerofs_writeback_ssd_admitted_operations 2",
+            "zerofs_writeback_ssd_outstanding_physical_claim_bytes 13",
+            "zerofs_writeback_ssd_available_bytes 89",
+            "zerofs_writeback_ssd_sampler_generation 21",
+            "zerofs_writeback_ssd_release_credit_bytes 34",
+            "zerofs_writeback_ssd_release_credit_operations 5",
         ] {
             assert!(
                 rendered.contains(expected),

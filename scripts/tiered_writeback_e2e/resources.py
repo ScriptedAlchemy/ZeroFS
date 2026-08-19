@@ -22,7 +22,16 @@ if TYPE_CHECKING:
     from .config import HarnessConfig
 
 SCHEMA = 1
-RESOURCE_KINDS = ("process", "listener", "mount", "device", "pool", "prefix", "path")
+RESOURCE_KINDS = (
+    "unit",
+    "process",
+    "listener",
+    "mount",
+    "device",
+    "pool",
+    "prefix",
+    "path",
+)
 
 _NBD_DEVICE = re.compile(r"/dev/nbd(?:0|[1-9][0-9]*)\Z")
 _SYSTEM_PORT_CEILING = 1024
@@ -176,9 +185,7 @@ class ResourceLedger:
             previous = str(event.get("hash"))
 
     def append(self, kind: str, payload: Mapping[str, Any]) -> dict[str, Any]:
-        previous = (
-            self.events[-1]["hash"] if self.events else self.identity_hash()
-        )
+        previous = self.events[-1]["hash"] if self.events else self.identity_hash()
         body = {
             "index": len(self.events),
             "kind": kind,
@@ -196,21 +203,20 @@ class ResourceLedger:
     def _validate_resource(self, kind: str, value: Any) -> Any:
         if kind not in RESOURCE_KINDS:
             raise UnownedResourceError(f"unknown resource kind {kind!r}")
+        if kind == "unit":
+            if not isinstance(value, str) or not value.startswith(
+                f"zerofs-tiered-{self.run_uuid}"
+            ):
+                raise UnownedResourceError(
+                    f"unowned unit {value!r}: not scoped to run {self.run_uuid}"
+                )
+            return value
         if kind == "process":
-            if isinstance(value, str):
-                if not value.startswith(f"zerofs-tiered-{self.run_uuid}"):
-                    raise UnownedResourceError(
-                        f"unowned unit {value!r}: not scoped to run {self.run_uuid}"
-                    )
-                return value
             if not isinstance(value, int) or value <= 0:
                 raise UnownedResourceError(f"unowned process id {value!r}")
             return value
         if kind == "listener":
-            if (
-                not isinstance(value, int)
-                or not _SYSTEM_PORT_CEILING <= value <= 65535
-            ):
+            if not isinstance(value, int) or not _SYSTEM_PORT_CEILING <= value <= 65535:
                 raise UnownedResourceError(
                     f"unowned listener port {value!r}: system and invalid ports are "
                     "never harness-owned"
@@ -244,15 +250,37 @@ class ResourceLedger:
 
     def record_resource(self, kind: str, value: Any, **details: Any) -> None:
         validated = self._validate_resource(kind, value)
+        if kind == "process":
+            unit = self._validate_resource("unit", details.get("unit"))
+            if ("unit", str(unit)) not in {
+                (active_kind, str(active_value))
+                for active_kind, active_value, _ in self.outstanding()
+            }:
+                raise UnownedResourceError(
+                    f"process {validated!r} has no active unit authority {unit!r}"
+                )
+        key = (kind, str(validated))
+        if any(
+            (owned_kind, str(owned_value)) == key
+            for owned_kind, owned_value, _ in self.outstanding()
+        ):
+            raise UnownedResourceError(
+                f"{kind} {validated!r} is already active for run {self.run_uuid}"
+            )
         self.append(
             "acquire", {"resource": kind, "value": validated, "details": details}
         )
 
     def record_release(self, kind: str, value: Any, **details: Any) -> None:
-        self.require_owned(kind, value)
-        self.append(
-            "release", {"resource": kind, "value": value, "details": details}
-        )
+        key = (kind, str(value))
+        if not any(
+            (owned_kind, str(owned_value)) == key
+            for owned_kind, owned_value, _ in self.outstanding()
+        ):
+            raise UnownedResourceError(
+                f"{kind} {value!r} is not active for run {self.run_uuid}"
+            )
+        self.append("release", {"resource": kind, "value": value, "details": details})
 
     def resources(self) -> list[tuple[str, Any, dict[str, Any]]]:
         return [
@@ -266,22 +294,34 @@ class ResourceLedger:
         ]
 
     def outstanding(self) -> list[tuple[str, Any, dict[str, Any]]]:
-        released: set[tuple[str, str]] = {
-            (event["payload"]["resource"], str(event["payload"]["value"]))
-            for event in self.events
-            if event["kind"] == "release"
-        }
-        return [
-            (kind, value, details)
-            for kind, value, details in self.resources()
-            if (kind, str(value)) not in released
-        ]
+        active: dict[tuple[str, str], tuple[str, Any, dict[str, Any]]] = {}
+        for event in self.events:
+            if event["kind"] not in ("acquire", "release"):
+                continue
+            payload = event["payload"]
+            key = (payload["resource"], str(payload["value"]))
+            if event["kind"] == "acquire":
+                active[key] = (
+                    payload["resource"],
+                    payload["value"],
+                    dict(payload.get("details", {})),
+                )
+            else:
+                active.pop(key, None)
+        return list(active.values())
 
     def require_owned(self, kind: str, value: Any) -> None:
         recorded = {(k, str(v)) for k, v, _ in self.resources()}
         if (kind, str(value)) not in recorded:
             raise UnownedResourceError(
                 f"{kind} {value!r} was never recorded by run {self.run_uuid}"
+            )
+
+    def require_active(self, kind: str, value: Any) -> None:
+        active = {(k, str(v)) for k, v, _ in self.outstanding()}
+        if (kind, str(value)) not in active:
+            raise UnownedResourceError(
+                f"{kind} {value!r} is not active for run {self.run_uuid}"
             )
 
     def validate_cleanup_scope(self) -> Path:
@@ -291,7 +331,9 @@ class ResourceLedger:
             self.identity.get("run_uuid"),
             self.control_root,
             self.resource_root,
-            root_parent=Path(str(self.identity.get("root_parent", DEFAULT_ROOT_PARENT))),
+            root_parent=Path(
+                str(self.identity.get("root_parent", DEFAULT_ROOT_PARENT))
+            ),
             workspace_root=Path(str(workspace)) if workspace else None,
             extra_strings=(str(self.identity.get("backend_prefix", "")),),
         )
