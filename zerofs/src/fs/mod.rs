@@ -132,6 +132,10 @@ pub struct ZeroFS {
     pub(crate) materializer: std::sync::Arc<
         std::sync::OnceLock<std::sync::Arc<crate::fs::mutation::materializer::Materializer>>,
     >,
+    /// Shared preparation gate plus materialization progress for metadata fences.
+    pub(crate) mutation_coordinator: std::sync::Arc<
+        std::sync::OnceLock<std::sync::Arc<crate::fs::mutation::fence::MutationCoordinator>>,
+    >,
     /// Durability lineage token (see `client_fsync_verified`). Identifies the current
     /// unbroken durable lineage; set once at bring-up, constant for this process's life.
     /// A ZeroFS client carries it, and a verified fsync succeeds only while it is

@@ -258,6 +258,7 @@ impl ZeroFS {
             ),
             volatile_overlay: std::sync::Arc::new(std::sync::OnceLock::new()),
             materializer: std::sync::Arc::new(std::sync::OnceLock::new()),
+            mutation_coordinator: std::sync::Arc::new(std::sync::OnceLock::new()),
             lineage_token,
             serving_writer_epoch,
             max_bytes,

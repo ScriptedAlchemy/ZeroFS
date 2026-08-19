@@ -5,9 +5,14 @@
 //! inode locks, and reopens admission on drop. It promises visibility
 //! order only, never SSD durability.
 
+use crate::fs::ZeroFS;
+use crate::fs::errors::FsError;
+#[cfg(test)]
+use crate::fs::inode::InodeId;
 use crate::fs::mutation::admission::PreparationGate;
 use crate::fs::mutation::progress::MutationProgress;
-use crate::fs::mutation::types::{ConflictScope, MutationCutoff, MutationError};
+use crate::fs::mutation::types::{ConflictKey, ConflictScope, MutationCutoff, MutationError};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 /// Owns preparation quiescence plus gap-free materialization drain.
@@ -89,6 +94,146 @@ impl Drop for MaterializationFence {
             self.armed = false;
             self.gate.reopen_scope(&self.scope);
         }
+    }
+}
+
+/// Holds a materialization fence for the duration of one metadata operation.
+/// Overlay drain happens before this guard is returned so setattr/io do not
+/// grow a second wait beside the fence.
+pub(crate) struct MetadataFence {
+    _materialization: Option<MaterializationFence>,
+}
+
+fn mutation_fs_error(error: MutationError) -> FsError {
+    match error {
+        MutationError::TooLarge { .. } => FsError::NoSpace,
+        MutationError::StaleIncarnation => FsError::StaleHandle,
+        MutationError::Closed | MutationError::Poisoned(_) => FsError::IoError,
+    }
+}
+
+impl ZeroFS {
+    /// Close overlapping preparation, drain accepted writes, then drain the
+    /// volatile overlay. Callers take canonical locks only after this returns.
+    pub(crate) async fn fence_metadata(
+        &self,
+        scope: ConflictScope,
+    ) -> Result<MetadataFence, FsError> {
+        let materialization = if let Some(coordinator) = self.mutation_coordinator.get() {
+            Some(
+                coordinator
+                    .materialization_fence(scope.clone())
+                    .await
+                    .map_err(mutation_fs_error)?,
+            )
+        } else {
+            None
+        };
+        let mut seen = BTreeSet::new();
+        for key in scope.keys() {
+            let id = match key {
+                ConflictKey::Inode(id) | ConflictKey::Directory(id) => id,
+            };
+            if seen.insert(id) {
+                self.quiesce_overlay_inode(id).await?;
+            }
+        }
+        Ok(MetadataFence {
+            _materialization: materialization,
+        })
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct HeldPreparation {
+    guard: Option<crate::fs::mutation::admission::PreparationGuard>,
+    _cache: crate::fs::mutation::request_cache::RequestCache,
+    _budget: crate::fs::mutation::admission::RawMutationBudget,
+}
+
+#[cfg(test)]
+impl HeldPreparation {
+    pub(crate) fn abort(mut self) {
+        if let Some(guard) = self.guard.take() {
+            guard
+                .abort(crate::fs::mutation::admission::PreparationAbort::TransportCancellation)
+                .unwrap();
+        }
+    }
+}
+
+#[cfg(test)]
+impl ZeroFS {
+    pub(crate) async fn hold_preparation_for_test(&self, scope: ConflictScope) -> HeldPreparation {
+        use crate::fs::mutation::admission::{PreparationGuard, RawMutationBudget};
+        use crate::fs::mutation::request_cache::{RequestCache, RequestLookup};
+        use crate::fs::mutation::types::{RequestFingerprint, RequestIdentity, RequestLifetime};
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static HANDLE: AtomicU64 = AtomicU64::new(1);
+        let coordinator = self
+            .mutation_coordinator
+            .get()
+            .expect("start_materializer must install the mutation coordinator");
+        let cache = RequestCache::new(8);
+        let budget = RawMutationBudget::new(1 << 20, 1024);
+        let handle = HANDLE.fetch_add(1, Ordering::Relaxed);
+        let pending = match cache
+            .lookup_or_reserve(
+                RequestIdentity::Nbd {
+                    connection_incarnation: 7,
+                    handle,
+                },
+                RequestFingerprint::from_parts(&[&handle.to_le_bytes()]),
+                RequestLifetime::InFlightOnly,
+            )
+            .unwrap()
+        {
+            RequestLookup::Vacant(vacancy) => vacancy.begin_pending(),
+            other => panic!("expected vacant lookup, got {other:?}"),
+        };
+        let guard = PreparationGuard::new(
+            coordinator.gate(),
+            scope,
+            budget.acquire(1).await.unwrap(),
+            pending,
+        )
+        .unwrap();
+        HeldPreparation {
+            guard: Some(guard),
+            _cache: cache,
+            _budget: budget,
+        }
+    }
+
+    pub(crate) async fn assert_pending_write_drains_without_canonical_lock<T>(
+        self: &Arc<Self>,
+        scope: ConflictScope,
+        lock_id: InodeId,
+        op: impl std::future::Future<Output = T> + Send + 'static,
+    ) -> T
+    where
+        T: Send + 'static,
+    {
+        let hold = self.hold_preparation_for_test(scope).await;
+        let task = tokio::spawn(op);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(
+            !task.is_finished(),
+            "metadata op must wait for the pending overlapping write"
+        );
+        let _lock = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            self.lock_manager.acquire(lock_id),
+        )
+        .await
+        .expect("fence must not hold a canonical lock while draining");
+        drop(_lock);
+        hold.abort();
+        tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .expect("metadata op must finish after the write drains")
+            .expect("metadata op task must join")
     }
 }
 

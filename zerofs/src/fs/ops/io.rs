@@ -8,6 +8,7 @@ use fp::fail_point;
 use crate::dedup::DedupResult;
 use crate::fs::errors::FsError;
 use crate::fs::inode::{Inode, InodeId};
+use crate::fs::mutation::types::{ConflictKey, ConflictScope};
 use crate::fs::permissions::{AccessMode, Credentials, check_access};
 use crate::fs::tracing::FileOperation;
 use crate::fs::types::{AuthContext, FallocateMode, FileAttributes, InodeWithId};
@@ -110,7 +111,9 @@ impl ZeroFS {
             id, offset, length
         );
 
-        self.quiesce_overlay_inode(id).await?;
+        let _fence = self
+            .fence_metadata(ConflictScope::single(ConflictKey::Inode(id)))
+            .await?;
         let _guard = self.lock_manager.acquire(id).await;
         let inode = self.inode_store.get(id).await?;
         let creds = Credentials::from_auth_context(auth);
@@ -204,7 +207,9 @@ impl ZeroFS {
         }
         let end = offset.checked_add(length).ok_or(FsError::InvalidArgument)?;
 
-        self.quiesce_overlay_inode(id).await?;
+        let _fence = self
+            .fence_metadata(ConflictScope::single(ConflictKey::Inode(id)))
+            .await?;
         let _guard = self.lock_manager.acquire(id).await;
         // Direct filesystem callers do not pass through the 9P single-flight.
         if let Some(result) = self.replay_dedup_result(&op_id, DedupResult::into_fallocate)? {
@@ -1685,5 +1690,82 @@ mod tests {
         let mut want = vec![b'B'; 12288];
         want[..4096].fill(b'A');
         assert_eq!(data, want, "the overlapping write lost the first write");
+    }
+
+    #[tokio::test]
+    async fn pending_write_drains_before_trim_without_holding_canonical_lock() {
+        use crate::fs::mutation::types::{ConflictKey, ConflictScope};
+        use std::sync::Arc;
+
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        fs.start_materializer();
+        let (file_id, _) = fs
+            .create(
+                &test_creds(),
+                0,
+                b"fenced-trim.txt",
+                &SetAttributes::default(),
+            )
+            .await
+            .unwrap();
+        fs.write(
+            &(&test_auth()).into(),
+            file_id,
+            0,
+            &Bytes::from_static(b"abcdef"),
+        )
+        .await
+        .unwrap();
+
+        fs.assert_pending_write_drains_without_canonical_lock(
+            ConflictScope::single(ConflictKey::Inode(file_id)),
+            file_id,
+            {
+                let fs = Arc::clone(&fs);
+                async move { fs.trim(&(&test_auth()).into(), file_id, 0, 3).await }
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn pending_write_drains_before_fallocate_without_holding_canonical_lock() {
+        use crate::fs::mutation::types::{ConflictKey, ConflictScope};
+        use std::sync::Arc;
+
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        fs.start_materializer();
+        let (file_id, _) = fs
+            .create(
+                &test_creds(),
+                0,
+                b"fenced-falloc.txt",
+                &SetAttributes::default(),
+            )
+            .await
+            .unwrap();
+
+        let attrs = fs
+            .assert_pending_write_drains_without_canonical_lock(
+                ConflictScope::single(ConflictKey::Inode(file_id)),
+                file_id,
+                {
+                    let fs = Arc::clone(&fs);
+                    async move {
+                        fs.fallocate_opened(
+                            &(&test_auth()).into(),
+                            file_id,
+                            0,
+                            16,
+                            FallocateMode::Allocate,
+                        )
+                        .await
+                    }
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(attrs.size, 16);
     }
 }

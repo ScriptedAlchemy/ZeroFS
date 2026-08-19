@@ -8,6 +8,7 @@ use fp::fail_point;
 use crate::dedup::DedupResult;
 use crate::fs::errors::FsError;
 use crate::fs::inode::{Inode, InodeAttrs, InodeId};
+use crate::fs::mutation::types::{ConflictKey, ConflictScope};
 use crate::fs::permissions::{
     AccessMode, Credentials, can_set_times, check_access, check_ownership, validate_mode,
 };
@@ -142,7 +143,9 @@ impl ZeroFS {
             creds.gid,
             &creds.groups[..creds.groups_count]
         );
-        self.quiesce_overlay_inode(id).await?;
+        let _fence = self
+            .fence_metadata(ConflictScope::single(ConflictKey::Inode(id)))
+            .await?;
         let _guard = self.lock_manager.acquire(id).await;
         // A same-id call may have completed while this one waited for the inode
         // lock (direct filesystem callers do not pass through the 9P single-flight).
@@ -1034,5 +1037,54 @@ mod tests {
         assert_eq!(shrunk.size, 1_024);
         assert_eq!(fs.quota.committed_bytes(), after_grow - 3_072);
         assert_eq!(fs.quota.pending_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn pending_write_drains_before_truncate_without_holding_canonical_lock() {
+        use crate::fs::mutation::types::{ConflictKey, ConflictScope};
+        use std::sync::Arc;
+
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        fs.start_materializer();
+        let (file_id, _) = fs
+            .create(
+                &test_creds(),
+                0,
+                b"fenced-trunc.txt",
+                &SetAttributes::default(),
+            )
+            .await
+            .unwrap();
+        fs.write(
+            &(&test_auth()).into(),
+            file_id,
+            0,
+            &Bytes::from_static(b"abcdef"),
+        )
+        .await
+        .unwrap();
+
+        let attrs = fs
+            .assert_pending_write_drains_without_canonical_lock(
+                ConflictScope::single(ConflictKey::Inode(file_id)),
+                file_id,
+                {
+                    let fs = Arc::clone(&fs);
+                    async move {
+                        fs.setattr(
+                            &test_creds(),
+                            file_id,
+                            &SetAttributes {
+                                size: SetSize::Set(2),
+                                ..SetAttributes::default()
+                            },
+                        )
+                        .await
+                    }
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(attrs.size, 2);
     }
 }

@@ -313,13 +313,17 @@ impl ZeroFS {
 
     /// Start owned apply workers once the filesystem is in an `Arc`.
     pub fn start_materializer(self: &Arc<Self>) {
-        let _ = self
-            .materializer
-            .set(super::materializer::Materializer::start(
-                super::types::MutationIncarnation::new(),
-                Arc::downgrade(self),
-                self.volatile_overlay.get().cloned(),
-            ));
+        let materializer = super::materializer::Materializer::start(
+            super::types::MutationIncarnation::new(),
+            Arc::downgrade(self),
+            self.volatile_overlay.get().cloned(),
+        );
+        let coordinator = super::fence::MutationCoordinator::new(
+            super::admission::PreparationGate::new(materializer.incarnation()),
+            materializer.progress(),
+        );
+        let _ = self.materializer.set(materializer);
+        let _ = self.mutation_coordinator.set(coordinator);
     }
 
     pub(crate) fn volatile_budget(&self) -> Option<Arc<VolatileBudget>> {
@@ -356,7 +360,7 @@ impl ZeroFS {
         Ok(inode)
     }
 
-    /// RAM-ack write used by NFS, 9P, and WebUI. Materialized mode falls
+    /// RAM-ack write used by NFS, 9P, NBD, and WebUI. Materialized mode falls
     /// through to the canonical write path.
     pub async fn write_ack(
         &self,
