@@ -449,6 +449,45 @@ printf 'parent_frozen=%s\n' "$parent_frozen"
         self.assertIn("private 10.10.10.20:8080", result.stdout)
         self.assertNotIn("pct destroy 120", result.stdout)
 
+    def test_prod_nfs_quiesce_waits_for_a_recent_session_to_settle(self) -> None:
+        source = HOST_SCRIPT.read_text()
+        function = source[
+            source.index("assert_prod_nfs_quiesced() {") : source.index(
+                "graceful_stop() {"
+            )
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            counter = Path(directory) / "calls"
+            counter.write_text("0")
+            script = f"""set -euo pipefail
+role=prod
+dry_run=false
+container_ip=10.10.10.55
+ctid=198
+counter={counter}
+ct_running() {{ return 0; }}
+sleep() {{ :; }}
+pct() {{
+  calls=$(<"$counter")
+  calls=$((calls + 1))
+  printf '%s\n' "$calls" >"$counter"
+  if ((calls < 3)); then
+    printf '0 0 10.10.10.55:2049 10.10.10.10:893\n'
+  fi
+}}
+{function}
+assert_prod_nfs_quiesced
+cat "$counter"
+"""
+            result = subprocess.run(
+                ["bash", "-c", script],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "4")
+
     def test_prod_deferred_deploy_has_explicit_commit_and_rollback_controls(
         self,
     ) -> None:
