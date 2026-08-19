@@ -9,7 +9,6 @@ use crate::writeback::store::WritebackObjectStore;
 use metrics::{counter, gauge};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use slatedb_common::metrics::{DefaultMetricsRecorder, MetricValue};
-use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -98,6 +97,11 @@ pub async fn start(
     shutdown: CancellationToken,
 ) -> anyhow::Result<Vec<JoinHandle<()>>> {
     let prepared_authority = prepare_authority_server(config, authority).await?;
+    let plaintext_listeners = if prepared_authority.is_none() {
+        bind_plaintext_listeners(config).await?
+    } else {
+        Vec::new()
+    };
     let recorder = PrometheusBuilder::new().build_recorder();
     let handle = recorder.handle();
 
@@ -135,15 +139,18 @@ pub async fn start(
             }));
         }
     } else {
-        for &addr in &config.addresses {
+        for listener in plaintext_listeners {
+            let address = listener
+                .local_addr()
+                .expect("bound Prometheus listener has a local address");
             tracing::info!(
                 "Prometheus metrics server listening on http://{}/metrics",
-                addr
+                address
             );
             let server_handle = handle.clone();
             let server_shutdown = shutdown.clone();
             handles.push(spawn_named("prometheus-http", async move {
-                serve_metrics(addr, server_handle, None, server_shutdown).await;
+                serve_metrics(listener, server_handle, None, server_shutdown).await;
             }));
         }
     }
@@ -200,6 +207,25 @@ pub async fn start(
     }));
 
     Ok(handles)
+}
+
+async fn bind_plaintext_listeners(
+    config: &PrometheusConfig,
+) -> anyhow::Result<Vec<tokio::net::TcpListener>> {
+    use anyhow::Context;
+
+    if config.benchmark_authority.is_some() {
+        anyhow::bail!("plaintext metrics listeners cannot be prepared in authority mode");
+    }
+    let mut listeners = Vec::with_capacity(config.addresses.len());
+    for address in &config.addresses {
+        listeners.push(
+            tokio::net::TcpListener::bind(address)
+                .await
+                .with_context(|| format!("failed to bind Prometheus metrics at {address}"))?,
+        );
+    }
+    Ok(listeners)
 }
 
 struct PreparedAuthorityServer {
@@ -363,19 +389,11 @@ fn load_tls_config(
 }
 
 async fn serve_metrics(
-    addr: SocketAddr,
+    listener: tokio::net::TcpListener,
     handle: PrometheusHandle,
     authority: Option<BenchmarkAuthority>,
     shutdown: CancellationToken,
 ) {
-    let listener = match tokio::net::TcpListener::bind(addr).await {
-        Ok(l) => l,
-        Err(e) => {
-            tracing::error!("Failed to bind Prometheus HTTP server to {}: {}", addr, e);
-            return;
-        }
-    };
-
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => break,
@@ -1068,6 +1086,25 @@ mod tests {
         assert_eq!(
             authority.server_instance_id,
             "2be254ef917b4ff8a2c547b873709aef"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_metrics_startup_fails_when_plaintext_address_is_occupied() {
+        let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = PrometheusConfig {
+            addresses: std::iter::once(occupied.local_addr().unwrap()).collect(),
+            benchmark_authority: None,
+        };
+
+        let error = match super::bind_plaintext_listeners(&config).await {
+            Err(error) => error,
+            Ok(_) => panic!("occupied plaintext metrics address must fail startup"),
+        };
+
+        assert!(
+            format!("{error:#}").contains("failed to bind Prometheus metrics"),
+            "unexpected error: {error:#}"
         );
     }
 
