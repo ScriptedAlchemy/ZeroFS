@@ -860,6 +860,9 @@ pub async fn build_slatedb(
     wal_object_store: Option<Arc<dyn object_store::ObjectStore>>,
     replication: Option<&crate::replication::ReplicationParams>,
 ) -> Result<SlateDbOpen> {
+    #[cfg(test)]
+    let _rss_cap_guard = crate::alloc_rss::lock_test_rss_cap().await;
+
     let total_disk_cache_gb = cache_config.max_cache_size_gb;
     let total_memory_cache_gb = cache_config.memory_cache_size_gb.unwrap_or(0.25);
 
@@ -1087,6 +1090,7 @@ pub async fn build_slatedb(
             info!("Opening database in read-only mode");
 
             let mut reader_builder = DbReader::builder(db_path, object_store)
+                .with_db_cache(cache)
                 .with_block_transformer(block_transformer)
                 .with_filter_policies(crate::fs::filter_policy::filter_policies())
                 .with_segment_extractor(Arc::new(crate::segment_extractor::ZeroFsSegmentExtractor));
@@ -1113,6 +1117,7 @@ pub async fn build_slatedb(
 
             let mut reader_builder = DbReader::builder(db_path, object_store)
                 .with_reader_mode(DbReaderMode::Checkpoint(checkpoint_id))
+                .with_db_cache(cache)
                 .with_block_transformer(block_transformer)
                 .with_filter_policies(crate::fs::filter_policy::filter_policies())
                 .with_segment_extractor(Arc::new(crate::segment_extractor::ZeroFsSegmentExtractor));
@@ -1752,6 +1757,118 @@ pub async fn run_server(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    enum ReaderModeUnderTest {
+        ReadOnly,
+        Checkpoint,
+    }
+
+    fn mode_cache_probe_key() -> bytes::Bytes {
+        crate::fs::key_codec::KeyCodec::new().inode_key(1)
+    }
+
+    async fn seeded_mode_cache_store() -> (
+        Arc<dyn object_store::ObjectStore>,
+        Arc<dyn BlockTransformer>,
+        uuid::Uuid,
+    ) {
+        use slatedb::config::{CheckpointOptions, CheckpointScope, PutOptions, WriteOptions};
+
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let transformer: Arc<dyn BlockTransformer> =
+            crate::block_transformer::ZeroFsBlockTransformer::new_arc(
+                &[7; 32],
+                crate::config::CompressionConfig::default(),
+            );
+        let db = DbBuilder::new(Path::from("mode-cache-test"), store.clone())
+            .with_settings(slatedb::config::Settings {
+                wal_enabled: false,
+                compactor_options: None,
+                ..Default::default()
+            })
+            .with_sst_block_size(slatedb::SstBlockSize::Block32Kib)
+            .with_block_transformer(transformer.clone())
+            .with_filter_policies(crate::fs::filter_policy::filter_policies())
+            .with_segment_extractor(Arc::new(crate::segment_extractor::ZeroFsSegmentExtractor))
+            .build()
+            .await
+            .expect("seed database");
+        db.put_with_options(
+            mode_cache_probe_key(),
+            vec![3; 64 * 1024],
+            &PutOptions::default(),
+            &WriteOptions {
+                await_durable: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("write probe");
+        db.flush().await.expect("flush probe");
+        let checkpoint = db
+            .create_checkpoint(CheckpointScope::Durable, &CheckpointOptions::default())
+            .await
+            .expect("create checkpoint");
+        db.close().await.expect("close seed database");
+
+        (store, transformer, checkpoint.id)
+    }
+
+    async fn assert_mode_exports_attached_decoded_cache(mode: ReaderModeUnderTest) {
+        let (store, transformer, checkpoint_id) = seeded_mode_cache_store().await;
+        let mode = match mode {
+            ReaderModeUnderTest::ReadOnly => DatabaseMode::ReadOnly,
+            ReaderModeUnderTest::Checkpoint => DatabaseMode::Checkpoint(checkpoint_id),
+        };
+        let cache_root = tempfile::tempdir().expect("cache root");
+        let opened = build_slatedb(
+            store,
+            &crate::fs::CacheConfig {
+                root_folder: cache_root.path().to_owned(),
+                max_cache_size_gb: 0.0,
+                memory_cache_size_gb: Some(0.064),
+            },
+            "mode-cache-test".to_owned(),
+            mode,
+            None,
+            transformer,
+            None,
+            None,
+        )
+        .await
+        .expect("open reader mode");
+        let reader = match &opened.data {
+            SlateDbHandle::ReadOnly(reader) => reader.load_full(),
+            SlateDbHandle::ReadWrite(_) => panic!("reader mode opened a writer"),
+        };
+
+        assert_eq!(
+            reader
+                .get(mode_cache_probe_key())
+                .await
+                .expect("read probe"),
+            Some(bytes::Bytes::from(vec![3; 64 * 1024]))
+        );
+        let snapshot = opened.cache_metrics.snapshot();
+        assert!(
+            snapshot.decoded_blocks.entries > 0,
+            "decoded-block metrics must observe the cache used by the reader: {snapshot:?}"
+        );
+
+        reader.close().await.expect("close reader");
+        opened.parts_cache.close().await.expect("close parts cache");
+    }
+
+    #[tokio::test]
+    async fn read_only_open_exports_its_attached_decoded_cache() {
+        assert_mode_exports_attached_decoded_cache(ReaderModeUnderTest::ReadOnly).await;
+    }
+
+    #[tokio::test]
+    async fn checkpoint_open_exports_its_attached_decoded_cache() {
+        assert_mode_exports_attached_decoded_cache(ReaderModeUnderTest::Checkpoint).await;
+    }
 
     #[test]
     fn volatile_nbd_ack_rejects_read_only_database_modes() {

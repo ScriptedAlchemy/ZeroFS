@@ -10,6 +10,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static RSS_CAP_BYTES: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(test)]
+static TEST_RSS_CAP_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[cfg(test)]
 thread_local! {
     static TEST_ENVELOPE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 }
@@ -22,6 +25,28 @@ pub fn set_rss_cap_bytes(cap: u64) {
 
 pub fn rss_cap_bytes() -> u64 {
     RSS_CAP_BYTES.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+pub(crate) struct TestRssCapGuard {
+    previous: u64,
+    _lock: tokio::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl Drop for TestRssCapGuard {
+    fn drop(&mut self) {
+        set_rss_cap_bytes(self.previous);
+    }
+}
+
+#[cfg(test)]
+pub(crate) async fn lock_test_rss_cap() -> TestRssCapGuard {
+    let lock = TEST_RSS_CAP_LOCK.lock().await;
+    TestRssCapGuard {
+        previous: rss_cap_bytes(),
+        _lock: lock,
+    }
 }
 
 fn advance_epoch() -> bool {
@@ -73,4 +98,16 @@ pub fn purge_arenas() {
 #[cfg(test)]
 pub fn set_test_rss_envelope(bytes: Option<u64>) {
     TEST_ENVELOPE.with(|c| c.set(bytes));
+}
+
+#[cfg(test)]
+mod tests {
+    #[tokio::test]
+    async fn test_cap_guard_restores_previous_value() {
+        let guard = super::lock_test_rss_cap().await;
+        let previous = guard.previous;
+        super::set_rss_cap_bytes(previous.wrapping_add(1));
+        drop(guard);
+        assert_eq!(super::rss_cap_bytes(), previous);
+    }
 }
