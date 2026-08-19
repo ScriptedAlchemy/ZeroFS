@@ -67,26 +67,28 @@ pub(super) fn spawn(
                 frame = outgoing.recv() => frame,
             };
             let Some(frame) = frame else { break };
+            let OutboundFrame { bytes, sent } = frame;
             writer_conn
                 .counters
                 .bytes_sent
-                .fetch_add(frame.bytes.len() as u64, Ordering::Relaxed);
+                .fetch_add(bytes.len() as u64, Ordering::Relaxed);
             writer_conn
                 .counters
                 .operations
                 .fetch_add(1, Ordering::Relaxed);
             if !matches!(
                 wait_for_write(
-                    writer.send(Message::Binary(frame.bytes.into())),
+                    writer.send(Message::Binary(bytes.into())),
                     &progress,
                     &writer_conn.writer_shutdown,
+                    || writer_conn.send_progress.advanced(),
                 )
                 .await,
                 WriteOutcome::Completed(Ok(())),
             ) {
                 break;
             }
-            let _ = frame.sent.send(());
+            let _ = sent.send(());
         }
         let _ = runtime::timeout(CONNECT_TIMEOUT, writer.close()).await;
         writer_conn.shutdown();

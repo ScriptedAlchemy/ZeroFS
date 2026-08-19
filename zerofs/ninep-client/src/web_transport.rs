@@ -118,6 +118,7 @@ pub(super) fn spawn(
             let buffered = u64::from(writer_socket.buffered_amount());
             if buffered < observed_buffered {
                 last_progress = runtime::Clock::now();
+                writer_conn.send_progress.advanced();
             }
             observed_buffered = buffered;
             pending.acknowledge_drained(buffered);
@@ -133,7 +134,8 @@ pub(super) fn spawn(
                 _ = writer_conn.writer_shutdown.notified() => return,
                 frame = outgoing.recv(), if can_send => {
                     let Some(frame) = frame else { break };
-                    let frame_len = frame.bytes.len() as u64;
+                    let OutboundFrame { bytes, sent } = frame;
+                    let frame_len = bytes.len() as u64;
                     writer_conn.counters.bytes_sent.fetch_add(
                         frame_len,
                         std::sync::atomic::Ordering::Relaxed,
@@ -142,10 +144,10 @@ pub(super) fn spawn(
                         .counters
                         .operations
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if writer_socket.send_with_u8_array(&frame.bytes).is_err() {
+                    if writer_socket.send_with_u8_array(&bytes).is_err() {
                         break;
                     }
-                    pending.push(frame_len, frame.sent);
+                    pending.push(frame_len, sent);
                     observed_buffered = u64::from(writer_socket.buffered_amount());
                     pending.acknowledge_drained(observed_buffered);
                 }
