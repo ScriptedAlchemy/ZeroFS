@@ -465,13 +465,11 @@ impl GarbageCollector {
                         // batch so compaction cannot start another 256 MiB
                         // gather. Foreground idleness only gates batches past
                         // the throughput floor.
-                        keep_going_ok(
-                            batches,
-                            floor,
-                            shutdown.is_cancelled(),
-                            gc.extent_store.seals_quiet(),
-                            Activity::sample(&gc.stats).idle_since(&pass_base),
-                        )
+                        !shutdown.is_cancelled()
+                            && gc.extent_store.seals_quiet()
+                            && !crate::alloc_rss::over_rss_cap()
+                            && (batches < floor
+                                || Activity::sample(&gc.stats).idle_since(&pass_base))
                     };
                     let outcome = gc.maybe_reclaim_segments(keep_going).await;
                     // Shutdown must not wait out the orphan sweep's daily
@@ -687,18 +685,6 @@ impl GarbageCollector {
     }
 }
 
-/// Batch approval used by the segment-GC loop. RSS over the clean-cache /
-/// cgroup-slack cap refuses another gather regardless of the throughput floor.
-fn keep_going_ok(
-    batches: usize,
-    floor: usize,
-    shutdown: bool,
-    seals_quiet: bool,
-    idle: bool,
-) -> bool {
-    !shutdown && seals_quiet && !crate::alloc_rss::over_rss_cap() && (batches < floor || idle)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -754,23 +740,6 @@ mod tests {
         // Not saturated: base even when idle.
         let p = plan(state(false, hi, 0, true));
         assert_eq!((p.tier, p.next_interval), (Tier::Base, t.interval));
-    }
-
-    #[test]
-    fn keep_going_false_when_rss_over_cap() {
-        crate::alloc_rss::set_test_rss_cap(Some(64));
-        crate::alloc_rss::set_test_rss_envelope(Some(100));
-        assert!(
-            !keep_going_ok(0, 8, false, true, true),
-            "RSS over the clean-cache cap must stop compaction gather"
-        );
-        crate::alloc_rss::set_test_rss_envelope(Some(10));
-        assert!(
-            keep_going_ok(0, 8, false, true, true),
-            "under the cap, the throughput floor still approves"
-        );
-        crate::alloc_rss::set_test_rss_envelope(None);
-        crate::alloc_rss::set_test_rss_cap(None);
     }
 
     // The seam trigger: reserve-deferred seams drain faster even with little

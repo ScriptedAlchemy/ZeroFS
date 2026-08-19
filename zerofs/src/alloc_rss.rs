@@ -126,3 +126,22 @@ pub fn set_test_rss_envelope(bytes: Option<u64>) {
 pub fn set_test_rss_cap(cap: Option<u64>) {
     TEST_CAP.with(|c| c.set(cap));
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn over_cap_compares_envelope_to_cap() {
+        set_test_rss_envelope(Some(100));
+        assert!(
+            over_rss_cap_of(64),
+            "an envelope over the cap must trip the brake"
+        );
+        set_test_rss_envelope(Some(10));
+        assert!(!over_rss_cap_of(64), "under the cap, no brake");
+        set_test_rss_envelope(Some(100));
+        assert!(!over_rss_cap_of(0), "cap 0 disables the brake");
+        set_test_rss_envelope(None);
+    }
+}
