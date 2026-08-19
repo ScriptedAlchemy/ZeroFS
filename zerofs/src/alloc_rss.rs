@@ -6,7 +6,9 @@
 //! statistic is deliberately excluded: it is reusable virtual address space,
 //! not resident physical memory.
 
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use tikv_jemalloc_ctl::{epoch, stats};
 
@@ -56,23 +58,65 @@ pub(crate) async fn lock_test_rss_cap() -> TestRssCapGuard {
     }
 }
 
-fn advance_epoch() -> bool {
-    tikv_jemalloc_ctl::epoch::mib()
-        .and_then(|e| e.advance())
-        .is_ok()
+/// How long a sampled resident value stays fresh. Admission gating runs per
+/// cached part (~128 KiB), and every jemalloc mallctl read serializes on the
+/// allocator's global stats mutex; between samples the gate is atomic loads.
+const SAMPLE_INTERVAL_MS: u64 = 100;
+
+static CACHED_RESIDENT: AtomicU64 = AtomicU64::new(0);
+static LAST_SAMPLE_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Milliseconds since the first call, starting at 1 so `0` can mean
+/// "never sampled".
+fn now_ms() -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64 + 1
 }
 
-/// jemalloc `stats.resident` after an epoch advance. `0` if jemalloc is
-/// unavailable (lib unit tests without the global allocator).
+/// jemalloc `stats.resident` after an epoch advance, sampled at most once per
+/// [`SAMPLE_INTERVAL_MS`] (losers of the sampling race and callers within the
+/// interval get the cached value). `0` if jemalloc is unavailable (lib unit
+/// tests without the global allocator).
 pub fn jemalloc_resident() -> u64 {
     #[cfg(test)]
     if let Some((resident, _)) = TEST_ALLOCATOR_STATS.with(|stats| stats.get()) {
         return resident;
     }
-    if !advance_epoch() {
+    let now = now_ms();
+    let last = LAST_SAMPLE_MS.load(Ordering::Relaxed);
+    let fresh = last != 0 && now.saturating_sub(last) < SAMPLE_INTERVAL_MS;
+    if fresh
+        || LAST_SAMPLE_MS
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+    {
+        return CACHED_RESIDENT.load(Ordering::Relaxed);
+    }
+    let resident = read_resident();
+    CACHED_RESIDENT.store(resident, Ordering::Relaxed);
+    resident
+}
+
+/// One coherent read: advance the epoch, then read `stats.resident` through
+/// MIBs resolved once (name lookups also take jemalloc's global mutex).
+fn read_resident() -> u64 {
+    struct Mibs {
+        epoch: tikv_jemalloc_ctl::epoch_mib,
+        resident: stats::resident_mib,
+    }
+    static MIBS: OnceLock<Option<Mibs>> = OnceLock::new();
+    let Some(mibs) = MIBS.get_or_init(|| {
+        Some(Mibs {
+            epoch: epoch::mib().ok()?,
+            resident: stats::resident::mib().ok()?,
+        })
+    }) else {
+        return 0;
+    };
+    if mibs.epoch.advance().is_err() {
         return 0;
     }
-    tikv_jemalloc_ctl::stats::resident::read().unwrap_or(0) as u64
+    mibs.resident.read().unwrap_or(0) as u64
 }
 
 /// Resident allocator pages, or the test override. Retained virtual mappings
