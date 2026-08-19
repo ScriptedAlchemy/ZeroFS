@@ -28,8 +28,21 @@ use tokio::task::{JoinHandle, JoinSet};
 const REMOTE_COALESCE_IDLE: Duration = Duration::from_millis(500);
 const REMOTE_RETRY_DELAY: Duration = Duration::from_millis(200);
 const REMOTE_OPERATION_TIMEOUT: Duration = Duration::from_secs(120);
-const REMOTE_STREAM_CHUNK_BYTES: usize = 8 * 1024 * 1024;
+/// Multipart part size for blobs above [`REMOTE_SINGLE_PUT_BYTES`]. Sized to
+/// fill the SFTP transport's pipelined request window (64 x 255 KiB): an
+/// 8 MiB part left the window half-empty and doubled the per-part
+/// open/close round-trip overhead.
+const REMOTE_STREAM_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 const REMOTE_STREAM_IN_FLIGHT_PARTS: usize = 2;
+/// Blobs at or below this ship as one atomic create-only put: one staging
+/// file, one fully pipelined write, one fsync, one publication link -- about
+/// 6 WAN round trips total. The multipart path costs ~3x that in pure
+/// round-trip latency (durable placeholder, per-part open/close, durable
+/// header rewrite), each op holding a pooled session while idle on the wire,
+/// so it is reserved for blobs whose single-put buffering would be unbounded.
+/// Sized to cover a full 32 MiB segment object plus its envelope; worst-case
+/// buffering is one blob per upload lane.
+const REMOTE_SINGLE_PUT_BYTES: u64 = 36 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RemoteBarrierError {
@@ -1292,18 +1305,21 @@ async fn stream_record_to_remote(
     let mut chunks = blob
         .range_stream(0..blob.len(), REMOTE_STREAM_CHUNK_BYTES)
         .map_err(|error| generic_error(format!("journal blob stream failed: {error:#}")))?;
-    if blob.len() <= REMOTE_STREAM_CHUNK_BYTES as u64 {
-        let bytes = chunks
-            .next()
-            .await
-            .transpose()
-            .map_err(|error| generic_error(format!("journal blob stream failed: {error:#}")))?
-            .unwrap_or_default();
-        debug_assert!(chunks.next().await.is_none());
+    if blob.len() <= REMOTE_SINGLE_PUT_BYTES {
+        let mut collected = Vec::new();
+        while let Some(chunk) = chunks.next().await {
+            collected.push(chunk.map_err(|error| {
+                generic_error(format!("journal blob stream failed: {error:#}"))
+            })?);
+        }
         let result = bounded_remote_step(
             record,
             "bounded atomic put",
-            remote.put_opts(target, bytes.into(), PutOptions::from(mode.clone())),
+            remote.put_opts(
+                target,
+                PutPayload::from_iter(collected),
+                PutOptions::from(mode.clone()),
+            ),
         )
         .await;
         return match result {

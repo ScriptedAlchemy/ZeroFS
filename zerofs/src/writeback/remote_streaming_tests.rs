@@ -284,7 +284,7 @@ fn identity() -> JournalIdentity {
 async fn remote_replay_streams_payload_larger_than_the_window_in_bounded_parts() {
     let temp = tempfile::tempdir().unwrap();
     let journal = Arc::new(Journal::open(temp.path().join("journal"), identity()).unwrap());
-    let payload = vec![0x5a; REMOTE_STREAM_CHUNK_BYTES + 1];
+    let payload = vec![0x5a; REMOTE_SINGLE_PUT_BYTES as usize + 1];
     let record = crate::writeback::test_util::put_record(
         1,
         "large-object",
@@ -312,7 +312,11 @@ async fn remote_replay_streams_payload_larger_than_the_window_in_bounded_parts()
     assert_eq!(store.multipart_calls.load(Ordering::SeqCst), 1);
     assert_eq!(
         *store.part_sizes.lock().unwrap(),
-        vec![REMOTE_STREAM_CHUNK_BYTES, 1]
+        vec![
+            REMOTE_STREAM_CHUNK_BYTES,
+            REMOTE_STREAM_CHUNK_BYTES,
+            REMOTE_SINGLE_PUT_BYTES as usize + 1 - 2 * REMOTE_STREAM_CHUNK_BYTES,
+        ]
     );
     let result = store.inner.get(&Path::from("large-object")).await.unwrap();
     assert_eq!(result.meta.size, payload.len() as u64);
@@ -323,7 +327,7 @@ async fn remote_replay_streams_payload_larger_than_the_window_in_bounded_parts()
 async fn remote_replay_at_the_window_boundary_keeps_atomic_put_semantics() {
     let temp = tempfile::tempdir().unwrap();
     let journal = Arc::new(Journal::open(temp.path().join("journal"), identity()).unwrap());
-    let payload = vec![0x6b; REMOTE_STREAM_CHUNK_BYTES];
+    let payload = vec![0x6b; REMOTE_SINGLE_PUT_BYTES as usize];
     let record = crate::writeback::test_util::put_record(
         1,
         "boundary-object",
@@ -432,7 +436,7 @@ async fn multipart_abort_failure_is_published_while_cleanup_input_remains_live()
 async fn shipping_scheduler_terminally_drains_cleanup_failure_without_retry() {
     let temp = tempfile::tempdir().unwrap();
     let journal = Arc::new(Journal::open(temp.path().join("journal"), identity()).unwrap());
-    let payload = vec![0x7c; REMOTE_STREAM_CHUNK_BYTES + 1];
+    let payload = vec![0x7c; REMOTE_SINGLE_PUT_BYTES as usize + 1];
     for sequence in 1..=2 {
         let record = crate::writeback::test_util::put_record(
             sequence,
