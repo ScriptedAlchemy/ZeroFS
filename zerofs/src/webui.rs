@@ -3,8 +3,8 @@ use crate::fs::ZeroFS;
 use crate::ninep::handler::{NinePHandler, SessionReleaseGuard};
 use crate::ninep::lock_manager::FileLockManager;
 use crate::ninep::server::{
-    InflightRegistry, P9GlobalAdmission, P9Response, P9TransportPermit, dispatch_9p_frame,
-    response_may_be_emitted, settle_request_tasks,
+    InflightRegistry, P9AcceptedWorkTracker, P9GlobalAdmission, P9Response, P9TransportPermit,
+    dispatch_9p_frame, response_may_be_emitted, settle_request_tasks,
 };
 use crate::rpc::proto;
 use crate::rpc::server::AdminRpcServer;
@@ -38,6 +38,7 @@ struct AppState {
     gid: u32,
     shutdown: CancellationToken,
     ws_drain: TaskTracker,
+    accepted_work: P9AcceptedWorkTracker,
 }
 
 #[cfg(test)]
@@ -76,6 +77,7 @@ pub(crate) fn test_9p_websocket_router(
             gid: 0,
             shutdown: CancellationToken::new(),
             ws_drain: TaskTracker::new(),
+            accepted_work: P9AcceptedWorkTracker::new(),
         },
         connections,
     };
@@ -85,6 +87,21 @@ pub(crate) fn test_9p_websocket_router(
 }
 
 const WS_DRAIN_TIMEOUT: std::time::Duration = crate::replication::RESPONSE_DRAIN_TIMEOUT;
+
+async fn drain_ws_sessions(ws_drain: TaskTracker) -> std::io::Result<()> {
+    ws_drain.close();
+    if tokio::time::timeout(WS_DRAIN_TIMEOUT, ws_drain.wait())
+        .await
+        .is_err()
+    {
+        tracing::warn!("timed out waiting for 9P WebSocket sessions to drain");
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "timed out waiting for 9P WebSocket sessions to drain",
+        ));
+    }
+    Ok(())
+}
 
 fn configure_9p_ws(ws: WebSocketUpgrade) -> WebSocketUpgrade {
     ws.max_message_size(ninep_proto::P9_MAX_MSIZE as usize)
@@ -124,7 +141,8 @@ async fn handle_9p_ws(
     );
     let mut release_guard = SessionReleaseGuard::new(Arc::clone(&handler));
     let inflight = InflightRegistry::default();
-    let admission = P9GlobalAdmission::shared().connection();
+    let admission =
+        P9GlobalAdmission::shared().connection_with_accepted_work(state.accepted_work.clone());
     let requests = TaskTracker::new();
 
     let (tx, mut rx) = mpsc::channel::<P9Response>(P9_CHANNEL_SIZE);
@@ -295,6 +313,7 @@ pub fn start(
     lock_manager: Arc<FileLockManager>,
     rpc_service: AdminRpcServer,
     shutdown: CancellationToken,
+    accepted_work: P9AcceptedWorkTracker,
 ) -> Vec<JoinHandle<Result<(), std::io::Error>>> {
     let ws_drain = TaskTracker::new();
     let state = AppState {
@@ -304,6 +323,7 @@ pub fn start(
         gid: config.gid,
         shutdown: shutdown.clone(),
         ws_drain: ws_drain.clone(),
+        accepted_work,
     };
 
     // gRPC-web: wrap tonic service with GrpcWebService + CORS
@@ -346,13 +366,7 @@ pub fn start(
                 .with_graceful_shutdown(shutdown.cancelled_owned())
                 .await
                 .map_err(|e| std::io::Error::other(e.to_string()));
-            ws_drain.close();
-            if tokio::time::timeout(WS_DRAIN_TIMEOUT, ws_drain.wait())
-                .await
-                .is_err()
-            {
-                tracing::warn!("timed out waiting for 9P WebSocket sessions to drain");
-            }
+            drain_ws_sessions(ws_drain).await?;
             result
         }));
     }
@@ -366,6 +380,17 @@ mod tests {
     use axum::routing::post;
     use std::process::Stdio;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test(start_paused = true)]
+    async fn websocket_session_drain_timeout_is_listener_failure() {
+        let sessions = TaskTracker::new();
+        let _active_session = sessions.token();
+        let drain = tokio::spawn(drain_ws_sessions(sessions));
+        tokio::task::yield_now().await;
+        tokio::time::advance(WS_DRAIN_TIMEOUT + std::time::Duration::from_millis(1)).await;
+        let error = drain.await.unwrap().unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    }
 
     #[derive(Clone)]
     struct SmokeState {
@@ -420,6 +445,7 @@ mod tests {
                 gid: 0,
                 shutdown: CancellationToken::new(),
                 ws_drain: TaskTracker::new(),
+                accepted_work: P9AcceptedWorkTracker::new(),
             });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -486,6 +512,7 @@ mod tests {
                 gid: 0,
                 shutdown: CancellationToken::new(),
                 ws_drain: TaskTracker::new(),
+                accepted_work: P9AcceptedWorkTracker::new(),
             },
             connections: Arc::new(std::sync::Mutex::new(CancellationToken::new())),
             connection_closed: Arc::new(tokio::sync::Notify::new()),

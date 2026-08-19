@@ -1,59 +1,65 @@
-use super::errors::P9Error;
+#[cfg(any(feature = "webui", test))]
 pub(crate) use super::handler::NinePHandler;
-use super::handler::SessionReleaseGuard;
 pub(crate) use super::lock_manager::FileLockManager;
 use crate::fs::ZeroFS;
 use crate::task::spawn_named;
+#[cfg(test)]
 use bytes::Bytes;
-use dashmap::DashMap;
-use dashmap::mapref::entry::Entry;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
+#[cfg(test)]
 use ninep_proto::{
-    DekuBytes, Message, P9_CHANNEL_SIZE, P9_COUNT_FIELD_LEN, P9_DEBUG_BUFFER_SIZE, P9_HEADER_SIZE,
-    P9_MAX_MSIZE, P9_MIN_MESSAGE_SIZE, P9_OP_ENVELOPE_LEN, P9_OP_FLAG_RETRY, P9_OP_ID_LEN,
-    P9_SIZE_FIELD_LEN, P9Message, Rlerror, T_WRITE, Twrite, message_type,
+    Message, P9_COUNT_FIELD_LEN, P9_HEADER_SIZE, P9_MAX_MSIZE, P9_OP_ENVELOPE_LEN,
+    P9_OP_FLAG_RETRY, P9_OP_ID_LEN, P9_SIZE_FIELD_LEN, P9Message, Rlerror, T_WRITE, message_type,
 };
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use std::sync::Arc;
+#[cfg(test)]
+use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, UnixListener};
 #[cfg(test)]
+use tokio::sync::mpsc;
+#[cfg(test)]
 use tokio::sync::oneshot;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
-use tokio_util::task::{AbortOnDropHandle, TaskTracker};
-use tracing::{debug, error, info, warn};
+use tokio_util::task::AbortOnDropHandle;
+use tracing::{error, info, warn};
 
-/// 9P message type byte for Tflush. Kept here so the reader can recognise a
-/// flush from the raw frame header without deku-parsing the whole body.
-const TFLUSH_TYPE: u8 = 108;
-/// `Rlerror` is permitted after serving-authority loss.
-const RLERROR_TYPE: u8 = 7;
-/// `Rversion` is permitted after serving-authority loss.
-const RVERSION_TYPE: u8 = 101;
-/// `Tversion` is a receive-order barrier for the entire session.
-const TVERSION_TYPE: u8 = 100;
-/// 9P type for `Tclunk`, a receive-order barrier for its fid.
-const TCLUNK_TYPE: u8 = 120;
-const RESPONSE_BUFFER_CAPACITY: usize = 64 * 1024;
-/// Process-wide protocol memory available to requests and their possible replies.
-const GLOBAL_INFLIGHT_MEMORY: usize = 384 * 1024 * 1024;
-/// One connection cannot consume more than a quarter of the process budget.
-const CONNECTION_INFLIGHT_MEMORY: usize = 64 * 1024 * 1024;
-const GLOBAL_INFLIGHT_REQUESTS: usize = 64;
-const CONNECTION_INFLIGHT_REQUESTS: usize = 16;
-/// Active transports allowed to receive a frame before byte admission.
-/// This leaves room for the expected sixteen idle Mesh sessions and the
-/// default uploader's sixteen connections while bounding reconnect storms.
-const GLOBAL_TRANSPORT_SESSIONS: usize = 64;
-const MAX_PRE_ADMISSION_MEMORY: usize = GLOBAL_TRANSPORT_SESSIONS * P9_MAX_MSIZE as usize;
-const DOCUMENTED_P9_MEMORY_BOUND: usize = GLOBAL_INFLIGHT_MEMORY + MAX_PRE_ADMISSION_MEMORY;
-const WEBSOCKET_RECEIVE_RESERVATION: u32 = 2 * P9_MAX_MSIZE;
-const P9_RWRITE_MAX_SIZE: usize = P9_HEADER_SIZE + P9_COUNT_FIELD_LEN;
-/// Bounded response drain after connection retirement.
-const CLIENT_DRAIN_TIMEOUT: std::time::Duration = crate::replication::RESPONSE_DRAIN_TIMEOUT;
+mod admission;
+mod frame_codec;
+mod response_writer;
+mod session;
+
+#[cfg(test)]
+use admission::P9AdmissionSnapshot;
+#[cfg(feature = "webui")]
+pub(crate) use admission::P9TransportPermit;
+#[cfg(test)]
+use admission::{
+    CONNECTION_INFLIGHT_MEMORY, CONNECTION_INFLIGHT_REQUESTS, GLOBAL_INFLIGHT_MEMORY,
+    GLOBAL_INFLIGHT_REQUESTS, GLOBAL_TRANSPORT_SESSIONS, P9ConnectionAdmission,
+};
+pub(crate) use admission::{P9AcceptedWorkTracker, P9GlobalAdmission};
+#[cfg(test)]
+use frame_codec::{
+    FidFootprint, P9_RWRITE_MAX_SIZE, ShallowFrameMetadata, inspect_frame_metadata,
+    possible_response_bytes, read_9p_frame,
+};
+#[cfg(any(feature = "webui", test))]
+#[allow(unused_imports)]
+pub(crate) use response_writer::{P9Response, response_may_be_emitted};
+#[cfg(test)]
+use response_writer::{RESPONSE_BUFFER_CAPACITY, ResponseAuthority, spawn_response_writer};
+#[cfg(test)]
+use session::{CLIENT_DRAIN_TIMEOUT, CompletionWaiter, enqueue_terminal_response};
+#[cfg(any(feature = "webui", test))]
+pub(crate) use session::{InflightRegistry, dispatch_9p_frame, settle_request_tasks};
+use session::{P9SessionAdmission, handle_client_stream};
+#[cfg(test)]
+use session::{handle_client_loop, join_with_timeout};
+
 /// TCP keepalive idle interval.
 const TCP_KEEPALIVE_IDLE: std::time::Duration = std::time::Duration::from_secs(10);
 const TCP_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
@@ -66,339 +72,6 @@ const TCP_KEEPALIVE_RETRIES: u32 = 4;
     target_os = "linux"
 ))]
 const TCP_USER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
-pub(crate) struct P9GlobalAdmission {
-    bytes: Arc<Semaphore>,
-    requests: Arc<Semaphore>,
-    transports: Arc<Semaphore>,
-    receive_bytes: Arc<Semaphore>,
-    byte_limit: usize,
-    request_limit: usize,
-    transport_limit: usize,
-}
-
-impl P9GlobalAdmission {
-    pub(crate) fn shared() -> &'static Arc<Self> {
-        static ADMISSION: OnceLock<Arc<P9GlobalAdmission>> = OnceLock::new();
-        ADMISSION.get_or_init(|| {
-            Arc::new(Self::new(
-                GLOBAL_INFLIGHT_MEMORY,
-                GLOBAL_INFLIGHT_REQUESTS,
-                GLOBAL_TRANSPORT_SESSIONS,
-            ))
-        })
-    }
-
-    fn new(byte_limit: usize, request_limit: usize, transport_limit: usize) -> Self {
-        Self {
-            bytes: Arc::new(Semaphore::new(byte_limit)),
-            requests: Arc::new(Semaphore::new(request_limit)),
-            transports: Arc::new(Semaphore::new(transport_limit)),
-            receive_bytes: Arc::new(Semaphore::new(transport_limit * P9_MAX_MSIZE as usize)),
-            byte_limit,
-            request_limit,
-            transport_limit,
-        }
-    }
-
-    pub(crate) fn try_admit_transport(self: &Arc<Self>) -> anyhow::Result<P9TransportPermit> {
-        metrics::gauge!("zerofs_p9_transport_session_capacity").set(self.transport_limit as f64);
-        metrics::gauge!("zerofs_p9_memory_bound_bytes").set(DOCUMENTED_P9_MEMORY_BOUND as f64);
-        let permit = Arc::clone(&self.transports)
-            .try_acquire_owned()
-            .map_err(|_| anyhow::anyhow!("9P transport capacity exhausted"))?;
-        metrics::gauge!("zerofs_p9_active_sessions").increment(1.0);
-        Ok(P9TransportPermit { _permit: permit })
-    }
-
-    pub(crate) async fn admit_receive(
-        self: &Arc<Self>,
-        shutdown: &CancellationToken,
-    ) -> anyhow::Result<P9ReceivePermit> {
-        self.admit_receive_bytes(P9_MAX_MSIZE, shutdown).await
-    }
-
-    pub(crate) async fn admit_websocket_receive(
-        self: &Arc<Self>,
-        shutdown: &CancellationToken,
-    ) -> anyhow::Result<P9ReceivePermit> {
-        // Tungstenite copies fragmented messages into a growing collector
-        // while retaining the current frame. Charging both maximum buffers
-        // keeps their combined peak inside the shared receive envelope.
-        self.admit_receive_bytes(WEBSOCKET_RECEIVE_RESERVATION, shutdown)
-            .await
-    }
-
-    async fn admit_receive_bytes(
-        self: &Arc<Self>,
-        permits: u32,
-        shutdown: &CancellationToken,
-    ) -> anyhow::Result<P9ReceivePermit> {
-        let permit = tokio::select! {
-            biased;
-            _ = shutdown.cancelled() => anyhow::bail!("9P receive cancelled by shutdown"),
-            result = Arc::clone(&self.receive_bytes).acquire_many_owned(permits) => result?,
-        };
-        metrics::gauge!("zerofs_p9_receive_reserved_bytes").increment(f64::from(permits));
-        Ok(P9ReceivePermit {
-            _permit: permit,
-            reserved_bytes: permits as usize,
-        })
-    }
-
-    pub(crate) fn connection(self: &Arc<Self>) -> P9ConnectionAdmission {
-        metrics::gauge!("zerofs_p9_inflight_memory_capacity_bytes").set(self.byte_limit as f64);
-        metrics::gauge!("zerofs_p9_inflight_request_capacity").set(self.request_limit as f64);
-        P9ConnectionAdmission {
-            global: Arc::clone(self),
-            bytes: Arc::new(Semaphore::new(CONNECTION_INFLIGHT_MEMORY)),
-            requests: Arc::new(Semaphore::new(CONNECTION_INFLIGHT_REQUESTS)),
-            byte_limit: CONNECTION_INFLIGHT_MEMORY,
-        }
-    }
-
-    #[cfg(test)]
-    fn for_test(byte_limit: usize, request_limit: usize) -> Arc<Self> {
-        Arc::new(Self::new(
-            byte_limit,
-            request_limit,
-            GLOBAL_TRANSPORT_SESSIONS,
-        ))
-    }
-
-    #[cfg(test)]
-    fn for_test_with_transports(
-        byte_limit: usize,
-        request_limit: usize,
-        transport_limit: usize,
-    ) -> Arc<Self> {
-        Arc::new(Self::new(byte_limit, request_limit, transport_limit))
-    }
-
-    #[cfg(test)]
-    fn connection_for_test(
-        self: &Arc<Self>,
-        byte_limit: usize,
-        request_limit: usize,
-    ) -> P9ConnectionAdmission {
-        P9ConnectionAdmission {
-            global: Arc::clone(self),
-            bytes: Arc::new(Semaphore::new(byte_limit)),
-            requests: Arc::new(Semaphore::new(request_limit)),
-            byte_limit,
-        }
-    }
-
-    #[cfg(test)]
-    fn snapshot(&self) -> P9AdmissionSnapshot {
-        P9AdmissionSnapshot {
-            reserved_bytes: self.byte_limit - self.bytes.available_permits(),
-            active_requests: self.request_limit - self.requests.available_permits(),
-            active_transports: self.transport_limit - self.transports.available_permits(),
-            receive_reserved_bytes: self.transport_limit * P9_MAX_MSIZE as usize
-                - self.receive_bytes.available_permits(),
-        }
-    }
-}
-
-#[cfg(test)]
-#[derive(Debug, PartialEq, Eq)]
-struct P9AdmissionSnapshot {
-    reserved_bytes: usize,
-    active_requests: usize,
-    active_transports: usize,
-    receive_reserved_bytes: usize,
-}
-
-pub(crate) struct P9TransportPermit {
-    _permit: OwnedSemaphorePermit,
-}
-
-impl Drop for P9TransportPermit {
-    fn drop(&mut self) {
-        metrics::gauge!("zerofs_p9_active_sessions").decrement(1.0);
-    }
-}
-
-pub(crate) struct P9ReceivePermit {
-    _permit: OwnedSemaphorePermit,
-    reserved_bytes: usize,
-}
-
-impl Drop for P9ReceivePermit {
-    fn drop(&mut self) {
-        metrics::gauge!("zerofs_p9_receive_reserved_bytes").decrement(self.reserved_bytes as f64);
-    }
-}
-
-#[derive(Clone)]
-pub(crate) struct P9ConnectionAdmission {
-    global: Arc<P9GlobalAdmission>,
-    bytes: Arc<Semaphore>,
-    requests: Arc<Semaphore>,
-    byte_limit: usize,
-}
-
-impl P9ConnectionAdmission {
-    #[cfg(test)]
-    async fn admit_request(
-        &self,
-        request_bytes: usize,
-        possible_response_bytes: usize,
-    ) -> anyhow::Result<P9AdmissionPermit> {
-        self.admit_request_or_shutdown(
-            request_bytes,
-            possible_response_bytes,
-            &CancellationToken::new(),
-        )
-        .await
-    }
-
-    async fn admit_request_or_shutdown(
-        &self,
-        request_bytes: usize,
-        possible_response_bytes: usize,
-        shutdown: &CancellationToken,
-    ) -> anyhow::Result<P9AdmissionPermit> {
-        let reserved_bytes = request_bytes
-            .checked_add(possible_response_bytes)
-            .ok_or_else(|| anyhow::anyhow!("9P request memory reservation overflow"))?;
-        if reserved_bytes > self.byte_limit || reserved_bytes > self.global.byte_limit {
-            anyhow::bail!("9P request requires {reserved_bytes} bytes, above the admission limit");
-        }
-        let permits = u32::try_from(reserved_bytes)
-            .map_err(|_| anyhow::anyhow!("9P request memory reservation exceeds u32"))?;
-
-        // Take the process-wide task slot first. Otherwise an unbounded number
-        // of reconnecting sessions could each hold a full frame while queued
-        // behind this semaphore on their independent connection-local slots.
-        let global_request =
-            acquire_owned_or_shutdown(Arc::clone(&self.global.requests), 1, shutdown).await?;
-        let local_request =
-            acquire_owned_or_shutdown(Arc::clone(&self.requests), 1, shutdown).await?;
-        let local_bytes =
-            acquire_owned_or_shutdown(Arc::clone(&self.bytes), permits, shutdown).await?;
-        let global_bytes =
-            acquire_owned_or_shutdown(Arc::clone(&self.global.bytes), permits, shutdown).await?;
-
-        metrics::gauge!("zerofs_p9_inflight_reserved_bytes").increment(reserved_bytes as f64);
-        metrics::gauge!("zerofs_p9_inflight_requests").increment(1.0);
-        Ok(P9AdmissionPermit {
-            _local_request: local_request,
-            _global_request: global_request,
-            _local_bytes: local_bytes,
-            _global_bytes: global_bytes,
-            reserved_bytes,
-        })
-    }
-}
-
-async fn acquire_owned_or_shutdown(
-    semaphore: Arc<Semaphore>,
-    permits: u32,
-    shutdown: &CancellationToken,
-) -> anyhow::Result<OwnedSemaphorePermit> {
-    tokio::select! {
-        biased;
-        _ = shutdown.cancelled() => anyhow::bail!("9P admission cancelled by shutdown"),
-        result = semaphore.acquire_many_owned(permits) => Ok(result?),
-    }
-}
-
-pub(crate) struct P9AdmissionPermit {
-    _local_request: OwnedSemaphorePermit,
-    _global_request: OwnedSemaphorePermit,
-    _local_bytes: OwnedSemaphorePermit,
-    _global_bytes: OwnedSemaphorePermit,
-    reserved_bytes: usize,
-}
-
-impl Drop for P9AdmissionPermit {
-    fn drop(&mut self) {
-        metrics::gauge!("zerofs_p9_inflight_reserved_bytes").decrement(self.reserved_bytes as f64);
-        metrics::gauge!("zerofs_p9_inflight_requests").decrement(1.0);
-    }
-}
-
-pub(crate) struct P9Response {
-    tag: u16,
-    bytes: Vec<u8>,
-    _admission: P9AdmissionPermit,
-}
-
-impl P9Response {
-    fn new(tag: u16, bytes: Vec<u8>, admission: P9AdmissionPermit) -> Self {
-        Self {
-            tag,
-            bytes,
-            _admission: admission,
-        }
-    }
-
-    pub(crate) fn into_guarded_parts(self) -> (u16, Vec<u8>, P9AdmissionPermit) {
-        (self.tag, self.bytes, self._admission)
-    }
-
-    #[cfg(test)]
-    fn into_parts(self) -> (u16, Vec<u8>) {
-        let (tag, bytes, _admission) = self.into_guarded_parts();
-        (tag, bytes)
-    }
-}
-
-struct P9SettlingMetricGuard;
-
-impl P9SettlingMetricGuard {
-    fn new() -> Self {
-        metrics::gauge!("zerofs_p9_sessions_settling_requests").increment(1.0);
-        Self
-    }
-}
-
-impl Drop for P9SettlingMetricGuard {
-    fn drop(&mut self) {
-        metrics::gauge!("zerofs_p9_sessions_settling_requests").decrement(1.0);
-    }
-}
-
-pub(crate) async fn settle_request_tasks(requests: TaskTracker) {
-    requests.close();
-    let settling = requests.len();
-    if settling == 0 {
-        return;
-    }
-    metrics::counter!("zerofs_p9_post_disconnect_requests_total").increment(settling as u64);
-    let settling_metric = P9SettlingMetricGuard::new();
-    if tokio::time::timeout(CLIENT_DRAIN_TIMEOUT, requests.wait())
-        .await
-        .is_ok()
-    {
-        return;
-    }
-
-    // Accepted mutation work retains its handler and admission permits. Do not
-    // abort it merely to let a disconnected session retire; continue settling
-    // in the server runtime after the connection task returns.
-    metrics::counter!("zerofs_p9_detached_settlements_total").increment(1);
-    drop(spawn_named("9p-request-settlement", async move {
-        let _settling_metric = settling_metric;
-        requests.wait().await;
-    }));
-}
-
-/// Whether a serialized response requires serving authority.
-/// Standard and private 9P frames store the type byte at offset four.
-pub(crate) fn response_requires_serving_authority(response_bytes: &[u8]) -> bool {
-    !matches!(
-        response_bytes.get(4),
-        Some(&RLERROR_TYPE) | Some(&RVERSION_TYPE)
-    )
-}
-
-/// Check serving authority at the final response boundary.
-pub(crate) fn response_may_be_emitted(db: &crate::db::Db, response_bytes: &[u8]) -> bool {
-    !response_requires_serving_authority(response_bytes) || db.permits_successful_response()
-}
 
 fn configure_accepted_tcp_stream(stream: &tokio::net::TcpStream) -> std::io::Result<()> {
     stream.set_nodelay(true)?;
@@ -419,21 +92,6 @@ fn configure_accepted_tcp_stream(stream: &tokio::net::TcpStream) -> std::io::Res
     socket.set_tcp_user_timeout(Some(TCP_USER_TIMEOUT))?;
 
     Ok(())
-}
-
-/// Await a task until `deadline`, then abort and join it.
-async fn join_with_timeout<T>(
-    mut task: AbortOnDropHandle<T>,
-    timeout: std::time::Duration,
-) -> Option<Result<T, tokio::task::JoinError>> {
-    match tokio::time::timeout(timeout, &mut task).await {
-        Ok(result) => Some(result),
-        Err(_) => {
-            task.abort();
-            let _ = task.await;
-            None
-        }
-    }
 }
 
 pub enum Transport {
@@ -470,7 +128,7 @@ impl NinePServer {
         write_stream: W,
         shutdown: &CancellationToken,
         client_name: String,
-        transport: P9TransportPermit,
+        session: P9SessionAdmission,
     ) -> AbortOnDropHandle<()>
     where
         R: AsyncRead + Unpin + Send + 'static,
@@ -487,7 +145,7 @@ impl NinePServer {
                 filesystem,
                 lock_manager,
                 client_shutdown,
-                transport,
+                session,
             )
             .await
             {
@@ -496,7 +154,22 @@ impl NinePServer {
         }))
     }
 
+    #[allow(dead_code)]
     pub async fn start(&self, shutdown: CancellationToken) -> std::io::Result<()> {
+        let accepted_work = P9AcceptedWorkTracker::new();
+        let result = self
+            .start_with_accepted_work(shutdown, accepted_work.clone())
+            .await;
+        accepted_work.stop_accepting();
+        accepted_work.wait().await;
+        result
+    }
+
+    pub(crate) async fn start_with_accepted_work(
+        &self,
+        shutdown: CancellationToken,
+        accepted_work: P9AcceptedWorkTracker,
+    ) -> std::io::Result<()> {
         let mut clients = FuturesUnordered::new();
         let clients_shutdown = shutdown.child_token();
         let serve_result = match &self.transport {
@@ -542,7 +215,11 @@ impl NinePServer {
                                     write_half,
                                     &clients_shutdown,
                                     peer_addr.to_string(),
-                                    transport,
+                                    P9SessionAdmission {
+                                        transport,
+                                        transport_label: "tcp",
+                                        accepted_work: accepted_work.clone(),
+                                    },
                                 ),
                             );
                         }
@@ -592,7 +269,11 @@ impl NinePServer {
                                     write_half,
                                     &clients_shutdown,
                                     "unix".to_string(),
-                                    transport,
+                                    P9SessionAdmission {
+                                        transport,
+                                        transport_label: "unix",
+                                        accepted_work: accepted_work.clone(),
+                                    },
                                 ),
                             );
                         }
@@ -615,783 +296,11 @@ impl NinePServer {
     }
 }
 
-#[derive(Clone)]
-enum ResponseAuthority {
-    Database(Arc<crate::db::Db>),
-    #[cfg(test)]
-    Always,
-}
-
-impl ResponseAuthority {
-    fn from_database(db: Arc<crate::db::Db>) -> Self {
-        Self::Database(db)
-    }
-
-    #[cfg(test)]
-    fn always() -> Self {
-        Self::Always
-    }
-
-    fn permits_successful_response(&self) -> bool {
-        match self {
-            Self::Database(db) => db.permits_successful_response(),
-            #[cfg(test)]
-            Self::Always => true,
-        }
-    }
-
-    fn may_emit(&self, response_bytes: &[u8]) -> bool {
-        match self {
-            Self::Database(db) => response_may_be_emitted(db, response_bytes),
-            #[cfg(test)]
-            Self::Always => true,
-        }
-    }
-}
-
-fn spawn_response_writer<W>(
-    write_stream: W,
-    mut rx: mpsc::Receiver<P9Response>,
-    authority: ResponseAuthority,
-    connection_shutdown: CancellationToken,
-) -> AbortOnDropHandle<()>
-where
-    W: AsyncWrite + Unpin + Send + 'static,
-{
-    AbortOnDropHandle::new(spawn_named("9p-writer", async move {
-        // Stop request dispatch when the response writer exits.
-        let _cancel_connection_on_exit = connection_shutdown.drop_guard();
-        let mut writer =
-            tokio::io::BufWriter::with_capacity(RESPONSE_BUFFER_CAPACITY, write_stream);
-        loop {
-            let first = match rx.recv().await {
-                Some(msg) => msg,
-                None => break,
-            };
-
-            // Avoid allocating a batch for the uncontended case. Adaptive
-            // kernel lanes normally carry one direct request; a Vec is useful
-            // only after a second response is already waiting.
-            let second = match rx.try_recv() {
-                Ok(more) => more,
-                Err(_) => {
-                    let (tag, response_bytes, admission) = first.into_guarded_parts();
-                    let requires_authority = response_requires_serving_authority(&response_bytes);
-                    if requires_authority && !authority.may_emit(&response_bytes) {
-                        warn!(
-                            "Dropping successful 9P response for tag {tag} after serving authority \
-                             was lost; closing the connection"
-                        );
-                        return;
-                    }
-                    // Keep the final authority check adjacent to the actual
-                    // transport write, just as on the buffered batch path.
-                    if requires_authority && !authority.permits_successful_response() {
-                        warn!(
-                            "Dropping successful 9P response for tag {tag} immediately before \
-                             write after serving authority was lost; closing the connection"
-                        );
-                        return;
-                    }
-                    // The outer BufWriter is empty after every batch. Bypass
-                    // its copy for this latency-critical case, but still flush
-                    // the underlying AsyncWrite: write_all only guarantees
-                    // acceptance, and the transport itself may be buffered.
-                    if let Err(e) = writer.get_mut().write_all(&response_bytes).await {
-                        error!("Failed to write response for tag {}: {}", tag, e);
-                        return;
-                    }
-                    // Mirror the buffered batch path's final authority check.
-                    // If the underlying writer retained the bytes, authority
-                    // loss must prevent its flush.
-                    if requires_authority && !authority.permits_successful_response() {
-                        warn!(
-                            "Dropping buffered successful 9P response for tag {tag} before flush \
-                             after serving authority was lost; closing the connection"
-                        );
-                        return;
-                    }
-                    if let Err(e) = writer.get_mut().flush().await {
-                        error!("Failed to flush response for tag {}: {}", tag, e);
-                        return;
-                    }
-                    drop(admission);
-                    continue;
-                }
-            };
-
-            // Form one bounded batch before any transport write. Continuing
-            // to drain across writes can indefinitely delay the final flush.
-            let mut batch = vec![first, second];
-            // Consolidate responses that are already queued without delaying
-            // an uncontended RPC by a scheduler turn.
-            while let Ok(more) = rx.try_recv() {
-                batch.push(more);
-            }
-
-            let mut buffered_authority_gated_success = false;
-            let mut dropped_authority_gated_success = false;
-            let mut admissions = Vec::with_capacity(batch.len());
-            for response in batch {
-                let (tag, response_bytes, admission) = response.into_guarded_parts();
-                admissions.push(admission);
-                let requires_authority = response_requires_serving_authority(&response_bytes);
-                if requires_authority && !authority.may_emit(&response_bytes) {
-                    warn!(
-                        "Dropping successful 9P response for tag {tag} after serving authority \
-                         was lost; closing the connection"
-                    );
-                    dropped_authority_gated_success = true;
-                    continue;
-                }
-                // `write_all` may flush buffered frames; recheck authority first.
-                if buffered_authority_gated_success && !authority.permits_successful_response() {
-                    warn!(
-                        "Dropping buffered successful 9P responses before writing response for \
-                         tag {tag} after serving authority was lost; closing the connection"
-                    );
-                    return;
-                }
-                buffered_authority_gated_success |= requires_authority;
-                if let Err(e) = writer.write_all(&response_bytes).await {
-                    error!("Failed to write response for tag {}: {}", tag, e);
-                    return;
-                }
-            }
-
-            // Recheck authority before the final buffer flush.
-            if buffered_authority_gated_success && !authority.permits_successful_response() {
-                warn!(
-                    "Dropping buffered successful 9P responses after serving authority was \
-                     lost; closing the connection"
-                );
-                return;
-            }
-            if let Err(e) = writer.flush().await {
-                error!("Failed to flush writer: {}", e);
-                return;
-            }
-            drop(admissions);
-            if dropped_authority_gated_success {
-                return;
-            }
-        }
-    }))
-}
-
-async fn handle_client_stream<R, W>(
-    read_stream: R,
-    write_stream: W,
-    filesystem: Arc<ZeroFS>,
-    lock_manager: Arc<FileLockManager>,
-    shutdown: CancellationToken,
-    _transport: P9TransportPermit,
-) -> anyhow::Result<()>
-where
-    R: AsyncRead + Unpin + Send + 'static,
-    W: AsyncWrite + Unpin + Send + 'static,
-{
-    let handler = Arc::new(NinePHandler::new(Arc::clone(&filesystem), lock_manager));
-    let admission = P9GlobalAdmission::shared().connection();
-    let requests = TaskTracker::new();
-
-    let (tx, rx) = mpsc::channel::<P9Response>(P9_CHANNEL_SIZE);
-    let connection_shutdown = shutdown.child_token();
-    let writer_task = spawn_response_writer(
-        write_stream,
-        rx,
-        ResponseAuthority::from_database(Arc::clone(&filesystem.db)),
-        connection_shutdown.clone(),
-    );
-
-    // Retire resource guards and locks before draining received requests.
-    let mut release_guard = SessionReleaseGuard::new(Arc::clone(&handler));
-
-    let result = handle_client_loop(
-        handler,
-        read_stream,
-        tx,
-        connection_shutdown,
-        &admission,
-        &requests,
-    )
-    .await;
-    release_guard.release();
-
-    match join_with_timeout(writer_task, CLIENT_DRAIN_TIMEOUT).await {
-        Some(Ok(())) => {}
-        Some(Err(e)) => warn!("9P writer task failed: {e}"),
-        None => {
-            metrics::counter!("zerofs_p9_response_drain_timeouts_total", "transport" => "tcp")
-                .increment(1);
-            warn!("timed out draining 9P client responses; writer aborted");
-        }
-    }
-
-    settle_request_tasks(requests).await;
-
-    result
-}
-
-/// Fid footprint used by receive-order barriers.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum FidFootprint {
-    #[default]
-    None,
-    One(u32),
-    Two(u32, u32),
-    All,
-}
-
-impl FidFootprint {
-    fn contains(self, fid: u32) -> bool {
-        match self {
-            Self::None => false,
-            Self::One(first) => first == fid,
-            Self::Two(first, second) => first == fid || second == fid,
-            Self::All => true,
-        }
-    }
-}
-
-/// Request completion signal and fid footprint.
-struct RequestState {
-    completed: CancellationToken,
-    fids: FidFootprint,
-}
-
-impl RequestState {
-    fn new(fids: FidFootprint) -> Self {
-        Self {
-            completed: CancellationToken::new(),
-            fids,
-        }
-    }
-
-    fn complete(&self) {
-        self.completed.cancel();
-    }
-
-    async fn wait(&self) {
-        self.completed.cancelled().await;
-    }
-}
-
-type CompletionWaiter = Arc<RequestState>;
-
-/// Per-connection request registry.
-#[derive(Default)]
-struct InflightRegistryInner {
-    /// One active request per wire tag, as required by 9P.
-    entries: DashMap<u16, Arc<RequestState>>,
-    /// Tail request of the receive-ordered Tflush chain for each oldtag.
-    flush_tails: DashMap<u16, Arc<RequestState>>,
-}
-
-#[derive(Clone, Default)]
-pub(crate) struct InflightRegistry {
-    inner: Arc<InflightRegistryInner>,
-}
-
-impl InflightRegistry {
-    fn register(&self, tag: u16, fids: FidFootprint) -> anyhow::Result<RequestLease> {
-        let Entry::Vacant(entry) = self.inner.entries.entry(tag) else {
-            anyhow::bail!("client reused in-flight 9P tag {tag}");
-        };
-        let state = Arc::new(RequestState::new(fids));
-        entry.insert(Arc::clone(&state));
-        Ok(RequestLease {
-            registry: self.clone(),
-            tag,
-            state,
-            flush_oldtag: None,
-        })
-    }
-
-    fn waiter(&self, tag: u16) -> Option<CompletionWaiter> {
-        self.inner
-            .entries
-            .get(&tag)
-            .map(|entry| Arc::clone(entry.value()))
-    }
-
-    /// Register a whole-session barrier after snapshotting earlier requests.
-    fn register_after_prior_snapshot(
-        &self,
-        tag: u16,
-    ) -> anyhow::Result<(RequestLease, Vec<CompletionWaiter>)> {
-        let waiters = self
-            .inner
-            .entries
-            .iter()
-            .map(|entry| Arc::clone(entry.value()))
-            .collect();
-        Ok((self.register(tag, FidFootprint::All)?, waiters))
-    }
-
-    /// Register a fid barrier after snapshotting earlier requests for that fid.
-    fn register_after_fid_snapshot(
-        &self,
-        tag: u16,
-        fid: u32,
-    ) -> anyhow::Result<(RequestLease, Vec<CompletionWaiter>)> {
-        let waiters = self
-            .inner
-            .entries
-            .iter()
-            .filter(|entry| entry.value().fids.contains(fid))
-            .map(|entry| Arc::clone(entry.value()))
-            .collect();
-        Ok((self.register(tag, FidFootprint::One(fid))?, waiters))
-    }
-
-    /// Append `Tflush` to the target tag's response-order chain.
-    fn register_flush(&self, tag: u16, oldtag: u16) -> anyhow::Result<FlushRegistration> {
-        let target = self.waiter(oldtag);
-        let mut lease = self.register(tag, FidFootprint::None)?;
-        let predecessor = self
-            .inner
-            .flush_tails
-            .insert(oldtag, Arc::clone(&lease.state));
-        lease.flush_oldtag = Some(oldtag);
-        Ok(FlushRegistration {
-            lease,
-            target,
-            predecessor,
-        })
-    }
-}
-
-struct FlushRegistration {
-    lease: RequestLease,
-    target: Option<CompletionWaiter>,
-    predecessor: Option<CompletionWaiter>,
-}
-
-/// Non-cloneable authority to retire one request.
-#[must_use = "dropping the lease completes and retires its request"]
-struct RequestLease {
-    registry: InflightRegistry,
-    tag: u16,
-    state: Arc<RequestState>,
-    flush_oldtag: Option<u16>,
-}
-
-impl RequestLease {
-    /// Publish a terminal response before making the tag reusable.
-    fn publish_terminal_response(&self, publish: impl FnOnce()) {
-        let retired = self
-            .registry
-            .inner
-            .entries
-            .remove_if(&self.tag, |_, current| {
-                if !Arc::ptr_eq(current, &self.state) {
-                    return false;
-                }
-                publish();
-                true
-            });
-        assert!(retired.is_some(), "request tag retired before its response");
-    }
-
-    /// Remove this lease's registry entry if it is still present.
-    fn retire_registration(&self) {
-        self.registry
-            .inner
-            .entries
-            .remove_if(&self.tag, |_, current| Arc::ptr_eq(current, &self.state));
-    }
-}
-
-impl Drop for RequestLease {
-    fn drop(&mut self) {
-        self.retire_registration();
-        if let Some(oldtag) = self.flush_oldtag {
-            self.registry
-                .inner
-                .flush_tails
-                .remove_if(&oldtag, |_, current| Arc::ptr_eq(current, &self.state));
-        }
-        self.state.complete();
-    }
-}
-
-/// Reserve response capacity, enqueue the terminal response, then retire its tag.
-async fn enqueue_terminal_response(
-    tx: &mpsc::Sender<P9Response>,
-    response_bytes: Vec<u8>,
-    request_lease: &RequestLease,
-    admission: P9AdmissionPermit,
-) -> Result<(), mpsc::error::SendError<()>> {
-    let permit = tx.reserve().await?;
-    request_lease.publish_terminal_response(|| {
-        permit.send(P9Response::new(
-            request_lease.tag,
-            response_bytes,
-            admission,
-        ))
-    });
-    Ok(())
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct ShallowFrameMetadata {
-    fids: FidFootprint,
-    received_op: Option<([u8; P9_OP_ID_LEN], u8, u64)>,
-}
-
-fn read_u32_at(bytes: &[u8], offset: usize) -> Option<u32> {
-    Some(u32::from_le_bytes(
-        bytes.get(offset..offset + 4)?.try_into().ok()?,
-    ))
-}
-
-fn fixed_one_fid(body: &[u8]) -> FidFootprint {
-    read_u32_at(body, 0).map_or(FidFootprint::None, FidFootprint::One)
-}
-
-fn fixed_two_fids(body: &[u8]) -> FidFootprint {
-    match (read_u32_at(body, 0), read_u32_at(body, 4)) {
-        (Some(first), Some(second)) => FidFootprint::Two(first, second),
-        _ => FidFootprint::None,
-    }
-}
-
-/// Decode the fid-bearing prefix needed for receive-order barriers.
-fn request_fid_footprint(type_byte: u8, body: &[u8]) -> FidFootprint {
-    match type_byte {
-        TVERSION_TYPE => FidFootprint::All,
-
-        20 | 30 | 70 | 104 | 110 | 230 | 236 | 238 | 246 | 252 => fixed_two_fids(body),
-
-        // `Trenameat.newdirfid` follows the variable-length old name.
-        74 | 235 => {
-            let Some(old_dir) = read_u32_at(body, 0) else {
-                return FidFootprint::None;
-            };
-            let Some(name_len) = body
-                .get(4..6)
-                .and_then(|bytes| bytes.try_into().ok())
-                .map(u16::from_le_bytes)
-            else {
-                return FidFootprint::None;
-            };
-            let new_dir_offset = 6usize.saturating_add(usize::from(name_len));
-            read_u32_at(body, new_dir_offset).map_or(FidFootprint::None, |new_dir| {
-                FidFootprint::Two(old_dir, new_dir)
-            })
-        }
-
-        8 | 12 | 14 | 16 | 18 | 22 | 24 | 26 | 40 | 50 | 52 | 54 | 72 | 76 | 116 | 118
-        | TCLUNK_TYPE | 228 | 232 | 240 | 242 | 244 | 248 | 250 | 254 => fixed_one_fid(body),
-        _ => FidFootprint::None,
-    }
-}
-
-/// Inspect framing, mutation envelope, and fid prefix without copying the body.
-fn inspect_frame_metadata(frame: &[u8], zerofs_protocol: bool) -> ShallowFrameMetadata {
-    let type_byte = frame[4];
-    let carries_op = zerofs_protocol && P9Message::carries_op_id(type_byte);
-    let body_offset = P9_HEADER_SIZE + usize::from(carries_op) * P9_OP_ENVELOPE_LEN;
-
-    let received_op = if carries_op && frame.len() >= body_offset {
-        let mut op_id = [0; P9_OP_ID_LEN];
-        op_id.copy_from_slice(&frame[P9_HEADER_SIZE..P9_HEADER_SIZE + P9_OP_ID_LEN]);
-        let origin_offset = P9_HEADER_SIZE + P9_OP_ID_LEN + 1;
-        let origin_epoch = u64::from_le_bytes(
-            frame[origin_offset..origin_offset + 8]
-                .try_into()
-                .expect("validated operation envelope"),
-        );
-        Some((op_id, frame[P9_HEADER_SIZE + P9_OP_ID_LEN], origin_epoch))
-    } else {
-        None
-    };
-
-    ShallowFrameMetadata {
-        fids: frame.get(body_offset..).map_or(FidFootprint::None, |body| {
-            request_fid_footprint(type_byte, body)
-        }),
-        received_op,
-    }
-}
-
-/// Decode only the fixed Twrite prefix for an epoch-zero RETRY. Such a retry
-/// can only replay the durable result of its original request, so retaining its
-/// bulk payload while waiting is unnecessary. Non-zero epochs keep the full
-/// payload because promotion grace may allow them to become the applier.
-fn shallow_epoch_zero_retry_write(
-    frame: &[u8],
-    metadata: ShallowFrameMetadata,
-) -> Option<P9Message> {
-    let (op_id, op_flags, origin_epoch) = metadata.received_op?;
-    if frame.get(4) != Some(&T_WRITE) || op_flags & P9_OP_FLAG_RETRY == 0 || origin_epoch != 0 {
-        return None;
-    }
-
-    let body_offset = P9_HEADER_SIZE + P9_OP_ENVELOPE_LEN;
-    let body = frame.get(body_offset..)?;
-    let fid = read_u32_at(body, 0)?;
-    let offset = u64::from_le_bytes(body.get(4..12)?.try_into().ok()?);
-    let count = read_u32_at(body, 12)?;
-    let payload_end = 16usize.checked_add(count as usize)?;
-    body.get(..payload_end)?;
-    let tag = u16::from_le_bytes(frame.get(5..7)?.try_into().ok()?);
-
-    Some(P9Message::new_with_op_id_flags_and_origin(
-        tag,
-        op_id,
-        op_flags,
-        origin_epoch,
-        Message::Twrite(Twrite {
-            fid,
-            offset,
-            count,
-            data: DekuBytes::from(Bytes::new()),
-        }),
-    ))
-}
-
-fn possible_response_bytes(type_byte: u8) -> usize {
-    match type_byte {
-        T_WRITE => P9_RWRITE_MAX_SIZE,
-        // Large read-like handlers retain their source payload while the
-        // protocol encoder materializes the wire response. Charge both live
-        // buffers; the process-wide byte semaphore remains the hard bound.
-        message_type::TREAD
-        | message_type::TREADDIR
-        | message_type::TLOPENATREAD
-        | message_type::TREADDIRATTR => 2 * P9_MAX_MSIZE as usize,
-        _ => P9_MAX_MSIZE as usize,
-    }
-}
-
-/// Dispatch a single 9P frame buffer. Shared between TCP (via LengthDelimitedCodec)
-/// and WebSocket transports.
-///
-/// Reserve receive-time dedup state before task detachment. Full decoding runs
-/// in the detached task.
-pub(crate) async fn dispatch_9p_frame(
-    frame: Bytes,
-    handler: &Arc<NinePHandler>,
-    tx: &mpsc::Sender<P9Response>,
-    inflight: &InflightRegistry,
-    admission: &P9ConnectionAdmission,
-    requests: &TaskTracker,
-    shutdown: &CancellationToken,
-) -> anyhow::Result<()> {
-    if frame.len() < P9_MIN_MESSAGE_SIZE as usize {
-        error!("Message too short: {} bytes", frame.len());
-        return Err(anyhow::anyhow!("Message too short"));
-    }
-    if frame.len() > P9_MAX_MSIZE as usize {
-        anyhow::bail!("9P message exceeds maximum negotiated size");
-    }
-
-    let type_byte = frame[4];
-    // Reserve the received allocation and a conservative type-specific reply
-    // before detaching request work. Bulk writes have a fixed-size Rwrite;
-    // other requests retain the full negotiated-response allowance.
-    let admission = admission
-        .admit_request_or_shutdown(frame.len(), possible_response_bytes(type_byte), shutdown)
-        .await?;
-
-    let tag = u16::from_le_bytes([frame[5], frame[6]]);
-    let zerofs_protocol = handler.zerofs_protocol_enabled();
-    let metadata = inspect_frame_metadata(&frame, zerofs_protocol);
-    let shallow_retry = shallow_epoch_zero_retry_write(&frame, metadata);
-
-    // Capture `oldtag` before any yield or tag reuse.
-    let (flush_oldtag, flush_waiters, request_lease, prior_waiters) = if type_byte == TFLUSH_TYPE {
-        if frame.len() < P9_HEADER_SIZE + 2 {
-            error!("Tflush message too short: {} bytes", frame.len());
-            return Err(anyhow::anyhow!("Tflush message too short"));
-        }
-        let oldtag = u16::from_le_bytes([frame[P9_HEADER_SIZE], frame[P9_HEADER_SIZE + 1]]);
-        let FlushRegistration {
-            lease,
-            target,
-            predecessor,
-        } = inflight.register_flush(tag, oldtag)?;
-        let waiters = target.into_iter().chain(predecessor).collect();
-        (Some(oldtag), waiters, lease, Vec::new())
-    } else {
-        // `Tclunk` waits on its fid; `Tversion` waits on the whole session.
-        let (request_lease, prior_waiters) = match (type_byte, metadata.fids) {
-            (TVERSION_TYPE, _) => inflight.register_after_prior_snapshot(tag)?,
-            (TCLUNK_TYPE, FidFootprint::One(fid)) => {
-                inflight.register_after_fid_snapshot(tag, fid)?
-            }
-            _ => (inflight.register(tag, metadata.fids)?, Vec::new()),
-        };
-        (None, Vec::new(), request_lease, prior_waiters)
-    };
-
-    // Reserve a FIRST envelope before EOF can admit a replacement RETRY.
-    let received_guard = metadata
-        .received_op
-        .and_then(|(op_id, op_flags, _origin_epoch)| {
-            handler.try_reserve_received_first(op_id, op_flags, type_byte)
-        });
-
-    let handler = Arc::clone(handler);
-    let tx = tx.clone();
-
-    let request = requests.track_future(async move {
-        // Only Twrite has an inbound bulk payload worth retaining. Other
-        // requests keep the regular decoder and the original error diagnostics.
-        let parsed = if let Some(parsed) = shallow_retry {
-            Ok(parsed)
-        } else if type_byte == T_WRITE {
-            P9Message::from_owned_bytes_ctx(frame.clone(), zerofs_protocol)
-        } else {
-            P9Message::from_bytes_ctx(&frame, zerofs_protocol)
-        };
-
-        // Barrier waiters were captured synchronously in receive order.
-        for waiter in prior_waiters {
-            waiter.wait().await;
-        }
-
-        // Parse failures stay registered until their `Rlerror` is enqueued.
-        let response_bytes = match parsed {
-            Ok(parsed) => {
-                drop(frame);
-                debug!(
-                    "Received message type {} tag {}: {:?}",
-                    parsed.type_, parsed.tag, parsed.body
-                );
-                let response = handler
-                    .handle_message_with_received_admission(
-                        tag,
-                        parsed.op_id,
-                        parsed.op_flags,
-                        parsed.op_origin_epoch,
-                        parsed.body,
-                        received_guard,
-                    )
-                    .await;
-                response.to_bytes().ok()
-            }
-            Err(e) => {
-                debug!(
-                    "Failed to parse message type {} (0x{:02x}) tag {}: {:?}",
-                    type_byte, type_byte, tag, e
-                );
-                debug!(
-                    "Message size: {}, buffer (first {} bytes): {:?}",
-                    frame.len(),
-                    P9_DEBUG_BUFFER_SIZE,
-                    &frame[..std::cmp::min(P9_DEBUG_BUFFER_SIZE, frame.len())]
-                );
-                P9Message::new(
-                    tag,
-                    Message::Rlerror(Rlerror {
-                        ecode: P9Error::NotImplemented.to_errno(),
-                    }),
-                )
-                .to_bytes()
-                .ok()
-            }
-        };
-
-        if let Some(oldtag) = flush_oldtag {
-            debug!("Tflush: waiting for oldtag {} to complete", oldtag);
-            for waiter in flush_waiters {
-                waiter.wait().await;
-            }
-            debug!("Tflush: oldtag {} completed", oldtag);
-        }
-
-        match response_bytes {
-            Some(response_bytes) => {
-                if let Err(e) =
-                    enqueue_terminal_response(&tx, response_bytes, &request_lease, admission).await
-                {
-                    warn!("Failed to send response for tag {}: {}", tag, e);
-                }
-            }
-            None => {
-                error!("Failed to serialize response for tag {}", tag);
-            }
-        }
-
-        drop(request_lease);
-    });
-    drop(spawn_named("9p-request", request));
-    Ok(())
-}
-
-async fn handle_client_loop<R>(
-    handler: Arc<NinePHandler>,
-    mut read_stream: R,
-    tx: mpsc::Sender<P9Response>,
-    shutdown: CancellationToken,
-    admission: &P9ConnectionAdmission,
-    requests: &TaskTracker,
-) -> anyhow::Result<()>
-where
-    R: AsyncRead + Unpin,
-{
-    let inflight = InflightRegistry::default();
-
-    loop {
-        // Hold a maximum-frame receive credit before polling the transport.
-        // The exact reader below never allocates a replacement decode buffer.
-        let receive = admission.global.admit_receive(&shutdown).await?;
-        let Some(full_buf) = read_9p_frame(&mut read_stream, &shutdown).await? else {
-            debug!("Client disconnected");
-            return Ok(());
-        };
-
-        dispatch_9p_frame(
-            full_buf, &handler, &tx, &inflight, admission, requests, &shutdown,
-        )
-        .await?;
-        drop(receive);
-    }
-}
-
-async fn read_9p_frame<R>(
-    reader: &mut R,
-    shutdown: &CancellationToken,
-) -> anyhow::Result<Option<Bytes>>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut header = [0u8; P9_SIZE_FIELD_LEN];
-    let header_result = tokio::select! {
-        biased;
-        _ = shutdown.cancelled() => return Ok(None),
-        result = reader.read_exact(&mut header) => result,
-    };
-    if let Err(error) = header_result {
-        return if error.kind() == std::io::ErrorKind::UnexpectedEof {
-            Ok(None)
-        } else {
-            Err(error.into())
-        };
-    }
-
-    let frame_len = u32::from_le_bytes(header) as usize;
-    if frame_len < P9_MIN_MESSAGE_SIZE as usize || frame_len > P9_MAX_MSIZE as usize {
-        anyhow::bail!("invalid 9P frame length {frame_len}");
-    }
-    let mut frame = Vec::with_capacity(frame_len);
-    frame.extend_from_slice(&header);
-    frame.resize(frame_len, 0);
-    tokio::select! {
-        biased;
-        _ = shutdown.cancelled() => return Ok(None),
-        result = reader.read_exact(&mut frame[P9_SIZE_FIELD_LEN..]) => { result?; }
-    }
-    Ok(Some(Bytes::from(frame)))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::fs::permissions::Credentials;
+    use crate::ninep::handler::SessionReleaseGuard;
     use crate::ninep::lock_manager::FileLock;
     use ninep_proto::{
         DekuBytes, GETATTR_ALL, LockType, P9String, Rclunk, Rflush, Rlopenat, Rread, Tattach,
@@ -1783,12 +692,15 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn timed_out_settlement_keeps_accepted_work_alive_after_connection_return() {
+    async fn timed_out_settlement_transfers_to_process_ownership() {
         let requests = TaskTracker::new();
+        let accepted_work = P9AcceptedWorkTracker::new();
+        let accepted_guard = accepted_work.try_accept().unwrap();
         let release = Arc::new(Notify::new());
         let task_release = Arc::clone(&release);
         let (finished_tx, mut finished_rx) = oneshot::channel();
         requests.spawn(async move {
+            let _accepted_guard = accepted_guard;
             task_release.notified().await;
             let _ = finished_tx.send(());
         });
@@ -1803,11 +715,50 @@ mod tests {
             finished_rx.try_recv().is_err(),
             "accepted work must not be aborted at the connection deadline"
         );
+        assert_eq!(accepted_work.len(), 1);
+        accepted_work.stop_accepting();
+        let mut process_settlement = tokio::spawn({
+            let accepted_work = accepted_work.clone();
+            async move { accepted_work.wait().await }
+        });
+        assert!(
+            tokio::time::timeout(QUIET_TIMEOUT, &mut process_settlement)
+                .await
+                .is_err(),
+            "process shutdown must retain accepted work ownership"
+        );
 
         release.notify_waiters();
         tokio::time::timeout(TEST_TIMEOUT, finished_rx)
             .await
-            .expect("detached accepted work must finish in the server runtime")
+            .expect("process-owned accepted work must finish")
+            .unwrap();
+        tokio::time::timeout(TEST_TIMEOUT, process_settlement)
+            .await
+            .expect("process ownership must drain after accepted work finishes")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn sealed_process_tracker_rejects_late_acceptance() {
+        let accepted_work = P9AcceptedWorkTracker::new();
+        let guard = accepted_work.try_accept().unwrap();
+        accepted_work.stop_accepting();
+        assert!(accepted_work.try_accept().is_none());
+
+        let mut settlement = tokio::spawn({
+            let accepted_work = accepted_work.clone();
+            async move { accepted_work.wait().await }
+        });
+        assert!(
+            tokio::time::timeout(QUIET_TIMEOUT, &mut settlement)
+                .await
+                .is_err()
+        );
+        drop(guard);
+        tokio::time::timeout(TEST_TIMEOUT, settlement)
+            .await
+            .expect("sealing must wait only for work accepted before the cutoff")
             .unwrap();
     }
 

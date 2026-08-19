@@ -7,6 +7,7 @@ use crate::fs::types::SetAttributes;
 use crate::fs::{CacheConfig, GarbageCollector, ZeroFS};
 use crate::length_checked_object_store::LengthCheckedObjectStore;
 use crate::nbd::{NBDServer, NbdExportGates};
+use crate::ninep::server::P9AcceptedWorkTracker;
 use crate::object_store_prefetch::PrefetchingObjectStore;
 use crate::parse_object_store::{ParsedStore, parse_url_opts};
 use crate::storage_class_object_store::with_storage_class;
@@ -178,6 +179,7 @@ fn start_ninep_servers(
     fs: Arc<ZeroFS>,
     config: Option<&NinePConfig>,
     shutdown: CancellationToken,
+    accepted_work: P9AcceptedWorkTracker,
 ) -> Vec<JoinHandle<Result<(), std::io::Error>>> {
     let config = match config {
         Some(c) => c,
@@ -190,8 +192,11 @@ fn start_ninep_servers(
             info!("Starting 9P server on {}", addr);
             let ninep_tcp_server = crate::ninep::NinePServer::new(Arc::clone(&fs), *addr);
             let shutdown_clone = shutdown.clone();
+            let accepted_work = accepted_work.clone();
             handles.push(spawn_named("9p-server", async move {
-                ninep_tcp_server.start(shutdown_clone).await
+                ninep_tcp_server
+                    .start_with_accepted_work(shutdown_clone, accepted_work)
+                    .await
             }));
         }
     }
@@ -205,8 +210,11 @@ fn start_ninep_servers(
         let ninep_unix_server =
             crate::ninep::NinePServer::new_unix(ninep_unix_fs, socket_path.clone());
         let shutdown_clone = shutdown.clone();
+        let accepted_work = accepted_work.clone();
         handles.push(spawn_named("9p-unix-server", async move {
-            ninep_unix_server.start(shutdown_clone).await
+            ninep_unix_server
+                .start_with_accepted_work(shutdown_clone, accepted_work)
+                .await
         }));
     }
 
@@ -625,6 +633,10 @@ async fn drain_server_handles_for_stop(
                 retain_listener_failure(&mut cause, &mut cleanup_errors, error);
             }
         }
+        cleanup_errors.push(anyhow::anyhow!(
+            "server listener shutdown exceeded the {}s response-drain grace",
+            crate::replication::RESPONSE_DRAIN_TIMEOUT.as_secs()
+        ));
     }
 
     (cause, cleanup_errors)
@@ -1241,6 +1253,7 @@ pub async fn run_server(
             .as_ref()
             .map_or_else(CancellationToken::new, |authority| authority.loss_token());
         let shutdown = leadership_deposed.child_token();
+        let p9_accepted_work = P9AcceptedWorkTracker::new();
 
         // Do not start listeners after authority was revoked during initialization.
         if leadership_deposed.is_cancelled() {
@@ -1308,6 +1321,7 @@ pub async fn run_server(
             Arc::clone(&fs),
             settings.servers.ninep.as_ref(),
             shutdown.clone(),
+            p9_accepted_work.clone(),
         );
 
         let (nbd_handles, nbd_runtime_registry) = start_nbd_servers(
@@ -1441,6 +1455,7 @@ pub async fn run_server(
                 webui_lock_manager,
                 webui_rpc_service,
                 shutdown.clone(),
+                p9_accepted_work.clone(),
             )
         } else {
             Vec::new()
@@ -1490,6 +1505,7 @@ pub async fn run_server(
 
         info!("Cancelling all servers and background tasks...");
         shutdown.cancel();
+        p9_accepted_work.stop_accepting();
         info!("Waiting for servers to exit...");
         let (stop_cause, serving_cleanup_errors) = drain_server_handles_for_stop(
             stop_cause,
@@ -1497,6 +1513,8 @@ pub async fn run_server(
             &leadership_deposed,
         )
         .await;
+        info!("Waiting for accepted 9P work to settle...");
+        p9_accepted_work.wait().await;
 
         if stop_cause.is_leadership_lost() {
             if let Some(registry) = &nbd_runtime_registry {
@@ -1929,13 +1947,17 @@ addresses = ["127.0.0.1:20490"]
             started.elapsed(),
             crate::replication::RESPONSE_DRAIN_TIMEOUT
         );
-        assert!(cleanup.is_empty(), "unexpected secondary failure");
+        assert_eq!(cleanup.len(), 1, "missing listener-timeout context");
+        assert!(cleanup[0].to_string().contains("shutdown exceeded"));
         let sibling_dropped = tokio::time::timeout(Duration::from_secs(1), alive_rx).await;
         assert!(
             matches!(sibling_dropped, Ok(Err(_))),
             "stuck sibling listener was not aborted and joined"
         );
-        let message = format!("{:#}", finish_serving_shutdown(cause, Ok(())).unwrap_err());
+        let message = format!(
+            "{:#}",
+            finish_serving_shutdown(cause, merge_cleanup_results(cleanup, Ok(()))).unwrap_err()
+        );
         assert!(
             message.contains("primary listener failure"),
             "unexpected primary error: {message}"
@@ -2022,7 +2044,7 @@ addresses = ["127.0.0.1:20490"]
     }
 
     #[tokio::test(start_paused = true)]
-    async fn signal_shutdown_aborts_and_joins_a_stuck_listener_after_grace() {
+    async fn signal_shutdown_reports_a_stuck_listener_after_grace() {
         let (alive_tx, alive_rx) = tokio::sync::oneshot::channel::<()>();
         let stuck = tokio::spawn(async move {
             let _alive = alive_tx;
@@ -2048,7 +2070,9 @@ addresses = ["127.0.0.1:20490"]
         );
         assert!(handles.is_empty(), "listener handle was not joined");
         assert!(alive_rx.await.is_err(), "stuck listener was not aborted");
-        finish_serving_shutdown(drained.0, merge_cleanup_results(drained.1, Ok(()))).unwrap();
+        let error = finish_serving_shutdown(drained.0, merge_cleanup_results(drained.1, Ok(())))
+            .unwrap_err();
+        assert!(error.to_string().contains("shutdown exceeded"));
     }
 
     #[tokio::test(start_paused = true)]
@@ -2158,7 +2182,7 @@ addresses = ["127.0.0.1:20490"]
             started.elapsed(),
             crate::replication::RESPONSE_DRAIN_TIMEOUT
         );
-        assert!(cleanup.is_empty(), "unexpected listener cleanup error");
+        assert_eq!(cleanup.len(), 1, "missing listener-timeout context");
         assert!(alive_rx.await.is_err(), "stuck listener was not joined");
         let message = format!("{:#}", finish_serving_shutdown(cause, Ok(())).unwrap_err());
         assert!(message.starts_with("HA writer was fenced or superseded"));
