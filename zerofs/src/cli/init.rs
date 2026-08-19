@@ -792,8 +792,7 @@ impl StartupContext {
                 self.object_store.clone(),
                 parts_cache,
                 self.store_profile.prefetch,
-            )
-            .with_admission_cap(crate::alloc_rss::rss_cap_bytes()),
+            ),
         );
         let db_prefix = Path::from(self.actual_db_path.clone());
         let segment_object_store: Arc<dyn object_store::ObjectStore> =

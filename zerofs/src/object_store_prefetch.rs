@@ -445,8 +445,6 @@ pub struct PrefetchingObjectStore {
     access_tracker: Cache<Path, Arc<Mutex<AccessHistory>>>,
     fetches: Fetches,
     cache_instance: uuid::Uuid,
-    /// Clean-cache / cgroup-slack RSS ceiling. `0` disables admission.
-    admission_cap_bytes: u64,
     /// Highest part_id+1 seen per object, so evict can form PartKeys
     /// after a seal warm that never saved a head.
     part_counts: Cache<Path, usize>,
@@ -464,7 +462,6 @@ struct FetchCtx {
     fetches: Fetches,
     part_size_bytes: usize,
     cache_instance: uuid::Uuid,
-    admission_cap_bytes: u64,
     part_counts: Cache<Path, usize>,
 }
 
@@ -500,14 +497,13 @@ enum WindowPlan {
 fn admit_part(
     parts: &HybridCache<PartKey, Bytes>,
     part_counts: &Cache<Path, usize>,
-    admission_cap_bytes: u64,
     location: &Path,
     part_size_bytes: usize,
     generation: &CacheGeneration,
     part_id: PartId,
     bytes: Bytes,
 ) {
-    if alloc_rss::over_rss_cap_of(admission_cap_bytes) {
+    if alloc_rss::over_rss_cap() {
         return;
     }
     parts.insert(
@@ -660,19 +656,11 @@ impl PrefetchingObjectStore {
             access_tracker,
             fetches: Arc::new(Mutex::new(HashMap::new())),
             cache_instance: uuid::Uuid::new_v4(),
-            admission_cap_bytes: 0,
             part_counts: foyer::CacheBuilder::new(HEADS_CAPACITY_ENTRIES)
                 .with_name("zerofs-object-prefetch-part-counts")
                 .with_eviction_config(foyer::S3FifoConfig::default())
                 .build(),
         }
-    }
-
-    /// RSS admission ceiling (configured clean-cache total). `0` leaves
-    /// inserts ungated (tests).
-    pub fn with_admission_cap(mut self, cap_bytes: u64) -> Self {
-        self.admission_cap_bytes = cap_bytes;
-        self
     }
 
     fn ctx(&self) -> FetchCtx {
@@ -685,7 +673,6 @@ impl PrefetchingObjectStore {
             fetches: self.fetches.clone(),
             part_size_bytes: self.part_size_bytes,
             cache_instance: self.cache_instance,
-            admission_cap_bytes: self.admission_cap_bytes,
             part_counts: self.part_counts.clone(),
         }
     }
@@ -776,7 +763,6 @@ impl PrefetchingObjectStore {
         admit_part(
             &self.parts,
             &self.part_counts,
-            self.admission_cap_bytes,
             location,
             self.part_size_bytes,
             generation,
@@ -1218,7 +1204,6 @@ impl PrefetchingObjectStore {
         Self::save_parts_stream(
             &self.parts,
             &self.part_counts,
-            self.admission_cap_bytes,
             self.part_size_bytes,
             location,
             &generation,
@@ -1232,7 +1217,6 @@ impl PrefetchingObjectStore {
     async fn save_parts_stream<S>(
         parts: &HybridCache<PartKey, Bytes>,
         part_counts: &Cache<Path, usize>,
-        admission_cap_bytes: u64,
         part_size_bytes: usize,
         location: &Path,
         generation: &CacheGeneration,
@@ -1261,7 +1245,6 @@ impl PrefetchingObjectStore {
                 admit_part(
                     parts,
                     part_counts,
-                    admission_cap_bytes,
                     location,
                     part_size_bytes,
                     generation,
@@ -1275,7 +1258,6 @@ impl PrefetchingObjectStore {
             admit_part(
                 parts,
                 part_counts,
-                admission_cap_bytes,
                 location,
                 part_size_bytes,
                 generation,
@@ -1463,7 +1445,6 @@ impl PrefetchingObjectStore {
         admit_part(
             &ctx.parts,
             &ctx.part_counts,
-            ctx.admission_cap_bytes,
             location,
             part_size_bytes,
             &generation,
@@ -1534,7 +1515,6 @@ impl PrefetchingObjectStore {
             admit_part(
                 &ctx.parts,
                 &ctx.part_counts,
-                ctx.admission_cap_bytes,
                 &location,
                 part_size_bytes,
                 &generation,
@@ -4310,8 +4290,8 @@ mod tests {
     #[tokio::test]
     async fn rss_cap_skips_part_admission() {
         crate::alloc_rss::set_test_rss_envelope(Some(100));
+        crate::alloc_rss::set_test_rss_cap(Some(50));
         let (store, _inner, _dir) = make_store(64 * 1024, MEM, DISK).await;
-        let store = store.with_admission_cap(50);
         let path = Path::from("over-cap");
         let payload = vec![3u8; 64 * 1024];
         store.put(&path, payload.into()).await.unwrap();
@@ -4324,5 +4304,6 @@ mod tests {
             "RSS admission ceiling must skip parts.insert"
         );
         crate::alloc_rss::set_test_rss_envelope(None);
+        crate::alloc_rss::set_test_rss_cap(None);
     }
 }

@@ -758,7 +758,7 @@ mod tests {
 
     #[test]
     fn keep_going_false_when_rss_over_cap() {
-        crate::alloc_rss::set_rss_cap_bytes(64);
+        crate::alloc_rss::set_test_rss_cap(Some(64));
         crate::alloc_rss::set_test_rss_envelope(Some(100));
         assert!(
             !keep_going_ok(0, 8, false, true, true),
@@ -770,7 +770,7 @@ mod tests {
             "under the cap, the throughput floor still approves"
         );
         crate::alloc_rss::set_test_rss_envelope(None);
-        crate::alloc_rss::set_rss_cap_bytes(0);
+        crate::alloc_rss::set_test_rss_cap(None);
     }
 
     // The seam trigger: reserve-deferred seams drain faster even with little

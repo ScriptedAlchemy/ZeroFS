@@ -26,6 +26,7 @@ static LAST_SAMPLE_MS: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 thread_local! {
     static TEST_ENVELOPE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    static TEST_CAP: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 }
 
 /// Install the configured clean-cache total (or `cgroup_limit - slack`).
@@ -35,6 +36,10 @@ pub fn set_rss_cap_bytes(cap: u64) {
 }
 
 pub fn rss_cap_bytes() -> u64 {
+    #[cfg(test)]
+    if let Some(v) = TEST_CAP.with(|c| c.get()) {
+        return v;
+    }
     RSS_CAP_BYTES.load(Ordering::Relaxed)
 }
 
@@ -114,4 +119,10 @@ pub fn purge_arenas() {
 #[cfg(test)]
 pub fn set_test_rss_envelope(bytes: Option<u64>) {
     TEST_ENVELOPE.with(|c| c.set(bytes));
+}
+
+/// Thread-local cap override so parallel tests don't race on the global.
+#[cfg(test)]
+pub fn set_test_rss_cap(cap: Option<u64>) {
+    TEST_CAP.with(|c| c.set(cap));
 }
