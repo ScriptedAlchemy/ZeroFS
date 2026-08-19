@@ -381,7 +381,7 @@ NBD_PROOF_IDENTITY_TOKEN="$(python3 scripts/tiered-writeback-e2e.py verify-proof
 NBD_PROOF_TARGET_TOKEN="$(python3 scripts/tiered-writeback-e2e.py verify-proof-host --controller-ssh-target "$ZEROFS_NBD_PROOF_HOST" --expected-host-key-sha256 "$ZEROFS_NBD_PROOF_HOST_KEY_SHA256" --expected-machine-id "$ZEROFS_NBD_PROOF_MACHINE_ID" --expected-proxmox-vmid "$ZEROFS_NBD_PROOF_VMID" --forbid-machine-id "$VM100_MACHINE_ID" --forbid-machine-id "$CT198_MACHINE_ID" --forbid-proxmox-vmid 100 --forbid-proxmox-vmid 198 --format target-token)"
 case "$NBD_PROOF_IDENTITY_TOKEN" in ''|*[!A-Za-z0-9_-]*) exit 1 ;; esac
 case "$NBD_PROOF_TARGET_TOKEN" in ''|*[!A-Za-z0-9_-]*) exit 1 ;; esac
-ssh "$ZEROFS_NBD_PROOF_HOST" "SLICE_SHA='$SLICE_SHA' bash -seuo pipefail" <<'REMOTE'
+ssh "$ZEROFS_NBD_PROOF_HOST" "SLICE_SHA='$SLICE_SHA' PROOF_HOST_IDENTITY='$NBD_PROOF_IDENTITY_TOKEN' CONTROLLER_TARGET_RECEIPT='$NBD_PROOF_TARGET_TOKEN' bash -seuo pipefail" <<'REMOTE'
 cd /fast/projects/ZeroFS
 git fetch origin codex/unified-tiered-writeback
 test "$(git rev-parse origin/codex/unified-tiered-writeback)" = "$SLICE_SHA"
