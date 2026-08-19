@@ -171,9 +171,16 @@ mod tests {
         let sample = sampler.sample().await.unwrap();
 
         assert_eq!(sampler.writeback_dir(), writeback_dir.as_path());
-        assert_eq!(
-            sample.available_bytes,
-            fs4::available_space(&writeback_dir).unwrap()
+        // The sampler and the direct probe read the live filesystem at
+        // different instants; parallel tests writing to the same filesystem
+        // legitimately move free space between the two reads. A coarse band
+        // still catches a sampler probing the wrong thing (zero, wrong unit).
+        let probe = fs4::available_space(&writeback_dir).unwrap();
+        let drift = sample.available_bytes.abs_diff(probe);
+        assert!(
+            drift <= 64 * 1024 * 1024,
+            "sample {} and probe {probe} disagree by {drift} bytes",
+            sample.available_bytes
         );
     }
 
