@@ -61,6 +61,41 @@ it does not merge those namespaces.
     independent immutable runs are fetched with bounded concurrency, and NFS, 9P,
     and NBD read throughput is proved against paired raw-direction controls and
     cache-state-matched ZeroFS protocol controls.
+12. Preserve the original production envelope: a configured 16 GB dirty-write RAM
+    budget distinct from the 64 GB clean read cache, a 1 TB local SSD tier shared by
+    the configured clean-cache and durable journal/staging budgets, and a 5 TB-class
+    user-visible volume/export. Capacity reporting must keep
+    sparse virtual-device geometry separate from physically allocated local and
+    remote bytes.
+
+## Production performance contract
+
+FUSE is not a shipping frontend. ZeroFS itself owns the shared tiering used by NBD,
+NFS, 9P, WebUI, and direct callers. Linux may use NBD for a fast guest filesystem and
+also mount the direct NFS/9P namespace seen by the Mac; those namespaces remain
+distinct even though admission, durability, caching, failures, and remote storage are
+shared below the adapters.
+
+The production-shaped acceptance profile is:
+
+- a 4 GiB foreground write must remain entirely on the RAM/local-SSD path and must
+  not collapse to remote Storage Box throughput;
+- a 100 GiB copy with the configured 16 GB volatile budget must show the bounded RAM burst and
+  then sustained local-SSD-rate admission while remote publication proceeds
+  concurrently;
+- after the configured SSD dirty capacity is genuinely exhausted, foreground
+  admission must pace smoothly at measured remote drain without the 95-to-85-percent
+  multi-minute stop/resume cycle;
+- the local SSD leg is compared with a same-host durable local control, whose known
+  production target is approximately 800-900 MB/s on the intended hardware;
+- remote publication is compared with a same-endpoint, same-session-count, durable
+  raw SFTP control, whose intended production target is approximately 70-100 MB/s;
+  an environment whose paired raw control cannot reach that range is reported as an
+  external-path limitation rather than hidden by a lower ZeroFS threshold.
+
+These rates are targets, not permission to weaken integrity or durability. Each result
+must include the paired control, tier-occupancy timeline, exact acknowledged and
+durable cutoffs, zero terminal errors, and cleanup evidence.
 
 ## Non-goals
 

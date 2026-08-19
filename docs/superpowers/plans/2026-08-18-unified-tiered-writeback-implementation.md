@@ -15,8 +15,11 @@
 - Work only in `/Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback` until final reviewed merge. The separately inventoried `ScriptedAlchemy/nfsserve` dependency worktree in Task A16 is the sole explicit exception.
 - Root is the one landing owner for ZeroFS and the NFS dependency fork. Task agents receive non-overlapping file fences and never merge, push, deploy, or rewrite shared history independently.
 - Materialized mode remains the generated/runtime default. Shared `volatile_memory` is explicit, globally byte/op bounded, unsafe before a completed durability barrier, and invalid without persistent local writeback.
+- Preserve the production-shaped profile as an acceptance contract: configured 16 GB shared dirty-write RAM, 64 GB separate clean read cache, a 1 TB local SSD tier shared by configured clean-cache and durable journal/staging budgets, and a 5 TB-class user-visible export. FUSE is not a shipping frontend; NBD, NFS, 9P, WebUI, and direct callers use ZeroFS tiering.
+- A 4 GiB write may not fall to remote speed; a 100 GiB copy proves RAM-to-SSD transition while remote drain proceeds concurrently; an SSD-pressure leg proves smooth remote-rate pacing. Compare the SSD leg with the same-host durable local control (production target about 800-900 MB/s) and remote drain with a durability-matched raw SFTP control (production target about 70-100 MB/s).
 - Filesystem validation, permission, quota, timestamps, inode metadata, extents, compression, encryption, and canonical persistence remain owned by the existing filesystem path.
 - NBD guest files remain a different namespace from direct NFS/9P files; shared admission/coherence/durability does not claim guest namespace unification.
+- VM100's current production file-sharing deployment is NFS-only at `/mnt/zerofs-files`, matching the namespace mounted by the Mac. NBD/XFS remains an optional capability proved only on disposable Ubuntu resources in this project; do not install or mount it on VM100 during this rollout.
 - With writeback enabled, filesystem FLUSH/fsync/COMMIT resolves to `LocalSsd`; materialized/direct backend with writeback disabled resolves to `RemoteBackend`. Adapters consume the resolved target.
 - Every implementation task starts with a named focused RED test, ends with non-vacuous focused GREEN tests, formatting/diff checks, independent review, and one exact-file commit.
 - Commit commands name every file. Never stage broad directories. Never edit the approved spec as part of implementation; any amendment is a separate reviewed documentation task.
@@ -130,6 +133,7 @@ Record SHA, branch, porcelain, commands, and results. Ignored failover/performan
 - [ ] Plan B is complete and green: physical sampling, SSD reservation, release credit, and multipart promotion each have one owner, with no acknowledgement-semantic change.
 - [ ] Plan C proves real simultaneous NBD/NFS/9P admission, same-backing-inode pending reads, every cross-adapter barrier, WebUI/RPC production paths, crash/restart, Linux filesystems, integrity, and paced performance.
 - [ ] Plan C proves cache-state-matched raw SFTP/NFS/9P/NBD read throughput with true remote-cold, clean-SSD, and clean-RAM evidence; historical client-page-cache-only “cold” numbers are not acceptance.
+- [ ] Plan C proves the 4 GiB foreground-isolation, 100 GiB RAM-to-SSD transition, and SSD-pressure-to-remote pacing scenarios with the configured 16 GB/64 GB/1 TB/5 TB-class production profile and paired local/SFTP controls.
 - [ ] Materialized mode remains the generated/runtime default; volatile mode is explicitly lossy before the completed local floor and durable afterward.
 - [ ] At/below the completed local floor all state is complete/consistent; above it only the explicitly permitted canonical striped-NBD member prefix may survive, with no torn metadata/namespace claim.
 - [ ] Every filtered test was listed first or replaced by a complete module gate; no zero-test result is accepted.
