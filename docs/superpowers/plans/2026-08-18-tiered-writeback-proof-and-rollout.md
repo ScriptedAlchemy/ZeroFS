@@ -181,7 +181,9 @@ The lifecycle/API suite names
 `test_controller_target_must_resolve_to_immutable_identity`,
 `test_recorded_host_identity_requires_pinned_digest_role_and_vmid`,
 `test_recorded_host_identity_rejects_live_ct198_refresh`, and
-`test_every_ubuntu_remote_block_receives_validated_target_token`. Each supervisor test
+`test_controller_target_normalized_output_matches_token`, and
+`test_every_ubuntu_remote_block_receives_validated_target_token`, and
+`test_every_cleanup_remote_block_mints_and_transports_fresh_target_token`. Each supervisor test
 injects the failure, asserts the returned status and separate ledger fields, then
 asserts both cleanup attempts and `assert-clean` ran.
 
@@ -263,6 +265,11 @@ target receipt without a VMID identity claim. Every `supervise` invocation requi
 stores the normalized target separately from local hostname, and adds the receipt hash
 to the manifest before allocating resources. The NBD proof-host target receipt remains
 additionally bound to its immutable identity token as specified above.
+Both `verify-controller-target` and `verify-proof-host` also accept
+`--format normalized-target`; they execute the identical live verification and emit
+only the validated target string contained in the corresponding fresh target token.
+The output must match `[-A-Za-z0-9._:@]+` and is used only to map a manifest-validated
+ledger target back to its freshly reverified transport token during C9 cleanup.
 
 `validate-recorded-host-identity --receipt PATH --expected-sha256 HEX
 --expected-role vm100|ct198 --expected-proxmox-vmid 100|198 --format machine-id`
@@ -1541,29 +1548,64 @@ fails enumeration. For each row, run the following block on that validated targe
 archived index must contain no unarchived entry before merge:
 
 ```bash
-: > "/tmp/zerofs-ledgers-${FINAL_PROOF_SHA}.tsv"
-for proof_host in ubuntu-main "$ZEROFS_NBD_PROOF_HOST"
+set -euo pipefail
+cd /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback
+FINAL_PROOF_SHA="$(git rev-parse HEAD^{commit})"
+test "${#FINAL_PROOF_SHA}" = 40
+VM100_MACHINE_ID="$(python3 scripts/tiered-writeback-e2e.py validate-recorded-host-identity --receipt "${ZEROFS_VM100_IDENTITY_RECEIPT:?}" --expected-sha256 "${ZEROFS_VM100_IDENTITY_RECEIPT_SHA256:?}" --expected-role vm100 --expected-proxmox-vmid 100 --format machine-id)"
+CT198_MACHINE_ID="$(python3 scripts/tiered-writeback-e2e.py validate-recorded-host-identity --receipt "${ZEROFS_CT198_IDENTITY_RECEIPT:?}" --expected-sha256 "${ZEROFS_CT198_IDENTITY_RECEIPT_SHA256:?}" --expected-role ct198 --expected-proxmox-vmid 198 --format machine-id)"
+UBUNTU_NORMALIZED_TARGET="$(python3 scripts/tiered-writeback-e2e.py verify-controller-target --controller-ssh-target ubuntu-main --expected-host-key-sha256 "${ZEROFS_VM100_HOST_KEY_SHA256:?}" --format normalized-target)"
+NBD_NORMALIZED_TARGET="$(python3 scripts/tiered-writeback-e2e.py verify-proof-host --controller-ssh-target "${ZEROFS_NBD_PROOF_HOST:?}" --expected-host-key-sha256 "${ZEROFS_NBD_PROOF_HOST_KEY_SHA256:?}" --expected-machine-id "${ZEROFS_NBD_PROOF_MACHINE_ID:?}" --expected-proxmox-vmid "${ZEROFS_NBD_PROOF_VMID:?}" --forbid-machine-id "$VM100_MACHINE_ID" --forbid-machine-id "$CT198_MACHINE_ID" --forbid-proxmox-vmid 100 --forbid-proxmox-vmid 198 --format normalized-target)"
+case "$UBUNTU_NORMALIZED_TARGET" in ''|*[!A-Za-z0-9._:@-]*) exit 1 ;; esac
+case "$NBD_NORMALIZED_TARGET" in ''|*[!A-Za-z0-9._:@-]*) exit 1 ;; esac
+test "$UBUNTU_NORMALIZED_TARGET" != "$NBD_NORMALIZED_TARGET"
+mint_target_token() {
+  target="$1"
+  case "$target" in
+    "$UBUNTU_NORMALIZED_TARGET")
+      python3 scripts/tiered-writeback-e2e.py verify-controller-target --controller-ssh-target "$target" --expected-host-key-sha256 "${ZEROFS_VM100_HOST_KEY_SHA256:?}" --format target-token
+      ;;
+    "$NBD_NORMALIZED_TARGET")
+      python3 scripts/tiered-writeback-e2e.py verify-proof-host --controller-ssh-target "$target" --expected-host-key-sha256 "${ZEROFS_NBD_PROOF_HOST_KEY_SHA256:?}" --expected-machine-id "${ZEROFS_NBD_PROOF_MACHINE_ID:?}" --expected-proxmox-vmid "${ZEROFS_NBD_PROOF_VMID:?}" --forbid-machine-id "$VM100_MACHINE_ID" --forbid-machine-id "$CT198_MACHINE_ID" --forbid-proxmox-vmid 100 --forbid-proxmox-vmid 198 --format target-token
+      ;;
+    *) return 1 ;;
+  esac
+}
+ledger_index="$(mktemp "${TMPDIR:-/tmp}/zerofs-ledgers.${FINAL_PROOF_SHA}.XXXXXX")"
+trap 'rm -f "$ledger_index"' EXIT
+for controller_target in "$UBUNTU_NORMALIZED_TARGET" "$NBD_NORMALIZED_TARGET"
 do
-  ssh "$proof_host" "cd /fast/projects/ZeroFS-unified-tiered-writeback && python3 scripts/tiered-writeback-e2e.py list-ledgers --campaign codex-unified-tiered-writeback --format controller-target-ledger-tsv" >> "/tmp/zerofs-ledgers-${FINAL_PROOF_SHA}.tsv"
+  fresh_target_token="$(mint_target_token "$controller_target")"
+  case "$fresh_target_token" in ''|*[!A-Za-z0-9_-]*) exit 1 ;; esac
+  ssh "$controller_target" "CONTROLLER_TARGET_RECEIPT='$fresh_target_token' bash -seuo pipefail" <<'REMOTE' >> "$ledger_index"
+cd /fast/projects/ZeroFS-unified-tiered-writeback
+python3 scripts/tiered-writeback-e2e.py list-ledgers --campaign codex-unified-tiered-writeback --format controller-target-ledger-tsv
+REMOTE
 done
-sort -u -o "/tmp/zerofs-ledgers-${FINAL_PROOF_SHA}.tsv" "/tmp/zerofs-ledgers-${FINAL_PROOF_SHA}.tsv"
-test -s "/tmp/zerofs-ledgers-${FINAL_PROOF_SHA}.tsv"
+sort -u -o "$ledger_index" "$ledger_index"
+test -s "$ledger_index"
 while IFS="$(printf '\t')" read -r controller_target ledger_path
 do
-  test -n "$controller_target"
-  test -n "$ledger_path"
   case "$controller_target" in -*|*[!A-Za-z0-9._:@-]*) exit 1 ;; esac
-  ssh "$controller_target" "LEDGER='$ledger_path' bash -seuo pipefail" <<'REMOTE'
+  case "$ledger_path" in ''|*[!A-Za-z0-9/._-]*) exit 1 ;; esac
+  fresh_target_token="$(mint_target_token "$controller_target")"
+  case "$fresh_target_token" in ''|*[!A-Za-z0-9_-]*) exit 1 ;; esac
+  ssh "$controller_target" "LEDGER='$ledger_path' CONTROLLER_TARGET_RECEIPT='$fresh_target_token' bash -seuo pipefail" <<'REMOTE'
 cd /fast/projects/ZeroFS-unified-tiered-writeback
 sudo python3 scripts/tiered-writeback-e2e.py cleanup --ledger "$LEDGER"
 sudo python3 scripts/tiered-writeback-e2e.py cleanup --ledger "$LEDGER"
 sudo python3 scripts/tiered-writeback-e2e.py assert-clean --ledger "$LEDGER"
 sudo python3 scripts/tiered-writeback-e2e.py archive-control --ledger "$LEDGER" --archive-root /fast/zerofs-tiered-receipts
 REMOTE
-done < "/tmp/zerofs-ledgers-${FINAL_PROOF_SHA}.tsv"
-for proof_host in ubuntu-main "$ZEROFS_NBD_PROOF_HOST"
+done < "$ledger_index"
+for controller_target in "$UBUNTU_NORMALIZED_TARGET" "$NBD_NORMALIZED_TARGET"
 do
-  ssh "$proof_host" "cd /fast/projects/ZeroFS-unified-tiered-writeback && python3 scripts/tiered-writeback-e2e.py list-ledgers --campaign codex-unified-tiered-writeback --require-all-archived"
+  fresh_target_token="$(mint_target_token "$controller_target")"
+  case "$fresh_target_token" in ''|*[!A-Za-z0-9_-]*) exit 1 ;; esac
+  ssh "$controller_target" "CONTROLLER_TARGET_RECEIPT='$fresh_target_token' bash -seuo pipefail" <<'REMOTE'
+cd /fast/projects/ZeroFS-unified-tiered-writeback
+python3 scripts/tiered-writeback-e2e.py list-ledgers --campaign codex-unified-tiered-writeback --require-all-archived
+REMOTE
 done
 ```
 

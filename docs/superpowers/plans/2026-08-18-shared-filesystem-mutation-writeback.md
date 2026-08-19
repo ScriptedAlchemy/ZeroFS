@@ -1362,7 +1362,7 @@ directly. No conflict is resolved by taking “ours” or “theirs” wholesale
 stops for an exact three-way review by the landing owner; prerequisite owners remain
 read-only.
 
-- [ ] **Step 3: Run exact prerequisite GREEN and synchronize the descendant**
+- [ ] **Step 3: Run exact prerequisite GREEN and publish the descendant**
 
 Run every exact non-vacuous paging/wire test listed in A20 Step 1, followed by:
 
@@ -1377,11 +1377,12 @@ cd ..
 PREREQ_HEAD="$(git rev-parse HEAD^{commit})"
 git push origin "$PREREQ_HEAD:refs/heads/codex/unified-tiered-writeback"
 test "$(git ls-remote origin refs/heads/codex/unified-tiered-writeback | awk '{print $1}')" = "$PREREQ_HEAD"
-ssh ubuntu-main "cd /fast/projects/ZeroFS && git fetch origin codex/unified-tiered-writeback && test \"\$(git rev-parse origin/codex/unified-tiered-writeback)\" = '$PREREQ_HEAD'"
 ```
 
 Expected: A20 begins only from a clean descendant of both reviewed authorities. This is
-an ancestry/test/synchronization task, not permission to redeploy or restart CT198.
+an ancestry/test/publication task, not permission to contact, redeploy, or restart
+CT198. Ubuntu synchronization starts only after Task C2 implements and tests the
+controller-target verifier; the rollout's required-promotion block owns that operation.
 
 ---
 
@@ -1581,9 +1582,9 @@ finishing a page synchronously cancels/drains its fetch before the next scan ope
 counter applied only after generic `Db::scan` has prefetched rows is not a bound. The
 sorted wanted merge index advances monotonically inside that iterator. Total pages and total rows are deliberately unbounded:
 valid sparse segments must make forward progress to EOF rather than fail because they
-cross a global work ceiling. At most one page task per memory/durable view is live, no
-more than two scans run concurrently, and page buffers/permits release before the next
-page. Any source-stream reopen at a page boundary, malformed geometry, error, or live reference fails
+cross a global work ceiling. Memory and durable views run sequentially, so exactly one
+source page task/scan may be live at a time; its buffer and permit release before the
+next view/range begins. Any source-stream reopen at a page boundary, malformed geometry, error, or live reference fails
 closed to `Keep`; successful deletion requires both complete views for the same
 immutable `(segid, object_size, footer_crc, k, dir_offset, dir_len)` identity.
 
