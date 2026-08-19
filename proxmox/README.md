@@ -112,8 +112,8 @@ SMB, NBD, or Prometheus from a public interface.
 
 ## Safe lifecycle
 
-Production in-place deployment holds root-owned, nonblocking locks on both the
-Proxmox CT and VM100 transition. It recovers any crash-left host/VM transaction,
+Production in-place deployment holds a root-owned global Proxmox deployment
+lock and a root-owned global VM100 transition lock. It recovers any crash-left host/VM transaction,
 validates the ownership receipt, then records VM100's direct-NFS unit,
 enablement, activity, and live mount record in a root-owned transaction. It
 quiesces that one mount before changing the container. Unmount the Mac NFS
@@ -125,17 +125,32 @@ established NFS session. It then requires four stable metrics samples with:
 - dirty RAM and SSD bytes equal to zero;
 - no terminal writeback error.
 
-Only after that drain does it switch the persistent release symlink and restart
+When VM100 has no direct mount yet, or has a recognized legacy bindfs topology,
+the host first activates a private NFS-and-metrics-only configuration. VM100
+mounts that namespace and produces the real recursive ownership receipt before
+the coordinator unmounts it again and promotes the full 9P/NBD/WebUI and
+optional SMB access profile. Optional SMB assets are staged during maintenance
+but are not started until promotion.
+
+Only after the drain does deployment switch the persistent release symlink and restart
 the server plus the access services selected by `--prod-access`. The old server
 is stopped immediately after the second no-NFS-session proof, closing the
 reconnect window while the release changes. Failure switches the symlink back
 and restarts the previously active services. The coordinator then restores
 VM100's exact prior unit contents, enablement, and mounted source. Staging
 fails before quiescing, while failures during quiesce, host deployment, or
-reconcile invoke rollback. Host activation remains uncommitted until the VM
+reconcile invoke rollback. The host-owned state root and its release,
+transaction, receipt, and `current` names are not writable by container root;
+only the `state`, `cache`, and dev backend directories are CT-owned. The exact
+prior config is included in the durable rollback transaction, including when a
+maintenance bootstrap reuses an existing release identifier. Host activation remains uncommitted until the VM
 mount is proven; reconcile failure compensates the host release and resources
 before restoring the VM mount. Durable phase state makes a retry recover a
-crash-left transaction. Success removes only its owned transaction and staging
+crash-left transaction. Before either participant deletes recovery state, VM100
+persists the authoritative commit decision. A retry finishes a decided host/VM
+commit and rolls back only a transaction that never reached that decision.
+Incomplete compensation leaves the CT stopped and preserves its transaction
+and resource snapshot for another recovery attempt. Success removes only its owned transaction and staging
 directory. No production rootfs destruction is available.
 
 Dev replacement requires the same four stable writeback samples plus zero

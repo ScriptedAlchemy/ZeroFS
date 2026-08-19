@@ -460,6 +460,9 @@ persist_host_transaction() {
   if [[ -n ${previous_config:-} ]]; then
     install -m 0600 "$previous_config" "$temporary_transaction/previous-config"
   fi
+  if [[ -n ${previous_receipt:-} ]]; then
+    install -m 0600 "$previous_receipt" "$temporary_transaction/previous-receipt"
+  fi
   printf '%s\n' "$previous_release" >"$temporary_transaction/previous-release"
   {
     printf 'saved_had_ct=%q\n' "$had_ct"
@@ -478,6 +481,7 @@ persist_host_transaction() {
   sync -f "$temporary_transaction/phase"
   [[ ! -e $temporary_transaction/ct-resources ]] || sync -f "$temporary_transaction/ct-resources"
   [[ ! -e $temporary_transaction/previous-config ]] || sync -f "$temporary_transaction/previous-config"
+  [[ ! -e $temporary_transaction/previous-receipt ]] || sync -f "$temporary_transaction/previous-receipt"
   sync -f "$temporary_transaction"
   mv -- "$temporary_transaction" "$deployment_transaction"
   sync -f "$state_root"
@@ -687,6 +691,11 @@ control_host_transaction() {
         "$deployment_transaction/previous-config" "$state_root/$previous_release/zerofs.toml"
       sync -f "$state_root/$previous_release/zerofs.toml"
     fi
+    if [[ -f $deployment_transaction/previous-receipt ]]; then
+      install -o 0 -g 0 -m 0600 "$deployment_transaction/previous-receipt" \
+        "$state_root/receipts/${previous_release#releases/}"
+      sync -f "$state_root/receipts/${previous_release#releases/}"
+    fi
     ln -sfn "$previous_release" "$state_root/current"
   else
     rm -f -- "$state_root/current"
@@ -889,6 +898,7 @@ if ct_exists; then
 fi
 previous_release=
 previous_config=
+previous_receipt=
 if [[ $dry_run == false && -L $state_root/current ]]; then
   previous_release=$(readlink "$state_root/current")
   [[ $previous_release =~ ^releases/[0-9a-f]{12}-[A-Za-z0-9]{6,32}$ ]] || {
@@ -898,6 +908,11 @@ if [[ $dry_run == false && -L $state_root/current ]]; then
   previous_config="$state_root/$previous_release/zerofs.toml"
   [[ -f $previous_config && ! -L $state_root/$previous_release ]] || {
     echo "current release config is not a canonical regular file" >&2
+    exit 1
+  }
+  previous_receipt="$state_root/receipts/${previous_release#releases/}"
+  [[ -f $previous_receipt && ! -L $previous_receipt ]] || {
+    echo "current release receipt is not a canonical regular file" >&2
     exit 1
   }
 fi
@@ -920,6 +935,12 @@ rollback() {
       rollback_try install -o 100000 -g 100000 -m 0600 \
         "$deployment_transaction/previous-config" "$state_root/$previous_release/zerofs.toml"
       rollback_try sync -f "$state_root/$previous_release/zerofs.toml"
+    fi
+    if [[ -f $deployment_transaction/previous-receipt ]]; then
+      rollback_try install -o 0 -g 0 -m 0600 \
+        "$deployment_transaction/previous-receipt" \
+        "$state_root/receipts/${previous_release#releases/}"
+      rollback_try sync -f "$state_root/receipts/${previous_release#releases/}"
     fi
     rollback_try ln -sfn "$previous_release" "$state_root/current"
   fi

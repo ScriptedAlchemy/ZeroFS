@@ -208,8 +208,13 @@ control_host_transaction
         self.assertIn('install -d -o 0 -g 100000 -m 0750 "$state_root"', source)
         self.assertNotIn('install -d -o 100000 -g 100000 -m 0750 "$state_root"', source)
         self.assertIn('"$temporary_transaction/previous-config"', source)
+        self.assertIn('"$temporary_transaction/previous-receipt"', source)
         self.assertIn(
             '"$deployment_transaction/previous-config" "$state_root/$previous_release/zerofs.toml"',
+            source,
+        )
+        self.assertIn(
+            '"$deployment_transaction/previous-receipt"',
             source,
         )
         self.assertIn(
