@@ -766,7 +766,10 @@ or physical-session scheduling correction and rerun the A/B. A benchmark-only bi
 or dormant selector is not completion. The receive-win, upload-gap-detected, and
 upload-gap-resolved results are independent typed fields in one validated archived
 decision receipt. A detected gap requires its correction SHA and complete-rerun receipt,
-and the final resolved flag must be true; the combined outcome executes both corrections
+and the final resolved flag must be true. The correction is a real lowercase 40-hex
+commit ancestral to the final proof SHA, and the manifest-covered rerun receipt proves
+download A/B, upload A/B, and ZeroFS session scaling all succeeded at that commit with
+resolved upload parity; the combined outcome executes both corrections
 and cannot be replaced by a free-form environment value. Receiver-window evidence alone
 cannot justify an upload claim.
 
