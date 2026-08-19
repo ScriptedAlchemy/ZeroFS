@@ -1574,7 +1574,7 @@ mint_target_token() {
 mint_identity_token() {
   target="$1"
   case "$target" in
-    "$UBUNTU_NORMALIZED_TARGET") printf '%s\n' not_applicable ;;
+    "$UBUNTU_NORMALIZED_TARGET") printf '\n' ;;
     "$NBD_NORMALIZED_TARGET")
       python3 scripts/tiered-writeback-e2e.py verify-proof-host --controller-ssh-target "$target" --expected-host-key-sha256 "${ZEROFS_NBD_PROOF_HOST_KEY_SHA256:?}" --expected-machine-id "${ZEROFS_NBD_PROOF_MACHINE_ID:?}" --expected-proxmox-vmid "${ZEROFS_NBD_PROOF_VMID:?}" --forbid-machine-id "$VM100_MACHINE_ID" --forbid-machine-id "$CT198_MACHINE_ID" --forbid-proxmox-vmid 100 --forbid-proxmox-vmid 198 --format identity-token
       ;;
@@ -1588,7 +1588,11 @@ do
   fresh_target_token="$(mint_target_token "$controller_target")"
   fresh_identity_token="$(mint_identity_token "$controller_target")"
   case "$fresh_target_token" in ''|*[!A-Za-z0-9_-]*) exit 1 ;; esac
-  case "$fresh_identity_token" in ''|*[!A-Za-z0-9_-]*) exit 1 ;; esac
+  case "$controller_target:$fresh_identity_token" in
+    "$UBUNTU_NORMALIZED_TARGET:") ;;
+    "$NBD_NORMALIZED_TARGET:"?*) case "$fresh_identity_token" in *[!A-Za-z0-9_-]*) exit 1 ;; esac ;;
+    *) exit 1 ;;
+  esac
   ssh "$controller_target" "PROOF_HOST_IDENTITY='$fresh_identity_token' CONTROLLER_TARGET_RECEIPT='$fresh_target_token' bash -seuo pipefail" <<'REMOTE' >> "$ledger_index"
 cd /fast/projects/ZeroFS-unified-tiered-writeback
 python3 scripts/tiered-writeback-e2e.py list-ledgers --campaign codex-unified-tiered-writeback --format controller-target-ledger-tsv
@@ -1603,7 +1607,11 @@ do
   fresh_target_token="$(mint_target_token "$controller_target")"
   fresh_identity_token="$(mint_identity_token "$controller_target")"
   case "$fresh_target_token" in ''|*[!A-Za-z0-9_-]*) exit 1 ;; esac
-  case "$fresh_identity_token" in ''|*[!A-Za-z0-9_-]*) exit 1 ;; esac
+  case "$controller_target:$fresh_identity_token" in
+    "$UBUNTU_NORMALIZED_TARGET:") ;;
+    "$NBD_NORMALIZED_TARGET:"?*) case "$fresh_identity_token" in *[!A-Za-z0-9_-]*) exit 1 ;; esac ;;
+    *) exit 1 ;;
+  esac
   ssh "$controller_target" "LEDGER='$ledger_path' PROOF_HOST_IDENTITY='$fresh_identity_token' CONTROLLER_TARGET_RECEIPT='$fresh_target_token' bash -seuo pipefail" <<'REMOTE'
 cd /fast/projects/ZeroFS-unified-tiered-writeback
 sudo python3 scripts/tiered-writeback-e2e.py cleanup --ledger "$LEDGER"
@@ -1617,7 +1625,11 @@ do
   fresh_target_token="$(mint_target_token "$controller_target")"
   fresh_identity_token="$(mint_identity_token "$controller_target")"
   case "$fresh_target_token" in ''|*[!A-Za-z0-9_-]*) exit 1 ;; esac
-  case "$fresh_identity_token" in ''|*[!A-Za-z0-9_-]*) exit 1 ;; esac
+  case "$controller_target:$fresh_identity_token" in
+    "$UBUNTU_NORMALIZED_TARGET:") ;;
+    "$NBD_NORMALIZED_TARGET:"?*) case "$fresh_identity_token" in *[!A-Za-z0-9_-]*) exit 1 ;; esac ;;
+    *) exit 1 ;;
+  esac
   ssh "$controller_target" "PROOF_HOST_IDENTITY='$fresh_identity_token' CONTROLLER_TARGET_RECEIPT='$fresh_target_token' bash -seuo pipefail" <<'REMOTE'
 cd /fast/projects/ZeroFS-unified-tiered-writeback
 python3 scripts/tiered-writeback-e2e.py list-ledgers --campaign codex-unified-tiered-writeback --require-all-archived
