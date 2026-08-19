@@ -18,6 +18,40 @@ use tokio_util::sync::CancellationToken;
 const GENERAL_COLLECT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 const WRITEBACK_COLLECT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BenchmarkAuthority {
+    pub server_instance_id: String,
+    pub filesystem_id: String,
+    pub export_id: String,
+}
+
+impl BenchmarkAuthority {
+    pub fn compose(
+        export_id: &str,
+        filesystem_id: uuid::Uuid,
+        invocation_id: Option<&str>,
+    ) -> anyhow::Result<Self> {
+        let server_instance_id = invocation_id.map_or_else(
+            || uuid::Uuid::new_v4().to_string(),
+            std::borrow::ToOwned::to_owned,
+        );
+        let filesystem_id = filesystem_id.to_string();
+        let export_id = export_id.to_owned();
+        for (role, value) in [
+            ("server_instance_id", server_instance_id.as_str()),
+            ("filesystem_id", filesystem_id.as_str()),
+            ("export_id", export_id.as_str()),
+        ] {
+            crate::config::BenchmarkAuthorityConfig::validate_label(value, role)?;
+        }
+        Ok(Self {
+            server_instance_id,
+            filesystem_id,
+            export_id,
+        })
+    }
+}
+
 /// Start the Prometheus metrics exporter.
 ///
 /// Installs the global metrics recorder, spawns an HTTP server per configured address
@@ -371,7 +405,9 @@ fn collect_lsm_stats(recorder: &DefaultMetricsRecorder) {
 
 #[cfg(test)]
 mod tests {
-    use super::{WRITEBACK_COLLECT_INTERVAL, lsm_export_name, record_writeback_status};
+    use super::{
+        BenchmarkAuthority, WRITEBACK_COLLECT_INTERVAL, lsm_export_name, record_writeback_status,
+    };
     use crate::cache_metrics::{
         CacheMetrics, CacheMetricsSnapshot, CacheTierSnapshot, FoyerMetricsRegistry,
         build_test_cache,
@@ -384,6 +420,51 @@ mod tests {
             WRITEBACK_COLLECT_INTERVAL,
             std::time::Duration::from_millis(100)
         );
+    }
+
+    #[test]
+    fn benchmark_authority_identity_uses_valid_systemd_invocation_id() {
+        let filesystem_id = uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+
+        let authority = BenchmarkAuthority::compose(
+            "10.10.10.30:/",
+            filesystem_id,
+            Some("2be254ef917b4ff8a2c547b873709aef"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            authority.server_instance_id,
+            "2be254ef917b4ff8a2c547b873709aef"
+        );
+        assert_eq!(authority.filesystem_id, filesystem_id.to_string());
+        assert_eq!(authority.export_id, "10.10.10.30:/");
+    }
+
+    #[test]
+    fn benchmark_authority_identity_rejects_invalid_present_invocation_id() {
+        let error = BenchmarkAuthority::compose(
+            "10.10.10.30:/",
+            uuid::Uuid::nil(),
+            Some("invocation id with spaces"),
+        )
+        .unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("server_instance_id"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn benchmark_authority_identity_fallback_changes_between_process_compositions() {
+        let filesystem_id = uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        let first = BenchmarkAuthority::compose("10.10.10.30:/", filesystem_id, None).unwrap();
+        let second = BenchmarkAuthority::compose("10.10.10.30:/", filesystem_id, None).unwrap();
+
+        assert_ne!(first.server_instance_id, second.server_instance_id);
+        assert_eq!(first.filesystem_id, second.filesystem_id);
+        assert_eq!(first.export_id, second.export_id);
     }
 
     #[test]
