@@ -971,7 +971,9 @@ impl ExtentStore {
         want: &BTreeSet<(InodeId, u64)>,
     ) -> Result<bool, ()> {
         for (inode, start, last) in inode_extent_runs(want) {
-            let Some((start_key, end_key)) = extent_scan_bounds(&self.key_codec, inode, start, last) else {
+            let Some((start_key, end_key)) =
+                extent_scan_bounds(&self.key_codec, inode, start, last)
+            else {
                 return Err(());
             };
             if self
@@ -1063,7 +1065,6 @@ fn extent_scan_bounds(
     Some((start_key, end_key))
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::super::select::{MAX_COMPACT_SEGMENTS_PER_ROUND, NOMINATE_PER_CALL_CAP, PairStats};
@@ -1112,14 +1113,7 @@ mod tests {
         let (store, db) = make().await;
         let mut model = Vec::new();
         for i in 0..16usize {
-            write_and_check(
-                &store,
-                &db,
-                &mut model,
-                i * EXTENT_SIZE,
-                &[1u8; 1000],
-            )
-            .await;
+            write_and_check(&store, &db, &mut model, i * EXTENT_SIZE, &[1u8; 1000]).await;
         }
         store.seal_open().await.unwrap();
         let seg = frameloc_of(&store, &db, 1, 0).await.unwrap().segid;
