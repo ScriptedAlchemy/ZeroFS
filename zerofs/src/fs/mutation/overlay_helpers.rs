@@ -1,4 +1,4 @@
-use super::types::{MutationError, PrepareWriteRequest, RequestFingerprint};
+use super::types::{MutationError, RequestFingerprint};
 use super::volatile_overlay::OverlayError;
 use crate::fs::errors::FsError;
 use crate::fs::inode::InodeId;
@@ -8,13 +8,14 @@ pub(super) fn direct_write_fingerprint(
     auth: &AuthContext,
     id: InodeId,
     offset: u64,
-    length: usize,
+    data: &[u8],
     op_id: crate::dedup::OpId,
     check_permissions: bool,
+    protocol_context: &[u8],
 ) -> RequestFingerprint {
     let id = id.to_le_bytes();
     let offset = offset.to_le_bytes();
-    let length = (length as u64).to_le_bytes();
+    let length = (data.len() as u64).to_le_bytes();
     let uid = auth.uid.to_le_bytes();
     let gid = auth.gid.to_le_bytes();
     let flags = [
@@ -27,7 +28,7 @@ pub(super) fn direct_write_fingerprint(
         gids.extend_from_slice(&supplementary_gid.to_le_bytes());
     }
     RequestFingerprint::from_parts(&[
-        b"direct-write",
+        b"filesystem-write",
         &id,
         &offset,
         &length,
@@ -36,26 +37,9 @@ pub(super) fn direct_write_fingerprint(
         &flags,
         &gids,
         &op_id,
+        data,
+        protocol_context,
     ])
-}
-
-pub(super) fn direct_batch_fingerprint(request: &PrepareWriteRequest) -> RequestFingerprint {
-    let mut encoded = Vec::new();
-    encoded.extend_from_slice(&request.auth.uid.to_le_bytes());
-    encoded.extend_from_slice(&request.auth.gid.to_le_bytes());
-    encoded.push(u8::from(request.auth.gid_known));
-    encoded.push(u8::from(request.auth.groups_complete));
-    encoded.push(u8::from(request.check_permissions));
-    encoded.extend_from_slice(&request.op_id);
-    for supplementary_gid in &request.auth.gids {
-        encoded.extend_from_slice(&supplementary_gid.to_le_bytes());
-    }
-    for member in &request.members {
-        encoded.extend_from_slice(&member.id.to_le_bytes());
-        encoded.extend_from_slice(&member.offset.to_le_bytes());
-        encoded.extend_from_slice(&(member.data.len() as u64).to_le_bytes());
-    }
-    RequestFingerprint::from_parts(&[b"direct-batch", &encoded])
 }
 
 pub(super) fn mutation_fs_error(error: MutationError) -> FsError {

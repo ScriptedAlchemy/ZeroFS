@@ -123,7 +123,7 @@ impl PendingDispatch {
             accepted = receiver => accepted.map_err(|_| OverlayError::IoError)?,
         };
         let (request, batch, raw_permit, cutoff) = accepted.into_parts();
-        let reply = prepared_batch_result(&batch);
+        let reply = prepared_batch_result(&batch).with_cutoff(cutoff);
         let coordinator = fs
             .mutation_coordinator
             .get()
@@ -157,6 +157,7 @@ fn prepared_batch_result(batch: &PreparedWriteBatch) -> PreparedBatchResult {
                 .iter()
                 .map(|member| (member.id, member.post_attrs.clone()))
                 .collect(),
+            cutoff: None,
         })
 }
 

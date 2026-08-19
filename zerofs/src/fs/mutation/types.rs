@@ -63,6 +63,7 @@ pub(crate) struct PreparedWriteBatch {
 #[derive(Debug, Clone)]
 pub(crate) struct PreparedBatchResult {
     pub(crate) members: Vec<(InodeId, FileAttributes)>,
+    pub(crate) cutoff: Option<MutationCutoff>,
 }
 
 impl PreparedWriteBatch {
@@ -88,6 +89,11 @@ impl PreparedBatchResult {
             .map(|(_, attrs)| attrs.clone())
             .expect("prepared batch result has at least one member")
     }
+
+    pub(crate) fn with_cutoff(mut self, cutoff: MutationCutoff) -> Self {
+        self.cutoff = Some(cutoff);
+        self
+    }
 }
 
 /// Protocol-scoped identity for request replay and collision detection.
@@ -99,7 +105,7 @@ impl PreparedBatchResult {
 pub(crate) enum RequestIdentity {
     NineP {
         session_incarnation: u64,
-        operation_id: u64,
+        operation_id: crate::dedup::OpId,
     },
     Nfs {
         server_incarnation: uuid::Uuid,
@@ -127,6 +133,7 @@ impl RequestFingerprint {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
         for part in parts {
+            hasher.update((part.len() as u64).to_le_bytes());
             hasher.update(part);
         }
         Self(hasher.finalize().into())
@@ -134,6 +141,20 @@ impl RequestFingerprint {
 
     pub(crate) fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)
+    }
+}
+
+#[cfg(test)]
+mod request_fingerprint_tests {
+    use super::RequestFingerprint;
+
+    #[test]
+    fn fingerprint_parts_are_structurally_unambiguous() {
+        assert_ne!(
+            RequestFingerprint::from_parts(&[b"ab", b"c"]),
+            RequestFingerprint::from_parts(&[b"a", b"bc"]),
+            "field boundaries must affect the fingerprint",
+        );
     }
 }
 

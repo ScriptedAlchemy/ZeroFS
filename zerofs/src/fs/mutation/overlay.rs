@@ -7,9 +7,7 @@
 
 use super::admission::{PreparationAbort, PreparationGuard};
 use super::overlay_dispatch::PendingDispatch;
-use super::overlay_helpers::{
-    direct_batch_fingerprint, direct_write_fingerprint, mutation_fs_error, overlay_fs_error,
-};
+use super::overlay_helpers::{direct_write_fingerprint, mutation_fs_error, overlay_fs_error};
 use super::volatile_overlay::{
     Materializer, OverlayError, OverlayResult, VolatileAdmission, VolatileBudget,
     VolatileWriteRuntime, WriteChunk, WriteVisibility, record_published_staged_writes,
@@ -20,8 +18,8 @@ use crate::fs::inode::{Inode, InodeId};
 use crate::fs::mutation::config::FilesystemWriteAckMode;
 use crate::fs::mutation::request_cache::RequestLookup;
 use crate::fs::mutation::types::{
-    ConflictKey, ConflictScope, PrepareWriteMember, PrepareWriteRequest, PreparedWriteBatch,
-    RequestIdentity, RequestLifetime,
+    ConflictKey, ConflictScope, MutationCutoff, PrepareWriteMember, PrepareWriteRequest,
+    PreparedWriteBatch, RequestFingerprint, RequestIdentity, RequestLifetime,
 };
 use crate::fs::ops::write::{apply_prepared_batch, prepare_write};
 use crate::fs::types::{AuthContext, FileAttributes};
@@ -52,6 +50,33 @@ pub(crate) struct FilesystemVolatileOverlay {
 struct VisibleAttrs {
     attrs: FileAttributes,
     visibility: Arc<WriteVisibility>,
+}
+
+pub(crate) struct WriteAckReceipt {
+    pub(crate) attrs: FileAttributes,
+    pub(crate) cutoff: MutationCutoff,
+}
+
+pub(crate) struct IdentifiedWrite<'a> {
+    pub(crate) auth: &'a AuthContext,
+    pub(crate) id: InodeId,
+    pub(crate) offset: u64,
+    pub(crate) data: &'a Bytes,
+    pub(crate) op_id: crate::dedup::OpId,
+    pub(crate) check_permissions: bool,
+    pub(crate) identity: RequestIdentity,
+    pub(crate) request_lifetime: RequestLifetime,
+    pub(crate) fingerprint_context: &'a [u8],
+}
+
+struct StagedWriteAccept {
+    inode: u64,
+    admission: VolatileAdmission,
+    offset: u64,
+    data: Bytes,
+    attrs: FileAttributes,
+    guard: PreparationGuard,
+    batch: PreparedWriteBatch,
 }
 
 #[cfg(test)]
@@ -203,16 +228,16 @@ impl FilesystemVolatileOverlay {
         self.frozen.load(Ordering::Acquire)
     }
 
-    pub(crate) async fn accept(
-        self: &Arc<Self>,
-        inode: u64,
-        admission: VolatileAdmission,
-        offset: u64,
-        data: Bytes,
-        attrs: FileAttributes,
-        guard: PreparationGuard,
-        batch: PreparedWriteBatch,
-    ) -> OverlayResult<u64> {
+    async fn accept(self: &Arc<Self>, request: StagedWriteAccept) -> OverlayResult<MutationCutoff> {
+        let StagedWriteAccept {
+            inode,
+            admission,
+            offset,
+            data,
+            attrs,
+            guard,
+            batch,
+        } = request;
         if self.is_frozen() {
             return Err(OverlayError::IoError);
         }
@@ -250,6 +275,7 @@ impl FilesystemVolatileOverlay {
                         return Err(OverlayError::IoError);
                     }
                 };
+                let cutoff = accepted.cutoff();
                 self.latest_attrs
                     .lock()
                     .expect("filesystem overlay poisoned")
@@ -277,7 +303,7 @@ impl FilesystemVolatileOverlay {
                     return Err(OverlayError::IoError);
                 }
                 self.accepted_batches.fetch_add(1, Ordering::Relaxed);
-                Ok(sequence)
+                Ok(cutoff)
             }
             Err(error) => {
                 let mut pending = self.pending.lock().expect("filesystem overlay poisoned");
@@ -323,7 +349,7 @@ impl FilesystemVolatileOverlay {
         admissions: Vec<VolatileAdmission>,
         guard: PreparationGuard,
         batch: PreparedWriteBatch,
-    ) -> OverlayResult<u64> {
+    ) -> OverlayResult<MutationCutoff> {
         if self.is_frozen() {
             return Err(OverlayError::IoError);
         }
@@ -355,7 +381,6 @@ impl FilesystemVolatileOverlay {
                     .push_back(Arc::clone(&dispatch));
             }
         }
-        let mut sequence = 0;
         let mut accepted_runtimes = Vec::with_capacity(members.len());
         for (admission, (id, offset, data, _attrs)) in
             admissions.into_iter().zip(members.iter().cloned())
@@ -372,7 +397,6 @@ impl FilesystemVolatileOverlay {
                 .await
             {
                 Ok(accepted) => {
-                    sequence = accepted;
                     accepted_runtimes.push((runtime, accepted));
                     #[cfg(test)]
                     if self.fail_batch_after.load(Ordering::Acquire) == accepted_runtimes.len() {
@@ -405,6 +429,7 @@ impl FilesystemVolatileOverlay {
                 return Err(OverlayError::IoError);
             }
         };
+        let cutoff = accepted.cutoff();
         let unique_ids = member_ids.iter().copied().collect::<BTreeSet<_>>();
         {
             let mut latest = self
@@ -452,7 +477,7 @@ impl FilesystemVolatileOverlay {
             return Err(OverlayError::IoError);
         }
         self.accepted_batches.fetch_add(1, Ordering::Relaxed);
-        Ok(sequence)
+        Ok(cutoff)
     }
 
     #[cfg(test)]
@@ -655,8 +680,19 @@ impl ZeroFS {
         offset: u64,
         data: &Bytes,
     ) -> Result<FileAttributes, FsError> {
-        self.write_ack_idempotent(auth, id, offset, data, [0u8; 16], true)
-            .await
+        self.write_ack_identified(IdentifiedWrite {
+            auth,
+            id,
+            offset,
+            data,
+            op_id: [0; 16],
+            check_permissions: true,
+            identity: RequestIdentity::DirectOneShot(uuid::Uuid::new_v4()),
+            request_lifetime: RequestLifetime::OneShot,
+            fingerprint_context: &[],
+        })
+        .await
+        .map(|receipt| receipt.attrs)
     }
 
     /// One prepared/accepted batch for a logical write that spans one or more
@@ -681,17 +717,17 @@ impl ZeroFS {
             op_id: [0u8; 16],
             check_permissions: true,
         };
-        let Some(overlay) = self.volatile_overlay.get().cloned() else {
+        if self.volatile_overlay.get().is_none() {
             let mut batch = prepare_write(&self.write_prepare_context(), request).await?;
             let result = apply_prepared_batch(&self.write_apply_context(), &mut batch).await?;
             return Ok(result.primary_attrs());
-        };
+        }
         let coordinator = self.mutation_coordinator.get().ok_or(FsError::IoError)?;
         let request_cache = coordinator.request_cache();
         let pending = match request_cache
             .lookup_or_reserve(
                 RequestIdentity::DirectOneShot(uuid::Uuid::new_v4()),
-                direct_batch_fingerprint(&request),
+                RequestFingerprint::from_bytes([0; 32]),
                 RequestLifetime::OneShot,
             )
             .map_err(|_| FsError::IoError)?
@@ -725,6 +761,28 @@ impl ZeroFS {
             pending,
         )
         .map_err(mutation_fs_error)?;
+        self.write_ack_batch_admitted(request, guard)
+            .await
+            .map(|receipt| receipt.attrs)
+    }
+
+    /// Finish a logical write whose request identity, raw byte ownership, and
+    /// preparation scope were acquired by the protocol before it copied the
+    /// request body. This is the NBD handoff seam: it must not look up the
+    /// request or acquire raw admission a second time.
+    pub(crate) async fn write_ack_batch_admitted(
+        &self,
+        request: PrepareWriteRequest,
+        guard: PreparationGuard,
+    ) -> Result<WriteAckReceipt, FsError> {
+        if request.members.is_empty() {
+            let _ = guard.abort(PreparationAbort::RequestFailure(FsError::InvalidArgument));
+            return Err(FsError::InvalidArgument);
+        }
+        let Some(overlay) = self.volatile_overlay.get().cloned() else {
+            let _ = guard.abort(PreparationAbort::RequestFailure(FsError::IoError));
+            return Err(FsError::IoError);
+        };
         let mut admissions = Vec::with_capacity(request.members.len());
         for member in &request.members {
             match overlay.reserve(member.id, member.data.len()).await {
@@ -754,11 +812,11 @@ impl ZeroFS {
                     .map(|member| member.post_attrs.clone())
             })
             .expect("prepared batch has attributes");
-        overlay
+        let cutoff = overlay
             .accept_batch(admissions, guard, batch)
             .await
             .map_err(overlay_fs_error)?;
-        Ok(attrs)
+        Ok(WriteAckReceipt { attrs, cutoff })
     }
 
     pub(crate) async fn write_ack_opened_idempotent(
@@ -769,43 +827,87 @@ impl ZeroFS {
         data: &Bytes,
         op_id: crate::dedup::OpId,
     ) -> Result<FileAttributes, FsError> {
-        self.write_ack_idempotent(auth, id, offset, data, op_id, false)
-            .await
+        self.write_ack_identified(IdentifiedWrite {
+            auth,
+            id,
+            offset,
+            data,
+            op_id,
+            check_permissions: false,
+            identity: RequestIdentity::DirectOneShot(uuid::Uuid::new_v4()),
+            request_lifetime: RequestLifetime::OneShot,
+            fingerprint_context: &[],
+        })
+        .await
+        .map(|receipt| receipt.attrs)
     }
 
-    async fn write_ack_idempotent(
+    pub(crate) async fn write_ack_identified(
         &self,
-        auth: &AuthContext,
-        id: InodeId,
-        offset: u64,
-        data: &Bytes,
-        op_id: crate::dedup::OpId,
-        check_permissions: bool,
-    ) -> Result<FileAttributes, FsError> {
+        write: IdentifiedWrite<'_>,
+    ) -> Result<WriteAckReceipt, FsError> {
+        let IdentifiedWrite {
+            auth,
+            id,
+            offset,
+            data,
+            op_id,
+            check_permissions,
+            identity,
+            request_lifetime,
+            fingerprint_context,
+        } = write;
         let Some(overlay) = self.volatile_overlay.get().cloned() else {
-            return if check_permissions {
+            let attrs = if check_permissions {
                 self.write_idempotent(auth, id, offset, data, op_id).await
             } else {
                 self.write_opened_idempotent(auth, id, offset, data, op_id)
                     .await
-            };
+            }?;
+            return Ok(WriteAckReceipt {
+                attrs,
+                cutoff: self.capture_mutation_cutoff(),
+            });
         };
         if data.is_empty() {
-            return self.write_idempotent(auth, id, offset, data, op_id).await;
+            let attrs = if check_permissions {
+                self.write_idempotent(auth, id, offset, data, op_id).await
+            } else {
+                self.write_opened_idempotent(auth, id, offset, data, op_id)
+                    .await
+            }?;
+            return Ok(WriteAckReceipt {
+                attrs,
+                cutoff: self.capture_mutation_cutoff(),
+            });
         }
 
         let coordinator = self.mutation_coordinator.get().ok_or(FsError::IoError)?;
         let request_cache = coordinator.request_cache();
+        let fingerprint = match &identity {
+            RequestIdentity::DirectOneShot(_) => RequestFingerprint::from_bytes([0; 32]),
+            _ => direct_write_fingerprint(
+                auth,
+                id,
+                offset,
+                data,
+                op_id,
+                check_permissions,
+                fingerprint_context,
+            ),
+        };
         let pending = match request_cache
-            .lookup_or_reserve(
-                RequestIdentity::DirectOneShot(uuid::Uuid::new_v4()),
-                direct_write_fingerprint(auth, id, offset, data.len(), op_id, check_permissions),
-                RequestLifetime::OneShot,
-            )
+            .lookup_or_reserve(identity, fingerprint, request_lifetime)
             .map_err(|_| FsError::IoError)?
         {
             RequestLookup::Vacant(vacancy) => vacancy.begin_pending(),
-            RequestLookup::Joined(retained) => return Ok(retained.wait().await?.primary_attrs()),
+            RequestLookup::Joined(retained) => {
+                let result = retained.wait().await?;
+                return Ok(WriteAckReceipt {
+                    attrs: result.primary_attrs(),
+                    cutoff: result.cutoff.ok_or(FsError::IoError)?,
+                });
+            }
             RequestLookup::FingerprintMismatch => return Err(FsError::InvalidArgument),
             RequestLookup::Backpressured => return Err(FsError::NoSpace),
         };
@@ -857,19 +959,19 @@ impl ZeroFS {
                     .map(|member| member.post_attrs.clone())
             })
             .expect("prepared batch has attributes");
-        overlay
-            .accept(
-                id,
+        let cutoff = overlay
+            .accept(StagedWriteAccept {
+                inode: id,
                 admission,
                 offset,
-                data.clone(),
-                attrs.clone(),
+                data: data.clone(),
+                attrs: attrs.clone(),
                 guard,
                 batch,
-            )
+            })
             .await
             .map_err(overlay_fs_error)?;
-        Ok(attrs)
+        Ok(WriteAckReceipt { attrs, cutoff })
     }
 
     pub(crate) async fn read_file_visible(
@@ -990,6 +1092,112 @@ mod tests {
         let (data, eof) = fs.read_file(&auth, file, 0, 32).await.unwrap();
         assert_eq!(data.as_ref(), b"hello-overlay");
         assert!(eof);
+    }
+
+    #[tokio::test]
+    async fn identified_write_replay_shares_the_original_cutoff_and_fingerprint() {
+        let mut fs = ZeroFS::new_in_memory().await.unwrap();
+        fs.write_ack = volatile_settings();
+        let fs = Arc::new(fs);
+        fs.install_volatile_overlay();
+        let auth = crate::fs::types::AuthContext::from(&test_creds());
+        let file = fs
+            .create_exclusive(&auth, 0, b"identified.txt")
+            .await
+            .unwrap();
+        let identity = RequestIdentity::DirectTagged {
+            caller_incarnation: uuid::Uuid::new_v4(),
+            operation_id: 17,
+        };
+        let (reached, resume) = fs
+            .volatile_overlay
+            .get()
+            .expect("overlay")
+            .pause_publish_for_test();
+
+        let first = tokio::spawn({
+            let fs = Arc::clone(&fs);
+            let auth = auth.clone();
+            let identity = identity.clone();
+            async move {
+                let data = Bytes::from_static(b"same-payload");
+                fs.write_ack_identified(IdentifiedWrite {
+                    auth: &auth,
+                    id: file,
+                    offset: 0,
+                    data: &data,
+                    op_id: [3; 16],
+                    check_permissions: true,
+                    identity,
+                    request_lifetime: RequestLifetime::CanonicalDedup,
+                    fingerprint_context: b"local-ssd-stable",
+                })
+                .await
+            }
+        });
+        reached.await.expect("first write reached publication");
+
+        let mismatch_data = Bytes::from_static(b"other-payload");
+        let mismatch = fs
+            .write_ack_identified(IdentifiedWrite {
+                auth: &auth,
+                id: file,
+                offset: 0,
+                data: &mismatch_data,
+                op_id: [3; 16],
+                check_permissions: true,
+                identity: identity.clone(),
+                request_lifetime: RequestLifetime::CanonicalDedup,
+                fingerprint_context: b"local-ssd-stable",
+            })
+            .await;
+        assert!(matches!(mismatch, Err(FsError::InvalidArgument)));
+
+        let joined = tokio::spawn({
+            let fs = Arc::clone(&fs);
+            let auth = auth.clone();
+            let identity = identity.clone();
+            async move {
+                let data = Bytes::from_static(b"same-payload");
+                fs.write_ack_identified(IdentifiedWrite {
+                    auth: &auth,
+                    id: file,
+                    offset: 0,
+                    data: &data,
+                    op_id: [3; 16],
+                    check_permissions: true,
+                    identity,
+                    request_lifetime: RequestLifetime::CanonicalDedup,
+                    fingerprint_context: b"local-ssd-stable",
+                })
+                .await
+            }
+        });
+        resume.send(()).expect("resume first publication");
+
+        let first = first.await.unwrap().unwrap();
+        let joined = joined.await.unwrap().unwrap();
+        assert_eq!(joined.attrs.size, first.attrs.size);
+        assert_eq!(joined.cutoff, first.cutoff);
+
+        fs.wait_configured_durability().await.unwrap();
+        let retained_data = Bytes::from_static(b"same-payload");
+        let retained = fs
+            .write_ack_identified(IdentifiedWrite {
+                auth: &auth,
+                id: file,
+                offset: 0,
+                data: &retained_data,
+                op_id: [3; 16],
+                check_permissions: true,
+                identity,
+                request_lifetime: RequestLifetime::CanonicalDedup,
+                fingerprint_context: b"local-ssd-stable",
+            })
+            .await
+            .unwrap();
+        assert_eq!(retained.attrs.size, first.attrs.size);
+        assert_eq!(retained.cutoff, first.cutoff);
     }
 
     #[tokio::test]

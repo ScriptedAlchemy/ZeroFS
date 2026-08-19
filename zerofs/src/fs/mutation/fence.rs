@@ -314,6 +314,7 @@ mod tests {
             [0u8; 16],
             PreparedBatchResult {
                 members: vec![(1, FileAttributes::default())],
+                cutoff: None,
             },
         )
     }

@@ -537,6 +537,7 @@ mod tests {
     fn result() -> PreparedBatchResult {
         PreparedBatchResult {
             members: vec![(1, attrs())],
+            cutoff: None,
         }
     }
 
@@ -600,7 +601,7 @@ mod tests {
         let cache = RequestCache::new(8);
         let identity = RequestIdentity::NineP {
             session_incarnation: 1,
-            operation_id: 9,
+            operation_id: [9; 16],
         };
         let pending = expect_vacant(
             cache

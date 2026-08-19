@@ -6,7 +6,13 @@ use super::{
 use crate::fs::ZeroFS;
 use crate::fs::errors::FsError;
 use crate::fs::inode::Inode;
-use crate::fs::mutation::volatile_overlay::{VolatileAdmission, VolatileBudget};
+use crate::fs::mutation::admission::PreparationGuard;
+use crate::fs::mutation::request_cache::RequestLookup;
+use crate::fs::mutation::types::{
+    ConflictKey, ConflictScope, MutationCutoff, MutationError, PrepareWriteRequest,
+    RequestFingerprint, RequestIdentity, RequestLifetime,
+};
+use crate::fs::mutation::volatile_overlay::VolatileBudget;
 use crate::fs::tracing::FileOperation;
 use crate::fs::types::AuthContext;
 use bytes::{Bytes, BytesMut};
@@ -62,7 +68,17 @@ pub struct NBDDevice {
 
 pub(crate) struct MutationAdmission {
     gate: OwnedRwLockReadGuard<()>,
-    reserved: Option<VolatileAdmission>,
+    preparation: Option<PreparationGuard>,
+    expected_offset: u64,
+    expected_length: usize,
+    expected_fua: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NbdMutationRequest {
+    pub(crate) offset: u64,
+    pub(crate) length: usize,
+    pub(crate) fua: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -736,25 +752,29 @@ impl NBDHandler {
     pub(crate) async fn begin_mutation(
         &self,
         device: &NBDDevice,
-        length: usize,
+        request: NbdMutationRequest,
     ) -> CommandResult<MutationAdmission> {
         let gate = Arc::clone(&device.state.gate).read_owned().await;
-        let reserved = if device.state.volatile_mode {
-            if let Some(overlay) = self.filesystem.volatile_overlay.get() {
-                let inode = match &device.backing {
-                    NbdBacking::Single { inode, .. } => *inode,
-                    NbdBacking::Striped { members, .. } => {
-                        members.first().map(|member| member.inode).unwrap_or(0)
-                    }
-                };
-                Some(overlay.reserve(inode, length).await?)
-            } else {
-                None
-            }
+        if request.length == 0
+            || request
+                .offset
+                .checked_add(request.length as u64)
+                .is_none_or(|end| end > device.size())
+        {
+            return Err(CommandError::InvalidArgument);
+        }
+        let preparation = if device.state.volatile_mode {
+            Some(self.begin_shared_preparation(device, request).await?)
         } else {
             None
         };
-        Ok(MutationAdmission { gate, reserved })
+        Ok(MutationAdmission {
+            gate,
+            preparation,
+            expected_offset: request.offset,
+            expected_length: request.length,
+            expected_fua: request.fua,
+        })
     }
 
     pub(crate) async fn write_admitted(
@@ -776,21 +796,89 @@ impl NBDHandler {
             return Err(CommandError::NoSpace);
         }
 
-        drop(admission.reserved);
-        if device.state.volatile_mode {
-            write_visible(&self.filesystem, &device.backing, offset, &data).await?;
+        if offset != admission.expected_offset
+            || data.len() != admission.expected_length
+            || fua != admission.expected_fua
+        {
+            if let Some(preparation) = admission.preparation {
+                let _ = preparation.abort(
+                    crate::fs::mutation::admission::PreparationAbort::RequestFailure(
+                        FsError::InvalidArgument,
+                    ),
+                );
+            }
+            return Err(CommandError::InvalidArgument);
+        }
+        let cutoff = if device.state.volatile_mode {
+            let preparation = admission.preparation.ok_or(CommandError::IoError)?;
+            Some(
+                write_visible(
+                    &self.filesystem,
+                    &device.backing,
+                    offset,
+                    &data,
+                    preparation,
+                )
+                .await?,
+            )
         } else {
             write_backing(&self.filesystem, &device.backing, offset, &data).await?;
-        }
+            None
+        };
         drop(admission.gate);
 
         if fua {
-            self.filesystem
-                .wait_inodes_durability(&device.backing.inodes())
-                .await?;
+            if let Some(cutoff) = cutoff {
+                self.filesystem.wait_mutation_durability(cutoff).await?;
+            } else {
+                self.filesystem
+                    .wait_inodes_durability(&device.backing.inodes())
+                    .await?;
+            }
         }
 
         Ok(())
+    }
+
+    async fn begin_shared_preparation(
+        &self,
+        device: &NBDDevice,
+        request: NbdMutationRequest,
+    ) -> CommandResult<PreparationGuard> {
+        let scope = nbd_write_scope(device, request)?;
+        let coordinator = self
+            .filesystem
+            .mutation_coordinator
+            .get()
+            .ok_or(CommandError::IoError)?;
+        let pending = match coordinator
+            .request_cache()
+            .lookup_or_reserve(
+                RequestIdentity::DirectOneShot(uuid::Uuid::new_v4()),
+                RequestFingerprint::from_bytes([0; 32]),
+                RequestLifetime::OneShot,
+            )
+            .map_err(|_| CommandError::IoError)?
+        {
+            RequestLookup::Vacant(vacancy) => vacancy.begin_pending(),
+            RequestLookup::Joined(_) | RequestLookup::FingerprintMismatch => {
+                return Err(CommandError::InvalidArgument);
+            }
+            RequestLookup::Backpressured => return Err(CommandError::NoSpace),
+        };
+        let raw_permit = match coordinator
+            .raw_budget()
+            .acquire(request.length as u64)
+            .await
+        {
+            Ok(permit) => permit,
+            Err(error) => {
+                pending.cancel();
+                return Err(mutation_command_error(error));
+            }
+        };
+        PreparationGuard::new(coordinator.gate(), scope, raw_permit, pending)
+            .map_err(mutation_command_error)
     }
 
     pub async fn trim(
@@ -855,8 +943,9 @@ impl NBDHandler {
 
     pub async fn flush(&self, device: &NBDDevice) -> CommandResult<()> {
         let _flush_guard = device.state.gate.write().await;
+        let cutoff = self.filesystem.capture_mutation_cutoff();
         self.filesystem
-            .wait_configured_durability()
+            .wait_mutation_durability(cutoff)
             .await
             .map_err(|_| CommandError::IoError)?;
 
@@ -875,12 +964,43 @@ async fn write_visible(
     backing: &NbdBacking,
     offset: u64,
     data: &Bytes,
-) -> CommandResult<()> {
+    preparation: PreparationGuard,
+) -> CommandResult<MutationCutoff> {
     let auth = AuthContext::default();
     let members =
         members_from_stripe_chunks(data, map_stripe_chunks(backing, offset, data.len() as u64)?)?;
-    filesystem.write_ack_batch(&auth, members).await?;
-    Ok(())
+    let receipt = filesystem
+        .write_ack_batch_admitted(
+            PrepareWriteRequest {
+                members,
+                auth,
+                op_id: [0; 16],
+                check_permissions: true,
+            },
+            preparation,
+        )
+        .await?;
+    Ok(receipt.cutoff)
+}
+
+fn nbd_write_scope(
+    device: &NBDDevice,
+    request: NbdMutationRequest,
+) -> CommandResult<ConflictScope> {
+    Ok(ConflictScope::new(
+        map_stripe_chunks(&device.backing, request.offset, request.length as u64)?
+            .into_iter()
+            .map(|chunk| ConflictKey::Inode(chunk.inode)),
+    ))
+}
+
+fn mutation_command_error(error: MutationError) -> CommandError {
+    match error {
+        MutationError::TooLarge { .. } => CommandError::NoSpace,
+        MutationError::Closed | MutationError::Poisoned(_) | MutationError::StaleIncarnation => {
+            CommandError::IoError
+        }
+    }
 }
 
 fn members_from_stripe_chunks(
@@ -1053,8 +1173,8 @@ async fn write_backing(
 #[cfg(test)]
 mod tests {
     use super::{
-        CommandError, NBDError, NBDHandler, NbdBacking, NbdExportGates, NbdMember, OptionResult,
-        map_stripe_chunks, parse_stripe_manifest,
+        CommandError, NBDError, NBDHandler, NbdBacking, NbdExportGates, NbdMember,
+        NbdMutationRequest, OptionResult, map_stripe_chunks, parse_stripe_manifest,
     };
     use crate::fs::ZeroFS;
     use crate::fs::permissions::Credentials;
@@ -1068,6 +1188,13 @@ mod tests {
     use std::sync::Arc;
 
     const PUBLISHED_EXPORT: &[u8] = b"vm100";
+    fn mutation_request(offset: u64, length: usize, fua: bool) -> NbdMutationRequest {
+        NbdMutationRequest {
+            offset,
+            length,
+            fua,
+        }
+    }
     const STAGING_EXPORT: &[u8] = b".zerofs-nbd-provision-v1-00000000-0000-0000-0000-000000000000";
     const NEAR_PREFIX_EXPORT: &[u8] = b".zerofs-nbd-provision-v1-archive";
 
@@ -1206,6 +1333,10 @@ mod tests {
     }
 
     async fn volatile_filesystem() -> Arc<ZeroFS> {
+        volatile_filesystem_with_budget(8 * 1024 * 1024).await
+    }
+
+    async fn volatile_filesystem_with_budget(volatile_memory_bytes: u64) -> Arc<ZeroFS> {
         use crate::fs::mutation::config::{
             ClientDurabilityTarget, DEFAULT_VOLATILE_MAX_OPERATIONS, FilesystemWriteAckMode,
             FilesystemWriteAckSettings, FilesystemWriteAckSource,
@@ -1215,7 +1346,7 @@ mod tests {
             .expect("create test filesystem");
         filesystem.write_ack = FilesystemWriteAckSettings {
             mode: FilesystemWriteAckMode::VolatileMemory,
-            volatile_memory_bytes: 8 * 1024 * 1024,
+            volatile_memory_bytes,
             volatile_max_operations: DEFAULT_VOLATILE_MAX_OPERATIONS,
             source: FilesystemWriteAckSource::Filesystem,
             client_durability_target: ClientDurabilityTarget::LocalSsd,
@@ -1226,7 +1357,13 @@ mod tests {
     }
 
     async fn striped_export_volatile() -> (Arc<ZeroFS>, NBDHandler, super::NBDDevice) {
-        let filesystem = volatile_filesystem().await;
+        striped_export_volatile_with_budget(8 * 1024 * 1024).await
+    }
+
+    async fn striped_export_volatile_with_budget(
+        volatile_memory_bytes: u64,
+    ) -> (Arc<ZeroFS>, NBDHandler, super::NBDDevice) {
+        let filesystem = volatile_filesystem_with_budget(volatile_memory_bytes).await;
         let credentials = root_credentials();
         let (nbd_dir, _) = filesystem
             .mkdir(&credentials, 0, b".nbd", &SetAttributes::default())
@@ -1327,7 +1464,7 @@ mod tests {
         );
 
         let admission = handler
-            .begin_mutation(&device, payload.len())
+            .begin_mutation(&device, mutation_request(2048, payload.len(), false))
             .await
             .unwrap();
         handler
@@ -1428,7 +1565,7 @@ mod tests {
         let (_filesystem, handler, device) = striped_export().await;
         let payload = Bytes::from(vec![0x5a; 24 * 1024]);
         let admission = handler
-            .begin_mutation(&device, payload.len())
+            .begin_mutation(&device, mutation_request(0, payload.len(), false))
             .await
             .unwrap();
         handler
@@ -1695,7 +1832,7 @@ mod tests {
             "NBD must not own a protocol-local overlay runtime"
         );
         let admission = handler
-            .begin_mutation(&device, 16)
+            .begin_mutation(&device, mutation_request(0, 16, false))
             .await
             .expect("admit striped write");
         handler
@@ -1715,12 +1852,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mutation_admission_owns_raw_payload_credit_before_the_body_copy() {
+        let payload_bytes = 16 * 1024;
+        let (filesystem, handler, device) =
+            striped_export_volatile_with_budget(payload_bytes as u64).await;
+        let coordinator = filesystem
+            .mutation_coordinator
+            .get()
+            .expect("volatile filesystem has a mutation coordinator");
+
+        let admission = handler
+            .begin_mutation(&device, mutation_request(0, payload_bytes, false))
+            .await
+            .expect("admit payload before reading it");
+
+        assert_eq!(
+            coordinator.raw_budget().used_bytes(),
+            payload_bytes as u64,
+            "the shipping NBD admission must own shared raw credit before the body is copied",
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            handler.write_admitted(
+                &device,
+                0,
+                Bytes::from(vec![0x7a; payload_bytes]),
+                false,
+                admission,
+            ),
+        )
+        .await
+        .expect("an admitted write must not reacquire its full raw budget")
+        .expect("write through the transferred admission");
+        filesystem
+            .wait_configured_durability()
+            .await
+            .expect("materialize admitted write");
+        assert_eq!(
+            coordinator.raw_budget().used_bytes(),
+            0,
+            "materialization must release the transferred raw credit exactly once",
+        );
+
+        let bodyless = handler
+            .begin_mutation(&device, mutation_request(0, payload_bytes, false))
+            .await
+            .expect("admit a request whose body never arrives");
+        assert_eq!(coordinator.raw_budget().used_bytes(), payload_bytes as u64);
+        drop(bodyless);
+        assert_eq!(
+            coordinator.raw_budget().used_bytes(),
+            0,
+            "dropping a body-less admission must release its raw credit",
+        );
+    }
+
+    #[tokio::test]
     async fn striped_write_publishes_one_batch() {
         let (filesystem, handler, device) = striped_export_volatile().await;
         let overlay = filesystem.volatile_overlay.get().cloned().expect("overlay");
         assert_eq!(overlay.accepted_batch_count(), 0);
         let admission = handler
-            .begin_mutation(&device, 16 * 1024)
+            .begin_mutation(&device, mutation_request(0, 16 * 1024, false))
             .await
             .expect("admit striped write");
         handler
@@ -1763,7 +1956,7 @@ mod tests {
             })
         });
         let admission = handler
-            .begin_mutation(&device, 16 * 1024)
+            .begin_mutation(&device, mutation_request(0, 16 * 1024, true))
             .await
             .expect("admit FUA write");
         handler
@@ -1854,7 +2047,7 @@ mod tests {
     async fn flush_quiesces_prior_preparers() {
         let (_filesystem, handler, device) = striped_export_volatile().await;
         let admission = handler
-            .begin_mutation(&device, 16)
+            .begin_mutation(&device, mutation_request(0, 16, false))
             .await
             .expect("admit prior write");
         let mut flush = tokio::spawn({
