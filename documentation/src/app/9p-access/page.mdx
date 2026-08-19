@@ -6,7 +6,11 @@ export const metadata = {
 
 # 9P File Access
 
-ZeroFS serves standard `9P2000.L` to stock Linux v9fs and the private `9P2000.L.Z` dialect to ZeroFS clients. On a supported kernel, the [native kernel client](/kernel-client) is the fastest mount path. The bundled `zerofs mount` command is the fallback when no matching kernel package is available. {{ className: 'lead' }}
+ZeroFS serves standard `9P2000.L` to stock Linux v9fs and the private
+`9P2000.L.Z` dialect to ZeroFS clients. On a supported kernel, the
+[native kernel client](/kernel-client) is the fastest mount path after it is
+built from source. The bundled `zerofs mount` command works without a kernel
+module. {{ className: 'lead' }}
 
 <Note>
   Over 9P, `fsync` returns after ZeroFS has flushed the data to stable storage.
@@ -41,7 +45,7 @@ zerofs run --config zerofs.toml
 
 | Client | Protocol | Installation | Connection loss |
 | --- | --- | --- | --- |
-| [Native kernel client](/kernel-client) | `9P2000.L.Z` | Exact-kernel ZeroFS module | Reconnects within its configured grace period |
+| [Native kernel client](/kernel-client) | `9P2000.L.Z` | Built from source for the running kernel | Reconnects within its configured grace period |
 | `zerofs mount` | `9P2000.L.Z` over FUSE | Included in the Linux `zerofs` binary | Reconnects and restores supported session state |
 | Stock Linux v9fs | `9P2000.L` | Linux 9P modules | Does not restore a session; remount after disconnect |
 
@@ -49,7 +53,8 @@ The private dialect adds reconnect support and compound metadata operations. Sto
 
 ## Native Kernel Client
 
-Install the package matching your distribution and exact kernel as described in [Native kernel client](/kernel-client). Once the module is loaded:
+Build and install the module from source as described in [Native kernel
+client](/kernel-client). Once the module is loaded:
 
 ```bash
 sudo mkdir -p /mnt/zerofs
