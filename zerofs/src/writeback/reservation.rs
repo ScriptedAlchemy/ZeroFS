@@ -315,6 +315,7 @@ impl SsdAdmission {
         result
     }
 
+    #[allow(dead_code)]
     pub(crate) fn observe_sample(
         &self,
         sample: PhysicalSpaceSample,
@@ -593,4 +594,149 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Durable local ownership after a reservation has been committed to the journal.
+#[derive(Debug)]
+pub(crate) struct CommittedSsdReservation {
+    request: SsdReservationRequest,
+    physical_bytes: u64,
+    sample: PhysicalSpaceSample,
+}
+
+impl CommittedSsdReservation {
+    pub(crate) fn request(&self) -> SsdReservationRequest {
+        self.request
+    }
+
+    pub(crate) fn physical_bytes(&self) -> u64 {
+        self.physical_bytes
+    }
+
+    pub(crate) fn sample(&self) -> PhysicalSpaceSample {
+        self.sample
+    }
+}
+
+impl SsdReservationRequest {
+    pub(crate) fn from_pending_record(
+        record: &crate::writeback::model::MutationRecord,
+    ) -> bincode::Result<Self> {
+        let ssd_reservation_bytes = record.ssd_reservation_bytes()?;
+        Ok(Self {
+            ssd_reservation_bytes,
+            physical_reservation_bytes: ssd_reservation_bytes,
+            operations: record.ssd_reservation_operations(),
+        })
+    }
+}
+
+impl SsdReservationToken {
+    /// Transition an admitted reservation to durable local ownership.
+    ///
+    /// On sample failure the charge is retained and admission is poisoned.
+    pub(crate) fn commit_local(
+        mut self,
+        current_physical_bytes: u64,
+        sample: PhysicalSpaceSample,
+    ) -> Result<CommittedSsdReservation, ReservationError> {
+        if self.state != ReservationState::Admitted {
+            self.state = ReservationState::Disarmed;
+            return Err(ReservationError::Poisoned(
+                "SSD reservation already committed or released".into(),
+            ));
+        }
+        match self
+            .admission
+            .transition_local(self.request, current_physical_bytes, sample)
+        {
+            Ok(sample) => {
+                self.state = ReservationState::Disarmed;
+                Ok(CommittedSsdReservation {
+                    request: self.request,
+                    physical_bytes: current_physical_bytes,
+                    sample,
+                })
+            }
+            Err(error) => {
+                self.state = ReservationState::Disarmed;
+                Err(error)
+            }
+        }
+    }
+}
+
+impl SsdAdmissionInner {
+    fn transition_local(
+        self: &Arc<Self>,
+        request: SsdReservationRequest,
+        current_physical_bytes: u64,
+        sample: PhysicalSpaceSample,
+    ) -> Result<PhysicalSpaceSample, ReservationError> {
+        let mut state = lock(&self.state);
+        if let Err(error) = self.observe_locked(&mut state, sample) {
+            drop(state);
+            self.terminate(ReservationError::Poisoned(format!(
+                "SSD reservation transition failed: {error}"
+            )));
+            return Err(error);
+        }
+        if let Some(error) = &state.terminal {
+            return Err(error.clone());
+        }
+        let outstanding = match state
+            .outstanding_physical_claims
+            .checked_sub(request.physical_reservation_bytes)
+            .and_then(|remaining| remaining.checked_add(current_physical_bytes))
+        {
+            Some(outstanding) => outstanding,
+            None => {
+                drop(state);
+                let error = ReservationError::Poisoned(
+                    "SSD physical-claim adjustment overflow or underflow".into(),
+                );
+                self.terminate(error.clone());
+                return Err(error);
+            }
+        };
+        state.outstanding_physical_claims = outstanding;
+        self.refresh(&mut state);
+        Ok(sample)
+    }
+}
+
+/// Transition every token in a durable batch with one shared sample.
+pub(crate) fn commit_batch_local(
+    tokens: Vec<SsdReservationToken>,
+    physical_bytes: &[u64],
+    sample: PhysicalSpaceSample,
+) -> Result<Vec<CommittedSsdReservation>, ReservationError> {
+    if tokens.len() != physical_bytes.len() {
+        return Err(ReservationError::Poisoned(
+            "SSD batch transition requires one physical size per token".into(),
+        ));
+    }
+    let mut committed = Vec::with_capacity(tokens.len());
+    for (token, physical) in tokens.into_iter().zip(physical_bytes.iter().copied()) {
+        committed.push(token.commit_local(physical, sample)?);
+    }
+    Ok(committed)
+}
+
+impl CommittedSsdReservation {
+    pub(crate) fn commit_local(
+        self,
+        _current_physical_bytes: u64,
+        _sample: PhysicalSpaceSample,
+    ) -> Result<Self, ReservationError> {
+        Err(ReservationError::Poisoned(
+            "SSD reservation already committed or released".into(),
+        ))
+    }
+
+    pub(crate) fn release(self) -> Result<(), ReservationError> {
+        Err(ReservationError::Poisoned(
+            "cannot release a committed SSD reservation".into(),
+        ))
+    }
 }
