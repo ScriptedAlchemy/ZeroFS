@@ -365,6 +365,7 @@ class Transition:
                 changed = True
         elif self.unit_path.exists():
             self.unit_path.unlink()
+            self._fsync_directory(self.unit_path.parent)
             changed = True
         if changed:
             self.system.daemon_reload()

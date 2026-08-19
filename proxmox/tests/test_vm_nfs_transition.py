@@ -184,6 +184,21 @@ class VmNfsTransitionTests(unittest.TestCase):
         self.assertFalse(self.system.enabled)
         self.assertFalse(self.system.active)
 
+    def test_rollback_fsyncs_unit_directory_after_removing_new_unit(self) -> None:
+        self.unit_path = self.unit_path.parent / "etc/systemd/system" / self.unit_path.name
+        self.manager.unit_path = self.unit_path
+        self.system.unit_path = self.unit_path
+        self.staged.write_text(self.unit("10.10.10.55:/"))
+        self.manager.prepare(self.staged, self.transaction, "10.10.10.55:/")
+        self.manager.reconcile(self.transaction)
+
+        with mock.patch.object(
+            self.manager, "_fsync_directory", wraps=self.manager._fsync_directory
+        ) as fsync_directory:
+            self.manager.rollback(self.transaction)
+
+        fsync_directory.assert_any_call(self.unit_path.parent)
+
     def test_reconcile_fails_closed_when_legacy_mount_or_unit_exists(self) -> None:
         desired = self.unit("10.10.10.55:/")
         self.staged.write_text(desired)
