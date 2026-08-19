@@ -990,8 +990,7 @@ pub async fn build_slatedb(
         total_memory_bytes / 1_000_000,
     );
     let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(
-        PrefetchingObjectStore::new(object_store, parts_cache.clone())
-            .with_admission_cap(rss_cap),
+        PrefetchingObjectStore::new(object_store, parts_cache.clone()).with_admission_cap(rss_cap),
     );
 
     let db_path = Path::from(db_path);

@@ -1132,14 +1132,7 @@ mod tests {
         let (store, db) = make().await;
         let mut model = Vec::new();
         for i in 0..16usize {
-            write_and_check(
-                &store,
-                &db,
-                &mut model,
-                i * EXTENT_SIZE,
-                &[1u8; 1000],
-            )
-            .await;
+            write_and_check(&store, &db, &mut model, i * EXTENT_SIZE, &[1u8; 1000]).await;
         }
         store.seal_open().await.unwrap();
         let seg = frameloc_of(&store, &db, 1, 0).await.unwrap().segid;

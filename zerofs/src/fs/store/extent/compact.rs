@@ -325,7 +325,14 @@ impl ExtentStore {
                 async move {
                     let payloads = store
                         .segments
-                        .read_compressed_run(segid, byte_offset, total_len, first_frame, &slots, false)
+                        .read_compressed_run(
+                            segid,
+                            byte_offset,
+                            total_len,
+                            first_frame,
+                            &slots,
+                            false,
+                        )
                         .await
                         .map_err(|_| FsError::IoError)?;
                     Ok::<_, FsError>(

@@ -191,7 +191,10 @@ mod tests {
         set_rss_cap_bytes(8 * GIB);
 
         assert_eq!(jemalloc_rss_envelope(), 2 * GIB);
-        assert!(!over_rss_cap(), "retained-only growth must not trip pressure");
+        assert!(
+            !over_rss_cap(),
+            "retained-only growth must not trip pressure"
+        );
     }
 
     #[test]

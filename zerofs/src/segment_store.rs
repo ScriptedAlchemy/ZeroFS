@@ -265,7 +265,9 @@ impl SegmentStore {
         first_frame: u32,
         slots: &[(InodeId, u64)],
     ) -> Result<Vec<Bytes>> {
-        let region = self.read_run_region(segid, byte_offset, byte_len, true).await?;
+        let region = self
+            .read_run_region(segid, byte_offset, byte_len, true)
+            .await?;
         let frames = crate::segment::read_frames_from_region(
             &self.codec,
             &region,
@@ -287,7 +289,9 @@ impl SegmentStore {
         slots: &[(InodeId, u64)],
         cache: bool,
     ) -> Result<Vec<Compressed>> {
-        let region = self.read_run_region(segid, byte_offset, byte_len, cache).await?;
+        let region = self
+            .read_run_region(segid, byte_offset, byte_len, cache)
+            .await?;
         Ok(crate::segment::read_compressed_frames_from_region(
             &self.codec,
             &region,

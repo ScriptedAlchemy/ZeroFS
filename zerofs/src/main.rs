@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use std::io::BufRead;
 
+mod alloc_rss;
 mod block_transformer;
 mod bucket_identity;
 mod checkpoint_manager;
@@ -20,7 +21,6 @@ mod nbd;
 mod net_util;
 mod nfs;
 mod ninep;
-mod alloc_rss;
 mod object_store_prefetch;
 mod object_trace;
 mod parse_object_store;

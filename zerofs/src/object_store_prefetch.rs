@@ -532,15 +532,18 @@ fn evict_location_parts(
     location: &Path,
 ) {
     let from_counts = part_counts.get(location).map(|e| *e.value()).unwrap_or(0);
-    let from_head = heads.get(location).map(|e| {
-        e.value()
-            .meta
-            .size
-            .div_ceil(part_size_bytes as u64) as usize
-    }).unwrap_or(0);
-    let generation = generations.get(location).map(|e| e.value().clone()).or_else(|| {
-        heads.get(location).map(|e| CacheGeneration::from_meta(&e.value().meta, cache_instance))
-    });
+    let from_head = heads
+        .get(location)
+        .map(|e| e.value().meta.size.div_ceil(part_size_bytes as u64) as usize)
+        .unwrap_or(0);
+    let generation = generations
+        .get(location)
+        .map(|e| e.value().clone())
+        .or_else(|| {
+            heads
+                .get(location)
+                .map(|e| CacheGeneration::from_meta(&e.value().meta, cache_instance))
+        });
     let from_gen = match &generation {
         Some(CacheGeneration::Unversioned { size, .. }) => {
             size.div_ceil(part_size_bytes as u64) as usize
@@ -550,7 +553,12 @@ fn evict_location_parts(
     let n = from_counts.max(from_head).max(from_gen);
     if let Some(generation) = generation {
         for part_id in 0..n {
-            parts.remove(&PartKey::new(location, part_size_bytes, &generation, part_id));
+            parts.remove(&PartKey::new(
+                location,
+                part_size_bytes,
+                &generation,
+                part_id,
+            ));
         }
     }
     heads.remove(location);
@@ -758,7 +766,13 @@ impl PrefetchingObjectStore {
         object_store::ObjectStoreExt::delete(&*self.inner, location).await
     }
 
-    fn admit_part(&self, location: &Path, generation: &CacheGeneration, part_id: PartId, bytes: Bytes) {
+    fn admit_part(
+        &self,
+        location: &Path,
+        generation: &CacheGeneration,
+        part_id: PartId,
+        bytes: Bytes,
+    ) {
         admit_part(
             &self.parts,
             &self.part_counts,
