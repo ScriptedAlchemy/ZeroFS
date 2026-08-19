@@ -152,8 +152,11 @@ impl P9ConnectionAdmission {
         let permits = u32::try_from(reserved_bytes)
             .map_err(|_| anyhow::anyhow!("9P request memory reservation exceeds u32"))?;
 
-        let local_request = Arc::clone(&self.requests).acquire_owned().await?;
+        // Take the process-wide task slot first. Otherwise an unbounded number
+        // of reconnecting sessions could each hold a full frame while queued
+        // behind this semaphore on their independent connection-local slots.
         let global_request = Arc::clone(&self.global.requests).acquire_owned().await?;
+        let local_request = Arc::clone(&self.requests).acquire_owned().await?;
         let local_bytes = Arc::clone(&self.bytes).acquire_many_owned(permits).await?;
         let global_bytes = Arc::clone(&self.global.bytes)
             .acquire_many_owned(permits)
@@ -1357,6 +1360,43 @@ mod tests {
             P9AdmissionSnapshot {
                 reserved_bytes: 16,
                 active_requests: 2,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn reconnect_waiters_are_bounded_before_connection_local_admission() {
+        let global = P9GlobalAdmission::for_test(8, 2);
+        let first_connection = global.connection_for_test(8, 1);
+        let waiting_connection = global.connection_for_test(8, 1);
+        let blocked_connection = global.connection_for_test(8, 1);
+        let first = first_connection.admit_request(8, 0).await.unwrap();
+        let mut waiting = Box::pin(waiting_connection.admit_request(8, 0));
+
+        tokio::select! {
+            _ = &mut waiting => panic!("byte-saturated admission completed"),
+            _ = tokio::task::yield_now() => {}
+        }
+        assert_eq!(global.snapshot().active_requests, 2);
+
+        assert!(
+            tokio::time::timeout(QUIET_TIMEOUT, blocked_connection.admit_request(1, 0))
+                .await
+                .is_err(),
+            "a reconnect cannot queue past the process-wide request slots"
+        );
+
+        drop(first);
+        let admitted = tokio::time::timeout(TEST_TIMEOUT, waiting)
+            .await
+            .expect("the queued request must advance when bytes are released")
+            .unwrap();
+        drop(admitted);
+        assert_eq!(
+            global.snapshot(),
+            P9AdmissionSnapshot {
+                reserved_bytes: 0,
+                active_requests: 0,
             }
         );
     }
