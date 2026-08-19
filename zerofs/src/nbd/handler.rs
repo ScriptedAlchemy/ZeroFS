@@ -6,15 +6,12 @@ use super::{
 use crate::fs::ZeroFS;
 use crate::fs::errors::FsError;
 use crate::fs::inode::Inode;
-use crate::fs::mutation::volatile_overlay::{
-    Materializer, OverlayError, VolatileAdmission, VolatileBudget, VolatileWriteRuntime,
-    WriteChunk as VolatileWriteChunk,
-};
+use crate::fs::mutation::volatile_overlay::{VolatileAdmission, VolatileBudget};
 use crate::fs::tracing::FileOperation;
 use crate::fs::types::AuthContext;
 use bytes::{Bytes, BytesMut};
 use deku::DekuContainerWrite;
-use futures::future::{join_all, try_join_all};
+use futures::future::try_join_all;
 use nbd_proto::{
     NBD_FLAG_SEND_TRIM, NBD_INFO_EXPORT, NBD_REP_ACK, NBD_REP_ERR_INVALID, NBD_REP_ERR_UNKNOWN,
     NBD_REP_INFO, NBD_REP_SERVER, NBDInfoExport, TRANSMISSION_FLAGS,
@@ -65,7 +62,7 @@ pub struct NBDDevice {
 
 pub(crate) struct MutationAdmission {
     gate: OwnedRwLockReadGuard<()>,
-    volatile: Option<VolatileAdmission>,
+    reserved: Option<VolatileAdmission>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -96,7 +93,6 @@ struct NbdExportState {
     identity: ExportIdentity,
     gate: Arc<RwLock<()>>,
     volatile_mode: bool,
-    volatile: Option<Arc<VolatileWriteRuntime>>,
 }
 
 fn parse_stripe_manifest(data: &[u8]) -> Result<StripeManifest> {
@@ -285,7 +281,6 @@ impl NbdExportGates {
                 identity,
                 gate,
                 volatile_mode: false,
-                volatile: None,
             }));
         }
         let mut registry = self
@@ -317,26 +312,10 @@ impl NbdExportGates {
             }
         }
 
-        let volatile = self.volatile_budget.as_ref().map(|budget| {
-            let filesystem = Arc::clone(filesystem);
-            let materializer: Materializer = Arc::new(move |inode, offset, data| {
-                let filesystem = Arc::clone(&filesystem);
-                Box::pin(async move {
-                    let auth = AuthContext::default();
-                    filesystem
-                        .write(&auth, inode, offset, &data)
-                        .await
-                        .map(|_| ())
-                        .map_err(OverlayError::from)
-                })
-            });
-            VolatileWriteRuntime::new(Arc::clone(budget), backing_inodes.clone(), materializer)
-        });
         let state = Arc::new(NbdExportState {
             identity: identity.clone(),
             gate: Arc::new(RwLock::new(())),
             volatile_mode: true,
-            volatile,
         });
         for inode in backing_inodes {
             registry.inode_owners.insert(inode, identity.clone());
@@ -353,44 +332,18 @@ impl NbdExportGates {
             },
             gate: Arc::new(RwLock::new(())),
             volatile_mode: self.volatile_budget.is_some(),
-            volatile: None,
         })
     }
 
     pub(crate) async fn stop_and_drain(&self) -> CommandResult<()> {
-        let runtimes = self.runtimes();
-        for runtime in &runtimes {
-            runtime.stop_admission();
-        }
-        let mut first_error = None;
-        for result in join_all(
-            runtimes
-                .into_iter()
-                .map(|runtime| async move { runtime.shutdown().await }),
-        )
-        .await
-        {
-            if let Err(error) = result {
-                first_error.get_or_insert(error);
-            }
-        }
-        first_error.map_or(Ok(()), |error| Err(CommandError::from(error)))
+        Ok(())
     }
 
-    pub(crate) fn fence_abort(&self) {
-        for runtime in self.runtimes() {
-            runtime.fence_abort();
-        }
-    }
+    pub(crate) fn fence_abort(&self) {}
 
-    fn runtimes(&self) -> Vec<Arc<VolatileWriteRuntime>> {
-        self.registry
-            .lock()
-            .expect("NBD export gate registry poisoned")
-            .exports
-            .values()
-            .filter_map(|state| state.volatile.clone())
-            .collect()
+    #[cfg(test)]
+    fn runtimes(&self) -> Vec<()> {
+        Vec::new()
     }
 }
 
@@ -748,23 +701,14 @@ impl NBDHandler {
             return Ok(Bytes::new());
         }
 
-        if let Some(runtime) = &device.state.volatile {
-            let filesystem = Arc::clone(&self.filesystem);
-            let backing = device.backing.clone();
-            return runtime
-                .read(offset, length as usize, move || {
-                    Box::pin(async move {
-                        read_backing(filesystem, backing, offset, length)
-                            .await
-                            .map_err(|error| match error {
-                                CommandError::InvalidArgument => OverlayError::InvalidArgument,
-                                CommandError::IoError => OverlayError::IoError,
-                                CommandError::NoSpace => OverlayError::NoSpace,
-                            })
-                    })
-                })
-                .await
-                .map_err(CommandError::from);
+        if device.state.volatile_mode {
+            return read_visible(
+                Arc::clone(&self.filesystem),
+                device.backing.clone(),
+                offset,
+                length,
+            )
+            .await;
         }
 
         read_backing(
@@ -782,11 +726,22 @@ impl NBDHandler {
         length: usize,
     ) -> CommandResult<MutationAdmission> {
         let gate = Arc::clone(&device.state.gate).read_owned().await;
-        let volatile = match &device.state.volatile {
-            Some(runtime) => Some(runtime.reserve(length).await?),
-            None => None,
+        let reserved = if device.state.volatile_mode {
+            if let Some(overlay) = self.filesystem.volatile_overlay.get() {
+                let inode = match &device.backing {
+                    NbdBacking::Single { inode, .. } => *inode,
+                    NbdBacking::Striped { members, .. } => {
+                        members.first().map(|member| member.inode).unwrap_or(0)
+                    }
+                };
+                Some(overlay.reserve(inode, length).await?)
+            } else {
+                None
+            }
+        } else {
+            None
         };
-        Ok(MutationAdmission { gate, volatile })
+        Ok(MutationAdmission { gate, reserved })
     }
 
     pub(crate) async fn write_admitted(
@@ -808,30 +763,9 @@ impl NBDHandler {
             return Err(CommandError::NoSpace);
         }
 
-        if let Some(runtime) = &device.state.volatile {
-            let volatile = admission.volatile.ok_or(CommandError::IoError)?;
-            let member_count = match &device.backing {
-                NbdBacking::Single { .. } => 1,
-                NbdBacking::Striped { members, .. } => members.len(),
-            };
-            let groups = group_stripe_chunks(
-                map_stripe_chunks(&device.backing, offset, data.len() as u64)?,
-                member_count,
-            )
-            .into_iter()
-            .map(|chunks| {
-                chunks
-                    .into_iter()
-                    .map(|chunk| VolatileWriteChunk {
-                        inode: chunk.inode,
-                        member_offset: chunk.member_offset,
-                        logical_offset: chunk.logical_offset as usize,
-                        length: chunk.length as usize,
-                    })
-                    .collect()
-            })
-            .collect();
-            runtime.accept_write(volatile, offset, data, groups).await?;
+        drop(admission.reserved);
+        if device.state.volatile_mode {
+            write_visible(&self.filesystem, &device.backing, offset, &data).await?;
         } else {
             write_backing(&self.filesystem, &device.backing, offset, &data).await?;
         }
@@ -906,10 +840,6 @@ impl NBDHandler {
 
     pub async fn flush(&self, device: &NBDDevice) -> CommandResult<()> {
         let _flush_guard = device.state.gate.write().await;
-        if let Some(runtime) = &device.state.volatile {
-            let target = runtime.accepted_cutoff();
-            runtime.wait_materialized(target).await?;
-        }
         self.filesystem
             .wait_configured_durability()
             .await
@@ -923,6 +853,48 @@ impl NBDHandler {
 
         Ok(())
     }
+}
+
+async fn write_visible(
+    filesystem: &ZeroFS,
+    backing: &NbdBacking,
+    offset: u64,
+    data: &Bytes,
+) -> CommandResult<()> {
+    let auth = AuthContext::default();
+    for chunk in map_stripe_chunks(backing, offset, data.len() as u64)? {
+        let start = chunk.logical_offset as usize;
+        let end = start + chunk.length as usize;
+        let piece = data.slice(start..end);
+        filesystem
+            .write_ack(&auth, chunk.inode, chunk.member_offset, &piece)
+            .await?;
+    }
+    Ok(())
+}
+
+async fn read_visible(
+    filesystem: Arc<ZeroFS>,
+    backing: NbdBacking,
+    offset: u64,
+    length: u32,
+) -> CommandResult<Bytes> {
+    let auth = AuthContext::default();
+    let chunks = map_stripe_chunks(&backing, offset, length as u64)?;
+    let mut out = BytesMut::zeroed(length as usize);
+    for chunk in chunks {
+        let (piece, _) = filesystem
+            .read_file_visible(
+                Some(&auth),
+                chunk.inode,
+                chunk.member_offset,
+                chunk.length as u32,
+            )
+            .await?;
+        let start = chunk.logical_offset as usize;
+        out[start..start + piece.len()].copy_from_slice(&piece);
+    }
+    Ok(out.freeze())
 }
 
 async fn read_backing(
