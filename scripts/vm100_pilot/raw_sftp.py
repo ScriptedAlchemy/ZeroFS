@@ -101,6 +101,181 @@ class RawSftpResult:
         return {"schema": 2, **asdict(self)}
 
 
+@dataclass(slots=True)
+class SftpTrialExecutor:
+    owner: "RawSftpRunner"
+    endpoint: SftpEndpoint
+    receipt: RunReceipt
+    scratch: Path
+    jobs: int
+    per_job_bytes: int
+    buffer_bytes: int
+    request_depth: int
+
+    def run(
+        self,
+        *,
+        repetition: int,
+        variant: str,
+        identity: SshBinaryIdentity,
+        sources: list[Path],
+        source_digests: tuple[str, ...],
+        remote: str,
+        label: str,
+    ) -> SftpTrialResult:
+        ssh_binary = Path(identity.path)
+        self.owner._run_batch(
+            self.endpoint,
+            self.owner._batch(
+                self.scratch,
+                f"create-{label}.batch",
+                [f"mkdir {shlex.quote(remote)}"],
+            ),
+            ssh_binary,
+            buffer_bytes=self.buffer_bytes,
+            request_depth=self.request_depth,
+        )
+        upload_batches = [
+            self.owner._batch(
+                self.scratch,
+                f"upload-{label}-{index}.batch",
+                [
+                    f"put {shlex.quote(str(path))} "
+                    f"{shlex.quote(_remote_child(remote, f'file-{index}.bin'))}"
+                ],
+            )
+            for index, path in enumerate(sources)
+        ]
+        upload = self.owner._parallel_batches(
+            self.endpoint,
+            upload_batches,
+            [
+                self.receipt.path(f"upload-{label}-{index}.log")
+                for index in range(self.jobs)
+            ],
+            ssh_binary,
+            buffer_bytes=self.buffer_bytes,
+            request_depth=self.request_depth,
+            bytes_per_session=self.per_job_bytes,
+        )
+        downloads = [
+            self.scratch / f"download-{label}-{index}.bin"
+            for index in range(self.jobs)
+        ]
+        download_batches = [
+            self.owner._batch(
+                self.scratch,
+                f"download-{label}-{index}.batch",
+                [
+                    f"get {shlex.quote(_remote_child(remote, f'file-{index}.bin'))} "
+                    f"{shlex.quote(str(downloads[index]))}"
+                ],
+            )
+            for index in range(self.jobs)
+        ]
+        download = self.owner._parallel_batches(
+            self.endpoint,
+            download_batches,
+            [
+                self.receipt.path(f"download-{label}-{index}.log")
+                for index in range(self.jobs)
+            ],
+            ssh_binary,
+            buffer_bytes=self.buffer_bytes,
+            request_depth=self.request_depth,
+            bytes_per_session=self.per_job_bytes,
+        )
+        download_digests = tuple(file_sha256(path) for path in downloads)
+        if download_digests != source_digests:
+            raise RuntimeError(
+                f"raw SFTP SHA-256 mismatch for trial {label}: "
+                f"source={source_digests}, download={download_digests}"
+            )
+        for path in downloads:
+            path.unlink()
+        result = SftpTrialResult(
+            repetition=repetition,
+            variant=variant,
+            ssh=identity,
+            upload_close_ack=upload,
+            download_close_ack=download,
+            source_sha256=source_digests,
+            download_sha256=download_digests,
+            sha256_verified=True,
+            remote_durability="not_measured",
+        )
+        self.owner._cleanup_remote(
+            self.endpoint,
+            self.scratch,
+            remote,
+            ssh_binary,
+            jobs=self.jobs,
+            buffer_bytes=self.buffer_bytes,
+            request_depth=self.request_depth,
+            label=label,
+        )
+        return result
+
+
+@dataclass(slots=True)
+class OwnedSftpResources:
+    scratch: Path
+    ledger: Path
+    active_remotes: list[tuple[str, Path, str]]
+    remote_resources: list[str]
+    cleanup_attempts: int = 0
+    cleanup_asserted: bool = False
+
+    @classmethod
+    def create(cls, scratch: Path, ledger: Path) -> "OwnedSftpResources":
+        return cls(scratch, ledger, [], [])
+
+    def write(self) -> None:
+        self.ledger.write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "scratch": str(self.scratch),
+                    "remote_resources": self.remote_resources,
+                    "active_remotes": [item[0] for item in self.active_remotes],
+                    "cleanup_attempts": self.cleanup_attempts,
+                    "asserted_clean": self.cleanup_asserted,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+    def register_remote(self, remote: str, ssh_binary: Path, label: str) -> None:
+        self.active_remotes.append((remote, ssh_binary, label))
+        self.remote_resources.append(remote)
+        self.write()
+
+    def release_remote(self, remote: str, ssh_binary: Path, label: str) -> None:
+        self.active_remotes.remove((remote, ssh_binary, label))
+        self.write()
+
+    def cleanup_local_twice(self, errors: list[str]) -> None:
+        for _ in range(2):
+            self.cleanup_attempts += 1
+            try:
+                remove_tree(self.scratch)
+            except BaseException as error:
+                errors.append(f"local cleanup: {error}")
+            self.write()
+
+    def assert_clean(self, errors: list[str]) -> None:
+        self.cleanup_asserted = not present(self.scratch) and not self.active_remotes
+        if not self.cleanup_asserted:
+            errors.append(
+                "raw SFTP cleanup assertion failed: "
+                f"scratch={present(self.scratch)}, remotes={self.active_remotes}"
+            )
+        self.write()
+
+
 def _rate(total_bytes: int, elapsed_ms: int) -> float:
     return (
         round(total_bytes / 1_048_576 / (elapsed_ms / 1000), 3)
@@ -490,10 +665,6 @@ class RawSftpRunner:
                 f"cannot prove remote directory absent: {remote}: {detail}"
             )
 
-    @staticmethod
-    def _cleanup_local(scratch: Path) -> None:
-        remove_tree(scratch)
-
     def run(
         self,
         scenario: RawSftpScenario,
@@ -509,39 +680,17 @@ class RawSftpRunner:
         order = counterbalanced_order(scenario.repetitions)
         receipt = RunReceipt.start(self.config, "raw-sftp-stock-hpn")
         scratch = self.config.temp_dir / f"zerofs-raw-sftp-{uuid.uuid4().hex}"
-        self.config.require_temp_child(scratch, "zerofs-raw-sftp-")
         sources: list[Path] = []
         source_digests: tuple[str, ...] = ()
-        active_remotes: list[tuple[str, Path, str]] = []
-        remote_resources: list[str] = []
         stop_attempted = False
-        cleanup_attempts = 0
-        cleanup_asserted = False
         primary: BaseException | None = None
         trials: list[SftpTrialResult] = []
-        ledger = receipt.path("cleanup-ledger.json")
+        ledger = receipt.directory / "cleanup-ledger.json"
+        owned = OwnedSftpResources.create(scratch, ledger)
         stock_identity: SshBinaryIdentity | None = None
         hpn_identity: SshBinaryIdentity | None = None
         endpoint: SftpEndpoint | None = None
         endpoint_authority: SftpEndpointAuthority | None = None
-
-        def write_ledger() -> None:
-            ledger.write_text(
-                json.dumps(
-                    {
-                        "schema": 1,
-                        "scratch": str(scratch),
-                        "remote_resources": remote_resources,
-                        "active_remotes": [item[0] for item in active_remotes],
-                        "cleanup_attempts": cleanup_attempts,
-                        "asserted_clean": cleanup_asserted,
-                    },
-                    indent=2,
-                    sort_keys=True,
-                )
-                + "\n",
-                encoding="utf-8",
-            )
 
         with receipt:
             receipt.record("order", order)
@@ -561,6 +710,8 @@ class RawSftpRunner:
                 },
             )
             try:
+                receipt.artifact("cleanup-ledger.json", ledger)
+                self.config.require_temp_child(scratch, "zerofs-raw-sftp-")
                 stock_identity, hpn_identity = self._identify_binaries(
                     stock_ssh, hpn_ssh
                 )
@@ -571,7 +722,7 @@ class RawSftpRunner:
                 endpoint = self._endpoint()
                 endpoint_authority = self._endpoint_authority(endpoint)
                 receipt.record("endpoint", asdict(endpoint_authority))
-                write_ledger()
+                owned.write()
                 scratch.mkdir(mode=0o700)
                 sources = self._create_sources(
                     scratch,
@@ -582,6 +733,16 @@ class RawSftpRunner:
                 stop_attempted = True
                 self.lifecycle.stop()
                 identities = {"stock": stock_identity, "hpn": hpn_identity}
+                trial_executor = SftpTrialExecutor(
+                    self,
+                    endpoint,
+                    receipt,
+                    scratch,
+                    jobs,
+                    per_job_bytes,
+                    buffer_bytes,
+                    request_depth,
+                )
                 for repetition, variant in enumerate(order):
                     identity = identities[variant]
                     ssh_binary = Path(identity.path)
@@ -590,112 +751,26 @@ class RawSftpRunner:
                         f"zerofs-raw-control-{uuid.uuid4().hex}",
                     )
                     label = f"{repetition}-{variant}"
-                    active_remotes.append((remote, ssh_binary, label))
-                    remote_resources.append(remote)
-                    write_ledger()
-                    self._run_batch(
-                        endpoint,
-                        self._batch(
-                            scratch,
-                            f"create-{label}.batch",
-                            [f"mkdir {shlex.quote(remote)}"],
-                        ),
-                        ssh_binary,
-                        buffer_bytes=buffer_bytes,
-                        request_depth=request_depth,
-                    )
-                    upload_batches = [
-                        self._batch(
-                            scratch,
-                            f"upload-{label}-{index}.batch",
-                            [
-                                f"put {shlex.quote(str(path))} "
-                                f"{shlex.quote(_remote_child(remote, f'file-{index}.bin'))}"
-                            ],
-                        )
-                        for index, path in enumerate(sources)
-                    ]
-                    upload_logs = [
-                        receipt.path(f"upload-{label}-{index}.log")
-                        for index in range(jobs)
-                    ]
-                    upload = self._parallel_batches(
-                        endpoint,
-                        upload_batches,
-                        upload_logs,
-                        ssh_binary,
-                        buffer_bytes=buffer_bytes,
-                        request_depth=request_depth,
-                        bytes_per_session=per_job_bytes,
-                    )
-                    downloads = [
-                        scratch / f"download-{label}-{index}.bin"
-                        for index in range(jobs)
-                    ]
-                    download_batches = [
-                        self._batch(
-                            scratch,
-                            f"download-{label}-{index}.batch",
-                            [
-                                f"get {shlex.quote(_remote_child(remote, f'file-{index}.bin'))} "
-                                f"{shlex.quote(str(downloads[index]))}"
-                            ],
-                        )
-                        for index in range(jobs)
-                    ]
-                    download_logs = [
-                        receipt.path(f"download-{label}-{index}.log")
-                        for index in range(jobs)
-                    ]
-                    download = self._parallel_batches(
-                        endpoint,
-                        download_batches,
-                        download_logs,
-                        ssh_binary,
-                        buffer_bytes=buffer_bytes,
-                        request_depth=request_depth,
-                        bytes_per_session=per_job_bytes,
-                    )
-                    download_digests = tuple(file_sha256(path) for path in downloads)
-                    if download_digests != source_digests:
-                        raise RuntimeError(
-                            f"raw SFTP SHA-256 mismatch for trial {label}: "
-                            f"source={source_digests}, download={download_digests}"
-                        )
-                    for path in downloads:
-                        path.unlink()
+                    owned.register_remote(remote, ssh_binary, label)
                     trials.append(
-                        SftpTrialResult(
+                        trial_executor.run(
                             repetition=repetition,
                             variant=variant,
-                            ssh=identity,
-                            upload_close_ack=upload,
-                            download_close_ack=download,
-                            source_sha256=source_digests,
-                            download_sha256=download_digests,
-                            sha256_verified=True,
-                            remote_durability="not_measured",
+                            identity=identity,
+                            sources=sources,
+                            source_digests=source_digests,
+                            remote=remote,
+                            label=label,
                         )
                     )
-                    self._cleanup_remote(
-                        endpoint,
-                        scratch,
-                        remote,
-                        ssh_binary,
-                        jobs=jobs,
-                        buffer_bytes=buffer_bytes,
-                        request_depth=request_depth,
-                        label=label,
-                    )
-                    active_remotes.remove((remote, ssh_binary, label))
-                    write_ledger()
+                    owned.release_remote(remote, ssh_binary, label)
                     receipt.record("trials", [asdict(item) for item in trials])
             except BaseException as error:
                 primary = error
                 raise
             finally:
                 cleanup_errors: list[str] = []
-                for remote, ssh_binary, label in list(active_remotes):
+                for remote, ssh_binary, label in list(owned.active_remotes):
                     if endpoint is None:
                         cleanup_errors.append(
                             f"remote cleanup {remote}: endpoint authority unavailable"
@@ -712,23 +787,11 @@ class RawSftpRunner:
                             request_depth=request_depth,
                             label=f"final-{label}",
                         )
-                        active_remotes.remove((remote, ssh_binary, label))
+                        owned.release_remote(remote, ssh_binary, label)
                     except BaseException as error:
                         cleanup_errors.append(f"remote cleanup {remote}: {error}")
-                for _ in range(2):
-                    cleanup_attempts += 1
-                    try:
-                        self._cleanup_local(scratch)
-                    except BaseException as error:
-                        cleanup_errors.append(f"local cleanup: {error}")
-                    write_ledger()
-                cleanup_asserted = not present(scratch) and not active_remotes
-                if not cleanup_asserted:
-                    cleanup_errors.append(
-                        "raw SFTP cleanup assertion failed: "
-                        f"scratch={present(scratch)}, remotes={active_remotes}"
-                    )
-                write_ledger()
+                owned.cleanup_local_twice(cleanup_errors)
+                owned.assert_clean(cleanup_errors)
                 if stop_attempted:
                     try:
                         self.lifecycle.start()
@@ -744,26 +807,30 @@ class RawSftpRunner:
                     else:
                         raise RuntimeError("; ".join(cleanup_errors))
 
-        if stock_identity is None or hpn_identity is None or endpoint_authority is None:
-            raise RuntimeError("raw SFTP completed without resolved authority")
-        result = RawSftpResult(
-            scenario=scenario.name,
-            jobs=jobs,
-            per_job_bytes=per_job_bytes,
-            buffer_bytes=buffer_bytes,
-            request_depth=request_depth,
-            repetitions=repetitions,
-            order=order,
-            endpoint=endpoint_authority,
-            stock_ssh=stock_identity,
-            hpn_ssh=hpn_identity,
-            trials=tuple(trials),
-            cleanup_attempts=cleanup_attempts,
-            cleanup_asserted=cleanup_asserted,
-            receipt_dir=str(receipt.directory),
-        )
-        receipt.path("summary.json").write_text(
-            json.dumps(result.to_dict(), indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
+            if (
+                stock_identity is None
+                or hpn_identity is None
+                or endpoint_authority is None
+            ):
+                raise RuntimeError("raw SFTP completed without resolved authority")
+            result = RawSftpResult(
+                scenario=scenario.name,
+                jobs=jobs,
+                per_job_bytes=per_job_bytes,
+                buffer_bytes=buffer_bytes,
+                request_depth=request_depth,
+                repetitions=repetitions,
+                order=order,
+                endpoint=endpoint_authority,
+                stock_ssh=stock_identity,
+                hpn_ssh=hpn_identity,
+                trials=tuple(trials),
+                cleanup_attempts=owned.cleanup_attempts,
+                cleanup_asserted=owned.cleanup_asserted,
+                receipt_dir=str(receipt.directory),
+            )
+            receipt.path("summary.json").write_text(
+                json.dumps(result.to_dict(), indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
         return result

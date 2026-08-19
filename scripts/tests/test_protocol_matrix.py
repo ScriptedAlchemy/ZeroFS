@@ -227,6 +227,7 @@ class ProtocolMatrixTests(unittest.TestCase):
             workload.stable_remote_drain_ns,
             workload.remote_cutoff_ns,
         )
+        self.assertEqual(workload.stable_remote_drain, {"drained": True})
         self.assertEqual(result.cleanup.attempts, 2)
         self.assertTrue(result.cleanup.asserted_clean)
         self.assertEqual(list(self.protocol_root.iterdir()), [])

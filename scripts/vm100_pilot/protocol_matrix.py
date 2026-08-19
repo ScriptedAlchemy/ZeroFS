@@ -21,7 +21,7 @@ from .metrics import (
 from .owned_resources import assert_absent, remove_empty_directory, unlink_file
 from .receipts import RunReceipt
 from .runner import Runner
-from .scenarios import ProtocolScenario
+from .scenarios import ProtocolScenario, WorkloadDefinition
 from .system_io import file_sha256
 from .writeback_observer import WritebackObserver
 
@@ -193,6 +193,7 @@ class ProtocolWorkloadResult:
     local_cutoff_ns: int
     remote_cutoff_ns: int
     stable_remote_drain_ns: int
+    stable_remote_drain: dict[str, object]
     readback_ns: int
     foreground_mibps: float
     readback_mibps: float
@@ -222,6 +223,103 @@ class ProtocolMatrixResult:
 
     def to_dict(self) -> dict[str, object]:
         return {"schema": 1, **asdict(self)}
+
+
+@dataclass(slots=True)
+class ProtocolWorkloadExecutor:
+    owner: "ProtocolMatrixRunner"
+    run_root: Path
+    scratch: Path
+    ledger: Path
+    files: list[Path]
+    resources: list[Path]
+
+    def run(
+        self,
+        workload: WorkloadDefinition,
+        index: int,
+    ) -> ProtocolWorkloadResult:
+        observer = self.owner.observer
+        observer.drain()
+        source = self.scratch / f"source-{index}.bin"
+        destination = self.run_root / f"payload-{index}.bin"
+        self.files.extend((destination, source))
+        self.resources.extend((destination, source))
+        self.owner._write_ledger(self.ledger, self.resources, 0, False)
+        self.owner._create_source(source, workload.bytes)
+        source_sha256 = file_sha256(source)
+        before = observer.metrics.snapshot()
+        write_started = time.monotonic_ns()
+        foreground_ns = self.owner._copy_without_barrier(source, destination)
+        memory = self.owner.memory_session
+        if memory is not None:
+            memory.sample(f"foreground_close:{workload.name}")
+        accepted = wait_for_accepted_after(
+            observer.metrics.snapshot,
+            previous_sequence=before.accepted,
+            timeout=self.owner.config.drain_timeout,
+        )
+        fsync_ns = self.owner._fsync(destination)
+        if memory is not None:
+            memory.sample(f"fsync_or_commit:{workload.name}")
+        local = wait_for_local(
+            observer.metrics.snapshot,
+            target_sequence=accepted.accepted,
+            timeout=self.owner.config.drain_timeout,
+        )
+        local_cutoff_ns = max(1, time.monotonic_ns() - write_started)
+        if memory is not None:
+            memory.sample(f"local:{workload.name}")
+        remote = wait_for_remote(
+            observer.metrics.snapshot,
+            target_sequence=accepted.accepted,
+            timeout=self.owner.config.drain_timeout,
+        )
+        remote_cutoff_ns = max(1, time.monotonic_ns() - write_started)
+        stable_remote_drain = observer.drain()
+        stable_remote_drain_ns = max(
+            remote_cutoff_ns,
+            time.monotonic_ns() - write_started,
+        )
+        if memory is not None:
+            memory.sample(f"remote:{workload.name}")
+        if destination.stat().st_size != workload.bytes:
+            raise RuntimeError(
+                f"protocol write byte count mismatch for {workload.name}: "
+                f"{destination.stat().st_size} != {workload.bytes}"
+            )
+        read_started = time.monotonic_ns()
+        readback_sha256 = file_sha256(destination)
+        readback_ns = max(1, time.monotonic_ns() - read_started)
+        if readback_sha256 != source_sha256:
+            raise RuntimeError(
+                f"protocol readback SHA-256 mismatch for {workload.name}: "
+                f"source={source_sha256}, readback={readback_sha256}"
+            )
+        result = ProtocolWorkloadResult(
+            name=workload.name,
+            bytes=workload.bytes,
+            pattern=workload.pattern,
+            source_sha256=source_sha256,
+            readback_sha256=readback_sha256,
+            target_sequence=accepted.accepted,
+            foreground_close_ns=foreground_ns,
+            fsync_or_commit_ns=fsync_ns,
+            local_cutoff_ns=local_cutoff_ns,
+            remote_cutoff_ns=remote_cutoff_ns,
+            stable_remote_drain_ns=stable_remote_drain_ns,
+            stable_remote_drain=stable_remote_drain,
+            readback_ns=readback_ns,
+            foreground_mibps=self.owner._rate(workload.bytes, foreground_ns),
+            readback_mibps=self.owner._rate(workload.bytes, readback_ns),
+            before=before,
+            accepted=accepted,
+            local=local,
+            remote=remote,
+        )
+        destination.unlink()
+        source.unlink()
+        return result
 
 
 class ProtocolMatrixRunner:
@@ -333,17 +431,14 @@ class ProtocolMatrixRunner:
 
         receipt = RunReceipt.start(self.config, scenario.name)
         run_id = uuid.uuid4().hex
-        run_root = authority.require_run_root(
-            authority.mountpoint / f".zerofs-protocol-bench-{run_id}"
-        )
+        run_root = authority.mountpoint / f".zerofs-protocol-bench-{run_id}"
         scratch = self.config.temp_dir / f"zerofs-protocol-bench-{run_id}"
-        self.config.require_temp_child(scratch, "zerofs-protocol-bench-")
         files: list[Path] = []
         directories = [run_root, scratch]
         resources: list[Path] = [run_root, scratch]
         attempts = 0
         asserted_clean = False
-        ledger = receipt.path("cleanup-ledger.json")
+        ledger = receipt.directory / "cleanup-ledger.json"
         results: list[ProtocolWorkloadResult] = []
         primary: BaseException | None = None
         memory_envelope: dict[str, object] | None = None
@@ -366,6 +461,9 @@ class ProtocolMatrixRunner:
                 {"metrics_endpoint": self.observer.metrics_endpoint},
             )
             try:
+                receipt.artifact("cleanup-ledger.json", ledger)
+                authority.require_run_root(run_root)
+                self.config.require_temp_child(scratch, "zerofs-protocol-bench-")
                 if self.memory_session is not None:
                     self.memory_session.attach_artifact(
                         receipt.path("memory-envelope.json")
@@ -380,90 +478,16 @@ class ProtocolMatrixRunner:
                 self._write_ledger(ledger, resources, attempts, asserted_clean)
                 run_root.mkdir(mode=0o700)
                 scratch.mkdir(mode=0o700)
+                workload_executor = ProtocolWorkloadExecutor(
+                    self,
+                    run_root,
+                    scratch,
+                    ledger,
+                    files,
+                    resources,
+                )
                 for index, workload in enumerate(scenario.workloads):
-                    self.observer.drain()
-                    source = scratch / f"source-{index}.bin"
-                    destination = run_root / f"payload-{index}.bin"
-                    files.extend((destination, source))
-                    resources.extend((destination, source))
-                    self._write_ledger(ledger, resources, attempts, asserted_clean)
-                    self._create_source(source, workload.bytes)
-                    source_sha256 = file_sha256(source)
-                    before = self.observer.metrics.snapshot()
-                    write_started = time.monotonic_ns()
-                    foreground_ns = self._copy_without_barrier(source, destination)
-                    if self.memory_session is not None:
-                        self.memory_session.sample(
-                            f"foreground_close:{workload.name}"
-                        )
-                    accepted = wait_for_accepted_after(
-                        self.observer.metrics.snapshot,
-                        previous_sequence=before.accepted,
-                        timeout=self.config.drain_timeout,
-                    )
-                    fsync_ns = self._fsync(destination)
-                    if self.memory_session is not None:
-                        self.memory_session.sample(
-                            f"fsync_or_commit:{workload.name}"
-                        )
-                    local = wait_for_local(
-                        self.observer.metrics.snapshot,
-                        target_sequence=accepted.accepted,
-                        timeout=self.config.drain_timeout,
-                    )
-                    local_cutoff_ns = max(1, time.monotonic_ns() - write_started)
-                    if self.memory_session is not None:
-                        self.memory_session.sample(f"local:{workload.name}")
-                    remote = wait_for_remote(
-                        self.observer.metrics.snapshot,
-                        target_sequence=accepted.accepted,
-                        timeout=self.config.drain_timeout,
-                    )
-                    remote_cutoff_ns = max(1, time.monotonic_ns() - write_started)
-                    self.observer.drain()
-                    stable_remote_drain_ns = max(
-                        remote_cutoff_ns,
-                        time.monotonic_ns() - write_started,
-                    )
-                    if self.memory_session is not None:
-                        self.memory_session.sample(f"remote:{workload.name}")
-                    if destination.stat().st_size != workload.bytes:
-                        raise RuntimeError(
-                            f"protocol write byte count mismatch for {workload.name}: "
-                            f"{destination.stat().st_size} != {workload.bytes}"
-                        )
-                    read_started = time.monotonic_ns()
-                    readback_sha256 = file_sha256(destination)
-                    readback_ns = max(1, time.monotonic_ns() - read_started)
-                    if readback_sha256 != source_sha256:
-                        raise RuntimeError(
-                            f"protocol readback SHA-256 mismatch for {workload.name}: "
-                            f"source={source_sha256}, readback={readback_sha256}"
-                        )
-                    results.append(
-                        ProtocolWorkloadResult(
-                            name=workload.name,
-                            bytes=workload.bytes,
-                            pattern=workload.pattern,
-                            source_sha256=source_sha256,
-                            readback_sha256=readback_sha256,
-                            target_sequence=accepted.accepted,
-                            foreground_close_ns=foreground_ns,
-                            fsync_or_commit_ns=fsync_ns,
-                            local_cutoff_ns=local_cutoff_ns,
-                            remote_cutoff_ns=remote_cutoff_ns,
-                            stable_remote_drain_ns=stable_remote_drain_ns,
-                            readback_ns=readback_ns,
-                            foreground_mibps=self._rate(workload.bytes, foreground_ns),
-                            readback_mibps=self._rate(workload.bytes, readback_ns),
-                            before=before,
-                            accepted=accepted,
-                            local=local,
-                            remote=remote,
-                        )
-                    )
-                    destination.unlink()
-                    source.unlink()
+                    results.append(workload_executor.run(workload, index))
                 self.observer.drain()
             except BaseException as error:
                 primary = error
@@ -497,23 +521,23 @@ class ProtocolMatrixRunner:
                     else:
                         raise RuntimeError(f"protocol benchmark cleanup failed: {detail}")
 
-        cleanup = CleanupEvidence(
-            resources=tuple(str(path) for path in resources),
-            attempts=attempts,
-            asserted_clean=asserted_clean,
-        )
-        result = ProtocolMatrixResult(
-            scenario=scenario.name,
-            protocol=scenario.protocol,
-            authority=authority_receipt,
-            total_bytes=total_bytes,
-            workloads=tuple(results),
-            memory_envelope=memory_envelope,
-            cleanup=cleanup,
-            receipt_dir=str(receipt.directory),
-        )
-        receipt.path("summary.json").write_text(
-            json.dumps(result.to_dict(), indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
+            cleanup = CleanupEvidence(
+                resources=tuple(str(path) for path in resources),
+                attempts=attempts,
+                asserted_clean=asserted_clean,
+            )
+            result = ProtocolMatrixResult(
+                scenario=scenario.name,
+                protocol=scenario.protocol,
+                authority=authority_receipt,
+                total_bytes=total_bytes,
+                workloads=tuple(results),
+                memory_envelope=memory_envelope,
+                cleanup=cleanup,
+                receipt_dir=str(receipt.directory),
+            )
+            receipt.path("summary.json").write_text(
+                json.dumps(result.to_dict(), indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
         return result
