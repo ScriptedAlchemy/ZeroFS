@@ -278,6 +278,16 @@ fn render_metrics(
 ) -> String {
     let mut rendered = metrics_handle.render();
     if let Some(authority) = authority {
+        rendered = rendered
+            .lines()
+            .filter(|line| {
+                line.starts_with('#')
+                    || line
+                        .split_once(['{', ' '])
+                        .is_none_or(|(name, _)| name != "zerofs_benchmark_authority_info")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
         if !rendered.is_empty() && !rendered.ends_with('\n') {
             rendered.push('\n');
         }
@@ -299,6 +309,8 @@ fn handle_request(
 ) -> HttpResponse {
     let canonical_authority_request = authority.is_none()
         || (req.method() == hyper::Method::GET
+            && req.uri().scheme().is_none()
+            && req.uri().authority().is_none()
             && req.uri().query().is_none()
             && !req.headers().contains_key(hyper::header::AUTHORIZATION));
     if req.uri().path() != "/metrics" || !canonical_authority_request {
@@ -785,6 +797,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn benchmark_authority_response_replaces_any_recorder_collision_with_the_canonical_tuple() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            metrics::gauge!("zerofs_benchmark_authority_info").set(99.0);
+        });
+
+        let body = super::render_metrics(&handle, Some(&benchmark_authority_fixture()));
+
+        assert_eq!(sample_count(&body, "zerofs_benchmark_authority_info"), 1);
+        assert!(body.contains(
+            "zerofs_benchmark_authority_info{server_instance_id=\"2be254ef917b4ff8a2c547b873709aef\",filesystem_id=\"550e8400-e29b-41d4-a716-446655440000\",export_id=\"10.10.10.30:/\"} 1"
+        ));
+        assert!(
+            !body
+                .lines()
+                .any(|line| line == "zerofs_benchmark_authority_info 99")
+        );
+    }
+
     #[tokio::test]
     async fn benchmark_authority_response_accepts_only_canonical_unauthenticated_get() {
         use http_body_util::BodyExt;
@@ -825,6 +858,9 @@ mod tests {
                 .method(hyper::Method::GET)
                 .uri("/metrics")
                 .header(hyper::header::AUTHORIZATION, "Bearer secret"),
+            hyper::Request::builder()
+                .method(hyper::Method::GET)
+                .uri("https://user:secret@example.invalid/metrics"),
         ] {
             let response = super::handle_request(
                 request
