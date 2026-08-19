@@ -185,6 +185,9 @@ prepare_managed_state_tree() {
       echo "unsafe persistent state root ownership/mode: $state_root ($root_state)" >&2
       return 1
     fi
+    # Remove mapped CT root's write access to the parent before inspecting any
+    # child. Once frozen, CT processes cannot swap a validated child for a link.
+    install -d -o 0 -g 100000 -m 0750 "$state_root"
     assert_managed_state_child "$state_root/releases" 0 0 0755
     assert_managed_state_child "$state_root/receipts" 0 0 0755
     assert_managed_state_child "$state_root/rollback" 0 0 0700 0755
@@ -215,8 +218,9 @@ prepare_managed_state_tree() {
           ;;
       esac
     done < <(find -P "$state_root" -mindepth 1 -maxdepth 1 -print)
+  else
+    install -d -o 0 -g 100000 -m 0750 "$state_root"
   fi
-  install -d -o 0 -g 100000 -m 0750 "$state_root"
 }
 
 if [[ $dry_run == false ]]; then

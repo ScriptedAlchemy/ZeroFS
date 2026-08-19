@@ -254,6 +254,48 @@ assert_managed_state_child "$state_root/releases" 0 0 0755
             self.assertIn("unsafe managed state child", result.stderr)
             self.assertEqual(list(outside.iterdir()), [])
 
+    def test_legacy_state_parent_is_frozen_before_any_child_enumeration(self) -> None:
+        source = HOST_SCRIPT.read_text()
+        functions = source[
+            source.index("assert_managed_state_child() {") : source.index(
+                "if [[ $dry_run == false ]]; then\n  [[ $EUID"
+            )
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            script = f"""set -euo pipefail
+dry_run=false
+state_root={root}
+parent_frozen=false
+stat() {{
+  if [[ ${{!#}} == "$state_root" ]]; then
+    printf '100000:100000:750\n'
+  else
+    command stat "$@"
+  fi
+}}
+install() {{
+  [[ ${{!#}} == "$state_root" ]] || return 90
+  parent_frozen=true
+}}
+find() {{
+  [[ $parent_frozen == true ]] || {{ echo child-scan-before-freeze >&2; return 91; }}
+}}
+{functions}
+prepare_managed_state_tree
+printf 'parent_frozen=%s\n' "$parent_frozen"
+"""
+            result = subprocess.run(
+                ["bash", "-c", script],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("parent_frozen=true", result.stdout)
+            self.assertNotIn("child-scan-before-freeze", result.stderr)
+
     def test_deploy_plan_uses_unprivileged_private_lxc_and_persistent_bind(
         self,
     ) -> None:
