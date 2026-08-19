@@ -1170,6 +1170,11 @@ impl SftpSessionPool {
         loop {
             let changed = self.inner.roster_changed.notified();
             tokio::pin!(changed);
+            // Register interest before inspecting the roster: notify_waiters
+            // only wakes already-registered waiters, so a release landing
+            // between the roster check and the first poll would otherwise be
+            // a lost wakeup.
+            changed.as_mut().enable();
             let placement = {
                 let roster = self.inner.roster.lock().unwrap();
                 if self.inner.closed.load(Ordering::SeqCst) {
@@ -1227,6 +1232,9 @@ impl SftpSessionPool {
                             // only fail when nothing can carry it.
                             let fallback = {
                                 let roster = self.inner.roster.lock().unwrap();
+                                if self.inner.closed.load(Ordering::SeqCst) {
+                                    return Err(error);
+                                }
                                 let candidate = roster
                                     .iter()
                                     .filter(|session| {
@@ -1551,25 +1559,32 @@ impl SessionLease {
             .take()
             .expect("lease always owns a session until retirement");
         // Marking the session broken removes it from placement; the close
-        // itself happens once the last concurrent operation releases it. Only
-        // the last release observes and reports the close outcome.
+        // itself happens once the last concurrent operation releases it.
         session.broken.store(true, Ordering::SeqCst);
         let pool = self.pool.clone();
-        let kind = self.kind;
-        if kind == OperationKind::Write {
+        if self.kind == OperationKind::Write {
             session.active_writes.fetch_sub(1, Ordering::SeqCst);
         }
         pool.remove_from_roster(&session);
+        let admission = self.admission.take();
+        let activity = self.activity.take();
         let remaining = session.active_ops.fetch_sub(1, Ordering::SeqCst) - 1;
-        let result = if remaining == 0 {
-            pool.close_shared_session(session).await
-        } else {
-            Ok(())
-        };
-        pool.roster_changed.notify_waiters();
-        drop(self.admission.take());
-        drop(self.activity.take());
-        result
+        // The close runs in an owned task so a canceled caller cannot abandon
+        // it half-way; admission capacity stays held until it finishes.
+        let cleanup = self.pool.tasks.spawn(async move {
+            let result = if remaining == 0 {
+                pool.close_shared_session(session).await
+            } else {
+                Ok(())
+            };
+            pool.roster_changed.notify_waiters();
+            drop(admission);
+            drop(activity);
+            result
+        });
+        cleanup
+            .await
+            .map_err(|_| TransportError::Close("SFTP retirement task failed".to_owned()))?
     }
 
     #[cfg(test)]
@@ -1985,8 +2000,16 @@ mod tests {
                 .expect("the pool opens its first session while the backend is healthy");
         assert_eq!(state.dials.load(Ordering::SeqCst), 1);
 
+        // Retire the warm session so every checkout must dial: with a live
+        // session in the roster a failed dial falls back to sharing it
+        // instead of surfacing the error.
         state.fail.store(true, Ordering::SeqCst);
-        let _held = pool.checkout(OperationKind::Write).await.unwrap();
+        pool.checkout(OperationKind::Write)
+            .await
+            .unwrap()
+            .retire()
+            .await
+            .unwrap();
         let paced_from = Instant::now();
         for _ in 0..5 {
             let error = pool.checkout(OperationKind::Read).await.unwrap_err();
@@ -2003,8 +2026,9 @@ mod tests {
         // The backend sheds its stale sessions; the next (paced) dial
         // succeeds and resets the schedule.
         state.fail.store(false, Ordering::SeqCst);
-        let _recovered = pool.checkout(OperationKind::Read).await.unwrap();
+        let recovered = pool.checkout(OperationKind::Read).await.unwrap();
         assert_eq!(state.dials.load(Ordering::SeqCst), 7);
+        recovered.retire().await.unwrap();
 
         state.fail.store(true, Ordering::SeqCst);
         let reset_from = Instant::now();
@@ -2066,14 +2090,16 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-    async fn thirty_two_waiters_observe_exact_shared_and_directional_caps() {
+    async fn thirty_two_waiters_observe_exact_directional_caps_and_connection_ceiling() {
         let factory = RecordingFactory::fully_capable();
         let pool = Arc::new(pool(factory.clone(), 8, 7, 7).await);
         let mut held = Vec::new();
         for _ in 0..7 {
             held.push(pool.checkout(OperationKind::Read).await.unwrap());
         }
-        held.push(pool.checkout(OperationKind::Write).await.unwrap());
+        for _ in 0..7 {
+            held.push(pool.checkout(OperationKind::Write).await.unwrap());
+        }
         let mut tasks = Vec::new();
 
         for index in 0..32 {
@@ -2093,15 +2119,17 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert!(tasks.iter().all(|task| !task.is_finished()));
-        assert_eq!(factory.live(), 8);
-        assert_eq!(factory.peak(), 8);
+        assert!(
+            factory.peak() <= 8,
+            "fourteen multiplexed operations never exceed the connection cap"
+        );
         for lease in held {
             lease.complete().await.unwrap();
         }
         for task in tasks {
             task.await.unwrap();
         }
-        assert_eq!(factory.peak(), 8);
+        assert!(factory.peak() <= 8);
     }
 
     #[tokio::test]
@@ -2368,35 +2396,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn metadata_uses_fifo_read_admission_without_starvation() {
+    async fn metadata_admission_does_not_queue_behind_the_read_limit() {
         let factory = RecordingFactory::fully_capable();
         let pool = Arc::new(pool(factory, 2, 1, 1).await);
         let first = pool.checkout(OperationKind::Read).await.unwrap();
-        let order = Arc::new(Mutex::new(Vec::new()));
-        let mut tasks = Vec::new();
-        for (position, kind) in [
-            OperationKind::Metadata,
-            OperationKind::Read,
-            OperationKind::Metadata,
-        ]
-        .into_iter()
-        .enumerate()
-        {
+
+        let queued_read = tokio::spawn({
             let pool = pool.clone();
-            let order = order.clone();
-            tasks.push(tokio::spawn(async move {
-                let lease = pool.checkout(kind).await.unwrap();
-                order.lock().unwrap().push(position);
-                lease.complete().await.unwrap();
-            }));
+            async move { pool.checkout(OperationKind::Read).await }
+        });
+        while pool.inner.admission.waiter_count() != 1 {
             tokio::task::yield_now().await;
         }
 
+        // Metadata has its own admission budget: a storm of one-round-trip
+        // calls proceeds while the read class is saturated.
+        let metadata = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            pool.checkout(OperationKind::Metadata),
+        )
+        .await
+        .expect("metadata admits while the read limit is exhausted")
+        .unwrap();
+        assert!(!queued_read.is_finished());
+
+        metadata.complete().await.unwrap();
         first.complete().await.unwrap();
-        for task in tasks {
-            task.await.unwrap();
-        }
-        assert_eq!(*order.lock().unwrap(), vec![0, 1, 2]);
+        queued_read
+            .await
+            .unwrap()
+            .unwrap()
+            .complete()
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -2404,9 +2436,11 @@ mod tests {
         let factory = RecordingFactory::fully_capable();
         let pool = Arc::new(pool(factory.clone(), 1, 1, 1).await);
         let held = pool.checkout(OperationKind::Read).await.unwrap();
+        // A second read queues in admission (read limit 1); metadata would
+        // multiplex onto the held session immediately.
         let waiter = tokio::spawn({
             let pool = pool.clone();
-            async move { pool.checkout(OperationKind::Metadata).await }
+            async move { pool.checkout(OperationKind::Read).await }
         });
         while pool.inner.admission.waiter_count() != 1 {
             tokio::task::yield_now().await;
@@ -2505,14 +2539,18 @@ mod tests {
         opening.abort();
         assert!(opening.await.unwrap_err().is_cancelled());
 
-        let replacement = tokio::spawn({
-            let pool = pool.clone();
-            async move { pool.checkout(OperationKind::Write).await }
-        });
-        tokio::task::yield_now().await;
-        assert!(!replacement.is_finished());
+        // The abandoned dial still holds a lifetime permit, so a replacement
+        // write multiplexes onto the held session instead of over-dialing.
+        let replacement = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            pool.checkout(OperationKind::Write),
+        )
+        .await
+        .expect("replacement multiplexes while the canceled open is pending")
+        .unwrap();
         assert_eq!(factory.dials(), 2);
         assert_eq!(factory.peak(), 2);
+        assert_eq!(pool.inner.shared.available_permits(), 0);
 
         factory.state.block_close.store(1, Ordering::SeqCst);
         factory.state.block_open_from.store(0, Ordering::SeqCst);
@@ -2524,18 +2562,24 @@ mod tests {
         .await
         .expect("abandoned opened session reaches blocked cleanup close");
         tokio::task::yield_now().await;
-        assert!(!replacement.is_finished());
         assert_eq!(factory.dials(), 2);
         assert_eq!(factory.live(), 2);
+        assert_eq!(
+            pool.inner.shared.available_permits(),
+            0,
+            "the abandoned session keeps its lifetime permit until its close finishes"
+        );
 
         factory.state.block_close.store(0, Ordering::SeqCst);
         factory.state.allow_close.notify_waiters();
-        let replacement = tokio::time::timeout(std::time::Duration::from_secs(1), replacement)
-            .await
-            .expect("replacement proceeds after abandoned open is closed")
-            .unwrap()
-            .unwrap();
-        assert_eq!(factory.dials(), 3);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while pool.inner.shared.available_permits() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("closing the abandoned session releases its lifetime permit");
+        assert_eq!(factory.live(), 1);
         assert_eq!(factory.peak(), 2);
         replacement.complete().await.unwrap();
         held.complete().await.unwrap();
@@ -3135,7 +3179,9 @@ mod tests {
     async fn shutdown_wakes_queued_checkout_and_drains_returned_active_session() {
         let factory = RecordingFactory::fully_capable();
         let pool = pool(factory.clone(), 1, 1, 1).await;
-        let held = pool.checkout(OperationKind::Read).await.unwrap();
+        // Hold the single write slot so the second write queues in admission
+        // instead of multiplexing onto the busy session.
+        let held = pool.checkout(OperationKind::Write).await.unwrap();
         let waiter = tokio::spawn({
             let pool = pool.clone();
             async move { pool.checkout(OperationKind::Write).await }
