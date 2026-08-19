@@ -908,7 +908,8 @@ impl TransportSession for SftpProtocolSession {
     }
 
     async fn close(&self, force: CancellationToken) -> Result<(), TransportError> {
-        self.closed.store(true, std::sync::atomic::Ordering::Release);
+        self.closed
+            .store(true, std::sync::atomic::Ordering::Release);
         let _ = self.sftp.close_session();
         let owner = self.owner.lock().unwrap().take();
         match owner {

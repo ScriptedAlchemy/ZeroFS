@@ -738,6 +738,10 @@ impl PoolInner {
 
     fn remove_from_roster(&self, session: &Arc<SharedSession>) {
         let mut roster = self.roster.lock().unwrap();
+        // Placement claims sessions while holding this same lock. Publish the
+        // broken state only after acquiring it so no checkout can pass the
+        // healthy-session filter and claim the session between these steps.
+        session.broken.store(true, Ordering::SeqCst);
         roster.retain(|entry| !Arc::ptr_eq(entry, session));
     }
 
@@ -1560,7 +1564,6 @@ impl SessionLease {
             .expect("lease always owns a session until retirement");
         // Marking the session broken removes it from placement; the close
         // itself happens once the last concurrent operation releases it.
-        session.broken.store(true, Ordering::SeqCst);
         let pool = self.pool.clone();
         if self.kind == OperationKind::Write {
             session.active_writes.fetch_sub(1, Ordering::SeqCst);
@@ -1618,7 +1621,7 @@ impl Drop for SessionLease {
         // A lease dropped without `complete` abandoned its operation mid
         // flight; the session's protocol state is ambiguous, so it must not
         // serve new operations.
-        session.broken.store(true, Ordering::SeqCst);
+        self.pool.remove_from_roster(&session);
         self.pool.release_session(&session, self.kind);
         drop(self.admission.take());
         drop(self.activity.take());
@@ -1834,8 +1837,7 @@ mod tests {
             }
         }
 
-        async fn close(
-            &self, _force: CancellationToken) -> Result<(), TransportError> {
+        async fn close(&self, _force: CancellationToken) -> Result<(), TransportError> {
             Ok(())
         }
     }
@@ -1880,8 +1882,7 @@ mod tests {
             }
         }
 
-        async fn close(
-            &self, force: CancellationToken) -> Result<(), TransportError> {
+        async fn close(&self, force: CancellationToken) -> Result<(), TransportError> {
             force.cancelled().await;
             self.state.force_seen.notify_one();
             self.state.allow_cleanup.notified().await;
@@ -1905,8 +1906,7 @@ mod tests {
             self.capabilities
         }
 
-        async fn close(
-            &self, _force: CancellationToken) -> Result<(), TransportError> {
+        async fn close(&self, _force: CancellationToken) -> Result<(), TransportError> {
             if self.state.block_close.load(Ordering::SeqCst) != 0 {
                 self.state
                     .close_started_count
@@ -1979,8 +1979,7 @@ mod tests {
             }
         }
 
-        async fn close(
-            &self, _force: CancellationToken) -> Result<(), TransportError> {
+        async fn close(&self, _force: CancellationToken) -> Result<(), TransportError> {
             Ok(())
         }
     }
@@ -2516,6 +2515,38 @@ mod tests {
             factory.dials(),
             1,
             "sessions released by multiplexed leases are reused"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retirement_marks_broken_only_while_removing_from_the_roster() {
+        let factory = RecordingFactory::fully_capable();
+        let pool = Arc::new(pool(factory, 1, 1, 1).await);
+        let lease = pool.checkout(OperationKind::Write).await.unwrap();
+        let session = lease.session.as_ref().unwrap().clone();
+        let roster = pool.inner.roster.lock().unwrap();
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let retiring = tokio::spawn(async move {
+            started_tx.send(()).unwrap();
+            lease.retire().await
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("retirement task started");
+        for _ in 0..100 {
+            if session.broken.load(Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        let published_before_removal = session.broken.load(Ordering::SeqCst);
+        drop(roster);
+        retiring.await.unwrap().unwrap();
+        assert!(
+            !published_before_removal,
+            "placement can claim a session while retirement has marked it broken but not removed it"
         );
     }
 
@@ -3323,7 +3354,7 @@ mod tests {
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
 
-        let mut session = OpenSshTransportSession::from_streams(stdin, stdout)
+        let session = OpenSshTransportSession::from_streams(stdin, stdout)
             .await
             .expect("complete the real SFTP extension handshake");
         assert_eq!(
@@ -3438,10 +3469,7 @@ mod tests {
             .await
             .unwrap();
         assert!(!root.path().join("object.bin").exists());
-        Box::new(session)
-            .close(CancellationToken::new())
-            .await
-            .unwrap();
+        session.close(CancellationToken::new()).await.unwrap();
         assert!(child.wait().await.unwrap().success());
     }
 }

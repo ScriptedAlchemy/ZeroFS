@@ -1650,10 +1650,7 @@ mod tests {
             }
         }
 
-        async fn ensure_directory_component(
-            &self,
-            _path: &FilePath,
-        ) -> Result<(), TransportError> {
+        async fn ensure_directory_component(&self, _path: &FilePath) -> Result<(), TransportError> {
             Ok(())
         }
 
@@ -1720,10 +1717,7 @@ mod tests {
             }
         }
 
-        async fn ensure_directory_component(
-            &self,
-            _path: &FilePath,
-        ) -> Result<(), TransportError> {
+        async fn ensure_directory_component(&self, _path: &FilePath) -> Result<(), TransportError> {
             Ok(())
         }
 
@@ -1744,11 +1738,7 @@ mod tests {
             Ok(())
         }
 
-        async fn hard_link(
-            &self,
-            _from: &FilePath,
-            _to: &FilePath,
-        ) -> Result<(), TransportError> {
+        async fn hard_link(&self, _from: &FilePath, _to: &FilePath) -> Result<(), TransportError> {
             Ok(())
         }
 
@@ -1853,10 +1843,7 @@ mod tests {
             }
         }
 
-        async fn ensure_directory_component(
-            &self,
-            _path: &FilePath,
-        ) -> Result<(), TransportError> {
+        async fn ensure_directory_component(&self, _path: &FilePath) -> Result<(), TransportError> {
             Ok(())
         }
 
@@ -1868,11 +1855,7 @@ mod tests {
             Ok(())
         }
 
-        async fn hard_link(
-            &self,
-            _from: &FilePath,
-            _to: &FilePath,
-        ) -> Result<(), TransportError> {
+        async fn hard_link(&self, _from: &FilePath, _to: &FilePath) -> Result<(), TransportError> {
             Ok(())
         }
 
@@ -2033,10 +2016,7 @@ mod tests {
             }
         }
 
-        async fn ensure_directory_component(
-            &self,
-            path: &FilePath,
-        ) -> Result<(), TransportError> {
+        async fn ensure_directory_component(&self, path: &FilePath) -> Result<(), TransportError> {
             for component in path.components() {
                 if !matches!(component, std::path::Component::Normal(_)) {
                     return Err(TransportError::Operation(format!(
@@ -2339,10 +2319,7 @@ mod tests {
             }
         }
 
-        async fn ensure_directory_component(
-            &self,
-            _path: &FilePath,
-        ) -> Result<(), TransportError> {
+        async fn ensure_directory_component(&self, _path: &FilePath) -> Result<(), TransportError> {
             Ok(())
         }
 
@@ -2354,11 +2331,7 @@ mod tests {
             Ok(())
         }
 
-        async fn hard_link(
-            &self,
-            _from: &FilePath,
-            _to: &FilePath,
-        ) -> Result<(), TransportError> {
+        async fn hard_link(&self, _from: &FilePath, _to: &FilePath) -> Result<(), TransportError> {
             Ok(())
         }
 
@@ -2570,10 +2543,7 @@ mod tests {
                 .ok_or_else(|| TransportError::NotFound(path.display().to_string()))
         }
 
-        async fn ensure_directory_component(
-            &self,
-            path: &FilePath,
-        ) -> Result<(), TransportError> {
+        async fn ensure_directory_component(&self, path: &FilePath) -> Result<(), TransportError> {
             self.0
                 .directories
                 .lock()
@@ -2610,11 +2580,7 @@ mod tests {
             Ok(bytes.slice(start..start + len))
         }
 
-        async fn hard_link(
-            &self,
-            from: &FilePath,
-            to: &FilePath,
-        ) -> Result<(), TransportError> {
+        async fn hard_link(&self, from: &FilePath, to: &FilePath) -> Result<(), TransportError> {
             let mut files = self.0.files.lock().unwrap();
             if files.contains_key(to) {
                 return Err(TransportError::Operation(format!(
@@ -2630,11 +2596,7 @@ mod tests {
             Ok(())
         }
 
-        async fn posix_rename(
-            &self,
-            from: &FilePath,
-            to: &FilePath,
-        ) -> Result<(), TransportError> {
+        async fn posix_rename(&self, from: &FilePath, to: &FilePath) -> Result<(), TransportError> {
             let mut files = self.0.files.lock().unwrap();
             let bytes = files
                 .remove(from)
@@ -2878,10 +2840,7 @@ mod tests {
             self.session.remove_file(path).await
         }
 
-        async fn ensure_directory_component(
-            &self,
-            path: &FilePath,
-        ) -> Result<(), TransportError> {
+        async fn ensure_directory_component(&self, path: &FilePath) -> Result<(), TransportError> {
             self.session.ensure_directory_component(path).await
         }
 
@@ -2922,19 +2881,11 @@ mod tests {
             self.session.read_exact(path, offset, len).await
         }
 
-        async fn hard_link(
-            &self,
-            from: &FilePath,
-            to: &FilePath,
-        ) -> Result<(), TransportError> {
+        async fn hard_link(&self, from: &FilePath, to: &FilePath) -> Result<(), TransportError> {
             self.session.hard_link(from, to).await
         }
 
-        async fn posix_rename(
-            &self,
-            from: &FilePath,
-            to: &FilePath,
-        ) -> Result<(), TransportError> {
+        async fn posix_rename(&self, from: &FilePath, to: &FilePath) -> Result<(), TransportError> {
             self.session.posix_rename(from, to).await
         }
 
