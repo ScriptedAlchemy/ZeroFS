@@ -13,16 +13,13 @@ use std::path::{Path, PathBuf};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::sync::CancellationToken;
 
-#[cfg(test)]
 use std::io;
-#[cfg(test)]
 use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio::io::ReadBuf;
+
 #[cfg(test)]
 use std::sync::atomic::Ordering;
-#[cfg(test)]
-use std::task::{Context, Poll};
-#[cfg(test)]
-use tokio::io::ReadBuf;
 
 /// russh-sftp 2.4 packet cap. Must match the SSH maximum packet size.
 pub const RUSSH_SFTP_MAX_PACKET_LEN: u32 = 256 * 1024;
@@ -305,13 +302,11 @@ fn map_sftp_close_error(path: &Path, error: russh_sftp::client::error::Error) ->
     TransportError::Close(format!("{}: {error}", path.display()))
 }
 
-#[cfg(test)]
-struct Duplex<R, W> {
-    reader: R,
-    writer: W,
+pub(crate) struct Duplex<R, W> {
+    pub(crate) reader: R,
+    pub(crate) writer: W,
 }
 
-#[cfg(test)]
 impl<R: AsyncRead + Unpin, W: Unpin> AsyncRead for Duplex<R, W> {
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -322,7 +317,6 @@ impl<R: AsyncRead + Unpin, W: Unpin> AsyncRead for Duplex<R, W> {
     }
 }
 
-#[cfg(test)]
 impl<R: Unpin, W: AsyncWrite + Unpin> AsyncWrite for Duplex<R, W> {
     fn poll_write(
         mut self: Pin<&mut Self>,

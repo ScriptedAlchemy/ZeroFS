@@ -192,7 +192,7 @@ pub enum SftpSshTransport {
     /// In-process russh client. Historical default when `transport` is omitted.
     #[default]
     Russh,
-    /// Pinned HPN-SSH `hpnssh` binary. The process backend lands in a later slice.
+    /// Pinned HPN-SSH `hpnssh` process transport.
     #[serde(rename = "hpn_openssh")]
     HpnOpenSsh,
 }
@@ -422,7 +422,7 @@ impl SftpConfig {
 
 const HPN_VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
-fn validate_pinned_hpn_program(program: &Path, expected_sha256: &str) -> Result<()> {
+pub(crate) fn validate_pinned_hpn_program(program: &Path, expected_sha256: &str) -> Result<()> {
     if !program.is_absolute() {
         anyhow::bail!("[sftp] hpn_program must be an absolute path to a pinned hpnssh executable");
     }
