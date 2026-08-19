@@ -286,6 +286,12 @@ impl RequestCache {
         lock(&self.inner.state).entries.len()
     }
 
+    /// Reject new identities while preserving already accepted/pending
+    /// entries so their canonical owners can publish terminal outcomes.
+    pub(crate) fn close(&self) {
+        lock(&self.inner.state).closed = true;
+    }
+
     pub(crate) fn lookup_or_reserve(
         &self,
         identity: RequestIdentity,
@@ -700,6 +706,31 @@ mod tests {
                 .unwrap(),
             RequestLookup::Backpressured
         ));
+    }
+
+    #[tokio::test]
+    async fn close_rejects_new_requests_and_preserves_pending_completion() {
+        let cache = RequestCache::new(2);
+        let identity = nbd(1);
+        let pending = expect_vacant(
+            cache
+                .lookup_or_reserve(
+                    identity.clone(),
+                    fingerprint(1),
+                    RequestLifetime::InFlightOnly,
+                )
+                .unwrap(),
+        )
+        .begin_pending();
+        let retained = pending.retained();
+        cache.close();
+        assert!(matches!(
+            cache.lookup_or_reserve(nbd(2), fingerprint(2), RequestLifetime::InFlightOnly),
+            Err(super::RequestCacheError::Closed)
+        ));
+        cache.complete(pending.accept(), Ok(result()));
+        assert_eq!(retained.wait().await.unwrap().members[0].0, 1);
+        assert_eq!(cache.used_slots(), 0);
     }
 
     #[test]

@@ -136,6 +136,9 @@ pub struct ZeroFS {
     pub(crate) mutation_coordinator: std::sync::Arc<
         std::sync::OnceLock<std::sync::Arc<crate::fs::mutation::fence::MutationCoordinator>>,
     >,
+    /// Bounded replay/collision cache for identified writes when volatile
+    /// acknowledgement is disabled and no mutation coordinator exists.
+    pub(crate) materialized_request_cache: crate::fs::mutation::request_cache::RequestCache,
     /// Durability lineage token (see `client_fsync_verified`). Identifies the current
     /// unbroken durable lineage; set once at bring-up, constant for this process's life.
     /// A ZeroFS client carries it, and a verified fsync succeeds only while it is

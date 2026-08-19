@@ -175,7 +175,7 @@ async fn stop_server(
     shutdown: CancellationToken,
     server_task: tokio::task::JoinHandle<std::io::Result<()>>,
     fs: &ZeroFS,
-) {
+) -> Result<(), crate::fs::errors::FsError> {
     drop(client);
     shutdown.cancel();
     tokio::time::timeout(Duration::from_secs(2), server_task)
@@ -184,8 +184,9 @@ async fn stop_server(
         .expect("9P server task panicked")
         .expect("9P server failed");
     fs.stop_new_mutation_admission();
-    fs.stop_mutation_workers().await;
+    let mutation_result = fs.stop_mutation_workers().await;
     fs.flush_coordinator.close().await.unwrap();
+    mutation_result
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -242,7 +243,9 @@ async fn standard_framed_writes_without_operation_ids_do_not_collapse() {
     assert_eq!(response_tags, [20, 21]);
     wait_for_slots(&request_cache, 0).await;
 
-    stop_server(client, shutdown, server_task, &fs).await;
+    stop_server(client, shutdown, server_task, &fs)
+        .await
+        .unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -303,7 +306,9 @@ async fn private_framed_writes_use_full_operation_id_width() {
     response_tags.sort_unstable();
     assert_eq!(response_tags, [20, 21]);
     wait_for_slots(&request_cache, 0).await;
-    stop_server(client, shutdown, server_task, &fs).await;
+    stop_server(client, shutdown, server_task, &fs)
+        .await
+        .unwrap();
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -419,7 +424,9 @@ async fn private_framed_reconnect_retry_replays_typed_write_result() {
                 .accepted_batch_count(),
             accepted_before_retry
         );
-        stop_server(retry, shutdown, server_task, &fs).await;
+        stop_server(retry, shutdown, server_task, &fs)
+            .await
+            .unwrap();
         request_cache
     };
     assert_eq!(request_cache.used_slots(), 0);
@@ -527,7 +534,9 @@ async fn private_materialized_first_retry_and_collision_share_typed_metadata() {
         .await
         .unwrap();
     assert_eq!(canonical, Bytes::from_static(payload));
-    stop_server(client, shutdown, server_task, &fs).await;
+    stop_server(client, shutdown, server_task, &fs)
+        .await
+        .unwrap();
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -689,7 +698,9 @@ async fn materialized_write_metadata_survives_caller_cancellation_after_submit()
         .await;
     let collision = client.receive().await;
     assert!(matches!(collision.body, Message::Rlerror(_)));
-    stop_server(client, shutdown, server_task, &fs).await;
+    stop_server(client, shutdown, server_task, &fs)
+        .await
+        .unwrap();
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -793,5 +804,8 @@ async fn framed_fast_materializer_failure_cannot_publish_applied_fallback() {
         "generic handler fallback replaced the retracted write"
     );
 
-    stop_server(client, shutdown, server_task, &fs).await;
+    assert!(matches!(
+        stop_server(client, shutdown, server_task, &fs).await,
+        Err(crate::fs::errors::FsError::IoError)
+    ));
 }

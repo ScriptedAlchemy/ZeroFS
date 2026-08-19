@@ -13,6 +13,7 @@
 
 mod compact;
 mod inflight;
+pub(crate) use inflight::InflightWriteGuard;
 #[cfg(test)]
 mod perf_harness;
 mod read;

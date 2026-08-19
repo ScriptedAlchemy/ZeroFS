@@ -259,6 +259,9 @@ impl ZeroFS {
             volatile_overlay: std::sync::Arc::new(std::sync::OnceLock::new()),
             materializer: std::sync::Arc::new(std::sync::OnceLock::new()),
             mutation_coordinator: std::sync::Arc::new(std::sync::OnceLock::new()),
+            materialized_request_cache: crate::fs::mutation::request_cache::RequestCache::new(
+                crate::fs::mutation::config::DEFAULT_VOLATILE_MAX_OPERATIONS,
+            ),
             lineage_token,
             serving_writer_epoch,
             max_bytes,
@@ -321,6 +324,7 @@ impl ZeroFS {
 
     /// Reject new mutation admission. Used by the sole shutdown owner.
     pub(crate) fn stop_new_mutation_admission(&self) {
+        self.materialized_request_cache.close();
         if let Some(coordinator) = self.mutation_coordinator.get() {
             coordinator.gate().poison("server shutting down");
         }
@@ -365,13 +369,20 @@ impl ZeroFS {
         Ok(())
     }
 
-    pub(crate) async fn stop_mutation_workers(&self) {
+    pub(crate) async fn stop_mutation_workers(&self) -> Result<(), crate::fs::errors::FsError> {
         if let Some(materializer) = self.materializer.get() {
             materializer.stop().await;
         }
         if let Some(overlay) = self.volatile_overlay.get() {
-            let _ = overlay.shutdown().await;
+            overlay
+                .shutdown()
+                .await
+                .map_err(|_| crate::fs::errors::FsError::IoError)?;
         }
+        // A disconnected materialized protocol call may already have queued a
+        // canonical commit. Drain those worker-owned requests before shutdown
+        // acquires the flush barrier and seals/closes the database.
+        self.write_coordinator.barrier().await
     }
 
     /// Client durability barrier (9P `Tfsync`, NFS COMMIT, NBD flush). A no-op when
@@ -549,7 +560,7 @@ mod tests {
         let cutoff = fs.capture_mutation_cutoff();
         assert_eq!(cutoff.sequence, 0);
         fs.materialize_through_cutoff(cutoff).await.unwrap();
-        fs.stop_mutation_workers().await;
+        fs.stop_mutation_workers().await.unwrap();
     }
 
     #[tokio::test]

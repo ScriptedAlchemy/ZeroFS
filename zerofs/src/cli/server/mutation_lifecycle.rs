@@ -34,12 +34,12 @@ pub(crate) enum ShutdownPhase {
     DrainDispatched,
     CloseAdmission,
     Materialize,
+    StopMutation,
     AcquireBarrier,
     CloseDatabase,
     CaptureObjects,
     ReleaseBarrier,
     WaitTarget,
-    StopMutation,
     StopWriteback,
     StopSftp,
     Complete,
@@ -269,6 +269,8 @@ impl MutationLifecycle {
         (self.owners.materialize)(mutation_cutoff)
             .await
             .map_err(|error| annotate(error, ShutdownPhase::Materialize))?;
+        self.run_step(ShutdownPhase::StopMutation, &self.owners.stop_mutation)
+            .await?;
         self.set_phase(ShutdownPhase::AcquireBarrier);
         let barrier = (self.owners.acquire_barrier)()
             .await
@@ -283,8 +285,6 @@ impl MutationLifecycle {
         (self.owners.wait_target)(object_coverage, target)
             .await
             .map_err(|error| annotate(error, ShutdownPhase::WaitTarget))?;
-        self.run_step(ShutdownPhase::StopMutation, &self.owners.stop_mutation)
-            .await?;
         self.run_step(ShutdownPhase::StopWriteback, &self.owners.stop_writeback)
             .await?;
         self.run_step(ShutdownPhase::StopSftp, &self.owners.stop_sftp)
@@ -406,8 +406,9 @@ impl LifecycleOwners {
                 Arc::new(move || {
                     let fs = Arc::clone(&fs);
                     Box::pin(async move {
-                        fs.stop_mutation_workers().await;
-                        Ok(())
+                        fs.stop_mutation_workers().await.map_err(|error| {
+                            ShutdownError::failed(ShutdownPhase::StopMutation, error)
+                        })
                     })
                 })
             },
@@ -570,6 +571,10 @@ fn blocked_step(
         })
     })
 }
+
+#[cfg(test)]
+#[path = "mutation_lifecycle_materialized_tests.rs"]
+mod materialized_tests;
 
 #[cfg(test)]
 mod tests {
@@ -835,6 +840,17 @@ mod tests {
             "{order:?}"
         );
         assert!(pos(&order, "writeback") < pos(&order, "sftp"), "{order:?}");
+    }
+
+    #[tokio::test]
+    async fn close_drains_mutation_workers_before_acquiring_database_barrier() {
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let _receipt = close_ok(owners_with(&order)).await;
+        let order = order.lock().expect("order");
+        assert!(
+            pos(&order, "mutation") < pos(&order, "barrier"),
+            "{order:?}"
+        );
     }
 
     #[tokio::test]

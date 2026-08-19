@@ -57,11 +57,9 @@ pub(crate) struct PreparedWriteBatch {
     pub(crate) members: Vec<PreparedWriteMember>,
     pub(crate) replayed: Option<PreparedBatchResult>,
     pub(crate) guards: Option<MultiLockGuard<InodeId>>,
-    /// Protocol replay metadata staged before canonical application. Once the
-    /// transaction is queued, ownership moves into the commit worker so
-    /// canceling the caller cannot erase metadata for a commit that still
-    /// completes.
-    pub(crate) pending_write_request: Option<crate::dedup::PendingWriteRequest>,
+    /// Protocol replay ownership. Before submission it remains caller-owned;
+    /// submission transfers the one typed owner into the canonical worker.
+    pub(crate) commit_ownership: crate::fs::write_coordinator::CommitOwnership,
 }
 
 /// One result boundary for the whole batch.
@@ -79,7 +77,7 @@ impl PreparedWriteBatch {
             members: Vec::new(),
             replayed: Some(result),
             guards: None,
-            pending_write_request: None,
+            commit_ownership: crate::fs::write_coordinator::CommitOwnership::None,
         }
     }
 

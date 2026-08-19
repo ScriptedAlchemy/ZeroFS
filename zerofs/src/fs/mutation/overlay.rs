@@ -898,6 +898,24 @@ impl ZeroFS {
             None
         };
         let Some(overlay) = self.volatile_overlay.get().cloned() else {
+            if matches!(&identity, RequestIdentity::Nfs { .. }) {
+                return self
+                    .write_materialized_nfs_identified(
+                        IdentifiedWrite {
+                            auth,
+                            id,
+                            offset,
+                            data,
+                            op_id,
+                            check_permissions,
+                            identity,
+                            request_lifetime,
+                            fingerprint_context,
+                        },
+                        fingerprint,
+                    )
+                    .await;
+            }
             if replay_count.is_some()
                 && matches!(
                     self.dedup.replay_write(&op_id, fingerprint.into_bytes()),
