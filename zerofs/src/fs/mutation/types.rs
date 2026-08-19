@@ -145,3 +145,75 @@ pub(crate) enum RequestLifetime {
     InFlightOnly,
     OneShot,
 }
+
+/// Terminal vocabulary shared by raw admission, preparation quiescence, and
+/// materialization progress.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum MutationError {
+    #[error("mutation coordinator is closed")]
+    Closed,
+    #[error("mutation coordinator is poisoned: {0}")]
+    Poisoned(String),
+    #[error("mutation requires {requested} bytes but the volatile budget is {capacity} bytes")]
+    TooLarge { requested: u64, capacity: u64 },
+    #[error("mutation cutoff belongs to a stale mutation incarnation")]
+    StaleIncarnation,
+}
+
+/// Canonical conflict unit counted by the preparation gate. Directory
+/// membership conflicts are distinct from the directory inode's own
+/// attribute conflicts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) enum ConflictKey {
+    Inode(InodeId),
+    Directory(InodeId),
+}
+
+/// The set of conflict keys one preparation touches.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ConflictScope(std::collections::BTreeSet<ConflictKey>);
+
+impl ConflictScope {
+    pub(crate) fn new(keys: impl IntoIterator<Item = ConflictKey>) -> Self {
+        Self(keys.into_iter().collect())
+    }
+
+    pub(crate) fn single(key: ConflictKey) -> Self {
+        Self::new([key])
+    }
+
+    pub(crate) fn keys(&self) -> impl Iterator<Item = ConflictKey> + '_ {
+        self.0.iter().copied()
+    }
+}
+
+/// One boot of the mutation coordinator. Sequences from different
+/// incarnations are never comparable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct MutationIncarnation(uuid::Uuid);
+
+impl MutationIncarnation {
+    pub(crate) fn new() -> Self {
+        Self(uuid::Uuid::new_v4())
+    }
+
+    pub(crate) fn as_uuid(self) -> uuid::Uuid {
+        self.0
+    }
+}
+
+/// A published mutation position: incarnation plus assigned sequence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MutationCutoff {
+    pub(crate) mutation_incarnation: MutationIncarnation,
+    pub(crate) sequence: u64,
+}
+
+/// Cutoffs are ordered only within one incarnation; comparing across
+/// incarnations yields no ordering rather than a fabricated one.
+impl PartialOrd for MutationCutoff {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        (self.mutation_incarnation == other.mutation_incarnation)
+            .then(|| self.sequence.cmp(&other.sequence))
+    }
+}
