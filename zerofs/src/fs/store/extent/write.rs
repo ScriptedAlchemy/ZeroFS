@@ -288,8 +288,12 @@ impl Reservation {
         limits: SegmentFormatLimits,
     ) -> Result<Self, crate::segment::SegmentError> {
         let segid = open.segid;
+        let final_frame_count = open.dir.len().checked_add(frames.len()).ok_or(
+            crate::segment::SegmentError::Malformed("segment frame count"),
+        )?;
         let first_frame =
             crate::segment::checked_frame_run_start(open.dir.len(), frames.len(), limits)?;
+        crate::segment::checked_directory_plaintext_len(final_frame_count, limits)?;
         let mut offset = u64::try_from(open.buf.len())
             .map_err(|_| crate::segment::SegmentError::Malformed("segment byte offset"))?;
         let mut offsets = Vec::new();
@@ -1518,14 +1522,45 @@ mod tests {
         let err = Reservation::claim_with_limits(
             &mut open,
             1,
-            &[(1, 5)],
-            crate::segment::SegmentFormatLimits::with_u32_max(8),
+            &[(1, 57)],
+            crate::segment::SegmentFormatLimits::with_u32_max(60),
         )
         .unwrap_err();
 
         assert!(matches!(
             err,
             crate::segment::SegmentError::Malformed("stored frame length")
+        ));
+        assert_eq!(open.buf, before_buf);
+        assert_eq!(open.dir, before_dir);
+    }
+
+    #[test]
+    fn reservation_rejects_unrepresentable_directory_without_mutating_open_segment() {
+        let mut open = OpenSegment {
+            segid: Segid::new(7, 9),
+            buf: vec![4, 0, 0, 0, 1, 2, 3, 4],
+            dir: vec![DirEntry {
+                byte_offset: 0,
+                len: 4,
+                inode: 1,
+                extent: 0,
+            }],
+        };
+        let before_buf = open.buf.clone();
+        let before_dir = open.dir.clone();
+
+        let err = Reservation::claim_with_limits(
+            &mut open,
+            1,
+            &[(1, 46)],
+            crate::segment::SegmentFormatLimits::with_u32_max(50),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            crate::segment::SegmentError::Malformed("directory plaintext length")
         ));
         assert_eq!(open.buf, before_buf);
         assert_eq!(open.dir, before_dir);

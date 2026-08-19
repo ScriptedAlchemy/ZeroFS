@@ -378,6 +378,12 @@ impl<'a> SegmentBuilder<'a> {
         sealed: &[u8],
     ) -> Result<u32, SegmentError> {
         let frame_index = checked_append_frame_index(self.dir.len(), self.limits)?;
+        let final_frame_count = self
+            .dir
+            .len()
+            .checked_add(1)
+            .ok_or(SegmentError::Malformed("segment frame count"))?;
+        checked_directory_plaintext_len(final_frame_count, self.limits)?;
         let len = checked_frame_body_len(sealed.len(), self.limits)?;
         let byte_offset = u64::try_from(self.buf.len())
             .map_err(|_| SegmentError::Malformed("segment byte offset"))?;
@@ -1004,27 +1010,60 @@ mod tests {
     #[test]
     fn builder_rejects_unrepresentable_frame_without_mutation() {
         let c = codec();
-        let mut builder =
-            SegmentBuilder::with_limits(&c, Segid::new(1, 1), SegmentFormatLimits::with_u32_max(8));
+        let mut builder = SegmentBuilder::with_limits(
+            &c,
+            Segid::new(1, 1),
+            SegmentFormatLimits::with_u32_max(60),
+        );
 
         assert_eq!(builder.append_sealed(1, 0, &[1; 4]), 0);
         let before_buf = builder.buf.clone();
         let before_dir = builder.dir.clone();
         assert!(matches!(
-            builder.try_append_sealed(1, 1, &[2; 5]),
+            builder.try_append_sealed(1, 1, &[2; 57]),
             Err(SegmentError::Malformed("stored frame length"))
         ));
         assert_eq!(builder.buf, before_buf);
         assert_eq!(builder.dir, before_dir);
 
-        for extent in 1..8 {
-            builder.append_sealed(1, extent, &[]);
-        }
+        let mut builder =
+            SegmentBuilder::with_limits(&c, Segid::new(1, 2), SegmentFormatLimits::with_u32_max(8));
+        builder.dir.resize(
+            8,
+            DirEntry {
+                byte_offset: 0,
+                len: 0,
+                inode: 1,
+                extent: 0,
+            },
+        );
         let before_buf = builder.buf.clone();
         let before_dir = builder.dir.clone();
         assert!(matches!(
             builder.try_append_sealed(1, 8, &[]),
             Err(SegmentError::Malformed("segment frame count"))
+        ));
+        assert_eq!(builder.buf, before_buf);
+        assert_eq!(builder.dir, before_dir);
+    }
+
+    #[test]
+    fn builder_rejects_unrepresentable_directory_before_mutation() {
+        let c = codec();
+        let mut builder = SegmentBuilder::with_limits(
+            &c,
+            Segid::new(1, 1),
+            SegmentFormatLimits::with_u32_max(50),
+        );
+        builder.try_append_sealed(1, 0, &[1; 4]).unwrap();
+        let before_buf = builder.buf.clone();
+        let before_dir = builder.dir.clone();
+
+        let err = builder.try_append_sealed(1, 1, &[2; 46]).unwrap_err();
+
+        assert!(matches!(
+            err,
+            SegmentError::Malformed("directory plaintext length")
         ));
         assert_eq!(builder.buf, before_buf);
         assert_eq!(builder.dir, before_dir);
