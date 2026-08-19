@@ -8,6 +8,7 @@ use fp::fail_point;
 use crate::dedup::DedupResult;
 use crate::fs::errors::FsError;
 use crate::fs::inode::{Inode, InodeAttrs, InodeId};
+use crate::fs::mutation::types::{ConflictKey, ConflictScope};
 use crate::fs::permissions::{AccessMode, Credentials, check_access, check_sticky_bit_delete};
 use crate::fs::tracing::FileOperation;
 use crate::fs::types::AuthContext;
@@ -190,6 +191,17 @@ impl ZeroFS {
             all_inodes_to_lock.push(target_id);
         }
 
+        let mut fence_keys = vec![
+            ConflictKey::Directory(from_dirid),
+            ConflictKey::Inode(source_inode_id),
+        ];
+        if from_dirid != to_dirid {
+            fence_keys.push(ConflictKey::Directory(to_dirid));
+        }
+        if let Some(target_id) = target_inode_id {
+            fence_keys.push(ConflictKey::Inode(target_id));
+        }
+        let _fence = self.fence_metadata(ConflictScope::new(fence_keys)).await?;
         let _guards = self.lock_manager.acquire_multi(all_inodes_to_lock).await;
 
         // Recheck replay state after waiting for inode locks.
@@ -1509,6 +1521,56 @@ mod tests {
         assert_eq!(
             directory_mutation_state(&fs.inode_store.get(to_dirid).await.unwrap()),
             to_dir_state
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_write_drains_before_rename_without_holding_canonical_lock() {
+        use crate::fs::mutation::types::{ConflictKey, ConflictScope};
+        use std::sync::Arc;
+
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        fs.start_materializer();
+        let (file_id, _) = fs
+            .create(
+                &test_creds(),
+                0,
+                b"fenced-src.txt",
+                &SetAttributes::default(),
+            )
+            .await
+            .unwrap();
+
+        fs.assert_pending_write_drains_without_canonical_lock(
+            ConflictScope::new([ConflictKey::Directory(0), ConflictKey::Inode(file_id)]),
+            file_id,
+            {
+                let fs = Arc::clone(&fs);
+                async move {
+                    fs.rename(
+                        &(&test_auth()).into(),
+                        0,
+                        b"fenced-src.txt",
+                        0,
+                        b"fenced-dst.txt",
+                    )
+                    .await
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            !fs.directory_store
+                .exists(0, b"fenced-src.txt")
+                .await
+                .unwrap()
+        );
+        assert!(
+            fs.directory_store
+                .exists(0, b"fenced-dst.txt")
+                .await
+                .unwrap()
         );
     }
 }

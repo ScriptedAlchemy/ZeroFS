@@ -3,14 +3,20 @@
 //! The local journaler and the remote scheduler both publish the same progress
 //! shape over a `tokio::sync::watch` channel and wait on it with the same loop;
 //! only the error vocabulary differs, and that is supplied by [`BarrierError`].
+//!
+//! Every wait is bound to the publisher's journal incarnation. A sequence
+//! number from a previous incarnation can never complete against a later one.
 
 use crate::writeback::model::Sequence;
 use std::marker::PhantomData;
 use tokio::sync::watch;
+use uuid::Uuid;
 
 /// Durability progress published by one writeback stage.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SequenceProgress {
+    /// Journal incarnation that owns `sequence`.
+    pub(crate) incarnation: Uuid,
     /// Highest sequence that is durable at this stage.
     pub(crate) sequence: Sequence,
     /// Set once the stage fails terminally; never cleared afterwards.
@@ -25,6 +31,8 @@ pub(crate) trait BarrierError {
     fn closed() -> Self;
     /// The stage failed terminally with `error`.
     fn terminal(error: String) -> Self;
+    /// The caller asked about a different journal incarnation than the publisher.
+    fn stale_incarnation() -> Self;
 }
 
 /// A durability barrier over a stage's published [`SequenceProgress`].
@@ -71,11 +79,14 @@ impl<E: BarrierError> SequenceBarrier<E> {
         self.current_terminal().unwrap_or_else(E::closed)
     }
 
-    /// Wait until `sequence` is durable at this stage.
-    pub(crate) async fn wait(&self, sequence: Sequence) -> Result<(), E> {
+    /// Wait until `sequence` is durable in `incarnation`.
+    pub(crate) async fn wait(&self, incarnation: Uuid, sequence: Sequence) -> Result<(), E> {
         let mut progress = self.progress.clone();
         loop {
             let state = progress.borrow().clone();
+            if state.incarnation != incarnation {
+                return Err(E::stale_incarnation());
+            }
             if state.sequence >= sequence {
                 return Ok(());
             }
@@ -87,5 +98,85 @@ impl<E: BarrierError> SequenceBarrier<E> {
             }
             progress.changed().await.map_err(|_| E::closed())?;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BarrierError, SequenceBarrier, SequenceProgress};
+    use tokio::sync::watch;
+    use uuid::Uuid;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum TestError {
+        Closed,
+        Terminal(String),
+        StaleIncarnation,
+    }
+
+    impl BarrierError for TestError {
+        fn closed() -> Self {
+            Self::Closed
+        }
+
+        fn terminal(error: String) -> Self {
+            Self::Terminal(error)
+        }
+
+        fn stale_incarnation() -> Self {
+            Self::StaleIncarnation
+        }
+    }
+
+    fn progress(incarnation: Uuid, sequence: u64) -> SequenceProgress {
+        SequenceProgress {
+            incarnation,
+            sequence,
+            terminal_error: None,
+            closed: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_rejects_a_stale_incarnation() {
+        let incarnation = Uuid::from_u128(1);
+        let (sender, receiver) = watch::channel(progress(incarnation, 4));
+        let barrier = SequenceBarrier::<TestError>::new(receiver);
+
+        let error = barrier.wait(Uuid::from_u128(2), 1).await.unwrap_err();
+        assert_eq!(error, TestError::StaleIncarnation);
+
+        sender.send_modify(|state| state.sequence = 8);
+        let error = barrier.wait(Uuid::from_u128(2), 8).await.unwrap_err();
+        assert_eq!(error, TestError::StaleIncarnation);
+    }
+
+    #[tokio::test]
+    async fn wait_accepts_the_current_incarnation() {
+        let incarnation = Uuid::from_u128(7);
+        let (sender, receiver) = watch::channel(progress(incarnation, 0));
+        let barrier = SequenceBarrier::<TestError>::new(receiver);
+        sender.send_modify(|state| state.sequence = 3);
+        barrier.wait(incarnation, 3).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn wait_fails_when_the_publisher_rotates_incarnation() {
+        let first = Uuid::from_u128(1);
+        let (sender, receiver) = watch::channel(progress(first, 2));
+        let barrier = SequenceBarrier::<TestError>::new(receiver);
+        let waiter = tokio::spawn({
+            let barrier = barrier.clone();
+            async move { barrier.wait(first, 9).await }
+        });
+        tokio::task::yield_now().await;
+        sender.send_modify(|state| {
+            state.incarnation = Uuid::from_u128(2);
+            state.sequence = 9;
+        });
+        assert_eq!(
+            waiter.await.unwrap().unwrap_err(),
+            TestError::StaleIncarnation
+        );
     }
 }

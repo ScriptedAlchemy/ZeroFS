@@ -1,4 +1,4 @@
-use crate::writeback::admission::{AcceptedAdmission, Admission, DiskPermit};
+use crate::writeback::admission::{AcceptedAdmission, Admission};
 use crate::writeback::barrier::{BarrierError, SequenceBarrier, SequenceProgress};
 use crate::writeback::journal::{Journal, PreparedMutation, StagedBatch};
 use crate::writeback::model::{MutationRecord, Sequence};
@@ -6,7 +6,7 @@ use crate::writeback::payload::VerifiedPayload;
 use crate::writeback::reservation::{
     CommittedSsdReservation, ReservationError, SsdReservationToken, commit_batch_local,
 };
-use crate::writeback::space_sample::PhysicalSpaceSample;
+use crate::writeback::space_sample::{PhysicalSpaceSample, PhysicalSpaceSampler};
 use anyhow::Result as AnyResult;
 use bytes::Bytes;
 use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
@@ -45,6 +45,8 @@ pub enum LocalBarrierError {
     Closed,
     #[error("local writeback durability failed: {0}")]
     LocalDurability(String),
+    #[error("local writeback journal incarnation is stale")]
+    StaleIncarnation,
 }
 
 impl BarrierError for LocalBarrierError {
@@ -55,11 +57,16 @@ impl BarrierError for LocalBarrierError {
     fn terminal(error: String) -> Self {
         Self::LocalDurability(error)
     }
+
+    fn stale_incarnation() -> Self {
+        Self::StaleIncarnation
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct LocalBarrier {
     progress: SequenceBarrier<LocalBarrierError>,
+    incarnation: uuid::Uuid,
 }
 
 impl LocalBarrier {
@@ -67,8 +74,12 @@ impl LocalBarrier {
         self.progress.sequence()
     }
 
+    pub fn incarnation(&self) -> uuid::Uuid {
+        self.incarnation
+    }
+
     pub async fn wait_local(&self, sequence: Sequence) -> Result<(), LocalBarrierError> {
-        self.progress.wait(sequence).await
+        self.progress.wait(self.incarnation, sequence).await
     }
 }
 
@@ -237,6 +248,7 @@ struct LocalJournalerInner {
 struct LocalJournalerOwnership {
     admission: Admission,
     retained_ram: Arc<StdMutex<Vec<AcceptedAdmission>>>,
+    space: Option<Arc<PhysicalSpaceSampler>>,
 }
 
 enum JournalCommand {
@@ -244,7 +256,7 @@ enum JournalCommand {
         record: Box<MutationRecord>,
         payload: Option<VerifiedPayload>,
         ram: Option<AcceptedAdmission>,
-        disk: Option<DiskPermit>,
+        disk: Option<SsdReservationToken>,
     },
     Shutdown(oneshot::Sender<()>),
 }
@@ -280,14 +292,37 @@ impl LocalJournaler {
         prepare_concurrency: usize,
         observer: Option<Arc<dyn LocalCommitObserver>>,
     ) -> AnyResult<Self> {
-        let local_sequence = journal.progress()?.local_seq;
-        Ok(Self::start_with_sink_and_observer(
+        let snapshot = journal.snapshot()?;
+        Ok(Self::start_with_sink_observer_space(
             journal,
             admission,
-            local_sequence,
+            snapshot.local_seq,
+            snapshot.incarnation,
             queue_depth,
             prepare_concurrency,
             observer,
+            None,
+        ))
+    }
+
+    pub(crate) fn start_with_observer_and_space(
+        journal: Arc<Journal>,
+        admission: Admission,
+        queue_depth: usize,
+        prepare_concurrency: usize,
+        observer: Option<Arc<dyn LocalCommitObserver>>,
+        space: Arc<PhysicalSpaceSampler>,
+    ) -> AnyResult<Self> {
+        let snapshot = journal.snapshot()?;
+        Ok(Self::start_with_sink_observer_space(
+            journal,
+            admission,
+            snapshot.local_seq,
+            snapshot.incarnation,
+            queue_depth,
+            prepare_concurrency,
+            observer,
+            Some(space),
         ))
     }
 
@@ -302,6 +337,7 @@ impl LocalJournaler {
             sink,
             admission,
             local_sequence,
+            uuid::Uuid::nil(),
             queue_depth,
             DEFAULT_LOCAL_PREPARE_CONCURRENCY,
             None,
@@ -312,12 +348,36 @@ impl LocalJournaler {
         sink: Arc<dyn LocalJournalSink>,
         admission: Admission,
         local_sequence: Sequence,
+        incarnation: uuid::Uuid,
         queue_depth: usize,
         prepare_concurrency: usize,
         observer: Option<Arc<dyn LocalCommitObserver>>,
     ) -> Self {
+        Self::start_with_sink_observer_space(
+            sink,
+            admission,
+            local_sequence,
+            incarnation,
+            queue_depth,
+            prepare_concurrency,
+            observer,
+            None,
+        )
+    }
+
+    fn start_with_sink_observer_space(
+        sink: Arc<dyn LocalJournalSink>,
+        admission: Admission,
+        local_sequence: Sequence,
+        incarnation: uuid::Uuid,
+        queue_depth: usize,
+        prepare_concurrency: usize,
+        observer: Option<Arc<dyn LocalCommitObserver>>,
+        space: Option<Arc<PhysicalSpaceSampler>>,
+    ) -> Self {
         let (sender, receiver) = mpsc::channel(queue_depth.max(1));
         let (progress_sender, progress) = watch::channel(SequenceProgress {
+            incarnation,
             sequence: local_sequence,
             terminal_error: None,
             closed: false,
@@ -334,6 +394,7 @@ impl LocalJournaler {
             LocalJournalerOwnership {
                 admission,
                 retained_ram: retained_ram.clone(),
+                space,
             },
         ));
         Self {
@@ -341,6 +402,7 @@ impl LocalJournaler {
                 sender,
                 barrier: LocalBarrier {
                     progress: SequenceBarrier::new(progress),
+                    incarnation,
                 },
                 admission_gate: Mutex::new(()),
                 closed: AtomicBool::new(false),
@@ -374,12 +436,12 @@ impl LocalJournaler {
         self.submit(record, Some(payload), Some(ram), None).await
     }
 
-    pub async fn submit_put_with_disk(
+    pub(crate) async fn submit_put_with_disk(
         &self,
         record: MutationRecord,
         payload: Bytes,
         ram: AcceptedAdmission,
-        disk: DiskPermit,
+        disk: SsdReservationToken,
     ) -> Result<LocalBarrier, LocalBarrierError> {
         self.submit_verified_put_with_disk(record, VerifiedPayload::new(payload), ram, disk)
             .await
@@ -390,16 +452,16 @@ impl LocalJournaler {
         record: MutationRecord,
         payload: VerifiedPayload,
         ram: AcceptedAdmission,
-        disk: DiskPermit,
+        disk: SsdReservationToken,
     ) -> Result<LocalBarrier, LocalBarrierError> {
         self.submit(record, Some(payload), Some(ram), Some(disk))
             .await
     }
 
-    pub async fn submit_metadata_with_disk(
+    pub(crate) async fn submit_metadata_with_disk(
         &self,
         record: MutationRecord,
-        disk: DiskPermit,
+        disk: SsdReservationToken,
     ) -> Result<LocalBarrier, LocalBarrierError> {
         self.submit(record, None, None, Some(disk)).await
     }
@@ -409,7 +471,7 @@ impl LocalJournaler {
         record: MutationRecord,
         payload: Option<VerifiedPayload>,
         ram: Option<AcceptedAdmission>,
-        disk: Option<DiskPermit>,
+        disk: Option<SsdReservationToken>,
     ) -> Result<LocalBarrier, LocalBarrierError> {
         let _gate = self.inner.admission_gate.lock().await;
         if self.inner.closed.load(Ordering::Acquire) {
@@ -452,7 +514,7 @@ impl LocalJournaler {
         record: MutationRecord,
         payload: Option<VerifiedPayload>,
         ram: Option<AcceptedAdmission>,
-        disk: Option<DiskPermit>,
+        disk: Option<SsdReservationToken>,
     ) -> Result<LocalBarrier, LocalBarrierError> {
         let _gate = self.inner.admission_gate.lock().await;
         if self.inner.closed.load(Ordering::Acquire) {
@@ -541,12 +603,12 @@ type Preparation = (
     Sequence,
     AnyResult<PreparedMutation>,
     Option<AcceptedAdmission>,
-    Option<DiskPermit>,
+    Option<SsdReservationToken>,
 );
 type PreparedEntry = (
     AnyResult<PreparedMutation>,
     Option<AcceptedAdmission>,
-    Option<DiskPermit>,
+    Option<SsdReservationToken>,
 );
 
 /// Files a finished preparation, returning a terminal error if its task died.
@@ -612,7 +674,7 @@ fn accept_journal_command(
 }
 
 /// The admission permits a batch owns, released when it commits.
-type BatchOwnership = Vec<(Sequence, Option<AcceptedAdmission>, Option<DiskPermit>)>;
+type BatchOwnership = Vec<(Sequence, Option<AcceptedAdmission>, Option<SsdReservationToken>)>;
 
 struct AssembledBatch {
     mutations: Vec<PreparedMutation>,
@@ -759,6 +821,41 @@ async fn join_pipeline_half<T>(
     }
 }
 
+
+async fn transition_ssd_tokens(
+    ownership: &mut BatchOwnership,
+    space: Option<&PhysicalSpaceSampler>,
+) -> Option<String> {
+    let mut tokens = Vec::new();
+    let mut physicals = Vec::new();
+    for (_, _, disk) in ownership.iter_mut() {
+        if let Some(token) = disk.take() {
+            physicals.push(token.request().physical_reservation_bytes);
+            tokens.push(token);
+        }
+    }
+    if tokens.is_empty() {
+        return None;
+    }
+    let Some(space) = space else {
+        for mut token in tokens {
+            token.disarm();
+        }
+        return None;
+    };
+    match space.sample().await {
+        Ok(sample) => crate::writeback::reservation::commit_batch_local(tokens, &physicals, sample)
+            .err()
+            .map(|error| format!("SSD reservation transition failed: {error}")),
+        Err(error) => {
+            for mut token in tokens {
+                token.disarm();
+            }
+            Some(format!("SSD reservation sample failed: {error}"))
+        }
+    }
+}
+
 /// Settle one committed batch: release its permits, notify the observer, and
 /// only then publish the new watermark. Returns a terminal error if the batch
 /// did not become durable exactly as assembled.
@@ -768,6 +865,7 @@ async fn finish_commit(
     observer: Option<&Arc<dyn LocalCommitObserver>>,
     retained_ram: &Arc<StdMutex<Vec<AcceptedAdmission>>>,
     progress: &watch::Sender<SequenceProgress>,
+    space: Option<&PhysicalSpaceSampler>,
 ) -> Option<String> {
     let committed = match result {
         Ok(Ok(records)) => records,
@@ -798,10 +896,8 @@ async fn finish_commit(
         .last()
         .expect("a committed batch contains at least one record");
 
-    for (_, _, disk) in &mut ownership {
-        if let Some(disk) = disk.take() {
-            disk.accept();
-        }
+    if let Some(error) = transition_ssd_tokens(&mut ownership, space).await {
+        return Some(error);
     }
 
     if let Some(observer) = observer
@@ -832,6 +928,7 @@ async fn run_journaler(
     let LocalJournalerOwnership {
         admission,
         retained_ram,
+        space,
     } = ownership;
     let prepare_concurrency = prepare_concurrency.max(1);
     let mut next_admitted = local_sequence.saturating_add(1);
@@ -967,6 +1064,7 @@ async fn run_journaler(
                     observer.as_ref(),
                     &retained_ram,
                     &progress,
+                    space.as_deref(),
                 )
                 .await
                     && terminal.is_none()
@@ -1102,7 +1200,29 @@ mod tests {
         MAX_LOCAL_PUBLISH_BATCH_RECORDS,
     };
     use crate::fault_store::FaultStore;
-    use crate::writeback::admission::{Admission, AdmissionError, DiskAdmission};
+    use crate::writeback::admission::{Admission, AdmissionError};
+    use crate::writeback::reservation::{SsdAdmission, SsdReservationRequest};
+    use crate::writeback::space_sample::{PhysicalSpaceSample, PhysicalSpaceSampler};
+
+    fn test_ssd(capacity: u64, min_free: u64) -> SsdAdmission {
+        SsdAdmission::new(capacity, 1 << 20, 95, 85, min_free).unwrap()
+    }
+
+    async fn reserve_ssd(ssd: &SsdAdmission, bytes: u64, available: u64) -> crate::writeback::reservation::SsdReservationToken {
+        ssd.reserve(
+            SsdReservationRequest {
+                ssd_reservation_bytes: bytes,
+                physical_reservation_bytes: bytes,
+                operations: 1,
+            },
+            PhysicalSpaceSample {
+                generation: 1,
+                available_bytes: available,
+            },
+        )
+        .await
+        .unwrap()
+    }
     use crate::writeback::journal::{Journal, StagedBatch};
     use crate::writeback::model::{
         FenceClass, JournalIdentity, MutationMode, MutationRecord, Sequence,
@@ -1110,10 +1230,6 @@ mod tests {
     use crate::writeback::overlay::{OverlayCommitObserver, OverlayIndex};
     use crate::writeback::payload::VerifiedPayload;
     use crate::writeback::remote::RemoteScheduler;
-    use crate::writeback::reservation::{
-        CommittedSsdReservation, ReservationError, SsdReservationToken, commit_batch_local,
-    };
-    use crate::writeback::space_sample::PhysicalSpaceSample;
     use anyhow::{Result, bail};
     use bytes::Bytes;
     use object_store::ObjectStoreExt;
@@ -1737,6 +1853,7 @@ mod tests {
             sink,
             admission.clone(),
             0,
+            uuid::Uuid::nil(),
             8,
             DEFAULT_LOCAL_PREPARE_CONCURRENCY,
             Some(observer.clone()),
@@ -2017,6 +2134,7 @@ mod tests {
             sink.clone(),
             admission.clone(),
             0,
+            uuid::Uuid::nil(),
             queue,
             queue,
             None,
@@ -2078,6 +2196,7 @@ mod tests {
             sink.clone(),
             admission.clone(),
             0,
+            uuid::Uuid::nil(),
             queue,
             queue,
             None,
@@ -2136,6 +2255,7 @@ mod tests {
             sink.clone(),
             admission.clone(),
             0,
+            uuid::Uuid::nil(),
             RECORDS as usize,
             PREPARE_CONCURRENCY,
             None,
@@ -2302,6 +2422,7 @@ mod tests {
             sink.clone(),
             admission.clone(),
             0,
+            uuid::Uuid::nil(),
             8,
             8,
             None,
@@ -2351,7 +2472,7 @@ mod tests {
         };
         let journal = Arc::new(Journal::open(&root, identity.clone()).unwrap());
         let admission = Admission::new(10);
-        let disk = DiskAdmission::new(100, 95, 85, 10).unwrap();
+        let disk = test_ssd(100, 10);
         let (head_release_tx, head_release_rx) = mpsc::channel();
         let (prepared_tx, mut prepared_rx) = tokio_mpsc::unbounded_channel();
         let sink = Arc::new(HeadBlockingJournalSink {
@@ -2363,13 +2484,14 @@ mod tests {
             sink,
             admission.clone(),
             0,
+            uuid::Uuid::nil(),
             8,
             8,
             Some(Arc::new(FailingSecondObserver)),
         );
         for sequence in 1..=2 {
             let ram = admission.reserve(1).await.unwrap().accept();
-            let disk_permit = disk.reserve(1, 1_000).await.unwrap();
+            let disk_permit = reserve_ssd(&disk, 1, 1_000).await;
             journaler
                 .submit_put_with_disk(
                     put_record(sequence, b"x"),
@@ -2437,7 +2559,8 @@ mod tests {
         let (remote, remote_controls) = FaultStore::new(remote_data.clone());
         let overlay = OverlayIndex::new(remote.clone());
         let admission = Admission::new(1_000_000);
-        let disk = DiskAdmission::new(1_000_000, 95, 85, 1).unwrap();
+        let disk = Arc::new(test_ssd(1_000_000, 1));
+        let space = Arc::new(PhysicalSpaceSampler::new(root.clone()));
         let observer = Arc::new(BlockingSecondOverlayObserver {
             inner: OverlayCommitObserver::new(overlay.clone(), journal.clone()),
             entered: Notify::new(),
@@ -2454,6 +2577,7 @@ mod tests {
             sink,
             admission.clone(),
             0,
+            uuid::Uuid::nil(),
             8,
             8,
             Some(observer.clone()),
@@ -2463,7 +2587,8 @@ mod tests {
             journal.clone(),
             overlay.clone(),
             admission.clone(),
-            disk.clone(),
+            Arc::clone(&disk),
+            Arc::clone(&space),
             journaler.barrier(),
             4,
         )
@@ -2479,10 +2604,12 @@ mod tests {
                 .await
                 .unwrap()
                 .accept();
-            let disk_permit = disk
-                .reserve(record.ssd_reservation_bytes().unwrap(), 1_000_000)
-                .await
-                .unwrap();
+            let disk_permit = reserve_ssd(
+                &disk,
+                record.ssd_reservation_bytes().unwrap(),
+                1_000_000,
+            )
+            .await;
             journaler
                 .submit_put_with_disk(record, Bytes::copy_from_slice(payload), ram, disk_permit)
                 .await
@@ -2624,10 +2751,10 @@ mod tests {
     #[tokio::test]
     async fn successful_local_commit_moves_bytes_from_ram_ownership_to_ssd_ownership() {
         let admission = Admission::new(10);
-        let disk = DiskAdmission::new(100, 95, 85, 10).unwrap();
+        let disk = test_ssd(100, 10);
         let (journaler, mut entered, release, _) = blocking_journaler(admission.clone(), None);
         let ram = admission.reserve(7).await.unwrap().accept();
-        let disk_permit = disk.reserve(7, 1_000).await.unwrap();
+        let disk_permit = reserve_ssd(&disk, 7, 1_000).await;
         let barrier = journaler
             .submit_put_with_disk(
                 put_record(1, b"payload"),
@@ -2646,7 +2773,18 @@ mod tests {
         assert_eq!(admission.used_bytes(), 0);
         assert_eq!(disk.used_bytes(), 7);
 
-        disk.set_remote_complete(7, 1_000).unwrap();
+        disk.release_remote(
+            SsdReservationRequest {
+                ssd_reservation_bytes: 7,
+                physical_reservation_bytes: 7,
+                operations: 1,
+            },
+            PhysicalSpaceSample {
+                generation: 2,
+                available_bytes: 1_000,
+            },
+        )
+        .unwrap();
         assert_eq!(disk.used_bytes(), 0);
         journaler.shutdown().await.unwrap();
     }
@@ -2671,8 +2809,15 @@ mod tests {
             staged_tx,
         ));
         let admission = Admission::new(64);
-        let journaler =
-            LocalJournaler::start_with_sink_and_observer(sink, admission.clone(), 0, 8, 8, None);
+        let journaler = LocalJournaler::start_with_sink_and_observer(
+            sink,
+            admission.clone(),
+            0,
+            uuid::Uuid::nil(),
+            8,
+            8,
+            None,
+        );
         let ram = admission.reserve(7).await.unwrap().accept();
         let barrier = journaler
             .submit_put(
@@ -2733,8 +2878,15 @@ mod tests {
             staged_tx,
         ));
         let admission = Admission::new(64);
-        let journaler =
-            LocalJournaler::start_with_sink_and_observer(sink, admission.clone(), 0, 8, 8, None);
+        let journaler = LocalJournaler::start_with_sink_and_observer(
+            sink,
+            admission.clone(),
+            0,
+            uuid::Uuid::nil(),
+            8,
+            8,
+            None,
+        );
 
         let ram = admission.reserve(7).await.unwrap().accept();
         let barrier = journaler
@@ -2852,7 +3004,7 @@ mod tests {
         let admission = Admission::new(64);
         let journaler = LocalJournaler::start(journal.clone(), admission.clone(), 8).unwrap();
 
-        let disk = DiskAdmission::new(1_000_000, 95, 85, 1).unwrap();
+        let disk = test_ssd(1_000_000, 1);
         let ram = admission.reserve(7).await.unwrap().accept();
         journaler
             .submit_put(
@@ -2871,7 +3023,7 @@ mod tests {
                     0x2000,
                     0,
                 ),
-                disk.reserve(10, 1_000_000).await.unwrap(),
+                reserve_ssd(&disk, 10, 1_000_000).await,
             )
             .await
             .unwrap();
@@ -2956,8 +3108,15 @@ mod tests {
             )
         });
         let admission = Admission::new(64);
-        let journaler =
-            LocalJournaler::start_with_sink_and_observer(sink, admission.clone(), 0, 8, 8, None);
+        let journaler = LocalJournaler::start_with_sink_and_observer(
+            sink,
+            admission.clone(),
+            0,
+            uuid::Uuid::nil(),
+            8,
+            8,
+            None,
+        );
 
         let ram = admission.reserve(7).await.unwrap().accept();
         let barrier = journaler
@@ -3018,8 +3177,15 @@ mod tests {
             ..PipelineGateSink::new(journal.clone(), 1, commit_entered_tx, release_rx, staged_tx)
         });
         let admission = Admission::new(64);
-        let journaler =
-            LocalJournaler::start_with_sink_and_observer(sink, admission.clone(), 0, 8, 8, None);
+        let journaler = LocalJournaler::start_with_sink_and_observer(
+            sink,
+            admission.clone(),
+            0,
+            uuid::Uuid::nil(),
+            8,
+            8,
+            None,
+        );
 
         let ram = admission.reserve(7).await.unwrap().accept();
         let barrier = journaler
@@ -3170,8 +3336,15 @@ mod tests {
             prepared_operations: AtomicU64::new(0),
             prepared_payload_bytes: AtomicU64::new(0),
         });
-        let journaler =
-            LocalJournaler::start_with_sink_and_observer(sink, admission.clone(), 0, 1, 1, None);
+        let journaler = LocalJournaler::start_with_sink_and_observer(
+            sink,
+            admission.clone(),
+            0,
+            uuid::Uuid::nil(),
+            1,
+            1,
+            None,
+        );
         let first = admission.reserve(1).await.unwrap().accept();
         journaler
             .submit_put(put_record(1, b"x"), Bytes::from_static(b"x"), first)

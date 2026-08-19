@@ -45,9 +45,16 @@ pub async fn attach(
         settings.resume_percent,
         settings.min_free_bytes,
         pending,
-        sample,
+        Some(sample),
     )?);
-    let lifecycle = WritebackObjectStore::open_paused(remote, journal, settings).await?;
+    let lifecycle = WritebackObjectStore::open_paused_with_owners(
+        remote,
+        journal,
+        settings,
+        Arc::clone(&space),
+        Arc::clone(&ssd),
+    )
+    .await?;
     if recovery.remote_seq < recovery.local_seq {
         tracing::info!(
             remote_sequence = recovery.remote_seq,
@@ -558,6 +565,14 @@ mod tests {
         assert_eq!(sample.generation, 2);
         assert_eq!(attached.ssd.used_bytes(), 0);
         assert_eq!(attached.ssd.used_operations(), 0);
+        assert!(
+            std::sync::Arc::ptr_eq(&attached.space, attached.lifecycle.space_sampler()),
+            "store must use the attach-time space sampler, not a shadow owner"
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(&attached.ssd, attached.lifecycle.ssd_admission()),
+            "store must use the attach-time SSD admission owner, not a shadow owner"
+        );
         attached.lifecycle.shutdown().await.unwrap();
     }
 }

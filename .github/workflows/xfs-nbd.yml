@@ -1,0 +1,420 @@
+name: XFS on ZeroFS NBD Test
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  xfs-nbd:
+    name: Run XFS on top of ZeroFS NBD
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start MinIO
+        run: |
+          docker run -d \
+            --name minio \
+            -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio server /data
+
+          # Wait for MinIO to be ready
+          for i in {1..30}; do
+            if curl -f http://localhost:9000/minio/health/live; then
+              echo "MinIO is ready"
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nbd-client xfsprogs wget
+
+      - name: Setup MinIO bucket
+        run: |
+          # Install mc (MinIO client)
+          wget https://dl.min.io/client/mc/release/linux-amd64/mc
+          chmod +x mc
+          ./mc alias set myminio http://localhost:9000 minioadmin minioadmin
+          ./mc mb myminio/zerofs-xfs-test || true
+
+      - name: Fetch the prebuilt ZeroFS binary
+        uses: actions/download-artifact@v4
+        with:
+          name: zerofs-ci-bin
+          path: zerofs/target/ci
+      - run: chmod +x zerofs/target/ci/zerofs
+
+      - name: Start ZeroFS
+        working-directory: zerofs
+        run: |
+          # Create cache directory
+          mkdir -p /tmp/zerofs-cache
+
+          # Create ZeroFS configuration
+          cat > zerofs-ci.toml << EOF
+          [cache]
+          dir = "/tmp/zerofs-cache"
+          disk_size_gb = 2.0
+          memory_size_gb = 2.0
+
+          [storage]
+          url = "s3://zerofs-xfs-test/xfs-test"
+          encryption_password = "test-password-123"
+
+          [servers.ninep]
+          addresses = ["127.0.0.1:5564"]
+
+          [servers.nbd]
+          addresses = ["127.0.0.1:10809"]
+
+          [aws]
+          access_key_id = "minioadmin"
+          secret_access_key = "minioadmin"
+          endpoint = "http://localhost:9000"
+          allow_http = "true"
+
+          [telemetry]
+          enabled = false
+          EOF
+
+          # Start ZeroFS with NBD support in the background
+          ./target/ci/zerofs run -c zerofs-ci.toml &
+
+          # Wait for ZeroFS NBD server to start
+          echo "Waiting for ZeroFS NBD server to start..."
+          for i in {1..30}; do
+            if nc -z 127.0.0.1 10809; then
+              echo "ZeroFS NBD server is ready"
+              break
+            fi
+            sleep 1
+          done
+
+          # Verify ZeroFS NBD server is running
+          if ! nc -z 127.0.0.1 10809; then
+            echo "ZeroFS NBD server failed to start"
+            exit 1
+          fi
+
+      - name: Mount 9P and create NBD device
+        run: |
+          echo "Mounting ZeroFS via 9P..."
+          sudo mkdir -p /mnt/zerofs
+          sudo mount -t 9p -o trans=tcp,port=5564,version=9p2000.L 127.0.0.1 /mnt/zerofs
+
+          echo "Creating NBD device file..."
+          sudo mkdir -p /mnt/zerofs/.nbd
+          sudo truncate -s 3G /mnt/zerofs/.nbd/test-device
+
+          sudo umount /mnt/zerofs
+
+      - name: Assert the runner owns the NBD device
+        run: |
+          sudo modprobe nbd
+          if sudo nbd-client -c /dev/nbd0; then
+            echo "/dev/nbd0 is already attached to another export; refusing to reuse it" >&2
+            exit 1
+          fi
+
+      - name: Connect NBD device
+        run: |
+          echo "Connecting to NBD device..."
+          sudo nbd-client 127.0.0.1 10809 /dev/nbd0 -N test-device
+
+          sudo blockdev --getsize64 /dev/nbd0
+          sudo fdisk -l /dev/nbd0
+
+      - name: Create XFS filesystem
+        run: |
+          echo "Formatting XFS on NBD device..."
+          sudo mkfs.xfs -f /dev/nbd0
+
+          sudo mkdir -p /mnt/xfsdata
+          sudo mount /dev/nbd0 /mnt/xfsdata
+
+          # Show filesystem info
+          df -h /mnt/xfsdata
+          xfs_info /mnt/xfsdata
+
+      - name: Write test data and checksums
+        run: |
+          echo "Creating test files..."
+          sudo dd if=/dev/urandom of=/mnt/xfsdata/random.dat bs=1M count=100
+          sudo mkdir -p /mnt/xfsdata/tree
+          for i in $(seq 1 50); do
+            sudo dd if=/dev/urandom of=/mnt/xfsdata/tree/file-$i.bin bs=64K count=4 status=none
+          done
+
+          echo "Calculating checksums..."
+          cd /mnt/xfsdata
+          sudo find . -type f -print0 | xargs -0 sudo sha256sum | sort > /tmp/file-checksums.txt
+          echo "Number of files checksummed: $(wc -l < /tmp/file-checksums.txt)"
+
+      - name: Unmount and disconnect before restart
+        run: |
+          echo "Syncing and unmounting XFS..."
+          sync
+          sudo umount /mnt/xfsdata
+
+          echo "Disconnecting NBD device..."
+          sudo nbd-client -d /dev/nbd0
+
+          # Wait for NBD to fully disconnect
+          echo "Waiting for NBD device to disconnect..."
+          for i in {1..10}; do
+            if [ ! -e /sys/block/nbd0/size ] || [ "$(cat /sys/block/nbd0/size 2>/dev/null)" = "0" ]; then
+              echo "NBD device disconnected successfully"
+              break
+            fi
+            echo "Waiting for NBD disconnect... attempt $i/10"
+            sleep 1
+          done
+
+          echo "Stopping ZeroFS..."
+          ZEROFS_PID=$(pgrep -f "zerofs.*run.*zerofs-ci.toml" || true)
+          if [ -n "$ZEROFS_PID" ]; then
+            echo "Found ZeroFS process: $ZEROFS_PID"
+            kill -TERM $ZEROFS_PID || true
+          else
+            echo "No ZeroFS process found (may have already stopped)"
+          fi
+
+          # Wait for ZeroFS to stop
+          for i in {1..10}; do
+            if ! pgrep -f "zerofs.*run.*zerofs-ci.toml" > /dev/null; then
+              echo "ZeroFS stopped"
+              break
+            fi
+            echo "Waiting for ZeroFS to stop... attempt $i/10"
+            sleep 1
+          done
+
+          # Final check if ZeroFS stopped
+          if pgrep -f "zerofs.*run.*zerofs-ci.toml" > /dev/null; then
+            echo "WARNING: ZeroFS may still be running, forcing kill..."
+            pkill -KILL -f "zerofs.*run.*zerofs-ci.toml" || true
+            sleep 1
+          fi
+
+          # Ensure port is free
+          echo "Waiting for port 10809 to be free..."
+          for i in {1..10}; do
+            if ! nc -z 127.0.0.1 10809 2>/dev/null; then
+              echo "Port 10809 is free"
+              break
+            fi
+            echo "Waiting for port to be released... attempt $i/10"
+            sleep 1
+          done
+
+          # Final check
+          if nc -z 127.0.0.1 10809 2>/dev/null; then
+            echo "ERROR: Port 10809 still in use after 10 seconds!"
+            exit 1
+          fi
+
+      - name: Restart ZeroFS
+        working-directory: zerofs
+        run: |
+          echo "Starting ZeroFS again..."
+          # Config file should still exist from earlier
+          ./target/ci/zerofs run -c zerofs-ci.toml &
+
+          # Wait for ZeroFS NBD server to start
+          echo "Waiting for ZeroFS NBD server to restart..."
+          for i in {1..30}; do
+            if nc -z 127.0.0.1 10809; then
+              echo "ZeroFS NBD server is ready"
+              break
+            fi
+            sleep 1
+          done
+
+          # Verify ZeroFS NBD server is running
+          if ! nc -z 127.0.0.1 10809; then
+            echo "ZeroFS NBD server failed to restart"
+            exit 1
+          fi
+
+      - name: Reconnect NBD and verify XFS
+        run: |
+          echo "Reconnecting NBD device..."
+          sudo nbd-client 127.0.0.1 10809 /dev/nbd0 -N test-device
+
+          # Verify NBD device is available
+          sudo blockdev --getsize64 /dev/nbd0
+
+          echo "Checking XFS after restart..."
+          sudo xfs_repair -n /dev/nbd0
+
+          echo "Remounting XFS..."
+          sudo mount /dev/nbd0 /mnt/xfsdata
+
+      - name: Verify data integrity
+        run: |
+          echo "Recomputing checksums of restored data..."
+          cd /mnt/xfsdata
+          sudo find . -type f -print0 | xargs -0 sudo sha256sum | sort > /tmp/file-checksums-restored.txt
+
+          if diff /tmp/file-checksums.txt /tmp/file-checksums-restored.txt; then
+            echo "SUCCESS: All file checksums match!"
+          else
+            echo "ERROR: File checksums differ!"
+            exit 1
+          fi
+
+      - name: Show ZeroFS S3 usage
+        run: |
+          # Show how much data was written to S3
+          ./mc du myminio/zerofs-xfs-test
+
+      - name: Cleanup
+        if: always()
+        run: |
+          # Unmount XFS
+          sudo umount /mnt/xfsdata || true
+
+          # Disconnect NBD device
+          sudo nbd-client -d /dev/nbd0 || true
+
+          # Kill ZeroFS
+          pkill -f "zerofs run -c zerofs-ci.toml" || true
+
+          # Stop MinIO
+          docker stop minio || true
+
+  xfs-nbd-tiered:
+    name: Run XFS on top of ZeroFS NBD (tiered volatile_memory+ssd)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nbd-client xfsprogs wget
+
+      - name: Assert the runner owns the disposable NBD device
+        run: |
+          sudo modprobe nbd
+          if sudo nbd-client -c /dev/nbd7; then
+            echo "/dev/nbd7 is already attached to another export; refusing to reuse it" >&2
+            exit 1
+          fi
+
+      - name: Fetch the prebuilt ZeroFS binary
+        uses: actions/download-artifact@v4
+        with:
+          name: zerofs-ci-bin
+          path: zerofs/target/ci
+      - run: chmod +x zerofs/target/ci/zerofs
+
+      - name: Start MinIO
+        run: |
+          docker run -d \
+            --name minio \
+            -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio server /data
+
+          # Wait for MinIO to be ready
+          for i in {1..30}; do
+            if curl -f http://localhost:9000/minio/health/live; then
+              echo "MinIO is ready"
+              break
+            fi
+            sleep 1
+          done
+
+          # Install mc (MinIO client)
+          wget https://dl.min.io/client/mc/release/linux-amd64/mc
+          chmod +x mc
+          ./mc alias set myminio http://localhost:9000 minioadmin minioadmin
+          ./mc mb myminio/zerofs-xfs-test || true
+
+      - name: Prepare the tiered run roots
+        run: |
+          RUN_UUID=$(python3 -c "import uuid; print(uuid.uuid4())")
+          CONTROL_ROOT="/var/tmp/zerofs-tiered-control-${RUN_UUID}"
+          RESOURCE_ROOT="/var/tmp/zerofs-tiered-resources-${RUN_UUID}"
+          {
+            echo "RUN_UUID=${RUN_UUID}"
+            echo "CONTROL_ROOT=${CONTROL_ROOT}"
+            echo "RESOURCE_ROOT=${RESOURCE_ROOT}"
+            echo "LEDGER=${CONTROL_ROOT}/ledger.json"
+          } >> "$GITHUB_ENV"
+
+      - name: Write the tiered ZeroFS config
+        run: |
+          cat > /tmp/zerofs-tiered.toml << EOF
+          [cache]
+          dir = "${RESOURCE_ROOT}/run/cache"
+          disk_size_gb = 2.0
+          memory_size_gb = 1.0
+
+          [storage]
+          url = "s3://zerofs-xfs-test/zerofs-tiered/${RUN_UUID}"
+          encryption_password = "test-password-123"
+
+          [filesystem]
+          write_ack_mode = "volatile_memory"
+          volatile_memory_gb = 1.0
+
+          [writeback]
+          enabled = true
+          dir = "${RESOURCE_ROOT}/run/writeback"
+          ack_mode = "ssd"
+          memory_size_gb = 1.0
+          disk_size_gb = 4.0
+
+          [servers.nbd]
+          addresses = ["127.0.0.1:10809"]
+
+          [aws]
+          access_key_id = "minioadmin"
+          secret_access_key = "minioadmin"
+          endpoint = "http://localhost:9000"
+          allow_http = "true"
+
+          [telemetry]
+          enabled = false
+          EOF
+
+      - name: Set up the tiered harness run
+        run: |
+          python3 scripts/tiered-writeback-e2e.py setup \
+            --run-uuid "$RUN_UUID" \
+            --filesystem-ack-mode volatile_memory \
+            --object-ack-mode ssd \
+            --zerofs-binary "$GITHUB_WORKSPACE/zerofs/target/ci/zerofs" \
+            --zerofs-config /tmp/zerofs-tiered.toml
+          mkdir -p "${RESOURCE_ROOT}/run/cache" "${RESOURCE_ROOT}/run/writeback"
+
+      - name: Run the tiered XFS restart scenario
+        run: |
+          python3 scripts/tiered-writeback-e2e.py run \
+            --ledger "$LEDGER" \
+            --scenario xfs-over-nbd-restart \
+            --filesystem-ack-mode volatile_memory \
+            --object-ack-mode ssd \
+            --zerofs-binary "$GITHUB_WORKSPACE/zerofs/target/ci/zerofs" \
+            --zerofs-config /tmp/zerofs-tiered.toml
+
+      - name: Clean up the tiered run
+        if: always()
+        run: |
+          if [ -f "$LEDGER" ]; then
+            python3 scripts/tiered-writeback-e2e.py cleanup --ledger "$LEDGER"
+            python3 scripts/tiered-writeback-e2e.py cleanup --ledger "$LEDGER"
+            python3 scripts/tiered-writeback-e2e.py assert-clean --ledger "$LEDGER"
+          fi

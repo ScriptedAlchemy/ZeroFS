@@ -1,20 +1,17 @@
 use super::error::{CommandError, CommandResult, NBDError, Result};
 use super::out_of_bounds;
-use super::volatile_overlay::{
-    Materializer, VolatileAdmission, VolatileBudget, VolatileWriteRuntime,
-    WriteChunk as VolatileWriteChunk,
-};
 use super::{
     NBD_STRIPE_MANIFEST_MAX_BYTES, NBD_STRIPE_MARKER, StripeManifest, is_nbd_provision_staging_name,
 };
 use crate::fs::ZeroFS;
 use crate::fs::errors::FsError;
 use crate::fs::inode::Inode;
+use crate::fs::mutation::volatile_overlay::{VolatileAdmission, VolatileBudget};
 use crate::fs::tracing::FileOperation;
 use crate::fs::types::AuthContext;
 use bytes::{Bytes, BytesMut};
 use deku::DekuContainerWrite;
-use futures::future::{join_all, try_join_all};
+use futures::future::try_join_all;
 use nbd_proto::{
     NBD_FLAG_SEND_TRIM, NBD_INFO_EXPORT, NBD_REP_ACK, NBD_REP_ERR_INVALID, NBD_REP_ERR_UNKNOWN,
     NBD_REP_INFO, NBD_REP_SERVER, NBDInfoExport, TRANSMISSION_FLAGS,
@@ -65,7 +62,7 @@ pub struct NBDDevice {
 
 pub(crate) struct MutationAdmission {
     gate: OwnedRwLockReadGuard<()>,
-    volatile: Option<VolatileAdmission>,
+    reserved: Option<VolatileAdmission>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -96,7 +93,6 @@ struct NbdExportState {
     identity: ExportIdentity,
     gate: Arc<RwLock<()>>,
     volatile_mode: bool,
-    volatile: Option<Arc<VolatileWriteRuntime>>,
 }
 
 fn parse_stripe_manifest(data: &[u8]) -> Result<StripeManifest> {
@@ -249,11 +245,16 @@ impl Default for NbdExportGates {
 
 impl NbdExportGates {
     pub fn new(volatile_memory_bytes: u64) -> Self {
+        Self::with_budget(
+            (volatile_memory_bytes > 0).then(|| VolatileBudget::new(volatile_memory_bytes, 65_536)),
+        )
+    }
+
+    pub fn with_budget(budget: Option<std::sync::Arc<VolatileBudget>>) -> Self {
         Self {
             registry: StdMutex::new(ExportRegistry::default()),
             materialized_gates: StdMutex::new(HashMap::new()),
-            volatile_budget: (volatile_memory_bytes > 0)
-                .then(|| VolatileBudget::new(volatile_memory_bytes, 65_536)),
+            volatile_budget: budget,
         }
     }
 
@@ -266,7 +267,8 @@ impl NbdExportGates {
         let identity = ExportIdentity {
             backing: backing.clone(),
         };
-        if self.volatile_budget.is_none() {
+        let volatile_mode = filesystem.volatile_overlay.get().is_some();
+        if !volatile_mode {
             let mut gates = self
                 .materialized_gates
                 .lock()
@@ -280,7 +282,6 @@ impl NbdExportGates {
                 identity,
                 gate,
                 volatile_mode: false,
-                volatile: None,
             }));
         }
         let mut registry = self
@@ -312,26 +313,10 @@ impl NbdExportGates {
             }
         }
 
-        let volatile = self.volatile_budget.as_ref().map(|budget| {
-            let filesystem = Arc::clone(filesystem);
-            let materializer: Materializer = Arc::new(move |inode, offset, data| {
-                let filesystem = Arc::clone(&filesystem);
-                Box::pin(async move {
-                    let auth = AuthContext::default();
-                    filesystem
-                        .write(&auth, inode, offset, &data)
-                        .await
-                        .map(|_| ())
-                        .map_err(CommandError::from)
-                })
-            });
-            VolatileWriteRuntime::new(Arc::clone(budget), backing_inodes.clone(), materializer)
-        });
         let state = Arc::new(NbdExportState {
             identity: identity.clone(),
             gate: Arc::new(RwLock::new(())),
             volatile_mode: true,
-            volatile,
         });
         for inode in backing_inodes {
             registry.inode_owners.insert(inode, identity.clone());
@@ -341,51 +326,37 @@ impl NbdExportGates {
         Ok(state)
     }
 
-    fn unactivated(&self, backing: &NbdBacking) -> Arc<NbdExportState> {
+    fn unactivated(&self, backing: &NbdBacking, filesystem: &ZeroFS) -> Arc<NbdExportState> {
         Arc::new(NbdExportState {
             identity: ExportIdentity {
                 backing: backing.clone(),
             },
             gate: Arc::new(RwLock::new(())),
-            volatile_mode: self.volatile_budget.is_some(),
-            volatile: None,
+            volatile_mode: filesystem.volatile_overlay.get().is_some(),
         })
     }
 
     pub(crate) async fn stop_and_drain(&self) -> CommandResult<()> {
-        let runtimes = self.runtimes();
-        for runtime in &runtimes {
-            runtime.stop_admission();
+        let states = {
+            let registry = self
+                .registry
+                .lock()
+                .expect("NBD export gate registry poisoned");
+            registry.exports.values().cloned().collect::<Vec<_>>()
+        };
+        let mut exclusive = Vec::with_capacity(states.len());
+        for state in &states {
+            exclusive.push(state.gate.write().await);
         }
-        let mut first_error = None;
-        for result in join_all(
-            runtimes
-                .into_iter()
-                .map(|runtime| async move { runtime.shutdown().await }),
-        )
-        .await
-        {
-            if let Err(error) = result {
-                first_error.get_or_insert(error);
-            }
-        }
-        first_error.map_or(Ok(()), Err)
+        drop(exclusive);
+        Ok(())
     }
 
-    pub(crate) fn fence_abort(&self) {
-        for runtime in self.runtimes() {
-            runtime.fence_abort();
-        }
-    }
+    pub(crate) fn fence_abort(&self) {}
 
-    fn runtimes(&self) -> Vec<Arc<VolatileWriteRuntime>> {
-        self.registry
-            .lock()
-            .expect("NBD export gate registry poisoned")
-            .exports
-            .values()
-            .filter_map(|state| state.volatile.clone())
-            .collect()
+    #[cfg(test)]
+    fn runtimes(&self) -> Vec<()> {
+        Vec::new()
     }
 }
 
@@ -625,7 +596,7 @@ impl NBDHandler {
                     self.export_gates
                         .for_export(name, &backing, &self.filesystem)?
                 } else {
-                    self.export_gates.unactivated(&backing)
+                    self.export_gates.unactivated(&backing, &self.filesystem)
                 };
                 Ok(NBDDevice {
                     name: name.to_vec(),
@@ -725,7 +696,7 @@ impl NBDHandler {
             self.export_gates
                 .for_export(name, &backing, &self.filesystem)?
         } else {
-            self.export_gates.unactivated(&backing)
+            self.export_gates.unactivated(&backing, &self.filesystem)
         };
         Ok(NBDDevice {
             name: name.to_vec(),
@@ -743,14 +714,14 @@ impl NBDHandler {
             return Ok(Bytes::new());
         }
 
-        if let Some(runtime) = &device.state.volatile {
-            let filesystem = Arc::clone(&self.filesystem);
-            let backing = device.backing.clone();
-            return runtime
-                .read(offset, length as usize, move || {
-                    Box::pin(read_backing(filesystem, backing, offset, length))
-                })
-                .await;
+        if device.state.volatile_mode {
+            return read_visible(
+                Arc::clone(&self.filesystem),
+                device.backing.clone(),
+                offset,
+                length,
+            )
+            .await;
         }
 
         read_backing(
@@ -768,11 +739,22 @@ impl NBDHandler {
         length: usize,
     ) -> CommandResult<MutationAdmission> {
         let gate = Arc::clone(&device.state.gate).read_owned().await;
-        let volatile = match &device.state.volatile {
-            Some(runtime) => Some(runtime.reserve(length).await?),
-            None => None,
+        let reserved = if device.state.volatile_mode {
+            if let Some(overlay) = self.filesystem.volatile_overlay.get() {
+                let inode = match &device.backing {
+                    NbdBacking::Single { inode, .. } => *inode,
+                    NbdBacking::Striped { members, .. } => {
+                        members.first().map(|member| member.inode).unwrap_or(0)
+                    }
+                };
+                Some(overlay.reserve(inode, length).await?)
+            } else {
+                None
+            }
+        } else {
+            None
         };
-        Ok(MutationAdmission { gate, volatile })
+        Ok(MutationAdmission { gate, reserved })
     }
 
     pub(crate) async fn write_admitted(
@@ -794,37 +776,18 @@ impl NBDHandler {
             return Err(CommandError::NoSpace);
         }
 
-        if let Some(runtime) = &device.state.volatile {
-            let volatile = admission.volatile.ok_or(CommandError::IoError)?;
-            let member_count = match &device.backing {
-                NbdBacking::Single { .. } => 1,
-                NbdBacking::Striped { members, .. } => members.len(),
-            };
-            let groups = group_stripe_chunks(
-                map_stripe_chunks(&device.backing, offset, data.len() as u64)?,
-                member_count,
-            )
-            .into_iter()
-            .map(|chunks| {
-                chunks
-                    .into_iter()
-                    .map(|chunk| VolatileWriteChunk {
-                        inode: chunk.inode,
-                        member_offset: chunk.member_offset,
-                        logical_offset: chunk.logical_offset as usize,
-                        length: chunk.length as usize,
-                    })
-                    .collect()
-            })
-            .collect();
-            runtime.accept_write(volatile, offset, data, groups).await?;
+        drop(admission.reserved);
+        if device.state.volatile_mode {
+            write_visible(&self.filesystem, &device.backing, offset, &data).await?;
         } else {
             write_backing(&self.filesystem, &device.backing, offset, &data).await?;
         }
         drop(admission.gate);
 
         if fua {
-            self.flush(device).await?;
+            self.filesystem
+                .wait_inodes_durability(&device.backing.inodes())
+                .await?;
         }
 
         Ok(())
@@ -892,12 +855,8 @@ impl NBDHandler {
 
     pub async fn flush(&self, device: &NBDDevice) -> CommandResult<()> {
         let _flush_guard = device.state.gate.write().await;
-        if let Some(runtime) = &device.state.volatile {
-            let target = runtime.accepted_cutoff();
-            runtime.wait_materialized(target).await?;
-        }
         self.filesystem
-            .client_fsync()
+            .wait_configured_durability()
             .await
             .map_err(|_| CommandError::IoError)?;
 
@@ -909,6 +868,79 @@ impl NBDHandler {
 
         Ok(())
     }
+}
+
+async fn write_visible(
+    filesystem: &ZeroFS,
+    backing: &NbdBacking,
+    offset: u64,
+    data: &Bytes,
+) -> CommandResult<()> {
+    let auth = AuthContext::default();
+    let members =
+        members_from_stripe_chunks(data, map_stripe_chunks(backing, offset, data.len() as u64)?)?;
+    filesystem.write_ack_batch(&auth, members).await?;
+    Ok(())
+}
+
+fn members_from_stripe_chunks(
+    data: &Bytes,
+    chunks: Vec<StripeChunk>,
+) -> CommandResult<Vec<crate::fs::mutation::types::PrepareWriteMember>> {
+    use crate::fs::mutation::types::PrepareWriteMember;
+    use std::collections::BTreeMap;
+    let mut by_inode: BTreeMap<u64, Vec<StripeChunk>> = BTreeMap::new();
+    for chunk in chunks {
+        by_inode.entry(chunk.inode).or_default().push(chunk);
+    }
+    let mut members = Vec::with_capacity(by_inode.len());
+    for (inode, mut chunks) in by_inode {
+        chunks.sort_by_key(|chunk| chunk.member_offset);
+        let offset = chunks[0].member_offset;
+        let mut payload = BytesMut::new();
+        let mut next = offset;
+        for chunk in chunks {
+            if chunk.member_offset != next {
+                return Err(CommandError::InvalidArgument);
+            }
+            let start = chunk.logical_offset as usize;
+            payload.extend_from_slice(&data[start..start + chunk.length as usize]);
+            next = chunk
+                .member_offset
+                .checked_add(chunk.length)
+                .ok_or(CommandError::InvalidArgument)?;
+        }
+        members.push(PrepareWriteMember {
+            id: inode,
+            offset,
+            data: payload.freeze(),
+        });
+    }
+    Ok(members)
+}
+
+async fn read_visible(
+    filesystem: Arc<ZeroFS>,
+    backing: NbdBacking,
+    offset: u64,
+    length: u32,
+) -> CommandResult<Bytes> {
+    let auth = AuthContext::default();
+    let chunks = map_stripe_chunks(&backing, offset, length as u64)?;
+    let mut out = BytesMut::zeroed(length as usize);
+    for chunk in chunks {
+        let (piece, _) = filesystem
+            .read_file_visible(
+                Some(&auth),
+                chunk.inode,
+                chunk.member_offset,
+                chunk.length as u32,
+            )
+            .await?;
+        let start = chunk.logical_offset as usize;
+        out[start..start + piece.len()].copy_from_slice(&piece);
+    }
+    Ok(out.freeze())
 }
 
 async fn read_backing(
@@ -1173,6 +1205,42 @@ mod tests {
         NBDHandler::new(filesystem, Arc::new(NbdExportGates::default()))
     }
 
+    async fn volatile_filesystem() -> Arc<ZeroFS> {
+        use crate::fs::mutation::config::{
+            ClientDurabilityTarget, DEFAULT_VOLATILE_MAX_OPERATIONS, FilesystemWriteAckMode,
+            FilesystemWriteAckSettings, FilesystemWriteAckSource,
+        };
+        let mut filesystem = ZeroFS::new_in_memory()
+            .await
+            .expect("create test filesystem");
+        filesystem.write_ack = FilesystemWriteAckSettings {
+            mode: FilesystemWriteAckMode::VolatileMemory,
+            volatile_memory_bytes: 8 * 1024 * 1024,
+            volatile_max_operations: DEFAULT_VOLATILE_MAX_OPERATIONS,
+            source: FilesystemWriteAckSource::Filesystem,
+            client_durability_target: ClientDurabilityTarget::LocalSsd,
+        };
+        let filesystem = Arc::new(filesystem);
+        filesystem.install_volatile_overlay();
+        filesystem
+    }
+
+    async fn striped_export_volatile() -> (Arc<ZeroFS>, NBDHandler, super::NBDDevice) {
+        let filesystem = volatile_filesystem().await;
+        let credentials = root_credentials();
+        let (nbd_dir, _) = filesystem
+            .mkdir(&credentials, 0, b".nbd", &SetAttributes::default())
+            .await
+            .expect("create .nbd directory");
+        create_striped_export(&filesystem, nbd_dir, b"striped-test").await;
+        let handler = NBDHandler::new(Arc::clone(&filesystem), Arc::new(NbdExportGates::default()));
+        let device = handler
+            .get_device(b"striped-test")
+            .await
+            .expect("discover striped export");
+        (filesystem, handler, device)
+    }
+
     fn export_option_payload(name: &[u8]) -> Vec<u8> {
         let mut payload = Vec::with_capacity(4 + name.len() + 2);
         payload.extend_from_slice(&(name.len() as u32).to_be_bytes());
@@ -1422,11 +1490,7 @@ mod tests {
 
     #[tokio::test]
     async fn volatile_list_does_not_activate_write_runtimes() {
-        let filesystem = Arc::new(
-            ZeroFS::new_in_memory()
-                .await
-                .expect("create test filesystem"),
-        );
+        let filesystem = volatile_filesystem().await;
         let credentials = root_credentials();
         let (nbd_dir, _) = filesystem
             .mkdir(&credentials, 0, b".nbd", &SetAttributes::default())
@@ -1452,11 +1516,7 @@ mod tests {
 
     #[tokio::test]
     async fn volatile_info_advertises_mode_without_activating_a_runtime() {
-        let filesystem = Arc::new(
-            ZeroFS::new_in_memory()
-                .await
-                .expect("create test filesystem"),
-        );
+        let filesystem = volatile_filesystem().await;
         let credentials = root_credentials();
         let (nbd_dir, _) = filesystem
             .mkdir(&credentials, 0, b".nbd", &SetAttributes::default())
@@ -1624,5 +1684,207 @@ mod tests {
                 .name,
             NEAR_PREFIX_EXPORT
         );
+    }
+
+    #[tokio::test]
+    async fn nbd_uses_no_protocol_local_overlay_owner() {
+        let (filesystem, handler, device) = striped_export_volatile().await;
+        assert!(filesystem.volatile_overlay.get().is_some());
+        assert!(
+            handler.export_gates.runtimes().is_empty(),
+            "NBD must not own a protocol-local overlay runtime"
+        );
+        let admission = handler
+            .begin_mutation(&device, 16)
+            .await
+            .expect("admit striped write");
+        handler
+            .write_admitted(
+                &device,
+                0,
+                Bytes::from_static(b"0123456789abcdef"),
+                false,
+                admission,
+            )
+            .await
+            .expect("write through shared overlay");
+        assert!(
+            handler.export_gates.runtimes().is_empty(),
+            "NBD must still own no overlay after a volatile write"
+        );
+    }
+
+    #[tokio::test]
+    async fn striped_write_publishes_one_batch() {
+        let (filesystem, handler, device) = striped_export_volatile().await;
+        let overlay = filesystem.volatile_overlay.get().cloned().expect("overlay");
+        assert_eq!(overlay.accepted_batch_count(), 0);
+        let admission = handler
+            .begin_mutation(&device, 16 * 1024)
+            .await
+            .expect("admit striped write");
+        handler
+            .write_admitted(
+                &device,
+                0,
+                Bytes::from(vec![0x5a; 16 * 1024]),
+                false,
+                admission,
+            )
+            .await
+            .expect("write one logical striped request");
+        assert_eq!(
+            overlay.accepted_batch_count(),
+            1,
+            "one logical NBD WRITE must publish exactly one prepared batch"
+        );
+        filesystem
+            .wait_configured_durability()
+            .await
+            .expect("materialize the striped batch");
+        let read = handler
+            .read(&device, 0, 16 * 1024)
+            .await
+            .expect("read striped write");
+        assert_eq!(read.as_ref(), &[0x5a; 16 * 1024]);
+    }
+
+    #[tokio::test]
+    async fn fua_covers_every_stripe_member() {
+        use crate::fs::mutation::durability::DurabilityTarget;
+        use std::sync::Mutex;
+        let (filesystem, handler, device) = striped_export_volatile().await;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        filesystem.flush_coordinator.set_object_wait({
+            let seen = Arc::clone(&seen);
+            std::sync::Arc::new(move |_, target| {
+                seen.lock().expect("seen").push(target);
+                Box::pin(async { Ok(()) })
+            })
+        });
+        let admission = handler
+            .begin_mutation(&device, 16 * 1024)
+            .await
+            .expect("admit FUA write");
+        handler
+            .write_admitted(
+                &device,
+                0,
+                Bytes::from(vec![0xa5; 16 * 1024]),
+                true,
+                admission,
+            )
+            .await
+            .expect("FUA write");
+        assert_eq!(
+            *seen.lock().expect("seen"),
+            vec![DurabilityTarget::LocalSsd],
+            "FUA must take durable_through once for the write cutoff"
+        );
+        let read = handler
+            .read(&device, 0, 16 * 1024)
+            .await
+            .expect("read FUA write");
+        assert_eq!(read.as_ref(), &[0xa5; 16 * 1024]);
+        match &device.backing {
+            NbdBacking::Striped { members, .. } => {
+                assert_eq!(members.len(), 4, "FUA must cover every stripe member");
+            }
+            NbdBacking::Single { .. } => panic!("expected a striped export"),
+        }
+    }
+
+    #[tokio::test]
+    async fn flush_uses_normalized_target() {
+        use crate::fs::mutation::config::ClientDurabilityTarget;
+        use crate::fs::mutation::durability::DurabilityTarget;
+        use std::sync::Mutex;
+
+        let (filesystem, handler, device) = striped_export_volatile().await;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        filesystem.flush_coordinator.set_object_wait({
+            let seen = Arc::clone(&seen);
+            std::sync::Arc::new(move |_, target| {
+                seen.lock().expect("seen").push(target);
+                Box::pin(async { Ok(()) })
+            })
+        });
+        handler.flush(&device).await.expect("flush LocalSsd");
+        assert_eq!(
+            *seen.lock().expect("seen"),
+            vec![DurabilityTarget::LocalSsd]
+        );
+
+        let mut remote = ZeroFS::new_in_memory().await.expect("remote fs");
+        remote.write_ack = filesystem.write_ack;
+        remote.write_ack.client_durability_target = ClientDurabilityTarget::RemoteBackend;
+        let remote = Arc::new(remote);
+        remote.install_volatile_overlay();
+        let seen_remote = Arc::new(Mutex::new(Vec::new()));
+        remote.flush_coordinator.set_object_wait({
+            let seen_remote = Arc::clone(&seen_remote);
+            std::sync::Arc::new(move |_, target| {
+                seen_remote.lock().expect("seen").push(target);
+                Box::pin(async { Ok(()) })
+            })
+        });
+        let credentials = root_credentials();
+        let (nbd_dir, _) = remote
+            .mkdir(&credentials, 0, b".nbd", &SetAttributes::default())
+            .await
+            .expect("create .nbd directory");
+        create_striped_export(&remote, nbd_dir, b"striped-test").await;
+        let remote_handler =
+            NBDHandler::new(Arc::clone(&remote), Arc::new(NbdExportGates::default()));
+        let remote_device = remote_handler
+            .get_device(b"striped-test")
+            .await
+            .expect("discover remote export");
+        remote_handler
+            .flush(&remote_device)
+            .await
+            .expect("flush RemoteBackend");
+        assert_eq!(
+            *seen_remote.lock().expect("seen"),
+            vec![DurabilityTarget::RemoteBackend]
+        );
+    }
+
+    #[tokio::test]
+    async fn flush_quiesces_prior_preparers() {
+        let (_filesystem, handler, device) = striped_export_volatile().await;
+        let admission = handler
+            .begin_mutation(&device, 16)
+            .await
+            .expect("admit prior write");
+        let mut flush = tokio::spawn({
+            let handler = NBDHandler::new(
+                Arc::clone(&handler.filesystem),
+                Arc::clone(&handler.export_gates),
+            );
+            let device = device.clone();
+            async move { handler.flush(&device).await }
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut flush)
+                .await
+                .is_err(),
+            "FLUSH overtook a write that still holds the export gate"
+        );
+        handler
+            .write_admitted(
+                &device,
+                0,
+                Bytes::from_static(b"0123456789abcdef"),
+                false,
+                admission,
+            )
+            .await
+            .expect("complete prior write");
+        tokio::time::timeout(std::time::Duration::from_secs(2), flush)
+            .await
+            .expect("FLUSH did not resume")
+            .expect("FLUSH task panicked")
+            .expect("FLUSH failed");
     }
 }

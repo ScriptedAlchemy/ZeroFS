@@ -52,4 +52,16 @@ impl From<FsError> for CommandError {
     }
 }
 
+impl From<crate::fs::mutation::volatile_overlay::OverlayError> for CommandError {
+    fn from(error: crate::fs::mutation::volatile_overlay::OverlayError) -> Self {
+        match error {
+            crate::fs::mutation::volatile_overlay::OverlayError::InvalidArgument => {
+                CommandError::InvalidArgument
+            }
+            crate::fs::mutation::volatile_overlay::OverlayError::IoError => CommandError::IoError,
+            crate::fs::mutation::volatile_overlay::OverlayError::NoSpace => CommandError::NoSpace,
+        }
+    }
+}
+
 pub type CommandResult<T> = std::result::Result<T, CommandError>;

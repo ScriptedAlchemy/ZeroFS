@@ -1,5 +1,5 @@
 use crate::segment_store::GeneratedSegmentCreate;
-use crate::writeback::admission::{Admission, DiskAdmission};
+use crate::writeback::admission::Admission;
 use crate::writeback::config::{AckMode, WritebackSettings};
 use crate::writeback::journal::Journal;
 use crate::writeback::journaler::{LocalBarrierError, LocalJournaler};
@@ -9,6 +9,9 @@ use crate::writeback::model::{
 use crate::writeback::overlay::{OverlayCommitObserver, OverlayIndex, VisibleVersion};
 use crate::writeback::payload::VerifiedPayload;
 use crate::writeback::remote::{RemoteBarrierError, RemoteScheduler};
+use crate::writeback::reservation::{SsdAdmission, SsdReservationRequest, SsdReservationToken};
+use crate::writeback::space_refresher::SpaceRefresher;
+use crate::writeback::space_sample::PhysicalSpaceSampler;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::BoxStream;
@@ -26,10 +29,19 @@ use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path as FilePath, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{Mutex, Notify, OwnedMutexGuard};
 use uuid::Uuid;
+
+/// Object-writeback durability failure. Local and remote terminals stay distinct.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum WritebackError {
+    #[error(transparent)]
+    Local(#[from] LocalBarrierError),
+    #[error(transparent)]
+    Remote(#[from] RemoteBarrierError),
+}
 
 const KEY_LOCK_SHARDS: usize = 256;
 
@@ -43,7 +55,9 @@ struct WritebackStoreInner {
     settings: WritebackSettings,
     overlay: OverlayIndex,
     admission: Admission,
-    disk: DiskAdmission,
+    space: Arc<PhysicalSpaceSampler>,
+    ssd: Arc<SsdAdmission>,
+    space_refresher: Arc<SpaceRefresher>,
     journaler: LocalJournaler,
     remote: RemoteScheduler,
     database_prefix: String,
@@ -54,6 +68,7 @@ struct WritebackStoreInner {
     started: std::time::Instant,
     available_space: AtomicU64,
     available_space_probed_ms: AtomicU64,
+    stopped: AtomicBool,
 }
 
 impl std::fmt::Debug for WritebackObjectStore {
@@ -91,12 +106,15 @@ impl WritebackStoreInner {
         if probed != 0 && now_ms.saturating_sub(probed) < PROBE_TTL_MS {
             return Ok(self.available_space.load(Ordering::Acquire));
         }
-        let available = fs4::available_space(&self.settings.dir)
-            .map_err(|error| generic_error(format!("failed to inspect writeback SSD: {error}")))?;
-        self.available_space.store(available, Ordering::Release);
+        let sample = self
+            .space
+            .latest_sample()
+            .ok_or_else(|| generic_error("writeback SSD has no physical-space sample"))?;
+        self.available_space
+            .store(sample.available_bytes, Ordering::Release);
         self.available_space_probed_ms
             .store(now_ms.max(1), Ordering::Release);
-        Ok(available)
+        Ok(sample.available_bytes)
     }
 }
 
@@ -106,7 +124,7 @@ impl WritebackObjectStore {
         journal: Arc<Journal>,
         settings: WritebackSettings,
     ) -> anyhow::Result<Self> {
-        Self::open_with_remote_state(remote, journal, settings, true).await
+        Self::open_with_remote_state(remote, journal, settings, true, None).await
     }
 
     /// Open a recovered overlay without allowing the remote view to advance.
@@ -115,7 +133,17 @@ impl WritebackObjectStore {
         journal: Arc<Journal>,
         settings: WritebackSettings,
     ) -> anyhow::Result<Self> {
-        Self::open_with_remote_state(remote, journal, settings, false).await
+        Self::open_with_remote_state(remote, journal, settings, false, None).await
+    }
+
+    pub(crate) async fn open_paused_with_owners(
+        remote: Arc<dyn ObjectStore>,
+        journal: Arc<Journal>,
+        settings: WritebackSettings,
+        space: Arc<PhysicalSpaceSampler>,
+        ssd: Arc<SsdAdmission>,
+    ) -> anyhow::Result<Self> {
+        Self::open_with_remote_state(remote, journal, settings, false, Some((space, ssd))).await
     }
 
     async fn open_with_remote_state(
@@ -123,26 +151,37 @@ impl WritebackObjectStore {
         journal: Arc<Journal>,
         settings: WritebackSettings,
         remote_active: bool,
+        owners: Option<(Arc<PhysicalSpaceSampler>, Arc<SsdAdmission>)>,
     ) -> anyhow::Result<Self> {
         if settings.memory_bytes == 0 {
             anyhow::bail!("writeback requires a positive independent dirty RAM budget");
         }
         let snapshot = journal.snapshot()?;
         let database_prefix = snapshot.identity.database_prefix.clone();
-        let available = fs4::available_space(&settings.dir)?;
+        let (space, ssd, sample) = match owners {
+            Some((space, ssd)) => {
+                let sample = space
+                    .latest_sample()
+                    .ok_or_else(|| anyhow::anyhow!("writeback SSD has no physical-space sample"))?;
+                (space, ssd, sample)
+            }
+            None => {
+                let space = Arc::new(PhysicalSpaceSampler::new(settings.dir.clone()));
+                let sample = space.sample().await?;
+                let pending = journal.pending_ssd_reservations()?;
+                let ssd = Arc::new(SsdAdmission::recover(
+                    settings.disk_bytes,
+                    1 << 20,
+                    settings.high_watermark_percent,
+                    settings.resume_percent,
+                    settings.min_free_bytes,
+                    pending,
+                    Some(sample),
+                )?);
+                (space, ssd, sample)
+            }
+        };
         let admission = Admission::new(settings.memory_bytes);
-        let dirty_ssd_reserved_bytes = snapshot
-            .dirty_blob_bytes
-            .checked_add(snapshot.dirty_metadata_reserved_bytes)
-            .ok_or_else(|| anyhow::anyhow!("dirty journal SSD byte count overflow"))?;
-        let disk = DiskAdmission::with_used(
-            settings.disk_bytes,
-            settings.high_watermark_percent,
-            settings.resume_percent,
-            settings.min_free_bytes,
-            dirty_ssd_reserved_bytes,
-            available,
-        )?;
         let overlay = OverlayIndex::recover(remote.clone(), journal.clone()).await?;
         let observer = Arc::new(OverlayCommitObserver::new(overlay.clone(), journal.clone()));
         let queue_depth = settings
@@ -150,12 +189,13 @@ impl WritebackObjectStore {
             .max(settings.local_concurrency)
             .saturating_mul(4)
             .max(16);
-        let journaler = LocalJournaler::start_with_observer(
+        let journaler = LocalJournaler::start_with_observer_and_space(
             journal.clone(),
             admission.clone(),
             queue_depth,
             settings.local_concurrency,
             Some(observer),
+            Arc::clone(&space),
         )?;
         let remote = if remote_active {
             RemoteScheduler::start(
@@ -163,7 +203,8 @@ impl WritebackObjectStore {
                 journal.clone(),
                 overlay.clone(),
                 admission.clone(),
-                disk.clone(),
+                Arc::clone(&ssd),
+                Arc::clone(&space),
                 journaler.barrier(),
                 settings.upload_concurrency,
             )?
@@ -173,7 +214,8 @@ impl WritebackObjectStore {
                 journal.clone(),
                 overlay.clone(),
                 admission.clone(),
-                disk.clone(),
+                Arc::clone(&ssd),
+                Arc::clone(&space),
                 journaler.barrier(),
                 settings.upload_concurrency,
             )?
@@ -184,7 +226,9 @@ impl WritebackObjectStore {
                 settings,
                 overlay,
                 admission,
-                disk,
+                space: Arc::clone(&space),
+                ssd: Arc::clone(&ssd),
+                space_refresher: SpaceRefresher::start(Arc::clone(&ssd), Arc::clone(&space)),
                 journaler,
                 remote,
                 database_prefix,
@@ -195,8 +239,9 @@ impl WritebackObjectStore {
                     .collect(),
                 admission_order: Mutex::new(()),
                 started: std::time::Instant::now(),
-                available_space: AtomicU64::new(0),
-                available_space_probed_ms: AtomicU64::new(0),
+                available_space: AtomicU64::new(sample.available_bytes),
+                available_space_probed_ms: AtomicU64::new(1),
+                stopped: AtomicBool::new(false),
             }),
         })
     }
@@ -219,6 +264,79 @@ impl WritebackObjectStore {
         self.inner.remote.barrier().wait_remote(sequence).await
     }
 
+    pub(crate) fn journal_incarnation(&self) -> uuid::Uuid {
+        self.inner.incarnation
+    }
+
+    /// Conservative newest accepted sequence. Callers capture this while the
+    /// filesystem flush barrier is held so later object mutations cannot commit
+    /// without being included.
+    pub(crate) fn accepted_sequence(&self) -> crate::writeback::model::Sequence {
+        self.inner.next_sequence.load(Ordering::Acquire)
+    }
+
+    /// Conservative object coverage after database close, including objects
+    /// emitted by close itself.
+    pub(crate) fn object_coverage(&self) -> crate::fs::mutation::durability::ObjectCoverage {
+        crate::fs::mutation::durability::ObjectCoverage::Writeback {
+            journal_incarnation: crate::fs::mutation::durability::JournalIncarnation::new(
+                self.journal_incarnation(),
+            ),
+            sequence: self.accepted_sequence(),
+        }
+    }
+
+    pub(crate) async fn wait_local_coverage(
+        &self,
+        journal_incarnation: uuid::Uuid,
+        sequence: crate::writeback::model::Sequence,
+    ) -> Result<(), LocalBarrierError> {
+        if journal_incarnation != self.inner.incarnation {
+            return Err(LocalBarrierError::StaleIncarnation);
+        }
+        self.wait_local(sequence).await
+    }
+
+    pub(crate) async fn wait_remote_coverage(
+        &self,
+        journal_incarnation: uuid::Uuid,
+        sequence: crate::writeback::model::Sequence,
+    ) -> Result<(), RemoteBarrierError> {
+        if journal_incarnation != self.inner.incarnation {
+            return Err(RemoteBarrierError::StaleIncarnation);
+        }
+        self.wait_remote(sequence).await
+    }
+
+    pub(crate) async fn wait_coverage(
+        &self,
+        journal_incarnation: uuid::Uuid,
+        sequence: crate::writeback::model::Sequence,
+        remote: bool,
+    ) -> Result<(), WritebackError> {
+        if remote {
+            self.wait_remote_coverage(journal_incarnation, sequence)
+                .await
+                .map_err(WritebackError::from)
+        } else {
+            self.wait_local_coverage(journal_incarnation, sequence)
+                .await
+                .map_err(WritebackError::from)
+        }
+    }
+
+    pub(crate) fn space_sampler(&self) -> &Arc<PhysicalSpaceSampler> {
+        &self.inner.space
+    }
+
+    pub(crate) fn ssd_admission(&self) -> &Arc<SsdAdmission> {
+        &self.inner.ssd
+    }
+
+    async fn reserve_ssd(&self, bytes: u64) -> object_store::Result<SsdReservationToken> {
+        reserve_ssd_token(&self.inner.ssd, &self.inner.space, bytes).await
+    }
+
     /// Start remote writeback after callers have finished opening over the
     /// stable recovered overlay. Repeated activation is harmless.
     pub fn activate_remote(&self) -> Result<(), RemoteBarrierError> {
@@ -230,7 +348,7 @@ impl WritebackObjectStore {
     }
 
     pub fn dirty_ssd_reserved_bytes(&self) -> u64 {
-        self.inner.disk.used_bytes()
+        self.inner.ssd.used_bytes()
     }
 
     pub fn status(&self) -> anyhow::Result<WritebackStatus> {
@@ -255,7 +373,7 @@ impl WritebackObjectStore {
             dirty_ram_bytes: self.inner.admission.used_bytes(),
             dirty_ram_capacity_bytes: self.inner.settings.memory_bytes,
             dirty_ram_operations: self.inner.admission.used_operations(),
-            dirty_ssd_reserved_bytes: self.inner.disk.used_bytes(),
+            dirty_ssd_reserved_bytes: self.inner.ssd.used_bytes(),
             dirty_ssd_capacity_bytes: self.inner.settings.disk_bytes,
             dirty_ssd_operations: progress.local_seq.saturating_sub(progress.remote_seq),
             oldest_pending_age_ms,
@@ -268,6 +386,14 @@ impl WritebackObjectStore {
     }
 
     pub async fn shutdown(&self) -> Result<(), LocalBarrierError> {
+        if self
+            .inner
+            .stopped
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Ok(());
+        }
         match self.inner.settings.shutdown_flush {
             crate::writeback::config::ShutdownFlush::Local => {
                 self.inner.remote.shutdown().await.map_err(|error| {
@@ -291,7 +417,8 @@ impl WritebackObjectStore {
                 })?;
             }
         }
-        self.inner.disk.close();
+        self.inner.space_refresher.shutdown().await;
+        self.inner.ssd.close();
         Ok(())
     }
 
@@ -345,8 +472,18 @@ impl WritebackObjectStore {
         bytes: Bytes,
         options: PutOptions,
         ram: crate::writeback::admission::AcceptedAdmission,
-        disk: crate::writeback::admission::DiskPermit,
+        disk: Option<SsdReservationToken>,
     ) -> object_store::Result<PutResult> {
+        let disk_charge = MutationRecord::ssd_reservation_estimate(
+            location.as_ref(),
+            None,
+            bytes.len() as u64,
+        )
+        .map_err(|error| generic_error(format!("failed to size put journal entry: {error}")))?;
+        let disk = match disk {
+            Some(disk) => disk,
+            None => self.reserve_ssd(disk_charge).await?,
+        };
         let lock = self.key_lock(&location);
         let key_guard = lock.lock_owned().await;
         let trusted_segment_create = options.extensions.get::<GeneratedSegmentCreate>().is_some();
@@ -460,13 +597,7 @@ impl WritebackObjectStore {
         let disk_charge = MutationRecord::metadata_ssd_reservation(&path).map_err(|error| {
             generic_error(format!("failed to size delete journal record: {error}"))
         })?;
-        let available = self.inner.available_space()?;
-        let disk = self
-            .inner
-            .disk
-            .reserve(disk_charge, available)
-            .await
-            .map_err(|error| generic_error(format!("dirty SSD admission failed: {error}")))?;
+        let disk = self.reserve_ssd(disk_charge).await?;
         let lock = self.key_lock(&location);
         let key_guard = lock.lock_owned().await;
         let slot =
@@ -557,7 +688,6 @@ impl WritebackObjectStore {
                 .await
                 .map_err(|error| generic_error(format!("dirty RAM admission failed: {error}")))?
                 .accept();
-            let available = self.inner.available_space()?;
             let disk_charge = MutationRecord::ssd_reservation_estimate(
                 to.as_ref(),
                 Some(from.as_ref()),
@@ -566,12 +696,7 @@ impl WritebackObjectStore {
             .map_err(|error| {
                 generic_error(format!("failed to size copy/rename journal entry: {error}"))
             })?;
-            let disk = self
-                .inner
-                .disk
-                .reserve(disk_charge, available)
-                .await
-                .map_err(|error| generic_error(format!("dirty SSD admission failed: {error}")))?;
+            let disk = self.reserve_ssd(disk_charge).await?;
 
             let key_guards = self.lock_pair(&from, &to).await;
             let target_visible = self.inner.overlay.visible_version(&to).await?;
@@ -698,21 +823,10 @@ impl ObjectStore for WritebackObjectStore {
             .await
             .map_err(|error| generic_error(format!("dirty RAM admission failed: {error}")))?
             .accept();
-        let available = self.inner.available_space()?;
-        let disk_charge =
-            MutationRecord::ssd_reservation_estimate(location.as_ref(), None, bytes_len).map_err(
-                |error| generic_error(format!("failed to size put journal entry: {error}")),
-            )?;
-        let disk = self
-            .inner
-            .disk
-            .reserve(disk_charge, available)
-            .await
-            .map_err(|error| generic_error(format!("dirty SSD admission failed: {error}")))?;
         let bytes = Bytes::from(payload);
         let owned = self.clone();
         let location = location.clone();
-        tokio::spawn(async move { owned.owned_put(location, bytes, options, ram, disk).await })
+        tokio::spawn(async move { owned.owned_put(location, bytes, options, ram, None).await })
             .await
             .map_err(|error| generic_error(format!("owned put task failed: {error}")))?
     }
@@ -1137,23 +1251,23 @@ async fn complete_memory_multipart(
     if assembled.len() != capacity {
         return Err(generic_error("multipart assembled length mismatch"));
     }
-    let available = store.inner.available_space()?;
     let disk_charge = MutationRecord::ssd_reservation_estimate(location.as_ref(), None, total_len)
         .map_err(|error| {
             generic_error(format!(
                 "failed to size memory multipart journal entry: {error}"
             ))
         })?;
-    let disk = store
-        .inner
-        .disk
-        .reserve(disk_charge, available)
-        .await
-        .map_err(|error| generic_error(format!("dirty SSD admission failed: {error}")))?;
+    let disk = store.reserve_ssd(disk_charge).await?;
     let put_options = multipart_put_options(options);
     store
         .clone()
-        .owned_put(location, Bytes::from(assembled), put_options, ram, disk)
+        .owned_put(
+            location,
+            Bytes::from(assembled),
+            put_options,
+            ram,
+            Some(disk),
+        )
         .await
 }
 
@@ -1173,19 +1287,13 @@ async fn complete_multipart(
         .await
         .map_err(|error| generic_error(format!("dirty RAM admission failed: {error}")))?
         .accept();
-    let available = store.inner.available_space()?;
     let disk_charge = MutationRecord::ssd_reservation_estimate(location.as_ref(), None, total_len)
         .map_err(|error| {
             generic_error(format!(
                 "failed to size staged multipart journal entry: {error}"
             ))
         })?;
-    let disk = store
-        .inner
-        .disk
-        .reserve(disk_charge, available)
-        .await
-        .map_err(|error| generic_error(format!("dirty SSD admission failed: {error}")))?;
+    let disk = store.reserve_ssd(disk_charge).await?;
     let read_staging = staging.clone();
     let bytes = tokio::task::spawn_blocking(move || {
         read_multipart_parts(&read_staging, &part_lengths, total_len)
@@ -1197,7 +1305,7 @@ async fn complete_multipart(
     let owned = store.clone();
     let result = tokio::spawn(async move {
         owned
-            .owned_put(location, bytes, put_options, ram, disk)
+            .owned_put(location, bytes, put_options, ram, Some(disk))
             .await
     })
     .await
@@ -1422,6 +1530,27 @@ fn generic_error(message: impl Into<String>) -> object_store::Error {
         store: "ZeroFSWriteback",
         source: message.into().into(),
     }
+}
+
+async fn reserve_ssd_token(
+    ssd: &SsdAdmission,
+    space: &PhysicalSpaceSampler,
+    bytes: u64,
+) -> object_store::Result<SsdReservationToken> {
+    let sample = space
+        .sample()
+        .await
+        .map_err(|error| generic_error(format!("writeback SSD sample failed: {error}")))?;
+    ssd.reserve(
+        SsdReservationRequest {
+            ssd_reservation_bytes: bytes,
+            physical_reservation_bytes: bytes,
+            operations: 1,
+        },
+        sample,
+    )
+    .await
+    .map_err(|error| generic_error(format!("dirty SSD admission failed: {error}")))
 }
 
 #[cfg(test)]
@@ -3092,16 +3221,10 @@ mod tests {
             .await
             .unwrap()
             .accept();
-        let available = fs4::available_space(&store.inner.settings.dir).unwrap();
         let disk_charge =
             MutationRecord::ssd_reservation_estimate(target.as_ref(), None, payload.len() as u64)
                 .unwrap();
-        let disk = store
-            .inner
-            .disk
-            .reserve(disk_charge, available)
-            .await
-            .unwrap();
+        let disk = store.reserve_ssd(disk_charge).await.unwrap();
         let target_blocker = store.key_lock(&target).lock_owned().await;
 
         let copy = tokio::spawn({
@@ -3129,7 +3252,7 @@ mod tests {
             let payload = payload.clone();
             async move {
                 store
-                    .owned_put(target, payload, PutOptions::default(), ram, disk)
+                    .owned_put(target, payload, PutOptions::default(), ram, Some(disk))
                     .await
             }
         });
@@ -4693,6 +4816,82 @@ mod tests {
             elapsed.as_secs_f64(),
         );
 
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn coverage_wait_rejects_a_stale_journal_incarnation() {
+        let (store, _, _temp) = test_store().await;
+        let sequence = store.accepted_sequence();
+        assert_eq!(
+            store
+                .wait_local_coverage(Uuid::nil(), sequence)
+                .await
+                .unwrap_err(),
+            crate::writeback::journaler::LocalBarrierError::StaleIncarnation
+        );
+        assert_eq!(
+            store
+                .wait_remote_coverage(Uuid::nil(), sequence)
+                .await
+                .unwrap_err(),
+            crate::writeback::remote::RemoteBarrierError::StaleIncarnation
+        );
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn object_coverage_includes_the_accepted_sequence() {
+        let (store, _, _temp) = test_store().await;
+        store
+            .put(
+                &Path::from("zerofs/pilot/close-coverage"),
+                Bytes::from_static(b"close").into(),
+            )
+            .await
+            .unwrap();
+        let coverage = store.object_coverage();
+        match coverage {
+            crate::fs::mutation::durability::ObjectCoverage::Writeback {
+                journal_incarnation,
+                sequence,
+            } => {
+                assert_eq!(journal_incarnation.as_uuid(), store.journal_incarnation());
+                assert_eq!(sequence, store.accepted_sequence());
+                assert!(sequence >= 1);
+            }
+            other => panic!("expected writeback coverage, got {other:?}"),
+        }
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn coverage_wait_uses_the_captured_accepted_sequence() {
+        let (store, _, _temp) = test_store().await;
+        store
+            .put(
+                &Path::from("zerofs/pilot/coverage"),
+                Bytes::from_static(b"one").into(),
+            )
+            .await
+            .unwrap();
+        let incarnation = store.journal_incarnation();
+        let sequence = store.accepted_sequence();
+        assert!(
+            sequence >= 1,
+            "accepted coverage must include the just-admitted put"
+        );
+        store
+            .wait_local_coverage(incarnation, sequence)
+            .await
+            .unwrap();
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_is_idempotent_after_the_first_owner_joins() {
+        let (store, _, _temp) = test_store().await;
+        store.shutdown().await.unwrap();
         store.shutdown().await.unwrap();
     }
 }

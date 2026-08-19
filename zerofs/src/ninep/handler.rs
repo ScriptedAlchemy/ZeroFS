@@ -370,6 +370,7 @@ impl Drop for SessionReleaseGuard {
 
 impl NinePHandler {
     pub fn new(filesystem: Arc<ZeroFS>, lock_manager: Arc<FileLockManager>) -> Self {
+        filesystem.install_volatile_overlay();
         static HANDLER_COUNTER: AtomicU64 = AtomicU64::new(1);
 
         let session = Arc::new(Mutex::new(SessionState {
@@ -1770,7 +1771,7 @@ impl NinePHandler {
         let data = Bytes::from(tw.data);
 
         self.filesystem
-            .write_opened_idempotent(&auth, fid_entry.inode_id, tw.offset, &data, op_id)
+            .write_ack_opened_idempotent(&auth, fid_entry.inode_id, tw.offset, &data, op_id)
             .await
             .inspect_err(|&e| {
                 debug!("write: failed with error: {:?}", e);
@@ -1785,7 +1786,7 @@ impl NinePHandler {
     async fn getattr(&self, tg: Tgetattr) -> P9Result<Message> {
         let fid_entry = self.get_fid(tg.fid)?;
 
-        let inode = self.filesystem.inode_store.get(fid_entry.inode_id).await?;
+        let inode = self.filesystem.visible_inode(fid_entry.inode_id).await?;
 
         Ok(Message::Rgetattr(Rgetattr {
             valid: tg.request_mask & GETATTR_ALL,
@@ -2039,7 +2040,7 @@ impl NinePHandler {
     async fn readlink(&self, tr: Treadlink) -> P9Result<Message> {
         let fid_entry = self.get_fid(tr.fid)?;
 
-        let inode = self.filesystem.inode_store.get(fid_entry.inode_id).await?;
+        let inode = self.filesystem.visible_inode(fid_entry.inode_id).await?;
 
         match inode {
             Inode::Symlink(s) => Ok(Message::Rreadlink(Rreadlink {
@@ -2216,7 +2217,7 @@ impl NinePHandler {
         let fid = self.get_fid(tf.fid)?;
         let fid_path = fid.path.clone();
 
-        self.filesystem.client_fsync().await?;
+        self.filesystem.wait_inode_durability(fid.inode_id).await?;
 
         {
             let path = if fid_path.is_empty() {
@@ -6682,6 +6683,67 @@ mod tests {
                 "seed {seed}: leaked open-handle counts after all sessions closed: {leaked:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn ninep_fsync_waits_for_configured_write_ack_barrier() {
+        use crate::fs::mutation::config::{
+            ClientDurabilityTarget, FilesystemWriteAckMode, FilesystemWriteAckSettings,
+            FilesystemWriteAckSource,
+        };
+        use tokio::sync::Notify;
+
+        let mut fs = ZeroFS::new_in_memory().await.unwrap();
+        fs.write_ack = FilesystemWriteAckSettings {
+            mode: FilesystemWriteAckMode::Materialized,
+            volatile_memory_bytes: 0,
+            volatile_max_operations: crate::fs::mutation::config::DEFAULT_VOLATILE_MAX_OPERATIONS,
+            source: FilesystemWriteAckSource::DefaultMaterialized,
+            client_durability_target: ClientDurabilityTarget::LocalSsd,
+        };
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        fs.flush_coordinator.set_local_durability_barrier({
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            Arc::new(move || {
+                let entered = Arc::clone(&entered);
+                let release = Arc::clone(&release);
+                Box::pin(async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    Ok(())
+                })
+            })
+        });
+        let fs = Arc::new(fs);
+        let handler = NinePHandler::new(Arc::clone(&fs), Arc::new(FileLockManager::new()));
+        start_plain_session(&handler).await;
+
+        let mut fsync = tokio::spawn(async move {
+            request(
+                &handler,
+                2,
+                Message::Tfsync(Tfsync {
+                    fid: 1,
+                    datasync: 0,
+                }),
+            )
+            .await
+        });
+        entered.notified().await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut fsync)
+                .await
+                .is_err(),
+            "9P Tfsync returned before the configured write-ack barrier completed"
+        );
+        release.notify_one();
+        let reply = tokio::time::timeout(Duration::from_secs(2), fsync)
+            .await
+            .expect("9P Tfsync did not resume")
+            .expect("9P Tfsync panicked");
+        assert!(matches!(reply.body, Message::Rfsync(_)));
     }
 
     fn test_creds() -> Credentials {
