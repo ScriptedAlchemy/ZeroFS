@@ -11,6 +11,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static RSS_CAP_BYTES: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(test)]
+pub(crate) static RSS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
 thread_local! {
     static TEST_ENVELOPE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
     static TEST_ALLOCATOR_STATS: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
@@ -82,8 +85,6 @@ mod tests {
     use super::*;
 
     const GIB: u64 = 1024 * 1024 * 1024;
-    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     struct Reset;
 
     impl Drop for Reset {
@@ -96,7 +97,7 @@ mod tests {
 
     #[test]
     fn retained_virtual_mappings_do_not_count_as_resident_pressure() {
-        let _lock = TEST_LOCK
+        let _lock = RSS_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _reset = Reset;
@@ -112,7 +113,7 @@ mod tests {
 
     #[test]
     fn validated_service_envelope_allows_full_clean_cache_plus_overhead() {
-        let _lock = TEST_LOCK
+        let _lock = RSS_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _reset = Reset;
@@ -129,7 +130,7 @@ mod tests {
 
     #[test]
     fn validated_service_envelope_trips_before_its_hard_limit() {
-        let _lock = TEST_LOCK
+        let _lock = RSS_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _reset = Reset;

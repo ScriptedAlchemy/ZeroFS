@@ -837,6 +837,22 @@ fn shared_maintenance_runtime() -> &'static tokio::runtime::Handle {
 const BARRIER_CONTROLLED_L0_SST_SIZE_BYTES: usize = usize::MAX - 1;
 const BARRIER_CONTROLLED_MAX_UNFLUSHED_BYTES: usize = usize::MAX;
 
+fn select_rss_pressure_cap(installed_cap: u64, clean_cache_fallback: u64) -> u64 {
+    if installed_cap == 0 {
+        clean_cache_fallback
+    } else {
+        installed_cap
+    }
+}
+
+fn install_validated_rss_cap(
+    memory_budget: Option<&crate::cli::memory_budget::MemoryBudgetReceipt>,
+) {
+    if let Some(memory_budget) = memory_budget {
+        crate::alloc_rss::set_rss_cap_bytes(memory_budget.rss_pressure_cap_bytes);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn build_slatedb(
     object_store: Arc<dyn object_store::ObjectStore>,
@@ -983,14 +999,11 @@ pub async fn build_slatedb(
     let compactor_object_store = object_store.clone();
     let wal_object_store = wal_object_store
         .map(|s| Arc::new(LengthCheckedObjectStore::new(s)) as Arc<dyn object_store::ObjectStore>);
-    let rss_pressure_cap_bytes = match crate::alloc_rss::rss_cap_bytes() {
-        0 => {
-            let clean_cache_fallback = total_memory_bytes as u64;
-            crate::alloc_rss::set_rss_cap_bytes(clean_cache_fallback);
-            clean_cache_fallback
-        }
-        validated_cap => validated_cap,
-    };
+    let installed_cap = crate::alloc_rss::rss_cap_bytes();
+    let rss_pressure_cap_bytes = select_rss_pressure_cap(installed_cap, total_memory_bytes as u64);
+    if installed_cap == 0 {
+        crate::alloc_rss::set_rss_cap_bytes(rss_pressure_cap_bytes);
+    }
     info!(
         "Resident-memory pressure cap: {} MB (configured clean cache: {} MB)",
         rss_pressure_cap_bytes / 1_000_000,
@@ -1189,9 +1202,7 @@ pub async fn run_server(
     info!("ZeroFS v{}", env!("CARGO_PKG_VERSION"));
 
     let (settings, memory_budget) = load_and_validate_server_settings(&config_path)?;
-    if let Some(memory_budget) = memory_budget {
-        crate::alloc_rss::set_rss_cap_bytes(memory_budget.rss_pressure_cap_bytes);
-    }
+    install_validated_rss_cap(memory_budget.as_ref());
 
     let db_mode = match (read_only, &checkpoint_name) {
         (false, None) => DatabaseMode::ReadWrite,
@@ -1759,6 +1770,63 @@ fn load_and_validate_server_settings(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validated_rss_cap_survives_startup_and_cache_build_selection() {
+        struct ResetRss;
+        impl Drop for ResetRss {
+            fn drop(&mut self) {
+                crate::alloc_rss::set_test_rss_envelope(None);
+                crate::alloc_rss::set_rss_cap_bytes(0);
+            }
+        }
+
+        let _lock = crate::alloc_rss::RSS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _reset = ResetRss;
+        let gib = 1024 * 1024 * 1024;
+        let validated_service_cap = 56 * gib;
+        let configured_clean_cache = 64 * gib;
+        let receipt = crate::cli::memory_budget::MemoryBudgetReceipt {
+            hard_limit_bytes: 96 * gib,
+            required_bytes: 88 * gib,
+            remaining_bytes: 8 * gib,
+            rss_pressure_cap_bytes: validated_service_cap,
+        };
+
+        crate::alloc_rss::set_rss_cap_bytes(0);
+        install_validated_rss_cap(Some(&receipt));
+        let installed_cap = crate::alloc_rss::rss_cap_bytes();
+        assert_eq!(
+            installed_cap, validated_service_cap,
+            "server startup must install the validated receipt cap"
+        );
+
+        assert_eq!(
+            select_rss_pressure_cap(installed_cap, configured_clean_cache),
+            validated_service_cap,
+            "build_slatedb must preserve the startup-validated service envelope"
+        );
+        assert_eq!(
+            select_rss_pressure_cap(0, configured_clean_cache),
+            configured_clean_cache,
+            "standalone callers without a validated envelope retain the cache fallback"
+        );
+
+        crate::alloc_rss::set_test_rss_envelope(Some(validated_service_cap));
+        assert!(
+            crate::alloc_rss::over_rss_cap(),
+            "GC's process-wide brake must consume the installed receipt cap"
+        );
+        assert!(
+            crate::alloc_rss::over_rss_cap_of(select_rss_pressure_cap(
+                installed_cap,
+                configured_clean_cache,
+            )),
+            "prefetch admission must consume the same selected cap"
+        );
+    }
 
     #[test]
     fn unsafe_budget_fails_before_the_file_backend_is_opened() {

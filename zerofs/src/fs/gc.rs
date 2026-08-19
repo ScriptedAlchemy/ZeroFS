@@ -758,6 +758,9 @@ mod tests {
 
     #[test]
     fn keep_going_false_when_rss_over_cap() {
+        let _lock = crate::alloc_rss::RSS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         crate::alloc_rss::set_rss_cap_bytes(64);
         crate::alloc_rss::set_test_rss_envelope(Some(100));
         assert!(
