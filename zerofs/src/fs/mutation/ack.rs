@@ -18,11 +18,24 @@ impl ZeroFS {
     /// Direct backends without writeback flush to the remote object store
     /// through that coordinator.
     pub(crate) async fn wait_configured_durability(&self) -> Result<(), FsError> {
+        if let Some(overlay) = self.volatile_overlay.get() {
+            overlay.wait_all().await.map_err(|_| FsError::IoError)?;
+        }
         match self.write_ack.client_durability_target {
             ClientDurabilityTarget::LocalSsd | ClientDurabilityTarget::RemoteBackend => {
                 self.client_fsync().await
             }
         }
+    }
+
+    pub(crate) async fn wait_inode_durability(
+        &self,
+        id: crate::fs::inode::InodeId,
+    ) -> Result<(), FsError> {
+        if let Some(overlay) = self.volatile_overlay.get() {
+            overlay.wait_inode(id).await.map_err(|_| FsError::IoError)?;
+        }
+        self.wait_configured_durability().await
     }
 }
 

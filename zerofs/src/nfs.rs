@@ -27,6 +27,7 @@ pub struct NFSAdapter {
 
 impl NFSAdapter {
     pub fn new(fs: Arc<ZeroFS>) -> Self {
+        fs.install_volatile_overlay();
         Self {
             fs,
             shared_identity: None,
@@ -101,7 +102,7 @@ impl NFSFileSystem for NFSAdapter {
 
     async fn getattr(&self, _auth: &NfsAuthContext, id: fileid3) -> Result<fattr3, nfsstat3> {
         debug!("getattr called: id={}", id);
-        let inode = self.fs.inode_store.get(id).await?;
+        let inode = self.fs.visible_inode(id).await?;
         Ok(InodeWithId { inode: &inode, id }.into())
     }
 
@@ -137,8 +138,10 @@ impl NFSFileSystem for NFSAdapter {
 
         let auth_ctx = self.auth_context(auth);
         let data_bytes = bytes::Bytes::copy_from_slice(data);
-        let file_attrs: crate::fs::types::FileAttributes =
-            self.fs.write(&auth_ctx, id, offset, &data_bytes).await?;
+        let file_attrs: crate::fs::types::FileAttributes = self
+            .fs
+            .write_ack(&auth_ctx, id, offset, &data_bytes)
+            .await?;
         Ok((&file_attrs).into())
     }
 
@@ -383,7 +386,7 @@ impl NFSFileSystem for NFSAdapter {
             count
         );
 
-        match self.fs.wait_configured_durability().await {
+        match self.fs.wait_inode_durability(fileid).await {
             Ok(_) => {
                 debug!("commit successful for file {}", fileid);
                 self.fs

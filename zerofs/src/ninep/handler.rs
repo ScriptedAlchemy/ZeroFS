@@ -370,6 +370,7 @@ impl Drop for SessionReleaseGuard {
 
 impl NinePHandler {
     pub fn new(filesystem: Arc<ZeroFS>, lock_manager: Arc<FileLockManager>) -> Self {
+        filesystem.install_volatile_overlay();
         static HANDLER_COUNTER: AtomicU64 = AtomicU64::new(1);
 
         let session = Arc::new(Mutex::new(SessionState {
@@ -1750,7 +1751,7 @@ impl NinePHandler {
         let data = Bytes::from(tw.data);
 
         self.filesystem
-            .write_opened_idempotent(&auth, fid_entry.inode_id, tw.offset, &data, op_id)
+            .write_ack_opened_idempotent(&auth, fid_entry.inode_id, tw.offset, &data, op_id)
             .await
             .inspect_err(|&e| {
                 debug!("write: failed with error: {:?}", e);
@@ -1765,7 +1766,7 @@ impl NinePHandler {
     async fn getattr(&self, tg: Tgetattr) -> P9Result<Message> {
         let fid_entry = self.get_fid(tg.fid)?;
 
-        let inode = self.filesystem.inode_store.get(fid_entry.inode_id).await?;
+        let inode = self.filesystem.visible_inode(fid_entry.inode_id).await?;
 
         Ok(Message::Rgetattr(Rgetattr {
             valid: tg.request_mask & GETATTR_ALL,
@@ -2019,7 +2020,7 @@ impl NinePHandler {
     async fn readlink(&self, tr: Treadlink) -> P9Result<Message> {
         let fid_entry = self.get_fid(tr.fid)?;
 
-        let inode = self.filesystem.inode_store.get(fid_entry.inode_id).await?;
+        let inode = self.filesystem.visible_inode(fid_entry.inode_id).await?;
 
         match inode {
             Inode::Symlink(s) => Ok(Message::Rreadlink(Rreadlink {

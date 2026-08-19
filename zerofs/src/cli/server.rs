@@ -275,6 +275,7 @@ async fn start_nbd_servers(
         None => return Ok((Vec::new(), None)),
     };
     let mut handles = Vec::new();
+    fs.install_volatile_overlay();
     let volatile_memory_bytes = nbd_volatile_budget(fs.write_ack);
     let volatile_enabled = volatile_memory_bytes > 0;
     metrics::gauge!("zerofs_nbd_volatile_memory_enabled").set(f64::from(volatile_enabled));
@@ -286,7 +287,10 @@ async fn start_nbd_servers(
     } else {
         info!("NBD materialized write acknowledgement is enabled");
     }
-    let export_gates = Arc::new(NbdExportGates::new(volatile_memory_bytes));
+    let export_gates = Arc::new(match fs.volatile_budget() {
+        Some(budget) => NbdExportGates::with_budget(Some(budget)),
+        None => NbdExportGates::new(volatile_memory_bytes),
+    });
 
     if let Some(addresses) = &config.addresses {
         for addr in addresses {

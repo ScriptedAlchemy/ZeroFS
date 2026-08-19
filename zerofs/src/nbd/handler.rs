@@ -1,15 +1,15 @@
 use super::error::{CommandError, CommandResult, NBDError, Result};
 use super::out_of_bounds;
-use crate::fs::mutation::volatile_overlay::{
-    Materializer, VolatileAdmission, VolatileBudget, VolatileWriteRuntime,
-    WriteChunk as VolatileWriteChunk,
-};
 use super::{
     NBD_STRIPE_MANIFEST_MAX_BYTES, NBD_STRIPE_MARKER, StripeManifest, is_nbd_provision_staging_name,
 };
 use crate::fs::ZeroFS;
 use crate::fs::errors::FsError;
 use crate::fs::inode::Inode;
+use crate::fs::mutation::volatile_overlay::{
+    Materializer, OverlayError, VolatileAdmission, VolatileBudget, VolatileWriteRuntime,
+    WriteChunk as VolatileWriteChunk,
+};
 use crate::fs::tracing::FileOperation;
 use crate::fs::types::AuthContext;
 use bytes::{Bytes, BytesMut};
@@ -249,11 +249,16 @@ impl Default for NbdExportGates {
 
 impl NbdExportGates {
     pub fn new(volatile_memory_bytes: u64) -> Self {
+        Self::with_budget(
+            (volatile_memory_bytes > 0).then(|| VolatileBudget::new(volatile_memory_bytes, 65_536)),
+        )
+    }
+
+    pub fn with_budget(budget: Option<std::sync::Arc<VolatileBudget>>) -> Self {
         Self {
             registry: StdMutex::new(ExportRegistry::default()),
             materialized_gates: StdMutex::new(HashMap::new()),
-            volatile_budget: (volatile_memory_bytes > 0)
-                .then(|| VolatileBudget::new(volatile_memory_bytes, 65_536)),
+            volatile_budget: budget,
         }
     }
 
@@ -322,7 +327,7 @@ impl NbdExportGates {
                         .write(&auth, inode, offset, &data)
                         .await
                         .map(|_| ())
-                        .map_err(CommandError::from)
+                        .map_err(OverlayError::from)
                 })
             });
             VolatileWriteRuntime::new(Arc::clone(budget), backing_inodes.clone(), materializer)
@@ -369,7 +374,7 @@ impl NbdExportGates {
                 first_error.get_or_insert(error);
             }
         }
-        first_error.map_or(Ok(()), Err)
+        first_error.map_or(Ok(()), |error| Err(CommandError::from(error)))
     }
 
     pub(crate) fn fence_abort(&self) {
@@ -748,9 +753,18 @@ impl NBDHandler {
             let backing = device.backing.clone();
             return runtime
                 .read(offset, length as usize, move || {
-                    Box::pin(read_backing(filesystem, backing, offset, length))
+                    Box::pin(async move {
+                        read_backing(filesystem, backing, offset, length)
+                            .await
+                            .map_err(|error| match error {
+                                CommandError::InvalidArgument => OverlayError::InvalidArgument,
+                                CommandError::IoError => OverlayError::IoError,
+                                CommandError::NoSpace => OverlayError::NoSpace,
+                            })
+                    })
                 })
-                .await;
+                .await
+                .map_err(CommandError::from);
         }
 
         read_backing(
