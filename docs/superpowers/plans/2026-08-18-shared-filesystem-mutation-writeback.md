@@ -1166,7 +1166,7 @@ Cover accepted/materialized sequence and lag, raw bytes/ops/age, active material
 
 Subscribe to lifecycle state and snapshots. Document materialized default, explicit RAM-loss boundary, protocol durability semantics, namespace separation, legacy migration, sizing, metrics, and explicit remote flush. Do not edit the approved spec.
 
-- [ ] **Step 3: Run Plan A gate and commit**
+- [ ] **Step 3: Run the pre-read composition gate and commit**
 
 ```bash
 cd /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback/zerofs
@@ -1181,3 +1181,646 @@ git commit -m "docs(writeback): expose shared mutation lifecycle"
 ```
 
 Expected: the old NBD overlay is absent; generated config remains materialized; every writable adapter reaches the shared coordinator; lifecycle has exactly one close owner; no approved-spec diff exists.
+
+---
+
+### Task A19: Fetch Independent Fragmented Read Runs With Bounded Concurrency
+
+**Files:**
+- Modify: `zerofs/src/fs/store/extent/read.rs`
+- Create: `zerofs/src/fs/store/extent/read/run_fetch.rs`
+- Create: `zerofs/src/fs/store/extent/read/tests.rs`
+- Create: `zerofs/src/fs/store/extent/read/metrics.rs`
+
+**Interfaces:**
+- Produces: an ordered read-run plan, bounded concurrent fetch of independent immutable on-store segment runs, and bounded-cardinality logical/read-run utilization metrics.
+- Consumes: the existing extent-location range scan, decoded/open-buffer fast paths, `SegmentStore::read_run`, stale-location re-resolution, nomination/crossing accounting, and the existing `PARALLEL_EXTENT_OPS` bound.
+
+- [ ] **Step 1: Split the existing tests and production worker without behavior change**
+
+Move the inline `read.rs` test module to `read/tests.rs` before adding behavior. Extract the existing maximal-run planning and run-fetch control flow from the current `read_range` body into `read/run_fetch.rs`; `read_range` remains a facade that performs validation, delegates planning/fetch, and assembles the result. No async function may exceed 100 lines, `read.rs` and `run_fetch.rs` must each remain below 600 production lines, and source plus tests remain below 1000 lines per file. Run the complete existing module gate and require a nonzero pass count.
+
+```bash
+cd /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback/zerofs
+cargo_test_nonzero 'fs::store::extent::read::tests' -p zerofs --locked
+cargo fmt --all -- --check
+git diff --check
+```
+
+- [ ] **Step 2: Add the focused RED tests**
+
+Name tests:
+
+- `one_fragmented_read_fetches_independent_runs_concurrently`
+- `fragmented_read_concurrency_is_bounded`
+- `fragmented_read_preserves_logical_output_order`
+- `contiguous_control_remains_one_ranged_get`
+- `stale_location_fallback_remains_correct_under_concurrency`
+- `failed_fragmented_read_releases_every_fetch_permit`
+
+Use a latency-gated, peak-concurrency-counting real `ObjectStore` test seam behind the production extent/segment path. Build a logically sequential file whose adjacent extents occupy at least eight independent segment runs. Before releasing any GET, require at least two and at most `PARALLEL_EXTENT_OPS` backend reads to have started. Verify exact bytes and the exact run count. Current code is RED because `read_range` awaits each on-store run before starting the next.
+
+List every fully qualified test first. Run the two concurrency assertions against the pre-fix implementation and require a failing exit. Run the four order/fallback/cleanup controls against the pre-fix implementation and require an exact pass; they protect existing behavior and are not artificial REDs. A missing test or zero selected tests fails either gate.
+
+```bash
+cd /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback/zerofs
+READ_TEST_PREFIX='fs::store::extent::read::tests::'
+cargo test -p zerofs --locked -- --list 2>&1 | tee "${TMPDIR:-/tmp}/zerofs-read-red-list.log"
+for name in \
+  one_fragmented_read_fetches_independent_runs_concurrently \
+  fragmented_read_concurrency_is_bounded
+do
+  grep -F "${READ_TEST_PREFIX}${name}: test" "${TMPDIR:-/tmp}/zerofs-read-red-list.log"
+  if cargo test -p zerofs --locked "${READ_TEST_PREFIX}${name}" -- --exact --nocapture; then
+    echo "expected RED but ${name} passed" >&2
+    exit 1
+  fi
+done
+for name in \
+  fragmented_read_preserves_logical_output_order \
+  contiguous_control_remains_one_ranged_get \
+  stale_location_fallback_remains_correct_under_concurrency \
+  failed_fragmented_read_releases_every_fetch_permit
+do
+  grep -F "${READ_TEST_PREFIX}${name}: test" "${TMPDIR:-/tmp}/zerofs-read-red-list.log"
+  cargo_test_nonzero "${READ_TEST_PREFIX}${name}" -p zerofs --locked
+done
+```
+
+- [ ] **Step 3: Implement the minimum shared read fix**
+
+Resolve and coalesce the existing maximal runs first. Serve decoded/open-buffer runs through their current fast paths. Fetch independent immutable on-store runs with bounded ordered concurrency, then assemble results in logical order. Preserve:
+
+- decoded-cache and raw-part-cache identities;
+- stale-location re-resolution and retry behavior;
+- extent crossing and nomination accounting;
+- exact zero-fill/EOF behavior;
+- one ranged GET for a contiguous single-segment run;
+- cancellation/error cleanup with no leaked permits or background tasks.
+
+The dedicated metrics owner records logical bytes, extent/run counts, unique segment
+count, on-store run count/bytes, active and peak run fetches, and total read duration.
+It uses no inode, path, object key, request ID, or error-string label. Cache-tier proof
+remains a benchmark receipt derived from isolated process/cache roots plus local-device
+and network counters; do not fabricate a RAM/SSD/remote label from unavailable cache
+internals.
+
+Do not change NFS framing, SFTP packet geometry, cache policy, write acknowledgement, durability, or object layout in this task. Further NFS copy/framing work requires a separate measured RED after this shared fix.
+
+- [ ] **Step 4: Run exact GREEN, the shared-read gate, and exact-fence commit**
+
+```bash
+cd /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback/zerofs
+READ_TEST_PREFIX='fs::store::extent::read::tests::'
+for name in \
+  one_fragmented_read_fetches_independent_runs_concurrently \
+  fragmented_read_concurrency_is_bounded \
+  fragmented_read_preserves_logical_output_order \
+  contiguous_control_remains_one_ranged_get \
+  stale_location_fallback_remains_correct_under_concurrency \
+  failed_fragmented_read_releases_every_fetch_permit
+do
+  cargo_test_nonzero "${READ_TEST_PREFIX}${name}" -p zerofs --locked
+done
+cargo_test_nonzero 'fs::store::extent::read::tests' -p zerofs --locked
+cargo_test_nonzero 'fs::ops::io::tests' -p zerofs --locked
+cargo_test_nonzero 'segment_store::tests' -p zerofs --locked
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --all-targets --locked
+cargo check -p ninep-client --target wasm32-unknown-unknown --locked
+git diff --check
+git add zerofs/src/fs/store/extent/read.rs zerofs/src/fs/store/extent/read/run_fetch.rs zerofs/src/fs/store/extent/read/tests.rs zerofs/src/fs/store/extent/read/metrics.rs
+git commit -m "perf(read): pipeline fragmented segment runs"
+```
+
+Expected: the fragmented RED proves peak backend concurrency greater than one; every bounded/error/order control is green; contiguous reads remain one GET; no protocol-specific behavior or durability semantics changed.
+
+---
+
+### Task A20: Bound Aggregate Resident Memory and Cache Admission
+
+**Files:**
+- Create: `zerofs/src/resident_memory.rs`
+- Modify: `zerofs/src/lib.rs`
+- Modify: `zerofs/src/main.rs`
+- Modify: `zerofs/src/config.rs`
+- Modify: `zerofs/src/cli/server.rs`
+- Modify: `zerofs/src/nfs.rs`
+- Modify: `zerofs/src/fs/store/extent/mod.rs`
+- Modify: `zerofs/src/fs/store/extent/write.rs`
+- Modify: `zerofs/src/fs/store/extent/compact.rs`
+- Modify: `zerofs/src/fs/store/extent/reclaim.rs`
+- Modify: `zerofs/src/fs/store/read_cache.rs`
+- Modify: `zerofs/src/fs/mutation/overlay.rs`
+- Modify: `zerofs/src/fs/mutation/request_cache.rs`
+- Modify: `zerofs/src/segment_store.rs`
+- Modify: `zerofs/src/object_store_prefetch.rs`
+- Modify: `zerofs/src/writeback/config.rs`
+- Modify: `zerofs/src/writeback/store.rs`
+- Modify: `zerofs/src/writeback/journal.rs`
+- Modify: `zerofs/src/writeback/journaler.rs`
+- Modify: `zerofs/src/prometheus.rs`
+
+**Interfaces:**
+- Produces: `ResidentMemoryConfig`, `ResidentMemoryKind`, `ResidentMemoryBudget`, `ResidentMemoryPermit`, conservative cache weighers, write-no-allocate, maintenance no-admit reads, and bounded-cardinality resident-memory metrics.
+- Consumes: configured clean-cache/writeback/volatile budgets, finite Linux cgroup-v2 `memory.max` when present, cache keys/values, segment buffers, object-prefetch parts, GC/compaction reads, and the generic admission primitive from A1.
+
+- [ ] **Step 1: Write the configuration and ownership RED tests**
+
+Add exact tests:
+
+- `resident_budget_rejects_payload_budgets_without_configured_reserve`
+- `finite_cgroup_limit_is_an_additional_hard_ceiling`
+- `unlimited_or_unavailable_cgroup_uses_configured_limit`
+- `resident_permit_charges_payload_overhead_and_replacement_once`
+- `resident_permit_releases_on_cancel_error_and_drop`
+- `ordinary_chunked_nfs_write_does_not_admit_decoded_extent_cache`
+- `compaction_reads_do_not_admit_raw_parts_or_decoded_cache`
+- `compaction_groups_adjacent_source_runs_under_one_bounded_scan`
+- `sparse_interleaved_256_mib_segment_uses_at_most_thirty_two_verification_scans`
+- `reclaim_scan_row_or_byte_budget_exhaustion_fails_closed`
+- `cache_weigher_includes_key_entry_and_allocator_slack`
+- `dirty_ram_zero_does_not_satisfy_resident_headroom`
+- `physical_residency_does_not_sum_jemalloc_resident_and_retained`
+- `retained_only_growth_does_not_consume_physical_headroom`
+
+Use a temporary cgroup-file seam that parses literal `memory.max` and `memory.events`
+contents; it is a unit seam for parsing/accounting, not Linux acceptance. Build a real
+ordinary chunked NFS write path and real compacted segment fixture for the
+write-no-allocate/no-admit
+tests. Current code is RED because decoded extent and parts weighers charge payload
+length only, every canonical write calls `decoded_insert`, and compaction reads through
+the cache-admitting segment path. The reclaim fixture creates a real maximum supported
+256 MiB compacted segment at 32 KiB extents: approximately 8,192 candidate frames whose
+`(inode, extent)` keys are deliberately sparse and interleaved. Maximal-consecutive-run
+grouping could otherwise issue about 16,384 memory/durable point reads.
+Before invoking reclaim, the test asserts `logical_payload_bytes == 268435456` and
+`candidate_frame_count == 8192`; a smaller fixture cannot satisfy the test by name.
+The fixture also counts every scanned row and encoded byte; an adversarial fixture
+places unrelated rows between desired keys and has separate table cases that cross the
+65,536-row ceiling and the 64 MiB encoded-byte ceiling. Each must stop at the first
+exhausted budget and return `Keep` rather than continue scanning.
+
+```bash
+cd /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback/zerofs
+MEMORY_TEST_PREFIX='resident_memory::tests::'
+cargo test -p zerofs --locked -- --list 2>&1 | tee "${TMPDIR:-/tmp}/zerofs-memory-red-list.log"
+for name in \
+  resident_budget_rejects_payload_budgets_without_configured_reserve \
+  finite_cgroup_limit_is_an_additional_hard_ceiling \
+  resident_permit_charges_payload_overhead_and_replacement_once \
+  ordinary_chunked_nfs_write_does_not_admit_decoded_extent_cache \
+  compaction_reads_do_not_admit_raw_parts_or_decoded_cache \
+  compaction_groups_adjacent_source_runs_under_one_bounded_scan \
+  physical_residency_does_not_sum_jemalloc_resident_and_retained \
+  retained_only_growth_does_not_consume_physical_headroom
+do
+  grep -F "${MEMORY_TEST_PREFIX}${name}: test" "${TMPDIR:-/tmp}/zerofs-memory-red-list.log"
+  if cargo test -p zerofs --locked "${MEMORY_TEST_PREFIX}${name}" -- --exact --nocapture; then
+    echo "expected resident-memory RED but ${name} passed" >&2
+    exit 1
+  fi
+done
+RECLAIM_RED='fs::store::extent::reclaim::tests::sparse_interleaved_256_mib_segment_uses_at_most_thirty_two_verification_scans'
+cargo test -p zerofs --locked -- --list 2>&1 | tee "${TMPDIR:-/tmp}/zerofs-reclaim-red-list.log"
+grep -F "${RECLAIM_RED}: test" "${TMPDIR:-/tmp}/zerofs-reclaim-red-list.log"
+if cargo test -p zerofs --locked "$RECLAIM_RED" -- --exact --nocapture; then
+  echo "expected reclaim scan-bound RED but ${RECLAIM_RED} passed" >&2
+  exit 1
+fi
+RECLAIM_BUDGET_RED='fs::store::extent::reclaim::tests::reclaim_scan_row_or_byte_budget_exhaustion_fails_closed'
+grep -F "${RECLAIM_BUDGET_RED}: test" "${TMPDIR:-/tmp}/zerofs-reclaim-red-list.log"
+if cargo test -p zerofs --locked "$RECLAIM_BUDGET_RED" -- --exact --nocapture; then
+  echo "expected reclaim row/byte-budget RED but ${RECLAIM_BUDGET_RED} passed" >&2
+  exit 1
+fi
+```
+
+- [ ] **Step 2: Define exact aggregate ownership types and validation**
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) enum ResidentMemoryKind {
+    CleanDecoded,
+    CleanRawPart,
+    CleanMetadata,
+    ProtocolIngress,
+    VolatileMutation,
+    ObjectWriteback,
+    OpenSegment,
+    Seal,
+    Compaction,
+    RequestReplay,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ResidentMemoryConfig {
+    pub(crate) configured_limit_bytes: u64,
+    pub(crate) reserve_bytes: u64,
+}
+
+pub(crate) struct ResidentMemoryBudget {
+    inner: std::sync::Arc<ResidentMemoryBudgetInner>,
+}
+
+struct ResidentMemoryBudgetInner {
+    effective_limit_bytes: u64,
+    reserve_bytes: u64,
+    admission: crate::coordination::Admission,
+    charged_by_kind: std::sync::Mutex<
+        std::collections::BTreeMap<ResidentMemoryKind, u64>,
+    >,
+    peak_bytes: std::sync::atomic::AtomicU64,
+}
+
+pub(crate) struct ResidentMemoryPermit {
+    budget: std::sync::Weak<ResidentMemoryBudgetInner>,
+    kind: ResidentMemoryKind,
+    charged_bytes: u64,
+    active: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ResidentMemorySnapshot {
+    pub(crate) effective_limit_bytes: u64,
+    pub(crate) reserve_bytes: u64,
+    pub(crate) charged_bytes: u64,
+    pub(crate) peak_bytes: u64,
+    pub(crate) process_resident_bytes: u64,
+    pub(crate) cgroup_current_bytes: Option<u64>,
+    pub(crate) jemalloc_resident_bytes: Option<u64>,
+    pub(crate) jemalloc_retained_virtual_bytes: Option<u64>,
+    pub(crate) baseline_bytes: u64,
+    pub(crate) unowned_residual_bytes: u64,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ResidentMemoryError {
+    #[error("resident-memory budget is closed")]
+    Closed,
+    #[error("resident-memory budget is poisoned")]
+    Poisoned,
+    #[error("resident-memory request exceeds the effective limit")]
+    TooLarge,
+}
+
+impl ResidentMemoryBudget {
+    pub(crate) async fn acquire(
+        &self,
+        kind: ResidentMemoryKind,
+        payload_bytes: u64,
+        ownership_overhead_bytes: u64,
+    ) -> Result<ResidentMemoryPermit, ResidentMemoryError>;
+
+    pub(crate) fn snapshot(&self) -> ResidentMemorySnapshot;
+}
+```
+
+Normalize `[memory].resident_limit_gb` and `[memory].resident_reserve_gb` to exact
+bytes. The effective limit is `min(configured_limit, finite cgroup memory.max)`.
+Startup sums every configured payload owner, conservative key/entry/allocator slack,
+maximum replacement overlap, maintenance working-set maxima, and the reserve. The
+example 64+16 GiB profile therefore requires the documented 128 GiB envelope; under a
+96 GiB cgroup it fails before listeners start. Do not derive success from dirty-
+writeback RAM. The runtime budget uses one cancellation-safe owner transfer per
+allocation; no layer temporarily owns uncharged bytes. Mount `ResidentMemoryPermit`
+ownership into the decoded/read-metadata caches, raw-part/Foyer buffers, mutation
+overlay, retained request cache, open/sealing segments, object-writeback RAM and
+journal staging, and compaction work. No enum variant may remain metrics-only.
+
+- [ ] **Step 3: Make write and maintenance cache admission explicit**
+
+Add a typed `CacheAdmission::{Read, NoAdmit}` argument below the extent and segment
+facades. User reads keep current cache behavior. Every canonical write, including each
+ordinary chunked NFS rsync write, uses `NoAdmit` and cannot call `decoded_insert`;
+pending-read coherence remains owned by the shared mutation overlay until canonical
+state is visible. GC/compaction uses 16 fixed batches of at most 512 sorted forward-map keys;
+each batch is merge-checked by one streaming memory-view scan and one durable-view scan,
+so a full supported 256 MiB segment with approximately 8,192 frames issues at most 32
+scans even when every key is sparse or interleaved. The two views contain about 16,384
+desired rows; the fixed 65,536-row aggregate ceiling permits at most four times that
+geometry, including bounded unrelated gap rows, while the independent encoded
+key/value ceiling remains 64 MiB. Exceeding either fixed budget stops immediately and
+returns `Keep`; it never falls back to one point read per frame. Absent forward keys mean
+dead frames as today, while any decode error, scan error, or reference to the segment
+fails closed to `Keep`. The scans
+use `NoAdmit` for decoded and raw-part caches. Cache weighers include key size, entry/container overhead,
+and documented allocator slack rather than `value.len()` alone. Replacement ownership
+may overlap only inside its precharged maximum.
+
+- [ ] **Step 4: Expose reconciled metrics and run GREEN**
+
+Expose configured/effective limit, reserve, charged/peak bytes by
+`ResidentMemoryKind`, aggregate waiters/backpressure, cache replacement bytes,
+maintenance working bytes/no-admit reads, allocator allocated/resident/retained, and
+Linux cgroup current/max/events. Labels never contain paths, keys, request IDs, or raw
+errors. Physical residency comes from OS RSS and, when available, cgroup
+`memory.current`; `jemalloc.stats.resident` is a correlation metric and
+`jemalloc.stats.retained` is retained virtual address space. Never add resident and
+retained or use retained alone as physical RSS/admission pressure. Reconciliation measures process RSS and cgroup `memory.current`, then records
+`owned + calibrated idle baseline + unowned residual = observed current`. The residual
+has a conservative configured ceiling and triggers backpressure/fail-closed poison if
+it escapes tolerance; merely proving charged owners sum to themselves is rejected.
+Plan C freezes `cgroup_high_event_delta_max=8`,
+`reconciliation_error_bytes_max=268435456`, and
+`unowned_residual_bytes_max=2147483648` in the immutable ledger before starting the
+process. Dependency-free rejection tests prove the scenario cannot omit, mutate after
+setup, or derive these values from its observed peak.
+
+```bash
+cd /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback/zerofs
+cargo_test_nonzero 'resident_memory::tests' -p zerofs --locked
+cargo_test_nonzero 'fs::store::extent::tests' -p zerofs --locked
+cargo_test_nonzero 'fs::store::read_cache::tests' -p zerofs --locked
+cargo_test_nonzero 'fs::mutation::request_cache::tests' -p zerofs --locked
+cargo_test_nonzero 'object_store_prefetch::tests' -p zerofs --locked
+cargo_test_nonzero 'segment_store::tests' -p zerofs --locked
+cargo_test_nonzero 'writeback::store::tests' -p zerofs --locked
+cargo_test_nonzero 'writeback::journaler::tests' -p zerofs --locked
+cargo_test_nonzero 'config::tests' -p zerofs --locked
+cargo_test_nonzero 'fs::store::extent::reclaim::tests::sparse_interleaved_256_mib_segment_uses_at_most_thirty_two_verification_scans' -p zerofs --locked
+cargo_test_nonzero 'fs::store::extent::reclaim::tests::reclaim_scan_row_or_byte_budget_exhaustion_fails_closed' -p zerofs --locked
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --all-targets --locked
+git diff --check
+git add zerofs/src/resident_memory.rs zerofs/src/lib.rs zerofs/src/main.rs zerofs/src/config.rs zerofs/src/cli/server.rs zerofs/src/nfs.rs zerofs/src/fs/store/extent/mod.rs zerofs/src/fs/store/extent/write.rs zerofs/src/fs/store/extent/compact.rs zerofs/src/fs/store/extent/reclaim.rs zerofs/src/fs/store/read_cache.rs zerofs/src/fs/mutation/overlay.rs zerofs/src/fs/mutation/request_cache.rs zerofs/src/segment_store.rs zerofs/src/object_store_prefetch.rs zerofs/src/writeback/config.rs zerofs/src/writeback/store.rs zerofs/src/writeback/journal.rs zerofs/src/writeback/journaler.rs zerofs/src/prometheus.rs
+git commit -m "fix(memory): bound server residency and cache admission"
+```
+
+Expected: payload-only cache limits are replaced by conservative ownership charges;
+write-only streams and maintenance do not pollute clean caches; the aggregate snapshot
+has an explicit reserve below the effective limit.
+
+---
+
+### Task A21: Bound Protocol Ingress Before Owned Payload Copies
+
+**Files:**
+- Create: `zerofs/src/fs/mutation/ingress.rs`
+- Modify: `zerofs/src/fs/mutation/mod.rs`
+- Modify: `zerofs/src/fs/mutation/request_cache.rs`
+- Modify: `zerofs/src/ninep/server.rs`
+- Modify: `zerofs/src/ninep/handler.rs`
+- Modify: `zerofs/src/nfs.rs`
+- Modify: `zerofs/src/webui.rs`
+- Modify: `zerofs/src/rpc/server.rs`
+- Modify: `zerofs/src/cli/server.rs`
+- Modify: `zerofs/src/prometheus.rs`
+- Modify in the separately owned fork: `src/context.rs`
+- Modify in the separately owned fork: `src/rpcwire.rs`
+- Modify in the separately owned fork: `src/tcp.rs`
+- Modify after the fork is pushed: `zerofs/Cargo.toml`
+- Modify after the fork is pushed: `zerofs/Cargo.lock`
+
+**Interfaces:**
+- Produces: `ProtocolClass`, `ProtocolIngressBudget`, `ProtocolIngressPermit`, pre-copy NFS/9P/WebUI admission, retransmit joining, and per-protocol bounded metrics.
+- Consumes: A1 fair admission, A5 request identity/cache, A20 `ResidentMemoryBudget`, protocol maximum frame sizes, the A16 connection context, and the sole lifecycle owner.
+
+- [ ] **Step 1: Write the focused protocol-ingress RED tests**
+
+Name tests:
+
+- `ninep_frame_acquires_bytes_before_owned_copy`
+- `webui_message_acquires_bytes_before_owned_copy`
+- `nfs_decode_acquires_bytes_before_owned_write_body`
+- `nfs_retransmit_joins_before_second_payload_charge`
+- `nfs_same_xid_different_payload_is_fingerprint_mismatch`
+- `nfs_retransmit_storm_stays_below_global_bytes_and_operations`
+- `one_connection_cannot_monopolize_protocol_ingress`
+- `ingress_cancel_disconnect_timeout_and_shutdown_release_once`
+- `ingress_pressure_backpressures_without_spawning_unbounded_tasks`
+
+The NFS dependency test feeds repeated identical XIDs over a latency-gated real RPC
+decoder and asserts peak decoded payload bytes never exceed one joined request plus
+the configured protocol bound. ZeroFS integration tests use real 9P frames, the real
+NFS service callback, and the production WebSocket/gRPC-Web handler; direct internal
+mutation calls do not count as acceptance.
+
+List every exact test before implementation and require the current allocation path to
+fail the boundary assertions:
+
+```bash
+cd /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback/zerofs
+INGRESS_TEST_PREFIX='fs::mutation::ingress::tests::'
+cargo test -p zerofs --locked -- --list 2>&1 | tee "${TMPDIR:-/tmp}/zerofs-ingress-red-list.log"
+for name in \
+  ninep_frame_acquires_bytes_before_owned_copy \
+  webui_message_acquires_bytes_before_owned_copy \
+  nfs_decode_acquires_bytes_before_owned_write_body \
+  nfs_retransmit_storm_stays_below_global_bytes_and_operations \
+  nfs_same_xid_different_payload_is_fingerprint_mismatch
+do
+  grep -F "${INGRESS_TEST_PREFIX}${name}: test" "${TMPDIR:-/tmp}/zerofs-ingress-red-list.log"
+  if cargo test -p zerofs --locked "${INGRESS_TEST_PREFIX}${name}" -- --exact --nocapture; then
+    echo "expected protocol-ingress RED but ${name} passed" >&2
+    exit 1
+  fi
+done
+```
+
+- [ ] **Step 2: Add one shared pre-copy ingress owner**
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum ProtocolClass {
+    Nfs,
+    NineP,
+    WebUiRpc,
+    Direct,
+    Nbd,
+}
+
+pub(crate) struct ProtocolIngressPermit {
+    resident: crate::resident_memory::ResidentMemoryPermit,
+    operation: crate::coordination::AdmissionPermit,
+    class: ProtocolClass,
+}
+
+pub(crate) struct ProtocolIngressBudget {
+    resident: std::sync::Arc<crate::resident_memory::ResidentMemoryBudget>,
+    operations: crate::coordination::Admission,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ProtocolIngressError {
+    #[error("protocol ingress is closed")]
+    Closed,
+    #[error("protocol request exceeds the configured frame bound")]
+    TooLarge,
+    #[error("resident-memory admission failed: {0}")]
+    Resident(#[from] crate::resident_memory::ResidentMemoryError),
+}
+
+impl ProtocolIngressBudget {
+    pub(crate) async fn acquire_before_copy(
+        &self,
+        class: ProtocolClass,
+        decoded_len: usize,
+    ) -> Result<ProtocolIngressPermit, ProtocolIngressError>;
+}
+```
+
+The 9P codec reads only the fixed header first, validates `msize`, acquires the exact
+remaining-frame permit, and only then allocates/reads the body. The WebSocket upgrade
+precharges one maximum message per admitted reader session and configures hard frame,
+message, and concurrent-session limits before axum/tungstenite may produce an owned
+`WsMessage::Binary`; after receive it refunds the unused maximum and transfers the
+exact charge. An unbounded callback or response queue is rejected. Every adapter moves
+the same permit through request-cache lookup, preparation, and acceptance.
+
+A retry always owns a bounded ingress permit while its complete fingerprint is
+streamed/decoded. Only after kind, inode/range, credentials, stability flags, length,
+and payload hash match may it join and release the retry's ingress permit before raw
+mutation admission. Same connection+XID with different payload remains a fingerprint
+mismatch; XID alone never skips body validation or receives an uncharged allocation.
+
+- [ ] **Step 3: Extend and pin the additive nfsserve API**
+
+In the separately inventoried A16 fork worktree, add a server-wide admission hook
+whose permit is acquired from RPC record/header length before decoding the opaque WRITE body.
+The hook returns an owned permit stored in `RequestContext`; connection incarnation,
+XID, peer, credentials, and requested stability remain available. If the wire decoder
+cannot know an exact length early, charge the protocol maximum before allocation and
+refund the difference after decode. Retries stay bounded while their full fingerprint
+is computed, then join before a second raw-mutation/cache charge. Run the complete fork tests, push the immutable revision, then
+pin that exact revision in ZeroFS. No branch or local-path dependency is accepted.
+
+```bash
+cd /Volumes/bigssd/projects/nfsserve/.worktrees/zerofs-write-context
+cargo test --all-targets --locked -- --list 2>&1 | tee "${TMPDIR:-/tmp}/nfsserve-ingress-tests.list"
+grep -F 'nfs_same_xid_different_payload_is_fingerprint_mismatch: test' "${TMPDIR:-/tmp}/nfsserve-ingress-tests.list"
+cargo test --all-targets --locked
+cargo fmt --all -- --check
+git diff --check
+```
+
+- [ ] **Step 4: Run GREEN and the bounded retransmit gate**
+
+```bash
+cd /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback/zerofs
+cargo_test_nonzero 'fs::mutation::ingress::tests' -p zerofs --locked
+cargo_test_nonzero 'ninep::server::tests' -p zerofs --locked
+cargo_test_nonzero 'nfs::tests' -p zerofs --locked
+cargo_test_nonzero 'webui::tests' -p zerofs --locked
+cargo_test_nonzero 'rpc::server::tests' -p zerofs --locked
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --all-targets --locked
+cargo check -p ninep-client --target wasm32-unknown-unknown --locked
+git diff --check
+git add zerofs/src/fs/mutation/ingress.rs zerofs/src/fs/mutation/mod.rs zerofs/src/fs/mutation/request_cache.rs zerofs/src/ninep/server.rs zerofs/src/ninep/handler.rs zerofs/src/nfs.rs zerofs/src/webui.rs zerofs/src/rpc/server.rs zerofs/src/cli/server.rs zerofs/src/prometheus.rs zerofs/Cargo.toml zerofs/Cargo.lock
+git commit -m "fix(protocol): bound request bodies before dispatch"
+```
+
+Record the nfsserve upstream base, exact pushed revision, fork test receipt, and Root
+landing ownership in the ZeroFS commit body. Expected: all protocol request bodies are
+bounded before owned copies; hard-mount retransmits cannot amplify resident memory.
+
+---
+
+### Task A22: Select SSH/SFTP Transport Only From Direction-Specific Evidence
+
+**Files:**
+- Create: `zerofs/src/sftp_transport/ssh_program.rs`
+- Modify: `zerofs/src/sftp_transport.rs`
+- Modify: `zerofs/src/config.rs`
+- Modify: `zerofs/src/parse_object_store.rs`
+- Modify: `zerofs/src/prometheus.rs`
+- Modify: `README.md`
+
+**Interfaces:**
+- Produces: validated optional `[sftp].ssh_program`, `SshProgramIdentity`, exact child-executable selection, status/metrics identity, and unchanged stock default.
+- Consumes: the existing owned foreground SSH child, strict host-key/key-only policy, SFTP physical-session pool, and the immutable real A/B contract executed in C7/C8.
+
+- [ ] **Step 1: Write executable-selection RED tests**
+
+Name tests `omitted_ssh_program_preserves_stock_lookup`,
+`configured_ssh_program_requires_absolute_executable_regular_file`,
+`ssh_program_rejects_arguments_and_non_regular_targets`,
+`ssh_program_canonicalizes_an_executable_symlink`,
+`selected_program_keeps_strict_authentication_arguments`,
+`selected_program_identity_records_path_version_and_sha256`, and
+`every_physical_session_uses_the_selected_program`. Use temporary executable scripts
+that record argv and implement only the version probe; they prove process selection,
+not transport throughput.
+
+```bash
+cd /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback/zerofs
+SSH_PROGRAM_TEST_PREFIX='sftp_transport::ssh_program::tests::'
+cargo test -p zerofs --locked -- --list 2>&1 | tee "${TMPDIR:-/tmp}/zerofs-ssh-program-red-list.log"
+for name in \
+  omitted_ssh_program_preserves_stock_lookup \
+  configured_ssh_program_requires_absolute_executable_regular_file \
+  selected_program_identity_records_path_version_and_sha256 \
+  every_physical_session_uses_the_selected_program
+do
+  grep -F "${SSH_PROGRAM_TEST_PREFIX}${name}: test" "${TMPDIR:-/tmp}/zerofs-ssh-program-red-list.log"
+  if cargo test -p zerofs --locked "${SSH_PROGRAM_TEST_PREFIX}${name}" -- --exact --nocapture; then
+    echo "expected ssh-program RED but ${name} passed" >&2
+    exit 1
+  fi
+done
+```
+
+- [ ] **Step 2: Implement the narrow production selector**
+
+```rust
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SshProgramIdentity {
+    pub(crate) canonical_path: std::path::PathBuf,
+    pub(crate) version: String,
+    pub(crate) sha256: [u8; 32],
+}
+
+pub(crate) struct SshProgram {
+    executable: std::path::PathBuf,
+    identity: SshProgramIdentity,
+}
+
+impl SshProgram {
+    pub(crate) async fn resolve(
+        configured: Option<&std::path::Path>,
+    ) -> Result<Self, TransportError>;
+
+    pub(crate) fn command(&self) -> tokio::process::Command;
+    pub(crate) fn identity(&self) -> &SshProgramIdentity;
+}
+```
+
+Omission retains the existing `ssh` lookup. An explicit value must be an absolute,
+canonical, executable regular file and contains no argument string. Build each owned
+physical session from `SshProgram::command`; preserve `-F`, strict host checking,
+known-hosts, identities-only, key, port, user, no ControlMaster, `-T -s -- host sftp`,
+and positive child reaping. Record only safe identity fields. Never mutate global
+`PATH`, `update-alternatives`, `/usr/bin/ssh`, or host SSH configuration.
+
+- [ ] **Step 3: Run portable GREEN and commit the selector fence**
+
+```bash
+cd /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback/zerofs
+cargo_test_nonzero 'sftp_transport::ssh_program::tests' -p zerofs --locked
+cargo_test_nonzero 'sftp_transport::tests' -p zerofs --locked
+cargo_test_nonzero 'config::tests' -p zerofs --locked
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --all-targets --locked
+cargo check -p ninep-client --target wasm32-unknown-unknown --locked
+cd /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback
+git diff --check
+git add zerofs/src/sftp_transport/ssh_program.rs zerofs/src/sftp_transport.rs zerofs/src/config.rs zerofs/src/parse_object_store.rs zerofs/src/prometheus.rs README.md
+git commit -m "feat(sftp): select a pinned ssh executable explicitly"
+```
+
+The production selector remains dormant until C7's real Linux A/B proves a pinned HPN
+binary wins. HPN receive-window improvement applies to downloads where ZeroFS is the
+receiver; uploads require measured request pipelining and all configured physical
+write sessions carrying bytes. No claim crosses directions without evidence, and C7B
+must land the winning shipping result before the final Plan A gate. Before that
+decision, Plan C runs the pinned upstream regression inventory under its ledger
+supervisor with fixed TERM/KILL deadlines, excludes only the pinned
+`dynamic-forward` test that backgrounds a multiplexed forwarding client, proves the
+remaining inventory is nonzero, and separately runs `transfer`, `rekey`, `sftp`,
+`sftp-batch`, `sftp-resume`, and `forwarding`. Any missing test/process-reap receipt
+rejects the package candidate.

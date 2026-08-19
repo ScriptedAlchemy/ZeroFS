@@ -1100,6 +1100,20 @@ impl Drop for WritebackMultipartUpload {
     }
 }
 
+fn multipart_put_options(options: PutMultipartOptions) -> PutOptions {
+    let mode = if options.extensions.get::<GeneratedSegmentCreate>().is_some() {
+        PutMode::Create
+    } else {
+        PutMode::Overwrite
+    };
+    PutOptions {
+        mode,
+        tags: options.tags,
+        attributes: options.attributes,
+        extensions: options.extensions,
+    }
+}
+
 async fn complete_memory_multipart(
     store: WritebackObjectStore,
     location: Path,
@@ -1136,12 +1150,7 @@ async fn complete_memory_multipart(
         .reserve(disk_charge, available)
         .await
         .map_err(|error| generic_error(format!("dirty SSD admission failed: {error}")))?;
-    let put_options = PutOptions {
-        mode: PutMode::Overwrite,
-        tags: options.tags,
-        attributes: options.attributes,
-        extensions: options.extensions,
-    };
+    let put_options = multipart_put_options(options);
     store
         .clone()
         .owned_put(location, Bytes::from(assembled), put_options, ram, disk)
@@ -1184,12 +1193,7 @@ async fn complete_multipart(
     .await
     .map_err(|error| generic_error(format!("multipart assembly task failed: {error}")))?
     .map_err(|error| generic_error(format!("multipart assembly failed: {error}")))?;
-    let put_options = PutOptions {
-        mode: PutMode::Overwrite,
-        tags: options.tags,
-        attributes: options.attributes,
-        extensions: options.extensions,
-    };
+    let put_options = multipart_put_options(options);
     let owned = store.clone();
     let result = tokio::spawn(async move {
         owned
@@ -1427,7 +1431,7 @@ mod tests {
     use crate::fault_store::{FaultControls, FaultStore};
     use crate::frame_codec::FrameCodec;
     use crate::segment::SEGMENT_INFO;
-    use crate::segment_store::SegmentStore;
+    use crate::segment_store::{GeneratedSegmentCreate, SegmentStore};
     use crate::writeback::config::{AckMode, ShutdownFlush, WritebackSettings};
     use crate::writeback::journal::Journal;
     use crate::writeback::model::{
@@ -1441,8 +1445,8 @@ mod tests {
     use object_store::path::Path;
     use object_store::prefix::PrefixStore;
     use object_store::{
-        CopyMode, CopyOptions, ObjectStore, ObjectStoreExt, PutMode, PutOptions, RenameOptions,
-        RenameTargetMode, UpdateVersion,
+        CopyMode, CopyOptions, ObjectStore, ObjectStoreExt, PutMode, PutMultipartOptions,
+        PutOptions, RenameOptions, RenameTargetMode, UpdateVersion,
     };
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -1567,6 +1571,93 @@ mod tests {
             FenceClass::ImmutableCreate,
             "persisted encoded path components must be parsed without double encoding"
         );
+    }
+
+    #[tokio::test]
+    async fn generated_segment_multipart_is_journaled_as_an_immutable_create() {
+        let (store, _remote, _temp) = test_store().await;
+        let path = Path::from("zerofs/pilot/segments/02/0000000000000001/0000000000000002");
+        let mut options = PutMultipartOptions::default();
+        options.extensions.insert(GeneratedSegmentCreate);
+        let mut upload = store.put_multipart_opts(&path, options).await.unwrap();
+        upload
+            .put_part(Bytes::from_static(b"part one").into())
+            .await
+            .unwrap();
+        upload
+            .put_part(Bytes::from_static(b"part two").into())
+            .await
+            .unwrap();
+        upload.complete().await.unwrap();
+        store.wait_local(1).await.unwrap();
+
+        let records = store.inner.journal.snapshot().unwrap().records;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].fence, FenceClass::ImmutableCreate);
+        assert!(matches!(
+            records[0].kind,
+            MutationKind::Put {
+                mode: MutationMode::Create,
+                ..
+            }
+        ));
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn generated_segment_multiparts_preupload_across_later_ordering_fences() {
+        async fn put_generated_multipart(store: &WritebackObjectStore, path: &Path, byte: u8) {
+            let mut options = PutMultipartOptions::default();
+            options.extensions.insert(GeneratedSegmentCreate);
+            let mut upload = store.put_multipart_opts(path, options).await.unwrap();
+            upload
+                .put_part(Bytes::from(vec![byte; 1024]).into())
+                .await
+                .unwrap();
+            upload.complete().await.unwrap();
+        }
+
+        let (store, _remote, _temp, controls) = test_store_with_controls(true).await;
+        controls.block_puts();
+        let manifest_one = Path::from("zerofs/pilot/manifest/one");
+        let segment_two = Path::from("zerofs/pilot/segments/02/0000000000000001/0000000000000002");
+        let manifest_three = Path::from("zerofs/pilot/manifest/three");
+        let segment_four = Path::from("zerofs/pilot/segments/04/0000000000000001/0000000000000004");
+
+        store
+            .put(&manifest_one, Bytes::from_static(b"manifest one").into())
+            .await
+            .unwrap();
+        put_generated_multipart(&store, &segment_two, 2).await;
+        store
+            .put(
+                &manifest_three,
+                Bytes::from_static(b"manifest three").into(),
+            )
+            .await
+            .unwrap();
+        put_generated_multipart(&store, &segment_four, 4).await;
+        store.wait_local(4).await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while controls.put_count() < 3 {
+                controls.put_activity().notified().await;
+            }
+        })
+        .await
+        .expect("multipart immutable creates did not preupload across the later fence");
+        let started = controls.put_paths();
+        assert!(started.contains(&manifest_one.to_string()));
+        assert!(started.contains(&segment_two.to_string()));
+        assert!(started.contains(&segment_four.to_string()));
+        assert!(
+            !started.contains(&manifest_three.to_string()),
+            "a later ordering fence started before the frontier advanced"
+        );
+
+        controls.release_puts();
+        store.wait_remote(4).await.unwrap();
+        store.shutdown().await.unwrap();
     }
 
     #[tokio::test]

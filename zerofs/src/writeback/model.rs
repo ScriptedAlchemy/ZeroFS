@@ -55,9 +55,10 @@ pub enum FenceClass {
 
 /// Derive replay ordering from the persisted operation contract, not from an
 /// object key alone. Only an explicit create-only PUT to a canonical immutable
-/// database object may preupload across an earlier ordering fence. Multipart
-/// completion is persisted as `Overwrite`, so it deliberately cannot qualify
-/// even when its destination resembles a compacted SST.
+/// database object may preupload across an earlier ordering fence. Ordinary
+/// multipart completion is persisted as `Overwrite` and remains fenced;
+/// generated segment multipart completion retains its trusted create marker,
+/// is persisted as `Create`, and qualifies only for a canonical segment path.
 pub(crate) fn classify_mutation_fence(
     path: &str,
     kind: &MutationKind,

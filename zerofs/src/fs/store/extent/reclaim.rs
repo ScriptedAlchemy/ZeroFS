@@ -13,13 +13,15 @@ use crate::fs::FsError;
 use crate::fs::inode::InodeId;
 use crate::fs::key_codec::KeyCodec;
 use crate::fs::metrics::SegmentGcPass;
-use crate::segment::{FrameLoc, Segid};
+use crate::segment::{DirEntry, FrameLoc, Segid};
 use crate::segment_store::SegmentStoreError;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
+use futures::Stream;
 use futures::stream::StreamExt;
 use slatedb::config::WriteOptions;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
+use std::pin::Pin;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use tracing::{error, info};
@@ -61,9 +63,20 @@ const TAIL_CANDIDATES_BUFFERED: usize = 8192;
 const MAX_BATCHES_PER_PASS: usize = 32;
 
 /// Cap on segments verified + deleted per reclaim pass; each delete costs a
-/// dir read plus O(frames) point-lookups. Deferred segments keep their
-/// (already-elapsed) deadline and are retried next pass.
+/// directory read plus bounded-memory paged range scans. Deferred segments
+/// keep their (already-elapsed) deadline and are retried next pass.
 const MAX_SEGMENT_DELETES_PER_PASS: usize = 1024;
+
+/// One directory verify checks both the memory and durable views. Consecutive
+/// extents stay in one narrow range; highly sparse/interleaved directories
+/// coalesce their runs so a legal full segment has at most 32 logical scans.
+/// Each logical scan is consumed in bounded pages without reopening its source
+/// iterator: page memory/work is bounded, while valid directories and unrelated
+/// rows in coalesced gaps always make forward progress.
+const MAX_VERIFY_LOGICAL_SCANS: usize = 32;
+const MAX_VERIFY_SCAN_RANGES: usize = MAX_VERIFY_LOGICAL_SCANS / 2;
+const MAX_VERIFY_PAGE_ROWS: usize = 65_536;
+const MAX_VERIFY_PAGE_ENCODED_BYTES: usize = 4 * 1024 * 1024;
 
 /// Orphan-sweep age floor: an uncounted segment object must have been PUT at
 /// least this long ago before it is deletable. Guards the window where an
@@ -83,6 +96,46 @@ enum SegmentDeadVerdict {
     ObjectAbsent,
     /// A live frame still points here, or a transient read error: keep (fail-closed).
     Keep,
+}
+
+#[derive(Clone, Copy)]
+struct VerifyPageLimits {
+    rows: usize,
+    encoded_bytes: usize,
+}
+
+const VERIFY_PAGE_LIMITS: VerifyPageLimits = VerifyPageLimits {
+    rows: MAX_VERIFY_PAGE_ROWS,
+    encoded_bytes: MAX_VERIFY_PAGE_ENCODED_BYTES,
+};
+
+type ExtentScanStream<'a> = Pin<Box<dyn Stream<Item = anyhow::Result<(Bytes, Bytes)>> + Send + 'a>>;
+
+#[derive(Default)]
+struct VerifyPageBudget {
+    rows: usize,
+    encoded_bytes: usize,
+}
+
+impl VerifyPageBudget {
+    fn charge(&mut self, key: &Bytes, value: &Bytes, limits: VerifyPageLimits) -> Result<(), ()> {
+        let encoded_bytes = key.len().checked_add(value.len()).ok_or(())?;
+        if encoded_bytes > limits.encoded_bytes {
+            return Err(());
+        }
+        let next_rows = self.rows.checked_add(1).ok_or(())?;
+        let next_encoded_bytes = self.encoded_bytes.checked_add(encoded_bytes).ok_or(())?;
+        if next_rows > limits.rows || next_encoded_bytes > limits.encoded_bytes {
+            return Err(());
+        }
+        self.rows = next_rows;
+        self.encoded_bytes = next_encoded_bytes;
+        Ok(())
+    }
+
+    fn full(&self, limits: VerifyPageLimits) -> bool {
+        self.rows >= limits.rows || self.encoded_bytes >= limits.encoded_bytes
+    }
 }
 
 /// What one reclaim pass did and whether it left actionable work behind —
@@ -946,16 +999,17 @@ impl ExtentStore {
     /// segment. This replaces a 20-wide dual get_bytes/get_bytes_durable per
     /// unique directory extent, which OOM-d reclaim on a full foyer floor.
     async fn verify_segment_reclaimable(&self, segid: Segid) -> SegmentDeadVerdict {
-        let dir = match self.segments.read_directory(segid, false).await {
+        let mut dir = match self.segments.read_directory(segid, false).await {
             Ok(d) => d,
             Err(SegmentStoreError::NotFound) => return SegmentDeadVerdict::ObjectAbsent,
             Err(_) => return SegmentDeadVerdict::Keep,
         };
-        let want: BTreeSet<(InodeId, u64)> = dir.iter().map(|e| (e.inode, e.extent)).collect();
-        if want.is_empty() {
+        dir.sort_unstable_by_key(dir_entry_key);
+        dir.dedup_by_key(|entry| dir_entry_key(entry));
+        if dir.is_empty() {
             return SegmentDeadVerdict::Reclaim;
         }
-        match self.directory_still_referenced(segid, &want).await {
+        match self.directory_still_referenced(segid, &dir).await {
             Ok(true) => SegmentDeadVerdict::Keep,
             Ok(false) => SegmentDeadVerdict::Reclaim,
             Err(()) => SegmentDeadVerdict::Keep,
@@ -963,78 +1017,112 @@ impl ExtentStore {
     }
 
     /// `Ok(true)` if any wanted extent still points at `segid` in memory or
-    /// durable view. `Err` on an unbounded range or a scan/decode error
-    /// (fail-closed: do not delete).
+    /// durable view. `Err` on an unrepresentable range end, oversized row, or
+    /// scan/decode error (fail-closed: do not delete).
     async fn directory_still_referenced(
         &self,
         segid: Segid,
-        want: &BTreeSet<(InodeId, u64)>,
+        want: &[DirEntry],
     ) -> Result<bool, ()> {
-        for (inode, start, last) in inode_extent_runs(want) {
-            let Some((start_key, end_key)) =
-                extent_scan_bounds(&self.key_codec, inode, start, last)
-            else {
-                return Err(());
-            };
-            if self
-                .scan_extent_run_points_here(segid, want, start_key.clone()..end_key.clone(), false)
-                .await?
-            {
-                return Ok(true);
-            }
-            if self
-                .scan_extent_run_points_here(segid, want, start_key..end_key, true)
-                .await?
-            {
-                return Ok(true);
+        let Some(ranges) = extent_scan_ranges(&self.key_codec, want) else {
+            return Err(());
+        };
+        for durable in [false, true] {
+            for range in &ranges {
+                if self
+                    .scan_extent_range_points_here(
+                        segid,
+                        want,
+                        range.clone(),
+                        durable,
+                        VERIFY_PAGE_LIMITS,
+                    )
+                    .await?
+                {
+                    return Ok(true);
+                }
             }
         }
         Ok(false)
     }
 
-    async fn scan_extent_run_points_here(
+    async fn scan_extent_range_points_here(
         &self,
         segid: Segid,
-        want: &BTreeSet<(InodeId, u64)>,
+        want: &[DirEntry],
         range: std::ops::Range<Bytes>,
         durable: bool,
+        limits: VerifyPageLimits,
     ) -> Result<bool, ()> {
+        if range.start >= range.end {
+            return Ok(false);
+        }
         let stream = if durable {
-            self.db.scan_durable(range).await
+            self.db.scan_durable_bounded(range).await
         } else {
-            self.db.scan(range).await
+            self.db.scan_bounded(range).await
         }
         .map_err(|_| ())?;
-        futures::pin_mut!(stream);
-        while let Some(item) = StreamExt::next(&mut stream).await {
+        self.inspect_extent_stream(segid, want, stream, limits)
+            .await
+    }
+
+    async fn inspect_extent_stream(
+        &self,
+        segid: Segid,
+        want: &[DirEntry],
+        mut stream: ExtentScanStream<'_>,
+        limits: VerifyPageLimits,
+    ) -> Result<bool, ()> {
+        let mut budget = VerifyPageBudget::default();
+        let mut want_index = None;
+        while let Some(item) = stream.next().await {
             let (key, val) = item.map_err(|_| ())?;
-            let Some((inode, extent)) = self.key_codec.parse_extent_key_full(&key) else {
-                continue;
-            };
-            if !want.contains(&(inode, extent)) {
-                continue;
+            if budget.full(limits) {
+                budget = VerifyPageBudget::default();
             }
-            match FrameLoc::decode(&val) {
-                Some(loc) if loc.segid == segid => return Ok(true),
-                Some(_) => {}
-                None => return Err(()),
+            if budget.charge(&key, &val, limits).is_err() {
+                budget = VerifyPageBudget::default();
+                budget.charge(&key, &val, limits)?;
+            }
+
+            if let Some(logical) = self.key_codec.parse_extent_key_full(&key) {
+                let index = want_index.get_or_insert_with(|| {
+                    want.partition_point(|entry| dir_entry_key(entry) < logical)
+                });
+                while *index < want.len() && dir_entry_key(&want[*index]) < logical {
+                    *index += 1;
+                }
+                if want.get(*index).map(dir_entry_key) == Some(logical) {
+                    match FrameLoc::decode(&val) {
+                        Some(loc) if loc.segid == segid => return Ok(true),
+                        Some(_) => {}
+                        None => return Err(()),
+                    }
+                }
             }
         }
         Ok(false)
     }
 }
 
+fn dir_entry_key(entry: &DirEntry) -> (InodeId, u64) {
+    (entry.inode, entry.extent)
+}
+
 /// Consecutive (inode, extent) runs, each (`inode`, first, last inclusive).
-fn inode_extent_runs(want: &BTreeSet<(InodeId, u64)>) -> Vec<(InodeId, u64, u64)> {
+fn inode_extent_runs(want: &[DirEntry]) -> Vec<(InodeId, u64, u64)> {
     let mut runs = Vec::new();
     let mut iter = want.iter();
-    let Some(&(inode, extent)) = iter.next() else {
+    let Some(first) = iter.next() else {
         return runs;
     };
+    let (inode, extent) = dir_entry_key(first);
     let mut cur_inode = inode;
     let mut start = extent;
     let mut last = extent;
-    for &(inode, extent) in iter {
+    for entry in iter {
+        let (inode, extent) = dir_entry_key(entry);
         if inode == cur_inode && extent == last.saturating_add(1) && last < u64::MAX {
             last = extent;
             continue;
@@ -1048,21 +1136,36 @@ fn inode_extent_runs(want: &BTreeSet<(InodeId, u64)>) -> Vec<(InodeId, u64, u64)
     runs
 }
 
-fn extent_scan_bounds(
+/// Coalesce consecutive extent runs into at most
+/// [`MAX_VERIFY_SCAN_RANGES`] ordered ranges. A coalesced range may include
+/// unrelated extent rows in a sparse gap; the scan filters every row against
+/// `want`, preserving the exact stale-reference check while bounding request
+/// fan-out. Returning `None` keeps the caller fail-closed when an exclusive end
+/// key cannot be represented.
+fn extent_scan_ranges(
     key_codec: &KeyCodec,
-    inode: InodeId,
-    start: u64,
-    last_inclusive: u64,
-) -> Option<(Bytes, Bytes)> {
-    let start_key = key_codec.extent_key(inode, start);
-    let end_key = if last_inclusive < u64::MAX {
-        key_codec.extent_key(inode, last_inclusive + 1)
-    } else if inode < u64::MAX {
-        key_codec.extent_key(inode + 1, 0)
-    } else {
-        return None;
-    };
-    Some((start_key, end_key))
+    want: &[DirEntry],
+) -> Option<Vec<std::ops::Range<Bytes>>> {
+    let runs = inode_extent_runs(want);
+    if runs.is_empty() {
+        return Some(Vec::new());
+    }
+    let runs_per_range = runs.len().div_ceil(MAX_VERIFY_SCAN_RANGES);
+    runs.chunks(runs_per_range)
+        .map(|chunk| {
+            let &(start_inode, start_extent, _) = chunk.first()?;
+            let &(last_inode, _, last_extent) = chunk.last()?;
+            let start = key_codec.extent_key(start_inode, start_extent);
+            let end = if last_extent < u64::MAX {
+                key_codec.extent_key(last_inode, last_extent + 1)
+            } else if last_inode < u64::MAX {
+                key_codec.extent_key(last_inode + 1, 0)
+            } else {
+                return None;
+            };
+            Some(start..end)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1073,11 +1176,82 @@ mod tests {
     use crate::block_transformer::ZeroFsBlockTransformer;
     use crate::config::CompressionConfig;
     use crate::db::Db;
+    use crate::frame_codec::FrameCodec;
     use crate::fs::EXTENT_SIZE;
+    use crate::replication::Lease;
+    use crate::segment::SEGMENT_INFO;
+    use crate::segment_store::SegmentStore;
+    use object_store::ObjectStoreExt;
+
+    fn test_dir_entry(inode: InodeId, extent: u64) -> DirEntry {
+        DirEntry {
+            byte_offset: 0,
+            len: 0,
+            inode,
+            extent,
+        }
+    }
     use slatedb::object_store::memory::InMemory;
     use slatedb::object_store::{ObjectStore, path::Path};
     use slatedb::{BlockTransformer, DbBuilder};
     use std::sync::Arc;
+
+    #[test]
+    fn verify_page_accepts_exact_row_and_byte_boundaries() {
+        let key = Bytes::from(vec![0u8; 23]);
+        let frame_loc = Bytes::from(vec![0u8; FrameLoc::ENCODED_LEN]);
+        let mut rows = VerifyPageBudget::default();
+        for _ in 0..MAX_VERIFY_PAGE_ROWS {
+            rows.charge(&key, &frame_loc, VERIFY_PAGE_LIMITS).unwrap();
+        }
+        assert!(rows.full(VERIFY_PAGE_LIMITS));
+        assert!(
+            rows.charge(&key, &frame_loc, VERIFY_PAGE_LIMITS).is_err(),
+            "row + 1 belongs to the next page"
+        );
+
+        let mut bytes = VerifyPageBudget::default();
+        let exact = Bytes::from(vec![0u8; MAX_VERIFY_PAGE_ENCODED_BYTES - key.len()]);
+        bytes.charge(&key, &exact, VERIFY_PAGE_LIMITS).unwrap();
+        assert!(bytes.full(VERIFY_PAGE_LIMITS));
+        let over = Bytes::from(vec![0u8; MAX_VERIFY_PAGE_ENCODED_BYTES - key.len() + 1]);
+        assert!(
+            VerifyPageBudget::default()
+                .charge(&key, &over, VERIFY_PAGE_LIMITS)
+                .is_err(),
+            "one unpageable row must fail closed"
+        );
+    }
+
+    #[test]
+    fn unrepresentable_end_fails_closed() {
+        let codec = KeyCodec::new();
+        assert!(
+            extent_scan_ranges(&codec, &[test_dir_entry(u64::MAX, u64::MAX)]).is_none(),
+            "an exclusive end beyond the key domain must fail closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_page_item_error_fails_closed() {
+        let (store, _db) = make().await;
+        let stream: ExtentScanStream<'_> = Box::pin(futures::stream::iter([Err(anyhow::anyhow!(
+            "injected scan item failure"
+        ))]));
+
+        assert!(
+            store
+                .inspect_extent_stream(
+                    Segid::new(7, 1),
+                    &[test_dir_entry(1, 0)],
+                    stream,
+                    VERIFY_PAGE_LIMITS,
+                )
+                .await
+                .is_err(),
+            "a mid-stream database error must fail closed"
+        );
+    }
 
     // The fail-closed directory-verify refuses to delete a segment the counter wrongly
     // calls dead (under-count) while a frame is still referenced: leak, never loss.
@@ -1130,6 +1304,555 @@ mod tests {
             scans, 1,
             "verify must issue a bounded grouped scan, not a point-read per frame"
         );
+    }
+
+    fn sparse_interleaved_full_directory() -> Vec<DirEntry> {
+        let mut want: Vec<_> = (0..1024u64)
+            .map(|slot| {
+                let inode = 1 + slot % 64;
+                let extent = (slot / 64) * 4096 + inode;
+                test_dir_entry(inode, extent)
+            })
+            .collect();
+        want.sort_unstable_by_key(dir_entry_key);
+        want
+    }
+
+    fn test_frame_loc(segid: Segid, frame_index: u32) -> Bytes {
+        Bytes::copy_from_slice(
+            &FrameLoc {
+                segid,
+                frame_index,
+                byte_offset: u64::from(frame_index) * 4096,
+                byte_len: 4096,
+            }
+            .encode(),
+        )
+    }
+
+    #[tokio::test]
+    async fn sparse_interleaved_full_directory_uses_bounded_scans_and_zero_point_reads() {
+        let (store, db) = make().await;
+        let want = sparse_interleaved_full_directory();
+        assert_eq!(want.len(), 1024, "fixture must exercise a full directory");
+        let target = Segid::new(7, 777);
+        let other = Segid::new(7, 778);
+        let final_key = dir_entry_key(want.last().unwrap());
+        let mut txn = db.new_transaction().unwrap();
+        for (frame_index, entry) in want.iter().enumerate() {
+            let (inode, extent) = dir_entry_key(entry);
+            let segid = if (inode, extent) == final_key {
+                target
+            } else {
+                other
+            };
+            txn.put_bytes(
+                &store.key_codec.extent_key(inode, extent),
+                test_frame_loc(segid, frame_index as u32),
+            );
+        }
+        commit(&store, txn).await;
+
+        let memory_before = db.scan_call_count();
+        let durable_before = db.durable_scan_call_count();
+        let points_before = db.point_read_call_count();
+        assert_eq!(
+            store.directory_still_referenced(target, &want).await,
+            Ok(true),
+            "the final sparse memory reference must fail closed"
+        );
+        assert!(
+            (db.scan_call_count() - memory_before)
+                + (db.durable_scan_call_count() - durable_before)
+                <= 32,
+            "combined memory+durable scans must stay bounded for 1,024 sparse/interleaved frames"
+        );
+        assert_eq!(
+            db.point_read_call_count() - points_before,
+            0,
+            "directory verification must never regress to per-frame point reads"
+        );
+    }
+
+    #[tokio::test]
+    async fn sparse_interleaved_full_directory_keeps_final_durable_stale_reference() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let bt: Arc<dyn BlockTransformer> =
+            ZeroFsBlockTransformer::new_arc(&[0u8; 32], CompressionConfig::default());
+        let settings = slatedb::config::Settings {
+            wal_enabled: false,
+            l0_sst_size_bytes: usize::MAX - 1,
+            max_unflushed_bytes: usize::MAX,
+            ..Default::default()
+        };
+        let slatedb = Arc::new(
+            DbBuilder::new(Path::from("sparse-durable-verify"), object_store.clone())
+                .with_settings(settings)
+                .with_block_transformer(bt)
+                .with_segment_extractor(Arc::new(crate::segment_extractor::ZeroFsSegmentExtractor))
+                .build()
+                .await
+                .unwrap(),
+        );
+        let db = Arc::new(Db::new(slatedb, None));
+        let store = make_store(object_store, db.clone(), CompressionConfig::Lz4, 7);
+        let want = sparse_interleaved_full_directory();
+        assert_eq!(want.len(), 1024, "fixture must exercise a full directory");
+        let target = Segid::new(7, 779);
+        let other = Segid::new(7, 780);
+        let final_key = dir_entry_key(want.last().unwrap());
+
+        let mut durable = db.new_transaction().unwrap();
+        for (frame_index, entry) in want.iter().enumerate() {
+            let (inode, extent) = dir_entry_key(entry);
+            let segid = if (inode, extent) == final_key {
+                target
+            } else {
+                other
+            };
+            durable.put_bytes(
+                &store.key_codec.extent_key(inode, extent),
+                test_frame_loc(segid, frame_index as u32),
+            );
+        }
+        commit(&store, durable).await;
+        db.flush().await.unwrap();
+
+        let mut memory_only = db.new_transaction().unwrap();
+        memory_only.put_bytes(
+            &store.key_codec.extent_key(final_key.0, final_key.1),
+            test_frame_loc(other, 1023),
+        );
+        commit(&store, memory_only).await;
+
+        let memory_before = db.scan_call_count();
+        let durable_before = db.durable_scan_call_count();
+        let points_before = db.point_read_call_count();
+        assert_eq!(
+            store.directory_still_referenced(target, &want).await,
+            Ok(true),
+            "a reference masked only in memory must remain visible durably and fail closed"
+        );
+        assert!(
+            (db.scan_call_count() - memory_before)
+                + (db.durable_scan_call_count() - durable_before)
+                <= 32,
+            "combined memory+durable scans must stay bounded for a final stale reference"
+        );
+        assert_eq!(
+            db.point_read_call_count() - points_before,
+            0,
+            "durable verification must never regress to per-frame point reads"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_256mib_directory_reclaims_after_memory_and_durable_verification() {
+        const FULL_SEGMENT_FRAMES: usize = (256 * 1024 * 1024) / EXTENT_SIZE;
+        let (writer, db, object_store) = make_with_compression(CompressionConfig::Lz4).await;
+        let source = Bytes::from(incompressible(0x256, FULL_SEGMENT_FRAMES * EXTENT_SIZE));
+        let frames: Vec<_> = (0..FULL_SEGMENT_FRAMES as u64)
+            .map(|slot| {
+                let start = slot as usize * EXTENT_SIZE;
+                (1, slot, source.slice(start..start + EXTENT_SIZE))
+            })
+            .collect();
+        assert_eq!(
+            frames.len(),
+            8192,
+            "fixture must cover a full 256 MiB segment"
+        );
+        let locs = writer.segments.seal(&frames).await.unwrap();
+        let segid = locs[0].2.segid;
+        let total = locs.iter().map(|(_, _, loc)| u64::from(loc.byte_len)).sum();
+        assert!(
+            total >= super::super::write::SEAL_THRESHOLD as u64,
+            "fixture frame region must actually reach the 256 MiB stored-byte threshold: {total}"
+        );
+        let object = object_store
+            .get(&Path::from(segid.object_key()))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let parsed = crate::segment::Segment::parse(object.clone()).unwrap();
+        assert_eq!(
+            parsed.dir_offset, total,
+            "parsed frame-region bytes must match the sealed FrameLocs"
+        );
+        assert_eq!(parsed.k as usize, FULL_SEGMENT_FRAMES);
+        assert_eq!(
+            object.len() as u64,
+            parsed.dir_offset + u64::from(parsed.dir_len) + crate::segment::FOOTER_LEN as u64,
+            "object length must include the exact frame region, directory, and footer"
+        );
+        let mut want = writer.segments.read_directory(segid, false).await.unwrap();
+        assert_eq!(
+            want.len(),
+            FULL_SEGMENT_FRAMES,
+            "stored object must carry the full supported directory"
+        );
+        want.sort_unstable_by_key(dir_entry_key);
+        want.dedup_by_key(|entry| dir_entry_key(entry));
+
+        // Restart at a newer epoch, mark the sealed segment dead, and point all
+        // of its logical extents at another segment in a durable commit. The
+        // verifier must scan both views without mistaking the supported full
+        // directory for budget exhaustion.
+        let store = make_store(object_store, db.clone(), CompressionConfig::Lz4, 8);
+        let other = Segid::new(99, 2);
+        let mut txn = db.new_transaction().unwrap();
+        txn.put_bytes(
+            &store.key_codec.segcount_key(segid.epoch, segid.counter),
+            KeyCodec::encode_segcount(0, total),
+        );
+        for (frame_index, (_, logical_extent, _)) in locs.iter().enumerate() {
+            txn.put_bytes(
+                &store.key_codec.extent_key(1, *logical_extent),
+                test_frame_loc(other, frame_index as u32),
+            );
+        }
+        commit(&store, txn).await;
+        db.flush().await.unwrap();
+
+        let memory_before = db.scan_call_count();
+        let durable_before = db.durable_scan_call_count();
+        let points_before = db.point_read_call_count();
+        assert_eq!(
+            store.directory_still_referenced(segid, &want).await,
+            Ok(false),
+            "both views must prove the full directory unreferenced"
+        );
+        let memory_scans = db.scan_call_count() - memory_before;
+        let durable_scans = db.durable_scan_call_count() - durable_before;
+        assert!(
+            memory_scans > 0,
+            "directory verification must scan the current memory view"
+        );
+        assert!(
+            durable_scans > 0,
+            "directory verification must also scan the durable view"
+        );
+        assert!(
+            memory_scans + durable_scans <= MAX_VERIFY_LOGICAL_SCANS as u64,
+            "full-size verification must honor the combined logical scan budget"
+        );
+        assert_eq!(
+            db.point_read_call_count() - points_before,
+            0,
+            "full-size verification must not regress to per-frame point reads"
+        );
+
+        let (deleted, _) = store.reclaim_segments(Utc::now(), None).await.unwrap();
+        assert_eq!(
+            deleted, 1,
+            "a dead full-size segment must remain reclaimable"
+        );
+        assert!(
+            !store
+                .segments
+                .list_segments()
+                .await
+                .unwrap()
+                .contains(&segid),
+            "the verified dead full-size segment must be deleted"
+        );
+    }
+
+    #[tokio::test]
+    async fn compressed_directory_above_one_page_reclaims_with_bounded_pagination() {
+        const FRAMES: usize = MAX_VERIFY_PAGE_ROWS + 1;
+        let (writer, db, object_store) = make_with_compression(CompressionConfig::Lz4).await;
+        let extent = Bytes::from(vec![0x5a; EXTENT_SIZE]);
+        let frames: Vec<_> = (0..FRAMES as u64)
+            .map(|logical_extent| (1, logical_extent, extent.clone()))
+            .collect();
+        let locs = writer.segments.seal(&frames).await.unwrap();
+        let segid = locs[0].2.segid;
+        let total: u64 = locs.iter().map(|(_, _, loc)| u64::from(loc.byte_len)).sum();
+        let object = object_store
+            .get(&Path::from(segid.object_key()))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let parsed = crate::segment::Segment::parse(object.clone()).unwrap();
+        assert_eq!(parsed.dir_offset, total);
+        assert_eq!(parsed.k as usize, FRAMES);
+        assert_eq!(
+            object.len() as u64,
+            parsed.dir_offset + u64::from(parsed.dir_len) + crate::segment::FOOTER_LEN as u64
+        );
+        assert!(
+            total < super::super::write::SEAL_THRESHOLD as u64,
+            "compressible frames model high cardinality at a scaled stored-byte threshold"
+        );
+
+        let store = make_store(object_store, db.clone(), CompressionConfig::Lz4, 8);
+        let other = Segid::new(99, 1);
+        let mut txn = db.new_transaction().unwrap();
+        txn.put_bytes(
+            &store.key_codec.segcount_key(segid.epoch, segid.counter),
+            KeyCodec::encode_segcount(0, total),
+        );
+        for (frame_index, (_, logical_extent, _)) in locs.iter().enumerate() {
+            txn.put_bytes(
+                &store.key_codec.extent_key(1, *logical_extent),
+                test_frame_loc(other, frame_index as u32),
+            );
+        }
+        commit(&store, txn).await;
+        db.flush().await.unwrap();
+
+        let memory_before = db.scan_call_count();
+        let durable_before = db.durable_scan_call_count();
+        let points_before = db.point_read_call_count();
+        assert!(matches!(
+            store.verify_segment_reclaimable(segid).await,
+            SegmentDeadVerdict::Reclaim
+        ));
+        assert_eq!(
+            db.scan_call_count() - memory_before,
+            1,
+            "consumer page boundaries must stay inside one source scan"
+        );
+        assert_eq!(
+            db.durable_scan_call_count() - durable_before,
+            1,
+            "durable page boundaries must stay inside one source scan"
+        );
+        assert_eq!(db.point_read_call_count() - points_before, 0);
+
+        let (deleted, _) = store.reclaim_segments(Utc::now(), None).await.unwrap();
+        assert_eq!(deleted, 1);
+        assert!(
+            !store
+                .segments
+                .list_segments()
+                .await
+                .unwrap()
+                .contains(&segid)
+        );
+    }
+
+    async fn dead_sparse_segment_with_gap_rows(
+        gap_rows: impl IntoIterator<Item = (u64, Bytes)>,
+    ) -> (ExtentStore, Arc<Db>, Segid) {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let bt: Arc<dyn BlockTransformer> =
+            ZeroFsBlockTransformer::new_arc(&[0u8; 32], CompressionConfig::default());
+        let settings = slatedb::config::Settings {
+            wal_enabled: false,
+            l0_sst_size_bytes: usize::MAX - 1,
+            max_unflushed_bytes: usize::MAX,
+            ..Default::default()
+        };
+        let slatedb = Arc::new(
+            DbBuilder::new(Path::from("paged-sparse-verify"), object_store.clone())
+                .with_settings(settings)
+                .with_block_transformer(bt)
+                .with_segment_extractor(Arc::new(crate::segment_extractor::ZeroFsSegmentExtractor))
+                .build()
+                .await
+                .unwrap(),
+        );
+        let db = Arc::new(Db::new(slatedb, None));
+        let writer = make_store(object_store.clone(), db.clone(), CompressionConfig::Lz4, 7);
+        let frames: Vec<_> = (0..17u64)
+            .map(|slot| (1, slot * 1_000_000, Bytes::from_static(b"x")))
+            .collect();
+        let locs = writer.segments.seal(&frames).await.unwrap();
+        let segid = locs[0].2.segid;
+        let total = locs.iter().map(|(_, _, loc)| u64::from(loc.byte_len)).sum();
+
+        // Restart at a newer epoch so the sealed segment is eligible for the
+        // fast reclaim pass, then make its counter durably dead. The gap rows
+        // are unrelated extents that a coalesced directory range must stream
+        // past before it can prove the segment unreferenced.
+        let store = make_store(object_store, db.clone(), CompressionConfig::Lz4, 8);
+        let mut txn = db.new_transaction().unwrap();
+        txn.put_bytes(
+            &store.key_codec.segcount_key(segid.epoch, segid.counter),
+            KeyCodec::encode_segcount(0, total),
+        );
+        for (extent, value) in gap_rows {
+            txn.put_bytes(&store.key_codec.extent_key(1, extent), value);
+        }
+        commit(&store, txn).await;
+        db.flush().await.unwrap();
+        (store, db, segid)
+    }
+
+    #[tokio::test]
+    async fn directory_verify_streams_past_row_pages_and_reclaims_segment() {
+        let other = Segid::new(99, 1);
+        let rows = (1..=65_537u64).map(|extent| {
+            (
+                extent,
+                test_frame_loc(other, u32::try_from(extent).unwrap()),
+            )
+        });
+        let (store, db, segid) = dead_sparse_segment_with_gap_rows(rows).await;
+        let scans_before = db.scan_call_count() + db.durable_scan_call_count();
+
+        let (deleted, _) = store.reclaim_segments(Utc::now(), None).await.unwrap();
+
+        assert_eq!(deleted, 1, "page boundaries must not become a liveness cap");
+        assert_eq!(
+            db.scan_call_count() + db.durable_scan_call_count() - scans_before,
+            19,
+            "nine logical ranges per view plus the segcount scan must not reopen at page bounds"
+        );
+        assert!(
+            !store
+                .segments
+                .list_segments()
+                .await
+                .unwrap()
+                .contains(&segid),
+            "a valid dead segment must reclaim after every row page is verified"
+        );
+    }
+
+    #[tokio::test]
+    async fn directory_verify_streams_past_byte_pages_and_reclaims_segment() {
+        let encoded = Bytes::from(vec![0x5a; 1024 * 1024]);
+        let rows = (1..=65u64).map(|extent| (extent, encoded.clone()));
+        let (store, db, segid) = dead_sparse_segment_with_gap_rows(rows).await;
+        let scans_before = db.scan_call_count() + db.durable_scan_call_count();
+
+        let (deleted, _) = store.reclaim_segments(Utc::now(), None).await.unwrap();
+
+        assert_eq!(deleted, 1, "byte pages must make forward progress");
+        assert_eq!(
+            db.scan_call_count() + db.durable_scan_call_count() - scans_before,
+            19,
+            "nine logical ranges per view plus the segcount scan must not reopen at page bounds"
+        );
+        assert!(
+            !store
+                .segments
+                .list_segments()
+                .await
+                .unwrap()
+                .contains(&segid),
+            "total streamed bytes must not permanently pin a valid dead segment"
+        );
+    }
+
+    #[tokio::test]
+    async fn directory_verify_oversized_row_keeps_segment_and_blocks_delete() {
+        let oversized = Bytes::from(vec![0x5a; MAX_VERIFY_PAGE_ENCODED_BYTES + 1]);
+        let (store, _db, segid) = dead_sparse_segment_with_gap_rows([(1, oversized)]).await;
+
+        let (deleted, _) = store.reclaim_segments(Utc::now(), None).await.unwrap();
+
+        assert_eq!(deleted, 0, "one oversized row must fail closed");
+        assert!(
+            store
+                .segments
+                .list_segments()
+                .await
+                .unwrap()
+                .contains(&segid),
+            "an unpageable row must never permit an irreversible delete"
+        );
+    }
+
+    #[tokio::test]
+    async fn directory_verify_keeps_reference_on_final_durable_page() {
+        const UNRELATED_ROWS: u64 = 70_000;
+        let target = Segid::new(7, super::super::write::OPEN_SEGMENT_LANES as u64);
+        let other = Segid::new(99, 1);
+        assert!(UNRELATED_ROWS as usize > MAX_VERIFY_PAGE_ROWS);
+        let rows = (1..UNRELATED_ROWS)
+            .map(|extent| (extent, test_frame_loc(other, extent as u32)))
+            .chain(std::iter::once((1_000_000, test_frame_loc(target, 1))));
+        let (store, db, segid) = dead_sparse_segment_with_gap_rows(rows).await;
+        assert_eq!(segid, target);
+        db.flush().await.unwrap();
+
+        // Mask the target only in memory. Durable verification must paginate
+        // past 70,000 unrelated rows and still find the final wanted key.
+        let mut memory_only = db.new_transaction().unwrap();
+        memory_only.put_bytes(
+            &store.key_codec.extent_key(1, 1_000_000),
+            test_frame_loc(other, 1),
+        );
+        commit(&store, memory_only).await;
+
+        let durable_before = db.durable_scan_call_count();
+        assert!(matches!(
+            store.verify_segment_reclaimable(segid).await,
+            SegmentDeadVerdict::Keep
+        ));
+        assert_eq!(
+            db.durable_scan_call_count() - durable_before,
+            1,
+            "the stale durable reference beyond the first consumer page must stay in one source scan"
+        );
+        assert!(
+            store
+                .segments
+                .list_segments()
+                .await
+                .unwrap()
+                .contains(&segid)
+        );
+    }
+
+    #[tokio::test]
+    async fn directory_verify_malformed_wanted_row_keeps_segment() {
+        let malformed = Bytes::from_static(b"not-a-frame-location");
+        let (store, _db, segid) = dead_sparse_segment_with_gap_rows([(1_000_000, malformed)]).await;
+
+        let (deleted, _) = store.reclaim_segments(Utc::now(), None).await.unwrap();
+
+        assert_eq!(deleted, 0, "a malformed wanted row must fail closed");
+        assert!(
+            store
+                .segments
+                .list_segments()
+                .await
+                .unwrap()
+                .contains(&segid)
+        );
+    }
+
+    #[tokio::test]
+    async fn directory_verify_scan_construction_failure_keeps_segment() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let writer = SegmentStore::new(
+            object_store.clone(),
+            FrameCodec::new(&[1u8; 32], SEGMENT_INFO, CompressionConfig::Lz4),
+            7,
+            None,
+        );
+        let locs = writer
+            .seal(&[(1, 0, Bytes::from_static(b"x"))])
+            .await
+            .unwrap();
+        let segid = locs[0].2.segid;
+
+        let bt: Arc<dyn BlockTransformer> =
+            ZeroFsBlockTransformer::new_arc(&[0u8; 32], CompressionConfig::default());
+        let slatedb = Arc::new(
+            DbBuilder::new(Path::from("lease-failed-verify"), object_store.clone())
+                .with_block_transformer(bt)
+                .with_segment_extractor(Arc::new(crate::segment_extractor::ZeroFsSegmentExtractor))
+                .build()
+                .await
+                .unwrap(),
+        );
+        let db = Arc::new(Db::new(slatedb, None).with_lease(Lease::new()));
+        let store = make_store(object_store, db, CompressionConfig::Lz4, 8);
+
+        assert!(matches!(
+            store.verify_segment_reclaimable(segid).await,
+            SegmentDeadVerdict::Keep
+        ));
     }
 
     /// A transaction may append a frame before its FrameLoc/counter commit.

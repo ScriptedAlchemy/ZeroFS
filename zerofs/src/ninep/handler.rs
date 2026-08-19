@@ -711,6 +711,26 @@ impl NinePHandler {
             };
             return P9Message::new(tag, Message::Rlerror(Rlerror { ecode }));
         }
+
+        // The receive path discards an epoch-zero RETRY's Twrite payload while
+        // it joins the original attempt. Once admission has waited for that
+        // attempt, replay the typed result without consulting the reconnecting
+        // session's fid table. A missing or different result is fail-closed.
+        if let Message::Twrite(tw) = &msg
+            && tw.data.len() != tw.count as usize
+        {
+            return match self.filesystem.dedup.get(&op_id) {
+                Some(crate::dedup::DedupResult::Write { .. }) => {
+                    P9Message::new(tag, Message::Rwrite(Rwrite { count: tw.count }))
+                }
+                Some(_) | None => P9Message::new(
+                    tag,
+                    Message::Rlerror(Rlerror {
+                        ecode: ninep_proto::P9_EOPIDSTALE,
+                    }),
+                ),
+            };
+        }
         let result = match msg {
             Message::Tversion(tv) => self.version(tv).await,
             Message::Tattach(ta) => self.attach(ta).await,

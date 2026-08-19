@@ -11,6 +11,11 @@ use futures::pin_mut;
 use futures::stream::{self, StreamExt};
 use std::sync::atomic::Ordering;
 
+/// Hard ceiling for one protocol-neutral directory page. Network adapters may
+/// derive their requested entry count from untrusted byte-count fields, so the
+/// filesystem must enforce its own bound before opening a directory scan.
+pub(crate) const MAX_READDIR_ENTRIES: usize = 4_096;
+
 impl ZeroFS {
     /// Resolve `filename` in `dirid` to its inode id (requires execute on the
     /// directory).
@@ -109,6 +114,7 @@ impl ZeroFS {
         max_entries: usize,
     ) -> Result<ReadDirResult, FsError> {
         let dir_inode = self.inode_store.get(dirid).await?;
+        let max_entries = max_entries.min(MAX_READDIR_ENTRIES);
 
         if let Some(auth) = auth {
             let creds = Credentials::from_auth_context(auth);
@@ -120,63 +126,82 @@ impl ZeroFS {
         match &dir_inode {
             Inode::Directory(dir) => {
                 let mut entries = Vec::new();
+                let mut special_entry_pending = false;
 
                 // Handle . and .. based on start_after cookie
                 if start_after < COOKIE_DOT {
-                    entries.push(DirEntry {
-                        fileid: dirid,
-                        name: b".".to_vec(),
-                        attr: InodeWithId {
-                            inode: &dir_inode,
-                            id: dirid,
-                        }
-                        .into(),
-                        cookie: COOKIE_DOT,
-                    });
+                    if entries.len() < max_entries {
+                        entries.push(DirEntry {
+                            fileid: dirid,
+                            name: b".".to_vec(),
+                            attr: InodeWithId {
+                                inode: &dir_inode,
+                                id: dirid,
+                            }
+                            .into(),
+                            cookie: COOKIE_DOT,
+                        });
+                    } else {
+                        special_entry_pending = true;
+                    }
                 }
 
                 if start_after < COOKIE_DOTDOT {
-                    let parent_id = if dirid == 0 { 0 } else { dir.parent };
-                    let parent_attr = if parent_id == dirid {
-                        InodeWithId {
-                            inode: &dir_inode,
-                            id: dirid,
-                        }
-                        .into()
+                    if entries.len() < max_entries {
+                        let parent_id = if dirid == 0 { 0 } else { dir.parent };
+                        let parent_attr = if parent_id == dirid {
+                            InodeWithId {
+                                inode: &dir_inode,
+                                id: dirid,
+                            }
+                            .into()
+                        } else {
+                            let parent_inode = self.inode_store.get(parent_id).await?;
+                            InodeWithId {
+                                inode: &parent_inode,
+                                id: parent_id,
+                            }
+                            .into()
+                        };
+                        entries.push(DirEntry {
+                            fileid: parent_id,
+                            name: b"..".to_vec(),
+                            attr: parent_attr,
+                            cookie: COOKIE_DOTDOT,
+                        });
                     } else {
-                        let parent_inode = self.inode_store.get(parent_id).await?;
-                        InodeWithId {
-                            inode: &parent_inode,
-                            id: parent_id,
-                        }
-                        .into()
-                    };
-                    entries.push(DirEntry {
-                        fileid: parent_id,
-                        name: b"..".to_vec(),
-                        attr: parent_attr,
-                        cookie: COOKIE_DOTDOT,
-                    });
+                        special_entry_pending = true;
+                    }
                 }
 
-                // Get regular entries, starting after the given cookie
-                let iter = if start_after < COOKIE_DOTDOT {
-                    self.directory_store.list(dirid).await?
-                } else {
-                    self.directory_store.list_from(dirid, start_after).await?
-                };
-                pin_mut!(iter);
-
                 let mut dir_entries: Vec<(InodeId, Vec<u8>, u64, Option<Inode>)> = Vec::new();
-                let mut has_more = false;
+                let mut has_more = special_entry_pending;
 
-                while let Some(result) = iter.next().await {
-                    if dir_entries.len() >= max_entries - entries.len() {
-                        has_more = true;
-                        break;
+                // A zero-sized page must not touch the directory scan. Returning
+                // `end = false` is conservative and lets a caller retry with a
+                // usable budget without losing its cookie.
+                if max_entries == 0 {
+                    has_more = start_after != u64::MAX;
+                } else if !special_entry_pending && start_after != u64::MAX {
+                    // Get regular entries, starting after the given cookie. One
+                    // additional item is consumed only to determine continuation;
+                    // it is returned by the next cookie-based scan.
+                    let iter = if start_after < COOKIE_DOTDOT {
+                        self.directory_store.list(dirid).await?
+                    } else {
+                        self.directory_store.list_from(dirid, start_after).await?
+                    };
+                    pin_mut!(iter);
+
+                    let remaining = max_entries.saturating_sub(entries.len());
+                    while let Some(result) = iter.next().await {
+                        if dir_entries.len() >= remaining {
+                            has_more = true;
+                            break;
+                        }
+                        let entry = result?;
+                        dir_entries.push((entry.inode_id, entry.name, entry.cookie, entry.inode));
                     }
-                    let entry = result?;
-                    dir_entries.push((entry.inode_id, entry.name, entry.cookie, entry.inode));
                 }
 
                 let lookup_indices: Vec<usize> = dir_entries
@@ -261,12 +286,42 @@ impl ZeroFS {
 mod tests {
 
     use crate::fs::inode::Inode;
+    use crate::fs::inode::test_file_inode;
+    use crate::fs::store::directory::COOKIE_FIRST_ENTRY;
     use crate::fs::test_util::test_creds;
     use crate::fs::*;
     use crate::test_helpers::test_helpers_mod::test_auth;
 
     use crate::fs::types::{SetAttributes, SetMode};
     use bytes::Bytes;
+
+    async fn seed_directory_entries(fs: &ZeroFS, count: usize) {
+        let mut transaction = fs.db.new_transaction().unwrap();
+
+        for index in 0..count {
+            let inode_id = fs.inode_store.allocate();
+            let name = format!("entry-{index:05}").into_bytes();
+            let mut inode = test_file_inode(0);
+            let Inode::File(file) = &mut inode else {
+                unreachable!("test_file_inode must return a file")
+            };
+            file.name = Some(name.clone());
+
+            fs.inode_store
+                .save(&mut transaction, inode_id, &inode)
+                .unwrap();
+            fs.directory_store.add(
+                &mut transaction,
+                0,
+                &name,
+                inode_id,
+                COOKIE_FIRST_ENTRY + index as u64,
+                Some(&inode),
+            );
+        }
+
+        fs.write_coordinator.commit(transaction).await.unwrap();
+    }
 
     #[tokio::test]
     async fn test_process_readdir() {
@@ -324,6 +379,116 @@ mod tests {
             .await
             .unwrap();
         assert!(result2.end);
+    }
+
+    #[tokio::test]
+    async fn readdir_zero_budget_returns_without_advancing() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+
+        fs.create(&test_creds(), 0, b"file.txt", &SetAttributes::default())
+            .await
+            .unwrap();
+
+        for start_after in [0, crate::fs::store::directory::COOKIE_DOTDOT] {
+            let result = fs
+                .readdir(&(&test_auth()).into(), 0, start_after, 0)
+                .await
+                .unwrap();
+
+            assert!(result.entries.is_empty());
+            assert!(!result.end);
+        }
+    }
+
+    #[tokio::test]
+    async fn readdir_one_entry_pages_dot_entries_deterministically() {
+        use crate::fs::store::directory::{COOKIE_DOT, COOKIE_DOTDOT};
+
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        fs.create(&test_creds(), 0, b"file.txt", &SetAttributes::default())
+            .await
+            .unwrap();
+
+        let dot = fs.readdir(&(&test_auth()).into(), 0, 0, 1).await.unwrap();
+        assert_eq!(dot.entries.len(), 1);
+        assert_eq!(dot.entries[0].name, b".");
+        assert_eq!(dot.entries[0].cookie, COOKIE_DOT);
+        assert!(!dot.end);
+
+        let dotdot = fs
+            .readdir(&(&test_auth()).into(), 0, COOKIE_DOT, 1)
+            .await
+            .unwrap();
+        assert_eq!(dotdot.entries.len(), 1);
+        assert_eq!(dotdot.entries[0].name, b"..");
+        assert_eq!(dotdot.entries[0].cookie, COOKIE_DOTDOT);
+        assert!(!dotdot.end);
+
+        let regular = fs
+            .readdir(&(&test_auth()).into(), 0, COOKIE_DOTDOT, 1)
+            .await
+            .unwrap();
+        assert_eq!(regular.entries.len(), 1);
+        assert_eq!(regular.entries[0].name, b"file.txt");
+        assert!(regular.end);
+    }
+
+    #[tokio::test]
+    async fn readdir_exact_dot_budget_preserves_regular_continuation() {
+        use crate::fs::store::directory::COOKIE_DOTDOT;
+
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        fs.create(&test_creds(), 0, b"file.txt", &SetAttributes::default())
+            .await
+            .unwrap();
+
+        let dots = fs.readdir(&(&test_auth()).into(), 0, 0, 2).await.unwrap();
+        assert_eq!(
+            dots.entries
+                .iter()
+                .map(|entry| entry.name.as_slice())
+                .collect::<Vec<_>>(),
+            vec![b".".as_slice(), b"..".as_slice()]
+        );
+        assert!(!dots.end);
+
+        let regular = fs
+            .readdir(&(&test_auth()).into(), 0, COOKIE_DOTDOT, 1)
+            .await
+            .unwrap();
+        assert_eq!(regular.entries.len(), 1);
+        assert_eq!(regular.entries[0].name, b"file.txt");
+        assert!(regular.end);
+    }
+
+    #[tokio::test]
+    async fn readdir_max_cookie_is_already_at_end() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        fs.create(&test_creds(), 0, b"file.txt", &SetAttributes::default())
+            .await
+            .unwrap();
+
+        let result = fs
+            .readdir(&(&test_auth()).into(), 0, u64::MAX, 1)
+            .await
+            .unwrap();
+
+        assert!(result.entries.is_empty());
+        assert!(result.end);
+    }
+
+    #[tokio::test]
+    async fn readdir_huge_budget_is_capped() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        seed_directory_entries(&fs, 4_097).await;
+
+        let result = fs
+            .readdir(&(&test_auth()).into(), 0, 0, usize::MAX)
+            .await
+            .unwrap();
+
+        assert_eq!(result.entries.len(), 4_096);
+        assert!(!result.end);
     }
 
     #[tokio::test]

@@ -6,7 +6,6 @@
 use crate::failpoints::{self as fp, fail_point};
 
 use super::reclaim::SMALL_SEGMENT_BYTES;
-use super::write::SEAL_THRESHOLD;
 use super::{ExtentStore, PARALLEL_EXTENT_OPS, human_bytes};
 use crate::frame_codec::Compressed;
 use crate::fs::FsError;
@@ -18,17 +17,12 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use tracing::{info, warn};
 
-/// Live frames evacuated from candidates are repacked into segments of this
-/// target size, in source on-store bytes — the unit candidacy and the
-/// selection budget use. Plaintext cuts would split a compressible chain
-/// across outputs, manufacturing a fresh seam for the same reads to re-heat.
-/// The compaction sealer is one object per batch (no auto-split), so an
-/// output may exceed this only by re-framing delta plus a folded sliver.
-const PACK_TARGET_BYTES: u64 = SEAL_THRESHOLD as u64;
-
 /// How far a batch cut may back off the target to land on a file-adjacency
-/// break instead of splitting a contiguous run (see [`plan_batches`]).
+/// break instead of splitting a contiguous run (see [`plan_batches`]). The
+/// effective value scales down with the configured pack target; 32 MiB is the
+/// historical/default value for a 256 MiB target.
 const PACK_CUT_SLACK_BYTES: u64 = 32 << 20;
+const PACK_CUT_SLACK_DIVISOR: u64 = 8;
 
 /// Charged against the gather cap per frame, on top of its payload: the fixed
 /// bookkeeping a gathered frame costs regardless of size (frames tuple, `seen`
@@ -108,10 +102,48 @@ fn plan_batches(metas: &[(InodeId, u64, u64)], target: u64, slack: u64) -> Vec<u
     bounds
 }
 
+/// Resolve compaction's packed-object geometry from the same threshold used
+/// by foreground seals. The one-MiB floor prevents a test-only or malformed
+/// sub-candidate threshold from guaranteeing that every output immediately
+/// re-enters small-segment compaction. Valid SFTP profiles are already at
+/// least 8 MiB, so production values pass through unchanged.
+fn pack_geometry(seal_threshold: usize) -> (u64, u64) {
+    let target = (seal_threshold as u64).max(SMALL_SEGMENT_BYTES);
+    let slack = (target / PACK_CUT_SLACK_DIVISOR).min(PACK_CUT_SLACK_BYTES);
+    (target, slack)
+}
+
+/// Plan bounded packed objects and fold a final small sliver only when doing
+/// so still respects the configured target. An over-target fold would trade a
+/// small future compaction candidate for a large serialized publication,
+/// defeating the backend's configured object cadence.
+fn plan_compaction_batches(metas: &[(InodeId, u64, u64)], target: u64, slack: u64) -> Vec<usize> {
+    let mut bounds = plan_batches(metas, target, slack);
+    if bounds.len() > 1 {
+        let predecessor_start = if bounds.len() > 2 {
+            bounds[bounds.len() - 3]
+        } else {
+            0
+        };
+        let last_start = bounds[bounds.len() - 2];
+        let predecessor_store: u64 = metas[predecessor_start..last_start]
+            .iter()
+            .map(|m| m.2)
+            .sum();
+        let last_store: u64 = metas[last_start..].iter().map(|m| m.2).sum();
+        if last_store < SMALL_SEGMENT_BYTES
+            && predecessor_store.saturating_add(last_store) <= target
+        {
+            bounds.remove(bounds.len() - 2);
+        }
+    }
+    bounds
+}
+
 impl ExtentStore {
     /// Compact a set of fragmented/small segments: gather their still-live frames
-    /// and repack them into fresh ~[`PACK_TARGET_BYTES`] segments, repointing each
-    /// relocated extent. The drained sources become fully dead and are deleted by
+    /// and repack them into fresh segments sized to this store's configured seal
+    /// threshold, repointing each relocated extent. The drained sources become fully dead and are deleted by
     /// a later pass once past their horizon, so in-flight reads of the old
     /// locations stay valid.
     ///
@@ -195,20 +227,15 @@ impl ExtentStore {
         // Cut into target-sized batches by SOURCE on-store bytes, never
         // between file-adjacent extents unless a single run alone exceeds the
         // target (see plan_batches). A final sliver under the small threshold
-        // folds into its predecessor: sealed alone it would re-enter small
-        // candidacy and be rewritten again.
+        // folds into its predecessor only when the merged pack remains within
+        // target; otherwise it stays separate rather than creating an
+        // oversized publication that defeats the configured object cadence.
         let metas: Vec<(InodeId, u64, u64)> = frames
             .iter()
             .map(|&(inode, extent, loc, _)| (inode, extent, loc.byte_len as u64))
             .collect();
-        let mut bounds = plan_batches(&metas, PACK_TARGET_BYTES, PACK_CUT_SLACK_BYTES);
-        if bounds.len() > 1 {
-            let last_start = bounds[bounds.len() - 2];
-            let last_store: u64 = metas[last_start..].iter().map(|m| m.2).sum();
-            if last_store < SMALL_SEGMENT_BYTES {
-                bounds.remove(bounds.len() - 2);
-            }
-        }
+        let (pack_target, pack_slack) = pack_geometry(self.seal_threshold());
+        let bounds = plan_compaction_batches(&metas, pack_target, pack_slack);
         let mut batches: Vec<PackBatch> = Vec::with_capacity(bounds.len());
         let mut iter = frames.into_iter();
         let mut prev = 0usize;
@@ -491,6 +518,29 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    #[test]
+    fn default_pack_geometry_preserves_the_historical_256_mib_cadence() {
+        assert_eq!(
+            pack_geometry(super::super::write::SEAL_THRESHOLD),
+            (
+                super::super::write::SEAL_THRESHOLD as u64,
+                PACK_CUT_SLACK_BYTES,
+            )
+        );
+    }
+
+    #[test]
+    fn final_sliver_never_pushes_its_predecessor_over_the_pack_target() {
+        let target = 32 * 1024 * 1024;
+        let metas = vec![(1, 0, target - 512 * 1024), (2, 0, 768 * 1024)];
+
+        assert_eq!(
+            plan_compaction_batches(&metas, target, target / PACK_CUT_SLACK_DIVISOR),
+            vec![1, 2],
+            "a sub-1 MiB tail must stay separate when folding would exceed the target"
+        );
+    }
+
     // Compaction moves live bytes from the drained sources onto the packed segment.
     #[tokio::test]
     async fn compaction_moves_counter_from_sources_to_packed() {
@@ -679,6 +729,58 @@ mod tests {
         );
         let expect: Vec<u8> = (0..3u8).flat_map(|c| vec![10 + c; EXTENT_SIZE]).collect();
         assert_eq!(got.as_ref(), expect.as_slice());
+    }
+
+    /// The configured SFTP profile seals foreground generations at 32 MiB.
+    /// Compaction must use that same object cadence instead of silently
+    /// rebuilding a single historical 256 MiB pack.
+    #[tokio::test]
+    async fn compaction_respects_the_configured_32_mib_pack_target() {
+        const SFTP_PACK_TARGET: usize = 32 * 1024 * 1024;
+
+        let (store, db) = make().await;
+        let store = store.with_seal_threshold(SFTP_PACK_TARGET);
+        const FILE_BYTES: usize = 17 * 1024 * 1024;
+        const FILE_EXTENTS: u64 = (FILE_BYTES / EXTENT_SIZE) as u64;
+
+        let mut sources = Vec::new();
+        for inode in 1_u64..=2 {
+            write_chunk_at(
+                &store,
+                &db,
+                inode,
+                0,
+                Bytes::from(incompressible(inode as usize, FILE_BYTES)),
+            )
+            .await;
+            store.seal_open().await.unwrap();
+            sources.push(frameloc_of(&store, &db, inode, 0).await.unwrap().segid);
+        }
+
+        let (relocated, packed, consumed) = store
+            .compact_segments(&sources, &[], MAX_COMPACT_BYTES_PER_ROUND)
+            .await
+            .unwrap();
+        assert_eq!(relocated, 2 * FILE_EXTENTS as usize);
+        assert_eq!(consumed, sources.len());
+        assert_eq!(packed, 2, "34 MiB of live frames must become two packs");
+
+        let source_set: HashSet<_> = sources.into_iter().collect();
+        let mut packed_bytes = BTreeMap::<Segid, u64>::new();
+        for inode in 1_u64..=2 {
+            for extent in 0..FILE_EXTENTS {
+                let loc = frameloc_of(&store, &db, inode, extent).await.unwrap();
+                assert!(!source_set.contains(&loc.segid), "extent was not relocated");
+                *packed_bytes.entry(loc.segid).or_default() += loc.byte_len as u64;
+            }
+        }
+        assert_eq!(packed_bytes.len(), packed);
+        assert!(
+            packed_bytes
+                .values()
+                .all(|&bytes| bytes <= SFTP_PACK_TARGET as u64),
+            "configured 32 MiB profile emitted oversized packs: {packed_bytes:?}"
+        );
     }
 
     /// A world whose decompressed size dwarfs the round budget while its

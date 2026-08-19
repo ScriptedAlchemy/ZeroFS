@@ -29,6 +29,20 @@ admits another large burst. The desired steady-state behavior is a smooth stairc
 
 `bounded RAM burst -> bounded SSD-rate admission -> remote-drain-rate admission`
 
+The 2026-08-19 production incident adds a distinct resident-memory constraint. A
+96 GiB, no-swap CT198 cgroup killed ZeroFS while dirty writeback RAM remained zero.
+The configured 64 GiB logical clean-cache payload had filled and stabilized, then
+process/jemalloc residency rose by roughly another 30 GiB in about three minutes
+under concurrent NFS writes, 9P/WebSocket traffic, and segment GC. Restart discarded
+the process-local 9P replay identities, so a retried mutation correctly failed closed
+as `EOPIDSTALE`. This proves that successful RAM-to-SSD drain and payload-only cache
+limits are not a server-resident-memory safety proof. The implementation must account
+for cache metadata and replacement overlap, allocator overhead, protocol request
+bodies, maintenance working sets, and explicit headroom before production reuse. The
+incident metric also overcounted physical memory by summing jemalloc `resident` and
+`retained`; retained virtual mappings are diagnostic, not physical RSS. OS RSS and
+cgroup `memory.current` remain the physical authorities.
+
 The namespaces remain deliberately separate. An XFS filesystem inside an NBD
 export is not the same namespace as ZeroFS files served directly over NFS or 9P.
 This design unifies write admission, coherence, durability, errors, and shutdown;
@@ -57,6 +71,69 @@ it does not merge those namespaces.
    never claim RAM-only writes survived a crash.
 10. Prove the behavior through cross-protocol, failpoint, restart, filesystem, and
     performance tests before merging or deploying it.
+11. Keep logically sequential reads from becoming one-backend-RTT-per-segment-run:
+    independent immutable runs are fetched with bounded concurrency, and NFS, 9P,
+    and NBD read throughput is proved against paired raw-direction controls and
+    cache-state-matched ZeroFS protocol controls.
+12. Preserve the original production envelope: a configured 16 GB dirty-write RAM
+    budget distinct from the 64 GB clean read cache, a 1 TB local SSD tier shared by
+    the configured clean-cache and durable journal/staging budgets, and a 5 TB-class
+    user-visible volume/export. Capacity reporting must keep
+    sparse virtual-device geometry separate from physically allocated local and
+    remote bytes.
+13. Bound aggregate server-resident memory before owned protocol payload copies,
+    including cache overhead/replacement, raw-parts buffers, segment/compaction work,
+    request replay, dirty tiers, and a configured reserve below the effective cgroup
+    or process limit. Before a scored process starts, freeze the cgroup-high-event,
+    accounting-error, and unowned-residual tolerances in the run ledger; a result may
+    not derive or relax them from its observed peak. A zero dirty-RAM gauge is never
+    sufficient memory evidence.
+14. Prove and remove the SSH/SFTP per-stream ceiling separately for each direction.
+    A pinned HPN OpenSSH client may be selected by ZeroFS only after a real stock/HPN
+    A/B wins; receiver-window gains must not be misreported as an upload fix.
+
+## Production performance contract
+
+FUSE is not a shipping frontend. ZeroFS itself owns the shared tiering used by NBD,
+NFS, 9P, WebUI, and direct callers. Linux may use NBD for a fast guest filesystem and
+also mount the direct NFS/9P namespace seen by the Mac; those namespaces remain
+distinct even though admission, durability, caching, failures, and remote storage are
+shared below the adapters.
+
+The production-shaped acceptance profile is:
+
+- a 4 GiB foreground write must remain entirely on the RAM/local-SSD path and must
+  not collapse to remote Storage Box throughput;
+- a 100 GiB copy with the configured 16 GB volatile budget must show the bounded RAM burst and
+  then sustained local-SSD-rate admission while remote publication proceeds
+  concurrently;
+- after the configured SSD dirty capacity is genuinely exhausted, foreground
+  admission must pace smoothly at measured remote drain without the 95-to-85-percent
+  multi-minute stop/resume cycle;
+- the local SSD leg is compared with a same-host durable local control, whose known
+  production target is approximately 800-900 MB/s on the intended hardware;
+- remote publication is compared with a same-endpoint, same-session-count, durable
+  raw SFTP control, whose intended production target is approximately 70-100 MB/s;
+  an environment whose paired raw control cannot reach that range is reported as an
+  external-path limitation rather than hidden by a lower ZeroFS threshold;
+- stock OpenSSH, a pinned HPN client, and ZeroFS using the same selected executable
+  are compared at one and configured-many physical sessions in both directions.
+  Receipts distinguish receive-window, SFTP request-depth, and session-utilization
+  limits. HPN is promoted only for a repeatable winning direction and ZeroFS retains
+  stock behavior by default.
+- any pinned HPN candidate must pass a supervisor-bounded upstream suite with a
+  recorded nonzero test inventory and focused transfer/rekey/SFTP tests. The only
+  permitted upstream exclusion is the pinned tree's `dynamic-forward` regression,
+  whose background multiplexed client is outside the bulk-transfer package proof;
+  every test process group is terminated and reaped on deadline.
+- ordinary epoch/counter-unique immutable segment objects use create-only publication,
+  not overwrite ordering fences. An unexpected name collision fails closed. The real
+  SegmentStore-to-writeback path, not a create-only synthetic scheduler fixture, must
+  keep configured upload lanes occupied before request-window tuning is considered.
+
+These rates are targets, not permission to weaken integrity or durability. Each result
+must include the paired control, tier-occupancy timeline, exact acknowledged and
+durable cutoffs, zero terminal errors, and cleanup evidence.
 
 ## Non-goals
 
@@ -146,6 +223,22 @@ volatile_memory_gb = 16.0
 
 # Hard cap for active prepared batches and retained duplicate-request results.
 volatile_max_operations = 65536
+
+# Aggregate protocol bodies waiting before or inside canonical preparation. The
+# byte permit is acquired before a decoded NFS/9P/WebUI payload becomes owned.
+protocol_inflight_memory_gb = 4.0
+protocol_inflight_max_operations = 4096
+
+[memory]
+# Explicit aggregate process envelope. On Linux the discovered cgroup memory.max,
+# when finite, is an additional upper bound; incompatible budgets fail startup.
+resident_limit_gb = 128.0
+resident_reserve_gb = 16.0
+
+[sftp]
+# Optional absolute executable used for the owned SFTP ssh child. Omission keeps
+# the existing stock `ssh` lookup. No arbitrary argument string is accepted.
+# ssh_program = "/opt/zerofs/hpn-ssh/e2dfa0cea55d93747f4c68b4a2b134d6fbe0db06/bin/hpnssh"
 ```
 
 `[filesystem].write_ack_mode` controls when a filesystem write may return:
@@ -176,6 +269,20 @@ operation cap; zero-length writes and retained results therefore remain bounded 
 when they charge no payload bytes. The generated configuration shows `materialized`;
 omission selects it.
 
+The aggregate resident envelope applies in both materialized and volatile modes.
+Startup computes a conservative upper bound for every configured payload owner plus
+entry/key/allocator overhead and the explicit reserve. A finite Linux cgroup limit is
+also read as an upper bound. Configuration fails closed when those values cannot fit;
+the server never silently reduces a requested durability or cache contract. Runtime
+admission uses the same ownership model and poisons or backpressures before exceeding
+the hard envelope.
+
+`[sftp].ssh_program`, when present, must be an absolute, executable regular file.
+ZeroFS records its canonical path, version, and binary digest without allowing extra
+shell arguments. Global `PATH`, `update-alternatives`, and the system `ssh` binary are
+never changed by this feature. A pinned HPN executable remains optional and must pass
+the same strict host-key and key-only authentication policy as stock OpenSSH.
+
 Existing `[servers.nbd] write_ack_mode = "volatile_memory"` and
 `volatile_memory_gb` are deprecated migration inputs. If the new filesystem fields
 are omitted, the legacy pair normalizes to shared volatile mode. If both forms are
@@ -186,10 +293,14 @@ release window the NBD-only fields and exclusivity rule are removed.
 The configuration must keep these budgets distinct:
 
 - clean read-cache RAM and SSD;
+- clean-cache entry/key/allocator overhead and replacement overlap;
 - raw volatile mutation RAM and operation count;
+- decoded protocol request RAM and operation count before and during preparation;
 - open/sealing segment memory;
+- raw-parts/Foyer buffers and GC/compaction working memory;
 - object-writeback RAM and operation count;
 - dirty SSD journal/staging bytes and operations;
+- immutable process-resident reserve below the effective configured/cgroup limit;
 - mandatory physical filesystem free-space reserve.
 
 The production default remains canonical-materialization-before-ack. This is not a
@@ -251,6 +362,35 @@ instead. NFSv3 has no globally stable client operation ID across a new connectio
 so a client-reissued write after reconnect remains a new NFS operation; its
 positioned byte write is idempotent, but ZeroFS does not fabricate cross-connection
 exactly-once semantics.
+
+Every protocol shares one fair byte/operation ingress budget. The adapter or framing
+layer acquires its permit before copying a decoded payload into an owned request. A
+retry is ingress-charged while its complete fingerprint is streamed or decoded under
+the hard bound, then joins the retained request before a second raw-mutation/cache
+charge. A same-identity/different-payload retry remains a fingerprint mismatch; XID
+alone never bypasses body validation. NFS hard-mount retransmits, 9P frames, and
+WebUI/RPC messages therefore cannot accumulate unbounded copies behind canonical
+preparation; cancellation, disconnect, timeout, fingerprint failure, and shutdown each
+release the single permit exactly once. If a protocol library decodes before its
+application callback, its connection accepts a precharged maximum frame/session permit
+and hard byte/concurrency limits before that library allocation.
+
+All canonical writes are write-no-allocate for the clean decoded read cache.
+Pending reads remain coherent through the mutation overlay and canonical store, but a
+chunked NFS rsync cannot fill the clean read cache. Subsequent reads populate the
+cache normally. Segment GC and compaction group adjacent source ranges into bounded
+sequential scans and use explicit no-admit/no-fill reads. Reclaim verification also
+batches sparse/interleaved forward keys: a real maximum 256 MiB compacted segment has
+approximately 8,192 32 KiB frames and uses 16 fixed 512-key batches plus two streaming
+views, for at most 32 scans rather than about 16,384 point reads. The desired keys
+occupy about 16,384 two-view rows; a fixed fourfold ceiling permits at most 65,536
+scanned rows including bounded gap overhead, while encoded key/value bytes remain
+capped at 64 MiB. Exhausting either budget returns `Keep`. Scan/decode errors
+and either view retaining a reference fail closed. Focused acceptance lists and runs
+both exact reclaim tests with nonzero selection; a raw Cargo zero-test success is not
+evidence.
+Any later write-admission or maintenance-cache
+exception requires its own bounded policy and measured RED/GREEN proof.
 
 The coordinator maintains an interval overlay per inode. Reads merge the newest
 pending intervals over the canonical materialized file. All members of a batch
@@ -483,6 +623,18 @@ Metrics and status expose at least:
 - NFS stability class counts;
 - terminal failure state and cause class;
 - shutdown phase and incomplete target.
+- aggregate resident limit/reserve/current/peak and Linux cgroup current/max/events;
+- charged payload and estimated overhead/replacement bytes for each cache owner;
+- protocol in-flight bytes/ops/waiters by bounded protocol class;
+- GC/compaction working bytes and no-admit read counts;
+- allocator allocated/resident/retained bytes, with retained labeled virtual and never
+  added to resident as physical pressure; OS RSS/cgroup current are reported separately;
+- selected SFTP executable identity, per-direction physical sessions, request depth,
+  session waits, and per-session/aggregate bytes;
+- logical read bytes, resolved extent/run fanout, active backend read lanes,
+  requested-versus-fetched bytes, and backend wait/latency. Isolated benchmark
+  receipts additionally prove cache source from process/cache roots plus local-device
+  and network counters rather than inventing an unavailable cache-tier label.
 
 Capacity reporting distinguishes logical namespace size, physically allocated local
 bytes, object-store live bytes, and sparse virtual-device geometry. Sparse NBD file
@@ -517,10 +669,57 @@ Implementation follows strict RED/GREEN slices. The required proof matrix includ
     the existing ZFS-over-NBD matrix where applicable;
 15. controlled performance comparisons separating foreground RAM acknowledgement,
     local SSD barrier, and remote backend flush.
+16. a real Ubuntu read matrix over raw SFTP, kernel NFSv3, native 9P, and
+    NBD/XFS, separating remote-cold, clean-SSD, and clean-RAM state and sweeping
+    concurrency through the configured read-session ceiling. The matrix records
+    negotiated request sizes, outstanding requests, extent-run fanout, active
+    backend lanes, cache/network/disk evidence, exact bytes, and SHA-256 readback.
+17. two cgroup-constrained Ubuntu resident-memory gates combining NFS retransmits,
+    concurrent 9P/WebUI requests, clean-cache churn, segment sealing, and GC: the exact
+    96 GiB/no-swap incident envelope must reject the incompatible 64+16 GiB profile
+    before serving, and a full-scale 128 GiB/no-swap soak must fill the 64 GiB clean
+    cache, exercise the 16 GiB volatile tier, then sustain replacement/GC overlap. It
+    stays below the effective limit by the configured reserve, records at setup the
+    immutable limits `high delta <= 8`, reconciliation error `<= 256 MiB`, and unowned
+    residual `<= 2 GiB`, reconciles owned, baseline, and residual residency within
+    those limits, records zero cgroup `oom`/`oom_kill` deltas, and proves retained-only
+    virtual growth cannot create false physical over-cap/backpressure. The same soak
+    verifies a real sparse/interleaved maximum 256 MiB/~8,192-frame reclaim candidate
+    stays within 32 scans, 65,536 rows, 64 MiB encoded bytes, and bounded maintenance
+    memory.
+18. stock OpenSSH versus pinned HPN versus ZeroFS SFTP A/Bs for upload and download at
+    one and configured-many sessions. Each cell records executable identity, RTT,
+    TCP window/retransmits, SFTP depth, lane utilization, exact bytes, SHA-256, and
+    durability; all temporary processes and remote prefixes are ledger-cleaned. One
+    registered composite runs all three measurement families in one supervisor ledger
+    at one source SHA and is the only decision-authority producer; final proof reruns
+    that composite at `FINAL_PROOF_SHA` and consumes only its fresh receipt.
+19. a harness-supervision matrix proving setup, every composite primary substep,
+    timeout, double cleanup, and `assert-clean` preserve their independent statuses;
+    a later success never masks the first primary failure. Ledger scalar/path access
+    is allowlisted and traversal-safe, and NBD receipts store immutable machine
+    identity separately from the controller-reachable SSH target validated to it.
 
 Performance acceptance requires integrity and durability checks, not just throughput:
 size, checksum, protocol-visible readback, restart behavior, local barrier, remote
 barrier, and zero leaked reservations or temporary objects.
+
+Read performance is judged against paired controls, not a historical absolute rate.
+Repeated materialized A/A controls establish a median plus MAD noise band. A candidate
+may not regress median throughput, p95 latency, requests per logical GiB, or scaling
+outside that band. Active read lanes must rise with independent demand until the
+configured pool or an evidenced extent-run limit is reached; an unexplained one-lane
+result fails. A control whose variance exceeds its acceptance band is inconclusive and
+must be rerun, never counted as a pass.
+
+Cache-state names require server-side proof. `fio --invalidate=1` proves only that the
+Linux client page cache was invalidated. Remote-cold requires a fresh process and empty
+clean-cache roots plus positive remote payload reads; clean-SSD requires zero remote
+payload reads and positive local-cache device reads after a restart that clears RAM;
+clean-RAM requires client-cache invalidation after server warmup, positive exact
+protocol/server logical read bytes for the scored ranges, and zero local-device and
+remote payload reads. A zero protocol/server-byte delta is a client-cache hit, not a
+clean-RAM result.
 
 ## Implementation phases and rollout
 
@@ -545,14 +744,58 @@ capacity snapshots, and prove the old emergency watermarks still fail safe. This
 phase is independently benchmarked and can be reverted without removing shared
 mutation correctness.
 
+### Phase 3B: Bounded read fanout and matched protocol benchmarks
+
+Plan logically sequential extent runs before fetching and issue independent immutable
+segment reads with bounded ordered concurrency. Preserve output order, cache identity,
+stale-location re-resolution, nomination/crossing accounting, and exact bytes. Reuse
+the maintained VM100 fio/hash/raw-SFTP benchmark primitives in the UUID-ledgered Ubuntu
+harness, but replace its NBD-only lifecycle and client-page-cache-only “cold” claim with
+real NFS/9P/NBD entry points and proven server cache states. Further NFS framing/copy
+work requires a separate measured RED after this shared read fix; it is not assumed in
+advance.
+
+VM100 itself remains NFS-only for the shared Mac/Linux namespace. NBD-containing
+cross-adapter, filesystem, and read cells execute only on a separately identified,
+disposable Linux proof host; an unavailable proof host fails those gates closed.
+
+### Phase 3C: Resident-memory containment and bounded protocol ingress
+
+Charge protocol frames before owned copies, conservatively account cache and allocator
+overhead, make streaming writes write-no-allocate, make GC reads no-admit, and enforce
+one aggregate process envelope with explicit reserve. Prove retransmit storms and
+cache replacement cannot escape it in a real cgroup-constrained Ubuntu process.
+
+### Phase 3D: Measured SSH/SFTP transport selection
+
+Run direction-specific stock/HPN/ZeroFS A/Bs before changing the shipping transport.
+If pinned HPN wins a receiving path, allow the explicitly configured absolute binary
+and land its immutable packaging/deployment selection without replacing system SSH.
+If upload remains below its raw same-session control, land the measured request-depth
+or physical-session scheduling correction and rerun the A/B. A benchmark-only binary
+or dormant selector is not completion. The receive-win and current-upload-gap results
+are typed fields emitted only after one composite runs download A/B, upload A/B, and
+ZeroFS session scaling in one supervisor ledger at one source SHA. After any correction,
+rerun the same composite; final proof runs it again at `FINAL_PROOF_SHA` and requires
+the fresh receipt's current upload gap to be false. Separate or stale ledgers cannot be
+assembled into authority; a combined HPN win and upload gap executes both corrections
+and cannot be replaced by a free-form environment value. Receiver-window evidence alone
+cannot justify an upload claim.
+
 ### Phase 4: Repository and Linux proof
 
 Run the full repository and thermonuclear quality gates, then isolated Linux protocol,
 crash, filesystem, and performance matrices. Merge and push `develop`; fast-forward
 the clean Ubuntu source checkout.
 
-- Do not deploy or restart CT198 while its current writeback backlog is nonzero or
-  while the current production shutdown policy could exceed systemd's stop budget.
+Cleanup routing is ledger authority too: every remote run carries a controller-validated
+target receipt, and global cleanup emits only manifest-validated
+`normalized_target<TAB>ledger` rows. A remote hostname or enumeration-loop value never
+substitutes for that target receipt.
+
+- Do not deploy or restart CT198 during this feature implementation, proof, merge, or
+  source-synchronization plan. The 2026-08-19 automatic post-OOM service restart is an
+  incident receipt, not permission for another restart.
 - After a separately approved deployment window, drain and verify production,
   deploy one exact build, validate recovery and metrics, and canary volatile mode
   with bounded data before any large transfer.

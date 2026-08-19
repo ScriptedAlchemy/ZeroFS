@@ -47,7 +47,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 #[cfg(not(target_arch = "wasm32"))]
 use tokio::net::{TcpStream, UnixStream};
-use tokio::sync::{Notify, mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 #[cfg(not(target_arch = "wasm32"))]
 use tokio_util::codec::LengthDelimitedCodec;
 use tracing::{debug, info, warn};
@@ -86,11 +86,20 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 /// Maximum age of a decoded frame accepted as proof of liveness.
 const LIVENESS_WINDOW: Duration = Duration::from_secs(3);
 /// Maximum time a transport may make no forward write progress.
-const SEND_STALL_TIMEOUT: Duration = MUTATION_RETRY_HORIZON;
+///
+/// This is deliberately shorter than the mutation retry horizon so a stalled
+/// first dispatch still has time to reconnect and replay with the same op-id.
+/// Actual byte progress refreshes this per-stall window, so it is not an
+/// aggregate deadline for a healthy large send.
+const SEND_STALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 const _: () = assert!(
     LIVENESS_WINDOW.as_nanos() < REQUEST_TIMEOUT.as_nanos(),
     "the liveness window must be shorter than the request timeout"
+);
+const _: () = assert!(
+    SEND_STALL_TIMEOUT.as_nanos() < MUTATION_RETRY_HORIZON.as_nanos(),
+    "send-stall recovery must leave time for mutation replay"
 );
 
 /// FIRST/RETRY state for one request future.
@@ -123,9 +132,9 @@ impl OpAttemptState {
         let result = dispatch(flags, origin_epoch)?;
         if has_op_id {
             self.origin_epoch.get_or_insert(origin_epoch);
-            if self.started.is_none() {
-                self.started = Some(runtime::Clock::now());
-            }
+        }
+        if self.started.is_none() {
+            self.started = Some(runtime::Clock::now());
         }
         Ok((flags, result))
     }
@@ -325,13 +334,13 @@ impl std::str::FromStr for Target {
 
         #[cfg(target_arch = "wasm32")]
         {
-            return if spec.starts_with("ws://") || spec.starts_with("wss://") {
+            if spec.starts_with("ws://") || spec.starts_with("wss://") {
                 Ok(Self::WebSocket(spec.into()))
             } else {
                 Err(format!(
                     "browser clients require a ws:// or wss:// target, got {spec:?}"
                 ))
-            };
+            }
         }
 
         #[cfg(not(target_arch = "wasm32"))]
@@ -453,6 +462,8 @@ struct Conn {
     writer_shutdown: Notify,
     /// Stops the reader when a healthy connection is discarded before install.
     reader_shutdown: Notify,
+    /// Forward write progress shared by all FIFO-queued request receipts.
+    send_progress: SendProgress,
     counters: Arc<TrafficCounters>,
 }
 
@@ -511,15 +522,53 @@ impl Conn {
     }
 }
 
+#[derive(Clone)]
+struct SendProgress {
+    generation: watch::Sender<u64>,
+}
+
+impl SendProgress {
+    fn new() -> Self {
+        let (generation, _) = watch::channel(0);
+        Self { generation }
+    }
+
+    fn subscribe(&self) -> watch::Receiver<u64> {
+        self.generation.subscribe()
+    }
+
+    fn advanced(&self) {
+        self.generation
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
+    }
+}
+
+struct SendReceipt {
+    sent: oneshot::Receiver<()>,
+    progress: watch::Receiver<u64>,
+}
+
+#[derive(Debug)]
+enum SendWaitError {
+    Disconnected,
+    Stalled,
+}
+
 struct OutboundFrame {
     bytes: Vec<u8>,
     sent: oneshot::Sender<()>,
 }
 
 impl OutboundFrame {
-    fn new(bytes: Vec<u8>) -> (Self, oneshot::Receiver<()>) {
+    fn new(bytes: Vec<u8>, progress: &SendProgress) -> (Self, SendReceipt) {
         let (sent, received) = oneshot::channel();
-        (Self { bytes, sent }, received)
+        (
+            Self { bytes, sent },
+            SendReceipt {
+                sent: received,
+                progress: progress.subscribe(),
+            },
+        )
     }
 
     #[cfg(test)]
@@ -760,6 +809,7 @@ impl NinePClient {
             probe_lock: tokio::sync::Mutex::new(()),
             writer_shutdown: Notify::new(),
             reader_shutdown: Notify::new(),
+            send_progress: SendProgress::new(),
             counters,
         });
 
@@ -1442,7 +1492,7 @@ impl NinePClient {
             // Frames after the first possible dispatch carry RETRY.
             let has_op_id = op_id != [0u8; 16];
             let connection_epoch = conn.writer_epoch.load(Ordering::Relaxed);
-            let (op_flags, mut sent) =
+            let (op_flags, mut send) =
                 attempt.dispatch_frame(has_op_id, connection_epoch, |op_flags, origin_epoch| {
                     let bytes = P9Message::new_with_op_id_flags_and_origin(
                         tag,
@@ -1455,17 +1505,22 @@ impl NinePClient {
                     .map_err(ClientError::Codec)?;
 
                     // Registration-to-enqueue has no cancellation point.
-                    let (frame, sent) = OutboundFrame::new(bytes);
+                    let (frame, send) = OutboundFrame::new(bytes, &conn.send_progress);
                     pending.mark_dispatched();
                     if let Some(dispatched_conn) = stateful_dispatched_conn {
                         *dispatched_conn.lock().unwrap() = Some(Arc::clone(&conn));
                     }
                     permit.send(frame);
-                    Ok(sent)
+                    Ok(send)
                 })?;
-            let early_response = match Self::wait_for_send_or_response(&mut sent, &mut orx).await {
+            let early_response = match Self::wait_for_send_or_response(&mut send, &mut orx).await {
                 Ok(response) => response,
-                Err(_) => {
+                Err(SendWaitError::Stalled) => {
+                    self.force_reprobe(&conn);
+                    runtime::yield_now().await;
+                    continue 'resend;
+                }
+                Err(SendWaitError::Disconnected) => {
                     runtime::yield_now().await;
                     continue 'resend;
                 }
@@ -1635,14 +1690,35 @@ impl NinePClient {
 
     /// Waits until the writer flushes a request or an early response proves it was sent.
     async fn wait_for_send_or_response(
-        sent: &mut oneshot::Receiver<()>,
+        send: &mut SendReceipt,
         response: &mut oneshot::Receiver<Bytes>,
-    ) -> ClientResult<Option<Bytes>> {
-        tokio::select! {
-            biased;
-            response = response => response.map(Some).map_err(|_| ClientError::Disconnected),
-            sent = sent => {
-                sent.map(|()| None).map_err(|_| ClientError::Disconnected)
+    ) -> Result<Option<Bytes>, SendWaitError> {
+        enum Event {
+            Response(Result<Bytes, oneshot::error::RecvError>),
+            Sent(Result<(), oneshot::error::RecvError>),
+            Progress(Result<(), watch::error::RecvError>),
+        }
+
+        loop {
+            let event = runtime::timeout(SEND_STALL_TIMEOUT, async {
+                tokio::select! {
+                    biased;
+                    response = &mut *response => Event::Response(response),
+                    sent = &mut send.sent => Event::Sent(sent),
+                    progress = send.progress.changed() => Event::Progress(progress),
+                }
+            })
+            .await;
+            match event {
+                Ok(Event::Response(response)) => {
+                    return response.map(Some).map_err(|_| SendWaitError::Disconnected);
+                }
+                Ok(Event::Sent(sent)) => {
+                    return sent.map(|()| None).map_err(|_| SendWaitError::Disconnected);
+                }
+                Ok(Event::Progress(Ok(()))) => continue,
+                Ok(Event::Progress(Err(_))) => return Err(SendWaitError::Disconnected),
+                Err(_) => return Err(SendWaitError::Stalled),
             }
         }
     }
@@ -1688,12 +1764,17 @@ impl NinePClient {
             Ok(b) => b,
             Err(e) => return Err(ClientError::Codec(e)),
         };
-        let (frame, mut sent) = OutboundFrame::new(bytes);
+        let (frame, mut send) = OutboundFrame::new(bytes, &conn.send_progress);
         pending.mark_dispatched();
         permit.send(frame);
-        let response = match Self::wait_for_send_or_response(&mut sent, &mut orx).await? {
-            Some(response) => response,
-            None => orx.await.map_err(|_| ClientError::Disconnected)?,
+        let response = match Self::wait_for_send_or_response(&mut send, &mut orx).await {
+            Ok(Some(response)) => response,
+            Ok(None) => orx.await.map_err(|_| ClientError::Disconnected)?,
+            Err(SendWaitError::Stalled) => {
+                conn.shutdown();
+                return Err(ClientError::Disconnected);
+            }
+            Err(SendWaitError::Disconnected) => return Err(ClientError::Disconnected),
         };
         let msg = P9Message::from_owned_bytes_ctx(response, false).map_err(ClientError::Codec)?;
         if msg.tag != tag {
@@ -3133,30 +3214,34 @@ fn spawn_writer(
                 _ = conn.writer_shutdown.notified() => break,
                 maybe = rx.recv() => {
                     let Some(frame) = maybe else { break };
-                    let mut acknowledgements = Vec::new();
-                    conn.counters.bytes_sent.fetch_add(frame.bytes.len() as u64, Ordering::Relaxed);
+                    let mut acknowledgements: Vec<oneshot::Sender<()>> = Vec::new();
+                    let OutboundFrame { bytes, sent } = frame;
+                    conn.counters.bytes_sent.fetch_add(bytes.len() as u64, Ordering::Relaxed);
                     conn.counters.operations.fetch_add(1, Ordering::Relaxed);
                     let wrote = matches!(
                         write_progress::wait_for_write(
-                            writer.write_all(&frame.bytes),
+                            writer.write_all(&bytes),
                             &progress,
                             &conn.writer_shutdown,
+                            || conn.send_progress.advanced(),
                         ).await,
                         write_progress::WriteOutcome::Completed(Ok(())),
                     );
                     if !wrote {
                         break;
                     }
-                    acknowledgements.push(frame.sent);
+                    acknowledgements.push(sent);
                     let mut failed = false;
                     while let Ok(more) = rx.try_recv() {
-                        conn.counters.bytes_sent.fetch_add(more.bytes.len() as u64, Ordering::Relaxed);
+                        let OutboundFrame { bytes, sent } = more;
+                        conn.counters.bytes_sent.fetch_add(bytes.len() as u64, Ordering::Relaxed);
                         conn.counters.operations.fetch_add(1, Ordering::Relaxed);
                         let wrote = matches!(
                             write_progress::wait_for_write(
-                                writer.write_all(&more.bytes),
+                                writer.write_all(&bytes),
                                 &progress,
                                 &conn.writer_shutdown,
+                                || conn.send_progress.advanced(),
                             ).await,
                             write_progress::WriteOutcome::Completed(Ok(())),
                         );
@@ -3164,7 +3249,7 @@ fn spawn_writer(
                             failed = true;
                             break;
                         }
-                        acknowledgements.push(more.sent);
+                        acknowledgements.push(sent);
                     }
                     if failed {
                         break;
@@ -3174,6 +3259,7 @@ fn spawn_writer(
                             writer.flush(),
                             &progress,
                             &conn.writer_shutdown,
+                            || conn.send_progress.advanced(),
                         ).await,
                         write_progress::WriteOutcome::Completed(Ok(())),
                     );
@@ -3399,6 +3485,7 @@ fn test_conn_with_receiver_at(base: runtime::Clock) -> (Arc<Conn>, mpsc::Receive
         probe_lock: tokio::sync::Mutex::new(()),
         writer_shutdown: Notify::new(),
         reader_shutdown: Notify::new(),
+        send_progress: SendProgress::new(),
         counters: Arc::new(TrafficCounters::default()),
     });
     (conn, rx)
@@ -4587,6 +4674,26 @@ mod session_transition_tests {
     }
 
     #[test]
+    fn nonmutation_dispatch_starts_a_bounded_reconnect_horizon() {
+        let mut attempt = OpAttemptState::default();
+        let (flags, origin) = attempt
+            .dispatch_frame(false, 7, |_, origin| Ok(origin))
+            .unwrap();
+        assert_eq!(flags, 0);
+        assert_eq!(origin, 0);
+        assert!(
+            attempt.started.is_some(),
+            "a dispatched read must not wait forever when no successor can reconnect"
+        );
+
+        attempt.started = Some(runtime::Clock::ago(MUTATION_RETRY_HORIZON));
+        assert!(matches!(
+            attempt.retry_budget(),
+            Err(ClientError::Disconnected)
+        ));
+    }
+
+    #[test]
     fn clean_rejection_of_retry_does_not_erase_older_ambiguity() {
         let mut attempt = OpAttemptState::default();
         let (first_flags, first_origin) = attempt
@@ -4902,7 +5009,7 @@ mod session_transition_tests {
     async fn cancelling_stateful_create_before_enqueue_keeps_connection_live() {
         let (conn, _requests) = test_conn_with_receiver();
         conn.writer_tx
-            .send(OutboundFrame::new(vec![0]).0)
+            .send(OutboundFrame::new(vec![0], &conn.send_progress).0)
             .await
             .expect("test writer queue should accept its first frame");
         let client = test_client(Arc::clone(&conn));
@@ -4982,6 +5089,7 @@ mod session_transition_tests {
 
         for _ in 0..=7 {
             tokio::time::advance(REQUEST_TIMEOUT).await;
+            conn.send_progress.advanced();
             tokio::task::yield_now().await;
         }
         assert!(
@@ -5009,6 +5117,53 @@ mod session_transition_tests {
 
         request.abort();
         let _ = request.await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn send_ack_stall_replays_a_mutation_with_the_same_operation_identity() {
+        let (old_conn, mut old_requests) = test_conn_with_receiver();
+        old_conn.writer_epoch.store(7, Ordering::Relaxed);
+        let client = test_client(Arc::clone(&old_conn));
+        let request_client = Arc::clone(&client);
+        let request = tokio::spawn(async move { request_client.write(7, 0, b"payload").await });
+
+        // Keep the queued frame alive without acknowledging it. This models a
+        // transport task which remains alive but makes no forward progress.
+        let first_frame = old_requests.recv().await.expect("initial write request");
+        let first = P9Message::from_bytes_ctx(&first_frame.bytes, true).unwrap();
+        assert!(matches!(first.body, Message::Twrite(_)));
+        assert_ne!(first.op_id, [0u8; 16]);
+        assert_eq!(first.op_flags, 0);
+        assert_eq!(first.op_origin_epoch, 7);
+
+        tokio::time::advance(SEND_STALL_TIMEOUT + Duration::from_millis(1)).await;
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            old_conn.dead.load(Ordering::Acquire),
+            "an application request must retire a transport whose send acknowledgement stalls"
+        );
+
+        let (successor, mut successor_requests) = test_conn_with_receiver();
+        successor.writer_epoch.store(8, Ordering::Relaxed);
+        client.conn.store(Arc::clone(&successor));
+        client.live.store(true, Ordering::Release);
+        client.live_notify.notify_waiters();
+
+        let retry = recv_op_request(&mut successor_requests, "retried write request").await;
+        assert_eq!(retry.op_id, first.op_id);
+        assert_eq!(retry.op_flags, P9_OP_FLAG_RETRY);
+        assert_eq!(retry.op_origin_epoch, 7);
+        reply(
+            &successor,
+            retry.tag,
+            Message::Rwrite(Rwrite {
+                count: b"payload".len() as u32,
+            }),
+        );
+        assert_eq!(request.await.unwrap().unwrap(), b"payload".len() as u64);
+        drop(first_frame);
     }
 
     #[tokio::test(start_paused = true)]
@@ -5070,13 +5225,14 @@ mod session_transition_tests {
         let expected = Bytes::from_static(b"response");
 
         for _ in 0..128 {
-            let (sent_tx, mut sent) = oneshot::channel();
+            let progress = SendProgress::new();
+            let (frame, mut send) = OutboundFrame::new(Vec::new(), &progress);
             let (response_tx, mut response) = oneshot::channel();
-            drop(sent_tx);
+            drop(frame);
             response_tx.send(expected.clone()).unwrap();
 
             assert_eq!(
-                NinePClient::wait_for_send_or_response(&mut sent, &mut response)
+                NinePClient::wait_for_send_or_response(&mut send, &mut response)
                     .await
                     .unwrap(),
                 Some(expected.clone()),
@@ -5093,7 +5249,7 @@ mod session_transition_tests {
         let (writer, _peer_that_never_reads) = tokio::io::duplex(1);
         spawn_writer(Box::new(writer), requests, Arc::clone(&conn), reconnect);
 
-        let (frame, sent) = OutboundFrame::new(vec![0; 64 * 1024 + 1]);
+        let (frame, sent) = OutboundFrame::new(vec![0; 64 * 1024 + 1], &conn.send_progress);
         conn.writer_tx.send(frame).await.unwrap();
         tokio::task::yield_now().await;
         tokio::time::advance(MUTATION_RETRY_HORIZON).await;
@@ -5103,7 +5259,7 @@ mod session_transition_tests {
             conn.dead.load(Ordering::Acquire),
             "a transport with no write progress must not hang the session forever"
         );
-        assert!(sent.await.is_err());
+        assert!(sent.sent.await.is_err());
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -5113,6 +5269,8 @@ mod session_transition_tests {
 
         let (stream, mut peer) = tokio::io::duplex(1);
         let (mut stream, progress) = write_progress::TrackedIo::new(stream);
+        let application_progress = SendProgress::new();
+        let mut observed_progress = application_progress.subscribe();
         let shutdown = Arc::new(Notify::new());
         let writer_shutdown = Arc::clone(&shutdown);
         let send = tokio::spawn(async move {
@@ -5120,6 +5278,7 @@ mod session_transition_tests {
                 stream.write_all(b"abc"),
                 &progress,
                 writer_shutdown.as_ref(),
+                || application_progress.advanced(),
             )
             .await
         });
@@ -5130,6 +5289,11 @@ mod session_transition_tests {
         let mut byte = [0];
         peer.read_exact(&mut byte).await.unwrap();
         tokio::task::yield_now().await;
+        assert!(
+            observed_progress.has_changed().unwrap(),
+            "real transport byte progress must reach the application wait"
+        );
+        observed_progress.borrow_and_update();
         assert!(!send.is_finished());
 
         tokio::time::advance(almost_stalled).await;
@@ -5142,11 +5306,62 @@ mod session_transition_tests {
         ));
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test(start_paused = true)]
+    async fn queued_request_does_not_stall_while_the_fifo_writer_makes_progress() {
+        use tokio::io::AsyncReadExt;
+
+        let (conn, requests) = test_conn_with_receiver();
+        let reconnect = Arc::new(Notify::new());
+        let (writer, mut peer) = tokio::io::duplex(1);
+        spawn_writer(Box::new(writer), requests, Arc::clone(&conn), reconnect);
+        let client = test_client(Arc::clone(&conn));
+
+        let first_client = Arc::clone(&client);
+        let first = tokio::spawn(async move {
+            let payload = vec![b'a'; 1024];
+            first_client.write(7, 0, &payload).await
+        });
+        let second_client = Arc::clone(&client);
+        let second = tokio::spawn(async move { second_client.write(7, 1024, b"b").await });
+
+        for _ in 0..16 {
+            if conn.pending.len() == 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(conn.pending.len(), 2, "both requests must be dispatched");
+
+        let almost_stalled = SEND_STALL_TIMEOUT - Duration::from_secs(1);
+        tokio::time::advance(almost_stalled).await;
+        let mut byte = [0];
+        peer.read_exact(&mut byte).await.unwrap();
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
+
+        tokio::time::advance(almost_stalled).await;
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !conn.dead.load(Ordering::Acquire),
+            "a queued request must share real progress from the FIFO transport ahead of it"
+        );
+
+        first.abort();
+        second.abort();
+        conn.shutdown();
+        let _ = first.await;
+        let _ = second.await;
+    }
+
     #[tokio::test]
     async fn cancelling_before_writer_capacity_does_not_register_a_tag() {
         let (conn, _requests) = test_conn_with_receiver();
         conn.writer_tx
-            .send(OutboundFrame::new(vec![0]).0)
+            .send(OutboundFrame::new(vec![0], &conn.send_progress).0)
             .await
             .expect("test writer queue should accept its first frame");
 
