@@ -1,4 +1,4 @@
-use crate::cache_metrics::{CacheMetricsSnapshot, CacheTierSnapshot};
+use crate::cache_metrics::{CacheMetrics, CacheMetricsSnapshot, CacheTierSnapshot};
 use crate::config::PrometheusConfig;
 use crate::dedup::DedupCache;
 use crate::fs::metrics::{FileSystemStats, SegmentGcStats};
@@ -82,7 +82,7 @@ pub fn start(
                     collect_global_stats(&global_stats);
                     collect_segment_gc_stats(&segment_gc_stats);
                     collect_dedup_stats(&dedup);
-                    record_cache_metrics(&cache_metrics.snapshot());
+                    collect_cache_metrics(&cache_metrics);
                     if let Some(ref registry) = slatedb_registry {
                         collect_lsm_stats(registry);
                     }
@@ -287,6 +287,10 @@ fn record_cache_metrics(snapshot: &CacheMetricsSnapshot) {
     record_tier("decoded_blocks", &snapshot.decoded_blocks);
 }
 
+fn collect_cache_metrics(cache_metrics: &CacheMetrics) {
+    record_cache_metrics(&cache_metrics.snapshot());
+}
+
 fn collect_writeback_stats(writeback: Option<&WritebackObjectStore>) {
     gauge!("zerofs_writeback_enabled").set(f64::from(writeback.is_some()));
     let Some(writeback) = writeback else {
@@ -368,7 +372,10 @@ fn collect_lsm_stats(recorder: &DefaultMetricsRecorder) {
 #[cfg(test)]
 mod tests {
     use super::{WRITEBACK_COLLECT_INTERVAL, lsm_export_name, record_writeback_status};
-    use crate::cache_metrics::{CacheMetricsSnapshot, CacheTierSnapshot};
+    use crate::cache_metrics::{
+        CacheMetrics, CacheMetricsSnapshot, CacheTierSnapshot, FoyerMetricsRegistry,
+        build_test_cache,
+    };
     use crate::writeback::model::WritebackStatus;
 
     #[test]
@@ -451,7 +458,17 @@ mod tests {
                 queue_buffer_overflow_total: 8,
                 queue_channel_overflow_total: 9,
             },
-            decoded_blocks: CacheTierSnapshot::default(),
+            decoded_blocks: CacheTierSnapshot {
+                logical_usage_bytes: 111,
+                logical_capacity_bytes: 222,
+                entries: 33,
+                disk_read_bytes: 444,
+                disk_write_bytes: 555,
+                disk_read_ios: 66,
+                disk_write_ios: 77,
+                queue_buffer_overflow_total: 88,
+                queue_channel_overflow_total: 99,
+            },
         };
 
         metrics::with_local_recorder(&recorder, || super::record_cache_metrics(&snapshot));
@@ -466,11 +483,69 @@ mod tests {
             "zerofs_cache_disk_write_ios_total{cache=\"raw_parts\"} 7",
             "zerofs_cache_queue_buffer_overflow_total{cache=\"raw_parts\"} 8",
             "zerofs_cache_queue_channel_overflow_total{cache=\"raw_parts\"} 9",
+            "zerofs_cache_logical_usage_bytes{cache=\"decoded_blocks\"} 111",
+            "zerofs_cache_logical_capacity_bytes{cache=\"decoded_blocks\"} 222",
+            "zerofs_cache_entries{cache=\"decoded_blocks\"} 33",
+            "zerofs_cache_disk_read_bytes_total{cache=\"decoded_blocks\"} 444",
+            "zerofs_cache_disk_write_bytes_total{cache=\"decoded_blocks\"} 555",
+            "zerofs_cache_disk_read_ios_total{cache=\"decoded_blocks\"} 66",
+            "zerofs_cache_disk_write_ios_total{cache=\"decoded_blocks\"} 77",
+            "zerofs_cache_queue_buffer_overflow_total{cache=\"decoded_blocks\"} 88",
+            "zerofs_cache_queue_channel_overflow_total{cache=\"decoded_blocks\"} 99",
         ] {
             assert!(
                 rendered.contains(expected),
                 "missing metric: {expected}\n{rendered}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn collector_tick_snapshots_both_live_cache_tiers() {
+        const KIB: usize = 1024;
+
+        let dir = tempfile::tempdir().unwrap();
+        let registry = FoyerMetricsRegistry::default();
+        let raw_parts = build_test_cache(
+            &dir.path().join("raw-parts"),
+            "zerofs-object-prefetch-parts",
+            32 * KIB,
+            16 * KIB,
+            registry.clone(),
+        )
+        .await;
+        let decoded_blocks = build_test_cache(
+            &dir.path().join("decoded-blocks"),
+            "zerofs-slatedb-hybrid",
+            16 * KIB,
+            16 * KIB,
+            registry.clone(),
+        )
+        .await;
+        raw_parts.insert(1, vec![1; 4 * KIB]);
+        decoded_blocks.insert(1, vec![2; 2 * KIB]);
+        let cache_metrics = CacheMetrics::new(raw_parts.clone(), decoded_blocks.clone(), registry);
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+
+        metrics::with_local_recorder(&recorder, || super::collect_cache_metrics(&cache_metrics));
+
+        let rendered = handle.render();
+        for expected in [
+            "zerofs_cache_logical_usage_bytes{cache=\"raw_parts\"} 4096",
+            "zerofs_cache_logical_capacity_bytes{cache=\"raw_parts\"} 32768",
+            "zerofs_cache_entries{cache=\"raw_parts\"} 1",
+            "zerofs_cache_logical_usage_bytes{cache=\"decoded_blocks\"} 2048",
+            "zerofs_cache_logical_capacity_bytes{cache=\"decoded_blocks\"} 16384",
+            "zerofs_cache_entries{cache=\"decoded_blocks\"} 1",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "missing metric: {expected}\n{rendered}"
+            );
+        }
+
+        raw_parts.close().await.unwrap();
+        decoded_blocks.close().await.unwrap();
     }
 }

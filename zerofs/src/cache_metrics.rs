@@ -308,49 +308,52 @@ impl CacheMetrics {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{CacheMetrics, FoyerMetricsRegistry, snapshot_hybrid};
+pub(crate) async fn build_test_cache(
+    root: &std::path::Path,
+    name: &'static str,
+    capacity: usize,
+    submit_queue_size: usize,
+    registry: FoyerMetricsRegistry,
+) -> HybridCache<u64, Vec<u8>> {
     use foyer::{
-        BlockEngineConfig, DeviceBuilder, FsDeviceBuilder, HybridCache, HybridCacheBuilder,
-        PsyncIoEngineConfig,
+        BlockEngineConfig, DeviceBuilder, FsDeviceBuilder, HybridCacheBuilder, PsyncIoEngineConfig,
     };
-    use std::path::Path;
 
     const KIB: usize = 1024;
 
-    async fn test_cache(
-        root: &Path,
-        name: &'static str,
-        capacity: usize,
-        submit_queue_size: usize,
-        registry: FoyerMetricsRegistry,
-    ) -> HybridCache<u64, Vec<u8>> {
-        HybridCacheBuilder::new()
-            .with_name(name)
-            .with_metrics_registry(Box::new(registry))
-            .memory(capacity)
-            .with_weighter(|_: &u64, value: &Vec<u8>| value.len())
-            .storage()
-            .with_io_engine_config(PsyncIoEngineConfig::new())
-            .with_engine_config(
-                BlockEngineConfig::new(
-                    FsDeviceBuilder::new(root)
-                        .with_capacity(16 * 1024 * KIB)
-                        .build()
-                        .unwrap(),
-                )
-                .with_block_size(1024 * KIB)
-                .with_submit_queue_size_threshold(submit_queue_size),
+    HybridCacheBuilder::new()
+        .with_name(name)
+        .with_metrics_registry(Box::new(registry))
+        .memory(capacity)
+        .with_shards(1)
+        .with_weighter(|_: &u64, value: &Vec<u8>| value.len())
+        .storage()
+        .with_io_engine_config(PsyncIoEngineConfig::new())
+        .with_engine_config(
+            BlockEngineConfig::new(
+                FsDeviceBuilder::new(root)
+                    .with_capacity(16 * 1024 * KIB)
+                    .build()
+                    .unwrap(),
             )
-            .build()
-            .await
-            .unwrap()
-    }
+            .with_block_size(1024 * KIB)
+            .with_submit_queue_size_threshold(submit_queue_size),
+        )
+        .build()
+        .await
+        .unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CacheMetrics, FoyerMetricsRegistry, build_test_cache, snapshot_hybrid};
+
+    const KIB: usize = 1024;
 
     #[tokio::test]
     async fn logical_occupancy_stays_within_capacity_during_eviction_churn() {
         let dir = tempfile::tempdir().unwrap();
-        let cache = test_cache(
+        let cache = build_test_cache(
             dir.path(),
             "bounded-test",
             64 * KIB,
@@ -376,10 +379,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn foyer_registry_counts_disk_queue_overflow() {
+    async fn foyer_registry_counts_real_disk_channel_overflow() {
         let dir = tempfile::tempdir().unwrap();
         let registry = FoyerMetricsRegistry::default();
-        let cache = test_cache(dir.path(), "overflow-test", 4 * KIB, 0, registry.clone()).await;
+        let cache =
+            build_test_cache(dir.path(), "overflow-test", 4 * KIB, 0, registry.clone()).await;
 
         // This loop does not yield to the flusher. The first eviction fills the
         // zero-threshold queue; later evictions exercise Foyer's real overflow
@@ -398,10 +402,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn foyer_registry_counts_real_disk_buffer_overflow() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = FoyerMetricsRegistry::default();
+        let cache = build_test_cache(
+            dir.path(),
+            "buffer-overflow-test",
+            64 * KIB,
+            usize::MAX,
+            registry.clone(),
+        )
+        .await;
+
+        // Values larger than the block engine's 1 MiB block cannot fit its
+        // serialization buffer. The test cache has one shard, so replacing
+        // its over-capacity entry deterministically reaches the real flusher.
+        for key in 0..2 {
+            cache.insert(key, vec![key as u8; 2 * 1024 * KIB]);
+        }
+        cache.storage().wait().await;
+
+        assert!(
+            registry.counter_value(
+                "foyer_storage_inner_op_total",
+                &[("name", "buffer-overflow-test"), ("op", "buffer_overflow")],
+            ) > 0
+        );
+        cache.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn aggregate_snapshot_keeps_cache_tiers_distinct() {
         let dir = tempfile::tempdir().unwrap();
         let registry = FoyerMetricsRegistry::default();
-        let parts = test_cache(
+        let parts = build_test_cache(
             &dir.path().join("parts"),
             "zerofs-object-prefetch-parts",
             32 * KIB,
@@ -409,7 +443,7 @@ mod tests {
             registry.clone(),
         )
         .await;
-        let blocks = test_cache(
+        let blocks = build_test_cache(
             &dir.path().join("blocks"),
             "zerofs-slatedb-hybrid",
             16 * KIB,
