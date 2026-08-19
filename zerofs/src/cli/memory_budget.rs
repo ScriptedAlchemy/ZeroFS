@@ -317,10 +317,12 @@ fn select_cgroup2_mount(
 
     // A private cgroup namespace exposes its own root as `/`, while mountinfo
     // may retain the host-side subtree in the mount root field. In that case,
-    // the process cgroup path is already relative to the mounted subtree.
+    // the process cgroup path is already relative to the mounted subtree. A
+    // deeper root is a nested bind, not the namespace root; prefer the
+    // shallowest root and retain mountinfo order as the deterministic tie-break.
     mounts
         .iter()
-        .max_by_key(|(root, _)| root.components().count())
+        .min_by_key(|(root, _)| root.components().count())
         .map(|(_, mountpoint)| {
             let relative = current.strip_prefix(Path::new("/")).unwrap_or(current);
             (mountpoint.clone(), mountpoint.join(relative))
@@ -589,6 +591,26 @@ mod tests {
             selected.1,
             PathBuf::from("/run/zerofs-cgroup/zerofs.service")
         );
+    }
+
+    #[test]
+    fn private_namespace_uses_the_outer_cgroup_mount_not_a_nested_bind() {
+        let current = Path::new("/");
+        let mounts = vec![
+            (
+                PathBuf::from("/host.slice/zerofs.service/nested"),
+                PathBuf::from("/run/nested-cgroup-bind"),
+            ),
+            (
+                PathBuf::from("/host.slice/zerofs.service"),
+                PathBuf::from("/sys/fs/cgroup"),
+            ),
+        ];
+
+        let selected = select_cgroup2_mount(current, &mounts).unwrap();
+
+        assert_eq!(selected.0, PathBuf::from("/sys/fs/cgroup"));
+        assert_eq!(selected.1, PathBuf::from("/sys/fs/cgroup"));
     }
 
     #[test]
