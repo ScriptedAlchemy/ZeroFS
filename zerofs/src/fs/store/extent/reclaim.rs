@@ -65,6 +65,12 @@ const MAX_BATCHES_PER_PASS: usize = 32;
 /// (already-elapsed) deadline and are retried next pass.
 const MAX_SEGMENT_DELETES_PER_PASS: usize = 1024;
 
+/// One directory verify checks both the memory and durable views. Consecutive
+/// extents stay in one narrow range; highly sparse/interleaved directories
+/// coalesce their runs so a legal full segment cannot fan out into thousands
+/// of backend requests.
+const MAX_VERIFY_SCAN_RANGES: usize = 32;
+
 /// Orphan-sweep age floor: an uncounted segment object must have been PUT at
 /// least this long ago before it is deletable. Guards the window where an
 /// object exists but its crediting commit is still in flight (a compaction
@@ -970,18 +976,18 @@ impl ExtentStore {
         segid: Segid,
         want: &BTreeSet<(InodeId, u64)>,
     ) -> Result<bool, ()> {
-        for (inode, start, last) in inode_extent_runs(want) {
-            let Some((start_key, end_key)) = extent_scan_bounds(&self.key_codec, inode, start, last) else {
-                return Err(());
-            };
+        let Some(ranges) = extent_scan_ranges(&self.key_codec, want) else {
+            return Err(());
+        };
+        for range in ranges {
             if self
-                .scan_extent_run_points_here(segid, want, start_key.clone()..end_key.clone(), false)
+                .scan_extent_run_points_here(segid, want, range.clone(), false)
                 .await?
             {
                 return Ok(true);
             }
             if self
-                .scan_extent_run_points_here(segid, want, start_key..end_key, true)
+                .scan_extent_run_points_here(segid, want, range, true)
                 .await?
             {
                 return Ok(true);
@@ -1046,23 +1052,37 @@ fn inode_extent_runs(want: &BTreeSet<(InodeId, u64)>) -> Vec<(InodeId, u64, u64)
     runs
 }
 
-fn extent_scan_bounds(
+/// Coalesce consecutive extent runs into at most
+/// [`MAX_VERIFY_SCAN_RANGES`] ordered ranges. A coalesced range may include
+/// unrelated extent rows in a sparse gap; the scan filters every row against
+/// `want`, preserving the exact stale-reference check while bounding request
+/// fan-out. Returning `None` keeps the caller fail-closed when an exclusive end
+/// key cannot be represented.
+fn extent_scan_ranges(
     key_codec: &KeyCodec,
-    inode: InodeId,
-    start: u64,
-    last_inclusive: u64,
-) -> Option<(Bytes, Bytes)> {
-    let start_key = key_codec.extent_key(inode, start);
-    let end_key = if last_inclusive < u64::MAX {
-        key_codec.extent_key(inode, last_inclusive + 1)
-    } else if inode < u64::MAX {
-        key_codec.extent_key(inode + 1, 0)
-    } else {
-        return None;
-    };
-    Some((start_key, end_key))
+    want: &BTreeSet<(InodeId, u64)>,
+) -> Option<Vec<std::ops::Range<Bytes>>> {
+    let runs = inode_extent_runs(want);
+    if runs.is_empty() {
+        return Some(Vec::new());
+    }
+    let runs_per_range = runs.len().div_ceil(MAX_VERIFY_SCAN_RANGES);
+    runs.chunks(runs_per_range)
+        .map(|chunk| {
+            let &(start_inode, start_extent, _) = chunk.first()?;
+            let &(last_inode, _, last_extent) = chunk.last()?;
+            let start = key_codec.extent_key(start_inode, start_extent);
+            let end = if last_extent < u64::MAX {
+                key_codec.extent_key(last_inode, last_extent + 1)
+            } else if last_inode < u64::MAX {
+                key_codec.extent_key(last_inode + 1, 0)
+            } else {
+                return None;
+            };
+            Some(start..end)
+        })
+        .collect()
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1135,6 +1155,146 @@ mod tests {
         assert_eq!(
             scans, 1,
             "verify must issue a bounded grouped scan, not a point-read per frame"
+        );
+    }
+
+    fn sparse_interleaved_full_directory() -> BTreeSet<(InodeId, u64)> {
+        (0..1024u64)
+            .map(|slot| {
+                let inode = 1 + slot % 64;
+                let extent = (slot / 64) * 4096 + inode;
+                (inode, extent)
+            })
+            .collect()
+    }
+
+    fn test_frame_loc(segid: Segid, frame_index: u32) -> Bytes {
+        Bytes::copy_from_slice(
+            &FrameLoc {
+                segid,
+                frame_index,
+                byte_offset: u64::from(frame_index) * 4096,
+                byte_len: 4096,
+            }
+            .encode(),
+        )
+    }
+
+    #[tokio::test]
+    async fn sparse_interleaved_full_directory_uses_bounded_scans_and_zero_point_reads() {
+        let (store, db) = make().await;
+        let want = sparse_interleaved_full_directory();
+        assert_eq!(want.len(), 1024, "fixture must exercise a full directory");
+        let target = Segid::new(7, 777);
+        let other = Segid::new(7, 778);
+        let final_key = *want.last().unwrap();
+        let mut txn = db.new_transaction().unwrap();
+        for (frame_index, &(inode, extent)) in want.iter().enumerate() {
+            let segid = if (inode, extent) == final_key {
+                target
+            } else {
+                other
+            };
+            txn.put_bytes(
+                &store.key_codec.extent_key(inode, extent),
+                test_frame_loc(segid, frame_index as u32),
+            );
+        }
+        commit(&store, txn).await;
+
+        let memory_before = db.scan_call_count();
+        let durable_before = db.durable_scan_call_count();
+        let points_before = db.point_read_call_count();
+        assert_eq!(
+            store.directory_still_referenced(target, &want).await,
+            Ok(true),
+            "the final sparse memory reference must fail closed"
+        );
+        assert!(
+            db.scan_call_count() - memory_before <= MAX_VERIFY_SCAN_RANGES as u64,
+            "memory verification scans must stay bounded for 1,024 sparse/interleaved frames"
+        );
+        assert!(
+            db.durable_scan_call_count() - durable_before <= MAX_VERIFY_SCAN_RANGES as u64,
+            "durable verification scans must stay bounded for 1,024 sparse/interleaved frames"
+        );
+        assert_eq!(
+            db.point_read_call_count() - points_before,
+            0,
+            "directory verification must never regress to per-frame point reads"
+        );
+    }
+
+    #[tokio::test]
+    async fn sparse_interleaved_full_directory_keeps_final_durable_stale_reference() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let bt: Arc<dyn BlockTransformer> =
+            ZeroFsBlockTransformer::new_arc(&[0u8; 32], CompressionConfig::default());
+        let settings = slatedb::config::Settings {
+            wal_enabled: false,
+            l0_sst_size_bytes: usize::MAX - 1,
+            max_unflushed_bytes: usize::MAX,
+            ..Default::default()
+        };
+        let slatedb = Arc::new(
+            DbBuilder::new(Path::from("sparse-durable-verify"), object_store.clone())
+                .with_settings(settings)
+                .with_block_transformer(bt)
+                .with_segment_extractor(Arc::new(crate::segment_extractor::ZeroFsSegmentExtractor))
+                .build()
+                .await
+                .unwrap(),
+        );
+        let db = Arc::new(Db::new(slatedb, None));
+        let store = make_store(object_store, db.clone(), CompressionConfig::Lz4, 7);
+        let want = sparse_interleaved_full_directory();
+        assert_eq!(want.len(), 1024, "fixture must exercise a full directory");
+        let target = Segid::new(7, 779);
+        let other = Segid::new(7, 780);
+        let final_key = *want.last().unwrap();
+
+        let mut durable = db.new_transaction().unwrap();
+        for (frame_index, &(inode, extent)) in want.iter().enumerate() {
+            let segid = if (inode, extent) == final_key {
+                target
+            } else {
+                other
+            };
+            durable.put_bytes(
+                &store.key_codec.extent_key(inode, extent),
+                test_frame_loc(segid, frame_index as u32),
+            );
+        }
+        commit(&store, durable).await;
+        db.flush().await.unwrap();
+
+        let mut memory_only = db.new_transaction().unwrap();
+        memory_only.put_bytes(
+            &store.key_codec.extent_key(final_key.0, final_key.1),
+            test_frame_loc(other, 1023),
+        );
+        commit(&store, memory_only).await;
+
+        let memory_before = db.scan_call_count();
+        let durable_before = db.durable_scan_call_count();
+        let points_before = db.point_read_call_count();
+        assert_eq!(
+            store.directory_still_referenced(target, &want).await,
+            Ok(true),
+            "a reference masked only in memory must remain visible durably and fail closed"
+        );
+        assert!(
+            db.scan_call_count() - memory_before <= MAX_VERIFY_SCAN_RANGES as u64,
+            "memory verification scans must stay bounded before the durable fallback"
+        );
+        assert!(
+            db.durable_scan_call_count() - durable_before <= MAX_VERIFY_SCAN_RANGES as u64,
+            "durable verification scans must stay bounded for a final stale reference"
+        );
+        assert_eq!(
+            db.point_read_call_count() - points_before,
+            0,
+            "durable verification must never regress to per-frame point reads"
         );
     }
 

@@ -983,10 +983,15 @@ pub async fn build_slatedb(
     let compactor_object_store = object_store.clone();
     let wal_object_store = wal_object_store
         .map(|s| Arc::new(LengthCheckedObjectStore::new(s)) as Arc<dyn object_store::ObjectStore>);
-    crate::alloc_rss::set_rss_cap_bytes(total_memory_bytes as u64);
+    let rss_cap = crate::alloc_rss::configure_rss_cap_bytes(total_memory_bytes as u64);
+    info!(
+        "Resident-memory pressure cap: {} MB (configured clean cache: {} MB)",
+        rss_cap / 1_000_000,
+        total_memory_bytes / 1_000_000,
+    );
     let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(
         PrefetchingObjectStore::new(object_store, parts_cache.clone())
-            .with_admission_cap(total_memory_bytes as u64),
+            .with_admission_cap(rss_cap),
     );
 
     let db_path = Path::from(db_path);
