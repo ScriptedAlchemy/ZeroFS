@@ -196,6 +196,22 @@ def _run_protocol_matrix(
         receipt.record("requested_protocol", args.protocol)
         receipt.record("memory_envelope_requested", bool(args.memory_envelope))
         scenario = require_protocol_scenario(f"protocol-matrix-{args.protocol}")
+        receipt.record("scenario", scenario.to_dict())
+        receipt.path("cleanup-ledger.json").write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "resources": [],
+                    "cleanup_attempts": 0,
+                    "asserted_clean": True,
+                    "state": "preflight-no-resources",
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
         authority = ProtocolAuthority.from_mapping(args.protocol, os.environ)
         observer = WritebackObserver(
             MetricsClient(authority.metrics_url, authority.metrics_identity),
@@ -230,6 +246,9 @@ def dispatch(
         return
     if config is None or runner is None:
         raise RuntimeError(f"{args.command} requires a configured VM100 runner")
+    if args.command == "protocol-matrix":
+        _emit(_run_protocol_matrix(args, config, runner))
+        return
     runner.run(
         [
             "install",
@@ -310,8 +329,6 @@ def dispatch(
         _emit(matrix.run(total_mib=total_mib, quick=args.quick))
     elif args.command == "real-world-matrix":
         _emit(real_world.run(quick=args.quick))
-    elif args.command == "protocol-matrix":
-        _emit(_run_protocol_matrix(args, config, runner))
     elif args.command == "iterate":
         if args.skip_build:
             deployed = None
@@ -352,8 +369,20 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "list-scenarios":
         dispatch(args, None, None)
         return 0
-    config = PilotConfig.from_environment(ROOT)
     try:
+        if args.command == "protocol-matrix":
+            allowed = {
+                "ZEROFS_PILOT_RESULT_DIR",
+                "ZEROFS_PILOT_TMP_DIR",
+                "ZEROFS_PILOT_LOCK_FILE",
+                "ZEROFS_PILOT_DRAIN_TIMEOUT",
+            }
+            config = PilotConfig.from_mapping(
+                ROOT,
+                {key: value for key, value in os.environ.items() if key in allowed},
+            )
+        else:
+            config = PilotConfig.from_environment(ROOT)
         with operation_lock(config.lock_file):
             dispatch(args, config, Runner())
     except BaseException as error:

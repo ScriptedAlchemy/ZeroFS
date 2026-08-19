@@ -5,6 +5,8 @@ import importlib.util
 import json
 import tempfile
 import unittest
+import io
+from contextlib import redirect_stderr
 from dataclasses import replace
 from pathlib import Path
 from subprocess import CompletedProcess
@@ -347,7 +349,35 @@ class ProtocolMatrixTests(unittest.TestCase):
         self.assertEqual(len(manifests), 1)
         payload = json.loads(manifests[0].read_text(encoding="utf-8"))
         self.assertEqual(payload["status"], "failed")
+        self.assertEqual(payload["scenario"]["name"], "protocol-matrix-nfs")
+        ledger = json.loads(
+            (manifests[0].parent / "cleanup-ledger.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(ledger["resources"], [])
+        self.assertTrue(ledger["asserted_clean"])
         self.assertNotIn("METRICS_INSTANCE_ID=", payload.get("error", ""))
+
+    def test_shipping_protocol_entrypoint_ignores_invalid_legacy_config(self) -> None:
+        module = load_cli()
+        result_dir = Path(self.temp.name) / "entrypoint-results"
+        values = {
+            "ZEROFS_PILOT_NBD_SIZE_GIB": "not-an-integer",
+            "ZEROFS_PILOT_RESULT_DIR": str(result_dir),
+            "ZEROFS_PILOT_TMP_DIR": str(self.config.temp_dir),
+            "ZEROFS_PILOT_LOCK_FILE": str(Path(self.temp.name) / "protocol.lock"),
+        }
+        with mock.patch.dict("os.environ", values, clear=True), redirect_stderr(
+            io.StringIO()
+        ):
+            status = module.main(["protocol-matrix", "--protocol", "nfs"])
+
+        self.assertEqual(status, 1)
+        manifests = list(result_dir.glob("*/manifest.json"))
+        self.assertEqual(len(manifests), 1)
+        self.assertEqual(
+            json.loads(manifests[0].read_text(encoding="utf-8"))["status"],
+            "failed",
+        )
 
     def test_metrics_url_credentials_never_enter_failed_manifest(self) -> None:
         module = load_cli()
@@ -407,8 +437,19 @@ class ProtocolMatrixTests(unittest.TestCase):
         )
         before = WritebackSnapshot(10, 10, 10, 0, 0, 100, 100, False)
         accepted = replace(before, accepted=11, dirty_ram=4096)
-        local = replace(accepted, local=11, dirty_ram=0, dirty_ssd_reserved=4096)
-        remote = replace(local, remote=11, dirty_ssd_reserved=0)
+        local = replace(
+            accepted,
+            local=11,
+            dirty_ram=0,
+            dirty_ssd_reserved=4096,
+            local_bytes=4196,
+        )
+        remote = replace(
+            local,
+            remote=11,
+            dirty_ssd_reserved=0,
+            remote_bytes=4196,
+        )
         lifecycle = Lifecycle([before, accepted, accepted, accepted, accepted, local, remote])
         runner = ProtocolMatrixRunner(
             self.config,

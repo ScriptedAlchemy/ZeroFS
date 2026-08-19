@@ -13,6 +13,12 @@ class TerminalWritebackError(RuntimeError):
     pass
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request: object, *args: object) -> None:
+        del request, args
+        return None
+
+
 _AUTHORITY_METRIC = "zerofs_benchmark_authority_info"
 _AUTHORITY_LABEL = re.compile(r'([a-z_]+)="([A-Za-z0-9._:/-]+)"\Z')
 
@@ -26,7 +32,7 @@ class MetricsAuthorityIdentity:
     def __post_init__(self) -> None:
         for name, value in asdict(self).items():
             if not value or not re.fullmatch(r"[A-Za-z0-9._:/-]+", value):
-                raise ValueError(f"invalid metrics authority {name}: {value!r}")
+                raise ValueError(f"invalid metrics authority field: {name}")
 
     @classmethod
     def parse(cls, text: str) -> "MetricsAuthorityIdentity":
@@ -170,6 +176,7 @@ class MetricsClient:
             or parsed.password is not None
             or bool(parsed.query)
             or bool(parsed.fragment)
+            or parsed.path != "/metrics"
         ):
             raise ValueError(
                 "metrics URL must be credential-free HTTPS without query or fragment"
@@ -178,9 +185,12 @@ class MetricsClient:
         self.expected_identity = expected_identity
         self.timeout = timeout
         self._identity_lock = threading.Lock()
+        self._opener = urllib.request.build_opener(_NoRedirectHandler)
 
     def _fetch(self) -> str:
-        with urllib.request.urlopen(self.url, timeout=self.timeout) as response:
+        with self._opener.open(self.url, timeout=self.timeout) as response:
+            if response.geturl() != self.url:
+                raise ValueError("metrics response URL differs from pinned endpoint")
             return response.read().decode("utf-8")
 
     def _validate_identity(self, text: str) -> MetricsAuthorityIdentity:

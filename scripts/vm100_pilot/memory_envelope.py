@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import json
 import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Mapping, Protocol
 
-from .metrics import WritebackSnapshot
+from .metrics import MetricsAuthorityIdentity, WritebackSnapshot
+from .owned_resources import atomic_write_json
 from .runner import Runner
 from .scenarios import MemoryEnvelopeScenario, MemoryLimits
 
@@ -18,6 +18,8 @@ def _phase_kind(phase: str) -> str:
 
 class SnapshotSource(Protocol):
     def snapshot(self) -> WritebackSnapshot: ...
+
+    def identity(self) -> MetricsAuthorityIdentity: ...
 
 
 def _absolute(path: Path, role: str) -> Path:
@@ -168,6 +170,7 @@ class ServiceIdentity:
     pid: int
     restart_count: int
     control_group: str
+    invocation_id: str
 
 
 def _service_identity(runner: Runner, service: str) -> ServiceIdentity:
@@ -177,7 +180,9 @@ def _service_identity(runner: Runner, service: str) -> ServiceIdentity:
             "show",
             service,
             "--property=MainPID,NRestarts,ControlGroup",
-        ]
+            "--property=InvocationID",
+        ],
+        timeout=10,
     )
     try:
         values = dict(
@@ -188,15 +193,21 @@ def _service_identity(runner: Runner, service: str) -> ServiceIdentity:
         pid = int(values["MainPID"])
         restarts = int(values["NRestarts"])
         control_group = values["ControlGroup"]
+        invocation_id = values["InvocationID"]
     except (KeyError, ValueError) as error:
         raise RuntimeError(
             f"cannot establish service identity for {service}: {completed.stdout!r}"
         ) from error
-    if pid <= 0 or restarts < 0 or not control_group.startswith("/"):
+    if (
+        pid <= 0
+        or restarts < 0
+        or not control_group.startswith("/")
+        or not re.fullmatch(r"[A-Za-z0-9._:-]+", invocation_id)
+    ):
         raise RuntimeError(
             f"invalid service identity for {service}: pid={pid}, restarts={restarts}"
         )
-    return ServiceIdentity(pid, restarts, control_group)
+    return ServiceIdentity(pid, restarts, control_group, invocation_id)
 
 
 class MemoryEnvelopeSession:
@@ -219,6 +230,8 @@ class MemoryEnvelopeSession:
         self._oom_kill = 0
         self._artifact: Path | None = None
         self._validation_errors: list[str] = []
+        self._capture_errors: list[str] = []
+        self._expected_workloads: tuple[str, ...] = ()
 
     @classmethod
     def prepare(
@@ -245,7 +258,11 @@ class MemoryEnvelopeSession:
     def begin(self) -> MemorySample:
         if self._samples:
             raise RuntimeError("memory-envelope baseline was already captured")
-        baseline = self._capture("before")
+        try:
+            baseline = self._capture("before")
+        except BaseException as error:
+            self._latch_capture_failure("before", error)
+            raise
         self._pid = baseline.pid
         self._restart_count = baseline.restart_count
         self._oom = baseline.oom
@@ -263,6 +280,17 @@ class MemoryEnvelopeSession:
         self._artifact = path
         self._persist()
 
+    def expect_workloads(self, names: tuple[str, ...]) -> None:
+        if self._samples:
+            raise RuntimeError("memory workload expectations must precede sampling")
+        if not names or len(set(names)) != len(names):
+            raise ValueError("memory workload expectations must be unique and nonempty")
+        self._expected_workloads = names
+
+    def _latch_capture_failure(self, phase: str, error: BaseException) -> None:
+        self._capture_errors.append(f"capture failed at {phase}: {error}")
+        self._persist()
+
     def _persist(self, result: MemoryEnvelopeResult | None = None) -> None:
         if self._artifact is None:
             return
@@ -271,19 +299,21 @@ class MemoryEnvelopeSession:
             "scenario": self.scenario.to_dict(),
             "authority": self.authority.to_dict(),
             "samples": [asdict(sample) for sample in self._samples],
-            "status": "failed" if self._validation_errors else "running",
+            "status": (
+                "failed"
+                if self._validation_errors or self._capture_errors
+                else "running"
+            ),
             "validation_errors": self._validation_errors,
+            "capture_errors": self._capture_errors,
         }
         if result is not None:
-            if self._validation_errors:
+            if self._validation_errors or self._capture_errors:
                 payload["status"] = "failed"
             else:
                 payload["status"] = "complete" if result.complete else "incomplete"
             payload["result"] = result.to_dict()
-        self._artifact.write_text(
-            json.dumps(payload, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
+        atomic_write_json(self._artifact, payload)
 
     def _record(self, sample: MemorySample) -> None:
         self._samples.append(sample)
@@ -307,11 +337,34 @@ class MemoryEnvelopeSession:
                 "systemd ControlGroup and configured cgroup mismatch: "
                 f"service={service_cgroup}, configured={self.authority.cgroup_path}"
             )
+        try:
+            process_cgroups = (
+                self.authority.proc_root
+                / str(identity.pid)
+                / "cgroup"
+            ).read_text(encoding="utf-8").splitlines()
+        except (FileNotFoundError, PermissionError) as error:
+            raise RuntimeError("cannot read service process cgroup membership") from error
+        if not any(
+            line.rpartition(":")[2] == identity.control_group
+            for line in process_cgroups
+        ):
+            raise RuntimeError(
+                "service PID is not a member of systemd ControlGroup"
+            )
+        metrics_identity = self.metrics.identity()
+        if metrics_identity.server_instance_id != identity.invocation_id:
+            raise RuntimeError(
+                "service InvocationID and authenticated metrics instance mismatch"
+            )
         cgroup = self.authority.cgroup_path
         oom, oom_kill = _events(cgroup / "memory.events")
         rss, hwm, process_swap = _status(
             self.authority.proc_root / str(identity.pid) / "status"
         )
+        writeback = self.metrics.snapshot()
+        if self.metrics.identity() != metrics_identity:
+            raise RuntimeError("authenticated metrics identity changed during sample")
         return MemorySample(
             phase=phase,
             pid=identity.pid,
@@ -325,7 +378,7 @@ class MemoryEnvelopeSession:
             pid_rss_bytes=rss,
             pid_hwm_bytes=hwm,
             pid_swap_bytes=process_swap,
-            writeback=self.metrics.snapshot(),
+            writeback=writeback,
         )
 
     def _validate(self, sample: MemorySample) -> None:
@@ -391,15 +444,31 @@ class MemoryEnvelopeSession:
                 "memory-envelope phase order mismatch: "
                 f"after={previous}, allowed={sorted(allowed)}, got={phase}"
             )
-        sample = self._capture(phase)
+        try:
+            sample = self._capture(phase)
+        except BaseException as error:
+            self._latch_capture_failure(phase, error)
+            raise
         self._record(sample)
         return sample
 
     def _result(self) -> MemoryEnvelopeResult:
         phases = tuple(_phase_kind(sample.phase) for sample in self._samples)
-        missing = tuple(phase for phase in self.scenario.phases if phase not in phases)
+        if self._expected_workloads:
+            observed = {sample.phase for sample in self._samples}
+            expected = ("before",) + tuple(
+                f"{phase}:{workload}"
+                for workload in self._expected_workloads
+                for phase in self.scenario.phases[1:-1]
+            ) + ("after_cleanup",)
+            missing = tuple(phase for phase in expected if phase not in observed)
+        else:
+            missing = tuple(
+                phase for phase in self.scenario.phases if phase not in phases
+            )
         complete = (
             not self._validation_errors
+            and not self._capture_errors
             and not missing
             and bool(phases)
             and phases[-1] == self.scenario.phases[-1]
@@ -415,16 +484,18 @@ class MemoryEnvelopeSession:
             cleanup_semantics="observer-owned-no-resources",
             complete=complete,
             missing_phases=missing,
-            validation_errors=tuple(self._validation_errors),
+            validation_errors=tuple(
+                [*self._validation_errors, *self._capture_errors]
+            ),
         )
 
     def finish(self) -> MemoryEnvelopeResult:
         result = self._result()
         self._persist(result)
-        if self._validation_errors:
+        if self._validation_errors or self._capture_errors:
             raise RuntimeError(
                 "memory envelope validation failed: "
-                + "; ".join(self._validation_errors)
+                + "; ".join([*self._validation_errors, *self._capture_errors])
             )
         if not result.complete:
             raise RuntimeError(
@@ -436,14 +507,18 @@ class MemoryEnvelopeSession:
         if not self._samples or _phase_kind(
             self._samples[-1].phase
         ) != self.scenario.phases[-1]:
-            sample = self._capture(self.scenario.phases[-1])
+            try:
+                sample = self._capture(self.scenario.phases[-1])
+            except BaseException as error:
+                self._latch_capture_failure(self.scenario.phases[-1], error)
+                raise
             self._record(sample)
         result = self._result()
         self._persist(result)
-        if require_complete and self._validation_errors:
+        if require_complete and (self._validation_errors or self._capture_errors):
             raise RuntimeError(
                 "memory envelope validation failed: "
-                + "; ".join(self._validation_errors)
+                + "; ".join([*self._validation_errors, *self._capture_errors])
             )
         if require_complete and not result.complete:
             raise RuntimeError(

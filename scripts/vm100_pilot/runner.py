@@ -26,6 +26,13 @@ class ManagedProcess:
     def signal_group(self, signal_number: int) -> None:
         os.killpg(self.process.pid, signal_number)
 
+    def group_exists(self) -> bool:
+        try:
+            os.killpg(self.process.pid, 0)
+        except ProcessLookupError:
+            return False
+        return True
+
     def terminate(self, timeout: float = 10.0) -> None:
         if self.process.poll() is not None:
             return

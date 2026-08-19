@@ -11,7 +11,7 @@ from scripts.vm100_pilot.memory_envelope import (
     MemoryEnvelopeAuthority,
     MemoryEnvelopeSession,
 )
-from scripts.vm100_pilot.metrics import WritebackSnapshot
+from scripts.vm100_pilot.metrics import MetricsAuthorityIdentity, WritebackSnapshot
 from scripts.vm100_pilot.runner import Runner
 from scripts.vm100_pilot.scenarios import require_memory_scenario
 
@@ -41,7 +41,8 @@ class SystemctlRunner(Runner):
                 0,
                 f"MainPID={self.pid}\n"
                 f"NRestarts={self.restarts}\n"
-                f"ControlGroup={self.control_group}\n",
+                f"ControlGroup={self.control_group}\n"
+                "InvocationID=instance-a\n",
                 "",
             )
         raise AssertionError(f"unexpected command: {args}")
@@ -50,9 +51,15 @@ class SystemctlRunner(Runner):
 class Metrics:
     def __init__(self, snapshot: WritebackSnapshot) -> None:
         self.value = snapshot
+        self.identity_error = False
 
     def snapshot(self) -> WritebackSnapshot:
         return self.value
+
+    def identity(self) -> MetricsAuthorityIdentity:
+        if self.identity_error:
+            raise RuntimeError("injected metrics identity failure")
+        return MetricsAuthorityIdentity("instance-a", "filesystem-a", "test-export")
 
 
 class MemoryEnvelopeTests(unittest.TestCase):
@@ -78,6 +85,7 @@ class MemoryEnvelopeTests(unittest.TestCase):
             "VmHWM:\t1572864 kB\n"
             "VmSwap:\t0 kB\n"
         )
+        (status.parent / "cgroup").write_text("0::/zerofs.service\n")
         self.authority = MemoryEnvelopeAuthority.from_mapping(
             {
                 "ZEROFS_BENCH_CGROUP_ROOT": str(self.cgroup_root),
@@ -145,6 +153,15 @@ class MemoryEnvelopeTests(unittest.TestCase):
             MemoryEnvelopeSession.start(
                 self.authority,
                 SystemctlRunner(control_group="/other.service"),
+                self.metrics,  # type: ignore[arg-type]
+                self.scenario,
+            )
+
+        (self.proc_root / "123" / "cgroup").write_text("0::/other.service\n")
+        with self.assertRaisesRegex(RuntimeError, "not a member"):
+            MemoryEnvelopeSession.start(
+                self.authority,
+                SystemctlRunner(),
                 self.metrics,  # type: ignore[arg-type]
                 self.scenario,
             )
@@ -264,6 +281,32 @@ class MemoryEnvelopeTests(unittest.TestCase):
         self.assertEqual(payload["status"], "failed")
         self.assertFalse(payload["result"]["complete"])
         self.assertIn("cgroup current ceiling", payload["validation_errors"][-1])
+
+    def test_second_workload_capture_failure_remains_failed_and_incomplete(self) -> None:
+        artifact = Path(self.temp.name) / "memory-envelope.json"
+        session = MemoryEnvelopeSession.prepare(
+            self.authority,
+            SystemctlRunner(),
+            self.metrics,  # type: ignore[arg-type]
+            self.scenario,
+        )
+        session.expect_workloads(("one", "two"))
+        session.attach_artifact(artifact)
+        session.begin()
+        for phase in ("foreground_close", "fsync_or_commit", "local", "remote"):
+            session.sample(f"{phase}:one")
+        self.metrics.identity_error = True
+        with self.assertRaisesRegex(RuntimeError, "identity failure"):
+            session.sample("foreground_close:two")
+        self.metrics.identity_error = False
+
+        result = session.finish_after_cleanup(require_complete=False)
+
+        self.assertFalse(result.complete)
+        self.assertIn("foreground_close:two", result.missing_phases)
+        payload = json.loads(artifact.read_text(encoding="utf-8"))
+        self.assertEqual(payload["status"], "failed")
+        self.assertIn("identity failure", payload["capture_errors"][-1])
 
 
 if __name__ == "__main__":

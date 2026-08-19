@@ -15,7 +15,7 @@ from urllib.parse import unquote, urlsplit
 
 from .config import PilotConfig
 from .lifecycle import PilotLifecycle
-from .owned_resources import present, remove_tree
+from .owned_resources import atomic_write_json, present, remove_tree
 from .receipts import RunReceipt
 from .runner import CommandError, ManagedProcess, Runner
 from .scenarios import RawSftpScenario
@@ -28,7 +28,11 @@ def _stop_process_groups(
     timeout: float,
     primary: BaseException | None,
 ) -> BaseException | None:
-    active = [process for process in processes if process.process.poll() is None]
+    def exists(process: ManagedProcess) -> bool:
+        checker = getattr(process, "group_exists", None)
+        return checker() if checker is not None else process.process.poll() is None
+
+    active = [process for process in processes if exists(process)]
     if not active:
         return primary
     errors: list[str] = []
@@ -44,7 +48,7 @@ def _stop_process_groups(
         except BaseException as error:
             errors.append(f"TERM {' '.join(process.argv)}: {error}")
     while time.monotonic() < term_deadline:
-        active = [process for process in active if process.process.poll() is None]
+        active = [process for process in active if exists(process)]
         if not active:
             break
         time.sleep(0.01)
@@ -57,7 +61,7 @@ def _stop_process_groups(
         except BaseException as error:
             errors.append(f"KILL {' '.join(process.argv)}: {error}")
     while time.monotonic() < final_deadline:
-        active = [process for process in active if process.process.poll() is None]
+        active = [process for process in active if exists(process)]
         if not active:
             break
         time.sleep(0.01)
@@ -282,9 +286,9 @@ class OwnedSftpResources:
         return cls(scratch, ledger, [], [])
 
     def write(self) -> None:
-        self.ledger.write_text(
-            json.dumps(
-                {
+        atomic_write_json(
+            self.ledger,
+            {
                     "schema": 1,
                     "scratch": str(self.scratch),
                     "remote_resources": self.remote_resources,
@@ -292,12 +296,13 @@ class OwnedSftpResources:
                     "cleanup_attempts": self.cleanup_attempts,
                     "asserted_clean": self.cleanup_asserted,
                 },
-                indent=2,
-                sort_keys=True,
-            )
-            + "\n",
-            encoding="utf-8",
         )
+
+    def persist(self, errors: list[str]) -> None:
+        try:
+            self.write()
+        except BaseException as error:
+            errors.append(f"cleanup ledger persistence: {error}")
 
     def register_remote(self, remote: str, ssh_binary: Path, label: str) -> None:
         self.active_remotes.append((remote, ssh_binary, label))
@@ -315,7 +320,7 @@ class OwnedSftpResources:
                 remove_tree(self.scratch)
             except BaseException as error:
                 errors.append(f"local cleanup: {error}")
-            self.write()
+            self.persist(errors)
 
     def assert_clean(self, errors: list[str]) -> None:
         self.cleanup_asserted = not present(self.scratch) and not self.active_remotes
@@ -324,7 +329,7 @@ class OwnedSftpResources:
                 "raw SFTP cleanup assertion failed: "
                 f"scratch={present(self.scratch)}, remotes={self.active_remotes}"
             )
-        self.write()
+        self.persist(errors)
 
 
 def _rate(total_bytes: int, elapsed_ms: int) -> float:
@@ -483,7 +488,12 @@ class RawSftpRunner:
             )
         identity = endpoint.identity_file.resolve(strict=True)
         known_hosts = endpoint.known_hosts.resolve(strict=True)
-        if not identity.is_file() or not known_hosts.is_file():
+        if (
+            not identity.is_file()
+            or not known_hosts.is_file()
+            or not os.access(identity, os.R_OK)
+            or not os.access(known_hosts, os.R_OK)
+        ):
             raise ValueError("SFTP identity and known-hosts authority must be files")
         return SftpEndpointAuthority(
             user=endpoint.user,
@@ -508,6 +518,8 @@ class RawSftpRunner:
         return [
             "sftp",
             "-q",
+            "-F",
+            "/dev/null",
             "-B",
             str(buffer_bytes),
             "-R",
@@ -524,6 +536,14 @@ class RawSftpRunner:
             "StrictHostKeyChecking=yes",
             "-o",
             "BatchMode=yes",
+            "-o",
+            "IdentitiesOnly=yes",
+            "-o",
+            "PasswordAuthentication=no",
+            "-o",
+            "KbdInteractiveAuthentication=no",
+            "-o",
+            "ControlMaster=no",
             "-o",
             "Compression=no",
             "-b",
@@ -573,7 +593,7 @@ class RawSftpRunner:
             )
         managed = self.runner.spawn(
             command,
-            sudo=True,
+            sudo=False,
             stdout=PIPE,
             stderr=PIPE,
         )
@@ -636,7 +656,7 @@ class RawSftpRunner:
                         buffer_bytes=buffer_bytes,
                         request_depth=request_depth,
                     ),
-                    sudo=True,
+                    sudo=False,
                     stdout=handle,
                     stderr=handle,
                 )
@@ -668,14 +688,26 @@ class RawSftpRunner:
                     break
                 if pending:
                     time.sleep(0.01)
+        except BaseException as error:
+            failure = error
         finally:
             failure = _stop_process_groups(
                 [process for _, process, _, _ in processes],
                 timeout=min(self.phase_timeout, 10.0),
                 primary=failure,
             )
+            close_errors: list[str] = []
             for _, _, handle, _ in processes:
-                handle.close()
+                try:
+                    handle.close()
+                except BaseException as error:
+                    close_errors.append(str(error))
+            if close_errors:
+                detail = "raw SFTP log close failed: " + "; ".join(close_errors)
+                if failure is None:
+                    failure = RuntimeError(detail)
+                else:
+                    failure.add_note(detail)
         if failure is not None:
             raise failure
         if len(finished) != len(batches):
@@ -721,15 +753,19 @@ class RawSftpRunner:
             for index in range(jobs)
         ]
         lines.append(f"-rmdir {shlex.quote(remote)}")
+        cleanup_errors: list[str] = []
         for attempt in range(2):
-            self._run_batch(
-                endpoint,
-                self._batch(scratch, f"cleanup-{label}-{attempt}.batch", lines),
-                ssh_binary,
-                buffer_bytes=buffer_bytes,
-                request_depth=request_depth,
-                check=False,
-            )
+            try:
+                self._run_batch(
+                    endpoint,
+                    self._batch(scratch, f"cleanup-{label}-{attempt}.batch", lines),
+                    ssh_binary,
+                    buffer_bytes=buffer_bytes,
+                    request_depth=request_depth,
+                    check=False,
+                )
+            except BaseException as error:
+                cleanup_errors.append(f"attempt {attempt + 1}: {error}")
         parent = str(PurePosixPath(remote).parent)
         parent_probe = self._run_batch(
             endpoint,
@@ -770,6 +806,11 @@ class RawSftpRunner:
         if not any(marker in detail.lower() for marker in missing_markers):
             raise RuntimeError(
                 f"cannot prove remote directory absent: {remote}: {detail}"
+            )
+        if cleanup_errors:
+            raise RuntimeError(
+                "remote cleanup attempts failed despite final absence proof: "
+                + "; ".join(cleanup_errors)
             )
 
     def run(

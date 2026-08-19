@@ -20,7 +20,12 @@ from .metrics import (
     wait_for_local,
     wait_for_remote,
 )
-from .owned_resources import assert_absent, remove_empty_directory, unlink_file
+from .owned_resources import (
+    assert_absent,
+    atomic_write_json,
+    remove_empty_directory,
+    unlink_file,
+)
 from .receipts import RunReceipt
 from .runner import Runner
 from .scenarios import ProtocolScenario, WorkloadDefinition
@@ -111,6 +116,7 @@ class ProtocolAuthority:
             or metrics.password is not None
             or bool(metrics.query)
             or bool(metrics.fragment)
+            or metrics.path != "/metrics"
         ):
             raise ValueError(
                 "ZeroFS metrics endpoint must be credential-free HTTPS without "
@@ -319,6 +325,13 @@ class ProtocolWorkloadExecutor:
             target_sequence=accepted.accepted,
             timeout=self.owner.config.drain_timeout,
         )
+        local_bytes = local.local_bytes - before.local_bytes
+        remote_bytes = remote.remote_bytes - before.remote_bytes
+        if local_bytes != workload.bytes or remote_bytes != workload.bytes:
+            raise RuntimeError(
+                f"protocol durability byte attribution mismatch for {workload.name}: "
+                f"expected={workload.bytes}, local={local_bytes}, remote={remote_bytes}"
+            )
         remote_cutoff_ns = max(1, time.monotonic_ns() - write_started)
         stable_remote_drain = observer.drain()
         stable_remote_drain_ns = max(
@@ -427,19 +440,14 @@ class ProtocolMatrixRunner:
         attempts: int,
         asserted_clean: bool,
     ) -> None:
-        path.write_text(
-            json.dumps(
-                {
+        atomic_write_json(
+            path,
+            {
                     "schema": 1,
                     "resources": [str(resource) for resource in resources],
                     "cleanup_attempts": attempts,
                     "asserted_clean": asserted_clean,
                 },
-                indent=2,
-                sort_keys=True,
-            )
-            + "\n",
-            encoding="utf-8",
         )
 
     @staticmethod
@@ -513,6 +521,9 @@ class ProtocolMatrixRunner:
                 authority.require_run_root(run_root)
                 self.config.require_temp_child(scratch, "zerofs-protocol-bench-")
                 if self.memory_session is not None:
+                    self.memory_session.expect_workloads(
+                        tuple(workload.name for workload in scenario.workloads)
+                    )
                     self.memory_session.attach_artifact(
                         receipt.path("memory-envelope.json")
                     )
@@ -562,13 +573,23 @@ class ProtocolMatrixRunner:
                         self._cleanup_once(files, directories)
                     except BaseException as error:
                         cleanup_errors.append(error)
-                    self._write_ledger(ledger, resources, attempts, asserted_clean)
+                    try:
+                        self._write_ledger(
+                            ledger, resources, attempts, asserted_clean
+                        )
+                    except BaseException as error:
+                        cleanup_errors.append(error)
                 try:
                     self._assert_clean(resources)
                     asserted_clean = True
                 except BaseException as error:
                     cleanup_errors.append(error)
-                self._write_ledger(ledger, resources, attempts, asserted_clean)
+                try:
+                    self._write_ledger(
+                        ledger, resources, attempts, asserted_clean
+                    )
+                except BaseException as error:
+                    cleanup_errors.append(error)
                 if self.memory_session is not None:
                     try:
                         memory_envelope = self.memory_session.finish_after_cleanup(

@@ -9,6 +9,7 @@ import shlex
 import tempfile
 import time
 import unittest
+from unittest import mock
 from contextlib import redirect_stderr
 from dataclasses import replace
 from pathlib import Path
@@ -72,7 +73,7 @@ class RawSftpAbTests(unittest.TestCase):
 
     def test_stock_and_hpn_controls_must_report_distinct_provenance(self) -> None:
         raw = object.__new__(RawSftpRunner)
-        raw.runner = mock_runner = unittest.mock.Mock()
+        raw.runner = mock_runner = mock.Mock()
         mock_runner.run.side_effect = [
             CompletedProcess(("ssh-a", "-V"), 0, "", "OpenSSH_9.9 HPN-SSH\n"),
             CompletedProcess(("ssh-b", "-V"), 0, "", "OpenSSH_9.9 HPN-SSH\n"),
@@ -218,7 +219,7 @@ class RawSftpAbTests(unittest.TestCase):
                 self.returncode = -signal_number
 
         process = NeverCommand()
-        runner = unittest.mock.Mock()
+        runner = mock.Mock()
         runner.spawn.return_value = process
         raw = object.__new__(RawSftpRunner)
         raw.runner = runner
@@ -277,6 +278,11 @@ class RawSftpAbTests(unittest.TestCase):
         self.assertEqual(command[command.index("-S") + 1], Path("/opt/hpn/bin/hpnssh"))
         self.assertEqual(command[command.index("-B") + 1], "1048576")
         self.assertEqual(command[command.index("-R") + 1], "128")
+        self.assertIn("IdentitiesOnly=yes", command)
+        self.assertIn("PasswordAuthentication=no", command)
+        self.assertIn("KbdInteractiveAuthentication=no", command)
+        self.assertIn("ControlMaster=no", command)
+        self.assertEqual(command[command.index("-F") + 1], "/dev/null")
 
     def test_endpoint_authority_records_prefix_and_pinned_known_hosts_sha(self) -> None:
         key = Path(self.temp.name) / "identity"
