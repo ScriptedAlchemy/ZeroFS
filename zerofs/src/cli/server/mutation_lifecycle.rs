@@ -444,7 +444,7 @@ impl LifecycleOwners {
 }
 
 async fn acquire_flush_barrier(fs: &crate::fs::ZeroFS) -> Result<BarrierGuard, ShutdownError> {
-    let _ = fs.flush_coordinator.abort_close_worker().await;
+    let _ = fs.flush_coordinator.stop_worker().await;
     let guard = fs.db.flush_barrier().write_owned().await;
     Ok(BarrierGuard::new(move || drop(guard)))
 }
@@ -682,7 +682,7 @@ mod tests {
     async fn close_drains_dispatched_calls_before_cutoff() {
         let calls = DispatchedCalls::new();
         let entered = Arc::new(Notify::new());
-        let release = Arc::new(Notify::new());
+        let _release = Arc::new(Notify::new());
         let order = Arc::new(Mutex::new(Vec::new()));
         let guard = calls.begin().expect("begin dispatched");
         let mut owners = owners_with(&order);

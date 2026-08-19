@@ -692,6 +692,8 @@ mod tests {
     #[tokio::test]
     async fn close_canonical_database_seals_and_closes() {
         let fs = super::ZeroFS::new_in_memory().await.unwrap();
+        let _ = fs.flush_coordinator.stop_worker().await;
+        let _barrier = fs.db.flush_barrier().write_owned().await;
         fs.close_canonical_database()
             .await
             .expect("canonical seal+flush+close should succeed once");

@@ -257,10 +257,18 @@ impl FlushCoordinator {
     ) -> Result<(), DurabilityError> {
         match self.object_wait.get() {
             Some(wait) => wait(coverage, target).await,
-            None => match coverage {
-                ObjectCoverage::DirectRemote => Ok(()),
-                ObjectCoverage::Writeback { .. } => Err(DurabilityError::Closed),
-            },
+            None => {
+                // Production writeback installs object_wait. Tests and
+                // direct backends share the same local hook the flush
+                // worker uses after metadata is durable.
+                if let Some(wait_local) = self.local_durability_hook.get() {
+                    wait_local().await.map_err(DurabilityError::from_flush)?;
+                }
+                match coverage {
+                    ObjectCoverage::DirectRemote => Ok(()),
+                    ObjectCoverage::Writeback { .. } => Err(DurabilityError::Closed),
+                }
+            }
         }
     }
 
@@ -319,12 +327,12 @@ impl FlushCoordinator {
         result.map_err(|_| FsError::IoError)
     }
 
-    /// Stop and join the actual coordinator worker after its final close
-    /// deadline expires. This is stronger than dropping the `close()` future,
-    /// which only abandons its reply receiver while the worker keeps using the
-    /// database and object store.
-    pub async fn abort_close_worker(&self) -> Result<(), FsError> {
-        self.db.mark_closing();
+    /// Abort and join the flush worker without fencing the database.
+    ///
+    /// Lifecycle close must stop the worker before taking the flush barrier so
+    /// seal/flush/close can still run. `abort_close_worker` marks the database
+    /// closing first, which makes a later `Db::flush` fail closed.
+    pub(crate) async fn stop_worker(&self) -> Result<(), FsError> {
         // Abort before taking the mutex: a canceled close can leave its join
         // future holding that mutex while the worker itself is stuck.
         self.worker_abort.abort();
@@ -339,6 +347,15 @@ impl FlushCoordinator {
             Err(error) if error.is_cancelled() => Ok(()),
             Err(_) => Err(FsError::IoError),
         }
+    }
+
+    /// Stop and join the actual coordinator worker after its final close
+    /// deadline expires. This is stronger than dropping the `close()` future,
+    /// which only abandons its reply receiver while the worker keeps using the
+    /// database and object store.
+    pub async fn abort_close_worker(&self) -> Result<(), FsError> {
+        self.db.mark_closing();
+        self.stop_worker().await
     }
 }
 
