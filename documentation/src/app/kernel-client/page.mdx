@@ -87,8 +87,6 @@ module_path=$(make -s \
 sudo install -D -m 0644 "$module_path" \
   "/lib/modules/$(uname -r)/updates/zerofs/zerofs.ko"
 sudo depmod -a "$(uname -r)"
-printf '%s\n' zerofs | \
-  sudo tee /etc/modules-load.d/zerofs.conf >/dev/null
 sudo modprobe zerofs
 ```
 
@@ -101,49 +99,26 @@ grep zerofs /proc/filesystems
 
 ## Secure Boot {{ id: 'secure-boot' }}
 
-Release modules are signed with the ZeroFS module key. The selector installs
-its public certificate at:
+Source-built modules must be signed by a key trusted by the running kernel when
+Secure Boot validation is enabled. The ZeroFS source tree does not provide,
+enroll, or manage that signing key. Follow the distribution's external-module
+signing and MOK enrollment procedure, using a machine-local key under your
+control, before loading `zerofs.ko`. Key locations, signing tools, and enrollment
+commands are distribution-specific.
 
-```text
-/usr/share/zerofs/zerofs-module-signing-cert.der
-```
-
-If Secure Boot rejects the module, install the distribution's `mokutil`
-package and check whether the certificate is already enrolled:
-
-```bash
-certificate=/usr/share/zerofs/zerofs-module-signing-cert.der
-
-mokutil --sb-state
-sudo mokutil --test-key "$certificate"
-```
-
-If `--test-key` reports that it is not enrolled, request enrollment:
+Check the boot state, installed signature, and final load:
 
 ```bash
-certificate=/usr/share/zerofs/zerofs-module-signing-cert.der
-sudo mokutil --import "$certificate"
-```
-
-Set the one-time password requested by `mokutil`, then reboot. In the MOK
-manager, select **Enroll MOK** → **Continue** → **Yes**, then enter that
-password. Menu wording varies by distribution. Reboot again if prompted.
-
-Verify the enrollment and load the module:
-
-```bash
-sudo mokutil --test-key \
-  /usr/share/zerofs/zerofs-module-signing-cert.der
-sudo modprobe zerofs
+command -v mokutil >/dev/null && mokutil --sb-state
 modinfo -F signer zerofs
+sudo modprobe zerofs
+grep zerofs /proc/filesystems
 ```
 
-Enrollment is not required when Secure Boot is disabled or the certificate is
-already trusted. If package installation ran before enrollment,
-`modules-load.d` retries the module on the next boot. A module built from
-source must be signed with a key trusted by that machine. MOK enrollment
+An empty signer is acceptable only when the active boot policy permits unsigned
+modules. Do not disable validation merely to load the module. MOK enrollment
 requires UEFI boot through the distribution's shim and console access; other
-boot chains need their own key-enrollment procedure.
+boot chains use their own trust and enrollment procedure.
 
 ## Mounting {{ id: 'mounting' }}
 
@@ -185,6 +160,10 @@ Unmount with `sudo umount /mnt/zerofs`.
 
 ZeroFS can build an x86-64 module for a compatible kernel with `CONFIG_RUST=n`. The release build compiles the exact kernel's Rust support and ZeroFS together, internalizes the Rust code, and runs the result through the target kernel's normal module build. The resulting module imports C kernel symbols and does not require Rust support from the running kernel.
 
-This requires the complete configured kernel source, `Module.symvers`, and matching Rust and LLVM tools. Distribution headers are not enough, so this path is limited to controlled prebuilt packages. It does not support kernels older than Linux 6.18.
+This requires the complete configured kernel source, `Module.symvers`, and
+matching Rust and LLVM tools. Distribution headers are not enough. The ordinary
+external-module source-build steps above do not support `CONFIG_RUST=n`; use the
+controlled kernel build workflow under `kernel/ci` instead. It does not support
+kernels older than Linux 6.18.
 
 CI tests this path by booting an upstream Linux 6.18 kernel built with `CONFIG_RUST=n`.
