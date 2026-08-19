@@ -35,6 +35,9 @@ class Step:
     cwd: str | None = None
     acquires: tuple[ResourceOwnership, ...] = ()
     releases: tuple[ResourceOwnership, ...] = ()
+    requires: tuple[ResourceOwnership, ...] = ()
+    capture_main_pid_unit: str | None = None
+    release_main_pid_unit: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -44,6 +47,9 @@ class Step:
             "cwd": self.cwd,
             "acquires": [resource.to_dict() for resource in self.acquires],
             "releases": [resource.to_dict() for resource in self.releases],
+            "requires": [resource.to_dict() for resource in self.requires],
+            "capture_main_pid_unit": self.capture_main_pid_unit,
+            "release_main_pid_unit": self.release_main_pid_unit,
         }
 
 
@@ -54,7 +60,8 @@ class ScenarioPlan:
     steps: tuple[Step, ...]
     durability_floors: tuple[DurabilityFloor, ...]
     tools: tuple[str, ...] = ()
-    requires_observed_durability: bool = False
+    requires_observed_durability: bool = True
+    acceptance_gaps: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -66,6 +73,7 @@ class ScenarioPlan:
             ],
             "tools": list(self.tools),
             "requires_observed_durability": self.requires_observed_durability,
+            "acceptance_gaps": list(self.acceptance_gaps),
         }
 
 
@@ -101,7 +109,8 @@ def server_steps(
                 str(context.zerofs_config),
             ),
             sudo=True,
-            acquires=(ResourceOwnership("process", unit),) + listeners,
+            acquires=(ResourceOwnership("unit", unit),) + listeners,
+            capture_main_pid_unit=unit,
         ),
         Step("wait for protocol listeners", ("sleep", "3")),
     )
@@ -116,19 +125,23 @@ def server_stop_steps(
             "stop the run-scoped ZeroFS instance",
             ("systemctl", "stop", context.config.unit_name),
             sudo=True,
-            releases=listeners
-            + (ResourceOwnership("process", context.config.unit_name),),
+            releases=listeners + (ResourceOwnership("unit", context.config.unit_name),),
+            release_main_pid_unit=context.config.unit_name,
         ),
     )
 
 
-def server_crash_steps(context: ScenarioContext) -> tuple[Step, ...]:
+def server_crash_steps(
+    context: ScenarioContext,
+    listeners: tuple[ResourceOwnership, ...] = (),
+) -> tuple[Step, ...]:
     return (
         Step(
             "SIGKILL the run-scoped ZeroFS instance at the crash boundary",
             ("systemctl", "kill", "-s", "KILL", context.config.unit_name),
             sudo=True,
-            releases=(ResourceOwnership("process", context.config.unit_name),),
+            releases=listeners + (ResourceOwnership("unit", context.config.unit_name),),
+            release_main_pid_unit=context.config.unit_name,
         ),
     )
 
@@ -174,18 +187,14 @@ def nfs_unmount_steps(config: HarnessConfig) -> tuple[Step, ...]:
             "unmount the NFS leg",
             ("umount", str(_mountpoint(config, "nfs"))),
             sudo=True,
-            releases=(
-                ResourceOwnership("mount", str(_mountpoint(config, "nfs"))),
-            ),
+            releases=(ResourceOwnership("mount", str(_mountpoint(config, "nfs"))),),
         ),
     )
 
 
 def ninep_mount_steps(config: HarnessConfig) -> tuple[Step, ...]:
     mountpoint = _mountpoint(config, "ninep")
-    options = (
-        f"trans=tcp,port={NINEP_PORT},version=9p2000.L,msize=1048576,access=user"
-    )
+    options = f"trans=tcp,port={NINEP_PORT},version=9p2000.L,msize=1048576,access=user"
     return (
         Step("create the 9P mountpoint", ("mkdir", "-p", str(mountpoint))),
         Step(
@@ -238,9 +247,7 @@ def ninep_unmount_steps(config: HarnessConfig) -> tuple[Step, ...]:
             "unmount the 9P leg",
             ("umount", str(_mountpoint(config, "ninep"))),
             sudo=True,
-            releases=(
-                ResourceOwnership("mount", str(_mountpoint(config, "ninep"))),
-            ),
+            releases=(ResourceOwnership("mount", str(_mountpoint(config, "ninep"))),),
         ),
     )
 
@@ -370,7 +377,7 @@ def webui_steps(context: ScenarioContext) -> tuple[Step, ...]:
             acquires=(ResourceOwnership("path", str(source)),),
         ),
         Step(
-            "upload bytes through the shipping WebSocket 9P client",
+            "upload bytes through the native WebSocket 9P transport control",
             (
                 str(context.zerofs_binary),
                 "upload",
@@ -382,7 +389,7 @@ def webui_steps(context: ScenarioContext) -> tuple[Step, ...]:
             ),
         ),
         Step(
-            "download bytes through the shipping WebSocket 9P client",
+            "download bytes through the native WebSocket 9P transport control",
             (
                 str(context.zerofs_binary),
                 "download",
@@ -418,7 +425,8 @@ def _plan(
     operations: tuple[str, ...],
     tools: tuple[str, ...] = (),
     *,
-    requires_observed_durability: bool = False,
+    requires_observed_durability: bool = True,
+    acceptance_gaps: tuple[str, ...] = (),
 ) -> ScenarioPlan:
     listener_by_leg = {
         "nfs": NFS_PORT,
@@ -441,6 +449,7 @@ def _plan(
         durability_floors=floors_for(context.config.ack, operations),
         tools=tools,
         requires_observed_durability=requires_observed_durability,
+        acceptance_gaps=acceptance_gaps,
     )
 
 
@@ -599,14 +608,16 @@ def _webui_rpc_production_path(context: ScenarioContext) -> ScenarioPlan:
         steps,
         ("rpc-ack", "webui-ack"),
         requires_observed_durability=True,
+        acceptance_gaps=(
+            "the shipping browser WASM client and gRPC-Web route are not wired into this harness",
+        ),
     )
 
 
 def _protocol_materialized_control(context: ScenarioContext) -> ScenarioPlan:
     if context.config.ack.filesystem != "materialized":
         raise ConfigError(
-            "protocol-materialized-control requires "
-            "--filesystem-ack-mode materialized"
+            "protocol-materialized-control requires --filesystem-ack-mode materialized"
         )
     config = context.config
     steps = (
@@ -656,24 +667,28 @@ def _benchmark(name: str, required_object_ack: str) -> ScenarioBuilder:
                 f"got {config.ack.object}"
             )
         mountpoint = _mountpoint(config, "nfs")
-        steps = nfs_mount_steps(config) + (
-            Step(
-                "run the fio tier benchmark on the mounted filesystem",
-                (
-                    "fio",
-                    "--name",
-                    name,
-                    f"--directory={mountpoint}",
-                    "--rw=write",
-                    "--bs=1M",
-                    "--size=256M",
-                    "--numjobs=4",
-                    "--fsync_on_close=1",
-                    "--group_reporting",
+        steps = (
+            nfs_mount_steps(config)
+            + (
+                Step(
+                    "run the fio tier benchmark on the mounted filesystem",
+                    (
+                        "fio",
+                        "--name",
+                        name,
+                        f"--directory={mountpoint}",
+                        "--rw=write",
+                        "--bs=1M",
+                        "--size=256M",
+                        "--numjobs=4",
+                        "--fsync_on_close=1",
+                        "--group_reporting",
+                    ),
+                    sudo=True,
                 ),
-                sudo=True,
-            ),
-        ) + nfs_unmount_steps(config)
+            )
+            + nfs_unmount_steps(config)
+        )
         return _plan(context, name, ("nfs",), steps, ("benchmark-write",))
 
     return build

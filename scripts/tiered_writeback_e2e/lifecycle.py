@@ -5,6 +5,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -83,6 +84,7 @@ REQUIRED_RECEIPT_FIELDS = (
     "control_root",
     "resource_root",
     "backend_prefix",
+    "units",
     "pids",
     "ports",
     "devices",
@@ -142,6 +144,7 @@ class HarnessReceipt:
             "control_root": str(config.control_root),
             "resource_root": str(config.resource_root),
             "backend_prefix": config.backend_prefix,
+            "units": [],
             "pids": [],
             "ports": [],
             "devices": [],
@@ -165,6 +168,7 @@ class HarnessReceipt:
 
     def sync_resources(self, ledger: ResourceLedger) -> None:
         buckets: dict[str, str] = {
+            "unit": "units",
             "process": "pids",
             "listener": "ports",
             "device": "devices",
@@ -209,6 +213,9 @@ class Probes:
 
     def process_alive(self, pid: int) -> bool:
         return self._succeeds(["kill", "-0", str(pid)])
+
+    def unit_active(self, unit: str) -> bool:
+        return self._succeeds(["systemctl", "is-active", "--quiet", unit])
 
     def port_listening(self, port: int) -> bool:
         return self._succeeds(["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN"])
@@ -256,9 +263,7 @@ def assert_source_idle(
                 cmdline = ""
             haystack = f"{comm} {cmdline}".lower()
             if any(token in haystack for token in BUSY_PROCESS_TOKENS):
-                busy.append(
-                    {"pid": int(entry.name), "comm": comm, "cwd": str(cwd)}
-                )
+                busy.append({"pid": int(entry.name), "comm": comm, "cwd": str(cwd)})
     if busy:
         rendered = ", ".join(f"pid {job['pid']} ({job['comm']})" for job in busy)
         raise SourceBusyError(f"active jobs rooted at {source}: {rendered}")
@@ -328,10 +333,10 @@ class HarnessLifecycle:
         self, kind: str, value: Any, details: dict[str, Any], scope: Path
     ) -> None:
         if kind == "process":
-            if isinstance(value, str):
-                self.runner.run(["systemctl", "stop", value], sudo=True)
-            elif self.probes.process_alive(value):
+            if self.probes.process_alive(value):
                 self.runner.run(["kill", "-9", str(value)], sudo=True)
+        elif kind == "unit":
+            self.runner.run(["systemctl", "stop", str(value)], sudo=True)
         elif kind == "mount":
             mountpoint = str(validate_owned_path(Path(str(value)), scope))
             if self.probes.mount_active(mountpoint):
@@ -385,11 +390,9 @@ class HarnessLifecycle:
 
     def _probe(self, kind: str, value: Any) -> bool:
         if kind == "process":
-            if isinstance(value, str):
-                # Transient units are stopped by name; their liveness shows up
-                # through the pid/listener resources they also recorded.
-                return False
             return self.probes.process_alive(value)
+        if kind == "unit":
+            return self.probes.unit_active(str(value))
         if kind == "listener":
             return self.probes.port_listening(value)
         if kind == "mount":
@@ -488,6 +491,11 @@ class HarnessLifecycle:
             )
         commands: list[list[str]] = []
         try:
+            if plan.acceptance_gaps:
+                raise LifecycleError(
+                    f"scenario {scenario!r} is unavailable: "
+                    + "; ".join(plan.acceptance_gaps)
+                )
             if plan.requires_observed_durability:
                 raise LifecycleError(
                     f"scenario {scenario!r} requires observed typed durability "
@@ -495,6 +503,8 @@ class HarnessLifecycle:
                     "collector is not wired"
                 )
             for step in plan.steps:
+                for resource in step.requires:
+                    ledger.require_active(resource.kind, resource.value)
                 commands.append(list(step.argv))
                 receipt.record("commands", commands)
                 for resource in step.acquires:
@@ -510,6 +520,57 @@ class HarnessLifecycle:
                     sudo=step.sudo,
                     cwd=Path(step.cwd) if step.cwd else None,
                 )
+                if step.capture_main_pid_unit is not None:
+                    pid_command = [
+                        "systemctl",
+                        "show",
+                        "--property=MainPID",
+                        "--value",
+                        step.capture_main_pid_unit,
+                    ]
+                    raw_pid = ""
+                    for attempt in range(20):
+                        commands.append(pid_command)
+                        receipt.record("commands", commands)
+                        result = self.runner.run(pid_command, sudo=True, check=False)
+                        raw_pid = result.stdout.strip()
+                        if (
+                            result.returncode == 0
+                            and raw_pid.isdecimal()
+                            and int(raw_pid) > 0
+                        ):
+                            break
+                        if attempt < 19:
+                            time.sleep(0.1)
+                    else:
+                        raise LifecycleError(
+                            f"unit {step.capture_main_pid_unit!r} has no positive MainPID"
+                        )
+                    ledger.record_resource(
+                        "process",
+                        int(raw_pid),
+                        unit=step.capture_main_pid_unit,
+                        scenario=scenario,
+                        step=step.description,
+                    )
+                if step.release_main_pid_unit is not None:
+                    owned_pids = [
+                        (kind, value)
+                        for kind, value, details in ledger.outstanding()
+                        if kind == "process"
+                        and details.get("unit") == step.release_main_pid_unit
+                    ]
+                    if not owned_pids:
+                        raise LifecycleError(
+                            f"unit {step.release_main_pid_unit!r} has no owned MainPID"
+                        )
+                    for kind, value in owned_pids:
+                        ledger.record_release(
+                            kind,
+                            value,
+                            scenario=scenario,
+                            step=step.description,
+                        )
                 for resource in step.releases:
                     ledger.record_release(
                         resource.kind,

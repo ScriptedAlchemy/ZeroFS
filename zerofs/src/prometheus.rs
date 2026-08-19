@@ -353,8 +353,9 @@ fn collect_lsm_stats(recorder: &DefaultMetricsRecorder) {
 mod tests {
     use super::{WRITEBACK_COLLECT_INTERVAL, lsm_export_name, record_writeback_status};
     use crate::writeback::model::WritebackStatus;
-    use crate::writeback::pacing::SsdAdmissionMode;
-    use crate::writeback::reservation::SsdAdmissionSnapshot;
+    use crate::writeback::pacing::SsdReleaseCredit;
+    use crate::writeback::reservation::{SsdAdmission, SsdReservationRequest};
+    use crate::writeback::space_sample::PhysicalSpaceSample;
 
     #[test]
     fn writeback_metrics_refresh_fast_enough_for_durability_tier_measurement() {
@@ -397,17 +398,30 @@ mod tests {
             retries: 2,
             terminal_error: Some("remote unavailable".to_owned()),
         };
-        let ssd = SsdAdmissionSnapshot {
-            used_ssd_bytes: 3,
-            used_operations: 2,
-            outstanding_physical_claims: 13,
-            available_bytes: 89,
-            sample_generation: 21,
-            paused: true,
-            mode: SsdAdmissionMode::Paced,
-            credit_bytes: 34,
-            credit_ops: 5,
-        };
+        let ssd_admission = SsdAdmission::recover(
+            3,
+            10,
+            66,
+            33,
+            0,
+            [SsdReservationRequest {
+                ssd_reservation_bytes: 3,
+                physical_reservation_bytes: 13,
+                operations: 2,
+            }],
+            Some(PhysicalSpaceSample {
+                generation: 21,
+                available_bytes: 89,
+            }),
+        )
+        .unwrap();
+        ssd_admission
+            .apply_release_credit(SsdReleaseCredit {
+                ssd_reservation_bytes: 34,
+                operations: 5,
+            })
+            .unwrap();
+        let ssd = ssd_admission.snapshot();
 
         record_writeback_status(&status, Some(&ssd));
         let rendered = handle.render();
@@ -424,6 +438,7 @@ mod tests {
             "zerofs_writeback_retries_total 2",
             "zerofs_writeback_terminal_error 1",
             "zerofs_writeback_ssd_admission_paced 1",
+            "zerofs_writeback_ssd_admitted_operations 2",
             "zerofs_writeback_ssd_outstanding_physical_claim_bytes 13",
             "zerofs_writeback_ssd_available_bytes 89",
             "zerofs_writeback_ssd_sampler_generation 21",

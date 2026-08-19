@@ -6,6 +6,9 @@ from pathlib import Path
 from .config import HarnessConfig, validate_owned_path
 from .integrity import IntegrityError, floors_for, sha256_file
 from .protocols import (
+    NFS_PORT,
+    NINEP_PORT,
+    ResourceOwnership,
     ScenarioBuilder,
     ScenarioContext,
     ScenarioPlan,
@@ -18,6 +21,14 @@ from .protocols import (
     server_steps,
     server_stop_steps,
 )
+
+
+def _listeners(*protocols: str) -> tuple[ResourceOwnership, ...]:
+    ports = {"nfs": NFS_PORT, "ninep": NINEP_PORT}
+    return tuple(
+        ResourceOwnership("listener", ports[protocol]) for protocol in protocols
+    )
+
 
 # Pinned tool revisions; focused C4 runs and C8's final reruns use these too.
 XFSTESTS_REVISION = "1ae822c1c2e2364e966085cee3ce4a97b2500241"
@@ -141,6 +152,7 @@ def _xfstests_config_step(config: HarnessConfig, protocol: str) -> Step:
 def _xfstests(name: str, protocol: str, groups: tuple[str, ...]) -> ScenarioBuilder:
     def build(context: ScenarioContext) -> ScenarioPlan:
         config = context.config
+        listeners = _listeners(protocol)
         mount = (
             nfs_mount_steps(config) if protocol == "nfs" else ninep_mount_steps(config)
         )
@@ -160,13 +172,13 @@ def _xfstests(name: str, protocol: str, groups: tuple[str, ...]) -> ScenarioBuil
             for group in groups
         )
         steps = (
-            server_steps(context)
+            server_steps(context, listeners)
             + tool_checkout_steps(config, "xfstests")
             + mount
             + (_xfstests_config_step(config, protocol),)
             + run_steps
             + unmount
-            + server_stop_steps(context)
+            + server_stop_steps(context, listeners)
         )
         return ScenarioPlan(
             name=name,
@@ -182,6 +194,7 @@ def _xfstests(name: str, protocol: str, groups: tuple[str, ...]) -> ScenarioBuil
 def _pjdfstest(name: str, protocol: str, tool: str) -> ScenarioBuilder:
     def build(context: ScenarioContext) -> ScenarioPlan:
         config = context.config
+        listeners = _listeners(protocol)
         mount = (
             nfs_mount_steps(config) if protocol == "nfs" else ninep_mount_steps(config)
         )
@@ -193,7 +206,7 @@ def _pjdfstest(name: str, protocol: str, tool: str) -> ScenarioBuilder:
         checkout = tool_checkout(config, tool)
         mountpoint = _mountpoint(config, protocol)
         steps = (
-            server_steps(context)
+            server_steps(context, listeners)
             + tool_checkout_steps(config, tool)
             + (
                 Step(
@@ -220,7 +233,7 @@ def _pjdfstest(name: str, protocol: str, tool: str) -> ScenarioBuilder:
                 ),
             )
             + unmount
-            + server_stop_steps(context)
+            + server_stop_steps(context, listeners)
         )
         return ScenarioPlan(
             name=name,
@@ -235,8 +248,9 @@ def _pjdfstest(name: str, protocol: str, tool: str) -> ScenarioBuilder:
 
 def _stress_ng(context: ScenarioContext) -> ScenarioPlan:
     config = context.config
+    listeners = _listeners("nfs", "ninep")
     steps = (
-        server_steps(context)
+        server_steps(context, listeners)
         + nfs_mount_steps(config)
         + ninep_mount_steps(config)
         + (
@@ -273,7 +287,7 @@ def _stress_ng(context: ScenarioContext) -> ScenarioPlan:
         )
         + ninep_unmount_steps(config)
         + nfs_unmount_steps(config)
-        + server_stop_steps(context)
+        + server_stop_steps(context, listeners)
     )
     return ScenarioPlan(
         name="stress-ng-nfs-ninep",
@@ -286,6 +300,7 @@ def _stress_ng(context: ScenarioContext) -> ScenarioPlan:
 def _kernel_compile(name: str, protocol: str) -> ScenarioBuilder:
     def build(context: ScenarioContext) -> ScenarioPlan:
         config = context.config
+        listeners = _listeners(protocol)
         mount = (
             nfs_mount_steps(config) if protocol == "nfs" else ninep_mount_steps(config)
         )
@@ -297,7 +312,7 @@ def _kernel_compile(name: str, protocol: str) -> ScenarioBuilder:
         mountpoint = _mountpoint(config, protocol)
         source = mountpoint / KERNEL_SOURCE_DIRNAME
         steps = (
-            server_steps(context)
+            server_steps(context, listeners)
             + mount
             + kernel_archive_steps(config, mountpoint)
             + (
@@ -313,7 +328,7 @@ def _kernel_compile(name: str, protocol: str) -> ScenarioBuilder:
                 ),
             )
             + unmount
-            + server_stop_steps(context)
+            + server_stop_steps(context, listeners)
         )
         return ScenarioPlan(
             name=name,
