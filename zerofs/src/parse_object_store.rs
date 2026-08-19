@@ -341,6 +341,17 @@ async fn build_sftp_store(
     crate::sftp_object_store::SftpObjectStore::validate_prefix(&path)?;
 
     let config = sftp_config.cloned().unwrap_or_default();
+    match config.transport {
+        crate::config::SftpSshTransport::Russh => {}
+        crate::config::SftpSshTransport::HpnOpenSsh => {
+            return Err(object_store::Error::Generic {
+                store: "SFTP",
+                source: Box::new(std::io::Error::other(
+                    "HPN OpenSSH SFTP transport is not implemented",
+                )),
+            });
+        }
+    }
     let endpoint = crate::config::SftpEndpoint {
         host: url
             .host_str()
@@ -580,5 +591,22 @@ mod tests {
             .to_string();
         assert!(error.contains("password"), "got: {error}");
         assert!(!error.contains(secret), "password leaked in error: {error}");
+    }
+
+    #[tokio::test]
+    async fn sftp_parser_fails_closed_for_hpn_openssh_until_backend_exists() {
+        let url = Url::parse("sftp://alice@example.com/data").unwrap();
+        let config = crate::config::SftpConfig {
+            transport: crate::config::SftpSshTransport::HpnOpenSsh,
+            ..Default::default()
+        };
+        let error = parse_url_opts(&url, std::iter::empty::<(&str, &str)>(), Some(&config))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("not implemented"),
+            "HPN must fail closed instead of falling back to russh: {error}"
+        );
     }
 }
