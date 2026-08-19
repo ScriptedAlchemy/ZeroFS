@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: host-deploy.sh deploy|replace|cleanup [options]
+Usage: host-deploy.sh deploy|replace|cleanup|commit|rollback|recover [options]
 
 This script runs on a Proxmox VE host. It never removes the persistent state
 bind mount. `replace` additionally requires --confirm-replace CTID.
@@ -12,7 +12,7 @@ EOF
 
 action=${1:-}
 case "$action" in
-  deploy|replace|cleanup) shift ;;
+  deploy|replace|cleanup|commit|rollback|recover) shift ;;
   *) usage >&2; exit 2 ;;
 esac
 
@@ -23,7 +23,7 @@ bridge=vmbr1
 gateway=10.10.10.1
 template=
 rootfs=local-lvm:8
-memory_mb=65536
+memory_mb=98304
 cores=8
 state_root=
 stage=
@@ -37,6 +37,8 @@ confirm_replace=
 dry_run=false
 assume_existing=false
 assume_stopped=false
+dry_run_ct_destroyed=false
+defer_commit=false
 
 while (($#)); do
   case "$1" in
@@ -60,6 +62,7 @@ while (($#)); do
     --confirm-replace) confirm_replace=$2; shift 2 ;;
     --assume-existing) assume_existing=true; shift ;;
     --assume-stopped) assume_stopped=true; shift ;;
+    --defer-commit) defer_commit=true; shift ;;
     --dry-run) dry_run=true; shift ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
@@ -84,8 +87,26 @@ fi
   echo "unsafe Samba user name" >&2
   exit 2
 }
+[[ $memory_mb =~ ^[1-9][0-9]*$ ]] || { echo "invalid --memory-mb" >&2; exit 2; }
+if ! [[ $cores =~ ^[1-9][0-9]*$ ]] || ((cores > 256)); then
+  echo "invalid --cores" >&2
+  exit 2
+fi
+[[ $bridge =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid --bridge" >&2; exit 2; }
+[[ $rootfs =~ ^[A-Za-z0-9_.-]+:[1-9][0-9]*$ ]] || {
+  echo "invalid --rootfs" >&2
+  exit 2
+}
 if [[ $role == prod && ( $action == replace || $action == cleanup ) ]]; then
   echo "prod permits in-place deploy only; replace and cleanup are dev-only" >&2
+  exit 2
+fi
+if [[ $defer_commit == true && ! ( $role == prod && $action == deploy ) ]]; then
+  echo "--defer-commit is valid only for production deploy" >&2
+  exit 2
+fi
+if [[ $action == commit || $action == rollback || $action == recover ]] && [[ $role != prod ]]; then
+  echo "$action controls only a production deployment transaction" >&2
   exit 2
 fi
 [[ $container_ip =~ ^10\.[0-9]+\.[0-9]+\.[0-9]+$|^172\.(1[6-9]|2[0-9]|3[01])\.[0-9]+\.[0-9]+$|^192\.168\.[0-9]+\.[0-9]+$ ]] || {
@@ -111,6 +132,7 @@ if [[ $action != cleanup ]]; then
     exit 2
   }
 fi
+deployment_transaction="$state_root/deployment-transaction"
 
 run() {
   printf '+ '
@@ -125,11 +147,17 @@ if [[ $dry_run == false ]]; then
   [[ $EUID -eq 0 ]] || { echo "host deployment requires root" >&2; exit 1; }
   command -v pct >/dev/null
   command -v pveversion >/dev/null
+  command -v flock >/dev/null
   pveversion >/dev/null
+  exec 8>"/run/lock/zerofs-lxc-$ctid.coordinator.lock"
+  flock -n 8 || { echo "another deployment owns CT $ctid" >&2; exit 75; }
+else
+  echo "+ acquire exclusive host lock /run/lock/zerofs-lxc-$ctid.coordinator.lock"
 fi
 
 ct_exists() {
   if [[ $dry_run == true ]]; then
+    [[ $dry_run_ct_destroyed == false ]] || return 1
     [[ $assume_existing == true || $action != deploy ]]
     return
   fi
@@ -142,6 +170,407 @@ ct_running() {
     return
   fi
   [[ $(pct status "$ctid" 2>/dev/null) == "status: running" ]]
+}
+
+ct_resource_snapshot=
+ct_resources_mutated=false
+
+config_value() {
+  local config=$1 key=$2
+  awk -F ': ' -v wanted="$key" '$1 == wanted { sub(/^[^:]*: /, ""); print; found=1; exit } END { if (!found) exit 1 }' "$config"
+}
+
+csv_field() {
+  local input=$1 wanted=$2 field
+  local old_ifs=$IFS
+  IFS=,
+  for field in $input; do
+    if [[ ${field%%=*} == "$wanted" ]]; then
+      printf '%s\n' "${field#*=}"
+      IFS=$old_ifs
+      return 0
+    fi
+  done
+  IFS=$old_ifs
+  return 1
+}
+
+csv_set_field() {
+  local input=$1 wanted=$2 value=$3 field output='' found=false
+  local old_ifs=$IFS
+  IFS=,
+  for field in $input; do
+    [[ -n $field ]] || continue
+    if [[ ${field%%=*} == "$wanted" ]]; then
+      field="$wanted=$value"
+      found=true
+    fi
+    if [[ -n $output ]]; then
+      output="$output,$field"
+    else
+      output=$field
+    fi
+  done
+  IFS=$old_ifs
+  if [[ $found == false ]]; then
+    if [[ -n $output ]]; then
+      output="$output,$wanted=$value"
+    else
+      output="$wanted=$value"
+    fi
+  fi
+  printf '%s\n' "$output"
+}
+
+desired_net0() {
+  local value=$1
+  value=$(csv_set_field "$value" name eth0)
+  value=$(csv_set_field "$value" bridge "$bridge")
+  value=$(csv_set_field "$value" ip "$container_ip/24")
+  value=$(csv_set_field "$value" gw "$gateway")
+  value=$(csv_set_field "$value" type veth)
+  printf '%s\n' "$value"
+}
+
+desired_mp0() {
+  local value=$1 first rest
+  if [[ -n $value ]]; then
+    first=${value%%,*}
+    if [[ $first == *=* ]]; then
+      value="$state_root,$value"
+    else
+      rest=${value#*,}
+      if [[ $rest == "$value" ]]; then
+        value=$state_root
+      else
+        value="$state_root,$rest"
+      fi
+    fi
+  else
+    value=$state_root
+  fi
+  value=$(csv_set_field "$value" mp /srv/zerofs-persist)
+  if [[ $(csv_field "$value" ro 2>/dev/null || true) == 1 ]]; then
+    value=$(csv_set_field "$value" ro 0)
+  fi
+  printf '%s\n' "$value"
+}
+
+desired_features() {
+  local value=$1
+  if [[ $has_smb == true ]]; then
+    value=$(csv_set_field "$value" fuse 1)
+  fi
+  printf '%s\n' "$value"
+}
+
+capture_ct_resources() {
+  [[ $had_ct == true && $action == deploy ]] || return 0
+  if [[ $dry_run == true ]]; then
+    echo "+ capture existing CT resource snapshot"
+    return 0
+  fi
+  local snapshot
+  snapshot=$(mktemp "/var/tmp/zerofs-ct-$ctid-resources.XXXXXX")
+  chmod 0600 "$snapshot"
+  if ! pct config "$ctid" >"$snapshot"; then
+    rm -f -- "$snapshot"
+    return 1
+  fi
+  ct_resource_snapshot=$snapshot
+}
+
+restore_ct_resources() {
+  [[ $ct_resources_mutated == true && -n $ct_resource_snapshot ]] || return 0
+  local key value failed=false
+  for key in cores memory swap onboot startup net0 mp0 hookscript features; do
+    if value=$(config_value "$ct_resource_snapshot" "$key"); then
+      if ! pct set "$ctid" "--$key" "$value" >/dev/null 2>&1; then
+        echo "rollback failed to restore CT resource: $key" >&2
+        failed=true
+      fi
+    else
+      if ! pct set "$ctid" --delete "$key" >/dev/null 2>&1; then
+        echo "rollback failed to remove newly introduced CT resource: $key" >&2
+        failed=true
+      fi
+    fi
+  done
+  [[ $failed == false ]] || return 1
+  assert_ct_resource_snapshot
+}
+
+assert_ct_resource_snapshot() {
+  local current key before after valid=true
+  current=$(mktemp "/var/tmp/zerofs-ct-$ctid-rollback-verify.XXXXXX")
+  chmod 0600 "$current"
+  if ! pct config "$ctid" >"$current"; then
+    rm -f -- "$current"
+    return 1
+  fi
+  for key in cores memory swap onboot startup net0 mp0 hookscript features; do
+    before=$(config_value "$ct_resource_snapshot" "$key" 2>/dev/null || true)
+    after=$(config_value "$current" "$key" 2>/dev/null || true)
+    [[ $before == "$after" ]] || valid=false
+  done
+  rm -f -- "$current"
+  [[ $valid == true ]]
+}
+
+assert_ct_resources() {
+  [[ $dry_run == false ]] || return 0
+  local config current current_net current_mp valid=true
+  config=$(mktemp "/var/tmp/zerofs-ct-$ctid-verify.XXXXXX")
+  chmod 0600 "$config"
+  if ! pct config "$ctid" >"$config"; then
+    rm -f -- "$config"
+    return 1
+  fi
+  [[ $(config_value "$config" cores 2>/dev/null || true) == "$cores" ]] || valid=false
+  [[ $(config_value "$config" memory 2>/dev/null || true) == "$memory_mb" ]] || valid=false
+  [[ $(config_value "$config" swap 2>/dev/null || true) == 0 ]] || valid=false
+  [[ $(config_value "$config" onboot 2>/dev/null || true) == 1 ]] || valid=false
+  current=$(config_value "$config" startup 2>/dev/null || true)
+  [[ $(csv_field "$current" order 2>/dev/null || true) == 20 ]] || valid=false
+  current_net=$(config_value "$config" net0 2>/dev/null || true)
+  [[ $(csv_field "$current_net" name 2>/dev/null || true) == eth0 ]] || valid=false
+  [[ $(csv_field "$current_net" bridge 2>/dev/null || true) == "$bridge" ]] || valid=false
+  [[ $(csv_field "$current_net" ip 2>/dev/null || true) == "$container_ip/24" ]] || valid=false
+  [[ $(csv_field "$current_net" gw 2>/dev/null || true) == "$gateway" ]] || valid=false
+  [[ $(csv_field "$current_net" type 2>/dev/null || true) == veth ]] || valid=false
+  current_mp=$(config_value "$config" mp0 2>/dev/null || true)
+  [[ ${current_mp%%,*} == "$state_root" ]] || valid=false
+  [[ $(csv_field "$current_mp" mp 2>/dev/null || true) == /srv/zerofs-persist ]] || valid=false
+  [[ $(csv_field "$current_mp" ro 2>/dev/null || true) != 1 ]] || valid=false
+  [[ $(config_value "$config" hookscript 2>/dev/null || true) == local:snippets/zerofs-lxc-hook.sh ]] || valid=false
+  if [[ $has_smb == true ]]; then
+    current=$(config_value "$config" features 2>/dev/null || true)
+    [[ $(csv_field "$current" fuse 2>/dev/null || true) == 1 ]] || valid=false
+  fi
+  rm -f -- "$config"
+  if [[ $valid != true ]]; then
+    echo "CT resources do not match the requested deployment profile" >&2
+    return 1
+  fi
+}
+
+reconcile_ct_resources() {
+  [[ $had_ct == true && $action == deploy ]] || return 0
+  if [[ $dry_run == true ]]; then
+    echo "+ validate/reconcile existing CT resources memory=$memory_mb cores=$cores swap=0 onboot=1 startup=order=20 net0=name=eth0,bridge=$bridge,ip=$container_ip/24,gw=$gateway,type=veth mp0=$state_root,mp=/srv/zerofs-persist"
+    echo "+ rollback restores captured CT resources"
+    return 0
+  fi
+  local config current desired key value changed=false
+  config=$ct_resource_snapshot
+  for key in cores memory swap onboot; do
+    case $key in
+      cores) desired=$cores ;;
+      memory) desired=$memory_mb ;;
+      swap) desired=0 ;;
+      onboot) desired=1 ;;
+    esac
+    current=$(config_value "$config" "$key" 2>/dev/null || true)
+    [[ $current == "$desired" ]] || changed=true
+  done
+  current=$(config_value "$config" startup 2>/dev/null || true)
+  [[ $current == "$(csv_set_field "$current" order 20)" ]] || changed=true
+  current=$(config_value "$config" net0 2>/dev/null || true)
+  [[ $current == "$(desired_net0 "$current")" ]] || changed=true
+  current=$(config_value "$config" mp0 2>/dev/null || true)
+  [[ $current == "$(desired_mp0 "$current")" ]] || changed=true
+  current=$(config_value "$config" hookscript 2>/dev/null || true)
+  [[ $current == local:snippets/zerofs-lxc-hook.sh ]] || changed=true
+  if [[ $has_smb == true ]]; then
+    current=$(config_value "$config" features 2>/dev/null || true)
+    [[ $current == "$(desired_features "$current")" ]] || changed=true
+  fi
+  [[ $changed == true ]] || { assert_ct_resources; return 0; }
+
+  if ct_running; then
+    graceful_stop
+  fi
+  ct_resources_mutated=true
+  for key in cores memory swap onboot; do
+    case $key in
+      cores) desired=$cores ;;
+      memory) desired=$memory_mb ;;
+      swap) desired=0 ;;
+      onboot) desired=1 ;;
+    esac
+    current=$(config_value "$config" "$key" 2>/dev/null || true)
+    if [[ $current != "$desired" ]]; then
+      run pct set "$ctid" "--$key" "$desired"
+    fi
+  done
+  current=$(config_value "$config" startup 2>/dev/null || true)
+  value=$(csv_set_field "$current" order 20)
+  if [[ $current != "$value" ]]; then
+    run pct set "$ctid" --startup "$value"
+  fi
+  current=$(config_value "$config" net0 2>/dev/null || true)
+  value=$(desired_net0 "$current")
+  if [[ $current != "$value" ]]; then
+    run pct set "$ctid" --net0 "$value"
+  fi
+  current=$(config_value "$config" mp0 2>/dev/null || true)
+  value=$(desired_mp0 "$current")
+  if [[ $current != "$value" ]]; then
+    run pct set "$ctid" --mp0 "$value"
+  fi
+  current=$(config_value "$config" hookscript 2>/dev/null || true)
+  if [[ $current != local:snippets/zerofs-lxc-hook.sh ]]; then
+    run pct set "$ctid" --hookscript local:snippets/zerofs-lxc-hook.sh
+  fi
+  if [[ $has_smb == true ]]; then
+    current=$(config_value "$config" features 2>/dev/null || true)
+    value=$(desired_features "$current")
+    if [[ $current != "$value" ]]; then
+      run pct set "$ctid" --features "$value"
+    fi
+  fi
+  assert_ct_resources
+}
+
+persist_host_transaction() {
+  [[ $defer_commit == true ]] || return 0
+  if [[ $dry_run == true ]]; then
+    echo "+ persist host rollback transaction $deployment_transaction"
+    return 0
+  fi
+  [[ ! -e $deployment_transaction ]] || {
+    echo "deployment transaction already exists: $deployment_transaction" >&2
+    return 1
+  }
+  install -d -m 0700 "$state_root"
+  local temporary_transaction="$state_root/.deployment-transaction.$$"
+  [[ ! -e $temporary_transaction ]] || return 1
+  install -d -m 0700 "$temporary_transaction"
+  if [[ -n $ct_resource_snapshot ]]; then
+    install -m 0600 "$ct_resource_snapshot" "$temporary_transaction/ct-resources"
+  fi
+  printf '%s\n' "$previous_release" >"$temporary_transaction/previous-release"
+  {
+    printf 'saved_had_ct=%q\n' "$had_ct"
+    printf 'saved_had_running_ct=%q\n' "$had_running_ct"
+    printf 'saved_prod_mount_was_active=%q\n' "$prod_mount_was_active"
+    printf 'saved_prod_smb_was_active=%q\n' "$prod_smb_was_active"
+    printf 'saved_prod_mount_was_enabled=%q\n' "$prod_mount_was_enabled"
+    printf 'saved_prod_smb_was_enabled=%q\n' "$prod_smb_was_enabled"
+    printf 'saved_release_id=%q\n' "$release_id"
+  } >"$temporary_transaction/state.env"
+  printf '%s\n' prepared >"$temporary_transaction/phase"
+  chmod 0600 "$temporary_transaction/previous-release" \
+    "$temporary_transaction/state.env" "$temporary_transaction/phase"
+  sync -f "$temporary_transaction/previous-release"
+  sync -f "$temporary_transaction/state.env"
+  sync -f "$temporary_transaction/phase"
+  [[ ! -e $temporary_transaction/ct-resources ]] || sync -f "$temporary_transaction/ct-resources"
+  sync -f "$temporary_transaction"
+  mv -- "$temporary_transaction" "$deployment_transaction"
+  sync -f "$state_root"
+}
+
+set_host_transaction_phase() {
+  [[ $defer_commit == true ]] || return 0
+  local phase=$1 temporary="$deployment_transaction/.phase.$$"
+  if [[ $dry_run == true ]]; then
+    echo "+ persist host deployment phase $phase"
+    return 0
+  fi
+  printf '%s\n' "$phase" >"$temporary"
+  chmod 0600 "$temporary"
+  sync -f "$temporary"
+  mv -f -- "$temporary" "$deployment_transaction/phase"
+  sync -f "$deployment_transaction"
+}
+
+restore_saved_prod_services() {
+  if [[ $saved_prod_mount_was_enabled == true ]]; then
+    pct exec "$ctid" -- systemctl enable zerofs-lxc-mount.service
+  else
+    pct exec "$ctid" -- systemctl disable zerofs-lxc-mount.service >/dev/null 2>&1 || true
+  fi
+  if [[ $saved_prod_smb_was_enabled == true ]]; then
+    pct exec "$ctid" -- systemctl enable smbd.service
+  else
+    pct exec "$ctid" -- systemctl disable smbd.service >/dev/null 2>&1 || true
+  fi
+  if [[ $saved_prod_mount_was_active == true ]]; then
+    pct exec "$ctid" -- systemctl start zerofs-lxc-mount.service
+  else
+    pct exec "$ctid" -- systemctl stop zerofs-lxc-mount.service >/dev/null 2>&1 || true
+  fi
+  if [[ $saved_prod_smb_was_active == true ]]; then
+    pct exec "$ctid" -- systemctl start smbd.service
+  else
+    pct exec "$ctid" -- systemctl stop smbd.service >/dev/null 2>&1 || true
+  fi
+}
+
+saved_had_ct=false
+saved_had_running_ct=false
+saved_prod_mount_was_active=false
+saved_prod_smb_was_active=false
+saved_prod_mount_was_enabled=false
+saved_prod_smb_was_enabled=false
+saved_release_id=
+
+control_host_transaction() {
+  if [[ $dry_run == true ]]; then
+    echo "+ $action host deployment transaction $deployment_transaction"
+    if [[ $action == rollback ]]; then
+      echo "+ restore previous release and exact CT resources before restarting services"
+    fi
+    return 0
+  fi
+  if [[ $action == recover && ! -d $deployment_transaction ]]; then
+    return 0
+  fi
+  [[ -d $deployment_transaction ]] || {
+    echo "missing deployment transaction: $deployment_transaction" >&2
+    return 1
+  }
+  if [[ $action == commit ]]; then
+    rm -rf -- "$deployment_transaction"
+    sync -f "$state_root"
+    return 0
+  fi
+  action=rollback
+  [[ -f $deployment_transaction/state.env && -f $deployment_transaction/previous-release && -f $deployment_transaction/phase ]] || {
+    echo "incomplete deployment transaction: $deployment_transaction" >&2
+    return 1
+  }
+  # The transaction is root-created mode 0700; shell quoting was applied when written.
+  # shellcheck disable=SC1091
+  source "$deployment_transaction/state.env"
+  if [[ $action != recover && $saved_release_id != "$release_id" ]]; then
+    echo "deployment transaction belongs to release $saved_release_id" >&2
+    return 1
+  fi
+  previous_release=$(<"$deployment_transaction/previous-release")
+  if ct_exists && ct_running; then
+    pct stop "$ctid" --skiplock 1
+  fi
+  if [[ -n $previous_release ]]; then
+    ln -sfn "$previous_release" "$state_root/current"
+  else
+    rm -f -- "$state_root/current"
+  fi
+  if [[ $saved_had_ct == true ]]; then
+    ct_resource_snapshot="$deployment_transaction/ct-resources"
+    ct_resources_mutated=true
+    restore_ct_resources
+    if [[ $saved_had_running_ct == true ]]; then
+      pct start "$ctid"
+      pct exec "$ctid" -- systemctl restart zerofs-lxc.service
+      restore_saved_prod_services
+    fi
+  elif ct_exists; then
+    pct stop "$ctid" --skiplock 1 >/dev/null 2>&1 || true
+  fi
+  rm -rf -- "$deployment_transaction"
+  sync -f "$state_root"
 }
 
 assert_server_drained() {
@@ -210,6 +639,27 @@ prod_mount_was_active=false
 prod_smb_was_active=false
 prod_mount_was_enabled=false
 prod_smb_was_enabled=false
+capture_prod_share_state() {
+  [[ $role == prod ]] || return 0
+  ct_exists && ct_running || return 0
+  if [[ $dry_run == true ]]; then
+    echo "+ capture prior optional SMB/FUSE service state"
+    return 0
+  fi
+  if pct exec "$ctid" -- systemctl is-enabled --quiet smbd.service; then
+    prod_smb_was_enabled=true
+  fi
+  if pct exec "$ctid" -- systemctl is-enabled --quiet zerofs-lxc-mount.service; then
+    prod_mount_was_enabled=true
+  fi
+  if pct exec "$ctid" -- systemctl is-active --quiet smbd.service; then
+    prod_smb_was_active=true
+  fi
+  if pct exec "$ctid" -- systemctl is-active --quiet zerofs-lxc-mount.service; then
+    prod_mount_was_active=true
+  fi
+}
+
 quiesce_prod_share() {
   [[ $role == prod ]] || return 0
   ct_exists || return 0
@@ -227,18 +677,10 @@ quiesce_prod_share() {
     fi
     return
   fi
-  if pct exec "$ctid" -- systemctl is-enabled --quiet smbd.service; then
-    prod_smb_was_enabled=true
-  fi
-  if pct exec "$ctid" -- systemctl is-enabled --quiet zerofs-lxc-mount.service; then
-    prod_mount_was_enabled=true
-  fi
-  if pct exec "$ctid" -- systemctl is-active --quiet smbd.service; then
-    prod_smb_was_active=true
+  if [[ $prod_smb_was_active == true ]]; then
     run pct exec "$ctid" -- systemctl stop smbd.service
   fi
-  if pct exec "$ctid" -- systemctl is-active --quiet zerofs-lxc-mount.service; then
-    prod_mount_was_active=true
+  if [[ $prod_mount_was_active == true ]]; then
     run pct exec "$ctid" -- sync -f /srv/zerofs-share
     run pct exec "$ctid" -- systemctl stop zerofs-lxc-mount.service
   fi
@@ -263,6 +705,11 @@ graceful_stop() {
     run pct shutdown "$ctid" --timeout 120
   fi
 }
+
+if [[ $action == commit || $action == rollback || $action == recover ]]; then
+  control_host_transaction
+  exit 0
+fi
 
 if [[ $action == cleanup ]]; then
   if ct_exists; then
@@ -302,6 +749,7 @@ previous_release=
 if [[ $dry_run == false && -L $state_root/current ]]; then
   previous_release=$(readlink "$state_root/current")
 fi
+capture_ct_resources
 rollback_backup=
 
 rollback() {
@@ -311,6 +759,13 @@ rollback() {
   echo "rollback: deployment failed; restoring the last runnable container/release" >&2
   if [[ -n $previous_release ]]; then
     ln -sfn "$previous_release" "$state_root/current"
+  fi
+  if [[ $ct_resources_mutated == true ]] && pct config "$ctid" >/dev/null 2>&1 && ct_running; then
+    pct stop "$ctid" --skiplock 1 >/dev/null 2>&1
+  fi
+  if ! restore_ct_resources; then
+    echo "rollback failed to verify original CT resources; leaving CT stopped and preserving $ct_resource_snapshot" >&2
+    exit 125
   fi
   if [[ -n $rollback_backup ]]; then
     pct stop "$ctid" --skiplock 1 >/dev/null 2>&1
@@ -345,9 +800,17 @@ rollback() {
   elif pct config "$ctid" >/dev/null 2>&1; then
     pct stop "$ctid" --skiplock 1 >/dev/null 2>&1
   fi
+  if [[ $defer_commit == true && -d $deployment_transaction ]]; then
+    rm -rf -- "$deployment_transaction"
+    sync -f "$state_root"
+  fi
+  [[ -z $ct_resource_snapshot ]] || rm -f -- "$ct_resource_snapshot"
   exit "$code"
 }
 trap rollback ERR
+
+capture_prod_share_state
+persist_host_transaction
 
 if [[ $had_ct == true ]]; then
   quiesce_prod_share
@@ -358,6 +821,9 @@ if [[ $had_ct == true ]]; then
     run pct exec "$ctid" -- systemctl stop zerofs-lxc.service
   fi
 fi
+set_host_transaction_phase quiesced
+
+reconcile_ct_resources
 
 run install -d -o 100000 -g 100000 -m 0750 "$state_root"
 if [[ $dry_run == false ]]; then
@@ -422,6 +888,9 @@ if [[ $action == replace && $had_ct == true ]]; then
   fi
   graceful_stop
   run pct destroy "$ctid" --purge 1
+  if [[ $dry_run == true ]]; then
+    dry_run_ct_destroyed=true
+  fi
   had_ct=false
 fi
 
@@ -438,10 +907,26 @@ if ! ct_exists; then
     --onboot 1 \
     --startup order=20
 fi
-run pct set "$ctid" --hookscript local:snippets/zerofs-lxc-hook.sh
-if [[ $has_smb == true ]]; then
-  run pct set "$ctid" --features fuse=1
+if [[ $dry_run == true ]]; then
+  current=
+else
+  current=$(pct config "$ctid" | awk -F ': ' '$1 == "hookscript" { sub(/^[^:]*: /, ""); print; exit }')
 fi
+if [[ $current != local:snippets/zerofs-lxc-hook.sh ]]; then
+  run pct set "$ctid" --hookscript local:snippets/zerofs-lxc-hook.sh
+fi
+if [[ $has_smb == true ]]; then
+  if [[ $dry_run == true ]]; then
+    current=
+  else
+    current=$(pct config "$ctid" | awk -F ': ' '$1 == "features" { sub(/^[^:]*: /, ""); print; exit }')
+  fi
+  feature_value=$(desired_features "$current")
+  if [[ $current != "$feature_value" ]]; then
+    run pct set "$ctid" --features "$feature_value"
+  fi
+fi
+assert_ct_resources
 if ! ct_running; then
   run pct start "$ctid"
 fi
@@ -535,4 +1020,9 @@ echo "deployed_ctid=$ctid"
 echo "deployed_commit=$commit"
 echo "binary_sha256=$binary_sha"
 echo "persistent_state=$state_root"
+if [[ $defer_commit == true ]]; then
+  set_host_transaction_phase activated
+  echo "deferred_transaction=$deployment_transaction"
+fi
+[[ -z $ct_resource_snapshot ]] || rm -f -- "$ct_resource_snapshot"
 trap - ERR

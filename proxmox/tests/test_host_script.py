@@ -11,6 +11,27 @@ HOOK = ROOT / "hooks" / "zerofs-lxc-hook.sh"
 
 
 class HostScriptTests(unittest.TestCase):
+    def run_resource_function(
+        self, function: str, value: str
+    ) -> subprocess.CompletedProcess[str]:
+        source = HOST_SCRIPT.read_text()
+        functions = source[
+            source.index("config_value() {") : source.index("assert_server_drained() {")
+        ]
+        script = (
+            "set -euo pipefail\n"
+            "state_root=/var/lib/zerofs-lxc/prod-198\n"
+            "bridge=vmbr1\ncontainer_ip=10.10.10.55\ngateway=10.10.10.1\n"
+            + functions
+            + f'\n{function} "$1"\n'
+        )
+        return subprocess.run(
+            ["bash", "-c", script, "resource-test", value],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
     def run_host(
         self, action: str, *extra: str, role: str = "dev"
     ) -> subprocess.CompletedProcess[str]:
@@ -87,6 +108,94 @@ class HostScriptTests(unittest.TestCase):
         self.assertNotIn("mkfs", result.stdout)
         self.assertNotIn("0.0.0.0", result.stdout)
 
+    def test_existing_ct_resources_are_reconciled_to_requested_values(self) -> None:
+        result = self.run_host(
+            "deploy",
+            "--assume-existing",
+            "--memory-mb",
+            "49152",
+            "--cores",
+            "6",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("validate/reconcile existing CT resources", result.stdout)
+        self.assertIn("memory=49152", result.stdout)
+        self.assertIn("cores=6", result.stdout)
+        self.assertIn("onboot=1", result.stdout)
+        self.assertIn("startup=order=20", result.stdout)
+        self.assertIn(
+            "net0=name=eth0,bridge=vmbr1,ip=10.10.10.20/24,gw=10.10.10.1,type=veth",
+            result.stdout,
+        )
+        self.assertIn(
+            "mp0=/var/lib/zerofs-lxc/dev-120,mp=/srv/zerofs-persist",
+            result.stdout,
+        )
+
+    def test_persistent_bind_is_normalized_read_write_without_losing_options(
+        self,
+    ) -> None:
+        result = self.run_resource_function(
+            "desired_mp0",
+            "/old/path,mp=/old/mount,backup=1,ro=1,replicate=0",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        fields = result.stdout.strip().split(",")
+        self.assertEqual(fields[0], "/var/lib/zerofs-lxc/prod-198")
+        self.assertIn("mp=/srv/zerofs-persist", fields)
+        self.assertIn("backup=1", fields)
+        self.assertIn("replicate=0", fields)
+        self.assertNotIn("ro=1", fields)
+
+    def test_existing_ct_resource_changes_have_a_failure_rollback_plan(self) -> None:
+        result = self.run_host("deploy", "--assume-existing")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("capture existing CT resource snapshot", result.stdout)
+        self.assertIn("rollback restores captured CT resources", result.stdout)
+
+    def test_resource_rollback_failure_preserves_snapshot_and_refuses_restart(
+        self,
+    ) -> None:
+        source = HOST_SCRIPT.read_text()
+        rollback = source[
+            source.index("rollback() {") : source.index("trap rollback ERR")
+        ]
+        self.assertIn("assert_ct_resource_snapshot", source)
+        self.assertRegex(
+            rollback,
+            r"if ! restore_ct_resources; then[\s\S]+preserving \$ct_resource_snapshot[\s\S]+exit 125",
+        )
+        self.assertLess(rollback.index("exit 125"), rollback.index('pct start "$ctid"'))
+
+    def test_replace_backs_up_original_ct_before_applying_new_resources(self) -> None:
+        result = self.run_host(
+            "replace",
+            "--confirm-replace",
+            "120",
+            "--memory-mb",
+            "49152",
+            "--cores",
+            "6",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        before_backup = result.stdout.split("vzdump 120", 1)[0]
+        self.assertNotIn("validate/reconcile existing CT resources", before_backup)
+        self.assertIn("pct create 120", result.stdout)
+        self.assertIn("--memory 49152", result.stdout)
+        self.assertIn("--cores 6", result.stdout)
+
+    def test_invalid_resource_requests_fail_before_any_host_plan(self) -> None:
+        for extra in (
+            ("--memory-mb", "0"),
+            ("--cores", "0"),
+            ("--bridge", "vmbr1;id"),
+            ("--rootfs", "local-lvm:8;id"),
+        ):
+            with self.subTest(extra=extra):
+                result = self.run_host("deploy", *extra)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "")
+
     def test_replace_requires_host_side_confirmation_and_creates_rollback_backup(
         self,
     ) -> None:
@@ -118,6 +227,66 @@ class HostScriptTests(unittest.TestCase):
         self.assertIn("systemctl start smbd.service", result.stdout)
         self.assertIn("private 10.10.10.20:8080", result.stdout)
         self.assertNotIn("pct destroy 120", result.stdout)
+
+    def test_prod_deferred_deploy_has_explicit_commit_and_rollback_controls(
+        self,
+    ) -> None:
+        deploy_result = self.run_host(
+            "deploy",
+            "--assume-existing",
+            "--defer-commit",
+            role="prod",
+        )
+        self.assertEqual(deploy_result.returncode, 0, deploy_result.stderr)
+        transaction = "/var/lib/zerofs-lxc/prod-120/deployment-transaction"
+        self.assertIn(f"deferred_transaction={transaction}", deploy_result.stdout)
+        self.assertIn("persist host rollback transaction", deploy_result.stdout)
+
+        commit = self.run_host("commit", role="prod")
+        self.assertEqual(commit.returncode, 0, commit.stderr)
+        self.assertIn(
+            f"commit host deployment transaction {transaction}", commit.stdout
+        )
+
+        rollback = self.run_host("rollback", role="prod")
+        self.assertEqual(rollback.returncode, 0, rollback.stderr)
+        self.assertIn(
+            f"rollback host deployment transaction {transaction}", rollback.stdout
+        )
+
+        recover = self.run_host("recover", role="prod")
+        self.assertEqual(recover.returncode, 0, recover.stderr)
+        self.assertIn(
+            f"recover host deployment transaction {transaction}", recover.stdout
+        )
+        self.assertIn(
+            "restore previous release and exact CT resources", rollback.stdout
+        )
+
+    def test_prod_persists_recovery_before_any_service_or_share_mutation(self) -> None:
+        source = HOST_SCRIPT.read_text()
+        persisted = source.index("\npersist_host_transaction\n")
+        quiesced = source.index("\n  quiesce_prod_share\n", persisted)
+        stopped = source.index(
+            'run pct exec "$ctid" -- systemctl stop zerofs-lxc.service', persisted
+        )
+        self.assertLess(persisted, quiesced)
+        self.assertLess(persisted, stopped)
+
+    def test_resource_snapshot_covers_every_ct_setting_mutated_by_deploy(self) -> None:
+        source = HOST_SCRIPT.read_text()
+        self.assertIn(
+            "for key in cores memory swap onboot startup net0 mp0 hookscript features",
+            source,
+        )
+
+    def test_dev_cannot_defer_or_control_a_production_transaction(self) -> None:
+        deferred = self.run_host("deploy", "--defer-commit", role="dev")
+        self.assertNotEqual(deferred.returncode, 0)
+        for action in ("commit", "rollback"):
+            with self.subTest(action=action):
+                result = self.run_host(action, role="dev")
+                self.assertNotEqual(result.returncode, 0)
 
     def test_default_prod_access_is_native_nfs_without_samba(self) -> None:
         result = self.run_host("deploy", role="prod")
