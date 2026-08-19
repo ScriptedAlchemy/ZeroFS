@@ -3866,6 +3866,28 @@ volatile_memory_gb = 2.0
     }
 
     #[test]
+    fn legacy_nbd_inputs_normalize_without_exclusivity() {
+        let ack = resolve_write_ack(&format!(
+            r#"[servers.nbd]
+addresses = ["127.0.0.1:10809"]
+write_ack_mode = "volatile_memory"
+volatile_memory_gb = 2.0
+
+[servers.nfs]
+addresses = ["127.0.0.1:2049"]
+
+[servers.ninep]
+addresses = ["127.0.0.1:5564"]
+{ENABLED_WRITEBACK}"#
+        ))
+        .unwrap();
+
+        assert_eq!(ack.mode, FilesystemWriteAckMode::VolatileMemory);
+        assert_eq!(ack.source, FilesystemWriteAckSource::LegacyNbd);
+        assert_eq!(ack.volatile_memory_bytes, 2_000_000_000);
+    }
+
+    #[test]
     fn filesystem_write_ack_matching_dual_forms_normalize_once() {
         let ack = resolve_write_ack(&format!(
             r#"[servers.nbd]
