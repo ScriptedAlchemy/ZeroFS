@@ -60,11 +60,6 @@ impl<E: BarrierError> SequenceBarrier<E> {
         self.progress.borrow().sequence
     }
 
-    /// The journal incarnation currently published by this stage.
-    pub(crate) fn incarnation(&self) -> Uuid {
-        self.progress.borrow().incarnation
-    }
-
     /// A consistent snapshot of the published progress.
     pub(crate) fn snapshot(&self) -> SequenceProgress {
         self.progress.borrow().clone()
