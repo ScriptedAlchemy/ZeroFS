@@ -2,6 +2,7 @@ use crate::writeback::admission::{AcceptedAdmission, Admission};
 use crate::writeback::barrier::{BarrierError, SequenceBarrier, SequenceProgress};
 use crate::writeback::journal::{Journal, PreparedMutation, StagedBatch};
 use crate::writeback::model::{MutationRecord, Sequence};
+use crate::writeback::multipart_reservation::MultipartStagingCleanup;
 use crate::writeback::payload::VerifiedPayload;
 use crate::writeback::reservation::{
     CommittedSsdReservation, ReservationError, SsdReservationToken, commit_batch_local,
@@ -242,12 +243,12 @@ struct LocalJournalerInner {
     closed: AtomicBool,
     join: Mutex<Option<JoinHandle<()>>>,
     shutdown_result: watch::Sender<Option<Result<(), LocalBarrierError>>>,
-    _retained_ram: Arc<StdMutex<Vec<AcceptedAdmission>>>,
+    _retained_failure_ownership: Arc<StdMutex<Vec<MutationOwnership>>>,
 }
 
 struct LocalJournalerOwnership {
     admission: Admission,
-    retained_ram: Arc<StdMutex<Vec<AcceptedAdmission>>>,
+    retained_failure_ownership: Arc<StdMutex<Vec<MutationOwnership>>>,
     space: Option<Arc<PhysicalSpaceSampler>>,
 }
 
@@ -257,6 +258,7 @@ enum JournalCommand {
         payload: Option<VerifiedPayload>,
         ram: Option<AcceptedAdmission>,
         disk: Option<SsdReservationToken>,
+        multipart_cleanup: Option<MultipartStagingCleanup>,
     },
     Shutdown(oneshot::Sender<()>),
 }
@@ -383,7 +385,7 @@ impl LocalJournaler {
             closed: false,
         });
         let (shutdown_result, _) = watch::channel(None);
-        let retained_ram = Arc::new(StdMutex::new(Vec::new()));
+        let retained_failure_ownership = Arc::new(StdMutex::new(Vec::new()));
         let join = tokio::spawn(run_journaler(
             sink,
             receiver,
@@ -393,7 +395,7 @@ impl LocalJournaler {
             prepare_concurrency,
             LocalJournalerOwnership {
                 admission,
-                retained_ram: retained_ram.clone(),
+                retained_failure_ownership: retained_failure_ownership.clone(),
                 space,
             },
         ));
@@ -408,7 +410,7 @@ impl LocalJournaler {
                 closed: AtomicBool::new(false),
                 join: Mutex::new(Some(join)),
                 shutdown_result,
-                _retained_ram: retained_ram,
+                _retained_failure_ownership: retained_failure_ownership,
             }),
         }
     }
@@ -433,7 +435,8 @@ impl LocalJournaler {
         payload: VerifiedPayload,
         ram: AcceptedAdmission,
     ) -> Result<LocalBarrier, LocalBarrierError> {
-        self.submit(record, Some(payload), Some(ram), None).await
+        self.submit(record, Some(payload), Some(ram), None, None)
+            .await
     }
 
     pub(crate) async fn submit_put_with_disk(
@@ -454,7 +457,7 @@ impl LocalJournaler {
         ram: AcceptedAdmission,
         disk: SsdReservationToken,
     ) -> Result<LocalBarrier, LocalBarrierError> {
-        self.submit(record, Some(payload), Some(ram), Some(disk))
+        self.submit(record, Some(payload), Some(ram), Some(disk), None)
             .await
     }
 
@@ -463,7 +466,7 @@ impl LocalJournaler {
         record: MutationRecord,
         disk: SsdReservationToken,
     ) -> Result<LocalBarrier, LocalBarrierError> {
-        self.submit(record, None, None, Some(disk)).await
+        self.submit(record, None, None, Some(disk), None).await
     }
 
     async fn submit(
@@ -472,6 +475,7 @@ impl LocalJournaler {
         payload: Option<VerifiedPayload>,
         ram: Option<AcceptedAdmission>,
         disk: Option<SsdReservationToken>,
+        multipart_cleanup: Option<MultipartStagingCleanup>,
     ) -> Result<LocalBarrier, LocalBarrierError> {
         let _gate = self.inner.admission_gate.lock().await;
         if self.inner.closed.load(Ordering::Acquire) {
@@ -484,6 +488,7 @@ impl LocalJournaler {
                 payload,
                 ram,
                 disk,
+                multipart_cleanup,
             })
             .await
             .map_err(|_| terminal_or_closed(&self.inner.barrier))?;
@@ -525,6 +530,33 @@ impl LocalJournaler {
             payload,
             ram,
             disk,
+            multipart_cleanup: None,
+        });
+        Ok(self.inner.barrier.clone())
+    }
+
+    /// Enqueue a reserved multipart mutation without surrendering staging
+    /// ownership until the journaler has accepted the command. This keeps the
+    /// caller able to perform sampled cleanup if shutdown wins the race.
+    pub(crate) async fn submit_reserved_with_cleanup(
+        &self,
+        slot: SubmitSlot,
+        record: MutationRecord,
+        payload: Option<VerifiedPayload>,
+        ram: Option<AcceptedAdmission>,
+        disk: Option<SsdReservationToken>,
+        multipart_cleanup: &mut Option<MultipartStagingCleanup>,
+    ) -> Result<LocalBarrier, LocalBarrierError> {
+        let _gate = self.inner.admission_gate.lock().await;
+        if self.inner.closed.load(Ordering::Acquire) {
+            return Err(LocalBarrierError::Closed);
+        }
+        slot.permit.send(JournalCommand::Mutation {
+            record: Box::new(record),
+            payload,
+            ram,
+            disk,
+            multipart_cleanup: multipart_cleanup.take(),
         });
         Ok(self.inner.barrier.clone())
     }
@@ -599,17 +631,15 @@ async fn drive_shutdown(inner: Arc<LocalJournalerInner>) {
         .send_replace(Some(outcome.unwrap_or(Ok(()))));
 }
 
-type Preparation = (
-    Sequence,
-    AnyResult<PreparedMutation>,
-    Option<AcceptedAdmission>,
-    Option<SsdReservationToken>,
-);
-type PreparedEntry = (
-    AnyResult<PreparedMutation>,
-    Option<AcceptedAdmission>,
-    Option<SsdReservationToken>,
-);
+type Preparation = (Sequence, AnyResult<PreparedMutation>, MutationOwnership);
+type PreparedEntry = (AnyResult<PreparedMutation>, MutationOwnership);
+
+struct MutationOwnership {
+    sequence: Sequence,
+    _ram: Option<AcceptedAdmission>,
+    disk: Option<SsdReservationToken>,
+    multipart_cleanup: Option<MultipartStagingCleanup>,
+}
 
 /// Files a finished preparation, returning a terminal error if its task died.
 fn collect_preparation(
@@ -617,8 +647,8 @@ fn collect_preparation(
     prepared: &mut BTreeMap<Sequence, PreparedEntry>,
 ) -> Option<String> {
     match result {
-        Ok((sequence, result, ram, disk)) => {
-            prepared.insert(sequence, (result, ram, disk));
+        Ok((sequence, result, ownership)) => {
+            prepared.insert(sequence, (result, ownership));
             None
         }
         Err(error) => Some(format!("local journal preparer panicked: {error}")),
@@ -641,14 +671,19 @@ fn accept_journal_command(
             payload,
             ram,
             disk,
+            multipart_cleanup,
         }) => {
             let record = *record;
             let sequence = record.sequence;
             if *next_received != Some(sequence) {
                 let expected = next_received
                     .map_or_else(|| "after overflow".to_owned(), |value| value.to_string());
-                drop(ram);
-                drop(disk);
+                drop(MutationOwnership {
+                    sequence,
+                    _ram: ram,
+                    disk,
+                    multipart_cleanup,
+                });
                 return Some(format!(
                     "journal worker expected sequence {expected}, got {sequence}"
                 ));
@@ -657,7 +692,16 @@ fn accept_journal_command(
             let prepare_sink = sink.clone();
             preparations.push(tokio::task::spawn_blocking(move || {
                 let result = prepare_sink.prepare(record, payload.as_ref());
-                (sequence, result, ram, disk)
+                (
+                    sequence,
+                    result,
+                    MutationOwnership {
+                        sequence,
+                        _ram: ram,
+                        disk,
+                        multipart_cleanup,
+                    },
+                )
             }));
             None
         }
@@ -674,11 +718,7 @@ fn accept_journal_command(
 }
 
 /// The admission permits a batch owns, released when it commits.
-type BatchOwnership = Vec<(
-    Sequence,
-    Option<AcceptedAdmission>,
-    Option<SsdReservationToken>,
-)>;
+type BatchOwnership = Vec<MutationOwnership>;
 
 struct AssembledBatch {
     mutations: Vec<PreparedMutation>,
@@ -695,11 +735,10 @@ fn take_fatal_head(
     prepared: &mut BTreeMap<Sequence, PreparedEntry>,
     sequence: Sequence,
 ) -> AnyResult<PreparedMutation> {
-    let (result, ram, disk) = prepared
+    let (result, ownership) = prepared
         .remove(&sequence)
         .expect("the fatal preparation still exists");
-    drop(ram);
-    drop(disk);
+    drop(ownership);
     result
 }
 
@@ -720,7 +759,7 @@ fn assemble_batch(
     let mut candidate = Some(next_admitted);
 
     while let Some(sequence) = candidate {
-        let Some((result, _, _)) = prepared.get(&sequence) else {
+        let Some((result, _)) = prepared.get(&sequence) else {
             break;
         };
         if result.is_err() {
@@ -773,11 +812,11 @@ fn assemble_batch(
         if next_payload_bytes > MAX_LOCAL_PUBLISH_BATCH_PAYLOAD_BYTES && !mutations.is_empty() {
             break;
         }
-        let (result, ram, disk) = prepared
+        let (result, mutation_ownership) = prepared
             .remove(&sequence)
             .expect("the expected prepared mutation still exists");
         mutations.push(result.expect("the prepared mutation was checked above"));
-        ownership.push((sequence, ram, disk));
+        ownership.push(mutation_ownership);
         encoded_record_bytes = next_encoded_bytes;
         container_payload_bytes = next_payload_bytes;
         candidate = sequence.checked_add(1);
@@ -831,8 +870,8 @@ async fn transition_ssd_tokens(
 ) -> Option<String> {
     let mut tokens = Vec::new();
     let mut physicals = Vec::new();
-    for (_, _, disk) in ownership.iter_mut() {
-        if let Some(token) = disk.take() {
+    for owner in ownership.iter_mut() {
+        if let Some(token) = owner.disk.take() {
             physicals.push(token.request().physical_reservation_bytes);
             tokens.push(token);
         }
@@ -859,6 +898,76 @@ async fn transition_ssd_tokens(
     }
 }
 
+async fn cleanup_multipart_staging(
+    ownership: &mut BatchOwnership,
+    space: Option<&PhysicalSpaceSampler>,
+) -> Option<String> {
+    let mut cleaned = Vec::new();
+    for owner in ownership.iter_mut() {
+        let Some(cleanup) = owner.multipart_cleanup.take() else {
+            continue;
+        };
+        match tokio::task::spawn_blocking(move || cleanup.remove()).await {
+            Ok(Ok(result)) => cleaned.push(result),
+            Ok(Err(error)) => {
+                let message = format!("multipart staging cleanup failed: {error}");
+                for result in cleaned {
+                    result.poison_and_retain(message.clone());
+                }
+                return Some(message);
+            }
+            Err(error) => {
+                let message = format!("multipart staging cleanup task failed: {error}");
+                for result in cleaned {
+                    result.poison_and_retain(message.clone());
+                }
+                return Some(message);
+            }
+        }
+    }
+    if cleaned.is_empty() {
+        return None;
+    }
+    let Some(space) = space else {
+        let message = "multipart staging cleanup has no physical-space sampler".to_owned();
+        for result in cleaned {
+            result.poison_and_retain(message.clone());
+        }
+        return Some(message);
+    };
+    let sample = match space.sample().await {
+        Ok(sample) => sample,
+        Err(error) => {
+            let message = format!("physical-space sample failed after multipart cleanup: {error}");
+            for result in cleaned {
+                result.poison_and_retain(message.clone());
+            }
+            return Some(message);
+        }
+    };
+    let observe_error = cleaned
+        .iter()
+        .find_map(|result| result.admission().observe_sample(sample).err());
+    if let Some(error) = observe_error {
+        let message = format!("SSD admission rejected post-cleanup space sample: {error}");
+        for retained in cleaned {
+            retained.poison_and_retain(message.clone());
+        }
+        return Some(message);
+    }
+    drop(cleaned);
+    None
+}
+
+async fn cleanup_uncommitted_ownership(
+    mut ownership: BatchOwnership,
+    space: Option<&PhysicalSpaceSampler>,
+) -> Option<String> {
+    let error = cleanup_multipart_staging(&mut ownership, space).await;
+    drop(ownership);
+    error
+}
+
 /// Settle one committed batch: release its permits, notify the observer, and
 /// only then publish the new watermark. Returns a terminal error if the batch
 /// did not become durable exactly as assembled.
@@ -866,7 +975,7 @@ async fn finish_commit(
     result: Result<AnyResult<Vec<MutationRecord>>, tokio::task::JoinError>,
     mut ownership: BatchOwnership,
     observer: Option<&Arc<dyn LocalCommitObserver>>,
-    retained_ram: &Arc<StdMutex<Vec<AcceptedAdmission>>>,
+    retained_failure_ownership: &Arc<StdMutex<Vec<MutationOwnership>>>,
     progress: &watch::Sender<SequenceProgress>,
     space: Option<&PhysicalSpaceSampler>,
 ) -> Option<String> {
@@ -883,7 +992,7 @@ async fn finish_commit(
     };
     let expected_sequences = ownership
         .iter()
-        .map(|(sequence, _, _)| *sequence)
+        .map(|owner| owner.sequence)
         .collect::<Vec<_>>();
     let committed_sequences = committed
         .iter()
@@ -906,11 +1015,14 @@ async fn finish_commit(
     if let Some(observer) = observer
         && let Err(error) = observer.committed_batch(&committed).await
     {
-        let mut retained = retained_ram
+        let mut retained = retained_failure_ownership
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        retained.extend(ownership.into_iter().filter_map(|(_, ram, _)| ram));
+        retained.extend(ownership);
         return Some(format!("local commit observer failed: {error:#}"));
+    }
+    if let Some(error) = cleanup_multipart_staging(&mut ownership, space).await {
+        return Some(error);
     }
     drop(ownership);
     // The watermark moves last, so `wait_local` releases a sequence only after
@@ -930,7 +1042,7 @@ async fn run_journaler(
 ) {
     let LocalJournalerOwnership {
         admission,
-        retained_ram,
+        retained_failure_ownership,
         space,
     } = ownership;
     let prepare_concurrency = prepare_concurrency.max(1);
@@ -1014,7 +1126,7 @@ async fn run_journaler(
                     next_admitted = match ownership
                         .last()
                         .expect("an assembled batch owns at least one sequence")
-                        .0
+                        .sequence
                         .checked_add(1)
                     {
                         Some(next) => next,
@@ -1065,7 +1177,7 @@ async fn run_journaler(
                     result,
                     ownership,
                     observer.as_ref(),
-                    &retained_ram,
+                    &retained_failure_ownership,
                     &progress,
                     space.as_deref(),
                 )
@@ -1082,7 +1194,7 @@ async fn run_journaler(
                             .get(&first)
                             .expect("a staged batch owns its permits")
                             .iter()
-                            .map(|(sequence, _, _)| *sequence)
+                            .map(|owner| owner.sequence)
                             .collect::<Vec<_>>();
                         let actual = staged.sequences();
                         if actual != expected {
@@ -1091,29 +1203,53 @@ async fn run_journaler(
                             // staged something else would release the wrong
                             // ones. Refuse it rather than commit it.
                             let _ = sink.discard_staged(staged);
-                            staged_ownership.remove(&first);
+                            let ownership = staged_ownership
+                                .remove(&first)
+                                .expect("mismatched staged batch owns its permits");
+                            let cleanup_error =
+                                cleanup_uncommitted_ownership(ownership, space.as_deref()).await;
                             commit_order.retain(|queued| *queued != first);
                             if terminal.is_none() {
-                                terminal = Some(format!(
+                                let mut message = format!(
                                     "local journal stager returned sequences {actual:?}, expected {expected:?}"
-                                ));
+                                );
+                                if let Some(error) = cleanup_error {
+                                    message.push_str(&format!("; {error}"));
+                                }
+                                terminal = Some(message);
                             }
                         } else if terminal.is_some() {
                             // The batch's bytes are durable but nothing will
                             // reference them; unlink instead of leaking until
                             // the next open collects it.
                             let _ = sink.discard_staged(staged);
-                            staged_ownership.remove(&first);
+                            let ownership = staged_ownership
+                                .remove(&first)
+                                .expect("discarded staged batch owns its permits");
+                            if let Some(error) =
+                                cleanup_uncommitted_ownership(ownership, space.as_deref()).await
+                                && terminal.is_none()
+                            {
+                                terminal = Some(error);
+                            }
                             commit_order.retain(|queued| *queued != first);
                         } else {
                             ready.insert(first, staged);
                         }
                     }
                     Ok((first, Err(error))) => {
-                        staged_ownership.remove(&first);
+                        let ownership = staged_ownership
+                            .remove(&first)
+                            .expect("failed staged batch owns its permits");
+                        let cleanup_error =
+                            cleanup_uncommitted_ownership(ownership, space.as_deref()).await;
                         commit_order.retain(|queued| *queued != first);
                         if terminal.is_none() {
-                            terminal = Some(format!("{error:#}"));
+                            let mut message = format!("{error:#}");
+                            if let Some(error) = cleanup_error {
+                                message.push_str(&format!("; {error}"));
+                            }
+                            terminal = Some(message);
                         }
                     }
                     Err(error) => {
@@ -1161,19 +1297,24 @@ async fn run_journaler(
 
     // Anything staged but never committed is durable bytes nothing will ever
     // reference. Recovery would collect it from its name, but unlink it now.
-    for (_, staged) in std::mem::take(&mut ready) {
+    for (first, staged) in std::mem::take(&mut ready) {
         let _ = sink.discard_staged(staged);
+        if let Some(ownership) = staged_ownership.remove(&first) {
+            let _ = cleanup_uncommitted_ownership(ownership, space.as_deref()).await;
+        }
     }
-    drop(std::mem::take(&mut staged_ownership));
+    for (_, ownership) in std::mem::take(&mut staged_ownership) {
+        let _ = cleanup_uncommitted_ownership(ownership, space.as_deref()).await;
+    }
     if let Some(error) = terminal {
         admission.poison(error.clone());
         progress.send_modify(|state| state.terminal_error = Some(error.clone()));
         while let Some(result) = preparations.next().await {
-            if let Ok((_, Ok(mutation), _, _)) = result {
+            if let Ok((_, Ok(mutation), _)) = result {
                 sink.discard(mutation);
             }
         }
-        for (_, (result, _, _)) in prepared {
+        for (_, (result, _)) in prepared {
             if let Ok(mutation) = result {
                 sink.discard(mutation);
             }
@@ -1233,6 +1374,10 @@ mod tests {
     use crate::writeback::journal::{Journal, StagedBatch};
     use crate::writeback::model::{
         FenceClass, JournalIdentity, MutationMode, MutationRecord, Sequence,
+    };
+    use crate::writeback::multipart_reservation::{
+        MultipartReservationSet, MutationReservation, SsdMultipartPartReservation,
+        promote_multipart,
     };
     use crate::writeback::overlay::{OverlayCommitObserver, OverlayIndex};
     use crate::writeback::payload::VerifiedPayload;
@@ -1476,6 +1621,59 @@ mod tests {
             }
             self.inner.committed_batch(records).await
         }
+    }
+
+    #[tokio::test]
+    async fn multipart_completion_holds_staging_and_journal_until_cleanup() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = pipeline_journal(&temp);
+        let space = Arc::new(PhysicalSpaceSampler::new(journal.root().to_path_buf()));
+        let sample = space.sample().await.unwrap();
+        let ssd =
+            SsdAdmission::recover(1_000_000, 100, 95, 85, 1, std::iter::empty(), Some(sample))
+                .unwrap();
+        let record = put_record(1, b"payload");
+        let journal_bytes = record.ssd_reservation_bytes().unwrap();
+        let reservation = SsdMultipartPartReservation::reserve(&ssd, 7, journal_bytes, 1, sample)
+            .await
+            .unwrap();
+        let staging = temp.path().join("multipart");
+        std::fs::create_dir(&staging).unwrap();
+        let staged_payload = staging.join("payload.staged");
+        std::fs::write(&staged_payload, b"payload").unwrap();
+        let verified = VerifiedPayload::from_staged_file(staged_payload, 7).unwrap();
+        let promoted = promote_multipart(MultipartReservationSet::Ssd(vec![reservation])).unwrap();
+        let MutationReservation::Ssd(mutation) = promoted.mutation else {
+            panic!("expected SSD multipart promotion")
+        };
+        let (disk, cleanup) = mutation.into_owned(staging.clone());
+        let observer = Arc::new(BlockingObserver::default());
+        let admission = Admission::new(64);
+        let journaler = LocalJournaler::start_with_observer_and_space(
+            journal,
+            admission,
+            8,
+            1,
+            Some(observer.clone()),
+            space,
+        )
+        .unwrap();
+        let barrier = journaler
+            .submit(record, Some(verified), None, Some(disk), Some(cleanup))
+            .await
+            .unwrap();
+
+        observer.entered.notified().await;
+        assert!(staging.exists());
+        assert_eq!(barrier.local_sequence(), 0);
+        assert_eq!(ssd.used_bytes(), 7 + journal_bytes);
+
+        observer.release.notify_one();
+        barrier.wait_local(1).await.unwrap();
+        assert!(!staging.exists());
+        assert_eq!(ssd.used_bytes(), journal_bytes);
+        assert_eq!(ssd.used_operations(), 1);
+        journaler.shutdown().await.unwrap();
     }
 
     impl LocalJournalSink for BlockingSink {
@@ -1926,6 +2124,71 @@ mod tests {
         barrier.wait_local(2).await.unwrap();
         assert_eq!(*sink.committed.lock().unwrap(), vec![1, 2]);
         journaler.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reserved_submit_close_race_returns_multipart_cleanup_ownership() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = pipeline_journal(&temp);
+        let space = Arc::new(PhysicalSpaceSampler::new(journal.root().to_path_buf()));
+        let sample = space.sample().await.unwrap();
+        let ssd =
+            SsdAdmission::recover(1_000_000, 100, 95, 85, 1, std::iter::empty(), Some(sample))
+                .unwrap();
+        let record = put_record(1, b"payload");
+        let journal_bytes = record.ssd_reservation_bytes().unwrap();
+        let reservation = SsdMultipartPartReservation::reserve(&ssd, 7, journal_bytes, 1, sample)
+            .await
+            .unwrap();
+        let staging = temp.path().join("reserved-close-race");
+        std::fs::create_dir(&staging).unwrap();
+        let staged_payload = staging.join("payload.staged");
+        std::fs::write(&staged_payload, b"payload").unwrap();
+        let verified = VerifiedPayload::from_staged_file(staged_payload, 7).unwrap();
+        let promoted = promote_multipart(MultipartReservationSet::Ssd(vec![reservation])).unwrap();
+        let MutationReservation::Ssd(mutation) = promoted.mutation else {
+            panic!("expected SSD multipart promotion")
+        };
+        let (disk, cleanup) = mutation.into_owned(staging.clone());
+        let mut cleanup = Some(cleanup);
+        let journaler = LocalJournaler::start_with_observer_and_space(
+            journal,
+            Admission::new(64),
+            8,
+            1,
+            None,
+            Arc::clone(&space),
+        )
+        .unwrap();
+        let slot = journaler.reserve_slot().await.unwrap();
+        let shutdown_journaler = journaler.clone();
+        let shutdown = tokio::spawn(async move { shutdown_journaler.shutdown().await });
+        while !journaler.inner.closed.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+
+        let error = journaler
+            .submit_reserved_with_cleanup(
+                slot,
+                record,
+                Some(verified),
+                None,
+                Some(disk),
+                &mut cleanup,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, LocalBarrierError::Closed));
+        let cleaned = cleanup
+            .take()
+            .expect("closed submit retained cleanup")
+            .remove()
+            .unwrap();
+        let fresh = space.sample().await.unwrap();
+        cleaned.admission().observe_sample(fresh).unwrap();
+        drop(cleaned);
+        assert!(!staging.exists());
+        shutdown.await.unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -2967,8 +3230,12 @@ mod tests {
                             0,
                         ),
                     )),
-                    None,
-                    None,
+                    super::MutationOwnership {
+                        sequence,
+                        _ram: None,
+                        disk: None,
+                        multipart_cleanup: None,
+                    },
                 ),
             );
         }

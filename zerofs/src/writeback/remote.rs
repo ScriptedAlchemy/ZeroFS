@@ -9,11 +9,14 @@ use crate::writeback::overlay::OverlayIndex;
 use crate::writeback::pacing::{DurableCleanupSteps, credit_for};
 use crate::writeback::reservation::{SsdAdmission, SsdReservationRequest};
 use crate::writeback::space_sample::PhysicalSpaceSampler;
-use bytes::Bytes;
-use futures::FutureExt;
 use futures::future::BoxFuture;
+use futures::stream::FuturesUnordered;
+use futures::{FutureExt, StreamExt};
 use object_store::path::Path;
-use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutResult, UpdateVersion};
+use object_store::{
+    GetOptions, GetRange, MultipartUpload, ObjectStore, ObjectStoreExt, PutMode,
+    PutMultipartOptions, PutPayload, PutResult, UpdateVersion,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::sync::Arc;
@@ -25,6 +28,8 @@ use tokio::task::{JoinHandle, JoinSet};
 const REMOTE_COALESCE_IDLE: Duration = Duration::from_millis(500);
 const REMOTE_RETRY_DELAY: Duration = Duration::from_millis(200);
 const REMOTE_OPERATION_TIMEOUT: Duration = Duration::from_secs(120);
+const REMOTE_STREAM_CHUNK_BYTES: usize = 8 * 1024 * 1024;
+const REMOTE_STREAM_IN_FLIGHT_PARTS: usize = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RemoteBarrierError {
@@ -493,10 +498,13 @@ async fn run_remote_scheduler(worker: RemoteWorker) {
                     let remote = remote.clone();
                     let journal = journal.clone();
                     active.spawn(async move {
-                        let applying = apply_record(remote, journal, record.clone());
-                        let result =
+                        let result = if matches!(record.kind, MutationKind::Delete) {
+                            let applying = apply_record(remote, journal, record.clone());
                             bounded_remote_operation(&record, REMOTE_OPERATION_TIMEOUT, applying)
-                                .await;
+                                .await
+                        } else {
+                            apply_record(remote, journal, record.clone()).await
+                        };
                         (record, result)
                     });
                 }
@@ -950,26 +958,15 @@ async fn apply_record(
         MutationKind::Put { mode, .. }
         | MutationKind::Copy { mode, .. }
         | MutationKind::Rename { mode, .. } => {
-            let options = PutOptions::from(remote_put_mode(*mode, &record, journal.as_ref())?);
-            let sequence = record.sequence;
-            let bytes = tokio::task::spawn_blocking(move || journal.read_blob(sequence))
-                .await
-                .map_err(|error| generic_error(format!("journal read task failed: {error}")))?
-                .map(Bytes::from)
-                .map_err(|error| generic_error(format!("journal read failed: {error:#}")))?;
-            let result = match remote
-                .put_opts(&target, bytes.clone().into(), options)
-                .await
-            {
-                Ok(result) => result,
-                Err(object_store::Error::AlreadyExists { .. }) if *mode == MutationMode::Create => {
-                    verify_existing(remote.as_ref(), &target, &bytes).await?
-                }
-                Err(object_store::Error::Precondition { .. }) if *mode == MutationMode::Update => {
-                    verify_existing(remote.as_ref(), &target, &bytes).await?
-                }
-                Err(error) => return Err(error),
-            };
+            let put_mode = remote_put_mode(*mode, &record, journal.as_ref())?;
+            let result = stream_record_to_remote(
+                Arc::clone(&remote),
+                Arc::clone(&journal),
+                &record,
+                &target,
+                &put_mode,
+            )
+            .await?;
             if let MutationKind::Rename { source, .. } = &record.kind {
                 let source = Path::parse(source)
                     .map_err(|error| generic_error(format!("invalid rename source: {error}")))?;
@@ -981,6 +978,215 @@ async fn apply_record(
             Ok(result)
         }
     }
+}
+
+struct RemoteMultipartOwner {
+    upload: Option<Box<dyn MultipartUpload>>,
+}
+
+impl RemoteMultipartOwner {
+    fn new(upload: Box<dyn MultipartUpload>) -> Self {
+        Self {
+            upload: Some(upload),
+        }
+    }
+
+    fn put_part(&mut self, payload: PutPayload) -> object_store::UploadPart {
+        self.upload
+            .as_mut()
+            .expect("active multipart owner has an upload")
+            .put_part(payload)
+    }
+
+    async fn complete(&mut self) -> object_store::Result<PutResult> {
+        let result = self
+            .upload
+            .as_mut()
+            .expect("active multipart owner has an upload")
+            .complete()
+            .await;
+        if result.is_ok() {
+            self.upload = None;
+        }
+        result
+    }
+
+    async fn abort(&mut self) -> object_store::Result<()> {
+        let result = self
+            .upload
+            .as_mut()
+            .expect("active multipart owner has an upload")
+            .abort()
+            .await;
+        if result.is_ok() {
+            self.upload = None;
+        }
+        result
+    }
+}
+
+impl Drop for RemoteMultipartOwner {
+    fn drop(&mut self) {
+        let Some(mut upload) = self.upload.take() else {
+            return;
+        };
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                if let Err(error) = upload.abort().await {
+                    tracing::error!(%error, "remote multipart cancellation cleanup failed");
+                }
+            });
+        } else {
+            tracing::error!("remote multipart owner dropped without a runtime for cleanup");
+        }
+    }
+}
+
+async fn stream_record_to_remote(
+    remote: Arc<dyn ObjectStore>,
+    journal: Arc<Journal>,
+    record: &MutationRecord,
+    target: &Path,
+    mode: &PutMode,
+) -> object_store::Result<PutResult> {
+    if let Some(existing) =
+        reconcile_precondition(remote.as_ref(), journal.as_ref(), record, target, mode).await?
+    {
+        return Ok(existing);
+    }
+
+    let sequence = record.sequence;
+    let blob_journal = Arc::clone(&journal);
+    let blob = tokio::task::spawn_blocking(move || blob_journal.open_verified_blob(sequence))
+        .await
+        .map_err(|error| generic_error(format!("journal open task failed: {error}")))?
+        .map_err(|error| generic_error(format!("journal blob open failed: {error:#}")))?;
+    let mut chunks = blob
+        .range_stream(0..blob.len(), REMOTE_STREAM_CHUNK_BYTES)
+        .map_err(|error| generic_error(format!("journal blob stream failed: {error:#}")))?;
+    let upload = bounded_remote_step(
+        record,
+        "multipart initiation",
+        remote.put_multipart_opts(target, PutMultipartOptions::default()),
+    )
+    .await?;
+    let mut owner = RemoteMultipartOwner::new(upload);
+    let mut parts = FuturesUnordered::new();
+    while let Some(chunk) = chunks.next().await {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                let source = generic_error(format!("journal blob stream failed: {error:#}"));
+                return abort_remote_multipart(&mut owner, record, source).await;
+            }
+        };
+        while parts.len() >= REMOTE_STREAM_IN_FLIGHT_PARTS {
+            let result = parts
+                .next()
+                .await
+                .expect("nonempty remote multipart part set");
+            if let Err(error) = result {
+                return abort_remote_multipart(&mut owner, record, error).await;
+            }
+        }
+        let part = owner.put_part(chunk.into());
+        let sequence = record.sequence;
+        parts.push(async move {
+            tokio::time::timeout(REMOTE_OPERATION_TIMEOUT, part)
+                .await
+                .map_err(|_| {
+                    generic_error(format!(
+                        "remote multipart part for sequence {sequence} timed out after {:.3}s",
+                        REMOTE_OPERATION_TIMEOUT.as_secs_f64()
+                    ))
+                })?
+        });
+    }
+    while let Some(result) = parts.next().await {
+        if let Err(error) = result {
+            return abort_remote_multipart(&mut owner, record, error).await;
+        }
+    }
+
+    if let Some(existing) =
+        reconcile_precondition(remote.as_ref(), journal.as_ref(), record, target, mode).await?
+    {
+        owner.abort().await?;
+        return Ok(existing);
+    }
+    bounded_remote_step(record, "multipart completion", owner.complete()).await
+}
+
+async fn abort_remote_multipart<T>(
+    owner: &mut RemoteMultipartOwner,
+    record: &MutationRecord,
+    error: object_store::Error,
+) -> object_store::Result<T> {
+    match bounded_remote_step(record, "multipart abort", owner.abort()).await {
+        Ok(()) => Err(error),
+        Err(abort_error) => Err(generic_error(format!(
+            "{error}; remote multipart abort also failed: {abort_error}"
+        ))),
+    }
+}
+
+async fn bounded_remote_step<T, F>(
+    record: &MutationRecord,
+    step: &'static str,
+    operation: F,
+) -> object_store::Result<T>
+where
+    F: Future<Output = object_store::Result<T>>,
+{
+    tokio::time::timeout(REMOTE_OPERATION_TIMEOUT, operation)
+        .await
+        .map_err(|_| {
+            generic_error(format!(
+                "remote {step} for sequence {} timed out after {:.3}s",
+                record.sequence,
+                REMOTE_OPERATION_TIMEOUT.as_secs_f64()
+            ))
+        })?
+}
+
+async fn reconcile_precondition(
+    remote: &dyn ObjectStore,
+    journal: &Journal,
+    record: &MutationRecord,
+    target: &Path,
+    mode: &PutMode,
+) -> object_store::Result<Option<PutResult>> {
+    let head = match mode {
+        PutMode::Overwrite => return Ok(None),
+        PutMode::Create | PutMode::Update(_) => {
+            bounded_remote_step(record, "precondition head", remote.head(target)).await
+        }
+    };
+    match (mode, head) {
+        (PutMode::Create, Err(object_store::Error::NotFound { .. })) => Ok(None),
+        (PutMode::Create, Ok(_)) => verify_existing(remote, journal, record, target)
+            .await
+            .map(Some),
+        (PutMode::Update(expected), Ok(meta)) if update_version_matches(expected, &meta) => {
+            Ok(None)
+        }
+        (PutMode::Update(_), Ok(_)) => verify_existing(remote, journal, record, target)
+            .await
+            .map(Some),
+        (_, Err(error)) => Err(error),
+        (PutMode::Overwrite, _) => unreachable!("overwrite returned before HEAD"),
+    }
+}
+
+fn update_version_matches(expected: &UpdateVersion, actual: &object_store::ObjectMeta) -> bool {
+    expected
+        .e_tag
+        .as_ref()
+        .is_none_or(|expected| actual.e_tag.as_ref() == Some(expected))
+        && expected
+            .version
+            .as_ref()
+            .is_none_or(|expected| actual.version.as_ref() == Some(expected))
 }
 
 fn remote_put_mode(
@@ -1045,17 +1251,57 @@ fn expected_visible_version(record: &MutationRecord) -> Option<&str> {
 
 async fn verify_existing(
     remote: &dyn ObjectStore,
+    journal: &Journal,
+    record: &MutationRecord,
     target: &Path,
-    expected: &Bytes,
 ) -> object_store::Result<PutResult> {
-    let existing = remote.get(target).await?;
-    let meta = existing.meta.clone();
-    let existing = existing.bytes().await?;
-    if existing != *expected {
+    let meta = bounded_remote_step(record, "reconciliation head", remote.head(target)).await?;
+    let sequence = record.sequence;
+    let blob = journal
+        .open_verified_blob(sequence)
+        .map_err(|error| generic_error(format!("journal blob open failed: {error:#}")))?;
+    if meta.size != blob.len() {
         return Err(object_store::Error::AlreadyExists {
             path: target.to_string(),
             source: Box::new(RemoteContentDivergence),
         });
+    }
+    let mut offset = 0u64;
+    while offset < blob.len() {
+        let end = offset
+            .checked_add(REMOTE_STREAM_CHUNK_BYTES as u64)
+            .unwrap_or(u64::MAX)
+            .min(blob.len());
+        let options = GetOptions {
+            if_match: meta.e_tag.clone(),
+            version: meta.version.clone(),
+            range: Some(GetRange::Bounded(offset..end)),
+            ..GetOptions::default()
+        };
+        let remote_range = bounded_remote_step(
+            record,
+            "reconciliation range read",
+            remote.get_opts(target, options),
+        )
+        .await?
+        .bytes()
+        .await?;
+        let mut local_stream = blob
+            .range_stream(offset..end, REMOTE_STREAM_CHUNK_BYTES)
+            .map_err(|error| generic_error(format!("journal range failed: {error:#}")))?;
+        let local_range = local_stream
+            .next()
+            .await
+            .transpose()
+            .map_err(|error| generic_error(format!("journal range read failed: {error:#}")))?
+            .unwrap_or_default();
+        if local_stream.next().await.is_some() || remote_range != local_range {
+            return Err(object_store::Error::AlreadyExists {
+                path: target.to_string(),
+                source: Box::new(RemoteContentDivergence),
+            });
+        }
+        offset = end;
     }
     Ok(PutResult {
         e_tag: meta.e_tag,
@@ -1188,17 +1434,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn verify_existing_reuses_metadata_from_its_single_get() {
+    async fn verify_existing_uses_bounded_range_reads_and_head_metadata() {
         let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let target = Path::from("segments/existing");
+        let target = Path::from("segments/1");
         let expected = Bytes::from_static(b"matching payload");
         let created = inner
             .put(&target, PutPayload::from(expected.clone()))
             .await
             .unwrap();
         let (remote, controls) = FaultStore::new(inner);
+        let temp = tempfile::tempdir().unwrap();
+        let journal = journal_with_local_records(temp.path(), 0);
+        let record = put_record(1, target.as_ref(), &expected);
+        journal.commit_put(record.clone(), &expected).unwrap();
 
-        let reconciled = verify_existing(remote.as_ref(), &target, &expected)
+        let reconciled = verify_existing(remote.as_ref(), &journal, &record, &target)
             .await
             .expect("matching existing content is a successful lost-reply reconciliation");
 
@@ -1206,8 +1456,8 @@ mod tests {
         assert_eq!(reconciled.version, created.version);
         assert_eq!(
             controls.get_count(),
-            1,
-            "GetResult already carries the metadata; a second HEAD is redundant"
+            2,
+            "reconciliation performs one bounded HEAD and one bounded range GET"
         );
     }
 
@@ -1478,3 +1728,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "remote_streaming_tests.rs"]
+mod streaming_tests;

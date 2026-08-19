@@ -76,6 +76,17 @@ pub(crate) struct SsdReservationToken {
     state: ReservationState,
 }
 
+/// The two independently owned claims created by one multipart part.
+///
+/// Both claims are charged atomically by [`SsdAdmission::reserve_multipart_part`]
+/// before the staging file is created. The multipart layer wraps them in its
+/// staging-cleanup and final-journal ownership types.
+#[derive(Debug)]
+pub(crate) struct SsdMultipartPartTokens {
+    pub(crate) staging: SsdReservationToken,
+    pub(crate) final_journal: SsdReservationToken,
+}
+
 impl SsdReservationToken {
     pub(crate) fn request(&self) -> SsdReservationRequest {
         self.request
@@ -350,14 +361,129 @@ impl SsdAdmission {
         result
     }
 
-    #[allow(dead_code)]
+    pub(crate) async fn reserve_multipart_part(
+        &self,
+        staging_bytes: u64,
+        final_journal_bytes: u64,
+        final_journal_operations: u64,
+        sample: PhysicalSpaceSample,
+    ) -> Result<SsdMultipartPartTokens, ReservationError> {
+        let staging = SsdReservationRequest {
+            ssd_reservation_bytes: staging_bytes,
+            physical_reservation_bytes: staging_bytes,
+            operations: 1,
+        };
+        let final_journal = SsdReservationRequest {
+            ssd_reservation_bytes: final_journal_bytes,
+            physical_reservation_bytes: final_journal_bytes,
+            operations: final_journal_operations,
+        };
+        let combined = staging
+            .ssd_reservation_bytes
+            .checked_add(final_journal.ssd_reservation_bytes)
+            .zip(
+                staging
+                    .physical_reservation_bytes
+                    .checked_add(final_journal.physical_reservation_bytes),
+            )
+            .zip(staging.operations.checked_add(final_journal.operations))
+            .map(
+                |((ssd_reservation_bytes, physical_reservation_bytes), operations)| {
+                    SsdReservationRequest {
+                        ssd_reservation_bytes,
+                        physical_reservation_bytes,
+                        operations,
+                    }
+                },
+            );
+        let Some(combined) = combined else {
+            let error = ReservationError::Poisoned("multipart part reservation overflow".into());
+            self.inner.terminate(error.clone());
+            return Err(error);
+        };
+        let mut token = self.reserve(combined, sample).await?;
+        token.disarm();
+        Ok(SsdMultipartPartTokens {
+            staging: self.inner.token(staging),
+            final_journal: self.inner.token(final_journal),
+        })
+    }
+
+    pub(crate) fn merge_multipart_tokens(
+        &self,
+        mut shares: Vec<SsdReservationToken>,
+    ) -> Result<SsdReservationToken, ReservationError> {
+        if shares.is_empty() {
+            return Err(ReservationError::InvalidConfiguration(
+                "multipart SSD promotion requires at least one journal share",
+            ));
+        }
+        if shares.iter().any(|share| {
+            !Arc::ptr_eq(&share.admission, &self.inner) || share.state != ReservationState::Admitted
+        }) {
+            return Err(ReservationError::InvalidConfiguration(
+                "multipart SSD journal shares must belong to one admission owner",
+            ));
+        }
+        let request = shares.iter().try_fold(
+            SsdReservationRequest {
+                ssd_reservation_bytes: 0,
+                physical_reservation_bytes: 0,
+                operations: 0,
+            },
+            |total, share| {
+                Some(SsdReservationRequest {
+                    ssd_reservation_bytes: total
+                        .ssd_reservation_bytes
+                        .checked_add(share.request.ssd_reservation_bytes)?,
+                    physical_reservation_bytes: total
+                        .physical_reservation_bytes
+                        .checked_add(share.request.physical_reservation_bytes)?,
+                    operations: total.operations.checked_add(share.request.operations)?,
+                })
+            },
+        );
+        let Some(request) = request else {
+            let error = ReservationError::Poisoned("multipart SSD promotion overflow".into());
+            self.inner.terminate(error.clone());
+            return Err(error);
+        };
+        let accounting_mismatch = {
+            let state = lock(&self.inner.state);
+            if let Some(error) = &state.terminal {
+                return Err(error.clone());
+            }
+            if state.used_ssd_bytes < request.ssd_reservation_bytes
+                || state.used_operations < request.operations
+                || state.outstanding_physical_claims < request.physical_reservation_bytes
+            {
+                true
+            } else {
+                for share in &mut shares {
+                    share.disarm();
+                }
+                false
+            }
+        };
+        if accounting_mismatch {
+            let error =
+                ReservationError::Poisoned("multipart SSD promotion accounting mismatch".into());
+            self.inner.terminate(error.clone());
+            return Err(error);
+        }
+        Ok(self.inner.token(request))
+    }
+
     pub(crate) fn observe_sample(
         &self,
         sample: PhysicalSpaceSample,
     ) -> Result<(), ReservationError> {
         {
             let mut state = lock(&self.inner.state);
-            self.inner.observe_locked(&mut state, sample)?;
+            match self.inner.observe_locked(&mut state, sample) {
+                Ok(()) | Err(ReservationError::StaleSample { .. }) => {}
+                Err(error) => return Err(error),
+            }
             if let Some(error) = &state.terminal {
                 return Err(error.clone());
             }
@@ -824,12 +950,15 @@ impl SsdAdmissionInner {
         sample: PhysicalSpaceSample,
     ) -> Result<PhysicalSpaceSample, ReservationError> {
         let mut state = lock(&self.state);
-        if let Err(error) = self.observe_locked(&mut state, sample) {
-            drop(state);
-            self.terminate(ReservationError::Poisoned(format!(
-                "SSD reservation transition failed: {error}"
-            )));
-            return Err(error);
+        match self.observe_locked(&mut state, sample) {
+            Ok(()) | Err(ReservationError::StaleSample { .. }) => {}
+            Err(error) => {
+                drop(state);
+                self.terminate(ReservationError::Poisoned(format!(
+                    "SSD reservation transition failed: {error}"
+                )));
+                return Err(error);
+            }
         }
         if let Some(error) = &state.terminal {
             return Err(error.clone());
@@ -851,7 +980,10 @@ impl SsdAdmissionInner {
         };
         state.outstanding_physical_claims = outstanding;
         self.refresh(&mut state);
-        Ok(sample)
+        Ok(PhysicalSpaceSample {
+            generation: state.sample_generation,
+            available_bytes: state.available_bytes,
+        })
     }
 }
 
