@@ -265,7 +265,6 @@ fn nbd_volatile_budget(write_ack: crate::fs::mutation::config::FilesystemWriteAc
 async fn start_nbd_servers(
     fs: Arc<ZeroFS>,
     config: Option<&NbdConfig>,
-    write_ack: crate::fs::mutation::config::FilesystemWriteAckSettings,
     shutdown: CancellationToken,
 ) -> anyhow::Result<(
     Vec<JoinHandle<Result<(), std::io::Error>>>,
@@ -276,7 +275,7 @@ async fn start_nbd_servers(
         None => return Ok((Vec::new(), None)),
     };
     let mut handles = Vec::new();
-    let volatile_memory_bytes = nbd_volatile_budget(write_ack);
+    let volatile_memory_bytes = nbd_volatile_budget(fs.write_ack);
     let volatile_enabled = volatile_memory_bytes > 0;
     metrics::gauge!("zerofs_nbd_volatile_memory_enabled").set(f64::from(volatile_enabled));
     if volatile_enabled {
@@ -1321,7 +1320,6 @@ pub async fn run_server(
         let (nbd_handles, nbd_runtime_registry) = start_nbd_servers(
             Arc::clone(&fs),
             settings.servers.nbd.as_ref(),
-            write_ack,
             shutdown.clone(),
         )
         .await?;

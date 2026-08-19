@@ -897,7 +897,7 @@ impl NBDHandler {
             runtime.wait_materialized(target).await?;
         }
         self.filesystem
-            .client_fsync()
+            .wait_configured_durability()
             .await
             .map_err(|_| CommandError::IoError)?;
 

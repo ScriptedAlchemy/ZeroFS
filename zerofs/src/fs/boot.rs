@@ -254,7 +254,8 @@ impl ZeroFS {
             flush_coordinator,
             write_coordinator,
             ignore_fsync,
-            write_ack: crate::fs::mutation::config::FilesystemWriteAckSettings::materialized_direct(),
+            write_ack: crate::fs::mutation::config::FilesystemWriteAckSettings::materialized_direct(
+            ),
             lineage_token,
             serving_writer_epoch,
             max_bytes,
@@ -333,7 +334,7 @@ impl ZeroFS {
         if self.ignore_fsync {
             return Ok(());
         }
-        self.flush_coordinator.flush().await?;
+        self.wait_configured_durability().await?;
         if client_token == 0 || client_token == self.lineage_token {
             Ok(())
         } else {
@@ -605,7 +606,6 @@ mod tests {
 
     // === Tests from operations.rs ===
 }
-
 
 #[cfg(test)]
 mod write_ack_retention_tests {

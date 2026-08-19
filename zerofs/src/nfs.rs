@@ -383,7 +383,7 @@ impl NFSFileSystem for NFSAdapter {
             count
         );
 
-        match self.fs.client_fsync().await {
+        match self.fs.wait_configured_durability().await {
             Ok(_) => {
                 debug!("commit successful for file {}", fileid);
                 self.fs
@@ -1205,5 +1205,100 @@ mod tests {
         entries1.sort();
         entries2.sort();
         assert_eq!(entries1, entries2);
+    }
+
+    #[tokio::test]
+    async fn nfs_commit_waits_for_configured_write_ack_barrier() {
+        use crate::fs::mutation::config::{
+            ClientDurabilityTarget, FilesystemWriteAckMode, FilesystemWriteAckSettings,
+            FilesystemWriteAckSource,
+        };
+        use std::time::Duration;
+        use tokio::sync::Notify;
+
+        let mut filesystem = ZeroFS::new_in_memory().await.unwrap();
+        filesystem.write_ack = FilesystemWriteAckSettings {
+            mode: FilesystemWriteAckMode::Materialized,
+            volatile_memory_bytes: 0,
+            volatile_max_operations: crate::fs::mutation::config::DEFAULT_VOLATILE_MAX_OPERATIONS,
+            source: FilesystemWriteAckSource::DefaultMaterialized,
+            client_durability_target: ClientDurabilityTarget::LocalSsd,
+        };
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        filesystem.flush_coordinator.set_local_durability_barrier({
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            Arc::new(move || {
+                let entered = Arc::clone(&entered);
+                let release = Arc::clone(&release);
+                Box::pin(async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    Ok(())
+                })
+            })
+        });
+        let filesystem = Arc::new(filesystem);
+        let adapter = NFSAdapter::new(Arc::clone(&filesystem));
+
+        let mut commit = tokio::spawn(async move { adapter.commit(&test_auth(), 0, 0, 0).await });
+        entered.notified().await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut commit)
+                .await
+                .is_err(),
+            "NFS COMMIT returned before the configured write-ack barrier completed"
+        );
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), commit)
+            .await
+            .expect("NFS COMMIT did not resume")
+            .expect("NFS COMMIT panicked")
+            .expect("NFS COMMIT failed");
+    }
+
+    #[tokio::test]
+    async fn nfs_write_returns_without_waiting_for_write_ack_barrier() {
+        use crate::fs::mutation::config::{
+            ClientDurabilityTarget, FilesystemWriteAckMode, FilesystemWriteAckSettings,
+            FilesystemWriteAckSource,
+        };
+        use std::time::Duration;
+        use tokio::sync::Notify;
+
+        let mut filesystem = ZeroFS::new_in_memory().await.unwrap();
+        filesystem.write_ack = FilesystemWriteAckSettings {
+            mode: FilesystemWriteAckMode::Materialized,
+            volatile_memory_bytes: 0,
+            volatile_max_operations: crate::fs::mutation::config::DEFAULT_VOLATILE_MAX_OPERATIONS,
+            source: FilesystemWriteAckSource::DefaultMaterialized,
+            client_durability_target: ClientDurabilityTarget::LocalSsd,
+        };
+        let filesystem = Arc::new(filesystem);
+        let adapter = NFSAdapter::new(Arc::clone(&filesystem));
+        let file_id = adapter
+            .create_exclusive(&test_auth(), 0, &filename(b"ack.txt"))
+            .await
+            .unwrap();
+        filesystem.flush_coordinator.set_local_durability_barrier({
+            let release = Arc::new(Notify::new());
+            Arc::new(move || {
+                let release = Arc::clone(&release);
+                Box::pin(async move {
+                    release.notified().await;
+                    Ok(())
+                })
+            })
+        });
+
+        let fattr = tokio::time::timeout(
+            Duration::from_secs(2),
+            adapter.write(&test_auth(), file_id, 0, b"hello"),
+        )
+        .await
+        .expect("NFS WRITE waited for the durability barrier")
+        .expect("NFS WRITE failed");
+        assert_eq!(fattr.size, 5);
     }
 }

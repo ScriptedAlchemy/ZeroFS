@@ -5,6 +5,7 @@
 //! configuration contract ([`config::FilesystemWriteAckSettings`]); the
 //! admission and overlay runtime lands in follow-up work.
 
+pub(crate) mod ack;
 pub(crate) mod config;
 
 pub(crate) mod request_cache;
