@@ -133,11 +133,11 @@ impl RawMutationBudget {
             if let Some(error) = &state.terminal {
                 return Err(error.clone());
             }
+            // Transient concurrency pressure, not a permanently oversized
+            // request: surface it as retryable backpressure (JUKEBOX/EAGAIN),
+            // never as NoSpace, which clients treat as fatal.
             if state.used_operations >= self.inner.max_operations {
-                return Err(MutationError::TooLarge {
-                    requested: 1,
-                    capacity: self.inner.max_operations,
-                });
+                return Err(MutationError::Backpressure);
             }
             state.used_operations += 1;
             if state.waiters.is_empty()
