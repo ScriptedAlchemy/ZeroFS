@@ -19,12 +19,90 @@ use crate::fs::{ZeroFS, get_current_time};
 use ::tracing::debug;
 use bytes::Bytes;
 use std::collections::BTreeSet;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 #[cfg(feature = "failpoints")]
 use crate::failpoints as fp;
 #[cfg(feature = "failpoints")]
 use fp::fail_point;
+
+struct SettledWrite {
+    id: InodeId,
+    offset: u64,
+    length: u64,
+    new_size: u64,
+}
+
+/// Write-side state that must remain owned until the canonical commit result.
+/// The commit worker consumes it before publishing protocol replay or replies.
+pub(crate) struct PostCommitSettlement {
+    extent_store: ExtentStore,
+    tail_updates: Vec<(InodeId, crate::fs::store::extent::TailUpdate)>,
+    inflight_extents: Vec<crate::fs::store::extent::InflightWriteGuard>,
+    quota: Vec<crate::fs::quota::ProvisionalQuotaReservation>,
+    stats: Arc<crate::fs::metrics::FileSystemStats>,
+    tracer: crate::fs::tracing::AccessTracer,
+    inode_store: crate::fs::store::InodeStore,
+    writes: Vec<SettledWrite>,
+    started: std::time::Instant,
+}
+
+impl PostCommitSettlement {
+    fn new(
+        fs: &ZeroFS,
+        tail_updates: Vec<(InodeId, crate::fs::store::extent::TailUpdate)>,
+        inflight_extents: Vec<crate::fs::store::extent::InflightWriteGuard>,
+        quota: Vec<crate::fs::quota::ProvisionalQuotaReservation>,
+        writes: Vec<SettledWrite>,
+        started: std::time::Instant,
+    ) -> Self {
+        Self {
+            extent_store: fs.extent_store.clone(),
+            tail_updates,
+            inflight_extents,
+            quota,
+            stats: Arc::clone(&fs.stats),
+            tracer: fs.tracer.clone(),
+            inode_store: fs.inode_store.clone(),
+            writes,
+            started,
+        }
+    }
+
+    pub(crate) fn finish(self, result: Result<(), FsError>) {
+        if result.is_ok() {
+            for reservation in &self.quota {
+                reservation.accept();
+                reservation.canonical();
+            }
+            for (id, tail_update) in self.tail_updates {
+                self.extent_store.apply_tail_update(id, tail_update);
+            }
+            let elapsed = self.started.elapsed();
+            for write in self.writes {
+                debug!(
+                    "Write processed successfully for inode {}, new size: {}, took: {:?}",
+                    write.id, write.new_size, elapsed
+                );
+                self.stats
+                    .bytes_written
+                    .fetch_add(write.length, Ordering::Relaxed);
+                self.stats.write_operations.fetch_add(1, Ordering::Relaxed);
+                self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
+                self.tracer.emit(
+                    &self.inode_store,
+                    write.id,
+                    FileOperation::Write {
+                        offset: write.offset,
+                        length: write.length,
+                    },
+                );
+            }
+        }
+        drop(self.inflight_extents);
+    }
+}
 
 /// Borrowed filesystem view used by [`prepare_write`].
 pub(crate) struct WritePrepareContext<'a> {
@@ -126,7 +204,9 @@ impl ZeroFS {
         pending_write_request: Option<crate::dedup::PendingWriteRequest>,
     ) -> Result<FileAttributes, FsError> {
         let mut batch = prepare_write(&self.write_prepare_context(), request).await?;
-        batch.pending_write_request = pending_write_request;
+        batch.commit_ownership = pending_write_request
+            .map(crate::fs::write_coordinator::CommitOwnership::Dedup)
+            .unwrap_or_default();
         let result = apply_prepared_batch(&self.write_apply_context(), &mut batch).await?;
         Ok(result.primary_attrs())
     }
@@ -286,7 +366,7 @@ pub(crate) async fn prepare_write(
         members: prepared_members,
         replayed: None,
         guards: Some(guards),
-        pending_write_request: None,
+        commit_ownership: crate::fs::write_coordinator::CommitOwnership::None,
     })
 }
 
@@ -387,53 +467,41 @@ pub(crate) async fn apply_prepared_batch(
         }
     }
 
-    let pending = match batch.pending_write_request.take() {
-        Some(request) => fs
-            .write_coordinator
-            .submit_with_write_request(txn, request)?,
-        None => fs.write_coordinator.submit(txn)?,
-    };
+    let quota = batch
+        .members
+        .iter_mut()
+        .filter_map(|member| member.quota.take())
+        .collect();
+    let writes = batch
+        .members
+        .iter()
+        .filter(|member| !member.data.is_empty())
+        .map(|member| SettledWrite {
+            id: member.id,
+            offset: member.offset,
+            length: member.data.len() as u64,
+            new_size: member.new_size,
+        })
+        .collect();
+    let settlement = PostCommitSettlement::new(
+        fs,
+        tail_updates,
+        queued_extents,
+        quota,
+        writes,
+        batch.start_time,
+    );
+    let pending = fs.write_coordinator.submit_owned(
+        txn,
+        std::mem::take(&mut batch.commit_ownership),
+        crate::fs::write_coordinator::CommitSettlement::Write(settlement),
+    )?;
     batch.guards = None;
     pending.wait().await?;
-    for member in &batch.members {
-        if let Some(reservation) = &member.quota {
-            reservation.accept();
-            reservation.canonical();
-        }
-    }
     debug!("DB write took: {:?}", db_write_start.elapsed());
-
-    for (id, tail_update) in tail_updates {
-        fs.extent_store.apply_tail_update(id, tail_update);
-    }
-    drop(queued_extents);
 
     #[cfg(feature = "failpoints")]
     fail_point!(fp::WRITE_AFTER_COMMIT);
-
-    let elapsed = batch.start_time.elapsed();
-    for member in &batch.members {
-        if member.data.is_empty() {
-            continue;
-        }
-        debug!(
-            "Write processed successfully for inode {}, new size: {}, took: {:?}",
-            member.id, member.new_size, elapsed
-        );
-        fs.stats
-            .bytes_written
-            .fetch_add(member.data.len() as u64, Ordering::Relaxed);
-        fs.stats.write_operations.fetch_add(1, Ordering::Relaxed);
-        fs.stats.total_operations.fetch_add(1, Ordering::Relaxed);
-        fs.tracer.emit(
-            &fs.inode_store,
-            member.id,
-            FileOperation::Write {
-                offset: member.offset,
-                length: member.data.len() as u64,
-            },
-        );
-    }
 
     Ok(PreparedBatchResult {
         members: batch
@@ -467,12 +535,11 @@ async fn empty_batch_result(
                 },
             );
         }
-        let pending = match batch.pending_write_request.take() {
-            Some(request) => fs
-                .write_coordinator
-                .submit_with_write_request(txn, request)?,
-            None => fs.write_coordinator.submit(txn)?,
-        };
+        let pending = fs.write_coordinator.submit_owned(
+            txn,
+            std::mem::take(&mut batch.commit_ownership),
+            crate::fs::write_coordinator::CommitSettlement::None,
+        )?;
         pending.wait().await?;
     }
     Ok(result)
