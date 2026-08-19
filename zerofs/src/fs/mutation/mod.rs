@@ -13,6 +13,7 @@
 pub(crate) mod ack;
 pub(crate) mod admission;
 pub(crate) mod config;
+pub(crate) mod durability;
 pub(crate) mod fence;
 pub(crate) mod materializer;
 pub(crate) mod overlay;

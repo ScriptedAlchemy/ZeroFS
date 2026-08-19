@@ -34,6 +34,15 @@ use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{Mutex, Notify, OwnedMutexGuard};
 use uuid::Uuid;
 
+/// Object-writeback durability failure. Local and remote terminals stay distinct.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum WritebackError {
+    #[error(transparent)]
+    Local(#[from] LocalBarrierError),
+    #[error(transparent)]
+    Remote(#[from] RemoteBarrierError),
+}
+
 const KEY_LOCK_SHARDS: usize = 256;
 
 #[derive(Clone)]
@@ -251,6 +260,39 @@ impl WritebackObjectStore {
 
     pub async fn wait_remote(&self, sequence: u64) -> Result<(), RemoteBarrierError> {
         self.inner.remote.barrier().wait_remote(sequence).await
+    }
+
+    pub(crate) fn journal_incarnation(&self) -> uuid::Uuid {
+        self.inner.incarnation
+    }
+
+    /// Conservative newest accepted sequence. Callers capture this while the
+    /// filesystem flush barrier is held so later object mutations cannot commit
+    /// without being included.
+    pub(crate) fn accepted_sequence(&self) -> crate::writeback::model::Sequence {
+        self.inner.next_sequence.load(Ordering::Acquire)
+    }
+
+    pub(crate) async fn wait_local_coverage(
+        &self,
+        journal_incarnation: uuid::Uuid,
+        sequence: crate::writeback::model::Sequence,
+    ) -> Result<(), LocalBarrierError> {
+        if journal_incarnation != self.inner.incarnation {
+            return Err(LocalBarrierError::StaleIncarnation);
+        }
+        self.wait_local(sequence).await
+    }
+
+    pub(crate) async fn wait_remote_coverage(
+        &self,
+        journal_incarnation: uuid::Uuid,
+        sequence: crate::writeback::model::Sequence,
+    ) -> Result<(), RemoteBarrierError> {
+        if journal_incarnation != self.inner.incarnation {
+            return Err(RemoteBarrierError::StaleIncarnation);
+        }
+        self.wait_remote(sequence).await
     }
 
     pub(crate) fn space_sampler(&self) -> &Arc<PhysicalSpaceSampler> {
@@ -4645,6 +4687,50 @@ mod tests {
             elapsed.as_secs_f64(),
         );
 
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn coverage_wait_rejects_a_stale_journal_incarnation() {
+        let (store, _, _temp) = test_store().await;
+        let sequence = store.accepted_sequence();
+        assert_eq!(
+            store
+                .wait_local_coverage(Uuid::nil(), sequence)
+                .await
+                .unwrap_err(),
+            crate::writeback::journaler::LocalBarrierError::StaleIncarnation
+        );
+        assert_eq!(
+            store
+                .wait_remote_coverage(Uuid::nil(), sequence)
+                .await
+                .unwrap_err(),
+            crate::writeback::remote::RemoteBarrierError::StaleIncarnation
+        );
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn coverage_wait_uses_the_captured_accepted_sequence() {
+        let (store, _, _temp) = test_store().await;
+        store
+            .put(
+                &Path::from("zerofs/pilot/coverage"),
+                Bytes::from_static(b"one").into(),
+            )
+            .await
+            .unwrap();
+        let incarnation = store.journal_incarnation();
+        let sequence = store.accepted_sequence();
+        assert!(
+            sequence >= 1,
+            "accepted coverage must include the just-admitted put"
+        );
+        store
+            .wait_local_coverage(incarnation, sequence)
+            .await
+            .unwrap();
         store.shutdown().await.unwrap();
     }
 }

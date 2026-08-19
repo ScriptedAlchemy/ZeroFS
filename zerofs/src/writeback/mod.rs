@@ -29,6 +29,7 @@ pub(crate) mod reservation;
 pub(crate) mod space_refresher;
 pub(crate) mod space_sample;
 pub mod store;
+pub use store::WritebackError;
 #[cfg(test)]
 mod test_util;
 

@@ -2,6 +2,10 @@ use crate::db::Db;
 #[cfg(feature = "failpoints")]
 use crate::failpoints::{self as fp, fail_point};
 use crate::fs::errors::FsError;
+use crate::fs::mutation::durability::{
+    DurabilityError, DurabilityReceipt, DurabilityTarget, ObjectCoverage,
+};
+use crate::fs::mutation::types::MutationCutoff;
 use crate::task::spawn_named;
 use std::future::Future;
 use std::pin::Pin;
@@ -15,6 +19,20 @@ type SealHook =
     Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Result<(), FsError>> + Send>> + Send + Sync>;
 type LocalDurabilityHook =
     Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Result<(), FsError>> + Send>> + Send + Sync>;
+type MaterializeHook = Arc<
+    dyn Fn(MutationCutoff) -> Pin<Box<dyn Future<Output = Result<(), DurabilityError>> + Send>>
+        + Send
+        + Sync,
+>;
+type CaptureHook = Arc<dyn Fn() -> ObjectCoverage + Send + Sync>;
+type ObjectWaitHook = Arc<
+    dyn Fn(
+            ObjectCoverage,
+            DurabilityTarget,
+        ) -> Pin<Box<dyn Future<Output = Result<(), DurabilityError>> + Send>>
+        + Send
+        + Sync,
+>;
 type Reply = oneshot::Sender<Result<(), FsError>>;
 
 /// Move-only evidence that the shared flush coordinator completed a durability
@@ -42,6 +60,9 @@ pub struct FlushCoordinator {
     sender: mpsc::UnboundedSender<Request>,
     seal_hook: Arc<OnceLock<SealHook>>,
     local_durability_hook: Arc<OnceLock<LocalDurabilityHook>>,
+    materialize_hook: Arc<OnceLock<MaterializeHook>>,
+    object_capture: Arc<OnceLock<CaptureHook>>,
+    object_wait: Arc<OnceLock<ObjectWaitHook>>,
     db: Arc<Db>,
     worker: Arc<Mutex<Option<JoinHandle<()>>>>,
     worker_abort: AbortHandle,
@@ -60,6 +81,9 @@ impl FlushCoordinator {
         let hook = Arc::clone(&seal_hook);
         let local_durability_hook: Arc<OnceLock<LocalDurabilityHook>> = Arc::new(OnceLock::new());
         let local_durability = Arc::clone(&local_durability_hook);
+        let materialize_hook: Arc<OnceLock<MaterializeHook>> = Arc::new(OnceLock::new());
+        let object_capture: Arc<OnceLock<CaptureHook>> = Arc::new(OnceLock::new());
+        let object_wait: Arc<OnceLock<ObjectWaitHook>> = Arc::new(OnceLock::new());
         let (sender, mut receiver) = mpsc::unbounded_channel::<Request>();
         #[cfg(test)]
         let requested_flushes = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -88,7 +112,7 @@ impl FlushCoordinator {
                 // A close keeps the barrier through db.close(), leaving no gap
                 // in which a FrameLoc can commit after the final seal.
                 let barrier = worker_db.flush_barrier().write_owned().await;
-                let result = match hook.get() {
+                let sealed = match hook.get() {
                     Some(seal) => match seal().await {
                         Ok(()) => {
                             #[cfg(feature = "failpoints")]
@@ -99,22 +123,31 @@ impl FlushCoordinator {
                     },
                     None => worker_db.flush().await.map_err(|_| FsError::IoError),
                 };
-                let result = match (result, local_durability.get()) {
-                    (Ok(()), Some(wait_local)) => wait_local().await,
-                    (result, _) => result,
-                };
-
-                let close_result = if closer.is_some() && result.is_ok() {
+                let close_result = if closer.is_some() && sealed.is_ok() {
                     worker_db.mark_closing();
                     worker_db.close().await.map_err(|_| FsError::IoError)
                 } else {
-                    result
+                    sealed
                 };
                 #[cfg(test)]
-                if result.is_ok() {
+                if sealed.is_ok() {
                     flush_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 drop(barrier);
+                let should_wait = if closer.is_some() {
+                    close_result.is_ok()
+                } else {
+                    sealed.is_ok()
+                };
+                let result = if should_wait {
+                    match local_durability.get() {
+                        Some(wait_local) => wait_local().await,
+                        None => Ok(()),
+                    }
+                } else {
+                    sealed
+                };
+                let close_result = close_result.and(result);
 
                 #[cfg(feature = "failpoints")]
                 fail_point!(fp::FLUSH_AFTER_COMPLETE);
@@ -141,6 +174,9 @@ impl FlushCoordinator {
             sender,
             seal_hook,
             local_durability_hook,
+            materialize_hook,
+            object_capture,
+            object_wait,
             db,
             worker: Arc::new(Mutex::new(Some(worker))),
             worker_abort,
@@ -164,6 +200,68 @@ impl FlushCoordinator {
     /// accepted object mutation and wait until the SSD journal covers it.
     pub fn set_local_durability_barrier(&self, hook: LocalDurabilityHook) {
         let _ = self.local_durability_hook.set(hook);
+    }
+
+    pub(crate) fn set_materialize(&self, hook: MaterializeHook) {
+        let _ = self.materialize_hook.set(hook);
+    }
+
+    pub(crate) fn set_object_capture(&self, hook: CaptureHook) {
+        let _ = self.object_capture.set(hook);
+    }
+
+    pub(crate) fn set_object_wait(&self, hook: ObjectWaitHook) {
+        let _ = self.object_wait.set(hook);
+    }
+
+    /// Materialize `cutoff`, then seal+flush+capture under the database
+    /// barrier, then wait the requested object target after releasing it.
+    pub(crate) async fn durable_through(
+        &self,
+        cutoff: MutationCutoff,
+        target: DurabilityTarget,
+    ) -> Result<DurabilityReceipt, DurabilityError> {
+        if let Some(materialize) = self.materialize_hook.get() {
+            materialize(cutoff).await?;
+        }
+
+        let coverage = self.capture_under_barrier().await?;
+        self.wait_object(coverage, target).await?;
+        Ok(DurabilityReceipt {
+            mutation_cutoff: cutoff,
+            object_coverage: coverage,
+            target,
+        })
+    }
+
+    async fn capture_under_barrier(&self) -> Result<ObjectCoverage, DurabilityError> {
+        let _barrier = self.db.flush_barrier().write_owned().await;
+        if let Some(seal) = self.seal_hook.get() {
+            seal().await.map_err(DurabilityError::from_flush)?;
+        }
+        self.db
+            .flush()
+            .await
+            .map_err(DurabilityError::FilesystemFlush)?;
+        Ok(self
+            .object_capture
+            .get()
+            .map(|capture| capture())
+            .unwrap_or(ObjectCoverage::DirectRemote))
+    }
+
+    async fn wait_object(
+        &self,
+        coverage: ObjectCoverage,
+        target: DurabilityTarget,
+    ) -> Result<(), DurabilityError> {
+        match self.object_wait.get() {
+            Some(wait) => wait(coverage, target).await,
+            None => match coverage {
+                ObjectCoverage::DirectRemote => Ok(()),
+                ObjectCoverage::Writeback { .. } => Err(DurabilityError::Closed),
+            },
+        }
     }
 
     pub async fn flush(&self) -> Result<(), FsError> {
@@ -241,5 +339,187 @@ impl FlushCoordinator {
             Err(error) if error.is_cancelled() => Ok(()),
             Err(_) => Err(FsError::IoError),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FlushCoordinator;
+    use crate::fs::ZeroFS;
+    use crate::fs::errors::FsError;
+    use crate::fs::mutation::durability::{DurabilityError, DurabilityTarget, ObjectCoverage};
+    use crate::fs::mutation::types::{MutationCutoff, MutationIncarnation};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tokio::sync::Notify;
+    use uuid::Uuid;
+
+    fn cutoff(sequence: u64) -> MutationCutoff {
+        MutationCutoff {
+            mutation_incarnation: MutationIncarnation::new(),
+            sequence,
+        }
+    }
+
+    async fn isolated_coordinator() -> (ZeroFS, FlushCoordinator) {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let coordinator = FlushCoordinator::new(Arc::clone(&fs.db));
+        (fs, coordinator)
+    }
+
+    #[tokio::test]
+    async fn seal_and_flush_complete_before_object_capture() {
+        let (_fs, coordinator) = isolated_coordinator().await;
+        let order = Arc::new(Mutex::new(Vec::new()));
+        coordinator.set_sealer({
+            let order = Arc::clone(&order);
+            Arc::new(move || {
+                order.lock().unwrap().push("seal");
+                Box::pin(async { Ok(()) })
+            })
+        });
+        coordinator.set_object_capture({
+            let order = Arc::clone(&order);
+            Arc::new(move || {
+                order.lock().unwrap().push("capture");
+                ObjectCoverage::DirectRemote
+            })
+        });
+
+        let _receipt = coordinator
+            .durable_through(cutoff(0), DurabilityTarget::RemoteBackend)
+            .await
+            .unwrap();
+        assert_eq!(*order.lock().unwrap(), ["seal", "capture"]);
+    }
+
+    #[tokio::test]
+    async fn object_capture_holds_the_flush_barrier() {
+        let (fs, coordinator) = isolated_coordinator().await;
+        let held = Arc::new(Mutex::new(false));
+        coordinator.set_object_capture({
+            let held = Arc::clone(&held);
+            let barrier = fs.db.flush_barrier();
+            Arc::new(move || {
+                *held.lock().unwrap() = barrier.try_write().is_err();
+                ObjectCoverage::DirectRemote
+            })
+        });
+        let _receipt = coordinator
+            .durable_through(cutoff(0), DurabilityTarget::RemoteBackend)
+            .await
+            .unwrap();
+        assert!(
+            *held.lock().unwrap(),
+            "object capture must run while the database flush barrier is held"
+        );
+    }
+
+    #[tokio::test]
+    async fn object_wait_runs_after_barrier_release() {
+        let (fs, coordinator) = isolated_coordinator().await;
+        let released = Arc::new(Mutex::new(false));
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        coordinator.set_object_capture(Arc::new(|| ObjectCoverage::Writeback {
+            journal_incarnation: crate::fs::mutation::durability::JournalIncarnation::new(
+                Uuid::nil(),
+            ),
+            sequence: 1,
+        }));
+        coordinator.set_object_wait({
+            let released = Arc::clone(&released);
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            let barrier = fs.db.flush_barrier();
+            Arc::new(move |_, _| {
+                let released = Arc::clone(&released);
+                let entered = Arc::clone(&entered);
+                let release = Arc::clone(&release);
+                let barrier = Arc::clone(&barrier);
+                Box::pin(async move {
+                    *released.lock().unwrap() = barrier.try_write().is_ok();
+                    entered.notify_one();
+                    release.notified().await;
+                    Ok(())
+                })
+            })
+        });
+
+        let mut wait = tokio::spawn({
+            let coordinator = coordinator.clone();
+            async move {
+                coordinator
+                    .durable_through(cutoff(1), DurabilityTarget::LocalSsd)
+                    .await
+            }
+        });
+        entered.notified().await;
+        assert!(
+            *released.lock().unwrap(),
+            "object wait must run after the database flush barrier is released"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut wait)
+                .await
+                .is_err(),
+            "durable_through returned before the object wait finished"
+        );
+        release.notify_one();
+        let _receipt = wait
+            .await
+            .expect("durable_through task panicked")
+            .expect("durable_through failed");
+    }
+
+    #[tokio::test]
+    async fn seal_failure_does_not_capture_or_wait() {
+        let (_fs, coordinator) = isolated_coordinator().await;
+        let captured = Arc::new(Mutex::new(false));
+        let waited = Arc::new(Mutex::new(false));
+        coordinator.set_sealer(Arc::new(|| Box::pin(async { Err(FsError::IoError) })));
+        coordinator.set_object_capture({
+            let captured = Arc::clone(&captured);
+            Arc::new(move || {
+                *captured.lock().unwrap() = true;
+                ObjectCoverage::DirectRemote
+            })
+        });
+        coordinator.set_object_wait({
+            let waited = Arc::clone(&waited);
+            Arc::new(move |_, _| {
+                *waited.lock().unwrap() = true;
+                Box::pin(async { Ok(()) })
+            })
+        });
+        let result = coordinator
+            .durable_through(cutoff(0), DurabilityTarget::RemoteBackend)
+            .await;
+        assert!(matches!(result, Err(DurabilityError::FilesystemFlush(_))));
+        assert!(!*captured.lock().unwrap());
+        assert!(!*waited.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn local_hook_waits_after_flush_barrier_release() {
+        let (fs, coordinator) = isolated_coordinator().await;
+        let released = Arc::new(Mutex::new(false));
+        coordinator.set_local_durability_barrier({
+            let released = Arc::clone(&released);
+            let barrier = fs.db.flush_barrier();
+            Arc::new(move || {
+                let released = Arc::clone(&released);
+                let barrier = Arc::clone(&barrier);
+                Box::pin(async move {
+                    *released.lock().unwrap() = barrier.try_write().is_ok();
+                    Ok(())
+                })
+            })
+        });
+        coordinator.flush().await.unwrap();
+        assert!(
+            *released.lock().unwrap(),
+            "the local durability hook must not hold the database flush barrier"
+        );
     }
 }
