@@ -162,14 +162,12 @@ impl WritebackConfig {
                 }
                 explicit
             }
-            // One upload per SFTP write stream by default; an explicitly
-            // lowered transport budget lowers the default with it instead of
-            // turning into a validation error.
-            None => sftp_write_concurrency
-                .map_or(default_upload_concurrency(), |limit| {
-                    default_upload_concurrency().min(limit)
-                })
-                .max(1),
+            // SFTP has its own stream-aware default. Other backends retain the
+            // conservative generic default instead of inheriting SFTP tuning.
+            None => match sftp_write_concurrency {
+                Some(limit) => default_sftp_upload_concurrency().min(limit).max(1),
+                None => default_upload_concurrency(),
+            },
         };
 
         Ok(Some(WritebackSettings {
@@ -195,11 +193,14 @@ const fn default_resume_percent() -> u8 {
     85
 }
 
-// Fill the SFTP write-stream budget. Per-session russh-sftp now pipelines 64
-// WRITE requests, so the leftover default of 4 upload lanes was leaving
-// remote publication idle. Seven lanes still sit under the 8-session account
-// cap and leave one slot for reads/control.
+// Conservative default shared by non-SFTP backends.
 const fn default_upload_concurrency() -> usize {
+    4
+}
+
+// Fill the SFTP write-stream budget. Per-session russh-sftp pipelines 64 WRITE
+// requests; seven lanes remain below the default eight-session pool budget.
+const fn default_sftp_upload_concurrency() -> usize {
     7
 }
 
@@ -246,4 +247,38 @@ fn normalize_absolute_path(path: &Path, name: &str) -> Result<PathBuf> {
             }
         })
         .with_context(|| format!("failed to normalize {name}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn enabled_writeback() -> WritebackConfig {
+        WritebackConfig {
+            enabled: true,
+            dir: std::env::temp_dir().join("zerofs-writeback-default-test"),
+            memory_size_gb: 1.0,
+            disk_size_gb: 1.0,
+            min_free_gb: 1.0,
+            ..WritebackConfig::default()
+        }
+    }
+
+    #[test]
+    fn default_upload_lanes_are_backend_aware() {
+        let config = enabled_writeback();
+        let clean_cache = std::env::temp_dir().join("zerofs-clean-cache-default-test");
+
+        let generic = config
+            .normalize(&clean_cache, None, WritebackAccessMode::ReadWrite, false)
+            .unwrap()
+            .unwrap();
+        let sftp = config
+            .normalize(&clean_cache, Some(8), WritebackAccessMode::ReadWrite, false)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(generic.upload_concurrency, 4);
+        assert_eq!(sftp.upload_concurrency, 7);
+    }
 }
