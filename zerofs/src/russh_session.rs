@@ -1419,8 +1419,8 @@ EoKHvFGzOKXUl8wiz1GPAAAAEXplcm9mcy1vdGhlci10ZXN0AQIDBA==
         endpoint: crate::config::SftpEndpoint,
         identity: PathBuf,
         known_hosts: PathBuf,
-        inflight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-        peak: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        _inflight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        _peak: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl Loopback {
@@ -1612,8 +1612,8 @@ EoKHvFGzOKXUl8wiz1GPAAAAEXplcm9mcy1vdGhlci10ZXN0AQIDBA==
                 },
                 identity,
                 known_hosts,
-                inflight,
-                peak,
+                _inflight: inflight,
+                _peak: peak,
             }
         }
     }
