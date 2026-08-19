@@ -17,6 +17,15 @@ NBD_DEVICE = "/dev/nbd7"
 
 
 @dataclass(frozen=True, slots=True)
+class ResourceOwnership:
+    kind: str
+    value: str | int
+
+    def to_dict(self) -> dict[str, str | int]:
+        return {"kind": self.kind, "value": self.value}
+
+
+@dataclass(frozen=True, slots=True)
 class Step:
     """One real command in a scenario plan."""
 
@@ -24,6 +33,8 @@ class Step:
     argv: tuple[str, ...]
     sudo: bool = False
     cwd: str | None = None
+    acquires: tuple[ResourceOwnership, ...] = ()
+    releases: tuple[ResourceOwnership, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -31,6 +42,8 @@ class Step:
             "argv": list(self.argv),
             "sudo": self.sudo,
             "cwd": self.cwd,
+            "acquires": [resource.to_dict() for resource in self.acquires],
+            "releases": [resource.to_dict() for resource in self.releases],
         }
 
 
@@ -41,16 +54,18 @@ class ScenarioPlan:
     steps: tuple[Step, ...]
     durability_floors: tuple[DurabilityFloor, ...]
     tools: tuple[str, ...] = ()
+    requires_observed_durability: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "name": self.name,
             "legs": list(self.legs),
             "steps": [step.to_dict() for step in self.steps],
-            "durability_floors": [
+            "expected_durability": [
                 floor.to_dict() for floor in self.durability_floors
             ],
             "tools": list(self.tools),
+            "requires_observed_durability": self.requires_observed_durability,
         }
 
 
@@ -68,7 +83,10 @@ def _mountpoint(config: HarnessConfig, leg: str) -> Path:
     return validate_owned_path(config.mount_root / leg, config.resource_root)
 
 
-def server_steps(context: ScenarioContext) -> tuple[Step, ...]:
+def server_steps(
+    context: ScenarioContext,
+    listeners: tuple[ResourceOwnership, ...] = (),
+) -> tuple[Step, ...]:
     unit = context.config.unit_name
     return (
         Step(
@@ -83,17 +101,23 @@ def server_steps(context: ScenarioContext) -> tuple[Step, ...]:
                 str(context.zerofs_config),
             ),
             sudo=True,
+            acquires=(ResourceOwnership("process", unit),) + listeners,
         ),
         Step("wait for protocol listeners", ("sleep", "3")),
     )
 
 
-def server_stop_steps(context: ScenarioContext) -> tuple[Step, ...]:
+def server_stop_steps(
+    context: ScenarioContext,
+    listeners: tuple[ResourceOwnership, ...] = (),
+) -> tuple[Step, ...]:
     return (
         Step(
             "stop the run-scoped ZeroFS instance",
             ("systemctl", "stop", context.config.unit_name),
             sudo=True,
+            releases=listeners
+            + (ResourceOwnership("process", context.config.unit_name),),
         ),
     )
 
@@ -104,6 +128,7 @@ def server_crash_steps(context: ScenarioContext) -> tuple[Step, ...]:
             "SIGKILL the run-scoped ZeroFS instance at the crash boundary",
             ("systemctl", "kill", "-s", "KILL", context.config.unit_name),
             sudo=True,
+            releases=(ResourceOwnership("process", context.config.unit_name),),
         ),
     )
 
@@ -120,6 +145,7 @@ def nfs_mount_steps(config: HarnessConfig) -> tuple[Step, ...]:
             "hard NFSv3 kernel mount against the run-scoped server",
             ("mount.nfs", "127.0.0.1:/", str(mountpoint), "-o", options),
             sudo=True,
+            acquires=(ResourceOwnership("mount", str(mountpoint)),),
         ),
     )
 
@@ -148,6 +174,9 @@ def nfs_unmount_steps(config: HarnessConfig) -> tuple[Step, ...]:
             "unmount the NFS leg",
             ("umount", str(_mountpoint(config, "nfs"))),
             sudo=True,
+            releases=(
+                ResourceOwnership("mount", str(_mountpoint(config, "nfs"))),
+            ),
         ),
     )
 
@@ -163,6 +192,7 @@ def ninep_mount_steps(config: HarnessConfig) -> tuple[Step, ...]:
             "v9fs kernel mount against the run-scoped server",
             ("mount", "-t", "9p", "-o", options, "127.0.0.1", str(mountpoint)),
             sudo=True,
+            acquires=(ResourceOwnership("mount", str(mountpoint)),),
         ),
     )
 
@@ -208,6 +238,9 @@ def ninep_unmount_steps(config: HarnessConfig) -> tuple[Step, ...]:
             "unmount the 9P leg",
             ("umount", str(_mountpoint(config, "ninep"))),
             sudo=True,
+            releases=(
+                ResourceOwnership("mount", str(_mountpoint(config, "ninep"))),
+            ),
         ),
     )
 
@@ -226,6 +259,7 @@ def nbd_connect_steps(config: HarnessConfig) -> tuple[Step, ...]:
                 "-persist",
             ),
             sudo=True,
+            acquires=(ResourceOwnership("device", NBD_DEVICE),),
         ),
     )
 
@@ -264,53 +298,113 @@ def nbd_disconnect_steps(config: HarnessConfig) -> tuple[Step, ...]:
             "detach the disposable NBD device",
             ("nbd-client", "-d", NBD_DEVICE),
             sudo=True,
+            releases=(ResourceOwnership("device", NBD_DEVICE),),
         ),
     )
 
 
 def rpc_steps(context: ScenarioContext) -> tuple[Step, ...]:
     socket = context.config.run_root / "rpc.sock"
+    proto_root = context.config.source_root / "zerofs" / "proto"
+    directory = f"/tiered-rpc-{context.config.run_uuid}"
+    common = (
+        "-plaintext",
+        "-import-path",
+        str(proto_root),
+        "-proto",
+        "admin.proto",
+    )
     return (
         Step(
-            "exercise the production gRPC service over its Unix socket",
+            "create a directory through the production TCP admin RPC",
             (
                 "grpcurl",
-                "-plaintext",
-                "-unix",
-                str(socket),
-                "list",
+                *common,
+                "-d",
+                f'{{"path":"{directory}","mode":493,"uid":0,"gid":0}}',
+                f"127.0.0.1:{RPC_PORT}",
+                "zerofs.admin.AdminService/CreateDirectory",
             ),
         ),
         Step(
-            "exercise the production gRPC service over TCP",
+            "flush through the production Unix admin RPC",
             (
                 "grpcurl",
-                "-plaintext",
+                *common,
+                "-unix=true",
+                "-d",
+                "{}",
+                str(socket),
+                "zerofs.admin.AdminService/Flush",
+            ),
+        ),
+        Step(
+            "remove the directory through the production TCP admin RPC",
+            (
+                "grpcurl",
+                *common,
+                "-d",
+                f'{{"path":"{directory}"}}',
                 f"127.0.0.1:{RPC_PORT}",
-                "list",
+                "zerofs.admin.AdminService/RemoveDirectory",
             ),
         ),
     )
 
 
 def webui_steps(context: ScenarioContext) -> tuple[Step, ...]:
-    _ = context
+    source = context.config.resource_root / "webui-source.bin"
+    downloaded = context.config.resource_root / "webui-downloaded.bin"
+    target = f"ws://127.0.0.1:{WEBUI_PORT}/ws/9p"
+    destination = f"/tiered-webui-{context.config.run_uuid}.bin"
     return (
         Step(
-            "exercise the WebUI gRPC-Web endpoint the WASM client uses",
+            "create an incompressible WebUI upload source",
             (
-                "grpcurl",
-                "-plaintext",
-                f"127.0.0.1:{WEBUI_PORT}",
-                "list",
+                "dd",
+                "if=/dev/urandom",
+                f"of={source}",
+                "bs=1M",
+                "count=8",
+            ),
+            acquires=(ResourceOwnership("path", str(source)),),
+        ),
+        Step(
+            "upload bytes through the shipping WebSocket 9P client",
+            (
+                str(context.zerofs_binary),
+                "upload",
+                target,
+                str(source),
+                destination,
+                "--jobs",
+                "1",
             ),
         ),
         Step(
-            "exercise the WebUI WebSocket route",
+            "download bytes through the shipping WebSocket 9P client",
             (
-                "websocat",
-                "--one-message",
-                f"ws://127.0.0.1:{WEBUI_PORT}/ws",
+                str(context.zerofs_binary),
+                "download",
+                target,
+                destination,
+                str(downloaded),
+                "--jobs",
+                "1",
+            ),
+            acquires=(ResourceOwnership("path", str(downloaded)),),
+        ),
+        Step("compare the WebSocket round trip", ("cmp", str(source), str(downloaded))),
+        Step(
+            "remove the WebSocket proof from ZeroFS",
+            (str(context.zerofs_binary), "rm", target, destination),
+        ),
+        Step(
+            "remove local WebSocket proof files",
+            ("rm", "-f", "--", str(source), str(downloaded)),
+            releases=(
+                ResourceOwnership("path", str(source)),
+                ResourceOwnership("path", str(downloaded)),
             ),
         ),
     )
@@ -323,13 +417,30 @@ def _plan(
     steps: tuple[Step, ...],
     operations: tuple[str, ...],
     tools: tuple[str, ...] = (),
+    *,
+    requires_observed_durability: bool = False,
 ) -> ScenarioPlan:
+    listener_by_leg = {
+        "nfs": NFS_PORT,
+        "ninep": NINEP_PORT,
+        "nbd": NBD_PORT,
+        "rpc": RPC_PORT,
+        "webui": WEBUI_PORT,
+    }
+    listeners = tuple(
+        ResourceOwnership("listener", listener_by_leg[leg])
+        for leg in dict.fromkeys(legs)
+        if leg in listener_by_leg
+    )
     return ScenarioPlan(
         name=name,
         legs=legs,
-        steps=server_steps(context) + steps + server_stop_steps(context),
+        steps=server_steps(context, listeners)
+        + steps
+        + server_stop_steps(context, listeners),
         durability_floors=floors_for(context.config.ack, operations),
         tools=tools,
+        requires_observed_durability=requires_observed_durability,
     )
 
 
@@ -352,6 +463,7 @@ def _global_admission(context: ScenarioContext) -> ScenarioPlan:
         ("nbd", "nfs", "ninep"),
         steps,
         ("nbd-flush", "nfs-commit", "ninep-fsync"),
+        requires_observed_durability=True,
     )
 
 
@@ -389,6 +501,7 @@ def _cross_adapter_pending_read(context: ScenarioContext) -> ScenarioPlan:
         ("nfs", "ninep"),
         steps,
         ("cross-adapter-read",),
+        requires_observed_durability=True,
     )
 
 
@@ -408,6 +521,7 @@ def _nfs_commit_covers_prior_nbd(context: ScenarioContext) -> ScenarioPlan:
         ("nbd", "nfs"),
         steps,
         ("nfs-commit",),
+        requires_observed_durability=True,
     )
 
 
@@ -440,6 +554,7 @@ def _ninep_fsync_covers_prior_nfs(context: ScenarioContext) -> ScenarioPlan:
         ("nfs", "ninep"),
         steps,
         ("ninep-fsync",),
+        requires_observed_durability=True,
     )
 
 
@@ -471,6 +586,7 @@ def _nbd_flush_covers_prior_ninep(context: ScenarioContext) -> ScenarioPlan:
         ("ninep", "nbd"),
         steps,
         ("nbd-flush",),
+        requires_observed_durability=True,
     )
 
 
@@ -482,6 +598,7 @@ def _webui_rpc_production_path(context: ScenarioContext) -> ScenarioPlan:
         ("rpc", "webui"),
         steps,
         ("rpc-ack", "webui-ack"),
+        requires_observed_durability=True,
     )
 
 
@@ -506,6 +623,7 @@ def _protocol_materialized_control(context: ScenarioContext) -> ScenarioPlan:
         ("nfs", "ninep"),
         steps,
         ("nfs-commit", "ninep-fsync"),
+        requires_observed_durability=True,
     )
 
 
@@ -525,6 +643,7 @@ def _protocol_durability_target_control(context: ScenarioContext) -> ScenarioPla
         ("nfs", "ninep"),
         steps,
         ("nfs-commit", "ninep-fsync"),
+        requires_observed_durability=True,
     )
 
 

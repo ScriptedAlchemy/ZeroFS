@@ -55,7 +55,7 @@ from scripts.tiered_writeback_e2e.lifecycle import (
     SourceBusyError,
     assert_source_idle,
 )
-from scripts.tiered_writeback_e2e import linux_suites
+from scripts.tiered_writeback_e2e import linux_suites, protocols
 from scripts.tiered_writeback_e2e.protocols import ScenarioContext
 from scripts.vm100_pilot.runner import Runner
 
@@ -407,6 +407,25 @@ class ResourceLedgerTests(HarnessCase):
             {(kind, value) for kind, value, _ in ledger.outstanding()},
         )
 
+    def test_release_then_reacquire_restores_cleanup_ownership(self) -> None:
+        _, ledger = self.make_ledger()
+        ledger.record_resource("listener", 12049, generation=1)
+        ledger.record_release("listener", 12049)
+        ledger.record_resource("listener", 12049, generation=2)
+        self.assertEqual(
+            [entry for entry in ledger.outstanding() if entry[0] == "listener"],
+            [("listener", 12049, {"generation": 2})],
+        )
+
+    def test_duplicate_active_acquire_and_release_are_rejected(self) -> None:
+        _, ledger = self.make_ledger()
+        ledger.record_resource("listener", 12049)
+        with self.assertRaises(UnownedResourceError):
+            ledger.record_resource("listener", 12049)
+        ledger.record_release("listener", 12049)
+        with self.assertRaises(UnownedResourceError):
+            ledger.record_release("listener", 12049)
+
     def test_ledger_value_reads_dotted_keys(self) -> None:
         config, ledger = self.make_ledger()
         self.assertEqual(ledger.value("identity.run_uuid"), RUN_UUID)
@@ -728,10 +747,27 @@ class ScenarioPlanTests(HarnessCase):
         )
         self.assertIn(("nbd-client", "-d", "/dev/nbd7"), steps)
 
-    def test_webui_rpc_path_uses_real_grpc_and_websocket_clients(self) -> None:
+    def test_webui_rpc_path_mutates_rpc_and_moves_bytes_over_websocket(self) -> None:
         steps = self.steps_for("webui-rpc-production-path")
-        self.assertTrue(any(argv[0] == "grpcurl" for argv in steps))
-        self.assertTrue(any(argv[0] == "websocat" for argv in steps))
+        rpc_methods = {
+            argv[-1]
+            for argv in steps
+            if argv[0] == "grpcurl"
+        }
+        self.assertIn("zerofs.admin.AdminService/CreateDirectory", rpc_methods)
+        self.assertIn("zerofs.admin.AdminService/Flush", rpc_methods)
+        self.assertIn("zerofs.admin.AdminService/RemoveDirectory", rpc_methods)
+        self.assertFalse(any(argv[-1] == "list" for argv in steps))
+        uploads = [argv for argv in steps if len(argv) > 1 and argv[1] == "upload"]
+        downloads = [
+            argv for argv in steps if len(argv) > 1 and argv[1] == "download"
+        ]
+        self.assertEqual(len(uploads), 1)
+        self.assertEqual(len(downloads), 1)
+        self.assertIn("/ws/9p", uploads[0][2])
+        self.assertIn("/ws/9p", downloads[0][2])
+        self.assertTrue(any(argv[0] == "cmp" for argv in steps))
+        self.assertFalse(any(argv[0] == "websocat" for argv in steps))
 
     def test_benchmark_scenarios_require_a_matching_object_ack_mode(self) -> None:
         for name, required in (
@@ -882,11 +918,38 @@ class RunScenarioTests(HarnessCase):
         receipt = json.loads(Path(summary["receipt"]).read_text())
         self.assertEqual(receipt["scenario"], "global-admission-nbd-nfs-ninep")
         self.assertEqual(receipt["terminal_state"], "planned")
-        self.assertEqual(receipt["exit_status"], 0)
+        self.assertIsNone(receipt["exit_status"])
+        self.assertEqual(receipt["status"], "planned")
         self.assertTrue(receipt["manifest"]["steps"])
-        self.assertTrue(receipt["durability_floors"])
+        self.assertTrue(receipt["manifest"]["expected_durability"])
+        self.assertEqual(receipt["durability_floors"], [])
         for field in REQUIRED_RECEIPT_FIELDS:
             self.assertIn(field, receipt, field)
+
+    def test_c3_refuses_to_convert_ack_flags_into_observed_frontiers(self) -> None:
+        config = self.make_config(filesystem="volatile_memory", object_="memory")
+        lifecycle, runner, _, ledger = self.setup_run(config)
+        with self.assertRaisesRegex(LifecycleError, "observed typed durability"):
+            lifecycle.run_scenario(
+                ledger,
+                "webui-rpc-production-path",
+                zerofs_binary=self.binary,
+                zerofs_config=self.zerofs_config,
+                plan_only=False,
+            )
+        self.assertFalse(
+            any(args[0] in ("grpcurl", "websocat") for args, _ in runner.calls)
+        )
+        receipts = sorted(config.receipt_root.rglob("manifest.json"))
+        payloads = [json.loads(path.read_text()) for path in receipts]
+        payload = next(
+            candidate
+            for candidate in payloads
+            if candidate.get("scenario") == "webui-rpc-production-path"
+        )
+        self.assertEqual(payload["durability_floors"], [])
+        self.assertEqual(payload["terminal_state"], "failed")
+        self.assertEqual(payload["cleanup_status"], "ok")
 
     def test_execution_requires_linux(self) -> None:
         config = self.make_config()
@@ -934,7 +997,7 @@ class RunScenarioTests(HarnessCase):
             with self.assertRaises(PrimaryAndCleanupError) as caught:
                 lifecycle.run_scenario(
                     ledger,
-                    "global-admission-nbd-nfs-ninep",
+                    "benchmark-paced-remote",
                     zerofs_binary=self.binary,
                     zerofs_config=self.zerofs_config,
                     plan_only=False,
@@ -954,7 +1017,7 @@ class RunScenarioTests(HarnessCase):
         with self.assertRaisesRegex(RuntimeError, "injected primary failure"):
             lifecycle.run_scenario(
                 ledger,
-                "global-admission-nbd-nfs-ninep",
+                "benchmark-paced-remote",
                 zerofs_binary=self.binary,
                 zerofs_config=self.zerofs_config,
                 plan_only=False,
@@ -968,7 +1031,7 @@ class RunScenarioTests(HarnessCase):
         with self.assertRaises(KeyboardInterrupt):
             lifecycle.run_scenario(
                 ledger,
-                "global-admission-nbd-nfs-ninep",
+                "benchmark-paced-remote",
                 zerofs_binary=self.binary,
                 zerofs_config=self.zerofs_config,
                 plan_only=False,
@@ -989,7 +1052,7 @@ class RunScenarioTests(HarnessCase):
         lifecycle, runner, _, ledger = self.setup_run(config)
         summary = lifecycle.run_scenario(
             ledger,
-            "webui-rpc-production-path",
+            "benchmark-paced-remote",
             zerofs_binary=self.binary,
             zerofs_config=self.zerofs_config,
             plan_only=False,
@@ -1001,6 +1064,41 @@ class RunScenarioTests(HarnessCase):
         executed = [tuple(command) for command in receipt["commands"]]
         self.assertEqual(
             executed, [args for args, _ in runner.calls[len(runner.calls) - len(executed):]]
+        )
+        reloaded = ResourceLedger.load(config.ledger_path)
+        acquired = {(kind, str(value)) for kind, value, _ in reloaded.resources()}
+        self.assertIn(("process", config.unit_name), acquired)
+        self.assertIn(("listener", str(protocols.NFS_PORT)), acquired)
+        self.assertNotIn(
+            "process",
+            {kind for kind, _, _ in reloaded.outstanding()},
+        )
+        self.assertNotIn(
+            "listener",
+            {kind for kind, _, _ in reloaded.outstanding()},
+        )
+
+    def test_crash_restart_reacquires_the_run_scoped_process(self) -> None:
+        config = self.make_config()
+        lifecycle, _, _, ledger = self.setup_run(config)
+        summary = lifecycle.run_scenario(
+            ledger,
+            "local-receipt-restart",
+            zerofs_binary=self.binary,
+            zerofs_config=self.zerofs_config,
+            plan_only=False,
+        )
+        self.assertEqual(summary["terminal_state"], "completed")
+        reloaded = ResourceLedger.load(config.ledger_path)
+        process_acquires = [
+            value
+            for kind, value, _ in reloaded.resources()
+            if kind == "process"
+        ]
+        self.assertEqual(process_acquires, [config.unit_name, config.unit_name])
+        self.assertNotIn(
+            "process",
+            {kind for kind, _, _ in reloaded.outstanding()},
         )
 
 

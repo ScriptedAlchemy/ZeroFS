@@ -471,13 +471,9 @@ class HarnessLifecycle:
             self.config, f"run-{scenario}", ledger.identity, scenario=scenario
         )
         receipt.record("manifest", plan.to_dict())
-        receipt.record(
-            "durability_floors", [floor.to_dict() for floor in plan.durability_floors]
-        )
         if plan_only:
             receipt.record("terminal_state", "planned")
-            receipt.record("exit_status", 0)
-            receipt.finish("ok")
+            receipt.finish("planned")
             return {
                 "scenario": scenario,
                 "terminal_state": "planned",
@@ -492,14 +488,35 @@ class HarnessLifecycle:
             )
         commands: list[list[str]] = []
         try:
+            if plan.requires_observed_durability:
+                raise LifecycleError(
+                    f"scenario {scenario!r} requires observed typed durability "
+                    "frontiers from the production mutation/object path; the "
+                    "collector is not wired"
+                )
             for step in plan.steps:
                 commands.append(list(step.argv))
                 receipt.record("commands", commands)
+                for resource in step.acquires:
+                    ledger.record_resource(
+                        resource.kind,
+                        resource.value,
+                        scenario=scenario,
+                        step=step.description,
+                    )
+                receipt.sync_resources(ledger)
                 self.runner.run(
                     step.argv,
                     sudo=step.sudo,
                     cwd=Path(step.cwd) if step.cwd else None,
                 )
+                for resource in step.releases:
+                    ledger.record_release(
+                        resource.kind,
+                        resource.value,
+                        scenario=scenario,
+                        step=step.description,
+                    )
         except BaseException as error:
             cancelled = isinstance(error, (KeyboardInterrupt, SystemExit))
             receipt.record("terminal_state", "cancelled" if cancelled else "failed")
@@ -513,6 +530,7 @@ class HarnessLifecycle:
                 cleanup_error = second
                 receipt.record("cleanup_status", "failed")
                 receipt.record("cleanup_error", str(second))
+            receipt.sync_resources(ledger)
             receipt.finish("failed")
             if cancelled:
                 raise

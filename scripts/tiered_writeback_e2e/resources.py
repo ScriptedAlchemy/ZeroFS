@@ -244,12 +244,27 @@ class ResourceLedger:
 
     def record_resource(self, kind: str, value: Any, **details: Any) -> None:
         validated = self._validate_resource(kind, value)
+        key = (kind, str(validated))
+        if any(
+            (owned_kind, str(owned_value)) == key
+            for owned_kind, owned_value, _ in self.outstanding()
+        ):
+            raise UnownedResourceError(
+                f"{kind} {validated!r} is already active for run {self.run_uuid}"
+            )
         self.append(
             "acquire", {"resource": kind, "value": validated, "details": details}
         )
 
     def record_release(self, kind: str, value: Any, **details: Any) -> None:
-        self.require_owned(kind, value)
+        key = (kind, str(value))
+        if not any(
+            (owned_kind, str(owned_value)) == key
+            for owned_kind, owned_value, _ in self.outstanding()
+        ):
+            raise UnownedResourceError(
+                f"{kind} {value!r} is not active for run {self.run_uuid}"
+            )
         self.append(
             "release", {"resource": kind, "value": value, "details": details}
         )
@@ -266,16 +281,21 @@ class ResourceLedger:
         ]
 
     def outstanding(self) -> list[tuple[str, Any, dict[str, Any]]]:
-        released: set[tuple[str, str]] = {
-            (event["payload"]["resource"], str(event["payload"]["value"]))
-            for event in self.events
-            if event["kind"] == "release"
-        }
-        return [
-            (kind, value, details)
-            for kind, value, details in self.resources()
-            if (kind, str(value)) not in released
-        ]
+        active: dict[tuple[str, str], tuple[str, Any, dict[str, Any]]] = {}
+        for event in self.events:
+            if event["kind"] not in ("acquire", "release"):
+                continue
+            payload = event["payload"]
+            key = (payload["resource"], str(payload["value"]))
+            if event["kind"] == "acquire":
+                active[key] = (
+                    payload["resource"],
+                    payload["value"],
+                    dict(payload.get("details", {})),
+                )
+            else:
+                active.pop(key, None)
+        return list(active.values())
 
     def require_owned(self, kind: str, value: Any) -> None:
         recorded = {(k, str(v)) for k, v, _ in self.resources()}
