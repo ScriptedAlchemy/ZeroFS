@@ -774,7 +774,8 @@ impl TransportSession for RusshTransportSession {
             .await
             .map_err(|error| map_sftp_error(path, error))?;
         let handle = opened.handle;
-        let speculative_range = match (&requested_range, head) {
+        let result = async {
+            let speculative_range = match (&requested_range, head) {
             (Some(object_store::GetRange::Bounded(range)), false) if range.start < range.end => {
                 usize::try_from(range.end - range.start)
                     .ok()
@@ -785,8 +786,8 @@ impl TransportSession for RusshTransportSession {
                     })
             }
             _ => None,
-        };
-        let speculative_payload = async {
+            };
+            let speculative_payload = async {
             match &speculative_range {
                 Some((_, physical_start, len)) => Some(
                     read_handle_pipelined(sftp, &handle, path, *physical_start, *len, self.limits)
@@ -794,61 +795,46 @@ impl TransportSession for RusshTransportSession {
                 ),
                 None => None,
             }
-        };
-        let (metadata, encoded_header, speculative_payload) = tokio::join!(
+            };
+            let (metadata, encoded_header, speculative_payload) = tokio::join!(
             sftp.fstat(handle.as_str()),
             read_handle_pipelined(sftp, &handle, path, 0, OBJECT_HEADER_LEN, self.limits),
             speculative_payload,
-        );
-        let metadata = metadata.map_err(|error| map_sftp_error(path, error))?.attrs;
-        if !metadata.is_regular() {
-            let _ = sftp.close(handle.clone()).await;
-            return Err(TransportError::CorruptObject(format!(
-                "{} is not a regular file",
-                path.display()
-            )));
-        }
-        let physical_len = metadata.size.ok_or_else(|| {
-            TransportError::CorruptObject(format!("{} has no physical length", path.display()))
-        })?;
-        let modified = metadata.modified().map_err(|_| {
-            TransportError::CorruptObject(format!("{} has no modification time", path.display()))
-        })?;
-
-        let encoded_header = match encoded_header {
-            Ok(header) => header,
-            Err(error) => {
-                let _ = sftp.close(handle.clone()).await;
-                return Err(error);
-            }
-        };
-        let header = match decode_header(&encoded_header) {
-            Ok(header) => header,
-            Err(error) => {
-                let _ = sftp.close(handle.clone()).await;
+            );
+            let metadata = metadata.map_err(|error| map_sftp_error(path, error))?.attrs;
+            if !metadata.is_regular() {
                 return Err(TransportError::CorruptObject(format!(
-                    "{}: {error}",
+                    "{} is not a regular file",
                     path.display()
                 )));
             }
-        };
-        let expected_physical_len = (OBJECT_HEADER_LEN as u64)
+            let physical_len = metadata.size.ok_or_else(|| {
+            TransportError::CorruptObject(format!("{} has no physical length", path.display()))
+            })?;
+            let modified = metadata.modified().map_err(|_| {
+            TransportError::CorruptObject(format!("{} has no modification time", path.display()))
+            })?;
+
+            let encoded_header = encoded_header?;
+            let header = decode_header(&encoded_header).map_err(|error| {
+                TransportError::CorruptObject(format!("{}: {error}", path.display()))
+            })?;
+            let expected_physical_len = (OBJECT_HEADER_LEN as u64)
             .checked_add(header.logical_len)
             .ok_or_else(|| {
                 TransportError::CorruptObject(format!(
                     "{} logical length overflows its physical representation",
                     path.display()
                 ))
-            })?;
-        if physical_len != expected_physical_len {
-            let _ = sftp.close(handle.clone()).await;
-            return Err(TransportError::CorruptObject(format!(
-                "{} physical length {physical_len} does not match expected {expected_physical_len}",
-                path.display()
-            )));
-        }
+                })?;
+            if physical_len != expected_physical_len {
+                return Err(TransportError::CorruptObject(format!(
+                    "{} physical length {physical_len} does not match expected {expected_physical_len}",
+                    path.display()
+                )));
+            }
 
-        let range = match requested_range {
+            let range = match requested_range {
             Some(range) => range.as_range(header.logical_len).map_err(|error| {
                 TransportError::InvalidRange(format!(
                     "invalid logical range for {}: {error}",
@@ -856,20 +842,14 @@ impl TransportSession for RusshTransportSession {
                 ))
             })?,
             None => 0..header.logical_len,
-        };
-        let payload = if head || range.is_empty() {
+            };
+            let payload = if head || range.is_empty() {
             Bytes::new()
         } else if let (Some(result), Some((requested, _, _))) =
             (speculative_payload, &speculative_range)
             && *requested == range
         {
-            match result {
-                Ok(payload) => payload,
-                Err(error) => {
-                    let _ = sftp.close(handle.clone()).await;
-                    return Err(error);
-                }
-            }
+                result?
         } else {
             let physical_start = (OBJECT_HEADER_LEN as u64)
                 .checked_add(range.start)
@@ -885,32 +865,24 @@ impl TransportSession for RusshTransportSession {
                     path.display()
                 ))
             })?;
-            match read_handle_pipelined(sftp, &handle, path, physical_start, len, self.limits).await
-            {
-                Ok(payload) => payload,
-                Err(error) => {
-                    let _ = sftp.close(handle.clone()).await;
-                    return Err(error);
-                }
-            }
-        };
-        let close_path = path.to_path_buf();
-        let close_handle = handle.clone();
-        let close_sftp = self.sftp()?;
-        // The handle close acknowledges nothing the caller depends on.
-        let _ = close_sftp.close(close_handle).await.map_err(|error| {
-            tracing::debug!(
-                path = %close_path.display(),
-                %error,
-                "SFTP read handle close failed off the critical path"
-            );
-        });
-        Ok(RemoteObjectRead {
-            header,
-            modified,
-            range,
-            payload,
-        })
+                read_handle_pipelined(sftp, &handle, path, physical_start, len, self.limits).await?
+            };
+            Ok(RemoteObjectRead {
+                header,
+                modified,
+                range,
+                payload,
+            })
+        }
+        .await;
+        let close = sftp
+            .close(handle)
+            .await
+            .map_err(|error| map_sftp_error(path, error));
+        match (result, close) {
+            (_, Err(close_error)) => Err(close_error),
+            (result, Ok(_)) => result,
+        }
     }
 
     async fn list_directory(
@@ -1596,6 +1568,39 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
         }
     }
 
+    #[tokio::test]
+    async fn russh_read_object_closes_handle_after_metadata_error() {
+        let env = Loopback::start_without_mtime().await;
+        let factory = RusshSessionFactory::new(
+            env.endpoint.clone(),
+            env.identity.clone(),
+            env.known_hosts.clone(),
+        )
+        .unwrap();
+        let mut session = factory.open(CancellationToken::new()).await.unwrap();
+        session
+            .write_file_durable(
+                Path::new("missing-mtime.bin"),
+                vec![Bytes::from_static(b"not-an-object")],
+            )
+            .await
+            .unwrap();
+        assert_eq!(env.open_handles.load(Ordering::SeqCst), 0);
+
+        let error = session
+            .read_object(Path::new("missing-mtime.bin"), None, false)
+            .await
+            .expect_err("missing object metadata must fail closed");
+
+        assert!(matches!(error, TransportError::CorruptObject(_)));
+        assert_eq!(
+            env.open_handles.load(Ordering::SeqCst),
+            0,
+            "every read_object error path must close its raw SFTP handle"
+        );
+        session.close(CancellationToken::new()).await.unwrap();
+    }
+
     struct Loopback {
         _root: tempfile::TempDir,
         endpoint: crate::config::SftpEndpoint,
@@ -1605,18 +1610,23 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
         _peak: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         exec_requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         active_connections: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        open_handles: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl Loopback {
         async fn start() -> Self {
-            Self::start_with(None).await
+            Self::start_with(None, false).await
         }
 
         async fn start_with_read_cap(read_cap: Option<usize>) -> Self {
-            Self::start_with(read_cap).await
+            Self::start_with(read_cap, false).await
         }
 
-        async fn start_with(read_cap: Option<usize>) -> Self {
+        async fn start_without_mtime() -> Self {
+            Self::start_with(None, true).await
+        }
+
+        async fn start_with(read_cap: Option<usize>, omit_mtime: bool) -> Self {
             use russh::server::{Auth, Msg, Server, Session};
             use russh::{Channel, ChannelId};
             use std::net::SocketAddr;
@@ -1645,6 +1655,7 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
             let peak = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let exec_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let active_connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let open_handles = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
@@ -1682,10 +1693,12 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
                 fs_root: PathBuf,
                 client_public: russh::keys::PublicKey,
                 read_cap: Option<usize>,
+                omit_mtime: bool,
                 inflight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
                 peak: std::sync::Arc<std::sync::atomic::AtomicUsize>,
                 exec_requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
                 active_connections: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+                open_handles: std::sync::Arc<std::sync::atomic::AtomicUsize>,
             }
 
             struct SshSession {
@@ -1764,11 +1777,13 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
                     let sftp = FsSftp {
                         root: self.state.fs_root.clone(),
                         read_cap: self.state.read_cap,
+                        omit_mtime: self.state.omit_mtime,
                         files: std::collections::HashMap::new(),
                         dirs: std::collections::HashMap::new(),
                         next: 1,
                         inflight: self.state.inflight.clone(),
                         peak: self.state.peak.clone(),
+                        open_handles: self.state.open_handles.clone(),
                     };
                     // Drive SFTP off the russh session task so SSH packets
                     // keep flowing into ChannelStream.
@@ -1792,10 +1807,12 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
                 fs_root: fs_root.clone(),
                 client_public,
                 read_cap,
+                omit_mtime,
                 inflight: inflight.clone(),
                 peak: peak.clone(),
                 exec_requests: exec_requests.clone(),
                 active_connections: active_connections.clone(),
+                open_handles: open_handles.clone(),
             };
             tokio::spawn(async move {
                 loop {
@@ -1828,6 +1845,7 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
                 _peak: peak,
                 exec_requests,
                 active_connections,
+                open_handles,
             }
         }
     }
@@ -1839,11 +1857,13 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
     struct FsSftp {
         root: PathBuf,
         read_cap: Option<usize>,
+        omit_mtime: bool,
         files: std::collections::HashMap<String, Opened>,
         dirs: std::collections::HashMap<String, std::vec::IntoIter<std::fs::DirEntry>>,
         next: u64,
         inflight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         peak: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        open_handles: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl FsSftp {
@@ -1857,6 +1877,7 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
         }
 
         fn attrs(
+            &self,
             path: &std::path::Path,
         ) -> Result<FileAttributes, russh_sftp::protocol::StatusCode> {
             let meta = std::fs::symlink_metadata(path)
@@ -1870,7 +1891,9 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
             } else if meta.file_type().is_symlink() {
                 attrs.set_symlink(true);
             }
-            if let Ok(modified) = meta.modified() {
+            if !self.omit_mtime
+                && let Ok(modified) = meta.modified()
+            {
                 if let Ok(secs) = modified.duration_since(std::time::UNIX_EPOCH) {
                     attrs.mtime = Some(secs.as_secs() as u32);
                 }
@@ -1891,6 +1914,7 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
             let handle = format!("h{}", self.next);
             self.next += 1;
             self.files.insert(handle.clone(), Opened { path });
+            self.open_handles.fetch_add(1, Ordering::SeqCst);
             handle
         }
     }
@@ -1941,7 +1965,9 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
             id: u32,
             handle: String,
         ) -> Result<russh_sftp::protocol::Status, Self::Error> {
-            self.files.remove(&handle);
+            if self.files.remove(&handle).is_some() {
+                self.open_handles.fetch_sub(1, Ordering::SeqCst);
+            }
             self.dirs.remove(&handle);
             Ok(Self::ok(id))
         }
@@ -1997,7 +2023,7 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
         ) -> Result<russh_sftp::protocol::Attrs, Self::Error> {
             Ok(russh_sftp::protocol::Attrs {
                 id,
-                attrs: Self::attrs(&self.resolve(&path))?,
+                attrs: self.attrs(&self.resolve(&path))?,
             })
         }
 
@@ -2009,7 +2035,7 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
             let path = &self.files.get(&handle).ok_or(StatusCode::Failure)?.path;
             Ok(russh_sftp::protocol::Attrs {
                 id,
-                attrs: Self::attrs(path)?,
+                attrs: self.attrs(path)?,
             })
         }
 
@@ -2041,7 +2067,7 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
             }
             let mut files = Vec::new();
             for entry in batch {
-                let attrs = Self::attrs(&entry.path()).unwrap_or_default();
+                let attrs = self.attrs(&entry.path()).unwrap_or_default();
                 files.push(russh_sftp::protocol::File::new(
                     entry.file_name().to_string_lossy().into_owned(),
                     attrs,
