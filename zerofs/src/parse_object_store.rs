@@ -349,8 +349,13 @@ async fn build_sftp_store(
         port: url.port().unwrap_or(22),
         username: url.username().to_owned(),
     };
+    tracing::info!(
+        ssh_program = %config.ssh_program.display(),
+        "using configured OpenSSH-compatible SFTP client"
+    );
     let factory = crate::sftp_transport::OpenSshSessionFactory::new(
         endpoint,
+        config.ssh_program.clone(),
         config.identity_file.clone(),
         config.known_hosts.clone(),
     )

@@ -545,6 +545,7 @@ impl Drop for OperationAdmission {
 
 pub struct OpenSshSessionFactory {
     endpoint: crate::config::SftpEndpoint,
+    ssh_program: PathBuf,
     identity_file: PathBuf,
     known_hosts: PathBuf,
     authentication_config: Arc<tempfile::NamedTempFile>,
@@ -553,6 +554,7 @@ pub struct OpenSshSessionFactory {
 impl OpenSshSessionFactory {
     pub fn new(
         endpoint: crate::config::SftpEndpoint,
+        ssh_program: PathBuf,
         identity_file: PathBuf,
         known_hosts: PathBuf,
     ) -> Result<Self, TransportError> {
@@ -583,6 +585,7 @@ impl OpenSshSessionFactory {
             .map_err(|_| TransportError::Open("could not flush SSH policy file".to_owned()))?;
         Ok(Self {
             endpoint,
+            ssh_program,
             identity_file,
             known_hosts,
             authentication_config: Arc::new(authentication_config),
@@ -596,8 +599,40 @@ impl fmt::Debug for OpenSshSessionFactory {
             .debug_struct("OpenSshSessionFactory")
             .field("host", &self.endpoint.host)
             .field("port", &self.endpoint.port)
+            .field("ssh_program", &self.ssh_program)
             .field("known_hosts", &self.known_hosts)
             .finish_non_exhaustive()
+    }
+}
+
+impl OpenSshSessionFactory {
+    fn command(&self) -> tokio::process::Command {
+        let mut command = tokio::process::Command::new(&self.ssh_program);
+        command
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .arg("-F")
+            .arg(self.authentication_config.path())
+            .arg("-o")
+            .arg("StrictHostKeyChecking=yes")
+            .arg("-o")
+            .arg(format!("UserKnownHostsFile={}", self.known_hosts.display()))
+            .arg("-o")
+            .arg("IdentitiesOnly=yes")
+            .arg("-i")
+            .arg(&self.identity_file)
+            .arg("-p")
+            .arg(self.endpoint.port.to_string())
+            .arg("-l")
+            .arg(&self.endpoint.username)
+            .arg("-T")
+            .arg("-s")
+            .arg("--")
+            .arg(&self.endpoint.host)
+            .arg("sftp");
+        command
     }
 }
 
@@ -652,36 +687,14 @@ impl SessionFactory for OpenSshSessionFactory {
             return Err(TransportError::PoolClosed);
         }
 
-        let mut command = tokio::process::Command::new("ssh");
-        command
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .arg("-F")
-            .arg(self.authentication_config.path())
-            .arg("-o")
-            .arg("StrictHostKeyChecking=yes")
-            .arg("-o")
-            .arg(format!("UserKnownHostsFile={}", self.known_hosts.display()))
-            .arg("-o")
-            .arg("IdentitiesOnly=yes")
-            .arg("-i")
-            .arg(&self.identity_file)
-            .arg("-p")
-            .arg(self.endpoint.port.to_string())
-            .arg("-l")
-            .arg(&self.endpoint.username)
-            .arg("-T")
-            .arg("-s")
-            .arg("--")
-            .arg(&self.endpoint.host)
-            .arg("sftp");
+        let mut command = self.command();
 
-        let mut child = command.spawn().map_err(|_| {
+        let mut child = command.spawn().map_err(|error| {
             TransportError::Open(format!(
-                "OpenSSH SFTP process for {}:{} failed to start",
-                self.endpoint.host, self.endpoint.port
+                "configured OpenSSH-compatible client {} for {}:{} failed to start: {error}",
+                self.ssh_program.display(),
+                self.endpoint.host,
+                self.endpoint.port
             ))
         })?;
         let stdin = match child.stdin.take() {
@@ -3667,6 +3680,7 @@ mod tests {
     async fn writable_pool_accepts_limits_from_sftp_config() {
         let factory = RecordingFactory::fully_capable();
         let config = crate::config::SftpConfig {
+            ssh_program: "ssh".into(),
             identity_file: "/tmp/id-ed25519".into(),
             known_hosts: "/tmp/known-hosts".into(),
             max_connections: 3,
@@ -3837,6 +3851,7 @@ mod tests {
                 port: 2222,
                 username: "account-secret-name".to_owned(),
             },
+            "ssh".into(),
             "/tmp/id-ed25519".into(),
             "/tmp/known-hosts".into(),
         )
@@ -3849,6 +3864,77 @@ mod tests {
     }
 
     #[test]
+    fn openssh_factory_keeps_the_configured_program_as_one_executable_path() {
+        let factory = OpenSshSessionFactory::new(
+            SftpEndpoint {
+                host: "storage.example.test".to_owned(),
+                port: 2222,
+                username: "account-name".to_owned(),
+            },
+            "/opt/HPN SSH/bin/hpnssh".into(),
+            "/tmp/id-ed25519".into(),
+            "/tmp/known-hosts".into(),
+        )
+        .unwrap();
+
+        let command = factory.command();
+        let command = command.as_std();
+        assert_eq!(
+            command.get_program(),
+            std::ffi::OsStr::new("/opt/HPN SSH/bin/hpnssh")
+        );
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            vec![
+                std::ffi::OsStr::new("-F"),
+                factory.authentication_config.path().as_os_str(),
+                std::ffi::OsStr::new("-o"),
+                std::ffi::OsStr::new("StrictHostKeyChecking=yes"),
+                std::ffi::OsStr::new("-o"),
+                std::ffi::OsStr::new("UserKnownHostsFile=/tmp/known-hosts"),
+                std::ffi::OsStr::new("-o"),
+                std::ffi::OsStr::new("IdentitiesOnly=yes"),
+                std::ffi::OsStr::new("-i"),
+                std::ffi::OsStr::new("/tmp/id-ed25519"),
+                std::ffi::OsStr::new("-p"),
+                std::ffi::OsStr::new("2222"),
+                std::ffi::OsStr::new("-l"),
+                std::ffi::OsStr::new("account-name"),
+                std::ffi::OsStr::new("-T"),
+                std::ffi::OsStr::new("-s"),
+                std::ffi::OsStr::new("--"),
+                std::ffi::OsStr::new("storage.example.test"),
+                std::ffi::OsStr::new("sftp"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn openssh_factory_fails_closed_when_the_configured_program_is_missing() {
+        let directory = tempfile::tempdir().unwrap();
+        let program = directory.path().join("missing-hpnssh");
+        let factory = OpenSshSessionFactory::new(
+            SftpEndpoint {
+                host: "storage.example.test".to_owned(),
+                port: 2222,
+                username: "account-name".to_owned(),
+            },
+            program,
+            "/tmp/id-ed25519".into(),
+            "/tmp/known-hosts".into(),
+        )
+        .unwrap();
+
+        let error = factory
+            .open(CancellationToken::new())
+            .await
+            .expect_err("a missing configured client must not fall back to stock ssh");
+        assert!(
+            matches!(error, TransportError::Open(message) if message.contains("failed to start"))
+        );
+    }
+
+    #[test]
     fn openssh_factory_effective_policy_bounds_connect_and_dead_peer_detection() {
         let factory = OpenSshSessionFactory::new(
             SftpEndpoint {
@@ -3856,6 +3942,7 @@ mod tests {
                 port: 2222,
                 username: "account-name".to_owned(),
             },
+            "ssh".into(),
             "/tmp/id-ed25519".into(),
             "/tmp/known-hosts".into(),
         )
