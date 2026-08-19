@@ -163,8 +163,6 @@ pub(crate) async fn prepare_write(
         return Ok(result);
     }
 
-    let (used_bytes, _) = fs.global_stats.get_totals();
-    let mut reserved_growth = 0u64;
     let mut prepared_members = Vec::with_capacity(request.members.len());
 
     for member in &request.members {
@@ -203,6 +201,7 @@ pub(crate) async fn prepare_write(
                 republish_metadata: false,
                 parent_name_for_update: None,
                 span,
+                quota: None,
             });
             continue;
         }
@@ -217,20 +216,10 @@ pub(crate) async fn prepare_write(
             .ok_or(FsError::InvalidArgument)?;
         let new_size = std::cmp::max(file.size, end_offset);
 
+        let mut quota = None;
         if new_size > old_size {
             let size_increase = new_size - old_size;
-            if used_bytes
-                .saturating_add(reserved_growth)
-                .saturating_add(size_increase)
-                > fs.max_bytes
-            {
-                debug!(
-                    "Write would exceed quota: used={}, reserved={}, increase={}, max={}",
-                    used_bytes, reserved_growth, size_increase, fs.max_bytes
-                );
-                return Err(FsError::NoSpace);
-            }
-            reserved_growth = reserved_growth.saturating_add(size_increase);
+            quota = Some(fs.quota.reserve(size_increase)?);
         }
 
         let (now_sec, now_nsec) = get_current_time();
@@ -269,6 +258,7 @@ pub(crate) async fn prepare_write(
             republish_metadata,
             parent_name_for_update,
             span,
+            quota,
         });
     }
 
@@ -410,6 +400,13 @@ pub(crate) async fn apply_prepared_batch(
                 length: member.data.len() as u64,
             },
         );
+    }
+
+    for member in &batch.members {
+        if let Some(reservation) = &member.quota {
+            reservation.accept();
+            reservation.canonical();
+        }
     }
 
     Ok(PreparedBatchResult {

@@ -17,6 +17,7 @@ mod boot;
 mod handle;
 pub(crate) mod mutation;
 mod ops;
+pub(crate) mod quota;
 #[cfg(test)]
 mod test_util;
 
@@ -126,6 +127,7 @@ pub struct ZeroFS {
     /// retries. Zero for standalone, read-only, and in-memory test filesystems.
     pub serving_writer_epoch: u64,
     pub max_bytes: u64,
+    pub(crate) quota: std::sync::Arc<crate::fs::quota::LogicalQuota>,
     pub tracer: AccessTracer,
     /// Traces backend object-store requests (the `otrace` feature). Created in
     /// `Prepared::prepare` and shared with the `TracingObjectStore` wrappers so

@@ -32,7 +32,6 @@ pub(crate) struct PrepareWriteRequest {
 
 /// Validation and attribute decisions for one member. No canonical
 /// mutation has been published yet.
-#[derive(Debug, Clone)]
 pub(crate) struct PreparedWriteMember {
     pub(crate) id: InodeId,
     pub(crate) offset: u64,
@@ -44,6 +43,7 @@ pub(crate) struct PreparedWriteMember {
     pub(crate) republish_metadata: bool,
     pub(crate) parent_name_for_update: Option<(InodeId, Vec<u8>)>,
     pub(crate) span: Option<(u64, u64)>,
+    pub(crate) quota: Option<crate::fs::quota::ProvisionalQuotaReservation>,
 }
 
 /// Outcome of [`prepare_write`](crate::fs::ops::write::prepare_write).
