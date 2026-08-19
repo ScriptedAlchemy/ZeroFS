@@ -108,7 +108,25 @@ impl ZeroFS {
             op_id,
             check_permissions,
         };
+        self.apply_write_request(request, None).await
+    }
+
+    pub(crate) async fn write_materialized_identified(
+        &self,
+        request: PrepareWriteRequest,
+        pending_write_request: crate::dedup::PendingWriteRequest,
+    ) -> Result<FileAttributes, FsError> {
+        self.apply_write_request(request, Some(pending_write_request))
+            .await
+    }
+
+    async fn apply_write_request(
+        &self,
+        request: PrepareWriteRequest,
+        pending_write_request: Option<crate::dedup::PendingWriteRequest>,
+    ) -> Result<FileAttributes, FsError> {
         let mut batch = prepare_write(&self.write_prepare_context(), request).await?;
+        batch.pending_write_request = pending_write_request;
         let result = apply_prepared_batch(&self.write_apply_context(), &mut batch).await?;
         Ok(result.primary_attrs())
     }
@@ -268,6 +286,7 @@ pub(crate) async fn prepare_write(
         members: prepared_members,
         replayed: None,
         guards: Some(guards),
+        pending_write_request: None,
     })
 }
 
@@ -368,7 +387,12 @@ pub(crate) async fn apply_prepared_batch(
         }
     }
 
-    let pending = fs.write_coordinator.submit(txn)?;
+    let pending = match batch.pending_write_request.take() {
+        Some(request) => fs
+            .write_coordinator
+            .submit_with_write_request(txn, request)?,
+        None => fs.write_coordinator.submit(txn)?,
+    };
     batch.guards = None;
     pending.wait().await?;
     for member in &batch.members {
@@ -423,7 +447,7 @@ pub(crate) async fn apply_prepared_batch(
 
 async fn empty_batch_result(
     fs: &ZeroFS,
-    batch: &PreparedWriteBatch,
+    batch: &mut PreparedWriteBatch,
 ) -> Result<PreparedBatchResult, FsError> {
     let result = PreparedBatchResult {
         members: batch
@@ -443,7 +467,13 @@ async fn empty_batch_result(
                 },
             );
         }
-        fs.write_coordinator.commit(txn).await?;
+        let pending = match batch.pending_write_request.take() {
+            Some(request) => fs
+                .write_coordinator
+                .submit_with_write_request(txn, request)?,
+            None => fs.write_coordinator.submit(txn)?,
+        };
+        pending.wait().await?;
     }
     Ok(result)
 }

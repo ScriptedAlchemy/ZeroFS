@@ -4,7 +4,7 @@ use crate::fs::errors::FsError;
 use crate::fs::inode::InodeId;
 use crate::fs::types::AuthContext;
 
-pub(super) fn direct_write_fingerprint(
+pub(crate) fn direct_write_fingerprint(
     auth: &AuthContext,
     id: InodeId,
     offset: u64,

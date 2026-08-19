@@ -77,6 +77,13 @@ struct StagedWriteAccept {
     attrs: FileAttributes,
     guard: PreparationGuard,
     batch: PreparedWriteBatch,
+    replay: Option<AcceptedWriteReplay>,
+}
+
+struct AcceptedWriteReplay {
+    op_id: crate::dedup::OpId,
+    fingerprint: [u8; 32],
+    count: u32,
 }
 
 #[cfg(test)]
@@ -237,6 +244,7 @@ impl FilesystemVolatileOverlay {
             attrs,
             guard,
             batch,
+            replay,
         } = request;
         if self.is_frozen() {
             return Err(OverlayError::IoError);
@@ -282,13 +290,27 @@ impl FilesystemVolatileOverlay {
                     .entry(inode)
                     .or_default()
                     .push_back(VisibleAttrs {
-                        attrs,
+                        attrs: attrs.clone(),
                         visibility: Arc::clone(&visibility),
                     });
                 #[cfg(test)]
                 self.pause_before_publish_if_requested().await;
                 visibility.publish();
                 record_published_staged_writes(length as u64, 1);
+                if let Some(replay) = replay {
+                    let fs = self.fs.upgrade().ok_or(OverlayError::IoError)?;
+                    let accepted_write = fs.dedup.begin_accepted_write(
+                        crate::dedup::DedupEntry {
+                            op_id: replay.op_id,
+                            result: crate::dedup::DedupResult::Write {
+                                attrs: attrs.clone(),
+                            },
+                        },
+                        replay.fingerprint,
+                        replay.count,
+                    );
+                    dispatch.install_accepted_write(accepted_write);
+                }
                 if let Err(accepted) = accepted_tx.send(accepted) {
                     let (request, _batch, raw_permit, _cutoff) = accepted.into_parts();
                     if let Some(fs) = self.fs.upgrade()
@@ -299,6 +321,7 @@ impl FilesystemVolatileOverlay {
                             .request_cache()
                             .complete(request, Err(FsError::IoError));
                     }
+                    dispatch.cancel_unpublished();
                     drop(raw_permit);
                     return Err(OverlayError::IoError);
                 }
@@ -857,33 +880,6 @@ impl ZeroFS {
             request_lifetime,
             fingerprint_context,
         } = write;
-        let Some(overlay) = self.volatile_overlay.get().cloned() else {
-            let attrs = if check_permissions {
-                self.write_idempotent(auth, id, offset, data, op_id).await
-            } else {
-                self.write_opened_idempotent(auth, id, offset, data, op_id)
-                    .await
-            }?;
-            return Ok(WriteAckReceipt {
-                attrs,
-                cutoff: self.capture_mutation_cutoff(),
-            });
-        };
-        if data.is_empty() {
-            let attrs = if check_permissions {
-                self.write_idempotent(auth, id, offset, data, op_id).await
-            } else {
-                self.write_opened_idempotent(auth, id, offset, data, op_id)
-                    .await
-            }?;
-            return Ok(WriteAckReceipt {
-                attrs,
-                cutoff: self.capture_mutation_cutoff(),
-            });
-        }
-
-        let coordinator = self.mutation_coordinator.get().ok_or(FsError::IoError)?;
-        let request_cache = coordinator.request_cache();
         let fingerprint = match &identity {
             RequestIdentity::DirectOneShot(_) => RequestFingerprint::from_bytes([0; 32]),
             _ => direct_write_fingerprint(
@@ -896,6 +892,65 @@ impl ZeroFS {
                 fingerprint_context,
             ),
         };
+        let replay_count = if matches!(&identity, RequestIdentity::NineP { .. }) {
+            Some(u32::try_from(data.len()).map_err(|_| FsError::InvalidArgument)?)
+        } else {
+            None
+        };
+        let Some(overlay) = self.volatile_overlay.get().cloned() else {
+            if replay_count.is_some()
+                && matches!(
+                    self.dedup.replay_write(&op_id, fingerprint.into_bytes()),
+                    Some(crate::dedup::WriteReplay::FingerprintMismatch)
+                )
+            {
+                return Err(FsError::InvalidArgument);
+            }
+            let pending_write = replay_count.map(|count| {
+                self.dedup
+                    .stage_write_request(op_id, fingerprint.into_bytes(), count)
+            });
+            let attrs = if let Some(pending_write) = pending_write {
+                self.write_materialized_identified(
+                    PrepareWriteRequest {
+                        members: vec![PrepareWriteMember {
+                            id,
+                            offset,
+                            data: data.clone(),
+                        }],
+                        auth: auth.clone(),
+                        op_id,
+                        check_permissions,
+                    },
+                    pending_write,
+                )
+                .await
+            } else if check_permissions {
+                self.write_idempotent(auth, id, offset, data, op_id).await
+            } else {
+                self.write_opened_idempotent(auth, id, offset, data, op_id)
+                    .await
+            }?;
+            if let Some(count) = replay_count {
+                self.dedup.record_materialized_write_entry(
+                    crate::dedup::DedupEntry {
+                        op_id,
+                        result: crate::dedup::DedupResult::Write {
+                            attrs: attrs.clone(),
+                        },
+                    },
+                    fingerprint.into_bytes(),
+                    count,
+                );
+            }
+            return Ok(WriteAckReceipt {
+                attrs,
+                cutoff: self.capture_mutation_cutoff(),
+            });
+        };
+
+        let coordinator = self.mutation_coordinator.get().ok_or(FsError::IoError)?;
+        let request_cache = coordinator.request_cache();
         let pending = match request_cache
             .lookup_or_reserve(identity, fingerprint, request_lifetime)
             .map_err(|_| FsError::IoError)?
@@ -968,6 +1023,11 @@ impl ZeroFS {
                 attrs: attrs.clone(),
                 guard,
                 batch,
+                replay: replay_count.map(|count| AcceptedWriteReplay {
+                    op_id,
+                    fingerprint: fingerprint.into_bytes(),
+                    count,
+                }),
             })
             .await
             .map_err(overlay_fs_error)?;
@@ -1198,6 +1258,138 @@ mod tests {
             .unwrap();
         assert_eq!(retained.attrs.size, first.attrs.size);
         assert_eq!(retained.cutoff, first.cutoff);
+    }
+
+    #[tokio::test]
+    async fn volatile_identified_write_publishes_typed_dedup_before_materialization() {
+        let mut fs = ZeroFS::new_in_memory().await.unwrap();
+        fs.write_ack = volatile_settings();
+        let fs = Arc::new(fs);
+        let auth = crate::fs::types::AuthContext::from(&test_creds());
+        let file = fs
+            .create_exclusive(&auth, 0, b"typed-dedup.txt")
+            .await
+            .unwrap();
+
+        let overlay = FilesystemVolatileOverlay::new(
+            fs.write_ack.volatile_memory_bytes,
+            fs.write_ack.volatile_max_operations,
+            Arc::downgrade(&fs),
+        );
+        assert!(fs.volatile_overlay.set(Arc::clone(&overlay)).is_ok());
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let hook: super::super::materializer::ApplyHook = {
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            let fs = Arc::downgrade(&fs);
+            Arc::new(move |_cutoff, mut batch| {
+                let entered = Arc::clone(&entered);
+                let release = Arc::clone(&release);
+                let fs = fs.clone();
+                Box::pin(async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    let fs = fs
+                        .upgrade()
+                        .ok_or(super::super::types::MutationError::Closed)?;
+                    apply_prepared_batch(&fs.write_apply_context(), &mut batch)
+                        .await
+                        .map(|_| ())
+                        .map_err(|error| {
+                            super::super::types::MutationError::Poisoned(error.to_string())
+                        })
+                })
+            })
+        };
+        let materializer = super::super::materializer::Materializer::start_with_hook(
+            super::super::types::MutationIncarnation::new(),
+            Arc::downgrade(&fs),
+            Some(overlay),
+            Some(hook),
+        );
+        let coordinator = super::super::fence::MutationCoordinator::new_with_limits(
+            super::super::admission::PreparationGate::new(materializer.incarnation()),
+            materializer.progress(),
+            fs.write_ack.volatile_memory_bytes,
+            fs.write_ack.volatile_max_operations as u64,
+        );
+        assert!(fs.materializer.set(Arc::clone(&materializer)).is_ok());
+        assert!(fs.mutation_coordinator.set(coordinator).is_ok());
+
+        let op_id = [9; 16];
+        let identity = RequestIdentity::NineP {
+            origin_epoch: 91,
+            operation_id: op_id,
+        };
+        let data = Bytes::from_static(b"accepted-before-durable");
+        let first = fs
+            .write_ack_identified(IdentifiedWrite {
+                auth: &auth,
+                id: file,
+                offset: 0,
+                data: &data,
+                op_id,
+                check_permissions: true,
+                identity: identity.clone(),
+                request_lifetime: RequestLifetime::CanonicalDedup,
+                fingerprint_context: b"9p-write",
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+
+        let accepted = fs.dedup.get(&op_id).expect("accepted result is published");
+        let crate::dedup::DedupResult::Write { attrs: accepted } = accepted else {
+            panic!("accepted dedup result must retain typed write attributes")
+        };
+        assert_eq!(accepted.fileid, first.attrs.fileid);
+        assert_eq!(accepted.size, first.attrs.size);
+        let fingerprint = direct_write_fingerprint(&auth, file, 0, &data, op_id, true, b"9p-write");
+        assert_eq!(
+            fs.dedup.replay_write(&op_id, fingerprint.into_bytes()),
+            Some(crate::dedup::WriteReplay::Match {
+                count: data.len() as u32,
+            })
+        );
+        assert_eq!(materializer.progress().materialized_through(), 0);
+
+        release.notify_one();
+        materializer
+            .progress()
+            .wait_materialized(first.cutoff)
+            .await
+            .unwrap();
+        let (canonical, eof) = fs.read_file(&auth, file, 0, 64).await.unwrap();
+        assert_eq!(canonical, data);
+        assert!(eof);
+
+        let replay = fs
+            .write_ack_identified(IdentifiedWrite {
+                auth: &auth,
+                id: file,
+                offset: 0,
+                data: &data,
+                op_id,
+                check_permissions: true,
+                identity,
+                request_lifetime: RequestLifetime::CanonicalDedup,
+                fingerprint_context: b"9p-write",
+            })
+            .await
+            .unwrap();
+        assert_eq!(replay.attrs.fileid, first.attrs.fileid);
+        assert_eq!(replay.attrs.size, first.attrs.size);
+        assert_eq!(replay.cutoff, first.cutoff);
+
+        let Some(crate::dedup::DedupResult::Write { attrs: durable }) = fs.dedup.get(&op_id) else {
+            panic!("materialized dedup result must remain a typed write")
+        };
+        assert_eq!(durable.fileid, first.attrs.fileid);
+        assert_eq!(durable.size, first.attrs.size);
+        materializer.stop().await;
     }
 
     #[tokio::test]
