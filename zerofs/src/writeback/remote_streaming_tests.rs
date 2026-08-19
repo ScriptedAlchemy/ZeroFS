@@ -119,7 +119,7 @@ fn identity() -> JournalIdentity {
 async fn remote_replay_streams_payload_larger_than_the_window_in_bounded_parts() {
     let temp = tempfile::tempdir().unwrap();
     let journal = Arc::new(Journal::open(temp.path().join("journal"), identity()).unwrap());
-    let payload = vec![0x5a; REMOTE_STREAM_CHUNK_BYTES * 2 + 17];
+    let payload = vec![0x5a; REMOTE_STREAM_CHUNK_BYTES + 1];
     let record = crate::writeback::test_util::put_record(
         1,
         "large-object",
@@ -147,9 +147,54 @@ async fn remote_replay_streams_payload_larger_than_the_window_in_bounded_parts()
     assert_eq!(store.multipart_calls.load(Ordering::SeqCst), 1);
     assert_eq!(
         *store.part_sizes.lock().unwrap(),
-        vec![REMOTE_STREAM_CHUNK_BYTES, REMOTE_STREAM_CHUNK_BYTES, 17]
+        vec![REMOTE_STREAM_CHUNK_BYTES, 1]
     );
     let result = store.inner.get(&Path::from("large-object")).await.unwrap();
     assert_eq!(result.meta.size, payload.len() as u64);
     assert_eq!(result.bytes().await.unwrap().as_ref(), payload.as_slice());
+}
+
+#[tokio::test]
+async fn remote_replay_at_the_window_boundary_keeps_atomic_put_semantics() {
+    let temp = tempfile::tempdir().unwrap();
+    let journal = Arc::new(Journal::open(temp.path().join("journal"), identity()).unwrap());
+    let payload = vec![0x6b; REMOTE_STREAM_CHUNK_BYTES];
+    let record = crate::writeback::test_util::put_record(
+        1,
+        "boundary-object",
+        &payload,
+        MutationMode::Overwrite,
+        FenceClass::Fence,
+        0x1000,
+        1_786_435_200_000,
+    );
+    let record = journal.commit_put(record, &payload).unwrap();
+    let remote_root = temp.path().join("remote");
+    std::fs::create_dir(&remote_root).unwrap();
+    let store = Arc::new(RecordingMultipartStore {
+        inner: Arc::new(LocalFileSystem::new_with_prefix(&remote_root).unwrap()),
+        put_opts_calls: AtomicUsize::new(0),
+        multipart_calls: AtomicUsize::new(0),
+        part_sizes: Arc::new(Mutex::new(Vec::new())),
+    });
+
+    apply_record(store.clone(), Arc::clone(&journal), record)
+        .await
+        .unwrap();
+
+    assert_eq!(store.put_opts_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(store.multipart_calls.load(Ordering::SeqCst), 0);
+    assert!(store.part_sizes.lock().unwrap().is_empty());
+    assert_eq!(
+        store
+            .inner
+            .get(&Path::from("boundary-object"))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap()
+            .as_ref(),
+        payload.as_slice()
+    );
 }

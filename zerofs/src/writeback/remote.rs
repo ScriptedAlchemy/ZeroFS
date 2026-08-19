@@ -15,7 +15,7 @@ use futures::{FutureExt, StreamExt};
 use object_store::path::Path;
 use object_store::{
     GetOptions, GetRange, MultipartUpload, ObjectStore, ObjectStoreExt, PutMode,
-    PutMultipartOptions, PutPayload, PutResult, UpdateVersion,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult, UpdateVersion,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
@@ -1064,6 +1064,31 @@ async fn stream_record_to_remote(
     let mut chunks = blob
         .range_stream(0..blob.len(), REMOTE_STREAM_CHUNK_BYTES)
         .map_err(|error| generic_error(format!("journal blob stream failed: {error:#}")))?;
+    if blob.len() <= REMOTE_STREAM_CHUNK_BYTES as u64 {
+        let bytes = chunks
+            .next()
+            .await
+            .transpose()
+            .map_err(|error| generic_error(format!("journal blob stream failed: {error:#}")))?
+            .unwrap_or_default();
+        debug_assert!(chunks.next().await.is_none());
+        let result = bounded_remote_step(
+            record,
+            "bounded atomic put",
+            remote.put_opts(target, bytes.into(), PutOptions::from(mode.clone())),
+        )
+        .await;
+        return match result {
+            Ok(result) => Ok(result),
+            Err(object_store::Error::AlreadyExists { .. }) if matches!(mode, PutMode::Create) => {
+                verify_existing(remote.as_ref(), journal.as_ref(), record, target).await
+            }
+            Err(object_store::Error::Precondition { .. }) if matches!(mode, PutMode::Update(_)) => {
+                verify_existing(remote.as_ref(), journal.as_ref(), record, target).await
+            }
+            Err(error) => Err(error),
+        };
+    }
     let upload = bounded_remote_step(
         record,
         "multipart initiation",
