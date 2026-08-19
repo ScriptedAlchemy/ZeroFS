@@ -206,6 +206,7 @@ struct BoundedSftpStream<S> {
     prefix_len: usize,
     prefix_emitted: usize,
     payload_remaining: usize,
+    failed: bool,
 }
 
 impl<S> BoundedSftpStream<S> {
@@ -217,6 +218,7 @@ impl<S> BoundedSftpStream<S> {
             prefix_len: 0,
             prefix_emitted: 0,
             payload_remaining: 0,
+            failed: false,
         }
     }
 }
@@ -228,6 +230,9 @@ impl<S: AsyncRead + Unpin> AsyncRead for BoundedSftpStream<S> {
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         if buf.remaining() == 0 {
+            return std::task::Poll::Ready(Ok(()));
+        }
+        if self.failed {
             return std::task::Poll::Ready(Ok(()));
         }
 
@@ -260,6 +265,7 @@ impl<S: AsyncRead + Unpin> AsyncRead for BoundedSftpStream<S> {
         if self.prefix_emitted == 0 {
             let packet_len = u32::from_be_bytes(self.prefix);
             if packet_len > self.max_packet_len {
+                self.failed = true;
                 return std::task::Poll::Ready(Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!(
@@ -348,6 +354,10 @@ fn map_sftp_error(path: &Path, error: russh_sftp::client::error::Error) -> Trans
         }
         error => TransportError::Operation(format!("{}: {error}", path.display())),
     }
+}
+
+fn map_sftp_close_error(path: &Path, error: russh_sftp::client::error::Error) -> TransportError {
+    TransportError::Close(format!("{}: {error}", path.display()))
 }
 
 #[cfg(test)]
@@ -584,6 +594,40 @@ where
     ))
 }
 
+async fn close_ssh_handle(
+    mut handle: client::Handle<StrictHostKey>,
+    force: &CancellationToken,
+) -> Result<(), TransportError> {
+    let disconnect = handle.disconnect(russh::Disconnect::ByApplication, "", "");
+    tokio::select! {
+        biased;
+        _ = force.cancelled() => {
+            return Err(TransportError::Close(
+                "russh disconnect was cancelled before it could be queued".to_owned()
+            ));
+        }
+        result = disconnect => {
+            if let Err(error) = result {
+                tracing::warn!(%error, "russh disconnect failed after SFTP close");
+            }
+        }
+    }
+    tokio::select! {
+        biased;
+        _ = force.cancelled() => {
+            Err(TransportError::Close(
+                "russh connection did not terminate before forced cleanup".to_owned()
+            ))
+        }
+        result = &mut handle => {
+            if let Err(error) = result {
+                tracing::warn!(%error, "russh connection task failed during close");
+            }
+            Ok(())
+        }
+    }
+}
+
 #[async_trait]
 impl SessionFactory for RusshSessionFactory {
     async fn open(
@@ -594,75 +638,92 @@ impl SessionFactory for RusshSessionFactory {
             return Err(TransportError::PoolClosed);
         }
 
-        let connect = async {
-            let handler = StrictHostKey {
-                host: self.endpoint.host.clone(),
-                port: self.endpoint.port,
-                known_hosts: self.known_hosts.clone(),
-            };
-            let mut handle = client::connect(
+        let handler = StrictHostKey {
+            host: self.endpoint.host.clone(),
+            port: self.endpoint.port,
+            known_hosts: self.known_hosts.clone(),
+        };
+        let mut handle = tokio::select! {
+            biased;
+            _ = force.cancelled() => return Err(TransportError::PoolClosed),
+            result = client::connect(
                 Arc::new(russh_client_config()),
                 (self.endpoint.host.as_str(), self.endpoint.port),
                 handler,
-            )
-            .await
-            .map_err(|error| {
-                TransportError::Open(format!(
-                    "russh connect to {}:{} failed: {error}",
-                    self.endpoint.host, self.endpoint.port
-                ))
-            })?;
-            let hash = if self.identity_key.algorithm().is_rsa() {
-                Some(select_rsa_auth_hash(
-                    handle.best_supported_rsa_hash().await.map_err(|error| {
-                        TransportError::Open(format!("RSA hash probe failed: {error}"))
-                    })?,
-                )?)
-            } else {
-                None
-            };
-            authenticate_identity(
-                &mut handle,
-                self.endpoint.username.as_str(),
-                &self.identity_file,
-                self.identity_key.clone(),
-                hash,
-            )
-            .await?;
-
-            let channel = handle.channel_open_session().await.map_err(|error| {
-                TransportError::Open(format!("failed to open SSH session channel: {error}"))
-            })?;
-            channel
-                .request_subsystem(true, "sftp")
-                .await
-                .map_err(|error| {
-                    TransportError::Open(format!("failed to start SFTP subsystem: {error}"))
-                })?;
-            let (sftp, capabilities, limits) = handshake_sftp(channel.into_stream()).await?;
-            tracing::info!(
-                host = %self.endpoint.host,
-                port = self.endpoint.port,
-                window_size = RUSSH_WINDOW_SIZE,
-                maximum_packet_size = RUSSH_MAXIMUM_PACKET_SIZE,
-                max_concurrent_writes = RUSSH_SFTP_MAX_CONCURRENT_WRITES,
-                fsync = capabilities.fsync,
-                hardlink = capabilities.hardlink,
-                posix_rename = capabilities.posix_rename,
-                "opened russh SFTP session"
-            );
-            Ok(Box::new(RusshTransportSession {
-                handle: Some(handle),
-                sftp: Some(sftp),
-                capabilities,
-                limits,
-            }) as Box<dyn TransportSession>)
+            ) => result.map_err(|error| {
+                    TransportError::Open(format!(
+                        "russh connect to {}:{} failed: {error}",
+                        self.endpoint.host, self.endpoint.port
+                    ))
+                })?,
         };
+        let session = {
+            let session = async {
+                let hash = if self.identity_key.algorithm().is_rsa() {
+                    Some(select_rsa_auth_hash(
+                        handle.best_supported_rsa_hash().await.map_err(|error| {
+                            TransportError::Open(format!("RSA hash probe failed: {error}"))
+                        })?,
+                    )?)
+                } else {
+                    None
+                };
+                authenticate_identity(
+                    &mut handle,
+                    self.endpoint.username.as_str(),
+                    &self.identity_file,
+                    self.identity_key.clone(),
+                    hash,
+                )
+                .await?;
 
-        tokio::select! {
-            result = connect => result,
-            _ = force.cancelled() => Err(TransportError::PoolClosed),
-        }
+                let channel = handle.channel_open_session().await.map_err(|error| {
+                    TransportError::Open(format!("failed to open SSH session channel: {error}"))
+                })?;
+                channel
+                    .request_subsystem(true, "sftp")
+                    .await
+                    .map_err(|error| {
+                        TransportError::Open(format!("failed to start SFTP subsystem: {error}"))
+                    })?;
+                handshake_sftp(channel.into_stream()).await
+            };
+            tokio::pin!(session);
+            tokio::select! {
+                result = &mut session => result,
+                _ = force.cancelled() => Err(TransportError::PoolClosed),
+            }
+        };
+        let (sftp, capabilities, limits) = match session {
+            Ok(session) => session,
+            Err(open_error) => {
+                // The pool owns the open deadline. Once a Handle exists, its
+                // cleanup must outlive that deadline so account capacity is not
+                // released while a detached SSH connection can still exist.
+                let cleanup_force = CancellationToken::new();
+                return match close_ssh_handle(handle, &cleanup_force).await {
+                    Ok(()) => Err(open_error),
+                    Err(close_error) => Err(close_error),
+                };
+            }
+        };
+        tracing::info!(
+            host = %self.endpoint.host,
+            port = self.endpoint.port,
+            window_size = RUSSH_WINDOW_SIZE,
+            maximum_packet_size = RUSSH_MAXIMUM_PACKET_SIZE,
+            max_concurrent_writes = RUSSH_SFTP_MAX_CONCURRENT_WRITES,
+            fsync = capabilities.fsync,
+            hardlink = capabilities.hardlink,
+            posix_rename = capabilities.posix_rename,
+            "opened russh SFTP session"
+        );
+        Ok(Box::new(RusshTransportSession {
+            handle: Some(handle),
+            sftp: Some(sftp),
+            capabilities,
+            limits,
+        }) as Box<dyn TransportSession>)
     }
 }
 
@@ -765,7 +826,7 @@ impl RusshTransportSession {
         let close = sftp
             .close(handle)
             .await
-            .map_err(|error| map_sftp_error(path, error))
+            .map_err(|error| map_sftp_close_error(path, error))
             .map(|_| ());
         finish_raw_handle(operation, close)
     }
@@ -1023,7 +1084,7 @@ impl TransportSession for RusshTransportSession {
         let close = sftp
             .close(handle)
             .await
-            .map_err(|error| map_sftp_error(path, error));
+            .map_err(|error| map_sftp_close_error(path, error));
         finish_raw_handle(result, close.map(|_| ()))
     }
 
@@ -1076,7 +1137,7 @@ impl TransportSession for RusshTransportSession {
         let close = sftp
             .close(handle)
             .await
-            .map_err(|error| map_sftp_error(path, error))
+            .map_err(|error| map_sftp_close_error(path, error))
             .map(|_| ());
         finish_raw_handle(operation, close)
     }
@@ -1172,7 +1233,7 @@ impl TransportSession for RusshTransportSession {
         let close = sftp
             .close(handle)
             .await
-            .map_err(|error| map_sftp_error(path, error))
+            .map_err(|error| map_sftp_close_error(path, error))
             .map(|_| ());
         finish_raw_handle(bytes, close)
     }
@@ -1224,34 +1285,8 @@ impl TransportSession for RusshTransportSession {
         if let Some(sftp) = self.sftp.take() {
             let _ = sftp.close_session();
         }
-        if let Some(mut handle) = self.handle.take() {
-            let disconnect = handle.disconnect(russh::Disconnect::ByApplication, "", "");
-            tokio::select! {
-                biased;
-                _ = force.cancelled() => {
-                    return Err(TransportError::Close(
-                        "russh disconnect was cancelled before it could be queued".to_owned()
-                    ));
-                }
-                result = disconnect => {
-                    if let Err(error) = result {
-                        tracing::warn!(%error, "russh disconnect failed after SFTP close");
-                    }
-                }
-            }
-            tokio::select! {
-                biased;
-                _ = force.cancelled() => {
-                    return Err(TransportError::Close(
-                        "russh connection did not terminate before forced cleanup".to_owned()
-                    ));
-                }
-                result = &mut handle => {
-                    if let Err(error) = result {
-                        tracing::warn!(%error, "russh connection task failed during close");
-                    }
-                }
-            }
+        if let Some(handle) = self.handle.take() {
+            close_ssh_handle(handle, &force).await?;
         }
         Ok(())
     }
@@ -1371,6 +1406,11 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
 
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("exceeds limit"));
+        let eof = bounded
+            .read_u32()
+            .await
+            .expect_err("an oversized frame must poison the reader instead of busy-looping");
+        assert_eq!(eof.kind(), std::io::ErrorKind::UnexpectedEof);
     }
 
     #[tokio::test]
@@ -1415,9 +1455,18 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
 
     #[test]
     fn raw_handle_close_failure_overrides_reusable_operation_errors() {
+        let close_error = map_sftp_close_error(
+            Path::new("object"),
+            russh_sftp::client::error::Error::Status(russh_sftp::protocol::Status {
+                id: 1,
+                status_code: StatusCode::NoSuchFile,
+                error_message: "missing handle".to_owned(),
+                language_tag: "en-US".to_owned(),
+            }),
+        );
         let error = finish_raw_handle::<()>(
             Err(TransportError::NotFound("object".to_owned())),
-            Err(TransportError::Close("handle close failed".to_owned())),
+            Err(close_error),
         )
         .expect_err("a failed CLOSE must retire the physical session");
 
@@ -1849,6 +1898,13 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
 
         assert!(matches!(error, TransportError::Open(_)), "{error:?}");
         assert!(error.to_string().contains("limits"), "{error:?}");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while env.active_connections.load(Ordering::SeqCst) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("failed session establishment must await SSH connection cleanup");
     }
 
     #[tokio::test]
