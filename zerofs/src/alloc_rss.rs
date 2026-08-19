@@ -1,115 +1,32 @@
 //! Process RSS pressure used as the clean-cache admission / GC brake.
 //!
 //! foyer parts weighter is `Bytes.len()`, which is not process RSS. The brake
-//! therefore compares jemalloc's resident pages to a host/cgroup pressure
-//! threshold. jemalloc's retained statistic is deliberately excluded: it is
-//! reusable virtual address space, not resident physical memory.
+//! therefore compares jemalloc's resident pages to the pressure threshold
+//! installed from the validated service memory envelope. jemalloc's retained
+//! statistic is deliberately excluded: it is reusable virtual address space,
+//! not resident physical memory.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static RSS_CAP_BYTES: AtomicU64 = AtomicU64::new(0);
-const GIB: u64 = 1024 * 1024 * 1024;
-const MIN_PRESSURE_SLACK_BYTES: u64 = GIB;
-const MAX_PRESSURE_SLACK_BYTES: u64 = 8 * GIB;
 
 #[cfg(test)]
 thread_local! {
     static TEST_ENVELOPE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
     static TEST_ALLOCATOR_STATS: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
-    static TEST_SYSTEM_LIMITS: std::cell::Cell<Option<(u64, Option<u64>)>> = const { std::cell::Cell::new(None) };
 }
 
 /// Install an explicit pressure threshold. `0` disables the brake.
 ///
-/// Production startup should use [`configure_rss_cap_bytes`] so the threshold
-/// comes from the effective physical/cgroup memory limit rather than a cache
-/// payload budget. This setter remains the narrow test/administrative seam.
+/// Production startup installs the cap from its validated explicit service
+/// envelope before any cache/backend construction. This module deliberately
+/// does not rediscover cgroups: a container namespace may hide its outer cap.
 pub fn set_rss_cap_bytes(cap: u64) {
     RSS_CAP_BYTES.store(cap, Ordering::Relaxed);
 }
 
 pub fn rss_cap_bytes() -> u64 {
     RSS_CAP_BYTES.load(Ordering::Relaxed)
-}
-
-/// Configure and return the resident-pressure threshold for this process.
-///
-/// The effective limit is the tighter of physical memory and the current
-/// cgroup-v2 hierarchy. Ten percent is reserved for the kernel, non-jemalloc
-/// mappings, request buffers, and allocator lag, clamped to 1..=8 GiB (or half
-/// of a sub-2-GiB limit). If neither limit is observable, retain fail-closed
-/// behavior with a conservative cache-plus-slack fallback instead of disabling
-/// the brake.
-pub fn configure_rss_cap_bytes(configured_clean_cache_bytes: u64) -> u64 {
-    let (physical, cgroup) = system_memory_limits();
-    let cap = pressure_cap_from_limits(physical, cgroup).unwrap_or_else(|| {
-        configured_clean_cache_bytes.saturating_add(pressure_slack(configured_clean_cache_bytes))
-    });
-    set_rss_cap_bytes(cap);
-    cap
-}
-
-fn pressure_cap_from_limits(physical: Option<u64>, cgroup: Option<u64>) -> Option<u64> {
-    let limit = match (physical.filter(|v| *v > 0), cgroup.filter(|v| *v > 0)) {
-        (Some(physical), Some(cgroup)) => physical.min(cgroup),
-        (Some(physical), None) => physical,
-        (None, Some(cgroup)) => cgroup,
-        (None, None) => return None,
-    };
-    Some(limit.saturating_sub(pressure_slack(limit)))
-}
-
-fn pressure_slack(limit: u64) -> u64 {
-    (limit / 10)
-        .clamp(MIN_PRESSURE_SLACK_BYTES, MAX_PRESSURE_SLACK_BYTES)
-        .min(limit / 2)
-}
-
-fn system_memory_limits() -> (Option<u64>, Option<u64>) {
-    #[cfg(test)]
-    if let Some((physical, cgroup)) = TEST_SYSTEM_LIMITS.with(|limits| limits.get()) {
-        return (Some(physical), cgroup);
-    }
-    (physical_memory_bytes(), cgroup_memory_limit_bytes())
-}
-
-fn physical_memory_bytes() -> Option<u64> {
-    // SAFETY: sysconf has no pointer arguments and these selectors are defined
-    // by every Unix target ZeroFS supports.
-    let pages = unsafe { libc::sysconf(libc::_SC_PHYS_PAGES) };
-    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    if pages <= 0 || page_size <= 0 {
-        return None;
-    }
-    u64::try_from(pages)
-        .ok()?
-        .checked_mul(u64::try_from(page_size).ok()?)
-}
-
-#[cfg(target_os = "linux")]
-fn cgroup_memory_limit_bytes() -> Option<u64> {
-    let cgroup = std::fs::read_to_string("/proc/self/cgroup").ok()?;
-    let relative = cgroup.lines().find_map(|line| line.strip_prefix("0::"))?;
-    let root = std::path::Path::new("/sys/fs/cgroup");
-    let mut current = root.join(relative.trim_start_matches('/'));
-    let mut limit: Option<u64> = None;
-    loop {
-        if let Ok(raw) = std::fs::read_to_string(current.join("memory.max"))
-            && let Ok(value) = raw.trim().parse::<u64>()
-            && value > 0
-        {
-            limit = Some(limit.map_or(value, |known| known.min(value)));
-        }
-        if current == root || !current.pop() || !current.starts_with(root) {
-            break;
-        }
-    }
-    limit
-}
-
-#[cfg(not(target_os = "linux"))]
-fn cgroup_memory_limit_bytes() -> Option<u64> {
-    None
 }
 
 fn advance_epoch() -> bool {
@@ -164,6 +81,7 @@ pub fn set_test_rss_envelope(bytes: Option<u64>) {
 mod tests {
     use super::*;
 
+    const GIB: u64 = 1024 * 1024 * 1024;
     static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     struct Reset;
@@ -171,14 +89,9 @@ mod tests {
     impl Drop for Reset {
         fn drop(&mut self) {
             TEST_ALLOCATOR_STATS.with(|stats| stats.set(None));
-            TEST_SYSTEM_LIMITS.with(|limits| limits.set(None));
             set_test_rss_envelope(None);
             set_rss_cap_bytes(0);
         }
-    }
-
-    fn set_test_system_limits(physical: u64, cgroup: Option<u64>) {
-        TEST_SYSTEM_LIMITS.with(|limits| limits.set(Some((physical, cgroup))));
     }
 
     #[test]
@@ -198,15 +111,13 @@ mod tests {
     }
 
     #[test]
-    fn full_clean_cache_plus_overhead_fits_below_physical_pressure_cap() {
+    fn validated_service_envelope_allows_full_clean_cache_plus_overhead() {
         let _lock = TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _reset = Reset;
-        set_test_system_limits(96 * GIB, None);
+        set_rss_cap_bytes(88 * GIB);
         TEST_ALLOCATOR_STATS.with(|stats| stats.set(Some((70 * GIB, 30 * GIB))));
-
-        configure_rss_cap_bytes(64 * GIB);
 
         assert_eq!(rss_cap_bytes(), 88 * GIB);
         assert!(rss_cap_bytes() > 64 * GIB);
@@ -217,21 +128,18 @@ mod tests {
     }
 
     #[test]
-    fn hidden_cgroup_limit_bounds_pressure_cap_below_physical_memory() {
+    fn validated_service_envelope_trips_before_its_hard_limit() {
         let _lock = TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _reset = Reset;
-        set_test_system_limits(128 * GIB, Some(32 * GIB));
-        TEST_ALLOCATOR_STATS.with(|stats| stats.set(Some((29 * GIB, 0))));
+        set_rss_cap_bytes(56 * GIB);
+        TEST_ALLOCATOR_STATS.with(|stats| stats.set(Some((57 * GIB, 80 * GIB))));
 
-        configure_rss_cap_bytes(64 * GIB);
-
-        assert_eq!(rss_cap_bytes(), 32 * GIB - (32 * GIB / 10));
-        assert!(rss_cap_bytes() < 32 * GIB);
+        assert_eq!(jemalloc_rss_envelope(), 57 * GIB);
         assert!(
             over_rss_cap(),
-            "resident usage inside the cgroup slack must fail closed"
+            "resident usage above the validated service cap must fail closed"
         );
     }
 }
