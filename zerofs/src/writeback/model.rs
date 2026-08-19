@@ -163,6 +163,9 @@ impl MutationRecord {
     /// which is not known at admission.
     const MAX_BLOB_PATH: &str = "blobs/ff/ffffffffffffffff-ffffffffffffffff.blobs#18446744073709551615+18446744073709551615";
     const MAX_LOCAL_ETAG: &str = "wb:ffffffff-ffff-ffff-ffff-ffffffffffff:18446744073709551615";
+    /// Every accepted mutation occupies one SSD operation slot. Recovery
+    /// reseeds admission from the pending-record count, never payload length.
+    pub const SSD_RESERVATION_OPERATIONS: u64 = 1;
 
     pub fn blob_path(&self) -> Option<&str> {
         match &self.kind {
@@ -266,6 +269,12 @@ impl MutationRecord {
             last_error: None,
         }
         .ssd_reservation_bytes()
+    }
+
+    /// Operation slots charged for this record. Always one; payload length
+    /// never substitutes for the operation count.
+    pub fn ssd_reservation_operations(&self) -> u64 {
+        Self::SSD_RESERVATION_OPERATIONS
     }
 
     /// Reconstruct the reservation owned by a persisted record.
@@ -565,5 +574,30 @@ mod tests {
             + remote_version_entry;
 
         assert!(reserved_before_remote >= post_mark_footprint);
+    }
+
+    #[test]
+    fn recovery_seeds_one_operation_per_pending_record() {
+        let payload = record(MutationKind::Put {
+            mode: MutationMode::Update,
+            expected_visible_version: None,
+            payload_len: 1_048_576,
+            payload_sha256: [0x11; 32],
+            blob_path: "blobs/07/00000000-0000-0000-0000-000000001234.blob".to_owned(),
+        });
+        let metadata = record(MutationKind::Delete);
+        assert_eq!(
+            payload.ssd_reservation_operations(),
+            MutationRecord::SSD_RESERVATION_OPERATIONS
+        );
+        assert_eq!(
+            metadata.ssd_reservation_operations(),
+            MutationRecord::SSD_RESERVATION_OPERATIONS
+        );
+        assert_eq!(MutationRecord::SSD_RESERVATION_OPERATIONS, 1);
+        assert_ne!(
+            payload.ssd_reservation_bytes().unwrap(),
+            metadata.ssd_reservation_bytes().unwrap()
+        );
     }
 }
