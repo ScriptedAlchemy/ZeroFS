@@ -36,6 +36,7 @@ mod segment;
 mod segment_extractor;
 mod segment_store;
 mod sftp_object_store;
+mod sftp_protocol;
 mod sftp_transport;
 mod storage_class_object_store;
 mod storage_compatibility;
