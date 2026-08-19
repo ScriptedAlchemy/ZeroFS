@@ -442,6 +442,14 @@ impl OverlayIndex {
         })
     }
 
+    pub(crate) async fn get_remote_opts(
+        &self,
+        location: &Path,
+        options: GetOptions,
+    ) -> object_store::Result<GetResult> {
+        self.remote.get_opts(location, options).await
+    }
+
     pub async fn list(&self, prefix: Option<&Path>) -> object_store::Result<Vec<ObjectMeta>> {
         // Snapshot the overlay first so this list linearizes before any remote
         // publication/removal handoff that may run while the backend streams.

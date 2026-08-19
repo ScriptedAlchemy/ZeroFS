@@ -32,6 +32,11 @@ use crate::segment::{
 #[derive(Clone, Debug)]
 pub(crate) struct GeneratedSegmentCreate;
 
+/// Requests the authoritative backend view when reconciling an ambiguous
+/// segment create. Writeback must bypass its attempted local overlay payload.
+#[derive(Clone, Debug)]
+pub(crate) struct AuthoritativeSegmentRead;
+
 /// Handshake for backends that can publish a multipart upload atomically with
 /// create-only semantics. Backends that consume [`GeneratedSegmentCreate`]
 /// acknowledge this context before returning the upload handle. An ignored
@@ -46,7 +51,7 @@ impl ConditionalMultipartCreate {
         self.acknowledged.store(true, Ordering::Release);
     }
 
-    fn is_acknowledged(&self) -> bool {
+    pub(crate) fn is_acknowledged(&self) -> bool {
         self.acknowledged.load(Ordering::Acquire)
     }
 }
@@ -65,6 +70,12 @@ pub enum SegmentStoreError {
 }
 
 type Result<T> = std::result::Result<T, SegmentStoreError>;
+
+#[derive(Debug)]
+enum SegmentPublication {
+    Multipart(PutResult),
+    SingleFallback,
+}
 
 /// Concurrent per-shard LIST chains inside [`SegmentStore::list_segments_stream`].
 /// Bounds in-flight LIST requests and, with them, how much listing a retrying
@@ -142,11 +153,14 @@ impl SegmentStore {
         if bytes.len() < SEAL_PART_SIZE {
             self.put_segment_create(&path, &bytes).await?;
         } else {
-            let result = self.put_segment_multipart(&path, &bytes).await?;
-            // Multipart bypasses the object-store wrapper's single-PUT
-            // write-through, so only this path needs the explicit warm hook.
-            if let Some(warm) = &self.warm {
-                warm(&path, bytes, &result);
+            if let SegmentPublication::Multipart(result) =
+                self.put_segment_multipart(&path, &bytes).await?
+            {
+                // True multipart bypasses the object-store wrapper's single-PUT
+                // write-through, so only this outcome needs the explicit hook.
+                if let Some(warm) = &self.warm {
+                    warm(&path, bytes, &result);
+                }
             }
         }
         Ok(())
@@ -188,6 +202,7 @@ impl SegmentStore {
         options
             .extensions
             .insert(crate::object_store_prefetch::SkipPartsCache);
+        options.extensions.insert(AuthoritativeSegmentRead);
         let result = self
             .object_store
             .get_opts(path, options)
@@ -230,30 +245,33 @@ impl SegmentStore {
         &self,
         path: &Path,
         bytes: &Bytes,
-    ) -> Result<slatedb::object_store::PutResult> {
+    ) -> Result<SegmentPublication> {
         let capability = ConditionalMultipartCreate::default();
         let mut options = PutMultipartOptions::default();
         options.extensions.insert(GeneratedSegmentCreate);
         options.extensions.insert(capability.clone());
-        let mut upload = match self.object_store.put_multipart_opts(path, options).await {
+        let upload = match self.object_store.put_multipart_opts(path, options).await {
             Ok(upload) => upload,
             Err(slatedb::object_store::Error::NotSupported { .. }) => {
-                return self.put_segment_create(path, bytes).await;
+                self.put_segment_create(path, bytes).await?;
+                return Ok(SegmentPublication::SingleFallback);
             }
             Err(error) => return Err(SegmentStoreError::ObjectStore(error.to_string())),
         };
         if capability.is_acknowledged() {
             return self
                 .complete_segment_upload(path, bytes, upload, true)
-                .await;
+                .await
+                .map(SegmentPublication::Multipart);
         }
 
-        upload.abort().await.map_err(|error| {
+        abort_segment_upload(upload).await.map_err(|error| {
             SegmentStoreError::ObjectStore(format!(
                 "backend ignored conditional multipart create and probe cleanup failed for {path}: {error}"
             ))
         })?;
-        self.put_segment_create(path, bytes).await
+        self.put_segment_create(path, bytes).await?;
+        Ok(SegmentPublication::SingleFallback)
     }
 
     async fn complete_segment_upload(
@@ -287,7 +305,7 @@ impl SegmentStore {
         .await;
         if let Err(error) = parts_result {
             parts.shutdown().await;
-            if let Err(abort_err) = upload.abort().await {
+            if let Err(abort_err) = abort_segment_upload(upload).await {
                 tracing::warn!("segment seal: aborting failed upload of {path}: {abort_err}");
             }
             return Err(SegmentStoreError::ObjectStore(error.to_string()));
@@ -296,7 +314,7 @@ impl SegmentStore {
         match upload.complete().await {
             Ok(result) => Ok(result),
             Err(e) => {
-                if let Err(abort_err) = upload.abort().await {
+                if let Err(abort_err) = abort_segment_upload(upload).await {
                     tracing::warn!("segment seal: aborting failed upload of {path}: {abort_err}");
                 }
                 if reconcile_completion {
@@ -467,6 +485,17 @@ impl SegmentStore {
             .await
             .map_err(|e| SegmentStoreError::ObjectStore(e.to_string()))
     }
+}
+
+async fn abort_segment_upload(
+    mut upload: Box<dyn MultipartUpload>,
+) -> slatedb::object_store::Result<()> {
+    tokio::spawn(async move { upload.abort().await })
+        .await
+        .map_err(|error| slatedb::object_store::Error::Generic {
+            store: "SegmentStore",
+            source: format!("multipart abort task failed: {error}").into(),
+        })?
 }
 
 /// GC/maintenance primitives.
@@ -1127,6 +1156,28 @@ mod tests {
             warms.load(Ordering::Relaxed),
             0,
             "the explicit warm hook is only needed when multipart bypasses single-PUT write-through"
+        );
+    }
+
+    #[tokio::test]
+    async fn multipart_fallback_does_not_repeat_the_store_write_through_warm() {
+        let os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let warms = Arc::new(AtomicU64::new(0));
+        let observed = warms.clone();
+        let warm: SegmentWarmHook = Arc::new(move |_, _, _| {
+            observed.fetch_add(1, Ordering::Relaxed);
+        });
+        let store = SegmentStore::new(os, codec(), 5, Some(warm));
+
+        store
+            .put_segment(store.next_segid(), Bytes::from(vec![7u8; SEAL_PART_SIZE]))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            warms.load(Ordering::Relaxed),
+            0,
+            "an unacknowledged multipart probe falls back to single-PUT write-through"
         );
     }
 
