@@ -29,6 +29,8 @@ pub enum RemoteBarrierError {
     Closed,
     #[error("remote writeback failed: {0}")]
     Remote(String),
+    #[error("remote writeback journal incarnation is stale")]
+    StaleIncarnation,
 }
 
 impl BarrierError for RemoteBarrierError {
@@ -38,6 +40,10 @@ impl BarrierError for RemoteBarrierError {
 
     fn terminal(error: String) -> Self {
         Self::Remote(error)
+    }
+
+    fn stale_incarnation() -> Self {
+        Self::StaleIncarnation
     }
 }
 
@@ -61,11 +67,16 @@ fn publish_terminal(
 #[derive(Clone)]
 pub struct RemoteBarrier {
     progress: SequenceBarrier<RemoteBarrierError>,
+    incarnation: uuid::Uuid,
 }
 
 impl RemoteBarrier {
+    pub fn incarnation(&self) -> uuid::Uuid {
+        self.incarnation
+    }
+
     pub async fn wait_remote(&self, sequence: Sequence) -> Result<(), RemoteBarrierError> {
-        self.progress.wait(sequence).await
+        self.progress.wait(self.incarnation, sequence).await
     }
 }
 
@@ -184,8 +195,10 @@ impl RemoteScheduler {
         active: bool,
     ) -> anyhow::Result<Self> {
         let (admission, disk) = admissions;
+        let snapshot = journal.snapshot()?;
         let journal_progress = journal.progress()?;
         let (progress_sender, progress) = watch::channel(SequenceProgress {
+            incarnation: snapshot.incarnation,
             sequence: journal_progress.remote_seq,
             terminal_error: None,
             closed: false,
@@ -213,6 +226,7 @@ impl RemoteScheduler {
             inner: Arc::new(RemoteSchedulerInner {
                 barrier: RemoteBarrier {
                     progress: SequenceBarrier::new(progress),
+                    incarnation: snapshot.incarnation,
                 },
                 activate,
                 stop,
@@ -974,13 +988,23 @@ fn remote_put_mode(
                 let expected = expected_visible_version(record).ok_or_else(|| {
                     precondition(&record.path, "update has no visible predecessor")
                 })?;
-                let predecessor_sequence =
-                    LocalEtag::sequence_from_str(expected).ok_or_else(|| {
+                let (predecessor_incarnation, predecessor_sequence) = LocalEtag::parse(expected)
+                    .ok_or_else(|| {
                         precondition(
                             &record.path,
                             "update has no durable remote predecessor ETag",
                         )
                     })?;
+                let current_incarnation = journal
+                    .snapshot()
+                    .map_err(|error| generic_error(format!("journal snapshot failed: {error}")))?
+                    .incarnation;
+                if predecessor_incarnation != current_incarnation {
+                    return Err(precondition(
+                        &record.path,
+                        "update predecessor ETag belongs to a stale journal incarnation",
+                    ));
+                }
                 journal
                     .remote_object_etag(&record.path, predecessor_sequence)
                     .map_err(|error| {

@@ -45,6 +45,8 @@ pub enum LocalBarrierError {
     Closed,
     #[error("local writeback durability failed: {0}")]
     LocalDurability(String),
+    #[error("local writeback journal incarnation is stale")]
+    StaleIncarnation,
 }
 
 impl BarrierError for LocalBarrierError {
@@ -55,11 +57,16 @@ impl BarrierError for LocalBarrierError {
     fn terminal(error: String) -> Self {
         Self::LocalDurability(error)
     }
+
+    fn stale_incarnation() -> Self {
+        Self::StaleIncarnation
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct LocalBarrier {
     progress: SequenceBarrier<LocalBarrierError>,
+    incarnation: uuid::Uuid,
 }
 
 impl LocalBarrier {
@@ -67,8 +74,12 @@ impl LocalBarrier {
         self.progress.sequence()
     }
 
+    pub fn incarnation(&self) -> uuid::Uuid {
+        self.incarnation
+    }
+
     pub async fn wait_local(&self, sequence: Sequence) -> Result<(), LocalBarrierError> {
-        self.progress.wait(sequence).await
+        self.progress.wait(self.incarnation, sequence).await
     }
 }
 
@@ -280,11 +291,12 @@ impl LocalJournaler {
         prepare_concurrency: usize,
         observer: Option<Arc<dyn LocalCommitObserver>>,
     ) -> AnyResult<Self> {
-        let local_sequence = journal.progress()?.local_seq;
+        let snapshot = journal.snapshot()?;
         Ok(Self::start_with_sink_and_observer(
             journal,
             admission,
-            local_sequence,
+            snapshot.local_seq,
+            snapshot.incarnation,
             queue_depth,
             prepare_concurrency,
             observer,
@@ -302,6 +314,7 @@ impl LocalJournaler {
             sink,
             admission,
             local_sequence,
+            uuid::Uuid::nil(),
             queue_depth,
             DEFAULT_LOCAL_PREPARE_CONCURRENCY,
             None,
@@ -312,12 +325,14 @@ impl LocalJournaler {
         sink: Arc<dyn LocalJournalSink>,
         admission: Admission,
         local_sequence: Sequence,
+        incarnation: uuid::Uuid,
         queue_depth: usize,
         prepare_concurrency: usize,
         observer: Option<Arc<dyn LocalCommitObserver>>,
     ) -> Self {
         let (sender, receiver) = mpsc::channel(queue_depth.max(1));
         let (progress_sender, progress) = watch::channel(SequenceProgress {
+            incarnation,
             sequence: local_sequence,
             terminal_error: None,
             closed: false,
@@ -341,6 +356,7 @@ impl LocalJournaler {
                 sender,
                 barrier: LocalBarrier {
                     progress: SequenceBarrier::new(progress),
+                    incarnation,
                 },
                 admission_gate: Mutex::new(()),
                 closed: AtomicBool::new(false),
@@ -1737,6 +1753,7 @@ mod tests {
             sink,
             admission.clone(),
             0,
+            uuid::Uuid::nil(),
             8,
             DEFAULT_LOCAL_PREPARE_CONCURRENCY,
             Some(observer.clone()),
@@ -2017,6 +2034,7 @@ mod tests {
             sink.clone(),
             admission.clone(),
             0,
+            uuid::Uuid::nil(),
             queue,
             queue,
             None,
@@ -2078,6 +2096,7 @@ mod tests {
             sink.clone(),
             admission.clone(),
             0,
+            uuid::Uuid::nil(),
             queue,
             queue,
             None,
@@ -2136,6 +2155,7 @@ mod tests {
             sink.clone(),
             admission.clone(),
             0,
+            uuid::Uuid::nil(),
             RECORDS as usize,
             PREPARE_CONCURRENCY,
             None,
@@ -2302,6 +2322,7 @@ mod tests {
             sink.clone(),
             admission.clone(),
             0,
+            uuid::Uuid::nil(),
             8,
             8,
             None,
@@ -2363,6 +2384,7 @@ mod tests {
             sink,
             admission.clone(),
             0,
+            uuid::Uuid::nil(),
             8,
             8,
             Some(Arc::new(FailingSecondObserver)),
@@ -2454,6 +2476,7 @@ mod tests {
             sink,
             admission.clone(),
             0,
+            uuid::Uuid::nil(),
             8,
             8,
             Some(observer.clone()),
@@ -2671,8 +2694,15 @@ mod tests {
             staged_tx,
         ));
         let admission = Admission::new(64);
-        let journaler =
-            LocalJournaler::start_with_sink_and_observer(sink, admission.clone(), 0, 8, 8, None);
+        let journaler = LocalJournaler::start_with_sink_and_observer(
+            sink,
+            admission.clone(),
+            0,
+            uuid::Uuid::nil(),
+            8,
+            8,
+            None,
+        );
         let ram = admission.reserve(7).await.unwrap().accept();
         let barrier = journaler
             .submit_put(
@@ -2733,8 +2763,15 @@ mod tests {
             staged_tx,
         ));
         let admission = Admission::new(64);
-        let journaler =
-            LocalJournaler::start_with_sink_and_observer(sink, admission.clone(), 0, 8, 8, None);
+        let journaler = LocalJournaler::start_with_sink_and_observer(
+            sink,
+            admission.clone(),
+            0,
+            uuid::Uuid::nil(),
+            8,
+            8,
+            None,
+        );
 
         let ram = admission.reserve(7).await.unwrap().accept();
         let barrier = journaler
@@ -2956,8 +2993,15 @@ mod tests {
             )
         });
         let admission = Admission::new(64);
-        let journaler =
-            LocalJournaler::start_with_sink_and_observer(sink, admission.clone(), 0, 8, 8, None);
+        let journaler = LocalJournaler::start_with_sink_and_observer(
+            sink,
+            admission.clone(),
+            0,
+            uuid::Uuid::nil(),
+            8,
+            8,
+            None,
+        );
 
         let ram = admission.reserve(7).await.unwrap().accept();
         let barrier = journaler
@@ -3018,8 +3062,15 @@ mod tests {
             ..PipelineGateSink::new(journal.clone(), 1, commit_entered_tx, release_rx, staged_tx)
         });
         let admission = Admission::new(64);
-        let journaler =
-            LocalJournaler::start_with_sink_and_observer(sink, admission.clone(), 0, 8, 8, None);
+        let journaler = LocalJournaler::start_with_sink_and_observer(
+            sink,
+            admission.clone(),
+            0,
+            uuid::Uuid::nil(),
+            8,
+            8,
+            None,
+        );
 
         let ram = admission.reserve(7).await.unwrap().accept();
         let barrier = journaler
@@ -3170,8 +3221,15 @@ mod tests {
             prepared_operations: AtomicU64::new(0),
             prepared_payload_bytes: AtomicU64::new(0),
         });
-        let journaler =
-            LocalJournaler::start_with_sink_and_observer(sink, admission.clone(), 0, 1, 1, None);
+        let journaler = LocalJournaler::start_with_sink_and_observer(
+            sink,
+            admission.clone(),
+            0,
+            uuid::Uuid::nil(),
+            1,
+            1,
+            None,
+        );
         let first = admission.reserve(1).await.unwrap().accept();
         journaler
             .submit_put(put_record(1, b"x"), Bytes::from_static(b"x"), first)

@@ -395,11 +395,14 @@ impl LocalEtag {
         &self.0
     }
 
-    pub(crate) fn sequence_from_str(value: &str) -> Option<Sequence> {
+    pub(crate) fn parse(value: &str) -> Option<(Uuid, Sequence)> {
         let (namespace_and_incarnation, sequence) = value.rsplit_once(':')?;
         let incarnation = namespace_and_incarnation.strip_prefix("wb:")?;
-        Uuid::parse_str(incarnation).ok()?;
-        sequence.parse().ok()
+        Some((Uuid::parse_str(incarnation).ok()?, sequence.parse().ok()?))
+    }
+
+    pub(crate) fn sequence_from_str(value: &str) -> Option<Sequence> {
+        Self::parse(value).map(|(_, sequence)| sequence)
     }
 }
 
@@ -442,6 +445,18 @@ mod tests {
             retry_count: 0,
             last_error: None,
         }
+    }
+
+    #[test]
+    fn local_etag_parse_retains_incarnation() {
+        let incarnation = Uuid::from_u128(0x5678);
+        let etag = LocalEtag::new(incarnation, 7);
+        assert_eq!(LocalEtag::parse(etag.as_str()), Some((incarnation, 7)));
+        assert_eq!(LocalEtag::sequence_from_str(etag.as_str()), Some(7));
+        assert_eq!(
+            LocalEtag::parse(&LocalEtag::new(Uuid::from_u128(0x1111), 7).as_str()),
+            Some((Uuid::from_u128(0x1111), 7))
+        );
     }
 
     #[test]
