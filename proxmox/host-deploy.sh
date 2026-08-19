@@ -42,6 +42,7 @@ dry_run_ct_destroyed=false
 defer_commit=false
 maintenance_nfs_only=false
 drain_timeout=1800
+local_durable_upgrade=false
 
 while (($#)); do
   case "$1" in
@@ -69,6 +70,7 @@ while (($#)); do
     --defer-commit) defer_commit=true; shift ;;
     --maintenance-nfs-only) maintenance_nfs_only=true; shift ;;
     --drain-timeout) drain_timeout=$2; shift 2 ;;
+    --local-durable-upgrade) local_durable_upgrade=true; shift ;;
     --dry-run) dry_run=true; shift ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
@@ -119,6 +121,10 @@ if [[ $defer_commit == true && ! ( $role == prod && $action == deploy ) ]]; then
 fi
 if [[ $maintenance_nfs_only == true && ! ( $role == prod && $action == deploy && $defer_commit == true ) ]]; then
   echo "--maintenance-nfs-only requires a deferred production deploy" >&2
+  exit 2
+fi
+if [[ $local_durable_upgrade == true && ! ( $role == prod && $action == deploy && $defer_commit == true ) ]]; then
+  echo "--local-durable-upgrade requires a deferred production deploy" >&2
   exit 2
 fi
 if [[ $action == promote || $action == finalize || $action == commit || $action == rollback || $action == recover ]] && [[ $role != prod ]]; then
@@ -178,6 +184,21 @@ assert_managed_state_child() {
     echo "unsafe managed state child ownership/mode: $path ($actual)" >&2
     return 1
   fi
+}
+
+writeback_dir_from_config() {
+  awk '
+    /^\[writeback\][[:space:]]*$/ { in_writeback=1; next }
+    /^\[/ { in_writeback=0 }
+    in_writeback && /^[[:space:]]*dir[[:space:]]*=/ {
+      value=$0
+      sub(/^[[:space:]]*dir[[:space:]]*=[[:space:]]*"/, "", value)
+      sub(/"[[:space:]]*(#.*)?$/, "", value)
+      print value
+      found++
+    }
+    END { if (found != 1) exit 1 }
+  ' "$1"
 }
 
 prepare_managed_state_tree() {
@@ -850,9 +871,11 @@ assert_server_drained() {
     fi
     drained=true
     [[ ${value[zerofs_writeback_accepted_sequence]} == "${value[zerofs_writeback_local_sequence]}" ]] || drained=false
-    [[ ${value[zerofs_writeback_local_sequence]} == "${value[zerofs_writeback_remote_sequence]}" ]] || drained=false
     [[ ${value[zerofs_writeback_dirty_ram_bytes]} == 0 ]] || drained=false
-    [[ ${value[zerofs_writeback_dirty_ssd_reserved_bytes]} == 0 ]] || drained=false
+    if [[ $local_durable_upgrade == false ]]; then
+      [[ ${value[zerofs_writeback_local_sequence]} == "${value[zerofs_writeback_remote_sequence]}" ]] || drained=false
+      [[ ${value[zerofs_writeback_dirty_ssd_reserved_bytes]} == 0 ]] || drained=false
+    fi
     if [[ $role == dev ]]; then
       [[ ${value[zerofs_nbd_volatile_memory_dirty_bytes]} == 0 ]] || drained=false
       [[ ${value[zerofs_nbd_volatile_memory_dirty_operations]} == 0 ]] || drained=false
@@ -1016,6 +1039,29 @@ if [[ $dry_run == false && -L $state_root/current ]]; then
     echo "current release receipt is not a canonical regular file" >&2
     exit 1
   }
+fi
+if [[ $local_durable_upgrade == true ]]; then
+  if [[ $dry_run == true ]]; then
+    echo "+ verify the existing and staged releases use the unchanged persistent writeback directory"
+  else
+    [[ -n $previous_config ]] || {
+      echo "local-durable upgrade requires an existing canonical release" >&2
+      exit 1
+    }
+    previous_writeback_dir=$(writeback_dir_from_config "$previous_config") || {
+      echo "existing release has no unambiguous [writeback] dir" >&2
+      exit 1
+    }
+    staged_writeback_dir=$(writeback_dir_from_config "$stage/zerofs.toml") || {
+      echo "staged release has no unambiguous [writeback] dir" >&2
+      exit 1
+    }
+    [[ $previous_writeback_dir == /srv/zerofs-persist/state/writeback \
+      && $staged_writeback_dir == "$previous_writeback_dir" ]] || {
+      echo "local-durable upgrade requires the unchanged persistent writeback directory" >&2
+      exit 1
+    }
+  fi
 fi
 capture_ct_resources
 rollback_backup=

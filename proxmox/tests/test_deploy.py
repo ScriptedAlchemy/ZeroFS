@@ -218,6 +218,15 @@ addresses = ["10.10.10.30:9567"]
             self.write_config(self.valid_config()), "10.10.10.20"
         )
 
+    def test_local_durable_upgrade_requires_exact_ctid_confirmation(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError, "ZEROFS_CONFIRM_LOCAL_DURABLE_UPGRADE=198"
+        ):
+            deploy.require_local_durable_upgrade_confirmation(198, "198", None)
+        with self.assertRaisesRegex(ValueError, "--confirm-local-durable-upgrade 198"):
+            deploy.require_local_durable_upgrade_confirmation(198, None, "198")
+        deploy.require_local_durable_upgrade_confirmation(198, "198", "198")
+
     def test_hpn_transport_requires_exact_release_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             program = Path(directory) / "hpnssh"
