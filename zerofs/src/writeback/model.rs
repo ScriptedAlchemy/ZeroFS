@@ -55,9 +55,7 @@ pub enum FenceClass {
 
 /// Derive replay ordering from the persisted operation contract, not from an
 /// object key alone. Only an explicit create-only PUT to a canonical immutable
-/// database object may preupload across an earlier ordering fence. Multipart
-/// completion is persisted as `Overwrite`, so it deliberately cannot qualify
-/// even when its destination resembles a compacted SST.
+/// database object may preupload across an earlier ordering fence.
 pub(crate) fn classify_mutation_fence(
     path: &str,
     kind: &MutationKind,
@@ -73,20 +71,10 @@ pub(crate) fn classify_mutation_fence(
         return FenceClass::Fence;
     }
 
-    let (Ok(location), Ok(database_prefix)) = (Path::parse(path), Path::parse(database_prefix))
-    else {
+    let Some(suffix) = database_suffix(path, database_prefix) else {
         return FenceClass::Fence;
     };
-    let Some(suffix) = location.prefix_match(&database_prefix) else {
-        return FenceClass::Fence;
-    };
-    let suffix = suffix
-        .map(|part| part.as_ref().to_owned())
-        .collect::<Vec<_>>();
-
-    let is_segment = suffix.len() == 4
-        && suffix[0] == "segments"
-        && crate::segment::Segid::from_object_key(&suffix.join("/")).is_some();
+    let is_segment = is_canonical_segment_suffix(&suffix);
     let is_sst = match suffix.as_slice() {
         [directory, filename] if directory == "wal" => canonical_wal_filename(filename),
         [directory, filename] if directory == "compacted" => canonical_compacted_filename(filename),
@@ -98,6 +86,27 @@ pub(crate) fn classify_mutation_fence(
     } else {
         FenceClass::Fence
     }
+}
+
+pub(crate) fn is_canonical_segment_path(path: &str, database_prefix: &str) -> bool {
+    database_suffix(path, database_prefix)
+        .is_some_and(|suffix| is_canonical_segment_suffix(&suffix))
+}
+
+fn database_suffix(path: &str, database_prefix: &str) -> Option<Vec<String>> {
+    let (Ok(location), Ok(database_prefix)) = (Path::parse(path), Path::parse(database_prefix))
+    else {
+        return None;
+    };
+    location
+        .prefix_match(&database_prefix)
+        .map(|suffix| suffix.map(|part| part.as_ref().to_owned()).collect())
+}
+
+fn is_canonical_segment_suffix(suffix: &[String]) -> bool {
+    suffix.len() == 4
+        && suffix[0] == "segments"
+        && crate::segment::Segid::from_object_key(&suffix.join("/")).is_some()
 }
 
 fn canonical_wal_filename(filename: &str) -> bool {
