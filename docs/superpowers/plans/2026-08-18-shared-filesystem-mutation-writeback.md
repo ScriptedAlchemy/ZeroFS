@@ -1533,8 +1533,8 @@ cargo_test_nonzero 'segment_store::tests' -p zerofs --locked
 cargo_test_nonzero 'writeback::store::tests' -p zerofs --locked
 cargo_test_nonzero 'writeback::journaler::tests' -p zerofs --locked
 cargo_test_nonzero 'config::tests' -p zerofs --locked
-cargo test -p zerofs --locked fs::store::extent::reclaim::tests::sparse_interleaved_full_segment_uses_at_most_thirty_two_verification_scans -- --exact --nocapture
-cargo test -p zerofs --locked fs::store::extent::reclaim::tests::reclaim_scan_row_or_byte_budget_exhaustion_fails_closed -- --exact --nocapture
+cargo_test_nonzero 'fs::store::extent::reclaim::tests::sparse_interleaved_full_segment_uses_at_most_thirty_two_verification_scans' -p zerofs --locked
+cargo_test_nonzero 'fs::store::extent::reclaim::tests::reclaim_scan_row_or_byte_budget_exhaustion_fails_closed' -p zerofs --locked
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --all-targets --locked

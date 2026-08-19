@@ -384,7 +384,9 @@ batches sparse/interleaved forward keys: a full 1,024-frame segment uses no more
 16 fixed 64-key batches and two streaming views, for at most 32 scans rather than
 2,048 point reads. Across both views it may inspect at most 4,096 rows and 64 MiB of
 encoded key/value bytes; exhausting either budget returns `Keep`. Scan/decode errors
-and either view retaining a reference fail closed.
+and either view retaining a reference fail closed. Focused acceptance lists and runs
+both exact reclaim tests with nonzero selection; a raw Cargo zero-test success is not
+evidence.
 Any later write-admission or maintenance-cache
 exception requires its own bounded policy and measured RED/GREEN proof.
 

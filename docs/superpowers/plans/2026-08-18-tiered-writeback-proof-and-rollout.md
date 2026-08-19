@@ -749,7 +749,8 @@ does not create false permanent over-cap or poison. The GC overlap includes one 
 1,024-frame sparse/interleaved candidate and requires at most 32 memory+durable scans,
 at most 4,096 scanned rows and 64 MiB encoded key/value bytes, no per-frame point-read
 fanout, and bounded scan working memory. Budget exhaustion must stop and fail closed to
-`Keep`.
+`Keep`. Both focused GREEN tests use the fully qualified `cargo_test_nonzero` helper;
+a zero-selection Cargo success is rejected.
 Before the first process starts, the immutable ledger records these fixed thresholds:
 `cgroup_high_event_delta_max=8`, `reconciliation_error_bytes_max=268435456`, and
 `unowned_residual_bytes_max=2147483648`. They cannot be supplied by scenario output,
