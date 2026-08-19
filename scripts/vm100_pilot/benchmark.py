@@ -20,6 +20,7 @@ from .metrics import (
     wait_for_gc_quiescence,
     wait_for_local,
 )
+from .owned_resources import atomic_write_json
 from .receipts import RunReceipt
 from .runner import Runner
 from .system_io import (
@@ -1108,10 +1109,7 @@ class BenchmarkRunner:
                 )
                 result = replace(result, receipt_dir=str(receipt.directory))
                 receipt.record("result", result.to_dict())
-                receipt.path("summary.json").write_text(
-                    json.dumps(result.to_dict(), indent=2, sort_keys=True) + "\n",
-                    encoding="utf-8",
-                )
+                atomic_write_json(receipt.path("summary.json"), result.to_dict())
             finally:
                 primary_error = sys.exception()
                 cleanup_errors: list[BaseException] = []
