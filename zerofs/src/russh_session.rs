@@ -11,7 +11,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
-pub use crate::sftp_protocol::{RUSSH_SFTP_MAX_CONCURRENT_WRITES, russh_sftp_config};
+pub use crate::sftp_protocol::RUSSH_SFTP_MAX_CONCURRENT_WRITES;
+#[cfg(test)]
+pub use crate::sftp_protocol::russh_sftp_config;
 
 /// HPN-style static SSH channel window. russh has no dynamic scaler.
 pub const RUSSH_WINDOW_SIZE: u32 = 16 * 1024 * 1024;
