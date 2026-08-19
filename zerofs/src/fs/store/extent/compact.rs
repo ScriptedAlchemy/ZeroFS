@@ -277,7 +277,7 @@ impl ExtentStore {
     ) -> Result<(), FsError> {
         let dir = self
             .segments
-            .read_directory(segid, false)
+            .read_directory(segid)
             .await
             .map_err(|_| FsError::IoError)?;
 
@@ -352,14 +352,7 @@ impl ExtentStore {
                 async move {
                     let payloads = store
                         .segments
-                        .read_compressed_run(
-                            segid,
-                            byte_offset,
-                            total_len,
-                            first_frame,
-                            &slots,
-                            false,
-                        )
+                        .read_compressed_run(segid, byte_offset, total_len, first_frame, &slots)
                         .await
                         .map_err(|_| FsError::IoError)?;
                     Ok::<_, FsError>(

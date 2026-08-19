@@ -1002,7 +1002,7 @@ impl ExtentStore {
     /// segment. This replaces a 20-wide dual get_bytes/get_bytes_durable per
     /// unique directory extent, which OOM-d reclaim on a full foyer floor.
     async fn verify_segment_reclaimable(&self, segid: Segid) -> SegmentDeadVerdict {
-        let mut dir = match self.segments.read_directory(segid, false).await {
+        let mut dir = match self.segments.read_directory(segid).await {
             Ok(d) => d,
             Err(SegmentStoreError::NotFound) => return SegmentDeadVerdict::ObjectAbsent,
             Err(error) => {
@@ -1554,7 +1554,7 @@ mod tests {
             parsed.dir_offset + u64::from(parsed.dir_len) + crate::segment::FOOTER_LEN as u64,
             "object length must include the exact frame region, directory, and footer"
         );
-        let mut want = writer.segments.read_directory(segid, false).await.unwrap();
+        let mut want = writer.segments.read_directory(segid).await.unwrap();
         assert_eq!(
             want.len(),
             FULL_SEGMENT_FRAMES,
