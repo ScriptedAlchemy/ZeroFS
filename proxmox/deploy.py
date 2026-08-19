@@ -406,6 +406,50 @@ def validate_server_config(
     return storage_url
 
 
+HPN_RELEASE_PROGRAM = "/srv/zerofs-persist/current/hpnssh"
+
+
+def validate_hpn_release_artifact(
+    config_path: Path, artifact: Path | None
+) -> str | None:
+    with config_path.open("rb") as handle:
+        settings = tomllib.load(handle)
+    sftp = settings.get("sftp")
+    transport = sftp.get("transport", "russh") if isinstance(sftp, dict) else "russh"
+    if transport != "hpn_openssh":
+        if artifact is not None:
+            raise ValueError("--hpn-program is only valid for transport = hpn_openssh")
+        return None
+    if artifact is None:
+        raise ValueError("--hpn-program is required for transport = hpn_openssh")
+    configured_program = sftp.get("hpn_program")
+    if configured_program != HPN_RELEASE_PROGRAM:
+        raise ValueError(
+            f"production HPN hpn_program must be exactly {HPN_RELEASE_PROGRAM}"
+        )
+    configured_sha = sftp.get("hpn_sha256")
+    if not isinstance(configured_sha, str) or not re.fullmatch(
+        r"[0-9a-f]{64}", configured_sha
+    ):
+        raise ValueError("production HPN hpn_sha256 must be 64 lowercase hex digits")
+    try:
+        metadata = artifact.lstat()
+    except OSError as error:
+        raise ValueError(f"--hpn-program is unavailable: {artifact}") from error
+    if artifact.is_symlink() or not artifact.is_file():
+        raise ValueError("--hpn-program must be a regular file, never a symlink")
+    if metadata.st_mode & 0o111 == 0 or metadata.st_mode & 0o022:
+        raise ValueError(
+            "--hpn-program must be executable and not group- or world-writable"
+        )
+    actual_sha = sha256(artifact)
+    if actual_sha != configured_sha:
+        raise ValueError(
+            f"--hpn-program SHA-256 {actual_sha} does not match configured {configured_sha}"
+        )
+    return actual_sha
+
+
 def render_nfs_bootstrap_config(source: str) -> str:
     excluded = ("servers.ninep", "servers.nbd", "servers.webui")
     rendered: list[str] = []
@@ -1025,6 +1069,8 @@ def _stage_and_run_host(
             files += ((args.identity_file, "storage-key"),)
         if args.known_hosts is not None:
             files += ((args.known_hosts, "known_hosts"),)
+        if args.hpn_program is not None:
+            files += ((args.hpn_program, "hpnssh"),)
         if (
             args.role == "prod"
             and args.prod_access in {"smb", "both"}
@@ -1072,6 +1118,8 @@ def _stage_and_run_host(
         "--prod-access",
         args.prod_access,
     ]
+    if args.hpn_sha256 is not None:
+        host_args.extend(["--hpn-sha256", args.hpn_sha256])
     if args.dry_run:
         host_args.append("--dry-run")
     if defer_commit:
@@ -1465,6 +1513,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--env-file", type=Path)
     parser.add_argument("--identity-file", type=Path)
     parser.add_argument("--known-hosts", type=Path)
+    parser.add_argument(
+        "--hpn-program",
+        type=Path,
+        help="pinned HPN-SSH executable to install in the immutable release",
+    )
     parser.add_argument("--samba-user", default="zerofs-share")
     parser.add_argument("--samba-password-file", type=Path)
     parser.add_argument("--prod-access", choices=("nfs", "smb", "both"), default="nfs")
@@ -1483,6 +1536,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    args.hpn_sha256 = None
     args.state_root = args.state_root or f"/var/lib/zerofs-lxc/{args.role}-{args.ctid}"
     state_root = validate_state_root(args.state_root, args.ctid, args.role)
     args.metrics_url = args.metrics_url or f"http://{args.container_ip}:9567/metrics"
@@ -1584,6 +1638,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         memory_mb=args.memory_mb,
         role=args.role,
     )
+    args.hpn_sha256 = validate_hpn_release_artifact(args.config, args.hpn_program)
     namespace = namespace_id(storage_url, args.role, state_root)
     commit, _dirty = _git_receipt(runner, root)
     binary = _build(runner, root, args.role)
@@ -1595,11 +1650,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.env_file,
             args.identity_file,
             args.known_hosts,
+            args.hpn_program,
             (args.samba_password_file if args.prod_access in {"smb", "both"} else None),
         )
         if path is not None
     )
     release_extras = [binary_hash, args.prod_access]
+    if args.hpn_sha256 is not None:
+        release_extras.append(args.hpn_sha256)
     if args.prod_access in {"smb", "both"}:
         release_extras.append(args.samba_user)
     release = (
