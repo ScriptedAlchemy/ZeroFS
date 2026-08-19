@@ -576,9 +576,6 @@ impl LocalJournaler {
         }
 
         loop {
-            if let Some(error) = local_progress.borrow().terminal_error.clone() {
-                return Err(LocalBarrierError::LocalDurability(error));
-            }
             if let Some(result) = completion.borrow().clone() {
                 return result;
             }
