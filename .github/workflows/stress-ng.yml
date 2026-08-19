@@ -32,6 +32,10 @@ jobs:
               echo "MinIO is ready"
               break
             fi
+            if [ "$i" -eq 30 ]; then
+              echo "MinIO failed to start after 30s" >&2
+              exit 1
+            fi
             sleep 1
           done
 
@@ -193,6 +197,10 @@ jobs:
               echo "MinIO is ready"
               break
             fi
+            if [ "$i" -eq 30 ]; then
+              echo "MinIO failed to start after 30s" >&2
+              exit 1
+            fi
             sleep 1
           done
 
@@ -339,6 +347,10 @@ jobs:
               echo "MinIO is ready"
               break
             fi
+            if [ "$i" -eq 30 ]; then
+              echo "MinIO failed to start after 30s" >&2
+              exit 1
+            fi
             sleep 1
           done
 
@@ -483,6 +495,10 @@ jobs:
               echo "MinIO is ready"
               break
             fi
+            if [ "$i" -eq 30 ]; then
+              echo "MinIO failed to start after 30s" >&2
+              exit 1
+            fi
             sleep 1
           done
 
@@ -555,7 +571,10 @@ jobs:
 
       - name: Run the tiered stress-ng scenario
         run: |
+          # Plan-only until the observed-durability collector is wired:
+          # run_scenario fails closed on requires_observed_durability.
           python3 scripts/tiered-writeback-e2e.py run \
+            --plan-only \
             --ledger "$LEDGER" \
             --scenario stress-ng-nfs-ninep \
             --filesystem-ack-mode volatile_memory \

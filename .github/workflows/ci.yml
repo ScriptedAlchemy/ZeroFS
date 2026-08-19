@@ -72,6 +72,10 @@ jobs:
     needs: build
     uses: ./.github/workflows/xfstests-nfs.yml
 
+  xfs-nbd:
+    needs: build
+    uses: ./.github/workflows/xfs-nbd.yml
+
   zfs-test:
     needs: build
     uses: ./.github/workflows/zfs-test.yml
