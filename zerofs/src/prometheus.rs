@@ -1,3 +1,4 @@
+use crate::cache_metrics::{CacheMetricsSnapshot, CacheTierSnapshot};
 use crate::config::PrometheusConfig;
 use crate::dedup::DedupCache;
 use crate::fs::metrics::{FileSystemStats, SegmentGcStats};
@@ -27,6 +28,7 @@ pub struct CollectorSources {
     pub global_stats: Arc<FileSystemGlobalStats>,
     pub segment_gc_stats: Arc<SegmentGcStats>,
     pub dedup: Arc<DedupCache>,
+    pub cache_metrics: Arc<crate::cache_metrics::CacheMetrics>,
     pub slatedb_registry: Option<Arc<DefaultMetricsRecorder>>,
     pub writeback: Option<WritebackObjectStore>,
 }
@@ -60,6 +62,7 @@ pub fn start(
         global_stats,
         segment_gc_stats,
         dedup,
+        cache_metrics,
         slatedb_registry,
         writeback,
     } = sources;
@@ -79,6 +82,7 @@ pub fn start(
                     collect_global_stats(&global_stats);
                     collect_segment_gc_stats(&segment_gc_stats);
                     collect_dedup_stats(&dedup);
+                    record_cache_metrics(&cache_metrics.snapshot());
                     if let Some(ref registry) = slatedb_registry {
                         collect_lsm_stats(registry);
                     }
@@ -257,6 +261,32 @@ fn collect_jemalloc_stats() {
     gauge!("zerofs_jemalloc_metadata_bytes").set(mem.metadata as f64);
 }
 
+fn record_cache_metrics(snapshot: &CacheMetricsSnapshot) {
+    fn record_tier(cache: &'static str, tier: &CacheTierSnapshot) {
+        let count = |value: usize| u64::try_from(value).unwrap_or(u64::MAX);
+        gauge!("zerofs_cache_logical_usage_bytes", "cache" => cache)
+            .set(tier.logical_usage_bytes as f64);
+        gauge!("zerofs_cache_logical_capacity_bytes", "cache" => cache)
+            .set(tier.logical_capacity_bytes as f64);
+        gauge!("zerofs_cache_entries", "cache" => cache).set(tier.entries as f64);
+        counter!("zerofs_cache_disk_read_bytes_total", "cache" => cache)
+            .absolute(count(tier.disk_read_bytes));
+        counter!("zerofs_cache_disk_write_bytes_total", "cache" => cache)
+            .absolute(count(tier.disk_write_bytes));
+        counter!("zerofs_cache_disk_read_ios_total", "cache" => cache)
+            .absolute(count(tier.disk_read_ios));
+        counter!("zerofs_cache_disk_write_ios_total", "cache" => cache)
+            .absolute(count(tier.disk_write_ios));
+        counter!("zerofs_cache_queue_buffer_overflow_total", "cache" => cache)
+            .absolute(tier.queue_buffer_overflow_total);
+        counter!("zerofs_cache_queue_channel_overflow_total", "cache" => cache)
+            .absolute(tier.queue_channel_overflow_total);
+    }
+
+    record_tier("raw_parts", &snapshot.raw_parts);
+    record_tier("decoded_blocks", &snapshot.decoded_blocks);
+}
+
 fn collect_writeback_stats(writeback: Option<&WritebackObjectStore>) {
     gauge!("zerofs_writeback_enabled").set(f64::from(writeback.is_some()));
     let Some(writeback) = writeback else {
@@ -338,6 +368,7 @@ fn collect_lsm_stats(recorder: &DefaultMetricsRecorder) {
 #[cfg(test)]
 mod tests {
     use super::{WRITEBACK_COLLECT_INTERVAL, lsm_export_name, record_writeback_status};
+    use crate::cache_metrics::{CacheMetricsSnapshot, CacheTierSnapshot};
     use crate::writeback::model::WritebackStatus;
 
     #[test]
@@ -396,6 +427,45 @@ mod tests {
             "zerofs_writeback_remote_bytes_completed_total 7",
             "zerofs_writeback_retries_total 2",
             "zerofs_writeback_terminal_error 1",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "missing metric: {expected}\n{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn cache_metrics_export_fixed_low_cardinality_tiers() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let snapshot = CacheMetricsSnapshot {
+            raw_parts: CacheTierSnapshot {
+                logical_usage_bytes: 11,
+                logical_capacity_bytes: 22,
+                entries: 3,
+                disk_read_bytes: 44,
+                disk_write_bytes: 55,
+                disk_read_ios: 6,
+                disk_write_ios: 7,
+                queue_buffer_overflow_total: 8,
+                queue_channel_overflow_total: 9,
+            },
+            decoded_blocks: CacheTierSnapshot::default(),
+        };
+
+        metrics::with_local_recorder(&recorder, || super::record_cache_metrics(&snapshot));
+        let rendered = handle.render();
+        for expected in [
+            "zerofs_cache_logical_usage_bytes{cache=\"raw_parts\"} 11",
+            "zerofs_cache_logical_capacity_bytes{cache=\"raw_parts\"} 22",
+            "zerofs_cache_entries{cache=\"raw_parts\"} 3",
+            "zerofs_cache_disk_read_bytes_total{cache=\"raw_parts\"} 44",
+            "zerofs_cache_disk_write_bytes_total{cache=\"raw_parts\"} 55",
+            "zerofs_cache_disk_read_ios_total{cache=\"raw_parts\"} 6",
+            "zerofs_cache_disk_write_ios_total{cache=\"raw_parts\"} 7",
+            "zerofs_cache_queue_buffer_overflow_total{cache=\"raw_parts\"} 8",
+            "zerofs_cache_queue_channel_overflow_total{cache=\"raw_parts\"} 9",
         ] {
             assert!(
                 rendered.contains(expected),

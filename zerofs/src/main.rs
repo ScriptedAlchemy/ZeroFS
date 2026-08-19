@@ -3,6 +3,7 @@ use std::io::BufRead;
 
 mod block_transformer;
 mod bucket_identity;
+mod cache_metrics;
 mod checkpoint_manager;
 mod cli;
 mod config;

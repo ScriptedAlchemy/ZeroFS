@@ -72,6 +72,7 @@ struct DbOpen {
     promotion: Option<PromotionSnapshot>,
     slatedb: SlateDbHandle,
     metrics_recorder: Option<Arc<DefaultMetricsRecorder>>,
+    cache_metrics: Arc<crate::cache_metrics::CacheMetrics>,
     /// Prefetch-wrapped object store for the segment data plane (cold read-ahead).
     segment_object_store: Arc<dyn object_store::ObjectStore>,
     /// Warms the parts cache with a just-sealed segment (multipart uploads bypass
@@ -709,6 +710,7 @@ impl StartupContext {
         let SlateDbOpen {
             data: slatedb,
             metrics_recorder,
+            cache_metrics,
             parts_cache,
             decoded_extent_memory_bytes,
         } = opened;
@@ -813,6 +815,7 @@ impl StartupContext {
             promotion,
             slatedb,
             metrics_recorder,
+            cache_metrics,
             segment_object_store,
             segment_warm,
             decoded_extent_memory_bytes,
@@ -893,6 +896,7 @@ impl ReconciledDb {
             promotion: _,
             slatedb,
             metrics_recorder,
+            cache_metrics,
             segment_object_store,
             segment_warm,
             decoded_extent_memory_bytes,
@@ -1170,6 +1174,7 @@ impl ReconciledDb {
             object_store,
             writeback,
             sftp_pool,
+            cache_metrics,
             wal_object_store,
             db_path: actual_db_path,
             db_handle,
