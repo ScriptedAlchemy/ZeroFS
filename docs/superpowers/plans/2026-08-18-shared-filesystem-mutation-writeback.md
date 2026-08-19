@@ -1374,7 +1374,13 @@ do
     exit 1
   fi
 done
-cargo test -p zerofs --locked fs::store::extent::reclaim::tests::sparse_interleaved_full_segment_uses_at_most_thirty_two_verification_scans -- --exact --nocapture
+RECLAIM_RED='fs::store::extent::reclaim::tests::sparse_interleaved_full_segment_uses_at_most_thirty_two_verification_scans'
+cargo test -p zerofs --locked -- --list 2>&1 | tee "${TMPDIR:-/tmp}/zerofs-reclaim-red-list.log"
+grep -F "${RECLAIM_RED}: test" "${TMPDIR:-/tmp}/zerofs-reclaim-red-list.log"
+if cargo test -p zerofs --locked "$RECLAIM_RED" -- --exact --nocapture; then
+  echo "expected reclaim scan-bound RED but ${RECLAIM_RED} passed" >&2
+  exit 1
+fi
 ```
 
 - [ ] **Step 2: Define exact aggregate ownership types and validation**

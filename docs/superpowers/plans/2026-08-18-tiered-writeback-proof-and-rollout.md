@@ -158,6 +158,7 @@ The lifecycle/API suite names
 `test_supervise_reports_cleanup_failure_after_primary_success`,
 `test_supervise_timeout_terminates_and_reaps_process_group`,
 `test_ledger_value_rejects_unknown_or_nonscalar_key`,
+`test_ledger_value_receipt_requires_manifest_validation`,
 `test_validate_owned_path_rejects_symlink_escape`,
 `test_validate_archived_receipt_requires_campaign_manifest`,
 `test_list_ledgers_requires_one_archived_decision_authority`, and
@@ -199,9 +200,10 @@ primary failure first or cleanup failure otherwise. `cleanup --ledger PATH` remo
 only ledger-owned resources and is idempotent. `assert-clean --ledger PATH` reads the
 surviving external authority and rejects any recorded survivor.
 
-`ledger-value --ledger PATH --key KEY` reads only an allowlisted immutable or
-scenario-output scalar, rejects missing/unknown/object values, and emits one
-newline-terminated value without shell quoting. `validate-owned-path --ledger PATH
+`ledger-value --ledger PATH [--receipt VALIDATED_PATH] --key KEY` reads only an
+allowlisted immutable/scenario-output scalar from the ledger or a receipt already
+covered by that ledger's live/archive manifest, rejects missing/unknown/object values,
+and emits one newline-terminated value without shell quoting. `validate-owned-path --ledger PATH
 --path PATH` resolves every existing ancestor without following a final symlink,
 rejects traversal/symlink escape, and succeeds only for an exact ledgered resource, a
 live receipt under `CONTROL_ROOT`, or an archived receipt whose hash and original
@@ -1208,9 +1210,17 @@ case "$ZEROFS_UPLOAD_GAP_DETECTED" in true|false) ;; *) exit 1 ;; esac
 test "$ZEROFS_UPLOAD_GAP_RESOLVED" = true
 if test "$ZEROFS_UPLOAD_GAP_DETECTED" = true; then
   ZEROFS_UPLOAD_CORRECTION_SHA="$(python3 scripts/tiered-writeback-e2e.py ledger-value --ledger "$C7B_DECISION_LEDGER" --key decision.upload_correction_sha)"
-  test "${#ZEROFS_UPLOAD_CORRECTION_SHA}" = 40
+  printf '%s\n' "$ZEROFS_UPLOAD_CORRECTION_SHA" | grep -Eq '^[0-9a-f]{40}$'
+  git cat-file -e "${ZEROFS_UPLOAD_CORRECTION_SHA}^{commit}"
+  git merge-base --is-ancestor "$ZEROFS_UPLOAD_CORRECTION_SHA" "$FINAL_PROOF_SHA"
   ZEROFS_UPLOAD_RERUN_RECEIPT="$(python3 scripts/tiered-writeback-e2e.py ledger-value --ledger "$C7B_DECISION_LEDGER" --key decision.upload_rerun_receipt)"
   python3 scripts/tiered-writeback-e2e.py validate-owned-path --ledger "$C7B_DECISION_LEDGER" --path "$ZEROFS_UPLOAD_RERUN_RECEIPT" --kind archived-receipt
+  test "$(python3 scripts/tiered-writeback-e2e.py ledger-value --ledger "$C7B_DECISION_LEDGER" --receipt "$ZEROFS_UPLOAD_RERUN_RECEIPT" --key source_sha)" = "$ZEROFS_UPLOAD_CORRECTION_SHA"
+  test "$(python3 scripts/tiered-writeback-e2e.py ledger-value --ledger "$C7B_DECISION_LEDGER" --receipt "$ZEROFS_UPLOAD_RERUN_RECEIPT" --key scenarios.sftp_stock_vs_hpn_download)" = true
+  test "$(python3 scripts/tiered-writeback-e2e.py ledger-value --ledger "$C7B_DECISION_LEDGER" --receipt "$ZEROFS_UPLOAD_RERUN_RECEIPT" --key scenarios.sftp_stock_vs_hpn_upload)" = true
+  test "$(python3 scripts/tiered-writeback-e2e.py ledger-value --ledger "$C7B_DECISION_LEDGER" --receipt "$ZEROFS_UPLOAD_RERUN_RECEIPT" --key scenarios.zerofs_sftp_session_scaling)" = true
+  test "$(python3 scripts/tiered-writeback-e2e.py ledger-value --ledger "$C7B_DECISION_LEDGER" --receipt "$ZEROFS_UPLOAD_RERUN_RECEIPT" --key success)" = true
+  test "$(python3 scripts/tiered-writeback-e2e.py ledger-value --ledger "$C7B_DECISION_LEDGER" --receipt "$ZEROFS_UPLOAD_RERUN_RECEIPT" --key zerofs_upload_parity_resolved)" = true
 fi
 if test "$HPN_RECEIVE_WINNER" = true; then
   run_final_scenario materialized remote hpn-package-winner
