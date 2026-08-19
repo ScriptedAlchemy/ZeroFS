@@ -1,46 +1,65 @@
-use super::errors::P9Error;
+#[cfg(any(feature = "webui", test))]
 pub(crate) use super::handler::NinePHandler;
-use super::handler::SessionReleaseGuard;
 pub(crate) use super::lock_manager::FileLockManager;
 use crate::fs::ZeroFS;
 use crate::task::spawn_named;
+#[cfg(test)]
 use bytes::Bytes;
-use dashmap::DashMap;
-use dashmap::mapref::entry::Entry;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
+#[cfg(test)]
 use ninep_proto::{
-    Message, P9_CHANNEL_SIZE, P9_DEBUG_BUFFER_SIZE, P9_HEADER_SIZE, P9_MAX_MSIZE,
-    P9_MIN_MESSAGE_SIZE, P9_OP_ENVELOPE_LEN, P9_OP_ID_LEN, P9_SIZE_FIELD_LEN, P9Message, Rlerror,
-    T_WRITE,
+    Message, P9_COUNT_FIELD_LEN, P9_HEADER_SIZE, P9_MAX_MSIZE, P9_OP_ENVELOPE_LEN,
+    P9_OP_FLAG_RETRY, P9_OP_ID_LEN, P9_SIZE_FIELD_LEN, P9Message, Rlerror, T_WRITE, message_type,
 };
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+#[cfg(test)]
+use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, UnixListener};
+#[cfg(test)]
 use tokio::sync::mpsc;
 #[cfg(test)]
 use tokio::sync::oneshot;
-use tokio_util::codec::LengthDelimitedCodec;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
-/// 9P message type byte for Tflush. Kept here so the reader can recognise a
-/// flush from the raw frame header without deku-parsing the whole body.
-const TFLUSH_TYPE: u8 = 108;
-/// `Rlerror` is permitted after serving-authority loss.
-const RLERROR_TYPE: u8 = 7;
-/// `Rversion` is permitted after serving-authority loss.
-const RVERSION_TYPE: u8 = 101;
-/// `Tversion` is a receive-order barrier for the entire session.
-const TVERSION_TYPE: u8 = 100;
-/// 9P type for `Tclunk`, a receive-order barrier for its fid.
-const TCLUNK_TYPE: u8 = 120;
-const RESPONSE_BUFFER_CAPACITY: usize = 64 * 1024;
-/// Bounded response drain after connection retirement.
-const CLIENT_DRAIN_TIMEOUT: std::time::Duration = crate::replication::RESPONSE_DRAIN_TIMEOUT;
+mod admission;
+mod frame_codec;
+mod response_writer;
+mod session;
+
+#[cfg(test)]
+use admission::P9AdmissionSnapshot;
+#[cfg(feature = "webui")]
+pub(crate) use admission::P9TransportPermit;
+#[cfg(test)]
+use admission::{
+    CONNECTION_INFLIGHT_MEMORY, CONNECTION_INFLIGHT_REQUESTS, GLOBAL_INFLIGHT_MEMORY,
+    GLOBAL_INFLIGHT_REQUESTS, GLOBAL_TRANSPORT_SESSIONS, P9ConnectionAdmission,
+};
+pub(crate) use admission::{P9AcceptedWorkTracker, P9GlobalAdmission};
+#[cfg(test)]
+use frame_codec::{
+    FidFootprint, P9_RWRITE_MAX_SIZE, ShallowFrameMetadata, inspect_frame_metadata,
+    possible_response_bytes, read_9p_frame,
+};
+#[cfg(any(feature = "webui", test))]
+#[allow(unused_imports)]
+pub(crate) use response_writer::{P9Response, response_may_be_emitted};
+#[cfg(test)]
+use response_writer::{RESPONSE_BUFFER_CAPACITY, ResponseAuthority, spawn_response_writer};
+#[cfg(test)]
+use session::{CLIENT_DRAIN_TIMEOUT, CompletionWaiter, enqueue_terminal_response};
+#[cfg(any(feature = "webui", test))]
+pub(crate) use session::{InflightRegistry, dispatch_9p_frame, settle_request_tasks};
+use session::{P9SessionAdmission, handle_client_stream};
+#[cfg(test)]
+use session::{handle_client_loop, join_with_timeout};
+
 /// TCP keepalive idle interval.
 const TCP_KEEPALIVE_IDLE: std::time::Duration = std::time::Duration::from_secs(10);
 const TCP_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
@@ -53,20 +72,6 @@ const TCP_KEEPALIVE_RETRIES: u32 = 4;
     target_os = "linux"
 ))]
 const TCP_USER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
-/// Whether a serialized response requires serving authority.
-/// Standard and private 9P frames store the type byte at offset four.
-pub(crate) fn response_requires_serving_authority(response_bytes: &[u8]) -> bool {
-    !matches!(
-        response_bytes.get(4),
-        Some(&RLERROR_TYPE) | Some(&RVERSION_TYPE)
-    )
-}
-
-/// Check serving authority at the final response boundary.
-pub(crate) fn response_may_be_emitted(db: &crate::db::Db, response_bytes: &[u8]) -> bool {
-    !response_requires_serving_authority(response_bytes) || db.permits_successful_response()
-}
 
 fn configure_accepted_tcp_stream(stream: &tokio::net::TcpStream) -> std::io::Result<()> {
     stream.set_nodelay(true)?;
@@ -87,21 +92,6 @@ fn configure_accepted_tcp_stream(stream: &tokio::net::TcpStream) -> std::io::Res
     socket.set_tcp_user_timeout(Some(TCP_USER_TIMEOUT))?;
 
     Ok(())
-}
-
-/// Await a task until `deadline`, then abort and join it.
-async fn join_with_timeout<T>(
-    mut task: AbortOnDropHandle<T>,
-    timeout: std::time::Duration,
-) -> Option<Result<T, tokio::task::JoinError>> {
-    match tokio::time::timeout(timeout, &mut task).await {
-        Ok(result) => Some(result),
-        Err(_) => {
-            task.abort();
-            let _ = task.await;
-            None
-        }
-    }
 }
 
 pub enum Transport {
@@ -138,6 +128,7 @@ impl NinePServer {
         write_stream: W,
         shutdown: &CancellationToken,
         client_name: String,
+        session: P9SessionAdmission,
     ) -> AbortOnDropHandle<()>
     where
         R: AsyncRead + Unpin + Send + 'static,
@@ -154,6 +145,7 @@ impl NinePServer {
                 filesystem,
                 lock_manager,
                 client_shutdown,
+                session,
             )
             .await
             {
@@ -162,7 +154,22 @@ impl NinePServer {
         }))
     }
 
+    #[allow(dead_code)]
     pub async fn start(&self, shutdown: CancellationToken) -> std::io::Result<()> {
+        let accepted_work = P9AcceptedWorkTracker::new();
+        let result = self
+            .start_with_accepted_work(shutdown, accepted_work.clone())
+            .await;
+        accepted_work.stop_accepting();
+        accepted_work.wait().await;
+        result
+    }
+
+    pub(crate) async fn start_with_accepted_work(
+        &self,
+        shutdown: CancellationToken,
+        accepted_work: P9AcceptedWorkTracker,
+    ) -> std::io::Result<()> {
         let mut clients = FuturesUnordered::new();
         let clients_shutdown = shutdown.child_token();
         let serve_result = match &self.transport {
@@ -194,6 +201,13 @@ impl NinePServer {
                                 warn!("Failed to configure 9P TCP client {peer_addr}: {e}");
                                 continue;
                             }
+                            let transport = match P9GlobalAdmission::shared().try_admit_transport() {
+                                Ok(transport) => transport,
+                                Err(error) => {
+                                    warn!("Rejecting 9P TCP client {peer_addr}: {error}");
+                                    continue;
+                                }
+                            };
                             let (read_half, write_half) = stream.into_split();
                             clients.push(
                                 self.spawn_client_handler(
@@ -201,6 +215,11 @@ impl NinePServer {
                                     write_half,
                                     &clients_shutdown,
                                     peer_addr.to_string(),
+                                    P9SessionAdmission {
+                                        transport,
+                                        transport_label: "tcp",
+                                        accepted_work: accepted_work.clone(),
+                                    },
                                 ),
                             );
                         }
@@ -236,6 +255,13 @@ impl NinePServer {
                                 Err(e) => break Err(e),
                             };
                             info!("9P client connected via Unix socket");
+                            let transport = match P9GlobalAdmission::shared().try_admit_transport() {
+                                Ok(transport) => transport,
+                                Err(error) => {
+                                    warn!("Rejecting 9P Unix client: {error}");
+                                    continue;
+                                }
+                            };
                             let (read_half, write_half) = stream.into_split();
                             clients.push(
                                 self.spawn_client_handler(
@@ -243,6 +269,11 @@ impl NinePServer {
                                     write_half,
                                     &clients_shutdown,
                                     "unix".to_string(),
+                                    P9SessionAdmission {
+                                        transport,
+                                        transport_label: "unix",
+                                        accepted_work: accepted_work.clone(),
+                                    },
                                 ),
                             );
                         }
@@ -265,659 +296,11 @@ impl NinePServer {
     }
 }
 
-#[derive(Clone)]
-enum ResponseAuthority {
-    Database(Arc<crate::db::Db>),
-    #[cfg(test)]
-    Always,
-}
-
-impl ResponseAuthority {
-    fn from_database(db: Arc<crate::db::Db>) -> Self {
-        Self::Database(db)
-    }
-
-    #[cfg(test)]
-    fn always() -> Self {
-        Self::Always
-    }
-
-    fn permits_successful_response(&self) -> bool {
-        match self {
-            Self::Database(db) => db.permits_successful_response(),
-            #[cfg(test)]
-            Self::Always => true,
-        }
-    }
-
-    fn may_emit(&self, response_bytes: &[u8]) -> bool {
-        match self {
-            Self::Database(db) => response_may_be_emitted(db, response_bytes),
-            #[cfg(test)]
-            Self::Always => true,
-        }
-    }
-}
-
-fn spawn_response_writer<W>(
-    write_stream: W,
-    mut rx: mpsc::Receiver<(u16, Vec<u8>)>,
-    authority: ResponseAuthority,
-    connection_shutdown: CancellationToken,
-) -> AbortOnDropHandle<()>
-where
-    W: AsyncWrite + Unpin + Send + 'static,
-{
-    AbortOnDropHandle::new(spawn_named("9p-writer", async move {
-        // Stop request dispatch when the response writer exits.
-        let _cancel_connection_on_exit = connection_shutdown.drop_guard();
-        let mut writer =
-            tokio::io::BufWriter::with_capacity(RESPONSE_BUFFER_CAPACITY, write_stream);
-        loop {
-            let first = match rx.recv().await {
-                Some(msg) => msg,
-                None => break,
-            };
-
-            // Avoid allocating a batch for the uncontended case. Adaptive
-            // kernel lanes normally carry one direct request; a Vec is useful
-            // only after a second response is already waiting.
-            let second = match rx.try_recv() {
-                Ok(more) => more,
-                Err(_) => {
-                    let (tag, response_bytes) = first;
-                    let requires_authority = response_requires_serving_authority(&response_bytes);
-                    if requires_authority && !authority.may_emit(&response_bytes) {
-                        warn!(
-                            "Dropping successful 9P response for tag {tag} after serving authority \
-                             was lost; closing the connection"
-                        );
-                        return;
-                    }
-                    // Keep the final authority check adjacent to the actual
-                    // transport write, just as on the buffered batch path.
-                    if requires_authority && !authority.permits_successful_response() {
-                        warn!(
-                            "Dropping successful 9P response for tag {tag} immediately before \
-                             write after serving authority was lost; closing the connection"
-                        );
-                        return;
-                    }
-                    // The outer BufWriter is empty after every batch. Bypass
-                    // its copy for this latency-critical case, but still flush
-                    // the underlying AsyncWrite: write_all only guarantees
-                    // acceptance, and the transport itself may be buffered.
-                    if let Err(e) = writer.get_mut().write_all(&response_bytes).await {
-                        error!("Failed to write response for tag {}: {}", tag, e);
-                        return;
-                    }
-                    // Mirror the buffered batch path's final authority check.
-                    // If the underlying writer retained the bytes, authority
-                    // loss must prevent its flush.
-                    if requires_authority && !authority.permits_successful_response() {
-                        warn!(
-                            "Dropping buffered successful 9P response for tag {tag} before flush \
-                             after serving authority was lost; closing the connection"
-                        );
-                        return;
-                    }
-                    if let Err(e) = writer.get_mut().flush().await {
-                        error!("Failed to flush response for tag {}: {}", tag, e);
-                        return;
-                    }
-                    continue;
-                }
-            };
-
-            // Form one bounded batch before any transport write. Continuing
-            // to drain across writes can indefinitely delay the final flush.
-            let mut batch = vec![first, second];
-            // Consolidate responses that are already queued without delaying
-            // an uncontended RPC by a scheduler turn.
-            while let Ok(more) = rx.try_recv() {
-                batch.push(more);
-            }
-
-            let mut buffered_authority_gated_success = false;
-            let mut dropped_authority_gated_success = false;
-            for (tag, response_bytes) in batch {
-                let requires_authority = response_requires_serving_authority(&response_bytes);
-                if requires_authority && !authority.may_emit(&response_bytes) {
-                    warn!(
-                        "Dropping successful 9P response for tag {tag} after serving authority \
-                         was lost; closing the connection"
-                    );
-                    dropped_authority_gated_success = true;
-                    continue;
-                }
-                // `write_all` may flush buffered frames; recheck authority first.
-                if buffered_authority_gated_success && !authority.permits_successful_response() {
-                    warn!(
-                        "Dropping buffered successful 9P responses before writing response for \
-                         tag {tag} after serving authority was lost; closing the connection"
-                    );
-                    return;
-                }
-                buffered_authority_gated_success |= requires_authority;
-                if let Err(e) = writer.write_all(&response_bytes).await {
-                    error!("Failed to write response for tag {}: {}", tag, e);
-                    return;
-                }
-            }
-
-            // Recheck authority before the final buffer flush.
-            if buffered_authority_gated_success && !authority.permits_successful_response() {
-                warn!(
-                    "Dropping buffered successful 9P responses after serving authority was \
-                     lost; closing the connection"
-                );
-                return;
-            }
-            if let Err(e) = writer.flush().await {
-                error!("Failed to flush writer: {}", e);
-                return;
-            }
-            if dropped_authority_gated_success {
-                return;
-            }
-        }
-    }))
-}
-
-async fn handle_client_stream<R, W>(
-    read_stream: R,
-    write_stream: W,
-    filesystem: Arc<ZeroFS>,
-    lock_manager: Arc<FileLockManager>,
-    shutdown: CancellationToken,
-) -> anyhow::Result<()>
-where
-    R: AsyncRead + Unpin + Send + 'static,
-    W: AsyncWrite + Unpin + Send + 'static,
-{
-    let handler = Arc::new(NinePHandler::new(Arc::clone(&filesystem), lock_manager));
-
-    let (tx, rx) = mpsc::channel::<(u16, Vec<u8>)>(P9_CHANNEL_SIZE);
-    let connection_shutdown = shutdown.child_token();
-    let writer_task = spawn_response_writer(
-        write_stream,
-        rx,
-        ResponseAuthority::from_database(Arc::clone(&filesystem.db)),
-        connection_shutdown.clone(),
-    );
-
-    // Retire resource guards and locks before draining received requests.
-    let mut release_guard = SessionReleaseGuard::new(Arc::clone(&handler));
-
-    let result = handle_client_loop(handler, read_stream, tx, connection_shutdown).await;
-    release_guard.release();
-
-    match join_with_timeout(writer_task, CLIENT_DRAIN_TIMEOUT).await {
-        Some(Ok(())) => {}
-        Some(Err(e)) => warn!("9P writer task failed: {e}"),
-        None => warn!("timed out draining 9P client responses; writer aborted"),
-    }
-
-    result
-}
-
-/// Fid footprint used by receive-order barriers.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum FidFootprint {
-    #[default]
-    None,
-    One(u32),
-    Two(u32, u32),
-    All,
-}
-
-impl FidFootprint {
-    fn contains(self, fid: u32) -> bool {
-        match self {
-            Self::None => false,
-            Self::One(first) => first == fid,
-            Self::Two(first, second) => first == fid || second == fid,
-            Self::All => true,
-        }
-    }
-}
-
-/// Request completion signal and fid footprint.
-struct RequestState {
-    completed: CancellationToken,
-    fids: FidFootprint,
-}
-
-impl RequestState {
-    fn new(fids: FidFootprint) -> Self {
-        Self {
-            completed: CancellationToken::new(),
-            fids,
-        }
-    }
-
-    fn complete(&self) {
-        self.completed.cancel();
-    }
-
-    async fn wait(&self) {
-        self.completed.cancelled().await;
-    }
-}
-
-type CompletionWaiter = Arc<RequestState>;
-
-/// Per-connection request registry.
-#[derive(Default)]
-struct InflightRegistryInner {
-    /// One active request per wire tag, as required by 9P.
-    entries: DashMap<u16, Arc<RequestState>>,
-    /// Tail request of the receive-ordered Tflush chain for each oldtag.
-    flush_tails: DashMap<u16, Arc<RequestState>>,
-}
-
-#[derive(Clone, Default)]
-pub(crate) struct InflightRegistry {
-    inner: Arc<InflightRegistryInner>,
-}
-
-impl InflightRegistry {
-    fn register(&self, tag: u16, fids: FidFootprint) -> anyhow::Result<RequestLease> {
-        let Entry::Vacant(entry) = self.inner.entries.entry(tag) else {
-            anyhow::bail!("client reused in-flight 9P tag {tag}");
-        };
-        let state = Arc::new(RequestState::new(fids));
-        entry.insert(Arc::clone(&state));
-        Ok(RequestLease {
-            registry: self.clone(),
-            tag,
-            state,
-            flush_oldtag: None,
-        })
-    }
-
-    fn waiter(&self, tag: u16) -> Option<CompletionWaiter> {
-        self.inner
-            .entries
-            .get(&tag)
-            .map(|entry| Arc::clone(entry.value()))
-    }
-
-    /// Register a whole-session barrier after snapshotting earlier requests.
-    fn register_after_prior_snapshot(
-        &self,
-        tag: u16,
-    ) -> anyhow::Result<(RequestLease, Vec<CompletionWaiter>)> {
-        let waiters = self
-            .inner
-            .entries
-            .iter()
-            .map(|entry| Arc::clone(entry.value()))
-            .collect();
-        Ok((self.register(tag, FidFootprint::All)?, waiters))
-    }
-
-    /// Register a fid barrier after snapshotting earlier requests for that fid.
-    fn register_after_fid_snapshot(
-        &self,
-        tag: u16,
-        fid: u32,
-    ) -> anyhow::Result<(RequestLease, Vec<CompletionWaiter>)> {
-        let waiters = self
-            .inner
-            .entries
-            .iter()
-            .filter(|entry| entry.value().fids.contains(fid))
-            .map(|entry| Arc::clone(entry.value()))
-            .collect();
-        Ok((self.register(tag, FidFootprint::One(fid))?, waiters))
-    }
-
-    /// Append `Tflush` to the target tag's response-order chain.
-    fn register_flush(&self, tag: u16, oldtag: u16) -> anyhow::Result<FlushRegistration> {
-        let target = self.waiter(oldtag);
-        let mut lease = self.register(tag, FidFootprint::None)?;
-        let predecessor = self
-            .inner
-            .flush_tails
-            .insert(oldtag, Arc::clone(&lease.state));
-        lease.flush_oldtag = Some(oldtag);
-        Ok(FlushRegistration {
-            lease,
-            target,
-            predecessor,
-        })
-    }
-}
-
-struct FlushRegistration {
-    lease: RequestLease,
-    target: Option<CompletionWaiter>,
-    predecessor: Option<CompletionWaiter>,
-}
-
-/// Non-cloneable authority to retire one request.
-#[must_use = "dropping the lease completes and retires its request"]
-struct RequestLease {
-    registry: InflightRegistry,
-    tag: u16,
-    state: Arc<RequestState>,
-    flush_oldtag: Option<u16>,
-}
-
-impl RequestLease {
-    /// Publish a terminal response before making the tag reusable.
-    fn publish_terminal_response(&self, publish: impl FnOnce()) {
-        let retired = self
-            .registry
-            .inner
-            .entries
-            .remove_if(&self.tag, |_, current| {
-                if !Arc::ptr_eq(current, &self.state) {
-                    return false;
-                }
-                publish();
-                true
-            });
-        assert!(retired.is_some(), "request tag retired before its response");
-    }
-
-    /// Remove this lease's registry entry if it is still present.
-    fn retire_registration(&self) {
-        self.registry
-            .inner
-            .entries
-            .remove_if(&self.tag, |_, current| Arc::ptr_eq(current, &self.state));
-    }
-}
-
-impl Drop for RequestLease {
-    fn drop(&mut self) {
-        self.retire_registration();
-        if let Some(oldtag) = self.flush_oldtag {
-            self.registry
-                .inner
-                .flush_tails
-                .remove_if(&oldtag, |_, current| Arc::ptr_eq(current, &self.state));
-        }
-        self.state.complete();
-    }
-}
-
-/// Reserve response capacity, enqueue the terminal response, then retire its tag.
-async fn enqueue_terminal_response(
-    tx: &mpsc::Sender<(u16, Vec<u8>)>,
-    response_bytes: Vec<u8>,
-    request_lease: &RequestLease,
-) -> Result<(), mpsc::error::SendError<()>> {
-    let permit = tx.reserve().await?;
-    request_lease.publish_terminal_response(|| permit.send((request_lease.tag, response_bytes)));
-    Ok(())
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct ShallowFrameMetadata {
-    fids: FidFootprint,
-    received_op: Option<([u8; P9_OP_ID_LEN], u8)>,
-}
-
-fn read_u32_at(bytes: &[u8], offset: usize) -> Option<u32> {
-    Some(u32::from_le_bytes(
-        bytes.get(offset..offset + 4)?.try_into().ok()?,
-    ))
-}
-
-fn fixed_one_fid(body: &[u8]) -> FidFootprint {
-    read_u32_at(body, 0).map_or(FidFootprint::None, FidFootprint::One)
-}
-
-fn fixed_two_fids(body: &[u8]) -> FidFootprint {
-    match (read_u32_at(body, 0), read_u32_at(body, 4)) {
-        (Some(first), Some(second)) => FidFootprint::Two(first, second),
-        _ => FidFootprint::None,
-    }
-}
-
-/// Decode the fid-bearing prefix needed for receive-order barriers.
-fn request_fid_footprint(type_byte: u8, body: &[u8]) -> FidFootprint {
-    match type_byte {
-        TVERSION_TYPE => FidFootprint::All,
-
-        20 | 30 | 70 | 104 | 110 | 230 | 236 | 238 | 246 | 252 => fixed_two_fids(body),
-
-        // `Trenameat.newdirfid` follows the variable-length old name.
-        74 | 235 => {
-            let Some(old_dir) = read_u32_at(body, 0) else {
-                return FidFootprint::None;
-            };
-            let Some(name_len) = body
-                .get(4..6)
-                .and_then(|bytes| bytes.try_into().ok())
-                .map(u16::from_le_bytes)
-            else {
-                return FidFootprint::None;
-            };
-            let new_dir_offset = 6usize.saturating_add(usize::from(name_len));
-            read_u32_at(body, new_dir_offset).map_or(FidFootprint::None, |new_dir| {
-                FidFootprint::Two(old_dir, new_dir)
-            })
-        }
-
-        8 | 12 | 14 | 16 | 18 | 22 | 24 | 26 | 40 | 50 | 52 | 54 | 72 | 76 | 116 | 118
-        | TCLUNK_TYPE | 228 | 232 | 240 | 242 | 244 | 248 | 250 | 254 => fixed_one_fid(body),
-        _ => FidFootprint::None,
-    }
-}
-
-/// Inspect framing, mutation envelope, and fid prefix without copying the body.
-fn inspect_frame_metadata(frame: &[u8], zerofs_protocol: bool) -> ShallowFrameMetadata {
-    let type_byte = frame[4];
-    let carries_op = zerofs_protocol && P9Message::carries_op_id(type_byte);
-    let body_offset = P9_HEADER_SIZE + usize::from(carries_op) * P9_OP_ENVELOPE_LEN;
-
-    let received_op = if carries_op && frame.len() >= body_offset {
-        let mut op_id = [0; P9_OP_ID_LEN];
-        op_id.copy_from_slice(&frame[P9_HEADER_SIZE..P9_HEADER_SIZE + P9_OP_ID_LEN]);
-        Some((op_id, frame[P9_HEADER_SIZE + P9_OP_ID_LEN]))
-    } else {
-        None
-    };
-
-    ShallowFrameMetadata {
-        fids: frame.get(body_offset..).map_or(FidFootprint::None, |body| {
-            request_fid_footprint(type_byte, body)
-        }),
-        received_op,
-    }
-}
-
-/// Dispatch a single 9P frame buffer. Shared between TCP (via LengthDelimitedCodec)
-/// and WebSocket transports.
-///
-/// Reserve receive-time dedup state before task detachment. Full decoding runs
-/// in the detached task.
-pub(crate) fn dispatch_9p_frame(
-    frame: Bytes,
-    handler: &Arc<NinePHandler>,
-    tx: &mpsc::Sender<(u16, Vec<u8>)>,
-    inflight: &InflightRegistry,
-) -> anyhow::Result<()> {
-    if frame.len() < P9_MIN_MESSAGE_SIZE as usize {
-        error!("Message too short: {} bytes", frame.len());
-        return Err(anyhow::anyhow!("Message too short"));
-    }
-
-    let type_byte = frame[4];
-    let tag = u16::from_le_bytes([frame[5], frame[6]]);
-    let zerofs_protocol = handler.zerofs_protocol_enabled();
-    let metadata = inspect_frame_metadata(&frame, zerofs_protocol);
-
-    // Capture `oldtag` before any yield or tag reuse.
-    let (flush_oldtag, flush_waiters, request_lease, prior_waiters) = if type_byte == TFLUSH_TYPE {
-        if frame.len() < P9_HEADER_SIZE + 2 {
-            error!("Tflush message too short: {} bytes", frame.len());
-            return Err(anyhow::anyhow!("Tflush message too short"));
-        }
-        let oldtag = u16::from_le_bytes([frame[P9_HEADER_SIZE], frame[P9_HEADER_SIZE + 1]]);
-        let FlushRegistration {
-            lease,
-            target,
-            predecessor,
-        } = inflight.register_flush(tag, oldtag)?;
-        let waiters = target.into_iter().chain(predecessor).collect();
-        (Some(oldtag), waiters, lease, Vec::new())
-    } else {
-        // `Tclunk` waits on its fid; `Tversion` waits on the whole session.
-        let (request_lease, prior_waiters) = match (type_byte, metadata.fids) {
-            (TVERSION_TYPE, _) => inflight.register_after_prior_snapshot(tag)?,
-            (TCLUNK_TYPE, FidFootprint::One(fid)) => {
-                inflight.register_after_fid_snapshot(tag, fid)?
-            }
-            _ => (inflight.register(tag, metadata.fids)?, Vec::new()),
-        };
-        (None, Vec::new(), request_lease, prior_waiters)
-    };
-
-    // Reserve a FIRST envelope before EOF can admit a replacement RETRY.
-    let received_guard = metadata.received_op.and_then(|(op_id, op_flags)| {
-        handler.try_reserve_received_first(op_id, op_flags, type_byte)
-    });
-
-    let handler = Arc::clone(handler);
-    let tx = tx.clone();
-
-    spawn_named("9p-request", async move {
-        // Only Twrite has an inbound bulk payload worth retaining. Other
-        // requests keep the regular decoder and the original error diagnostics.
-        let parsed = if type_byte == T_WRITE {
-            P9Message::from_owned_bytes_ctx(frame.clone(), zerofs_protocol)
-        } else {
-            P9Message::from_bytes_ctx(&frame, zerofs_protocol)
-        };
-
-        // Barrier waiters were captured synchronously in receive order.
-        for waiter in prior_waiters {
-            waiter.wait().await;
-        }
-
-        // Parse failures stay registered until their `Rlerror` is enqueued.
-        let response_bytes = match parsed {
-            Ok(parsed) => {
-                drop(frame);
-                debug!(
-                    "Received message type {} tag {}: {:?}",
-                    parsed.type_, parsed.tag, parsed.body
-                );
-                let response = handler
-                    .handle_message_with_received_admission(
-                        tag,
-                        parsed.op_id,
-                        parsed.op_flags,
-                        parsed.op_origin_epoch,
-                        parsed.body,
-                        received_guard,
-                    )
-                    .await;
-                response.to_bytes().ok()
-            }
-            Err(e) => {
-                debug!(
-                    "Failed to parse message type {} (0x{:02x}) tag {}: {:?}",
-                    type_byte, type_byte, tag, e
-                );
-                debug!(
-                    "Message size: {}, buffer (first {} bytes): {:?}",
-                    frame.len(),
-                    P9_DEBUG_BUFFER_SIZE,
-                    &frame[..std::cmp::min(P9_DEBUG_BUFFER_SIZE, frame.len())]
-                );
-                P9Message::new(
-                    tag,
-                    Message::Rlerror(Rlerror {
-                        ecode: P9Error::NotImplemented.to_errno(),
-                    }),
-                )
-                .to_bytes()
-                .ok()
-            }
-        };
-
-        if let Some(oldtag) = flush_oldtag {
-            debug!("Tflush: waiting for oldtag {} to complete", oldtag);
-            for waiter in flush_waiters {
-                waiter.wait().await;
-            }
-            debug!("Tflush: oldtag {} completed", oldtag);
-        }
-
-        match response_bytes {
-            Some(response_bytes) => {
-                if let Err(e) = enqueue_terminal_response(&tx, response_bytes, &request_lease).await
-                {
-                    warn!("Failed to send response for tag {}: {}", tag, e);
-                }
-            }
-            None => {
-                error!("Failed to serialize response for tag {}", tag);
-            }
-        }
-
-        drop(request_lease);
-    });
-    Ok(())
-}
-
-async fn handle_client_loop<R>(
-    handler: Arc<NinePHandler>,
-    read_stream: R,
-    tx: mpsc::Sender<(u16, Vec<u8>)>,
-    shutdown: CancellationToken,
-) -> anyhow::Result<()>
-where
-    R: AsyncRead + Unpin,
-{
-    let inflight = InflightRegistry::default();
-
-    let codec = LengthDelimitedCodec::builder()
-        .little_endian()
-        .length_field_offset(0)
-        .length_field_length(P9_SIZE_FIELD_LEN)
-        .length_adjustment(0)
-        .num_skip(0)
-        .max_frame_length(P9_MAX_MSIZE as usize)
-        .new_read(read_stream);
-
-    tokio::pin!(codec);
-
-    loop {
-        let full_buf = tokio::select! {
-            biased;
-            _ = shutdown.cancelled() => {
-                debug!("9P client handler shutting down");
-                return Ok(());
-            }
-            result = codec.next() => {
-                match result {
-                    Some(Ok(buf)) => buf.freeze(),
-                    Some(Err(e)) => {
-                        return Err(e.into());
-                    }
-                    None => {
-                        debug!("Client disconnected");
-                        return Ok(());
-                    }
-                }
-            }
-        };
-
-        dispatch_9p_frame(full_buf, &handler, &tx, &inflight)?;
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::fs::permissions::Credentials;
+    use crate::ninep::handler::SessionReleaseGuard;
     use crate::ninep::lock_manager::FileLock;
     use ninep_proto::{
         DekuBytes, GETATTR_ALL, LockType, P9String, Rclunk, Rflush, Rlopenat, Rread, Tattach,
@@ -926,9 +309,626 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::io::AsyncReadExt;
+    use tokio::sync::Notify;
+    use tokio_util::task::TaskTracker;
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(1);
     const QUIET_TIMEOUT: Duration = Duration::from_millis(20);
+
+    #[tokio::test]
+    async fn transport_receive_envelope_bounds_reconnect_frames() {
+        const TEST_TRANSPORTS: usize = GLOBAL_TRANSPORT_SESSIONS;
+        let global = P9GlobalAdmission::for_test_with_transports(
+            GLOBAL_INFLIGHT_MEMORY,
+            GLOBAL_INFLIGHT_REQUESTS,
+            TEST_TRANSPORTS,
+        );
+        let mut admitted = Vec::new();
+        for _ in 0..TEST_TRANSPORTS {
+            admitted.push(global.try_admit_transport().unwrap());
+        }
+
+        for _ in 0..128 {
+            assert!(
+                global.try_admit_transport().is_err(),
+                "excess reconnects must be rejected before handler spawn or WebSocket upgrade"
+            );
+        }
+        assert_eq!(global.snapshot().active_transports, TEST_TRANSPORTS);
+        assert!(
+            global.transport_limit >= 32,
+            "the envelope must retain room for sixteen idle Mesh and sixteen upload sessions"
+        );
+        let documented_bound = global.byte_limit + global.transport_limit * P9_MAX_MSIZE as usize;
+        assert_eq!(
+            documented_bound,
+            1024 * 1024 * 1024,
+            "the admitted budget plus one maximum frame per transport is the documented bound"
+        );
+
+        drop(admitted);
+        assert_eq!(global.snapshot().active_transports, 0);
+    }
+
+    #[tokio::test]
+    async fn exact_reader_transfers_a_max_frame_from_receive_to_request_credit() {
+        let global = P9GlobalAdmission::for_test_with_transports(
+            P9_MAX_MSIZE as usize + P9_RWRITE_MAX_SIZE,
+            1,
+            1,
+        );
+        let _transport = global.try_admit_transport().unwrap();
+        let connection = global.connection_for_test(P9_MAX_MSIZE as usize + P9_RWRITE_MAX_SIZE, 1);
+        let shutdown = CancellationToken::new();
+        let receive = global.admit_receive(&shutdown).await.unwrap();
+        let (mut client, mut server) = tokio::io::duplex(P9_MAX_MSIZE as usize + 1);
+        let mut encoded = vec![0; P9_MAX_MSIZE as usize];
+        encoded[..P9_SIZE_FIELD_LEN].copy_from_slice(&P9_MAX_MSIZE.to_le_bytes());
+        let writer = tokio::spawn(async move { client.write_all(&encoded).await });
+
+        let frame = read_9p_frame(&mut server, &shutdown)
+            .await
+            .unwrap()
+            .expect("maximum frame");
+        writer.await.unwrap().unwrap();
+        assert_eq!(frame.len(), P9_MAX_MSIZE as usize);
+        assert_eq!(
+            global.snapshot().receive_reserved_bytes,
+            P9_MAX_MSIZE as usize,
+            "the complete frame allocation must remain covered by receive credit"
+        );
+
+        let admitted = connection
+            .admit_request(frame.len(), P9_RWRITE_MAX_SIZE)
+            .await
+            .unwrap();
+        drop(receive);
+        assert_eq!(global.snapshot().receive_reserved_bytes, 0);
+        assert_eq!(
+            global.snapshot().reserved_bytes,
+            P9_MAX_MSIZE as usize + P9_RWRITE_MAX_SIZE
+        );
+        drop(frame);
+        drop(admitted);
+    }
+
+    #[test]
+    fn large_read_response_reserves_source_and_serialized_buffers() {
+        assert_eq!(
+            possible_response_bytes(message_type::TREAD),
+            2 * P9_MAX_MSIZE as usize,
+            "a large read retains its source payload while serializing the wire response"
+        );
+    }
+
+    #[tokio::test]
+    async fn fragmented_websocket_receive_reserves_collector_and_frame() {
+        let global = P9GlobalAdmission::for_test_with_transports(
+            GLOBAL_INFLIGHT_MEMORY,
+            GLOBAL_INFLIGHT_REQUESTS,
+            2,
+        );
+        let shutdown = CancellationToken::new();
+        let receive = global.admit_websocket_receive(&shutdown).await.unwrap();
+        assert_eq!(
+            global.snapshot().receive_reserved_bytes,
+            2 * P9_MAX_MSIZE as usize,
+            "fragment assembly must charge both the collector and current frame"
+        );
+        drop(receive);
+        assert_eq!(global.snapshot().receive_reserved_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn default_upload_pipeline_fits_the_global_byte_budget() {
+        const DEFAULT_CONNECTIONS: usize = 16;
+        const PIPELINE_PER_CONNECTION: usize = 2;
+        const CHUNK_BYTES: usize = 9 * 1024 * 1024;
+        const TWRITE_FRAME_BYTES: usize =
+            CHUNK_BYTES + P9_HEADER_SIZE + P9_OP_ENVELOPE_LEN + 4 + 8 + P9_COUNT_FIELD_LEN;
+
+        let global = P9GlobalAdmission::for_test(GLOBAL_INFLIGHT_MEMORY, GLOBAL_INFLIGHT_REQUESTS);
+        let connections = (0..DEFAULT_CONNECTIONS)
+            .map(|_| {
+                global.connection_for_test(CONNECTION_INFLIGHT_MEMORY, CONNECTION_INFLIGHT_REQUESTS)
+            })
+            .collect::<Vec<_>>();
+        let mut admitted = Vec::new();
+        for connection in &connections {
+            for _ in 0..PIPELINE_PER_CONNECTION {
+                admitted.push(
+                    connection
+                        .admit_request(TWRITE_FRAME_BYTES, possible_response_bytes(T_WRITE))
+                        .await
+                        .unwrap(),
+                );
+            }
+        }
+
+        assert_eq!(admitted.len(), 32);
+        assert!(global.snapshot().reserved_bytes < GLOBAL_INFLIGHT_MEMORY);
+        drop(admitted);
+        assert_eq!(global.snapshot().reserved_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn connection_request_bytes_apply_backpressure_before_dispatch() {
+        let global = P9GlobalAdmission::for_test(16, 4);
+        let connection = global.connection_for_test(8, 4);
+        let first = connection.admit_request(5, 3).await.unwrap();
+
+        assert!(
+            tokio::time::timeout(QUIET_TIMEOUT, connection.admit_request(1, 0))
+                .await
+                .is_err(),
+            "request and possible response bytes must share the local budget"
+        );
+
+        drop(first);
+        tokio::time::timeout(TEST_TIMEOUT, connection.admit_request(1, 0))
+            .await
+            .expect("released request bytes must unblock the connection")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn global_request_bytes_apply_backpressure_across_connections() {
+        let global = P9GlobalAdmission::for_test(8, 4);
+        let first_connection = global.connection_for_test(8, 4);
+        let second_connection = global.connection_for_test(8, 4);
+        let first = first_connection.admit_request(5, 3).await.unwrap();
+
+        assert!(
+            tokio::time::timeout(QUIET_TIMEOUT, second_connection.admit_request(1, 0))
+                .await
+                .is_err(),
+            "connections must share the process request-byte budget"
+        );
+
+        drop(first);
+        tokio::time::timeout(TEST_TIMEOUT, second_connection.admit_request(1, 0))
+            .await
+            .expect("released global bytes must unblock another connection")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_blocked_request_admission_without_leaking_permits() {
+        let global = P9GlobalAdmission::for_test(8, 2);
+        let first_connection = global.connection_for_test(8, 1);
+        let blocked_connection = global.connection_for_test(8, 1);
+        let first = first_connection.admit_request(8, 0).await.unwrap();
+        let shutdown = CancellationToken::new();
+        let blocked_shutdown = shutdown.clone();
+        let blocked = tokio::spawn(async move {
+            blocked_connection
+                .admit_request_or_shutdown(1, 0, &blocked_shutdown)
+                .await
+        });
+        tokio::task::yield_now().await;
+        shutdown.cancel();
+
+        assert!(
+            tokio::time::timeout(TEST_TIMEOUT, blocked)
+                .await
+                .expect("shutdown-aware admission must return")
+                .unwrap()
+                .is_err()
+        );
+        drop(first);
+        assert_eq!(
+            global.snapshot(),
+            P9AdmissionSnapshot {
+                reserved_bytes: 0,
+                active_requests: 0,
+                active_transports: 0,
+                receive_reserved_bytes: 0,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn request_task_limit_bounds_tiny_frames() {
+        let global = P9GlobalAdmission::for_test(128, 1);
+        let connection = global.connection_for_test(128, 1);
+        let first = connection.admit_request(1, 0).await.unwrap();
+
+        assert!(
+            tokio::time::timeout(QUIET_TIMEOUT, connection.admit_request(1, 0))
+                .await
+                .is_err(),
+            "small frames must not bypass the request-task bound"
+        );
+
+        drop(first);
+        tokio::time::timeout(TEST_TIMEOUT, connection.admit_request(1, 0))
+            .await
+            .expect("released task capacity must admit the next frame")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn queued_response_holds_byte_admission_until_consumed() {
+        let global = P9GlobalAdmission::for_test(8, 4);
+        let connection = global.connection_for_test(8, 4);
+        let admitted = connection.admit_request(1, 7).await.unwrap();
+        let response = P9Response::new(7, vec![0; 7], admitted);
+
+        assert!(
+            tokio::time::timeout(QUIET_TIMEOUT, connection.admit_request(1, 0))
+                .await
+                .is_err(),
+            "queued response bytes must remain charged until the writer consumes them"
+        );
+
+        drop(response);
+        tokio::time::timeout(TEST_TIMEOUT, connection.admit_request(1, 0))
+            .await
+            .expect("consuming a response must release its byte charge")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn response_flush_releases_admission_exactly_once() {
+        let global = P9GlobalAdmission::for_test(32, 1);
+        let connection = global.connection_for_test(32, 1);
+        let admitted = connection.admit_request(8, 8).await.unwrap();
+        let response = P9Response::new(7, vec![0; 8], admitted);
+        let (tx, rx) = mpsc::channel(1);
+        tx.send(response).await.unwrap();
+        drop(tx);
+        let (mut client, server) = tokio::io::duplex(64);
+        let writer = spawn_response_writer(
+            server,
+            rx,
+            ResponseAuthority::always(),
+            CancellationToken::new(),
+        );
+
+        drain_writer(writer, "response writer must flush").await;
+        let mut bytes = [0; 8];
+        client.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(
+            global.snapshot(),
+            P9AdmissionSnapshot {
+                reserved_bytes: 0,
+                active_requests: 0,
+                active_transports: 0,
+                receive_reserved_bytes: 0,
+            },
+            "transport completion must release both byte and request permits once"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconnect_storm_cannot_exceed_the_global_budget() {
+        let global = P9GlobalAdmission::for_test(16, 2);
+        let connections = (0..32)
+            .map(|_| global.connection_for_test(8, 1))
+            .collect::<Vec<_>>();
+        let mut admitted = Vec::new();
+
+        for connection in &connections {
+            if let Ok(Ok(permit)) =
+                tokio::time::timeout(Duration::from_millis(1), connection.admit_request(5, 3)).await
+            {
+                admitted.push(permit);
+            }
+        }
+
+        assert_eq!(admitted.len(), 2);
+        assert_eq!(
+            global.snapshot(),
+            P9AdmissionSnapshot {
+                reserved_bytes: 16,
+                active_requests: 2,
+                active_transports: 0,
+                receive_reserved_bytes: 0,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn reconnect_waiters_are_bounded_before_connection_local_admission() {
+        let global = P9GlobalAdmission::for_test(8, 2);
+        let first_connection = global.connection_for_test(8, 1);
+        let waiting_connection = global.connection_for_test(8, 1);
+        let blocked_connection = global.connection_for_test(8, 1);
+        let first = first_connection.admit_request(8, 0).await.unwrap();
+        let mut waiting = Box::pin(waiting_connection.admit_request(8, 0));
+
+        tokio::select! {
+            _ = &mut waiting => panic!("byte-saturated admission completed"),
+            _ = tokio::task::yield_now() => {}
+        }
+        assert_eq!(global.snapshot().active_requests, 2);
+
+        assert!(
+            tokio::time::timeout(QUIET_TIMEOUT, blocked_connection.admit_request(1, 0))
+                .await
+                .is_err(),
+            "a reconnect cannot queue past the process-wide request slots"
+        );
+
+        drop(first);
+        let admitted = tokio::time::timeout(TEST_TIMEOUT, waiting)
+            .await
+            .expect("the queued request must advance when bytes are released")
+            .unwrap();
+        drop(admitted);
+        assert_eq!(
+            global.snapshot(),
+            P9AdmissionSnapshot {
+                reserved_bytes: 0,
+                active_requests: 0,
+                active_transports: 0,
+                receive_reserved_bytes: 0,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn disconnect_settlement_waits_for_tracked_requests() {
+        let requests = TaskTracker::new();
+        let release = Arc::new(Notify::new());
+        let task_release = Arc::clone(&release);
+        requests.spawn(async move {
+            task_release.notified().await;
+        });
+
+        let mut settlement = tokio::spawn(settle_request_tasks(requests));
+        assert!(
+            tokio::time::timeout(QUIET_TIMEOUT, &mut settlement)
+                .await
+                .is_err(),
+            "disconnect settlement must keep accepted request work alive"
+        );
+
+        release.notify_waiters();
+        tokio::time::timeout(TEST_TIMEOUT, settlement)
+            .await
+            .expect("settled requests must release the disconnected session")
+            .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timed_out_settlement_transfers_to_process_ownership() {
+        let requests = TaskTracker::new();
+        let accepted_work = P9AcceptedWorkTracker::new();
+        let accepted_guard = accepted_work.try_accept().unwrap();
+        let release = Arc::new(Notify::new());
+        let task_release = Arc::clone(&release);
+        let (finished_tx, mut finished_rx) = oneshot::channel();
+        requests.spawn(async move {
+            let _accepted_guard = accepted_guard;
+            task_release.notified().await;
+            let _ = finished_tx.send(());
+        });
+
+        let settlement = tokio::spawn(settle_request_tasks(requests));
+        tokio::task::yield_now().await;
+        tokio::time::advance(CLIENT_DRAIN_TIMEOUT + Duration::from_millis(1)).await;
+        settlement
+            .await
+            .expect("connection settlement must return after its bound");
+        assert!(
+            finished_rx.try_recv().is_err(),
+            "accepted work must not be aborted at the connection deadline"
+        );
+        assert_eq!(accepted_work.len(), 1);
+        accepted_work.stop_accepting();
+        let mut process_settlement = tokio::spawn({
+            let accepted_work = accepted_work.clone();
+            async move { accepted_work.wait().await }
+        });
+        assert!(
+            tokio::time::timeout(QUIET_TIMEOUT, &mut process_settlement)
+                .await
+                .is_err(),
+            "process shutdown must retain accepted work ownership"
+        );
+
+        release.notify_waiters();
+        tokio::time::timeout(TEST_TIMEOUT, finished_rx)
+            .await
+            .expect("process-owned accepted work must finish")
+            .unwrap();
+        tokio::time::timeout(TEST_TIMEOUT, process_settlement)
+            .await
+            .expect("process ownership must drain after accepted work finishes")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn sealed_process_tracker_rejects_late_acceptance() {
+        let accepted_work = P9AcceptedWorkTracker::new();
+        let guard = accepted_work.try_accept().unwrap();
+        accepted_work.stop_accepting();
+        assert!(accepted_work.try_accept().is_none());
+
+        let mut settlement = tokio::spawn({
+            let accepted_work = accepted_work.clone();
+            async move { accepted_work.wait().await }
+        });
+        assert!(
+            tokio::time::timeout(QUIET_TIMEOUT, &mut settlement)
+                .await
+                .is_err()
+        );
+        drop(guard);
+        tokio::time::timeout(TEST_TIMEOUT, settlement)
+            .await
+            .expect("sealing must wait only for work accepted before the cutoff")
+            .unwrap();
+    }
+
+    struct DropTrackedFrame {
+        bytes: Vec<u8>,
+        dropped: Option<oneshot::Sender<()>>,
+    }
+
+    impl AsRef<[u8]> for DropTrackedFrame {
+        fn as_ref(&self) -> &[u8] {
+            &self.bytes
+        }
+    }
+
+    impl Drop for DropTrackedFrame {
+        fn drop(&mut self) {
+            if let Some(dropped) = self.dropped.take() {
+                let _ = dropped.send(());
+            }
+        }
+    }
+
+    fn tracked_retry_write_frame(
+        tag: u16,
+        op_id: [u8; P9_OP_ID_LEN],
+        count: usize,
+    ) -> (Bytes, oneshot::Receiver<()>) {
+        let encoded = P9Message::new_with_op_id_flags_and_origin(
+            tag,
+            op_id,
+            P9_OP_FLAG_RETRY,
+            0,
+            Message::Twrite(Twrite {
+                fid: u32::MAX,
+                offset: 0,
+                count: count as u32,
+                data: DekuBytes::from(Bytes::from(vec![0x5a; count])),
+            }),
+        )
+        .to_bytes_ctx(true)
+        .unwrap();
+        let (dropped_tx, dropped_rx) = oneshot::channel();
+        (
+            Bytes::from_owner(DropTrackedFrame {
+                bytes: encoded,
+                dropped: Some(dropped_tx),
+            }),
+            dropped_rx,
+        )
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn duplicate_write_retry_drops_payload_before_waiting_for_first() {
+        let filesystem = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let handler = Arc::new(NinePHandler::new(
+            Arc::clone(&filesystem),
+            Arc::new(FileLockManager::new()),
+        ));
+        negotiate(&handler).await;
+
+        let op_id = [0x72; 16];
+        let first = filesystem
+            .dedup
+            .reserve_initial(op_id)
+            .expect("reserve the original mutation");
+        let (frame, dropped_rx) = tracked_retry_write_frame(7, op_id, 1024 * 1024);
+        let reserved = frame.len() + P9_MAX_MSIZE as usize;
+        let global = P9GlobalAdmission::for_test(reserved, 1);
+        let admission = global.connection_for_test(reserved, 1);
+        let requests = TaskTracker::new();
+        let (tx, mut rx) = mpsc::channel(1);
+        let inflight = InflightRegistry::default();
+
+        dispatch_9p_frame(
+            frame,
+            &handler,
+            &tx,
+            &inflight,
+            &admission,
+            &requests,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(TEST_TIMEOUT, dropped_rx)
+            .await
+            .expect("retry payload allocation must be dropped while the first remains in flight")
+            .unwrap();
+
+        filesystem.dedup.record_entry(crate::dedup::DedupEntry {
+            op_id,
+            result: crate::dedup::DedupResult::Write {
+                attrs: crate::fs::types::FileAttributes::default(),
+            },
+        });
+        drop(first);
+        let response = tokio::time::timeout(TEST_TIMEOUT, rx.recv())
+            .await
+            .expect("retry must replay after the first completes")
+            .expect("response channel");
+        let (_, response_bytes) = response.into_parts();
+        let response = decode(&response_bytes);
+        assert!(matches!(
+            response.body,
+            Message::Rwrite(ninep_proto::Rwrite { count }) if count == 1024 * 1024
+        ));
+
+        requests.close();
+        requests.wait().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shallow_write_retry_rejects_a_mismatched_completed_result() {
+        let filesystem = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let handler = Arc::new(NinePHandler::new(
+            Arc::clone(&filesystem),
+            Arc::new(FileLockManager::new()),
+        ));
+        negotiate(&handler).await;
+
+        let op_id = [0x73; 16];
+        let first = filesystem
+            .dedup
+            .reserve_initial(op_id)
+            .expect("reserve the original mutation");
+        let (frame, dropped_rx) = tracked_retry_write_frame(8, op_id, 64 * 1024);
+        let reserved = frame.len() + P9_MAX_MSIZE as usize;
+        let global = P9GlobalAdmission::for_test(reserved, 1);
+        let admission = global.connection_for_test(reserved, 1);
+        let requests = TaskTracker::new();
+        let (tx, mut rx) = mpsc::channel(1);
+
+        dispatch_9p_frame(
+            frame,
+            &handler,
+            &tx,
+            &InflightRegistry::default(),
+            &admission,
+            &requests,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(TEST_TIMEOUT, dropped_rx)
+            .await
+            .expect("mismatched retry payload must still be released before joining")
+            .unwrap();
+
+        filesystem.dedup.record_entry(crate::dedup::DedupEntry {
+            op_id,
+            result: crate::dedup::DedupResult::Mkdir {
+                inode_id: 0,
+                attrs: crate::fs::types::FileAttributes::default(),
+            },
+        });
+        drop(first);
+        let response = tokio::time::timeout(TEST_TIMEOUT, rx.recv())
+            .await
+            .expect("mismatched retry response")
+            .expect("response channel");
+        assert!(matches!(
+            decode(&response.into_parts().1).body,
+            Message::Rlerror(Rlerror {
+                ecode: ninep_proto::P9_EOPIDSTALE
+            })
+        ));
+
+        requests.close();
+        requests.wait().await;
+    }
 
     fn frame(tag: u16, body: Message) -> Bytes {
         Bytes::from(P9Message::new(tag, body).to_bytes().unwrap())
@@ -988,19 +988,25 @@ mod tests {
 
     struct DispatchFixture {
         handler: Arc<NinePHandler>,
-        tx: mpsc::Sender<(u16, Vec<u8>)>,
-        rx: mpsc::Receiver<(u16, Vec<u8>)>,
+        tx: mpsc::Sender<P9Response>,
+        rx: mpsc::Receiver<P9Response>,
         inflight: InflightRegistry,
+        admission: P9ConnectionAdmission,
+        requests: TaskTracker,
     }
 
     impl DispatchFixture {
         fn new(handler: Arc<NinePHandler>, capacity: usize) -> Self {
             let (tx, rx) = mpsc::channel(capacity);
+            let byte_limit = P9_MAX_MSIZE as usize * 64;
+            let global = P9GlobalAdmission::for_test(byte_limit, 64);
             Self {
                 handler,
                 tx,
                 rx,
                 inflight: InflightRegistry::default(),
+                admission: global.connection_for_test(byte_limit, 64),
+                requests: TaskTracker::new(),
             }
         }
 
@@ -1009,19 +1015,30 @@ mod tests {
             Self::new(handler, capacity)
         }
 
-        fn dispatch(&self, tag: u16, body: Message) {
-            self.dispatch_frame(frame(tag, body));
+        async fn dispatch(&self, tag: u16, body: Message) {
+            self.dispatch_frame(frame(tag, body)).await;
         }
 
-        fn dispatch_frame(&self, bytes: Bytes) {
-            dispatch_9p_frame(bytes, &self.handler, &self.tx, &self.inflight).unwrap();
+        async fn dispatch_frame(&self, bytes: Bytes) {
+            dispatch_9p_frame(
+                bytes,
+                &self.handler,
+                &self.tx,
+                &self.inflight,
+                &self.admission,
+                &self.requests,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
         }
 
         async fn recv(&mut self, context: &str) -> (u16, P9Message) {
-            let (tag, bytes) = tokio::time::timeout(TEST_TIMEOUT, self.rx.recv())
+            let response = tokio::time::timeout(TEST_TIMEOUT, self.rx.recv())
                 .await
                 .expect(context)
                 .expect("response channel");
+            let (tag, bytes) = response.into_parts();
             (tag, decode(&bytes))
         }
 
@@ -1064,14 +1081,30 @@ mod tests {
             .expect("writer task");
     }
 
-    fn response_queue<const N: usize>(
+    async fn response_queue<const N: usize>(
         responses: [(u16, Vec<u8>); N],
-    ) -> mpsc::Receiver<(u16, Vec<u8>)> {
+    ) -> mpsc::Receiver<P9Response> {
         let (tx, rx) = mpsc::channel(N);
-        for response in responses {
-            tx.try_send(response).unwrap();
+        let byte_limit = responses
+            .iter()
+            .map(|(_, bytes)| bytes.len())
+            .sum::<usize>()
+            .max(1);
+        let global = P9GlobalAdmission::for_test(byte_limit, N.max(1));
+        let admission = global.connection_for_test(byte_limit, N.max(1));
+        for (tag, bytes) in responses {
+            let permit = admission.admit_request(0, bytes.len()).await.unwrap();
+            tx.try_send(P9Response::new(tag, bytes, permit)).unwrap();
         }
         rx
+    }
+
+    async fn test_response(tag: u16, bytes: Vec<u8>) -> P9Response {
+        let byte_limit = bytes.len().max(1);
+        let global = P9GlobalAdmission::for_test(byte_limit, 1);
+        let admission = global.connection_for_test(byte_limit, 1);
+        let permit = admission.admit_request(0, bytes.len()).await.unwrap();
+        P9Response::new(tag, bytes, permit)
     }
 
     fn not_leader(tag: u16) -> Vec<u8> {
@@ -1103,8 +1136,9 @@ mod tests {
                 newfid: 2,
                 flags: libc::O_RDONLY as u32,
             }),
-        );
-        io.dispatch(followup_tag, followup);
+        )
+        .await;
+        io.dispatch(followup_tag, followup).await;
         io.expect_quiet(quiet_message).await;
         drop(inode_lock);
 
@@ -1256,6 +1290,31 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn listener_shutdown_completes_with_an_idle_accepted_client() {
+        let filesystem = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("ninep-shutdown.sock");
+        let server = NinePServer::new_unix(filesystem, socket.clone());
+        let shutdown = CancellationToken::new();
+        let server_shutdown = shutdown.clone();
+        let task = tokio::spawn(async move { server.start(server_shutdown).await });
+
+        let client = loop {
+            match tokio::net::UnixStream::connect(&socket).await {
+                Ok(client) => break client,
+                Err(_) => tokio::task::yield_now().await,
+            }
+        };
+        shutdown.cancel();
+        tokio::time::timeout(TEST_TIMEOUT, task)
+            .await
+            .expect("listener and accepted client must stop after shutdown")
+            .unwrap()
+            .unwrap();
+        drop(client);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn timed_join_aborts_and_awaits_the_task_before_returning() {
         let (started_tx, started_rx) = oneshot::channel();
@@ -1286,7 +1345,7 @@ mod tests {
         let response = frame(21, Message::Rflush(Rflush)).to_vec();
         let writer = spawn_response_writer(
             buffered_server,
-            response_queue([(21, response.clone())]),
+            response_queue([(21, response.clone())]).await,
             ResponseAuthority::always(),
             CancellationToken::new(),
         );
@@ -1320,7 +1379,7 @@ mod tests {
         let second = not_leader(32);
         let writer = spawn_response_writer(
             counted_server,
-            response_queue([(31, first.clone()), (32, second.clone())]),
+            response_queue([(31, first.clone()), (32, second.clone())]).await,
             ResponseAuthority::always(),
             CancellationToken::new(),
         );
@@ -1348,7 +1407,7 @@ mod tests {
         assert!(matches!(completed.body, Message::Rflush(Rflush)));
         let completed_bytes = completed.to_bytes().unwrap();
         let (mut client, server) = tokio::io::duplex(4096);
-        let rx = response_queue([(41, completed_bytes)]);
+        let rx = response_queue([(41, completed_bytes)]).await;
         lease.revoke();
 
         let connection_shutdown = CancellationToken::new();
@@ -1372,7 +1431,7 @@ mod tests {
         let (mut client, server) = tokio::io::duplex(4096);
         let writer = spawn_response_writer(
             server,
-            response_queue([(42, error_bytes.clone())]),
+            response_queue([(42, error_bytes.clone())]).await,
             ResponseAuthority::from_database(Arc::clone(&filesystem.db)),
             CancellationToken::new(),
         );
@@ -1414,7 +1473,8 @@ mod tests {
                 (51, first_error.clone()),
                 (52, buffered_success),
                 (53, trailing_error),
-            ]),
+            ])
+            .await,
             ResponseAuthority::from_database(Arc::clone(&filesystem.db)),
             CancellationToken::new(),
         );
@@ -1455,9 +1515,23 @@ mod tests {
             .unwrap();
         let (tx, _rx) = mpsc::channel(2);
         let inflight = InflightRegistry::default();
+        let byte_limit = P9_MAX_MSIZE as usize * 2;
+        let global = P9GlobalAdmission::for_test(byte_limit, 2);
+        let admission = global.connection_for_test(byte_limit, 2);
+        let requests = TaskTracker::new();
 
         // The current-thread runtime leaves the received FIRST task unpolled.
-        dispatch_9p_frame(Bytes::from(first), &old, &tx, &inflight).unwrap();
+        dispatch_9p_frame(
+            Bytes::from(first),
+            &old,
+            &tx,
+            &inflight,
+            &admission,
+            &requests,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
         old.close_for_disconnect();
 
         // RETRY must wait for the received FIRST and replay its mkdir result.
@@ -1539,7 +1613,7 @@ mod tests {
             connection_shutdown.clone(),
         );
 
-        tx.send((21, vec![1, 2, 3]))
+        tx.send(test_response(21, vec![1, 2, 3]).await)
             .await
             .expect("response enqueue");
         tokio::time::timeout(TEST_TIMEOUT, connection_shutdown.cancelled())
@@ -1639,9 +1713,17 @@ mod tests {
         let original_waiter = inflight.waiter(7).expect("original request");
         let response = vec![1, 2, 3];
         let (tx, mut rx) = mpsc::channel(1);
-        tx.send((99, vec![0])).await.unwrap();
+        tx.send(test_response(99, vec![0]).await).await.unwrap();
+        let global = P9GlobalAdmission::for_test(response.len(), 1);
+        let admission = global.connection_for_test(response.len(), 1);
+        let response_admission = admission.admit_request(0, response.len()).await.unwrap();
 
-        let mut enqueue = Box::pin(enqueue_terminal_response(&tx, response.clone(), &original));
+        let mut enqueue = Box::pin(enqueue_terminal_response(
+            &tx,
+            response.clone(),
+            &original,
+            response_admission,
+        ));
         tokio::select! {
             biased;
             result = &mut enqueue => panic!("full response queue accepted a send: {result:?}"),
@@ -1651,14 +1733,14 @@ mod tests {
             inflight.register(7, FidFootprint::None).is_err(),
             "queue backpressure must keep the tag occupied until capacity is reserved"
         );
-        assert_eq!(rx.recv().await.unwrap(), (99, vec![0]));
+        assert_eq!(rx.recv().await.unwrap().into_parts(), (99, vec![0]));
 
         tokio::time::timeout(TEST_TIMEOUT, &mut enqueue)
             .await
             .expect("response enqueue")
             .unwrap();
         drop(enqueue);
-        assert_eq!(rx.recv().await.unwrap(), (7, response));
+        assert_eq!(rx.recv().await.unwrap().into_parts(), (7, response));
 
         let replacement = inflight
             .register(7, FidFootprint::None)
@@ -1692,10 +1774,21 @@ mod tests {
         let (mut client, server) = tokio::io::duplex(4096);
         client.write_all(&input).await.unwrap();
         let (tx, _rx) = mpsc::channel(2);
+        let byte_limit = P9_MAX_MSIZE as usize * 4;
+        let global = P9GlobalAdmission::for_test(byte_limit, 4);
+        let admission = global.connection_for_test(byte_limit, 4);
+        let requests = TaskTracker::new();
 
-        let error = handle_client_loop(handler, server, tx, CancellationToken::new())
-            .await
-            .expect_err("duplicate tag must terminate the reader");
+        let error = handle_client_loop(
+            handler,
+            server,
+            tx,
+            CancellationToken::new(),
+            &admission,
+            &requests,
+        )
+        .await
+        .expect_err("duplicate tag must terminate the reader");
         assert!(error.to_string().contains("reused in-flight 9P tag 7"));
 
         let mut byte = [0];
@@ -1794,7 +1887,7 @@ mod tests {
             inspect_frame_metadata(&frame, true),
             ShallowFrameMetadata {
                 fids: FidFootprint::One(42),
-                received_op: Some((op_id, 0)),
+                received_op: Some((op_id, 0, 0)),
             }
         );
     }
@@ -1817,7 +1910,7 @@ mod tests {
         .unwrap();
 
         let mut io = DispatchFixture::new(handler, 1);
-        io.dispatch_frame(Bytes::from(frame));
+        io.dispatch_frame(Bytes::from(frame)).await;
         assert!(matches!(
             io.recv("malformed request response").await.1.body,
             Message::Rlerror(_)
@@ -1913,7 +2006,8 @@ mod tests {
     async fn tflush_captures_its_target_before_dispatch_returns() {
         let mut io = DispatchFixture::in_memory(2).await;
         let target_lease = io.inflight.register(20, FidFootprint::None).unwrap();
-        io.dispatch(21, Message::Tflush(Tflush { oldtag: 20 }));
+        io.dispatch(21, Message::Tflush(Tflush { oldtag: 20 }))
+            .await;
         io.expect_quiet("Rflush must wait for the captured target generation")
             .await;
         drop(target_lease);
@@ -1927,7 +2021,8 @@ mod tests {
         let target_lease = io.inflight.register(20, FidFootprint::None).unwrap();
 
         for tag in [21, 22] {
-            io.dispatch(tag, Message::Tflush(Tflush { oldtag: 20 }));
+            io.dispatch(tag, Message::Tflush(Tflush { oldtag: 20 }))
+                .await;
         }
 
         io.expect_quiet("both flushes must wait for the same target generation")
@@ -1945,8 +2040,10 @@ mod tests {
     async fn flushing_a_flush_waits_for_its_response() {
         let mut io = DispatchFixture::in_memory(2).await;
         let target_lease = io.inflight.register(20, FidFootprint::None).unwrap();
-        io.dispatch(21, Message::Tflush(Tflush { oldtag: 20 }));
-        io.dispatch(22, Message::Tflush(Tflush { oldtag: 21 }));
+        io.dispatch(21, Message::Tflush(Tflush { oldtag: 20 }))
+            .await;
+        io.dispatch(22, Message::Tflush(Tflush { oldtag: 21 }))
+            .await;
         io.expect_quiet("the second flush must observe the first flush as in flight")
             .await;
         drop(target_lease);
@@ -1959,7 +2056,8 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn flush_of_an_unknown_tag_responds_immediately() {
         let mut io = DispatchFixture::in_memory(1).await;
-        io.dispatch(21, Message::Tflush(Tflush { oldtag: 20 }));
+        io.dispatch(21, Message::Tflush(Tflush { oldtag: 20 }))
+            .await;
 
         assert_eq!(io.recv_flush("immediate flush response").await, 21);
     }
@@ -1977,7 +2075,7 @@ mod tests {
 
         let mut io = DispatchFixture::new(handler, 2);
         let target_lease = io.inflight.register(20, FidFootprint::None).unwrap();
-        io.dispatch_frame(Bytes::from(frame));
+        io.dispatch_frame(Bytes::from(frame)).await;
 
         drop(target_lease);
         io.recv_flush("flush response").await;
@@ -2010,8 +2108,9 @@ mod tests {
                 newfid: 2,
                 flags: libc::O_RDONLY as u32,
             }),
-        );
-        io.dispatch(11, Message::Tclunk(Tclunk { fid: 3 }));
+        )
+        .await;
+        io.dispatch(11, Message::Tclunk(Tclunk { fid: 3 })).await;
 
         let (tag, clunk) = io.recv("unrelated clunk response").await;
         assert_eq!(tag, 11);
@@ -2044,7 +2143,8 @@ mod tests {
                 fid: 2,
                 request_mask: GETATTR_ALL,
             }),
-        );
+        )
+        .await;
         assert!(matches!(
             io.recv("getattr response").await.1.body,
             Message::Rlerror(_)
