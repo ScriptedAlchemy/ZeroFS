@@ -547,7 +547,10 @@ Cache-state names require server-side proof. `fio --invalidate=1` proves only th
 Linux client page cache was invalidated. Remote-cold requires a fresh process and empty
 clean-cache roots plus positive remote payload reads; clean-SSD requires zero remote
 payload reads and positive local-cache device reads after a restart that clears RAM;
-clean-RAM requires zero local-device and remote payload reads for the scored ranges.
+clean-RAM requires client-cache invalidation after server warmup, positive exact
+protocol/server logical read bytes for the scored ranges, and zero local-device and
+remote payload reads. A zero protocol/server-byte delta is a client-cache hit, not a
+clean-RAM result.
 
 ## Implementation phases and rollout
 
