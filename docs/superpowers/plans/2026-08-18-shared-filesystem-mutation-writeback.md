@@ -1310,6 +1310,7 @@ Expected: the fragmented RED proves peak backend concurrency greater than one; e
 - Modify: `zerofs/src/fs/store/extent/mod.rs`
 - Modify: `zerofs/src/fs/store/extent/write.rs`
 - Modify: `zerofs/src/fs/store/extent/compact.rs`
+- Modify: `zerofs/src/fs/store/extent/reclaim.rs`
 - Modify: `zerofs/src/fs/store/read_cache.rs`
 - Modify: `zerofs/src/fs/mutation/overlay.rs`
 - Modify: `zerofs/src/fs/mutation/request_cache.rs`
@@ -1337,8 +1338,11 @@ Add exact tests:
 - `ordinary_chunked_nfs_write_does_not_admit_decoded_extent_cache`
 - `compaction_reads_do_not_admit_raw_parts_or_decoded_cache`
 - `compaction_groups_adjacent_source_runs_under_one_bounded_scan`
+- `sparse_interleaved_full_segment_uses_at_most_thirty_two_verification_scans`
 - `cache_weigher_includes_key_entry_and_allocator_slack`
 - `dirty_ram_zero_does_not_satisfy_resident_headroom`
+- `physical_residency_does_not_sum_jemalloc_resident_and_retained`
+- `retained_only_growth_does_not_consume_physical_headroom`
 
 Use a temporary cgroup-file seam that parses literal `memory.max` and `memory.events`
 contents; it is a unit seam for parsing/accounting, not Linux acceptance. Build a real
@@ -1346,7 +1350,9 @@ ordinary chunked NFS write path and real compacted segment fixture for the
 write-no-allocate/no-admit
 tests. Current code is RED because decoded extent and parts weighers charge payload
 length only, every canonical write calls `decoded_insert`, and compaction reads through
-the cache-admitting segment path.
+the cache-admitting segment path. The reclaim fixture contains a full 1,024-frame
+segment whose `(inode, extent)` keys are deliberately sparse and interleaved, so
+maximal-consecutive-run grouping would still issue 2,048 memory/durable point reads.
 
 ```bash
 cd /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback/zerofs
@@ -1358,7 +1364,9 @@ for name in \
   resident_permit_charges_payload_overhead_and_replacement_once \
   ordinary_chunked_nfs_write_does_not_admit_decoded_extent_cache \
   compaction_reads_do_not_admit_raw_parts_or_decoded_cache \
-  compaction_groups_adjacent_source_runs_under_one_bounded_scan
+  compaction_groups_adjacent_source_runs_under_one_bounded_scan \
+  physical_residency_does_not_sum_jemalloc_resident_and_retained \
+  retained_only_growth_does_not_consume_physical_headroom
 do
   grep -F "${MEMORY_TEST_PREFIX}${name}: test" "${TMPDIR:-/tmp}/zerofs-memory-red-list.log"
   if cargo test -p zerofs --locked "${MEMORY_TEST_PREFIX}${name}" -- --exact --nocapture; then
@@ -1366,6 +1374,7 @@ do
     exit 1
   fi
 done
+cargo test -p zerofs --locked fs::store::extent::reclaim::tests::sparse_interleaved_full_segment_uses_at_most_thirty_two_verification_scans -- --exact --nocapture
 ```
 
 - [ ] **Step 2: Define exact aggregate ownership types and validation**
@@ -1420,6 +1429,8 @@ pub(crate) struct ResidentMemorySnapshot {
     pub(crate) peak_bytes: u64,
     pub(crate) process_resident_bytes: u64,
     pub(crate) cgroup_current_bytes: Option<u64>,
+    pub(crate) jemalloc_resident_bytes: Option<u64>,
+    pub(crate) jemalloc_retained_virtual_bytes: Option<u64>,
     pub(crate) baseline_bytes: u64,
     pub(crate) unowned_residual_bytes: u64,
 }
@@ -1464,8 +1475,13 @@ Add a typed `CacheAdmission::{Read, NoAdmit}` argument below the extent and segm
 facades. User reads keep current cache behavior. Every canonical write, including each
 ordinary chunked NFS rsync write, uses `NoAdmit` and cannot call `decoded_insert`;
 pending-read coherence remains owned by the shared mutation overlay until canonical
-state is visible. GC/compaction coalesces adjacent source ranges into bounded sequential
-scans and uses `NoAdmit` for decoded and raw-part caches. Cache weighers include key size, entry/container overhead,
+state is visible. GC/compaction uses fixed batches of at most 64 sorted forward-map keys;
+each batch is merge-checked by one streaming memory-view scan and one durable-view scan,
+so a full 1,024-frame segment issues at most 32 scans even when every key is sparse or
+interleaved. It never falls back to one point read per frame; absent forward keys mean
+dead frames as today, while any decode error, scan error, or reference to the segment
+fails closed to `Keep`. The scans
+use `NoAdmit` for decoded and raw-part caches. Cache weighers include key size, entry/container overhead,
 and documented allocator slack rather than `value.len()` alone. Replacement ownership
 may overlap only inside its precharged maximum.
 
@@ -1475,7 +1491,10 @@ Expose configured/effective limit, reserve, charged/peak bytes by
 `ResidentMemoryKind`, aggregate waiters/backpressure, cache replacement bytes,
 maintenance working bytes/no-admit reads, allocator allocated/resident/retained, and
 Linux cgroup current/max/events. Labels never contain paths, keys, request IDs, or raw
-errors. Reconciliation measures process RSS and cgroup `memory.current`, then records
+errors. Physical residency comes from OS RSS and, when available, cgroup
+`memory.current`; `jemalloc.stats.resident` is a correlation metric and
+`jemalloc.stats.retained` is retained virtual address space. Never add resident and
+retained or use retained alone as physical RSS/admission pressure. Reconciliation measures process RSS and cgroup `memory.current`, then records
 `owned + calibrated idle baseline + unowned residual = observed current`. The residual
 has a conservative configured ceiling and triggers backpressure/fail-closed poison if
 it escapes tolerance; merely proving charged owners sum to themselves is rejected.
@@ -1500,7 +1519,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --all-targets --locked
 git diff --check
-git add zerofs/src/resident_memory.rs zerofs/src/lib.rs zerofs/src/main.rs zerofs/src/config.rs zerofs/src/cli/server.rs zerofs/src/nfs.rs zerofs/src/fs/store/extent/mod.rs zerofs/src/fs/store/extent/write.rs zerofs/src/fs/store/extent/compact.rs zerofs/src/fs/store/read_cache.rs zerofs/src/fs/mutation/overlay.rs zerofs/src/fs/mutation/request_cache.rs zerofs/src/segment_store.rs zerofs/src/object_store_prefetch.rs zerofs/src/writeback/config.rs zerofs/src/writeback/store.rs zerofs/src/writeback/journal.rs zerofs/src/writeback/journaler.rs zerofs/src/prometheus.rs
+git add zerofs/src/resident_memory.rs zerofs/src/lib.rs zerofs/src/main.rs zerofs/src/config.rs zerofs/src/cli/server.rs zerofs/src/nfs.rs zerofs/src/fs/store/extent/mod.rs zerofs/src/fs/store/extent/write.rs zerofs/src/fs/store/extent/compact.rs zerofs/src/fs/store/extent/reclaim.rs zerofs/src/fs/store/read_cache.rs zerofs/src/fs/mutation/overlay.rs zerofs/src/fs/mutation/request_cache.rs zerofs/src/segment_store.rs zerofs/src/object_store_prefetch.rs zerofs/src/writeback/config.rs zerofs/src/writeback/store.rs zerofs/src/writeback/journal.rs zerofs/src/writeback/journaler.rs zerofs/src/prometheus.rs
 git commit -m "fix(memory): bound server residency and cache admission"
 ```
 
