@@ -258,10 +258,7 @@ impl Materializer {
         }
     }
 
-    fn lane(
-        self: &Arc<Self>,
-        inode: u64,
-    ) -> Result<mpsc::UnboundedSender<LaneJob>, MutationError> {
+    fn lane(self: &Arc<Self>, inode: u64) -> Result<mpsc::UnboundedSender<LaneJob>, MutationError> {
         let mut lanes = lock(&self.inner.lanes);
         // Re-checked under the lanes lock: stop() drains this map after
         // setting `closed`, so a dispatch that passed the earlier closed
