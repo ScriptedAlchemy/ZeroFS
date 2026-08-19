@@ -10,12 +10,14 @@ use super::{
 use crate::cli::attach_cleanup_errors;
 use crate::fs::ZeroFS;
 use crate::ninep::NinePServer;
+use ninep_proto::{Message, P9_SIZE_FIELD_LEN, P9Message};
 use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use zerofs_client::Client;
@@ -50,6 +52,92 @@ async fn remote_client_with_filesystem() -> (
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     panic!("test 9P client did not connect");
+}
+
+async fn remote_client_with_read_disconnect() -> (
+    Arc<Client>,
+    CancellationToken,
+    tempfile::TempDir,
+    Arc<AtomicUsize>,
+    Arc<Notify>,
+) {
+    let filesystem = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+    let temp = tempfile::tempdir().unwrap();
+    let socket = temp.path().join("transfer-backend.9p.sock");
+    let server = NinePServer::new_unix(filesystem, socket.clone());
+    let shutdown = CancellationToken::new();
+    let server_shutdown = shutdown.clone();
+    tokio::spawn(async move { server.start(server_shutdown).await.unwrap() });
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let target = format!("tcp://{}", listener.local_addr().unwrap());
+    let disconnect_on_read = Arc::new(AtomicUsize::new(0));
+    let proxy_disconnect_on_read = Arc::clone(&disconnect_on_read);
+    let observed_reads = Arc::new(AtomicUsize::new(0));
+    let proxy_observed_reads = Arc::clone(&observed_reads);
+    let read_seen = Arc::new(Notify::new());
+    let proxy_read_seen = Arc::clone(&read_seen);
+    let proxy_shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        let (downstream, _) = tokio::select! {
+            accepted = listener.accept() => accepted.unwrap(),
+            _ = proxy_shutdown.cancelled() => return,
+        };
+        drop(listener);
+        let upstream = loop {
+            match tokio::net::UnixStream::connect(&socket).await {
+                Ok(stream) => break stream,
+                Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+            }
+        };
+        let (mut downstream_read, downstream_write) = downstream.into_split();
+        let (upstream_read, mut upstream_write) = upstream.into_split();
+        let responses = tokio::spawn(async move {
+            let mut downstream_write = downstream_write;
+            let mut upstream_read = upstream_read;
+            let _ = tokio::io::copy(&mut upstream_read, &mut downstream_write).await;
+        });
+
+        loop {
+            let mut size = [0u8; P9_SIZE_FIELD_LEN];
+            if downstream_read.read_exact(&mut size).await.is_err() {
+                break;
+            }
+            let frame_len = u32::from_le_bytes(size) as usize;
+            if frame_len < P9_SIZE_FIELD_LEN {
+                break;
+            }
+            let mut frame = Vec::with_capacity(frame_len);
+            frame.extend_from_slice(&size);
+            frame.resize(frame_len, 0);
+            if downstream_read
+                .read_exact(&mut frame[P9_SIZE_FIELD_LEN..])
+                .await
+                .is_err()
+            {
+                break;
+            }
+            if P9Message::from_bytes_ctx(&frame, true)
+                .is_ok_and(|message| matches!(message.body, Message::Tread(_)))
+            {
+                let read_number = proxy_observed_reads.fetch_add(1, Ordering::AcqRel) + 1;
+                if read_number == proxy_disconnect_on_read.load(Ordering::Acquire) {
+                    proxy_read_seen.notify_one();
+                    break;
+                }
+            }
+            if upstream_write.write_all(&frame).await.is_err() {
+                break;
+            }
+        }
+        responses.abort();
+        let _ = responses.await;
+    });
+
+    let client = connect_transfer_client(&target).await.unwrap();
+    (client, shutdown, temp, disconnect_on_read, read_seen)
 }
 
 #[tokio::test]
@@ -586,6 +674,69 @@ async fn single_file_transfers_use_the_exact_destination_path() {
     .unwrap();
 
     assert_eq!(fs::read(destination).unwrap(), b"payload");
+}
+
+async fn assert_first_cancellation_interrupts_read(read_number: usize) {
+    let (client, shutdown, local, disconnect_on_read, read_seen) =
+        remote_client_with_read_disconnect().await;
+    client.write("/source.bin", b"replacement").await.unwrap();
+    let plan = scan_remote(&client, Path::new("/source.bin"))
+        .await
+        .unwrap();
+    let destination = local.path().join("destination.bin");
+    fs::write(&destination, b"original").unwrap();
+    let clients = vec![Arc::clone(&client)];
+    let cancellation = CancellationToken::new();
+    disconnect_on_read.store(read_number, Ordering::Release);
+
+    let download = execute_download(
+        &clients,
+        plan,
+        &destination,
+        Progress::new("download", 11, 1),
+        cancellation.clone(),
+    );
+    tokio::pin!(download);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::select! {
+            biased;
+            _ = read_seen.notified() => {}
+            result = &mut download => {
+                panic!("download settled before read {read_number} was interrupted: {result:?}")
+            }
+        }
+    })
+    .await
+    .expect("proxy did not observe the configured Tread");
+
+    cancellation.cancel();
+    let error = tokio::time::timeout(Duration::from_secs(1), &mut download)
+        .await
+        .expect("first cancellation did not interrupt the in-flight read")
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("download cancelled"),
+        "{error:#}"
+    );
+    assert_eq!(fs::read(&destination).unwrap(), b"original");
+    assert!(fs::read_dir(local.path()).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".zerofs-")
+    }));
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn first_download_cancellation_interrupts_data_read_without_successor() {
+    assert_first_cancellation_interrupts_read(1).await;
+}
+
+#[tokio::test]
+async fn first_download_cancellation_interrupts_length_probe_without_successor() {
+    assert_first_cancellation_interrupts_read(2).await;
 }
 
 #[tokio::test]

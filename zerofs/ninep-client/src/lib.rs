@@ -132,9 +132,9 @@ impl OpAttemptState {
         let result = dispatch(flags, origin_epoch)?;
         if has_op_id {
             self.origin_epoch.get_or_insert(origin_epoch);
-            if self.started.is_none() {
-                self.started = Some(runtime::Clock::now());
-            }
+        }
+        if self.started.is_none() {
+            self.started = Some(runtime::Clock::now());
         }
         Ok((flags, result))
     }
@@ -4671,6 +4671,26 @@ mod session_transition_tests {
             (0, 8),
             "a definitive rejection of the sole FIRST may be routed as FIRST again"
         );
+    }
+
+    #[test]
+    fn nonmutation_dispatch_starts_a_bounded_reconnect_horizon() {
+        let mut attempt = OpAttemptState::default();
+        let (flags, origin) = attempt
+            .dispatch_frame(false, 7, |_, origin| Ok(origin))
+            .unwrap();
+        assert_eq!(flags, 0);
+        assert_eq!(origin, 0);
+        assert!(
+            attempt.started.is_some(),
+            "a dispatched read must not wait forever when no successor can reconnect"
+        );
+
+        attempt.started = Some(runtime::Clock::ago(MUTATION_RETRY_HORIZON));
+        assert!(matches!(
+            attempt.retry_budget(),
+            Err(ClientError::Disconnected)
+        ));
     }
 
     #[test]
