@@ -429,8 +429,9 @@ impl AdminService for AdminRpcServer {
         &self,
         _request: Request<proto::FlushRequest>,
     ) -> Result<Response<proto::FlushResponse>, Status> {
-        self.fs
-            .wait_configured_durability()
+        let _receipt = self
+            .fs
+            .administrative_remote_durability()
             .await
             .map_err(|e| Status::internal(format!("Flush failed: {:?}", e)))?;
 
@@ -1244,7 +1245,8 @@ mod tests {
         );
         shutdown.cancel();
     }
-}
 
-#[cfg(test)]
-mod typed_flush_tests;
+    mod typed_flush_tests {
+        include!("server/typed_flush_tests.rs");
+    }
+}
