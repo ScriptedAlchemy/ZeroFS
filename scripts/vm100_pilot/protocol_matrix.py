@@ -325,15 +325,19 @@ class ProtocolWorkloadExecutor:
             target_sequence=accepted.accepted,
             timeout=self.owner.config.drain_timeout,
         )
-        local_bytes = local.local_bytes - before.local_bytes
-        remote_bytes = remote.remote_bytes - before.remote_bytes
+        remote_cutoff_ns = max(1, time.monotonic_ns() - write_started)
+        stable_remote_drain = observer.drain()
+        try:
+            stable_snapshot = stable_remote_drain["snapshot"]
+            local_bytes = int(stable_snapshot["local_bytes"]) - before.local_bytes
+            remote_bytes = int(stable_snapshot["remote_bytes"]) - before.remote_bytes
+        except (KeyError, TypeError, ValueError) as error:
+            raise RuntimeError("stable drain receipt lacks byte counters") from error
         if local_bytes != workload.bytes or remote_bytes != workload.bytes:
             raise RuntimeError(
                 f"protocol durability byte attribution mismatch for {workload.name}: "
                 f"expected={workload.bytes}, local={local_bytes}, remote={remote_bytes}"
             )
-        remote_cutoff_ns = max(1, time.monotonic_ns() - write_started)
-        stable_remote_drain = observer.drain()
         stable_remote_drain_ns = max(
             remote_cutoff_ns,
             time.monotonic_ns() - write_started,
@@ -619,8 +623,5 @@ class ProtocolMatrixRunner:
                 cleanup=cleanup,
                 receipt_dir=str(receipt.directory),
             )
-            receipt.path("summary.json").write_text(
-                json.dumps(result.to_dict(), indent=2, sort_keys=True) + "\n",
-                encoding="utf-8",
-            )
+            atomic_write_json(receipt.path("summary.json"), result.to_dict())
         return result

@@ -23,6 +23,7 @@ from scripts.vm100_pilot.memory_envelope import (  # noqa: E402
     MemoryEnvelopeSession,
 )
 from scripts.vm100_pilot.metrics import MetricsClient  # noqa: E402
+from scripts.vm100_pilot.owned_resources import atomic_write_json  # noqa: E402
 from scripts.vm100_pilot.migration import StripedMigrator  # noqa: E402
 from scripts.vm100_pilot.performance_matrix import PerformanceMatrixRunner  # noqa: E402
 from scripts.vm100_pilot.profile import ProfileRunner  # noqa: E402
@@ -197,20 +198,15 @@ def _run_protocol_matrix(
         receipt.record("memory_envelope_requested", bool(args.memory_envelope))
         scenario = require_protocol_scenario(f"protocol-matrix-{args.protocol}")
         receipt.record("scenario", scenario.to_dict())
-        receipt.path("cleanup-ledger.json").write_text(
-            json.dumps(
-                {
+        atomic_write_json(
+            receipt.path("cleanup-ledger.json"),
+            {
                     "schema": 1,
                     "resources": [],
                     "cleanup_attempts": 0,
                     "asserted_clean": True,
                     "state": "preflight-no-resources",
                 },
-                indent=2,
-                sort_keys=True,
-            )
-            + "\n",
-            encoding="utf-8",
         )
         authority = ProtocolAuthority.from_mapping(args.protocol, os.environ)
         observer = WritebackObserver(

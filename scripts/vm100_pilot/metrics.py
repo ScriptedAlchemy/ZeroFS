@@ -43,19 +43,15 @@ class MetricsAuthorityIdentity:
                 continue
             series, separator, value = line.rpartition(" ")
             if not separator or value != "1":
-                raise ValueError(
-                    f"invalid {_AUTHORITY_METRIC} sample: {line}"
-                )
+                raise ValueError(f"invalid {_AUTHORITY_METRIC} sample structure")
             prefix = f"{_AUTHORITY_METRIC}{{"
             if not series.endswith("}"):
-                raise ValueError(f"invalid {_AUTHORITY_METRIC} series: {series}")
+                raise ValueError(f"invalid {_AUTHORITY_METRIC} series structure")
             labels: dict[str, str] = {}
             for token in series[len(prefix) : -1].split(","):
                 match = _AUTHORITY_LABEL.fullmatch(token)
                 if match is None or match.group(1) in labels:
-                    raise ValueError(
-                        f"invalid {_AUTHORITY_METRIC} label: {token!r}"
-                    )
+                    raise ValueError(f"invalid {_AUTHORITY_METRIC} label structure")
                 labels[match.group(1)] = match.group(2)
             expected = {"server_instance_id", "filesystem_id", "export_id"}
             if set(labels) != expected:

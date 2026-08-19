@@ -116,6 +116,7 @@ class Lifecycle:
         )
         self.drain_calls = 0
         self.metrics_endpoint = "https://10.10.10.55:9567/metrics"
+        self.final_snapshot = snapshots[-1]
 
     def status(self) -> dict[str, object]:
         return {"healthy": True}
@@ -129,7 +130,10 @@ class Lifecycle:
     def drain(self, timeout: float | None = None) -> dict[str, object]:
         del timeout
         self.drain_calls += 1
-        return {"drained": True}
+        return {
+            "drained": True,
+            "snapshot": self.final_snapshot.to_dict(),
+        }
 
 
 class ProtocolAuthorityTests(unittest.TestCase):
@@ -474,7 +478,7 @@ class ProtocolMatrixTests(unittest.TestCase):
             workload.stable_remote_drain_ns,
             workload.remote_cutoff_ns,
         )
-        self.assertEqual(workload.stable_remote_drain, {"drained": True})
+        self.assertTrue(workload.stable_remote_drain["drained"])
         self.assertEqual(result.cleanup.attempts, 2)
         self.assertTrue(result.cleanup.asserted_clean)
         self.assertEqual(list(self.protocol_root.iterdir()), [])

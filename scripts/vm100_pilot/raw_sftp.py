@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 import signal
 import shlex
@@ -28,14 +27,24 @@ def _stop_process_groups(
     timeout: float,
     primary: BaseException | None,
 ) -> BaseException | None:
+    errors: list[str] = []
+    probe_failures: set[int] = set()
+
     def exists(process: ManagedProcess) -> bool:
+        process.process.poll()
         checker = getattr(process, "group_exists", None)
-        return checker() if checker is not None else process.process.poll() is None
+        try:
+            return checker() if checker is not None else process.process.poll() is None
+        except BaseException as error:
+            marker = id(process)
+            if marker not in probe_failures:
+                probe_failures.add(marker)
+                errors.append(f"PROBE {' '.join(process.argv)}: {error}")
+            return True
 
     active = [process for process in processes if exists(process)]
     if not active:
         return primary
-    errors: list[str] = []
     started = time.monotonic()
     final_deadline = started + max(0.02, timeout)
     term_deadline = started + max(0.01, timeout / 2)
@@ -977,8 +986,5 @@ class RawSftpRunner:
                 cleanup_asserted=owned.cleanup_asserted,
                 receipt_dir=str(receipt.directory),
             )
-            receipt.path("summary.json").write_text(
-                json.dumps(result.to_dict(), indent=2, sort_keys=True) + "\n",
-                encoding="utf-8",
-            )
+            atomic_write_json(receipt.path("summary.json"), result.to_dict())
         return result
