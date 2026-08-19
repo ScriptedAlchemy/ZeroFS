@@ -66,10 +66,18 @@ class FakeSystem:
 
     def start(self, unit: str) -> None:
         self.record_command(f"start {unit}")
+        if unit != transition.UNIT_NAME:
+            self.loaded_units.add(unit)
+            return
         self.active = True
         source = re.search(r"^What=(.+)$", self.unit_path.read_text(), re.MULTILINE)
         assert source is not None
-        self.mount = self.record(source.group(1))
+        if source.group(1) == "/mnt/zerofs-files-raw":
+            self.mount = transition.MountRecord(
+                source=source.group(1), fstype="fuse.bindfs", options=("rw",)
+            )
+        else:
+            self.mount = self.record(source.group(1))
 
     def stop(self, unit: str) -> None:
         self.record_command(f"stop {unit}")
@@ -185,7 +193,9 @@ class VmNfsTransitionTests(unittest.TestCase):
         self.assertFalse(self.system.active)
 
     def test_rollback_fsyncs_unit_directory_after_removing_new_unit(self) -> None:
-        self.unit_path = self.unit_path.parent / "etc/systemd/system" / self.unit_path.name
+        self.unit_path = (
+            self.unit_path.parent / "etc/systemd/system" / self.unit_path.name
+        )
         self.manager.unit_path = self.unit_path
         self.system.unit_path = self.unit_path
         self.staged.write_text(self.unit("10.10.10.55:/"))
@@ -351,6 +361,80 @@ class VmNfsTransitionTests(unittest.TestCase):
         self.assertTrue(self.system.active)
         self.assertEqual(self.system.mount.source, "10.10.10.44:/")
         self.assertFalse(self.transaction.exists())
+
+    def test_recognized_bindfs_cutover_is_snapshotted_and_rollback_safe(self) -> None:
+        legacy_unit = """[Unit]
+Description=ZeroFS file namespace mapped for VM100 and macOS ownership
+Requires=mnt-zerofs\\x2dfiles\\x2draw-.nbd.mount
+After=mnt-zerofs\\x2dfiles\\x2draw-.nbd.mount
+
+[Mount]
+What=/mnt/zerofs-files-raw
+Where=/mnt/zerofs-files
+Type=fuse.bindfs
+Options=mirror=zack,create-for-user=501,create-for-group=20,chown-ignore,chgrp-ignore,chmod-ignore,_netdev
+TimeoutSec=30s
+
+[Install]
+WantedBy=remote-fs.target
+"""
+        legacy_artifact = self.unit_path.parent / "legacy-raw.mount"
+        legacy_artifact.write_text("canonical legacy dependency\n")
+        self.manager.legacy_artifacts = (legacy_artifact,)
+        self.unit_path.write_text(legacy_unit)
+        self.staged.write_text(self.unit("10.10.10.55:/"))
+        self.system.enabled = True
+        self.system.active = True
+        self.system.mount = transition.MountRecord(
+            source="/mnt/zerofs-files-raw",
+            fstype="fuse.bindfs",
+            options=("rw",),
+        )
+        raw_mountpoint = self.manager.forbidden_mounts[0]
+        self.system.other_mounts[str(raw_mountpoint)] = self.system.record(
+            "10.10.10.55:/"
+        )
+        legacy_service = self.manager.forbidden_units[0]
+        self.system.loaded_units.add(legacy_service)
+
+        self.manager.prepare(
+            self.staged,
+            self.transaction,
+            "10.10.10.55:/",
+            allow_legacy_bindfs=True,
+        )
+        self.manager.quiesce(self.transaction)
+        legacy_artifact.unlink()
+        self.system.loaded_units.clear()
+        self.system.other_mounts.clear()
+        self.manager.rollback(self.transaction)
+
+        self.assertEqual(legacy_artifact.read_text(), "canonical legacy dependency\n")
+        self.assertEqual(self.unit_path.read_text(), legacy_unit)
+        self.assertEqual(self.system.mount.source, "/mnt/zerofs-files-raw")
+        self.assertEqual(self.system.mount.fstype, "fuse.bindfs")
+
+    def test_legacy_bindfs_override_rejects_unknown_main_unit_bytes(self) -> None:
+        self.unit_path.write_text(
+            "[Mount]\nWhat=/mnt/zerofs-files-raw\nWhere=/tmp/escape\nType=fuse.bindfs\n"
+        )
+        self.staged.write_text(self.unit("10.10.10.55:/"))
+        self.system.mount = transition.MountRecord(
+            source="/mnt/zerofs-files-raw",
+            fstype="fuse.bindfs",
+            options=("rw",),
+        )
+        self.system.other_mounts[
+            str(self.manager.forbidden_mounts[0])
+        ] = self.system.record("10.10.10.55:/")
+
+        with self.assertRaisesRegex(RuntimeError, "recognized legacy bindfs"):
+            self.manager.prepare(
+                self.staged,
+                self.transaction,
+                "10.10.10.55:/",
+                allow_legacy_bindfs=True,
+            )
 
 
 if __name__ == "__main__":

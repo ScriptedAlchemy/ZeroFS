@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import hashlib
 import ipaddress
 import json
 import os
@@ -39,6 +40,27 @@ RFC1918_NETWORKS = tuple(
     for value in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
 )
 TRANSACTION_PHASES = frozenset({"prepared", "quiesced", "reconciled", "rolled_back"})
+LEGACY_BINDFS_HASHES = frozenset(
+    {
+        "013e9481f2bf7e0ba66f4dbc60bba64937da88293f7f3732c0e62c7cb2c5b33d",
+        "9a0e6e3501a971c13b5d5ad7e609cc92989f83c197821f0c09596a02c3cbeac2",
+    }
+)
+LEGACY_ARTIFACTS = tuple(
+    Path(value)
+    for value in (
+        r"/etc/systemd/system/mnt-zerofs\x2dlxc.mount",
+        "/etc/systemd/system/mnt-zerofs-lxc.mount",
+        "/etc/systemd/system/zerofs-lxc-nbd-client.service",
+        r"/etc/systemd/system/mnt-zerofs\x2dfiles\x2draw.mount",
+        r"/etc/systemd/system/mnt-zerofs\x2dfiles\x2draw-.nbd.mount",
+        r"/etc/systemd/system/mnt-zerofs\x2dfiles-.nbd.mount",
+        "/etc/systemd/system/zerofs-shared-namespace-permissions.service",
+        "/usr/local/libexec/zerofs-tune-nbd",
+        "/usr/local/libexec/zerofs-normalize-shared-namespace",
+        "/etc/zerofs-lxc/client.env",
+    )
+)
 
 
 @dataclass(frozen=True)
@@ -151,12 +173,14 @@ class Transition:
         mountpoint: Path = MOUNTPOINT,
         forbidden_units: Sequence[str] = FORBIDDEN_UNITS,
         forbidden_mounts: Sequence[Path] = FORBIDDEN_MOUNTS,
+        legacy_artifacts: Sequence[Path] = LEGACY_ARTIFACTS,
     ) -> None:
         self.system = system
         self.unit_path = unit_path
         self.mountpoint = mountpoint
         self.forbidden_units = tuple(forbidden_units)
         self.forbidden_mounts = tuple(forbidden_mounts)
+        self.legacy_artifacts = tuple(legacy_artifacts)
 
     @staticmethod
     def _state_path(transaction: Path) -> Path:
@@ -249,8 +273,57 @@ class Transition:
         finally:
             temporary.unlink(missing_ok=True)
 
+    def _install_artifact(self, source: Path, destination: Path, mode: int) -> None:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            dir=destination.parent, delete=False
+        ) as handle:
+            temporary = Path(handle.name)
+        try:
+            shutil.copyfile(source, temporary)
+            temporary.chmod(mode)
+            self._fsync_file(temporary)
+            os.replace(temporary, destination)
+            self._fsync_directory(destination.parent)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def _recognized_legacy_bindfs(
+        self, mount: MountRecord, expected_source: str
+    ) -> bool:
+        if (
+            mount.source != "/mnt/zerofs-files-raw"
+            or mount.fstype != "fuse.bindfs"
+            or "rw" not in mount.options
+            or not self.unit_path.is_file()
+        ):
+            return False
+        if (
+            hashlib.sha256(self.unit_path.read_bytes()).hexdigest()
+            not in LEGACY_BINDFS_HASHES
+        ):
+            return False
+        raw_mountpoint = next(
+            (path for path in self.forbidden_mounts if path.name == "zerofs-files-raw"),
+            None,
+        )
+        if raw_mountpoint is None:
+            return False
+        raw_mount = self.system.mount_record(raw_mountpoint)
+        return bool(
+            raw_mount
+            and raw_mount.source == expected_source
+            and raw_mount.fstype == "nfs"
+            and "rw" in raw_mount.options
+        )
+
     def prepare(
-        self, staged_unit: Path, transaction: Path, expected_source: str
+        self,
+        staged_unit: Path,
+        transaction: Path,
+        expected_source: str,
+        *,
+        allow_legacy_bindfs: bool = False,
     ) -> None:
         if transaction.exists():
             raise RuntimeError(f"VM NFS transaction already exists: {transaction}")
@@ -261,10 +334,17 @@ class Transition:
                 f"staged VM NFS unit does not contain expected NFS source {expected_source}"
             )
         mount = self.system.mount_record(self.mountpoint)
-        if mount is not None and mount.source != expected_source:
+        if (
+            mount is not None
+            and mount.source != expected_source
+            and not (
+                allow_legacy_bindfs
+                and self._recognized_legacy_bindfs(mount, expected_source)
+            )
+        ):
             raise RuntimeError(
                 f"live VM NFS source is {mount.source}, not {expected_source}; "
-                "refusing a non-transactional container-address transition"
+                "it is not a recognized legacy bindfs topology"
             )
         transaction.parent.mkdir(parents=True, exist_ok=True)
         temporary = Path(
@@ -275,6 +355,32 @@ class Transition:
             unit_existed = self.unit_path.is_file()
             if unit_existed:
                 shutil.copyfile(self.unit_path, temporary / "previous.mount")
+            legacy_directory = temporary / "legacy-artifacts"
+            legacy_artifacts: list[dict[str, object]] = []
+            for index, artifact in enumerate(self.legacy_artifacts):
+                if not artifact.exists():
+                    continue
+                if not artifact.is_file() or artifact.is_symlink():
+                    raise RuntimeError(f"unsafe legacy artifact: {artifact}")
+                legacy_directory.mkdir(exist_ok=True)
+                snapshot = legacy_directory / str(index)
+                shutil.copyfile(artifact, snapshot)
+                legacy_artifacts.append(
+                    {
+                        "index": index,
+                        "path": str(artifact),
+                        "mode": artifact.stat().st_mode & 0o7777,
+                    }
+                )
+            legacy_units = [
+                {
+                    "unit": unit,
+                    "enabled": self.system.is_enabled(unit),
+                    "active": self.system.is_active(unit),
+                }
+                for unit in self.forbidden_units
+                if self.system.is_loaded(unit)
+            ]
             state = {
                 "phase": "prepared",
                 "expected_source": expected_source,
@@ -283,12 +389,17 @@ class Transition:
                 "active": self.system.is_active(UNIT_NAME),
                 "mountpoint_existed": self.mountpoint.is_dir(),
                 "mount": dataclasses.asdict(mount) if mount else None,
+                "legacy_artifacts": legacy_artifacts,
+                "legacy_units": legacy_units,
             }
             self._state_path(temporary).write_text(
                 json.dumps(state, sort_keys=True) + "\n"
             )
-            for path in temporary.iterdir():
-                self._fsync_file(path)
+            for path in temporary.rglob("*"):
+                if path.is_file():
+                    self._fsync_file(path)
+                elif path.is_dir():
+                    self._fsync_directory(path)
             self._fsync_directory(temporary)
             os.replace(temporary, transaction)
             self._fsync_directory(transaction.parent)
@@ -369,6 +480,49 @@ class Transition:
             changed = True
         if changed:
             self.system.daemon_reload()
+
+        legacy_artifacts = state.get("legacy_artifacts", [])
+        if not isinstance(legacy_artifacts, list):
+            raise RuntimeError("invalid saved legacy artifact state")
+        restored_legacy = False
+        for item in legacy_artifacts:
+            if not isinstance(item, dict):
+                raise RuntimeError("invalid saved legacy artifact")
+            index = item.get("index")
+            path = item.get("path")
+            mode = item.get("mode")
+            if (
+                not isinstance(index, int)
+                or not isinstance(path, str)
+                or not isinstance(mode, int)
+            ):
+                raise RuntimeError("invalid saved legacy artifact")
+            destination = Path(path)
+            if destination not in self.legacy_artifacts:
+                raise RuntimeError(f"unowned saved legacy artifact: {destination}")
+            snapshot = transaction / "legacy-artifacts" / str(index)
+            if not snapshot.is_file():
+                raise RuntimeError(f"missing saved legacy artifact: {destination}")
+            self._install_artifact(snapshot, destination, mode)
+            restored_legacy = True
+        if restored_legacy:
+            self.system.daemon_reload()
+
+        legacy_units = state.get("legacy_units", [])
+        if not isinstance(legacy_units, list):
+            raise RuntimeError("invalid saved legacy unit state")
+        for item in legacy_units:
+            if (
+                not isinstance(item, dict)
+                or item.get("unit") not in self.forbidden_units
+            ):
+                raise RuntimeError("invalid saved legacy unit")
+            unit = item["unit"]
+            assert isinstance(unit, str)
+            if item.get("enabled") is True and not self.system.is_enabled(unit):
+                self.system.enable(unit)
+            if item.get("active") is True and not self.system.is_active(unit):
+                self.system.start(unit)
 
         was_enabled = state.get("enabled") is True
         if was_enabled and not self.system.is_enabled(UNIT_NAME):
@@ -454,6 +608,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--transaction", required=True)
     parser.add_argument("--staged-unit")
     parser.add_argument("--expected-source")
+    parser.add_argument("--allow-legacy-bindfs", action="store_true")
     return parser
 
 
@@ -472,6 +627,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             Path(args.staged_unit),
             transaction,
             _private_nfs_source(args.expected_source),
+            allow_legacy_bindfs=args.allow_legacy_bindfs,
         )
     elif args.action == "quiesce":
         manager.quiesce(transaction)
