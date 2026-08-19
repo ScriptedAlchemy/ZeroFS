@@ -1298,15 +1298,108 @@ Expected: the fragmented RED proves peak backend concurrency greater than one; e
 
 ---
 
+### Task A19B: Adopt the Reviewed Reclaim-Paging and Segment-Format Prerequisites
+
+**Landing owner:** the unified feature-worktree owner only. The prerequisite owners do
+not write or merge inside the unified worktree.
+
+**Exact prerequisite authorities:**
+
+- `codex/pr5-oom-corrections` range
+  `10352ba4ec4b10397283cb5fc7ff0d139fa5fe41..43580a8cddeeb206abcac66fe6cb1bcde981d0b2`
+  owns only `zerofs/src/db.rs` and `zerofs/src/fs/store/extent/reclaim.rs`.
+- `codex/segment-cardinality-hardening` at
+  `f4719f63dac9c855f130ffac3bfeb5af629c311d..001f8f74413ee8c8964d17ae79c8e706ffc0d832`
+  owns only
+  `zerofs/src/segment.rs`, `zerofs/src/segment_store.rs`, and
+  `zerofs/src/fs/store/extent/write.rs`.
+
+- [ ] **Step 1: Verify immutable remote authorities and exact fences**
+
+```bash
+cd /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback
+PAGING_BASE='10352ba4ec4b10397283cb5fc7ff0d139fa5fe41'
+PAGING_SHA='43580a8cddeeb206abcac66fe6cb1bcde981d0b2'
+CARDINALITY_BASE='f4719f63dac9c855f130ffac3bfeb5af629c311d'
+CARDINALITY_SHA='001f8f74413ee8c8964d17ae79c8e706ffc0d832'
+test "${#PAGING_BASE}" = 40 && test "${#PAGING_SHA}" = 40
+test "${#CARDINALITY_BASE}" = 40 && test "${#CARDINALITY_SHA}" = 40
+git fetch origin codex/pr5-oom-corrections codex/segment-cardinality-hardening develop
+test "$(git ls-remote origin refs/heads/codex/pr5-oom-corrections | awk '{print $1}')" = "$PAGING_SHA"
+test "$(git ls-remote origin refs/heads/codex/segment-cardinality-hardening | awk '{print $1}')" = "$CARDINALITY_SHA"
+git cat-file -e "$PAGING_SHA^{commit}"
+git cat-file -e "$CARDINALITY_SHA^{commit}"
+test "$(git rev-list --reverse "$PAGING_BASE..$PAGING_SHA" | tr '\n' ' ')" = "1a54fa6437c3932e5585b5c818395783b3c13353 651366777438630db565f35e50a1751b127c77b6 43580a8cddeeb206abcac66fe6cb1bcde981d0b2 "
+test "$(git rev-list --reverse "$CARDINALITY_BASE..$CARDINALITY_SHA" | tr '\n' ' ')" = "1077f98c939427c45d405f12bdf63beffc5f0587 7cc500ed37dd963f6c2dde93924af43e1d1cb94b 001f8f74413ee8c8964d17ae79c8e706ffc0d832 "
+test "$(git diff --name-only "$PAGING_BASE..$PAGING_SHA" | sort | tr '\n' ' ')" = "zerofs/src/db.rs zerofs/src/fs/store/extent/reclaim.rs "
+test "$(git diff --name-only "$CARDINALITY_BASE..$CARDINALITY_SHA" | sort | tr '\n' ' ')" = "zerofs/src/fs/store/extent/write.rs zerofs/src/segment.rs zerofs/src/segment_store.rs "
+for sha in $(git rev-list "$PAGING_BASE..$PAGING_SHA") $(git rev-list "$CARDINALITY_BASE..$CARDINALITY_SHA"); do git show --check "$sha"; done
+git merge-base --is-ancestor "$PAGING_SHA" origin/develop
+git merge-base --is-ancestor "$CARDINALITY_SHA" origin/develop
+```
+
+Expected: both exact SHAs are pushed, independently reviewed, remote-equal, confined to
+their declared commit fences, and already landed through the develop integration owner.
+A branch tip, local-only commit, unknown SHA, wider diff, or SHA not ancestral to
+`origin/develop` stops before unified integration.
+
+- [ ] **Step 2: Integrate only through the unified landing owner and prove ancestry**
+
+```bash
+cd /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback
+PAGING_SHA='43580a8cddeeb206abcac66fe6cb1bcde981d0b2'
+CARDINALITY_SHA='001f8f74413ee8c8964d17ae79c8e706ffc0d832'
+test -z "$(git status --porcelain=v1)"
+git merge --no-edit --no-ff origin/develop
+git merge-base --is-ancestor "$PAGING_SHA" HEAD
+git merge-base --is-ancestor "$CARDINALITY_SHA" HEAD
+test -z "$(git status --porcelain=v1)"
+git diff --check
+```
+
+The unified owner merges only the reviewed develop integration, never the feature refs
+directly. No conflict is resolved by taking “ours” or “theirs” wholesale. A conflict
+stops for an exact three-way review by the landing owner; prerequisite owners remain
+read-only.
+
+- [ ] **Step 3: Run exact prerequisite GREEN and synchronize the descendant**
+
+Run every exact non-vacuous paging/wire test listed in A20 Step 1, followed by:
+
+```bash
+cd /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback/zerofs
+cargo fmt --all -- --check
+cargo test -p zerofs --locked fs::store::extent::reclaim::tests
+cargo test -p zerofs --locked segment::tests
+cargo test -p zerofs --locked segment_store::tests
+git diff --check
+cd ..
+PREREQ_HEAD="$(git rev-parse HEAD^{commit})"
+git push origin "$PREREQ_HEAD:refs/heads/codex/unified-tiered-writeback"
+test "$(git ls-remote origin refs/heads/codex/unified-tiered-writeback | awk '{print $1}')" = "$PREREQ_HEAD"
+ssh ubuntu-main "cd /fast/projects/ZeroFS && git fetch origin codex/unified-tiered-writeback && test \"\$(git rev-parse origin/codex/unified-tiered-writeback)\" = '$PREREQ_HEAD'"
+```
+
+Expected: A20 begins only from a clean descendant of both reviewed authorities. This is
+an ancestry/test/synchronization task, not permission to redeploy or restart CT198.
+
+---
+
 ### Task A20: Bound Aggregate Resident Memory and Cache Admission
 
 **Files:**
+- Modify: `zerofs/Cargo.lock`
+- Modify: `zerofs/Cargo.toml`
 - Create: `zerofs/src/resident_memory.rs`
 - Modify: `zerofs/src/lib.rs`
 - Modify: `zerofs/src/main.rs`
 - Modify: `zerofs/src/config.rs`
 - Modify: `zerofs/src/cli/server.rs`
 - Modify: `zerofs/src/nfs.rs`
+- Modify: `zerofs/src/frame_codec.rs`
+- Create: `zerofs/src/frame_codec_stream.rs`
+- Modify: `zerofs/src/segment.rs`
+- Create: `zerofs/src/segment_directory_stream.rs`
 - Modify: `zerofs/src/fs/store/extent/mod.rs`
 - Modify: `zerofs/src/fs/store/extent/write.rs`
 - Modify: `zerofs/src/fs/store/extent/compact.rs`
@@ -1317,16 +1410,18 @@ Expected: the fragmented RED proves peak backend concurrency greater than one; e
 - Modify: `zerofs/src/segment_store.rs`
 - Modify: `zerofs/src/object_store_prefetch.rs`
 - Modify: `zerofs/src/writeback/config.rs`
+- Modify: `zerofs/src/writeback/bootstrap.rs`
+- Modify: `zerofs/src/writeback/reservation.rs`
 - Modify: `zerofs/src/writeback/store.rs`
 - Modify: `zerofs/src/writeback/journal.rs`
 - Modify: `zerofs/src/writeback/journaler.rs`
 - Modify: `zerofs/src/prometheus.rs`
 
 **Interfaces:**
-- Produces: `ResidentMemoryConfig`, `ResidentMemoryKind`, `ResidentMemoryBudget`, `ResidentMemoryPermit`, conservative cache weighers, write-no-allocate, maintenance no-admit reads, and bounded-cardinality resident-memory metrics.
-- Consumes: configured clean-cache/writeback/volatile budgets, finite Linux cgroup-v2 `memory.max` when present, cache keys/values, segment buffers, object-prefetch parts, GC/compaction reads, and the generic admission primitive from A1.
+- Produces: `ResidentMemoryConfig`, `ResidentMemoryKind`, `ResidentMemoryBudget`, `ResidentMemoryPermit`, bounded authenticated `DirectoryRowStream`, conservative cache weighers, write-no-allocate, maintenance no-admit reads, and bounded-cardinality resident-memory metrics.
+- Consumes: prerequisite `SegmentFormatLimits` checked helpers and paginated reclaim merge verification, configured clean-cache/writeback/volatile budgets, finite Linux cgroup-v2 `memory.max` when present, the canonical `writeback::reservation::SsdReservationToken`, structurally validated segment footer geometry plus post-decode authenticated identity, cache keys/values, segment buffers, object-prefetch parts, GC/compaction reads, and the generic admission primitive from A1.
 
-- [ ] **Step 1: Write the configuration and ownership RED tests**
+- [ ] **Step 1: Write configuration/ownership RED tests and pin reclaim prerequisite GREEN**
 
 Add exact tests:
 
@@ -1338,12 +1433,54 @@ Add exact tests:
 - `ordinary_chunked_nfs_write_does_not_admit_decoded_extent_cache`
 - `compaction_reads_do_not_admit_raw_parts_or_decoded_cache`
 - `compaction_groups_adjacent_source_runs_under_one_bounded_scan`
-- `sparse_interleaved_256_mib_segment_uses_at_most_thirty_two_verification_scans`
-- `reclaim_scan_row_or_byte_budget_exhaustion_fails_closed`
+- `verify_page_accepts_exact_row_and_byte_boundaries`
+- `verify_page_item_error_fails_closed`
+- `full_256mib_directory_reclaims_after_memory_and_durable_verification`
+- `compressed_directory_above_one_page_reclaims_with_bounded_pagination`
+- `directory_verify_streams_past_row_pages_and_reclaims_segment`
+- `directory_verify_streams_past_byte_pages_and_reclaims_segment`
+- `directory_verify_oversized_row_keeps_segment_and_blocks_delete`
+- `directory_verify_keeps_reference_on_final_durable_page`
+- `directory_verify_malformed_wanted_row_keeps_segment`
+- `directory_verify_scan_construction_failure_keeps_segment`
+- `wire_width_checks_reject_overflow_without_large_allocations`
+- `builder_rejects_unrepresentable_frame_without_mutation`
+- `builder_rejects_unrepresentable_directory_before_mutation`
+- `assembly_rejects_unrepresentable_directory_without_mutating_frame_bytes`
+- `directory_rejects_unrepresentable_plaintext_before_codec_allocation`
+- `directory_rejects_unrepresentable_sealed_output`
+- `seal_rejects_format_overflow_before_allocating_id_or_publishing`
+- `seal_rejects_frame_length_before_allocating_id_or_publishing`
+- `seal_rejects_directory_plaintext_before_allocating_id_or_publishing`
+- `reservation_rejects_unrepresentable_batch_without_mutating_open_segment`
+- `reservation_rejects_unrepresentable_directory_without_mutating_open_segment`
+- `rotation_rejects_unrepresentable_directory_without_taking_or_publishing_buffer`
+- `rotation_rejects_replacement_allocation_without_taking_buffer`
 - `cache_weigher_includes_key_entry_and_allocator_slack`
 - `dirty_ram_zero_does_not_satisfy_resident_headroom`
 - `physical_residency_does_not_sum_jemalloc_resident_and_retained`
 - `retained_only_growth_does_not_consume_physical_headroom`
+- `reclaim_directory_fetch_decode_and_sort_are_precharged`
+- `reclaim_bounded_source_holds_permit_until_stream_drop`
+- `reclaim_bounded_source_permit_denial_starts_zero_scans_and_rows`
+- `streamed_directory_matches_one_shot_lz4_and_zstd`
+- `streamed_directory_authenticates_before_emitting_rows`
+- `streamed_directory_external_sort_stays_within_chunk_permits`
+- `streamed_directory_scratch_cleans_on_success_error_cancel_and_restart`
+- `streamed_directory_sorted_keys_match_one_shot_across_duplicates_and_multipass`
+- `sort_run_corruption_truncation_or_count_mismatch_fails_closed`
+- `directory_scratch_formula_covers_all_live_generations`
+- `directory_scratch_denial_writes_zero_bytes`
+- `directory_scratch_token_releases_on_success_error_cancel_and_restart`
+
+The paging and wire-geometry tests named above are prerequisite GREEN delivered by the
+separately owned PR5/cardinality corrections. They must already select nonzero and pass
+at the synchronized source SHA before A20 edits. A20 does not reimplement, amend, or
+stage those prerequisite commits; it only composes their shipping interfaces with the
+resident-memory budget. The resident-permit tests remain A20 RED. The denial test blocks
+permit acquisition and asserts scan-construction count, stream count, first-row count,
+and source-allocation bytes all remain exactly zero; holding a permit only after a scan
+has already allocated is not a pass.
 
 Use a temporary cgroup-file seam that parses literal `memory.max` and `memory.events`
 contents; it is a unit seam for parsing/accounting, not Linux acceptance. Build a real
@@ -1351,16 +1488,104 @@ ordinary chunked NFS write path and real compacted segment fixture for the
 write-no-allocate/no-admit
 tests. Current code is RED because decoded extent and parts weighers charge payload
 length only, every canonical write calls `decoded_insert`, and compaction reads through
-the cache-admitting segment path. The reclaim fixture creates a real maximum supported
-256 MiB compacted segment at 32 KiB extents: approximately 8,192 candidate frames whose
-`(inode, extent)` keys are deliberately sparse and interleaved. Maximal-consecutive-run
-grouping could otherwise issue about 16,384 memory/durable point reads.
-Before invoking reclaim, the test asserts `logical_payload_bytes == 268435456` and
-`candidate_frame_count == 8192`; a smaller fixture cannot satisfy the test by name.
-The fixture also counts every scanned row and encoded byte; an adversarial fixture
-places unrelated rows between desired keys and has separate table cases that cross the
-65,536-row ceiling and the 64 MiB encoded-byte ceiling. Each must stop at the first
-exhausted budget and return `Keep` rather than continue scanning.
+the cache-admitting segment path. Do not infer segment cardinality from 256 MiB divided
+by the 32 KiB plaintext extent size: `SEAL_THRESHOLD` is applied to the compressed,
+AEAD-sealed frame region before the directory and footer are appended. The format stores
+`k` and frame indexes as `u32`, each plaintext directory row is 28 bytes, and the current
+writer can admit far more than 8,192 highly compressible frames before the stored frame
+region crosses 256 MiB.
+
+The prerequisite source-of-truth `SegmentFormatLimits` and checked helpers cover the actual wire/host bounds. It
+checks that directory count fits footer `k: u32`, each sealed body fits `len: u32`, each
+four-byte prefix plus body fits `FrameLoc.byte_len: u32`, frame-index start plus batch
+offset fits `u32`, sealed directory length fits footer `dir_len: u32`, and every buffer,
+offset, and total-length calculation fits its host/wire type. Do not derive cardinality
+from segment size or introduce a lower writer cap to make the verifier's test
+pass: current valid 256 MiB stored-frame regions can contain about 4.07 million highly
+compressed extents, a crossing batch can overshoot the byte threshold, and version 1
+represents `k` and frame indexes as `u32`. Once a directory is decoded under its
+resident permit, the verifier must stream every row to a terminal verdict; neither a
+small fixed-key assumption nor any finite total-row work budget is a liveness-safe
+proxy for the format. The prerequisite fixtures consume the
+production geometry rather than repeat a derived count in test code. They are separate:
+
+1. 8,192 deterministic incompressible 32 KiB frames go through the real writer until
+   the stored frame region reaches `SEAL_THRESHOLD`; the test parses the persisted footer
+   and directory and asserts `dir_offset >= 268435456`, exact object size
+   `dir_offset + dir_len + 64`, and decoded row count `k`;
+2. the Linux full-scale scenario feeds maximally compressible frames through the real
+   current writer/codec until the stored frame region crosses 256 MiB, including a real crossing batch. On the Linux proof
+   host this is expected to be roughly 4.07 million rows, but the test scores the
+   parsed persisted `k`, `dir_offset`, `dir_len`, and total object bytes rather than an
+   estimate. It must then reclaim through paginated verification without point reads;
+3. a sparse/interleaved fixture inserts an unbounded-in-principle sequence of unrelated
+   forward-map rows between wanted keys and proves page counters reset within one
+   direct-owned source stream per logical range until both views reach EOF; and
+4. corruption, decode/scan error, cancellation, or a live reference at any page fails
+   closed to `Keep` and never converts a partial prefix into deletion evidence.
+
+Boundary unit tests use injected small limits and pure checked helpers rather than GiB
+allocations. Reservation validates the whole batch before changing `open.buf` or
+`open.dir`; rotation validates/seals/assembles before replacing the live generation;
+and `SegmentStore` performs no object PUT until a complete representable object exists.
+Each overflow test asserts the original open bytes/directory/segid remain exact and the
+recording object store observed zero PUTs.
+
+Directory traversal may not allocate `dir_len + k * 28 + sort` in RAM. Add a
+spill-backed version-1 directory reader under the configured local scratch root. It
+range-fetches sealed directory ciphertext in permit-owned 4 MiB chunks into an exclusive
+0600 UUID scratch file, verifies the existing XChaCha20-Poly1305 AAD/tag over the full
+ciphertext before releasing any row, then performs a second bounded decrypt/decompress
+pass. Use audited RustCrypto primitives and byte-for-byte differential/KAT tests against
+the shipping one-shot decoder; do not silently define a new wire format. Zstd decoding
+sets `DIRECTORY_ZSTD_WINDOW_MAX_BYTES = 128 MiB`. The current size-prefixed LZ4 block
+decoder uses `DIRECTORY_LZ4_HISTORY_BYTES = 64 KiB` and differential/property tests over
+valid and corrupt blocks. Resident ownership is fixed at a conservative 144 MiB maximum
+per active directory stream: two 4 MiB codec/cipher chunks, one 4 MiB row chunk, the
+128 MiB Zstd window (or smaller LZ4 history), eight 64 KiB merge inputs, and allocator
+slack. Only one directory verification stream runs at once.
+
+Decoded fixed-width 28-byte rows accumulate only to 65,536 rows or 4 MiB, whichever
+comes first, sort/deduplicate into UUID-owned scratch runs, and merge with
+`DIRECTORY_MERGE_FAN_IN = 8` under resident permits. Every 256-byte run header binds
+format version, source geometry SHA-256, run/generation number, input row count, unique
+row count, payload length, first/last key, and payload SHA-256. A run is written to a
+private create-new temporary, fsynced, atomically renamed, and revalidated before every
+merge input; merge output repeats the same contract. The manifest enumerates every run,
+requires contiguous run IDs, proves initial input counts sum to footer `k`, and proves
+each merge pass consumed every declared input exactly once. Corruption, truncation,
+missing/extra runs, count/hash/range mismatch, or cancellation returns `Keep`; no partial
+run becomes deletion evidence.
+
+`DirectoryScratchReservation` is a typed use of the existing sole
+`writeback::reservation::SsdReservationToken`/physical-space sampler, not a second disk
+counter. Before any file growth it reserves, with checked `u64` arithmetic:
+`2 * dir_len + 2 * (k * 28) + 2 * ceil(k / 65_536) * 256 + 4096` bytes. This covers
+ciphertext plus decrypted-compressed generations, source plus destination sort/merge
+generations, both generations' headers, and one manifest. The token releases only after
+all owned files are removed; restart reconciliation removes and releases only a
+manifest-valid abandoned UUID scope. Success, error, cancellation, and startup recovery
+must leave zero reservation and zero scratch residue. Ciphertext, codec window, row
+chunk, run heads, and SlateDB source stream each have one resident permit before
+allocation; no whole-directory Vec or BTreeSet remains. A tag/CRC/length failure emits
+zero rows and returns `Keep`.
+
+Forward-map verification is a streaming merge between that sorted wanted-row stream and
+paginated SlateDB rows. Every page admits at most 65,536 rows and
+4 MiB of encoded keys plus values; reaching either limit resets the counters before the
+next row continues on the same source iterator.
+The page uses a dedicated bounded database scan API that enforces those limits at the
+fetch source: one fetch task, no block-cache admission, no spawned forwarding task or
+row channel, and no read-ahead beyond the permit-owned page allowance. Dropping or
+finishing a page synchronously cancels/drains its fetch before the next scan opens; a
+counter applied only after generic `Db::scan` has prefetched rows is not a bound. The
+sorted wanted merge index advances monotonically inside that iterator. Total pages and total rows are deliberately unbounded:
+valid sparse segments must make forward progress to EOF rather than fail because they
+cross a global work ceiling. At most one page task per memory/durable view is live, no
+more than two scans run concurrently, and page buffers/permits release before the next
+page. Any source-stream reopen at a page boundary, malformed geometry, error, or live reference fails
+closed to `Keep`; successful deletion requires both complete views for the same
+immutable `(segid, object_size, footer_crc, k, dir_offset, dir_len)` identity.
 
 ```bash
 cd /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback/zerofs
@@ -1382,19 +1607,55 @@ do
     exit 1
   fi
 done
-RECLAIM_RED='fs::store::extent::reclaim::tests::sparse_interleaved_256_mib_segment_uses_at_most_thirty_two_verification_scans'
 cargo test -p zerofs --locked -- --list 2>&1 | tee "${TMPDIR:-/tmp}/zerofs-reclaim-red-list.log"
-grep -F "${RECLAIM_RED}: test" "${TMPDIR:-/tmp}/zerofs-reclaim-red-list.log"
-if cargo test -p zerofs --locked "$RECLAIM_RED" -- --exact --nocapture; then
-  echo "expected reclaim scan-bound RED but ${RECLAIM_RED} passed" >&2
-  exit 1
-fi
-RECLAIM_BUDGET_RED='fs::store::extent::reclaim::tests::reclaim_scan_row_or_byte_budget_exhaustion_fails_closed'
-grep -F "${RECLAIM_BUDGET_RED}: test" "${TMPDIR:-/tmp}/zerofs-reclaim-red-list.log"
-if cargo test -p zerofs --locked "$RECLAIM_BUDGET_RED" -- --exact --nocapture; then
-  echo "expected reclaim row/byte-budget RED but ${RECLAIM_BUDGET_RED} passed" >&2
-  exit 1
-fi
+for fq in \
+  fs::store::extent::reclaim::tests::verify_page_accepts_exact_row_and_byte_boundaries \
+  fs::store::extent::reclaim::tests::verify_page_item_error_fails_closed \
+  fs::store::extent::reclaim::tests::full_256mib_directory_reclaims_after_memory_and_durable_verification \
+  fs::store::extent::reclaim::tests::compressed_directory_above_one_page_reclaims_with_bounded_pagination \
+  fs::store::extent::reclaim::tests::directory_verify_streams_past_row_pages_and_reclaims_segment \
+  fs::store::extent::reclaim::tests::directory_verify_streams_past_byte_pages_and_reclaims_segment \
+  fs::store::extent::reclaim::tests::directory_verify_oversized_row_keeps_segment_and_blocks_delete \
+  fs::store::extent::reclaim::tests::directory_verify_keeps_reference_on_final_durable_page \
+  fs::store::extent::reclaim::tests::directory_verify_malformed_wanted_row_keeps_segment \
+  fs::store::extent::reclaim::tests::directory_verify_scan_construction_failure_keeps_segment \
+  segment::tests::wire_width_checks_reject_overflow_without_large_allocations \
+  segment::tests::builder_rejects_unrepresentable_frame_without_mutation \
+  segment::tests::builder_rejects_unrepresentable_directory_before_mutation \
+  segment::tests::assembly_rejects_unrepresentable_directory_without_mutating_frame_bytes \
+  segment::tests::directory_rejects_unrepresentable_plaintext_before_codec_allocation \
+  segment::tests::directory_rejects_unrepresentable_sealed_output \
+  segment_store::tests::seal_rejects_format_overflow_before_allocating_id_or_publishing \
+  segment_store::tests::seal_rejects_frame_length_before_allocating_id_or_publishing \
+  segment_store::tests::seal_rejects_directory_plaintext_before_allocating_id_or_publishing \
+  fs::store::extent::write::tests::reservation_rejects_unrepresentable_batch_without_mutating_open_segment \
+  fs::store::extent::write::tests::reservation_rejects_unrepresentable_directory_without_mutating_open_segment \
+  fs::store::extent::write::tests::rotation_rejects_unrepresentable_directory_without_taking_or_publishing_buffer \
+  fs::store::extent::write::tests::rotation_rejects_replacement_allocation_without_taking_buffer
+do
+  grep -F "${fq}: test" "${TMPDIR:-/tmp}/zerofs-reclaim-red-list.log"
+  cargo_test_nonzero "$fq" -p zerofs --locked
+done
+for fq in \
+  fs::store::extent::reclaim::tests::reclaim_directory_fetch_decode_and_sort_are_precharged \
+  fs::store::extent::reclaim::tests::reclaim_bounded_source_holds_permit_until_stream_drop \
+  fs::store::extent::reclaim::tests::reclaim_bounded_source_permit_denial_starts_zero_scans_and_rows \
+  segment_directory_stream::tests::streamed_directory_matches_one_shot_lz4_and_zstd \
+  segment_directory_stream::tests::streamed_directory_authenticates_before_emitting_rows \
+  segment_directory_stream::tests::streamed_directory_external_sort_stays_within_chunk_permits \
+  segment_directory_stream::tests::streamed_directory_scratch_cleans_on_success_error_cancel_and_restart \
+  segment_directory_stream::tests::streamed_directory_sorted_keys_match_one_shot_across_duplicates_and_multipass \
+  segment_directory_stream::tests::sort_run_corruption_truncation_or_count_mismatch_fails_closed \
+  segment_directory_stream::tests::directory_scratch_formula_covers_all_live_generations \
+  segment_directory_stream::tests::directory_scratch_denial_writes_zero_bytes \
+  segment_directory_stream::tests::directory_scratch_token_releases_on_success_error_cancel_and_restart
+do
+  grep -F "${fq}: test" "${TMPDIR:-/tmp}/zerofs-reclaim-red-list.log"
+  if cargo test -p zerofs --locked "$fq" -- --exact --nocapture; then
+    echo "expected resident-memory reclaim RED but ${fq} passed" >&2
+    exit 1
+  fi
+done
 ```
 
 - [ ] **Step 2: Define exact aggregate ownership types and validation**
@@ -1475,6 +1736,24 @@ impl ResidentMemoryBudget {
 
     pub(crate) fn snapshot(&self) -> ResidentMemorySnapshot;
 }
+
+pub(crate) const DIRECTORY_STREAM_CHUNK_BYTES: u64 = 4 * 1024 * 1024;
+pub(crate) const DIRECTORY_SORT_RUN_ROWS: u64 = 65_536;
+pub(crate) const DIRECTORY_ZSTD_WINDOW_MAX_BYTES: u64 = 128 * 1024 * 1024;
+pub(crate) const DIRECTORY_LZ4_HISTORY_BYTES: u64 = 64 * 1024;
+pub(crate) const DIRECTORY_MERGE_FAN_IN: usize = 8;
+pub(crate) const DIRECTORY_RUN_HEADER_BYTES: u64 = 256;
+pub(crate) const DIRECTORY_STREAM_RESIDENT_MAX_BYTES: u64 = 144 * 1024 * 1024;
+
+pub(crate) struct DirectoryScratchReservation {
+    token: crate::writeback::reservation::SsdReservationToken,
+    scope_id: uuid::Uuid,
+    reserved_bytes: u64,
+}
+
+impl DirectoryScratchReservation {
+    pub(crate) fn required_bytes(dir_len: u32, k: u32) -> Result<u64, FsError>;
+}
 ```
 
 Normalize `[memory].resident_limit_gb` and `[memory].resident_reserve_gb` to exact
@@ -1482,7 +1761,9 @@ bytes. The effective limit is `min(configured_limit, finite cgroup memory.max)`.
 Startup sums every configured payload owner, conservative key/entry/allocator slack,
 maximum replacement overlap, maintenance working-set maxima, and the reserve. The
 example 64+16 GiB profile therefore requires the documented 128 GiB envelope; under a
-96 GiB cgroup it fails before listeners start. Do not derive success from dirty-
+96 GiB cgroup it fails before listeners start. The maintenance term includes exactly
+one 144 MiB authenticated directory stream; disk scratch is separately reserved from
+the canonical physical SSD authority with the checked per-object formula above. Do not derive success from dirty-
 writeback RAM. The runtime budget uses one cancellation-safe owner transfer per
 allocation; no layer temporarily owns uncharged bytes. Mount `ResidentMemoryPermit`
 ownership into the decoded/read-metadata caches, raw-part/Foyer buffers, mutation
@@ -1495,17 +1776,28 @@ Add a typed `CacheAdmission::{Read, NoAdmit}` argument below the extent and segm
 facades. User reads keep current cache behavior. Every canonical write, including each
 ordinary chunked NFS rsync write, uses `NoAdmit` and cannot call `decoded_insert`;
 pending-read coherence remains owned by the shared mutation overlay until canonical
-state is visible. GC/compaction uses 16 fixed batches of at most 512 sorted forward-map keys;
-each batch is merge-checked by one streaming memory-view scan and one durable-view scan,
-so a full supported 256 MiB segment with approximately 8,192 frames issues at most 32
-scans even when every key is sparse or interleaved. The two views contain about 16,384
-desired rows; the fixed 65,536-row aggregate ceiling permits at most four times that
-geometry, including bounded unrelated gap rows, while the independent encoded
-key/value ceiling remains 64 MiB. Exceeding either fixed budget stops immediately and
-returns `Keep`; it never falls back to one point read per frame. Absent forward keys mean
-dead frames as today, while any decode error, scan error, or reference to the segment
-fails closed to `Keep`. The scans
-use `NoAdmit` for decoded and raw-part caches. Cache weighers include key size, entry/container overhead,
+state is visible.
+
+The prerequisite version-1 segment format module owns `SegmentFormatLimits` and exposes checked
+geometry to the writer, decoder, verifier, and tests. It validates `k`, offsets,
+lengths, object size, and every `usize`/`u32` conversion without imposing a new total
+cardinality limit below what the format and existing writer can represent. A20 mounts
+the spill-backed authenticated directory stream below `SegmentStore`; its ciphertext,
+decoder history, row chunk, external-sort runs, and merge heads are independently
+precharged against `ResidentMemoryKind::Compaction` before ownership.
+
+GC/compaction merge-checks sorted forward-map keys with a paginated streaming scan of
+the memory view and durable view. Sparse runs coalesce into at most 16 logical ranges
+per view (32 logical traversals); each traversal opens exactly one direct-owned source
+stream and resets page counters without reopening it. Fix per-page row and encoded-byte
+ceilings in one `ReclaimPageBudget` at 65,536 rows and 4 MiB. The bounded scan source
+uses one fetch task, disables cache and generic read-ahead/forwarding channels, and drops
+its iterator directly. Total rows/pages are not capped; source scans stay at most 32 and
+peak source-stream concurrency is one. There is no point-read fallback. Absent forward keys mean dead frames
+as today, while any decode error, scan error, source reopen, directory-identity
+change, or reference to the segment fails closed to `Keep`. Deletion requires EOF from
+both views against the same immutable geometry. The scans use `NoAdmit` for decoded and raw-part caches. Cache
+weighers include key size, entry/container overhead,
 and documented allocator slack rather than `value.len()` alone. Replacement ownership
 may overlap only inside its precharged maximum.
 
@@ -1513,7 +1805,8 @@ may overlap only inside its precharged maximum.
 
 Expose configured/effective limit, reserve, charged/peak bytes by
 `ResidentMemoryKind`, aggregate waiters/backpressure, cache replacement bytes,
-maintenance working bytes/no-admit reads, allocator allocated/resident/retained, and
+maintenance working bytes/no-admit reads, reclaim logical ranges/pages/source scans,
+per-page rows/encoded bytes, source-reopen/error counts, peak scan tasks, allocator allocated/resident/retained, and
 Linux cgroup current/max/events. Labels never contain paths, keys, request IDs, or raw
 errors. Physical residency comes from OS RSS and, when available, cgroup
 `memory.current`; `jemalloc.stats.resident` is a correlation metric and
@@ -1539,13 +1832,46 @@ cargo_test_nonzero 'segment_store::tests' -p zerofs --locked
 cargo_test_nonzero 'writeback::store::tests' -p zerofs --locked
 cargo_test_nonzero 'writeback::journaler::tests' -p zerofs --locked
 cargo_test_nonzero 'config::tests' -p zerofs --locked
-cargo_test_nonzero 'fs::store::extent::reclaim::tests::sparse_interleaved_256_mib_segment_uses_at_most_thirty_two_verification_scans' -p zerofs --locked
-cargo_test_nonzero 'fs::store::extent::reclaim::tests::reclaim_scan_row_or_byte_budget_exhaustion_fails_closed' -p zerofs --locked
+cargo_test_nonzero 'fs::store::extent::reclaim::tests::verify_page_accepts_exact_row_and_byte_boundaries' -p zerofs --locked
+cargo_test_nonzero 'fs::store::extent::reclaim::tests::verify_page_item_error_fails_closed' -p zerofs --locked
+cargo_test_nonzero 'fs::store::extent::reclaim::tests::full_256mib_directory_reclaims_after_memory_and_durable_verification' -p zerofs --locked
+cargo_test_nonzero 'fs::store::extent::reclaim::tests::compressed_directory_above_one_page_reclaims_with_bounded_pagination' -p zerofs --locked
+cargo_test_nonzero 'fs::store::extent::reclaim::tests::directory_verify_streams_past_row_pages_and_reclaims_segment' -p zerofs --locked
+cargo_test_nonzero 'fs::store::extent::reclaim::tests::directory_verify_streams_past_byte_pages_and_reclaims_segment' -p zerofs --locked
+cargo_test_nonzero 'fs::store::extent::reclaim::tests::directory_verify_oversized_row_keeps_segment_and_blocks_delete' -p zerofs --locked
+cargo_test_nonzero 'fs::store::extent::reclaim::tests::directory_verify_keeps_reference_on_final_durable_page' -p zerofs --locked
+cargo_test_nonzero 'fs::store::extent::reclaim::tests::directory_verify_malformed_wanted_row_keeps_segment' -p zerofs --locked
+cargo_test_nonzero 'fs::store::extent::reclaim::tests::directory_verify_scan_construction_failure_keeps_segment' -p zerofs --locked
+cargo_test_nonzero 'segment::tests::wire_width_checks_reject_overflow_without_large_allocations' -p zerofs --locked
+cargo_test_nonzero 'segment::tests::builder_rejects_unrepresentable_frame_without_mutation' -p zerofs --locked
+cargo_test_nonzero 'segment::tests::builder_rejects_unrepresentable_directory_before_mutation' -p zerofs --locked
+cargo_test_nonzero 'segment::tests::assembly_rejects_unrepresentable_directory_without_mutating_frame_bytes' -p zerofs --locked
+cargo_test_nonzero 'segment::tests::directory_rejects_unrepresentable_plaintext_before_codec_allocation' -p zerofs --locked
+cargo_test_nonzero 'segment::tests::directory_rejects_unrepresentable_sealed_output' -p zerofs --locked
+cargo_test_nonzero 'segment_store::tests::seal_rejects_format_overflow_before_allocating_id_or_publishing' -p zerofs --locked
+cargo_test_nonzero 'segment_store::tests::seal_rejects_frame_length_before_allocating_id_or_publishing' -p zerofs --locked
+cargo_test_nonzero 'segment_store::tests::seal_rejects_directory_plaintext_before_allocating_id_or_publishing' -p zerofs --locked
+cargo_test_nonzero 'fs::store::extent::write::tests::reservation_rejects_unrepresentable_batch_without_mutating_open_segment' -p zerofs --locked
+cargo_test_nonzero 'fs::store::extent::write::tests::reservation_rejects_unrepresentable_directory_without_mutating_open_segment' -p zerofs --locked
+cargo_test_nonzero 'fs::store::extent::write::tests::rotation_rejects_unrepresentable_directory_without_taking_or_publishing_buffer' -p zerofs --locked
+cargo_test_nonzero 'fs::store::extent::write::tests::rotation_rejects_replacement_allocation_without_taking_buffer' -p zerofs --locked
+cargo_test_nonzero 'fs::store::extent::reclaim::tests::reclaim_directory_fetch_decode_and_sort_are_precharged' -p zerofs --locked
+cargo_test_nonzero 'fs::store::extent::reclaim::tests::reclaim_bounded_source_holds_permit_until_stream_drop' -p zerofs --locked
+cargo_test_nonzero 'fs::store::extent::reclaim::tests::reclaim_bounded_source_permit_denial_starts_zero_scans_and_rows' -p zerofs --locked
+cargo_test_nonzero 'segment_directory_stream::tests::streamed_directory_matches_one_shot_lz4_and_zstd' -p zerofs --locked
+cargo_test_nonzero 'segment_directory_stream::tests::streamed_directory_authenticates_before_emitting_rows' -p zerofs --locked
+cargo_test_nonzero 'segment_directory_stream::tests::streamed_directory_external_sort_stays_within_chunk_permits' -p zerofs --locked
+cargo_test_nonzero 'segment_directory_stream::tests::streamed_directory_scratch_cleans_on_success_error_cancel_and_restart' -p zerofs --locked
+cargo_test_nonzero 'segment_directory_stream::tests::streamed_directory_sorted_keys_match_one_shot_across_duplicates_and_multipass' -p zerofs --locked
+cargo_test_nonzero 'segment_directory_stream::tests::sort_run_corruption_truncation_or_count_mismatch_fails_closed' -p zerofs --locked
+cargo_test_nonzero 'segment_directory_stream::tests::directory_scratch_formula_covers_all_live_generations' -p zerofs --locked
+cargo_test_nonzero 'segment_directory_stream::tests::directory_scratch_denial_writes_zero_bytes' -p zerofs --locked
+cargo_test_nonzero 'segment_directory_stream::tests::directory_scratch_token_releases_on_success_error_cancel_and_restart' -p zerofs --locked
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --all-targets --locked
 git diff --check
-git add zerofs/src/resident_memory.rs zerofs/src/lib.rs zerofs/src/main.rs zerofs/src/config.rs zerofs/src/cli/server.rs zerofs/src/nfs.rs zerofs/src/fs/store/extent/mod.rs zerofs/src/fs/store/extent/write.rs zerofs/src/fs/store/extent/compact.rs zerofs/src/fs/store/extent/reclaim.rs zerofs/src/fs/store/read_cache.rs zerofs/src/fs/mutation/overlay.rs zerofs/src/fs/mutation/request_cache.rs zerofs/src/segment_store.rs zerofs/src/object_store_prefetch.rs zerofs/src/writeback/config.rs zerofs/src/writeback/store.rs zerofs/src/writeback/journal.rs zerofs/src/writeback/journaler.rs zerofs/src/prometheus.rs
+git add zerofs/Cargo.lock zerofs/Cargo.toml zerofs/src/resident_memory.rs zerofs/src/lib.rs zerofs/src/main.rs zerofs/src/config.rs zerofs/src/cli/server.rs zerofs/src/nfs.rs zerofs/src/frame_codec.rs zerofs/src/frame_codec_stream.rs zerofs/src/segment.rs zerofs/src/segment_directory_stream.rs zerofs/src/fs/store/extent/mod.rs zerofs/src/fs/store/extent/write.rs zerofs/src/fs/store/extent/compact.rs zerofs/src/fs/store/extent/reclaim.rs zerofs/src/fs/store/read_cache.rs zerofs/src/fs/mutation/overlay.rs zerofs/src/fs/mutation/request_cache.rs zerofs/src/segment_store.rs zerofs/src/object_store_prefetch.rs zerofs/src/writeback/config.rs zerofs/src/writeback/bootstrap.rs zerofs/src/writeback/reservation.rs zerofs/src/writeback/store.rs zerofs/src/writeback/journal.rs zerofs/src/writeback/journaler.rs zerofs/src/prometheus.rs
 git commit -m "fix(memory): bound server residency and cache admission"
 ```
 

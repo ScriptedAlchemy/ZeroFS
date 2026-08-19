@@ -746,13 +746,56 @@ resident, and retained separately; retained is virtual address space and is neve
 to resident or used alone to trigger admission. Include a retained-only growth/purge
 leg that raises `stats.retained` without a matching RSS/cgroup increase and prove it
 does not create false permanent over-cap or poison. The GC overlap includes one real
-maximum 256 MiB compacted segment with approximately 8,192 sparse/interleaved 32 KiB
-frames and requires at most 32 memory+durable scans, at most 65,536 scanned rows and
-64 MiB encoded key/value bytes, no per-frame point-read
-fanout, and bounded scan working memory. Budget exhaustion must stop and fail closed to
-`Keep`. Both focused GREEN tests use the fully qualified `cargo_test_nonzero` helper;
-a zero-selection Cargo success is rejected. The receipt records and requires exactly
-268,435,456 logical payload bytes and 8,192 candidate frames before scoring the scan.
+stored-threshold segment made from 8,192 deterministic incompressible 32 KiB frames and
+one real maximally compressible stored-threshold segment produced by the current writer
+and codec. The latter is expected to carry roughly 4.07 million rows, plus its real
+crossing-batch overshoot, but acceptance uses parsed persisted geometry rather than the
+estimate.
+Receipts parse the persisted footer and require actual frame-region bytes, directory
+bytes, total object bytes, footer `k`, and decoded row count; 256 MiB of plaintext or a
+compressible repeated-byte plaintext total is not stored-size evidence.
+
+The same gate enforces only real wire/host representability: footer `k`, sealed body
+length, `FrameLoc.byte_len`, frame-index arithmetic, sealed-directory length, offsets,
+and total length are checked before mutation or publication. Small-limit boundary tests
+prove overflow leaves the open generation byte-for-byte unchanged and emits no object
+PUT; no segment-size-derived cardinality cap is permitted.
+
+Verification uses a streaming merge with a fixed per-page cap of 65,536 rows and 4 MiB
+of encoded keys plus values,
+one sequential live source stream across the memory/durable views, no per-frame point-read fanout,
+and precharged directory/page working memory. The existing version-1 sealed directory is
+authenticated before row release, decoded into permit-owned 4 MiB/65,536-row external
+sort runs, and merged eight-way with a 128 MiB Zstd window or 64 KiB LZ4 history; one
+stream stays within 144 MiB resident memory. Every 256-byte run header carries source,
+generation, count, key-range, length, and SHA-256 identity, and every multipass input is
+manifest-accounted. The canonical SSD owner reserves
+`2*dir_len + 2*(k*28) + 2*ceil(k/65536)*256 + 4096` bytes before growth; no
+whole-directory allocation or second disk counter is allowed.
+The database source itself has one fetch task, no cache admission or forwarding task/
+row channel, and one-block read ahead instead of the generic four-way prefetch. Page
+counters reset inside that same direct-owned iterator; a post-fetch counter wrapped
+around generic `Db::scan` is rejected as memory evidence.
+Scratch is UUID-owned, reserved before growth, and cleaned on success/error/cancel and
+startup recovery. There is deliberately no total row or page cap. At most 16 logical
+ranges per view each use one source scan, so at most 32 source scans cover both views
+while sparse ranges may contain arbitrarily many unrelated rows, and every
+valid `u32` directory cardinality must make progress to EOF without reopening at page
+boundaries. Errors, corruption, source reopen,
+changed geometry, or live references return fail-closed `Keep`. The Linux scenario
+inserts unrelated rows across many page boundaries, proves one source stream per range, and
+reclaims both real threshold objects without a liveness-gating total budget.
+All focused GREEN tests use fully qualified `cargo_test_nonzero`; a zero-selection Cargo
+success is rejected. The receipt records real stored/object/directory measurements,
+total pages/rows/bytes, peak concurrent scans/tasks, and peak permitted working bytes
+before scoring reclamation. Typed fields require `page_rows_peak <= 65536`,
+`page_encoded_bytes_peak <= 4194304`,
+`logical_ranges_total <= 32`, `source_scans_total <= 32`,
+`source_scan_tasks_peak <= 1`, `physical_pages_total > 1` for each sparse paging leg,
+both-view EOF, zero point reads, `directory_rows_emitted_before_auth = 0`, fixed decoder
+window/run/fan-in peaks, exact initial/merge counts and hashes, complete one-shot versus
+multipass sorted-key equivalence, zero scratch reservation/residue, and successful deletion only after those
+EOF markers.
 Before the first process starts, the immutable ledger records these fixed thresholds:
 `cgroup_high_event_delta_max=8`, `reconciliation_error_bytes_max=268435456`, and
 `unowned_residual_bytes_max=2147483648`. They cannot be supplied by scenario output,
@@ -850,9 +893,26 @@ Name dependency-free RED tests that reject:
   eight, reconciliation error above 256 MiB, or unowned residual above 2 GiB;
 - physical residency computed as jemalloc resident plus retained, retained-only growth
   causing backpressure, or a mismatch with OS RSS/cgroup current;
-- a sparse/interleaved maximum 256 MiB/~8,192-frame segment issuing more than 32
-  verification scans or scaling beyond 65,536 rows/64 MiB encoded bytes, or scaling
-  maintenance memory with all ~16,384 would-be two-view point reads;
+- deriving cardinality from plaintext bytes, treating a repeated-byte fixture as a
+  256 MiB stored segment, or failing to assert footer `k`, `dir_offset`, `dir_len`, total
+  object bytes, and decoded directory rows;
+- a finite total cardinality, row, page, or encoded-byte cap that can make a
+  valid version-1 segment permanently unreclaimable;
+- unchecked `usize`/`u32` segment geometry, an overflow that mutates the open generation
+  or publishes an object, or a boundary test that requires a GiB allocation instead of
+  the production checked helper with injected limits;
+- a page exceeding 65,536 rows, 4 MiB encoded keys plus values, or its concurrency
+  budget, resuming without
+  strict key progress, allocating directory/page working memory before its resident
+  permit, or deleting before both views reach EOF for one immutable geometry identity;
+- a generic cached/four-way-prefetch scan allocating ahead of the page budget, a
+  forwarding task/channel, or a source stream reopened at a page boundary;
+- a whole-directory allocation, unauthenticated row emission, unbounded codec history or
+  external-sort fan-in, scratch growth without reservation, or owned scratch surviving
+  success, error, cancellation, or startup recovery;
+- a run without bound source/generation/count/range/hash identity, a merge that does not
+  consume every manifest input exactly once, or any full-stream difference from the
+  authenticated one-shot decoder across duplicates/corruption/cancellation;
 - an HPN result without exact executable identity, a direction label, or per-session
   byte evidence;
 - an HPN suite without the pinned `LTESTS` inventory, with an exclusion other than
@@ -873,7 +933,11 @@ The memory suite names
 `test_reconciliation_error_above_256_mib_is_rejected`, and
 `test_unowned_residual_above_2_gib_is_rejected`,
 `test_retained_virtual_bytes_are_not_physical_rss`, and
-`test_sparse_interleaved_segment_scan_calls_rows_and_bytes_are_bounded`. The SFTP suite names
+`test_reclaim_page_rows_and_encoded_bytes_are_bounded`,
+`test_reclaim_source_scans_are_bounded_and_pages_do_not_reopen`,
+`test_reclaim_source_task_concurrency_is_one`,
+`test_sparse_unrelated_rows_make_uncapped_multi_page_progress`, and
+`test_reclaim_requires_both_view_eof_before_delete`. The SFTP suite names
 `test_missing_executable_identity_is_rejected`,
 `test_hpn_inventory_and_single_exclusion_are_required`,
 `test_hpn_timeout_must_reap_process_group`,
@@ -985,7 +1049,14 @@ grep -F 'test_missing_benchmark_read_throughput_scenario_is_rejected' "$READ_TES
 grep -F 'test_incomplete_protocol_cache_concurrency_matrix_is_rejected' "$READ_TEST_LOG"
 grep -F 'test_client_page_cache_cannot_masquerade_as_server_ram' "$READ_TEST_LOG"
 grep -F 'test_failed_nfs_readahead_cell_restores_recorded_original' "$READ_TEST_LOG"
-python3 -m unittest discover -s scripts/tests -p 'test_memory_envelope_benchmark.py' -v
+MEMORY_TEST_LOG="${TMPDIR:-/tmp}/zerofs-memory-envelope-green.log"
+python3 -m unittest discover -s scripts/tests -p 'test_memory_envelope_benchmark.py' -v 2>&1 | tee "$MEMORY_TEST_LOG"
+grep -Eq '^Ran [1-9][0-9]* tests? in ' "$MEMORY_TEST_LOG"
+grep -F 'test_reclaim_page_rows_and_encoded_bytes_are_bounded' "$MEMORY_TEST_LOG"
+grep -F 'test_reclaim_source_scans_are_bounded_and_pages_do_not_reopen' "$MEMORY_TEST_LOG"
+grep -F 'test_reclaim_source_task_concurrency_is_one' "$MEMORY_TEST_LOG"
+grep -F 'test_sparse_unrelated_rows_make_uncapped_multi_page_progress' "$MEMORY_TEST_LOG"
+grep -F 'test_reclaim_requires_both_view_eof_before_delete' "$MEMORY_TEST_LOG"
 python3 -m unittest discover -s scripts/tests -p 'test_sftp_transport_benchmark.py' -v
 python3 -m unittest discover -s scripts/tests -p 'test_*.py' -v
 git diff --check

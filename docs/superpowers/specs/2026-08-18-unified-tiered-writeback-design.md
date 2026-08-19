@@ -379,16 +379,76 @@ All canonical writes are write-no-allocate for the clean decoded read cache.
 Pending reads remain coherent through the mutation overlay and canonical store, but a
 chunked NFS rsync cannot fill the clean read cache. Subsequent reads populate the
 cache normally. Segment GC and compaction group adjacent source ranges into bounded
-sequential scans and use explicit no-admit/no-fill reads. Reclaim verification also
-batches sparse/interleaved forward keys: a real maximum 256 MiB compacted segment has
-approximately 8,192 32 KiB frames and uses 16 fixed 512-key batches plus two streaming
-views, for at most 32 scans rather than about 16,384 point reads. The desired keys
-occupy about 16,384 two-view rows; a fixed fourfold ceiling permits at most 65,536
-scanned rows including bounded gap overhead, while encoded key/value bytes remain
-capped at 64 MiB. Exhausting either budget returns `Keep`. Scan/decode errors
-and either view retaining a reference fail closed. Focused acceptance lists and runs
-both exact reclaim tests with nonzero selection; a raw Cargo zero-test success is not
-evidence.
+sequential scans and use explicit no-admit/no-fill reads.
+
+Segment cardinality is defined from the stored wire geometry, never from plaintext
+size. Version 1 stores compressed+AEAD frames plus four-byte prefixes in the frame
+region, then one compressed+sealed directory of 28 plaintext bytes per row, then a
+64-byte footer whose `k`, frame index, and `dir_len` fields are `u32`. The 256 MiB seal
+threshold applies only to the stored frame region. Valid current segments can therefore
+contain roughly 4.07 million highly compressed extents before the threshold, plus a
+crossing-batch overshoot; the current internal writer has no universal batch bound. A
+shared `SegmentFormatLimits` checked helpers validate actual `k`, frame-region size, directory
+size, total size, and all conversions without inventing a lower total-cardinality cap.
+The concrete representability checks are directory count into footer `k: u32`, sealed
+body length into `len: u32`, prefix plus body into `FrameLoc.byte_len: u32`, frame-index
+start plus batch offset into `u32`, sealed directory into footer `dir_len: u32`, and all
+buffer/offset/total arithmetic into its host/wire type. A reservation validates the
+entire batch before mutating the open segment; rotation builds successfully before
+replacing it; object publication begins only after the complete object is representable.
+Injected-limit boundary tests prove failure preserves the live generation and performs
+zero PUTs without allocating GiBs.
+
+Reclaim verification merge-streams sorted wanted keys against paginated memory and
+durable scans. Sparse runs coalesce into at most 16 logical ranges per view; these 32
+logical traversals each open one direct-owned source stream. A single
+`ReclaimPageBudget` fixes each page at no more than 65,536 rows and
+4 MiB of encoded keys plus values. Reaching either resets the counters and continues
+with the next row on that same iterator; the sorted wanted merge index remains
+monotonic. The scan API owns the iterator directly with one fetch task, no cache
+admission, one-block read ahead instead of the generic four-way prefetch, and no spawned
+forwarding channel. The current verifier scans memory then durable ranges sequentially,
+so peak source-stream concurrency is one and total source scans are at most 32. Total
+pages, rows, and encoded bytes are not capped: sparse ranges may contain arbitrarily many unrelated keys, and a finite
+total ceiling would make a valid segment permanently unreclaimable.
+
+The version-1 directory itself is also streamed rather than fetched/decoded/sorted into
+O(`k`) RAM. Permit-owned 4 MiB range chunks spool sealed ciphertext to an exclusive 0600
+scratch object. An audited incremental XChaCha20-Poly1305 verification pass checks the
+existing AAD/tag before any row is released; a second bounded pass decrypts and streams
+the existing Zstd or size-prefixed LZ4 representation. Zstd is capped at a 128 MiB
+window; LZ4 keeps 64 KiB of history. Fixed 28-byte rows form external
+sorted/deduplicated runs of at most 65,536 rows or 4 MiB and merge eight-way. One active
+stream has a conservative 144 MiB resident maximum.
+
+Every 256-byte run header binds the source-geometry SHA-256, run/generation IDs, input
+and unique row counts, payload length/hash, and first/last keys. A manifest requires
+contiguous IDs and initial counts summing to footer `k`; each merge generation proves it
+consumed every declared input exactly once and validates all headers/hashes/ranges before
+emitting output. The canonical `SsdReservationToken` owner reserves
+`2*dir_len + 2*(k*28) + 2*ceil(k/65536)*256 + 4096` checked bytes before growth, covering
+ciphertext/decrypted-compressed files, simultaneous input/output run generations,
+headers, and manifest. No second disk-capacity counter exists.
+Ciphertext, codec window, row chunk, merge heads, and each SlateDB page acquire their
+resident permits before allocation. Scratch space is reserved before growth, uses only
+UUID-owned names under the configured local root, and is removed on success, error,
+cancellation, and startup recovery. CRC/tag/length failure releases no row. Differential
+known-answer tests prove the streamed decoder is byte-identical to the existing one-shot
+version-1 decoder. Adversarial multipass tests compare the complete sorted/deduplicated
+key stream across duplicates, corruption, truncation, missing runs, and cancellation;
+any mismatch fails closed. This is not a new wire format. There is no point-read fallback.
+
+Deletion requires both views to reach EOF for the same immutable `(segid, object_size,
+footer_crc, k, dir_offset, dir_len)` identity. A page-boundary source reopen, changed identity,
+malformed geometry, scan/decode error, cancellation, or either view retaining a
+reference returns fail-closed `Keep`; a partial prefix is never deletion evidence.
+Focused acceptance separately proves a real 8,192-frame incompressible object crosses
+the 256 MiB stored threshold and a real maximally compressible threshold object records
+its actual roughly-four-million footer `k`. A sparse/interleaved fixture forces many
+page boundaries with unrelated rows and proves one source stream per range to both EOFs. Each test
+asserts persisted `dir_offset`, `dir_len`, total bytes, footer `k`, decoded rows,
+per-page rows/bytes, peak scan concurrency, and zero point reads; raw Cargo zero-test
+success is not evidence.
 Any later write-admission or maintenance-cache
 exception requires its own bounded policy and measured RED/GREEN proof.
 
@@ -684,9 +744,13 @@ Implementation follows strict RED/GREEN slices. The required proof matrix includ
     residual `<= 2 GiB`, reconciles owned, baseline, and residual residency within
     those limits, records zero cgroup `oom`/`oom_kill` deltas, and proves retained-only
     virtual growth cannot create false physical over-cap/backpressure. The same soak
-    verifies a real sparse/interleaved maximum 256 MiB/~8,192-frame reclaim candidate
-    stays within 32 scans, 65,536 rows, 64 MiB encoded bytes, and bounded maintenance
-    memory.
+    verifies stored-byte and cardinality geometry separately: an incompressible
+    8,192-frame object really crosses the 256 MiB frame-region threshold, a real
+    maximally compressible threshold object records its actual roughly-four-million
+    footer `k`, and sparse unrelated rows cross many bounded streaming pages. Every page
+    stays within fixed row/encoded-byte/concurrency limits and precharged maintenance
+    memory; total page progress is uncapped without reopening source streams, and a partial prefix never
+    becomes deletion evidence.
 18. stock OpenSSH versus pinned HPN versus ZeroFS SFTP A/Bs for upload and download at
     one and configured-many sessions. Each cell records executable identity, RTT,
     TCP window/retransmits, SFTP depth, lane utilization, exact bytes, SHA-256, and
