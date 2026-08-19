@@ -81,10 +81,10 @@ impl Drop for WaitRegistration {
         {
             let mut state = lock(&self.inner.state);
             state.waiters.retain(|waiter| waiter.id != self.id);
-            if state.terminal.is_none() {
-                if let Some(operations) = state.used_operations.checked_sub(1) {
-                    state.used_operations = operations;
-                }
+            if state.terminal.is_none()
+                && let Some(operations) = state.used_operations.checked_sub(1)
+            {
+                state.used_operations = operations;
             }
         }
         self.inner.grant_waiters();

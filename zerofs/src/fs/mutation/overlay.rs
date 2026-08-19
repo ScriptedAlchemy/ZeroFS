@@ -357,10 +357,8 @@ impl FilesystemVolatileOverlay {
         }
         let mut sequence = 0;
         let mut accepted_runtimes = Vec::with_capacity(members.len());
-        for (_index, (admission, (id, offset, data, _attrs))) in admissions
-            .into_iter()
-            .zip(members.iter().cloned())
-            .enumerate()
+        for (admission, (id, offset, data, _attrs)) in
+            admissions.into_iter().zip(members.iter().cloned())
         {
             let groups = vec![vec![WriteChunk {
                 inode: id,
@@ -377,7 +375,7 @@ impl FilesystemVolatileOverlay {
                     sequence = accepted;
                     accepted_runtimes.push((runtime, accepted));
                     #[cfg(test)]
-                    if self.fail_batch_after.load(Ordering::Acquire) == _index + 1 {
+                    if self.fail_batch_after.load(Ordering::Acquire) == accepted_runtimes.len() {
                         let error = OverlayError::IoError;
                         let _ =
                             guard.abort(PreparationAbort::RequestFailure(overlay_fs_error(error)));

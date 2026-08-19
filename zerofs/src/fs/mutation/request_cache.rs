@@ -10,6 +10,7 @@ use crate::fs::mutation::types::{
     PreparedBatchResult, RequestFingerprint, RequestIdentity, RequestLifetime,
 };
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Instant;
 use tokio::sync::Notify;
@@ -60,6 +61,17 @@ pub(crate) enum RequestLookup {
     Joined(Arc<RetainedRequest>),
     FingerprintMismatch,
     Backpressured,
+}
+
+impl fmt::Debug for RequestLookup {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Vacant(_) => f.write_str("Vacant"),
+            Self::Joined(_) => f.write_str("Joined"),
+            Self::FingerprintMismatch => f.write_str("FingerprintMismatch"),
+            Self::Backpressured => f.write_str("Backpressured"),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -461,14 +473,12 @@ impl RequestCacheInner {
                 expires_at, slot, ..
             } => {
                 let expired = expires_at.is_some_and(|deadline| deadline <= now);
-                if expired {
-                    if let Some(mut owned) = slot.take() {
-                        if owned.active {
-                            state.used_slots = state.used_slots.saturating_sub(1);
-                            owned.disarm();
-                        }
-                        released.push(owned);
+                if expired && let Some(mut owned) = slot.take() {
+                    if owned.active {
+                        state.used_slots = state.used_slots.saturating_sub(1);
+                        owned.disarm();
                     }
+                    released.push(owned);
                 }
                 !expired
             }
@@ -573,7 +583,7 @@ mod tests {
             .unwrap()
         {
             RequestLookup::Joined(retained) => retained,
-            other => panic!("expected join, got other variant"),
+            other => panic!("expected join, got {other:?}"),
         };
         assert_eq!(cache.used_slots(), 1);
         let waiter = tokio::spawn({
@@ -829,18 +839,5 @@ mod tests {
 
     fn pending_retained_slot(cache: &RequestCache) -> usize {
         cache.used_slots()
-    }
-}
-
-use std::fmt;
-
-impl fmt::Debug for RequestLookup {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Vacant(_) => f.write_str("Vacant"),
-            Self::Joined(_) => f.write_str("Joined"),
-            Self::FingerprintMismatch => f.write_str("FingerprintMismatch"),
-            Self::Backpressured => f.write_str("Backpressured"),
-        }
     }
 }
