@@ -10,6 +10,7 @@ use crate::writeback::overlay::{OverlayCommitObserver, OverlayIndex, VisibleVers
 use crate::writeback::payload::VerifiedPayload;
 use crate::writeback::remote::{RemoteBarrierError, RemoteScheduler};
 use crate::writeback::reservation::{SsdAdmission, SsdReservationRequest, SsdReservationToken};
+use crate::writeback::space_refresher::SpaceRefresher;
 use crate::writeback::space_sample::PhysicalSpaceSampler;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -47,6 +48,7 @@ struct WritebackStoreInner {
     admission: Admission,
     space: Arc<PhysicalSpaceSampler>,
     ssd: Arc<SsdAdmission>,
+    space_refresher: Arc<SpaceRefresher>,
     journaler: LocalJournaler,
     remote: RemoteScheduler,
     database_prefix: String,
@@ -214,8 +216,9 @@ impl WritebackObjectStore {
                 settings,
                 overlay,
                 admission,
-                space,
-                ssd,
+                space: Arc::clone(&space),
+                ssd: Arc::clone(&ssd),
+                space_refresher: SpaceRefresher::start(Arc::clone(&ssd), Arc::clone(&space)),
                 journaler,
                 remote,
                 database_prefix,
@@ -334,6 +337,7 @@ impl WritebackObjectStore {
                 })?;
             }
         }
+        self.inner.space_refresher.shutdown().await;
         self.inner.ssd.close();
         Ok(())
     }

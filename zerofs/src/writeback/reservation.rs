@@ -5,10 +5,11 @@
 //! exactly once, and [`SsdReservationToken::disarm`] transfers ownership to a
 //! later journal-commit path.
 
+use crate::writeback::pacing::{PacingLedger, SsdAdmissionMode, SsdReleaseCredit};
 use crate::writeback::space_sample::PhysicalSpaceSample;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard};
-use tokio::sync::oneshot;
+use tokio::sync::{Notify, oneshot};
 
 /// Stable journal reservation plus the conservative local allocation claim.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,6 +40,9 @@ pub(crate) struct SsdAdmissionSnapshot {
     pub(crate) available_bytes: u64,
     pub(crate) sample_generation: u64,
     pub(crate) paused: bool,
+    pub(crate) mode: SsdAdmissionMode,
+    pub(crate) credit_bytes: u64,
+    pub(crate) credit_ops: u64,
 }
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum ReservationError {
@@ -103,14 +107,27 @@ pub(crate) struct SsdAdmission {
     inner: Arc<SsdAdmissionInner>,
 }
 
-#[derive(Debug)]
 struct SsdAdmissionInner {
     capacity_bytes: u64,
     max_operations: u64,
     high_bytes: u64,
     resume_bytes: u64,
     min_free_bytes: u64,
+    physical_waiters: Arc<Notify>,
     state: Mutex<SsdState>,
+}
+
+impl std::fmt::Debug for SsdAdmissionInner {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SsdAdmissionInner")
+            .field("capacity_bytes", &self.capacity_bytes)
+            .field("max_operations", &self.max_operations)
+            .field("high_bytes", &self.high_bytes)
+            .field("resume_bytes", &self.resume_bytes)
+            .field("min_free_bytes", &self.min_free_bytes)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug)]
@@ -124,6 +141,7 @@ struct SsdState {
     next_waiter: u64,
     waiters: VecDeque<SsdWaiter>,
     terminal: Option<ReservationError>,
+    pacing: PacingLedger,
 }
 
 #[derive(Debug)]
@@ -224,6 +242,7 @@ impl SsdAdmission {
                 high_bytes,
                 resume_bytes: percent_bytes(capacity_bytes, resume_percent),
                 min_free_bytes,
+                physical_waiters: Arc::new(Notify::new()),
                 state: Mutex::new(SsdState {
                     used_ssd_bytes,
                     used_operations,
@@ -242,6 +261,13 @@ impl SsdAdmission {
                     next_waiter: 0,
                     waiters: VecDeque::new(),
                     terminal: None,
+                    pacing: {
+                        let mut pacing = PacingLedger::default();
+                        if used_ssd_bytes > high_bytes {
+                            pacing.enter_paced();
+                        }
+                        pacing
+                    },
                 }),
             }),
         })
@@ -264,7 +290,7 @@ impl SsdAdmission {
             });
         }
 
-        let (id, receiver) = {
+        let (id, receiver, physical_wait) = {
             let mut state = lock(&self.inner.state);
             self.inner.observe_locked(&mut state, sample)?;
             if let Some(error) = &state.terminal {
@@ -292,6 +318,7 @@ impl SsdAdmission {
                 request.ssd_reservation_bytes,
                 self.inner.high_bytes,
             ) {
+                state.pacing.enter_paced();
                 state.paused = true;
             }
             let id = state.next_waiter;
@@ -302,8 +329,17 @@ impl SsdAdmission {
                 request,
                 sender,
             });
-            (id, receiver)
+            let physical_wait = !physical_headroom(
+                state.available_bytes,
+                state.outstanding_physical_claims,
+                request.physical_reservation_bytes,
+                self.inner.min_free_bytes,
+            );
+            (id, receiver, physical_wait)
         };
+        if physical_wait {
+            self.inner.physical_waiters.notify_waiters();
+        }
         let mut registration = WaitRegistration {
             inner: self.inner.clone(),
             id,
@@ -339,7 +375,10 @@ impl SsdAdmission {
             outstanding_physical_claims: state.outstanding_physical_claims,
             available_bytes: state.available_bytes,
             sample_generation: state.sample_generation,
-            paused: state.paused,
+            paused: state.pacing.mode() == SsdAdmissionMode::Paced,
+            mode: state.pacing.mode(),
+            credit_bytes: state.pacing.credit_bytes(),
+            credit_ops: state.pacing.credit_ops(),
         }
     }
 
@@ -369,6 +408,54 @@ impl SsdAdmission {
         self.inner.release(request);
     }
 
+    pub(crate) fn mode(&self) -> SsdAdmissionMode {
+        lock(&self.inner.state).pacing.mode()
+    }
+
+    pub(crate) fn credit_bytes(&self) -> u64 {
+        lock(&self.inner.state).pacing.credit_bytes()
+    }
+
+    pub(crate) fn credit_ops(&self) -> u64 {
+        lock(&self.inner.state).pacing.credit_ops()
+    }
+
+    pub(crate) fn physical_waiter_notify(&self) -> Arc<Notify> {
+        Arc::clone(&self.inner.physical_waiters)
+    }
+
+    pub(crate) fn min_free_waiters_changed(&self) -> impl std::future::Future<Output = ()> + '_ {
+        self.inner.physical_waiters.notified()
+    }
+
+    pub(crate) fn has_min_free_waiters(&self) -> bool {
+        let state = lock(&self.inner.state);
+        state.waiters.iter().any(|waiter| {
+            !physical_headroom(
+                state.available_bytes,
+                state.outstanding_physical_claims,
+                waiter.request.physical_reservation_bytes,
+                self.inner.min_free_bytes,
+            )
+        })
+    }
+
+    pub(crate) fn apply_release_credit(
+        &self,
+        credit: SsdReleaseCredit,
+    ) -> Result<(), ReservationError> {
+        {
+            let mut state = lock(&self.inner.state);
+            if let Some(error) = &state.terminal {
+                return Err(error.clone());
+            }
+            state.pacing.add_credit(credit);
+            self.inner.refresh(&mut state);
+        }
+        self.inner.grant_waiters();
+        Ok(())
+    }
+
     /// Release a locally committed reservation after remote cleanup.
     ///
     /// Observes `sample` first so waiters see the post-cleanup free space.
@@ -386,7 +473,7 @@ impl SsdAdmission {
                 return Err(error.clone());
             }
         }
-        self.inner.release(request);
+        self.inner.release_charge_only(request);
         Ok(())
     }
 }
@@ -408,39 +495,50 @@ impl SsdAdmissionInner {
     }
 
     fn refresh(&self, state: &mut SsdState) {
-        if state.paused
-            && state.used_ssd_bytes <= self.resume_bytes
-            && physical_headroom(
-                state.available_bytes,
-                state.outstanding_physical_claims,
-                0,
-                self.min_free_bytes,
-            )
-        {
-            state.paused = false;
+        if physical_headroom(
+            state.available_bytes,
+            state.outstanding_physical_claims,
+            0,
+            self.min_free_bytes,
+        ) {
+            state
+                .pacing
+                .maybe_resume(state.used_ssd_bytes, self.resume_bytes);
         }
+        state.paused = state.pacing.mode() == SsdAdmissionMode::Paced;
     }
 
     fn fits(&self, state: &SsdState, request: SsdReservationRequest) -> bool {
-        let bytes_fit = !state.paused
-            && (!projected_exceeds(
-                state.used_ssd_bytes,
-                request.ssd_reservation_bytes,
-                self.high_bytes,
-            ) || (state.used_ssd_bytes == 0
-                && !projected_exceeds(0, request.ssd_reservation_bytes, self.capacity_bytes)));
-        bytes_fit
-            && !projected_exceeds(
-                state.used_operations,
-                request.operations,
-                self.max_operations,
-            )
-            && physical_headroom(
-                state.available_bytes,
-                state.outstanding_physical_claims,
-                request.physical_reservation_bytes,
-                self.min_free_bytes,
-            )
+        let hard = !projected_exceeds(
+            state.used_ssd_bytes,
+            request.ssd_reservation_bytes,
+            self.capacity_bytes,
+        ) && !projected_exceeds(
+            state.used_operations,
+            request.operations,
+            self.max_operations,
+        ) && physical_headroom(
+            state.available_bytes,
+            state.outstanding_physical_claims,
+            request.physical_reservation_bytes,
+            self.min_free_bytes,
+        );
+        if !hard {
+            return false;
+        }
+        match state.pacing.mode() {
+            SsdAdmissionMode::Burst => {
+                !projected_exceeds(
+                    state.used_ssd_bytes,
+                    request.ssd_reservation_bytes,
+                    self.high_bytes,
+                ) || (state.used_ssd_bytes == 0
+                    && !projected_exceeds(0, request.ssd_reservation_bytes, self.capacity_bytes))
+            }
+            SsdAdmissionMode::Paced => state
+                .pacing
+                .can_grant(request.ssd_reservation_bytes, request.operations),
+        }
     }
 
     fn charge(
@@ -481,9 +579,13 @@ impl SsdAdmissionInner {
         state.used_ssd_bytes = used_ssd_bytes;
         state.used_operations = used_operations;
         state.outstanding_physical_claims = outstanding_physical_claims;
+        state
+            .pacing
+            .consume_grant(request.ssd_reservation_bytes, request.operations);
         if state.used_ssd_bytes > self.high_bytes {
-            state.paused = true;
+            state.pacing.enter_paced();
         }
+        state.paused = state.pacing.mode() == SsdAdmissionMode::Paced;
         Ok(())
     }
 
@@ -495,6 +597,14 @@ impl SsdAdmissionInner {
         }
     }
     fn release(self: &Arc<Self>, request: SsdReservationRequest) {
+        self.release_with_credit(request, true);
+    }
+
+    fn release_charge_only(self: &Arc<Self>, request: SsdReservationRequest) {
+        self.release_with_credit(request, false);
+    }
+
+    fn release_with_credit(self: &Arc<Self>, request: SsdReservationRequest, return_credit: bool) {
         let poison = {
             let mut state = lock(&self.state);
             match (
@@ -510,6 +620,11 @@ impl SsdAdmissionInner {
                     state.used_ssd_bytes = bytes;
                     state.used_operations = operations;
                     state.outstanding_physical_claims = physical;
+                    if return_credit {
+                        state
+                            .pacing
+                            .return_grant_credit(request.ssd_reservation_bytes, request.operations);
+                    }
                     self.refresh(&mut state);
                     None
                 }
@@ -538,6 +653,7 @@ impl SsdAdmissionInner {
                     request.ssd_reservation_bytes,
                     self.high_bytes,
                 ) {
+                    state.pacing.enter_paced();
                     state.paused = true;
                 }
                 break;

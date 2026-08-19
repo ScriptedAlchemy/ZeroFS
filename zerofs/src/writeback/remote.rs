@@ -1,6 +1,4 @@
 use crate::writeback::admission::Admission;
-use crate::writeback::reservation::{SsdAdmission, SsdReservationRequest};
-use crate::writeback::space_sample::PhysicalSpaceSampler;
 use crate::writeback::barrier::{BarrierError, SequenceBarrier, SequenceProgress};
 use crate::writeback::journal::Journal;
 use crate::writeback::journaler::{LocalBarrier, LocalBarrierError};
@@ -8,6 +6,9 @@ use crate::writeback::model::{
     FenceClass, LocalEtag, MutationKind, MutationMode, MutationRecord, Sequence,
 };
 use crate::writeback::overlay::OverlayIndex;
+use crate::writeback::pacing::{DurableCleanupSteps, credit_for};
+use crate::writeback::reservation::{SsdAdmission, SsdReservationRequest};
+use crate::writeback::space_sample::PhysicalSpaceSampler;
 use bytes::Bytes;
 use futures::FutureExt;
 use futures::future::BoxFuture;
@@ -1092,9 +1093,21 @@ async fn commit_remote_run(
     tokio::task::spawn_blocking(move || cleanup_journal.remove_remote_prefix(last))
         .await
         .map_err(|error| anyhow::anyhow!("remote cleanup task failed: {error}"))??;
+    let previous_generation = ssd.snapshot().sample_generation;
     let sample = space.sample().await?;
     for request in requests {
         ssd.release_remote(request, sample)?;
+        if let Some((credit, _)) = credit_for(DurableCleanupSteps {
+            watermark_committed: true,
+            overlay_retired: true,
+            local_cleanup_committed: true,
+            sample: Some(sample),
+            previous_generation,
+            ssd_reservation_bytes: request.ssd_reservation_bytes,
+            operations: request.operations,
+        }) {
+            ssd.apply_release_credit(credit)?;
+        }
     }
     Ok(())
 }

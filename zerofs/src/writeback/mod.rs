@@ -22,9 +22,11 @@ pub mod journal;
 pub mod journaler;
 pub mod model;
 pub mod overlay;
+pub(crate) mod pacing;
 mod payload;
 pub mod remote;
 pub(crate) mod reservation;
+pub(crate) mod space_refresher;
 pub(crate) mod space_sample;
 pub mod store;
 #[cfg(test)]
