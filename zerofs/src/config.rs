@@ -2931,8 +2931,8 @@ known_hosts = "${ZEROFS_TEST_KNOWN_HOSTS}""#,
     fn sftp_rejects_empty_or_relative_ssh_program() {
         for program in ["", "hpnssh"] {
             let extra = format!("[sftp]\nssh_program = {program:?}");
-            let error = write_and_load(&sftp_config("sftp://alice@example.com/data", &extra))
-                .unwrap_err();
+            let error =
+                write_and_load(&sftp_config("sftp://alice@example.com/data", &extra)).unwrap_err();
             assert!(error.to_string().contains("ssh_program"));
         }
     }
