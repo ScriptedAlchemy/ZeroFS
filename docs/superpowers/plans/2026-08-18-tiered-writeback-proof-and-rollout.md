@@ -182,6 +182,7 @@ The lifecycle/API suite names
 `test_recorded_host_identity_requires_pinned_digest_role_and_vmid`,
 `test_recorded_host_identity_rejects_live_ct198_refresh`, and
 `test_controller_target_normalized_output_matches_token`, and
+`test_normalized_controller_target_rejects_leading_ssh_option`,
 `test_every_ubuntu_remote_block_receives_validated_target_token`, and
 `test_every_cleanup_remote_block_mints_and_transports_fresh_target_token`. Each supervisor test
 injects the failure, asserts the returned status and separate ledger fields, then
@@ -268,7 +269,8 @@ additionally bound to its immutable identity token as specified above.
 Both `verify-controller-target` and `verify-proof-host` also accept
 `--format normalized-target`; they execute the identical live verification and emit
 only the validated target string contained in the corresponding fresh target token.
-The output must match `[-A-Za-z0-9._:@]+` and is used only to map a manifest-validated
+The output must match `[-A-Za-z0-9._:@]+` and must not start with `-`; it is used only
+to map a manifest-validated
 ledger target back to its freshly reverified transport token during C9 cleanup.
 
 `validate-recorded-host-identity --receipt PATH --expected-sha256 HEX
@@ -1556,8 +1558,8 @@ VM100_MACHINE_ID="$(python3 scripts/tiered-writeback-e2e.py validate-recorded-ho
 CT198_MACHINE_ID="$(python3 scripts/tiered-writeback-e2e.py validate-recorded-host-identity --receipt "${ZEROFS_CT198_IDENTITY_RECEIPT:?}" --expected-sha256 "${ZEROFS_CT198_IDENTITY_RECEIPT_SHA256:?}" --expected-role ct198 --expected-proxmox-vmid 198 --format machine-id)"
 UBUNTU_NORMALIZED_TARGET="$(python3 scripts/tiered-writeback-e2e.py verify-controller-target --controller-ssh-target ubuntu-main --expected-host-key-sha256 "${ZEROFS_VM100_HOST_KEY_SHA256:?}" --format normalized-target)"
 NBD_NORMALIZED_TARGET="$(python3 scripts/tiered-writeback-e2e.py verify-proof-host --controller-ssh-target "${ZEROFS_NBD_PROOF_HOST:?}" --expected-host-key-sha256 "${ZEROFS_NBD_PROOF_HOST_KEY_SHA256:?}" --expected-machine-id "${ZEROFS_NBD_PROOF_MACHINE_ID:?}" --expected-proxmox-vmid "${ZEROFS_NBD_PROOF_VMID:?}" --forbid-machine-id "$VM100_MACHINE_ID" --forbid-machine-id "$CT198_MACHINE_ID" --forbid-proxmox-vmid 100 --forbid-proxmox-vmid 198 --format normalized-target)"
-case "$UBUNTU_NORMALIZED_TARGET" in ''|*[!A-Za-z0-9._:@-]*) exit 1 ;; esac
-case "$NBD_NORMALIZED_TARGET" in ''|*[!A-Za-z0-9._:@-]*) exit 1 ;; esac
+case "$UBUNTU_NORMALIZED_TARGET" in ''|-*|*[!A-Za-z0-9._:@-]*) exit 1 ;; esac
+case "$NBD_NORMALIZED_TARGET" in ''|-*|*[!A-Za-z0-9._:@-]*) exit 1 ;; esac
 test "$UBUNTU_NORMALIZED_TARGET" != "$NBD_NORMALIZED_TARGET"
 mint_target_token() {
   target="$1"
