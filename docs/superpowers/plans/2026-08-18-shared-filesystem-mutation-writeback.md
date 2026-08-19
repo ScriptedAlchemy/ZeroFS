@@ -1181,3 +1181,76 @@ git commit -m "docs(writeback): expose shared mutation lifecycle"
 ```
 
 Expected: the old NBD overlay is absent; generated config remains materialized; every writable adapter reaches the shared coordinator; lifecycle has exactly one close owner; no approved-spec diff exists.
+
+---
+
+### Task A19: Fetch Independent Fragmented Read Runs With Bounded Concurrency
+
+**Files:**
+- Modify: `zerofs/src/fs/store/extent/read.rs`
+- Create: `zerofs/src/fs/store/extent/read/tests.rs`
+- Create: `zerofs/src/fs/store/extent/read/metrics.rs`
+
+**Interfaces:**
+- Produces: an ordered read-run plan, bounded concurrent fetch of independent immutable on-store segment runs, and bounded-cardinality logical/read-run utilization metrics.
+- Consumes: the existing extent-location range scan, decoded/open-buffer fast paths, `SegmentStore::read_run`, stale-location re-resolution, nomination/crossing accounting, and the existing `PARALLEL_EXTENT_OPS` bound.
+
+- [ ] **Step 1: Split the existing tests without behavior change**
+
+Move the inline `read.rs` test module to `read/tests.rs` before adding behavior. Keep production below 600 lines and source plus tests below 1000 lines per file. Run the complete existing module gate and require a nonzero pass count.
+
+```bash
+cd /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback/zerofs
+cargo_test_nonzero 'fs::store::extent::read::tests' -p zerofs --locked
+cargo fmt --all -- --check
+git diff --check
+```
+
+- [ ] **Step 2: Add the focused RED tests**
+
+Name tests:
+
+- `one_fragmented_read_fetches_independent_runs_concurrently`
+- `fragmented_read_concurrency_is_bounded`
+- `fragmented_read_preserves_logical_output_order`
+- `contiguous_control_remains_one_ranged_get`
+- `stale_location_fallback_remains_correct_under_concurrency`
+- `failed_fragmented_read_releases_every_fetch_permit`
+
+Use a latency-gated, peak-concurrency-counting real `ObjectStore` test seam behind the production extent/segment path. Build a logically sequential file whose adjacent extents occupy at least eight independent segment runs. Before releasing any GET, require at least two and at most `PARALLEL_EXTENT_OPS` backend reads to have started. Verify exact bytes and the exact run count. Current code is RED because `read_range` awaits each on-store run before starting the next.
+
+- [ ] **Step 3: Implement the minimum shared read fix**
+
+Resolve and coalesce the existing maximal runs first. Serve decoded/open-buffer runs through their current fast paths. Fetch independent immutable on-store runs with bounded ordered concurrency, then assemble results in logical order. Preserve:
+
+- decoded-cache and raw-part-cache identities;
+- stale-location re-resolution and retry behavior;
+- extent crossing and nomination accounting;
+- exact zero-fill/EOF behavior;
+- one ranged GET for a contiguous single-segment run;
+- cancellation/error cleanup with no leaked permits or background tasks.
+
+The dedicated metrics owner records logical bytes, extent/run counts, unique segment
+count, on-store run count/bytes, active and peak run fetches, and total read duration.
+It uses no inode, path, object key, request ID, or error-string label. Cache-tier proof
+remains a benchmark receipt derived from isolated process/cache roots plus local-device
+and network counters; do not fabricate a RAM/SSD/remote label from unavailable cache
+internals.
+
+Do not change NFS framing, SFTP packet geometry, cache policy, write acknowledgement, durability, or object layout in this task. Further NFS copy/framing work requires a separate measured RED after this shared fix.
+
+- [ ] **Step 4: Run GREEN, parity, and exact-fence commit**
+
+```bash
+cd /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback/zerofs
+cargo_test_nonzero 'fs::store::extent::read::tests' -p zerofs --locked
+cargo_test_nonzero 'fs::ops::io::tests' -p zerofs --locked
+cargo_test_nonzero 'segment_store::tests' -p zerofs --locked
+cargo clippy -p zerofs --lib --locked -- -D warnings
+cargo fmt --all -- --check
+git diff --check
+git add zerofs/src/fs/store/extent/read.rs zerofs/src/fs/store/extent/read/tests.rs zerofs/src/fs/store/extent/read/metrics.rs
+git commit -m "perf(read): pipeline fragmented segment runs"
+```
+
+Expected: the fragmented RED proves peak backend concurrency greater than one; every bounded/error/order control is green; contiguous reads remain one GET; no protocol-specific behavior or durability semantics changed.
