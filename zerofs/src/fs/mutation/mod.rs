@@ -7,11 +7,13 @@
 //! quiescence gate, [`progress`] the gap-free materialization barrier,
 //! [`volatile_overlay`] the bounded RAM overlay runtime, [`overlay`]
 //! the filesystem-facing overlay manager, and [`materializer`] the
-//! ordered canonical apply workers.
+//! ordered canonical apply workers, and [`fence`] deadlock-safe
+//! conflict fences.
 
 pub(crate) mod ack;
 pub(crate) mod admission;
 pub(crate) mod config;
+pub(crate) mod fence;
 pub(crate) mod materializer;
 pub(crate) mod overlay;
 pub(crate) mod progress;

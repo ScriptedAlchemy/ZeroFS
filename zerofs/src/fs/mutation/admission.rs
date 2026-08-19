@@ -246,7 +246,8 @@ pub(crate) struct PreparationGate {
 struct GateState {
     active: HashMap<u64, ConflictScope>,
     next_id: u64,
-    closing: HashSet<ConflictKey>,
+    published_through: u64,
+    closing: HashMap<ConflictKey, usize>,
     terminal: Option<MutationError>,
 }
 
@@ -257,7 +258,8 @@ impl PreparationGate {
             state: Mutex::new(GateState {
                 active: HashMap::new(),
                 next_id: 1,
-                closing: HashSet::new(),
+                published_through: 0,
+                closing: HashMap::new(),
                 terminal: None,
             }),
             notify: Notify::new(),
@@ -282,16 +284,37 @@ impl PreparationGate {
         self.notify.notify_waiters();
     }
 
-    pub(crate) async fn close_scope(&self, scope: &ConflictScope) -> Result<(), MutationError> {
+    pub(crate) fn published_through(&self) -> u64 {
+        lock(&self.state).published_through
+    }
+
+    pub(crate) fn begin_close(&self, scope: &ConflictScope) -> Result<(), MutationError> {
+        let mut state = lock(&self.state);
+        if let Some(error) = &state.terminal {
+            return Err(error.clone());
+        }
+        for key in scope.keys() {
+            *state.closing.entry(key).or_insert(0) += 1;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn reopen_scope(&self, scope: &ConflictScope) {
         {
             let mut state = lock(&self.state);
-            if let Some(error) = &state.terminal {
-                return Err(error.clone());
-            }
             for key in scope.keys() {
-                state.closing.insert(key);
+                if let Some(count) = state.closing.get_mut(&key) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        state.closing.remove(&key);
+                    }
+                }
             }
         }
+        self.notify.notify_waiters();
+    }
+
+    pub(crate) async fn wait_closed(&self, scope: &ConflictScope) -> Result<(), MutationError> {
         loop {
             {
                 let state = lock(&self.state);
@@ -307,12 +330,25 @@ impl PreparationGate {
         }
     }
 
+    pub(crate) async fn close_scope(&self, scope: &ConflictScope) -> Result<(), MutationError> {
+        self.begin_close(scope)?;
+        self.wait_closed(scope).await
+    }
+
+    fn mark_published(&self, sequence: u64) {
+        let mut state = lock(&self.state);
+        state.published_through = state.published_through.max(sequence);
+    }
+
     fn register(&self, scope: ConflictScope) -> Result<u64, MutationError> {
         let mut state = lock(&self.state);
         if let Some(error) = &state.terminal {
             return Err(error.clone());
         }
-        if scope.keys().any(|key| state.closing.contains(&key)) {
+        if scope
+            .keys()
+            .any(|key| state.closing.get(&key).copied().unwrap_or(0) > 0)
+        {
             return Err(MutationError::Closed);
         }
         let id = state.next_id;
@@ -403,6 +439,7 @@ impl PreparationGuard {
             mutation_incarnation: self.gate.incarnation(),
             sequence: self.id,
         };
+        self.gate.mark_published(self.id);
         self.gate.unregister(self.id);
         Ok(AcceptedMutation {
             request: request.accept(),
