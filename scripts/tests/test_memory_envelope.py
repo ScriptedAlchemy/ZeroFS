@@ -241,6 +241,30 @@ class MemoryEnvelopeTests(unittest.TestCase):
         self.assertEqual(payload["samples"][-1]["oom"], 3)
         self.assertIn("OOM counters changed", payload["validation_errors"][-1])
 
+    def test_rejected_sample_can_never_be_rehabilitated_as_complete(self) -> None:
+        artifact = Path(self.temp.name) / "memory-envelope.json"
+        session = MemoryEnvelopeSession.start(
+            self.authority,
+            SystemctlRunner(),
+            self.metrics,  # type: ignore[arg-type]
+            self.scenario,
+        )
+        session.attach_artifact(artifact)
+        for phase in ("foreground_close", "fsync_or_commit", "local"):
+            session.sample(phase)
+        (self.cgroup / "memory.current").write_text(str((96 << 30) + 1))
+        with self.assertRaisesRegex(RuntimeError, "cgroup current ceiling"):
+            session.sample("remote")
+        (self.cgroup / "memory.current").write_text(str(1 << 30))
+
+        result = session.finish_after_cleanup(require_complete=False)
+
+        self.assertFalse(result.complete)
+        payload = json.loads(artifact.read_text(encoding="utf-8"))
+        self.assertEqual(payload["status"], "failed")
+        self.assertFalse(payload["result"]["complete"])
+        self.assertIn("cgroup current ceiling", payload["validation_errors"][-1])
+
 
 if __name__ == "__main__":
     unittest.main()

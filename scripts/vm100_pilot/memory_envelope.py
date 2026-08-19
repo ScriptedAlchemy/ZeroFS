@@ -105,6 +105,7 @@ class MemoryEnvelopeResult:
     cleanup_semantics: str
     complete: bool
     missing_phases: tuple[str, ...]
+    validation_errors: tuple[str, ...]
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -119,6 +120,7 @@ class MemoryEnvelopeResult:
             "cleanup_semantics": self.cleanup_semantics,
             "complete": self.complete,
             "missing_phases": list(self.missing_phases),
+            "validation_errors": list(self.validation_errors),
         }
 
 
@@ -273,7 +275,10 @@ class MemoryEnvelopeSession:
             "validation_errors": self._validation_errors,
         }
         if result is not None:
-            payload["status"] = "complete" if result.complete else "incomplete"
+            if self._validation_errors:
+                payload["status"] = "failed"
+            else:
+                payload["status"] = "complete" if result.complete else "incomplete"
             payload["result"] = result.to_dict()
         self._artifact.write_text(
             json.dumps(payload, indent=2, sort_keys=True) + "\n",
@@ -393,7 +398,12 @@ class MemoryEnvelopeSession:
     def _result(self) -> MemoryEnvelopeResult:
         phases = tuple(_phase_kind(sample.phase) for sample in self._samples)
         missing = tuple(phase for phase in self.scenario.phases if phase not in phases)
-        complete = not missing and phases[-1] == self.scenario.phases[-1]
+        complete = (
+            not self._validation_errors
+            and not missing
+            and bool(phases)
+            and phases[-1] == self.scenario.phases[-1]
+        )
         return MemoryEnvelopeResult(
             scenario=self.scenario.name,
             authority=self.authority,
@@ -405,11 +415,17 @@ class MemoryEnvelopeSession:
             cleanup_semantics="observer-owned-no-resources",
             complete=complete,
             missing_phases=missing,
+            validation_errors=tuple(self._validation_errors),
         )
 
     def finish(self) -> MemoryEnvelopeResult:
         result = self._result()
         self._persist(result)
+        if self._validation_errors:
+            raise RuntimeError(
+                "memory envelope validation failed: "
+                + "; ".join(self._validation_errors)
+            )
         if not result.complete:
             raise RuntimeError(
                 f"memory envelope missing phases: {list(result.missing_phases)}"
@@ -424,6 +440,11 @@ class MemoryEnvelopeSession:
             self._record(sample)
         result = self._result()
         self._persist(result)
+        if require_complete and self._validation_errors:
+            raise RuntimeError(
+                "memory envelope validation failed: "
+                + "; ".join(self._validation_errors)
+            )
         if require_complete and not result.complete:
             raise RuntimeError(
                 f"memory envelope missing phases: {list(result.missing_phases)}"

@@ -2,12 +2,70 @@ from __future__ import annotations
 
 import time
 import urllib.request
+import re
 from dataclasses import asdict, dataclass
 from typing import Callable
 
 
 class TerminalWritebackError(RuntimeError):
     pass
+
+
+_AUTHORITY_METRIC = "zerofs_benchmark_authority_info"
+_AUTHORITY_LABEL = re.compile(r'([a-z_]+)="([A-Za-z0-9._:/-]+)"\Z')
+
+
+@dataclass(frozen=True, slots=True)
+class MetricsAuthorityIdentity:
+    server_instance_id: str
+    filesystem_id: str
+    export_id: str
+
+    def __post_init__(self) -> None:
+        for name, value in asdict(self).items():
+            if not value or not re.fullmatch(r"[A-Za-z0-9._:/-]+", value):
+                raise ValueError(f"invalid metrics authority {name}: {value!r}")
+
+    @classmethod
+    def parse(cls, text: str) -> "MetricsAuthorityIdentity":
+        matches: list[MetricsAuthorityIdentity] = []
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line.startswith(f"{_AUTHORITY_METRIC}{{"):
+                continue
+            series, separator, value = line.rpartition(" ")
+            if not separator or value != "1":
+                raise ValueError(
+                    f"invalid {_AUTHORITY_METRIC} sample: {line}"
+                )
+            prefix = f"{_AUTHORITY_METRIC}{{"
+            if not series.endswith("}"):
+                raise ValueError(f"invalid {_AUTHORITY_METRIC} series: {series}")
+            labels: dict[str, str] = {}
+            for token in series[len(prefix) : -1].split(","):
+                match = _AUTHORITY_LABEL.fullmatch(token)
+                if match is None or match.group(1) in labels:
+                    raise ValueError(
+                        f"invalid {_AUTHORITY_METRIC} label: {token!r}"
+                    )
+                labels[match.group(1)] = match.group(2)
+            expected = {"server_instance_id", "filesystem_id", "export_id"}
+            if set(labels) != expected:
+                raise ValueError(
+                    f"invalid {_AUTHORITY_METRIC} labels: {sorted(labels)}"
+                )
+            matches.append(
+                cls(
+                    labels["server_instance_id"],
+                    labels["filesystem_id"],
+                    labels["export_id"],
+                )
+            )
+        if len(matches) != 1:
+            raise ValueError(
+                f"expected exactly one {_AUTHORITY_METRIC} sample, found {len(matches)}"
+            )
+        return matches[0]
 
 
 _METRICS = {
@@ -100,10 +158,15 @@ class MetricsClient:
         self.url = url
         self.timeout = timeout
 
-    def snapshot(self) -> WritebackSnapshot:
+    def _fetch(self) -> str:
         with urllib.request.urlopen(self.url, timeout=self.timeout) as response:
-            text = response.read().decode("utf-8")
-        return WritebackSnapshot.parse(text)
+            return response.read().decode("utf-8")
+
+    def snapshot(self) -> WritebackSnapshot:
+        return WritebackSnapshot.parse(self._fetch())
+
+    def identity(self) -> MetricsAuthorityIdentity:
+        return MetricsAuthorityIdentity.parse(self._fetch())
 
 
 def wait_for_gc_quiescence(

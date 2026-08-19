@@ -11,7 +11,7 @@ from typing import Mapping, Sequence
 from unittest import mock
 
 from scripts.vm100_pilot.config import PilotConfig
-from scripts.vm100_pilot.metrics import WritebackSnapshot
+from scripts.vm100_pilot.metrics import MetricsAuthorityIdentity, WritebackSnapshot
 from scripts.vm100_pilot.protocol_matrix import (
     ProtocolAuthority,
     ProtocolMatrixRunner,
@@ -42,24 +42,43 @@ class AuthorityRunner(Runner):
 
 
 class SnapshotSource:
-    def __init__(self, snapshots: list[WritebackSnapshot]) -> None:
+    def __init__(
+        self,
+        snapshots: list[WritebackSnapshot],
+        identity: MetricsAuthorityIdentity,
+    ) -> None:
         self.snapshots = snapshots
         self.index = 0
+        self.authority_identity = identity
 
     def snapshot(self) -> WritebackSnapshot:
         index = min(self.index, len(self.snapshots) - 1)
         self.index += 1
         return self.snapshots[index]
 
+    def identity(self) -> MetricsAuthorityIdentity:
+        return self.authority_identity
+
 
 class Lifecycle:
-    def __init__(self, snapshots: list[WritebackSnapshot]) -> None:
-        self.metrics = SnapshotSource(snapshots)
+    def __init__(
+        self,
+        snapshots: list[WritebackSnapshot],
+        identity: MetricsAuthorityIdentity | None = None,
+    ) -> None:
+        self.metrics = SnapshotSource(
+            snapshots,
+            identity
+            or MetricsAuthorityIdentity("instance-a", "filesystem-a", "nfs-root"),
+        )
         self.drain_calls = 0
         self.metrics_endpoint = "http://10.10.10.55:9567/metrics"
 
     def status(self) -> dict[str, object]:
         return {"healthy": True}
+
+    def identity(self) -> MetricsAuthorityIdentity:
+        return self.metrics.identity()
 
     def drain(self, timeout: float | None = None) -> dict[str, object]:
         del timeout
@@ -78,12 +97,45 @@ class ProtocolAuthorityTests(unittest.TestCase):
         with self.assertRaisesRegex(ScenarioUnavailableError, "NFS.*unavailable"):
             ProtocolAuthority.from_mapping("nfs", {})
 
+    def test_metrics_identity_is_required_and_must_match_exactly(self) -> None:
+        values = {
+            "ZEROFS_BENCH_NFS_MOUNTPOINT": str(self.root),
+            "ZEROFS_BENCH_NFS_ENDPOINT": "10.10.10.55:/",
+            "ZEROFS_BENCH_NFS_MOUNT_OPTIONS": "rw,hard,vers=3",
+            "ZEROFS_BENCH_NFS_METRICS_URL": "http://10.10.10.55:9567/metrics",
+        }
+        with self.assertRaisesRegex(ScenarioUnavailableError, "METRICS_INSTANCE_ID"):
+            ProtocolAuthority.from_mapping("nfs", values)
+
+        values |= {
+            "ZEROFS_BENCH_NFS_METRICS_INSTANCE_ID": "instance-a",
+            "ZEROFS_BENCH_NFS_METRICS_FILESYSTEM_ID": "filesystem-a",
+            "ZEROFS_BENCH_NFS_METRICS_EXPORT_ID": "nfs-root",
+        }
+        authority = ProtocolAuthority.from_mapping("nfs", values)
+        self.assertEqual(
+            authority.metrics_identity,
+            MetricsAuthorityIdentity("instance-a", "filesystem-a", "nfs-root"),
+        )
+
+    def test_metrics_identity_requires_one_exact_server_emitted_series(self) -> None:
+        identity = MetricsAuthorityIdentity.parse(
+            'zerofs_benchmark_authority_info{export_id="nfs-root",'
+            'filesystem_id="filesystem-a",server_instance_id="instance-a"} 1\n'
+        )
+        self.assertEqual(identity.server_instance_id, "instance-a")
+        with self.assertRaisesRegex(ValueError, "exactly one"):
+            MetricsAuthorityIdentity.parse("zerofs_writeback_accepted_sequence 3\n")
+
     def test_nfs_authority_rejects_mutable_host_aliases(self) -> None:
         values = {
             "ZEROFS_BENCH_NFS_MOUNTPOINT": str(self.root),
             "ZEROFS_BENCH_NFS_ENDPOINT": "zerofs.internal:/",
             "ZEROFS_BENCH_NFS_MOUNT_OPTIONS": "rw,hard,vers=3",
             "ZEROFS_BENCH_NFS_METRICS_URL": "http://10.10.10.55:9567/metrics",
+            "ZEROFS_BENCH_NFS_METRICS_INSTANCE_ID": "instance-a",
+            "ZEROFS_BENCH_NFS_METRICS_FILESYSTEM_ID": "filesystem-a",
+            "ZEROFS_BENCH_NFS_METRICS_EXPORT_ID": "nfs-root",
         }
 
         with self.assertRaisesRegex(ValueError, "literal IP"):
@@ -97,6 +149,9 @@ class ProtocolAuthorityTests(unittest.TestCase):
                 "ZEROFS_BENCH_NFS_ENDPOINT": "10.10.10.55:/",
                 "ZEROFS_BENCH_NFS_MOUNT_OPTIONS": "rw,hard,vers=3",
                 "ZEROFS_BENCH_NFS_METRICS_URL": "http://10.10.10.55:9567/metrics",
+                "ZEROFS_BENCH_NFS_METRICS_INSTANCE_ID": "instance-a",
+                "ZEROFS_BENCH_NFS_METRICS_FILESYSTEM_ID": "filesystem-a",
+                "ZEROFS_BENCH_NFS_METRICS_EXPORT_ID": "nfs-root",
             },
         )
         runner = AuthorityRunner(
@@ -144,6 +199,9 @@ class ProtocolAuthorityTests(unittest.TestCase):
                     "ZEROFS_BENCH_NFS_METRICS_URL": (
                         "http://10.10.10.99:9567/metrics"
                     ),
+                    "ZEROFS_BENCH_NFS_METRICS_INSTANCE_ID": "instance-a",
+                    "ZEROFS_BENCH_NFS_METRICS_FILESYSTEM_ID": "filesystem-a",
+                    "ZEROFS_BENCH_NFS_METRICS_EXPORT_ID": "nfs-root",
                 },
             )
 
@@ -185,6 +243,9 @@ class ProtocolMatrixTests(unittest.TestCase):
                 "ZEROFS_BENCH_NFS_ENDPOINT": "10.10.10.55:/",
                 "ZEROFS_BENCH_NFS_MOUNT_OPTIONS": "rw,hard,vers=3",
                 "ZEROFS_BENCH_NFS_METRICS_URL": "http://10.10.10.55:9567/metrics",
+                "ZEROFS_BENCH_NFS_METRICS_INSTANCE_ID": "instance-a",
+                "ZEROFS_BENCH_NFS_METRICS_FILESYSTEM_ID": "filesystem-a",
+                "ZEROFS_BENCH_NFS_METRICS_EXPORT_ID": "nfs-root",
             },
         )
         findmnt = AuthorityRunner(
@@ -253,6 +314,9 @@ class ProtocolMatrixTests(unittest.TestCase):
                 "ZEROFS_BENCH_NFS_ENDPOINT": "10.10.10.55:/",
                 "ZEROFS_BENCH_NFS_MOUNT_OPTIONS": "rw,hard,vers=3",
                 "ZEROFS_BENCH_NFS_METRICS_URL": "http://10.10.10.55:9567/metrics",
+                "ZEROFS_BENCH_NFS_METRICS_INSTANCE_ID": "instance-a",
+                "ZEROFS_BENCH_NFS_METRICS_FILESYSTEM_ID": "filesystem-a",
+                "ZEROFS_BENCH_NFS_METRICS_EXPORT_ID": "nfs-root",
             },
         )
         findmnt = AuthorityRunner(
@@ -287,6 +351,45 @@ class ProtocolMatrixTests(unittest.TestCase):
             with self.assertRaisesRegex(OSError, "injected scratch mkdir failure"):
                 runner.run(scenario, authority)
 
+        self.assertEqual(list(self.protocol_root.iterdir()), [])
+
+    def test_same_host_wrong_metrics_identity_fails_before_writes(self) -> None:
+        scenario = ProtocolScenario(
+            "protocol-matrix-nfs-test",
+            "nfs",
+            "small real transfer",
+            (WorkloadDefinition("small", 4096, "test-pattern"),),
+        )
+        authority = ProtocolAuthority.from_mapping(
+            "nfs",
+            {
+                "ZEROFS_BENCH_NFS_MOUNTPOINT": str(self.protocol_root),
+                "ZEROFS_BENCH_NFS_ENDPOINT": "10.10.10.55:/",
+                "ZEROFS_BENCH_NFS_MOUNT_OPTIONS": "rw,hard,vers=3",
+                "ZEROFS_BENCH_NFS_METRICS_URL": "http://10.10.10.55:9567/metrics",
+                "ZEROFS_BENCH_NFS_METRICS_INSTANCE_ID": "instance-a",
+                "ZEROFS_BENCH_NFS_METRICS_FILESYSTEM_ID": "filesystem-a",
+                "ZEROFS_BENCH_NFS_METRICS_EXPORT_ID": "nfs-root",
+            },
+        )
+        findmnt = AuthorityRunner(
+            {"filesystems": [{
+                "target": str(self.protocol_root),
+                "source": "10.10.10.55:/",
+                "fstype": "nfs",
+                "options": "rw,hard,vers=3",
+            }]}
+        )
+        before = WritebackSnapshot(10, 10, 10, 0, 0, 100, 100, False)
+        observer = Lifecycle(
+            [before],
+            MetricsAuthorityIdentity("wrong-instance", "filesystem-a", "nfs-root"),
+        )
+
+        with self.assertRaisesRegex(ScenarioUnavailableError, "identity mismatch"):
+            ProtocolMatrixRunner(
+                self.config, findmnt, observer  # type: ignore[arg-type]
+            ).run(scenario, authority)
         self.assertEqual(list(self.protocol_root.iterdir()), [])
 
 

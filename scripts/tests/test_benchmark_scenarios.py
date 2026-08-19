@@ -57,9 +57,12 @@ class ScenarioRegistryTests(unittest.TestCase):
                 (
                     "mountpoint",
                     "endpoint",
-                    "mount_options",
-                    "metrics_endpoint",
-                ),
+                "mount_options",
+                "metrics_endpoint",
+                "metrics_server_instance_id",
+                "metrics_filesystem_id",
+                "metrics_export_id",
+            ),
             )
             self.assertEqual(
                 scenario.cutoffs,

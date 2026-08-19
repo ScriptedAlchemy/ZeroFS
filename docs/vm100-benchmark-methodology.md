@@ -50,13 +50,13 @@ error; the harness does not silently benchmark a local directory.
 
 ## NFS and 9P authority
 
-Each protocol needs all four values below. Values are read only for the chosen
-protocol.
+Each protocol needs the mount values plus a server-emitted metrics identity.
+Values are read only for the chosen protocol.
 
-| Protocol | Mountpoint | Endpoint/source | Required options | Metrics authority |
+| Protocol | Mountpoint | Endpoint/source | Required options | Metrics URL and identity prefix |
 | --- | --- | --- | --- | --- |
-| NFS | `ZEROFS_BENCH_NFS_MOUNTPOINT` | `ZEROFS_BENCH_NFS_ENDPOINT` | `ZEROFS_BENCH_NFS_MOUNT_OPTIONS` | `ZEROFS_BENCH_NFS_METRICS_URL` |
-| 9P | `ZEROFS_BENCH_9P_MOUNTPOINT` | `ZEROFS_BENCH_9P_ENDPOINT` | `ZEROFS_BENCH_9P_MOUNT_OPTIONS` | `ZEROFS_BENCH_9P_METRICS_URL` |
+| NFS | `ZEROFS_BENCH_NFS_MOUNTPOINT` | `ZEROFS_BENCH_NFS_ENDPOINT` | `ZEROFS_BENCH_NFS_MOUNT_OPTIONS` | `ZEROFS_BENCH_NFS_METRICS_*` |
+| 9P | `ZEROFS_BENCH_9P_MOUNTPOINT` | `ZEROFS_BENCH_9P_ENDPOINT` | `ZEROFS_BENCH_9P_MOUNT_OPTIONS` | `ZEROFS_BENCH_9P_METRICS_*` |
 
 The NFS endpoint must contain a literal IP, for example `192.0.2.10:/test`.
 A mutable SSH or shell alias is not host authority. The endpoint must match
@@ -65,8 +65,19 @@ mounted options. Use the exact 9P source reported by `findmnt`; a missing 9P
 mount is an honest unavailable result, not permission to create a local
 substitute. NFS metrics must use the same literal server IP as the mount source.
 The supported 9P scenario is explicitly local and therefore requires a loopback
-metrics URL. This prevents unrelated metrics from being attributed to mounted
-I/O.
+metrics URL. Address equality is not enough to attribute durability evidence.
+The harness also requires an exact match between three configured identity
+values and exactly one server-emitted series:
+
+```text
+zerofs_benchmark_authority_info{server_instance_id="...",filesystem_id="...",export_id="..."} 1
+```
+
+For each protocol prefix, set `METRICS_INSTANCE_ID`, `METRICS_FILESYSTEM_ID`,
+and `METRICS_EXPORT_ID` to those immutable server values. A same-host listener
+with a different identity is rejected before any test path is created. A server
+build that does not export this identity is honestly unavailable; host/port
+equality alone is never durability authority.
 
 Example against deliberately prepared test mounts:
 
@@ -75,12 +86,18 @@ ZEROFS_BENCH_NFS_MOUNTPOINT=/mnt/zerofs-test-nfs \
 ZEROFS_BENCH_NFS_ENDPOINT=192.0.2.10:/test \
 ZEROFS_BENCH_NFS_MOUNT_OPTIONS=rw,hard,vers=3,proto=tcp \
 ZEROFS_BENCH_NFS_METRICS_URL=http://192.0.2.10:9567/metrics \
+ZEROFS_BENCH_NFS_METRICS_INSTANCE_ID=instance-uuid \
+ZEROFS_BENCH_NFS_METRICS_FILESYSTEM_ID=filesystem-uuid \
+ZEROFS_BENCH_NFS_METRICS_EXPORT_ID=nfs-test-root \
 python3 scripts/vm100-pilot.py protocol-matrix --protocol nfs
 
 ZEROFS_BENCH_9P_MOUNTPOINT=/mnt/zerofs-test-9p \
 ZEROFS_BENCH_9P_ENDPOINT=zerofs-test \
 ZEROFS_BENCH_9P_MOUNT_OPTIONS=rw,trans=unix,access=client \
 ZEROFS_BENCH_9P_METRICS_URL=http://127.0.0.1:9567/metrics \
+ZEROFS_BENCH_9P_METRICS_INSTANCE_ID=instance-uuid \
+ZEROFS_BENCH_9P_METRICS_FILESYSTEM_ID=filesystem-uuid \
+ZEROFS_BENCH_9P_METRICS_EXPORT_ID=9p-test-root \
 python3 scripts/vm100-pilot.py protocol-matrix --protocol 9p
 ```
 
@@ -186,9 +203,11 @@ python3 scripts/vm100-pilot.py raw-sftp \
   --hpn-ssh /opt/zerofs/hpn/bin/hpnssh
 ```
 
-The HPN executable must identify itself as an HPN build. Stock and HPN paths and
-SHA-256 values must be distinct. Receipts record each absolute path, `ssh -V`
-output, and executable SHA-256.
+The HPN executable must identify itself as an HPN build, and the stock
+executable must not report HPN provenance. Stock and HPN paths and SHA-256
+values must be distinct. Receipts record each absolute path, `ssh -V` output,
+and executable SHA-256. Two distinct HPN binaries cannot be mislabeled as a
+stock-versus-HPN comparison.
 
 The immutable registered scenario supplies four jobs, 128 MiB per job, four
 ABBA repetitions, a 1 MiB SFTP buffer, and request depth 128. The CLI does not
@@ -211,6 +230,11 @@ downloads are not accepted as integrity evidence. Each remote UUID directory is
 cleaned twice and probed for absence. The local UUID scratch path is also cleaned
 twice and asserted absent. Cleanup failure makes the command fail, while the
 original transfer error remains primary.
+
+Metadata batches have a bounded 60-second-or-configured-stop deadline. Parallel
+transfer phases have a bounded 900-second-or-configured-drain deadline. A
+deadline terminates every spawned process group, preserves the failed receipt,
+runs both cleanup scopes, and restores the stopped pilot stack.
 
 The raw control stops and restores only the separately configured legacy pilot
 stack to avoid account-session contention. It must not be configured against a

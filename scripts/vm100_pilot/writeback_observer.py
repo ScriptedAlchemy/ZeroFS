@@ -3,11 +3,18 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import Protocol
 
-from .metrics import DrainReceipt, WritebackSnapshot, wait_for_drain
+from .metrics import (
+    DrainReceipt,
+    MetricsAuthorityIdentity,
+    WritebackSnapshot,
+    wait_for_drain,
+)
 
 
 class SnapshotSource(Protocol):
     def snapshot(self) -> WritebackSnapshot: ...
+
+    def identity(self) -> MetricsAuthorityIdentity: ...
 
 
 @dataclass(slots=True)
@@ -27,6 +34,9 @@ class WritebackObserver:
             "metrics": snapshot.to_dict(),
             "terminal": False,
         }
+
+    def identity(self) -> MetricsAuthorityIdentity:
+        return self.metrics.identity()
 
     def drain(self, timeout: float | None = None) -> dict[str, object]:
         receipt: DrainReceipt = wait_for_drain(

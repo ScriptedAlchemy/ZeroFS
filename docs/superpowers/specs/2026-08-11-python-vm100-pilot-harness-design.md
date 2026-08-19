@@ -83,7 +83,8 @@ A `finally` block always stops collectors, generates the text call-graph report,
 
 ### Raw SFTP control
 
-The control requires explicit stock and HPN SSH executable paths, records each
+The control requires explicit stock and HPN SSH executable paths, rejects a
+stock executable that reports HPN provenance, records each
 absolute path, version, and SHA-256, and uses the selected executable through
 OpenSSH SFTP's `-S` option. It stops the isolated pilot ZeroFS service to avoid
 account-session contention, creates four 128 MiB incompressible files, and runs
@@ -93,7 +94,9 @@ SHA-256 checked against the shared sources. Receipts distinguish each SFTP
 process's close acknowledgement from remote durability, which this control does
 not measure. UUID-owned remote and local artifacts are cleaned twice, asserted
 absent, and the canonical stack is restored in `finally`. Worker failures do
-not strand siblings.
+not strand siblings. Metadata commands and parallel transfer phases have fixed
+upper deadlines; expiry terminates all owned process groups before cleanup and
+stack restoration.
 
 ### Real workloads
 

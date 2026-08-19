@@ -8,7 +8,7 @@ import tomllib
 import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
-from subprocess import CompletedProcess
+from subprocess import PIPE, CompletedProcess, TimeoutExpired
 from typing import IO
 from urllib.parse import unquote, urlsplit
 
@@ -16,7 +16,7 @@ from .config import PilotConfig
 from .lifecycle import PilotLifecycle
 from .owned_resources import present, remove_tree
 from .receipts import RunReceipt
-from .runner import ManagedProcess, Runner
+from .runner import CommandError, ManagedProcess, Runner
 from .scenarios import RawSftpScenario
 from .system_io import file_sha256
 
@@ -335,6 +335,18 @@ class RawSftpRunner:
         self.config = config
         self.runner = runner
         self.lifecycle = lifecycle
+        drain_timeout = config.drain_timeout
+        stop_timeout = config.stop_timeout
+        self.phase_timeout = (
+            min(float(drain_timeout), 900.0)
+            if isinstance(drain_timeout, (int, float))
+            else 900.0
+        )
+        self.command_timeout = (
+            min(float(stop_timeout), 60.0)
+            if isinstance(stop_timeout, (int, float))
+            else 60.0
+        )
 
     def _identify_binaries(
         self,
@@ -345,6 +357,10 @@ class RawSftpRunner:
         hpn = identify_ssh_binary(hpn_ssh, self.runner)
         if stock.path == hpn.path or stock.sha256 == hpn.sha256:
             raise ValueError("stock and HPN controls must use distinct SSH binaries")
+        if "hpn" in stock.version.lower():
+            raise ValueError(
+                f"stock SSH control reports HPN provenance: {stock.version!r}"
+            )
         if "hpn" not in hpn.version.lower():
             raise ValueError(
                 f"HPN control binary does not report an HPN version: {hpn.version!r}"
@@ -497,17 +513,41 @@ class RawSftpRunner:
         request_depth: int,
         check: bool = True,
     ) -> CompletedProcess[str]:
-        return self.runner.run(
-            self._command(
+        command = self._command(
                 endpoint,
                 batch,
                 ssh_binary,
                 buffer_bytes=buffer_bytes,
                 request_depth=request_depth,
-            ),
+            )
+        managed = self.runner.spawn(
+            command,
             sudo=True,
-            check=check,
+            stdout=PIPE,
+            stderr=PIPE,
         )
+        try:
+            stdout, stderr = managed.process.communicate(timeout=self.command_timeout)
+        except TimeoutExpired as error:
+            managed.terminate()
+            managed.process.communicate()
+            raise TimeoutError(
+                f"raw SFTP command exceeded {self.command_timeout}s deadline: "
+                f"{' '.join(managed.argv)}"
+            ) from error
+        except BaseException:
+            managed.terminate()
+            managed.process.communicate()
+            raise
+        completed = CompletedProcess(
+            managed.argv,
+            managed.process.returncode,
+            stdout or "",
+            stderr or "",
+        )
+        if check and completed.returncode:
+            raise CommandError(managed.argv, completed.returncode, completed.stderr)
+        return completed
 
     def _parallel_batches(
         self,
@@ -524,6 +564,7 @@ class RawSftpRunner:
         finished: dict[int, tuple[int, int]] = {}
         failure: BaseException | None = None
         phase_started = time.monotonic_ns()
+        deadline = time.monotonic() + self.phase_timeout
         try:
             for index, (batch, log) in enumerate(zip(batches, logs, strict=True)):
                 handle = log.open("w", encoding="utf-8")
@@ -561,14 +602,28 @@ class RawSftpRunner:
                         )
                 if failure is not None:
                     break
+                if time.monotonic() >= deadline:
+                    failure = TimeoutError(
+                        f"raw SFTP phase exceeded {self.phase_timeout}s deadline"
+                    )
+                    break
                 if pending:
                     time.sleep(0.01)
         finally:
+            termination_errors: list[BaseException] = []
             for _, process, _, _ in processes:
                 if process.process.poll() is None:
-                    process.terminate()
+                    try:
+                        process.terminate()
+                    except BaseException as error:
+                        termination_errors.append(error)
             for _, _, handle, _ in processes:
                 handle.close()
+            if termination_errors and failure is None:
+                failure = RuntimeError(
+                    "raw SFTP process-group termination failed: "
+                    + "; ".join(str(error) for error in termination_errors)
+                )
         if failure is not None:
             raise failure
         if len(finished) != len(batches):

@@ -13,6 +13,7 @@ from urllib.parse import urlsplit
 from .config import PilotConfig
 from .memory_envelope import MemoryEnvelopeSession
 from .metrics import (
+    MetricsAuthorityIdentity,
     WritebackSnapshot,
     wait_for_accepted_after,
     wait_for_local,
@@ -56,6 +57,7 @@ class ProtocolAuthority:
     endpoint: str
     mount_options: tuple[str, ...]
     metrics_url: str
+    metrics_identity: MetricsAuthorityIdentity
 
     @classmethod
     def from_mapping(
@@ -70,12 +72,29 @@ class ProtocolAuthority:
         endpoint = values.get(f"{prefix}_ENDPOINT", "").strip()
         options = values.get(f"{prefix}_MOUNT_OPTIONS", "").strip()
         metrics_url = values.get(f"{prefix}_METRICS_URL", "").strip()
-        if not mountpoint or not endpoint or not options or not metrics_url:
+        identity_values = {
+            "server_instance_id": values.get(
+                f"{prefix}_METRICS_INSTANCE_ID", ""
+            ).strip(),
+            "filesystem_id": values.get(
+                f"{prefix}_METRICS_FILESYSTEM_ID", ""
+            ).strip(),
+            "export_id": values.get(f"{prefix}_METRICS_EXPORT_ID", "").strip(),
+        }
+        if (
+            not mountpoint
+            or not endpoint
+            or not options
+            or not metrics_url
+            or not all(identity_values.values())
+        ):
             label = "NFS" if protocol == "nfs" else "9P"
             raise ScenarioUnavailableError(
                 f"{label} benchmark unavailable: set {prefix}_MOUNTPOINT, "
                 f"{prefix}_ENDPOINT, {prefix}_MOUNT_OPTIONS, and "
-                f"{prefix}_METRICS_URL explicitly"
+                f"{prefix}_METRICS_URL, {prefix}_METRICS_INSTANCE_ID, "
+                f"{prefix}_METRICS_FILESYSTEM_ID, and "
+                f"{prefix}_METRICS_EXPORT_ID explicitly"
             )
         root = Path(mountpoint)
         if not root.is_absolute():
@@ -108,6 +127,7 @@ class ProtocolAuthority:
             endpoint=endpoint,
             mount_options=_options(options),
             metrics_url=metrics_url,
+            metrics_identity=MetricsAuthorityIdentity(**identity_values),
         )
 
     def verify(self, runner: Runner) -> dict[str, object]:
@@ -166,6 +186,7 @@ class ProtocolAuthority:
             "options": list(mounted_options),
             "required_options": list(self.mount_options),
             "metrics_url": self.metrics_url,
+            "metrics_identity": asdict(self.metrics_identity),
         }
 
     def require_run_root(self, path: Path) -> Path:
@@ -454,6 +475,7 @@ class ProtocolMatrixRunner:
                     "endpoint": authority.endpoint,
                     "mount_options": list(authority.mount_options),
                     "metrics_url": authority.metrics_url,
+                    "metrics_identity": asdict(authority.metrics_identity),
                 },
             )
             receipt.record(
@@ -470,6 +492,20 @@ class ProtocolMatrixRunner:
                     )
                     if not self.memory_session.samples:
                         self.memory_session.begin()
+                try:
+                    observed_identity = self.observer.identity()
+                except (ValueError, OSError) as error:
+                    raise ScenarioUnavailableError(
+                        "ZeroFS metrics endpoint does not expose one immutable "
+                        "benchmark authority identity"
+                    ) from error
+                if observed_identity != authority.metrics_identity:
+                    raise ScenarioUnavailableError(
+                        "ZeroFS metrics identity mismatch: "
+                        f"expected={asdict(authority.metrics_identity)}, "
+                        f"actual={asdict(observed_identity)}"
+                    )
+                receipt.record("metrics_identity", asdict(observed_identity))
                 observer_status = self.observer.status()
                 receipt.record("writeback_observer", observer_status)
                 self.observer.drain()

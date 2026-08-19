@@ -6,6 +6,7 @@ import io
 import json
 import shlex
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stderr
 from dataclasses import replace
@@ -67,6 +68,113 @@ class RawSftpAbTests(unittest.TestCase):
         binary.write_text("content", encoding="utf-8")
         with self.assertRaisesRegex(ValueError, "executable"):
             identify_ssh_binary(binary, Runner(base_env={}))
+
+    def test_stock_and_hpn_controls_must_report_distinct_provenance(self) -> None:
+        raw = object.__new__(RawSftpRunner)
+        raw.runner = mock_runner = unittest.mock.Mock()
+        mock_runner.run.side_effect = [
+            CompletedProcess(("ssh-a", "-V"), 0, "", "OpenSSH_9.9 HPN-SSH\n"),
+            CompletedProcess(("ssh-b", "-V"), 0, "", "OpenSSH_9.9 HPN-SSH\n"),
+        ]
+        first = Path(self.temp.name) / "ssh-a"
+        second = Path(self.temp.name) / "ssh-b"
+        for path, content in ((first, "a"), (second, "b")):
+            path.write_text(content, encoding="utf-8")
+            path.chmod(0o700)
+
+        with self.assertRaisesRegex(ValueError, "stock.*HPN"):
+            raw._identify_binaries(first, second)
+
+    def test_parallel_phase_deadline_terminates_every_process_group(self) -> None:
+        class NeverProcess:
+            def __init__(self) -> None:
+                self.process = self
+                self.argv = ("sftp",)
+                self.terminated = False
+
+            def poll(self) -> None:
+                return None
+
+            def terminate(self, timeout: float = 10.0) -> None:
+                del timeout
+                self.terminated = True
+
+        class SpawnRunner:
+            def __init__(self) -> None:
+                self.processes: list[NeverProcess] = []
+
+            def spawn(self, *args: object, **kwargs: object) -> NeverProcess:
+                del args, kwargs
+                process = NeverProcess()
+                self.processes.append(process)
+                return process
+
+        raw = object.__new__(RawSftpRunner)
+        raw.runner = runner = SpawnRunner()
+        raw.phase_timeout = 0.01
+        scratch = Path(self.temp.name)
+        batches = [scratch / "a.batch", scratch / "b.batch"]
+        logs = [scratch / "a.log", scratch / "b.log"]
+        for batch in batches:
+            batch.write_text("quit\n", encoding="utf-8")
+        endpoint = SftpEndpoint(
+            "alice", "203.0.113.10", 22, Path("/key"), Path("/known"), "/"
+        )
+
+        started = time.monotonic()
+        with self.assertRaisesRegex(TimeoutError, "deadline"):
+            raw._parallel_batches(
+                endpoint,
+                batches,
+                logs,
+                Path("/ssh"),
+                buffer_bytes=1_048_576,
+                request_depth=128,
+                bytes_per_session=1,
+            )
+
+        self.assertLess(time.monotonic() - started, 1)
+        self.assertTrue(runner.processes)
+        self.assertTrue(all(process.terminated for process in runner.processes))
+
+    def test_metadata_deadline_terminates_its_process_group(self) -> None:
+        class NeverCommand:
+            def __init__(self) -> None:
+                self.process = self
+                self.argv = ("sudo", "sftp")
+                self.returncode = -15
+                self.terminated = False
+                self.communicate_calls = 0
+
+            def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+                self.communicate_calls += 1
+                if timeout is not None:
+                    from subprocess import TimeoutExpired
+
+                    raise TimeoutExpired(self.argv, timeout)
+                return "", ""
+
+            def terminate(self, timeout: float = 10.0) -> None:
+                del timeout
+                self.terminated = True
+
+        process = NeverCommand()
+        runner = unittest.mock.Mock()
+        runner.spawn.return_value = process
+        raw = object.__new__(RawSftpRunner)
+        raw.runner = runner
+        raw.command_timeout = 0.01
+        batch = Path(self.temp.name) / "batch"
+        batch.write_text("stat /\n", encoding="utf-8")
+        endpoint = SftpEndpoint(
+            "alice", "203.0.113.10", 22, Path("/key"), Path("/known"), "/"
+        )
+
+        with self.assertRaisesRegex(TimeoutError, "deadline"):
+            raw._run_batch(endpoint, batch, Path("/ssh"), buffer_bytes=1, request_depth=1)
+
+        self.assertTrue(process.terminated)
+        self.assertEqual(process.communicate_calls, 2)
 
     def test_counterbalanced_order_repeats_each_variant_equally(self) -> None:
         self.assertEqual(
@@ -237,6 +345,7 @@ class RawSftpAbTests(unittest.TestCase):
                 self.remote_dirs: set[str] = {"/prefix"}
                 self.remote_files: dict[str, bytes] = {}
                 self.fail_create_ambiguously = False
+                self.fail_transfer = False
 
             def _identify_binaries(
                 self, stock_ssh: Path, hpn_ssh: Path
@@ -319,6 +428,8 @@ class RawSftpAbTests(unittest.TestCase):
                 bytes_per_session: int,
             ) -> SftpPhaseResult:
                 del endpoint, logs, ssh_binary, buffer_bytes, request_depth
+                if self.fail_transfer:
+                    raise TimeoutError("injected transfer deadline")
                 for batch in batches:
                     command = shlex.split(batch.read_text(encoding="utf-8"))
                     if command[0] == "put":
@@ -392,6 +503,32 @@ class RawSftpAbTests(unittest.TestCase):
                 hpn_ssh=Path("/hpn/ssh"),
             )
         self.assertEqual(failed.remote_dirs, {"/prefix"})
+        self.assertEqual(failed_lifecycle.start_calls, 1)
+
+        timeout_lifecycle = Lifecycle()
+        timeout_config = replace(
+            config,
+            result_dir=Path(self.temp.name) / "timeout-results",
+        )
+        timed_out = InMemoryRaw(
+            timeout_config,
+            Runner(base_env={}),
+            timeout_lifecycle,  # type: ignore[arg-type]
+        )
+        timed_out.fail_transfer = True
+        with self.assertRaisesRegex(TimeoutError, "transfer deadline"):
+            timed_out.run(
+                scenario,
+                stock_ssh=Path("/stock/ssh"),
+                hpn_ssh=Path("/hpn/ssh"),
+            )
+        self.assertEqual(timeout_lifecycle.start_calls, 1)
+        manifests = list(timeout_config.result_dir.glob("*/manifest.json"))
+        self.assertEqual(len(manifests), 1)
+        self.assertEqual(
+            json.loads(manifests[0].read_text(encoding="utf-8"))["status"],
+            "failed",
+        )
 
 
 if __name__ == "__main__":

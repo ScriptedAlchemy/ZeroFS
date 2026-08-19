@@ -43,6 +43,9 @@ _PROTOCOL_AUTHORITY = (
     "endpoint",
     "mount_options",
     "metrics_endpoint",
+    "metrics_server_instance_id",
+    "metrics_filesystem_id",
+    "metrics_export_id",
 )
 _PROTOCOL_CUTOFFS = (
     "foreground_close",
