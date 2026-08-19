@@ -493,11 +493,41 @@ pub async fn start_nfs_server_with_config(
 mod tests {
     use super::*;
     use crate::config::NfsSharedIdentity;
+    use crate::fs::inode::{Inode, test_file_inode};
+    use crate::fs::store::directory::COOKIE_FIRST_ENTRY;
     use crate::test_helpers::test_helpers_mod::{filename, test_auth};
     use zerofs_nfsserve::nfs::{
         ftype3, nfspath3, nfsstat3, sattr3, set_atime, set_gid3, set_mode3, set_mtime, set_size3,
         set_uid3,
     };
+
+    async fn seed_directory_entries(fs: &ZeroFS, count: usize) {
+        let mut transaction = fs.db.new_transaction().unwrap();
+
+        for index in 0..count {
+            let inode_id = fs.inode_store.allocate();
+            let name = format!("entry-{index:05}").into_bytes();
+            let mut inode = test_file_inode(0);
+            let Inode::File(file) = &mut inode else {
+                unreachable!("test_file_inode must return a file")
+            };
+            file.name = Some(name.clone());
+
+            fs.inode_store
+                .save(&mut transaction, inode_id, &inode)
+                .unwrap();
+            fs.directory_store.add(
+                &mut transaction,
+                0,
+                &name,
+                inode_id,
+                COOKIE_FIRST_ENTRY + index as u64,
+                Some(&inode),
+            );
+        }
+
+        fs.write_coordinator.commit(transaction).await.unwrap();
+    }
 
     #[tokio::test]
     async fn test_nfs_filesystem_trait() {
@@ -703,6 +733,46 @@ mod tests {
         assert!(names.contains(&b".".as_ref()));
         assert!(names.contains(&b"..".as_ref()));
         assert!(names.contains(&b"file_in_dir.txt".as_ref()));
+    }
+
+    #[tokio::test]
+    async fn readdir_honors_zero_one_and_two_entry_budgets() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let adapter = NFSAdapter::new(Arc::clone(&fs));
+        adapter
+            .create(&test_auth(), 0, &filename(b"file.txt"), sattr3::default())
+            .await
+            .unwrap();
+
+        let zero = adapter.readdir(&test_auth(), 0, 0, 0).await.unwrap();
+        assert!(zero.entries.is_empty());
+        assert!(!zero.end);
+
+        let one = adapter.readdir(&test_auth(), 0, 0, 1).await.unwrap();
+        assert_eq!(one.entries.len(), 1);
+        assert_eq!(one.entries[0].name.0, b".");
+        assert!(!one.end);
+
+        let two = adapter.readdir(&test_auth(), 0, 0, 2).await.unwrap();
+        assert_eq!(two.entries.len(), 2);
+        assert_eq!(two.entries[0].name.0, b".");
+        assert_eq!(two.entries[1].name.0, b"..");
+        assert!(!two.end);
+    }
+
+    #[tokio::test]
+    async fn readdir_huge_budget_is_capped_at_adapter_boundary() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        seed_directory_entries(&fs, 4_097).await;
+        let adapter = NFSAdapter::new(fs);
+
+        let result = adapter
+            .readdir(&test_auth(), 0, 0, usize::MAX)
+            .await
+            .unwrap();
+
+        assert_eq!(result.entries.len(), 4_096);
+        assert!(!result.end);
     }
 
     #[tokio::test]
