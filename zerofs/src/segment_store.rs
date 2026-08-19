@@ -279,7 +279,8 @@ impl SegmentStore {
     }
 
     /// As [`Self::read_run`] but AEAD-verify only, returning still-compressed
-    /// payloads for relocation (see [`Self::seal_compressed`]).
+    /// payloads for relocation (see [`Self::seal_compressed`]). Compaction-only,
+    /// so the read bypasses the user parts cache.
     pub async fn read_compressed_run(
         &self,
         segid: Segid,
@@ -287,10 +288,9 @@ impl SegmentStore {
         byte_len: u32,
         first_frame: u32,
         slots: &[(InodeId, u64)],
-        cache: bool,
     ) -> Result<Vec<Compressed>> {
         let region = self
-            .read_run_region(segid, byte_offset, byte_len, cache)
+            .read_run_region(segid, byte_offset, byte_len, false)
             .await?;
         Ok(crate::segment::read_compressed_frames_from_region(
             &self.codec,
@@ -403,8 +403,9 @@ impl SegmentStore {
     }
 
     /// Read and decrypt a segment's reverse-map directory (which frame backs
-    /// which logical block), for the coalescer.
-    pub async fn read_directory(&self, segid: Segid, cache: bool) -> Result<Vec<DirEntry>> {
+    /// which logical block), for the coalescer. GC/compaction-only, so the
+    /// reads bypass the user parts cache.
+    pub async fn read_directory(&self, segid: Segid) -> Result<Vec<DirEntry>> {
         let path = Path::from(segid.object_key());
         // Fetch just the footer (last FOOTER_LEN bytes) to locate the directory,
         // then a ranged GET of the directory itself — never the whole object.
@@ -412,11 +413,9 @@ impl SegmentStore {
             range: Some(GetRange::Suffix(crate::segment::FOOTER_LEN as u64)),
             ..Default::default()
         };
-        if !cache {
-            footer_opts
-                .extensions
-                .insert(crate::object_store_prefetch::SkipPartsCache);
-        }
+        footer_opts
+            .extensions
+            .insert(crate::object_store_prefetch::SkipPartsCache);
         let footer_res = self
             .object_store
             .get_opts(&path, footer_opts)
@@ -445,7 +444,7 @@ impl SegmentStore {
             .get_object_range(
                 &path,
                 meta.dir_offset..meta.dir_offset + meta.dir_len as u64,
-                cache,
+                false,
             )
             .await?;
         Ok(crate::segment::decode_directory(

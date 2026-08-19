@@ -985,9 +985,10 @@ pub async fn build_slatedb(
         .map(|s| Arc::new(LengthCheckedObjectStore::new(s)) as Arc<dyn object_store::ObjectStore>);
     // The global cap gates both part admission and the GC gather brake.
     crate::alloc_rss::set_rss_cap_bytes(total_memory_bytes as u64);
-    let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(
-        PrefetchingObjectStore::new(object_store, parts_cache.clone()),
-    );
+    let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(PrefetchingObjectStore::new(
+        object_store,
+        parts_cache.clone(),
+    ));
 
     let db_path = Path::from(db_path);
 

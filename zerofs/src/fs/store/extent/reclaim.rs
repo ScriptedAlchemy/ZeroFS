@@ -952,7 +952,7 @@ impl ExtentStore {
     /// segment. This replaces a 20-wide dual get_bytes/get_bytes_durable per
     /// unique directory extent, which OOM-d reclaim on a full foyer floor.
     async fn verify_segment_reclaimable(&self, segid: Segid) -> SegmentDeadVerdict {
-        let dir = match self.segments.read_directory(segid, false).await {
+        let dir = match self.segments.read_directory(segid).await {
             Ok(d) => d,
             Err(SegmentStoreError::NotFound) => return SegmentDeadVerdict::ObjectAbsent,
             Err(_) => return SegmentDeadVerdict::Keep,
