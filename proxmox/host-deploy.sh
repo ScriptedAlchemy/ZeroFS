@@ -41,6 +41,7 @@ assume_stopped=false
 dry_run_ct_destroyed=false
 defer_commit=false
 maintenance_nfs_only=false
+drain_timeout=1800
 
 while (($#)); do
   case "$1" in
@@ -67,6 +68,7 @@ while (($#)); do
     --assume-stopped) assume_stopped=true; shift ;;
     --defer-commit) defer_commit=true; shift ;;
     --maintenance-nfs-only) maintenance_nfs_only=true; shift ;;
+    --drain-timeout) drain_timeout=$2; shift 2 ;;
     --dry-run) dry_run=true; shift ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
@@ -98,6 +100,10 @@ if ! [[ $cores =~ ^[1-9][0-9]*$ ]] || ((cores > 256)); then
   echo "invalid --cores" >&2
   exit 2
 fi
+[[ $drain_timeout =~ ^[1-9][0-9]*$ ]] || {
+  echo "invalid --drain-timeout" >&2
+  exit 2
+}
 [[ $bridge =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid --bridge" >&2; exit 2; }
 [[ $rootfs =~ ^[A-Za-z0-9_.-]+:[1-9][0-9]*$ ]] || {
   echo "invalid --rootfs" >&2
@@ -823,7 +829,7 @@ assert_server_drained() {
     )
   fi
   local body name stable=0
-  local deadline=$((SECONDS + 1800))
+  local deadline=$((SECONDS + drain_timeout))
   while ((SECONDS < deadline)); do
     body=$(curl --fail --silent --show-error --max-time 10 "http://$container_ip:9567/metrics")
     declare -A value=()

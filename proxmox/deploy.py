@@ -1117,6 +1117,8 @@ def _stage_and_run_host(
         args.samba_user,
         "--prod-access",
         args.prod_access,
+        "--drain-timeout",
+        str(args.drain_timeout),
     ]
     if args.hpn_sha256 is not None:
         host_args.extend(["--hpn-sha256", args.hpn_sha256])

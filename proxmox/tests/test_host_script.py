@@ -410,6 +410,7 @@ printf 'parent_frozen=%s\n' "$parent_frozen"
             ("--cores", "0"),
             ("--bridge", "vmbr1;id"),
             ("--rootfs", "local-lvm:8;id"),
+            ("--drain-timeout", "0"),
         ):
             with self.subTest(extra=extra):
                 result = self.run_host("deploy", *extra)
