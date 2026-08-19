@@ -161,7 +161,7 @@ async fn handle_9p_ws(
     use futures::StreamExt;
     loop {
         let receive = match P9GlobalAdmission::shared()
-            .admit_receive(&state.shutdown)
+            .admit_websocket_receive(&state.shutdown)
             .await
         {
             Ok(receive) => receive,

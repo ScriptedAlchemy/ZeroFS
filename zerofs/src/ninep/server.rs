@@ -50,6 +50,7 @@ const CONNECTION_INFLIGHT_REQUESTS: usize = 16;
 const GLOBAL_TRANSPORT_SESSIONS: usize = 64;
 const MAX_PRE_ADMISSION_MEMORY: usize = GLOBAL_TRANSPORT_SESSIONS * P9_MAX_MSIZE as usize;
 const DOCUMENTED_P9_MEMORY_BOUND: usize = GLOBAL_INFLIGHT_MEMORY + MAX_PRE_ADMISSION_MEMORY;
+const WEBSOCKET_RECEIVE_RESERVATION: u32 = 2 * P9_MAX_MSIZE;
 const P9_RWRITE_MAX_SIZE: usize = P9_HEADER_SIZE + P9_COUNT_FIELD_LEN;
 /// Bounded response drain after connection retirement.
 const CLIENT_DRAIN_TIMEOUT: std::time::Duration = crate::replication::RESPONSE_DRAIN_TIMEOUT;
@@ -114,7 +115,25 @@ impl P9GlobalAdmission {
         self: &Arc<Self>,
         shutdown: &CancellationToken,
     ) -> anyhow::Result<P9ReceivePermit> {
-        let permits = P9_MAX_MSIZE;
+        self.admit_receive_bytes(P9_MAX_MSIZE, shutdown).await
+    }
+
+    pub(crate) async fn admit_websocket_receive(
+        self: &Arc<Self>,
+        shutdown: &CancellationToken,
+    ) -> anyhow::Result<P9ReceivePermit> {
+        // Tungstenite copies fragmented messages into a growing collector
+        // while retaining the current frame. Charging both maximum buffers
+        // keeps their combined peak inside the shared receive envelope.
+        self.admit_receive_bytes(WEBSOCKET_RECEIVE_RESERVATION, shutdown)
+            .await
+    }
+
+    async fn admit_receive_bytes(
+        self: &Arc<Self>,
+        permits: u32,
+        shutdown: &CancellationToken,
+    ) -> anyhow::Result<P9ReceivePermit> {
         let permit = tokio::select! {
             biased;
             _ = shutdown.cancelled() => anyhow::bail!("9P receive cancelled by shutdown"),
@@ -1471,6 +1490,24 @@ mod tests {
             2 * P9_MAX_MSIZE as usize,
             "a large read retains its source payload while serializing the wire response"
         );
+    }
+
+    #[tokio::test]
+    async fn fragmented_websocket_receive_reserves_collector_and_frame() {
+        let global = P9GlobalAdmission::for_test_with_transports(
+            GLOBAL_INFLIGHT_MEMORY,
+            GLOBAL_INFLIGHT_REQUESTS,
+            2,
+        );
+        let shutdown = CancellationToken::new();
+        let receive = global.admit_websocket_receive(&shutdown).await.unwrap();
+        assert_eq!(
+            global.snapshot().receive_reserved_bytes,
+            2 * P9_MAX_MSIZE as usize,
+            "fragment assembly must charge both the collector and current frame"
+        );
+        drop(receive);
+        assert_eq!(global.snapshot().receive_reserved_bytes, 0);
     }
 
     #[tokio::test]
