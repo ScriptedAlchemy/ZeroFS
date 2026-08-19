@@ -429,9 +429,9 @@ impl AdminService for AdminRpcServer {
         &self,
         _request: Request<proto::FlushRequest>,
     ) -> Result<Response<proto::FlushResponse>, Status> {
-        self.fs
-            .flush_coordinator
-            .flush()
+        let _receipt = self
+            .fs
+            .administrative_remote_durability()
             .await
             .map_err(|e| Status::internal(format!("Flush failed: {:?}", e)))?;
 
@@ -771,12 +771,25 @@ mod tests {
     /// Build an in-memory ZeroFS plus the CheckpointManager the admin server
     /// needs. The slatedb handle is constructed here (instead of via
     /// ZeroFS::new_in_memory) because the CheckpointManager needs it too.
-    async fn make_fs() -> (Arc<ZeroFS>, Arc<CheckpointManager>) {
-        make_fs_with_lease(None).await
+    pub(super) async fn make_fs() -> (Arc<ZeroFS>, Arc<CheckpointManager>) {
+        make_fs_with_lease_and_write_ack(None, None).await
     }
 
     async fn make_fs_with_lease(
         lease: Option<Arc<crate::replication::Lease>>,
+    ) -> (Arc<ZeroFS>, Arc<CheckpointManager>) {
+        make_fs_with_lease_and_write_ack(lease, None).await
+    }
+
+    pub(super) async fn make_fs_with_write_ack(
+        write_ack: crate::fs::mutation::config::FilesystemWriteAckSettings,
+    ) -> (Arc<ZeroFS>, Arc<CheckpointManager>) {
+        make_fs_with_lease_and_write_ack(None, Some(write_ack)).await
+    }
+
+    async fn make_fs_with_lease_and_write_ack(
+        lease: Option<Arc<crate::replication::Lease>>,
+        write_ack: Option<crate::fs::mutation::config::FilesystemWriteAckSettings>,
     ) -> (Arc<ZeroFS>, Arc<CheckpointManager>) {
         let test_key = [0u8; 32];
         let object_store: Arc<dyn slatedb::object_store::ObjectStore> =
@@ -794,30 +807,33 @@ mod tests {
                 .unwrap(),
         );
         let db_handle = SlateDbHandle::ReadWrite(slatedb);
-        let fs = Arc::new(
-            ZeroFS::new_with_slatedb_and_lease(
-                db_handle.clone(),
-                u64::MAX,
-                None,
-                false,
-                false,
-                lease,
-                None,
-                Arc::new(crate::dedup::DedupCache::new()),
-                None,
-                crate::object_trace::ObjectTracer::new(),
-                Arc::clone(&object_store),
-                crate::frame_codec::FrameCodec::new(
-                    &test_key,
-                    crate::segment::SEGMENT_INFO,
-                    CompressionConfig::default(),
-                ),
-                None,
-                crate::config::StoreProfile::default(),
-            )
-            .await
-            .unwrap(),
-        );
+        let mut fs = ZeroFS::new_with_slatedb_and_lease(
+            db_handle.clone(),
+            u64::MAX,
+            None,
+            false,
+            false,
+            lease,
+            None,
+            Arc::new(crate::dedup::DedupCache::new()),
+            None,
+            crate::object_trace::ObjectTracer::new(),
+            Arc::clone(&object_store),
+            crate::frame_codec::FrameCodec::new(
+                &test_key,
+                crate::segment::SEGMENT_INFO,
+                CompressionConfig::default(),
+            ),
+            None,
+            crate::config::StoreProfile::default(),
+        )
+        .await
+        .unwrap();
+        if let Some(write_ack) = write_ack {
+            fs.write_ack = write_ack;
+        }
+        let fs = Arc::new(fs);
+        fs.install_volatile_overlay();
         fs.start_reclaim_drainer();
         let checkpoint_manager = Arc::new(CheckpointManager::new(
             db_handle,
@@ -850,7 +866,16 @@ mod tests {
         protect_nbd_exports: bool,
     ) -> (Arc<ZeroFS>, RpcClient, CancellationToken, tempfile::TempDir) {
         let (fs, checkpoint_manager) = make_fs().await;
+        let (client, shutdown, dir) =
+            setup_fs(Arc::clone(&fs), checkpoint_manager, protect_nbd_exports).await;
+        (fs, client, shutdown, dir)
+    }
 
+    pub(super) async fn setup_fs(
+        fs: Arc<ZeroFS>,
+        checkpoint_manager: Arc<CheckpointManager>,
+        protect_nbd_exports: bool,
+    ) -> (RpcClient, CancellationToken, tempfile::TempDir) {
         let shutdown = CancellationToken::new();
         let service = AdminRpcServer::new(checkpoint_manager, Arc::clone(&fs), shutdown.clone())
             .with_nbd_export_protection(protect_nbd_exports);
@@ -865,7 +890,7 @@ mod tests {
             });
         }
         let client = connect_with_retry(&sock).await;
-        (fs, client, shutdown, dir)
+        (client, shutdown, dir)
     }
 
     async fn connect_with_retry(sock: &std::path::Path) -> RpcClient {
@@ -1219,5 +1244,9 @@ mod tests {
             "unexpected error: {error}"
         );
         shutdown.cancel();
+    }
+
+    mod typed_flush_tests {
+        include!("server/typed_flush_tests.rs");
     }
 }
