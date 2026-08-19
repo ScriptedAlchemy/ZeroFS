@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 import time
 import uuid
@@ -11,6 +10,7 @@ from typing import Sequence
 
 from .config import PilotConfig
 from .lifecycle import PilotLifecycle
+from .owned_resources import atomic_write_json
 from .receipts import RunReceipt
 from .runner import Runner
 from .system_io import prepare_run_root
@@ -223,8 +223,5 @@ class WorkloadRunner:
                             raise
         if result is None:
             raise RuntimeError("workloads completed without a result")
-        receipt.path("summary.json").write_text(
-            json.dumps(result.to_dict(), indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
+        atomic_write_json(receipt.path("summary.json"), result.to_dict())
         return result

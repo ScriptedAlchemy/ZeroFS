@@ -12,6 +12,7 @@ from .metrics import WritebackSnapshot
 from .metrics import wait_for_accepted_after
 from .config import PilotConfig
 from .lifecycle import PilotLifecycle
+from .owned_resources import atomic_write_json
 from .runner import Runner
 from .receipts import RunReceipt
 from .performance_matrix import PerformanceMatrixRunner, require_drained
@@ -1069,10 +1070,7 @@ class RealWorldMatrixRunner:
                 for source in sorted(scratch.iterdir()):
                     if source.is_file():
                         shutil.copy2(source, receipt.path(source.name))
-                receipt.path("summary.json").write_text(
-                    json.dumps(result.to_dict(), indent=2, sort_keys=True) + "\n",
-                    encoding="utf-8",
-                )
+                atomic_write_json(receipt.path("summary.json"), result.to_dict())
                 receipt.record(
                     "total_measured_bytes", result.to_dict()["total_measured_bytes"]
                 )
