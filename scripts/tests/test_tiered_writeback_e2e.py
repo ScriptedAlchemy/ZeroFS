@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -16,6 +17,7 @@ from unittest import mock
 from scripts.tiered_writeback_e2e.config import (
     FILESYSTEM_ACK_MODES,
     OBJECT_ACK_MODES,
+    PRODUCTION_MARKERS,
     AckModes,
     ConfigError,
     HarnessConfig,
@@ -1173,6 +1175,230 @@ class CliTests(HarnessCase):
         )
         self.assertEqual(result.returncode, 1)
         self.assertIn("321", result.stderr)
+
+
+WORKFLOWS_ROOT = Path(__file__).resolve().parents[2] / ".github" / "workflows"
+
+TIERED_CONTROL_ROOT = "/var/tmp/zerofs-tiered-control-${RUN_UUID}"
+TIERED_RESOURCE_ROOT = "/var/tmp/zerofs-tiered-resources-${RUN_UUID}"
+
+TIERED_ACK_FLAGS = (
+    "--filesystem-ack-mode volatile_memory",
+    "--object-ack-mode ssd",
+)
+
+# Workflow file -> (control job id, tiered job id, harness scenario, NBD leg).
+TIERED_WORKFLOW_LEGS = {
+    "xfstests-nfs.yml": (
+        "xfstests",
+        "xfstests-tiered",
+        "xfstests-nfs-quick",
+        False,
+    ),
+    "xfstests-9p.yml": (
+        "xfstests",
+        "xfstests-tiered",
+        "xfstests-ninep-quick-and-strict",
+        False,
+    ),
+    "pjdfstest.yml": ("pjdfstest", "pjdfstest-tiered", "pjdfstest-nfs", False),
+    "pjdfstest-9p.yml": (
+        "pjdfstest-9p",
+        "pjdfstest-9p-tiered",
+        "pjdfstest-ninep",
+        False,
+    ),
+    "kernel-compile-nfs.yml": (
+        "kernel-compile-nfs",
+        "kernel-compile-nfs-tiered",
+        "kernel-compile-nfs",
+        False,
+    ),
+    "kernel-compile-9p.yml": (
+        "kernel-compile-9p",
+        "kernel-compile-9p-tiered",
+        "kernel-compile-ninep",
+        False,
+    ),
+    "stress-ng.yml": (
+        "stress-ng-nfs",
+        "stress-ng-tiered",
+        "stress-ng-nfs-ninep",
+        False,
+    ),
+    "zfs-test.yml": ("zfs-test", "zfs-test-tiered", "zfs-over-nbd-restart", True),
+    "xfs-nbd.yml": ("xfs-nbd", "xfs-nbd-tiered", "xfs-over-nbd-restart", True),
+}
+
+
+class WorkflowContractTests(unittest.TestCase):
+    """Static contract checks over the tiered CI workflow text."""
+
+    def regions(self, filename: str) -> tuple[str, str]:
+        """Split one workflow into (control region, tiered region)."""
+        control_job, tiered_job, _, _ = TIERED_WORKFLOW_LEGS[filename]
+        path = WORKFLOWS_ROOT / filename
+        self.assertTrue(path.is_file(), f"{filename} is missing")
+        text = path.read_text(encoding="utf-8")
+        self.assertIn(
+            f"\n  {control_job}:\n",
+            text,
+            f"{filename} lost its materialized control job {control_job!r}",
+        )
+        marker = f"\n  {tiered_job}:\n"
+        self.assertIn(marker, text, f"{filename} has no {tiered_job!r} job")
+        control_region, tiered_region = text.split(marker, 1)
+        return control_region, tiered_region
+
+    def harness_commands(self, region: str) -> list[str]:
+        """Join backslash-continued harness invocations into single strings."""
+        lines = region.splitlines()
+        commands: list[str] = []
+        index = 0
+        while index < len(lines):
+            line = lines[index]
+            if "tiered-writeback-e2e.py" in line:
+                parts = [line.strip()]
+                while parts[-1].endswith("\\"):
+                    index += 1
+                    parts.append(lines[index].strip())
+                commands.append(
+                    " ".join(part.rstrip("\\").strip() for part in parts)
+                )
+            index += 1
+        return commands
+
+    def tiered_steps(self, region: str) -> list[str]:
+        return re.split(r"\n      - name: ", region)
+
+    def test_every_tiered_leg_declares_both_ack_flags(self) -> None:
+        for filename in sorted(TIERED_WORKFLOW_LEGS):
+            with self.subTest(workflow=filename):
+                _, tiered = self.regions(filename)
+                commands = self.harness_commands(tiered)
+                setups = [c for c in commands if ".py setup " in f"{c} "]
+                runs = [c for c in commands if ".py run " in f"{c} "]
+                self.assertTrue(setups, f"{filename} never runs harness setup")
+                self.assertTrue(runs, f"{filename} never runs a harness scenario")
+                for command in setups + runs:
+                    for flag in TIERED_ACK_FLAGS:
+                        self.assertIn(
+                            flag, command, f"{filename}: {command!r} lacks {flag!r}"
+                        )
+
+    def test_run_roots_are_disjoint_uuid_scoped_paths(self) -> None:
+        for filename in sorted(TIERED_WORKFLOW_LEGS):
+            with self.subTest(workflow=filename):
+                _, tiered = self.regions(filename)
+                self.assertIn(TIERED_CONTROL_ROOT, tiered, filename)
+                self.assertIn(TIERED_RESOURCE_ROOT, tiered, filename)
+                self.assertNotEqual(TIERED_CONTROL_ROOT, TIERED_RESOURCE_ROOT)
+
+    def test_ledger_lives_under_the_control_root(self) -> None:
+        for filename in sorted(TIERED_WORKFLOW_LEGS):
+            with self.subTest(workflow=filename):
+                _, tiered = self.regions(filename)
+                self.assertIn("${CONTROL_ROOT}/ledger.json", tiered, filename)
+                for command in self.harness_commands(tiered):
+                    if any(
+                        f".py {sub} " in f"{command} "
+                        for sub in ("run", "cleanup", "assert-clean")
+                    ):
+                        self.assertIn(
+                            '--ledger "$LEDGER"',
+                            command,
+                            f"{filename}: {command!r} bypasses the run ledger",
+                        )
+
+    def test_cleanup_is_always_run_twice_then_asserted_clean(self) -> None:
+        for filename in sorted(TIERED_WORKFLOW_LEGS):
+            with self.subTest(workflow=filename):
+                _, tiered = self.regions(filename)
+                cleanup_steps = [
+                    step
+                    for step in self.tiered_steps(tiered)
+                    if 'cleanup --ledger "$LEDGER"' in step
+                ]
+                self.assertEqual(
+                    len(cleanup_steps),
+                    1,
+                    f"{filename} needs exactly one tiered cleanup step",
+                )
+                step = cleanup_steps[0]
+                self.assertIn(
+                    "if: always()", step, f"{filename} cleanup is conditional"
+                )
+                self.assertEqual(
+                    step.count('cleanup --ledger "$LEDGER"'),
+                    2,
+                    f"{filename} must invoke cleanup twice (idempotence proof)",
+                )
+                self.assertIn(
+                    'assert-clean --ledger "$LEDGER"',
+                    step,
+                    f"{filename} never asserts the run left no residue",
+                )
+                self.assertGreater(
+                    step.rindex("assert-clean --ledger"),
+                    step.rindex("cleanup --ledger"),
+                    f"{filename} asserts cleanliness before cleanup finished",
+                )
+
+    def test_tiered_legs_run_registered_scenarios(self) -> None:
+        for filename, (_, _, scenario, _) in sorted(TIERED_WORKFLOW_LEGS.items()):
+            with self.subTest(workflow=filename):
+                self.assertIn(scenario, SCENARIO_NAMES)
+                _, tiered = self.regions(filename)
+                self.assertIn(f"--scenario {scenario}", tiered, filename)
+
+    def test_materialized_control_legs_stay_unharnessed(self) -> None:
+        for filename in sorted(TIERED_WORKFLOW_LEGS):
+            with self.subTest(workflow=filename):
+                control, _ = self.regions(filename)
+                for marker in (
+                    "tiered-writeback-e2e",
+                    "--filesystem-ack-mode",
+                    "--object-ack-mode",
+                    "zerofs-tiered-control",
+                    "zerofs-tiered-resources",
+                    "volatile_memory",
+                ):
+                    self.assertNotIn(
+                        marker,
+                        control,
+                        f"{filename}: control leg picked up tiered marker {marker!r}",
+                    )
+
+    def test_nbd_legs_check_runner_owned_devices(self) -> None:
+        for filename, (_, _, _, nbd) in sorted(TIERED_WORKFLOW_LEGS.items()):
+            if not nbd:
+                continue
+            with self.subTest(workflow=filename):
+                _, tiered = self.regions(filename)
+                self.assertIn(
+                    "nbd-client -c /dev/nbd7",
+                    tiered,
+                    f"{filename} never proves the runner owns /dev/nbd7",
+                )
+        control, _ = self.regions("xfs-nbd.yml")
+        self.assertIn(
+            "nbd-client -c /dev/nbd0",
+            control,
+            "xfs-nbd.yml control leg never proves the runner owns /dev/nbd0",
+        )
+
+    def test_no_production_targets_anywhere(self) -> None:
+        for filename in sorted(TIERED_WORKFLOW_LEGS):
+            with self.subTest(workflow=filename):
+                path = WORKFLOWS_ROOT / filename
+                self.assertTrue(path.is_file(), f"{filename} is missing")
+                text = path.read_text(encoding="utf-8").lower()
+                for marker in PRODUCTION_MARKERS:
+                    self.assertNotIn(
+                        marker,
+                        text,
+                        f"{filename} mentions production marker {marker!r}",
+                    )
 
 
 if __name__ == "__main__":

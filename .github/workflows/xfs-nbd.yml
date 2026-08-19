@@ -1,4 +1,4 @@
-name: ZFS on ZeroFS Test
+name: XFS on ZeroFS NBD Test
 
 on:
   workflow_call:
@@ -7,8 +7,8 @@ permissions:
   contents: read
 
 jobs:
-  zfs-test:
-    name: Run ZFS on top of ZeroFS
+  xfs-nbd:
+    name: Run XFS on top of ZeroFS NBD
     runs-on: ubuntu-latest
 
     steps:
@@ -35,7 +35,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y nbd-client zfsutils-linux wget pigz pixz parallel
+          sudo apt-get install -y nbd-client xfsprogs wget
 
       - name: Setup MinIO bucket
         run: |
@@ -43,7 +43,7 @@ jobs:
           wget https://dl.min.io/client/mc/release/linux-amd64/mc
           chmod +x mc
           ./mc alias set myminio http://localhost:9000 minioadmin minioadmin
-          ./mc mb myminio/zerofs-zfs-test || true
+          ./mc mb myminio/zerofs-xfs-test || true
 
       - name: Fetch the prebuilt ZeroFS binary
         uses: actions/download-artifact@v4
@@ -66,7 +66,7 @@ jobs:
           memory_size_gb = 2.0
 
           [storage]
-          url = "s3://zerofs-zfs-test/zfs-test"
+          url = "s3://zerofs-xfs-test/xfs-test"
           encryption_password = "test-password-123"
 
           [servers.ninep]
@@ -116,6 +116,14 @@ jobs:
 
           sudo umount /mnt/zerofs
 
+      - name: Assert the runner owns the NBD device
+        run: |
+          sudo modprobe nbd
+          if sudo nbd-client -c /dev/nbd0; then
+            echo "/dev/nbd0 is already attached to another export; refusing to reuse it" >&2
+            exit 1
+          fi
+
       - name: Connect NBD device
         run: |
           echo "Connecting to NBD device..."
@@ -124,141 +132,44 @@ jobs:
           sudo blockdev --getsize64 /dev/nbd0
           sudo fdisk -l /dev/nbd0
 
-      - name: Create ZFS pool
+      - name: Create XFS filesystem
         run: |
-          # Create ZFS pool directly on NBD block device
-          echo "Creating ZFS pool on NBD device..."
-          sudo zpool create testpool /dev/nbd0
+          echo "Formatting XFS on NBD device..."
+          sudo mkfs.xfs -f /dev/nbd0
 
-          # Check pool status
-          sudo zpool status testpool
-          sudo zpool list testpool
+          sudo mkdir -p /mnt/xfsdata
+          sudo mount /dev/nbd0 /mnt/xfsdata
 
-      - name: Create ZFS filesystem
+          # Show filesystem info
+          df -h /mnt/xfsdata
+          xfs_info /mnt/xfsdata
+
+      - name: Write test data and checksums
         run: |
-          # Create a ZFS filesystem
-          sudo zfs create testpool/data
-
-          # Set mountpoint
-          sudo zfs set mountpoint=/mnt/zfsdata testpool/data
-
-          # Set copies=2 for redundancy (allows scrub to detect/repair corruption)
-          sudo zfs set copies=2 testpool/data
-
-          # List filesystems
-          sudo zfs list
-
-      - name: Download and extract Linux kernel
-        run: |
-          # Download Linux kernel source
-          echo "Downloading Linux kernel 7.2-rc1..."
-          cd /mnt/zfsdata
-          sudo wget -q https://git.kernel.org/torvalds/t/linux-7.2-rc1.tar.gz
-
-          # Show download size
-          ls -lh linux-7.2-rc1.tar.gz
-
-          echo "Extracting kernel source..."
-          time sudo tar -I pigz -xf linux-7.2-rc1.tar.gz
-
-          # Count files to verify extraction
-          echo "Counting extracted files..."
-          sudo find linux-7.2-rc1 -type f | wc -l
-
-      - name: Test ZFS operations
-        run: |
-          # Create a snapshot
-          echo "Creating ZFS snapshot..."
-          sudo zfs snapshot testpool/data@after-kernel
-
-          # List snapshots
-          sudo zfs list -t snapshot
-
-          # Show pool I/O statistics
-          sudo zpool iostat testpool 1 5
-
-          # Create some test files
           echo "Creating test files..."
-          sudo dd if=/dev/urandom of=/mnt/zfsdata/random.dat bs=1M count=100
+          sudo dd if=/dev/urandom of=/mnt/xfsdata/random.dat bs=1M count=100
+          sudo mkdir -p /mnt/xfsdata/tree
+          for i in $(seq 1 50); do
+            sudo dd if=/dev/urandom of=/mnt/xfsdata/tree/file-$i.bin bs=64K count=4 status=none
+          done
 
-          # Create another snapshot
-          sudo zfs snapshot testpool/data@after-random
-
-          # Show space usage
-          sudo zfs list -o name,used,avail,refer,mountpoint
-
-      - name: Create tarball and checksum for durability test
-        run: |
-          echo "Creating tarball of ZFS data..."
-          cd /mnt/zfsdata
-          sudo tar -I pigz -cf /tmp/zfsdata-backup.tar.gz .
-
-          echo "Calculating checksum..."
-          sudo sha256sum /tmp/zfsdata-backup.tar.gz > /tmp/zfsdata-backup.sha256
-          cat /tmp/zfsdata-backup.sha256
-
-          # Also create checksum of individual files for comparison
-          sudo find . -type f -print0 | parallel -0 -j+0 sha256sum | sort > /tmp/file-checksums.txt
+          echo "Calculating checksums..."
+          cd /mnt/xfsdata
+          sudo find . -type f -print0 | xargs -0 sudo sha256sum | sort > /tmp/file-checksums.txt
           echo "Number of files checksummed: $(wc -l < /tmp/file-checksums.txt)"
 
-      - name: Sync and prepare for durability test
+      - name: Unmount and disconnect before restart
         run: |
-          echo "Syncing filesystem..."
+          echo "Syncing and unmounting XFS..."
           sync
-          sudo zpool sync testpool
+          sudo umount /mnt/xfsdata
 
-          echo "Running ZFS TRIM..."
-          sudo zpool trim testpool
-
-          # Wait for trim to complete
-          echo "Waiting for TRIM to complete..."
-          while sudo zpool status testpool | grep -q 'trimming'; do
-            sleep 2
-            echo "TRIM in progress..."
-            sudo zpool status testpool
-          done
-          echo "TRIM completed"
-
-          echo "Starting ZFS scrub..."
-          sudo zpool scrub testpool
-
-          # Wait for scrub to complete
-          echo "Waiting for scrub to complete..."
-          while sudo zpool status testpool | grep -q 'scrub in progress'; do
-            sleep 2
-            echo "Scrub in progress..."
-            sudo zpool status testpool
-          done
-          echo "Scrub completed"
-
-          # Show final pool status before restart
-          sudo zpool status testpool
-
-      - name: Unmount and export ZFS pool
-        run: |
-          echo "Unmounting ZFS filesystem..."
-          sudo zfs unmount testpool/data
-
-          echo "Exporting ZFS pool..."
-          sudo zpool export testpool
-
-          # Verify pool is exported
-          if sudo zpool list testpool 2>/dev/null; then
-            echo "ERROR: Pool still imported!"
-            exit 1
-          fi
-          echo "Pool successfully exported"
-
-      - name: Disconnect NBD and stop ZeroFS
-        run: |
           echo "Disconnecting NBD device..."
           sudo nbd-client -d /dev/nbd0
 
-          # Wait for NBD to fully disconnect - check if device is actually in use
+          # Wait for NBD to fully disconnect
           echo "Waiting for NBD device to disconnect..."
           for i in {1..10}; do
-            # Check if the NBD device is in use by looking at /sys/block/nbd0/size
-            # When disconnected, this should be 0
             if [ ! -e /sys/block/nbd0/size ] || [ "$(cat /sys/block/nbd0/size 2>/dev/null)" = "0" ]; then
               echo "NBD device disconnected successfully"
               break
@@ -267,15 +178,7 @@ jobs:
             sleep 1
           done
 
-          # Also check using nbd-client -c to see if device is connected
-          if sudo nbd-client -c /dev/nbd0 2>/dev/null; then
-            echo "WARNING: NBD device reports as still connected, but continuing..."
-          else
-            echo "NBD device confirmed disconnected"
-          fi
-
           echo "Stopping ZeroFS..."
-          # Find and kill the zerofs process
           ZEROFS_PID=$(pgrep -f "zerofs.*run.*zerofs-ci.toml" || true)
           if [ -n "$ZEROFS_PID" ]; then
             echo "Found ZeroFS process: $ZEROFS_PID"
@@ -341,67 +244,43 @@ jobs:
             exit 1
           fi
 
-      - name: Reconnect NBD and import pool
+      - name: Reconnect NBD and verify XFS
         run: |
           echo "Reconnecting NBD device..."
           sudo nbd-client 127.0.0.1 10809 /dev/nbd0 -N test-device
 
           # Verify NBD device is available
           sudo blockdev --getsize64 /dev/nbd0
-          sudo fdisk -l /dev/nbd0
 
-          echo "Importing ZFS pool..."
-          sudo zpool import testpool
+          echo "Checking XFS after restart..."
+          sudo xfs_repair -n /dev/nbd0
 
-          # Check pool status
-          sudo zpool status testpool
-          sudo zfs list
+          echo "Remounting XFS..."
+          sudo mount /dev/nbd0 /mnt/xfsdata
 
       - name: Verify data integrity
         run: |
-          echo "Creating new tarball of restored data..."
-          cd /mnt/zfsdata
-          sudo tar -I pigz -cf /tmp/zfsdata-restored.tar.gz .
-
-          echo "Calculating checksum of restored data..."
-          sudo sha256sum /tmp/zfsdata-restored.tar.gz > /tmp/zfsdata-restored.sha256
-          cat /tmp/zfsdata-restored.sha256
-
-          # Compare checksums
-          echo "Comparing tarball checksums..."
-          ORIGINAL_SUM=$(cut -d' ' -f1 < /tmp/zfsdata-backup.sha256)
-          RESTORED_SUM=$(cut -d' ' -f1 < /tmp/zfsdata-restored.sha256)
-
-          if [ "$ORIGINAL_SUM" = "$RESTORED_SUM" ]; then
-            echo "SUCCESS: Checksums match! Data integrity verified."
-          else
-            echo "ERROR: Checksums do not match!"
-            echo "Original: $ORIGINAL_SUM"
-            echo "Restored: $RESTORED_SUM"
-            exit 1
-          fi
-
-          # Also verify individual file checksums
-          echo "Verifying individual file checksums..."
-          sudo find . -type f -print0 | parallel -0 -j+0 sha256sum | sort > /tmp/file-checksums-restored.txt
+          echo "Recomputing checksums of restored data..."
+          cd /mnt/xfsdata
+          sudo find . -type f -print0 | xargs -0 sudo sha256sum | sort > /tmp/file-checksums-restored.txt
 
           if diff /tmp/file-checksums.txt /tmp/file-checksums-restored.txt; then
-            echo "SUCCESS: All individual file checksums match!"
+            echo "SUCCESS: All file checksums match!"
           else
-            echo "ERROR: Individual file checksums differ!"
+            echo "ERROR: File checksums differ!"
             exit 1
           fi
 
       - name: Show ZeroFS S3 usage
         run: |
           # Show how much data was written to S3
-          ./mc du myminio/zerofs-zfs-test
+          ./mc du myminio/zerofs-xfs-test
 
       - name: Cleanup
         if: always()
         run: |
-          # Export and destroy ZFS pool
-          sudo zpool export testpool || true
+          # Unmount XFS
+          sudo umount /mnt/xfsdata || true
 
           # Disconnect NBD device
           sudo nbd-client -d /dev/nbd0 || true
@@ -412,8 +291,8 @@ jobs:
           # Stop MinIO
           docker stop minio || true
 
-  zfs-test-tiered:
-    name: Run ZFS on top of ZeroFS (tiered volatile_memory+ssd)
+  xfs-nbd-tiered:
+    name: Run XFS on top of ZeroFS NBD (tiered volatile_memory+ssd)
     runs-on: ubuntu-latest
 
     steps:
@@ -422,7 +301,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y nbd-client zfsutils-linux wget
+          sudo apt-get install -y nbd-client xfsprogs wget
 
       - name: Assert the runner owns the disposable NBD device
         run: |
@@ -461,7 +340,7 @@ jobs:
           wget https://dl.min.io/client/mc/release/linux-amd64/mc
           chmod +x mc
           ./mc alias set myminio http://localhost:9000 minioadmin minioadmin
-          ./mc mb myminio/zerofs-zfs-test || true
+          ./mc mb myminio/zerofs-xfs-test || true
 
       - name: Prepare the tiered run roots
         run: |
@@ -484,7 +363,7 @@ jobs:
           memory_size_gb = 1.0
 
           [storage]
-          url = "s3://zerofs-zfs-test/zerofs-tiered/${RUN_UUID}"
+          url = "s3://zerofs-xfs-test/zerofs-tiered/${RUN_UUID}"
           encryption_password = "test-password-123"
 
           [filesystem]
@@ -521,11 +400,11 @@ jobs:
             --zerofs-config /tmp/zerofs-tiered.toml
           mkdir -p "${RESOURCE_ROOT}/run/cache" "${RESOURCE_ROOT}/run/writeback"
 
-      - name: Run the tiered ZFS restart scenario
+      - name: Run the tiered XFS restart scenario
         run: |
           python3 scripts/tiered-writeback-e2e.py run \
             --ledger "$LEDGER" \
-            --scenario zfs-over-nbd-restart \
+            --scenario xfs-over-nbd-restart \
             --filesystem-ack-mode volatile_memory \
             --object-ack-mode ssd \
             --zerofs-binary "$GITHUB_WORKSPACE/zerofs/target/ci/zerofs" \
