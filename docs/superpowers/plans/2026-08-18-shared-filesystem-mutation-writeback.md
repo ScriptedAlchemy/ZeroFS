@@ -1479,6 +1479,11 @@ errors. Reconciliation measures process RSS and cgroup `memory.current`, then re
 `owned + calibrated idle baseline + unowned residual = observed current`. The residual
 has a conservative configured ceiling and triggers backpressure/fail-closed poison if
 it escapes tolerance; merely proving charged owners sum to themselves is rejected.
+Plan C freezes `cgroup_high_event_delta_max=8`,
+`reconciliation_error_bytes_max=268435456`, and
+`unowned_residual_bytes_max=2147483648` in the immutable ledger before starting the
+process. Dependency-free rejection tests prove the scenario cannot omit, mutate after
+setup, or derive these values from its observed peak.
 
 ```bash
 cd /Volumes/bigssd/projects/ZeroFS/.worktrees/unified-tiered-writeback/zerofs
@@ -1767,4 +1772,10 @@ The production selector remains dormant until C7's real Linux A/B proves a pinne
 binary wins. HPN receive-window improvement applies to downloads where ZeroFS is the
 receiver; uploads require measured request pipelining and all configured physical
 write sessions carrying bytes. No claim crosses directions without evidence, and C7B
-must land the winning shipping result before the final Plan A gate.
+must land the winning shipping result before the final Plan A gate. Before that
+decision, Plan C runs the pinned upstream regression inventory under its ledger
+supervisor with fixed TERM/KILL deadlines, excludes only the pinned
+`dynamic-forward` test that backgrounds a multiplexed forwarding client, proves the
+remaining inventory is nonzero, and separately runs `transfer`, `rekey`, `sftp`,
+`sftp-batch`, `sftp-resume`, and `forwarding`. Any missing test/process-reap receipt
+rejects the package candidate.
