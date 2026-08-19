@@ -53,6 +53,19 @@ The `[cache]` table is required. ZeroFS runs two caches, each with a memory and 
 
 See [Caching](/caching) for how the two budgets are split between the tiers.
 
+## Runtime Memory Envelope
+
+Linux servers discover their effective cgroup-v2 `memory.max` at startup. Container runtimes can hide an outer cgroup limit from the process; set an explicit fallback in that case:
+
+```toml
+[runtime]
+memory_limit_gb = 96.0
+```
+
+`memory_limit_gb` is a decimal-GB hard envelope, like the other `*_gb` settings. When both values are available, ZeroFS uses the smaller of the configured fallback and the finite cgroup limit.
+
+Before opening the storage backend or starting listeners, ZeroFS checks the resolved clean-cache, object-writeback, and volatile-write budgets against that envelope. The guard reserves an additional 50% of the clean-cache capacity for transient cache, GC, and allocator residency, plus up to 8 GiB (or 25% of a smaller envelope) for the rest of the process. Startup fails closed when the total does not fit. If neither a finite cgroup limit nor `runtime.memory_limit_gb` is available, ZeroFS logs that it cannot enforce the startup memory budget.
+
 ## Storage Backends
 
 ### URL Schemes

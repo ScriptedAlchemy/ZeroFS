@@ -1175,12 +1175,7 @@ pub async fn run_server(
 
     info!("ZeroFS v{}", env!("CARGO_PKG_VERSION"));
 
-    let settings = Settings::from_file(&config_path)
-        .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
-    settings
-        .servers
-        .require_listener_endpoint()
-        .context("Invalid [servers] configuration")?;
+    let settings = load_and_validate_server_settings(&config_path)?;
 
     let db_mode = match (read_only, &checkpoint_name) {
         (false, None) => DatabaseMode::ReadWrite,
@@ -1723,9 +1718,66 @@ pub async fn run_server(
     result
 }
 
+fn load_and_validate_server_settings(config_path: &std::path::Path) -> Result<Settings> {
+    let settings = Settings::from_file(config_path)
+        .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
+    settings
+        .servers
+        .require_listener_endpoint()
+        .context("Invalid [servers] configuration")?;
+    let volatile_write_bytes = settings
+        .servers
+        .nbd
+        .as_ref()
+        .map(crate::config::NbdConfig::volatile_memory_bytes)
+        .transpose()?
+        .unwrap_or(0);
+    super::memory_budget::validate_server_startup(&settings, volatile_write_bytes)
+        .context("Invalid startup memory budget")?;
+    Ok(settings)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unsafe_budget_fails_before_the_file_backend_is_opened() {
+        let temp = tempfile::tempdir().unwrap();
+        let backend = temp.path().join("backend-must-not-exist");
+        let config = temp.path().join("zerofs.toml");
+        std::fs::write(
+            &config,
+            format!(
+                r#"[cache]
+dir = {cache:?}
+disk_size_gb = 1.0
+memory_size_gb = 64.0
+
+[runtime]
+memory_limit_gb = 96.0
+
+[storage]
+url = {storage:?}
+encryption_password = "test-password"
+
+[servers.nfs]
+addresses = ["127.0.0.1:20490"]
+"#,
+                cache = temp.path().join("cache").display().to_string(),
+                storage = format!("file://{}", backend.display()),
+            ),
+        )
+        .unwrap();
+
+        let error = load_and_validate_server_settings(&config).unwrap_err();
+
+        assert!(format!("{error:#}").contains("Invalid startup memory budget"));
+        assert!(
+            !backend.exists(),
+            "memory guard reached backend initialization"
+        );
+    }
 
     #[test]
     fn volatile_nbd_ack_rejects_read_only_database_modes() {
