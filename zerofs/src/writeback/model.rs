@@ -466,7 +466,7 @@ mod tests {
         assert_eq!(LocalEtag::parse(etag.as_str()), Some((incarnation, 7)));
         assert_eq!(LocalEtag::sequence_from_str(etag.as_str()), Some(7));
         assert_eq!(
-            LocalEtag::parse(&LocalEtag::new(Uuid::from_u128(0x1111), 7).as_str()),
+            LocalEtag::parse(LocalEtag::new(Uuid::from_u128(0x1111), 7).as_str()),
             Some((Uuid::from_u128(0x1111), 7))
         );
     }

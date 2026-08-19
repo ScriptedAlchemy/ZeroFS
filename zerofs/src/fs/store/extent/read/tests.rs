@@ -623,7 +623,7 @@ async fn sealed_independent_runs(
         let byte = (extent as u8).wrapping_add(1);
         write_extent(&writer, &db, extent, &[byte; EXTENT_SIZE]).await;
         writer.seal_open().await.unwrap();
-        model.extend(std::iter::repeat(byte).take(EXTENT_SIZE));
+        model.extend(std::iter::repeat_n(byte, EXTENT_SIZE));
     }
     let store = make_store(object_store.clone(), db, CompressionConfig::Lz4, 8);
     (store, model, gate, object_store)
@@ -750,7 +750,7 @@ async fn failed_fragmented_read_releases_every_fetch_permit() {
             let byte = (extent as u8).wrapping_add(3);
             write_extent(&writer, &db, extent, &[byte; EXTENT_SIZE]).await;
             writer.seal_open().await.unwrap();
-            model.extend(std::iter::repeat(byte).take(EXTENT_SIZE));
+            model.extend(std::iter::repeat_n(byte, EXTENT_SIZE));
         }
         (
             make_store(object_store, db, CompressionConfig::Lz4, 8),
@@ -763,9 +763,8 @@ async fn failed_fragmented_read_releases_every_fetch_permit() {
     let err = store.read(1, 0, 8 * EXTENT_SIZE as u64).await;
     assert!(err.is_err(), "expected failed fragmented read, got success");
     let snapshot = super::metrics::last_snapshot().expect("failed read still records metrics");
-    assert_eq!(
+    assert!(
         snapshot.peak_run_fetches > 0,
-        true,
         "failed read never started a run fetch"
     );
     controls.fail_gets(0);
