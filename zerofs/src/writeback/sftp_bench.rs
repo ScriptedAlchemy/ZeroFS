@@ -48,6 +48,7 @@ const TOTAL_MIB_ENV: &str = "ZEROFS_BENCH_SFTP_TOTAL_MIB";
 const PAYLOAD_KIB_ENV: &str = "ZEROFS_BENCH_SFTP_PAYLOAD_KIB";
 const WRITERS_ENV: &str = "ZEROFS_BENCH_SFTP_WRITERS";
 const MAX_CONNECTIONS_ENV: &str = "ZEROFS_BENCH_SFTP_MAX_CONNECTIONS";
+const SSD_MIB_ENV: &str = "ZEROFS_BENCH_SFTP_SSD_MIB";
 const BENCH_DIR_ENV: &str = "ZEROFS_BENCH_DIR";
 const IDENTITY_FILE_ENV: &str = "ZEROFS_BENCH_SFTP_IDENTITY_FILE";
 const KNOWN_HOSTS_ENV: &str = "ZEROFS_BENCH_SFTP_KNOWN_HOSTS";
@@ -124,6 +125,41 @@ struct BenchReport {
     sftp_close_total_seconds: f64,
     sftp_hardlink_total_seconds: f64,
     sftp_remove_total_seconds: f64,
+    sftp_session_publications: Vec<u64>,
+    sftp_session_write_bytes: Vec<u64>,
+    payload_sha256: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SaturationReport {
+    total_bytes: u64,
+    object_count: usize,
+    payload_bytes: usize,
+    writers: usize,
+    max_connections: usize,
+    upload_concurrency: usize,
+    local_concurrency: usize,
+    ssd_capacity_bytes: u64,
+    ssd_high_watermark_bytes: u64,
+    ssd_reservation_bytes_per_object: u64,
+    prefill_objects: usize,
+    prefill_reserved_bytes: u64,
+    blocked_objects_before_activation: usize,
+    prefill_seconds: f64,
+    remote_directory_prepare_seconds: f64,
+    first_blocked_ack_seconds: f64,
+    blocked_ack_seconds: f64,
+    blocked_ack_mib_per_second: f64,
+    max_blocked_ack_gap_seconds: f64,
+    remote_cleanup_bytes_during_blocked_acks: u64,
+    remote_cleanup_mib_per_second: f64,
+    foreground_to_remote_rate_ratio: f64,
+    remote_drain_seconds: f64,
+    remote_drain_mib_per_second: f64,
+    remote_read_seconds: f64,
+    remote_read_mib_per_second: f64,
+    remote_read_verified_objects: usize,
+    sftp_publications: u64,
     sftp_session_publications: Vec<u64>,
     sftp_session_write_bytes: Vec<u64>,
     payload_sha256: String,
@@ -377,6 +413,218 @@ async fn execute_benchmark(
     })
 }
 
+async fn execute_saturation_benchmark(
+    store: &WritebackObjectStore,
+    remote: &Arc<dyn ObjectStore>,
+    objects: &[ObjectPath],
+    payload: Bytes,
+    geometry: BenchGeometry,
+    saturation: SaturationGeometry,
+) -> Result<SaturationReport> {
+    let total_bytes = u64::try_from(objects.len())?
+        .checked_mul(u64::try_from(payload.len())?)
+        .context("saturation benchmark byte count overflowed")?;
+    let blocked_bytes = u64::try_from(saturation.paced_objects)?
+        .checked_mul(u64::try_from(payload.len())?)
+        .context("saturation blocked byte count overflowed")?;
+    let mut hasher = Sha256::new();
+    hasher.update(&payload);
+    let payload_sha256 = format!("{:x}", hasher.finalize());
+    let paths = Arc::new(objects.to_vec());
+    crate::sftp_protocol::reset_bench_timing();
+
+    let (completion_sender, mut completion_receiver) =
+        tokio::sync::mpsc::unbounded_channel::<(usize, std::result::Result<(), String>)>();
+    let mut writers = tokio::task::JoinSet::new();
+    let prefill_started = Instant::now();
+    for writer in 0..geometry.writers {
+        let store = store.clone();
+        let payload = payload.clone();
+        let paths = Arc::clone(&paths);
+        let completion_sender = completion_sender.clone();
+        writers.spawn(async move {
+            let mut index = writer;
+            while index < paths.len() {
+                let result = store
+                    .put_opts(
+                        &paths[index],
+                        payload.clone().into(),
+                        generated_segment_options(),
+                    )
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| error.to_string());
+                let failed = result.is_err();
+                if completion_sender.send((index, result)).is_err() {
+                    break;
+                }
+                if failed {
+                    break;
+                }
+                index += geometry.writers;
+            }
+        });
+    }
+    drop(completion_sender);
+
+    for _ in 0..saturation.prefill_objects {
+        let (index, result) =
+            tokio::time::timeout(Duration::from_secs(60), completion_receiver.recv())
+                .await
+                .context("timed out filling the benchmark SSD high watermark")?
+                .context("benchmark writers exited before filling the SSD high watermark")?;
+        result.map_err(|error| anyhow::anyhow!("prefill object {index} failed: {error}"))?;
+    }
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        store.wait_local(u64::try_from(saturation.prefill_objects)?),
+    )
+    .await
+    .context("timed out waiting for saturation prefill durability")??;
+    let prefill = prefill_started.elapsed();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    match completion_receiver.try_recv() {
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+            anyhow::bail!("benchmark writers exited instead of blocking at the SSD watermark")
+        }
+        Ok((index, result)) => {
+            result.map_err(|error| anyhow::anyhow!("tail object {index} failed: {error}"))?;
+            anyhow::bail!("tail object {index} bypassed the full SSD admission boundary")
+        }
+    }
+    let before = store.status()?;
+    anyhow::ensure!(
+        before.accepted_seq == u64::try_from(saturation.prefill_objects)?,
+        "expected {} accepted prefill objects, observed {}",
+        saturation.prefill_objects,
+        before.accepted_seq
+    );
+    anyhow::ensure!(
+        before.local_seq == before.accepted_seq,
+        "saturation prefill was not locally durable"
+    );
+    anyhow::ensure!(
+        before.remote_seq == 0,
+        "paused saturation benchmark unexpectedly advanced remote sequence"
+    );
+    anyhow::ensure!(
+        before.dirty_ssd_reserved_bytes == saturation.prefill_reserved_bytes,
+        "expected {} prefill SSD bytes, observed {}",
+        saturation.prefill_reserved_bytes,
+        before.dirty_ssd_reserved_bytes
+    );
+    anyhow::ensure!(before.terminal_error.is_none(), "prefill became terminal");
+
+    let activated = Instant::now();
+    store.activate_remote()?;
+    let blocked_ack_times = tokio::time::timeout(Duration::from_secs(300), async {
+        let mut completions = Vec::with_capacity(saturation.paced_objects);
+        for _ in 0..saturation.paced_objects {
+            let (index, result) = completion_receiver
+                .recv()
+                .await
+                .context("benchmark writers exited before the blocked tail was admitted")?;
+            result.map_err(|error| anyhow::anyhow!("blocked object {index} failed: {error}"))?;
+            completions.push(activated.elapsed());
+        }
+        Result::<Vec<Duration>>::Ok(completions)
+    })
+    .await
+    .context("blocked foreground writes did not progress after remote activation")??;
+    while let Some(result) = writers.join_next().await {
+        result.context("saturation writer task failed")?;
+    }
+    let target = store.status()?.accepted_seq;
+    anyhow::ensure!(
+        target == u64::try_from(objects.len())?,
+        "expected {} accepted objects after pacing, observed {target}",
+        objects.len()
+    );
+    tokio::time::timeout(Duration::from_secs(60), store.wait_local(target))
+        .await
+        .context("timed out waiting for the paced tail to become locally durable")??;
+    let after_blocked_acks = store.status()?;
+    let blocked_ack = blocked_ack_times
+        .last()
+        .copied()
+        .context("saturation benchmark did not record blocked acknowledgements")?;
+    let first_blocked_ack = blocked_ack_times[0];
+    let mut previous = Duration::ZERO;
+    let mut max_blocked_ack_gap = Duration::ZERO;
+    for completion in blocked_ack_times {
+        max_blocked_ack_gap = max_blocked_ack_gap.max(completion.saturating_sub(previous));
+        previous = completion;
+    }
+    let remote_cleanup_bytes = after_blocked_acks
+        .remote_bytes_completed
+        .saturating_sub(before.remote_bytes_completed);
+    anyhow::ensure!(
+        remote_cleanup_bytes > 0,
+        "blocked foreground writes resumed without durable remote cleanup"
+    );
+    let blocked_rate = mib_per_second(blocked_bytes, blocked_ack);
+    let remote_cleanup_rate = mib_per_second(remote_cleanup_bytes, blocked_ack);
+
+    tokio::time::timeout(Duration::from_secs(300), store.wait_remote(target))
+        .await
+        .context("timed out draining the saturated SSD journal to remote")??;
+    let remote_drain = activated.elapsed();
+    let final_status = store.status()?;
+    anyhow::ensure!(
+        final_status.dirty_ssd_reserved_bytes == 0,
+        "remote drain left {} SSD bytes reserved",
+        final_status.dirty_ssd_reserved_bytes
+    );
+    anyhow::ensure!(
+        final_status.terminal_error.is_none(),
+        "saturation benchmark ended terminal: {:?}",
+        final_status.terminal_error
+    );
+    let sftp_timing = crate::sftp_protocol::bench_timing();
+    let last_used_session = sftp_timing
+        .session_publications
+        .iter()
+        .rposition(|publications| *publications != 0)
+        .map_or(0, |index| index + 1);
+    let (remote_read, remote_read_verified_objects) =
+        read_and_verify_remote(remote, objects, &payload, geometry.writers).await?;
+
+    Ok(SaturationReport {
+        total_bytes,
+        object_count: objects.len(),
+        payload_bytes: payload.len(),
+        writers: geometry.writers,
+        max_connections: geometry.max_connections,
+        upload_concurrency: geometry.upload_concurrency,
+        local_concurrency: geometry.local_concurrency,
+        ssd_capacity_bytes: final_status.dirty_ssd_capacity_bytes,
+        ssd_high_watermark_bytes: saturation.high_watermark_bytes,
+        ssd_reservation_bytes_per_object: saturation.reservation_bytes,
+        prefill_objects: saturation.prefill_objects,
+        prefill_reserved_bytes: saturation.prefill_reserved_bytes,
+        blocked_objects_before_activation: saturation.paced_objects,
+        prefill_seconds: prefill.as_secs_f64(),
+        remote_directory_prepare_seconds: geometry.remote_directory_prepare.as_secs_f64(),
+        first_blocked_ack_seconds: first_blocked_ack.as_secs_f64(),
+        blocked_ack_seconds: blocked_ack.as_secs_f64(),
+        blocked_ack_mib_per_second: blocked_rate,
+        max_blocked_ack_gap_seconds: max_blocked_ack_gap.as_secs_f64(),
+        remote_cleanup_bytes_during_blocked_acks: remote_cleanup_bytes,
+        remote_cleanup_mib_per_second: remote_cleanup_rate,
+        foreground_to_remote_rate_ratio: blocked_rate / remote_cleanup_rate,
+        remote_drain_seconds: remote_drain.as_secs_f64(),
+        remote_drain_mib_per_second: mib_per_second(total_bytes, remote_drain),
+        remote_read_seconds: remote_read.as_secs_f64(),
+        remote_read_mib_per_second: mib_per_second(total_bytes, remote_read),
+        remote_read_verified_objects,
+        sftp_publications: sftp_timing.publications,
+        sftp_session_publications: sftp_timing.session_publications[..last_used_session].to_vec(),
+        sftp_session_write_bytes: sftp_timing.session_write_bytes[..last_used_session].to_vec(),
+        payload_sha256,
+    })
+}
+
 async fn prepare_remote_run(pool: &SftpSessionPool, directories: &[PathBuf]) -> Result<Duration> {
     let started = Instant::now();
     let mut lease = pool.checkout(OperationKind::Metadata).await?;
@@ -466,6 +714,49 @@ pub(super) fn finish_benchmark<T>(
     } else {
         Err(anyhow::anyhow!(errors.join("; ")))
     }
+}
+
+async fn finish_sftp_run<T>(
+    store: WritebackObjectStore,
+    remote: Arc<dyn ObjectStore>,
+    pool: SftpSessionPool,
+    scratch: tempfile::TempDir,
+    objects: &BenchObjectSet,
+    benchmark: Result<T>,
+    benchmark_context: &'static str,
+) -> Result<T> {
+    let shutdown = store.shutdown().await;
+    drop(store);
+    let cleanup = cleanup_remote_run(
+        &remote,
+        &pool,
+        &objects.objects,
+        &objects.directories_deepest_first,
+    )
+    .await;
+    drop(remote);
+    let pool_shutdown = pool.shutdown().await;
+    let scratch_path = scratch.path().to_path_buf();
+    let scratch_cleanup = scratch.close().context("remove local benchmark journal");
+    let scratch_absence = if scratch_path.exists() {
+        Err(anyhow::anyhow!(
+            "local benchmark journal still exists at {}",
+            scratch_path.display()
+        ))
+        .context("verify local benchmark journal removal")
+    } else {
+        Ok(())
+    };
+    finish_benchmark(
+        benchmark.context(benchmark_context),
+        [
+            shutdown.context("writeback shutdown failed"),
+            cleanup.context("remote benchmark cleanup failed"),
+            pool_shutdown.context("SFTP pool shutdown failed"),
+            scratch_cleanup,
+            scratch_absence,
+        ],
+    )
 }
 
 /// Directly measures the shipping SFTP object store behind the shipping
@@ -587,39 +878,160 @@ async fn bench_sftp_writeback_remote_drain() -> Result<()> {
         }
         Err(error) => Err(error.context("prepare remote benchmark directories")),
     };
-    let shutdown = store.shutdown().await;
-    drop(store);
-    let cleanup = cleanup_remote_run(
-        &remote,
-        &pool,
-        &objects.objects,
-        &objects.directories_deepest_first,
+    let report = finish_sftp_run(
+        store,
+        remote,
+        pool,
+        scratch,
+        &objects,
+        benchmark,
+        "SFTP writeback benchmark failed",
     )
-    .await;
-    drop(remote);
-    let pool_shutdown = pool.shutdown().await;
-    let scratch_path = scratch.path().to_path_buf();
-    let scratch_cleanup = scratch.close().context("remove local benchmark journal");
-    let scratch_absence = if scratch_path.exists() {
-        Err(anyhow::anyhow!(
-            "local benchmark journal still exists at {}",
-            scratch_path.display()
-        ))
-        .context("verify local benchmark journal removal")
-    } else {
-        Ok(())
-    };
-    let report = finish_benchmark(
-        benchmark.context("SFTP writeback benchmark failed"),
-        [
-            shutdown.context("writeback shutdown failed"),
-            cleanup.context("remote benchmark cleanup failed"),
-            pool_shutdown.context("SFTP pool shutdown failed"),
-            scratch_cleanup,
-            scratch_absence,
-        ],
-    )?;
+    .await?;
     println!("SFTP_WRITEBACK_BENCH {}", serde_json::to_string(&report)?);
+    Ok(())
+}
+
+/// Fills a deliberately small local writeback journal while remote replay is
+/// paused, proves additional foreground writes block at the SSD watermark,
+/// then measures how smoothly durable remote cleanup admits that blocked tail.
+/// It uses the shipping journal, admission, scheduler, native SFTP transport,
+/// and generated-segment create contract without installing or restarting the
+/// production service.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "real full-SSD SFTP pacing benchmark; run explicitly on Linux"]
+async fn bench_sftp_writeback_full_ssd_pacing() -> Result<()> {
+    let config_path = std::env::var_os(CONFIG_ENV)
+        .map(PathBuf::from)
+        .with_context(|| format!("{CONFIG_ENV} must name a ZeroFS TOML file"))?;
+    let mut settings = load_benchmark_settings(&config_path)?;
+    anyhow::ensure!(
+        settings.sftp_endpoint()?.is_some(),
+        "{CONFIG_ENV} must configure an sftp:// storage URL"
+    );
+    let total_mib: usize = bench_env(TOTAL_MIB_ENV, 256)?;
+    let payload_kib: usize = bench_env(PAYLOAD_KIB_ENV, 8 * 1024)?;
+    let writers: usize = bench_env(WRITERS_ENV, 16)?;
+    let ssd_mib: usize = bench_env(SSD_MIB_ENV, 64)?;
+    let sftp = settings
+        .sftp
+        .as_mut()
+        .context("benchmark config must include [sftp]")?;
+    let max_connections: usize = bench_env(MAX_CONNECTIONS_ENV, sftp.max_connections)?;
+    sftp.max_connections = max_connections;
+    settings.validate()?;
+    let production_writeback = settings
+        .writeback_settings(WritebackAccessMode::ReadWrite)?
+        .context("benchmark config must enable [writeback]")?;
+    anyhow::ensure!(total_mib > 0, "{TOTAL_MIB_ENV} must be positive");
+    anyhow::ensure!(payload_kib > 0, "{PAYLOAD_KIB_ENV} must be positive");
+    anyhow::ensure!(writers > 0, "{WRITERS_ENV} must be positive");
+    anyhow::ensure!(ssd_mib > 0, "{SSD_MIB_ENV} must be positive");
+    let total_kib = total_mib
+        .checked_mul(1024)
+        .context("saturation benchmark size overflowed")?;
+    anyhow::ensure!(
+        total_kib.is_multiple_of(payload_kib),
+        "{TOTAL_MIB_ENV} must be divisible by {PAYLOAD_KIB_ENV}"
+    );
+    let object_count = total_kib / payload_kib;
+    let total_bytes = u64::try_from(total_kib)? << 10;
+    let disk_bytes = u64::try_from(ssd_mib)? << 20;
+    let payload_bytes = payload_kib
+        .checked_mul(1024)
+        .context("saturation benchmark payload size overflowed")?;
+
+    let (remote, base, pool) = build_remote_store(&settings).await?;
+    let setup = (|| -> Result<_> {
+        let objects = BenchObjectSet::new(&base, Uuid::new_v4(), object_count)?;
+        let saturation = SaturationGeometry::new(&objects.objects, payload_bytes, disk_bytes, 95)?;
+        let scratch = match std::env::var_os(BENCH_DIR_ENV) {
+            Some(directory) => tempfile::tempdir_in(PathBuf::from(directory))?,
+            None => tempfile::tempdir()?,
+        };
+        let journal_dir = scratch.path().join("writeback");
+        let journal = Arc::new(Journal::open(
+            &journal_dir,
+            JournalIdentity {
+                format_version: 1,
+                bucket_id: format!("sftp-writeback-saturation-{}", Uuid::new_v4().simple()),
+                backend_endpoint: "sftp://benchmark-target".to_owned(),
+                database_prefix: objects.database_prefix.to_string(),
+                backend_kind: "sftp".to_owned(),
+                encryption_key_identity_sha256: [0x52; 32],
+            },
+        )?);
+        let bench_settings = WritebackSettings {
+            dir: journal_dir,
+            ack_mode: AckMode::Memory,
+            memory_bytes: total_bytes.saturating_add(64 << 20),
+            disk_bytes,
+            min_free_bytes: 1,
+            high_watermark_percent: 95,
+            resume_percent: 85,
+            upload_concurrency: production_writeback.upload_concurrency,
+            local_concurrency: production_writeback.local_concurrency,
+            shutdown_flush: ShutdownFlush::Local,
+        };
+        Ok((objects, saturation, scratch, journal, bench_settings))
+    })();
+    let (objects, saturation, scratch, journal, bench_settings) = match setup {
+        Ok(setup) => setup,
+        Err(error) => {
+            return Err(close_pool_after_setup_error(remote, pool, error).await);
+        }
+    };
+    let store = match WritebackObjectStore::open_paused(
+        Arc::clone(&remote),
+        journal,
+        bench_settings.clone(),
+    )
+    .await
+    {
+        Ok(store) => store,
+        Err(error) => {
+            return Err(close_pool_after_setup_error(remote, pool, error).await);
+        }
+    };
+
+    let mut payload = vec![0_u8; payload_bytes];
+    StdRng::seed_from_u64(0x5353_445f_4655_4c4c).fill_bytes(&mut payload);
+    let remote_directory_prepare =
+        prepare_remote_run(&pool, &objects.directories_deepest_first).await;
+    let benchmark = match remote_directory_prepare {
+        Ok(remote_directory_prepare) => {
+            execute_saturation_benchmark(
+                &store,
+                &remote,
+                &objects.objects,
+                Bytes::from(payload),
+                BenchGeometry {
+                    writers,
+                    max_connections,
+                    upload_concurrency: bench_settings.upload_concurrency,
+                    local_concurrency: bench_settings.local_concurrency,
+                    remote_directory_prepare,
+                },
+                saturation,
+            )
+            .await
+        }
+        Err(error) => Err(error.context("prepare remote saturation benchmark directories")),
+    };
+    let report = finish_sftp_run(
+        store,
+        remote,
+        pool,
+        scratch,
+        &objects,
+        benchmark,
+        "full-SSD SFTP pacing benchmark failed",
+    )
+    .await?;
+    println!(
+        "SFTP_WRITEBACK_SATURATION_BENCH {}",
+        serde_json::to_string(&report)?
+    );
     Ok(())
 }
 
