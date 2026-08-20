@@ -3186,13 +3186,16 @@ mod tests {
             journaler.barrier().wait_local(1).await,
             Err(LocalBarrierError::LocalDurability(_))
         ));
-        assert!(sink.published.lock().unwrap().is_empty());
-        assert_eq!(*sink.discarded.lock().unwrap(), vec![2]);
-        assert_eq!(admission.used_bytes(), 0);
+        // Barriers wake as soon as the terminal error is published, before the
+        // drain discards prepared work and releases its admission permits, so
+        // quiesce via shutdown before observing the discard outcome.
         assert!(matches!(
             journaler.shutdown().await,
             Err(LocalBarrierError::LocalDurability(_))
         ));
+        assert!(sink.published.lock().unwrap().is_empty());
+        assert_eq!(*sink.discarded.lock().unwrap(), vec![2]);
+        assert_eq!(admission.used_bytes(), 0);
     }
 
     #[tokio::test]
