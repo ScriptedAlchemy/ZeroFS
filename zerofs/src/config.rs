@@ -329,7 +329,10 @@ impl Default for SftpConfig {
 
 impl SftpConfig {
     pub const MAX_ACCOUNT_CONNECTIONS: usize = 8;
-    pub const MAX_DIRECTION_CONCURRENCY: usize = 7;
+    // Operations multiplex onto pooled connections, so per-direction
+    // concurrency may exceed max_connections; the transport still caps how
+    // many operations share one connection.
+    pub const MAX_DIRECTION_CONCURRENCY: usize = 64;
 
     fn validate(&self) -> Result<()> {
         if self.identity_file.to_string_lossy().trim().is_empty() {
@@ -346,20 +349,24 @@ impl SftpConfig {
                 Self::MAX_ACCOUNT_CONNECTIONS
             );
         }
+        // The pool can place at most SFTP_SESSION_MAX_CONCURRENT_OPS
+        // operations per connection, so bound per-direction concurrency by
+        // the configured pool size here instead of failing at pool
+        // construction.
+        let concurrency_ceiling = (self.max_connections
+            * crate::sftp_transport::SFTP_SESSION_MAX_CONCURRENT_OPS)
+            .min(Self::MAX_DIRECTION_CONCURRENCY);
         for (name, value) in [
             ("read_concurrency", self.read_concurrency),
             ("write_concurrency", self.write_concurrency),
         ] {
-            if !(1..=Self::MAX_DIRECTION_CONCURRENCY).contains(&value) {
+            if !(1..=concurrency_ceiling).contains(&value) {
                 anyhow::bail!(
-                    "[sftp] {name} must be between 1 and {}",
+                    "[sftp] {name} must be between 1 and {concurrency_ceiling} \
+                     ({} operations per connection across max_connections = {}, capped at {})",
+                    crate::sftp_transport::SFTP_SESSION_MAX_CONCURRENT_OPS,
+                    self.max_connections,
                     Self::MAX_DIRECTION_CONCURRENCY
-                );
-            }
-            if value > self.max_connections {
-                anyhow::bail!(
-                    "[sftp] {name} ({value}) must not exceed max_connections ({})",
-                    self.max_connections
                 );
             }
         }
@@ -412,7 +419,10 @@ impl SftpConfig {
     pub fn data_profile(&self) -> SftpDataProfile {
         SftpDataProfile {
             segment_size_bytes: self.segment_size_mib * 1024 * 1024,
-            max_inflight_seals: self.write_concurrency,
+            // Each in-flight seal buffers a full segment; cap the coupling to
+            // write_concurrency so raising SFTP operation concurrency does
+            // not silently multiply segment-buffer memory.
+            max_inflight_seals: self.write_concurrency.min(8),
             read_cache_part_size_bytes: self.read_cache_part_size_kib * 1024,
             read_fetch_window_min_bytes: self.read_cache_part_size_kib * 1024,
             read_fetch_window_max_bytes: self.segment_size_mib * 1024 * 1024,
@@ -572,7 +582,10 @@ const fn default_sftp_max_connections() -> usize {
 }
 
 const fn default_sftp_direction_concurrency() -> usize {
-    SftpConfig::MAX_DIRECTION_CONCURRENCY
+    // Concurrent operations per direction, multiplexed across pooled
+    // connections. Two per default connection hides the WAN round trip on
+    // small objects without letting bulk transfers oversubscribe memory.
+    16
 }
 
 const fn default_sftp_segment_size_mib() -> usize {
@@ -2313,8 +2326,8 @@ impl Settings {
             "# hpn_sha256 = \"...\"             # SHA-256 of that binary; required for hpn_openssh\n",
         );
         toml_string.push_str("# max_connections = 8\n");
-        toml_string.push_str("# read_concurrency = 7\n");
-        toml_string.push_str("# write_concurrency = 7\n");
+        toml_string.push_str("# read_concurrency = 16\n");
+        toml_string.push_str("# write_concurrency = 16\n");
         toml_string.push_str("# segment_size_mib = 32\n");
         toml_string.push_str("# read_cache_part_size_kib = 1024\n");
 
@@ -2334,7 +2347,7 @@ impl Settings {
         toml_string.push_str("# resume_percent = 85\n");
         toml_string.push_str("# local_concurrency = 4\n");
         toml_string.push_str(
-            "# upload_concurrency = 4         # generic default; SFTP auto-defaults to 7 and pipelines 64 requests per session\n",
+            "# upload_concurrency = 4         # generic default; SFTP auto-defaults to 8 lanes multiplexed over pooled sessions\n",
         );
         toml_string.push_str("# shutdown_flush = \"local\"       # local | remote\n");
 
@@ -2965,7 +2978,7 @@ min_free_gb = 256.0"#,
         );
         assert_eq!(writeback.disk_bytes, 512_000_000_000);
         assert_eq!(writeback.local_concurrency, 4);
-        assert_eq!(writeback.upload_concurrency, 7);
+        assert_eq!(writeback.upload_concurrency, 8);
     }
 
     #[test]
@@ -3202,8 +3215,8 @@ min_free_gb = 256.0"#,
         assert!(sftp.identity_file.ends_with(".ssh/id_ed25519"));
         assert!(sftp.known_hosts.ends_with(".ssh/known_hosts"));
         assert_eq!(sftp.max_connections, 8);
-        assert_eq!(sftp.read_concurrency, 7);
-        assert_eq!(sftp.write_concurrency, 7);
+        assert_eq!(sftp.read_concurrency, 16);
+        assert_eq!(sftp.write_concurrency, 16);
         assert_eq!(sftp.segment_size_mib, 32);
         assert_eq!(sftp.read_cache_part_size_kib, 1024);
         assert_eq!(sftp.transport, SftpSshTransport::Russh);
@@ -3424,16 +3437,18 @@ known_hosts = "${ZEROFS_TEST_KNOWN_HOSTS}""#,
             ("max_connections = 0", "max_connections"),
             ("max_connections = 9", "max_connections"),
             ("read_concurrency = 0", "read_concurrency"),
-            ("read_concurrency = 8", "read_concurrency"),
+            ("read_concurrency = 65", "read_concurrency"),
             ("write_concurrency = 0", "write_concurrency"),
-            ("write_concurrency = 8", "write_concurrency"),
+            ("write_concurrency = 65", "write_concurrency"),
+            // Concurrency beyond what the configured connections can place
+            // (16 multiplexed operations each) fails at load time.
             (
-                "max_connections = 4\nread_concurrency = 5",
-                "read_concurrency",
+                "max_connections = 2\nwrite_concurrency = 33",
+                "write_concurrency",
             ),
             (
-                "max_connections = 4\nread_concurrency = 4\nwrite_concurrency = 5",
-                "write_concurrency",
+                "max_connections = 1\nread_concurrency = 17",
+                "read_concurrency",
             ),
         ];
 
@@ -3445,6 +3460,16 @@ known_hosts = "${ZEROFS_TEST_KNOWN_HOSTS}""#,
             );
             assert!(err.contains(expected), "limits {limits:?}: got {err}");
         }
+
+        // Operations multiplex onto shared connections, so per-direction
+        // concurrency above max_connections is valid.
+        let extra = "[sftp]\nknown_hosts = \"/tmp/known_hosts\"\n\
+                     max_connections = 4\nread_concurrency = 8\nwrite_concurrency = 16";
+        let settings =
+            write_and_load(&sftp_config("sftp://alice@example.com/data", extra)).unwrap();
+        let sftp = settings.sftp.as_ref().unwrap();
+        assert_eq!(sftp.read_concurrency, 8);
+        assert_eq!(sftp.write_concurrency, 16);
     }
 
     #[test]

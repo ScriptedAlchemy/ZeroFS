@@ -509,6 +509,23 @@ impl Drop for StagingCleanup {
 
 const STORE_NAME: &str = "SFTP";
 const SFTP_NEGATIVE_CACHE_MAX_ENTRIES: usize = 16 * 1024;
+/// Ranged reads at or below this size are admitted as metadata operations:
+/// they cost one round trip like a stat and move a negligible payload, and
+/// database GC/compaction probes issue them in storms that must not compete
+/// with bulk transfers for read slots.
+const SFTP_METADATA_READ_MAX_BYTES: u64 = 256 * 1024;
+
+fn read_operation_kind(options: &GetOptions) -> crate::sftp_transport::OperationKind {
+    if options.head {
+        return crate::sftp_transport::OperationKind::Metadata;
+    }
+    if let Some(object_store::GetRange::Bounded(range)) = &options.range
+        && range.end.saturating_sub(range.start) <= SFTP_METADATA_READ_MAX_BYTES
+    {
+        return crate::sftp_transport::OperationKind::Metadata;
+    }
+    crate::sftp_transport::OperationKind::Read
+}
 // Directory listings need one metadata round trip per child; fan them out so a
 // large directory does not cost thousands of serialized WAN round trips. The
 // pool's own read/metadata admission limit still gates real concurrency.
@@ -609,10 +626,14 @@ impl RemoteSession for PooledRemoteSession {
         .map_err(remote_transport_error)
     }
 
+    // Remove, hard-link, and rename mutate the remote namespace but move no
+    // payload: each is one WAN round trip. Admitting them as metadata keeps
+    // publication finalization and cleanup from competing with bulk uploads
+    // for write slots.
     async fn remove_file(&self, path: &FilePath) -> RemoteResult<()> {
         with_lease!(
             self.pool,
-            crate::sftp_transport::OperationKind::Write,
+            crate::sftp_transport::OperationKind::Metadata,
             "SFTP remove",
             |lease| lease.remove_file(path)
         )
@@ -623,7 +644,7 @@ impl RemoteSession for PooledRemoteSession {
     async fn hard_link(&self, from: &FilePath, to: &FilePath) -> RemoteResult<()> {
         with_lease!(
             self.pool,
-            crate::sftp_transport::OperationKind::Write,
+            crate::sftp_transport::OperationKind::Metadata,
             "SFTP hard link",
             |lease| lease.hard_link(from, to)
         )
@@ -634,7 +655,7 @@ impl RemoteSession for PooledRemoteSession {
     async fn posix_rename(&self, from: &FilePath, to: &FilePath) -> RemoteResult<()> {
         with_lease!(
             self.pool,
-            crate::sftp_transport::OperationKind::Write,
+            crate::sftp_transport::OperationKind::Metadata,
             "SFTP POSIX rename",
             |lease| lease.posix_rename(from, to)
         )
@@ -784,11 +805,7 @@ impl SftpObjectStore {
         }
         let result = with_lease!(
             self.pool,
-            if options.head {
-                crate::sftp_transport::OperationKind::Metadata
-            } else {
-                crate::sftp_transport::OperationKind::Read
-            },
+            read_operation_kind(options),
             "SFTP object read",
             |lease| lease.read_object(&remote, options.range.clone(), options.head)
         )
@@ -1633,15 +1650,12 @@ mod tests {
             }
         }
 
-        async fn ensure_directory_component(
-            &mut self,
-            _path: &FilePath,
-        ) -> Result<(), TransportError> {
+        async fn ensure_directory_component(&self, _path: &FilePath) -> Result<(), TransportError> {
             Ok(())
         }
 
         async fn write_file_durable(
-            &mut self,
+            &self,
             _path: &FilePath,
             _chunks: Vec<Bytes>,
         ) -> Result<(), TransportError> {
@@ -1651,7 +1665,7 @@ mod tests {
         }
 
         async fn close(
-            self: Box<Self>,
+            &self,
             _force: tokio_util::sync::CancellationToken,
         ) -> Result<(), TransportError> {
             self.0.close_started.fetch_add(1, Ordering::SeqCst);
@@ -1703,15 +1717,12 @@ mod tests {
             }
         }
 
-        async fn ensure_directory_component(
-            &mut self,
-            _path: &FilePath,
-        ) -> Result<(), TransportError> {
+        async fn ensure_directory_component(&self, _path: &FilePath) -> Result<(), TransportError> {
             Ok(())
         }
 
         async fn write_file_durable(
-            &mut self,
+            &self,
             _path: &FilePath,
             _chunks: Vec<Bytes>,
         ) -> Result<(), TransportError> {
@@ -1723,20 +1734,16 @@ mod tests {
             }
         }
 
-        async fn remove_file(&mut self, _path: &FilePath) -> Result<(), TransportError> {
+        async fn remove_file(&self, _path: &FilePath) -> Result<(), TransportError> {
             Ok(())
         }
 
-        async fn hard_link(
-            &mut self,
-            _from: &FilePath,
-            _to: &FilePath,
-        ) -> Result<(), TransportError> {
+        async fn hard_link(&self, _from: &FilePath, _to: &FilePath) -> Result<(), TransportError> {
             Ok(())
         }
 
         async fn posix_rename(
-            &mut self,
+            &self,
             _from: &FilePath,
             _to: &FilePath,
         ) -> Result<(), TransportError> {
@@ -1744,7 +1751,7 @@ mod tests {
         }
 
         async fn close(
-            self: Box<Self>,
+            &self,
             _force: tokio_util::sync::CancellationToken,
         ) -> Result<(), TransportError> {
             Ok(())
@@ -1836,30 +1843,23 @@ mod tests {
             }
         }
 
-        async fn ensure_directory_component(
-            &mut self,
-            _path: &FilePath,
-        ) -> Result<(), TransportError> {
+        async fn ensure_directory_component(&self, _path: &FilePath) -> Result<(), TransportError> {
             Ok(())
         }
 
         async fn write_file_durable(
-            &mut self,
+            &self,
             _path: &FilePath,
             _chunks: Vec<Bytes>,
         ) -> Result<(), TransportError> {
             Ok(())
         }
 
-        async fn hard_link(
-            &mut self,
-            _from: &FilePath,
-            _to: &FilePath,
-        ) -> Result<(), TransportError> {
+        async fn hard_link(&self, _from: &FilePath, _to: &FilePath) -> Result<(), TransportError> {
             Ok(())
         }
 
-        async fn remove_file(&mut self, _path: &FilePath) -> Result<(), TransportError> {
+        async fn remove_file(&self, _path: &FilePath) -> Result<(), TransportError> {
             if self.0.remove_calls.fetch_add(1, Ordering::SeqCst) == 0 {
                 return Err(TransportError::Operation(
                     "forced first staging removal failure".to_owned(),
@@ -1871,7 +1871,7 @@ mod tests {
         }
 
         async fn close(
-            self: Box<Self>,
+            &self,
             _force: tokio_util::sync::CancellationToken,
         ) -> Result<(), TransportError> {
             Ok(())
@@ -1904,7 +1904,7 @@ mod tests {
             }
         }
 
-        async fn remove_file(&mut self, _path: &FilePath) -> Result<(), TransportError> {
+        async fn remove_file(&self, _path: &FilePath) -> Result<(), TransportError> {
             let current = self.0.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
             self.0.peak.fetch_max(current, Ordering::SeqCst);
             self.0.barrier.wait().await;
@@ -1913,7 +1913,7 @@ mod tests {
         }
 
         async fn close(
-            self: Box<Self>,
+            &self,
             _force: tokio_util::sync::CancellationToken,
         ) -> Result<(), TransportError> {
             Ok(())
@@ -2016,10 +2016,7 @@ mod tests {
             }
         }
 
-        async fn ensure_directory_component(
-            &mut self,
-            path: &FilePath,
-        ) -> Result<(), TransportError> {
+        async fn ensure_directory_component(&self, path: &FilePath) -> Result<(), TransportError> {
             for component in path.components() {
                 if !matches!(component, std::path::Component::Normal(_)) {
                     return Err(TransportError::Operation(format!(
@@ -2075,7 +2072,7 @@ mod tests {
         }
 
         async fn write_file_durable(
-            &mut self,
+            &self,
             path: &FilePath,
             _chunks: Vec<Bytes>,
         ) -> Result<(), TransportError> {
@@ -2093,7 +2090,7 @@ mod tests {
         }
 
         async fn close(
-            self: Box<Self>,
+            &self,
             _force: tokio_util::sync::CancellationToken,
         ) -> Result<(), TransportError> {
             Ok(())
@@ -2322,30 +2319,23 @@ mod tests {
             }
         }
 
-        async fn ensure_directory_component(
-            &mut self,
-            _path: &FilePath,
-        ) -> Result<(), TransportError> {
+        async fn ensure_directory_component(&self, _path: &FilePath) -> Result<(), TransportError> {
             Ok(())
         }
 
         async fn write_file_durable(
-            &mut self,
+            &self,
             _path: &FilePath,
             _chunks: Vec<Bytes>,
         ) -> Result<(), TransportError> {
             Ok(())
         }
 
-        async fn hard_link(
-            &mut self,
-            _from: &FilePath,
-            _to: &FilePath,
-        ) -> Result<(), TransportError> {
+        async fn hard_link(&self, _from: &FilePath, _to: &FilePath) -> Result<(), TransportError> {
             Ok(())
         }
 
-        async fn remove_file(&mut self, _path: &FilePath) -> Result<(), TransportError> {
+        async fn remove_file(&self, _path: &FilePath) -> Result<(), TransportError> {
             let call = self.0.remove_calls.fetch_add(1, Ordering::SeqCst) + 1;
             if call <= 2 {
                 if call == 2 {
@@ -2359,7 +2349,7 @@ mod tests {
         }
 
         async fn close(
-            self: Box<Self>,
+            &self,
             _force: tokio_util::sync::CancellationToken,
         ) -> Result<(), TransportError> {
             Ok(())
@@ -2479,7 +2469,7 @@ mod tests {
         }
 
         async fn read_object(
-            &mut self,
+            &self,
             path: &FilePath,
             requested_range: Option<object_store::GetRange>,
             head: bool,
@@ -2517,7 +2507,7 @@ mod tests {
         }
 
         async fn list_directory(
-            &mut self,
+            &self,
             path: &FilePath,
         ) -> Result<Vec<RemoteDirectoryEntry>, TransportError> {
             use crate::sftp_transport::RemoteEntryKind;
@@ -2543,7 +2533,7 @@ mod tests {
             Ok(entries)
         }
 
-        async fn remove_file(&mut self, path: &FilePath) -> Result<(), TransportError> {
+        async fn remove_file(&self, path: &FilePath) -> Result<(), TransportError> {
             self.0
                 .files
                 .lock()
@@ -2553,10 +2543,7 @@ mod tests {
                 .ok_or_else(|| TransportError::NotFound(path.display().to_string()))
         }
 
-        async fn ensure_directory_component(
-            &mut self,
-            path: &FilePath,
-        ) -> Result<(), TransportError> {
+        async fn ensure_directory_component(&self, path: &FilePath) -> Result<(), TransportError> {
             self.0
                 .directories
                 .lock()
@@ -2566,7 +2553,7 @@ mod tests {
         }
 
         async fn write_file_durable(
-            &mut self,
+            &self,
             path: &FilePath,
             chunks: Vec<Bytes>,
         ) -> Result<(), TransportError> {
@@ -2580,7 +2567,7 @@ mod tests {
         }
 
         async fn read_exact(
-            &mut self,
+            &self,
             path: &FilePath,
             offset: u64,
             len: usize,
@@ -2593,11 +2580,7 @@ mod tests {
             Ok(bytes.slice(start..start + len))
         }
 
-        async fn hard_link(
-            &mut self,
-            from: &FilePath,
-            to: &FilePath,
-        ) -> Result<(), TransportError> {
+        async fn hard_link(&self, from: &FilePath, to: &FilePath) -> Result<(), TransportError> {
             let mut files = self.0.files.lock().unwrap();
             if files.contains_key(to) {
                 return Err(TransportError::Operation(format!(
@@ -2613,11 +2596,7 @@ mod tests {
             Ok(())
         }
 
-        async fn posix_rename(
-            &mut self,
-            from: &FilePath,
-            to: &FilePath,
-        ) -> Result<(), TransportError> {
+        async fn posix_rename(&self, from: &FilePath, to: &FilePath) -> Result<(), TransportError> {
             let mut files = self.0.files.lock().unwrap();
             let bytes = files
                 .remove(from)
@@ -2627,7 +2606,7 @@ mod tests {
         }
 
         async fn close(
-            self: Box<Self>,
+            &self,
             _force: tokio_util::sync::CancellationToken,
         ) -> Result<(), TransportError> {
             Ok(())
@@ -2809,7 +2788,7 @@ mod tests {
             let session = OpenSshTransportSession::from_streams(stdin, stdout).await?;
             Ok(Box::new(LocalSftpSession {
                 session,
-                child,
+                child: tokio::sync::Mutex::new(child),
                 reads: self.reads.clone(),
                 payload_reads: self.payload_reads.clone(),
             }))
@@ -2818,7 +2797,7 @@ mod tests {
 
     struct LocalSftpSession {
         session: OpenSshTransportSession,
-        child: tokio::process::Child,
+        child: tokio::sync::Mutex<tokio::process::Child>,
         reads: Arc<AtomicUsize>,
         payload_reads: Arc<AtomicUsize>,
     }
@@ -2838,7 +2817,7 @@ mod tests {
         }
 
         async fn read_object(
-            &mut self,
+            &self,
             path: &FilePath,
             range: Option<object_store::GetRange>,
             head: bool,
@@ -2851,25 +2830,22 @@ mod tests {
         }
 
         async fn list_directory(
-            &mut self,
+            &self,
             path: &FilePath,
         ) -> Result<Vec<RemoteDirectoryEntry>, TransportError> {
             self.session.list_directory(path).await
         }
 
-        async fn remove_file(&mut self, path: &FilePath) -> Result<(), TransportError> {
+        async fn remove_file(&self, path: &FilePath) -> Result<(), TransportError> {
             self.session.remove_file(path).await
         }
 
-        async fn ensure_directory_component(
-            &mut self,
-            path: &FilePath,
-        ) -> Result<(), TransportError> {
+        async fn ensure_directory_component(&self, path: &FilePath) -> Result<(), TransportError> {
             self.session.ensure_directory_component(path).await
         }
 
         async fn write_file_durable(
-            &mut self,
+            &self,
             path: &FilePath,
             chunks: Vec<Bytes>,
         ) -> Result<(), TransportError> {
@@ -2877,7 +2853,7 @@ mod tests {
         }
 
         async fn write_file_at_durable(
-            &mut self,
+            &self,
             path: &FilePath,
             offset: u64,
             chunks: Vec<Bytes>,
@@ -2888,7 +2864,7 @@ mod tests {
         }
 
         async fn write_file_at(
-            &mut self,
+            &self,
             path: &FilePath,
             offset: u64,
             chunks: Vec<Bytes>,
@@ -2897,7 +2873,7 @@ mod tests {
         }
 
         async fn read_exact(
-            &mut self,
+            &self,
             path: &FilePath,
             offset: u64,
             len: usize,
@@ -2905,31 +2881,23 @@ mod tests {
             self.session.read_exact(path, offset, len).await
         }
 
-        async fn hard_link(
-            &mut self,
-            from: &FilePath,
-            to: &FilePath,
-        ) -> Result<(), TransportError> {
+        async fn hard_link(&self, from: &FilePath, to: &FilePath) -> Result<(), TransportError> {
             self.session.hard_link(from, to).await
         }
 
-        async fn posix_rename(
-            &mut self,
-            from: &FilePath,
-            to: &FilePath,
-        ) -> Result<(), TransportError> {
+        async fn posix_rename(&self, from: &FilePath, to: &FilePath) -> Result<(), TransportError> {
             self.session.posix_rename(from, to).await
         }
 
         async fn close(
-            self: Box<Self>,
+            &self,
             force: tokio_util::sync::CancellationToken,
         ) -> Result<(), TransportError> {
-            let LocalSftpSession {
-                session, mut child, ..
-            } = *self;
-            Box::new(session).close(force).await?;
-            let status = child
+            self.session.close(force).await?;
+            let status = self
+                .child
+                .lock()
+                .await
                 .wait()
                 .await
                 .map_err(|error| TransportError::Close(error.to_string()))?;

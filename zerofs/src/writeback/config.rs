@@ -194,10 +194,12 @@ const fn default_upload_concurrency() -> usize {
     4
 }
 
-// Fill the SFTP write-stream budget. Per-session russh-sftp pipelines 64 WRITE
-// requests; seven lanes remain below the default eight-session pool budget.
+// Publication lanes multiplex onto pooled SFTP connections, so more lanes
+// than connections hide the fixed per-object round trips. Eight lanes fill
+// half the default write-operation budget, leaving room for multipart parts
+// and finalization, and bound worst-case in-flight record memory.
 const fn default_sftp_upload_concurrency() -> usize {
-    7
+    8
 }
 
 const fn default_local_concurrency() -> usize {
@@ -275,6 +277,6 @@ mod tests {
             .unwrap();
 
         assert_eq!(generic.upload_concurrency, 4);
-        assert_eq!(sftp.upload_concurrency, 7);
+        assert_eq!(sftp.upload_concurrency, 8);
     }
 }

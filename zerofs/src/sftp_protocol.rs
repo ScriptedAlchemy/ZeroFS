@@ -348,10 +348,13 @@ impl SshConnectionOwner for DetachedConnectionOwner {
 }
 
 pub struct SftpProtocolSession {
-    sftp: Option<RawSftpSession>,
+    sftp: RawSftpSession,
+    closed: std::sync::atomic::AtomicBool,
     capabilities: SftpCapabilities,
     limits: SftpLimits,
-    owner: Option<Box<dyn SshConnectionOwner>>,
+    // Taken exactly once by `close`; the pool guarantees no operations are in
+    // flight when it closes a session, so contention here is teardown-only.
+    owner: std::sync::Mutex<Option<Box<dyn SshConnectionOwner>>>,
 }
 
 impl fmt::Debug for SftpProtocolSession {
@@ -365,9 +368,7 @@ impl fmt::Debug for SftpProtocolSession {
 
 impl Drop for SftpProtocolSession {
     fn drop(&mut self) {
-        if let Some(sftp) = self.sftp.take() {
-            let _ = sftp.close_session();
-        }
+        let _ = self.sftp.close_session();
     }
 }
 
@@ -379,10 +380,11 @@ impl SftpProtocolSession {
         owner: Box<dyn SshConnectionOwner>,
     ) -> Self {
         Self {
-            sftp: Some(sftp),
+            sftp,
+            closed: std::sync::atomic::AtomicBool::new(false),
             capabilities,
             limits,
-            owner: Some(owner),
+            owner: std::sync::Mutex::new(Some(owner)),
         }
     }
 
@@ -401,9 +403,12 @@ impl SftpProtocolSession {
         ))
     }
     fn sftp(&self) -> Result<&RawSftpSession, TransportError> {
-        self.sftp
-            .as_ref()
-            .ok_or_else(|| TransportError::Operation("SFTP session is closed".to_owned()))
+        if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(TransportError::Operation(
+                "SFTP session is closed".to_owned(),
+            ));
+        }
+        Ok(&self.sftp)
     }
 
     async fn write_chunks(
@@ -594,7 +599,7 @@ impl TransportSession for SftpProtocolSession {
     }
 
     async fn read_object(
-        &mut self,
+        &self,
         path: &Path,
         requested_range: Option<object_store::GetRange>,
         head: bool,
@@ -715,7 +720,7 @@ impl TransportSession for SftpProtocolSession {
     }
 
     async fn list_directory(
-        &mut self,
+        &self,
         path: &Path,
     ) -> Result<Vec<RemoteDirectoryEntry>, TransportError> {
         let sftp = self.sftp()?;
@@ -768,7 +773,7 @@ impl TransportSession for SftpProtocolSession {
         finish_raw_handle(operation, close)
     }
 
-    async fn remove_file(&mut self, path: &Path) -> Result<(), TransportError> {
+    async fn remove_file(&self, path: &Path) -> Result<(), TransportError> {
         let remote = sftp_path(path)?;
         self.sftp()?
             .remove(remote)
@@ -777,7 +782,7 @@ impl TransportSession for SftpProtocolSession {
             .map(|_| ())
     }
 
-    async fn ensure_directory_component(&mut self, path: &Path) -> Result<(), TransportError> {
+    async fn ensure_directory_component(&self, path: &Path) -> Result<(), TransportError> {
         let sftp = self.sftp()?;
         for component in path.components() {
             if !matches!(component, std::path::Component::Normal(_)) {
@@ -817,7 +822,7 @@ impl TransportSession for SftpProtocolSession {
     }
 
     async fn write_file_durable(
-        &mut self,
+        &self,
         path: &Path,
         chunks: Vec<Bytes>,
     ) -> Result<(), TransportError> {
@@ -825,7 +830,7 @@ impl TransportSession for SftpProtocolSession {
     }
 
     async fn write_file_at_durable(
-        &mut self,
+        &self,
         path: &Path,
         offset: u64,
         chunks: Vec<Bytes>,
@@ -834,7 +839,7 @@ impl TransportSession for SftpProtocolSession {
     }
 
     async fn write_file_at(
-        &mut self,
+        &self,
         path: &Path,
         offset: u64,
         chunks: Vec<Bytes>,
@@ -843,7 +848,7 @@ impl TransportSession for SftpProtocolSession {
     }
 
     async fn read_exact(
-        &mut self,
+        &self,
         path: &Path,
         offset: u64,
         len: usize,
@@ -864,7 +869,7 @@ impl TransportSession for SftpProtocolSession {
         finish_raw_handle(bytes, close)
     }
 
-    async fn hard_link(&mut self, from: &Path, to: &Path) -> Result<(), TransportError> {
+    async fn hard_link(&self, from: &Path, to: &Path) -> Result<(), TransportError> {
         let sftp = self.sftp()?;
         sftp.hardlink(sftp_path(from)?, sftp_path(to)?)
             .await
@@ -872,7 +877,7 @@ impl TransportSession for SftpProtocolSession {
             .map_err(|error| map_sftp_error(to, error))
     }
 
-    async fn posix_rename(&mut self, from: &Path, to: &Path) -> Result<(), TransportError> {
+    async fn posix_rename(&self, from: &Path, to: &Path) -> Result<(), TransportError> {
         if !self.capabilities.posix_rename {
             return Err(TransportError::MissingCapability(POSIX_RENAME));
         }
@@ -902,11 +907,12 @@ impl TransportSession for SftpProtocolSession {
         }
     }
 
-    async fn close(mut self: Box<Self>, force: CancellationToken) -> Result<(), TransportError> {
-        if let Some(sftp) = self.sftp.take() {
-            let _ = sftp.close_session();
-        }
-        match self.owner.take() {
+    async fn close(&self, force: CancellationToken) -> Result<(), TransportError> {
+        self.closed
+            .store(true, std::sync::atomic::Ordering::Release);
+        let _ = self.sftp.close_session();
+        let owner = self.owner.lock().unwrap().take();
+        match owner {
             Some(owner) => owner.close(force).await,
             None => Ok(()),
         }

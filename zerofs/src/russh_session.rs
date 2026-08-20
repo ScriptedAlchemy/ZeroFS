@@ -787,7 +787,7 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
             env.known_hosts.clone(),
         )
         .unwrap();
-        let mut session = factory
+        let session = factory
             .open(CancellationToken::new())
             .await
             .expect("native russh client must complete a loopback handshake");
@@ -864,7 +864,7 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
             env.known_hosts.clone(),
         )
         .unwrap();
-        let mut session = factory.open(CancellationToken::new()).await.unwrap();
+        let session = factory.open(CancellationToken::new()).await.unwrap();
         let payload = Bytes::from(vec![0xa5; SFTP_READ_PACKET_SIZE + 17]);
 
         session
@@ -1008,7 +1008,7 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
             env.known_hosts.clone(),
         )
         .unwrap();
-        let mut session = factory.open(CancellationToken::new()).await.unwrap();
+        let session = factory.open(CancellationToken::new()).await.unwrap();
         session
             .write_file_durable(
                 Path::new("missing-mtime.bin"),
