@@ -3270,6 +3270,31 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn writable_config_warms_the_full_connection_budget_before_returning() {
+        let factory = RecordingFactory::fully_capable();
+        let config = crate::config::SftpConfig {
+            identity_file: "/tmp/id-ed25519".into(),
+            known_hosts: "/tmp/known-hosts".into(),
+            max_connections: 4,
+            read_concurrency: 8,
+            write_concurrency: 8,
+            segment_size_mib: 32,
+            read_cache_part_size_kib: 1024,
+            ..Default::default()
+        };
+
+        let pool = SftpSessionPool::from_config_writable(Arc::new(factory.clone()), &config)
+            .await
+            .unwrap();
+
+        assert_eq!(factory.dials(), 4);
+        assert_eq!(factory.live(), 4);
+        assert_eq!(pool.inner.roster.lock().unwrap().len(), 4);
+        pool.shutdown().await.unwrap();
+        assert_eq!(factory.live(), 0);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn idle_reaper_closes_expired_sessions_but_keeps_one_warm() {
         let factory = RecordingFactory::fully_capable();
