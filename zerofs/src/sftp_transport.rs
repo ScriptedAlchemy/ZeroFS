@@ -1704,9 +1704,10 @@ impl Drop for SessionLease {
 mod tests {
     use super::{
         LeaseFinishError, OpenSshTransportSession, OperationKind, RemoteEntryKind,
-        SFTP_READ_PACKET_SIZE, SFTP_READ_REQUEST_CONCURRENCY, SFTP_WRITE_PACKET_SIZE,
-        SFTP_WRITE_REQUEST_CONCURRENCY, SessionDisposition, SessionFactory, SftpSessionPool,
-        TransportError, TransportSession, plan_pipelined_reads, plan_pipelined_writes,
+        SFTP_IDLE_REAP_INTERVAL, SFTP_IDLE_TIMEOUT, SFTP_READ_PACKET_SIZE,
+        SFTP_READ_REQUEST_CONCURRENCY, SFTP_WRITE_PACKET_SIZE, SFTP_WRITE_REQUEST_CONCURRENCY,
+        SessionDisposition, SessionFactory, SftpSessionPool, TransportError, TransportSession,
+        plan_pipelined_reads, plan_pipelined_writes,
     };
     use crate::sftp_object_store::{ObjectHeader, SftpCapabilities, encode_header};
     use async_trait::async_trait;
