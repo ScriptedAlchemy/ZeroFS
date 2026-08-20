@@ -2649,6 +2649,38 @@ mod tests {
         pool.shutdown().await.unwrap();
     }
 
+    #[tokio::test]
+    async fn pipelined_writes_wait_for_an_idle_physical_session() {
+        let factory = RecordingFactory::fully_capable();
+        let pool = Arc::new(pool(factory, 2, 4, 4).await);
+        let first = pool.checkout(OperationKind::Write).await.unwrap();
+        let second = pool.checkout(OperationKind::Write).await.unwrap();
+
+        let waiting = tokio::spawn({
+            let pool = pool.clone();
+            async move { pool.checkout(OperationKind::Write).await.unwrap() }
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), async {
+                while !waiting.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_err(),
+            "a fully pipelined upload must not share a physical session with another upload"
+        );
+
+        first.complete().await.unwrap();
+        let third = tokio::time::timeout(std::time::Duration::from_secs(1), waiting)
+            .await
+            .expect("a released physical session admits the waiting upload")
+            .unwrap();
+        third.complete().await.unwrap();
+        second.complete().await.unwrap();
+        pool.shutdown().await.unwrap();
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn retirement_marks_broken_only_while_removing_from_the_roster() {
         let factory = RecordingFactory::fully_capable();
