@@ -20,14 +20,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SftpBenchTiming {
     pub open_nanos: u64,
-    /// Serialized wall time of the whole write reply window. Since writes,
-    /// fsync, and close are issued together and their replies awaited in one
-    /// window, this single counter carries the pipelined window's cost;
-    /// `fsync_nanos`/`close_nanos` then record only serialized time spent
-    /// beyond it (the large-write tail window), not per-request latency.
-    pub write_nanos: u64,
-    pub fsync_nanos: u64,
-    pub close_nanos: u64,
+    pub publication_window_nanos: u64,
     pub hardlink_nanos: u64,
     pub remove_nanos: u64,
     pub publications: u64,
@@ -38,11 +31,7 @@ pub(crate) struct SftpBenchTiming {
 #[cfg(test)]
 static BENCH_OPEN_NANOS: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
-static BENCH_WRITE_NANOS: AtomicU64 = AtomicU64::new(0);
-#[cfg(test)]
-static BENCH_FSYNC_NANOS: AtomicU64 = AtomicU64::new(0);
-#[cfg(test)]
-static BENCH_CLOSE_NANOS: AtomicU64 = AtomicU64::new(0);
+static BENCH_PUBLICATION_WINDOW_NANOS: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 static BENCH_HARDLINK_NANOS: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
@@ -65,9 +54,7 @@ fn bench_nanos(elapsed: std::time::Duration) -> u64 {
 pub(crate) fn reset_bench_timing() {
     for counter in [
         &BENCH_OPEN_NANOS,
-        &BENCH_WRITE_NANOS,
-        &BENCH_FSYNC_NANOS,
-        &BENCH_CLOSE_NANOS,
+        &BENCH_PUBLICATION_WINDOW_NANOS,
         &BENCH_HARDLINK_NANOS,
         &BENCH_REMOVE_NANOS,
         &BENCH_PUBLICATIONS,
@@ -86,9 +73,7 @@ pub(crate) fn reset_bench_timing() {
 pub(crate) fn bench_timing() -> SftpBenchTiming {
     SftpBenchTiming {
         open_nanos: BENCH_OPEN_NANOS.load(Ordering::SeqCst),
-        write_nanos: BENCH_WRITE_NANOS.load(Ordering::SeqCst),
-        fsync_nanos: BENCH_FSYNC_NANOS.load(Ordering::SeqCst),
-        close_nanos: BENCH_CLOSE_NANOS.load(Ordering::SeqCst),
+        publication_window_nanos: BENCH_PUBLICATION_WINDOW_NANOS.load(Ordering::SeqCst),
         hardlink_nanos: BENCH_HARDLINK_NANOS.load(Ordering::SeqCst),
         remove_nanos: BENCH_REMOVE_NANOS.load(Ordering::SeqCst),
         publications: BENCH_PUBLICATIONS.load(Ordering::SeqCst),
@@ -545,6 +530,26 @@ impl SftpProtocolSession {
         #[cfg(test)]
         BENCH_OPEN_NANOS.fetch_add(bench_nanos(open_started.elapsed()), Ordering::SeqCst);
         let handle = opened.handle;
+        let requests = match transfer_request_len(
+            SFTP_WRITE_PACKET_SIZE,
+            self.limits.write_len,
+            self.limits.packet_len,
+            handle.len(),
+        )
+        .and_then(|packet_size| plan_pipelined_writes(offset, chunks, packet_size))
+        {
+            Ok(requests) => requests,
+            Err(error) => {
+                let close = sftp
+                    .close(handle)
+                    .await
+                    .map_err(|error| map_sftp_close_error(path, error))
+                    .map(|_| ());
+                return finish_raw_handle(Err(error), close);
+            }
+        };
+        #[cfg(test)]
+        let window_started = std::time::Instant::now();
         let fsync = || async {
             if durable {
                 sftp.fsync(handle.as_str())
@@ -561,25 +566,6 @@ impl SftpProtocolSession {
                 .map(|_| ())
                 .map_err(|error| map_sftp_close_error(path, error))
         };
-        let planned = transfer_request_len(
-            SFTP_WRITE_PACKET_SIZE,
-            self.limits.write_len,
-            self.limits.packet_len,
-            handle.len(),
-        )
-        .and_then(|packet_size| plan_pipelined_writes(offset, chunks, packet_size));
-        let requests = match planned {
-            Ok(requests) => requests,
-            Err(error) => {
-                // The handle is already open on the server: a planning
-                // failure must still retire it instead of leaking it for the
-                // lifetime of the session.
-                let close = close_handle().await;
-                return finish_raw_handle(Err(error), close);
-            }
-        };
-        #[cfg(test)]
-        let window_started = std::time::Instant::now();
         let (operation, close) = if requests.len() <= SFTP_WRITE_REQUEST_CONCURRENCY {
             // The raw session queues every request onto the outbound stream
             // before its first await, and the server executes one channel's
@@ -609,7 +595,8 @@ impl SftpProtocolSession {
         };
         #[cfg(test)]
         {
-            BENCH_WRITE_NANOS.fetch_add(bench_nanos(window_started.elapsed()), Ordering::SeqCst);
+            BENCH_PUBLICATION_WINDOW_NANOS
+                .fetch_add(bench_nanos(window_started.elapsed()), Ordering::SeqCst);
             BENCH_PUBLICATIONS.fetch_add(1, Ordering::SeqCst);
             BENCH_SESSION_PUBLICATIONS[self.bench_session_slot].fetch_add(1, Ordering::SeqCst);
             BENCH_SESSION_WRITE_BYTES[self.bench_session_slot]
@@ -1222,100 +1209,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_write_plan_failure_after_open_still_closes_the_remote_handle() {
-        use russh_sftp::protocol::{Handle as HandlePacket, Packet, Status, StatusCode, Version};
-        use std::collections::HashMap;
-        use std::sync::{Arc, Mutex};
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        async fn send_packet<W: tokio::io::AsyncWrite + Unpin>(writer: &mut W, packet: Packet) {
-            let bytes = Bytes::try_from(packet).unwrap();
-            writer.write_all(&bytes).await.unwrap();
-            writer.flush().await.unwrap();
-        }
-
-        let (client_stream, server_stream) = tokio::io::duplex(1 << 16);
-        let arrivals: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let server_arrivals = Arc::clone(&arrivals);
-        tokio::spawn(async move {
-            let (mut reader, mut writer) = tokio::io::split(server_stream);
-            loop {
-                let Ok(length) = reader.read_u32().await else {
-                    break;
-                };
-                let mut frame = vec![0_u8; length as usize];
-                if frame.is_empty() || reader.read_exact(&mut frame).await.is_err() {
-                    break;
-                }
-                let mut frame = Bytes::from(frame);
-                let Ok(packet) = Packet::try_from(&mut frame) else {
-                    break;
-                };
-                match packet {
-                    Packet::Init(_) => {
-                        send_packet(
-                            &mut writer,
-                            Packet::Version(Version {
-                                version: 3,
-                                extensions: HashMap::from([(FSYNC.to_owned(), "1".to_owned())]),
-                            }),
-                        )
-                        .await;
-                    }
-                    Packet::Open(open) => {
-                        send_packet(
-                            &mut writer,
-                            Packet::Handle(HandlePacket {
-                                id: open.id,
-                                handle: "handle-1".to_owned(),
-                            }),
-                        )
-                        .await;
-                    }
-                    Packet::Close(close) => {
-                        server_arrivals.lock().unwrap().push("close".to_owned());
-                        send_packet(
-                            &mut writer,
-                            Packet::Status(Status {
-                                id: close.id,
-                                status_code: StatusCode::Ok,
-                                error_message: "ok".to_owned(),
-                                language_tag: "en-US".to_owned(),
-                            }),
-                        )
-                        .await;
-                    }
-                    _ => break,
-                }
-            }
-        });
-
-        let (read_half, write_half) = tokio::io::split(client_stream);
-        let session = SftpProtocolSession::from_streams(write_half, read_half)
-            .await
-            .unwrap();
-        // An offset at u64::MAX makes the write plan overflow after the
-        // handle is already open on the server.
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            session.write_file_at_durable(
-                Path::new("staging-object"),
-                u64::MAX,
-                vec![Bytes::from_static(b"payload")],
-            ),
-        )
-        .await
-        .expect("a failed write plan must resolve promptly");
-        result.expect_err("an overflowing write plan must fail the operation");
-
-        assert_eq!(
-            arrivals.lock().unwrap().as_slice(),
-            ["close"],
-            "the opened remote handle must be closed even when planning fails"
-        );
-    }
-
-    #[tokio::test]
     async fn durable_write_pipelines_writes_fsync_and_close_into_one_request_window() {
         use russh_sftp::protocol::{Handle as HandlePacket, Packet, Status, StatusCode, Version};
         use std::collections::HashMap;
@@ -1328,6 +1221,7 @@ mod tests {
             writer.flush().await.unwrap();
         }
 
+        reset_bench_timing();
         let (client_stream, server_stream) = tokio::io::duplex(1 << 20);
         let arrivals: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let server_arrivals = Arc::clone(&arrivals);
@@ -1453,6 +1347,99 @@ mod tests {
         assert!(
             fsync_at < close_at,
             "close must be sent after fsync: {arrivals:?}"
+        );
+        let timing = bench_timing();
+        assert_eq!(timing.publications, 1);
+        assert!(timing.publication_window_nanos > 0);
+    }
+
+    #[tokio::test]
+    async fn write_planning_failure_closes_the_open_handle() {
+        use russh_sftp::protocol::{Handle as HandlePacket, Packet, Status, StatusCode, Version};
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn send_packet<W: tokio::io::AsyncWrite + Unpin>(writer: &mut W, packet: Packet) {
+            let bytes = Bytes::try_from(packet).unwrap();
+            writer.write_all(&bytes).await.unwrap();
+            writer.flush().await.unwrap();
+        }
+
+        let (client_stream, server_stream) = tokio::io::duplex(1 << 20);
+        let close_seen = Arc::new(AtomicBool::new(false));
+        let server_close_seen = Arc::clone(&close_seen);
+        tokio::spawn(async move {
+            let (mut reader, mut writer) = tokio::io::split(server_stream);
+            loop {
+                let Ok(length) = reader.read_u32().await else {
+                    break;
+                };
+                let mut frame = vec![0_u8; length as usize];
+                if frame.is_empty() || reader.read_exact(&mut frame).await.is_err() {
+                    break;
+                }
+                let mut frame = Bytes::from(frame);
+                let Ok(packet) = Packet::try_from(&mut frame) else {
+                    break;
+                };
+                match packet {
+                    Packet::Init(_) => {
+                        send_packet(
+                            &mut writer,
+                            Packet::Version(Version {
+                                version: 3,
+                                extensions: HashMap::new(),
+                            }),
+                        )
+                        .await;
+                    }
+                    Packet::Open(open) => {
+                        send_packet(
+                            &mut writer,
+                            Packet::Handle(HandlePacket {
+                                id: open.id,
+                                handle: "planning-handle".to_owned(),
+                            }),
+                        )
+                        .await;
+                    }
+                    Packet::Close(close) => {
+                        server_close_seen.store(true, Ordering::SeqCst);
+                        send_packet(
+                            &mut writer,
+                            Packet::Status(Status {
+                                id: close.id,
+                                status_code: StatusCode::Ok,
+                                error_message: "ok".to_owned(),
+                                language_tag: "en-US".to_owned(),
+                            }),
+                        )
+                        .await;
+                    }
+                    _ => break,
+                }
+            }
+        });
+
+        let (read_half, write_half) = tokio::io::split(client_stream);
+        let session = SftpProtocolSession::from_streams(write_half, read_half)
+            .await
+            .unwrap();
+        let error = session
+            .write_file_at(
+                Path::new("staging-object"),
+                u64::MAX,
+                vec![Bytes::from_static(b"overflow")],
+            )
+            .await
+            .expect_err("offset overflow must fail planning");
+
+        assert!(matches!(error, TransportError::Operation(_)), "{error:?}");
+        assert!(
+            close_seen.load(Ordering::SeqCst),
+            "open handle was not closed"
         );
     }
 }

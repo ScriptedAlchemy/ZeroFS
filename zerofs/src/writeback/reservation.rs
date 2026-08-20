@@ -516,6 +516,11 @@ impl SsdAdmission {
         lock(&self.inner.state).used_operations
     }
 
+    #[cfg(test)]
+    pub(crate) fn waiter_count(&self) -> usize {
+        lock(&self.inner.state).waiters.len()
+    }
+
     pub(crate) fn outstanding_physical_claims(&self) -> u64 {
         lock(&self.inner.state).outstanding_physical_claims
     }

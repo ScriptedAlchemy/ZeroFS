@@ -155,14 +155,12 @@ struct BenchReport {
     remote_read_seconds: f64,
     remote_read_mib_per_second: f64,
     remote_read_verified_objects: usize,
-    sftp_publications: u64,
+    sftp_write_handles_closed: u64,
     sftp_open_total_seconds: f64,
-    sftp_write_total_seconds: f64,
-    sftp_fsync_total_seconds: f64,
-    sftp_close_total_seconds: f64,
+    sftp_publication_window_total_seconds: f64,
     sftp_hardlink_total_seconds: f64,
     sftp_remove_total_seconds: f64,
-    sftp_session_publications: Vec<u64>,
+    sftp_session_write_handles_closed: Vec<u64>,
     sftp_session_write_bytes: Vec<u64>,
     payload_sha256: String,
     manifest_payload_sha256: String,
@@ -173,16 +171,20 @@ struct SaturationReport {
     total_bytes: u64,
     object_count: usize,
     payload_bytes: usize,
+    manifest_payload_bytes: usize,
+    segment_objects: usize,
+    manifest_objects: usize,
     writers: usize,
     max_connections: usize,
     upload_concurrency: usize,
     local_concurrency: usize,
     ssd_capacity_bytes: u64,
     ssd_high_watermark_bytes: u64,
-    ssd_reservation_bytes_per_object: u64,
+    ssd_reservation_bytes_min: u64,
+    ssd_reservation_bytes_max: u64,
     prefill_objects: usize,
     prefill_reserved_bytes: u64,
-    blocked_objects_before_activation: usize,
+    tail_objects_after_activation: usize,
     prefill_seconds: f64,
     remote_directory_prepare_seconds: f64,
     first_blocked_ack_seconds: f64,
@@ -197,16 +199,15 @@ struct SaturationReport {
     remote_read_seconds: f64,
     remote_read_mib_per_second: f64,
     remote_read_verified_objects: usize,
-    sftp_publications: u64,
+    sftp_write_handles_closed: u64,
     sftp_open_total_seconds: f64,
-    sftp_write_total_seconds: f64,
-    sftp_fsync_total_seconds: f64,
-    sftp_close_total_seconds: f64,
+    sftp_publication_window_total_seconds: f64,
     sftp_hardlink_total_seconds: f64,
     sftp_remove_total_seconds: f64,
-    sftp_session_publications: Vec<u64>,
+    sftp_session_write_handles_closed: Vec<u64>,
     sftp_session_write_bytes: Vec<u64>,
     payload_sha256: String,
+    manifest_payload_sha256: String,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -220,11 +221,13 @@ struct BenchGeometry {
 
 #[derive(Debug, Clone, Copy)]
 struct SaturationGeometry {
-    reservation_bytes: u64,
+    reservation_bytes_min: u64,
+    reservation_bytes_max: u64,
     high_watermark_bytes: u64,
     prefill_reserved_bytes: u64,
     prefill_objects: usize,
     paced_objects: usize,
+    paced_payload_bytes: u64,
 }
 
 impl SaturationGeometry {
@@ -235,26 +238,50 @@ impl SaturationGeometry {
 
     fn new(
         objects: &[ObjectPath],
-        payload_bytes: usize,
+        classes: &[BenchObjectClass],
+        segment_payload_bytes: usize,
+        manifest_payload_bytes: usize,
         disk_bytes: u64,
         high_watermark_percent: u8,
     ) -> Result<Self> {
         anyhow::ensure!(!objects.is_empty(), "saturation benchmark needs objects");
-        anyhow::ensure!(payload_bytes > 0, "saturation payload must be positive");
+        anyhow::ensure!(
+            objects.len() == classes.len(),
+            "saturation object classes must match object paths"
+        );
+        anyhow::ensure!(
+            segment_payload_bytes > 0 && manifest_payload_bytes > 0,
+            "saturation payloads must be positive"
+        );
         anyhow::ensure!(
             (1..=100).contains(&high_watermark_percent),
             "saturation high watermark must be between 1 and 100"
         );
-        let reservation_bytes = Self::reservation_bytes(&objects[0], payload_bytes)?;
-        for path in &objects[1..] {
-            anyhow::ensure!(
-                Self::reservation_bytes(path, payload_bytes)? == reservation_bytes,
-                "saturation benchmark object paths must reserve equally"
-            );
-        }
+        let reservation_bytes = objects
+            .iter()
+            .zip(classes.iter().copied())
+            .map(|(path, class)| {
+                let payload_bytes = match class {
+                    BenchObjectClass::Segment => segment_payload_bytes,
+                    BenchObjectClass::Manifest => manifest_payload_bytes,
+                };
+                Self::reservation_bytes(path, payload_bytes)
+            })
+            .collect::<Result<Vec<_>>>()?;
         let high_watermark_bytes =
             u64::try_from(u128::from(disk_bytes) * u128::from(high_watermark_percent) / 100)?;
-        let prefill_objects = usize::try_from(high_watermark_bytes / reservation_bytes)?;
+        let mut prefill_reserved_bytes = 0_u64;
+        let mut prefill_objects = 0_usize;
+        for reservation in &reservation_bytes {
+            let Some(next) = prefill_reserved_bytes.checked_add(*reservation) else {
+                anyhow::bail!("saturation prefill reservation overflowed");
+            };
+            if next > high_watermark_bytes {
+                break;
+            }
+            prefill_reserved_bytes = next;
+            prefill_objects += 1;
+        }
         anyhow::ensure!(
             prefill_objects > 0,
             "saturation SSD budget cannot admit one payload"
@@ -263,16 +290,35 @@ impl SaturationGeometry {
             prefill_objects < objects.len(),
             "saturation workload must exceed the SSD high watermark"
         );
-        let prefill_reserved_bytes = reservation_bytes
-            .checked_mul(u64::try_from(prefill_objects)?)
-            .context("saturation prefill reservation overflowed")?;
+        let paced_payload_bytes =
+            classes[prefill_objects..]
+                .iter()
+                .try_fold(0_u64, |total, class| {
+                    let payload = match class {
+                        BenchObjectClass::Segment => segment_payload_bytes,
+                        BenchObjectClass::Manifest => manifest_payload_bytes,
+                    };
+                    total
+                        .checked_add(u64::try_from(payload)?)
+                        .context("saturation tail payload overflowed")
+                })?;
+        let reservation_bytes_min = *reservation_bytes
+            .iter()
+            .min()
+            .context("saturation benchmark needs reservations")?;
+        let reservation_bytes_max = *reservation_bytes
+            .iter()
+            .max()
+            .context("saturation benchmark needs reservations")?;
 
         Ok(Self {
-            reservation_bytes,
+            reservation_bytes_min,
+            reservation_bytes_max,
             high_watermark_bytes,
             prefill_reserved_bytes,
             prefill_objects,
             paced_objects: objects.len() - prefill_objects,
+            paced_payload_bytes,
         })
     }
 }
@@ -297,6 +343,14 @@ fn mib_per_second(total_bytes: u64, elapsed: Duration) -> f64 {
 
 fn seconds(nanos: u64) -> f64 {
     Duration::from_nanos(nanos).as_secs_f64()
+}
+
+fn max_inter_completion_gap(completions: &[Duration]) -> Duration {
+    completions
+        .windows(2)
+        .map(|pair| pair[1].saturating_sub(pair[0]))
+        .max()
+        .unwrap_or_default()
 }
 
 fn generated_segment_options() -> PutOptions {
@@ -519,14 +573,13 @@ async fn execute_benchmark(
         remote_read_seconds: remote_read.as_secs_f64(),
         remote_read_mib_per_second: mib_per_second(total_bytes, remote_read),
         remote_read_verified_objects,
-        sftp_publications: sftp_timing.publications,
+        sftp_write_handles_closed: sftp_timing.publications,
         sftp_open_total_seconds: seconds(sftp_timing.open_nanos),
-        sftp_write_total_seconds: seconds(sftp_timing.write_nanos),
-        sftp_fsync_total_seconds: seconds(sftp_timing.fsync_nanos),
-        sftp_close_total_seconds: seconds(sftp_timing.close_nanos),
+        sftp_publication_window_total_seconds: seconds(sftp_timing.publication_window_nanos),
         sftp_hardlink_total_seconds: seconds(sftp_timing.hardlink_nanos),
         sftp_remove_total_seconds: seconds(sftp_timing.remove_nanos),
-        sftp_session_publications: sftp_timing.session_publications[..last_used_session].to_vec(),
+        sftp_session_write_handles_closed: sftp_timing.session_publications[..last_used_session]
+            .to_vec(),
         sftp_session_write_bytes: sftp_timing.session_write_bytes[..last_used_session].to_vec(),
         payload_sha256,
         manifest_payload_sha256,
@@ -537,39 +590,76 @@ async fn execute_saturation_benchmark(
     store: &WritebackObjectStore,
     remote: &Arc<dyn ObjectStore>,
     objects: &[ObjectPath],
-    payload: Bytes,
+    classes: &[BenchObjectClass],
+    segment_payload: Bytes,
+    manifest_payload: Bytes,
     geometry: BenchGeometry,
     saturation: SaturationGeometry,
 ) -> Result<SaturationReport> {
-    let total_bytes = u64::try_from(objects.len())?
-        .checked_mul(u64::try_from(payload.len())?)
-        .context("saturation benchmark byte count overflowed")?;
-    let blocked_bytes = u64::try_from(saturation.paced_objects)?
-        .checked_mul(u64::try_from(payload.len())?)
-        .context("saturation blocked byte count overflowed")?;
+    anyhow::ensure!(
+        objects.len() == classes.len(),
+        "saturation object classes must match object paths"
+    );
+    let total_bytes = classes.iter().try_fold(0_u64, |total, class| {
+        let payload = benchmark_payload(*class, &segment_payload, &manifest_payload);
+        total
+            .checked_add(u64::try_from(payload.len())?)
+            .context("saturation benchmark byte count overflowed")
+    })?;
+    let blocked_bytes = saturation.paced_payload_bytes;
     let mut hasher = Sha256::new();
-    hasher.update(&payload);
+    hasher.update(&segment_payload);
     let payload_sha256 = format!("{:x}", hasher.finalize());
+    let mut manifest_hasher = Sha256::new();
+    manifest_hasher.update(&manifest_payload);
+    let manifest_payload_sha256 = format!("{:x}", manifest_hasher.finalize());
     let paths = Arc::new(objects.to_vec());
+    let classes = Arc::new(classes.to_vec());
     crate::sftp_protocol::reset_bench_timing();
+
+    let prefill_started = Instant::now();
+    for index in 0..saturation.prefill_objects {
+        let class = classes[index];
+        store
+            .put_opts(
+                &paths[index],
+                benchmark_payload(class, &segment_payload, &manifest_payload)
+                    .clone()
+                    .into(),
+                benchmark_put_options(class),
+            )
+            .await
+            .with_context(|| format!("prefill object {index} failed"))?;
+    }
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        store.wait_local(u64::try_from(saturation.prefill_objects)?),
+    )
+    .await
+    .context("timed out waiting for saturation prefill durability")??;
+    let prefill = prefill_started.elapsed();
 
     let (completion_sender, mut completion_receiver) =
         tokio::sync::mpsc::unbounded_channel::<(usize, std::result::Result<(), String>)>();
     let mut writers = tokio::task::JoinSet::new();
-    let prefill_started = Instant::now();
     for writer in 0..geometry.writers {
-        let store = store.clone();
-        let payload = payload.clone();
+        let writer_store = store.clone();
+        let segment_payload = segment_payload.clone();
+        let manifest_payload = manifest_payload.clone();
         let paths = Arc::clone(&paths);
+        let classes = Arc::clone(&classes);
         let completion_sender = completion_sender.clone();
         writers.spawn(async move {
-            let mut index = writer;
+            let mut index = saturation.prefill_objects + writer;
             while index < paths.len() {
-                let result = store
+                let class = classes[index];
+                let result = writer_store
                     .put_opts(
                         &paths[index],
-                        payload.clone().into(),
-                        generated_segment_options(),
+                        benchmark_payload(class, &segment_payload, &manifest_payload)
+                            .clone()
+                            .into(),
+                        benchmark_put_options(class),
                     )
                     .await
                     .map(|_| ())
@@ -584,24 +674,17 @@ async fn execute_saturation_benchmark(
                 index += geometry.writers;
             }
         });
+        if writer == 0 {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while store.ssd_admission().waiter_count() == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .context("first saturation tail object did not enter SSD admission")?;
+        }
     }
     drop(completion_sender);
-
-    for _ in 0..saturation.prefill_objects {
-        let (index, result) =
-            tokio::time::timeout(Duration::from_secs(60), completion_receiver.recv())
-                .await
-                .context("timed out filling the benchmark SSD high watermark")?
-                .context("benchmark writers exited before filling the SSD high watermark")?;
-        result.map_err(|error| anyhow::anyhow!("prefill object {index} failed: {error}"))?;
-    }
-    tokio::time::timeout(
-        Duration::from_secs(60),
-        store.wait_local(u64::try_from(saturation.prefill_objects)?),
-    )
-    .await
-    .context("timed out waiting for saturation prefill durability")??;
-    let prefill = prefill_started.elapsed();
     tokio::time::sleep(Duration::from_millis(100)).await;
     match completion_receiver.try_recv() {
         Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
@@ -652,30 +735,25 @@ async fn execute_saturation_benchmark(
     })
     .await
     .context("blocked foreground writes did not progress after remote activation")??;
-    while let Some(result) = writers.join_next().await {
-        result.context("saturation writer task failed")?;
-    }
-    let target = store.status()?.accepted_seq;
+    let after_blocked_acks = store.status()?;
+    let target = after_blocked_acks.accepted_seq;
     anyhow::ensure!(
         target == u64::try_from(objects.len())?,
         "expected {} accepted objects after pacing, observed {target}",
         objects.len()
     );
+    while let Some(result) = writers.join_next().await {
+        result.context("saturation writer task failed")?;
+    }
     tokio::time::timeout(Duration::from_secs(60), store.wait_local(target))
         .await
         .context("timed out waiting for the paced tail to become locally durable")??;
-    let after_blocked_acks = store.status()?;
     let blocked_ack = blocked_ack_times
         .last()
         .copied()
         .context("saturation benchmark did not record blocked acknowledgements")?;
     let first_blocked_ack = blocked_ack_times[0];
-    let mut previous = Duration::ZERO;
-    let mut max_blocked_ack_gap = Duration::ZERO;
-    for completion in blocked_ack_times {
-        max_blocked_ack_gap = max_blocked_ack_gap.max(completion.saturating_sub(previous));
-        previous = completion;
-    }
+    let max_blocked_ack_gap = max_inter_completion_gap(&blocked_ack_times);
     let remote_cleanup_bytes = after_blocked_acks
         .remote_bytes_completed
         .saturating_sub(before.remote_bytes_completed);
@@ -707,31 +785,39 @@ async fn execute_saturation_benchmark(
         .iter()
         .rposition(|publications| *publications != 0)
         .map_or(0, |index| index + 1);
-    let classes = vec![BenchObjectClass::Segment; objects.len()];
     let (remote_read, remote_read_verified_objects) = read_and_verify_remote(
         remote,
         objects,
         &classes,
-        &payload,
-        &payload,
+        &segment_payload,
+        &manifest_payload,
         geometry.writers,
     )
     .await?;
+    let segment_objects = classes
+        .iter()
+        .filter(|class| **class == BenchObjectClass::Segment)
+        .count();
+    let manifest_objects = classes.len() - segment_objects;
 
     Ok(SaturationReport {
         total_bytes,
         object_count: objects.len(),
-        payload_bytes: payload.len(),
+        payload_bytes: segment_payload.len(),
+        manifest_payload_bytes: manifest_payload.len(),
+        segment_objects,
+        manifest_objects,
         writers: geometry.writers,
         max_connections: geometry.max_connections,
         upload_concurrency: geometry.upload_concurrency,
         local_concurrency: geometry.local_concurrency,
         ssd_capacity_bytes: final_status.dirty_ssd_capacity_bytes,
         ssd_high_watermark_bytes: saturation.high_watermark_bytes,
-        ssd_reservation_bytes_per_object: saturation.reservation_bytes,
+        ssd_reservation_bytes_min: saturation.reservation_bytes_min,
+        ssd_reservation_bytes_max: saturation.reservation_bytes_max,
         prefill_objects: saturation.prefill_objects,
         prefill_reserved_bytes: saturation.prefill_reserved_bytes,
-        blocked_objects_before_activation: saturation.paced_objects,
+        tail_objects_after_activation: saturation.paced_objects,
         prefill_seconds: prefill.as_secs_f64(),
         remote_directory_prepare_seconds: geometry.remote_directory_prepare.as_secs_f64(),
         first_blocked_ack_seconds: first_blocked_ack.as_secs_f64(),
@@ -746,16 +832,16 @@ async fn execute_saturation_benchmark(
         remote_read_seconds: remote_read.as_secs_f64(),
         remote_read_mib_per_second: mib_per_second(total_bytes, remote_read),
         remote_read_verified_objects,
-        sftp_publications: sftp_timing.publications,
+        sftp_write_handles_closed: sftp_timing.publications,
         sftp_open_total_seconds: seconds(sftp_timing.open_nanos),
-        sftp_write_total_seconds: seconds(sftp_timing.write_nanos),
-        sftp_fsync_total_seconds: seconds(sftp_timing.fsync_nanos),
-        sftp_close_total_seconds: seconds(sftp_timing.close_nanos),
+        sftp_publication_window_total_seconds: seconds(sftp_timing.publication_window_nanos),
         sftp_hardlink_total_seconds: seconds(sftp_timing.hardlink_nanos),
         sftp_remove_total_seconds: seconds(sftp_timing.remove_nanos),
-        sftp_session_publications: sftp_timing.session_publications[..last_used_session].to_vec(),
+        sftp_session_write_handles_closed: sftp_timing.session_publications[..last_used_session]
+            .to_vec(),
         sftp_session_write_bytes: sftp_timing.session_write_bytes[..last_used_session].to_vec(),
         payload_sha256,
+        manifest_payload_sha256,
     })
 }
 
@@ -1056,8 +1142,10 @@ async fn bench_sftp_writeback_full_ssd_pacing() -> Result<()> {
     );
     let total_mib: usize = bench_env(TOTAL_MIB_ENV, 256)?;
     let payload_kib: usize = bench_env(PAYLOAD_KIB_ENV, 8 * 1024)?;
+    let manifest_kib: usize = bench_env(MANIFEST_KIB_ENV, 64)?;
     let writers: usize = bench_env(WRITERS_ENV, 16)?;
     let ssd_mib: usize = bench_env(SSD_MIB_ENV, 64)?;
+    let fence_every: usize = bench_env(FENCE_EVERY_ENV, 4)?;
     let sftp = settings
         .sftp
         .as_mut()
@@ -1070,6 +1158,7 @@ async fn bench_sftp_writeback_full_ssd_pacing() -> Result<()> {
         .context("benchmark config must enable [writeback]")?;
     anyhow::ensure!(total_mib > 0, "{TOTAL_MIB_ENV} must be positive");
     anyhow::ensure!(payload_kib > 0, "{PAYLOAD_KIB_ENV} must be positive");
+    anyhow::ensure!(manifest_kib > 0, "{MANIFEST_KIB_ENV} must be positive");
     anyhow::ensure!(writers > 0, "{WRITERS_ENV} must be positive");
     anyhow::ensure!(ssd_mib > 0, "{SSD_MIB_ENV} must be positive");
     let total_kib = total_mib
@@ -1085,11 +1174,22 @@ async fn bench_sftp_writeback_full_ssd_pacing() -> Result<()> {
     let payload_bytes = payload_kib
         .checked_mul(1024)
         .context("saturation benchmark payload size overflowed")?;
+    let manifest_bytes = manifest_kib
+        .checked_mul(1024)
+        .context("saturation manifest size overflowed")?;
 
     let (remote, base, pool) = build_remote_store(&settings).await?;
     let setup = (|| -> Result<_> {
-        let objects = BenchObjectSet::new(&base, Uuid::new_v4(), object_count)?;
-        let saturation = SaturationGeometry::new(&objects.objects, payload_bytes, disk_bytes, 95)?;
+        let objects =
+            BenchObjectSet::new_with_fences(&base, Uuid::new_v4(), object_count, fence_every)?;
+        let saturation = SaturationGeometry::new(
+            &objects.objects,
+            &objects.classes,
+            payload_bytes,
+            manifest_bytes,
+            disk_bytes,
+            95,
+        )?;
         let scratch = match std::env::var_os(BENCH_DIR_ENV) {
             Some(directory) => tempfile::tempdir_in(PathBuf::from(directory))?,
             None => tempfile::tempdir()?,
@@ -1141,6 +1241,8 @@ async fn bench_sftp_writeback_full_ssd_pacing() -> Result<()> {
 
     let mut payload = vec![0_u8; payload_bytes];
     StdRng::seed_from_u64(0x5353_445f_4655_4c4c).fill_bytes(&mut payload);
+    let mut manifest_payload = vec![0_u8; manifest_bytes];
+    StdRng::seed_from_u64(0x5353_445f_4d41_4e49).fill_bytes(&mut manifest_payload);
     let remote_directory_prepare =
         prepare_remote_run(&pool, &objects.directories_deepest_first).await;
     let benchmark = match remote_directory_prepare {
@@ -1149,7 +1251,9 @@ async fn bench_sftp_writeback_full_ssd_pacing() -> Result<()> {
                 &store,
                 &remote,
                 &objects.objects,
+                &objects.classes,
                 Bytes::from(payload),
+                Bytes::from(manifest_payload),
                 BenchGeometry {
                     writers,
                     max_connections,
@@ -1185,7 +1289,7 @@ mod tests {
     use super::{
         BenchObjectClass, BenchObjectSet, GeneratedSegmentCreate, SaturationGeometry,
         benchmark_put_options, build_remote_store, finish_benchmark, generated_segment_options,
-        read_and_verify_remote,
+        max_inter_completion_gap, read_and_verify_remote,
     };
     use crate::config::Settings;
     use bytes::Bytes;
@@ -1193,7 +1297,20 @@ mod tests {
     use object_store::path::Path;
     use object_store::{ObjectStore, ObjectStoreExt};
     use std::sync::Arc;
+    use std::time::Duration;
     use uuid::Uuid;
+
+    #[test]
+    fn inter_completion_gap_excludes_initial_ack_latency() {
+        assert_eq!(
+            max_inter_completion_gap(&[
+                Duration::from_millis(900),
+                Duration::from_millis(950),
+                Duration::from_millis(1_075),
+            ]),
+            Duration::from_millis(125)
+        );
+    }
 
     #[test]
     fn benchmark_object_names_are_canonical_and_run_scoped() {
@@ -1263,24 +1380,38 @@ mod tests {
 
     #[test]
     fn saturation_geometry_fills_the_high_watermark_and_leaves_a_blocked_tail() {
-        let objects = BenchObjectSet::new(
+        let objects = BenchObjectSet::new_with_fences(
             &Path::from("zerofs/prod"),
             Uuid::parse_str("12345678-1234-1234-1234-123456789abc").unwrap(),
             8,
+            4,
         )
         .unwrap();
-        let payload_bytes = 8 * 1024 * 1024;
-        let reservation =
-            SaturationGeometry::reservation_bytes(&objects.objects[0], payload_bytes).unwrap();
-        let geometry =
-            SaturationGeometry::new(&objects.objects, payload_bytes, reservation * 4, 95).unwrap();
+        let segment_bytes = 8 * 1024 * 1024;
+        let manifest_bytes = 64 * 1024;
+        let segment_reservation =
+            SaturationGeometry::reservation_bytes(&objects.objects[0], segment_bytes).unwrap();
+        let geometry = SaturationGeometry::new(
+            &objects.objects,
+            &objects.classes,
+            segment_bytes,
+            manifest_bytes,
+            segment_reservation * 4,
+            95,
+        )
+        .unwrap();
 
-        assert_eq!(geometry.prefill_objects, 3);
-        assert_eq!(geometry.paced_objects, 5);
+        assert_eq!(geometry.prefill_objects, 4);
+        assert_eq!(geometry.paced_objects, 4);
+        assert!(geometry.reservation_bytes_min < geometry.reservation_bytes_max);
         assert!(geometry.prefill_reserved_bytes <= geometry.high_watermark_bytes);
         assert!(
-            geometry.prefill_reserved_bytes + geometry.reservation_bytes
+            geometry.prefill_reserved_bytes + geometry.reservation_bytes_max
                 > geometry.high_watermark_bytes
+        );
+        assert_eq!(
+            geometry.paced_payload_bytes,
+            u64::try_from(segment_bytes * 3 + manifest_bytes).unwrap()
         );
     }
 
