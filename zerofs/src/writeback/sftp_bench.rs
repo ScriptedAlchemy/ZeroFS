@@ -649,7 +649,7 @@ async fn execute_saturation_benchmark(
         tokio::sync::mpsc::unbounded_channel::<(usize, std::result::Result<(), String>)>();
     let mut writers = tokio::task::JoinSet::new();
     for writer in 0..geometry.writers {
-        let store = store.clone();
+        let writer_store = store.clone();
         let segment_payload = segment_payload.clone();
         let manifest_payload = manifest_payload.clone();
         let paths = Arc::clone(&paths);
@@ -659,7 +659,7 @@ async fn execute_saturation_benchmark(
             let mut index = saturation.prefill_objects + writer;
             while index < paths.len() {
                 let class = classes[index];
-                let result = store
+                let result = writer_store
                     .put_opts(
                         &paths[index],
                         benchmark_payload(class, &segment_payload, &manifest_payload)
@@ -680,6 +680,15 @@ async fn execute_saturation_benchmark(
                 index += geometry.writers;
             }
         });
+        if writer == 0 {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while store.ssd_admission().waiter_count() == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .context("first saturation tail object did not enter SSD admission")?;
+        }
     }
     drop(completion_sender);
     tokio::time::sleep(Duration::from_millis(100)).await;
