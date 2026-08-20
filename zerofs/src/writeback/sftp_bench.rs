@@ -49,6 +49,7 @@ const PAYLOAD_KIB_ENV: &str = "ZEROFS_BENCH_SFTP_PAYLOAD_KIB";
 const WRITERS_ENV: &str = "ZEROFS_BENCH_SFTP_WRITERS";
 const MAX_CONNECTIONS_ENV: &str = "ZEROFS_BENCH_SFTP_MAX_CONNECTIONS";
 const SSD_MIB_ENV: &str = "ZEROFS_BENCH_SFTP_SSD_MIB";
+const FENCE_EVERY_ENV: &str = "ZEROFS_BENCH_SFTP_FENCE_EVERY";
 const BENCH_DIR_ENV: &str = "ZEROFS_BENCH_DIR";
 const IDENTITY_FILE_ENV: &str = "ZEROFS_BENCH_SFTP_IDENTITY_FILE";
 const KNOWN_HOSTS_ENV: &str = "ZEROFS_BENCH_SFTP_KNOWN_HOSTS";
@@ -58,10 +59,20 @@ struct BenchObjectSet {
     database_prefix: ObjectPath,
     objects: Vec<ObjectPath>,
     directories_deepest_first: Vec<PathBuf>,
+    fence_objects: usize,
 }
 
 impl BenchObjectSet {
     fn new(base: &ObjectPath, run_id: Uuid, object_count: usize) -> Result<Self> {
+        Self::new_with_fences(base, run_id, object_count, 0)
+    }
+
+    fn new_with_fences(
+        base: &ObjectPath,
+        run_id: Uuid,
+        object_count: usize,
+        fence_every: usize,
+    ) -> Result<Self> {
         let token = run_id.simple().to_string();
         let database_prefix = ObjectPath::parse(format!("{base}/.zerofs-writeback-bench-{token}"))?;
         let epoch = u64::from_str_radix(&token[..16], 16)?;
@@ -69,9 +80,18 @@ impl BenchObjectSet {
         let mut directories = BTreeSet::new();
         directories.insert(PathBuf::from(database_prefix.as_ref()));
         directories.insert(PathBuf::from(format!("{database_prefix}/segments")));
+        let mut fence_objects = 0;
 
         for index in 0..object_count {
             let counter = u64::try_from(index)?.saturating_add(1);
+            if fence_every != 0 && usize::try_from(counter)?.is_multiple_of(fence_every) {
+                directories.insert(PathBuf::from(format!("{database_prefix}/manifest")));
+                objects.push(ObjectPath::parse(format!(
+                    "{database_prefix}/manifest/{counter:020}.manifest"
+                ))?);
+                fence_objects += 1;
+                continue;
+            }
             let shard = counter & 0xff;
             let shard_dir = format!("{database_prefix}/segments/{shard:02x}");
             let generation_dir = format!("{shard_dir}/{epoch:016x}");
@@ -95,6 +115,7 @@ impl BenchObjectSet {
             database_prefix,
             objects,
             directories_deepest_first,
+            fence_objects,
         })
     }
 }
@@ -108,6 +129,7 @@ struct BenchReport {
     max_connections: usize,
     upload_concurrency: usize,
     local_concurrency: usize,
+    fence_objects: usize,
     ram_ack_seconds: f64,
     ram_ack_mib_per_second: f64,
     local_seconds: f64,
@@ -160,6 +182,12 @@ struct SaturationReport {
     remote_read_mib_per_second: f64,
     remote_read_verified_objects: usize,
     sftp_publications: u64,
+    sftp_open_total_seconds: f64,
+    sftp_write_total_seconds: f64,
+    sftp_fsync_total_seconds: f64,
+    sftp_close_total_seconds: f64,
+    sftp_hardlink_total_seconds: f64,
+    sftp_remove_total_seconds: f64,
     sftp_session_publications: Vec<u64>,
     sftp_session_write_bytes: Vec<u64>,
     payload_sha256: String,
@@ -261,6 +289,14 @@ fn generated_segment_options() -> PutOptions {
     options
 }
 
+fn benchmark_put_options(path: &ObjectPath) -> PutOptions {
+    if path.as_ref().contains("/manifest/") {
+        PutOptions::from(PutMode::Overwrite)
+    } else {
+        generated_segment_options()
+    }
+}
+
 fn apply_transport_path_overrides(settings: &mut Settings) -> Result<()> {
     let Some(config) = settings.sftp.as_mut() else {
         anyhow::bail!("benchmark config must include [sftp]");
@@ -351,7 +387,7 @@ async fn execute_benchmark(
                     .put_opts(
                         &paths[index],
                         payload.clone().into(),
-                        generated_segment_options(),
+                        benchmark_put_options(&paths[index]),
                     )
                     .await?;
                 index += geometry.writers;
@@ -390,6 +426,10 @@ async fn execute_benchmark(
         max_connections: geometry.max_connections,
         upload_concurrency: geometry.upload_concurrency,
         local_concurrency: geometry.local_concurrency,
+        fence_objects: objects
+            .iter()
+            .filter(|path| path.as_ref().contains("/manifest/"))
+            .count(),
         ram_ack_seconds: ram_ack.as_secs_f64(),
         ram_ack_mib_per_second: mib_per_second(total_bytes, ram_ack),
         local_seconds: local.as_secs_f64(),
@@ -619,6 +659,12 @@ async fn execute_saturation_benchmark(
         remote_read_mib_per_second: mib_per_second(total_bytes, remote_read),
         remote_read_verified_objects,
         sftp_publications: sftp_timing.publications,
+        sftp_open_total_seconds: seconds(sftp_timing.open_nanos),
+        sftp_write_total_seconds: seconds(sftp_timing.write_nanos),
+        sftp_fsync_total_seconds: seconds(sftp_timing.fsync_nanos),
+        sftp_close_total_seconds: seconds(sftp_timing.close_nanos),
+        sftp_hardlink_total_seconds: seconds(sftp_timing.hardlink_nanos),
+        sftp_remove_total_seconds: seconds(sftp_timing.remove_nanos),
         sftp_session_publications: sftp_timing.session_publications[..last_used_session].to_vec(),
         sftp_session_write_bytes: sftp_timing.session_write_bytes[..last_used_session].to_vec(),
         payload_sha256,
@@ -777,6 +823,7 @@ async fn bench_sftp_writeback_remote_drain() -> Result<()> {
     let total_mib: usize = bench_env(TOTAL_MIB_ENV, 256)?;
     let payload_kib: usize = bench_env(PAYLOAD_KIB_ENV, 1024)?;
     let writers: usize = bench_env(WRITERS_ENV, 16)?;
+    let fence_every: usize = bench_env(FENCE_EVERY_ENV, 0)?;
     let sftp = settings
         .sftp
         .as_mut()
@@ -805,7 +852,8 @@ async fn bench_sftp_writeback_remote_drain() -> Result<()> {
 
     let (remote, base, pool) = build_remote_store(&settings).await?;
     let setup = (|| -> Result<_> {
-        let objects = BenchObjectSet::new(&base, Uuid::new_v4(), object_count)?;
+        let objects =
+            BenchObjectSet::new_with_fences(&base, Uuid::new_v4(), object_count, fence_every)?;
         let scratch = match std::env::var_os(BENCH_DIR_ENV) {
             Some(directory) => tempfile::tempdir_in(PathBuf::from(directory))?,
             None => tempfile::tempdir()?,
@@ -1038,8 +1086,8 @@ async fn bench_sftp_writeback_full_ssd_pacing() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BenchObjectSet, GeneratedSegmentCreate, SaturationGeometry, build_remote_store,
-        finish_benchmark, generated_segment_options, read_and_verify_remote,
+        BenchObjectSet, GeneratedSegmentCreate, SaturationGeometry, benchmark_put_options,
+        build_remote_store, finish_benchmark, generated_segment_options, read_and_verify_remote,
     };
     use crate::config::Settings;
     use bytes::Bytes;
@@ -1081,6 +1129,27 @@ mod tests {
     fn benchmark_uses_the_shipping_generated_segment_contract() {
         assert!(
             generated_segment_options()
+                .extensions
+                .get::<GeneratedSegmentCreate>()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn mixed_benchmark_paths_insert_real_manifest_fences() {
+        let run_id = Uuid::parse_str("12345678-1234-1234-1234-123456789abc").unwrap();
+        let objects =
+            BenchObjectSet::new_with_fences(&Path::from("zerofs/prod"), run_id, 8, 4).unwrap();
+
+        assert_eq!(objects.fence_objects, 2);
+        assert!(objects.objects[3].as_ref().contains("/manifest/"));
+        assert!(objects.objects[7].as_ref().contains("/manifest/"));
+        assert!(matches!(
+            benchmark_put_options(&objects.objects[3]).mode,
+            object_store::PutMode::Overwrite
+        ));
+        assert!(
+            benchmark_put_options(&objects.objects[0])
                 .extensions
                 .get::<GeneratedSegmentCreate>()
                 .is_some()
