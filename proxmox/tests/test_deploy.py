@@ -580,14 +580,33 @@ addresses = ["10.10.10.30:9567"]
                 self.write_config(dev_with_webui), "10.10.10.20", role="dev"
             )
 
-    def test_both_roles_cap_sftp_session_fields_at_four(self) -> None:
-        too_many = self.prod_config().replace(
-            "max_connections = 4", "max_connections = 8"
+    def test_sftp_multiplexed_concurrency_is_accepted(self) -> None:
+        multiplexed = self.prod_config().replace(
+            "write_concurrency = 4", "write_concurrency = 16"
         )
-        with self.assertRaisesRegex(ValueError, "SFTP.*four"):
-            deploy.validate_server_config(
-                self.write_config(too_many), "10.10.10.30", role="prod"
-            )
+        deploy.validate_server_config(
+            self.write_config(multiplexed), "10.10.10.30", role="prod"
+        )
+
+    def test_sftp_concurrency_respects_connections_and_transport_cap(self) -> None:
+        invalid = (
+            ("max_connections = 4", "max_connections = 9", "max_connections"),
+            ("write_concurrency = 4", "write_concurrency = 65", "write_concurrency"),
+            (
+                "max_connections = 4\nread_concurrency = 4",
+                "max_connections = 1\nread_concurrency = 17",
+                "read_concurrency",
+            ),
+        )
+        for old, new, expected in invalid:
+            with self.subTest(expected=expected), self.assertRaisesRegex(
+                ValueError, expected
+            ):
+                deploy.validate_server_config(
+                    self.write_config(self.prod_config().replace(old, new)),
+                    "10.10.10.30",
+                    role="prod",
+                )
 
 
 class PlanTests(unittest.TestCase):

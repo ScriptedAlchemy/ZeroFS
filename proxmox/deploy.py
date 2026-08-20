@@ -62,6 +62,9 @@ MIB = 1024 * 1024
 GIB = 1024 * MIB
 PROD_UNIFIED_VOLATILE_MEMORY_GB = 16.0
 PROD_FIXED_MEMORY_RESERVE_BYTES = 40 * GIB
+SFTP_MAX_ACCOUNT_CONNECTIONS = 8
+SFTP_SESSION_MAX_CONCURRENT_OPS = 16
+SFTP_MAX_DIRECTION_CONCURRENCY = 64
 
 
 def is_rfc1918(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
@@ -399,10 +402,25 @@ def validate_server_config(
     if storage_url.startswith("sftp://"):
         if not isinstance(sftp, dict):
             raise ValueError("[sftp] is required for SFTP storage")
-        for field in ("max_connections", "read_concurrency", "write_concurrency"):
+        max_connections = sftp.get("max_connections")
+        if not isinstance(max_connections, int) or not (
+            1 <= max_connections <= SFTP_MAX_ACCOUNT_CONNECTIONS
+        ):
+            raise ValueError(
+                "SFTP max_connections must be between one and "
+                f"{SFTP_MAX_ACCOUNT_CONNECTIONS}"
+            )
+        concurrency_ceiling = min(
+            max_connections * SFTP_SESSION_MAX_CONCURRENT_OPS,
+            SFTP_MAX_DIRECTION_CONCURRENCY,
+        )
+        for field in ("read_concurrency", "write_concurrency"):
             value = sftp.get(field)
-            if not isinstance(value, int) or not 1 <= value <= 4:
-                raise ValueError(f"SFTP {field} must be between one and four")
+            if not isinstance(value, int) or not 1 <= value <= concurrency_ceiling:
+                raise ValueError(
+                    f"SFTP {field} must be between one and {concurrency_ceiling} "
+                    f"for max_connections = {max_connections}"
+                )
     return storage_url
 
 
