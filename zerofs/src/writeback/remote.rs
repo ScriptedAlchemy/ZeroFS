@@ -6,7 +6,7 @@ use crate::writeback::model::{
     FenceClass, LocalEtag, MutationKind, MutationMode, MutationRecord, Sequence,
 };
 use crate::writeback::overlay::OverlayIndex;
-use crate::writeback::pacing::{DurableCleanupSteps, credit_for};
+use crate::writeback::pacing::{DurableCleanupSteps, SsdAdmissionMode, credit_for};
 use crate::writeback::reservation::{SsdAdmission, SsdReservationRequest};
 use crate::writeback::space_sample::PhysicalSpaceSampler;
 use futures::future::BoxFuture;
@@ -531,6 +531,7 @@ async fn run_remote_scheduler(worker: RemoteWorker) {
             upload_concurrency,
             &completed,
             next <= known_local_tail,
+            ssd.mode() == SsdAdmissionMode::Paced,
             &mut stop,
         )
         .await
@@ -960,6 +961,7 @@ async fn coalesce_local_batch(
     upload_concurrency: usize,
     completed: &BTreeMap<Sequence, CompletedRemote>,
     drain_known_backlog: bool,
+    _paced_admission: bool,
     stop: &mut watch::Receiver<bool>,
 ) -> anyhow::Result<Option<SchedulerWindow>> {
     let mut window = load_scheduler_window(journal, next, upload_concurrency)?;
@@ -1688,8 +1690,8 @@ fn missing_remote_predecessor(
 mod tests {
     use super::{
         CompletedRemote, SchedulerWindow, apply_record_with_tracked_cleanup,
-        bounded_remote_operation, collect_pipeline_batch, load_scheduler_window,
-        validate_scheduler_window, verify_existing,
+        bounded_remote_operation, coalesce_local_batch, collect_pipeline_batch,
+        load_scheduler_window, validate_scheduler_window, verify_existing,
     };
     use crate::fault_store::FaultStore;
     use crate::writeback::journal::Journal;
@@ -1700,6 +1702,24 @@ mod tests {
     use object_store::{ObjectStore, ObjectStoreExt, PutPayload, PutResult, path::Path};
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn paced_admission_dispatches_a_partial_local_window_without_idle_coalescing() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = journal_with_local_records(temp.path(), 1);
+        let (_stop_sender, mut stop) = tokio::sync::watch::channel(false);
+
+        let window = tokio::time::timeout(
+            Duration::from_millis(100),
+            coalesce_local_batch(&journal, 1, 4, &Default::default(), false, true, &mut stop),
+        )
+        .await
+        .expect("paced release must not pay the 500ms burst coalescing delay")
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(window.records.len(), 1);
+    }
 
     fn record(sequence: u64, path: &str, fence: FenceClass) -> MutationRecord {
         crate::writeback::test_util::delete_record(sequence, path, fence, 0, 0)
