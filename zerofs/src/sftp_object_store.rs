@@ -4184,7 +4184,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_uses_hardlink_then_removes_staging() {
+    async fn create_returns_after_hardlink_and_owns_staging_cleanup_asynchronously() {
         let session = Arc::new(RecordingSession::new());
         let target = FilePath::new("/objects/segment.bin");
 
@@ -4201,8 +4201,9 @@ mod tests {
         assert!(outcome.cleanup_debt.is_none());
         assert_eq!(
             session.operations.lock().unwrap().as_slice(),
-            ["create", "write", "fsync", "close", "hardlink", "remove"]
+            ["create", "write", "fsync", "close", "hardlink"]
         );
+        assert_eq!(session.scheduled_cleanups.load(Ordering::SeqCst), 1);
         let files = session.files.lock().unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(
