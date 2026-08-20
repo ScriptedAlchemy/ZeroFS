@@ -589,6 +589,9 @@ struct PoolInner {
     admission: FairAdmission,
     roster: StdMutex<Vec<Arc<SharedSession>>>,
     roster_changed: Notify,
+    // Rotates the placement scan's starting entry so load-tie checkouts
+    // spread across the roster instead of always landing on its first entry.
+    session_cursor: AtomicUsize,
     idle_warm_floor: AtomicUsize,
     directories: DirectoryCache,
     writable: bool,
@@ -1057,6 +1060,7 @@ impl SftpSessionPool {
                 ),
                 roster: StdMutex::new(Vec::new()),
                 roster_changed: Notify::new(),
+                session_cursor: AtomicUsize::new(0),
                 idle_warm_floor: AtomicUsize::new(SFTP_IDLE_WARM_FLOOR),
                 directories: DirectoryCache::default(),
                 writable: true,
@@ -1239,8 +1243,20 @@ impl SftpSessionPool {
                 if self.inner.closed.load(Ordering::SeqCst) {
                     return Err(TransportError::PoolClosed);
                 }
+                // min_by_key keeps the first minimum, so ties between equally
+                // loaded sessions would otherwise pin every idle-burst
+                // checkout to the first roster entry and leave the rest of
+                // the pool cold. Rotating the scan start spreads those ties
+                // across every connection.
+                let rotation = match roster.len() {
+                    0 => 0,
+                    len => self.inner.session_cursor.fetch_add(1, Ordering::Relaxed) % len,
+                };
                 let candidate = roster
                     .iter()
+                    .cycle()
+                    .skip(rotation)
+                    .take(roster.len())
                     .filter(|session| {
                         !session.broken.load(Ordering::SeqCst)
                             && session.active_ops.load(Ordering::SeqCst)
@@ -3659,5 +3675,34 @@ mod tests {
         assert!(!root.path().join("object.bin").exists());
         session.close(CancellationToken::new()).await.unwrap();
         assert!(child.wait().await.unwrap().success());
+    }
+
+    #[tokio::test]
+    async fn idle_checkouts_rotate_across_warm_sessions_instead_of_pinning_the_first() {
+        let factory = RecordingFactory::fully_capable();
+        let pool = pool(factory, 2, 4, 4).await;
+
+        let first = pool.checkout(OperationKind::Write).await.unwrap();
+        let second = pool.checkout(OperationKind::Write).await.unwrap();
+        let warm = [
+            Arc::as_ptr(first.session.as_ref().unwrap()) as usize,
+            Arc::as_ptr(second.session.as_ref().unwrap()) as usize,
+        ];
+        assert_ne!(warm[0], warm[1], "the warmup leases must dial two sessions");
+        first.complete().await.unwrap();
+        second.complete().await.unwrap();
+
+        let mut used = std::collections::HashSet::new();
+        for _ in 0..4 {
+            let lease = pool.checkout(OperationKind::Write).await.unwrap();
+            used.insert(Arc::as_ptr(lease.session.as_ref().unwrap()) as usize);
+            lease.complete().await.unwrap();
+        }
+        assert!(
+            used.len() > 1,
+            "sequential idle checkouts must rotate across the warm connections instead of \
+             re-picking the first roster entry every time"
+        );
+        pool.shutdown().await.unwrap();
     }
 }
