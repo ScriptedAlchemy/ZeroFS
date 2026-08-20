@@ -13,7 +13,6 @@ mod db;
 mod dedup;
 mod frame_codec;
 mod fs;
-mod hpn_session;
 mod key_management;
 mod length_checked_object_store;
 mod linux_errno;

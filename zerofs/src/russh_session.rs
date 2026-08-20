@@ -15,7 +15,7 @@ pub use crate::sftp_protocol::RUSSH_SFTP_MAX_CONCURRENT_WRITES;
 #[cfg(test)]
 pub use crate::sftp_protocol::russh_sftp_config;
 
-/// HPN-style static SSH channel window. russh has no dynamic scaler.
+/// Large static SSH channel window for high-bandwidth, high-latency links.
 pub const RUSSH_WINDOW_SIZE: u32 = 16 * 1024 * 1024;
 /// russh channel_buffer_size is an mpsc *message* depth, not bytes.
 /// 1024 slots covers a 16 MiB window of 256 KiB packets plus control messages.
@@ -478,7 +478,7 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
 "#;
 
     #[test]
-    fn russh_client_config_uses_hpn_static_windows() {
+    fn russh_client_config_uses_large_static_windows() {
         let config = russh_client_config();
         assert_eq!(config.window_size, 16 * 1024 * 1024);
         assert_eq!(config.maximum_packet_size, 256 * 1024);
@@ -779,7 +779,7 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
     }
 
     #[tokio::test]
-    async fn russh_loopback_pipelines_writes_and_reads_with_hpn_windows() {
+    async fn russh_loopback_pipelines_writes_and_reads_with_large_windows() {
         let env = Loopback::start().await;
         let factory = RusshSessionFactory::new(
             env.endpoint.clone(),

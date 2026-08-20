@@ -311,20 +311,11 @@ printf 'parent_frozen=%s\n' "$parent_frozen"
         self.assertNotIn("mkfs", result.stdout)
         self.assertNotIn("0.0.0.0", result.stdout)
 
-    def test_hpn_artifact_is_installed_inside_the_immutable_release(self) -> None:
-        digest = "d" * 64
-        result = self.run_host("deploy", "--hpn-sha256", digest)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn(
-            "install -o 0 -g 0 -m 0755 /var/tmp/zerofs-lxc-stage/hpnssh "
-            "/var/lib/zerofs-lxc/dev-120/releases/"
-            "0123456789ab-cccccccccccccccc/hpnssh",
-            result.stdout,
-        )
-
-        rejected = self.run_host("deploy", "--hpn-sha256", "not-a-digest")
-        self.assertNotEqual(rejected.returncode, 0)
-        self.assertEqual(rejected.stdout, "")
+    def test_removed_hpn_artifact_argument_is_rejected(self) -> None:
+        result = self.run_host("deploy", "--hpn-sha256", "d" * 64)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("unknown argument: --hpn-sha256", result.stderr)
 
     def test_existing_ct_resources_are_reconciled_to_requested_values(self) -> None:
         result = self.run_host(
