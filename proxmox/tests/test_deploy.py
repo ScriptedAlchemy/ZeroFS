@@ -227,57 +227,10 @@ addresses = ["10.10.10.30:9567"]
             deploy.require_local_durable_upgrade_confirmation(198, None, "198")
         deploy.require_local_durable_upgrade_confirmation(198, "198", "198")
 
-    def test_hpn_transport_requires_exact_release_artifact(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            program = Path(directory) / "hpnssh"
-            program.write_text("#!/bin/sh\necho OpenSSH_10.3p1_hpn18.9.0 >&2\n")
-            program.chmod(0o755)
-            digest = hashlib.sha256(program.read_bytes()).hexdigest()
-            config = self.write_config(
-                self.prod_config().replace(
-                    "write_concurrency = 4\n",
-                    "write_concurrency = 4\n"
-                    'transport = "hpn_openssh"\n'
-                    'hpn_program = "/srv/zerofs-persist/current/hpnssh"\n'
-                    f'hpn_sha256 = "{digest}"\n',
-                )
-            )
-
-            self.assertEqual(
-                deploy.validate_hpn_release_artifact(config, program), digest
-            )
-            wrong = self.write_config("wrong artifact")
-            wrong.chmod(0o755)
-            with self.assertRaisesRegex(ValueError, "SHA-256"):
-                deploy.validate_hpn_release_artifact(config, wrong)
-            with self.assertRaisesRegex(ValueError, "--hpn-program"):
-                deploy.validate_hpn_release_artifact(config, None)
-
-    def test_russh_transport_rejects_hpn_release_artifact(self) -> None:
-        config = self.write_config(self.prod_config())
-        artifact = self.write_config("not used")
-        with self.assertRaisesRegex(ValueError, "only valid"):
-            deploy.validate_hpn_release_artifact(config, artifact)
-
-    def test_hpn_dry_run_stages_pinned_binary_in_release(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            program = Path(directory) / "hpnssh"
-            program.write_text("#!/bin/sh\necho OpenSSH_10.3p1_hpn18.9.0 >&2\n")
-            program.chmod(0o755)
-            digest = hashlib.sha256(program.read_bytes()).hexdigest()
-            config = self.write_config(
-                self.prod_config().replace(
-                    "write_concurrency = 4\n",
-                    "write_concurrency = 4\n"
-                    'transport = "hpn_openssh"\n'
-                    'hpn_program = "/srv/zerofs-persist/current/hpnssh"\n'
-                    f'hpn_sha256 = "{digest}"\n',
-                )
-            )
-            result = subprocess.run(
+    def test_cli_rejects_removed_hpn_program_option(self) -> None:
+        with self.assertRaises(SystemExit):
+            deploy.build_parser().parse_args(
                 [
-                    "python3",
-                    str(MODULE_PATH),
                     "deploy",
                     "--role",
                     "prod",
@@ -285,19 +238,27 @@ addresses = ["10.10.10.30:9567"]
                     "130",
                     "--container-ip",
                     "10.10.10.30",
-                    "--config",
-                    str(config),
                     "--hpn-program",
-                    str(program),
-                    "--dry-run",
-                ],
-                text=True,
-                capture_output=True,
-                check=False,
+                    "/tmp/hpnssh",
+                ]
             )
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn(f"--hpn-sha256 {digest}", result.stdout)
-            self.assertIn("/hpnssh", result.stdout)
+
+    def test_prod_preflight_rejects_removed_hpn_config(self) -> None:
+        for legacy in (
+            'transport = "hpn_openssh"\n',
+            'hpn_program = "/srv/zerofs-persist/current/hpnssh"\n',
+            'hpn_sha256 = "' + "a" * 64 + '"\n',
+        ):
+            config = self.prod_config().replace(
+                "write_concurrency = 4\n",
+                "write_concurrency = 4\n" + legacy,
+            )
+            with self.subTest(legacy=legacy), self.assertRaisesRegex(
+                ValueError, "native russh"
+            ):
+                deploy.validate_server_config(
+                    self.write_config(config), "10.10.10.30", role="prod"
+                )
 
     def test_bootstrap_config_exposes_only_nfs_rpc_and_metrics(self) -> None:
         rendered = deploy.render_nfs_bootstrap_config(self.prod_config())

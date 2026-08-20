@@ -1,4 +1,4 @@
-use crate::config::{Settings, SftpSshTransport};
+use crate::config::Settings;
 use crate::segment_store::GeneratedSegmentCreate;
 use crate::sftp_object_store::SftpObjectStore;
 use crate::sftp_transport::{
@@ -33,16 +33,11 @@ async fn build_remote_store(
     let path = ObjectPath::from_url_path(url.path())?;
     SftpObjectStore::validate_prefix(&path)?;
     let config = settings.sftp.clone().unwrap_or_default();
-    let factory: Arc<dyn SessionFactory> = match config.transport {
-        SftpSshTransport::Russh => Arc::new(RusshSessionFactory::new(
-            endpoint.clone(),
-            config.identity_file.clone(),
-            config.known_hosts.clone(),
-        )?),
-        SftpSshTransport::HpnOpenSsh => Arc::new(
-            crate::hpn_session::HpnSessionFactory::from_config(endpoint.clone(), &config)?,
-        ),
-    };
+    let factory: Arc<dyn SessionFactory> = Arc::new(RusshSessionFactory::new(
+        endpoint.clone(),
+        config.identity_file.clone(),
+        config.known_hosts.clone(),
+    )?);
     let pool = SftpSessionPool::from_config_writable(factory, &config).await?;
     let store = SftpObjectStore::new(pool.clone(), path.clone())?;
     Ok((Arc::new(store), path, pool))
@@ -56,7 +51,6 @@ const MAX_CONNECTIONS_ENV: &str = "ZEROFS_BENCH_SFTP_MAX_CONNECTIONS";
 const BENCH_DIR_ENV: &str = "ZEROFS_BENCH_DIR";
 const IDENTITY_FILE_ENV: &str = "ZEROFS_BENCH_SFTP_IDENTITY_FILE";
 const KNOWN_HOSTS_ENV: &str = "ZEROFS_BENCH_SFTP_KNOWN_HOSTS";
-const HPN_PROGRAM_ENV: &str = "ZEROFS_BENCH_SFTP_HPN_PROGRAM";
 
 #[derive(Debug)]
 struct BenchObjectSet {
@@ -178,9 +172,6 @@ fn apply_transport_path_overrides(settings: &mut Settings) -> Result<()> {
     }
     if let Some(path) = std::env::var_os(KNOWN_HOSTS_ENV) {
         config.known_hosts = PathBuf::from(path);
-    }
-    if let Some(path) = std::env::var_os(HPN_PROGRAM_ENV) {
-        config.hpn_program = Some(PathBuf::from(path));
     }
     Ok(())
 }

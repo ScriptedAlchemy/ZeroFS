@@ -29,7 +29,6 @@ state_root=
 stage=
 commit=
 binary_sha=
-hpn_sha=
 namespace_id=
 release_id=
 samba_user=zerofs-share
@@ -59,7 +58,6 @@ while (($#)); do
     --stage) stage=$2; shift 2 ;;
     --commit) commit=$2; shift 2 ;;
     --sha256) binary_sha=$2; shift 2 ;;
-    --hpn-sha256) hpn_sha=$2; shift 2 ;;
     --namespace-id) namespace_id=$2; shift 2 ;;
     --release-id) release_id=$2; shift 2 ;;
     --samba-user) samba_user=$2; shift 2 ;;
@@ -153,10 +151,6 @@ if [[ $action != cleanup ]]; then
     echo "deploy metadata and staging options are required" >&2
     exit 2
   }
-fi
-if [[ -n $hpn_sha && ! $hpn_sha =~ ^[0-9a-f]{64}$ ]]; then
-  echo "invalid --hpn-sha256" >&2
-  exit 2
 fi
 deployment_transaction="$state_root/deployment-transaction"
 
@@ -1000,16 +994,6 @@ if [[ $dry_run == false ]]; then
     echo "staged binary SHA-256 mismatch" >&2
     exit 1
   }
-  if [[ -n $hpn_sha ]]; then
-    [[ -f $stage/hpnssh && ! -L $stage/hpnssh ]] || {
-      echo "missing staged HPN-SSH executable" >&2
-      exit 1
-    }
-    [[ $(sha256sum "$stage/hpnssh" | awk '{print $1}') == "$hpn_sha" ]] || {
-      echo "staged HPN-SSH SHA-256 mismatch" >&2
-      exit 1
-    }
-  fi
 fi
 
 had_ct=false
@@ -1186,9 +1170,6 @@ fi
 release="$state_root/releases/$release_id"
 run install -d -o 0 -g 0 -m 0755 "$release"
 run install -m 0755 "$stage/zerofs" "$release/zerofs"
-if [[ -n $hpn_sha ]]; then
-  run install -o 0 -g 0 -m 0755 "$stage/hpnssh" "$release/hpnssh"
-fi
 run install -o 100000 -g 100000 -m 0600 "$stage/zerofs.toml" "$release/zerofs.toml"
 if [[ $dry_run == false && -f $stage/zerofs.env ]]; then
   run install -o 100000 -g 100000 -m 0600 "$stage/zerofs.env" "$release/zerofs.env"
@@ -1201,7 +1182,7 @@ if [[ $dry_run == false && -f $stage/known_hosts ]]; then
 fi
 if [[ $dry_run == false ]]; then
   config_sha=$(sha256sum "$stage/zerofs.toml" | awk '{print $1}')
-  printf 'commit=%s\nrelease_id=%s\nbinary_sha256=%s\nconfig_sha256=%s\nhpn_sha256=%s\n' "$commit" "$release_id" "$binary_sha" "$config_sha" "$hpn_sha" >"$state_root/receipts/$release_id"
+  printf 'commit=%s\nrelease_id=%s\nbinary_sha256=%s\nconfig_sha256=%s\n' "$commit" "$release_id" "$binary_sha" "$config_sha" >"$state_root/receipts/$release_id"
 fi
 run ln -sfn "releases/$release_id" "$state_root/current"
 
