@@ -322,10 +322,17 @@ pub async fn publish_payload(
             }
         };
         return match publication {
-            Ok(()) => Ok(PublicationOutcome {
-                header,
-                cleanup_debt: cleanup.remove_now().await.err(),
-            }),
+            Ok(()) => {
+                // The hard link is the atomic, durable publication point. The
+                // hidden staging inode no longer belongs on the caller's WAN
+                // latency path; its armed guard transfers cleanup to the
+                // pool-owned retry worker, which shutdown drains.
+                drop(cleanup);
+                Ok(PublicationOutcome {
+                    header,
+                    cleanup_debt: None,
+                })
+            }
             Err(error) => Err(failure_with_cleanup(&mut cleanup, error).await),
         };
     }
@@ -4153,7 +4160,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_remove_failure_returns_committed_outcome_with_cleanup_debt() {
+    async fn create_remove_failure_stays_owned_by_the_async_cleanup_worker() {
         let session = Arc::new(RecordingSession::with_remove_failure());
         let target = FilePath::new("/objects/segment.bin");
 
@@ -4172,15 +4179,12 @@ mod tests {
         let staging = files
             .keys()
             .find(|path| is_staging_name(path.file_name().unwrap().as_ref()))
-            .expect("failed removal leaves staging for a reaper");
-        let debt = outcome
-            .cleanup_debt
-            .expect("committed create reports cleanup debt");
-        assert_eq!(debt.path, *staging);
-        assert!(matches!(
-            *debt.error,
-            RemoteError::Other(ref message) if message == "forced staging removal failure"
-        ));
+            .expect("failed removal leaves staging for a reaper")
+            .clone();
+        drop(files);
+        assert!(outcome.cleanup_debt.is_none());
+        assert_eq!(session.scheduled_cleanups.load(Ordering::SeqCst), 1);
+        assert!(session.files.lock().unwrap().contains_key(&staging));
     }
 
     #[tokio::test]
