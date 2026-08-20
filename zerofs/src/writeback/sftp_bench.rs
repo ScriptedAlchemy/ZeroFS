@@ -1,4 +1,4 @@
-use crate::config::{Settings, SftpEndpoint, SftpSshTransport};
+use crate::config::{Settings, SftpSshTransport};
 use crate::sftp_object_store::SftpObjectStore;
 use crate::sftp_transport::{
     OperationKind, RusshSessionFactory, SessionFactory, SftpSessionPool, TransportError,
@@ -10,7 +10,7 @@ use crate::writeback::store::WritebackObjectStore;
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use object_store::path::Path as ObjectPath;
-use object_store::{ObjectStore, PutMode, PutOptions};
+use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions};
 use rand::{RngCore, SeedableRng, rngs::StdRng};
 use serde::Serialize;
 use sha2::{Digest, Sha256};

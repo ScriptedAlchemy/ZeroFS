@@ -785,7 +785,7 @@ impl TransportSession for SftpProtocolSession {
     async fn remove_directory(&self, path: &Path) -> Result<(), TransportError> {
         let remote = sftp_path(path)?;
         self.sftp()?
-            .remove_dir(remote)
+            .rmdir(remote)
             .await
             .map_err(|error| map_sftp_error(path, error))
             .map(|_| ())
