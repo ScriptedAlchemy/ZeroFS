@@ -1,4 +1,5 @@
 use crate::config::NfsSharedIdentity;
+use crate::fs::EXTENT_SIZE;
 use crate::fs::ZeroFS;
 use crate::fs::inode::Inode;
 use crate::fs::mutation::durability::DurabilityTarget;
@@ -13,7 +14,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
-use zerofs::fs::EXTENT_SIZE;
 use zerofs_nfsserve::nfs::{
     FSF_CANSETTIME, FSF_HOMOGENEOUS, FSF_LINK, FSF_SYMLINK, fattr3, fileid3, filename3, fsinfo3,
     fsstat3, ftype3, nfspath3, nfsstat3, nfstime3, post_op_attr, sattr3, specdata3, stable_how,

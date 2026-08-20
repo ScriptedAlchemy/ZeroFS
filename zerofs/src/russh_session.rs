@@ -18,10 +18,11 @@ pub use crate::sftp_protocol::russh_sftp_config;
 /// Large static SSH channel window for high-bandwidth, high-latency links.
 pub const RUSSH_WINDOW_SIZE: u32 = 16 * 1024 * 1024;
 /// russh channel_buffer_size is an mpsc *message* depth, not bytes.
-/// 1024 slots covers a 16 MiB window of 256 KiB packets plus control messages.
+/// 1024 slots covers a 16 MiB window of SSH packets plus control messages.
 pub const RUSSH_CHANNEL_BUFFER_SIZE: usize = 1024;
-/// 256 KiB SSH packets.
-pub const RUSSH_MAXIMUM_PACKET_SIZE: u32 = 256 * 1024;
+/// russh requires the SSH transport packet size to fit in a TCP packet.
+/// Larger SFTP frames are streamed independently across these packets.
+pub const RUSSH_MAXIMUM_PACKET_SIZE: u32 = u16::MAX as u32;
 
 pub fn russh_client_config() -> client::Config {
     client::Config {
@@ -436,8 +437,8 @@ pub type OpenSshTransportSession = SftpProtocolSession;
 mod tests {
     use super::*;
     use crate::sftp_protocol::{
-        CLIENT_WRITE_IN_FLIGHT, CLIENT_WRITE_PEAK, FSYNC, HARDLINK, POSIX_RENAME,
-        SFTP_READ_PACKET_SIZE, SFTP_WRITE_PACKET_SIZE,
+        CLIENT_WRITE_IN_FLIGHT, CLIENT_WRITE_PEAK, CLIENT_WRITE_TRACKING, FSYNC, HARDLINK,
+        POSIX_RENAME, SFTP_READ_PACKET_SIZE, SFTP_WRITE_PACKET_SIZE,
     };
     use bytes::Bytes;
     use russh_sftp::protocol::{FileAttributes, OpenFlags, StatusCode};
@@ -478,10 +479,10 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
 "#;
 
     #[test]
-    fn russh_client_config_uses_large_static_windows() {
+    fn russh_client_config_caps_ssh_packets_at_the_tcp_packet_limit() {
         let config = russh_client_config();
         assert_eq!(config.window_size, 16 * 1024 * 1024);
-        assert_eq!(config.maximum_packet_size, 256 * 1024);
+        assert_eq!(config.maximum_packet_size, u16::MAX as u32);
         assert_eq!(config.channel_buffer_size, 1024);
         assert_eq!(config.inactivity_timeout, None);
         assert_eq!(
@@ -802,13 +803,16 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
 
         let packets = 32;
         let payload = Bytes::from(vec![0x5a; packets * SFTP_WRITE_PACKET_SIZE]);
+        CLIENT_WRITE_TRACKING.store(false, Ordering::SeqCst);
         CLIENT_WRITE_IN_FLIGHT.store(0, Ordering::SeqCst);
         CLIENT_WRITE_PEAK.store(0, Ordering::SeqCst);
+        CLIENT_WRITE_TRACKING.store(true, Ordering::SeqCst);
         let started = std::time::Instant::now();
         session
             .write_file_durable(std::path::Path::new("bulk.bin"), vec![payload.clone()])
             .await
             .unwrap();
+        CLIENT_WRITE_TRACKING.store(false, Ordering::SeqCst);
         assert_eq!(
             env.exec_requests.load(Ordering::SeqCst),
             0,

@@ -1,4 +1,4 @@
-#[cfg(any(feature = "webui", test))]
+#[cfg(test)]
 pub(crate) use super::handler::NinePHandler;
 pub(crate) use super::lock_manager::FileLockManager;
 use crate::fs::ZeroFS;
