@@ -15,6 +15,7 @@ use rand::{RngCore, SeedableRng, rngs::StdRng};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
+use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -149,6 +150,16 @@ fn apply_transport_path_overrides(settings: &mut Settings) -> Result<()> {
         config.hpn_program = Some(PathBuf::from(path));
     }
     Ok(())
+}
+
+fn load_benchmark_settings(config_path: &std::path::Path) -> Result<Settings> {
+    let content = fs::read_to_string(config_path)
+        .with_context(|| format!("read benchmark config {}", config_path.display()))?;
+    let mut settings: Settings = toml::from_str(&content)
+        .with_context(|| format!("parse benchmark config {}", config_path.display()))?;
+    apply_transport_path_overrides(&mut settings)?;
+    settings.validate()?;
+    Ok(settings)
 }
 
 async fn execute_benchmark(
@@ -287,8 +298,7 @@ async fn bench_sftp_writeback_remote_drain() -> Result<()> {
     let config_path = std::env::var_os(CONFIG_ENV)
         .map(PathBuf::from)
         .with_context(|| format!("{CONFIG_ENV} must name a ZeroFS TOML file"))?;
-    let mut settings = Settings::from_file(&config_path)?;
-    apply_transport_path_overrides(&mut settings)?;
+    let settings = load_benchmark_settings(&config_path)?;
     anyhow::ensure!(
         settings.sftp_endpoint()?.is_some(),
         "{CONFIG_ENV} must configure an sftp:// storage URL"
