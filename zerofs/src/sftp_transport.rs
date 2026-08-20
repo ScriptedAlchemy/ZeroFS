@@ -499,9 +499,8 @@ impl Drop for OperationAdmission {
 }
 
 /// One SSH connection shared by up to [`SFTP_SESSION_MAX_CONCURRENT_OPS`]
-/// concurrent operations. The underlying transport pipelines independent
-/// requests, so sharing multiplies small-operation throughput per connection
-/// instead of serializing every operation on one WAN round trip at a time.
+/// concurrent small read/metadata operations. A write already pipelines a
+/// full WAN window, so it owns its physical session until completion.
 struct SharedSession {
     transport: Arc<dyn TransportSession>,
     // Dropped only after the transport finished closing, so a redial cannot
@@ -538,6 +537,18 @@ impl SharedSession {
             self.active_writes.fetch_add(1, Ordering::SeqCst);
         }
         self.active_ops.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn can_accept(&self, kind: OperationKind) -> bool {
+        if self.broken.load(Ordering::SeqCst) {
+            return false;
+        }
+        match kind {
+            OperationKind::Write => self.active_ops.load(Ordering::SeqCst) == 0,
+            OperationKind::Read | OperationKind::Metadata => {
+                self.active_ops.load(Ordering::SeqCst) < SFTP_SESSION_MAX_CONCURRENT_OPS
+            }
+        }
     }
 }
 
@@ -1214,9 +1225,9 @@ impl SftpSessionPool {
     }
 
     /// Places one operation on a session. Prefers a fully idle session, then
-    /// dials a new connection while capacity remains, and only then stacks
-    /// the operation onto the least-loaded session below the per-session cap
-    /// so bulk transfers spread across connections before they share one.
+    /// dials a new connection while capacity remains. Small reads and metadata
+    /// may share the least-loaded session; a pipelined write waits for an idle
+    /// physical session instead of competing with another full write window.
     async fn acquire_session(
         &self,
         kind: OperationKind,
@@ -1241,11 +1252,7 @@ impl SftpSessionPool {
                 }
                 let candidate = roster
                     .iter()
-                    .filter(|session| {
-                        !session.broken.load(Ordering::SeqCst)
-                            && session.active_ops.load(Ordering::SeqCst)
-                                < SFTP_SESSION_MAX_CONCURRENT_OPS
-                    })
+                    .filter(|session| session.can_accept(kind))
                     .min_by_key(|session| {
                         let ops = session.active_ops.load(Ordering::SeqCst);
                         match kind {
@@ -1308,11 +1315,7 @@ impl SftpSessionPool {
                                 }
                                 let candidate = roster
                                     .iter()
-                                    .filter(|session| {
-                                        !session.broken.load(Ordering::SeqCst)
-                                            && session.active_ops.load(Ordering::SeqCst)
-                                                < SFTP_SESSION_MAX_CONCURRENT_OPS
-                                    })
+                                    .filter(|session| session.can_accept(kind))
                                     .min_by_key(|session| session.active_ops.load(Ordering::SeqCst))
                                     .cloned();
                                 if let Some(session) = &candidate {
@@ -2628,22 +2631,33 @@ mod tests {
 
         factory.state.block_open_from.store(0, Ordering::SeqCst);
         factory.state.allow_open.notify_waiters();
-        let mut leases = vec![first];
-        for task in tasks {
-            leases.push(task.await.unwrap());
-        }
-        let mut writes_per_session = pool
-            .inner
-            .roster
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|session| session.active_writes.load(Ordering::SeqCst))
-            .collect::<Vec<_>>();
-        writes_per_session.sort_unstable();
-        assert_eq!(writes_per_session, [2, 2, 2, 2]);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let writes_per_session = pool
+                    .inner
+                    .roster
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|session| session.active_writes.load(Ordering::SeqCst))
+                    .collect::<Vec<_>>();
+                if writes_per_session.len() == 4
+                    && writes_per_session.iter().all(|writes| *writes == 1)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("each physical session receives exactly one pipelined upload");
 
-        for lease in leases {
+        first.complete().await.unwrap();
+        for task in tasks {
+            let lease = tokio::time::timeout(std::time::Duration::from_secs(1), task)
+                .await
+                .expect("a released session admits the next upload")
+                .unwrap();
             lease.complete().await.unwrap();
         }
         pool.shutdown().await.unwrap();
