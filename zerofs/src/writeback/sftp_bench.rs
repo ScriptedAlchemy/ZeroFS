@@ -50,6 +50,9 @@ const TOTAL_MIB_ENV: &str = "ZEROFS_BENCH_SFTP_TOTAL_MIB";
 const PAYLOAD_KIB_ENV: &str = "ZEROFS_BENCH_SFTP_PAYLOAD_KIB";
 const WRITERS_ENV: &str = "ZEROFS_BENCH_SFTP_WRITERS";
 const BENCH_DIR_ENV: &str = "ZEROFS_BENCH_DIR";
+const IDENTITY_FILE_ENV: &str = "ZEROFS_BENCH_SFTP_IDENTITY_FILE";
+const KNOWN_HOSTS_ENV: &str = "ZEROFS_BENCH_SFTP_KNOWN_HOSTS";
+const HPN_PROGRAM_ENV: &str = "ZEROFS_BENCH_SFTP_HPN_PROGRAM";
 
 #[derive(Debug)]
 struct BenchObjectSet {
@@ -130,6 +133,22 @@ where
 
 fn mib_per_second(total_bytes: u64, elapsed: Duration) -> f64 {
     total_bytes as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64()
+}
+
+fn apply_transport_path_overrides(settings: &mut Settings) -> Result<()> {
+    let Some(config) = settings.sftp.as_mut() else {
+        anyhow::bail!("benchmark config must include [sftp]");
+    };
+    if let Some(path) = std::env::var_os(IDENTITY_FILE_ENV) {
+        config.identity_file = PathBuf::from(path);
+    }
+    if let Some(path) = std::env::var_os(KNOWN_HOSTS_ENV) {
+        config.known_hosts = PathBuf::from(path);
+    }
+    if let Some(path) = std::env::var_os(HPN_PROGRAM_ENV) {
+        config.hpn_program = Some(PathBuf::from(path));
+    }
+    Ok(())
 }
 
 async fn execute_benchmark(
@@ -268,7 +287,8 @@ async fn bench_sftp_writeback_remote_drain() -> Result<()> {
     let config_path = std::env::var_os(CONFIG_ENV)
         .map(PathBuf::from)
         .with_context(|| format!("{CONFIG_ENV} must name a ZeroFS TOML file"))?;
-    let settings = Settings::from_file(&config_path)?;
+    let mut settings = Settings::from_file(&config_path)?;
+    apply_transport_path_overrides(&mut settings)?;
     anyhow::ensure!(
         settings.sftp_endpoint()?.is_some(),
         "{CONFIG_ENV} must configure an sftp:// storage URL"

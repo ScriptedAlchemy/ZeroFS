@@ -22,6 +22,9 @@ source /secure/zerofs-prod.env
 set +a
 ZEROFS_SFTP_WRITEBACK_BENCH_CONFIG=/secure/zerofs-prod.toml \
 ZEROFS_BENCH_DIR=/var/tmp \
+ZEROFS_BENCH_SFTP_IDENTITY_FILE=/secure/storage-key \
+ZEROFS_BENCH_SFTP_KNOWN_HOSTS=/secure/known_hosts \
+ZEROFS_BENCH_SFTP_HPN_PROGRAM=/home/zack/.local/opt/hpnssh/e2dfa0cea55d93747f4c68b4a2b134d6fbe0db06/bin/hpnssh \
 cargo test --locked -p zerofs --lib \
   bench_sftp_writeback_remote_drain -- --ignored --nocapture
 ```
