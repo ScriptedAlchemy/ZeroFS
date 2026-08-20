@@ -1108,6 +1108,15 @@ fn collect_pipeline_batch(
     let mut batch = Vec::new();
     let mut earlier_keys = BTreeSet::new();
     let mut expected = first_sequence;
+    // Segment reclamation emits long contiguous runs of delete fences, each of
+    // which previously reached the frontier alone at one WAN round trip per
+    // record. A contiguous prefix of deletes at the frontier may dispatch
+    // concurrently: every object in the run is already unreferenced by the
+    // durable manifest that preceded it in the journal, so any subset of the
+    // run completing is a consistent remote state, and a replayed delete
+    // tolerates NotFound. The first non-delete record ends the run; the
+    // watermark still commits strictly in sequence order.
+    let mut frontier_delete_run = true;
     for record in records
         .iter()
         .filter(|record| record.sequence >= first_sequence)
@@ -1119,12 +1128,13 @@ fn collect_pipeline_batch(
         let conflicts_with_earlier = keys.iter().any(|key| earlier_keys.contains(key));
         let is_frontier = record.sequence == first_sequence;
         let may_preupload = record.fence == FenceClass::ImmutableCreate;
+        frontier_delete_run &= matches!(record.kind, MutationKind::Delete);
         // Only immutable, unreferenced data may cross a fence. Results remain
         // held in memory and are journal-committed strictly in sequence order.
         if !completed.contains_key(&record.sequence)
             && !active.contains(&record.sequence)
             && !conflicts_with_earlier
-            && (is_frontier || may_preupload)
+            && (is_frontier || may_preupload || frontier_delete_run)
         {
             batch.push(record.clone());
         }
@@ -1730,7 +1740,17 @@ mod tests {
     use std::time::Duration;
 
     fn record(sequence: u64, path: &str, fence: FenceClass) -> MutationRecord {
-        crate::writeback::test_util::delete_record(sequence, path, fence, 0, 0)
+        // Keep the fabricated kind consistent with the fence class: batch
+        // admission now distinguishes deletes from ordered puts by kind.
+        let mode = match fence {
+            FenceClass::ImmutableCreate => crate::writeback::model::MutationMode::Create,
+            FenceClass::Fence => crate::writeback::model::MutationMode::Overwrite,
+        };
+        crate::writeback::test_util::put_record(sequence, path, b"payload", mode, fence, 0, 0)
+    }
+
+    fn frontier_delete(sequence: u64, path: &str) -> MutationRecord {
+        crate::writeback::test_util::delete_record(sequence, path, FenceClass::Fence, 0, 0)
     }
 
     #[tokio::test]
@@ -1928,6 +1948,28 @@ mod tests {
                 .map(|record| record.sequence)
                 .collect::<Vec<_>>(),
             vec![1, 3, 5, 7]
+        );
+    }
+
+    #[test]
+    fn a_contiguous_frontier_delete_run_dispatches_concurrently() {
+        let mut records = (1_u64..=5)
+            .map(|sequence| frontier_delete(sequence, &format!("compacted/{sequence:020}.sst")))
+            .collect::<Vec<_>>();
+        records.push(record(6, "manifest/000006.manifest", FenceClass::Fence));
+        records.push(record(7, "segments/7", FenceClass::ImmutableCreate));
+
+        let batch =
+            collect_pipeline_batch(&records, 1, 8, &Default::default(), &Default::default());
+
+        assert_eq!(
+            batch
+                .iter()
+                .map(|record| record.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5, 7],
+            "a contiguous run of frontier deletes must dispatch together; the ordered \
+             manifest behind the run still waits to become the frontier"
         );
     }
 
