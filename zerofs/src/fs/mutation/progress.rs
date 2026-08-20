@@ -1,8 +1,5 @@
 //! Gap-free mutation materialization progress.
 
-// WIP mutation submodule: parts of this API are landed but not yet wired.
-#![allow(dead_code)]
-
 use crate::fs::mutation::types::{MutationCutoff, MutationError, MutationIncarnation};
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -41,6 +38,7 @@ impl MutationProgress {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn materialized_through(&self) -> u64 {
         lock(&self.inner.state).materialized_through
     }

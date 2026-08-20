@@ -6,9 +6,6 @@
 //! the captured sequence before entering the existing filesystem durability
 //! barrier.
 
-// WIP mutation submodule: parts of this API are landed but not yet wired.
-#![allow(dead_code)]
-
 use crate::fs::errors::FsError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -203,6 +200,7 @@ impl WriteVisibility {
         })
     }
 
+    #[allow(dead_code)]
     pub(crate) fn published() -> Arc<Self> {
         Arc::new(Self {
             published: AtomicBool::new(true),
@@ -472,6 +470,7 @@ impl VolatileWriteRuntime {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn accept_write(
         &self,
         admission: VolatileAdmission,
@@ -667,6 +666,7 @@ impl VolatileWriteRuntime {
         cutoff
     }
 
+    #[allow(dead_code)]
     pub(crate) fn fence_abort(&self) {
         let sequence = self.accepted_cutoff().saturating_add(1);
         self.fail(sequence, OverlayError::IoError);

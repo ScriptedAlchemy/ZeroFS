@@ -5,9 +5,6 @@
 //! after mutation materialization, conservative object capture, and the
 //! requested local or remote wait all succeed.
 
-// WIP mutation submodule: parts of this API are landed but not yet wired.
-#![allow(dead_code)]
-
 use crate::fs::errors::FsError;
 use crate::fs::mutation::config::ClientDurabilityTarget;
 use crate::fs::mutation::types::MutationCutoff;
@@ -69,8 +66,10 @@ pub(crate) struct DurabilityReceipt {
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum DurabilityError {
     #[error("stale mutation incarnation")]
+    #[allow(dead_code)]
     StaleMutationIncarnation,
     #[error("stale journal incarnation")]
+    #[allow(dead_code)]
     StaleJournalIncarnation,
     #[error("mutation materialization failed: {0}")]
     Materialization(#[source] FsError),
@@ -91,6 +90,7 @@ impl DurabilityError {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn from_local(error: LocalBarrierError) -> Self {
         match error {
             LocalBarrierError::StaleIncarnation => Self::StaleJournalIncarnation,
@@ -99,6 +99,7 @@ impl DurabilityError {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn from_remote(error: RemoteBarrierError) -> Self {
         match error {
             RemoteBarrierError::StaleIncarnation => Self::StaleJournalIncarnation,
@@ -107,6 +108,7 @@ impl DurabilityError {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn from_materialization(error: crate::fs::mutation::types::MutationError) -> Self {
         use crate::fs::mutation::types::MutationError;
         match error {

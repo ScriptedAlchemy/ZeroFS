@@ -6,10 +6,6 @@
 //! ownership without add/subtract. Shrink subtracts only after a successful
 //! canonical commit.
 
-// Landed-but-not-wired quota API; production call sites arrive with the
-// mutation wiring.
-#![allow(dead_code)]
-
 use crate::fs::errors::FsError;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
@@ -17,10 +13,12 @@ use std::sync::{Arc, Mutex};
 const STATE_PROVISIONAL: u8 = 0;
 const STATE_ACCEPTED: u8 = 1;
 const STATE_CANONICAL: u8 = 2;
+#[allow(dead_code)]
 const STATE_TERMINAL: u8 = 3;
 const STATE_RELEASED: u8 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub(crate) enum QuotaReservationState {
     Provisional,
     Accepted,
@@ -30,6 +28,7 @@ pub(crate) enum QuotaReservationState {
 }
 
 impl QuotaReservationState {
+    #[allow(dead_code)]
     fn from_u8(value: u8) -> Self {
         match value {
             STATE_PROVISIONAL => Self::Provisional,
@@ -75,6 +74,7 @@ impl LogicalQuota {
         })
     }
 
+    #[allow(dead_code)]
     pub(crate) fn max_bytes(&self) -> u64 {
         self.max_bytes
     }
@@ -97,18 +97,22 @@ impl LogicalQuota {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn is_poisoned(&self) -> bool {
         self.lock().poisoned.is_some()
     }
 
+    #[allow(dead_code)]
     pub(crate) fn committed_bytes(&self) -> u64 {
         self.lock().committed
     }
 
+    #[allow(dead_code)]
     pub(crate) fn pending_bytes(&self) -> u64 {
         self.lock().pending
     }
 
+    #[allow(dead_code)]
     pub(crate) fn visible_bytes(&self) -> u64 {
         let mut inner = self.lock();
         match inner.committed.checked_add(inner.pending) {
@@ -219,10 +223,12 @@ impl LogicalQuota {
 }
 
 impl ProvisionalQuotaReservation {
+    #[allow(dead_code)]
     pub(crate) fn bytes(&self) -> u64 {
         self.bytes
     }
 
+    #[allow(dead_code)]
     pub(crate) fn state(&self) -> QuotaReservationState {
         QuotaReservationState::from_u8(self.state.load(Ordering::Acquire))
     }
@@ -246,6 +252,7 @@ impl ProvisionalQuotaReservation {
     }
 
     /// Keep the pending charge after a terminal failure. Drop will not release.
+    #[allow(dead_code)]
     pub(crate) fn retain_terminal(&self) {
         let previous = self.state.swap(STATE_TERMINAL, Ordering::AcqRel);
         if previous == STATE_PROVISIONAL {

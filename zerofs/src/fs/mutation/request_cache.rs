@@ -5,9 +5,6 @@
 //! before any raw admission call. A vacant lookup already owns exactly one
 //! operation slot; [`RequestVacancy::begin_pending`] moves that same slot.
 
-// WIP mutation submodule: parts of this API are landed but not yet wired.
-#![allow(dead_code)]
-
 use crate::fs::errors::FsError;
 use crate::fs::mutation::types::{
     PreparedBatchResult, RequestFingerprint, RequestIdentity, RequestLifetime,
@@ -122,6 +119,7 @@ pub(crate) struct RequestVacancy {
 pub(crate) struct PendingRequest {
     cache: Arc<RequestCacheInner>,
     identity: RequestIdentity,
+    #[allow(dead_code)]
     fingerprint: RequestFingerprint,
     lifetime: RequestLifetime,
     operation_slot: Option<RequestOperationSlot>,
@@ -146,6 +144,7 @@ pub(crate) struct AcceptedRequest {
 /// Shared in-flight or completed result. Joiners wait here instead of
 /// re-entering raw admission.
 pub(crate) struct RetainedRequest {
+    #[allow(dead_code)]
     identity: RequestIdentity,
     fingerprint: RequestFingerprint,
     outcome: Mutex<Option<Result<PreparedBatchResult, FsError>>>,
@@ -162,10 +161,12 @@ impl RetainedRequest {
         })
     }
 
+    #[allow(dead_code)]
     pub(crate) fn identity(&self) -> &RequestIdentity {
         &self.identity
     }
 
+    #[allow(dead_code)]
     pub(crate) fn fingerprint(&self) -> RequestFingerprint {
         self.fingerprint
     }
@@ -287,10 +288,12 @@ impl RequestCache {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn used_slots(&self) -> usize {
         lock(&self.inner.state).used_slots
     }
 
+    #[allow(dead_code)]
     pub(crate) fn len(&self) -> usize {
         lock(&self.inner.state).entries.len()
     }

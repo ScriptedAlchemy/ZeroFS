@@ -5,9 +5,6 @@
 //! Application consumes those exact attributes and payloads; it does not
 //! re-decide timestamps, set-id bits, or post-write size.
 
-// WIP mutation submodule: parts of this API are landed but not yet wired.
-#![allow(dead_code)]
-
 use crate::dedup::OpId;
 use crate::fs::inode::{Inode, InodeId};
 use crate::fs::lock_manager::MultiLockGuard;
@@ -84,6 +81,7 @@ impl PreparedWriteBatch {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn is_replayed(&self) -> bool {
         self.replayed.is_some()
     }
@@ -119,10 +117,12 @@ pub(crate) enum RequestIdentity {
         connection_incarnation: u64,
         xid: u32,
     },
+    #[allow(dead_code)]
     Nbd {
         connection_incarnation: u64,
         handle: u64,
     },
+    #[allow(dead_code)]
     DirectTagged {
         caller_incarnation: uuid::Uuid,
         operation_id: u128,
@@ -172,6 +172,7 @@ mod request_fingerprint_tests {
 /// How long a completed request may occupy the replay cache.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RequestLifetime {
+    #[allow(dead_code)]
     CanonicalDedup,
     ReplayWindow(std::time::Duration),
     InFlightOnly,
@@ -231,6 +232,7 @@ impl MutationIncarnation {
         Self(uuid::Uuid::new_v4())
     }
 
+    #[allow(dead_code)]
     pub(crate) fn as_uuid(self) -> uuid::Uuid {
         self.0
     }
