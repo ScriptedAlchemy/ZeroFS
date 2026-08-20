@@ -21,6 +21,8 @@ use crate::writeback::reservation::{
 };
 use crate::writeback::space_refresher::SpaceRefresher;
 use crate::writeback::space_sample::{PhysicalSpaceSample, PhysicalSpaceSampler};
+#[cfg(test)]
+use crate::writeback::test_util::WriteAdmissionTestControl;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::BoxStream;
@@ -416,6 +418,28 @@ impl WritebackObjectStore {
         reserve_ssd_token(&self.inner.ssd, &self.inner.space, bytes).await
     }
 
+    #[cfg(test)]
+    async fn reserve_ssd_observed(
+        &self,
+        bytes: u64,
+        control: &WriteAdmissionTestControl,
+    ) -> object_store::Result<SsdReservationToken> {
+        let sample = self
+            .inner
+            .space
+            .sample()
+            .await
+            .map_err(|error| generic_error(format!("writeback SSD sample failed: {error}")))?;
+        reserve_ssd_token_from_sample_observed(
+            &self.inner.ssd,
+            &self.inner.space,
+            bytes,
+            sample,
+            control,
+        )
+        .await
+    }
+
     /// Start remote writeback after callers have finished opening over the
     /// stable recovered overlay. Repeated activation is harmless.
     pub fn activate_remote(&self) -> Result<(), RemoteBarrierError> {
@@ -609,6 +633,11 @@ impl WritebackObjectStore {
         disk: Option<SsdReservationToken>,
         multipart_cleanup: &mut Option<MultipartStagingCleanup>,
     ) -> object_store::Result<PutResult> {
+        #[cfg(test)]
+        let admission_test_control = options
+            .extensions
+            .get::<WriteAdmissionTestControl>()
+            .cloned();
         let disk_charge = MutationRecord::ssd_reservation_estimate(
             location.as_ref(),
             None,
@@ -617,8 +646,21 @@ impl WritebackObjectStore {
         .map_err(|error| generic_error(format!("failed to size put journal entry: {error}")))?;
         let disk = match disk {
             Some(disk) => disk,
-            None => self.reserve_ssd(disk_charge).await?,
+            None => {
+                #[cfg(test)]
+                if let Some(control) = &admission_test_control {
+                    self.reserve_ssd_observed(disk_charge, control).await?
+                } else {
+                    self.reserve_ssd(disk_charge).await?
+                }
+                #[cfg(not(test))]
+                self.reserve_ssd(disk_charge).await?
+            }
         };
+        #[cfg(test)]
+        if let Some(control) = &admission_test_control {
+            control.wait_for_allocation_release().await;
+        }
         let lock = self.key_lock(&location);
         let key_guard = lock.lock_owned().await;
         let trusted_segment_create = options.extensions.get::<GeneratedSegmentCreate>().is_some();
@@ -664,6 +706,10 @@ impl WritebackObjectStore {
             })?;
         let order_guard = self.inner.admission_order.lock().await;
         let sequence = self.allocate_sequence()?;
+        #[cfg(test)]
+        if let Some(control) = &admission_test_control {
+            control.mark_allocated();
+        }
         let local_etag = LocalEtag::new(self.inner.incarnation, sequence);
         let path = location.to_string();
         let kind = MutationKind::Put {
@@ -1991,7 +2037,31 @@ async fn reserve_ssd_token_from_sample(
     ssd: &SsdAdmission,
     space: &PhysicalSpaceSampler,
     bytes: u64,
+    sample: PhysicalSpaceSample,
+) -> object_store::Result<SsdReservationToken> {
+    reserve_ssd_token_from_sample_with_observer(ssd, space, bytes, sample, || {}).await
+}
+
+#[cfg(test)]
+async fn reserve_ssd_token_from_sample_observed(
+    ssd: &SsdAdmission,
+    space: &PhysicalSpaceSampler,
+    bytes: u64,
+    sample: PhysicalSpaceSample,
+    control: &WriteAdmissionTestControl,
+) -> object_store::Result<SsdReservationToken> {
+    reserve_ssd_token_from_sample_with_observer(ssd, space, bytes, sample, || {
+        control.mark_queued();
+    })
+    .await
+}
+
+async fn reserve_ssd_token_from_sample_with_observer(
+    ssd: &SsdAdmission,
+    space: &PhysicalSpaceSampler,
+    bytes: u64,
     mut sample: PhysicalSpaceSample,
+    on_queued: impl Fn(),
 ) -> object_store::Result<SsdReservationToken> {
     let request = SsdReservationRequest {
         ssd_reservation_bytes: bytes,
@@ -1999,7 +2069,10 @@ async fn reserve_ssd_token_from_sample(
         operations: 1,
     };
     loop {
-        match ssd.reserve(request, sample).await {
+        match ssd
+            .reserve_with_queue_observer(request, sample, &on_queued)
+            .await
+        {
             Ok(token) => return Ok(token),
             Err(error @ ReservationError::StaleSample { latest, .. }) => {
                 let Some(newer) = space.latest_sample().filter(|newer| {
@@ -2038,6 +2111,7 @@ mod tests {
     use crate::writeback::payload::VerifiedPayload;
     use crate::writeback::reservation::{SsdAdmission, SsdReservationRequest};
     use crate::writeback::space_sample::PhysicalSpaceSampler;
+    use crate::writeback::test_util::WriteAdmissionTestControl;
     use bytes::Bytes;
     use futures::{StreamExt, stream};
     use object_store::memory::InMemory;
@@ -2055,6 +2129,92 @@ mod tests {
 
     async fn test_store() -> (WritebackObjectStore, Arc<InMemory>, tempfile::TempDir) {
         test_store_with_remote_drain(false).await
+    }
+
+    #[tokio::test]
+    async fn allocation_test_control_does_not_deadlock_on_a_key_shard_collision() {
+        let (store, _remote, _temp) = test_store().await;
+        let first_path = Path::from("zerofs/pilot/segments/01/0000000000000001/0000000000000001");
+        let first_shard = store.key_lock_index(&first_path);
+        let second_path = (2_u64..10_000)
+            .map(|counter| {
+                Path::from(format!(
+                    "zerofs/pilot/segments/02/0000000000000001/{counter:016x}"
+                ))
+            })
+            .find(|path| store.key_lock_index(path) == first_shard)
+            .expect("a colliding benchmark path exists within the bounded search");
+
+        let second_control = WriteAdmissionTestControl::new();
+        let mut second_options = PutOptions::default();
+        second_options.extensions.insert(second_control.clone());
+
+        let second = tokio::spawn({
+            let store = store.clone();
+            let second_path = second_path.clone();
+            async move {
+                store
+                    .put_opts(
+                        &second_path,
+                        Bytes::from_static(b"second").into(),
+                        second_options,
+                    )
+                    .await
+            }
+        });
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            second_control.wait_until_allocation_waits(),
+        )
+        .await
+        .expect("the later colliding path must reach the allocation test seam");
+
+        let first_control = WriteAdmissionTestControl::new();
+        let mut first_options = PutOptions::default();
+        first_options.extensions.insert(first_control.clone());
+        let first = tokio::spawn({
+            let store = store.clone();
+            let first_path = first_path.clone();
+            async move {
+                store
+                    .put_opts(
+                        &first_path,
+                        Bytes::from_static(b"first").into(),
+                        first_options,
+                    )
+                    .await
+            }
+        });
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            first_control.wait_until_allocation_waits(),
+        )
+        .await
+        .expect("the earlier path must reach allocation despite the colliding later path");
+        first_control.release_allocation();
+        tokio::time::timeout(Duration::from_secs(1), first_control.wait_until_allocated())
+            .await
+            .expect("the earlier path must allocate first");
+        second_control.release_allocation();
+
+        let first = first.await.unwrap().unwrap();
+        let second = second.await.unwrap().unwrap();
+
+        assert_eq!(
+            first
+                .e_tag
+                .as_deref()
+                .and_then(LocalEtag::sequence_from_str),
+            Some(1)
+        );
+        assert_eq!(
+            second
+                .e_tag
+                .as_deref()
+                .and_then(LocalEtag::sequence_from_str),
+            Some(2)
+        );
+        store.shutdown().await.unwrap();
     }
 
     #[test]

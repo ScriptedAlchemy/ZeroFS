@@ -211,6 +211,27 @@ async fn stale_sample_is_rejected() {
     );
 }
 
+#[test]
+fn remote_cleanup_releases_with_a_stale_sample_without_forgetting_the_newer_observation() {
+    let pending = request(40, 12, 1);
+    let admission =
+        SsdAdmission::recover(1_000, 16, 90, 70, 10, [pending], Some(sample(7, 500))).unwrap();
+
+    admission
+        .release_remote(pending, sample(6, 900))
+        .expect("remote cleanup owns the charge even when its space sample lost a race");
+
+    let snapshot = admission.snapshot();
+    assert_eq!(snapshot.used_ssd_bytes, 0);
+    assert_eq!(snapshot.used_operations, 0);
+    assert_eq!(snapshot.outstanding_physical_claims, 0);
+    assert_eq!(snapshot.sample_generation, 7);
+    assert_eq!(snapshot.available_bytes, 500);
+    admission
+        .observe_sample(sample(8, 480))
+        .expect("stale remote cleanup must not poison SSD admission");
+}
+
 #[tokio::test]
 async fn close_and_poison_wake_waiters() {
     let admission = exact_admission();

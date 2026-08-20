@@ -44,6 +44,7 @@ pub(crate) struct SsdAdmissionSnapshot {
     pub(crate) credit_bytes: u64,
     pub(crate) credit_ops: u64,
 }
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum ReservationError {
     #[error("writeback SSD admission is closed")]
@@ -293,6 +294,16 @@ impl SsdAdmission {
         request: SsdReservationRequest,
         sample: PhysicalSpaceSample,
     ) -> Result<SsdReservationToken, ReservationError> {
+        self.reserve_with_queue_observer(request, sample, || {})
+            .await
+    }
+
+    pub(crate) async fn reserve_with_queue_observer(
+        &self,
+        request: SsdReservationRequest,
+        sample: PhysicalSpaceSample,
+        on_queued: impl FnOnce(),
+    ) -> Result<SsdReservationToken, ReservationError> {
         if request.ssd_reservation_bytes > self.inner.capacity_bytes {
             return Err(ReservationError::TooLarge {
                 requested: request.ssd_reservation_bytes,
@@ -353,6 +364,7 @@ impl SsdAdmission {
             );
             (id, receiver, physical_wait)
         };
+        on_queued();
         if physical_wait {
             self.inner.physical_waiters.notify_waiters();
         }
@@ -590,8 +602,9 @@ impl SsdAdmission {
     /// Release a locally committed reservation after remote cleanup.
     ///
     /// Observes `sample` first so waiters see the post-cleanup free space.
-    /// The charge stays held if the sampler generation is stale or admission
-    /// is already terminal.
+    /// A newer concurrent observation wins over a stale cleanup sample; the
+    /// remote cleanup still owns and must release its exact logical charge.
+    /// The charge stays held if admission is already terminal.
     pub(crate) fn release_remote(
         &self,
         request: SsdReservationRequest,
@@ -599,7 +612,10 @@ impl SsdAdmission {
     ) -> Result<(), ReservationError> {
         {
             let mut state = lock(&self.inner.state);
-            self.inner.observe_locked(&mut state, sample)?;
+            match self.inner.observe_locked(&mut state, sample) {
+                Ok(()) | Err(ReservationError::StaleSample { .. }) => {}
+                Err(error) => return Err(error),
+            }
             if let Some(error) = &state.terminal {
                 return Err(error.clone());
             }

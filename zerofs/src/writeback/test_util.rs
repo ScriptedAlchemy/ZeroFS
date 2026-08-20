@@ -10,7 +10,108 @@
 
 use super::model::{FenceClass, LocalEtag, MutationKind, MutationMode, MutationRecord};
 use sha2::{Digest, Sha256};
+use std::sync::{Arc, Mutex};
+use tokio::sync::Notify;
 use uuid::Uuid;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum WriteAdmissionTestPhase {
+    Created,
+    Queued,
+    AllocationWaiting,
+    Allocated,
+}
+
+#[derive(Debug)]
+struct WriteAdmissionTestState {
+    phase: WriteAdmissionTestPhase,
+    queued: bool,
+    allocation_released: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct WriteAdmissionTestControl {
+    state: Arc<Mutex<WriteAdmissionTestState>>,
+    changed: Arc<Notify>,
+}
+
+impl WriteAdmissionTestControl {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(WriteAdmissionTestState {
+                phase: WriteAdmissionTestPhase::Created,
+                queued: false,
+                allocation_released: false,
+            })),
+            changed: Arc::new(Notify::new()),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, WriteAdmissionTestState> {
+        self.state.lock().unwrap()
+    }
+
+    async fn wait_for_phase(&self, target: WriteAdmissionTestPhase) {
+        loop {
+            let changed = self.changed.notified();
+            if self.lock().phase >= target {
+                return;
+            }
+            changed.await;
+        }
+    }
+
+    pub(crate) async fn wait_until_registered(&self) {
+        self.wait_for_phase(WriteAdmissionTestPhase::Queued).await;
+    }
+
+    pub(crate) async fn wait_until_allocation_waits(&self) {
+        self.wait_for_phase(WriteAdmissionTestPhase::AllocationWaiting)
+            .await;
+    }
+
+    pub(crate) async fn wait_until_allocated(&self) {
+        self.wait_for_phase(WriteAdmissionTestPhase::Allocated)
+            .await;
+    }
+
+    pub(crate) fn release_allocation(&self) {
+        self.lock().allocation_released = true;
+        self.changed.notify_waiters();
+    }
+
+    pub(crate) fn mark_queued(&self) {
+        let mut state = self.lock();
+        state.queued = true;
+        state.phase = state.phase.max(WriteAdmissionTestPhase::Queued);
+        drop(state);
+        self.changed.notify_waiters();
+    }
+
+    pub(crate) fn was_queued(&self) -> bool {
+        self.lock().queued
+    }
+
+    pub(crate) async fn wait_for_allocation_release(&self) {
+        {
+            let mut state = self.lock();
+            state.phase = state.phase.max(WriteAdmissionTestPhase::AllocationWaiting);
+        }
+        self.changed.notify_waiters();
+        loop {
+            let changed = self.changed.notified();
+            if self.lock().allocation_released {
+                return;
+            }
+            changed.await;
+        }
+    }
+
+    pub(crate) fn mark_allocated(&self) {
+        self.lock().phase = WriteAdmissionTestPhase::Allocated;
+        self.changed.notify_waiters();
+    }
+}
 
 /// Build a `Put` `MutationRecord`.
 ///
