@@ -16,9 +16,11 @@ use crate::writeback::multipart_reservation::{
 use crate::writeback::overlay::{OverlayCommitObserver, OverlayIndex, VisibleVersion};
 use crate::writeback::payload::VerifiedPayload;
 use crate::writeback::remote::{RemoteBarrierError, RemoteScheduler};
-use crate::writeback::reservation::{SsdAdmission, SsdReservationRequest, SsdReservationToken};
+use crate::writeback::reservation::{
+    ReservationError, SsdAdmission, SsdReservationRequest, SsdReservationToken,
+};
 use crate::writeback::space_refresher::SpaceRefresher;
-use crate::writeback::space_sample::PhysicalSpaceSampler;
+use crate::writeback::space_sample::{PhysicalSpaceSample, PhysicalSpaceSampler};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::BoxStream;
@@ -1972,21 +1974,45 @@ async fn reserve_ssd_token(
         .sample()
         .await
         .map_err(|error| generic_error(format!("writeback SSD sample failed: {error}")))?;
-    ssd.reserve(
-        SsdReservationRequest {
-            ssd_reservation_bytes: bytes,
-            physical_reservation_bytes: bytes,
-            operations: 1,
-        },
-        sample,
-    )
-    .await
-    .map_err(|error| generic_error(format!("dirty SSD admission failed: {error}")))
+    reserve_ssd_token_from_sample(ssd, space, bytes, sample).await
+}
+
+async fn reserve_ssd_token_from_sample(
+    ssd: &SsdAdmission,
+    space: &PhysicalSpaceSampler,
+    bytes: u64,
+    mut sample: PhysicalSpaceSample,
+) -> object_store::Result<SsdReservationToken> {
+    let request = SsdReservationRequest {
+        ssd_reservation_bytes: bytes,
+        physical_reservation_bytes: bytes,
+        operations: 1,
+    };
+    loop {
+        match ssd.reserve(request, sample).await {
+            Ok(token) => return Ok(token),
+            Err(error @ ReservationError::StaleSample { latest, .. }) => {
+                let Some(newer) = space.latest_sample().filter(|newer| {
+                    newer.generation >= latest && newer.generation > sample.generation
+                }) else {
+                    return Err(generic_error(format!(
+                        "dirty SSD admission failed: {error}"
+                    )));
+                };
+                sample = newer;
+            }
+            Err(error) => {
+                return Err(generic_error(format!(
+                    "dirty SSD admission failed: {error}"
+                )));
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::WritebackObjectStore;
+    use super::{WritebackObjectStore, reserve_ssd_token_from_sample};
     use crate::config::CompressionConfig;
     use crate::fault_store::{FaultControls, FaultStore};
     use crate::frame_codec::FrameCodec;
@@ -2000,7 +2026,7 @@ mod tests {
         classify_mutation_fence,
     };
     use crate::writeback::payload::VerifiedPayload;
-    use crate::writeback::reservation::SsdAdmission;
+    use crate::writeback::reservation::{SsdAdmission, SsdReservationRequest};
     use crate::writeback::space_sample::PhysicalSpaceSampler;
     use bytes::Bytes;
     use futures::{StreamExt, stream};
@@ -2574,6 +2600,32 @@ mod tests {
         .await
         .unwrap();
         (store, remote, temp)
+    }
+
+    #[tokio::test]
+    async fn out_of_order_space_probe_retries_with_the_latest_sample() {
+        let temp = tempfile::tempdir().unwrap();
+        let space = PhysicalSpaceSampler::new(temp.path());
+        let stale = space.sample().await.unwrap();
+        let latest = space.sample().await.unwrap();
+        let ssd = SsdAdmission::recover(
+            1 << 20,
+            16,
+            95,
+            85,
+            1,
+            std::iter::empty::<SsdReservationRequest>(),
+            Some(latest),
+        )
+        .unwrap();
+
+        let token = reserve_ssd_token_from_sample(&ssd, &space, 4096, stale)
+            .await
+            .unwrap();
+
+        assert_eq!(ssd.used_bytes(), 4096);
+        drop(token);
+        assert_eq!(ssd.used_bytes(), 0);
     }
 
     #[tokio::test]

@@ -114,6 +114,9 @@ struct BenchReport {
     remote_directory_prepare_seconds: f64,
     remote_drain_seconds: f64,
     remote_drain_mib_per_second: f64,
+    remote_read_seconds: f64,
+    remote_read_mib_per_second: f64,
+    remote_read_verified_objects: usize,
     sftp_publications: u64,
     sftp_open_total_seconds: f64,
     sftp_write_total_seconds: f64,
@@ -186,6 +189,44 @@ fn load_benchmark_settings(config_path: &std::path::Path) -> Result<Settings> {
     Ok(settings)
 }
 
+async fn read_and_verify_remote(
+    remote: &Arc<dyn ObjectStore>,
+    objects: &[ObjectPath],
+    payload: &Bytes,
+    readers: usize,
+) -> Result<(Duration, usize)> {
+    let paths = Arc::new(objects.to_vec());
+    let started = Instant::now();
+    let mut tasks = tokio::task::JoinSet::new();
+    for reader in 0..readers {
+        let remote = Arc::clone(remote);
+        let paths = Arc::clone(&paths);
+        let payload = payload.clone();
+        tasks.spawn(async move {
+            let mut verified = 0;
+            let mut index = reader;
+            while index < paths.len() {
+                let readback = remote.get(&paths[index]).await?.bytes().await?;
+                anyhow::ensure!(
+                    readback == payload,
+                    "SFTP readback mismatch for {}: expected {} bytes, got {}",
+                    paths[index],
+                    payload.len(),
+                    readback.len()
+                );
+                verified += 1;
+                index += readers;
+            }
+            Result::<usize>::Ok(verified)
+        });
+    }
+    let mut verified = 0;
+    while let Some(result) = tasks.join_next().await {
+        verified += result.context("remote reader task failed")??;
+    }
+    Ok((started.elapsed(), verified))
+}
+
 async fn execute_benchmark(
     store: &WritebackObjectStore,
     remote: &Arc<dyn ObjectStore>,
@@ -243,15 +284,8 @@ async fn execute_benchmark(
         .rposition(|publications| *publications != 0)
         .map_or(0, |index| index + 1);
 
-    for path in objects {
-        let readback = remote.get(path).await?.bytes().await?;
-        anyhow::ensure!(
-            readback == payload,
-            "SFTP readback mismatch for {path}: expected {} bytes, got {}",
-            payload.len(),
-            readback.len()
-        );
-    }
+    let (remote_read, remote_read_verified_objects) =
+        read_and_verify_remote(remote, objects, &payload, geometry.writers).await?;
 
     Ok(BenchReport {
         total_bytes,
@@ -268,6 +302,9 @@ async fn execute_benchmark(
         remote_directory_prepare_seconds: geometry.remote_directory_prepare.as_secs_f64(),
         remote_drain_seconds: remote_drain.as_secs_f64(),
         remote_drain_mib_per_second: mib_per_second(total_bytes, remote_drain),
+        remote_read_seconds: remote_read.as_secs_f64(),
+        remote_read_mib_per_second: mib_per_second(total_bytes, remote_read),
+        remote_read_verified_objects,
         sftp_publications: sftp_timing.publications,
         sftp_open_total_seconds: seconds(sftp_timing.open_nanos),
         sftp_write_total_seconds: seconds(sftp_timing.write_nanos),
@@ -352,7 +389,7 @@ async fn close_pool_after_setup_error(
     }
 }
 
-fn finish_benchmark<T>(
+pub(super) fn finish_benchmark<T>(
     primary: Result<T>,
     teardowns: impl IntoIterator<Item = Result<()>>,
 ) -> Result<T> {
@@ -531,10 +568,14 @@ async fn bench_sftp_writeback_remote_drain() -> Result<()> {
 mod tests {
     use super::{
         BenchObjectSet, GeneratedSegmentCreate, build_remote_store, finish_benchmark,
-        generated_segment_options,
+        generated_segment_options, read_and_verify_remote,
     };
     use crate::config::Settings;
+    use bytes::Bytes;
+    use object_store::memory::InMemory;
     use object_store::path::Path;
+    use object_store::{ObjectStore, ObjectStoreExt};
+    use std::sync::Arc;
     use uuid::Uuid;
 
     #[test]
@@ -603,6 +644,25 @@ mod tests {
              remove local benchmark journal: scratch close failure; \
              verify local benchmark journal removal: scratch remains"
         );
+    }
+
+    #[tokio::test]
+    async fn remote_read_phase_verifies_every_object_and_reports_elapsed_time() {
+        let remote: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let payload = Bytes::from_static(b"verified remote payload");
+        let paths = (0..4)
+            .map(|index| Path::from(format!("bench/{index}")))
+            .collect::<Vec<_>>();
+        for path in &paths {
+            remote.put(path, payload.clone().into()).await.unwrap();
+        }
+
+        let (elapsed, verified) = read_and_verify_remote(&remote, &paths, &payload, 2)
+            .await
+            .unwrap();
+
+        assert_eq!(verified, paths.len());
+        assert!(!elapsed.is_zero());
     }
 
     #[tokio::test]
