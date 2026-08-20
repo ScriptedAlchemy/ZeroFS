@@ -51,6 +51,7 @@ const CONFIG_ENV: &str = "ZEROFS_SFTP_WRITEBACK_BENCH_CONFIG";
 const TOTAL_MIB_ENV: &str = "ZEROFS_BENCH_SFTP_TOTAL_MIB";
 const PAYLOAD_KIB_ENV: &str = "ZEROFS_BENCH_SFTP_PAYLOAD_KIB";
 const WRITERS_ENV: &str = "ZEROFS_BENCH_SFTP_WRITERS";
+const MAX_CONNECTIONS_ENV: &str = "ZEROFS_BENCH_SFTP_MAX_CONNECTIONS";
 const BENCH_DIR_ENV: &str = "ZEROFS_BENCH_DIR";
 const IDENTITY_FILE_ENV: &str = "ZEROFS_BENCH_SFTP_IDENTITY_FILE";
 const KNOWN_HOSTS_ENV: &str = "ZEROFS_BENCH_SFTP_KNOWN_HOSTS";
@@ -108,6 +109,7 @@ struct BenchReport {
     object_count: usize,
     payload_bytes: usize,
     writers: usize,
+    max_connections: usize,
     upload_concurrency: usize,
     local_concurrency: usize,
     ram_ack_seconds: f64,
@@ -189,6 +191,7 @@ async fn execute_benchmark(
     objects: &[ObjectPath],
     payload: Bytes,
     writers: usize,
+    max_connections: usize,
     upload_concurrency: usize,
     local_concurrency: usize,
     remote_directory_prepare: Duration,
@@ -258,6 +261,7 @@ async fn execute_benchmark(
         object_count: objects.len(),
         payload_bytes: payload.len(),
         writers,
+        max_connections,
         upload_concurrency,
         local_concurrency,
         ram_ack_seconds: ram_ack.as_secs_f64(),
@@ -361,18 +365,29 @@ async fn bench_sftp_writeback_remote_drain() -> Result<()> {
     let config_path = std::env::var_os(CONFIG_ENV)
         .map(PathBuf::from)
         .with_context(|| format!("{CONFIG_ENV} must name a ZeroFS TOML file"))?;
-    let settings = load_benchmark_settings(&config_path)?;
+    let mut settings = load_benchmark_settings(&config_path)?;
     anyhow::ensure!(
         settings.sftp_endpoint()?.is_some(),
         "{CONFIG_ENV} must configure an sftp:// storage URL"
     );
-    let production_writeback = settings
-        .writeback_settings(WritebackAccessMode::ReadWrite)?
-        .context("benchmark config must enable [writeback]")?;
-
     let total_mib: usize = bench_env(TOTAL_MIB_ENV, 256)?;
     let payload_kib: usize = bench_env(PAYLOAD_KIB_ENV, 1024)?;
     let writers: usize = bench_env(WRITERS_ENV, 16)?;
+    let configured_max_connections = settings
+        .sftp
+        .as_ref()
+        .context("benchmark config must include [sftp]")?
+        .max_connections;
+    let max_connections: usize = bench_env(MAX_CONNECTIONS_ENV, configured_max_connections)?;
+    settings
+        .sftp
+        .as_mut()
+        .expect("[sftp] was checked above")
+        .max_connections = max_connections;
+    settings.validate()?;
+    let production_writeback = settings
+        .writeback_settings(WritebackAccessMode::ReadWrite)?
+        .context("benchmark config must enable [writeback]")?;
     anyhow::ensure!(total_mib > 0, "{TOTAL_MIB_ENV} must be positive");
     anyhow::ensure!(payload_kib > 0, "{PAYLOAD_KIB_ENV} must be positive");
     anyhow::ensure!(writers > 0, "{WRITERS_ENV} must be positive");
@@ -453,6 +468,7 @@ async fn bench_sftp_writeback_remote_drain() -> Result<()> {
                 &objects.objects,
                 Bytes::from(payload),
                 writers,
+                max_connections,
                 bench_settings.upload_concurrency,
                 bench_settings.local_concurrency,
                 remote_directory_prepare,
