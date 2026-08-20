@@ -26,9 +26,10 @@ ZEROFS_BENCH_SFTP_IDENTITY_FILE=/secure/storage-key \
 ZEROFS_BENCH_SFTP_KNOWN_HOSTS=/secure/known_hosts \
 ZEROFS_BENCH_SFTP_HPN_PROGRAM=/home/zack/.local/opt/hpnssh/e2dfa0cea55d93747f4c68b4a2b134d6fbe0db06/bin/hpnssh \
 cargo test --locked -p zerofs --lib \
-  bench_sftp_writeback_remote_drain -- --ignored --nocapture
+  writeback::sftp_bench::bench_sftp_writeback_remote_drain \
+  -- --exact --ignored --nocapture
 ```
 
-Optional normal-profile sizing knobs are `ZEROFS_BENCH_SFTP_TOTAL_MIB` (default 256), `ZEROFS_BENCH_SFTP_PAYLOAD_KIB` (default 1024), and `ZEROFS_BENCH_SFTP_WRITERS` (default 16). The output line begins with `SFTP_WRITEBACK_BENCH` and contains JSON. Capture the exact Git SHA, command, output, and cleanup result with any reported rate.
+Optional normal-profile sizing knobs are `ZEROFS_BENCH_SFTP_TOTAL_MIB` (default 256), `ZEROFS_BENCH_SFTP_PAYLOAD_KIB` (default 1024), `ZEROFS_BENCH_SFTP_WRITERS` (default 16), and `ZEROFS_BENCH_SFTP_MAX_CONNECTIONS` (defaults to the supplied config). The output line begins with `SFTP_WRITEBACK_BENCH` and contains JSON. Capture the exact Git SHA, command, output, and cleanup result with any reported rate. When production remains connected, keep its pool plus the benchmark pool within the Storage Box account limit; an eight-connection production pool leaves at most two slots for this benchmark.
 
 Do not point legacy pilot lifecycle commands at CT198 or a shared production mount. Do not call a `tiered-writeback-e2e.py --plan-only` receipt a benchmark result. A normal dev microbenchmark is diagnostic evidence; production acceptance still requires the real mounted path, durability cutoffs, integrity, and cleanup.
