@@ -373,17 +373,12 @@ async fn bench_sftp_writeback_remote_drain() -> Result<()> {
     let total_mib: usize = bench_env(TOTAL_MIB_ENV, 256)?;
     let payload_kib: usize = bench_env(PAYLOAD_KIB_ENV, 1024)?;
     let writers: usize = bench_env(WRITERS_ENV, 16)?;
-    let configured_max_connections = settings
-        .sftp
-        .as_ref()
-        .context("benchmark config must include [sftp]")?
-        .max_connections;
-    let max_connections: usize = bench_env(MAX_CONNECTIONS_ENV, configured_max_connections)?;
-    settings
+    let sftp = settings
         .sftp
         .as_mut()
-        .expect("[sftp] was checked above")
-        .max_connections = max_connections;
+        .context("benchmark config must include [sftp]")?;
+    let max_connections: usize = bench_env(MAX_CONNECTIONS_ENV, sftp.max_connections)?;
+    sftp.max_connections = max_connections;
     settings.validate()?;
     let production_writeback = settings
         .writeback_settings(WritebackAccessMode::ReadWrite)?
