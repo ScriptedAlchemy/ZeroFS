@@ -585,7 +585,7 @@ impl DirectoryCache {
 struct PoolInner {
     factory: Arc<dyn SessionFactory>,
     shared: Arc<Semaphore>,
-    max_sessions: usize,
+    pending_dials: AtomicUsize,
     admission: FairAdmission,
     roster: StdMutex<Vec<Arc<SharedSession>>>,
     roster_changed: Notify,
@@ -620,6 +620,24 @@ struct DialBackoff {
 struct FailClosedOnOwnerDrop {
     pool: Arc<PoolInner>,
     armed: bool,
+}
+
+struct PendingDial {
+    pool: Arc<PoolInner>,
+}
+
+impl PendingDial {
+    fn new(pool: Arc<PoolInner>) -> Self {
+        pool.pending_dials.fetch_add(1, Ordering::SeqCst);
+        Self { pool }
+    }
+}
+
+impl Drop for PendingDial {
+    fn drop(&mut self) {
+        self.pool.pending_dials.fetch_sub(1, Ordering::SeqCst);
+        self.pool.roster_changed.notify_waiters();
+    }
 }
 
 impl FailClosedOnOwnerDrop {
@@ -1017,7 +1035,7 @@ impl SftpSessionPool {
             inner: Arc::new(PoolInner {
                 factory,
                 shared: Arc::new(Semaphore::new(shared)),
-                max_sessions: shared,
+                pending_dials: AtomicUsize::new(0),
                 admission: FairAdmission::new(
                     shared * SFTP_SESSION_MAX_CONCURRENT_OPS,
                     reads,
@@ -1175,7 +1193,7 @@ impl SftpSessionPool {
     ) -> Result<Arc<SharedSession>, TransportError> {
         enum Placement {
             Use(Arc<SharedSession>),
-            Dial(OwnedSemaphorePermit),
+            Dial(OwnedSemaphorePermit, PendingDial),
             Wait,
         }
         loop {
@@ -1214,12 +1232,12 @@ impl SftpSessionPool {
                         Placement::Use(session)
                     }
                     other => match self.inner.shared.clone().try_acquire_owned() {
-                        Ok(permit) => Placement::Dial(permit),
+                        Ok(permit) => Placement::Dial(permit, PendingDial::new(self.inner.clone())),
                         Err(tokio::sync::TryAcquireError::Closed) => {
                             return Err(TransportError::PoolClosed);
                         }
                         Err(tokio::sync::TryAcquireError::NoPermits)
-                            if roster.len() < self.inner.max_sessions =>
+                            if self.inner.pending_dials.load(Ordering::SeqCst) != 0 =>
                         {
                             // The missing permits belong to expansion dials or
                             // retiring sessions that have not released their
@@ -1241,11 +1259,12 @@ impl SftpSessionPool {
             };
             match placement {
                 Placement::Use(session) => return Ok(session),
-                Placement::Dial(permit) => {
+                Placement::Dial(permit, pending_dial) => {
                     match self.open_with_permit(permit).await {
                         Ok(session) => {
                             session.claim(kind);
                             self.inner.roster.lock().unwrap().push(session.clone());
+                            drop(pending_dial);
                             self.inner.roster_changed.notify_waiters();
                             return Ok(session);
                         }
@@ -1271,6 +1290,7 @@ impl SftpSessionPool {
                                 }
                                 candidate
                             };
+                            drop(pending_dial);
                             match fallback {
                                 Some(session) => return Ok(session),
                                 None => return Err(error),
