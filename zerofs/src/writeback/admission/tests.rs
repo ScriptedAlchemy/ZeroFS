@@ -214,16 +214,8 @@ async fn stale_sample_is_rejected() {
 #[test]
 fn remote_cleanup_releases_with_a_stale_sample_without_forgetting_the_newer_observation() {
     let pending = request(40, 12, 1);
-    let admission = SsdAdmission::recover(
-        1_000,
-        16,
-        90,
-        70,
-        10,
-        [pending],
-        Some(sample(7, 500)),
-    )
-    .unwrap();
+    let admission =
+        SsdAdmission::recover(1_000, 16, 90, 70, 10, [pending], Some(sample(7, 500))).unwrap();
 
     admission
         .release_remote(pending, sample(6, 900))

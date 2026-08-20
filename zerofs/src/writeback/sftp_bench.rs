@@ -46,6 +46,7 @@ async fn build_remote_store(
 const CONFIG_ENV: &str = "ZEROFS_SFTP_WRITEBACK_BENCH_CONFIG";
 const TOTAL_MIB_ENV: &str = "ZEROFS_BENCH_SFTP_TOTAL_MIB";
 const PAYLOAD_KIB_ENV: &str = "ZEROFS_BENCH_SFTP_PAYLOAD_KIB";
+const MANIFEST_KIB_ENV: &str = "ZEROFS_BENCH_SFTP_MANIFEST_KIB";
 const WRITERS_ENV: &str = "ZEROFS_BENCH_SFTP_WRITERS";
 const MAX_CONNECTIONS_ENV: &str = "ZEROFS_BENCH_SFTP_MAX_CONNECTIONS";
 const SSD_MIB_ENV: &str = "ZEROFS_BENCH_SFTP_SSD_MIB";
@@ -54,10 +55,17 @@ const BENCH_DIR_ENV: &str = "ZEROFS_BENCH_DIR";
 const IDENTITY_FILE_ENV: &str = "ZEROFS_BENCH_SFTP_IDENTITY_FILE";
 const KNOWN_HOSTS_ENV: &str = "ZEROFS_BENCH_SFTP_KNOWN_HOSTS";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BenchObjectClass {
+    Segment,
+    Manifest,
+}
+
 #[derive(Debug)]
 struct BenchObjectSet {
     database_prefix: ObjectPath,
     objects: Vec<ObjectPath>,
+    classes: Vec<BenchObjectClass>,
     directories_deepest_first: Vec<PathBuf>,
     fence_objects: usize,
 }
@@ -77,6 +85,7 @@ impl BenchObjectSet {
         let database_prefix = ObjectPath::parse(format!("{base}/.zerofs-writeback-bench-{token}"))?;
         let epoch = u64::from_str_radix(&token[..16], 16)?;
         let mut objects = Vec::with_capacity(object_count);
+        let mut classes = Vec::with_capacity(object_count);
         let mut directories = BTreeSet::new();
         directories.insert(PathBuf::from(database_prefix.as_ref()));
         directories.insert(PathBuf::from(format!("{database_prefix}/segments")));
@@ -84,11 +93,12 @@ impl BenchObjectSet {
 
         for index in 0..object_count {
             let counter = u64::try_from(index)?.saturating_add(1);
-            if fence_every != 0 && usize::try_from(counter)?.is_multiple_of(fence_every) {
+            if fence_every != 0 && (index + 1).is_multiple_of(fence_every) {
                 directories.insert(PathBuf::from(format!("{database_prefix}/manifest")));
                 objects.push(ObjectPath::parse(format!(
                     "{database_prefix}/manifest/{counter:020}.manifest"
                 ))?);
+                classes.push(BenchObjectClass::Manifest);
                 fence_objects += 1;
                 continue;
             }
@@ -100,6 +110,7 @@ impl BenchObjectSet {
             objects.push(ObjectPath::parse(format!(
                 "{generation_dir}/{counter:016x}"
             ))?);
+            classes.push(BenchObjectClass::Segment);
         }
 
         let mut directories_deepest_first: Vec<_> = directories.into_iter().collect();
@@ -114,6 +125,7 @@ impl BenchObjectSet {
         Ok(Self {
             database_prefix,
             objects,
+            classes,
             directories_deepest_first,
             fence_objects,
         })
@@ -125,6 +137,9 @@ struct BenchReport {
     total_bytes: u64,
     object_count: usize,
     payload_bytes: usize,
+    manifest_payload_bytes: usize,
+    segment_objects: usize,
+    manifest_objects: usize,
     writers: usize,
     max_connections: usize,
     upload_concurrency: usize,
@@ -150,6 +165,7 @@ struct BenchReport {
     sftp_session_publications: Vec<u64>,
     sftp_session_write_bytes: Vec<u64>,
     payload_sha256: String,
+    manifest_payload_sha256: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -289,11 +305,21 @@ fn generated_segment_options() -> PutOptions {
     options
 }
 
-fn benchmark_put_options(path: &ObjectPath) -> PutOptions {
-    if path.as_ref().contains("/manifest/") {
-        PutOptions::from(PutMode::Create)
-    } else {
-        generated_segment_options()
+fn benchmark_put_options(class: BenchObjectClass) -> PutOptions {
+    match class {
+        BenchObjectClass::Segment => generated_segment_options(),
+        BenchObjectClass::Manifest => PutOptions::from(PutMode::Create),
+    }
+}
+
+fn benchmark_payload<'a>(
+    class: BenchObjectClass,
+    segment: &'a Bytes,
+    manifest: &'a Bytes,
+) -> &'a Bytes {
+    match class {
+        BenchObjectClass::Segment => segment,
+        BenchObjectClass::Manifest => manifest,
     }
 }
 
@@ -323,20 +349,27 @@ fn load_benchmark_settings(config_path: &std::path::Path) -> Result<Settings> {
 async fn read_and_verify_remote(
     remote: &Arc<dyn ObjectStore>,
     objects: &[ObjectPath],
-    payload: &Bytes,
+    classes: &[BenchObjectClass],
+    segment_payload: &Bytes,
+    manifest_payload: &Bytes,
     readers: usize,
 ) -> Result<(Duration, usize)> {
     let paths = Arc::new(objects.to_vec());
+    let classes = Arc::new(classes.to_vec());
     let started = Instant::now();
     let mut tasks = tokio::task::JoinSet::new();
     for reader in 0..readers {
         let remote = Arc::clone(remote);
         let paths = Arc::clone(&paths);
-        let payload = payload.clone();
+        let classes = Arc::clone(&classes);
+        let segment_payload = segment_payload.clone();
+        let manifest_payload = manifest_payload.clone();
         tasks.spawn(async move {
             let mut verified = 0;
             let mut index = reader;
             while index < paths.len() {
+                let payload =
+                    benchmark_payload(classes[index], &segment_payload, &manifest_payload);
                 let readback = remote.get(&paths[index]).await?.bytes().await?;
                 anyhow::ensure!(
                     readback == payload,
@@ -362,41 +395,74 @@ async fn execute_benchmark(
     store: &WritebackObjectStore,
     remote: &Arc<dyn ObjectStore>,
     objects: &[ObjectPath],
-    payload: Bytes,
+    classes: &[BenchObjectClass],
+    segment_payload: Bytes,
+    manifest_payload: Bytes,
     geometry: BenchGeometry,
 ) -> Result<BenchReport> {
-    let total_bytes = u64::try_from(objects.len())?
-        .checked_mul(u64::try_from(payload.len())?)
-        .context("benchmark byte count overflowed")?;
+    anyhow::ensure!(
+        objects.len() == classes.len(),
+        "benchmark object plan is inconsistent"
+    );
+    let total_bytes = classes.iter().try_fold(0_u64, |total, class| {
+        total
+            .checked_add(u64::try_from(
+                benchmark_payload(*class, &segment_payload, &manifest_payload).len(),
+            )?)
+            .context("benchmark byte count overflowed")
+    })?;
     let mut hasher = Sha256::new();
-    hasher.update(&payload);
+    hasher.update(&segment_payload);
     let payload_sha256 = format!("{:x}", hasher.finalize());
+    let mut manifest_hasher = Sha256::new();
+    manifest_hasher.update(&manifest_payload);
+    let manifest_payload_sha256 = format!("{:x}", manifest_hasher.finalize());
     let paths = Arc::new(objects.to_vec());
+    let classes = Arc::new(classes.to_vec());
     crate::sftp_protocol::reset_bench_timing();
 
     let started = Instant::now();
-    let mut tasks = tokio::task::JoinSet::new();
-    for writer in 0..geometry.writers {
-        let store = store.clone();
-        let payload = payload.clone();
-        let paths = Arc::clone(&paths);
-        tasks.spawn(async move {
-            let mut index = writer;
-            while index < paths.len() {
-                store
-                    .put_opts(
-                        &paths[index],
-                        payload.clone().into(),
-                        benchmark_put_options(&paths[index]),
-                    )
-                    .await?;
-                index += geometry.writers;
-            }
-            object_store::Result::<()>::Ok(())
-        });
-    }
-    while let Some(result) = tasks.join_next().await {
-        result.context("benchmark writer task failed")??;
+    if classes.contains(&BenchObjectClass::Manifest) {
+        for (path, class) in paths.iter().zip(classes.iter().copied()) {
+            store
+                .put_opts(
+                    path,
+                    benchmark_payload(class, &segment_payload, &manifest_payload)
+                        .clone()
+                        .into(),
+                    benchmark_put_options(class),
+                )
+                .await?;
+        }
+    } else {
+        let mut tasks = tokio::task::JoinSet::new();
+        for writer in 0..geometry.writers {
+            let store = store.clone();
+            let segment_payload = segment_payload.clone();
+            let manifest_payload = manifest_payload.clone();
+            let paths = Arc::clone(&paths);
+            let classes = Arc::clone(&classes);
+            tasks.spawn(async move {
+                let mut index = writer;
+                while index < paths.len() {
+                    let class = classes[index];
+                    store
+                        .put_opts(
+                            &paths[index],
+                            benchmark_payload(class, &segment_payload, &manifest_payload)
+                                .clone()
+                                .into(),
+                            benchmark_put_options(class),
+                        )
+                        .await?;
+                    index += geometry.writers;
+                }
+                object_store::Result::<()>::Ok(())
+            });
+        }
+        while let Some(result) = tasks.join_next().await {
+            result.context("benchmark writer task failed")??;
+        }
     }
     let ram_ack = started.elapsed();
 
@@ -415,21 +481,34 @@ async fn execute_benchmark(
         .rposition(|publications| *publications != 0)
         .map_or(0, |index| index + 1);
 
-    let (remote_read, remote_read_verified_objects) =
-        read_and_verify_remote(remote, objects, &payload, geometry.writers).await?;
+    let (remote_read, remote_read_verified_objects) = read_and_verify_remote(
+        remote,
+        objects,
+        &classes,
+        &segment_payload,
+        &manifest_payload,
+        geometry.writers,
+    )
+    .await?;
+
+    let segment_objects = classes
+        .iter()
+        .filter(|class| **class == BenchObjectClass::Segment)
+        .count();
+    let manifest_objects = classes.len() - segment_objects;
 
     Ok(BenchReport {
         total_bytes,
         object_count: objects.len(),
-        payload_bytes: payload.len(),
+        payload_bytes: segment_payload.len(),
+        manifest_payload_bytes: manifest_payload.len(),
+        segment_objects,
+        manifest_objects,
         writers: geometry.writers,
         max_connections: geometry.max_connections,
         upload_concurrency: geometry.upload_concurrency,
         local_concurrency: geometry.local_concurrency,
-        fence_objects: objects
-            .iter()
-            .filter(|path| path.as_ref().contains("/manifest/"))
-            .count(),
+        fence_objects: manifest_objects,
         ram_ack_seconds: ram_ack.as_secs_f64(),
         ram_ack_mib_per_second: mib_per_second(total_bytes, ram_ack),
         local_seconds: local.as_secs_f64(),
@@ -450,6 +529,7 @@ async fn execute_benchmark(
         sftp_session_publications: sftp_timing.session_publications[..last_used_session].to_vec(),
         sftp_session_write_bytes: sftp_timing.session_write_bytes[..last_used_session].to_vec(),
         payload_sha256,
+        manifest_payload_sha256,
     })
 }
 
@@ -627,8 +707,16 @@ async fn execute_saturation_benchmark(
         .iter()
         .rposition(|publications| *publications != 0)
         .map_or(0, |index| index + 1);
-    let (remote_read, remote_read_verified_objects) =
-        read_and_verify_remote(remote, objects, &payload, geometry.writers).await?;
+    let classes = vec![BenchObjectClass::Segment; objects.len()];
+    let (remote_read, remote_read_verified_objects) = read_and_verify_remote(
+        remote,
+        objects,
+        &classes,
+        &payload,
+        &payload,
+        geometry.writers,
+    )
+    .await?;
 
     Ok(SaturationReport {
         total_bytes,
@@ -822,6 +910,7 @@ async fn bench_sftp_writeback_remote_drain() -> Result<()> {
     );
     let total_mib: usize = bench_env(TOTAL_MIB_ENV, 256)?;
     let payload_kib: usize = bench_env(PAYLOAD_KIB_ENV, 1024)?;
+    let manifest_kib: usize = bench_env(MANIFEST_KIB_ENV, 64)?;
     let writers: usize = bench_env(WRITERS_ENV, 16)?;
     let fence_every: usize = bench_env(FENCE_EVERY_ENV, 0)?;
     let sftp = settings
@@ -836,6 +925,7 @@ async fn bench_sftp_writeback_remote_drain() -> Result<()> {
         .context("benchmark config must enable [writeback]")?;
     anyhow::ensure!(total_mib > 0, "{TOTAL_MIB_ENV} must be positive");
     anyhow::ensure!(payload_kib > 0, "{PAYLOAD_KIB_ENV} must be positive");
+    anyhow::ensure!(manifest_kib > 0, "{MANIFEST_KIB_ENV} must be positive");
     anyhow::ensure!(writers > 0, "{WRITERS_ENV} must be positive");
     let total_kib = total_mib
         .checked_mul(1024)
@@ -849,6 +939,9 @@ async fn bench_sftp_writeback_remote_drain() -> Result<()> {
     let payload_bytes = payload_kib
         .checked_mul(1024)
         .context("benchmark payload size overflowed")?;
+    let manifest_bytes = manifest_kib
+        .checked_mul(1024)
+        .context("benchmark manifest size overflowed")?;
 
     let (remote, base, pool) = build_remote_store(&settings).await?;
     let setup = (|| -> Result<_> {
@@ -905,6 +998,8 @@ async fn bench_sftp_writeback_remote_drain() -> Result<()> {
 
     let mut payload = vec![0_u8; payload_bytes];
     StdRng::seed_from_u64(0x5f54_4653_4245_4e43).fill_bytes(&mut payload);
+    let mut manifest_payload = vec![0_u8; manifest_bytes];
+    StdRng::seed_from_u64(0x4d41_4e49_4645_5354).fill_bytes(&mut manifest_payload);
     let remote_directory_prepare =
         prepare_remote_run(&pool, &objects.directories_deepest_first).await;
     let benchmark = match remote_directory_prepare {
@@ -913,7 +1008,9 @@ async fn bench_sftp_writeback_remote_drain() -> Result<()> {
                 &store,
                 &remote,
                 &objects.objects,
+                &objects.classes,
                 Bytes::from(payload),
+                Bytes::from(manifest_payload),
                 BenchGeometry {
                     writers,
                     max_connections,
@@ -1086,8 +1183,9 @@ async fn bench_sftp_writeback_full_ssd_pacing() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BenchObjectSet, GeneratedSegmentCreate, SaturationGeometry, benchmark_put_options,
-        build_remote_store, finish_benchmark, generated_segment_options, read_and_verify_remote,
+        BenchObjectClass, BenchObjectSet, GeneratedSegmentCreate, SaturationGeometry,
+        benchmark_put_options, build_remote_store, finish_benchmark, generated_segment_options,
+        read_and_verify_remote,
     };
     use crate::config::Settings;
     use bytes::Bytes;
@@ -1145,18 +1243,18 @@ mod tests {
         assert!(objects.objects[3].as_ref().contains("/manifest/"));
         assert!(objects.objects[7].as_ref().contains("/manifest/"));
         assert!(matches!(
-            benchmark_put_options(&objects.objects[3]).mode,
+            benchmark_put_options(objects.classes[3]).mode,
             object_store::PutMode::Create
         ));
         assert!(
-            benchmark_put_options(&objects.objects[3])
+            benchmark_put_options(objects.classes[3])
                 .extensions
                 .get::<GeneratedSegmentCreate>()
                 .is_none(),
             "a SlateDB manifest is create-only but remains an ordered fence"
         );
         assert!(
-            benchmark_put_options(&objects.objects[0])
+            benchmark_put_options(objects.classes[0])
                 .extensions
                 .get::<GeneratedSegmentCreate>()
                 .is_some()
@@ -1227,9 +1325,11 @@ mod tests {
             remote.put(path, payload.clone().into()).await.unwrap();
         }
 
-        let (elapsed, verified) = read_and_verify_remote(&remote, &paths, &payload, 2)
-            .await
-            .unwrap();
+        let classes = vec![BenchObjectClass::Segment; paths.len()];
+        let (elapsed, verified) =
+            read_and_verify_remote(&remote, &paths, &classes, &payload, &payload, 2)
+                .await
+                .unwrap();
 
         assert_eq!(verified, paths.len());
         assert!(!elapsed.is_zero());
