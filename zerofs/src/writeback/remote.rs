@@ -1348,7 +1348,7 @@ async fn stream_record_to_remote(
             remote.put_opts(
                 target,
                 PutPayload::from_iter(collected),
-                PutOptions::from(mode.clone()),
+                small_put_options(mode, !small_atomic_create),
             ),
         )
         .await;
@@ -1482,6 +1482,22 @@ async fn reconcile_precondition(
         (_, Err(error)) => Err(error),
         (PutMode::Overwrite, _) => unreachable!("overwrite returned before HEAD"),
     }
+}
+
+/// Options for the bounded single put. When `reconcile_precondition` has just
+/// HEAD-verified an update's expected generation, the put carries that proof
+/// so an SFTP backend can skip its own redundant header re-read — the ordered
+/// frontier pays every one of those round trips serially. The scheduler's
+/// key-conflict guard keeps at most one in-flight operation per key, so no
+/// concurrent same-key writer exists to invalidate the verification.
+fn small_put_options(mode: &PutMode, precondition_verified: bool) -> PutOptions {
+    let mut options = PutOptions::from(mode.clone());
+    if precondition_verified && matches!(mode, PutMode::Update(_)) {
+        options
+            .extensions
+            .insert(crate::sftp_object_store::PreverifiedUpdateGeneration);
+    }
+    options
 }
 
 fn update_version_matches(expected: &UpdateVersion, actual: &object_store::ObjectMeta) -> bool {
@@ -1789,6 +1805,36 @@ mod tests {
         assert_eq!(
             remote.get(&target).await.unwrap().bytes().await.unwrap(),
             payload
+        );
+    }
+
+    #[test]
+    fn a_reconciled_update_put_carries_the_preverified_generation_marker() {
+        let update = object_store::PutMode::Update(object_store::UpdateVersion {
+            e_tag: Some(uuid::Uuid::from_u128(9).to_string()),
+            version: None,
+        });
+
+        assert!(
+            super::small_put_options(&update, true)
+                .extensions
+                .get::<crate::sftp_object_store::PreverifiedUpdateGeneration>()
+                .is_some(),
+            "a HEAD-verified update must carry its verification to the backend"
+        );
+        assert!(
+            super::small_put_options(&update, false)
+                .extensions
+                .get::<crate::sftp_object_store::PreverifiedUpdateGeneration>()
+                .is_none(),
+            "an unverified update must keep the backend's own generation check"
+        );
+        assert!(
+            super::small_put_options(&object_store::PutMode::Create, true)
+                .extensions
+                .get::<crate::sftp_object_store::PreverifiedUpdateGeneration>()
+                .is_none(),
+            "the marker only applies to conditional updates"
         );
     }
 
