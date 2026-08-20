@@ -1146,8 +1146,15 @@ mod tests {
         assert!(objects.objects[7].as_ref().contains("/manifest/"));
         assert!(matches!(
             benchmark_put_options(&objects.objects[3]).mode,
-            object_store::PutMode::Overwrite
+            object_store::PutMode::Create
         ));
+        assert!(
+            benchmark_put_options(&objects.objects[3])
+                .extensions
+                .get::<GeneratedSegmentCreate>()
+                .is_none(),
+            "a SlateDB manifest is create-only but remains an ordered fence"
+        );
         assert!(
             benchmark_put_options(&objects.objects[0])
                 .extensions
