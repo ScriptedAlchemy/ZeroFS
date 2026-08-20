@@ -218,6 +218,11 @@ pub trait TransportSession: fmt::Debug + Send + Sync + 'static {
             "remove_file is not implemented by this session".to_owned(),
         ))
     }
+    async fn remove_directory(&self, _path: &std::path::Path) -> Result<(), TransportError> {
+        Err(TransportError::Operation(
+            "remove_directory is not implemented by this session".to_owned(),
+        ))
+    }
     async fn ensure_directory_component(
         &self,
         _path: &std::path::Path,
@@ -580,9 +585,11 @@ impl DirectoryCache {
 struct PoolInner {
     factory: Arc<dyn SessionFactory>,
     shared: Arc<Semaphore>,
+    pending_dials: AtomicUsize,
     admission: FairAdmission,
     roster: StdMutex<Vec<Arc<SharedSession>>>,
     roster_changed: Notify,
+    idle_warm_floor: AtomicUsize,
     directories: DirectoryCache,
     writable: bool,
     closed: AtomicBool,
@@ -614,6 +621,24 @@ struct DialBackoff {
 struct FailClosedOnOwnerDrop {
     pool: Arc<PoolInner>,
     armed: bool,
+}
+
+struct PendingDial {
+    pool: Arc<PoolInner>,
+}
+
+impl PendingDial {
+    fn new(pool: Arc<PoolInner>) -> Self {
+        pool.pending_dials.fetch_add(1, Ordering::SeqCst);
+        Self { pool }
+    }
+}
+
+impl Drop for PendingDial {
+    fn drop(&mut self) {
+        self.pool.pending_dials.fetch_sub(1, Ordering::SeqCst);
+        self.pool.roster_changed.notify_waiters();
+    }
 }
 
 impl FailClosedOnOwnerDrop {
@@ -868,7 +893,7 @@ impl PoolInner {
             let mut expired = Vec::new();
             let mut retained = roster.len();
             roster.retain(|session| {
-                let expirable = retained > SFTP_IDLE_WARM_FLOOR
+                let expirable = retained > self.idle_warm_floor.load(Ordering::SeqCst)
                     && session.active_ops.load(Ordering::SeqCst) == 0
                     && now.saturating_duration_since(*session.idle_since.lock().unwrap())
                         >= SFTP_IDLE_TIMEOUT;
@@ -991,13 +1016,25 @@ impl SftpSessionPool {
         factory: Arc<dyn SessionFactory>,
         config: &crate::config::SftpConfig,
     ) -> Result<Self, TransportError> {
-        Self::new_writable(
+        let pool = Self::new_writable(
             factory,
             config.max_connections,
             config.read_concurrency,
             config.write_concurrency,
         )
-        .await
+        .await?;
+        pool.inner
+            .idle_warm_floor
+            .store(config.max_connections, Ordering::SeqCst);
+        if let Err(error) = pool.warm_to(config.max_connections).await {
+            return match pool.shutdown().await {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(TransportError::Close(format!(
+                    "SFTP pool warmup failed: {error}; cleanup also failed: {cleanup}"
+                ))),
+            };
+        }
+        Ok(pool)
     }
 
     pub async fn new_writable(
@@ -1011,6 +1048,7 @@ impl SftpSessionPool {
             inner: Arc::new(PoolInner {
                 factory,
                 shared: Arc::new(Semaphore::new(shared)),
+                pending_dials: AtomicUsize::new(0),
                 admission: FairAdmission::new(
                     shared * SFTP_SESSION_MAX_CONCURRENT_OPS,
                     reads,
@@ -1019,6 +1057,7 @@ impl SftpSessionPool {
                 ),
                 roster: StdMutex::new(Vec::new()),
                 roster_changed: Notify::new(),
+                idle_warm_floor: AtomicUsize::new(SFTP_IDLE_WARM_FLOOR),
                 directories: DirectoryCache::default(),
                 writable: true,
                 closed: AtomicBool::new(false),
@@ -1042,6 +1081,22 @@ impl SftpSessionPool {
         pool.inner.roster.lock().unwrap().push(session);
         pool.start_idle_reaper();
         Ok(pool)
+    }
+
+    async fn warm_to(&self, target: usize) -> Result<(), TransportError> {
+        while self.inner.roster.lock().unwrap().len() < target {
+            let permit = self
+                .inner
+                .shared
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| TransportError::PoolClosed)?;
+            let session = self.open_with_permit(permit).await?;
+            self.inner.roster.lock().unwrap().push(session);
+            self.inner.roster_changed.notify_waiters();
+        }
+        Ok(())
     }
 
     fn start_idle_reaper(&self) {
@@ -1168,7 +1223,7 @@ impl SftpSessionPool {
     ) -> Result<Arc<SharedSession>, TransportError> {
         enum Placement {
             Use(Arc<SharedSession>),
-            Dial(OwnedSemaphorePermit),
+            Dial(OwnedSemaphorePermit, PendingDial),
             Wait,
         }
         loop {
@@ -1207,9 +1262,20 @@ impl SftpSessionPool {
                         Placement::Use(session)
                     }
                     other => match self.inner.shared.clone().try_acquire_owned() {
-                        Ok(permit) => Placement::Dial(permit),
+                        Ok(permit) => Placement::Dial(permit, PendingDial::new(self.inner.clone())),
                         Err(tokio::sync::TryAcquireError::Closed) => {
                             return Err(TransportError::PoolClosed);
+                        }
+                        Err(tokio::sync::TryAcquireError::NoPermits)
+                            if self.inner.pending_dials.load(Ordering::SeqCst) != 0 =>
+                        {
+                            // The missing permits belong to expansion dials or
+                            // retiring sessions that have not released their
+                            // remote connection slots yet. Wait for those
+                            // owners instead of stacking the rest of a burst
+                            // onto the first live session while its peers are
+                            // still opening.
+                            Placement::Wait
                         }
                         Err(tokio::sync::TryAcquireError::NoPermits) => match other {
                             Some(session) => {
@@ -1223,11 +1289,12 @@ impl SftpSessionPool {
             };
             match placement {
                 Placement::Use(session) => return Ok(session),
-                Placement::Dial(permit) => {
+                Placement::Dial(permit, pending_dial) => {
                     match self.open_with_permit(permit).await {
                         Ok(session) => {
                             session.claim(kind);
                             self.inner.roster.lock().unwrap().push(session.clone());
+                            drop(pending_dial);
                             self.inner.roster_changed.notify_waiters();
                             return Ok(session);
                         }
@@ -1253,6 +1320,7 @@ impl SftpSessionPool {
                                 }
                                 candidate
                             };
+                            drop(pending_dial);
                             match fallback {
                                 Some(session) => return Ok(session),
                                 None => return Err(error),
@@ -1486,6 +1554,10 @@ impl SessionLease {
         self.transport().remove_file(path).await
     }
 
+    pub async fn remove_directory(&mut self, path: &std::path::Path) -> Result<(), TransportError> {
+        self.transport().remove_directory(path).await
+    }
+
     async fn ensure_directory_component(
         &mut self,
         path: &std::path::Path,
@@ -1632,9 +1704,10 @@ impl Drop for SessionLease {
 mod tests {
     use super::{
         LeaseFinishError, OpenSshTransportSession, OperationKind, RemoteEntryKind,
-        SFTP_READ_PACKET_SIZE, SFTP_READ_REQUEST_CONCURRENCY, SFTP_WRITE_PACKET_SIZE,
-        SFTP_WRITE_REQUEST_CONCURRENCY, SessionDisposition, SessionFactory, SftpSessionPool,
-        TransportError, TransportSession, plan_pipelined_reads, plan_pipelined_writes,
+        SFTP_IDLE_REAP_INTERVAL, SFTP_IDLE_TIMEOUT, SFTP_READ_PACKET_SIZE,
+        SFTP_READ_REQUEST_CONCURRENCY, SFTP_WRITE_PACKET_SIZE, SFTP_WRITE_REQUEST_CONCURRENCY,
+        SessionDisposition, SessionFactory, SftpSessionPool, TransportError, TransportSession,
+        plan_pipelined_reads, plan_pipelined_writes,
     };
     use crate::sftp_object_store::{ObjectHeader, SftpCapabilities, encode_header};
     use async_trait::async_trait;
@@ -2518,6 +2591,64 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn pending_dials_do_not_stack_excess_writes_on_the_first_session() {
+        let factory = RecordingFactory::fully_capable();
+        let pool = Arc::new(pool(factory.clone(), 4, 8, 8).await);
+        let first = pool.checkout(OperationKind::Write).await.unwrap();
+        factory.state.block_open_from.store(2, Ordering::SeqCst);
+
+        let mut tasks = Vec::new();
+        for _ in 0..7 {
+            let pool = pool.clone();
+            tasks.push(tokio::spawn(async move {
+                pool.checkout(OperationKind::Write).await.unwrap()
+            }));
+        }
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            factory.state.open_started.notified(),
+        )
+        .await
+        .expect("the first expansion dial reaches the controlled pause");
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), async {
+                loop {
+                    if tasks.iter().any(tokio::task::JoinHandle::is_finished) {
+                        return;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_err(),
+            "uploads beyond the connection cap must wait for pending dials instead of stacking on the first session"
+        );
+
+        factory.state.block_open_from.store(0, Ordering::SeqCst);
+        factory.state.allow_open.notify_waiters();
+        let mut leases = vec![first];
+        for task in tasks {
+            leases.push(task.await.unwrap());
+        }
+        let mut writes_per_session = pool
+            .inner
+            .roster
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|session| session.active_writes.load(Ordering::SeqCst))
+            .collect::<Vec<_>>();
+        writes_per_session.sort_unstable();
+        assert_eq!(writes_per_session, [2, 2, 2, 2]);
+
+        for lease in leases {
+            lease.complete().await.unwrap();
+        }
+        pool.shutdown().await.unwrap();
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn retirement_marks_broken_only_while_removing_from_the_roster() {
         let factory = RecordingFactory::fully_capable();
@@ -3168,6 +3299,63 @@ mod tests {
         for lease in leases {
             lease.complete().await.unwrap();
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn writable_config_warms_the_full_connection_budget_before_returning() {
+        let factory = RecordingFactory::fully_capable();
+        let config = crate::config::SftpConfig {
+            identity_file: "/tmp/id-ed25519".into(),
+            known_hosts: "/tmp/known-hosts".into(),
+            max_connections: 4,
+            read_concurrency: 8,
+            write_concurrency: 8,
+            segment_size_mib: 32,
+            read_cache_part_size_kib: 1024,
+            ..Default::default()
+        };
+
+        let pool = SftpSessionPool::from_config_writable(Arc::new(factory.clone()), &config)
+            .await
+            .unwrap();
+
+        assert_eq!(factory.dials(), 4);
+        assert_eq!(factory.live(), 4);
+        assert_eq!(pool.inner.roster.lock().unwrap().len(), 4);
+        tokio::time::advance(SFTP_IDLE_TIMEOUT + SFTP_IDLE_REAP_INTERVAL).await;
+        tokio::task::yield_now().await;
+        assert_eq!(factory.live(), 4, "configured warm sessions remain ready");
+        pool.shutdown().await.unwrap();
+        assert_eq!(factory.live(), 0);
+    }
+
+    #[tokio::test]
+    async fn partial_writable_warmup_failure_reaps_opened_sessions_and_lifetime_capacity() {
+        let factory = RecordingFactory::fully_capable();
+        factory.state.fail_open_from.store(3, Ordering::SeqCst);
+        let config = crate::config::SftpConfig {
+            identity_file: "/tmp/id-ed25519".into(),
+            known_hosts: "/tmp/known-hosts".into(),
+            max_connections: 4,
+            read_concurrency: 8,
+            write_concurrency: 8,
+            segment_size_mib: 32,
+            read_cache_part_size_kib: 1024,
+            ..Default::default()
+        };
+
+        let error = SftpSessionPool::from_config_writable(Arc::new(factory.clone()), &config)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, TransportError::PoolClosed), "{error:?}");
+        assert_eq!(factory.dials(), 3);
+        assert_eq!(factory.peak(), 3);
+        assert_eq!(
+            factory.live(),
+            0,
+            "each live test session owns one pool lifetime permit until its close completes"
+        );
     }
 
     #[tokio::test(start_paused = true)]

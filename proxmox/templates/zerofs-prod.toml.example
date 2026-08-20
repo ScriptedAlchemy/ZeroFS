@@ -13,9 +13,9 @@ encryption_password = "${ZEROFS_STORAGE_PASSWORD}"
 [sftp]
 identity_file = "/srv/zerofs-persist/current/storage-key"
 known_hosts = "/srv/zerofs-persist/current/known_hosts"
-max_connections = 4
+max_connections = 8
 read_concurrency = 4
-write_concurrency = 4
+write_concurrency = 16
 segment_size_mib = 32
 read_cache_part_size_kib = 1024
 

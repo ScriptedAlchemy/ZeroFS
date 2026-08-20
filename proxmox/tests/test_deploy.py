@@ -401,6 +401,8 @@ addresses = ["10.10.10.30:9567"]
             settings["filesystem"]["max_size_gb"] * 1_000_000_000,
             5 * 1024**4,
         )
+        self.assertEqual(settings["sftp"]["max_connections"], 8)
+        self.assertEqual(settings["sftp"]["write_concurrency"], 16)
 
     def test_prod_enforces_bounded_clean_cache_and_distinct_writeback_ram(
         self,

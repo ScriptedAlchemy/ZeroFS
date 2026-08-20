@@ -527,10 +527,10 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
     }
 
     #[test]
-    fn russh_sftp_config_pipelines_64_by_256kib() {
+    fn russh_sftp_config_matches_the_proven_raw_sftp_request_window() {
         let config = russh_sftp_config();
         assert_eq!(config.max_packet_len, 256 * 1024);
-        assert_eq!(config.max_concurrent_writes, 64);
+        assert_eq!(config.max_concurrent_writes, 128);
         assert_ne!(
             config.max_concurrent_writes,
             russh_sftp::client::Config::default().max_concurrent_writes
