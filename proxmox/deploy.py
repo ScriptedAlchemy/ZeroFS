@@ -402,6 +402,10 @@ def validate_server_config(
     if storage_url.startswith("sftp://"):
         if not isinstance(sftp, dict):
             raise ValueError("[sftp] is required for SFTP storage")
+        if sftp.get("transport", "russh") != "russh" or any(
+            field in sftp for field in ("hpn_program", "hpn_sha256")
+        ):
+            raise ValueError("[sftp] supports native russh only")
         max_connections = sftp.get("max_connections")
         if not isinstance(max_connections, int) or not (
             1 <= max_connections <= SFTP_MAX_ACCOUNT_CONNECTIONS

@@ -243,6 +243,23 @@ addresses = ["10.10.10.30:9567"]
                 ]
             )
 
+    def test_prod_preflight_rejects_removed_hpn_config(self) -> None:
+        for legacy in (
+            'transport = "hpn_openssh"\n',
+            'hpn_program = "/srv/zerofs-persist/current/hpnssh"\n',
+            'hpn_sha256 = "' + "a" * 64 + '"\n',
+        ):
+            config = self.prod_config().replace(
+                "write_concurrency = 4\n",
+                "write_concurrency = 4\n" + legacy,
+            )
+            with self.subTest(legacy=legacy), self.assertRaisesRegex(
+                ValueError, "native russh"
+            ):
+                deploy.validate_server_config(
+                    self.write_config(config), "10.10.10.30", role="prod"
+                )
+
     def test_bootstrap_config_exposes_only_nfs_rpc_and_metrics(self) -> None:
         rendered = deploy.render_nfs_bootstrap_config(self.prod_config())
         config = tomllib.loads(rendered)
