@@ -1677,8 +1677,9 @@ fn missing_remote_predecessor(
 #[cfg(test)]
 mod tests {
     use super::{
-        CompletedRemote, SchedulerWindow, bounded_remote_operation, collect_pipeline_batch,
-        load_scheduler_window, validate_scheduler_window, verify_existing,
+        CompletedRemote, SchedulerWindow, apply_record_with_tracked_cleanup,
+        bounded_remote_operation, collect_pipeline_batch, load_scheduler_window,
+        validate_scheduler_window, verify_existing,
     };
     use crate::fault_store::FaultStore;
     use crate::writeback::journal::Journal;
@@ -1739,6 +1740,33 @@ mod tests {
             controls.get_count(),
             2,
             "reconciliation performs one bounded HEAD and one bounded range GET"
+        );
+    }
+
+    #[tokio::test]
+    async fn new_small_immutable_create_uses_one_atomic_put_without_a_preflight_head() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (remote, controls) = FaultStore::new(inner);
+        let temp = tempfile::tempdir().unwrap();
+        let journal = Arc::new(journal_with_local_records(temp.path(), 0));
+        let target = Path::from("segments/new-small-object");
+        let payload = Bytes::from_static(b"new immutable payload");
+        let record = put_record(1, target.as_ref(), &payload);
+        let record = journal.commit_put(record, &payload).unwrap();
+
+        apply_record_with_tracked_cleanup(remote.clone(), journal, record)
+            .await
+            .expect("the atomic create must publish the new immutable object");
+
+        assert_eq!(controls.put_count(), 1);
+        assert_eq!(
+            controls.head_count(),
+            0,
+            "an atomic small Create must not pay a redundant precondition HEAD"
+        );
+        assert_eq!(
+            remote.get(&target).await.unwrap().bytes().await.unwrap(),
+            payload
         );
     }
 
