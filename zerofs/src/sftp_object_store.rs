@@ -84,15 +84,6 @@ pub enum PublicationMode {
     Update,
 }
 
-/// Caller's proof that it HEAD-verified the expected update generation
-/// immediately before this put. The publication rename is unconditional
-/// either way, so the store's own header re-read is an arbitration step
-/// between unverified callers, not an atomic guard; a caller that has just
-/// performed the same comparison gains nothing from paying that read again
-/// across the WAN, and its update publishes as a plain overwrite.
-#[derive(Clone, Debug)]
-pub(crate) struct PreverifiedUpdateGeneration;
-
 pub fn validate_publication_capabilities(
     capabilities: SftpCapabilities,
     mode: PublicationMode,
@@ -290,48 +281,6 @@ pub trait RemoteSession: Debug + Send + Sync {
     async fn hard_link(&self, from: &FilePath, to: &FilePath) -> RemoteResult<()>;
     async fn posix_rename(&self, from: &FilePath, to: &FilePath) -> RemoteResult<()>;
     fn schedule_cleanup(&self, path: PathBuf);
-}
-
-fn publication_plan(
-    location: &ObjectPath,
-    opts: &PutOptions,
-) -> object_store::Result<(PublicationMode, Option<Uuid>)> {
-    match &opts.mode {
-        PutMode::Overwrite => Ok((PublicationMode::Overwrite, None)),
-        PutMode::Create => Ok((PublicationMode::Create, None)),
-        PutMode::Update(version) => {
-            if version.version.is_some() {
-                return Err(object_store::Error::NotSupported {
-                    source: "SFTP conditional updates use ETags, not versions".into(),
-                });
-            }
-            let expected =
-                version
-                    .e_tag
-                    .as_deref()
-                    .ok_or_else(|| object_store::Error::Precondition {
-                        path: location.to_string(),
-                        source: "SFTP update requires an ETag".into(),
-                    })?;
-            let expected =
-                Uuid::parse_str(expected).map_err(|error| object_store::Error::Precondition {
-                    path: location.to_string(),
-                    source: Box::new(error),
-                })?;
-            if opts
-                .extensions
-                .get::<PreverifiedUpdateGeneration>()
-                .is_some()
-            {
-                // The caller has just HEAD-compared this exact generation, so
-                // the update publishes as a plain overwrite instead of paying
-                // the store's own header re-read across the WAN.
-                Ok((PublicationMode::Overwrite, None))
-            } else {
-                Ok((PublicationMode::Update, Some(expected)))
-            }
-        }
-    }
 }
 
 pub async fn publish_payload(
@@ -1021,7 +970,30 @@ impl ObjectStore for SftpObjectStore {
     ) -> object_store::Result<PutResult> {
         let target = self.remote_path(location, false)?;
         self.forget_missing(location);
-        let (mode, expected_generation) = publication_plan(location, &opts)?;
+        let (mode, expected_generation) = match opts.mode {
+            PutMode::Overwrite => (PublicationMode::Overwrite, None),
+            PutMode::Create => (PublicationMode::Create, None),
+            PutMode::Update(version) => {
+                if version.version.is_some() {
+                    return Err(object_store::Error::NotSupported {
+                        source: "SFTP conditional updates use ETags, not versions".into(),
+                    });
+                }
+                let expected = version
+                    .e_tag
+                    .ok_or_else(|| object_store::Error::Precondition {
+                        path: location.to_string(),
+                        source: "SFTP update requires an ETag".into(),
+                    })?;
+                let expected = Uuid::parse_str(&expected).map_err(|error| {
+                    object_store::Error::Precondition {
+                        path: location.to_string(),
+                        source: Box::new(error),
+                    }
+                })?;
+                (PublicationMode::Update, Some(expected))
+            }
+        };
         let outcome = publish_payload(
             Arc::new(PooledRemoteSession {
                 pool: self.pool.clone(),
@@ -1586,39 +1558,6 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::sync::{Barrier, Notify};
-
-    #[test]
-    fn a_preverified_update_publishes_as_an_overwrite_without_the_header_read() {
-        let expected = Uuid::from_u128(0x00112233_4455_6677_8899_aabbccddeeff);
-        let version = object_store::UpdateVersion {
-            e_tag: Some(expected.to_string()),
-            version: None,
-        };
-        let location = ObjectPath::from("db/manifest/000001.manifest");
-
-        let unverified = PutOptions::from(PutMode::Update(version.clone()));
-        assert_eq!(
-            publication_plan(&location, &unverified).unwrap(),
-            (PublicationMode::Update, Some(expected)),
-            "an unverified update must keep the store's own generation check"
-        );
-
-        let mut verified = PutOptions::from(PutMode::Update(version));
-        verified.extensions.insert(PreverifiedUpdateGeneration);
-        assert_eq!(
-            publication_plan(&location, &verified).unwrap(),
-            (PublicationMode::Overwrite, None),
-            "a caller-verified update must skip the redundant header re-read"
-        );
-
-        let mut create = PutOptions::from(PutMode::Create);
-        create.extensions.insert(PreverifiedUpdateGeneration);
-        assert_eq!(
-            publication_plan(&location, &create).unwrap(),
-            (PublicationMode::Create, None),
-            "the marker must not weaken create-only publication"
-        );
-    }
 
     #[test]
     fn pool_closed_is_a_terminal_object_store_error() {
