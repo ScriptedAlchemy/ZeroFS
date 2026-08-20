@@ -25,6 +25,7 @@ pub(crate) struct MutationCoordinator {
 }
 
 impl MutationCoordinator {
+    #[allow(dead_code)]
     pub(crate) fn new(gate: Arc<PreparationGate>, progress: MutationProgress) -> Arc<Self> {
         Self::new_with_limits(gate, progress, u64::MAX, 1024)
     }
@@ -47,6 +48,7 @@ impl MutationCoordinator {
         Arc::clone(&self.gate)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn progress(&self) -> MutationProgress {
         self.progress.clone()
     }
@@ -110,10 +112,12 @@ pub(crate) struct MaterializationFence {
 }
 
 impl MaterializationFence {
+    #[allow(dead_code)]
     pub(crate) fn cutoff(&self) -> MutationCutoff {
         self.cutoff
     }
 
+    #[allow(dead_code)]
     pub(crate) fn disarm(&mut self) {
         self.armed = false;
     }

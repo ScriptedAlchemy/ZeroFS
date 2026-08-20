@@ -243,6 +243,8 @@ impl NBDDevice {
 pub struct NbdExportGates {
     registry: StdMutex<ExportRegistry>,
     materialized_gates: StdMutex<HashMap<Vec<u8>, Weak<RwLock<()>>>>,
+    // Landed-but-not-wired: consumed once NBD volatile-overlay admission lands.
+    #[allow(dead_code)]
     volatile_budget: Option<Arc<VolatileBudget>>,
 }
 

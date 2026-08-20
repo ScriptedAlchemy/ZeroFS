@@ -119,6 +119,7 @@ pub(crate) struct RequestVacancy {
 pub(crate) struct PendingRequest {
     cache: Arc<RequestCacheInner>,
     identity: RequestIdentity,
+    #[allow(dead_code)]
     fingerprint: RequestFingerprint,
     lifetime: RequestLifetime,
     operation_slot: Option<RequestOperationSlot>,
@@ -143,6 +144,7 @@ pub(crate) struct AcceptedRequest {
 /// Shared in-flight or completed result. Joiners wait here instead of
 /// re-entering raw admission.
 pub(crate) struct RetainedRequest {
+    #[allow(dead_code)]
     identity: RequestIdentity,
     fingerprint: RequestFingerprint,
     outcome: Mutex<Option<Result<PreparedBatchResult, FsError>>>,
@@ -159,10 +161,12 @@ impl RetainedRequest {
         })
     }
 
+    #[allow(dead_code)]
     pub(crate) fn identity(&self) -> &RequestIdentity {
         &self.identity
     }
 
+    #[allow(dead_code)]
     pub(crate) fn fingerprint(&self) -> RequestFingerprint {
         self.fingerprint
     }
@@ -284,10 +288,12 @@ impl RequestCache {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn used_slots(&self) -> usize {
         lock(&self.inner.state).used_slots
     }
 
+    #[allow(dead_code)]
     pub(crate) fn len(&self) -> usize {
         lock(&self.inner.state).entries.len()
     }
@@ -531,11 +537,10 @@ impl RequestCacheInner {
             slot: Some(mut owned),
             ..
         }) = state.entries.remove(identity)
+            && owned.active
         {
-            if owned.active {
-                state.used_slots = state.used_slots.saturating_sub(1);
-                owned.disarm();
-            }
+            state.used_slots = state.used_slots.saturating_sub(1);
+            owned.disarm();
         }
         true
     }

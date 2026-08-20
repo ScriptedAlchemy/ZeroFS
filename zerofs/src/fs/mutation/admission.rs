@@ -48,10 +48,12 @@ pub(crate) struct RawMutationPermit {
 }
 
 impl RawMutationPermit {
+    #[allow(dead_code)]
     pub(crate) fn bytes(&self) -> u64 {
         self.bytes
     }
 
+    #[allow(dead_code)]
     fn disarm(&mut self) {
         self.active = false;
     }
@@ -108,14 +110,17 @@ impl RawMutationBudget {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn used_bytes(&self) -> u64 {
         lock(&self.inner.state).used_bytes
     }
 
+    #[allow(dead_code)]
     pub(crate) fn used_operations(&self) -> u64 {
         lock(&self.inner.state).used_operations
     }
 
+    #[allow(dead_code)]
     pub(crate) fn poison(&self, message: impl Into<String>) {
         self.inner
             .terminate(MutationError::Poisoned(message.into()));
@@ -209,6 +214,7 @@ impl BudgetInner {
         self.grant_waiters();
     }
 
+    #[allow(dead_code)]
     fn terminate(&self, error: MutationError) {
         let waiters = {
             let mut state = lock(&self.state);
@@ -228,6 +234,7 @@ impl BudgetInner {
 #[derive(Debug)]
 pub(crate) enum PreparationAbort {
     RequestFailure(FsError),
+    #[allow(dead_code)]
     TransportCancellation,
 }
 
@@ -270,6 +277,7 @@ impl PreparationGate {
         self.incarnation
     }
 
+    #[allow(dead_code)]
     pub(crate) fn active_guards(&self) -> usize {
         lock(&self.state).active.len()
     }
@@ -331,6 +339,7 @@ impl PreparationGate {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn close_scope(&self, scope: &ConflictScope) -> Result<(), MutationError> {
         self.begin_close(scope)?;
         self.wait_closed(scope).await

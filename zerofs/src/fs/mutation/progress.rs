@@ -38,6 +38,7 @@ impl MutationProgress {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn materialized_through(&self) -> u64 {
         lock(&self.inner.state).materialized_through
     }

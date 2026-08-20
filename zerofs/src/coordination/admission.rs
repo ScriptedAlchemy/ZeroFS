@@ -72,6 +72,8 @@ trait AdmissionPolicy: fmt::Debug + Sized {
 #[derive(Debug)]
 struct Gate<P: AdmissionPolicy> {
     capacity: u64,
+    // Landed-but-not-wired: retained for the tier policy that owns this gate.
+    #[allow(dead_code)]
     policy: P,
     state: Mutex<GateState<P>>,
 }

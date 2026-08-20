@@ -59,6 +59,8 @@ pub struct NFSAdapter {
 }
 
 impl NFSAdapter {
+    // Landed-but-not-wired public constructor; external adapters use it.
+    #[allow(dead_code)]
     pub fn new(fs: Arc<ZeroFS>) -> Self {
         Self::with_service_identity(fs, NfsServiceIdentity::new())
     }
@@ -624,6 +626,8 @@ impl NFSFileSystem for NFSAdapter {
     }
 }
 
+// Landed-but-not-wired entry point kept alongside the service-identity variant.
+#[allow(dead_code)]
 pub async fn start_nfs_server_with_config(
     filesystem: Arc<ZeroFS>,
     socket: SocketAddr,

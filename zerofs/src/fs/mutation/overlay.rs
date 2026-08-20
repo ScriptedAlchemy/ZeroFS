@@ -173,6 +173,7 @@ impl FilesystemVolatileOverlay {
         canonical.max(dirty).max(attrs)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn visible_attrs(&self, inode: u64, canonical: FileAttributes) -> FileAttributes {
         let canonical_size = canonical.size;
         let mut attrs = self
@@ -200,6 +201,7 @@ impl FilesystemVolatileOverlay {
         self.runtime(inode).reserve(bytes).await
     }
 
+    #[allow(dead_code)]
     pub(crate) fn preview_attrs(&self, inode: u64, attrs: FileAttributes) {
         self.latest_attrs
             .lock()
@@ -671,6 +673,7 @@ impl ZeroFS {
             .unwrap_or(canonical)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn overlay_is_dirty(&self, id: InodeId) -> bool {
         self.volatile_overlay
             .get()
@@ -720,6 +723,7 @@ impl ZeroFS {
 
     /// One prepared/accepted batch for a logical write that spans one or more
     /// backing inodes (NBD striped WRITE).
+    #[allow(dead_code)]
     pub(crate) async fn write_ack_batch(
         &self,
         auth: &AuthContext,
@@ -842,6 +846,7 @@ impl ZeroFS {
         Ok(WriteAckReceipt { attrs, cutoff })
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn write_ack_opened_idempotent(
         &self,
         auth: &AuthContext,

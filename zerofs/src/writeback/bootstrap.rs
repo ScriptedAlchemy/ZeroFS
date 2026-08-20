@@ -14,7 +14,10 @@ use std::sync::Arc;
 pub struct AttachedWriteback {
     pub store: Arc<dyn ObjectStore>,
     pub lifecycle: WritebackObjectStore,
+    // Landed-but-not-wired: consumers arrive with the tiered admission wiring.
+    #[allow(dead_code)]
     pub(crate) space: Arc<PhysicalSpaceSampler>,
+    #[allow(dead_code)]
     pub(crate) ssd: Arc<SsdAdmission>,
 }
 

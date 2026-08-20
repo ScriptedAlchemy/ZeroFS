@@ -93,6 +93,8 @@ impl SsdReservationToken {
         self.request
     }
 
+    // Landed-but-not-wired accessor.
+    #[allow(dead_code)]
     pub(crate) fn state(&self) -> ReservationState {
         self.state
     }
@@ -182,6 +184,7 @@ impl Drop for WaitRegistration {
     }
 }
 impl SsdAdmission {
+    #[allow(dead_code)]
     pub(crate) fn new(
         capacity_bytes: u64,
         max_operations: u64,
@@ -524,10 +527,12 @@ impl SsdAdmission {
         lock(&self.inner.state).used_ssd_bytes
     }
 
+    #[allow(dead_code)]
     pub(crate) fn used_operations(&self) -> u64 {
         lock(&self.inner.state).used_operations
     }
 
+    #[allow(dead_code)]
     pub(crate) fn outstanding_physical_claims(&self) -> u64 {
         lock(&self.inner.state).outstanding_physical_claims
     }
@@ -546,14 +551,17 @@ impl SsdAdmission {
         self.inner.release(request);
     }
 
+    #[allow(dead_code)]
     pub(crate) fn mode(&self) -> SsdAdmissionMode {
         lock(&self.inner.state).pacing.mode()
     }
 
+    #[allow(dead_code)]
     pub(crate) fn credit_bytes(&self) -> u64 {
         lock(&self.inner.state).pacing.credit_bytes()
     }
 
+    #[allow(dead_code)]
     pub(crate) fn credit_ops(&self) -> u64 {
         lock(&self.inner.state).pacing.credit_ops()
     }
@@ -562,6 +570,7 @@ impl SsdAdmission {
         Arc::clone(&self.inner.physical_waiters)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn min_free_waiters_changed(&self) -> impl std::future::Future<Output = ()> + '_ {
         self.inner.physical_waiters.notified()
     }
@@ -891,20 +900,26 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// Durable local ownership after a reservation has been committed to the journal.
 #[derive(Debug)]
 pub(crate) struct CommittedSsdReservation {
+    #[allow(dead_code)]
     request: SsdReservationRequest,
+    #[allow(dead_code)]
     physical_bytes: u64,
+    #[allow(dead_code)]
     sample: PhysicalSpaceSample,
 }
 
 impl CommittedSsdReservation {
+    #[allow(dead_code)]
     pub(crate) fn request(&self) -> SsdReservationRequest {
         self.request
     }
 
+    #[allow(dead_code)]
     pub(crate) fn physical_bytes(&self) -> u64 {
         self.physical_bytes
     }
 
+    #[allow(dead_code)]
     pub(crate) fn sample(&self) -> PhysicalSpaceSample {
         self.sample
     }
@@ -1022,6 +1037,7 @@ pub(crate) fn commit_batch_local(
 }
 
 impl CommittedSsdReservation {
+    #[allow(dead_code)]
     pub(crate) fn commit_local(
         self,
         _current_physical_bytes: u64,
@@ -1032,6 +1048,7 @@ impl CommittedSsdReservation {
         ))
     }
 
+    #[allow(dead_code)]
     pub(crate) fn release(self) -> Result<(), ReservationError> {
         Err(ReservationError::Poisoned(
             "cannot release a committed SSD reservation".into(),

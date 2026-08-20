@@ -77,8 +77,12 @@ struct WritebackStoreInner {
     next_sequence: AtomicU64,
     key_locks: Vec<Arc<Mutex<()>>>,
     admission_order: Mutex<()>,
+    // Landed-but-not-wired: cached free-space probe state for SSD admission.
+    #[allow(dead_code)]
     started: std::time::Instant,
+    #[allow(dead_code)]
     available_space: AtomicU64,
+    #[allow(dead_code)]
     available_space_probed_ms: AtomicU64,
     stopped: AtomicBool,
     #[cfg(test)]
@@ -120,6 +124,8 @@ impl WritebackStoreInner {
     /// Free-space probes guard SSD admission but do not need per-operation
     /// precision; serve a briefly cached value so the write path is not one
     /// statvfs syscall per mutation.
+    // Landed-but-not-wired: consumed by tiered SSD admission.
+    #[allow(dead_code)]
     fn available_space(&self) -> object_store::Result<u64> {
         const PROBE_TTL_MS: u64 = 250;
         let now_ms = self.started.elapsed().as_millis() as u64;
@@ -162,6 +168,8 @@ impl WritebackObjectStore {
     }
 
     /// Open a recovered overlay without allowing the remote view to advance.
+    // Landed-but-not-wired constructor variant.
+    #[allow(dead_code)]
     pub(crate) async fn open_paused(
         remote: Arc<dyn ObjectStore>,
         journal: Arc<Journal>,
@@ -396,6 +404,8 @@ impl WritebackObjectStore {
         }
     }
 
+    // Landed-but-not-wired accessor.
+    #[allow(dead_code)]
     pub(crate) fn space_sampler(&self) -> &Arc<PhysicalSpaceSampler> {
         &self.inner.space
     }

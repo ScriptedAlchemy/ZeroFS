@@ -173,6 +173,7 @@ impl std::fmt::Debug for RemoteScheduler {
 }
 
 impl RemoteScheduler {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn start(
         remote: Arc<dyn ObjectStore>,
         journal: Arc<Journal>,
@@ -194,6 +195,7 @@ impl RemoteScheduler {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn start_paused(
         remote: Arc<dyn ObjectStore>,
         journal: Arc<Journal>,
@@ -1318,12 +1320,11 @@ async fn stream_record_to_remote(
         && record
             .payload()
             .is_some_and(|(payload_len, _)| payload_len <= REMOTE_SINGLE_PUT_BYTES);
-    if !small_atomic_create {
-        if let Some(existing) =
+    if !small_atomic_create
+        && let Some(existing) =
             reconcile_precondition(remote.as_ref(), &journal, record, target, mode).await?
-        {
-            return Ok(existing);
-        }
+    {
+        return Ok(existing);
     }
 
     let sequence = record.sequence;
