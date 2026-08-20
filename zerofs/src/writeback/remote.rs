@@ -4,6 +4,7 @@ use crate::writeback::journal::Journal;
 use crate::writeback::journaler::{LocalBarrier, LocalBarrierError};
 use crate::writeback::model::{
     FenceClass, LocalEtag, MutationKind, MutationMode, MutationRecord, Sequence,
+    is_reclaimed_immutable_delete,
 };
 use crate::writeback::overlay::OverlayIndex;
 use crate::writeback::pacing::{DurableCleanupSteps, credit_for};
@@ -485,6 +486,13 @@ async fn run_remote_scheduler(worker: RemoteWorker) {
             }
         }
     }
+    // Fetched once: the database prefix proves which frontier deletes are
+    // canonical immutable reclamation and may run concurrently. An unknown
+    // identity degrades to strict per-delete ordering, never the reverse.
+    let database_prefix = journal
+        .identity()
+        .ok()
+        .map(|identity| identity.database_prefix);
     let mut next = progress.borrow().sequence.saturating_add(1);
     let cleanup_state = RemoteCleanupState::new();
     let mut cleanup_failure = cleanup_state.failure.subscribe();
@@ -536,6 +544,7 @@ async fn run_remote_scheduler(worker: RemoteWorker) {
             &journal,
             next,
             upload_concurrency,
+            database_prefix.as_deref(),
             &completed,
             next <= known_local_tail,
             &mut stop,
@@ -575,6 +584,7 @@ async fn run_remote_scheduler(worker: RemoteWorker) {
                     &window.records,
                     next,
                     upload_concurrency,
+                    database_prefix.as_deref(),
                     &completed,
                     &active_sequences,
                 );
@@ -965,6 +975,7 @@ async fn coalesce_local_batch(
     journal: &Journal,
     next: Sequence,
     upload_concurrency: usize,
+    reclamation_prefix: Option<&str>,
     completed: &BTreeMap<Sequence, CompletedRemote>,
     drain_known_backlog: bool,
     stop: &mut watch::Receiver<bool>,
@@ -981,6 +992,7 @@ async fn coalesce_local_batch(
                 &window.records,
                 next,
                 upload_concurrency,
+                reclamation_prefix,
                 completed,
                 &BTreeSet::new(),
             )
@@ -1079,6 +1091,7 @@ fn collect_pipeline_batch(
     records: &[MutationRecord],
     first_sequence: Sequence,
     limit: usize,
+    reclamation_prefix: Option<&str>,
     completed: &BTreeMap<Sequence, CompletedRemote>,
     active: &BTreeSet<Sequence>,
 ) -> Vec<MutationRecord> {
@@ -1110,12 +1123,15 @@ fn collect_pipeline_batch(
     let mut expected = first_sequence;
     // Segment reclamation emits long contiguous runs of delete fences, each of
     // which previously reached the frontier alone at one WAN round trip per
-    // record. A contiguous prefix of deletes at the frontier may dispatch
-    // concurrently: every object in the run is already unreferenced by the
-    // durable manifest that preceded it in the journal, so any subset of the
-    // run completing is a consistent remote state, and a replayed delete
-    // tolerates NotFound. The first non-delete record ends the run; the
-    // watermark still commits strictly in sequence order.
+    // record. A contiguous prefix of *reclamation* deletes at the frontier may
+    // dispatch concurrently: a canonical immutable segment/SST is only deleted
+    // after the manifest update that unreferenced it, and that update precedes
+    // the delete in the journal, so any subset of the run completing is a
+    // consistent remote state and a replayed delete tolerates NotFound. A
+    // delete of any other path carries no such provenance (deleting past it
+    // could expose a remote manifest referencing a missing object), so it —
+    // like any non-delete record — ends the run. The watermark still commits
+    // strictly in sequence order.
     let mut frontier_delete_run = true;
     for record in records
         .iter()
@@ -1128,7 +1144,9 @@ fn collect_pipeline_batch(
         let conflicts_with_earlier = keys.iter().any(|key| earlier_keys.contains(key));
         let is_frontier = record.sequence == first_sequence;
         let may_preupload = record.fence == FenceClass::ImmutableCreate;
-        frontier_delete_run &= matches!(record.kind, MutationKind::Delete);
+        frontier_delete_run &= reclamation_prefix.is_some_and(|prefix| {
+            is_reclaimed_immutable_delete(&record.path, &record.kind, prefix)
+        });
         // Only immutable, unreferenced data may cross a fence. Results remain
         // held in memory and are journal-committed strictly in sequence order.
         if !completed.contains_key(&record.sequence)
@@ -1822,7 +1840,8 @@ mod tests {
         ];
 
         let completed = Default::default();
-        let first = collect_pipeline_batch(&records, 1, 8, &completed, &Default::default());
+        let first =
+            collect_pipeline_batch(&records, 1, 8, Some(""), &completed, &Default::default());
         assert_eq!(
             first
                 .iter()
@@ -1831,7 +1850,8 @@ mod tests {
             vec![1, 2, 4]
         );
 
-        let fence = collect_pipeline_batch(&records, 3, 8, &completed, &Default::default());
+        let fence =
+            collect_pipeline_batch(&records, 3, 8, Some(""), &completed, &Default::default());
         assert_eq!(
             fence
                 .iter()
@@ -1840,7 +1860,8 @@ mod tests {
             vec![3, 4]
         );
 
-        let after = collect_pipeline_batch(&records, 4, 8, &completed, &Default::default());
+        let after =
+            collect_pipeline_batch(&records, 4, 8, Some(""), &completed, &Default::default());
         assert_eq!(
             after
                 .iter()
@@ -1858,8 +1879,14 @@ mod tests {
             record(3, "segments/independent", FenceClass::ImmutableCreate),
         ];
 
-        let batch =
-            collect_pipeline_batch(&records, 1, 8, &Default::default(), &Default::default());
+        let batch = collect_pipeline_batch(
+            &records,
+            1,
+            8,
+            Some(""),
+            &Default::default(),
+            &Default::default(),
+        );
 
         assert_eq!(
             batch
@@ -1894,7 +1921,8 @@ mod tests {
             })
             .collect();
 
-        let batch = collect_pipeline_batch(&records, 1, 4, &completed, &Default::default());
+        let batch =
+            collect_pipeline_batch(&records, 1, 4, Some(""), &completed, &Default::default());
 
         assert_eq!(
             batch
@@ -1908,13 +1936,19 @@ mod tests {
     #[test]
     fn a_contiguous_frontier_delete_run_dispatches_concurrently() {
         let mut records = (1_u64..=5)
-            .map(|sequence| frontier_delete(sequence, &format!("compacted/{sequence:020}.sst")))
+            .map(|sequence| frontier_delete(sequence, &format!("wal/{sequence:020}.sst")))
             .collect::<Vec<_>>();
         records.push(record(6, "manifest/000006.manifest", FenceClass::Fence));
         records.push(record(7, "segments/7", FenceClass::ImmutableCreate));
 
-        let batch =
-            collect_pipeline_batch(&records, 1, 8, &Default::default(), &Default::default());
+        let batch = collect_pipeline_batch(
+            &records,
+            1,
+            8,
+            Some(""),
+            &Default::default(),
+            &Default::default(),
+        );
 
         assert_eq!(
             batch
@@ -1924,6 +1958,38 @@ mod tests {
             vec![1, 2, 3, 4, 5, 7],
             "a contiguous run of frontier deletes must dispatch together; the ordered \
              manifest behind the run still waits to become the frontier"
+        );
+    }
+
+    #[test]
+    fn a_delete_without_reclamation_provenance_ends_the_frontier_run() {
+        // A manifest delete has no proof that its object is unreferenced:
+        // deleting a segment past it could expose a remote manifest that
+        // still references a missing object. Only canonical immutable
+        // segment/SST paths — which are deleted strictly after the manifest
+        // update that unreferenced them — may run concurrently.
+        let records = vec![
+            frontier_delete(1, "wal/00000000000000000001.sst"),
+            frontier_delete(2, "manifest/000002.manifest"),
+            frontier_delete(3, "wal/00000000000000000003.sst"),
+        ];
+
+        let batch = collect_pipeline_batch(
+            &records,
+            1,
+            8,
+            Some(""),
+            &Default::default(),
+            &Default::default(),
+        );
+
+        assert_eq!(
+            batch
+                .iter()
+                .map(|record| record.sequence)
+                .collect::<Vec<_>>(),
+            vec![1],
+            "a delete without reclamation provenance must wait to become the frontier"
         );
     }
 
@@ -1949,7 +2015,8 @@ mod tests {
             })
             .collect();
 
-        let batch = collect_pipeline_batch(&records, 1, 4, &completed, &Default::default());
+        let batch =
+            collect_pipeline_batch(&records, 1, 4, Some(""), &completed, &Default::default());
 
         assert_eq!(
             batch
@@ -1985,7 +2052,8 @@ mod tests {
             })
             .collect();
 
-        let batch = collect_pipeline_batch(&records, 1, 4, &completed, &Default::default());
+        let batch =
+            collect_pipeline_batch(&records, 1, 4, Some(""), &completed, &Default::default());
 
         assert_eq!(
             batch
@@ -2125,7 +2193,7 @@ mod tests {
             .collect::<Vec<_>>();
         let active = [1_u64, 2, 3].into_iter().collect();
 
-        let batch = collect_pipeline_batch(&records, 1, 4, &Default::default(), &active);
+        let batch = collect_pipeline_batch(&records, 1, 4, Some(""), &Default::default(), &active);
 
         assert_eq!(
             batch

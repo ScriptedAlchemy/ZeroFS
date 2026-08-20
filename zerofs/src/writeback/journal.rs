@@ -527,6 +527,19 @@ impl Journal {
         &self.root
     }
 
+    /// The journal's persisted identity, without the full-record scan a
+    /// [`Journal::snapshot`] performs.
+    pub fn identity(&self) -> Result<JournalIdentity> {
+        let read = self
+            .database
+            .begin_read()
+            .context("failed to read journal")?;
+        let meta = read
+            .open_table(META)
+            .context("failed to open journal metadata")?;
+        read_required::<JournalIdentity>(&meta, IDENTITY_KEY)
+    }
+
     pub fn snapshot(&self) -> Result<JournalSnapshot> {
         #[cfg(test)]
         self.snapshot_calls.fetch_add(1, Ordering::Relaxed);

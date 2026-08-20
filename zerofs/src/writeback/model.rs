@@ -77,18 +77,35 @@ pub(crate) fn classify_mutation_fence(
     let Some(suffix) = database_suffix(path, database_prefix) else {
         return FenceClass::Fence;
     };
-    let is_segment = is_canonical_segment_suffix(&suffix);
-    let is_sst = match suffix.as_slice() {
-        [directory, filename] if directory == "wal" => canonical_wal_filename(filename),
-        [directory, filename] if directory == "compacted" => canonical_compacted_filename(filename),
-        _ => false,
-    };
-
-    if is_segment || is_sst {
+    if is_canonical_immutable_suffix(&suffix) {
         FenceClass::ImmutableCreate
     } else {
         FenceClass::Fence
     }
+}
+
+fn is_canonical_immutable_suffix(suffix: &[String]) -> bool {
+    let is_sst = match suffix {
+        [directory, filename] if directory == "wal" => canonical_wal_filename(filename),
+        [directory, filename] if directory == "compacted" => canonical_compacted_filename(filename),
+        _ => false,
+    };
+    is_canonical_segment_suffix(suffix) || is_sst
+}
+
+/// A delete of a canonical immutable database object (segment or SST) is by
+/// construction reclamation: those objects are only deleted after the
+/// manifest update that stopped referencing them, and that update precedes
+/// the delete in the journal. Any other deleted path carries no such
+/// provenance and must stay strictly ordered at the remote frontier.
+pub(crate) fn is_reclaimed_immutable_delete(
+    path: &str,
+    kind: &MutationKind,
+    database_prefix: &str,
+) -> bool {
+    matches!(kind, MutationKind::Delete)
+        && database_suffix(path, database_prefix)
+            .is_some_and(|suffix| is_canonical_immutable_suffix(&suffix))
 }
 
 pub(crate) fn is_canonical_segment_path(path: &str, database_prefix: &str) -> bool {
