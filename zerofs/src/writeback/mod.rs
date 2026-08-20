@@ -32,6 +32,8 @@ pub(crate) mod space_sample;
 pub mod store;
 pub use store::WritebackError;
 #[cfg(test)]
+mod sftp_bench;
+#[cfg(test)]
 mod test_util;
 
 #[cfg(unix)]

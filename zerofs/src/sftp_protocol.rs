@@ -782,6 +782,15 @@ impl TransportSession for SftpProtocolSession {
             .map(|_| ())
     }
 
+    async fn remove_directory(&self, path: &Path) -> Result<(), TransportError> {
+        let remote = sftp_path(path)?;
+        self.sftp()?
+            .remove_dir(remote)
+            .await
+            .map_err(|error| map_sftp_error(path, error))
+            .map(|_| ())
+    }
+
     async fn ensure_directory_component(&self, path: &Path) -> Result<(), TransportError> {
         let sftp = self.sftp()?;
         for component in path.components() {

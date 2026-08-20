@@ -218,6 +218,11 @@ pub trait TransportSession: fmt::Debug + Send + Sync + 'static {
             "remove_file is not implemented by this session".to_owned(),
         ))
     }
+    async fn remove_directory(&self, _path: &std::path::Path) -> Result<(), TransportError> {
+        Err(TransportError::Operation(
+            "remove_directory is not implemented by this session".to_owned(),
+        ))
+    }
     async fn ensure_directory_component(
         &self,
         _path: &std::path::Path,
@@ -1484,6 +1489,10 @@ impl SessionLease {
 
     pub async fn remove_file(&mut self, path: &std::path::Path) -> Result<(), TransportError> {
         self.transport().remove_file(path).await
+    }
+
+    pub async fn remove_directory(&mut self, path: &std::path::Path) -> Result<(), TransportError> {
+        self.transport().remove_directory(path).await
     }
 
     async fn ensure_directory_component(
