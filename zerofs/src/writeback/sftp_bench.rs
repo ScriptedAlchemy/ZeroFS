@@ -291,7 +291,7 @@ fn generated_segment_options() -> PutOptions {
 
 fn benchmark_put_options(path: &ObjectPath) -> PutOptions {
     if path.as_ref().contains("/manifest/") {
-        PutOptions::from(PutMode::Overwrite)
+        PutOptions::from(PutMode::Create)
     } else {
         generated_segment_options()
     }
