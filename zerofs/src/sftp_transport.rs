@@ -2527,6 +2527,64 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn pending_dials_do_not_stack_excess_writes_on_the_first_session() {
+        let factory = RecordingFactory::fully_capable();
+        let pool = Arc::new(pool(factory.clone(), 4, 8, 8).await);
+        let first = pool.checkout(OperationKind::Write).await.unwrap();
+        factory.state.block_open_from.store(2, Ordering::SeqCst);
+
+        let mut tasks = Vec::new();
+        for _ in 0..7 {
+            let pool = pool.clone();
+            tasks.push(tokio::spawn(async move {
+                pool.checkout(OperationKind::Write).await.unwrap()
+            }));
+        }
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            factory.state.open_started.notified(),
+        )
+        .await
+        .expect("the first expansion dial reaches the controlled pause");
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), async {
+                loop {
+                    if tasks.iter().any(tokio::task::JoinHandle::is_finished) {
+                        return;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_err(),
+            "uploads beyond the connection cap must wait for pending dials instead of stacking on the first session"
+        );
+
+        factory.state.block_open_from.store(0, Ordering::SeqCst);
+        factory.state.allow_open.notify_waiters();
+        let mut leases = vec![first];
+        for task in tasks {
+            leases.push(task.await.unwrap());
+        }
+        let mut writes_per_session = pool
+            .inner
+            .roster
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|session| session.active_writes.load(Ordering::SeqCst))
+            .collect::<Vec<_>>();
+        writes_per_session.sort_unstable();
+        assert_eq!(writes_per_session, [2, 2, 2, 2]);
+
+        for lease in leases {
+            lease.complete().await.unwrap();
+        }
+        pool.shutdown().await.unwrap();
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn retirement_marks_broken_only_while_removing_from_the_roster() {
         let factory = RecordingFactory::fully_capable();
