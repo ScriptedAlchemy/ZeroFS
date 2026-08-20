@@ -567,8 +567,8 @@ async fn bench_sftp_writeback_remote_drain() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BenchObjectSet, GeneratedSegmentCreate, build_remote_store, finish_benchmark,
-        generated_segment_options, read_and_verify_remote,
+        BenchObjectSet, GeneratedSegmentCreate, SaturationGeometry, build_remote_store,
+        finish_benchmark, generated_segment_options, read_and_verify_remote,
     };
     use crate::config::Settings;
     use bytes::Bytes;
@@ -613,6 +613,29 @@ mod tests {
                 .extensions
                 .get::<GeneratedSegmentCreate>()
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn saturation_geometry_fills_the_high_watermark_and_leaves_a_blocked_tail() {
+        let objects = BenchObjectSet::new(
+            &Path::from("zerofs/prod"),
+            Uuid::parse_str("12345678-1234-1234-1234-123456789abc").unwrap(),
+            8,
+        )
+        .unwrap();
+        let payload_bytes = 8 * 1024 * 1024;
+        let reservation =
+            SaturationGeometry::reservation_bytes(&objects.objects[0], payload_bytes).unwrap();
+        let geometry =
+            SaturationGeometry::new(&objects.objects, payload_bytes, reservation * 4, 95).unwrap();
+
+        assert_eq!(geometry.prefill_objects, 3);
+        assert_eq!(geometry.paced_objects, 5);
+        assert!(geometry.prefill_reserved_bytes <= geometry.high_watermark_bytes);
+        assert!(
+            geometry.prefill_reserved_bytes + geometry.reservation_bytes
+                > geometry.high_watermark_bytes
         );
     }
 
