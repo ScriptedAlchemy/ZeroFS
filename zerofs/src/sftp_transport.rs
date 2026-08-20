@@ -499,8 +499,8 @@ impl Drop for OperationAdmission {
 }
 
 /// One SSH connection shared by up to [`SFTP_SESSION_MAX_CONCURRENT_OPS`]
-/// concurrent small read/metadata operations. A write already pipelines a
-/// full WAN window, so it owns its physical session until completion.
+/// concurrent operations. A write already pipelines a full WAN window, so a
+/// physical session admits at most one write at a time.
 struct SharedSession {
     transport: Arc<dyn TransportSession>,
     // Dropped only after the transport finished closing, so a redial cannot
@@ -544,7 +544,10 @@ impl SharedSession {
             return false;
         }
         match kind {
-            OperationKind::Write => self.active_ops.load(Ordering::SeqCst) == 0,
+            OperationKind::Write => {
+                self.active_writes.load(Ordering::SeqCst) == 0
+                    && self.active_ops.load(Ordering::SeqCst) < SFTP_SESSION_MAX_CONCURRENT_OPS
+            }
             OperationKind::Read | OperationKind::Metadata => {
                 self.active_ops.load(Ordering::SeqCst) < SFTP_SESSION_MAX_CONCURRENT_OPS
             }
@@ -1226,8 +1229,8 @@ impl SftpSessionPool {
 
     /// Places one operation on a session. Prefers a fully idle session, then
     /// dials a new connection while capacity remains. Small reads and metadata
-    /// may share the least-loaded session; a pipelined write waits for an idle
-    /// physical session instead of competing with another full write window.
+    /// may share the least-loaded session; a pipelined write waits for a
+    /// session without another full write window.
     async fn acquire_session(
         &self,
         kind: OperationKind,
@@ -2664,7 +2667,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pipelined_writes_wait_for_an_idle_physical_session() {
+    async fn pipelined_writes_do_not_share_a_physical_session() {
         let factory = RecordingFactory::fully_capable();
         let pool = Arc::new(pool(factory, 2, 4, 4).await);
         let first = pool.checkout(OperationKind::Write).await.unwrap();
