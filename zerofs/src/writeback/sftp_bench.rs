@@ -8,6 +8,7 @@ use crate::writeback::config::{AckMode, ShutdownFlush, WritebackAccessMode, Writ
 use crate::writeback::journal::Journal;
 use crate::writeback::model::{JournalIdentity, LocalEtag, MutationRecord};
 use crate::writeback::store::WritebackObjectStore;
+use crate::writeback::test_util::WriteAdmissionTestControl;
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use object_store::path::Path as ObjectPath;
@@ -15,7 +16,7 @@ use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions};
 use rand::{RngCore, SeedableRng, rngs::StdRng};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -362,31 +363,121 @@ fn validate_saturation_sequence(index: usize, sequence: u64) -> Result<()> {
     Ok(())
 }
 
-async fn start_saturation_write(
-    start: tokio::sync::oneshot::Sender<()>,
-    mut finished: tokio::sync::oneshot::Receiver<()>,
-    store: &WritebackObjectStore,
+fn saturation_writer_slots(object_count: usize, writers: usize) -> usize {
+    object_count.min(writers)
+}
+
+fn saturation_ack_elapsed(activated: Instant, acknowledged: Instant) -> Duration {
+    acknowledged.saturating_duration_since(activated)
+}
+
+type SaturationCompletion = (usize, std::result::Result<u64, String>, Instant);
+
+async fn next_saturation_completion(
+    writers: &mut tokio::task::JoinSet<SaturationCompletion>,
+) -> Result<SaturationCompletion> {
+    writers
+        .join_next()
+        .await
+        .context("saturation writer task set ended before its completion")?
+        .context("saturation writer task failed")
+}
+
+#[derive(Clone)]
+struct SaturationWriterContext {
+    store: WritebackObjectStore,
+    segment_payload: Bytes,
+    manifest_payload: Bytes,
+    paths: Arc<Vec<ObjectPath>>,
+    classes: Arc<Vec<BenchObjectClass>>,
+}
+
+struct ActiveSaturationWriter {
+    control: WriteAdmissionTestControl,
+    finished: tokio::sync::oneshot::Receiver<()>,
+}
+
+impl SaturationWriterContext {
+    fn spawn(
+        &self,
+        writers: &mut tokio::task::JoinSet<SaturationCompletion>,
+        index: usize,
+    ) -> ActiveSaturationWriter {
+        let context = self.clone();
+        let control = WriteAdmissionTestControl::new();
+        let writer_control = control.clone();
+        let (finished_sender, finished) = tokio::sync::oneshot::channel();
+        writers.spawn(async move {
+            let class = context.classes[index];
+            let mut options = benchmark_put_options(class);
+            options.extensions.insert(writer_control);
+            let result = match context
+                .store
+                .put_opts(
+                    &context.paths[index],
+                    benchmark_payload(class, &context.segment_payload, &context.manifest_payload)
+                        .clone()
+                        .into(),
+                    options,
+                )
+                .await
+            {
+                Ok(result) => result
+                    .e_tag
+                    .as_deref()
+                    .and_then(LocalEtag::sequence_from_str)
+                    .ok_or_else(|| format!("tail object {index} returned no local sequence")),
+                Err(error) => Err(error.to_string()),
+            };
+            let _ = finished_sender.send(());
+            (index, result, Instant::now())
+        });
+        ActiveSaturationWriter { control, finished }
+    }
+}
+
+async fn wait_for_saturation_admission(
+    active: &mut ActiveSaturationWriter,
+    require_queue: bool,
 ) -> Result<()> {
-    let registrations = store.ssd_admission().waiter_registration_count();
-    start
-        .send(())
-        .map_err(|_| anyhow::anyhow!("saturation writer exited before admission"))?;
     tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if store.ssd_admission().waiter_registration_count() != registrations {
-                return Ok(());
-            }
-            tokio::select! {
-                result = &mut finished => {
-                    result.context("saturation writer exited before reporting completion")?;
-                    return Ok(());
-                }
-                () = tokio::task::yield_now() => {}
+        tokio::select! {
+            () = active.control.wait_until_registered() => Ok(()),
+            result = &mut active.finished => {
+                result.context("saturation writer exited before reporting completion")?;
+                anyhow::bail!("saturation writer exited before SSD admission")
             }
         }
     })
     .await
-    .context("saturation writer did not enter SSD admission")?
+    .context("saturation writer did not enter SSD admission")??;
+    anyhow::ensure!(
+        !require_queue || active.control.was_queued(),
+        "saturation writer reached sequence allocation without queuing at the SSD watermark"
+    );
+    Ok(())
+}
+
+async fn release_saturation_allocation(active: &mut ActiveSaturationWriter) -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        tokio::select! {
+            () = active.control.wait_until_allocation_waits() => Ok(()),
+            result = &mut active.finished => {
+                result.context("saturation writer exited before reporting completion")?;
+                anyhow::bail!("saturation writer exited before sequence allocation")
+            }
+        }
+    })
+    .await
+    .context("saturation writer did not reach sequence allocation")??;
+    active.control.release_allocation();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        active.control.wait_until_allocated(),
+    )
+    .await
+    .context("saturation writer did not allocate its journal sequence")?;
+    Ok(())
 }
 
 fn generated_segment_options() -> PutOptions {
@@ -675,61 +766,28 @@ async fn execute_saturation_benchmark(
     .context("timed out waiting for saturation prefill durability")??;
     let prefill = prefill_started.elapsed();
 
-    let (completion_sender, mut completion_receiver) =
-        tokio::sync::mpsc::unbounded_channel::<(usize, std::result::Result<u64, String>)>();
     let mut writers = tokio::task::JoinSet::new();
-    let mut pending_starts = VecDeque::with_capacity(saturation.paced_objects);
-    for index in saturation.prefill_objects..paths.len() {
-        let writer_store = store.clone();
-        let segment_payload = segment_payload.clone();
-        let manifest_payload = manifest_payload.clone();
-        let paths = Arc::clone(&paths);
-        let classes = Arc::clone(&classes);
-        let completion_sender = completion_sender.clone();
-        let (start_sender, start_receiver) = tokio::sync::oneshot::channel();
-        let (finished_sender, finished_receiver) = tokio::sync::oneshot::channel();
-        writers.spawn(async move {
-            if start_receiver.await.is_err() {
-                return;
-            }
-            let class = classes[index];
-            let result = match writer_store
-                .put_opts(
-                    &paths[index],
-                    benchmark_payload(class, &segment_payload, &manifest_payload)
-                        .clone()
-                        .into(),
-                    benchmark_put_options(class),
-                )
-                .await
-            {
-                Ok(result) => result
-                    .e_tag
-                    .as_deref()
-                    .and_then(LocalEtag::sequence_from_str)
-                    .ok_or_else(|| format!("tail object {index} returned no local sequence")),
-                Err(error) => Err(error.to_string()),
-            };
-            let _ = finished_sender.send(());
-            let _ = completion_sender.send((index, result));
-        });
-        pending_starts.push_back((start_sender, finished_receiver));
-    }
-    let initially_active = geometry.writers.min(saturation.paced_objects);
+    let writer_context = SaturationWriterContext {
+        store: store.clone(),
+        segment_payload: segment_payload.clone(),
+        manifest_payload: manifest_payload.clone(),
+        paths: Arc::clone(&paths),
+        classes: Arc::clone(&classes),
+    };
+    let initially_active = saturation_writer_slots(saturation.paced_objects, geometry.writers);
+    let mut next_index = saturation.prefill_objects;
+    let mut initial_writers = Vec::with_capacity(initially_active);
     for _ in 0..initially_active {
-        let (start, finished) = pending_starts
-            .pop_front()
-            .context("saturation writer plan ended before the active set was filled")?;
-        start_saturation_write(start, finished, store).await?;
+        let mut active = writer_context.spawn(&mut writers, next_index);
+        wait_for_saturation_admission(&mut active, true).await?;
+        initial_writers.push(active);
+        next_index += 1;
     }
-    drop(completion_sender);
     tokio::time::sleep(Duration::from_millis(100)).await;
-    match completion_receiver.try_recv() {
-        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
-        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-            anyhow::bail!("benchmark writers exited instead of blocking at the SSD watermark")
-        }
-        Ok((index, result)) => {
+    match writers.try_join_next() {
+        None => {}
+        Some(Err(error)) => return Err(error).context("saturation writer task failed"),
+        Some(Ok((index, result, _))) => {
             result.map_err(|error| anyhow::anyhow!("tail object {index} failed: {error}"))?;
             anyhow::bail!("tail object {index} bypassed the full SSD admission boundary")
         }
@@ -761,19 +819,23 @@ async fn execute_saturation_benchmark(
     store.activate_remote()?;
     let blocked_ack_times = tokio::time::timeout(Duration::from_secs(300), async {
         let mut completions = Vec::with_capacity(saturation.paced_objects);
+        for active in &mut initial_writers {
+            release_saturation_allocation(active).await?;
+        }
         for _ in 0..saturation.paced_objects {
-            let (index, result) = completion_receiver
-                .recv()
-                .await
-                .context("benchmark writers exited before the blocked tail was admitted")?;
+            let (index, result, acknowledged) = next_saturation_completion(&mut writers).await?;
             let sequence = result
                 .map_err(|error| anyhow::anyhow!("blocked object {index} failed: {error}"))?;
             validate_saturation_sequence(index, sequence)?;
-            completions.push(activated.elapsed());
-            if let Some((start, finished)) = pending_starts.pop_front() {
-                start_saturation_write(start, finished, store).await?;
+            completions.push(saturation_ack_elapsed(activated, acknowledged));
+            if next_index < paths.len() {
+                let mut active = writer_context.spawn(&mut writers, next_index);
+                wait_for_saturation_admission(&mut active, false).await?;
+                release_saturation_allocation(&mut active).await?;
+                next_index += 1;
             }
         }
+        completions.sort_unstable();
         Result::<Vec<Duration>>::Ok(completions)
     })
     .await
@@ -785,9 +847,10 @@ async fn execute_saturation_benchmark(
         "expected {} accepted objects after pacing, observed {target}",
         objects.len()
     );
-    while let Some(result) = writers.join_next().await {
-        result.context("saturation writer task failed")?;
-    }
+    anyhow::ensure!(
+        writers.is_empty(),
+        "saturation writer tasks remain after all acknowledgements"
+    );
     tokio::time::timeout(Duration::from_secs(60), store.wait_local(target))
         .await
         .context("timed out waiting for the paced tail to become locally durable")??;
@@ -1356,6 +1419,17 @@ mod tests {
     }
 
     #[test]
+    fn saturation_ack_elapsed_uses_the_writer_completion_timestamp() {
+        let activated = std::time::Instant::now();
+        let acknowledged = activated + Duration::from_millis(25);
+
+        assert_eq!(
+            super::saturation_ack_elapsed(activated, acknowledged),
+            Duration::from_millis(25)
+        );
+    }
+
+    #[test]
     fn benchmark_object_names_are_canonical_and_run_scoped() {
         let run_id = Uuid::parse_str("12345678-1234-1234-1234-123456789abc").unwrap();
         let objects = BenchObjectSet::new(&Path::from("zerofs/prod"), run_id, 2).unwrap();
@@ -1470,6 +1544,12 @@ mod tests {
     }
 
     #[test]
+    fn saturation_writer_pool_is_bounded_independently_of_object_count() {
+        assert_eq!(super::saturation_writer_slots(262_144, 8), 8);
+        assert_eq!(super::saturation_writer_slots(4, 8), 4);
+    }
+
+    #[test]
     fn simultaneous_benchmark_and_teardown_failures_are_all_reported() {
         let error = finish_benchmark(
             Err::<(), _>(
@@ -1518,6 +1598,24 @@ mod tests {
 
         assert_eq!(verified, paths.len());
         assert!(!elapsed.is_zero());
+    }
+
+    #[tokio::test]
+    async fn saturation_writer_panics_are_reported_by_the_completion_owner() {
+        let mut writers = tokio::task::JoinSet::new();
+        writers.spawn(async {
+            panic!("injected saturation writer panic");
+            #[allow(unreachable_code)]
+            (0, Ok(1), std::time::Instant::now())
+        });
+
+        let error = super::next_saturation_completion(&mut writers)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("injected saturation writer panic"),
+            "panic cause must be preserved: {error:#}"
+        );
     }
 
     #[tokio::test]
