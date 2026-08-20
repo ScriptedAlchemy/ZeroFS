@@ -540,34 +540,61 @@ impl SftpProtocolSession {
         #[cfg(test)]
         BENCH_OPEN_NANOS.fetch_add(bench_nanos(open_started.elapsed()), Ordering::SeqCst);
         let handle = opened.handle;
-        let operation = async {
-            #[cfg(test)]
-            let write_started = std::time::Instant::now();
-            write_handle_pipelined(sftp, &handle, path, offset, chunks, self.limits).await?;
-            #[cfg(test)]
-            BENCH_WRITE_NANOS.fetch_add(bench_nanos(write_started.elapsed()), Ordering::SeqCst);
+        let packet_size = transfer_request_len(
+            SFTP_WRITE_PACKET_SIZE,
+            self.limits.write_len,
+            self.limits.packet_len,
+            handle.len(),
+        )?;
+        let requests = plan_pipelined_writes(offset, chunks, packet_size)?;
+        #[cfg(test)]
+        let window_started = std::time::Instant::now();
+        let fsync = || async {
             if durable {
-                #[cfg(test)]
-                let fsync_started = std::time::Instant::now();
                 sftp.fsync(handle.as_str())
                     .await
-                    .map_err(|error| map_sftp_error(path, error))?;
-                #[cfg(test)]
-                BENCH_FSYNC_NANOS.fetch_add(bench_nanos(fsync_started.elapsed()), Ordering::SeqCst);
+                    .map(|_| ())
+                    .map_err(|error| map_sftp_error(path, error))
+            } else {
+                Ok(())
             }
-            Ok(())
-        }
-        .await;
-        #[cfg(test)]
-        let close_started = std::time::Instant::now();
-        let close = sftp
-            .close(handle)
-            .await
-            .map_err(|error| map_sftp_close_error(path, error))
-            .map(|_| ());
+        };
+        let close_handle = || async {
+            sftp.close(handle.as_str())
+                .await
+                .map(|_| ())
+                .map_err(|error| map_sftp_close_error(path, error))
+        };
+        let (operation, close) = if requests.len() <= SFTP_WRITE_REQUEST_CONCURRENCY {
+            // The raw session queues every request onto the outbound stream
+            // before its first await, and the server executes one channel's
+            // requests in arrival order. Polling the writes, the fsync, and
+            // the close in that order therefore preserves the durable
+            // write-before-fsync-before-close ordering while all of their
+            // replies are awaited in a single round-trip window.
+            let writes = futures::future::join_all(
+                requests
+                    .into_iter()
+                    .map(|request| send_pipelined_write(sftp, &handle, path, request)),
+            );
+            let (writes, fsync, close) = futures::join!(writes, fsync(), close_handle());
+            let operation = writes
+                .into_iter()
+                .collect::<Result<(), TransportError>>()
+                .and(fsync);
+            (operation, close)
+        } else {
+            // Too many write requests for one burst: the write stream itself
+            // paces sends against replies, so fsync and close only join the
+            // window once every write has been acknowledged.
+            match write_handle_pipelined(sftp, &handle, path, requests).await {
+                Ok(()) => futures::join!(fsync(), close_handle()),
+                Err(error) => (Err(error), close_handle().await),
+            }
+        };
         #[cfg(test)]
         {
-            BENCH_CLOSE_NANOS.fetch_add(bench_nanos(close_started.elapsed()), Ordering::SeqCst);
+            BENCH_WRITE_NANOS.fetch_add(bench_nanos(window_started.elapsed()), Ordering::SeqCst);
             BENCH_PUBLICATIONS.fetch_add(1, Ordering::SeqCst);
             BENCH_SESSION_PUBLICATIONS[self.bench_session_slot].fetch_add(1, Ordering::SeqCst);
             BENCH_SESSION_WRITE_BYTES[self.bench_session_slot]
@@ -587,43 +614,39 @@ pub(crate) static CLIENT_WRITE_IN_FLIGHT: std::sync::atomic::AtomicUsize =
 pub(crate) static CLIENT_WRITE_PEAK: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+async fn send_pipelined_write(
+    sftp: &RawSftpSession,
+    handle: &str,
+    path: &Path,
+    request: PipelinedWrite,
+) -> Result<(), TransportError> {
+    #[cfg(test)]
+    let track_write = CLIENT_WRITE_TRACKING.load(Ordering::SeqCst);
+    #[cfg(test)]
+    if track_write {
+        let current = CLIENT_WRITE_IN_FLIGHT.fetch_add(1, Ordering::SeqCst) + 1;
+        CLIENT_WRITE_PEAK.fetch_max(current, Ordering::SeqCst);
+    }
+    let result = sftp
+        .write(handle, request.offset, request.payload.to_vec())
+        .await
+        .map(|_| ())
+        .map_err(|error| map_sftp_error(path, error));
+    #[cfg(test)]
+    if track_write {
+        CLIENT_WRITE_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+    }
+    result
+}
+
 async fn write_handle_pipelined(
     sftp: &RawSftpSession,
     handle: &str,
     path: &Path,
-    offset: u64,
-    chunks: Vec<Bytes>,
-    limits: SftpLimits,
+    requests: Vec<PipelinedWrite>,
 ) -> Result<(), TransportError> {
-    let packet_size = transfer_request_len(
-        SFTP_WRITE_PACKET_SIZE,
-        limits.write_len,
-        limits.packet_len,
-        handle.len(),
-    )?;
-    let requests = plan_pipelined_writes(offset, chunks, packet_size)?;
     futures::stream::iter(requests)
-        .map(|request| {
-            let handle = handle.to_owned();
-            async move {
-                #[cfg(test)]
-                let track_write = CLIENT_WRITE_TRACKING.load(Ordering::SeqCst);
-                #[cfg(test)]
-                if track_write {
-                    let current = CLIENT_WRITE_IN_FLIGHT.fetch_add(1, Ordering::SeqCst) + 1;
-                    CLIENT_WRITE_PEAK.fetch_max(current, Ordering::SeqCst);
-                }
-                let result = sftp
-                    .write(handle, request.offset, request.payload.to_vec())
-                    .await
-                    .map_err(|error| map_sftp_error(path, error));
-                #[cfg(test)]
-                if track_write {
-                    CLIENT_WRITE_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
-                }
-                result
-            }
-        })
+        .map(|request| send_pipelined_write(sftp, handle, path, request))
         .buffer_unordered(SFTP_WRITE_REQUEST_CONCURRENCY)
         .try_collect::<Vec<_>>()
         .await?;
@@ -1181,5 +1204,146 @@ mod tests {
         assert!(write_len <= 32 * 1024);
         assert!(read_len + handle_len + 64 <= 64 * 1024);
         assert!(write_len + handle_len + 64 <= 64 * 1024);
+    }
+
+    #[tokio::test]
+    async fn durable_write_pipelines_writes_fsync_and_close_into_one_request_window() {
+        use russh_sftp::protocol::{Handle as HandlePacket, Packet, Status, StatusCode, Version};
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn send_packet<W: tokio::io::AsyncWrite + Unpin>(writer: &mut W, packet: Packet) {
+            let bytes = Bytes::try_from(packet).unwrap();
+            writer.write_all(&bytes).await.unwrap();
+            writer.flush().await.unwrap();
+        }
+
+        let (client_stream, server_stream) = tokio::io::duplex(1 << 20);
+        let arrivals: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let server_arrivals = Arc::clone(&arrivals);
+        tokio::spawn(async move {
+            let (mut reader, mut writer) = tokio::io::split(server_stream);
+            let mut withheld: Vec<u32> = Vec::new();
+            loop {
+                let Ok(length) = reader.read_u32().await else {
+                    break;
+                };
+                let mut frame = vec![0_u8; length as usize];
+                if frame.is_empty() || reader.read_exact(&mut frame).await.is_err() {
+                    break;
+                }
+                let mut frame = Bytes::from(frame);
+                let Ok(packet) = Packet::try_from(&mut frame) else {
+                    break;
+                };
+                match packet {
+                    Packet::Init(_) => {
+                        let extensions = HashMap::from([
+                            (FSYNC.to_owned(), "1".to_owned()),
+                            (HARDLINK.to_owned(), "1".to_owned()),
+                            (POSIX_RENAME.to_owned(), "1".to_owned()),
+                        ]);
+                        send_packet(
+                            &mut writer,
+                            Packet::Version(Version {
+                                version: 3,
+                                extensions,
+                            }),
+                        )
+                        .await;
+                    }
+                    Packet::Open(open) => {
+                        send_packet(
+                            &mut writer,
+                            Packet::Handle(HandlePacket {
+                                id: open.id,
+                                handle: "handle-1".to_owned(),
+                            }),
+                        )
+                        .await;
+                    }
+                    Packet::Write(write) => {
+                        server_arrivals
+                            .lock()
+                            .unwrap()
+                            .push(format!("write@{}", write.offset));
+                        withheld.push(write.id);
+                    }
+                    Packet::Extended(extended) => {
+                        server_arrivals
+                            .lock()
+                            .unwrap()
+                            .push(extended.request.clone());
+                        withheld.push(extended.id);
+                    }
+                    Packet::Close(close) => {
+                        // Nothing is acknowledged until the whole durable
+                        // window has arrived: a client that awaits each of
+                        // write, fsync, and close before sending the next
+                        // request can never reach this reply.
+                        server_arrivals.lock().unwrap().push("close".to_owned());
+                        withheld.push(close.id);
+                        for id in withheld.drain(..) {
+                            send_packet(
+                                &mut writer,
+                                Packet::Status(Status {
+                                    id,
+                                    status_code: StatusCode::Ok,
+                                    error_message: "ok".to_owned(),
+                                    language_tag: "en-US".to_owned(),
+                                }),
+                            )
+                            .await;
+                        }
+                    }
+                    _ => break,
+                }
+            }
+        });
+
+        let (read_half, write_half) = tokio::io::split(client_stream);
+        let session = SftpProtocolSession::from_streams(write_half, read_half)
+            .await
+            .unwrap();
+        let chunks = vec![
+            Bytes::from_static(b"first"),
+            Bytes::from_static(b"second"),
+            Bytes::from_static(b"third"),
+        ];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            session.write_file_durable(Path::new("staging-object"), chunks),
+        )
+        .await
+        .expect("a durable write must issue writes, fsync, and close in one request window")
+        .unwrap();
+
+        let arrivals = arrivals.lock().unwrap().clone();
+        let writes = arrivals
+            .iter()
+            .filter(|entry| entry.starts_with("write@"))
+            .count();
+        let last_write = arrivals
+            .iter()
+            .rposition(|entry| entry.starts_with("write@"))
+            .expect("write requests must arrive");
+        let fsync_at = arrivals
+            .iter()
+            .position(|entry| entry == FSYNC)
+            .expect("the fsync request must arrive");
+        let close_at = arrivals
+            .iter()
+            .position(|entry| entry == "close")
+            .expect("the close request must arrive");
+        assert_eq!(writes, 3);
+        assert!(
+            last_write < fsync_at,
+            "fsync must be sent after every write request: {arrivals:?}"
+        );
+        assert!(
+            fsync_at < close_at,
+            "close must be sent after fsync: {arrivals:?}"
+        );
     }
 }
