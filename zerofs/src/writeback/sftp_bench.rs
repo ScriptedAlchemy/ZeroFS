@@ -155,14 +155,14 @@ struct BenchReport {
     remote_read_seconds: f64,
     remote_read_mib_per_second: f64,
     remote_read_verified_objects: usize,
-    sftp_publications: u64,
+    sftp_write_handles_closed: u64,
     sftp_open_total_seconds: f64,
     sftp_write_total_seconds: f64,
     sftp_fsync_total_seconds: f64,
     sftp_close_total_seconds: f64,
     sftp_hardlink_total_seconds: f64,
     sftp_remove_total_seconds: f64,
-    sftp_session_publications: Vec<u64>,
+    sftp_session_write_handles_closed: Vec<u64>,
     sftp_session_write_bytes: Vec<u64>,
     payload_sha256: String,
     manifest_payload_sha256: String,
@@ -182,7 +182,7 @@ struct SaturationReport {
     ssd_reservation_bytes_per_object: u64,
     prefill_objects: usize,
     prefill_reserved_bytes: u64,
-    blocked_objects_before_activation: usize,
+    tail_objects_after_activation: usize,
     prefill_seconds: f64,
     remote_directory_prepare_seconds: f64,
     first_blocked_ack_seconds: f64,
@@ -197,14 +197,14 @@ struct SaturationReport {
     remote_read_seconds: f64,
     remote_read_mib_per_second: f64,
     remote_read_verified_objects: usize,
-    sftp_publications: u64,
+    sftp_write_handles_closed: u64,
     sftp_open_total_seconds: f64,
     sftp_write_total_seconds: f64,
     sftp_fsync_total_seconds: f64,
     sftp_close_total_seconds: f64,
     sftp_hardlink_total_seconds: f64,
     sftp_remove_total_seconds: f64,
-    sftp_session_publications: Vec<u64>,
+    sftp_session_write_handles_closed: Vec<u64>,
     sftp_session_write_bytes: Vec<u64>,
     payload_sha256: String,
 }
@@ -297,6 +297,14 @@ fn mib_per_second(total_bytes: u64, elapsed: Duration) -> f64 {
 
 fn seconds(nanos: u64) -> f64 {
     Duration::from_nanos(nanos).as_secs_f64()
+}
+
+fn max_inter_completion_gap(completions: &[Duration]) -> Duration {
+    completions
+        .windows(2)
+        .map(|pair| pair[1].saturating_sub(pair[0]))
+        .max()
+        .unwrap_or_default()
 }
 
 fn generated_segment_options() -> PutOptions {
@@ -519,14 +527,15 @@ async fn execute_benchmark(
         remote_read_seconds: remote_read.as_secs_f64(),
         remote_read_mib_per_second: mib_per_second(total_bytes, remote_read),
         remote_read_verified_objects,
-        sftp_publications: sftp_timing.publications,
+        sftp_write_handles_closed: sftp_timing.publications,
         sftp_open_total_seconds: seconds(sftp_timing.open_nanos),
         sftp_write_total_seconds: seconds(sftp_timing.write_nanos),
         sftp_fsync_total_seconds: seconds(sftp_timing.fsync_nanos),
         sftp_close_total_seconds: seconds(sftp_timing.close_nanos),
         sftp_hardlink_total_seconds: seconds(sftp_timing.hardlink_nanos),
         sftp_remove_total_seconds: seconds(sftp_timing.remove_nanos),
-        sftp_session_publications: sftp_timing.session_publications[..last_used_session].to_vec(),
+        sftp_session_write_handles_closed: sftp_timing.session_publications[..last_used_session]
+            .to_vec(),
         sftp_session_write_bytes: sftp_timing.session_write_bytes[..last_used_session].to_vec(),
         payload_sha256,
         manifest_payload_sha256,
@@ -652,30 +661,25 @@ async fn execute_saturation_benchmark(
     })
     .await
     .context("blocked foreground writes did not progress after remote activation")??;
-    while let Some(result) = writers.join_next().await {
-        result.context("saturation writer task failed")?;
-    }
-    let target = store.status()?.accepted_seq;
+    let after_blocked_acks = store.status()?;
+    let target = after_blocked_acks.accepted_seq;
     anyhow::ensure!(
         target == u64::try_from(objects.len())?,
         "expected {} accepted objects after pacing, observed {target}",
         objects.len()
     );
+    while let Some(result) = writers.join_next().await {
+        result.context("saturation writer task failed")?;
+    }
     tokio::time::timeout(Duration::from_secs(60), store.wait_local(target))
         .await
         .context("timed out waiting for the paced tail to become locally durable")??;
-    let after_blocked_acks = store.status()?;
     let blocked_ack = blocked_ack_times
         .last()
         .copied()
         .context("saturation benchmark did not record blocked acknowledgements")?;
     let first_blocked_ack = blocked_ack_times[0];
-    let mut previous = Duration::ZERO;
-    let mut max_blocked_ack_gap = Duration::ZERO;
-    for completion in blocked_ack_times {
-        max_blocked_ack_gap = max_blocked_ack_gap.max(completion.saturating_sub(previous));
-        previous = completion;
-    }
+    let max_blocked_ack_gap = max_inter_completion_gap(&blocked_ack_times);
     let remote_cleanup_bytes = after_blocked_acks
         .remote_bytes_completed
         .saturating_sub(before.remote_bytes_completed);
@@ -731,7 +735,7 @@ async fn execute_saturation_benchmark(
         ssd_reservation_bytes_per_object: saturation.reservation_bytes,
         prefill_objects: saturation.prefill_objects,
         prefill_reserved_bytes: saturation.prefill_reserved_bytes,
-        blocked_objects_before_activation: saturation.paced_objects,
+        tail_objects_after_activation: saturation.paced_objects,
         prefill_seconds: prefill.as_secs_f64(),
         remote_directory_prepare_seconds: geometry.remote_directory_prepare.as_secs_f64(),
         first_blocked_ack_seconds: first_blocked_ack.as_secs_f64(),
@@ -746,14 +750,15 @@ async fn execute_saturation_benchmark(
         remote_read_seconds: remote_read.as_secs_f64(),
         remote_read_mib_per_second: mib_per_second(total_bytes, remote_read),
         remote_read_verified_objects,
-        sftp_publications: sftp_timing.publications,
+        sftp_write_handles_closed: sftp_timing.publications,
         sftp_open_total_seconds: seconds(sftp_timing.open_nanos),
         sftp_write_total_seconds: seconds(sftp_timing.write_nanos),
         sftp_fsync_total_seconds: seconds(sftp_timing.fsync_nanos),
         sftp_close_total_seconds: seconds(sftp_timing.close_nanos),
         sftp_hardlink_total_seconds: seconds(sftp_timing.hardlink_nanos),
         sftp_remove_total_seconds: seconds(sftp_timing.remove_nanos),
-        sftp_session_publications: sftp_timing.session_publications[..last_used_session].to_vec(),
+        sftp_session_write_handles_closed: sftp_timing.session_publications[..last_used_session]
+            .to_vec(),
         sftp_session_write_bytes: sftp_timing.session_write_bytes[..last_used_session].to_vec(),
         payload_sha256,
     })
@@ -1185,7 +1190,7 @@ mod tests {
     use super::{
         BenchObjectClass, BenchObjectSet, GeneratedSegmentCreate, SaturationGeometry,
         benchmark_put_options, build_remote_store, finish_benchmark, generated_segment_options,
-        read_and_verify_remote,
+        max_inter_completion_gap, read_and_verify_remote,
     };
     use crate::config::Settings;
     use bytes::Bytes;
@@ -1193,7 +1198,20 @@ mod tests {
     use object_store::path::Path;
     use object_store::{ObjectStore, ObjectStoreExt};
     use std::sync::Arc;
+    use std::time::Duration;
     use uuid::Uuid;
+
+    #[test]
+    fn inter_completion_gap_excludes_initial_ack_latency() {
+        assert_eq!(
+            max_inter_completion_gap(&[
+                Duration::from_millis(900),
+                Duration::from_millis(950),
+                Duration::from_millis(1_075),
+            ]),
+            Duration::from_millis(125)
+        );
+    }
 
     #[test]
     fn benchmark_object_names_are_canonical_and_run_scoped() {
