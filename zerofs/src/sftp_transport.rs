@@ -589,6 +589,7 @@ struct PoolInner {
     admission: FairAdmission,
     roster: StdMutex<Vec<Arc<SharedSession>>>,
     roster_changed: Notify,
+    idle_warm_floor: AtomicUsize,
     directories: DirectoryCache,
     writable: bool,
     closed: AtomicBool,
@@ -892,7 +893,7 @@ impl PoolInner {
             let mut expired = Vec::new();
             let mut retained = roster.len();
             roster.retain(|session| {
-                let expirable = retained > SFTP_IDLE_WARM_FLOOR
+                let expirable = retained > self.idle_warm_floor.load(Ordering::SeqCst)
                     && session.active_ops.load(Ordering::SeqCst) == 0
                     && now.saturating_duration_since(*session.idle_since.lock().unwrap())
                         >= SFTP_IDLE_TIMEOUT;
@@ -1015,13 +1016,25 @@ impl SftpSessionPool {
         factory: Arc<dyn SessionFactory>,
         config: &crate::config::SftpConfig,
     ) -> Result<Self, TransportError> {
-        Self::new_writable(
+        let pool = Self::new_writable(
             factory,
             config.max_connections,
             config.read_concurrency,
             config.write_concurrency,
         )
-        .await
+        .await?;
+        pool.inner
+            .idle_warm_floor
+            .store(config.max_connections, Ordering::SeqCst);
+        if let Err(error) = pool.warm_to(config.max_connections).await {
+            return match pool.shutdown().await {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(TransportError::Close(format!(
+                    "SFTP pool warmup failed: {error}; cleanup also failed: {cleanup}"
+                ))),
+            };
+        }
+        Ok(pool)
     }
 
     pub async fn new_writable(
@@ -1044,6 +1057,7 @@ impl SftpSessionPool {
                 ),
                 roster: StdMutex::new(Vec::new()),
                 roster_changed: Notify::new(),
+                idle_warm_floor: AtomicUsize::new(SFTP_IDLE_WARM_FLOOR),
                 directories: DirectoryCache::default(),
                 writable: true,
                 closed: AtomicBool::new(false),
@@ -1067,6 +1081,22 @@ impl SftpSessionPool {
         pool.inner.roster.lock().unwrap().push(session);
         pool.start_idle_reaper();
         Ok(pool)
+    }
+
+    async fn warm_to(&self, target: usize) -> Result<(), TransportError> {
+        while self.inner.roster.lock().unwrap().len() < target {
+            let permit = self
+                .inner
+                .shared
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| TransportError::PoolClosed)?;
+            let session = self.open_with_permit(permit).await?;
+            self.inner.roster.lock().unwrap().push(session);
+            self.inner.roster_changed.notify_waiters();
+        }
+        Ok(())
     }
 
     fn start_idle_reaper(&self) {
@@ -3270,7 +3300,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn writable_config_warms_the_full_connection_budget_before_returning() {
         let factory = RecordingFactory::fully_capable();
         let config = crate::config::SftpConfig {
@@ -3291,6 +3321,9 @@ mod tests {
         assert_eq!(factory.dials(), 4);
         assert_eq!(factory.live(), 4);
         assert_eq!(pool.inner.roster.lock().unwrap().len(), 4);
+        tokio::time::advance(SFTP_IDLE_TIMEOUT + SFTP_IDLE_REAP_INTERVAL).await;
+        tokio::task::yield_now().await;
+        assert_eq!(factory.live(), 4, "configured warm sessions remain ready");
         pool.shutdown().await.unwrap();
         assert_eq!(factory.live(), 0);
     }
