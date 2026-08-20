@@ -961,11 +961,15 @@ async fn coalesce_local_batch(
     upload_concurrency: usize,
     completed: &BTreeMap<Sequence, CompletedRemote>,
     drain_known_backlog: bool,
-    _paced_admission: bool,
+    paced_admission: bool,
     stop: &mut watch::Receiver<bool>,
 ) -> anyhow::Result<Option<SchedulerWindow>> {
     let mut window = load_scheduler_window(journal, next, upload_concurrency)?;
-    if drain_known_backlog {
+    // Paced SSD admission can only release work in small credit-backed waves.
+    // Waiting for a full upload batch here adds the idle coalescing deadline
+    // to every wave even though no larger local burst can arrive until this
+    // remote work frees more credit.
+    if drain_known_backlog || paced_admission {
         return Ok(Some(window));
     }
     let mut observed_local = window.local_seq;
