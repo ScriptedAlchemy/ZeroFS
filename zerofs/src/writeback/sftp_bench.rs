@@ -6,7 +6,7 @@ use crate::sftp_transport::{
 };
 use crate::writeback::config::{AckMode, ShutdownFlush, WritebackAccessMode, WritebackSettings};
 use crate::writeback::journal::Journal;
-use crate::writeback::model::JournalIdentity;
+use crate::writeback::model::{JournalIdentity, MutationRecord};
 use crate::writeback::store::WritebackObjectStore;
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -136,6 +136,65 @@ struct BenchGeometry {
     upload_concurrency: usize,
     local_concurrency: usize,
     remote_directory_prepare: Duration,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SaturationGeometry {
+    reservation_bytes: u64,
+    high_watermark_bytes: u64,
+    prefill_reserved_bytes: u64,
+    prefill_objects: usize,
+    paced_objects: usize,
+}
+
+impl SaturationGeometry {
+    fn reservation_bytes(path: &ObjectPath, payload_bytes: usize) -> Result<u64> {
+        MutationRecord::ssd_reservation_estimate(path.as_ref(), None, u64::try_from(payload_bytes)?)
+            .context("estimate benchmark SSD reservation")
+    }
+
+    fn new(
+        objects: &[ObjectPath],
+        payload_bytes: usize,
+        disk_bytes: u64,
+        high_watermark_percent: u8,
+    ) -> Result<Self> {
+        anyhow::ensure!(!objects.is_empty(), "saturation benchmark needs objects");
+        anyhow::ensure!(payload_bytes > 0, "saturation payload must be positive");
+        anyhow::ensure!(
+            (1..=100).contains(&high_watermark_percent),
+            "saturation high watermark must be between 1 and 100"
+        );
+        let reservation_bytes = Self::reservation_bytes(&objects[0], payload_bytes)?;
+        for path in &objects[1..] {
+            anyhow::ensure!(
+                Self::reservation_bytes(path, payload_bytes)? == reservation_bytes,
+                "saturation benchmark object paths must reserve equally"
+            );
+        }
+        let high_watermark_bytes =
+            u64::try_from(u128::from(disk_bytes) * u128::from(high_watermark_percent) / 100)?;
+        let prefill_objects = usize::try_from(high_watermark_bytes / reservation_bytes)?;
+        anyhow::ensure!(
+            prefill_objects > 0,
+            "saturation SSD budget cannot admit one payload"
+        );
+        anyhow::ensure!(
+            prefill_objects < objects.len(),
+            "saturation workload must exceed the SSD high watermark"
+        );
+        let prefill_reserved_bytes = reservation_bytes
+            .checked_mul(u64::try_from(prefill_objects)?)
+            .context("saturation prefill reservation overflowed")?;
+
+        Ok(Self {
+            reservation_bytes,
+            high_watermark_bytes,
+            prefill_reserved_bytes,
+            prefill_objects,
+            paced_objects: objects.len() - prefill_objects,
+        })
+    }
 }
 
 fn bench_env<T>(name: &str, default: T) -> Result<T>
