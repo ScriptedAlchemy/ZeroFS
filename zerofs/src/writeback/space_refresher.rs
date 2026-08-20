@@ -32,6 +32,8 @@ impl SpaceRefresher {
         })
     }
 
+    // Landed-but-not-wired alias for `shutdown`.
+    #[allow(dead_code)]
     pub(crate) async fn stop(&self) {
         self.shutdown().await;
     }

@@ -59,6 +59,9 @@ pub(crate) async fn run_upload(
     let worker_count = jobs.min(plan.files.len().max(1));
     let clients =
         connect_workers(target, client, worker_count * UPLOAD_CONNECTIONS_PER_WORKER).await?;
+    // `as_chunks` would yield `&[_; N]` chunks and force reworking
+    // `UploadWorker::new`'s `&[Arc<Client>]` signature for no benefit here.
+    #[allow(clippy::chunks_exact_to_as_chunks)]
     let workers = clients
         .chunks_exact(UPLOAD_CONNECTIONS_PER_WORKER)
         .map(UploadWorker::new)

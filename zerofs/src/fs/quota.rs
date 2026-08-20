@@ -6,6 +6,10 @@
 //! ownership without add/subtract. Shrink subtracts only after a successful
 //! canonical commit.
 
+// Landed-but-not-wired quota API; production call sites arrive with the
+// mutation wiring.
+#![allow(dead_code)]
+
 use crate::fs::errors::FsError;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};

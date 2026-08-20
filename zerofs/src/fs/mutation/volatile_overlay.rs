@@ -6,6 +6,9 @@
 //! the captured sequence before entering the existing filesystem durability
 //! barrier.
 
+// WIP mutation submodule: parts of this API are landed but not yet wired.
+#![allow(dead_code)]
+
 use crate::fs::errors::FsError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

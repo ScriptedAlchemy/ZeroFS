@@ -92,6 +92,8 @@ impl SsdReservationToken {
         self.request
     }
 
+    // Landed-but-not-wired accessor.
+    #[allow(dead_code)]
     pub(crate) fn state(&self) -> ReservationState {
         self.state
     }
@@ -180,6 +182,9 @@ impl Drop for WaitRegistration {
         self.inner.grant_waiters();
     }
 }
+// Landed-but-not-wired: several SSD-admission entry points are consumed only
+// once tiered admission wiring lands.
+#[allow(dead_code)]
 impl SsdAdmission {
     pub(crate) fn new(
         capacity_bytes: u64,
@@ -873,13 +878,16 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// Durable local ownership after a reservation has been committed to the journal.
+// Landed-but-not-wired: read once tiered admission wiring lands.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub(crate) struct CommittedSsdReservation {
     request: SsdReservationRequest,
     physical_bytes: u64,
     sample: PhysicalSpaceSample,
 }
 
+#[allow(dead_code)]
 impl CommittedSsdReservation {
     pub(crate) fn request(&self) -> SsdReservationRequest {
         self.request
@@ -1005,6 +1013,7 @@ pub(crate) fn commit_batch_local(
     Ok(committed)
 }
 
+#[allow(dead_code)]
 impl CommittedSsdReservation {
     pub(crate) fn commit_local(
         self,

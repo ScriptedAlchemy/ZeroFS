@@ -5,6 +5,9 @@
 //! before any raw admission call. A vacant lookup already owns exactly one
 //! operation slot; [`RequestVacancy::begin_pending`] moves that same slot.
 
+// WIP mutation submodule: parts of this API are landed but not yet wired.
+#![allow(dead_code)]
+
 use crate::fs::errors::FsError;
 use crate::fs::mutation::types::{
     PreparedBatchResult, RequestFingerprint, RequestIdentity, RequestLifetime,
@@ -531,11 +534,10 @@ impl RequestCacheInner {
             slot: Some(mut owned),
             ..
         }) = state.entries.remove(identity)
+            && owned.active
         {
-            if owned.active {
-                state.used_slots = state.used_slots.saturating_sub(1);
-                owned.disarm();
-            }
+            state.used_slots = state.used_slots.saturating_sub(1);
+            owned.disarm();
         }
         true
     }

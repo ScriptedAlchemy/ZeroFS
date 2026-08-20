@@ -766,6 +766,7 @@ fn budget_cost(length: u32) -> u32 {
 /// carries its payload and its admission guard, an oversized or malformed
 /// request has already had its body discarded. Running one therefore needs only
 /// the handler, which is what lets it overlap with the next request's arrival.
+#[allow(clippy::large_enum_variant)]
 enum AdmittedCommand {
     Read {
         offset: u64,

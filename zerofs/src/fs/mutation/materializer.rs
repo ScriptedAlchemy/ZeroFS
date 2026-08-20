@@ -35,6 +35,7 @@ pub(crate) type ApplyHook = Arc<
         + Sync,
 >;
 
+#[allow(clippy::large_enum_variant)]
 enum LaneJob {
     Apply {
         cutoff: MutationCutoff,

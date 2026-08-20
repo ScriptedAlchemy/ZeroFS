@@ -1,5 +1,8 @@
 //! Raw mutation admission and preparation quiescence.
 
+// WIP mutation submodule: parts of this API are landed but not yet wired.
+#![allow(dead_code)]
+
 use crate::fs::errors::FsError;
 use crate::fs::mutation::request_cache::{AcceptedRequest, PendingRequest};
 use crate::fs::mutation::types::{

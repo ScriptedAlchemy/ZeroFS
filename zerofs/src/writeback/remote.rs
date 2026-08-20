@@ -166,6 +166,7 @@ impl std::fmt::Debug for RemoteScheduler {
 }
 
 impl RemoteScheduler {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn start(
         remote: Arc<dyn ObjectStore>,
         journal: Arc<Journal>,
@@ -187,6 +188,7 @@ impl RemoteScheduler {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn start_paused(
         remote: Arc<dyn ObjectStore>,
         journal: Arc<Journal>,

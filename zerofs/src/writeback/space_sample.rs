@@ -32,6 +32,8 @@ pub(crate) enum SpaceSampleError {
         #[source]
         source: io::Error,
     },
+    // Landed-but-not-wired: constructed once stale-sample rejection is wired.
+    #[allow(dead_code)]
     #[error("writeback space sample generation {sample} is stale; latest is {latest}")]
     Stale { sample: u64, latest: u64 },
 }
@@ -46,6 +48,8 @@ impl PhysicalSpaceSampler {
         }
     }
 
+    // Landed-but-not-wired accessor.
+    #[allow(dead_code)]
     pub(crate) fn writeback_dir(&self) -> &Path {
         &self.writeback_dir
     }
@@ -92,6 +96,8 @@ impl PhysicalSpaceSampler {
         })
     }
 
+    // Landed-but-not-wired: called once stale-sample rejection is wired.
+    #[allow(dead_code)]
     pub(crate) fn reject_stale(
         &self,
         sample: PhysicalSpaceSample,

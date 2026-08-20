@@ -5,6 +5,9 @@
 //! Application consumes those exact attributes and payloads; it does not
 //! re-decide timestamps, set-id bits, or post-write size.
 
+// WIP mutation submodule: parts of this API are landed but not yet wired.
+#![allow(dead_code)]
+
 use crate::dedup::OpId;
 use crate::fs::inode::{Inode, InodeId};
 use crate::fs::lock_manager::MultiLockGuard;

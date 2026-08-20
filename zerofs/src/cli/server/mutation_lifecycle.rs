@@ -112,6 +112,9 @@ impl DispatchedCalls {
         Arc::new(Self::default())
     }
 
+    // Landed-but-not-wired admission API; production call sites arrive with
+    // the mutation lifecycle wiring.
+    #[allow(dead_code)]
     pub(crate) fn begin(&self) -> Result<DispatchedGuard<'_>, ShutdownError> {
         let mut state = self.inner.lock().expect("dispatched calls");
         if state.closed {
@@ -124,6 +127,7 @@ impl DispatchedCalls {
         Ok(DispatchedGuard { calls: self })
     }
 
+    #[allow(dead_code)]
     fn finish(&self) {
         {
             let mut state = self.inner.lock().expect("dispatched calls");
@@ -148,6 +152,7 @@ impl DispatchedCalls {
     }
 }
 
+#[allow(dead_code)]
 pub(crate) struct DispatchedGuard<'a> {
     calls: &'a DispatchedCalls,
 }
@@ -538,6 +543,7 @@ async fn wait_object_target(
     }
 }
 
+#[cfg(test)]
 fn record_step(order: &Arc<Mutex<Vec<&'static str>>>, name: &'static str) -> Step {
     let order = Arc::clone(order);
     Arc::new(move || {
@@ -549,6 +555,7 @@ fn record_step(order: &Arc<Mutex<Vec<&'static str>>>, name: &'static str) -> Ste
     })
 }
 
+#[cfg(test)]
 fn blocked_step(
     order: &Arc<Mutex<Vec<&'static str>>>,
     name: &'static str,
