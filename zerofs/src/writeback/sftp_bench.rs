@@ -1,4 +1,5 @@
 use crate::config::{Settings, SftpSshTransport};
+use crate::segment_store::GeneratedSegmentCreate;
 use crate::sftp_object_store::SftpObjectStore;
 use crate::sftp_transport::{
     OperationKind, RusshSessionFactory, SessionFactory, SftpSessionPool, TransportError,
@@ -136,6 +137,12 @@ fn mib_per_second(total_bytes: u64, elapsed: Duration) -> f64 {
     total_bytes as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64()
 }
 
+fn generated_segment_options() -> PutOptions {
+    let mut options = PutOptions::from(PutMode::Create);
+    options.extensions.insert(GeneratedSegmentCreate);
+    options
+}
+
 fn apply_transport_path_overrides(settings: &mut Settings) -> Result<()> {
     let Some(config) = settings.sftp.as_mut() else {
         anyhow::bail!("benchmark config must include [sftp]");
@@ -192,7 +199,7 @@ async fn execute_benchmark(
                     .put_opts(
                         &paths[index],
                         payload.clone().into(),
-                        PutOptions::from(PutMode::Create),
+                        generated_segment_options(),
                     )
                     .await?;
                 index += writers;
@@ -395,7 +402,7 @@ async fn bench_sftp_writeback_remote_drain() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::BenchObjectSet;
+    use super::{BenchObjectSet, GeneratedSegmentCreate, generated_segment_options};
     use object_store::path::Path;
     use uuid::Uuid;
 
@@ -424,6 +431,16 @@ mod tests {
                 .unwrap()
                 .to_string_lossy(),
             prefix
+        );
+    }
+
+    #[test]
+    fn benchmark_uses_the_shipping_generated_segment_contract() {
+        assert!(
+            generated_segment_options()
+                .extensions
+                .get::<GeneratedSegmentCreate>()
+                .is_some()
         );
     }
 }
