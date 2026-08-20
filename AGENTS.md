@@ -32,6 +32,25 @@ cargo test --locked -p zerofs --lib \
 
 Optional normal-profile sizing knobs are `ZEROFS_BENCH_SFTP_TOTAL_MIB` (default 256), `ZEROFS_BENCH_SFTP_PAYLOAD_KIB` (default 1024), `ZEROFS_BENCH_SFTP_WRITERS` (default 16; also the remote reader count), and `ZEROFS_BENCH_SFTP_MAX_CONNECTIONS` (defaults to the supplied config). The output line begins with `SFTP_WRITEBACK_BENCH` and contains JSON for RAM acknowledgement, SSD durability, remote write drain, and timed verified remote reads. Capture the exact Git SHA, command, output, and cleanup result with any reported rate. When production remains connected, keep its pool plus the benchmark pool within the Storage Box account limit; an eight-connection production pool leaves at most two slots for this benchmark.
 
+To reproduce the full-journal fallback path without changing production, run the separate saturation case with an intentionally small synthetic SSD budget. It proves the tail is blocked before remote activation, reports each remote-cleanup-paced foreground interval, verifies every remote object, and uses the same mandatory teardown gate:
+
+```bash
+ZEROFS_SFTP_WRITEBACK_BENCH_CONFIG=/secure/zerofs-prod.toml \
+ZEROFS_BENCH_DIR=/var/tmp \
+ZEROFS_BENCH_SFTP_IDENTITY_FILE=/secure/storage-key \
+ZEROFS_BENCH_SFTP_KNOWN_HOSTS=/secure/known_hosts \
+ZEROFS_BENCH_SFTP_TOTAL_MIB=128 \
+ZEROFS_BENCH_SFTP_PAYLOAD_KIB=8192 \
+ZEROFS_BENCH_SFTP_WRITERS=8 \
+ZEROFS_BENCH_SFTP_MAX_CONNECTIONS=2 \
+ZEROFS_BENCH_SFTP_SSD_MIB=32 \
+cargo test --locked -p zerofs --lib \
+  writeback::sftp_bench::bench_sftp_writeback_full_ssd_pacing \
+  -- --exact --ignored --nocapture
+```
+
+Its output begins with `SFTP_WRITEBACK_SATURATION_BENCH`. Treat `blocked_ack_mib_per_second`, `remote_cleanup_mib_per_second`, their ratio, and `max_blocked_ack_gap_seconds` as the full-SSD pacing evidence. This workload uses generated immutable segments; it does not model a metadata-heavy ordered frontier, so do not use it alone to explain a deployed manifest/fence backlog.
+
 ZeroFS uses the in-process native Rust `russh` transport. Production configs and benchmark commands must not depend on an external OpenSSH or HPN executable.
 
 ## Direct RAM/SSD read/write benchmark
