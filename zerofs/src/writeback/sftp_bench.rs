@@ -308,6 +308,20 @@ async fn cleanup_remote_run(
     Ok(())
 }
 
+async fn close_pool_after_setup_error(
+    remote: Arc<dyn ObjectStore>,
+    pool: SftpSessionPool,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    drop(remote);
+    match pool.shutdown().await {
+        Ok(()) => error,
+        Err(cleanup_error) => anyhow::anyhow!(
+            "{error:#}; SFTP pool shutdown after setup failure also failed: {cleanup_error}"
+        ),
+    }
+}
+
 /// Directly measures the shipping SFTP object store behind the shipping
 /// writeback scheduler. This is a normal dev-profile ignored test: it does not
 /// build, install, stop, or start ZeroFS. The caller must provide a validated
@@ -347,39 +361,56 @@ async fn bench_sftp_writeback_remote_drain() -> Result<()> {
         .context("benchmark payload size overflowed")?;
 
     let (remote, base, pool) = build_remote_store(&settings).await?;
-    let objects = BenchObjectSet::new(&base, Uuid::new_v4(), object_count)?;
-
-    let scratch = match std::env::var_os(BENCH_DIR_ENV) {
-        Some(directory) => tempfile::tempdir_in(PathBuf::from(directory))?,
-        None => tempfile::tempdir()?,
+    let setup = (|| -> Result<_> {
+        let objects = BenchObjectSet::new(&base, Uuid::new_v4(), object_count)?;
+        let scratch = match std::env::var_os(BENCH_DIR_ENV) {
+            Some(directory) => tempfile::tempdir_in(PathBuf::from(directory))?,
+            None => tempfile::tempdir()?,
+        };
+        let journal_dir = scratch.path().join("writeback");
+        let journal = Arc::new(Journal::open(
+            &journal_dir,
+            JournalIdentity {
+                format_version: 1,
+                bucket_id: format!("sftp-writeback-bench-{}", Uuid::new_v4().simple()),
+                backend_endpoint: "sftp://benchmark-target".to_owned(),
+                database_prefix: objects.database_prefix.to_string(),
+                backend_kind: "sftp".to_owned(),
+                encryption_key_identity_sha256: [0x42; 32],
+            },
+        )?);
+        let bench_settings = WritebackSettings {
+            dir: journal_dir,
+            ack_mode: AckMode::Memory,
+            memory_bytes: total_bytes.saturating_add(64 << 20),
+            disk_bytes: total_bytes.saturating_mul(2).saturating_add(256 << 20),
+            min_free_bytes: 1,
+            high_watermark_percent: 95,
+            resume_percent: 85,
+            upload_concurrency: production_writeback.upload_concurrency,
+            local_concurrency: production_writeback.local_concurrency,
+            shutdown_flush: ShutdownFlush::Local,
+        };
+        Ok((objects, scratch, journal, bench_settings))
+    })();
+    let (objects, scratch, journal, bench_settings) = match setup {
+        Ok(setup) => setup,
+        Err(error) => {
+            return Err(close_pool_after_setup_error(remote, pool, error).await);
+        }
     };
-    let journal_dir = scratch.path().join("writeback");
-    let journal = Arc::new(Journal::open(
-        &journal_dir,
-        JournalIdentity {
-            format_version: 1,
-            bucket_id: format!("sftp-writeback-bench-{}", Uuid::new_v4().simple()),
-            backend_endpoint: "sftp://benchmark-target".to_owned(),
-            database_prefix: objects.database_prefix.to_string(),
-            backend_kind: "sftp".to_owned(),
-            encryption_key_identity_sha256: [0x42; 32],
-        },
-    )?);
-    let bench_settings = WritebackSettings {
-        dir: journal_dir,
-        ack_mode: AckMode::Memory,
-        memory_bytes: total_bytes.saturating_add(64 << 20),
-        disk_bytes: total_bytes.saturating_mul(2).saturating_add(256 << 20),
-        min_free_bytes: 1,
-        high_watermark_percent: 95,
-        resume_percent: 85,
-        upload_concurrency: production_writeback.upload_concurrency,
-        local_concurrency: production_writeback.local_concurrency,
-        shutdown_flush: ShutdownFlush::Local,
+    let store = match WritebackObjectStore::open_paused(
+        Arc::clone(&remote),
+        journal,
+        bench_settings.clone(),
+    )
+    .await
+    {
+        Ok(store) => store,
+        Err(error) => {
+            return Err(close_pool_after_setup_error(remote, pool, error).await);
+        }
     };
-    let store =
-        WritebackObjectStore::open_paused(Arc::clone(&remote), journal, bench_settings.clone())
-            .await?;
 
     let mut payload = vec![0_u8; payload_bytes];
     StdRng::seed_from_u64(0x5f54_4653_4245_4e43).fill_bytes(&mut payload);
@@ -417,6 +448,13 @@ async fn bench_sftp_writeback_remote_drain() -> Result<()> {
     shutdown.context("writeback shutdown failed")?;
     cleanup.context("remote benchmark cleanup failed")?;
     pool_shutdown.context("SFTP pool shutdown failed")?;
+    let scratch_path = scratch.path().to_path_buf();
+    scratch.close().context("remove local benchmark journal")?;
+    anyhow::ensure!(
+        !scratch_path.exists(),
+        "local benchmark journal still exists at {}",
+        scratch_path.display()
+    );
     println!("SFTP_WRITEBACK_BENCH {}", serde_json::to_string(&report)?);
     Ok(())
 }
