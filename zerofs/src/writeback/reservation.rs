@@ -44,6 +44,7 @@ pub(crate) struct SsdAdmissionSnapshot {
     pub(crate) credit_bytes: u64,
     pub(crate) credit_ops: u64,
 }
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum ReservationError {
     #[error("writeback SSD admission is closed")]
@@ -288,6 +289,16 @@ impl SsdAdmission {
         request: SsdReservationRequest,
         sample: PhysicalSpaceSample,
     ) -> Result<SsdReservationToken, ReservationError> {
+        self.reserve_with_queue_observer(request, sample, || {})
+            .await
+    }
+
+    pub(crate) async fn reserve_with_queue_observer(
+        &self,
+        request: SsdReservationRequest,
+        sample: PhysicalSpaceSample,
+        on_queued: impl FnOnce(),
+    ) -> Result<SsdReservationToken, ReservationError> {
         if request.ssd_reservation_bytes > self.inner.capacity_bytes {
             return Err(ReservationError::TooLarge {
                 requested: request.ssd_reservation_bytes,
@@ -348,6 +359,7 @@ impl SsdAdmission {
             );
             (id, receiver, physical_wait)
         };
+        on_queued();
         if physical_wait {
             self.inner.physical_waiters.notify_waiters();
         }
@@ -514,11 +526,6 @@ impl SsdAdmission {
 
     pub(crate) fn used_operations(&self) -> u64 {
         lock(&self.inner.state).used_operations
-    }
-
-    #[cfg(test)]
-    pub(crate) fn waiter_count(&self) -> usize {
-        lock(&self.inner.state).waiters.len()
     }
 
     pub(crate) fn outstanding_physical_claims(&self) -> u64 {
