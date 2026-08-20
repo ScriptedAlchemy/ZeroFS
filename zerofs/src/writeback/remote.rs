@@ -1298,10 +1298,16 @@ async fn stream_record_to_remote(
     cleanup_sender: RemoteCleanupSender,
     cleanup_state: Arc<RemoteCleanupState>,
 ) -> object_store::Result<PutResult> {
-    if let Some(existing) =
-        reconcile_precondition(remote.as_ref(), &journal, record, target, mode).await?
-    {
-        return Ok(existing);
+    let small_atomic_create = matches!(mode, PutMode::Create)
+        && record
+            .payload()
+            .is_some_and(|(payload_len, _)| payload_len <= REMOTE_SINGLE_PUT_BYTES);
+    if !small_atomic_create {
+        if let Some(existing) =
+            reconcile_precondition(remote.as_ref(), &journal, record, target, mode).await?
+        {
+            return Ok(existing);
+        }
     }
 
     let sequence = record.sequence;
@@ -1332,6 +1338,9 @@ async fn stream_record_to_remote(
         .await;
         return match result {
             Ok(result) => Ok(result),
+            // Small Create is atomic at the backend. Avoiding a speculative
+            // HEAD saves one network round trip for every new immutable
+            // object; a collision still takes the exact-content verifier.
             Err(object_store::Error::AlreadyExists { .. }) if matches!(mode, PutMode::Create) => {
                 verify_existing(remote.as_ref(), &journal, record, target).await
             }
