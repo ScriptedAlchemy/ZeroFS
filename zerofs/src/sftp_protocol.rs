@@ -578,6 +578,9 @@ impl SftpProtocolSession {
 }
 
 #[cfg(test)]
+pub(crate) static CLIENT_WRITE_TRACKING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
 pub(crate) static CLIENT_WRITE_IN_FLIGHT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 #[cfg(test)]
@@ -604,7 +607,9 @@ async fn write_handle_pipelined(
             let handle = handle.to_owned();
             async move {
                 #[cfg(test)]
-                {
+                let track_write = CLIENT_WRITE_TRACKING.load(Ordering::SeqCst);
+                #[cfg(test)]
+                if track_write {
                     let current = CLIENT_WRITE_IN_FLIGHT.fetch_add(1, Ordering::SeqCst) + 1;
                     CLIENT_WRITE_PEAK.fetch_max(current, Ordering::SeqCst);
                 }
@@ -613,7 +618,7 @@ async fn write_handle_pipelined(
                     .await
                     .map_err(|error| map_sftp_error(path, error));
                 #[cfg(test)]
-                {
+                if track_write {
                     CLIENT_WRITE_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
                 }
                 result

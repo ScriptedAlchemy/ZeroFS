@@ -437,8 +437,8 @@ pub type OpenSshTransportSession = SftpProtocolSession;
 mod tests {
     use super::*;
     use crate::sftp_protocol::{
-        CLIENT_WRITE_IN_FLIGHT, CLIENT_WRITE_PEAK, FSYNC, HARDLINK, POSIX_RENAME,
-        SFTP_READ_PACKET_SIZE, SFTP_WRITE_PACKET_SIZE,
+        CLIENT_WRITE_IN_FLIGHT, CLIENT_WRITE_PEAK, CLIENT_WRITE_TRACKING, FSYNC, HARDLINK,
+        POSIX_RENAME, SFTP_READ_PACKET_SIZE, SFTP_WRITE_PACKET_SIZE,
     };
     use bytes::Bytes;
     use russh_sftp::protocol::{FileAttributes, OpenFlags, StatusCode};
@@ -803,13 +803,16 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
 
         let packets = 32;
         let payload = Bytes::from(vec![0x5a; packets * SFTP_WRITE_PACKET_SIZE]);
+        CLIENT_WRITE_TRACKING.store(false, Ordering::SeqCst);
         CLIENT_WRITE_IN_FLIGHT.store(0, Ordering::SeqCst);
         CLIENT_WRITE_PEAK.store(0, Ordering::SeqCst);
+        CLIENT_WRITE_TRACKING.store(true, Ordering::SeqCst);
         let started = std::time::Instant::now();
         session
             .write_file_durable(std::path::Path::new("bulk.bin"), vec![payload.clone()])
             .await
             .unwrap();
+        CLIENT_WRITE_TRACKING.store(false, Ordering::SeqCst);
         assert_eq!(
             env.exec_requests.load(Ordering::SeqCst),
             0,
