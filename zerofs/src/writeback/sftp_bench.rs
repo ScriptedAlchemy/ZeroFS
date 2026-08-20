@@ -131,6 +131,15 @@ struct BenchReport {
     payload_sha256: String,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct BenchGeometry {
+    writers: usize,
+    max_connections: usize,
+    upload_concurrency: usize,
+    local_concurrency: usize,
+    remote_directory_prepare: Duration,
+}
+
 fn bench_env<T>(name: &str, default: T) -> Result<T>
 where
     T: std::str::FromStr,
@@ -190,11 +199,7 @@ async fn execute_benchmark(
     remote: &Arc<dyn ObjectStore>,
     objects: &[ObjectPath],
     payload: Bytes,
-    writers: usize,
-    max_connections: usize,
-    upload_concurrency: usize,
-    local_concurrency: usize,
-    remote_directory_prepare: Duration,
+    geometry: BenchGeometry,
 ) -> Result<BenchReport> {
     let total_bytes = u64::try_from(objects.len())?
         .checked_mul(u64::try_from(payload.len())?)
@@ -207,7 +212,7 @@ async fn execute_benchmark(
 
     let started = Instant::now();
     let mut tasks = tokio::task::JoinSet::new();
-    for writer in 0..writers {
+    for writer in 0..geometry.writers {
         let store = store.clone();
         let payload = payload.clone();
         let paths = Arc::clone(&paths);
@@ -221,7 +226,7 @@ async fn execute_benchmark(
                         generated_segment_options(),
                     )
                     .await?;
-                index += writers;
+                index += geometry.writers;
             }
             object_store::Result::<()>::Ok(())
         });
@@ -260,15 +265,15 @@ async fn execute_benchmark(
         total_bytes,
         object_count: objects.len(),
         payload_bytes: payload.len(),
-        writers,
-        max_connections,
-        upload_concurrency,
-        local_concurrency,
+        writers: geometry.writers,
+        max_connections: geometry.max_connections,
+        upload_concurrency: geometry.upload_concurrency,
+        local_concurrency: geometry.local_concurrency,
         ram_ack_seconds: ram_ack.as_secs_f64(),
         ram_ack_mib_per_second: mib_per_second(total_bytes, ram_ack),
         local_seconds: local.as_secs_f64(),
         local_mib_per_second: mib_per_second(total_bytes, local),
-        remote_directory_prepare_seconds: remote_directory_prepare.as_secs_f64(),
+        remote_directory_prepare_seconds: geometry.remote_directory_prepare.as_secs_f64(),
         remote_drain_seconds: remote_drain.as_secs_f64(),
         remote_drain_mib_per_second: mib_per_second(total_bytes, remote_drain),
         sftp_publications: sftp_timing.publications,
@@ -462,11 +467,13 @@ async fn bench_sftp_writeback_remote_drain() -> Result<()> {
                 &remote,
                 &objects.objects,
                 Bytes::from(payload),
-                writers,
-                max_connections,
-                bench_settings.upload_concurrency,
-                bench_settings.local_concurrency,
-                remote_directory_prepare,
+                BenchGeometry {
+                    writers,
+                    max_connections,
+                    upload_concurrency: bench_settings.upload_concurrency,
+                    local_concurrency: bench_settings.local_concurrency,
+                    remote_directory_prepare,
+                },
             )
             .await
         }
