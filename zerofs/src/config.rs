@@ -3545,6 +3545,23 @@ known_hosts = "${ZEROFS_TEST_KNOWN_HOSTS}""#,
     }
 
     #[test]
+    fn sftp_rejects_removed_hpn_transport() {
+        let error = format!(
+            "{:#}",
+            write_and_load(&sftp_config(
+                "sftp://alice@example.com/data",
+                "[sftp]\ntransport = \"hpn_openssh\"\n",
+            ))
+            .unwrap_err()
+        );
+
+        assert!(
+            error.contains("unknown variant") && error.contains("russh"),
+            "removed HPN transport must fail at configuration parsing: {error}"
+        );
+    }
+
+    #[test]
     fn sftp_rejects_unknown_transport_and_ssh_transport_alias() {
         for extra in [
             "[sftp]\ntransport = \"openssh\"\n",

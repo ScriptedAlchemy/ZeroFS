@@ -259,6 +259,22 @@ addresses = ["10.10.10.30:9567"]
         with self.assertRaisesRegex(ValueError, "only valid"):
             deploy.validate_hpn_release_artifact(config, artifact)
 
+    def test_cli_rejects_removed_hpn_program_option(self) -> None:
+        with self.assertRaises(SystemExit):
+            deploy.build_parser().parse_args(
+                [
+                    "deploy",
+                    "--role",
+                    "prod",
+                    "--ctid",
+                    "130",
+                    "--container-ip",
+                    "10.10.10.30",
+                    "--hpn-program",
+                    "/tmp/hpnssh",
+                ]
+            )
+
     def test_hpn_dry_run_stages_pinned_binary_in_release(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             program = Path(directory) / "hpnssh"
