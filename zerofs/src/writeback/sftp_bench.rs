@@ -117,6 +117,15 @@ struct BenchReport {
     remote_directory_prepare_seconds: f64,
     remote_drain_seconds: f64,
     remote_drain_mib_per_second: f64,
+    sftp_publications: u64,
+    sftp_open_total_seconds: f64,
+    sftp_write_total_seconds: f64,
+    sftp_fsync_total_seconds: f64,
+    sftp_close_total_seconds: f64,
+    sftp_hardlink_total_seconds: f64,
+    sftp_remove_total_seconds: f64,
+    sftp_session_publications: Vec<u64>,
+    sftp_session_write_bytes: Vec<u64>,
     payload_sha256: String,
 }
 
@@ -136,6 +145,10 @@ where
 
 fn mib_per_second(total_bytes: u64, elapsed: Duration) -> f64 {
     total_bytes as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64()
+}
+
+fn seconds(nanos: u64) -> f64 {
+    Duration::from_nanos(nanos).as_secs_f64()
 }
 
 fn generated_segment_options() -> PutOptions {
@@ -187,6 +200,7 @@ async fn execute_benchmark(
     hasher.update(&payload);
     let payload_sha256 = format!("{:x}", hasher.finalize());
     let paths = Arc::new(objects.to_vec());
+    crate::sftp_protocol::reset_bench_timing();
 
     let started = Instant::now();
     let mut tasks = tokio::task::JoinSet::new();
@@ -222,6 +236,12 @@ async fn execute_benchmark(
     store.activate_remote()?;
     store.wait_remote(target).await?;
     let remote_drain = remote_started.elapsed();
+    let sftp_timing = crate::sftp_protocol::bench_timing();
+    let last_used_session = sftp_timing
+        .session_publications
+        .iter()
+        .rposition(|publications| *publications != 0)
+        .map_or(0, |index| index + 1);
 
     for path in objects {
         let readback = remote.get(path).await?.bytes().await?;
@@ -247,6 +267,15 @@ async fn execute_benchmark(
         remote_directory_prepare_seconds: remote_directory_prepare.as_secs_f64(),
         remote_drain_seconds: remote_drain.as_secs_f64(),
         remote_drain_mib_per_second: mib_per_second(total_bytes, remote_drain),
+        sftp_publications: sftp_timing.publications,
+        sftp_open_total_seconds: seconds(sftp_timing.open_nanos),
+        sftp_write_total_seconds: seconds(sftp_timing.write_nanos),
+        sftp_fsync_total_seconds: seconds(sftp_timing.fsync_nanos),
+        sftp_close_total_seconds: seconds(sftp_timing.close_nanos),
+        sftp_hardlink_total_seconds: seconds(sftp_timing.hardlink_nanos),
+        sftp_remove_total_seconds: seconds(sftp_timing.remove_nanos),
+        sftp_session_publications: sftp_timing.session_publications[..last_used_session].to_vec(),
+        sftp_session_write_bytes: sftp_timing.session_write_bytes[..last_used_session].to_vec(),
         payload_sha256,
     })
 }

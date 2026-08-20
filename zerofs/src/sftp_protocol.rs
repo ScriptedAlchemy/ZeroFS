@@ -14,7 +14,87 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::sync::CancellationToken;
 
 #[cfg(test)]
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SftpBenchTiming {
+    pub open_nanos: u64,
+    pub write_nanos: u64,
+    pub fsync_nanos: u64,
+    pub close_nanos: u64,
+    pub hardlink_nanos: u64,
+    pub remove_nanos: u64,
+    pub publications: u64,
+    pub session_publications: [u64; 32],
+    pub session_write_bytes: [u64; 32],
+}
+
+#[cfg(test)]
+static BENCH_OPEN_NANOS: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+static BENCH_WRITE_NANOS: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+static BENCH_FSYNC_NANOS: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+static BENCH_CLOSE_NANOS: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+static BENCH_HARDLINK_NANOS: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+static BENCH_REMOVE_NANOS: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+static BENCH_PUBLICATIONS: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+static BENCH_SESSION_PUBLICATIONS: [AtomicU64; 32] = [const { AtomicU64::new(0) }; 32];
+#[cfg(test)]
+static BENCH_SESSION_WRITE_BYTES: [AtomicU64; 32] = [const { AtomicU64::new(0) }; 32];
+#[cfg(test)]
+static NEXT_BENCH_SESSION_SLOT: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+fn bench_nanos(elapsed: std::time::Duration) -> u64 {
+    u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+pub(crate) fn reset_bench_timing() {
+    for counter in [
+        &BENCH_OPEN_NANOS,
+        &BENCH_WRITE_NANOS,
+        &BENCH_FSYNC_NANOS,
+        &BENCH_CLOSE_NANOS,
+        &BENCH_HARDLINK_NANOS,
+        &BENCH_REMOVE_NANOS,
+        &BENCH_PUBLICATIONS,
+    ] {
+        counter.store(0, Ordering::SeqCst);
+    }
+    for counter in BENCH_SESSION_PUBLICATIONS
+        .iter()
+        .chain(BENCH_SESSION_WRITE_BYTES.iter())
+    {
+        counter.store(0, Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn bench_timing() -> SftpBenchTiming {
+    SftpBenchTiming {
+        open_nanos: BENCH_OPEN_NANOS.load(Ordering::SeqCst),
+        write_nanos: BENCH_WRITE_NANOS.load(Ordering::SeqCst),
+        fsync_nanos: BENCH_FSYNC_NANOS.load(Ordering::SeqCst),
+        close_nanos: BENCH_CLOSE_NANOS.load(Ordering::SeqCst),
+        hardlink_nanos: BENCH_HARDLINK_NANOS.load(Ordering::SeqCst),
+        remove_nanos: BENCH_REMOVE_NANOS.load(Ordering::SeqCst),
+        publications: BENCH_PUBLICATIONS.load(Ordering::SeqCst),
+        session_publications: std::array::from_fn(|index| {
+            BENCH_SESSION_PUBLICATIONS[index].load(Ordering::SeqCst)
+        }),
+        session_write_bytes: std::array::from_fn(|index| {
+            BENCH_SESSION_WRITE_BYTES[index].load(Ordering::SeqCst)
+        }),
+    }
+}
 
 /// russh-sftp 2.4 packet cap. Must match the SSH maximum packet size.
 pub const RUSSH_SFTP_MAX_PACKET_LEN: u32 = 256 * 1024;
@@ -355,6 +435,8 @@ pub struct SftpProtocolSession {
     // Taken exactly once by `close`; the pool guarantees no operations are in
     // flight when it closes a session, so contention here is teardown-only.
     owner: std::sync::Mutex<Option<Box<dyn SshConnectionOwner>>>,
+    #[cfg(test)]
+    bench_session_slot: usize,
 }
 
 impl fmt::Debug for SftpProtocolSession {
@@ -385,6 +467,11 @@ impl SftpProtocolSession {
             capabilities,
             limits,
             owner: std::sync::Mutex::new(Some(owner)),
+            #[cfg(test)]
+            bench_session_slot: usize::try_from(
+                NEXT_BENCH_SESSION_SLOT.fetch_add(1, Ordering::SeqCst) % 32,
+            )
+            .expect("benchmark session slot fits usize"),
         }
     }
 
@@ -438,26 +525,52 @@ impl SftpProtocolSession {
         } else {
             OpenFlags::WRITE
         };
+        #[cfg(test)]
+        let write_bytes = chunks.iter().fold(0_u64, |total, chunk| {
+            total.saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX))
+        });
+        #[cfg(test)]
+        let open_started = std::time::Instant::now();
         let opened = sftp
             .open(remote, flags, FileAttributes::default())
             .await
             .map_err(|error| map_sftp_error(path, error))?;
+        #[cfg(test)]
+        BENCH_OPEN_NANOS.fetch_add(bench_nanos(open_started.elapsed()), Ordering::SeqCst);
         let handle = opened.handle;
         let operation = async {
+            #[cfg(test)]
+            let write_started = std::time::Instant::now();
             write_handle_pipelined(sftp, &handle, path, offset, chunks, self.limits).await?;
+            #[cfg(test)]
+            BENCH_WRITE_NANOS.fetch_add(bench_nanos(write_started.elapsed()), Ordering::SeqCst);
             if durable {
+                #[cfg(test)]
+                let fsync_started = std::time::Instant::now();
                 sftp.fsync(handle.as_str())
                     .await
                     .map_err(|error| map_sftp_error(path, error))?;
+                #[cfg(test)]
+                BENCH_FSYNC_NANOS.fetch_add(bench_nanos(fsync_started.elapsed()), Ordering::SeqCst);
             }
             Ok(())
         }
         .await;
+        #[cfg(test)]
+        let close_started = std::time::Instant::now();
         let close = sftp
             .close(handle)
             .await
             .map_err(|error| map_sftp_close_error(path, error))
             .map(|_| ());
+        #[cfg(test)]
+        {
+            BENCH_CLOSE_NANOS.fetch_add(bench_nanos(close_started.elapsed()), Ordering::SeqCst);
+            BENCH_PUBLICATIONS.fetch_add(1, Ordering::SeqCst);
+            BENCH_SESSION_PUBLICATIONS[self.bench_session_slot].fetch_add(1, Ordering::SeqCst);
+            BENCH_SESSION_WRITE_BYTES[self.bench_session_slot]
+                .fetch_add(write_bytes, Ordering::SeqCst);
+        }
         finish_raw_handle(operation, close)
     }
 }
@@ -775,11 +888,17 @@ impl TransportSession for SftpProtocolSession {
 
     async fn remove_file(&self, path: &Path) -> Result<(), TransportError> {
         let remote = sftp_path(path)?;
-        self.sftp()?
+        #[cfg(test)]
+        let started = std::time::Instant::now();
+        let result = self
+            .sftp()?
             .remove(remote)
             .await
             .map_err(|error| map_sftp_error(path, error))
-            .map(|_| ())
+            .map(|_| ());
+        #[cfg(test)]
+        BENCH_REMOVE_NANOS.fetch_add(bench_nanos(started.elapsed()), Ordering::SeqCst);
+        result
     }
 
     async fn remove_directory(&self, path: &Path) -> Result<(), TransportError> {
@@ -880,10 +999,16 @@ impl TransportSession for SftpProtocolSession {
 
     async fn hard_link(&self, from: &Path, to: &Path) -> Result<(), TransportError> {
         let sftp = self.sftp()?;
-        sftp.hardlink(sftp_path(from)?, sftp_path(to)?)
+        #[cfg(test)]
+        let started = std::time::Instant::now();
+        let result = sftp
+            .hardlink(sftp_path(from)?, sftp_path(to)?)
             .await
             .map(|_| ())
-            .map_err(|error| map_sftp_error(to, error))
+            .map_err(|error| map_sftp_error(to, error));
+        #[cfg(test)]
+        BENCH_HARDLINK_NANOS.fetch_add(bench_nanos(started.elapsed()), Ordering::SeqCst);
+        result
     }
 
     async fn posix_rename(&self, from: &Path, to: &Path) -> Result<(), TransportError> {
