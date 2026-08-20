@@ -585,6 +585,7 @@ impl DirectoryCache {
 struct PoolInner {
     factory: Arc<dyn SessionFactory>,
     shared: Arc<Semaphore>,
+    max_sessions: usize,
     admission: FairAdmission,
     roster: StdMutex<Vec<Arc<SharedSession>>>,
     roster_changed: Notify,
@@ -1016,6 +1017,7 @@ impl SftpSessionPool {
             inner: Arc::new(PoolInner {
                 factory,
                 shared: Arc::new(Semaphore::new(shared)),
+                max_sessions: shared,
                 admission: FairAdmission::new(
                     shared * SFTP_SESSION_MAX_CONCURRENT_OPS,
                     reads,
@@ -1215,6 +1217,17 @@ impl SftpSessionPool {
                         Ok(permit) => Placement::Dial(permit),
                         Err(tokio::sync::TryAcquireError::Closed) => {
                             return Err(TransportError::PoolClosed);
+                        }
+                        Err(tokio::sync::TryAcquireError::NoPermits)
+                            if roster.len() < self.inner.max_sessions =>
+                        {
+                            // The missing permits belong to expansion dials or
+                            // retiring sessions that have not released their
+                            // remote connection slots yet. Wait for those
+                            // owners instead of stacking the rest of a burst
+                            // onto the first live session while its peers are
+                            // still opening.
+                            Placement::Wait
                         }
                         Err(tokio::sync::TryAcquireError::NoPermits) => match other {
                             Some(session) => {
