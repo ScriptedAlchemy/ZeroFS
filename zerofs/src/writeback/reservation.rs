@@ -585,8 +585,9 @@ impl SsdAdmission {
     /// Release a locally committed reservation after remote cleanup.
     ///
     /// Observes `sample` first so waiters see the post-cleanup free space.
-    /// The charge stays held if the sampler generation is stale or admission
-    /// is already terminal.
+    /// A newer concurrent observation wins over a stale cleanup sample; the
+    /// remote cleanup still owns and must release its exact logical charge.
+    /// The charge stays held if admission is already terminal.
     pub(crate) fn release_remote(
         &self,
         request: SsdReservationRequest,
@@ -594,7 +595,10 @@ impl SsdAdmission {
     ) -> Result<(), ReservationError> {
         {
             let mut state = lock(&self.inner.state);
-            self.inner.observe_locked(&mut state, sample)?;
+            match self.inner.observe_locked(&mut state, sample) {
+                Ok(()) | Err(ReservationError::StaleSample { .. }) => {}
+                Err(error) => return Err(error),
+            }
             if let Some(error) = &state.terminal {
                 return Err(error.clone());
             }
