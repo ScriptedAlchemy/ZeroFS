@@ -35,6 +35,8 @@ pub use store::WritebackError;
 mod sftp_bench;
 #[cfg(test)]
 mod test_util;
+#[cfg(test)]
+mod tier_bench;
 
 #[cfg(unix)]
 pub(crate) fn validate_owner_only(

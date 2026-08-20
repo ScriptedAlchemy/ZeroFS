@@ -7,6 +7,7 @@
 - `scripts/vm100_pilot/` contains the benchmark implementation, receipts, metrics sampling, matrices, raw-SFTP comparison, and cleanup logic. Historical receipts normally live under `/var/tmp/zerofs-pilot-results` on `ubuntu-main`.
 - `scripts/tiered-writeback-e2e.py` and `scripts/tiered_writeback_e2e/` describe UUID-scoped RAM/SSD/remote scenarios. Real scenarios currently fail closed until the typed durability collector is wired; `--plan-only` is not performance evidence.
 - `zerofs/src/writeback/sftp_bench.rs` is the direct real-SFTP/writeback microbenchmark. It constructs the production SFTP transport, pool, object store, journal, and remote scheduler without launching the CLI or protocol servers. It uses the normal dev/CI test profile, not `--release`.
+- `zerofs/src/writeback/tier_bench.rs` is the direct host-local read/write microbenchmark. It measures RAM acknowledgement through the production writeback store, RAM reads through the production overlay, SSD durability through the production journaler, and SSD reads through verified journal blobs. It also uses the normal dev/CI test profile.
 - `zerofs/src/writeback/store.rs`, `journal.rs`, and `journaler.rs` contain older ignored in-process tier microbenchmarks. Their comments currently prescribe `--release`; do not use them when the task asks for the normal dev benchmark.
 - `zerofs/src/fs/store/extent/perf_harness.rs` contains in-process cumulative pipeline benchmarking. It is not a deployed remote-backend acceptance test.
 - `docs/vm100-benchmark-methodology.md` is the benchmark evidence and safety contract. The detailed historical rollout targets are under `docs/superpowers/specs/` and `docs/superpowers/plans/`.
@@ -29,8 +30,22 @@ cargo test --locked -p zerofs --lib \
   -- --exact --ignored --nocapture
 ```
 
-Optional normal-profile sizing knobs are `ZEROFS_BENCH_SFTP_TOTAL_MIB` (default 256), `ZEROFS_BENCH_SFTP_PAYLOAD_KIB` (default 1024), `ZEROFS_BENCH_SFTP_WRITERS` (default 16), and `ZEROFS_BENCH_SFTP_MAX_CONNECTIONS` (defaults to the supplied config). The output line begins with `SFTP_WRITEBACK_BENCH` and contains JSON. Capture the exact Git SHA, command, output, and cleanup result with any reported rate. When production remains connected, keep its pool plus the benchmark pool within the Storage Box account limit; an eight-connection production pool leaves at most two slots for this benchmark.
+Optional normal-profile sizing knobs are `ZEROFS_BENCH_SFTP_TOTAL_MIB` (default 256), `ZEROFS_BENCH_SFTP_PAYLOAD_KIB` (default 1024), `ZEROFS_BENCH_SFTP_WRITERS` (default 16; also the remote reader count), and `ZEROFS_BENCH_SFTP_MAX_CONNECTIONS` (defaults to the supplied config). The output line begins with `SFTP_WRITEBACK_BENCH` and contains JSON for RAM acknowledgement, SSD durability, remote write drain, and timed verified remote reads. Capture the exact Git SHA, command, output, and cleanup result with any reported rate. When production remains connected, keep its pool plus the benchmark pool within the Storage Box account limit; an eight-connection production pool leaves at most two slots for this benchmark.
 
 ZeroFS uses the in-process native Rust `russh` transport. Production configs and benchmark commands must not depend on an external OpenSSH or HPN executable.
+
+## Direct RAM/SSD read/write benchmark
+
+Run the host-local benchmark in the normal dev profile. It does not need an SFTP configuration, launch ZeroFS, or touch a remote backend. Use a scratch parent on the SSD being measured; the benchmark creates a unique temporary child, shuts down the writeback workers, removes that child, and verifies it is absent before emitting JSON.
+
+```bash
+cd /fast/projects/ZeroFS/zerofs
+ZEROFS_BENCH_DIR=/var/tmp \
+cargo test --locked -p zerofs --lib \
+  writeback::tier_bench::bench_writeback_local_tier_read_write \
+  -- --exact --ignored --nocapture
+```
+
+Optional sizing knobs are `ZEROFS_BENCH_TIER_TOTAL_MIB` (default 256), `ZEROFS_BENCH_TIER_PAYLOAD_KIB` (default 1024), `ZEROFS_BENCH_TIER_WRITERS` (default 16), `ZEROFS_BENCH_TIER_READERS` (defaults to the writer count), and `ZEROFS_BENCH_LOCAL_CONCURRENCY` (default 8). The output line begins with `LOCAL_TIER_RW_BENCH` and contains exact JSON. RAM reads are served from pending in-memory overlay payloads; SSD reads use verified durable journal blobs. Neither rate is a filesystem/page-cache or deployed protocol claim.
 
 Do not point legacy pilot lifecycle commands at CT198 or a shared production mount. Do not call a `tiered-writeback-e2e.py --plan-only` receipt a benchmark result. A normal dev microbenchmark is diagnostic evidence; production acceptance still requires the real mounted path, durability cutoffs, integrity, and cleanup.
