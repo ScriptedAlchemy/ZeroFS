@@ -2635,7 +2635,13 @@ mod tests {
         // observe sequence 1 alone and durably commit it as its own batch,
         // which releases record 1's RAM early and makes the assertions below
         // race.
-        assert_eq!(prepare_entered_rx.recv().await.unwrap(), 3);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), prepare_entered_rx.recv())
+                .await
+                .expect("record 3 did not enter preparation after record 2 was collected")
+                .expect("preparation-entry channel closed before record 3"),
+            3
+        );
         prepare_release_senders[&1].send(()).unwrap();
         assert_eq!(prepared_rx.recv().await.unwrap(), 1);
 
@@ -2658,10 +2664,25 @@ mod tests {
         );
 
         prepare_release_senders[&3].send(()).unwrap();
-        assert_eq!(prepared_rx.recv().await.unwrap(), 3);
-        assert_eq!(publish_entered_rx.recv().await.unwrap(), 3);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), prepared_rx.recv())
+                .await
+                .expect("record 3 did not finish preparation")
+                .expect("prepared channel closed before record 3"),
+            3
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), publish_entered_rx.recv())
+                .await
+                .expect("record 3 did not enter durable publication")
+                .expect("publication-entry channel closed before record 3"),
+            3
+        );
         publish_release_tx.send(()).unwrap();
-        journaler.barrier().wait_local(3).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), journaler.barrier().wait_local(3))
+            .await
+            .expect("record 3 did not become locally durable")
+            .unwrap();
         assert_eq!(admission.used_bytes(), 0);
         journaler.shutdown().await.unwrap();
     }
