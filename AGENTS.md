@@ -41,6 +41,8 @@ ZEROFS_BENCH_SFTP_IDENTITY_FILE=/secure/storage-key \
 ZEROFS_BENCH_SFTP_KNOWN_HOSTS=/secure/known_hosts \
 ZEROFS_BENCH_SFTP_TOTAL_MIB=128 \
 ZEROFS_BENCH_SFTP_PAYLOAD_KIB=8192 \
+ZEROFS_BENCH_SFTP_MANIFEST_KIB=64 \
+ZEROFS_BENCH_SFTP_FENCE_EVERY=4 \
 ZEROFS_BENCH_SFTP_WRITERS=8 \
 ZEROFS_BENCH_SFTP_MAX_CONNECTIONS=2 \
 ZEROFS_BENCH_SFTP_SSD_MIB=32 \
@@ -49,7 +51,7 @@ cargo test --locked -p zerofs --lib \
   -- --exact --ignored --nocapture
 ```
 
-Its output begins with `SFTP_WRITEBACK_SATURATION_BENCH`. Treat `blocked_ack_mib_per_second`, `remote_cleanup_mib_per_second`, their ratio, and `max_blocked_ack_gap_seconds` as the full-SSD pacing evidence. Remote cleanup bytes are sampled at the final memory acknowledgement, before waiting for local durability, and the maximum gap excludes first-ack latency. `tail_objects_after_activation` names the complete paced tail rather than claiming every tail object was simultaneously queued before activation. This workload uses generated immutable segments; it does not model a metadata-heavy ordered frontier, so do not use it alone to explain a deployed manifest/fence backlog.
+Its output begins with `SFTP_WRITEBACK_SATURATION_BENCH`. Treat `blocked_ack_mib_per_second`, `remote_cleanup_mib_per_second`, their ratio, and `max_blocked_ack_gap_seconds` as the full-SSD pacing evidence. Remote cleanup bytes are sampled at the final memory acknowledgement, before waiting for local durability, and the maximum gap excludes first-ack latency. `tail_objects_after_activation` names the complete paced tail rather than claiming every tail object was simultaneously queued before activation. By default every fourth object is a small create-only manifest fence and the other three are generated immutable segments, matching the shipping flush ordering shape while retaining deterministic admission order. Set `ZEROFS_BENCH_SFTP_FENCE_EVERY=0` only when intentionally measuring an immutable-only control.
 
 ZeroFS uses the in-process native Rust `russh` transport. Production configs and benchmark commands must not depend on an external OpenSSH or HPN executable.
 
