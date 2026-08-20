@@ -114,6 +114,7 @@ struct BenchReport {
     ram_ack_mib_per_second: f64,
     local_seconds: f64,
     local_mib_per_second: f64,
+    remote_directory_prepare_seconds: f64,
     remote_drain_seconds: f64,
     remote_drain_mib_per_second: f64,
     payload_sha256: String,
@@ -177,6 +178,7 @@ async fn execute_benchmark(
     writers: usize,
     upload_concurrency: usize,
     local_concurrency: usize,
+    remote_directory_prepare: Duration,
 ) -> Result<BenchReport> {
     let total_bytes = u64::try_from(objects.len())?
         .checked_mul(u64::try_from(payload.len())?)
@@ -242,10 +244,21 @@ async fn execute_benchmark(
         ram_ack_mib_per_second: mib_per_second(total_bytes, ram_ack),
         local_seconds: local.as_secs_f64(),
         local_mib_per_second: mib_per_second(total_bytes, local),
+        remote_directory_prepare_seconds: remote_directory_prepare.as_secs_f64(),
         remote_drain_seconds: remote_drain.as_secs_f64(),
         remote_drain_mib_per_second: mib_per_second(total_bytes, remote_drain),
         payload_sha256,
     })
+}
+
+async fn prepare_remote_run(pool: &SftpSessionPool, directories: &[PathBuf]) -> Result<Duration> {
+    let started = Instant::now();
+    let mut lease = pool.checkout(OperationKind::Metadata).await?;
+    for directory in directories {
+        pool.ensure_directory(&mut lease, directory).await?;
+    }
+    lease.complete().await?;
+    Ok(started.elapsed())
 }
 
 async fn cleanup_remote_run(
@@ -370,16 +383,24 @@ async fn bench_sftp_writeback_remote_drain() -> Result<()> {
 
     let mut payload = vec![0_u8; payload_bytes];
     StdRng::seed_from_u64(0x5f54_4653_4245_4e43).fill_bytes(&mut payload);
-    let benchmark = execute_benchmark(
-        &store,
-        &remote,
-        &objects.objects,
-        Bytes::from(payload),
-        writers,
-        bench_settings.upload_concurrency,
-        bench_settings.local_concurrency,
-    )
-    .await;
+    let remote_directory_prepare =
+        prepare_remote_run(&pool, &objects.directories_deepest_first).await;
+    let benchmark = match remote_directory_prepare {
+        Ok(remote_directory_prepare) => {
+            execute_benchmark(
+                &store,
+                &remote,
+                &objects.objects,
+                Bytes::from(payload),
+                writers,
+                bench_settings.upload_concurrency,
+                bench_settings.local_concurrency,
+                remote_directory_prepare,
+            )
+            .await
+        }
+        Err(error) => Err(error.context("prepare remote benchmark directories")),
+    };
     let shutdown = store.shutdown().await;
     drop(store);
     let cleanup = cleanup_remote_run(
