@@ -2589,7 +2589,7 @@ mod tests {
         let (publish_release_tx, publish_release_rx) = mpsc::channel();
         let mut prepare_releases = HashMap::new();
         let mut prepare_release_senders = HashMap::new();
-        for sequence in 1..=2 {
+        for sequence in 1..=3 {
             let (sender, receiver) = mpsc::channel();
             prepare_release_senders.insert(sequence, sender);
             prepare_releases.insert(sequence, receiver);
@@ -2601,8 +2601,19 @@ mod tests {
             publish_entered: publish_entered_tx,
             publish_release: Mutex::new(publish_release_rx),
         });
-        let journaler = LocalJournaler::start_with_sink(sink, admission.clone(), 0, 8);
-        for sequence in 1..=2 {
+        // Two preparation slots: records 1 and 2 fill them and record 3 waits
+        // in the queue, so record 3 entering preparation later proves a slot
+        // was freed by collecting a finished preparation.
+        let journaler = LocalJournaler::start_with_sink_and_observer(
+            sink,
+            admission.clone(),
+            0,
+            uuid::Uuid::nil(),
+            8,
+            2,
+            None,
+        );
+        for sequence in 1..=3 {
             let ram = admission.reserve(1).await.unwrap().accept();
             journaler
                 .submit_put(put_record(sequence, b"x"), Bytes::from_static(b"x"), ram)
@@ -2617,21 +2628,40 @@ mod tests {
         assert_eq!(entered, [1, 2]);
         prepare_release_senders[&2].send(()).unwrap();
         assert_eq!(prepared_rx.recv().await.unwrap(), 2);
+        // Record 1 is still gated, so the slot record 3 occupies here was
+        // freed by record 2's collected preparation: sequence 2 is in the
+        // prepared backlog before sequence 1 finishes, and the drain must
+        // assemble [1, 2] as one batch. Without this ordering the drain may
+        // observe sequence 1 alone and durably commit it as its own batch,
+        // which releases record 1's RAM early and makes the assertions below
+        // race.
+        assert_eq!(prepare_entered_rx.recv().await.unwrap(), 3);
         prepare_release_senders[&1].send(()).unwrap();
         assert_eq!(prepared_rx.recv().await.unwrap(), 1);
 
         assert_eq!(publish_entered_rx.recv().await.unwrap(), 1);
-        assert_eq!(admission.used_bytes(), 2);
+        assert_eq!(admission.used_bytes(), 3);
         publish_release_tx.send(()).unwrap();
         assert_eq!(publish_entered_rx.recv().await.unwrap(), 2);
         assert_eq!(
             admission.used_bytes(),
-            2,
+            3,
             "no admission may be released before the durable batch returns"
         );
         publish_release_tx.send(()).unwrap();
 
         journaler.barrier().wait_local(2).await.unwrap();
+        assert_eq!(
+            admission.used_bytes(),
+            1,
+            "the durable batch releases exactly its own records"
+        );
+
+        prepare_release_senders[&3].send(()).unwrap();
+        assert_eq!(prepared_rx.recv().await.unwrap(), 3);
+        assert_eq!(publish_entered_rx.recv().await.unwrap(), 3);
+        publish_release_tx.send(()).unwrap();
+        journaler.barrier().wait_local(3).await.unwrap();
         assert_eq!(admission.used_bytes(), 0);
         journaler.shutdown().await.unwrap();
     }
