@@ -3329,6 +3329,35 @@ mod tests {
         assert_eq!(factory.live(), 0);
     }
 
+    #[tokio::test]
+    async fn partial_writable_warmup_failure_reaps_opened_sessions_and_lifetime_capacity() {
+        let factory = RecordingFactory::fully_capable();
+        factory.state.fail_open_from.store(3, Ordering::SeqCst);
+        let config = crate::config::SftpConfig {
+            identity_file: "/tmp/id-ed25519".into(),
+            known_hosts: "/tmp/known-hosts".into(),
+            max_connections: 4,
+            read_concurrency: 8,
+            write_concurrency: 8,
+            segment_size_mib: 32,
+            read_cache_part_size_kib: 1024,
+            ..Default::default()
+        };
+
+        let error = SftpSessionPool::from_config_writable(Arc::new(factory.clone()), &config)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, TransportError::PoolClosed), "{error:?}");
+        assert_eq!(factory.dials(), 3);
+        assert_eq!(factory.peak(), 3);
+        assert_eq!(
+            factory.live(),
+            0,
+            "each live test session owns one pool lifetime permit until its close completes"
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn idle_reaper_closes_expired_sessions_but_keeps_one_warm() {
         let factory = RecordingFactory::fully_capable();

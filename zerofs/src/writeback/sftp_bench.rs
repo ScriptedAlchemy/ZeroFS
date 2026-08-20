@@ -29,6 +29,9 @@ async fn build_remote_store(
     let endpoint = settings
         .sftp_endpoint()?
         .context("benchmark config must use an sftp:// storage URL")?;
+    let url = Url::parse(&settings.storage.url).context("parse benchmark SFTP URL")?;
+    let path = ObjectPath::from_url_path(url.path())?;
+    SftpObjectStore::validate_prefix(&path)?;
     let config = settings.sftp.clone().unwrap_or_default();
     let factory: Arc<dyn SessionFactory> = match config.transport {
         SftpSshTransport::Russh => Arc::new(RusshSessionFactory::new(
@@ -41,8 +44,6 @@ async fn build_remote_store(
         ),
     };
     let pool = SftpSessionPool::from_config_writable(factory, &config).await?;
-    let url = Url::parse(&settings.storage.url).context("parse benchmark SFTP URL")?;
-    let path = ObjectPath::from_url_path(url.path())?;
     let store = SftpObjectStore::new(pool.clone(), path.clone())?;
     Ok((Arc::new(store), path, pool))
 }
@@ -360,6 +361,26 @@ async fn close_pool_after_setup_error(
     }
 }
 
+fn finish_benchmark<T>(
+    primary: Result<T>,
+    teardowns: impl IntoIterator<Item = Result<()>>,
+) -> Result<T> {
+    let mut errors = Vec::new();
+    if let Err(error) = &primary {
+        errors.push(format!("{error:#}"));
+    }
+    for teardown in teardowns {
+        if let Err(error) = teardown {
+            errors.push(format!("{error:#}"));
+        }
+    }
+    if errors.is_empty() {
+        primary
+    } else {
+        Err(anyhow::anyhow!(errors.join("; ")))
+    }
+}
+
 /// Directly measures the shipping SFTP object store behind the shipping
 /// writeback scheduler. This is a normal dev-profile ignored test: it does not
 /// build, install, stop, or start ZeroFS. The caller must provide a validated
@@ -490,25 +511,38 @@ async fn bench_sftp_writeback_remote_drain() -> Result<()> {
     .await;
     drop(remote);
     let pool_shutdown = pool.shutdown().await;
-
-    let report = benchmark.context("SFTP writeback benchmark failed")?;
-    shutdown.context("writeback shutdown failed")?;
-    cleanup.context("remote benchmark cleanup failed")?;
-    pool_shutdown.context("SFTP pool shutdown failed")?;
     let scratch_path = scratch.path().to_path_buf();
-    scratch.close().context("remove local benchmark journal")?;
-    anyhow::ensure!(
-        !scratch_path.exists(),
-        "local benchmark journal still exists at {}",
-        scratch_path.display()
-    );
+    let scratch_cleanup = scratch.close().context("remove local benchmark journal");
+    let scratch_absence = if scratch_path.exists() {
+        Err(anyhow::anyhow!(
+            "local benchmark journal still exists at {}",
+            scratch_path.display()
+        ))
+        .context("verify local benchmark journal removal")
+    } else {
+        Ok(())
+    };
+    let report = finish_benchmark(
+        benchmark.context("SFTP writeback benchmark failed"),
+        [
+            shutdown.context("writeback shutdown failed"),
+            cleanup.context("remote benchmark cleanup failed"),
+            pool_shutdown.context("SFTP pool shutdown failed"),
+            scratch_cleanup,
+            scratch_absence,
+        ],
+    )?;
     println!("SFTP_WRITEBACK_BENCH {}", serde_json::to_string(&report)?);
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{BenchObjectSet, GeneratedSegmentCreate, generated_segment_options};
+    use super::{
+        BenchObjectSet, GeneratedSegmentCreate, build_remote_store, finish_benchmark,
+        generated_segment_options,
+    };
+    use crate::config::Settings;
     use object_store::path::Path;
     use uuid::Uuid;
 
@@ -547,6 +581,66 @@ mod tests {
                 .extensions
                 .get::<GeneratedSegmentCreate>()
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn simultaneous_benchmark_and_teardown_failures_are_all_reported() {
+        let error = finish_benchmark(
+            Err::<(), _>(
+                anyhow::anyhow!("primary failure").context("SFTP writeback benchmark failed"),
+            ),
+            [
+                Err(anyhow::anyhow!("shutdown failure").context("writeback shutdown failed")),
+                Err(anyhow::anyhow!("remote cleanup failure")
+                    .context("remote benchmark cleanup failed")),
+                Err(anyhow::anyhow!("pool shutdown failure").context("SFTP pool shutdown failed")),
+                Err(anyhow::anyhow!("scratch close failure")
+                    .context("remove local benchmark journal")),
+                Err(anyhow::anyhow!("scratch remains")
+                    .context("verify local benchmark journal removal")),
+            ],
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            format!("{error:#}"),
+            "SFTP writeback benchmark failed: primary failure; \
+             writeback shutdown failed: shutdown failure; \
+             remote benchmark cleanup failed: remote cleanup failure; \
+             SFTP pool shutdown failed: pool shutdown failure; \
+             remove local benchmark journal: scratch close failure; \
+             verify local benchmark journal removal: scratch remains"
+        );
+    }
+
+    #[tokio::test]
+    async fn benchmark_rejects_a_root_prefix_before_transport_preflight() {
+        let settings: Settings = toml::from_str(
+            r#"
+[cache]
+dir = "/tmp/zerofs-benchmark-prefix-test-cache"
+disk_size_gb = 1.0
+memory_size_gb = 1.0
+
+[storage]
+url = "sftp://benchmark@example.test/"
+encryption_password = "test-only"
+
+[sftp]
+identity_file = "/definitely/missing/identity"
+known_hosts = "/definitely/missing/known-hosts"
+
+[servers]
+"#,
+        )
+        .unwrap();
+
+        let error = build_remote_store(&settings).await.unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("non-root dedicated prefix"),
+            "prefix validation must run before transport preflight: {error:#}"
         );
     }
 }
