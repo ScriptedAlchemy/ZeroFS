@@ -43,6 +43,13 @@ const REMOTE_STREAM_IN_FLIGHT_PARTS: usize = 2;
 /// Sized to cover a full 32 MiB segment object plus its envelope; worst-case
 /// buffering is one blob per upload lane.
 const REMOTE_SINGLE_PUT_BYTES: u64 = 36 * 1024 * 1024;
+/// The scheduler scans (and may hold completions for) this many records per
+/// upload lane. The held-completion cap in [`collect_pipeline_batch`] is
+/// derived from the same factor so a stalled ordering fence at the frontier
+/// can never strangle speculative preupload below the scan window itself:
+/// a held [`CompletedRemote`] is record metadata only, so the bound exists
+/// to keep the completion map proportional to the window, not to cap memory.
+const SCHEDULER_WINDOW_PER_LANE: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RemoteBarrierError {
@@ -1005,7 +1012,9 @@ fn load_scheduler_window(
     first_sequence: Sequence,
     upload_concurrency: usize,
 ) -> anyhow::Result<SchedulerWindow> {
-    let scan_limit = upload_concurrency.saturating_mul(8).max(upload_concurrency);
+    let scan_limit = upload_concurrency
+        .saturating_mul(SCHEDULER_WINDOW_PER_LANE)
+        .max(upload_concurrency);
     let pending = journal.pending_window(first_sequence, scan_limit)?;
     let window = SchedulerWindow {
         local_seq: pending.local_seq,
@@ -1073,7 +1082,10 @@ fn collect_pipeline_batch(
     completed: &BTreeMap<Sequence, CompletedRemote>,
     active: &BTreeSet<Sequence>,
 ) -> Vec<MutationRecord> {
-    let held_limit = limit.saturating_mul(4).max(limit);
+    // Match the scan window: a tighter cap used to throttle every lane down
+    // to the single frontier slot while a fence retried, leaving the rest of
+    // the connection pool idle exactly when the backlog was deepest.
+    let held_limit = limit.saturating_mul(SCHEDULER_WINDOW_PER_LANE).max(limit);
     let mut available = limit
         .saturating_sub(active.len())
         .min(held_limit.saturating_sub(completed.len()));
@@ -1870,6 +1882,41 @@ mod tests {
                 .map(|record| record.sequence)
                 .collect::<Vec<_>>(),
             vec![1, 3, 5, 7]
+        );
+    }
+
+    #[test]
+    fn a_stalled_frontier_fence_does_not_collapse_speculative_preupload_capacity() {
+        let mut records = vec![record(1, "manifest/000001.manifest", FenceClass::Fence)];
+        records.extend((2_u64..=24).map(|sequence| {
+            record(
+                sequence,
+                &format!("segments/{sequence}"),
+                FenceClass::ImmutableCreate,
+            )
+        }));
+        let completed = (2_u64..=17)
+            .map(|sequence| {
+                (
+                    sequence,
+                    CompletedRemote {
+                        record: records[(sequence - 1) as usize].clone(),
+                        e_tag: None,
+                    },
+                )
+            })
+            .collect();
+
+        let batch = collect_pipeline_batch(&records, 1, 4, &completed, &Default::default());
+
+        assert_eq!(
+            batch
+                .iter()
+                .map(|record| record.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 18, 19, 20],
+            "held completions below the scan-window bound must not starve the remaining \
+             upload lanes while the frontier fence is still in flight"
         );
     }
 
