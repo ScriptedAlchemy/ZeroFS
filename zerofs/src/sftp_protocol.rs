@@ -98,8 +98,9 @@ pub(crate) fn bench_timing() -> SftpBenchTiming {
 
 /// russh-sftp 2.4 packet cap. Must match the SSH maximum packet size.
 pub const RUSSH_SFTP_MAX_PACKET_LEN: u32 = 256 * 1024;
-/// OpenSSH sftp's proven in-flight WRITE window. The crate default of 8 is leftover.
-pub const RUSSH_SFTP_MAX_CONCURRENT_WRITES: usize = 64;
+/// Match the raw OpenSSH SFTP control's proven `-R 128` in-flight WRITE window.
+/// The crate default of 8 leaves WAN bandwidth idle.
+pub const RUSSH_SFTP_MAX_CONCURRENT_WRITES: usize = 128;
 
 pub(crate) const SFTP_WRITE_PACKET_SIZE: usize = 255 * 1024;
 pub(crate) const SFTP_READ_PACKET_SIZE: usize = 255 * 1024;
