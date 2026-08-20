@@ -1120,19 +1120,19 @@ mod tests {
     }
 
     #[test]
-    fn pipelined_write_plan_uses_255kib_packets_not_ack_per_byte() {
-        let payload = Bytes::from(vec![0u8; SFTP_WRITE_PACKET_SIZE * 64 + 17]);
+    fn pipelined_write_plan_matches_the_proven_raw_sftp_request_window() {
+        let payload = Bytes::from(vec![0u8; SFTP_WRITE_PACKET_SIZE * 128 + 17]);
         let plan = plan_pipelined_writes(0, vec![payload], SFTP_WRITE_PACKET_SIZE).unwrap();
-        assert_eq!(plan.len(), 65);
+        assert_eq!(plan.len(), 129);
         assert!(
             plan.iter()
                 .all(|request| request.payload.len() <= SFTP_WRITE_PACKET_SIZE)
         );
         assert_eq!(plan[0].payload.len(), SFTP_WRITE_PACKET_SIZE);
         assert_eq!(plan[63].payload.len(), SFTP_WRITE_PACKET_SIZE);
-        assert_eq!(plan[64].payload.len(), 17);
+        assert_eq!(plan[128].payload.len(), 17);
         assert_eq!(plan[1].offset, SFTP_WRITE_PACKET_SIZE as u64);
-        assert_eq!(SFTP_WRITE_REQUEST_CONCURRENCY, 64);
+        assert_eq!(SFTP_WRITE_REQUEST_CONCURRENCY, 128);
         assert_eq!(SFTP_WRITE_PACKET_SIZE, 255 * 1024);
     }
 
