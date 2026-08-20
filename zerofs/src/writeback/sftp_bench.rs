@@ -716,13 +716,14 @@ async fn execute_benchmark(
 async fn execute_saturation_benchmark(
     store: &WritebackObjectStore,
     remote: &Arc<dyn ObjectStore>,
-    objects: &[ObjectPath],
-    classes: &[BenchObjectClass],
+    object_set: &BenchObjectSet,
     segment_payload: Bytes,
     manifest_payload: Bytes,
     geometry: BenchGeometry,
     saturation: SaturationGeometry,
 ) -> Result<SaturationReport> {
+    let objects = &object_set.objects;
+    let classes = &object_set.classes;
     anyhow::ensure!(
         objects.len() == classes.len(),
         "saturation object classes must match object paths"
@@ -1356,8 +1357,7 @@ async fn bench_sftp_writeback_full_ssd_pacing() -> Result<()> {
             execute_saturation_benchmark(
                 &store,
                 &remote,
-                &objects.objects,
-                &objects.classes,
+                &objects,
                 Bytes::from(payload),
                 Bytes::from(manifest_payload),
                 BenchGeometry {
