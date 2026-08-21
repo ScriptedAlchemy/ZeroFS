@@ -1005,6 +1005,29 @@ def _wait_remote_drain(runner: Runner, args: argparse.Namespace) -> None:
     )
 
 
+def _wait_recovered_server_ready(runner: Runner, args: argparse.Namespace) -> None:
+    timeout = min(args.drain_timeout, 600)
+    if runner.dry_run:
+        print(
+            f"+ wait-for-recovered-server {args.existing_metrics_url} "
+            f"timeout={timeout}s"
+        )
+        return
+    metrics_url = shlex.quote(args.existing_metrics_url)
+    script = f"""set -euo pipefail
+deadline=$((SECONDS + {timeout}))
+while ((SECONDS < deadline)); do
+  if curl --fail --silent --show-error --max-time 10 {metrics_url} >/dev/null 2>&1; then
+    exit 0
+  fi
+  sleep 2
+done
+echo "recovered ZeroFS server did not become ready within {timeout} seconds" >&2
+exit 1
+"""
+    _ssh(runner, args.vm_host, script)
+
+
 def _stop_source_server(runner: Runner, args: argparse.Namespace) -> None:
     if args.source_server_unit is None:
         return
@@ -1377,6 +1400,8 @@ def _run_prod_vm_nfs_transaction(
                 action("commit")
                 return
             recover_host()
+            if status.get("phase") != "absent":
+                _wait_recovered_server_ready(runner, args)
             action("recover")
             receipt_output = guest_action("preflight")
             if not runner.dry_run:

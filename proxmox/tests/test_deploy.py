@@ -893,6 +893,46 @@ class VmNfsCoordinatorTests(unittest.TestCase):
             ["recover", "prepare", "quiesce", "reconcile", "decide", "commit"],
         )
 
+    def test_recovery_waits_for_the_restarted_server_before_restoring_vm_nfs(
+        self,
+    ) -> None:
+        class RecoveryRunner(self.RecordingRunner):
+            def run_remote_shell(self, host: str, script: str) -> str | None:
+                result = super().run_remote_shell(host, script)
+                if "vm_nfs_transition.py status " in script:
+                    return '{"phase": "quiesced"}'
+                return result
+
+        runner = RecoveryRunner()
+        args = self.args()
+        args.existing_metrics_url = "http://10.10.10.55:9567/metrics"
+        args.drain_timeout = 14400
+
+        self.transaction_runner()(
+            runner,
+            args,
+            "0123456789ab-cccccccccccccccc",
+            lambda: None,
+            lambda: None,
+            lambda: None,
+            lambda: None,
+        )
+
+        readiness = [
+            index
+            for index, call in enumerate(runner.calls)
+            if "curl --fail --silent --show-error --max-time 10 "
+            "http://10.10.10.55:9567/metrics" in call
+        ]
+        recover = [
+            index
+            for index, call in enumerate(runner.calls)
+            if "vm_nfs_transition.py recover " in call
+        ]
+        self.assertEqual(len(readiness), 1)
+        self.assertEqual(len(recover), 1)
+        self.assertLess(readiness[0], recover[0])
+
     def test_every_mutating_vm_command_runs_inside_the_lock_session(self) -> None:
         runner = self.RecordingRunner()
 
