@@ -236,6 +236,9 @@ class ProtocolWorkloadResult:
     stable_remote_drain: dict[str, object]
     readback_ns: int
     foreground_mibps: float
+    # Integrity-check rate, not protocol read throughput: hashes the
+    # just-written file back through the same mount with no cache
+    # invalidation (often client-cached) and includes SHA-256 CPU cost.
     readback_mibps: float
     before: WritebackSnapshot
     accepted: WritebackSnapshot

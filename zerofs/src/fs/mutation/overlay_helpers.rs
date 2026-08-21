@@ -51,6 +51,19 @@ pub(super) fn mutation_fs_error(error: MutationError) -> FsError {
     }
 }
 
+/// Filesystem vocabulary for the shared write-admission sequence. Protocols
+/// that speak a different error language (NBD) map the same typed outcomes
+/// themselves rather than reimplementing the sequence.
+pub(super) fn write_admission_fs_error(error: super::overlay::WriteAdmissionError) -> FsError {
+    use super::overlay::WriteAdmissionError;
+    match error {
+        WriteAdmissionError::Unavailable => FsError::IoError,
+        WriteAdmissionError::Backpressured => FsError::RetryLater,
+        WriteAdmissionError::FingerprintMismatch => FsError::InvalidArgument,
+        WriteAdmissionError::Mutation(error) => mutation_fs_error(error),
+    }
+}
+
 pub(super) fn overlay_fs_error(error: OverlayError) -> FsError {
     match error {
         OverlayError::NoSpace => FsError::NoSpace,

@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from scripts.vm100_pilot.runner import resolve_nbd_client
+
 from .config import ConfigError, HarnessConfig, validate_owned_path
 from .integrity import DurabilityFloor, floors_for
 
@@ -14,6 +16,12 @@ NBD_PORT = 10809
 WEBUI_PORT = 18080
 RPC_PORT = 18081
 NBD_DEVICE = "/dev/nbd7"
+
+# Resolved once per process and shared with vm100_pilot's migration harness;
+# see runner.resolve_nbd_client for why this must not be a bare "nbd-client"
+# string (sudo's secure_path can make a bare command name resolve
+# differently under sudo than it does directly).
+NBD_CLIENT = resolve_nbd_client()
 
 
 @dataclass(frozen=True, slots=True)
@@ -257,7 +265,7 @@ def nbd_connect_steps(config: HarnessConfig) -> tuple[Step, ...]:
         Step(
             "attach the disposable NBD device to the run-scoped export",
             (
-                "nbd-client",
+                NBD_CLIENT,
                 "127.0.0.1",
                 str(NBD_PORT),
                 NBD_DEVICE,
@@ -303,7 +311,7 @@ def nbd_disconnect_steps(config: HarnessConfig) -> tuple[Step, ...]:
     return (
         Step(
             "detach the disposable NBD device",
-            ("nbd-client", "-d", NBD_DEVICE),
+            (NBD_CLIENT, "-d", NBD_DEVICE),
             sudo=True,
             releases=(ResourceOwnership("device", NBD_DEVICE),),
         ),

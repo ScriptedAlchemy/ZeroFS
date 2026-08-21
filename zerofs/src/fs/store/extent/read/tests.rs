@@ -632,6 +632,7 @@ async fn sealed_independent_runs(
 #[tokio::test]
 async fn one_fragmented_read_fetches_independent_runs_concurrently() {
     let (store, model, gate, _) = sealed_independent_runs(8).await;
+    let metrics_store = store.clone();
     gate.hold();
     let reader = tokio::spawn(async move { store.read(1, 0, 8 * EXTENT_SIZE as u64).await });
     tokio::time::timeout(Duration::from_secs(2), async {
@@ -661,7 +662,9 @@ async fn one_fragmented_read_fetches_independent_runs_concurrently() {
         .expect("fragmented read task panicked")
         .expect("fragmented read failed");
     assert_eq!(got.as_ref(), model.as_slice());
-    let snapshot = super::metrics::last_snapshot().expect("read recorded metrics");
+    let snapshot = metrics_store
+        .last_read_metrics()
+        .expect("read recorded metrics");
     assert_eq!(snapshot.on_store_runs, 8);
     assert!(snapshot.peak_run_fetches >= 2);
 }
@@ -762,7 +765,9 @@ async fn failed_fragmented_read_releases_every_fetch_permit() {
     controls.fail_gets(64);
     let err = store.read(1, 0, 8 * EXTENT_SIZE as u64).await;
     assert!(err.is_err(), "expected failed fragmented read, got success");
-    let snapshot = super::metrics::last_snapshot().expect("failed read still records metrics");
+    let snapshot = store
+        .last_read_metrics()
+        .expect("failed read still records metrics");
     assert!(
         snapshot.peak_run_fetches > 0,
         "failed read never started a run fetch"

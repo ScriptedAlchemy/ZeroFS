@@ -1,10 +1,11 @@
 //! Shared volatile write acknowledgement overlay.
 //!
 //! WRITE owns the payload in a bounded process-wide RAM pool, publishes it to
-//! the read overlay, and only then replies.  Per-member workers materialize the
-//! accepted sequence through the ordinary filesystem path.  FLUSH/FUA wait for
-//! the captured sequence before entering the existing filesystem durability
-//! barrier.
+//! the read overlay, and only then replies.  Each runtime owns exactly one
+//! backing inode and materializes its accepted sequence in acceptance order
+//! through the ordinary filesystem path.  Striped logical writes fan out one
+//! runtime per member above this layer.  FLUSH/FUA wait for the captured
+//! sequence before entering the existing filesystem durability barrier.
 
 use crate::fs::errors::FsError;
 
@@ -26,8 +27,8 @@ use bytes::{Bytes, BytesMut};
 use futures::{FutureExt, future::BoxFuture};
 use std::collections::{BTreeMap, BTreeSet};
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{Notify, RwLock, mpsc};
 use tokio::task::JoinHandle;
@@ -37,14 +38,6 @@ pub(crate) type Materializer =
     Arc<dyn Fn(u64, u64, Bytes) -> BoxFuture<'static, OverlayResult<()>> + Send + Sync + 'static>;
 
 const GRACEFUL_DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
-
-#[derive(Debug, Clone)]
-pub(crate) struct WriteChunk {
-    pub(crate) inode: u64,
-    pub(crate) member_offset: u64,
-    pub(crate) logical_offset: usize,
-    pub(crate) length: usize,
-}
 
 #[derive(Debug)]
 struct BudgetState {
@@ -225,33 +218,9 @@ struct State {
     terminal: Option<(u64, OverlayError)>,
 }
 
-struct LogicalWrite {
+struct AcceptedWrite {
     sequence: u64,
     entry: Arc<OverlayEntry>,
-    groups: Vec<Vec<WriteChunk>>,
-}
-
-struct MemberWrite {
-    sequence: u64,
-    entry: Arc<OverlayEntry>,
-    chunks: Vec<WriteChunk>,
-    completion: Arc<LogicalCompletion>,
-}
-
-struct LogicalCompletion {
-    sequence: u64,
-    remaining: AtomicUsize,
-    runtime: Weak<VolatileWriteRuntime>,
-}
-
-impl LogicalCompletion {
-    async fn member_finished(&self) {
-        if self.remaining.fetch_sub(1, Ordering::AcqRel) == 1
-            && let Some(runtime) = self.runtime.upgrade()
-        {
-            runtime.complete(self.sequence).await;
-        }
-    }
 }
 
 pub(crate) struct VolatileWriteRuntime {
@@ -262,24 +231,18 @@ pub(crate) struct VolatileWriteRuntime {
     /// so partially materialized data can never escape through the base layer.
     retirement: RwLock<()>,
     budget: Arc<VolatileBudget>,
-    lane_inodes: Arc<[u64]>,
-    ingress: mpsc::UnboundedSender<LogicalWrite>,
+    ingress: mpsc::UnboundedSender<AcceptedWrite>,
     task_shutdown: CancellationToken,
-    task_handles: Mutex<Option<Vec<JoinHandle<()>>>>,
+    worker: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl VolatileWriteRuntime {
     pub(crate) fn new(
         budget: Arc<VolatileBudget>,
-        lane_inodes: Vec<u64>,
+        inode: u64,
         materialize: Materializer,
     ) -> Arc<Self> {
-        let lane_count = lane_inodes.len();
-        assert!(
-            lane_count > 0,
-            "volatile runtime requires at least one lane"
-        );
-        let (ingress, mut ingress_rx) = mpsc::unbounded_channel::<LogicalWrite>();
+        let (ingress, mut ingress_rx) = mpsc::unbounded_channel::<AcceptedWrite>();
         let task_shutdown = CancellationToken::new();
         let runtime = Arc::new(Self {
             state: Mutex::new(State {
@@ -293,138 +256,50 @@ impl VolatileWriteRuntime {
             changed: Notify::new(),
             retirement: RwLock::new(()),
             budget,
-            lane_inodes: lane_inodes.into(),
             ingress,
             task_shutdown: task_shutdown.clone(),
-            task_handles: Mutex::new(Some(Vec::with_capacity(lane_count + 1))),
+            worker: Mutex::new(None),
         });
 
-        let mut lane_senders = Vec::with_capacity(lane_count);
-        for _ in 0..lane_count {
-            let (sender, mut receiver) = mpsc::unbounded_channel::<MemberWrite>();
-            lane_senders.push(sender);
-            let worker_runtime_weak = Arc::downgrade(&runtime);
-            let materialize = Arc::clone(&materialize);
-            let worker_shutdown = task_shutdown.clone();
-            let handle = tokio::spawn(async move {
-                let worker_runtime = worker_runtime_weak.clone();
-                let outcome = AssertUnwindSafe(async move {
-                    loop {
-                        let member = tokio::select! {
-                            biased;
-                            _ = worker_shutdown.cancelled() => return,
-                            member = receiver.recv() => match member {
-                                Some(member) => member,
-                                None => return,
-                            },
-                        };
-                        let Some(runtime) = worker_runtime_weak.upgrade() else {
-                            return;
-                        };
-                        if runtime.terminal().is_some() {
-                            return;
-                        }
-                        let mut result = Ok(());
-                        for chunk in &member.chunks {
-                            let start = chunk.logical_offset;
-                            let data = member.entry.data.slice(start..start + chunk.length);
-                            let materialization = AssertUnwindSafe(materialize(
-                                chunk.inode,
-                                chunk.member_offset,
-                                data,
-                            ))
-                            .catch_unwind();
-                            tokio::pin!(materialization);
-                            let outcome = tokio::select! {
-                                biased;
-                                _ = worker_shutdown.cancelled() => return,
-                                outcome = &mut materialization => outcome,
-                            };
-                            match outcome {
-                                Ok(Ok(())) => {}
-                                Ok(Err(error)) => {
-                                    result = Err(error);
-                                    break;
-                                }
-                                Err(_) => {
-                                    result = Err(OverlayError::IoError);
-                                    break;
-                                }
-                            }
-                        }
-                        match result {
-                            Ok(()) => member.completion.member_finished().await,
-                            Err(error) => {
-                                runtime.fail(member.sequence, error);
-                                return;
-                            }
-                        }
-                    }
-                })
-                .catch_unwind()
-                .await;
-                if outcome.is_err()
-                    && let Some(runtime) = worker_runtime.upgrade()
-                {
-                    runtime.fail(runtime.accepted_cutoff(), OverlayError::IoError);
-                }
-            });
-            runtime
-                .task_handles
-                .lock()
-                .expect("volatile task handles poisoned")
-                .as_mut()
-                .expect("volatile tasks not yet shut down")
-                .push(handle);
-        }
-
-        let weak_runtime = Arc::downgrade(&runtime);
-        let dispatcher_runtime = weak_runtime.clone();
-        let dispatcher_shutdown = task_shutdown;
-        let dispatcher = tokio::spawn(async move {
+        let worker_runtime_weak = Arc::downgrade(&runtime);
+        let panic_runtime_weak = worker_runtime_weak.clone();
+        let worker_shutdown = task_shutdown;
+        let handle = tokio::spawn(async move {
             let outcome = AssertUnwindSafe(async move {
                 loop {
                     let write = tokio::select! {
                         biased;
-                        _ = dispatcher_shutdown.cancelled() => return,
+                        _ = worker_shutdown.cancelled() => return,
                         write = ingress_rx.recv() => match write {
                             Some(write) => write,
                             None => return,
                         },
                     };
-                    let Some(runtime) = weak_runtime.upgrade() else {
+                    let Some(runtime) = worker_runtime_weak.upgrade() else {
                         return;
                     };
                     if runtime.terminal().is_some() {
-                        continue;
+                        return;
                     }
-                    let touched = write
-                        .groups
-                        .iter()
-                        .filter(|group| !group.is_empty())
-                        .count();
-                    let completion = Arc::new(LogicalCompletion {
-                        sequence: write.sequence,
-                        remaining: AtomicUsize::new(touched),
-                        runtime: Arc::downgrade(&runtime),
-                    });
-                    if touched == 0 {
-                        runtime.complete(write.sequence).await;
-                        continue;
-                    }
-                    for (lane, chunks) in write.groups.into_iter().enumerate() {
-                        if chunks.is_empty() {
-                            continue;
+                    let materialization = AssertUnwindSafe(materialize(
+                        inode,
+                        write.entry.offset,
+                        write.entry.data.clone(),
+                    ))
+                    .catch_unwind();
+                    tokio::pin!(materialization);
+                    let outcome = tokio::select! {
+                        biased;
+                        _ = worker_shutdown.cancelled() => return,
+                        outcome = &mut materialization => outcome,
+                    };
+                    match outcome {
+                        Ok(Ok(())) => runtime.complete(write.sequence).await,
+                        Ok(Err(error)) => {
+                            runtime.fail(write.sequence, error);
+                            return;
                         }
-                        if lane_senders[lane]
-                            .send(MemberWrite {
-                                sequence: write.sequence,
-                                entry: Arc::clone(&write.entry),
-                                chunks,
-                                completion: Arc::clone(&completion),
-                            })
-                            .is_err()
-                        {
+                        Err(_) => {
                             runtime.fail(write.sequence, OverlayError::IoError);
                             return;
                         }
@@ -434,18 +309,12 @@ impl VolatileWriteRuntime {
             .catch_unwind()
             .await;
             if outcome.is_err()
-                && let Some(runtime) = dispatcher_runtime.upgrade()
+                && let Some(runtime) = panic_runtime_weak.upgrade()
             {
                 runtime.fail(runtime.accepted_cutoff(), OverlayError::IoError);
             }
         });
-        runtime
-            .task_handles
-            .lock()
-            .expect("volatile task handles poisoned")
-            .as_mut()
-            .expect("volatile tasks not yet shut down")
-            .push(dispatcher);
+        *runtime.worker.lock().expect("volatile worker poisoned") = Some(handle);
 
         runtime
     }
@@ -470,49 +339,34 @@ impl VolatileWriteRuntime {
         }
     }
 
-    #[allow(dead_code)]
-    pub(crate) async fn accept_write(
+    /// Accept a write that is visible the moment it is accepted, the shape a
+    /// single-member logical write has once its preparation is published.
+    #[cfg(test)]
+    async fn accept_write(
         &self,
         admission: VolatileAdmission,
         offset: u64,
         data: Bytes,
-        groups: Vec<Vec<WriteChunk>>,
     ) -> OverlayResult<u64> {
-        self.accept_write_with_visibility(
-            admission,
-            offset,
-            data,
-            groups,
-            WriteVisibility::published(),
-        )
-        .await
+        self.accept_staged_write(admission, offset, data, WriteVisibility::published())
+            .await
     }
 
+    /// Stage one write for this runtime's inode. The caller publishes
+    /// `visibility` once every member of its logical write is accepted; a
+    /// write staged with an already-published token is accounted immediately.
     pub(crate) async fn accept_staged_write(
         &self,
         admission: VolatileAdmission,
         offset: u64,
         data: Bytes,
-        groups: Vec<Vec<WriteChunk>>,
-        visibility: Arc<WriteVisibility>,
-    ) -> OverlayResult<u64> {
-        self.accept_write_with_visibility(admission, offset, data, groups, visibility)
-            .await
-    }
-
-    async fn accept_write_with_visibility(
-        &self,
-        admission: VolatileAdmission,
-        offset: u64,
-        data: Bytes,
-        groups: Vec<Vec<WriteChunk>>,
         visibility: Arc<WriteVisibility>,
     ) -> OverlayResult<u64> {
         let record_accepted = visibility.is_published();
         if admission.permit.bytes != data.len() as u64 {
             return Err(OverlayError::InvalidArgument);
         }
-        if !valid_write_groups(&data, &groups, &self.lane_inodes) {
+        if data.is_empty() || offset.checked_add(data.len() as u64).is_none() {
             return Err(OverlayError::InvalidArgument);
         }
         if self.budget.is_terminal() {
@@ -537,11 +391,7 @@ impl VolatileWriteRuntime {
         state.entries.insert(sequence, Arc::clone(&entry));
         if self
             .ingress
-            .send(LogicalWrite {
-                sequence,
-                entry,
-                groups,
-            })
+            .send(AcceptedWrite { sequence, entry })
             .is_err()
         {
             state.terminal = Some((sequence, OverlayError::IoError));
@@ -699,17 +549,12 @@ impl VolatileWriteRuntime {
                 }
             };
         self.task_shutdown.cancel();
-        let handles = self
-            .task_handles
-            .lock()
-            .expect("volatile task handles poisoned")
-            .take()
-            .unwrap_or_default();
-        for handle in handles {
-            if handle.await.is_err() {
-                self.fail(cutoff, OverlayError::IoError);
-                result = Err(OverlayError::IoError);
-            }
+        let worker = self.worker.lock().expect("volatile worker poisoned").take();
+        if let Some(worker) = worker
+            && worker.await.is_err()
+        {
+            self.fail(cutoff, OverlayError::IoError);
+            result = Err(OverlayError::IoError);
         }
         result
     }
@@ -790,41 +635,6 @@ pub(crate) fn record_published_staged_writes(bytes: u64, operations: u64) {
     metrics::counter!("zerofs_nbd_volatile_bytes_accepted_total").increment(bytes);
 }
 
-fn valid_write_groups(data: &Bytes, groups: &[Vec<WriteChunk>], lane_inodes: &[u64]) -> bool {
-    if data.is_empty() || groups.len() != lane_inodes.len() {
-        return false;
-    }
-    let mut spans = Vec::new();
-    for (lane, chunks) in groups.iter().enumerate() {
-        for chunk in chunks {
-            if chunk.inode != lane_inodes[lane] || chunk.length == 0 {
-                return false;
-            }
-            let Some(logical_end) = chunk.logical_offset.checked_add(chunk.length) else {
-                return false;
-            };
-            if logical_end > data.len()
-                || chunk
-                    .member_offset
-                    .checked_add(chunk.length as u64)
-                    .is_none()
-            {
-                return false;
-            }
-            spans.push((chunk.logical_offset, logical_end));
-        }
-    }
-    spans.sort_unstable();
-    let mut covered_through = 0;
-    for (start, end) in spans {
-        if start != covered_through {
-            return false;
-        }
-        covered_through = end;
-    }
-    covered_through == data.len()
-}
-
 fn overlap(
     request_offset: u64,
     request_len: usize,
@@ -895,22 +705,13 @@ fn fully_covered(
 
 #[cfg(test)]
 mod tests {
-    use super::{Materializer, VolatileBudget, VolatileWriteRuntime, WriteChunk};
+    use super::{Materializer, VolatileBudget, VolatileWriteRuntime};
     use bytes::Bytes;
     use futures::FutureExt;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::sync::{Notify, mpsc};
-
-    fn one_chunk(length: usize) -> Vec<Vec<WriteChunk>> {
-        vec![vec![WriteChunk {
-            inode: 7,
-            member_offset: 0,
-            logical_offset: 0,
-            length,
-        }]]
-    }
 
     #[tokio::test]
     async fn acknowledges_and_reads_before_materialization() {
@@ -931,10 +732,10 @@ mod tests {
             })
         };
         let budget = VolatileBudget::new(4096, 16);
-        let runtime = VolatileWriteRuntime::new(Arc::clone(&budget), vec![7], materialize);
+        let runtime = VolatileWriteRuntime::new(Arc::clone(&budget), 7, materialize);
         let admission = runtime.reserve(4).await.unwrap();
         runtime
-            .accept_write(admission, 0, Bytes::from_static(b"fast"), one_chunk(4))
+            .accept_write(admission, 0, Bytes::from_static(b"fast"))
             .await
             .unwrap();
         entered.notified().await;
@@ -967,26 +768,15 @@ mod tests {
                 .boxed()
             })
         };
-        let runtime =
-            VolatileWriteRuntime::new(VolatileBudget::new(4096, 16), vec![7], materialize);
+        let runtime = VolatileWriteRuntime::new(VolatileBudget::new(4096, 16), 7, materialize);
         let first = runtime.reserve(4).await.unwrap();
         runtime
-            .accept_write(first, 0, Bytes::from_static(b"aaaa"), one_chunk(4))
+            .accept_write(first, 0, Bytes::from_static(b"aaaa"))
             .await
             .unwrap();
         let second = runtime.reserve(2).await.unwrap();
         runtime
-            .accept_write(
-                second,
-                1,
-                Bytes::from_static(b"BB"),
-                vec![vec![WriteChunk {
-                    inode: 7,
-                    member_offset: 1,
-                    logical_offset: 0,
-                    length: 2,
-                }]],
-            )
+            .accept_write(second, 1, Bytes::from_static(b"BB"))
             .await
             .unwrap();
 
@@ -1014,21 +804,10 @@ mod tests {
                 .boxed()
             })
         };
-        let runtime =
-            VolatileWriteRuntime::new(VolatileBudget::new(4096, 16), vec![7], materialize);
+        let runtime = VolatileWriteRuntime::new(VolatileBudget::new(4096, 16), 7, materialize);
         let admission = runtime.reserve(2).await.unwrap();
         runtime
-            .accept_write(
-                admission,
-                1,
-                Bytes::from_static(b"XX"),
-                vec![vec![WriteChunk {
-                    inode: 7,
-                    member_offset: 1,
-                    logical_offset: 0,
-                    length: 2,
-                }]],
-            )
+            .accept_write(admission, 1, Bytes::from_static(b"XX"))
             .await
             .unwrap();
 
@@ -1054,10 +833,10 @@ mod tests {
                 .boxed()
             })
         };
-        let runtime = VolatileWriteRuntime::new(VolatileBudget::new(4, 16), vec![7], materialize);
+        let runtime = VolatileWriteRuntime::new(VolatileBudget::new(4, 16), 7, materialize);
         let admission = runtime.reserve(4).await.unwrap();
         runtime
-            .accept_write(admission, 0, Bytes::from_static(b"full"), one_chunk(4))
+            .accept_write(admission, 0, Bytes::from_static(b"full"))
             .await
             .unwrap();
 
@@ -1075,50 +854,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn malformed_chunk_geometry_is_rejected_before_acknowledgement() {
+    async fn malformed_write_geometry_is_rejected_before_acknowledgement() {
         let materialize: Materializer = Arc::new(|_, _, _| async { Ok(()) }.boxed());
         let budget = VolatileBudget::new(4096, 16);
-        let runtime = VolatileWriteRuntime::new(Arc::clone(&budget), vec![7], materialize);
-        let admission = runtime.reserve(4).await.unwrap();
-        let result = runtime
-            .accept_write(
-                admission,
-                0,
-                Bytes::from_static(b"tiny"),
-                vec![vec![WriteChunk {
-                    inode: 7,
-                    member_offset: 0,
-                    logical_offset: 3,
-                    length: 2,
-                }]],
-            )
-            .await;
+        let runtime = VolatileWriteRuntime::new(Arc::clone(&budget), 7, materialize);
 
+        let empty = runtime.reserve(0).await.unwrap();
+        let result = runtime.accept_write(empty, 0, Bytes::new()).await;
         assert!(matches!(result, Err(super::OverlayError::InvalidArgument)));
         assert_eq!(runtime.accepted_cutoff(), 0);
         assert_eq!(budget.used_bytes(), 0);
-    }
 
-    #[tokio::test]
-    async fn cross_lane_chunk_is_rejected_before_acknowledgement() {
-        let materialize: Materializer = Arc::new(|_, _, _| async { Ok(()) }.boxed());
-        let budget = VolatileBudget::new(4096, 16);
-        let runtime = VolatileWriteRuntime::new(Arc::clone(&budget), vec![7], materialize);
-        let admission = runtime.reserve(4).await.unwrap();
+        let overflowing = runtime.reserve(4).await.unwrap();
         let result = runtime
-            .accept_write(
-                admission,
-                0,
-                Bytes::from_static(b"tiny"),
-                vec![vec![WriteChunk {
-                    inode: 8,
-                    member_offset: 0,
-                    logical_offset: 0,
-                    length: 4,
-                }]],
-            )
+            .accept_write(overflowing, u64::MAX - 1, Bytes::from_static(b"tiny"))
             .await;
+        assert!(matches!(result, Err(super::OverlayError::InvalidArgument)));
+        assert_eq!(runtime.accepted_cutoff(), 0);
+        assert_eq!(budget.used_bytes(), 0);
 
+        let mismatched = runtime.reserve(8).await.unwrap();
+        let result = runtime
+            .accept_write(mismatched, 0, Bytes::from_static(b"tiny"))
+            .await;
         assert!(matches!(result, Err(super::OverlayError::InvalidArgument)));
         assert_eq!(runtime.accepted_cutoff(), 0);
         assert_eq!(budget.used_bytes(), 0);
@@ -1143,15 +901,15 @@ mod tests {
             })
         };
         let budget = VolatileBudget::new(4, 16);
-        let first = VolatileWriteRuntime::new(Arc::clone(&budget), vec![7], failing_materializer);
+        let first = VolatileWriteRuntime::new(Arc::clone(&budget), 7, failing_materializer);
         let second = VolatileWriteRuntime::new(
             Arc::clone(&budget),
-            vec![8],
+            8,
             Arc::new(|_, _, _| async { Ok(()) }.boxed()),
         );
         let admission = first.reserve(4).await.unwrap();
         first
-            .accept_write(admission, 0, Bytes::from_static(b"full"), one_chunk(4))
+            .accept_write(admission, 0, Bytes::from_static(b"full"))
             .await
             .unwrap();
         entered.notified().await;
@@ -1202,31 +960,16 @@ mod tests {
             })
         };
         let budget = VolatileBudget::new(16, 16);
-        let first = VolatileWriteRuntime::new(Arc::clone(&budget), vec![7], failing_materializer);
-        let second = VolatileWriteRuntime::new(Arc::clone(&budget), vec![8], blocked_materializer);
+        let first = VolatileWriteRuntime::new(Arc::clone(&budget), 7, failing_materializer);
+        let second = VolatileWriteRuntime::new(Arc::clone(&budget), 8, blocked_materializer);
         let first_admission = first.reserve(4).await.unwrap();
         first
-            .accept_write(
-                first_admission,
-                0,
-                Bytes::from_static(b"fail"),
-                one_chunk(4),
-            )
+            .accept_write(first_admission, 0, Bytes::from_static(b"fail"))
             .await
             .unwrap();
         let second_admission = second.reserve(4).await.unwrap();
         second
-            .accept_write(
-                second_admission,
-                0,
-                Bytes::from_static(b"wait"),
-                vec![vec![WriteChunk {
-                    inode: 8,
-                    member_offset: 0,
-                    logical_offset: 0,
-                    length: 4,
-                }]],
-            )
+            .accept_write(second_admission, 0, Bytes::from_static(b"wait"))
             .await
             .unwrap();
         first_entered.notified().await;
@@ -1283,31 +1026,16 @@ mod tests {
             })
         };
         let budget = VolatileBudget::new(16, 16);
-        let first = VolatileWriteRuntime::new(Arc::clone(&budget), vec![7], failing_materializer);
-        let second = VolatileWriteRuntime::new(Arc::clone(&budget), vec![8], healthy_materializer);
+        let first = VolatileWriteRuntime::new(Arc::clone(&budget), 7, failing_materializer);
+        let second = VolatileWriteRuntime::new(Arc::clone(&budget), 8, healthy_materializer);
         let first_admission = first.reserve(4).await.unwrap();
         first
-            .accept_write(
-                first_admission,
-                0,
-                Bytes::from_static(b"fail"),
-                one_chunk(4),
-            )
+            .accept_write(first_admission, 0, Bytes::from_static(b"fail"))
             .await
             .unwrap();
         let second_admission = second.reserve(4).await.unwrap();
         second
-            .accept_write(
-                second_admission,
-                0,
-                Bytes::from_static(b"keep"),
-                vec![vec![WriteChunk {
-                    inode: 8,
-                    member_offset: 0,
-                    logical_offset: 0,
-                    length: 4,
-                }]],
-            )
+            .accept_write(second_admission, 0, Bytes::from_static(b"keep"))
             .await
             .unwrap();
         second_entered.notified().await;
@@ -1360,8 +1088,7 @@ mod tests {
                 .boxed()
             })
         };
-        let runtime =
-            VolatileWriteRuntime::new(VolatileBudget::new(4096, 16), vec![7], materialize);
+        let runtime = VolatileWriteRuntime::new(VolatileBudget::new(4096, 16), 7, materialize);
         let base_entered = Arc::new(Notify::new());
         let base_release = Arc::new(Notify::new());
         let reader_runtime = Arc::clone(&runtime);
@@ -1386,17 +1113,7 @@ mod tests {
         let admission = runtime.reserve(2).await.unwrap();
         tokio::time::timeout(
             Duration::from_millis(250),
-            runtime.accept_write(
-                admission,
-                1,
-                Bytes::from_static(b"XX"),
-                vec![vec![WriteChunk {
-                    inode: 7,
-                    member_offset: 1,
-                    logical_offset: 0,
-                    length: 2,
-                }]],
-            ),
+            runtime.accept_write(admission, 1, Bytes::from_static(b"XX")),
         )
         .await
         .expect("slow base read must not delay volatile acknowledgement")
@@ -1417,11 +1134,10 @@ mod tests {
             }
             .boxed()
         });
-        let runtime =
-            VolatileWriteRuntime::new(VolatileBudget::new(4096, 16), vec![7], materialize);
+        let runtime = VolatileWriteRuntime::new(VolatileBudget::new(4096, 16), 7, materialize);
         let admission = runtime.reserve(4).await.unwrap();
         runtime
-            .accept_write(admission, 0, Bytes::from_static(b"boom"), one_chunk(4))
+            .accept_write(admission, 0, Bytes::from_static(b"boom"))
             .await
             .unwrap();
 
@@ -1447,11 +1163,10 @@ mod tests {
                 .boxed()
             })
         };
-        let runtime =
-            VolatileWriteRuntime::new(VolatileBudget::new(4096, 16), vec![7], materialize);
+        let runtime = VolatileWriteRuntime::new(VolatileBudget::new(4096, 16), 7, materialize);
         let admission = runtime.reserve(4).await.unwrap();
         runtime
-            .accept_write(admission, 0, Bytes::from_static(b"data"), one_chunk(4))
+            .accept_write(admission, 0, Bytes::from_static(b"data"))
             .await
             .unwrap();
         entered.notified().await;
@@ -1478,11 +1193,10 @@ mod tests {
                 .boxed()
             })
         };
-        let runtime =
-            VolatileWriteRuntime::new(VolatileBudget::new(4096, 16), vec![7], materialize);
+        let runtime = VolatileWriteRuntime::new(VolatileBudget::new(4096, 16), 7, materialize);
         let admission = runtime.reserve(4).await.unwrap();
         runtime
-            .accept_write(admission, 0, Bytes::from_static(b"data"), one_chunk(4))
+            .accept_write(admission, 0, Bytes::from_static(b"data"))
             .await
             .unwrap();
         entered.notified().await;
@@ -1508,20 +1222,15 @@ mod tests {
             })
         };
         let budget = VolatileBudget::new(16, 16);
-        let first = VolatileWriteRuntime::new(Arc::clone(&budget), vec![7], failing_materializer);
+        let first = VolatileWriteRuntime::new(Arc::clone(&budget), 7, failing_materializer);
         let second = VolatileWriteRuntime::new(
             Arc::clone(&budget),
-            vec![8],
+            8,
             Arc::new(|_, _, _| async { Ok(()) }.boxed()),
         );
         let first_admission = first.reserve(4).await.unwrap();
         first
-            .accept_write(
-                first_admission,
-                0,
-                Bytes::from_static(b"fail"),
-                one_chunk(4),
-            )
+            .accept_write(first_admission, 0, Bytes::from_static(b"fail"))
             .await
             .unwrap();
         let reserved_before_failure = second.reserve(4).await.unwrap();
@@ -1532,17 +1241,7 @@ mod tests {
             .unwrap_err();
 
         let result = second
-            .accept_write(
-                reserved_before_failure,
-                0,
-                Bytes::from_static(b"late"),
-                vec![vec![WriteChunk {
-                    inode: 8,
-                    member_offset: 0,
-                    logical_offset: 0,
-                    length: 4,
-                }]],
-            )
+            .accept_write(reserved_before_failure, 0, Bytes::from_static(b"late"))
             .await;
         assert!(matches!(result, Err(super::OverlayError::IoError)));
         assert!(matches!(
@@ -1555,11 +1254,10 @@ mod tests {
     async fn terminal_materialization_failure_retains_acknowledged_read_view() {
         let materialize: Materializer =
             Arc::new(|_, _, _| async { Err(super::OverlayError::IoError) }.boxed());
-        let runtime =
-            VolatileWriteRuntime::new(VolatileBudget::new(4096, 16), vec![7], materialize);
+        let runtime = VolatileWriteRuntime::new(VolatileBudget::new(4096, 16), 7, materialize);
         let admission = runtime.reserve(4).await.unwrap();
         runtime
-            .accept_write(admission, 0, Bytes::from_static(b"data"), one_chunk(4))
+            .accept_write(admission, 0, Bytes::from_static(b"data"))
             .await
             .unwrap();
         runtime.wait_materialized(1).await.unwrap_err();
@@ -1575,21 +1273,10 @@ mod tests {
     async fn terminal_partial_read_merges_frozen_overlay_over_canonical_base() {
         let materialize: Materializer =
             Arc::new(|_, _, _| async { Err(super::OverlayError::IoError) }.boxed());
-        let runtime =
-            VolatileWriteRuntime::new(VolatileBudget::new(4096, 16), vec![7], materialize);
+        let runtime = VolatileWriteRuntime::new(VolatileBudget::new(4096, 16), 7, materialize);
         let admission = runtime.reserve(2).await.unwrap();
         runtime
-            .accept_write(
-                admission,
-                1,
-                Bytes::from_static(b"XX"),
-                vec![vec![WriteChunk {
-                    inode: 7,
-                    member_offset: 1,
-                    logical_offset: 0,
-                    length: 2,
-                }]],
-            )
+            .accept_write(admission, 1, Bytes::from_static(b"XX"))
             .await
             .unwrap();
         runtime.wait_materialized(1).await.unwrap_err();
@@ -1621,22 +1308,11 @@ mod tests {
                 .boxed()
             })
         };
-        let runtime =
-            VolatileWriteRuntime::new(VolatileBudget::new(4096, 16), vec![7], materialize);
+        let runtime = VolatileWriteRuntime::new(VolatileBudget::new(4096, 16), 7, materialize);
         for offset in [0, 4] {
             let admission = runtime.reserve(4).await.unwrap();
             runtime
-                .accept_write(
-                    admission,
-                    offset,
-                    Bytes::from_static(b"data"),
-                    vec![vec![WriteChunk {
-                        inode: 7,
-                        member_offset: offset,
-                        logical_offset: 0,
-                        length: 4,
-                    }]],
-                )
+                .accept_write(admission, offset, Bytes::from_static(b"data"))
                 .await
                 .unwrap();
         }
@@ -1652,7 +1328,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn one_lane_materializes_writes_in_acceptance_order() {
+    async fn writes_materialize_in_acceptance_order() {
         let release_first = Arc::new(Notify::new());
         let call_count = Arc::new(AtomicUsize::new(0));
         let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
@@ -1674,23 +1350,12 @@ mod tests {
                 .boxed()
             })
         };
-        let runtime =
-            VolatileWriteRuntime::new(VolatileBudget::new(4096, 16), vec![7], materialize);
+        let runtime = VolatileWriteRuntime::new(VolatileBudget::new(4096, 16), 7, materialize);
 
         for (offset, data) in [(0, b"first".as_slice()), (5, b"second".as_slice())] {
             let admission = runtime.reserve(data.len()).await.unwrap();
             runtime
-                .accept_write(
-                    admission,
-                    offset,
-                    Bytes::copy_from_slice(data),
-                    vec![vec![WriteChunk {
-                        inode: 7,
-                        member_offset: offset,
-                        logical_offset: 0,
-                        length: data.len(),
-                    }]],
-                )
+                .accept_write(admission, offset, Bytes::copy_from_slice(data))
                 .await
                 .unwrap();
         }
@@ -1708,6 +1373,8 @@ mod tests {
         runtime.shutdown().await.unwrap();
     }
 
+    /// A striped logical write stages one member per lane runtime, so the two
+    /// members must materialize concurrently rather than serially.
     #[tokio::test]
     async fn distinct_lanes_materialize_one_logical_write_in_parallel() {
         let release = Arc::new(Notify::new());
@@ -1725,31 +1392,23 @@ mod tests {
                 .boxed()
             })
         };
-        let runtime =
-            VolatileWriteRuntime::new(VolatileBudget::new(4096, 16), vec![7, 8], materialize);
-        let admission = runtime.reserve(4).await.unwrap();
-        runtime
-            .accept_write(
+        let budget = VolatileBudget::new(4096, 16);
+        let first_lane =
+            VolatileWriteRuntime::new(Arc::clone(&budget), 7, Arc::clone(&materialize));
+        let second_lane = VolatileWriteRuntime::new(Arc::clone(&budget), 8, materialize);
+        let visibility = super::WriteVisibility::staged();
+        for lane in [&first_lane, &second_lane] {
+            let admission = lane.reserve(2).await.unwrap();
+            lane.accept_staged_write(
                 admission,
                 0,
-                Bytes::from_static(b"data"),
-                vec![
-                    vec![WriteChunk {
-                        inode: 7,
-                        member_offset: 0,
-                        logical_offset: 0,
-                        length: 2,
-                    }],
-                    vec![WriteChunk {
-                        inode: 8,
-                        member_offset: 0,
-                        logical_offset: 2,
-                        length: 2,
-                    }],
-                ],
+                Bytes::from_static(b"da"),
+                Arc::clone(&visibility),
             )
             .await
             .unwrap();
+        }
+        visibility.publish();
 
         let first = entered_rx.recv().await.unwrap();
         let second = tokio::time::timeout(Duration::from_millis(250), entered_rx.recv())
@@ -1758,8 +1417,10 @@ mod tests {
             .unwrap();
         assert_ne!(first, second);
         release.notify_waiters();
-        runtime.wait_materialized(1).await.unwrap();
-        runtime.shutdown().await.unwrap();
+        first_lane.wait_materialized(1).await.unwrap();
+        second_lane.wait_materialized(1).await.unwrap();
+        first_lane.shutdown().await.unwrap();
+        second_lane.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -1777,10 +1438,10 @@ mod tests {
             })
         };
         let budget = VolatileBudget::new(8, 2);
-        let runtime = VolatileWriteRuntime::new(Arc::clone(&budget), vec![7], materialize);
+        let runtime = VolatileWriteRuntime::new(Arc::clone(&budget), 7, materialize);
         let admission = runtime.reserve(4).await.unwrap();
         runtime
-            .accept_write(admission, 0, Bytes::from_static(b"data"), one_chunk(4))
+            .accept_write(admission, 0, Bytes::from_static(b"data"))
             .await
             .unwrap();
 

@@ -848,7 +848,21 @@ impl DedupCache {
         self.notify_reclaim(reclaim);
     }
 
+    #[cfg(test)]
     pub(crate) fn replay_write(&self, op_id: &OpId, fingerprint: [u8; 32]) -> Option<WriteReplay> {
+        self.replay_write_entry(op_id, fingerprint)
+            .map(|(replay, _)| replay)
+    }
+
+    /// The replay verdict together with the completed result it judges, read
+    /// under one lock. A caller that must both reject a fingerprint collision
+    /// and answer a replay with the original attributes therefore cannot
+    /// observe an expiry between two separate lookups.
+    pub(crate) fn replay_write_entry(
+        &self,
+        op_id: &OpId,
+        fingerprint: [u8; 32],
+    ) -> Option<(WriteReplay, FileAttributes)> {
         if !has_op_id(op_id) {
             return None;
         }
@@ -861,16 +875,18 @@ impl DedupCache {
         if entry.retracted {
             return None;
         }
-        if !matches!(entry.value, DedupResult::Write { .. }) {
+        let DedupResult::Write { attrs } = &entry.value else {
             return None;
-        }
-        Some(match entry.write_request {
+        };
+        let attrs = attrs.clone();
+        let replay = match entry.write_request {
             Some(request) if request.fingerprint == fingerprint => WriteReplay::Match {
                 count: request.count,
             },
             Some(_) => WriteReplay::FingerprintMismatch,
             None => WriteReplay::Legacy,
-        })
+        };
+        Some((replay, attrs))
     }
 
     #[cfg(test)]

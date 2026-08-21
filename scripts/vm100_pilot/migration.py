@@ -12,11 +12,15 @@ from typing import Callable, Iterator, Protocol
 
 from .config import PilotConfig
 from .lifecycle import PilotLifecycle
-from .runner import Runner
+from .runner import Runner, resolve_nbd_client
 from .system_io import install_config_text
 
 
 _EXPORT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+
+# Resolved once per process; see runner.resolve_nbd_client for why this must
+# not be a bare "nbd-client" string.
+NBD_CLIENT = resolve_nbd_client()
 
 
 class ExportNamespace(Protocol):
@@ -225,7 +229,7 @@ class StripedMigrator:
     def _attach_stage(self, replacement: str) -> None:
         self.runner.run(
             [
-                "/usr/sbin/nbd-client",
+                NBD_CLIENT,
                 "-unix",
                 self.config.nbd_socket,
                 self.config.migration_device,
@@ -249,7 +253,7 @@ class StripedMigrator:
             )
         if self._device_size() != 0:
             self.runner.run(
-                ["/usr/sbin/nbd-client", "-d", self.config.migration_device],
+                [NBD_CLIENT, "-d", self.config.migration_device],
                 sudo=True,
                 timeout=120,
             )

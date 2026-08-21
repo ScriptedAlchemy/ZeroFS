@@ -151,6 +151,10 @@ pub struct ExtentStore {
     /// Test-only gate that can pause `seal_open` after rotating its generation.
     #[cfg(test)]
     seal_open_put_gate: Option<Arc<Semaphore>>,
+    /// Test observation slot: metrics snapshot of this store's most recent
+    /// fragmented read. Arc-shared so clones observe the same slot.
+    #[cfg(test)]
+    last_read_metrics: Arc<Mutex<Option<read::metrics::ReadRunSnapshot>>>,
     /// Writers hold the read side from FrameLoc assignment through commit; GC
     /// takes the write side before sealing and choosing its cutoff.
     extent_ref_barrier: Arc<tokio::sync::RwLock<()>>,
@@ -301,6 +305,8 @@ impl ExtentStore {
             before_batch_seal: None,
             #[cfg(test)]
             seal_open_put_gate: None,
+            #[cfg(test)]
+            last_read_metrics: Arc::new(Mutex::new(None)),
             extent_ref_barrier: Arc::new(tokio::sync::RwLock::new(())),
             sealing: Arc::new(Mutex::new(BTreeMap::new())),
             seal_upload_sem: Arc::new(Semaphore::new(max_inflight_seals)),

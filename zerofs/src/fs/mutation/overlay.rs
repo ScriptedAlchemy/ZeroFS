@@ -7,19 +7,21 @@
 
 use super::admission::{PreparationAbort, PreparationGuard};
 use super::overlay_dispatch::PendingDispatch;
-use super::overlay_helpers::{direct_write_fingerprint, mutation_fs_error, overlay_fs_error};
+use super::overlay_helpers::{
+    direct_write_fingerprint, overlay_fs_error, write_admission_fs_error,
+};
 use super::volatile_overlay::{
     Materializer, OverlayError, OverlayResult, VolatileAdmission, VolatileBudget,
-    VolatileWriteRuntime, WriteChunk, WriteVisibility, record_published_staged_writes,
+    VolatileWriteRuntime, WriteVisibility, record_published_staged_writes,
 };
 use crate::fs::ZeroFS;
 use crate::fs::errors::FsError;
 use crate::fs::inode::{Inode, InodeId};
 use crate::fs::mutation::config::FilesystemWriteAckMode;
-use crate::fs::mutation::request_cache::RequestLookup;
+use crate::fs::mutation::request_cache::{RequestLookup, RetainedRequest};
 use crate::fs::mutation::types::{
-    ConflictKey, ConflictScope, MutationCutoff, PrepareWriteMember, PrepareWriteRequest,
-    PreparedWriteBatch, RequestFingerprint, RequestIdentity, RequestLifetime,
+    ConflictKey, ConflictScope, MutationCutoff, MutationError, PrepareWriteMember,
+    PrepareWriteRequest, PreparedWriteBatch, RequestFingerprint, RequestIdentity, RequestLifetime,
 };
 use crate::fs::ops::write::{apply_prepared_batch, prepare_write};
 use crate::fs::types::{AuthContext, FileAttributes};
@@ -55,6 +57,28 @@ struct VisibleAttrs {
 pub(crate) struct WriteAckReceipt {
     pub(crate) attrs: FileAttributes,
     pub(crate) cutoff: MutationCutoff,
+}
+
+/// Outcome of the shared write-admission sequence.
+pub(crate) enum WriteAdmission {
+    /// This caller owns the preparation and must publish or abort it.
+    Prepared(PreparationGuard),
+    /// An identical request already owns a preparation; its result answers
+    /// this one, so nothing further is admitted.
+    Joined(Arc<RetainedRequest>),
+}
+
+/// Why a write could not enter shared admission. Each protocol maps these
+/// onto its own error vocabulary; the sequence itself stays protocol-agnostic.
+pub(crate) enum WriteAdmissionError {
+    /// The mutation coordinator or its request cache is gone.
+    Unavailable,
+    /// Request-cache pressure: no operation slot for new work.
+    Backpressured,
+    /// A live request reused this identity with a different body.
+    FingerprintMismatch,
+    /// Raw byte admission or the preparation gate refused the write.
+    Mutation(MutationError),
 }
 
 pub(crate) struct IdentifiedWrite<'a> {
@@ -133,7 +157,7 @@ impl FilesystemVolatileOverlay {
                     let overlay = Arc::clone(&overlay);
                     Box::pin(async move { overlay.materialize(inode, offset, data).await })
                 });
-                VolatileWriteRuntime::new(Arc::clone(&self.budget), vec![inode], materialize)
+                VolatileWriteRuntime::new(Arc::clone(&self.budget), inode, materialize)
             })
             .clone()
     }
@@ -351,19 +375,12 @@ impl FilesystemVolatileOverlay {
         }
         let mut accepted_runtimes = Vec::with_capacity(members.len());
         for (admission, member) in admissions.into_iter().zip(members.iter()) {
-            let groups = vec![vec![WriteChunk {
-                inode: member.id,
-                member_offset: member.offset,
-                logical_offset: 0,
-                length: member.data.len(),
-            }]];
             let runtime = self.runtime(member.id);
             match runtime
                 .accept_staged_write(
                     admission,
                     member.offset,
                     member.data.clone(),
-                    groups,
                     Arc::clone(&visibility),
                 )
                 .await
@@ -718,45 +735,33 @@ impl ZeroFS {
             let result = apply_prepared_batch(&self.write_apply_context(), &mut batch).await?;
             return Ok(result.primary_attrs());
         }
-        let coordinator = self.mutation_coordinator.get().ok_or(FsError::IoError)?;
-        let request_cache = coordinator.request_cache();
-        let pending = match request_cache
-            .lookup_or_reserve(
-                RequestIdentity::DirectOneShot(uuid::Uuid::new_v4()),
-                RequestFingerprint::from_bytes([0; 32]),
-                RequestLifetime::OneShot,
-            )
-            .map_err(|_| FsError::IoError)?
-        {
-            RequestLookup::Vacant(vacancy) => vacancy.begin_pending(),
-            RequestLookup::Joined(retained) => return Ok(retained.wait().await?.primary_attrs()),
-            RequestLookup::FingerprintMismatch => return Err(FsError::InvalidArgument),
-            RequestLookup::Backpressured => return Err(FsError::RetryLater),
-        };
         let raw_bytes = request.members.iter().try_fold(0_u64, |total, member| {
             total.checked_add(member.data.len() as u64)
         });
         let Some(raw_bytes) = raw_bytes else {
-            pending.cancel();
             return Err(FsError::NoSpace);
         };
-        let raw_permit = coordinator
-            .raw_budget()
-            .acquire(raw_bytes)
+        let guard = match self
+            .begin_write_admission(
+                RequestIdentity::DirectOneShot(uuid::Uuid::new_v4()),
+                RequestFingerprint::from_bytes([0; 32]),
+                RequestLifetime::OneShot,
+                ConflictScope::new(
+                    request
+                        .members
+                        .iter()
+                        .map(|member| ConflictKey::Inode(member.id)),
+                ),
+                raw_bytes,
+            )
             .await
-            .map_err(mutation_fs_error)?;
-        let guard = PreparationGuard::new(
-            coordinator.gate(),
-            ConflictScope::new(
-                request
-                    .members
-                    .iter()
-                    .map(|member| ConflictKey::Inode(member.id)),
-            ),
-            raw_permit,
-            pending,
-        )
-        .map_err(mutation_fs_error)?;
+            .map_err(write_admission_fs_error)?
+        {
+            WriteAdmission::Prepared(guard) => guard,
+            WriteAdmission::Joined(retained) => {
+                return Ok(retained.wait().await?.primary_attrs());
+            }
+        };
         self.write_ack_batch_admitted(request, guard)
             .await
             .map(|receipt| receipt.attrs)
@@ -839,6 +844,71 @@ impl ZeroFS {
         .map(|receipt| receipt.attrs)
     }
 
+    /// The one admission sequence every write-ack shares: take the request
+    /// cache slot, then raw bytes, then the preparation gate — in that order,
+    /// so cache pressure is rejected before raw bytes are charged and no
+    /// protocol can invent its own backpressure order.
+    pub(crate) async fn begin_write_admission(
+        &self,
+        identity: RequestIdentity,
+        fingerprint: RequestFingerprint,
+        lifetime: RequestLifetime,
+        scope: ConflictScope,
+        length: u64,
+    ) -> Result<WriteAdmission, WriteAdmissionError> {
+        let coordinator = self
+            .mutation_coordinator
+            .get()
+            .ok_or(WriteAdmissionError::Unavailable)?;
+        let pending = match coordinator
+            .request_cache()
+            .lookup_or_reserve(identity, fingerprint, lifetime)
+            .map_err(|_| WriteAdmissionError::Unavailable)?
+        {
+            RequestLookup::Vacant(vacancy) => vacancy.begin_pending(),
+            RequestLookup::Joined(retained) => return Ok(WriteAdmission::Joined(retained)),
+            RequestLookup::FingerprintMismatch => {
+                return Err(WriteAdmissionError::FingerprintMismatch);
+            }
+            RequestLookup::Backpressured => return Err(WriteAdmissionError::Backpressured),
+        };
+        let raw_permit = match coordinator.raw_budget().acquire(length).await {
+            Ok(permit) => permit,
+            Err(error) => {
+                pending.cancel();
+                return Err(WriteAdmissionError::Mutation(error));
+            }
+        };
+        PreparationGuard::new(coordinator.gate(), scope, raw_permit, pending)
+            .map(WriteAdmission::Prepared)
+            .map_err(WriteAdmissionError::Mutation)
+    }
+
+    /// The single protocol-ledger consultation for one write-ack.
+    ///
+    /// A completed result whose request fingerprint disagrees is a collision
+    /// on a reused operation id and is rejected; a matching (or pre-fingerprint
+    /// legacy) result replays with the attributes the original write produced.
+    fn completed_write_replay(
+        &self,
+        op_id: crate::dedup::OpId,
+        fingerprint: RequestFingerprint,
+    ) -> Result<Option<FileAttributes>, FsError> {
+        match self
+            .dedup
+            .replay_write_entry(&op_id, fingerprint.into_bytes())
+        {
+            Some((crate::dedup::WriteReplay::FingerprintMismatch, _)) => {
+                Err(FsError::InvalidArgument)
+            }
+            Some((
+                crate::dedup::WriteReplay::Match { .. } | crate::dedup::WriteReplay::Legacy,
+                attrs,
+            )) => Ok(Some(attrs)),
+            None => Ok(None),
+        }
+    }
+
     pub(crate) async fn write_ack_identified(
         &self,
         write: IdentifiedWrite<'_>,
@@ -854,9 +924,9 @@ impl ZeroFS {
             request_lifetime,
             fingerprint_context,
         } = write;
-        let fingerprint = match &identity {
-            RequestIdentity::DirectOneShot(_) => RequestFingerprint::from_bytes([0; 32]),
-            _ => direct_write_fingerprint(
+        let policy = identity.replay_policy();
+        let fingerprint = if policy.fingerprints_request() {
+            direct_write_fingerprint(
                 auth,
                 id,
                 offset,
@@ -864,15 +934,25 @@ impl ZeroFS {
                 op_id,
                 check_permissions,
                 fingerprint_context,
-            ),
+            )
+        } else {
+            RequestFingerprint::from_bytes([0; 32])
         };
-        let replay_count = if matches!(&identity, RequestIdentity::NineP { .. }) {
+        let replay_count = if policy.tracks_protocol_ledger() {
             Some(u32::try_from(data.len()).map_err(|_| FsError::InvalidArgument)?)
         } else {
             None
         };
+        // The protocol replay ledger is consulted exactly once per write, here
+        // at the shared boundary: before any request slot, raw byte, or
+        // overlay staging cost is taken, and for every protocol that keeps a
+        // ledger rather than only for the one that used to pre-check.
+        let ledger_replay = match replay_count {
+            Some(_) => self.completed_write_replay(op_id, fingerprint)?,
+            None => None,
+        };
         let Some(overlay) = self.volatile_overlay.get().cloned() else {
-            if matches!(&identity, RequestIdentity::Nfs { .. }) {
+            if policy.uses_materialized_fallback() {
                 return self
                     .write_materialized_nfs_identified(
                         IdentifiedWrite {
@@ -890,13 +970,11 @@ impl ZeroFS {
                     )
                     .await;
             }
-            if replay_count.is_some()
-                && matches!(
-                    self.dedup.replay_write(&op_id, fingerprint.into_bytes()),
-                    Some(crate::dedup::WriteReplay::FingerprintMismatch)
-                )
-            {
-                return Err(FsError::InvalidArgument);
+            if let Some(attrs) = ledger_replay {
+                return Ok(WriteAckReceipt {
+                    attrs,
+                    cutoff: self.capture_mutation_cutoff(),
+                });
             }
             let pending_write = replay_count.map(|count| {
                 self.dedup
@@ -941,35 +1019,32 @@ impl ZeroFS {
             });
         };
 
-        let coordinator = self.mutation_coordinator.get().ok_or(FsError::IoError)?;
-        let request_cache = coordinator.request_cache();
-        let pending = match request_cache
-            .lookup_or_reserve(identity, fingerprint, request_lifetime)
-            .map_err(|_| FsError::IoError)?
+        if let Some(attrs) = ledger_replay {
+            return Ok(WriteAckReceipt {
+                attrs,
+                cutoff: self.capture_mutation_cutoff(),
+            });
+        }
+        let guard = match self
+            .begin_write_admission(
+                identity,
+                fingerprint,
+                request_lifetime,
+                ConflictScope::single(ConflictKey::Inode(id)),
+                data.len() as u64,
+            )
+            .await
+            .map_err(write_admission_fs_error)?
         {
-            RequestLookup::Vacant(vacancy) => vacancy.begin_pending(),
-            RequestLookup::Joined(retained) => {
+            WriteAdmission::Prepared(guard) => guard,
+            WriteAdmission::Joined(retained) => {
                 let result = retained.wait().await?;
                 return Ok(WriteAckReceipt {
                     attrs: result.primary_attrs(),
                     cutoff: result.cutoff.ok_or(FsError::IoError)?,
                 });
             }
-            RequestLookup::FingerprintMismatch => return Err(FsError::InvalidArgument),
-            RequestLookup::Backpressured => return Err(FsError::RetryLater),
         };
-        let raw_permit = coordinator
-            .raw_budget()
-            .acquire(data.len() as u64)
-            .await
-            .map_err(mutation_fs_error)?;
-        let guard = PreparationGuard::new(
-            coordinator.gate(),
-            ConflictScope::single(ConflictKey::Inode(id)),
-            raw_permit,
-            pending,
-        )
-        .map_err(mutation_fs_error)?;
         let admission = match overlay.reserve(id, data.len()).await {
             Ok(admission) => admission,
             Err(error) => {

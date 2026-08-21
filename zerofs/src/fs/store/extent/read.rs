@@ -61,6 +61,17 @@ fn plan_read_ahead(
 }
 
 impl ExtentStore {
+    /// Metrics snapshot of this store's most recent fragmented read.
+    /// Shared across clones of the store; replaces the old process-global
+    /// slot that let concurrent tests clobber each other's snapshots.
+    #[cfg(test)]
+    pub(super) fn last_read_metrics(&self) -> Option<metrics::ReadRunSnapshot> {
+        *self
+            .last_read_metrics
+            .lock()
+            .expect("last_read_metrics never poisoned")
+    }
+
     async fn load_extent_location(
         &self,
         id: InodeId,
@@ -608,7 +619,16 @@ impl ExtentStore {
                 Err(_) => {}
             }
         }
-        recorder.finish();
+        let run_metrics = recorder.finish();
+        #[cfg(test)]
+        {
+            *self
+                .last_read_metrics
+                .lock()
+                .expect("last_read_metrics never poisoned") = Some(run_metrics);
+        }
+        #[cfg(not(test))]
+        let _ = run_metrics;
         if let Some(error) = fetch_error {
             return Err(error);
         }
@@ -687,7 +707,7 @@ impl ExtentStore {
     }
 }
 
-mod metrics;
+pub(super) mod metrics;
 use metrics::{OnStoreRun, PlannedPiece};
 
 #[cfg(test)]

@@ -28,6 +28,15 @@ acceptance tests. Those belong in the separately isolated tiered-writeback E2E
 harness described by the unified rollout plan. A production observer may read
 metrics, but it must not pretend that observation is a writable benchmark.
 
+## Real-world matrix cache state
+
+`real-world-matrix` read cells are labeled `cold` or `warm` by client-side
+cache handling only. A `cold` cell issues `sync -f` on the mountpoint and then
+runs fio with `--invalidate=1`, dropping the client's page cache for the
+target file before the timed read starts; a `warm` cell skips invalidation.
+"Cold" refers strictly to the client page cache — ZeroFS's own server-internal
+caches are never reset by a cell, since that would require a server restart.
+
 ## Scenario registry
 
 List the immutable shipping registry without loading VM100 configuration or
@@ -153,12 +162,21 @@ Each protocol workload records these independent cutoffs:
    gate. The drain gate requires four stable samples, equal accepted/local/remote
    sequences, zero dirty RAM and SSD, and no terminal error.
 
+`local_cutoff_ns` and `remote_cutoff_ns` are found by polling the metrics
+endpoint every 0.05 s, so each cutoff's resolution is bounded by that poll
+interval plus one HTTPS round-trip to the metrics endpoint, not by a
+sub-poll-interval wall-clock timestamp.
+
 The first remote sequence crossing and stable global drain are intentionally
 different fields. A close, an SFTP process exit, or an elapsed-time guess is
 never relabeled as remote durability.
 
 Readback begins only after the remote cutoff and stable drain. Its SHA-256 and
-rate are separate from the foreground write rate.
+rate are separate from the foreground write rate. `readback_mibps` is an
+integrity-check rate, not protocol read throughput: it hashes the just-written
+file back through the same mount with no cache invalidation, so the read is
+frequently served by the client's NFS or 9P cache, and the timed interval
+includes SHA-256 hashing CPU cost.
 
 ## Fixed memory envelope
 
