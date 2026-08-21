@@ -127,6 +127,7 @@ async fn listed_child_vanishing_does_not_cancel_other_metadata_or_retire_the_ses
     })
     .await
     .expect("both snapshot metadata lookups were not concurrently active");
+    let dials_while_both_lookups_are_active = state.dials.load(Ordering::SeqCst);
     state.release_vanished.notify_one();
     tokio::task::yield_now().await;
     assert!(
@@ -142,7 +143,11 @@ async fn listed_child_vanishing_does_not_cancel_other_metadata_or_retire_the_ses
         .unwrap();
     assert_eq!(objects.len(), 1);
     assert_eq!(objects[0].location, ObjectPath::from("root/survivor"));
-    assert_eq!(state.dials.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        state.dials.load(Ordering::SeqCst),
+        dials_while_both_lookups_are_active,
+        "settling the listing must not dial a replacement session"
+    );
     assert_eq!(state.closes.load(Ordering::SeqCst), 0);
 
     drop(store);
