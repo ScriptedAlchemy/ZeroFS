@@ -1517,15 +1517,17 @@ impl NinePClient {
             let connection_epoch = conn.writer_epoch.load(Ordering::Relaxed);
             let (op_flags, mut send) =
                 attempt.dispatch_frame(has_op_id, connection_epoch, |op_flags, origin_epoch| {
-                    // Positioned writes are idempotent: replaying the same
-                    // bytes at the same inode and offset has the same visible
-                    // result. Encode every Twrite resend as another FIRST with
-                    // the same operation ID and full payload. This lets the
-                    // server either join/replay an accepted attempt or admit a
-                    // frame that the previous transport buffered locally but
-                    // never delivered. Other mutations retain strict RETRY
-                    // semantics because applying them twice is not safe.
-                    let wire_op_flags = if matches!(body, Message::Twrite(_)) {
+                    // On a standalone (epoch-zero) server, positioned writes
+                    // can safely replay as another FIRST with the same
+                    // operation ID and full payload. This lets the server
+                    // either join/replay an accepted attempt or admit a frame
+                    // that the previous transport buffered locally but never
+                    // delivered. Nonzero HA epochs must retain RETRY so an
+                    // unseen operation still passes the promotion-coverage
+                    // fence before it can be admitted. Other mutations also
+                    // retain strict RETRY semantics because applying them
+                    // twice is not safe.
+                    let wire_op_flags = if matches!(body, Message::Twrite(_)) && origin_epoch == 0 {
                         0
                     } else {
                         op_flags
@@ -4820,8 +4822,8 @@ mod session_transition_tests {
     }
 
     #[tokio::test]
-    async fn generic_notleader_after_first_reroutes_positioned_write_as_idempotent_first() {
-        assert_notleader_reroute(P9_ENOTLEADER, 0, 7).await;
+    async fn generic_notleader_after_first_preserves_ha_retry_fencing() {
+        assert_notleader_reroute(P9_ENOTLEADER, P9_OP_FLAG_RETRY, 7).await;
     }
 
     #[tokio::test]
@@ -5188,7 +5190,7 @@ mod session_transition_tests {
 
         let retry = recv_op_request(&mut successor_requests, "retried write request").await;
         assert_eq!(retry.op_id, first.op_id);
-        assert_eq!(retry.op_flags, 0);
+        assert_eq!(retry.op_flags, P9_OP_FLAG_RETRY);
         assert_eq!(retry.op_origin_epoch, 7);
         reply(
             &successor,

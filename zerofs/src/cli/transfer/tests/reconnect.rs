@@ -1,14 +1,14 @@
-use super::super::copy::{stream_upload, sync_remote_files};
 use super::*;
 use futures::{SinkExt, StreamExt};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tokio::task::JoinSet;
 use tokio_tungstenite::tungstenite::Message as WebSocketMessage;
-use zerofs_client::OpenOptions;
+use zerofs_client::ConnectOptions;
 
 #[derive(Debug, Default)]
 struct WriteReplyFault {
     writes_seen: AtomicUsize,
+    held_unsent_writes: AtomicUsize,
     fired: AtomicBool,
 }
 
@@ -39,7 +39,14 @@ async fn run_websocket_fault_proxy(
         }
     }
     sessions.abort_all();
-    while sessions.join_next().await.is_some() {}
+    while let Some(joined) = sessions.join_next().await {
+        if let Err(error) = joined {
+            assert!(
+                error.is_cancelled(),
+                "WebSocket fault-proxy session failed: {error}"
+            );
+        }
+    }
 }
 
 async fn proxy_websocket_session<Downstream, Upstream>(
@@ -74,10 +81,38 @@ async fn proxy_websocket_session<Downstream, Upstream>(
                     return;
                 }
                 let Some(drop_reply_tag) = drop_reply_tag else { continue };
+
+                // The original failure requires two distinct ambiguous states:
+                // the first write reached the server and lost its reply, while
+                // a second write was accepted by the client transport but never
+                // reached the server. Hold that second frame locally before
+                // observing the first response so the regression cannot pass by
+                // replaying only an already-accepted operation.
+                let held = downstream_rx
+                    .next()
+                    .await
+                    .expect("faulted upload did not pipeline a second write")
+                    .expect("faulted upload's second write frame failed");
+                let WebSocketMessage::Binary(held_frame) = held else {
+                    panic!("faulted upload's second frame was not binary");
+                };
+                let held_request = P9Message::from_bytes_ctx(&held_frame, true)
+                    .expect("faulted upload's second frame was not valid 9P");
+                assert!(
+                    matches!(held_request.body, Message::Twrite(_)),
+                    "faulted upload's second frame was not Twrite"
+                );
+                fault.writes_seen.fetch_add(1, Ordering::AcqRel);
+                fault.held_unsent_writes.fetch_add(1, Ordering::AcqRel);
+
                 while let Some(Ok(response)) = upstream_rx.next().await {
                     let matching_reply = match &response {
-                        WebSocketMessage::Binary(frame) => P9Message::from_bytes_ctx(frame, false)
-                            .is_ok_and(|message| message.tag == drop_reply_tag),
+                        WebSocketMessage::Binary(frame) => {
+                            P9Message::from_bytes_ctx(frame, false).is_ok_and(|message| {
+                                message.tag == drop_reply_tag
+                                    && matches!(message.body, Message::Rwrite(_))
+                            })
+                        }
                         _ => false,
                     };
                     if matching_reply {
@@ -121,72 +156,100 @@ async fn websocket_upload_rebinds_linked_temp_after_an_accepted_write_loses_its_
         proxy_shutdown.clone(),
     ));
     let target = format!("ws://{proxy_address}/ws/9p");
-    let primary_client = connect_transfer_client(&target).await.unwrap();
-    let secondary_client = connect_transfer_client(&target).await.unwrap();
+    let msize = 64 * 1024 + ninep_proto::P9_TWRITE_HDR + ninep_proto::P9_OP_ENVELOPE_LEN as u32;
+    let connect_options = ConnectOptions {
+        msize,
+        ..ConnectOptions::default()
+    };
+    let primary_client = Client::connect_with(&target, connect_options.clone())
+        .await
+        .unwrap();
+    let secondary_client = Client::connect_with(&target, connect_options)
+        .await
+        .unwrap();
+    let clients = vec![Arc::clone(&primary_client), Arc::clone(&secondary_client)];
+    let workers = vec![UploadWorker::new(&clients)];
 
-    primary_client.create_dir_all("/dest", 0o755).await.unwrap();
-    let primary_remote = primary_client
-        .open(
-            "/dest/.zerofs-reconnect.tmp",
-            OpenOptions::write_only().create_new(true).mode(0o644),
-        )
-        .await
-        .unwrap();
-    let secondary_remote = secondary_client
-        .open("/dest/.zerofs-reconnect.tmp", OpenOptions::write_only())
-        .await
-        .unwrap();
-    let inode_id = primary_remote.metadata().await.unwrap().ino;
     let local = tempfile::tempdir().unwrap();
+    let local_path = local.path().to_path_buf();
     let source = local.path().join("source.bin");
     let payload = (0..(64 * 1024 * 6))
         .map(|index| (index % 251) as u8)
         .collect::<Vec<_>>();
     fs::write(&source, &payload).unwrap();
-    let planned = scan_local(&source).unwrap().files.pop().unwrap();
-    let progress = Progress::new("upload", planned.size, 1);
-    let file_progress = progress.start_file(Path::new("source.bin"), planned.size);
-    let remotes = [primary_remote, secondary_remote];
+    let plan = scan_local(&source).unwrap();
+    let baseline_files_created = inspect_filesystem
+        .stats
+        .files_created
+        .load(Ordering::Relaxed);
+    let baseline_bytes_written = inspect_filesystem
+        .stats
+        .bytes_written
+        .load(Ordering::Relaxed);
 
     let upload = tokio::time::timeout(
         Duration::from_secs(10),
-        stream_upload(
-            &remotes,
-            &planned,
-            64 * 1024,
-            &file_progress,
-            &CancellationToken::new(),
+        execute_upload(
+            &workers,
+            plan,
+            Path::new("/dest/reconnect.bin"),
+            false,
+            Progress::new("upload", payload.len() as u64, 1),
+            CancellationToken::new(),
         ),
     )
     .await
     .expect("upload did not recover from the lost WebSocket write reply");
     if let Err(error) = upload {
-        let inode = inspect_filesystem.inode_store.get(inode_id).await;
-        let path = inspect_filesystem
-            .inode_store
-            .resolve_path_components(inode_id)
-            .await;
-        panic!("upload replay failed: {error:#}; inode={inode:?}; path={path:?}");
+        panic!("upload replay failed: {error:#}");
     }
-    sync_remote_files(&remotes).await.unwrap();
     assert!(fault.fired.load(Ordering::Acquire));
+    assert_eq!(fault.held_unsent_writes.load(Ordering::Acquire), 1);
+    assert!(
+        fault.writes_seen.load(Ordering::Acquire) > 6,
+        "the proxy must observe retries in addition to six logical chunks"
+    );
     assert_eq!(
-        primary_client
-            .read("/dest/.zerofs-reconnect.tmp")
-            .await
-            .unwrap(),
+        primary_client.read("/dest/reconnect.bin").await.unwrap(),
         payload
     );
+    assert_eq!(
+        inspect_filesystem
+            .stats
+            .files_created
+            .load(Ordering::Relaxed)
+            - baseline_files_created,
+        1,
+        "the product upload path must recover within its first temporary file attempt"
+    );
+    assert_eq!(
+        inspect_filesystem
+            .stats
+            .bytes_written
+            .load(Ordering::Relaxed)
+            - baseline_bytes_written,
+        payload.len() as u64,
+        "ambiguous replay must not apply any logical chunk twice"
+    );
+    let entries = primary_client.read_dir("/dest").await.unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].name, "reconnect.bin");
 
-    futures::future::join_all(remotes.iter().map(|remote| remote.close())).await;
     primary_client
-        .remove_file("/dest/.zerofs-reconnect.tmp")
+        .remove_file("/dest/reconnect.bin")
         .await
         .unwrap();
-    close_client(&primary_client).await.unwrap();
-    close_client(&secondary_client).await.unwrap();
+    primary_client.remove_dir("/dest").await.unwrap();
+    super::super::finish_clients(&clients, Ok(()))
+        .await
+        .unwrap();
     proxy_shutdown.cancel();
     proxy.await.unwrap();
     backend.abort();
-    let _ = backend.await;
+    let backend_error = backend.await.unwrap_err();
+    assert!(backend_error.is_cancelled());
+    inspect_filesystem.stop_new_mutation_admission();
+    inspect_filesystem.stop_mutation_workers().await.unwrap();
+    local.close().unwrap();
+    assert!(!local_path.exists());
 }
