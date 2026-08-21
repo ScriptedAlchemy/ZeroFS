@@ -18,7 +18,7 @@ from .owned_resources import atomic_write_json, present, remove_tree
 from .receipts import RunReceipt
 from .runner import CommandError, ManagedProcess, Runner
 from .scenarios import RawSftpScenario
-from .system_io import file_sha256
+from .system_io import file_sha256, mib_per_second
 
 
 def _stop_process_groups(
@@ -342,11 +342,7 @@ class OwnedSftpResources:
 
 
 def _rate(total_bytes: int, elapsed_ms: int) -> float:
-    return (
-        round(total_bytes / 1_048_576 / (elapsed_ms / 1000), 3)
-        if elapsed_ms
-        else 0.0
-    )
+    return mib_per_second(total_bytes, elapsed_ms / 1000) if elapsed_ms else 0.0
 
 
 def counterbalanced_order(repetitions: int) -> tuple[str, ...]:

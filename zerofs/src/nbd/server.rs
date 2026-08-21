@@ -838,12 +838,12 @@ where
             return Err(error);
         }
     };
-    let mut data = BytesMut::zeroed(length as usize);
+    let mut data = BytesMut::with_capacity(length as usize);
     tokio::select! {
         _ = shutdown.cancelled() => return Err(CommandError::IoError),
         result = tokio::time::timeout(
             WRITE_PAYLOAD_TIMEOUT,
-            reader.read_exact(&mut data),
+            read_write_payload(reader, &mut data, length),
         ) => {
             match result {
                 Ok(read) => {
@@ -868,6 +868,29 @@ where
     }
 
     Ok(Some((data.freeze(), admission)))
+}
+
+/// Append exactly `length` payload bytes to `data`, filling the buffer's spare
+/// capacity directly instead of pre-zeroing bytes the payload overwrites.
+/// The reader is limited to the payload so no byte of the next request header
+/// is consumed, and a short stream reports `UnexpectedEof`, the same error
+/// `read_exact` produced here.
+async fn read_write_payload<R>(
+    reader: &mut R,
+    data: &mut BytesMut,
+    length: u32,
+) -> std::io::Result<()>
+where
+    R: AsyncRead + Unpin,
+{
+    let length = length as usize;
+    let mut payload = reader.take(length as u64);
+    while data.len() < length {
+        if payload.read_buf(data).await? == 0 {
+            return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+        }
+    }
+    Ok(())
 }
 
 async fn discard_write_payload<R>(

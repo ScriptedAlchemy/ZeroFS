@@ -639,8 +639,8 @@ impl VolatileWriteRuntime {
             return Ok(data);
         }
 
-        let mut output = BytesMut::from(base().await?.as_ref());
-        if output.len() != length {
+        let base = base().await?;
+        if base.len() != length {
             return Err(OverlayError::IoError);
         }
         // Terminal state stops admission and durability progress, but accepted
@@ -650,7 +650,15 @@ impl VolatileWriteRuntime {
         // Snapshot after the canonical read while retirement remains pinned.
         // Any write that could have partially changed the base is therefore
         // still present here in its complete logical form.
-        for entry in self.snapshot() {
+        let overlay = self.snapshot();
+        if overlay.is_empty() {
+            // Nothing to apply: the canonical bytes are already the answer, so
+            // skip copying them into a mutable buffer.
+            return Ok(base);
+        }
+
+        let mut output = BytesMut::from(base.as_ref());
+        for entry in overlay {
             apply_entry(&mut output, offset, &entry);
         }
         Ok(output.freeze())
@@ -847,6 +855,9 @@ fn fully_covered(
     request_len: usize,
     entries: &[Arc<OverlayEntry>],
 ) -> Option<Bytes> {
+    if entries.is_empty() {
+        return None;
+    }
     let mut output = BytesMut::zeroed(request_len);
     let mut uncovered = vec![(0usize, request_len)];
     for entry in entries.iter().rev() {

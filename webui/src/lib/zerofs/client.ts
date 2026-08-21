@@ -274,6 +274,35 @@ export class ZeroFsClient {
     return this.client;
   }
 
+  /**
+   * Tear down the session: stop auto-reconnect and timers, and explicitly
+   * close the underlying wasm client so the server can release its state
+   * promptly instead of waiting for the transport to time out.
+   *
+   * Safe to call even if never connected, and safe to call more than once.
+   */
+  async close(): Promise<void> {
+    this.reconnectUrl = null;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    if (this.monitorTimer) {
+      clearInterval(this.monitorTimer);
+      this.monitorTimer = null;
+    }
+    const client = this.client;
+    this.client = null;
+    this.setState("disconnected");
+    if (!client) return;
+    try {
+      await client.close();
+    } catch (error) {
+      // Best-effort: the session is being discarded regardless.
+      console.warn("ZeroFsClient: error closing wasm client", error);
+    }
+  }
+
   private async createTemporaryFile(
     fs: SharedClient,
     targetPath: string,
@@ -719,3 +748,18 @@ export class ZeroFsClient {
 }
 
 export const p9client = new ZeroFsClient();
+
+// `p9client` is a page-lifetime singleton: it is created once here and never
+// replaced or discarded during normal use (the underlying wasm session
+// reconnects itself internally rather than being swapped out from JS). The
+// only real teardown seam is the page going away, so close it best-effort
+// there rather than leaking the session until the transport times out.
+// `pagehide` fires reliably (including on bfcache navigation); `beforeunload`
+// is kept as a fallback for environments where `pagehide` is unavailable.
+if (typeof window !== "undefined") {
+  const closeOnTeardown = () => {
+    void p9client.close();
+  };
+  window.addEventListener("pagehide", closeOnTeardown);
+  window.addEventListener("beforeunload", closeOnTeardown);
+}

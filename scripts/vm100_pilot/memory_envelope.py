@@ -358,10 +358,19 @@ class MemoryEnvelopeSession:
                 "service InvocationID and authenticated metrics instance mismatch"
             )
         cgroup = self.authority.cgroup_path
+        # Read every memory counter adjacently, before the metrics scrape. The
+        # cgroup's instantaneous `memory.current` used to be read after an HTTPS
+        # round trip that the process RSS was read before, so one sample mixed
+        # readings from two different instants. `memory.peak`/`VmHWM` are kernel
+        # high-water marks and so are interval-correct either way, but
+        # `memory.current`/`VmRSS` are point samples and must line up.
         oom, oom_kill = _events(cgroup / "memory.events")
         rss, hwm, process_swap = _status(
             self.authority.proc_root / str(identity.pid) / "status"
         )
+        cgroup_current_bytes = _read_integer(cgroup / "memory.current")
+        cgroup_peak_bytes = _read_integer(cgroup / "memory.peak")
+        cgroup_swap_bytes = _read_integer(cgroup / "memory.swap.current")
         writeback = self.metrics.snapshot()
         if self.metrics.identity() != metrics_identity:
             raise RuntimeError("authenticated metrics identity changed during sample")
@@ -370,9 +379,9 @@ class MemoryEnvelopeSession:
             pid=identity.pid,
             restart_count=identity.restart_count,
             control_group=identity.control_group,
-            cgroup_current_bytes=_read_integer(cgroup / "memory.current"),
-            cgroup_peak_bytes=_read_integer(cgroup / "memory.peak"),
-            cgroup_swap_bytes=_read_integer(cgroup / "memory.swap.current"),
+            cgroup_current_bytes=cgroup_current_bytes,
+            cgroup_peak_bytes=cgroup_peak_bytes,
+            cgroup_swap_bytes=cgroup_swap_bytes,
             oom=oom,
             oom_kill=oom_kill,
             pid_rss_bytes=rss,

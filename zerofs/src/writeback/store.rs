@@ -4,7 +4,7 @@ use crate::segment_store::{
 use crate::writeback::admission::Admission;
 use crate::writeback::config::{AckMode, WritebackSettings};
 use crate::writeback::journal::Journal;
-use crate::writeback::journaler::{LocalBarrierError, LocalJournaler};
+use crate::writeback::journaler::{LocalBarrier, LocalBarrierError, LocalJournaler};
 use crate::writeback::model::{
     LocalEtag, MutationKind, MutationMode, MutationRecord, WritebackStatus, classify_mutation_fence,
 };
@@ -77,13 +77,6 @@ struct WritebackStoreInner {
     next_sequence: AtomicU64,
     key_locks: Vec<Arc<Mutex<()>>>,
     admission_order: Mutex<()>,
-    // Landed-but-not-wired: cached free-space probe state for SSD admission.
-    #[allow(dead_code)]
-    started: std::time::Instant,
-    #[allow(dead_code)]
-    available_space: AtomicU64,
-    #[allow(dead_code)]
-    available_space_probed_ms: AtomicU64,
     stopped: AtomicBool,
     #[cfg(test)]
     journal_submit_pause: StdMutex<Option<Arc<JournalSubmitPause>>>,
@@ -119,29 +112,6 @@ impl std::fmt::Display for WritebackObjectStore {
 impl WritebackStoreInner {
     fn overlay_remote(&self) -> &'static str {
         "remote"
-    }
-
-    /// Free-space probes guard SSD admission but do not need per-operation
-    /// precision; serve a briefly cached value so the write path is not one
-    /// statvfs syscall per mutation.
-    // Landed-but-not-wired: consumed by tiered SSD admission.
-    #[allow(dead_code)]
-    fn available_space(&self) -> object_store::Result<u64> {
-        const PROBE_TTL_MS: u64 = 250;
-        let now_ms = self.started.elapsed().as_millis() as u64;
-        let probed = self.available_space_probed_ms.load(Ordering::Acquire);
-        if probed != 0 && now_ms.saturating_sub(probed) < PROBE_TTL_MS {
-            return Ok(self.available_space.load(Ordering::Acquire));
-        }
-        let sample = self
-            .space
-            .latest_sample()
-            .ok_or_else(|| generic_error("writeback SSD has no physical-space sample"))?;
-        self.available_space
-            .store(sample.available_bytes, Ordering::Release);
-        self.available_space_probed_ms
-            .store(now_ms.max(1), Ordering::Release);
-        Ok(sample.available_bytes)
     }
 }
 
@@ -200,13 +170,8 @@ impl WritebackObjectStore {
         }
         let snapshot = journal.snapshot()?;
         let database_prefix = snapshot.identity.database_prefix.clone();
-        let (space, ssd, sample) = match owners {
-            Some((space, ssd)) => {
-                let sample = space
-                    .latest_sample()
-                    .ok_or_else(|| anyhow::anyhow!("writeback SSD has no physical-space sample"))?;
-                (space, ssd, sample)
-            }
+        let (space, ssd) = match owners {
+            Some((space, ssd)) => (space, ssd),
             None => {
                 let space = Arc::new(PhysicalSpaceSampler::new(settings.dir.clone()));
                 let sample = space.sample().await?;
@@ -220,7 +185,7 @@ impl WritebackObjectStore {
                     pending,
                     Some(sample),
                 )?);
-                (space, ssd, sample)
+                (space, ssd)
             }
         };
         let admission = Admission::new(settings.memory_bytes);
@@ -280,9 +245,6 @@ impl WritebackObjectStore {
                     .map(|_| Arc::new(Mutex::new(())))
                     .collect(),
                 admission_order: Mutex::new(()),
-                started: std::time::Instant::now(),
-                available_space: AtomicU64::new(sample.available_bytes),
-                available_space_probed_ms: AtomicU64::new(1),
                 stopped: AtomicBool::new(false),
                 #[cfg(test)]
                 journal_submit_pause: StdMutex::new(None),
@@ -327,6 +289,22 @@ impl WritebackObjectStore {
                 "local durability failed: {error}; overlay reconciliation failed: {reconcile_error:#}"
             )),
         }
+    }
+
+    /// Hold the caller until the configured acknowledgement tier covers this
+    /// sequence. `AckMode::Memory` acknowledges as soon as the overlay has the
+    /// mutation, so it waits for nothing here.
+    async fn await_ack(&self, barrier: &LocalBarrier, sequence: u64) -> object_store::Result<()> {
+        if self.inner.settings.ack_mode == AckMode::Ssd {
+            if let Err(error) = barrier.wait_local(sequence).await {
+                return Err(self.reconcile_local_wait_error(sequence, error).await);
+            }
+        } else if self.inner.settings.ack_mode == AckMode::Remote {
+            self.wait_remote(sequence)
+                .await
+                .map_err(|error| generic_error(format!("remote durability failed: {error}")))?;
+        }
+        Ok(())
     }
 
     /// Capture every mutation accepted before this barrier and wait until the
@@ -720,20 +698,8 @@ impl WritebackObjectStore {
             blob_path: String::new(),
         };
         let fence = classify_mutation_fence(&path, &kind, &self.inner.database_prefix);
-        let record = MutationRecord {
-            format_version: 1,
-            sequence,
-            operation_id: Uuid::new_v4(),
-            path,
-            kind,
-            local_etag: local_etag.clone(),
-            accepted_at_unix_ms: chrono::Utc::now().timestamp_millis().max(0) as u64,
-            remote_predecessor_etag: predecessor,
-            remote_result_etag: None,
-            fence,
-            retry_count: 0,
-            last_error: None,
-        };
+        let record =
+            MutationRecord::new(sequence, path, kind, local_etag.clone(), predecessor, fence);
         self.inner
             .overlay
             .install_verified_memory(record.clone(), payload.clone())
@@ -769,15 +735,7 @@ impl WritebackObjectStore {
         };
         drop(order_guard);
         drop(key_guard);
-        if self.inner.settings.ack_mode == AckMode::Ssd {
-            if let Err(error) = barrier.wait_local(sequence).await {
-                return Err(self.reconcile_local_wait_error(sequence, error).await);
-            }
-        } else if self.inner.settings.ack_mode == AckMode::Remote {
-            self.wait_remote(sequence)
-                .await
-                .map_err(|error| generic_error(format!("remote durability failed: {error}")))?;
-        }
+        self.await_ack(&barrier, sequence).await?;
         Ok(PutResult {
             e_tag: Some(local_etag.as_str().to_owned()),
             version: Some(local_etag.as_str().to_owned()),
@@ -801,20 +759,14 @@ impl WritebackObjectStore {
         let sequence = self.allocate_sequence()?;
         let kind = MutationKind::Delete;
         let fence = classify_mutation_fence(&path, &kind, &self.inner.database_prefix);
-        let record = MutationRecord {
-            format_version: 1,
+        let record = MutationRecord::new(
             sequence,
-            operation_id: Uuid::new_v4(),
             path,
             kind,
-            local_etag: LocalEtag::new(self.inner.incarnation, sequence),
-            accepted_at_unix_ms: chrono::Utc::now().timestamp_millis().max(0) as u64,
-            remote_predecessor_etag: None,
-            remote_result_etag: None,
+            LocalEtag::new(self.inner.incarnation, sequence),
+            None,
             fence,
-            retry_count: 0,
-            last_error: None,
-        };
+        );
         self.inner
             .overlay
             .install_delete(record.clone())
@@ -838,15 +790,7 @@ impl WritebackObjectStore {
         };
         drop(order_guard);
         drop(key_guard);
-        if self.inner.settings.ack_mode == AckMode::Ssd {
-            if let Err(error) = barrier.wait_local(sequence).await {
-                return Err(self.reconcile_local_wait_error(sequence, error).await);
-            }
-        } else if self.inner.settings.ack_mode == AckMode::Remote {
-            self.wait_remote(sequence)
-                .await
-                .map_err(|error| generic_error(format!("remote durability failed: {error}")))?;
-        }
+        self.await_ack(&barrier, sequence).await?;
         Ok(location)
     }
 
@@ -940,20 +884,7 @@ impl WritebackObjectStore {
         };
         let path = to.to_string();
         let fence = classify_mutation_fence(&path, &kind, &self.inner.database_prefix);
-        let record = MutationRecord {
-            format_version: 1,
-            sequence,
-            operation_id: Uuid::new_v4(),
-            path,
-            kind,
-            local_etag,
-            accepted_at_unix_ms: chrono::Utc::now().timestamp_millis().max(0) as u64,
-            remote_predecessor_etag: None,
-            remote_result_etag: None,
-            fence,
-            retry_count: 0,
-            last_error: None,
-        };
+        let record = MutationRecord::new(sequence, path, kind, local_etag, None, fence);
         let overlay_result = if rename {
             self.inner
                 .overlay
@@ -984,15 +915,7 @@ impl WritebackObjectStore {
         };
         drop(order_guard);
         drop(key_guards);
-        if self.inner.settings.ack_mode == AckMode::Ssd {
-            if let Err(error) = barrier.wait_local(sequence).await {
-                return Err(self.reconcile_local_wait_error(sequence, error).await);
-            }
-        } else if self.inner.settings.ack_mode == AckMode::Remote {
-            self.wait_remote(sequence)
-                .await
-                .map_err(|error| generic_error(format!("remote durability failed: {error}")))?;
-        }
+        self.await_ack(&barrier, sequence).await?;
         Ok(())
     }
 }
@@ -1170,6 +1093,9 @@ struct WritebackMultipartUpload {
 #[derive(Debug, Default)]
 struct MultipartState {
     parts: Vec<MultipartPart>,
+    /// Running sum of `parts[..].len`, maintained on every push so the write
+    /// path does not refold the whole part list under the state mutex.
+    registered_len: u64,
     active: usize,
     aborted: bool,
 }
@@ -1255,13 +1181,7 @@ impl MultipartUpload for WritebackMultipartUpload {
         };
         let (index, offset, total) = {
             let mut state = self.state.lock().unwrap();
-            let Some(offset) = state
-                .parts
-                .iter()
-                .try_fold(0_u64, |total, part| total.checked_add(part.len))
-            else {
-                return Box::pin(async { Err(generic_error("multipart length overflow")) });
-            };
+            let offset = state.registered_len;
             let Some(total) = offset.checked_add(len) else {
                 return Box::pin(async { Err(generic_error("multipart length overflow")) });
             };
@@ -1291,6 +1211,7 @@ impl MultipartUpload for WritebackMultipartUpload {
                 payload: None,
                 reservation: None,
             });
+            state.registered_len = total;
             (index, offset, total)
         };
         let journal_share = if self.memory_parts {

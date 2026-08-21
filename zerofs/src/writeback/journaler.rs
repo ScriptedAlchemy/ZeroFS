@@ -9,7 +9,6 @@ use crate::writeback::reservation::{
 };
 use crate::writeback::space_sample::{PhysicalSpaceSample, PhysicalSpaceSampler};
 use anyhow::Result as AnyResult;
-use bytes::Bytes;
 use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
@@ -73,10 +72,6 @@ pub struct LocalBarrier {
 impl LocalBarrier {
     pub fn local_sequence(&self) -> Sequence {
         self.progress.sequence()
-    }
-
-    pub fn incarnation(&self) -> uuid::Uuid {
-        self.incarnation
     }
 
     pub async fn wait_local(&self, sequence: Sequence) -> Result<(), LocalBarrierError> {
@@ -420,86 +415,6 @@ impl LocalJournaler {
 
     pub fn barrier(&self) -> LocalBarrier {
         self.inner.barrier.clone()
-    }
-
-    pub async fn submit_put(
-        &self,
-        record: MutationRecord,
-        payload: Bytes,
-        ram: AcceptedAdmission,
-    ) -> Result<LocalBarrier, LocalBarrierError> {
-        self.submit_verified_put(record, VerifiedPayload::new(payload), ram)
-            .await
-    }
-
-    async fn submit_verified_put(
-        &self,
-        record: MutationRecord,
-        payload: VerifiedPayload,
-        ram: AcceptedAdmission,
-    ) -> Result<LocalBarrier, LocalBarrierError> {
-        self.submit(record, Some(payload), Some(ram), None, None)
-            .await
-    }
-
-    // Landed-but-not-wired: SSD-reservation submit variants for tiered admission.
-    #[allow(dead_code)]
-    pub(crate) async fn submit_put_with_disk(
-        &self,
-        record: MutationRecord,
-        payload: Bytes,
-        ram: AcceptedAdmission,
-        disk: SsdReservationToken,
-    ) -> Result<LocalBarrier, LocalBarrierError> {
-        self.submit_verified_put_with_disk(record, VerifiedPayload::new(payload), ram, disk)
-            .await
-    }
-
-    #[allow(dead_code)]
-    pub(crate) async fn submit_verified_put_with_disk(
-        &self,
-        record: MutationRecord,
-        payload: VerifiedPayload,
-        ram: AcceptedAdmission,
-        disk: SsdReservationToken,
-    ) -> Result<LocalBarrier, LocalBarrierError> {
-        self.submit(record, Some(payload), Some(ram), Some(disk), None)
-            .await
-    }
-
-    #[allow(dead_code)]
-    pub(crate) async fn submit_metadata_with_disk(
-        &self,
-        record: MutationRecord,
-        disk: SsdReservationToken,
-    ) -> Result<LocalBarrier, LocalBarrierError> {
-        self.submit(record, None, None, Some(disk), None).await
-    }
-
-    async fn submit(
-        &self,
-        record: MutationRecord,
-        payload: Option<VerifiedPayload>,
-        ram: Option<AcceptedAdmission>,
-        disk: Option<SsdReservationToken>,
-        multipart_cleanup: Option<MultipartStagingCleanup>,
-    ) -> Result<LocalBarrier, LocalBarrierError> {
-        let _gate = self.inner.admission_gate.lock().await;
-        if self.inner.closed.load(Ordering::Acquire) {
-            return Err(LocalBarrierError::Closed);
-        }
-        self.inner
-            .sender
-            .send(JournalCommand::Mutation {
-                record: Box::new(record),
-                payload,
-                ram,
-                disk,
-                multipart_cleanup,
-            })
-            .await
-            .map_err(|_| terminal_or_closed(&self.inner.barrier))?;
-        Ok(self.inner.barrier.clone())
     }
 
     /// Wait for queue capacity without submitting anything yet.
@@ -1415,6 +1330,32 @@ mod tests {
     use crate::writeback::reservation::{SsdAdmission, SsdReservationRequest};
     use crate::writeback::space_sample::{PhysicalSpaceSample, PhysicalSpaceSampler};
 
+    impl LocalJournaler {
+        /// Test-only submit that mirrors the production admission path:
+        /// wait for queue capacity, then enqueue into the reserved slot.
+        async fn submit_for_test(
+            &self,
+            record: MutationRecord,
+            payload: Option<VerifiedPayload>,
+            ram: Option<crate::writeback::admission::AcceptedAdmission>,
+            disk: Option<crate::writeback::reservation::SsdReservationToken>,
+            mut multipart_cleanup: Option<
+                crate::writeback::multipart_reservation::MultipartStagingCleanup,
+            >,
+        ) -> std::result::Result<super::LocalBarrier, LocalBarrierError> {
+            let slot = self.reserve_slot().await?;
+            self.submit_reserved_with_cleanup(
+                slot,
+                record,
+                payload,
+                ram,
+                disk,
+                &mut multipart_cleanup,
+            )
+            .await
+        }
+    }
+
     fn test_ssd(capacity: u64, min_free: u64) -> SsdAdmission {
         SsdAdmission::new(capacity, 1 << 20, 95, 85, min_free).unwrap()
     }
@@ -1746,7 +1687,7 @@ mod tests {
         )
         .unwrap();
         let barrier = journaler
-            .submit(record, Some(verified), None, Some(disk), Some(cleanup))
+            .submit_for_test(record, Some(verified), None, Some(disk), Some(cleanup))
             .await
             .unwrap();
 
@@ -1813,7 +1754,7 @@ mod tests {
         );
 
         let barrier = journaler
-            .submit(record, Some(verified), None, Some(disk), Some(cleanup))
+            .submit_for_test(record, Some(verified), None, Some(disk), Some(cleanup))
             .await
             .unwrap();
         let error = barrier.wait_local(1).await.unwrap_err();
@@ -1903,7 +1844,7 @@ mod tests {
         for (record, verified, disk, cleanup, staging) in submissions {
             barrier = Some(
                 journaler
-                    .submit(record, Some(verified), None, Some(disk), Some(cleanup))
+                    .submit_for_test(record, Some(verified), None, Some(disk), Some(cleanup))
                     .await
                     .unwrap(),
             );
@@ -2274,10 +2215,12 @@ mod tests {
         let (journaler, mut entered, release, _) = blocking_journaler(admission.clone(), None);
         let ram = admission.reserve(7).await.unwrap().accept();
         let barrier = journaler
-            .submit_put(
+            .submit_for_test(
                 put_record(1, b"payload"),
-                Bytes::from_static(b"payload"),
-                ram,
+                Some(VerifiedPayload::new(Bytes::from_static(b"payload"))),
+                Some(ram),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -2320,10 +2263,12 @@ mod tests {
         );
         let ram = admission.reserve(7).await.unwrap().accept();
         let barrier = journaler
-            .submit_put(
+            .submit_for_test(
                 put_record(1, b"payload"),
-                Bytes::from_static(b"payload"),
-                ram,
+                Some(VerifiedPayload::new(Bytes::from_static(b"payload"))),
+                Some(ram),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -2453,11 +2398,23 @@ mod tests {
         let first = admission.reserve(3).await.unwrap().accept();
         let second = admission.reserve(3).await.unwrap().accept();
         let barrier = journaler
-            .submit_put(put_record(1, b"one"), Bytes::from_static(b"one"), first)
+            .submit_for_test(
+                put_record(1, b"one"),
+                Some(VerifiedPayload::new(Bytes::from_static(b"one"))),
+                Some(first),
+                None,
+                None,
+            )
             .await
             .unwrap();
         journaler
-            .submit_put(put_record(2, b"two"), Bytes::from_static(b"two"), second)
+            .submit_for_test(
+                put_record(2, b"two"),
+                Some(VerifiedPayload::new(Bytes::from_static(b"two"))),
+                Some(second),
+                None,
+                None,
+            )
             .await
             .unwrap();
 
@@ -2487,10 +2444,12 @@ mod tests {
                 .unwrap()
                 .accept();
             journaler
-                .submit_put(
+                .submit_for_test(
                     put_record(sequence, payload),
-                    Bytes::copy_from_slice(payload),
-                    ram,
+                    Some(VerifiedPayload::new(Bytes::copy_from_slice(payload))),
+                    Some(ram),
+                    None,
+                    None,
                 )
                 .await
                 .unwrap();
@@ -2520,7 +2479,13 @@ mod tests {
         for sequence in 1..=submitted {
             let ram = admission.reserve(1).await.unwrap().accept();
             journaler
-                .submit_put(put_record(sequence, b"x"), Bytes::from_static(b"x"), ram)
+                .submit_for_test(
+                    put_record(sequence, b"x"),
+                    Some(VerifiedPayload::new(Bytes::from_static(b"x"))),
+                    Some(ram),
+                    None,
+                    None,
+                )
                 .await
                 .unwrap();
         }
@@ -2563,7 +2528,13 @@ mod tests {
         for sequence in 1..=2 {
             let ram = admission.reserve(1).await.unwrap().accept();
             journaler
-                .submit_put(put_record(sequence, b"x"), Bytes::from_static(b"x"), ram)
+                .submit_for_test(
+                    put_record(sequence, b"x"),
+                    Some(VerifiedPayload::new(Bytes::from_static(b"x"))),
+                    Some(ram),
+                    None,
+                    None,
+                )
                 .await
                 .unwrap();
         }
@@ -2623,7 +2594,13 @@ mod tests {
         for sequence in 1..=3 {
             let ram = admission.reserve(1).await.unwrap().accept();
             journaler
-                .submit_put(put_record(sequence, b"x"), Bytes::from_static(b"x"), ram)
+                .submit_for_test(
+                    put_record(sequence, b"x"),
+                    Some(VerifiedPayload::new(Bytes::from_static(b"x"))),
+                    Some(ram),
+                    None,
+                    None,
+                )
                 .await
                 .unwrap();
         }
@@ -2718,7 +2695,13 @@ mod tests {
         for sequence in 1..=RECORDS {
             let ram = admission.reserve(1).await.unwrap().accept();
             journaler
-                .submit_put(put_record(sequence, b"x"), Bytes::from_static(b"x"), ram)
+                .submit_for_test(
+                    put_record(sequence, b"x"),
+                    Some(VerifiedPayload::new(Bytes::from_static(b"x"))),
+                    Some(ram),
+                    None,
+                    None,
+                )
                 .await
                 .unwrap();
         }
@@ -2780,7 +2763,13 @@ mod tests {
         for sequence in 1..=records {
             let ram = admission.reserve(PAYLOAD as u64).await.unwrap().accept();
             journaler
-                .submit_put(put_record(sequence, &payload), payload.clone(), ram)
+                .submit_for_test(
+                    put_record(sequence, &payload),
+                    Some(VerifiedPayload::new(payload.clone())),
+                    Some(ram),
+                    None,
+                    None,
+                )
                 .await
                 .unwrap();
         }
@@ -2839,7 +2828,13 @@ mod tests {
         for sequence in 1..=RECORDS {
             let ram = admission.reserve(1).await.unwrap().accept();
             journaler
-                .submit_put(put_record(sequence, b"x"), Bytes::from_static(b"x"), ram)
+                .submit_for_test(
+                    put_record(sequence, b"x"),
+                    Some(VerifiedPayload::new(Bytes::from_static(b"x"))),
+                    Some(ram),
+                    None,
+                    None,
+                )
                 .await
                 .unwrap();
         }
@@ -2960,7 +2955,7 @@ mod tests {
                     .unwrap()
                     .accept();
                 journaler
-                    .submit_verified_put(record, verified.clone(), ram)
+                    .submit_for_test(record, Some(verified.clone()), Some(ram), None, None)
                     .await
                     .unwrap();
             }
@@ -3008,7 +3003,13 @@ mod tests {
             record.path = "x".repeat(8 * 1024 * 1024);
             let ram = admission.reserve(1).await.unwrap().accept();
             journaler
-                .submit_put(record, Bytes::from_static(b"x"), ram)
+                .submit_for_test(
+                    record,
+                    Some(VerifiedPayload::new(Bytes::from_static(b"x"))),
+                    Some(ram),
+                    None,
+                    None,
+                )
                 .await
                 .unwrap();
         }
@@ -3069,11 +3070,12 @@ mod tests {
             let ram = admission.reserve(1).await.unwrap().accept();
             let disk_permit = reserve_ssd(&disk, 1, 1_000).await;
             journaler
-                .submit_put_with_disk(
+                .submit_for_test(
                     put_record(sequence, b"x"),
-                    Bytes::from_static(b"x"),
-                    ram,
-                    disk_permit,
+                    Some(VerifiedPayload::new(Bytes::from_static(b"x"))),
+                    Some(ram),
+                    Some(disk_permit),
+                    None,
                 )
                 .await
                 .unwrap();
@@ -3183,7 +3185,13 @@ mod tests {
             let disk_permit =
                 reserve_ssd(&disk, record.ssd_reservation_bytes().unwrap(), 1_000_000).await;
             journaler
-                .submit_put_with_disk(record, Bytes::copy_from_slice(payload), ram, disk_permit)
+                .submit_for_test(
+                    record,
+                    Some(VerifiedPayload::new(Bytes::copy_from_slice(payload))),
+                    Some(ram),
+                    Some(disk_permit),
+                    None,
+                )
                 .await
                 .unwrap();
         }
@@ -3228,7 +3236,13 @@ mod tests {
         for sequence in 1..=2 {
             let ram = admission.reserve(1).await.unwrap().accept();
             journaler
-                .submit_put(put_record(sequence, b"x"), Bytes::from_static(b"x"), ram)
+                .submit_for_test(
+                    put_record(sequence, b"x"),
+                    Some(VerifiedPayload::new(Bytes::from_static(b"x"))),
+                    Some(ram),
+                    None,
+                    None,
+                )
                 .await
                 .unwrap();
         }
@@ -3264,7 +3278,13 @@ mod tests {
         for sequence in 1..=2 {
             let ram = admission.reserve(1).await.unwrap().accept();
             journaler
-                .submit_put(put_record(sequence, b"x"), Bytes::from_static(b"x"), ram)
+                .submit_for_test(
+                    put_record(sequence, b"x"),
+                    Some(VerifiedPayload::new(Bytes::from_static(b"x"))),
+                    Some(ram),
+                    None,
+                    None,
+                )
                 .await
                 .unwrap();
         }
@@ -3300,10 +3320,12 @@ mod tests {
         let (journaler, mut entered, release, _) = blocking_journaler(admission.clone(), Some(1));
         let ram = admission.reserve(7).await.unwrap().accept();
         let barrier = journaler
-            .submit_put(
+            .submit_for_test(
                 put_record(1, b"payload"),
-                Bytes::from_static(b"payload"),
-                ram,
+                Some(VerifiedPayload::new(Bytes::from_static(b"payload"))),
+                Some(ram),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -3331,11 +3353,12 @@ mod tests {
         let ram = admission.reserve(7).await.unwrap().accept();
         let disk_permit = reserve_ssd(&disk, 7, 1_000).await;
         let barrier = journaler
-            .submit_put_with_disk(
+            .submit_for_test(
                 put_record(1, b"payload"),
-                Bytes::from_static(b"payload"),
-                ram,
-                disk_permit,
+                Some(VerifiedPayload::new(Bytes::from_static(b"payload"))),
+                Some(ram),
+                Some(disk_permit),
+                None,
             )
             .await
             .unwrap();
@@ -3395,10 +3418,12 @@ mod tests {
         );
         let ram = admission.reserve(7).await.unwrap().accept();
         let barrier = journaler
-            .submit_put(
+            .submit_for_test(
                 put_record(1, b"payload"),
-                Bytes::from_static(b"payload"),
-                ram,
+                Some(VerifiedPayload::new(Bytes::from_static(b"payload"))),
+                Some(ram),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -3465,10 +3490,12 @@ mod tests {
 
         let ram = admission.reserve(7).await.unwrap().accept();
         let barrier = journaler
-            .submit_put(
+            .submit_for_test(
                 put_record(1, b"payload"),
-                Bytes::from_static(b"payload"),
-                ram,
+                Some(VerifiedPayload::new(Bytes::from_static(b"payload"))),
+                Some(ram),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -3486,7 +3513,13 @@ mod tests {
 
         let ram = admission.reserve(5).await.unwrap().accept();
         journaler
-            .submit_put(put_record(2, b"again"), Bytes::from_static(b"again"), ram)
+            .submit_for_test(
+                put_record(2, b"again"),
+                Some(VerifiedPayload::new(Bytes::from_static(b"again"))),
+                Some(ram),
+                None,
+                None,
+            )
             .await
             .unwrap();
 
@@ -3586,15 +3619,17 @@ mod tests {
         let disk = test_ssd(1_000_000, 1);
         let ram = admission.reserve(7).await.unwrap().accept();
         journaler
-            .submit_put(
+            .submit_for_test(
                 put_record(1, b"payload"),
-                Bytes::from_static(b"payload"),
-                ram,
+                Some(VerifiedPayload::new(Bytes::from_static(b"payload"))),
+                Some(ram),
+                None,
+                None,
             )
             .await
             .unwrap();
         let barrier = journaler
-            .submit_metadata_with_disk(
+            .submit_for_test(
                 crate::writeback::test_util::delete_record(
                     2,
                     "obsolete",
@@ -3602,7 +3637,10 @@ mod tests {
                     0x2000,
                     0,
                 ),
-                reserve_ssd(&disk, 10, 1_000_000).await,
+                None,
+                None,
+                Some(reserve_ssd(&disk, 10, 1_000_000).await),
+                None,
             )
             .await
             .unwrap();
@@ -3699,10 +3737,12 @@ mod tests {
 
         let ram = admission.reserve(7).await.unwrap().accept();
         let barrier = journaler
-            .submit_put(
+            .submit_for_test(
                 put_record(1, b"payload"),
-                Bytes::from_static(b"payload"),
-                ram,
+                Some(VerifiedPayload::new(Bytes::from_static(b"payload"))),
+                Some(ram),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -3716,7 +3756,13 @@ mod tests {
 
         let ram = admission.reserve(5).await.unwrap().accept();
         journaler
-            .submit_put(put_record(2, b"again"), Bytes::from_static(b"again"), ram)
+            .submit_for_test(
+                put_record(2, b"again"),
+                Some(VerifiedPayload::new(Bytes::from_static(b"again"))),
+                Some(ram),
+                None,
+                None,
+            )
             .await
             .unwrap();
 
@@ -3768,10 +3814,12 @@ mod tests {
 
         let ram = admission.reserve(7).await.unwrap().accept();
         let barrier = journaler
-            .submit_put(
+            .submit_for_test(
                 put_record(1, b"payload"),
-                Bytes::from_static(b"payload"),
-                ram,
+                Some(VerifiedPayload::new(Bytes::from_static(b"payload"))),
+                Some(ram),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -3790,7 +3838,13 @@ mod tests {
         // Batch 2 stages while batch 1 is parked inside its commit.
         let ram = admission.reserve(5).await.unwrap().accept();
         journaler
-            .submit_put(put_record(2, b"again"), Bytes::from_static(b"again"), ram)
+            .submit_for_test(
+                put_record(2, b"again"),
+                Some(VerifiedPayload::new(Bytes::from_static(b"again"))),
+                Some(ram),
+                None,
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -3856,10 +3910,12 @@ mod tests {
         let journaler = LocalJournaler::start(journal.clone(), admission.clone(), 2).unwrap();
         let ram = admission.reserve(7).await.unwrap().accept();
         let barrier = journaler
-            .submit_put(
+            .submit_for_test(
                 put_record(1, b"payload"),
-                Bytes::from_static(b"payload"),
-                ram,
+                Some(VerifiedPayload::new(Bytes::from_static(b"payload"))),
+                Some(ram),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -3877,10 +3933,12 @@ mod tests {
         let (journaler, mut entered, release, _) = blocking_journaler(admission.clone(), None);
         let ram = admission.reserve(7).await.unwrap().accept();
         let barrier = journaler
-            .submit_put(
+            .submit_for_test(
                 put_record(1, b"payload"),
-                Bytes::from_static(b"payload"),
-                ram,
+                Some(VerifiedPayload::new(Bytes::from_static(b"payload"))),
+                Some(ram),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -3896,7 +3954,13 @@ mod tests {
 
         let ram = Admission::new(1).reserve(1).await.unwrap().accept();
         let error = journaler
-            .submit_put(put_record(2, b"x"), Bytes::from_static(b"x"), ram)
+            .submit_for_test(
+                put_record(2, b"x"),
+                Some(VerifiedPayload::new(Bytes::from_static(b"x"))),
+                Some(ram),
+                None,
+                None,
+            )
             .await
             .unwrap_err();
         assert_eq!(error, LocalBarrierError::Closed);
@@ -3926,13 +3990,25 @@ mod tests {
         );
         let first = admission.reserve(1).await.unwrap().accept();
         journaler
-            .submit_put(put_record(1, b"x"), Bytes::from_static(b"x"), first)
+            .submit_for_test(
+                put_record(1, b"x"),
+                Some(VerifiedPayload::new(Bytes::from_static(b"x"))),
+                Some(first),
+                None,
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(entered.recv().await.unwrap(), 1);
         let second = admission.reserve(1).await.unwrap().accept();
         journaler
-            .submit_put(put_record(2, b"x"), Bytes::from_static(b"x"), second)
+            .submit_for_test(
+                put_record(2, b"x"),
+                Some(VerifiedPayload::new(Bytes::from_static(b"x"))),
+                Some(second),
+                None,
+                None,
+            )
             .await
             .unwrap();
 
@@ -3971,7 +4047,13 @@ mod tests {
         let (journaler, mut entered, release, _) = blocking_journaler(admission.clone(), Some(1));
         let ram = admission.reserve(1).await.unwrap().accept();
         journaler
-            .submit_put(put_record(1, b"x"), Bytes::from_static(b"x"), ram)
+            .submit_for_test(
+                put_record(1, b"x"),
+                Some(VerifiedPayload::new(Bytes::from_static(b"x"))),
+                Some(ram),
+                None,
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(entered.recv().await.unwrap(), 1);

@@ -179,6 +179,35 @@ impl MutationRecord {
     /// reseeds admission from the pending-record count, never payload length.
     pub const SSD_RESERVATION_OPERATIONS: u64 = 1;
 
+    /// Build a freshly accepted mutation record. The publication-side fields
+    /// (`remote_result_etag`, `retry_count`, `last_error`) always start empty
+    /// and the identity fields (`format_version`, `operation_id`,
+    /// `accepted_at_unix_ms`) are minted here so every admission path stamps
+    /// them identically.
+    pub(crate) fn new(
+        sequence: Sequence,
+        path: String,
+        kind: MutationKind,
+        local_etag: LocalEtag,
+        remote_predecessor_etag: Option<String>,
+        fence: FenceClass,
+    ) -> Self {
+        Self {
+            format_version: 1,
+            sequence,
+            operation_id: Uuid::new_v4(),
+            path,
+            kind,
+            local_etag,
+            accepted_at_unix_ms: chrono::Utc::now().timestamp_millis().max(0) as u64,
+            remote_predecessor_etag,
+            remote_result_etag: None,
+            fence,
+            retry_count: 0,
+            last_error: None,
+        }
+    }
+
     pub fn blob_path(&self) -> Option<&str> {
         match &self.kind {
             MutationKind::Put { blob_path, .. }

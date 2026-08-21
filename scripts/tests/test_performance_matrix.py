@@ -103,7 +103,6 @@ class PerformanceMatrixContractTests(unittest.TestCase):
         self.assertEqual(result.bytes, 8 * 1024 * 1024)
         self.assertEqual(result.runtime_ms, 2000)
         self.assertEqual(result.requests, 256)
-        self.assertEqual(result.errors, 0)
         self.assertEqual(result.requests_per_second, 128.0)
         self.assertEqual(result.mibps, 4.0)
 
@@ -116,7 +115,10 @@ class PerformanceMatrixContractTests(unittest.TestCase):
             json.dumps(
                 {
                     "jobs": [
-                        {"write": {"io_bytes": 1024, "runtime": 1}},
+                        # `error` is present so this fixture isolates the
+                        # missing-total_ios rejection; the error counter is now
+                        # required of every fio consumer, not just this one.
+                        {"error": 0, "write": {"io_bytes": 1024, "runtime": 1}},
                     ]
                 }
             ),
@@ -638,7 +640,6 @@ class PerformanceMatrixOrchestrationTests(unittest.TestCase):
             bytes=32 << 20,
             runtime_ms=200,
             requests=(32 << 20) // cell.block_size_bytes,
-            errors=0,
             requests_per_second=160.0,
             mibps=160.0,
         )
@@ -667,6 +668,19 @@ class PerformanceMatrixOrchestrationTests(unittest.TestCase):
             nbd_io=BlockIoDelta("nbd0", 0, 32 << 20, 400),
             system_io=zero_io,
         )
+
+    def test_csv_row_rejects_regressed_encoded_byte_counters(self) -> None:
+        """A ZeroFS restart mid-cell must not become a negative CSV byte count.
+
+        These two columns were raw subtractions, so a counter reset silently
+        wrote a negative `*_completed_bytes` into cells.csv instead of failing.
+        """
+        cell = matrix_cells(quick=True)[0]
+        result = self._result(cell)
+        restarted = replace(result, post_drain=replace(self.snapshot, remote_bytes=0))
+
+        with self.assertRaisesRegex(RuntimeError, "remote encoded bytes.*regressed"):
+            PerformanceMatrixRunner._csv_row(restarted)
 
     def test_authority_records_exact_commit_config_hash_and_devices(self) -> None:
         self.assertTrue(
@@ -872,7 +886,6 @@ class PerformanceMatrixOrchestrationTests(unittest.TestCase):
         self.assertEqual(rows[1]["block_size"], "1M")
         self.assertEqual(rows[1]["jobs"], "4")
         self.assertEqual(rows[1]["fio_bytes"], str(32 << 20))
-        self.assertEqual(rows[1]["fio_errors"], "0")
         self.assertEqual(rows[1]["syncfs_local_tail_ms"], "200")
         self.assertEqual(rows[1]["remote_target_sequence"], "10")
         self.assertEqual(len(list(receipt.glob("*-fio.json"))), 3)

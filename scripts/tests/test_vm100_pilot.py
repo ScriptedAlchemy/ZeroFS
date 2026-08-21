@@ -32,6 +32,7 @@ from scripts.vm100_pilot.benchmark import (
     _active_windows,
     _counter_delta,
     _monotonic_ms,
+    _rate,
     _validate_fio_bytes,
     calculate_tiers,
 )
@@ -62,9 +63,12 @@ from scripts.vm100_pilot.profile import (
     _require_perf_data,
 )
 from scripts.vm100_pilot.system_io import (
+    RATE_DIGITS,
     BlockIoSnapshot,
     SystemIoSnapshot,
+    aggregate_fio_jobs,
     filesystem_device,
+    mib_per_second,
     summarize_system_io,
     verify_page_cache_hit,
 )
@@ -1594,7 +1598,14 @@ class BenchmarkTests(unittest.TestCase):
                     self.calls.append((args, bool(kwargs.get("sudo", False))))
                     output.write_text(
                         json.dumps(
-                            {"jobs": [{"read": {"io_bytes": 4 << 20, "runtime": 1}}]}
+                            {
+                                "jobs": [
+                                    {
+                                        "error": 0,
+                                        "read": {"io_bytes": 4 << 20, "runtime": 1},
+                                    }
+                                ]
+                            }
                         ),
                         encoding="utf-8",
                     )
@@ -1637,10 +1648,11 @@ class BenchmarkTests(unittest.TestCase):
                             {
                                 "jobs": [
                                     {
+                                        "error": 0,
                                         "write": {
                                             "io_bytes": 4 << 20,
                                             "runtime": 2,
-                                        }
+                                        },
                                     }
                                 ]
                             }
@@ -1926,7 +1938,10 @@ class BenchmarkTests(unittest.TestCase):
                 output = Path(kwargs["output"])
                 fio_outputs.append(output)
                 output.write_text("{}", encoding="utf-8")
-                return FioResult(bytes=4 << 20, runtime_ms=1, mibps=4096.0)
+                # A runtime the mocked wall clock cannot coincidentally match:
+                # every phase here elapses in well under a millisecond, so
+                # `millis()` of the wall window would round to 1.
+                return FioResult(bytes=4 << 20, runtime_ms=7, mibps=571.429)
 
             def _run_direct_write_tiers(self, **kwargs: Any) -> DirectWriteTiers:
                 nonlocal direct_calls
@@ -1994,6 +2009,19 @@ class BenchmarkTests(unittest.TestCase):
             "tmpfs benchmark artifacts must be removed after persistence",
         )
         self.assertTrue((Path(result.receipt_dir) / "direct-write-fio.json").is_file())
+        # The foreground buffered write is rated on fio's own reported runtime,
+        # like its three sibling throughput phases -- not on the wall clock
+        # around `sudo fio`, which would charge process startup to the write
+        # and leave write and read rates non-comparable in one receipt.
+        self.assertEqual(result.user_buffered_page_cache_write_ms, 7)
+        self.assertEqual(result.user_buffered_page_cache_write_mibps, 571.429)
+        self.assertEqual(result.page_cache_hot_read_ms, 7)
+        self.assertEqual(result.zerofs_direct_read_ms, 7)
+        # The perf-sliceable phase window stays wall-clock, and the durability
+        # end-to-end fields still run from the pre-fio anchor.
+        self.assertIn(
+            "user_buffered_page_cache_write", manifest["phase_monotonic_ns"]
+        )
         self.assertEqual(result.zerofs_nbd_odirect_write_bytes, 4 << 20)
         self.assertEqual(result.zerofs_nbd_odirect_write_service_ack_mibps, 1000.0)
         self.assertEqual(result.zerofs_nbd_odirect_local_durability_end_to_end_ms, 1)
@@ -2057,15 +2085,21 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(result.user_buffered_page_cache_write_mibps, 10_240.0)
         self.assertEqual(result.zerofs_nbd_odirect_write_service_ack_ms, 400)
         self.assertEqual(result.zerofs_nbd_odirect_write_service_ack_mibps, 2560.0)
-        self.assertEqual(result.zerofs_nbd_odirect_local_durability_tail_mibps, 2275.56)
+        # Three decimals, the shared system_io.RATE_DIGITS. This entry point
+        # used to round MiB/s to two while every other one used three, so the
+        # same transfer read as two different numbers depending on which
+        # command wrote the receipt.
         self.assertEqual(
-            result.zerofs_nbd_odirect_local_durability_end_to_end_mibps, 1137.78
+            result.zerofs_nbd_odirect_local_durability_tail_mibps, 2275.556
         )
         self.assertEqual(
-            result.zerofs_nbd_odirect_remote_durability_tail_mibps, 1137.78
+            result.zerofs_nbd_odirect_local_durability_end_to_end_mibps, 1137.778
         )
         self.assertEqual(
-            result.zerofs_nbd_odirect_remote_durability_end_to_end_mibps, 568.89
+            result.zerofs_nbd_odirect_remote_durability_tail_mibps, 1137.778
+        )
+        self.assertEqual(
+            result.zerofs_nbd_odirect_remote_durability_end_to_end_mibps, 568.889
         )
         self.assertEqual(
             asdict(result)["user_buffered_page_cache_write_mibps"], 10_240.0
@@ -2080,6 +2114,7 @@ class BenchmarkTests(unittest.TestCase):
                 {
                     "jobs": [
                         {
+                            "error": 0,
                             "read": {
                                 "io_bytes": 536_870_912,
                                 "runtime": 40,
@@ -2108,6 +2143,92 @@ class BenchmarkTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "reached nbd0"):
             verify_page_cache_hit(before, BlockIoSnapshot("nbd0", 1512, 2000, 40))
+
+    def test_page_cache_proof_rejects_regressed_counter(self) -> None:
+        """A reset diskstats counter must not be clamped into a fake proof.
+
+        `proven` is `read_bytes == 0`, so clamping a regression with
+        `max(0, after - before)` would report a page-cache hit precisely when
+        the evidence for one was lost.
+        """
+        before = BlockIoSnapshot("nbd0", 4096, 2000, 30)
+        regressed = BlockIoSnapshot("nbd0", 0, 2000, 30)
+
+        with self.assertRaisesRegex(RuntimeError, "read bytes counter regressed"):
+            verify_page_cache_hit(before, regressed)
+
+    def test_fio_result_rejects_reported_io_errors(self) -> None:
+        """The benchmark entry point must reject errored fio jobs.
+
+        It is the only fio consumer that does not need `total_ios`, and used to
+        skip the `error` counter along with it -- so a run whose jobs reported
+        I/O errors still produced a throughput number.
+        """
+        path = Path(self.temp.name) / "errored-fio.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "jobs": [
+                        {
+                            "error": 5,
+                            "write": {"io_bytes": 4 << 20, "runtime": 10},
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "I/O errors=5"):
+            FioResult.from_json(path, operation="write")
+
+    def test_fio_aggregate_requires_error_counter_without_request_counters(
+        self,
+    ) -> None:
+        path = Path(self.temp.name) / "aggregate-fio.json"
+        jobs = [{"write": {"io_bytes": 4 << 20, "runtime": 10, "total_ios": 4}}]
+
+        with self.assertRaisesRegex(ValueError, "no error counter"):
+            aggregate_fio_jobs(
+                jobs, operation="write", path=path, require_request_counters=False
+            )
+
+    def test_fio_aggregate_maxes_runtime_for_concurrent_jobs(self) -> None:
+        """fio runs an invocation's jobs concurrently (nothing here stonewalls).
+
+        total_bytes over the longest job's runtime is the concurrent phase rate;
+        summing runtimes would understate every multi-job cell.
+        """
+        path = Path(self.temp.name) / "concurrent-fio.json"
+        jobs = [
+            {"error": 0, "write": {"io_bytes": 3 << 20, "runtime": 1000}},
+            {"error": 0, "write": {"io_bytes": 5 << 20, "runtime": 2000}},
+        ]
+
+        aggregate = aggregate_fio_jobs(
+            jobs, operation="write", path=path, require_request_counters=False
+        )
+
+        self.assertEqual(aggregate.byte_count, 8 << 20)
+        self.assertEqual(aggregate.runtime_ms, 2000)
+        self.assertEqual(mib_per_second(aggregate.byte_count, 2.0), 4.0)
+
+    def test_every_entry_point_reports_rates_at_one_precision(self) -> None:
+        """One MiB/s precision across commands, so receipts are comparable."""
+        from scripts.vm100_pilot.protocol_matrix import ProtocolMatrixRunner
+        from scripts.vm100_pilot.raw_sftp import _rate as sftp_rate
+
+        byte_count = 1 << 30
+        self.assertEqual(RATE_DIGITS, 3)
+        # 1024 MiB / 0.45 s = 2275.5555... -- a value that actually exposes the
+        # digit count, unlike the round numbers most fixtures use.
+        expected = 2275.556
+        self.assertEqual(_rate(byte_count, 450), expected)
+        self.assertEqual(sftp_rate(byte_count, 450), expected)
+        self.assertEqual(
+            ProtocolMatrixRunner._rate(byte_count, 450_000_000), expected
+        )
+        self.assertEqual(mib_per_second(byte_count, 0.45), expected)
 
     def test_system_io_snapshot_and_summary_attribute_root_disk_pressure(self) -> None:
         proc = Path(self.temp.name) / "proc"

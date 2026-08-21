@@ -540,7 +540,6 @@ class RealWorldMatrixDefinitionTests(unittest.TestCase):
                         cell.total_bytes,
                         250,
                         cell.total_bytes // cell.block_size_bytes,
-                        0,
                         4.0,
                         32.0,
                     )

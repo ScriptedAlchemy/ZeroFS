@@ -80,6 +80,14 @@ struct StagedWriteAccept {
     replay: Option<AcceptedWriteReplay>,
 }
 
+/// One backing inode of a logical write, staged into its own lane.
+struct StagedMember {
+    id: u64,
+    offset: u64,
+    data: Bytes,
+    attrs: FileAttributes,
+}
+
 struct AcceptedWriteReplay {
     op_id: crate::dedup::OpId,
     fingerprint: [u8; 32],
@@ -237,6 +245,9 @@ impl FilesystemVolatileOverlay {
         self.frozen.load(Ordering::Acquire)
     }
 
+    /// Single-inode acceptance. The staged member is described explicitly
+    /// because a replayed [`PreparedWriteBatch`] carries no members, so the
+    /// bytes to stage cannot be recovered from `batch`.
     async fn accept(self: &Arc<Self>, request: StagedWriteAccept) -> OverlayResult<MutationCutoff> {
         let StagedWriteAccept {
             inode,
@@ -248,100 +259,19 @@ impl FilesystemVolatileOverlay {
             batch,
             replay,
         } = request;
-        if self.is_frozen() {
-            return Err(OverlayError::IoError);
-        }
-        let visibility = WriteVisibility::staged();
-        let length = data.len();
-        let groups = vec![vec![WriteChunk {
-            inode,
-            member_offset: offset,
-            logical_offset: 0,
-            length,
-        }]];
-        let (accepted_tx, accepted_rx) = oneshot::channel();
-        let dispatch = PendingDispatch::new(1, accepted_rx);
-        {
-            let mut pending = self.pending.lock().expect("filesystem overlay poisoned");
-            pending
-                .entry(inode)
-                .or_default()
-                .push_back(Arc::clone(&dispatch));
-        }
-        let runtime = self.runtime(inode);
-        match runtime
-            .accept_staged_write(admission, offset, data, groups, Arc::clone(&visibility))
-            .await
-        {
-            Ok(sequence) => {
-                #[cfg(test)]
-                self.inject_publish_failure_if_requested();
-                let accepted = match guard.publish(batch) {
-                    Ok(accepted) => accepted,
-                    Err(_) => {
-                        drop(accepted_tx);
-                        dispatch.cancel_unpublished();
-                        runtime.wait_released(sequence).await;
-                        return Err(OverlayError::IoError);
-                    }
-                };
-                let cutoff = accepted.cutoff();
-                self.latest_attrs
-                    .lock()
-                    .expect("filesystem overlay poisoned")
-                    .entry(inode)
-                    .or_default()
-                    .push_back(VisibleAttrs {
-                        attrs: attrs.clone(),
-                        visibility: Arc::clone(&visibility),
-                    });
-                #[cfg(test)]
-                self.pause_before_publish_if_requested().await;
-                visibility.publish();
-                record_published_staged_writes(length as u64, 1);
-                if let Some(replay) = replay {
-                    let fs = self.fs.upgrade().ok_or(OverlayError::IoError)?;
-                    let accepted_write = fs.dedup.begin_accepted_write(
-                        crate::dedup::DedupEntry {
-                            op_id: replay.op_id,
-                            result: crate::dedup::DedupResult::Write {
-                                attrs: attrs.clone(),
-                            },
-                        },
-                        replay.fingerprint,
-                        replay.count,
-                    );
-                    dispatch.install_accepted_write(accepted_write);
-                }
-                if let Err(accepted) = accepted_tx.send(accepted) {
-                    let (request, _batch, raw_permit, _cutoff) = accepted.into_parts();
-                    if let Some(fs) = self.fs.upgrade()
-                        && let Some(coordinator) = fs.mutation_coordinator.get()
-                    {
-                        coordinator.poison("overlay dispatch receiver dropped");
-                        coordinator
-                            .request_cache()
-                            .complete(request, Err(FsError::IoError));
-                    }
-                    dispatch.cancel_unpublished();
-                    drop(raw_permit);
-                    return Err(OverlayError::IoError);
-                }
-                self.accepted_batches.fetch_add(1, Ordering::Relaxed);
-                Ok(cutoff)
-            }
-            Err(error) => {
-                let mut pending = self.pending.lock().expect("filesystem overlay poisoned");
-                if let Some(queue) = pending.get_mut(&inode) {
-                    queue.retain(|queued| !Arc::ptr_eq(queued, &dispatch));
-                    if queue.is_empty() {
-                        pending.remove(&inode);
-                    }
-                }
-                let _ = guard.abort(PreparationAbort::RequestFailure(overlay_fs_error(error)));
-                Err(error)
-            }
-        }
+        self.accept_members(
+            vec![admission],
+            vec![StagedMember {
+                id: inode,
+                offset,
+                data,
+                attrs,
+            }],
+            guard,
+            batch,
+            replay,
+        )
+        .await
     }
 
     async fn rollback_unpublished(
@@ -375,31 +305,44 @@ impl FilesystemVolatileOverlay {
         guard: PreparationGuard,
         batch: PreparedWriteBatch,
     ) -> OverlayResult<MutationCutoff> {
+        let members = batch
+            .members
+            .iter()
+            .map(|member| StagedMember {
+                id: member.id,
+                offset: member.offset,
+                data: member.data.clone(),
+                attrs: member.post_attrs.clone(),
+            })
+            .collect::<Vec<_>>();
+        self.accept_members(admissions, members, guard, batch, None)
+            .await
+    }
+
+    /// One acceptance path for every logical write, striped or not: stage each
+    /// member into its lane, publish the preparation once, then hand the
+    /// accepted mutation to the dispatch that the apply workers drain.
+    async fn accept_members(
+        self: &Arc<Self>,
+        admissions: Vec<VolatileAdmission>,
+        members: Vec<StagedMember>,
+        guard: PreparationGuard,
+        batch: PreparedWriteBatch,
+        replay: Option<AcceptedWriteReplay>,
+    ) -> OverlayResult<MutationCutoff> {
         if self.is_frozen() {
             return Err(OverlayError::IoError);
         }
-        if batch.members.is_empty() || admissions.len() != batch.members.len() {
+        if members.is_empty() || admissions.len() != members.len() {
             return Err(OverlayError::InvalidArgument);
         }
         let visibility = WriteVisibility::staged();
-        let members: Vec<_> = batch
-            .members
-            .iter()
-            .map(|member| {
-                (
-                    member.id,
-                    member.offset,
-                    member.data.clone(),
-                    member.post_attrs.clone(),
-                )
-            })
-            .collect();
-        let member_ids = members.iter().map(|(id, _, _, _)| *id).collect::<Vec<_>>();
+        let member_ids = members.iter().map(|member| member.id).collect::<Vec<_>>();
         let (accepted_tx, accepted_rx) = oneshot::channel();
         let dispatch = PendingDispatch::new(members.len(), accepted_rx);
         {
             let mut pending = self.pending.lock().expect("filesystem overlay poisoned");
-            for (id, _, _, _) in &members {
+            for id in &member_ids {
                 pending
                     .entry(*id)
                     .or_default()
@@ -407,18 +350,22 @@ impl FilesystemVolatileOverlay {
             }
         }
         let mut accepted_runtimes = Vec::with_capacity(members.len());
-        for (admission, (id, offset, data, _attrs)) in
-            admissions.into_iter().zip(members.iter().cloned())
-        {
+        for (admission, member) in admissions.into_iter().zip(members.iter()) {
             let groups = vec![vec![WriteChunk {
-                inode: id,
-                member_offset: offset,
+                inode: member.id,
+                member_offset: member.offset,
                 logical_offset: 0,
-                length: data.len(),
+                length: member.data.len(),
             }]];
-            let runtime = self.runtime(id);
+            let runtime = self.runtime(member.id);
             match runtime
-                .accept_staged_write(admission, offset, data, groups, Arc::clone(&visibility))
+                .accept_staged_write(
+                    admission,
+                    member.offset,
+                    member.data.clone(),
+                    groups,
+                    Arc::clone(&visibility),
+                )
                 .await
             {
                 Ok(accepted) => {
@@ -465,9 +412,9 @@ impl FilesystemVolatileOverlay {
                 let attrs = members
                     .iter()
                     .rev()
-                    .find(|(id, _, _, _)| id == member_id)
+                    .find(|member| member.id == *member_id)
                     .expect("unique member id came from members")
-                    .3
+                    .attrs
                     .clone();
                 latest
                     .entry(*member_id)
@@ -482,12 +429,23 @@ impl FilesystemVolatileOverlay {
         self.pause_before_publish_if_requested().await;
         visibility.publish();
         record_published_staged_writes(
-            members
-                .iter()
-                .map(|(_, _, data, _)| data.len() as u64)
-                .sum(),
+            members.iter().map(|member| member.data.len() as u64).sum(),
             members.len() as u64,
         );
+        if let Some(replay) = replay {
+            let fs = self.fs.upgrade().ok_or(OverlayError::IoError)?;
+            let accepted_write = fs.dedup.begin_accepted_write(
+                crate::dedup::DedupEntry {
+                    op_id: replay.op_id,
+                    result: crate::dedup::DedupResult::Write {
+                        attrs: members.first().expect("non-empty members").attrs.clone(),
+                    },
+                },
+                replay.fingerprint,
+                replay.count,
+            );
+            dispatch.install_accepted_write(accepted_write);
+        }
         if let Err(accepted) = accepted_tx.send(accepted) {
             let (request, _batch, raw_permit, _cutoff) = accepted.into_parts();
             if let Some(fs) = self.fs.upgrade()
@@ -498,6 +456,11 @@ impl FilesystemVolatileOverlay {
                     .request_cache()
                     .complete(request, Err(FsError::IoError));
             }
+            // The send only fails once the dispatch has taken and dropped the
+            // receiver, so nothing will ever consume this mutation. Cancelling
+            // retires the accepted (not yet durable) dedup lifecycle and
+            // releases any member still parked on a dispatch result.
+            dispatch.cancel_unpublished();
             drop(raw_permit);
             return Err(OverlayError::IoError);
         }
@@ -576,27 +539,33 @@ impl FilesystemVolatileOverlay {
     }
 
     pub(crate) async fn wait_inode(self: &Arc<Self>, inode: u64) -> OverlayResult<()> {
-        let runtime = {
+        self.wait_inodes(std::slice::from_ref(&inode)).await
+    }
+
+    /// Barrier over several backing inodes of one logical write (NBD FUA, 9P
+    /// `fsync`). Every lane and the cutoff it must reach are captured in one
+    /// lock pass and then awaited together, so the barrier still covers
+    /// everything accepted before the call without a later lane also inheriting
+    /// the writes accepted while an earlier lane drained.
+    pub(crate) async fn wait_inodes(self: &Arc<Self>, inodes: &[InodeId]) -> OverlayResult<()> {
+        let targets = {
             let runtimes = self.runtimes.lock().expect("filesystem overlay poisoned");
-            runtimes.get(&inode).cloned()
+            inodes
+                .iter()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .filter_map(|inode| runtimes.get(inode).map(materialization_target))
+                .collect::<Vec<_>>()
         };
-        if let Some(runtime) = runtime {
-            let target = runtime.accepted_cutoff();
-            runtime.wait_materialized(target).await?;
-        }
-        Ok(())
+        wait_materialization_targets(targets).await
     }
 
     pub(crate) async fn wait_all(self: &Arc<Self>) -> OverlayResult<()> {
-        let runtimes = {
+        let targets = {
             let runtimes = self.runtimes.lock().expect("filesystem overlay poisoned");
-            runtimes.values().cloned().collect::<Vec<_>>()
+            runtimes.values().map(materialization_target).collect()
         };
-        for runtime in runtimes {
-            let target = runtime.accepted_cutoff();
-            runtime.wait_materialized(target).await?;
-        }
-        Ok(())
+        wait_materialization_targets(targets).await
     }
 
     pub(crate) async fn shutdown(self: &Arc<Self>) -> OverlayResult<()> {
@@ -1099,6 +1068,27 @@ impl ZeroFS {
             .map_err(overlay_fs_error)?;
         Ok((data, offset + read_len as u64 >= visible_size))
     }
+}
+
+/// Pair a lane with the cutoff a barrier must reach, taken while the runtimes
+/// map is still locked so no lane observes a cutoff extended by a later write.
+fn materialization_target(runtime: &Arc<VolatileWriteRuntime>) -> (Arc<VolatileWriteRuntime>, u64) {
+    let target = runtime.accepted_cutoff();
+    (Arc::clone(runtime), target)
+}
+
+/// Await every captured lane concurrently. As with the previous sequential
+/// wait, the first error ends the barrier and the remaining waits are dropped.
+async fn wait_materialization_targets(
+    targets: Vec<(Arc<VolatileWriteRuntime>, u64)>,
+) -> OverlayResult<()> {
+    futures::future::try_join_all(
+        targets
+            .iter()
+            .map(|(runtime, target)| runtime.wait_materialized(*target)),
+    )
+    .await
+    .map(|_| ())
 }
 
 async fn canonical_read_base(

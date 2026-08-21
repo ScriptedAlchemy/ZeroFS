@@ -514,6 +514,63 @@ class ProtocolMatrixTests(unittest.TestCase):
         self.assertEqual(list(self.protocol_root.iterdir()), [])
         self.assertEqual(list(self.config.temp_dir.iterdir()), [])
 
+    def test_restarted_byte_counters_are_named_not_silently_negative(self) -> None:
+        """A ZeroFS restart mid-workload must name the regressed counter.
+
+        These deltas were raw subtractions, so a counter reset surfaced only as
+        a confusing "byte attribution mismatch" against a negative number
+        instead of saying the counter had regressed.
+        """
+        scenario = ProtocolScenario(
+            name="protocol-matrix-nfs-test",
+            protocol="nfs",
+            description="small real transfer",
+            workloads=(WorkloadDefinition("small", 4096, "test-pattern"),),
+        )
+        authority = ProtocolAuthority.from_mapping(
+            "nfs",
+            {
+                "ZEROFS_BENCH_NFS_MOUNTPOINT": str(self.protocol_root),
+                "ZEROFS_BENCH_NFS_ENDPOINT": "10.10.10.55:/",
+                "ZEROFS_BENCH_NFS_MOUNT_OPTIONS": "rw,hard,vers=3",
+                "ZEROFS_BENCH_NFS_METRICS_URL": "https://10.10.10.55:9567/metrics",
+                "ZEROFS_BENCH_NFS_METRICS_INSTANCE_ID": "instance-a",
+                "ZEROFS_BENCH_NFS_METRICS_FILESYSTEM_ID": "filesystem-a",
+                "ZEROFS_BENCH_NFS_METRICS_EXPORT_ID": "nfs-root",
+            },
+        )
+        findmnt = AuthorityRunner(
+            {
+                "filesystems": [
+                    {
+                        "target": str(self.protocol_root),
+                        "source": "10.10.10.55:/",
+                        "fstype": "nfs",
+                        "options": "rw,hard,vers=3",
+                    }
+                ]
+            }
+        )
+        before = WritebackSnapshot(10, 10, 10, 0, 0, 100, 100, False)
+        accepted = replace(before, accepted=11, dirty_ram=4096)
+        local = replace(accepted, local=11, dirty_ram=0, local_bytes=4196)
+        # The drain lands on a process whose counters restarted from zero.
+        restarted = replace(local, remote=11, local_bytes=0, remote_bytes=0)
+        lifecycle = Lifecycle(
+            [before, accepted, accepted, accepted, accepted, local, restarted]
+        )
+        runner = ProtocolMatrixRunner(
+            self.config,
+            findmnt,
+            lifecycle,  # type: ignore[arg-type]
+            random_bytes=lambda count: b"x" * count,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "local encoded bytes.*regressed"):
+            runner.run(scenario, authority)
+
+        self.assertEqual(list(self.protocol_root.iterdir()), [])
+
     def test_registry_protocol_scenarios_are_not_noops(self) -> None:
         for name in ("protocol-matrix-nfs", "protocol-matrix-9p"):
             scenario = require_protocol_scenario(name)

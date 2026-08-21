@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use std::fmt;
 use std::fs;
 use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Compression algorithm configuration for extent data.
 /// Supports lz4 and zstd.
@@ -1118,15 +1118,19 @@ pub struct NinePConfig {
     pub shared_identity: Option<NfsSharedIdentity>,
 }
 
+/// Shared endpoint check for the server configs that expose an optional
+/// address set plus an optional Unix socket path.
+fn endpoint_configured(
+    addresses: Option<&HashSet<SocketAddr>>,
+    unix_socket: Option<&Path>,
+) -> bool {
+    addresses.is_some_and(|addresses| !addresses.is_empty())
+        || unix_socket.is_some_and(|path| !path.as_os_str().is_empty())
+}
+
 impl NinePConfig {
     fn has_endpoint(&self) -> bool {
-        self.addresses
-            .as_ref()
-            .is_some_and(|addresses| !addresses.is_empty())
-            || self
-                .unix_socket
-                .as_ref()
-                .is_some_and(|path| !path.as_os_str().is_empty())
+        endpoint_configured(self.addresses.as_ref(), self.unix_socket.as_deref())
     }
 }
 
@@ -1168,13 +1172,7 @@ const MIN_NBD_VOLATILE_MEMORY_BYTES: u64 = 128 * 1024 * 1024;
 
 impl NbdConfig {
     fn has_endpoint(&self) -> bool {
-        self.addresses
-            .as_ref()
-            .is_some_and(|addresses| !addresses.is_empty())
-            || self
-                .unix_socket
-                .as_ref()
-                .is_some_and(|path| !path.as_os_str().is_empty())
+        endpoint_configured(self.addresses.as_ref(), self.unix_socket.as_deref())
     }
 
     fn validate(&self) -> Result<()> {
@@ -1228,13 +1226,7 @@ pub struct RpcConfig {
 
 impl RpcConfig {
     fn has_endpoint(&self) -> bool {
-        self.addresses
-            .as_ref()
-            .is_some_and(|addresses| !addresses.is_empty())
-            || self
-                .unix_socket
-                .as_ref()
-                .is_some_and(|path| !path.as_os_str().is_empty())
+        endpoint_configured(self.addresses.as_ref(), self.unix_socket.as_deref())
     }
 }
 

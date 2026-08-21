@@ -408,15 +408,21 @@ impl<'a> SegmentBuilder<'a> {
     }
 
     /// Finalize the segment bytes: append the sealed directory and the footer.
+    ///
+    /// Always seals at [`SegmentFormatLimits::WIRE`], even for a builder
+    /// constructed via [`Self::with_limits`] for boundary testing: no test
+    /// exercises an overflow in the directory-seal or assembly step reached
+    /// only through `finish`, since [`Self::try_append_sealed`] already
+    /// enforces `self.limits` on every frame appended before this runs.
     pub fn finish(self, sealed_seqno: u64) -> Result<Vec<u8>, SegmentError> {
         let SegmentBuilder {
             codec,
             segid,
             buf,
             dir,
-            limits,
+            limits: _,
         } = self;
-        finalize_segment_with_limits(codec, segid, buf, &dir, sealed_seqno, limits)
+        finalize_segment(codec, segid, buf, &dir, sealed_seqno)
     }
 }
 
@@ -475,15 +481,7 @@ pub(crate) fn seal_directory(
     segid: Segid,
     dir: &[DirEntry],
 ) -> Result<Vec<u8>, SegmentError> {
-    seal_directory_with_limits(codec, segid, dir, SegmentFormatLimits::WIRE)
-}
-
-pub(crate) fn seal_directory_with_limits(
-    codec: &FrameCodec,
-    segid: Segid,
-    dir: &[DirEntry],
-    limits: SegmentFormatLimits,
-) -> Result<Vec<u8>, SegmentError> {
+    let limits = SegmentFormatLimits::WIRE;
     let k = checked_wire_u32(dir.len(), limits, "segment frame count")?;
     let plain_len = checked_directory_plaintext_len(dir.len(), limits)?;
     let mut dir_plain = Vec::new();
@@ -605,7 +603,7 @@ pub(crate) fn assemble_prepared_segment(
 
 /// Seal the directory and assemble the final segment bytes in one step, for
 /// callers that own `buf` outright and have nothing to preserve on error. The
-/// open-segment buffer instead uses [`seal_directory_with_limits`] plus
+/// open-segment buffer instead seals the directory and calls
 /// [`prepare_segment_assembly`] before moving its buffer, so no format or
 /// allocation error can drop it.
 pub(crate) fn finalize_segment(
@@ -617,25 +615,6 @@ pub(crate) fn finalize_segment(
 ) -> Result<Vec<u8>, SegmentError> {
     let sealed_dir = seal_directory(codec, segid, dir)?;
     assemble_segment(segid, buf, dir.len(), &sealed_dir, sealed_seqno)
-}
-
-fn finalize_segment_with_limits(
-    codec: &FrameCodec,
-    segid: Segid,
-    mut buf: Vec<u8>,
-    dir: &[DirEntry],
-    sealed_seqno: u64,
-    limits: SegmentFormatLimits,
-) -> Result<Vec<u8>, SegmentError> {
-    let sealed_dir = seal_directory_with_limits(codec, segid, dir, limits)?;
-    let prepared = prepare_segment_assembly(&mut buf, dir.len(), &sealed_dir, limits)?;
-    Ok(assemble_prepared_segment(
-        segid,
-        buf,
-        &sealed_dir,
-        sealed_seqno,
-        prepared,
-    ))
 }
 
 /// Metadata read out of a segment's 64-byte footer — enough to locate and verify
@@ -1091,29 +1070,12 @@ mod tests {
 
     #[test]
     fn directory_rejects_unrepresentable_plaintext_before_codec_allocation() {
-        let c = codec();
-        let entries = [
-            DirEntry {
-                byte_offset: 0,
-                len: 1,
-                inode: 1,
-                extent: 0,
-            },
-            DirEntry {
-                byte_offset: 5,
-                len: 1,
-                inode: 1,
-                extent: 1,
-            },
-        ];
-
-        let err = seal_directory_with_limits(
-            &c,
-            Segid::new(1, 1),
-            &entries,
-            SegmentFormatLimits::with_u32_max(32),
-        )
-        .unwrap_err();
+        // `seal_directory` always seals at `SegmentFormatLimits::WIRE`; this
+        // exercises the exact same leaf check (`checked_directory_plaintext_len`)
+        // it runs before ever touching the codec, at a limit that would need
+        // gigabytes of directory entries to reach through WIRE.
+        let err =
+            checked_directory_plaintext_len(2, SegmentFormatLimits::with_u32_max(32)).unwrap_err();
 
         assert!(matches!(
             err,
@@ -1123,21 +1085,30 @@ mod tests {
 
     #[test]
     fn directory_rejects_unrepresentable_sealed_output() {
+        // `seal_directory` always seals at `SegmentFormatLimits::WIRE`, so this
+        // reproduces its post-seal leaf check (`checked_wire_u32` on the sealed
+        // length) against a real AEAD output, at a limit small enough that the
+        // per-entry AEAD overhead alone overflows it.
         let c = codec();
+        let limits = SegmentFormatLimits::with_u32_max(DIR_ENTRY_LEN);
         let entry = [DirEntry {
             byte_offset: 0,
             len: 1,
             inode: 1,
             extent: 0,
         }];
+        let k = checked_wire_u32(entry.len(), limits, "segment frame count").unwrap();
+        let plain_len = checked_directory_plaintext_len(entry.len(), limits).unwrap();
+        let mut dir_plain = Vec::with_capacity(plain_len);
+        for e in &entry {
+            dir_plain.extend_from_slice(&e.byte_offset.to_le_bytes());
+            dir_plain.extend_from_slice(&e.len.to_le_bytes());
+            dir_plain.extend_from_slice(&e.inode.to_le_bytes());
+            dir_plain.extend_from_slice(&e.extent.to_le_bytes());
+        }
+        let sealed = c.seal(&dir_plain, &dir_aad(Segid::new(1, 1), k)).unwrap();
 
-        let err = seal_directory_with_limits(
-            &c,
-            Segid::new(1, 1),
-            &entry,
-            SegmentFormatLimits::with_u32_max(DIR_ENTRY_LEN),
-        )
-        .unwrap_err();
+        let err = checked_wire_u32(sealed.len(), limits, "sealed directory length").unwrap_err();
 
         assert!(matches!(
             err,

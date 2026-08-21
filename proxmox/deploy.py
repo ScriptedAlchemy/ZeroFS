@@ -162,6 +162,19 @@ def _split_listener(
         ) from error
 
 
+def _require_private_listener(
+    addresses: list[str],
+    *,
+    expected_ip: ipaddress.IPv4Address | ipaddress.IPv6Address,
+    port: int,
+    message: str,
+) -> None:
+    for address in addresses:
+        host, found_port = _split_listener(address)
+        if host != expected_ip or found_port != port:
+            raise ValueError(message)
+
+
 def _posix_identity(
     section: dict[str, object], label: str, *, nested: bool
 ) -> tuple[int, int]:
@@ -214,12 +227,12 @@ def validate_server_config(
         nbd_addresses = _addresses(nbd)
         if not nbd_addresses:
             raise ValueError("NBD must have a private TCP listener")
-        for address in nbd_addresses:
-            host, port = _split_listener(address)
-            if host != expected_ip or port != 10809:
-                raise ValueError(
-                    "NBD must listen only on the private container address at port 10809"
-                )
+        _require_private_listener(
+            nbd_addresses,
+            expected_ip=expected_ip,
+            port=10809,
+            message="NBD must listen only on the private container address at port 10809",
+        )
         if nbd.get("write_ack_mode") != "volatile_memory":
             raise ValueError('NBD write_ack_mode must be "volatile_memory"')
         budget = nbd.get("volatile_memory_gb", 0)
@@ -237,12 +250,14 @@ def validate_server_config(
         nbd_addresses = _addresses(nbd)
         if not nbd_addresses:
             raise ValueError("prod NBD must have a private TCP listener")
-        for address in nbd_addresses:
-            host, port = _split_listener(address)
-            if host != expected_ip or port != 10809:
-                raise ValueError(
-                    "prod NBD must listen only on the private container address at port 10809"
-                )
+        _require_private_listener(
+            nbd_addresses,
+            expected_ip=expected_ip,
+            port=10809,
+            message=(
+                "prod NBD must listen only on the private container address at port 10809"
+            ),
+        )
         if nbd.get("unix_socket") != "/run/zerofs/nbd.sock":
             raise ValueError("prod requires the container-owned NBD Unix socket")
         if nbd.get("write_ack_mode") != "materialized":
@@ -256,36 +271,36 @@ def validate_server_config(
         ninep_addresses = _addresses(ninep)
         if not ninep_addresses:
             raise ValueError("prod 9P must have a private TCP listener")
-        for address in ninep_addresses:
-            host, port = _split_listener(address)
-            if host != expected_ip or port != 5564:
-                raise ValueError(
-                    "9P must listen only on the private container address at port 5564"
-                )
+        _require_private_listener(
+            ninep_addresses,
+            expected_ip=expected_ip,
+            port=5564,
+            message="9P must listen only on the private container address at port 5564",
+        )
         nfs = servers.get("nfs")
         if not isinstance(nfs, dict):
             raise ValueError("prod requires the private NFS listener")
         nfs_addresses = _addresses(nfs)
         if not nfs_addresses:
             raise ValueError("prod NFS must have a private TCP listener")
-        for address in nfs_addresses:
-            host, port = _split_listener(address)
-            if host != expected_ip or port != 2049:
-                raise ValueError(
-                    "NFS must listen only on the private container address at port 2049"
-                )
+        _require_private_listener(
+            nfs_addresses,
+            expected_ip=expected_ip,
+            port=2049,
+            message="NFS must listen only on the private container address at port 2049",
+        )
         webui = servers.get("webui")
         if not isinstance(webui, dict):
             raise ValueError("prod requires the private WebUI listener")
         webui_addresses = _addresses(webui)
         if not webui_addresses:
             raise ValueError("prod WebUI must have a private TCP listener")
-        for address in webui_addresses:
-            host, port = _split_listener(address)
-            if host != expected_ip or port != 8080:
-                raise ValueError(
-                    "WebUI must listen only on the private container address at port 8080"
-                )
+        _require_private_listener(
+            webui_addresses,
+            expected_ip=expected_ip,
+            port=8080,
+            message="WebUI must listen only on the private container address at port 8080",
+        )
         identities = {
             _posix_identity(nfs, "NFS shared_identity", nested=True),
             _posix_identity(ninep, "9P shared_identity", nested=True),
@@ -311,12 +326,14 @@ def validate_server_config(
         raise ValueError(
             "[prometheus] must expose metrics on the private container address"
         )
-    for address in metrics_addresses:
-        host, port = _split_listener(address)
-        if host != expected_ip or port != 9567:
-            raise ValueError(
-                "Prometheus must listen only on the private container address at port 9567"
-            )
+    _require_private_listener(
+        metrics_addresses,
+        expected_ip=expected_ip,
+        port=9567,
+        message=(
+            "Prometheus must listen only on the private container address at port 9567"
+        ),
+    )
 
     writeback = settings.get("writeback")
     if not isinstance(writeback, dict) or writeback.get("enabled") is not True:
@@ -523,69 +540,6 @@ def release_id(commit: str, paths: Sequence[Path], values: Sequence[str] = ()) -
 
 def shell_join(command: Sequence[str]) -> str:
     return shlex.join([str(part) for part in command])
-
-
-def build_host_plan(
-    *,
-    action: str,
-    ctid: int,
-    container_ip: str,
-    bridge: str,
-    gateway: str = "10.10.10.1",
-    template: str,
-    state_root: Path,
-    memory_mb: int,
-    rootfs: str,
-    cores: int = 8,
-) -> list[list[str]]:
-    if action not in {"deploy", "replace", "cleanup"}:
-        raise ValueError(f"unsupported host action: {action}")
-    plan: list[list[str]] = []
-    if action == "replace":
-        plan.extend(
-            [
-                ["pct", "shutdown", str(ctid), "--timeout", "120"],
-                ["pct", "destroy", str(ctid), "--purge", "1"],
-            ]
-        )
-    if action in {"deploy", "replace"}:
-        plan.extend(
-            [
-                ["install", "-d", "-m", "0750", str(state_root)],
-                [
-                    "pct",
-                    "create",
-                    str(ctid),
-                    template,
-                    "--unprivileged",
-                    "1",
-                    "--memory",
-                    str(memory_mb),
-                    "--cores",
-                    str(cores),
-                    "--swap",
-                    "0",
-                    "--rootfs",
-                    rootfs,
-                    "--net0",
-                    f"name=eth0,bridge={bridge},ip={container_ip}/24,gw={gateway},type=veth",
-                    "--mp0",
-                    f"{state_root},mp=/srv/zerofs-persist",
-                    "--onboot",
-                    "1",
-                    "--startup",
-                    "order=20",
-                ],
-            ]
-        )
-    else:
-        plan.extend(
-            [
-                ["pct", "shutdown", str(ctid), "--timeout", "120"],
-                ["pct", "destroy", str(ctid), "--purge", "1"],
-            ]
-        )
-    return plan
 
 
 class _FlockLease:
@@ -1038,65 +992,48 @@ test "$(systemctl is-active {shlex.quote(args.source_server_unit)} 2>/dev/null |
     _ssh(runner, args.vm_host, script)
 
 
-def _stage_and_run_host(
-    runner: Runner,
-    args: argparse.Namespace,
-    binary: Path,
-    commit: str,
-    binary_hash: str,
-    namespace: str,
-    release: str,
-    *,
-    defer_commit: bool = False,
-    config_path: Path | None = None,
-    maintenance_nfs_only: bool = False,
-) -> None:
-    bundle = Path(__file__).resolve().parent
-    stage = f"/var/tmp/zerofs-lxc-deploy-{args.ctid}-{commit[:12]}"
+@contextlib.contextmanager
+def _staged_host_directory(runner: Runner, args: argparse.Namespace, stage: str):
+    """Create a remote scratch stage directory and guarantee its removal.
+
+    The stage is created up front and always removed on the way out, whether
+    the body inside the ``with`` block succeeds, raises, or is interrupted.
+    """
     _ssh(
         runner,
         args.pve_host,
         f"set -euo pipefail\ninstall -d -m 0700 {shlex.quote(stage)}\n",
     )
-    files: tuple[tuple[Path, str], ...]
-    if args.action == "cleanup":
-        files = ((bundle / "host-deploy.sh", "host-deploy.sh"),)
-    else:
-        files = (
-            (binary, "zerofs"),
-            (config_path or args.config, "zerofs.toml"),
-            (bundle / "host-deploy.sh", "host-deploy.sh"),
-            (bundle / "hooks" / "zerofs-lxc-hook.sh", "zerofs-lxc-hook.sh"),
-            (bundle / "systemd" / "zerofs-lxc.service", "zerofs-lxc.service"),
+    try:
+        yield stage
+    finally:
+        _ssh(
+            runner,
+            args.pve_host,
+            f"set -euo pipefail\nrm -rf -- {shlex.quote(stage)}\n",
         )
-        if args.role == "prod" and args.prod_access in {"smb", "both"}:
-            files += (
-                (
-                    bundle / "systemd" / "zerofs-lxc-mount.service",
-                    "zerofs-lxc-mount.service",
-                ),
-                (bundle / "templates" / "smb.conf", "smb.conf"),
-            )
-        if args.env_file is not None:
-            files += ((args.env_file, "zerofs.env"),)
-        if args.identity_file is not None:
-            files += ((args.identity_file, "storage-key"),)
-        if args.known_hosts is not None:
-            files += ((args.known_hosts, "known_hosts"),)
-        if (
-            args.role == "prod"
-            and args.prod_access in {"smb", "both"}
-            and args.samba_password_file is not None
-        ):
-            files += ((args.samba_password_file, "samba-password"),)
-    for path, destination in files:
-        runner.run(["scp", "-q", str(path), f"{args.pve_host}:{stage}/{destination}"])
+
+
+def _build_host_deploy_argv(
+    *,
+    remote_script: str,
+    action: str,
+    role: str,
+    stage: str,
+    args: argparse.Namespace,
+    commit: str,
+    binary_hash: str,
+    namespace: str,
+    release: str,
+    include_drain_timeout: bool,
+    extra_flags: Sequence[str] = (),
+) -> list[str]:
     host_args = [
         "bash",
-        f"{stage}/host-deploy.sh",
-        args.action,
+        remote_script,
+        action,
         "--role",
-        args.role,
+        role,
         "--ctid",
         str(args.ctid),
         "--container-ip",
@@ -1129,27 +1066,89 @@ def _stage_and_run_host(
         args.samba_user,
         "--prod-access",
         args.prod_access,
-        "--drain-timeout",
-        str(args.drain_timeout),
     ]
-    if args.local_durable_upgrade:
-        host_args.append("--local-durable-upgrade")
-    if args.dry_run:
-        host_args.append("--dry-run")
-    if defer_commit:
-        host_args.append("--defer-commit")
-    if maintenance_nfs_only:
-        host_args.append("--maintenance-nfs-only")
-    if args.action == "replace":
-        host_args.extend(["--confirm-replace", str(args.ctid)])
-    try:
-        runner.run(["ssh", "-o", "BatchMode=yes", args.pve_host, *host_args])
-    finally:
-        _ssh(
-            runner,
-            args.pve_host,
-            f"set -euo pipefail\nrm -rf -- {shlex.quote(stage)}\n",
+    if include_drain_timeout:
+        host_args.extend(["--drain-timeout", str(args.drain_timeout)])
+    host_args.extend(extra_flags)
+    return host_args
+
+
+def _stage_and_run_host(
+    runner: Runner,
+    args: argparse.Namespace,
+    binary: Path,
+    commit: str,
+    binary_hash: str,
+    namespace: str,
+    release: str,
+    *,
+    defer_commit: bool = False,
+    config_path: Path | None = None,
+    maintenance_nfs_only: bool = False,
+) -> None:
+    bundle = Path(__file__).resolve().parent
+    stage = f"/var/tmp/zerofs-lxc-deploy-{args.ctid}-{commit[:12]}"
+    files: tuple[tuple[Path, str], ...]
+    if args.action == "cleanup":
+        files = ((bundle / "host-deploy.sh", "host-deploy.sh"),)
+    else:
+        files = (
+            (binary, "zerofs"),
+            (config_path or args.config, "zerofs.toml"),
+            (bundle / "host-deploy.sh", "host-deploy.sh"),
+            (bundle / "hooks" / "zerofs-lxc-hook.sh", "zerofs-lxc-hook.sh"),
+            (bundle / "systemd" / "zerofs-lxc.service", "zerofs-lxc.service"),
         )
+        if args.role == "prod" and args.prod_access in {"smb", "both"}:
+            files += (
+                (
+                    bundle / "systemd" / "zerofs-lxc-mount.service",
+                    "zerofs-lxc-mount.service",
+                ),
+                (bundle / "templates" / "smb.conf", "smb.conf"),
+            )
+        if args.env_file is not None:
+            files += ((args.env_file, "zerofs.env"),)
+        if args.identity_file is not None:
+            files += ((args.identity_file, "storage-key"),)
+        if args.known_hosts is not None:
+            files += ((args.known_hosts, "known_hosts"),)
+        if (
+            args.role == "prod"
+            and args.prod_access in {"smb", "both"}
+            and args.samba_password_file is not None
+        ):
+            files += ((args.samba_password_file, "samba-password"),)
+    extra_flags: list[str] = []
+    if args.local_durable_upgrade:
+        extra_flags.append("--local-durable-upgrade")
+    if args.dry_run:
+        extra_flags.append("--dry-run")
+    if defer_commit:
+        extra_flags.append("--defer-commit")
+    if maintenance_nfs_only:
+        extra_flags.append("--maintenance-nfs-only")
+    if args.action == "replace":
+        extra_flags.extend(["--confirm-replace", str(args.ctid)])
+    with _staged_host_directory(runner, args, stage):
+        for path, destination in files:
+            runner.run(
+                ["scp", "-q", str(path), f"{args.pve_host}:{stage}/{destination}"]
+            )
+        host_args = _build_host_deploy_argv(
+            remote_script=f"{stage}/host-deploy.sh",
+            action=args.action,
+            role=args.role,
+            stage=stage,
+            args=args,
+            commit=commit,
+            binary_hash=binary_hash,
+            namespace=namespace,
+            release=release,
+            include_drain_timeout=True,
+            extra_flags=extra_flags,
+        )
+        runner.run(["ssh", "-o", "BatchMode=yes", args.pve_host, *host_args])
 
 
 def _run_host_deployment_control(
@@ -1166,12 +1165,7 @@ def _run_host_deployment_control(
     bundle = Path(__file__).resolve().parent
     stage = f"/var/tmp/zerofs-lxc-control-{args.ctid}-{release}"
     remote_script = f"{stage}/host-deploy.sh"
-    _ssh(
-        runner,
-        args.pve_host,
-        f"set -euo pipefail\ninstall -d -m 0700 {shlex.quote(stage)}\n",
-    )
-    try:
+    with _staged_host_directory(runner, args, stage):
         runner.run(
             [
                 "scp",
@@ -1189,54 +1183,21 @@ def _run_host_deployment_control(
                     f"{args.pve_host}:{stage}/zerofs.toml",
                 ]
             )
-        host_args = [
-            "bash",
-            remote_script,
-            action,
-            "--role",
-            "prod",
-            "--ctid",
-            str(args.ctid),
-            "--container-ip",
-            args.container_ip,
-            "--bridge",
-            args.bridge,
-            "--gateway",
-            args.gateway,
-            "--template",
-            args.template,
-            "--rootfs",
-            args.rootfs,
-            "--memory-mb",
-            str(args.memory_mb),
-            "--cores",
-            str(args.cores),
-            "--state-root",
-            args.state_root,
-            "--stage",
-            stage,
-            "--commit",
-            commit,
-            "--sha256",
-            binary_hash,
-            "--namespace-id",
-            namespace,
-            "--release-id",
-            release,
-            "--samba-user",
-            args.samba_user,
-            "--prod-access",
-            args.prod_access,
-        ]
-        if args.dry_run:
-            host_args.append("--dry-run")
-        runner.run(["ssh", "-o", "BatchMode=yes", args.pve_host, *host_args])
-    finally:
-        _ssh(
-            runner,
-            args.pve_host,
-            f"set -euo pipefail\nrm -rf -- {shlex.quote(stage)}\n",
+        extra_flags = ["--dry-run"] if args.dry_run else []
+        host_args = _build_host_deploy_argv(
+            remote_script=remote_script,
+            action=action,
+            role="prod",
+            stage=stage,
+            args=args,
+            commit=commit,
+            binary_hash=binary_hash,
+            namespace=namespace,
+            release=release,
+            include_drain_timeout=False,
+            extra_flags=extra_flags,
         )
+        runner.run(["ssh", "-o", "BatchMode=yes", args.pve_host, *host_args])
 
 
 def _run_ownership_migration(runner: Runner, args: argparse.Namespace) -> None:

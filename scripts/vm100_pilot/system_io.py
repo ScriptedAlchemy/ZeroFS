@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import stat
 import tempfile
@@ -9,6 +10,37 @@ from pathlib import Path
 
 from .config import PilotConfig
 from .runner import Runner
+
+
+MIB = 1_048_576
+
+# Canonical MiB/s precision for every reported benchmark rate. Entry points must
+# not each pick their own, or the same transfer reads as two different numbers
+# depending on which command produced the receipt.
+RATE_DIGITS = 3
+
+
+def counter_delta(after: int, before: int, label: str) -> int:
+    """Compute a monotonic counter delta, raising if it regressed.
+
+    A regression means the counter's source restarted or was re-enumerated
+    mid-measurement. Clamping it (``max(0, after - before)``) would silently
+    turn that lost interval into a plausible-looking small or zero delta, so
+    every counter-backed benchmark quantity fails closed instead.
+    """
+    if after < before:
+        raise RuntimeError(f"{label} counter regressed: before={before}, after={after}")
+    return after - before
+
+
+def mib_per_second(
+    byte_count: int, elapsed_seconds: float, *, digits: int = RATE_DIGITS
+) -> float:
+    """Shared MiB/s kernel: callers own their own zero-guard and time units.
+
+    Precision is deliberately *not* a caller choice -- see ``RATE_DIGITS``.
+    """
+    return round(byte_count / MIB / elapsed_seconds, digits)
 
 
 def file_sha256(path: Path) -> str:
@@ -95,12 +127,21 @@ def verify_page_cache_hit(
 ) -> PageCacheEvidence:
     if before.device != after.device:
         raise ValueError("block device changed during page-cache measurement")
-    read_bytes = max(0, after.read_bytes - before.read_bytes)
+    # A regressed diskstats counter (device re-enumerated, driver reloaded)
+    # must not be clamped to zero: `proven` is derived from a zero read delta,
+    # so clamping would turn lost evidence into a fabricated page-cache proof.
+    read_bytes = counter_delta(
+        after.read_bytes, before.read_bytes, f"{before.device} read bytes"
+    )
     evidence = PageCacheEvidence(
         device=before.device,
         read_bytes=read_bytes,
-        write_bytes=max(0, after.write_bytes - before.write_bytes),
-        busy_ms=max(0, after.busy_ms - before.busy_ms),
+        write_bytes=counter_delta(
+            after.write_bytes, before.write_bytes, f"{before.device} write bytes"
+        ),
+        busy_ms=counter_delta(
+            after.busy_ms, before.busy_ms, f"{before.device} busy ms"
+        ),
         proven=read_bytes == 0,
     )
     if not evidence.proven:
@@ -222,6 +263,71 @@ def install_config_text(
         )
     finally:
         temporary.unlink(missing_ok=True)
+
+
+@dataclass(frozen=True, slots=True)
+class FioJobAggregate:
+    byte_count: int
+    runtime_ms: int
+    requests: int
+    errors: int
+
+
+def load_fio_jobs(path: Path) -> list[dict]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    jobs = payload.get("jobs")
+    if not isinstance(jobs, list) or not jobs:
+        raise ValueError(f"fio output has no jobs: {path}")
+    return jobs
+
+
+def aggregate_fio_jobs(
+    jobs: list[dict],
+    *,
+    operation: str,
+    path: Path,
+    require_request_counters: bool,
+) -> FioJobAggregate:
+    """Sum io_bytes/total_ios/error and max runtime across fio jobs.
+
+    ``runtime`` is aggregated with ``max`` rather than ``sum`` because fio runs
+    every job of an invocation concurrently unless ``stonewall`` is set, and no
+    caller here sets it. ``total_bytes / max(runtime)`` is therefore the rate of
+    the concurrent phase. (With ``--group_reporting`` fio already collapses the
+    array to one grouped entry, so this is usually a one-element reduction.)
+
+    The per-job ``error`` counter is always required and aggregated: a job that
+    reported I/O errors cannot back a valid measurement regardless of which
+    entry point is reading the file. ``require_request_counters`` gates only the
+    optional ``total_ios`` request counter, which just the request-rate callers
+    need.
+
+    Callers keep their own validation of the aggregate (short-I/O checks, error
+    rejection, measurable-runtime checks); this only does the shared per-job
+    aggregation.
+    """
+    byte_count = 0
+    runtime_ms = 0
+    requests = 0
+    errors = 0
+    for job in jobs:
+        stats = job.get(operation)
+        if not isinstance(stats, dict):
+            raise ValueError(f"fio output has no {operation} stats: {path}")
+        if "error" not in job:
+            raise ValueError(f"fio job has no error counter: {path}")
+        errors += int(job["error"])
+        if require_request_counters:
+            if "total_ios" not in stats:
+                raise ValueError(
+                    f"fio {operation} stats have no total_ios counter: {path}"
+                )
+            requests += int(stats["total_ios"])
+        byte_count += int(stats.get("io_bytes", 0))
+        runtime_ms = max(runtime_ms, int(stats.get("runtime", 0)))
+    return FioJobAggregate(
+        byte_count=byte_count, runtime_ms=runtime_ms, requests=requests, errors=errors
+    )
 
 
 def prepare_run_root(

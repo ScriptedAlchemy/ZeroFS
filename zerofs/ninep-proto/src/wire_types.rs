@@ -98,10 +98,6 @@ impl<T: AsRef<[u8]> + ?Sized> ByteStorage for T {}
 pub struct WireBytes<B: ByteStorage>(pub B);
 
 impl<B: ByteStorage> WireBytes<B> {
-    pub fn new(bytes: B) -> Self {
-        Self(bytes)
-    }
-
     pub fn len(&self) -> usize {
         self.0.as_ref().len()
     }

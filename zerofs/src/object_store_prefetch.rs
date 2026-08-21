@@ -1193,21 +1193,21 @@ impl PrefetchingObjectStore {
         let limit = start_part + max_parts.max(1);
         let mut map = ctx.fetches.lock().unwrap();
 
-        let covered = |map: &HashMap<PartKey, SharedFetch>, part: PartId| {
-            let key = PartKey::new(location, ctx.part_size_bytes, generation, part);
-            map.contains_key(&key) || ctx.parts.contains(&key)
-        };
+        // Location, part size, and generation are invariant across the window,
+        // so probe with a single key and advance only its part id instead of
+        // re-allocating the location and generation strings for every part.
+        let mut probe = PartKey::new(location, ctx.part_size_bytes, generation, start_part);
 
         let mut start = start_part;
         if let Some(needed_end) = front_trim {
             let mut in_flight = None;
             while start < limit {
-                let key = PartKey::new(location, ctx.part_size_bytes, generation, start);
-                if let Some(fut) = map.get(&key) {
+                probe.part_id = start;
+                if let Some(fut) = map.get(&probe) {
                     if in_flight.is_none() {
                         in_flight = Some(fut.clone());
                     }
-                } else if !ctx.parts.contains(&key) {
+                } else if !ctx.parts.contains(&probe) {
                     break;
                 }
                 start += 1;
@@ -1219,21 +1219,25 @@ impl PrefetchingObjectStore {
                 };
             }
         } else {
-            let key = PartKey::new(location, ctx.part_size_bytes, generation, start);
-            if let Some(fut) = map.get(&key) {
+            probe.part_id = start;
+            if let Some(fut) = map.get(&probe) {
                 return WindowPlan::Join(fut.clone());
             }
             // The caller's initial HybridCache lookup may have begun as a
             // disk miss while a window fetch inserted this part and dropped
             // its registry guard. Recheck under the planner lock so demand
             // does not lead a redundant one-part GET.
-            if ctx.parts.contains(&key) {
+            if ctx.parts.contains(&probe) {
                 return WindowPlan::Covered;
             }
         }
 
         let mut end = start + 1;
-        while end < limit && !covered(&map, end) {
+        while end < limit {
+            probe.part_id = end;
+            if map.contains_key(&probe) || ctx.parts.contains(&probe) {
+                break;
+            }
             end += 1;
         }
 
@@ -1242,7 +1246,8 @@ impl PrefetchingObjectStore {
             .shared();
         let mut keys = Vec::with_capacity(end - start);
         for part in start..end {
-            let key = PartKey::new(location, ctx.part_size_bytes, generation, part);
+            probe.part_id = part;
+            let key = probe.clone();
             map.insert(key.clone(), fut.clone());
             keys.push(key);
         }

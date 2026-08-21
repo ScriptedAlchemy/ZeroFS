@@ -273,15 +273,11 @@ impl Reservation {
     /// The reserved bytes are zeroed and each frame's length prefix written
     /// immediately, so the buffer stays a structurally walkable frame stream at
     /// every instant; only the AEAD bodies are outstanding.
+    ///
+    /// `limits` is always [`SegmentFormatLimits::WIRE`] in production; the
+    /// value is injectable so a boundary test can make the wire-format checks
+    /// below fail without building a batch of billions of bytes.
     fn claim(
-        open: &mut OpenSegment,
-        inode: InodeId,
-        frames: &[(u64, usize)],
-    ) -> Result<Self, crate::segment::SegmentError> {
-        Self::claim_with_limits(open, inode, frames, SegmentFormatLimits::WIRE)
-    }
-
-    fn claim_with_limits(
         open: &mut OpenSegment,
         inode: InodeId,
         frames: &[(u64, usize)],
@@ -855,10 +851,13 @@ impl ExtentStore {
                 .collect();
             let (reservation, buffered) = {
                 let mut open = lane.open.lock().unwrap();
-                let reservation = Reservation::claim(&mut open, id, &claim).map_err(|e| {
-                    error!("segment reservation rejected for inode {id}: {e}");
-                    FsError::IoError
-                })?;
+                let reservation =
+                    Reservation::claim(&mut open, id, &claim, SegmentFormatLimits::WIRE).map_err(
+                        |e| {
+                            error!("segment reservation rejected for inode {id}: {e}");
+                            FsError::IoError
+                        },
+                    )?;
                 (reservation, open.buf.len())
             };
             // Whoever's claim first carries the buffer past the threshold owns
@@ -1011,15 +1010,16 @@ impl ExtentStore {
     /// the buffer is a complete frame stream rather than one with holes, and
     /// (because it is built from the lane's append guard) that no further
     /// reservation can be placed against the generation being sealed.
+    ///
+    /// `limits` is always [`SegmentFormatLimits::WIRE`] in production; the
+    /// value is injectable so a boundary test can make the directory-count
+    /// check fail here without building a directory with billions of
+    /// entries. Rotation always seals via [`crate::segment::seal_directory`]
+    /// (which itself checks at `WIRE`), so the count is checked again here
+    /// under the caller's `limits` first, before any mutation, to reject an
+    /// oversized directory at the same early point a non-`WIRE` `seal_directory`
+    /// would have.
     fn rotate_sealing_generation(
-        &self,
-        freeze: &LaneFreeze<'_>,
-        residency: tokio::sync::OwnedSemaphorePermit,
-    ) -> Result<Option<(Segid, Bytes)>, FsError> {
-        self.rotate_sealing_generation_with_limits(freeze, residency, SegmentFormatLimits::WIRE)
-    }
-
-    fn rotate_sealing_generation_with_limits(
         &self,
         freeze: &LaneFreeze<'_>,
         residency: tokio::sync::OwnedSemaphorePermit,
@@ -1030,9 +1030,10 @@ impl ExtentStore {
             return Ok(None);
         }
         let segid = open.segid;
-        let sealed_dir =
-            crate::segment::seal_directory_with_limits(&self.codec, segid, &open.dir, limits)
-                .map_err(|_| FsError::IoError)?;
+        crate::segment::checked_segment_frame_count(open.dir.len(), limits)
+            .map_err(|_| FsError::IoError)?;
+        let sealed_dir = crate::segment::seal_directory(&self.codec, segid, &open.dir)
+            .map_err(|_| FsError::IoError)?;
         let frame_count = open.dir.len();
         let prepared = crate::segment::prepare_segment_assembly(
             &mut open.buf,
@@ -1137,7 +1138,8 @@ impl ExtentStore {
                         .expect("append gates are held until every lane has rotated")[index],
                 )
                 .await;
-                match self.rotate_sealing_generation(&freeze, residency) {
+                match self.rotate_sealing_generation(&freeze, residency, SegmentFormatLimits::WIRE)
+                {
                     Ok(Some((segid, bytes))) => {
                         let segments = Arc::clone(&self.segments);
                         uploads
@@ -1206,14 +1208,15 @@ impl ExtentStore {
             Err(_) => return,
         };
         let freeze = LaneFreeze::acquire(appended).await;
-        let (segid, _) = match self.rotate_sealing_generation(&freeze, residency) {
-            Ok(Some(generation)) => generation,
-            Ok(None) => return,
-            Err(e) => {
-                error!("failed to seal open segment directory: {}", e);
-                return;
-            }
-        };
+        let (segid, _) =
+            match self.rotate_sealing_generation(&freeze, residency, SegmentFormatLimits::WIRE) {
+                Ok(Some(generation)) => generation,
+                Ok(None) => return,
+                Err(e) => {
+                    error!("failed to seal open segment directory: {}", e);
+                    return;
+                }
+            };
         drop(freeze);
         let segments = self.segments.clone();
         let sealing = self.sealing.clone();
@@ -1519,7 +1522,7 @@ mod tests {
         let before_buf = open.buf.clone();
         let before_dir = open.dir.clone();
 
-        let err = Reservation::claim_with_limits(
+        let err = Reservation::claim(
             &mut open,
             1,
             &[(1, 57)],
@@ -1550,7 +1553,7 @@ mod tests {
         let before_buf = open.buf.clone();
         let before_dir = open.dir.clone();
 
-        let err = Reservation::claim_with_limits(
+        let err = Reservation::claim(
             &mut open,
             1,
             &[(1, 46)],
@@ -1591,7 +1594,7 @@ mod tests {
             .unwrap();
 
         let err = store
-            .rotate_sealing_generation_with_limits(
+            .rotate_sealing_generation(
                 &freeze,
                 residency,
                 crate::segment::SegmentFormatLimits::with_u32_max(0),
@@ -1641,7 +1644,7 @@ mod tests {
             .unwrap();
 
         let err = store
-            .rotate_sealing_generation(&freeze, residency)
+            .rotate_sealing_generation(&freeze, residency, SegmentFormatLimits::WIRE)
             .unwrap_err();
 
         assert!(matches!(err, FsError::IoError));

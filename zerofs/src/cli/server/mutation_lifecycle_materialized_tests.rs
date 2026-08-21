@@ -61,7 +61,7 @@ async fn production_close_drains_cancelled_materialized_commit_before_database_c
     let verified_before_close = Arc::new(AtomicBool::new(false));
     let mut owners = LifecycleOwners::for_process(
         tokio_util::sync::CancellationToken::new(),
-        DispatchedCalls::new(),
+        crate::ninep::server::P9AcceptedWorkTracker::new(),
         Arc::clone(&fs),
         None,
         None,

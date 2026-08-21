@@ -1696,7 +1696,7 @@ pub async fn run_server(
             info!("Performing final flush and closing database...");
             let lifecycle = MutationLifecycle::new(LifecycleOwners::for_process(
                 shutdown.clone(),
-                mutation_lifecycle::DispatchedCalls::new(),
+                p9_accepted_work.clone(),
                 Arc::clone(&fs),
                 writeback_for_lifecycle.clone(),
                 sftp_pool_for_close.clone(),

@@ -30,6 +30,7 @@ type WaitStep = Arc<
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ShutdownPhase {
     StopListeners,
+    /// Already-dispatched protocol calls settle before the mutation cutoff.
     DrainDispatched,
     CloseAdmission,
     Materialize,
@@ -91,75 +92,6 @@ impl Drop for BarrierGuard {
         if let Some(release) = self.release.take() {
             release();
         }
-    }
-}
-
-/// In-flight protocol calls that must drain before the mutation cutoff.
-#[derive(Debug, Default)]
-pub(crate) struct DispatchedCalls {
-    inner: Mutex<DispatchedState>,
-    notify: Notify,
-}
-
-#[derive(Debug, Default)]
-struct DispatchedState {
-    inflight: u64,
-    closed: bool,
-}
-
-impl DispatchedCalls {
-    pub(crate) fn new() -> Arc<Self> {
-        Arc::new(Self::default())
-    }
-
-    // Landed-but-not-wired admission API; production call sites arrive with
-    // the mutation lifecycle wiring.
-    #[allow(dead_code)]
-    pub(crate) fn begin(&self) -> Result<DispatchedGuard<'_>, ShutdownError> {
-        let mut state = self.inner.lock().expect("dispatched calls");
-        if state.closed {
-            return Err(ShutdownError::failed(
-                ShutdownPhase::DrainDispatched,
-                "lifecycle already closed admission",
-            ));
-        }
-        state.inflight += 1;
-        Ok(DispatchedGuard { calls: self })
-    }
-
-    #[allow(dead_code)]
-    fn finish(&self) {
-        {
-            let mut state = self.inner.lock().expect("dispatched calls");
-            state.inflight = state.inflight.saturating_sub(1);
-        }
-        self.notify.notify_waiters();
-    }
-
-    pub(crate) async fn drain(&self) -> Result<(), ShutdownError> {
-        {
-            self.inner.lock().expect("dispatched calls").closed = true;
-        }
-        loop {
-            {
-                let state = self.inner.lock().expect("dispatched calls");
-                if state.inflight == 0 {
-                    return Ok(());
-                }
-            }
-            self.notify.notified().await;
-        }
-    }
-}
-
-#[allow(dead_code)]
-pub(crate) struct DispatchedGuard<'a> {
-    calls: &'a DispatchedCalls,
-}
-
-impl Drop for DispatchedGuard<'_> {
-    fn drop(&mut self) {
-        self.calls.finish();
     }
 }
 
@@ -317,7 +249,7 @@ fn annotate(error: ShutdownError, phase: ShutdownPhase) -> ShutdownError {
 impl LifecycleOwners {
     pub(crate) fn for_process(
         shutdown: tokio_util::sync::CancellationToken,
-        dispatched: Arc<DispatchedCalls>,
+        dispatched: crate::ninep::server::P9AcceptedWorkTracker,
         fs: Arc<crate::fs::ZeroFS>,
         writeback: Option<crate::writeback::store::WritebackObjectStore>,
         sftp: Option<crate::sftp_transport::SftpSessionPool>,
@@ -350,11 +282,23 @@ impl LifecycleOwners {
                     })
                 })
             },
+            // The only process-level owner of already-dispatched protocol work
+            // is the 9P accepted-work tracker: every dispatched 9P request holds
+            // one of its tokens for the life of the call. Closing it here and
+            // waiting is idempotent, so the serving loop's earlier
+            // stop-accepting/wait pair stays valid and this phase remains a real
+            // barrier for any other caller of `close`. NBD and NFS dispatched
+            // work is owned by the NBD runtime registry and the listener join,
+            // both of which complete before this owner runs.
             drain_dispatched: {
-                let dispatched = Arc::clone(&dispatched);
+                let dispatched = dispatched.clone();
                 Arc::new(move || {
-                    let dispatched = Arc::clone(&dispatched);
-                    Box::pin(async move { dispatched.drain().await })
+                    let dispatched = dispatched.clone();
+                    Box::pin(async move {
+                        dispatched.stop_accepting();
+                        dispatched.wait().await;
+                        Ok(())
+                    })
                 })
             },
             close_admission: {
@@ -692,27 +636,11 @@ mod tests {
 
     #[tokio::test]
     async fn close_drains_dispatched_calls_before_cutoff() {
-        let calls = DispatchedCalls::new();
         let entered = Arc::new(Notify::new());
-        let _release = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
         let order = Arc::new(Mutex::new(Vec::new()));
-        let guard = calls.begin().expect("begin dispatched");
         let mut owners = owners_with(&order);
-        owners.drain_dispatched = {
-            let calls = Arc::clone(&calls);
-            let order = Arc::clone(&order);
-            let entered = Arc::clone(&entered);
-            Arc::new(move || {
-                let calls = Arc::clone(&calls);
-                let order = Arc::clone(&order);
-                let entered = Arc::clone(&entered);
-                Box::pin(async move {
-                    order.lock().expect("order").push("drain");
-                    entered.notify_one();
-                    calls.drain().await
-                })
-            })
-        };
+        owners.drain_dispatched = blocked_step(&order, "drain", &entered, &release);
         let lifecycle = MutationLifecycle::new(owners);
         let mut closing = tokio::spawn({
             let lifecycle = Arc::clone(&lifecycle);
@@ -732,11 +660,47 @@ mod tests {
                 .is_err(),
             "cutoff must wait for dispatched drain"
         );
-        drop(guard);
+        assert!(
+            order
+                .lock()
+                .expect("order")
+                .iter()
+                .all(|step| *step != "cutoff"),
+            "the cutoff must not be captured while dispatched work is settling"
+        );
+        release.notify_one();
         let receipt = closing.await.expect("join").expect("close");
         let order = order.lock().expect("order");
         assert!(pos(&order, "drain") < pos(&order, "cutoff"), "{order:?}");
         assert_eq!(receipt.target, DurabilityTarget::RemoteBackend);
+    }
+
+    /// The production drain owner is the process 9P accepted-work tracker: the
+    /// phase must close it and wait for its tokens, not merely latch a local flag.
+    #[tokio::test]
+    async fn process_drain_step_closes_and_waits_accepted_work() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let dispatched = crate::ninep::server::P9AcceptedWorkTracker::new();
+        let owners = LifecycleOwners::for_process(
+            tokio_util::sync::CancellationToken::new(),
+            dispatched.clone(),
+            fs,
+            None,
+            None,
+            false,
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), dispatched.wait())
+                .await
+                .is_err(),
+            "an open accepted-work tracker must not report drained"
+        );
+        (owners.drain_dispatched)()
+            .await
+            .expect("drain dispatched work");
+        tokio::time::timeout(Duration::from_millis(100), dispatched.wait())
+            .await
+            .expect("the drain phase must close the accepted-work tracker");
     }
 
     #[tokio::test]

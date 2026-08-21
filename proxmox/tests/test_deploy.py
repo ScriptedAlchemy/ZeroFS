@@ -765,30 +765,6 @@ WantedBy=remote-fs.target
             with self.subTest(path=unsafe), self.assertRaises(ValueError):
                 deploy.validate_state_root(unsafe, 120, "dev")
 
-    def test_dry_run_plan_uses_private_bridge_and_never_formats_storage(self) -> None:
-        plan = deploy.build_host_plan(
-            action="replace",
-            ctid=120,
-            container_ip="10.10.10.20",
-            bridge="vmbr1",
-            template="local:vztmpl/debian-13-standard.tar.zst",
-            state_root=Path("/var/lib/zerofs-lxc/dev-120"),
-            memory_mb=65536,
-            rootfs="local-lvm:8",
-        )
-        rendered = "\n".join(deploy.shell_join(command) for command in plan)
-        self.assertIn("bridge=vmbr1", rendered)
-        self.assertIn("ip=10.10.10.20/24", rendered)
-        self.assertIn("gw=10.10.10.1", rendered)
-        self.assertIn("mp=/srv/zerofs-persist", rendered)
-        self.assertIn("--cores 8", rendered)
-        self.assertIn("--memory 65536", rendered)
-        self.assertIn("--swap 0", rendered)
-        self.assertIn("--onboot 1", rendered)
-        self.assertIn("--startup order=20", rendered)
-        self.assertNotIn("mkfs", rendered)
-        self.assertNotIn("0.0.0.0", rendered)
-
 
 class VmNfsCoordinatorTests(unittest.TestCase):
     class RecordingRunner:

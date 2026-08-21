@@ -99,10 +99,6 @@ pub struct RemoteBarrier {
 }
 
 impl RemoteBarrier {
-    pub fn incarnation(&self) -> uuid::Uuid {
-        self.incarnation
-    }
-
     pub async fn wait_remote(&self, sequence: Sequence) -> Result<(), RemoteBarrierError> {
         self.progress.wait(self.incarnation, sequence).await
     }
@@ -536,6 +532,7 @@ async fn run_remote_scheduler(worker: RemoteWorker) {
         }
         let mut window = match coalesce_local_batch(
             &journal,
+            &local,
             next,
             upload_concurrency,
             &completed,
@@ -581,6 +578,7 @@ async fn run_remote_scheduler(worker: RemoteWorker) {
                     &active_sequences,
                 );
                 for record in batch {
+                    let record = record.clone();
                     active_sequences.insert(record.sequence);
                     let remote = remote.clone();
                     let journal = journal.clone();
@@ -965,6 +963,7 @@ where
 
 async fn coalesce_local_batch(
     journal: &Journal,
+    local: &LocalBarrier,
     next: Sequence,
     upload_concurrency: usize,
     completed: &BTreeMap<Sequence, CompletedRemote>,
@@ -977,6 +976,10 @@ async fn coalesce_local_batch(
     }
     let mut observed_local = window.local_seq;
     let mut idle_deadline = tokio::time::Instant::now() + REMOTE_COALESCE_IDLE;
+    // The window can only change when the local watermark advances, so wait on
+    // the barrier that publishes it instead of re-decoding the journal window
+    // on a timer.
+    let mut local_progress_open = true;
     loop {
         if !completed.is_empty()
             || collect_pipeline_batch(
@@ -992,8 +995,24 @@ async fn coalesce_local_batch(
         {
             return Ok(Some(window));
         }
+        let local_progress = async {
+            if local_progress_open {
+                local.wait_local(observed_local + 1).await
+            } else {
+                std::future::pending().await
+            }
+        };
         tokio::select! {
-            _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+            result = local_progress => {
+                if result.is_err() {
+                    // The local journal is closed or terminally failed: no
+                    // further watermark movement is possible, so hold the
+                    // window open until the idle deadline expires.
+                    local_progress_open = false;
+                    continue;
+                }
+            }
+            _ = tokio::time::sleep_until(idle_deadline) => {}
             changed = stop.changed() => {
                 if changed.is_err() || *stop.borrow() {
                     return Ok(None);
@@ -1077,13 +1096,13 @@ fn validate_scheduler_window(
     Ok(())
 }
 
-fn collect_pipeline_batch(
-    records: &[MutationRecord],
+fn collect_pipeline_batch<'records>(
+    records: &'records [MutationRecord],
     first_sequence: Sequence,
     limit: usize,
     completed: &BTreeMap<Sequence, CompletedRemote>,
     active: &BTreeSet<Sequence>,
-) -> Vec<MutationRecord> {
+) -> Vec<&'records MutationRecord> {
     // Match the scan window: a tighter cap used to throttle every lane down
     // to the single frontier slot while a fence retried, leaving the rest of
     // the connection pool idle exactly when the backlog was deepest.
@@ -1128,7 +1147,7 @@ fn collect_pipeline_batch(
             && !conflicts_with_earlier
             && (is_frontier || may_preupload)
         {
-            batch.push(record.clone());
+            batch.push(record);
         }
         earlier_keys.extend(keys);
         let Some(incremented) = expected.checked_add(1) else {
@@ -1183,10 +1202,10 @@ fn start_ready_commit(
     )
 }
 
-fn touched_keys(record: &MutationRecord) -> Vec<String> {
-    let mut keys = vec![record.path.clone()];
+fn touched_keys(record: &MutationRecord) -> Vec<&str> {
+    let mut keys = vec![record.path.as_str()];
     if let MutationKind::Rename { source, .. } = &record.kind {
-        keys.push(source.clone());
+        keys.push(source.as_str());
     }
     keys
 }

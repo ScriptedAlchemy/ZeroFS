@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use backon::{ExponentialBuilder, Retryable};
+use backon::Retryable;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use dashmap::DashSet;
@@ -239,9 +239,22 @@ type TargetLock = AsyncMutex<()>;
 static TARGET_LOCKS: LazyLock<StdMutex<HashMap<PathBuf, Weak<TargetLock>>>> =
     LazyLock::new(|| StdMutex::new(HashMap::new()));
 
+// `retain` walks the whole map, which is wasteful when this is called on
+// every SFTP PUT and multipart complete but the map rarely accumulates dead
+// entries between calls. Only prune once the map has grown past a
+// high-water mark, then reset the mark to twice the post-prune size (with a
+// floor so small maps do not thrash on every insert).
+const TARGET_LOCKS_PRUNE_FLOOR: usize = 32;
+static TARGET_LOCKS_PRUNE_AT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(TARGET_LOCKS_PRUNE_FLOOR);
+
 fn target_lock(target: &FilePath) -> Arc<TargetLock> {
     let mut locks = TARGET_LOCKS.lock().unwrap();
-    locks.retain(|_, lock| lock.strong_count() > 0);
+    if locks.len() >= TARGET_LOCKS_PRUNE_AT.load(std::sync::atomic::Ordering::Relaxed) {
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        let next_prune_at = (locks.len() * 2).max(TARGET_LOCKS_PRUNE_FLOOR);
+        TARGET_LOCKS_PRUNE_AT.store(next_prune_at, std::sync::atomic::Ordering::Relaxed);
+    }
     if let Some(lock) = locks.get(target).and_then(Weak::upgrade) {
         return lock;
     }
@@ -383,12 +396,7 @@ async fn reconcile_publication(
         let bytes = session.read_exact(target, 0, OBJECT_HEADER_LEN).await?;
         decode_header(&bytes).map_err(RemoteError::CorruptObject)
     })
-    .retry(
-        ExponentialBuilder::default()
-            .without_max_times()
-            .with_min_delay(std::time::Duration::from_millis(100))
-            .with_max_delay(std::time::Duration::from_secs(1)),
-    )
+    .retry(crate::retrying_object_store::default_retry_builder())
     .when(RemoteError::is_retryable)
     .await;
 
@@ -432,12 +440,7 @@ async fn reconcile_create_publication(
         }
         Ok(true)
     })
-    .retry(
-        ExponentialBuilder::default()
-            .without_max_times()
-            .with_min_delay(std::time::Duration::from_millis(100))
-            .with_max_delay(std::time::Duration::from_secs(1)),
-    )
+    .retry(crate::retrying_object_store::default_retry_builder())
     .when(RemoteError::is_retryable)
     .await;
 
@@ -1015,9 +1018,9 @@ impl ObjectStore for SftpObjectStore {
         opts: PutMultipartOptions,
     ) -> object_store::Result<Box<dyn MultipartUpload>> {
         let mode = if opts.extensions.get::<GeneratedSegmentCreate>().is_some() {
-            MultipartPublicationMode::Create
+            PublicationMode::Create
         } else {
-            MultipartPublicationMode::Overwrite
+            PublicationMode::Overwrite
         };
         let target = self.remote_path(location, false)?;
         self.forget_missing(location);
@@ -1033,7 +1036,7 @@ impl ObjectStore for SftpObjectStore {
         )
         .await
         .map_err(|error| publication_error(location, error))?;
-        if mode == MultipartPublicationMode::Create
+        if mode == PublicationMode::Create
             && let Some(context) = opts.extensions.get::<ConditionalMultipartCreate>()
         {
             context.acknowledge();
@@ -1154,23 +1157,8 @@ struct SftpMultipartUpload {
     generation: Uuid,
     state: Arc<StdMutex<SftpMultipartState>>,
     known_missing: Arc<DashSet<String>>,
-    mode: MultipartPublicationMode,
+    mode: PublicationMode,
     terminal: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MultipartPublicationMode {
-    Create,
-    Overwrite,
-}
-
-impl MultipartPublicationMode {
-    fn publication_mode(self) -> PublicationMode {
-        match self {
-            Self::Create => PublicationMode::Create,
-            Self::Overwrite => PublicationMode::Overwrite,
-        }
-    }
 }
 
 #[derive(Debug, Default)]
@@ -1185,14 +1173,11 @@ impl SftpMultipartUpload {
         location: ObjectPath,
         target: PathBuf,
         known_missing: Arc<DashSet<String>>,
-        mode: MultipartPublicationMode,
+        mode: PublicationMode,
     ) -> RemoteResult<Self> {
-        validate_publication_capabilities(session.capabilities(), mode.publication_mode())
-            .map_err(|extension| {
-                RemoteError::NotSupported(format!(
-                    "SFTP server lacks required {extension} extension"
-                ))
-            })?;
+        validate_publication_capabilities(session.capabilities(), mode).map_err(|extension| {
+            RemoteError::NotSupported(format!("SFTP server lacks required {extension} extension"))
+        })?;
         let generation = Uuid::new_v4();
         let staging = staging_path(&target, generation).map_err(RemoteError::InvalidPath)?;
         let placeholder = encode_header(ObjectHeader {
@@ -1309,22 +1294,20 @@ impl MultipartUpload for SftpMultipartUpload {
             .await
             .map_err(|error| publication_error(&self.location, error))?;
         let publication = match self.mode {
-            MultipartPublicationMode::Create => {
-                match self.session.hard_link(&staging, &self.target).await {
-                    Ok(()) => Ok(()),
-                    Err(error) => {
-                        reconcile_create_publication(
-                            &self.session,
-                            &self.target,
-                            &staging,
-                            header,
-                            error,
-                        )
-                        .await
-                    }
+            PublicationMode::Create => match self.session.hard_link(&staging, &self.target).await {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    reconcile_create_publication(
+                        &self.session,
+                        &self.target,
+                        &staging,
+                        header,
+                        error,
+                    )
+                    .await
                 }
-            }
-            MultipartPublicationMode::Overwrite => {
+            },
+            PublicationMode::Overwrite => {
                 match self.session.posix_rename(&staging, &self.target).await {
                     Ok(()) => Ok(()),
                     Err(error) => {
@@ -1332,10 +1315,13 @@ impl MultipartUpload for SftpMultipartUpload {
                     }
                 }
             }
+            PublicationMode::Update => {
+                unreachable!("multipart uploads never construct Update mode")
+            }
         };
         publication.map_err(|error| publication_error(&self.location, error))?;
         self.terminal = true;
-        if self.mode == MultipartPublicationMode::Create
+        if self.mode == PublicationMode::Create
             && let Err(error) = self.session.remove_file(&staging).await
             && !matches!(error, RemoteError::NotFound(_))
         {
@@ -3298,7 +3284,7 @@ mod tests {
             location,
             target.to_path_buf(),
             Arc::new(DashSet::new()),
-            MultipartPublicationMode::Overwrite,
+            PublicationMode::Overwrite,
         )
         .await
         .unwrap();
@@ -3344,7 +3330,7 @@ mod tests {
                     ObjectPath::from("zerofs/v1/cancelled-begin.bin"),
                     PathBuf::from("zerofs/v1/cancelled-begin.bin"),
                     Arc::new(DashSet::new()),
-                    MultipartPublicationMode::Overwrite,
+                    PublicationMode::Overwrite,
                 )
                 .await
             })
@@ -3388,7 +3374,7 @@ mod tests {
             location,
             target.clone(),
             Arc::new(DashSet::new()),
-            MultipartPublicationMode::Create,
+            PublicationMode::Create,
         )
         .await
         .unwrap();
@@ -3415,7 +3401,7 @@ mod tests {
             location,
             target.clone(),
             Arc::new(DashSet::new()),
-            MultipartPublicationMode::Create,
+            PublicationMode::Create,
         )
         .await
         .unwrap();
@@ -3447,7 +3433,7 @@ mod tests {
             location,
             target,
             Arc::new(DashSet::new()),
-            MultipartPublicationMode::Create,
+            PublicationMode::Create,
         )
         .await
         .unwrap();
@@ -3471,7 +3457,7 @@ mod tests {
             location,
             target,
             Arc::new(DashSet::new()),
-            MultipartPublicationMode::Overwrite,
+            PublicationMode::Overwrite,
         )
         .await
         .unwrap();
@@ -3530,7 +3516,7 @@ mod tests {
             location,
             target,
             Arc::new(DashSet::new()),
-            MultipartPublicationMode::Overwrite,
+            PublicationMode::Overwrite,
         )
         .await
         .expect_err("failed initiation must report both write failure and cleanup debt");

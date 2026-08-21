@@ -45,6 +45,15 @@ struct OverlayEntry {
     payload: Option<PayloadLocation>,
 }
 
+/// Projection of [`OverlayEntry`] carrying only the fields
+/// [`OverlayIndex::visible_version`] and [`OverlayIndex::has_visible_local_object`]
+/// need, so those lookups don't pay for cloning the full mutation record and
+/// payload location.
+struct VisibleSnapshot {
+    effect: OverlayEffect,
+    local_etag: LocalEtag,
+}
+
 #[derive(Default)]
 struct OverlayState {
     entries: BTreeMap<Path, VecDeque<OverlayEntry>>,
@@ -200,11 +209,6 @@ impl OverlayIndex {
         self.install(record, OverlayEffect::Delete, None).await
     }
 
-    pub async fn install_copy(&self, record: MutationRecord, payload: Bytes) -> anyhow::Result<()> {
-        self.install_verified_copy(record, VerifiedPayload::new(payload))
-            .await
-    }
-
     pub(crate) async fn install_verified_copy(
         &self,
         record: MutationRecord,
@@ -220,15 +224,6 @@ impl OverlayIndex {
             Some(PayloadLocation::Pending(payload)),
         )
         .await
-    }
-
-    pub async fn install_rename(
-        &self,
-        record: MutationRecord,
-        payload: Bytes,
-    ) -> anyhow::Result<()> {
-        self.install_verified_rename(record, VerifiedPayload::new(payload))
-            .await
     }
 
     pub(crate) async fn install_verified_rename(
@@ -299,16 +294,15 @@ impl OverlayIndex {
             return Ok(());
         }
         let mut state = self.state.write().await;
+        let OverlayState {
+            entries,
+            paths_by_sequence,
+        } = &mut *state;
         for committed in records {
             let sequence = committed.sequence;
             let mut matched = false;
-            let paths = state
-                .paths_by_sequence
-                .get(&sequence)
-                .cloned()
-                .unwrap_or_default();
-            for path in paths {
-                let Some(versions) = state.entries.get_mut(&path) else {
+            for path in paths_by_sequence.get(&sequence).into_iter().flatten() {
+                let Some(versions) = entries.get_mut(path) else {
                     continue;
                 };
                 for entry in versions
@@ -369,10 +363,10 @@ impl OverlayIndex {
         &self,
         location: &Path,
     ) -> object_store::Result<Option<VisibleVersion>> {
-        if let Some(entry) = self.visible_entry(location).await {
-            return Ok(match entry.effect {
+        if let Some(snapshot) = self.visible_snapshot(location).await {
+            return Ok(match snapshot.effect {
                 OverlayEffect::Delete => None,
-                OverlayEffect::Put => Some(VisibleVersion::Local(entry.record.local_etag)),
+                OverlayEffect::Put => Some(VisibleVersion::Local(snapshot.local_etag)),
             });
         }
         match self.remote.head(location).await {
@@ -386,9 +380,9 @@ impl OverlayIndex {
     }
 
     pub(crate) async fn has_visible_local_object(&self, location: &Path) -> bool {
-        self.visible_entry(location)
+        self.visible_snapshot(location)
             .await
-            .is_some_and(|entry| matches!(entry.effect, OverlayEffect::Put))
+            .is_some_and(|snapshot| matches!(snapshot.effect, OverlayEffect::Put))
     }
 
     pub async fn get(&self, location: &Path) -> object_store::Result<GetResult> {
@@ -576,13 +570,42 @@ impl OverlayIndex {
             .cloned()
     }
 
+    /// Cheaper alternative to [`Self::visible_entry`] for callers that only
+    /// need the effect and local ETag: avoids cloning the full
+    /// [`MutationRecord`] (and any pending payload) under the read lock.
+    async fn visible_snapshot(&self, location: &Path) -> Option<VisibleSnapshot> {
+        let state = self.state.read().await;
+        let entry = state.entries.get(location)?.back()?;
+        Some(VisibleSnapshot {
+            effect: entry.effect,
+            local_etag: entry.record.local_etag.clone(),
+        })
+    }
+
     async fn visible_entries(&self, prefix: Option<&Path>) -> Vec<(Path, OverlayEntry)> {
-        self.state
-            .read()
-            .await
+        let state = self.state.read().await;
+        let Some(prefix) = prefix else {
+            return state
+                .entries
+                .iter()
+                .filter_map(|(path, entries)| {
+                    entries.back().cloned().map(|entry| (path.clone(), entry))
+                })
+                .collect();
+        };
+        // `BTreeMap<Path, _>` orders keys by their raw string representation,
+        // which is not the same as hierarchical prefix matching (e.g.
+        // "prefix.x" sorts before "prefix/child" because '.' < '/'). Bound the
+        // scan with a raw-string `take_while` -- entries sharing that raw
+        // prefix are contiguous in sort order, so this cannot skip a later
+        // match -- then apply the segment-aware `prefix_matches` check inside
+        // that bounded span to drop any raw-only matches like "prefix.x".
+        let raw_prefix = prefix.as_ref();
+        state
             .entries
-            .iter()
-            .filter(|(path, _)| prefix.is_none_or(|prefix| path.prefix_matches(prefix)))
+            .range(prefix.clone()..)
+            .take_while(|(path, _)| path.as_ref().starts_with(raw_prefix))
+            .filter(|(path, _)| path.prefix_matches(prefix))
             .filter_map(|(path, entries)| {
                 entries.back().cloned().map(|entry| (path.clone(), entry))
             })

@@ -141,7 +141,12 @@ struct BenchReport {
     manifest_payload_bytes: usize,
     segment_objects: usize,
     manifest_objects: usize,
+    /// Configured writer knob. It is also the remote read fanout.
     writers: usize,
+    /// Writers that were concurrently in flight during the acknowledgement
+    /// phase. A mixed segment/manifest plan is admitted in exact path order,
+    /// so that phase is single-threaded no matter what `writers` says.
+    effective_writers: usize,
     max_connections: usize,
     upload_concurrency: usize,
     local_concurrency: usize,
@@ -175,7 +180,11 @@ struct SaturationReport {
     manifest_payload_bytes: usize,
     segment_objects: usize,
     manifest_objects: usize,
+    /// Configured writer knob. It is also the remote read fanout.
     writers: usize,
+    /// Blocked tail writers held concurrently at the SSD boundary. The prefill
+    /// phase ahead of them is ordered and single-threaded.
+    effective_writers: usize,
     max_connections: usize,
     upload_concurrency: usize,
     local_concurrency: usize,
@@ -344,6 +353,19 @@ fn mib_per_second(total_bytes: u64, elapsed: Duration) -> f64 {
 
 fn seconds(nanos: u64) -> f64 {
     Duration::from_nanos(nanos).as_secs_f64()
+}
+
+/// Number of leading per-session transport slots the run actually touched.
+///
+/// A session that wrote bytes without closing a write handle still belongs in
+/// the report, so the cut is the last slot that is non-zero in *either* series.
+/// Deriving it from publications alone silently dropped that session's bytes.
+fn used_session_count(session_publications: &[u64], session_write_bytes: &[u64]) -> usize {
+    [session_publications, session_write_bytes]
+        .into_iter()
+        .filter_map(|samples| samples.iter().rposition(|value| *value != 0))
+        .max()
+        .map_or(0, |index| index + 1)
 }
 
 fn max_inter_completion_gap(completions: &[Duration]) -> Duration {
@@ -602,8 +624,18 @@ async fn execute_benchmark(
     let classes = Arc::new(classes.to_vec());
     crate::sftp_protocol::reset_bench_timing();
 
+    // A mixed segment/manifest plan is admitted in exact path order so the
+    // journal geometry stays deterministic, which makes the acknowledgement
+    // phase single-threaded regardless of the configured writer count.
+    let ordered_admission = classes.contains(&BenchObjectClass::Manifest);
+    let effective_writers = if ordered_admission {
+        1
+    } else {
+        geometry.writers
+    };
+
     let started = Instant::now();
-    if classes.contains(&BenchObjectClass::Manifest) {
+    if ordered_admission {
         for (path, class) in paths.iter().zip(classes.iter().copied()) {
             store
                 .put_opts(
@@ -656,11 +688,10 @@ async fn execute_benchmark(
     store.wait_remote(target).await?;
     let remote_drain = remote_started.elapsed();
     let sftp_timing = crate::sftp_protocol::bench_timing();
-    let last_used_session = sftp_timing
-        .session_publications
-        .iter()
-        .rposition(|publications| *publications != 0)
-        .map_or(0, |index| index + 1);
+    let last_used_session = used_session_count(
+        &sftp_timing.session_publications,
+        &sftp_timing.session_write_bytes,
+    );
 
     let (remote_read, remote_read_verified_objects) = read_and_verify_remote(
         remote,
@@ -686,6 +717,7 @@ async fn execute_benchmark(
         segment_objects,
         manifest_objects,
         writers: geometry.writers,
+        effective_writers,
         max_connections: geometry.max_connections,
         upload_concurrency: geometry.upload_concurrency,
         local_concurrency: geometry.local_concurrency,
@@ -887,11 +919,10 @@ async fn execute_saturation_benchmark(
         final_status.terminal_error
     );
     let sftp_timing = crate::sftp_protocol::bench_timing();
-    let last_used_session = sftp_timing
-        .session_publications
-        .iter()
-        .rposition(|publications| *publications != 0)
-        .map_or(0, |index| index + 1);
+    let last_used_session = used_session_count(
+        &sftp_timing.session_publications,
+        &sftp_timing.session_write_bytes,
+    );
     let (remote_read, remote_read_verified_objects) = read_and_verify_remote(
         remote,
         objects,
@@ -915,6 +946,7 @@ async fn execute_saturation_benchmark(
         segment_objects,
         manifest_objects,
         writers: geometry.writers,
+        effective_writers: initially_active,
         max_connections: geometry.max_connections,
         upload_concurrency: geometry.upload_concurrency,
         local_concurrency: geometry.local_concurrency,
@@ -1395,7 +1427,8 @@ mod tests {
     use super::{
         BenchObjectClass, BenchObjectSet, GeneratedSegmentCreate, SaturationGeometry,
         benchmark_put_options, build_remote_store, finish_benchmark, generated_segment_options,
-        max_inter_completion_gap, read_and_verify_remote, validate_saturation_sequence,
+        max_inter_completion_gap, read_and_verify_remote, used_session_count,
+        validate_saturation_sequence,
     };
     use crate::config::Settings;
     use bytes::Bytes;
@@ -1405,6 +1438,16 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
     use uuid::Uuid;
+
+    #[test]
+    fn used_session_count_keeps_every_session_that_moved_write_bytes() {
+        assert_eq!(used_session_count(&[0, 0, 0], &[0, 0, 0]), 0);
+        assert_eq!(used_session_count(&[3, 1, 0], &[9, 4, 0]), 2);
+        // A session that streamed bytes without closing a write handle must
+        // still be reported instead of being truncated away.
+        assert_eq!(used_session_count(&[3, 0, 0], &[9, 0, 7]), 3);
+        assert_eq!(used_session_count(&[0, 0, 5], &[8, 0, 0]), 3);
+    }
 
     #[test]
     fn inter_completion_gap_excludes_initial_ack_latency() {

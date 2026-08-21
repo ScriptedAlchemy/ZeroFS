@@ -29,7 +29,7 @@ from .owned_resources import (
 from .receipts import RunReceipt
 from .runner import Runner
 from .scenarios import ProtocolScenario, WorkloadDefinition
-from .system_io import file_sha256
+from .system_io import counter_delta, file_sha256, mib_per_second
 from .writeback_observer import WritebackObserver
 
 
@@ -319,10 +319,23 @@ class ProtocolWorkloadExecutor:
         stable_remote_drain = observer.drain()
         try:
             stable_snapshot = stable_remote_drain["snapshot"]
-            local_bytes = int(stable_snapshot["local_bytes"]) - before.local_bytes
-            remote_bytes = int(stable_snapshot["remote_bytes"]) - before.remote_bytes
+            stable_local_bytes = int(stable_snapshot["local_bytes"])
+            stable_remote_bytes = int(stable_snapshot["remote_bytes"])
         except (KeyError, TypeError, ValueError) as error:
             raise RuntimeError("stable drain receipt lacks byte counters") from error
+        # Guarded, not raw: a ZeroFS restart inside the workload resets these
+        # counters, and a bare subtraction would surface that as a confusing
+        # byte-attribution mismatch instead of naming the regressed counter.
+        local_bytes = counter_delta(
+            stable_local_bytes,
+            before.local_bytes,
+            f"{workload.name} local encoded bytes",
+        )
+        remote_bytes = counter_delta(
+            stable_remote_bytes,
+            before.remote_bytes,
+            f"{workload.name} remote encoded bytes",
+        )
         if local_bytes != workload.bytes or remote_bytes != workload.bytes:
             raise RuntimeError(
                 f"protocol durability byte attribution mismatch for {workload.name}: "
@@ -425,7 +438,11 @@ class ProtocolMatrixRunner:
 
     @staticmethod
     def _rate(byte_count: int, elapsed_ns: int) -> float:
-        return round(byte_count / 1_048_576 / (elapsed_ns / 1_000_000_000), 3)
+        # Nanoseconds, unlike the millisecond call sites, because the protocol
+        # cutoffs this feeds are recorded as `*_ns` and an fsync can be
+        # sub-millisecond. Every caller passes a `max(1, ...)` duration, so no
+        # zero guard is needed here.
+        return mib_per_second(byte_count, elapsed_ns / 1_000_000_000)
 
     @staticmethod
     def _write_ledger(

@@ -409,33 +409,9 @@ impl Inode {
         }
     }
 
-    /// Get the file size (0 for directories/special files).
-    pub fn size(&self) -> u64 {
-        match self {
-            Inode::File(f) => f.size,
-            Inode::Symlink(s) => s.target.len() as u64,
-            _ => 0,
-        }
-    }
-
     /// Check if this is a directory.
     pub fn is_directory(&self) -> bool {
         matches!(self, Inode::Directory(_))
-    }
-
-    /// Check if this is a regular file.
-    pub fn is_file(&self) -> bool {
-        matches!(self, Inode::File(_))
-    }
-
-    /// Check if this is a symlink.
-    pub fn is_symlink(&self) -> bool {
-        matches!(self, Inode::Symlink(_))
-    }
-
-    /// Get uid/gid tuple for ownership checks.
-    pub fn ownership(&self) -> (u32, u32) {
-        (self.uid(), self.gid())
     }
 }
 

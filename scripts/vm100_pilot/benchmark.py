@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import csv
-import json
 import shutil
 import sys
 import tempfile
@@ -26,24 +25,25 @@ from .runner import Runner
 from .system_io import (
     BlockIoSnapshot,
     SystemIoSnapshot,
+    aggregate_fio_jobs,
     block_device,
     filesystem_device,
+    load_fio_jobs,
     prepare_run_root,
     summarize_system_io,
     verify_page_cache_hit,
 )
+from .system_io import counter_delta as _counter_delta
+from .system_io import mib_per_second
 
 
 def _rate(byte_count: int, elapsed_ms: int) -> float:
+    # calculate_tiers defaults every optional NBD O_DIRECT duration to 0, so
+    # this call site -- unlike the ns-based protocol one -- genuinely needs a
+    # zero guard. The precision is the shared RATE_DIGITS, not a local choice.
     if elapsed_ms <= 0:
         return 0.0
-    return round(byte_count / 1_048_576 / (elapsed_ms / 1000), 2)
-
-
-def _counter_delta(after: int, before: int, label: str) -> int:
-    if after < before:
-        raise RuntimeError(f"{label} counter regressed: before={before}, after={after}")
-    return after - before
+    return mib_per_second(byte_count, elapsed_ms / 1000)
 
 
 def _monotonic_ms() -> int:
@@ -74,23 +74,19 @@ class FioResult:
 
     @classmethod
     def from_json(cls, path: Path, *, operation: str) -> "FioResult":
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        jobs = payload.get("jobs")
-        if not isinstance(jobs, list) or not jobs:
-            raise ValueError(f"fio output has no jobs: {path}")
-        byte_count = 0
-        runtime_ms = 0
-        for job in jobs:
-            stats = job.get(operation)
-            if not isinstance(stats, dict):
-                raise ValueError(f"fio output has no {operation} stats: {path}")
-            byte_count += int(stats.get("io_bytes", 0))
-            runtime_ms = max(runtime_ms, int(stats.get("runtime", 0)))
+        jobs = load_fio_jobs(path)
+        aggregate = aggregate_fio_jobs(
+            jobs, operation=operation, path=path, require_request_counters=False
+        )
+        byte_count = aggregate.byte_count
+        runtime_ms = aggregate.runtime_ms
         if byte_count <= 0 or runtime_ms <= 0:
             raise ValueError(
                 f"fio {operation} did no measurable I/O: "
                 f"bytes={byte_count}, runtime_ms={runtime_ms}"
             )
+        if aggregate.errors:
+            raise RuntimeError(f"fio reported I/O errors={aggregate.errors}: {path}")
         return cls(
             bytes=byte_count,
             runtime_ms=runtime_ms,
@@ -1072,7 +1068,16 @@ class BenchmarkRunner:
                         before.remote_bytes,
                         "buffered-write remote encoded bytes",
                     ),
-                    user_buffered_page_cache_write_ms=millis(foreground_end, started),
+                    # fio's own reported runtime, not the wall clock around the
+                    # subprocess: the wall window also contains sudo + fio
+                    # startup and JSON teardown. The three sibling
+                    # throughput-bearing phases below (page-cache hot read,
+                    # direct read, O_DIRECT service ACK) already use fio's
+                    # runtime, so charging orchestration overhead to the write
+                    # alone made write and read rates non-comparable inside a
+                    # single receipt. `started` still anchors the durability
+                    # end-to-end fields and the perf phase window below.
+                    user_buffered_page_cache_write_ms=write_result.runtime_ms,
                     local_end_to_end_ms=millis(local_end, started),
                     remote_end_to_end_ms=millis(remote_end, started),
                     local_active_ms=local_active_ms,

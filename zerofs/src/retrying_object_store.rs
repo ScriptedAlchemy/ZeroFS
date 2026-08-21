@@ -23,6 +23,17 @@ use object_store::{
 
 const RETRY_DELETE_CONCURRENCY: usize = 10;
 
+/// Shared indefinite-retry backoff policy: exponential backoff between 100ms
+/// and 1s, retried forever. Used both by [`RetryingObjectStore`] and by the
+/// SFTP backend's ambiguous-write reconciliation, which needs the same
+/// policy but does not go through this type.
+pub(crate) fn default_retry_builder() -> ExponentialBuilder {
+    ExponentialBuilder::default()
+        .without_max_times()
+        .with_min_delay(Duration::from_millis(100))
+        .with_max_delay(Duration::from_secs(1))
+}
+
 /// Terminal (never-retryable) backend error with no typed
 /// `object_store::Error` equivalent. Backends wrap such conditions in this
 /// marker before boxing them into `Error::Generic`, so retry classification
@@ -60,10 +71,7 @@ impl RetryingObjectStore {
 
     #[inline]
     fn retry_builder() -> ExponentialBuilder {
-        ExponentialBuilder::default()
-            .without_max_times()
-            .with_min_delay(Duration::from_millis(100))
-            .with_max_delay(Duration::from_secs(1))
+        default_retry_builder()
     }
 
     #[inline]

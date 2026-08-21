@@ -36,12 +36,10 @@ impl ZeroFS {
     /// take the normalized durability target once.
     pub(crate) async fn wait_inodes_durability(&self, ids: &[InodeId]) -> Result<(), FsError> {
         if let Some(overlay) = self.volatile_overlay.get() {
-            for id in ids {
-                overlay
-                    .wait_inode(*id)
-                    .await
-                    .map_err(|_| FsError::IoError)?;
-            }
+            overlay
+                .wait_inodes(ids)
+                .await
+                .map_err(|_| FsError::IoError)?;
         }
         self.durable_to_configured_target(self.capture_mutation_cutoff())
             .await

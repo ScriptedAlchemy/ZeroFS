@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import csv
-import json
 import shutil
 import tempfile
 import time
@@ -25,11 +24,16 @@ from .owned_resources import atomic_write_json
 from .receipts import RunReceipt
 from .runner import Runner
 from .system_io import (
+    RATE_DIGITS,
     BlockIoSnapshot,
     SystemIoSnapshot,
     SystemIoSummary,
+    aggregate_fio_jobs,
     block_device,
+    counter_delta,
     filesystem_device,
+    load_fio_jobs,
+    mib_per_second,
     prepare_run_root,
     summarize_system_io,
 )
@@ -75,32 +79,19 @@ class MatrixFioResult:
     bytes: int
     runtime_ms: int
     requests: int
-    errors: int
     requests_per_second: float
     mibps: float
 
     @classmethod
     def from_json(cls, path: Path) -> "MatrixFioResult":
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        jobs = payload.get("jobs")
-        if not isinstance(jobs, list) or not jobs:
-            raise ValueError(f"fio output has no jobs: {path}")
-        byte_count = 0
-        runtime_ms = 0
-        requests = 0
-        errors = 0
-        for job in jobs:
-            stats = job.get("write")
-            if not isinstance(stats, dict):
-                raise ValueError(f"fio output has no write stats: {path}")
-            if "total_ios" not in stats:
-                raise ValueError(f"fio write stats have no total_ios counter: {path}")
-            if "error" not in job:
-                raise ValueError(f"fio job has no error counter: {path}")
-            byte_count += int(stats.get("io_bytes", 0))
-            runtime_ms = max(runtime_ms, int(stats.get("runtime", 0)))
-            requests += int(stats["total_ios"])
-            errors += int(job["error"])
+        jobs = load_fio_jobs(path)
+        aggregate = aggregate_fio_jobs(
+            jobs, operation="write", path=path, require_request_counters=True
+        )
+        byte_count = aggregate.byte_count
+        runtime_ms = aggregate.runtime_ms
+        requests = aggregate.requests
+        errors = aggregate.errors
         if byte_count <= 0 or runtime_ms <= 0 or requests <= 0:
             raise ValueError(
                 "fio write did no measurable I/O: "
@@ -113,9 +104,8 @@ class MatrixFioResult:
             bytes=byte_count,
             runtime_ms=runtime_ms,
             requests=requests,
-            errors=errors,
-            requests_per_second=round(requests / seconds, 3),
-            mibps=round(byte_count / 1_048_576 / seconds, 3),
+            requests_per_second=round(requests / seconds, RATE_DIGITS),
+            mibps=mib_per_second(byte_count, seconds),
         )
 
 
@@ -175,10 +165,6 @@ class MatrixCellResult:
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
-
-    @property
-    def maintenance_before(self) -> WritebackSnapshot:
-        return self.before
 
 
 @dataclass(frozen=True, slots=True)
@@ -681,7 +667,6 @@ class PerformanceMatrixRunner:
             "fio_bytes": result.fio.bytes,
             "fio_runtime_ms": result.fio.runtime_ms,
             "fio_requests": result.fio.requests,
-            "fio_errors": result.fio.errors,
             "fio_requests_per_second": result.fio.requests_per_second,
             "fio_mibps": result.fio.mibps,
             "syncfs_local_tail_ms": result.syncfs_local_tail_ms,
@@ -695,11 +680,15 @@ class PerformanceMatrixRunner:
             "after_fio_accepted": result.after_fio.accepted,
             "after_syncfs_local": result.after_syncfs.local,
             "post_drain_remote": result.post_drain.remote,
-            "local_completed_bytes": (
-                result.after_syncfs.local_bytes - result.before.local_bytes
+            "local_completed_bytes": counter_delta(
+                result.after_syncfs.local_bytes,
+                result.before.local_bytes,
+                f"{result.cell.name} local encoded bytes",
             ),
-            "remote_completed_bytes": (
-                result.post_drain.remote_bytes - result.before.remote_bytes
+            "remote_completed_bytes": counter_delta(
+                result.post_drain.remote_bytes,
+                result.before.remote_bytes,
+                f"{result.cell.name} remote encoded bytes",
             ),
             "nbd_device": result.nbd_io.device,
             "nbd_read_bytes": result.nbd_io.read_bytes,

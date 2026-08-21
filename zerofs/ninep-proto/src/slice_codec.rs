@@ -715,11 +715,6 @@ pub struct Rreaddirattr<'a> {
 }
 
 impl<'a> Rreaddirattr<'a> {
-    /// Serialized directory payload, excluding the outer `count[4]`.
-    pub fn data(&self) -> &'a [u8] {
-        self.data.0
-    }
-
     /// Number of complete [`DirEntryPlus`] records in the payload.
     pub fn len(&self) -> usize {
         self.entry_count
@@ -1017,37 +1012,7 @@ impl<'a> Qids<'a> {
         let mut reader = Reader::new(bytes);
         decode_qid(&mut reader).ok()
     }
-
-    pub fn iter(&self) -> QidIter<'a> {
-        QidIter {
-            qids: *self,
-            index: 0,
-        }
-    }
 }
-
-/// Iterator over a borrowed [`Qids`] list.
-pub struct QidIter<'a> {
-    qids: Qids<'a>,
-    index: usize,
-}
-
-impl Iterator for QidIter<'_> {
-    type Item = Qid;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let qid = self.qids.get(self.index)?;
-        self.index = self.index.saturating_add(1);
-        Some(qid)
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let remaining = self.qids.len().saturating_sub(self.index);
-        (remaining, Some(remaining))
-    }
-}
-
-impl ExactSizeIterator for QidIter<'_> {}
 
 /// One entry in an `Rreaddirattr` counted payload.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -39,7 +39,6 @@ pub(crate) struct SsdAdmissionSnapshot {
     pub(crate) outstanding_physical_claims: u64,
     pub(crate) available_bytes: u64,
     pub(crate) sample_generation: u64,
-    pub(crate) paused: bool,
     pub(crate) mode: SsdAdmissionMode,
     pub(crate) credit_bytes: u64,
     pub(crate) credit_ops: u64,
@@ -151,7 +150,6 @@ struct SsdState {
     outstanding_physical_claims: u64,
     available_bytes: u64,
     sample_generation: u64,
-    paused: bool,
     next_waiter: u64,
     waiters: VecDeque<SsdWaiter>,
     terminal: Option<ReservationError>,
@@ -264,15 +262,6 @@ impl SsdAdmission {
                     outstanding_physical_claims,
                     available_bytes: sample.map(|s| s.available_bytes).unwrap_or(0),
                     sample_generation: sample.map(|s| s.generation).unwrap_or(0),
-                    paused: used_ssd_bytes > high_bytes
-                        || sample.is_some_and(|s| {
-                            !physical_headroom(
-                                s.available_bytes,
-                                outstanding_physical_claims,
-                                0,
-                                min_free_bytes,
-                            )
-                        }),
                     next_waiter: 0,
                     waiters: VecDeque::new(),
                     terminal: None,
@@ -344,7 +333,6 @@ impl SsdAdmission {
                 self.inner.high_bytes,
             ) {
                 state.pacing.enter_paced();
-                state.paused = true;
             }
             let id = state.next_waiter;
             state.next_waiter = state.next_waiter.wrapping_add(1);
@@ -516,7 +504,6 @@ impl SsdAdmission {
             outstanding_physical_claims: state.outstanding_physical_claims,
             available_bytes: state.available_bytes,
             sample_generation: state.sample_generation,
-            paused: state.pacing.mode() == SsdAdmissionMode::Paced,
             mode: state.pacing.mode(),
             credit_bytes: state.pacing.credit_bytes(),
             credit_ops: state.pacing.credit_ops(),
@@ -656,7 +643,6 @@ impl SsdAdmissionInner {
                 .pacing
                 .maybe_resume(state.used_ssd_bytes, self.resume_bytes);
         }
-        state.paused = state.pacing.mode() == SsdAdmissionMode::Paced;
     }
 
     fn fits(&self, state: &SsdState, request: SsdReservationRequest) -> bool {
@@ -736,7 +722,6 @@ impl SsdAdmissionInner {
         if state.used_ssd_bytes > self.high_bytes {
             state.pacing.enter_paced();
         }
-        state.paused = state.pacing.mode() == SsdAdmissionMode::Paced;
         Ok(())
     }
 
@@ -805,7 +790,6 @@ impl SsdAdmissionInner {
                     self.high_bytes,
                 ) {
                     state.pacing.enter_paced();
-                    state.paused = true;
                 }
                 break;
             }

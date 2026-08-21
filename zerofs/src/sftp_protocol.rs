@@ -1228,10 +1228,7 @@ mod tests {
         tokio::spawn(async move {
             let (mut reader, mut writer) = tokio::io::split(server_stream);
             let mut withheld: Vec<u32> = Vec::new();
-            loop {
-                let Ok(length) = reader.read_u32().await else {
-                    break;
-                };
+            while let Ok(length) = reader.read_u32().await {
                 let mut frame = vec![0_u8; length as usize];
                 if frame.is_empty() || reader.read_exact(&mut frame).await.is_err() {
                     break;
@@ -1372,10 +1369,7 @@ mod tests {
         let server_close_seen = Arc::clone(&close_seen);
         tokio::spawn(async move {
             let (mut reader, mut writer) = tokio::io::split(server_stream);
-            loop {
-                let Ok(length) = reader.read_u32().await else {
-                    break;
-                };
+            while let Ok(length) = reader.read_u32().await {
                 let mut frame = vec![0_u8; length as usize];
                 if frame.is_empty() || reader.read_exact(&mut frame).await.is_err() {
                     break;

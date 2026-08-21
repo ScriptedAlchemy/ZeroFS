@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import shutil
 import tempfile
 import uuid
@@ -17,11 +16,18 @@ from .runner import Runner
 from .receipts import RunReceipt
 from .performance_matrix import PerformanceMatrixRunner, require_drained
 from .benchmark import _assert_no_maintenance
-from .system_io import prepare_run_root
+from .system_io import (
+    MIB,
+    RATE_DIGITS,
+    aggregate_fio_jobs,
+    counter_delta,
+    load_fio_jobs,
+    mib_per_second,
+    prepare_run_root,
+)
 
 
 KIB = 1024
-MIB = 1024 * KIB
 GIB = 1024 * MIB
 
 
@@ -303,18 +309,11 @@ def real_world_cells(*, quick: bool) -> tuple[RealWorldCell, ...]:
     return _QUICK_CELLS + _FULL_ONLY_CELLS
 
 
-def counter_delta(*, after: int, before: int, label: str) -> int:
-    if after < before:
-        raise RuntimeError(f"{label} counter regressed: before={before}, after={after}")
-    return after - before
-
-
 @dataclass(frozen=True, slots=True)
 class RealWorldFioResult:
     bytes: int
     runtime_ms: int
     requests: int
-    errors: int
     mibps: float
     requests_per_second: float
 
@@ -327,28 +326,14 @@ class RealWorldFioResult:
         expected_bytes: int,
         expected_requests: int,
     ) -> "RealWorldFioResult":
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        jobs = payload.get("jobs")
-        if not isinstance(jobs, list) or not jobs:
-            raise ValueError(f"fio output has no jobs: {path}")
-        byte_count = 0
-        runtime_ms = 0
-        requests = 0
-        errors = 0
-        for job in jobs:
-            stats = job.get(operation)
-            if not isinstance(stats, dict):
-                raise ValueError(f"fio output has no {operation} stats: {path}")
-            if "total_ios" not in stats:
-                raise ValueError(
-                    f"fio {operation} stats have no total_ios counter: {path}"
-                )
-            if "error" not in job:
-                raise ValueError(f"fio job has no error counter: {path}")
-            byte_count += int(stats.get("io_bytes", 0))
-            runtime_ms = max(runtime_ms, int(stats.get("runtime", 0)))
-            requests += int(stats["total_ios"])
-            errors += int(job["error"])
+        jobs = load_fio_jobs(path)
+        aggregate = aggregate_fio_jobs(
+            jobs, operation=operation, path=path, require_request_counters=True
+        )
+        byte_count = aggregate.byte_count
+        runtime_ms = aggregate.runtime_ms
+        requests = aggregate.requests
+        errors = aggregate.errors
         if errors:
             raise RuntimeError(f"fio reported I/O errors={errors}: {path}")
         if byte_count != expected_bytes:
@@ -368,9 +353,8 @@ class RealWorldFioResult:
             bytes=byte_count,
             runtime_ms=runtime_ms,
             requests=requests,
-            errors=errors,
-            mibps=round(byte_count / MIB / seconds, 3),
-            requests_per_second=round(requests / seconds, 3),
+            mibps=mib_per_second(byte_count, seconds),
+            requests_per_second=round(requests / seconds, RATE_DIGITS),
         )
 
 

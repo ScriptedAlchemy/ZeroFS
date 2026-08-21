@@ -119,6 +119,32 @@ class MemoryEnvelopeTests(unittest.TestCase):
         self.assertEqual(before.restart_count, 4)
         self.assertFalse(before.writeback.terminal)
 
+    def test_point_counters_are_read_before_the_metrics_scrape(self) -> None:
+        """One sample must not straddle the metrics HTTPS round trip.
+
+        `VmRSS` was read before the scrape and `memory.current` after it, so a
+        single MemorySample mixed two instants. `memory.peak`/`VmHWM` are kernel
+        high-water marks and are interval-correct either way, but the two point
+        counters have to line up. Here the scrape rewrites `memory.current`; the
+        recorded value must still be the pre-scrape one.
+        """
+        current = self.cgroup / "memory.current"
+
+        class ScrapeMovesMemory(Metrics):
+            def snapshot(inner) -> WritebackSnapshot:  # noqa: N805
+                current.write_text("4294967296\n")
+                return inner.value
+
+        session = MemoryEnvelopeSession.start(
+            self.authority,
+            SystemctlRunner(),
+            ScrapeMovesMemory(self.metrics.value),  # type: ignore[arg-type]
+            self.scenario,
+        )
+
+        self.assertEqual(session.samples[0].cgroup_current_bytes, 1 << 30)
+        self.assertEqual(current.read_text().strip(), "4294967296")
+
     def test_new_oom_or_restart_fails_closed(self) -> None:
         runner = SystemctlRunner()
         session = MemoryEnvelopeSession.start(
