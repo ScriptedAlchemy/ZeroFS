@@ -250,6 +250,7 @@ async fn websocket_upload_rebinds_linked_temp_after_an_accepted_write_loses_its_
     assert!(backend_error.is_cancelled());
     inspect_filesystem.stop_new_mutation_admission();
     inspect_filesystem.stop_mutation_workers().await.unwrap();
+    inspect_filesystem.flush_coordinator.close().await.unwrap();
     local.close().unwrap();
     assert!(!local_path.exists());
 }
