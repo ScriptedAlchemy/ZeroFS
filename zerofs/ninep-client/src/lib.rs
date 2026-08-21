@@ -1052,6 +1052,21 @@ impl NinePClient {
             let has_lock = snapshot.locks.iter().any(|lock| lock.fid == fid);
             let restored = self.replay_fid(conn, fid, rec, rpc_timeout).await?;
             if !restored {
+                if rec.opened.is_some() {
+                    warn!(
+                        fid,
+                        inode_id = rec.inode_id,
+                        root_inode = rec.root_inode,
+                        "9P replay server reported an open fid missing or stale"
+                    );
+                } else {
+                    debug!(
+                        fid,
+                        inode_id = rec.inode_id,
+                        root_inode = rec.root_inode,
+                        "9P replay dropped an unopened fid that no longer exists"
+                    );
+                }
                 if has_lock {
                     return Err(self.replay_state_lost("fid with a held lock could not be rebound"));
                 }
@@ -1077,6 +1092,14 @@ impl NinePClient {
                         );
                     }
                     Err(ClientError::Errno(errno)) if Self::replay_state_lost_errno(errno) => {
+                        warn!(
+                            fid,
+                            inode_id = rec.inode_id,
+                            root_inode = rec.root_inode,
+                            flags,
+                            errno,
+                            "9P replay server refused to reopen a recorded fid"
+                        );
                         if has_lock {
                             return Err(self.replay_state_lost("locked fid could not be reopened"));
                         }
@@ -1494,10 +1517,23 @@ impl NinePClient {
             let connection_epoch = conn.writer_epoch.load(Ordering::Relaxed);
             let (op_flags, mut send) =
                 attempt.dispatch_frame(has_op_id, connection_epoch, |op_flags, origin_epoch| {
+                    // Positioned writes are idempotent: replaying the same
+                    // bytes at the same inode and offset has the same visible
+                    // result. Encode every Twrite resend as another FIRST with
+                    // the same operation ID and full payload. This lets the
+                    // server either join/replay an accepted attempt or admit a
+                    // frame that the previous transport buffered locally but
+                    // never delivered. Other mutations retain strict RETRY
+                    // semantics because applying them twice is not safe.
+                    let wire_op_flags = if matches!(body, Message::Twrite(_)) {
+                        0
+                    } else {
+                        op_flags
+                    };
                     let bytes = P9Message::new_with_op_id_flags_and_origin(
                         tag,
                         op_id,
-                        op_flags,
+                        wire_op_flags,
                         origin_epoch,
                         body.clone(),
                     )
@@ -4762,11 +4798,11 @@ mod session_transition_tests {
         assert_eq!(rerouted.op_id, op_id);
         assert_eq!(
             rerouted.op_flags, expected_flags,
-            "CLEAN must restore FIRST; an ambiguous rejection must retain RETRY"
+            "positioned writes must reroute with the expected idempotent FIRST encoding"
         );
         assert_eq!(
             rerouted.op_origin_epoch, expected_epoch,
-            "FIRST adopts the successor epoch; RETRY retains its origin epoch"
+            "a CLEAN reroute adopts the successor epoch; an ambiguous reroute retains its origin"
         );
         assert!(matches!(rerouted.body, Message::Twrite(_)));
 
@@ -4784,8 +4820,8 @@ mod session_transition_tests {
     }
 
     #[tokio::test]
-    async fn generic_notleader_after_first_reroutes_same_op_id_as_retry() {
-        assert_notleader_reroute(P9_ENOTLEADER, P9_OP_FLAG_RETRY, 7).await;
+    async fn generic_notleader_after_first_reroutes_positioned_write_as_idempotent_first() {
+        assert_notleader_reroute(P9_ENOTLEADER, 0, 7).await;
     }
 
     #[tokio::test]
@@ -4877,7 +4913,7 @@ mod session_transition_tests {
     }
 
     #[tokio::test]
-    async fn ambiguous_reply_loss_marks_the_next_frame_as_retry() {
+    async fn ambiguous_write_reply_loss_resends_full_payload_as_idempotent_first() {
         let (conn, mut requests) = test_conn_with_receiver();
         let client = test_client(Arc::clone(&conn));
 
@@ -4896,20 +4932,19 @@ mod session_transition_tests {
 
             let retry = recv_op_request(&mut requests, "retried write request").await;
             assert_eq!(retry.op_id, op_id);
-            assert_eq!(retry.op_flags, P9_OP_FLAG_RETRY);
+            assert_eq!(retry.op_flags, 0);
+            assert!(matches!(
+                retry.body,
+                Message::Twrite(Twrite { count: 1, .. })
+            ));
             reply(
                 &responder_conn,
                 retry.tag,
-                Message::Rlerror(Rlerror {
-                    ecode: P9_EOPIDSTALE,
-                }),
+                Message::Rwrite(Rwrite { count: 1 }),
             );
         });
 
-        assert!(matches!(
-            client.write(7, 0, b"x").await,
-            Err(ClientError::Errno(P9_EOPIDSTALE))
-        ));
+        assert_eq!(client.write(7, 0, b"x").await.unwrap(), 1);
         responder.await.unwrap();
         assert!(conn.pending.is_empty());
     }
@@ -5153,7 +5188,7 @@ mod session_transition_tests {
 
         let retry = recv_op_request(&mut successor_requests, "retried write request").await;
         assert_eq!(retry.op_id, first.op_id);
-        assert_eq!(retry.op_flags, P9_OP_FLAG_RETRY);
+        assert_eq!(retry.op_flags, 0);
         assert_eq!(retry.op_origin_epoch, 7);
         reply(
             &successor,

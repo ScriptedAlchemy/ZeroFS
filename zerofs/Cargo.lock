@@ -7520,6 +7520,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-stream",
+ "tokio-tungstenite 0.26.2",
  "tokio-util",
  "toml 0.9.12+spec-1.1.0",
  "tonic 0.14.5",

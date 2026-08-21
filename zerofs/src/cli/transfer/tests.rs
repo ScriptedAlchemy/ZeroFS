@@ -22,6 +22,8 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use zerofs_client::Client;
 
+#[cfg(feature = "webui")]
+mod reconnect;
 mod resume;
 mod safety;
 mod throughput;
