@@ -115,7 +115,7 @@ pub struct SegmentStore {
 }
 
 impl SegmentStore {
-    pub fn new(
+    pub(crate) fn new(
         object_store: Arc<dyn ObjectStore>,
         codec: FrameCodec,
         epoch: u64,
@@ -132,19 +132,19 @@ impl SegmentStore {
     }
 
     /// A shared handle to the frame codec (for the open-segment buffer).
-    pub fn codec(&self) -> Arc<FrameCodec> {
+    pub(crate) fn codec(&self) -> Arc<FrameCodec> {
         Arc::clone(&self.codec)
     }
 
     /// Allocate the next epoch-namespaced segment id.
-    pub fn next_segid(&self) -> Segid {
+    pub(crate) fn next_segid(&self) -> Segid {
         Segid::new(self.epoch, self.counter.fetch_add(1, Ordering::Relaxed))
     }
 
     /// PUT pre-built segment bytes (durable on return). Used by the open-segment
     /// buffer's seal, which builds the bytes itself via `seal_directory` +
     /// `assemble_segment`.
-    pub async fn put_segment(&self, segid: Segid, bytes: Bytes) -> Result<()> {
+    pub(crate) async fn put_segment(&self, segid: Segid, bytes: Bytes) -> Result<()> {
         // A small (partial-fsync) seal goes up as a single PUT (which still
         // writes through the parts cache) but a full 256 MiB seal streams as
         // concurrent multipart, so the fsync-path PUT latency stays bounded
@@ -334,7 +334,7 @@ impl SegmentStore {
     /// Seal `frames` (each `(inode, extent, full-extent plaintext)`) into one new
     /// segment object, durable on return. Returns each frame's location.
     #[cfg(test)] // production packs via seal_compressed; tests build plaintext worlds here
-    pub async fn seal(
+    pub(crate) async fn seal(
         &self,
         frames: &[(InodeId, u64, Bytes)],
     ) -> Result<Vec<(InodeId, u64, FrameLoc)>> {
@@ -353,7 +353,7 @@ impl SegmentStore {
     /// AAD, never decompressed, so compaction's memory tracks stored size. A
     /// large batch's seals fan out on rayon ([`seal_compressed_batch`]); the
     /// appends assign offsets in the same order.
-    pub async fn seal_compressed(
+    pub(crate) async fn seal_compressed(
         &self,
         frames: Vec<(InodeId, u64, Compressed)>,
     ) -> Result<Vec<(InodeId, u64, FrameLoc)>> {
@@ -399,7 +399,12 @@ impl SegmentStore {
     }
 
     /// Read one extent's plaintext via a ranged GET of just its frame.
-    pub async fn read_extent(&self, loc: FrameLoc, id: InodeId, extent: u64) -> Result<Bytes> {
+    pub(crate) async fn read_extent(
+        &self,
+        loc: FrameLoc,
+        id: InodeId,
+        extent: u64,
+    ) -> Result<Bytes> {
         let mut frames = self
             .read_run(
                 loc.segid,
@@ -415,7 +420,7 @@ impl SegmentStore {
     /// Read a contiguous run of `slots.len()` frames from `segid` in one ranged
     /// GET over `[byte_offset, byte_offset + byte_len)`, returning each plaintext.
     /// `slots[i]` is the `(inode, extent)` of the frame at `first_frame + i`.
-    pub async fn read_run(
+    pub(crate) async fn read_run(
         &self,
         segid: Segid,
         byte_offset: u64,
@@ -439,7 +444,7 @@ impl SegmentStore {
     /// As [`Self::read_run`] but AEAD-verify only, returning still-compressed
     /// payloads for relocation (see [`Self::seal_compressed`]). Compaction-only,
     /// so the read bypasses the user parts cache.
-    pub async fn read_compressed_run(
+    pub(crate) async fn read_compressed_run(
         &self,
         segid: Segid,
         byte_offset: u64,
@@ -516,13 +521,13 @@ async fn abort_segment_upload(
 /// GC/maintenance primitives.
 impl SegmentStore {
     /// This writer's epoch (segids it produces are namespaced under it).
-    pub fn epoch(&self) -> u64 {
+    pub(crate) fn epoch(&self) -> u64 {
         self.epoch
     }
 
     /// Ranged segment GETs issued so far (read-amplification metric).
     #[cfg(test)]
-    pub fn read_calls(&self) -> u64 {
+    pub(crate) fn read_calls(&self) -> u64 {
         self.read_calls.load(Ordering::Relaxed)
     }
 
@@ -530,7 +535,7 @@ impl SegmentStore {
     /// streams via [`Self::list_segments_stream`]; this collected form serves
     /// the tests and the failpoints harness.
     #[cfg(test)]
-    pub async fn list_segments(&self) -> Result<Vec<Segid>> {
+    pub(crate) async fn list_segments(&self) -> Result<Vec<Segid>> {
         use futures::TryStreamExt;
         self.list_segments_stream()
             .map_ok(|(segid, _, _)| segid)
@@ -543,7 +548,7 @@ impl SegmentStore {
     /// (O(#segments)) in RAM. `last_modified` is the object's creation time
     /// (segments are immutable), used to protect anything that could predate a
     /// persistent checkpoint.
-    pub fn list_segments_stream(
+    pub(crate) fn list_segments_stream(
         &self,
     ) -> impl futures::Stream<Item = Result<(Segid, u64, chrono::DateTime<chrono::Utc>)>> + '_ {
         // One listing per shard prefix (segments/00 .. segments/ff), flattened
@@ -564,7 +569,7 @@ impl SegmentStore {
     }
 
     /// Delete one segment object.
-    pub async fn delete_segment(&self, segid: Segid) -> Result<()> {
+    pub(crate) async fn delete_segment(&self, segid: Segid) -> Result<()> {
         self.object_store
             .delete(&Path::from(segid.object_key()))
             .await
@@ -574,7 +579,7 @@ impl SegmentStore {
     /// Read and decrypt a segment's reverse-map directory (which frame backs
     /// which logical block), for the coalescer. GC/compaction-only, so the
     /// reads bypass the user parts cache.
-    pub async fn read_directory(&self, segid: Segid) -> Result<Vec<DirEntry>> {
+    pub(crate) async fn read_directory(&self, segid: Segid) -> Result<Vec<DirEntry>> {
         let (footer, meta, dir_bytes) =
             fetch_footer_and_dir_bytes(&self.object_store, segid).await?;
         Ok(crate::segment::decode_directory(
@@ -645,13 +650,13 @@ async fn fetch_footer_and_dir_bytes(
 }
 
 /// A shipped frame, for the HA standby to rebuild an un-PUT segment on takeover.
-pub struct ReconFrame {
-    pub frame_index: u32,
-    pub byte_offset: u64,
-    pub byte_len: u32,
-    pub inode: InodeId,
-    pub extent: u64,
-    pub bytes: Bytes,
+pub(crate) struct ReconFrame {
+    pub(crate) frame_index: u32,
+    pub(crate) byte_offset: u64,
+    pub(crate) byte_len: u32,
+    pub(crate) inode: InodeId,
+    pub(crate) extent: u64,
+    pub(crate) bytes: Bytes,
 }
 
 /// Confirm that an object which won a concurrent create contains every frame the
@@ -727,7 +732,7 @@ async fn verify_existing_recon_segment(
 /// reconstruction. Each frame's raw `[len][sealed]` bytes go back at its
 /// original `byte_offset`, so the replayed `FrameLoc`s resolve. Returns whether
 /// this call created the object. HA-takeover only.
-pub async fn materialize_segment_if_absent(
+pub(crate) async fn materialize_segment_if_absent(
     object_store: &Arc<dyn ObjectStore>,
     codec: &FrameCodec,
     segid: Segid,

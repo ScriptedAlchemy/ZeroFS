@@ -462,7 +462,7 @@ impl NinePHandler {
     }
 
     #[cfg(test)]
-    pub fn handler_id(&self) -> u64 {
+    pub(crate) fn handler_id(&self) -> u64 {
         self.handler_id
     }
 
@@ -651,13 +651,13 @@ impl NinePHandler {
 
     /// Op-id-less dispatch for the unit tests; production passes the frame op-id.
     #[cfg(test)]
-    pub async fn handle_message(&self, tag: u16, msg: Message) -> P9Message {
+    pub(crate) async fn handle_message(&self, tag: u16, msg: Message) -> P9Message {
         self.handle_message_with_op_id(tag, [0u8; 16], msg).await
     }
 
     /// Test dispatch using initial-attempt framing.
     #[cfg(test)]
-    pub async fn handle_message_with_op_id(
+    pub(crate) async fn handle_message_with_op_id(
         &self,
         tag: u16,
         op_id: crate::dedup::OpId,
@@ -681,7 +681,7 @@ impl NinePHandler {
     }
 
     #[cfg(test)]
-    pub async fn handle_message_with_op_envelope_origin(
+    pub(crate) async fn handle_message_with_op_envelope_origin(
         &self,
         tag: u16,
         op_id: crate::dedup::OpId,

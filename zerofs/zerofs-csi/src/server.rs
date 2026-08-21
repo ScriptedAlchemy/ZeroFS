@@ -33,7 +33,7 @@ impl Mode {
 
 /// Turn a CSI endpoint (`unix:///csi/csi.sock`, `unix:/csi/csi.sock`, or a
 /// bare absolute path) into a socket path.
-pub fn socket_path(endpoint: &str) -> Result<PathBuf> {
+fn socket_path(endpoint: &str) -> Result<PathBuf> {
     let path = endpoint
         .strip_prefix("unix://")
         .or_else(|| endpoint.strip_prefix("unix:"))

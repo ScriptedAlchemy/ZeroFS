@@ -6,12 +6,12 @@ pub type Sequence = u64;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JournalIdentity {
-    pub format_version: u32,
-    pub bucket_id: String,
-    pub backend_endpoint: String,
-    pub database_prefix: String,
-    pub backend_kind: String,
-    pub encryption_key_identity_sha256: [u8; 32],
+    pub(crate) format_version: u32,
+    pub(crate) bucket_id: String,
+    pub(crate) backend_endpoint: String,
+    pub(crate) database_prefix: String,
+    pub(crate) backend_kind: String,
+    pub(crate) encryption_key_identity_sha256: [u8; 32],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -131,18 +131,18 @@ fn canonical_compacted_filename(filename: &str) -> bool {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MutationRecord {
-    pub format_version: u32,
-    pub sequence: Sequence,
-    pub operation_id: Uuid,
-    pub path: String,
-    pub kind: MutationKind,
-    pub local_etag: LocalEtag,
-    pub accepted_at_unix_ms: u64,
-    pub remote_predecessor_etag: Option<String>,
-    pub remote_result_etag: Option<String>,
-    pub fence: FenceClass,
-    pub retry_count: u32,
-    pub last_error: Option<String>,
+    pub(crate) format_version: u32,
+    pub(crate) sequence: Sequence,
+    pub(crate) operation_id: Uuid,
+    pub(crate) path: String,
+    pub(crate) kind: MutationKind,
+    pub(crate) local_etag: LocalEtag,
+    pub(crate) accepted_at_unix_ms: u64,
+    pub(crate) remote_predecessor_etag: Option<String>,
+    pub(crate) remote_result_etag: Option<String>,
+    pub(crate) fence: FenceClass,
+    pub(crate) retry_count: u32,
+    pub(crate) last_error: Option<String>,
 }
 
 impl MutationRecord {
@@ -177,7 +177,7 @@ impl MutationRecord {
     const MAX_LOCAL_ETAG: &str = "wb:ffffffff-ffff-ffff-ffff-ffffffffffff:18446744073709551615";
     /// Every accepted mutation occupies one SSD operation slot. Recovery
     /// reseeds admission from the pending-record count, never payload length.
-    pub const SSD_RESERVATION_OPERATIONS: u64 = 1;
+    const SSD_RESERVATION_OPERATIONS: u64 = 1;
 
     /// Build a freshly accepted mutation record. The publication-side fields
     /// (`remote_result_etag`, `retry_count`, `last_error`) always start empty
@@ -208,7 +208,7 @@ impl MutationRecord {
         }
     }
 
-    pub fn blob_path(&self) -> Option<&str> {
+    pub(crate) fn blob_path(&self) -> Option<&str> {
         match &self.kind {
             MutationKind::Put { blob_path, .. }
             | MutationKind::Copy { blob_path, .. }
@@ -217,7 +217,7 @@ impl MutationRecord {
         }
     }
 
-    pub fn payload(&self) -> Option<(u64, [u8; 32])> {
+    pub(crate) fn payload(&self) -> Option<(u64, [u8; 32])> {
         match &self.kind {
             MutationKind::Put {
                 payload_len,
@@ -238,7 +238,7 @@ impl MutationRecord {
         }
     }
 
-    pub fn blob_path_mut(&mut self) -> Option<&mut String> {
+    pub(crate) fn blob_path_mut(&mut self) -> Option<&mut String> {
         match &mut self.kind {
             MutationKind::Put { blob_path, .. }
             | MutationKind::Copy { blob_path, .. }
@@ -255,7 +255,7 @@ impl MutationRecord {
     /// retained in the journal, so acceptance, restart recovery, metrics, and
     /// remote release reconstruct the same value without changing the journal
     /// format.
-    pub fn ssd_reservation_estimate(
+    pub(crate) fn ssd_reservation_estimate(
         path: &str,
         source: Option<&str>,
         payload_len: u64,
@@ -294,7 +294,7 @@ impl MutationRecord {
     }
 
     /// Compatibility wrapper for metadata-only foreground admission.
-    pub fn metadata_ssd_reservation(path: &str) -> bincode::Result<u64> {
+    pub(crate) fn metadata_ssd_reservation(path: &str) -> bincode::Result<u64> {
         Self {
             format_version: u32::MAX,
             sequence: u64::MAX,
@@ -314,7 +314,7 @@ impl MutationRecord {
 
     /// Operation slots charged for this record. Always one; payload length
     /// never substitutes for the operation count.
-    pub fn ssd_reservation_operations(&self) -> u64 {
+    pub(crate) fn ssd_reservation_operations(&self) -> u64 {
         Self::SSD_RESERVATION_OPERATIONS
     }
 
@@ -324,7 +324,7 @@ impl MutationRecord {
     /// by older binaries may contain larger version metadata, so recovery and
     /// release expand the reservation to the record's actual logical footprint
     /// instead of rejecting an otherwise readable journal.
-    pub fn ssd_reservation_bytes(&self) -> bincode::Result<u64> {
+    pub(crate) fn ssd_reservation_bytes(&self) -> bincode::Result<u64> {
         let payload_len = self.payload().map_or(0, |(payload_len, _)| payload_len);
         let mut normalized = self.clone();
         normalized.local_etag.0 =
@@ -396,7 +396,7 @@ impl MutationRecord {
         }
     }
 
-    pub fn validate_persisted_version_field(
+    pub(crate) fn validate_persisted_version_field(
         field: &'static str,
         value: Option<&str>,
     ) -> Result<(), PersistedMetadataError> {
@@ -428,11 +428,11 @@ pub enum PersistedMetadataError {
 pub struct LocalEtag(String);
 
 impl LocalEtag {
-    pub fn new(journal_incarnation: Uuid, sequence: Sequence) -> Self {
+    pub(crate) fn new(journal_incarnation: Uuid, sequence: Sequence) -> Self {
         Self(format!("wb:{journal_incarnation}:{sequence}"))
     }
 
-    pub fn as_str(&self) -> &str {
+    pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
 
@@ -451,21 +451,21 @@ impl LocalEtag {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WritebackStatus {
-    pub accepted_seq: Sequence,
-    pub local_seq: Sequence,
-    pub remote_seq: Sequence,
-    pub dirty_ram_bytes: u64,
-    pub dirty_ram_capacity_bytes: u64,
-    pub dirty_ram_operations: u64,
-    pub dirty_ssd_reserved_bytes: u64,
-    pub dirty_ssd_capacity_bytes: u64,
-    pub dirty_ssd_operations: u64,
-    pub oldest_pending_age_ms: u64,
-    pub local_bytes_completed: u64,
-    pub remote_bytes_completed: u64,
-    pub remote_operations_completed: u64,
-    pub retries: u64,
-    pub terminal_error: Option<String>,
+    pub(crate) accepted_seq: Sequence,
+    pub(crate) local_seq: Sequence,
+    pub(crate) remote_seq: Sequence,
+    pub(crate) dirty_ram_bytes: u64,
+    pub(crate) dirty_ram_capacity_bytes: u64,
+    pub(crate) dirty_ram_operations: u64,
+    pub(crate) dirty_ssd_reserved_bytes: u64,
+    pub(crate) dirty_ssd_capacity_bytes: u64,
+    pub(crate) dirty_ssd_operations: u64,
+    pub(crate) oldest_pending_age_ms: u64,
+    pub(crate) local_bytes_completed: u64,
+    pub(crate) remote_bytes_completed: u64,
+    pub(crate) remote_operations_completed: u64,
+    pub(crate) retries: u64,
+    pub(crate) terminal_error: Option<String>,
 }
 
 #[cfg(test)]

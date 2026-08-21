@@ -45,7 +45,7 @@ struct TailBatch {
 }
 
 impl TailBuffer {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
@@ -156,7 +156,7 @@ impl TailBuffer {
 
     /// Test helper for direct tail construction.
     #[cfg(test)]
-    pub fn accept(
+    pub(crate) fn accept(
         &mut self,
         epoch: u64,
         seqno: u64,
@@ -172,17 +172,17 @@ impl TailBuffer {
     }
 
     /// Term of the buffered batches (0 before anything was accepted).
-    pub fn epoch(&self) -> u64 {
+    pub(crate) fn epoch(&self) -> u64 {
         self.epoch
     }
 
     /// Drops all batches after durable state supersedes the tail.
-    pub fn discard(&mut self) {
+    pub(crate) fn discard(&mut self) {
         *self = Self::default();
     }
 
     /// Drops batches through `watermark` and returns their dedup results.
-    pub fn prune(&mut self, watermark: u64) -> Vec<DedupEntry> {
+    pub(crate) fn prune(&mut self, watermark: u64) -> Vec<DedupEntry> {
         self.durable_through = self.durable_through.max(watermark);
         let mut durable_entries = Vec::new();
         self.batches.retain(|&seqno, batch| {
@@ -249,7 +249,7 @@ impl TailBuffer {
     }
 
     /// Clears a replayed tail and returns its now-durable results.
-    pub fn finish_replay(&mut self) -> Vec<DedupEntry> {
+    pub(crate) fn finish_replay(&mut self) -> Vec<DedupEntry> {
         let batches = std::mem::take(self).batches;
         batches
             .into_values()
@@ -258,17 +258,17 @@ impl TailBuffer {
     }
 
     /// Ascending seqno order, for replay on takeover.
-    pub fn batches_in_order(&self) -> impl Iterator<Item = (u64, &[ReplOp])> {
+    pub(crate) fn batches_in_order(&self) -> impl Iterator<Item = (u64, &[ReplOp])> {
         self.batches
             .iter()
             .map(|(&seqno, batch)| (seqno, batch.ops.as_slice()))
     }
 
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.batches.len()
     }
 
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.batches.is_empty()
     }
 }

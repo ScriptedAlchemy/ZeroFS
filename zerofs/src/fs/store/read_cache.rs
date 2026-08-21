@@ -98,7 +98,7 @@ where
     K: Clone + Eq + Hash + Send + Sync + 'static,
     V: Clone + Send + Sync + 'static,
 {
-    pub(crate) fn disabled() -> Self {
+    fn disabled() -> Self {
         Self {
             cache: None,
             keys: Vec::new(),
@@ -185,11 +185,11 @@ where
         }
     }
 
-    pub(crate) fn get(&self, key: &K) -> Option<V> {
+    fn get(&self, key: &K) -> Option<V> {
         self.entries.get(key).map(|entry| entry.value().clone())
     }
 
-    pub(crate) async fn get_or_load<F, Fut, E>(&self, key: K, load: F) -> Result<V, E>
+    async fn get_or_load<F, Fut, E>(&self, key: K, load: F) -> Result<V, E>
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<V, E>>,
@@ -321,10 +321,7 @@ where
     }
 
     /// Evict `keys` and block fills until the returned guard is dropped.
-    pub(crate) fn invalidate(
-        self: &Arc<Self>,
-        keys: impl IntoIterator<Item = K>,
-    ) -> InvalidationGuard<K, V> {
+    fn invalidate(self: &Arc<Self>, keys: impl IntoIterator<Item = K>) -> InvalidationGuard<K, V> {
         let keys: Vec<_> = keys.into_iter().collect();
         for key in &keys {
             let mut state = self.states.entry(key.clone()).or_default();

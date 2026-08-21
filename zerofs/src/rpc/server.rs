@@ -737,7 +737,7 @@ mod tests {
     /// Build an in-memory ZeroFS plus the CheckpointManager the admin server
     /// needs. The slatedb handle is constructed here (instead of via
     /// ZeroFS::new_in_memory) because the CheckpointManager needs it too.
-    pub(super) async fn make_fs() -> (Arc<ZeroFS>, Arc<CheckpointManager>) {
+    async fn make_fs() -> (Arc<ZeroFS>, Arc<CheckpointManager>) {
         make_fs_with_lease_and_write_ack(None, None).await
     }
 
@@ -747,7 +747,7 @@ mod tests {
         make_fs_with_lease_and_write_ack(lease, None).await
     }
 
-    pub(super) async fn make_fs_with_write_ack(
+    async fn make_fs_with_write_ack(
         write_ack: crate::fs::mutation::config::FilesystemWriteAckSettings,
     ) -> (Arc<ZeroFS>, Arc<CheckpointManager>) {
         make_fs_with_lease_and_write_ack(None, Some(write_ack)).await
@@ -837,7 +837,7 @@ mod tests {
         (fs, client, shutdown, dir)
     }
 
-    pub(super) async fn setup_fs(
+    async fn setup_fs(
         fs: Arc<ZeroFS>,
         checkpoint_manager: Arc<CheckpointManager>,
         protect_nbd_exports: bool,

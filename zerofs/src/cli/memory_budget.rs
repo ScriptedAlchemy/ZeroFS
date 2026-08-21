@@ -13,13 +13,13 @@ const COMPANION_PROCESS_RESERVE_BYTES: u64 = 8 * GIB;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct StartupMemoryTiers {
-    pub(crate) clean_cache_bytes: u64,
-    pub(crate) object_writeback_bytes: u64,
-    pub(crate) volatile_write_bytes: u64,
+    clean_cache_bytes: u64,
+    object_writeback_bytes: u64,
+    volatile_write_bytes: u64,
 }
 
 impl StartupMemoryTiers {
-    pub(crate) fn from_settings(settings: &Settings, volatile_write_bytes: u64) -> Result<Self> {
+    fn from_settings(settings: &Settings, volatile_write_bytes: u64) -> Result<Self> {
         let configured_clean = decimal_gb_to_bytes(
             "[cache] memory_size_gb",
             settings.cache.memory_size_gb.unwrap_or(0.25),
@@ -48,14 +48,14 @@ impl StartupMemoryTiers {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MemoryEnvelope {
-    pub(crate) hard_limit_bytes: u64,
-    pub(crate) source: PathBuf,
+    hard_limit_bytes: u64,
+    source: PathBuf,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct CgroupMemoryLimits {
-    pub(crate) dedicated: Option<MemoryEnvelope>,
-    pub(crate) shared_ceiling: Option<MemoryEnvelope>,
+    dedicated: Option<MemoryEnvelope>,
+    shared_ceiling: Option<MemoryEnvelope>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -94,7 +94,7 @@ pub(crate) fn validate_server_startup(
     Ok(Some(receipt))
 }
 
-pub(crate) fn validate_memory_budget(
+fn validate_memory_budget(
     tiers: StartupMemoryTiers,
     hard_limit_bytes: u64,
     source: &str,
@@ -136,7 +136,7 @@ pub(crate) fn validate_memory_budget(
     })
 }
 
-pub(crate) fn select_memory_limit(
+fn select_memory_limit(
     detected: CgroupMemoryLimits,
     configured_bytes: Option<u64>,
 ) -> Result<Option<MemoryEnvelope>> {
@@ -184,7 +184,7 @@ fn detect_process_cgroup_v2_memory_limit() -> Result<CgroupMemoryLimits> {
     )
 }
 
-pub(crate) fn detect_cgroup_v2_memory_limit(
+fn detect_cgroup_v2_memory_limit(
     proc_cgroup: &Path,
     mountinfo: &Path,
 ) -> Result<CgroupMemoryLimits> {

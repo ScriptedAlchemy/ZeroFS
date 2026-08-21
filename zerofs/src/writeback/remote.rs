@@ -99,7 +99,7 @@ pub struct RemoteBarrier {
 }
 
 impl RemoteBarrier {
-    pub async fn wait_remote(&self, sequence: Sequence) -> Result<(), RemoteBarrierError> {
+    pub(crate) async fn wait_remote(&self, sequence: Sequence) -> Result<(), RemoteBarrierError> {
         self.progress.wait(self.incarnation, sequence).await
     }
 }
@@ -268,15 +268,15 @@ impl RemoteScheduler {
         })
     }
 
-    pub fn barrier(&self) -> RemoteBarrier {
+    pub(crate) fn barrier(&self) -> RemoteBarrier {
         self.inner.barrier.clone()
     }
 
-    pub fn terminal_error(&self) -> Option<String> {
+    pub(crate) fn terminal_error(&self) -> Option<String> {
         self.inner.barrier.progress.snapshot().terminal_error
     }
 
-    pub fn check_available(&self) -> Result<(), RemoteBarrierError> {
+    pub(crate) fn check_available(&self) -> Result<(), RemoteBarrierError> {
         let state = self.inner.barrier.progress.snapshot();
         if let Some(error) = &state.terminal_error {
             return Err(RemoteBarrierError::Remote(error.clone()));
@@ -287,7 +287,7 @@ impl RemoteScheduler {
         Ok(())
     }
 
-    pub fn activate(&self) -> Result<(), RemoteBarrierError> {
+    pub(crate) fn activate(&self) -> Result<(), RemoteBarrierError> {
         self.check_available()?;
         self.inner
             .activate
@@ -295,7 +295,7 @@ impl RemoteScheduler {
             .map_err(|_| RemoteBarrierError::Closed)
     }
 
-    pub async fn shutdown(&self) -> Result<(), RemoteBarrierError> {
+    pub(crate) async fn shutdown(&self) -> Result<(), RemoteBarrierError> {
         let mut completion = self.inner.shutdown_result.subscribe();
         if !self.inner.shutdown_started.swap(true, Ordering::AcqRel) {
             let inner = self.inner.clone();

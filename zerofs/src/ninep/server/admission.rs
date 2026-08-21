@@ -16,10 +16,8 @@ pub(super) const CONNECTION_INFLIGHT_REQUESTS: usize = 16;
 /// This leaves room for the expected sixteen idle Mesh sessions and the
 /// default uploader's sixteen connections while bounding reconnect storms.
 pub(super) const GLOBAL_TRANSPORT_SESSIONS: usize = 64;
-pub(super) const MAX_PRE_ADMISSION_MEMORY: usize =
-    GLOBAL_TRANSPORT_SESSIONS * P9_MAX_MSIZE as usize;
-pub(super) const DOCUMENTED_P9_MEMORY_BOUND: usize =
-    GLOBAL_INFLIGHT_MEMORY + MAX_PRE_ADMISSION_MEMORY;
+const MAX_PRE_ADMISSION_MEMORY: usize = GLOBAL_TRANSPORT_SESSIONS * P9_MAX_MSIZE as usize;
+const DOCUMENTED_P9_MEMORY_BOUND: usize = GLOBAL_INFLIGHT_MEMORY + MAX_PRE_ADMISSION_MEMORY;
 #[cfg(any(feature = "webui", test))]
 const WEBSOCKET_RECEIVE_RESERVATION: u32 = 2 * P9_MAX_MSIZE;
 

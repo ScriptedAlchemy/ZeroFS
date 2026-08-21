@@ -26,13 +26,13 @@ use tracing::info;
 
 /// StorageClass parameter / provisioner-secret key: gateway admin RPC URL
 /// (e.g. http://zerofs-gateway.zerofs.svc:7000).
-pub const PARAM_ADMIN_ENDPOINT: &str = "adminEndpoint";
+const PARAM_ADMIN_ENDPOINT: &str = "adminEndpoint";
 /// StorageClass parameter: 9P TCP address nodes mount from
 /// (e.g. zerofs-gateway.zerofs.svc:5564).
-pub const PARAM_GATEWAY: &str = "gateway";
+pub(crate) const PARAM_GATEWAY: &str = "gateway";
 /// StorageClass parameter: directory on the gateway filesystem under which
 /// volume directories are created. Defaults to /volumes.
-pub const PARAM_VOLUMES_ROOT: &str = "volumesRoot";
+pub(crate) const PARAM_VOLUMES_ROOT: &str = "volumesRoot";
 
 pub struct ControllerService;
 
@@ -50,7 +50,7 @@ impl Default for ControllerService {
 
 /// Check that a capability is a mount volume (no block support) with one of
 /// the supported access modes.
-pub fn validate_volume_capability(cap: &VolumeCapability) -> Result<(), String> {
+pub(crate) fn validate_volume_capability(cap: &VolumeCapability) -> Result<(), String> {
     match &cap.access_type {
         Some(volume_capability::AccessType::Mount(m)) => {
             // The FUSE mount takes no pass-through options; refuse
@@ -84,7 +84,7 @@ pub fn validate_volume_capability(cap: &VolumeCapability) -> Result<(), String> 
 
 /// `volumesRoot` + `/` + `volume_id`, the directory backing a volume. Also
 /// used verbatim as the 9P attach aname on nodes.
-pub fn volume_path(volumes_root: &str, volume_id: &str) -> String {
+pub(crate) fn volume_path(volumes_root: &str, volume_id: &str) -> String {
     format!("{}/{}", volumes_root.trim_end_matches('/'), volume_id)
 }
 

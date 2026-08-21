@@ -25,7 +25,7 @@ pub struct StorageClassObjectStore {
 }
 
 impl StorageClassObjectStore {
-    pub fn new(inner: Arc<dyn ObjectStore>, storage_class: impl Into<AttributeValue>) -> Self {
+    fn new(inner: Arc<dyn ObjectStore>, storage_class: impl Into<AttributeValue>) -> Self {
         Self {
             inner,
             storage_class: storage_class.into(),
@@ -41,7 +41,7 @@ impl StorageClassObjectStore {
 
 /// Wraps `store` so every write is stamped with `storage_class`, or returns it
 /// unchanged when no class is configured.
-pub fn with_storage_class(
+pub(crate) fn with_storage_class(
     store: Arc<dyn ObjectStore>,
     storage_class: Option<&str>,
 ) -> Arc<dyn ObjectStore> {

@@ -65,7 +65,7 @@ impl ExtentStore {
     /// Shared across clones of the store; replaces the old process-global
     /// slot that let concurrent tests clobber each other's snapshots.
     #[cfg(test)]
-    pub(super) fn last_read_metrics(&self) -> Option<metrics::ReadRunSnapshot> {
+    fn last_read_metrics(&self) -> Option<metrics::ReadRunSnapshot> {
         *self
             .last_read_metrics
             .lock()
@@ -98,7 +98,7 @@ impl ExtentStore {
 
     /// The full-extent (EXTENT_SIZE) plaintext for `(id, extent)`, or `None` for a
     /// hole. Resolves the extent key's `FrameLoc` then fetches the frame.
-    pub async fn get(&self, id: InodeId, extent_idx: u64) -> Result<Option<Bytes>, FsError> {
+    pub(crate) async fn get(&self, id: InodeId, extent_idx: u64) -> Result<Option<Bytes>, FsError> {
         let key = self.key_codec.extent_key(id, extent_idx);
         let location = self
             .extent_location_cache

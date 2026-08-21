@@ -27,7 +27,7 @@ pub struct Credentials {
 }
 
 impl Credentials {
-    pub fn from_auth_context(auth: &AuthContext) -> Self {
+    pub(crate) fn from_auth_context(auth: &AuthContext) -> Self {
         let mut creds = Self {
             uid: auth.uid,
             gid: auth.gid,
@@ -44,11 +44,11 @@ impl Credentials {
         creds
     }
 
-    pub fn with_gid(self, gid: u32) -> Self {
+    pub(crate) fn with_gid(self, gid: u32) -> Self {
         Self { gid, ..self }
     }
 
-    pub fn is_member_of_group(&self, gid: u32) -> bool {
+    pub(crate) fn is_member_of_group(&self, gid: u32) -> bool {
         self.is_known_member_of_group(gid) || !self.groups_complete
     }
 
@@ -72,7 +72,11 @@ pub enum AccessMode {
     Execute,
 }
 
-pub fn check_access(inode: &Inode, creds: &Credentials, mode: AccessMode) -> Result<(), FsError> {
+pub(crate) fn check_access(
+    inode: &Inode,
+    creds: &Credentials,
+    mode: AccessMode,
+) -> Result<(), FsError> {
     let (uid, gid, file_mode) = (inode.uid(), inode.gid(), inode.mode());
 
     if creds.uid == 0 {
@@ -109,7 +113,7 @@ pub fn check_access(inode: &Inode, creds: &Credentials, mode: AccessMode) -> Res
     Err(FsError::PermissionDenied)
 }
 
-pub fn check_ownership(inode: &Inode, creds: &Credentials) -> Result<(), FsError> {
+pub(crate) fn check_ownership(inode: &Inode, creds: &Credentials) -> Result<(), FsError> {
     if creds.uid == 0 || creds.uid == inode.uid() {
         Ok(())
     } else {
@@ -117,7 +121,7 @@ pub fn check_ownership(inode: &Inode, creds: &Credentials) -> Result<(), FsError
     }
 }
 
-pub fn check_sticky_bit_delete(
+pub(crate) fn check_sticky_bit_delete(
     parent: &Inode,
     target: &Inode,
     creds: &Credentials,
@@ -133,11 +137,11 @@ pub fn check_sticky_bit_delete(
     Ok(())
 }
 
-pub fn validate_mode(mode: u32) -> u32 {
+pub(crate) fn validate_mode(mode: u32) -> u32 {
     mode & 0o7777
 }
 
-pub fn can_set_times(
+pub(crate) fn can_set_times(
     inode: &Inode,
     creds: &Credentials,
     setting_to_current_time: bool,

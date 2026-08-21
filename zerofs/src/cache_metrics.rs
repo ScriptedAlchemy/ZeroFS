@@ -34,7 +34,7 @@ impl FoyerMetricsRegistry {
             .clone()
     }
 
-    pub(crate) fn counter_value(&self, name: &str, labels: &[(&str, &str)]) -> u64 {
+    fn counter_value(&self, name: &str, labels: &[(&str, &str)]) -> u64 {
         let key = MetricKey {
             name: Cow::Owned(name.to_owned()),
             labels: labels

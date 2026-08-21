@@ -22,7 +22,7 @@ use uuid::Uuid;
 
 use crate::segment_store::{ConditionalMultipartCreate, GeneratedSegmentCreate};
 
-pub const OBJECT_HEADER_LEN: usize = 32;
+pub(crate) const OBJECT_HEADER_LEN: usize = 32;
 const CREATE_RECONCILIATION_CHUNK_SIZE: u64 = 8 * 1024 * 1024;
 const OBJECT_HEADER_MAGIC: &[u8; 8] = b"ZEROFS\x01\0";
 const SFTP_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
@@ -66,15 +66,15 @@ macro_rules! with_lease {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ObjectHeader {
-    pub generation: Uuid,
-    pub logical_len: u64,
+    pub(crate) generation: Uuid,
+    pub(crate) logical_len: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SftpCapabilities {
-    pub fsync: bool,
-    pub hardlink: bool,
-    pub posix_rename: bool,
+    pub(crate) fsync: bool,
+    pub(crate) hardlink: bool,
+    pub(crate) posix_rename: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,7 +84,7 @@ pub enum PublicationMode {
     Update,
 }
 
-pub fn validate_publication_capabilities(
+fn validate_publication_capabilities(
     capabilities: SftpCapabilities,
     mode: PublicationMode,
 ) -> Result<(), &'static str> {
@@ -100,7 +100,7 @@ pub fn validate_publication_capabilities(
     }
 }
 
-pub fn encode_header(header: ObjectHeader) -> [u8; OBJECT_HEADER_LEN] {
+pub(crate) fn encode_header(header: ObjectHeader) -> [u8; OBJECT_HEADER_LEN] {
     let mut encoded = [0; OBJECT_HEADER_LEN];
     encoded[..8].copy_from_slice(OBJECT_HEADER_MAGIC);
     encoded[8..24].copy_from_slice(header.generation.as_bytes());
@@ -108,7 +108,7 @@ pub fn encode_header(header: ObjectHeader) -> [u8; OBJECT_HEADER_LEN] {
     encoded
 }
 
-pub fn decode_header(bytes: &[u8]) -> Result<ObjectHeader, String> {
+pub(crate) fn decode_header(bytes: &[u8]) -> Result<ObjectHeader, String> {
     let bytes: &[u8; OBJECT_HEADER_LEN] = bytes
         .get(..OBJECT_HEADER_LEN)
         .ok_or_else(|| "SFTP object is shorter than its internal header".to_owned())?
@@ -133,7 +133,7 @@ pub fn decode_header(bytes: &[u8]) -> Result<ObjectHeader, String> {
 
 const STAGING_PREFIX: &str = ".zerofs-staging-";
 
-pub fn staging_path(target: &FilePath, upload_id: Uuid) -> Result<PathBuf, String> {
+fn staging_path(target: &FilePath, upload_id: Uuid) -> Result<PathBuf, String> {
     let filename = target
         .file_name()
         .and_then(|filename| filename.to_str())
@@ -141,7 +141,7 @@ pub fn staging_path(target: &FilePath, upload_id: Uuid) -> Result<PathBuf, Strin
     Ok(target.with_file_name(format!("{STAGING_PREFIX}{filename}-{upload_id}")))
 }
 
-pub fn is_staging_name(name: &FilePath) -> bool {
+fn is_staging_name(name: &FilePath) -> bool {
     let Some(name) = name.to_str() else {
         return false;
     };
@@ -201,7 +201,7 @@ impl RemoteError {
         matches!(self, Self::Other(_))
     }
 
-    pub(crate) fn is_retryable(&self) -> bool {
+    fn is_retryable(&self) -> bool {
         match self {
             Self::NotFound(_)
             | Self::AlreadyExists(_)
@@ -224,14 +224,14 @@ pub type RemoteResult<T> = Result<T, RemoteError>;
 #[derive(Debug, thiserror::Error)]
 #[error("failed to remove staging path {}: {error}", path.display())]
 pub struct StagingCleanupDebt {
-    pub path: PathBuf,
-    pub error: Box<RemoteError>,
+    path: PathBuf,
+    error: Box<RemoteError>,
 }
 
 #[derive(Debug)]
 pub struct PublicationOutcome {
-    pub header: ObjectHeader,
-    pub cleanup_debt: Option<StagingCleanupDebt>,
+    header: ObjectHeader,
+    cleanup_debt: Option<StagingCleanupDebt>,
 }
 
 type TargetLock = AsyncMutex<()>;
@@ -296,7 +296,7 @@ pub trait RemoteSession: Debug + Send + Sync {
     fn schedule_cleanup(&self, path: PathBuf);
 }
 
-pub async fn publish_payload(
+async fn publish_payload(
     session: Arc<dyn RemoteSession>,
     target: &FilePath,
     payload: Vec<Bytes>,
@@ -729,7 +729,7 @@ impl SftpObjectStore {
         Ok(())
     }
 
-    pub fn new(
+    pub(crate) fn new(
         pool: crate::sftp_transport::SftpSessionPool,
         prefix: ObjectPath,
     ) -> object_store::Result<Self> {

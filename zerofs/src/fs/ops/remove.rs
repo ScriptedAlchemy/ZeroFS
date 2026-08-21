@@ -33,7 +33,7 @@ impl ZeroFS {
 
     /// `remove` tagged with an idempotency op-id: an applied retry is a no-op
     /// success instead of NotFound. See [`Self::create_idempotent`].
-    pub async fn remove_idempotent(
+    pub(crate) async fn remove_idempotent(
         &self,
         auth: &AuthContext,
         dirid: InodeId,

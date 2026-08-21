@@ -13,10 +13,10 @@ use tracing::warn;
 
 /// Reserved cookie values
 /// 0 is reserved for "start from beginning" (not a valid entry cookie)
-pub const COOKIE_DOT: u64 = 1;
-pub const COOKIE_DOTDOT: u64 = 2;
+pub(crate) const COOKIE_DOT: u64 = 1;
+pub(crate) const COOKIE_DOTDOT: u64 = 2;
 /// First cookie value for regular entries
-pub const COOKIE_FIRST_ENTRY: u64 = 3;
+pub(crate) const COOKIE_FIRST_ENTRY: u64 = 3;
 
 /// Value stored in directory scan entries.
 /// For entries with nlink=1, we embed the full inode to avoid separate lookups.
@@ -30,14 +30,14 @@ pub enum DirScanValue {
 }
 
 impl DirScanValue {
-    pub fn inode_id(&self) -> InodeId {
+    fn inode_id(&self) -> InodeId {
         match self {
             DirScanValue::WithInode { inode_id, .. } => *inode_id,
             DirScanValue::Reference { inode_id } => *inode_id,
         }
     }
 
-    pub fn into_inode(self) -> Option<Inode> {
+    fn into_inode(self) -> Option<Inode> {
         match self {
             DirScanValue::WithInode { inode, .. } => Some(inode),
             DirScanValue::Reference { .. } => None,
@@ -82,9 +82,9 @@ pub fn decode_dir_scan_value(data: &[u8]) -> Result<(Vec<u8>, DirScanValue), FsE
 pub struct DirEntryInfo {
     pub name: Vec<u8>,
     pub inode_id: InodeId,
-    pub cookie: u64,
+    pub(crate) cookie: u64,
     /// Embedded inode if available (None for hardlinked entries)
-    pub inode: Option<Inode>,
+    pub(crate) inode: Option<Inode>,
 }
 
 const ENTRY_CACHE_BYTES: usize = 8 * 1024 * 1024;
@@ -105,7 +105,7 @@ pub struct DirectoryStore {
 }
 
 impl DirectoryStore {
-    pub fn new(db: Arc<Db>, key_codec: Arc<KeyCodec>) -> Self {
+    pub(crate) fn new(db: Arc<Db>, key_codec: Arc<KeyCodec>) -> Self {
         let entry_cache = DirectoryEntryCache::new(
             db.clone(),
             ENTRY_CACHE_BYTES,
@@ -119,7 +119,7 @@ impl DirectoryStore {
         }
     }
 
-    pub async fn get(&self, dir_id: InodeId, name: &[u8]) -> Result<InodeId, FsError> {
+    pub(crate) async fn get(&self, dir_id: InodeId, name: &[u8]) -> Result<InodeId, FsError> {
         self.get_entry_with_cookie(dir_id, name)
             .await
             .map(|(inode_id, _)| inode_id)
@@ -138,7 +138,7 @@ impl DirectoryStore {
         KeyCodec::decode_dir_entry(&entry_data)
     }
 
-    pub async fn allocate_cookie(
+    pub(crate) async fn allocate_cookie(
         &self,
         dir_id: InodeId,
         txn: &mut Transaction,
@@ -174,7 +174,7 @@ impl DirectoryStore {
         txn.put_bytes(&counter_key, KeyCodec::encode_counter(current + 1));
     }
 
-    pub async fn exists(&self, dir_id: InodeId, name: &[u8]) -> Result<bool, FsError> {
+    pub(crate) async fn exists(&self, dir_id: InodeId, name: &[u8]) -> Result<bool, FsError> {
         let cache_key = (dir_id, Bytes::copy_from_slice(name));
         if self.entry_cache.get(&cache_key)?.is_some() {
             return Ok(true);
@@ -238,7 +238,7 @@ impl DirectoryStore {
         )))
     }
 
-    pub async fn list_from(
+    pub(crate) async fn list_from(
         &self,
         dir_id: InodeId,
         resume_after_cookie: u64,
@@ -291,7 +291,7 @@ impl DirectoryStore {
     /// Add a directory entry.
     /// If `inode` is provided, it will be embedded in the scan entry (for nlink=1 entries).
     /// If `inode` is None, only a reference is stored (for hardlinked entries).
-    pub fn add(
+    pub(crate) fn add(
         &self,
         txn: &mut Transaction,
         dir_id: InodeId,
@@ -317,7 +317,13 @@ impl DirectoryStore {
         txn.put_bytes(&scan_key, encode_dir_scan_value(name, &scan_value));
     }
 
-    pub fn unlink_entry(&self, txn: &mut Transaction, dir_id: InodeId, name: &[u8], cookie: u64) {
+    pub(crate) fn unlink_entry(
+        &self,
+        txn: &mut Transaction,
+        dir_id: InodeId,
+        name: &[u8],
+        cookie: u64,
+    ) {
         let entry_key = self.key_codec.dir_entry_key(dir_id, name);
         txn.delete_bytes(&entry_key);
         let cache_name = Bytes::copy_from_slice(name);
@@ -327,12 +333,12 @@ impl DirectoryStore {
         txn.delete_bytes(&scan_key);
     }
 
-    pub fn delete_directory(&self, txn: &mut Transaction, dir_id: InodeId) {
+    pub(crate) fn delete_directory(&self, txn: &mut Transaction, dir_id: InodeId) {
         let counter_key = self.key_codec.dir_cookie_counter_key(dir_id);
         txn.delete_bytes(&counter_key);
     }
 
-    pub async fn get_entry_with_cookie(
+    pub(crate) async fn get_entry_with_cookie(
         &self,
         dir_id: InodeId,
         name: &[u8],
@@ -351,7 +357,7 @@ impl DirectoryStore {
     }
 
     #[cfg(test)]
-    pub(crate) fn cached_entry(&self, dir_id: InodeId, name: &[u8]) -> Option<(InodeId, u64)> {
+    fn cached_entry(&self, dir_id: InodeId, name: &[u8]) -> Option<(InodeId, u64)> {
         self.entry_cache
             .peek(&(dir_id, Bytes::copy_from_slice(name)))
     }
@@ -368,7 +374,7 @@ impl DirectoryStore {
 
     /// Update the embedded inode in a directory scan entry.
     /// Used when inode attributes change (write, setattr, etc.).
-    pub async fn update_inode_in_entry(
+    pub(crate) async fn update_inode_in_entry(
         &self,
         txn: &mut Transaction,
         dir_id: InodeId,
@@ -387,7 +393,7 @@ impl DirectoryStore {
 
     /// Convert a directory scan entry to a Reference (for hardlinks).
     /// Used when nlink goes from 1 to 2+.
-    pub async fn convert_to_reference(
+    pub(crate) async fn convert_to_reference(
         &self,
         txn: &mut Transaction,
         dir_id: InodeId,

@@ -11,7 +11,7 @@ pub struct ZeroFsSegmentExtractor;
 
 /// Persisted name. Stamped onto the manifest at first creation; checked on
 /// every reopen.
-pub const EXTRACTOR_NAME: &str = "zerofs-meta-extent-v1";
+const EXTRACTOR_NAME: &str = "zerofs-meta-extent-v1";
 
 impl PrefixExtractor for ZeroFsSegmentExtractor {
     fn name(&self) -> &str {

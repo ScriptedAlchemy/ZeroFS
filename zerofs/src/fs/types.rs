@@ -28,7 +28,7 @@ pub enum FallocateMode {
 
 impl FallocateMode {
     /// Linux fallocate mode bits used in traces and on the private 9P wire.
-    pub const fn linux_mode(self) -> u32 {
+    pub(crate) const fn linux_mode(self) -> u32 {
         match self {
             Self::Allocate => 0,
             Self::PunchHole => 0x01 | 0x02,
@@ -68,12 +68,12 @@ impl From<ftype3> for FileType {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Timestamp {
-    pub seconds: u64,
-    pub nanoseconds: u32,
+    pub(crate) seconds: u64,
+    pub(crate) nanoseconds: u32,
 }
 
 impl Timestamp {
-    pub fn now() -> Self {
+    pub(crate) fn now() -> Self {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap();
@@ -104,19 +104,19 @@ impl From<nfstime3> for Timestamp {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileAttributes {
-    pub file_type: FileType,
-    pub mode: u32,
-    pub nlink: u32,
-    pub uid: u32,
-    pub gid: u32,
-    pub size: u64,
-    pub used: u64,
-    pub rdev: Option<(u32, u32)>,
-    pub fsid: u64,
-    pub fileid: u64,
-    pub atime: Timestamp,
-    pub mtime: Timestamp,
-    pub ctime: Timestamp,
+    pub(crate) file_type: FileType,
+    pub(crate) mode: u32,
+    pub(crate) nlink: u32,
+    pub(crate) uid: u32,
+    pub(crate) gid: u32,
+    pub(crate) size: u64,
+    pub(crate) used: u64,
+    pub(crate) rdev: Option<(u32, u32)>,
+    pub(crate) fsid: u64,
+    pub(crate) fileid: u64,
+    pub(crate) atime: Timestamp,
+    pub(crate) mtime: Timestamp,
+    pub(crate) ctime: Timestamp,
 }
 
 impl Default for FileAttributes {
@@ -172,8 +172,8 @@ impl From<&FileAttributes> for fattr3 {
 }
 
 pub struct InodeWithId<'a> {
-    pub inode: &'a super::inode::Inode,
-    pub id: u64,
+    pub(crate) inode: &'a super::inode::Inode,
+    pub(crate) id: u64,
 }
 
 impl From<InodeWithId<'_>> for fattr3 {
@@ -351,16 +351,16 @@ pub type InodeId = u64;
 
 #[derive(Debug, Clone)]
 pub struct DirEntry {
-    pub fileid: InodeId,
-    pub name: Vec<u8>,
-    pub attr: FileAttributes,
-    pub cookie: u64,
+    pub(crate) fileid: InodeId,
+    pub(crate) name: Vec<u8>,
+    pub(crate) attr: FileAttributes,
+    pub(crate) cookie: u64,
 }
 
 #[derive(Debug, Clone)]
 pub struct ReadDirResult {
-    pub entries: Vec<DirEntry>,
-    pub end: bool,
+    pub(crate) entries: Vec<DirEntry>,
+    pub(crate) end: bool,
 }
 
 /// Protocol-agnostic authentication context

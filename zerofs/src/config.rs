@@ -94,24 +94,24 @@ impl<'de> Deserialize<'de> for CompressionConfig {
 #[serde(deny_unknown_fields)]
 pub struct WalConfig {
     #[serde(deserialize_with = "deserialize_expandable_string")]
-    pub url: String,
+    pub(crate) url: String,
     /// Object storage class/tier for WAL writes.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         deserialize_with = "deserialize_optional_expandable_string"
     )]
-    pub storage_class: Option<String>,
+    pub(crate) storage_class: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub aws: Option<AwsConfig>,
+    aws: Option<AwsConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub azure: Option<AzureConfig>,
+    azure: Option<AzureConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub gcp: Option<GcsConfig>,
+    gcp: Option<GcsConfig>,
 }
 
 impl WalConfig {
-    pub fn cloud_provider_env_vars(&self) -> Vec<(String, String)> {
+    pub(crate) fn cloud_provider_env_vars(&self) -> Vec<(String, String)> {
         let mut env_vars = Vec::new();
         if let Some(aws) = &self.aws {
             for (k, v) in &aws.0 {
@@ -135,41 +135,41 @@ impl WalConfig {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct Settings {
-    pub cache: CacheConfig,
-    pub storage: StorageConfig,
-    pub servers: ServerConfig,
+    pub(crate) cache: CacheConfig,
+    pub(crate) storage: StorageConfig,
+    pub(crate) servers: ServerConfig,
     /// Process-level resource limits used when container namespaces hide the
     /// parent cgroup envelope.
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub runtime: Option<RuntimeConfig>,
+    runtime: Option<RuntimeConfig>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub filesystem: Option<FilesystemConfig>,
+    pub(crate) filesystem: Option<FilesystemConfig>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub lsm: Option<LsmConfig>,
+    pub(crate) lsm: Option<LsmConfig>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub gc: Option<GcConfig>,
+    pub(crate) gc: Option<GcConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub aws: Option<AwsConfig>,
+    pub(crate) aws: Option<AwsConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub azure: Option<AzureConfig>,
+    azure: Option<AzureConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub gcp: Option<GcsConfig>,
+    gcp: Option<GcsConfig>,
     /// Strict SSH transport settings used only when `[storage].url` is SFTP.
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub sftp: Option<SftpConfig>,
+    pub(crate) sftp: Option<SftpConfig>,
     /// Optional local RAM/SSD dirty-data tier in front of the remote store.
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub writeback: Option<crate::writeback::config::WritebackConfig>,
+    pub(crate) writeback: Option<crate::writeback::config::WritebackConfig>,
     /// Location of a pre-2.0 volume's separate WAL store.
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub wal: Option<WalConfig>,
+    pub(crate) wal: Option<WalConfig>,
     #[serde(skip_serializing_if = "Option::is_none", default = "default_telemetry")]
-    pub telemetry: Option<TelemetryConfig>,
+    pub(crate) telemetry: Option<TelemetryConfig>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub prometheus: Option<PrometheusConfig>,
+    pub(crate) prometheus: Option<PrometheusConfig>,
     /// HA replication. Absent means single-node (non-replicated behavior).
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub replication: Option<ReplicationConfig>,
+    pub(crate) replication: Option<ReplicationConfig>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
@@ -179,7 +179,7 @@ pub struct RuntimeConfig {
     /// Use this when a container namespace hides the dedicated service limit.
     /// A shared parent cgroup is only a ceiling and cannot supply this budget.
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub memory_limit_gb: Option<f64>,
+    memory_limit_gb: Option<f64>,
 }
 
 /// In-process SSH implementation used for SFTP sessions.
@@ -204,34 +204,34 @@ pub struct SftpConfig {
         default = "default_sftp_identity_file",
         deserialize_with = "deserialize_expandable_path"
     )]
-    pub identity_file: PathBuf,
+    pub(crate) identity_file: PathBuf,
     /// OpenSSH known-hosts file used for strict server identity verification.
     #[serde(
         default = "default_sftp_known_hosts",
         deserialize_with = "deserialize_expandable_path"
     )]
-    pub known_hosts: PathBuf,
+    pub(crate) known_hosts: PathBuf,
     /// Shared connection budget for the whole account, leaving provider headroom.
     #[serde(default = "default_sftp_max_connections")]
-    pub max_connections: usize,
+    pub(crate) max_connections: usize,
     /// Maximum read concurrency within the shared connection budget.
     #[serde(default = "default_sftp_direction_concurrency")]
-    pub read_concurrency: usize,
+    pub(crate) read_concurrency: usize,
     /// Maximum write concurrency within the shared connection budget.
     #[serde(default = "default_sftp_direction_concurrency")]
-    pub write_concurrency: usize,
+    pub(crate) write_concurrency: usize,
     /// Packed segment size. Smaller segments let SFTP publish independent files
     /// concurrently instead of contending on disjoint writes to one large file.
     #[serde(default = "default_sftp_segment_size_mib")]
-    pub segment_size_mib: usize,
+    pub(crate) segment_size_mib: usize,
     /// Aligned SSD/RAM cache part used for cold segment reads. A larger part
     /// amortizes SFTP open/stat/header latency while the adaptive prefetcher
     /// still bounds random-read amplification.
     #[serde(default = "default_sftp_read_cache_part_size_kib")]
-    pub read_cache_part_size_kib: usize,
+    pub(crate) read_cache_part_size_kib: usize,
     /// SSH implementation that carries SFTP. Only native `russh` is supported.
     #[serde(default, skip_serializing_if = "SftpSshTransport::is_russh")]
-    pub transport: SftpSshTransport,
+    pub(crate) transport: SftpSshTransport,
 }
 
 impl fmt::Debug for SftpConfig {
@@ -252,11 +252,11 @@ impl fmt::Debug for SftpConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SftpDataProfile {
-    pub segment_size_bytes: usize,
-    pub max_inflight_seals: usize,
-    pub read_cache_part_size_bytes: usize,
-    pub read_fetch_window_min_bytes: usize,
-    pub read_fetch_window_max_bytes: usize,
+    segment_size_bytes: usize,
+    max_inflight_seals: usize,
+    read_cache_part_size_bytes: usize,
+    read_fetch_window_min_bytes: usize,
+    read_fetch_window_max_bytes: usize,
 }
 
 /// Data-plane tuning for the configured storage backend, resolved once at
@@ -307,11 +307,11 @@ impl Default for SftpConfig {
 }
 
 impl SftpConfig {
-    pub const MAX_ACCOUNT_CONNECTIONS: usize = 8;
+    const MAX_ACCOUNT_CONNECTIONS: usize = 8;
     // Operations multiplex onto pooled connections, so per-direction
     // concurrency may exceed max_connections; the transport still caps how
     // many operations share one connection.
-    pub const MAX_DIRECTION_CONCURRENCY: usize = 64;
+    const MAX_DIRECTION_CONCURRENCY: usize = 64;
 
     fn validate(&self) -> Result<()> {
         if self.identity_file.to_string_lossy().trim().is_empty() {
@@ -362,7 +362,7 @@ impl SftpConfig {
         Ok(())
     }
 
-    pub fn data_profile(&self) -> SftpDataProfile {
+    fn data_profile(&self) -> SftpDataProfile {
         SftpDataProfile {
             segment_size_bytes: self.segment_size_mib * 1024 * 1024,
             // Each in-flight seal buffers a full segment; cap the coupling to
@@ -406,9 +406,9 @@ const fn default_sftp_read_cache_part_size_kib() -> usize {
 /// Parsed endpoint information for transport setup.
 #[derive(Clone, PartialEq, Eq)]
 pub struct SftpEndpoint {
-    pub host: String,
-    pub port: u16,
-    pub username: String,
+    pub(crate) host: String,
+    pub(crate) port: u16,
+    pub(crate) username: String,
 }
 
 impl fmt::Debug for SftpEndpoint {
@@ -466,27 +466,27 @@ impl<'de> Deserialize<'de> for ReplicationRole {
 pub struct ReplicationConfig {
     /// This node's stable identity within the pair.
     #[serde(deserialize_with = "deserialize_expandable_string")]
-    pub node_id: String,
+    pub(crate) node_id: String,
     /// Role: "leader" or "standby".
-    pub role: ReplicationRole,
+    pub(crate) role: ReplicationRole,
     /// Peer replication endpoint. Required with `replication_listen`.
     #[serde(default, deserialize_with = "deserialize_expandable_string_vec")]
-    pub peers: Vec<String>,
+    pub(crate) peers: Vec<String>,
     /// Local endpoint for replication, heartbeats, and role election.
     #[serde(
         skip_serializing_if = "Option::is_none",
         deserialize_with = "deserialize_optional_expandable_string",
         default
     )]
-    pub replication_listen: Option<String>,
+    pub(crate) replication_listen: Option<String>,
     /// One-startup authorization to replace durable HA ownership.
     /// All former participants must be stopped before this is enabled.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub force_recovery: bool,
+    pub(crate) force_recovery: bool,
 }
 
 impl ReplicationConfig {
-    pub fn validate(&self) -> Result<()> {
+    fn validate(&self) -> Result<()> {
         if self.node_id.trim().is_empty() {
             anyhow::bail!("[replication] node_id must not be empty");
         }
@@ -593,21 +593,21 @@ pub enum WarmMetadata {
 #[serde(deny_unknown_fields)]
 pub struct CacheConfig {
     #[serde(deserialize_with = "deserialize_expandable_path")]
-    pub dir: PathBuf,
-    pub disk_size_gb: f64,
+    pub(crate) dir: PathBuf,
+    pub(crate) disk_size_gb: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub memory_size_gb: Option<f64>,
+    pub(crate) memory_size_gb: Option<f64>,
     #[serde(default)]
-    pub warm_metadata: WarmMetadata,
+    pub(crate) warm_metadata: WarmMetadata,
 }
 
 #[derive(Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct StorageConfig {
     #[serde(deserialize_with = "deserialize_expandable_string")]
-    pub url: String,
+    pub(crate) url: String,
     #[serde(deserialize_with = "deserialize_expandable_string")]
-    pub encryption_password: String,
+    pub(crate) encryption_password: String,
     /// Object storage class/tier for data writes, passed through verbatim as the
     /// per-backend tiering header.
     #[serde(
@@ -615,7 +615,7 @@ pub struct StorageConfig {
         skip_serializing_if = "Option::is_none",
         deserialize_with = "deserialize_optional_expandable_string"
     )]
-    pub storage_class: Option<String>,
+    pub(crate) storage_class: Option<String>,
 }
 
 impl fmt::Debug for StorageConfig {
@@ -711,35 +711,35 @@ fn backend_capabilities(url: &str) -> BackendCapabilities {
 #[serde(deny_unknown_fields)]
 pub struct FilesystemConfig {
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub max_size_gb: Option<f64>,
+    max_size_gb: Option<f64>,
     /// Compression algorithm for extent data: "zstd-{level}" (default: "zstd-3", level 1-22) or "lz4"
     #[serde(default)]
-    pub compression: CompressionConfig,
+    compression: CompressionConfig,
     /// Treat `fsync` as a no-op: a client fsync/COMMIT returns without forcing a
     /// flush to object storage. Intended for HA, where semi-sync replication
     /// already holds the write on the standby, making the per-fsync flush
     /// redundant. Trades object-store durability for latency: un-flushed writes are
     /// lost if both nodes (or a standalone node) die before a background flush.
     #[serde(default)]
-    pub ignore_fsync: bool,
+    pub(crate) ignore_fsync: bool,
     /// Point at which an ordinary write on any protocol is acknowledged.
     /// Omission selects `materialized`. `volatile_memory` is intentionally
     /// unsafe across process or power loss: explicit flush barriers remain
     /// the durability boundary. Supersedes the deprecated
     /// `[servers.nbd] write_ack_mode`.
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub(crate) write_ack_mode: Option<FilesystemWriteAckMode>,
+    write_ack_mode: Option<FilesystemWriteAckMode>,
     /// Global RAM ceiling for volatile writes, shared by every protocol.
     /// Required (finite, positive) when `write_ack_mode = "volatile_memory"`.
     #[serde(default)]
-    pub(crate) volatile_memory_gb: f64,
+    volatile_memory_gb: f64,
     /// In-flight volatile operation cap; omission selects the default.
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub(crate) volatile_max_operations: Option<usize>,
+    volatile_max_operations: Option<usize>,
 }
 
 impl FilesystemConfig {
-    pub fn max_bytes(&self) -> u64 {
+    fn max_bytes(&self) -> u64 {
         self.max_size_gb
             .filter(|&gb| gb.is_finite() && gb > 0.0)
             .map(|gb| (gb * 1_000_000_000.0) as u64)
@@ -752,13 +752,13 @@ impl FilesystemConfig {
 pub struct LsmConfig {
     /// Maximum number of SST files in level 0 before triggering compaction
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub l0_max_ssts: Option<usize>,
+    l0_max_ssts: Option<usize>,
     /// Maximum number of concurrent compactions
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub max_concurrent_compactions: Option<usize>,
+    max_concurrent_compactions: Option<usize>,
     /// Interval in seconds between periodic flushes
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub flush_interval_secs: Option<u64>,
+    flush_interval_secs: Option<u64>,
     /// When true, every committed write is durably flushed to object storage
     /// before returning success. Trades per-op latency for zero unflushed data
     /// in case of a crash. Expensive: the WAL is off, so each write forces a
@@ -770,15 +770,15 @@ pub struct LsmConfig {
     /// writes between fsync calls, making them durable on return rather than
     /// buffered until the next flush.
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub sync_writes: Option<bool>,
+    sync_writes: Option<bool>,
     /// Deprecated, ignored: the WAL is permanently off (sealing correctness
     /// requires it). Accepted so pre-2.0 configs still parse; never re-emitted.
     #[serde(default, skip_serializing)]
-    pub wal_enabled: Option<bool>,
+    wal_enabled: Option<bool>,
     /// Deprecated, ignored: unflushed-data budgeting went away with the WAL.
     /// Accepted so pre-2.0 configs still parse; never re-emitted.
     #[serde(default, skip_serializing)]
-    pub max_unflushed_gb: Option<f64>,
+    max_unflushed_gb: Option<f64>,
 }
 
 impl LsmConfig {
@@ -787,38 +787,38 @@ impl LsmConfig {
     /// or flushes stall on compaction. The SSTs are small, bloom-filtered
     /// metadata, so the point-lookup cost is negligible. Applies to
     /// `l0_max_ssts_per_key` too.
-    pub const DEFAULT_L0_MAX_SSTS: usize = 256;
+    pub(crate) const DEFAULT_L0_MAX_SSTS: usize = 256;
     /// Default max_concurrent_compactions
-    pub const DEFAULT_MAX_CONCURRENT_COMPACTIONS: usize = 2;
+    pub(crate) const DEFAULT_MAX_CONCURRENT_COMPACTIONS: usize = 2;
     /// Default flush_interval_sec
-    pub const DEFAULT_FLUSH_INTERVAL_SECS: u64 = 30;
+    pub(crate) const DEFAULT_FLUSH_INTERVAL_SECS: u64 = 30;
 
     /// Minimum l0_max_ssts to maintain reasonable performance
-    pub const MIN_L0_MAX_SSTS: usize = 4;
+    const MIN_L0_MAX_SSTS: usize = 4;
     /// Minimum max_concurrent_compactions: 1
-    pub const MIN_MAX_CONCURRENT_COMPACTIONS: usize = 1;
+    const MIN_MAX_CONCURRENT_COMPACTIONS: usize = 1;
     /// Minimum flush_interval_secs: 5 seconds
-    pub const MIN_FLUSH_INTERVAL_SECS: u64 = 5;
+    const MIN_FLUSH_INTERVAL_SECS: u64 = 5;
 
-    pub fn l0_max_ssts(&self) -> usize {
+    pub(crate) fn l0_max_ssts(&self) -> usize {
         self.l0_max_ssts
             .unwrap_or(Self::DEFAULT_L0_MAX_SSTS)
             .max(Self::MIN_L0_MAX_SSTS)
     }
 
-    pub fn max_concurrent_compactions(&self) -> usize {
+    pub(crate) fn max_concurrent_compactions(&self) -> usize {
         self.max_concurrent_compactions
             .unwrap_or(Self::DEFAULT_MAX_CONCURRENT_COMPACTIONS)
             .max(Self::MIN_MAX_CONCURRENT_COMPACTIONS)
     }
 
-    pub fn flush_interval_secs(&self) -> u64 {
+    pub(crate) fn flush_interval_secs(&self) -> u64 {
         self.flush_interval_secs
             .unwrap_or(Self::DEFAULT_FLUSH_INTERVAL_SECS)
             .max(Self::MIN_FLUSH_INTERVAL_SECS)
     }
 
-    pub fn sync_writes(&self) -> bool {
+    pub(crate) fn sync_writes(&self) -> bool {
         self.sync_writes.unwrap_or(false)
     }
 }
@@ -831,7 +831,7 @@ pub struct GcConfig {
     /// below the ~30 s flush cadence make a busy pass's barrier seal real
     /// sub-1-MiB segments — each itself future GC work.
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub interval_secs: Option<u64>,
+    interval_secs: Option<u64>,
     /// Seconds between passes while a saturated backlog meets an idle store
     /// (no reads, no writes since the previous pass). A fast pass performs a
     /// full reclamation round plus roughly two small bookkeeping PUTs of
@@ -840,11 +840,11 @@ pub struct GcConfig {
     /// interval_secs disables the idle acceleration tier only; the
     /// busy-backlog drain tier is independent.
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub idle_interval_secs: Option<u64>,
+    idle_interval_secs: Option<u64>,
     /// Whether reads steer compaction (nominations, seam heat, chain repacks).
     /// The counter-driven policy and the tail scrub are unaffected.
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub read_directed: Option<bool>,
+    read_directed: Option<bool>,
     /// Tail-scrub floor: a write-cold segment more than this percent dead —
     /// but not dead enough for normal compaction candidacy — is repacked with
     /// leftover pass budget. The space-amplification dial: worst-case overhead
@@ -852,23 +852,23 @@ pub struct GcConfig {
     /// (100 - floor)/floor bytes rewritten per byte reclaimed. 0 disables the
     /// scrub; 50 empties the band, same effect.
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub tail_scrub_min_dead_percent: Option<u64>,
+    tail_scrub_min_dead_percent: Option<u64>,
     /// Compaction batches a pass runs before it yields to foreground load:
     /// below the floor it drains regardless of client activity, above it a
     /// client op ends the pass. Idle stores always drain to the internal
     /// per-pass cap. 1 restores the historical single-batch busy pass.
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub min_batches_per_pass: Option<usize>,
+    min_batches_per_pass: Option<usize>,
     /// Pass interval while the store is active but its dead backlog is large
     /// (dead space >= busy_backlog_dead_percent). Clamped to
     /// [MIN_INTERVAL_SECS, interval_secs], so a loaded store keeps draining
     /// without waiting the full base interval. >= interval_secs disables the tier.
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub busy_backlog_interval_secs: Option<u64>,
+    busy_backlog_interval_secs: Option<u64>,
     /// Store dead-space percent at or above which busy_backlog_interval_secs
     /// applies. Below it a busy store uses interval_secs.
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub busy_backlog_dead_percent: Option<u64>,
+    busy_backlog_dead_percent: Option<u64>,
     /// Per-round compaction budget in MiB: the live-byte selection cap, the
     /// heat reserve (half), and the stored-byte gather cap. Raising it packs
     /// hot seams whose cheapest pair exceeds half the default round (the
@@ -876,62 +876,62 @@ pub struct GcConfig {
     /// ~this much peak gather RAM per batch (more when the leading seam
     /// chain alone exceeds it, gathered whole). Default 256.
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub compact_round_max_mib: Option<u64>,
+    compact_round_max_mib: Option<u64>,
 }
 
 impl GcConfig {
     /// Default interval_secs: 60 seconds, the historical fixed cadence.
-    pub const DEFAULT_INTERVAL_SECS: u64 = 60;
+    const DEFAULT_INTERVAL_SECS: u64 = 60;
     /// Default idle_interval_secs: 5 seconds (~12x drain while idle).
-    pub const DEFAULT_IDLE_INTERVAL_SECS: u64 = 5;
+    const DEFAULT_IDLE_INTERVAL_SECS: u64 = 5;
     /// Default read_directed: true.
-    pub const DEFAULT_READ_DIRECTED: bool = true;
+    const DEFAULT_READ_DIRECTED: bool = true;
     /// Default tail_scrub_min_dead_percent: 5 (1.053x worst-case space
     /// amplification at up to 19x rewrite per reclaimed byte; the request-cost
     /// break-even on S3 is near 1.5%, so 5 is the write-amplification choice).
     pub const DEFAULT_TAIL_SCRUB_MIN_DEAD_PERCENT: u64 = 5;
     /// Default min_batches_per_pass: 4 (~4x the single-batch reclaim rate under
     /// load; 1 restores single-batch passes).
-    pub const DEFAULT_MIN_BATCHES_PER_PASS: usize = 4;
+    const DEFAULT_MIN_BATCHES_PER_PASS: usize = 4;
     /// Default busy_backlog_interval_secs: 15 (a loaded, dirty store drains
     /// ~4x more often than the base interval).
-    pub const DEFAULT_BUSY_BACKLOG_INTERVAL_SECS: u64 = 15;
+    const DEFAULT_BUSY_BACKLOG_INTERVAL_SECS: u64 = 15;
     /// Default busy_backlog_dead_percent: 20.
-    pub const DEFAULT_BUSY_BACKLOG_DEAD_PERCENT: u64 = 20;
+    const DEFAULT_BUSY_BACKLOG_DEAD_PERCENT: u64 = 20;
     /// Default compact_round_max_mib: 256 (the historical fixed round budget).
-    pub const DEFAULT_COMPACT_ROUND_MAX_MIB: u64 = 256;
+    const DEFAULT_COMPACT_ROUND_MAX_MIB: u64 = 256;
     /// Min compact_round_max_mib: below the pack target a round can't hold one
     /// output segment.
-    pub const MIN_COMPACT_ROUND_MAX_MIB: u64 = 64;
+    const MIN_COMPACT_ROUND_MAX_MIB: u64 = 64;
     /// Max compact_round_max_mib: a hard ceiling on per-batch gather RAM.
-    pub const MAX_COMPACT_ROUND_MAX_MIB: u64 = 4096;
+    const MAX_COMPACT_ROUND_MAX_MIB: u64 = 4096;
 
     /// Minimum interval_secs: each pass runs a flush barrier, so the LSM
     /// flush floor applies.
-    pub const MIN_INTERVAL_SECS: u64 = LsmConfig::MIN_FLUSH_INTERVAL_SECS;
+    pub(crate) const MIN_INTERVAL_SECS: u64 = LsmConfig::MIN_FLUSH_INTERVAL_SECS;
     /// Minimum idle_interval_secs: below ~1 s the pass's barrier round-trips
     /// stop amortizing.
-    pub const MIN_IDLE_INTERVAL_SECS: u64 = 1;
+    const MIN_IDLE_INTERVAL_SECS: u64 = 1;
 
-    pub fn interval_secs(&self) -> u64 {
+    pub(crate) fn interval_secs(&self) -> u64 {
         self.interval_secs
             .unwrap_or(Self::DEFAULT_INTERVAL_SECS)
             .max(Self::MIN_INTERVAL_SECS)
     }
 
-    pub fn idle_interval_secs(&self) -> u64 {
+    pub(crate) fn idle_interval_secs(&self) -> u64 {
         self.idle_interval_secs
             .unwrap_or(Self::DEFAULT_IDLE_INTERVAL_SECS)
             .max(Self::MIN_IDLE_INTERVAL_SECS)
             .min(self.interval_secs())
     }
 
-    pub fn read_directed(&self) -> bool {
+    pub(crate) fn read_directed(&self) -> bool {
         self.read_directed.unwrap_or(Self::DEFAULT_READ_DIRECTED)
     }
 
     /// `None` = scrub disabled (configured 0).
-    pub fn tail_scrub_min_dead_percent(&self) -> Option<u64> {
+    pub(crate) fn tail_scrub_min_dead_percent(&self) -> Option<u64> {
         match self.tail_scrub_min_dead_percent {
             Some(0) => None,
             v => Some(
@@ -941,7 +941,7 @@ impl GcConfig {
         }
     }
 
-    pub fn min_batches_per_pass(&self) -> usize {
+    pub(crate) fn min_batches_per_pass(&self) -> usize {
         self.min_batches_per_pass
             .unwrap_or(Self::DEFAULT_MIN_BATCHES_PER_PASS)
             .max(1)
@@ -949,21 +949,21 @@ impl GcConfig {
 
     /// Clamped to [MIN_INTERVAL_SECS, interval_secs]; equal to interval_secs
     /// disables the busy-backlog tier.
-    pub fn busy_backlog_interval_secs(&self) -> u64 {
+    pub(crate) fn busy_backlog_interval_secs(&self) -> u64 {
         self.busy_backlog_interval_secs
             .unwrap_or(Self::DEFAULT_BUSY_BACKLOG_INTERVAL_SECS)
             .max(Self::MIN_INTERVAL_SECS)
             .min(self.interval_secs())
     }
 
-    pub fn busy_backlog_dead_percent(&self) -> u64 {
+    pub(crate) fn busy_backlog_dead_percent(&self) -> u64 {
         self.busy_backlog_dead_percent
             .unwrap_or(Self::DEFAULT_BUSY_BACKLOG_DEAD_PERCENT)
             .min(100)
     }
 
     /// Per-round compaction budget in bytes (MiB config, clamped).
-    pub fn compact_round_bytes(&self) -> u64 {
+    pub(crate) fn compact_round_bytes(&self) -> u64 {
         self.compact_round_max_mib
             .unwrap_or(Self::DEFAULT_COMPACT_ROUND_MAX_MIB)
             .clamp(
@@ -978,15 +978,15 @@ impl GcConfig {
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub nfs: Option<NfsConfig>,
+    pub(crate) nfs: Option<NfsConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub ninep: Option<NinePConfig>,
+    pub(crate) ninep: Option<NinePConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub nbd: Option<NbdConfig>,
+    pub(crate) nbd: Option<NbdConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub rpc: Option<RpcConfig>,
+    pub(crate) rpc: Option<RpcConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub webui: Option<WebUIConfig>,
+    pub(crate) webui: Option<WebUIConfig>,
 }
 
 impl ServerConfig {
@@ -1046,7 +1046,7 @@ impl ServerConfig {
     }
 
     /// Require at least one endpoint that the current build can serve.
-    pub fn require_listener_endpoint(&self) -> Result<()> {
+    pub(crate) fn require_listener_endpoint(&self) -> Result<()> {
         if !self.has_listener_endpoint() {
             anyhow::bail!(
                 "[servers] must configure at least one listener endpoint (address or unix_socket)"
@@ -1063,9 +1063,9 @@ pub struct WebUIConfig {
         default = "default_webui_addresses",
         deserialize_with = "deserialize_expandable_socket_addrs"
     )]
-    pub addresses: HashSet<SocketAddr>,
-    pub uid: u32,
-    pub gid: u32,
+    pub(crate) addresses: HashSet<SocketAddr>,
+    pub(crate) uid: u32,
+    pub(crate) gid: u32,
 }
 
 fn default_webui_addresses() -> HashSet<SocketAddr> {
@@ -1085,17 +1085,17 @@ pub struct NfsConfig {
         deserialize_with = "deserialize_optional_expandable_socket_addrs",
         default
     )]
-    pub addresses: Option<HashSet<SocketAddr>>,
+    pub(crate) addresses: Option<HashSet<SocketAddr>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub shared_identity: Option<NfsSharedIdentity>,
+    pub(crate) shared_identity: Option<NfsSharedIdentity>,
 }
 
 /// Optional all-client identity for an NFS export.
 #[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct NfsSharedIdentity {
-    pub uid: u32,
-    pub gid: u32,
+    pub(crate) uid: u32,
+    pub(crate) gid: u32,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -1106,16 +1106,16 @@ pub struct NinePConfig {
         deserialize_with = "deserialize_optional_expandable_socket_addrs",
         default
     )]
-    pub addresses: Option<HashSet<SocketAddr>>,
+    pub(crate) addresses: Option<HashSet<SocketAddr>>,
     #[serde(
         skip_serializing_if = "Option::is_none",
         deserialize_with = "deserialize_optional_expandable_path",
         default
     )]
-    pub unix_socket: Option<PathBuf>,
+    pub(crate) unix_socket: Option<PathBuf>,
     /// Optional all-client identity for a shared writable namespace.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub shared_identity: Option<NfsSharedIdentity>,
+    pub(crate) shared_identity: Option<NfsSharedIdentity>,
 }
 
 /// Shared endpoint check for the server configs that expose an optional
@@ -1142,22 +1142,22 @@ pub struct NbdConfig {
         deserialize_with = "deserialize_optional_expandable_socket_addrs",
         default
     )]
-    pub addresses: Option<HashSet<SocketAddr>>,
+    pub(crate) addresses: Option<HashSet<SocketAddr>>,
     #[serde(
         skip_serializing_if = "Option::is_none",
         deserialize_with = "deserialize_optional_expandable_path",
         default
     )]
-    pub unix_socket: Option<PathBuf>,
+    pub(crate) unix_socket: Option<PathBuf>,
     /// Point at which an ordinary NBD WRITE is acknowledged.
     ///
     /// `volatile_memory` is intentionally unsafe across process or power loss:
     /// FLUSH/FUA remain the durability boundary.
     #[serde(default)]
-    pub write_ack_mode: NbdWriteAckMode,
+    pub(crate) write_ack_mode: NbdWriteAckMode,
     /// Global RAM ceiling for volatile NBD writes, shared by every export.
     #[serde(default)]
-    pub volatile_memory_gb: f64,
+    pub(crate) volatile_memory_gb: f64,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Copy, Default, PartialEq, Eq)]
@@ -1194,7 +1194,7 @@ impl NbdConfig {
         }
     }
 
-    pub fn volatile_memory_bytes(&self) -> Result<u64> {
+    pub(crate) fn volatile_memory_bytes(&self) -> Result<u64> {
         self.validate()?;
         if self.write_ack_mode == NbdWriteAckMode::Materialized {
             return Ok(0);
@@ -1215,13 +1215,13 @@ pub struct RpcConfig {
         deserialize_with = "deserialize_optional_expandable_socket_addrs",
         default
     )]
-    pub addresses: Option<HashSet<SocketAddr>>,
+    pub(crate) addresses: Option<HashSet<SocketAddr>>,
     #[serde(
         skip_serializing_if = "Option::is_none",
         deserialize_with = "deserialize_optional_expandable_path",
         default
     )]
-    pub unix_socket: Option<PathBuf>,
+    pub(crate) unix_socket: Option<PathBuf>,
 }
 
 impl RpcConfig {
@@ -1234,7 +1234,7 @@ impl RpcConfig {
 #[serde(deny_unknown_fields)]
 pub struct TelemetryConfig {
     #[serde(default = "default_true")]
-    pub enabled: bool,
+    pub(crate) enabled: bool,
 }
 
 fn default_true() -> bool {
@@ -1252,9 +1252,9 @@ pub struct PrometheusConfig {
         default = "default_prometheus_addresses",
         deserialize_with = "deserialize_expandable_socket_addrs"
     )]
-    pub addresses: HashSet<SocketAddr>,
+    pub(crate) addresses: HashSet<SocketAddr>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub benchmark_authority: Option<BenchmarkAuthorityConfig>,
+    pub(crate) benchmark_authority: Option<BenchmarkAuthorityConfig>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
@@ -1267,13 +1267,13 @@ pub enum BenchmarkAdapter {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct BenchmarkAuthorityConfig {
-    pub adapter: BenchmarkAdapter,
+    pub(crate) adapter: BenchmarkAdapter,
     #[serde(deserialize_with = "deserialize_expandable_string")]
-    pub export_id: String,
+    pub(crate) export_id: String,
     #[serde(deserialize_with = "deserialize_expandable_path")]
-    pub tls_certificate: PathBuf,
+    pub(crate) tls_certificate: PathBuf,
     #[serde(deserialize_with = "deserialize_expandable_path")]
-    pub tls_private_key: PathBuf,
+    pub(crate) tls_private_key: PathBuf,
 }
 
 impl BenchmarkAuthorityConfig {
@@ -1381,7 +1381,7 @@ impl BenchmarkAuthorityConfig {
 }
 
 #[derive(Debug, Serialize, Clone)]
-pub struct AwsConfig(pub std::collections::HashMap<String, String>);
+pub struct AwsConfig(std::collections::HashMap<String, String>);
 
 impl<'de> Deserialize<'de> for AwsConfig {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -1393,7 +1393,7 @@ impl<'de> Deserialize<'de> for AwsConfig {
 }
 
 #[derive(Debug, Serialize, Clone)]
-pub struct AzureConfig(pub std::collections::HashMap<String, String>);
+pub struct AzureConfig(std::collections::HashMap<String, String>);
 
 impl<'de> Deserialize<'de> for AzureConfig {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -1405,7 +1405,7 @@ impl<'de> Deserialize<'de> for AzureConfig {
 }
 
 #[derive(Debug, Serialize, Clone)]
-pub struct GcsConfig(pub std::collections::HashMap<String, String>);
+pub struct GcsConfig(std::collections::HashMap<String, String>);
 
 impl<'de> Deserialize<'de> for GcsConfig {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -1601,21 +1601,21 @@ where
 }
 
 impl Settings {
-    pub fn max_bytes(&self) -> u64 {
+    pub(crate) fn max_bytes(&self) -> u64 {
         self.filesystem
             .as_ref()
             .map(|fs| fs.max_bytes())
             .unwrap_or(u64::MAX)
     }
 
-    pub fn compression(&self) -> CompressionConfig {
+    pub(crate) fn compression(&self) -> CompressionConfig {
         self.filesystem
             .as_ref()
             .map(|fs| fs.compression)
             .unwrap_or_default()
     }
 
-    pub fn runtime_memory_limit_bytes(&self) -> Result<Option<u64>> {
+    pub(crate) fn runtime_memory_limit_bytes(&self) -> Result<Option<u64>> {
         let Some(value) = self
             .runtime
             .as_ref()
@@ -1633,7 +1633,7 @@ impl Settings {
         Ok(Some(bytes.round() as u64))
     }
 
-    pub fn from_file(config_path: impl AsRef<std::path::Path>) -> Result<Self> {
+    pub(crate) fn from_file(config_path: impl AsRef<std::path::Path>) -> Result<Self> {
         let path = config_path.as_ref();
         let content = fs::read_to_string(path)
             .with_context(|| format!("Failed to read config file: {}", path.display()))?;
@@ -1651,7 +1651,7 @@ impl Settings {
     }
 
     /// Cross-section validation applied after deserialization.
-    pub fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         self.servers.validate()?;
         self.runtime_memory_limit_bytes()?;
         if let Some(prometheus) = &self.prometheus
@@ -1756,7 +1756,7 @@ impl Settings {
         Ok(())
     }
 
-    pub fn writeback_settings(
+    pub(crate) fn writeback_settings(
         &self,
         access_mode: crate::writeback::config::WritebackAccessMode,
     ) -> Result<Option<crate::writeback::config::WritebackSettings>> {
@@ -1830,7 +1830,7 @@ impl Settings {
 
     /// Data-plane tuning for the configured backend. SFTP publishes its own
     /// profile; every other backend runs on the defaults.
-    pub fn store_profile(&self) -> Result<StoreProfile> {
+    pub(crate) fn store_profile(&self) -> Result<StoreProfile> {
         Ok(match self.sftp_endpoint()? {
             // `from_file` fills `[sftp]` whenever the URL is SFTP; fall back to
             // the same defaults `validate` uses so a Settings built in code
@@ -1841,7 +1841,7 @@ impl Settings {
     }
 
     /// Return normalized SFTP endpoint data without retaining URL credentials.
-    pub fn sftp_endpoint(&self) -> Result<Option<SftpEndpoint>> {
+    pub(crate) fn sftp_endpoint(&self) -> Result<Option<SftpEndpoint>> {
         if !has_sftp_scheme(&self.storage.url) {
             return Ok(None);
         }
@@ -1868,7 +1868,7 @@ impl Settings {
         }))
     }
 
-    pub fn cloud_provider_env_vars(&self) -> Vec<(String, String)> {
+    pub(crate) fn cloud_provider_env_vars(&self) -> Vec<(String, String)> {
         let mut env_vars = Vec::new();
         if let Some(aws) = &self.aws {
             for (k, v) in &aws.0 {
@@ -1888,7 +1888,7 @@ impl Settings {
         env_vars
     }
 
-    pub fn generate_default() -> Self {
+    pub(crate) fn generate_default() -> Self {
         let mut aws_config = std::collections::HashMap::new();
         aws_config.insert(
             "access_key_id".to_string(),
@@ -1953,7 +1953,7 @@ impl Settings {
         }
     }
 
-    pub fn render_default_config() -> Result<String> {
+    pub(crate) fn render_default_config() -> Result<String> {
         let default = Self::generate_default();
         let mut toml_string = toml::to_string_pretty(&default)?;
 
@@ -2208,7 +2208,7 @@ impl Settings {
         Ok(commented)
     }
 
-    pub fn write_default_config(path: impl AsRef<std::path::Path>) -> Result<()> {
+    pub(crate) fn write_default_config(path: impl AsRef<std::path::Path>) -> Result<()> {
         fs::write(path, Self::render_default_config()?)?;
         Ok(())
     }

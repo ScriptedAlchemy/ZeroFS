@@ -14,13 +14,13 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
-pub use crate::russh_session::{
+pub(crate) use crate::russh_session::{
     RUSSH_MAXIMUM_PACKET_SIZE, RUSSH_SFTP_MAX_CONCURRENT_WRITES, RUSSH_WINDOW_SIZE,
     RusshSessionFactory,
 };
 
 #[cfg(test)]
-pub use crate::russh_session::OpenSshTransportSession;
+pub(crate) use crate::russh_session::OpenSshTransportSession;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OperationKind {
@@ -180,16 +180,16 @@ pub enum RemoteEntryKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteDirectoryEntry {
-    pub filename: PathBuf,
-    pub kind: RemoteEntryKind,
+    pub(crate) filename: PathBuf,
+    pub(crate) kind: RemoteEntryKind,
 }
 
 #[derive(Debug, Clone)]
 pub struct RemoteObjectRead {
-    pub header: ObjectHeader,
-    pub modified: SystemTime,
-    pub range: Range<u64>,
-    pub payload: Bytes,
+    pub(crate) header: ObjectHeader,
+    pub(crate) modified: SystemTime,
+    pub(crate) range: Range<u64>,
+    pub(crate) payload: Bytes,
 }
 
 #[async_trait]
@@ -1015,7 +1015,7 @@ impl SftpSessionPool {
         ));
     }
 
-    pub async fn from_config_writable(
+    pub(crate) async fn from_config_writable(
         factory: Arc<dyn SessionFactory>,
         config: &crate::config::SftpConfig,
     ) -> Result<Self, TransportError> {
@@ -1040,7 +1040,7 @@ impl SftpSessionPool {
         Ok(pool)
     }
 
-    pub async fn new_writable(
+    pub(crate) async fn new_writable(
         factory: Arc<dyn SessionFactory>,
         shared: usize,
         reads: usize,
@@ -1143,7 +1143,10 @@ impl SftpSessionPool {
         Ok(())
     }
 
-    pub async fn checkout(&self, kind: OperationKind) -> Result<SessionLease, TransportError> {
+    pub(crate) async fn checkout(
+        &self,
+        kind: OperationKind,
+    ) -> Result<SessionLease, TransportError> {
         let admission = self.inner.admission.acquire(kind).await?;
         let activity = self.inner.register_activity()?;
 
@@ -1157,11 +1160,11 @@ impl SftpSessionPool {
         })
     }
 
-    pub fn begin_shutdown(&self) {
+    pub(crate) fn begin_shutdown(&self) {
         self.inner.fail_closed();
     }
 
-    pub async fn shutdown(&self) -> Result<(), TransportError> {
+    pub(crate) async fn shutdown(&self) -> Result<(), TransportError> {
         let deadline = Instant::now() + SFTP_POOL_SHUTDOWN_TIMEOUT;
         let _shutdown = tokio::time::timeout_at(deadline, self.inner.shutdown_lock.lock())
             .await
@@ -1550,7 +1553,7 @@ impl SessionLease {
             .as_ref()
     }
 
-    pub async fn read_object(
+    pub(crate) async fn read_object(
         &mut self,
         path: &std::path::Path,
         range: Option<object_store::GetRange>,
@@ -1559,18 +1562,25 @@ impl SessionLease {
         self.transport().read_object(path, range, head).await
     }
 
-    pub async fn list_directory(
+    pub(crate) async fn list_directory(
         &mut self,
         path: &std::path::Path,
     ) -> Result<Vec<RemoteDirectoryEntry>, TransportError> {
         self.transport().list_directory(path).await
     }
 
-    pub async fn remove_file(&mut self, path: &std::path::Path) -> Result<(), TransportError> {
+    pub(crate) async fn remove_file(
+        &mut self,
+        path: &std::path::Path,
+    ) -> Result<(), TransportError> {
         self.transport().remove_file(path).await
     }
 
-    pub async fn remove_directory(&mut self, path: &std::path::Path) -> Result<(), TransportError> {
+    #[cfg(test)] // only used by the cfg(test) sftp_bench cleanup path
+    pub(crate) async fn remove_directory(
+        &mut self,
+        path: &std::path::Path,
+    ) -> Result<(), TransportError> {
         self.transport().remove_directory(path).await
     }
 
@@ -1581,7 +1591,7 @@ impl SessionLease {
         self.transport().ensure_directory_component(path).await
     }
 
-    pub async fn write_file_durable(
+    pub(crate) async fn write_file_durable(
         &mut self,
         path: &std::path::Path,
         chunks: Vec<Bytes>,
@@ -1589,7 +1599,7 @@ impl SessionLease {
         self.transport().write_file_durable(path, chunks).await
     }
 
-    pub async fn write_file_at_durable(
+    pub(crate) async fn write_file_at_durable(
         &mut self,
         path: &std::path::Path,
         offset: u64,
@@ -1600,7 +1610,7 @@ impl SessionLease {
             .await
     }
 
-    pub async fn write_file_at(
+    pub(crate) async fn write_file_at(
         &mut self,
         path: &std::path::Path,
         offset: u64,
@@ -1609,7 +1619,7 @@ impl SessionLease {
         self.transport().write_file_at(path, offset, chunks).await
     }
 
-    pub async fn read_exact(
+    pub(crate) async fn read_exact(
         &mut self,
         path: &std::path::Path,
         offset: u64,
@@ -1618,7 +1628,7 @@ impl SessionLease {
         self.transport().read_exact(path, offset, len).await
     }
 
-    pub async fn hard_link(
+    pub(crate) async fn hard_link(
         &mut self,
         from: &std::path::Path,
         to: &std::path::Path,
@@ -1626,7 +1636,7 @@ impl SessionLease {
         self.transport().hard_link(from, to).await
     }
 
-    pub async fn posix_rename(
+    pub(crate) async fn posix_rename(
         &mut self,
         from: &std::path::Path,
         to: &std::path::Path,
@@ -1634,7 +1644,7 @@ impl SessionLease {
         self.transport().posix_rename(from, to).await
     }
 
-    pub async fn complete(mut self) -> Result<(), TransportError> {
+    pub(crate) async fn complete(mut self) -> Result<(), TransportError> {
         let session = self
             .session
             .take()
@@ -1645,7 +1655,7 @@ impl SessionLease {
         Ok(())
     }
 
-    pub async fn retire(mut self) -> Result<(), TransportError> {
+    pub(crate) async fn retire(mut self) -> Result<(), TransportError> {
         let session = self
             .session
             .take()
@@ -1679,7 +1689,7 @@ impl SessionLease {
     }
 
     #[cfg(test)]
-    pub async fn finish<T, E>(
+    async fn finish<T, E>(
         self,
         operation: Result<T, E>,
         error_disposition: SessionDisposition,

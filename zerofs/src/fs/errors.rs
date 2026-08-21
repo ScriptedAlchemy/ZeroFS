@@ -116,7 +116,7 @@ impl FsError {
             .unwrap_or(Self::IoError)
     }
 
-    pub fn to_errno(self) -> u32 {
+    pub(crate) fn to_errno(self) -> u32 {
         match self {
             FsError::PermissionDenied => crate::linux_errno::EACCES,
             FsError::OperationNotPermitted => crate::linux_errno::EPERM,

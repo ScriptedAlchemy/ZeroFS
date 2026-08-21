@@ -18,12 +18,12 @@ pub struct OrphanStore {
 }
 
 impl OrphanStore {
-    pub fn new(db: Arc<Db>, key_codec: Arc<KeyCodec>) -> Self {
+    pub(crate) fn new(db: Arc<Db>, key_codec: Arc<KeyCodec>) -> Self {
         Self { db, key_codec }
     }
 
     /// Mark `inode_id` as an orphan in the surrounding namespace transaction.
-    pub fn add(&self, txn: &mut Transaction, inode_id: InodeId) {
+    pub(crate) fn add(&self, txn: &mut Transaction, inode_id: InodeId) {
         let key = self.key_codec.orphan_key(inode_id);
         txn.put_bytes(&key, bytes::Bytes::new());
     }
@@ -35,7 +35,7 @@ impl OrphanStore {
 
     /// Whether `inode_id` currently has an orphan-set entry. A point read used
     /// to avoid committing a no-op delete txn on the hot clunk path.
-    pub async fn contains(&self, inode_id: InodeId) -> Result<bool, FsError> {
+    pub(crate) async fn contains(&self, inode_id: InodeId) -> Result<bool, FsError> {
         let key = self.key_codec.orphan_key(inode_id);
         Ok(self
             .db

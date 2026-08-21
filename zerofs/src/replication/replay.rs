@@ -54,7 +54,7 @@ impl LineageProof {
 
 impl PromotionRetryGraceProof {
     /// Arms the bounded retry window. Returns false after its deadline.
-    pub fn arm(self) -> bool {
+    pub(crate) fn arm(self) -> bool {
         self.dedup
             .arm_promotion_retry_grace_until(self.predecessor_epoch, self.deadline)
     }
@@ -73,7 +73,7 @@ fn proves_promotion_retry_grace(
 
 impl PromotionSnapshot {
     /// Reconciles a frozen tail with durable state and completes promotion.
-    pub async fn reconcile_into(
+    pub(crate) async fn reconcile_into(
         mut self,
         raw_db: &Arc<slatedb::Db>,
         segment_object_store: &Arc<dyn ObjectStore>,

@@ -30,7 +30,7 @@ impl<K: Eq + Hash + Clone + Send + Sync + 'static> Default for KeyedLockManager<
 }
 
 impl<K: Eq + Hash + Clone + Send + Sync + 'static> KeyedLockManager<K> {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             locks: Arc::new(DashMap::new()),
         }
@@ -58,7 +58,7 @@ impl<K: Eq + Hash + Clone + Send + Sync + 'static> KeyedLockManager<K> {
 
 impl<K: Eq + Hash + Clone + Ord + Send + Sync + 'static> KeyedLockManager<K> {
     /// Acquire multiple locks with automatic ordering to prevent deadlocks.
-    pub async fn acquire_multi(&self, mut keys: Vec<K>) -> MultiLockGuard<K> {
+    pub(crate) async fn acquire_multi(&self, mut keys: Vec<K>) -> MultiLockGuard<K> {
         // Sort by key to ensure consistent ordering
         keys.sort();
         keys.dedup();

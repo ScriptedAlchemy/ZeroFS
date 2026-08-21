@@ -35,14 +35,14 @@ impl ZeroFsBlockTransformer {
     ///
     /// The encryption key is derived from the master key using HKDF-SHA256 with
     /// the info string "zerofs-v1-encryption".
-    pub fn new(master_key: &[u8; 32], compression: CompressionConfig) -> Self {
+    fn new(master_key: &[u8; 32], compression: CompressionConfig) -> Self {
         Self {
             codec: Arc::new(FrameCodec::new(master_key, ENCRYPTION_INFO, compression)),
         }
     }
 
     /// Create a shareable Arc-wrapped transformer.
-    pub fn new_arc(master_key: &[u8; 32], compression: CompressionConfig) -> Arc<Self> {
+    pub(crate) fn new_arc(master_key: &[u8; 32], compression: CompressionConfig) -> Arc<Self> {
         Arc::new(Self::new(master_key, compression))
     }
 }

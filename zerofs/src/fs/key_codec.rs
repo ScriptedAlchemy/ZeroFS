@@ -123,7 +123,7 @@ impl From<KeyPrefix> for u8 {
 }
 
 impl KeyPrefix {
-    pub fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Inode => "INODE",
             Self::Extent => "EXTENT",
@@ -166,7 +166,7 @@ impl KeyCodec {
     }
 
     /// Number of bytes the domain prefix contributes for `prefix`.
-    pub fn domain_len(&self, prefix: KeyPrefix) -> usize {
+    fn domain_len(&self, prefix: KeyPrefix) -> usize {
         prefix.domain().len()
     }
 
@@ -194,21 +194,21 @@ impl KeyCodec {
     }
 
     /// Total bytes in a complete extent key.
-    pub fn extent_key_size(&self) -> usize {
+    fn extent_key_size(&self) -> usize {
         self.id_offset(KeyPrefix::Extent) + U64_SIZE * 2
     }
 
     /// Total bytes in a complete tombstone key.
-    pub fn tombstone_key_size(&self) -> usize {
+    fn tombstone_key_size(&self) -> usize {
         self.id_offset(KeyPrefix::Tombstone) + U64_SIZE * 2
     }
 
     /// Total bytes in a complete orphan key.
-    pub fn orphan_key_size(&self) -> usize {
+    fn orphan_key_size(&self) -> usize {
         self.id_offset(KeyPrefix::Orphan) + U64_SIZE
     }
 
-    pub fn inode_key(&self, inode_id: InodeId) -> Bytes {
+    pub(crate) fn inode_key(&self, inode_id: InodeId) -> Bytes {
         let mut key = Vec::with_capacity(self.inode_key_size());
         self.push_prefix(&mut key, KeyPrefix::Inode);
         key.extend_from_slice(&inode_id.to_be_bytes());
@@ -242,7 +242,7 @@ impl KeyCodec {
 
     /// `(inode_id, extent_index)` for an extent key, for the HA standby rebuilding a
     /// shipped segment's directory on takeover.
-    pub fn parse_extent_key_full(&self, key: &[u8]) -> Option<(InodeId, u64)> {
+    pub(crate) fn parse_extent_key_full(&self, key: &[u8]) -> Option<(InodeId, u64)> {
         let expected = self.extent_key_size();
         if key.len() != expected {
             return None;
@@ -315,7 +315,7 @@ impl KeyCodec {
     }
 
     /// Build a key for resuming dir scan from a specific cookie
-    pub fn dir_scan_resume_key(&self, dir_id: InodeId, resume_after_cookie: u64) -> Bytes {
+    pub(crate) fn dir_scan_resume_key(&self, dir_id: InodeId, resume_after_cookie: u64) -> Bytes {
         let mut key = self.dir_scan_prefix(dir_id);
         key.extend_from_slice(&(resume_after_cookie + 1).to_be_bytes());
         Bytes::from(key)
@@ -329,7 +329,7 @@ impl KeyCodec {
         Bytes::from(key)
     }
 
-    pub fn tombstone_key(&self, timestamp: u64, inode_id: InodeId) -> Bytes {
+    pub(crate) fn tombstone_key(&self, timestamp: u64, inode_id: InodeId) -> Bytes {
         let mut key = Vec::with_capacity(self.tombstone_key_size());
         self.push_prefix(&mut key, KeyPrefix::Tombstone);
         key.extend_from_slice(&timestamp.to_be_bytes());
@@ -340,14 +340,14 @@ impl KeyCodec {
     /// Key for an orphan-set entry. The inode_id alone keys the entry (no
     /// timestamp, unlike tombstones): presence signals "open-unlinked, pending
     /// reclaim", so it must be a point key the reclaim path can delete by id.
-    pub fn orphan_key(&self, inode_id: InodeId) -> Bytes {
+    pub(crate) fn orphan_key(&self, inode_id: InodeId) -> Bytes {
         let mut key = Vec::with_capacity(self.orphan_key_size());
         self.push_prefix(&mut key, KeyPrefix::Orphan);
         key.extend_from_slice(&inode_id.to_be_bytes());
         Bytes::from(key)
     }
 
-    pub fn stats_shard_key(&self, shard_id: usize) -> Bytes {
+    pub(crate) fn stats_shard_key(&self, shard_id: usize) -> Bytes {
         let mut key = Vec::with_capacity(self.id_offset(KeyPrefix::Stats) + U64_SIZE);
         self.push_prefix(&mut key, KeyPrefix::Stats);
         key.extend_from_slice(&(shard_id as u64).to_be_bytes());
@@ -365,7 +365,7 @@ impl KeyCodec {
     /// batch. The stamp records the writer epoch, acknowledged ship, Solo
     /// history, and highest locally applied ship attempt; takeover validates the
     /// volatile tail and exact-result ledger against it.
-    pub fn ha_seqno_key(&self) -> Bytes {
+    pub(crate) fn ha_seqno_key(&self) -> Bytes {
         let mut key = Vec::with_capacity(self.id_offset(KeyPrefix::System) + 1);
         self.push_prefix(&mut key, KeyPrefix::System);
         key.push(SYSTEM_HA_SEQNO_SUBTYPE);
@@ -388,7 +388,7 @@ impl KeyCodec {
     }
 
     /// Key for the durability lineage token (a single u64).
-    pub fn lineage_key(&self) -> Bytes {
+    pub(crate) fn lineage_key(&self) -> Bytes {
         let mut key = Vec::with_capacity(self.id_offset(KeyPrefix::System) + 1);
         self.push_prefix(&mut key, KeyPrefix::System);
         key.push(SYSTEM_LINEAGE_SUBTYPE);
@@ -396,7 +396,7 @@ impl KeyCodec {
     }
 
     /// Key for the Solo taint (the lineage token that went Solo).
-    pub fn taint_key(&self) -> Bytes {
+    pub(crate) fn taint_key(&self) -> Bytes {
         let mut key = Vec::with_capacity(self.id_offset(KeyPrefix::System) + 1);
         self.push_prefix(&mut key, KeyPrefix::System);
         key.push(SYSTEM_TAINT_SUBTYPE);
@@ -405,18 +405,18 @@ impl KeyCodec {
 
     /// Key for the last-orphan-sweep wall-clock timestamp (epoch seconds, a u64 via
     /// [`Self::encode_u64`]).
-    pub fn last_orphan_sweep_key(&self) -> Bytes {
+    pub(crate) fn last_orphan_sweep_key(&self) -> Bytes {
         let mut key = Vec::with_capacity(self.id_offset(KeyPrefix::System) + 1);
         self.push_prefix(&mut key, KeyPrefix::System);
         key.push(SYSTEM_ORPHAN_SWEEP_SUBTYPE);
         Bytes::from(key)
     }
 
-    pub fn encode_u64(value: u64) -> Bytes {
+    pub(crate) fn encode_u64(value: u64) -> Bytes {
         Bytes::copy_from_slice(&value.to_le_bytes())
     }
 
-    pub fn decode_u64(data: &[u8]) -> Option<u64> {
+    pub(crate) fn decode_u64(data: &[u8]) -> Option<u64> {
         if data.len() != U64_SIZE {
             return None;
         }
@@ -427,7 +427,7 @@ impl KeyCodec {
     /// `total` bytes (cumulative frame bytes ever appended, monotonic). The GC reads
     /// `live/total` as the segment's live fraction straight from this value, so the
     /// fast reclaim path never has to list the object to get its size.
-    pub fn encode_segcount(live: u64, total: u64) -> Bytes {
+    pub(crate) fn encode_segcount(live: u64, total: u64) -> Bytes {
         let mut b = [0u8; U64_SIZE * 2];
         b[..U64_SIZE].copy_from_slice(&live.to_le_bytes());
         b[U64_SIZE..].copy_from_slice(&total.to_le_bytes());
@@ -563,7 +563,7 @@ impl KeyCodec {
         None
     }
 
-    pub fn encode_counter(value: u64) -> Bytes {
+    pub(crate) fn encode_counter(value: u64) -> Bytes {
         Bytes::copy_from_slice(&value.to_le_bytes())
     }
 
@@ -575,7 +575,7 @@ impl KeyCodec {
         Ok(u64::from_le_bytes(bytes))
     }
 
-    pub fn encode_dir_entry(inode_id: InodeId, cookie: u64) -> Bytes {
+    pub(crate) fn encode_dir_entry(inode_id: InodeId, cookie: u64) -> Bytes {
         let mut value = Vec::with_capacity(U64_SIZE * 2);
         value.extend_from_slice(&inode_id.to_le_bytes());
         value.extend_from_slice(&cookie.to_le_bytes());
@@ -598,11 +598,11 @@ impl KeyCodec {
         ))
     }
 
-    pub fn encode_tombstone_size(size: u64) -> Bytes {
+    pub(crate) fn encode_tombstone_size(size: u64) -> Bytes {
         Bytes::copy_from_slice(&size.to_le_bytes())
     }
 
-    pub fn decode_tombstone_size(data: &[u8]) -> Result<u64, FsError> {
+    pub(crate) fn decode_tombstone_size(data: &[u8]) -> Result<u64, FsError> {
         if data.len() != U64_SIZE {
             return Err(FsError::InvalidData);
         }

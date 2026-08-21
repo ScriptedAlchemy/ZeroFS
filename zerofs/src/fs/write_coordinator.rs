@@ -179,7 +179,7 @@ struct WorkerContext {
 
 impl WriteCoordinator {
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    pub(crate) fn new(
         db: Arc<Db>,
         inode_store: InodeStore,
         directory_store: DirectoryStore,
@@ -311,7 +311,7 @@ impl WriteCoordinator {
     /// order. A wave of concurrent writers that fragments into many singleton
     /// batches shows up here as a run of 1s.
     #[cfg(test)]
-    pub(crate) fn batch_sizes(&self) -> Vec<usize> {
+    fn batch_sizes(&self) -> Vec<usize> {
         self.batch_sizes
             .lock()
             .expect("write coordinator batch-size probe poisoned")
@@ -328,12 +328,12 @@ impl WriteCoordinator {
 
     /// The [`stage_seg_deltas`] share of [`Self::apply_nanos`].
     #[cfg(test)]
-    pub(crate) fn stage_nanos(&self) -> u64 {
+    fn stage_nanos(&self) -> u64 {
         self.stage_nanos.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Weak commit handle for data-plane GC and compaction.
-    pub fn downgrade(&self) -> WeakWriteCoordinator {
+    pub(crate) fn downgrade(&self) -> WeakWriteCoordinator {
         WeakWriteCoordinator {
             sender: self.sender.downgrade(),
             inode_store: self.inode_store.clone(),
@@ -365,7 +365,7 @@ pub struct WeakWriteCoordinator {
 }
 
 impl WeakWriteCoordinator {
-    pub async fn commit(&self, txn: Transaction) -> Result<(), FsError> {
+    pub(crate) async fn commit(&self, txn: Transaction) -> Result<(), FsError> {
         let sender = self.sender.upgrade().ok_or(FsError::IoError)?;
         // Same submit-time queueing as the strong handle; see there.
         let queued_inode = self.inode_store.install_pending(txn.inode_cache_updates());

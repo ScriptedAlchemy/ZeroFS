@@ -56,10 +56,10 @@ pub(crate) struct VolatileBudget {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct VolatileBudgetStatus {
-    pub(crate) capacity_bytes: u64,
+    capacity_bytes: u64,
     pub(crate) dirty_bytes: u64,
     pub(crate) dirty_operations: usize,
-    pub(crate) terminal: bool,
+    terminal: bool,
 }
 
 impl VolatileBudget {
@@ -514,7 +514,7 @@ impl VolatileWriteRuntime {
         Ok(output.freeze())
     }
 
-    pub(crate) fn stop_admission(&self) -> u64 {
+    fn stop_admission(&self) -> u64 {
         let mut state = self.state.lock().expect("volatile runtime poisoned");
         state.accepting = false;
         let cutoff = state.next_sequence;

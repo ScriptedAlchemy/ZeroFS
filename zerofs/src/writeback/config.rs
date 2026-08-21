@@ -35,33 +35,33 @@ pub enum WritebackAccessMode {
 #[serde(deny_unknown_fields)]
 pub struct WritebackConfig {
     #[serde(default)]
-    pub enabled: bool,
+    pub(crate) enabled: bool,
     #[serde(
         default,
         deserialize_with = "crate::config::deserialize_expandable_path"
     )]
-    pub dir: PathBuf,
+    pub(crate) dir: PathBuf,
     #[serde(default)]
-    pub ack_mode: AckMode,
+    pub(crate) ack_mode: AckMode,
     #[serde(default)]
-    pub memory_size_gb: f64,
+    pub(crate) memory_size_gb: f64,
     #[serde(default)]
-    pub disk_size_gb: f64,
+    pub(crate) disk_size_gb: f64,
     #[serde(default)]
-    pub min_free_gb: f64,
+    pub(crate) min_free_gb: f64,
     #[serde(default = "default_high_watermark_percent")]
-    pub high_watermark_percent: u8,
+    pub(crate) high_watermark_percent: u8,
     #[serde(default = "default_resume_percent")]
-    pub resume_percent: u8,
+    pub(crate) resume_percent: u8,
     /// Concurrent remote uploads. Defaults to four for generic backends. SFTP
     /// defaults to seven, clamped to `[sftp] write_concurrency`, so its default
     /// eight-session pool retains one lane for reads and control traffic.
     #[serde(default)]
-    pub upload_concurrency: Option<usize>,
+    pub(crate) upload_concurrency: Option<usize>,
     #[serde(default = "default_local_concurrency")]
-    pub local_concurrency: usize,
+    pub(crate) local_concurrency: usize,
     #[serde(default)]
-    pub shutdown_flush: ShutdownFlush,
+    pub(crate) shutdown_flush: ShutdownFlush,
 }
 
 impl Default for WritebackConfig {
@@ -84,20 +84,20 @@ impl Default for WritebackConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WritebackSettings {
-    pub dir: PathBuf,
-    pub ack_mode: AckMode,
-    pub memory_bytes: u64,
-    pub disk_bytes: u64,
-    pub min_free_bytes: u64,
-    pub high_watermark_percent: u8,
-    pub resume_percent: u8,
-    pub upload_concurrency: usize,
-    pub local_concurrency: usize,
-    pub shutdown_flush: ShutdownFlush,
+    pub(crate) dir: PathBuf,
+    pub(crate) ack_mode: AckMode,
+    pub(crate) memory_bytes: u64,
+    pub(crate) disk_bytes: u64,
+    pub(crate) min_free_bytes: u64,
+    pub(crate) high_watermark_percent: u8,
+    pub(crate) resume_percent: u8,
+    pub(crate) upload_concurrency: usize,
+    pub(crate) local_concurrency: usize,
+    pub(crate) shutdown_flush: ShutdownFlush,
 }
 
 impl WritebackConfig {
-    pub fn normalize(
+    pub(crate) fn normalize(
         &self,
         clean_cache_dir: &Path,
         sftp_write_concurrency: Option<usize>,

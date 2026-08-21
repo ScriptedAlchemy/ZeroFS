@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-pub const MAX_HARDLINKS_PER_INODE: u32 = u32::MAX;
+pub(crate) const MAX_HARDLINKS_PER_INODE: u32 = u32::MAX;
 
 const INODE_CACHE_BYTES: usize = 8 * 1024 * 1024;
 
@@ -129,7 +129,7 @@ pub(crate) struct PendingInodeGuard {
 }
 
 impl PendingInodeGuard {
-    pub(crate) fn empty() -> Self {
+    fn empty() -> Self {
         Self {
             pending: None,
             owned: Vec::new(),
@@ -166,7 +166,7 @@ pub struct InodeStore {
 }
 
 impl InodeStore {
-    pub fn new(db: Arc<Db>, key_codec: Arc<KeyCodec>, initial_next_id: u64) -> Self {
+    pub(crate) fn new(db: Arc<Db>, key_codec: Arc<KeyCodec>, initial_next_id: u64) -> Self {
         let cache = InodeCache::new(
             db.clone(),
             INODE_CACHE_BYTES,
@@ -182,11 +182,11 @@ impl InodeStore {
         }
     }
 
-    pub fn allocate(&self) -> InodeId {
+    pub(crate) fn allocate(&self) -> InodeId {
         self.next_id.fetch_add(1, Ordering::SeqCst)
     }
 
-    pub fn next_id(&self) -> u64 {
+    pub(crate) fn next_id(&self) -> u64 {
         self.next_id.load(Ordering::SeqCst)
     }
 
@@ -306,7 +306,7 @@ impl InodeStore {
         self.cache.load_count()
     }
 
-    pub fn save(
+    pub(crate) fn save(
         &self,
         txn: &mut Transaction,
         id: InodeId,
@@ -319,7 +319,7 @@ impl InodeStore {
         Ok(())
     }
 
-    pub fn delete(&self, txn: &mut Transaction, id: InodeId) {
+    pub(crate) fn delete(&self, txn: &mut Transaction, id: InodeId) {
         let key = self.key_codec.inode_key(id);
         txn.delete_bytes(&key);
         txn.update_cached_inode(id, None);
@@ -327,7 +327,7 @@ impl InodeStore {
 
     /// Resolve inode ID to full path components by walking parent chain.
     /// Returns Vec of path components (excluding root), in order from root to target.
-    pub async fn resolve_path_components(&self, id: InodeId) -> Vec<Vec<u8>> {
+    pub(crate) async fn resolve_path_components(&self, id: InodeId) -> Vec<Vec<u8>> {
         const ROOT_INODE_ID: InodeId = 0;
 
         if id == ROOT_INODE_ID {
@@ -366,7 +366,7 @@ impl InodeStore {
     }
 
     /// Resolve inode ID to full path string.
-    pub async fn resolve_path_lossy(&self, id: InodeId) -> String {
+    pub(crate) async fn resolve_path_lossy(&self, id: InodeId) -> String {
         let components = self.resolve_path_components(id).await;
         if components.is_empty() {
             return "/".to_string();

@@ -17,7 +17,7 @@ mod key_management;
 pub mod length_checked_object_store;
 #[allow(dead_code)]
 mod linux_errno;
-pub mod metadata_digest;
+pub(crate) mod metadata_digest;
 #[cfg(target_os = "linux")]
 mod mount;
 mod nbd;
@@ -41,7 +41,7 @@ mod sftp_protocol;
 pub mod sftp_transport;
 pub mod storage_class_object_store;
 mod storage_compatibility;
-pub mod task;
+pub(crate) mod task;
 mod telemetry;
 #[cfg(feature = "webui")]
 mod webui;
@@ -54,7 +54,7 @@ pub mod failpoints;
 pub mod fault_store;
 
 #[cfg(test)]
-pub mod test_helpers;
+pub(crate) mod test_helpers;
 
 #[cfg(test)]
 mod posix_tests;

@@ -143,7 +143,7 @@ impl FilesystemVolatileOverlay {
         })
     }
 
-    pub(crate) fn budget(&self) -> Arc<VolatileBudget> {
+    fn budget(&self) -> Arc<VolatileBudget> {
         Arc::clone(&self.budget)
     }
 
@@ -225,7 +225,7 @@ impl FilesystemVolatileOverlay {
         attrs
     }
 
-    pub(crate) async fn reserve(
+    async fn reserve(
         self: &Arc<Self>,
         inode: u64,
         bytes: usize,
@@ -323,7 +323,7 @@ impl FilesystemVolatileOverlay {
 
     /// Publish every member of one logical write under a single pending batch.
     /// Visibility is accepted per inode; canonical apply happens once.
-    pub(crate) async fn accept_batch(
+    async fn accept_batch(
         self: &Arc<Self>,
         admissions: Vec<VolatileAdmission>,
         guard: PreparationGuard,
@@ -491,13 +491,13 @@ impl FilesystemVolatileOverlay {
     }
 
     #[cfg(test)]
-    pub(crate) fn fail_batch_after_for_test(&self, accepted_members: usize) {
+    fn fail_batch_after_for_test(&self, accepted_members: usize) {
         self.fail_batch_after
             .store(accepted_members, Ordering::Release);
     }
 
     #[cfg(test)]
-    pub(crate) fn fail_publish_for_test(&self) {
+    fn fail_publish_for_test(&self) {
         self.fail_publish.store(true, Ordering::Release);
     }
 
@@ -538,7 +538,7 @@ impl FilesystemVolatileOverlay {
         }
     }
 
-    pub(crate) async fn read(
+    async fn read(
         self: &Arc<Self>,
         inode: u64,
         offset: u64,
@@ -603,7 +603,7 @@ impl FilesystemVolatileOverlay {
 impl ZeroFS {
     /// Install the process-wide volatile overlay once the filesystem is in an
     /// `Arc`. Idempotent; a no-op when acknowledgement is materialized.
-    pub fn install_volatile_overlay(self: &Arc<Self>) {
+    pub(crate) fn install_volatile_overlay(self: &Arc<Self>) {
         if self.write_ack.mode != FilesystemWriteAckMode::VolatileMemory {
             return;
         }
@@ -619,7 +619,7 @@ impl ZeroFS {
     }
 
     /// Start owned apply workers once the filesystem is in an `Arc`.
-    pub fn start_materializer(self: &Arc<Self>) {
+    pub(crate) fn start_materializer(self: &Arc<Self>) {
         let materializer = super::materializer::Materializer::start(
             super::types::MutationIncarnation::new(),
             Arc::downgrade(self),
@@ -685,7 +685,7 @@ impl ZeroFS {
 
     /// RAM-ack write used by NFS, 9P, NBD, and WebUI. Materialized mode falls
     /// through to the canonical write path.
-    pub async fn write_ack(
+    pub(crate) async fn write_ack(
         &self,
         auth: &AuthContext,
         id: InodeId,

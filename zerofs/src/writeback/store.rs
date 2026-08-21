@@ -129,7 +129,11 @@ impl WritebackObjectStore {
         pause
     }
 
-    pub async fn open(
+    /// Test-only convenience: production always opens through
+    /// `open_paused_with_owners` (see `bootstrap.rs`), which supplies its own
+    /// space/SSD owners and starts with the remote view paused.
+    #[cfg(test)]
+    async fn open(
         remote: Arc<dyn ObjectStore>,
         journal: Arc<Journal>,
         settings: WritebackSettings,
@@ -252,7 +256,7 @@ impl WritebackObjectStore {
         })
     }
 
-    pub async fn wait_local(&self, sequence: u64) -> Result<(), LocalBarrierError> {
+    pub(crate) async fn wait_local(&self, sequence: u64) -> Result<(), LocalBarrierError> {
         self.inner.journaler.barrier().wait_local(sequence).await
     }
 
@@ -309,7 +313,7 @@ impl WritebackObjectStore {
 
     /// Capture every mutation accepted before this barrier and wait until the
     /// contiguous local SSD journal covers that sequence.
-    pub async fn wait_local_through_accepted(&self) -> Result<(), LocalBarrierError> {
+    pub(crate) async fn wait_local_through_accepted(&self) -> Result<(), LocalBarrierError> {
         let target = {
             let _order_guard = self.inner.admission_order.lock().await;
             self.inner.next_sequence.load(Ordering::Acquire)
@@ -317,7 +321,7 @@ impl WritebackObjectStore {
         self.wait_local(target).await
     }
 
-    pub async fn wait_remote(&self, sequence: u64) -> Result<(), RemoteBarrierError> {
+    pub(crate) async fn wait_remote(&self, sequence: u64) -> Result<(), RemoteBarrierError> {
         self.inner.remote.barrier().wait_remote(sequence).await
     }
 
@@ -420,19 +424,21 @@ impl WritebackObjectStore {
 
     /// Start remote writeback after callers have finished opening over the
     /// stable recovered overlay. Repeated activation is harmless.
-    pub fn activate_remote(&self) -> Result<(), RemoteBarrierError> {
+    pub(crate) fn activate_remote(&self) -> Result<(), RemoteBarrierError> {
         self.inner.remote.activate()
     }
 
-    pub fn dirty_ram_bytes(&self) -> u64 {
+    #[cfg(test)]
+    fn dirty_ram_bytes(&self) -> u64 {
         self.inner.admission.used_bytes()
     }
 
-    pub fn dirty_ssd_reserved_bytes(&self) -> u64 {
+    #[cfg(test)]
+    fn dirty_ssd_reserved_bytes(&self) -> u64 {
         self.inner.ssd.used_bytes()
     }
 
-    pub fn status(&self) -> anyhow::Result<WritebackStatus> {
+    pub(crate) fn status(&self) -> anyhow::Result<WritebackStatus> {
         let progress = self.inner.journal.progress()?;
         let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
         // One snapshot for the age: reading the watermark and the record in
@@ -466,7 +472,7 @@ impl WritebackObjectStore {
         })
     }
 
-    pub async fn shutdown(&self) -> Result<(), LocalBarrierError> {
+    pub(crate) async fn shutdown(&self) -> Result<(), LocalBarrierError> {
         if self
             .inner
             .stopped

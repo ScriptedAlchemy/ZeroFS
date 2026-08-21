@@ -65,10 +65,7 @@ impl NFSAdapter {
         Self::with_service_identity(fs, NfsServiceIdentity::new())
     }
 
-    pub(crate) fn with_service_identity(
-        fs: Arc<ZeroFS>,
-        service_identity: NfsServiceIdentity,
-    ) -> Self {
+    fn with_service_identity(fs: Arc<ZeroFS>, service_identity: NfsServiceIdentity) -> Self {
         fs.install_volatile_overlay();
         Self {
             fs,

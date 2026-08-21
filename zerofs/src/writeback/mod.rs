@@ -16,7 +16,7 @@ pub(crate) mod barrier {
         BarrierError, SequenceBarrier, SequenceProgress,
     };
 }
-pub mod bootstrap;
+pub(crate) mod bootstrap;
 pub mod config;
 pub mod journal;
 pub mod journaler;
@@ -39,7 +39,7 @@ mod test_util;
 mod tier_bench;
 
 #[cfg(unix)]
-pub(crate) fn validate_owner_only(
+fn validate_owner_only(
     path: &std::path::Path,
     metadata: &std::fs::Metadata,
     expected_mode: u32,

@@ -54,12 +54,13 @@ fn get_current_uid_gid() -> (u32, u32) {
 /// time varies run to run and flows into committed inode rows, whose byte
 /// values shift compressed SST block sizes and break same-seed replay.
 #[doc(hidden)]
+/// Public for the DST simulation crate (`tests/dst`, `--cfg dst`); hawk cannot see that consumer.
 pub static DST_FIXED_TIME: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 /// Wall-clock now as `(seconds, nanoseconds)` since the Unix epoch; a
 /// pre-epoch clock clamps to zero.
-pub fn get_current_time() -> (u64, u32) {
+pub(crate) fn get_current_time() -> (u64, u32) {
     if DST_FIXED_TIME.load(std::sync::atomic::Ordering::Relaxed) {
         return (1_700_000_000, 0);
     }
@@ -74,16 +75,16 @@ pub fn get_current_time() -> (u64, u32) {
 }
 
 pub const EXTENT_SIZE: usize = 32 * 1024;
-pub const STATS_SHARDS: usize = 100;
-pub const SMALL_FILE_TOMBSTONE_THRESHOLD: usize = 10;
-pub const NAME_MAX: usize = 255;
+pub(crate) const STATS_SHARDS: usize = 100;
+pub(crate) const SMALL_FILE_TOMBSTONE_THRESHOLD: usize = 10;
+const NAME_MAX: usize = 255;
 /// Total inode capacity reported by statfs. A fixed, signed-safe value (< 2^63):
 /// statfs must not report a u64 >= 2^63, because GNU `stat`/`df` render such a
 /// count as a negative signed value and miscompute inode usage on the mount.
-pub const TOTAL_INODES: u64 = 1 << 48;
+pub(crate) const TOTAL_INODES: u64 = 1 << 48;
 
 /// Names are opaque bytes to the fs; only the [`NAME_MAX`] length is enforced.
-pub fn validate_filename(filename: &[u8]) -> Result<(), FsError> {
+pub(crate) fn validate_filename(filename: &[u8]) -> Result<(), FsError> {
     if filename.len() > NAME_MAX {
         Err(FsError::NameTooLong)
     } else {
@@ -102,10 +103,10 @@ pub struct ZeroFS {
     /// In-memory, process-global open-file pins for each inode. Empty after a
     /// restart by construction; used to pick the defer-vs-delete branch in
     /// `remove`/`rename`.
-    pub open_handles: Arc<DashMap<InodeId, u64>>,
+    pub(crate) open_handles: Arc<DashMap<InodeId, u64>>,
     /// Reclaim queue: an `OpenHandle` drop that takes a count to zero pushes the
     /// inode here for `start_reclaim_drainer` to reclaim.
-    pub reclaim_tx: UnboundedSender<InodeId>,
+    reclaim_tx: UnboundedSender<InodeId>,
     /// Receiver, parked until `start_reclaim_drainer` takes it (tests that don't
     /// start the drainer just let sends buffer). `Arc<Mutex<..>>` keeps the
     /// vestigial `ZeroFS: Clone` derive working.
@@ -117,7 +118,7 @@ pub struct ZeroFS {
     pub write_coordinator: WriteCoordinator,
     /// When set, a client `fsync`/COMMIT returns without forcing a flush to object
     /// storage; semi-sync replication is relied on for durability. See `client_fsync`.
-    pub ignore_fsync: bool,
+    pub(crate) ignore_fsync: bool,
     /// Resolved acknowledgement contract. Adapters consume this; they must
     /// not re-read raw `[filesystem]` / `[servers.nbd]` fields.
     pub(crate) write_ack: crate::fs::mutation::config::FilesystemWriteAckSettings,
@@ -138,33 +139,33 @@ pub struct ZeroFS {
     >,
     /// Bounded replay/collision cache for identified writes when volatile
     /// acknowledgement is disabled and no mutation coordinator exists.
-    pub(crate) materialized_request_cache: crate::fs::mutation::request_cache::RequestCache,
+    materialized_request_cache: crate::fs::mutation::request_cache::RequestCache,
     /// Durability lineage token (see `client_fsync_verified`). Identifies the current
     /// unbroken durable lineage; set once at bring-up, constant for this process's life.
     /// A ZeroFS client carries it, and a verified fsync succeeds only while it is
     /// still live, so a successful fsync implies the client's writes are durable.
-    pub lineage_token: u64,
+    pub(crate) lineage_token: u64,
     /// Current HA writer epoch advertised to clients as the origin for mutation
     /// retries. Zero for standalone, read-only, and in-memory test filesystems.
-    pub serving_writer_epoch: u64,
-    pub max_bytes: u64,
+    pub(crate) serving_writer_epoch: u64,
+    pub(crate) max_bytes: u64,
     pub(crate) quota: std::sync::Arc<crate::fs::quota::LogicalQuota>,
-    pub tracer: AccessTracer,
+    pub(crate) tracer: AccessTracer,
     /// Traces backend object-store requests (the `otrace` feature). Created in
     /// `Prepared::prepare` and shared with the `TracingObjectStore` wrappers so
     /// the RPC server can stream what the wrappers see.
-    pub object_tracer: ObjectTracer,
+    pub(crate) object_tracer: ObjectTracer,
     /// Idempotency cache for retried non-idempotent ops. Shared across all
     /// connections (a retry may arrive on a new one); on a standby it is also fed
     /// by the replication stream.
-    pub dedup: Arc<crate::dedup::DedupCache>,
+    pub(crate) dedup: Arc<crate::dedup::DedupCache>,
 }
 
 #[derive(Clone)]
 pub struct CacheConfig {
-    pub root_folder: PathBuf,
-    pub max_cache_size_gb: f64,
-    pub memory_cache_size_gb: Option<f64>,
+    pub(crate) root_folder: PathBuf,
+    pub(crate) max_cache_size_gb: f64,
+    pub(crate) memory_cache_size_gb: Option<f64>,
 }
 
 #[cfg(test)]

@@ -49,9 +49,9 @@ pub(crate) enum ShutdownPhase {
 #[must_use = "a shutdown receipt is proof that close completed"]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ShutdownReceipt {
-    pub(crate) mutation_cutoff: MutationCutoff,
-    pub(crate) object_coverage: ObjectCoverage,
-    pub(crate) target: DurabilityTarget,
+    mutation_cutoff: MutationCutoff,
+    object_coverage: ObjectCoverage,
+    target: DurabilityTarget,
 }
 
 #[derive(Debug, Clone, thiserror::Error)]
@@ -80,7 +80,7 @@ pub(crate) struct BarrierGuard {
 }
 
 impl BarrierGuard {
-    pub(crate) fn new(release: impl FnOnce() + Send + 'static) -> Self {
+    fn new(release: impl FnOnce() + Send + 'static) -> Self {
         Self {
             release: Some(Box::new(release)),
         }
@@ -98,18 +98,18 @@ impl Drop for BarrierGuard {
 /// Injectable owners consumed by the single close path.
 #[derive(Clone)]
 pub(crate) struct LifecycleOwners {
-    pub(crate) stop_listeners: Step,
-    pub(crate) stop_admission: Step,
-    pub(crate) drain_dispatched: Step,
-    pub(crate) close_admission: CutoffStep,
-    pub(crate) materialize: MaterializeStep,
-    pub(crate) acquire_barrier: BarrierStep,
-    pub(crate) close_database: Step,
-    pub(crate) capture_objects: CaptureStep,
-    pub(crate) wait_target: WaitStep,
-    pub(crate) stop_mutation: Step,
-    pub(crate) stop_writeback: Step,
-    pub(crate) stop_sftp: Step,
+    stop_listeners: Step,
+    stop_admission: Step,
+    drain_dispatched: Step,
+    close_admission: CutoffStep,
+    materialize: MaterializeStep,
+    acquire_barrier: BarrierStep,
+    close_database: Step,
+    capture_objects: CaptureStep,
+    wait_target: WaitStep,
+    stop_mutation: Step,
+    stop_writeback: Step,
+    stop_sftp: Step,
 }
 
 /// Process-wide close owner. The first `close` starts the owner; later
@@ -133,7 +133,7 @@ impl MutationLifecycle {
         })
     }
 
-    pub(crate) fn phase(&self) -> ShutdownPhase {
+    fn phase(&self) -> ShutdownPhase {
         *self.phase.lock().expect("lifecycle phase")
     }
 

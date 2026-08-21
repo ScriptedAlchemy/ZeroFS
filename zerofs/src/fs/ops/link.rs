@@ -36,7 +36,7 @@ impl ZeroFS {
 
     /// `symlink` tagged with an idempotency op-id: an applied retry returns the
     /// existing link instead of EEXIST. See [`Self::create_idempotent`].
-    pub async fn symlink_idempotent(
+    pub(crate) async fn symlink_idempotent(
         &self,
         creds: &Credentials,
         dirid: InodeId,
@@ -212,7 +212,7 @@ impl ZeroFS {
 
     /// `link` tagged with an idempotency op-id: an applied retry returns success
     /// instead of EEXIST. See [`Self::create_idempotent`].
-    pub async fn link_idempotent(
+    pub(crate) async fn link_idempotent(
         &self,
         auth: &AuthContext,
         fileid: InodeId,

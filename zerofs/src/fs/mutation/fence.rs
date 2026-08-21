@@ -67,7 +67,7 @@ impl MutationCoordinator {
         self.progress.poison(message);
     }
 
-    pub(crate) async fn materialization_fence(
+    async fn materialization_fence(
         self: &Arc<Self>,
         scope: ConflictScope,
     ) -> Result<MaterializationFence, MutationError> {
@@ -181,7 +181,7 @@ impl ZeroFS {
 }
 
 #[cfg(test)]
-pub(crate) struct HeldPreparation {
+struct HeldPreparation {
     guard: Option<crate::fs::mutation::admission::PreparationGuard>,
     _cache: crate::fs::mutation::request_cache::RequestCache,
     _budget: crate::fs::mutation::admission::RawMutationBudget,
@@ -189,7 +189,7 @@ pub(crate) struct HeldPreparation {
 
 #[cfg(test)]
 impl HeldPreparation {
-    pub(crate) fn abort(mut self) {
+    fn abort(mut self) {
         if let Some(guard) = self.guard.take() {
             guard
                 .abort(crate::fs::mutation::admission::PreparationAbort::TransportCancellation)
@@ -200,7 +200,7 @@ impl HeldPreparation {
 
 #[cfg(test)]
 impl ZeroFS {
-    pub(crate) async fn hold_preparation_for_test(&self, scope: ConflictScope) -> HeldPreparation {
+    async fn hold_preparation_for_test(&self, scope: ConflictScope) -> HeldPreparation {
         use crate::fs::mutation::admission::{PreparationGuard, RawMutationBudget};
         use crate::fs::mutation::request_cache::{RequestCache, RequestLookup};
         use crate::fs::mutation::types::{RequestFingerprint, RequestIdentity, RequestLifetime};
