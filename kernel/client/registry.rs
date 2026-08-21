@@ -822,6 +822,11 @@ pub(super) fn request_fids(request: &Request<'_>) -> ([u32; 2], usize) {
             olddirfid,
             newdirfid,
             ..
+        }
+        | Request::Trenamenoreplace {
+            olddirfid,
+            newdirfid,
+            ..
         } => ([olddirfid, newdirfid], 2),
     }
 }

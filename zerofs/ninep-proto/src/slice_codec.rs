@@ -715,6 +715,15 @@ pub struct Rreaddirattr<'a> {
 }
 
 impl<'a> Rreaddirattr<'a> {
+    /// Serialized directory payload, excluding the outer `count[4]`.
+    ///
+    /// Unused by the workspace crates, but the in-tree kernel module includes
+    /// this file via `#[path]` (kernel/protocol.rs) and reads it; cargo-based
+    /// dead-code analysis cannot see that consumer.
+    pub fn data(&self) -> &'a [u8] {
+        self.data.0
+    }
+
     /// Number of complete [`DirEntryPlus`] records in the payload.
     pub fn len(&self) -> usize {
         self.entry_count

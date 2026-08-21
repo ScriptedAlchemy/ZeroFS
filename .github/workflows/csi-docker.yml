@@ -122,8 +122,10 @@ jobs:
           fi
           echo "image=$base" >> "$GITHUB_OUTPUT"
 
+      # Log in even on pull_request: the fork's base image package on ghcr is
+      # private, so the build stage's pull of ZEROFS_IMAGE needs auth. Push
+      # remains disabled for PRs below.
       - name: Log in to Container Registry
-        if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}

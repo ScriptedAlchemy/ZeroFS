@@ -544,7 +544,7 @@ impl ExpectedResponse {
             Request::Tsymlinkattr { .. } => Self::Symlinkattr,
             Request::Tmknodattr { .. } => Self::Mknodattr,
             Request::Tlinkattr { .. } => Self::Linkattr,
-            Request::Trenameat { .. } => Self::Renameat,
+            Request::Trenameat { .. } | Request::Trenamenoreplace { .. } => Self::Renameat,
             Request::Tunlinkat { .. } => Self::Unlinkat,
             Request::Treadlink { .. } => Self::Readlink,
             Request::Tflush { .. } => Self::Flush,

@@ -171,6 +171,9 @@ jobs:
 
             const owner = context.repo.owner;
             const repo = context.repo.repo;
+            // Forks often run with Issues disabled; drift reporting is then
+            // impossible but must not fail the whole update check.
+            try {
             const issues = await github.paginate(
               github.rest.issues.listForRepo,
               { owner, repo, state: "all", labels: label, per_page: 100 },
@@ -218,4 +221,16 @@ jobs:
                 state: "closed",
                 state_reason: "completed",
               });
+            }
+            } catch (error) {
+              if (error.status === 410) {
+                core.warning(
+                  `Issues are disabled on ${owner}/${repo}; skipping ` +
+                    `kernel-update issue reconciliation for ` +
+                    `${entry.channel_id} (update available: ` +
+                    `${entry.update_available}).`,
+                );
+                return;
+              }
+              throw error;
             }
