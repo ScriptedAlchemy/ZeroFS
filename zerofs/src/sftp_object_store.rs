@@ -869,8 +869,17 @@ impl SftpObjectStore {
                 Ok(Some(ListedChild::Directory(child)))
             }
             crate::sftp_transport::RemoteEntryKind::File => {
-                let object = self.metadata(&child).await?;
-                Ok(Some(ListedChild::Object(object)))
+                match self.metadata(&child).await {
+                    Ok(object) => Ok(Some(ListedChild::Object(object))),
+                    // A directory snapshot and its per-child metadata probes
+                    // are not atomic. GC may remove a listed child in between;
+                    // that child simply no longer belongs in this listing.
+                    // Keeping this as a successful classification also lets
+                    // the other concurrent probes settle normally instead of
+                    // canceling their session leases as ambiguous.
+                    Err(object_store::Error::NotFound { .. }) => Ok(None),
+                    Err(error) => Err(error),
+                }
             }
             crate::sftp_transport::RemoteEntryKind::Symlink => Err(generic_error(format!(
                 "refusing to follow SFTP symlink {child}"
@@ -4575,3 +4584,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod listing_race_tests;
