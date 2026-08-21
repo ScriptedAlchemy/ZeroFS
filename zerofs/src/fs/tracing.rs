@@ -51,9 +51,9 @@ impl std::fmt::Display for FileOperation {
 /// A file access event emitted when a filesystem operation occurs.
 #[derive(Clone, Debug)]
 pub struct FileAccessEvent {
-    pub timestamp: u64,
-    pub operation: FileOperation,
-    pub path: String,
+    pub(crate) timestamp: u64,
+    pub(crate) operation: FileOperation,
+    pub(crate) path: String,
 }
 
 /// Traces filesystem operations and broadcasts them to subscribers.
@@ -71,18 +71,18 @@ pub struct AccessTracer {
 }
 
 impl AccessTracer {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let (sender, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         Self { sender }
     }
 
     /// Returns true if there are any active subscribers.
-    pub fn has_subscribers(&self) -> bool {
+    pub(crate) fn has_subscribers(&self) -> bool {
         self.sender.receiver_count() > 0
     }
 
     /// Subscribe to the event stream.
-    pub fn subscribe(&self) -> broadcast::Receiver<FileAccessEvent> {
+    pub(crate) fn subscribe(&self) -> broadcast::Receiver<FileAccessEvent> {
         self.sender.subscribe()
     }
 
@@ -90,7 +90,7 @@ impl AccessTracer {
     ///
     /// If there are active subscribers, spawns a background task to resolve
     /// the path and broadcast the event. Returns immediately without blocking.
-    pub fn emit(&self, inode_store: &InodeStore, id: InodeId, operation: FileOperation) {
+    pub(crate) fn emit(&self, inode_store: &InodeStore, id: InodeId, operation: FileOperation) {
         if !self.has_subscribers() {
             return;
         }
@@ -106,7 +106,7 @@ impl AccessTracer {
     ///
     /// If there are active subscribers, spawns a background task to broadcast
     /// the event. Returns immediately without blocking.
-    pub fn emit_with_path(&self, path: String, operation: FileOperation) {
+    pub(crate) fn emit_with_path(&self, path: String, operation: FileOperation) {
         if !self.has_subscribers() {
             return;
         }

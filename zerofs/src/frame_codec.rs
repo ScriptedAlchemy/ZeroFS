@@ -28,7 +28,7 @@ const NONCE_SIZE: usize = 24;
 const TAG_SIZE: usize = 16;
 /// Fixed per-frame expansion of [`FrameCodec::seal_compressed`]: the prepended
 /// nonce plus the appended authentication tag. See [`Compressed::sealed_len`].
-pub(crate) const SEALED_FRAME_OVERHEAD: usize = NONCE_SIZE + TAG_SIZE;
+const SEALED_FRAME_OVERHEAD: usize = NONCE_SIZE + TAG_SIZE;
 pub(crate) const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 
 #[derive(Debug, thiserror::Error)]
@@ -51,12 +51,12 @@ pub enum CodecError {
 /// as if pre-compressed (double compression on read) nor a compressed payload
 /// served as plaintext; the only ways out are `seal_compressed` (re-encrypt
 /// as-is, the compaction passthrough) and `decompress`.
-pub struct Compressed(Vec<u8>);
+pub(crate) struct Compressed(Vec<u8>);
 
 impl Compressed {
     /// Stored payload size, the unit of compaction's gather accounting.
     #[allow(clippy::len_without_is_empty)] // a compressed payload is never empty
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.0.len()
     }
 
@@ -68,7 +68,7 @@ impl Compressed {
     /// The extent write path relies on this: it reserves a frame's byte range
     /// in the open segment buffer under a short lock, then runs the AEAD
     /// outside that lock and copies the result into the reserved range.
-    pub fn sealed_len(&self) -> usize {
+    pub(crate) fn sealed_len(&self) -> usize {
         self.0.len() + SEALED_FRAME_OVERHEAD
     }
 }
@@ -96,7 +96,7 @@ impl FrameCodec {
     }
 
     /// Whether encoding is cheap enough to run inline rather than on a blocking thread.
-    pub fn encode_is_cheap(&self) -> bool {
+    pub(crate) fn encode_is_cheap(&self) -> bool {
         match self.compression {
             CompressionConfig::Lz4 => true,
             CompressionConfig::Zstd(level) => level <= 12,
@@ -104,7 +104,7 @@ impl FrameCodec {
     }
 
     /// Compress then encrypt `plain`, binding `aad`. Returns `[nonce][ct+tag]`.
-    pub fn seal(&self, plain: &[u8], aad: &[u8]) -> Result<Vec<u8>, CodecError> {
+    pub(crate) fn seal(&self, plain: &[u8], aad: &[u8]) -> Result<Vec<u8>, CodecError> {
         self.seal_compressed(self.compress(plain)?, aad)
     }
 
@@ -114,7 +114,7 @@ impl FrameCodec {
     /// critical section must assign the identifiers the AAD binds, and so a
     /// relocation can rebind a frame's AAD from [`Self::open_compressed`]'s
     /// output without a decompress/recompress round trip.
-    pub fn seal_compressed(
+    pub(crate) fn seal_compressed(
         &self,
         Compressed(compressed): Compressed,
         aad: &[u8],
@@ -134,7 +134,7 @@ impl FrameCodec {
     }
 
     /// Decrypt (verifying `aad`) then decompress a frame produced by [`Self::seal`].
-    pub fn open(&self, frame: &[u8], aad: &[u8]) -> Result<Vec<u8>, CodecError> {
+    pub(crate) fn open(&self, frame: &[u8], aad: &[u8]) -> Result<Vec<u8>, CodecError> {
         let Compressed(compressed) = self.open_compressed(frame, aad)?;
         self.decompress(&compressed)
     }
@@ -143,7 +143,11 @@ impl FrameCodec {
     /// `open(frame, aad)` is exactly `decompress(open_compressed(frame, aad))`;
     /// the split lets a relocation verify and rebind a frame without ever
     /// materializing (or recompressing) the plaintext.
-    pub fn open_compressed(&self, frame: &[u8], aad: &[u8]) -> Result<Compressed, CodecError> {
+    pub(crate) fn open_compressed(
+        &self,
+        frame: &[u8],
+        aad: &[u8],
+    ) -> Result<Compressed, CodecError> {
         if frame.len() < NONCE_SIZE + TAG_SIZE {
             return Err(CodecError::TooShort(frame.len()));
         }
@@ -164,7 +168,7 @@ impl FrameCodec {
     /// Compress `data` with the configured codec. Pure: the output depends only
     /// on the bytes and the configured level, never on shared state, so it can
     /// run on any thread, outside any lock, and feed [`Self::seal_compressed`].
-    pub fn compress(&self, data: &[u8]) -> Result<Compressed, CodecError> {
+    pub(crate) fn compress(&self, data: &[u8]) -> Result<Compressed, CodecError> {
         match self.compression {
             CompressionConfig::Lz4 => Ok(Compressed(lz4_flex::compress_prepend_size(data))),
             CompressionConfig::Zstd(level) => {

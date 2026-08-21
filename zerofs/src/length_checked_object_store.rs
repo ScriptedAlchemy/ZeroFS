@@ -25,7 +25,7 @@ pub struct LengthCheckedObjectStore {
 }
 
 impl LengthCheckedObjectStore {
-    pub fn new(inner: Arc<dyn ObjectStore>) -> Self {
+    pub(crate) fn new(inner: Arc<dyn ObjectStore>) -> Self {
         Self { inner }
     }
 }

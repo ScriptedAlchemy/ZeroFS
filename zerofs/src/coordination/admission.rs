@@ -15,6 +15,13 @@ pub enum AdmissionError {
     TooLarge { requested: u64, capacity: u64 },
     #[error("invalid writeback admission configuration: {0}")]
     InvalidConfiguration(&'static str),
+    /// Reserved for the underflow-poison contract documented on
+    /// [`AdmissionPolicy::release`]: a policy's `release` is allowed to
+    /// report an accounting underflow through this variant. `RamPolicy`
+    /// (the only policy today) reports underflow as `Poisoned` instead, so
+    /// no production path constructs this yet. Keep it defined for future
+    /// `AdmissionPolicy` implementations rather than dropping the contract.
+    #[allow(dead_code)]
     #[error("writeback admission accounting underflow")]
     AccountingUnderflow,
 }
@@ -325,29 +332,29 @@ pub struct AdmissionPermit {
 pub struct AcceptedAdmission(AdmissionPermit);
 
 impl Admission {
-    pub fn new(capacity: u64) -> Self {
+    pub(crate) fn new(capacity: u64) -> Self {
         Self {
             inner: Gate::new(capacity, RamPolicy, GateState::default()),
         }
     }
 
-    pub async fn reserve(&self, bytes: u64) -> Result<AdmissionPermit, AdmissionError> {
+    pub(crate) async fn reserve(&self, bytes: u64) -> Result<AdmissionPermit, AdmissionError> {
         reserve_bytes(&self.inner, bytes, |_| {}).await
     }
 
-    pub fn used_bytes(&self) -> u64 {
+    pub(crate) fn used_bytes(&self) -> u64 {
         lock(&self.inner.state).used
     }
 
-    pub fn used_operations(&self) -> u64 {
+    pub(crate) fn used_operations(&self) -> u64 {
         lock(&self.inner.state).extra.used_operations
     }
 
-    pub fn poison(&self, message: impl Into<String>) {
+    pub(crate) fn poison(&self, message: impl Into<String>) {
         terminate(&self.inner, AdmissionError::Poisoned(message.into()));
     }
 
-    pub fn close(&self) {
+    pub(crate) fn close(&self) {
         terminate(&self.inner, AdmissionError::Closed);
     }
 
@@ -416,17 +423,17 @@ impl AdmissionPermit {
         }
     }
 
-    pub fn bytes(&self) -> u64 {
+    fn bytes(&self) -> u64 {
         self.bytes
     }
 
-    pub fn accept(self) -> AcceptedAdmission {
+    pub(crate) fn accept(self) -> AcceptedAdmission {
         AcceptedAdmission(self)
     }
 }
 
 impl AcceptedAdmission {
-    pub fn bytes(&self) -> u64 {
+    pub(crate) fn bytes(&self) -> u64 {
         self.0.bytes()
     }
 }

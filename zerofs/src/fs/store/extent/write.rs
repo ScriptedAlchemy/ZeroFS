@@ -182,7 +182,7 @@ pub(super) struct OpenLane {
 /// gate — so a rotation cannot be aimed at a lane other than the one it froze.
 /// Previously the witness was a bare `MutexGuard`, which any lane's guard
 /// satisfied.
-pub(super) struct LaneAppendGuard<'a> {
+struct LaneAppendGuard<'a> {
     lane: &'a OpenLane,
     _gate: tokio::sync::MutexGuard<'a, ()>,
 }
@@ -212,7 +212,7 @@ impl<'a> LaneAppendGuard<'a> {
 /// reservation already placed has copied its sealed bytes in. Built only from a
 /// [`LaneAppendGuard`], which is what ties both guards and the rotated lane to
 /// one another.
-pub(super) struct LaneFreeze<'a> {
+struct LaneFreeze<'a> {
     lane: &'a OpenLane,
     _filled: tokio::sync::RwLockWriteGuard<'a, ()>,
 }
@@ -416,28 +416,28 @@ impl Reservation {
 #[derive(Default)]
 pub(super) struct StagePhaseNanos {
     /// Superseded-FrameLoc discovery (point lookups or the range scan).
-    pub(super) old_debit: std::sync::atomic::AtomicU64,
+    old_debit: std::sync::atomic::AtomicU64,
     /// Compression, deliberately outside every lock.
-    pub(super) compress: std::sync::atomic::AtomicU64,
+    compress: std::sync::atomic::AtomicU64,
     /// Waiting for the extent-ref publication read guard.
-    pub(super) protect_ref: std::sync::atomic::AtomicU64,
+    protect_ref: std::sync::atomic::AtomicU64,
     /// Waiting to enter the lane's append gate.
-    pub(super) gate_wait: std::sync::atomic::AtomicU64,
+    gate_wait: std::sync::atomic::AtomicU64,
     /// Holding the lane's append gate: reserving the frame-index run and byte
     /// range only (the per-lane serial section).
-    pub(super) gate_hold: std::sync::atomic::AtomicU64,
+    gate_hold: std::sync::atomic::AtomicU64,
     /// Batch AEAD, outside the append gate.
-    pub(super) aead: std::sync::atomic::AtomicU64,
+    aead: std::sync::atomic::AtomicU64,
     /// Blocking on the lane's open-buffer std mutex to fill the reservation.
-    pub(super) open_lock_wait: std::sync::atomic::AtomicU64,
+    open_lock_wait: std::sync::atomic::AtomicU64,
     /// Copying sealed frames into the reserved range under that mutex.
-    pub(super) append: std::sync::atomic::AtomicU64,
+    append: std::sync::atomic::AtomicU64,
     /// Rotation admission: the residency permit plus the reservation drain.
-    pub(super) spawn_seal: std::sync::atomic::AtomicU64,
+    spawn_seal: std::sync::atomic::AtomicU64,
     /// Staging pointers, cache inserts, and segment-counter deltas onto the txn.
-    pub(super) txn_stage: std::sync::atomic::AtomicU64,
+    txn_stage: std::sync::atomic::AtomicU64,
     /// Staging calls that carried at least one frame.
-    pub(super) batches: std::sync::atomic::AtomicU64,
+    batches: std::sync::atomic::AtomicU64,
 }
 
 #[cfg(test)]
@@ -548,7 +548,7 @@ impl ExtentStore {
     }
 
     /// Apply a `write`'s tail-cache effect. Call only after its commit succeeds.
-    pub fn apply_tail_update(&self, id: InodeId, update: TailUpdate) {
+    pub(crate) fn apply_tail_update(&self, id: InodeId, update: TailUpdate) {
         match update {
             TailUpdate::Set { extent_idx, data } => self.tail_set(id, extent_idx, data),
             TailUpdate::Clear => self.tail_invalidate(id),
@@ -577,7 +577,7 @@ impl ExtentStore {
     /// still un-PUT becomes a `PutFrame` carrying the sealed frame bytes, so
     /// the standby can materialize that segment on takeover. Already-PUT
     /// segments stay plain `Put`. Called by the commit worker when replicating.
-    pub fn enrich_repl_ops(&self, ops: Vec<ReplOp>) -> Vec<ReplOp> {
+    pub(crate) fn enrich_repl_ops(&self, ops: Vec<ReplOp>) -> Vec<ReplOp> {
         ops.into_iter()
             .map(|op| match op {
                 ReplOp::Put(k, v) => {
@@ -598,7 +598,7 @@ impl ExtentStore {
 
     /// Stage the extent-key delete only: the segment-counter debit is the
     /// caller's job (see [`Self::delete_range`], which debits as it scans).
-    pub fn delete(&self, txn: &mut Transaction, id: InodeId, extent_idx: u64) {
+    fn delete(&self, txn: &mut Transaction, id: InodeId, extent_idx: u64) {
         let key = self.key_codec.extent_key(id, extent_idx);
         txn.delete_bytes(&key);
         txn.update_cached_extent_location(id, extent_idx, None);
@@ -628,7 +628,7 @@ impl ExtentStore {
     /// Stage deletes for allocated extents in `[start, end)` with their live-byte
     /// debits. The transaction must be fresh with respect to this inode's extent
     /// keys: the database scan cannot see writes already staged on `txn`.
-    pub async fn delete_range(
+    pub(crate) async fn delete_range(
         &self,
         txn: &mut Transaction,
         id: InodeId,
@@ -1363,7 +1363,7 @@ impl ExtentStore {
 
     /// Stage a shrink to `new_size` (growth is a no-op: extension is sparse):
     /// drops extents past the end and zero-fills the partial last one.
-    pub async fn truncate(
+    pub(crate) async fn truncate(
         &self,
         txn: &mut Transaction,
         id: InodeId,
@@ -1400,7 +1400,7 @@ impl ExtentStore {
 
     /// Stage zeroes over `[offset, offset + length)` capped at `file_size`:
     /// fully-covered extents become holes, partial ones are RMW-zeroed.
-    pub async fn zero_range(
+    pub(crate) async fn zero_range(
         &self,
         txn: &mut Transaction,
         id: InodeId,
@@ -1459,7 +1459,7 @@ impl ExtentStore {
     /// live, then lost the race to a concurrent tombstone delete, would re-commit
     /// the extent last-writer-wins (the LSM has no CAS), resurrecting a deleted
     /// inode's extent and pinning the repacked segment forever.
-    pub async fn delete_extents(
+    pub(crate) async fn delete_extents(
         &self,
         inode: InodeId,
         start_extent: u64,

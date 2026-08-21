@@ -106,12 +106,12 @@ impl PostCommitSettlement {
 
 /// Borrowed filesystem view used by [`prepare_write`].
 pub(crate) struct WritePrepareContext<'a> {
-    pub(crate) fs: &'a ZeroFS,
+    fs: &'a ZeroFS,
 }
 
 /// Borrowed filesystem view used by [`apply_prepared_batch`].
 pub(crate) struct WriteApplyContext<'a> {
-    pub(crate) fs: &'a ZeroFS,
+    fs: &'a ZeroFS,
 }
 
 impl ZeroFS {
@@ -137,7 +137,7 @@ impl ZeroFS {
     }
 
     /// Idempotent write retaining the original post-write attributes.
-    pub async fn write_idempotent(
+    pub(crate) async fn write_idempotent(
         &self,
         auth: &AuthContext,
         id: InodeId,

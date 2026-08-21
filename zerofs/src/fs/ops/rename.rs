@@ -21,7 +21,7 @@ use std::sync::atomic::Ordering;
 impl ZeroFS {
     /// True when `ancestor_id` is `descendant_id` or on its parent chain: the
     /// rename cycle guard. A parentless (hardlinked) inode reports false.
-    pub async fn is_ancestor_of(
+    async fn is_ancestor_of(
         &self,
         ancestor_id: InodeId,
         descendant_id: InodeId,
@@ -70,7 +70,7 @@ impl ZeroFS {
     /// `rename` tagged with an idempotency op-id: an applied retry is a no-op
     /// success instead of failing on the now-missing source. See
     /// [`Self::create_idempotent`].
-    pub async fn rename_idempotent(
+    pub(crate) async fn rename_idempotent(
         &self,
         auth: &AuthContext,
         from_dirid: u64,
@@ -84,7 +84,7 @@ impl ZeroFS {
     }
 
     /// Atomic no-replace rename tagged with an idempotency op-id.
-    pub async fn rename_noreplace_idempotent(
+    pub(crate) async fn rename_noreplace_idempotent(
         &self,
         auth: &AuthContext,
         from_dirid: u64,

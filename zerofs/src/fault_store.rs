@@ -54,70 +54,70 @@ pub struct FaultControls {
 }
 
 impl FaultControls {
-    pub fn partition_writes(&self, on: bool) {
+    pub(crate) fn partition_writes(&self, on: bool) {
         self.partition_writes.store(on, Ordering::SeqCst);
     }
-    pub fn fail_gets(&self, n: usize) {
+    pub(crate) fn fail_gets(&self, n: usize) {
         self.fail_next_gets.store(n, Ordering::SeqCst);
     }
-    pub fn fail_puts(&self, n: usize) {
+    pub(crate) fn fail_puts(&self, n: usize) {
         self.fail_next_puts.store(n, Ordering::SeqCst);
     }
-    pub fn fail_puts_after_apply(&self, n: usize) {
+    pub(crate) fn fail_puts_after_apply(&self, n: usize) {
         self.fail_after_puts.store(n, Ordering::SeqCst);
     }
     /// Make the next `n` gets return a body `by` bytes short of the claimed length.
-    pub fn truncate_gets(&self, n: usize, by: usize) {
+    pub(crate) fn truncate_gets(&self, n: usize, by: usize) {
         self.truncate_bytes.store(by, Ordering::SeqCst);
         self.truncate_next_gets.store(n, Ordering::SeqCst);
     }
-    pub fn get_count(&self) -> usize {
+    pub(crate) fn get_count(&self) -> usize {
         self.gets.load(Ordering::SeqCst)
     }
-    pub fn put_count(&self) -> usize {
+    pub(crate) fn put_count(&self) -> usize {
         self.puts.load(Ordering::SeqCst)
     }
-    pub fn put_paths(&self) -> Vec<String> {
+    pub(crate) fn put_paths(&self) -> Vec<String> {
         self.put_paths.lock().unwrap().clone()
     }
-    pub fn block_puts(&self) {
+    pub(crate) fn block_puts(&self) {
         self.block_puts.store(true, Ordering::SeqCst);
     }
-    pub fn release_puts(&self) {
+    pub(crate) fn release_puts(&self) {
         self.block_puts.store(false, Ordering::SeqCst);
         self.put_release.notify_waiters();
     }
-    pub fn release_put_path(&self, path: &str) {
+    pub(crate) fn release_put_path(&self, path: &str) {
         self.released_put_paths
             .lock()
             .unwrap()
             .insert(path.to_owned());
         self.put_release.notify_waiters();
     }
-    pub fn max_active_puts(&self) -> usize {
+    pub(crate) fn max_active_puts(&self) -> usize {
         self.max_active_puts.load(Ordering::SeqCst)
     }
-    pub fn put_activity(&self) -> Arc<Notify> {
+    pub(crate) fn put_activity(&self) -> Arc<Notify> {
         self.put_activity.clone()
     }
     #[cfg(test)]
-    pub fn block_heads(&self) {
+    pub(crate) fn block_heads(&self) {
         self.block_heads.store(true, Ordering::SeqCst);
     }
     #[cfg(test)]
-    pub fn release_heads(&self) {
+    pub(crate) fn release_heads(&self) {
         self.block_heads.store(false, Ordering::SeqCst);
         self.head_release.notify_waiters();
     }
     #[cfg(test)]
-    pub fn head_count(&self) -> usize {
+    pub(crate) fn head_count(&self) -> usize {
         self.heads.load(Ordering::SeqCst)
     }
     #[cfg(test)]
-    pub fn head_activity(&self) -> Arc<Notify> {
+    fn head_activity(&self) -> Arc<Notify> {
         self.head_activity.clone()
     }
-    pub fn force_put_etag(&self, e_tag: String) {
+    pub(crate) fn force_put_etag(&self, e_tag: String) {
         *self.forced_put_etag.lock().unwrap() = Some(e_tag);
     }
 }
@@ -142,7 +142,7 @@ pub struct FaultStore {
 
 impl FaultStore {
     /// Returns the store and its shared controls (default: no fault).
-    pub fn new(inner: Arc<dyn ObjectStore>) -> (Arc<Self>, Arc<FaultControls>) {
+    pub(crate) fn new(inner: Arc<dyn ObjectStore>) -> (Arc<Self>, Arc<FaultControls>) {
         let ctl = Arc::new(FaultControls::default());
         (
             Arc::new(Self {

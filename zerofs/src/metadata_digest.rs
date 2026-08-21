@@ -53,7 +53,7 @@ fn digest_line(bytes_delta: u64, ssts_delta: u64, l0: usize, l0_max: usize) -> O
     ))
 }
 
-pub fn spawn(
+pub(crate) fn spawn(
     recorder: Arc<DefaultMetricsRecorder>,
     status: tokio::sync::watch::Receiver<slatedb::DbStatus>,
     l0_max_ssts: usize,

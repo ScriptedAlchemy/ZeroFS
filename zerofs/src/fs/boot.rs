@@ -26,7 +26,7 @@ impl ZeroFS {
     /// Thin no-lease wrapper retained for the single-node constructors and tests;
     /// the replication-aware server path calls `new_with_slatedb_and_lease`.
     #[cfg(test)]
-    pub async fn new_with_slatedb(
+    pub(crate) async fn new_with_slatedb(
         slatedb: SlateDbHandle,
         max_bytes: u64,
         metrics_recorder: Option<Arc<DefaultMetricsRecorder>>,
@@ -412,7 +412,7 @@ impl ZeroFS {
 
     /// Flush and verify the client's oldest unflushed-write lineage token.
     /// Token zero means no unflushed write. A mismatched token returns `ESTALE`.
-    pub async fn client_fsync_verified(
+    pub(crate) async fn client_fsync_verified(
         &self,
         client_token: u64,
     ) -> Result<(), crate::fs::errors::FsError> {
@@ -428,12 +428,12 @@ impl ZeroFS {
     }
 
     #[cfg(test)]
-    pub async fn new_in_memory() -> anyhow::Result<Self> {
+    pub(crate) async fn new_in_memory() -> anyhow::Result<Self> {
         Self::new_in_memory_with_sync_writes(false).await
     }
 
     #[cfg(test)]
-    pub async fn new_in_memory_with_sync_writes(sync_writes: bool) -> anyhow::Result<Self> {
+    pub(crate) async fn new_in_memory_with_sync_writes(sync_writes: bool) -> anyhow::Result<Self> {
         use crate::block_transformer::ZeroFsBlockTransformer;
         use crate::config::CompressionConfig;
         use slatedb::BlockTransformer;
@@ -474,7 +474,7 @@ impl ZeroFS {
     }
 
     #[cfg(test)]
-    pub async fn new_in_memory_read_only(
+    pub(crate) async fn new_in_memory_read_only(
         object_store: Arc<dyn slatedb::object_store::ObjectStore>,
     ) -> anyhow::Result<Self> {
         use crate::block_transformer::ZeroFsBlockTransformer;

@@ -70,11 +70,12 @@ pub struct LocalBarrier {
 }
 
 impl LocalBarrier {
-    pub fn local_sequence(&self) -> Sequence {
+    #[cfg(test)]
+    fn local_sequence(&self) -> Sequence {
         self.progress.sequence()
     }
 
-    pub async fn wait_local(&self, sequence: Sequence) -> Result<(), LocalBarrierError> {
+    pub(crate) async fn wait_local(&self, sequence: Sequence) -> Result<(), LocalBarrierError> {
         self.progress.wait(self.incarnation, sequence).await
     }
 }
@@ -183,6 +184,11 @@ impl LocalJournalSink for Journal {
 // validations, which is also the journal queue's dequeue burst. RAM held by
 // prepared-but-unpublished payloads stays bounded by the submitters'
 // admission permits, not by this constant.
+//
+// Only `LocalJournaler::start` (test-only convenience; production always
+// supplies its own concurrency via `start_with_observer_and_space`) reads
+// this default.
+#[cfg(test)]
 const DEFAULT_LOCAL_PREPARE_CONCURRENCY: usize = 16;
 // Blob payloads are already external files, so this bounds the serialized
 // mutation metadata retained by one redb transaction without throttling large
@@ -268,11 +274,8 @@ pub(crate) struct SubmitSlot {
 }
 
 impl LocalJournaler {
-    pub fn start(
-        journal: Arc<Journal>,
-        admission: Admission,
-        queue_depth: usize,
-    ) -> AnyResult<Self> {
+    #[cfg(test)]
+    fn start(journal: Arc<Journal>, admission: Admission, queue_depth: usize) -> AnyResult<Self> {
         Self::start_with_observer(
             journal,
             admission,
@@ -282,7 +285,8 @@ impl LocalJournaler {
         )
     }
 
-    pub fn start_with_observer(
+    #[cfg(test)]
+    fn start_with_observer(
         journal: Arc<Journal>,
         admission: Admission,
         queue_depth: usize,
@@ -413,7 +417,7 @@ impl LocalJournaler {
         }
     }
 
-    pub fn barrier(&self) -> LocalBarrier {
+    pub(crate) fn barrier(&self) -> LocalBarrier {
         self.inner.barrier.clone()
     }
 
@@ -483,7 +487,7 @@ impl LocalJournaler {
         Ok(self.inner.barrier.clone())
     }
 
-    pub async fn shutdown(&self) -> Result<(), LocalBarrierError> {
+    pub(crate) async fn shutdown(&self) -> Result<(), LocalBarrierError> {
         let mut completion = self.inner.shutdown_result.subscribe();
         let mut local_progress = self.inner.barrier.progress.watcher();
         let mut local_progress_open = true;

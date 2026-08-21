@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from .protocols import (
+    NBD_CLIENT,
     NBD_DEVICE,
     NBD_PORT,
     NFS_PORT,
@@ -81,7 +82,7 @@ def _xfs_over_nbd_restart(context: ScenarioContext) -> ScenarioPlan:
             Step(
                 "reattach the device after restart",
                 (
-                    "nbd-client",
+                    NBD_CLIENT,
                     "127.0.0.1",
                     str(NBD_PORT),
                     NBD_DEVICE,
@@ -153,7 +154,7 @@ def _zfs_over_nbd_restart(context: ScenarioContext) -> ScenarioPlan:
             Step(
                 "reattach the device after restart",
                 (
-                    "nbd-client",
+                    NBD_CLIENT,
                     "127.0.0.1",
                     str(NBD_PORT),
                     NBD_DEVICE,

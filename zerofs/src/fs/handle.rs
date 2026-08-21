@@ -76,13 +76,13 @@ impl ZeroFS {
     /// `handle_closed` test path uses this; production decrements via the
     /// `OpenHandle` guard's drop.
     #[cfg(test)]
-    pub fn open_handle_dec(&self, id: InodeId) -> u64 {
+    fn open_handle_dec(&self, id: InodeId) -> u64 {
         dec_open_handle(&self.open_handles, id)
     }
 
     /// Current open-handle count for `id`. Consulted by `remove`/`rename`
     /// under the inode lock to choose defer-vs-delete.
-    pub fn open_handle_count(&self, id: InodeId) -> u64 {
+    pub(crate) fn open_handle_count(&self, id: InodeId) -> u64 {
         self.open_handles.get(&id).map(|r| *r).unwrap_or(0)
     }
 
@@ -138,7 +138,7 @@ impl ZeroFS {
     /// Synchronous decrement-then-reclaim. Production drives this through the
     /// `OpenHandle` guard (drop decrements) and the drainer.
     #[cfg(test)]
-    pub async fn handle_closed(&self, id: InodeId) {
+    pub(crate) async fn handle_closed(&self, id: InodeId) {
         // Decrement outside the lock; reclaim_if_unreferenced re-reads the count
         // (and nlink) under it.
         if self.open_handle_dec(id) > 0 {

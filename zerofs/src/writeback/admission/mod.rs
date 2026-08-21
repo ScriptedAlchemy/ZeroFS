@@ -6,8 +6,8 @@
 
 mod ram;
 
-pub use crate::coordination::admission::AdmissionError;
-pub use ram::{AcceptedAdmission, Admission, AdmissionPermit};
+pub(crate) use crate::coordination::admission::AdmissionError;
+pub(crate) use ram::{AcceptedAdmission, Admission};
 
 #[cfg(test)]
 mod tests;

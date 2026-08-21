@@ -42,7 +42,7 @@ pub(crate) fn default_retry_builder() -> ExponentialBuilder {
 pub struct PermanentError(Box<dyn std::error::Error + Send + Sync + 'static>);
 
 impl PermanentError {
-    pub fn new(error: impl std::error::Error + Send + Sync + 'static) -> Self {
+    pub(crate) fn new(error: impl std::error::Error + Send + Sync + 'static) -> Self {
         Self(Box::new(error))
     }
 }

@@ -27,7 +27,7 @@ const LEADER_MARKER: &str = ".zerofs_ha_leader";
 const OWNERSHIP_RECORD: &str = ".zerofs_ha_ownership";
 
 /// Covers the previous owner's cached authority, final validation, and response drain.
-pub const CLAIM_GRACE: Duration = crate::replication::AUTHORITY_TTL
+const CLAIM_GRACE: Duration = crate::replication::AUTHORITY_TTL
     .saturating_add(crate::replication::FINAL_OWNERSHIP_RECOVERY_TIMEOUT)
     .saturating_add(crate::replication::RESPONSE_DRAIN_TIMEOUT)
     .saturating_add(Duration::from_secs(1));
@@ -37,7 +37,7 @@ const HANDOFF_RENEW_INTERVAL: Duration = Duration::from_secs(1);
 const HANDOFF_TRANSITION_RETRY: Duration = Duration::from_millis(100);
 
 /// Required unchanged interval before a Claiming or Opening record is recoverable.
-pub const HANDOFF_STALE_AFTER: Duration = HANDOFF_RENEW_INTERVAL.saturating_mul(5);
+const HANDOFF_STALE_AFTER: Duration = HANDOFF_RENEW_INTERVAL.saturating_mul(5);
 
 fn leader_marker_path(db_path: &str) -> Path {
     Path::from(db_path).join(LEADER_MARKER)
@@ -417,24 +417,24 @@ pub struct Inspection {
 }
 
 impl Inspection {
-    pub fn phase(&self) -> Option<OwnershipPhase> {
+    pub(crate) fn phase(&self) -> Option<OwnershipPhase> {
         self.phase
     }
 
     /// Node identities that block startup on peer silence.
-    pub fn startup_blockers(&self) -> &[String] {
+    pub(crate) fn startup_blockers(&self) -> &[String] {
         &self.startup_blockers
     }
 
     /// Last active writer, including the bootstrap marker when no ownership record exists.
-    pub fn latest_writer(&self) -> Option<(u64, &str)> {
+    pub(crate) fn latest_writer(&self) -> Option<(u64, &str)> {
         self.latest_writer
             .as_ref()
             .map(|(epoch, node)| (*epoch, node.as_str()))
     }
 }
 
-pub async fn inspect(
+pub(crate) async fn inspect(
     object_store: &Arc<dyn ObjectStore>,
     db_path: &str,
 ) -> anyhow::Result<Inspection> {
@@ -753,7 +753,7 @@ impl Drop for HandoffLease {
 
 /// Shared representation for typed Claiming and Opening capabilities.
 #[doc(hidden)]
-pub struct HandoffToken<const OPENING: bool> {
+pub(crate) struct HandoffToken<const OPENING: bool> {
     lease: HandoffLease,
 }
 
@@ -769,13 +769,13 @@ impl<const OPENING: bool> HandoffToken<OPENING> {
 }
 
 /// Opaque renewable capability for the exact durable Claiming generation.
-pub type ClaimToken = HandoffToken<false>;
+pub(crate) type ClaimToken = HandoffToken<false>;
 
 /// Opaque renewable capability for the exact Opening generation.
-pub type OpeningToken = HandoffToken<true>;
+pub(crate) type OpeningToken = HandoffToken<true>;
 
 /// Validates Opening ownership and refreshes its object version.
-pub async fn validate_opening(token: &OpeningToken) -> anyhow::Result<bool> {
+pub(crate) async fn validate_opening(token: &OpeningToken) -> anyhow::Result<bool> {
     let mut state = token.lease.state.lock().await;
     if state.ownership_lost || state.renewal_failure.is_some() {
         return Ok(false);
@@ -823,12 +823,7 @@ impl ActiveOwnership {
         self.active().1
     }
 
-    pub(crate) fn for_test(
-        generation: u64,
-        node_id: &str,
-        incarnation: &str,
-        writer_epoch: u64,
-    ) -> Self {
+    fn for_test(generation: u64, node_id: &str, incarnation: &str, writer_epoch: u64) -> Self {
         Self {
             record: OwnershipRecord {
                 generation,
@@ -848,7 +843,7 @@ impl ActiveOwnership {
 /// unchanged Claiming/Opening record is recoverable after
 /// [`HANDOFF_STALE_AFTER`]. Force skips that observation interval. A failed CAS
 /// returns [`ClaimRejected`] without retrying against the observed generation.
-pub async fn claim(
+pub(crate) async fn claim(
     object_store: &Arc<dyn ObjectStore>,
     db_path: &str,
     node_id: &str,
@@ -859,7 +854,7 @@ pub async fn claim(
 
 /// Recovers only a Claiming or Opening record. Active and absent records return
 /// [`ClaimRejected`].
-pub async fn recover_handoff(
+pub(crate) async fn recover_handoff(
     object_store: &Arc<dyn ObjectStore>,
     db_path: &str,
     node_id: &str,
@@ -964,7 +959,7 @@ async fn claim_inner(
     }
 }
 
-pub async fn begin_open(token: ClaimToken) -> anyhow::Result<OpeningToken> {
+pub(crate) async fn begin_open(token: ClaimToken) -> anyhow::Result<OpeningToken> {
     begin_open_after(token, CLAIM_GRACE).await
 }
 
@@ -1030,7 +1025,7 @@ async fn begin_open_after(token: ClaimToken, grace: Duration) -> anyhow::Result<
 }
 
 /// Atomically publishes the writer epoch and activates the Opening owner.
-pub async fn activate(
+pub(crate) async fn activate(
     mut token: OpeningToken,
     writer_epoch: u64,
 ) -> anyhow::Result<ActiveOwnership> {
@@ -1103,7 +1098,7 @@ pub async fn activate(
 
 /// Returns true only for the exact Active generation, owner, incarnation,
 /// and writer epoch. Read and parse failures propagate.
-pub async fn validate_active(
+pub(crate) async fn validate_active(
     object_store: &Arc<dyn ObjectStore>,
     db_path: &str,
     ownership: &ActiveOwnership,

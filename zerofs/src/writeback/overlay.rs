@@ -126,7 +126,7 @@ impl std::fmt::Debug for OverlayIndex {
 }
 
 impl OverlayIndex {
-    pub fn new(remote: Arc<dyn ObjectStore>) -> Self {
+    pub(crate) fn new(remote: Arc<dyn ObjectStore>) -> Self {
         Self {
             remote,
             state: Arc::new(RwLock::new(OverlayState::default())),
@@ -136,7 +136,7 @@ impl OverlayIndex {
         }
     }
 
-    pub async fn recover(
+    pub(crate) async fn recover(
         remote: Arc<dyn ObjectStore>,
         journal: Arc<Journal>,
     ) -> anyhow::Result<Self> {
@@ -174,7 +174,8 @@ impl OverlayIndex {
         Ok(overlay)
     }
 
-    pub async fn install_memory(
+    #[cfg(test)]
+    pub(crate) async fn install_memory(
         &self,
         record: MutationRecord,
         payload: Bytes,
@@ -202,7 +203,7 @@ impl OverlayIndex {
         .await
     }
 
-    pub async fn install_delete(&self, record: MutationRecord) -> anyhow::Result<()> {
+    pub(crate) async fn install_delete(&self, record: MutationRecord) -> anyhow::Result<()> {
         if !matches!(record.kind, MutationKind::Delete) {
             anyhow::bail!("delete overlay requires a delete mutation");
         }
@@ -269,7 +270,7 @@ impl OverlayIndex {
         install_locked(&mut state, path, record, effect, payload)
     }
 
-    pub async fn mark_local(
+    pub(crate) async fn mark_local(
         &self,
         sequence: Sequence,
         journal: Arc<Journal>,
@@ -285,7 +286,7 @@ impl OverlayIndex {
     /// journal payload under a single write-lock acquisition. The committed
     /// records are supplied by the publication path, so no journal read is
     /// needed here.
-    pub async fn mark_local_batch(
+    async fn mark_local_batch(
         &self,
         records: &[MutationRecord],
         journal: Arc<Journal>,
@@ -326,7 +327,7 @@ impl OverlayIndex {
         Ok(())
     }
 
-    pub async fn remove_remote_prefix(&self, through: Sequence) {
+    pub(crate) async fn remove_remote_prefix(&self, through: Sequence) {
         let mut state = self.state.write().await;
         let affected = state
             .paths_by_sequence
@@ -352,14 +353,14 @@ impl OverlayIndex {
         self.blob_cache().retain(|sequence| sequence > through);
     }
 
-    pub async fn remove_sequence(&self, sequence: Sequence) {
+    pub(crate) async fn remove_sequence(&self, sequence: Sequence) {
         let mut state = self.state.write().await;
         remove_sequence_locked(&mut state, sequence);
         drop(state);
         self.blob_cache().retain(|cached| cached != sequence);
     }
 
-    pub async fn visible_version(
+    pub(crate) async fn visible_version(
         &self,
         location: &Path,
     ) -> object_store::Result<Option<VisibleVersion>> {
@@ -385,11 +386,11 @@ impl OverlayIndex {
             .is_some_and(|snapshot| matches!(snapshot.effect, OverlayEffect::Put))
     }
 
-    pub async fn get(&self, location: &Path) -> object_store::Result<GetResult> {
+    pub(crate) async fn get(&self, location: &Path) -> object_store::Result<GetResult> {
         self.get_opts(location, GetOptions::default()).await
     }
 
-    pub async fn head(&self, location: &Path) -> object_store::Result<ObjectMeta> {
+    pub(crate) async fn head(&self, location: &Path) -> object_store::Result<ObjectMeta> {
         let options = GetOptions {
             head: true,
             ..GetOptions::default()
@@ -397,7 +398,7 @@ impl OverlayIndex {
         Ok(self.get_opts(location, options).await?.meta)
     }
 
-    pub async fn get_opts(
+    pub(crate) async fn get_opts(
         &self,
         location: &Path,
         options: GetOptions,
@@ -481,7 +482,10 @@ impl OverlayIndex {
         self.remote.get_opts(location, options).await
     }
 
-    pub async fn list(&self, prefix: Option<&Path>) -> object_store::Result<Vec<ObjectMeta>> {
+    pub(crate) async fn list(
+        &self,
+        prefix: Option<&Path>,
+    ) -> object_store::Result<Vec<ObjectMeta>> {
         // Snapshot the overlay first so this list linearizes before any remote
         // publication/removal handoff that may run while the backend streams.
         let visible = self.visible_entries(prefix).await;
@@ -506,7 +510,7 @@ impl OverlayIndex {
         Ok(merged.into_values().collect())
     }
 
-    pub async fn list_with_delimiter(
+    pub(crate) async fn list_with_delimiter(
         &self,
         prefix: Option<&Path>,
     ) -> object_store::Result<ListResult> {
@@ -620,7 +624,7 @@ pub struct OverlayCommitObserver {
 }
 
 impl OverlayCommitObserver {
-    pub fn new(overlay: OverlayIndex, journal: Arc<Journal>) -> Self {
+    pub(crate) fn new(overlay: OverlayIndex, journal: Arc<Journal>) -> Self {
         Self { overlay, journal }
     }
 }

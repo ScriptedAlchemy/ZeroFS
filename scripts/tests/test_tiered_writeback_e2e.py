@@ -58,7 +58,7 @@ from scripts.tiered_writeback_e2e.lifecycle import (
     assert_source_idle,
 )
 from scripts.tiered_writeback_e2e import linux_suites, protocols
-from scripts.tiered_writeback_e2e.protocols import ScenarioContext
+from scripts.tiered_writeback_e2e.protocols import NBD_CLIENT, ScenarioContext
 from scripts.vm100_pilot.runner import Runner
 
 RUN_UUID = "1f4a3c60-8f6f-4c39-9f3e-2b8f6f2d9a01"
@@ -583,7 +583,7 @@ class CleanupTests(HarnessCase):
         lifecycle.cleanup(ledger)
         commands = [args for args, _ in runner.calls]
         self.assertIn(("zpool", "destroy", pool), commands)
-        self.assertIn(("nbd-client", "-d", "/dev/nbd7"), commands)
+        self.assertIn((NBD_CLIENT, "-d", "/dev/nbd7"), commands)
         self.assertIn(("umount", str(mountpoint)), commands)
         self.assertNotIn(("kill", "-9", "4242"), commands)
         self.assertIn(("systemctl", "stop", config.unit_name), commands)
@@ -776,9 +776,9 @@ class ScenarioPlanTests(HarnessCase):
 
     def test_nbd_leg_connects_flushes_and_disconnects(self) -> None:
         steps = self.steps_for("nbd-flush-covers-prior-ninep")
-        self.assertTrue(any(argv[0] == "nbd-client" for argv in steps))
+        self.assertTrue(any(argv[0] == NBD_CLIENT for argv in steps))
         self.assertTrue(any(argv[:2] == ("blockdev", "--flushbufs") for argv in steps))
-        self.assertIn(("nbd-client", "-d", "/dev/nbd7"), steps)
+        self.assertIn((NBD_CLIENT, "-d", "/dev/nbd7"), steps)
 
     def test_webui_rpc_path_mutates_rpc_and_moves_bytes_over_websocket(self) -> None:
         steps = self.steps_for("webui-rpc-production-path")

@@ -150,7 +150,7 @@ pub struct PassOutcome {
     pub chains: ChainOutcome,
     /// Store-wide dead-space percent at scan time (0 on a skipped pass). The
     /// cadence uses it to keep a busy store draining while the backlog is large.
-    pub dead_percent: u64,
+    pub(crate) dead_percent: u64,
 }
 
 /// Per-pass chain accounting: assembled, how many packed, and the rest by
@@ -162,8 +162,8 @@ pub struct ChainOutcome {
     pub assembled: usize,
     pub packed: usize,
     pub deferred: usize,
-    pub warm: usize,
-    pub unpackable: usize,
+    pub(crate) warm: usize,
+    pub(crate) unpackable: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -184,7 +184,7 @@ impl ExtentStore {
     /// Returns (segments deleted, frames relocated); production goes through
     /// [`Self::reclaim_segments_gated`], which also reports saturation.
     #[cfg(test)]
-    pub async fn reclaim_segments(
+    pub(crate) async fn reclaim_segments(
         &self,
         delete_horizon: DateTime<Utc>,
         // Set when a persistent checkpoint pins a view; see the `pinned` gate
@@ -949,7 +949,7 @@ impl ExtentStore {
     /// persisted wall-clock timestamp so the cadence survives restarts (an
     /// uptime timer would never fire on a frequently-restarting deployment).
     /// Returns the orphans reclaimed, or `None` when not yet due.
-    pub async fn sweep_orphans_if_due(
+    pub(crate) async fn sweep_orphans_if_due(
         &self,
         interval: chrono::Duration,
     ) -> Result<Option<usize>, FsError> {

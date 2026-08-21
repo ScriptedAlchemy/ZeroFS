@@ -12,7 +12,7 @@ use tokio::net::UnixStream;
 use tonic::transport::{Channel, Endpoint, Uri};
 use tower::service_fn;
 
-pub struct AdminClient {
+pub(crate) struct AdminClient {
     client: AdminServiceClient<Channel>,
 }
 
@@ -20,7 +20,7 @@ impl AdminClient {
     /// Connect to a gateway admin endpoint. Accepted forms:
     /// `unix:///path/to.sock` (or `unix:/path`), `http://host:port`, or a
     /// bare `host:port` (treated as http).
-    pub async fn connect(endpoint: &str) -> Result<Self> {
+    pub(crate) async fn connect(endpoint: &str) -> Result<Self> {
         if let Some(path) = endpoint
             .strip_prefix("unix://")
             .or_else(|| endpoint.strip_prefix("unix:"))
@@ -67,7 +67,7 @@ impl AdminClient {
 
     /// mkdir -p `path` on the gateway. Returns true when this call created
     /// the leaf directory, false when it already existed.
-    pub async fn create_directory(
+    pub(crate) async fn create_directory(
         &self,
         path: &str,
         mode: u32,
@@ -89,7 +89,7 @@ impl AdminClient {
 
     /// Remove `path` and everything below it on the gateway. Idempotent;
     /// deletion completes in the background on the gateway.
-    pub async fn remove_directory(&self, path: &str) -> Result<(), tonic::Status> {
+    pub(crate) async fn remove_directory(&self, path: &str) -> Result<(), tonic::Status> {
         self.client
             .clone()
             .remove_directory(RemoveDirectoryRequest {

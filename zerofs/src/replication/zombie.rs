@@ -16,14 +16,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Debug)]
-pub struct ZombieObjectStore {
+pub(crate) struct ZombieObjectStore {
     inner: Arc<dyn ObjectStore>,
     isolated: Arc<AtomicBool>,
 }
 
 impl ZombieObjectStore {
     /// Returns the store and the shared isolation flag (true = partition writes).
-    pub fn new(inner: Arc<dyn ObjectStore>) -> (Arc<Self>, Arc<AtomicBool>) {
+    fn new(inner: Arc<dyn ObjectStore>) -> (Arc<Self>, Arc<AtomicBool>) {
         let isolated = Arc::new(AtomicBool::new(false));
         (
             Arc::new(Self {

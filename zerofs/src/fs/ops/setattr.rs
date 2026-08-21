@@ -92,7 +92,7 @@ impl ZeroFS {
 
     /// Idempotent setattr retaining the original post-operation attributes.
     /// A delayed truncate retry does not affect later writes.
-    pub async fn setattr_idempotent(
+    pub(crate) async fn setattr_idempotent(
         &self,
         creds: &Credentials,
         id: InodeId,

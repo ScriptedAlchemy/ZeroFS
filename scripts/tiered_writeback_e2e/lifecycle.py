@@ -25,7 +25,7 @@ from .config import (
 from .crash import CRASH_SCENARIOS
 from .integrity import sha256_file, verify_copied_tree
 from .linux_suites import PINNED_REVISIONS, SUITE_SCENARIOS
-from .protocols import PROTOCOL_SCENARIOS, ScenarioBuilder, ScenarioContext
+from .protocols import NBD_CLIENT, PROTOCOL_SCENARIOS, ScenarioBuilder, ScenarioContext
 from .resources import ResourceLedger
 
 
@@ -234,7 +234,7 @@ class Probes:
         return self._succeeds(["mountpoint", "-q", mountpoint])
 
     def device_attached(self, device: str) -> bool:
-        return self._succeeds(["nbd-client", "-c", device])
+        return self._succeeds([NBD_CLIENT, "-c", device])
 
     def pool_exists(self, name: str) -> bool:
         return self._succeeds(["zpool", "list", "-H", "-o", "name", name])
@@ -358,7 +358,7 @@ class HarnessLifecycle:
                 self.runner.run(["umount", mountpoint], sudo=True)
         elif kind == "device":
             if self.probes.device_attached(str(value)):
-                self.runner.run(["nbd-client", "-d", str(value)], sudo=True)
+                self.runner.run([NBD_CLIENT, "-d", str(value)], sudo=True)
         elif kind == "pool":
             if self.probes.pool_exists(str(value)):
                 self.runner.run(["zpool", "destroy", str(value)], sudo=True)

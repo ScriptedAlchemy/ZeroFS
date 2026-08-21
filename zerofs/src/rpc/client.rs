@@ -205,7 +205,7 @@ impl RpcClient {
 
     /// Test helper for the admin create-directory RPC.
     #[cfg(test)]
-    pub async fn create_directory(
+    pub(crate) async fn create_directory(
         &self,
         path: &str,
         mode: u32,
@@ -232,7 +232,7 @@ impl RpcClient {
 
     /// Test helper for the admin remove-directory RPC.
     #[cfg(test)]
-    pub async fn remove_directory(&self, path: &str) -> Result<()> {
+    pub(crate) async fn remove_directory(&self, path: &str) -> Result<()> {
         let request = proto::RemoveDirectoryRequest {
             path: path.to_string(),
         };

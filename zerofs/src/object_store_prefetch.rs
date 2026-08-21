@@ -25,7 +25,7 @@ use crate::alloc_rss;
 #[derive(Clone, Copy, Debug)]
 pub struct SkipPartsCache;
 
-pub const DEFAULT_PART_SIZE_BYTES: usize = 128 * 1024;
+const DEFAULT_PART_SIZE_BYTES: usize = 128 * 1024;
 const HEADS_CAPACITY_ENTRIES: usize = 16 * 1024;
 const ACCESS_TRACKER_CAPACITY: usize = 8 * 1024;
 
@@ -44,12 +44,12 @@ const PREFETCH_DEPTH_WINDOWS: usize = 4;
 /// every backend that does not publish a profile of its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PrefetchProfile {
-    pub part_size_bytes: usize,
-    pub fetch_window_min_bytes: usize,
+    part_size_bytes: usize,
+    fetch_window_min_bytes: usize,
     /// Window floor once a stream is confirmed sequential. Never below
     /// `fetch_window_min_bytes`, never above `fetch_window_max_bytes`.
-    pub sequential_fetch_window_min_bytes: usize,
-    pub fetch_window_max_bytes: usize,
+    sequential_fetch_window_min_bytes: usize,
+    fetch_window_max_bytes: usize,
 }
 
 impl Default for PrefetchProfile {
@@ -67,7 +67,7 @@ impl PrefetchProfile {
     /// Tuning for a high-latency backend: the caller sets the part size and the
     /// window bounds, and a confirmed sequential stream starts at the multiplied
     /// minimum, capped by the maximum.
-    pub fn tuned(
+    pub(crate) fn tuned(
         part_size_bytes: usize,
         fetch_window_min_bytes: usize,
         fetch_window_max_bytes: usize,
@@ -646,13 +646,13 @@ impl EvictionCtx {
 
 impl PrefetchingObjectStore {
     /// Build with the crate default tuning.
-    pub fn new(inner: Arc<dyn ObjectStore>, parts: HybridCache<PartKey, Bytes>) -> Self {
+    pub(crate) fn new(inner: Arc<dyn ObjectStore>, parts: HybridCache<PartKey, Bytes>) -> Self {
         Self::with_profile(inner, parts, PrefetchProfile::default())
     }
 
     /// Build over a backend's resolved [`PrefetchProfile`]; `Default` gives the
     /// crate tuning.
-    pub fn with_profile(
+    pub(crate) fn with_profile(
         inner: Arc<dyn ObjectStore>,
         parts: HybridCache<PartKey, Bytes>,
         profile: PrefetchProfile,
@@ -668,7 +668,7 @@ impl PrefetchingObjectStore {
     }
 
     #[cfg(test)]
-    pub fn with_options(
+    fn with_options(
         inner: Arc<dyn ObjectStore>,
         parts: HybridCache<PartKey, Bytes>,
         part_size_bytes: usize,
@@ -747,7 +747,7 @@ impl PrefetchingObjectStore {
 
     /// RSS admission ceiling (configured clean-cache total). `0` leaves
     /// inserts ungated (tests).
-    pub fn with_admission_cap(mut self, cap_bytes: u64) -> Self {
+    pub(crate) fn with_admission_cap(mut self, cap_bytes: u64) -> Self {
         self.admission_cap_bytes = cap_bytes;
         self
     }
@@ -833,7 +833,7 @@ impl PrefetchingObjectStore {
 
     /// Backend GET that does not `save_get_result`, `read_part`, or
     /// `spawn_async_prefetch`. GC/compaction use this (or `SkipPartsCache`).
-    pub async fn get_opts_uncached(
+    async fn get_opts_uncached(
         &self,
         location: &Path,
         options: GetOptions,
@@ -1315,7 +1315,7 @@ impl PrefetchingObjectStore {
     /// Warm the parts cache with an object's full bytes, sliced into
     /// part-sized entries keyed as the read path expects. For callers that
     /// hold the bytes but upload via multipart, which doesn't write through.
-    pub fn warm_object(&self, location: &Path, bytes: Bytes, result: &PutResult) {
+    pub(crate) fn warm_object(&self, location: &Path, bytes: Bytes, result: &PutResult) {
         let Some(generation) = CacheGeneration::from_put_result(result) else {
             return;
         };

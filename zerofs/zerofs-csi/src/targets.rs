@@ -3,7 +3,7 @@
 use ninep_client::Target;
 
 /// Split a comma-separated parameter into trimmed, non-empty segments.
-pub fn split(spec: &str) -> Vec<&str> {
+pub(crate) fn split(spec: &str) -> Vec<&str> {
     spec.split(',')
         .map(str::trim)
         .filter(|segment| !segment.is_empty())
@@ -11,7 +11,7 @@ pub fn split(spec: &str) -> Vec<&str> {
 }
 
 /// Parse the `gateway` parameter using the shared 9P target grammar.
-pub fn parse_9p_targets(spec: &str) -> Result<Vec<Target>, String> {
+pub(crate) fn parse_9p_targets(spec: &str) -> Result<Vec<Target>, String> {
     Target::parse_list(spec)
 }
 

@@ -72,8 +72,8 @@ pub enum DedupResult {
 /// One completed mutation and the result associated with its client op id.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DedupEntry {
-    pub op_id: OpId,
-    pub result: DedupResult,
+    pub(crate) op_id: OpId,
+    pub(crate) result: DedupResult,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -170,7 +170,7 @@ impl DedupResult {
     }
 
     /// Encode a versioned replication result.
-    pub fn encode_wire(&self) -> Result<Vec<u8>, DedupWireError> {
+    pub(crate) fn encode_wire(&self) -> Result<Vec<u8>, DedupWireError> {
         let encoded = wire_options()
             .serialize(self)
             .map_err(DedupWireError::InvalidResult)?;
@@ -181,7 +181,7 @@ impl DedupResult {
     }
 
     /// Decode a versioned replication result.
-    pub fn decode_wire(raw: &[u8]) -> Result<Self, DedupWireError> {
+    fn decode_wire(raw: &[u8]) -> Result<Self, DedupWireError> {
         let (&version, encoded) = raw.split_first().ok_or(DedupWireError::EmptyResult)?;
         if version != DEDUP_RESULT_WIRE_VERSION {
             return Err(DedupWireError::UnsupportedVersion(version));
@@ -193,7 +193,7 @@ impl DedupResult {
 }
 
 impl DedupEntry {
-    pub fn from_wire(op_id: &[u8], result: &[u8]) -> Result<Self, DedupWireError> {
+    pub(crate) fn from_wire(op_id: &[u8], result: &[u8]) -> Result<Self, DedupWireError> {
         let op_id: OpId = op_id
             .try_into()
             .map_err(|_| DedupWireError::InvalidOpIdLength(op_id.len()))?;
@@ -206,7 +206,7 @@ impl DedupEntry {
         })
     }
 
-    pub fn to_wire_parts(&self) -> Result<(Vec<u8>, Vec<u8>), DedupWireError> {
+    pub(crate) fn to_wire_parts(&self) -> Result<(Vec<u8>, Vec<u8>), DedupWireError> {
         if !has_op_id(&self.op_id) {
             return Err(DedupWireError::MissingOpId);
         }
@@ -215,7 +215,7 @@ impl DedupEntry {
 }
 
 /// Whether an op id was actually supplied (non-zero).
-pub fn has_op_id(op_id: &OpId) -> bool {
+pub(crate) fn has_op_id(op_id: &OpId) -> bool {
     op_id.iter().any(|&b| b != 0)
 }
 
@@ -245,11 +245,11 @@ const EXPIRY_REAP_BATCH: usize = 256;
 #[derive(Debug, Clone, Copy)]
 pub struct DedupStats {
     /// Completed outcomes retained for exact replay.
-    pub retained_results: usize,
+    pub(crate) retained_results: usize,
     /// Distinct operation IDs currently being applied.
-    pub inflight_ids: usize,
+    pub(crate) inflight_ids: usize,
     /// Retained outcomes currently pinned while a reply is reconstructed.
-    pub replay_pinned_results: usize,
+    pub(crate) replay_pinned_results: usize,
 }
 
 struct Inner {
@@ -499,7 +499,7 @@ impl DedupCache {
     }
 
     /// Starts the expiry reaper once.
-    pub fn start_expiry_reaper(self: &Arc<Self>) {
+    pub(crate) fn start_expiry_reaper(self: &Arc<Self>) {
         let Some(receiver) = self.expiry_rx.lock().unwrap().take() else {
             return;
         };
@@ -616,7 +616,7 @@ impl DedupCache {
     ///
     /// An unexpired result is pinned for replay. A new initial frame reserves an
     /// apply slot. Unseen retries require promotion grace for their origin epoch.
-    pub async fn begin_attempt_from_origin(
+    pub(crate) async fn begin_attempt_from_origin(
         self: &Arc<Self>,
         op_id: OpId,
         is_retry: bool,
@@ -653,7 +653,7 @@ impl DedupCache {
     }
 
     /// Return a live or replay-pinned result.
-    pub fn get(&self, op_id: &OpId) -> Option<DedupResult> {
+    pub(crate) fn get(&self, op_id: &OpId) -> Option<DedupResult> {
         if !has_op_id(op_id) {
             return None;
         }
@@ -667,7 +667,7 @@ impl DedupCache {
     }
 
     /// Return physical ledger occupancy.
-    pub fn stats(&self) -> DedupStats {
+    pub(crate) fn stats(&self) -> DedupStats {
         let inner = self.inner.lock().unwrap();
         DedupStats {
             retained_results: inner.entries.len() - inner.inflight_ids,
@@ -688,7 +688,7 @@ impl DedupCache {
         self.record_entry_with_write_request(entry, None, false)
     }
 
-    pub(crate) fn record_accepted_write_entry(
+    fn record_accepted_write_entry(
         &self,
         entry: DedupEntry,
         fingerprint: [u8; 32],
@@ -810,7 +810,7 @@ impl DedupCache {
     /// replay deadline. A failed materialization retracts the optimistic
     /// in-memory result; a successful one makes the original deadline
     /// collectible immediately if it elapsed while apply was blocked.
-    pub(crate) fn finish_accepted_write(&self, op_id: &OpId, materialized: bool) {
+    fn finish_accepted_write(&self, op_id: &OpId, materialized: bool) {
         if !has_op_id(op_id) {
             return;
         }
@@ -848,7 +848,21 @@ impl DedupCache {
         self.notify_reclaim(reclaim);
     }
 
+    #[cfg(test)]
     pub(crate) fn replay_write(&self, op_id: &OpId, fingerprint: [u8; 32]) -> Option<WriteReplay> {
+        self.replay_write_entry(op_id, fingerprint)
+            .map(|(replay, _)| replay)
+    }
+
+    /// The replay verdict together with the completed result it judges, read
+    /// under one lock. A caller that must both reject a fingerprint collision
+    /// and answer a replay with the original attributes therefore cannot
+    /// observe an expiry between two separate lookups.
+    pub(crate) fn replay_write_entry(
+        &self,
+        op_id: &OpId,
+        fingerprint: [u8; 32],
+    ) -> Option<(WriteReplay, FileAttributes)> {
         if !has_op_id(op_id) {
             return None;
         }
@@ -861,16 +875,18 @@ impl DedupCache {
         if entry.retracted {
             return None;
         }
-        if !matches!(entry.value, DedupResult::Write { .. }) {
+        let DedupResult::Write { attrs } = &entry.value else {
             return None;
-        }
-        Some(match entry.write_request {
+        };
+        let attrs = attrs.clone();
+        let replay = match entry.write_request {
             Some(request) if request.fingerprint == fingerprint => WriteReplay::Match {
                 count: request.count,
             },
             Some(_) => WriteReplay::FingerprintMismatch,
             None => WriteReplay::Legacy,
-        })
+        };
+        Some((replay, attrs))
     }
 
     #[cfg(test)]
@@ -881,7 +897,7 @@ impl DedupCache {
         )
     }
 
-    pub fn record_entry(&self, entry: DedupEntry) {
+    pub(crate) fn record_entry(&self, entry: DedupEntry) {
         let _ = self.record_entry_with_expiry(entry);
     }
 
@@ -930,7 +946,7 @@ impl DedupCache {
     }
 
     /// Maximum replay-protection deadline for an inode.
-    pub(crate) fn replay_inode_protected_until(&self, inode_id: InodeId) -> Option<Instant> {
+    fn replay_inode_protected_until(&self, inode_id: InodeId) -> Option<Instant> {
         let inner = self.inner.lock().unwrap();
         inner
             .protected_inodes
@@ -954,7 +970,7 @@ impl DedupCache {
     }
 
     #[cfg(test)]
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.stats().retained_results == 0
     }
 }

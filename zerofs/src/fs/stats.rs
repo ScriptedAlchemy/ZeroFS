@@ -7,33 +7,33 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
 pub struct StatsShardData {
-    pub used_bytes: u64,
-    pub used_inodes: u64,
+    pub(crate) used_bytes: u64,
+    pub(crate) used_inodes: u64,
 }
 
 pub struct StatsShard {
-    pub used_bytes: AtomicU64,
-    pub used_inodes: AtomicU64,
+    used_bytes: AtomicU64,
+    used_inodes: AtomicU64,
 }
 
 pub struct FileSystemGlobalStats {
-    pub shards: Vec<StatsShard>,
+    shards: Vec<StatsShard>,
     key_codec: Arc<KeyCodec>,
 }
 
 /// Absolute shard values staged by the commit worker for one batch. The
 /// encoded value goes into the batch itself; once the batch is in the
 /// memtable, `publish` makes the same values the visible in-memory counters.
-pub struct StagedShard {
+pub(crate) struct StagedShard {
     shard_id: usize,
-    pub key: Bytes,
-    pub value: Bytes,
+    pub(crate) key: Bytes,
+    pub(crate) value: Bytes,
     data: StatsShardData,
 }
 
 /// Signed difference `new_size - old_size`, clamped to ±i64::MAX. The clamp
 /// is symmetric so a clamped grow and the matching shrink cancel exactly.
-pub fn size_delta(old_size: u64, new_size: u64) -> i64 {
+pub(crate) fn size_delta(old_size: u64, new_size: u64) -> i64 {
     if new_size >= old_size {
         i64::try_from(new_size - old_size).unwrap_or(i64::MAX)
     } else {
@@ -44,7 +44,7 @@ pub fn size_delta(old_size: u64, new_size: u64) -> i64 {
 }
 
 impl FileSystemGlobalStats {
-    pub fn new(key_codec: Arc<KeyCodec>) -> Self {
+    pub(crate) fn new(key_codec: Arc<KeyCodec>) -> Self {
         let shards = (0..STATS_SHARDS)
             .map(|_| StatsShard {
                 used_bytes: AtomicU64::new(0),
@@ -64,7 +64,7 @@ impl FileSystemGlobalStats {
         (total_bytes, total_inodes)
     }
 
-    pub fn shard_of(&self, inode_id: InodeId) -> usize {
+    pub(crate) fn shard_of(&self, inode_id: InodeId) -> usize {
         inode_id as usize % STATS_SHARDS
     }
 
@@ -74,7 +74,7 @@ impl FileSystemGlobalStats {
     /// read-modify-write sound.
     ///
     /// [`publish`]: Self::publish
-    pub fn stage_delta(&self, shard_id: usize, bytes: i64, inodes: i64) -> StagedShard {
+    pub(crate) fn stage_delta(&self, shard_id: usize, bytes: i64, inodes: i64) -> StagedShard {
         let shard = &self.shards[shard_id];
         let data = StatsShardData {
             used_bytes: shard
@@ -98,7 +98,7 @@ impl FileSystemGlobalStats {
 
     /// Make staged values the visible in-memory counters, after the batch
     /// carrying them was written.
-    pub fn publish(&self, staged: &StagedShard) {
+    pub(crate) fn publish(&self, staged: &StagedShard) {
         let shard = &self.shards[staged.shard_id];
         shard
             .used_bytes
@@ -109,7 +109,7 @@ impl FileSystemGlobalStats {
     }
 
     /// Load statistics from persistent storage
-    pub fn load_shard(&self, shard_id: usize, data: &StatsShardData) {
+    pub(crate) fn load_shard(&self, shard_id: usize, data: &StatsShardData) {
         if shard_id < self.shards.len() {
             self.shards[shard_id]
                 .used_bytes

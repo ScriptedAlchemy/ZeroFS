@@ -1,11 +1,28 @@
 from __future__ import annotations
 
 import os
+import shutil
 import signal
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, Callable, Mapping, Sequence
+
+
+def resolve_nbd_client() -> str:
+    """Resolve the `nbd-client` binary shared by every harness that shells out to it.
+
+    Every call site (vm100_pilot's migration harness, tiered_writeback_e2e's
+    crash/lifecycle/protocol scenarios) must go through this resolver instead
+    of a bare "nbd-client" string. `sudo`'s `secure_path` commonly omits
+    directories from the invoking user's own PATH, so a bare command name can
+    resolve differently under `sudo` than it does directly — an absolute path
+    closes that gap. We still prefer whatever `nbd-client` resolves to on this
+    process's PATH (so environments that install it somewhere other than
+    `/usr/sbin` keep working) and only fall back to the Debian/Ubuntu
+    packaging location when it can't be found on PATH at all.
+    """
+    return shutil.which("nbd-client") or "/usr/sbin/nbd-client"
 
 
 class CommandError(RuntimeError):

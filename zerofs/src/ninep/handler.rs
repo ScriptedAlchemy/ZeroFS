@@ -462,7 +462,7 @@ impl NinePHandler {
     }
 
     #[cfg(test)]
-    pub fn handler_id(&self) -> u64 {
+    pub(crate) fn handler_id(&self) -> u64 {
         self.handler_id
     }
 
@@ -651,13 +651,13 @@ impl NinePHandler {
 
     /// Op-id-less dispatch for the unit tests; production passes the frame op-id.
     #[cfg(test)]
-    pub async fn handle_message(&self, tag: u16, msg: Message) -> P9Message {
+    pub(crate) async fn handle_message(&self, tag: u16, msg: Message) -> P9Message {
         self.handle_message_with_op_id(tag, [0u8; 16], msg).await
     }
 
     /// Test dispatch using initial-attempt framing.
     #[cfg(test)]
-    pub async fn handle_message_with_op_id(
+    pub(crate) async fn handle_message_with_op_id(
         &self,
         tag: u16,
         op_id: crate::dedup::OpId,
@@ -681,7 +681,7 @@ impl NinePHandler {
     }
 
     #[cfg(test)]
-    pub async fn handle_message_with_op_envelope_origin(
+    pub(crate) async fn handle_message_with_op_envelope_origin(
         &self,
         tag: u16,
         op_id: crate::dedup::OpId,
@@ -1858,31 +1858,12 @@ impl NinePHandler {
         let auth = AuthContext::from(&fid_entry.creds);
         let data_len = u32::try_from(tw.data.len()).map_err(|_| P9Error::InvalidArgument)?;
         let data = Bytes::from(tw.data);
-        let fingerprint = crate::fs::mutation::overlay_helpers::direct_write_fingerprint(
-            &auth,
-            fid_entry.inode_id,
-            tw.offset,
-            &data,
-            op_id,
-            false,
-            b"9p-twrite-opened",
-        );
-        match self
-            .filesystem
-            .dedup
-            .replay_write(&op_id, fingerprint.into_bytes())
-        {
-            Some(crate::dedup::WriteReplay::Match { count }) => {
-                return Ok(Message::Rwrite(Rwrite { count }));
-            }
-            Some(crate::dedup::WriteReplay::FingerprintMismatch) => {
-                return Err(P9Error::InvalidArgument);
-            }
-            Some(crate::dedup::WriteReplay::Legacy) => {
-                return Ok(Message::Rwrite(Rwrite { count: data_len }));
-            }
-            None => {}
-        }
+        // Replay is decided once, inside `write_ack_identified`: it consults
+        // the ledger under the same `b"9p-twrite-opened"` fingerprint before
+        // taking any admission or staging cost, replays a completed write with
+        // its original attributes, and rejects an operation-id collision with
+        // `InvalidArgument`. A replayed write acknowledges the same byte count
+        // as the original, because the payload is part of that fingerprint.
         let (identity, request_lifetime) = if crate::dedup::has_op_id(&op_id) {
             (
                 RequestIdentity::NineP {

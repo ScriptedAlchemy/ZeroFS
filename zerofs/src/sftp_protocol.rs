@@ -19,13 +19,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(test)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SftpBenchTiming {
-    pub open_nanos: u64,
-    pub publication_window_nanos: u64,
-    pub hardlink_nanos: u64,
-    pub remove_nanos: u64,
-    pub publications: u64,
-    pub session_publications: [u64; 32],
-    pub session_write_bytes: [u64; 32],
+    pub(crate) open_nanos: u64,
+    pub(crate) publication_window_nanos: u64,
+    pub(crate) hardlink_nanos: u64,
+    pub(crate) remove_nanos: u64,
+    pub(crate) publications: u64,
+    pub(crate) session_publications: [u64; 32],
+    pub(crate) session_write_bytes: [u64; 32],
 }
 
 #[cfg(test)]

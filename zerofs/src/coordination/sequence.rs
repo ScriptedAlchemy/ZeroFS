@@ -56,6 +56,7 @@ impl<E: BarrierError> SequenceBarrier<E> {
     }
 
     /// The sequence that is currently durable at this stage.
+    #[cfg(test)]
     pub(crate) fn sequence(&self) -> Sequence {
         self.progress.borrow().sequence
     }

@@ -14,7 +14,7 @@ use std::sync::atomic::Ordering;
 /// Hard ceiling for one protocol-neutral directory page. Network adapters may
 /// derive their requested entry count from untrusted byte-count fields, so the
 /// filesystem must enforce its own bound before opening a directory scan.
-pub(crate) const MAX_READDIR_ENTRIES: usize = 4_096;
+const MAX_READDIR_ENTRIES: usize = 4_096;
 
 impl ZeroFS {
     /// Resolve `filename` in `dirid` to its inode id (requires execute on the
@@ -81,7 +81,7 @@ impl ZeroFS {
     /// `.` and `..`), up to `max_entries`. Attributes come from the entry's
     /// embedded inode when current, else a point lookup; entries whose inode
     /// vanished mid-scan are skipped.
-    pub async fn readdir(
+    pub(crate) async fn readdir(
         &self,
         auth: &AuthContext,
         dirid: InodeId,

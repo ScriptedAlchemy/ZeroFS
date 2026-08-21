@@ -37,7 +37,7 @@ impl P9Response {
     }
 }
 
-pub(crate) fn response_requires_serving_authority(response_bytes: &[u8]) -> bool {
+fn response_requires_serving_authority(response_bytes: &[u8]) -> bool {
     !matches!(
         response_bytes.get(4),
         Some(&RLERROR_TYPE) | Some(&RVERSION_TYPE)

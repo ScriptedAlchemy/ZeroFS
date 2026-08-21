@@ -58,7 +58,7 @@ fn fixed_two_fids(body: &[u8]) -> FidFootprint {
 }
 
 /// Decode the fid-bearing prefix needed for receive-order barriers.
-pub(super) fn request_fid_footprint(type_byte: u8, body: &[u8]) -> FidFootprint {
+fn request_fid_footprint(type_byte: u8, body: &[u8]) -> FidFootprint {
     match type_byte {
         TVERSION_TYPE => FidFootprint::All,
 

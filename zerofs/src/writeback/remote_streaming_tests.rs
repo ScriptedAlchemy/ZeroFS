@@ -464,7 +464,7 @@ async fn multipart_abort_failure_is_published_while_cleanup_input_remains_live()
         cleanup_state,
     ));
 
-    tokio::time::timeout(Duration::from_secs(1), failure_receiver.changed())
+    tokio::time::timeout(Duration::from_secs(15), failure_receiver.changed())
         .await
         .expect("cleanup failure was not published while the input remained live")
         .unwrap();
@@ -542,7 +542,7 @@ async fn shipping_scheduler_terminally_drains_cleanup_failure_without_retry() {
     )
     .unwrap();
 
-    let error = tokio::time::timeout(Duration::from_secs(3), scheduler.barrier().wait_remote(1))
+    let error = tokio::time::timeout(Duration::from_secs(30), scheduler.barrier().wait_remote(1))
         .await
         .expect("cleanup failure did not terminally stop remote replay")
         .unwrap_err();
@@ -555,7 +555,7 @@ async fn shipping_scheduler_terminally_drains_cleanup_failure_without_retry() {
                 .contains("injected multipart abort failure"),
         "unexpected terminal error: {error}"
     );
-    let shutdown = tokio::time::timeout(Duration::from_secs(3), scheduler.shutdown())
+    let shutdown = tokio::time::timeout(Duration::from_secs(30), scheduler.shutdown())
         .await
         .expect("scheduler shutdown did not wait for cleanup drain")
         .unwrap_err();

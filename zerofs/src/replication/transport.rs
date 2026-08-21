@@ -32,7 +32,7 @@ const HEARTBEAT_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const MAX_SHIP_DECODE_BYTES: usize = usize::MAX;
 /// Version 2 uses unary heartbeats with exact-epoch acknowledgements. Version 1
 /// used an unacknowledged client stream; zero is the protobuf default.
-pub(crate) const HA_PROTOCOL_VERSION: u32 = 2;
+const HA_PROTOCOL_VERSION: u32 = 2;
 /// Terminal liveness value after an incompatible heartbeat.
 pub(crate) const INCOMPATIBLE_HEARTBEAT_LIVENESS: u64 = u64::MAX;
 
@@ -230,7 +230,7 @@ pub struct ReceiverControl {
 
 /// Tail and observed epoch detached by one promotion transition.
 #[must_use = "a promotion snapshot must be reconciled before serving"]
-pub struct PromotionSnapshot {
+pub(crate) struct PromotionSnapshot {
     control: ReceiverControl,
     writer_epoch: u64,
     observed_epoch: u64,
@@ -293,7 +293,10 @@ impl ReceiverControl {
     }
 
     /// Fence receiver admission and take ownership of the standby tail.
-    pub async fn begin_promotion(&self, writer_epoch: u64) -> anyhow::Result<PromotionSnapshot> {
+    pub(crate) async fn begin_promotion(
+        &self,
+        writer_epoch: u64,
+    ) -> anyhow::Result<PromotionSnapshot> {
         anyhow::ensure!(writer_epoch > 0, "receiver writer epoch must be nonzero");
         let mut phase = self.core.phase.lock().await;
         match &*phase {
@@ -358,7 +361,7 @@ impl ReceiverControl {
 
     /// Returns a failed promotion's tail to receiver admission. `observed_epoch`
     /// may include a database fence not observed over replication.
-    pub(crate) async fn return_to_standby(
+    async fn return_to_standby(
         &self,
         writer_epoch: u64,
         snapshot_observed_epoch: u64,
@@ -418,7 +421,7 @@ impl ReceiverControl {
     }
 
     #[cfg(test)]
-    pub(crate) async fn inspect_phase_epochs_for_tests(&self) -> (&'static str, u64, u64) {
+    async fn inspect_phase_epochs_for_tests(&self) -> (&'static str, u64, u64) {
         let phase = self.core.phase.lock().await;
         match &*phase {
             ReceiverPhase::Standby(standby) => ("standby", 0, standby.observed_epoch),
@@ -558,7 +561,7 @@ pub struct ReplicationReceiver {
 }
 
 impl ReplicationReceiver {
-    pub fn new(
+    pub(crate) fn new(
         dedup: Arc<crate::dedup::DedupCache>,
         takeover_trigger: Option<Arc<Notify>>,
         node_id: String,
@@ -617,12 +620,12 @@ impl ReplicationReceiver {
     }
 
     /// Subscribe before [`Self::into_server`] consumes the receiver.
-    pub fn liveness(&self) -> watch::Receiver<u64> {
+    pub(crate) fn liveness(&self) -> watch::Receiver<u64> {
         self.heartbeats.subscribe()
     }
 
     /// Returns the promotion control handle.
-    pub fn control(&self) -> ReceiverControl {
+    pub(crate) fn control(&self) -> ReceiverControl {
         ReceiverControl {
             core: self.core.clone(),
         }
@@ -813,7 +816,7 @@ impl ReplicationReceiver {
         }
     }
 
-    pub fn into_server(self) -> ReplicationServiceServer<Self> {
+    pub(crate) fn into_server(self) -> ReplicationServiceServer<Self> {
         ReplicationServiceServer::new(self).max_decoding_message_size(MAX_SHIP_DECODE_BYTES)
     }
 }
@@ -919,7 +922,7 @@ pub struct ReplicationSender {
 }
 
 impl ReplicationSender {
-    pub async fn connect(endpoint: String) -> anyhow::Result<Self> {
+    pub(crate) async fn connect(endpoint: String) -> anyhow::Result<Self> {
         let client =
             tokio::time::timeout(CONNECT_TIMEOUT, ReplicationServiceClient::connect(endpoint))
                 .await
@@ -963,8 +966,8 @@ impl ReplicationSender {
 /// Promoting, Leading, and retained-tail states.
 #[derive(Debug)]
 pub struct HelloAnswer {
-    pub peer_active: bool,
-    pub node_id: String,
+    pub(crate) peer_active: bool,
+    pub(crate) node_id: String,
 }
 
 fn decode_hello_answer(resp: HelloResponse) -> anyhow::Result<HelloAnswer> {
@@ -992,7 +995,7 @@ pub(crate) fn hello_protocol_incompatible(error: &anyhow::Error) -> bool {
         .any(|cause| cause.downcast_ref::<IncompatibleHelloProtocol>().is_some())
 }
 
-pub async fn hello_peer(endpoint: String) -> anyhow::Result<HelloAnswer> {
+pub(crate) async fn hello_peer(endpoint: String) -> anyhow::Result<HelloAnswer> {
     let mut client =
         tokio::time::timeout(CONNECT_TIMEOUT, ReplicationServiceClient::connect(endpoint))
             .await

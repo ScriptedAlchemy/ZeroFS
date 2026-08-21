@@ -11,9 +11,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::Arc;
 
-pub struct AttachedWriteback {
-    pub store: Arc<dyn ObjectStore>,
-    pub lifecycle: WritebackObjectStore,
+pub(crate) struct AttachedWriteback {
+    pub(crate) store: Arc<dyn ObjectStore>,
+    pub(crate) lifecycle: WritebackObjectStore,
     // Landed-but-not-wired: consumers arrive with the tiered admission wiring.
     #[allow(dead_code)]
     pub(crate) space: Arc<PhysicalSpaceSampler>,
@@ -27,7 +27,7 @@ pub struct AttachedWriteback {
 /// finishes opening the database over `store`. This keeps the remote manifest
 /// view from changing underneath database recovery without making startup wait
 /// for the entire SSD backlog to reach the backend.
-pub async fn attach(
+pub(crate) async fn attach(
     remote: Arc<dyn ObjectStore>,
     mut settings: WritebackSettings,
     identity: JournalIdentity,

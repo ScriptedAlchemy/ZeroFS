@@ -105,10 +105,10 @@ impl Segid {
 /// One directory entry: where a frame lives and which logical block it backs.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct DirEntry {
-    pub byte_offset: u64,
-    pub len: u32,
-    pub inode: u64,
-    pub extent: u64,
+    pub(crate) byte_offset: u64,
+    pub(crate) len: u32,
+    pub(crate) inode: u64,
+    pub(crate) extent: u64,
 }
 
 /// Location of one extent's frame inside a sealed segment. Persisted as the value
@@ -118,15 +118,15 @@ pub struct FrameLoc {
     pub segid: Segid,
     pub frame_index: u32,
     /// Offset of the frame's length prefix within the segment.
-    pub byte_offset: u64,
+    pub(crate) byte_offset: u64,
     /// Byte span covering the length prefix and the sealed frame.
     pub byte_len: u32,
 }
 
 impl FrameLoc {
-    pub const ENCODED_LEN: usize = 32;
+    pub(crate) const ENCODED_LEN: usize = 32;
 
-    pub fn encode(&self) -> [u8; Self::ENCODED_LEN] {
+    pub(crate) fn encode(&self) -> [u8; Self::ENCODED_LEN] {
         let mut b = [0u8; Self::ENCODED_LEN];
         b[0..8].copy_from_slice(&self.segid.epoch.to_le_bytes());
         b[8..16].copy_from_slice(&self.segid.counter.to_le_bytes());
@@ -308,7 +308,7 @@ fn rd_u64(b: &[u8], off: usize) -> u64 {
 }
 
 /// Builds one segment by appending frames, then serializing directory + footer.
-pub struct SegmentBuilder<'a> {
+pub(crate) struct SegmentBuilder<'a> {
     codec: &'a FrameCodec,
     segid: Segid,
     buf: Vec<u8>,
@@ -317,7 +317,8 @@ pub struct SegmentBuilder<'a> {
 }
 
 impl<'a> SegmentBuilder<'a> {
-    pub fn new(codec: &'a FrameCodec, segid: Segid) -> Self {
+    #[cfg(test)]
+    fn new(codec: &'a FrameCodec, segid: Segid) -> Self {
         Self::with_limits(codec, segid, SegmentFormatLimits::WIRE)
     }
 
@@ -336,14 +337,14 @@ impl<'a> SegmentBuilder<'a> {
     }
 
     /// Current byte length of the packed frame region (the next frame's offset).
-    pub fn byte_len(&self) -> u64 {
+    pub(crate) fn byte_len(&self) -> u64 {
         self.buf.len() as u64
     }
 
     /// Seal `plaintext` for logical block `(inode, extent)` and append it.
     /// Returns the frame's index within the segment.
     #[cfg(test)] // production packs via seal_compressed_batch; tests build plaintext worlds here
-    pub fn add_frame(
+    fn add_frame(
         &mut self,
         inode: u64,
         extent: u64,
@@ -364,14 +365,15 @@ impl<'a> SegmentBuilder<'a> {
     /// Append a frame body sealed under this builder's segid and the index
     /// this append assigns (`dir.len()`); a batch pre-sealed by
     /// [`seal_compressed_batch`] knows both upfront.
-    pub fn append_sealed(&mut self, inode: u64, extent: u64, sealed: &[u8]) -> u32 {
+    #[cfg(test)]
+    fn append_sealed(&mut self, inode: u64, extent: u64, sealed: &[u8]) -> u32 {
         self.try_append_sealed(inode, extent, sealed)
             .expect("sealed frame must fit the segment wire format")
     }
 
     /// Fallible form of [`Self::append_sealed`] for production writers. It
     /// rejects wire-width or allocation failure before changing the builder.
-    pub fn try_append_sealed(
+    pub(crate) fn try_append_sealed(
         &mut self,
         inode: u64,
         extent: u64,
@@ -414,7 +416,7 @@ impl<'a> SegmentBuilder<'a> {
     /// exercises an overflow in the directory-seal or assembly step reached
     /// only through `finish`, since [`Self::try_append_sealed`] already
     /// enforces `self.limits` on every frame appended before this runs.
-    pub fn finish(self, sealed_seqno: u64) -> Result<Vec<u8>, SegmentError> {
+    pub(crate) fn finish(self, sealed_seqno: u64) -> Result<Vec<u8>, SegmentError> {
         let SegmentBuilder {
             codec,
             segid,
@@ -430,7 +432,7 @@ impl<'a> SegmentBuilder<'a> {
 /// to its `(segid, frame_index, inode, extent)` AAD. Shared by [`SegmentBuilder`]
 /// and the data plane's open-segment buffer.
 #[cfg(test)]
-pub(crate) fn seal_frame(
+fn seal_frame(
     codec: &FrameCodec,
     segid: Segid,
     frame_index: u32,
@@ -446,7 +448,7 @@ pub(crate) fn seal_frame(
 /// and is independent of the AAD) and binds `(segid, frame_index)` here, under
 /// the lock that assigns them. Compaction feeds it [`open_compressed_frame`]'s
 /// output to relocate a frame without a decompress/recompress round trip.
-pub(crate) fn seal_compressed_frame(
+fn seal_compressed_frame(
     codec: &FrameCodec,
     segid: Segid,
     frame_index: u32,
@@ -461,7 +463,7 @@ pub(crate) fn seal_compressed_frame(
 /// sealed frame body into its still-compressed payload, for relocation: the
 /// payload re-seals under a new slot's AAD via [`seal_compressed_frame`] without
 /// the plaintext ever being materialized.
-pub(crate) fn open_compressed_frame(
+fn open_compressed_frame(
     codec: &FrameCodec,
     segid: Segid,
     frame_index: u32,
@@ -543,7 +545,7 @@ pub(crate) fn prepare_segment_assembly(
 /// then append them to a frame region. Open-segment rotation performs the
 /// preparation while it still owns the live buffer, and only then moves the
 /// buffer into [`assemble_prepared_segment`].
-pub(crate) fn assemble_segment(
+fn assemble_segment(
     segid: Segid,
     mut buf: Vec<u8>,
     frame_count: usize,
@@ -714,12 +716,12 @@ fn parse_dir_entries(plain: &[u8], k: u32) -> Result<Vec<DirEntry>, SegmentError
 /// production reads go through the ranged `parse_footer`/`read_run`/`read_directory`
 /// paths; this wraps them to assert the on-disk format end to end.
 #[cfg(test)]
-pub struct Segment {
-    pub segid: Segid,
-    pub k: u32,
-    pub dir_offset: u64,
-    pub dir_len: u32,
-    pub sealed_seqno: u64,
+pub(crate) struct Segment {
+    segid: Segid,
+    pub(crate) k: u32,
+    pub(crate) dir_offset: u64,
+    pub(crate) dir_len: u32,
+    sealed_seqno: u64,
     bytes: Bytes,
 }
 
@@ -728,7 +730,7 @@ impl Segment {
     /// Parse the footer, verify magic/version/total_len, and verify the CRC over
     /// the metadata tail. The CRC is a keyless torn-write detector; per-frame
     /// AEAD remains the integrity authority on read.
-    pub fn parse(bytes: Bytes) -> Result<Segment, SegmentError> {
+    pub(crate) fn parse(bytes: Bytes) -> Result<Segment, SegmentError> {
         let n = bytes.len();
         if n < FOOTER_LEN {
             return Err(SegmentError::TooSmall(n));
@@ -757,7 +759,7 @@ impl Segment {
     /// where `slots[i] = (inode, extent)` for the frame at absolute index
     /// `first_frame + i`. This is the data-plane (extent-driven) read path: it
     /// never consults the directory.
-    pub fn read_range(
+    fn read_range(
         &self,
         codec: &FrameCodec,
         byte_offset: u64,
@@ -783,7 +785,7 @@ impl Segment {
     }
 
     /// Open and parse the AEAD-sealed directory (GC/coalescer/recovery path).
-    pub fn directory(&self, codec: &FrameCodec) -> Result<Vec<DirEntry>, SegmentError> {
+    fn directory(&self, codec: &FrameCodec) -> Result<Vec<DirEntry>, SegmentError> {
         let start = self.dir_offset as usize;
         let end = start + self.dir_len as usize;
         let plain = codec.open(&self.bytes[start..end], &dir_aad(self.segid, self.k))?;

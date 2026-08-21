@@ -61,6 +61,17 @@ fn plan_read_ahead(
 }
 
 impl ExtentStore {
+    /// Metrics snapshot of this store's most recent fragmented read.
+    /// Shared across clones of the store; replaces the old process-global
+    /// slot that let concurrent tests clobber each other's snapshots.
+    #[cfg(test)]
+    fn last_read_metrics(&self) -> Option<metrics::ReadRunSnapshot> {
+        *self
+            .last_read_metrics
+            .lock()
+            .expect("last_read_metrics never poisoned")
+    }
+
     async fn load_extent_location(
         &self,
         id: InodeId,
@@ -87,7 +98,7 @@ impl ExtentStore {
 
     /// The full-extent (EXTENT_SIZE) plaintext for `(id, extent)`, or `None` for a
     /// hole. Resolves the extent key's `FrameLoc` then fetches the frame.
-    pub async fn get(&self, id: InodeId, extent_idx: u64) -> Result<Option<Bytes>, FsError> {
+    pub(crate) async fn get(&self, id: InodeId, extent_idx: u64) -> Result<Option<Bytes>, FsError> {
         let key = self.key_codec.extent_key(id, extent_idx);
         let location = self
             .extent_location_cache
@@ -608,7 +619,16 @@ impl ExtentStore {
                 Err(_) => {}
             }
         }
-        recorder.finish();
+        let run_metrics = recorder.finish();
+        #[cfg(test)]
+        {
+            *self
+                .last_read_metrics
+                .lock()
+                .expect("last_read_metrics never poisoned") = Some(run_metrics);
+        }
+        #[cfg(not(test))]
+        let _ = run_metrics;
         if let Some(error) = fetch_error {
             return Err(error);
         }
@@ -687,7 +707,7 @@ impl ExtentStore {
     }
 }
 
-mod metrics;
+pub(super) mod metrics;
 use metrics::{OnStoreRun, PlannedPiece};
 
 #[cfg(test)]

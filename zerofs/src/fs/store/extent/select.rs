@@ -68,9 +68,9 @@ impl ColdCtx {
 #[derive(Default)]
 pub(super) struct NominationSet {
     pub(super) set: HashSet<Segid>,
-    pub(super) order: VecDeque<Segid>,
+    order: VecDeque<Segid>,
     /// Evictions since the last drain, for the pass summary.
-    pub(super) dropped: u64,
+    dropped: u64,
 }
 
 impl NominationSet {
@@ -104,8 +104,8 @@ impl NominationSet {
 /// staleness, a duration that must not compress with cadence.
 pub(super) struct PairStat {
     pub(super) count: u32,
-    pub(super) last_round: u64,
-    pub(super) last_seen: Instant,
+    last_round: u64,
+    last_seen: Instant,
 }
 
 /// Crossing-pair statistics. A self-pair is an internal seam (adjacent
@@ -114,7 +114,7 @@ pub(super) struct PairStat {
 pub(super) struct PairStats {
     pub(super) map: HashMap<(Segid, Segid), PairStat>,
     /// Pairs dropped at capacity since the last sweep, for the pass summary.
-    pub(super) dropped: u64,
+    dropped: u64,
 }
 
 impl PairStats {
@@ -249,8 +249,8 @@ pub(super) struct RoundSelection {
     pub(super) sel_live: u64,
     /// Reserve accounting: selections admitted ahead of the fragmentation
     /// ranking (chains + nominated candidates), capped at half the round.
-    pub(super) reserve_slots: usize,
-    pub(super) reserve_live: u64,
+    reserve_slots: usize,
+    reserve_live: u64,
     pub(super) nominated_selected: usize,
     /// Admitted chain groups' member counts, in selection order. Chain
     /// admissions are the leading prefix of `selected`, so this is also

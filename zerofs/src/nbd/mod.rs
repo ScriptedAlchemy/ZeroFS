@@ -8,9 +8,9 @@ pub use server::NBDServer;
 pub(crate) const NBD_PROVISION_STAGING_PREFIX: &str = ".zerofs-nbd-provision-v1-";
 pub(crate) const NBD_STRIPE_MARKER: &str = ".zerofs-nbd-stripe-v1";
 pub(crate) const NBD_STRIPE_MANIFEST_MAX_BYTES: u64 = 4096;
-pub(crate) const NBD_STRIPE_MIN_BYTES: u64 = 4096;
-pub(crate) const NBD_STRIPE_MAX_BYTES: u64 = 64 * 1024 * 1024;
-pub(crate) const NBD_STRIPE_MAX_MEMBERS: usize = 32;
+const NBD_STRIPE_MIN_BYTES: u64 = 4096;
+const NBD_STRIPE_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const NBD_STRIPE_MAX_MEMBERS: usize = 32;
 
 pub(crate) fn is_nbd_provision_staging_name(name: &[u8]) -> bool {
     let Some(uuid) = name.strip_prefix(NBD_PROVISION_STAGING_PREFIX.as_bytes()) else {

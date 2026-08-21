@@ -24,78 +24,78 @@ pub trait InodeAttrs {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileInode {
     pub size: u64,
-    pub mtime: u64,
-    pub mtime_nsec: u32,
-    pub ctime: u64,
-    pub ctime_nsec: u32,
-    pub atime: u64,
-    pub atime_nsec: u32,
-    pub mode: u32,
-    pub uid: u32,
-    pub gid: u32,
+    pub(crate) mtime: u64,
+    pub(crate) mtime_nsec: u32,
+    pub(crate) ctime: u64,
+    pub(crate) ctime_nsec: u32,
+    pub(crate) atime: u64,
+    pub(crate) atime_nsec: u32,
+    pub(crate) mode: u32,
+    pub(crate) uid: u32,
+    pub(crate) gid: u32,
     /// Parent directory ID. None when file has multiple hardlinks (nlink > 1).
     /// Lazily restored to Some(parent) when file becomes singly-linked again.
-    pub parent: Option<InodeId>,
+    pub(crate) parent: Option<InodeId>,
     /// File name in parent directory. None when file has multiple hardlinks.
-    pub name: Option<Vec<u8>>,
+    pub(crate) name: Option<Vec<u8>>,
     pub nlink: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DirectoryInode {
-    pub mtime: u64,
-    pub mtime_nsec: u32,
-    pub ctime: u64,
-    pub ctime_nsec: u32,
-    pub atime: u64,
-    pub atime_nsec: u32,
-    pub mode: u32,
-    pub uid: u32,
-    pub gid: u32,
+    pub(crate) mtime: u64,
+    pub(crate) mtime_nsec: u32,
+    pub(crate) ctime: u64,
+    pub(crate) ctime_nsec: u32,
+    pub(crate) atime: u64,
+    pub(crate) atime_nsec: u32,
+    pub(crate) mode: u32,
+    pub(crate) uid: u32,
+    pub(crate) gid: u32,
     pub entry_count: u64,
-    pub parent: InodeId,
+    pub(crate) parent: InodeId,
     /// Directory name. None for root directory.
-    pub name: Option<Vec<u8>>,
+    pub(crate) name: Option<Vec<u8>>,
     pub nlink: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SymlinkInode {
     pub target: Vec<u8>,
-    pub mtime: u64,
-    pub mtime_nsec: u32,
-    pub ctime: u64,
-    pub ctime_nsec: u32,
-    pub atime: u64,
-    pub atime_nsec: u32,
-    pub mode: u32,
-    pub uid: u32,
-    pub gid: u32,
+    pub(crate) mtime: u64,
+    pub(crate) mtime_nsec: u32,
+    pub(crate) ctime: u64,
+    pub(crate) ctime_nsec: u32,
+    pub(crate) atime: u64,
+    pub(crate) atime_nsec: u32,
+    pub(crate) mode: u32,
+    pub(crate) uid: u32,
+    pub(crate) gid: u32,
     /// Parent directory ID. None when file has multiple hardlinks (nlink > 1).
     /// Lazily restored to Some(parent) when file becomes singly-linked again.
-    pub parent: Option<InodeId>,
+    pub(crate) parent: Option<InodeId>,
     /// Symlink name in parent directory. None when symlink has multiple hardlinks.
-    pub name: Option<Vec<u8>>,
-    pub nlink: u32,
+    pub(crate) name: Option<Vec<u8>>,
+    pub(crate) nlink: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpecialInode {
-    pub mtime: u64,
-    pub mtime_nsec: u32,
-    pub ctime: u64,
-    pub ctime_nsec: u32,
-    pub atime: u64,
-    pub atime_nsec: u32,
-    pub mode: u32,
-    pub uid: u32,
-    pub gid: u32,
+    pub(crate) mtime: u64,
+    pub(crate) mtime_nsec: u32,
+    pub(crate) ctime: u64,
+    pub(crate) ctime_nsec: u32,
+    pub(crate) atime: u64,
+    pub(crate) atime_nsec: u32,
+    pub(crate) mode: u32,
+    pub(crate) uid: u32,
+    pub(crate) gid: u32,
     /// Parent directory ID. None when file has multiple hardlinks (nlink > 1).
     /// Lazily restored to Some(parent) when file becomes singly-linked again.
-    pub parent: Option<InodeId>,
+    pub(crate) parent: Option<InodeId>,
     /// Name in parent directory. None when inode has multiple hardlinks.
-    pub name: Option<Vec<u8>>,
-    pub nlink: u32,
+    pub(crate) name: Option<Vec<u8>>,
+    pub(crate) nlink: u32,
     pub rdev: Option<(u32, u32)>, // For character and block devices (major, minor)
 }
 
@@ -398,7 +398,7 @@ impl InodeAttrs for Inode {
 
 impl Inode {
     /// Get the name if available (None for root or hardlinked files).
-    pub fn name(&self) -> Option<&[u8]> {
+    pub(crate) fn name(&self) -> Option<&[u8]> {
         match self {
             Inode::Directory(d) => d.name.as_deref(),
             Inode::File(f) => f.name.as_deref(),
@@ -410,7 +410,7 @@ impl Inode {
     }
 
     /// Check if this is a directory.
-    pub fn is_directory(&self) -> bool {
+    pub(crate) fn is_directory(&self) -> bool {
         matches!(self, Inode::Directory(_))
     }
 }

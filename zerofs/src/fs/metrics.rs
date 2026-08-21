@@ -17,30 +17,30 @@ struct PreviousSnapshot {
 
 pub struct FileSystemStats {
     // File operations
-    pub files_created: AtomicU64,
-    pub files_deleted: AtomicU64,
-    pub files_renamed: AtomicU64,
-    pub directories_created: AtomicU64,
-    pub directories_deleted: AtomicU64,
-    pub directories_renamed: AtomicU64,
-    pub links_created: AtomicU64,
-    pub links_deleted: AtomicU64,
-    pub links_renamed: AtomicU64,
+    pub(crate) files_created: AtomicU64,
+    pub(crate) files_deleted: AtomicU64,
+    pub(crate) files_renamed: AtomicU64,
+    pub(crate) directories_created: AtomicU64,
+    pub(crate) directories_deleted: AtomicU64,
+    pub(crate) directories_renamed: AtomicU64,
+    pub(crate) links_created: AtomicU64,
+    pub(crate) links_deleted: AtomicU64,
+    pub(crate) links_renamed: AtomicU64,
 
     // Read/Write operations
-    pub read_operations: AtomicU64,
-    pub write_operations: AtomicU64,
-    pub bytes_read: AtomicU64,
-    pub bytes_written: AtomicU64,
+    pub(crate) read_operations: AtomicU64,
+    pub(crate) write_operations: AtomicU64,
+    pub(crate) bytes_read: AtomicU64,
+    pub(crate) bytes_written: AtomicU64,
 
     // Garbage collection
-    pub tombstones_created: AtomicU64,
-    pub tombstones_processed: AtomicU64,
-    pub gc_extents_deleted: AtomicU64,
-    pub gc_runs: AtomicU64,
+    pub(crate) tombstones_created: AtomicU64,
+    pub(crate) tombstones_processed: AtomicU64,
+    pub(crate) gc_extents_deleted: AtomicU64,
+    pub(crate) gc_runs: AtomicU64,
 
     // Performance
-    pub total_operations: AtomicU64,
+    pub(crate) total_operations: AtomicU64,
 
     // Internal state for rate calculation
     last_snapshot: std::sync::Mutex<PreviousSnapshot>,
@@ -53,7 +53,7 @@ impl Default for FileSystemStats {
 }
 
 impl FileSystemStats {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             files_created: AtomicU64::new(0),
             files_deleted: AtomicU64::new(0),
@@ -84,7 +84,7 @@ impl FileSystemStats {
         }
     }
 
-    pub fn report(&self) -> String {
+    fn report(&self) -> String {
         // Load current values
         let files_created = self.files_created.load(Ordering::Relaxed);
         let files_deleted = self.files_deleted.load(Ordering::Relaxed);
@@ -251,7 +251,7 @@ impl FileSystemStats {
         table.to_string()
     }
 
-    pub fn output_report_debug(&self) {
+    pub(crate) fn output_report_debug(&self) {
         tracing::debug!("\n{}", self.report());
     }
 }
@@ -274,28 +274,28 @@ pub struct SegmentFootprint {
 pub struct SegmentGcPass {
     // Delete-horizon / backlog gauges (footprint is maintained incrementally,
     // see `apply_footprint_delta`, not recorded from the pass scan).
-    pub awaiting_delete: u64,
-    pub awaiting_delete_bytes: u64,
-    pub candidate_backlog: u64,
-    pub chains_deferred: u64,
-    pub saturated: bool,
+    pub(crate) awaiting_delete: u64,
+    pub(crate) awaiting_delete_bytes: u64,
+    pub(crate) candidate_backlog: u64,
+    pub(crate) chains_deferred: u64,
+    pub(crate) saturated: bool,
     /// Reclaim + compaction paused by a persistent checkpoint pin.
-    pub pinned: bool,
+    pub(crate) pinned: bool,
 
     // Work done this pass (accumulated into counters).
-    pub segments_deleted: u64,
-    pub deleted_bytes: u64,
-    pub segments_compacted: u64,
-    pub segments_packed: u64,
-    pub frames_relocated: u64,
-    pub compaction_freed_bytes: u64,
-    pub batches: u64,
-    pub tail_scrubbed: u64,
-    pub chains_packed: u64,
-    pub chains_assembled: u64,
-    pub nominations: u64,
-    pub nominations_dropped: u64,
-    pub hot_seams: u64,
+    pub(crate) segments_deleted: u64,
+    pub(crate) deleted_bytes: u64,
+    pub(crate) segments_compacted: u64,
+    pub(crate) segments_packed: u64,
+    pub(crate) frames_relocated: u64,
+    pub(crate) compaction_freed_bytes: u64,
+    pub(crate) batches: u64,
+    pub(crate) tail_scrubbed: u64,
+    pub(crate) chains_packed: u64,
+    pub(crate) chains_assembled: u64,
+    pub(crate) nominations: u64,
+    pub(crate) nominations_dropped: u64,
+    pub(crate) hot_seams: u64,
 }
 
 /// Segment-GC / reclaim metrics, bridged to Prometheus by `crate::prometheus`.
@@ -306,50 +306,50 @@ pub struct SegmentGcPass {
 #[derive(Default)]
 pub struct SegmentGcStats {
     // Counters
-    pub passes: AtomicU64,
-    pub segments_deleted: AtomicU64,
-    pub deleted_bytes: AtomicU64,
-    pub segments_compacted: AtomicU64,
-    pub segments_packed: AtomicU64,
-    pub frames_relocated: AtomicU64,
-    pub compaction_freed_bytes: AtomicU64,
-    pub batches: AtomicU64,
-    pub tail_scrubbed: AtomicU64,
-    pub chains_packed: AtomicU64,
-    pub nominations: AtomicU64,
-    pub nominations_dropped: AtomicU64,
-    pub hot_seams: AtomicU64,
-    pub orphans_reclaimed: AtomicU64,
+    pub(crate) passes: AtomicU64,
+    pub(crate) segments_deleted: AtomicU64,
+    pub(crate) deleted_bytes: AtomicU64,
+    pub(crate) segments_compacted: AtomicU64,
+    pub(crate) segments_packed: AtomicU64,
+    pub(crate) frames_relocated: AtomicU64,
+    pub(crate) compaction_freed_bytes: AtomicU64,
+    pub(crate) batches: AtomicU64,
+    pub(crate) tail_scrubbed: AtomicU64,
+    pub(crate) chains_packed: AtomicU64,
+    pub(crate) nominations: AtomicU64,
+    pub(crate) nominations_dropped: AtomicU64,
+    pub(crate) hot_seams: AtomicU64,
+    pub(crate) orphans_reclaimed: AtomicU64,
     /// True for the complete reclaim/orphan-sweep pass. Benchmark and operator
     /// tooling use this to avoid attributing maintenance I/O to foreground work.
-    pub active: AtomicBool,
+    pub(crate) active: AtomicBool,
 
     // Gauges (last pass)
     pub segment_count: AtomicU64,
     pub appended_bytes: AtomicU64,
     pub live_bytes: AtomicU64,
     pub reclaimable_bytes: AtomicU64,
-    pub awaiting_delete: AtomicU64,
-    pub awaiting_delete_bytes: AtomicU64,
-    pub candidate_backlog: AtomicU64,
-    pub chains_deferred: AtomicU64,
-    pub saturated: AtomicU64,
+    pub(crate) awaiting_delete: AtomicU64,
+    pub(crate) awaiting_delete_bytes: AtomicU64,
+    pub(crate) candidate_backlog: AtomicU64,
+    pub(crate) chains_deferred: AtomicU64,
+    pub(crate) saturated: AtomicU64,
 
     // Last-pass activity + cadence posture, for the `monitor` status line.
-    pub last_deleted: AtomicU64,
-    pub last_deleted_bytes: AtomicU64,
-    pub last_frames_relocated: AtomicU64,
-    pub last_chains_packed: AtomicU64,
-    pub last_chains_assembled: AtomicU64,
-    pub last_hot_seams: AtomicU64,
-    pub pinned: AtomicBool,
+    pub(crate) last_deleted: AtomicU64,
+    pub(crate) last_deleted_bytes: AtomicU64,
+    pub(crate) last_frames_relocated: AtomicU64,
+    pub(crate) last_chains_packed: AtomicU64,
+    pub(crate) last_chains_assembled: AtomicU64,
+    pub(crate) last_hot_seams: AtomicU64,
+    pub(crate) pinned: AtomicBool,
     /// False until the first reclaim pass populates the gauges above.
-    pub has_run: AtomicBool,
+    pub(crate) has_run: AtomicBool,
     /// Cadence tier of the last plan: 0 none, 1 base, 2 drain, 3 fast.
-    pub tier: AtomicU8,
-    pub read_directed: AtomicBool,
+    pub(crate) tier: AtomicU8,
+    pub(crate) read_directed: AtomicBool,
     /// The GC planner's own plain-language reason for the current cadence.
-    pub reason: Mutex<String>,
+    pub(crate) reason: Mutex<String>,
 }
 
 pub struct SegmentGcActivity {
@@ -363,7 +363,7 @@ impl Drop for SegmentGcActivity {
 }
 
 impl SegmentGcStats {
-    pub fn begin_activity(self: &Arc<Self>) -> SegmentGcActivity {
+    pub(crate) fn begin_activity(self: &Arc<Self>) -> SegmentGcActivity {
         let was_active = self.active.swap(true, Ordering::AcqRel);
         debug_assert!(!was_active, "segment GC passes must not overlap");
         SegmentGcActivity {
@@ -371,7 +371,7 @@ impl SegmentGcStats {
         }
     }
 
-    pub fn record_pass(&self, p: &SegmentGcPass) {
+    pub(crate) fn record_pass(&self, p: &SegmentGcPass) {
         use Ordering::Relaxed;
         self.passes.fetch_add(1, Relaxed);
         self.segments_deleted.fetch_add(p.segments_deleted, Relaxed);
@@ -414,13 +414,13 @@ impl SegmentGcStats {
         self.has_run.store(true, Relaxed);
     }
 
-    pub fn record_orphans_reclaimed(&self, n: u64) {
+    pub(crate) fn record_orphans_reclaimed(&self, n: u64) {
         self.orphans_reclaimed.fetch_add(n, Ordering::Relaxed);
     }
 
     /// Record the cadence planner's decision (tier + reason) for `monitor`.
     /// `tier`: 1 base, 2 drain, 3 fast.
-    pub fn record_plan(&self, tier: u8, read_directed: bool, reason: &str) {
+    pub(crate) fn record_plan(&self, tier: u8, read_directed: bool, reason: &str) {
         self.tier.store(tier, Ordering::Relaxed);
         self.read_directed.store(read_directed, Ordering::Relaxed);
         if let Ok(mut r) = self.reason.lock() {
@@ -431,7 +431,7 @@ impl SegmentGcStats {
 
     /// Seed the footprint gauges from a one-time scan at store open. After this,
     /// they are maintained incrementally by [`Self::apply_footprint_delta`].
-    pub fn seed_footprint(&self, f: &SegmentFootprint) {
+    pub(crate) fn seed_footprint(&self, f: &SegmentFootprint) {
         use Ordering::Relaxed;
         self.segment_count.store(f.segment_count, Relaxed);
         self.appended_bytes.store(f.appended_bytes, Relaxed);
@@ -444,7 +444,7 @@ impl SegmentGcStats {
     /// footprint gauges. Called off the commit path with the exact deltas
     /// `stage_seg_deltas` computed, so the gauges track writes and deletes in
     /// real time without a scan. Deletions pass negative `d_segments`/`d_appended`.
-    pub fn apply_footprint_delta(&self, d_segments: i64, d_appended: i64, d_live: i64) {
+    pub(crate) fn apply_footprint_delta(&self, d_segments: i64, d_appended: i64, d_live: i64) {
         apply_i64(&self.segment_count, d_segments);
         apply_i64(&self.appended_bytes, d_appended);
         apply_i64(&self.live_bytes, d_live);

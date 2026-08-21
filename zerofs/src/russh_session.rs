@@ -11,9 +11,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
-pub use crate::sftp_protocol::RUSSH_SFTP_MAX_CONCURRENT_WRITES;
+pub(crate) use crate::sftp_protocol::RUSSH_SFTP_MAX_CONCURRENT_WRITES;
 #[cfg(test)]
-pub use crate::sftp_protocol::russh_sftp_config;
+pub(crate) use crate::sftp_protocol::russh_sftp_config;
 
 /// Large static SSH channel window for high-bandwidth, high-latency links.
 pub const RUSSH_WINDOW_SIZE: u32 = 16 * 1024 * 1024;
@@ -114,7 +114,7 @@ pub struct RusshSessionFactory {
 }
 
 impl RusshSessionFactory {
-    pub fn new(
+    pub(crate) fn new(
         endpoint: crate::config::SftpEndpoint,
         identity_file: PathBuf,
         known_hosts: PathBuf,

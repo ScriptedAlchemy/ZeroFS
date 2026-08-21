@@ -377,21 +377,21 @@ impl fmt::Debug for Journal {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JournalSnapshot {
-    pub identity: JournalIdentity,
-    pub incarnation: Uuid,
-    pub local_seq: Sequence,
-    pub remote_seq: Sequence,
-    pub local_bytes_completed: u64,
-    pub remote_bytes_completed: u64,
-    pub remote_retries: u64,
-    pub records: Vec<MutationRecord>,
-    pub dirty_blob_bytes: u64,
-    pub dirty_metadata_reserved_bytes: u64,
-    pub pending_blob_count: u64,
+    pub(crate) identity: JournalIdentity,
+    pub(crate) incarnation: Uuid,
+    pub(crate) local_seq: Sequence,
+    pub(crate) remote_seq: Sequence,
+    local_bytes_completed: u64,
+    remote_bytes_completed: u64,
+    remote_retries: u64,
+    pub(crate) records: Vec<MutationRecord>,
+    pub(crate) dirty_blob_bytes: u64,
+    pub(crate) dirty_metadata_reserved_bytes: u64,
+    pending_blob_count: u64,
 }
 
 impl JournalSnapshot {
-    pub(crate) fn pending_ssd_reservations(
+    fn pending_ssd_reservations(
         &self,
     ) -> Result<Vec<crate::writeback::reservation::SsdReservationRequest>> {
         self.records
@@ -407,11 +407,11 @@ impl JournalSnapshot {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JournalProgress {
-    pub local_seq: Sequence,
-    pub remote_seq: Sequence,
-    pub local_bytes_completed: u64,
-    pub remote_bytes_completed: u64,
-    pub remote_retries: u64,
+    pub(crate) local_seq: Sequence,
+    pub(crate) remote_seq: Sequence,
+    pub(crate) local_bytes_completed: u64,
+    pub(crate) remote_bytes_completed: u64,
+    pub(crate) remote_retries: u64,
 }
 
 /// A bounded pending-record slice read together with the watermarks it is
@@ -420,13 +420,13 @@ pub struct JournalProgress {
 /// watermark says must still exist.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingWindow {
-    pub local_seq: Sequence,
-    pub remote_seq: Sequence,
-    pub records: Vec<MutationRecord>,
+    pub(crate) local_seq: Sequence,
+    pub(crate) remote_seq: Sequence,
+    pub(crate) records: Vec<MutationRecord>,
 }
 
 impl Journal {
-    pub fn open_existing(root: impl AsRef<Path>) -> Result<Self> {
+    pub(crate) fn open_existing(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
         let database_path = root.join("journal.redb");
         if !database_path.is_file() {
@@ -454,7 +454,7 @@ impl Journal {
         Self::open(root, identity)
     }
 
-    pub fn open(root: impl AsRef<Path>, expected_identity: JournalIdentity) -> Result<Self> {
+    pub(crate) fn open(root: impl AsRef<Path>, expected_identity: JournalIdentity) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
         ensure_journal_root(&root)?;
         let lock_path = root.join("LOCK");
@@ -523,11 +523,11 @@ impl Journal {
         Ok(journal)
     }
 
-    pub fn root(&self) -> &Path {
+    pub(crate) fn root(&self) -> &Path {
         &self.root
     }
 
-    pub fn snapshot(&self) -> Result<JournalSnapshot> {
+    pub(crate) fn snapshot(&self) -> Result<JournalSnapshot> {
         #[cfg(test)]
         self.snapshot_calls.fetch_add(1, Ordering::Relaxed);
         let read = self
@@ -658,7 +658,7 @@ impl Journal {
         }
     }
 
-    pub fn progress(&self) -> Result<JournalProgress> {
+    pub(crate) fn progress(&self) -> Result<JournalProgress> {
         let read = self
             .database
             .begin_read()
@@ -682,11 +682,8 @@ impl Journal {
         self.snapshot()?.pending_ssd_reservations()
     }
 
-    pub fn pending_from(
-        &self,
-        first_sequence: Sequence,
-        limit: usize,
-    ) -> Result<Vec<MutationRecord>> {
+    #[cfg(test)]
+    fn pending_from(&self, first_sequence: Sequence, limit: usize) -> Result<Vec<MutationRecord>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -703,7 +700,11 @@ impl Journal {
     /// The bounded pending slice plus the watermarks it is consistent with, in
     /// one read transaction. Callers that validate the slice against a
     /// watermark must use this instead of `progress` + `pending_from`.
-    pub fn pending_window(&self, first_sequence: Sequence, limit: usize) -> Result<PendingWindow> {
+    pub(crate) fn pending_window(
+        &self,
+        first_sequence: Sequence,
+        limit: usize,
+    ) -> Result<PendingWindow> {
         let read = self
             .database
             .begin_read()
@@ -749,7 +750,12 @@ impl Journal {
         Ok(records)
     }
 
-    pub fn commit_put(&self, record: MutationRecord, payload: &[u8]) -> Result<MutationRecord> {
+    #[cfg(test)]
+    pub(crate) fn commit_put(
+        &self,
+        record: MutationRecord,
+        payload: &[u8],
+    ) -> Result<MutationRecord> {
         let verified = VerifiedPayload::new(bytes::Bytes::copy_from_slice(payload));
         let prepared = self.prepare_verified_put(record, &verified)?;
         self.publish_prepared(prepared)
@@ -1204,12 +1210,13 @@ impl Journal {
         }
     }
 
-    pub fn commit_metadata(&self, record: MutationRecord) -> Result<MutationRecord> {
+    #[cfg(test)]
+    fn commit_metadata(&self, record: MutationRecord) -> Result<MutationRecord> {
         let prepared = self.prepare_metadata(record)?;
         self.publish_prepared(prepared)
     }
 
-    pub fn read_blob(&self, sequence: Sequence) -> Result<Vec<u8>> {
+    pub(crate) fn read_blob(&self, sequence: Sequence) -> Result<Vec<u8>> {
         let blob = self.open_verified_blob(sequence)?;
         let capacity = usize::try_from(blob.len).context("blob is too large to read")?;
         let mut collected = Vec::with_capacity(capacity);
@@ -1234,7 +1241,12 @@ impl Journal {
         open_verified_blob(&path, reference.slice, &record)
     }
 
-    pub fn mark_remote(&self, sequence: Sequence, result_etag: Option<String>) -> Result<()> {
+    #[cfg(test)]
+    pub(crate) fn mark_remote(
+        &self,
+        sequence: Sequence,
+        result_etag: Option<String>,
+    ) -> Result<()> {
         self.mark_remote_batch(&[(sequence, result_etag)])
     }
 
@@ -1244,7 +1256,10 @@ impl Journal {
     /// each sequence alone, at one fsync'd commit for the whole run instead of
     /// one per record (the fixed transaction cost otherwise becomes the remote
     /// replay throughput ceiling).
-    pub fn mark_remote_batch(&self, completions: &[(Sequence, Option<String>)]) -> Result<()> {
+    pub(crate) fn mark_remote_batch(
+        &self,
+        completions: &[(Sequence, Option<String>)],
+    ) -> Result<()> {
         if completions.is_empty() {
             bail!("remote watermark batch must not be empty");
         }
@@ -1348,7 +1363,7 @@ impl Journal {
         Ok((published_sequence == sequence).then_some(e_tag))
     }
 
-    pub fn seed_remote_object_etag(
+    pub(crate) fn seed_remote_object_etag(
         &self,
         path: &str,
         sequence: Sequence,
@@ -1405,7 +1420,7 @@ impl Journal {
             .context("failed to commit remote object predecessor seed")
     }
 
-    pub fn record_remote_failure(&self, sequence: Sequence, error: &str) -> Result<()> {
+    pub(crate) fn record_remote_failure(&self, sequence: Sequence, error: &str) -> Result<()> {
         let _write = self.write_gate.lock();
         let mut transaction = self
             .database
@@ -1460,7 +1475,7 @@ impl Journal {
             .context("failed to commit remote retry")
     }
 
-    pub fn remove_remote_prefix(&self, through: Sequence) -> Result<()> {
+    pub(crate) fn remove_remote_prefix(&self, through: Sequence) -> Result<()> {
         let progress = self.progress()?;
         if through > progress.remote_seq {
             bail!(

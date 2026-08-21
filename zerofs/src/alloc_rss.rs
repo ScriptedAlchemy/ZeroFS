@@ -28,11 +28,11 @@ thread_local! {
 /// Production startup installs the cap from its validated explicit service
 /// envelope before any cache/backend construction. This module deliberately
 /// does not rediscover cgroups: a container namespace may hide its outer cap.
-pub fn set_rss_cap_bytes(cap: u64) {
+pub(crate) fn set_rss_cap_bytes(cap: u64) {
     RSS_CAP_BYTES.store(cap, Ordering::Relaxed);
 }
 
-pub fn rss_cap_bytes() -> u64 {
+pub(crate) fn rss_cap_bytes() -> u64 {
     RSS_CAP_BYTES.load(Ordering::Relaxed)
 }
 
@@ -77,7 +77,7 @@ fn now_ms() -> u64 {
 /// [`SAMPLE_INTERVAL_MS`] (losers of the sampling race and callers within the
 /// interval get the cached value). `0` if jemalloc is unavailable (lib unit
 /// tests without the global allocator).
-pub fn jemalloc_resident() -> u64 {
+fn jemalloc_resident() -> u64 {
     #[cfg(test)]
     if let Some((resident, _)) = TEST_ALLOCATOR_STATS.with(|stats| stats.get()) {
         return resident;
@@ -121,7 +121,7 @@ fn read_resident() -> u64 {
 
 /// Resident allocator pages, or the test override. Retained virtual mappings
 /// are intentionally not pressure.
-pub fn jemalloc_rss_envelope() -> u64 {
+fn jemalloc_rss_envelope() -> u64 {
     #[cfg(test)]
     if let Some(v) = TEST_ENVELOPE.with(|c| c.get()) {
         return v;
@@ -129,7 +129,7 @@ pub fn jemalloc_rss_envelope() -> u64 {
     jemalloc_resident()
 }
 
-pub fn over_rss_cap() -> bool {
+pub(crate) fn over_rss_cap() -> bool {
     over_rss_cap_of(rss_cap_bytes())
 }
 
@@ -167,12 +167,12 @@ impl Hysteresis {
 // are installed from the same validated pressure cap at startup.
 static PRESSURE: Hysteresis = Hysteresis::new();
 
-pub fn over_rss_cap_of(cap: u64) -> bool {
+pub(crate) fn over_rss_cap_of(cap: u64) -> bool {
     cap > 0 && PRESSURE.check(cap, jemalloc_rss_envelope())
 }
 
 /// `mallctl("arena.*.purge")` -- return unused dirty pages to the OS.
-pub fn purge_arenas() {
+pub(crate) fn purge_arenas() {
     // `()` is zero-sized, so this is mallctl with newlen=0: a command.
     let _ = unsafe { tikv_jemalloc_ctl::raw::write::<()>(b"arena.*.purge\0", ()) };
 }
@@ -184,19 +184,19 @@ pub fn purge_arenas() {
 #[derive(Clone, Copy, Default)]
 pub struct JemallocMemStats {
     /// Bytes actively allocated by the application.
-    pub allocated: u64,
+    pub(crate) allocated: u64,
     /// Bytes in physically resident pages mapped by the allocator.
-    pub resident: u64,
+    pub(crate) resident: u64,
     /// Bytes in active pages mapped by the allocator.
-    pub mapped: u64,
+    pub(crate) mapped: u64,
     /// Bytes in virtual memory mappings retained for future reuse.
-    pub retained: u64,
+    pub(crate) retained: u64,
     /// Bytes dedicated to allocator metadata.
-    pub metadata: u64,
+    pub(crate) metadata: u64,
 }
 
 impl JemallocMemStats {
-    pub fn read() -> Self {
+    pub(crate) fn read() -> Self {
         if epoch::mib().and_then(|e| e.advance()).is_err() {
             return Self::default();
         }
@@ -211,7 +211,7 @@ impl JemallocMemStats {
 }
 
 #[cfg(test)]
-pub fn set_test_rss_envelope(bytes: Option<u64>) {
+pub(crate) fn set_test_rss_envelope(bytes: Option<u64>) {
     TEST_ENVELOPE.with(|c| c.set(bytes));
 }
 

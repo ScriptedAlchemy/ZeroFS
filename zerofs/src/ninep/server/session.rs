@@ -164,14 +164,14 @@ pub(super) struct RequestState {
 }
 
 impl RequestState {
-    pub(super) fn new(fids: FidFootprint) -> Self {
+    fn new(fids: FidFootprint) -> Self {
         Self {
             completed: CancellationToken::new(),
             fids,
         }
     }
 
-    pub(super) fn complete(&self) {
+    fn complete(&self) {
         self.completed.cancel();
     }
 

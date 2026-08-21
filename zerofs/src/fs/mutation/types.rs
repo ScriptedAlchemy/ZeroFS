@@ -130,6 +130,58 @@ pub(crate) enum RequestIdentity {
     DirectOneShot(uuid::Uuid),
 }
 
+/// What replay treatment one request identity asks of the shared write-ack
+/// path.
+///
+/// The shared path dispatches on this answer instead of naming protocols, so
+/// a new [`RequestIdentity`] variant has to state its replay treatment here
+/// rather than growing another protocol test inside the write path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReplayPolicy {
+    /// The protocol dedup ledger owns completed replays: it records the
+    /// acknowledged byte count, and the shared boundary judges each request
+    /// fingerprint against it before admitting any work.
+    ProtocolLedger,
+    /// Replays are served by the materialized request cache whenever no
+    /// volatile overlay is installed.
+    MaterializedFallback,
+    /// The mutation request cache alone decides joins and collisions.
+    RequestCache,
+    /// One-shot work: a fresh identity per call, so there is no request body
+    /// to fingerprint and nothing to replay.
+    Untracked,
+}
+
+impl ReplayPolicy {
+    /// Whether the request body is hashed into a replay fingerprint.
+    pub(crate) fn fingerprints_request(self) -> bool {
+        !matches!(self, Self::Untracked)
+    }
+
+    /// Whether the protocol dedup ledger records and replays the
+    /// acknowledged byte count for this request.
+    pub(crate) fn tracks_protocol_ledger(self) -> bool {
+        matches!(self, Self::ProtocolLedger)
+    }
+
+    /// Whether a missing volatile overlay diverts to the materialized replay
+    /// cache instead of the canonical write path.
+    pub(crate) fn uses_materialized_fallback(self) -> bool {
+        matches!(self, Self::MaterializedFallback)
+    }
+}
+
+impl RequestIdentity {
+    pub(crate) fn replay_policy(&self) -> ReplayPolicy {
+        match self {
+            Self::NineP { .. } => ReplayPolicy::ProtocolLedger,
+            Self::Nfs { .. } => ReplayPolicy::MaterializedFallback,
+            Self::Nbd { .. } | Self::DirectTagged { .. } => ReplayPolicy::RequestCache,
+            Self::DirectOneShot(_) => ReplayPolicy::Untracked,
+        }
+    }
+}
+
 /// Hash of payload, auth, requested stability, durability, and (for NFS)
 /// client address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -157,7 +209,56 @@ impl RequestFingerprint {
 
 #[cfg(test)]
 mod request_fingerprint_tests {
-    use super::RequestFingerprint;
+    use super::{ReplayPolicy, RequestFingerprint, RequestIdentity};
+
+    /// Pins the per-variant replay treatment the shared write path used to
+    /// spell out as protocol tests.
+    #[test]
+    fn every_identity_answers_its_own_replay_policy() {
+        for (identity, expected) in [
+            (
+                RequestIdentity::NineP {
+                    origin_epoch: 1,
+                    operation_id: [1; 16],
+                },
+                ReplayPolicy::ProtocolLedger,
+            ),
+            (
+                RequestIdentity::Nfs {
+                    server_incarnation: uuid::Uuid::nil(),
+                    connection_incarnation: 2,
+                    xid: 3,
+                },
+                ReplayPolicy::MaterializedFallback,
+            ),
+            (
+                RequestIdentity::Nbd {
+                    connection_incarnation: 4,
+                    handle: 5,
+                },
+                ReplayPolicy::RequestCache,
+            ),
+            (
+                RequestIdentity::DirectTagged {
+                    caller_incarnation: uuid::Uuid::nil(),
+                    operation_id: 6,
+                },
+                ReplayPolicy::RequestCache,
+            ),
+            (
+                RequestIdentity::DirectOneShot(uuid::Uuid::nil()),
+                ReplayPolicy::Untracked,
+            ),
+        ] {
+            assert_eq!(identity.replay_policy(), expected, "{identity:?}");
+        }
+        assert!(ReplayPolicy::ProtocolLedger.tracks_protocol_ledger());
+        assert!(!ReplayPolicy::MaterializedFallback.tracks_protocol_ledger());
+        assert!(ReplayPolicy::MaterializedFallback.uses_materialized_fallback());
+        assert!(!ReplayPolicy::ProtocolLedger.uses_materialized_fallback());
+        assert!(ReplayPolicy::RequestCache.fingerprints_request());
+        assert!(!ReplayPolicy::Untracked.fingerprints_request());
+    }
 
     #[test]
     fn fingerprint_parts_are_structurally_unambiguous() {

@@ -3,12 +3,11 @@
 //! Counters are logical/run utilization only. No inode, path, object key,
 //! request ID, or error-string labels.
 
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(super) struct ReadRunSnapshot {
+pub(in crate::fs::store::extent) struct ReadRunSnapshot {
     pub logical_bytes: u64,
     pub extent_count: u64,
     pub run_count: u64,
@@ -18,8 +17,6 @@ pub(super) struct ReadRunSnapshot {
     pub peak_run_fetches: usize,
     pub duration_ns: u64,
 }
-
-static LAST: Mutex<Option<ReadRunSnapshot>> = Mutex::new(None);
 
 pub(super) struct ReadRunRecorder {
     started: Instant,
@@ -70,7 +67,7 @@ impl ReadRunRecorder {
     }
 
     pub(super) fn finish(&self) -> ReadRunSnapshot {
-        let snapshot = ReadRunSnapshot {
+        ReadRunSnapshot {
             logical_bytes: self.logical_bytes,
             extent_count: self.extent_count,
             run_count: self.run_count,
@@ -79,11 +76,7 @@ impl ReadRunRecorder {
             on_store_bytes: self.on_store_bytes,
             peak_run_fetches: self.peak.load(Ordering::Relaxed),
             duration_ns: self.started.elapsed().as_nanos() as u64,
-        };
-        if let Ok(mut last) = LAST.lock() {
-            *last = Some(snapshot);
         }
-        snapshot
     }
 }
 
@@ -95,11 +88,6 @@ impl Drop for FetchGuard<'_> {
     fn drop(&mut self) {
         self.active.fetch_sub(1, Ordering::Relaxed);
     }
-}
-
-#[cfg(test)]
-pub(super) fn last_snapshot() -> Option<ReadRunSnapshot> {
-    LAST.lock().ok().and_then(|guard| *guard)
 }
 
 use crate::fs::inode::InodeId;

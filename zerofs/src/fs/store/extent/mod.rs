@@ -151,6 +151,10 @@ pub struct ExtentStore {
     /// Test-only gate that can pause `seal_open` after rotating its generation.
     #[cfg(test)]
     seal_open_put_gate: Option<Arc<Semaphore>>,
+    /// Test observation slot: metrics snapshot of this store's most recent
+    /// fragmented read. Arc-shared so clones observe the same slot.
+    #[cfg(test)]
+    last_read_metrics: Arc<Mutex<Option<read::metrics::ReadRunSnapshot>>>,
     /// Writers hold the read side from FrameLoc assignment through commit; GC
     /// takes the write side before sealing and choosing its cutoff.
     extent_ref_barrier: Arc<tokio::sync::RwLock<()>>,
@@ -249,7 +253,7 @@ impl ExtentStore {
             .insert(DecodedExtentKey::new(id, extent, loc), data);
     }
 
-    pub fn new(
+    pub(crate) fn new(
         db: Arc<Db>,
         key_codec: Arc<KeyCodec>,
         segments: Arc<SegmentStore>,
@@ -301,6 +305,8 @@ impl ExtentStore {
             before_batch_seal: None,
             #[cfg(test)]
             seal_open_put_gate: None,
+            #[cfg(test)]
+            last_read_metrics: Arc::new(Mutex::new(None)),
             extent_ref_barrier: Arc::new(tokio::sync::RwLock::new(())),
             sealing: Arc::new(Mutex::new(BTreeMap::new())),
             seal_upload_sem: Arc::new(Semaphore::new(max_inflight_seals)),
@@ -373,7 +379,7 @@ impl ExtentStore {
     }
 
     /// Attach one publication guard before assigning any FrameLoc.
-    pub(super) async fn protect_extent_ref(&self, txn: &mut Transaction) {
+    async fn protect_extent_ref(&self, txn: &mut Transaction) {
         if !txn.has_extent_ref_guard() {
             txn.hold_extent_ref_guard(self.new_extent_ref_guard().await);
         }
@@ -413,7 +419,7 @@ impl ExtentStore {
     /// Seed the monitor footprint gauges from a one-time scan. Call at store
     /// open, before writes begin, so the incremental deltas start from the
     /// existing on-store footprint.
-    pub async fn seed_footprint(&self) -> Result<(), FsError> {
+    pub(crate) async fn seed_footprint(&self) -> Result<(), FsError> {
         let f = self.sample_footprint().await?;
         self.segment_gc_stats.seed_footprint(&f);
         Ok(())
@@ -423,7 +429,7 @@ impl ExtentStore {
     /// plus sealed segments whose PUT is active or failed and pending retry. This
     /// is the write-back buffer, the recently-written data a crash would lose
     /// without a flush. Read fresh (it is volatile); cheap in-memory lengths.
-    pub fn unflushed_bytes(&self) -> u64 {
+    pub(crate) fn unflushed_bytes(&self) -> u64 {
         let open: u64 = self
             .open_lanes
             .iter()
@@ -441,7 +447,10 @@ impl ExtentStore {
 
     /// Inject the commit worker's weak handle so this store's GC/compaction
     /// seg-delta txns route through the single writer. Idempotent.
-    pub fn set_coordinator(&self, coord: crate::fs::write_coordinator::WeakWriteCoordinator) {
+    pub(crate) fn set_coordinator(
+        &self,
+        coord: crate::fs::write_coordinator::WeakWriteCoordinator,
+    ) {
         let _ = self.coordinator.set(coord);
     }
 
@@ -452,7 +461,7 @@ impl ExtentStore {
 
     /// No seal PUT in flight or pending re-PUT. Fast passes must not queue
     /// the barrier's all-permits drain behind a seal burst.
-    pub fn seals_quiet(&self) -> bool {
+    pub(crate) fn seals_quiet(&self) -> bool {
         self.seal_upload_sem.available_permits() == self.max_inflight_seals
             && self.sealing.lock().unwrap().is_empty()
     }
@@ -515,7 +524,7 @@ impl ExtentStore {
         self
     }
 
-    pub(super) fn seal_threshold(&self) -> usize {
+    fn seal_threshold(&self) -> usize {
         self.seal_threshold
     }
 
@@ -523,7 +532,7 @@ impl ExtentStore {
     /// enough to classify except for the exact current lane generations, which
     /// can still gain references and remain excluded even if they rotate while
     /// the scan is running.
-    pub(super) fn current_open_boundary(&self) -> (u64, HashSet<Segid>) {
+    fn current_open_boundary(&self) -> (u64, HashSet<Segid>) {
         let current: HashSet<_> = self
             .open_lanes
             .iter()

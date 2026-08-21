@@ -68,15 +68,15 @@ impl Display for ObjectOperation {
 /// An object-store access event emitted when a backend request completes.
 #[derive(Clone, Debug)]
 pub struct ObjectAccessEvent {
-    pub timestamp: u64,
+    pub(crate) timestamp: u64,
     /// Which backend the request hit: `"data"` or `"wal"`.
-    pub store: &'static str,
-    pub operation: ObjectOperation,
-    pub path: String,
+    pub(crate) store: &'static str,
+    pub(crate) operation: ObjectOperation,
+    pub(crate) path: String,
     /// How long the request took. `None` for stream-shaped ops (list, delete)
     /// where there is no single request to time.
-    pub duration_us: Option<u64>,
-    pub error: bool,
+    pub(crate) duration_us: Option<u64>,
+    pub(crate) error: bool,
 }
 
 /// Traces object-store requests and broadcasts them to subscribers.
@@ -96,11 +96,11 @@ impl ObjectTracer {
 
     /// True when at least one subscriber is connected. Every wrapper method
     /// checks this first so tracing adds nothing when no one is watching.
-    pub fn has_subscribers(&self) -> bool {
+    fn has_subscribers(&self) -> bool {
         self.sender.receiver_count() > 0
     }
 
-    pub fn subscribe(&self) -> broadcast::Receiver<ObjectAccessEvent> {
+    pub(crate) fn subscribe(&self) -> broadcast::Receiver<ObjectAccessEvent> {
         self.sender.subscribe()
     }
 
@@ -142,7 +142,11 @@ pub struct TracingObjectStore {
 }
 
 impl TracingObjectStore {
-    pub fn new(inner: Arc<dyn ObjectStore>, tracer: ObjectTracer, store: &'static str) -> Self {
+    pub(crate) fn new(
+        inner: Arc<dyn ObjectStore>,
+        tracer: ObjectTracer,
+        store: &'static str,
+    ) -> Self {
         Self {
             inner,
             tracer,

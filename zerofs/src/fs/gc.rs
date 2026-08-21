@@ -45,28 +45,28 @@ const ORPHAN_SWEEP_INTERVAL_SECS: i64 = 24 * 60 * 60;
 #[derive(Debug, Clone, Copy)]
 pub struct GcTuning {
     /// Pass interval while the store is active.
-    pub interval: Duration,
+    interval: Duration,
     /// Pass interval while a saturated backlog meets an idle store.
-    pub idle_interval: Duration,
+    idle_interval: Duration,
     /// Pass interval while the store is active but its dead backlog is large
     /// (>= `busy_backlog_dead_percent`). `>= interval` disables the tier.
-    pub busy_backlog_interval: Duration,
+    busy_backlog_interval: Duration,
     /// Dead-space percent at or above which `busy_backlog_interval` applies.
-    pub busy_backlog_dead_percent: u64,
+    busy_backlog_dead_percent: u64,
     /// Compaction batches a pass runs before it gates continuation on
     /// foreground idleness (the busy-store throughput floor).
-    pub min_batches_per_pass: usize,
+    min_batches_per_pass: usize,
     /// Per-round live-byte budget (selection cap, half-reserve for heat, and
     /// stored-byte gather cap). Raising it packs over-reserve seams and lifts
     /// per-batch dead-space throughput, at proportional gather RAM.
-    pub round_bytes: u64,
+    round_bytes: u64,
     /// Whether reads feed compaction at all (nominations, seam heat, chains).
-    pub read_directed: bool,
+    read_directed: bool,
     /// Tail-scrub floor, percent dead; `None` = scrub off.
-    pub tail_min_dead_percent: Option<u64>,
+    tail_min_dead_percent: Option<u64>,
     /// How long the open counter must sit unchanged before the whole store
     /// counts as write-cold.
-    pub quiescent_after: Duration,
+    quiescent_after: Duration,
 }
 
 impl Default for GcTuning {
@@ -421,7 +421,7 @@ impl GarbageCollector {
     }
 
     /// Spawns both GC loops
-    pub fn start(
+    pub(crate) fn start(
         self: Arc<Self>,
         shutdown: CancellationToken,
         runtime: Option<tokio::runtime::Handle>,

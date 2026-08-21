@@ -39,7 +39,7 @@ impl Clone for SlateDbHandle {
 }
 
 impl SlateDbHandle {
-    pub fn is_read_only(&self) -> bool {
+    fn is_read_only(&self) -> bool {
         matches!(self, SlateDbHandle::ReadOnly(_))
     }
 }
@@ -49,9 +49,9 @@ impl SlateDbHandle {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct WarmStats {
     /// Metadata SSTs the warm fan-out touched.
-    pub ssts: usize,
+    pub(crate) ssts: usize,
     /// Of those, how many had at least one target fail (counted, not fatal).
-    pub failed: usize,
+    pub(crate) failed: usize,
 }
 
 /// Tracks which metadata SSTs have already been warmed, so that across manifest
@@ -97,13 +97,14 @@ impl<Id: Eq + std::hash::Hash + Copy> WarmTracker<Id> {
 /// instance's workers stop and the test goes on to verify what the crash
 /// left behind.
 #[doc(hidden)]
+/// Public for the DST simulation crate (`tests/dst`, `--cfg dst`); hawk cannot see that consumer.
 pub static DST_PANIC_ON_WRITE_ERROR: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 /// Fatal handler for SlateDB write errors.
 /// After a write failure, the database state is unknown. Exit and let
 /// the eventual orchestrator restart the service to rebuild from a known-good state.
-pub fn exit_on_write_error(err: impl std::fmt::Display) -> ! {
+pub(crate) fn exit_on_write_error(err: impl std::fmt::Display) -> ! {
     if DST_PANIC_ON_WRITE_ERROR.load(std::sync::atomic::Ordering::Relaxed) {
         panic!("dst: simulated process death on write error: {err}");
     }
@@ -120,9 +121,9 @@ enum TxOp {
 /// the commit worker can aggregate them per shard across a whole batch and
 /// persist one absolute shard value, without any per-operation locking.
 pub struct StatsDelta {
-    pub inode_id: u64,
-    pub bytes: i64,
-    pub inodes: i64,
+    pub(crate) inode_id: u64,
+    pub(crate) bytes: i64,
+    pub(crate) inodes: i64,
 }
 
 pub(crate) type DirectoryEntryCacheUpdate = ((u64, Bytes), Option<(u64, u64)>);
@@ -151,7 +152,7 @@ pub struct Transaction {
 pub(crate) type ExtentRefGuard = Arc<tokio::sync::OwnedRwLockReadGuard<()>>;
 
 impl Transaction {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             ops: Vec::new(),
             inode_cache_updates: Vec::new(),
@@ -181,7 +182,7 @@ impl Transaction {
     }
 
     /// Attach the result published after this transaction applies.
-    pub fn set_dedup_result(
+    pub(crate) fn set_dedup_result(
         &mut self,
         op_id: crate::dedup::OpId,
         result: crate::dedup::DedupResult,
@@ -190,15 +191,15 @@ impl Transaction {
             crate::dedup::has_op_id(&op_id).then_some(crate::dedup::DedupEntry { op_id, result });
     }
 
-    pub fn take_dedup_entry(&mut self) -> Option<crate::dedup::DedupEntry> {
+    pub(crate) fn take_dedup_entry(&mut self) -> Option<crate::dedup::DedupEntry> {
         self.dedup_entry.take()
     }
 
-    pub fn put_bytes(&mut self, key: &Bytes, value: Bytes) {
+    pub(crate) fn put_bytes(&mut self, key: &Bytes, value: Bytes) {
         self.ops.push(TxOp::Put(key.clone(), value));
     }
 
-    pub fn delete_bytes(&mut self, key: &Bytes) {
+    pub(crate) fn delete_bytes(&mut self, key: &Bytes) {
         self.ops.push(TxOp::Delete(key.clone()));
     }
 
@@ -257,7 +258,7 @@ impl Transaction {
     /// derives the byte dimension from each inode's pre- and post-image
     /// instead; see `derive_byte_deltas`. The inode-count dimension needs no
     /// base and so stays here.
-    pub fn add_inode_count_delta(&mut self, inode_id: u64, inodes: i64) {
+    pub(crate) fn add_inode_count_delta(&mut self, inode_id: u64, inodes: i64) {
         if inodes != 0 {
             self.stats_deltas.push(StatsDelta {
                 inode_id,
@@ -280,7 +281,7 @@ impl Transaction {
         }
     }
 
-    pub fn take_stats_deltas(&mut self) -> Vec<StatsDelta> {
+    pub(crate) fn take_stats_deltas(&mut self) -> Vec<StatsDelta> {
         std::mem::take(&mut self.stats_deltas)
     }
 
@@ -288,18 +289,23 @@ impl Transaction {
     /// materialized as an absolute `(live, total)` by the commit worker. A frame
     /// write credits both (`+len, +len`); an overwrite/delete debits live only
     /// (`-len, 0`), keeping `total` monotonic. All-zero deltas drop.
-    pub fn add_seg_delta(&mut self, segcount_key: &Bytes, live_delta: i64, total_delta: i64) {
+    pub(crate) fn add_seg_delta(
+        &mut self,
+        segcount_key: &Bytes,
+        live_delta: i64,
+        total_delta: i64,
+    ) {
         if live_delta != 0 || total_delta != 0 {
             self.seg_deltas
                 .push((segcount_key.clone(), (live_delta, total_delta)));
         }
     }
 
-    pub fn take_seg_deltas(&mut self) -> Vec<(Bytes, (i64, i64))> {
+    pub(crate) fn take_seg_deltas(&mut self) -> Vec<(Bytes, (i64, i64))> {
         std::mem::take(&mut self.seg_deltas)
     }
 
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.ops.is_empty()
     }
 
@@ -308,7 +314,7 @@ impl Transaction {
     /// produces one merged batch with last-write-wins per key.
     ///
     /// Side channels must be drained by the write coordinator first.
-    pub fn apply_to(self, target: &mut WriteBatch) {
+    pub(crate) fn apply_to(self, target: &mut WriteBatch) {
         self.assert_side_channels_drained();
         for op in self.ops {
             match op {
@@ -358,7 +364,10 @@ impl Transaction {
     /// Like [`apply_to`](Self::apply_to) but also returns the ops as `ReplOp`s
     /// for shipping. In apply order; replaying in seqno-then-op order on the
     /// standby reproduces the merged batch's last-write-wins result.
-    pub fn apply_to_collecting(self, target: &mut WriteBatch) -> Vec<crate::replication::ReplOp> {
+    pub(crate) fn apply_to_collecting(
+        self,
+        target: &mut WriteBatch,
+    ) -> Vec<crate::replication::ReplOp> {
         use crate::replication::ReplOp;
         self.assert_side_channels_drained();
         let mut ops = Vec::with_capacity(self.ops.len());
@@ -377,7 +386,7 @@ impl Transaction {
         ops
     }
 
-    pub fn into_inner(self) -> WriteBatch {
+    pub(crate) fn into_inner(self) -> WriteBatch {
         let mut batch = WriteBatch::new();
         self.apply_to(&mut batch);
         batch
@@ -445,7 +454,7 @@ impl WritePermit<'_> {
 }
 
 impl Db {
-    pub fn new(
+    pub(crate) fn new(
         db: Arc<slatedb::Db>,
         metrics_recorder: Option<Arc<DefaultMetricsRecorder>>,
     ) -> Self {
@@ -466,7 +475,7 @@ impl Db {
         }
     }
 
-    pub fn new_read_only(db_reader: ArcSwap<DbReader>) -> Self {
+    pub(crate) fn new_read_only(db_reader: ArcSwap<DbReader>) -> Self {
         Self {
             inner: SlateDbHandle::ReadOnly(db_reader),
             metrics_recorder: None,
@@ -485,13 +494,13 @@ impl Db {
 
     /// The flush barrier (see the field). The seal+flush durability sequence holds
     /// the *write* lock across `seal_open()` + `flush()`; commits hold a read lock.
-    pub fn flush_barrier(&self) -> Arc<tokio::sync::RwLock<()>> {
+    pub(crate) fn flush_barrier(&self) -> Arc<tokio::sync::RwLock<()>> {
         Arc::clone(&self.flush_barrier)
     }
 
     /// Attach the HA leader lease; reads/writes are then refused while it is
     /// invalid. Single-node `Db`s have no lease and are never gated.
-    pub fn with_lease(mut self, lease: Arc<crate::replication::Lease>) -> Self {
+    pub(crate) fn with_lease(mut self, lease: Arc<crate::replication::Lease>) -> Self {
         self.lease = Some(lease);
         self
     }
@@ -538,18 +547,18 @@ impl Db {
     }
 
     /// Called under the flush barrier's write lock immediately before close.
-    pub fn mark_closing(&self) {
+    pub(crate) fn mark_closing(&self) {
         self.closing.store(true, Ordering::Release);
     }
 
     /// Whether a protocol adapter may emit a successful response.
     #[inline]
-    pub fn permits_successful_response(&self) -> bool {
+    pub(crate) fn permits_successful_response(&self) -> bool {
         !self.is_deposed()
     }
 
     /// Waits for terminal HA lease revocation. Without a lease, this does not complete.
-    pub async fn serving_authority_lost(&self) {
+    pub(crate) async fn serving_authority_lost(&self) {
         match &self.lease {
             Some(lease) => lease.revoked().await,
             None => std::future::pending().await,
@@ -557,7 +566,7 @@ impl Db {
     }
 
     /// Permanently revoke the attached serving lease.
-    pub fn revoke_lease(&self) {
+    pub(crate) fn revoke_lease(&self) {
         if let Some(lease) = &self.lease {
             lease.revoke();
         }
@@ -583,7 +592,7 @@ impl Db {
         false
     }
 
-    pub fn is_read_only(&self) -> bool {
+    pub(crate) fn is_read_only(&self) -> bool {
         self.inner.is_read_only()
     }
 
@@ -669,7 +678,7 @@ impl Db {
     }
 
     /// Scan seeing only object-storage-durable data.
-    pub async fn scan_durable<R: slatedb::ByteRangeBounds + Send>(
+    pub(crate) async fn scan_durable<R: slatedb::ByteRangeBounds + Send>(
         &self,
         range: R,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<(Bytes, Bytes)>> + Send + '_>>> {
@@ -770,7 +779,7 @@ impl Db {
     /// lower bound, so SlateDB prunes sorted runs entirely below the resume
     /// point at setup instead of opening them and seeking forward.
     /// `read_ahead_bytes` controls SlateDB's read-ahead within the iterator.
-    pub async fn scan_prefix(
+    pub(crate) async fn scan_prefix(
         &self,
         prefix: Bytes,
         seek_to: Option<Bytes>,
@@ -830,7 +839,7 @@ impl Db {
 
     /// Returns the committed batch's SlateDB seqnum, mapped to `durable_seq` to
     /// advance the standby's prune watermark.
-    pub async fn write_with_options(
+    pub(crate) async fn write_with_options(
         &self,
         batch: WriteBatch,
         options: &WriteOptions,
@@ -876,7 +885,7 @@ impl Db {
         Ok(Transaction::new())
     }
 
-    pub async fn put_with_options(
+    pub(crate) async fn put_with_options(
         &self,
         key: &Bytes,
         value: &[u8],
@@ -904,7 +913,7 @@ impl Db {
         Ok(())
     }
 
-    pub async fn flush(&self) -> Result<()> {
+    pub(crate) async fn flush(&self) -> Result<()> {
         if self.is_read_only() {
             return Err(FsError::ReadOnlyFilesystem.into());
         }
@@ -924,7 +933,7 @@ impl Db {
         Ok(())
     }
 
-    pub fn slatedb_metrics(&self) -> Option<Arc<DefaultMetricsRecorder>> {
+    pub(crate) fn slatedb_metrics(&self) -> Option<Arc<DefaultMetricsRecorder>> {
         self.metrics_recorder.clone()
     }
 
@@ -953,7 +962,7 @@ impl Db {
     /// propagated. A no-op on a volume with no metadata segment yet (a fresh DB
     /// before its first flush) or without a block cache. Not lease-gated.
     #[cfg(test)]
-    pub async fn warm_metadata(&self, warm_data: bool) -> WarmStats {
+    pub(crate) async fn warm_metadata(&self, warm_data: bool) -> WarmStats {
         let targets = Self::warm_targets(warm_data);
 
         // Snapshot the metadata segment's SST ids; the manifest borrow ends with
@@ -1005,7 +1014,9 @@ impl Db {
     /// A fresh status subscription (manifest + durability updates) for the
     /// read-write handle, or `None` for a read-only open (which has no block
     /// cache to keep warm).
-    pub fn subscribe_status(&self) -> Option<tokio::sync::watch::Receiver<slatedb::DbStatus>> {
+    pub(crate) fn subscribe_status(
+        &self,
+    ) -> Option<tokio::sync::watch::Receiver<slatedb::DbStatus>> {
         match &self.inner {
             SlateDbHandle::ReadWrite(db) => Some(db.subscribe()),
             SlateDbHandle::ReadOnly(_) => None,
@@ -1021,7 +1032,7 @@ impl Db {
     /// cost again right after every compaction. The set of already-warmed ids is
     /// diffed against each new manifest, so each SST is warmed exactly once and an
     /// unchanged manifest is a no-op. Runs until `shutdown`.
-    pub async fn warm_metadata_watch(
+    pub(crate) async fn warm_metadata_watch(
         &self,
         warm_data: bool,
         mut status: tokio::sync::watch::Receiver<slatedb::DbStatus>,
@@ -1092,7 +1103,7 @@ impl Db {
         }
     }
 
-    pub async fn close(&self) -> Result<()> {
+    pub(crate) async fn close(&self) -> Result<()> {
         self.mark_closing();
         match &self.inner {
             SlateDbHandle::ReadWrite(db) => {

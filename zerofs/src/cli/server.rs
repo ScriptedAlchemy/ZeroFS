@@ -713,7 +713,7 @@ fn foyer_build_error(context: &str, err: foyer::Error) -> anyhow::Error {
 
 /// Build the foyer hybrid cache used as slatedb's block cache. Shared by the
 /// server open path and the warm-metadata integration test.
-pub(crate) async fn build_block_hybrid(
+async fn build_block_hybrid(
     hybrid_cache_root: &std::path::Path,
     memory_bytes: usize,
     disk_bytes: usize,
@@ -783,7 +783,7 @@ fn parts_engine_knobs(disk_bytes: usize) -> PartsEngineKnobs {
     }
 }
 
-pub(crate) async fn build_parts_hybrid(
+async fn build_parts_hybrid(
     cache_root: &std::path::Path,
     memory_bytes: usize,
     disk_bytes: usize,
@@ -836,7 +836,7 @@ pub(crate) async fn build_parts_hybrid(
 /// miss is a parts-cache hit plus a re-decode). The decoded-blocks side gets a
 /// bounded slice; the parts cache, where the bulk segment bytes live, gets the
 /// rest. Floors keep either side from collapsing on a tiny config.
-pub(crate) fn split_disk_budget(total_disk_bytes: usize) -> (usize, usize) {
+fn split_disk_budget(total_disk_bytes: usize) -> (usize, usize) {
     const MIN_BYTES: usize = 1024 * 1024 * 1024; // 1 GiB floor per side
     // u64: 16 GiB overflows usize on 32-bit targets
     const MAX_META_BYTES: u64 = 16 * 1024 * 1024 * 1024; // metadata rarely needs more

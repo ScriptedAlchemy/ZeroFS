@@ -206,7 +206,7 @@ impl ZeroFS {
 
     /// `create` with default attributes, returning only the id; EEXIST doubles
     /// as the exclusivity guarantee.
-    pub async fn create_exclusive(
+    pub(crate) async fn create_exclusive(
         &self,
         auth: &AuthContext,
         dirid: InodeId,
@@ -238,7 +238,7 @@ impl ZeroFS {
 
     /// `mkdir` tagged with an idempotency op-id: an applied retry returns the
     /// existing directory instead of EEXIST. See [`Self::create_idempotent`].
-    pub async fn mkdir_idempotent(
+    pub(crate) async fn mkdir_idempotent(
         &self,
         creds: &Credentials,
         dirid: InodeId,
@@ -441,7 +441,7 @@ impl ZeroFS {
     /// `mknod` tagged with an idempotency op-id: an applied retry returns the
     /// existing node instead of EEXIST. See [`Self::create_idempotent`].
     #[allow(clippy::too_many_arguments)]
-    pub async fn mknod_idempotent(
+    pub(crate) async fn mknod_idempotent(
         &self,
         creds: &Credentials,
         dirid: InodeId,

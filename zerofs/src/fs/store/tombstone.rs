@@ -10,9 +10,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone)]
 pub struct TombstoneEntry {
-    pub key: Bytes,
+    pub(crate) key: Bytes,
     pub inode_id: InodeId,
-    pub remaining_size: u64,
+    pub(crate) remaining_size: u64,
 }
 
 #[derive(Clone)]
@@ -22,11 +22,11 @@ pub struct TombstoneStore {
 }
 
 impl TombstoneStore {
-    pub fn new(db: Arc<Db>, key_codec: Arc<KeyCodec>) -> Self {
+    pub(crate) fn new(db: Arc<Db>, key_codec: Arc<KeyCodec>) -> Self {
         Self { db, key_codec }
     }
 
-    pub fn add(&self, txn: &mut Transaction, inode_id: InodeId, size: u64) {
+    pub(crate) fn add(&self, txn: &mut Transaction, inode_id: InodeId, size: u64) {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -35,11 +35,11 @@ impl TombstoneStore {
         txn.put_bytes(&key, KeyCodec::encode_tombstone_size(size));
     }
 
-    pub fn update(&self, txn: &mut Transaction, key: &Bytes, new_size: u64) {
+    pub(crate) fn update(&self, txn: &mut Transaction, key: &Bytes, new_size: u64) {
         txn.put_bytes(key, KeyCodec::encode_tombstone_size(new_size));
     }
 
-    pub fn remove(&self, txn: &mut Transaction, key: &Bytes) {
+    pub(crate) fn remove(&self, txn: &mut Transaction, key: &Bytes) {
         txn.delete_bytes(key);
     }
 

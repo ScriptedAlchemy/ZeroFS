@@ -7,7 +7,7 @@ use crate::fs::ZeroFS;
 use crate::fs::errors::FsError;
 use crate::fs::inode::Inode;
 use crate::fs::mutation::admission::PreparationGuard;
-use crate::fs::mutation::request_cache::RequestLookup;
+use crate::fs::mutation::overlay::{WriteAdmission, WriteAdmissionError};
 use crate::fs::mutation::types::{
     ConflictKey, ConflictScope, MutationCutoff, MutationError, PrepareWriteRequest,
     RequestFingerprint, RequestIdentity, RequestLifetime,
@@ -848,39 +848,32 @@ impl NBDHandler {
         request: NbdMutationRequest,
     ) -> CommandResult<PreparationGuard> {
         let scope = nbd_write_scope(device, request)?;
-        let coordinator = self
+        // The acquire order (request slot, then raw bytes, then the gate) is
+        // owned by the shared write path, so admission and backpressure fixes
+        // reach NBD without being re-derived here. The identity stays the
+        // production one-shot key: it decides request-cache keying, not
+        // ordering.
+        match self
             .filesystem
-            .mutation_coordinator
-            .get()
-            .ok_or(CommandError::IoError)?;
-        let pending = match coordinator
-            .request_cache()
-            .lookup_or_reserve(
+            .begin_write_admission(
                 RequestIdentity::DirectOneShot(uuid::Uuid::new_v4()),
                 RequestFingerprint::from_bytes([0; 32]),
                 RequestLifetime::OneShot,
+                scope,
+                request.length as u64,
             )
-            .map_err(|_| CommandError::IoError)?
-        {
-            RequestLookup::Vacant(vacancy) => vacancy.begin_pending(),
-            RequestLookup::Joined(_) | RequestLookup::FingerprintMismatch => {
-                return Err(CommandError::InvalidArgument);
-            }
-            RequestLookup::Backpressured => return Err(CommandError::NoSpace),
-        };
-        let raw_permit = match coordinator
-            .raw_budget()
-            .acquire(request.length as u64)
             .await
         {
-            Ok(permit) => permit,
-            Err(error) => {
-                pending.cancel();
-                return Err(mutation_command_error(error));
+            Ok(WriteAdmission::Prepared(preparation)) => Ok(preparation),
+            // A freshly minted one-shot identity can neither join live work
+            // nor collide with it.
+            Ok(WriteAdmission::Joined(_)) | Err(WriteAdmissionError::FingerprintMismatch) => {
+                Err(CommandError::InvalidArgument)
             }
-        };
-        PreparationGuard::new(coordinator.gate(), scope, raw_permit, pending)
-            .map_err(mutation_command_error)
+            Err(WriteAdmissionError::Unavailable) => Err(CommandError::IoError),
+            Err(WriteAdmissionError::Backpressured) => Err(CommandError::NoSpace),
+            Err(WriteAdmissionError::Mutation(error)) => Err(mutation_command_error(error)),
+        }
     }
 
     pub async fn trim(

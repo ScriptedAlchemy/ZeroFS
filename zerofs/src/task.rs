@@ -2,7 +2,7 @@ use std::future::Future;
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 
-pub fn spawn_named<T, F>(name: &str, future: F) -> JoinHandle<T>
+pub(crate) fn spawn_named<T, F>(name: &str, future: F) -> JoinHandle<T>
 where
     F: Future<Output = T> + Send + 'static,
     T: Send + 'static,
@@ -13,7 +13,7 @@ where
         .expect("failed to spawn task")
 }
 
-pub fn spawn_named_on<T, F>(name: &str, future: F, handle: &Handle) -> JoinHandle<T>
+pub(crate) fn spawn_named_on<T, F>(name: &str, future: F, handle: &Handle) -> JoinHandle<T>
 where
     F: Future<Output = T> + Send + 'static,
     T: Send + 'static,
@@ -24,7 +24,7 @@ where
         .expect("failed to spawn task")
 }
 
-pub fn spawn_blocking_named<T, F>(name: &str, f: F) -> std::io::Result<JoinHandle<T>>
+pub(crate) fn spawn_blocking_named<T, F>(name: &str, f: F) -> std::io::Result<JoinHandle<T>>
 where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,

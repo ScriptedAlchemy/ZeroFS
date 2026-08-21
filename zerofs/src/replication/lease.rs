@@ -53,7 +53,7 @@ pub struct Lease {
 }
 
 impl Lease {
-    pub fn new() -> Arc<Self> {
+    pub(crate) fn new() -> Arc<Self> {
         Self::new_with_wall_clock(Arc::new(SystemWallClock))
     }
 
@@ -147,7 +147,7 @@ impl Lease {
     }
 
     /// Activates an uninitialized lease from the authority request start time.
-    pub fn activate_from(&self, start: Instant, ttl: Duration) -> bool {
+    pub(crate) fn activate_from(&self, start: Instant, ttl: Duration) -> bool {
         if self.state.load(Ordering::Acquire) != UNINITIALIZED {
             return false;
         }
@@ -187,7 +187,7 @@ impl Lease {
 
     /// Renews an active lease from the authority request start time. A response
     /// received after expiry suspends serving.
-    pub fn renew_from(&self, start: Instant, ttl: Duration) -> bool {
+    fn renew_from(&self, start: Instant, ttl: Duration) -> bool {
         let proposed = self.encoded_deadline(start, ttl);
         loop {
             let state = self.state.load(Ordering::Acquire);
@@ -254,7 +254,7 @@ impl Lease {
 
     /// Test helper for activating or renewing from the current instant.
     #[cfg(test)]
-    pub fn renew(&self, ttl: Duration) {
+    pub(crate) fn renew(&self, ttl: Duration) {
         let start = Instant::now();
         if self.state.load(Ordering::Acquire) == UNINITIALIZED {
             let _ = self.activate_from(start, ttl);
@@ -264,7 +264,7 @@ impl Lease {
     }
 
     /// Permanently revokes the lease. The first terminal transition wins.
-    pub fn revoke(&self) {
+    pub(crate) fn revoke(&self) {
         loop {
             let state = self.state.load(Ordering::Acquire);
             if matches!(state, REVOKED | CLOSED_CLEANLY) {
@@ -331,7 +331,7 @@ impl Lease {
     }
 
     /// Resolves on terminal invalidation, not recoverable suspension.
-    pub async fn revoked(&self) {
+    pub(crate) async fn revoked(&self) {
         self.revoked.cancelled().await;
     }
 
@@ -381,7 +381,7 @@ impl Lease {
         }
     }
 
-    pub fn is_valid(&self) -> bool {
+    pub(crate) fn is_valid(&self) -> bool {
         let state = self.state.load(Ordering::Acquire);
         if state < DEADLINE_BIAS {
             return false;
@@ -597,11 +597,11 @@ impl AuthoritySupervisor {
         })
     }
 
-    pub fn lease(&self) -> Arc<Lease> {
+    pub(crate) fn lease(&self) -> Arc<Lease> {
         Arc::clone(&self.lease)
     }
 
-    pub fn loss_token(&self) -> CancellationToken {
+    pub(crate) fn loss_token(&self) -> CancellationToken {
         self.loss.clone()
     }
 

@@ -52,6 +52,11 @@ impl FlushReceipt {
 
 enum Request {
     Flush(Reply),
+    /// Only constructed by the `#[cfg(test)]` `FlushCoordinator::close`;
+    /// production shutdown goes through `stop_worker` + `Db::close` instead.
+    /// Gating the variant itself would require `#[cfg(test)]` on several
+    /// match arms in the worker loop below, so `allow` is simpler here.
+    #[allow(dead_code)]
     Close(Reply),
 }
 
@@ -76,7 +81,7 @@ pub struct FlushCoordinator {
 }
 
 impl FlushCoordinator {
-    pub fn new(db: Arc<Db>) -> Self {
+    pub(crate) fn new(db: Arc<Db>) -> Self {
         let seal_hook: Arc<OnceLock<SealHook>> = Arc::new(OnceLock::new());
         let hook = Arc::clone(&seal_hook);
         let local_durability_hook: Arc<OnceLock<LocalDurabilityHook>> = Arc::new(OnceLock::new());
@@ -189,7 +194,7 @@ impl FlushCoordinator {
 
     /// Install the pre-flush seal hook (first call wins). Set once at bring-up,
     /// after the data plane is constructed.
-    pub fn set_sealer(&self, hook: SealHook) {
+    pub(crate) fn set_sealer(&self, hook: SealHook) {
         let _ = self.seal_hook.set(hook);
     }
 
@@ -198,7 +203,7 @@ impl FlushCoordinator {
     /// The worker invokes it only after the data segment is sealed and SlateDB
     /// flushes its metadata. Writeback uses this point to capture the newest
     /// accepted object mutation and wait until the SSD journal covers it.
-    pub fn set_local_durability_barrier(&self, hook: LocalDurabilityHook) {
+    pub(crate) fn set_local_durability_barrier(&self, hook: LocalDurabilityHook) {
         let _ = self.local_durability_hook.set(hook);
     }
 
@@ -306,6 +311,7 @@ impl FlushCoordinator {
 
     /// Seal, flush, and close under one barrier write lock. On error, the
     /// caller must exit without closing the database separately.
+    #[cfg(any(test, dst))]
     pub async fn close(&self) -> Result<(), FsError> {
         let (tx, rx) = oneshot::channel();
 
@@ -317,6 +323,7 @@ impl FlushCoordinator {
         joined.and(reply)
     }
 
+    #[cfg(any(test, dst))]
     async fn join_worker(&self) -> Result<(), FsError> {
         let mut worker = self.worker.lock().await;
         let Some(handle) = worker.as_mut() else {
@@ -353,7 +360,7 @@ impl FlushCoordinator {
     /// deadline expires. This is stronger than dropping the `close()` future,
     /// which only abandons its reply receiver while the worker keeps using the
     /// database and object store.
-    pub async fn abort_close_worker(&self) -> Result<(), FsError> {
+    pub(crate) async fn abort_close_worker(&self) -> Result<(), FsError> {
         self.db.mark_closing();
         self.stop_worker().await
     }

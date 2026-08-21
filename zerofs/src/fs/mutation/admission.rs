@@ -82,8 +82,18 @@ impl Drop for WaitRegistration {
         }
         {
             let mut state = lock(&self.inner.state);
+            let before = state.waiters.len();
             state.waiters.retain(|waiter| waiter.id != self.id);
-            if state.terminal.is_none()
+            let was_still_queued = state.waiters.len() != before;
+            // If the waiter was already popped by `grant_waiters`, ownership of
+            // this operation charge has moved to the in-flight
+            // `RawMutationPermit` — whether it is later observed by the caller
+            // or dropped unsent because this registration's receiver is gone,
+            // that permit's own `Drop` releases the byte and operation charge
+            // exactly once. Refunding here too would double-release the
+            // operation for a single acquisition.
+            if was_still_queued
+                && state.terminal.is_none()
                 && let Some(operations) = state.used_operations.checked_sub(1)
             {
                 state.used_operations = operations;
@@ -617,6 +627,98 @@ mod tests {
         drop(held);
         assert_eq!(budget.used_bytes(), 0);
         assert_eq!(budget.used_operations(), 0);
+    }
+
+    #[test]
+    fn cancelled_waiter_after_grant_refunds_operation_exactly_once() {
+        // Deterministically reconstruct the race between `grant_waiters`
+        // delivering a permit through the waiter's oneshot channel and the
+        // waiter's own future being dropped (cancelled) before it ever
+        // observes that permit. Both the permit's `Drop` (unsent value from
+        // the failed `send`) and `WaitRegistration::drop` are candidates to
+        // refund the operation charge; exactly one of them must.
+        //
+        // A `sentinel` permit is kept alive throughout so the outstanding
+        // operation count never touches zero mid-test: a stray double
+        // decrement would otherwise be silently absorbed by the
+        // `checked_sub` underflow guard instead of producing a visible
+        // discrepancy.
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::task::{Context, Waker};
+
+        let budget = RawMutationBudget::new(16, 8);
+        let sentinel = futures_lite_block_on(budget.acquire(4)).unwrap();
+        let held = futures_lite_block_on(budget.acquire(12)).unwrap();
+        assert_eq!(budget.used_bytes(), 16);
+        assert_eq!(budget.used_operations(), 2);
+
+        // Poll the third acquire once so it registers as a queued waiter
+        // without a real executor driving it further.
+        let mut fut: Pin<
+            Box<dyn Future<Output = Result<super::RawMutationPermit, MutationError>>>,
+        > = Box::pin(budget.acquire(4));
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        assert!(fut.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(
+            budget.used_operations(),
+            3,
+            "the queued waiter already owns its operation reservation"
+        );
+
+        // Freeing `held` synchronously grants the queued waiter: `release`
+        // -> `grant_waiters` pops it from the queue, reserves its bytes, and
+        // sends the permit into the (still-buffered) oneshot — all before
+        // this test ever polls `fut` again.
+        drop(held);
+        assert_eq!(
+            budget.used_bytes(),
+            8,
+            "bytes were transferred to the granted-but-unobserved waiter"
+        );
+        assert_eq!(
+            budget.used_operations(),
+            2,
+            "held's own operation charge is refunded; the waiter's charge is \
+             still outstanding, now owned by the granted permit"
+        );
+
+        // Cancel the waiter now, after the grant but before it was ever
+        // observed: this drops the granted `RawMutationPermit` (unsent, so
+        // its `Drop` releases bytes+op) and the `WaitRegistration` guard in
+        // the same moment.
+        drop(fut);
+
+        assert_eq!(
+            budget.used_bytes(),
+            4,
+            "bytes must be refunded exactly once (only the sentinel remains)"
+        );
+        assert_eq!(
+            budget.used_operations(),
+            1,
+            "operations must be refunded exactly once, not twice \
+             (only the sentinel's charge remains)"
+        );
+
+        drop(sentinel);
+        assert_eq!(budget.used_bytes(), 0);
+        assert_eq!(budget.used_operations(), 0);
+    }
+
+    /// Minimal single-poll executor helper: every future used with it here
+    /// resolves on first poll (no real suspension), so this just extracts
+    /// the value without pulling in an async runtime dependency.
+    fn futures_lite_block_on<F: std::future::Future>(fut: F) -> F::Output {
+        use std::task::{Context, Waker};
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let mut fut = Box::pin(fut);
+        match fut.as_mut().poll(&mut cx) {
+            std::task::Poll::Ready(value) => value,
+            std::task::Poll::Pending => panic!("expected immediate readiness"),
+        }
     }
 
     #[tokio::test]
