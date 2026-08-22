@@ -1,5 +1,7 @@
 use crate::runtime;
-use crate::write_progress::{TrackedIo, WriteOutcome, WriteProgress, wait_for_write};
+use crate::write_progress::{
+    IoProgress, ReadOutcome, TrackedIo, WriteOutcome, wait_for_read, wait_for_write,
+};
 use crate::{ClientError, ClientResult, Conn, OutboundFrame, configure_tcp_socket};
 use futures::{SinkExt, StreamExt};
 use std::sync::Arc;
@@ -13,7 +15,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub(super) struct WebSocketIo {
     stream: WebSocketStream<TrackedIo<tokio::net::TcpStream>>,
-    progress: WriteProgress,
+    progress: IoProgress,
 }
 
 pub(super) async fn connect(url: &str) -> ClientResult<WebSocketIo> {
@@ -57,6 +59,7 @@ pub(super) fn spawn(
 ) {
     let WebSocketIo { stream, progress } = io;
     let (mut writer, mut reader) = stream.split();
+    let reader_progress = progress.clone();
     let writer_conn = Arc::clone(&conn);
     let writer_reconnect = Arc::clone(&reconnect);
     runtime::spawn(async move {
@@ -97,10 +100,16 @@ pub(super) fn spawn(
 
     runtime::spawn(async move {
         loop {
-            let next = tokio::select! {
-                biased;
-                _ = conn.reader_shutdown.notified() => break,
-                next = reader.next() => next,
+            let next = match wait_for_read(
+                reader.next(),
+                &reader_progress,
+                &conn.reader_shutdown,
+                || conn.mark_alive(),
+            )
+            .await
+            {
+                ReadOutcome::Completed(next) => next,
+                ReadOutcome::Shutdown => break,
             };
             match next {
                 Some(Ok(Message::Binary(frame))) => conn.deliver(frame),

@@ -6,30 +6,37 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{Notify, watch};
 
 #[derive(Clone)]
-pub(crate) struct WriteProgress {
-    generation: watch::Sender<u64>,
+pub(crate) struct IoProgress {
+    reads: watch::Sender<u64>,
+    writes: watch::Sender<u64>,
 }
 
-impl WriteProgress {
+impl IoProgress {
     fn new() -> Self {
-        let (generation, _) = watch::channel(0);
-        Self { generation }
+        let (reads, _) = watch::channel(0);
+        let (writes, _) = watch::channel(0);
+        Self { reads, writes }
     }
 
-    fn advanced(&self) {
-        self.generation
+    fn read_advanced(&self) {
+        self.reads
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
+    }
+
+    fn write_advanced(&self) {
+        self.writes
             .send_modify(|generation| *generation = generation.wrapping_add(1));
     }
 }
 
 pub(crate) struct TrackedIo<T> {
     inner: T,
-    progress: WriteProgress,
+    progress: IoProgress,
 }
 
 impl<T> TrackedIo<T> {
-    pub(crate) fn new(inner: T) -> (Self, WriteProgress) {
-        let progress = WriteProgress::new();
+    pub(crate) fn new(inner: T) -> (Self, IoProgress) {
+        let progress = IoProgress::new();
         (
             Self {
                 inner,
@@ -46,7 +53,12 @@ impl<T: AsyncRead + Unpin> AsyncRead for TrackedIo<T> {
         cx: &mut Context<'_>,
         buffer: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.inner).poll_read(cx, buffer)
+        let filled_before = buffer.filled().len();
+        let result = Pin::new(&mut self.inner).poll_read(cx, buffer);
+        if buffer.filled().len() > filled_before {
+            self.progress.read_advanced();
+        }
+        result
     }
 }
 
@@ -58,7 +70,7 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for TrackedIo<T> {
     ) -> Poll<Result<usize, std::io::Error>> {
         let result = Pin::new(&mut self.inner).poll_write(cx, buffer);
         if matches!(result, Poll::Ready(Ok(written)) if written > 0) {
-            self.progress.advanced();
+            self.progress.write_advanced();
         }
         result
     }
@@ -86,7 +98,7 @@ pub(crate) enum WriteOutcome<T> {
 
 pub(crate) async fn wait_for_write<F, P>(
     future: F,
-    progress: &WriteProgress,
+    progress: &IoProgress,
     shutdown: &Notify,
     mut on_progress: P,
 ) -> WriteOutcome<F::Output>
@@ -100,7 +112,7 @@ where
         Advanced,
     }
 
-    let mut changes = progress.generation.subscribe();
+    let mut changes = progress.writes.subscribe();
     tokio::pin!(future);
     loop {
         let event = tokio::time::timeout(SEND_STALL_TIMEOUT, async {
@@ -123,6 +135,39 @@ where
                 continue;
             }
             Err(_) => return WriteOutcome::Stalled,
+        }
+    }
+}
+
+pub(crate) enum ReadOutcome<T> {
+    Completed(T),
+    Shutdown,
+}
+
+pub(crate) async fn wait_for_read<F, P>(
+    future: F,
+    progress: &IoProgress,
+    shutdown: &Notify,
+    mut on_progress: P,
+) -> ReadOutcome<F::Output>
+where
+    F: Future,
+    P: FnMut(),
+{
+    let mut changes = progress.reads.subscribe();
+    tokio::pin!(future);
+    loop {
+        tokio::select! {
+            biased;
+            _ = shutdown.notified() => return ReadOutcome::Shutdown,
+            result = &mut future => return ReadOutcome::Completed(result),
+            changed = changes.changed() => {
+                debug_assert!(changed.is_ok(), "the progress sender outlives this wait");
+                if changed.is_err() {
+                    return ReadOutcome::Shutdown;
+                }
+                on_progress();
+            }
         }
     }
 }
