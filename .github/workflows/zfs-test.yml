@@ -157,7 +157,7 @@ jobs:
           # Download Linux kernel source
           echo "Downloading Linux kernel 7.2-rc1..."
           cd /mnt/zfsdata
-          sudo wget -q https://git.kernel.org/torvalds/t/linux-7.2-rc1.tar.gz
+          sudo wget -q https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/snapshot/linux-7.2-rc1.tar.gz
 
           # Show download size
           ls -lh linux-7.2-rc1.tar.gz

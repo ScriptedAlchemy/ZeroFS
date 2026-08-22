@@ -125,7 +125,7 @@ jobs:
       - name: Download Linux kernel
         run: |
           cd /mnt/zerofs
-          wget -q https://git.kernel.org/torvalds/t/linux-7.2-rc1.tar.gz
+          wget -q https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/snapshot/linux-7.2-rc1.tar.gz
           tar -xf linux-7.2-rc1.tar.gz
           rm linux-7.2-rc1.tar.gz
 
