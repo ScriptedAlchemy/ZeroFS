@@ -27,6 +27,8 @@ _GC_CADENCE_KEYS = (
     "idle_interval_secs",
     "busy_backlog_interval_secs",
 )
+_SYSTEMD_RUNTIME_DIR = Path("/run/systemd/system")
+_SYSTEMD_SERVICE_NAME = re.compile(r"[A-Za-z0-9_.@:-]+\.service\Z")
 
 
 @dataclass(slots=True)
@@ -379,6 +381,108 @@ class CanonicalDeployment:
         shutil.rmtree(self.directory)
 
 
+class _TemporaryHotpathEnvironment:
+    """Own one service-scoped Hotpath environment drop-in for a profile run."""
+
+    def __init__(self, config: PilotConfig, runner: Runner, report: Path) -> None:
+        if _SYSTEMD_SERVICE_NAME.fullmatch(config.service) is None:
+            raise ValueError(f"unsafe systemd service name: {config.service!r}")
+        if not report.is_absolute() or report.name != "hotpath.json":
+            raise ValueError(f"unsafe Hotpath report path: {report}")
+        self.config = config
+        self.runner = runner
+        self.report = report
+        self.directory = _SYSTEMD_RUNTIME_DIR / f"{config.service}.d"
+        self.dropin = self.directory / f"zerofs-hotpath-profile-{uuid.uuid4().hex}.conf"
+        self._directory_created = False
+        self._installation_attempted = False
+
+    def install(self) -> None:
+        if (
+            self.runner.run(
+                ["test", "-e", self.dropin], sudo=True, check=False
+            ).returncode
+            == 0
+        ):
+            raise RuntimeError(f"Hotpath service drop-in already exists: {self.dropin}")
+        directory_existed = (
+            self.runner.run(
+                ["test", "-d", self.directory], sudo=True, check=False
+            ).returncode
+            == 0
+        )
+        self._directory_created = not directory_existed
+        self.runner.run(["install", "-d", "-m", "0755", self.directory], sudo=True)
+        content = (
+            "[Service]\n"
+            f'Environment="HOTPATH_OUTPUT_PATH={self.report}"\n'
+            'Environment="HOTPATH_OUTPUT_FORMAT=json"\n'
+            'Environment="HOTPATH_METRICS_SERVER_OFF=true"\n'
+        )
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            prefix="zerofs-hotpath-profile-",
+            dir=self.config.temp_dir,
+            delete=False,
+        ) as handle:
+            handle.write(content)
+            temporary = Path(handle.name)
+        try:
+            self._installation_attempted = True
+            self.runner.run(
+                [
+                    "install",
+                    "-o",
+                    "root",
+                    "-g",
+                    "root",
+                    "-m",
+                    "0644",
+                    temporary,
+                    self.dropin,
+                ],
+                sudo=True,
+            )
+        finally:
+            temporary.unlink(missing_ok=True)
+        self.runner.run(["systemctl", "daemon-reload"], sudo=True)
+
+    def cleanup(self) -> None:
+        if not self._installation_attempted:
+            return
+        errors: list[BaseException] = []
+        try:
+            self.runner.run(["rm", "-f", "--", self.dropin], sudo=True)
+        except BaseException as error:
+            errors.append(error)
+        if self._directory_created:
+            try:
+                self.runner.run(
+                    ["rmdir", "--ignore-fail-on-non-empty", self.directory],
+                    sudo=True,
+                )
+            except BaseException as error:
+                errors.append(error)
+        try:
+            self.runner.run(["systemctl", "daemon-reload"], sudo=True)
+        except BaseException as error:
+            errors.append(error)
+        if errors:
+            raise RuntimeError(
+                "Hotpath environment cleanup failures: "
+                + "; ".join(str(error) for error in errors)
+            )
+
+
+def _require_hotpath_report(path: Path) -> object:
+    if not path.is_file() or path.stat().st_size == 0:
+        raise RuntimeError(f"Hotpath report is missing or empty: {path}")
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"Hotpath report contains invalid JSON: {path}") from error
+
+
 class _Benchmark(Protocol):
     def run(
         self,
@@ -589,7 +693,14 @@ class ProfileRunner:
             ),
         }
         self.runner.run(
-            [self.config.cargo, "build", "--release", "--locked"],
+            [
+                self.config.cargo,
+                "build",
+                "--release",
+                "--locked",
+                "--features",
+                "hotpath-profile",
+            ],
             cwd=self.config.crate,
             env=env,
             capture=False,
@@ -656,7 +767,10 @@ class ProfileRunner:
         canonical = CanonicalDeployment.capture(self.config, self.runner)
         receipt = RunReceipt.start(self.config, "profile")
         collectors: CollectorGroup | object | None = None
+        hotpath_environment: _TemporaryHotpathEnvironment | None = None
+        hotpath_report: Path | None = None
         deployed = False
+        profile_service_started = False
         stop_attempted = False
         installation_started = False
         primary: BaseException | None = None
@@ -683,7 +797,13 @@ class ProfileRunner:
                         "temporary_config_sha256": maintenance_config_sha256,
                     },
                 )
+                hotpath_report = receipt.path("hotpath.json")
+                hotpath_environment = _TemporaryHotpathEnvironment(
+                    self.config, self.runner, hotpath_report
+                )
+                hotpath_environment.install()
                 self.lifecycle.start()
+                profile_service_started = True
                 profile_status = self.lifecycle.status(validate_data=True)
                 receipt.record("profile_status", profile_status)
                 pid = self._service_pid()
@@ -711,17 +831,42 @@ class ProfileRunner:
                         )
                     except BaseException as error:
                         cleanup_errors.append(error)
+                profile_service_stopped = not deployed
                 if stop_attempted:
                     try:
                         if deployed:
                             self.lifecycle.stop()
+                            profile_service_stopped = True
+                        if profile_service_started and profile_service_stopped:
+                            assert hotpath_report is not None
+                            _require_hotpath_report(hotpath_report)
+                            receipt.record(
+                                "hotpath_report",
+                                {
+                                    "path": str(hotpath_report),
+                                    "sha256": _sha256(hotpath_report),
+                                },
+                            )
+                    except BaseException as error:
+                        cleanup_errors.append(error)
+                    try:
+                        if hotpath_environment is not None:
+                            hotpath_environment.cleanup()
+                    except BaseException as error:
+                        cleanup_errors.append(error)
+                    try:
                         if installation_started:
+                            if deployed and not profile_service_stopped:
+                                raise RuntimeError(
+                                    "profile service did not stop; canonical deployment retained"
+                                )
                             canonical.restore()
-                        self.lifecycle.start()
-                        status = self.lifecycle.status(validate_data=True)
-                        self.lifecycle.drain()
-                        receipt.record("canonical_status", status)
-                        restored = True
+                        if installation_started:
+                            self.lifecycle.start()
+                            status = self.lifecycle.status(validate_data=True)
+                            self.lifecycle.drain()
+                            receipt.record("canonical_status", status)
+                            restored = True
                     except BaseException as error:
                         cleanup_errors.append(error)
                 if not installation_started or restored:

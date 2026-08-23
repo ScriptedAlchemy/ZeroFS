@@ -2618,7 +2618,7 @@ class _ProfileBenchmark:
 class _TestProfileRunner(ProfileRunner):
     def _build_profile(self) -> Path:
         binary = self.config.profile_target / "release" / "zerofs"
-        binary.parent.mkdir(parents=True)
+        binary.parent.mkdir(parents=True, exist_ok=True)
         binary.write_bytes(b"profile-binary")
         return binary
 
@@ -2631,6 +2631,85 @@ class _TestProfileRunner(ProfileRunner):
 
     def _service_pid(self) -> int:
         return 123
+
+
+class _HotpathEnvironmentRunner(FakeRunner):
+    def __init__(self) -> None:
+        super().__init__()
+        self.hotpath_environment: dict[str, str] = {}
+        self.installed_environments: list[dict[str, str]] = []
+        self.installed_dropins: list[Path] = []
+        self.removed_dropins: list[Path] = []
+        self.dropin_directories: set[Path] = set()
+
+    def run(
+        self,
+        argv: Sequence[str | Path],
+        **kwargs: Any,
+    ) -> CompletedProcess[str]:
+        args = tuple(str(value) for value in argv)
+        if args[:2] == ("test", "-d") and args[2].startswith("/run/systemd/"):
+            path = Path(args[2])
+            return CompletedProcess(
+                args, int(path not in self.dropin_directories), "", ""
+            )
+        if args[:3] == ("install", "-d", "-m") and args[-1].startswith("/run/systemd/"):
+            self.calls.append((args, bool(kwargs.get("sudo", False))))
+            self.dropin_directories.add(Path(args[-1]))
+            return CompletedProcess(args, 0, "", "")
+        if args[:1] == ("install",) and args[-1].startswith("/run/systemd/"):
+            self.calls.append((args, bool(kwargs.get("sudo", False))))
+            self.installed_dropins.append(Path(args[-1]))
+            for line in Path(args[-2]).read_text().splitlines():
+                if line.startswith("Environment="):
+                    assignment = line.removeprefix("Environment=").strip('"')
+                    key, value = assignment.split("=", 1)
+                    self.hotpath_environment[key] = value
+            self.installed_environments.append(dict(self.hotpath_environment))
+            return CompletedProcess(args, 0, "", "")
+        if args[:3] == ("rm", "-f", "--") and args[3].startswith("/run/systemd/"):
+            self.calls.append((args, bool(kwargs.get("sudo", False))))
+            path = Path(args[3])
+            self.removed_dropins.append(path)
+            self.hotpath_environment.clear()
+            return CompletedProcess(args, 0, "", "")
+        if args[:2] == ("rmdir", "--ignore-fail-on-non-empty"):
+            self.calls.append((args, bool(kwargs.get("sudo", False))))
+            self.dropin_directories.discard(Path(args[2]))
+            return CompletedProcess(args, 0, "", "")
+        return super().run(argv, **kwargs)
+
+
+class _HotpathLifecycle(_HealthyLifecycle):
+    def __init__(
+        self,
+        snapshot: WritebackSnapshot,
+        config: PilotConfig,
+        runner: _HotpathEnvironmentRunner,
+        report: str | None,
+        *,
+        fail_profile_start: bool = False,
+    ) -> None:
+        super().__init__(snapshot, config)
+        self.runner = runner
+        self.report = report
+        self.fail_profile_start = fail_profile_start
+        self.profile_started = False
+
+    def start(self) -> dict[str, int]:
+        if self.fail_profile_start:
+            self.fail_profile_start = False
+            raise RuntimeError("injected profile start failure")
+        self.profile_started = bool(self.runner.hotpath_environment)
+        return super().start()
+
+    def stop(self) -> None:
+        if self.profile_started:
+            output = self.runner.hotpath_environment.get("HOTPATH_OUTPUT_PATH")
+            if output is not None and self.report is not None:
+                Path(output).write_text(self.report)
+            self.profile_started = False
+        super().stop()
 
 
 class ProfileTests(unittest.TestCase):
@@ -2675,9 +2754,37 @@ class ProfileTests(unittest.TestCase):
             build_receipt=self.receipt_file,
             config_file=self.config_file,
         )
-        self.runner = FakeRunner()
         self.snapshot = WritebackSnapshot(9, 9, 9, 0, 0, 1, 1, False)
-        self.lifecycle = _HealthyLifecycle(self.snapshot, self.config)
+        self.runner = _HotpathEnvironmentRunner()
+        self.lifecycle = _HotpathLifecycle(
+            self.snapshot,
+            self.config,
+            self.runner,
+            '{"report":"default"}\n',
+        )
+
+    def _hotpath_profiler(
+        self,
+        report: str | None,
+        *,
+        fail_profile_start: bool = False,
+        benchmark: Any = None,
+    ) -> tuple[_TestProfileRunner, _HotpathEnvironmentRunner, _HotpathLifecycle]:
+        runner = _HotpathEnvironmentRunner()
+        lifecycle = _HotpathLifecycle(
+            self.snapshot,
+            self.config,
+            runner,
+            report,
+            fail_profile_start=fail_profile_start,
+        )
+        profiler = _TestProfileRunner(
+            self.config,
+            runner,
+            lifecycle,  # type: ignore[arg-type]
+            benchmark or _ProfileBenchmark(self.config, self.config_file),
+        )
+        return profiler, runner, lifecycle
 
     def test_profile_build_forces_frame_pointers_for_actionable_callchains(
         self,
@@ -2687,6 +2794,7 @@ class ProfileTests(unittest.TestCase):
                 super().__init__()
                 self.binary = binary
                 self.build_env: Mapping[str, str] | None = None
+                self.build_args: tuple[str, ...] | None = None
 
             def run(
                 self,
@@ -2695,6 +2803,7 @@ class ProfileTests(unittest.TestCase):
             ) -> CompletedProcess[str]:
                 args = tuple(str(value) for value in argv)
                 if args[:2] == (str(self_config.cargo), "build"):
+                    self.build_args = args
                     self.build_env = kwargs.get("env")
                     self.binary.parent.mkdir(parents=True, exist_ok=True)
                     self.binary.write_bytes(b"profile-binary")
@@ -2719,6 +2828,111 @@ class ProfileTests(unittest.TestCase):
         self.assertIn("-C force-frame-pointers=yes", runner.build_env["RUSTFLAGS"])
         self.assertIn("--cfg tokio_unstable", runner.build_env["RUSTFLAGS"])
         self.assertIn("--cfg io_uring_skip_arch_check", runner.build_env["RUSTFLAGS"])
+        self.assertEqual(
+            runner.build_args,
+            (
+                str(self.config.cargo),
+                "build",
+                "--release",
+                "--locked",
+                "--features",
+                "hotpath-profile",
+            ),
+        )
+
+    def test_profile_retains_unique_static_json_hotpath_report(self) -> None:
+        profiler, runner, _lifecycle = self._hotpath_profiler('{"report":"ok"}\n')
+
+        result = profiler.run(total_mib=4, jobs=1)
+
+        report = Path(result.receipt_dir) / "hotpath.json"
+        manifest = json.loads((Path(result.receipt_dir) / "manifest.json").read_text())
+        self.assertEqual(manifest["artifacts"]["hotpath.json"], str(report))
+        self.assertEqual(json.loads(report.read_text()), {"report": "ok"})
+        self.assertEqual(
+            runner.hotpath_environment,
+            {},
+        )
+        self.assertEqual(
+            runner.installed_environments,
+            [
+                {
+                    "HOTPATH_OUTPUT_PATH": str(report),
+                    "HOTPATH_OUTPUT_FORMAT": "json",
+                    "HOTPATH_METRICS_SERVER_OFF": "true",
+                }
+            ],
+        )
+        self.assertEqual(len(runner.installed_dropins), 1)
+        self.assertEqual(runner.removed_dropins, runner.installed_dropins)
+        installed = runner.installed_dropins[0]
+        self.assertTrue(installed.name.startswith("zerofs-hotpath-profile-"))
+        self.assertGreaterEqual(
+            sum(call[0] == ("systemctl", "daemon-reload") for call in runner.calls),
+            2,
+        )
+
+    def test_profile_fails_closed_for_missing_empty_or_invalid_hotpath_report(
+        self,
+    ) -> None:
+        for index, (report, message) in enumerate(
+            (
+                (None, "missing or empty"),
+                ("", "missing or empty"),
+                ("not-json", "invalid JSON"),
+            )
+        ):
+            with self.subTest(report=report):
+                profiler, runner, lifecycle = self._hotpath_profiler(report)
+                profiler.config = replace(
+                    profiler.config,
+                    result_dir=Path(self.temp.name) / f"results-hotpath-{index}",
+                )
+
+                with self.assertRaisesRegex(RuntimeError, message):
+                    profiler.run(total_mib=4, jobs=1)
+
+                self.assertEqual(runner.hotpath_environment, {})
+                self.assertEqual(runner.removed_dropins, runner.installed_dropins)
+                self.assertEqual(self.config_file.read_bytes(), self.original_config)
+                self.assertEqual(self.binary.read_bytes(), b"canonical-binary")
+                self.assertGreaterEqual(lifecycle.start_calls, 2)
+
+    def test_profile_hotpath_environment_is_removed_on_cancellation_and_start_failure(
+        self,
+    ) -> None:
+        cancelled, cancelled_runner, _ = self._hotpath_profiler(
+            '{"report":"cancelled"}\n',
+            benchmark=_ProfileBenchmark(
+                self.config,
+                self.config_file,
+                KeyboardInterrupt("injected cancellation"),
+            ),
+        )
+        with self.assertRaisesRegex(KeyboardInterrupt, "injected cancellation"):
+            cancelled.run(total_mib=4, jobs=1)
+        self.assertEqual(len(cancelled_runner.installed_dropins), 1)
+        self.assertEqual(
+            cancelled_runner.removed_dropins, cancelled_runner.installed_dropins
+        )
+        self.assertEqual(self.config_file.read_bytes(), self.original_config)
+        self.assertEqual(self.binary.read_bytes(), b"canonical-binary")
+
+        starter, start_runner, _ = self._hotpath_profiler(
+            None,
+            fail_profile_start=True,
+        )
+        starter.config = replace(
+            starter.config,
+            result_dir=Path(self.temp.name) / "results-hotpath-start-failure",
+        )
+        with self.assertRaisesRegex(RuntimeError, "injected profile start failure"):
+            starter.run(total_mib=4, jobs=1)
+        self.assertEqual(len(start_runner.installed_dropins), 1)
+        self.assertEqual(start_runner.removed_dropins, start_runner.installed_dropins)
+        self.assertEqual(start_runner.hotpath_environment, {})
+        self.assertEqual(self.config_file.read_bytes(), self.original_config)
+        self.assertEqual(self.binary.read_bytes(), b"canonical-binary")
 
     def test_phase_perf_report_uses_exact_monotonic_window(self) -> None:
         argv = _phase_perf_report_argv(
