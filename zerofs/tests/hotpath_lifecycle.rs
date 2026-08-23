@@ -137,9 +137,9 @@ fn verify_io_report(report: &Value) -> Result<(), String> {
         .and_then(|io| io.get("data"))
         .and_then(Value::as_array)
         .and_then(|entries| {
-            entries.iter().find(|entry| {
-                entry.get("label").and_then(Value::as_str) == Some(IO_LABEL)
-            })
+            entries
+                .iter()
+                .find(|entry| entry.get("label").and_then(Value::as_str) == Some(IO_LABEL))
         })
         .ok_or_else(|| format!("Hotpath JSON report omitted I/O label {IO_LABEL}"))?;
 
@@ -154,8 +154,7 @@ fn verify_io_report(report: &Value) -> Result<(), String> {
         if count == 0
             || operation.get("sampled_count").and_then(Value::as_u64) != Some(count)
             || operation.get("bytes").and_then(Value::as_u64) != Some(expected_bytes)
-            || operation.get("sampled_bytes").and_then(Value::as_u64)
-                != Some(expected_bytes)
+            || operation.get("sampled_bytes").and_then(Value::as_u64) != Some(expected_bytes)
             || operation.get("errors").and_then(Value::as_u64) != Some(0)
             || operation
                 .get("total_ns")
