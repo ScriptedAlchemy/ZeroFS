@@ -203,7 +203,9 @@ Before any deployment mutation, local mode reads the guest hostname and DMI
 SMBIOS UUID, reads VM 100's `name` and `smbios1` UUID through `qm config` on
 the configured Proxmox host, and requires both identities to match exactly.
 Missing or mismatched identity fails closed; it never silently falls back to
-local execution. Omit the local option to use the SSH fallback.
+local execution. Local dry-runs perform the same identity reads plus a
+nonblocking probe of the VM-global lock; they do not print fabricated identity
+or lease success. Omit the local option to use the SSH fallback.
 
 Local mode starts the same root-owned, transaction-long `flock` holder directly
 with `sudo`. Every VM command, staged file, recovery action, rollback, and
@@ -212,7 +214,10 @@ stdout, stderr, and the exit status separately. QEMU guest-agent commands such
 as `qm agent 100 ping` and `qm guest exec 100 -- hostname` remain useful for
 external health or recovery checks, but they are not a deployment transport:
 independent guest-agent executions cannot own the coordinator lock across the
-whole transaction.
+whole transaction. The lock holder runs in a separate process group so a
+terminal interrupt reaches the coordinator first; rollback finishes while the
+holder still owns the lock, and the original interrupt remains the reported
+failure.
 
 ## Templates and resource sizing
 

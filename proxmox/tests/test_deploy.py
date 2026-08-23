@@ -1311,6 +1311,69 @@ class DeploymentLockTests(unittest.TestCase):
                 self.assertEqual(caught.exception.returncode, 17)
                 self.assertEqual(caught.exception.stdout, "failed-out")
                 self.assertEqual(caught.exception.stderr, "failed-err")
+                self.assertIn("stdout: failed-out", str(caught.exception))
+                self.assertIn("stderr: failed-err", str(caught.exception))
+
+    def test_keyboard_interrupt_reaches_rollback_before_lock_release(self) -> None:
+        script = f"""
+import importlib.util
+import os
+import signal
+import sys
+
+spec = importlib.util.spec_from_file_location("deploy_under_signal", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+holder = "flock() {{ return 0; }}; " + module._remote_lock_holder(sys.argv[2])
+lease = module._FlockLease(["bash", "-c", holder], dry_run=False)
+try:
+    with lease:
+        try:
+            os.killpg(os.getpgrp(), signal.SIGINT)
+        except KeyboardInterrupt:
+            result = lease.execute("printf 'rollback-complete'")
+            print(result.stdout, flush=True)
+            raise
+except KeyboardInterrupt:
+    print("keyboard-interrupt-preserved", flush=True)
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    script,
+                    str(MODULE_PATH),
+                    str(Path(directory) / "coordinator.lock"),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+                start_new_session=True,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("rollback-complete", result.stdout)
+        self.assertIn("keyboard-interrupt-preserved", result.stdout)
+        self.assertNotIn("deployment lock process exited", result.stderr)
+
+    def test_holder_exit_does_not_mask_an_active_keyboard_interrupt(self) -> None:
+        lease = deploy._FlockLease(["unused"], dry_run=False)
+        lease.process = SimpleNamespace(
+            stdin=io.StringIO(),
+            stdout=io.StringIO(),
+            stderr=io.StringIO(),
+            wait=lambda timeout: 17,
+        )
+        interrupt = KeyboardInterrupt()
+
+        lease.__exit__(KeyboardInterrupt, interrupt, None)
+
+        self.assertIn(
+            "deployment lock process exited 17",
+            "\n".join(interrupt.__notes__),
+        )
 
     def test_nonblocking_flock_rejects_a_concurrent_coordinator(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1350,13 +1413,25 @@ class VmTransportTests(unittest.TestCase):
         def __init__(
             self,
             *,
+            dry_run: bool = False,
             local_name: str = "ubuntu-main",
             local_uuid: str | None = None,
         ) -> None:
-            super().__init__(dry_run=False)
+            super().__init__(dry_run=dry_run)
             self.local_name = local_name
             self.local_uuid = local_uuid or VmTransportTests.UUID
             self.identity_calls: list[list[str]] = []
+
+        def probe(
+            self,
+            command: list[str],
+            *,
+            capture: bool = False,
+        ) -> subprocess.CompletedProcess[str]:
+            self.identity_calls.append(command)
+            if command[:3] == ["sudo", "flock", "-n"]:
+                return subprocess.CompletedProcess(command, 0, "", "")
+            return self.run(command, capture=capture)
 
         def run(
             self,
@@ -1481,7 +1556,7 @@ class VmTransportTests(unittest.TestCase):
         self.assertEqual(stderr.getvalue(), "local-err")
 
     def test_local_dry_run_renders_guest_shell_without_self_ssh(self) -> None:
-        runner = deploy.Runner(dry_run=True)
+        runner = self.IdentityRunner(dry_run=True)
         runner.configure_vm_transport(self.args())
         output = io.StringIO()
 
@@ -1490,6 +1565,11 @@ class VmTransportTests(unittest.TestCase):
 
         self.assertIn("+ bash -se", output.getvalue())
         self.assertNotIn("ssh -o BatchMode=yes ubuntu-main", output.getvalue())
+        self.assertIn(["hostname"], runner.identity_calls)
+        self.assertIn(
+            ["sudo", "cat", "/sys/class/dmi/id/product_uuid"],
+            runner.identity_calls,
+        )
 
     def test_local_transport_stages_exact_bytes_without_scp(self) -> None:
         runner = self.IdentityRunner()
@@ -1510,9 +1590,8 @@ class VmTransportTests(unittest.TestCase):
             self.assertEqual(target.stat().st_mode & 0o777, 0o600)
 
     def test_local_lock_uses_one_sudo_holder_and_cleans_runner_state(self) -> None:
-        runner = deploy.Runner(dry_run=True)
-        runner.vm_transport = "local"
-        runner.local_vm_host = "ubuntu-main"
+        runner = self.IdentityRunner(dry_run=True)
+        runner.configure_vm_transport(self.args())
         args = self.args()
 
         with runner.remote_deployment_locks(args):
@@ -1520,13 +1599,22 @@ class VmTransportTests(unittest.TestCase):
             self.assertEqual(lease.command[:3], ["sudo", "bash", "-c"])
             self.assertEqual(runner._active_leases, [lease])
 
+        self.assertIn(
+            [
+                "sudo",
+                "flock",
+                "-n",
+                "/run/lock/zerofs-vm-nfs-global.coordinator.lock",
+                "true",
+            ],
+            runner.identity_calls,
+        )
         self.assertEqual(runner._active_leases, [])
         self.assertEqual(runner._remote_leases, {})
 
     def test_local_lock_cleanup_runs_when_the_transaction_is_cancelled(self) -> None:
-        runner = deploy.Runner(dry_run=True)
-        runner.vm_transport = "local"
-        runner.local_vm_host = "ubuntu-main"
+        runner = self.IdentityRunner(dry_run=True)
+        runner.configure_vm_transport(self.args())
 
         with self.assertRaises(KeyboardInterrupt):
             with runner.remote_deployment_locks(self.args()):
@@ -1739,43 +1827,6 @@ class CliDryRunTests(ConfigValidationTests):
         self.assert_direct_nfs_mount_is_provisioned(result, "10.10.10.55")
         self.assertNotIn("smb.conf", result.stdout)
         self.assertNotIn("smbd.service", result.stdout)
-
-    def test_prod_local_transport_keeps_the_whole_vm_transaction_local(self) -> None:
-        config = self.write_config(
-            self.prod_config().replace("10.10.10.30", "10.10.10.55")
-        )
-        result = subprocess.run(
-            [
-                "python3",
-                str(MODULE_PATH),
-                "deploy",
-                "--role",
-                "prod",
-                "--ctid",
-                "130",
-                "--container-ip",
-                "10.10.10.55",
-                "--config",
-                str(config),
-                "--vm-transport",
-                "local",
-                "--vm-vmid",
-                "100",
-                "--dry-run",
-            ],
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("+ verify-local-vm-identity vmid=100", result.stdout)
-        self.assertIn("+ acquire-lock sudo bash -c", result.stdout)
-        self.assertIn("+ stage-local-file", result.stdout)
-        self.assertIn("vm_nfs_transition.py recover", result.stdout)
-        self.assertIn("vm_nfs_transition.py commit", result.stdout)
-        self.assertNotIn("ssh -o BatchMode=yes ubuntu-main", result.stdout)
-        self.assertNotIn("ubuntu-main:", result.stdout)
 
     def test_prod_drain_timeout_is_forwarded_to_the_host_coordinator(self) -> None:
         config = self.write_config(

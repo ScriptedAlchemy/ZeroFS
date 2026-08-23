@@ -559,6 +559,7 @@ class _FlockLease:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            start_new_session=True,
         )
         self.process = process
         assert process.stdout is not None
@@ -580,7 +581,12 @@ class _FlockLease:
             + (f": {stderr.strip()}" if stderr.strip() else "")
         )
 
-    def __exit__(self, *_exc: object) -> None:
+    def __exit__(
+        self,
+        _exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        _traceback: object,
+    ) -> None:
         if self.process is None:
             return
         process = self.process
@@ -596,7 +602,11 @@ class _FlockLease:
         if process.stderr is not None:
             process.stderr.close()
         if returncode != 0:
-            raise RuntimeError(f"deployment lock process exited {returncode}")
+            detail = f"deployment lock process exited {returncode}"
+            if exc is not None:
+                exc.add_note(detail)
+                return
+            raise RuntimeError(detail)
 
     def execute(self, script: str) -> subprocess.CompletedProcess[str]:
         process = self.process
@@ -635,10 +645,14 @@ class LockedRemoteCommandError(RuntimeError):
         self.returncode = returncode
         self.stdout = stdout
         self.stderr = stderr
-        detail = stderr or stdout
+        details = []
+        if stdout:
+            details.append(f"stdout: {stdout.strip()}")
+        if stderr:
+            details.append(f"stderr: {stderr.strip()}")
         super().__init__(
             f"locked remote command exited {returncode}"
-            + (f": {detail.strip()}" if detail.strip() else "")
+            + (f": {'; '.join(details)}" if details else "")
         )
 
 
@@ -700,7 +714,7 @@ def verify_local_vm_identity(
     runner: Runner, args: argparse.Namespace
 ) -> LocalVmIdentity:
     validate_vm_transport_args(args)
-    config = runner.run(
+    config = runner.probe(
         [
             "ssh",
             "-o",
@@ -714,8 +728,8 @@ def verify_local_vm_identity(
         capture=True,
     ).stdout
     identity = _parse_pve_vm_identity(config, args.vm_vmid)
-    local_name = runner.run(["hostname"], capture=True).stdout.strip()
-    local_uuid = runner.run(
+    local_name = runner.probe(["hostname"], capture=True).stdout.strip()
+    local_uuid = runner.probe(
         ["sudo", "cat", "/sys/class/dmi/id/product_uuid"], capture=True
     ).stdout.strip().lower()
     if local_name != identity.name:
@@ -743,13 +757,11 @@ class Runner:
         validate_vm_transport_args(args)
         if args.vm_transport == "ssh":
             return
-        if self.dry_run:
-            print(
-                f"+ verify-local-vm-identity vmid={args.vm_vmid} "
-                f"pve={args.pve_host} host={args.vm_host}"
-            )
-        else:
-            verify_local_vm_identity(self, args)
+        identity = verify_local_vm_identity(self, args)
+        print(
+            f"local VM identity verified: vmid={identity.vmid} "
+            f"name={identity.name} smbios_uuid={identity.smbios_uuid}"
+        )
         self.vm_transport = "local"
         self.local_vm_host = args.vm_host
 
@@ -790,6 +802,20 @@ class Runner:
         self._assert_leases_held()
         return result
 
+    def probe(
+        self,
+        command: Sequence[str],
+        *,
+        capture: bool = False,
+    ) -> subprocess.CompletedProcess[str]:
+        print(f"+ probe {shell_join(command)}")
+        return subprocess.run(
+            list(command),
+            check=True,
+            text=True,
+            capture_output=capture,
+        )
+
     @contextlib.contextmanager
     def remote_deployment_locks(self, args: argparse.Namespace) -> Iterator[None]:
         locks = (
@@ -808,6 +834,11 @@ class Runner:
                     else f"bash -c {shlex.quote(lock_script)}"
                 )
                 if self.is_local_vm_host(host):
+                    if self.dry_run:
+                        self.probe(
+                            ["sudo", "flock", "-n", path, "true"],
+                            capture=True,
+                        )
                     command = ["sudo", "bash", "-c", lock_script]
                 else:
                     command = [
