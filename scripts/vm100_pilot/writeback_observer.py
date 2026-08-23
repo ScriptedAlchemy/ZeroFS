@@ -16,6 +16,8 @@ class SnapshotSource(Protocol):
 
     def identity(self) -> MetricsAuthorityIdentity: ...
 
+    def counter(self, name: str) -> int: ...
+
 
 @dataclass(slots=True)
 class WritebackObserver:
@@ -40,6 +42,9 @@ class WritebackObserver:
 
     def snapshot(self) -> WritebackSnapshot:
         return self.metrics.snapshot()
+
+    def counter(self, name: str) -> int:
+        return self.metrics.counter(name)
 
     def drain(self, timeout: float | None = None) -> dict[str, object]:
         receipt: DrainReceipt = wait_for_drain(
