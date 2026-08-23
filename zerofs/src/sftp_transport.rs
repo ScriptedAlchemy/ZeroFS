@@ -1224,6 +1224,10 @@ impl SftpSessionPool {
     /// dials a new connection while capacity remains, and only then stacks
     /// the operation onto the least-loaded session below the per-session cap
     /// so bulk transfers spread across connections before they share one.
+    #[cfg_attr(
+        feature = "hotpath-profile",
+        hotpath::measure(future = true, label = "zerofs.sftp.pool.acquire")
+    )]
     async fn acquire_session(
         &self,
         kind: OperationKind,
@@ -1401,6 +1405,10 @@ impl SftpSessionPool {
         result
     }
 
+    #[cfg_attr(
+        feature = "hotpath-profile",
+        hotpath::measure(future = true, label = "zerofs.sftp.connect")
+    )]
     async fn open_with_permit_unpaced(
         &self,
         permit: OwnedSemaphorePermit,
@@ -1553,6 +1561,10 @@ impl SessionLease {
             .as_ref()
     }
 
+    #[cfg_attr(
+        feature = "hotpath-profile",
+        hotpath::measure(future = true, label = "zerofs.sftp.read")
+    )]
     pub(crate) async fn read_object(
         &mut self,
         path: &std::path::Path,

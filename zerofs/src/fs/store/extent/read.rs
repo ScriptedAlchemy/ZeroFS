@@ -310,6 +310,10 @@ impl ExtentStore {
     /// Read `[offset, offset+length)`, then kick off the bounded,
     /// sequential-only logical read-ahead so the next read lands warm in the
     /// parts cache.
+    #[cfg_attr(
+        feature = "hotpath-profile",
+        hotpath::measure(future = true, label = "zerofs.extent.read")
+    )]
     pub async fn read(&self, id: InodeId, offset: u64, length: u64) -> Result<Bytes, FsError> {
         let data = self.read_range(id, offset, length, true).await?;
         self.trigger_read_ahead(id, offset, length);

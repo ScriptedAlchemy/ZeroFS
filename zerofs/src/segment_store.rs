@@ -420,6 +420,10 @@ impl SegmentStore {
     /// Read a contiguous run of `slots.len()` frames from `segid` in one ranged
     /// GET over `[byte_offset, byte_offset + byte_len)`, returning each plaintext.
     /// `slots[i]` is the `(inode, extent)` of the frame at `first_frame + i`.
+    #[cfg_attr(
+        feature = "hotpath-profile",
+        hotpath::measure(future = true, label = "zerofs.segment.read")
+    )]
     pub(crate) async fn read_run(
         &self,
         segid: Segid,
