@@ -10,7 +10,7 @@ import io
 from contextlib import redirect_stderr
 from dataclasses import replace
 from pathlib import Path
-from subprocess import CompletedProcess
+from subprocess import CompletedProcess, TimeoutExpired
 from typing import Mapping, Sequence
 from unittest import mock
 
@@ -85,6 +85,59 @@ class AuthorityRunner(Runner):
         raise AssertionError(f"unexpected command: {args}")
 
 
+class ColdReadAuthorityRunner(AuthorityRunner):
+    def __init__(
+        self,
+        payload: Mapping[str, object],
+        *,
+        read_bytes: int,
+        timeout_fio: bool = False,
+    ) -> None:
+        super().__init__(payload)
+        self.read_bytes = read_bytes
+        self.timeout_fio = timeout_fio
+        self.calls: list[tuple[tuple[str, ...], float | None]] = []
+
+    def run(
+        self,
+        argv: Sequence[str | Path],
+        **kwargs: object,
+    ) -> CompletedProcess[str]:
+        args = tuple(str(value) for value in argv)
+        if args[:2] == ("findmnt", "--json"):
+            return super().run(argv, **kwargs)
+        self.calls.append((args, kwargs.get("timeout")))  # type: ignore[arg-type]
+        if args and args[0] == "fio":
+            if self.timeout_fio:
+                raise TimeoutExpired(args, kwargs.get("timeout"))
+            output = Path(
+                next(
+                    value.split("=", 1)[1]
+                    for value in args
+                    if value.startswith("--output=")
+                )
+            )
+            output.write_text(
+                json.dumps(
+                    {
+                        "jobs": [
+                            {
+                                "error": 0,
+                                "read": {
+                                    "io_bytes": self.read_bytes,
+                                    "runtime": 25,
+                                    "total_ios": self.read_bytes // (1024 * 1024),
+                                },
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return CompletedProcess(args, 0, "", "")
+        raise AssertionError(f"unexpected command: {args}")
+
+
 class SnapshotSource:
     def __init__(
         self,
@@ -109,6 +162,7 @@ class Lifecycle:
         self,
         snapshots: list[WritebackSnapshot],
         identity: MetricsAuthorityIdentity | None = None,
+        backend_interval_counters: list[int] | None = None,
     ) -> None:
         self.metrics = SnapshotSource(
             snapshots,
@@ -118,6 +172,7 @@ class Lifecycle:
         self.drain_calls = 0
         self.metrics_endpoint = "https://10.10.10.55:9567/metrics"
         self.final_snapshot = snapshots[-1]
+        self.backend_interval_counters = iter(backend_interval_counters or (0, 0))
 
     def status(self) -> dict[str, object]:
         return {"healthy": True}
@@ -127,6 +182,15 @@ class Lifecycle:
 
     def snapshot(self) -> WritebackSnapshot:
         return self.metrics.snapshot()
+
+    def counter(self, name: str) -> int:
+        self.assert_counter_name(name)
+        return next(self.backend_interval_counters)
+
+    @staticmethod
+    def assert_counter_name(name: str) -> None:
+        if name != "zerofs_sftp_object_read_bytes_total":
+            raise AssertionError(f"unexpected counter: {name}")
 
     def drain(self, timeout: float | None = None) -> dict[str, object]:
         del timeout
@@ -244,6 +308,25 @@ class ProtocolAuthorityTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(ValueError, "exactly one"):
                 identity_free.snapshot()
+
+    def test_sftp_read_activity_counter_is_identity_checked_and_missing_means_zero(
+        self,
+    ) -> None:
+        identity = MetricsAuthorityIdentity("instance-a", "filesystem-a", "nfs-root")
+        client = MetricsClient("https://10.10.10.55/metrics", identity)
+        with mock.patch.object(
+            client,
+            "_fetch",
+            side_effect=(
+                metrics_text(identity),
+                metrics_text(identity)
+                + "\nzerofs_sftp_object_read_bytes_total 4194304\n",
+            ),
+        ):
+            self.assertEqual(client.counter("zerofs_sftp_object_read_bytes_total"), 0)
+            self.assertEqual(
+                client.counter("zerofs_sftp_object_read_bytes_total"), 4 * 1024 * 1024
+            )
 
     def test_9p_authority_requires_unix_transport_and_source_bound_export(self) -> None:
         base = {
@@ -370,6 +453,77 @@ class ProtocolMatrixTests(unittest.TestCase):
         )
         self.config.temp_dir.mkdir()
 
+    def _idle_read_fixture(
+        self,
+        *,
+        service_isolated: bool,
+        backend_interval_counters: list[int] | None = None,
+        timeout_fio: bool = False,
+    ) -> tuple[
+        ProtocolScenario,
+        ProtocolAuthority,
+        ColdReadAuthorityRunner,
+        Lifecycle,
+    ]:
+        byte_count = 4 * 1024 * 1024
+        scenario = ProtocolScenario(
+            name="protocol-idle-read-nfs-test",
+            protocol="nfs",
+            description="long-idle mounted read test",
+            workloads=(WorkloadDefinition("small", byte_count, "test"),),
+            read_idle_seconds=5,
+            read_timeout_seconds=30,
+            require_backend_interval_activity=True,
+        )
+        values = {
+            "ZEROFS_BENCH_NFS_MOUNTPOINT": str(self.protocol_root),
+            "ZEROFS_BENCH_NFS_ENDPOINT": "10.10.10.55:/",
+            "ZEROFS_BENCH_NFS_MOUNT_OPTIONS": "rw,hard,vers=3",
+            "ZEROFS_BENCH_NFS_METRICS_URL": "https://10.10.10.55:9567/metrics",
+            "ZEROFS_BENCH_NFS_METRICS_INSTANCE_ID": "instance-a",
+            "ZEROFS_BENCH_NFS_METRICS_FILESYSTEM_ID": "filesystem-a",
+            "ZEROFS_BENCH_NFS_METRICS_EXPORT_ID": "nfs-root",
+        }
+        if service_isolated:
+            values["ZEROFS_BENCH_NFS_SERVICE_ISOLATED"] = "true"
+        authority = ProtocolAuthority.from_mapping("nfs", values)
+        findmnt = ColdReadAuthorityRunner(
+            {
+                "filesystems": [
+                    {
+                        "target": str(self.protocol_root),
+                        "source": "10.10.10.55:/",
+                        "fstype": "nfs",
+                        "options": "rw,hard,vers=3",
+                    }
+                ]
+            },
+            read_bytes=byte_count,
+            timeout_fio=timeout_fio,
+        )
+        before = WritebackSnapshot(10, 10, 10, 0, 0, 100, 100, False)
+        accepted = replace(before, accepted=11, dirty_ram=byte_count)
+        local = replace(
+            accepted,
+            local=11,
+            dirty_ram=0,
+            dirty_ssd_reserved=byte_count,
+            local_bytes=100 + byte_count,
+        )
+        remote = replace(
+            local,
+            remote=11,
+            dirty_ssd_reserved=0,
+            remote_bytes=100 + byte_count,
+        )
+        observer = Lifecycle(
+            [before, accepted, accepted, accepted, accepted, local, remote],
+            backend_interval_counters=(
+                backend_interval_counters or [7, 7 + byte_count]
+            ),
+        )
+        return scenario, authority, findmnt, observer
+
     def test_unavailable_protocol_authority_still_writes_failed_manifest(self) -> None:
         module = load_cli()
         args = module.build_parser().parse_args(
@@ -390,6 +544,22 @@ class ProtocolMatrixTests(unittest.TestCase):
         self.assertEqual(ledger["resources"], [])
         self.assertTrue(ledger["asserted_clean"])
         self.assertNotIn("METRICS_INSTANCE_ID=", payload.get("error", ""))
+
+    def test_idle_read_rejects_9p_before_creating_resources(self) -> None:
+        module = load_cli()
+        args = module.build_parser().parse_args(
+            ["protocol-matrix", "--protocol", "9p", "--idle-read"]
+        )
+
+        with self.assertRaisesRegex(ValueError, "long-idle read.*NFS"):
+            module._run_protocol_matrix(args, self.config, Runner(base_env={}))
+
+        manifests = list(self.config.result_dir.glob("*/manifest.json"))
+        self.assertEqual(len(manifests), 1)
+        self.assertEqual(
+            json.loads(manifests[0].read_text(encoding="utf-8"))["status"],
+            "failed",
+        )
 
     def test_shipping_protocol_entrypoint_ignores_invalid_legacy_config(self) -> None:
         module = load_cli()
@@ -514,6 +684,238 @@ class ProtocolMatrixTests(unittest.TestCase):
         self.assertEqual(list(self.protocol_root.iterdir()), [])
         self.assertEqual(list(self.config.temp_dir.iterdir()), [])
 
+    def test_idle_client_cold_read_reports_interval_global_backend_activity(
+        self,
+    ) -> None:
+        scenario = ProtocolScenario(
+            name="protocol-idle-read-nfs-test",
+            protocol="nfs",
+            description="long-idle mounted read test",
+            workloads=(WorkloadDefinition("small", 4 * 1024 * 1024, "test"),),
+            read_idle_seconds=5,
+            read_timeout_seconds=30,
+            require_backend_interval_activity=True,
+        )
+        authority = ProtocolAuthority.from_mapping(
+            "nfs",
+            {
+                "ZEROFS_BENCH_NFS_MOUNTPOINT": str(self.protocol_root),
+                "ZEROFS_BENCH_NFS_ENDPOINT": "10.10.10.55:/",
+                "ZEROFS_BENCH_NFS_MOUNT_OPTIONS": "rw,hard,vers=3",
+                "ZEROFS_BENCH_NFS_METRICS_URL": "https://10.10.10.55:9567/metrics",
+                "ZEROFS_BENCH_NFS_METRICS_INSTANCE_ID": "instance-a",
+                "ZEROFS_BENCH_NFS_METRICS_FILESYSTEM_ID": "filesystem-a",
+                "ZEROFS_BENCH_NFS_METRICS_EXPORT_ID": "nfs-root",
+                "ZEROFS_BENCH_NFS_SERVICE_ISOLATED": "true",
+            },
+        )
+        findmnt = ColdReadAuthorityRunner(
+            {
+                "filesystems": [
+                    {
+                        "target": str(self.protocol_root),
+                        "source": "10.10.10.55:/",
+                        "fstype": "nfs",
+                        "options": "rw,hard,vers=3",
+                    }
+                ]
+            },
+            read_bytes=4 * 1024 * 1024,
+        )
+        before = WritebackSnapshot(10, 10, 10, 0, 0, 100, 100, False)
+        accepted = replace(before, accepted=11, dirty_ram=4 * 1024 * 1024)
+        local = replace(
+            accepted,
+            local=11,
+            dirty_ram=0,
+            dirty_ssd_reserved=4 * 1024 * 1024,
+            local_bytes=100 + 4 * 1024 * 1024,
+        )
+        remote = replace(
+            local,
+            remote=11,
+            dirty_ssd_reserved=0,
+            remote_bytes=100 + 4 * 1024 * 1024,
+        )
+        observer = Lifecycle(
+            [before, accepted, accepted, accepted, accepted, local, remote],
+            backend_interval_counters=[7, 7 + 4 * 1024 * 1024],
+        )
+        sleeps: list[float] = []
+
+        result = ProtocolMatrixRunner(
+            self.config,
+            findmnt,
+            observer,  # type: ignore[arg-type]
+            random_bytes=lambda count: b"x" * count,
+            sleep=sleeps.append,
+        ).run(scenario, authority)
+
+        read = result.workloads[0].client_cold_read
+        self.assertIsNotNone(read)
+        assert read is not None
+        self.assertEqual(read.cache_scope, "nfs_client_page_cache_only")
+        self.assertEqual(read.bytes, 4 * 1024 * 1024)
+        self.assertEqual(read.requests, 4)
+        self.assertEqual(read.backend_interval_activity_bytes, 4 * 1024 * 1024)
+        self.assertEqual(read.backend_activity_scope, "service_global_interval")
+        self.assertTrue(read.isolated_service_instance_required)
+        self.assertEqual(read.timeout_seconds, 30)
+        self.assertEqual(sleeps, [5])
+        manifest_path = next(self.config.result_dir.glob("*/manifest.json"))
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            manifest["requested_authority"]["isolated_service_instance_id"],
+            "instance-a",
+        )
+        fio_args, timeout = next(
+            (args, deadline) for args, deadline in findmnt.calls if args[0] == "fio"
+        )
+        self.assertIn("--rw=read", fio_args)
+        self.assertIn("--invalidate=1", fio_args)
+        self.assertIn("--allow_file_create=0", fio_args)
+        self.assertIn("--readonly", fio_args)
+        self.assertIn("--bs=1M", fio_args)
+        self.assertEqual(timeout, 30)
+        self.assertEqual(list(self.protocol_root.iterdir()), [])
+
+    def test_idle_client_cold_read_rejects_insufficient_backend_interval_activity(
+        self,
+    ) -> None:
+        scenario = ProtocolScenario(
+            "protocol-idle-read-nfs-test",
+            "nfs",
+            "long-idle mounted read test",
+            (WorkloadDefinition("small", 4 * 1024 * 1024, "test"),),
+            read_idle_seconds=1,
+            read_timeout_seconds=30,
+            require_backend_interval_activity=True,
+        )
+        authority = ProtocolAuthority.from_mapping(
+            "nfs",
+            {
+                "ZEROFS_BENCH_NFS_MOUNTPOINT": str(self.protocol_root),
+                "ZEROFS_BENCH_NFS_ENDPOINT": "10.10.10.55:/",
+                "ZEROFS_BENCH_NFS_MOUNT_OPTIONS": "rw,hard,vers=3",
+                "ZEROFS_BENCH_NFS_METRICS_URL": "https://10.10.10.55:9567/metrics",
+                "ZEROFS_BENCH_NFS_METRICS_INSTANCE_ID": "instance-a",
+                "ZEROFS_BENCH_NFS_METRICS_FILESYSTEM_ID": "filesystem-a",
+                "ZEROFS_BENCH_NFS_METRICS_EXPORT_ID": "nfs-root",
+                "ZEROFS_BENCH_NFS_SERVICE_ISOLATED": "true",
+            },
+        )
+        findmnt = ColdReadAuthorityRunner(
+            {
+                "filesystems": [
+                    {
+                        "target": str(self.protocol_root),
+                        "source": "10.10.10.55:/",
+                        "fstype": "nfs",
+                        "options": "rw,hard,vers=3",
+                    }
+                ]
+            },
+            read_bytes=4 * 1024 * 1024,
+        )
+        before = WritebackSnapshot(10, 10, 10, 0, 0, 100, 100, False)
+        accepted = replace(before, accepted=11, dirty_ram=4 * 1024 * 1024)
+        local = replace(
+            accepted,
+            local=11,
+            dirty_ram=0,
+            dirty_ssd_reserved=4 * 1024 * 1024,
+            local_bytes=100 + 4 * 1024 * 1024,
+        )
+        remote = replace(
+            local,
+            remote=11,
+            dirty_ssd_reserved=0,
+            remote_bytes=100 + 4 * 1024 * 1024,
+        )
+        observer = Lifecycle(
+            [before, accepted, accepted, accepted, accepted, local, remote],
+            backend_interval_counters=[9, 9 + 1024],
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError, "fewer backend SFTP activity bytes"
+        ):
+            ProtocolMatrixRunner(
+                self.config,
+                findmnt,
+                observer,  # type: ignore[arg-type]
+                random_bytes=lambda count: b"x" * count,
+                sleep=lambda _: None,
+            ).run(scenario, authority)
+
+        self.assertEqual(list(self.protocol_root.iterdir()), [])
+        manifests = list(self.config.result_dir.glob("*/manifest.json"))
+        self.assertEqual(len(manifests), 1)
+        self.assertEqual(
+            json.loads(manifests[0].read_text(encoding="utf-8"))["status"],
+            "failed",
+        )
+        ledger = json.loads(
+            (manifests[0].parent / "cleanup-ledger.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(ledger["cleanup_attempts"], 2)
+        self.assertTrue(ledger["asserted_clean"])
+
+    def test_idle_read_requires_explicit_service_isolation_authority(self) -> None:
+        scenario, authority, findmnt, observer = self._idle_read_fixture(
+            service_isolated=False
+        )
+
+        with self.assertRaisesRegex(
+            ScenarioUnavailableError, "ZEROFS_BENCH_NFS_SERVICE_ISOLATED=true"
+        ):
+            ProtocolMatrixRunner(
+                self.config,
+                findmnt,
+                observer,  # type: ignore[arg-type]
+                random_bytes=lambda count: b"x" * count,
+                sleep=lambda _: None,
+            ).run(scenario, authority)
+
+        self.assertEqual(list(self.protocol_root.iterdir()), [])
+
+    def test_returned_fio_timeout_writes_failed_receipt_and_double_cleans(self) -> None:
+        scenario, authority, findmnt, observer = self._idle_read_fixture(
+            service_isolated=True,
+            timeout_fio=True,
+        )
+
+        with self.assertRaises(TimeoutExpired):
+            ProtocolMatrixRunner(
+                self.config,
+                findmnt,
+                observer,  # type: ignore[arg-type]
+                random_bytes=lambda count: b"x" * count,
+                sleep=lambda _: None,
+            ).run(scenario, authority)
+
+        manifests = list(self.config.result_dir.glob("*/manifest.json"))
+        self.assertEqual(len(manifests), 1)
+        manifest = json.loads(manifests[0].read_text(encoding="utf-8"))
+        self.assertEqual(manifest["status"], "failed")
+        self.assertEqual(
+            manifest["idle_read_attempt"],
+            {
+                "cache_scope": "nfs_client_page_cache_only",
+                "deadline_seconds": 30,
+                "d_state_bounded": False,
+                "timeout_scope": "userspace_process_only",
+                "workload": "small",
+            },
+        )
+        ledger = json.loads(
+            (manifests[0].parent / "cleanup-ledger.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(ledger["cleanup_attempts"], 2)
+        self.assertTrue(ledger["asserted_clean"])
+        self.assertEqual(list(self.protocol_root.iterdir()), [])
+        self.assertEqual(list(self.config.temp_dir.iterdir()), [])
+
     def test_restarted_byte_counters_are_named_not_silently_negative(self) -> None:
         """A ZeroFS restart mid-workload must name the regressed counter.
 
@@ -540,16 +942,12 @@ class ProtocolMatrixTests(unittest.TestCase):
             },
         )
         findmnt = AuthorityRunner(
-            {
-                "filesystems": [
-                    {
-                        "target": str(self.protocol_root),
-                        "source": "10.10.10.55:/",
-                        "fstype": "nfs",
-                        "options": "rw,hard,vers=3",
-                    }
-                ]
-            }
+            {"filesystems": [{
+                "target": str(self.protocol_root),
+                "source": "10.10.10.55:/",
+                "fstype": "nfs",
+                "options": "rw,hard,vers=3",
+            }]}
         )
         before = WritebackSnapshot(10, 10, 10, 0, 0, 100, 100, False)
         accepted = replace(before, accepted=11, dirty_ram=4096)
@@ -650,12 +1048,16 @@ class ProtocolMatrixTests(unittest.TestCase):
             },
         )
         findmnt = AuthorityRunner(
-            {"filesystems": [{
-                "target": str(self.protocol_root),
-                "source": "10.10.10.55:/",
-                "fstype": "nfs",
-                "options": "rw,hard,vers=3",
-            }]}
+            {
+                "filesystems": [
+                    {
+                        "target": str(self.protocol_root),
+                        "source": "10.10.10.55:/",
+                        "fstype": "nfs",
+                        "options": "rw,hard,vers=3",
+                    }
+                ]
+            }
         )
         before = WritebackSnapshot(10, 10, 10, 0, 0, 100, 100, False)
         observer = Lifecycle(
