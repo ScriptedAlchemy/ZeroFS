@@ -86,6 +86,16 @@ from scripts.vm100_pilot.workloads import WorkloadRunner
 import scripts.vm100_pilot.profile as profile_module
 
 
+_VALID_HOTPATH_REPORT = json.dumps(
+    {
+        "type": "hotpath_report",
+        "functions_timing": {},
+        "futures": {},
+        "threads": {},
+    }
+) + "\n"
+
+
 class FakeRunner(Runner):
     def __init__(self) -> None:
         super().__init__(base_env={})
@@ -2633,6 +2643,11 @@ class _TestProfileRunner(ProfileRunner):
     def _service_pid(self) -> int:
         return 123
 
+    def _fetch_hotpath_runtime(self, _port: int) -> dict[str, object]:
+        return profile_module._require_hotpath_runtime(
+            getattr(self.lifecycle, "runtime_payload")
+        )
+
 
 class _HotpathEnvironmentRunner(FakeRunner):
     def __init__(self) -> None:
@@ -2716,6 +2731,29 @@ class _FailingHotpathEnvironmentRunner(_HotpathEnvironmentRunner):
         return result
 
 
+class _BrokenHotpathStagingFile:
+    def __init__(self, path: Path, failure: str) -> None:
+        self.name = str(path)
+        self._handle = path.open("w")
+        self.failure = failure
+
+    def write(self, value: str) -> int:
+        if self.failure == "write":
+            raise OSError("injected staging write failure")
+        return self._handle.write(value)
+
+    def flush(self) -> None:
+        self._handle.flush()
+
+    def fileno(self) -> int:
+        return self._handle.fileno()
+
+    def close(self) -> None:
+        self._handle.close()
+        if self.failure == "close":
+            raise OSError("injected staging close failure")
+
+
 class _HotpathLifecycle(_HealthyLifecycle):
     def __init__(
         self,
@@ -2723,12 +2761,23 @@ class _HotpathLifecycle(_HealthyLifecycle):
         config: PilotConfig,
         runner: _HotpathEnvironmentRunner,
         report: str | None,
+        runtime_payload: object | None = None,
         *,
         fail_profile_start: bool = False,
     ) -> None:
         super().__init__(snapshot, config)
         self.runner = runner
         self.report = report
+        self.runtime_payload = (
+            {
+                "num_workers": 1,
+                "num_alive_tasks": 0,
+                "global_queue_depth": 0,
+                "workers": [{"index": 0, "park_count": 1, "busy_duration_ms": 2}],
+            }
+            if runtime_payload is None
+            else runtime_payload
+        )
         self.fail_profile_start = fail_profile_start
         self.profile_started = False
 
@@ -2796,7 +2845,7 @@ class ProfileTests(unittest.TestCase):
             self.snapshot,
             self.config,
             self.runner,
-            '{"report":"default"}\n',
+            _VALID_HOTPATH_REPORT,
         )
 
     def _hotpath_profiler(
@@ -2805,6 +2854,7 @@ class ProfileTests(unittest.TestCase):
         *,
         fail_profile_start: bool = False,
         benchmark: Any = None,
+        runtime_payload: object | None = None,
     ) -> tuple[_TestProfileRunner, _HotpathEnvironmentRunner, _HotpathLifecycle]:
         runner = _HotpathEnvironmentRunner()
         lifecycle = _HotpathLifecycle(
@@ -2812,6 +2862,7 @@ class ProfileTests(unittest.TestCase):
             self.config,
             runner,
             report,
+            runtime_payload,
             fail_profile_start=fail_profile_start,
         )
         profiler = _TestProfileRunner(
@@ -2832,6 +2883,7 @@ class ProfileTests(unittest.TestCase):
             self.config,
             runner,
             report or Path(self.temp.name) / "hotpath.json",
+            38473,
         )
 
     def test_profile_build_forces_frame_pointers_for_actionable_callchains(
@@ -2889,29 +2941,34 @@ class ProfileTests(unittest.TestCase):
         )
 
     def test_profile_retains_unique_static_json_hotpath_report(self) -> None:
-        profiler, runner, _lifecycle = self._hotpath_profiler('{"report":"ok"}\n')
+        profiler, runner, _lifecycle = self._hotpath_profiler(_VALID_HOTPATH_REPORT)
 
         result = profiler.run(total_mib=4, jobs=1)
 
         report = Path(result.receipt_dir) / "hotpath.json"
         manifest = json.loads((Path(result.receipt_dir) / "manifest.json").read_text())
         self.assertEqual(manifest["artifacts"]["hotpath.json"], str(report))
-        self.assertEqual(json.loads(report.read_text()), {"report": "ok"})
+        self.assertEqual(json.loads(report.read_text())["type"], "hotpath_report")
         self.assertEqual(
             runner.hotpath_environment,
             {},
         )
+        self.assertEqual(len(runner.installed_environments), 1)
+        environment = runner.installed_environments[0]
         self.assertEqual(
-            runner.installed_environments,
-            [
-                {
-                    "HOTPATH_OUTPUT_PATH": str(report),
-                    "HOTPATH_OUTPUT_FORMAT": "json",
-                    "HOTPATH_METRICS_SERVER_OFF": "true",
-                    "HOTPATH_REPORT": "functions-timing,futures,threads",
-                }
-            ],
+            {key: value for key, value in environment.items() if key != "HOTPATH_METRICS_PORT"},
+            {
+                "HOTPATH_OUTPUT_PATH": str(report),
+                "HOTPATH_OUTPUT_FORMAT": "json",
+                "HOTPATH_METRICS_SERVER_OFF": "false",
+                "HOTPATH_REPORT": "functions-timing,futures,threads",
+                "HOTPATH_CPU_BASELINE_OFF": "true",
+            },
         )
+        self.assertTrue(environment["HOTPATH_METRICS_PORT"].isdigit())
+        runtime = Path(result.receipt_dir) / "hotpath-tokio-runtime.json"
+        self.assertEqual(manifest["artifacts"]["hotpath-tokio-runtime.json"], str(runtime))
+        self.assertEqual(json.loads(runtime.read_text())["num_workers"], 1)
         self.assertEqual(len(runner.installed_dropins), 1)
         self.assertEqual(runner.removed_dropins, runner.installed_dropins)
         installed = runner.installed_dropins[0]
@@ -2929,6 +2986,18 @@ class ProfileTests(unittest.TestCase):
                 (None, "missing or empty"),
                 ("", "missing or empty"),
                 ("not-json", "invalid JSON"),
+                (
+                    json.dumps(
+                        {
+                            "type": "hotpath_report",
+                            "functions_timing": {},
+                            "futures": {},
+                            "threads": {},
+                            "streams": {},
+                        }
+                    ),
+                    "forbidden sections",
+                ),
             )
         ):
             with self.subTest(report=report):
@@ -2951,11 +3020,31 @@ class ProfileTests(unittest.TestCase):
                 self.assertEqual(self.binary.read_bytes(), b"canonical-binary")
                 self.assertGreaterEqual(lifecycle.start_calls, 2)
 
+    def test_profile_fails_closed_for_missing_or_invalid_hotpath_runtime(self) -> None:
+        for index, payload in enumerate(({}, {"num_workers": "bad", "workers": []})):
+            with self.subTest(payload=payload):
+                profiler, _runner, _lifecycle = self._hotpath_profiler(
+                    _VALID_HOTPATH_REPORT,
+                    runtime_payload=payload,
+                )
+                profiler.config = replace(
+                    profiler.config,
+                    result_dir=Path(self.temp.name) / f"results-runtime-{index}",
+                )
+                with self.assertRaisesRegex(RuntimeError, "Tokio runtime"):
+                    profiler.run(total_mib=4, jobs=1)
+                manifest = json.loads(
+                    next(profiler.config.result_dir.glob("*/manifest.json")).read_text()
+                )
+                self.assertNotIn("hotpath-tokio-runtime.json", manifest["artifacts"])
+                self.assertEqual(self.config_file.read_bytes(), self.original_config)
+                self.assertEqual(self.binary.read_bytes(), b"canonical-binary")
+
     def test_profile_hotpath_environment_is_removed_on_cancellation_and_start_failure(
         self,
     ) -> None:
         cancelled, cancelled_runner, _ = self._hotpath_profiler(
-            '{"report":"cancelled"}\n',
+            _VALID_HOTPATH_REPORT,
             benchmark=_ProfileBenchmark(
                 self.config,
                 self.config_file,
@@ -3049,6 +3138,36 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(runner.removed_dropins, [environment.dropin])
         self.assertNotIn(environment.directory, runner.dropin_directories)
         self.assertEqual(runner.hotpath_environment, {})
+
+    def test_hotpath_environment_staging_write_and_close_failures_leave_no_file(
+        self,
+    ) -> None:
+        config = replace(self.config, temp_dir=Path(self.temp.name))
+        for failure in ("write", "close"):
+            with self.subTest(failure=failure):
+                runner = _HotpathEnvironmentRunner()
+                environment = _TemporaryHotpathEnvironment(
+                    config,
+                    runner,
+                    Path(self.temp.name) / "hotpath.json",
+                    38473,
+                )
+                staging = Path(self.temp.name) / f"zerofs-hotpath-profile-{failure}"
+                broken = _BrokenHotpathStagingFile(staging, failure)
+                with (
+                    mock.patch.object(
+                        profile_module.tempfile,
+                        "NamedTemporaryFile",
+                        return_value=broken,
+                    ),
+                    self.assertRaisesRegex(OSError, f"staging {failure} failure"),
+                ):
+                    environment.install()
+                environment.cleanup()
+                self.assertFalse(staging.exists())
+                self.assertEqual(
+                    list(Path(self.temp.name).glob("zerofs-hotpath-profile-*")), []
+                )
 
     def test_profile_restores_canonical_deployment_after_hotpath_install_failure(
         self,

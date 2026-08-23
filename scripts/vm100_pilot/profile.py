@@ -5,9 +5,12 @@ import os
 import re
 import select
 import shutil
+import socket
 import tempfile
 import time
 import tomllib
+import urllib.error
+import urllib.request
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,6 +33,30 @@ _GC_CADENCE_KEYS = (
 _SYSTEMD_RUNTIME_DIR = Path("/run/systemd/system")
 _SYSTEMD_SERVICE_NAME = re.compile(r"[A-Za-z0-9_.@:-]+\.service\Z")
 _UNSAFE_SYSTEMD_ENVIRONMENT_PATH = re.compile(r'["\\\r\n%]')
+_HOTPATH_RUNTIME_ATTEMPTS = 5
+_HOTPATH_RUNTIME_TIMEOUT = 1.0
+_HOTPATH_RUNTIME_MAX_BYTES = 1 << 20
+
+
+@dataclass(slots=True)
+class _LoopbackPortReservation:
+    socket: socket.socket
+    port: int
+
+    @classmethod
+    def reserve(cls) -> "_LoopbackPortReservation":
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(1)
+            return cls(listener, int(listener.getsockname()[1]))
+        except BaseException:
+            listener.close()
+            raise
+
+    def release(self) -> None:
+        self.socket.close()
 
 
 @dataclass(slots=True)
@@ -385,7 +412,9 @@ class CanonicalDeployment:
 class _TemporaryHotpathEnvironment:
     """Own one service-scoped Hotpath environment drop-in for a profile run."""
 
-    def __init__(self, config: PilotConfig, runner: Runner, report: Path) -> None:
+    def __init__(
+        self, config: PilotConfig, runner: Runner, report: Path, metrics_port: int
+    ) -> None:
         if _SYSTEMD_SERVICE_NAME.fullmatch(config.service) is None:
             raise ValueError(f"unsafe systemd service name: {config.service!r}")
         if (
@@ -394,9 +423,12 @@ class _TemporaryHotpathEnvironment:
             or _UNSAFE_SYSTEMD_ENVIRONMENT_PATH.search(str(report)) is not None
         ):
             raise ValueError(f"unsafe Hotpath report path: {report}")
+        if not 1 <= metrics_port <= 65535:
+            raise ValueError(f"invalid Hotpath metrics port: {metrics_port}")
         self.config = config
         self.runner = runner
         self.report = report
+        self.metrics_port = metrics_port
         self.directory = _SYSTEMD_RUNTIME_DIR / f"{config.service}.d"
         self.dropin = self.directory / f"zerofs-hotpath-profile-{uuid.uuid4().hex}.conf"
         self._directory_created = False
@@ -426,17 +458,30 @@ class _TemporaryHotpathEnvironment:
             "[Service]\n"
             f'Environment="HOTPATH_OUTPUT_PATH={self.report}"\n'
             'Environment="HOTPATH_OUTPUT_FORMAT=json"\n'
-            'Environment="HOTPATH_METRICS_SERVER_OFF=true"\n'
+            'Environment="HOTPATH_METRICS_SERVER_OFF=false"\n'
+            f'Environment="HOTPATH_METRICS_PORT={self.metrics_port}"\n'
+            'Environment="HOTPATH_CPU_BASELINE_OFF=true"\n'
             'Environment="HOTPATH_REPORT=functions-timing,futures,threads"\n'
         )
-        with tempfile.NamedTemporaryFile(
+        temporary: Path | None = None
+        handle = tempfile.NamedTemporaryFile(
             mode="w",
             prefix="zerofs-hotpath-profile-",
             dir=self.config.temp_dir,
             delete=False,
-        ) as handle:
-            handle.write(content)
+        )
+        try:
             temporary = Path(handle.name)
+            try:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            finally:
+                handle.close()
+        except BaseException:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+            raise
         try:
             self._cleanup_required = True
             self.runner.run(
@@ -454,6 +499,7 @@ class _TemporaryHotpathEnvironment:
                 sudo=True,
             )
         finally:
+            assert temporary is not None
             temporary.unlink(missing_ok=True)
         self.runner.run(["systemctl", "daemon-reload"], sudo=True)
 
@@ -484,13 +530,71 @@ class _TemporaryHotpathEnvironment:
             )
 
 
-def _require_hotpath_report(path: Path) -> object:
+def _require_hotpath_report(path: Path) -> dict[str, object]:
     if not path.is_file() or path.stat().st_size == 0:
         raise RuntimeError(f"Hotpath report is missing or empty: {path}")
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise RuntimeError(f"Hotpath report contains invalid JSON: {path}") from error
+    if not isinstance(payload, dict) or payload.get("type") != "hotpath_report":
+        raise RuntimeError(f"Hotpath report has an invalid envelope: {path}")
+    required = {"functions_timing", "futures", "threads"}
+    if any(key not in payload or payload[key] is None for key in required):
+        raise RuntimeError(f"Hotpath report omits required sections: {path}")
+    allowed = {
+        "type",
+        "label",
+        "time_sampling",
+        "functions_timing",
+        "futures",
+        "threads",
+    }
+    if not set(payload).issubset(allowed):
+        raise RuntimeError(f"Hotpath report includes forbidden sections: {path}")
+    return payload
+
+
+def _require_hotpath_runtime(payload: object) -> dict[str, object]:
+    if not isinstance(payload, dict):
+        raise RuntimeError("Hotpath Tokio runtime response is not an object")
+    required = ("num_workers", "num_alive_tasks", "global_queue_depth", "workers")
+    if any(key not in payload for key in required):
+        raise RuntimeError("Hotpath Tokio runtime response omits required fields")
+    for key in required[:3]:
+        if not isinstance(payload[key], int) or isinstance(payload[key], bool) or payload[key] < 0:
+            raise RuntimeError(f"Hotpath Tokio runtime field is invalid: {key}")
+    workers = payload["workers"]
+    if not isinstance(workers, list) or len(workers) != payload["num_workers"]:
+        raise RuntimeError("Hotpath Tokio runtime workers are invalid")
+    for worker in workers:
+        if not isinstance(worker, dict):
+            raise RuntimeError("Hotpath Tokio runtime worker is invalid")
+        for key in ("index", "park_count", "busy_duration_ms"):
+            value = worker.get(key)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise RuntimeError(f"Hotpath Tokio runtime worker field is invalid: {key}")
+    return payload
+
+
+def _fetch_hotpath_runtime(port: int) -> dict[str, object]:
+    url = f"http://127.0.0.1:{port}/tokio_runtime"
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    errors: list[str] = []
+    for attempt in range(_HOTPATH_RUNTIME_ATTEMPTS):
+        try:
+            with opener.open(url, timeout=_HOTPATH_RUNTIME_TIMEOUT) as response:
+                if response.geturl() != url or response.getcode() != 200:
+                    raise RuntimeError("Hotpath Tokio runtime response is not pinned")
+                body = response.read(_HOTPATH_RUNTIME_MAX_BYTES + 1)
+                if len(body) > _HOTPATH_RUNTIME_MAX_BYTES:
+                    raise RuntimeError("Hotpath Tokio runtime response is too large")
+                return _require_hotpath_runtime(json.loads(body.decode("utf-8")))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, RuntimeError, urllib.error.URLError) as error:
+            errors.append(str(error))
+            if attempt + 1 < _HOTPATH_RUNTIME_ATTEMPTS:
+                time.sleep(0.1)
+    raise RuntimeError("Hotpath Tokio runtime retrieval failed: " + "; ".join(errors))
 
 
 class _Benchmark(Protocol):
@@ -771,6 +875,9 @@ class ProfileRunner:
     def _start_collectors(self, pid: int, receipt: RunReceipt) -> CollectorGroup:
         return CollectorGroup(self.runner, receipt, pid)
 
+    def _fetch_hotpath_runtime(self, port: int) -> dict[str, object]:
+        return _fetch_hotpath_runtime(port)
+
     def run(self, *, total_mib: int = 256, jobs: int = 4) -> ProfileResult:
         self.lifecycle.status()
         self.lifecycle.drain()
@@ -779,6 +886,8 @@ class ProfileRunner:
         collectors: CollectorGroup | object | None = None
         hotpath_environment: _TemporaryHotpathEnvironment | None = None
         hotpath_report: Path | None = None
+        hotpath_runtime: Path | None = None
+        hotpath_port: _LoopbackPortReservation | None = None
         deployed = False
         profile_service_started = False
         stop_attempted = False
@@ -808,10 +917,12 @@ class ProfileRunner:
                     },
                 )
                 hotpath_report = receipt.directory / "hotpath.json"
+                hotpath_port = _LoopbackPortReservation.reserve()
                 hotpath_environment = _TemporaryHotpathEnvironment(
-                    self.config, self.runner, hotpath_report
+                    self.config, self.runner, hotpath_report, hotpath_port.port
                 )
                 hotpath_environment.install()
+                hotpath_port.release()
                 self.lifecycle.start()
                 profile_service_started = True
                 profile_status = self.lifecycle.status(validate_data=True)
@@ -825,10 +936,26 @@ class ProfileRunner:
                     maintenance_isolated=True,
                 )
                 receipt.record("benchmark", benchmark_result.to_dict())
+                phase_windows = _load_phase_windows(benchmark_result)
+                collectors.stop(phase_windows=phase_windows)  # type: ignore[attr-defined]
+                collectors = None
+                hotpath_runtime = receipt.directory / "hotpath-tokio-runtime.json"
+                runtime_payload = self._fetch_hotpath_runtime(hotpath_port.port)
+                atomic_write_json(hotpath_runtime, runtime_payload)
+                receipt.artifact("hotpath-tokio-runtime.json", hotpath_runtime)
+                receipt.record(
+                    "hotpath_tokio_runtime",
+                    {"path": str(hotpath_runtime), "sha256": _sha256(hotpath_runtime)},
+                )
             except BaseException as error:
                 primary = error
             finally:
                 cleanup_errors: list[BaseException] = []
+                if hotpath_port is not None:
+                    try:
+                        hotpath_port.release()
+                    except OSError:
+                        pass
                 if collectors is not None:
                     try:
                         phase_windows = (
