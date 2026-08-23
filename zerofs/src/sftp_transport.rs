@@ -513,6 +513,9 @@ struct SharedSession {
     // Whoever swaps this to true owns the close; releases and reapers race
     // for it once a session must go away.
     closing: AtomicBool,
+    close_settled: AtomicBool,
+    close_changed: Notify,
+    close_failure: StdMutex<Option<String>>,
     idle_since: StdMutex<Instant>,
 }
 
@@ -525,6 +528,9 @@ impl SharedSession {
             active_writes: AtomicUsize::new(0),
             broken: AtomicBool::new(false),
             closing: AtomicBool::new(false),
+            close_settled: AtomicBool::new(false),
+            close_changed: Notify::new(),
+            close_failure: StdMutex::new(None),
             idle_since: StdMutex::new(Instant::now()),
         }
     }
@@ -538,6 +544,19 @@ impl SharedSession {
             self.active_writes.fetch_add(1, Ordering::SeqCst);
         }
         self.active_ops.fetch_add(1, Ordering::SeqCst);
+    }
+
+    async fn wait_close_settled(&self) -> Result<(), TransportError> {
+        loop {
+            let changed = self.close_changed.notified();
+            if self.close_settled.load(Ordering::Acquire) {
+                return match self.close_failure.lock().unwrap().clone() {
+                    Some(error) => Err(TransportError::Close(error)),
+                    None => Ok(()),
+                };
+            }
+            changed.await;
+        }
     }
 }
 
@@ -728,6 +747,11 @@ impl PoolInner {
         }
         let lifetime = session.take_lifetime();
         let result = self.close_owned(session.transport.clone(), lifetime).await;
+        if let Err(error) = &result {
+            *session.close_failure.lock().unwrap() = Some(error.to_string());
+        }
+        session.close_settled.store(true, Ordering::Release);
+        session.close_changed.notify_waiters();
         self.roster_changed.notify_waiters();
         result
     }
@@ -1667,11 +1691,8 @@ impl SessionLease {
         Ok(())
     }
 
-    pub(crate) async fn retire(mut self) -> Result<(), TransportError> {
-        let session = self
-            .session
-            .take()
-            .expect("lease always owns a session until retirement");
+    fn start_retirement(&mut self) -> Option<tokio::task::JoinHandle<Result<(), TransportError>>> {
+        let session = self.session.take()?;
         // Marking the session broken removes it from placement; the close
         // itself happens once the last concurrent operation releases it.
         let pool = self.pool.clone();
@@ -1682,19 +1703,26 @@ impl SessionLease {
         let admission = self.admission.take();
         let activity = self.activity.take();
         let remaining = session.active_ops.fetch_sub(1, Ordering::SeqCst) - 1;
-        // The close runs in an owned task so a canceled caller cannot abandon
-        // it half-way; admission capacity stays held until it finishes.
-        let cleanup = self.pool.tasks.spawn(async move {
+        // The close runs in an owned task so caller cancellation or an
+        // implicit lease drop cannot abandon it half-way. Admission and pool
+        // activity remain held until the physical session has settled.
+        Some(self.pool.tasks.spawn(async move {
             let result = if remaining == 0 {
                 pool.close_shared_session(session).await
             } else {
-                Ok(())
+                session.wait_close_settled().await
             };
             pool.roster_changed.notify_waiters();
             drop(admission);
             drop(activity);
             result
-        });
+        }))
+    }
+
+    pub(crate) async fn retire(mut self) -> Result<(), TransportError> {
+        let cleanup = self
+            .start_retirement()
+            .expect("lease always owns a session until retirement");
         cleanup
             .await
             .map_err(|_| TransportError::Close("SFTP retirement task failed".to_owned()))?
@@ -1725,16 +1753,13 @@ impl SessionLease {
 
 impl Drop for SessionLease {
     fn drop(&mut self) {
-        let Some(session) = self.session.take() else {
+        if self.session.is_none() {
             return;
-        };
-        // A lease dropped without `complete` abandoned its operation mid
-        // flight; the session's protocol state is ambiguous, so it must not
-        // serve new operations.
-        self.pool.remove_from_roster(&session);
-        self.pool.release_session(&session, self.kind);
-        drop(self.admission.take());
-        drop(self.activity.take());
+        }
+        // A lease dropped without completing abandoned its operation mid
+        // flight. The same owned retirement path as explicit failures keeps
+        // admission and lifetime capacity until the physical close settles.
+        drop(self.start_retirement());
     }
 }
 
@@ -3059,6 +3084,120 @@ mod tests {
             .complete()
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn multiplexed_dropped_leases_hold_each_admission_until_shared_close_finishes() {
+        let factory = RecordingFactory::fully_capable();
+        let pool = Arc::new(pool(factory.clone(), 1, 2, 2).await);
+        factory.state.block_close.store(1, Ordering::SeqCst);
+        let first = pool.checkout(OperationKind::Write).await.unwrap();
+        let second = pool.checkout(OperationKind::Write).await.unwrap();
+
+        drop(first);
+        tokio::task::yield_now().await;
+        assert_eq!(
+            pool.inner
+                .admission
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .active_writes,
+            2,
+            "the first canceled multiplexed operation must wait for shared close"
+        );
+        assert_eq!(factory.state.close_started_count.load(Ordering::SeqCst), 0);
+
+        drop(second);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            factory.state.close_started.notified(),
+        )
+        .await
+        .expect("the last dropped lease owns the shared close");
+        assert_eq!(
+            pool.inner
+                .admission
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .active_writes,
+            2,
+            "both canceled operations hold admission until the socket settles"
+        );
+
+        factory.state.block_close.store(0, Ordering::SeqCst);
+        factory.state.allow_close.notify_waiters();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if pool
+                    .inner
+                    .admission
+                    .inner
+                    .state
+                    .lock()
+                    .unwrap()
+                    .active_writes
+                    == 0
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("owned retirement releases every admission after close");
+        assert_eq!(factory.live(), 0);
+    }
+
+    #[tokio::test]
+    async fn dropped_lease_holds_admission_until_owned_close_finishes() {
+        let factory = RecordingFactory::fully_capable();
+        let pool = Arc::new(pool(factory.clone(), 1, 1, 1).await);
+        factory.state.block_close.store(1, Ordering::SeqCst);
+        let lease = pool.checkout(OperationKind::Write).await.unwrap();
+
+        drop(lease);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            factory.state.close_started.notified(),
+        )
+        .await
+        .expect("dropped lease starts owned retirement");
+
+        assert_eq!(
+            pool.inner
+                .admission
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .active_writes,
+            1,
+            "operation admission must remain held until physical close settles"
+        );
+
+        let replacement = tokio::spawn({
+            let pool = pool.clone();
+            async move { pool.checkout(OperationKind::Read).await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!replacement.is_finished());
+        assert_eq!(factory.dials(), 1);
+
+        factory.state.block_close.store(0, Ordering::SeqCst);
+        factory.state.allow_close.notify_waiters();
+        replacement
+            .await
+            .unwrap()
+            .unwrap()
+            .complete()
+            .await
+            .unwrap();
+        assert_eq!(factory.dials(), 2);
+        assert_eq!(factory.peak(), 1);
     }
 
     #[tokio::test]

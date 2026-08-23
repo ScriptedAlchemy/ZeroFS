@@ -28,6 +28,10 @@ use tokio::task::{JoinHandle, JoinSet};
 const REMOTE_COALESCE_IDLE: Duration = Duration::from_millis(500);
 const REMOTE_RETRY_DELAY: Duration = Duration::from_millis(200);
 const REMOTE_OPERATION_TIMEOUT: Duration = Duration::from_secs(120);
+/// Atomic publication composes multiple independently bounded SFTP phases.
+/// Create and Update can require a durable staging write, a publication link,
+/// and staging removal, so their watchdog must exceed three request budgets.
+const REMOTE_PUBLICATION_TIMEOUT: Duration = Duration::from_secs(480);
 /// Multipart part size for blobs above [`REMOTE_SINGLE_PUT_BYTES`]. Sized to
 /// fill the SFTP transport's pipelined request window (64 x 255 KiB): an
 /// 8 MiB part left the window half-empty and doubled the per-part
@@ -938,6 +942,16 @@ fn is_terminal_remote_error(error: &object_store::Error) -> bool {
     match error {
         object_store::Error::AlreadyExists { source, .. } => source.is::<RemoteContentDivergence>(),
         object_store::Error::Precondition { source, .. } => source.is::<MissingRemotePredecessor>(),
+        object_store::Error::NotSupported { source } => {
+            source
+                .downcast_ref::<crate::sftp_object_store::RemoteError>()
+                .is_some_and(crate::sftp_object_store::RemoteError::is_pool_closed)
+                || matches!(
+                    source.downcast_ref::<crate::sftp_transport::TransportError>(),
+                    Some(crate::sftp_transport::TransportError::PoolClosed)
+                )
+        }
+        _ if crate::retrying_object_store::has_permanent_source(error) => true,
         _ => false,
     }
 }
@@ -1220,7 +1234,7 @@ async fn apply_record(
     let target = Path::parse(&record.path).map_err(|error| generic_error(error.to_string()))?;
     match &record.kind {
         MutationKind::Delete => {
-            match remote.delete(&target).await {
+            match bounded_remote_step(&record, "delete", remote.delete(&target)).await {
                 Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
                 Err(error) => return Err(error),
             }
@@ -1243,7 +1257,9 @@ async fn apply_record(
             if let MutationKind::Rename { source, .. } = &record.kind {
                 let source = Path::parse(source)
                     .map_err(|error| generic_error(format!("invalid rename source: {error}")))?;
-                match remote.delete(&source).await {
+                match bounded_remote_step(&record, "rename source delete", remote.delete(&source))
+                    .await
+                {
                     Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
                     Err(error) => return Err(error),
                 }
@@ -1366,14 +1382,15 @@ async fn stream_record_to_remote(
                 generic_error(format!("journal blob stream failed: {error:#}"))
             })?);
         }
-        let result = bounded_remote_step(
+        let mut options = PutOptions::from(mode.clone());
+        options
+            .extensions
+            .insert(crate::retrying_object_store::CallerOwnsRetries);
+        let result = bounded_remote_step_with_timeout(
             record,
             "bounded atomic put",
-            remote.put_opts(
-                target,
-                PutPayload::from_iter(collected),
-                PutOptions::from(mode.clone()),
-            ),
+            REMOTE_PUBLICATION_TIMEOUT,
+            remote.put_opts(target, PutPayload::from_iter(collected), options),
         )
         .await;
         return match result {
@@ -1387,10 +1404,14 @@ async fn stream_record_to_remote(
             Err(error) => Err(error),
         };
     }
+    let mut multipart_options = PutMultipartOptions::default();
+    multipart_options
+        .extensions
+        .insert(crate::retrying_object_store::CallerOwnsRetries);
     let upload = bounded_remote_step(
         record,
         "multipart initiation",
-        remote.put_multipart_opts(target, PutMultipartOptions::default()),
+        remote.put_multipart_opts(target, multipart_options),
     )
     .await?;
     let mut owner = RemoteMultipartOwner::new(upload, cleanup_sender, cleanup_state);
@@ -1444,7 +1465,13 @@ async fn stream_record_to_remote(
         bounded_remote_step(record, "multipart precondition abort", owner.abort()).await?;
         return Ok(existing);
     }
-    bounded_remote_step(record, "multipart completion", owner.complete()).await
+    bounded_remote_step_with_timeout(
+        record,
+        "multipart completion",
+        REMOTE_PUBLICATION_TIMEOUT,
+        owner.complete(),
+    )
+    .await
 }
 
 async fn abort_remote_multipart<T>(
@@ -1468,13 +1495,25 @@ async fn bounded_remote_step<T, F>(
 where
     F: Future<Output = object_store::Result<T>>,
 {
-    tokio::time::timeout(REMOTE_OPERATION_TIMEOUT, operation)
+    bounded_remote_step_with_timeout(record, step, REMOTE_OPERATION_TIMEOUT, operation).await
+}
+
+async fn bounded_remote_step_with_timeout<T, F>(
+    record: &MutationRecord,
+    step: &'static str,
+    deadline: Duration,
+    operation: F,
+) -> object_store::Result<T>
+where
+    F: Future<Output = object_store::Result<T>>,
+{
+    tokio::time::timeout(deadline, operation)
         .await
         .map_err(|_| {
             generic_error(format!(
                 "remote {step} for sequence {} timed out after {:.3}s",
                 record.sequence,
-                REMOTE_OPERATION_TIMEOUT.as_secs_f64()
+                deadline.as_secs_f64()
             ))
         })?
 }
@@ -1723,13 +1762,16 @@ fn missing_remote_predecessor(
 #[cfg(test)]
 mod tests {
     use super::{
-        CompletedRemote, SchedulerWindow, apply_record_with_tracked_cleanup,
-        bounded_remote_operation, collect_pipeline_batch, load_scheduler_window,
-        validate_scheduler_window, verify_existing,
+        CompletedRemote, REMOTE_OPERATION_TIMEOUT, REMOTE_PUBLICATION_TIMEOUT, SchedulerWindow,
+        apply_record_with_tracked_cleanup, bounded_remote_operation, collect_pipeline_batch,
+        is_terminal_remote_error, load_scheduler_window, validate_scheduler_window,
+        verify_existing,
     };
     use crate::fault_store::FaultStore;
     use crate::writeback::journal::Journal;
-    use crate::writeback::model::{FenceClass, JournalIdentity, MutationMode, MutationRecord};
+    use crate::writeback::model::{
+        FenceClass, JournalIdentity, MutationKind, MutationMode, MutationRecord,
+    };
     use bytes::Bytes;
     use futures::future;
     use object_store::memory::InMemory;
@@ -1812,6 +1854,495 @@ mod tests {
         );
         assert_eq!(
             remote.get(&target).await.unwrap().bytes().await.unwrap(),
+            payload
+        );
+    }
+
+    #[tokio::test]
+    async fn writeback_marks_atomic_puts_as_scheduler_owned_attempts() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (remote, controls) = FaultStore::new(inner);
+        let temp = tempfile::tempdir().unwrap();
+        let journal = Arc::new(journal_with_local_records(temp.path(), 0));
+        let target = Path::from("segments/scheduler-owned");
+        let payload = Bytes::from_static(b"single scheduler attempt");
+        let record = put_record(1, target.as_ref(), &payload);
+        let record = journal.commit_put(record, &payload).unwrap();
+
+        apply_record_with_tracked_cleanup(remote, journal, record)
+            .await
+            .expect("the scheduler-owned atomic put succeeds");
+
+        assert_eq!(
+            controls.caller_owned_put_attempt_count(),
+            1,
+            "the durable-journal scheduler must own retries for its atomic put"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn permanently_pending_publication_still_hits_the_composite_watchdog() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (remote, controls) = FaultStore::new(inner);
+        controls.block_puts();
+        let put_activity = controls.put_activity();
+        let temp = tempfile::tempdir().unwrap();
+        let journal = Arc::new(journal_with_local_records(temp.path(), 0));
+        let payload = Bytes::from_static(b"never settles");
+        let record = put_record(1, "segments/pending-publication", &payload);
+        let record = journal.commit_put(record, &payload).unwrap();
+        let publication = tokio::spawn(apply_record_with_tracked_cleanup(remote, journal, record));
+        put_activity.notified().await;
+
+        tokio::time::advance(REMOTE_PUBLICATION_TIMEOUT + Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+
+        let error = publication
+            .await
+            .unwrap()
+            .expect_err("a permanently pending publication must remain finitely bounded");
+        assert!(
+            error
+                .to_string()
+                .contains("bounded atomic put for sequence 1 timed out after 480.000s"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[derive(Debug, Default)]
+    struct SlowSftpPhaseState {
+        files: std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, Bytes>>,
+        phases: std::sync::atomic::AtomicUsize,
+    }
+
+    #[derive(Debug, Clone)]
+    struct SlowSftpPhaseFactory(Arc<SlowSftpPhaseState>);
+
+    #[async_trait::async_trait]
+    impl crate::sftp_transport::SessionFactory for SlowSftpPhaseFactory {
+        async fn open(
+            &self,
+            _force: tokio_util::sync::CancellationToken,
+        ) -> Result<
+            Box<dyn crate::sftp_transport::TransportSession>,
+            crate::sftp_transport::TransportError,
+        > {
+            Ok(Box::new(SlowSftpPhaseSession(self.0.clone())))
+        }
+    }
+
+    #[derive(Debug)]
+    struct SlowSftpPhaseSession(Arc<SlowSftpPhaseState>);
+
+    #[async_trait::async_trait]
+    impl crate::sftp_transport::TransportSession for SlowSftpPhaseSession {
+        fn capabilities(&self) -> crate::sftp_object_store::SftpCapabilities {
+            crate::sftp_object_store::SftpCapabilities {
+                fsync: true,
+                hardlink: true,
+                posix_rename: true,
+            }
+        }
+
+        async fn ensure_directory_component(
+            &self,
+            _path: &std::path::Path,
+        ) -> Result<(), crate::sftp_transport::TransportError> {
+            Ok(())
+        }
+
+        async fn write_file_durable(
+            &self,
+            path: &std::path::Path,
+            chunks: Vec<Bytes>,
+        ) -> Result<(), crate::sftp_transport::TransportError> {
+            tokio::time::sleep(Duration::from_secs(41)).await;
+            self.0
+                .phases
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.0.files.lock().unwrap().insert(
+                path.to_path_buf(),
+                chunks.into_iter().flatten().collect::<Vec<_>>().into(),
+            );
+            Ok(())
+        }
+
+        async fn hard_link(
+            &self,
+            from: &std::path::Path,
+            to: &std::path::Path,
+        ) -> Result<(), crate::sftp_transport::TransportError> {
+            tokio::time::sleep(Duration::from_secs(41)).await;
+            self.0
+                .phases
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let bytes = self
+                .0
+                .files
+                .lock()
+                .unwrap()
+                .get(from)
+                .cloned()
+                .ok_or_else(|| {
+                    crate::sftp_transport::TransportError::NotFound(from.display().to_string())
+                })?;
+            self.0.files.lock().unwrap().insert(to.to_path_buf(), bytes);
+            Ok(())
+        }
+
+        async fn remove_file(
+            &self,
+            path: &std::path::Path,
+        ) -> Result<(), crate::sftp_transport::TransportError> {
+            tokio::time::sleep(Duration::from_secs(41)).await;
+            self.0
+                .phases
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.0
+                .files
+                .lock()
+                .unwrap()
+                .remove(path)
+                .map(|_| ())
+                .ok_or_else(|| {
+                    crate::sftp_transport::TransportError::NotFound(path.display().to_string())
+                })
+        }
+
+        async fn close(
+            &self,
+            _force: tokio_util::sync::CancellationToken,
+        ) -> Result<(), crate::sftp_transport::TransportError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn concrete_sftp_create_phases_can_validly_exceed_legacy_120_seconds() {
+        let state = Arc::new(SlowSftpPhaseState::default());
+        let pool = crate::sftp_transport::SftpSessionPool::new_writable(
+            Arc::new(SlowSftpPhaseFactory(state.clone())),
+            1,
+            1,
+            1,
+        )
+        .await
+        .unwrap();
+        let backend: Arc<dyn ObjectStore> = Arc::new(
+            crate::sftp_object_store::SftpObjectStore::new(pool.clone(), Path::from("root"))
+                .unwrap(),
+        );
+        let remote: Arc<dyn ObjectStore> = Arc::new(
+            crate::retrying_object_store::RetryingObjectStore::new(backend),
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let journal = Arc::new(journal_with_local_records(temp.path(), 0));
+        let payload = Bytes::from_static(b"three real SFTP phases");
+        let record = put_record(1, "root/slow-create", &payload);
+        let record = journal.commit_put(record, &payload).unwrap();
+        let started = tokio::time::Instant::now();
+
+        apply_record_with_tracked_cleanup(remote, journal, record)
+            .await
+            .expect("three valid SFTP phases must fit the composite watchdog");
+
+        assert_eq!(state.phases.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert_eq!(
+            tokio::time::Instant::now() - started,
+            Duration::from_secs(123)
+        );
+        let files = state.files.lock().unwrap();
+        assert!(files.contains_key(std::path::Path::new("root/slow-create")));
+        assert!(files.keys().all(|path| {
+            !path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(".zerofs-staging-"))
+        }));
+        drop(files);
+        pool.shutdown().await.unwrap();
+    }
+
+    #[derive(Debug, Default)]
+    struct CleanupDebtTransportState {
+        writes: std::sync::atomic::AtomicUsize,
+        removes: std::sync::atomic::AtomicUsize,
+        cleanup_pool_closed: std::sync::atomic::AtomicBool,
+    }
+
+    #[derive(Debug, Clone)]
+    struct CleanupDebtFactory(Arc<CleanupDebtTransportState>);
+
+    #[async_trait::async_trait]
+    impl crate::sftp_transport::SessionFactory for CleanupDebtFactory {
+        async fn open(
+            &self,
+            _force: tokio_util::sync::CancellationToken,
+        ) -> Result<
+            Box<dyn crate::sftp_transport::TransportSession>,
+            crate::sftp_transport::TransportError,
+        > {
+            Ok(Box::new(CleanupDebtSession(self.0.clone())))
+        }
+    }
+
+    #[derive(Debug)]
+    struct CleanupDebtSession(Arc<CleanupDebtTransportState>);
+
+    #[async_trait::async_trait]
+    impl crate::sftp_transport::TransportSession for CleanupDebtSession {
+        fn capabilities(&self) -> crate::sftp_object_store::SftpCapabilities {
+            crate::sftp_object_store::SftpCapabilities {
+                fsync: true,
+                hardlink: true,
+                posix_rename: true,
+            }
+        }
+
+        async fn ensure_directory_component(
+            &self,
+            _path: &std::path::Path,
+        ) -> Result<(), crate::sftp_transport::TransportError> {
+            Ok(())
+        }
+
+        async fn write_file_durable(
+            &self,
+            _path: &std::path::Path,
+            _chunks: Vec<Bytes>,
+        ) -> Result<(), crate::sftp_transport::TransportError> {
+            self.0
+                .writes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(crate::sftp_transport::TransportError::Operation(
+                "injected publication failure".to_owned(),
+            ))
+        }
+
+        async fn remove_file(
+            &self,
+            _path: &std::path::Path,
+        ) -> Result<(), crate::sftp_transport::TransportError> {
+            self.0
+                .removes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self
+                .0
+                .cleanup_pool_closed
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                Err(crate::sftp_transport::TransportError::PoolClosed)
+            } else {
+                Err(crate::sftp_transport::TransportError::Operation(
+                    "injected unresolved staging cleanup".to_owned(),
+                ))
+            }
+        }
+
+        async fn close(
+            &self,
+            _force: tokio_util::sync::CancellationToken,
+        ) -> Result<(), crate::sftp_transport::TransportError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn scheduler_classifier_terminalizes_unsettled_sftp_cleanup_without_wrapper_retry() {
+        let state = Arc::new(CleanupDebtTransportState::default());
+        let pool = crate::sftp_transport::SftpSessionPool::new_writable(
+            Arc::new(CleanupDebtFactory(state.clone())),
+            1,
+            1,
+            1,
+        )
+        .await
+        .unwrap();
+        let backend: Arc<dyn ObjectStore> = Arc::new(
+            crate::sftp_object_store::SftpObjectStore::new(pool.clone(), Path::from("root"))
+                .unwrap(),
+        );
+        let remote: Arc<dyn ObjectStore> = Arc::new(
+            crate::retrying_object_store::RetryingObjectStore::new(backend),
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let journal = Arc::new(journal_with_local_records(temp.path(), 0));
+        let payload = Bytes::from_static(b"terminal cleanup debt");
+        let record = put_record(1, "root/terminal-cleanup", &payload);
+        let record = journal.commit_put(record, &payload).unwrap();
+
+        let error = apply_record_with_tracked_cleanup(remote, journal, record)
+            .await
+            .expect_err("unsettled staging cleanup must fail the publication");
+        assert!(
+            is_terminal_remote_error(&error),
+            "the scheduler must terminalize the typed permanent cleanup error: {error:?}"
+        );
+        assert_eq!(
+            state.writes.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the retry wrapper must not replay the scheduler-owned publication"
+        );
+        assert!(
+            state.removes.load(std::sync::atomic::Ordering::SeqCst)
+                >= crate::sftp_object_store::SFTP_STAGING_CLEANUP_ATTEMPTS,
+            "the SFTP layer must settle its bounded inline cleanup attempts before returning"
+        );
+        let shutdown = pool.shutdown().await;
+        assert!(
+            shutdown.is_err(),
+            "unresolved cleanup debt must remain explicit at pool shutdown"
+        );
+        assert!(
+            state.removes.load(std::sync::atomic::Ordering::SeqCst)
+                > crate::sftp_object_store::SFTP_STAGING_CLEANUP_ATTEMPTS,
+            "pool shutdown must drain the final owner-scheduled cleanup"
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduler_classifier_terminalizes_cleanup_debt_caused_by_pool_close() {
+        let state = Arc::new(CleanupDebtTransportState::default());
+        state
+            .cleanup_pool_closed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let pool = crate::sftp_transport::SftpSessionPool::new_writable(
+            Arc::new(CleanupDebtFactory(state.clone())),
+            1,
+            1,
+            1,
+        )
+        .await
+        .unwrap();
+        let backend: Arc<dyn ObjectStore> = Arc::new(
+            crate::sftp_object_store::SftpObjectStore::new(pool.clone(), Path::from("root"))
+                .unwrap(),
+        );
+        let remote: Arc<dyn ObjectStore> = Arc::new(
+            crate::retrying_object_store::RetryingObjectStore::new(backend),
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let journal = Arc::new(journal_with_local_records(temp.path(), 0));
+        let payload = Bytes::from_static(b"pool closed cleanup debt");
+        let record = put_record(1, "root/pool-closed-cleanup", &payload);
+        let record = journal.commit_put(record, &payload).unwrap();
+
+        let error = apply_record_with_tracked_cleanup(remote, journal, record)
+            .await
+            .expect_err("pool-closed cleanup debt must fail the publication");
+        assert!(matches!(error, object_store::Error::NotSupported { .. }));
+        assert!(
+            is_terminal_remote_error(&error),
+            "typed SFTP pool closure must terminalize the scheduler: {error:?}"
+        );
+        assert_eq!(
+            state.writes.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the retry wrapper must not replay the scheduler-owned publication"
+        );
+        assert!(
+            state.removes.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "pool closure must attempt cleanup before terminalizing"
+        );
+        pool.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn scheduler_classifier_terminalizes_a_directly_closed_sftp_pool() {
+        let state = Arc::new(CleanupDebtTransportState::default());
+        let pool = crate::sftp_transport::SftpSessionPool::new_writable(
+            Arc::new(CleanupDebtFactory(state.clone())),
+            1,
+            1,
+            1,
+        )
+        .await
+        .unwrap();
+        let backend: Arc<dyn ObjectStore> = Arc::new(
+            crate::sftp_object_store::SftpObjectStore::new(pool.clone(), Path::from("root"))
+                .unwrap(),
+        );
+        let remote: Arc<dyn ObjectStore> = Arc::new(
+            crate::retrying_object_store::RetryingObjectStore::new(backend),
+        );
+        pool.shutdown().await.unwrap();
+
+        let temp = tempfile::tempdir().unwrap();
+        let journal = Arc::new(journal_with_local_records(temp.path(), 0));
+        let payload = Bytes::from_static(b"direct pool closure");
+        let record = put_record(1, "root/direct-pool-closed", &payload);
+        let record = journal.commit_put(record, &payload).unwrap();
+
+        let error = apply_record_with_tracked_cleanup(remote, journal, record)
+            .await
+            .expect_err("a directly closed SFTP pool must fail the publication");
+        assert!(matches!(error, object_store::Error::NotSupported { .. }));
+        assert!(
+            is_terminal_remote_error(&error),
+            "typed transport pool closure must terminalize the scheduler: {error:?}"
+        );
+        assert_eq!(state.writes.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_rename_source_delete_is_bounded_after_target_publication() {
+        let inner = Arc::new(InMemory::new());
+        let (fault, controls) = FaultStore::new(inner);
+        controls.block_deletes();
+        let delete_activity = controls.delete_activity();
+        let remote: Arc<dyn ObjectStore> = Arc::new(
+            crate::retrying_object_store::RetryingObjectStore::new(Arc::new(fault)),
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let journal = Arc::new(journal_with_local_records(temp.path(), 0));
+        let payload = Bytes::from_static(b"rename payload");
+        let mut record = put_record(1, "target", &payload);
+        let MutationKind::Put {
+            mode,
+            payload_len,
+            payload_sha256,
+            blob_path,
+            ..
+        } = record.kind.clone()
+        else {
+            unreachable!()
+        };
+        record.kind = MutationKind::Rename {
+            source: "source".to_owned(),
+            mode,
+            payload_len,
+            payload_sha256,
+            blob_path,
+        };
+        record.fence = FenceClass::Fence;
+        let record = journal.commit_put(record, &payload).unwrap();
+        let applying = tokio::spawn(apply_record_with_tracked_cleanup(
+            remote.clone(),
+            journal,
+            record,
+        ));
+        delete_activity.notified().await;
+
+        tokio::time::advance(REMOTE_OPERATION_TIMEOUT + Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+
+        let error = applying
+            .await
+            .unwrap()
+            .expect_err("a pending rename source delete must time out");
+        assert!(
+            error
+                .to_string()
+                .contains("rename source delete for sequence 1 timed out after 120.000s"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            remote
+                .get(&Path::from("target"))
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap(),
             payload
         );
     }

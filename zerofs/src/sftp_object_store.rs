@@ -26,7 +26,7 @@ pub(crate) const OBJECT_HEADER_LEN: usize = 32;
 const CREATE_RECONCILIATION_CHUNK_SIZE: u64 = 8 * 1024 * 1024;
 const OBJECT_HEADER_MAGIC: &[u8; 8] = b"ZEROFS\x01\0";
 const SFTP_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
-const SFTP_STAGING_CLEANUP_ATTEMPTS: usize = 3;
+pub(crate) const SFTP_STAGING_CLEANUP_ATTEMPTS: usize = 3;
 
 async fn bounded_sftp_request<T, F>(
     operation: &'static str,
@@ -56,11 +56,11 @@ where
 /// explicit return-type annotation plus a boxed future at every call site.
 macro_rules! with_lease {
     ($pool:expr, $kind:expr, $operation:literal, |$lease:ident| $request:expr) => {
-        async {
+        bounded_sftp_request($operation, async {
             let mut $lease = $pool.checkout($kind).await?;
-            let result = bounded_sftp_request($operation, $request).await;
+            let result = $request.await;
             finish_lease($lease, result).await
-        }
+        })
     };
 }
 
@@ -187,7 +187,7 @@ pub enum RemoteError {
 }
 
 impl RemoteError {
-    fn is_pool_closed(&self) -> bool {
+    pub(crate) fn is_pool_closed(&self) -> bool {
         match self {
             Self::PoolClosed => true,
             Self::CleanupRequired { operation, debt } => {
@@ -211,9 +211,10 @@ impl RemoteError {
             | Self::CorruptObject(_)
             | Self::NotSupported(_)
             | Self::PoolClosed => false,
-            Self::CleanupRequired { operation, debt } => {
-                operation.is_retryable() && debt.error.is_retryable()
-            }
+            // A new publication cannot safely start while the prior attempt's
+            // staging path is still unresolved. Fail closed; the cleanup debt
+            // remains explicit for operator recovery.
+            Self::CleanupRequired { .. } => false,
             Self::Other(_) => true,
         }
     }
@@ -236,6 +237,10 @@ pub struct PublicationOutcome {
 
 type TargetLock = AsyncMutex<()>;
 
+// Path-only scope deliberately fails safe across independently constructed
+// pools that may address the same backend namespace. It can over-serialize
+// unrelated backends with identical paths; a future narrower key must carry a
+// canonical endpoint-and-prefix identity, never an in-process pool pointer.
 static TARGET_LOCKS: LazyLock<StdMutex<HashMap<PathBuf, Weak<TargetLock>>>> =
     LazyLock::new(|| StdMutex::new(HashMap::new()));
 
@@ -263,9 +268,25 @@ fn target_lock(target: &FilePath) -> Arc<TargetLock> {
     lock
 }
 
+async fn bounded_target_lock<'a>(
+    lock: &'a TargetLock,
+    target: &FilePath,
+) -> RemoteResult<tokio::sync::MutexGuard<'a, ()>> {
+    tokio::time::timeout(SFTP_REQUEST_TIMEOUT, lock.lock())
+        .await
+        .map_err(|_| {
+            RemoteError::Other(format!(
+                "target lock timed out after {:.3}s for {}",
+                SFTP_REQUEST_TIMEOUT.as_secs_f64(),
+                target.display()
+            ))
+        })
+}
+
 #[async_trait]
 pub trait RemoteSession: Debug + Send + Sync {
     fn capabilities(&self) -> SftpCapabilities;
+
     async fn read_exact(&self, path: &FilePath, offset: u64, len: usize) -> RemoteResult<Bytes>;
     async fn write_file_durable(&self, path: &FilePath, chunks: Vec<Bytes>) -> RemoteResult<()>;
     async fn write_file_at_durable(
@@ -304,7 +325,7 @@ async fn publish_payload(
     expected_generation: Option<Uuid>,
 ) -> RemoteResult<PublicationOutcome> {
     let target_lock = target_lock(target);
-    let _target_guard = target_lock.lock().await;
+    let _target_guard = bounded_target_lock(&target_lock, target).await?;
     validate_publication_capabilities(session.capabilities(), mode).map_err(|extension| {
         RemoteError::NotSupported(format!("SFTP server lacks required {extension} extension"))
     })?;
@@ -383,6 +404,20 @@ async fn publish_payload(
     })
 }
 
+async fn bounded_reconciliation<T, F>(target: &FilePath, future: F) -> RemoteResult<T>
+where
+    F: Future<Output = RemoteResult<T>>,
+{
+    match tokio::time::timeout(SFTP_REQUEST_TIMEOUT, future).await {
+        Ok(result) => result,
+        Err(_) => Err(RemoteError::Other(format!(
+            "publication reconciliation timed out after {:.3}s for {}",
+            SFTP_REQUEST_TIMEOUT.as_secs_f64(),
+            target.display()
+        ))),
+    }
+}
+
 async fn reconcile_publication(
     session: &Arc<dyn RemoteSession>,
     target: &FilePath,
@@ -392,12 +427,15 @@ async fn reconcile_publication(
     if !error.is_ambiguous() {
         return Err(error);
     }
-    let observed = (|| async {
-        let bytes = session.read_exact(target, 0, OBJECT_HEADER_LEN).await?;
-        decode_header(&bytes).map_err(RemoteError::CorruptObject)
+    let observed = bounded_reconciliation(target, async {
+        (|| async {
+            let bytes = session.read_exact(target, 0, OBJECT_HEADER_LEN).await?;
+            decode_header(&bytes).map_err(RemoteError::CorruptObject)
+        })
+        .retry(crate::retrying_object_store::default_retry_builder())
+        .when(RemoteError::is_retryable)
+        .await
     })
-    .retry(crate::retrying_object_store::default_retry_builder())
-    .when(RemoteError::is_retryable)
     .await;
 
     match observed {
@@ -417,31 +455,34 @@ async fn reconcile_create_publication(
     if !error.is_ambiguous() {
         return Err(error);
     }
-    let matches_staging = (|| async {
-        let bytes = session.read_exact(target, 0, OBJECT_HEADER_LEN).await?;
-        let observed = decode_header(&bytes).map_err(RemoteError::CorruptObject)?;
-        if observed != expected {
-            return Ok(false);
-        }
-
-        let mut logical_offset = 0;
-        while logical_offset < expected.logical_len {
-            let len = (expected.logical_len - logical_offset).min(CREATE_RECONCILIATION_CHUNK_SIZE)
-                as usize;
-            let physical_offset = OBJECT_HEADER_LEN as u64 + logical_offset;
-            let (target_bytes, staging_bytes) = tokio::try_join!(
-                session.read_exact(target, physical_offset, len),
-                session.read_exact(staging, physical_offset, len),
-            )?;
-            if target_bytes != staging_bytes {
+    let matches_staging = bounded_reconciliation(target, async {
+        (|| async {
+            let bytes = session.read_exact(target, 0, OBJECT_HEADER_LEN).await?;
+            let observed = decode_header(&bytes).map_err(RemoteError::CorruptObject)?;
+            if observed != expected {
                 return Ok(false);
             }
-            logical_offset += len as u64;
-        }
-        Ok(true)
+
+            let mut logical_offset = 0;
+            while logical_offset < expected.logical_len {
+                let len = (expected.logical_len - logical_offset)
+                    .min(CREATE_RECONCILIATION_CHUNK_SIZE) as usize;
+                let physical_offset = OBJECT_HEADER_LEN as u64 + logical_offset;
+                let (target_bytes, staging_bytes) = tokio::try_join!(
+                    session.read_exact(target, physical_offset, len),
+                    session.read_exact(staging, physical_offset, len),
+                )?;
+                if target_bytes != staging_bytes {
+                    return Ok(false);
+                }
+                logical_offset += len as u64;
+            }
+            Ok(true)
+        })
+        .retry(crate::retrying_object_store::default_retry_builder())
+        .when(RemoteError::is_retryable)
+        .await
     })
-    .retry(crate::retrying_object_store::default_retry_builder())
-    .when(RemoteError::is_retryable)
     .await;
 
     match matches_staging {
@@ -456,7 +497,7 @@ async fn failure_with_cleanup(cleanup: &mut StagingCleanup, operation: RemoteErr
     if operation.is_pool_closed() {
         return operation;
     }
-    match cleanup.remove_now().await {
+    match cleanup.remove_before_retry().await {
         Ok(()) => operation,
         Err(debt) => RemoteError::CleanupRequired {
             operation: Box::new(operation),
@@ -498,6 +539,22 @@ impl StagingCleanup {
                 error: Box::new(error),
             }),
         }
+    }
+
+    async fn remove_before_retry(&mut self) -> Result<(), StagingCleanupDebt> {
+        for attempt in 1..=SFTP_STAGING_CLEANUP_ATTEMPTS {
+            match self.remove_now().await {
+                Ok(()) => return Ok(()),
+                Err(debt)
+                    if debt.error.is_retryable() && attempt < SFTP_STAGING_CLEANUP_ATTEMPTS =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(100 * attempt as u64))
+                        .await;
+                }
+                Err(debt) => return Err(debt),
+            }
+        }
+        unreachable!("cleanup attempt range is non-empty")
     }
 }
 
@@ -1293,7 +1350,9 @@ impl MultipartUpload for SftpMultipartUpload {
         };
         let staging = self.staging()?.to_path_buf();
         let target_lock = target_lock(&self.target);
-        let _target_guard = target_lock.lock().await;
+        let _target_guard = bounded_target_lock(&target_lock, &self.target)
+            .await
+            .map_err(|error| publication_error(&self.location, error))?;
         let header = ObjectHeader {
             generation: self.generation,
             logical_len,
@@ -1799,6 +1858,51 @@ mod tests {
             .await
             .unwrap();
         assert!(state.dials.load(Ordering::SeqCst) >= 2);
+        pool.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pool_checkout_wait_is_included_in_one_sftp_phase_deadline() {
+        let state = Arc::new(HangingOperationState::default());
+        let pool = crate::sftp_transport::SftpSessionPool::new_writable(
+            Arc::new(HangingOperationFactory(state)),
+            1,
+            crate::sftp_transport::SFTP_SESSION_MAX_CONCURRENT_OPS,
+            crate::sftp_transport::SFTP_SESSION_MAX_CONCURRENT_OPS,
+        )
+        .await
+        .unwrap();
+        let mut held = Vec::new();
+        for _ in 0..crate::sftp_transport::SFTP_SESSION_MAX_CONCURRENT_OPS {
+            held.push(
+                pool.checkout(crate::sftp_transport::OperationKind::Write)
+                    .await
+                    .unwrap(),
+            );
+        }
+        let store = Arc::new(SftpObjectStore::new(pool.clone(), ObjectPath::from("root")).unwrap());
+        let read = tokio::spawn({
+            let store = store.clone();
+            async move { store.get(&ObjectPath::from("root/blocked-read")).await }
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(SFTP_REQUEST_TIMEOUT + Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+
+        assert!(
+            read.is_finished(),
+            "checkout admission must be included in the request deadline"
+        );
+        let error = read
+            .await
+            .unwrap()
+            .expect_err("the saturated checkout must time out");
+        assert!(
+            error.to_string().contains("timed out"),
+            "unexpected error: {error}"
+        );
+
+        drop(held);
         pool.shutdown().await.unwrap();
     }
 
@@ -2441,6 +2545,222 @@ mod tests {
         directories: Mutex<HashSet<PathBuf>>,
     }
 
+    #[derive(Debug, Default)]
+    struct FullPoolPublicationState {
+        remote: Arc<SharedRemoteFs>,
+        dials: AtomicUsize,
+        live: AtomicUsize,
+        peak: AtomicUsize,
+        stalled_publications: AtomicUsize,
+        stalled_writes: AtomicUsize,
+    }
+
+    #[derive(Debug, Clone)]
+    struct FullPoolPublicationFactory(Arc<FullPoolPublicationState>);
+
+    #[async_trait]
+    impl SessionFactory for FullPoolPublicationFactory {
+        async fn open(
+            &self,
+            _force: tokio_util::sync::CancellationToken,
+        ) -> Result<Box<dyn TransportSession>, TransportError> {
+            let dial = self.0.dials.fetch_add(1, Ordering::SeqCst);
+            let live = self.0.live.fetch_add(1, Ordering::SeqCst) + 1;
+            self.0.peak.fetch_max(live, Ordering::SeqCst);
+            Ok(Box::new(FullPoolPublicationSession {
+                state: self.0.clone(),
+                stall_publication: dial == 0,
+            }))
+        }
+    }
+
+    #[derive(Debug)]
+    struct FullPoolPublicationSession {
+        state: Arc<FullPoolPublicationState>,
+        stall_publication: bool,
+    }
+
+    #[async_trait]
+    impl TransportSession for FullPoolPublicationSession {
+        fn capabilities(&self) -> SftpCapabilities {
+            SftpCapabilities {
+                fsync: true,
+                hardlink: true,
+                posix_rename: true,
+            }
+        }
+
+        async fn read_object(
+            &self,
+            path: &FilePath,
+            requested_range: Option<object_store::GetRange>,
+            head: bool,
+        ) -> Result<RemoteObjectRead, TransportError> {
+            SharedRemoteSession(self.state.remote.clone())
+                .read_object(path, requested_range, head)
+                .await
+        }
+
+        async fn ensure_directory_component(&self, path: &FilePath) -> Result<(), TransportError> {
+            SharedRemoteSession(self.state.remote.clone())
+                .ensure_directory_component(path)
+                .await
+        }
+
+        async fn write_file_durable(
+            &self,
+            path: &FilePath,
+            chunks: Vec<Bytes>,
+        ) -> Result<(), TransportError> {
+            if self.stall_publication && path.to_string_lossy().contains("write-stall") {
+                self.state.stalled_writes.fetch_add(1, Ordering::SeqCst);
+                std::future::pending().await
+            } else {
+                SharedRemoteSession(self.state.remote.clone())
+                    .write_file_durable(path, chunks)
+                    .await
+            }
+        }
+
+        async fn remove_file(&self, path: &FilePath) -> Result<(), TransportError> {
+            SharedRemoteSession(self.state.remote.clone())
+                .remove_file(path)
+                .await
+        }
+
+        async fn hard_link(&self, from: &FilePath, to: &FilePath) -> Result<(), TransportError> {
+            if self.stall_publication {
+                self.state
+                    .stalled_publications
+                    .fetch_add(1, Ordering::SeqCst);
+                std::future::pending().await
+            } else {
+                SharedRemoteSession(self.state.remote.clone())
+                    .hard_link(from, to)
+                    .await
+            }
+        }
+
+        async fn close(
+            &self,
+            _force: tokio_util::sync::CancellationToken,
+        ) -> Result<(), TransportError> {
+            self.state.live.fetch_sub(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn full_physical_session_timeouts_cleanup_before_foreground_read_recovers() {
+        let state = Arc::new(FullPoolPublicationState::default());
+        let read_payload = b"foreground read recovered";
+        let mut physical = encode_header(ObjectHeader {
+            generation: Uuid::new_v4(),
+            logical_len: read_payload.len() as u64,
+        })
+        .to_vec();
+        physical.extend_from_slice(read_payload);
+        state
+            .remote
+            .files
+            .lock()
+            .unwrap()
+            .insert(PathBuf::from("root/readable.bin"), Bytes::from(physical));
+        let pool = crate::sftp_transport::SftpSessionPool::new_writable(
+            Arc::new(FullPoolPublicationFactory(state.clone())),
+            1,
+            crate::sftp_transport::SFTP_SESSION_MAX_CONCURRENT_OPS,
+            crate::sftp_transport::SFTP_SESSION_MAX_CONCURRENT_OPS,
+        )
+        .await
+        .unwrap();
+        let store = Arc::new(SftpObjectStore::new(pool.clone(), ObjectPath::from("root")).unwrap());
+
+        let mut publications = Vec::new();
+        for index in 0..8 {
+            for (class, mode) in [
+                ("publish-stall", PutMode::Create),
+                ("write-stall", PutMode::Overwrite),
+            ] {
+                publications.push(tokio::spawn({
+                    let store = store.clone();
+                    async move {
+                        store
+                            .put_opts(
+                                &ObjectPath::from(format!("root/{class}-{index}")),
+                                PutPayload::from_static(b"payload"),
+                                PutOptions::from(mode),
+                            )
+                            .await
+                    }
+                }));
+            }
+        }
+        for _ in 0..1_000 {
+            if state.stalled_publications.load(Ordering::SeqCst) == 8
+                && state.stalled_writes.load(Ordering::SeqCst) == 8
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            (
+                state.stalled_publications.load(Ordering::SeqCst),
+                state.stalled_writes.load(Ordering::SeqCst),
+            ),
+            (8, 8),
+            "metadata and write admission together must fill all physical session slots"
+        );
+
+        tokio::time::advance(Duration::from_secs(5)).await;
+        let foreground = tokio::spawn({
+            let store = store.clone();
+            async move {
+                store
+                    .get(&ObjectPath::from("root/readable.bin"))
+                    .await?
+                    .bytes()
+                    .await
+            }
+        });
+        tokio::task::yield_now().await;
+        assert!(!foreground.is_finished());
+
+        tokio::time::advance(Duration::from_secs(41)).await;
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        let bytes = foreground
+            .await
+            .unwrap()
+            .expect("foreground read must recover on a replacement session");
+        assert_eq!(bytes.as_ref(), read_payload);
+
+        for publication in publications {
+            publication
+                .await
+                .unwrap()
+                .expect_err("each ambiguous publication must surface its timeout");
+        }
+        assert!(state.dials.load(Ordering::SeqCst) >= 2);
+        assert_eq!(
+            state.peak.load(Ordering::SeqCst),
+            1,
+            "replacement sessions must not overlap the timed-out physical session"
+        );
+        assert!(
+            state.remote.files.lock().unwrap().keys().all(|path| {
+                !path
+                    .file_name()
+                    .is_some_and(|name| is_staging_name(name.as_ref()))
+            }),
+            "every timed-out publication must settle staging cleanup before returning"
+        );
+        pool.shutdown().await.unwrap();
+        assert_eq!(state.live.load(Ordering::SeqCst), 0);
+    }
+
     #[derive(Debug, Clone)]
     struct SharedRemoteFactory(Arc<SharedRemoteFs>);
 
@@ -2961,6 +3281,206 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    #[derive(Debug, Default)]
+    struct LockHoldingSession {
+        write_started: Notify,
+    }
+
+    #[async_trait]
+    impl RemoteSession for LockHoldingSession {
+        fn capabilities(&self) -> SftpCapabilities {
+            SftpCapabilities {
+                fsync: true,
+                hardlink: true,
+                posix_rename: true,
+            }
+        }
+
+        async fn read_exact(
+            &self,
+            path: &FilePath,
+            _offset: u64,
+            _len: usize,
+        ) -> RemoteResult<Bytes> {
+            Err(RemoteError::NotFound(path.display().to_string()))
+        }
+
+        async fn write_file_durable(
+            &self,
+            _path: &FilePath,
+            _chunks: Vec<Bytes>,
+        ) -> RemoteResult<()> {
+            self.write_started.notify_one();
+            std::future::pending().await
+        }
+
+        async fn remove_file(&self, path: &FilePath) -> RemoteResult<()> {
+            Err(RemoteError::NotFound(path.display().to_string()))
+        }
+
+        async fn hard_link(&self, _from: &FilePath, _to: &FilePath) -> RemoteResult<()> {
+            Ok(())
+        }
+
+        async fn posix_rename(&self, _from: &FilePath, _to: &FilePath) -> RemoteResult<()> {
+            Ok(())
+        }
+
+        fn schedule_cleanup(&self, _path: PathBuf) {}
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn target_lock_wait_is_bounded_independently_of_publication_phases() {
+        let session = Arc::new(LockHoldingSession::default());
+        let target = PathBuf::from("/objects/locked.bin");
+        let first = tokio::spawn({
+            let session = session.clone();
+            let target = target.clone();
+            async move {
+                publish_payload(
+                    session,
+                    &target,
+                    vec![Bytes::from_static(b"first")],
+                    PublicationMode::Create,
+                    None,
+                )
+                .await
+            }
+        });
+        session.write_started.notified().await;
+
+        let second = tokio::spawn({
+            let session = session.clone();
+            let target = target.clone();
+            async move {
+                publish_payload(
+                    session,
+                    &target,
+                    vec![Bytes::from_static(b"second")],
+                    PublicationMode::Create,
+                    None,
+                )
+                .await
+            }
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(SFTP_REQUEST_TIMEOUT + Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+
+        assert!(
+            second.is_finished(),
+            "a same-target publication must not wait forever before its own phase budgets start"
+        );
+        let error = second
+            .await
+            .unwrap()
+            .expect_err("the same-target waiter must time out");
+        assert!(error.to_string().contains("target lock timed out"));
+
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+    }
+
+    #[derive(Debug)]
+    struct NeverReconcilingSession {
+        inner: RecordingSession,
+        reconciliation_started: Notify,
+    }
+
+    impl NeverReconcilingSession {
+        fn new() -> Self {
+            Self {
+                inner: RecordingSession::new(),
+                reconciliation_started: Notify::new(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl RemoteSession for NeverReconcilingSession {
+        fn capabilities(&self) -> SftpCapabilities {
+            self.inner.capabilities()
+        }
+
+        async fn read_exact(
+            &self,
+            _path: &FilePath,
+            _offset: u64,
+            _len: usize,
+        ) -> RemoteResult<Bytes> {
+            self.reconciliation_started.notify_one();
+            Err(RemoteError::Other(
+                "injected endless reconciliation failure".to_owned(),
+            ))
+        }
+
+        async fn write_file_durable(
+            &self,
+            path: &FilePath,
+            chunks: Vec<Bytes>,
+        ) -> RemoteResult<()> {
+            self.inner.write_file_durable(path, chunks).await
+        }
+
+        async fn remove_file(&self, path: &FilePath) -> RemoteResult<()> {
+            self.inner.remove_file(path).await
+        }
+
+        async fn hard_link(&self, _from: &FilePath, _to: &FilePath) -> RemoteResult<()> {
+            Err(RemoteError::Other(
+                "injected ambiguous publication".to_owned(),
+            ))
+        }
+
+        async fn posix_rename(&self, _from: &FilePath, _to: &FilePath) -> RemoteResult<()> {
+            Err(RemoteError::Other(
+                "injected ambiguous publication".to_owned(),
+            ))
+        }
+
+        fn schedule_cleanup(&self, path: PathBuf) {
+            self.inner.schedule_cleanup(path);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ambiguous_publication_reconciliation_has_a_finite_deadline() {
+        let session = Arc::new(NeverReconcilingSession::new());
+        let publication = tokio::spawn({
+            let session = session.clone();
+            async move {
+                publish_payload(
+                    session,
+                    FilePath::new("/objects/ambiguous.bin"),
+                    vec![Bytes::from_static(b"payload")],
+                    PublicationMode::Create,
+                    None,
+                )
+                .await
+            }
+        });
+        session.reconciliation_started.notified().await;
+        tokio::time::advance(SFTP_REQUEST_TIMEOUT + Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+
+        assert!(
+            publication.is_finished(),
+            "ambiguous reconciliation must not retry forever"
+        );
+        let error = publication
+            .await
+            .unwrap()
+            .expect_err("the unreconcilable publication must fail");
+        assert!(
+            error.to_string().contains("reconciliation timed out"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            session.inner.files.lock().unwrap().is_empty(),
+            "failed publication must remove its staging file before returning"
+        );
     }
 
     #[derive(Debug)]
@@ -3579,7 +4099,7 @@ mod tests {
         let target = PathBuf::from("zerofs/v1/failed-begin.bin");
 
         let error = SftpMultipartUpload::begin(
-            session,
+            session.clone(),
             location,
             target,
             Arc::new(DashSet::new()),
@@ -3588,6 +4108,10 @@ mod tests {
         .await
         .expect_err("failed initiation must report both write failure and cleanup debt");
 
+        assert!(
+            !error.is_retryable(),
+            "unsettled staging cleanup must fail closed instead of starting another upload"
+        );
         match error {
             RemoteError::CleanupRequired { operation, debt } => {
                 assert!(matches!(
@@ -3601,6 +4125,17 @@ mod tests {
             }
             error => panic!("expected cleanup debt, got {error:?}"),
         }
+        assert_eq!(
+            session
+                .operations
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|operation| operation.as_str() == "remove")
+                .count(),
+            SFTP_STAGING_CLEANUP_ATTEMPTS,
+            "the failed publication must exhaust bounded inline cleanup before returning"
+        );
     }
 
     #[tokio::test]
@@ -4108,7 +4643,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn concurrent_updates_with_one_expected_generation_have_one_winner() {
         let session = Arc::new(RacingSession::new());
-        let target = PathBuf::from("/objects/segment.bin");
+        let target = PathBuf::from("/objects/concurrent-update-winner.bin");
         let current = ObjectHeader {
             generation: Uuid::from_u128(0x00112233_4455_6677_8899_aabbccddeeff),
             logical_len: 8,
@@ -4152,7 +4687,11 @@ mod tests {
         };
 
         let results = [first.await.unwrap(), second.await.unwrap()];
-        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results.iter().filter(|result| result.is_ok()).count(),
+            1,
+            "{results:?}"
+        );
         assert_eq!(
             results
                 .iter()
