@@ -26,7 +26,7 @@ pub(crate) const OBJECT_HEADER_LEN: usize = 32;
 const CREATE_RECONCILIATION_CHUNK_SIZE: u64 = 8 * 1024 * 1024;
 const OBJECT_HEADER_MAGIC: &[u8; 8] = b"ZEROFS\x01\0";
 const SFTP_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
-const SFTP_STAGING_CLEANUP_ATTEMPTS: usize = 3;
+pub(crate) const SFTP_STAGING_CLEANUP_ATTEMPTS: usize = 3;
 
 async fn bounded_sftp_request<T, F>(
     operation: &'static str,
@@ -56,19 +56,11 @@ where
 /// explicit return-type annotation plus a boxed future at every call site.
 macro_rules! with_lease {
     ($pool:expr, $kind:expr, $operation:literal, |$lease:ident| $request:expr) => {
-        async {
-            let mut $lease = tokio::time::timeout(SFTP_REQUEST_TIMEOUT, $pool.checkout($kind))
-                .await
-                .map_err(|_| {
-                    crate::sftp_transport::TransportError::Operation(format!(
-                        "{} checkout timed out after {:.3}s",
-                        $operation,
-                        SFTP_REQUEST_TIMEOUT.as_secs_f64()
-                    ))
-                })??;
-            let result = bounded_sftp_request($operation, $request).await;
+        bounded_sftp_request($operation, async {
+            let mut $lease = $pool.checkout($kind).await?;
+            let result = $request.await;
             finish_lease($lease, result).await
-        }
+        })
     };
 }
 
@@ -245,7 +237,7 @@ pub struct PublicationOutcome {
 
 type TargetLock = AsyncMutex<()>;
 
-static TARGET_LOCKS: LazyLock<StdMutex<HashMap<(usize, PathBuf), Weak<TargetLock>>>> =
+static TARGET_LOCKS: LazyLock<StdMutex<HashMap<PathBuf, Weak<TargetLock>>>> =
     LazyLock::new(|| StdMutex::new(HashMap::new()));
 
 // `retain` walks the whole map, which is wasteful when this is called on
@@ -257,19 +249,18 @@ const TARGET_LOCKS_PRUNE_FLOOR: usize = 32;
 static TARGET_LOCKS_PRUNE_AT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(TARGET_LOCKS_PRUNE_FLOOR);
 
-fn target_lock(scope: usize, target: &FilePath) -> Arc<TargetLock> {
+fn target_lock(target: &FilePath) -> Arc<TargetLock> {
     let mut locks = TARGET_LOCKS.lock().unwrap();
     if locks.len() >= TARGET_LOCKS_PRUNE_AT.load(std::sync::atomic::Ordering::Relaxed) {
         locks.retain(|_, lock| lock.strong_count() > 0);
         let next_prune_at = (locks.len() * 2).max(TARGET_LOCKS_PRUNE_FLOOR);
         TARGET_LOCKS_PRUNE_AT.store(next_prune_at, std::sync::atomic::Ordering::Relaxed);
     }
-    let key = (scope, target.to_path_buf());
-    if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+    if let Some(lock) = locks.get(target).and_then(Weak::upgrade) {
         return lock;
     }
     let lock = Arc::new(TargetLock::new(()));
-    locks.insert(key, Arc::downgrade(&lock));
+    locks.insert(target.to_path_buf(), Arc::downgrade(&lock));
     lock
 }
 
@@ -292,9 +283,6 @@ async fn bounded_target_lock<'a>(
 pub trait RemoteSession: Debug + Send + Sync {
     fn capabilities(&self) -> SftpCapabilities;
 
-    fn target_lock_scope(&self) -> usize {
-        self as *const Self as *const () as usize
-    }
     async fn read_exact(&self, path: &FilePath, offset: u64, len: usize) -> RemoteResult<Bytes>;
     async fn write_file_durable(&self, path: &FilePath, chunks: Vec<Bytes>) -> RemoteResult<()>;
     async fn write_file_at_durable(
@@ -332,7 +320,7 @@ async fn publish_payload(
     mode: PublicationMode,
     expected_generation: Option<Uuid>,
 ) -> RemoteResult<PublicationOutcome> {
-    let target_lock = target_lock(session.target_lock_scope(), target);
+    let target_lock = target_lock(target);
     let _target_guard = bounded_target_lock(&target_lock, target).await?;
     validate_publication_capabilities(session.capabilities(), mode).map_err(|extension| {
         RemoteError::NotSupported(format!("SFTP server lacks required {extension} extension"))
@@ -625,10 +613,6 @@ impl RemoteSession for PooledRemoteSession {
             hardlink: true,
             posix_rename: true,
         }
-    }
-
-    fn target_lock_scope(&self) -> usize {
-        self.pool.identity()
     }
 
     async fn read_exact(&self, path: &FilePath, offset: u64, len: usize) -> RemoteResult<Bytes> {
@@ -1361,7 +1345,7 @@ impl MultipartUpload for SftpMultipartUpload {
             state.logical_len
         };
         let staging = self.staging()?.to_path_buf();
-        let target_lock = target_lock(self.session.target_lock_scope(), &self.target);
+        let target_lock = target_lock(&self.target);
         let _target_guard = bounded_target_lock(&target_lock, &self.target)
             .await
             .map_err(|error| publication_error(&self.location, error))?;
@@ -1874,7 +1858,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn pool_checkout_wait_is_bounded_before_an_sftp_request() {
+    async fn pool_checkout_wait_is_included_in_one_sftp_phase_deadline() {
         let state = Arc::new(HangingOperationState::default());
         let pool = crate::sftp_transport::SftpSessionPool::new_writable(
             Arc::new(HangingOperationFactory(state)),
@@ -1910,7 +1894,7 @@ mod tests {
             .unwrap()
             .expect_err("the saturated checkout must time out");
         assert!(
-            error.to_string().contains("checkout timed out"),
+            error.to_string().contains("timed out"),
             "unexpected error: {error}"
         );
 
@@ -4655,7 +4639,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn concurrent_updates_with_one_expected_generation_have_one_winner() {
         let session = Arc::new(RacingSession::new());
-        let target = PathBuf::from("/objects/segment.bin");
+        let target = PathBuf::from("/objects/concurrent-update-winner.bin");
         let current = ObjectHeader {
             generation: Uuid::from_u128(0x00112233_4455_6677_8899_aabbccddeeff),
             logical_len: 8,

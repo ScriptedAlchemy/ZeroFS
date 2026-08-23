@@ -62,6 +62,20 @@ impl std::error::Error for PermanentError {
     }
 }
 
+pub(crate) fn has_permanent_source(err: &object_store::Error) -> bool {
+    let object_store::Error::Generic { source, .. } = err else {
+        return false;
+    };
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(source.as_ref());
+    while let Some(error) = current {
+        if error.is::<PermanentError>() {
+            return true;
+        }
+        current = error.source();
+    }
+    false
+}
+
 #[derive(Debug)]
 pub struct RetryingObjectStore {
     inner: Arc<dyn ObjectStore>,
@@ -105,17 +119,7 @@ impl RetryingObjectStore {
     }
 
     fn has_permanent_source(err: &object_store::Error) -> bool {
-        let object_store::Error::Generic { source, .. } = err else {
-            return false;
-        };
-        let mut current: Option<&(dyn std::error::Error + 'static)> = Some(source.as_ref());
-        while let Some(error) = current {
-            if error.is::<PermanentError>() {
-                return true;
-            }
-            current = error.source();
-        }
-        false
+        has_permanent_source(err)
     }
 
     /// Detect deterministic ranges beginning at or beyond EOF.

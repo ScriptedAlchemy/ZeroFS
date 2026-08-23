@@ -942,6 +942,7 @@ fn is_terminal_remote_error(error: &object_store::Error) -> bool {
     match error {
         object_store::Error::AlreadyExists { source, .. } => source.is::<RemoteContentDivergence>(),
         object_store::Error::Precondition { source, .. } => source.is::<MissingRemotePredecessor>(),
+        _ if crate::retrying_object_store::has_permanent_source(error) => true,
         _ => false,
     }
 }
@@ -1224,7 +1225,7 @@ async fn apply_record(
     let target = Path::parse(&record.path).map_err(|error| generic_error(error.to_string()))?;
     match &record.kind {
         MutationKind::Delete => {
-            match remote.delete(&target).await {
+            match bounded_remote_step(&record, "delete", remote.delete(&target)).await {
                 Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
                 Err(error) => return Err(error),
             }
@@ -1247,7 +1248,9 @@ async fn apply_record(
             if let MutationKind::Rename { source, .. } = &record.kind {
                 let source = Path::parse(source)
                     .map_err(|error| generic_error(format!("invalid rename source: {error}")))?;
-                match remote.delete(&source).await {
+                match bounded_remote_step(&record, "rename source delete", remote.delete(&source))
+                    .await
+                {
                     Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
                     Err(error) => return Err(error),
                 }
@@ -1750,13 +1753,16 @@ fn missing_remote_predecessor(
 #[cfg(test)]
 mod tests {
     use super::{
-        CompletedRemote, REMOTE_PUBLICATION_TIMEOUT, SchedulerWindow,
+        CompletedRemote, REMOTE_OPERATION_TIMEOUT, REMOTE_PUBLICATION_TIMEOUT, SchedulerWindow,
         apply_record_with_tracked_cleanup, bounded_remote_operation, collect_pipeline_batch,
-        load_scheduler_window, validate_scheduler_window, verify_existing,
+        is_terminal_remote_error, load_scheduler_window, validate_scheduler_window,
+        verify_existing,
     };
     use crate::fault_store::FaultStore;
     use crate::writeback::journal::Journal;
-    use crate::writeback::model::{FenceClass, JournalIdentity, MutationMode, MutationRecord};
+    use crate::writeback::model::{
+        FenceClass, JournalIdentity, MutationKind, MutationMode, MutationRecord,
+    };
     use bytes::Bytes;
     use futures::future;
     use object_store::memory::InMemory;
@@ -1866,50 +1872,6 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn valid_composite_publication_can_exceed_the_legacy_operation_timeout() {
-        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let (remote, controls) = FaultStore::new(inner);
-        controls.delay_put_in_phases(3, Duration::from_secs(41));
-        let phase_started = controls.put_phase_started();
-        let temp = tempfile::tempdir().unwrap();
-        let journal = Arc::new(journal_with_local_records(temp.path(), 0));
-        let target = Path::from("segments/slow-valid-create");
-        let payload = Bytes::from_static(b"valid slow publication");
-        let record = put_record(1, target.as_ref(), &payload);
-        let record = journal.commit_put(record, &payload).unwrap();
-        let publication = tokio::spawn(apply_record_with_tracked_cleanup(
-            remote.clone(),
-            journal,
-            record,
-        ));
-        tokio::task::yield_now().await;
-
-        for _ in 0..2 {
-            phase_started.notified().await;
-            tokio::time::advance(Duration::from_secs(41)).await;
-            tokio::task::yield_now().await;
-        }
-        phase_started.notified().await;
-        tokio::time::advance(Duration::from_secs(39)).await;
-        tokio::task::yield_now().await;
-        assert!(
-            !publication.is_finished(),
-            "a valid composite publication must outlive the legacy 120s watchdog"
-        );
-        tokio::time::advance(Duration::from_secs(2)).await;
-        tokio::task::yield_now().await;
-
-        publication
-            .await
-            .unwrap()
-            .expect("three healthy phases must not hit the single-operation timeout");
-        assert_eq!(
-            remote.get(&target).await.unwrap().bytes().await.unwrap(),
-            payload
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
     async fn permanently_pending_publication_still_hits_the_composite_watchdog() {
         let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let (remote, controls) = FaultStore::new(inner);
@@ -1935,6 +1897,351 @@ mod tests {
                 .to_string()
                 .contains("bounded atomic put for sequence 1 timed out after 480.000s"),
             "unexpected error: {error}"
+        );
+    }
+
+    #[derive(Debug, Default)]
+    struct SlowSftpPhaseState {
+        files: std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, Bytes>>,
+        phases: std::sync::atomic::AtomicUsize,
+    }
+
+    #[derive(Debug, Clone)]
+    struct SlowSftpPhaseFactory(Arc<SlowSftpPhaseState>);
+
+    #[async_trait::async_trait]
+    impl crate::sftp_transport::SessionFactory for SlowSftpPhaseFactory {
+        async fn open(
+            &self,
+            _force: tokio_util::sync::CancellationToken,
+        ) -> Result<
+            Box<dyn crate::sftp_transport::TransportSession>,
+            crate::sftp_transport::TransportError,
+        > {
+            Ok(Box::new(SlowSftpPhaseSession(self.0.clone())))
+        }
+    }
+
+    #[derive(Debug)]
+    struct SlowSftpPhaseSession(Arc<SlowSftpPhaseState>);
+
+    #[async_trait::async_trait]
+    impl crate::sftp_transport::TransportSession for SlowSftpPhaseSession {
+        fn capabilities(&self) -> crate::sftp_object_store::SftpCapabilities {
+            crate::sftp_object_store::SftpCapabilities {
+                fsync: true,
+                hardlink: true,
+                posix_rename: true,
+            }
+        }
+
+        async fn ensure_directory_component(
+            &self,
+            _path: &std::path::Path,
+        ) -> Result<(), crate::sftp_transport::TransportError> {
+            Ok(())
+        }
+
+        async fn write_file_durable(
+            &self,
+            path: &std::path::Path,
+            chunks: Vec<Bytes>,
+        ) -> Result<(), crate::sftp_transport::TransportError> {
+            tokio::time::sleep(Duration::from_secs(41)).await;
+            self.0
+                .phases
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.0.files.lock().unwrap().insert(
+                path.to_path_buf(),
+                chunks.into_iter().flatten().collect::<Vec<_>>().into(),
+            );
+            Ok(())
+        }
+
+        async fn hard_link(
+            &self,
+            from: &std::path::Path,
+            to: &std::path::Path,
+        ) -> Result<(), crate::sftp_transport::TransportError> {
+            tokio::time::sleep(Duration::from_secs(41)).await;
+            self.0
+                .phases
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let bytes = self
+                .0
+                .files
+                .lock()
+                .unwrap()
+                .get(from)
+                .cloned()
+                .ok_or_else(|| {
+                    crate::sftp_transport::TransportError::NotFound(from.display().to_string())
+                })?;
+            self.0.files.lock().unwrap().insert(to.to_path_buf(), bytes);
+            Ok(())
+        }
+
+        async fn remove_file(
+            &self,
+            path: &std::path::Path,
+        ) -> Result<(), crate::sftp_transport::TransportError> {
+            tokio::time::sleep(Duration::from_secs(41)).await;
+            self.0
+                .phases
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.0
+                .files
+                .lock()
+                .unwrap()
+                .remove(path)
+                .map(|_| ())
+                .ok_or_else(|| {
+                    crate::sftp_transport::TransportError::NotFound(path.display().to_string())
+                })
+        }
+
+        async fn close(
+            &self,
+            _force: tokio_util::sync::CancellationToken,
+        ) -> Result<(), crate::sftp_transport::TransportError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn concrete_sftp_create_phases_can_validly_exceed_legacy_120_seconds() {
+        let state = Arc::new(SlowSftpPhaseState::default());
+        let pool = crate::sftp_transport::SftpSessionPool::new_writable(
+            Arc::new(SlowSftpPhaseFactory(state.clone())),
+            1,
+            1,
+            1,
+        )
+        .await
+        .unwrap();
+        let backend: Arc<dyn ObjectStore> = Arc::new(
+            crate::sftp_object_store::SftpObjectStore::new(pool.clone(), Path::from("root"))
+                .unwrap(),
+        );
+        let remote: Arc<dyn ObjectStore> = Arc::new(
+            crate::retrying_object_store::RetryingObjectStore::new(backend),
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let journal = Arc::new(journal_with_local_records(temp.path(), 0));
+        let payload = Bytes::from_static(b"three real SFTP phases");
+        let record = put_record(1, "root/slow-create", &payload);
+        let record = journal.commit_put(record, &payload).unwrap();
+        let started = tokio::time::Instant::now();
+
+        apply_record_with_tracked_cleanup(remote, journal, record)
+            .await
+            .expect("three valid SFTP phases must fit the composite watchdog");
+
+        assert_eq!(state.phases.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert_eq!(
+            tokio::time::Instant::now() - started,
+            Duration::from_secs(123)
+        );
+        let files = state.files.lock().unwrap();
+        assert!(files.contains_key(std::path::Path::new("root/slow-create")));
+        assert!(files.keys().all(|path| {
+            !path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(".zerofs-staging-"))
+        }));
+        drop(files);
+        pool.shutdown().await.unwrap();
+    }
+
+    #[derive(Debug, Default)]
+    struct CleanupDebtTransportState {
+        writes: std::sync::atomic::AtomicUsize,
+        removes: std::sync::atomic::AtomicUsize,
+    }
+
+    #[derive(Debug, Clone)]
+    struct CleanupDebtFactory(Arc<CleanupDebtTransportState>);
+
+    #[async_trait::async_trait]
+    impl crate::sftp_transport::SessionFactory for CleanupDebtFactory {
+        async fn open(
+            &self,
+            _force: tokio_util::sync::CancellationToken,
+        ) -> Result<
+            Box<dyn crate::sftp_transport::TransportSession>,
+            crate::sftp_transport::TransportError,
+        > {
+            Ok(Box::new(CleanupDebtSession(self.0.clone())))
+        }
+    }
+
+    #[derive(Debug)]
+    struct CleanupDebtSession(Arc<CleanupDebtTransportState>);
+
+    #[async_trait::async_trait]
+    impl crate::sftp_transport::TransportSession for CleanupDebtSession {
+        fn capabilities(&self) -> crate::sftp_object_store::SftpCapabilities {
+            crate::sftp_object_store::SftpCapabilities {
+                fsync: true,
+                hardlink: true,
+                posix_rename: true,
+            }
+        }
+
+        async fn ensure_directory_component(
+            &self,
+            _path: &std::path::Path,
+        ) -> Result<(), crate::sftp_transport::TransportError> {
+            Ok(())
+        }
+
+        async fn write_file_durable(
+            &self,
+            _path: &std::path::Path,
+            _chunks: Vec<Bytes>,
+        ) -> Result<(), crate::sftp_transport::TransportError> {
+            self.0
+                .writes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(crate::sftp_transport::TransportError::Operation(
+                "injected publication failure".to_owned(),
+            ))
+        }
+
+        async fn remove_file(
+            &self,
+            _path: &std::path::Path,
+        ) -> Result<(), crate::sftp_transport::TransportError> {
+            self.0
+                .removes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(crate::sftp_transport::TransportError::Operation(
+                "injected unresolved staging cleanup".to_owned(),
+            ))
+        }
+
+        async fn close(
+            &self,
+            _force: tokio_util::sync::CancellationToken,
+        ) -> Result<(), crate::sftp_transport::TransportError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn scheduler_terminalizes_unsettled_sftp_staging_cleanup_without_retry() {
+        let state = Arc::new(CleanupDebtTransportState::default());
+        let pool = crate::sftp_transport::SftpSessionPool::new_writable(
+            Arc::new(CleanupDebtFactory(state.clone())),
+            1,
+            1,
+            1,
+        )
+        .await
+        .unwrap();
+        let backend: Arc<dyn ObjectStore> = Arc::new(
+            crate::sftp_object_store::SftpObjectStore::new(pool.clone(), Path::from("root"))
+                .unwrap(),
+        );
+        let remote: Arc<dyn ObjectStore> = Arc::new(
+            crate::retrying_object_store::RetryingObjectStore::new(backend),
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let journal = Arc::new(journal_with_local_records(temp.path(), 0));
+        let payload = Bytes::from_static(b"terminal cleanup debt");
+        let record = put_record(1, "root/terminal-cleanup", &payload);
+        let record = journal.commit_put(record, &payload).unwrap();
+
+        let error = apply_record_with_tracked_cleanup(remote, journal, record)
+            .await
+            .expect_err("unsettled staging cleanup must fail the publication");
+        assert!(
+            is_terminal_remote_error(&error),
+            "the scheduler must terminalize the typed permanent cleanup error: {error:?}"
+        );
+        assert_eq!(
+            state.writes.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the retry wrapper must not replay the scheduler-owned publication"
+        );
+        assert!(
+            state.removes.load(std::sync::atomic::Ordering::SeqCst)
+                >= crate::sftp_object_store::SFTP_STAGING_CLEANUP_ATTEMPTS,
+            "the SFTP layer must settle its bounded inline cleanup attempts before returning"
+        );
+        let shutdown = pool.shutdown().await;
+        assert!(
+            shutdown.is_err(),
+            "unresolved cleanup debt must remain explicit at pool shutdown"
+        );
+        assert!(
+            state.removes.load(std::sync::atomic::Ordering::SeqCst)
+                > crate::sftp_object_store::SFTP_STAGING_CLEANUP_ATTEMPTS,
+            "pool shutdown must drain the final owner-scheduled cleanup"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_rename_source_delete_is_bounded_after_target_publication() {
+        let inner = Arc::new(InMemory::new());
+        let (fault, controls) = FaultStore::new(inner);
+        controls.block_deletes();
+        let delete_activity = controls.delete_activity();
+        let remote: Arc<dyn ObjectStore> = Arc::new(
+            crate::retrying_object_store::RetryingObjectStore::new(Arc::new(fault)),
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let journal = Arc::new(journal_with_local_records(temp.path(), 0));
+        let payload = Bytes::from_static(b"rename payload");
+        let mut record = put_record(1, "target", &payload);
+        let MutationKind::Put {
+            mode,
+            payload_len,
+            payload_sha256,
+            blob_path,
+            ..
+        } = record.kind.clone()
+        else {
+            unreachable!()
+        };
+        record.kind = MutationKind::Rename {
+            source: "source".to_owned(),
+            mode,
+            payload_len,
+            payload_sha256,
+            blob_path,
+        };
+        record.fence = FenceClass::Fence;
+        let record = journal.commit_put(record, &payload).unwrap();
+        let applying = tokio::spawn(apply_record_with_tracked_cleanup(
+            remote.clone(),
+            journal,
+            record,
+        ));
+        delete_activity.notified().await;
+
+        tokio::time::advance(REMOTE_OPERATION_TIMEOUT + Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+
+        let error = applying
+            .await
+            .unwrap()
+            .expect_err("a pending rename source delete must time out");
+        assert!(
+            error
+                .to_string()
+                .contains("rename source delete for sequence 1 timed out after 120.000s"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            remote
+                .get(&Path::from("target"))
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap(),
+            payload
         );
     }
 

@@ -16,8 +16,6 @@ use std::collections::HashSet;
 use std::fmt::{self, Display, Formatter};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-#[cfg(test)]
-use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tokio::sync::Notify;
 
@@ -39,6 +37,10 @@ pub struct FaultControls {
     puts: AtomicUsize,
     put_paths: StdMutex<Vec<String>>,
     block_puts: AtomicBool,
+    #[cfg(test)]
+    block_deletes: AtomicBool,
+    #[cfg(test)]
+    delete_activity: Arc<Notify>,
     released_put_paths: StdMutex<HashSet<String>>,
     active_puts: AtomicUsize,
     max_active_puts: AtomicUsize,
@@ -50,12 +52,6 @@ pub struct FaultControls {
     heads: AtomicUsize,
     #[cfg(test)]
     caller_owned_put_attempts: AtomicUsize,
-    #[cfg(test)]
-    put_delay_phases: AtomicUsize,
-    #[cfg(test)]
-    put_delay_millis: AtomicU64,
-    #[cfg(test)]
-    put_phase_started: Arc<Notify>,
     #[cfg(test)]
     head_activity: Arc<Notify>,
     #[cfg(test)]
@@ -93,6 +89,14 @@ impl FaultControls {
     pub(crate) fn block_puts(&self) {
         self.block_puts.store(true, Ordering::SeqCst);
     }
+    #[cfg(test)]
+    pub(crate) fn block_deletes(&self) {
+        self.block_deletes.store(true, Ordering::SeqCst);
+    }
+    #[cfg(test)]
+    pub(crate) fn delete_activity(&self) -> Arc<Notify> {
+        self.delete_activity.clone()
+    }
     pub(crate) fn release_puts(&self) {
         self.block_puts.store(false, Ordering::SeqCst);
         self.put_release.notify_waiters();
@@ -126,18 +130,6 @@ impl FaultControls {
     #[cfg(test)]
     pub(crate) fn caller_owned_put_attempt_count(&self) -> usize {
         self.caller_owned_put_attempts.load(Ordering::SeqCst)
-    }
-    #[cfg(test)]
-    pub(crate) fn delay_put_in_phases(&self, phases: usize, delay: std::time::Duration) {
-        self.put_delay_phases.store(phases, Ordering::SeqCst);
-        self.put_delay_millis.store(
-            u64::try_from(delay.as_millis()).expect("test PUT delay fits u64 milliseconds"),
-            Ordering::SeqCst,
-        );
-    }
-    #[cfg(test)]
-    pub(crate) fn put_phase_started(&self) -> Arc<Notify> {
-        self.put_phase_started.clone()
     }
     #[cfg(test)]
     fn head_activity(&self) -> Arc<Notify> {
@@ -225,14 +217,6 @@ impl ObjectStore for FaultStore {
                 .caller_owned_put_attempts
                 .fetch_add(1, Ordering::SeqCst);
         }
-        #[cfg(test)]
-        for _ in 0..self.ctl.put_delay_phases.load(Ordering::SeqCst) {
-            self.ctl.put_phase_started.notify_one();
-            tokio::time::sleep(std::time::Duration::from_millis(
-                self.ctl.put_delay_millis.load(Ordering::SeqCst),
-            ))
-            .await;
-        }
         if take_one(&self.ctl.fail_next_puts) {
             return Err(Self::transient("put"));
         }
@@ -318,6 +302,20 @@ impl ObjectStore for FaultStore {
         &self,
         locations: BoxStream<'static, object_store::Result<Path>>,
     ) -> BoxStream<'static, object_store::Result<Path>> {
+        #[cfg(test)]
+        if self.ctl.block_deletes.load(Ordering::SeqCst) {
+            let controls = self.ctl.clone();
+            return locations
+                .then(move |location| {
+                    let controls = controls.clone();
+                    async move {
+                        let _path = location?;
+                        controls.delete_activity.notify_one();
+                        std::future::pending::<object_store::Result<Path>>().await
+                    }
+                })
+                .boxed();
+        }
         // A write partition fails every delete fast (one yield per input, as the
         // provided `ObjectStoreExt::delete` and bulk callers expect).
         if self.ctl.partition_writes.load(Ordering::SeqCst) {
