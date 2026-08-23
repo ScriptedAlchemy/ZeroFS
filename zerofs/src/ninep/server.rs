@@ -316,8 +316,7 @@ mod tests {
     use crate::ninep::lock_manager::FileLock;
     use ninep_proto::{
         DekuBytes, GETATTR_ALL, LockType, P9String, Rclunk, Rflush, Rlopenat, Rread, Tattach,
-        Tclunk, Tflush, Tgetattr, Tlopenat, Tmkdir, Tversion, Twrite, VERSION_9P2000L,
-        VERSION_9P2000L_ZEROFS,
+        Tclunk, Tflush, Tgetattr, Tlopenat, Tmkdir, Tversion, Twrite, VERSION_9P2000L_ZEROFS,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
@@ -756,32 +755,43 @@ mod tests {
     async fn process_shutdown_cancels_dispatched_request_before_settlement_wait() {
         let filesystem = Arc::new(ZeroFS::new_in_memory().await.unwrap());
         let handler = Arc::new(NinePHandler::new(
-            filesystem,
+            Arc::clone(&filesystem),
             Arc::new(FileLockManager::new()),
         ));
+        establish_session(&handler, 1, b"root", 0, None).await;
+
         let accepted_work = P9AcceptedWorkTracker::new();
         let byte_limit = P9_MAX_MSIZE as usize * 2;
         let global = P9GlobalAdmission::for_test(byte_limit, 2);
         let admission = global.connection_with_accepted_work(accepted_work.clone());
         let requests = TaskTracker::new();
         let (tx, _rx) = mpsc::channel(1);
-        let shutdown = CancellationToken::new();
-        let (request_reached, release_request) = pause_success_terminal_dedup([0; 16]);
+        let connection_shutdown = CancellationToken::new();
+        let process_shutdown = CancellationToken::new();
+        let op_id = [0x92; 16];
+        let (request_reached, release_request) = pause_success_terminal_dedup(op_id);
+        let request = P9Message::new_with_op_id(
+            10,
+            op_id,
+            Message::Tmkdir(Tmkdir {
+                dfid: 1,
+                name: P9String::new(b"process-shutdown-first".to_vec()),
+                mode: 0o755,
+                gid: 0,
+            }),
+        )
+        .to_bytes_ctx(true)
+        .unwrap();
 
         dispatch_9p_frame(
-            frame(
-                1,
-                Message::Tversion(Tversion {
-                    msize: P9_MAX_MSIZE,
-                    version: P9String::new(VERSION_9P2000L.to_vec()),
-                }),
-            ),
+            Bytes::from(request),
             &handler,
             &tx,
             &InflightRegistry::default(),
             &admission,
             &requests,
-            &shutdown,
+            &connection_shutdown,
+            &process_shutdown,
         )
         .await
         .unwrap();
@@ -791,7 +801,7 @@ mod tests {
             .unwrap();
         assert_eq!(accepted_work.len(), 1);
 
-        shutdown.cancel();
+        process_shutdown.cancel();
         requests.close();
         let settlement = tokio::time::timeout(QUIET_TIMEOUT, requests.wait()).await;
         if settlement.is_err() {
@@ -806,6 +816,79 @@ mod tests {
             "process shutdown must cancel a dispatched request before waiting for its ownership token"
         );
         process_settlement.expect("process ownership must drain after request cancellation");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn connection_shutdown_retains_an_accepted_first_request() {
+        let filesystem = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let handler = Arc::new(NinePHandler::new(
+            filesystem,
+            Arc::new(FileLockManager::new()),
+        ));
+        establish_session(&handler, 1, b"root", 0, None).await;
+
+        let accepted_work = P9AcceptedWorkTracker::new();
+        let byte_limit = P9_MAX_MSIZE as usize * 2;
+        let global = P9GlobalAdmission::for_test(byte_limit, 2);
+        let admission = global.connection_with_accepted_work(accepted_work.clone());
+        let requests = TaskTracker::new();
+        let (tx, _rx) = mpsc::channel(1);
+        let connection_shutdown = CancellationToken::new();
+        let process_shutdown = CancellationToken::new();
+        let op_id = [0x91; 16];
+        let (request_reached, release_request) = pause_success_terminal_dedup(op_id);
+        let request = P9Message::new_with_op_id(
+            10,
+            op_id,
+            Message::Tmkdir(Tmkdir {
+                dfid: 1,
+                name: P9String::new(b"retained-first".to_vec()),
+                mode: 0o755,
+                gid: 0,
+            }),
+        )
+        .to_bytes_ctx(true)
+        .unwrap();
+
+        dispatch_9p_frame(
+            Bytes::from(request),
+            &handler,
+            &tx,
+            &InflightRegistry::default(),
+            &admission,
+            &requests,
+            &connection_shutdown,
+            &process_shutdown,
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(TEST_TIMEOUT, request_reached)
+            .await
+            .expect("accepted FIRST must reach its controlled pause")
+            .unwrap();
+        assert_eq!(accepted_work.len(), 1);
+
+        connection_shutdown.cancel();
+        requests.close();
+        let mut settlement = Box::pin(requests.wait());
+        let retained = tokio::time::timeout(QUIET_TIMEOUT, &mut settlement)
+            .await
+            .is_err();
+        if retained {
+            let _ = release_request.send(());
+            tokio::time::timeout(TEST_TIMEOUT, settlement)
+                .await
+                .expect("released accepted FIRST must settle");
+        }
+        accepted_work.stop_accepting();
+        tokio::time::timeout(TEST_TIMEOUT, accepted_work.wait())
+            .await
+            .expect("process ownership must drain after the FIRST completes");
+
+        assert!(
+            retained,
+            "connection shutdown must not cancel already-accepted FIRST work"
+        );
     }
 
     #[tokio::test]
@@ -909,6 +992,7 @@ mod tests {
             &admission,
             &requests,
             &CancellationToken::new(),
+            &CancellationToken::new(),
         )
         .await
         .unwrap();
@@ -967,6 +1051,7 @@ mod tests {
             &InflightRegistry::default(),
             &admission,
             &requests,
+            &CancellationToken::new(),
             &CancellationToken::new(),
         )
         .await
@@ -1221,6 +1306,7 @@ mod tests {
                 &self.inflight,
                 &self.admission,
                 &self.requests,
+                &CancellationToken::new(),
                 &CancellationToken::new(),
             )
             .await
@@ -1723,6 +1809,7 @@ mod tests {
             &admission,
             &requests,
             &CancellationToken::new(),
+            &CancellationToken::new(),
         )
         .await
         .unwrap();
@@ -1977,6 +2064,7 @@ mod tests {
             handler,
             server,
             tx,
+            CancellationToken::new(),
             CancellationToken::new(),
             &admission,
             &requests,

@@ -132,6 +132,7 @@ where
         read_stream,
         tx,
         connection_shutdown,
+        shutdown,
         &admission,
         &requests,
     )
@@ -350,7 +351,8 @@ pub(crate) async fn dispatch_9p_frame(
     inflight: &InflightRegistry,
     admission: &P9ConnectionAdmission,
     requests: &TaskTracker,
-    shutdown: &CancellationToken,
+    connection_shutdown: &CancellationToken,
+    process_shutdown: &CancellationToken,
 ) -> anyhow::Result<()> {
     if frame.len() < P9_MIN_MESSAGE_SIZE as usize {
         error!("Message too short: {} bytes", frame.len());
@@ -365,7 +367,11 @@ pub(crate) async fn dispatch_9p_frame(
     // before detaching request work. Bulk writes have a fixed-size Rwrite;
     // other requests retain the full negotiated-response allowance.
     let admission_permit = admission
-        .admit_request_or_shutdown(frame.len(), possible_response_bytes(type_byte), shutdown)
+        .admit_request_or_shutdown(
+            frame.len(),
+            possible_response_bytes(type_byte),
+            connection_shutdown,
+        )
         .await?;
     let accepted_work = admission
         .accepted_work
@@ -413,7 +419,7 @@ pub(crate) async fn dispatch_9p_frame(
 
     let handler = Arc::clone(handler);
     let tx = tx.clone();
-    let request_shutdown = shutdown.clone();
+    let request_shutdown = process_shutdown.clone();
 
     let request = async move {
         let _accepted_work = accepted_work;
@@ -518,7 +524,8 @@ pub(super) async fn handle_client_loop<R>(
     handler: Arc<NinePHandler>,
     mut read_stream: R,
     tx: mpsc::Sender<P9Response>,
-    shutdown: CancellationToken,
+    connection_shutdown: CancellationToken,
+    process_shutdown: CancellationToken,
     admission: &P9ConnectionAdmission,
     requests: &TaskTracker,
 ) -> anyhow::Result<()>
@@ -530,14 +537,21 @@ where
     loop {
         // Hold a maximum-frame receive credit before polling the transport.
         // The exact reader below never allocates a replacement decode buffer.
-        let receive = admission.global.admit_receive(&shutdown).await?;
-        let Some(full_buf) = read_9p_frame(&mut read_stream, &shutdown).await? else {
+        let receive = admission.global.admit_receive(&connection_shutdown).await?;
+        let Some(full_buf) = read_9p_frame(&mut read_stream, &connection_shutdown).await? else {
             debug!("Client disconnected");
             return Ok(());
         };
 
         dispatch_9p_frame(
-            full_buf, &handler, &tx, &inflight, admission, requests, &shutdown,
+            full_buf,
+            &handler,
+            &tx,
+            &inflight,
+            admission,
+            requests,
+            &connection_shutdown,
+            &process_shutdown,
         )
         .await?;
         drop(receive);
