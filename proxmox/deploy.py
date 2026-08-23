@@ -547,7 +547,7 @@ def shell_join(command: Sequence[str]) -> str:
 @dataclass(frozen=True)
 class _ActiveLockedPayload:
     token: str
-    pgid: int
+    pgid: int | None
     runtime_directory: str
 
 
@@ -568,6 +568,7 @@ class _FlockLease:
         )
         self.process: subprocess.Popen[str] | None = None
         self.holder_pid: int | None = None
+        self.runtime_root: str | None = None
         self._active_payloads: dict[str, _ActiveLockedPayload] = {}
 
     def __enter__(self) -> _FlockLease:
@@ -592,9 +593,11 @@ class _FlockLease:
             selector.close()
         if ready:
             fields = process.stdout.readline().strip().split(" ")
-            if fields[0] == "LOCKED" and len(fields) in (1, 2):
-                if len(fields) == 2:
+            if fields[0] == "LOCKED" and len(fields) in (1, 2, 3):
+                if len(fields) >= 2:
                     self.holder_pid = int(fields[1])
+                if len(fields) == 3:
+                    self.runtime_root = base64.b64decode(fields[2]).decode()
                 return self
         try:
             _stdout, stderr = process.communicate(timeout=2)
@@ -648,6 +651,16 @@ class _FlockLease:
         assert process.stdin is not None and process.stdout is not None
         token = hashlib.sha256(os.urandom(32)).hexdigest()
         payload = base64.b64encode(script.encode()).decode()
+        if self.runtime_root is not None:
+            runtime_directory = os.path.join(
+                self.runtime_root,
+                f"zerofs-lock-command-{token}",
+            )
+            self._active_payloads[token] = _ActiveLockedPayload(
+                token=token,
+                pgid=None,
+                runtime_directory=runtime_directory,
+            )
         process.stdin.write(f"RUN {token} {payload}\n")
         process.stdin.flush()
         result_marker = f"__ZEROFS_LOCK_RESULT__ {token} "
@@ -659,6 +672,8 @@ class _FlockLease:
                     raise RuntimeError("deployment lock lease was lost during command")
                 if line.startswith(started_marker):
                     self._record_started(token, line, started_marker)
+                    process.stdin.write(f"ACK {token}\n")
+                    process.stdin.flush()
                     continue
                 if line.startswith(result_marker):
                     self._active_payloads.pop(token, None)
@@ -687,6 +702,12 @@ class _FlockLease:
                 "deployment lock holder reported an invalid payload PGID"
             )
         runtime_directory = base64.b64decode(runtime_encoded).decode()
+        pending = self._active_payloads.get(token)
+        if (
+            pending is not None
+            and pending.runtime_directory != runtime_directory
+        ):
+            raise RuntimeError("deployment lock runtime ownership changed")
         self._active_payloads[token] = _ActiveLockedPayload(
             token=token,
             pgid=pgid,
@@ -925,39 +946,64 @@ def wait_while(predicate, timeout):
         time.sleep(0.05)
 
 
+def stop_holder(pid):
+    if pid and pid_is_live(pid):
+        try:
+            os.kill(pid, signal.SIGSTOP)
+        except ProcessLookupError:
+            pass
+
+
 def validate_payload(item):
     token = item["token"]
-    pgid = item["pgid"]
+    requested_pgid = item["pgid"]
     runtime = Path(item["runtime_directory"])
     if (
         len(token) != 64
         or any(character not in "0123456789abcdef" for character in token)
-        or not isinstance(pgid, int)
-        or pgid <= 1
+        or (
+            requested_pgid is not None
+            and (
+                not isinstance(requested_pgid, int)
+                or requested_pgid <= 1
+            )
+        )
     ):
         raise RuntimeError("invalid forced-cleanup payload identity")
-    expected_prefix = f"zerofs-lock-command-{token}-"
     temp_root = Path(tempfile.gettempdir()).resolve()
     if (
         not runtime.is_absolute()
         or runtime.parent.resolve() != temp_root
-        or not runtime.name.startswith(expected_prefix)
+        or runtime.name != f"zerofs-lock-command-{token}"
         or runtime.is_symlink()
     ):
         raise RuntimeError("unsafe forced-cleanup runtime directory")
+    marker_pgid = None
     if runtime.exists():
         owner = json.loads((runtime / "owner.json").read_text())
-        if owner != {"token": token, "pgid": pgid}:
+        if owner.get("token") != token:
             raise RuntimeError("forced-cleanup payload ownership changed")
-    elif process_group_exists(pgid):
+        marker_pgid = owner.get("pgid")
+        if marker_pgid is not None and (
+            not isinstance(marker_pgid, int) or marker_pgid <= 1
+        ):
+            raise RuntimeError("invalid forced-cleanup marker PGID")
+        if (
+            requested_pgid is not None
+            and marker_pgid is not None
+            and requested_pgid != marker_pgid
+        ):
+            raise RuntimeError("forced-cleanup payload PGID changed")
+    elif requested_pgid is not None and process_group_exists(requested_pgid):
         raise RuntimeError("payload runtime disappeared while its group survived")
-    return pgid, runtime
+    return requested_pgid or marker_pgid, runtime
 
 
 def terminate_payload_group(pgid):
     if process_group_exists(pgid):
         try:
             os.killpg(pgid, signal.SIGTERM)
+            os.killpg(pgid, signal.SIGCONT)
         except ProcessLookupError:
             pass
     wait_while(lambda: group_has_live_members(pgid), 2)
@@ -977,6 +1023,7 @@ def terminate_holder(pid):
     if pid_is_live(pid):
         try:
             os.kill(pid, signal.SIGTERM)
+            os.kill(pid, signal.SIGCONT)
         except ProcessLookupError:
             return
     wait_while(lambda: pid_is_live(pid), 2)
@@ -993,14 +1040,18 @@ def terminate_holder(pid):
 def main():
     holder_pid = int(sys.argv[1]) if sys.argv[1] != "-" else None
     payloads = json.loads(base64.b64decode(sys.argv[2]))
+    stop_holder(holder_pid)
     validated = [validate_payload(item) for item in payloads]
     for pgid, _runtime in validated:
-        terminate_payload_group(pgid)
+        if pgid is not None:
+            terminate_payload_group(pgid)
     for _pgid, runtime in validated:
         if runtime.exists():
             shutil.rmtree(runtime)
     terminate_holder(holder_pid)
     for pgid, _runtime in validated:
+        if pgid is None:
+            continue
         wait_while(lambda pgid=pgid: process_group_exists(pgid), 2)
         if process_group_exists(pgid):
             raise RuntimeError(f"payload process group {pgid} was not reaped")
@@ -1022,12 +1073,32 @@ import fcntl
 import json
 import os
 import selectors
+import shutil
 import signal
 import subprocess
 import sys
 import tempfile
 import time
 from pathlib import Path
+
+
+PAYLOAD_LAUNCHER = """
+import ctypes
+import os
+import signal
+import sys
+
+expected_parent = int(sys.argv[1])
+libc = ctypes.CDLL(None, use_errno=True)
+if libc.prctl(1, signal.SIGKILL, 0, 0, 0) != 0:
+    raise OSError(ctypes.get_errno(), "prctl(PR_SET_PDEATHSIG) failed")
+if os.getppid() != expected_parent:
+    raise SystemExit(125)
+os.kill(os.getpid(), signal.SIGSTOP)
+if os.getppid() != expected_parent:
+    raise SystemExit(125)
+os.execvp("bash", ["bash", "-se"])
+"""
 
 
 def process_group_exists(pgid):
@@ -1038,11 +1109,20 @@ def process_group_exists(pgid):
     return True
 
 
+def process_state(pid):
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    return stat[stat.rfind(")") + 2:].split()[0]
+
+
 def terminate_payload(process):
     pgid = process.pid
     if process_group_exists(pgid):
         try:
             os.killpg(pgid, signal.SIGTERM)
+            os.killpg(pgid, signal.SIGCONT)
         except ProcessLookupError:
             pass
     deadline = time.monotonic() + 2
@@ -1061,6 +1141,33 @@ def terminate_payload(process):
         except ProcessLookupError:
             pass
         process.wait(timeout=2)
+
+
+def write_owner(directory, token, pgid):
+    owner_path = Path(directory, "owner.json")
+    temporary_path = Path(directory, "owner.json.tmp")
+    with temporary_path.open("w") as handle:
+        json.dump({"token": token, "pgid": pgid}, handle, separators=(",", ":"))
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary_path, owner_path)
+    descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def wait_for_payload_stop(process):
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        state = process_state(process.pid)
+        if state in ("T", "t"):
+            return
+        if state is None or process.poll() is not None:
+            raise RuntimeError("payload launcher exited before ownership handshake")
+        time.sleep(0.01)
+    raise RuntimeError("payload launcher did not stop for ownership handshake")
 
 
 def stop_holder(signum, _frame):
@@ -1084,8 +1191,11 @@ def main():
         fcntl.flock(lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         raise SystemExit(75)
-    print(f"LOCKED {os.getpid()}", flush=True)
+    runtime_root = tempfile.gettempdir()
+    encoded_root = base64.b64encode(runtime_root.encode()).decode()
+    print(f"LOCKED {os.getpid()} {encoded_root}", flush=True)
     active = None
+    directory = None
     try:
         while True:
             request = sys.stdin.readline()
@@ -1097,58 +1207,80 @@ def main():
             if action != "RUN" or not token or not payload:
                 raise RuntimeError("invalid deployment lock request")
             script = base64.b64decode(payload)
-            with tempfile.TemporaryDirectory(
-                prefix=f"zerofs-lock-command-{token}-"
-            ) as directory:
+            directory = os.path.join(
+                runtime_root,
+                f"zerofs-lock-command-{token}",
+            )
+            os.mkdir(directory, mode=0o700)
+            try:
+                write_owner(directory, token, None)
                 stdout_path = os.path.join(directory, "stdout")
                 stderr_path = os.path.join(directory, "stderr")
                 script_path = os.path.join(directory, "script")
                 with open(script_path, "wb") as handle:
                     handle.write(script)
+                    handle.flush()
+                    os.fsync(handle.fileno())
                 with (
                     open(script_path, "rb") as stdin_handle,
                     open(stdout_path, "wb") as stdout_handle,
                     open(stderr_path, "wb") as stderr_handle,
                 ):
                     active = subprocess.Popen(
-                        ["bash", "-se"],
+                        [
+                            sys.executable,
+                            "-c",
+                            PAYLOAD_LAUNCHER,
+                            str(os.getpid()),
+                        ],
                         stdin=stdin_handle,
                         stdout=stdout_handle,
                         stderr=stderr_handle,
                         start_new_session=True,
                         close_fds=True,
                     )
-                Path(directory, "owner.json").write_text(
-                    json.dumps(
-                        {"token": token, "pgid": active.pid},
-                        separators=(",", ":"),
-                    )
-                )
+                wait_for_payload_stop(active)
+                write_owner(directory, token, active.pid)
                 runtime = base64.b64encode(directory.encode()).decode()
                 print(
                     f"__ZEROFS_LOCK_STARTED__ {token} {active.pid} {runtime}",
                     flush=True,
                 )
+                control = sys.stdin.readline()
+                if not control:
+                    terminate_payload(active)
+                    active = None
+                    return
+                fields = control.rstrip("\n").split(" ", 2)
+                cancelled = fields[:2] == ["CANCEL", token]
+                if fields[:2] == ["ACK", token]:
+                    os.killpg(active.pid, signal.SIGCONT)
+                elif cancelled:
+                    terminate_payload(active)
+                else:
+                    raise RuntimeError("invalid deployment lock start response")
                 selector = selectors.DefaultSelector()
                 selector.register(sys.stdin, selectors.EVENT_READ)
-                cancelled = False
                 try:
-                    while active.poll() is None:
-                        if not selector.select(timeout=0.1):
-                            continue
-                        control = sys.stdin.readline()
-                        if not control:
-                            terminate_payload(active)
-                            active = None
-                            return
-                        fields = control.rstrip("\n").split(" ", 2)
-                        if fields[:2] == ["CANCEL", token]:
-                            terminate_payload(active)
-                            cancelled = True
-                            break
+                    if cancelled:
+                        status = 130
+                    else:
+                        while active.poll() is None:
+                            if not selector.select(timeout=0.1):
+                                continue
+                            control = sys.stdin.readline()
+                            if not control:
+                                terminate_payload(active)
+                                active = None
+                                return
+                            fields = control.rstrip("\n").split(" ", 2)
+                            if fields[:2] == ["CANCEL", token]:
+                                terminate_payload(active)
+                                cancelled = True
+                                break
+                        status = 130 if cancelled else active.wait()
                 finally:
                     selector.close()
-                status = 130 if cancelled else active.wait()
                 active = None
                 emit_result(
                     token,
@@ -1156,9 +1288,17 @@ def main():
                     Path(stdout_path),
                     Path(stderr_path),
                 )
+            finally:
+                if active is not None:
+                    terminate_payload(active)
+                    active = None
+                shutil.rmtree(directory, ignore_errors=True)
+                directory = None
     finally:
         if active is not None:
             terminate_payload(active)
+        if directory is not None:
+            shutil.rmtree(directory, ignore_errors=True)
         lock_handle.close()
 
 

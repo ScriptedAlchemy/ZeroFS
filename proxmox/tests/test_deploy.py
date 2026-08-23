@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import contextlib
 import fcntl
 import hashlib
@@ -7,6 +8,7 @@ import importlib.util
 import io
 import os
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -1664,6 +1666,135 @@ while True:
                 for stream in (lease.process.stdout, lease.process.stderr):
                     if stream is not None:
                         stream.close()
+
+    def test_holder_death_before_start_ack_never_executes_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            directory_path = Path(directory)
+            lock = directory_path / "coordinator.lock"
+            mutation = directory_path / "payload-executed"
+            token = "b" * 64
+            payload_source = f'''from pathlib import Path
+import os
+import signal
+import time
+Path({str(mutation)!r}).write_text(str(os.getpid()))
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+while True:
+    time.sleep(1)
+'''
+            payload = base64.b64encode(
+                ("exec python3 -c " + shlex.quote(payload_source)).encode()
+            ).decode()
+            holder = subprocess.Popen(
+                [
+                    "env",
+                    f"TMPDIR={directory}",
+                    "bash",
+                    "-c",
+                    deploy._remote_lock_holder(str(lock)),
+                ],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+            )
+            assert holder.stdin is not None
+            assert holder.stdout is not None
+            assert holder.stderr is not None
+            child_pid = None
+            runtime_directory = None
+            try:
+                self.assertTrue(holder.stdout.readline().startswith("LOCKED"))
+                holder.stdin.write(f"RUN {token} {payload}\n")
+                holder.stdin.flush()
+                deadline = time.monotonic() + 5
+                children_path = Path(
+                    f"/proc/{holder.pid}/task/{holder.pid}/children"
+                )
+                while time.monotonic() < deadline:
+                    try:
+                        children = children_path.read_text().split()
+                    except FileNotFoundError:
+                        children = []
+                    if children:
+                        child_pid = int(children[0])
+                        break
+                    time.sleep(0.005)
+                self.assertIsNotNone(child_pid, "holder did not create a child")
+
+                os.killpg(holder.pid, signal.SIGKILL)
+                holder.wait(timeout=3)
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline:
+                    try:
+                        os.kill(child_pid, 0)
+                    except ProcessLookupError:
+                        break
+                    time.sleep(0.02)
+                try:
+                    os.kill(child_pid, 0)
+                except ProcessLookupError:
+                    child_survived = False
+                else:
+                    child_survived = True
+                payload_executed = mutation.exists()
+                runtime_directory = directory_path / (
+                    f"zerofs-lock-command-{token}"
+                )
+                self.assertTrue(runtime_directory.exists())
+                active = deploy._ActiveLockedPayload(
+                    token=token,
+                    pgid=child_pid,
+                    runtime_directory=str(runtime_directory),
+                )
+                cleanup = subprocess.run(
+                    [
+                        "env",
+                        f"TMPDIR={directory}",
+                        "bash",
+                        "-c",
+                        deploy._remote_lock_cleanup(None, (active,)),
+                    ],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    timeout=15,
+                )
+                self.assertEqual(cleanup.returncode, 0, cleanup.stderr)
+                self.assertFalse(runtime_directory.exists())
+                self.assertFalse(
+                    child_survived,
+                    "child survived holder death before start acknowledgment",
+                )
+                self.assertFalse(
+                    payload_executed,
+                    "payload executed before the start acknowledgment",
+                )
+                handle = lock.open("w")
+                try:
+                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                finally:
+                    handle.close()
+            finally:
+                for pid in (child_pid, holder.pid):
+                    if pid is None:
+                        continue
+                    try:
+                        os.killpg(pid, signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError):
+                        try:
+                            os.kill(pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                if holder.poll() is None:
+                    holder.kill()
+                    holder.wait(timeout=2)
+                holder.stdin.close()
+                holder.stdout.close()
+                holder.stderr.close()
+                if runtime_directory is not None and runtime_directory.exists():
+                    shutil.rmtree(runtime_directory)
 
     def test_second_interrupt_performs_bounded_payload_and_holder_cleanup(self) -> None:
         script = """
