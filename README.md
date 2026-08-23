@@ -202,6 +202,8 @@ supports x86-64 and little-endian arm64. See the
 - **[Jepsen HA](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml)**: a Connected leader/standby pair over MinIO under a nemesis that kills or pauses nodes; no acknowledged write may be lost, resurrected, or corrupted across the tested failovers. The local-fs model checker also runs with failovers injected.
 - **[Deterministic simulation](https://github.com/Barre/ZeroFS/actions/workflows/rust.yml)**: data, namespace, segment-GC, and compaction paths run in a simulated world ([`zerofs/tests/dst`](https://github.com/Barre/ZeroFS/tree/main/zerofs/tests/dst)): virtual time, seeded storage latencies and transient faults, and crashes at arbitrary await points or narrow failpoint windows. Recovery is checked against byte-level and namespace reference models, a full metadata consistency scan, segment-accounting reconciliation, and an authoritative footprint scan. One seed is one exact schedule, so a failure reproduces identically.
 
+Maintainers can use `scripts/vm100-pilot.py profile` to temporarily install a feature-gated diagnostic binary and retain function, future, SFTP protocol I/O, and thread evidence after the canonical deployment is restored. Normal builds and deploys contain no Hotpath instrumentation. Profile I/O bytes include SFTP framing and metadata, while its throughput is based on summed sampled operation time; neither is product, link, durability, cancellation-safe, or end-to-end benchmark evidence.
+
 ## Web UI
 
 ```toml

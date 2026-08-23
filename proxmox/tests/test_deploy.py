@@ -29,6 +29,17 @@ sys.modules[SPEC.name] = deploy
 SPEC.loader.exec_module(deploy)
 
 
+SAFE_HOTPATH_PROFILE_ENV = {
+    "HOTPATH_OUTPUT_PATH": "/srv/zerofs-persist/state/hotpath.json",
+    "HOTPATH_OUTPUT_FORMAT": "json",
+    "HOTPATH_METRICS_SERVER_OFF": "false",
+    "HOTPATH_METRICS_PORT": "9477",
+    "HOTPATH_CPU_BASELINE_OFF": "true",
+    "HOTPATH_REPORT": "functions-timing,futures,io,threads",
+    "HOTPATH_IO_TIME_SAMPLING_RATE": "1",
+}
+
+
 class MetricsTests(unittest.TestCase):
     def test_drain_requires_volatile_and_writeback_tiers_to_be_clean(self) -> None:
         clean = """
@@ -2557,10 +2568,22 @@ class CliDryRunTests(ConfigValidationTests):
     def test_prod_hotpath_profile_builds_optimized_instrumented_release(
         self,
     ) -> None:
+        self.assertEqual(
+            deploy.HOTPATH_PROFILE_ENV,
+            {
+                "HOTPATH_OUTPUT_PATH": "/srv/zerofs-persist/state/hotpath.json",
+                "HOTPATH_OUTPUT_FORMAT": "json",
+                "HOTPATH_METRICS_SERVER_OFF": "false",
+                "HOTPATH_METRICS_PORT": "9477",
+                "HOTPATH_CPU_BASELINE_OFF": "true",
+                "HOTPATH_REPORT": "functions-timing,futures,io,threads",
+                "HOTPATH_IO_TIME_SAMPLING_RATE": "1",
+            },
+        )
         env_file = self.write_config(
             "\n".join(
                 f"{key}={value}"
-                for key, value in deploy.HOTPATH_PROFILE_ENV.items()
+                for key, value in SAFE_HOTPATH_PROFILE_ENV.items()
             )
             + "\n"
         )
@@ -2602,6 +2625,31 @@ class CliDryRunTests(ConfigValidationTests):
             ),
         )
 
+    def test_hotpath_profile_validator_requires_the_exact_io_contract(self) -> None:
+        valid = self.write_config(
+            "\n".join(
+                f"{key}={value}"
+                for key, value in SAFE_HOTPATH_PROFILE_ENV.items()
+            )
+            + "\n"
+        )
+        try:
+            deploy.validate_hotpath_profile_env(valid)
+        except ValueError as error:
+            self.fail(f"exact Hotpath I/O contract was rejected: {error}")
+
+        invalid_sampling = self.write_config(
+            "\n".join(
+                f"{key}={'0' if key == 'HOTPATH_IO_TIME_SAMPLING_RATE' else value}"
+                for key, value in SAFE_HOTPATH_PROFILE_ENV.items()
+            )
+            + "\n"
+        )
+        with self.assertRaisesRegex(
+            ValueError, "HOTPATH_IO_TIME_SAMPLING_RATE"
+        ):
+            deploy.validate_hotpath_profile_env(invalid_sampling)
+
     def test_hotpath_profile_fails_closed_without_safe_prod_environment(
         self,
     ) -> None:
@@ -2634,7 +2682,7 @@ class CliDryRunTests(ConfigValidationTests):
         unsafe_env = self.write_config(
             "\n".join(
                 f"{key}={'false' if key == 'HOTPATH_CPU_BASELINE_OFF' else value}"
-                for key, value in deploy.HOTPATH_PROFILE_ENV.items()
+                for key, value in SAFE_HOTPATH_PROFILE_ENV.items()
             )
             + "\n"
         )
@@ -2665,7 +2713,7 @@ class CliDryRunTests(ConfigValidationTests):
 
         valid_lines = [
             f"{key}={value}"
-            for key, value in deploy.HOTPATH_PROFILE_ENV.items()
+            for key, value in SAFE_HOTPATH_PROFILE_ENV.items()
         ]
         invalid_environments = {
             "export": "\n".join(f"export {line}" for line in valid_lines),

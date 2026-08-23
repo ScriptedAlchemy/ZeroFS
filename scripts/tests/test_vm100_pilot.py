@@ -87,14 +87,72 @@ from scripts.vm100_pilot.workloads import WorkloadRunner
 import scripts.vm100_pilot.profile as profile_module
 
 
-_VALID_HOTPATH_REPORT = json.dumps(
-    {
-        "type": "hotpath_report",
-        "functions_timing": {},
-        "futures": {},
-        "threads": {},
-    }
-) + "\n"
+_VALID_HOTPATH_REPORT_PAYLOAD = {
+    "type": "hotpath_report",
+    "functions_timing": {},
+    "futures": {},
+    "io": {
+        "current_elapsed_ns": 10_000,
+        "percentiles": [95.0],
+        "data": [
+            {
+                "id": 1,
+                "source": "zerofs/src/sftp_protocol.rs:1",
+                "label": "zerofs.sftp.protocol",
+                "has_custom_label": True,
+                "type_name": "BoundedSftpStream",
+                "read": {
+                    "count": 2,
+                    "sampled_count": 2,
+                    "bytes": 4096,
+                    "sampled_bytes": 4096,
+                    "errors": 0,
+                    "avg": "500ns",
+                    "throughput": "3.81 GiB/s",
+                    "total_ns": 1000,
+                    "percentiles": {"p95": "600ns"},
+                },
+                "write": {
+                    "count": 1,
+                    "sampled_count": 1,
+                    "bytes": 2048,
+                    "sampled_bytes": 2048,
+                    "errors": 0,
+                    "avg": "1us",
+                    "throughput": "1.91 GiB/s",
+                    "total_ns": 1000,
+                    "percentiles": {"p95": "1us"},
+                },
+                "flush": {
+                    "count": 0,
+                    "sampled_count": 0,
+                    "bytes": 0,
+                    "sampled_bytes": 0,
+                    "errors": 0,
+                    "avg": "-",
+                    "throughput": None,
+                    "total_ns": 0,
+                    "percentiles": {},
+                },
+                "shutdown": {
+                    "count": 0,
+                    "sampled_count": 0,
+                    "bytes": 0,
+                    "sampled_bytes": 0,
+                    "errors": 0,
+                    "avg": "-",
+                    "throughput": None,
+                    "total_ns": 0,
+                    "percentiles": {},
+                },
+                "instances": 1,
+                "iter": 0,
+            }
+        ],
+    },
+    "threads": {},
+}
+_VALID_HOTPATH_REPORT = json.dumps(_VALID_HOTPATH_REPORT_PAYLOAD) + "\n"
 
 
 class FakeRunner(Runner):
@@ -2963,8 +3021,9 @@ class ProfileTests(unittest.TestCase):
                 "HOTPATH_OUTPUT_PATH": str(report),
                 "HOTPATH_OUTPUT_FORMAT": "json",
                 "HOTPATH_METRICS_SERVER_OFF": "false",
-                "HOTPATH_REPORT": "functions-timing,futures,threads",
+                "HOTPATH_REPORT": "functions-timing,futures,io,threads",
                 "HOTPATH_CPU_BASELINE_OFF": "true",
+                "HOTPATH_IO_TIME_SAMPLING_RATE": "1",
             },
         )
         self.assertTrue(environment["HOTPATH_METRICS_PORT"].isdigit())
@@ -2990,24 +3049,14 @@ class ProfileTests(unittest.TestCase):
                 ("", "missing or empty"),
                 ("not-json", "invalid JSON"),
                 (
-                    json.dumps(
-                        {
-                            "type": "hotpath_report",
-                            "functions_timing": {},
-                            "futures": {},
-                            "threads": {},
-                            "streams": {},
-                        }
-                    ),
+                    json.dumps({**_VALID_HOTPATH_REPORT_PAYLOAD, "streams": {}}),
                     "forbidden sections",
                 ),
                 (
                     json.dumps(
                         {
-                            "type": "hotpath_report",
+                            **_VALID_HOTPATH_REPORT_PAYLOAD,
                             "functions_timing": [],
-                            "futures": {},
-                            "threads": {},
                         }
                     ),
                     "required sections",
@@ -3033,6 +3082,48 @@ class ProfileTests(unittest.TestCase):
                 self.assertEqual(self.config_file.read_bytes(), self.original_config)
                 self.assertEqual(self.binary.read_bytes(), b"canonical-binary")
                 self.assertGreaterEqual(lifecycle.start_calls, 2)
+
+    def test_profile_fails_closed_for_invalid_hotpath_io_evidence(self) -> None:
+        invalid_reports: dict[str, dict[str, object]] = {}
+
+        missing = json.loads(json.dumps(_VALID_HOTPATH_REPORT_PAYLOAD))
+        missing.pop("io")
+        invalid_reports["missing"] = missing
+
+        non_object = json.loads(json.dumps(_VALID_HOTPATH_REPORT_PAYLOAD))
+        non_object["io"] = []
+        invalid_reports["non_object"] = non_object
+
+        empty = json.loads(json.dumps(_VALID_HOTPATH_REPORT_PAYLOAD))
+        empty["io"]["data"] = []
+        invalid_reports["empty"] = empty
+
+        wrong_label = json.loads(json.dumps(_VALID_HOTPATH_REPORT_PAYLOAD))
+        wrong_label["io"]["data"][0]["label"] = "another.resource"
+        invalid_reports["wrong_label"] = wrong_label
+
+        for name, field, value in (
+            ("boolean", "bytes", True),
+            ("negative", "bytes", -1),
+            ("non_integer", "bytes", 1.5),
+            ("sampled_count", "sampled_count", 3),
+            ("sampled_bytes", "sampled_bytes", 4097),
+            ("zero_duration", "total_ns", 0),
+        ):
+            payload = json.loads(json.dumps(_VALID_HOTPATH_REPORT_PAYLOAD))
+            payload["io"]["data"][0]["read"][field] = value
+            invalid_reports[name] = payload
+
+        no_throughput = json.loads(json.dumps(_VALID_HOTPATH_REPORT_PAYLOAD))
+        no_throughput["io"]["data"][0]["read"]["throughput"] = None
+        invalid_reports["no_throughput"] = no_throughput
+
+        for name, payload in invalid_reports.items():
+            with self.subTest(name=name):
+                report = Path(self.temp.name) / f"invalid-hotpath-io-{name}.json"
+                report.write_text(json.dumps(payload))
+                with self.assertRaisesRegex(RuntimeError, "Hotpath I/O"):
+                    profile_module._require_hotpath_report(report)
 
     def test_profile_fails_closed_for_missing_or_invalid_hotpath_runtime(self) -> None:
         for index, payload in enumerate(

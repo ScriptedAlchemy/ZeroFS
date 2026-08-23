@@ -19,6 +19,7 @@ fn main() -> Result<()> {
         .sections(vec![
             hotpath::Section::FunctionsTiming,
             hotpath::Section::Futures,
+            hotpath::Section::Io,
             hotpath::Section::Threads,
         ])
         .build();

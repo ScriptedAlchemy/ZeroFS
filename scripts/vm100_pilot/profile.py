@@ -36,6 +36,7 @@ _UNSAFE_SYSTEMD_ENVIRONMENT_PATH = re.compile(r'["\\\r\n%]')
 _HOTPATH_RUNTIME_ATTEMPTS = 5
 _HOTPATH_RUNTIME_TIMEOUT = 1.0
 _HOTPATH_RUNTIME_MAX_BYTES = 1 << 20
+_HOTPATH_IO_LABEL = "zerofs.sftp.protocol"
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -467,7 +468,8 @@ class _TemporaryHotpathEnvironment:
             'Environment="HOTPATH_METRICS_SERVER_OFF=false"\n'
             f'Environment="HOTPATH_METRICS_PORT={self.metrics_port}"\n'
             'Environment="HOTPATH_CPU_BASELINE_OFF=true"\n'
-            'Environment="HOTPATH_REPORT=functions-timing,futures,threads"\n'
+            'Environment="HOTPATH_REPORT=functions-timing,futures,io,threads"\n'
+            'Environment="HOTPATH_IO_TIME_SAMPLING_RATE=1"\n'
         )
         temporary: Path | None = None
         handle = tempfile.NamedTemporaryFile(
@@ -536,6 +538,125 @@ class _TemporaryHotpathEnvironment:
             )
 
 
+def _require_hotpath_io(payload: dict[str, object], path: Path) -> None:
+    io = payload.get("io")
+    if not isinstance(io, dict) or set(io) != {
+        "current_elapsed_ns",
+        "percentiles",
+        "data",
+    }:
+        raise RuntimeError(f"Hotpath I/O section is invalid: {path}")
+
+    elapsed = io.get("current_elapsed_ns")
+    percentiles = io.get("percentiles")
+    data = io.get("data")
+    if (
+        not isinstance(elapsed, int)
+        or isinstance(elapsed, bool)
+        or elapsed <= 0
+        or not isinstance(percentiles, list)
+        or not percentiles
+        or any(
+            not isinstance(percentile, (int, float))
+            or isinstance(percentile, bool)
+            or percentile < 0
+            or percentile > 100
+            for percentile in percentiles
+        )
+        or not isinstance(data, list)
+    ):
+        raise RuntimeError(f"Hotpath I/O section is invalid: {path}")
+
+    matching = [
+        entry
+        for entry in data
+        if isinstance(entry, dict) and entry.get("label") == _HOTPATH_IO_LABEL
+    ]
+    if len(matching) != 1 or len(data) != 1:
+        raise RuntimeError(f"Hotpath I/O protocol entry is missing or ambiguous: {path}")
+    entry = matching[0]
+    expected_entry_keys = {
+        "id",
+        "source",
+        "label",
+        "has_custom_label",
+        "type_name",
+        "read",
+        "write",
+        "flush",
+        "shutdown",
+        "instances",
+        "iter",
+    }
+    if (
+        set(entry) != expected_entry_keys
+        or not isinstance(entry.get("id"), int)
+        or isinstance(entry.get("id"), bool)
+        or entry["id"] <= 0
+        or not isinstance(entry.get("source"), str)
+        or not entry["source"]
+        or entry.get("has_custom_label") is not True
+        or not isinstance(entry.get("type_name"), str)
+        or not entry["type_name"]
+        or not isinstance(entry.get("instances"), int)
+        or isinstance(entry.get("instances"), bool)
+        or entry["instances"] <= 0
+        or entry.get("iter") != 0
+    ):
+        raise RuntimeError(f"Hotpath I/O protocol entry is invalid: {path}")
+
+    expected_operation_keys = {
+        "count",
+        "sampled_count",
+        "bytes",
+        "sampled_bytes",
+        "errors",
+        "avg",
+        "throughput",
+        "total_ns",
+        "percentiles",
+    }
+    for direction in ("read", "write", "flush", "shutdown"):
+        operation = entry.get(direction)
+        if not isinstance(operation, dict) or set(operation) != expected_operation_keys:
+            raise RuntimeError(f"Hotpath I/O {direction} evidence is invalid: {path}")
+        numeric: dict[str, int] = {}
+        for field in (
+            "count",
+            "sampled_count",
+            "bytes",
+            "sampled_bytes",
+            "errors",
+            "total_ns",
+        ):
+            value = operation.get(field)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise RuntimeError(
+                    f"Hotpath I/O {direction} field is invalid: {field}: {path}"
+                )
+            numeric[field] = value
+        throughput = operation.get("throughput")
+        if (
+            numeric["sampled_count"] != numeric["count"]
+            or numeric["sampled_bytes"] != numeric["bytes"]
+            or (numeric["sampled_count"] == 0) != (numeric["total_ns"] == 0)
+            or not isinstance(operation.get("avg"), str)
+            or not isinstance(operation.get("percentiles"), dict)
+            or (
+                numeric["sampled_bytes"] > 0
+                and numeric["total_ns"] > 0
+                and (not isinstance(throughput, str) or not throughput)
+            )
+        ):
+            raise RuntimeError(f"Hotpath I/O {direction} evidence is invalid: {path}")
+        if direction in {"read", "write"} and (
+            numeric["count"] == 0
+            or numeric["bytes"] == 0
+            or numeric["total_ns"] == 0
+        ):
+            raise RuntimeError(f"Hotpath I/O {direction} evidence is empty: {path}")
+
+
 def _require_hotpath_report(path: Path) -> dict[str, object]:
     if not path.is_file() or path.stat().st_size == 0:
         raise RuntimeError(f"Hotpath report is missing or empty: {path}")
@@ -548,12 +669,14 @@ def _require_hotpath_report(path: Path) -> dict[str, object]:
     required = {"functions_timing", "futures", "threads"}
     if any(not isinstance(payload.get(key), dict) for key in required):
         raise RuntimeError(f"Hotpath report omits required sections: {path}")
+    _require_hotpath_io(payload, path)
     allowed = {
         "type",
         "label",
         "time_sampling",
         "functions_timing",
         "futures",
+        "io",
         "threads",
     }
     if not set(payload).issubset(allowed):

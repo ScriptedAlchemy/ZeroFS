@@ -13,6 +13,10 @@
 - `zerofs/src/fs/store/extent/perf_harness.rs` contains in-process cumulative pipeline benchmarking. It is not a deployed remote-backend acceptance test.
 - `docs/vm100-benchmark-methodology.md` is the benchmark evidence and safety contract. The detailed historical rollout targets are under `docs/superpowers/specs/` and `docs/superpowers/plans/`.
 
+## VM100 Hotpath I/O receipt
+
+`scripts/vm100-pilot.py profile` may retain a feature-gated `hotpath.json` diagnostic receipt after it restores the canonical deployment. Its `zerofs.sftp.protocol` I/O row measures completed operations on the wrapped SFTP protocol stream. Byte totals include SFTP framing and metadata, and Hotpath throughput is sampled bytes divided by summed sampled operation time. It is not logical file payload, TCP link, device, durability, cancellation-safe, or benchmark evidence. Use the function/future labels for request wall latency and the VM100 benchmark receipts for end-to-end rates. Ordinary builds and deploys do not enable `hotpath-profile`.
+
 ## Direct SFTP/writeback benchmark
 
 Run the real benchmark on Linux, normally `ubuntu-main`; do not run it on macOS. It is ignored by default and uses the configured SFTP transport and writeback concurrency. It creates one UUID-scoped child under the configured SFTP prefix, verifies every payload, deletes every object, removes the owned remote directories, shuts down its pool, and removes its local temporary journal.

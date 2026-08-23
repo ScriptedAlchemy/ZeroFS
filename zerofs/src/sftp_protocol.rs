@@ -376,6 +376,8 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let bounded = BoundedSftpStream::new(stream, RUSSH_SFTP_MAX_PACKET_LEN);
+    #[cfg(feature = "hotpath-profile")]
+    let bounded = hotpath::io!(bounded, label = "zerofs.sftp.protocol");
     let mut raw = RawSftpSession::new_with_config(bounded, russh_sftp_config());
     let version = raw
         .init()
