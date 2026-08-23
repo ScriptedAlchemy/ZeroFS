@@ -2129,7 +2129,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scheduler_terminalizes_unsettled_sftp_staging_cleanup_without_retry() {
+    async fn scheduler_classifier_terminalizes_unsettled_sftp_cleanup_without_wrapper_retry() {
         let state = Arc::new(CleanupDebtTransportState::default());
         let pool = crate::sftp_transport::SftpSessionPool::new_writable(
             Arc::new(CleanupDebtFactory(state.clone())),

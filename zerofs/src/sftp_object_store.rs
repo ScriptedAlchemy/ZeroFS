@@ -237,6 +237,10 @@ pub struct PublicationOutcome {
 
 type TargetLock = AsyncMutex<()>;
 
+// Path-only scope deliberately fails safe across independently constructed
+// pools that may address the same backend namespace. It can over-serialize
+// unrelated backends with identical paths; a future narrower key must carry a
+// canonical endpoint-and-prefix identity, never an in-process pool pointer.
 static TARGET_LOCKS: LazyLock<StdMutex<HashMap<PathBuf, Weak<TargetLock>>>> =
     LazyLock::new(|| StdMutex::new(HashMap::new()));
 
