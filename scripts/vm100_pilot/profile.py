@@ -29,6 +29,7 @@ _GC_CADENCE_KEYS = (
 )
 _SYSTEMD_RUNTIME_DIR = Path("/run/systemd/system")
 _SYSTEMD_SERVICE_NAME = re.compile(r"[A-Za-z0-9_.@:-]+\.service\Z")
+_UNSAFE_SYSTEMD_ENVIRONMENT_PATH = re.compile(r'["\\\r\n%]')
 
 
 @dataclass(slots=True)
@@ -387,7 +388,11 @@ class _TemporaryHotpathEnvironment:
     def __init__(self, config: PilotConfig, runner: Runner, report: Path) -> None:
         if _SYSTEMD_SERVICE_NAME.fullmatch(config.service) is None:
             raise ValueError(f"unsafe systemd service name: {config.service!r}")
-        if not report.is_absolute() or report.name != "hotpath.json":
+        if (
+            not report.is_absolute()
+            or report.name != "hotpath.json"
+            or _UNSAFE_SYSTEMD_ENVIRONMENT_PATH.search(str(report)) is not None
+        ):
             raise ValueError(f"unsafe Hotpath report path: {report}")
         self.config = config
         self.runner = runner
@@ -395,7 +400,7 @@ class _TemporaryHotpathEnvironment:
         self.directory = _SYSTEMD_RUNTIME_DIR / f"{config.service}.d"
         self.dropin = self.directory / f"zerofs-hotpath-profile-{uuid.uuid4().hex}.conf"
         self._directory_created = False
-        self._installation_attempted = False
+        self._cleanup_required = False
 
     def install(self) -> None:
         if (
@@ -412,12 +417,17 @@ class _TemporaryHotpathEnvironment:
             == 0
         )
         self._directory_created = not directory_existed
-        self.runner.run(["install", "-d", "-m", "0755", self.directory], sudo=True)
+        if self._directory_created:
+            self._cleanup_required = True
+            self.runner.run(
+                ["install", "-d", "-m", "0755", self.directory], sudo=True
+            )
         content = (
             "[Service]\n"
             f'Environment="HOTPATH_OUTPUT_PATH={self.report}"\n'
             'Environment="HOTPATH_OUTPUT_FORMAT=json"\n'
             'Environment="HOTPATH_METRICS_SERVER_OFF=true"\n'
+            'Environment="HOTPATH_REPORT=functions-timing,futures,threads"\n'
         )
         with tempfile.NamedTemporaryFile(
             mode="w",
@@ -428,7 +438,7 @@ class _TemporaryHotpathEnvironment:
             handle.write(content)
             temporary = Path(handle.name)
         try:
-            self._installation_attempted = True
+            self._cleanup_required = True
             self.runner.run(
                 [
                     "install",
@@ -448,7 +458,7 @@ class _TemporaryHotpathEnvironment:
         self.runner.run(["systemctl", "daemon-reload"], sudo=True)
 
     def cleanup(self) -> None:
-        if not self._installation_attempted:
+        if not self._cleanup_required:
             return
         errors: list[BaseException] = []
         try:
@@ -797,7 +807,7 @@ class ProfileRunner:
                         "temporary_config_sha256": maintenance_config_sha256,
                     },
                 )
-                hotpath_report = receipt.path("hotpath.json")
+                hotpath_report = receipt.directory / "hotpath.json"
                 hotpath_environment = _TemporaryHotpathEnvironment(
                     self.config, self.runner, hotpath_report
                 )
@@ -840,6 +850,7 @@ class ProfileRunner:
                         if profile_service_started and profile_service_stopped:
                             assert hotpath_report is not None
                             _require_hotpath_report(hotpath_report)
+                            receipt.artifact("hotpath.json", hotpath_report)
                             receipt.record(
                                 "hotpath_report",
                                 {

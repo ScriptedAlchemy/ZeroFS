@@ -55,6 +55,7 @@ from scripts.vm100_pilot.metrics import (
 from scripts.vm100_pilot.profile import (
     CanonicalDeployment,
     ProfileRunner,
+    _TemporaryHotpathEnvironment,
     _load_phase_windows,
     _perf_report_argv,
     _phase_report_text,
@@ -2680,6 +2681,41 @@ class _HotpathEnvironmentRunner(FakeRunner):
         return super().run(argv, **kwargs)
 
 
+class _FailingHotpathEnvironmentRunner(_HotpathEnvironmentRunner):
+    def __init__(self, fail_stage: str, *, cancellation: bool = False) -> None:
+        super().__init__()
+        self.fail_stage = fail_stage
+        self.cancellation = cancellation
+        self.failed = False
+        self.fail_cleanup = False
+
+    def run(
+        self,
+        argv: Sequence[str | Path],
+        **kwargs: Any,
+    ) -> CompletedProcess[str]:
+        args = tuple(str(value) for value in argv)
+        result = super().run(argv, **kwargs)
+        stage_matches = {
+            "directory": args[:3] == ("install", "-d", "-m"),
+            "dropin": args[:1] == ("install",) and args[-1].startswith("/run/systemd/"),
+            "reload": args[:2] == ("systemctl", "daemon-reload"),
+        }
+        if not self.failed and stage_matches.get(self.fail_stage, False):
+            self.failed = True
+            if self.cancellation:
+                raise KeyboardInterrupt(f"injected {self.fail_stage} cancellation")
+            raise RuntimeError(f"injected {self.fail_stage} failure")
+        cleanup_matches = (
+            args[:3] == ("rm", "-f", "--")
+            or args[:2] == ("rmdir", "--ignore-fail-on-non-empty")
+            or args[:2] == ("systemctl", "daemon-reload")
+        )
+        if self.fail_cleanup and cleanup_matches:
+            raise RuntimeError(f"injected cleanup failure: {' '.join(args)}")
+        return result
+
+
 class _HotpathLifecycle(_HealthyLifecycle):
     def __init__(
         self,
@@ -2786,6 +2822,18 @@ class ProfileTests(unittest.TestCase):
         )
         return profiler, runner, lifecycle
 
+    def _hotpath_environment(
+        self,
+        runner: _HotpathEnvironmentRunner,
+        *,
+        report: Path | None = None,
+    ) -> _TemporaryHotpathEnvironment:
+        return _TemporaryHotpathEnvironment(
+            self.config,
+            runner,
+            report or Path(self.temp.name) / "hotpath.json",
+        )
+
     def test_profile_build_forces_frame_pointers_for_actionable_callchains(
         self,
     ) -> None:
@@ -2860,6 +2908,7 @@ class ProfileTests(unittest.TestCase):
                     "HOTPATH_OUTPUT_PATH": str(report),
                     "HOTPATH_OUTPUT_FORMAT": "json",
                     "HOTPATH_METRICS_SERVER_OFF": "true",
+                    "HOTPATH_REPORT": "functions-timing,futures,threads",
                 }
             ],
         )
@@ -2894,6 +2943,10 @@ class ProfileTests(unittest.TestCase):
 
                 self.assertEqual(runner.hotpath_environment, {})
                 self.assertEqual(runner.removed_dropins, runner.installed_dropins)
+                manifest = json.loads(
+                    next(profiler.config.result_dir.glob("*/manifest.json")).read_text()
+                )
+                self.assertNotIn("hotpath.json", manifest["artifacts"])
                 self.assertEqual(self.config_file.read_bytes(), self.original_config)
                 self.assertEqual(self.binary.read_bytes(), b"canonical-binary")
                 self.assertGreaterEqual(lifecycle.start_calls, 2)
@@ -2933,6 +2986,110 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(start_runner.hotpath_environment, {})
         self.assertEqual(self.config_file.read_bytes(), self.original_config)
         self.assertEqual(self.binary.read_bytes(), b"canonical-binary")
+        manifest = json.loads(
+            next(starter.config.result_dir.glob("*/manifest.json")).read_text()
+        )
+        self.assertNotIn("hotpath.json", manifest["artifacts"])
+
+    def test_hotpath_environment_partial_install_cleanup_is_cancellation_safe(
+        self,
+    ) -> None:
+        for stage in ("directory", "dropin", "reload"):
+            with self.subTest(stage=stage):
+                cancellation = stage == "directory"
+                runner = _FailingHotpathEnvironmentRunner(
+                    stage, cancellation=cancellation
+                )
+                environment = self._hotpath_environment(runner)
+
+                expected = KeyboardInterrupt if cancellation else RuntimeError
+                outcome = "cancellation" if cancellation else "failure"
+                with self.assertRaisesRegex(expected, f"injected {stage} {outcome}"):
+                    environment.install()
+                environment.cleanup()
+
+                self.assertEqual(runner.removed_dropins, [environment.dropin])
+                self.assertNotIn(environment.directory, runner.dropin_directories)
+                self.assertEqual(runner.hotpath_environment, {})
+                self.assertGreaterEqual(
+                    sum(
+                        call[0] == ("systemctl", "daemon-reload")
+                        for call in runner.calls
+                    ),
+                    1,
+                )
+
+        runner = _HotpathEnvironmentRunner()
+        environment = self._hotpath_environment(runner)
+        with (
+            mock.patch.object(
+                profile_module.tempfile,
+                "NamedTemporaryFile",
+                side_effect=OSError("injected tempfile failure"),
+            ),
+            self.assertRaisesRegex(OSError, "injected tempfile failure"),
+        ):
+            environment.install()
+        environment.cleanup()
+        self.assertEqual(runner.removed_dropins, [environment.dropin])
+        self.assertNotIn(environment.directory, runner.dropin_directories)
+
+    def test_hotpath_environment_cleanup_aggregates_all_failures(self) -> None:
+        runner = _FailingHotpathEnvironmentRunner("never")
+        environment = self._hotpath_environment(runner)
+        environment.install()
+        runner.fail_cleanup = True
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "Hotpath environment cleanup failures:.*rm.*rmdir.*daemon-reload",
+        ):
+            environment.cleanup()
+
+        self.assertEqual(runner.removed_dropins, [environment.dropin])
+        self.assertNotIn(environment.directory, runner.dropin_directories)
+        self.assertEqual(runner.hotpath_environment, {})
+
+    def test_profile_restores_canonical_deployment_after_hotpath_install_failure(
+        self,
+    ) -> None:
+        runner = _FailingHotpathEnvironmentRunner("reload")
+        lifecycle = _HotpathLifecycle(self.snapshot, self.config, runner, None)
+        profiler = _TestProfileRunner(
+            self.config,
+            runner,
+            lifecycle,  # type: ignore[arg-type]
+            _ProfileBenchmark(self.config, self.config_file),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "injected reload failure"):
+            profiler.run(total_mib=4, jobs=1)
+
+        self.assertEqual(runner.removed_dropins, runner.installed_dropins)
+        self.assertEqual(self.config_file.read_bytes(), self.original_config)
+        self.assertEqual(self.binary.read_bytes(), b"canonical-binary")
+
+    def test_hotpath_environment_rejects_unsafe_report_paths_before_mutation(
+        self,
+    ) -> None:
+        for suffix in ('quote"', "backslash\\", "newline\n", "percent%"):
+            with self.subTest(suffix=suffix):
+                runner = _HotpathEnvironmentRunner()
+                with self.assertRaisesRegex(ValueError, "unsafe Hotpath report path"):
+                    self._hotpath_environment(
+                        runner,
+                        report=Path(self.temp.name) / suffix / "hotpath.json",
+                    )
+                self.assertEqual(runner.calls, [])
+
+        runner = _HotpathEnvironmentRunner()
+        report = Path(self.temp.name) / "receipt with space" / "hotpath.json"
+        environment = self._hotpath_environment(runner, report=report)
+        environment.install()
+        environment.cleanup()
+        self.assertEqual(
+            runner.installed_environments[0]["HOTPATH_OUTPUT_PATH"], str(report)
+        )
 
     def test_phase_perf_report_uses_exact_monotonic_window(self) -> None:
         argv = _phase_perf_report_argv(
