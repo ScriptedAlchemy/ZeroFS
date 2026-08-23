@@ -16,20 +16,34 @@ fn hotpath_json_distinguishes_completed_and_cancelled_futures() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("reserve a loopback port");
     let address = listener.local_addr().expect("read reserved loopback port");
     drop(listener);
+    let report_dir = tempfile::tempdir().expect("create lifecycle report directory");
+    let report_path = report_dir.path().join("hotpath-lifecycle.json");
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_hotpath_lifecycle"))
         .env("HOTPATH_METRICS_PORT", address.port().to_string())
         .env("HOTPATH_METRICS_SERVER_OFF", "false")
-        .env("HOTPATH_OUTPUT_FORMAT", "none")
+        .env("HOTPATH_OUTPUT_FORMAT", "json")
+        .env("HOTPATH_OUTPUT_PATH", &report_path)
+        .env("HOTPATH_REPORT", "functions-timing,futures,threads")
+        .env("HOTPATH_TOKIO_RUNTIME_INTERVAL_MS", "10")
+        .env("HOTPATH_CPU_BASELINE_OFF", "true")
+        .env("ZEROFS_HOTPATH_LIFECYCLE_HOLD_MS", "250")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .expect("start hotpath lifecycle fixture");
 
-    let result = wait_for_lifecycle_evidence(address);
-    let _ = child.kill();
-    let _ = child.wait();
-    result.expect("Hotpath JSON must retain completed and cancelled future lifecycles");
+    let result = (|| {
+        wait_for_lifecycle_evidence(address)?;
+        wait_for_tokio_runtime_snapshot(address)?;
+        wait_for_graceful_exit(&mut child)?;
+        verify_static_report(&report_path)
+    })();
+    if result.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    result.expect("Hotpath must retain lifecycle, Tokio, and static JSON evidence");
 }
 
 fn wait_for_lifecycle_evidence(address: SocketAddr) -> Result<(), String> {
@@ -44,6 +58,75 @@ fn wait_for_lifecycle_evidence(address: SocketAddr) -> Result<(), String> {
         thread::sleep(Duration::from_millis(25));
     }
     Err("did not observe ready and cancelled lifecycle states from Hotpath".to_owned())
+}
+
+fn wait_for_tokio_runtime_snapshot(address: SocketAddr) -> Result<(), String> {
+    for _ in 0..80 {
+        if let Some(snapshot) = get_json(address, "/tokio_runtime")
+            && snapshot
+                .get("num_workers")
+                .and_then(Value::as_u64)
+                .is_some_and(|workers| workers > 0)
+            && snapshot
+                .get("workers")
+                .and_then(Value::as_array)
+                .is_some_and(|workers| !workers.is_empty())
+        {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    Err("did not observe a Tokio runtime metrics snapshot from Hotpath".to_owned())
+}
+
+fn wait_for_graceful_exit(child: &mut std::process::Child) -> Result<(), String> {
+    for _ in 0..80 {
+        if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
+            return status
+                .success()
+                .then_some(())
+                .ok_or_else(|| format!("lifecycle fixture exited unsuccessfully: {status}"));
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    Err("lifecycle fixture did not exit gracefully".to_owned())
+}
+
+fn verify_static_report(path: &std::path::Path) -> Result<(), String> {
+    let report = std::fs::read_to_string(path)
+        .map_err(|error| format!("read Hotpath JSON report: {error}"))?;
+    let report: Value = serde_json::from_str(&report)
+        .map_err(|error| format!("parse Hotpath JSON report: {error}"))?;
+    if report.get("type").and_then(Value::as_str) != Some("hotpath_report") {
+        return Err("Hotpath JSON report did not have type hotpath_report".to_owned());
+    }
+    for required in ["functions_timing", "futures", "threads"] {
+        if report.get(required).is_none() {
+            return Err(format!(
+                "Hotpath JSON report omitted required {required} section"
+            ));
+        }
+    }
+    for forbidden in [
+        "functions_alloc",
+        "functions_cpu",
+        "channels",
+        "streams",
+        "rw_locks",
+        "mutexes",
+        "sql",
+        "http",
+        "io",
+        "debug",
+        "cpu_baseline",
+    ] {
+        if report.get(forbidden).is_some() {
+            return Err(format!(
+                "Hotpath JSON report included forbidden {forbidden} section"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn lifecycle_state(address: SocketAddr, futures: &Value, label: &str) -> Option<String> {

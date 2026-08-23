@@ -5,7 +5,11 @@ fn main() {
         .build()
         .expect("build Hotpath lifecycle runtime");
     let _hotpath_guard = hotpath::HotpathGuardBuilder::new("zerofs::hotpath_lifecycle")
-        .sections(vec![hotpath::Section::Futures, hotpath::Section::Threads])
+        .sections(vec![
+            hotpath::Section::FunctionsTiming,
+            hotpath::Section::Futures,
+            hotpath::Section::Threads,
+        ])
         .build();
     hotpath::tokio_runtime!(runtime.handle());
 
@@ -15,7 +19,11 @@ fn main() {
             std::future::pending::<()>(),
             label = "zerofs.hotpath.lifecycle.cancelled"
         ));
-        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        let hold_ms = std::env::var("ZEROFS_HOTPATH_LIFECYCLE_HOLD_MS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(1_000);
+        tokio::time::sleep(std::time::Duration::from_millis(hold_ms)).await;
     });
 }
 
