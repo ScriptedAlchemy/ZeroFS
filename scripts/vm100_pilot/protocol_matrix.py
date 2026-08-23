@@ -70,6 +70,7 @@ class ProtocolAuthority:
     mount_options: tuple[str, ...]
     metrics_url: str
     metrics_identity: MetricsAuthorityIdentity
+    isolated_test_export: bool
 
     @classmethod
     def from_mapping(
@@ -84,6 +85,9 @@ class ProtocolAuthority:
         endpoint = values.get(f"{prefix}_ENDPOINT", "").strip()
         options = values.get(f"{prefix}_MOUNT_OPTIONS", "").strip()
         metrics_url = values.get(f"{prefix}_METRICS_URL", "").strip()
+        isolated_value = values.get(f"{prefix}_ISOLATED", "").strip().lower()
+        if isolated_value not in {"", "false", "true"}:
+            raise ValueError(f"{prefix}_ISOLATED must be true or false")
         identity_values = {
             "server_instance_id": values.get(
                 f"{prefix}_METRICS_INSTANCE_ID", ""
@@ -153,6 +157,7 @@ class ProtocolAuthority:
             mount_options=parsed_options,
             metrics_url=metrics_url,
             metrics_identity=MetricsAuthorityIdentity(**identity_values),
+            isolated_test_export=isolated_value == "true",
         )
 
     def verify(self, runner: Runner) -> dict[str, object]:
@@ -212,6 +217,7 @@ class ProtocolAuthority:
             "required_options": list(self.mount_options),
             "metrics_url": self.metrics_url,
             "metrics_identity": asdict(self.metrics_identity),
+            "isolated_test_export": self.isolated_test_export,
         }
 
     def require_run_root(self, path: Path) -> Path:
@@ -232,12 +238,14 @@ class ClientColdReadResult:
     runtime_ms: int
     requests: int
     mibps: float
-    backend_read_counter_before: int
-    backend_read_counter_after: int
-    backend_read_bytes: int
+    backend_interval_counter_before: int
+    backend_interval_counter_after: int
+    backend_interval_activity_bytes: int
     idle_seconds: int
     timeout_seconds: int
     cache_scope: str = "nfs_client_page_cache_only"
+    backend_activity_scope: str = "service_global_interval"
+    isolated_test_export_required: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -379,7 +387,17 @@ class ProtocolWorkloadExecutor:
                 f"{destination.stat().st_size} != {workload.bytes}"
             )
         client_cold_read = None
-        if self.scenario.require_backend_read:
+        if self.scenario.require_backend_interval_activity:
+            self.receipt.record(
+                "idle_read_attempt",
+                {
+                    "cache_scope": "nfs_client_page_cache_only",
+                    "deadline_seconds": self.scenario.read_timeout_seconds,
+                    "d_state_bounded": False,
+                    "timeout_scope": "userspace_process_only",
+                    "workload": workload.name,
+                },
+            )
             client_cold_read = self.owner._run_client_cold_read(
                 destination,
                 workload,
@@ -492,26 +510,27 @@ class ProtocolMatrixRunner:
         if aggregate.runtime_ms <= 0:
             raise ValueError("client-cold fio has no measurable runtime")
         after = self.observer.counter("zerofs_sftp_object_read_bytes_total")
-        backend_bytes = counter_delta(
+        backend_activity_bytes = counter_delta(
             after,
             before,
-            "long-idle client-cold backend SFTP read bytes",
+            "long-idle client-cold service-global SFTP read activity bytes",
         )
-        if backend_bytes < aggregate.byte_count:
+        if backend_activity_bytes < aggregate.byte_count:
             raise RuntimeError(
-                "long-idle client-cold NFS read moved fewer backend SFTP bytes "
+                "long-idle client-cold NFS interval observed fewer backend SFTP "
+                "activity bytes "
                 f"than logical bytes: logical={aggregate.byte_count}, "
-                f"backend={backend_bytes}; server cache state does not prove a "
-                "fully backend-traversing read"
+                f"backend_interval={backend_activity_bytes}; the interval-global "
+                "evidence is insufficient"
             )
         return ClientColdReadResult(
             bytes=aggregate.byte_count,
             runtime_ms=aggregate.runtime_ms,
             requests=aggregate.requests,
             mibps=mib_per_second(aggregate.byte_count, aggregate.runtime_ms / 1000),
-            backend_read_counter_before=before,
-            backend_read_counter_after=after,
-            backend_read_bytes=backend_bytes,
+            backend_interval_counter_before=before,
+            backend_interval_counter_after=after,
+            backend_interval_activity_bytes=backend_activity_bytes,
             idle_seconds=scenario.read_idle_seconds,
             timeout_seconds=scenario.read_timeout_seconds,
         )
@@ -635,6 +654,7 @@ class ProtocolMatrixRunner:
                     "mount_options": list(authority.mount_options),
                     "metrics_url": authority.metrics_url,
                     "metrics_identity": asdict(authority.metrics_identity),
+                    "isolated_test_export": authority.isolated_test_export,
                 },
             )
             receipt.record(
@@ -645,6 +665,14 @@ class ProtocolMatrixRunner:
                 receipt.artifact("cleanup-ledger.json", ledger)
                 authority.require_run_root(run_root)
                 self.config.require_temp_child(scratch, "zerofs-protocol-bench-")
+                if (
+                    scenario.require_backend_interval_activity
+                    and not authority.isolated_test_export
+                ):
+                    raise ScenarioUnavailableError(
+                        "long-idle backend interval evidence requires explicit "
+                        "ZEROFS_BENCH_NFS_ISOLATED=true authority"
+                    )
                 if self.memory_session is not None:
                     self.memory_session.expect_workloads(
                         tuple(workload.name for workload in scenario.workloads)

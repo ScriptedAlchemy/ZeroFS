@@ -144,7 +144,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--idle-read",
         dest="idle_read",
         action="store_true",
-        help="run the deadline-guarded backend-proven NFS read after a 61-minute idle",
+        help="run the long-idle NFS read with service-global backend interval evidence",
     )
     protocol.add_argument(
         "--memory-envelope",

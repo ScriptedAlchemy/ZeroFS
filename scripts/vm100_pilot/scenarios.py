@@ -64,24 +64,24 @@ class ProtocolScenario:
     workloads: tuple[WorkloadDefinition, ...]
     read_idle_seconds: int = 0
     read_timeout_seconds: int = 0
-    require_backend_read: bool = False
+    require_backend_interval_activity: bool = False
 
     def __post_init__(self) -> None:
         if self.protocol not in {"nfs", "9p"}:
             raise ValueError(f"unsupported protocol scenario: {self.protocol!r}")
         if not self.name or not self.description or not self.workloads:
             raise ValueError("protocol scenario must define real workloads")
-        if self.require_backend_read:
+        if self.require_backend_interval_activity:
             if self.protocol != "nfs":
-                raise ValueError("backend-proven long-idle reads currently require NFS")
+                raise ValueError("backend-observed long-idle reads currently require NFS")
             if self.read_idle_seconds <= 0 or self.read_timeout_seconds <= 0:
                 raise ValueError(
-                    "backend-proven long-idle reads require positive idle and timeout seconds"
+                    "backend-observed long-idle reads require positive idle and timeout seconds"
                 )
             if any(workload.bytes % (1024 * 1024) for workload in self.workloads):
-                raise ValueError("backend-proven read workloads must be whole MiB")
+                raise ValueError("backend-observed read workloads must be whole MiB")
         elif self.read_idle_seconds or self.read_timeout_seconds:
-            raise ValueError("read timing is only valid for a backend-proven read")
+            raise ValueError("read timing is only valid for a backend-observed read")
 
     @property
     def kind(self) -> str:
@@ -89,12 +89,14 @@ class ProtocolScenario:
 
     @property
     def required_authority(self) -> tuple[str, ...]:
+        if self.require_backend_interval_activity:
+            return (*_PROTOCOL_AUTHORITY, "isolated_test_export_assertion")
         return _PROTOCOL_AUTHORITY
 
     @property
     def cutoffs(self) -> tuple[str, ...]:
-        if self.require_backend_read:
-            return (*_PROTOCOL_CUTOFFS, "idle_client_cold_backend_read")
+        if self.require_backend_interval_activity:
+            return (*_PROTOCOL_CUTOFFS, "idle_client_cold_backend_interval")
         return _PROTOCOL_CUTOFFS
 
     @property
@@ -118,12 +120,14 @@ class ProtocolScenario:
             "sha256_required": True,
             "cleanup_required": True,
         }
-        if self.require_backend_read:
+        if self.require_backend_interval_activity:
             result["read_probe"] = {
                 "idle_seconds": self.read_idle_seconds,
                 "timeout_seconds": self.read_timeout_seconds,
                 "cache_scope": "nfs_client_page_cache_only",
                 "backend_counter": "zerofs_sftp_object_read_bytes_total",
+                "backend_activity_scope": "service_global_interval",
+                "isolated_test_export_required": True,
             }
         return result
 
@@ -276,13 +280,13 @@ _DEFINITIONS: tuple[Scenario, ...] = (
         name="protocol-idle-read-nfs",
         protocol="nfs",
         description=(
-            "Backend-proven NFS read after the configured SFTP pool was idle, "
-            "with client-cache invalidation and a read deadline"
+            "NFS read after the configured SFTP pool was idle, with client-cache "
+            "invalidation and service-global backend interval evidence"
         ),
         workloads=(_PROTOCOL_WORKLOADS[0],),
         read_idle_seconds=61 * 60,
         read_timeout_seconds=30,
-        require_backend_read=True,
+        require_backend_interval_activity=True,
     ),
     RawSftpScenario(
         name="raw-sftp-stock-hpn",
