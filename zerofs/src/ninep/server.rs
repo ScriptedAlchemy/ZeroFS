@@ -312,11 +312,12 @@ mod tests {
     use super::*;
     use crate::fs::inode::Inode;
     use crate::fs::permissions::Credentials;
-    use crate::ninep::handler::SessionReleaseGuard;
+    use crate::ninep::handler::{SessionReleaseGuard, pause_success_terminal_dedup};
     use crate::ninep::lock_manager::FileLock;
     use ninep_proto::{
         DekuBytes, GETATTR_ALL, LockType, P9String, Rclunk, Rflush, Rlopenat, Rread, Tattach,
-        Tclunk, Tflush, Tgetattr, Tlopenat, Tmkdir, Tversion, Twrite, VERSION_9P2000L_ZEROFS,
+        Tclunk, Tflush, Tgetattr, Tlopenat, Tmkdir, Tversion, Twrite, VERSION_9P2000L,
+        VERSION_9P2000L_ZEROFS,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
@@ -749,6 +750,62 @@ mod tests {
             .await
             .expect("process ownership must drain after accepted work finishes")
             .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn process_shutdown_cancels_dispatched_request_before_settlement_wait() {
+        let filesystem = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let handler = Arc::new(NinePHandler::new(
+            filesystem,
+            Arc::new(FileLockManager::new()),
+        ));
+        let accepted_work = P9AcceptedWorkTracker::new();
+        let byte_limit = P9_MAX_MSIZE as usize * 2;
+        let global = P9GlobalAdmission::for_test(byte_limit, 2);
+        let admission = global.connection_with_accepted_work(accepted_work.clone());
+        let requests = TaskTracker::new();
+        let (tx, _rx) = mpsc::channel(1);
+        let shutdown = CancellationToken::new();
+        let (request_reached, release_request) = pause_success_terminal_dedup([0; 16]);
+
+        dispatch_9p_frame(
+            frame(
+                1,
+                Message::Tversion(Tversion {
+                    msize: P9_MAX_MSIZE,
+                    version: P9String::new(VERSION_9P2000L.to_vec()),
+                }),
+            ),
+            &handler,
+            &tx,
+            &InflightRegistry::default(),
+            &admission,
+            &requests,
+            &shutdown,
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(TEST_TIMEOUT, request_reached)
+            .await
+            .expect("dispatched request must reach its controlled pause")
+            .unwrap();
+        assert_eq!(accepted_work.len(), 1);
+
+        shutdown.cancel();
+        requests.close();
+        let settlement = tokio::time::timeout(QUIET_TIMEOUT, requests.wait()).await;
+        if settlement.is_err() {
+            let _ = release_request.send(());
+            requests.wait().await;
+        }
+        accepted_work.stop_accepting();
+        let process_settlement = tokio::time::timeout(TEST_TIMEOUT, accepted_work.wait()).await;
+
+        assert!(
+            settlement.is_ok(),
+            "process shutdown must cancel a dispatched request before waiting for its ownership token"
+        );
+        process_settlement.expect("process ownership must drain after request cancellation");
     }
 
     #[tokio::test]

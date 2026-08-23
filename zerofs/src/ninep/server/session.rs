@@ -413,8 +413,9 @@ pub(crate) async fn dispatch_9p_frame(
 
     let handler = Arc::clone(handler);
     let tx = tx.clone();
+    let request_shutdown = shutdown.clone();
 
-    let request = requests.track_future(async move {
+    let request = async move {
         let _accepted_work = accepted_work;
         // Only Twrite has an inbound bulk payload worth retaining. Other
         // requests keep the regular decoder and the original error diagnostics.
@@ -495,6 +496,19 @@ pub(crate) async fn dispatch_9p_frame(
         }
 
         drop(request_lease);
+    };
+
+    let request = requests.track_future(async move {
+        // A disconnected client retains process ownership during its bounded
+        // settlement grace. Process shutdown is different: no response can be
+        // delivered, and the mutation layer owns work after submission, so
+        // dropping the protocol future releases its request and accepted-work
+        // guards without abandoning committed work.
+        tokio::select! {
+            biased;
+            _ = request_shutdown.cancelled() => {}
+            _ = request => {}
+        }
     });
     drop(spawn_named("9p-request", request));
     Ok(())
