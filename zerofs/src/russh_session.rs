@@ -1,5 +1,7 @@
 use crate::sftp_protocol::{SftpProtocolSession, SshConnectionOwner, handshake_sftp};
-use crate::sftp_transport::{SessionFactory, TransportError, TransportSession};
+use crate::sftp_transport::{
+    SessionFactory, SftpBackendNamespace, TransportError, TransportSession,
+};
 use async_trait::async_trait;
 use russh::client;
 use russh::keys::{Algorithm, EcdsaCurve, HashAlg, PrivateKeyWithHashAlg, load_secret_key};
@@ -336,6 +338,10 @@ async fn connect_ssh_handle(
 
 #[async_trait]
 impl SessionFactory for RusshSessionFactory {
+    fn backend_namespace(&self) -> SftpBackendNamespace {
+        SftpBackendNamespace::from_endpoint(&self.endpoint)
+    }
+
     async fn open(
         &self,
         force: CancellationToken,
