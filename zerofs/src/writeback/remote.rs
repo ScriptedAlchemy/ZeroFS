@@ -1322,6 +1322,10 @@ impl Drop for RemoteMultipartOwner {
     }
 }
 
+#[cfg_attr(
+    feature = "hotpath-profile",
+    hotpath::measure(future = true, label = "zerofs.writeback.remote.write")
+)]
 async fn stream_record_to_remote(
     remote: Arc<dyn ObjectStore>,
     journal: Arc<Journal>,
