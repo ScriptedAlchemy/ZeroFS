@@ -10,6 +10,7 @@ use serde_json::Value;
 
 const COMPLETED_LABEL: &str = "zerofs.hotpath.lifecycle.completed";
 const CANCELLED_LABEL: &str = "zerofs.hotpath.lifecycle.cancelled";
+const IO_LABEL: &str = "zerofs.hotpath.lifecycle.loopback";
 
 #[test]
 fn hotpath_json_distinguishes_completed_and_cancelled_futures() {
@@ -24,7 +25,8 @@ fn hotpath_json_distinguishes_completed_and_cancelled_futures() {
         .env("HOTPATH_METRICS_SERVER_OFF", "false")
         .env("HOTPATH_OUTPUT_FORMAT", "json")
         .env("HOTPATH_OUTPUT_PATH", &report_path)
-        .env("HOTPATH_REPORT", "functions-timing,futures,threads")
+        .env("HOTPATH_REPORT", "functions-timing,futures,io,threads")
+        .env("HOTPATH_IO_TIME_SAMPLING_RATE", "1")
         .env("HOTPATH_TOKIO_RUNTIME_INTERVAL_MS", "10")
         .env("HOTPATH_CPU_BASELINE_OFF", "true")
         .env("ZEROFS_HOTPATH_LIFECYCLE_HOLD_MS", "2000")
@@ -100,7 +102,7 @@ fn verify_static_report(path: &std::path::Path) -> Result<(), String> {
     if report.get("type").and_then(Value::as_str) != Some("hotpath_report") {
         return Err("Hotpath JSON report did not have type hotpath_report".to_owned());
     }
-    for required in ["functions_timing", "futures", "threads"] {
+    for required in ["functions_timing", "futures", "io", "threads"] {
         if report.get(required).is_none() {
             return Err(format!(
                 "Hotpath JSON report omitted required {required} section"
@@ -116,13 +118,56 @@ fn verify_static_report(path: &std::path::Path) -> Result<(), String> {
         "mutexes",
         "sql",
         "http",
-        "io",
         "debug",
         "cpu_baseline",
     ] {
         if report.get(forbidden).is_some() {
             return Err(format!(
                 "Hotpath JSON report included forbidden {forbidden} section"
+            ));
+        }
+    }
+    verify_io_report(&report)?;
+    Ok(())
+}
+
+fn verify_io_report(report: &Value) -> Result<(), String> {
+    let entry = report
+        .get("io")
+        .and_then(|io| io.get("data"))
+        .and_then(Value::as_array)
+        .and_then(|entries| {
+            entries.iter().find(|entry| {
+                entry.get("label").and_then(Value::as_str) == Some(IO_LABEL)
+            })
+        })
+        .ok_or_else(|| format!("Hotpath JSON report omitted I/O label {IO_LABEL}"))?;
+
+    for (direction, expected_bytes) in [("read", 7), ("write", 5)] {
+        let operation = entry
+            .get(direction)
+            .ok_or_else(|| format!("Hotpath I/O entry omitted {direction}"))?;
+        let count = operation
+            .get("count")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| format!("Hotpath I/O {direction} count is invalid"))?;
+        if count == 0
+            || operation.get("sampled_count").and_then(Value::as_u64) != Some(count)
+            || operation.get("bytes").and_then(Value::as_u64) != Some(expected_bytes)
+            || operation.get("sampled_bytes").and_then(Value::as_u64)
+                != Some(expected_bytes)
+            || operation.get("errors").and_then(Value::as_u64) != Some(0)
+            || operation
+                .get("total_ns")
+                .and_then(Value::as_u64)
+                .is_none_or(|total| total == 0)
+            || operation
+                .get("throughput")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+        {
+            return Err(format!(
+                "Hotpath I/O {direction} evidence is incomplete: {operation}"
             ));
         }
     }

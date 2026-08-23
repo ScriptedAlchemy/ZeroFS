@@ -2557,6 +2557,18 @@ class CliDryRunTests(ConfigValidationTests):
     def test_prod_hotpath_profile_builds_optimized_instrumented_release(
         self,
     ) -> None:
+        self.assertEqual(
+            deploy.HOTPATH_PROFILE_ENV,
+            {
+                "HOTPATH_OUTPUT_PATH": "/srv/zerofs-persist/state/hotpath.json",
+                "HOTPATH_OUTPUT_FORMAT": "json",
+                "HOTPATH_METRICS_SERVER_OFF": "false",
+                "HOTPATH_METRICS_PORT": "9477",
+                "HOTPATH_CPU_BASELINE_OFF": "true",
+                "HOTPATH_REPORT": "functions-timing,futures,io,threads",
+                "HOTPATH_IO_TIME_SAMPLING_RATE": "1",
+            },
+        )
         env_file = self.write_config(
             "\n".join(
                 f"{key}={value}"
