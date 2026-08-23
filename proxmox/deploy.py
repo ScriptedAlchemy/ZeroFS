@@ -1586,7 +1586,84 @@ def release_rustflags(existing: str) -> str:
     return flags
 
 
-def _build(runner: Runner, root: Path, role: str) -> Path:
+HOTPATH_PROFILE_ENV = {
+    "HOTPATH_OUTPUT_PATH": "/srv/zerofs-persist/state/hotpath.json",
+    "HOTPATH_OUTPUT_FORMAT": "json",
+    "HOTPATH_METRICS_SERVER_OFF": "false",
+    "HOTPATH_METRICS_PORT": "9477",
+    "HOTPATH_CPU_BASELINE_OFF": "true",
+    "HOTPATH_REPORT": "functions-timing,futures,threads",
+}
+
+
+def validate_hotpath_profile_env(path: Path | None) -> None:
+    if path is None:
+        raise ValueError("--hotpath-profile requires --env-file")
+    values: dict[str, str] = {}
+    content = path.read_bytes().decode("utf-8")
+    unsupported_separators = (
+        "\r",
+        "\v",
+        "\f",
+        "\x1c",
+        "\x1d",
+        "\x1e",
+        "\x85",
+        "\u2028",
+        "\u2029",
+    )
+    if any(separator in content for separator in unsupported_separators):
+        raise ValueError("Hotpath production environment has an unsafe separator")
+    for raw_line in content.split("\n"):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.endswith("\\"):
+            raise ValueError("Hotpath production environment has a continuation")
+        quote: str | None = None
+        escaped = False
+        for character in line:
+            if escaped:
+                escaped = False
+                continue
+            if character == "\\" and quote != "'":
+                escaped = True
+                continue
+            if quote is None and character in {"'", '"'}:
+                quote = character
+            elif character == quote:
+                quote = None
+        if quote is not None:
+            raise ValueError(
+                "Hotpath production environment has an unterminated quote"
+            )
+        if "HOTPATH_" not in line:
+            continue
+        if raw_line != line:
+            raise ValueError("Hotpath production environment has ambiguous syntax")
+        key, separator, value = line.partition("=")
+        if not separator or key not in HOTPATH_PROFILE_ENV:
+            raise ValueError(
+                "Hotpath production environment contains an unsupported control"
+            )
+        if key in values:
+            raise ValueError(
+                f"Hotpath production environment duplicates {key}"
+            )
+        values[key] = value
+    missing_or_unsafe = [
+        key
+        for key, expected in HOTPATH_PROFILE_ENV.items()
+        if values.get(key) != expected
+    ]
+    if missing_or_unsafe:
+        raise ValueError(
+            "Hotpath production environment is missing or unsafe: "
+            + ", ".join(missing_or_unsafe)
+        )
+
+
+def _build(runner: Runner, root: Path, role: str, hotpath_profile: bool = False) -> Path:
     target = root / "target" / "proxmox-lxc"
     if role == "prod":
         user_paths = (Path.home() / ".local" / "bin", Path.home() / ".cargo" / "bin")
@@ -1634,8 +1711,13 @@ def _build(runner: Runner, root: Path, role: str) -> Path:
         "--target-dir",
         str(target),
     ]
+    features = []
     if role == "prod":
-        command.extend(["--features", "webui"])
+        features.append("webui")
+    if hotpath_profile:
+        features.append("hotpath-profile")
+    if features:
+        command.extend(["--features", ",".join(features)])
     os.environ["RUSTFLAGS"] = release_rustflags(os.environ.get("RUSTFLAGS", ""))
     runner.run(command, cwd=root)
     return target / "release" / "zerofs"
@@ -1916,6 +1998,8 @@ def _build_host_deploy_argv(
         args.samba_user,
         "--prod-access",
         args.prod_access,
+        "--hotpath-profile",
+        "1" if args.hotpath_profile else "0",
     ]
     if include_drain_timeout:
         host_args.extend(["--drain-timeout", str(args.drain_timeout)])
@@ -2357,6 +2441,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--metrics-url")
     parser.add_argument("--existing-metrics-url")
     parser.add_argument("--drain-timeout", type=int, default=1800)
+    parser.add_argument("--hotpath-profile", action="store_true")
     parser.add_argument("--skip-existing-drain", action="store_true")
     parser.add_argument("--source-client-unit")
     parser.add_argument("--source-mount-unit")
@@ -2387,6 +2472,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ValueError(
             "prod supports drain-safe in-place deploy only; replace and cleanup are dev-only"
         )
+    if args.hotpath_profile:
+        if args.role != "prod" or args.action != "deploy":
+            raise ValueError(
+                "Hotpath profiling is valid only for production deploy"
+            )
+        validate_hotpath_profile_env(args.env_file)
     if args.action.startswith("ownership-") and args.role != "prod":
         raise ValueError("ownership migration is valid only for production")
     if args.action == "ownership-repair" and not args.dry_run:
@@ -2485,7 +2576,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     namespace = namespace_id(storage_url, args.role, state_root)
     commit, _dirty = _git_receipt(runner, root)
-    binary = _build(runner, root, args.role)
+    binary = _build(runner, root, args.role, args.hotpath_profile)
     binary_hash = "DRY_RUN_SHA256" if args.dry_run else sha256(binary)
     release_paths = [args.config]
     release_paths.extend(
@@ -2501,6 +2592,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     release_extras = [binary_hash, args.prod_access]
     if args.local_durable_upgrade:
         release_extras.append("local-durable-upgrade")
+    if args.hotpath_profile:
+        release_extras.append("hotpath-profile")
     if args.prod_access in {"smb", "both"}:
         release_extras.append(args.samba_user)
     release = (

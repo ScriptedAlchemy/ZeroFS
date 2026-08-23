@@ -42,6 +42,7 @@ defer_commit=false
 maintenance_nfs_only=false
 drain_timeout=1800
 local_durable_upgrade=false
+hotpath_profile=0
 
 while (($#)); do
   case "$1" in
@@ -69,10 +70,16 @@ while (($#)); do
     --maintenance-nfs-only) maintenance_nfs_only=true; shift ;;
     --drain-timeout) drain_timeout=$2; shift 2 ;;
     --local-durable-upgrade) local_durable_upgrade=true; shift ;;
+    --hotpath-profile) hotpath_profile=$2; shift 2 ;;
     --dry-run) dry_run=true; shift ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
+
+[[ $hotpath_profile == 0 || $hotpath_profile == 1 ]] || {
+  echo "--hotpath-profile must be 0 or 1" >&2
+  exit 2
+}
 
 if [[ $assume_stopped == true && $dry_run != true ]]; then
   echo "--assume-stopped is valid only with --dry-run" >&2
@@ -1182,7 +1189,7 @@ if [[ $dry_run == false && -f $stage/known_hosts ]]; then
 fi
 if [[ $dry_run == false ]]; then
   config_sha=$(sha256sum "$stage/zerofs.toml" | awk '{print $1}')
-  printf 'commit=%s\nrelease_id=%s\nbinary_sha256=%s\nconfig_sha256=%s\n' "$commit" "$release_id" "$binary_sha" "$config_sha" >"$state_root/receipts/$release_id"
+  printf 'commit=%s\nrelease_id=%s\nbinary_sha256=%s\nconfig_sha256=%s\nhotpath_profile=%s\n' "$commit" "$release_id" "$binary_sha" "$config_sha" "$hotpath_profile" >"$state_root/receipts/$release_id"
 fi
 run ln -sfn "releases/$release_id" "$state_root/current"
 
