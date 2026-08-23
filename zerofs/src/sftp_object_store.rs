@@ -245,7 +245,7 @@ pub struct PublicationOutcome {
 
 type TargetLock = AsyncMutex<()>;
 
-static TARGET_LOCKS: LazyLock<StdMutex<HashMap<PathBuf, Weak<TargetLock>>>> =
+static TARGET_LOCKS: LazyLock<StdMutex<HashMap<(usize, PathBuf), Weak<TargetLock>>>> =
     LazyLock::new(|| StdMutex::new(HashMap::new()));
 
 // `retain` walks the whole map, which is wasteful when this is called on
@@ -257,18 +257,19 @@ const TARGET_LOCKS_PRUNE_FLOOR: usize = 32;
 static TARGET_LOCKS_PRUNE_AT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(TARGET_LOCKS_PRUNE_FLOOR);
 
-fn target_lock(target: &FilePath) -> Arc<TargetLock> {
+fn target_lock(scope: usize, target: &FilePath) -> Arc<TargetLock> {
     let mut locks = TARGET_LOCKS.lock().unwrap();
     if locks.len() >= TARGET_LOCKS_PRUNE_AT.load(std::sync::atomic::Ordering::Relaxed) {
         locks.retain(|_, lock| lock.strong_count() > 0);
         let next_prune_at = (locks.len() * 2).max(TARGET_LOCKS_PRUNE_FLOOR);
         TARGET_LOCKS_PRUNE_AT.store(next_prune_at, std::sync::atomic::Ordering::Relaxed);
     }
-    if let Some(lock) = locks.get(target).and_then(Weak::upgrade) {
+    let key = (scope, target.to_path_buf());
+    if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
         return lock;
     }
     let lock = Arc::new(TargetLock::new(()));
-    locks.insert(target.to_path_buf(), Arc::downgrade(&lock));
+    locks.insert(key, Arc::downgrade(&lock));
     lock
 }
 
@@ -290,6 +291,10 @@ async fn bounded_target_lock<'a>(
 #[async_trait]
 pub trait RemoteSession: Debug + Send + Sync {
     fn capabilities(&self) -> SftpCapabilities;
+
+    fn target_lock_scope(&self) -> usize {
+        self as *const Self as *const () as usize
+    }
     async fn read_exact(&self, path: &FilePath, offset: u64, len: usize) -> RemoteResult<Bytes>;
     async fn write_file_durable(&self, path: &FilePath, chunks: Vec<Bytes>) -> RemoteResult<()>;
     async fn write_file_at_durable(
@@ -327,7 +332,7 @@ async fn publish_payload(
     mode: PublicationMode,
     expected_generation: Option<Uuid>,
 ) -> RemoteResult<PublicationOutcome> {
-    let target_lock = target_lock(target);
+    let target_lock = target_lock(session.target_lock_scope(), target);
     let _target_guard = bounded_target_lock(&target_lock, target).await?;
     validate_publication_capabilities(session.capabilities(), mode).map_err(|extension| {
         RemoteError::NotSupported(format!("SFTP server lacks required {extension} extension"))
@@ -620,6 +625,10 @@ impl RemoteSession for PooledRemoteSession {
             hardlink: true,
             posix_rename: true,
         }
+    }
+
+    fn target_lock_scope(&self) -> usize {
+        self.pool.identity()
     }
 
     async fn read_exact(&self, path: &FilePath, offset: u64, len: usize) -> RemoteResult<Bytes> {
@@ -1352,7 +1361,7 @@ impl MultipartUpload for SftpMultipartUpload {
             state.logical_len
         };
         let staging = self.staging()?.to_path_buf();
-        let target_lock = target_lock(&self.target);
+        let target_lock = target_lock(self.session.target_lock_scope(), &self.target);
         let _target_guard = bounded_target_lock(&target_lock, &self.target)
             .await
             .map_err(|error| publication_error(&self.location, error))?;
@@ -4690,7 +4699,11 @@ mod tests {
         };
 
         let results = [first.await.unwrap(), second.await.unwrap()];
-        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results.iter().filter(|result| result.is_ok()).count(),
+            1,
+            "{results:?}"
+        );
         assert_eq!(
             results
                 .iter()

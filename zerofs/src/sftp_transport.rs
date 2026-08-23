@@ -933,6 +933,10 @@ impl fmt::Debug for SftpSessionPool {
 }
 
 impl SftpSessionPool {
+    pub(crate) fn identity(&self) -> usize {
+        Arc::as_ptr(&self.inner) as usize
+    }
+
     pub(crate) fn write_concurrency(&self) -> usize {
         self.inner.admission.inner.write_limit
     }
