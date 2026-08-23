@@ -538,6 +538,10 @@ impl FilesystemVolatileOverlay {
         }
     }
 
+    #[cfg_attr(
+        feature = "hotpath-profile",
+        hotpath::measure(future = true, label = "zerofs.overlay.read")
+    )]
     async fn read(
         self: &Arc<Self>,
         inode: u64,

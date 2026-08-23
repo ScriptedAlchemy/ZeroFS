@@ -27,6 +27,27 @@ use zerofs_nfsserve::vfs::{
 
 const NFS_REPLAY_WINDOW: Duration = Duration::from_secs(60);
 
+#[cfg_attr(
+    feature = "hotpath-profile",
+    hotpath::measure(future = true, label = "zerofs.nfs.read")
+)]
+async fn read_nfs_file(
+    adapter: &NFSAdapter,
+    auth: &NfsAuthContext,
+    id: fileid3,
+    offset: u64,
+    count: u32,
+) -> Result<(Vec<u8>, bool), nfsstat3> {
+    debug!("read called: id={}, offset={}, count={}", id, offset, count);
+    let auth_ctx = adapter.auth_context(auth);
+    adapter
+        .fs
+        .read_file(&auth_ctx, id, offset, count)
+        .await
+        .map(|(data, eof)| (data.to_vec(), eof))
+        .map_err(|e| e.into())
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct NfsServiceIdentity {
     server_incarnation: uuid::Uuid,
@@ -193,13 +214,7 @@ impl NFSFileSystem for NFSAdapter {
         offset: u64,
         count: u32,
     ) -> Result<(Vec<u8>, bool), nfsstat3> {
-        debug!("read called: id={}, offset={}, count={}", id, offset, count);
-        let auth_ctx = self.auth_context(auth);
-        self.fs
-            .read_file(&auth_ctx, id, offset, count)
-            .await
-            .map(|(data, eof)| (data.to_vec(), eof))
-            .map_err(|e| e.into())
+        read_nfs_file(self, auth, id, offset, count).await
     }
 
     async fn write(
