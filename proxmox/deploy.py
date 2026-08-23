@@ -21,6 +21,7 @@ import re
 import selectors
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -544,13 +545,20 @@ def shell_join(command: Sequence[str]) -> str:
 
 
 class _FlockLease:
-    def __init__(self, command: Sequence[str], *, dry_run: bool) -> None:
+    def __init__(
+        self,
+        command: Sequence[str],
+        *,
+        dry_run: bool,
+        display_command: Sequence[str] | None = None,
+    ) -> None:
         self.command = list(command)
+        self.display_command = list(display_command or command)
         self.dry_run = dry_run
         self.process: subprocess.Popen[str] | None = None
 
     def __enter__(self) -> _FlockLease:
-        print(f"+ acquire-lock {shell_join(self.command)}")
+        print(f"+ acquire-lock {shell_join(self.display_command)}")
         if self.dry_run:
             return self
         process = subprocess.Popen(
@@ -590,13 +598,7 @@ class _FlockLease:
         if self.process is None:
             return
         process = self.process
-        if process.stdin is not None:
-            process.stdin.close()
-        try:
-            returncode = process.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            process.terminate()
-            returncode = process.wait(timeout=5)
+        returncode = self._shutdown_holder(graceful_timeout=10)
         if process.stdout is not None:
             process.stdout.close()
         if process.stderr is not None:
@@ -609,35 +611,121 @@ class _FlockLease:
             raise RuntimeError(detail)
 
     def execute(self, script: str) -> subprocess.CompletedProcess[str]:
+        if self.dry_run:
+            print("+ locked-shell")
+            for line in script.rstrip().splitlines():
+                print(f"  | {line}")
+            return subprocess.CompletedProcess(
+                ["locked-remote-shell"], 0, "", ""
+            )
         process = self.process
         if process is None or process.poll() is not None:
             raise RuntimeError("deployment lock lease was lost")
         assert process.stdin is not None and process.stdout is not None
         token = hashlib.sha256(os.urandom(32)).hexdigest()
         payload = base64.b64encode(script.encode()).decode()
-        process.stdin.write(f"{token} {payload}\n")
+        process.stdin.write(f"RUN {token} {payload}\n")
         process.stdin.flush()
         marker = f"__ZEROFS_LOCK_RESULT__ {token} "
-        while True:
-            line = process.stdout.readline()
-            if not line:
-                raise RuntimeError("deployment lock lease was lost during command")
-            if line.startswith(marker):
-                status_text, stdout_encoded, stderr_encoded = (
-                    line.removeprefix(marker).rstrip("\n").split(" ", 2)
-                )
-                status = int(status_text)
-                stdout = base64.b64decode(stdout_encoded).decode()
-                stderr = base64.b64decode(stderr_encoded).decode()
-                if status != 0:
-                    raise LockedRemoteCommandError(
-                        status,
-                        stdout,
-                        stderr,
+        try:
+            while True:
+                line = process.stdout.readline()
+                if not line:
+                    raise RuntimeError("deployment lock lease was lost during command")
+                if line.startswith(marker):
+                    return self._parse_result(line, marker)
+        except KeyboardInterrupt as interrupt:
+            self._cancel_active(token, marker, interrupt)
+            raise
+
+    @staticmethod
+    def _parse_result(
+        line: str, marker: str
+    ) -> subprocess.CompletedProcess[str]:
+        status_text, stdout_encoded, stderr_encoded = (
+            line.removeprefix(marker).rstrip("\n").split(" ", 2)
+        )
+        status = int(status_text)
+        stdout = base64.b64decode(stdout_encoded).decode()
+        stderr = base64.b64decode(stderr_encoded).decode()
+        if status != 0:
+            raise LockedRemoteCommandError(status, stdout, stderr)
+        return subprocess.CompletedProcess(
+            ["locked-remote-shell"], status, stdout, stderr
+        )
+
+    def _readline(self, timeout: float) -> str:
+        process = self.process
+        if process is None or process.stdout is None:
+            return ""
+        selector = selectors.DefaultSelector()
+        selector.register(process.stdout, selectors.EVENT_READ)
+        try:
+            if not selector.select(timeout=timeout):
+                raise TimeoutError("deployment lock holder response timed out")
+            return process.stdout.readline()
+        finally:
+            selector.close()
+
+    def _cancel_active(
+        self,
+        token: str,
+        marker: str,
+        interrupt: KeyboardInterrupt,
+    ) -> None:
+        process = self.process
+        if process is None or process.stdin is None or process.stdin.closed:
+            interrupt.add_note("deployment lock holder was unavailable for cancellation")
+            return
+        try:
+            process.stdin.write(f"CANCEL {token}\n")
+            process.stdin.flush()
+        except (BrokenPipeError, OSError) as error:
+            interrupt.add_note(f"deployment command cancellation failed: {error}")
+            self._shutdown_holder(graceful_timeout=5)
+            return
+        deadline = time.monotonic() + 5
+        try:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("deployment command cancellation timed out")
+                line = self._readline(remaining)
+                if not line:
+                    interrupt.add_note(
+                        "deployment lock holder exited during command cancellation"
                     )
-                return subprocess.CompletedProcess(
-                    ["locked-remote-shell"], status, stdout, stderr
-                )
+                    return
+                if line.startswith(marker):
+                    return
+        except KeyboardInterrupt:
+            self._shutdown_holder(graceful_timeout=5)
+            raise
+        except TimeoutError as error:
+            interrupt.add_note(str(error))
+            self._shutdown_holder(graceful_timeout=5)
+
+    def _shutdown_holder(self, *, graceful_timeout: float) -> int:
+        process = self.process
+        if process is None:
+            return 0
+        if process.stdin is not None and not process.stdin.closed:
+            process.stdin.close()
+        try:
+            return process.wait(timeout=graceful_timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        try:
+            return process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            return process.wait(timeout=2)
 
 
 class LockedRemoteCommandError(RuntimeError):
@@ -657,20 +745,144 @@ class LockedRemoteCommandError(RuntimeError):
 
 
 def _remote_lock_holder(path: str) -> str:
-    return (
-        f"exec 9>{shlex.quote(path)}; "
-        "flock -n 9 || exit 75; printf 'LOCKED\\n'; "
-        "runtime=$(mktemp -d); trap 'rm -rf -- \"$runtime\"' EXIT; "
-        "while IFS=' ' read -r token payload; do "
-        "set +e; printf '%s' \"$payload\" | base64 -d | bash -se "
-        '>\"$runtime/stdout\" 2>\"$runtime/stderr\"; '
-        "status=$?; set -e; "
-        'stdout=$(base64 <"$runtime/stdout" | tr -d \'\\n\'); '
-        'stderr=$(base64 <"$runtime/stderr" | tr -d \'\\n\'); '
-        'printf \'__ZEROFS_LOCK_RESULT__ %s %s %s %s\\n\' '
-        '"$token" "$status" "$stdout" "$stderr"; '
-        "done"
+    program = r'''
+import base64
+import fcntl
+import os
+import selectors
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+
+def process_group_exists(pgid):
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def terminate_payload(process):
+    pgid = process.pid
+    if process_group_exists(pgid):
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    deadline = time.monotonic() + 2
+    while process_group_exists(pgid) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    if process_group_exists(pgid):
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    try:
+        process.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait(timeout=2)
+
+
+def stop_holder(signum, _frame):
+    raise SystemExit(128 + signum)
+
+
+def emit_result(token, status, stdout_path, stderr_path):
+    stdout = base64.b64encode(stdout_path.read_bytes()).decode()
+    stderr = base64.b64encode(stderr_path.read_bytes()).decode()
+    print(
+        f"__ZEROFS_LOCK_RESULT__ {token} {status} {stdout} {stderr}",
+        flush=True,
     )
+
+
+def main():
+    signal.signal(signal.SIGTERM, stop_holder)
+    signal.signal(signal.SIGHUP, stop_holder)
+    lock_handle = open(sys.argv[1], "w")
+    try:
+        fcntl.flock(lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise SystemExit(75)
+    print("LOCKED", flush=True)
+    active = None
+    try:
+        while True:
+            request = sys.stdin.readline()
+            if not request:
+                return
+            action, token, payload = (request.rstrip("\n").split(" ", 2) + [""])[:3]
+            if action == "CANCEL":
+                continue
+            if action != "RUN" or not token or not payload:
+                raise RuntimeError("invalid deployment lock request")
+            script = base64.b64decode(payload)
+            with tempfile.TemporaryDirectory(prefix="zerofs-lock-command-") as directory:
+                stdout_path = os.path.join(directory, "stdout")
+                stderr_path = os.path.join(directory, "stderr")
+                script_path = os.path.join(directory, "script")
+                with open(script_path, "wb") as handle:
+                    handle.write(script)
+                with (
+                    open(script_path, "rb") as stdin_handle,
+                    open(stdout_path, "wb") as stdout_handle,
+                    open(stderr_path, "wb") as stderr_handle,
+                ):
+                    active = subprocess.Popen(
+                        ["bash", "-se"],
+                        stdin=stdin_handle,
+                        stdout=stdout_handle,
+                        stderr=stderr_handle,
+                        start_new_session=True,
+                        close_fds=True,
+                    )
+                print(
+                    f"__ZEROFS_LOCK_STARTED__ {token} {active.pid}",
+                    flush=True,
+                )
+                selector = selectors.DefaultSelector()
+                selector.register(sys.stdin, selectors.EVENT_READ)
+                cancelled = False
+                try:
+                    while active.poll() is None:
+                        if not selector.select(timeout=0.1):
+                            continue
+                        control = sys.stdin.readline()
+                        if not control:
+                            terminate_payload(active)
+                            active = None
+                            return
+                        fields = control.rstrip("\n").split(" ", 2)
+                        if fields[:2] == ["CANCEL", token]:
+                            terminate_payload(active)
+                            cancelled = True
+                            break
+                finally:
+                    selector.close()
+                status = 130 if cancelled else active.wait()
+                active = None
+                emit_result(
+                    token,
+                    status,
+                    Path(stdout_path),
+                    Path(stderr_path),
+                )
+    finally:
+        if active is not None:
+            terminate_payload(active)
+
+
+main()
+'''
+    return f"exec python3 -u -c {shlex.quote(program)} {shlex.quote(path)}"
 
 
 @dataclass(frozen=True)
@@ -836,7 +1048,13 @@ class Runner:
                 if self.is_local_vm_host(host):
                     if self.dry_run:
                         self.probe(
-                            ["sudo", "flock", "-n", path, "true"],
+                            [
+                                "sudo",
+                                "bash",
+                                "-c",
+                                f"test ! -e {shlex.quote(path)} || "
+                                f"exec flock -n {shlex.quote(path)} true",
+                            ],
                             capture=True,
                         )
                     command = ["sudo", "bash", "-c", lock_script]
@@ -852,7 +1070,18 @@ class Runner:
                         host,
                         remote,
                     ]
-                lease = stack.enter_context(_FlockLease(command, dry_run=self.dry_run))
+                display_command = (
+                    ["local-vm-lock-holder", path]
+                    if self.is_local_vm_host(host)
+                    else ["ssh", host, "vm-lock-holder", path]
+                )
+                lease = stack.enter_context(
+                    _FlockLease(
+                        command,
+                        dry_run=self.dry_run,
+                        display_command=display_command,
+                    )
+                )
                 self._active_leases.append(lease)
                 stack.callback(self._active_leases.remove, lease)
                 self._remote_leases[host] = lease
@@ -862,11 +1091,11 @@ class Runner:
     def run_remote_shell(
         self, host: str, script: str
     ) -> subprocess.CompletedProcess[str] | str | None:
-        if self.dry_run:
-            return None
         lease = self._remote_leases.get(host)
         if lease is not None:
             return lease.execute(script)
+        if self.dry_run:
+            return None
         if self.is_local_vm_host(host):
             return self.run(
                 ["bash", "-se"],
@@ -1012,10 +1241,8 @@ def _stage_remote_file(
     runner: Runner, host: str, local_path: Path, remote_path: str
 ) -> None:
     if runner.dry_run:
-        if runner.is_local_vm_host(host):
-            print(f"+ stage-local-file {local_path} {remote_path}")
-        else:
-            runner.run(["scp", "-q", str(local_path), f"{host}:{remote_path}"])
+        ownership = "locked-plan" if host in runner._remote_leases else "plan"
+        print(f"+ {ownership} stage-file {local_path} {host}:{remote_path}")
         return
     encoded = base64.b64encode(local_path.read_bytes()).decode("ascii")
     remote = shlex.quote(remote_path)

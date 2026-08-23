@@ -5,9 +5,11 @@ import contextlib
 import hashlib
 import io
 import os
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
 import unittest
 from pathlib import Path
@@ -1290,7 +1292,11 @@ class DeploymentLockTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             lock = Path(directory) / "coordinator.lock"
             holder = "flock() { return 0; }; " + deploy._remote_lock_holder(str(lock))
-            lease = deploy._FlockLease(["bash", "-c", holder], dry_run=False)
+            lease = deploy._FlockLease(
+                ["bash", "-c", holder],
+                dry_run=False,
+                display_command=["test-lock-holder"],
+            )
 
             with lease:
                 result = lease.execute(
@@ -1315,48 +1321,308 @@ class DeploymentLockTests(unittest.TestCase):
                 self.assertIn("stderr: failed-err", str(caught.exception))
 
     def test_keyboard_interrupt_reaches_rollback_before_lock_release(self) -> None:
-        script = f"""
+        script = """
 import importlib.util
+import fcntl
 import os
+import shlex
 import signal
+import subprocess
 import sys
+import threading
+import time
 
 spec = importlib.util.spec_from_file_location("deploy_under_signal", sys.argv[1])
 module = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = module
 spec.loader.exec_module(module)
-holder = "flock() {{ return 0; }}; " + module._remote_lock_holder(sys.argv[2])
-lease = module._FlockLease(["bash", "-c", holder], dry_run=False)
+lock_path, payload_pid_path, shim_dir = sys.argv[2:]
+flock_shim = "flock() { python3 -c 'import fcntl; fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)'; }; "
+holder = flock_shim + module._remote_lock_holder(lock_path)
+lease = module._FlockLease(
+    ["env", f"PATH={shim_dir}:{os.environ['PATH']}", "bash", "-c", holder],
+    dry_run=False,
+)
+
+def lock_available():
+    handle = open(lock_path, "w")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return False
+    finally:
+        handle.close()
+    return True
+
+def interrupt_active_payload():
+    deadline = time.monotonic() + 3
+    while not os.path.exists(payload_pid_path):
+        if time.monotonic() >= deadline:
+            os._exit(91)
+        time.sleep(0.01)
+    os.kill(os.getpid(), signal.SIGINT)
+
+payload_source = f'''import os
+import signal
+import time
+with open({payload_pid_path!r}, "w") as handle:
+    handle.write(str(os.getpid()))
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+while True:
+    time.sleep(1)
+'''
+payload_script = "exec python3 -c " + shlex.quote(payload_source)
+threading.Thread(target=interrupt_active_payload, daemon=True).start()
 try:
     with lease:
         try:
-            os.killpg(os.getpgrp(), signal.SIGINT)
+            lease.execute(payload_script)
         except KeyboardInterrupt:
+            payload_pid = int(open(payload_pid_path).read())
+            try:
+                os.kill(payload_pid, 0)
+            except ProcessLookupError:
+                print("payload-reaped", flush=True)
+            else:
+                raise RuntimeError("cancelled payload is still alive")
+            if lock_available():
+                raise RuntimeError("holder released flock before rollback")
             result = lease.execute("printf 'rollback-complete'")
             print(result.stdout, flush=True)
             raise
 except KeyboardInterrupt:
     print("keyboard-interrupt-preserved", flush=True)
+if not lock_available():
+    raise RuntimeError("flock was not released after clean holder close")
+print("lock-reacquired", flush=True)
 """
         with tempfile.TemporaryDirectory() as directory:
+            directory_path = Path(directory)
+            setsid = directory_path / "setsid"
+            setsid.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os, sys\n"
+                "os.setsid()\n"
+                "os.execvp(sys.argv[1], sys.argv[1:])\n"
+            )
+            setsid.chmod(0o755)
             result = subprocess.run(
                 [
                     sys.executable,
                     "-c",
                     script,
                     str(MODULE_PATH),
-                    str(Path(directory) / "coordinator.lock"),
+                    str(directory_path / "coordinator.lock"),
+                    str(directory_path / "payload.pid"),
+                    directory,
                 ],
                 text=True,
                 capture_output=True,
                 check=False,
                 start_new_session=True,
+                timeout=20,
             )
 
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("payload-reaped", result.stdout)
         self.assertIn("rollback-complete", result.stdout)
         self.assertIn("keyboard-interrupt-preserved", result.stdout)
+        self.assertIn("lock-reacquired", result.stdout)
         self.assertNotIn("deployment lock process exited", result.stderr)
+
+    def test_parent_death_cancels_payload_and_releases_real_flock(self) -> None:
+        helper = """
+import importlib.util
+import os
+import shlex
+import sys
+
+spec = importlib.util.spec_from_file_location("deploy_parent_death", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+lock_path, holder_pid_path, payload_pid_path, shim_dir = sys.argv[2:]
+flock_shim = "flock() { python3 -c 'import fcntl; fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)'; }; "
+holder = flock_shim + module._remote_lock_holder(lock_path)
+lease = module._FlockLease(
+    ["env", f"PATH={shim_dir}:{os.environ['PATH']}", "bash", "-c", holder],
+    dry_run=False,
+)
+payload_source = f'''import os
+import signal
+import time
+with open({payload_pid_path!r}, "w") as handle:
+    handle.write(str(os.getpid()))
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+while True:
+    time.sleep(1)
+'''
+with lease:
+    with open(holder_pid_path, "w") as handle:
+        handle.write(str(lease.process.pid))
+    lease.execute("exec python3 -c " + shlex.quote(payload_source))
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            directory_path = Path(directory)
+            setsid = directory_path / "setsid"
+            setsid.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os, sys\n"
+                "os.setsid()\n"
+                "os.execvp(sys.argv[1], sys.argv[1:])\n"
+            )
+            setsid.chmod(0o755)
+            lock = directory_path / "coordinator.lock"
+            holder_pid_path = directory_path / "holder.pid"
+            payload_pid_path = directory_path / "payload.pid"
+            coordinator = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    helper,
+                    str(MODULE_PATH),
+                    str(lock),
+                    str(holder_pid_path),
+                    str(payload_pid_path),
+                    directory,
+                ],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
+            deadline = time.monotonic() + 5
+            while not holder_pid_path.exists() or not payload_pid_path.exists():
+                if time.monotonic() >= deadline:
+                    coordinator.kill()
+                    self.fail("holder and payload did not start")
+                time.sleep(0.02)
+            holder_pid = int(holder_pid_path.read_text())
+            payload_pid = int(payload_pid_path.read_text())
+            coordinator.kill()
+            coordinator.wait(timeout=3)
+            assert coordinator.stdout is not None and coordinator.stderr is not None
+            coordinator.stdout.close()
+            coordinator.stderr.close()
+            try:
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    payload_alive = True
+                    holder_alive = True
+                    try:
+                        os.kill(payload_pid, 0)
+                    except ProcessLookupError:
+                        payload_alive = False
+                    try:
+                        os.kill(holder_pid, 0)
+                    except ProcessLookupError:
+                        holder_alive = False
+                    if not payload_alive and not holder_alive:
+                        break
+                    time.sleep(0.05)
+                self.assertFalse(payload_alive, "payload survived coordinator death")
+                self.assertFalse(holder_alive, "holder survived coordinator death")
+                probe = subprocess.run(
+                    [
+                        sys.executable,
+                        "-c",
+                        "import fcntl, sys; h=open(sys.argv[1], 'w'); "
+                        "fcntl.flock(h, fcntl.LOCK_EX | fcntl.LOCK_NB)",
+                        str(lock),
+                    ],
+                    check=False,
+                )
+                self.assertEqual(probe.returncode, 0, "flock remained held")
+            finally:
+                for pid in (payload_pid, holder_pid):
+                    try:
+                        os.killpg(pid, signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError):
+                        try:
+                            os.kill(pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+
+    def test_second_interrupt_performs_bounded_payload_and_holder_cleanup(self) -> None:
+        script = """
+import fcntl
+import importlib.util
+import os
+import shlex
+import signal
+import sys
+import threading
+import time
+
+spec = importlib.util.spec_from_file_location("deploy_second_interrupt", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+lock_path, payload_pid_path = sys.argv[2:]
+holder = module._remote_lock_holder(lock_path)
+lease = module._FlockLease(["bash", "-c", holder], dry_run=False)
+
+def interrupt_twice():
+    deadline = time.monotonic() + 3
+    while not os.path.exists(payload_pid_path):
+        if time.monotonic() >= deadline:
+            os._exit(92)
+        time.sleep(0.01)
+    os.kill(os.getpid(), signal.SIGINT)
+    time.sleep(0.2)
+    os.kill(os.getpid(), signal.SIGINT)
+
+payload_source = f'''import os
+import signal
+import time
+with open({payload_pid_path!r}, "w") as handle:
+    handle.write(str(os.getpid()))
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+while True:
+    time.sleep(1)
+'''
+threading.Thread(target=interrupt_twice, daemon=True).start()
+try:
+    with lease:
+        lease.execute("exec python3 -c " + shlex.quote(payload_source))
+except KeyboardInterrupt:
+    print("second-interrupt-preserved", flush=True)
+payload_pid = int(open(payload_pid_path).read())
+try:
+    os.kill(payload_pid, 0)
+except ProcessLookupError:
+    print("payload-reaped", flush=True)
+else:
+    raise RuntimeError("payload survived second interrupt")
+handle = open(lock_path, "w")
+fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+print("lock-reacquired", flush=True)
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            directory_path = Path(directory)
+            started = time.monotonic()
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    script,
+                    str(MODULE_PATH),
+                    str(directory_path / "coordinator.lock"),
+                    str(directory_path / "payload.pid"),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+                start_new_session=True,
+                timeout=10,
+            )
+            elapsed = time.monotonic() - started
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertLess(elapsed, 7)
+        self.assertIn("second-interrupt-preserved", result.stdout)
+        self.assertIn("payload-reaped", result.stdout)
+        self.assertIn("lock-reacquired", result.stdout)
 
     def test_holder_exit_does_not_mask_an_active_keyboard_interrupt(self) -> None:
         lease = deploy._FlockLease(["unused"], dry_run=False)
@@ -1429,8 +1695,6 @@ class VmTransportTests(unittest.TestCase):
             capture: bool = False,
         ) -> subprocess.CompletedProcess[str]:
             self.identity_calls.append(command)
-            if command[:3] == ["sudo", "flock", "-n"]:
-                return subprocess.CompletedProcess(command, 0, "", "")
             return self.run(command, capture=capture)
 
         def run(
@@ -1602,10 +1866,10 @@ class VmTransportTests(unittest.TestCase):
         self.assertIn(
             [
                 "sudo",
-                "flock",
-                "-n",
-                "/run/lock/zerofs-vm-nfs-global.coordinator.lock",
-                "true",
+                "bash",
+                "-c",
+                "test ! -e /run/lock/zerofs-vm-nfs-global.coordinator.lock || "
+                "exec flock -n /run/lock/zerofs-vm-nfs-global.coordinator.lock true",
             ],
             runner.identity_calls,
         )
@@ -1622,6 +1886,28 @@ class VmTransportTests(unittest.TestCase):
 
         self.assertEqual(runner._active_leases, [])
         self.assertEqual(runner._remote_leases, {})
+
+    def test_local_dry_run_marks_commands_and_staging_as_lock_owned(self) -> None:
+        runner = self.IdentityRunner(dry_run=True)
+        runner.configure_vm_transport(self.args())
+        output = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source"
+            source.write_text("payload")
+            with contextlib.redirect_stdout(output):
+                with runner.remote_deployment_locks(self.args()):
+                    deploy._ssh(runner, "ubuntu-main", "printf 'planned-command'")
+                    deploy._stage_remote_file(
+                        runner,
+                        "ubuntu-main",
+                        source,
+                        "/tmp/planned-target",
+                    )
+
+        self.assertIn("+ locked-shell", output.getvalue())
+        self.assertIn("+ locked-plan stage-file", output.getvalue())
+        self.assertNotIn("+ bash -se", output.getvalue())
+        self.assertNotIn("+ stage-local-file", output.getvalue())
 
 
 class OwnershipMigrationTests(unittest.TestCase):
@@ -1688,7 +1974,8 @@ class CliDryRunTests(ConfigValidationTests):
     def assert_direct_nfs_mount_is_provisioned(
         self, result: subprocess.CompletedProcess[str], container_ip: str
     ) -> None:
-        self.assertIn("ubuntu-main bash -se", result.stdout)
+        self.assertIn("+ acquire-lock ssh ubuntu-main vm-lock-holder", result.stdout)
+        self.assertIn("+ locked-shell", result.stdout)
         self.assertIn(r"mnt-zerofs\x2dfiles.mount", result.stdout)
         self.assertIn("vm_nfs_transition.py", result.stdout)
         self.assertIn("reconcile-zerofs-nfs.sh", result.stdout)
