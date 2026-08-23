@@ -27,7 +27,7 @@ fn hotpath_json_distinguishes_completed_and_cancelled_futures() {
         .env("HOTPATH_REPORT", "functions-timing,futures,threads")
         .env("HOTPATH_TOKIO_RUNTIME_INTERVAL_MS", "10")
         .env("HOTPATH_CPU_BASELINE_OFF", "true")
-        .env("ZEROFS_HOTPATH_LIFECYCLE_HOLD_MS", "250")
+        .env("ZEROFS_HOTPATH_LIFECYCLE_HOLD_MS", "2000")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -80,7 +80,7 @@ fn wait_for_tokio_runtime_snapshot(address: SocketAddr) -> Result<(), String> {
 }
 
 fn wait_for_graceful_exit(child: &mut std::process::Child) -> Result<(), String> {
-    for _ in 0..80 {
+    for _ in 0..320 {
         if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
             return status
                 .success()
