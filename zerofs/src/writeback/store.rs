@@ -2640,65 +2640,6 @@ mod tests {
         (store, remote, temp)
     }
 
-    async fn test_ssd_store_with_physical_headroom(
-        headroom_bytes: u64,
-    ) -> (WritebackObjectStore, Arc<InMemory>, tempfile::TempDir) {
-        let temp = tempfile::tempdir().unwrap();
-        let writeback_dir = temp.path().join("writeback");
-        let journal = Arc::new(
-            Journal::open(
-                &writeback_dir,
-                JournalIdentity {
-                    format_version: 1,
-                    bucket_id: "multipart-physical-headroom".to_owned(),
-                    backend_endpoint: "memory://remote".to_owned(),
-                    database_prefix: "zerofs/pilot".to_owned(),
-                    backend_kind: "memory".to_owned(),
-                    encryption_key_identity_sha256: [0x77; 32],
-                },
-            )
-            .unwrap(),
-        );
-        let space = Arc::new(PhysicalSpaceSampler::new(writeback_dir.clone()));
-        let sample = space.sample().await.unwrap();
-        assert!(sample.available_bytes > headroom_bytes);
-        let settings = WritebackSettings {
-            dir: writeback_dir,
-            ack_mode: AckMode::Ssd,
-            memory_bytes: 1,
-            disk_bytes: 64 * 1024 * 1024,
-            min_free_bytes: sample.available_bytes - headroom_bytes,
-            high_watermark_percent: 95,
-            resume_percent: 85,
-            upload_concurrency: 2,
-            local_concurrency: 2,
-            shutdown_flush: ShutdownFlush::Local,
-        };
-        let ssd = Arc::new(
-            SsdAdmission::recover(
-                settings.disk_bytes,
-                100,
-                settings.high_watermark_percent,
-                settings.resume_percent,
-                settings.min_free_bytes,
-                std::iter::empty(),
-                Some(sample),
-            )
-            .unwrap(),
-        );
-        let remote = Arc::new(InMemory::new());
-        let store = WritebackObjectStore::open_paused_with_owners(
-            remote.clone(),
-            journal,
-            settings,
-            space,
-            ssd,
-        )
-        .await
-        .unwrap();
-        (store, remote, temp)
-    }
-
     #[tokio::test]
     async fn out_of_order_space_probe_retries_with_the_latest_sample() {
         let temp = tempfile::tempdir().unwrap();
@@ -4314,51 +4255,6 @@ mod tests {
         assert!(second.await.unwrap().is_err());
         assert_eq!(store.inner.ssd.used_operations(), 0);
         assert_eq!(store.inner.ssd.used_bytes(), 0);
-        store.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn parallel_ssd_uploads_cannot_race_min_free_reserve() {
-        let payload_len = 4 * 1024 * 1024_u64;
-        let first_path = Path::from("physical-race-a");
-        let second_path = Path::from("physical-race-b");
-        let journal_bytes =
-            MutationRecord::ssd_reservation_estimate(first_path.as_ref(), None, payload_len)
-                .unwrap();
-        let headroom = payload_len + journal_bytes + 1024 * 1024;
-        let (store, _remote, _temp) = test_ssd_store_with_physical_headroom(headroom).await;
-        let payload = Bytes::from(vec![0x5a; payload_len as usize]);
-        let mut first = store.put_multipart(&first_path).await.unwrap();
-        let mut second = store.put_multipart(&second_path).await.unwrap();
-        let first_part = tokio::spawn(first.put_part(payload.clone().into()));
-        let second_part = tokio::spawn(second.put_part(payload.into()));
-
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while !first_part.is_finished() && !second_part.is_finished() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("neither physical reservation was admitted");
-        assert_ne!(
-            first_part.is_finished(),
-            second_part.is_finished(),
-            "parallel parts both crossed one-part physical headroom"
-        );
-
-        if first_part.is_finished() {
-            first_part.await.unwrap().unwrap();
-            first.abort().await.unwrap();
-            let _ = second_part.await.unwrap();
-            second.abort().await.unwrap();
-        } else {
-            second_part.await.unwrap().unwrap();
-            second.abort().await.unwrap();
-            let _ = first_part.await.unwrap();
-            first.abort().await.unwrap();
-        }
-        assert_eq!(store.inner.ssd.used_bytes(), 0);
-        assert_eq!(store.inner.ssd.outstanding_physical_claims(), 0);
         store.shutdown().await.unwrap();
     }
 

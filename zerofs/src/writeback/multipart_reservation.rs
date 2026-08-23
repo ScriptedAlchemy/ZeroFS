@@ -330,6 +330,7 @@ pub(crate) fn remove_aborted_ssd_multipart(
 mod tests {
     use super::*;
     use crate::writeback::space_sample::PhysicalSpaceSample;
+    use std::sync::Arc;
     use std::time::Duration;
 
     fn sample(available_bytes: u64) -> PhysicalSpaceSample {
@@ -447,29 +448,84 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ssd_parts_share_physical_free_space_reserve() {
-        let admission = SsdAdmission::new(200, 100, 95, 80, 10).unwrap();
-        let first = ssd_part(&admission, 60, 5, 1).await;
-        let second = tokio::spawn({
-            let admission = admission.clone();
-            async move { SsdMultipartPartReservation::reserve(&admission, 31, 5, 0, sample(100)).await }
-        });
-        tokio::time::sleep(Duration::from_millis(20)).await;
+    async fn parallel_ssd_parts_share_physical_free_space_reserve_atomically() {
+        let admission = Arc::new(SsdAdmission::new(200, 100, 95, 80, 10).unwrap());
+        let start = Arc::new(tokio::sync::Barrier::new(3));
+        let (granted, mut grants) = tokio::sync::mpsc::unbounded_channel();
+        let mut tasks = Vec::new();
+        for _ in 0..2 {
+            let admission = Arc::clone(&admission);
+            let start = Arc::clone(&start);
+            let granted = granted.clone();
+            tasks.push(tokio::spawn(async move {
+                start.wait().await;
+                let reservation =
+                    SsdMultipartPartReservation::reserve(&admission, 41, 9, 1, sample(100)).await;
+                granted.send(reservation).unwrap();
+            }));
+        }
+        drop(granted);
+        start.wait().await;
+
+        let first = tokio::time::timeout(Duration::from_secs(1), grants.recv())
+            .await
+            .expect("neither physical reservation was admitted")
+            .expect("physical reservation workers exited")
+            .unwrap();
+        let unexpected_second = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if admission.has_min_free_waiters() {
+                    return None;
+                }
+                match grants.try_recv() {
+                    Ok(reservation) => return Some(reservation),
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                        tokio::task::yield_now().await;
+                    }
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        panic!("physical reservation workers exited")
+                    }
+                }
+            }
+        })
+        .await
+        .expect("the competing physical reservation neither queued nor completed");
         assert!(
-            !second.is_finished(),
-            "the second part must observe the first part's physical claim"
+            unexpected_second.is_none(),
+            "parallel parts both crossed one-part physical headroom"
         );
+        let snapshot = admission.snapshot();
+        assert_eq!(snapshot.used_ssd_bytes, 50);
+        assert_eq!(snapshot.used_operations, 2);
+        assert_eq!(snapshot.outstanding_physical_claims, 50);
+        assert_eq!(snapshot.available_bytes, 100);
+
         let root = tempfile::tempdir().unwrap();
         let first_staging = root.path().join("first");
         fs::create_dir(&first_staging).unwrap();
         fs::write(first_staging.join("payload.staged"), b"first").unwrap();
         cleanup_aborted_ssd_multipart(first_staging, vec![first]);
 
-        let second = second.await.unwrap().unwrap();
+        let second = tokio::time::timeout(Duration::from_secs(1), grants.recv())
+            .await
+            .expect("cleanup did not release the competing physical reservation")
+            .expect("physical reservation workers exited")
+            .unwrap();
+        let snapshot = admission.snapshot();
+        assert_eq!(snapshot.used_ssd_bytes, 50);
+        assert_eq!(snapshot.used_operations, 2);
+        assert_eq!(snapshot.outstanding_physical_claims, 50);
         let second_staging = root.path().join("second");
         fs::create_dir(&second_staging).unwrap();
         fs::write(second_staging.join("payload.staged"), b"second").unwrap();
         cleanup_aborted_ssd_multipart(second_staging, vec![second]);
+        for task in tasks {
+            task.await.unwrap();
+        }
+        let snapshot = admission.snapshot();
+        assert_eq!(snapshot.used_ssd_bytes, 0);
+        assert_eq!(snapshot.used_operations, 0);
+        assert_eq!(snapshot.outstanding_physical_claims, 0);
     }
 
     #[tokio::test]
