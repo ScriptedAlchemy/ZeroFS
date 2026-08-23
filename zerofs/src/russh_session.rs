@@ -224,43 +224,51 @@ fn select_rsa_auth_hash(
 
 async fn close_ssh_handle(
     mut handle: client::Handle<StrictHostKey>,
+    abort_socket: std::net::TcpStream,
     force: &CancellationToken,
 ) -> Result<(), TransportError> {
     let disconnect = handle.disconnect(russh::Disconnect::ByApplication, "", "");
-    tokio::select! {
+    let forced = tokio::select! {
         biased;
-        _ = force.cancelled() => {
-            return Err(TransportError::Close(
-                "russh disconnect was cancelled before it could be queued".to_owned()
-            ));
-        }
+        _ = force.cancelled() => true,
         result = disconnect => {
             if let Err(error) = result {
                 tracing::warn!(%error, "russh disconnect failed after SFTP close");
             }
+            false
         }
-    }
-    tokio::select! {
-        biased;
-        _ = force.cancelled() => {
-            Err(TransportError::Close(
-                "russh connection did not terminate before forced cleanup".to_owned()
-            ))
-        }
-        result = &mut handle => {
-            if let Err(error) = result {
-                tracing::warn!(%error, "russh connection task failed during close");
+    };
+    if !forced {
+        tokio::select! {
+            biased;
+            _ = force.cancelled() => {}
+            result = &mut handle => {
+                if let Err(error) = result {
+                    tracing::warn!(%error, "russh connection task failed during close");
+                }
+                return Ok(());
             }
-            Ok(())
         }
     }
+    if let Err(error) = abort_socket.shutdown(std::net::Shutdown::Both) {
+        tracing::warn!(%error, "failed to shut down forced russh socket");
+    }
+    if let Err(error) = (&mut handle).await {
+        tracing::warn!(%error, "russh connection task failed during forced close");
+    }
+    Ok(())
+}
+
+struct ConnectedSshHandle {
+    handle: client::Handle<StrictHostKey>,
+    abort_socket: std::net::TcpStream,
 }
 
 async fn connect_ssh_handle(
     endpoint: &crate::config::SftpEndpoint,
     known_hosts: &Path,
     force: &CancellationToken,
-) -> Result<client::Handle<StrictHostKey>, TransportError> {
+) -> Result<ConnectedSshHandle, TransportError> {
     let socket = tokio::select! {
         biased;
         _ = force.cancelled() => return Err(TransportError::PoolClosed),
@@ -300,12 +308,14 @@ async fn connect_ssh_handle(
     let connecting = client::connect_stream(config, socket, handler);
     tokio::pin!(connecting);
     tokio::select! {
-        result = &mut connecting => result.map_err(|error| {
-            TransportError::Open(format!(
-                "russh connect to {}:{} failed: {error}",
-                endpoint.host, endpoint.port
-            ))
-        }),
+        result = &mut connecting => result
+            .map(|handle| ConnectedSshHandle { handle, abort_socket })
+            .map_err(|error| {
+                TransportError::Open(format!(
+                    "russh connect to {}:{} failed: {error}",
+                    endpoint.host, endpoint.port
+                ))
+            }),
         _ = force.cancelled() => {
             if let Err(error) = abort_socket.shutdown(std::net::Shutdown::Both) {
                 tracing::warn!(%error, "failed to shut down cancelled SSH socket");
@@ -313,7 +323,7 @@ async fn connect_ssh_handle(
             match connecting.await {
                 Ok(handle) => {
                     let cleanup_force = CancellationToken::new();
-                    close_ssh_handle(handle, &cleanup_force).await?;
+                    close_ssh_handle(handle, abort_socket, &cleanup_force).await?;
                 }
                 Err(error) => {
                     tracing::debug!(%error, "cancelled SSH connection terminated during handshake");
@@ -334,7 +344,10 @@ impl SessionFactory for RusshSessionFactory {
             return Err(TransportError::PoolClosed);
         }
 
-        let mut handle = connect_ssh_handle(&self.endpoint, &self.known_hosts, &force).await?;
+        let ConnectedSshHandle {
+            mut handle,
+            abort_socket,
+        } = connect_ssh_handle(&self.endpoint, &self.known_hosts, &force).await?;
         let session = {
             let session = async {
                 let hash = if self.identity_key.algorithm().is_rsa() {
@@ -379,7 +392,7 @@ impl SessionFactory for RusshSessionFactory {
                 // cleanup must outlive that deadline so account capacity is not
                 // released while a detached SSH connection can still exist.
                 let cleanup_force = CancellationToken::new();
-                return match close_ssh_handle(handle, &cleanup_force).await {
+                return match close_ssh_handle(handle, abort_socket, &cleanup_force).await {
                     Ok(()) => Err(open_error),
                     Err(close_error) => Err(close_error),
                 };
@@ -400,13 +413,17 @@ impl SessionFactory for RusshSessionFactory {
             sftp,
             capabilities,
             limits,
-            Box::new(RusshConnectionOwner { handle }),
+            Box::new(RusshConnectionOwner {
+                handle,
+                abort_socket,
+            }),
         )) as Box<dyn TransportSession>)
     }
 }
 
 struct RusshConnectionOwner {
     handle: client::Handle<StrictHostKey>,
+    abort_socket: std::net::TcpStream,
 }
 
 impl fmt::Debug for RusshConnectionOwner {
@@ -420,7 +437,7 @@ impl fmt::Debug for RusshConnectionOwner {
 #[async_trait]
 impl SshConnectionOwner for RusshConnectionOwner {
     async fn close(self: Box<Self>, force: CancellationToken) -> Result<(), TransportError> {
-        close_ssh_handle(self.handle, &force).await
+        close_ssh_handle(self.handle, self.abort_socket, &force).await
     }
 }
 
@@ -936,7 +953,7 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
     }
 
     #[tokio::test]
-    async fn russh_forced_close_never_reports_success() {
+    async fn russh_forced_close_shuts_down_the_socket_and_awaits_connection_exit() {
         let env = Loopback::start().await;
         let factory = RusshSessionFactory::new(
             env.endpoint.clone(),
@@ -948,12 +965,15 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
         let force = CancellationToken::new();
         force.cancel();
 
-        let error = session
-            .close(force)
-            .await
-            .expect_err("forced cleanup must fail closed instead of releasing capacity");
+        session.close(force).await.unwrap();
 
-        assert!(matches!(error, TransportError::Close(_)), "{error:?}");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while env.active_connections.load(Ordering::SeqCst) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("forced close must terminate the remote SSH handler");
     }
 
     #[tokio::test]
