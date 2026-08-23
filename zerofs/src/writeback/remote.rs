@@ -942,6 +942,9 @@ fn is_terminal_remote_error(error: &object_store::Error) -> bool {
     match error {
         object_store::Error::AlreadyExists { source, .. } => source.is::<RemoteContentDivergence>(),
         object_store::Error::Precondition { source, .. } => source.is::<MissingRemotePredecessor>(),
+        object_store::Error::NotSupported { source } => source
+            .downcast_ref::<crate::sftp_object_store::RemoteError>()
+            .is_some_and(crate::sftp_object_store::RemoteError::is_pool_closed),
         _ if crate::retrying_object_store::has_permanent_source(error) => true,
         _ => false,
     }
@@ -2057,6 +2060,7 @@ mod tests {
     struct CleanupDebtTransportState {
         writes: std::sync::atomic::AtomicUsize,
         removes: std::sync::atomic::AtomicUsize,
+        cleanup_pool_closed: std::sync::atomic::AtomicBool,
     }
 
     #[derive(Debug, Clone)]
@@ -2115,9 +2119,17 @@ mod tests {
             self.0
                 .removes
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Err(crate::sftp_transport::TransportError::Operation(
-                "injected unresolved staging cleanup".to_owned(),
-            ))
+            if self
+                .0
+                .cleanup_pool_closed
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                Err(crate::sftp_transport::TransportError::PoolClosed)
+            } else {
+                Err(crate::sftp_transport::TransportError::Operation(
+                    "injected unresolved staging cleanup".to_owned(),
+                ))
+            }
         }
 
         async fn close(
@@ -2179,6 +2191,53 @@ mod tests {
                 > crate::sftp_object_store::SFTP_STAGING_CLEANUP_ATTEMPTS,
             "pool shutdown must drain the final owner-scheduled cleanup"
         );
+    }
+
+    #[tokio::test]
+    async fn scheduler_classifier_terminalizes_cleanup_debt_caused_by_pool_close() {
+        let state = Arc::new(CleanupDebtTransportState::default());
+        state
+            .cleanup_pool_closed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let pool = crate::sftp_transport::SftpSessionPool::new_writable(
+            Arc::new(CleanupDebtFactory(state.clone())),
+            1,
+            1,
+            1,
+        )
+        .await
+        .unwrap();
+        let backend: Arc<dyn ObjectStore> = Arc::new(
+            crate::sftp_object_store::SftpObjectStore::new(pool.clone(), Path::from("root"))
+                .unwrap(),
+        );
+        let remote: Arc<dyn ObjectStore> = Arc::new(
+            crate::retrying_object_store::RetryingObjectStore::new(backend),
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let journal = Arc::new(journal_with_local_records(temp.path(), 0));
+        let payload = Bytes::from_static(b"pool closed cleanup debt");
+        let record = put_record(1, "root/pool-closed-cleanup", &payload);
+        let record = journal.commit_put(record, &payload).unwrap();
+
+        let error = apply_record_with_tracked_cleanup(remote, journal, record)
+            .await
+            .expect_err("pool-closed cleanup debt must fail the publication");
+        assert!(matches!(error, object_store::Error::NotSupported { .. }));
+        assert!(
+            is_terminal_remote_error(&error),
+            "typed SFTP pool closure must terminalize the scheduler: {error:?}"
+        );
+        assert_eq!(
+            state.writes.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the retry wrapper must not replay the scheduler-owned publication"
+        );
+        assert!(
+            state.removes.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "pool closure must attempt cleanup before terminalizing"
+        );
+        pool.shutdown().await.unwrap();
     }
 
     #[tokio::test(start_paused = true)]

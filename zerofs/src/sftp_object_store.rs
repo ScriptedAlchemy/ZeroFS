@@ -187,7 +187,7 @@ pub enum RemoteError {
 }
 
 impl RemoteError {
-    fn is_pool_closed(&self) -> bool {
+    pub(crate) fn is_pool_closed(&self) -> bool {
         match self {
             Self::PoolClosed => true,
             Self::CleanupRequired { operation, debt } => {
@@ -2651,7 +2651,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn full_pool_publication_timeouts_cleanup_before_foreground_read_recovers() {
+    async fn full_physical_session_timeouts_cleanup_before_foreground_read_recovers() {
         let state = Arc::new(FullPoolPublicationState::default());
         let read_payload = b"foreground read recovered";
         let mut physical = encode_header(ObjectHeader {
