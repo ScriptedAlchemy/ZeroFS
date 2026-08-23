@@ -1609,7 +1609,8 @@ HOTPATH_PROFILE_ENV = {
     "HOTPATH_METRICS_SERVER_OFF": "false",
     "HOTPATH_METRICS_PORT": "9477",
     "HOTPATH_CPU_BASELINE_OFF": "true",
-    "HOTPATH_REPORT": "functions-timing,futures,threads",
+    "HOTPATH_REPORT": "functions-timing,futures,io,threads",
+    "HOTPATH_IO_TIME_SAMPLING_RATE": "1",
 }
 
 

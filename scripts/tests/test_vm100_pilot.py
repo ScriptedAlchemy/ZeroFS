@@ -3049,24 +3049,14 @@ class ProfileTests(unittest.TestCase):
                 ("", "missing or empty"),
                 ("not-json", "invalid JSON"),
                 (
-                    json.dumps(
-                        {
-                            "type": "hotpath_report",
-                            "functions_timing": {},
-                            "futures": {},
-                            "threads": {},
-                            "streams": {},
-                        }
-                    ),
+                    json.dumps({**_VALID_HOTPATH_REPORT_PAYLOAD, "streams": {}}),
                     "forbidden sections",
                 ),
                 (
                     json.dumps(
                         {
-                            "type": "hotpath_report",
+                            **_VALID_HOTPATH_REPORT_PAYLOAD,
                             "functions_timing": [],
-                            "futures": {},
-                            "threads": {},
                         }
                     ),
                     "required sections",
