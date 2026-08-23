@@ -772,7 +772,21 @@ def validate_hotpath_profile_env(path: Path | None) -> None:
     if path is None:
         raise ValueError("--hotpath-profile requires --env-file")
     values: dict[str, str] = {}
-    for raw_line in path.read_text().splitlines():
+    content = path.read_bytes().decode("utf-8")
+    unsupported_separators = (
+        "\r",
+        "\v",
+        "\f",
+        "\x1c",
+        "\x1d",
+        "\x1e",
+        "\x85",
+        "\u2028",
+        "\u2029",
+    )
+    if any(separator in content for separator in unsupported_separators):
+        raise ValueError("Hotpath production environment has an unsafe separator")
+    for raw_line in content.split("\n"):
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue

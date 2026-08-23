@@ -1677,6 +1677,8 @@ class CliDryRunTests(ConfigValidationTests):
                     "'",
                 ]
             ),
+            "carriage_return_records": "\r".join(valid_lines),
+            "vertical_tab_records": "\v".join(valid_lines),
         }
         for name, content in invalid_environments.items():
             with self.subTest(name=name):
