@@ -185,13 +185,55 @@ durable before a dev CT is replaced. A missing metric fails closed.
   `cargo build --features webui`, prepends `~/.local/bin` and `~/.cargo/bin` to
   `PATH`, enforces the Vite Node minimum (20.19+, 22.12+, or newer), and fails
   if `webui/dist/index.html` is absent.
-- SSH aliases for Proxmox and VM100 (defaults `gthost-tor-pve-root` and
-  `ubuntu-main`).
+- An SSH alias for Proxmox (default `gthost-tor-pve-root`). VM commands use
+  the backward-compatible `ssh` transport by default, which also requires the
+  VM100 alias `ubuntu-main`.
 - `pct`, `vzdump`, and a downloaded Debian LXC template on Proxmox.
 - Proxmox `local` storage configured for `snippets` so it can hold
   `local:snippets/zerofs-lxc-hook.sh`.
 - NFS client support (`nfs-common`) and systemd on VM100. The bundle never
   connects, mounts, or configures an NBD device on VM100.
+
+### VM100 command transport
+
+`deploy.py` defaults to `--vm-transport ssh`, preserving the existing VM100
+SSH path. When the coordinator itself is running inside VM100, explicitly use
+`--vm-transport local --vm-vmid 100` to avoid SSHing back into the same guest.
+Before any deployment mutation, local mode reads the guest hostname and DMI
+SMBIOS UUID, reads VM 100's `name` and `smbios1` UUID through `qm config` on
+the configured Proxmox host, and requires both identities to match exactly.
+Missing or mismatched identity fails closed; it never silently falls back to
+local execution. Local dry-runs perform the same identity reads plus a
+nonblocking probe of the VM-global lock when its lock file already exists; the
+probe does not create that file. Planned VM commands and staging are labelled
+as lock-owned without printing fabricated identity or lease success. Omit the
+local option to use the SSH fallback.
+
+Local mode starts the same root-owned, transaction-long `flock` holder directly
+with `sudo`. Every VM command, staged file, recovery action, rollback, and
+cleanup request continues through that one process. Its protocol preserves
+stdout, stderr, and the exit status separately. QEMU guest-agent commands such
+as `qm agent 100 ping` and `qm guest exec 100 -- hostname` remain useful for
+external health or recovery checks, but they are not a deployment transport:
+independent guest-agent executions cannot own the coordinator lock across the
+whole transaction. The lock holder runs in a separate process group so a
+terminal interrupt reaches the coordinator first; rollback finishes while the
+holder still owns the lock, and the original interrupt remains the reported
+failure. Each command runs in its own process group without inheriting the lock
+descriptor. A STARTED receipt binds its token, process-group ID, and owned
+runtime directory to the coordinator. Before that receipt, the holder launches
+the command through a parent-death-signalled process that self-stops without
+executing the payload. The holder durably records its ownership, emits STARTED,
+and waits for the coordinator's ACK before allowing the command to run. Holder
+death in any pre-ACK window therefore kills the stopped child without a root
+mutation. Interrupt or coordinator loss terminates and reaps the command group
+with bounded TERM-to-KILL escalation while the holder retains the lock for
+rollback. If the holder stops responding, a separate root cleanup command
+freezes it before validating the receipt. A markerless runtime is safe only for
+the coordinator's pre-STARTED `pgid=None` receipt, before any child is spawned.
+Cleanup terminates the active command group and removes its owned runtime, and
+its bounded finalizer always resumes and terminates the holder even when
+validation fails. Clean holder exit then releases the lock immediately.
 
 ## Templates and resource sizing
 
