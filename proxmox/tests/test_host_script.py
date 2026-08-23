@@ -65,6 +65,8 @@ class HostScriptTests(unittest.TestCase):
                 "b" * 64,
                 "--release-id",
                 "0123456789ab-cccccccccccccccc",
+                "--hotpath-profile",
+                "0",
                 "--dry-run",
                 *extra,
             ],
@@ -72,6 +74,11 @@ class HostScriptTests(unittest.TestCase):
             capture_output=True,
             check=False,
         )
+
+    def test_release_receipt_records_hotpath_profile_state(self) -> None:
+        source = HOST_SCRIPT.read_text()
+        self.assertIn("hotpath_profile=%s", source)
+        self.assertIn('"$hotpath_profile"', source)
 
     def test_recover_accepts_an_interrupted_older_release_transaction(self) -> None:
         source = HOST_SCRIPT.read_text()

@@ -758,6 +758,49 @@ def release_rustflags(existing: str) -> str:
     return flags
 
 
+HOTPATH_PROFILE_ENV = {
+    "HOTPATH_OUTPUT_PATH": "/srv/zerofs-persist/state/hotpath.json",
+    "HOTPATH_OUTPUT_FORMAT": "json",
+    "HOTPATH_METRICS_SERVER_OFF": "false",
+    "HOTPATH_METRICS_PORT": "9477",
+    "HOTPATH_CPU_BASELINE_OFF": "true",
+    "HOTPATH_REPORT": "functions-timing,futures,threads",
+}
+
+
+def validate_hotpath_profile_env(path: Path | None) -> None:
+    if path is None:
+        raise ValueError("--hotpath-profile requires --env-file")
+    values: dict[str, str] = {}
+    for raw_line in path.read_text().splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line.removeprefix("export ").lstrip()
+        key, separator, value = line.partition("=")
+        if not separator or key not in HOTPATH_PROFILE_ENV:
+            continue
+        value = value.strip()
+        if (
+            len(value) >= 2
+            and value[0] == value[-1]
+            and value[0] in {"'", '"'}
+        ):
+            value = value[1:-1]
+        values[key] = value
+    mismatches = [
+        key
+        for key, expected in HOTPATH_PROFILE_ENV.items()
+        if values.get(key) != expected
+    ]
+    if mismatches:
+        raise ValueError(
+            "Hotpath production environment is missing or unsafe: "
+            + ", ".join(mismatches)
+        )
+
+
 def _build(runner: Runner, root: Path, role: str, hotpath_profile: bool = False) -> Path:
     target = root / "target" / "proxmox-lxc"
     if role == "prod":
@@ -1071,6 +1114,8 @@ def _build_host_deploy_argv(
         args.samba_user,
         "--prod-access",
         args.prod_access,
+        "--hotpath-profile",
+        "1" if args.hotpath_profile else "0",
     ]
     if include_drain_timeout:
         host_args.extend(["--drain-timeout", str(args.drain_timeout)])
@@ -1532,6 +1577,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ValueError(
             "prod supports drain-safe in-place deploy only; replace and cleanup are dev-only"
         )
+    if args.hotpath_profile:
+        if args.role != "prod" or args.action != "deploy":
+            raise ValueError(
+                "Hotpath profiling is valid only for production deploy"
+            )
+        validate_hotpath_profile_env(args.env_file)
     if args.action.startswith("ownership-") and args.role != "prod":
         raise ValueError("ownership migration is valid only for production")
     if args.action == "ownership-repair" and not args.dry_run:

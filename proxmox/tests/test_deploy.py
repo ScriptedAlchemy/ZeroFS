@@ -1530,12 +1530,62 @@ class CliDryRunTests(ConfigValidationTests):
         self.assertIn("host-deploy.sh finalize --role prod", result.stdout)
         self.assertNotIn("host-deploy.sh rollback --role prod", result.stdout)
         self.assertIn("--features webui", result.stdout)
+        self.assertNotIn("--features webui,hotpath-profile", result.stdout)
+        self.assertIn("--hotpath-profile 0", result.stdout)
         self.assertIn("--prod-access nfs", result.stdout)
         self.assert_direct_nfs_mount_is_provisioned(result, "10.10.10.55")
         self.assertNotIn("smb.conf", result.stdout)
         self.assertNotIn("smbd.service", result.stdout)
 
     def test_prod_hotpath_profile_builds_optimized_instrumented_release(
+        self,
+    ) -> None:
+        env_file = self.write_config(
+            "\n".join(
+                f"{key}={value}"
+                for key, value in deploy.HOTPATH_PROFILE_ENV.items()
+            )
+            + "\n"
+        )
+        config = self.write_config(
+            self.prod_config().replace("10.10.10.30", "10.10.10.55")
+        )
+        result = subprocess.run(
+            [
+                "python3",
+                str(MODULE_PATH),
+                "deploy",
+                "--role",
+                "prod",
+                "--ctid",
+                "198",
+                "--container-ip",
+                "10.10.10.55",
+                "--config",
+                str(config),
+                "--env-file",
+                str(env_file),
+                "--hotpath-profile",
+                "--dry-run",
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("cargo build --release --locked", result.stdout)
+        self.assertIn("--features webui,hotpath-profile", result.stdout)
+        self.assertIn("--hotpath-profile 1", result.stdout)
+        self.assertNotEqual(
+            deploy.release_id("a" * 40, [config, env_file], ["hash", "nfs"]),
+            deploy.release_id(
+                "a" * 40,
+                [config, env_file],
+                ["hash", "nfs", "hotpath-profile"],
+            ),
+        )
+
+    def test_hotpath_profile_fails_closed_without_safe_prod_environment(
         self,
     ) -> None:
         config = self.write_config(
@@ -1561,10 +1611,68 @@ class CliDryRunTests(ConfigValidationTests):
             capture_output=True,
             check=False,
         )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("cargo build --release --locked", result.stdout)
-        self.assertIn("--features webui,hotpath-profile", result.stdout)
-        self.assertIn("hotpath-profile", result.stdout)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--hotpath-profile requires --env-file", result.stderr)
+
+        unsafe_env = self.write_config(
+            "\n".join(
+                f"{key}={'false' if key == 'HOTPATH_CPU_BASELINE_OFF' else value}"
+                for key, value in deploy.HOTPATH_PROFILE_ENV.items()
+            )
+            + "\n"
+        )
+        unsafe = subprocess.run(
+            [
+                "python3",
+                str(MODULE_PATH),
+                "deploy",
+                "--role",
+                "prod",
+                "--ctid",
+                "198",
+                "--container-ip",
+                "10.10.10.55",
+                "--config",
+                str(config),
+                "--env-file",
+                str(unsafe_env),
+                "--hotpath-profile",
+                "--dry-run",
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertNotEqual(unsafe.returncode, 0)
+        self.assertIn("HOTPATH_CPU_BASELINE_OFF", unsafe.stderr)
+
+    def test_hotpath_profile_rejects_non_production_deploy_scope(self) -> None:
+        config = self.write_config(self.valid_config())
+        result = subprocess.run(
+            [
+                "python3",
+                str(MODULE_PATH),
+                "deploy",
+                "--role",
+                "dev",
+                "--ctid",
+                "120",
+                "--container-ip",
+                "10.10.10.20",
+                "--config",
+                str(config),
+                "--hotpath-profile",
+                "--dry-run",
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "Hotpath profiling is valid only for production deploy",
+            result.stderr,
+        )
 
     def test_prod_drain_timeout_is_forwarded_to_the_host_coordinator(self) -> None:
         config = self.write_config(
