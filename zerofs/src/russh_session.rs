@@ -389,10 +389,10 @@ impl SessionFactory for RusshSessionFactory {
             Ok(session) => session,
             Err(open_error) => {
                 // The pool owns the open deadline. Once a Handle exists, its
-                // cleanup must outlive that deadline so account capacity is not
-                // released while a detached SSH connection can still exist.
-                let cleanup_force = CancellationToken::new();
-                return match close_ssh_handle(handle, abort_socket, &cleanup_force).await {
+                // cleanup must prove termination before account capacity is
+                // released. A cancelled open force-closes the retained socket;
+                // an ordinary setup error still gets a graceful disconnect.
+                return match close_ssh_handle(handle, abort_socket, &force).await {
                     Ok(()) => Err(open_error),
                     Err(close_error) => Err(close_error),
                 };
