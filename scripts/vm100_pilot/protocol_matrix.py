@@ -70,7 +70,7 @@ class ProtocolAuthority:
     mount_options: tuple[str, ...]
     metrics_url: str
     metrics_identity: MetricsAuthorityIdentity
-    isolated_test_export: bool
+    isolated_service_instance: bool
 
     @classmethod
     def from_mapping(
@@ -85,9 +85,11 @@ class ProtocolAuthority:
         endpoint = values.get(f"{prefix}_ENDPOINT", "").strip()
         options = values.get(f"{prefix}_MOUNT_OPTIONS", "").strip()
         metrics_url = values.get(f"{prefix}_METRICS_URL", "").strip()
-        isolated_value = values.get(f"{prefix}_ISOLATED", "").strip().lower()
+        isolated_value = values.get(
+            f"{prefix}_SERVICE_ISOLATED", ""
+        ).strip().lower()
         if isolated_value not in {"", "false", "true"}:
-            raise ValueError(f"{prefix}_ISOLATED must be true or false")
+            raise ValueError(f"{prefix}_SERVICE_ISOLATED must be true or false")
         identity_values = {
             "server_instance_id": values.get(
                 f"{prefix}_METRICS_INSTANCE_ID", ""
@@ -157,7 +159,7 @@ class ProtocolAuthority:
             mount_options=parsed_options,
             metrics_url=metrics_url,
             metrics_identity=MetricsAuthorityIdentity(**identity_values),
-            isolated_test_export=isolated_value == "true",
+            isolated_service_instance=isolated_value == "true",
         )
 
     def verify(self, runner: Runner) -> dict[str, object]:
@@ -217,7 +219,12 @@ class ProtocolAuthority:
             "required_options": list(self.mount_options),
             "metrics_url": self.metrics_url,
             "metrics_identity": asdict(self.metrics_identity),
-            "isolated_test_export": self.isolated_test_export,
+            "isolated_service_instance": self.isolated_service_instance,
+            "isolated_service_instance_id": (
+                self.metrics_identity.server_instance_id
+                if self.isolated_service_instance
+                else None
+            ),
         }
 
     def require_run_root(self, path: Path) -> Path:
@@ -245,7 +252,7 @@ class ClientColdReadResult:
     timeout_seconds: int
     cache_scope: str = "nfs_client_page_cache_only"
     backend_activity_scope: str = "service_global_interval"
-    isolated_test_export_required: bool = True
+    isolated_service_instance_required: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -654,7 +661,12 @@ class ProtocolMatrixRunner:
                     "mount_options": list(authority.mount_options),
                     "metrics_url": authority.metrics_url,
                     "metrics_identity": asdict(authority.metrics_identity),
-                    "isolated_test_export": authority.isolated_test_export,
+                    "isolated_service_instance": authority.isolated_service_instance,
+                    "isolated_service_instance_id": (
+                        authority.metrics_identity.server_instance_id
+                        if authority.isolated_service_instance
+                        else None
+                    ),
                 },
             )
             receipt.record(
@@ -667,11 +679,12 @@ class ProtocolMatrixRunner:
                 self.config.require_temp_child(scratch, "zerofs-protocol-bench-")
                 if (
                     scenario.require_backend_interval_activity
-                    and not authority.isolated_test_export
+                    and not authority.isolated_service_instance
                 ):
                     raise ScenarioUnavailableError(
                         "long-idle backend interval evidence requires explicit "
-                        "ZEROFS_BENCH_NFS_ISOLATED=true authority"
+                        "ZEROFS_BENCH_NFS_SERVICE_ISOLATED=true authority tied "
+                        "to the metrics server_instance_id"
                     )
                 if self.memory_session is not None:
                     self.memory_session.expect_workloads(

@@ -84,6 +84,7 @@ class ScenarioRegistryTests(unittest.TestCase):
         self.assertEqual(scenario.read_idle_seconds, 61 * 60)
         self.assertEqual(scenario.read_timeout_seconds, 30)
         self.assertTrue(scenario.require_backend_interval_activity)
+        self.assertIn("isolated_service_instance_assertion", scenario.required_authority)
         self.assertEqual(
             [(workload.bytes, workload.pattern) for workload in scenario.workloads],
             [(64 * 1024 * 1024, "incompressible-random-v1")],

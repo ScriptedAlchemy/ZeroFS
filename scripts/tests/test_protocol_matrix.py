@@ -456,7 +456,7 @@ class ProtocolMatrixTests(unittest.TestCase):
     def _idle_read_fixture(
         self,
         *,
-        isolated: bool,
+        service_isolated: bool,
         backend_interval_counters: list[int] | None = None,
         timeout_fio: bool = False,
     ) -> tuple[
@@ -484,8 +484,8 @@ class ProtocolMatrixTests(unittest.TestCase):
             "ZEROFS_BENCH_NFS_METRICS_FILESYSTEM_ID": "filesystem-a",
             "ZEROFS_BENCH_NFS_METRICS_EXPORT_ID": "nfs-root",
         }
-        if isolated:
-            values["ZEROFS_BENCH_NFS_ISOLATED"] = "true"
+        if service_isolated:
+            values["ZEROFS_BENCH_NFS_SERVICE_ISOLATED"] = "true"
         authority = ProtocolAuthority.from_mapping("nfs", values)
         findmnt = ColdReadAuthorityRunner(
             {
@@ -706,7 +706,7 @@ class ProtocolMatrixTests(unittest.TestCase):
                 "ZEROFS_BENCH_NFS_METRICS_INSTANCE_ID": "instance-a",
                 "ZEROFS_BENCH_NFS_METRICS_FILESYSTEM_ID": "filesystem-a",
                 "ZEROFS_BENCH_NFS_METRICS_EXPORT_ID": "nfs-root",
-                "ZEROFS_BENCH_NFS_ISOLATED": "true",
+                "ZEROFS_BENCH_NFS_SERVICE_ISOLATED": "true",
             },
         )
         findmnt = ColdReadAuthorityRunner(
@@ -759,9 +759,15 @@ class ProtocolMatrixTests(unittest.TestCase):
         self.assertEqual(read.requests, 4)
         self.assertEqual(read.backend_interval_activity_bytes, 4 * 1024 * 1024)
         self.assertEqual(read.backend_activity_scope, "service_global_interval")
-        self.assertTrue(read.isolated_test_export_required)
+        self.assertTrue(read.isolated_service_instance_required)
         self.assertEqual(read.timeout_seconds, 30)
         self.assertEqual(sleeps, [5])
+        manifest_path = next(self.config.result_dir.glob("*/manifest.json"))
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            manifest["requested_authority"]["isolated_service_instance_id"],
+            "instance-a",
+        )
         fio_args, timeout = next(
             (args, deadline) for args, deadline in findmnt.calls if args[0] == "fio"
         )
@@ -795,7 +801,7 @@ class ProtocolMatrixTests(unittest.TestCase):
                 "ZEROFS_BENCH_NFS_METRICS_INSTANCE_ID": "instance-a",
                 "ZEROFS_BENCH_NFS_METRICS_FILESYSTEM_ID": "filesystem-a",
                 "ZEROFS_BENCH_NFS_METRICS_EXPORT_ID": "nfs-root",
-                "ZEROFS_BENCH_NFS_ISOLATED": "true",
+                "ZEROFS_BENCH_NFS_SERVICE_ISOLATED": "true",
             },
         )
         findmnt = ColdReadAuthorityRunner(
@@ -855,13 +861,13 @@ class ProtocolMatrixTests(unittest.TestCase):
         self.assertEqual(ledger["cleanup_attempts"], 2)
         self.assertTrue(ledger["asserted_clean"])
 
-    def test_idle_read_requires_explicit_isolated_export_authority(self) -> None:
+    def test_idle_read_requires_explicit_service_isolation_authority(self) -> None:
         scenario, authority, findmnt, observer = self._idle_read_fixture(
-            isolated=False
+            service_isolated=False
         )
 
         with self.assertRaisesRegex(
-            ScenarioUnavailableError, "ZEROFS_BENCH_NFS_ISOLATED=true"
+            ScenarioUnavailableError, "ZEROFS_BENCH_NFS_SERVICE_ISOLATED=true"
         ):
             ProtocolMatrixRunner(
                 self.config,
@@ -875,7 +881,7 @@ class ProtocolMatrixTests(unittest.TestCase):
 
     def test_returned_fio_timeout_writes_failed_receipt_and_double_cleans(self) -> None:
         scenario, authority, findmnt, observer = self._idle_read_fixture(
-            isolated=True,
+            service_isolated=True,
             timeout_fio=True,
         )
 

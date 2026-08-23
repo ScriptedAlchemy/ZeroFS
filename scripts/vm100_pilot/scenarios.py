@@ -90,7 +90,7 @@ class ProtocolScenario:
     @property
     def required_authority(self) -> tuple[str, ...]:
         if self.require_backend_interval_activity:
-            return (*_PROTOCOL_AUTHORITY, "isolated_test_export_assertion")
+            return (*_PROTOCOL_AUTHORITY, "isolated_service_instance_assertion")
         return _PROTOCOL_AUTHORITY
 
     @property
@@ -127,7 +127,7 @@ class ProtocolScenario:
                 "cache_scope": "nfs_client_page_cache_only",
                 "backend_counter": "zerofs_sftp_object_read_bytes_total",
                 "backend_activity_scope": "service_global_interval",
-                "isolated_test_export_required": True,
+                "isolated_service_instance_required": True,
             }
         return result
 

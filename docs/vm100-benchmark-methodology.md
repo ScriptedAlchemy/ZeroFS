@@ -185,7 +185,7 @@ The ordinary protocol readback above intentionally remains a hot integrity
 check. The separate recovery probe is selected explicitly:
 
 ```console
-ZEROFS_BENCH_NFS_ISOLATED=true \
+ZEROFS_BENCH_NFS_SERVICE_ISOLATED=true \
   python3 scripts/vm100-pilot.py protocol-matrix --protocol nfs --idle-read
 ```
 
@@ -205,10 +205,12 @@ backend-byte counters. SHA-256 is checked separately after the timed read.
 harness does not deploy, restart, stop, mount, or unmount ZeroFS. The server
 build must export `zerofs_sftp_object_read_bytes_total`, which counts payload
 bytes returned by every successful production `SftpObjectStore` read in that
-service. `ZEROFS_BENCH_NFS_ISOLATED=true` is a required, recorded operator
-assertion that the deliberately prepared export has no concurrent clients or
-maintenance traffic. It is a machine-enforced prerequisite, not machine proof
-of isolation. The observed interval delta must be at least the benchmark's
+service. `ZEROFS_BENCH_NFS_SERVICE_ISOLATED=true` is a required, recorded
+operator assertion, tied to the receipt's metrics `server_instance_id`, that
+the whole service instance has no other protocol/client/export activity and no
+internal maintenance that performs SFTP reads. It is a machine-enforced
+prerequisite, not machine proof of isolation. The observed interval delta must
+be at least the benchmark's
 logical byte count; a smaller delta fails closed. Even when large enough, the
 delta remains service-global interval activity and is not attributed to this
 request or file. The metric does not claim the remote provider served physical
@@ -223,7 +225,7 @@ prevent `TimeoutExpired` from returning at all. In that case the harness cannot
 guarantee manifest finalization or cleanup execution. The attempt receipt
 records `timeout_scope=userspace_process_only` and `d_state_bounded=false` so
 that limitation is machine-readable. Run this only on a deliberately prepared
-isolated test export, never a shared production namespace.
+isolated test service instance, never a shared production service or namespace.
 
 ## Fixed memory envelope
 
