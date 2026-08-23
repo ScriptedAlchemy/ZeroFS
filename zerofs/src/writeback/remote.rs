@@ -1210,6 +1210,10 @@ fn touched_keys(record: &MutationRecord) -> Vec<&str> {
     keys
 }
 
+#[cfg_attr(
+    feature = "hotpath-profile",
+    hotpath::measure(future = true, label = "zerofs.writeback.remote.write")
+)]
 async fn apply_record(
     remote: Arc<dyn ObjectStore>,
     journal: Arc<Journal>,
