@@ -758,7 +758,7 @@ def release_rustflags(existing: str) -> str:
     return flags
 
 
-def _build(runner: Runner, root: Path, role: str) -> Path:
+def _build(runner: Runner, root: Path, role: str, hotpath_profile: bool = False) -> Path:
     target = root / "target" / "proxmox-lxc"
     if role == "prod":
         user_paths = (Path.home() / ".local" / "bin", Path.home() / ".cargo" / "bin")
@@ -806,8 +806,13 @@ def _build(runner: Runner, root: Path, role: str) -> Path:
         "--target-dir",
         str(target),
     ]
+    features = []
     if role == "prod":
-        command.extend(["--features", "webui"])
+        features.append("webui")
+    if hotpath_profile:
+        features.append("hotpath-profile")
+    if features:
+        command.extend(["--features", ",".join(features)])
     os.environ["RUSTFLAGS"] = release_rustflags(os.environ.get("RUSTFLAGS", ""))
     runner.run(command, cwd=root)
     return target / "release" / "zerofs"
@@ -1496,6 +1501,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--metrics-url")
     parser.add_argument("--existing-metrics-url")
     parser.add_argument("--drain-timeout", type=int, default=1800)
+    parser.add_argument("--hotpath-profile", action="store_true")
     parser.add_argument("--skip-existing-drain", action="store_true")
     parser.add_argument("--source-client-unit")
     parser.add_argument("--source-mount-unit")
@@ -1623,7 +1629,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     namespace = namespace_id(storage_url, args.role, state_root)
     commit, _dirty = _git_receipt(runner, root)
-    binary = _build(runner, root, args.role)
+    binary = _build(runner, root, args.role, args.hotpath_profile)
     binary_hash = "DRY_RUN_SHA256" if args.dry_run else sha256(binary)
     release_paths = [args.config]
     release_paths.extend(
@@ -1639,6 +1645,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     release_extras = [binary_hash, args.prod_access]
     if args.local_durable_upgrade:
         release_extras.append("local-durable-upgrade")
+    if args.hotpath_profile:
+        release_extras.append("hotpath-profile")
     if args.prod_access in {"smb", "both"}:
         release_extras.append(args.samba_user)
     release = (
