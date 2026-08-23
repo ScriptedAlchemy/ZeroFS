@@ -517,6 +517,7 @@ const SFTP_NEGATIVE_CACHE_MAX_ENTRIES: usize = 16 * 1024;
 /// database GC/compaction probes issue them in storms that must not compete
 /// with bulk transfers for read slots.
 const SFTP_METADATA_READ_MAX_BYTES: u64 = 256 * 1024;
+const SFTP_OBJECT_READ_BYTES_METRIC: &str = "zerofs_sftp_object_read_bytes_total";
 
 fn read_operation_kind(options: &GetOptions) -> crate::sftp_transport::OperationKind {
     if options.head {
@@ -734,6 +735,7 @@ impl SftpObjectStore {
         prefix: ObjectPath,
     ) -> object_store::Result<Self> {
         Self::validate_prefix(&prefix)?;
+        metrics::counter!(SFTP_OBJECT_READ_BYTES_METRIC).increment(0);
         Ok(Self {
             pool,
             prefix,
@@ -815,8 +817,10 @@ impl SftpObjectStore {
         .await
         .map_err(transport_error);
         match &result {
-            Ok(_) => {
+            Ok(object) => {
                 self.forget_missing(location);
+                metrics::counter!(SFTP_OBJECT_READ_BYTES_METRIC)
+                    .increment(object.payload.len() as u64);
             }
             Err(object_store::Error::NotFound { .. }) => {
                 self.remember_missing(location);
@@ -2606,6 +2610,60 @@ mod tests {
         ) -> Result<(), TransportError> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn successful_object_read_publishes_backend_payload_bytes() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let remote = Arc::new(SharedRemoteFs::default());
+                    let payload = b"backend payload";
+                    let mut physical = encode_header(ObjectHeader {
+                        generation: Uuid::nil(),
+                        logical_len: payload.len() as u64,
+                    })
+                    .to_vec();
+                    physical.extend_from_slice(payload);
+                    remote
+                        .files
+                        .lock()
+                        .unwrap()
+                        .insert(PathBuf::from("root/object.bin"), Bytes::from(physical));
+                    let pool = crate::sftp_transport::SftpSessionPool::new_writable(
+                        Arc::new(SharedRemoteFactory(remote)),
+                        1,
+                        1,
+                        1,
+                    )
+                    .await
+                    .unwrap();
+                    let store =
+                        SftpObjectStore::new(pool.clone(), ObjectPath::from("root")).unwrap();
+
+                    let read = store
+                        .get(&ObjectPath::from("root/object.bin"))
+                        .await
+                        .unwrap()
+                        .bytes()
+                        .await
+                        .unwrap();
+                    assert_eq!(read.as_ref(), payload);
+                    drop(store);
+                    pool.shutdown().await.unwrap();
+                });
+        });
+
+        let rendered = handle.render();
+        assert!(
+            rendered.contains("zerofs_sftp_object_read_bytes_total 15"),
+            "metrics:\n{rendered}"
+        );
     }
 
     /// The kill-during-staged-manifest recovery shape from the vm100 pilot: a

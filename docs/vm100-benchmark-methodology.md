@@ -49,6 +49,7 @@ python3 scripts/vm100-pilot.py list-scenarios
 The registry contains only nonzero work or real sampling:
 
 - `protocol-matrix-nfs`
+- `protocol-idle-read-nfs`
 - `protocol-matrix-9p`
 - `raw-sftp-stock-hpn`
 - `memory-envelope`
@@ -177,6 +178,54 @@ integrity-check rate, not protocol read throughput: it hashes the just-written
 file back through the same mount with no cache invalidation, so the read is
 frequently served by the client's NFS or 9P cache, and the timed interval
 includes SHA-256 hashing CPU cost.
+
+## Long-idle NFS read with backend interval evidence
+
+The ordinary protocol readback above intentionally remains a hot integrity
+check. The separate recovery probe is selected explicitly:
+
+```console
+ZEROFS_BENCH_NFS_SERVICE_ISOLATED=true \
+  python3 scripts/vm100-pilot.py protocol-matrix --protocol nfs --idle-read
+```
+
+The registered `protocol-idle-read-nfs` scenario writes one 64 MiB random file,
+waits for its exact accepted sequence to reach local durability, remote
+durability, and stable drain, then leaves the server's existing SFTP pool idle
+for 61 minutes. The interval is intentionally longer than the one-hour
+rekey/rotation horizon evaluated by the companion pool-recovery work, but this
+benchmark neither requires nor claims that a rekey, reconnect, or rotation
+occurred. The runner then performs one fio read with `--invalidate=1`,
+`--allow_file_create=0`, a 1 MiB request size, and a 30-second subprocess
+deadline. The receipt retains fio JSON and records exact bytes, request count,
+runtime, rate, deadline, idle interval, and the before/after service-global
+backend-byte counters. SHA-256 is checked separately after the timed read.
+
+`--idle-read` is NFS-only and keeps the protocol-matrix safety boundary: the
+harness does not deploy, restart, stop, mount, or unmount ZeroFS. The server
+build must export `zerofs_sftp_object_read_bytes_total`, which counts payload
+bytes returned by every successful production `SftpObjectStore` read in that
+service. `ZEROFS_BENCH_NFS_SERVICE_ISOLATED=true` is a required, recorded
+operator assertion, tied to the receipt's metrics `server_instance_id`, that
+the whole service instance has no other protocol/client/export activity and no
+internal maintenance that performs SFTP reads. It is a machine-enforced
+prerequisite, not machine proof of isolation. The observed interval delta must
+be at least the benchmark's
+logical byte count; a smaller delta fails closed. Even when large enough, the
+delta remains service-global interval activity and is not attributed to this
+request or file. The metric does not claim the remote provider served physical
+media rather than its own cache, nor does it prove which pool session was
+reused, retired, rekeyed, or rotated.
+
+The fio subprocess receives a 30-second userspace deadline. If the bounded
+process call returns `TimeoutExpired`, the harness writes a failed manifest and
+attempts cleanup twice. This is not a wall-clock bound for a `hard` NFS mount:
+an uninterruptible kernel D-state can prevent process termination and therefore
+prevent `TimeoutExpired` from returning at all. In that case the harness cannot
+guarantee manifest finalization or cleanup execution. The attempt receipt
+records `timeout_scope=userspace_process_only` and `d_state_bounded=false` so
+that limitation is machine-readable. Run this only on a deliberately prepared
+isolated test service instance, never a shared production service or namespace.
 
 ## Fixed memory envelope
 

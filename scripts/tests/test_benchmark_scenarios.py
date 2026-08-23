@@ -77,6 +77,19 @@ class ScenarioRegistryTests(unittest.TestCase):
             self.assertTrue(scenario.sha256_required)
             self.assertTrue(scenario.cleanup_required)
 
+    def test_idle_nfs_read_is_a_distinct_remote_proof_scenario(self) -> None:
+        scenario = require_protocol_scenario("protocol-idle-read-nfs")
+
+        self.assertEqual(scenario.protocol, "nfs")
+        self.assertEqual(scenario.read_idle_seconds, 61 * 60)
+        self.assertEqual(scenario.read_timeout_seconds, 30)
+        self.assertTrue(scenario.require_backend_interval_activity)
+        self.assertIn("isolated_service_instance_assertion", scenario.required_authority)
+        self.assertEqual(
+            [(workload.bytes, workload.pattern) for workload in scenario.workloads],
+            [(64 * 1024 * 1024, "incompressible-random-v1")],
+        )
+
     def test_memory_envelope_has_fixed_nonzero_limits(self) -> None:
         scenario = require_memory_scenario("memory-envelope")
 
@@ -135,6 +148,11 @@ class ScenarioRegistryTests(unittest.TestCase):
         )
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             parser.parse_args(["protocol-matrix", "--protocol", "nbd"])
+
+        idle = parser.parse_args(
+            ["protocol-matrix", "--protocol", "nfs", "--idle-read"]
+        )
+        self.assertTrue(idle.idle_read)
 
 
 if __name__ == "__main__":
