@@ -6,7 +6,7 @@ import re
 from dataclasses import asdict, dataclass
 
 
-RELEASE_TAG = re.compile(r"^v\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$")
+RELEASE_TAG = re.compile(r"^v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$")
 
 
 @dataclass(frozen=True)

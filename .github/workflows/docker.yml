@@ -17,6 +17,8 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  PGO_VALIDATION_TAG: v2.2.2
+  PGO_VALIDATION_SHA256: 09a412614c15e37cfbd7964d08b7e3b0b894843dd65b29f65eb1801167b108ab
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -62,9 +64,12 @@ jobs:
 
       - name: Download PGO builds
         run: |
-          DOWNLOAD_URL="https://github.com/Barre/zerofs/releases/latest/download/zerofs-pgo-multiplatform.tar.gz"
+          archive="zerofs-pgo-multiplatform.tar.gz"
+          DOWNLOAD_URL="https://github.com/Barre/zerofs/releases/download/${PGO_VALIDATION_TAG}/${archive}"
           echo "Downloading PGO builds from: $DOWNLOAD_URL"
-          curl -fsSL "$DOWNLOAD_URL" | tar xz
+          curl -fsSL "$DOWNLOAD_URL" -o "$archive"
+          echo "${PGO_VALIDATION_SHA256}  ${archive}" | sha256sum --check
+          tar xzf "$archive"
           echo "Extracted binaries:"
           ls -la zerofs-linux-*-pgo
 
@@ -110,9 +115,13 @@ jobs:
         env:
           RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
         run: |
-          DOWNLOAD_URL="https://github.com/Barre/zerofs/releases/download/${RELEASE_TAG}/zerofs-pgo-multiplatform.tar.gz"
-          echo "Downloading PGO builds from: $DOWNLOAD_URL"
-          curl -fsSL "$DOWNLOAD_URL" | tar xz
+          archive="zerofs-pgo-multiplatform.tar.gz"
+          base_url="https://github.com/Barre/zerofs/releases/download/${RELEASE_TAG}"
+          echo "Downloading PGO builds from: ${base_url}/${archive}"
+          curl -fsSL "${base_url}/${archive}" -o "$archive"
+          curl -fsSL "${base_url}/${archive}.sha256" -o "${archive}.sha256"
+          sha256sum --check "${archive}.sha256"
+          tar xzf "$archive"
           echo "Extracted binaries:"
           ls -la zerofs-linux-*-pgo
 

@@ -14,6 +14,9 @@ PUBLIC_BASE = (
     "ghcr.io/barre/zerofs@"
     "sha256:3ec09262cba72ec84d12a9f64e796a2cb607c962c2b94e3704c14cde7102e2e0"
 )
+PGO_VALIDATION_SHA256 = (
+    "09a412614c15e37cfbd7964d08b7e3b0b894843dd65b29f65eb1801167b108ab"
+)
 
 
 class CsiDockerWorkflowTests(unittest.TestCase):
@@ -51,12 +54,26 @@ class CsiDockerWorkflowTests(unittest.TestCase):
         for path in (WORKFLOW, BASE_WORKFLOW):
             with self.subTest(workflow=path.name):
                 workflow = path.read_text()
-                mutable = re.findall(r"uses:\s+[^\s#]+@(v\d+|stable|main)\b", workflow)
-                self.assertEqual(mutable, [])
+                uses = re.findall(r"uses:\s+([^\s#]+)", workflow)
+                self.assertNotEqual(uses, [])
+                for action in uses:
+                    with self.subTest(action=action):
+                        _, separator, revision = action.rpartition("@")
+                        self.assertEqual(separator, "@")
+                        self.assertRegex(revision, r"^[0-9a-f]{40}$")
         self.assertRegex(
             WORKFLOW.read_text(),
             r"cargo install cross .* --rev [0-9a-f]{40} --locked",
         )
+        self.assertIn("toolchain: 1.91.0", WORKFLOW.read_text())
+
+    def test_pgo_archives_are_verified_before_extraction(self) -> None:
+        workflow = BASE_WORKFLOW.read_text()
+        self.assertIn("PGO_VALIDATION_TAG: v2.2.2", workflow)
+        self.assertIn(f"PGO_VALIDATION_SHA256: {PGO_VALIDATION_SHA256}", workflow)
+        self.assertNotIn("releases/latest/download", workflow)
+        self.assertNotIn("| tar xz", workflow)
+        self.assertGreaterEqual(workflow.count("sha256sum --check"), 2)
 
 
 class ContainerBuildEventTests(unittest.TestCase):
@@ -131,6 +148,7 @@ class ContainerBuildEventTests(unittest.TestCase):
         for event_name, ref, input_tag in (
             ("workflow_dispatch", "refs/heads/develop", "develop"),
             ("workflow_dispatch", "refs/heads/develop", "2.2.2"),
+            ("workflow_dispatch", "refs/heads/develop", "v2.2.2+build.1"),
             ("push", "refs/heads/develop", ""),
         ):
             with self.subTest(event_name=event_name, ref=ref, input_tag=input_tag):
