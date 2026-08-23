@@ -62,12 +62,26 @@ class ProtocolScenario:
     protocol: str
     description: str
     workloads: tuple[WorkloadDefinition, ...]
+    read_idle_seconds: int = 0
+    read_timeout_seconds: int = 0
+    require_backend_read: bool = False
 
     def __post_init__(self) -> None:
         if self.protocol not in {"nfs", "9p"}:
             raise ValueError(f"unsupported protocol scenario: {self.protocol!r}")
         if not self.name or not self.description or not self.workloads:
             raise ValueError("protocol scenario must define real workloads")
+        if self.require_backend_read:
+            if self.protocol != "nfs":
+                raise ValueError("backend-proven long-idle reads currently require NFS")
+            if self.read_idle_seconds <= 0 or self.read_timeout_seconds <= 0:
+                raise ValueError(
+                    "backend-proven long-idle reads require positive idle and timeout seconds"
+                )
+            if any(workload.bytes % (1024 * 1024) for workload in self.workloads):
+                raise ValueError("backend-proven read workloads must be whole MiB")
+        elif self.read_idle_seconds or self.read_timeout_seconds:
+            raise ValueError("read timing is only valid for a backend-proven read")
 
     @property
     def kind(self) -> str:
@@ -79,6 +93,8 @@ class ProtocolScenario:
 
     @property
     def cutoffs(self) -> tuple[str, ...]:
+        if self.require_backend_read:
+            return (*_PROTOCOL_CUTOFFS, "idle_client_cold_backend_read")
         return _PROTOCOL_CUTOFFS
 
     @property
@@ -90,7 +106,7 @@ class ProtocolScenario:
         return True
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        result: dict[str, object] = {
             "schema": 1,
             "name": self.name,
             "kind": self.kind,
@@ -102,6 +118,14 @@ class ProtocolScenario:
             "sha256_required": True,
             "cleanup_required": True,
         }
+        if self.require_backend_read:
+            result["read_probe"] = {
+                "idle_seconds": self.read_idle_seconds,
+                "timeout_seconds": self.read_timeout_seconds,
+                "cache_scope": "nfs_client_page_cache_only",
+                "backend_counter": "zerofs_sftp_object_read_bytes_total",
+            }
+        return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -247,6 +271,18 @@ _DEFINITIONS: tuple[Scenario, ...] = (
             "local, and remote durability evidence"
         ),
         workloads=_PROTOCOL_WORKLOADS,
+    ),
+    ProtocolScenario(
+        name="protocol-idle-read-nfs",
+        protocol="nfs",
+        description=(
+            "Backend-proven NFS read after the configured SFTP pool was idle, "
+            "with client-cache invalidation and a read deadline"
+        ),
+        workloads=(_PROTOCOL_WORKLOADS[0],),
+        read_idle_seconds=61 * 60,
+        read_timeout_seconds=30,
+        require_backend_read=True,
     ),
     RawSftpScenario(
         name="raw-sftp-stock-hpn",

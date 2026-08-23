@@ -21,6 +21,7 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
 
 _AUTHORITY_METRIC = "zerofs_benchmark_authority_info"
 _AUTHORITY_LABEL = re.compile(r'([a-z_]+)="([A-Za-z0-9._:/-]+)"\Z')
+_METRIC_NAME = re.compile(r"[a-z][a-z0-9_]*\Z")
 
 
 def validate_metrics_url(url: str) -> SplitResult:
@@ -221,6 +222,30 @@ class MetricsClient:
 
     def identity(self) -> MetricsAuthorityIdentity:
         return self._validate_identity(self._fetch())
+
+    def counter(self, name: str) -> int:
+        if _METRIC_NAME.fullmatch(name) is None:
+            raise ValueError("invalid metrics counter name")
+        text = self._fetch()
+        self._validate_identity(text)
+        value = 0
+        found = False
+        for raw_line in text.splitlines():
+            parts = raw_line.strip().split()
+            if len(parts) < 2 or parts[0] != name:
+                continue
+            if found:
+                raise ValueError(
+                    f"metrics counter has multiple unlabelled samples: {name}"
+                )
+            try:
+                value = int(float(parts[1]))
+            except ValueError:
+                raise ValueError("invalid metrics counter value") from None
+            if value < 0:
+                raise ValueError("metrics counter value must not be negative")
+            found = True
+        return value
 
 
 def wait_for_gc_quiescence(

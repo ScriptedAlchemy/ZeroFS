@@ -141,6 +141,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     protocol.add_argument("--protocol", choices=("nfs", "9p"), required=True)
     protocol.add_argument(
+        "--idle-read",
+        dest="idle_read",
+        action="store_true",
+        help="run the deadline-guarded backend-proven NFS read after a 61-minute idle",
+    )
+    protocol.add_argument(
         "--memory-envelope",
         action="store_true",
         help="enforce the registered fixed cgroup/process memory envelope",
@@ -192,11 +198,20 @@ def _run_protocol_matrix(
     config: PilotConfig,
     runner: Runner,
 ) -> object:
-    receipt = RunReceipt.start(config, f"protocol-matrix-{args.protocol}")
+    if args.idle_read and args.protocol != "nfs":
+        receipt = RunReceipt.start(config, "protocol-idle-read-invalid")
+        with receipt:
+            raise ValueError("long-idle read benchmark is available only for NFS")
+    scenario_name = (
+        "protocol-idle-read-nfs"
+        if args.idle_read
+        else f"protocol-matrix-{args.protocol}"
+    )
+    receipt = RunReceipt.start(config, scenario_name)
     with receipt:
         receipt.record("requested_protocol", args.protocol)
         receipt.record("memory_envelope_requested", bool(args.memory_envelope))
-        scenario = require_protocol_scenario(f"protocol-matrix-{args.protocol}")
+        scenario = require_protocol_scenario(scenario_name)
         receipt.record("scenario", scenario.to_dict())
         atomic_write_json(
             receipt.path("cleanup-ledger.json"),

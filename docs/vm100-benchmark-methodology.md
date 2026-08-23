@@ -49,6 +49,7 @@ python3 scripts/vm100-pilot.py list-scenarios
 The registry contains only nonzero work or real sampling:
 
 - `protocol-matrix-nfs`
+- `protocol-idle-read-nfs`
 - `protocol-matrix-9p`
 - `raw-sftp-stock-hpn`
 - `memory-envelope`
@@ -177,6 +178,46 @@ integrity-check rate, not protocol read throughput: it hashes the just-written
 file back through the same mount with no cache invalidation, so the read is
 frequently served by the client's NFS or 9P cache, and the timed interval
 includes SHA-256 hashing CPU cost.
+
+## Long-idle backend-proven NFS read
+
+The ordinary protocol readback above intentionally remains a hot integrity
+check. The separate recovery probe is selected explicitly:
+
+```console
+python3 scripts/vm100-pilot.py protocol-matrix --protocol nfs --idle-read
+```
+
+The registered `protocol-idle-read-nfs` scenario writes one 64 MiB random file,
+waits for its exact accepted sequence to reach local durability, remote
+durability, and stable drain, then leaves the server's existing SFTP pool idle
+for 61 minutes. The interval is intentionally longer than the one-hour
+rekey/rotation horizon evaluated by the companion pool-recovery work, but this
+benchmark neither requires nor claims that a rekey, reconnect, or rotation
+occurred. The runner then performs one fio read with `--invalidate=1`,
+`--allow_file_create=0`, a 1 MiB request size, and a 30-second subprocess
+deadline. The receipt retains fio JSON and records exact bytes, request count,
+runtime, rate, deadline, idle interval, and the before/after backend-byte
+counters. SHA-256 is checked separately after the timed read.
+
+`--idle-read` is NFS-only and keeps the protocol-matrix safety boundary: the
+harness does not deploy, restart, stop, mount, or unmount ZeroFS. The server
+build must export `zerofs_sftp_object_read_bytes_total`, which counts payload
+bytes returned by successful production `SftpObjectStore` reads. The observed
+delta must be at least the benchmark's logical byte count; a smaller delta
+fails closed because client-cache invalidation alone cannot prove the full read
+traversed SFTP. This is service-global interval evidence, so the deliberately
+prepared export must have no concurrent clients or maintenance traffic; the
+receipt is invalid if that isolation is not true. The metric does not claim the
+remote provider served physical media rather than its own cache, nor does it
+prove which pool session was reused, retired, rekeyed, or rotated.
+
+The fio subprocess receives the 30-second deadline and any timeout preserves a
+failed manifest before cleanup is attempted twice. On a `hard` NFS mount, an
+uninterruptible kernel wait can outlive a userspace deadline; if that prevents
+resource removal, the cleanup ledger remains failed rather than claiming
+teardown succeeded. Run this only on a deliberately prepared isolated test
+export, never a shared production namespace.
 
 ## Fixed memory envelope
 
