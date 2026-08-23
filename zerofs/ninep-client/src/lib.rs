@@ -5345,6 +5345,48 @@ mod session_transition_tests {
 
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test(start_paused = true)]
+    async fn slow_tcp_read_progress_refreshes_connection_liveness() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (stream, mut peer) = tokio::io::duplex(1);
+        let (mut stream, progress) = write_progress::TrackedIo::new(stream);
+        let (conn, _requests) = test_conn_with_receiver_at(runtime::Clock::ago(LIVENESS_WINDOW));
+        assert!(!conn.heard_within(LIVENESS_WINDOW));
+
+        let shutdown = Arc::new(Notify::new());
+        let reader_shutdown = Arc::clone(&shutdown);
+        let reader_conn = Arc::clone(&conn);
+        let read = tokio::spawn(async move {
+            let mut bytes = [0_u8; 3];
+            write_progress::wait_for_read(
+                stream.read_exact(&mut bytes),
+                &progress,
+                reader_shutdown.as_ref(),
+                || reader_conn.mark_alive(),
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+
+        for byte in b"abc" {
+            peer.write_all(&[*byte]).await.unwrap();
+            tokio::task::yield_now().await;
+            assert!(
+                conn.heard_within(LIVENESS_WINDOW),
+                "each partial socket read must prove the connection is still alive"
+            );
+            tokio::time::advance(LIVENESS_WINDOW - Duration::from_secs(1)).await;
+        }
+
+        assert!(matches!(
+            read.await.unwrap(),
+            write_progress::ReadOutcome::Completed(Ok(_))
+        ));
+        assert!(!conn.dead.load(Ordering::Acquire));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test(start_paused = true)]
     async fn queued_request_does_not_stall_while_the_fifo_writer_makes_progress() {
         use tokio::io::AsyncReadExt;
 
