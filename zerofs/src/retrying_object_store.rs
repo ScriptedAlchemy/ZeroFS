@@ -23,6 +23,9 @@ use object_store::{
 
 const RETRY_DELETE_CONCURRENCY: usize = 10;
 
+#[derive(Clone, Debug)]
+pub(crate) struct CallerOwnsRetries;
+
 /// Shared indefinite-retry backoff policy: exponential backoff between 100ms
 /// and 1s, retried forever. Used both by [`RetryingObjectStore`] and by the
 /// SFTP backend's ambiguous-write reconciliation, which needs the same
@@ -201,6 +204,9 @@ impl ObjectStore for RetryingObjectStore {
         payload: PutPayload,
         opts: PutOptions,
     ) -> object_store::Result<PutResult> {
+        if opts.extensions.get::<CallerOwnsRetries>().is_some() {
+            return self.inner.put_opts(location, payload, opts).await;
+        }
         (|| async {
             self.inner
                 .put_opts(location, payload.clone(), opts.clone())
@@ -217,6 +223,9 @@ impl ObjectStore for RetryingObjectStore {
         location: &Path,
         opts: PutMultipartOptions,
     ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        if opts.extensions.get::<CallerOwnsRetries>().is_some() {
+            return self.inner.put_multipart_opts(location, opts).await;
+        }
         // Only the initiation is retried; part uploads and completion belong to
         // the returned handle (BufWriter drives those and surfaces their errors
         // to the seal path, which has its own retry).
@@ -344,6 +353,7 @@ mod tests {
         fail_puts: AtomicUsize,
         fail_lists: AtomicUsize,
         gets: AtomicUsize,
+        puts: AtomicUsize,
         truncate_gets: AtomicUsize,
         delete_barrier: Option<Arc<Barrier>>,
         deletes_in_flight: Arc<AtomicUsize>,
@@ -358,6 +368,7 @@ mod tests {
                 fail_puts: AtomicUsize::new(0),
                 fail_lists: AtomicUsize::new(0),
                 gets: AtomicUsize::new(0),
+                puts: AtomicUsize::new(0),
                 truncate_gets: AtomicUsize::new(0),
                 delete_barrier: None,
                 deletes_in_flight: Arc::new(AtomicUsize::new(0)),
@@ -430,6 +441,7 @@ mod tests {
             payload: PutPayload,
             opts: PutOptions,
         ) -> object_store::Result<PutResult> {
+            self.puts.fetch_add(1, Ordering::SeqCst);
             if Self::take(&self.fail_puts) {
                 return Err(Self::transient());
             }
@@ -441,6 +453,10 @@ mod tests {
             location: &Path,
             opts: PutMultipartOptions,
         ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.puts.fetch_add(1, Ordering::SeqCst);
+            if Self::take(&self.fail_puts) {
+                return Err(Self::transient());
+            }
             self.inner.put_multipart_opts(location, opts).await
         }
 
@@ -601,6 +617,42 @@ mod tests {
             .await
             .expect_err("create over an existing object");
         assert!(matches!(err, object_store::Error::AlreadyExists { .. }));
+    }
+
+    #[tokio::test]
+    async fn caller_owned_put_attempt_is_not_retried_inside_the_store_wrapper() {
+        let (flaky, retrying) = seeded();
+        let path = Path::from("writeback-owned");
+        let mut options = PutOptions::default();
+        options.extensions.insert(CallerOwnsRetries);
+        flaky.fail_puts.store(1, Ordering::SeqCst);
+
+        retrying
+            .put_opts(&path, PutPayload::from_static(b"payload"), options)
+            .await
+            .expect_err("the writeback scheduler must observe the first failed attempt");
+
+        assert_eq!(
+            flaky.puts.load(Ordering::SeqCst),
+            1,
+            "the durable-journal scheduler, not this wrapper, owns the retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn caller_owned_multipart_initiation_is_not_retried_inside_the_store_wrapper() {
+        let (flaky, retrying) = seeded();
+        let path = Path::from("writeback-multipart-owned");
+        let mut options = PutMultipartOptions::default();
+        options.extensions.insert(CallerOwnsRetries);
+        flaky.fail_puts.store(1, Ordering::SeqCst);
+
+        retrying
+            .put_multipart_opts(&path, options)
+            .await
+            .expect_err("the scheduler must observe the first failed multipart initiation");
+
+        assert_eq!(flaky.puts.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

@@ -16,6 +16,8 @@ use std::collections::HashSet;
 use std::fmt::{self, Display, Formatter};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+#[cfg(test)]
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tokio::sync::Notify;
 
@@ -46,6 +48,14 @@ pub struct FaultControls {
     block_heads: AtomicBool,
     #[cfg(test)]
     heads: AtomicUsize,
+    #[cfg(test)]
+    caller_owned_put_attempts: AtomicUsize,
+    #[cfg(test)]
+    put_delay_phases: AtomicUsize,
+    #[cfg(test)]
+    put_delay_millis: AtomicU64,
+    #[cfg(test)]
+    put_phase_started: Arc<Notify>,
     #[cfg(test)]
     head_activity: Arc<Notify>,
     #[cfg(test)]
@@ -112,6 +122,22 @@ impl FaultControls {
     #[cfg(test)]
     pub(crate) fn head_count(&self) -> usize {
         self.heads.load(Ordering::SeqCst)
+    }
+    #[cfg(test)]
+    pub(crate) fn caller_owned_put_attempt_count(&self) -> usize {
+        self.caller_owned_put_attempts.load(Ordering::SeqCst)
+    }
+    #[cfg(test)]
+    pub(crate) fn delay_put_in_phases(&self, phases: usize, delay: std::time::Duration) {
+        self.put_delay_phases.store(phases, Ordering::SeqCst);
+        self.put_delay_millis.store(
+            u64::try_from(delay.as_millis()).expect("test PUT delay fits u64 milliseconds"),
+            Ordering::SeqCst,
+        );
+    }
+    #[cfg(test)]
+    pub(crate) fn put_phase_started(&self) -> Arc<Notify> {
+        self.put_phase_started.clone()
     }
     #[cfg(test)]
     fn head_activity(&self) -> Arc<Notify> {
@@ -189,6 +215,24 @@ impl ObjectStore for FaultStore {
             .unwrap()
             .push(location.to_string());
         self.check_writable("put")?;
+        #[cfg(test)]
+        if opts
+            .extensions
+            .get::<crate::retrying_object_store::CallerOwnsRetries>()
+            .is_some()
+        {
+            self.ctl
+                .caller_owned_put_attempts
+                .fetch_add(1, Ordering::SeqCst);
+        }
+        #[cfg(test)]
+        for _ in 0..self.ctl.put_delay_phases.load(Ordering::SeqCst) {
+            self.ctl.put_phase_started.notify_one();
+            tokio::time::sleep(std::time::Duration::from_millis(
+                self.ctl.put_delay_millis.load(Ordering::SeqCst),
+            ))
+            .await;
+        }
         if take_one(&self.ctl.fail_next_puts) {
             return Err(Self::transient("put"));
         }

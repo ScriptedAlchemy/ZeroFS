@@ -28,6 +28,10 @@ use tokio::task::{JoinHandle, JoinSet};
 const REMOTE_COALESCE_IDLE: Duration = Duration::from_millis(500);
 const REMOTE_RETRY_DELAY: Duration = Duration::from_millis(200);
 const REMOTE_OPERATION_TIMEOUT: Duration = Duration::from_secs(120);
+/// Atomic publication composes multiple independently bounded SFTP phases.
+/// Create and Update can require a durable staging write, a publication link,
+/// and staging removal, so their watchdog must exceed three request budgets.
+const REMOTE_PUBLICATION_TIMEOUT: Duration = Duration::from_secs(480);
 /// Multipart part size for blobs above [`REMOTE_SINGLE_PUT_BYTES`]. Sized to
 /// fill the SFTP transport's pipelined request window (64 x 255 KiB): an
 /// 8 MiB part left the window half-empty and doubled the per-part
@@ -1366,14 +1370,15 @@ async fn stream_record_to_remote(
                 generic_error(format!("journal blob stream failed: {error:#}"))
             })?);
         }
-        let result = bounded_remote_step(
+        let mut options = PutOptions::from(mode.clone());
+        options
+            .extensions
+            .insert(crate::retrying_object_store::CallerOwnsRetries);
+        let result = bounded_remote_step_with_timeout(
             record,
             "bounded atomic put",
-            remote.put_opts(
-                target,
-                PutPayload::from_iter(collected),
-                PutOptions::from(mode.clone()),
-            ),
+            REMOTE_PUBLICATION_TIMEOUT,
+            remote.put_opts(target, PutPayload::from_iter(collected), options),
         )
         .await;
         return match result {
@@ -1387,10 +1392,14 @@ async fn stream_record_to_remote(
             Err(error) => Err(error),
         };
     }
+    let mut multipart_options = PutMultipartOptions::default();
+    multipart_options
+        .extensions
+        .insert(crate::retrying_object_store::CallerOwnsRetries);
     let upload = bounded_remote_step(
         record,
         "multipart initiation",
-        remote.put_multipart_opts(target, PutMultipartOptions::default()),
+        remote.put_multipart_opts(target, multipart_options),
     )
     .await?;
     let mut owner = RemoteMultipartOwner::new(upload, cleanup_sender, cleanup_state);
@@ -1444,7 +1453,13 @@ async fn stream_record_to_remote(
         bounded_remote_step(record, "multipart precondition abort", owner.abort()).await?;
         return Ok(existing);
     }
-    bounded_remote_step(record, "multipart completion", owner.complete()).await
+    bounded_remote_step_with_timeout(
+        record,
+        "multipart completion",
+        REMOTE_PUBLICATION_TIMEOUT,
+        owner.complete(),
+    )
+    .await
 }
 
 async fn abort_remote_multipart<T>(
@@ -1468,13 +1483,25 @@ async fn bounded_remote_step<T, F>(
 where
     F: Future<Output = object_store::Result<T>>,
 {
-    tokio::time::timeout(REMOTE_OPERATION_TIMEOUT, operation)
+    bounded_remote_step_with_timeout(record, step, REMOTE_OPERATION_TIMEOUT, operation).await
+}
+
+async fn bounded_remote_step_with_timeout<T, F>(
+    record: &MutationRecord,
+    step: &'static str,
+    deadline: Duration,
+    operation: F,
+) -> object_store::Result<T>
+where
+    F: Future<Output = object_store::Result<T>>,
+{
+    tokio::time::timeout(deadline, operation)
         .await
         .map_err(|_| {
             generic_error(format!(
                 "remote {step} for sequence {} timed out after {:.3}s",
                 record.sequence,
-                REMOTE_OPERATION_TIMEOUT.as_secs_f64()
+                deadline.as_secs_f64()
             ))
         })?
 }
@@ -1810,6 +1837,72 @@ mod tests {
             0,
             "an atomic small Create must not pay a redundant precondition HEAD"
         );
+        assert_eq!(
+            remote.get(&target).await.unwrap().bytes().await.unwrap(),
+            payload
+        );
+    }
+
+    #[tokio::test]
+    async fn writeback_marks_atomic_puts_as_scheduler_owned_attempts() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (remote, controls) = FaultStore::new(inner);
+        let temp = tempfile::tempdir().unwrap();
+        let journal = Arc::new(journal_with_local_records(temp.path(), 0));
+        let target = Path::from("segments/scheduler-owned");
+        let payload = Bytes::from_static(b"single scheduler attempt");
+        let record = put_record(1, target.as_ref(), &payload);
+        let record = journal.commit_put(record, &payload).unwrap();
+
+        apply_record_with_tracked_cleanup(remote, journal, record)
+            .await
+            .expect("the scheduler-owned atomic put succeeds");
+
+        assert_eq!(
+            controls.caller_owned_put_attempt_count(),
+            1,
+            "the durable-journal scheduler must own retries for its atomic put"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn valid_composite_publication_can_exceed_the_legacy_operation_timeout() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (remote, controls) = FaultStore::new(inner);
+        controls.delay_put_in_phases(3, Duration::from_secs(41));
+        let phase_started = controls.put_phase_started();
+        let temp = tempfile::tempdir().unwrap();
+        let journal = Arc::new(journal_with_local_records(temp.path(), 0));
+        let target = Path::from("segments/slow-valid-create");
+        let payload = Bytes::from_static(b"valid slow publication");
+        let record = put_record(1, target.as_ref(), &payload);
+        let record = journal.commit_put(record, &payload).unwrap();
+        let publication = tokio::spawn(apply_record_with_tracked_cleanup(
+            remote.clone(),
+            journal,
+            record,
+        ));
+        tokio::task::yield_now().await;
+
+        for _ in 0..2 {
+            phase_started.notified().await;
+            tokio::time::advance(Duration::from_secs(41)).await;
+            tokio::task::yield_now().await;
+        }
+        phase_started.notified().await;
+        tokio::time::advance(Duration::from_secs(39)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !publication.is_finished(),
+            "a valid composite publication must outlive the legacy 120s watchdog"
+        );
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+
+        publication
+            .await
+            .unwrap()
+            .expect("three healthy phases must not hit the single-operation timeout");
         assert_eq!(
             remote.get(&target).await.unwrap().bytes().await.unwrap(),
             payload
