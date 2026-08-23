@@ -942,9 +942,15 @@ fn is_terminal_remote_error(error: &object_store::Error) -> bool {
     match error {
         object_store::Error::AlreadyExists { source, .. } => source.is::<RemoteContentDivergence>(),
         object_store::Error::Precondition { source, .. } => source.is::<MissingRemotePredecessor>(),
-        object_store::Error::NotSupported { source } => source
-            .downcast_ref::<crate::sftp_object_store::RemoteError>()
-            .is_some_and(crate::sftp_object_store::RemoteError::is_pool_closed),
+        object_store::Error::NotSupported { source } => {
+            source
+                .downcast_ref::<crate::sftp_object_store::RemoteError>()
+                .is_some_and(crate::sftp_object_store::RemoteError::is_pool_closed)
+                || matches!(
+                    source.downcast_ref::<crate::sftp_transport::TransportError>(),
+                    Some(crate::sftp_transport::TransportError::PoolClosed)
+                )
+        }
         _ if crate::retrying_object_store::has_permanent_source(error) => true,
         _ => false,
     }
@@ -2238,6 +2244,43 @@ mod tests {
             "pool closure must attempt cleanup before terminalizing"
         );
         pool.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn scheduler_classifier_terminalizes_a_directly_closed_sftp_pool() {
+        let state = Arc::new(CleanupDebtTransportState::default());
+        let pool = crate::sftp_transport::SftpSessionPool::new_writable(
+            Arc::new(CleanupDebtFactory(state.clone())),
+            1,
+            1,
+            1,
+        )
+        .await
+        .unwrap();
+        let backend: Arc<dyn ObjectStore> = Arc::new(
+            crate::sftp_object_store::SftpObjectStore::new(pool.clone(), Path::from("root"))
+                .unwrap(),
+        );
+        let remote: Arc<dyn ObjectStore> = Arc::new(
+            crate::retrying_object_store::RetryingObjectStore::new(backend),
+        );
+        pool.shutdown().await.unwrap();
+
+        let temp = tempfile::tempdir().unwrap();
+        let journal = Arc::new(journal_with_local_records(temp.path(), 0));
+        let payload = Bytes::from_static(b"direct pool closure");
+        let record = put_record(1, "root/direct-pool-closed", &payload);
+        let record = journal.commit_put(record, &payload).unwrap();
+
+        let error = apply_record_with_tracked_cleanup(remote, journal, record)
+            .await
+            .expect_err("a directly closed SFTP pool must fail the publication");
+        assert!(matches!(error, object_store::Error::NotSupported { .. }));
+        assert!(
+            is_terminal_remote_error(&error),
+            "typed transport pool closure must terminalize the scheduler: {error:?}"
+        );
+        assert_eq!(state.writes.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[tokio::test(start_paused = true)]
