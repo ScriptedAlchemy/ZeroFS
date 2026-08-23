@@ -210,6 +210,7 @@ async fn handle_9p_ws(
                     &admission,
                     &requests,
                     &state.shutdown,
+                    &state.shutdown,
                 )
                 .await
                 {
