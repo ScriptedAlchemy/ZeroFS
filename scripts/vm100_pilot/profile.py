@@ -38,6 +38,12 @@ _HOTPATH_RUNTIME_TIMEOUT = 1.0
 _HOTPATH_RUNTIME_MAX_BYTES = 1 << 20
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request: object, *args: object) -> None:
+        del request, args
+        return None
+
+
 @dataclass(slots=True)
 class _LoopbackPortReservation:
     socket: socket.socket
@@ -540,7 +546,7 @@ def _require_hotpath_report(path: Path) -> dict[str, object]:
     if not isinstance(payload, dict) or payload.get("type") != "hotpath_report":
         raise RuntimeError(f"Hotpath report has an invalid envelope: {path}")
     required = {"functions_timing", "futures", "threads"}
-    if any(key not in payload or payload[key] is None for key in required):
+    if any(not isinstance(payload.get(key), dict) for key in required):
         raise RuntimeError(f"Hotpath report omits required sections: {path}")
     allowed = {
         "type",
@@ -565,8 +571,14 @@ def _require_hotpath_runtime(payload: object) -> dict[str, object]:
         if not isinstance(payload[key], int) or isinstance(payload[key], bool) or payload[key] < 0:
             raise RuntimeError(f"Hotpath Tokio runtime field is invalid: {key}")
     workers = payload["workers"]
-    if not isinstance(workers, list) or len(workers) != payload["num_workers"]:
+    if (
+        payload["num_workers"] <= 0
+        or not isinstance(workers, list)
+        or not workers
+        or len(workers) != payload["num_workers"]
+    ):
         raise RuntimeError("Hotpath Tokio runtime workers are invalid")
+    indices: set[int] = set()
     for worker in workers:
         if not isinstance(worker, dict):
             raise RuntimeError("Hotpath Tokio runtime worker is invalid")
@@ -574,12 +586,17 @@ def _require_hotpath_runtime(payload: object) -> dict[str, object]:
             value = worker.get(key)
             if not isinstance(value, int) or isinstance(value, bool) or value < 0:
                 raise RuntimeError(f"Hotpath Tokio runtime worker field is invalid: {key}")
+        indices.add(worker["index"])
+    if indices != set(range(payload["num_workers"])):
+        raise RuntimeError("Hotpath Tokio runtime worker indices are invalid")
     return payload
 
 
 def _fetch_hotpath_runtime(port: int) -> dict[str, object]:
     url = f"http://127.0.0.1:{port}/tokio_runtime"
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}), _NoRedirectHandler
+    )
     errors: list[str] = []
     for attempt in range(_HOTPATH_RUNTIME_ATTEMPTS):
         try:
@@ -592,6 +609,8 @@ def _fetch_hotpath_runtime(port: int) -> dict[str, object]:
                 return _require_hotpath_runtime(json.loads(body.decode("utf-8")))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError, RuntimeError, urllib.error.URLError) as error:
             errors.append(str(error))
+            if isinstance(error, urllib.error.HTTPError):
+                error.close()
             if attempt + 1 < _HOTPATH_RUNTIME_ATTEMPTS:
                 time.sleep(0.1)
     raise RuntimeError("Hotpath Tokio runtime retrieval failed: " + "; ".join(errors))
@@ -927,6 +946,7 @@ class ProfileRunner:
                 profile_service_started = True
                 profile_status = self.lifecycle.status(validate_data=True)
                 receipt.record("profile_status", profile_status)
+                self._fetch_hotpath_runtime(hotpath_port.port)
                 pid = self._service_pid()
                 receipt.record("profile_service_pid", pid)
                 collectors = self._start_collectors(pid, receipt)

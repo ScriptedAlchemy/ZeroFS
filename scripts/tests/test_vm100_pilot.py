@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import http.server
 import importlib.util
 import io
 import json
@@ -2644,6 +2645,7 @@ class _TestProfileRunner(ProfileRunner):
         return 123
 
     def _fetch_hotpath_runtime(self, _port: int) -> dict[str, object]:
+        self.runtime_fetches = getattr(self, "runtime_fetches", 0) + 1
         return profile_module._require_hotpath_runtime(
             getattr(self.lifecycle, "runtime_payload")
         )
@@ -2969,6 +2971,7 @@ class ProfileTests(unittest.TestCase):
         runtime = Path(result.receipt_dir) / "hotpath-tokio-runtime.json"
         self.assertEqual(manifest["artifacts"]["hotpath-tokio-runtime.json"], str(runtime))
         self.assertEqual(json.loads(runtime.read_text())["num_workers"], 1)
+        self.assertEqual(profiler.runtime_fetches, 2)
         self.assertEqual(len(runner.installed_dropins), 1)
         self.assertEqual(runner.removed_dropins, runner.installed_dropins)
         installed = runner.installed_dropins[0]
@@ -2998,6 +3001,17 @@ class ProfileTests(unittest.TestCase):
                     ),
                     "forbidden sections",
                 ),
+                (
+                    json.dumps(
+                        {
+                            "type": "hotpath_report",
+                            "functions_timing": [],
+                            "futures": {},
+                            "threads": {},
+                        }
+                    ),
+                    "required sections",
+                ),
             )
         ):
             with self.subTest(report=report):
@@ -3021,7 +3035,27 @@ class ProfileTests(unittest.TestCase):
                 self.assertGreaterEqual(lifecycle.start_calls, 2)
 
     def test_profile_fails_closed_for_missing_or_invalid_hotpath_runtime(self) -> None:
-        for index, payload in enumerate(({}, {"num_workers": "bad", "workers": []})):
+        for index, payload in enumerate(
+            (
+                {},
+                {"num_workers": "bad", "workers": []},
+                {
+                    "num_workers": 0,
+                    "num_alive_tasks": 0,
+                    "global_queue_depth": 0,
+                    "workers": [],
+                },
+                {
+                    "num_workers": 2,
+                    "num_alive_tasks": 0,
+                    "global_queue_depth": 0,
+                    "workers": [
+                        {"index": 0, "park_count": 1, "busy_duration_ms": 1},
+                        {"index": 0, "park_count": 1, "busy_duration_ms": 1},
+                    ],
+                },
+            )
+        ):
             with self.subTest(payload=payload):
                 profiler, _runner, _lifecycle = self._hotpath_profiler(
                     _VALID_HOTPATH_REPORT,
@@ -3039,6 +3073,98 @@ class ProfileTests(unittest.TestCase):
                 self.assertNotIn("hotpath-tokio-runtime.json", manifest["artifacts"])
                 self.assertEqual(self.config_file.read_bytes(), self.original_config)
                 self.assertEqual(self.binary.read_bytes(), b"canonical-binary")
+
+    def test_fetch_hotpath_runtime_uses_loopback_without_redirects_and_retries(
+        self,
+    ) -> None:
+        responses = [500, 500, 200]
+        requests: list[str] = []
+        payload = {
+            "num_workers": 1,
+            "num_alive_tasks": 0,
+            "global_queue_depth": 0,
+            "workers": [{"index": 0, "park_count": 1, "busy_duration_ms": 2}],
+        }
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                requests.append(self.path)
+                status = responses.pop(0)
+                self.send_response(status)
+                self.end_headers()
+                if status == 200:
+                    self.wfile.write(json.dumps(payload).encode())
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(thread.join)
+        self.addCleanup(server.shutdown)
+        with mock.patch.object(profile_module.time, "sleep"):
+            self.assertEqual(
+                profile_module._fetch_hotpath_runtime(server.server_port), payload
+            )
+        self.assertEqual(requests, ["/tokio_runtime"] * 3)
+
+        redirects: list[str] = []
+
+        class RedirectHandler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                redirects.append(self.path)
+                if self.path == "/tokio_runtime":
+                    self.send_response(302)
+                    self.send_header("Location", "/target")
+                    self.end_headers()
+                    return
+                self.send_response(200)
+                self.end_headers()
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        redirect_server = http.server.ThreadingHTTPServer(
+            ("127.0.0.1", 0), RedirectHandler
+        )
+        redirect_thread = threading.Thread(target=redirect_server.serve_forever)
+        redirect_thread.start()
+        self.addCleanup(redirect_server.server_close)
+        self.addCleanup(redirect_thread.join)
+        self.addCleanup(redirect_server.shutdown)
+        with (
+            mock.patch.object(profile_module.time, "sleep"),
+            self.assertRaisesRegex(RuntimeError, "runtime retrieval failed"),
+        ):
+            profile_module._fetch_hotpath_runtime(redirect_server.server_port)
+        self.assertEqual(redirects, ["/tokio_runtime"] * 5)
+
+        for body, expected in (
+            (b'{"num_workers":0,"workers":[]}', "runtime retrieval failed"),
+            (b"x" * (profile_module._HOTPATH_RUNTIME_MAX_BYTES + 1), "runtime retrieval failed"),
+        ):
+            class BodyHandler(http.server.BaseHTTPRequestHandler):
+                def do_GET(self) -> None:  # noqa: N802
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(body)
+
+                def log_message(self, _format: str, *_args: object) -> None:
+                    return
+
+            body_server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), BodyHandler)
+            body_thread = threading.Thread(target=body_server.serve_forever)
+            body_thread.start()
+            self.addCleanup(body_server.server_close)
+            self.addCleanup(body_thread.join)
+            self.addCleanup(body_server.shutdown)
+            with (
+                mock.patch.object(profile_module.time, "sleep"),
+                self.assertRaisesRegex(RuntimeError, expected),
+            ):
+                profile_module._fetch_hotpath_runtime(body_server.server_port)
 
     def test_profile_hotpath_environment_is_removed_on_cancellation_and_start_failure(
         self,
