@@ -1646,6 +1646,37 @@ class CliDryRunTests(ConfigValidationTests):
         self.assertNotEqual(unsafe.returncode, 0)
         self.assertIn("HOTPATH_CPU_BASELINE_OFF", unsafe.stderr)
 
+        valid_lines = [
+            f"{key}={value}"
+            for key, value in deploy.HOTPATH_PROFILE_ENV.items()
+        ]
+        invalid_environments = {
+            "export": "\n".join(f"export {line}" for line in valid_lines),
+            "unexpected": "\n".join(
+                [*valid_lines, "HOTPATH_TOKIO_RUNTIME_INTERVAL_MS=0"]
+            ),
+            "duplicate": "\n".join(
+                [
+                    *valid_lines,
+                    "HOTPATH_CPU_BASELINE_OFF=true",
+                ]
+            ),
+            "continuation": "\n".join(
+                [
+                    *valid_lines[:-1],
+                    f"{valid_lines[-1]}\\",
+                ]
+            ),
+        }
+        for name, content in invalid_environments.items():
+            with self.subTest(name=name):
+                invalid = self.write_config(content + "\n")
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "Hotpath production environment",
+                ):
+                    deploy.validate_hotpath_profile_env(invalid)
+
     def test_hotpath_profile_rejects_non_production_deploy_scope(self) -> None:
         config = self.write_config(self.valid_config())
         result = subprocess.run(

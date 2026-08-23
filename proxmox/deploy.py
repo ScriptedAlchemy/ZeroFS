@@ -776,28 +776,29 @@ def validate_hotpath_profile_env(path: Path | None) -> None:
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
-        if line.startswith("export "):
-            line = line.removeprefix("export ").lstrip()
+        if "HOTPATH_" not in line:
+            continue
+        if raw_line != line or line.endswith("\\"):
+            raise ValueError("Hotpath production environment has ambiguous syntax")
         key, separator, value = line.partition("=")
         if not separator or key not in HOTPATH_PROFILE_ENV:
-            continue
-        value = value.strip()
-        if (
-            len(value) >= 2
-            and value[0] == value[-1]
-            and value[0] in {"'", '"'}
-        ):
-            value = value[1:-1]
+            raise ValueError(
+                "Hotpath production environment contains an unsupported control"
+            )
+        if key in values:
+            raise ValueError(
+                f"Hotpath production environment duplicates {key}"
+            )
         values[key] = value
-    mismatches = [
+    missing_or_unsafe = [
         key
         for key, expected in HOTPATH_PROFILE_ENV.items()
         if values.get(key) != expected
     ]
-    if mismatches:
+    if missing_or_unsafe:
         raise ValueError(
             "Hotpath production environment is missing or unsafe: "
-            + ", ".join(mismatches)
+            + ", ".join(missing_or_unsafe)
         )
 
 
