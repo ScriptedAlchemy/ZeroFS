@@ -1750,9 +1750,9 @@ fn missing_remote_predecessor(
 #[cfg(test)]
 mod tests {
     use super::{
-        CompletedRemote, SchedulerWindow, apply_record_with_tracked_cleanup,
-        bounded_remote_operation, collect_pipeline_batch, load_scheduler_window,
-        validate_scheduler_window, verify_existing,
+        CompletedRemote, REMOTE_PUBLICATION_TIMEOUT, SchedulerWindow,
+        apply_record_with_tracked_cleanup, bounded_remote_operation, collect_pipeline_batch,
+        load_scheduler_window, validate_scheduler_window, verify_existing,
     };
     use crate::fault_store::FaultStore;
     use crate::writeback::journal::Journal;
@@ -1906,6 +1906,35 @@ mod tests {
         assert_eq!(
             remote.get(&target).await.unwrap().bytes().await.unwrap(),
             payload
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn permanently_pending_publication_still_hits_the_composite_watchdog() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (remote, controls) = FaultStore::new(inner);
+        controls.block_puts();
+        let put_activity = controls.put_activity();
+        let temp = tempfile::tempdir().unwrap();
+        let journal = Arc::new(journal_with_local_records(temp.path(), 0));
+        let payload = Bytes::from_static(b"never settles");
+        let record = put_record(1, "segments/pending-publication", &payload);
+        let record = journal.commit_put(record, &payload).unwrap();
+        let publication = tokio::spawn(apply_record_with_tracked_cleanup(remote, journal, record));
+        put_activity.notified().await;
+
+        tokio::time::advance(REMOTE_PUBLICATION_TIMEOUT + Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+
+        let error = publication
+            .await
+            .unwrap()
+            .expect_err("a permanently pending publication must remain finitely bounded");
+        assert!(
+            error
+                .to_string()
+                .contains("bounded atomic put for sequence 1 timed out after 480.000s"),
+            "unexpected error: {error}"
         );
     }
 

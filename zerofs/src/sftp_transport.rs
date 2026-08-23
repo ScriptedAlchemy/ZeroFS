@@ -1667,11 +1667,8 @@ impl SessionLease {
         Ok(())
     }
 
-    pub(crate) async fn retire(mut self) -> Result<(), TransportError> {
-        let session = self
-            .session
-            .take()
-            .expect("lease always owns a session until retirement");
+    fn start_retirement(&mut self) -> Option<tokio::task::JoinHandle<Result<(), TransportError>>> {
+        let session = self.session.take()?;
         // Marking the session broken removes it from placement; the close
         // itself happens once the last concurrent operation releases it.
         let pool = self.pool.clone();
@@ -1682,9 +1679,10 @@ impl SessionLease {
         let admission = self.admission.take();
         let activity = self.activity.take();
         let remaining = session.active_ops.fetch_sub(1, Ordering::SeqCst) - 1;
-        // The close runs in an owned task so a canceled caller cannot abandon
-        // it half-way; admission capacity stays held until it finishes.
-        let cleanup = self.pool.tasks.spawn(async move {
+        // The close runs in an owned task so caller cancellation or an
+        // implicit lease drop cannot abandon it half-way. Admission and pool
+        // activity remain held until the physical session has settled.
+        Some(self.pool.tasks.spawn(async move {
             let result = if remaining == 0 {
                 pool.close_shared_session(session).await
             } else {
@@ -1694,7 +1692,13 @@ impl SessionLease {
             drop(admission);
             drop(activity);
             result
-        });
+        }))
+    }
+
+    pub(crate) async fn retire(mut self) -> Result<(), TransportError> {
+        let cleanup = self
+            .start_retirement()
+            .expect("lease always owns a session until retirement");
         cleanup
             .await
             .map_err(|_| TransportError::Close("SFTP retirement task failed".to_owned()))?
@@ -1725,16 +1729,13 @@ impl SessionLease {
 
 impl Drop for SessionLease {
     fn drop(&mut self) {
-        let Some(session) = self.session.take() else {
+        if self.session.is_none() {
             return;
-        };
-        // A lease dropped without `complete` abandoned its operation mid
-        // flight; the session's protocol state is ambiguous, so it must not
-        // serve new operations.
-        self.pool.remove_from_roster(&session);
-        self.pool.release_session(&session, self.kind);
-        drop(self.admission.take());
-        drop(self.activity.take());
+        }
+        // A lease dropped without completing abandoned its operation mid
+        // flight. The same owned retirement path as explicit failures keeps
+        // admission and lifetime capacity until the physical close settles.
+        drop(self.start_retirement());
     }
 }
 
@@ -3059,6 +3060,54 @@ mod tests {
             .complete()
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropped_lease_holds_admission_until_owned_close_finishes() {
+        let factory = RecordingFactory::fully_capable();
+        let pool = Arc::new(pool(factory.clone(), 1, 1, 1).await);
+        factory.state.block_close.store(1, Ordering::SeqCst);
+        let lease = pool.checkout(OperationKind::Write).await.unwrap();
+
+        drop(lease);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            factory.state.close_started.notified(),
+        )
+        .await
+        .expect("dropped lease starts owned retirement");
+
+        assert_eq!(
+            pool.inner
+                .admission
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .active_writes,
+            1,
+            "operation admission must remain held until physical close settles"
+        );
+
+        let replacement = tokio::spawn({
+            let pool = pool.clone();
+            async move { pool.checkout(OperationKind::Read).await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!replacement.is_finished());
+        assert_eq!(factory.dials(), 1);
+
+        factory.state.block_close.store(0, Ordering::SeqCst);
+        factory.state.allow_close.notify_waiters();
+        replacement
+            .await
+            .unwrap()
+            .unwrap()
+            .complete()
+            .await
+            .unwrap();
+        assert_eq!(factory.dials(), 2);
+        assert_eq!(factory.peak(), 1);
     }
 
     #[tokio::test]
