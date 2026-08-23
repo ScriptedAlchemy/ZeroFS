@@ -237,11 +237,15 @@ pub struct PublicationOutcome {
 
 type TargetLock = AsyncMutex<()>;
 
-// Path-only scope deliberately fails safe across independently constructed
-// pools that may address the same backend namespace. It can over-serialize
-// unrelated backends with identical paths; a future narrower key must carry a
-// canonical endpoint-and-prefix identity, never an in-process pool pointer.
-static TARGET_LOCKS: LazyLock<StdMutex<HashMap<PathBuf, Weak<TargetLock>>>> =
+#[derive(Clone, Eq, Hash, PartialEq)]
+struct TargetLockKey {
+    backend_namespace: crate::sftp_transport::SftpBackendNamespace,
+    target: PathBuf,
+}
+
+// Canonical transport identity keeps independent pools for one backend safe
+// without coupling unrelated servers that happen to use the same remote path.
+static TARGET_LOCKS: LazyLock<StdMutex<HashMap<TargetLockKey, Weak<TargetLock>>>> =
     LazyLock::new(|| StdMutex::new(HashMap::new()));
 
 // `retain` walks the whole map, which is wasteful when this is called on
@@ -253,18 +257,25 @@ const TARGET_LOCKS_PRUNE_FLOOR: usize = 32;
 static TARGET_LOCKS_PRUNE_AT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(TARGET_LOCKS_PRUNE_FLOOR);
 
-fn target_lock(target: &FilePath) -> Arc<TargetLock> {
+fn target_lock(
+    backend_namespace: &crate::sftp_transport::SftpBackendNamespace,
+    target: &FilePath,
+) -> Arc<TargetLock> {
+    let key = TargetLockKey {
+        backend_namespace: backend_namespace.clone(),
+        target: target.to_path_buf(),
+    };
     let mut locks = TARGET_LOCKS.lock().unwrap();
     if locks.len() >= TARGET_LOCKS_PRUNE_AT.load(std::sync::atomic::Ordering::Relaxed) {
         locks.retain(|_, lock| lock.strong_count() > 0);
         let next_prune_at = (locks.len() * 2).max(TARGET_LOCKS_PRUNE_FLOOR);
         TARGET_LOCKS_PRUNE_AT.store(next_prune_at, std::sync::atomic::Ordering::Relaxed);
     }
-    if let Some(lock) = locks.get(target).and_then(Weak::upgrade) {
+    if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
         return lock;
     }
     let lock = Arc::new(TargetLock::new(()));
-    locks.insert(target.to_path_buf(), Arc::downgrade(&lock));
+    locks.insert(key, Arc::downgrade(&lock));
     lock
 }
 
@@ -285,6 +296,13 @@ async fn bounded_target_lock<'a>(
 
 #[async_trait]
 pub trait RemoteSession: Debug + Send + Sync {
+    /// Identify the remote namespace whose paths this session mutates.
+    ///
+    /// Unidentified sessions deliberately share one fail-safe namespace.
+    fn backend_namespace(&self) -> crate::sftp_transport::SftpBackendNamespace {
+        crate::sftp_transport::SftpBackendNamespace::default()
+    }
+
     fn capabilities(&self) -> SftpCapabilities;
 
     async fn read_exact(&self, path: &FilePath, offset: u64, len: usize) -> RemoteResult<Bytes>;
@@ -324,7 +342,7 @@ async fn publish_payload(
     mode: PublicationMode,
     expected_generation: Option<Uuid>,
 ) -> RemoteResult<PublicationOutcome> {
-    let target_lock = target_lock(target);
+    let target_lock = target_lock(&session.backend_namespace(), target);
     let _target_guard = bounded_target_lock(&target_lock, target).await?;
     validate_publication_capabilities(session.capabilities(), mode).map_err(|extension| {
         RemoteError::NotSupported(format!("SFTP server lacks required {extension} extension"))
@@ -611,6 +629,10 @@ struct PooledRemoteSession {
 
 #[async_trait]
 impl RemoteSession for PooledRemoteSession {
+    fn backend_namespace(&self) -> crate::sftp_transport::SftpBackendNamespace {
+        self.pool.backend_namespace()
+    }
+
     fn capabilities(&self) -> SftpCapabilities {
         SftpCapabilities {
             fsync: true,
@@ -1349,7 +1371,7 @@ impl MultipartUpload for SftpMultipartUpload {
             state.logical_len
         };
         let staging = self.staging()?.to_path_buf();
-        let target_lock = target_lock(&self.target);
+        let target_lock = target_lock(&self.session.backend_namespace(), &self.target);
         let _target_guard = bounded_target_lock(&target_lock, &self.target)
             .await
             .map_err(|error| publication_error(&self.location, error))?;
@@ -1601,7 +1623,7 @@ mod tests {
     use super::*;
     use crate::sftp_transport::{
         OpenSshTransportSession, RemoteDirectoryEntry, RemoteObjectRead, SessionFactory,
-        TransportError, TransportSession,
+        SftpBackendNamespace, TransportError, TransportSession,
     };
     use object_store::ObjectStoreExt;
     use std::collections::{HashMap, HashSet};
@@ -1609,6 +1631,109 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::sync::{Barrier, Notify};
+
+    #[derive(Debug, Clone)]
+    struct NamespaceFactory(SftpBackendNamespace);
+
+    #[async_trait]
+    impl SessionFactory for NamespaceFactory {
+        fn backend_namespace(&self) -> SftpBackendNamespace {
+            self.0.clone()
+        }
+
+        async fn open(
+            &self,
+            _force: tokio_util::sync::CancellationToken,
+        ) -> Result<Box<dyn TransportSession>, TransportError> {
+            Ok(Box::new(NamespaceSession))
+        }
+    }
+
+    #[derive(Debug)]
+    struct NamespaceSession;
+
+    #[async_trait]
+    impl TransportSession for NamespaceSession {
+        fn capabilities(&self) -> SftpCapabilities {
+            SftpCapabilities {
+                fsync: true,
+                hardlink: true,
+                posix_rename: true,
+            }
+        }
+
+        async fn close(
+            &self,
+            _force: tokio_util::sync::CancellationToken,
+        ) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    fn namespace_endpoint(host: &str, port: u16, username: &str) -> crate::config::SftpEndpoint {
+        crate::config::SftpEndpoint {
+            host: host.to_owned(),
+            port,
+            username: username.to_owned(),
+        }
+    }
+
+    async fn namespace_pool(
+        endpoint: crate::config::SftpEndpoint,
+    ) -> crate::sftp_transport::SftpSessionPool {
+        crate::sftp_transport::SftpSessionPool::new_writable(
+            Arc::new(NamespaceFactory(SftpBackendNamespace::from_endpoint(
+                &endpoint,
+            ))),
+            1,
+            1,
+            1,
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn target_locks_share_canonical_backend_identity_without_coupling_endpoints() {
+        assert_eq!(
+            SftpBackendNamespace::new("2001:0db8::1", 22, "alice"),
+            SftpBackendNamespace::new("2001:db8::1", 22, "alice"),
+            "equivalent IP spellings must share a stable namespace"
+        );
+        assert!(
+            !format!("{:?}", SftpBackendNamespace::new("host", 22, "secret-user"))
+                .contains("secret-user"),
+            "namespace diagnostics must not expose usernames"
+        );
+
+        let first = namespace_pool(namespace_endpoint("Storage.Example.", 22, "alice")).await;
+        let same = namespace_pool(namespace_endpoint("storage.example", 22, "alice")).await;
+        let other_host = namespace_pool(namespace_endpoint("backup.example", 22, "alice")).await;
+        let other_port = namespace_pool(namespace_endpoint("storage.example", 2222, "alice")).await;
+        let other_user = namespace_pool(namespace_endpoint("storage.example", 22, "bob")).await;
+        let target = PathBuf::from("root/objects/shared.bin");
+
+        let first_lock = target_lock(&first.backend_namespace(), &target);
+        let same_lock = target_lock(&same.backend_namespace(), &target);
+        let other_host_lock = target_lock(&other_host.backend_namespace(), &target);
+        let other_port_lock = target_lock(&other_port.backend_namespace(), &target);
+        let other_user_lock = target_lock(&other_user.backend_namespace(), &target);
+
+        let _held = first_lock.lock().await;
+        assert!(
+            same_lock.try_lock().is_err(),
+            "independent pools for one canonical endpoint and path must serialize"
+        );
+        assert!(other_host_lock.try_lock().is_ok());
+        assert!(other_port_lock.try_lock().is_ok());
+        assert!(other_user_lock.try_lock().is_ok());
+
+        first.shutdown().await.unwrap();
+        same.shutdown().await.unwrap();
+        other_host.shutdown().await.unwrap();
+        other_port.shutdown().await.unwrap();
+        other_user.shutdown().await.unwrap();
+    }
 
     #[test]
     fn pool_closed_is_a_terminal_object_store_error() {

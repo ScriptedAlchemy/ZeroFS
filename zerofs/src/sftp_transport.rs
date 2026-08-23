@@ -291,8 +291,75 @@ pub trait TransportSession: fmt::Debug + Send + Sync + 'static {
     async fn close(&self, force: CancellationToken) -> Result<(), TransportError>;
 }
 
+/// Stable identity for one remote SFTP account namespace.
+///
+/// Equality never depends on an in-process pool address or allocation lifetime.
+#[derive(Clone, Eq, Hash, PartialEq)]
+pub struct SftpBackendNamespace(SftpBackendIdentity);
+
+#[derive(Clone, Eq, Hash, PartialEq)]
+enum SftpBackendIdentity {
+    Canonical {
+        host: String,
+        port: u16,
+        username: String,
+    },
+    Unspecified,
+}
+
+impl SftpBackendNamespace {
+    /// Build an identity from a host, port, and case-sensitive username.
+    ///
+    /// DNS case/trailing dots and equivalent IP spellings are canonicalized.
+    pub fn new(host: &str, port: u16, username: impl Into<String>) -> Self {
+        let host = host.trim_end_matches('.');
+        let host = host
+            .parse::<std::net::IpAddr>()
+            .map(|address| address.to_string())
+            .unwrap_or_else(|_| host.to_ascii_lowercase());
+        Self(SftpBackendIdentity::Canonical {
+            host,
+            port,
+            username: username.into(),
+        })
+    }
+
+    pub(crate) fn from_endpoint(endpoint: &crate::config::SftpEndpoint) -> Self {
+        Self::new(&endpoint.host, endpoint.port, endpoint.username.clone())
+    }
+}
+
+impl Default for SftpBackendNamespace {
+    fn default() -> Self {
+        Self(SftpBackendIdentity::Unspecified)
+    }
+}
+
+impl fmt::Debug for SftpBackendNamespace {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.0 {
+            SftpBackendIdentity::Canonical { host, port, .. } => formatter
+                .debug_struct("SftpBackendNamespace")
+                .field("host", host)
+                .field("port", port)
+                .finish_non_exhaustive(),
+            SftpBackendIdentity::Unspecified => {
+                formatter.write_str("SftpBackendNamespace(Unspecified)")
+            }
+        }
+    }
+}
+
 #[async_trait]
 pub trait SessionFactory: fmt::Debug + Send + Sync + 'static {
+    /// Identify the remote account namespace opened by this factory.
+    ///
+    /// The default remains deliberately shared so unidentified custom
+    /// factories fail safe by serializing equal remote paths.
+    fn backend_namespace(&self) -> SftpBackendNamespace {
+        SftpBackendNamespace::default()
+    }
+
     async fn open(
         &self,
         force: CancellationToken,
@@ -603,6 +670,7 @@ impl DirectoryCache {
 
 struct PoolInner {
     factory: Arc<dyn SessionFactory>,
+    backend_namespace: SftpBackendNamespace,
     shared: Arc<Semaphore>,
     pending_dials: AtomicUsize,
     admission: FairAdmission,
@@ -957,6 +1025,10 @@ impl fmt::Debug for SftpSessionPool {
 }
 
 impl SftpSessionPool {
+    pub(crate) fn backend_namespace(&self) -> SftpBackendNamespace {
+        self.inner.backend_namespace.clone()
+    }
+
     pub(crate) fn write_concurrency(&self) -> usize {
         self.inner.admission.inner.write_limit
     }
@@ -1071,9 +1143,11 @@ impl SftpSessionPool {
         writes: usize,
     ) -> Result<Self, TransportError> {
         Self::validate_limits(shared, reads, writes)?;
+        let backend_namespace = factory.backend_namespace();
         let pool = Self {
             inner: Arc::new(PoolInner {
                 factory,
+                backend_namespace,
                 shared: Arc::new(Semaphore::new(shared)),
                 pending_dials: AtomicUsize::new(0),
                 admission: FairAdmission::new(
