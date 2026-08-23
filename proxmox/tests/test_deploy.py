@@ -1667,6 +1667,16 @@ class CliDryRunTests(ConfigValidationTests):
                     f"{valid_lines[-1]}\\",
                 ]
             ),
+            "unrelated_continuation": "\n".join(
+                ["OTHER_SECRET=prefix\\", *valid_lines]
+            ),
+            "unrelated_multiline_quote": "\n".join(
+                [
+                    "OTHER_SECRET='prefix",
+                    *valid_lines,
+                    "'",
+                ]
+            ),
         }
         for name, content in invalid_environments.items():
             with self.subTest(name=name):

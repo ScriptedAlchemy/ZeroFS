@@ -776,9 +776,28 @@ def validate_hotpath_profile_env(path: Path | None) -> None:
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
+        if line.endswith("\\"):
+            raise ValueError("Hotpath production environment has a continuation")
+        quote: str | None = None
+        escaped = False
+        for character in line:
+            if escaped:
+                escaped = False
+                continue
+            if character == "\\" and quote != "'":
+                escaped = True
+                continue
+            if quote is None and character in {"'", '"'}:
+                quote = character
+            elif character == quote:
+                quote = None
+        if quote is not None:
+            raise ValueError(
+                "Hotpath production environment has an unterminated quote"
+            )
         if "HOTPATH_" not in line:
             continue
-        if raw_line != line or line.endswith("\\"):
+        if raw_line != line:
             raise ValueError("Hotpath production environment has ambiguous syntax")
         key, separator, value = line.partition("=")
         if not separator or key not in HOTPATH_PROFILE_ENV:
