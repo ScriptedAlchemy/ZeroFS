@@ -5,9 +5,12 @@ import os
 import re
 import select
 import shutil
+import socket
 import tempfile
 import time
 import tomllib
+import urllib.error
+import urllib.request
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,6 +30,39 @@ _GC_CADENCE_KEYS = (
     "idle_interval_secs",
     "busy_backlog_interval_secs",
 )
+_SYSTEMD_RUNTIME_DIR = Path("/run/systemd/system")
+_SYSTEMD_SERVICE_NAME = re.compile(r"[A-Za-z0-9_.@:-]+\.service\Z")
+_UNSAFE_SYSTEMD_ENVIRONMENT_PATH = re.compile(r'["\\\r\n%]')
+_HOTPATH_RUNTIME_ATTEMPTS = 5
+_HOTPATH_RUNTIME_TIMEOUT = 1.0
+_HOTPATH_RUNTIME_MAX_BYTES = 1 << 20
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request: object, *args: object) -> None:
+        del request, args
+        return None
+
+
+@dataclass(slots=True)
+class _LoopbackPortReservation:
+    socket: socket.socket
+    port: int
+
+    @classmethod
+    def reserve(cls) -> "_LoopbackPortReservation":
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(1)
+            return cls(listener, int(listener.getsockname()[1]))
+        except BaseException:
+            listener.close()
+            raise
+
+    def release(self) -> None:
+        self.socket.close()
 
 
 @dataclass(slots=True)
@@ -379,6 +415,207 @@ class CanonicalDeployment:
         shutil.rmtree(self.directory)
 
 
+class _TemporaryHotpathEnvironment:
+    """Own one service-scoped Hotpath environment drop-in for a profile run."""
+
+    def __init__(
+        self, config: PilotConfig, runner: Runner, report: Path, metrics_port: int
+    ) -> None:
+        if _SYSTEMD_SERVICE_NAME.fullmatch(config.service) is None:
+            raise ValueError(f"unsafe systemd service name: {config.service!r}")
+        if (
+            not report.is_absolute()
+            or report.name != "hotpath.json"
+            or _UNSAFE_SYSTEMD_ENVIRONMENT_PATH.search(str(report)) is not None
+        ):
+            raise ValueError(f"unsafe Hotpath report path: {report}")
+        if not 1 <= metrics_port <= 65535:
+            raise ValueError(f"invalid Hotpath metrics port: {metrics_port}")
+        self.config = config
+        self.runner = runner
+        self.report = report
+        self.metrics_port = metrics_port
+        self.directory = _SYSTEMD_RUNTIME_DIR / f"{config.service}.d"
+        self.dropin = self.directory / f"zerofs-hotpath-profile-{uuid.uuid4().hex}.conf"
+        self._directory_created = False
+        self._cleanup_required = False
+
+    def install(self) -> None:
+        if (
+            self.runner.run(
+                ["test", "-e", self.dropin], sudo=True, check=False
+            ).returncode
+            == 0
+        ):
+            raise RuntimeError(f"Hotpath service drop-in already exists: {self.dropin}")
+        directory_existed = (
+            self.runner.run(
+                ["test", "-d", self.directory], sudo=True, check=False
+            ).returncode
+            == 0
+        )
+        self._directory_created = not directory_existed
+        if self._directory_created:
+            self._cleanup_required = True
+            self.runner.run(
+                ["install", "-d", "-m", "0755", self.directory], sudo=True
+            )
+        content = (
+            "[Service]\n"
+            f'Environment="HOTPATH_OUTPUT_PATH={self.report}"\n'
+            'Environment="HOTPATH_OUTPUT_FORMAT=json"\n'
+            'Environment="HOTPATH_METRICS_SERVER_OFF=false"\n'
+            f'Environment="HOTPATH_METRICS_PORT={self.metrics_port}"\n'
+            'Environment="HOTPATH_CPU_BASELINE_OFF=true"\n'
+            'Environment="HOTPATH_REPORT=functions-timing,futures,threads"\n'
+        )
+        temporary: Path | None = None
+        handle = tempfile.NamedTemporaryFile(
+            mode="w",
+            prefix="zerofs-hotpath-profile-",
+            dir=self.config.temp_dir,
+            delete=False,
+        )
+        try:
+            temporary = Path(handle.name)
+            try:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            finally:
+                handle.close()
+        except BaseException:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+            raise
+        try:
+            self._cleanup_required = True
+            self.runner.run(
+                [
+                    "install",
+                    "-o",
+                    "root",
+                    "-g",
+                    "root",
+                    "-m",
+                    "0644",
+                    temporary,
+                    self.dropin,
+                ],
+                sudo=True,
+            )
+        finally:
+            assert temporary is not None
+            temporary.unlink(missing_ok=True)
+        self.runner.run(["systemctl", "daemon-reload"], sudo=True)
+
+    def cleanup(self) -> None:
+        if not self._cleanup_required:
+            return
+        errors: list[BaseException] = []
+        try:
+            self.runner.run(["rm", "-f", "--", self.dropin], sudo=True)
+        except BaseException as error:
+            errors.append(error)
+        if self._directory_created:
+            try:
+                self.runner.run(
+                    ["rmdir", "--ignore-fail-on-non-empty", self.directory],
+                    sudo=True,
+                )
+            except BaseException as error:
+                errors.append(error)
+        try:
+            self.runner.run(["systemctl", "daemon-reload"], sudo=True)
+        except BaseException as error:
+            errors.append(error)
+        if errors:
+            raise RuntimeError(
+                "Hotpath environment cleanup failures: "
+                + "; ".join(str(error) for error in errors)
+            )
+
+
+def _require_hotpath_report(path: Path) -> dict[str, object]:
+    if not path.is_file() or path.stat().st_size == 0:
+        raise RuntimeError(f"Hotpath report is missing or empty: {path}")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"Hotpath report contains invalid JSON: {path}") from error
+    if not isinstance(payload, dict) or payload.get("type") != "hotpath_report":
+        raise RuntimeError(f"Hotpath report has an invalid envelope: {path}")
+    required = {"functions_timing", "futures", "threads"}
+    if any(not isinstance(payload.get(key), dict) for key in required):
+        raise RuntimeError(f"Hotpath report omits required sections: {path}")
+    allowed = {
+        "type",
+        "label",
+        "time_sampling",
+        "functions_timing",
+        "futures",
+        "threads",
+    }
+    if not set(payload).issubset(allowed):
+        raise RuntimeError(f"Hotpath report includes forbidden sections: {path}")
+    return payload
+
+
+def _require_hotpath_runtime(payload: object) -> dict[str, object]:
+    if not isinstance(payload, dict):
+        raise RuntimeError("Hotpath Tokio runtime response is not an object")
+    required = ("num_workers", "num_alive_tasks", "global_queue_depth", "workers")
+    if any(key not in payload for key in required):
+        raise RuntimeError("Hotpath Tokio runtime response omits required fields")
+    for key in required[:3]:
+        if not isinstance(payload[key], int) or isinstance(payload[key], bool) or payload[key] < 0:
+            raise RuntimeError(f"Hotpath Tokio runtime field is invalid: {key}")
+    workers = payload["workers"]
+    if (
+        payload["num_workers"] <= 0
+        or not isinstance(workers, list)
+        or not workers
+        or len(workers) != payload["num_workers"]
+    ):
+        raise RuntimeError("Hotpath Tokio runtime workers are invalid")
+    indices: set[int] = set()
+    for worker in workers:
+        if not isinstance(worker, dict):
+            raise RuntimeError("Hotpath Tokio runtime worker is invalid")
+        for key in ("index", "park_count", "busy_duration_ms"):
+            value = worker.get(key)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise RuntimeError(f"Hotpath Tokio runtime worker field is invalid: {key}")
+        indices.add(worker["index"])
+    if indices != set(range(payload["num_workers"])):
+        raise RuntimeError("Hotpath Tokio runtime worker indices are invalid")
+    return payload
+
+
+def _fetch_hotpath_runtime(port: int) -> dict[str, object]:
+    url = f"http://127.0.0.1:{port}/tokio_runtime"
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}), _NoRedirectHandler
+    )
+    errors: list[str] = []
+    for attempt in range(_HOTPATH_RUNTIME_ATTEMPTS):
+        try:
+            with opener.open(url, timeout=_HOTPATH_RUNTIME_TIMEOUT) as response:
+                if response.geturl() != url or response.getcode() != 200:
+                    raise RuntimeError("Hotpath Tokio runtime response is not pinned")
+                body = response.read(_HOTPATH_RUNTIME_MAX_BYTES + 1)
+                if len(body) > _HOTPATH_RUNTIME_MAX_BYTES:
+                    raise RuntimeError("Hotpath Tokio runtime response is too large")
+                return _require_hotpath_runtime(json.loads(body.decode("utf-8")))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, RuntimeError, urllib.error.URLError) as error:
+            errors.append(str(error))
+            if isinstance(error, urllib.error.HTTPError):
+                error.close()
+            if attempt + 1 < _HOTPATH_RUNTIME_ATTEMPTS:
+                time.sleep(0.1)
+    raise RuntimeError("Hotpath Tokio runtime retrieval failed: " + "; ".join(errors))
+
+
 class _Benchmark(Protocol):
     def run(
         self,
@@ -589,7 +826,14 @@ class ProfileRunner:
             ),
         }
         self.runner.run(
-            [self.config.cargo, "build", "--release", "--locked"],
+            [
+                self.config.cargo,
+                "build",
+                "--release",
+                "--locked",
+                "--features",
+                "hotpath-profile",
+            ],
             cwd=self.config.crate,
             env=env,
             capture=False,
@@ -650,13 +894,21 @@ class ProfileRunner:
     def _start_collectors(self, pid: int, receipt: RunReceipt) -> CollectorGroup:
         return CollectorGroup(self.runner, receipt, pid)
 
+    def _fetch_hotpath_runtime(self, port: int) -> dict[str, object]:
+        return _fetch_hotpath_runtime(port)
+
     def run(self, *, total_mib: int = 256, jobs: int = 4) -> ProfileResult:
         self.lifecycle.status()
         self.lifecycle.drain()
         canonical = CanonicalDeployment.capture(self.config, self.runner)
         receipt = RunReceipt.start(self.config, "profile")
         collectors: CollectorGroup | object | None = None
+        hotpath_environment: _TemporaryHotpathEnvironment | None = None
+        hotpath_report: Path | None = None
+        hotpath_runtime: Path | None = None
+        hotpath_port: _LoopbackPortReservation | None = None
         deployed = False
+        profile_service_started = False
         stop_attempted = False
         installation_started = False
         primary: BaseException | None = None
@@ -683,9 +935,18 @@ class ProfileRunner:
                         "temporary_config_sha256": maintenance_config_sha256,
                     },
                 )
+                hotpath_report = receipt.directory / "hotpath.json"
+                hotpath_port = _LoopbackPortReservation.reserve()
+                hotpath_environment = _TemporaryHotpathEnvironment(
+                    self.config, self.runner, hotpath_report, hotpath_port.port
+                )
+                hotpath_environment.install()
+                hotpath_port.release()
                 self.lifecycle.start()
+                profile_service_started = True
                 profile_status = self.lifecycle.status(validate_data=True)
                 receipt.record("profile_status", profile_status)
+                self._fetch_hotpath_runtime(hotpath_port.port)
                 pid = self._service_pid()
                 receipt.record("profile_service_pid", pid)
                 collectors = self._start_collectors(pid, receipt)
@@ -695,10 +956,26 @@ class ProfileRunner:
                     maintenance_isolated=True,
                 )
                 receipt.record("benchmark", benchmark_result.to_dict())
+                phase_windows = _load_phase_windows(benchmark_result)
+                collectors.stop(phase_windows=phase_windows)  # type: ignore[attr-defined]
+                collectors = None
+                hotpath_runtime = receipt.directory / "hotpath-tokio-runtime.json"
+                runtime_payload = self._fetch_hotpath_runtime(hotpath_port.port)
+                atomic_write_json(hotpath_runtime, runtime_payload)
+                receipt.artifact("hotpath-tokio-runtime.json", hotpath_runtime)
+                receipt.record(
+                    "hotpath_tokio_runtime",
+                    {"path": str(hotpath_runtime), "sha256": _sha256(hotpath_runtime)},
+                )
             except BaseException as error:
                 primary = error
             finally:
                 cleanup_errors: list[BaseException] = []
+                if hotpath_port is not None:
+                    try:
+                        hotpath_port.release()
+                    except OSError:
+                        pass
                 if collectors is not None:
                     try:
                         phase_windows = (
@@ -711,17 +988,43 @@ class ProfileRunner:
                         )
                     except BaseException as error:
                         cleanup_errors.append(error)
+                profile_service_stopped = not deployed
                 if stop_attempted:
                     try:
                         if deployed:
                             self.lifecycle.stop()
+                            profile_service_stopped = True
+                        if profile_service_started and profile_service_stopped:
+                            assert hotpath_report is not None
+                            _require_hotpath_report(hotpath_report)
+                            receipt.artifact("hotpath.json", hotpath_report)
+                            receipt.record(
+                                "hotpath_report",
+                                {
+                                    "path": str(hotpath_report),
+                                    "sha256": _sha256(hotpath_report),
+                                },
+                            )
+                    except BaseException as error:
+                        cleanup_errors.append(error)
+                    try:
+                        if hotpath_environment is not None:
+                            hotpath_environment.cleanup()
+                    except BaseException as error:
+                        cleanup_errors.append(error)
+                    try:
                         if installation_started:
+                            if deployed and not profile_service_stopped:
+                                raise RuntimeError(
+                                    "profile service did not stop; canonical deployment retained"
+                                )
                             canonical.restore()
-                        self.lifecycle.start()
-                        status = self.lifecycle.status(validate_data=True)
-                        self.lifecycle.drain()
-                        receipt.record("canonical_status", status)
-                        restored = True
+                        if installation_started:
+                            self.lifecycle.start()
+                            status = self.lifecycle.status(validate_data=True)
+                            self.lifecycle.drain()
+                            receipt.record("canonical_status", status)
+                            restored = True
                     except BaseException as error:
                         cleanup_errors.append(error)
                 if not installation_started or restored:

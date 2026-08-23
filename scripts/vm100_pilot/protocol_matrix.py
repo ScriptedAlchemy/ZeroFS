@@ -29,7 +29,13 @@ from .owned_resources import (
 from .receipts import RunReceipt
 from .runner import Runner
 from .scenarios import ProtocolScenario, WorkloadDefinition
-from .system_io import counter_delta, file_sha256, mib_per_second
+from .system_io import (
+    aggregate_fio_jobs,
+    counter_delta,
+    file_sha256,
+    load_fio_jobs,
+    mib_per_second,
+)
 from .writeback_observer import WritebackObserver
 
 
@@ -64,6 +70,7 @@ class ProtocolAuthority:
     mount_options: tuple[str, ...]
     metrics_url: str
     metrics_identity: MetricsAuthorityIdentity
+    isolated_service_instance: bool
 
     @classmethod
     def from_mapping(
@@ -78,6 +85,11 @@ class ProtocolAuthority:
         endpoint = values.get(f"{prefix}_ENDPOINT", "").strip()
         options = values.get(f"{prefix}_MOUNT_OPTIONS", "").strip()
         metrics_url = values.get(f"{prefix}_METRICS_URL", "").strip()
+        isolated_value = values.get(
+            f"{prefix}_SERVICE_ISOLATED", ""
+        ).strip().lower()
+        if isolated_value not in {"", "false", "true"}:
+            raise ValueError(f"{prefix}_SERVICE_ISOLATED must be true or false")
         identity_values = {
             "server_instance_id": values.get(
                 f"{prefix}_METRICS_INSTANCE_ID", ""
@@ -147,6 +159,7 @@ class ProtocolAuthority:
             mount_options=parsed_options,
             metrics_url=metrics_url,
             metrics_identity=MetricsAuthorityIdentity(**identity_values),
+            isolated_service_instance=isolated_value == "true",
         )
 
     def verify(self, runner: Runner) -> dict[str, object]:
@@ -206,6 +219,12 @@ class ProtocolAuthority:
             "required_options": list(self.mount_options),
             "metrics_url": self.metrics_url,
             "metrics_identity": asdict(self.metrics_identity),
+            "isolated_service_instance": self.isolated_service_instance,
+            "isolated_service_instance_id": (
+                self.metrics_identity.server_instance_id
+                if self.isolated_service_instance
+                else None
+            ),
         }
 
     def require_run_root(self, path: Path) -> Path:
@@ -218,6 +237,22 @@ class ProtocolAuthority:
         if not resolved.name.startswith(".zerofs-protocol-bench-"):
             raise ValueError(f"unsafe protocol benchmark root name: {resolved.name}")
         return resolved
+
+
+@dataclass(frozen=True, slots=True)
+class ClientColdReadResult:
+    bytes: int
+    runtime_ms: int
+    requests: int
+    mibps: float
+    backend_interval_counter_before: int
+    backend_interval_counter_after: int
+    backend_interval_activity_bytes: int
+    idle_seconds: int
+    timeout_seconds: int
+    cache_scope: str = "nfs_client_page_cache_only"
+    backend_activity_scope: str = "service_global_interval"
+    isolated_service_instance_required: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -244,6 +279,7 @@ class ProtocolWorkloadResult:
     accepted: WritebackSnapshot
     local: WritebackSnapshot
     remote: WritebackSnapshot
+    client_cold_read: ClientColdReadResult | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -276,6 +312,8 @@ class ProtocolWorkloadExecutor:
     ledger: Path
     files: list[Path]
     resources: list[Path]
+    receipt: RunReceipt
+    scenario: ProtocolScenario
 
     def run(
         self,
@@ -355,6 +393,24 @@ class ProtocolWorkloadExecutor:
                 f"protocol write byte count mismatch for {workload.name}: "
                 f"{destination.stat().st_size} != {workload.bytes}"
             )
+        client_cold_read = None
+        if self.scenario.require_backend_interval_activity:
+            self.receipt.record(
+                "idle_read_attempt",
+                {
+                    "cache_scope": "nfs_client_page_cache_only",
+                    "deadline_seconds": self.scenario.read_timeout_seconds,
+                    "d_state_bounded": False,
+                    "timeout_scope": "userspace_process_only",
+                    "workload": workload.name,
+                },
+            )
+            client_cold_read = self.owner._run_client_cold_read(
+                destination,
+                workload,
+                output=self.receipt.path(f"client-cold-read-{index}-fio.json"),
+                scenario=self.scenario,
+            )
         read_started = time.monotonic_ns()
         readback_sha256 = file_sha256(destination)
         readback_ns = max(1, time.monotonic_ns() - read_started)
@@ -383,6 +439,7 @@ class ProtocolWorkloadExecutor:
             accepted=accepted,
             local=local,
             remote=remote,
+            client_cold_read=client_cold_read,
         )
         destination.unlink()
         source.unlink()
@@ -398,12 +455,92 @@ class ProtocolMatrixRunner:
         *,
         random_bytes: Callable[[int], bytes] = os.urandom,
         memory_session: MemoryEnvelopeSession | None = None,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self.config = config
         self.runner = runner
         self.observer = observer
         self.random_bytes = random_bytes
         self.memory_session = memory_session
+        self.sleep = sleep
+
+    def _run_client_cold_read(
+        self,
+        path: Path,
+        workload: WorkloadDefinition,
+        *,
+        output: Path,
+        scenario: ProtocolScenario,
+    ) -> ClientColdReadResult:
+        self.sleep(scenario.read_idle_seconds)
+        before = self.observer.counter("zerofs_sftp_object_read_bytes_total")
+        self.runner.run(
+            [
+                "fio",
+                "--name=zerofs_nfs_idle_client_cold_read",
+                f"--filename={path}",
+                "--rw=read",
+                "--bs=1M",
+                f"--size={workload.bytes}",
+                "--numjobs=1",
+                "--direct=0",
+                "--invalidate=1",
+                "--fadvise_hint=0",
+                "--allow_file_create=0",
+                "--readonly",
+                "--group_reporting",
+                "--output-format=json",
+                f"--output={output}",
+            ],
+            timeout=scenario.read_timeout_seconds,
+            capture=False,
+        )
+        aggregate = aggregate_fio_jobs(
+            load_fio_jobs(output),
+            operation="read",
+            path=output,
+            require_request_counters=True,
+        )
+        expected_requests = workload.bytes // (1024 * 1024)
+        if aggregate.errors:
+            raise RuntimeError(f"fio reported I/O errors={aggregate.errors}: {output}")
+        if aggregate.byte_count != workload.bytes:
+            raise RuntimeError(
+                "client-cold fio returned short I/O: "
+                f"expected={workload.bytes}, actual={aggregate.byte_count}"
+            )
+        if aggregate.requests != expected_requests:
+            raise RuntimeError(
+                "client-cold fio request count mismatch: "
+                f"expected={expected_requests}, actual={aggregate.requests}"
+            )
+        if aggregate.runtime_ms <= 0:
+            raise ValueError("client-cold fio has no measurable runtime")
+        after = self.observer.counter("zerofs_sftp_object_read_bytes_total")
+        backend_activity_bytes = counter_delta(
+            after,
+            before,
+            "long-idle client-cold service-global SFTP read activity bytes",
+        )
+        if backend_activity_bytes < aggregate.byte_count:
+            raise RuntimeError(
+                "long-idle client-cold NFS interval observed fewer backend SFTP "
+                "activity bytes "
+                f"than logical bytes: logical={aggregate.byte_count}, "
+                f"backend_interval={backend_activity_bytes}; the interval-global "
+                "evidence is insufficient"
+            )
+        return ClientColdReadResult(
+            bytes=aggregate.byte_count,
+            runtime_ms=aggregate.runtime_ms,
+            requests=aggregate.requests,
+            mibps=mib_per_second(aggregate.byte_count, aggregate.runtime_ms / 1000),
+            backend_interval_counter_before=before,
+            backend_interval_counter_after=after,
+            backend_interval_activity_bytes=backend_activity_bytes,
+            idle_seconds=scenario.read_idle_seconds,
+            timeout_seconds=scenario.read_timeout_seconds,
+        )
 
     def _create_source(self, path: Path, byte_count: int) -> None:
         remaining = byte_count
@@ -524,6 +661,12 @@ class ProtocolMatrixRunner:
                     "mount_options": list(authority.mount_options),
                     "metrics_url": authority.metrics_url,
                     "metrics_identity": asdict(authority.metrics_identity),
+                    "isolated_service_instance": authority.isolated_service_instance,
+                    "isolated_service_instance_id": (
+                        authority.metrics_identity.server_instance_id
+                        if authority.isolated_service_instance
+                        else None
+                    ),
                 },
             )
             receipt.record(
@@ -534,6 +677,15 @@ class ProtocolMatrixRunner:
                 receipt.artifact("cleanup-ledger.json", ledger)
                 authority.require_run_root(run_root)
                 self.config.require_temp_child(scratch, "zerofs-protocol-bench-")
+                if (
+                    scenario.require_backend_interval_activity
+                    and not authority.isolated_service_instance
+                ):
+                    raise ScenarioUnavailableError(
+                        "long-idle backend interval evidence requires explicit "
+                        "ZEROFS_BENCH_NFS_SERVICE_ISOLATED=true authority tied "
+                        "to the metrics server_instance_id"
+                    )
                 if self.memory_session is not None:
                     self.memory_session.expect_workloads(
                         tuple(workload.name for workload in scenario.workloads)
@@ -572,6 +724,8 @@ class ProtocolMatrixRunner:
                     ledger,
                     files,
                     resources,
+                    receipt,
+                    scenario,
                 )
                 for index, workload in enumerate(scenario.workloads):
                     results.append(workload_executor.run(workload, index))
