@@ -1894,6 +1894,156 @@ print("lock-reacquired", flush=True)
             "\n".join(interrupt.__notes__),
         )
 
+    def test_forced_cleanup_handles_runtime_before_owner_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            directory_path = Path(directory)
+            lock = directory_path / "coordinator.lock"
+            token = "c" * 64
+            runtime_directory = directory_path / (
+                f"zerofs-lock-command-{token}"
+            )
+            runtime_directory.mkdir()
+            holder_script = """
+import fcntl
+import sys
+handle = open(sys.argv[1], "w")
+fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+print("LOCKED", flush=True)
+sys.stdin.read()
+handle.close()
+"""
+            holder = subprocess.Popen(
+                [sys.executable, "-u", "-c", holder_script, str(lock)],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+            )
+            assert holder.stdout is not None
+            assert holder.stdin is not None
+            assert holder.stderr is not None
+            try:
+                self.assertEqual(holder.stdout.readline().strip(), "LOCKED")
+                active = deploy._ActiveLockedPayload(
+                    token=token,
+                    pgid=None,
+                    runtime_directory=str(runtime_directory),
+                )
+                cleanup = subprocess.run(
+                    [
+                        "env",
+                        f"TMPDIR={directory}",
+                        "bash",
+                        "-c",
+                        deploy._remote_lock_cleanup(holder.pid, (active,)),
+                    ],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    timeout=15,
+                )
+
+                self.assertEqual(cleanup.returncode, 0, cleanup.stderr)
+                holder.wait(timeout=3)
+                self.assertFalse(runtime_directory.exists())
+                self.assertIsNotNone(holder.poll(), "holder was not reaped")
+                handle = lock.open("w")
+                try:
+                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                finally:
+                    handle.close()
+            finally:
+                if holder.poll() is None:
+                    try:
+                        os.killpg(holder.pid, signal.SIGCONT)
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        os.killpg(holder.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    holder.wait(timeout=2)
+                holder.stdin.close()
+                holder.stdout.close()
+                holder.stderr.close()
+
+    def test_forced_cleanup_validation_error_still_releases_holder(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            directory_path = Path(directory)
+            lock = directory_path / "coordinator.lock"
+            token = "d" * 64
+            runtime_directory = directory_path / (
+                f"zerofs-lock-command-{token}"
+            )
+            runtime_directory.mkdir()
+            (runtime_directory / "owner.json").write_text(
+                '{"token":"wrong","pgid":null}'
+            )
+            holder_script = """
+import fcntl
+import sys
+handle = open(sys.argv[1], "w")
+fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+print("LOCKED", flush=True)
+sys.stdin.read()
+handle.close()
+"""
+            holder = subprocess.Popen(
+                [sys.executable, "-u", "-c", holder_script, str(lock)],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+            )
+            assert holder.stdout is not None
+            assert holder.stdin is not None
+            assert holder.stderr is not None
+            try:
+                self.assertEqual(holder.stdout.readline().strip(), "LOCKED")
+                active = deploy._ActiveLockedPayload(
+                    token=token,
+                    pgid=None,
+                    runtime_directory=str(runtime_directory),
+                )
+                cleanup = subprocess.run(
+                    [
+                        "env",
+                        f"TMPDIR={directory}",
+                        "bash",
+                        "-c",
+                        deploy._remote_lock_cleanup(holder.pid, (active,)),
+                    ],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    timeout=15,
+                )
+
+                self.assertNotEqual(cleanup.returncode, 0)
+                holder.wait(timeout=3)
+                self.assertIsNotNone(holder.poll(), "holder was not reaped")
+                handle = lock.open("w")
+                try:
+                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                finally:
+                    handle.close()
+            finally:
+                if holder.poll() is None:
+                    try:
+                        os.killpg(holder.pid, signal.SIGCONT)
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        os.killpg(holder.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    holder.wait(timeout=2)
+                holder.stdin.close()
+                holder.stdout.close()
+                holder.stderr.close()
+
     def test_forced_cleanup_error_does_not_mask_active_failure(self) -> None:
         lease = deploy._FlockLease(
             ["unused"],

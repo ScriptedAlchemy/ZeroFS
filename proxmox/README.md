@@ -228,10 +228,12 @@ and waits for the coordinator's ACK before allowing the command to run. Holder
 death in any pre-ACK window therefore kills the stopped child without a root
 mutation. Interrupt or coordinator loss terminates and reaps the command group
 with bounded TERM-to-KILL escalation while the holder retains the lock for
-rollback. If the holder stops responding, a
-separate root cleanup command validates that ownership receipt, terminates the
-active command group, and removes its runtime directory before terminating the
-holder. Clean holder exit then releases the lock immediately.
+rollback. If the holder stops responding, a separate root cleanup command
+freezes it before validating the receipt. A markerless runtime is safe only for
+the coordinator's pre-STARTED `pgid=None` receipt, before any child is spawned.
+Cleanup terminates the active command group and removes its owned runtime, and
+its bounded finalizer always resumes and terminates the holder even when
+validation fails. Clean holder exit then releases the lock immediately.
 
 ## Templates and resource sizing
 

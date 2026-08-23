@@ -947,11 +947,18 @@ def wait_while(predicate, timeout):
 
 
 def stop_holder(pid):
-    if pid and pid_is_live(pid):
-        try:
-            os.kill(pid, signal.SIGSTOP)
-        except ProcessLookupError:
-            pass
+    if not pid or not pid_is_live(pid):
+        return
+    try:
+        os.kill(pid, signal.SIGSTOP)
+    except ProcessLookupError:
+        return
+    wait_while(
+        lambda: pid_is_live(pid) and process_state(pid) not in ("T", "t"),
+        2,
+    )
+    if pid_is_live(pid) and process_state(pid) not in ("T", "t"):
+        raise RuntimeError(f"lock holder {pid} did not stop for cleanup")
 
 
 def validate_payload(item):
@@ -980,7 +987,14 @@ def validate_payload(item):
         raise RuntimeError("unsafe forced-cleanup runtime directory")
     marker_pgid = None
     if runtime.exists():
-        owner = json.loads((runtime / "owner.json").read_text())
+        owner_path = runtime / "owner.json"
+        if not owner_path.exists():
+            if requested_pgid is None:
+                return None, runtime
+            raise RuntimeError(
+                "payload owner marker is missing after its PGID was reported"
+            )
+        owner = json.loads(owner_path.read_text())
         if owner.get("token") != token:
             raise RuntimeError("forced-cleanup payload ownership changed")
         marker_pgid = owner.get("pgid")
@@ -1039,16 +1053,19 @@ def terminate_holder(pid):
 
 def main():
     holder_pid = int(sys.argv[1]) if sys.argv[1] != "-" else None
-    payloads = json.loads(base64.b64decode(sys.argv[2]))
-    stop_holder(holder_pid)
-    validated = [validate_payload(item) for item in payloads]
-    for pgid, _runtime in validated:
-        if pgid is not None:
-            terminate_payload_group(pgid)
-    for _pgid, runtime in validated:
-        if runtime.exists():
-            shutil.rmtree(runtime)
-    terminate_holder(holder_pid)
+    validated = []
+    try:
+        payloads = json.loads(base64.b64decode(sys.argv[2]))
+        stop_holder(holder_pid)
+        validated = [validate_payload(item) for item in payloads]
+        for pgid, _runtime in validated:
+            if pgid is not None:
+                terminate_payload_group(pgid)
+        for _pgid, runtime in validated:
+            if runtime.exists():
+                shutil.rmtree(runtime)
+    finally:
+        terminate_holder(holder_pid)
     for pgid, _runtime in validated:
         if pgid is None:
             continue
