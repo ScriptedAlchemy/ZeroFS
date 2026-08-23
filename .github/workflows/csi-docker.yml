@@ -91,16 +91,19 @@ jobs:
 
       # The csi image layers on the zerofs image of the same release. Both
       # workflows trigger on the same tag push, so wait for docker.yml to
-      # publish the base before building against it. PRs and manual runs
-      # build against :latest.
+      # publish the base before building against it. PRs and tagless manual
+      # runs validate the CSI layer against the public upstream base declared
+      # by zerofs/zerofs-csi/Dockerfile; this fork does not publish :latest.
       - name: Resolve base image
         id: base
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
           TAG=""
-          if [[ -n "${{ inputs.tag }}" ]]; then
-            TAG="${{ inputs.tag }}"
-          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
-            TAG="${GITHUB_REF_NAME}"
+          if [[ -n "$INPUT_TAG" ]]; then
+            TAG="$INPUT_TAG"
+          elif [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            TAG="$GITHUB_REF_NAME"
           fi
           if [[ -n "$TAG" ]]; then
             base="${REGISTRY}/${{ github.repository_owner }}/zerofs:${TAG#v}"
@@ -117,15 +120,14 @@ jobs:
               sleep 30
             done
           else
-            base="${REGISTRY}/${{ github.repository_owner }}/zerofs:latest"
-            base=$(echo "$base" | tr '[:upper:]' '[:lower:]')
+            base="ghcr.io/barre/zerofs:latest"
           fi
           echo "image=$base" >> "$GITHUB_OUTPUT"
 
-      # Log in even on pull_request: the fork's base image package on ghcr is
-      # private, so the build stage's pull of ZEROFS_IMAGE needs auth. Push
-      # remains disabled for PRs below.
+      # Tagged builds may pull this fork's private base package and push the
+      # CSI image. PR builds use the public upstream base and never push.
       - name: Log in to Container Registry
+        if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
