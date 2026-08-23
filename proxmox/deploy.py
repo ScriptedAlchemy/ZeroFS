@@ -53,6 +53,7 @@ DEV_LEGACY_NBD_MOUNTPOINT = "/mnt/storagebox-nbd-pilot"
 DEV_LEGACY_NBD_SERVER_UNIT = "zerofs-nbd-pilot.service"
 DEV_LEGACY_NBD_DEVICE = "/dev/nbd0"
 OWNERSHIP_REPAIR_CONFIRMATION = "501:20"
+VM100_VMID = 100
 RFC1918_NETWORKS = tuple(
     ipaddress.ip_network(value)
     for value in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
@@ -597,7 +598,7 @@ class _FlockLease:
         if returncode != 0:
             raise RuntimeError(f"deployment lock process exited {returncode}")
 
-    def execute(self, script: str) -> str:
+    def execute(self, script: str) -> subprocess.CompletedProcess[str]:
         process = self.process
         if process is None or process.poll() is not None:
             raise RuntimeError("deployment lock lease was lost")
@@ -606,40 +607,154 @@ class _FlockLease:
         payload = base64.b64encode(script.encode()).decode()
         process.stdin.write(f"{token} {payload}\n")
         process.stdin.flush()
-        output: list[str] = []
         marker = f"__ZEROFS_LOCK_RESULT__ {token} "
         while True:
             line = process.stdout.readline()
             if not line:
                 raise RuntimeError("deployment lock lease was lost during command")
             if line.startswith(marker):
-                status = int(line.removeprefix(marker).strip())
-                text = "".join(output)
+                status_text, stdout_encoded, stderr_encoded = (
+                    line.removeprefix(marker).rstrip("\n").split(" ", 2)
+                )
+                status = int(status_text)
+                stdout = base64.b64decode(stdout_encoded).decode()
+                stderr = base64.b64decode(stderr_encoded).decode()
                 if status != 0:
-                    raise RuntimeError(
-                        f"locked remote command exited {status}: {text.strip()}"
+                    raise LockedRemoteCommandError(
+                        status,
+                        stdout,
+                        stderr,
                     )
-                return text
-            output.append(line)
+                return subprocess.CompletedProcess(
+                    ["locked-remote-shell"], status, stdout, stderr
+                )
+
+
+class LockedRemoteCommandError(RuntimeError):
+    def __init__(self, returncode: int, stdout: str, stderr: str) -> None:
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+        detail = stderr or stdout
+        super().__init__(
+            f"locked remote command exited {returncode}"
+            + (f": {detail.strip()}" if detail.strip() else "")
+        )
 
 
 def _remote_lock_holder(path: str) -> str:
     return (
         f"exec 9>{shlex.quote(path)}; "
         "flock -n 9 || exit 75; printf 'LOCKED\\n'; "
+        "runtime=$(mktemp -d); trap 'rm -rf -- \"$runtime\"' EXIT; "
         "while IFS=' ' read -r token payload; do "
-        "set +e; output=$(printf '%s' \"$payload\" | base64 -d | bash -se 2>&1); "
-        'status=$?; set -e; test -z "$output" || printf \'%s\\n\' "$output"; '
-        'printf \'__ZEROFS_LOCK_RESULT__ %s %s\\n\' "$token" "$status"; '
+        "set +e; printf '%s' \"$payload\" | base64 -d | bash -se "
+        '>\"$runtime/stdout\" 2>\"$runtime/stderr\"; '
+        "status=$?; set -e; "
+        'stdout=$(base64 <"$runtime/stdout" | tr -d \'\\n\'); '
+        'stderr=$(base64 <"$runtime/stderr" | tr -d \'\\n\'); '
+        'printf \'__ZEROFS_LOCK_RESULT__ %s %s %s %s\\n\' '
+        '"$token" "$status" "$stdout" "$stderr"; '
         "done"
     )
+
+
+@dataclass(frozen=True)
+class LocalVmIdentity:
+    vmid: int
+    name: str
+    smbios_uuid: str
+
+
+def validate_vm_transport_args(args: argparse.Namespace) -> None:
+    if args.vm_transport == "local":
+        if args.vm_vmid != VM100_VMID:
+            raise ValueError("local VM transport requires --vm-vmid 100")
+        return
+    if args.vm_vmid is not None:
+        raise ValueError("--vm-vmid is valid only with --vm-transport local")
+
+
+def _parse_pve_vm_identity(config: str, vmid: int) -> LocalVmIdentity:
+    name: str | None = None
+    smbios_uuid: str | None = None
+    for line in config.splitlines():
+        key, separator, value = line.partition(":")
+        if not separator:
+            continue
+        if key == "name":
+            name = value.strip()
+        elif key == "smbios1":
+            for field in value.split(","):
+                field_key, equals, field_value = field.strip().partition("=")
+                if equals and field_key == "uuid":
+                    smbios_uuid = field_value.strip().lower()
+    if not name or not smbios_uuid:
+        raise RuntimeError(
+            f"Proxmox VM {vmid} must expose both name and smbios1 UUID"
+        )
+    return LocalVmIdentity(vmid=vmid, name=name, smbios_uuid=smbios_uuid)
+
+
+def verify_local_vm_identity(
+    runner: Runner, args: argparse.Namespace
+) -> LocalVmIdentity:
+    validate_vm_transport_args(args)
+    config = runner.run(
+        [
+            "ssh",
+            "-o",
+            "BatchMode=yes",
+            args.pve_host,
+            "qm",
+            "config",
+            str(args.vm_vmid),
+            "--current",
+        ],
+        capture=True,
+    ).stdout
+    identity = _parse_pve_vm_identity(config, args.vm_vmid)
+    local_name = runner.run(["hostname"], capture=True).stdout.strip()
+    local_uuid = runner.run(
+        ["sudo", "cat", "/sys/class/dmi/id/product_uuid"], capture=True
+    ).stdout.strip().lower()
+    if local_name != identity.name:
+        raise RuntimeError(
+            f"local hostname {local_name!r} does not match Proxmox VM "
+            f"{identity.vmid} name {identity.name!r}"
+        )
+    if local_uuid != identity.smbios_uuid:
+        raise RuntimeError(
+            f"local SMBIOS UUID {local_uuid!r} does not match Proxmox VM "
+            f"{identity.vmid} SMBIOS UUID {identity.smbios_uuid!r}"
+        )
+    return identity
 
 
 class Runner:
     def __init__(self, dry_run: bool) -> None:
         self.dry_run = dry_run
+        self.vm_transport = "ssh"
+        self.local_vm_host: str | None = None
         self._active_leases: list[_FlockLease] = []
         self._remote_leases: dict[str, _FlockLease] = {}
+
+    def configure_vm_transport(self, args: argparse.Namespace) -> None:
+        validate_vm_transport_args(args)
+        if args.vm_transport == "ssh":
+            return
+        if self.dry_run:
+            print(
+                f"+ verify-local-vm-identity vmid={args.vm_vmid} "
+                f"pve={args.pve_host} host={args.vm_host}"
+            )
+        else:
+            verify_local_vm_identity(self, args)
+        self.vm_transport = "local"
+        self.local_vm_host = args.vm_host
+
+    def is_local_vm_host(self, host: str) -> bool:
+        return self.vm_transport == "local" and host == self.local_vm_host
 
     def _assert_leases_held(self) -> None:
         if self.dry_run:
@@ -692,17 +807,20 @@ class Runner:
                     if sudo
                     else f"bash -c {shlex.quote(lock_script)}"
                 )
-                command = [
-                    "ssh",
-                    "-o",
-                    "BatchMode=yes",
-                    "-o",
-                    "ServerAliveInterval=15",
-                    "-o",
-                    "ServerAliveCountMax=3",
-                    host,
-                    remote,
-                ]
+                if self.is_local_vm_host(host):
+                    command = ["sudo", "bash", "-c", lock_script]
+                else:
+                    command = [
+                        "ssh",
+                        "-o",
+                        "BatchMode=yes",
+                        "-o",
+                        "ServerAliveInterval=15",
+                        "-o",
+                        "ServerAliveCountMax=3",
+                        host,
+                        remote,
+                    ]
                 lease = stack.enter_context(_FlockLease(command, dry_run=self.dry_run))
                 self._active_leases.append(lease)
                 stack.callback(self._active_leases.remove, lease)
@@ -710,13 +828,21 @@ class Runner:
                 stack.callback(self._remote_leases.pop, host)
             yield
 
-    def run_remote_shell(self, host: str, script: str) -> str | None:
+    def run_remote_shell(
+        self, host: str, script: str
+    ) -> subprocess.CompletedProcess[str] | str | None:
         if self.dry_run:
             return None
         lease = self._remote_leases.get(host)
-        if lease is None:
-            return None
-        return lease.execute(script)
+        if lease is not None:
+            return lease.execute(script)
+        if self.is_local_vm_host(host):
+            return self.run(
+                ["bash", "-se"],
+                input_text=script,
+                capture=True,
+            )
+        return None
 
 
 def sha256(path: Path) -> str:
@@ -814,27 +940,51 @@ def _build(runner: Runner, root: Path, role: str) -> Path:
 
 
 def _ssh(runner: Runner, host: str, script: str) -> None:
-    if runner.run_remote_shell(host, script) is not None:
+    result = runner.run_remote_shell(host, script)
+    if result is not None:
+        stdout = result if isinstance(result, str) else result.stdout
+        stderr = "" if isinstance(result, str) else result.stderr
+        if stdout:
+            sys.stdout.write(stdout)
+            sys.stdout.flush()
+        if stderr:
+            sys.stderr.write(stderr)
+            sys.stderr.flush()
+        return
+    if runner.is_local_vm_host(host):
+        runner.run(["bash", "-se"], input_text=script)
         return
     runner.run(["ssh", "-o", "BatchMode=yes", host, "bash", "-se"], input_text=script)
 
 
 def _ssh_capture(runner: Runner, host: str, script: str) -> str:
-    locked = runner.run_remote_shell(host, script)
-    if locked is not None:
-        return locked
-    return runner.run(
-        ["ssh", "-o", "BatchMode=yes", host, "bash", "-se"],
-        input_text=script,
-        capture=True,
-    ).stdout
+    result = runner.run_remote_shell(host, script)
+    if isinstance(result, str):
+        return result
+    if result is None and runner.is_local_vm_host(host):
+        result = runner.run(
+            ["bash", "-se"], input_text=script, capture=True
+        )
+    elif result is None:
+        result = runner.run(
+            ["ssh", "-o", "BatchMode=yes", host, "bash", "-se"],
+            input_text=script,
+            capture=True,
+        )
+    if result.stderr:
+        sys.stderr.write(result.stderr)
+        sys.stderr.flush()
+    return result.stdout
 
 
 def _stage_remote_file(
     runner: Runner, host: str, local_path: Path, remote_path: str
 ) -> None:
     if runner.dry_run:
-        runner.run(["scp", "-q", str(local_path), f"{host}:{remote_path}"])
+        if runner.is_local_vm_host(host):
+            print(f"+ stage-local-file {local_path} {remote_path}")
+        else:
+            runner.run(["scp", "-q", str(local_path), f"{host}:{remote_path}"])
         return
     encoded = base64.b64encode(local_path.read_bytes()).decode("ascii")
     remote = shlex.quote(remote_path)
@@ -931,10 +1081,6 @@ def _wait_remote_drain(runner: Runner, args: argparse.Namespace) -> None:
         )
         return
     command = [
-        "ssh",
-        "-o",
-        "BatchMode=yes",
-        args.vm_host,
         "curl",
         "--fail",
         "--silent",
@@ -945,8 +1091,12 @@ def _wait_remote_drain(runner: Runner, args: argparse.Namespace) -> None:
     stable = 0
     last: DrainState | None = None
     while time.monotonic() < deadline:
-        result = runner.run(command, capture=True)
-        last = parse_drain_state(result.stdout)
+        output = _ssh_capture(
+            runner,
+            args.vm_host,
+            f"set -euo pipefail\n{shell_join(command)}\n",
+        )
+        last = parse_drain_state(output)
         if last.volatile_terminal or last.writeback_terminal:
             raise RuntimeError(f"ZeroFS reported a terminal error: {last}")
         stable = stable + 1 if last.drained else 0
@@ -1475,6 +1625,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--role", choices=("prod", "dev"), required=True)
     parser.add_argument("--pve-host", default="gthost-tor-pve-root")
     parser.add_argument("--vm-host", default="ubuntu-main")
+    parser.add_argument(
+        "--vm-transport",
+        choices=("ssh", "local"),
+        default="ssh",
+        help="VM command transport; local requires execution inside VM100",
+    )
+    parser.add_argument(
+        "--vm-vmid",
+        type=int,
+        help="required as 100 with --vm-transport local",
+    )
     parser.add_argument("--ctid", type=int, required=True)
     parser.add_argument("--container-ip", required=True)
     parser.add_argument("--bridge", default="vmbr1")
@@ -1566,6 +1727,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ValueError("cannot skip drain while migrating a source ZeroFS server")
     legacy_nbd_source = _has_legacy_nbd_source(args)
     runner = Runner(args.dry_run)
+    runner.configure_vm_transport(args)
 
     if args.action.startswith("ownership-"):
         _run_ownership_migration(runner, args)

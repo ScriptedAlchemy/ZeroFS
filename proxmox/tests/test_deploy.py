@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import contextlib
 import hashlib
+import io
 import os
 import subprocess
 import sys
@@ -1285,20 +1286,31 @@ class VmNfsCoordinatorTests(unittest.TestCase):
 
 
 class DeploymentLockTests(unittest.TestCase):
-    def test_lock_owner_executes_remote_commands_and_reports_failures(self) -> None:
+    def test_lock_owner_preserves_exact_stdout_stderr_and_exit_status(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             lock = Path(directory) / "coordinator.lock"
             holder = "flock() { return 0; }; " + deploy._remote_lock_holder(str(lock))
             lease = deploy._FlockLease(["bash", "-c", holder], dry_run=False)
 
             with lease:
-                self.assertEqual(
-                    lease.execute("printf 'inside-lock\\n'"), "inside-lock\n"
+                result = lease.execute(
+                    "printf 'stdout-without-newline'; "
+                    "printf 'stderr-without-newline' >&2"
                 )
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "stdout-without-newline")
+                self.assertEqual(result.stderr, "stderr-without-newline")
+
                 with self.assertRaisesRegex(
-                    RuntimeError, "locked remote command exited 17"
-                ):
-                    lease.execute("printf 'failed\\n'; exit 17")
+                    deploy.LockedRemoteCommandError,
+                    "locked remote command exited 17",
+                ) as caught:
+                    lease.execute(
+                        "printf 'failed-out'; printf 'failed-err' >&2; exit 17"
+                    )
+                self.assertEqual(caught.exception.returncode, 17)
+                self.assertEqual(caught.exception.stdout, "failed-out")
+                self.assertEqual(caught.exception.stderr, "failed-err")
 
     def test_nonblocking_flock_rejects_a_concurrent_coordinator(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1329,6 +1341,199 @@ sys.stdin.read()
 
         with self.assertRaisesRegex(RuntimeError, "lock lease was lost"):
             runner.run(["/usr/bin/true"])
+
+
+class VmTransportTests(unittest.TestCase):
+    UUID = "b03be38a-3da1-470c-823b-666ed880f0b4"
+
+    class IdentityRunner(deploy.Runner):
+        def __init__(
+            self,
+            *,
+            local_name: str = "ubuntu-main",
+            local_uuid: str | None = None,
+        ) -> None:
+            super().__init__(dry_run=False)
+            self.local_name = local_name
+            self.local_uuid = local_uuid or VmTransportTests.UUID
+            self.identity_calls: list[list[str]] = []
+
+        def run(
+            self,
+            command: list[str],
+            *,
+            cwd: Path | None = None,
+            capture: bool = False,
+            input_text: str | None = None,
+        ) -> subprocess.CompletedProcess[str]:
+            if command == ["hostname"]:
+                self.identity_calls.append(command)
+                return subprocess.CompletedProcess(
+                    command, 0, f"{self.local_name}\n", ""
+                )
+            if command == ["sudo", "cat", "/sys/class/dmi/id/product_uuid"]:
+                self.identity_calls.append(command)
+                return subprocess.CompletedProcess(
+                    command, 0, f"{self.local_uuid}\n", ""
+                )
+            if command == [
+                "ssh",
+                "-o",
+                "BatchMode=yes",
+                "gthost-tor-pve-root",
+                "qm",
+                "config",
+                "100",
+                "--current",
+            ]:
+                self.identity_calls.append(command)
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    "agent: enabled=1\n"
+                    "name: ubuntu-main\n"
+                    f"smbios1: uuid={VmTransportTests.UUID}\n",
+                    "",
+                )
+            return super().run(
+                command,
+                cwd=cwd,
+                capture=capture,
+                input_text=input_text,
+            )
+
+    @staticmethod
+    def args(**overrides):
+        values = {
+            "vm_transport": "local",
+            "vm_vmid": 100,
+            "vm_host": "ubuntu-main",
+            "pve_host": "gthost-tor-pve-root",
+        }
+        values.update(overrides)
+        return SimpleNamespace(**values)
+
+    def test_ssh_remains_the_default_without_a_vmid(self) -> None:
+        args = deploy.build_parser().parse_args(
+            [
+                "status",
+                "--role",
+                "prod",
+                "--ctid",
+                "198",
+                "--container-ip",
+                "10.10.10.55",
+            ]
+        )
+
+        self.assertEqual(args.vm_transport, "ssh")
+        self.assertIsNone(args.vm_vmid)
+
+    def test_local_transport_requires_the_explicit_vm100_vmid(self) -> None:
+        for vmid in (None, 99, 101):
+            with self.subTest(vmid=vmid), self.assertRaisesRegex(
+                ValueError, "--vm-vmid 100"
+            ):
+                deploy.validate_vm_transport_args(
+                    self.args(vm_vmid=vmid)
+                )
+
+    def test_local_identity_matches_proxmox_name_and_smbios_uuid(self) -> None:
+        runner = self.IdentityRunner()
+
+        identity = deploy.verify_local_vm_identity(runner, self.args())
+
+        self.assertEqual(identity.vmid, 100)
+        self.assertEqual(identity.name, "ubuntu-main")
+        self.assertEqual(identity.smbios_uuid, self.UUID)
+
+    def test_local_identity_rejects_a_random_runner_before_activation(self) -> None:
+        runner = self.IdentityRunner(
+            local_uuid="11111111-2222-3333-4444-555555555555"
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "SMBIOS UUID"):
+            runner.configure_vm_transport(self.args())
+
+        self.assertEqual(runner.vm_transport, "ssh")
+
+    def test_local_identity_rejects_a_different_hostname(self) -> None:
+        runner = self.IdentityRunner(local_name="random-runner")
+
+        with self.assertRaisesRegex(RuntimeError, "local hostname"):
+            runner.configure_vm_transport(self.args())
+
+        self.assertEqual(runner.vm_transport, "ssh")
+
+    def test_local_transport_executes_guest_shell_without_self_ssh(self) -> None:
+        runner = self.IdentityRunner()
+        runner.configure_vm_transport(self.args())
+        stderr = io.StringIO()
+
+        with contextlib.redirect_stderr(stderr):
+            output = deploy._ssh_capture(
+                runner,
+                "ubuntu-main",
+                "printf 'local-out'; printf 'local-err' >&2",
+            )
+
+        self.assertEqual(output, "local-out")
+        self.assertEqual(stderr.getvalue(), "local-err")
+
+    def test_local_dry_run_renders_guest_shell_without_self_ssh(self) -> None:
+        runner = deploy.Runner(dry_run=True)
+        runner.configure_vm_transport(self.args())
+        output = io.StringIO()
+
+        with contextlib.redirect_stdout(output):
+            deploy._ssh(runner, "ubuntu-main", "printf 'local-plan'")
+
+        self.assertIn("+ bash -se", output.getvalue())
+        self.assertNotIn("ssh -o BatchMode=yes ubuntu-main", output.getvalue())
+
+    def test_local_transport_stages_exact_bytes_without_scp(self) -> None:
+        runner = self.IdentityRunner()
+        runner.configure_vm_transport(self.args())
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source"
+            target = Path(directory) / "target"
+            source.write_bytes(b"exact-stage-bytes\x00\xff")
+
+            deploy._stage_remote_file(
+                runner,
+                "ubuntu-main",
+                source,
+                str(target),
+            )
+
+            self.assertEqual(target.read_bytes(), source.read_bytes())
+            self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+
+    def test_local_lock_uses_one_sudo_holder_and_cleans_runner_state(self) -> None:
+        runner = deploy.Runner(dry_run=True)
+        runner.vm_transport = "local"
+        runner.local_vm_host = "ubuntu-main"
+        args = self.args()
+
+        with runner.remote_deployment_locks(args):
+            lease = runner._remote_leases["ubuntu-main"]
+            self.assertEqual(lease.command[:3], ["sudo", "bash", "-c"])
+            self.assertEqual(runner._active_leases, [lease])
+
+        self.assertEqual(runner._active_leases, [])
+        self.assertEqual(runner._remote_leases, {})
+
+    def test_local_lock_cleanup_runs_when_the_transaction_is_cancelled(self) -> None:
+        runner = deploy.Runner(dry_run=True)
+        runner.vm_transport = "local"
+        runner.local_vm_host = "ubuntu-main"
+
+        with self.assertRaises(KeyboardInterrupt):
+            with runner.remote_deployment_locks(self.args()):
+                raise KeyboardInterrupt
+
+        self.assertEqual(runner._active_leases, [])
+        self.assertEqual(runner._remote_leases, {})
 
 
 class OwnershipMigrationTests(unittest.TestCase):
@@ -1534,6 +1739,43 @@ class CliDryRunTests(ConfigValidationTests):
         self.assert_direct_nfs_mount_is_provisioned(result, "10.10.10.55")
         self.assertNotIn("smb.conf", result.stdout)
         self.assertNotIn("smbd.service", result.stdout)
+
+    def test_prod_local_transport_keeps_the_whole_vm_transaction_local(self) -> None:
+        config = self.write_config(
+            self.prod_config().replace("10.10.10.30", "10.10.10.55")
+        )
+        result = subprocess.run(
+            [
+                "python3",
+                str(MODULE_PATH),
+                "deploy",
+                "--role",
+                "prod",
+                "--ctid",
+                "130",
+                "--container-ip",
+                "10.10.10.55",
+                "--config",
+                str(config),
+                "--vm-transport",
+                "local",
+                "--vm-vmid",
+                "100",
+                "--dry-run",
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("+ verify-local-vm-identity vmid=100", result.stdout)
+        self.assertIn("+ acquire-lock sudo bash -c", result.stdout)
+        self.assertIn("+ stage-local-file", result.stdout)
+        self.assertIn("vm_nfs_transition.py recover", result.stdout)
+        self.assertIn("vm_nfs_transition.py commit", result.stdout)
+        self.assertNotIn("ssh -o BatchMode=yes ubuntu-main", result.stdout)
+        self.assertNotIn("ubuntu-main:", result.stdout)
 
     def test_prod_drain_timeout_is_forwarded_to_the_host_coordinator(self) -> None:
         config = self.write_config(
