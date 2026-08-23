@@ -1,14 +1,17 @@
 from __future__ import annotations
 
-import importlib.util
 import contextlib
+import fcntl
 import hashlib
+import importlib.util
 import io
 import os
+import shlex
 import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import tomllib
 import unittest
@@ -1527,7 +1530,7 @@ with lease:
                         sys.executable,
                         "-c",
                         "import fcntl, sys; h=open(sys.argv[1], 'w'); "
-                        "fcntl.flock(h, fcntl.LOCK_EX | fcntl.LOCK_NB)",
+                        "fcntl.flock(h, fcntl.LOCK_EX | fcntl.LOCK_NB); h.close()",
                         str(lock),
                     ],
                     check=False,
@@ -1542,6 +1545,125 @@ with lease:
                             os.kill(pid, signal.SIGKILL)
                         except ProcessLookupError:
                             pass
+
+    def test_forced_holder_teardown_cleans_active_payload_before_lock_release(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            directory_path = Path(directory)
+            lock = directory_path / "coordinator.lock"
+            payload_pid_path = directory_path / "payload.pid"
+            holder = deploy._remote_lock_holder(str(lock))
+            lease = deploy._FlockLease(
+                [
+                    "env",
+                    f"TMPDIR={directory}",
+                    "bash",
+                    "-c",
+                    holder,
+                ],
+                dry_run=False,
+                force_cleanup_command=lambda script: [
+                    "env",
+                    f"TMPDIR={directory}",
+                    "bash",
+                    "-c",
+                    script,
+                ],
+            )
+            payload_source = f'''import os
+import signal
+import time
+with open({str(payload_pid_path)!r}, "w") as handle:
+    handle.write(str(os.getpid()))
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+while True:
+    time.sleep(1)
+'''
+            outcome: list[BaseException] = []
+
+            def execute_payload() -> None:
+                try:
+                    lease.execute(
+                        "exec python3 -c " + shlex.quote(payload_source)
+                    )
+                except BaseException as error:
+                    outcome.append(error)
+
+            lease.__enter__()
+            assert lease.process is not None
+            thread = threading.Thread(target=execute_payload)
+            thread.start()
+            payload_pid = None
+            runtime_directory = None
+            try:
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    if payload_pid_path.exists():
+                        payload_pid = int(payload_pid_path.read_text())
+                    runtime_directories = list(
+                        directory_path.glob("zerofs-lock-command-*")
+                    )
+                    if runtime_directories:
+                        runtime_directory = runtime_directories[0]
+                    if (
+                        payload_pid is not None
+                        and runtime_directory is not None
+                        and lease._active_payloads
+                    ):
+                        break
+                    time.sleep(0.02)
+                self.assertIsNotNone(payload_pid, "payload did not start")
+                self.assertIsNotNone(
+                    runtime_directory, "command runtime directory was not created"
+                )
+
+                os.killpg(lease.process.pid, signal.SIGSTOP)
+                started = time.monotonic()
+                lease._shutdown_holder(graceful_timeout=0.1)
+                elapsed = time.monotonic() - started
+                thread.join(timeout=3)
+
+                self.assertLess(elapsed, 8)
+                self.assertFalse(thread.is_alive(), "execute remained blocked")
+                self.assertIsNotNone(lease.process.poll(), "holder was not reaped")
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(payload_pid, 0)
+                self.assertFalse(
+                    runtime_directory.exists(), "command runtime directory leaked"
+                )
+                self.assertEqual(len(outcome), 1)
+                self.assertIsInstance(outcome[0], RuntimeError)
+                self.assertIn("lease was lost", str(outcome[0]))
+                handle = lock.open("w")
+                try:
+                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                finally:
+                    handle.close()
+            finally:
+                try:
+                    os.killpg(lease.process.pid, signal.SIGCONT)
+                except ProcessLookupError:
+                    pass
+                for pid in (payload_pid, lease.process.pid):
+                    if pid is None:
+                        continue
+                    try:
+                        os.killpg(pid, signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError):
+                        try:
+                            os.kill(pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                try:
+                    lease.process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    lease.process.kill()
+                    lease.process.wait(timeout=2)
+                thread.join(timeout=2)
+                for stream in (lease.process.stdout, lease.process.stderr):
+                    if stream is not None:
+                        stream.close()
 
     def test_second_interrupt_performs_bounded_payload_and_holder_cleanup(self) -> None:
         script = """
@@ -1639,6 +1761,40 @@ print("lock-reacquired", flush=True)
         self.assertIn(
             "deployment lock process exited 17",
             "\n".join(interrupt.__notes__),
+        )
+
+    def test_forced_cleanup_error_does_not_mask_active_failure(self) -> None:
+        lease = deploy._FlockLease(
+            ["unused"],
+            dry_run=False,
+            force_cleanup_command=lambda _script: ["bash", "-c", "exit 23"],
+        )
+
+        def wait_for_holder(timeout):
+            raise subprocess.TimeoutExpired(["unused"], timeout)
+
+        lease.process = SimpleNamespace(
+            pid=424242,
+            stdin=io.StringIO(),
+            stdout=io.StringIO(),
+            stderr=io.StringIO(),
+            wait=wait_for_holder,
+        )
+        lease.holder_pid = 424242
+        token = "a" * 64
+        lease._active_payloads[token] = deploy._ActiveLockedPayload(
+            token=token,
+            pgid=424243,
+            runtime_directory=f"/tmp/zerofs-lock-command-{token}-owned",
+        )
+        original = RuntimeError("transaction failed")
+
+        lease.__exit__(RuntimeError, original, None)
+
+        self.assertIn(
+            "deployment lock cleanup failed: "
+            "deployment lock forced cleanup exited 23",
+            "\n".join(original.__notes__),
         )
 
     def test_nonblocking_flock_rejects_a_concurrent_coordinator(self) -> None:

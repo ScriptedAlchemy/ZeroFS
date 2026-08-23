@@ -544,6 +544,13 @@ def shell_join(command: Sequence[str]) -> str:
     return shlex.join([str(part) for part in command])
 
 
+@dataclass(frozen=True)
+class _ActiveLockedPayload:
+    token: str
+    pgid: int
+    runtime_directory: str
+
+
 class _FlockLease:
     def __init__(
         self,
@@ -551,11 +558,17 @@ class _FlockLease:
         *,
         dry_run: bool,
         display_command: Sequence[str] | None = None,
+        force_cleanup_command: Callable[[str], Sequence[str]] | None = None,
     ) -> None:
         self.command = list(command)
         self.display_command = list(display_command or command)
         self.dry_run = dry_run
+        self.force_cleanup_command = force_cleanup_command or (
+            lambda script: ["bash", "-c", script]
+        )
         self.process: subprocess.Popen[str] | None = None
+        self.holder_pid: int | None = None
+        self._active_payloads: dict[str, _ActiveLockedPayload] = {}
 
     def __enter__(self) -> _FlockLease:
         print(f"+ acquire-lock {shell_join(self.display_command)}")
@@ -577,8 +590,12 @@ class _FlockLease:
             ready = selector.select(timeout=15)
         finally:
             selector.close()
-        if ready and process.stdout.readline().strip() == "LOCKED":
-            return self
+        if ready:
+            fields = process.stdout.readline().strip().split(" ")
+            if fields[0] == "LOCKED" and len(fields) in (1, 2):
+                if len(fields) == 2:
+                    self.holder_pid = int(fields[1])
+                return self
         try:
             _stdout, stderr = process.communicate(timeout=2)
         except subprocess.TimeoutExpired:
@@ -598,11 +615,18 @@ class _FlockLease:
         if self.process is None:
             return
         process = self.process
-        returncode = self._shutdown_holder(graceful_timeout=10)
-        if process.stdout is not None:
-            process.stdout.close()
-        if process.stderr is not None:
-            process.stderr.close()
+        try:
+            returncode = self._shutdown_holder(graceful_timeout=10)
+        except BaseException as cleanup_error:
+            if exc is not None:
+                exc.add_note(f"deployment lock cleanup failed: {cleanup_error}")
+                return
+            raise
+        finally:
+            if process.stdout is not None:
+                process.stdout.close()
+            if process.stderr is not None:
+                process.stderr.close()
         if returncode != 0:
             detail = f"deployment lock process exited {returncode}"
             if exc is not None:
@@ -626,17 +650,48 @@ class _FlockLease:
         payload = base64.b64encode(script.encode()).decode()
         process.stdin.write(f"RUN {token} {payload}\n")
         process.stdin.flush()
-        marker = f"__ZEROFS_LOCK_RESULT__ {token} "
+        result_marker = f"__ZEROFS_LOCK_RESULT__ {token} "
+        started_marker = f"__ZEROFS_LOCK_STARTED__ {token} "
         try:
             while True:
                 line = process.stdout.readline()
                 if not line:
                     raise RuntimeError("deployment lock lease was lost during command")
-                if line.startswith(marker):
-                    return self._parse_result(line, marker)
+                if line.startswith(started_marker):
+                    self._record_started(token, line, started_marker)
+                    continue
+                if line.startswith(result_marker):
+                    self._active_payloads.pop(token, None)
+                    return self._parse_result(line, result_marker)
         except KeyboardInterrupt as interrupt:
-            self._cancel_active(token, marker, interrupt)
+            self._cancel_active(
+                token,
+                result_marker,
+                started_marker,
+                interrupt,
+            )
             raise
+
+    def _record_started(
+        self,
+        token: str,
+        line: str,
+        marker: str,
+    ) -> None:
+        pgid_text, runtime_encoded = (
+            line.removeprefix(marker).rstrip("\n").split(" ", 1)
+        )
+        pgid = int(pgid_text)
+        if pgid <= 1:
+            raise RuntimeError(
+                "deployment lock holder reported an invalid payload PGID"
+            )
+        runtime_directory = base64.b64decode(runtime_encoded).decode()
+        self._active_payloads[token] = _ActiveLockedPayload(
+            token=token,
+            pgid=pgid,
+            runtime_directory=runtime_directory,
+        )
 
     @staticmethod
     def _parse_result(
@@ -670,7 +725,8 @@ class _FlockLease:
     def _cancel_active(
         self,
         token: str,
-        marker: str,
+        result_marker: str,
+        started_marker: str,
         interrupt: KeyboardInterrupt,
     ) -> None:
         process = self.process
@@ -682,7 +738,7 @@ class _FlockLease:
             process.stdin.flush()
         except (BrokenPipeError, OSError) as error:
             interrupt.add_note(f"deployment command cancellation failed: {error}")
-            self._shutdown_holder(graceful_timeout=5)
+            self._shutdown_without_masking(interrupt)
             return
         deadline = time.monotonic() + 5
         try:
@@ -696,14 +752,60 @@ class _FlockLease:
                         "deployment lock holder exited during command cancellation"
                     )
                     return
-                if line.startswith(marker):
+                if line.startswith(started_marker):
+                    self._record_started(token, line, started_marker)
+                    continue
+                if line.startswith(result_marker):
+                    self._active_payloads.pop(token, None)
                     return
         except KeyboardInterrupt:
-            self._shutdown_holder(graceful_timeout=5)
-            raise
+            interrupt.add_note(
+                "second interrupt received during deployment command cancellation"
+            )
+            self._shutdown_without_masking(interrupt)
+            raise interrupt
         except TimeoutError as error:
             interrupt.add_note(str(error))
+            self._shutdown_without_masking(interrupt)
+
+    def _shutdown_without_masking(self, original: BaseException) -> None:
+        try:
             self._shutdown_holder(graceful_timeout=5)
+        except BaseException as cleanup_error:
+            original.add_note(f"deployment lock cleanup failed: {cleanup_error}")
+
+    def _force_cleanup(self, *, include_holder: bool) -> None:
+        if not self._active_payloads and not (
+            include_holder and self.holder_pid is not None
+        ):
+            return
+        script = _remote_lock_cleanup(
+            self.holder_pid if include_holder else None,
+            tuple(self._active_payloads.values()),
+        )
+        command = list(self.force_cleanup_command(script))
+        try:
+            result = subprocess.run(
+                command,
+                check=False,
+                text=True,
+                capture_output=True,
+                timeout=15,
+                start_new_session=True,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise RuntimeError("deployment lock forced cleanup timed out") from error
+        if result.returncode != 0:
+            details = []
+            if result.stdout:
+                details.append(f"stdout: {result.stdout.strip()}")
+            if result.stderr:
+                details.append(f"stderr: {result.stderr.strip()}")
+            raise RuntimeError(
+                f"deployment lock forced cleanup exited {result.returncode}"
+                + (f": {'; '.join(details)}" if details else "")
+            )
+        self._active_payloads.clear()
 
     def _shutdown_holder(self, *, graceful_timeout: float) -> int:
         process = self.process
@@ -712,20 +814,27 @@ class _FlockLease:
         if process.stdin is not None and not process.stdin.closed:
             process.stdin.close()
         try:
-            return process.wait(timeout=graceful_timeout)
+            returncode = process.wait(timeout=graceful_timeout)
         except subprocess.TimeoutExpired:
+            self._force_cleanup(include_holder=True)
             try:
-                os.killpg(process.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-        try:
-            return process.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            return process.wait(timeout=2)
+                returncode = process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    returncode = process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    returncode = process.wait(timeout=2)
+        if self._active_payloads:
+            self._force_cleanup(include_holder=False)
+        return returncode
 
 
 class LockedRemoteCommandError(RuntimeError):
@@ -744,10 +853,173 @@ class LockedRemoteCommandError(RuntimeError):
         )
 
 
+def _remote_lock_cleanup(
+    holder_pid: int | None,
+    payloads: Sequence[_ActiveLockedPayload],
+) -> str:
+    encoded_payloads = base64.b64encode(
+        json.dumps(
+            [
+                {
+                    "token": payload.token,
+                    "pgid": payload.pgid,
+                    "runtime_directory": payload.runtime_directory,
+                }
+                for payload in payloads
+            ],
+            separators=(",", ":"),
+        ).encode()
+    ).decode()
+    program = r'''
+import base64
+import json
+import os
+import shutil
+import signal
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+
+def process_state(pid):
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    return stat[stat.rfind(")") + 2:].split()[0]
+
+
+def pid_is_live(pid):
+    state = process_state(pid)
+    return state is not None and state != "Z"
+
+
+def process_group_exists(pgid):
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def group_has_live_members(pgid):
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            fields = (entry / "stat").read_text()
+            fields = fields[fields.rfind(")") + 2:].split()
+            state = fields[0]
+            process_group = int(fields[2])
+        except (FileNotFoundError, ProcessLookupError, ValueError, IndexError):
+            continue
+        if process_group == pgid and state != "Z":
+            return True
+    return False
+
+
+def wait_while(predicate, timeout):
+    deadline = time.monotonic() + timeout
+    while predicate() and time.monotonic() < deadline:
+        time.sleep(0.05)
+
+
+def validate_payload(item):
+    token = item["token"]
+    pgid = item["pgid"]
+    runtime = Path(item["runtime_directory"])
+    if (
+        len(token) != 64
+        or any(character not in "0123456789abcdef" for character in token)
+        or not isinstance(pgid, int)
+        or pgid <= 1
+    ):
+        raise RuntimeError("invalid forced-cleanup payload identity")
+    expected_prefix = f"zerofs-lock-command-{token}-"
+    temp_root = Path(tempfile.gettempdir()).resolve()
+    if (
+        not runtime.is_absolute()
+        or runtime.parent.resolve() != temp_root
+        or not runtime.name.startswith(expected_prefix)
+        or runtime.is_symlink()
+    ):
+        raise RuntimeError("unsafe forced-cleanup runtime directory")
+    if runtime.exists():
+        owner = json.loads((runtime / "owner.json").read_text())
+        if owner != {"token": token, "pgid": pgid}:
+            raise RuntimeError("forced-cleanup payload ownership changed")
+    elif process_group_exists(pgid):
+        raise RuntimeError("payload runtime disappeared while its group survived")
+    return pgid, runtime
+
+
+def terminate_payload_group(pgid):
+    if process_group_exists(pgid):
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    wait_while(lambda: group_has_live_members(pgid), 2)
+    if group_has_live_members(pgid):
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    wait_while(lambda: group_has_live_members(pgid), 2)
+    if group_has_live_members(pgid):
+        raise RuntimeError(f"payload process group {pgid} survived SIGKILL")
+
+
+def terminate_holder(pid):
+    if not pid:
+        return
+    if pid_is_live(pid):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+    wait_while(lambda: pid_is_live(pid), 2)
+    if pid_is_live(pid):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+    wait_while(lambda: pid_is_live(pid), 2)
+    if pid_is_live(pid):
+        raise RuntimeError(f"lock holder {pid} survived SIGKILL")
+
+
+def main():
+    holder_pid = int(sys.argv[1]) if sys.argv[1] != "-" else None
+    payloads = json.loads(base64.b64decode(sys.argv[2]))
+    validated = [validate_payload(item) for item in payloads]
+    for pgid, _runtime in validated:
+        terminate_payload_group(pgid)
+    for _pgid, runtime in validated:
+        if runtime.exists():
+            shutil.rmtree(runtime)
+    terminate_holder(holder_pid)
+    for pgid, _runtime in validated:
+        wait_while(lambda pgid=pgid: process_group_exists(pgid), 2)
+        if process_group_exists(pgid):
+            raise RuntimeError(f"payload process group {pgid} was not reaped")
+
+
+main()
+'''
+    holder = str(holder_pid) if holder_pid is not None else "-"
+    return (
+        f"exec python3 -u -c {shlex.quote(program)} "
+        f"{shlex.quote(holder)} {shlex.quote(encoded_payloads)}"
+    )
+
+
 def _remote_lock_holder(path: str) -> str:
     program = r'''
 import base64
 import fcntl
+import json
 import os
 import selectors
 import signal
@@ -812,7 +1084,7 @@ def main():
         fcntl.flock(lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         raise SystemExit(75)
-    print("LOCKED", flush=True)
+    print(f"LOCKED {os.getpid()}", flush=True)
     active = None
     try:
         while True:
@@ -825,7 +1097,9 @@ def main():
             if action != "RUN" or not token or not payload:
                 raise RuntimeError("invalid deployment lock request")
             script = base64.b64decode(payload)
-            with tempfile.TemporaryDirectory(prefix="zerofs-lock-command-") as directory:
+            with tempfile.TemporaryDirectory(
+                prefix=f"zerofs-lock-command-{token}-"
+            ) as directory:
                 stdout_path = os.path.join(directory, "stdout")
                 stderr_path = os.path.join(directory, "stderr")
                 script_path = os.path.join(directory, "script")
@@ -844,8 +1118,15 @@ def main():
                         start_new_session=True,
                         close_fds=True,
                     )
+                Path(directory, "owner.json").write_text(
+                    json.dumps(
+                        {"token": token, "pgid": active.pid},
+                        separators=(",", ":"),
+                    )
+                )
+                runtime = base64.b64encode(directory.encode()).decode()
                 print(
-                    f"__ZEROFS_LOCK_STARTED__ {token} {active.pid}",
+                    f"__ZEROFS_LOCK_STARTED__ {token} {active.pid} {runtime}",
                     flush=True,
                 )
                 selector = selectors.DefaultSelector()
@@ -878,6 +1159,7 @@ def main():
     finally:
         if active is not None:
             terminate_payload(active)
+        lock_handle.close()
 
 
 main()
@@ -1070,6 +1352,25 @@ class Runner:
                         host,
                         remote,
                     ]
+                if self.is_local_vm_host(host):
+                    force_cleanup_command = lambda script: [
+                        "sudo",
+                        "bash",
+                        "-c",
+                        script,
+                    ]
+                else:
+                    force_cleanup_command = lambda script, host=host: [
+                        "ssh",
+                        "-o",
+                        "BatchMode=yes",
+                        "-o",
+                        "ServerAliveInterval=15",
+                        "-o",
+                        "ServerAliveCountMax=3",
+                        host,
+                        f"sudo bash -c {shlex.quote(script)}",
+                    ]
                 display_command = (
                     ["local-vm-lock-holder", path]
                     if self.is_local_vm_host(host)
@@ -1080,6 +1381,7 @@ class Runner:
                         command,
                         dry_run=self.dry_run,
                         display_command=display_command,
+                        force_cleanup_command=force_cleanup_command,
                     )
                 )
                 self._active_leases.append(lease)

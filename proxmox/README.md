@@ -220,10 +220,13 @@ whole transaction. The lock holder runs in a separate process group so a
 terminal interrupt reaches the coordinator first; rollback finishes while the
 holder still owns the lock, and the original interrupt remains the reported
 failure. Each command runs in its own process group without inheriting the lock
-descriptor. A STARTED receipt binds cancellation to that command; interrupt or
-coordinator loss terminates and reaps the command group with bounded
-TERM-to-KILL escalation while the holder retains the lock for rollback. Clean
-holder exit then releases the lock immediately.
+descriptor. A STARTED receipt binds its token, process-group ID, and owned
+runtime directory to the coordinator. Interrupt or coordinator loss terminates
+and reaps the command group with bounded TERM-to-KILL escalation while the
+holder retains the lock for rollback. If the holder stops responding, a
+separate root cleanup command validates that ownership receipt, terminates the
+active command group, and removes its runtime directory before terminating the
+holder. Clean holder exit then releases the lock immediately.
 
 ## Templates and resource sizing
 
