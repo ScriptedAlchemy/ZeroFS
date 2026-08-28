@@ -38,6 +38,14 @@ where
     tokio::time::timeout(SFTP_REQUEST_TIMEOUT, future)
         .await
         .map_err(|_| {
+            // Surface the deadline at WARN here: the callers that retry this
+            // error log each attempt below WARN, so a stalled backend would
+            // otherwise time out and retry in silence indefinitely.
+            tracing::warn!(
+                operation,
+                timeout_secs = SFTP_REQUEST_TIMEOUT.as_secs(),
+                "SFTP request exceeded its deadline; abandoning its session"
+            );
             crate::sftp_transport::TransportError::Operation(format!(
                 "{operation} timed out after {:.3}s",
                 SFTP_REQUEST_TIMEOUT.as_secs_f64()

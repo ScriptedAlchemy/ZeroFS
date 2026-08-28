@@ -113,6 +113,14 @@ const SFTP_SESSION_CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
 const SFTP_SESSION_FORCE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 const SFTP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const SFTP_IDLE_REAP_INTERVAL: Duration = Duration::from_secs(10);
+/// A backend can stall an established TCP session without erroring it: write
+/// requests then pend inside their sessions and admission slots drain to
+/// zero throughput while every socket still looks healthy. When write work
+/// stays pending this long without one write completing, the watchdog
+/// force-closes every pooled session so replacements reconnect. Zero
+/// disables the watchdog; the production value comes from
+/// `[sftp] flush_stall_recycle_secs`.
+const SFTP_FLUSH_STALL_RECYCLE_DISABLED: u64 = 0;
 const SFTP_IDLE_WARM_FLOOR: usize = 1;
 const SFTP_POOL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(45);
 // How long shutdown lets already-scheduled staging cleanups finish while the
@@ -520,6 +528,16 @@ impl FairAdmission {
         state.waiters.clear();
     }
 
+    /// Whether any write operation is admitted or queued right now.
+    fn write_work_pending(&self) -> bool {
+        let state = self.inner.state.lock().unwrap();
+        state.active_writes > 0
+            || state
+                .waiters
+                .iter()
+                .any(|waiter| waiter.kind == OperationKind::Write)
+    }
+
     #[cfg(test)]
     fn waiter_count(&self) -> usize {
         self.inner.state.lock().unwrap().waiters.len()
@@ -680,6 +698,12 @@ struct PoolInner {
     // spread across the roster instead of always landing on its first entry.
     session_cursor: AtomicUsize,
     idle_warm_floor: AtomicUsize,
+    // Millisecond window for the flush-stall watchdog; zero disables it.
+    flush_stall_recycle_millis: AtomicU64,
+    // Completed (transport-answered) write operations, the watchdog's
+    // liveness signal.
+    write_completions: AtomicU64,
+    flush_stall: StdMutex<FlushStallTracker>,
     directories: DirectoryCache,
     writable: bool,
     closed: AtomicBool,
@@ -706,6 +730,14 @@ struct PoolInner {
 struct DialBackoff {
     consecutive_failures: u32,
     next_allowed: Option<Instant>,
+}
+
+/// Watchdog state: the completion count last observed and how long write
+/// work has been pending without that count advancing.
+#[derive(Debug, Default)]
+struct FlushStallTracker {
+    last_completions: u64,
+    pending_since: Option<Instant>,
 }
 
 struct FailClosedOnOwnerDrop {
@@ -981,6 +1013,80 @@ impl PoolInner {
         }
     }
 
+    /// Runs on every reaper tick. Write work continuously pending without a
+    /// single write completing means every carrying session may be stalled
+    /// on a backend that no longer answers (an established TCP session a
+    /// storage backend wedged without erroring it). Recycle the whole pool:
+    /// force-closing the sessions errors their pending operations, retries
+    /// re-checkout onto freshly dialed connections, and the log line makes a
+    /// stall visible instead of silent.
+    fn check_flush_stall(self: &Arc<Self>) {
+        let window = self.flush_stall_recycle_millis.load(Ordering::SeqCst);
+        if window == SFTP_FLUSH_STALL_RECYCLE_DISABLED || self.closed.load(Ordering::SeqCst) {
+            return;
+        }
+        let window = Duration::from_millis(window);
+        let completions = self.write_completions.load(Ordering::SeqCst);
+        let now = Instant::now();
+        let stalled_for = {
+            let mut stall = self.flush_stall.lock().unwrap();
+            if !self.admission.write_work_pending() {
+                stall.pending_since = None;
+                return;
+            }
+            if stall.pending_since.is_none() || completions != stall.last_completions {
+                stall.last_completions = completions;
+                stall.pending_since = Some(now);
+                return;
+            }
+            let pending_since = stall
+                .pending_since
+                .expect("pending_since was checked above");
+            let stalled_for = now.saturating_duration_since(pending_since);
+            if stalled_for < window {
+                return;
+            }
+            // Restart the window so a backend that stays wedged is recycled
+            // again rather than warned about exactly once.
+            stall.pending_since = Some(now);
+            stalled_for
+        };
+        let recycled = self.recycle_all_sessions();
+        tracing::warn!(
+            stalled_secs = stalled_for.as_secs(),
+            sessions = recycled,
+            "SFTP write flushes made no progress while work was pending; \
+             force-closing every pooled session so replacements reconnect"
+        );
+        metrics::counter!("zerofs_sftp_pool_stall_recycles_total").increment(1);
+    }
+
+    /// Removes every session from the roster and closes each one, in-flight
+    /// operations included. The existing close path force-closes a socket
+    /// that will not shut down gracefully, so operations wedged inside a
+    /// stalled session fail fast and retry on a fresh connection.
+    fn recycle_all_sessions(self: &Arc<Self>) -> usize {
+        let departing: Vec<Arc<SharedSession>> = {
+            let mut roster = self.roster.lock().unwrap();
+            // Publish the broken state under the roster lock so no checkout
+            // can claim a session between drain and close (the same ordering
+            // `remove_from_roster` relies on).
+            for session in roster.iter() {
+                session.broken.store(true, Ordering::SeqCst);
+            }
+            roster.drain(..).collect()
+        };
+        let recycled = departing.len();
+        for session in departing {
+            let pool = self.clone();
+            self.tasks.spawn(async move {
+                let _ = pool.close_shared_session(session).await;
+            });
+        }
+        self.roster_changed.notify_waiters();
+        recycled
+    }
+
     async fn reap_expired_idle(self: &Arc<Self>) {
         let expired = {
             let now = Instant::now();
@@ -1125,6 +1231,10 @@ impl SftpSessionPool {
         pool.inner
             .idle_warm_floor
             .store(config.max_connections, Ordering::SeqCst);
+        pool.inner.flush_stall_recycle_millis.store(
+            config.flush_stall_recycle_secs.saturating_mul(1000),
+            Ordering::SeqCst,
+        );
         if let Err(error) = pool.warm_to(config.max_connections).await {
             return match pool.shutdown().await {
                 Ok(()) => Err(error),
@@ -1160,6 +1270,9 @@ impl SftpSessionPool {
                 roster_changed: Notify::new(),
                 session_cursor: AtomicUsize::new(0),
                 idle_warm_floor: AtomicUsize::new(SFTP_IDLE_WARM_FLOOR),
+                flush_stall_recycle_millis: AtomicU64::new(SFTP_FLUSH_STALL_RECYCLE_DISABLED),
+                write_completions: AtomicU64::new(0),
+                flush_stall: StdMutex::new(FlushStallTracker::default()),
                 directories: DirectoryCache::default(),
                 writable: true,
                 closed: AtomicBool::new(false),
@@ -1215,6 +1328,7 @@ impl SftpSessionPool {
                             break;
                         };
                         inner.reap_expired_idle().await;
+                        inner.check_flush_stall();
                     }
                 }
             }
@@ -1759,6 +1873,11 @@ impl SessionLease {
             .session
             .take()
             .expect("lease always owns a session until completion");
+        if self.kind == OperationKind::Write {
+            // The transport answered this write, so the flush path is alive;
+            // the stall watchdog keys off this count.
+            self.pool.write_completions.fetch_add(1, Ordering::SeqCst);
+        }
         self.pool.release_session(&session, self.kind);
         drop(self.admission.take());
         drop(self.activity.take());
@@ -1841,10 +1960,10 @@ impl Drop for SessionLease {
 mod tests {
     use super::{
         LeaseFinishError, OpenSshTransportSession, OperationKind, RemoteEntryKind,
-        SFTP_IDLE_REAP_INTERVAL, SFTP_IDLE_TIMEOUT, SFTP_READ_PACKET_SIZE,
-        SFTP_READ_REQUEST_CONCURRENCY, SFTP_WRITE_PACKET_SIZE, SFTP_WRITE_REQUEST_CONCURRENCY,
-        SessionDisposition, SessionFactory, SftpSessionPool, TransportError, TransportSession,
-        plan_pipelined_reads, plan_pipelined_writes,
+        SFTP_FLUSH_STALL_RECYCLE_DISABLED, SFTP_IDLE_REAP_INTERVAL, SFTP_IDLE_TIMEOUT,
+        SFTP_READ_PACKET_SIZE, SFTP_READ_REQUEST_CONCURRENCY, SFTP_WRITE_PACKET_SIZE,
+        SFTP_WRITE_REQUEST_CONCURRENCY, SessionDisposition, SessionFactory, SftpSessionPool,
+        TransportError, TransportSession, plan_pipelined_reads, plan_pipelined_writes,
     };
     use crate::sftp_object_store::{ObjectHeader, SftpCapabilities, encode_header};
     use async_trait::async_trait;
@@ -3523,6 +3642,108 @@ mod tests {
                 format!("SFTP server lacks required {missing} extension")
             );
         }
+    }
+
+    /// The silent flush stall: a backend wedges established sessions without
+    /// erroring them, so write operations pend forever while every socket
+    /// still looks healthy and throughput drops to zero. Once write work has
+    /// been pending for the configured window with no write completing, the
+    /// watchdog must force-close every pooled session so retries reconnect.
+    #[tokio::test(start_paused = true)]
+    async fn stalled_write_flushes_recycle_every_pooled_session() {
+        let factory = RecordingFactory::fully_capable();
+        let pool = pool(factory.clone(), 2, 2, 2).await;
+        pool.inner
+            .flush_stall_recycle_millis
+            .store(30_000, Ordering::SeqCst);
+
+        // A write whose operation never finishes: it holds a write admission
+        // slot and its session, and never produces a completion.
+        let lease = pool.checkout(OperationKind::Write).await.unwrap();
+        let live_before = factory.live();
+        assert!(live_before >= 1);
+
+        // The first tick only observes the pending work and arms the tracker.
+        tokio::time::advance(SFTP_IDLE_REAP_INTERVAL).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            factory.live(),
+            live_before,
+            "the watchdog must not fire before its window elapses"
+        );
+
+        tokio::time::advance(Duration::from_secs(30) + SFTP_IDLE_REAP_INTERVAL).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            factory.live(),
+            0,
+            "a stalled pool must force-close every session, in-flight operations included"
+        );
+
+        // The stalled operation's owner finds its session already closed.
+        lease.retire().await.unwrap();
+        pool.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn completing_writes_keep_the_stall_watchdog_quiet() {
+        let factory = RecordingFactory::fully_capable();
+        let pool = pool(factory.clone(), 2, 2, 2).await;
+        pool.inner
+            .flush_stall_recycle_millis
+            .store(30_000, Ordering::SeqCst);
+
+        // One write pends forever, so write work is always pending; another
+        // write completes between every tick, which is real flush progress.
+        let stuck = pool.checkout(OperationKind::Write).await.unwrap();
+        // The first completing write may dial a second session; settle the
+        // roster before measuring so the assertion sees recycles only.
+        let first = pool.checkout(OperationKind::Write).await.unwrap();
+        first.complete().await.unwrap();
+        let live_before = factory.live();
+        for _ in 0..6 {
+            let completing = pool.checkout(OperationKind::Write).await.unwrap();
+            completing.complete().await.unwrap();
+            tokio::time::advance(SFTP_IDLE_REAP_INTERVAL).await;
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            factory.live(),
+            live_before,
+            "completed writes must keep the stall watchdog from recycling live sessions"
+        );
+
+        stuck.retire().await.unwrap();
+        pool.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn writable_config_arms_the_flush_stall_watchdog() {
+        let factory = RecordingFactory::fully_capable();
+        let config = crate::config::SftpConfig {
+            identity_file: "/tmp/id-ed25519".into(),
+            known_hosts: "/tmp/known-hosts".into(),
+            max_connections: 1,
+            read_concurrency: 1,
+            write_concurrency: 1,
+            segment_size_mib: 32,
+            read_cache_part_size_kib: 1024,
+            ..Default::default()
+        };
+        let pool = SftpSessionPool::from_config_writable(Arc::new(factory), &config)
+            .await
+            .unwrap();
+        assert_eq!(
+            pool.inner.flush_stall_recycle_millis.load(Ordering::SeqCst),
+            config.flush_stall_recycle_secs * 1000,
+            "the configured stall window must arm the pool watchdog"
+        );
+        assert_ne!(
+            pool.inner.flush_stall_recycle_millis.load(Ordering::SeqCst),
+            SFTP_FLUSH_STALL_RECYCLE_DISABLED,
+            "the default configuration must not leave the watchdog disabled"
+        );
+        pool.shutdown().await.unwrap();
     }
 
     #[tokio::test]

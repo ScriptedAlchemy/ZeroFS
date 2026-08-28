@@ -232,6 +232,12 @@ pub struct SftpConfig {
     /// SSH implementation that carries SFTP. Only native `russh` is supported.
     #[serde(default, skip_serializing_if = "SftpSshTransport::is_russh")]
     pub(crate) transport: SftpSshTransport,
+    /// Flush-stall watchdog: when write operations stay pending this many
+    /// seconds without one completing, every pooled session is force-closed
+    /// so replacements reconnect. Catches backends that stall an established
+    /// TCP session without erroring it. 0 disables the watchdog.
+    #[serde(default = "default_sftp_flush_stall_recycle_secs")]
+    pub(crate) flush_stall_recycle_secs: u64,
 }
 
 impl fmt::Debug for SftpConfig {
@@ -302,6 +308,7 @@ impl Default for SftpConfig {
             segment_size_mib: default_sftp_segment_size_mib(),
             read_cache_part_size_kib: default_sftp_read_cache_part_size_kib(),
             transport: SftpSshTransport::Russh,
+            flush_stall_recycle_secs: default_sftp_flush_stall_recycle_secs(),
         }
     }
 }
@@ -359,6 +366,11 @@ impl SftpConfig {
                 "[sftp] read_cache_part_size_kib must be a power of two between 256 and 8192"
             );
         }
+        // A too-short window would recycle healthy sessions mid-transfer:
+        // large single puts legitimately run for minutes between completions.
+        if self.flush_stall_recycle_secs != 0 && self.flush_stall_recycle_secs < 30 {
+            anyhow::bail!("[sftp] flush_stall_recycle_secs must be 0 (disabled) or at least 30");
+        }
         Ok(())
     }
 
@@ -393,6 +405,10 @@ const fn default_sftp_direction_concurrency() -> usize {
     // connections. Two per default connection hides the WAN round trip on
     // small objects without letting bulk transfers oversubscribe memory.
     16
+}
+
+const fn default_sftp_flush_stall_recycle_secs() -> u64 {
+    180
 }
 
 const fn default_sftp_segment_size_mib() -> usize {

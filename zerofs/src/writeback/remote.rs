@@ -28,6 +28,10 @@ use tokio::task::{JoinHandle, JoinSet};
 const REMOTE_COALESCE_IDLE: Duration = Duration::from_millis(500);
 const REMOTE_RETRY_DELAY: Duration = Duration::from_millis(200);
 const REMOTE_OPERATION_TIMEOUT: Duration = Duration::from_secs(120);
+/// Warn (and keep warning) once a single flush operation has run this long
+/// without completing. Below every operation and publication deadline, so a
+/// stalled backend logs before its flushes start timing out.
+const REMOTE_SLOW_FLUSH_WARN: Duration = Duration::from_secs(60);
 /// Atomic publication composes multiple independently bounded SFTP phases.
 /// Create and Update can require a durable staging write, a publication link,
 /// and staging removal, so their watchdog must exceed three request budgets.
@@ -589,25 +593,22 @@ async fn run_remote_scheduler(worker: RemoteWorker) {
                     let cleanup_sender = cleanup_sender.clone();
                     let cleanup_state = Arc::clone(&cleanup_state);
                     active.spawn(async move {
-                        let result = if matches!(record.kind, MutationKind::Delete) {
-                            let applying = apply_record(
-                                remote,
-                                journal,
-                                record.clone(),
-                                cleanup_sender,
-                                cleanup_state,
-                            );
-                            bounded_remote_operation(&record, REMOTE_OPERATION_TIMEOUT, applying)
-                                .await
-                        } else {
+                        let applying = warn_while_flush_is_slow(
+                            record.sequence,
+                            record.path.clone(),
                             apply_record(
                                 remote,
                                 journal,
                                 record.clone(),
                                 cleanup_sender,
                                 cleanup_state,
-                            )
-                            .await
+                            ),
+                        );
+                        let result = if matches!(record.kind, MutationKind::Delete) {
+                            bounded_remote_operation(&record, REMOTE_OPERATION_TIMEOUT, applying)
+                                .await
+                        } else {
+                            applying.await
                         };
                         (record, result)
                     });
@@ -953,6 +954,36 @@ fn is_terminal_remote_error(error: &object_store::Error) -> bool {
         }
         _ if crate::retrying_object_store::has_permanent_source(error) => true,
         _ => false,
+    }
+}
+
+/// Emits a WARN each time `operation` is still pending after another
+/// [`REMOTE_SLOW_FLUSH_WARN`], so a stalled SFTP backend produces log lines
+/// while its flushes hang instead of dropping write throughput in silence.
+/// Purely observational: completion, failure, and timeout semantics belong
+/// to the wrapped future and its own deadline.
+async fn warn_while_flush_is_slow<F>(sequence: Sequence, path: String, operation: F) -> F::Output
+where
+    F: Future,
+{
+    tokio::pin!(operation);
+    let started = tokio::time::Instant::now();
+    let mut next_warn = started + REMOTE_SLOW_FLUSH_WARN;
+    loop {
+        tokio::select! {
+            biased;
+            output = &mut operation => return output,
+            _ = tokio::time::sleep_until(next_warn) => {
+                tracing::warn!(
+                    sequence,
+                    path = %path,
+                    elapsed_secs = started.elapsed().as_secs(),
+                    "remote writeback flush operation is still running; the \
+                     storage backend may be stalled"
+                );
+                next_warn += REMOTE_SLOW_FLUSH_WARN;
+            }
+        }
     }
 }
 
@@ -1801,6 +1832,33 @@ mod tests {
             message.contains("timed out"),
             "timeout remains distinguishable from a provider error"
         );
+    }
+
+    /// The stall warner is observability only: an operation crossing several
+    /// warn thresholds still completes with its own output, and a wrapped
+    /// deadline still owns timeout semantics.
+    #[tokio::test(start_paused = true)]
+    async fn slow_flush_warner_is_transparent_to_its_operation() {
+        let output = super::warn_while_flush_is_slow(7, "segments/slow".to_owned(), async {
+            tokio::time::sleep(super::REMOTE_SLOW_FLUSH_WARN * 3).await;
+            42
+        })
+        .await;
+        assert_eq!(output, 42);
+
+        let mutation = record(43, "segments/slow-and-stalled", FenceClass::ImmutableCreate);
+        let error = bounded_remote_operation(
+            &mutation,
+            Duration::from_millis(10),
+            super::warn_while_flush_is_slow(
+                43,
+                mutation.path.clone(),
+                future::pending::<object_store::Result<PutResult>>(),
+            ),
+        )
+        .await
+        .expect_err("the warner must not mask the wrapped operation deadline");
+        assert!(error.to_string().contains("timed out"));
     }
 
     #[tokio::test]

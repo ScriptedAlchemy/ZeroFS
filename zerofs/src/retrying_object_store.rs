@@ -93,11 +93,22 @@ impl RetryingObjectStore {
 
     #[inline]
     fn notify(err: &object_store::Error, duration: Duration) {
-        tracing::info!(
-            "retrying object store operation [error={:?}, delay={:?}]",
-            err,
-            duration
-        );
+        // Retries at the backoff ceiling have been failing for a while;
+        // escalate to WARN so a persistently unhealthy backend is visible in
+        // production logs, where INFO is commonly filtered out.
+        if duration >= Duration::from_secs(1) {
+            tracing::warn!(
+                "retrying object store operation [error={:?}, delay={:?}]",
+                err,
+                duration
+            );
+        } else {
+            tracing::info!(
+                "retrying object store operation [error={:?}, delay={:?}]",
+                err,
+                duration
+            );
+        }
     }
 
     #[inline]
