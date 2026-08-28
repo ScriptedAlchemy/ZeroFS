@@ -1066,6 +1066,17 @@ pub struct WebUIConfig {
     pub(crate) addresses: HashSet<SocketAddr>,
     pub(crate) uid: u32,
     pub(crate) gid: u32,
+    /// Close a 9P WebSocket session that has received no message and
+    /// completed no request for this many seconds. Peers that vanish without
+    /// a clean close (VPN restarts, killed apps) otherwise hold their
+    /// transport-session permits forever and exhaust admission. 0 disables
+    /// the reaper.
+    #[serde(default = "default_webui_p9_idle_timeout_secs")]
+    pub(crate) p9_idle_timeout_secs: u64,
+}
+
+const fn default_webui_p9_idle_timeout_secs() -> u64 {
+    120
 }
 
 fn default_webui_addresses() -> HashSet<SocketAddr> {
@@ -1935,6 +1946,7 @@ impl Settings {
                     addresses: default_webui_addresses(),
                     uid: 1000,
                     gid: 1000,
+                    p9_idle_timeout_secs: default_webui_p9_idle_timeout_secs(),
                 }),
             },
             runtime: None,

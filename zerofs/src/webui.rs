@@ -39,6 +39,9 @@ struct AppState {
     shutdown: CancellationToken,
     ws_drain: TaskTracker,
     accepted_work: P9AcceptedWorkTracker,
+    /// Close a session with no inbound message and no completed request for
+    /// this long; `None` disables the reaper.
+    p9_idle_timeout: Option<std::time::Duration>,
 }
 
 #[cfg(test)]
@@ -78,6 +81,7 @@ pub(crate) fn test_9p_websocket_router(
             shutdown: CancellationToken::new(),
             ws_drain: TaskTracker::new(),
             accepted_work: P9AcceptedWorkTracker::new(),
+            p9_idle_timeout: None,
         },
         connections,
     };
@@ -108,6 +112,25 @@ fn configure_9p_ws(ws: WebSocketUpgrade) -> WebSocketUpgrade {
         .max_frame_size(ninep_proto::P9_MAX_MSIZE as usize)
 }
 
+/// WebSocket close code 1013 "Try Again Later" (RFC 6455 / IANA registry).
+const WS_CLOSE_TRY_AGAIN_LATER: u16 = 1013;
+
+/// Complete the upgrade only to deliver an explicit close frame. Bridge
+/// clients that ignore a non-101 upgrade response would otherwise wait on a
+/// connection the server never speaks on; an accepted-then-closed WebSocket
+/// surfaces the rejection at the transport level and disconnects promptly.
+fn reject_9p_ws(ws: WebSocketUpgrade, reason: String) -> axum::response::Response {
+    configure_9p_ws(ws)
+        .on_upgrade(move |mut socket| async move {
+            let close = WsMessage::Close(Some(axum::extract::ws::CloseFrame {
+                code: WS_CLOSE_TRY_AGAIN_LATER,
+                reason: reason.into(),
+            }));
+            let _ = socket.send(close).await;
+        })
+        .into_response()
+}
+
 async fn ws_9p_upgrade(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
     // Gate before completing the upgrade so a queued client cannot deliver a
     // full WebSocket frame outside the process receive envelope.
@@ -115,7 +138,8 @@ async fn ws_9p_upgrade(ws: WebSocketUpgrade, State(state): State<AppState>) -> i
         Ok(transport) => transport,
         Err(error) => {
             error!("9P WebSocket transport admission failed: {error}");
-            return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+            metrics::counter!("zerofs_p9_ws_admission_rejections_total").increment(1);
+            return reject_9p_ws(ws, error.to_string());
         }
     };
     // Register the session before returning the upgrade response.
@@ -123,6 +147,22 @@ async fn ws_9p_upgrade(ws: WebSocketUpgrade, State(state): State<AppState>) -> i
     configure_9p_ws(ws)
         .on_upgrade(move |socket| handle_9p_ws(socket, state, drain_guard, transport))
         .into_response()
+}
+
+/// Resolves once `last_activity` is at least `idle_timeout` old, re-arming
+/// whenever traffic advances the timestamp. Raced inside `select!` against
+/// the transport reads it polices.
+async fn wait_for_idle_expiry(
+    last_activity: &std::sync::Mutex<tokio::time::Instant>,
+    idle_timeout: std::time::Duration,
+) {
+    loop {
+        let deadline = *last_activity.lock().unwrap() + idle_timeout;
+        if tokio::time::Instant::now() >= deadline {
+            return;
+        }
+        tokio::time::sleep_until(deadline).await;
+    }
 }
 
 async fn handle_9p_ws(
@@ -147,10 +187,19 @@ async fn handle_9p_ws(
 
     let (tx, mut rx) = mpsc::channel::<P9Response>(P9_CHANNEL_SIZE);
 
+    // A dead peer (VPN restart, killed app) never sends a clean close, so
+    // this session would otherwise pin its transport permit forever. Any
+    // received WebSocket message or delivered response counts as life; a
+    // session quiet on both sides past the configured window is reaped.
+    let idle_timeout = state.p9_idle_timeout;
+    let last_activity = Arc::new(std::sync::Mutex::new(tokio::time::Instant::now()));
+    let mut reaped_idle = false;
+
     // Writer task: sends response bytes as WS binary messages
     let (mut ws_tx, mut ws_rx) = socket.split();
     let response_authority_lost = CancellationToken::new();
     let writer_authority_lost = response_authority_lost.clone();
+    let writer_activity = Arc::clone(&last_activity);
 
     // Abort on early exit; normal teardown drains responses for a bounded interval.
     let mut writer = AbortOnDropHandle::new(spawn_named("9p-ws-writer", async move {
@@ -172,21 +221,29 @@ async fn handle_9p_ws(
             {
                 break;
             }
+            *writer_activity.lock().unwrap() = tokio::time::Instant::now();
             drop(admission);
         }
     }));
 
     use futures::StreamExt;
     loop {
-        let receive = match P9GlobalAdmission::shared()
-            .admit_websocket_receive(&state.shutdown)
-            .await
-        {
-            Ok(receive) => receive,
-            Err(error) => {
-                debug!("9P WebSocket receive admission ended: {error}");
+        let admit = P9GlobalAdmission::shared().admit_websocket_receive(&state.shutdown);
+        let receive = tokio::select! {
+            biased;
+            _ = wait_for_idle_expiry(&last_activity, idle_timeout.unwrap_or_default()),
+                if idle_timeout.is_some() =>
+            {
+                reaped_idle = true;
                 break;
             }
+            receive = admit => match receive {
+                Ok(receive) => receive,
+                Err(error) => {
+                    debug!("9P WebSocket receive admission ended: {error}");
+                    break;
+                }
+            },
         };
         let next = tokio::select! {
             biased;
@@ -198,8 +255,17 @@ async fn handle_9p_ws(
                 debug!("9P WebSocket handler closing after serving authority loss");
                 break;
             }
+            _ = wait_for_idle_expiry(&last_activity, idle_timeout.unwrap_or_default()),
+                if idle_timeout.is_some() =>
+            {
+                reaped_idle = true;
+                break;
+            }
             next = ws_rx.next() => next,
         };
+        if matches!(next, Some(Ok(_))) {
+            *last_activity.lock().unwrap() = tokio::time::Instant::now();
+        }
         match next {
             Some(Ok(WsMessage::Binary(data))) => {
                 if let Err(e) = dispatch_9p_frame(
@@ -229,6 +295,15 @@ async fn handle_9p_ws(
             _ => {} // ping/pong/text ignored
         }
         drop(receive);
+    }
+
+    if reaped_idle {
+        metrics::counter!("zerofs_p9_ws_idle_sessions_reaped_total").increment(1);
+        warn!(
+            idle_secs = idle_timeout.unwrap_or_default().as_secs(),
+            "closing 9P WebSocket session with no inbound message or completed \
+             request inside the idle window; releasing its transport permit"
+        );
     }
 
     // Disconnect before awaiting request tasks to block late resource installs.
@@ -325,6 +400,8 @@ pub fn start(
         shutdown: shutdown.clone(),
         ws_drain: ws_drain.clone(),
         accepted_work,
+        p9_idle_timeout: (config.p9_idle_timeout_secs != 0)
+            .then(|| std::time::Duration::from_secs(config.p9_idle_timeout_secs)),
     };
 
     // gRPC-web: wrap tonic service with GrpcWebService + CORS
@@ -447,6 +524,7 @@ mod tests {
                 shutdown: CancellationToken::new(),
                 ws_drain: TaskTracker::new(),
                 accepted_work: P9AcceptedWorkTracker::new(),
+                p9_idle_timeout: None,
             });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -500,6 +578,113 @@ mod tests {
         let _ = server.await;
     }
 
+    async fn ws_handshake(client: &mut tokio::net::TcpStream, address: std::net::SocketAddr) {
+        client
+            .write_all(
+                format!(
+                    "GET /ws/9p HTTP/1.1\r\nHost: {address}\r\nUpgrade: websocket\r\n\
+                     Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+                     Sec-WebSocket-Version: 13\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut handshake = Vec::new();
+        loop {
+            let mut byte = [0];
+            client.read_exact(&mut byte).await.unwrap();
+            handshake.push(byte[0]);
+            if handshake.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+        assert!(handshake.starts_with(b"HTTP/1.1 101"));
+    }
+
+    #[tokio::test]
+    async fn idle_websocket_session_is_reaped_and_finishes_its_handler() {
+        let filesystem = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let ws_drain = TaskTracker::new();
+        let app = Router::new()
+            .route("/ws/9p", get(ws_9p_upgrade))
+            .with_state(AppState {
+                filesystem,
+                lock_manager: Arc::new(FileLockManager::new()),
+                uid: 0,
+                gid: 0,
+                shutdown: CancellationToken::new(),
+                ws_drain: ws_drain.clone(),
+                accepted_work: P9AcceptedWorkTracker::new(),
+                p9_idle_timeout: Some(std::time::Duration::from_millis(100)),
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+        ws_handshake(&mut client, address).await;
+
+        // A session that sends nothing and completes no request must be
+        // closed by the server once the idle window elapses.
+        let mut response = [0; 2];
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.read(&mut response),
+        )
+        .await
+        .expect("idle WebSocket session must be reaped promptly")
+        .unwrap();
+        assert!(
+            read == 0 || response[0] & 0x0f == 0x08,
+            "idle reap produced a non-close WebSocket response: {response:?}"
+        );
+
+        // The handler itself finished, so its drain token (and with it the
+        // transport permit the handler owned) has been released.
+        ws_drain.close();
+        tokio::time::timeout(std::time::Duration::from_secs(5), ws_drain.wait())
+            .await
+            .expect("reaped session must release its drain token");
+        server.abort();
+        let _ = server.await;
+    }
+
+    async fn rejecting_ws_upgrade(ws: WebSocketUpgrade) -> impl IntoResponse {
+        reject_9p_ws(ws, "9P transport capacity exhausted".to_owned())
+    }
+
+    #[tokio::test]
+    async fn admission_rejection_surfaces_as_a_websocket_close_frame() {
+        let app = Router::new().route("/ws/9p", get(rejecting_ws_upgrade));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+        ws_handshake(&mut client, address).await;
+
+        // The rejected session completes the upgrade only to deliver an
+        // explicit close frame, so a bridge client that ignores non-101
+        // responses still observes a prompt transport-level rejection.
+        let mut header = [0; 2];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.read_exact(&mut header),
+        )
+        .await
+        .expect("rejected WebSocket must be closed promptly")
+        .unwrap();
+        assert_eq!(header[0] & 0x0f, 0x08, "expected a close frame");
+        let mut code = [0; 2];
+        client.read_exact(&mut code).await.unwrap();
+        assert_eq!(
+            u16::from_be_bytes(code),
+            WS_CLOSE_TRY_AGAIN_LATER,
+            "close frame must carry the try-again-later code"
+        );
+        server.abort();
+        let _ = server.await;
+    }
+
     /// Browser-runtime smoke test requiring generated wasm output and Node 22.
     #[tokio::test]
     #[ignore]
@@ -514,6 +699,7 @@ mod tests {
                 shutdown: CancellationToken::new(),
                 ws_drain: TaskTracker::new(),
                 accepted_work: P9AcceptedWorkTracker::new(),
+                p9_idle_timeout: None,
             },
             connections: Arc::new(std::sync::Mutex::new(CancellationToken::new())),
             connection_closed: Arc::new(tokio::sync::Notify::new()),
