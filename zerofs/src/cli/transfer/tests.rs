@@ -150,16 +150,8 @@ async fn transfer_clients_negotiate_nine_mibibyte_write_payloads() {
 }
 
 async fn quiesced_fids(client: &Client) -> usize {
-    let mut previous = client.outstanding_fids();
-    for _ in 0..100 {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        let current = client.outstanding_fids();
-        if current == previous {
-            return current;
-        }
-        previous = current;
-    }
-    previous
+    client.wait_for_cleanup().await;
+    client.outstanding_fids()
 }
 
 fn upload_workers(clients: &[Arc<Client>]) -> Vec<UploadWorker> {
