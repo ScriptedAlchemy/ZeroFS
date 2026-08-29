@@ -376,13 +376,13 @@ async fn handle_9p_ws(
 
 /// Largest accepted upload part body. Clients send 8-64 MiB parts; anything
 /// larger is refused with 413 before it is buffered.
-const MAX_UPLOAD_PART_BYTES: usize = 64 * 1024 * 1024;
+const MAX_UPLOAD_PART_BYTES: usize = 16 * 1024 * 1024;
 
 /// Upload part bodies buffered concurrently. Bodies are only read after a
 /// permit is held, so HTTP upload buffering is capped at
-/// `MAX_CONCURRENT_UPLOAD_PARTS * MAX_UPLOAD_PART_BYTES` = 4 * 64 MiB
+/// `MAX_CONCURRENT_UPLOAD_PARTS * MAX_UPLOAD_PART_BYTES` = 16 * 16 MiB
 /// = 256 MiB; further parts wait unbuffered on the socket.
-const MAX_CONCURRENT_UPLOAD_PARTS: usize = 4;
+const MAX_CONCURRENT_UPLOAD_PARTS: usize = 16;
 
 /// Read granularity while re-hashing a committed file server-side.
 const UPLOAD_COMMIT_HASH_CHUNK: u32 = 1024 * 1024;
