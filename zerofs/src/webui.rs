@@ -398,6 +398,14 @@ struct UploadCommitRequest {
     size: u64,
     sha256: String,
     publish_to: Option<String>,
+    /// Staging segments to concatenate into `{path}`, in order, before
+    /// verification. Lets a client upload one file over several parallel
+    /// connections: each segment is written contiguously to its own staging
+    /// file, so the "size == contiguously-written prefix" resume contract
+    /// still holds per segment and survives a restart. Absent for the
+    /// single-stream path, which is unchanged.
+    #[serde(default)]
+    assemble_from: Vec<String>,
 }
 
 fn upload_router() -> Router<AppState> {
@@ -674,6 +682,60 @@ async fn upload_hash_file(
     Ok((offset, hex))
 }
 
+/// Concatenate `segments` into the file at `components`, in order, then
+/// unlink them. The destination is created if absent and truncated by
+/// construction: segments are written from offset 0 upward and the caller
+/// verifies the resulting length and digest before anything is published.
+async fn upload_assemble_segments(
+    fs: &ZeroFS,
+    auth: &AuthContext,
+    creds: &Credentials,
+    components: &[Vec<u8>],
+    segments: &[String],
+) -> Result<(), FsError> {
+    let (dirs, name) = components.split_at(components.len() - 1);
+    let parent = upload_resolve_dir_creating(fs, creds, dirs).await?;
+    let target = match fs.lookup(creds, parent, &name[0]).await {
+        Ok(id) => id,
+        Err(FsError::NotFound) => match fs
+            .create(creds, parent, &name[0], &SetAttributes::default())
+            .await
+        {
+            Ok((id, _)) => id,
+            Err(FsError::Exists) => fs.lookup(creds, parent, &name[0]).await?,
+            Err(error) => return Err(error),
+        },
+        Err(error) => return Err(error),
+    };
+
+    let mut offset: u64 = 0;
+    for segment in segments {
+        let segment_components = upload_path_components(segment.trim_start_matches('/'))
+            .map_err(|_| FsError::InvalidArgument)?;
+        let (segment_dir, segment_file) =
+            upload_resolve_existing(fs, creds, &segment_components).await?;
+        let mut read_at: u64 = 0;
+        loop {
+            let (chunk, eof) = fs
+                .read_file(auth, segment_file, read_at, UPLOAD_COMMIT_HASH_CHUNK)
+                .await?;
+            if !chunk.is_empty() {
+                fs.write_ack(auth, target, offset, &chunk).await?;
+                read_at += chunk.len() as u64;
+                offset += chunk.len() as u64;
+            }
+            if eof {
+                break;
+            }
+        }
+        let segment_name = &segment_components[segment_components.len() - 1];
+        // Best effort: a leftover segment costs space but never correctness,
+        // and failing the commit over it would strand a verified upload.
+        let _ = fs.remove(auth, segment_dir, segment_name).await;
+    }
+    Ok(())
+}
+
 async fn upload_commit(
     State(state): State<AppState>,
     axum::extract::Path(path): axum::extract::Path<String>,
@@ -691,6 +753,19 @@ async fn upload_commit(
     };
     let auth = upload_auth(&state);
     let creds = Credentials::from_auth_context(&auth);
+    if !request.assemble_from.is_empty() {
+        if let Err(error) = upload_assemble_segments(
+            &state.filesystem,
+            &auth,
+            &creds,
+            &components,
+            &request.assemble_from,
+        )
+        .await
+        {
+            return upload_fs_error(error);
+        }
+    }
     let (staging_dir, file) =
         match upload_resolve_existing(&state.filesystem, &creds, &components).await {
             Ok(resolved) => resolved,
@@ -1258,6 +1333,87 @@ mod tests {
             write!(hex, "{byte:02x}").unwrap();
         }
         hex
+    }
+
+    #[tokio::test]
+    async fn upload_assembles_parallel_segments_then_publishes() {
+        use sha2::Digest;
+        let filesystem = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let app = upload_test_router(Arc::clone(&filesystem));
+        // Two segments of one logical file, each uploaded on its own
+        // connection. Segment 1 is written before segment 0 to prove the
+        // order on the wire does not matter — only the commit list does.
+        let seg0 = b"the first half of the file, ".to_vec();
+        let seg1 = b"and the second half of it.".to_vec();
+        let total: Vec<u8> = [seg0.clone(), seg1.clone()].concat();
+
+        let (status, _) = upload_request(
+            &app,
+            "PUT",
+            "/api/v1/upload/staging/big.bin.seg1?offset=0",
+            seg1.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = upload_request(
+            &app,
+            "PUT",
+            "/api/v1/upload/staging/big.bin.seg0?offset=0",
+            seg0.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(&total);
+        let digest = hasher.finalize();
+        let mut sha = String::new();
+        {
+            use std::fmt::Write as _;
+            for byte in digest {
+                write!(sha, "{byte:02x}").unwrap();
+            }
+        }
+
+        let commit = serde_json::json!({
+            "size": total.len(),
+            "sha256": sha,
+            "publish_to": "/published/big.bin",
+            "assemble_from": ["/staging/big.bin.seg0", "/staging/big.bin.seg1"],
+        });
+        let (status, body) = upload_request(
+            &app,
+            "POST",
+            "/api/v1/upload/staging/big.bin/commit",
+            serde_json::to_vec(&commit).unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["verified"], true);
+        assert_eq!(body["size"], total.len() as u64);
+        assert_eq!(body["path"], "/published/big.bin");
+
+        // The assembled bytes are the concatenation in commit-list order,
+        // not upload order.
+        let (status, body) = upload_request(
+            &app,
+            "GET",
+            "/api/v1/upload/published/big.bin/status",
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["size"], total.len() as u64);
+
+        // Segments are cleaned up once folded in.
+        let (status, _) = upload_request(
+            &app,
+            "GET",
+            "/api/v1/upload/staging/big.bin.seg0/status",
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
