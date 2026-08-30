@@ -793,7 +793,7 @@ control_host_transaction() {
   fi
   if [[ -n $previous_release ]]; then
     if [[ -f $deployment_transaction/previous-config ]]; then
-      [[ $previous_release =~ ^releases/[0-9a-f]{12}-[A-Za-z0-9]{6,32}$ ]] || return 1
+      is_canonical_release_target "$previous_release" || return 1
       install -o 100000 -g 100000 -m 0600 \
         "$deployment_transaction/previous-config" "$state_root/$previous_release/zerofs.toml"
       sync -f "$state_root/$previous_release/zerofs.toml"
@@ -827,6 +827,10 @@ control_host_transaction() {
   fi
   rm -rf -- "$deployment_transaction"
   sync -f "$state_root"
+}
+
+is_canonical_release_target() {
+  [[ $1 =~ ^releases/([0-9a-f]{8}|[0-9a-f]{12})-[A-Za-z0-9]{6,32}$ ]]
 }
 
 assert_server_drained() {
@@ -1016,7 +1020,7 @@ previous_config=
 previous_receipt=
 if [[ $dry_run == false && -L $state_root/current ]]; then
   previous_release=$(readlink "$state_root/current")
-  [[ $previous_release =~ ^releases/[0-9a-f]{12}-[A-Za-z0-9]{6,32}$ ]] || {
+  is_canonical_release_target "$previous_release" || {
     echo "current release symlink is not canonical: $previous_release" >&2
     exit 1
   }

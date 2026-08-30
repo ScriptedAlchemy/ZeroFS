@@ -80,6 +80,32 @@ class HostScriptTests(unittest.TestCase):
         self.assertIn("hotpath_profile=%s", source)
         self.assertIn('"$hotpath_profile"', source)
 
+    def test_canonical_release_target_accepts_deployed_legacy_and_current_ids(
+        self,
+    ) -> None:
+        for target in (
+            "releases/fe696057-202608291359",
+            "releases/0123456789ab-cccccccccccccccc",
+        ):
+            with self.subTest(target=target):
+                result = self.run_resource_function(
+                    "is_canonical_release_target", target
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+        for target in (
+            "releases/fe69605-202608291359",
+            "releases/fe6960570-202608291359",
+            "releases/0123456789abc-cccccccccccccccc",
+            "releases/../../escape",
+            "/var/lib/zerofs-lxc/prod-198/releases/fe696057-202608291359",
+        ):
+            with self.subTest(target=target):
+                result = self.run_resource_function(
+                    "is_canonical_release_target", target
+                )
+                self.assertNotEqual(result.returncode, 0)
+
     def test_recover_accepts_an_interrupted_older_release_transaction(self) -> None:
         source = HOST_SCRIPT.read_text()
         functions = source[
