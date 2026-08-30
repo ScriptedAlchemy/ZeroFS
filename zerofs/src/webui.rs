@@ -3,7 +3,7 @@ use crate::fs::ZeroFS;
 use crate::fs::errors::FsError;
 use crate::fs::inode::{Inode, InodeId};
 use crate::fs::permissions::Credentials;
-use crate::fs::types::{AuthContext, SetAttributes};
+use crate::fs::types::{AuthContext, SetAttributes, SetSize};
 use crate::ninep::handler::{NinePHandler, SessionReleaseGuard};
 use crate::ninep::lock_manager::FileLockManager;
 use crate::ninep::server::{
@@ -47,13 +47,13 @@ struct AppState {
     /// Close a session with no inbound message and no completed request for
     /// this long; `None` disables the reaper.
     p9_idle_timeout: Option<std::time::Duration>,
-    /// Caps how many HTTP upload part bodies are buffered in memory at once;
-    /// see [`MAX_CONCURRENT_UPLOAD_PARTS`].
-    upload_permits: Arc<tokio::sync::Semaphore>,
+    /// Caps concurrent filesystem writes made by HTTP uploads; request bodies
+    /// are streamed before they enter this admission boundary.
+    upload_write_permits: Arc<tokio::sync::Semaphore>,
 }
 
-fn upload_permits() -> Arc<tokio::sync::Semaphore> {
-    Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_UPLOAD_PARTS))
+fn upload_write_permits() -> Arc<tokio::sync::Semaphore> {
+    Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_UPLOAD_WRITES))
 }
 
 #[cfg(test)]
@@ -94,7 +94,7 @@ pub(crate) fn test_9p_websocket_router(
             ws_drain: TaskTracker::new(),
             accepted_work: P9AcceptedWorkTracker::new(),
             p9_idle_timeout: None,
-            upload_permits: upload_permits(),
+            upload_write_permits: upload_write_permits(),
         },
         connections,
     };
@@ -352,7 +352,7 @@ async fn handle_9p_ws(
 // Contract (all paths are absolute filesystem paths, `/`-separated, no `.`
 // or `..` components):
 //
-//   PUT  /api/v1/upload/{path}?offset=N     binary body, one part (8-64 MiB)
+//   PUT  /api/v1/upload/{path}?offset=N     binary body, one part (up to 16 MiB)
 //   POST /api/v1/upload/{path}/commit       {"size": N, "sha256": "hex",
 //                                            "publish_to": "path"?}
 //   GET  /api/v1/upload/{path}/status       {"size": N}
@@ -374,15 +374,18 @@ async fn handle_9p_ws(
 // `rename` (the fs layer's atomic-promote primitive); without it the file is
 // verified in place.
 
-/// Largest accepted upload part body. Clients send 8-64 MiB parts; anything
-/// larger is refused with 413 before it is buffered.
+/// Largest accepted upload part body. Clients send parts up to 16 MiB;
+/// anything larger is refused with 413 while it is streamed.
 const MAX_UPLOAD_PART_BYTES: usize = 16 * 1024 * 1024;
 
-/// Upload part bodies buffered concurrently. Bodies are only read after a
-/// permit is held, so HTTP upload buffering is capped at
-/// `MAX_CONCURRENT_UPLOAD_PARTS * MAX_UPLOAD_PART_BYTES` = 16 * 16 MiB
-/// = 256 MiB; further parts wait unbuffered on the socket.
-const MAX_CONCURRENT_UPLOAD_PARTS: usize = 16;
+/// Concurrent filesystem writes made by HTTP uploads. A slow or abandoned
+/// request body must not consume one of these permits; admission happens only
+/// around each bounded `write_ack` call.
+const MAX_CONCURRENT_UPLOAD_WRITES: usize = 16;
+
+/// Maximum body data copied into one filesystem write. This bounds the extra
+/// per-request buffer without tying write admission to network read latency.
+const UPLOAD_STREAM_WRITE_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 
 /// Read granularity while re-hashing a committed file server-side.
 const UPLOAD_COMMIT_HASH_CHUNK: u32 = 1024 * 1024;
@@ -521,49 +524,39 @@ async fn upload_visible_file_size(fs: &ZeroFS, id: InodeId) -> Result<u64, FsErr
     }
 }
 
-fn body_hit_length_limit(error: &axum::Error) -> bool {
-    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
-    while let Some(inner) = source {
-        if inner.is::<http_body_util::LengthLimitError>() {
-            return true;
-        }
-        source = inner.source();
-    }
-    false
+async fn upload_write_admitted(
+    state: &AppState,
+    auth: &AuthContext,
+    file: InodeId,
+    offset: u64,
+    data: &bytes::Bytes,
+) -> Result<u64, FsError> {
+    let _permit = state
+        .upload_write_permits
+        .acquire()
+        .await
+        .expect("upload write semaphore is never closed");
+    // Same RAM-ack seam 9P Twrite lands on (`write_ack` forwards to
+    // `write_ack_identified`, the path `NinePHandler::write` uses).
+    Ok(state
+        .filesystem
+        .write_ack(auth, file, offset, data)
+        .await?
+        .size)
 }
 
 async fn upload_part(
     State(state): State<AppState>,
     axum::extract::Path(path): axum::extract::Path<String>,
     axum::extract::Query(query): axum::extract::Query<UploadPartQuery>,
-    body: axum::body::Body,
+    mut body: axum::body::Body,
 ) -> axum::response::Response {
+    use http_body_util::BodyExt as _;
+
     let components = match upload_path_components(&path) {
         Ok(components) => components,
         Err(message) => return upload_error(StatusCode::BAD_REQUEST, message),
     };
-
-    // Admission before buffering: at most MAX_CONCURRENT_UPLOAD_PARTS bodies
-    // are ever resident; later parts wait here without consuming memory.
-    let _permit = state
-        .upload_permits
-        .acquire()
-        .await
-        .expect("upload semaphore is never closed");
-    let data = match axum::body::to_bytes(body, MAX_UPLOAD_PART_BYTES).await {
-        Ok(data) => data,
-        Err(error) if body_hit_length_limit(&error) => {
-            return upload_error(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "part body exceeds the 64 MiB part limit",
-            );
-        }
-        Err(_) => return upload_error(StatusCode::BAD_REQUEST, "failed to read request body"),
-    };
-    let Some(end_offset) = query.offset.checked_add(data.len() as u64) else {
-        return upload_error(StatusCode::BAD_REQUEST, "offset + length overflows");
-    };
-    let _ = end_offset;
 
     let auth = upload_auth(&state);
     let creds = Credentials::from_auth_context(&auth);
@@ -613,19 +606,68 @@ async fn upload_part(
         );
     }
 
-    // Same RAM-ack seam 9P Twrite lands on (`write_ack` forwards to
-    // `write_ack_identified`, the path `NinePHandler::write` uses).
-    let attrs = match state
-        .filesystem
-        .write_ack(&auth, file, query.offset, &data)
-        .await
-    {
-        Ok(attrs) => attrs,
-        Err(error) => return upload_fs_error(error),
-    };
+    let mut buffered = bytes::BytesMut::with_capacity(UPLOAD_STREAM_WRITE_CHUNK_BYTES);
+    let mut received = 0usize;
+    let mut write_offset = query.offset;
+    let mut final_size = current_size;
+
+    while let Some(frame) = body.frame().await {
+        let frame = match frame {
+            Ok(frame) => frame,
+            Err(_) => return upload_error(StatusCode::BAD_REQUEST, "failed to read request body"),
+        };
+        let Ok(data) = frame.into_data() else {
+            continue;
+        };
+        let Some(next_received) = received.checked_add(data.len()) else {
+            return upload_error(StatusCode::PAYLOAD_TOO_LARGE, "part body is too large");
+        };
+        if next_received > MAX_UPLOAD_PART_BYTES {
+            return upload_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "part body exceeds the 16 MiB part limit",
+            );
+        }
+        received = next_received;
+
+        let mut remaining = data.as_ref();
+        while !remaining.is_empty() {
+            let take = remaining
+                .len()
+                .min(UPLOAD_STREAM_WRITE_CHUNK_BYTES - buffered.len());
+            buffered.extend_from_slice(&remaining[..take]);
+            remaining = &remaining[take..];
+            if buffered.len() == UPLOAD_STREAM_WRITE_CHUNK_BYTES {
+                let Some(next_offset) = write_offset.checked_add(buffered.len() as u64) else {
+                    return upload_error(StatusCode::BAD_REQUEST, "offset + length overflows");
+                };
+                let write_data = buffered.split().freeze();
+                final_size =
+                    match upload_write_admitted(&state, &auth, file, write_offset, &write_data)
+                        .await
+                    {
+                        Ok(size) => size,
+                        Err(error) => return upload_fs_error(error),
+                    };
+                write_offset = next_offset;
+            }
+        }
+    }
+
+    if !buffered.is_empty() {
+        if write_offset.checked_add(buffered.len() as u64).is_none() {
+            return upload_error(StatusCode::BAD_REQUEST, "offset + length overflows");
+        }
+        let write_data = buffered.freeze();
+        final_size =
+            match upload_write_admitted(&state, &auth, file, write_offset, &write_data).await {
+                Ok(size) => size,
+                Err(error) => return upload_fs_error(error),
+            };
+    }
     metrics::counter!("zerofs_http_upload_parts_total").increment(1);
-    metrics::counter!("zerofs_http_upload_bytes_total").increment(data.len() as u64);
-    upload_json(StatusCode::OK, serde_json::json!({ "size": attrs.size }))
+    metrics::counter!("zerofs_http_upload_bytes_total").increment(received as u64);
+    upload_json(StatusCode::OK, serde_json::json!({ "size": final_size }))
 }
 
 async fn upload_status(
@@ -682,19 +724,30 @@ async fn upload_hash_file(
     Ok((offset, hex))
 }
 
-/// Concatenate `segments` into the file at `components`, in order, then
-/// unlink them. The destination is created if absent and truncated by
-/// construction: segments are written from offset 0 upward and the caller
-/// verifies the resulting length and digest before anything is published.
+/// Concatenate `segments` into a freshly truncated file at `components`, in
+/// order. Every source is resolved before the destination is modified, and
+/// sources remain available until the caller verifies and publishes the
+/// result so a failed commit can be retried.
 async fn upload_assemble_segments(
     fs: &ZeroFS,
     auth: &AuthContext,
     creds: &Credentials,
     components: &[Vec<u8>],
     segments: &[String],
-) -> Result<(), FsError> {
+) -> Result<Vec<(InodeId, InodeId, Vec<u8>)>, FsError> {
     let (dirs, name) = components.split_at(components.len() - 1);
     let parent = upload_resolve_dir_creating(fs, creds, dirs).await?;
+
+    let mut resolved_segments = Vec::with_capacity(segments.len());
+    for segment in segments {
+        let segment_components = upload_path_components(segment.trim_start_matches('/'))
+            .map_err(|_| FsError::InvalidArgument)?;
+        let (segment_dir, segment_file) =
+            upload_resolve_existing(fs, creds, &segment_components).await?;
+        let segment_name = segment_components[segment_components.len() - 1].clone();
+        resolved_segments.push((segment_dir, segment_file, segment_name));
+    }
+
     let target = match fs.lookup(creds, parent, &name[0]).await {
         Ok(id) => id,
         Err(FsError::NotFound) => match fs
@@ -707,17 +760,28 @@ async fn upload_assemble_segments(
         },
         Err(error) => return Err(error),
     };
+    if resolved_segments
+        .iter()
+        .any(|(_, segment_file, _)| *segment_file == target)
+    {
+        return Err(FsError::InvalidArgument);
+    }
+    fs.setattr(
+        creds,
+        target,
+        &SetAttributes {
+            size: SetSize::Set(0),
+            ..SetAttributes::default()
+        },
+    )
+    .await?;
 
     let mut offset: u64 = 0;
-    for segment in segments {
-        let segment_components = upload_path_components(segment.trim_start_matches('/'))
-            .map_err(|_| FsError::InvalidArgument)?;
-        let (segment_dir, segment_file) =
-            upload_resolve_existing(fs, creds, &segment_components).await?;
+    for (_, segment_file, _) in &resolved_segments {
         let mut read_at: u64 = 0;
         loop {
             let (chunk, eof) = fs
-                .read_file(auth, segment_file, read_at, UPLOAD_COMMIT_HASH_CHUNK)
+                .read_file(auth, *segment_file, read_at, UPLOAD_COMMIT_HASH_CHUNK)
                 .await?;
             if !chunk.is_empty() {
                 fs.write_ack(auth, target, offset, &chunk).await?;
@@ -728,12 +792,8 @@ async fn upload_assemble_segments(
                 break;
             }
         }
-        let segment_name = &segment_components[segment_components.len() - 1];
-        // Best effort: a leftover segment costs space but never correctness,
-        // and failing the commit over it would strand a verified upload.
-        let _ = fs.remove(auth, segment_dir, segment_name).await;
     }
-    Ok(())
+    Ok(resolved_segments)
 }
 
 async fn upload_commit(
@@ -753,8 +813,10 @@ async fn upload_commit(
     };
     let auth = upload_auth(&state);
     let creds = Credentials::from_auth_context(&auth);
-    if !request.assemble_from.is_empty() {
-        if let Err(error) = upload_assemble_segments(
+    let assembled_segments = if request.assemble_from.is_empty() {
+        Vec::new()
+    } else {
+        match upload_assemble_segments(
             &state.filesystem,
             &auth,
             &creds,
@@ -763,9 +825,10 @@ async fn upload_commit(
         )
         .await
         {
-            return upload_fs_error(error);
+            Ok(segments) => segments,
+            Err(error) => return upload_fs_error(error),
         }
-    }
+    };
     let (staging_dir, file) =
         match upload_resolve_existing(&state.filesystem, &creds, &components).await {
             Ok(resolved) => resolved,
@@ -839,6 +902,25 @@ async fn upload_commit(
             return upload_fs_error(error);
         }
         final_path = format!("/{}", publish_to.trim_start_matches('/'));
+    }
+
+    for (segment_dir, segment_file, segment_name) in assembled_segments {
+        // The committed target is already verified and durable. A failed
+        // cleanup only leaves an independently named staging object behind.
+        // Re-check the inode so a concurrent replacement or a publish onto a
+        // segment's old path cannot be unlinked by stale cleanup metadata.
+        if matches!(
+            state
+                .filesystem
+                .lookup(&creds, segment_dir, &segment_name)
+                .await,
+            Ok(current) if current == segment_file
+        ) {
+            let _ = state
+                .filesystem
+                .remove(&auth, segment_dir, &segment_name)
+                .await;
+        }
     }
 
     metrics::counter!("zerofs_http_upload_commits_total").increment(1);
@@ -933,7 +1015,7 @@ pub fn start(
         accepted_work,
         p9_idle_timeout: (config.p9_idle_timeout_secs != 0)
             .then(|| std::time::Duration::from_secs(config.p9_idle_timeout_secs)),
-        upload_permits: upload_permits(),
+        upload_write_permits: upload_write_permits(),
     };
 
     // gRPC-web: wrap tonic service with GrpcWebService + CORS
@@ -1059,7 +1141,7 @@ mod tests {
                 ws_drain: TaskTracker::new(),
                 accepted_work: P9AcceptedWorkTracker::new(),
                 p9_idle_timeout: None,
-                upload_permits: upload_permits(),
+                upload_write_permits: upload_write_permits(),
             });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -1152,7 +1234,7 @@ mod tests {
                 ws_drain: ws_drain.clone(),
                 accepted_work: P9AcceptedWorkTracker::new(),
                 p9_idle_timeout: Some(std::time::Duration::from_millis(100)),
-                upload_permits: upload_permits(),
+                upload_write_permits: upload_write_permits(),
             });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -1236,7 +1318,7 @@ mod tests {
                 ws_drain: TaskTracker::new(),
                 accepted_work: P9AcceptedWorkTracker::new(),
                 p9_idle_timeout: None,
-                upload_permits: upload_permits(),
+                upload_write_permits: upload_write_permits(),
             },
             connections: Arc::new(std::sync::Mutex::new(CancellationToken::new())),
             connection_closed: Arc::new(tokio::sync::Notify::new()),
@@ -1276,6 +1358,13 @@ mod tests {
     }
 
     fn upload_test_router(filesystem: Arc<ZeroFS>) -> Router {
+        upload_test_router_with_permits(filesystem, upload_write_permits())
+    }
+
+    fn upload_test_router_with_permits(
+        filesystem: Arc<ZeroFS>,
+        upload_write_permits: Arc<tokio::sync::Semaphore>,
+    ) -> Router {
         Router::new().merge(upload_router()).with_state(AppState {
             filesystem,
             lock_manager: Arc::new(FileLockManager::new()),
@@ -1285,7 +1374,7 @@ mod tests {
             ws_drain: TaskTracker::new(),
             accepted_work: P9AcceptedWorkTracker::new(),
             p9_idle_timeout: None,
-            upload_permits: upload_permits(),
+            upload_write_permits,
         })
     }
 
@@ -1333,6 +1422,65 @@ mod tests {
             write!(hex, "{byte:02x}").unwrap();
         }
         hex
+    }
+
+    #[tokio::test]
+    async fn stalled_request_bodies_do_not_block_a_ready_upload() {
+        use tower::ServiceExt;
+
+        let filesystem = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let permits = upload_write_permits();
+        let app = upload_test_router_with_permits(filesystem, Arc::clone(&permits));
+        let bodies_polled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut stalled = Vec::new();
+
+        for index in 0..MAX_CONCURRENT_UPLOAD_WRITES {
+            let bodies_polled = Arc::clone(&bodies_polled);
+            let first_chunk = futures::stream::once(async {
+                Ok::<bytes::Bytes, std::convert::Infallible>(bytes::Bytes::from_static(b"partial"))
+            });
+            let stalled_tail = futures::stream::once(async move {
+                bodies_polled.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                futures::future::pending::<()>().await;
+                Ok::<bytes::Bytes, std::convert::Infallible>(bytes::Bytes::new())
+            });
+            let stream = futures::StreamExt::chain(first_chunk, stalled_tail);
+            let request = axum::http::Request::builder()
+                .method("PUT")
+                .uri(format!("/api/v1/upload/stalled/{index}.bin?offset=0"))
+                .header("content-type", "application/octet-stream")
+                .body(axum::body::Body::from_stream(stream))
+                .unwrap();
+            let service = app.clone();
+            stalled.push(tokio::spawn(async move { service.oneshot(request).await }));
+        }
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while bodies_polled.load(std::sync::atomic::Ordering::SeqCst)
+                != MAX_CONCURRENT_UPLOAD_WRITES
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("every stalled request body must be polled");
+
+        let ready = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            upload_request(
+                &app,
+                "PUT",
+                "/api/v1/upload/ready.bin?offset=0",
+                b"ready".to_vec(),
+            ),
+        )
+        .await
+        .expect("slow request bodies must not monopolize write admission");
+        assert_eq!(ready.0, StatusCode::OK, "{}", ready.1);
+
+        for task in stalled {
+            task.abort();
+        }
     }
 
     #[tokio::test]
@@ -1414,6 +1562,180 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn upload_segment_assembly_replaces_a_longer_staging_file() {
+        let filesystem = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let app = upload_test_router(Arc::clone(&filesystem));
+        let replacement = b"short replacement".to_vec();
+
+        let (status, body) = upload_request(
+            &app,
+            "PUT",
+            "/api/v1/upload/staging/target.bin?offset=0",
+            b"an older staging value with a long stale tail".to_vec(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = upload_request(
+            &app,
+            "PUT",
+            "/api/v1/upload/staging/target.bin.segment?offset=0",
+            replacement.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let commit = serde_json::json!({
+            "size": replacement.len(),
+            "sha256": sha256_hex(&replacement),
+            "assemble_from": ["/staging/target.bin.segment"],
+        });
+        let (status, body) = upload_request(
+            &app,
+            "POST",
+            "/api/v1/upload/staging/target.bin/commit",
+            serde_json::to_vec(&commit).unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["size"], replacement.len() as u64);
+
+        let auth = AuthContext::default();
+        let creds = Credentials::from_auth_context(&auth);
+        let (_, target) = upload_resolve_existing(
+            &filesystem,
+            &creds,
+            &upload_path_components("staging/target.bin").unwrap(),
+        )
+        .await
+        .unwrap();
+        let (contents, eof) = filesystem.read_file(&auth, target, 0, 1024).await.unwrap();
+        assert!(eof);
+        assert_eq!(contents.as_ref(), replacement.as_slice());
+    }
+
+    #[tokio::test]
+    async fn failed_segment_assembly_preserves_every_source_segment() {
+        let filesystem = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let app = upload_test_router(filesystem);
+        let segment = b"retryable segment".to_vec();
+        let (status, body) = upload_request(
+            &app,
+            "PUT",
+            "/api/v1/upload/staging/retry.segment0?offset=0",
+            segment.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let commit = serde_json::json!({
+            "size": segment.len(),
+            "sha256": sha256_hex(&segment),
+            "assemble_from": [
+                "/staging/retry.segment0",
+                "/staging/missing.segment1"
+            ],
+        });
+        let (status, _) = upload_request(
+            &app,
+            "POST",
+            "/api/v1/upload/staging/retry.bin/commit",
+            serde_json::to_vec(&commit).unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (status, body) = upload_request(
+            &app,
+            "GET",
+            "/api/v1/upload/staging/retry.segment0/status",
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["size"], segment.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn failed_segment_verification_preserves_sources_for_retry() {
+        let filesystem = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let app = upload_test_router(filesystem);
+        let segment = b"complete but not verified".to_vec();
+        let (status, body) = upload_request(
+            &app,
+            "PUT",
+            "/api/v1/upload/staging/verify.segment?offset=0",
+            segment.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let commit = serde_json::json!({
+            "size": segment.len(),
+            "sha256": "0".repeat(64),
+            "assemble_from": ["/staging/verify.segment"],
+        });
+        let (status, body) = upload_request(
+            &app,
+            "POST",
+            "/api/v1/upload/staging/verify.bin/commit",
+            serde_json::to_vec(&commit).unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+
+        let (status, body) = upload_request(
+            &app,
+            "GET",
+            "/api/v1/upload/staging/verify.segment/status",
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["size"], segment.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn segment_cleanup_does_not_remove_publish_destination() {
+        let filesystem = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let app = upload_test_router(filesystem);
+        let segment = b"published over its source path".to_vec();
+        let (status, body) = upload_request(
+            &app,
+            "PUT",
+            "/api/v1/upload/staging/publish.segment?offset=0",
+            segment.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let commit = serde_json::json!({
+            "size": segment.len(),
+            "sha256": sha256_hex(&segment),
+            "assemble_from": ["/staging/publish.segment"],
+            "publish_to": "/staging/publish.segment",
+        });
+        let (status, body) = upload_request(
+            &app,
+            "POST",
+            "/api/v1/upload/staging/publish.target/commit",
+            serde_json::to_vec(&commit).unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["path"], "/staging/publish.segment");
+
+        let (status, body) = upload_request(
+            &app,
+            "GET",
+            "/api/v1/upload/staging/publish.segment/status",
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["size"], segment.len() as u64);
     }
 
     #[tokio::test]
