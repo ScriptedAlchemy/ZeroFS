@@ -106,6 +106,52 @@ class HostScriptTests(unittest.TestCase):
                 )
                 self.assertNotEqual(result.returncode, 0)
 
+    def test_previous_release_receipt_allows_only_missing_legacy_receipt(
+        self,
+    ) -> None:
+        source = HOST_SCRIPT.read_text()
+        functions = source[
+            source.index("config_value() {") : source.index(
+                "assert_server_drained() {"
+            )
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "receipts").mkdir()
+
+            def resolve(target: str) -> subprocess.CompletedProcess[str]:
+                script = (
+                    "set -euo pipefail\n"
+                    + functions
+                    + '\nresolve_previous_release_receipt "$1" "$2"\n'
+                )
+                return subprocess.run(
+                    ["bash", "-c", script, "receipt-test", str(root), target],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+
+            legacy = "releases/fe696057-202608291359"
+            current = "releases/0123456789ab-cccccccccccccccc"
+            result = resolve(legacy)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "")
+
+            result = resolve(current)
+            self.assertNotEqual(result.returncode, 0)
+
+            receipt = root / "receipts" / current.removeprefix("releases/")
+            receipt.write_text("commit=0123456789ab\n")
+            result = resolve(current)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), str(receipt))
+
+            legacy_receipt = root / "receipts" / legacy.removeprefix("releases/")
+            legacy_receipt.symlink_to(root / "missing-receipt")
+            result = resolve(legacy)
+            self.assertNotEqual(result.returncode, 0)
+
     def test_recover_accepts_an_interrupted_older_release_transaction(self) -> None:
         source = HOST_SCRIPT.read_text()
         functions = source[

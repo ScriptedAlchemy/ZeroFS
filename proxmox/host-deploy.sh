@@ -833,6 +833,24 @@ is_canonical_release_target() {
   [[ $1 =~ ^releases/([0-9a-f]{8}|[0-9a-f]{12})-[A-Za-z0-9]{6,32}$ ]]
 }
 
+is_legacy_release_target() {
+  [[ $1 =~ ^releases/[0-9a-f]{8}-[A-Za-z0-9]{6,32}$ ]]
+}
+
+resolve_previous_release_receipt() {
+  local root=$1 target=$2 receipt
+  is_canonical_release_target "$target" || return 1
+  receipt="$root/receipts/${target#releases/}"
+  if [[ -f $receipt && ! -L $receipt ]]; then
+    printf '%s\n' "$receipt"
+    return 0
+  fi
+  if is_legacy_release_target "$target" && [[ ! -e $receipt && ! -L $receipt ]]; then
+    return 0
+  fi
+  return 1
+}
+
 assert_server_drained() {
   ct_running || return 0
   if [[ $dry_run == true ]]; then
@@ -1029,11 +1047,10 @@ if [[ $dry_run == false && -L $state_root/current ]]; then
     echo "current release config is not a canonical regular file" >&2
     exit 1
   }
-  previous_receipt="$state_root/receipts/${previous_release#releases/}"
-  [[ -f $previous_receipt && ! -L $previous_receipt ]] || {
+  if ! previous_receipt=$(resolve_previous_release_receipt "$state_root" "$previous_release"); then
     echo "current release receipt is not a canonical regular file" >&2
     exit 1
-  }
+  fi
 fi
 if [[ $local_durable_upgrade == true ]]; then
   if [[ $dry_run == true ]]; then
