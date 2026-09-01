@@ -140,6 +140,28 @@ pub async fn run_cli() -> Result<()> {
             } => {
                 cli::debug::reseed_writeback_predecessor(config, journal, path, sequence).await?;
             }
+            cli::DebugCommands::AcceptRemoteWritebackBranch {
+                config,
+                journal,
+                expected_remote_sequence,
+                expected_local_sequence,
+                manifest_path,
+                expected_local_sha256,
+                expected_remote_sha256,
+                confirm_abandon_maintenance_tail,
+            } => {
+                cli::debug::accept_remote_writeback_branch(
+                    config,
+                    journal,
+                    expected_remote_sequence,
+                    expected_local_sequence,
+                    manifest_path,
+                    expected_local_sha256,
+                    expected_remote_sha256,
+                    confirm_abandon_maintenance_tail,
+                )
+                .await?;
+            }
         },
         cli::Commands::Checkpoint { subcommand } => match subcommand {
             cli::CheckpointCommands::Create { config, name } => {

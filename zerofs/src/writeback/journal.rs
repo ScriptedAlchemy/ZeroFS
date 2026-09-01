@@ -1340,6 +1340,136 @@ impl Journal {
         Ok(())
     }
 
+    /// Resolve a split-brain manifest create by accepting the already-published
+    /// remote branch and abandoning only the exact local maintenance tail.
+    ///
+    /// This is an offline operator recovery primitive, not a scheduler path.
+    /// [`Journal::open_existing`] holds the journal lock, so a running server
+    /// prevents the caller from reaching this method. The caller must pin both
+    /// payload hashes from independently captured evidence; equal hashes are an
+    /// idempotent retry and do not justify abandonment.
+    pub(crate) fn abandon_divergent_maintenance_tail(
+        &self,
+        expected_remote_seq: Sequence,
+        expected_local_seq: Sequence,
+        expected_manifest_path: &str,
+        expected_local_sha256: [u8; 32],
+        observed_remote_sha256: [u8; 32],
+    ) -> Result<Vec<MutationRecord>> {
+        if expected_local_sha256 == observed_remote_sha256 {
+            bail!("remote manifest matches the local journal payload");
+        }
+        let snapshot = self.snapshot()?;
+        if snapshot.remote_seq != expected_remote_seq || snapshot.local_seq != expected_local_seq {
+            bail!(
+                "writeback watermarks changed: expected remote/local {expected_remote_seq}/{expected_local_seq}, got {}/{}",
+                snapshot.remote_seq,
+                snapshot.local_seq
+            );
+        }
+        let first_sequence = expected_remote_seq
+            .checked_add(1)
+            .context("remote sequence overflow")?;
+        let abandoned = snapshot
+            .records
+            .into_iter()
+            .filter(|record| record.sequence >= first_sequence)
+            .collect::<Vec<_>>();
+        let expected_count = expected_local_seq
+            .checked_sub(expected_remote_seq)
+            .context("local watermark is below remote watermark")?;
+        if abandoned.len() as u64 != expected_count {
+            bail!(
+                "pending tail is not the exact contiguous range {first_sequence}..={expected_local_seq}"
+            );
+        }
+        for (index, record) in abandoned.iter().enumerate() {
+            let expected_sequence = first_sequence
+                .checked_add(index as u64)
+                .context("pending sequence overflow")?;
+            if record.sequence != expected_sequence {
+                bail!(
+                    "pending tail is not contiguous: expected {expected_sequence}, got {}",
+                    record.sequence
+                );
+            }
+        }
+        let manifest = abandoned
+            .first()
+            .context("divergent maintenance tail is empty")?;
+        if manifest.path != expected_manifest_path {
+            bail!(
+                "first pending path changed: expected {expected_manifest_path}, got {}",
+                manifest.path
+            );
+        }
+        match &manifest.kind {
+            MutationKind::Put {
+                mode: MutationMode::Create,
+                payload_sha256,
+                ..
+            } if *payload_sha256 == expected_local_sha256 => {}
+            _ => bail!("first pending mutation is not the expected create-only manifest"),
+        }
+
+        let prefix = snapshot.identity.database_prefix.trim_end_matches('/');
+        let manifest_prefix = format!("{prefix}/manifest/");
+        if !manifest.path.starts_with(&manifest_prefix) || !manifest.path.ends_with(".manifest") {
+            bail!("first pending mutation is outside the manifest namespace");
+        }
+        let compaction_prefix = format!("{prefix}/compactions/");
+        let segment_prefix = format!("{prefix}/segments/");
+        for record in abandoned.iter().skip(1) {
+            let safe = match &record.kind {
+                MutationKind::Put {
+                    mode: MutationMode::Create,
+                    ..
+                } => {
+                    record.path.starts_with(&compaction_prefix)
+                        && record.path.ends_with(".compactions")
+                }
+                MutationKind::Delete => record.path.starts_with(&segment_prefix),
+                _ => false,
+            };
+            if !safe {
+                bail!(
+                    "refusing to abandon non-maintenance mutation {} at sequence {}",
+                    record.path,
+                    record.sequence
+                );
+            }
+        }
+
+        {
+            let _write = self.write_gate.lock();
+            let mut transaction = self
+                .database
+                .begin_write()
+                .context("failed to resolve divergent maintenance tail")?;
+            transaction
+                .set_durability(Durability::Immediate)
+                .context("failed to set divergence recovery durability")?;
+            {
+                let mut meta = transaction
+                    .open_table(META)
+                    .context("failed to open journal metadata for divergence recovery")?;
+                let remote_seq = read_required::<u64>(&meta, REMOTE_SEQ_KEY)?;
+                let local_seq = read_required::<u64>(&meta, LOCAL_SEQ_KEY)?;
+                if remote_seq != expected_remote_seq || local_seq != expected_local_seq {
+                    bail!(
+                        "writeback watermarks changed during recovery: expected remote/local {expected_remote_seq}/{expected_local_seq}, got {remote_seq}/{local_seq}"
+                    );
+                }
+                write_value(&mut meta, REMOTE_SEQ_KEY, &expected_local_seq)?;
+            }
+            transaction
+                .commit()
+                .context("failed to commit divergent maintenance-tail recovery")?;
+        }
+        self.remove_remote_prefix(expected_local_seq)?;
+        Ok(abandoned)
+    }
+
     pub(crate) fn remote_object_etag(
         &self,
         path: &str,
@@ -3422,6 +3552,109 @@ mod tests {
                 elapsed.as_secs_f64(),
             );
         }
+    }
+
+    #[test]
+    fn exact_divergent_maintenance_tail_can_be_abandoned_without_counting_remote_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = open_temp_journal(&temp, "bucket-a");
+        let manifest_payload = b"local manifest branch";
+        let compaction_payload = b"local compaction event";
+        let manifest_path = "zerofs/pilot/manifest/00000000000000000007.manifest";
+        let mut manifest = put_record(1, manifest_path, manifest_payload);
+        manifest.fence = FenceClass::Fence;
+        let mut compaction = put_record(
+            2,
+            "zerofs/pilot/compactions/00000000000000000003.compactions",
+            compaction_payload,
+        );
+        compaction.fence = FenceClass::Fence;
+        journal.commit_put(manifest, manifest_payload).unwrap();
+        journal.commit_put(compaction, compaction_payload).unwrap();
+        journal
+            .commit_metadata(delete_record(
+                3,
+                "zerofs/pilot/segments/20/0000000000000001/0000000000000002",
+            ))
+            .unwrap();
+
+        let abandoned = journal
+            .abandon_divergent_maintenance_tail(
+                0,
+                3,
+                manifest_path,
+                Sha256::digest(manifest_payload).into(),
+                Sha256::digest(b"remote manifest branch").into(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            abandoned
+                .iter()
+                .map(|record| record.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        let progress = journal.progress().unwrap();
+        assert_eq!(progress.local_seq, 3);
+        assert_eq!(progress.remote_seq, 3);
+        assert_eq!(progress.remote_bytes_completed, 0);
+        assert!(journal.snapshot().unwrap().records.is_empty());
+    }
+
+    #[test]
+    fn divergent_tail_recovery_refuses_payload_bearing_segment_create() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = open_temp_journal(&temp, "bucket-a");
+        let manifest_payload = b"local manifest branch";
+        let segment_payload = b"user-bearing immutable segment";
+        let manifest_path = "zerofs/pilot/manifest/00000000000000000007.manifest";
+        let mut manifest = put_record(1, manifest_path, manifest_payload);
+        manifest.fence = FenceClass::Fence;
+        journal.commit_put(manifest, manifest_payload).unwrap();
+        journal
+            .commit_put(
+                put_record(
+                    2,
+                    "zerofs/pilot/segments/20/0000000000000001/0000000000000002",
+                    segment_payload,
+                ),
+                segment_payload,
+            )
+            .unwrap();
+
+        let error = journal
+            .abandon_divergent_maintenance_tail(
+                0,
+                2,
+                manifest_path,
+                Sha256::digest(manifest_payload).into(),
+                Sha256::digest(b"remote manifest branch").into(),
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("non-maintenance mutation"));
+        assert_eq!(journal.progress().unwrap().remote_seq, 0);
+        assert_eq!(journal.snapshot().unwrap().records.len(), 2);
+    }
+
+    #[test]
+    fn divergent_tail_recovery_refuses_equal_manifest_hashes() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = open_temp_journal(&temp, "bucket-a");
+        let manifest_payload = b"same manifest";
+        let manifest_path = "zerofs/pilot/manifest/00000000000000000007.manifest";
+        let mut manifest = put_record(1, manifest_path, manifest_payload);
+        manifest.fence = FenceClass::Fence;
+        journal.commit_put(manifest, manifest_payload).unwrap();
+        let digest = Sha256::digest(manifest_payload).into();
+
+        let error = journal
+            .abandon_divergent_maintenance_tail(0, 1, manifest_path, digest, digest)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("matches the local journal"));
+        assert_eq!(journal.progress().unwrap().remote_seq, 0);
     }
 
     #[test]

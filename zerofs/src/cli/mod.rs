@@ -231,6 +231,31 @@ pub enum DebugCommands {
         #[arg(long)]
         sequence: u64,
     },
+    /// Accept an already-published remote manifest branch and abandon an exact
+    /// conflicting local maintenance tail. The server must be stopped.
+    AcceptRemoteWritebackBranch {
+        #[arg(short, long)]
+        config: PathBuf,
+        /// Exact writeback journal namespace containing journal.redb.
+        #[arg(long)]
+        journal: PathBuf,
+        #[arg(long)]
+        expected_remote_sequence: u64,
+        #[arg(long)]
+        expected_local_sequence: u64,
+        /// Full create-only manifest path reported by the terminal error.
+        #[arg(long)]
+        manifest_path: String,
+        /// SHA-256 of the locally durable manifest payload.
+        #[arg(long)]
+        expected_local_sha256: String,
+        /// Independently captured SHA-256 of the existing remote payload.
+        #[arg(long)]
+        expected_remote_sha256: String,
+        /// Required destructive-action acknowledgement.
+        #[arg(long)]
+        confirm_abandon_maintenance_tail: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -354,7 +379,7 @@ pub(crate) async fn finish_with_sftp_cleanup<T>(
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Commands, NbdCommands};
+    use super::{Cli, Commands, DebugCommands, NbdCommands};
     use clap::Parser;
     use std::path::PathBuf;
 
@@ -389,6 +414,56 @@ mod tests {
         assert_eq!(size, 64 * 1024 * 1024 * 1024);
         assert_eq!(lanes, 4);
         assert_eq!(stripe_size, 256 * 1024);
+    }
+
+    #[test]
+    fn accept_remote_writeback_branch_requires_exact_incident_evidence() {
+        let cli = Cli::try_parse_from([
+            "zerofs",
+            "debug",
+            "accept-remote-writeback-branch",
+            "--config",
+            "/secure/zerofs.toml",
+            "--journal",
+            "/state/writeback/bucket",
+            "--expected-remote-sequence",
+            "1389612",
+            "--expected-local-sequence",
+            "1389615",
+            "--manifest-path",
+            "zerofs-prod/manifest/00000000000000157770.manifest",
+            "--expected-local-sha256",
+            "f999731c449efa7f8fdb16b68977613a1f4b15a61dde40d397a9835d7f29569d",
+            "--expected-remote-sha256",
+            "0f3fbe3ed660257b4977a995673ca01969b9a5ac81c12f1f28b65abc2571167f",
+            "--confirm-abandon-maintenance-tail",
+        ])
+        .unwrap();
+
+        let Commands::Debug {
+            subcommand:
+                DebugCommands::AcceptRemoteWritebackBranch {
+                    config,
+                    journal,
+                    expected_remote_sequence,
+                    expected_local_sequence,
+                    manifest_path,
+                    expected_local_sha256,
+                    expected_remote_sha256,
+                    confirm_abandon_maintenance_tail,
+                },
+        } = cli.command
+        else {
+            panic!("expected accept-remote-writeback-branch command");
+        };
+        assert_eq!(config, PathBuf::from("/secure/zerofs.toml"));
+        assert_eq!(journal, PathBuf::from("/state/writeback/bucket"));
+        assert_eq!(expected_remote_sequence, 1_389_612);
+        assert_eq!(expected_local_sequence, 1_389_615);
+        assert!(manifest_path.ends_with("157770.manifest"));
+        assert!(expected_local_sha256.starts_with("f999"));
+        assert!(expected_remote_sha256.starts_with("0f3f"));
+        assert!(confirm_abandon_maintenance_tail);
     }
 
     #[test]

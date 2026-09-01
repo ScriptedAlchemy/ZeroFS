@@ -9,6 +9,7 @@ use crate::parse_object_store::parse_url_opts;
 use crate::storage_class_object_store::with_storage_class;
 use anyhow::{Context, Result};
 use object_store::ObjectStoreExt;
+use sha2::{Digest, Sha256};
 use slatedb::BlockTransformer;
 use slatedb::config::{DurabilityLevel, ScanOptions};
 use slatedb::object_store::path::Path;
@@ -294,6 +295,114 @@ pub async fn reseed_writeback_predecessor(
     }
     .await;
     finish_with_sftp_cleanup(sftp_pool.as_ref(), "Failed to shut down SFTP pool", result).await
+}
+
+fn parse_sha256(value: &str, label: &str) -> Result<[u8; 32]> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        anyhow::bail!("{label} must be exactly 64 hexadecimal characters");
+    }
+    let mut digest = [0_u8; 32];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        digest[index] = u8::from_str_radix(std::str::from_utf8(pair)?, 16)?;
+    }
+    Ok(digest)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn accept_remote_writeback_branch(
+    config_path: PathBuf,
+    journal_path: PathBuf,
+    expected_remote_sequence: u64,
+    expected_local_sequence: u64,
+    manifest_path: String,
+    expected_local_sha256: String,
+    expected_remote_sha256: String,
+    confirm_abandon_maintenance_tail: bool,
+) -> Result<()> {
+    if !confirm_abandon_maintenance_tail {
+        anyhow::bail!("--confirm-abandon-maintenance-tail is required");
+    }
+    let local_sha256 = parse_sha256(&expected_local_sha256, "local SHA-256")?;
+    let remote_sha256 = parse_sha256(&expected_remote_sha256, "remote SHA-256")?;
+    let settings = Settings::from_file(&config_path)
+        .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
+    if !settings
+        .writeback
+        .as_ref()
+        .is_some_and(|writeback| writeback.enabled)
+    {
+        anyhow::bail!("[writeback] must be enabled in the supplied config");
+    }
+    let env_vars = settings.cloud_provider_env_vars();
+    let crate::parse_object_store::ParsedStore {
+        store: remote,
+        sftp_pool,
+        ..
+    } = parse_url_opts(
+        &settings.storage.url.parse()?,
+        env_vars,
+        settings.sftp.as_ref(),
+    )
+    .await?;
+    let remote = with_storage_class(Arc::from(remote), settings.storage.storage_class.as_deref());
+    let location = Path::parse(&manifest_path).context("invalid divergent manifest path")?;
+    let result: Result<()> = async {
+        let remote_payload = remote
+            .get(&location)
+            .await
+            .with_context(|| format!("failed to read remote manifest {manifest_path}"))?
+            .bytes()
+            .await
+            .with_context(|| format!("failed to collect remote manifest {manifest_path}"))?;
+        let actual_remote_sha256: [u8; 32] = Sha256::digest(&remote_payload).into();
+        if actual_remote_sha256 != remote_sha256 {
+            anyhow::bail!(
+                "remote manifest changed: expected {}, got {}",
+                expected_remote_sha256,
+                hex_sha256(actual_remote_sha256)
+            );
+        }
+        let journal = crate::writeback::journal::Journal::open_existing(&journal_path)
+            .with_context(|| {
+                format!(
+                    "failed to open stopped writeback journal {}",
+                    journal_path.display()
+                )
+            })?;
+        let abandoned = journal.abandon_divergent_maintenance_tail(
+            expected_remote_sequence,
+            expected_local_sequence,
+            &manifest_path,
+            local_sha256,
+            actual_remote_sha256,
+        )?;
+        println!(
+            "accepted_remote_writeback_branch remote_sequence={} local_sequence={} abandoned_operations={} local_sha256={} remote_sha256={}",
+            expected_remote_sequence,
+            expected_local_sequence,
+            abandoned.len(),
+            expected_local_sha256,
+            expected_remote_sha256
+        );
+        for record in abandoned {
+            println!(
+                "abandoned_local_mutation sequence={} path={}",
+                record.sequence, record.path
+            );
+        }
+        Ok(())
+    }
+    .await;
+    finish_with_sftp_cleanup(
+        sftp_pool.as_ref(),
+        "Failed to shut down SFTP pool after writeback branch recovery",
+        result,
+    )
+    .await
+}
+
+fn hex_sha256(digest: [u8; 32]) -> String {
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 #[cfg(test)]
