@@ -238,6 +238,18 @@ pub struct SftpConfig {
     /// TCP session without erroring it. 0 disables the watchdog.
     #[serde(default = "default_sftp_flush_stall_recycle_secs")]
     pub(crate) flush_stall_recycle_secs: u64,
+    /// Auth-stall watchdog: when every SSH dial has been rejected at
+    /// authentication for this many seconds with no successful open in
+    /// between, the pool reloads the identity from disk, rebuilds its
+    /// session factory, force-closes pooled sessions and resets the dial
+    /// backoff, so the next dial starts from clean state. Catches a russh
+    /// client that keeps presenting a key the server has stopped accepting
+    /// even though the same key still works from a fresh process — observed
+    /// live as 21 hours of `public-key authentication rejected` at one dial
+    /// every few seconds, cleared instantly by a service restart. 0 disables
+    /// the watchdog.
+    #[serde(default = "default_sftp_auth_stall_recycle_secs")]
+    pub(crate) auth_stall_recycle_secs: u64,
 }
 
 impl fmt::Debug for SftpConfig {
@@ -309,6 +321,7 @@ impl Default for SftpConfig {
             read_cache_part_size_kib: default_sftp_read_cache_part_size_kib(),
             transport: SftpSshTransport::Russh,
             flush_stall_recycle_secs: default_sftp_flush_stall_recycle_secs(),
+            auth_stall_recycle_secs: default_sftp_auth_stall_recycle_secs(),
         }
     }
 }
@@ -371,6 +384,9 @@ impl SftpConfig {
         if self.flush_stall_recycle_secs != 0 && self.flush_stall_recycle_secs < 30 {
             anyhow::bail!("[sftp] flush_stall_recycle_secs must be 0 (disabled) or at least 30");
         }
+        if self.auth_stall_recycle_secs != 0 && self.auth_stall_recycle_secs < 30 {
+            anyhow::bail!("[sftp] auth_stall_recycle_secs must be 0 (disabled) or at least 30");
+        }
         Ok(())
     }
 
@@ -409,6 +425,14 @@ const fn default_sftp_direction_concurrency() -> usize {
 
 const fn default_sftp_flush_stall_recycle_secs() -> u64 {
     180
+}
+
+const fn default_sftp_auth_stall_recycle_secs() -> u64 {
+    // Long enough that a transient rejection (a key rotation landing, a
+    // server-side auth hiccup) clears on its own backoff; short enough that
+    // a wedged client costs minutes, not the day it cost before this
+    // existed.
+    120
 }
 
 const fn default_sftp_segment_size_mib() -> usize {
@@ -2247,6 +2271,34 @@ mod tests {
     use super::*;
     use std::env;
     use tempfile::NamedTempFile;
+
+    /// The auth-stall watchdog shares the flush watchdog's floor: a window
+    /// under 30 s would re-dial faster than a transient rejection can clear,
+    /// so the only values below 30 that mean anything are 0 (disabled).
+    #[test]
+    fn sftp_auth_stall_recycle_secs_is_zero_or_at_least_thirty() {
+        let mut config = SftpConfig::default();
+        assert!(
+            config.auth_stall_recycle_secs >= 30,
+            "the default must be enabled and above the floor: {}",
+            config.auth_stall_recycle_secs
+        );
+        config.auth_stall_recycle_secs = 10;
+        let error = config
+            .validate()
+            .expect_err("a window under thirty seconds must be rejected")
+            .to_string();
+        assert!(error.contains("auth_stall_recycle_secs"), "{error}");
+        for accepted in [0, 30, 120] {
+            config.auth_stall_recycle_secs = accepted;
+            if let Err(error) = config.validate() {
+                assert!(
+                    !error.to_string().contains("auth_stall_recycle_secs"),
+                    "{accepted} must be accepted: {error}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn test_env_var_expansion() {

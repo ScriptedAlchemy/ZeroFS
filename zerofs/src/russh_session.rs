@@ -342,6 +342,29 @@ impl SessionFactory for RusshSessionFactory {
         SftpBackendNamespace::from_endpoint(&self.endpoint)
     }
 
+    /// Re-run construction: the identity is read from disk again and
+    /// validated, and the new factory retains no client state from this one.
+    /// A file that no longer loads keeps the current factory rather than
+    /// leaving the pool with none; the watchdog logs and tries again next
+    /// window.
+    fn rebuild(&self) -> Option<Arc<dyn SessionFactory>> {
+        match Self::new(
+            self.endpoint.clone(),
+            self.identity_file.clone(),
+            self.known_hosts.clone(),
+        ) {
+            Ok(fresh) => Some(Arc::new(fresh)),
+            Err(error) => {
+                tracing::error!(
+                    %error,
+                    identity_file = %self.identity_file.display(),
+                    "could not rebuild the russh session factory; keeping the current identity"
+                );
+                None
+            }
+        }
+    }
+
     async fn open(
         &self,
         force: CancellationToken,
