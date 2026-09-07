@@ -10,7 +10,7 @@ use crate::block_transformer::ZeroFsBlockTransformer;
 use crate::bucket_identity;
 use crate::cli::finish_with_sftp_cleanup;
 use crate::cli::server::{
-    DatabaseMode, InitResult, SlateDbOpen, build_slatedb, parse_wal_object_store,
+    CleanCacheOwner, DatabaseMode, InitResult, SlateDbOpen, build_slatedb, parse_wal_object_store,
 };
 use crate::config::Settings;
 use crate::db::SlateDbHandle;
@@ -98,6 +98,7 @@ struct DbOpen {
     segment_warm: Option<crate::segment_store::SegmentWarmHook>,
     /// Configured clean-cache share for decoded plaintext extents.
     decoded_extent_memory_bytes: usize,
+    cache_owner: Arc<CleanCacheOwner>,
 }
 
 /// Open database with a reconciled replication tail.
@@ -729,6 +730,7 @@ impl StartupContext {
             cache_metrics,
             parts_cache,
             decoded_extent_memory_bytes,
+            cache_owner,
         } = opened;
 
         if let Some(opening) = self.opening.as_ref() {
@@ -836,6 +838,7 @@ impl StartupContext {
             segment_object_store,
             segment_warm,
             decoded_extent_memory_bytes,
+            cache_owner,
         }))
     }
 }
@@ -917,6 +920,7 @@ impl ReconciledDb {
             segment_object_store,
             segment_warm,
             decoded_extent_memory_bytes,
+            cache_owner,
         } = open;
         // Activation requires the Opening token and a reconciled tail.
         let ownership = match startup.opening.take() {
@@ -1236,6 +1240,7 @@ impl ReconciledDb {
             db_path: actual_db_path,
             db_handle,
             authority,
+            _cache_owner: cache_owner,
         })
     }
 }
