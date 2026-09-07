@@ -2822,7 +2822,7 @@ min_free_gb = 256.0
     }
 
     #[tokio::test]
-    async fn lower_capacity_reopens_real_foyer_and_refetches_pruned_data() {
+    async fn lower_capacity_reclaims_real_partitions_and_reopens_cache() {
         async fn open(root: &StdPath, capacity: usize) -> foyer::HybridCache<u64, Vec<u8>> {
             HybridCacheBuilder::new()
                 .with_name("capacity-prune-test")
