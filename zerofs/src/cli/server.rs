@@ -2846,7 +2846,12 @@ min_free_gb = 256.0
         let root = tempfile::tempdir().unwrap();
         let cache_root = root.path().join("foyer");
         let owner = acquire_clean_cache_owner(root.path()).unwrap();
-        let cache = open(&cache_root, 16 * 1024 * 1024).await;
+        let cache = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            open(&cache_root, 16 * 1024 * 1024),
+        )
+        .await
+        .expect("initial foyer open must remain bounded");
         tokio::time::timeout(std::time::Duration::from_secs(5), cache.close())
             .await
             .expect("initial foyer close must remain bounded")
@@ -2876,19 +2881,27 @@ min_free_gb = 256.0
         drop(high_file);
 
         let _owner = acquire_clean_cache_owner(root.path()).unwrap();
-        let pruned = prune_foyer_partitions(&cache_root, 4 * 1024 * 1024).unwrap();
+        let pruned = prune_foyer_partitions(&cache_root, 8 * 1024 * 1024).unwrap();
         assert!(pruned.removed_files > 0);
         assert!(pruned.allocated_bytes_reclaimed > 0);
-        let cache = open(&cache_root, 4 * 1024 * 1024).await;
+        let cache = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            open(&cache_root, 8 * 1024 * 1024),
+        )
+        .await
+        .expect("resized foyer open must remain bounded");
         let fetch_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counted = fetch_count.clone();
-        let fetched = cache
-            .get_or_fetch(&42, move || async move {
+        let fetched = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            cache.get_or_fetch(&42, move || async move {
                 counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Ok::<_, anyhow::Error>(vec![42; 32])
-            })
-            .await
-            .unwrap();
+            }),
+        )
+        .await
+        .expect("fallback read must remain bounded")
+        .unwrap();
         assert_eq!(fetched.value(), &vec![42; 32]);
         assert_eq!(fetch_count.load(std::sync::atomic::Ordering::Relaxed), 1);
         tokio::time::timeout(std::time::Duration::from_secs(5), cache.close())
