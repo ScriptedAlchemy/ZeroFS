@@ -13,10 +13,12 @@ use crate::ninep::server::{
 use crate::rpc::proto;
 use crate::rpc::server::AdminRpcServer;
 use crate::task::spawn_named;
+use crate::writeback::reservation::WriteAdmissionHealth;
+use crate::writeback::store::WritebackObjectStore;
 use axum::Router;
 use axum::extract::State;
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::IntoResponse;
 use axum::routing::{get, put};
 use ninep_proto::P9_CHANNEL_SIZE;
@@ -50,6 +52,7 @@ struct AppState {
     /// Caps concurrent filesystem writes made by HTTP uploads; request bodies
     /// are streamed before they enter this admission boundary.
     upload_write_permits: Arc<tokio::sync::Semaphore>,
+    writeback: Option<WritebackObjectStore>,
 }
 
 fn upload_write_permits() -> Arc<tokio::sync::Semaphore> {
@@ -95,6 +98,7 @@ pub(crate) fn test_9p_websocket_router(
             accepted_work: P9AcceptedWorkTracker::new(),
             p9_idle_timeout: None,
             upload_write_permits: upload_write_permits(),
+            writeback: None,
         },
         connections,
     };
@@ -436,6 +440,22 @@ fn upload_error(status: StatusCode, message: &str) -> axum::response::Response {
     upload_json(status, serde_json::json!({ "error": message }))
 }
 
+async fn upload_writeback_preflight(
+    writeback: Option<&WritebackObjectStore>,
+) -> Result<(), FsError> {
+    let Some(writeback) = writeback else {
+        return Ok(());
+    };
+    match writeback.write_admission_health().await {
+        Ok(WriteAdmissionHealth::Ready) => Ok(()),
+        Ok(WriteAdmissionHealth::Pressured) => Err(FsError::RetryLater),
+        Err(error) => {
+            warn!(error = %error, "HTTP upload writeback preflight failed");
+            Err(FsError::IoError)
+        }
+    }
+}
+
 fn upload_fs_error(error: FsError) -> axum::response::Response {
     let status = match error {
         FsError::NotFound | FsError::StaleHandle => StatusCode::NOT_FOUND,
@@ -452,7 +472,13 @@ fn upload_fs_error(error: FsError) -> axum::response::Response {
         FsError::RetryLater => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
-    upload_json(status, serde_json::json!({ "error": error.to_string() }))
+    let mut response = upload_json(status, serde_json::json!({ "error": error.to_string() }));
+    if error == FsError::RetryLater {
+        response
+            .headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+    }
+    response
 }
 
 /// Split a wildcard-captured upload path into name components. The fs treats
@@ -552,6 +578,10 @@ async fn upload_part(
     mut body: axum::body::Body,
 ) -> axum::response::Response {
     use http_body_util::BodyExt as _;
+
+    if let Err(error) = upload_writeback_preflight(state.writeback.as_ref()).await {
+        return upload_fs_error(error);
+    }
 
     let components = match upload_path_components(&path) {
         Ok(components) => components,
@@ -801,6 +831,10 @@ async fn upload_commit(
     axum::extract::Path(path): axum::extract::Path<String>,
     axum::extract::Json(request): axum::extract::Json<UploadCommitRequest>,
 ) -> axum::response::Response {
+    if let Err(error) = upload_writeback_preflight(state.writeback.as_ref()).await {
+        return upload_fs_error(error);
+    }
+
     let Some(path) = path.strip_suffix("/commit") else {
         return upload_error(
             StatusCode::NOT_FOUND,
@@ -1003,6 +1037,7 @@ pub fn start(
     rpc_service: AdminRpcServer,
     shutdown: CancellationToken,
     accepted_work: P9AcceptedWorkTracker,
+    writeback: Option<WritebackObjectStore>,
 ) -> Vec<JoinHandle<Result<(), std::io::Error>>> {
     let ws_drain = TaskTracker::new();
     let state = AppState {
@@ -1016,6 +1051,7 @@ pub fn start(
         p9_idle_timeout: (config.p9_idle_timeout_secs != 0)
             .then(|| std::time::Duration::from_secs(config.p9_idle_timeout_secs)),
         upload_write_permits: upload_write_permits(),
+        writeback,
     };
 
     // gRPC-web: wrap tonic service with GrpcWebService + CORS
@@ -1070,8 +1106,13 @@ pub fn start(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::writeback::config::{AckMode, ShutdownFlush, WritebackSettings};
+    use crate::writeback::journal::Journal;
+    use crate::writeback::model::JournalIdentity;
+    use crate::writeback::store::WritebackObjectStore;
     use axum::http::StatusCode;
     use axum::routing::post;
+    use object_store::memory::InMemory;
     use std::process::Stdio;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -1142,6 +1183,7 @@ mod tests {
                 accepted_work: P9AcceptedWorkTracker::new(),
                 p9_idle_timeout: None,
                 upload_write_permits: upload_write_permits(),
+                writeback: None,
             });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -1235,6 +1277,7 @@ mod tests {
                 accepted_work: P9AcceptedWorkTracker::new(),
                 p9_idle_timeout: Some(std::time::Duration::from_millis(100)),
                 upload_write_permits: upload_write_permits(),
+                writeback: None,
             });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -1319,6 +1362,7 @@ mod tests {
                 accepted_work: P9AcceptedWorkTracker::new(),
                 p9_idle_timeout: None,
                 upload_write_permits: upload_write_permits(),
+                writeback: None,
             },
             connections: Arc::new(std::sync::Mutex::new(CancellationToken::new())),
             connection_closed: Arc::new(tokio::sync::Notify::new()),
@@ -1375,7 +1419,66 @@ mod tests {
             accepted_work: P9AcceptedWorkTracker::new(),
             p9_idle_timeout: None,
             upload_write_permits,
+            writeback: None,
         })
+    }
+
+    fn upload_test_router_with_writeback(
+        filesystem: Arc<ZeroFS>,
+        writeback: WritebackObjectStore,
+    ) -> Router {
+        Router::new().merge(upload_router()).with_state(AppState {
+            filesystem,
+            lock_manager: Arc::new(FileLockManager::new()),
+            uid: 0,
+            gid: 0,
+            shutdown: CancellationToken::new(),
+            ws_drain: TaskTracker::new(),
+            accepted_work: P9AcceptedWorkTracker::new(),
+            p9_idle_timeout: None,
+            upload_write_permits: upload_write_permits(),
+            writeback: Some(writeback),
+        })
+    }
+
+    async fn writeback_with_min_free(
+        min_free_bytes: u64,
+    ) -> (WritebackObjectStore, tempfile::TempDir) {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("writeback");
+        let journal = Arc::new(
+            Journal::open(
+                dir.clone(),
+                JournalIdentity {
+                    format_version: 1,
+                    bucket_id: "upload-pressure".to_owned(),
+                    backend_endpoint: "memory://remote".to_owned(),
+                    database_prefix: "zerofs/upload-pressure".to_owned(),
+                    backend_kind: "memory".to_owned(),
+                    encryption_key_identity_sha256: [0x77; 32],
+                },
+            )
+            .unwrap(),
+        );
+        let writeback = WritebackObjectStore::open_paused(
+            Arc::new(InMemory::new()),
+            journal,
+            WritebackSettings {
+                dir,
+                ack_mode: AckMode::Memory,
+                memory_bytes: 1024 * 1024,
+                disk_bytes: 1024 * 1024,
+                min_free_bytes,
+                high_watermark_percent: 95,
+                resume_percent: 85,
+                upload_concurrency: 1,
+                local_concurrency: 1,
+                shutdown_flush: ShutdownFlush::Local,
+            },
+        )
+        .await
+        .unwrap();
+        (writeback, temp)
     }
 
     async fn upload_request(
@@ -1422,6 +1525,85 @@ mod tests {
             write!(hex, "{byte:02x}").unwrap();
         }
         hex
+    }
+
+    #[tokio::test]
+    async fn known_storage_pressure_returns_retryable_upload_response_before_path_work() {
+        let (writeback, _temp) = writeback_with_min_free(u64::MAX).await;
+        let error = upload_writeback_preflight(Some(&writeback))
+            .await
+            .unwrap_err();
+        let response = upload_fs_error(error);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers()[header::RETRY_AFTER],
+            HeaderValue::from_static("1")
+        );
+    }
+
+    #[tokio::test]
+    async fn pressured_upload_routes_reject_before_creating_staging_paths() {
+        use tower::ServiceExt;
+
+        let (writeback, _temp) = writeback_with_min_free(u64::MAX).await;
+        let filesystem = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let app = upload_test_router_with_writeback(Arc::clone(&filesystem), writeback);
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("PUT")
+                    .uri("/api/v1/upload/staging/blocked.bin?offset=0")
+                    .body(axum::body::Body::from("blocked"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/upload/staging/blocked.bin/commit")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(r#"{"size": 0, "sha256": "00"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+
+        let creds = Credentials::from_auth_context(&AuthContext::default());
+        assert!(matches!(
+            upload_resolve_existing(
+                &filesystem,
+                &creds,
+                &upload_path_components("staging/blocked.bin").unwrap(),
+            )
+            .await,
+            Err(FsError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn healthy_writeback_preflight_leaves_uploads_admitted() {
+        let (writeback, _temp) = writeback_with_min_free(1).await;
+        assert!(upload_writeback_preflight(Some(&writeback)).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn closed_writeback_preflight_is_not_retryable_pressure() {
+        let (writeback, _temp) = writeback_with_min_free(1).await;
+        writeback.ssd_admission().close();
+        assert_eq!(
+            upload_writeback_preflight(Some(&writeback))
+                .await
+                .unwrap_err(),
+            FsError::IoError
+        );
     }
 
     #[tokio::test]

@@ -1522,7 +1522,7 @@ pub async fn run_server(
                     dedup: Arc::clone(&fs.dedup),
                     cache_metrics: init_result.cache_metrics.clone(),
                     slatedb_registry,
-                    writeback: writeback_for_metrics,
+                    writeback: writeback_for_metrics.clone(),
                 },
                 prometheus_authority,
                 shutdown.clone(),
@@ -1704,6 +1704,7 @@ pub async fn run_server(
                 webui_rpc_service,
                 shutdown.clone(),
                 p9_accepted_work.clone(),
+                writeback_for_metrics.clone(),
             )
         } else {
             Vec::new()

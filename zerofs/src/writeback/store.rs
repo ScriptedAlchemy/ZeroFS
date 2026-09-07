@@ -18,6 +18,7 @@ use crate::writeback::payload::VerifiedPayload;
 use crate::writeback::remote::{RemoteBarrierError, RemoteScheduler};
 use crate::writeback::reservation::{
     ReservationError, SsdAdmission, SsdReservationRequest, SsdReservationToken,
+    WriteAdmissionHealth,
 };
 use crate::writeback::space_refresher::SpaceRefresher;
 use crate::writeback::space_sample::{PhysicalSpaceSample, PhysicalSpaceSampler};
@@ -394,6 +395,20 @@ impl WritebackObjectStore {
 
     pub(crate) fn ssd_admission(&self) -> &Arc<SsdAdmission> {
         &self.inner.ssd
+    }
+
+    /// Current physical-space health for callers that can decline work before
+    /// starting a mutation. This is advisory and intentionally holds no token.
+    pub(crate) async fn write_admission_health(&self) -> anyhow::Result<WriteAdmissionHealth> {
+        self.inner
+            .remote
+            .check_available()
+            .map_err(|error| anyhow::anyhow!("writeback remote is unavailable: {error}"))?;
+        let sample = self.inner.space.sample().await?;
+        self.inner
+            .ssd
+            .physical_admission_health(sample)
+            .map_err(|error| anyhow::anyhow!("writeback SSD admission is unavailable: {error}"))
     }
 
     async fn reserve_ssd(&self, bytes: u64) -> object_store::Result<SsdReservationToken> {

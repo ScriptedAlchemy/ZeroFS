@@ -156,6 +156,12 @@ struct SsdState {
     pacing: PacingLedger,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WriteAdmissionHealth {
+    Ready,
+    Pressured,
+}
+
 #[derive(Debug)]
 struct SsdWaiter {
     id: u64,
@@ -475,6 +481,31 @@ impl SsdAdmission {
             return Err(error);
         }
         Ok(self.inner.token(request))
+    }
+
+    /// Refresh from a current physical-space sample and classify only whether
+    /// new writes have the configured free-space floor. This takes no token.
+    pub(crate) fn physical_admission_health(
+        &self,
+        sample: PhysicalSpaceSample,
+    ) -> Result<WriteAdmissionHealth, ReservationError> {
+        let mut state = lock(&self.inner.state);
+        self.inner.observe_locked(&mut state, sample)?;
+        if let Some(error) = &state.terminal {
+            return Err(error.clone());
+        }
+        Ok(
+            if physical_headroom(
+                state.available_bytes,
+                state.outstanding_physical_claims,
+                0,
+                self.inner.min_free_bytes,
+            ) {
+                WriteAdmissionHealth::Ready
+            } else {
+                WriteAdmissionHealth::Pressured
+            },
+        )
     }
 
     pub(crate) fn observe_sample(
