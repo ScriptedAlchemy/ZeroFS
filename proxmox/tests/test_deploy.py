@@ -1491,6 +1491,8 @@ with lease:
             lock = directory_path / "coordinator.lock"
             holder_pid_path = directory_path / "holder.pid"
             payload_pid_path = directory_path / "payload.pid"
+            coordinator_log = (directory_path / "coordinator.log").open("w+")
+            self.addCleanup(coordinator_log.close)
             coordinator = subprocess.Popen(
                 [
                     sys.executable,
@@ -1503,23 +1505,27 @@ with lease:
                     directory,
                 ],
                 text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stdout=coordinator_log,
+                stderr=coordinator_log,
                 start_new_session=True,
             )
             deadline = time.monotonic() + 5
             while not holder_pid_path.exists() or not payload_pid_path.exists():
                 if time.monotonic() >= deadline:
                     coordinator.kill()
-                    self.fail("holder and payload did not start")
+                    coordinator.wait(timeout=3)
+                    coordinator_log.seek(0)
+                    self.fail(
+                        "holder and payload did not start; "
+                        f"returncode={coordinator.returncode}; "
+                        f"output={coordinator_log.read()!r}"
+                    )
                 time.sleep(0.02)
             holder_pid = int(holder_pid_path.read_text())
             payload_pid = int(payload_pid_path.read_text())
             coordinator.kill()
             coordinator.wait(timeout=3)
-            assert coordinator.stdout is not None and coordinator.stderr is not None
-            coordinator.stdout.close()
-            coordinator.stderr.close()
+            coordinator_log.close()
             try:
                 deadline = time.monotonic() + 5
                 while time.monotonic() < deadline:
