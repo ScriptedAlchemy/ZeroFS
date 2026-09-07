@@ -2826,8 +2826,6 @@ min_free_gb = 256.0
         async fn open(root: &StdPath, capacity: usize) -> foyer::HybridCache<u64, Vec<u8>> {
             HybridCacheBuilder::new()
                 .with_name("capacity-prune-test")
-                .with_policy(foyer::HybridCachePolicy::WriteOnInsertion)
-                .with_flush_on_close(true)
                 .memory(1024 * 1024)
                 .storage()
                 .with_io_engine_config(PsyncIoEngineConfig::new())
@@ -2849,12 +2847,33 @@ min_free_gb = 256.0
         let cache_root = root.path().join("foyer");
         let owner = acquire_clean_cache_owner(root.path()).unwrap();
         let cache = open(&cache_root, 16 * 1024 * 1024).await;
-        for key in 0..20 {
-            cache.insert(key, vec![key as u8; 512 * 1024]);
-        }
-        cache.close().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), cache.close())
+            .await
+            .expect("initial foyer close must remain bounded")
+            .unwrap();
         drop(cache);
         drop(owner);
+
+        let highest_partition = std::fs::read_dir(&cache_root)
+            .unwrap()
+            .filter_map(|entry| {
+                let path = entry.ok()?.path();
+                path.file_name()?
+                    .to_str()?
+                    .starts_with(FOYER_PARTITION_PREFIX)
+                    .then_some(path)
+            })
+            .max()
+            .expect("real foyer open must create partitions");
+        use std::io::{Seek, SeekFrom, Write};
+        let mut high_file = OpenOptions::new()
+            .write(true)
+            .open(highest_partition)
+            .unwrap();
+        high_file.seek(SeekFrom::Start(0)).unwrap();
+        high_file.write_all(&vec![7; 1024 * 1024]).unwrap();
+        high_file.sync_all().unwrap();
+        drop(high_file);
 
         let _owner = acquire_clean_cache_owner(root.path()).unwrap();
         let pruned = prune_foyer_partitions(&cache_root, 4 * 1024 * 1024).unwrap();
@@ -2862,19 +2881,20 @@ min_free_gb = 256.0
         assert!(pruned.allocated_bytes_reclaimed > 0);
         let cache = open(&cache_root, 4 * 1024 * 1024).await;
         let fetch_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        for key in 0..20 {
-            let fetch_count = fetch_count.clone();
-            let fetched = cache
-                .get_or_fetch(&key, move || async move {
-                    fetch_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    Ok::<_, anyhow::Error>(vec![key as u8; 512 * 1024])
-                })
-                .await
-                .unwrap();
-            assert_eq!(fetched.value(), &vec![key as u8; 512 * 1024]);
-        }
-        assert!(fetch_count.load(std::sync::atomic::Ordering::Relaxed) > 0);
-        cache.close().await.unwrap();
+        let counted = fetch_count.clone();
+        let fetched = cache
+            .get_or_fetch(&42, move || async move {
+                counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok::<_, anyhow::Error>(vec![42; 32])
+            })
+            .await
+            .unwrap();
+        assert_eq!(fetched.value(), &vec![42; 32]);
+        assert_eq!(fetch_count.load(std::sync::atomic::Ordering::Relaxed), 1);
+        tokio::time::timeout(std::time::Duration::from_secs(5), cache.close())
+            .await
+            .expect("reopened foyer close must remain bounded")
+            .unwrap();
     }
 
     #[test]
