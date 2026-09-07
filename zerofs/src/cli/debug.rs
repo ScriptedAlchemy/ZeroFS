@@ -708,7 +708,10 @@ mod tests {
         let reseed_journal_path = temp.path().join("relocated-reseed-journal");
         let predecessor = format!("{prefix_a}/recovery/predecessor");
         remote_b
-            .put(&Path::from(&predecessor), b"remote predecessor".into())
+            .put(
+                &Path::from(predecessor.as_str()),
+                (&b"remote predecessor"[..]).into(),
+            )
             .await
             .unwrap();
         let journal = Journal::open(&reseed_journal_path, identity_a.clone()).unwrap();
@@ -740,7 +743,10 @@ mod tests {
         );
         drop(journal);
         remote_a
-            .put(&Path::from(&predecessor), b"remote predecessor".into())
+            .put(
+                &Path::from(predecessor.as_str()),
+                (&b"remote predecessor"[..]).into(),
+            )
             .await
             .unwrap();
         reseed_writeback_predecessor(
@@ -765,7 +771,10 @@ mod tests {
         let local = b"local manifest";
         let remote = b"remote manifest";
         remote_b
-            .put(&Path::from(&manifest_path), remote.as_slice().into())
+            .put(
+                &Path::from(manifest_path.as_str()),
+                remote.as_slice().into(),
+            )
             .await
             .unwrap();
         let journal = Journal::open(&accept_journal_path, identity_a).unwrap();
@@ -792,7 +801,10 @@ mod tests {
         assert_eq!(journal.read_blob(1).unwrap(), local);
         drop(journal);
         remote_a
-            .put(&Path::from(&manifest_path), remote.as_slice().into())
+            .put(
+                &Path::from(manifest_path.as_str()),
+                remote.as_slice().into(),
+            )
             .await
             .unwrap();
         accept_remote_writeback_branch(
