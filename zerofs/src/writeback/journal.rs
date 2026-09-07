@@ -454,6 +454,44 @@ impl Journal {
         Self::open(root, identity)
     }
 
+    /// Open a stopped journal only after its persisted identity matches the
+    /// configured remote identity. The preliminary read is deliberately
+    /// mutation-free: `open` may normalize or recover journal state.
+    pub(crate) fn open_existing_with_identity(
+        root: impl AsRef<Path>,
+        expected_identity: JournalIdentity,
+    ) -> Result<Self> {
+        let root = root.as_ref().to_path_buf();
+        let actual_identity = Self::read_existing_identity(&root)?;
+        if actual_identity != expected_identity {
+            bail!("writeback journal identity mismatch");
+        }
+        Self::open(root, expected_identity)
+    }
+
+    fn read_existing_identity(root: &Path) -> Result<JournalIdentity> {
+        let database_path = root.join("journal.redb");
+        if !database_path.is_file() {
+            bail!(
+                "writeback journal database does not exist at {}",
+                database_path.display()
+            );
+        }
+        let database = Database::create(&database_path).with_context(|| {
+            format!(
+                "failed to open existing journal database {}",
+                database_path.display()
+            )
+        })?;
+        let read = database
+            .begin_read()
+            .context("failed to read existing journal identity")?;
+        let meta = read
+            .open_table(META)
+            .context("failed to open existing journal metadata")?;
+        read_required::<JournalIdentity>(&meta, IDENTITY_KEY)
+    }
+
     pub(crate) fn open(root: impl AsRef<Path>, expected_identity: JournalIdentity) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
         ensure_journal_root(&root)?;
