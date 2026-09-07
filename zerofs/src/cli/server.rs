@@ -19,6 +19,7 @@ use foyer::{
     BlockEngineConfig, DeviceBuilder, FsDeviceBuilder, HybridCacheBuilder, PsyncIoEngineConfig,
     S3FifoConfig, Spawner,
 };
+use fs4::fs_std::FileExt;
 use futures::stream::{FuturesUnordered, StreamExt};
 use slatedb::admin::AdminBuilder;
 use slatedb::config::GarbageCollectorDirectoryOptions;
@@ -27,7 +28,8 @@ use slatedb::db_cache::foyer_hybrid::FoyerHybridCache;
 use slatedb::object_store::path::Path;
 use slatedb::{BlockTransformer, CompactorBuilder, DbBuilder, DbReader, DbReaderMode};
 use slatedb_common::metrics::DefaultMetricsRecorder;
-use std::path::PathBuf;
+use std::fs::{File, OpenOptions};
+use std::path::{Path as StdPath, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::task::JoinHandle;
@@ -711,6 +713,119 @@ fn foyer_build_error(context: &str, err: foyer::Error) -> anyhow::Error {
     }
 }
 
+const FOYER_PARTITION_PREFIX: &str = "foyer-storage-direct-fs-";
+
+#[derive(Debug)]
+pub(super) struct CleanCacheOwner {
+    _lock: File,
+}
+
+fn acquire_clean_cache_owner(root: &StdPath) -> Result<CleanCacheOwner> {
+    std::fs::create_dir_all(root)
+        .with_context(|| format!("creating clean cache root at {}", root.display()))?;
+    if std::fs::symlink_metadata(root)?.file_type().is_symlink() {
+        anyhow::bail!("clean cache root {} must not be a symlink", root.display());
+    }
+    let lock_path = root.join(".zerofs-clean-cache.lock");
+    let mut options = OpenOptions::new();
+    options.create(true).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let lock = options
+        .open(&lock_path)
+        .with_context(|| format!("opening clean cache ownership lock {}", lock_path.display()))?;
+    if !lock.metadata()?.file_type().is_file() {
+        anyhow::bail!(
+            "clean cache ownership lock {} is not a regular file",
+            lock_path.display()
+        );
+    }
+    if !FileExt::try_lock_exclusive(&lock)
+        .with_context(|| format!("locking clean cache root {}", root.display()))?
+    {
+        anyhow::bail!(
+            "clean cache root {} is already in use by another ZeroFS process; use a unique [cache] dir for each server instance",
+            root.display()
+        );
+    }
+    Ok(CleanCacheOwner { _lock: lock })
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct FoyerPruneResult {
+    removed_files: usize,
+    allocated_bytes_reclaimed: u64,
+}
+
+fn prune_foyer_partitions(root: &StdPath, capacity: usize) -> Result<FoyerPruneResult> {
+    if !root.exists() {
+        return Ok(FoyerPruneResult::default());
+    }
+    if std::fs::symlink_metadata(root)?.file_type().is_symlink() {
+        anyhow::bail!(
+            "foyer cache directory {} must not be a symlink",
+            root.display()
+        );
+    }
+
+    let mut partitions = Vec::new();
+    for entry in std::fs::read_dir(root)
+        .with_context(|| format!("reading foyer cache directory {}", root.display()))?
+    {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(id) = name.strip_prefix(FOYER_PARTITION_PREFIX) else {
+            continue;
+        };
+        if id.len() != 8 || !id.bytes().all(|byte| byte.is_ascii_digit()) {
+            continue;
+        }
+        let metadata = std::fs::symlink_metadata(entry.path())?;
+        if !metadata.file_type().is_file() {
+            anyhow::bail!(
+                "foyer-owned partition {} is not a regular file",
+                entry.path().display()
+            );
+        }
+        let file = File::open(entry.path())?;
+        partitions.push((
+            id.parse::<u32>()?,
+            entry.path(),
+            metadata.len(),
+            file.allocated_size()?,
+        ));
+    }
+    partitions.sort_unstable_by_key(|partition| partition.0);
+    let mut retained_logical_bytes = 0_u64;
+    let mut expected_id = 0_u32;
+    let mut retained = 0;
+    for (id, _, logical, _) in &partitions {
+        let fits = retained_logical_bytes
+            .checked_add(*logical)
+            .is_some_and(|bytes| bytes <= capacity as u64);
+        if *id != expected_id || !fits {
+            break;
+        }
+        retained_logical_bytes += *logical;
+        expected_id += 1;
+        retained += 1;
+    }
+
+    let mut result = FoyerPruneResult::default();
+    for (_, path, _, allocated) in partitions.into_iter().skip(retained).rev() {
+        std::fs::remove_file(&path)
+            .with_context(|| format!("pruning surplus foyer partition {}", path.display()))?;
+        result.removed_files += 1;
+        result.allocated_bytes_reclaimed =
+            result.allocated_bytes_reclaimed.saturating_add(allocated);
+    }
+    Ok(result)
+}
+
 /// Build the foyer hybrid cache used as slatedb's block cache. Shared by the
 /// server open path and the warm-metadata integration test.
 async fn build_block_hybrid(
@@ -875,6 +990,7 @@ pub struct SlateDbOpen {
     /// read-ready plaintext plus its logical location map. This is separate from
     /// the dirty writeback budget.
     pub decoded_extent_memory_bytes: usize,
+    pub(super) cache_owner: Arc<CleanCacheOwner>,
 }
 
 /// Process-wide runtime for cache, database, and GC maintenance.
@@ -932,6 +1048,29 @@ pub async fn build_slatedb(
 
     let total_disk_bytes = (total_disk_cache_gb * 1_000_000_000.0) as usize;
     let (parts_disk_bytes, hybrid_disk_bytes) = split_disk_budget(total_disk_bytes);
+    let cache_owner = Arc::new(acquire_clean_cache_owner(&cache_config.root_folder)?);
+    for (name, root, capacity) in [
+        (
+            "decoded-blocks",
+            cache_config.root_folder.join("hybrid_cache"),
+            hybrid_disk_bytes,
+        ),
+        (
+            "raw-parts",
+            cache_config.root_folder.join("parts_cache"),
+            parts_disk_bytes,
+        ),
+    ] {
+        let pruned = prune_foyer_partitions(&root, capacity)?;
+        if pruned.removed_files > 0 {
+            info!(
+                cache = name,
+                removed_files = pruned.removed_files,
+                allocated_bytes_reclaimed = pruned.allocated_bytes_reclaimed,
+                "Pruned surplus clean-cache partitions before opening Foyer"
+            );
+        }
+    }
     let total_memory_bytes = (total_memory_cache_gb * 1_000_000_000.0) as usize;
     let (parts_memory_bytes, hybrid_memory_bytes, decoded_extent_memory_bytes) =
         split_memory_budget(total_memory_bytes);
@@ -1157,6 +1296,7 @@ pub async fn build_slatedb(
                 cache_metrics: cache_metrics.clone(),
                 parts_cache: parts_cache.clone(),
                 decoded_extent_memory_bytes,
+                cache_owner: cache_owner.clone(),
             })
         }
         DatabaseMode::ReadOnly => {
@@ -1183,6 +1323,7 @@ pub async fn build_slatedb(
                 cache_metrics: cache_metrics.clone(),
                 parts_cache: parts_cache.clone(),
                 decoded_extent_memory_bytes,
+                cache_owner: cache_owner.clone(),
             })
         }
         DatabaseMode::Checkpoint(checkpoint_id) => {
@@ -1210,6 +1351,7 @@ pub async fn build_slatedb(
                 cache_metrics,
                 parts_cache: parts_cache.clone(),
                 decoded_extent_memory_bytes,
+                cache_owner,
             })
         }
     }
@@ -1226,6 +1368,7 @@ pub struct InitResult {
     pub db_handle: SlateDbHandle,
     /// HA authority monitors retained through database close.
     pub authority: Option<crate::replication::AuthoritySupervisor>,
+    pub(super) _cache_owner: Arc<CleanCacheOwner>,
 }
 
 const STARTUP_BANNER: &str = r#"
@@ -1316,6 +1459,7 @@ pub async fn run_server(
     crate::telemetry::send_startup_event(&settings);
 
     let init_result = crate::cli::init::initialize_filesystem(&settings, db_mode).await?;
+    let cache_owner = init_result._cache_owner.clone();
     let writeback_for_shutdown = init_result.writeback.clone();
     let writeback_for_metrics = init_result.writeback.clone();
     let writeback_for_checkpoints = init_result.writeback.clone();
@@ -1325,6 +1469,7 @@ pub async fn run_server(
     let lifecycle_completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let lifecycle_completed_after = std::sync::Arc::clone(&lifecycle_completed);
     let server_result: anyhow::Result<()> = async move {
+        let _cache_owner = cache_owner;
         let prometheus_authority = if let Some(authority_config) = settings
             .prometheus
             .as_ref()
@@ -2534,6 +2679,201 @@ min_free_gb = 256.0
         assert_eq!(tiny.clean_block_threshold, 1);
         assert_eq!(tiny.submit_queue_bytes, 16 * mib);
         assert_eq!(tiny.buffer_pool_bytes, 64 * mib);
+    }
+
+    #[test]
+    fn lowering_foyer_capacity_prunes_only_highest_owned_partitions() {
+        use std::io::Write;
+
+        let root = tempfile::tempdir().unwrap();
+        for id in 0..4 {
+            let path = root.path().join(format!("foyer-storage-direct-fs-{id:08}"));
+            let mut file = std::fs::File::create(path).unwrap();
+            file.write_all(&vec![id as u8; 4096]).unwrap();
+        }
+        std::fs::write(root.path().join("foreign-file"), b"keep").unwrap();
+
+        let result = prune_foyer_partitions(root.path(), 2 * 4096).unwrap();
+
+        assert_eq!(result.removed_files, 2);
+        assert!(result.allocated_bytes_reclaimed >= 2 * 4096);
+        assert!(
+            root.path()
+                .join("foyer-storage-direct-fs-00000000")
+                .exists()
+        );
+        assert!(
+            root.path()
+                .join("foyer-storage-direct-fs-00000001")
+                .exists()
+        );
+        assert!(
+            !root
+                .path()
+                .join("foyer-storage-direct-fs-00000002")
+                .exists()
+        );
+        assert!(
+            !root
+                .path()
+                .join("foyer-storage-direct-fs-00000003")
+                .exists()
+        );
+        assert_eq!(
+            std::fs::read(root.path().join("foreign-file")).unwrap(),
+            b"keep"
+        );
+    }
+
+    #[test]
+    fn foyer_prune_is_noop_when_allocation_is_within_capacity() {
+        let root = tempfile::tempdir().unwrap();
+        for id in 0..2 {
+            let path = root.path().join(format!("foyer-storage-direct-fs-{id:08}"));
+            std::fs::write(path, vec![0; 4096]).unwrap();
+        }
+
+        let result = prune_foyer_partitions(root.path(), 2 * 4096).unwrap();
+
+        assert_eq!(result.removed_files, 0);
+        assert_eq!(result.allocated_bytes_reclaimed, 0);
+    }
+
+    #[test]
+    fn foyer_prune_removes_every_partition_after_an_id_gap() {
+        let root = tempfile::tempdir().unwrap();
+        for id in [0, 2, 3] {
+            let path = root.path().join(format!("foyer-storage-direct-fs-{id:08}"));
+            std::fs::write(path, vec![0; 4096]).unwrap();
+        }
+
+        let result = prune_foyer_partitions(root.path(), 4 * 4096).unwrap();
+
+        assert_eq!(result.removed_files, 2);
+        assert!(
+            root.path()
+                .join("foyer-storage-direct-fs-00000000")
+                .exists()
+        );
+        assert!(
+            !root
+                .path()
+                .join("foyer-storage-direct-fs-00000002")
+                .exists()
+        );
+        assert!(
+            !root
+                .path()
+                .join("foyer-storage-direct-fs-00000003")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn foyer_prune_rejects_symlinked_owned_partition() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let root = tempfile::tempdir().unwrap();
+            let outside = tempfile::NamedTempFile::new().unwrap();
+            symlink(
+                outside.path(),
+                root.path().join("foyer-storage-direct-fs-00000000"),
+            )
+            .unwrap();
+
+            let error = prune_foyer_partitions(root.path(), 0).unwrap_err();
+            assert!(
+                error.to_string().contains("not a regular file"),
+                "{error:#}"
+            );
+            assert!(outside.path().exists());
+        }
+    }
+
+    #[test]
+    fn a_second_clean_cache_owner_is_rejected() {
+        let root = tempfile::tempdir().unwrap();
+        let first = acquire_clean_cache_owner(root.path()).unwrap();
+        let error = acquire_clean_cache_owner(root.path()).unwrap_err();
+        assert!(error.to_string().contains("already in use"), "{error:#}");
+        drop(first);
+        acquire_clean_cache_owner(root.path()).unwrap();
+    }
+
+    #[test]
+    fn clean_cache_owner_rejects_a_symlinked_lock_file() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let root = tempfile::tempdir().unwrap();
+            let outside = tempfile::NamedTempFile::new().unwrap();
+            symlink(outside.path(), root.path().join(".zerofs-clean-cache.lock")).unwrap();
+
+            let error = acquire_clean_cache_owner(root.path()).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("opening clean cache ownership lock"),
+                "{error:#}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn lower_capacity_reopens_real_foyer_and_refetches_pruned_data() {
+        async fn open(root: &StdPath, capacity: usize) -> foyer::HybridCache<u64, Vec<u8>> {
+            HybridCacheBuilder::new()
+                .with_name("capacity-prune-test")
+                .with_policy(foyer::HybridCachePolicy::WriteOnInsertion)
+                .with_flush_on_close(true)
+                .memory(1024 * 1024)
+                .storage()
+                .with_io_engine_config(PsyncIoEngineConfig::new())
+                .with_engine_config(
+                    BlockEngineConfig::new(
+                        FsDeviceBuilder::new(root)
+                            .with_capacity(capacity)
+                            .build()
+                            .unwrap(),
+                    )
+                    .with_block_size(1024 * 1024),
+                )
+                .build()
+                .await
+                .unwrap()
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let cache_root = root.path().join("foyer");
+        let owner = acquire_clean_cache_owner(root.path()).unwrap();
+        let cache = open(&cache_root, 16 * 1024 * 1024).await;
+        for key in 0..20 {
+            cache.insert(key, vec![key as u8; 512 * 1024]);
+        }
+        cache.close().await.unwrap();
+        drop(cache);
+        drop(owner);
+
+        let _owner = acquire_clean_cache_owner(root.path()).unwrap();
+        let pruned = prune_foyer_partitions(&cache_root, 4 * 1024 * 1024).unwrap();
+        assert!(pruned.removed_files > 0);
+        assert!(pruned.allocated_bytes_reclaimed > 0);
+        let cache = open(&cache_root, 4 * 1024 * 1024).await;
+        let fetch_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for key in 0..20 {
+            let fetch_count = fetch_count.clone();
+            let fetched = cache
+                .get_or_fetch(&key, move || async move {
+                    fetch_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Ok::<_, anyhow::Error>(vec![key as u8; 512 * 1024])
+                })
+                .await
+                .unwrap();
+            assert_eq!(fetched.value(), &vec![key as u8; 512 * 1024]);
+        }
+        assert!(fetch_count.load(std::sync::atomic::Ordering::Relaxed) > 0);
+        cache.close().await.unwrap();
     }
 
     #[test]
