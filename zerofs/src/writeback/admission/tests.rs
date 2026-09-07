@@ -17,7 +17,7 @@ async fn reservation_larger_than_the_dirty_ram_budget_fails_immediately() {
 }
 
 use crate::writeback::reservation::{
-    ReservationError, ReservationState, SsdAdmission, SsdReservationRequest,
+    ReservationError, ReservationState, SsdAdmission, SsdReservationRequest, WriteAdmissionHealth,
 };
 use crate::writeback::space_sample::PhysicalSpaceSample;
 
@@ -38,6 +38,29 @@ fn request(ssd: u64, physical: u64, operations: u64) -> SsdReservationRequest {
 
 fn exact_admission() -> SsdAdmission {
     SsdAdmission::new(100, 4, 100, 50, 10).unwrap()
+}
+
+#[test]
+fn fresh_physical_sample_recovers_preflight_health() {
+    let admission = exact_admission();
+    assert_eq!(
+        admission.physical_admission_health(sample(1, 9)).unwrap(),
+        WriteAdmissionHealth::Pressured
+    );
+    assert_eq!(
+        admission.physical_admission_health(sample(2, 10)).unwrap(),
+        WriteAdmissionHealth::Ready
+    );
+}
+
+#[test]
+fn closed_physical_admission_is_not_retryable_pressure() {
+    let admission = exact_admission();
+    admission.close();
+    assert_eq!(
+        admission.physical_admission_health(sample(1, 1_000)),
+        Err(ReservationError::Closed)
+    );
 }
 
 #[tokio::test]
