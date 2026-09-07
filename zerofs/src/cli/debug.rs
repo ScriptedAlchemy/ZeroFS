@@ -604,6 +604,33 @@ mod tests {
         }
     }
 
+    #[test]
+    fn checked_existing_open_never_initializes_missing_journal_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing-journal");
+        let error =
+            Journal::open_existing_with_identity(&missing, recovery_identity()).unwrap_err();
+        assert!(format!("{error:#}").contains("database does not exist"));
+        assert!(!missing.exists(), "missing journal must not be initialized");
+
+        let missing_identity = temp.path().join("missing-identity");
+        fs::create_dir(&missing_identity).unwrap();
+        let database_path = missing_identity.join("journal.redb");
+        drop(redb::Database::create(&database_path).unwrap());
+        #[cfg(unix)]
+        fs::set_permissions(
+            &database_path,
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
+        )
+        .unwrap();
+        let error = Journal::open_existing_with_identity(&missing_identity, recovery_identity())
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("journal metadata"));
+        assert!(!missing_identity.join("LOCK").exists());
+        assert!(!missing_identity.join("blobs").exists());
+        assert!(!missing_identity.join("tmp").exists());
+    }
+
     async fn recovery_config(
         temp: &TempDir,
         namespace: &str,
@@ -679,15 +706,15 @@ mod tests {
             recovery_config(&temp, "b", "b-password").await;
 
         let reseed_journal_path = temp.path().join("relocated-reseed-journal");
-        let predecessor = "recovery/predecessor";
+        let predecessor = format!("{prefix_a}/recovery/predecessor");
         remote_b
-            .put(&Path::from(predecessor), b"remote predecessor".into())
+            .put(&Path::from(&predecessor), b"remote predecessor".into())
             .await
             .unwrap();
         let journal = Journal::open(&reseed_journal_path, identity_a.clone()).unwrap();
         journal
             .commit_put(
-                recovery_put(1, predecessor, b"local predecessor"),
+                recovery_put(1, &predecessor, b"local predecessor"),
                 b"local predecessor",
             )
             .unwrap();
@@ -697,7 +724,7 @@ mod tests {
         let error = reseed_writeback_predecessor(
             config_b.clone(),
             reseed_journal_path.clone(),
-            predecessor.to_owned(),
+            predecessor.clone(),
             1,
         )
         .await
@@ -707,19 +734,19 @@ mod tests {
         assert_eq!(journal.snapshot().unwrap(), reseed_before);
         assert!(
             journal
-                .remote_object_etag(predecessor, 1)
+                .remote_object_etag(&predecessor, 1)
                 .unwrap()
                 .is_none()
         );
         drop(journal);
         remote_a
-            .put(&Path::from(predecessor), b"remote predecessor".into())
+            .put(&Path::from(&predecessor), b"remote predecessor".into())
             .await
             .unwrap();
         reseed_writeback_predecessor(
             config_a.clone(),
             reseed_journal_path.clone(),
-            predecessor.to_owned(),
+            predecessor.clone(),
             1,
         )
         .await
@@ -727,7 +754,7 @@ mod tests {
         let journal = Journal::open_existing(&reseed_journal_path).unwrap();
         assert!(
             journal
-                .remote_object_etag(predecessor, 1)
+                .remote_object_etag(&predecessor, 1)
                 .unwrap()
                 .is_some()
         );
@@ -752,7 +779,7 @@ mod tests {
             accept_journal_path.clone(),
             0,
             1,
-            manifest_path,
+            manifest_path.clone(),
             hex_sha256(Sha256::digest(local).into()),
             hex_sha256(Sha256::digest(remote).into()),
             true,
