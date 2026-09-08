@@ -278,6 +278,13 @@ pub async fn reseed_writeback_predecessor(
             &database_path.to_string(),
         )
         .await?;
+        let metadata = remote
+            .head(&location)
+            .await
+            .with_context(|| format!("failed to inspect remote predecessor {path}"))?;
+        let e_tag = metadata
+            .e_tag
+            .context("remote predecessor has no ETag and cannot be safely reseeded")?;
         let journal = crate::writeback::journal::Journal::open_existing_with_identity(
             &journal_path,
             expected_identity,
@@ -288,13 +295,6 @@ pub async fn reseed_writeback_predecessor(
                 journal_path.display()
             )
         })?;
-        let metadata = remote
-            .head(&location)
-            .await
-            .with_context(|| format!("failed to inspect remote predecessor {path}"))?;
-        let e_tag = metadata
-            .e_tag
-            .context("remote predecessor has no ETag and cannot be safely reseeded")?;
         journal.seed_remote_object_etag(&path, sequence, &e_tag)?;
         println!(
             "seeded_remote_predecessor path={} sequence={} etag={}",
@@ -362,11 +362,6 @@ pub async fn accept_remote_writeback_branch(
             &database_path.to_string(),
         )
         .await?;
-        let journal = crate::writeback::journal::Journal::open_existing_with_identity(
-            &journal_path,
-            expected_identity,
-        )
-        .with_context(|| format!("failed to open stopped writeback journal {}", journal_path.display()))?;
         let remote_payload = remote
             .get(&location)
             .await
@@ -382,6 +377,16 @@ pub async fn accept_remote_writeback_branch(
                 hex_sha256(actual_remote_sha256)
             );
         }
+        let journal = crate::writeback::journal::Journal::open_existing_with_identity(
+            &journal_path,
+            expected_identity,
+        )
+        .with_context(|| {
+            format!(
+                "failed to open stopped writeback journal {}",
+                journal_path.display()
+            )
+        })?;
         let abandoned = journal.abandon_divergent_maintenance_tail(
             expected_remote_sequence,
             expected_local_sequence,
@@ -715,6 +720,75 @@ mod tests {
         let config = temp.path().join(format!("config-{namespace}.toml"));
         fs::write(&config, toml::to_string(&settings).unwrap()).unwrap();
         (config, remote, prefix, identity)
+    }
+
+    #[tokio::test]
+    async fn reseed_rejects_missing_remote_evidence_without_recovering_the_journal() {
+        let temp = tempfile::tempdir().unwrap();
+        let (config, _remote, prefix, identity) = recovery_config(&temp, "a", "a-password").await;
+        let journal_path = temp.path().join("reseed-invalid-evidence-journal");
+        drop(Journal::open(&journal_path, identity).unwrap());
+        fs::write(journal_path.join("tmp/recoverable"), b"must survive").unwrap();
+        let before = stopped_journal_files(&journal_path);
+
+        let error = reseed_writeback_predecessor(
+            config,
+            journal_path.clone(),
+            format!("{prefix}/recovery/missing"),
+            1,
+        )
+        .await
+        .expect_err("missing remote evidence must reject reseed");
+
+        assert!(format!("{error:#}").contains("failed to inspect remote predecessor"));
+        assert!(
+            stopped_journal_files(&journal_path) == before,
+            "invalid remote evidence must not recover or normalize the stopped journal"
+        );
+    }
+
+    #[tokio::test]
+    async fn accept_rejects_wrong_remote_hash_without_recovering_the_journal() {
+        let temp = tempfile::tempdir().unwrap();
+        let (config, remote_store, prefix, identity) =
+            recovery_config(&temp, "a", "a-password").await;
+        let journal_path = temp.path().join("accept-invalid-evidence-journal");
+        let manifest_path = format!("{prefix}/manifest/00000000000000000001.manifest");
+        let local = b"local manifest";
+        let remote = b"remote manifest";
+        remote_store
+            .put(
+                &Path::from(manifest_path.as_str()),
+                remote.as_slice().into(),
+            )
+            .await
+            .unwrap();
+        let journal = Journal::open(&journal_path, identity).unwrap();
+        journal
+            .commit_put(recovery_put(1, &manifest_path, local), local)
+            .unwrap();
+        drop(journal);
+        fs::write(journal_path.join("tmp/recoverable"), b"must survive").unwrap();
+        let before = stopped_journal_files(&journal_path);
+
+        let error = accept_remote_writeback_branch(
+            config,
+            journal_path.clone(),
+            0,
+            1,
+            manifest_path,
+            hex_sha256(Sha256::digest(local).into()),
+            hex_sha256([0; 32]),
+            true,
+        )
+        .await
+        .expect_err("wrong remote digest must reject maintenance-tail acceptance");
+
+        assert!(format!("{error:#}").contains("remote manifest changed"));
+        assert!(
+            stopped_journal_files(&journal_path) == before,
+            "invalid remote evidence must not recover or normalize the stopped journal"
+        );
     }
 
     #[tokio::test]
