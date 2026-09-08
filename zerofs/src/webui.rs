@@ -1,9 +1,9 @@
 use crate::config::WebUIConfig;
-use crate::fs::ZeroFS;
 use crate::fs::errors::FsError;
 use crate::fs::inode::{Inode, InodeId};
 use crate::fs::permissions::Credentials;
 use crate::fs::types::{AuthContext, SetAttributes, SetSize};
+use crate::fs::{VerifiedFileContent, VerifiedFileExpectation, VerifiedRenameOutcome, ZeroFS};
 use crate::ninep::handler::{NinePHandler, SessionReleaseGuard};
 use crate::ninep::lock_manager::FileLockManager;
 use crate::ninep::server::{
@@ -52,11 +52,55 @@ struct AppState {
     /// Caps concurrent filesystem writes made by HTTP uploads; request bodies
     /// are streamed before they enter this admission boundary.
     upload_write_permits: Arc<tokio::sync::Semaphore>,
+    /// Fail-fast request and retained-byte ownership, independent of active
+    /// filesystem write concurrency.
+    upload_ingress: Arc<UploadIngressAdmission>,
     writeback: Option<WritebackObjectStore>,
 }
 
 fn upload_write_permits() -> Arc<tokio::sync::Semaphore> {
     Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_UPLOAD_WRITES))
+}
+
+struct UploadIngressAdmission {
+    requests: Arc<tokio::sync::Semaphore>,
+    bytes: Arc<tokio::sync::Semaphore>,
+}
+
+struct UploadRequestGuard {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+struct UploadBytesGuard {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl UploadIngressAdmission {
+    fn new(requests: usize, bytes: usize) -> Arc<Self> {
+        Arc::new(Self {
+            requests: Arc::new(tokio::sync::Semaphore::new(requests)),
+            bytes: Arc::new(tokio::sync::Semaphore::new(bytes)),
+        })
+    }
+
+    fn try_request(self: &Arc<Self>) -> Result<Arc<UploadRequestGuard>, FsError> {
+        Arc::clone(&self.requests)
+            .try_acquire_owned()
+            .map(|permit| Arc::new(UploadRequestGuard { _permit: permit }))
+            .map_err(|_| FsError::RetryLater)
+    }
+
+    fn try_bytes(self: &Arc<Self>, bytes: usize) -> Result<Arc<UploadBytesGuard>, FsError> {
+        let permits = u32::try_from(bytes).map_err(|_| FsError::RetryLater)?;
+        Arc::clone(&self.bytes)
+            .try_acquire_many_owned(permits)
+            .map(|permit| Arc::new(UploadBytesGuard { _permit: permit }))
+            .map_err(|_| FsError::RetryLater)
+    }
+}
+
+fn upload_ingress() -> Arc<UploadIngressAdmission> {
+    UploadIngressAdmission::new(MAX_UPLOAD_INGRESS_REQUESTS, MAX_UPLOAD_INGRESS_BYTES)
 }
 
 #[cfg(test)]
@@ -98,6 +142,7 @@ pub(crate) fn test_9p_websocket_router(
             accepted_work: P9AcceptedWorkTracker::new(),
             p9_idle_timeout: None,
             upload_write_permits: upload_write_permits(),
+            upload_ingress: upload_ingress(),
             writeback: None,
         },
         connections,
@@ -382,6 +427,10 @@ async fn handle_9p_ws(
 /// anything larger is refused with 413 while it is streamed.
 const MAX_UPLOAD_PART_BYTES: usize = 16 * 1024 * 1024;
 
+/// Upload handlers admitted before body polling or filesystem path creation.
+/// Admission is fail-fast so excess connections do not form a waiter queue.
+const MAX_UPLOAD_INGRESS_REQUESTS: usize = 32;
+
 /// Concurrent filesystem writes made by HTTP uploads. A slow or abandoned
 /// request body must not consume one of these permits; admission happens only
 /// around each bounded `write_ack` call.
@@ -390,6 +439,20 @@ const MAX_CONCURRENT_UPLOAD_WRITES: usize = 16;
 /// Maximum body data copied into one filesystem write. This bounds the extra
 /// per-request buffer without tying write admission to network read latency.
 const UPLOAD_STREAM_WRITE_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+
+/// An accepted Body frame can retain a full part-sized backing allocation
+/// while a copied write chunk is live. Preserve sixteen active writers while
+/// charging that conservative 20 MiB per-frame peak.
+const UPLOAD_FRAME_AND_COPY_BYTES: usize = MAX_UPLOAD_PART_BYTES + UPLOAD_STREAM_WRITE_CHUNK_BYTES;
+const MAX_UPLOAD_INGRESS_BYTES: usize =
+    (MAX_CONCURRENT_UPLOAD_WRITES + 1) * UPLOAD_FRAME_AND_COPY_BYTES;
+
+const UPLOAD_BODY_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const MAX_UPLOAD_COMMIT_BODY_BYTES: usize = 1024 * 1024;
+/// Commit JSON frames, their contiguous parse copy, worst-case Vec<String>
+/// headers and owned string allocations, and one assembly/hash chunk share
+/// this conservative fixed reservation before JSON polling begins.
+const UPLOAD_COMMIT_WORKSPACE_BYTES: usize = 32 * 1024 * 1024;
 
 /// Read granularity while re-hashing a committed file server-side.
 const UPLOAD_COMMIT_HASH_CHUNK: u32 = 1024 * 1024;
@@ -531,13 +594,25 @@ async fn upload_resolve_existing(
     creds: &Credentials,
     components: &[Vec<u8>],
 ) -> Result<(InodeId, InodeId), FsError> {
+    upload_resolve_existing_entry(fs, creds, components)
+        .await
+        .map(|(dir, file, _)| (dir, file))
+}
+
+/// Resolve an existing path and retain the namespace cookie that distinguishes
+/// remove/recreate and same-inode hard-link replacement.
+async fn upload_resolve_existing_entry(
+    fs: &ZeroFS,
+    creds: &Credentials,
+    components: &[Vec<u8>],
+) -> Result<(InodeId, InodeId, u64), FsError> {
     let (dirs, name) = components.split_at(components.len() - 1);
     let mut dir: InodeId = 0;
     for component in dirs {
         dir = fs.lookup(creds, dir, component).await?;
     }
-    let file = fs.lookup(creds, dir, &name[0]).await?;
-    Ok((dir, file))
+    let (file, cookie) = fs.entry_identity(dir, &name[0]).await?;
+    Ok((dir, file, cookie))
 }
 
 /// Overlay-visible size of a regular file (RAM-acked writes included), so an
@@ -550,25 +625,84 @@ async fn upload_visible_file_size(fs: &ZeroFS, id: InodeId) -> Result<u64, FsErr
     }
 }
 
+fn upload_admit_request(
+    state: &AppState,
+) -> Result<Arc<UploadRequestGuard>, axum::response::Response> {
+    if state.shutdown.is_cancelled() {
+        return Err(upload_fs_error(FsError::RetryLater));
+    }
+    state.upload_ingress.try_request().map_err(upload_fs_error)
+}
+
+async fn upload_next_body_data(
+    state: &AppState,
+    body: &mut axum::body::Body,
+) -> Result<Option<bytes::Bytes>, axum::response::Response> {
+    use http_body_util::BodyExt as _;
+
+    let deadline = tokio::time::Instant::now() + UPLOAD_BODY_IDLE_TIMEOUT;
+    loop {
+        let frame = tokio::select! {
+            biased;
+            _ = state.shutdown.cancelled() => {
+                return Err(upload_fs_error(FsError::RetryLater));
+            }
+            result = tokio::time::timeout_at(deadline, body.frame()) => {
+                match result {
+                    Ok(frame) => frame,
+                    Err(_) => return Err(upload_error(StatusCode::REQUEST_TIMEOUT, "upload body idle timeout")),
+                }
+            }
+        };
+        let Some(frame) = frame else {
+            return Ok(None);
+        };
+        let frame = frame
+            .map_err(|_| upload_error(StatusCode::BAD_REQUEST, "failed to read request body"))?;
+        if let Ok(data) = frame.into_data()
+            && !data.is_empty()
+        {
+            return Ok(Some(data));
+        }
+    }
+}
+
 async fn upload_write_admitted(
     state: &AppState,
+    request_guard: Arc<UploadRequestGuard>,
     auth: &AuthContext,
     file: InodeId,
     offset: u64,
-    data: &bytes::Bytes,
+    data: bytes::Bytes,
+    bytes_guard: Arc<UploadBytesGuard>,
 ) -> Result<u64, FsError> {
-    let _permit = state
-        .upload_write_permits
-        .acquire()
-        .await
-        .expect("upload write semaphore is never closed");
-    // Same RAM-ack seam 9P Twrite lands on (`write_ack` forwards to
-    // `write_ack_identified`, the path `NinePHandler::write` uses).
-    Ok(state
-        .filesystem
-        .write_ack(auth, file, offset, data)
-        .await?
-        .size)
+    let write_permit = tokio::select! {
+        biased;
+        _ = state.shutdown.cancelled() => return Err(FsError::RetryLater),
+        permit = Arc::clone(&state.upload_write_permits).acquire_owned() => {
+            permit.map_err(|_| FsError::IoError)?
+        }
+    };
+    let accepted_guard = state
+        .accepted_work
+        .try_accept()
+        .ok_or(FsError::RetryLater)?;
+    let filesystem = Arc::clone(&state.filesystem);
+    let auth = auth.clone();
+    tokio::spawn(async move {
+        let _request_guard = request_guard;
+        let _bytes_guard = bytes_guard;
+        let _write_permit = write_permit;
+        let _accepted_guard = accepted_guard;
+        // Same RAM-ack seam 9P Twrite lands on (`write_ack` forwards to
+        // `write_ack_identified`, the path `NinePHandler::write` uses).
+        filesystem
+            .write_ack(&auth, file, offset, &data)
+            .await
+            .map(|attrs| attrs.size)
+    })
+    .await
+    .map_err(|_| FsError::IoError)?
 }
 
 async fn upload_part(
@@ -577,8 +711,10 @@ async fn upload_part(
     axum::extract::Query(query): axum::extract::Query<UploadPartQuery>,
     mut body: axum::body::Body,
 ) -> axum::response::Response {
-    use http_body_util::BodyExt as _;
-
+    let request_guard = match upload_admit_request(&state) {
+        Ok(guard) => guard,
+        Err(response) => return response,
+    };
     if let Err(error) = upload_writeback_preflight(state.writeback.as_ref()).await {
         return upload_fs_error(error);
     }
@@ -586,6 +722,30 @@ async fn upload_part(
     let components = match upload_path_components(&path) {
         Ok(components) => components,
         Err(message) => return upload_error(StatusCode::BAD_REQUEST, message),
+    };
+
+    // Poll and own the first retained Body frame before creating directories
+    // or a staging inode. The fixed frame charge covers its backing allocation
+    // even when a Bytes view is shorter than that allocation.
+    let first_frame_guard = match state.upload_ingress.try_bytes(MAX_UPLOAD_PART_BYTES) {
+        Ok(guard) => guard,
+        Err(error) => return upload_fs_error(error),
+    };
+    let mut next_frame = match upload_next_body_data(&state, &mut body).await {
+        Ok(Some(data)) => {
+            if data.len() > MAX_UPLOAD_PART_BYTES {
+                return upload_error(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "part body exceeds the 16 MiB part limit",
+                );
+            }
+            Some((data, first_frame_guard))
+        }
+        Ok(None) => {
+            drop(first_frame_guard);
+            None
+        }
+        Err(response) => return response,
     };
 
     let auth = upload_auth(&state);
@@ -636,19 +796,13 @@ async fn upload_part(
         );
     }
 
-    let mut buffered = bytes::BytesMut::with_capacity(UPLOAD_STREAM_WRITE_CHUNK_BYTES);
     let mut received = 0usize;
     let mut write_offset = query.offset;
     let mut final_size = current_size;
+    let mut buffered = bytes::BytesMut::new();
+    let mut buffer_guard: Option<Arc<UploadBytesGuard>> = None;
 
-    while let Some(frame) = body.frame().await {
-        let frame = match frame {
-            Ok(frame) => frame,
-            Err(_) => return upload_error(StatusCode::BAD_REQUEST, "failed to read request body"),
-        };
-        let Ok(data) = frame.into_data() else {
-            continue;
-        };
+    while let Some((data, frame_guard)) = next_frame {
         let Some(next_received) = received.checked_add(data.len()) else {
             return upload_error(StatusCode::PAYLOAD_TOO_LARGE, "part body is too large");
         };
@@ -662,6 +816,16 @@ async fn upload_part(
 
         let mut remaining = data.as_ref();
         while !remaining.is_empty() {
+            if buffer_guard.is_none() {
+                buffer_guard = match state
+                    .upload_ingress
+                    .try_bytes(UPLOAD_STREAM_WRITE_CHUNK_BYTES)
+                {
+                    Ok(guard) => Some(guard),
+                    Err(error) => return upload_fs_error(error),
+                };
+                buffered = bytes::BytesMut::with_capacity(UPLOAD_STREAM_WRITE_CHUNK_BYTES);
+            }
             let take = remaining
                 .len()
                 .min(UPLOAD_STREAM_WRITE_CHUNK_BYTES - buffered.len());
@@ -671,17 +835,40 @@ async fn upload_part(
                 let Some(next_offset) = write_offset.checked_add(buffered.len() as u64) else {
                     return upload_error(StatusCode::BAD_REQUEST, "offset + length overflows");
                 };
-                let write_data = buffered.split().freeze();
-                final_size =
-                    match upload_write_admitted(&state, &auth, file, write_offset, &write_data)
-                        .await
-                    {
-                        Ok(size) => size,
-                        Err(error) => return upload_fs_error(error),
-                    };
+                let write_data = std::mem::take(&mut buffered).freeze();
+                let copy_guard = buffer_guard.take().expect("non-empty buffer is charged");
+                final_size = match upload_write_admitted(
+                    &state,
+                    Arc::clone(&request_guard),
+                    &auth,
+                    file,
+                    write_offset,
+                    write_data,
+                    copy_guard,
+                )
+                .await
+                {
+                    Ok(size) => size,
+                    Err(error) => return upload_fs_error(error),
+                };
                 write_offset = next_offset;
             }
         }
+        drop(data);
+        drop(frame_guard);
+
+        let frame_guard = match state.upload_ingress.try_bytes(MAX_UPLOAD_PART_BYTES) {
+            Ok(guard) => guard,
+            Err(error) => return upload_fs_error(error),
+        };
+        next_frame = match upload_next_body_data(&state, &mut body).await {
+            Ok(Some(data)) => Some((data, frame_guard)),
+            Ok(None) => {
+                drop(frame_guard);
+                None
+            }
+            Err(response) => return response,
+        };
     }
 
     if !buffered.is_empty() {
@@ -689,11 +876,21 @@ async fn upload_part(
             return upload_error(StatusCode::BAD_REQUEST, "offset + length overflows");
         }
         let write_data = buffered.freeze();
-        final_size =
-            match upload_write_admitted(&state, &auth, file, write_offset, &write_data).await {
-                Ok(size) => size,
-                Err(error) => return upload_fs_error(error),
-            };
+        let copy_guard = buffer_guard.take().expect("non-empty buffer is charged");
+        final_size = match upload_write_admitted(
+            &state,
+            Arc::clone(&request_guard),
+            &auth,
+            file,
+            write_offset,
+            write_data,
+            copy_guard,
+        )
+        .await
+        {
+            Ok(size) => size,
+            Err(error) => return upload_fs_error(error),
+        };
     }
     metrics::counter!("zerofs_http_upload_parts_total").increment(1);
     metrics::counter!("zerofs_http_upload_bytes_total").increment(received as u64);
@@ -704,6 +901,10 @@ async fn upload_status(
     State(state): State<AppState>,
     axum::extract::Path(path): axum::extract::Path<String>,
 ) -> axum::response::Response {
+    let _request_guard = match upload_admit_request(&state) {
+        Ok(guard) => guard,
+        Err(response) => return response,
+    };
     let Some(path) = path.strip_suffix("/status") else {
         return upload_error(
             StatusCode::NOT_FOUND,
@@ -726,32 +927,59 @@ async fn upload_status(
     }
 }
 
-/// Size and lowercase-hex SHA-256 of the bytes the server holds for `id`,
-/// read back through the filesystem's own read path.
-async fn upload_hash_file(
-    fs: &ZeroFS,
-    auth: &AuthContext,
-    id: InodeId,
-) -> Result<(u64, String), FsError> {
-    use sha2::Digest;
-    let mut hasher = sha2::Sha256::new();
-    let mut offset: u64 = 0;
-    loop {
-        let (chunk, eof) = fs
-            .read_file(auth, id, offset, UPLOAD_COMMIT_HASH_CHUNK)
-            .await?;
-        hasher.update(&chunk);
-        offset += chunk.len() as u64;
-        if eof {
-            break;
-        }
+fn upload_parse_sha256(value: &str) -> Option<[u8; 32]> {
+    if value.len() != 64 {
+        return None;
     }
+    let mut digest = [0u8; 32];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        let pair = std::str::from_utf8(pair).ok()?;
+        digest[index] = u8::from_str_radix(pair, 16).ok()?;
+    }
+    Some(digest)
+}
+
+fn upload_sha256_hex(digest: [u8; 32]) -> String {
     use std::fmt::Write as _;
     let mut hex = String::with_capacity(64);
-    for byte in hasher.finalize() {
+    for byte in digest {
         write!(hex, "{byte:02x}").expect("writing to a String cannot fail");
     }
-    Ok((offset, hex))
+    hex
+}
+
+fn upload_verification_failed(
+    path: &str,
+    expected_size: u64,
+    expected_sha256: &str,
+    actual: VerifiedFileContent,
+) -> axum::response::Response {
+    let actual_sha256 = upload_sha256_hex(actual.sha256);
+    metrics::counter!("zerofs_http_upload_verify_failures_total").increment(1);
+    warn!(
+        path,
+        expected_size,
+        actual_size = actual.size,
+        expected_sha256,
+        actual_sha256 = %actual_sha256,
+        "HTTP upload commit verification failed"
+    );
+    upload_json(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        serde_json::json!({
+            "verified": false,
+            "size": actual.size,
+            "sha256": actual_sha256,
+        }),
+    )
+}
+
+fn upload_commit_fs_error(error: FsError) -> axum::response::Response {
+    if error == FsError::StaleHandle {
+        upload_error(StatusCode::CONFLICT, "upload source changed during commit")
+    } else {
+        upload_fs_error(error)
+    }
 }
 
 /// Concatenate `segments` into a freshly truncated file at `components`, in
@@ -759,12 +987,15 @@ async fn upload_hash_file(
 /// sources remain available until the caller verifies and publishes the
 /// result so a failed commit can be retried.
 async fn upload_assemble_segments(
-    fs: &ZeroFS,
+    state: &AppState,
+    request_guard: &Arc<UploadRequestGuard>,
+    workspace_guard: &Arc<UploadBytesGuard>,
     auth: &AuthContext,
     creds: &Credentials,
     components: &[Vec<u8>],
     segments: &[String],
-) -> Result<Vec<(InodeId, InodeId, Vec<u8>)>, FsError> {
+) -> Result<Vec<(InodeId, InodeId, u64, Vec<u8>)>, FsError> {
+    let fs = &state.filesystem;
     let (dirs, name) = components.split_at(components.len() - 1);
     let parent = upload_resolve_dir_creating(fs, creds, dirs).await?;
 
@@ -772,10 +1003,10 @@ async fn upload_assemble_segments(
     for segment in segments {
         let segment_components = upload_path_components(segment.trim_start_matches('/'))
             .map_err(|_| FsError::InvalidArgument)?;
-        let (segment_dir, segment_file) =
-            upload_resolve_existing(fs, creds, &segment_components).await?;
+        let (segment_dir, segment_file, segment_cookie) =
+            upload_resolve_existing_entry(fs, creds, &segment_components).await?;
         let segment_name = segment_components[segment_components.len() - 1].clone();
-        resolved_segments.push((segment_dir, segment_file, segment_name));
+        resolved_segments.push((segment_dir, segment_file, segment_cookie, segment_name));
     }
 
     let target = match fs.lookup(creds, parent, &name[0]).await {
@@ -792,7 +1023,7 @@ async fn upload_assemble_segments(
     };
     if resolved_segments
         .iter()
-        .any(|(_, segment_file, _)| *segment_file == target)
+        .any(|(_, segment_file, _, _)| *segment_file == target)
     {
         return Err(FsError::InvalidArgument);
     }
@@ -807,16 +1038,26 @@ async fn upload_assemble_segments(
     .await?;
 
     let mut offset: u64 = 0;
-    for (_, segment_file, _) in &resolved_segments {
+    for (_, segment_file, _, _) in &resolved_segments {
         let mut read_at: u64 = 0;
         loop {
             let (chunk, eof) = fs
                 .read_file(auth, *segment_file, read_at, UPLOAD_COMMIT_HASH_CHUNK)
                 .await?;
             if !chunk.is_empty() {
-                fs.write_ack(auth, target, offset, &chunk).await?;
-                read_at += chunk.len() as u64;
-                offset += chunk.len() as u64;
+                let chunk_len = chunk.len() as u64;
+                upload_write_admitted(
+                    state,
+                    Arc::clone(request_guard),
+                    auth,
+                    target,
+                    offset,
+                    chunk,
+                    Arc::clone(workspace_guard),
+                )
+                .await?;
+                read_at += chunk_len;
+                offset += chunk_len;
             }
             if eof {
                 break;
@@ -826,14 +1067,53 @@ async fn upload_assemble_segments(
     Ok(resolved_segments)
 }
 
+async fn upload_read_commit_request(
+    state: &AppState,
+    body: &mut axum::body::Body,
+) -> Result<UploadCommitRequest, axum::response::Response> {
+    let mut json = Vec::with_capacity(MAX_UPLOAD_COMMIT_BODY_BYTES);
+    let mut received = 0usize;
+    while let Some(data) = upload_next_body_data(state, body).await? {
+        received = received.checked_add(data.len()).ok_or_else(|| {
+            upload_error(StatusCode::PAYLOAD_TOO_LARGE, "commit body is too large")
+        })?;
+        if received > MAX_UPLOAD_COMMIT_BODY_BYTES {
+            return Err(upload_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "commit body is too large",
+            ));
+        }
+        json.extend_from_slice(&data);
+        drop(data);
+    }
+    serde_json::from_slice(&json)
+        .map_err(|_| upload_error(StatusCode::BAD_REQUEST, "invalid commit request"))
+}
+
 async fn upload_commit(
     State(state): State<AppState>,
     axum::extract::Path(path): axum::extract::Path<String>,
-    axum::extract::Json(request): axum::extract::Json<UploadCommitRequest>,
+    mut body: axum::body::Body,
 ) -> axum::response::Response {
+    let request_guard = match upload_admit_request(&state) {
+        Ok(guard) => guard,
+        Err(response) => return response,
+    };
+    let workspace_guard = match state
+        .upload_ingress
+        .try_bytes(UPLOAD_COMMIT_WORKSPACE_BYTES)
+    {
+        Ok(guard) => guard,
+        Err(error) => return upload_fs_error(error),
+    };
     if let Err(error) = upload_writeback_preflight(state.writeback.as_ref()).await {
         return upload_fs_error(error);
     }
+
+    let request = match upload_read_commit_request(&state, &mut body).await {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
 
     let Some(path) = path.strip_suffix("/commit") else {
         return upload_error(
@@ -851,7 +1131,9 @@ async fn upload_commit(
         Vec::new()
     } else {
         match upload_assemble_segments(
-            &state.filesystem,
+            &state,
+            &request_guard,
+            &workspace_guard,
             &auth,
             &creds,
             &components,
@@ -863,8 +1145,8 @@ async fn upload_commit(
             Err(error) => return upload_fs_error(error),
         }
     };
-    let (staging_dir, file) =
-        match upload_resolve_existing(&state.filesystem, &creds, &components).await {
+    let (staging_dir, file, staging_cookie) =
+        match upload_resolve_existing_entry(&state.filesystem, &creds, &components).await {
             Ok(resolved) => resolved,
             Err(error) => return upload_fs_error(error),
         };
@@ -876,33 +1158,15 @@ async fn upload_commit(
         return upload_fs_error(error);
     }
 
-    let (actual_size, actual_sha256) = match upload_hash_file(&state.filesystem, &auth, file).await
-    {
-        Ok(hashed) => hashed,
-        Err(error) => return upload_fs_error(error),
+    let expected = VerifiedFileExpectation {
+        inode: file,
+        entry_cookie: staging_cookie,
+        size: request.size,
+        sha256: upload_parse_sha256(&request.sha256),
     };
-    if actual_size != request.size || !actual_sha256.eq_ignore_ascii_case(&request.sha256) {
-        metrics::counter!("zerofs_http_upload_verify_failures_total").increment(1);
-        warn!(
-            path,
-            expected_size = request.size,
-            actual_size,
-            expected_sha256 = %request.sha256,
-            actual_sha256 = %actual_sha256,
-            "HTTP upload commit verification failed"
-        );
-        return upload_json(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            serde_json::json!({
-                "verified": false,
-                "size": actual_size,
-                "sha256": actual_sha256,
-            }),
-        );
-    }
-
+    let staging_name = &components[components.len() - 1];
     let mut final_path = format!("/{path}");
-    if let Some(publish_to) = &request.publish_to {
+    let (publish_dir, publish_name) = if let Some(publish_to) = &request.publish_to {
         let publish_components = match upload_path_components(publish_to.trim_start_matches('/')) {
             Ok(components) => components,
             Err(message) => return upload_error(StatusCode::BAD_REQUEST, message),
@@ -914,62 +1178,71 @@ async fn upload_commit(
                 Ok(dir) => dir,
                 Err(error) => return upload_fs_error(error),
             };
-        let staging_name = &components[components.len() - 1];
-        // The fs layer's atomic-promote primitive: `rename` moves the
-        // verified file over the destination in one transaction.
-        if let Err(error) = state
-            .filesystem
-            .rename(
-                &auth,
-                staging_dir,
-                staging_name,
-                publish_dir,
-                &publish_name[0],
-            )
-            .await
-        {
-            return upload_fs_error(error);
-        }
-        // Second barrier so the rename itself is durable before we report
-        // the publish as committed.
-        if let Err(error) = state.filesystem.wait_inode_durability(file).await {
-            return upload_fs_error(error);
-        }
         final_path = format!("/{}", publish_to.trim_start_matches('/'));
+        (publish_dir, publish_name[0].clone())
+    } else {
+        (staging_dir, staging_name.clone())
+    };
+
+    // Hash exactly once while the fs layer's ordinary rename fence and
+    // ordered locks remain held through either publication or the same-path
+    // verification-only linearization point.
+    let verified = match state
+        .filesystem
+        .rename_verified(
+            &auth,
+            staging_dir,
+            staging_name,
+            publish_dir,
+            &publish_name,
+            expected,
+        )
+        .await
+    {
+        Ok(VerifiedRenameOutcome::Published(content)) => content,
+        Ok(VerifiedRenameOutcome::Mismatch(actual)) => {
+            return upload_verification_failed(path, request.size, &request.sha256, actual);
+        }
+        Err(error) => return upload_commit_fs_error(error),
+    };
+
+    // Cover writes accepted after the first barrier but before the metadata
+    // fence closed, plus the rename transaction itself, at the configured
+    // durability target before returning success.
+    if let Err(error) = state.filesystem.wait_inode_durability(file).await {
+        return upload_fs_error(error);
     }
 
-    for (segment_dir, segment_file, segment_name) in assembled_segments {
+    for (segment_dir, segment_file, segment_cookie, segment_name) in assembled_segments {
         // The committed target is already verified and durable. A failed
         // cleanup only leaves an independently named staging object behind.
-        // Re-check the inode so a concurrent replacement or a publish onto a
-        // segment's old path cannot be unlinked by stale cleanup metadata.
-        if matches!(
-            state
-                .filesystem
-                .lookup(&creds, segment_dir, &segment_name)
-                .await,
-            Ok(current) if current == segment_file
-        ) {
-            let _ = state
-                .filesystem
-                .remove(&auth, segment_dir, &segment_name)
-                .await;
-        }
+        // The compare and unlink share the normal unlink fence, ordered locks,
+        // and transaction. A recreated or same-inode/new-cookie entry wins.
+        let _ = state
+            .filesystem
+            .remove_if_entry_matches(
+                &auth,
+                segment_dir,
+                &segment_name,
+                segment_file,
+                segment_cookie,
+            )
+            .await;
     }
 
     metrics::counter!("zerofs_http_upload_commits_total").increment(1);
     info!(
         path = %final_path,
-        size = actual_size,
-        sha256 = %actual_sha256,
+        size = verified.size,
+        sha256 = %upload_sha256_hex(verified.sha256),
         "HTTP upload committed"
     );
     upload_json(
         StatusCode::OK,
         serde_json::json!({
             "verified": true,
-            "size": actual_size,
-            "sha256": actual_sha256,
+            "size": verified.size,
+            "sha256": upload_sha256_hex(verified.sha256),
             "path": final_path,
         }),
     )
@@ -1051,6 +1324,7 @@ pub fn start(
         p9_idle_timeout: (config.p9_idle_timeout_secs != 0)
             .then(|| std::time::Duration::from_secs(config.p9_idle_timeout_secs)),
         upload_write_permits: upload_write_permits(),
+        upload_ingress: upload_ingress(),
         writeback,
     };
 
@@ -1183,6 +1457,7 @@ mod tests {
                 accepted_work: P9AcceptedWorkTracker::new(),
                 p9_idle_timeout: None,
                 upload_write_permits: upload_write_permits(),
+                upload_ingress: upload_ingress(),
                 writeback: None,
             });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1277,6 +1552,7 @@ mod tests {
                 accepted_work: P9AcceptedWorkTracker::new(),
                 p9_idle_timeout: Some(std::time::Duration::from_millis(100)),
                 upload_write_permits: upload_write_permits(),
+                upload_ingress: upload_ingress(),
                 writeback: None,
             });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1362,6 +1638,7 @@ mod tests {
                 accepted_work: P9AcceptedWorkTracker::new(),
                 p9_idle_timeout: None,
                 upload_write_permits: upload_write_permits(),
+                upload_ingress: upload_ingress(),
                 writeback: None,
             },
             connections: Arc::new(std::sync::Mutex::new(CancellationToken::new())),
@@ -1409,6 +1686,14 @@ mod tests {
         filesystem: Arc<ZeroFS>,
         upload_write_permits: Arc<tokio::sync::Semaphore>,
     ) -> Router {
+        upload_test_router_with_admission(filesystem, upload_write_permits, upload_ingress())
+    }
+
+    fn upload_test_router_with_admission(
+        filesystem: Arc<ZeroFS>,
+        upload_write_permits: Arc<tokio::sync::Semaphore>,
+        upload_ingress: Arc<UploadIngressAdmission>,
+    ) -> Router {
         Router::new().merge(upload_router()).with_state(AppState {
             filesystem,
             lock_manager: Arc::new(FileLockManager::new()),
@@ -1419,6 +1704,7 @@ mod tests {
             accepted_work: P9AcceptedWorkTracker::new(),
             p9_idle_timeout: None,
             upload_write_permits,
+            upload_ingress,
             writeback: None,
         })
     }
@@ -1437,6 +1723,7 @@ mod tests {
             accepted_work: P9AcceptedWorkTracker::new(),
             p9_idle_timeout: None,
             upload_write_permits: upload_write_permits(),
+            upload_ingress: upload_ingress(),
             writeback: Some(writeback),
         })
     }
@@ -1661,6 +1948,373 @@ mod tests {
         assert_eq!(ready.0, StatusCode::OK, "{}", ready.1);
 
         for task in stalled {
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn small_network_frames_are_coalesced_into_bounded_filesystem_writes() {
+        use tower::ServiceExt;
+
+        const FRAME_BYTES: usize = 8 * 1024;
+        const TOTAL_BYTES: usize = 5 * 1024 * 1024;
+        let filesystem = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let auth = AuthContext::default();
+        let creds = Credentials::from_auth_context(&auth);
+        filesystem
+            .create(&creds, 0, b"batched.bin", &SetAttributes::default())
+            .await
+            .unwrap();
+        let before = filesystem
+            .stats
+            .write_operations
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let app = upload_test_router(Arc::clone(&filesystem));
+        let stream = futures::stream::iter((0..TOTAL_BYTES / FRAME_BYTES).map(|index| {
+            Ok::<bytes::Bytes, std::convert::Infallible>(bytes::Bytes::from(vec![
+                index as u8;
+                FRAME_BYTES
+            ]))
+        }));
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("PUT")
+                    .uri("/api/v1/upload/batched.bin?offset=0")
+                    .body(axum::body::Body::from_stream(stream))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let after = filesystem
+            .stats
+            .write_operations
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            after - before,
+            2,
+            "5 MiB from 8 KiB frames must flush as 4 MiB plus one EOF tail"
+        );
+    }
+
+    #[tokio::test]
+    async fn stalled_partial_bodies_are_bounded_and_excess_is_rejected() {
+        use tower::ServiceExt;
+
+        const REQUEST_LIMIT: usize = 32;
+        let filesystem = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let app = upload_test_router_with_admission(
+            Arc::clone(&filesystem),
+            upload_write_permits(),
+            UploadIngressAdmission::new(REQUEST_LIMIT, REQUEST_LIMIT * UPLOAD_FRAME_AND_COPY_BYTES),
+        );
+        let bodies_polled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut stalled = Vec::new();
+
+        for index in 0..REQUEST_LIMIT {
+            let bodies_polled = Arc::clone(&bodies_polled);
+            let first_chunk = futures::stream::once(async {
+                Ok::<bytes::Bytes, std::convert::Infallible>(bytes::Bytes::from_static(b"partial"))
+            });
+            let stalled_tail = futures::stream::once(async move {
+                bodies_polled.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                futures::future::pending::<()>().await;
+                Ok::<bytes::Bytes, std::convert::Infallible>(bytes::Bytes::new())
+            });
+            let request = axum::http::Request::builder()
+                .method("PUT")
+                .uri(format!("/api/v1/upload/bounded/{index}.bin?offset=0"))
+                .body(axum::body::Body::from_stream(futures::StreamExt::chain(
+                    first_chunk,
+                    stalled_tail,
+                )))
+                .unwrap();
+            let service = app.clone();
+            stalled.push(tokio::spawn(async move { service.oneshot(request).await }));
+        }
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while bodies_polled.load(std::sync::atomic::Ordering::SeqCst) != REQUEST_LIMIT {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all admitted request bodies must reach their stalled tail");
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            upload_request(
+                &app,
+                "PUT",
+                "/api/v1/upload/bounded/excess.bin?offset=0",
+                b"excess".to_vec(),
+            ),
+        )
+        .await
+        .expect("excess request must be rejected promptly");
+        assert_eq!(
+            response.0,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{}",
+            response.1
+        );
+
+        let creds = Credentials::from_auth_context(&AuthContext::default());
+        assert!(matches!(
+            upload_resolve_existing(
+                &filesystem,
+                &creds,
+                &upload_path_components("bounded/excess.bin").unwrap(),
+            )
+            .await,
+            Err(FsError::NotFound)
+        ));
+        for task in stalled {
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_idle_body_after_accepted_partial_write_settles() {
+        use tower::ServiceExt;
+
+        let filesystem = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let shutdown = CancellationToken::new();
+        let state = AppState {
+            filesystem: Arc::clone(&filesystem),
+            lock_manager: Arc::new(FileLockManager::new()),
+            uid: 0,
+            gid: 0,
+            shutdown: shutdown.clone(),
+            ws_drain: TaskTracker::new(),
+            accepted_work: P9AcceptedWorkTracker::new(),
+            p9_idle_timeout: None,
+            upload_write_permits: upload_write_permits(),
+            upload_ingress: upload_ingress(),
+            writeback: None,
+        };
+        let app = Router::new().merge(upload_router()).with_state(state);
+        let tail_polled = Arc::new(tokio::sync::Notify::new());
+        let accepted = vec![0x5a; UPLOAD_STREAM_WRITE_CHUNK_BYTES];
+        let accepted_len = accepted.len() as u64;
+        let stream = futures::StreamExt::chain(
+            futures::stream::once(async move {
+                Ok::<bytes::Bytes, std::convert::Infallible>(bytes::Bytes::from(accepted))
+            }),
+            futures::stream::once({
+                let tail_polled = Arc::clone(&tail_polled);
+                async move {
+                    tail_polled.notify_one();
+                    futures::future::pending::<()>().await;
+                    Ok::<bytes::Bytes, std::convert::Infallible>(bytes::Bytes::new())
+                }
+            }),
+        );
+        let request = axum::http::Request::builder()
+            .method("PUT")
+            .uri("/api/v1/upload/shutdown.bin?offset=0")
+            .body(axum::body::Body::from_stream(stream))
+            .unwrap();
+        let upload = tokio::spawn(app.oneshot(request));
+        tail_polled.notified().await;
+        shutdown.cancel();
+
+        let response = tokio::time::timeout(std::time::Duration::from_secs(1), upload)
+            .await
+            .expect("shutdown must stop polling an idle body")
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let creds = Credentials::from_auth_context(&AuthContext::default());
+        let (_, file) = upload_resolve_existing(
+            &filesystem,
+            &creds,
+            &upload_path_components("shutdown.bin").unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            upload_visible_file_size(&filesystem, file).await.unwrap(),
+            accepted_len
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_caller_cannot_drop_accepted_write_ownership() {
+        let filesystem = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let auth = AuthContext::default();
+        let creds = Credentials::from_auth_context(&auth);
+        let (file, _) = filesystem
+            .create(&creds, 0, b"accepted.bin", &SetAttributes::default())
+            .await
+            .unwrap();
+        let inode_lock = filesystem.lock_manager.acquire(file).await;
+        let payload = bytes::Bytes::from_static(b"accepted");
+        let ingress = UploadIngressAdmission::new(1, payload.len());
+        let request_guard = ingress.try_request().unwrap();
+        let bytes_guard = ingress.try_bytes(payload.len()).unwrap();
+        let write_permits = Arc::new(tokio::sync::Semaphore::new(1));
+        let accepted_work = P9AcceptedWorkTracker::new();
+        let state = AppState {
+            filesystem: Arc::clone(&filesystem),
+            lock_manager: Arc::new(FileLockManager::new()),
+            uid: 0,
+            gid: 0,
+            shutdown: CancellationToken::new(),
+            ws_drain: TaskTracker::new(),
+            accepted_work: accepted_work.clone(),
+            p9_idle_timeout: None,
+            upload_write_permits: Arc::clone(&write_permits),
+            upload_ingress: Arc::clone(&ingress),
+            writeback: None,
+        };
+        let caller = tokio::spawn(async move {
+            upload_write_admitted(&state, request_guard, &auth, file, 0, payload, bytes_guard).await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while accepted_work.len() != 1 || write_permits.available_permits() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("write did not enter accepted ownership");
+        assert_eq!(ingress.requests.available_permits(), 0);
+        assert_eq!(ingress.bytes.available_permits(), 0);
+
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        accepted_work.stop_accepting();
+        let mut drain = tokio::spawn({
+            let accepted_work = accepted_work.clone();
+            async move { accepted_work.wait().await }
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), &mut drain)
+                .await
+                .is_err(),
+            "cancelled caller released accepted write ownership"
+        );
+        assert_eq!(ingress.requests.available_permits(), 0);
+        assert_eq!(ingress.bytes.available_permits(), 0);
+        assert_eq!(write_permits.available_permits(), 0);
+
+        drop(inode_lock);
+        tokio::time::timeout(std::time::Duration::from_secs(2), drain)
+            .await
+            .expect("accepted write did not settle")
+            .unwrap();
+        assert_eq!(ingress.requests.available_permits(), 1);
+        assert_eq!(ingress.bytes.available_permits(), 8);
+        assert_eq!(write_permits.available_permits(), 1);
+        let (contents, eof) = filesystem
+            .read_file(&AuthContext::default(), file, 0, 32)
+            .await
+            .unwrap();
+        assert!(eof);
+        assert_eq!(contents.as_ref(), b"accepted");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn body_idle_timeout_releases_request_without_creating_a_path() {
+        use tower::ServiceExt;
+
+        let filesystem = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let app = upload_test_router(Arc::clone(&filesystem));
+        let empty_frames = futures::StreamExt::take(
+            futures::stream::repeat(Ok::<bytes::Bytes, std::convert::Infallible>(
+                bytes::Bytes::new(),
+            )),
+            100,
+        );
+        let stalled = futures::stream::once(async {
+            futures::future::pending::<()>().await;
+            Ok::<bytes::Bytes, std::convert::Infallible>(bytes::Bytes::new())
+        });
+        let stream = futures::StreamExt::chain(empty_frames, stalled);
+        let request = axum::http::Request::builder()
+            .method("PUT")
+            .uri("/api/v1/upload/idle.bin?offset=0")
+            .body(axum::body::Body::from_stream(stream))
+            .unwrap();
+        let upload = tokio::spawn(app.oneshot(request));
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(31)).await;
+
+        let response = tokio::time::timeout(std::time::Duration::from_millis(1), upload)
+            .await
+            .expect("idle body must be cancelled")
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        let creds = Credentials::from_auth_context(&AuthContext::default());
+        assert!(matches!(
+            upload_resolve_existing(
+                &filesystem,
+                &creds,
+                &upload_path_components("idle.bin").unwrap(),
+            )
+            .await,
+            Err(FsError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn full_upload_frames_blocked_on_writers_exhaust_the_byte_budget() {
+        use tower::ServiceExt;
+
+        const SATURATING_REQUESTS: usize = MAX_CONCURRENT_UPLOAD_WRITES + 1;
+        let filesystem = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let write_permits = Arc::new(tokio::sync::Semaphore::new(0));
+        let app = upload_test_router_with_permits(filesystem, write_permits);
+        let frames_polled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut blocked = Vec::new();
+
+        for index in 0..SATURATING_REQUESTS {
+            let frames_polled = Arc::clone(&frames_polled);
+            let frame = vec![index as u8; UPLOAD_STREAM_WRITE_CHUNK_BYTES];
+            let stream = futures::stream::once(async move {
+                frames_polled.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok::<bytes::Bytes, std::convert::Infallible>(bytes::Bytes::from(frame))
+            });
+            let request = axum::http::Request::builder()
+                .method("PUT")
+                .uri(format!("/api/v1/upload/full/{index}.bin?offset=0"))
+                .body(axum::body::Body::from_stream(stream))
+                .unwrap();
+            let service = app.clone();
+            blocked.push(tokio::spawn(async move { service.oneshot(request).await }));
+        }
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while frames_polled.load(std::sync::atomic::Ordering::SeqCst) != SATURATING_REQUESTS {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all saturating frames must be polled");
+        tokio::task::yield_now().await;
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            upload_request(
+                &app,
+                "PUT",
+                "/api/v1/upload/full/excess.bin?offset=0",
+                b"x".to_vec(),
+            ),
+        )
+        .await
+        .expect("byte-budget exhaustion must reject instead of queueing a retained body");
+        assert_eq!(
+            response.0,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{}",
+            response.1
+        );
+
+        for task in blocked {
             task.abort();
         }
     }

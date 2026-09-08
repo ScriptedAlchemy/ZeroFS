@@ -41,7 +41,7 @@ struct P9AcceptedWorkInner {
     tasks: TaskTracker,
 }
 
-pub(super) struct P9AcceptedWorkGuard {
+pub(crate) struct P9AcceptedWorkGuard {
     _token: TaskTrackerToken,
 }
 
@@ -55,7 +55,7 @@ impl P9AcceptedWorkTracker {
         }
     }
 
-    pub(super) fn try_accept(&self) -> Option<P9AcceptedWorkGuard> {
+    pub(crate) fn try_accept(&self) -> Option<P9AcceptedWorkGuard> {
         // Register first so shutdown cannot observe an empty tracker after a
         // racing request has observed the accepting state.
         let token = self.inner.tasks.token();
@@ -75,7 +75,7 @@ impl P9AcceptedWorkTracker {
     }
 
     #[cfg(test)]
-    pub(super) fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.inner.tasks.len()
     }
 }
