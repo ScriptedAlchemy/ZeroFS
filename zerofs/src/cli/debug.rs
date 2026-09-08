@@ -544,6 +544,32 @@ mod tests {
         }
     }
 
+    fn stopped_journal_files(root: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+        fn collect(
+            root: &std::path::Path,
+            current: &std::path::Path,
+            files: &mut Vec<(std::path::PathBuf, Vec<u8>)>,
+        ) {
+            for entry in fs::read_dir(current).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                if path.is_dir() {
+                    collect(root, &path, files);
+                } else if path.is_file() {
+                    files.push((
+                        path.strip_prefix(root).unwrap().to_path_buf(),
+                        fs::read(path).unwrap(),
+                    ));
+                }
+            }
+        }
+
+        let mut files = Vec::new();
+        collect(root, root, &mut files);
+        files.sort_by(|left, right| left.0.cmp(&right.0));
+        files
+    }
+
     #[test]
     fn checked_existing_open_rejects_each_config_identity_field_without_journal_mutation() {
         let temp = tempfile::tempdir().unwrap();
@@ -560,7 +586,7 @@ mod tests {
                 b"payload-a",
             )
             .unwrap();
-        let before = journal.snapshot().unwrap();
+        let before = stopped_journal_files(&journal_path);
         drop(journal);
 
         let mut bucket = identity.clone();
@@ -590,16 +616,10 @@ mod tests {
                 format!("{error:#}").contains("identity mismatch"),
                 "{field}: {error:#}"
             );
-            let reopened = Journal::open_existing(&journal_path).unwrap();
             assert_eq!(
-                reopened.snapshot().unwrap(),
+                stopped_journal_files(&journal_path),
                 before,
                 "{field} changed journal state"
-            );
-            assert_eq!(
-                reopened.read_blob(1).unwrap(),
-                b"payload-a",
-                "{field} changed payload"
             );
         }
     }
@@ -722,7 +742,7 @@ mod tests {
             )
             .unwrap();
         journal.mark_remote(1, None).unwrap();
-        let reseed_before = journal.snapshot().unwrap();
+        let reseed_before = stopped_journal_files(&reseed_journal_path);
         drop(journal);
         let error = reseed_writeback_predecessor(
             config_b.clone(),
@@ -733,15 +753,7 @@ mod tests {
         .await
         .expect_err("config B must not seed journal A");
         assert!(format!("{error:#}").contains("identity mismatch"));
-        let journal = Journal::open_existing(&reseed_journal_path).unwrap();
-        assert_eq!(journal.snapshot().unwrap(), reseed_before);
-        assert!(
-            journal
-                .remote_object_etag(&predecessor, 1)
-                .unwrap()
-                .is_none()
-        );
-        drop(journal);
+        assert_eq!(stopped_journal_files(&reseed_journal_path), reseed_before);
         remote_a
             .put(
                 &Path::from(predecessor.as_str()),
@@ -781,7 +793,7 @@ mod tests {
         journal
             .commit_put(recovery_put(1, &manifest_path, local), local)
             .unwrap();
-        let accept_before = journal.snapshot().unwrap();
+        let accept_before = stopped_journal_files(&accept_journal_path);
         drop(journal);
         let error = accept_remote_writeback_branch(
             config_b,
@@ -796,10 +808,7 @@ mod tests {
         .await
         .expect_err("config B must not abandon journal A");
         assert!(format!("{error:#}").contains("identity mismatch"));
-        let journal = Journal::open_existing(&accept_journal_path).unwrap();
-        assert_eq!(journal.snapshot().unwrap(), accept_before);
-        assert_eq!(journal.read_blob(1).unwrap(), local);
-        drop(journal);
+        assert_eq!(stopped_journal_files(&accept_journal_path), accept_before);
         remote_a
             .put(
                 &Path::from(manifest_path.as_str()),
