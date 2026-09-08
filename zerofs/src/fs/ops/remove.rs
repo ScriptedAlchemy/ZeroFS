@@ -17,7 +17,92 @@ use crate::fs::{
 };
 use std::sync::atomic::Ordering;
 
+#[cfg(test)]
+struct ConditionalRemovePause {
+    filesystem: usize,
+    inode: InodeId,
+    reached: tokio::sync::oneshot::Sender<()>,
+    resume: tokio::sync::oneshot::Receiver<()>,
+}
+
+#[cfg(test)]
+static CONDITIONAL_REMOVE_PAUSE: std::sync::OnceLock<
+    std::sync::Mutex<Option<ConditionalRemovePause>>,
+> = std::sync::OnceLock::new();
+
 impl ZeroFS {
+    #[cfg(test)]
+    fn pause_conditional_remove_before_lock_for_test(
+        &self,
+        inode: InodeId,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        let previous = CONDITIONAL_REMOVE_PAUSE
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .unwrap()
+            .replace(ConditionalRemovePause {
+                filesystem: std::sync::Arc::as_ptr(&self.db) as usize,
+                inode,
+                reached: reached_tx,
+                resume: resume_rx,
+            });
+        assert!(
+            previous.is_none(),
+            "conditional remove pause already installed"
+        );
+        (reached_rx, resume_tx)
+    }
+
+    #[cfg(test)]
+    async fn pause_conditional_remove_before_lock_if_requested(&self, inode: InodeId) {
+        let pause = {
+            let mut slot = CONDITIONAL_REMOVE_PAUSE
+                .get_or_init(|| std::sync::Mutex::new(None))
+                .lock()
+                .unwrap();
+            let filesystem = std::sync::Arc::as_ptr(&self.db) as usize;
+            if slot
+                .as_ref()
+                .is_some_and(|pause| pause.filesystem == filesystem && pause.inode == inode)
+            {
+                slot.take()
+            } else {
+                None
+            }
+        };
+        if let Some(pause) = pause {
+            let _ = pause.reached.send(());
+            let _ = pause.resume.await;
+        }
+    }
+
+    /// Remove only if `name` still denotes the exact observed directory entry.
+    /// Inode and cookie comparison occurs under the ordinary remove fence and
+    /// ordered locks before any unlink mutation.
+    pub(crate) async fn remove_if_entry_matches(
+        &self,
+        auth: &AuthContext,
+        dirid: InodeId,
+        name: &[u8],
+        expected_inode: InodeId,
+        expected_cookie: u64,
+    ) -> Result<bool, FsError> {
+        self.remove_idempotent_inner(
+            auth,
+            dirid,
+            name,
+            [0; 16],
+            None,
+            Some((expected_inode, expected_cookie)),
+        )
+        .await
+    }
+
     /// Unlink `name` from `dirid`; an empty directory is removed, a non-empty
     /// one is ENOTEMPTY, sticky-bit rules apply. Dropping the last link of an
     /// inode a fid still holds open defers reclaim: nlink goes to 0 and the
@@ -40,8 +125,9 @@ impl ZeroFS {
         name: &[u8],
         op_id: crate::dedup::OpId,
     ) -> Result<(), FsError> {
-        self.remove_idempotent_inner(auth, dirid, name, op_id, None)
+        self.remove_idempotent_inner(auth, dirid, name, op_id, None, None)
             .await
+            .map(|_| ())
     }
 
     /// Remove with `unlinkat(2)`'s expected target kind enforced after the
@@ -56,8 +142,9 @@ impl ZeroFS {
         op_id: crate::dedup::OpId,
         remove_directory: bool,
     ) -> Result<(), FsError> {
-        self.remove_idempotent_inner(auth, dirid, name, op_id, Some(remove_directory))
+        self.remove_idempotent_inner(auth, dirid, name, op_id, Some(remove_directory), None)
             .await
+            .map(|_| ())
     }
 
     async fn remove_idempotent_inner(
@@ -67,7 +154,8 @@ impl ZeroFS {
         name: &[u8],
         op_id: crate::dedup::OpId,
         expected_directory: Option<bool>,
-    ) -> Result<(), FsError> {
+        expected_entry: Option<(InodeId, u64)>,
+    ) -> Result<bool, FsError> {
         validate_filename(name)?;
 
         // Replay a completed remove before resolving the missing entry.
@@ -75,7 +163,7 @@ impl ZeroFS {
             .replay_dedup_result(&op_id, DedupResult::into_remove)?
             .is_some()
         {
-            return Ok(());
+            return Ok(true);
         }
 
         let creds = Credentials::from_auth_context(auth);
@@ -96,22 +184,32 @@ impl ZeroFS {
             }
         }
 
-        let (file_id, cookie) = match self
-            .directory_store
-            .get_entry_with_cookie(dirid, name)
-            .await
-        {
-            Ok(entry) => entry,
-            Err(error) => {
-                if self
-                    .replay_dedup_result(&op_id, DedupResult::into_remove)?
-                    .is_some()
-                {
-                    return Ok(());
+        let (file_id, cookie) = if let Some(expected) = expected_entry {
+            expected
+        } else {
+            match self
+                .directory_store
+                .get_entry_with_cookie(dirid, name)
+                .await
+            {
+                Ok(entry) => entry,
+                Err(error) => {
+                    if self
+                        .replay_dedup_result(&op_id, DedupResult::into_remove)?
+                        .is_some()
+                    {
+                        return Ok(true);
+                    }
+                    return Err(error);
                 }
-                return Err(error);
             }
         };
+
+        #[cfg(test)]
+        if expected_entry.is_some() {
+            self.pause_conditional_remove_before_lock_if_requested(file_id)
+                .await;
+        }
 
         let _fence = self
             .fence_metadata(ConflictScope::new([
@@ -126,7 +224,7 @@ impl ZeroFS {
             .replay_dedup_result(&op_id, DedupResult::into_remove)?
             .is_some()
         {
-            return Ok(());
+            return Ok(true);
         }
 
         let mut dir_inode = self.inode_store.get(dirid).await?;
@@ -141,12 +239,21 @@ impl ZeroFS {
         }
 
         // Re-check inside lock to verify entry still points to same inode
-        let (verified_id, verified_cookie) = self
+        let verified_entry = self
             .directory_store
             .get_entry_with_cookie(dirid, name)
-            .await?;
+            .await;
+        let (verified_id, verified_cookie) = match verified_entry {
+            Ok(entry) => entry,
+            Err(FsError::NotFound) if expected_entry.is_some() => return Ok(false),
+            Err(error) => return Err(error),
+        };
         if verified_id != file_id || verified_cookie != cookie {
-            return Err(FsError::NotFound);
+            return if expected_entry.is_some() {
+                Ok(false)
+            } else {
+                Err(FsError::NotFound)
+            };
         }
 
         let mut file_inode = self.inode_store.get(file_id).await?;
@@ -392,7 +499,7 @@ impl ZeroFS {
                     self.tracer.emit_with_path(path, FileOperation::Remove);
                 }
 
-                Ok(())
+                Ok(true)
             }
             _ => Err(FsError::NotDirectory),
         }
@@ -409,7 +516,7 @@ mod tests {
 
     use crate::fs::key_codec::KeyCodec;
 
-    use crate::fs::types::{SetAttributes, SetMode};
+    use crate::fs::types::{AuthContext, SetAttributes, SetMode};
     use bytes::Bytes;
 
     #[tokio::test]
@@ -617,5 +724,107 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn conditional_remove_preserves_a_recreated_entry() {
+        use std::sync::Arc;
+
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let auth = AuthContext::from(&test_creds());
+        let (original, _) = fs
+            .create(&test_creds(), 0, b"segment", &SetAttributes::default())
+            .await
+            .unwrap();
+        let (_, cookie) = fs
+            .directory_store
+            .get_entry_with_cookie(0, b"segment")
+            .await
+            .unwrap();
+        let (cleanup_reached, resume_cleanup) =
+            fs.pause_conditional_remove_before_lock_for_test(original);
+        let cleanup = tokio::spawn({
+            let fs = Arc::clone(&fs);
+            let auth = auth.clone();
+            async move {
+                fs.remove_if_entry_matches(&auth, 0, b"segment", original, cookie)
+                    .await
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), cleanup_reached)
+            .await
+            .expect("conditional remove did not reach the pre-lock pause")
+            .unwrap();
+        fs.remove(&auth, 0, b"segment").await.unwrap();
+        let (replacement, _) = fs
+            .create(&test_creds(), 0, b"segment", &SetAttributes::default())
+            .await
+            .unwrap();
+        resume_cleanup.send(()).unwrap();
+
+        assert!(
+            !tokio::time::timeout(std::time::Duration::from_secs(2), cleanup)
+                .await
+                .expect("conditional remove did not resume")
+                .unwrap()
+                .unwrap()
+        );
+        assert_eq!(
+            fs.lookup(&test_creds(), 0, b"segment").await.unwrap(),
+            replacement
+        );
+    }
+
+    #[tokio::test]
+    async fn conditional_remove_preserves_same_inode_with_a_new_cookie() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let auth = AuthContext::from(&test_creds());
+        let (file, _) = fs
+            .create(&test_creds(), 0, b"segment", &SetAttributes::default())
+            .await
+            .unwrap();
+        fs.link(&auth, file, 0, b"keeper").await.unwrap();
+        let (_, old_cookie) = fs
+            .directory_store
+            .get_entry_with_cookie(0, b"segment")
+            .await
+            .unwrap();
+
+        fs.remove(&auth, 0, b"segment").await.unwrap();
+        fs.link(&auth, file, 0, b"segment").await.unwrap();
+        let (_, new_cookie) = fs
+            .directory_store
+            .get_entry_with_cookie(0, b"segment")
+            .await
+            .unwrap();
+        assert_ne!(old_cookie, new_cookie);
+
+        assert!(
+            !fs.remove_if_entry_matches(&auth, 0, b"segment", file, old_cookie)
+                .await
+                .unwrap()
+        );
+        assert_eq!(fs.lookup(&test_creds(), 0, b"segment").await.unwrap(), file);
+    }
+
+    #[tokio::test]
+    async fn conditional_remove_unlinks_the_exact_observed_entry() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let auth = AuthContext::from(&test_creds());
+        let (file, _) = fs
+            .create(&test_creds(), 0, b"segment", &SetAttributes::default())
+            .await
+            .unwrap();
+        let (_, cookie) = fs.entry_identity(0, b"segment").await.unwrap();
+
+        assert!(
+            fs.remove_if_entry_matches(&auth, 0, b"segment", file, cookie)
+                .await
+                .unwrap()
+        );
+        assert!(matches!(
+            fs.lookup(&test_creds(), 0, b"segment").await,
+            Err(FsError::NotFound)
+        ));
     }
 }

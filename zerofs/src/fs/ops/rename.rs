@@ -18,7 +18,153 @@ use crate::fs::{
 use ::tracing::debug;
 use std::sync::atomic::Ordering;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct VerifiedFileExpectation {
+    pub(crate) inode: InodeId,
+    pub(crate) entry_cookie: u64,
+    pub(crate) size: u64,
+    pub(crate) sha256: Option<[u8; 32]>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct VerifiedFileContent {
+    pub(crate) size: u64,
+    pub(crate) sha256: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum VerifiedRenameOutcome {
+    Published(VerifiedFileContent),
+    Mismatch(VerifiedFileContent),
+}
+
+#[cfg(test)]
+struct VerifiedRenamePause {
+    filesystem: usize,
+    inode: InodeId,
+    reached: tokio::sync::oneshot::Sender<()>,
+    resume: tokio::sync::oneshot::Receiver<()>,
+}
+
+#[cfg(test)]
+static VERIFIED_RENAME_PAUSE: std::sync::OnceLock<std::sync::Mutex<Option<VerifiedRenamePause>>> =
+    std::sync::OnceLock::new();
+
 impl ZeroFS {
+    #[cfg(test)]
+    fn pause_verified_rename_after_hash_for_test(
+        &self,
+        inode: InodeId,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        let previous = VERIFIED_RENAME_PAUSE
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .unwrap()
+            .replace(VerifiedRenamePause {
+                filesystem: std::sync::Arc::as_ptr(&self.db) as usize,
+                inode,
+                reached: reached_tx,
+                resume: resume_rx,
+            });
+        assert!(
+            previous.is_none(),
+            "verified rename pause already installed"
+        );
+        (reached_rx, resume_tx)
+    }
+
+    #[cfg(test)]
+    async fn pause_verified_rename_after_hash_if_requested(&self, inode: InodeId) {
+        let pause = {
+            let mut slot = VERIFIED_RENAME_PAUSE
+                .get_or_init(|| std::sync::Mutex::new(None))
+                .lock()
+                .unwrap();
+            let filesystem = std::sync::Arc::as_ptr(&self.db) as usize;
+            if slot
+                .as_ref()
+                .is_some_and(|pause| pause.filesystem == filesystem && pause.inode == inode)
+            {
+                slot.take()
+            } else {
+                None
+            }
+        };
+        if let Some(pause) = pause {
+            let _ = pause.reached.send(());
+            let _ = pause.resume.await;
+        }
+    }
+
+    pub(crate) async fn entry_identity(
+        &self,
+        dirid: InodeId,
+        name: &[u8],
+    ) -> Result<(InodeId, u64), FsError> {
+        self.directory_store
+            .get_entry_with_cookie(dirid, name)
+            .await
+    }
+
+    /// Verify the exact observed namespace entry and canonical bytes while
+    /// holding the ordinary rename fence and ordered inode locks, then
+    /// publish without releasing either boundary. Passing the same source and
+    /// destination performs a locked verification-only commit.
+    pub(crate) async fn rename_verified(
+        &self,
+        auth: &AuthContext,
+        from_dirid: u64,
+        from_name: &[u8],
+        to_dirid: u64,
+        to_name: &[u8],
+        expected: VerifiedFileExpectation,
+    ) -> Result<VerifiedRenameOutcome, FsError> {
+        self.rename_with_options(
+            auth,
+            from_dirid,
+            from_name,
+            to_dirid,
+            to_name,
+            [0; 16],
+            true,
+            Some(expected),
+        )
+        .await?
+        .ok_or(FsError::IoError)
+    }
+
+    async fn hash_file_canonical_locked(
+        &self,
+        auth: &AuthContext,
+        id: InodeId,
+    ) -> Result<VerifiedFileContent, FsError> {
+        use sha2::Digest as _;
+
+        let mut hasher = sha2::Sha256::new();
+        let mut offset = 0u64;
+        loop {
+            let (chunk, eof) = self
+                .read_file_inner_canonical(Some(auth), id, offset, 1024 * 1024)
+                .await?;
+            hasher.update(&chunk);
+            offset = offset
+                .checked_add(chunk.len() as u64)
+                .ok_or(FsError::InvalidData)?;
+            if eof {
+                break;
+            }
+        }
+        Ok(VerifiedFileContent {
+            size: offset,
+            sha256: hasher.finalize().into(),
+        })
+    }
+
     /// True when `ancestor_id` is `descendant_id` or on its parent chain: the
     /// rename cycle guard. A parentless (hardlinked) inode reports false.
     async fn is_ancestor_of(
@@ -79,8 +225,11 @@ impl ZeroFS {
         to_name: &[u8],
         op_id: crate::dedup::OpId,
     ) -> Result<(), FsError> {
-        self.rename_with_options(auth, from_dirid, from_name, to_dirid, to_name, op_id, true)
-            .await
+        self.rename_with_options(
+            auth, from_dirid, from_name, to_dirid, to_name, op_id, true, None,
+        )
+        .await
+        .map(|_| ())
     }
 
     /// Atomic no-replace rename tagged with an idempotency op-id.
@@ -93,8 +242,11 @@ impl ZeroFS {
         to_name: &[u8],
         op_id: crate::dedup::OpId,
     ) -> Result<(), FsError> {
-        self.rename_with_options(auth, from_dirid, from_name, to_dirid, to_name, op_id, false)
-            .await
+        self.rename_with_options(
+            auth, from_dirid, from_name, to_dirid, to_name, op_id, false, None,
+        )
+        .await
+        .map(|_| ())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -107,7 +259,8 @@ impl ZeroFS {
         to_name: &[u8],
         op_id: crate::dedup::OpId,
         replace_existing: bool,
-    ) -> Result<(), FsError> {
+        verification: Option<VerifiedFileExpectation>,
+    ) -> Result<Option<VerifiedRenameOutcome>, FsError> {
         if from_name.is_empty() || to_name.is_empty() {
             return Err(FsError::InvalidArgument);
         }
@@ -120,7 +273,7 @@ impl ZeroFS {
             .replay_dedup_result(&op_id, DedupResult::into_rename)?
             .is_some()
         {
-            return Ok(());
+            return Ok(None);
         }
 
         if from_name == b"." || from_name == b".." {
@@ -130,14 +283,14 @@ impl ZeroFS {
             return Err(FsError::Exists);
         }
 
-        if from_dirid == to_dirid && from_name == to_name {
+        if verification.is_none() && from_dirid == to_dirid && from_name == to_name {
             // No-op renames still publish a durable replay result.
             if crate::dedup::has_op_id(&op_id) {
                 let mut txn = self.db.new_transaction()?;
                 txn.set_dedup_result(op_id, DedupResult::Rename);
                 self.write_coordinator.commit(txn).await?;
             }
-            return Ok(());
+            return Ok(None);
         }
 
         debug!(
@@ -162,11 +315,17 @@ impl ZeroFS {
                     .replay_dedup_result(&op_id, DedupResult::into_rename)?
                     .is_some()
                 {
-                    return Ok(());
+                    return Ok(None);
                 }
                 return Err(error);
             }
         };
+
+        if verification.is_some_and(|expected| {
+            expected.inode != source_inode_id || expected.entry_cookie != source_cookie
+        }) {
+            return Err(FsError::StaleHandle);
+        }
 
         if to_dirid == source_inode_id {
             return Err(FsError::InvalidArgument);
@@ -209,7 +368,7 @@ impl ZeroFS {
             .replay_dedup_result(&op_id, DedupResult::into_rename)?
             .is_some()
         {
-            return Ok(());
+            return Ok(None);
         }
 
         // Re-verify inside lock that entries still point to same inodes
@@ -218,6 +377,11 @@ impl ZeroFS {
             .get_entry_with_cookie(from_dirid, from_name)
             .await?;
         if verified_source_id != source_inode_id || verified_source_cookie != source_cookie {
+            return Err(FsError::StaleHandle);
+        }
+        if verification.is_some_and(|expected| {
+            expected.inode != verified_source_id || expected.entry_cookie != verified_source_cookie
+        }) {
             return Err(FsError::StaleHandle);
         }
 
@@ -296,7 +460,22 @@ impl ZeroFS {
                 txn.set_dedup_result(op_id, DedupResult::Rename);
                 self.write_coordinator.commit(txn).await?;
             }
-            return Ok(());
+            let outcome = if let Some(expected) = verification {
+                let actual = self
+                    .hash_file_canonical_locked(auth, source_inode_id)
+                    .await?;
+                #[cfg(test)]
+                self.pause_verified_rename_after_hash_if_requested(source_inode_id)
+                    .await;
+                if actual.size != expected.size || expected.sha256 != Some(actual.sha256) {
+                    VerifiedRenameOutcome::Mismatch(actual)
+                } else {
+                    VerifiedRenameOutcome::Published(actual)
+                }
+            } else {
+                return Ok(None);
+            };
+            return Ok(Some(outcome));
         }
 
         // Capture old path before rename for tracing (name will change after)
@@ -336,6 +515,21 @@ impl ZeroFS {
         let target_should_defer = target
             .as_ref()
             .is_some_and(|(target_id, _)| self.should_defer_unlinked_inode(*target_id));
+
+        let verified_content = if let Some(expected) = verification {
+            let actual = self
+                .hash_file_canonical_locked(auth, source_inode_id)
+                .await?;
+            #[cfg(test)]
+            self.pause_verified_rename_after_hash_if_requested(source_inode_id)
+                .await;
+            if actual.size != expected.size || expected.sha256 != Some(actual.sha256) {
+                return Ok(Some(VerifiedRenameOutcome::Mismatch(actual)));
+            }
+            Some(actual)
+        } else {
+            None
+        };
 
         let mut txn = self.db.new_transaction()?;
         txn.set_dedup_result(op_id, DedupResult::Rename);
@@ -693,13 +887,14 @@ impl ZeroFS {
             });
         }
 
-        Ok(())
+        Ok(verified_content.map(VerifiedRenameOutcome::Published))
     }
 }
 
 #[cfg(test)]
 mod tests {
 
+    use super::{VerifiedFileExpectation, VerifiedRenameOutcome};
     use crate::dedup::DedupResult;
     use crate::fs::inode::Inode;
     use crate::fs::key_codec::KeyCodec;
@@ -707,8 +902,23 @@ mod tests {
     use crate::fs::*;
     use crate::test_helpers::test_helpers_mod::test_auth;
 
-    use crate::fs::types::{SetAttributes, SetMode};
+    use crate::fs::types::{AuthContext, SetAttributes, SetMode, SetSize};
     use bytes::Bytes;
+    use std::sync::Arc;
+
+    fn content_expectation(
+        inode: InodeId,
+        entry_cookie: u64,
+        data: &[u8],
+    ) -> VerifiedFileExpectation {
+        use sha2::Digest as _;
+        VerifiedFileExpectation {
+            inode,
+            entry_cookie,
+            size: data.len() as u64,
+            sha256: Some(sha2::Sha256::digest(data).into()),
+        }
+    }
 
     #[tokio::test]
     async fn rename_retry_replays_success_after_source_is_gone() {
@@ -1571,6 +1781,307 @@ mod tests {
                 .exists(0, b"fenced-dst.txt")
                 .await
                 .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn verified_rename_rejects_a_recreated_source_entry() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let auth = AuthContext::from(&test_creds());
+        let original = b"verified bytes";
+        let (original_id, _) = fs
+            .create(&test_creds(), 0, b"staging", &SetAttributes::default())
+            .await
+            .unwrap();
+        fs.write(&auth, original_id, 0, &Bytes::copy_from_slice(original))
+            .await
+            .unwrap();
+        let (_, original_cookie) = fs
+            .directory_store
+            .get_entry_with_cookie(0, b"staging")
+            .await
+            .unwrap();
+        let expected = content_expectation(original_id, original_cookie, original);
+
+        fs.remove(&auth, 0, b"staging").await.unwrap();
+        let (replacement_id, _) = fs
+            .create(&test_creds(), 0, b"staging", &SetAttributes::default())
+            .await
+            .unwrap();
+        fs.write(
+            &auth,
+            replacement_id,
+            0,
+            &Bytes::from_static(b"replacement"),
+        )
+        .await
+        .unwrap();
+
+        let result = fs
+            .rename_verified(&auth, 0, b"staging", 0, b"published", expected)
+            .await;
+        assert!(matches!(result, Err(FsError::StaleHandle)));
+        assert_eq!(
+            fs.lookup(&test_creds(), 0, b"staging").await.unwrap(),
+            replacement_id
+        );
+        assert!(matches!(
+            fs.lookup(&test_creds(), 0, b"published").await,
+            Err(FsError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn verified_rename_hashes_accepted_volatile_same_length_overwrite() {
+        use crate::fs::mutation::config::{
+            ClientDurabilityTarget, FilesystemWriteAckMode, FilesystemWriteAckSettings,
+            FilesystemWriteAckSource,
+        };
+
+        let mut fs = ZeroFS::new_in_memory().await.unwrap();
+        fs.write_ack = FilesystemWriteAckSettings {
+            mode: FilesystemWriteAckMode::VolatileMemory,
+            volatile_memory_bytes: 8 * 1024 * 1024,
+            volatile_max_operations: 1024,
+            source: FilesystemWriteAckSource::Filesystem,
+            client_durability_target: ClientDurabilityTarget::LocalSsd,
+        };
+        let fs = Arc::new(fs);
+        fs.install_volatile_overlay();
+        let auth = AuthContext::from(&test_creds());
+        let original = b"verified";
+        let changed = b"mutated!";
+        let (file, _) = fs
+            .create(&test_creds(), 0, b"staging", &SetAttributes::default())
+            .await
+            .unwrap();
+        fs.write_ack(&auth, file, 0, &Bytes::copy_from_slice(original))
+            .await
+            .unwrap();
+        fs.wait_inode_durability(file).await.unwrap();
+        let (_, cookie) = fs
+            .directory_store
+            .get_entry_with_cookie(0, b"staging")
+            .await
+            .unwrap();
+        let expected = content_expectation(file, cookie, original);
+
+        fs.write_ack(&auth, file, 0, &Bytes::copy_from_slice(changed))
+            .await
+            .unwrap();
+        let result = fs
+            .rename_verified(&auth, 0, b"staging", 0, b"published", expected)
+            .await
+            .unwrap();
+        assert!(matches!(result, VerifiedRenameOutcome::Mismatch(_)));
+        assert_eq!(fs.lookup(&test_creds(), 0, b"staging").await.unwrap(), file);
+        assert!(matches!(
+            fs.lookup(&test_creds(), 0, b"published").await,
+            Err(FsError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn verified_rename_rejects_truncate_after_observation() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let auth = AuthContext::from(&test_creds());
+        let original = b"verified bytes";
+        let (file, _) = fs
+            .create(&test_creds(), 0, b"staging", &SetAttributes::default())
+            .await
+            .unwrap();
+        fs.write(&auth, file, 0, &Bytes::copy_from_slice(original))
+            .await
+            .unwrap();
+        let (_, cookie) = fs
+            .directory_store
+            .get_entry_with_cookie(0, b"staging")
+            .await
+            .unwrap();
+        let expected = content_expectation(file, cookie, original);
+        fs.setattr(
+            &test_creds(),
+            file,
+            &SetAttributes {
+                size: SetSize::Set(3),
+                ..SetAttributes::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let result = fs
+            .rename_verified(&auth, 0, b"staging", 0, b"published", expected)
+            .await
+            .unwrap();
+        let VerifiedRenameOutcome::Mismatch(actual) = result else {
+            panic!("truncated source must not be published")
+        };
+        assert_eq!(actual.size, 3);
+        assert_eq!(fs.lookup(&test_creds(), 0, b"staging").await.unwrap(), file);
+        assert!(matches!(
+            fs.lookup(&test_creds(), 0, b"published").await,
+            Err(FsError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn verified_noop_rename_still_checks_the_digest() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let auth = AuthContext::from(&test_creds());
+        let bytes = b"actual";
+        let (file, _) = fs
+            .create(&test_creds(), 0, b"staging", &SetAttributes::default())
+            .await
+            .unwrap();
+        fs.write(&auth, file, 0, &Bytes::copy_from_slice(bytes))
+            .await
+            .unwrap();
+        let (_, cookie) = fs
+            .directory_store
+            .get_entry_with_cookie(0, b"staging")
+            .await
+            .unwrap();
+        let mut expected = content_expectation(file, cookie, bytes);
+        expected.sha256 = Some([0; 32]);
+
+        let result = fs
+            .rename_verified(&auth, 0, b"staging", 0, b"staging", expected)
+            .await
+            .unwrap();
+        assert!(matches!(result, VerifiedRenameOutcome::Mismatch(_)));
+        assert_eq!(fs.lookup(&test_creds(), 0, b"staging").await.unwrap(), file);
+    }
+
+    #[tokio::test]
+    async fn verified_rename_to_a_hardlink_alias_checks_content_before_noop() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let auth = AuthContext::from(&test_creds());
+        let bytes = b"actual";
+        let (file, _) = fs
+            .create(&test_creds(), 0, b"staging", &SetAttributes::default())
+            .await
+            .unwrap();
+        fs.write(&auth, file, 0, &Bytes::copy_from_slice(bytes))
+            .await
+            .unwrap();
+        fs.link(&auth, file, 0, b"alias").await.unwrap();
+        let (_, cookie) = fs
+            .directory_store
+            .get_entry_with_cookie(0, b"staging")
+            .await
+            .unwrap();
+        let mut expected = content_expectation(file, cookie, bytes);
+        expected.sha256 = Some([0; 32]);
+
+        let result = fs
+            .rename_verified(&auth, 0, b"staging", 0, b"alias", expected)
+            .await
+            .unwrap();
+        assert!(matches!(result, VerifiedRenameOutcome::Mismatch(_)));
+        assert_eq!(fs.lookup(&test_creds(), 0, b"staging").await.unwrap(), file);
+        assert_eq!(fs.lookup(&test_creds(), 0, b"alias").await.unwrap(), file);
+    }
+
+    #[tokio::test]
+    async fn verified_rename_keeps_competing_write_out_until_publication() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let auth = AuthContext::from(&test_creds());
+        let bytes = b"verified";
+        let (file, _) = fs
+            .create(&test_creds(), 0, b"staging", &SetAttributes::default())
+            .await
+            .unwrap();
+        fs.write(&auth, file, 0, &Bytes::copy_from_slice(bytes))
+            .await
+            .unwrap();
+        let (_, cookie) = fs.entry_identity(0, b"staging").await.unwrap();
+        let expected = content_expectation(file, cookie, bytes);
+        let (hash_reached, resume_publish) = fs.pause_verified_rename_after_hash_for_test(file);
+
+        let mut publication = tokio::spawn({
+            let fs = Arc::clone(&fs);
+            let auth = auth.clone();
+            async move {
+                fs.rename_verified(&auth, 0, b"staging", 0, b"published", expected)
+                    .await
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), hash_reached)
+            .await
+            .expect("verified rename did not reach the post-hash pause")
+            .unwrap();
+        let mut overwrite = tokio::spawn({
+            let fs = Arc::clone(&fs);
+            let auth = auth.clone();
+            async move {
+                fs.write(&auth, file, 0, &Bytes::from_static(b"mutated!"))
+                    .await
+            }
+        });
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), &mut overwrite)
+                .await
+                .is_err(),
+            "competing overwrite entered the verified hash-to-publish interval"
+        );
+        assert!(matches!(
+            fs.lookup(&test_creds(), 0, b"published").await,
+            Err(FsError::NotFound)
+        ));
+        resume_publish.send(()).unwrap();
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), &mut publication)
+            .await
+            .expect("publication did not resume")
+            .unwrap()
+            .unwrap();
+        assert!(matches!(outcome, VerifiedRenameOutcome::Published(_)));
+        tokio::time::timeout(std::time::Duration::from_secs(2), overwrite)
+            .await
+            .expect("competing overwrite did not resume after publication")
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            fs.lookup(&test_creds(), 0, b"staging").await,
+            Err(FsError::NotFound)
+        ));
+        assert_eq!(
+            fs.lookup(&test_creds(), 0, b"published").await.unwrap(),
+            file
+        );
+    }
+
+    #[tokio::test]
+    async fn verified_rename_publishes_matching_content() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let auth = AuthContext::from(&test_creds());
+        let bytes = b"verified";
+        let (file, _) = fs
+            .create(&test_creds(), 0, b"staging", &SetAttributes::default())
+            .await
+            .unwrap();
+        fs.write(&auth, file, 0, &Bytes::copy_from_slice(bytes))
+            .await
+            .unwrap();
+        let (_, cookie) = fs.entry_identity(0, b"staging").await.unwrap();
+
+        let outcome = fs
+            .rename_verified(
+                &auth,
+                0,
+                b"staging",
+                0,
+                b"published",
+                content_expectation(file, cookie, bytes),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(outcome, VerifiedRenameOutcome::Published(_)));
+        assert_eq!(
+            fs.lookup(&test_creds(), 0, b"published").await.unwrap(),
+            file
         );
     }
 }
