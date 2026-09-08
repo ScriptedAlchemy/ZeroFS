@@ -207,7 +207,7 @@ pub async fn save_wrapped_key_to_object_store(
 }
 
 /// Load the existing encryption key without initializing remote state.
-pub async fn load_existing_encryption_key(
+pub(crate) async fn load_existing_encryption_key(
     object_store: &Arc<dyn ObjectStore>,
     db_path: &Path,
     password: &str,
