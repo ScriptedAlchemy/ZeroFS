@@ -428,6 +428,7 @@ pub struct PendingWindow {
 }
 
 impl Journal {
+    #[cfg(test)]
     pub(crate) fn open_existing(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
         let identity = Self::read_existing_identity(&root)?;
