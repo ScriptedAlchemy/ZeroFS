@@ -58,14 +58,14 @@ Produces controlled pre-commit rejection on unavailable incremental growth, with
 
 ## Draft 07: conditional large-object replay
 
-Consumes persisted `MutationRecord` mode, kind, database prefix and validated canonical object identity; existing `GeneratedSegmentCreate` plus `ConditionalMultipartCreate` handshake.
+Consumes persisted `MutationRecord` mode and the existing `ConditionalMultipartCreate` handshake. Generated-segment provenance remains separate from the backend's atomic-create capability.
 Produces the same Create/Update guarantee above and below the 36 MiB transfer threshold.
 
 - [ ] Pause large Create replay before publication, insert competing different bytes, resume, and assert those bytes survive and the losing record does not advance the remote frontier.
 - [ ] Cover small Create, changed Update ETag, and identical-content lost-reply reconciliation.
-- [ ] Choose conditional publication before initiating multipart. For validated generated-segment PUT/Create records, restore the trusted marker and require backend capability acknowledgment.
+- [ ] Choose conditional publication before initiating multipart. Request and require a genuine atomic Create capability for persisted Create records; no redundant generated-segment tag or provenance reconstruction is needed during replay.
 - [ ] Preserve large generic Create records such as compacted SSTs using SFTP's genuine atomic create capability. Keep the private capability request separate from generated-segment provenance; do not label ordinary SSTs as generated segments. Backends without atomic completion must fail closed and terminally, rather than retrying an unsupported contract forever.
-- [ ] Do not treat `ImmutableCreate` alone as segment provenance: it also covers WAL and compacted SST objects. Reject arbitrary keys, Copy/Rename records, and unsupported conditional completions rather than disguising them as generated segments.
+- [ ] Do not treat `ImmutableCreate` alone as segment provenance: it also covers WAL and compacted SST objects. Never disguise ordinary records as generated segments; reject unsupported conditional completions before sending parts.
 - [ ] Keep bounded streaming; no unbounded collection, extra HEAD-as-lock, or unconditional complete for a conditional mutation.
 - [ ] Run real recording/fault backend regressions and SFTP multipart capability tests; review and commit.
 
@@ -77,7 +77,7 @@ Produces nonmutating prospective physical separation and anchored creation/openi
 - [x] Execute real Rust temporary-filesystem tests for `alias -> clean` plus missing `alias/new-dirty`, nested missing suffixes, dangling links, ENOTDIR, relative/parent components, legitimate first start, and `cache2` siblings.
 - [x] Canonicalize the nearest existing ancestor, then append validated missing components. Normalization must create no files or directories.
 - [x] Reproduce the Phase 1 behavioral failure against the tests-only commit, then restore the implementation and run GREEN. Implementation preceded observed RED: tests-only `6885110` ran seven tests, five passed and two failed; fixed `f3bdb5f` ran nine, all passed. Logs: `/var/tmp/zerofs-audit-path-{red,green}.log` on Ubuntu. Integrated as `00330430`; concurrent replacement protection below is still pending.
-- [x] Review a narrowly owned directory-handle API before bootstrap/journal edits. Preserve ancestry through base/namespace creation, lock/database opening, recovery, publication and cleanup; reuse `rustix` and redb's file-backed construction. Integrated as `47bafd04` (worker `9d7b45c2`). Linux writeback prefix: 319 passed, eight ignored (`cc-9910`). The Mac Journal gate and multipart staging caller integration remain pending.
+- [x] Review a narrowly owned directory-handle API before bootstrap/journal edits. Preserve ancestry through base/namespace creation, lock/database opening, recovery, publication and cleanup; reuse `rustix` and redb's file-backed construction. Integrated as `47bafd04` (worker `9d7b45c2`), with portability followup `68f3a916`. Final Linux writeback prefix: 319 passed, eight ignored (`cc-9924`); Mac helper: seven passed (`cc-14`); Mac Journal: 74 passed, two ignored (`cc-16`). Multipart staging caller integration remains pending.
 - [x] Resolve the read-only redb opening boundary without weakening the first audit's mutation-free identity preflight. Exact-opened-file descriptor probes passed on Linux and macOS; no vendored patch, writable inspection fallback, or platform ban. Parent aliases are normalized before strict final-root traversal; nonregular files cannot block before type validation.
 - [ ] Race parent replacement and final-entry substitution; require anchored behavior or fail-closed nonmutation. Run normalization/bootstrap/journal identity tests; review and commit.
 
@@ -86,7 +86,7 @@ Produces nonmutating prospective physical separation and anchored creation/openi
 Consumes overlay visibility/attributes/read retirement and materializer FIFO/multi-inode execution.
 Produces generation-safe idle retirement and reaped task bookkeeping, bounded by current work rather than historical inode count.
 
-- [x] Add a 10,000-distinct-inode churn regression at concurrency one. Actual baseline execution retained 10,000 overlay runtimes, workers, pending keys and materializer lanes/handles after drain. The first missing-WebUI compile and a separate hot-runtime fixture timeout are not behavioral failure receipts. Fixed-code acceptance is still pending.
+- [x] Add a 10,000-distinct-inode churn regression at concurrency one. Actual baseline execution retained 10,000 overlay runtimes, workers, pending keys and materializer lanes/handles after drain. The first missing-WebUI compile and a separate hot-runtime fixture timeout are not behavioral failure receipts. The bounded stage passed the actual churn gate; the subsequent single-executor refactor has a separate gate below.
 - [x] Race hot-inode enqueue against retirement. Enqueue and removal agree on one generation; both materializer and overlay hot-inode races passed.
 - [x] Retire only when queued, executing, staged, held and read-retirement work is absent. Prune empty bookkeeping and reap completed join handles. Integrated bounded-lifecycle stage as `f2300b5f` (worker `a240b72a`). Real 10,000-inode plus race suite: three passed (`cc-9900`); the post-drain census requires exact zero.
 - [x] Preserve striped ordering, cancellation, frozen-overlay and read-visibility tests after rebasing on the aggregate reservation fix. Full mutation prefix: 97 passed, zero ignored (`cc-9909`); root independently read the broker receipt.
