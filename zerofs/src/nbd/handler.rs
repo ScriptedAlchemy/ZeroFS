@@ -871,7 +871,7 @@ impl NBDHandler {
                 Err(CommandError::InvalidArgument)
             }
             Err(WriteAdmissionError::Unavailable) => Err(CommandError::IoError),
-            Err(WriteAdmissionError::Backpressured) => Err(CommandError::NoSpace),
+            Err(WriteAdmissionError::Backpressured) => Err(CommandError::IoError),
             Err(WriteAdmissionError::Mutation(error)) => Err(mutation_command_error(error)),
         }
     }
@@ -1180,8 +1180,8 @@ mod tests {
     use bytes::Bytes;
     use deku::DekuContainerRead;
     use nbd_proto::{
-        NBD_FLAG_SEND_TRIM, NBD_REP_ACK, NBD_REP_ERR_UNKNOWN, NBD_REP_INFO, NBD_REP_SERVER,
-        NBDInfoExport,
+        NBD_EIO, NBD_FLAG_SEND_TRIM, NBD_REP_ACK, NBD_REP_ERR_UNKNOWN, NBD_REP_INFO,
+        NBD_REP_SERVER, NBDInfoExport,
     };
     use std::sync::Arc;
 
@@ -1335,9 +1335,18 @@ mod tests {
     }
 
     async fn volatile_filesystem_with_budget(volatile_memory_bytes: u64) -> Arc<ZeroFS> {
+        use crate::fs::mutation::config::DEFAULT_VOLATILE_MAX_OPERATIONS;
+        volatile_filesystem_with_limits(volatile_memory_bytes, DEFAULT_VOLATILE_MAX_OPERATIONS)
+            .await
+    }
+
+    async fn volatile_filesystem_with_limits(
+        volatile_memory_bytes: u64,
+        volatile_max_operations: usize,
+    ) -> Arc<ZeroFS> {
         use crate::fs::mutation::config::{
-            ClientDurabilityTarget, DEFAULT_VOLATILE_MAX_OPERATIONS, FilesystemWriteAckMode,
-            FilesystemWriteAckSettings, FilesystemWriteAckSource,
+            ClientDurabilityTarget, FilesystemWriteAckMode, FilesystemWriteAckSettings,
+            FilesystemWriteAckSource,
         };
         let mut filesystem = ZeroFS::new_in_memory()
             .await
@@ -1345,7 +1354,7 @@ mod tests {
         filesystem.write_ack = FilesystemWriteAckSettings {
             mode: FilesystemWriteAckMode::VolatileMemory,
             volatile_memory_bytes,
-            volatile_max_operations: DEFAULT_VOLATILE_MAX_OPERATIONS,
+            volatile_max_operations,
             source: FilesystemWriteAckSource::Filesystem,
             client_durability_target: ClientDurabilityTarget::LocalSsd,
         };
@@ -1361,7 +1370,17 @@ mod tests {
     async fn striped_export_volatile_with_budget(
         volatile_memory_bytes: u64,
     ) -> (Arc<ZeroFS>, NBDHandler, super::NBDDevice) {
-        let filesystem = volatile_filesystem_with_budget(volatile_memory_bytes).await;
+        use crate::fs::mutation::config::DEFAULT_VOLATILE_MAX_OPERATIONS;
+        striped_export_volatile_with_limits(volatile_memory_bytes, DEFAULT_VOLATILE_MAX_OPERATIONS)
+            .await
+    }
+
+    async fn striped_export_volatile_with_limits(
+        volatile_memory_bytes: u64,
+        volatile_max_operations: usize,
+    ) -> (Arc<ZeroFS>, NBDHandler, super::NBDDevice) {
+        let filesystem =
+            volatile_filesystem_with_limits(volatile_memory_bytes, volatile_max_operations).await;
         let credentials = root_credentials();
         let (nbd_dir, _) = filesystem
             .mkdir(&credentials, 0, b".nbd", &SetAttributes::default())
@@ -1902,6 +1921,91 @@ mod tests {
             coordinator.raw_budget().used_bytes(),
             0,
             "dropping a body-less admission must release its raw credit",
+        );
+    }
+
+    #[tokio::test]
+    async fn two_stripe_fua_write_uses_one_logical_volatile_operation() {
+        use crate::fs::mutation::durability::DurabilityTarget;
+        use std::sync::Mutex;
+
+        let (filesystem, handler, device) =
+            striped_export_volatile_with_limits(8 * 1024 * 1024, 1).await;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        filesystem.flush_coordinator.set_object_wait({
+            let seen = Arc::clone(&seen);
+            Arc::new(move |_, target| {
+                seen.lock().expect("seen").push(target);
+                Box::pin(async { Ok(()) })
+            })
+        });
+        let payload = Bytes::from_static(b"cross-two-stripe");
+        let offset = 4092;
+        let admission = handler
+            .begin_mutation(&device, mutation_request(offset, payload.len(), true))
+            .await
+            .expect("admit cross-stripe FUA write");
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            handler.write_admitted(&device, offset, payload.clone(), true, admission),
+        )
+        .await
+        .expect("one logical operation slot must admit every stripe member")
+        .expect("write cross-stripe FUA payload");
+
+        assert_eq!(
+            handler
+                .read(&device, offset, payload.len() as u32)
+                .await
+                .expect("read back cross-stripe payload"),
+            payload
+        );
+        assert_eq!(
+            *seen.lock().expect("seen"),
+            vec![DurabilityTarget::LocalSsd]
+        );
+    }
+
+    #[tokio::test]
+    async fn request_cache_pressure_is_wire_eio_and_recovers_after_slot_release() {
+        let (_filesystem, handler, device) =
+            striped_export_volatile_with_limits(8 * 1024 * 1024, 1).await;
+        let held = handler
+            .begin_mutation(&device, mutation_request(0, 16, false))
+            .await
+            .expect("hold the sole request-cache slot");
+        let retry_request = mutation_request(32, 16, false);
+
+        let error = match handler.begin_mutation(&device, retry_request).await {
+            Ok(_) => panic!("request-cache pressure admitted a second mutation"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, CommandError::IoError));
+        assert_eq!(error.to_errno(), NBD_EIO);
+
+        drop(held);
+        let recovered = handler
+            .begin_mutation(&device, retry_request)
+            .await
+            .expect("the same configured slot must recover after release");
+        let payload = Bytes::from_static(b"recovered-write!");
+        handler
+            .write_admitted(
+                &device,
+                retry_request.offset,
+                payload.clone(),
+                false,
+                recovered,
+            )
+            .await
+            .expect("write after request-cache slot release");
+        assert_eq!(
+            handler
+                .read(&device, retry_request.offset, payload.len() as u32)
+                .await
+                .expect("read back write after request-cache recovery"),
+            payload
         );
     }
 

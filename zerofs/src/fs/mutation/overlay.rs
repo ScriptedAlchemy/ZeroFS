@@ -233,6 +233,31 @@ impl FilesystemVolatileOverlay {
         self.runtime(inode).reserve(bytes).await
     }
 
+    async fn reserve_batch(
+        self: &Arc<Self>,
+        members: &[(InodeId, usize)],
+    ) -> OverlayResult<Vec<VolatileAdmission>> {
+        let runtimes = members
+            .iter()
+            .map(|(inode, _)| self.runtime(*inode))
+            .collect::<Vec<_>>();
+        let member_bytes = members
+            .iter()
+            .map(|(_, bytes)| *bytes as u64)
+            .collect::<Vec<_>>();
+        self.budget
+            .reserve_many_while(&member_bytes, || {
+                !self.is_frozen() && runtimes.iter().all(|runtime| runtime.can_accept())
+            })
+            .await
+            .map(|permits| {
+                permits
+                    .into_iter()
+                    .map(VolatileAdmission::from_permit)
+                    .collect()
+            })
+    }
+
     #[allow(dead_code)]
     pub(crate) fn preview_attrs(&self, inode: u64, attrs: FileAttributes) {
         self.latest_attrs
@@ -263,6 +288,7 @@ impl FilesystemVolatileOverlay {
 
     pub(crate) fn freeze_terminal(&self) {
         self.frozen.store(true, Ordering::Release);
+        self.budget.notify_waiters();
     }
 
     pub(crate) fn is_frozen(&self) -> bool {
@@ -788,17 +814,19 @@ impl ZeroFS {
             let _ = guard.abort(PreparationAbort::RequestFailure(FsError::IoError));
             return Err(FsError::IoError);
         };
-        let mut admissions = Vec::with_capacity(request.members.len());
-        for member in &request.members {
-            match overlay.reserve(member.id, member.data.len()).await {
-                Ok(admission) => admissions.push(admission),
-                Err(error) => {
-                    let fs_error = overlay_fs_error(error);
-                    let _ = guard.abort(PreparationAbort::RequestFailure(fs_error));
-                    return Err(fs_error);
-                }
+        let reservation_members = request
+            .members
+            .iter()
+            .map(|member| (member.id, member.data.len()))
+            .collect::<Vec<_>>();
+        let admissions = match overlay.reserve_batch(&reservation_members).await {
+            Ok(admissions) => admissions,
+            Err(error) => {
+                let fs_error = overlay_fs_error(error);
+                let _ = guard.abort(PreparationAbort::RequestFailure(fs_error));
+                return Err(fs_error);
             }
-        }
+        };
         let batch = match prepare_write(&self.write_prepare_context(), request).await {
             Ok(batch) => batch,
             Err(error) => {
@@ -1623,7 +1651,10 @@ mod tests {
     #[tokio::test]
     async fn partial_batch_acceptance_rolls_back_without_stuck_lane() {
         let mut fs = ZeroFS::new_in_memory().await.unwrap();
-        fs.write_ack = volatile_settings();
+        fs.write_ack = FilesystemWriteAckSettings {
+            volatile_max_operations: 1,
+            ..volatile_settings()
+        };
         let fs = Arc::new(fs);
         fs.install_volatile_overlay();
 
@@ -1667,6 +1698,45 @@ mod tests {
         let (data, eof) = fs.read_file(&auth, first, 0, 32).await.unwrap();
         assert!(data.is_empty());
         assert!(eof);
+        let (data, eof) = fs.read_file(&auth, second, 0, 32).await.unwrap();
+        assert!(data.is_empty());
+        assert!(eof);
+    }
+
+    #[tokio::test]
+    async fn freezing_overlay_wakes_a_blocked_batch_reservation() {
+        let mut fs = ZeroFS::new_in_memory().await.unwrap();
+        fs.write_ack = FilesystemWriteAckSettings {
+            volatile_max_operations: 1,
+            ..volatile_settings()
+        };
+        let fs = Arc::new(fs);
+        fs.install_volatile_overlay();
+
+        let auth = crate::fs::types::AuthContext::from(&test_creds());
+        let first = fs.create_exclusive(&auth, 0, b"freeze-a").await.unwrap();
+        let second = fs.create_exclusive(&auth, 0, b"freeze-b").await.unwrap();
+        let overlay = fs.volatile_overlay.get().expect("overlay").clone();
+        let held = overlay.reserve(first, 1).await.unwrap();
+        let members = [(first, 1), (second, 1)];
+        let mut reservation = Box::pin(overlay.reserve_batch(&members));
+        assert!(
+            futures::poll!(reservation.as_mut()).is_pending(),
+            "the held slot must park the batch reservation"
+        );
+
+        overlay.freeze_terminal();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), reservation)
+            .await
+            .expect("freeze must wake the blocked reservation");
+        let result = match result {
+            Ok(_) => panic!("frozen overlay admitted the batch reservation"),
+            Err(error) => error,
+        };
+        assert_eq!(result, OverlayError::IoError);
+        drop(held);
+        assert_eq!(overlay.budget().status().dirty_bytes, 0);
+        assert_eq!(overlay.budget().status().dirty_operations, 0);
     }
 
     #[tokio::test]

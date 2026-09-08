@@ -78,30 +78,63 @@ impl VolatileBudget {
         budget
     }
 
-    async fn reserve(self: &Arc<Self>, bytes: u64) -> OverlayResult<BudgetPermit> {
-        if bytes > self.max_bytes {
+    pub(crate) async fn reserve_many_while<F>(
+        self: &Arc<Self>,
+        member_bytes: &[u64],
+        accepting: F,
+    ) -> OverlayResult<Vec<BudgetPermit>>
+    where
+        F: Fn() -> bool,
+    {
+        let total_bytes = member_bytes
+            .iter()
+            .try_fold(0_u64, |total, bytes| total.checked_add(*bytes))
+            .ok_or(OverlayError::NoSpace)?;
+        if member_bytes.is_empty() {
+            return Err(OverlayError::InvalidArgument);
+        }
+        if total_bytes > self.max_bytes {
             return Err(OverlayError::NoSpace);
         }
         loop {
             let changed = self.changed.notified();
-            {
+            if !accepting() {
+                return Err(OverlayError::IoError);
+            }
+            let permits = {
                 let mut state = self.state.lock().expect("volatile budget poisoned");
                 if state.terminal {
                     return Err(OverlayError::IoError);
                 }
-                if state.used_bytes.saturating_add(bytes) <= self.max_bytes
+                if let Some(used_bytes) = state.used_bytes.checked_add(total_bytes)
+                    && used_bytes <= self.max_bytes
                     && state.used_operations < self.max_operations
                 {
-                    state.used_bytes += bytes;
+                    state.used_bytes = used_bytes;
                     state.used_operations += 1;
-                    let permit = BudgetPermit {
+                    let operation = Arc::new(BudgetOperationPermit {
                         budget: Arc::clone(self),
-                        bytes,
-                    };
-                    drop(state);
-                    self.record_metrics();
-                    return Ok(permit);
+                    });
+                    Some(
+                        member_bytes
+                            .iter()
+                            .map(|bytes| BudgetPermit {
+                                operation: Arc::clone(&operation),
+                                bytes: *bytes,
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                } else {
+                    None
                 }
+            };
+            if let Some(permits) = permits {
+                self.record_metrics();
+                if !accepting() {
+                    drop(permits);
+                    return Err(OverlayError::IoError);
+                }
+                return Ok(permits);
             }
             changed.await;
         }
@@ -143,6 +176,10 @@ impl VolatileBudget {
         metrics::gauge!("zerofs_nbd_volatile_memory_terminal").set(f64::from(status.terminal));
     }
 
+    pub(crate) fn notify_waiters(&self) {
+        self.changed.notify_waiters();
+    }
+
     #[cfg(test)]
     fn used_bytes(&self) -> u64 {
         self.state
@@ -153,14 +190,32 @@ impl VolatileBudget {
 }
 
 pub(crate) struct BudgetPermit {
-    budget: Arc<VolatileBudget>,
+    operation: Arc<BudgetOperationPermit>,
     bytes: u64,
 }
 
 impl Drop for BudgetPermit {
     fn drop(&mut self) {
-        let mut state = self.budget.state.lock().expect("volatile budget poisoned");
+        let mut state = self
+            .operation
+            .budget
+            .state
+            .lock()
+            .expect("volatile budget poisoned");
         state.used_bytes -= self.bytes;
+        drop(state);
+        self.operation.budget.record_metrics();
+        self.operation.budget.changed.notify_waiters();
+    }
+}
+
+struct BudgetOperationPermit {
+    budget: Arc<VolatileBudget>,
+}
+
+impl Drop for BudgetOperationPermit {
+    fn drop(&mut self) {
+        let mut state = self.budget.state.lock().expect("volatile budget poisoned");
         state.used_operations -= 1;
         drop(state);
         self.budget.record_metrics();
@@ -170,6 +225,12 @@ impl Drop for BudgetPermit {
 
 pub(crate) struct VolatileAdmission {
     permit: BudgetPermit,
+}
+
+impl VolatileAdmission {
+    pub(crate) fn from_permit(permit: BudgetPermit) -> Self {
+        Self { permit }
+    }
 }
 
 struct OverlayEntry {
@@ -320,23 +381,18 @@ impl VolatileWriteRuntime {
     }
 
     pub(crate) async fn reserve(&self, bytes: usize) -> OverlayResult<VolatileAdmission> {
-        loop {
-            let changed = self.changed.notified();
-            if self.terminal().is_some() || !self.is_accepting() {
-                return Err(OverlayError::IoError);
-            }
-            tokio::select! {
-                permit = self.budget.reserve(bytes as u64) => {
-                    let permit = permit?;
-                    if self.terminal().is_some() || !self.is_accepting() {
-                        drop(permit);
-                        return Err(OverlayError::IoError);
-                    }
-                    return Ok(VolatileAdmission { permit });
-                }
-                _ = changed => {}
-            }
-        }
+        let mut permits = self
+            .budget
+            .reserve_many_while(&[bytes as u64], || self.can_accept())
+            .await?;
+        Ok(VolatileAdmission {
+            permit: permits.pop().expect("one requested budget permit"),
+        })
+    }
+
+    pub(crate) fn can_accept(&self) -> bool {
+        let state = self.state.lock().expect("volatile runtime poisoned");
+        state.terminal.is_none() && state.accepting
     }
 
     /// Accept a write that is visible the moment it is accepted, the shape a
@@ -557,13 +613,6 @@ impl VolatileWriteRuntime {
             result = Err(OverlayError::IoError);
         }
         result
-    }
-
-    fn is_accepting(&self) -> bool {
-        self.state
-            .lock()
-            .expect("volatile runtime poisoned")
-            .accepting
     }
 
     fn terminal(&self) -> Option<(u64, OverlayError)> {
@@ -1454,5 +1503,20 @@ mod tests {
         runtime.fence_abort();
         assert!(budget.status().terminal);
         release.notify_waiters();
+    }
+
+    #[tokio::test]
+    async fn logical_reservation_releases_operation_after_its_last_member() {
+        let budget = VolatileBudget::new(8, 1);
+        let mut permits = budget.reserve_many_while(&[3, 5], || true).await.unwrap();
+
+        assert_eq!(budget.status().dirty_bytes, 8);
+        assert_eq!(budget.status().dirty_operations, 1);
+        drop(permits.pop());
+        assert_eq!(budget.status().dirty_bytes, 3);
+        assert_eq!(budget.status().dirty_operations, 1);
+        drop(permits);
+        assert_eq!(budget.status().dirty_bytes, 0);
+        assert_eq!(budget.status().dirty_operations, 0);
     }
 }
