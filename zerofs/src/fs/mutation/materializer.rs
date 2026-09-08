@@ -548,24 +548,22 @@ impl Materializer {
     }
 }
 
-fn spawn_lane(
+async fn spawn_lane(
     materializer: Arc<Materializer>,
     inode: u64,
     generation: u64,
     mut receiver: mpsc::UnboundedReceiver<LaneJob>,
-) -> impl Future<Output = ()> + Send + 'static {
-    async move {
-        let mut next = receiver.recv().await;
-        while let Some(job) = next {
-            run_lane_job(&materializer, inode, job).await;
-            #[cfg(test)]
-            if receiver.is_empty() {
-                materializer
-                    .pause_before_idle_retirement_for_test(inode)
-                    .await;
-            }
-            next = next_lane_job_or_retire(&materializer, inode, generation, &mut receiver);
+) {
+    let mut next = receiver.recv().await;
+    while let Some(job) = next {
+        run_lane_job(&materializer, inode, job).await;
+        #[cfg(test)]
+        if receiver.is_empty() {
+            materializer
+                .pause_before_idle_retirement_for_test(inode)
+                .await;
         }
+        next = next_lane_job_or_retire(&materializer, inode, generation, &mut receiver);
     }
 }
 
