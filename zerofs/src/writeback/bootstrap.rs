@@ -1,3 +1,4 @@
+use crate::writeback::anchored_dir::AnchoredDir;
 use crate::writeback::config::WritebackSettings;
 use crate::writeback::journal::Journal;
 use crate::writeback::model::JournalIdentity;
@@ -5,10 +6,6 @@ use crate::writeback::reservation::SsdAdmission;
 use crate::writeback::space_sample::PhysicalSpaceSampler;
 use crate::writeback::store::WritebackObjectStore;
 use object_store::ObjectStore;
-use std::fs;
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
 use std::sync::Arc;
 
 pub(crate) struct AttachedWriteback {
@@ -34,11 +31,12 @@ pub(crate) async fn attach(
     namespace: &str,
 ) -> anyhow::Result<AttachedWriteback> {
     validate_namespace(namespace)?;
-    ensure_base_directory(&settings.dir)?;
-    settings.dir = settings.dir.join(namespace);
-    let journal = Arc::new(Journal::open(&settings.dir, identity)?);
+    let base = AnchoredDir::open_or_create_absolute(&settings.dir, 0o700)?;
+    let journal_dir = base.open_or_create_child(namespace.as_ref(), 0o700)?;
+    settings.dir = journal_dir.display().to_path_buf();
+    let journal = Arc::new(Journal::open_anchored(journal_dir.clone(), identity)?);
     let recovery = journal.progress()?;
-    let space = Arc::new(PhysicalSpaceSampler::new(settings.dir.clone()));
+    let space = Arc::new(PhysicalSpaceSampler::new_anchored(journal_dir));
     let sample = space.sample().await?;
     let pending = journal.pending_ssd_reservations()?;
     let ssd = Arc::new(SsdAdmission::recover(
@@ -72,37 +70,6 @@ pub(crate) async fn attach(
         space,
         ssd,
     })
-}
-
-fn ensure_base_directory(path: &Path) -> anyhow::Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            if metadata.file_type().is_symlink() || !metadata.is_dir() {
-                anyhow::bail!("writeback base {} must be a real directory", path.display());
-            }
-            super::validate_owner_only(path, &metadata, 0o700, "writeback base")?;
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            fs::create_dir(path).map_err(|error| {
-                anyhow::anyhow!(
-                    "failed to create writeback base {}: {error}",
-                    path.display()
-                )
-            })?;
-            #[cfg(unix)]
-            fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-            if let Some(parent) = path.parent() {
-                fs::File::open(parent)?.sync_all()?;
-            }
-        }
-        Err(error) => {
-            anyhow::bail!(
-                "failed to inspect writeback base {}: {error}",
-                path.display()
-            );
-        }
-    }
-    Ok(())
 }
 
 fn validate_namespace(namespace: &str) -> anyhow::Result<()> {

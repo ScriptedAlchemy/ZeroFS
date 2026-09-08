@@ -217,7 +217,7 @@ fn decimal_gb_to_bytes(name: &str, value: f64) -> Result<u64> {
     Ok(bytes.round() as u64)
 }
 
-fn normalize_absolute_path(path: &Path, name: &str) -> Result<PathBuf> {
+pub(crate) fn normalize_absolute_path(path: &Path, name: &str) -> Result<PathBuf> {
     if path.as_os_str().is_empty() {
         bail!("{name} must be configured when writeback is enabled");
     }

@@ -4,9 +4,16 @@
 //! [`PhysicalSpaceSample`] values from [`PhysicalSpaceSampler::sample`]. They
 //! do not allocate or construct generations themselves.
 
+use crate::writeback::anchored_dir::AnchoredDir;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+#[derive(Debug, Clone)]
+enum SpaceSource {
+    Path(PathBuf),
+    Anchored(AnchoredDir),
+}
 
 /// One successful probe of the writeback filesystem.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,6 +26,7 @@ pub(crate) struct PhysicalSpaceSample {
 #[derive(Debug)]
 pub(crate) struct PhysicalSpaceSampler {
     writeback_dir: PathBuf,
+    source: SpaceSource,
     next_generation: AtomicU64,
     latest_generation: AtomicU64,
     latest_available: AtomicU64,
@@ -40,8 +48,20 @@ pub(crate) enum SpaceSampleError {
 
 impl PhysicalSpaceSampler {
     pub(crate) fn new(writeback_dir: impl Into<PathBuf>) -> Self {
+        let writeback_dir = writeback_dir.into();
         Self {
-            writeback_dir: writeback_dir.into(),
+            source: SpaceSource::Path(writeback_dir.clone()),
+            writeback_dir,
+            next_generation: AtomicU64::new(1),
+            latest_generation: AtomicU64::new(0),
+            latest_available: AtomicU64::new(0),
+        }
+    }
+
+    pub(crate) fn new_anchored(writeback_dir: AnchoredDir) -> Self {
+        Self {
+            writeback_dir: writeback_dir.display().to_path_buf(),
+            source: SpaceSource::Anchored(writeback_dir),
             next_generation: AtomicU64::new(1),
             latest_generation: AtomicU64::new(0),
             latest_available: AtomicU64::new(0),
@@ -75,17 +95,22 @@ impl PhysicalSpaceSampler {
     ///
     /// The generation is allocated only after `fs4::available_space` succeeds.
     pub(crate) async fn sample(&self) -> Result<PhysicalSpaceSample, SpaceSampleError> {
-        let path = self.writeback_dir.clone();
-        let available_bytes = tokio::task::spawn_blocking(move || fs4::available_space(&path))
-            .await
-            .map_err(|error| SpaceSampleError::Probe {
-                path: self.writeback_dir.clone(),
-                source: io::Error::other(format!("space probe task failed: {error}")),
-            })?
-            .map_err(|source| SpaceSampleError::Probe {
-                path: self.writeback_dir.clone(),
-                source,
-            })?;
+        let source = self.source.clone();
+        let available_bytes = tokio::task::spawn_blocking(move || match source {
+            SpaceSource::Path(path) => fs4::available_space(path),
+            SpaceSource::Anchored(directory) => directory
+                .available_space()
+                .map_err(|error| io::Error::other(error.to_string())),
+        })
+        .await
+        .map_err(|error| SpaceSampleError::Probe {
+            path: self.writeback_dir.clone(),
+            source: io::Error::other(format!("space probe task failed: {error}")),
+        })?
+        .map_err(|source| SpaceSampleError::Probe {
+            path: self.writeback_dir.clone(),
+            source,
+        })?;
         let generation = self.next_generation.fetch_add(1, Ordering::AcqRel);
         publish_latest(&self.latest_generation, generation);
         self.latest_available
@@ -128,6 +153,7 @@ fn publish_latest(latest: &AtomicU64, generation: u64) {
 #[cfg(test)]
 mod tests {
     use super::{PhysicalSpaceSampler, SpaceSampleError};
+    use crate::writeback::anchored_dir::AnchoredDir;
     use std::collections::BTreeSet;
     use std::sync::Arc;
 
@@ -204,6 +230,24 @@ mod tests {
         let sample = sampler.sample().await.unwrap();
         assert_eq!(sample.generation, 1);
         assert_eq!(sampler.latest_generation(), 1);
+    }
+
+    #[tokio::test]
+    async fn anchored_sample_survives_pathname_replacement() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let original = temp.path().join("original");
+        let retained = temp.path().join("retained");
+        std::fs::create_dir(&original).unwrap();
+        std::fs::set_permissions(&original, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let anchored = AnchoredDir::open_or_create_absolute(&original, 0o700).unwrap();
+        let sampler = PhysicalSpaceSampler::new_anchored(anchored);
+        std::fs::rename(&original, &retained).unwrap();
+
+        let sample = sampler.sample().await.unwrap();
+
+        assert!(sample.available_bytes > 0);
+        assert_eq!(sample.generation, 1);
     }
 
     #[tokio::test]

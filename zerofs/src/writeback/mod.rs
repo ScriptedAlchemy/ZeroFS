@@ -3,6 +3,7 @@
 /// RAM admission lives in this module. SSD ownership lives in `reservation`. The shared FIFO gate lives
 /// in `crate::coordination::admission`.
 pub mod admission;
+pub(crate) mod anchored_dir;
 /// Shared durability-barrier primitive.
 ///
 /// The local journaler and the remote scheduler both publish the same progress

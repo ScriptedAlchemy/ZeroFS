@@ -122,6 +122,7 @@
 //! it runs ahead of it; it takes the expected first sequence from its caller
 //! as an early check and leaves the authoritative one to the commit.
 
+use crate::writeback::anchored_dir::AnchoredDir;
 use crate::writeback::model::{
     FenceClass, JournalIdentity, MutationKind, MutationMode, MutationRecord, Sequence,
     classify_mutation_fence, is_canonical_segment_path,
@@ -132,15 +133,16 @@ use bytes::Bytes;
 use fs4::fs_std::FileExt;
 use futures::{StreamExt, stream, stream::BoxStream};
 use redb::{
-    Database, Durability, ReadOnlyDatabase, ReadableDatabase, ReadableTable, TableDefinition,
+    Builder, Database, Durability, ReadOnlyDatabase, ReadableDatabase, ReadableTable,
+    TableDefinition,
 };
+use rustix::fs::OFlags;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+use std::fs::File;
 use std::io::{Read, Seek};
-#[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -166,6 +168,7 @@ const FENCE_CLASSIFICATION_VERSION: u32 = 2;
 
 pub struct Journal {
     root: PathBuf,
+    root_dir: AnchoredDir,
     database: Database,
     write_gate: JournalWriteGate,
     _lock_file: File,
@@ -286,7 +289,7 @@ impl Drop for JournalWriteGuard<'_> {
 pub(crate) enum StagedBatch {
     Durable {
         records: Vec<MutationRecord>,
-        container: Option<PathBuf>,
+        container: Option<AnchoredFileLocation>,
     },
     /// A sink that does not separate the two halves (the journaler's test
     /// doubles) carries its prepared mutations through to the commit half
@@ -315,15 +318,22 @@ pub(crate) struct PreparedMutation {
 }
 
 trait PublicationFilesystem {
-    fn sync_directory(&self, path: &Path) -> Result<()>;
+    fn sync_directory(&self, directory: &AnchoredDir) -> Result<()>;
 }
 
 struct StdPublicationFilesystem;
 
 impl PublicationFilesystem for StdPublicationFilesystem {
-    fn sync_directory(&self, path: &Path) -> Result<()> {
-        sync_directory(path)
+    fn sync_directory(&self, directory: &AnchoredDir) -> Result<()> {
+        directory.sync()
     }
+}
+
+pub(crate) struct AnchoredFileLocation {
+    parent: AnchoredDir,
+    name: OsString,
+    relative: PathBuf,
+    display: PathBuf,
 }
 
 impl PreparedMutation {
@@ -427,12 +437,32 @@ pub struct PendingWindow {
     pub(crate) records: Vec<MutationRecord>,
 }
 
+fn normalize_journal_root(root: &Path) -> Result<PathBuf> {
+    let absolute = if root.is_absolute() {
+        root.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("failed to resolve relative writeback journal path")?
+            .join(root)
+    };
+    let Some(Component::Normal(name)) = absolute.components().next_back() else {
+        bail!("writeback journal path must end in a directory name");
+    };
+    let parent = absolute
+        .parent()
+        .context("writeback journal path has no parent directory")?;
+    let normalized_parent =
+        crate::writeback::config::normalize_absolute_path(parent, "writeback journal parent")?;
+    Ok(normalized_parent.join(name))
+}
+
 impl Journal {
     #[cfg(test)]
     pub(crate) fn open_existing(root: impl AsRef<Path>) -> Result<Self> {
-        let root = root.as_ref().to_path_buf();
-        let identity = Self::read_existing_identity(&root)?;
-        Self::open(root, identity)
+        let root = normalize_journal_root(root.as_ref())?;
+        let root_dir = AnchoredDir::open_absolute(&root, 0o700)?;
+        let identity = Self::read_existing_identity(&root_dir)?;
+        Self::open_anchored(root_dir, identity)
     }
 
     /// Open a stopped journal only after its persisted identity matches the
@@ -442,36 +472,29 @@ impl Journal {
         root: impl AsRef<Path>,
         expected_identity: JournalIdentity,
     ) -> Result<Self> {
-        let root = root.as_ref().to_path_buf();
-        let actual_identity = Self::read_existing_identity(&root)?;
+        let root = normalize_journal_root(root.as_ref())?;
+        let root_dir = AnchoredDir::open_absolute(&root, 0o700)?;
+        let actual_identity = Self::read_existing_identity(&root_dir)?;
         if actual_identity != expected_identity {
             bail!("writeback journal identity mismatch");
         }
-        Self::open(root, expected_identity)
+        Self::open_anchored(root_dir, expected_identity)
     }
 
-    fn read_existing_identity(root: &Path) -> Result<JournalIdentity> {
-        let database_path = root.join("journal.redb");
-        reject_symlink_if_present(&database_path, "journal database")?;
-        if !database_path.is_file() {
-            bail!(
-                "writeback journal database does not exist at {}",
-                database_path.display()
-            );
-        }
-        let metadata =
-            fs::metadata(&database_path).context("failed to inspect journal database")?;
-        if !metadata.is_file() {
-            bail!(
-                "journal database {} is not a regular file",
-                database_path.display()
-            );
-        }
-        validate_owner_only(&database_path, &metadata, 0o600)?;
-        let database = ReadOnlyDatabase::open(&database_path).with_context(|| {
+    fn read_existing_identity(root_dir: &AnchoredDir) -> Result<JournalIdentity> {
+        let database_file = root_dir
+            .open_existing_owner_file_read_only("journal.redb".as_ref())
+            .with_context(|| {
+                format!(
+                    "writeback journal database does not exist at {}",
+                    root_dir.display().join("journal.redb").display()
+                )
+            })?;
+        let descriptor_path = AnchoredDir::descriptor_path(&database_file);
+        let database = ReadOnlyDatabase::open(&descriptor_path).with_context(|| {
             format!(
                 "failed to open existing journal database read-only {}",
-                database_path.display()
+                root_dir.display().join("journal.redb").display()
             )
         })?;
         let read = database
@@ -484,43 +507,57 @@ impl Journal {
     }
 
     pub(crate) fn open(root: impl AsRef<Path>, expected_identity: JournalIdentity) -> Result<Self> {
-        let root = root.as_ref().to_path_buf();
-        ensure_journal_root(&root)?;
-        let lock_path = root.join("LOCK");
-        reject_symlink_if_present(&lock_path, "journal lock")?;
-        let lock_file = open_owner_file(&lock_path, true)
-            .with_context(|| format!("failed to open journal lock {}", lock_path.display()))?;
+        Self::open_with_root_hook(root, expected_identity, |_| Ok(()))
+    }
+
+    pub(crate) fn open_anchored(
+        root_dir: AnchoredDir,
+        expected_identity: JournalIdentity,
+    ) -> Result<Self> {
+        Self::open_anchored_with_root_hook(root_dir, expected_identity, |_| Ok(()))
+    }
+
+    fn open_with_root_hook(
+        root: impl AsRef<Path>,
+        expected_identity: JournalIdentity,
+        after_root_open: impl FnOnce(&Path) -> Result<()>,
+    ) -> Result<Self> {
+        let root = normalize_journal_root(root.as_ref())?;
+        let root_dir = AnchoredDir::open_or_create_absolute(&root, 0o700)?;
+        Self::open_anchored_with_root_hook(root_dir, expected_identity, after_root_open)
+    }
+
+    fn open_anchored_with_root_hook(
+        root_dir: AnchoredDir,
+        expected_identity: JournalIdentity,
+        after_root_open: impl FnOnce(&Path) -> Result<()>,
+    ) -> Result<Self> {
+        let root = root_dir.display().to_path_buf();
+        after_root_open(&root)?;
+        let (lock_file, _) = root_dir
+            .open_owner_file("LOCK".as_ref(), true)
+            .with_context(|| {
+                format!(
+                    "failed to open journal lock {}",
+                    root.join("LOCK").display()
+                )
+            })?;
         if !FileExt::try_lock_exclusive(&lock_file).context("failed to acquire journal lock")? {
             bail!("writeback journal is already locked by another process");
         }
 
-        let blobs = root.join("blobs");
-        let tmp = root.join("tmp");
-        ensure_owner_directory(&blobs, true)?;
-        ensure_owner_directory(&tmp, true)?;
-        let database_path = root.join("journal.redb");
-        reject_symlink_if_present(&database_path, "journal database")?;
-        let database_existed = database_path.exists();
-        if database_existed {
-            let metadata =
-                fs::metadata(&database_path).context("failed to inspect journal database")?;
-            if !metadata.is_file() {
-                bail!(
-                    "journal database {} is not a regular file",
-                    database_path.display()
-                );
-            }
-            validate_owner_only(&database_path, &metadata, 0o600)?;
-        }
-        let database = Database::create(&database_path).with_context(|| {
+        root_dir.open_or_create_child("blobs".as_ref(), 0o700)?;
+        root_dir.open_or_create_child("tmp".as_ref(), 0o700)?;
+        let (database_file, database_existed) =
+            root_dir.open_owner_file("journal.redb".as_ref(), true)?;
+        let database = Builder::new().create_file(database_file).with_context(|| {
             format!(
                 "failed to open journal database {}",
-                database_path.display()
+                root.join("journal.redb").display()
             )
         })?;
         if !database_existed {
-            set_owner_only_file(&database_path)?;
-            sync_directory(&root)?;
+            root_dir.sync()?;
         }
 
         initialize_or_validate_identity(&database, &expected_identity)?;
@@ -529,6 +566,7 @@ impl Journal {
         backfill_remote_object_versions(&database)?;
         let journal = Self {
             root,
+            root_dir,
             database,
             write_gate: JournalWriteGate::default(),
             _lock_file: lock_file,
@@ -554,6 +592,37 @@ impl Journal {
 
     pub(crate) fn root(&self) -> &Path {
         &self.root
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn anchored_root(&self) -> AnchoredDir {
+        self.root_dir.clone()
+    }
+
+    fn blob_location(&self, relative: &str, create_parent: bool) -> Result<AnchoredFileLocation> {
+        let relative = checked_blob_relative(relative)?;
+        let (parent, name) = self
+            .root_dir
+            .resolve_parent(&relative, create_parent, 0o700)?;
+        Ok(AnchoredFileLocation {
+            parent,
+            name,
+            display: self.root.join(&relative),
+            relative,
+        })
+    }
+
+    fn existing_blob_location(&self, relative: &str) -> Result<Option<AnchoredFileLocation>> {
+        let relative = checked_blob_relative(relative)?;
+        let Some((parent, name)) = self.root_dir.try_resolve_parent(&relative, 0o700)? else {
+            return Ok(None);
+        };
+        Ok(Some(AnchoredFileLocation {
+            parent,
+            name,
+            display: self.root.join(&relative),
+            relative,
+        }))
     }
 
     pub(crate) fn snapshot(&self) -> Result<JournalSnapshot> {
@@ -960,27 +1029,21 @@ impl Journal {
         };
         record_local_publish_phase("container_write", write_started.elapsed());
 
-        let mut directories = BTreeSet::new();
-        if let Some(path) = written.as_deref() {
-            // The container exists on disk from here on, so every exit has to
-            // unlink it rather than return straight out.
-            let Some(parent) = path.parent() else {
-                let error = anyhow::anyhow!("blob path has no parent");
-                return Err(with_container_cleanup(error, self.discard_container(path)));
-            };
-            directories.insert(parent.to_path_buf());
-        }
+        let directories = written
+            .iter()
+            .map(|container| container.parent.clone())
+            .collect::<Vec<_>>();
 
         let fsync_started = Instant::now();
         for directory in &directories {
             if let Err(error) = filesystem.sync_directory(directory) {
                 let publication = error.context(format!(
                     "failed to fsync published blob directory {}",
-                    directory.display()
+                    directory.display().display()
                 ));
                 return Err(with_container_cleanup(
                     publication,
-                    self.rollback_uncommitted_batch(written.as_deref(), &directories, filesystem),
+                    self.rollback_uncommitted_batch(written.as_ref(), &directories, filesystem),
                 ));
             }
         }
@@ -1028,9 +1091,7 @@ impl Journal {
     /// from sitting on bytes nothing references.
     pub(crate) fn discard_staged(&self, staged: StagedBatch) -> Result<()> {
         match staged {
-            StagedBatch::Durable { container, .. } => {
-                self.discard_container_at(container.as_deref())
-            }
+            StagedBatch::Durable { container, .. } => self.discard_container_at(container.as_ref()),
             StagedBatch::Unstaged(prepared) => {
                 drop(prepared);
                 Ok(())
@@ -1038,7 +1099,7 @@ impl Journal {
         }
     }
 
-    fn discard_container_at(&self, container: Option<&Path>) -> Result<()> {
+    fn discard_container_at(&self, container: Option<&AnchoredFileLocation>) -> Result<()> {
         match container {
             Some(path) => self.discard_container(path),
             None => Ok(()),
@@ -1052,11 +1113,8 @@ impl Journal {
         &self,
         relative: &str,
         payloads: &[(usize, VerifiedPayload)],
-    ) -> Result<PathBuf> {
-        let path = checked_join(&self.root, relative)?;
-        let shard = path.parent().context("blob path has no parent")?;
-        ensure_owner_directory(shard, true)?;
-        reject_symlink_if_present(&path, "journal container blob")?;
+    ) -> Result<AnchoredFileLocation> {
+        let location = self.blob_location(relative, true)?;
 
         let expected_len = payloads
             .iter()
@@ -1067,8 +1125,12 @@ impl Journal {
         // Create first, and only arm the cleanup once the file exists: a
         // failure to create it means there is nothing of ours to unlink, and
         // whatever occupies the name is not ours to remove.
-        let mut file = open_owner_file(&path, false)
-            .with_context(|| format!("failed to create container {}", path.display()))?;
+        let (mut file, _) = location
+            .parent
+            .open_owner_file(&location.name, false)
+            .with_context(|| {
+                format!("failed to create container {}", location.display.display())
+            })?;
         let write = (|| -> Result<()> {
             for (_, payload) in payloads {
                 payload
@@ -1091,27 +1153,27 @@ impl Journal {
             Ok(())
         })();
         if let Err(error) = write {
-            return Err(with_container_cleanup(error, self.discard_container(&path)));
+            return Err(with_container_cleanup(
+                error,
+                self.discard_container(&location),
+            ));
         }
-        Ok(path)
+        Ok(location)
     }
 
     fn rollback_uncommitted_batch(
         &self,
-        written: Option<&Path>,
-        directories: &BTreeSet<PathBuf>,
+        written: Option<&AnchoredFileLocation>,
+        directories: &[AnchoredDir],
         filesystem: &dyn PublicationFilesystem,
     ) -> Result<()> {
         let mut first_error = None;
-        if let Some(path) = written {
-            match fs::remove_file(path) {
+        if let Some(location) = written {
+            match location.parent.remove_file(&location.name) {
                 Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => {
-                    first_error = Some(
-                        anyhow::Error::new(error)
-                            .context("failed to remove uncommitted publication container"),
-                    );
+                    first_error =
+                        Some(error.context("failed to remove uncommitted publication container"));
                 }
             }
         }
@@ -1121,7 +1183,7 @@ impl Journal {
             {
                 first_error = Some(error.context(format!(
                     "failed to fsync uncommitted blob cleanup directory {}",
-                    directory.display()
+                    directory.display().display()
                 )));
             }
         }
@@ -1228,15 +1290,15 @@ impl Journal {
         Ok(())
     }
 
-    fn discard_container(&self, path: &Path) -> Result<()> {
-        match fs::remove_file(path) {
-            Ok(()) => match path.parent() {
-                Some(parent) => sync_directory(parent),
-                None => Ok(()),
-            },
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error).context("failed to remove uncommitted container"),
+    fn discard_container(&self, location: &AnchoredFileLocation) -> Result<()> {
+        let removed = location
+            .parent
+            .remove_file_if_exists(&location.name)
+            .context("failed to remove uncommitted container")?;
+        if removed {
+            location.parent.sync()?;
         }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -1266,8 +1328,12 @@ impl Journal {
             .blob_path()
             .with_context(|| format!("journal mutation {sequence} has no blob"))?;
         let reference = BlobRef::parse(reference)?;
-        let path = checked_join(&self.root, reference.relative)?;
-        open_verified_blob(&path, reference.slice, &record)
+        let location = self.blob_location(reference.relative, false)?;
+        let file = location
+            .parent
+            .open_file(&location.name, OFlags::RDONLY, 0)
+            .with_context(|| format!("missing committed blob {}", location.display.display()))?;
+        open_verified_blob(file, &location.display, reference.slice, &record)
     }
 
     #[cfg(test)]
@@ -1680,7 +1746,7 @@ impl Journal {
                 continue;
             };
             let reference = BlobRef::parse(relative)?;
-            let path = checked_join(&self.root, reference.relative)?;
+            let path = checked_blob_relative(reference.relative)?;
             if let Some(parent) = path.parent() {
                 shards.insert(parent.to_path_buf());
             }
@@ -1692,21 +1758,41 @@ impl Journal {
                 legacy.insert(path);
             }
         }
-        let mut swept = BTreeSet::new();
-        for shard in &shards {
-            for container in drained_containers_in(shard, through)? {
-                remove_blob_file(&container)?;
-                swept.insert(shard.clone());
+        let mut swept = BTreeMap::new();
+        for shard_path in &shards {
+            let Some(shard) = self.root_dir.try_open_relative_dir(shard_path, 0o700)? else {
+                continue;
+            };
+            shard.for_each_entry(|name| {
+                let Some(last) = name.to_str().and_then(container_last_sequence) else {
+                    return Ok(());
+                };
+                if last <= through && shard.remove_file_if_exists(name)? {
+                    swept.insert(shard_path.clone(), shard.clone());
+                }
+                Ok(())
+            })?;
+        }
+        for relative in &legacy {
+            let relative = relative
+                .to_str()
+                .context("journal blob path is not UTF-8")?;
+            let Some(location) = self.existing_blob_location(relative)? else {
+                continue;
+            };
+            if location.parent.remove_file_if_exists(&location.name)? {
+                swept.insert(
+                    location
+                        .relative
+                        .parent()
+                        .context("blob path has no parent")?
+                        .to_path_buf(),
+                    location.parent,
+                );
             }
         }
-        for path in &legacy {
-            remove_blob_file(path)?;
-            if let Some(parent) = path.parent() {
-                swept.insert(parent.to_path_buf());
-            }
-        }
-        for shard in &swept {
-            sync_directory(shard)?;
+        for shard in swept.values() {
+            shard.sync()?;
         }
 
         let _write = self.write_gate.lock();
@@ -1741,25 +1827,24 @@ impl Journal {
     /// a stray one costs disk until the next restart instead of failing
     /// `reject_unreferenced_blobs` and refusing to open the journal at all.
     fn reclaim_drained_containers(&self, through: Sequence) -> Result<()> {
-        let mut swept = BTreeSet::new();
-        for shard in
-            fs::read_dir(self.root.join("blobs")).context("failed to scan blob directory")?
-        {
-            let shard = shard.context("failed to read blob shard")?.path();
-            if !fs::symlink_metadata(&shard)
-                .context("failed to inspect blob shard")?
-                .is_dir()
-            {
-                continue;
+        let blobs = self.root_dir.open_child("blobs".as_ref(), 0o700)?;
+        blobs.for_each_entry(|shard_name| {
+            let shard = blobs.open_child(shard_name, 0o700)?;
+            let mut removed = false;
+            shard.for_each_entry(|name| {
+                let Some(last) = name.to_str().and_then(container_last_sequence) else {
+                    return Ok(());
+                };
+                if last <= through && shard.remove_file_if_exists(name)? {
+                    removed = true;
+                }
+                Ok(())
+            })?;
+            if removed {
+                shard.sync()?;
             }
-            for container in drained_containers_in(&shard, through)? {
-                remove_blob_file(&container)?;
-                swept.insert(shard.clone());
-            }
-        }
-        for shard in &swept {
-            sync_directory(shard)?;
-        }
+            Ok(())
+        })?;
         Ok(())
     }
 
@@ -1792,20 +1877,22 @@ impl Journal {
     }
 
     fn recover_local_artifacts(&self) -> Result<()> {
-        remove_directory_contents(&self.root.join("tmp"))?;
-        sync_directory(self.root.join("tmp"))?;
+        let tmp = self.root_dir.open_child("tmp".as_ref(), 0o700)?;
+        tmp.for_each_entry(|name| tmp.remove_tree(name))?;
+        tmp.sync()?;
 
         let pending = self.pending_blobs()?;
         for relative in pending.values() {
-            let path = checked_join(&self.root, BlobRef::parse(relative)?.relative)?;
-            match fs::remove_file(&path) {
-                Ok(()) => {
-                    if let Some(parent) = path.parent() {
-                        sync_directory(parent)?;
-                    }
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error).context("failed to remove uncommitted blob"),
+            let Some(location) = self.existing_blob_location(BlobRef::parse(relative)?.relative)?
+            else {
+                continue;
+            };
+            if location
+                .parent
+                .remove_file_if_exists(&location.name)
+                .context("failed to remove uncommitted blob")?
+            {
+                location.parent.sync()?;
             }
         }
         if !pending.is_empty() {
@@ -1844,39 +1931,25 @@ impl Journal {
     /// reject it as unreferenced.
     fn remove_uncommitted_containers(&self) -> Result<()> {
         let local_seq = self.progress()?.local_seq;
-        let mut removed = BTreeSet::new();
-        for shard in
-            fs::read_dir(self.root.join("blobs")).context("failed to scan blob directory")?
-        {
-            let shard = shard.context("failed to read blob shard")?;
-            if !fs::symlink_metadata(shard.path())
-                .context("failed to inspect blob shard")?
-                .is_dir()
-            {
-                continue;
-            }
-            for blob in fs::read_dir(shard.path()).context("failed to scan blob shard")? {
-                let path = blob.context("failed to read blob entry")?.path();
-                let Some(last) = path.to_str().and_then(container_last_sequence) else {
-                    continue;
+        let blobs = self.root_dir.open_child("blobs".as_ref(), 0o700)?;
+        blobs.for_each_entry(|shard_name| {
+            let shard = blobs.open_child(shard_name, 0o700)?;
+            let mut removed = false;
+            shard.for_each_entry(|blob_name| {
+                let Some(last) = blob_name.to_str().and_then(container_last_sequence) else {
+                    return Ok(());
                 };
-                if last <= local_seq {
-                    continue;
+                if last > local_seq {
+                    shard.remove_file(blob_name)?;
+                    removed = true;
                 }
-                match fs::remove_file(&path) {
-                    Ok(()) => {
-                        removed.insert(shard.path());
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => {
-                        return Err(error).context("failed to remove uncommitted container");
-                    }
-                }
+                Ok(())
+            })?;
+            if removed {
+                shard.sync()?;
             }
-        }
-        for shard in removed {
-            sync_directory(shard)?;
-        }
+            Ok(())
+        })?;
         Ok(())
     }
 
@@ -1898,7 +1971,7 @@ impl Journal {
             let relative = std::str::from_utf8(value.value())
                 .context("pending blob path is not UTF-8")?
                 .to_owned();
-            checked_join(&self.root, BlobRef::parse(&relative)?.relative)?;
+            checked_blob_relative(BlobRef::parse(&relative)?.relative)?;
             pending.insert(intent_key, relative);
         }
         Ok(pending)
@@ -1927,18 +2000,22 @@ impl Journal {
                 .context("journal sequence overflow")?;
             if let Some(relative) = record.blob_path() {
                 let reference = BlobRef::parse(relative)?;
-                let path = checked_join(&self.root, reference.relative)?;
-                verify_record_blob(&path, reference.slice, record).with_context(|| {
-                    if path.exists() {
+                let location = self.blob_location(reference.relative, false)?;
+                let file = location
+                    .parent
+                    .open_file(&location.name, OFlags::RDONLY, 0)
+                    .with_context(|| {
+                        format!("missing committed blob for sequence {}", record.sequence)
+                    })?;
+                verify_record_blob(file, &location.display, reference.slice, record).with_context(
+                    || {
                         format!(
                             "committed blob validation failed for sequence {}",
                             record.sequence
                         )
-                    } else {
-                        format!("missing committed blob for sequence {}", record.sequence)
-                    }
-                })?;
-                referenced_blobs.insert(path);
+                    },
+                )?;
+                referenced_blobs.insert(location.relative);
             }
         }
         if snapshot.local_seq >= snapshot.remote_seq
@@ -1953,31 +2030,24 @@ impl Journal {
     }
 
     fn reject_unreferenced_blobs(&self, referenced: &BTreeSet<PathBuf>) -> Result<()> {
-        for shard in
-            fs::read_dir(self.root.join("blobs")).context("failed to scan blob directory")?
-        {
-            let shard = shard.context("failed to read blob shard")?;
-            let metadata =
-                fs::symlink_metadata(shard.path()).context("failed to inspect blob shard")?;
-            if metadata.file_type().is_symlink() || !metadata.is_dir() {
-                bail!(
-                    "blob shard {} is not a safe directory",
-                    shard.path().display()
-                );
-            }
-            for blob in fs::read_dir(shard.path()).context("failed to scan blob shard")? {
-                let blob = blob.context("failed to read blob entry")?;
-                let path = blob.path();
-                let metadata =
-                    fs::symlink_metadata(&path).context("failed to inspect blob entry")?;
-                if metadata.file_type().is_symlink() || !metadata.is_file() {
+        let blobs = self.root_dir.open_child("blobs".as_ref(), 0o700)?;
+        blobs.for_each_entry(|shard_name| {
+            let shard = blobs.open_child(shard_name, 0o700)?;
+            shard.for_each_entry(|blob_name| {
+                let relative = PathBuf::from("blobs").join(shard_name).join(blob_name);
+                let path = self.root.join(&relative);
+                let file = shard.open_file(blob_name, OFlags::RDONLY, 0)?;
+                let metadata = file.metadata()?;
+                if !metadata.is_file() {
                     bail!("blob entry {} is not a safe regular file", path.display());
                 }
-                if !referenced.contains(&path) {
+                validate_owner_only(&path, &metadata, 0o600)?;
+                if !referenced.contains(&relative) {
                     bail!("unreferenced committed blob {}", path.display());
                 }
-            }
-        }
+                Ok(())
+            })
+        })?;
         Ok(())
     }
 }
@@ -2504,35 +2574,6 @@ fn container_relative_path(first: Sequence, last: Sequence) -> PathBuf {
         .join(format!("{first:016x}-{last:016x}.blobs"))
 }
 
-/// Every container in one shard directory whose last member is at or below
-/// `through` -- that is, every container nothing needs any more.
-fn drained_containers_in(shard: &Path, through: Sequence) -> Result<Vec<PathBuf>> {
-    let mut drained = Vec::new();
-    let entries = match fs::read_dir(shard) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(drained),
-        Err(error) => return Err(error).context("failed to scan blob shard"),
-    };
-    for entry in entries {
-        let path = entry.context("failed to read blob entry")?.path();
-        let Some(last) = path.to_str().and_then(container_last_sequence) else {
-            continue;
-        };
-        if last <= through {
-            drained.push(path);
-        }
-    }
-    Ok(drained)
-}
-
-fn remove_blob_file(path: &Path) -> Result<()> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error).context("failed to remove remote-complete blob"),
-    }
-}
-
 /// The last sequence a container covers, parsed back out of its file name.
 fn container_last_sequence(relative: &str) -> Option<Sequence> {
     let name = Path::new(relative).file_name()?.to_str()?;
@@ -2558,7 +2599,7 @@ fn path_to_portable_string(path: &Path) -> Result<String> {
         .context("journal blob path is not UTF-8")
 }
 
-fn checked_join(root: &Path, relative: &str) -> Result<PathBuf> {
+fn checked_blob_relative(relative: &str) -> Result<PathBuf> {
     let relative = Path::new(relative);
     if relative.is_absolute() {
         bail!("journal blob path must be relative");
@@ -2573,10 +2614,11 @@ fn checked_join(root: &Path, relative: &str) -> Result<PathBuf> {
     if safe.components().next().map(|part| part.as_os_str()) != Some("blobs".as_ref()) {
         bail!("journal blob path must be below blobs/");
     }
-    Ok(root.join(safe))
+    Ok(safe)
 }
 
 fn open_verified_blob(
+    file: File,
     path: &Path,
     slice: Option<BlobSlice>,
     record: &MutationRecord,
@@ -2584,7 +2626,7 @@ fn open_verified_blob(
     let (payload_len, payload_sha256) = record
         .payload()
         .context("journal record does not reference a payload blob")?;
-    let (file, offset) = verify_file_payload(path, slice, payload_len, payload_sha256)?;
+    let (file, offset) = verify_file_payload(file, path, slice, payload_len, payload_sha256)?;
     Ok(VerifiedBlob {
         file: Arc::new(Mutex::new(file)),
         offset,
@@ -2594,6 +2636,7 @@ fn open_verified_blob(
 }
 
 fn verify_record_blob(
+    file: File,
     path: &Path,
     slice: Option<BlobSlice>,
     record: &MutationRecord,
@@ -2601,7 +2644,7 @@ fn verify_record_blob(
     let (payload_len, payload_sha256) = record
         .payload()
         .context("journal record does not reference a payload blob")?;
-    verify_file_payload(path, slice, payload_len, payload_sha256).map(drop)
+    verify_file_payload(file, path, slice, payload_len, payload_sha256).map(drop)
 }
 
 /// Verify (and optionally collect) one record's payload.
@@ -2611,6 +2654,7 @@ fn verify_record_blob(
 /// it. A whole-file reference still demands an exact file length, while a
 /// container only requires that it be long enough to hold the slice.
 fn verify_file_payload(
+    mut file: File,
     path: &Path,
     slice: Option<BlobSlice>,
     expected_len: u64,
@@ -2625,9 +2669,10 @@ fn verify_file_payload(
     let required_len = offset
         .checked_add(expected_len)
         .context("committed blob slice overflows")?;
-    let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("missing committed blob {}", path.display()))?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to inspect committed blob {}", path.display()))?;
+    if !metadata.is_file() {
         bail!(
             "committed blob {} is not a safe regular file",
             path.display()
@@ -2643,19 +2688,6 @@ fn verify_file_payload(
         bail!("committed blob length mismatch");
     }
 
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    options.custom_flags(libc::O_NOFOLLOW);
-    let mut file = options
-        .open(path)
-        .with_context(|| format!("failed to read blob {}", path.display()))?;
-    let opened_metadata = file
-        .metadata()
-        .with_context(|| format!("failed to inspect open blob {}", path.display()))?;
-    if !opened_metadata.is_file() || opened_metadata.len() != metadata.len() {
-        bail!("committed blob changed while opening");
-    }
     if offset > 0 {
         file.seek(std::io::SeekFrom::Start(offset))
             .with_context(|| format!("failed to seek blob {}", path.display()))?;
@@ -2683,193 +2715,20 @@ fn verify_file_payload(
     Ok((file, offset))
 }
 
-fn ensure_journal_root(root: &Path) -> Result<()> {
-    reject_symlink_if_present(root, "journal root")?;
-    if root.exists() {
-        ensure_owner_directory(root, false)
-    } else {
-        fs::create_dir(root)
-            .with_context(|| format!("failed to create journal root {}", root.display()))?;
-        set_owner_only_directory(root)?;
-        if let Some(parent) = root.parent() {
-            sync_directory(parent)?;
-        }
-        Ok(())
-    }
-}
-
-fn ensure_owner_directory(path: &Path, create: bool) -> Result<()> {
-    if !path.exists() {
-        if !create {
-            bail!("journal directory {} does not exist", path.display());
-        }
-        match fs::create_dir(path) {
-            Ok(()) => {
-                set_owner_only_directory(path)?;
-                if let Some(parent) = path.parent() {
-                    sync_directory(parent)?;
-                }
-            }
-            // Concurrent preparations share a shard directory; losing the
-            // create race to a sibling is success. Convergence happens below.
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("failed to create journal directory {}", path.display())
-                });
-            }
-        }
-    }
-    let mut metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("failed to inspect journal directory {}", path.display()))?;
-    if metadata.file_type().is_symlink() {
-        bail!("journal directory {} must not be a symlink", path.display());
-    }
-    if !metadata.is_dir() {
-        bail!("journal path {} is not a directory", path.display());
-    }
-    // A sibling that created this directory may not have tightened its
-    // permissions yet (create_dir then chmod is not atomic), and the racer
-    // can observe the window either via EEXIST above or via a bare exists().
-    // With create rights, converge any real directory to owner-only -- chmod
-    // only ever tightens -- then let validation have the final word (a
-    // foreign owner still fails).
-    if create && validate_owner_only(path, &metadata, 0o700).is_err() {
-        set_owner_only_directory(path)?;
-        metadata = fs::symlink_metadata(path)
-            .with_context(|| format!("failed to inspect journal directory {}", path.display()))?;
-    }
-    validate_owner_only(path, &metadata, 0o700)
-}
-
-fn reject_symlink_if_present(path: &Path, description: &str) -> Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            bail!("{description} {} must not be a symlink", path.display())
-        }
-        Ok(_) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error).with_context(|| format!("failed to inspect {description}")),
-    }
-}
-
-fn open_owner_file(path: &Path, allow_existing: bool) -> Result<File> {
-    open_owner_file_with(path, allow_existing, || Ok(()))
-}
-
-fn open_owner_file_with<F>(path: &Path, allow_existing: bool, after_open: F) -> Result<File>
-where
-    F: FnOnce() -> Result<()>,
-{
-    let existed = match fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            if metadata.file_type().is_symlink() {
-                bail!("journal file {} must not be a symlink", path.display());
-            }
-            if !metadata.is_file() {
-                bail!("journal path {} is not a regular file", path.display());
-            }
-            validate_owner_only(path, &metadata, 0o600)?;
-            true
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-        Err(error) => return Err(error).context("failed to inspect journal file"),
-    };
-    let mut options = OpenOptions::new();
-    options.read(true).write(true);
-    if allow_existing {
-        options.create(true);
-    } else {
-        options.create_new(true);
-    }
-    #[cfg(unix)]
-    options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-    let file = options.open(path)?;
-    let setup = (|| -> Result<()> {
-        after_open()?;
-        if !existed {
-            set_owner_only_file(path)?;
-        }
-        let metadata = file.metadata()?;
-        validate_owner_only(path, &metadata, 0o600)
-    })();
-    if let Err(error) = setup {
-        if allow_existing {
-            return Err(error);
-        }
-        drop(file);
-        return match fs::remove_file(path) {
-            Ok(()) => Err(error),
-            Err(cleanup) if cleanup.kind() == std::io::ErrorKind::NotFound => Err(error),
-            Err(cleanup) => Err(error.context(format!(
-                "failed to remove exclusively-created journal file after setup error: {cleanup}"
-            ))),
-        };
-    }
-    Ok(file)
-}
-
-#[cfg(unix)]
-fn set_owner_only_file(path: &Path) -> Result<()> {
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("failed to chmod journal file {}", path.display()))
-}
-
-#[cfg(not(unix))]
-fn set_owner_only_file(_path: &Path) -> Result<()> {
-    Ok(())
-}
-
-#[cfg(unix)]
-fn set_owner_only_directory(path: &Path) -> Result<()> {
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-        .with_context(|| format!("failed to chmod journal directory {}", path.display()))
-}
-
-#[cfg(not(unix))]
-fn set_owner_only_directory(_path: &Path) -> Result<()> {
-    Ok(())
-}
-
-fn validate_owner_only(path: &Path, metadata: &fs::Metadata, expected_mode: u32) -> Result<()> {
+fn validate_owner_only(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+    expected_mode: u32,
+) -> Result<()> {
     super::validate_owner_only(path, metadata, expected_mode, "journal path")
-}
-
-fn remove_directory_contents(path: &Path) -> Result<()> {
-    for entry in fs::read_dir(path).with_context(|| format!("failed to scan {}", path.display()))? {
-        let entry = entry.context("failed to read temporary journal entry")?;
-        let entry_path = entry.path();
-        let metadata =
-            fs::symlink_metadata(&entry_path).context("failed to inspect temporary entry")?;
-        if metadata.file_type().is_symlink() || metadata.is_file() {
-            fs::remove_file(&entry_path).context("failed to remove temporary file")?;
-        } else if metadata.is_dir() {
-            fs::remove_dir_all(&entry_path).context("failed to remove temporary directory")?;
-        } else {
-            bail!("temporary journal entry {} is unsafe", entry_path.display());
-        }
-    }
-    Ok(())
-}
-
-fn sync_directory(path: impl AsRef<Path>) -> Result<()> {
-    File::open(path.as_ref())
-        .with_context(|| {
-            format!(
-                "failed to open directory {} for fsync",
-                path.as_ref().display()
-            )
-        })?
-        .sync_all()
-        .with_context(|| format!("failed to fsync directory {}", path.as_ref().display()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        FENCE_CLASSIFICATION_VERSION, FENCE_CLASSIFICATION_VERSION_KEY, Journal, JournalSnapshot,
-        JournalWriteGate, META, PublicationFilesystem, REMOTE_OBJECT_VERSIONS, blob_relative_path,
-        open_owner_file_with, read_optional, write_value,
+        AnchoredDir, FENCE_CLASSIFICATION_VERSION, FENCE_CLASSIFICATION_VERSION_KEY, Journal,
+        JournalSnapshot, JournalWriteGate, META, PublicationFilesystem, REMOTE_OBJECT_VERSIONS,
+        blob_relative_path, read_optional, write_value,
     };
     use crate::writeback::model::{
         FenceClass, JournalIdentity, LocalEtag, MutationKind, MutationMode, MutationRecord,
@@ -2905,16 +2764,16 @@ mod tests {
     }
 
     impl PublicationFilesystem for RecordingPublicationFilesystem {
-        fn sync_directory(&self, path: &Path) -> anyhow::Result<()> {
+        fn sync_directory(&self, directory: &AnchoredDir) -> anyhow::Result<()> {
             let call = {
                 let mut calls = self.sync_calls.lock().unwrap();
-                calls.push(path.to_path_buf());
+                calls.push(directory.display().to_path_buf());
                 calls.len()
             };
             if self.fail_sync_call == Some(call) {
                 anyhow::bail!("injected directory fsync failure");
             }
-            super::sync_directory(path)
+            directory.sync()
         }
     }
 
@@ -2973,6 +2832,170 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn anchored_root_path_replacement_cannot_redirect_journal_initialization() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let temp = tempfile::tempdir().unwrap();
+        let configured = temp.path().join("configured");
+        let retained = temp.path().join("retained");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&configured).unwrap();
+        std::fs::set_permissions(&configured, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let journal =
+            Journal::open_with_root_hook(&configured, identity("root-replacement"), |_| {
+                std::fs::rename(&configured, &retained)?;
+                symlink(&outside, &configured)?;
+                Ok(())
+            })
+            .unwrap();
+        drop(journal);
+
+        for artifact in ["LOCK", "journal.redb", "blobs", "tmp"] {
+            assert!(
+                retained.join(artifact).exists(),
+                "missing anchored {artifact}"
+            );
+            assert!(
+                !outside.join(artifact).exists(),
+                "journal initialization escaped through replaced root: {artifact}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_normalizes_a_parent_alias_before_anchoring() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("parent");
+        let alias = temp.path().join("alias");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        symlink(&parent, &alias).unwrap();
+
+        let journal = Journal::open(alias.join("journal"), identity("parent-alias")).unwrap();
+
+        assert_eq!(
+            journal.root(),
+            parent.canonicalize().unwrap().join("journal")
+        );
+        assert!(parent.join("journal/LOCK").is_file());
+    }
+
+    #[test]
+    fn relative_journal_root_is_normalized_before_anchoring() {
+        let current = std::env::current_dir().unwrap();
+        let temp = tempfile::tempdir_in(&current).unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let relative = temp.path().strip_prefix(&current).unwrap().join("journal");
+        let expected = temp.path().canonicalize().unwrap().join("journal");
+
+        drop(Journal::open(&relative, identity("relative-root")).unwrap());
+        let reopened = Journal::open_existing(&relative).unwrap();
+
+        assert_eq!(reopened.root(), expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nonempty_recovery_uses_the_anchored_root_after_path_replacement() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let temp = tempfile::tempdir().unwrap();
+        let configured = temp.path().join("configured");
+        let retained = temp.path().join("retained");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&configured).unwrap();
+        std::fs::set_permissions(&configured, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(outside.join("sentinel"), b"outside").unwrap();
+        let journal = Journal::open(&configured, identity("root-recovery")).unwrap();
+        journal
+            .commit_put(put_record(1, "segments/1", b"retained"), b"retained")
+            .unwrap();
+        drop(journal);
+
+        let recovered =
+            Journal::open_with_root_hook(&configured, identity("root-recovery"), |_| {
+                std::fs::rename(&configured, &retained)?;
+                symlink(&outside, &configured)?;
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(recovered.read_blob(1).unwrap(), b"retained");
+        assert_eq!(std::fs::read(outside.join("sentinel")).unwrap(), b"outside");
+        assert!(!outside.join("journal.redb").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_publication_and_cleanup_stay_on_anchored_root_after_rename() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let temp = tempfile::tempdir().unwrap();
+        let configured = temp.path().join("configured");
+        let retained = temp.path().join("retained");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&configured).unwrap();
+        std::fs::set_permissions(&configured, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::create_dir(outside.join("blobs")).unwrap();
+        std::fs::set_permissions(
+            outside.join("blobs"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        std::fs::write(outside.join("sentinel"), b"outside").unwrap();
+        let journal = Journal::open(&configured, identity("live-root")).unwrap();
+        journal
+            .commit_put(put_record(1, "segments/1", b"before"), b"before")
+            .unwrap();
+        std::fs::rename(&configured, &retained).unwrap();
+        symlink(&outside, &configured).unwrap();
+
+        journal
+            .commit_put(put_record(2, "segments/2", b"after"), b"after")
+            .unwrap();
+
+        assert_eq!(journal.read_blob(1).unwrap(), b"before");
+        assert_eq!(journal.read_blob(2).unwrap(), b"after");
+        assert_eq!(blob_files_below(&retained).len(), 2);
+        assert!(blob_files_below(&outside).is_empty());
+        assert_eq!(std::fs::read(outside.join("sentinel")).unwrap(), b"outside");
+
+        journal.mark_remote_batch(&[(1, None), (2, None)]).unwrap();
+        journal.remove_remote_prefix(2).unwrap();
+
+        assert!(blob_files_below(&retained).is_empty());
+        assert!(blob_files_below(&outside).is_empty());
+        assert_eq!(std::fs::read(outside.join("sentinel")).unwrap(), b"outside");
+    }
+
+    fn blob_files_below(root: &Path) -> Vec<PathBuf> {
+        let mut files = Vec::new();
+        for shard in std::fs::read_dir(root.join("blobs")).unwrap() {
+            let shard = shard.unwrap().path();
+            if !shard.is_dir() {
+                continue;
+            }
+            for blob in std::fs::read_dir(shard).unwrap() {
+                files.push(blob.unwrap().path());
+            }
+        }
+        files.sort();
+        files
+    }
+
     fn put_record(sequence: u64, path: &str, payload: &[u8]) -> MutationRecord {
         crate::writeback::test_util::put_record(
             sequence,
@@ -3001,16 +3024,23 @@ mod tests {
     #[test]
     fn racing_shard_directory_creation_is_not_an_error() {
         let temp = tempfile::tempdir().unwrap();
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let root = AnchoredDir::open_or_create_absolute(temp.path(), 0o700).unwrap();
         for round in 0..20 {
-            let shard = temp.path().join(format!("blobs-{round}"));
+            let shard_name = format!("blobs-{round}");
             thread::scope(|scope| {
                 let handles: Vec<_> = (0..4)
-                    .map(|_| scope.spawn(|| super::ensure_owner_directory(&shard, true)))
+                    .map(|_| {
+                        let root = root.clone();
+                        let shard_name = shard_name.clone();
+                        scope.spawn(move || root.open_or_create_child(shard_name.as_ref(), 0o700))
+                    })
                     .collect();
                 for handle in handles {
                     handle.join().unwrap().unwrap();
                 }
             });
+            let shard = temp.path().join(shard_name);
             let mode = fs::symlink_metadata(&shard).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o700, "shard directory must end owner-only");
         }
@@ -4248,26 +4278,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn exclusive_owner_file_setup_failure_removes_the_file_it_created() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("container.blobs");
-
-        let error = open_owner_file_with(&path, false, || {
-            Err(anyhow::anyhow!("injected owner-file setup failure"))
-        })
-        .unwrap_err();
-
-        assert!(
-            format!("{error:#}").contains("injected owner-file setup failure"),
-            "{error:#}"
-        );
-        assert!(
-            !path.exists(),
-            "exclusive creation must not leave a file when post-create setup fails"
-        );
-    }
-
     #[cfg(unix)]
     #[test]
     fn journal_rejects_a_symlink_root() {
@@ -4292,6 +4302,38 @@ mod tests {
         let error = Journal::open(&link, identity("bucket-a")).unwrap_err();
 
         assert!(format!("{error:#}").contains("symlink"), "{error:#}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reopening_rejects_a_fifo_blob_without_blocking() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::sync::mpsc;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("writeback");
+        drop(Journal::open(&root, identity("fifo-blob")).unwrap());
+        let shard = root.join("blobs/00");
+        fs::create_dir(&shard).unwrap();
+        fs::set_permissions(&shard, fs::Permissions::from_mode(0o700)).unwrap();
+        let fifo = shard.join("stray.blob");
+        let fifo = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+
+        let (send, receive) = mpsc::channel();
+        thread::spawn(move || {
+            let result = Journal::open(&root, identity("fifo-blob"))
+                .map(drop)
+                .map_err(|error| format!("{error:#}"));
+            send.send(result).unwrap();
+        });
+
+        let error = receive
+            .recv_timeout(Duration::from_secs(2))
+            .expect("opening a malformed FIFO journal artifact blocked")
+            .unwrap_err();
+        assert!(error.contains("not a safe regular file"), "{error}");
     }
 
     #[cfg(unix)]
