@@ -33,15 +33,6 @@ struct LifecycleCensus {
 impl LifecycleCensus {
     fn observe_max(&mut self, sample: Self) {
         self.overlay.runtimes = self.overlay.runtimes.max(sample.overlay.runtimes);
-        self.overlay.runtime_workers = self
-            .overlay
-            .runtime_workers
-            .max(sample.overlay.runtime_workers);
-        self.overlay.pending_keys = self.overlay.pending_keys.max(sample.overlay.pending_keys);
-        self.overlay.pending_dispatches = self
-            .overlay
-            .pending_dispatches
-            .max(sample.overlay.pending_dispatches);
         self.overlay.visible_attrs = self.overlay.visible_attrs.max(sample.overlay.visible_attrs);
         self.materializer.lanes = self.materializer.lanes.max(sample.materializer.lanes);
         self.materializer.worker_handles = self
@@ -56,9 +47,6 @@ impl LifecycleCensus {
 
     fn execution_is_idle(self) -> bool {
         self.overlay.runtimes == 0
-            && self.overlay.runtime_workers == 0
-            && self.overlay.pending_keys == 0
-            && self.overlay.pending_dispatches == 0
             && self.overlay.visible_attrs == 0
             && self.materializer.lanes == 0
             && self.materializer.worker_handles == 0
@@ -204,9 +192,6 @@ async fn real_inode_churn_is_bounded_by_live_concurrency() {
         peak.overlay.runtimes <= MAX_ACTIVE_PLUS_RETIRING,
         "runtime cardinality followed history rather than live work: {peak:?}"
     );
-    assert!(peak.overlay.runtime_workers <= MAX_ACTIVE_PLUS_RETIRING);
-    assert!(peak.overlay.pending_keys <= MAX_ACTIVE_PLUS_RETIRING);
-    assert!(peak.overlay.pending_dispatches <= MAX_ACTIVE_PLUS_RETIRING);
     assert!(peak.overlay.visible_attrs <= MAX_ACTIVE_PLUS_RETIRING);
     assert!(peak.materializer.lanes <= MAX_ACTIVE_PLUS_RETIRING);
     assert!(peak.materializer.worker_handles <= MAX_ACTIVE_PLUS_RETIRING);
@@ -325,7 +310,7 @@ async fn hot_enqueue_racing_materializer_retirement_keeps_one_fifo_owner() {
 
 /// Exercise the real overlay acceptance path while a drained runtime is at
 /// its retirement edge. The hot write must stay visible, drainable, and owned
-/// by a single runtime worker generation.
+/// by one runtime generation feeding the materializer-owned FIFO.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn hot_write_racing_runtime_retirement_remains_visible_and_drainable() {
     let (fs, auth) = filesystem().await;
@@ -369,10 +354,6 @@ async fn hot_write_racing_runtime_retirement_remains_visible_and_drainable() {
         .expect("hot write failed");
     let raced = census(&fs);
     assert_eq!(raced.overlay.runtimes, 1, "two runtime owners: {raced:?}");
-    assert_eq!(
-        raced.overlay.runtime_workers, 1,
-        "two runtime workers: {raced:?}"
-    );
 
     retirement_pause.resume();
     tokio::time::timeout(OPERATION_TIMEOUT, fs.quiesce_overlay_inode(inode))

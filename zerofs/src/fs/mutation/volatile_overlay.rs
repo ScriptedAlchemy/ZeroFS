@@ -1,11 +1,11 @@
 //! Shared volatile write acknowledgement overlay.
 //!
 //! WRITE owns the payload in a bounded process-wide RAM pool, publishes it to
-//! the read overlay, and only then replies.  Each runtime owns exactly one
-//! backing inode and materializes its accepted sequence in acceptance order
-//! through the ordinary filesystem path.  Striped logical writes fan out one
-//! runtime per member above this layer.  FLUSH/FUA wait for the captured
-//! sequence before entering the existing filesystem durability barrier.
+//! the read overlay, and only then replies. Each runtime owns visibility state
+//! for one backing inode; the materializer's inode lane is the sole execution
+//! owner for its accepted sequence. Striped logical writes fan out one runtime
+//! per member above this layer. FLUSH/FUA wait for the captured sequence before
+//! entering the existing filesystem durability barrier.
 
 use crate::fs::errors::FsError;
 
@@ -24,18 +24,25 @@ impl From<FsError> for OverlayError {
 
 pub(crate) type OverlayResult<T> = Result<T, OverlayError>;
 use bytes::{Bytes, BytesMut};
-use futures::{FutureExt, future::BoxFuture};
+#[cfg(test)]
+use futures::FutureExt;
+use futures::future::BoxFuture;
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(test)]
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 #[cfg(test)]
+use tokio::sync::mpsc;
+#[cfg(test)]
 use tokio::sync::oneshot;
-use tokio::sync::{Notify, RwLock, mpsc};
+use tokio::sync::{Notify, RwLock};
 use tokio_util::sync::CancellationToken;
+#[cfg(test)]
 use tokio_util::task::TaskTracker;
 
+#[cfg(test)]
 pub(crate) type Materializer =
     Arc<dyn Fn(u64, u64, Bytes) -> BoxFuture<'static, OverlayResult<()>> + Send + Sync + 'static>;
 pub(crate) type IdleHook = Arc<dyn Fn(u64, u64) + Send + Sync + 'static>;
@@ -282,9 +289,9 @@ struct State {
     terminal: Option<(u64, OverlayError)>,
 }
 
+#[cfg(test)]
 struct AcceptedWrite {
     sequence: u64,
-    entry: Arc<OverlayEntry>,
 }
 
 #[cfg(test)]
@@ -293,10 +300,12 @@ struct IdleRetirementPause {
     resume: oneshot::Receiver<()>,
 }
 
+#[cfg(test)]
 struct RuntimeWorkerCompletion {
     runtime: std::sync::Weak<VolatileWriteRuntime>,
 }
 
+#[cfg(test)]
 impl Drop for RuntimeWorkerCompletion {
     fn drop(&mut self) {
         if let Some(runtime) = self.runtime.upgrade() {
@@ -314,31 +323,28 @@ pub(crate) struct VolatileWriteRuntime {
     /// so partially materialized data can never escape through the base layer.
     retirement: RwLock<()>,
     budget: Arc<VolatileBudget>,
-    ingress: mpsc::UnboundedSender<AcceptedWrite>,
+    inode: u64,
+    generation: u64,
+    idle_hook: Option<IdleHook>,
     task_shutdown: CancellationToken,
+    #[cfg(test)]
+    ingress: Option<mpsc::UnboundedSender<AcceptedWrite>>,
+    #[cfg(test)]
     worker_running: AtomicBool,
+    #[cfg(test)]
     worker_stopped: Notify,
     #[cfg(test)]
     idle_retirement_pause: Mutex<Option<IdleRetirementPause>>,
 }
 
 impl VolatileWriteRuntime {
+    #[cfg(test)]
     pub(crate) fn new(
         budget: Arc<VolatileBudget>,
         inode: u64,
         materialize: Materializer,
     ) -> Arc<Self> {
-        Self::new_tracked(budget, inode, materialize, TaskTracker::new(), 0, None)
-    }
-
-    pub(crate) fn new_tracked(
-        budget: Arc<VolatileBudget>,
-        inode: u64,
-        materialize: Materializer,
-        workers: TaskTracker,
-        generation: u64,
-        idle_hook: Option<IdleHook>,
-    ) -> Arc<Self> {
+        let workers = TaskTracker::new();
         let (ingress, mut ingress_rx) = mpsc::unbounded_channel::<AcceptedWrite>();
         let task_shutdown = CancellationToken::new();
         let runtime = Arc::new(Self {
@@ -353,17 +359,18 @@ impl VolatileWriteRuntime {
             changed: Notify::new(),
             retirement: RwLock::new(()),
             budget,
-            ingress,
+            inode,
+            generation: 0,
+            idle_hook: None,
             task_shutdown: task_shutdown.clone(),
+            ingress: Some(ingress),
             worker_running: AtomicBool::new(true),
             worker_stopped: Notify::new(),
-            #[cfg(test)]
             idle_retirement_pause: Mutex::new(None),
         });
 
         let worker_runtime_weak = Arc::downgrade(&runtime);
         let panic_runtime_weak = worker_runtime_weak.clone();
-        let worker_shutdown = task_shutdown;
         drop(workers.spawn(async move {
             let _completion = RuntimeWorkerCompletion {
                 runtime: worker_runtime_weak.clone(),
@@ -372,7 +379,7 @@ impl VolatileWriteRuntime {
                 loop {
                     let write = tokio::select! {
                         biased;
-                        _ = worker_shutdown.cancelled() => return,
+                        _ = task_shutdown.cancelled() => return,
                         write = ingress_rx.recv() => match write {
                             Some(write) => write,
                             None => return,
@@ -384,28 +391,21 @@ impl VolatileWriteRuntime {
                     if runtime.terminal().is_some() {
                         return;
                     }
-                    let materialization = AssertUnwindSafe(materialize(
-                        inode,
-                        write.entry.offset,
-                        write.entry.data.clone(),
-                    ))
-                    .catch_unwind();
+                    let Some(entry) = runtime.entry_for_test(write.sequence) else {
+                        runtime.fail(write.sequence, OverlayError::IoError);
+                        return;
+                    };
+                    let materialization =
+                        AssertUnwindSafe(materialize(inode, entry.offset, entry.data.clone()))
+                            .catch_unwind();
                     tokio::pin!(materialization);
                     let outcome = tokio::select! {
                         biased;
-                        _ = worker_shutdown.cancelled() => return,
+                        _ = task_shutdown.cancelled() => return,
                         outcome = &mut materialization => outcome,
                     };
                     match outcome {
-                        Ok(Ok(())) => {
-                            runtime.complete(write.sequence).await;
-                            #[cfg(test)]
-                            runtime.pause_before_idle_retirement_for_test().await;
-                            drop(runtime);
-                            if let Some(idle_hook) = &idle_hook {
-                                idle_hook(inode, generation);
-                            }
-                        }
+                        Ok(Ok(())) => runtime.complete(write.sequence).await,
                         Ok(Err(error)) => {
                             runtime.fail(write.sequence, error);
                             return;
@@ -427,6 +427,39 @@ impl VolatileWriteRuntime {
         }));
 
         runtime
+    }
+
+    pub(crate) fn new_state_only(
+        budget: Arc<VolatileBudget>,
+        inode: u64,
+        generation: u64,
+        idle_hook: Option<IdleHook>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(State {
+                accepting: true,
+                next_sequence: 0,
+                materialized_through: 0,
+                completed: BTreeSet::new(),
+                entries: BTreeMap::new(),
+                terminal: None,
+            }),
+            changed: Notify::new(),
+            retirement: RwLock::new(()),
+            budget,
+            inode,
+            generation,
+            idle_hook,
+            task_shutdown: CancellationToken::new(),
+            #[cfg(test)]
+            ingress: None,
+            #[cfg(test)]
+            worker_running: AtomicBool::new(false),
+            #[cfg(test)]
+            worker_stopped: Notify::new(),
+            #[cfg(test)]
+            idle_retirement_pause: Mutex::new(None),
+        })
     }
 
     pub(crate) async fn reserve(&self, bytes: usize) -> OverlayResult<VolatileAdmission> {
@@ -457,16 +490,36 @@ impl VolatileWriteRuntime {
             .await
     }
 
-    /// Stage one write for this runtime's inode. The caller publishes
-    /// `visibility` once every member of its logical write is accepted; a
-    /// write staged with an already-published token is accounted immediately.
-    pub(crate) async fn accept_staged_write(
+    #[cfg(test)]
+    async fn accept_staged_write(
         &self,
         admission: VolatileAdmission,
         offset: u64,
         data: Bytes,
         visibility: Arc<WriteVisibility>,
     ) -> OverlayResult<u64> {
+        let ingress = self.ingress.as_ref().ok_or(OverlayError::IoError)?;
+        self.accept_staged_write_enqueued(admission, offset, data, visibility, |sequence| {
+            ingress
+                .send(AcceptedWrite { sequence })
+                .map_err(|_| OverlayError::IoError)
+        })
+    }
+
+    /// Stage one write for this runtime's inode. The caller publishes
+    /// `visibility` once every member of its logical write is accepted; a
+    /// write staged with an already-published token is accounted immediately.
+    pub(crate) fn accept_staged_write_enqueued<F>(
+        &self,
+        admission: VolatileAdmission,
+        offset: u64,
+        data: Bytes,
+        visibility: Arc<WriteVisibility>,
+        enqueue: F,
+    ) -> OverlayResult<u64>
+    where
+        F: FnOnce(u64) -> OverlayResult<()>,
+    {
         let record_accepted = visibility.is_published();
         if admission.permit.bytes != data.len() as u64 {
             return Err(OverlayError::InvalidArgument);
@@ -492,19 +545,9 @@ impl VolatileWriteRuntime {
             visibility,
             _permit: admission.permit,
         });
+        enqueue(sequence)?;
         state.next_sequence = sequence;
         state.entries.insert(sequence, Arc::clone(&entry));
-        if self
-            .ingress
-            .send(AcceptedWrite { sequence, entry })
-            .is_err()
-        {
-            state.terminal = Some((sequence, OverlayError::IoError));
-            drop(state);
-            self.changed.notify_waiters();
-            self.budget.changed.notify_waiters();
-            return Err(OverlayError::IoError);
-        }
         drop(state);
         if self.budget.is_terminal() {
             self.fail(sequence, OverlayError::IoError);
@@ -515,6 +558,16 @@ impl VolatileWriteRuntime {
             record_published_staged_writes(accepted_bytes, 1);
         }
         Ok(sequence)
+    }
+
+    #[cfg(test)]
+    fn entry_for_test(&self, sequence: u64) -> Option<Arc<OverlayEntry>> {
+        self.state
+            .lock()
+            .expect("volatile runtime poisoned")
+            .entries
+            .get(&sequence)
+            .cloned()
     }
 
     pub(crate) fn accepted_cutoff(&self) -> u64 {
@@ -648,7 +701,7 @@ impl VolatileWriteRuntime {
         Ok(output.freeze())
     }
 
-    fn stop_admission(&self) -> u64 {
+    pub(crate) fn stop_admission(&self) -> u64 {
         let mut state = self.state.lock().expect("volatile runtime poisoned");
         state.accepting = false;
         let cutoff = state.next_sequence;
@@ -674,7 +727,7 @@ impl VolatileWriteRuntime {
         // fences, but already-acknowledged writes in otherwise healthy
         // exports still deserve a bounded materialization attempt during
         // graceful shutdown.
-        let mut result =
+        let drain_result =
             match tokio::time::timeout(timeout, self.wait_materialized_locally(cutoff)).await {
                 Ok(result) => result,
                 Err(_) => {
@@ -682,17 +735,40 @@ impl VolatileWriteRuntime {
                     Err(OverlayError::IoError)
                 }
             };
-        self.task_shutdown.cancel();
-        if tokio::time::timeout(timeout, self.wait_worker_stopped())
-            .await
-            .is_err()
-        {
-            self.fail(cutoff, OverlayError::IoError);
-            result = Err(OverlayError::IoError);
+        #[cfg(test)]
+        let mut result = drain_result;
+        #[cfg(not(test))]
+        let result = drain_result;
+        if result.is_err() {
+            self.task_shutdown.cancel();
+        }
+        #[cfg(test)]
+        if self.ingress.is_some() {
+            self.task_shutdown.cancel();
+            if tokio::time::timeout(timeout, self.wait_worker_stopped())
+                .await
+                .is_err()
+            {
+                self.fail(cutoff, OverlayError::IoError);
+                result = Err(OverlayError::IoError);
+            }
         }
         result
     }
 
+    #[cfg(test)]
+    pub(crate) async fn shutdown_with_timeout_for_test(
+        &self,
+        timeout: Duration,
+    ) -> OverlayResult<()> {
+        self.shutdown_with_timeout(timeout).await
+    }
+
+    pub(crate) fn shutdown_token(&self) -> CancellationToken {
+        self.task_shutdown.clone()
+    }
+
+    #[cfg(test)]
     async fn wait_worker_stopped(&self) {
         loop {
             let stopped = self.worker_stopped.notified();
@@ -703,6 +779,7 @@ impl VolatileWriteRuntime {
         }
     }
 
+    #[cfg(test)]
     fn terminal(&self) -> Option<(u64, OverlayError)> {
         self.state
             .lock()
@@ -718,7 +795,7 @@ impl VolatileWriteRuntime {
             && state.materialized_through == state.next_sequence
     }
 
-    fn fail(&self, sequence: u64, error: OverlayError) {
+    pub(crate) fn fail(&self, sequence: u64, error: OverlayError) {
         let mut state = self.state.lock().expect("volatile runtime poisoned");
         state.accepting = false;
         state.terminal.get_or_insert((sequence, error));
@@ -728,8 +805,8 @@ impl VolatileWriteRuntime {
         self.budget.changed.notify_waiters();
     }
 
-    async fn complete(&self, sequence: u64) {
-        let _retirement = self.retirement.write().await;
+    pub(crate) async fn complete(&self, sequence: u64) {
+        let retirement = self.retirement.write().await;
         let mut released_operations = 0_u64;
         let mut released_bytes = 0_u64;
         {
@@ -760,6 +837,12 @@ impl VolatileWriteRuntime {
             metrics::counter!("zerofs_nbd_volatile_bytes_materialized_total")
                 .increment(released_bytes);
             self.budget.changed.notify_waiters();
+        }
+        drop(retirement);
+        #[cfg(test)]
+        self.pause_before_idle_retirement_for_test().await;
+        if let Some(idle_hook) = &self.idle_hook {
+            idle_hook(self.inode, self.generation);
         }
     }
 

@@ -8,10 +8,12 @@
 use crate::dedup::AcceptedWriteLifecycle;
 use crate::fs::ZeroFS;
 use crate::fs::mutation::overlay::FilesystemVolatileOverlay;
+use crate::fs::mutation::overlay_dispatch::PendingDispatch;
 use crate::fs::mutation::progress::MutationProgress;
 use crate::fs::mutation::types::{
     MutationCutoff, MutationError, MutationIncarnation, PreparedWriteBatch,
 };
+use crate::fs::mutation::volatile_overlay::{OverlayError, VolatileWriteRuntime};
 use crate::fs::ops::write::apply_prepared_batch;
 use futures::FutureExt;
 use std::collections::{BTreeSet, HashMap};
@@ -23,7 +25,9 @@ use std::sync::Condvar;
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
+#[cfg(test)]
+use tokio::sync::oneshot;
 use tokio_util::task::TaskTracker;
 
 pub(crate) type ApplyHook = Arc<
@@ -37,15 +41,28 @@ pub(crate) type ApplyHook = Arc<
 
 #[allow(clippy::large_enum_variant)]
 enum LaneJob {
+    #[cfg(test)]
     Apply {
         cutoff: MutationCutoff,
         batch: PreparedWriteBatch,
         accepted_write: Option<AcceptedWriteLifecycle>,
         reply: oneshot::Sender<Result<(), MutationError>>,
     },
+    #[cfg(test)]
     Hold {
         acquired: oneshot::Sender<()>,
         release: oneshot::Receiver<()>,
+    },
+    VolatileMember {
+        fs: Arc<ZeroFS>,
+        dispatch: Arc<PendingDispatch>,
+        runtime: Arc<VolatileWriteRuntime>,
+        sequence: u64,
+    },
+    #[cfg(test)]
+    Probe {
+        label: &'static str,
+        observed: mpsc::UnboundedSender<&'static str>,
     },
 }
 
@@ -160,6 +177,7 @@ impl Materializer {
         self.inner.progress.clone()
     }
 
+    #[cfg(test)]
     pub(crate) async fn dispatch_through(
         self: &Arc<Self>,
         cutoff: MutationCutoff,
@@ -168,6 +186,7 @@ impl Materializer {
         self.dispatch_through_owned(cutoff, batch, None).await
     }
 
+    #[cfg(test)]
     pub(crate) async fn dispatch_accepted_through(
         self: &Arc<Self>,
         cutoff: MutationCutoff,
@@ -178,6 +197,7 @@ impl Materializer {
             .await
     }
 
+    #[cfg(test)]
     async fn dispatch_through_owned(
         self: &Arc<Self>,
         cutoff: MutationCutoff,
@@ -192,14 +212,7 @@ impl Materializer {
         }
         self.inner.progress.check()?;
 
-        let mut inodes = batch
-            .members
-            .iter()
-            .map(|member| member.id)
-            .collect::<BTreeSet<_>>();
-        if let Some(replayed) = &batch.replayed {
-            inodes.extend(replayed.members.iter().map(|(id, _)| *id));
-        }
+        let inodes = batch_inodes(&batch);
         if inodes.is_empty() {
             self.record_success(cutoff)?;
             if let Some(accepted_write) = accepted_write {
@@ -278,7 +291,74 @@ impl Materializer {
         result
     }
 
+    pub(crate) fn with_volatile_enqueue_gate<T>(&self, operation: impl FnOnce() -> T) -> T {
+        // Volatile admission takes this gate, then one runtime state lock, then
+        // the lane registry. The closure must remain synchronous so workers
+        // never await behind an admission-held lock.
+        let _enqueue = lock(&self.inner.hold_enqueue);
+        operation()
+    }
+
+    pub(crate) fn enqueue_volatile_member(
+        self: &Arc<Self>,
+        inode: u64,
+        fs: Arc<ZeroFS>,
+        dispatch: Arc<PendingDispatch>,
+        runtime: Arc<VolatileWriteRuntime>,
+        sequence: u64,
+    ) -> Result<(), MutationError> {
+        self.enqueue_lane(
+            inode,
+            LaneJob::VolatileMember {
+                fs,
+                dispatch,
+                runtime,
+                sequence,
+            },
+        )
+    }
+
+    #[cfg(test)]
+    fn enqueue_probe(
+        self: &Arc<Self>,
+        inode: u64,
+        label: &'static str,
+        observed: mpsc::UnboundedSender<&'static str>,
+    ) -> Result<(), MutationError> {
+        self.enqueue_lane(inode, LaneJob::Probe { label, observed })
+    }
+
+    pub(crate) async fn apply_held(
+        &self,
+        cutoff: MutationCutoff,
+        batch: PreparedWriteBatch,
+        accepted_write: Option<AcceptedWriteLifecycle>,
+    ) -> Result<(), MutationError> {
+        if cutoff.mutation_incarnation != self.inner.incarnation {
+            if let Some(accepted_write) = accepted_write {
+                accepted_write.finish(false);
+            }
+            return Err(MutationError::StaleIncarnation);
+        }
+        if let Err(error) = self.inner.progress.check() {
+            if let Some(accepted_write) = accepted_write {
+                accepted_write.finish(false);
+            }
+            return Err(error);
+        }
+        let inodes = batch_inodes(&batch);
+        let result = self.apply_caught(cutoff, batch, accepted_write).await;
+        if result.is_ok() {
+            self.retire_inodes(&inodes);
+        }
+        result
+    }
+
     pub(crate) async fn stop(&self) {
+        if let Some(overlay) = self.inner.overlay.upgrade() {
+            overlay.stop_admission();
+            let _ = overlay.shutdown().await;
+        }
         let senders = {
             let mut lanes = lock(&self.inner.lanes);
             lanes.closed = true;
@@ -489,8 +569,9 @@ fn spawn_lane(
     }
 }
 
-async fn run_lane_job(materializer: &Materializer, inode: u64, job: LaneJob) {
+async fn run_lane_job(materializer: &Materializer, _inode: u64, job: LaneJob) {
     match job {
+        #[cfg(test)]
         LaneJob::Apply {
             cutoff,
             batch,
@@ -504,15 +585,77 @@ async fn run_lane_job(materializer: &Materializer, inode: u64, job: LaneJob) {
                 // Canonical apply, attribute-preview retirement, and the reply
                 // form one lane-owned completion. A new generation cannot be
                 // installed before this tail finishes.
-                materializer.retire_inode(inode);
+                materializer.retire_inode(_inode);
             }
             let _ = reply.send(result);
         }
+        #[cfg(test)]
         LaneJob::Hold { acquired, release } => {
             let _ = acquired.send(());
             let _ = release.await;
         }
+        LaneJob::VolatileMember {
+            fs,
+            dispatch,
+            runtime,
+            sequence,
+        } => {
+            let shutdown = runtime.shutdown_token();
+            let lifecycle = AssertUnwindSafe(async {
+                tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => {
+                        dispatch.fail_terminal();
+                        runtime.fail(sequence, OverlayError::IoError);
+                        Err(OverlayError::IoError)
+                    }
+                    result = async {
+                        match dispatch.arrive_held(fs, materializer).await {
+                            Ok(()) => {
+                                runtime.complete(sequence).await;
+                                Ok(())
+                            }
+                            Err(error) => {
+                                runtime.fail(sequence, error);
+                                Err(error)
+                            }
+                        }
+                    } => result,
+                }
+            })
+            .catch_unwind()
+            .await;
+            match lifecycle {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => {
+                    materializer.poison("volatile member materialization failed");
+                }
+                Err(_) => {
+                    dispatch.fail_terminal();
+                    let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                        runtime.fail(sequence, OverlayError::IoError);
+                    }));
+                    materializer.poison("volatile member lifecycle panicked");
+                }
+            }
+        }
+        #[cfg(test)]
+        LaneJob::Probe { label, observed } => {
+            let _ = observed.send(label);
+        }
     }
+}
+
+fn batch_inodes(batch: &PreparedWriteBatch) -> BTreeSet<u64> {
+    let mut inodes = batch
+        .members
+        .iter()
+        .map(|member| member.id)
+        .collect::<BTreeSet<_>>();
+    if let Some(replayed) = &batch.replayed {
+        inodes.extend(replayed.members.iter().map(|(id, _)| *id));
+    }
+    inodes
 }
 
 fn next_lane_job_or_retire(
@@ -572,6 +715,13 @@ mod tests {
             source: FilesystemWriteAckSource::Filesystem,
             client_durability_target: ClientDurabilityTarget::LocalSsd,
         }
+    }
+
+    async fn receive_probe(receiver: &mut mpsc::UnboundedReceiver<&'static str>) -> &'static str {
+        tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .expect("probe did not run")
+            .expect("probe observer dropped")
     }
 
     async fn filesystem() -> (Arc<ZeroFS>, AuthContext) {
@@ -885,6 +1035,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn held_apply_rejects_stale_incarnation_before_canonical_apply() {
+        let (fs, auth) = filesystem().await;
+        let inode = create_file(&fs, &auth, b"stale-held.txt").await;
+        let apply_calls = Arc::new(AtomicUsize::new(0));
+        let incarnation = MutationIncarnation::new();
+        let hook: ApplyHook = {
+            let apply_calls = Arc::clone(&apply_calls);
+            Arc::new(move |_cutoff, _batch| {
+                apply_calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(()) })
+            })
+        };
+        let materializer = Materializer::start_with_hook(
+            incarnation,
+            Arc::downgrade(&fs),
+            fs.volatile_overlay.get().cloned(),
+            Some(hook),
+        );
+        let batch = prepare(&fs, auth, inode, b"stale").await;
+
+        let error = materializer
+            .apply_held(cutoff(MutationIncarnation::new(), 1), batch, None)
+            .await
+            .expect_err("stale held apply must be rejected");
+        assert!(matches!(error, MutationError::StaleIncarnation));
+        assert_eq!(apply_calls.load(Ordering::SeqCst), 0);
+        materializer.stop().await;
+    }
+
+    #[tokio::test]
     async fn striped_batch_completes_after_all_members() {
         let (fs, auth) = filesystem().await;
         let first_id = create_file(&fs, &auth, b"stripe0.bin").await;
@@ -965,6 +1145,75 @@ mod tests {
         })
         .await
         .expect("overlapping striped batches split their inode holds and deadlocked");
+        materializer.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn single_enqueue_cannot_split_striped_volatile_group() {
+        let incarnation = MutationIncarnation::new();
+        let materializer = Materializer::start_with_hook(
+            incarnation,
+            Weak::new(),
+            None,
+            Some(Arc::new(|_, _| Box::pin(async { Ok(()) }))),
+        );
+        let enqueue_order = Arc::new(Mutex::new(Vec::new()));
+        let (shared_tx, mut shared_rx) = mpsc::unbounded_channel();
+        let (other_tx, mut other_rx) = mpsc::unbounded_channel();
+        let (first_member_tx, first_member_rx) = std::sync::mpsc::channel();
+        let (single_attempt_tx, single_attempt_rx) = std::sync::mpsc::channel();
+
+        let striped = tokio::task::spawn_blocking({
+            let materializer = Arc::clone(&materializer);
+            let enqueue_order = Arc::clone(&enqueue_order);
+            let shared_tx = shared_tx.clone();
+            move || {
+                materializer.with_volatile_enqueue_gate(|| {
+                    enqueue_order.lock().unwrap().push("striped-shared");
+                    materializer
+                        .enqueue_probe(71, "striped-shared", shared_tx)
+                        .unwrap();
+                    first_member_tx.send(()).unwrap();
+                    single_attempt_rx
+                        .recv_timeout(Duration::from_secs(2))
+                        .expect("single enqueue did not race striped group");
+                    enqueue_order.lock().unwrap().push("striped-other");
+                    materializer
+                        .enqueue_probe(72, "striped-other", other_tx)
+                        .unwrap();
+                });
+            }
+        });
+        let single = tokio::task::spawn_blocking({
+            let materializer = Arc::clone(&materializer);
+            let enqueue_order = Arc::clone(&enqueue_order);
+            move || {
+                first_member_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("striped enqueue did not start");
+                single_attempt_tx.send(()).unwrap();
+                materializer.with_volatile_enqueue_gate(|| {
+                    enqueue_order.lock().unwrap().push("single-shared");
+                    materializer
+                        .enqueue_probe(71, "single-shared", shared_tx)
+                        .unwrap();
+                });
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            striped.await.unwrap();
+            single.await.unwrap();
+        })
+        .await
+        .expect("mixed volatile enqueue race deadlocked");
+        assert_eq!(
+            *enqueue_order.lock().unwrap(),
+            ["striped-shared", "striped-other", "single-shared"]
+        );
+        assert_eq!(receive_probe(&mut shared_rx).await, "striped-shared");
+        assert_eq!(receive_probe(&mut shared_rx).await, "single-shared");
+        assert_eq!(receive_probe(&mut other_rx).await, "striped-other");
         materializer.stop().await;
     }
 

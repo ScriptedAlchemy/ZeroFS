@@ -1,8 +1,8 @@
 //! Filesystem-facing volatile overlay shared by NFS, 9P, WebUI, and NBD.
 //!
-//! One process-wide [`VolatileBudget`] bounds RAM. Each inode gets a single-lane
-//! [`VolatileWriteRuntime`] so accepted writes are visible to later reads and
-//! getattr before the canonical apply finishes. Protocol adapters call
+//! One process-wide [`VolatileBudget`] bounds RAM. Each inode gets a
+//! [`VolatileWriteRuntime`] for pre-materialization visibility and one
+//! materializer lane for ordered canonical apply. Protocol adapters call
 //! [`ZeroFS::write_ack`] and [`ZeroFS::wait_configured_durability`].
 
 use super::admission::{PreparationAbort, PreparationGuard};
@@ -11,8 +11,8 @@ use super::overlay_helpers::{
     direct_write_fingerprint, overlay_fs_error, write_admission_fs_error,
 };
 use super::volatile_overlay::{
-    IdleHook, Materializer, OverlayError, OverlayResult, VolatileAdmission, VolatileBudget,
-    VolatileWriteRuntime, WriteVisibility, record_published_staged_writes,
+    IdleHook, OverlayError, OverlayResult, VolatileAdmission, VolatileBudget, VolatileWriteRuntime,
+    WriteVisibility, record_published_staged_writes,
 };
 use crate::fs::ZeroFS;
 use crate::fs::errors::FsError;
@@ -33,13 +33,10 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::oneshot;
-use tokio_util::task::TaskTracker;
 
 pub(crate) struct FilesystemVolatileOverlay {
     budget: Arc<VolatileBudget>,
     runtimes: Mutex<RuntimeRegistry>,
-    runtime_workers: TaskTracker,
-    pending: Mutex<HashMap<u64, VecDeque<Arc<PendingDispatch>>>>,
     latest_attrs: Mutex<HashMap<u64, VecDeque<VisibleAttrs>>>,
     frozen: AtomicBool,
     accepted_batches: AtomicU64,
@@ -97,9 +94,6 @@ struct RuntimeAdmission {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct OverlayLifecycleCensus {
     pub(crate) runtimes: usize,
-    pub(crate) runtime_workers: usize,
-    pub(crate) pending_keys: usize,
-    pub(crate) pending_dispatches: usize,
     pub(crate) visible_attrs: usize,
 }
 
@@ -209,8 +203,6 @@ impl FilesystemVolatileOverlay {
                 next_generation: 1,
                 entries: HashMap::new(),
             }),
-            runtime_workers: TaskTracker::new(),
-            pending: Mutex::new(HashMap::new()),
             latest_attrs: Mutex::new(HashMap::new()),
             frozen: AtomicBool::new(false),
             accepted_batches: AtomicU64::new(0),
@@ -240,30 +232,18 @@ impl FilesystemVolatileOverlay {
                 .checked_add(1)
                 .ok_or(OverlayError::IoError)?;
             let overlay = Arc::downgrade(self);
-            let materialize_overlay = overlay.clone();
             let idle_overlay = overlay.clone();
             let idle_hook: IdleHook = Arc::new(move |inode, generation| {
                 if let Some(overlay) = idle_overlay.upgrade() {
                     overlay.try_reap_runtime(inode, generation);
                 }
             });
-            let runtime = {
-                let materialize: Materializer = Arc::new(move |inode, offset, data| {
-                    let overlay = materialize_overlay.clone();
-                    Box::pin(async move {
-                        let overlay = overlay.upgrade().ok_or(OverlayError::IoError)?;
-                        overlay.materialize(inode, offset, data).await
-                    })
-                });
-                VolatileWriteRuntime::new_tracked(
-                    Arc::clone(&self.budget),
-                    inode,
-                    materialize,
-                    self.runtime_workers.clone(),
-                    generation,
-                    Some(idle_hook),
-                )
-            };
+            let runtime = VolatileWriteRuntime::new_state_only(
+                Arc::clone(&self.budget),
+                inode,
+                generation,
+                Some(idle_hook),
+            );
             runtimes.entries.insert(
                 inode,
                 RuntimeEntry {
@@ -328,29 +308,6 @@ impl FilesystemVolatileOverlay {
             reapable.then(|| runtimes.entries.remove(&inode)).flatten()
         };
         drop(removed);
-    }
-
-    async fn materialize(
-        self: Arc<Self>,
-        inode: u64,
-        _offset: u64,
-        _data: Bytes,
-    ) -> OverlayResult<()> {
-        let dispatch = {
-            let mut pending = self.pending.lock().expect("filesystem overlay poisoned");
-            let dispatch = match pending.get_mut(&inode).and_then(VecDeque::pop_front) {
-                Some(dispatch) => dispatch,
-                None => return Ok(()),
-            };
-            if pending.get(&inode).is_some_and(VecDeque::is_empty) {
-                pending.remove(&inode);
-            }
-            dispatch
-        };
-        let Some(fs) = self.fs.upgrade() else {
-            return Err(OverlayError::IoError);
-        };
-        dispatch.arrive(fs).await
     }
 
     pub(crate) fn visible_size(&self, inode: u64, canonical: u64) -> u64 {
@@ -506,21 +463,9 @@ impl FilesystemVolatileOverlay {
     async fn rollback_unpublished(
         &self,
         dispatch: &Arc<PendingDispatch>,
-        member_ids: &[InodeId],
         accepted: &[(RuntimeHandle, u64)],
     ) {
         dispatch.cancel_unpublished();
-        {
-            let mut pending = self.pending.lock().expect("filesystem overlay poisoned");
-            for member_id in member_ids {
-                if let Some(queue) = pending.get_mut(member_id) {
-                    queue.retain(|queued| !Arc::ptr_eq(queued, dispatch));
-                    if queue.is_empty() {
-                        pending.remove(member_id);
-                    }
-                }
-            }
-        }
         for (runtime, sequence) in accepted {
             runtime.wait_released(*sequence).await;
         }
@@ -569,48 +514,52 @@ impl FilesystemVolatileOverlay {
         let member_ids = members.iter().map(|member| member.id).collect::<Vec<_>>();
         let (accepted_tx, accepted_rx) = oneshot::channel();
         let dispatch = PendingDispatch::new(members.len(), accepted_rx);
-        {
-            let mut pending = self.pending.lock().expect("filesystem overlay poisoned");
-            for id in &member_ids {
-                pending
-                    .entry(*id)
-                    .or_default()
-                    .push_back(Arc::clone(&dispatch));
-            }
-        }
+        let fs = self.fs.upgrade().ok_or(OverlayError::IoError)?;
+        let materializer = fs
+            .materializer
+            .get()
+            .cloned()
+            .ok_or(OverlayError::IoError)?;
         let mut accepted_runtimes = Vec::with_capacity(members.len());
-        for (admission, member) in admissions.into_iter().zip(members.iter()) {
-            let RuntimeAdmission { runtime, admission } = admission;
-            match runtime
-                .accept_staged_write(
+        let stage_result = materializer.with_volatile_enqueue_gate(|| {
+            for (admission, member) in admissions.into_iter().zip(members.iter()) {
+                let RuntimeAdmission { runtime, admission } = admission;
+                let job_runtime =
+                    Arc::clone(runtime.runtime.as_ref().expect("live runtime handle"));
+                let job_fs = Arc::clone(&fs);
+                let job_dispatch = Arc::clone(&dispatch);
+                let job_materializer = Arc::clone(&materializer);
+                let accepted = runtime.accept_staged_write_enqueued(
                     admission,
                     member.offset,
                     member.data.clone(),
                     Arc::clone(&visibility),
-                )
-                .await
-            {
-                Ok(accepted) => {
-                    accepted_runtimes.push((runtime, accepted));
-                    #[cfg(test)]
-                    if self.fail_batch_after.load(Ordering::Acquire) == accepted_runtimes.len() {
-                        let error = OverlayError::IoError;
-                        let _ =
-                            guard.abort(PreparationAbort::RequestFailure(overlay_fs_error(error)));
-                        drop(accepted_tx);
-                        self.rollback_unpublished(&dispatch, &member_ids, &accepted_runtimes)
-                            .await;
-                        return Err(error);
-                    }
-                }
-                Err(error) => {
-                    let _ = guard.abort(PreparationAbort::RequestFailure(overlay_fs_error(error)));
-                    drop(accepted_tx);
-                    self.rollback_unpublished(&dispatch, &member_ids, &accepted_runtimes)
-                        .await;
-                    return Err(error);
+                    move |sequence| {
+                        job_materializer
+                            .enqueue_volatile_member(
+                                member.id,
+                                job_fs,
+                                job_dispatch,
+                                job_runtime,
+                                sequence,
+                            )
+                            .map_err(|_| OverlayError::IoError)
+                    },
+                )?;
+                accepted_runtimes.push((runtime, accepted));
+                #[cfg(test)]
+                if self.fail_batch_after.load(Ordering::Acquire) == accepted_runtimes.len() {
+                    return Err(OverlayError::IoError);
                 }
             }
+            Ok(())
+        });
+        if let Err(error) = stage_result {
+            let _ = guard.abort(PreparationAbort::RequestFailure(overlay_fs_error(error)));
+            drop(accepted_tx);
+            self.rollback_unpublished(&dispatch, &accepted_runtimes)
+                .await;
+            return Err(error);
         }
         #[cfg(test)]
         self.inject_publish_failure_if_requested();
@@ -618,7 +567,7 @@ impl FilesystemVolatileOverlay {
             Ok(accepted) => accepted,
             Err(_) => {
                 drop(accepted_tx);
-                self.rollback_unpublished(&dispatch, &member_ids, &accepted_runtimes)
+                self.rollback_unpublished(&dispatch, &accepted_runtimes)
                     .await;
                 return Err(OverlayError::IoError);
             }
@@ -699,12 +648,7 @@ impl FilesystemVolatileOverlay {
     pub(crate) fn lifecycle_census_for_test(&self) -> OverlayLifecycleCensus {
         let runtimes = self.runtimes.lock().expect("filesystem overlay poisoned");
         let runtime_count = runtimes.entries.len();
-        let runtime_workers = self.runtime_workers.len();
         drop(runtimes);
-        let pending = self.pending.lock().expect("filesystem overlay poisoned");
-        let pending_keys = pending.len();
-        let pending_dispatches = pending.values().map(VecDeque::len).sum();
-        drop(pending);
         let visible_attrs = self
             .latest_attrs
             .lock()
@@ -714,9 +658,6 @@ impl FilesystemVolatileOverlay {
             .sum();
         OverlayLifecycleCensus {
             runtimes: runtime_count,
-            runtime_workers,
-            pending_keys,
-            pending_dispatches,
             visible_attrs,
         }
     }
@@ -903,9 +844,15 @@ impl FilesystemVolatileOverlay {
             }
         }
         drop(runtimes);
-        self.runtime_workers.close();
-        self.runtime_workers.wait().await;
         first_error.map_or(Ok(()), Err)
+    }
+
+    pub(crate) fn stop_admission(&self) {
+        let mut registry = self.runtimes.lock().expect("filesystem overlay poisoned");
+        registry.closed = true;
+        for entry in registry.entries.values() {
+            entry.runtime.stop_admission();
+        }
     }
 }
 
@@ -1500,6 +1447,7 @@ mod tests {
     use crate::fs::test_util::test_creds;
     use bytes::Bytes;
     use std::sync::Arc;
+    use std::time::Duration;
     use tokio::sync::Notify;
 
     fn volatile_settings() -> FilesystemWriteAckSettings {
@@ -1542,6 +1490,65 @@ mod tests {
         let (data, eof) = fs.read_file(&auth, file, 0, 32).await.unwrap();
         assert_eq!(data.as_ref(), b"hello-overlay");
         assert!(eof);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn held_read_timeout_cancels_materializer_owned_member_and_pins_visibility() {
+        let mut fs = ZeroFS::new_in_memory().await.unwrap();
+        fs.write_ack = volatile_settings();
+        let fs = Arc::new(fs);
+        fs.install_volatile_overlay();
+        let auth = crate::fs::types::AuthContext::from(&test_creds());
+        let file = fs
+            .create_exclusive(&auth, 0, b"held-read-timeout.bin")
+            .await
+            .unwrap();
+        let overlay = fs.volatile_overlay.get().cloned().expect("overlay");
+        let runtime = overlay.runtime(file).expect("runtime");
+        let read_runtime = Arc::clone(runtime.runtime.as_ref().expect("runtime handle"));
+        let (base_entered_tx, base_entered_rx) = oneshot::channel();
+        let release_base = Arc::new(Notify::new());
+        let read = tokio::spawn({
+            let release_base = Arc::clone(&release_base);
+            async move {
+                read_runtime
+                    .read(0, 8, move || {
+                        Box::pin(async move {
+                            let _ = base_entered_tx.send(());
+                            release_base.notified().await;
+                            Ok(Bytes::from_static(b"old-data"))
+                        })
+                    })
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(2), base_entered_rx)
+            .await
+            .expect("read did not enter canonical base")
+            .expect("read base dropped");
+
+        fs.write_ack(&auth, file, 0, &Bytes::from_static(b"new-data"))
+            .await
+            .unwrap();
+        let shutdown = runtime
+            .shutdown_with_timeout_for_test(Duration::from_millis(50))
+            .await;
+        assert!(matches!(shutdown, Err(OverlayError::IoError)));
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            fs.materializer.get().expect("materializer").stop(),
+        )
+        .await
+        .expect("materializer stop ignored runtime cancellation deadline");
+
+        release_base.notify_waiters();
+        let visible = tokio::time::timeout(Duration::from_secs(2), read)
+            .await
+            .expect("held read did not finish")
+            .expect("held read task failed")
+            .expect("held read failed");
+        assert_eq!(visible, Bytes::from_static(b"new-data"));
+        assert!(overlay.is_frozen());
     }
 
     #[tokio::test]
