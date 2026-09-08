@@ -50,6 +50,8 @@ pub(crate) enum ReservationError {
     Closed,
     #[error("writeback SSD admission is poisoned: {0}")]
     Poisoned(String),
+    #[error("writeback SSD admission cannot currently reserve without queueing")]
+    Unavailable,
     #[error("SSD reservation requires {requested} bytes but capacity is {capacity} bytes")]
     TooLarge { requested: u64, capacity: u64 },
     #[error("SSD reservation requires {requested} operations but capacity is {capacity}")]
@@ -291,6 +293,49 @@ impl SsdAdmission {
             .await
     }
 
+    /// Attempts an immediate reservation without overtaking a FIFO waiter.
+    /// Incomplete multipart uploads use this instead of joining the blocking
+    /// queue while retaining earlier staging claims.
+    pub(crate) fn try_reserve(
+        &self,
+        request: SsdReservationRequest,
+        sample: PhysicalSpaceSample,
+    ) -> Result<SsdReservationToken, ReservationError> {
+        if request.ssd_reservation_bytes > self.inner.capacity_bytes {
+            return Err(ReservationError::TooLarge {
+                requested: request.ssd_reservation_bytes,
+                capacity: self.inner.capacity_bytes,
+            });
+        }
+        if request.operations > self.inner.max_operations {
+            return Err(ReservationError::TooManyOperations {
+                requested: request.operations,
+                capacity: self.inner.max_operations,
+            });
+        }
+        self.observe_sample(sample)?;
+        let mut state = lock(&self.inner.state);
+        if let Some(error) = &state.terminal {
+            return Err(error.clone());
+        }
+        if !physical_headroom(
+            state.available_bytes,
+            0,
+            request.physical_reservation_bytes,
+            self.inner.min_free_bytes,
+        ) {
+            return Err(ReservationError::TooLargePhysical {
+                requested: request.physical_reservation_bytes,
+                available: state.available_bytes,
+                min_free: self.inner.min_free_bytes,
+            });
+        }
+        if !state.waiters.is_empty() || !self.inner.fits(&state, request) {
+            return Err(ReservationError::Unavailable);
+        }
+        self.inner.charge(&mut state, request)?;
+        Ok(self.inner.token(request))
+    }
     pub(crate) async fn reserve_with_queue_observer(
         &self,
         request: SsdReservationRequest,
@@ -377,6 +422,53 @@ impl SsdAdmission {
         final_journal_operations: u64,
         sample: PhysicalSpaceSample,
     ) -> Result<SsdMultipartPartTokens, ReservationError> {
+        let (staging, final_journal, combined) = self.multipart_part_requests(
+            staging_bytes,
+            final_journal_bytes,
+            final_journal_operations,
+        )?;
+        let mut token = self.reserve(combined, sample).await?;
+        token.disarm();
+        Ok(SsdMultipartPartTokens {
+            staging: self.inner.token(staging),
+            final_journal: self.inner.token(final_journal),
+        })
+    }
+
+    /// The nonblocking multipart variant of [`Self::reserve_multipart_part`].
+    pub(crate) fn try_reserve_multipart_part(
+        &self,
+        staging_bytes: u64,
+        final_journal_bytes: u64,
+        final_journal_operations: u64,
+        sample: PhysicalSpaceSample,
+    ) -> Result<SsdMultipartPartTokens, ReservationError> {
+        let (staging, final_journal, combined) = self.multipart_part_requests(
+            staging_bytes,
+            final_journal_bytes,
+            final_journal_operations,
+        )?;
+        let mut token = self.try_reserve(combined, sample)?;
+        token.disarm();
+        Ok(SsdMultipartPartTokens {
+            staging: self.inner.token(staging),
+            final_journal: self.inner.token(final_journal),
+        })
+    }
+
+    fn multipart_part_requests(
+        &self,
+        staging_bytes: u64,
+        final_journal_bytes: u64,
+        final_journal_operations: u64,
+    ) -> Result<
+        (
+            SsdReservationRequest,
+            SsdReservationRequest,
+            SsdReservationRequest,
+        ),
+        ReservationError,
+    > {
         let staging = SsdReservationRequest {
             ssd_reservation_bytes: staging_bytes,
             physical_reservation_bytes: staging_bytes,
@@ -410,12 +502,7 @@ impl SsdAdmission {
             self.inner.terminate(error.clone());
             return Err(error);
         };
-        let mut token = self.reserve(combined, sample).await?;
-        token.disarm();
-        Ok(SsdMultipartPartTokens {
-            staging: self.inner.token(staging),
-            final_journal: self.inner.token(final_journal),
-        })
+        Ok((staging, final_journal, combined))
     }
 
     pub(crate) fn merge_multipart_tokens(
@@ -937,6 +1024,85 @@ impl CommittedSsdReservation {
     #[allow(dead_code)]
     pub(crate) fn sample(&self) -> PhysicalSpaceSample {
         self.sample
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn try_reserve_fresh_sample_grants_existing_fifo_waiter_before_caller() {
+        let admission = SsdAdmission::recover(
+            100,
+            1,
+            95,
+            85,
+            1,
+            std::iter::empty(),
+            Some(PhysicalSpaceSample {
+                generation: 1,
+                available_bytes: 10,
+            }),
+        )
+        .unwrap();
+        let held = admission
+            .reserve(
+                SsdReservationRequest {
+                    ssd_reservation_bytes: 0,
+                    physical_reservation_bytes: 7,
+                    operations: 0,
+                },
+                PhysicalSpaceSample {
+                    generation: 1,
+                    available_bytes: 10,
+                },
+            )
+            .await
+            .unwrap();
+        let queued = Arc::new(Notify::new());
+        let waiter = tokio::spawn({
+            let admission = admission.clone();
+            let queued = queued.clone();
+            async move {
+                admission
+                    .reserve_with_queue_observer(
+                        SsdReservationRequest {
+                            ssd_reservation_bytes: 0,
+                            physical_reservation_bytes: 4,
+                            operations: 1,
+                        },
+                        PhysicalSpaceSample {
+                            generation: 1,
+                            available_bytes: 10,
+                        },
+                        || queued.notify_one(),
+                    )
+                    .await
+            }
+        });
+        queued.notified().await;
+
+        let result = admission.try_reserve(
+            SsdReservationRequest {
+                ssd_reservation_bytes: 0,
+                physical_reservation_bytes: 1,
+                operations: 1,
+            },
+            PhysicalSpaceSample {
+                generation: 2,
+                available_bytes: 20,
+            },
+        );
+
+        assert!(matches!(result, Err(ReservationError::Unavailable)));
+        let waiter = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("fresh sample did not wake FIFO waiter")
+            .unwrap()
+            .unwrap();
+        drop(waiter);
+        drop(held);
     }
 }
 

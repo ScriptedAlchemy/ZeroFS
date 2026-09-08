@@ -44,9 +44,21 @@ pub(crate) struct AuthoritativeSegmentRead;
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ConditionalMultipartCreate {
     acknowledged: Arc<AtomicBool>,
+    declared_payload_len: Option<u64>,
 }
 
 impl ConditionalMultipartCreate {
+    pub(crate) fn for_payload_len(declared_payload_len: u64) -> Self {
+        Self {
+            acknowledged: Arc::new(AtomicBool::new(false)),
+            declared_payload_len: Some(declared_payload_len),
+        }
+    }
+
+    pub(crate) fn declared_payload_len(&self) -> Option<u64> {
+        self.declared_payload_len
+    }
+
     pub(crate) fn acknowledge(&self) {
         self.acknowledged.store(true, Ordering::Release);
     }
@@ -244,7 +256,7 @@ impl SegmentStore {
         path: &Path,
         bytes: &Bytes,
     ) -> Result<SegmentPublication> {
-        let capability = ConditionalMultipartCreate::default();
+        let capability = ConditionalMultipartCreate::for_payload_len(bytes.len() as u64);
         let mut options = PutMultipartOptions::default();
         options.extensions.insert(GeneratedSegmentCreate);
         options.extensions.insert(capability.clone());

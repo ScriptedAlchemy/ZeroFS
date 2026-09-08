@@ -6,7 +6,8 @@ use crate::writeback::config::{AckMode, WritebackSettings};
 use crate::writeback::journal::Journal;
 use crate::writeback::journaler::{LocalBarrier, LocalBarrierError, LocalJournaler};
 use crate::writeback::model::{
-    LocalEtag, MutationKind, MutationMode, MutationRecord, WritebackStatus, classify_mutation_fence,
+    FenceClass, LocalEtag, MutationKind, MutationMode, MutationRecord, WritebackStatus,
+    classify_mutation_fence,
 };
 use crate::writeback::multipart_reservation::{
     CleanedMultipartStaging, MultipartReservationSet, MultipartStagingCleanup, MutationReservation,
@@ -972,10 +973,27 @@ impl ObjectStore for WritebackObjectStore {
         options: PutMultipartOptions,
     ) -> object_store::Result<Box<dyn MultipartUpload>> {
         self.ensure_writable()?;
-        if options.extensions.get::<GeneratedSegmentCreate>().is_some()
-            && let Some(context) = options.extensions.get::<ConditionalMultipartCreate>()
-        {
-            context.acknowledge();
+        let generated_segment = options.extensions.get::<GeneratedSegmentCreate>().is_some();
+        if generated_segment {
+            let payload_len = options
+                .extensions
+                .get::<ConditionalMultipartCreate>()
+                .and_then(ConditionalMultipartCreate::declared_payload_len)
+                .unwrap_or(0);
+            let kind = MutationKind::Put {
+                mode: MutationMode::Create,
+                expected_visible_version: None,
+                payload_len,
+                payload_sha256: [0; 32],
+                blob_path: String::new(),
+            };
+            if classify_mutation_fence(location.as_ref(), &kind, &self.inner.database_prefix)
+                != FenceClass::ImmutableCreate
+            {
+                return Err(generic_error(
+                    "generated segment multipart capability requires a canonical segment path",
+                ));
+            }
         }
         let memory_parts = self.inner.settings.ack_mode == AckMode::Memory;
         let staging = if memory_parts {
@@ -987,13 +1005,67 @@ impl ObjectStore for WritebackObjectStore {
                 })?,
             )
         };
+        let declared_payload_len =
+            options
+                .extensions
+                .get::<GeneratedSegmentCreate>()
+                .and_then(|_| {
+                    options
+                        .extensions
+                        .get::<ConditionalMultipartCreate>()
+                        .and_then(ConditionalMultipartCreate::declared_payload_len)
+                });
+        let preowned_reservation = match declared_payload_len {
+            Some(payload_len) if memory_parts => Some(MultipartPartReservation::Ram(
+                RamMultipartPartReservation::reserve(&self.inner.admission, payload_len)
+                    .await
+                    .map_err(|error| {
+                        generic_error(format!("declared multipart RAM admission failed: {error}"))
+                    })?,
+            )),
+            Some(payload_len) => {
+                let journal_bytes =
+                    MutationRecord::ssd_reservation_estimate(location.as_ref(), None, payload_len)
+                        .map_err(|error| {
+                            generic_error(format!(
+                                "failed to size declared multipart journal reservation: {error}"
+                            ))
+                        })?;
+                let sample = self.inner.space.sample().await.map_err(|error| {
+                    generic_error(format!("declared multipart space sample failed: {error}"))
+                })?;
+                Some(MultipartPartReservation::Ssd(
+                    SsdMultipartPartReservation::reserve(
+                        self.inner.ssd.as_ref(),
+                        payload_len,
+                        journal_bytes,
+                        1,
+                        sample,
+                    )
+                    .await
+                    .map_err(|error| {
+                        generic_error(format!("declared multipart SSD admission failed: {error}"))
+                    })?,
+                ))
+            }
+            None => None,
+        };
+        if generated_segment
+            && let Some(context) = options.extensions.get::<ConditionalMultipartCreate>()
+        {
+            context.acknowledge();
+        }
         Ok(Box::new(WritebackMultipartUpload {
             store: self.clone(),
             location: location.clone(),
             options,
             staging,
             memory_parts,
-            state: Arc::new(StdMutex::new(MultipartState::default())),
+            state: Arc::new(StdMutex::new(MultipartState {
+                declared_payload_len,
+                preowned_reservation,
+                ..Default::default()
+            })),
             notify: Arc::new(Notify::new()),
             terminal: false,
         }))
@@ -1119,6 +1191,12 @@ struct MultipartState {
     registered_len: u64,
     active: usize,
     aborted: bool,
+    cleanup_started: bool,
+    cleanup_result: Option<Result<(), String>>,
+    /// Generated segments with trusted declared bytes reserve the full logical
+    /// object before their capability is acknowledged.
+    declared_payload_len: Option<u64>,
+    preowned_reservation: Option<MultipartPartReservation>,
 }
 
 #[derive(Debug)]
@@ -1200,8 +1278,11 @@ impl MultipartUpload for WritebackMultipartUpload {
         let Ok(len) = u64::try_from(data.content_length()) else {
             return Box::pin(async { Err(generic_error("multipart part is too large")) });
         };
-        let (index, offset, total) = {
+        let (index, offset, total, preowned) = {
             let mut state = self.state.lock().unwrap();
+            if state.aborted {
+                return Box::pin(async { Err(generic_error("multipart upload was aborted")) });
+            }
             let offset = state.registered_len;
             let Some(total) = offset.checked_add(len) else {
                 return Box::pin(async { Err(generic_error("multipart length overflow")) });
@@ -1213,11 +1294,6 @@ impl MultipartUpload for WritebackMultipartUpload {
                     ))
                 });
             }
-            // Memory-mode parts hold their RAM admission until complete()/
-            // abort(), so an object whose parts exceed the gate's capacity
-            // would wait on bytes only its own completion can free -- a
-            // self-deadlock that also wedges every writer queued behind it
-            // on the FIFO gate. Fail fast instead.
             if self.memory_parts && total > self.store.inner.settings.memory_bytes {
                 return Box::pin(async {
                     Err(generic_error(
@@ -1225,7 +1301,18 @@ impl MultipartUpload for WritebackMultipartUpload {
                     ))
                 });
             }
+            if state
+                .declared_payload_len
+                .is_some_and(|declared| total > declared)
+            {
+                return Box::pin(async {
+                    Err(generic_error(
+                        "multipart parts exceed the declared payload length",
+                    ))
+                });
+            }
             let index = state.parts.len();
+            let preowned = state.preowned_reservation.is_some();
             state.parts.push(MultipartPart {
                 len,
                 completed: false,
@@ -1233,9 +1320,9 @@ impl MultipartUpload for WritebackMultipartUpload {
                 reservation: None,
             });
             state.registered_len = total;
-            (index, offset, total)
+            (index, offset, total, preowned)
         };
-        let journal_share = if self.memory_parts {
+        let journal_share = if self.memory_parts || preowned {
             None
         } else {
             let next =
@@ -1283,6 +1370,10 @@ impl MultipartUpload for WritebackMultipartUpload {
         let state = self.state.clone();
         let notify = self.notify.clone();
         let store = self.store.clone();
+        let cleanup_staging = staging.clone();
+        let cleanup_notify = notify.clone();
+        let cleanup_ssd = store.inner.ssd.as_ref().clone();
+        let cleanup_space = Arc::clone(&store.inner.space);
         Box::pin(async move {
             store.ensure_writable()?;
             {
@@ -1299,26 +1390,35 @@ impl MultipartUpload for WritebackMultipartUpload {
                 active: true,
             };
             if memory_parts {
-                let reservation = tokio::select! {
-                    result = reserve_memory_multipart_payload(
-                        &store.inner.admission,
-                        len,
-                        data,
-                    ) => {
-                        result.map_err(|error| {
-                            generic_error(format!("multipart RAM admission failed: {error}"))
-                        })?
-                    }
-                    () = wait_for_multipart_abort(&state, &guard.notify) => {
-                        return Err(generic_error("multipart upload was aborted"));
-                    }
+                let reservation = if preowned {
+                    None
+                } else {
+                    Some(
+                        match RamMultipartPartReservation::try_reserve(&store.inner.admission, len)
+                        {
+                            Ok(reservation) => reservation,
+                            Err(error) => {
+                                guard.finish(false, None, None);
+                                reject_multipart_part(
+                                    state.clone(),
+                                    cleanup_notify,
+                                    cleanup_staging,
+                                    cleanup_ssd,
+                                    cleanup_space,
+                                )
+                                .await?;
+                                return Err(generic_error(format!(
+                                    "multipart RAM admission failed: {error}"
+                                )));
+                            }
+                        },
+                    )
                 };
-                let (data, reservation) = reservation;
                 let valid = data.content_length() as u64 == len;
                 let aborted = guard.finish(
                     valid,
                     valid.then_some(data),
-                    Some(MultipartPartReservation::Ram(reservation)),
+                    reservation.map(MultipartPartReservation::Ram),
                 );
                 if aborted {
                     return Err(generic_error("multipart upload was aborted"));
@@ -1330,26 +1430,39 @@ impl MultipartUpload for WritebackMultipartUpload {
                 };
             }
             let staging = staging.ok_or_else(|| generic_error("multipart staging is missing"))?;
-            let (journal_bytes, journal_operations) =
-                journal_share.ok_or_else(|| generic_error("multipart journal share is missing"))?;
-            let sample = store.inner.space.sample().await.map_err(|error| {
-                generic_error(format!("multipart space sample failed: {error}"))
-            })?;
-            let reservation = tokio::select! {
-                result = SsdMultipartPartReservation::reserve(
-                    &store.inner.ssd,
-                    len,
-                    journal_bytes,
-                    journal_operations,
-                    sample,
-                ) => {
-                    result.map_err(|error| {
-                        generic_error(format!("multipart SSD admission failed: {error}"))
-                    })?
-                }
-                () = wait_for_multipart_abort(&state, &guard.notify) => {
-                    return Err(generic_error("multipart upload was aborted"));
-                }
+            let reservation = if preowned {
+                None
+            } else {
+                let (journal_bytes, journal_operations) = journal_share
+                    .ok_or_else(|| generic_error("multipart journal share is missing"))?;
+                let sample = store.inner.space.sample().await.map_err(|error| {
+                    generic_error(format!("multipart space sample failed: {error}"))
+                })?;
+                Some(
+                    match SsdMultipartPartReservation::try_reserve(
+                        &store.inner.ssd,
+                        len,
+                        journal_bytes,
+                        journal_operations,
+                        sample,
+                    ) {
+                        Ok(reservation) => reservation,
+                        Err(error) => {
+                            guard.finish(false, None, None);
+                            reject_multipart_part(
+                                state.clone(),
+                                cleanup_notify,
+                                cleanup_staging,
+                                cleanup_ssd,
+                                cleanup_space,
+                            )
+                            .await?;
+                            return Err(generic_error(format!(
+                                "multipart SSD admission failed: {error}"
+                            )));
+                        }
+                    },
+                )
             };
             let part_path = staging.join("payload.staged");
             let (write, aborted) = tokio::task::spawn_blocking(move || {
@@ -1361,7 +1474,7 @@ impl MultipartUpload for WritebackMultipartUpload {
                 let aborted = guard.finish(
                     write.is_ok(),
                     None,
-                    Some(MultipartPartReservation::Ssd(reservation)),
+                    reservation.map(MultipartPartReservation::Ssd),
                 );
                 (write, aborted)
             })
@@ -1382,7 +1495,7 @@ impl MultipartUpload for WritebackMultipartUpload {
                 "multipart upload is already completed or aborted",
             ));
         }
-        let (parts, total_len) = {
+        let (parts, total_len, preowned_reservation) = {
             let mut state = self.state.lock().unwrap();
             if state.aborted {
                 return Err(generic_error("multipart upload was aborted"));
@@ -1395,12 +1508,23 @@ impl MultipartUpload for WritebackMultipartUpload {
             let total = state
                 .parts
                 .iter()
-                .try_fold(0_u64, |total, part| total.checked_add(part.len));
-            validate_completed_multipart_parts(&state.parts, self.memory_parts)?;
-            (
-                std::mem::take(&mut state.parts),
-                total.ok_or_else(|| generic_error("multipart length overflow"))?,
-            )
+                .try_fold(0_u64, |total, part| total.checked_add(part.len))
+                .ok_or_else(|| generic_error("multipart length overflow"))?;
+            if state
+                .declared_payload_len
+                .is_some_and(|declared| total != declared)
+            {
+                return Err(generic_error(
+                    "multipart payload length differs from its declaration",
+                ));
+            }
+            validate_completed_multipart_parts(
+                &state.parts,
+                self.memory_parts,
+                state.preowned_reservation.is_some(),
+            )?;
+            let preowned = state.preowned_reservation.take();
+            (std::mem::take(&mut state.parts), total, preowned)
         };
         let staging = self.staging.take();
         self.terminal = true;
@@ -1410,11 +1534,28 @@ impl MultipartUpload for WritebackMultipartUpload {
         let memory_parts = self.memory_parts;
         tokio::spawn(async move {
             if memory_parts {
-                complete_memory_multipart(store, location, options, parts, total_len).await
+                complete_memory_multipart(
+                    store,
+                    location,
+                    options,
+                    parts,
+                    total_len,
+                    preowned_reservation,
+                )
+                .await
             } else {
                 let staging =
                     staging.ok_or_else(|| generic_error("multipart staging is missing"))?;
-                complete_multipart(store, location, options, staging, parts, total_len).await
+                complete_multipart(
+                    store,
+                    location,
+                    options,
+                    staging,
+                    parts,
+                    total_len,
+                    preowned_reservation,
+                )
+                .await
             }
         })
         .await
@@ -1427,20 +1568,9 @@ impl MultipartUpload for WritebackMultipartUpload {
         }
         self.terminal = true;
         let staging = self.staging.take();
-        {
-            self.state.lock().unwrap().aborted = true;
-        }
-        self.notify.notify_waiters();
-        let state = self.state.clone();
-        let notify = self.notify.clone();
         let ssd = self.store.inner.ssd.as_ref().clone();
         let space = Arc::clone(&self.store.inner.space);
-        tokio::spawn(async move {
-            wait_for_multipart_parts(&state, &notify).await;
-            cleanup_aborted_multipart(&state, staging, ssd, space).await
-        })
-        .await
-        .map_err(|error| generic_error(format!("owned multipart abort failed: {error}")))?
+        reject_multipart_part(self.state.clone(), self.notify.clone(), staging, ssd, space).await
     }
 }
 
@@ -1449,39 +1579,47 @@ impl Drop for WritebackMultipartUpload {
         if self.terminal {
             return;
         }
-        self.state.lock().unwrap().aborted = true;
-        self.notify.notify_waiters();
-        let Some(staging) = self.staging.take() else {
-            return;
-        };
+        let staging = self.staging.take();
         let state = self.state.clone();
         let notify = self.notify.clone();
         let ssd = self.store.inner.ssd.as_ref().clone();
         let space = Arc::clone(&self.store.inner.space);
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
-                wait_for_multipart_parts(&state, &notify).await;
-                if let Err(error) =
-                    cleanup_aborted_multipart(&state, Some(staging), ssd, space).await
-                {
-                    tracing::warn!(%error, "failed to clean dropped writeback multipart staging");
-                }
-            });
-        } else if state.lock().unwrap().active == 0 {
-            let reservations = take_multipart_reservations(&state);
-            match remove_aborted_reservations(staging, reservations) {
-                Ok(Some(cleaned)) => {
-                    cleaned.admission().poison(
-                        "multipart staging was removed without a fresh physical-space sample",
-                    );
-                    cleaned.retain_claims();
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    tracing::warn!(%error, "failed to clean dropped writeback multipart staging");
-                }
+            if begin_multipart_abort(&state, &notify) {
+                let completion = MultipartCleanupCompletion::new(state.clone(), notify.clone());
+                runtime.spawn(async move {
+                    wait_for_multipart_parts(&state, &notify).await;
+                    let result = cleanup_aborted_multipart(&state, staging, ssd, space)
+                        .await
+                        .map_err(|error| error.to_string());
+                    if let Err(error) = &result {
+                        tracing::warn!(%error, "failed to clean dropped writeback multipart staging");
+                    }
+                    completion.publish(result);
+                });
             }
-        } else {
+        } else if state.lock().unwrap().active == 0 {
+            if !begin_multipart_abort(&state, &notify) {
+                return;
+            }
+            let reservations = take_multipart_reservations(&state);
+            if let Some(staging) = staging {
+                match remove_aborted_reservations(staging, reservations) {
+                    Ok(Some(cleaned)) => {
+                        cleaned.admission().poison(
+                            "multipart staging was removed without a fresh physical-space sample",
+                        );
+                        cleaned.retain_claims();
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(%error, "failed to clean dropped writeback multipart staging");
+                    }
+                }
+            } else {
+                drop(reservations);
+            }
+        } else if let Some(staging) = staging {
             ssd.poison(format!(
                 "multipart runtime disappeared with active staging writes at {}",
                 staging.display()
@@ -1490,10 +1628,16 @@ impl Drop for WritebackMultipartUpload {
                 path = %staging.display(),
                 "multipart runtime disappeared with active staging writes; claims retained"
             );
+        } else {
+            ssd.poison("multipart runtime disappeared with active memory parts");
+            tracing::error!(
+                "multipart runtime disappeared with active memory parts; claims retained"
+            );
         }
     }
 }
 
+#[cfg(test)]
 async fn reserve_memory_multipart_payload(
     admission: &Admission,
     bytes: u64,
@@ -1507,11 +1651,14 @@ async fn reserve_memory_multipart_payload(
 fn validate_completed_multipart_parts(
     parts: &[MultipartPart],
     memory_parts: bool,
+    preowned: bool,
 ) -> object_store::Result<()> {
     for part in parts {
-        match (&part.payload, &part.reservation, memory_parts) {
-            (Some(_), Some(MultipartPartReservation::Ram(_)), true)
-            | (None, Some(MultipartPartReservation::Ssd(_)), false) => {}
+        match (&part.payload, &part.reservation, memory_parts, preowned) {
+            (Some(_), Some(MultipartPartReservation::Ram(_)), true, _)
+            | (None, Some(MultipartPartReservation::Ssd(_)), false, _)
+            | (Some(_), None, true, true)
+            | (None, None, false, true) => {}
             _ => return Err(generic_error("multipart part ownership is incomplete")),
         }
     }
@@ -1538,7 +1685,14 @@ async fn complete_memory_multipart(
     options: PutMultipartOptions,
     parts: Vec<MultipartPart>,
     total_len: u64,
+    preowned_reservation: Option<MultipartPartReservation>,
 ) -> object_store::Result<PutResult> {
+    let preowned = match preowned_reservation {
+        Some(MultipartPartReservation::Ram(reservation)) => Some(reservation),
+        Some(_) => return Err(generic_error("memory multipart preownership is not RAM")),
+        None => None,
+    };
+    let has_preowned = preowned.is_some();
     let mut payload_parts = Vec::with_capacity(parts.len());
     let mut reservations = Vec::with_capacity(parts.len().max(1));
     for mut part in parts {
@@ -1549,8 +1703,12 @@ async fn complete_memory_multipart(
         );
         match part.reservation.take() {
             Some(MultipartPartReservation::Ram(reservation)) => reservations.push(reservation),
+            None if has_preowned => {}
             _ => return Err(generic_error("memory multipart reservation is missing")),
         }
+    }
+    if let Some(preowned) = preowned {
+        reservations.push(preowned);
     }
     if reservations.is_empty() {
         reservations.push(
@@ -1583,20 +1741,18 @@ async fn complete_memory_multipart(
             ))
         })?;
     let disk = store.reserve_ssd(disk_charge).await?;
-    let put_options = multipart_put_options(options);
     store
         .clone()
         .owned_put_verified(
             location,
             verified,
-            put_options,
+            multipart_put_options(options),
             Some(ram.final_ram),
             Some(disk),
             None,
         )
         .await
 }
-
 async fn complete_multipart(
     store: WritebackObjectStore,
     location: Path,
@@ -1604,14 +1760,25 @@ async fn complete_multipart(
     staging: PathBuf,
     parts: Vec<MultipartPart>,
     total_len: u64,
+    preowned_reservation: Option<MultipartPartReservation>,
 ) -> object_store::Result<PutResult> {
+    let preowned = match preowned_reservation {
+        Some(MultipartPartReservation::Ssd(reservation)) => Some(reservation),
+        Some(_) => return Err(generic_error("SSD multipart preownership is not SSD")),
+        None => None,
+    };
+    let has_preowned = preowned.is_some();
     let mut reservations = Vec::with_capacity(parts.len().max(1));
-    let mut create_empty_staging = false;
+    let mut create_empty_staging = parts.is_empty();
     for mut part in parts {
         match part.reservation.take() {
             Some(MultipartPartReservation::Ssd(reservation)) => reservations.push(reservation),
+            None if has_preowned => {}
             _ => return Err(generic_error("SSD multipart reservation is missing")),
         }
+    }
+    if let Some(preowned) = preowned {
+        reservations.push(preowned);
     }
     if reservations.is_empty() {
         create_empty_staging = true;
@@ -1690,7 +1857,6 @@ async fn complete_multipart(
         )
         .await
 }
-
 async fn cleanup_failed_multipart<T>(
     store: &WritebackObjectStore,
     disk: SsdReservationToken,
@@ -1716,24 +1882,23 @@ async fn wait_for_multipart_parts(state: &StdMutex<MultipartState>, notify: &Not
     }
 }
 
-async fn wait_for_multipart_abort(state: &StdMutex<MultipartState>, notify: &Notify) {
-    loop {
-        let notified = notify.notified();
-        if state.lock().unwrap().aborted {
-            return;
-        }
-        notified.await;
-    }
-}
-
 fn take_multipart_reservations(state: &StdMutex<MultipartState>) -> Vec<MultipartPartReservation> {
-    state
-        .lock()
-        .unwrap()
-        .parts
-        .iter_mut()
-        .filter_map(|part| part.reservation.take())
-        .collect()
+    let mut state = state.lock().unwrap();
+    let mut parts = std::mem::take(&mut state.parts);
+    state.registered_len = 0;
+    let mut reservations =
+        Vec::with_capacity(parts.len() + usize::from(state.preowned_reservation.is_some()));
+    for part in &mut parts {
+        part.payload.take();
+        if let Some(reservation) = part.reservation.take() {
+            reservations.push(reservation);
+        }
+    }
+    drop(parts);
+    if let Some(preowned) = state.preowned_reservation.take() {
+        reservations.push(preowned);
+    }
+    reservations
 }
 
 fn remove_aborted_reservations(
@@ -1748,6 +1913,89 @@ fn remove_aborted_reservations(
         }
     }
     remove_aborted_ssd_multipart(staging, ssd_reservations)
+}
+
+fn begin_multipart_abort(state: &StdMutex<MultipartState>, notify: &Notify) -> bool {
+    let mut state = state.lock().unwrap();
+    state.aborted = true;
+    if state.cleanup_started {
+        drop(state);
+        notify.notify_waiters();
+        return false;
+    }
+    state.cleanup_started = true;
+    drop(state);
+    notify.notify_waiters();
+    true
+}
+
+struct MultipartCleanupCompletion {
+    state: Arc<StdMutex<MultipartState>>,
+    notify: Arc<Notify>,
+    published: bool,
+}
+
+impl MultipartCleanupCompletion {
+    fn new(state: Arc<StdMutex<MultipartState>>, notify: Arc<Notify>) -> Self {
+        Self {
+            state,
+            notify,
+            published: false,
+        }
+    }
+
+    fn publish(mut self, result: Result<(), String>) {
+        self.state.lock().unwrap().cleanup_result = Some(result);
+        self.published = true;
+        self.notify.notify_waiters();
+    }
+}
+
+impl Drop for MultipartCleanupCompletion {
+    fn drop(&mut self) {
+        if self.published {
+            return;
+        }
+        self.state.lock().unwrap().cleanup_result = Some(Err(
+            "owned multipart cleanup task was canceled or panicked".to_owned(),
+        ));
+        self.notify.notify_waiters();
+    }
+}
+
+async fn wait_for_multipart_cleanup(
+    state: &StdMutex<MultipartState>,
+    notify: &Notify,
+) -> object_store::Result<()> {
+    loop {
+        let notified = notify.notified();
+        if let Some(result) = state.lock().unwrap().cleanup_result.clone() {
+            return result.map_err(generic_error);
+        }
+        notified.await;
+    }
+}
+
+async fn reject_multipart_part(
+    state: Arc<StdMutex<MultipartState>>,
+    notify: Arc<Notify>,
+    staging: Option<PathBuf>,
+    ssd: SsdAdmission,
+    space: Arc<PhysicalSpaceSampler>,
+) -> object_store::Result<()> {
+    if begin_multipart_abort(&state, &notify) {
+        let cleanup_state = state.clone();
+        let cleanup_notify = notify.clone();
+        let completion = MultipartCleanupCompletion::new(state.clone(), notify.clone());
+        tokio::spawn(async move {
+            wait_for_multipart_parts(&cleanup_state, &cleanup_notify).await;
+            let result = cleanup_aborted_multipart(&cleanup_state, staging, ssd, space)
+                .await
+                .map_err(|error| error.to_string());
+            completion.publish(result);
+        });
+    }
+    wait_for_multipart_cleanup(&state, &notify).await
 }
 
 async fn cleanup_aborted_multipart(
@@ -2037,12 +2285,15 @@ async fn reserve_ssd_token_from_sample_with_observer(
 
 #[cfg(test)]
 mod tests {
-    use super::{WritebackObjectStore, reserve_ssd_token_from_sample};
+    use super::{
+        MultipartPart, MultipartPartReservation, MultipartState, RamMultipartPartReservation,
+        WritebackObjectStore, reserve_ssd_token_from_sample, take_multipart_reservations,
+    };
     use crate::config::CompressionConfig;
     use crate::fault_store::{FaultControls, FaultStore};
     use crate::frame_codec::FrameCodec;
     use crate::segment::{SEGMENT_INFO, Segid};
-    use crate::segment_store::{GeneratedSegmentCreate, SegmentStore};
+    use crate::segment_store::{ConditionalMultipartCreate, GeneratedSegmentCreate, SegmentStore};
     use crate::writeback::admission::Admission;
     use crate::writeback::config::{AckMode, ShutdownFlush, WritebackSettings};
     use crate::writeback::journal::Journal;
@@ -2065,7 +2316,7 @@ mod tests {
     };
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex as StdMutex};
     use std::time::Duration;
     use uuid::Uuid;
 
@@ -2601,6 +2852,25 @@ mod tests {
         disk_bytes: u64,
         max_operations: u64,
     ) -> (WritebackObjectStore, Arc<InMemory>, tempfile::TempDir) {
+        test_store_with_resource_limits_and_watermarks(
+            ack_mode,
+            memory_bytes,
+            disk_bytes,
+            max_operations,
+            95,
+            85,
+        )
+        .await
+    }
+
+    async fn test_store_with_resource_limits_and_watermarks(
+        ack_mode: AckMode,
+        memory_bytes: u64,
+        disk_bytes: u64,
+        max_operations: u64,
+        high_watermark_percent: u8,
+        resume_percent: u8,
+    ) -> (WritebackObjectStore, Arc<InMemory>, tempfile::TempDir) {
         let temp = tempfile::tempdir().unwrap();
         let settings = WritebackSettings {
             dir: temp.path().join("writeback"),
@@ -2608,8 +2878,8 @@ mod tests {
             memory_bytes,
             disk_bytes,
             min_free_bytes: 1,
-            high_watermark_percent: 95,
-            resume_percent: 85,
+            high_watermark_percent,
+            resume_percent,
             upload_concurrency: 2,
             local_concurrency: 2,
             shutdown_flush: ShutdownFlush::Local,
@@ -4121,12 +4391,255 @@ mod tests {
         .await
         .expect("over-budget part must fail fast, not wait on its own bytes")
         .unwrap_err();
+
         assert!(
             error.to_string().contains("exceeds the dirty RAM budget"),
             "unexpected error: {error}"
         );
         upload.abort().await.unwrap();
         assert_eq!(store.inner.admission.used_bytes(), 0);
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn multipart_rejection_cleanup_drops_payload_before_refunding_ram() {
+        let admission = Admission::new(8);
+        let reservation = RamMultipartPartReservation::reserve(&admission, 4)
+            .await
+            .unwrap();
+        let state = StdMutex::new(MultipartState {
+            parts: vec![MultipartPart {
+                len: 4,
+                completed: true,
+                payload: Some(Bytes::from_static(b"held").into()),
+                reservation: Some(MultipartPartReservation::Ram(reservation)),
+            }],
+            registered_len: 4,
+            ..Default::default()
+        });
+
+        let reservations = take_multipart_reservations(&state);
+        assert!(state.lock().unwrap().parts.is_empty());
+        assert_eq!(state.lock().unwrap().registered_len, 0);
+        assert_eq!(admission.used_bytes(), 4);
+        drop(reservations);
+        assert_eq!(admission.used_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn canceled_rejection_waiter_does_not_detach_later_abort_from_owned_cleanup() {
+        let admission = Admission::new(8);
+        let reservation = RamMultipartPartReservation::reserve(&admission, 4)
+            .await
+            .unwrap();
+        let state = Arc::new(StdMutex::new(MultipartState {
+            parts: vec![MultipartPart {
+                len: 4,
+                completed: true,
+                payload: Some(Bytes::from_static(b"held").into()),
+                reservation: Some(MultipartPartReservation::Ram(reservation)),
+            }],
+            registered_len: 4,
+            active: 1,
+            ..Default::default()
+        }));
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let temp = tempfile::tempdir().unwrap();
+        let space = Arc::new(PhysicalSpaceSampler::new(temp.path().to_path_buf()));
+        let ssd = SsdAdmission::new(1024, 8, 95, 85, 0).unwrap();
+
+        let first = tokio::spawn(super::reject_multipart_part(
+            state.clone(),
+            notify.clone(),
+            None,
+            ssd.clone(),
+            space.clone(),
+        ));
+        tokio::task::yield_now().await;
+        first.abort();
+        let _ = first.await;
+
+        let mut second = tokio::spawn(super::reject_multipart_part(
+            state.clone(),
+            notify.clone(),
+            None,
+            ssd,
+            space,
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut second)
+                .await
+                .is_err(),
+            "explicit abort returned before its active sibling released"
+        );
+        state.lock().unwrap().active = 0;
+        notify.notify_waiters();
+        second.await.unwrap().unwrap();
+        assert_eq!(admission.used_bytes(), 0);
+        assert!(state.lock().unwrap().parts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn interleaved_unknown_memory_multiparts_cannot_hold_a4_b4_while_a2_b2_wait() {
+        let (store, _remote, _temp) =
+            test_store_with_resource_limits(AckMode::Memory, 8, 1_000_000, 100).await;
+        let mut upload_a = store
+            .put_multipart(&Path::from("unknown-memory-a"))
+            .await
+            .unwrap();
+        let mut upload_b = store
+            .put_multipart(&Path::from("unknown-memory-b"))
+            .await
+            .unwrap();
+        upload_a
+            .put_part(Bytes::from_static(b"A4__").into())
+            .await
+            .unwrap();
+        upload_b
+            .put_part(Bytes::from_static(b"B4__").into())
+            .await
+            .unwrap();
+        assert_eq!(store.inner.admission.used_bytes(), 8);
+
+        let a2 = upload_a.put_part(Bytes::from_static(b"A2").into());
+        let b2 = upload_b.put_part(Bytes::from_static(b"B2").into());
+        let settled = tokio::time::timeout(Duration::from_secs(1), async {
+            futures::future::join(a2, b2).await
+        })
+        .await;
+
+        let (a2, b2) =
+            settled.expect("multipart growth waited on capacity owned by the same two uploads");
+        let rejected = usize::from(a2.is_err()) + usize::from(b2.is_err());
+        if a2.is_ok() {
+            upload_a.complete().await.unwrap();
+        } else {
+            upload_a.abort().await.unwrap();
+        }
+        if b2.is_ok() {
+            upload_b.complete().await.unwrap();
+        } else {
+            upload_b.abort().await.unwrap();
+        }
+        assert!(
+            rejected >= 1,
+            "at least one full-capacity multipart must reject"
+        );
+        let accepted = store.status().unwrap().accepted_seq;
+        if accepted != 0 {
+            store.wait_local(accepted).await.unwrap();
+        }
+        assert_eq!(store.inner.admission.used_bytes(), 0);
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn interleaved_unknown_ssd_multiparts_cannot_hold_a4_b4_while_a2_b2_wait() {
+        let path_a = Path::from("unknown-ssd-a");
+        let path_b = Path::from("unknown-ssd-b");
+        let first_part_charge =
+            4 + MutationRecord::ssd_reservation_estimate(path_a.as_ref(), None, 4).unwrap();
+        let (store, _remote, _temp) = test_store_with_resource_limits_and_watermarks(
+            AckMode::Ssd,
+            8,
+            first_part_charge * 2,
+            100,
+            100,
+            85,
+        )
+        .await;
+        let mut upload_a = store.put_multipart(&path_a).await.unwrap();
+        let mut upload_b = store.put_multipart(&path_b).await.unwrap();
+        upload_a
+            .put_part(Bytes::from_static(b"A4__").into())
+            .await
+            .unwrap();
+        upload_b
+            .put_part(Bytes::from_static(b"B4__").into())
+            .await
+            .unwrap();
+        assert_eq!(store.inner.ssd.used_bytes(), first_part_charge * 2);
+
+        let a2 = upload_a.put_part(Bytes::from_static(b"A2").into());
+        let b2 = upload_b.put_part(Bytes::from_static(b"B2").into());
+        let (a2, b2) = tokio::time::timeout(Duration::from_secs(1), async {
+            futures::future::join(a2, b2).await
+        })
+        .await
+        .expect("multipart growth waited on SSD claims owned by the same two uploads");
+        let rejected = usize::from(a2.is_err()) + usize::from(b2.is_err());
+        if a2.is_ok() {
+            upload_a.complete().await.unwrap();
+        } else {
+            upload_a.abort().await.unwrap();
+        }
+        if b2.is_ok() {
+            upload_b.complete().await.unwrap();
+        } else {
+            upload_b.abort().await.unwrap();
+        }
+        assert!(
+            rejected >= 1,
+            "at least one full-capacity multipart must reject"
+        );
+        let accepted = store.status().unwrap().accepted_seq;
+        if accepted != 0 {
+            store.wait_remote(accepted).await.unwrap();
+        }
+        assert_eq!(store.inner.ssd.used_bytes(), 0);
+        assert_eq!(store.inner.ssd.outstanding_physical_claims(), 0);
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn generated_multipart_declared_length_is_reserved_atomically_before_ack() {
+        let (store, _remote, _temp) =
+            test_store_with_resource_limits(AckMode::Memory, 8, 1_000_000, 100).await;
+        let capability = ConditionalMultipartCreate::for_payload_len(6);
+        let mut options = PutMultipartOptions::default();
+        options.extensions.insert(GeneratedSegmentCreate);
+        options.extensions.insert(capability.clone());
+
+        let mut upload = store
+            .put_multipart_opts(
+                &Path::from("zerofs/pilot/segments/01/0000000000000001/0000000000000001"),
+                options,
+            )
+            .await
+            .unwrap();
+        let acknowledged = capability.is_acknowledged();
+        let declared = capability.declared_payload_len();
+        let reserved = store.inner.admission.used_bytes();
+        upload.abort().await.unwrap();
+
+        assert!(acknowledged);
+        assert_eq!(declared, Some(6));
+        assert_eq!(
+            reserved, 6,
+            "acknowledgement preceded whole-object admission"
+        );
+        assert_eq!(store.inner.admission.used_bytes(), 0);
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn declared_zero_length_ssd_multipart_completes_without_parts() {
+        let (store, _remote, _temp) =
+            test_store_with_resource_limits(AckMode::Ssd, 8, 1_000_000, 100).await;
+        let capability = ConditionalMultipartCreate::for_payload_len(0);
+        let mut options = PutMultipartOptions::default();
+        options.extensions.insert(GeneratedSegmentCreate);
+        options.extensions.insert(capability.clone());
+        let path = Path::from("zerofs/pilot/segments/02/0000000000000002/0000000000000002");
+
+        let mut upload = store.put_multipart_opts(&path, options).await.unwrap();
+        upload.complete().await.unwrap();
+
+        assert!(capability.is_acknowledged());
+        assert_eq!(
+            store.get(&path).await.unwrap().bytes().await.unwrap(),
+            Bytes::new()
+        );
         store.shutdown().await.unwrap();
     }
 

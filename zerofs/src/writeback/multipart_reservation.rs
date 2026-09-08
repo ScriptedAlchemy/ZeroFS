@@ -19,6 +19,13 @@ impl RamMultipartPartReservation {
             admission: admission.clone(),
         })
     }
+
+    pub(crate) fn try_reserve(admission: &Admission, bytes: u64) -> Result<Self, AdmissionError> {
+        Ok(Self {
+            final_ram_share: admission.try_reserve(bytes)?.accept(),
+            admission: admission.clone(),
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -79,6 +86,31 @@ impl SsdMultipartPartReservation {
                 sample,
             )
             .await?;
+        Ok(Self {
+            staging: SsdStagingToken {
+                token: Some(tokens.staging),
+                admission: admission.clone(),
+            },
+            final_journal_share: SsdJournalShareToken {
+                token: tokens.final_journal,
+                admission: admission.clone(),
+            },
+        })
+    }
+
+    pub(crate) fn try_reserve(
+        admission: &SsdAdmission,
+        staging_bytes: u64,
+        final_journal_bytes: u64,
+        final_journal_operations: u64,
+        sample: PhysicalSpaceSample,
+    ) -> Result<Self, ReservationError> {
+        let tokens = admission.try_reserve_multipart_part(
+            staging_bytes,
+            final_journal_bytes,
+            final_journal_operations,
+            sample,
+        )?;
         Ok(Self {
             staging: SsdStagingToken {
                 token: Some(tokens.staging),

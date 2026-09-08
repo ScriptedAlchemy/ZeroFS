@@ -13,6 +13,8 @@ pub enum AdmissionError {
     Poisoned(String),
     #[error("writeback mutation requires {requested} bytes but capacity is {capacity} bytes")]
     TooLarge { requested: u64, capacity: u64 },
+    #[error("writeback admission cannot currently reserve {requested} bytes without queueing")]
+    Unavailable { requested: u64 },
     #[error("invalid writeback admission configuration: {0}")]
     InvalidConfiguration(&'static str),
     /// Reserved for the underflow-poison contract documented on
@@ -194,6 +196,32 @@ async fn reserve_bytes<P: AdmissionPolicy>(
     result
 }
 
+/// Attempts one immediate reservation without bypassing FIFO waiters.
+fn try_reserve_bytes<P: AdmissionPolicy>(
+    gate: &Arc<Gate<P>>,
+    bytes: u64,
+    prepare: impl FnOnce(&mut GateState<P>),
+) -> Result<P::Permit, AdmissionError> {
+    if bytes > gate.capacity {
+        return Err(AdmissionError::TooLarge {
+            requested: bytes,
+            capacity: gate.capacity,
+        });
+    }
+    let mut state = lock(&gate.state);
+    prepare(&mut state);
+    P::refresh(gate, &mut state);
+    if let Some(error) = &state.terminal {
+        return Err(error.clone());
+    }
+    if !state.waiters.is_empty() || !P::fits(gate, &state, bytes) {
+        return Err(AdmissionError::Unavailable { requested: bytes });
+    }
+    state.used += bytes;
+    P::on_admitted(gate, &mut state);
+    Ok(P::permit(gate, bytes))
+}
+
 /// Wakes waiters from the front of the queue while the head still fits.
 fn grant_waiters<P: AdmissionPolicy>(gate: &Arc<Gate<P>>) {
     let mut state = lock(&gate.state);
@@ -340,6 +368,12 @@ impl Admission {
 
     pub(crate) async fn reserve(&self, bytes: u64) -> Result<AdmissionPermit, AdmissionError> {
         reserve_bytes(&self.inner, bytes, |_| {}).await
+    }
+
+    /// Attempts an immediate reservation while preserving existing FIFO
+    /// waiters. This is for incomplete multipart ownership only.
+    pub(crate) fn try_reserve(&self, bytes: u64) -> Result<AdmissionPermit, AdmissionError> {
+        try_reserve_bytes(&self.inner, bytes, |_| {})
     }
 
     pub(crate) fn used_bytes(&self) -> u64 {
