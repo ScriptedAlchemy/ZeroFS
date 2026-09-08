@@ -91,7 +91,7 @@ impl AnchoredDir {
             Ok(fd) => (fd, false),
             Err(Errno::NOENT) if !create => return Ok(None),
             Err(Errno::NOENT) => {
-                let created = match mkdirat(self.fd.as_ref(), name, Mode::from_raw_mode(mode)) {
+                let created = match mkdirat(self.fd.as_ref(), name, rustix_mode(mode)?) {
                     Ok(()) => true,
                     Err(Errno::EXIST) => false,
                     Err(error) => {
@@ -207,7 +207,7 @@ impl AnchoredDir {
                 .union(OFlags::NONBLOCK)
                 .union(OFlags::NOFOLLOW)
                 .union(OFlags::CLOEXEC),
-            Mode::from_raw_mode(mode),
+            rustix_mode(mode)?,
         )
         .map_err(anyhow::Error::new)
         .with_context(|| format!("open anchored file {}", self.display.join(name).display()))?;
@@ -452,6 +452,12 @@ impl AnchoredDir {
     }
 }
 
+fn rustix_mode(mode: u32) -> Result<Mode> {
+    Ok(Mode::from_raw_mode(mode.try_into().map_err(|_| {
+        anyhow::anyhow!("anchored file mode does not fit the host mode type")
+    })?))
+}
+
 fn validate_component(name: &OsStr) -> Result<()> {
     let mut components = Path::new(name).components();
     let valid = matches!(components.next(), Some(Component::Normal(part)) if part == name)
@@ -473,12 +479,18 @@ mod tests {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
 
+    fn anchored_temp(root: &tempfile::TempDir) -> AnchoredDir {
+        owner_only(root.path());
+        AnchoredDir::open_or_create_absolute(&root.path().canonicalize().unwrap(), 0o700).unwrap()
+    }
+
     #[test]
     fn parent_replacement_does_not_redirect_child_creation() {
         let root = tempfile::tempdir().unwrap();
-        let original = root.path().join("original");
-        let retained = root.path().join("retained");
-        let outside = root.path().join("outside");
+        let physical_root = root.path().canonicalize().unwrap();
+        let original = physical_root.join("original");
+        let retained = physical_root.join("retained");
+        let outside = physical_root.join("outside");
         std::fs::create_dir(&original).unwrap();
         std::fs::create_dir(&outside).unwrap();
         owner_only(&original);
@@ -497,10 +509,9 @@ mod tests {
     #[test]
     fn repeated_enumeration_starts_from_the_beginning() {
         let root = tempfile::tempdir().unwrap();
-        owner_only(root.path());
         std::fs::write(root.path().join("a"), b"").unwrap();
         std::fs::write(root.path().join("b"), b"").unwrap();
-        let anchored = AnchoredDir::open_or_create_absolute(root.path(), 0o700).unwrap();
+        let anchored = anchored_temp(&root);
 
         let mut first = Vec::new();
         let mut second = Vec::new();
@@ -525,11 +536,10 @@ mod tests {
     #[test]
     fn create_child_converges_an_existing_owned_directory_to_owner_only() {
         let root = tempfile::tempdir().unwrap();
-        owner_only(root.path());
         let child = root.path().join("child");
         std::fs::create_dir(&child).unwrap();
         std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o775)).unwrap();
-        let anchored = AnchoredDir::open_or_create_absolute(root.path(), 0o700).unwrap();
+        let anchored = anchored_temp(&root);
 
         anchored
             .open_or_create_child("child".as_ref(), 0o700)
@@ -548,8 +558,7 @@ mod tests {
     #[test]
     fn absolute_parent_and_multi_component_names_are_rejected() {
         let root = tempfile::tempdir().unwrap();
-        owner_only(root.path());
-        let anchored = AnchoredDir::open_or_create_absolute(root.path(), 0o700).unwrap();
+        let anchored = anchored_temp(&root);
         for invalid in ["", ".", "/", "..", "a/", "a/b", "a//b"] {
             assert!(
                 anchored
@@ -568,8 +577,7 @@ mod tests {
     fn descriptor_read_only_open_retains_identity_and_exact_writer_lock() {
         const IDENTITY: TableDefinition<u64, &str> = TableDefinition::new("identity");
         let root = tempfile::tempdir().unwrap();
-        owner_only(root.path());
-        let anchored = AnchoredDir::open_or_create_absolute(root.path(), 0o700).unwrap();
+        let anchored = anchored_temp(&root);
         let database_path = root.path().join("journal.redb");
         let retained_path = root.path().join("retained.redb");
         let original = Database::create(&database_path).unwrap();
@@ -619,8 +627,7 @@ mod tests {
     #[test]
     fn exclusive_owner_file_setup_failure_removes_the_anchored_file() {
         let root = tempfile::tempdir().unwrap();
-        owner_only(root.path());
-        let anchored = AnchoredDir::open_or_create_absolute(root.path(), 0o700).unwrap();
+        let anchored = anchored_temp(&root);
 
         let error = anchored
             .open_owner_file_with("container.blobs".as_ref(), false, |_| {
@@ -638,11 +645,10 @@ mod tests {
     #[test]
     fn exclusive_owner_file_does_not_replace_an_existing_entry() {
         let root = tempfile::tempdir().unwrap();
-        owner_only(root.path());
         let existing = root.path().join("container.blobs");
         std::fs::write(&existing, b"outside").unwrap();
         std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let anchored = AnchoredDir::open_or_create_absolute(root.path(), 0o700).unwrap();
+        let anchored = anchored_temp(&root);
 
         assert!(
             anchored

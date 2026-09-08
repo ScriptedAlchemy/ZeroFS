@@ -3025,7 +3025,9 @@ mod tests {
     fn racing_shard_directory_creation_is_not_an_error() {
         let temp = tempfile::tempdir().unwrap();
         fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
-        let root = AnchoredDir::open_or_create_absolute(temp.path(), 0o700).unwrap();
+        let root =
+            AnchoredDir::open_or_create_absolute(&temp.path().canonicalize().unwrap(), 0o700)
+                .unwrap();
         for round in 0..20 {
             let shard_name = format!("blobs-{round}");
             thread::scope(|scope| {
