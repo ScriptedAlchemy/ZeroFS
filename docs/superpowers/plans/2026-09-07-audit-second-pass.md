@@ -16,7 +16,7 @@
 - Sol/Terra workers implement; primary agent reads, reviews, plans and integrates.
 - Preserve the first six fixes, ordinary POSIX and 9P semantics, NBD raw-byte ownership, configured resource budgets, and all original audiobook data.
 - No new framework, broad dependency upgrade, minimum-limit workaround, ambiguous-write replay, or fabricated durability result.
-- Worktree isolation is for ownership, not bypassing build locks. Each worktree uses its own default target and plain Cargo/Hauler with `--locked`, `-j2`, and `--features webui` for ZeroFS library gates.
+- Worktree isolation is for ownership, not bypassing build locks. Each worktree uses its own default target and explicit `hauler exec -- cargo ...` with `--locked`, `-j2`, and `--features webui` for Linux library gates. The Ubuntu login PATH does not reliably select the Cargo shim.
 - At most two expensive Linux build lanes: `/tmp/zerofs-audit-test.lock` and `/tmp/zerofs-audit-test-secondary.lock`. Never share root-package binaries/fingerprints between worktrees or count zero-test filters as passing.
 - All artifacts remain under BigSSD projects or Linux `/fast`; no iPhone mirroring, app uninstall, keychain changes, unrelated guest changes, or production-mounted NBD tests.
 - The prior release build was deliberately cancelled through Hauler after this scope addition. It is not a failed regression or a deployable receipt.
@@ -49,7 +49,7 @@ Produces one aggregate byte reservation and one shared logical operation owner, 
 Consumes retained `RamMultipartPartReservation`, multipart part state and existing owned abort/cleanup.
 Produces controlled pre-commit rejection on unavailable incremental growth, with exact refund/abort accounting; ordinary drainable writes retain their existing waiting policy.
 
-- [ ] Execute the A4/B4/A2/B2 schedule with shared capacity 8; both complete objects fit individually. A bounded test must observe the current wait cycle before changing admission.
+- [x] Execute the A4/B4/A2/B2 schedule with shared capacity 8; both complete objects fit individually. Real RAM and SSD tests each failed at the original wait cycle; declared-length admission failed with zero bytes reserved instead of six. The first implementation's store suite passed 81 tests (two ignored, `cc-9891`), but cancellation/FIFO review followups remain before final acceptance.
 - [ ] Add nonblocking multipart growth admission rather than blocking behind reservations held by incomplete objects. Reject overload before commit, then use owned abort and a fresh logical upload attempt.
 - [ ] For trusted generated segments with a declared payload length, reserve the complete logical payload before acknowledging multipart support. Validate exact completion length. Unknown-length multipart parts use try-only admission without bypassing queued ordinary writes.
 - [ ] Verify failure does not strand active-part counters, retained payloads, FIFO waiters or reservations. Exercise cancellation and retry, including empty multipart completion.
@@ -64,6 +64,7 @@ Produces the same Create/Update guarantee above and below the 36 MiB transfer th
 - [ ] Pause large Create replay before publication, insert competing different bytes, resume, and assert those bytes survive and the losing record does not advance the remote frontier.
 - [ ] Cover small Create, changed Update ETag, and identical-content lost-reply reconciliation.
 - [ ] Choose conditional publication before initiating multipart. For validated generated-segment PUT/Create records, restore the trusted marker and require backend capability acknowledgment.
+- [ ] Preserve large generic Create records such as compacted SSTs using SFTP's genuine atomic create capability. Keep the private capability request separate from generated-segment provenance; do not label ordinary SSTs as generated segments. Backends without atomic completion must fail closed and terminally, rather than retrying an unsupported contract forever.
 - [ ] Do not treat `ImmutableCreate` alone as segment provenance: it also covers WAL and compacted SST objects. Reject arbitrary keys, Copy/Rename records, and unsupported conditional completions rather than disguising them as generated segments.
 - [ ] Keep bounded streaming; no unbounded collection, extra HEAD-as-lock, or unconditional complete for a conditional mutation.
 - [ ] Run real recording/fault backend regressions and SFTP multipart capability tests; review and commit.
@@ -76,8 +77,8 @@ Produces nonmutating prospective physical separation and anchored creation/openi
 - [x] Execute real Rust temporary-filesystem tests for `alias -> clean` plus missing `alias/new-dirty`, nested missing suffixes, dangling links, ENOTDIR, relative/parent components, legitimate first start, and `cache2` siblings.
 - [x] Canonicalize the nearest existing ancestor, then append validated missing components. Normalization must create no files or directories.
 - [x] Reproduce the Phase 1 behavioral failure against the tests-only commit, then restore the implementation and run GREEN. Implementation preceded observed RED: tests-only `6885110` ran seven tests, five passed and two failed; fixed `f3bdb5f` ran nine, all passed. Logs: `/var/tmp/zerofs-audit-path-{red,green}.log` on Ubuntu. Integrated as `00330430`; concurrent replacement protection below is still pending.
-- [ ] Review a narrowly owned directory-handle API before bootstrap/journal edits. Preserve ancestry through base/namespace creation, lock/database opening and initial mutation; reuse `rustix` and redb's file-backed construction where supported.
-- [ ] Resolve the read-only redb opening boundary without weakening the first audit's mutation-free identity preflight. No unreviewed vendored patch, platform ban, or silent path-based fallback.
+- [x] Review a narrowly owned directory-handle API before bootstrap/journal edits. Preserve ancestry through base/namespace creation, lock/database opening, recovery, publication and cleanup; reuse `rustix` and redb's file-backed construction. Integrated as `47bafd04` (worker `9d7b45c2`). Linux writeback prefix: 319 passed, eight ignored (`cc-9910`). The Mac Journal gate and multipart staging caller integration remain pending.
+- [x] Resolve the read-only redb opening boundary without weakening the first audit's mutation-free identity preflight. Exact-opened-file descriptor probes passed on Linux and macOS; no vendored patch, writable inspection fallback, or platform ban. Parent aliases are normalized before strict final-root traversal; nonregular files cannot block before type validation.
 - [ ] Race parent replacement and final-entry substitution; require anchored behavior or fail-closed nonmutation. Run normalization/bootstrap/journal identity tests; review and commit.
 
 ## Draft 10: bounded idle execution lifecycle
@@ -85,10 +86,10 @@ Produces nonmutating prospective physical separation and anchored creation/openi
 Consumes overlay visibility/attributes/read retirement and materializer FIFO/multi-inode execution.
 Produces generation-safe idle retirement and reaped task bookkeeping, bounded by current work rather than historical inode count.
 
-- [ ] Add a 10,000-distinct-inode churn regression at concurrency one. After drain, assert runtime/lane/worker/map cardinalities directly; RSS alone is not acceptance.
-- [ ] Race hot-inode enqueue against retirement. Enqueue and removal must agree on one generation; no two concurrent ordering owners may exist.
-- [ ] Retire only when queued, executing, staged, held and read-retirement work is absent. Prune empty bookkeeping and reap completed join handles.
-- [ ] Preserve striped ordering, cancellation, frozen-overlay and read-visibility tests after rebasing on the aggregate reservation fix.
+- [x] Add a 10,000-distinct-inode churn regression at concurrency one. Actual baseline execution retained 10,000 overlay runtimes, workers, pending keys and materializer lanes/handles after drain. The first missing-WebUI compile and a separate hot-runtime fixture timeout are not behavioral failure receipts. Fixed-code acceptance is still pending.
+- [x] Race hot-inode enqueue against retirement. Enqueue and removal agree on one generation; both materializer and overlay hot-inode races passed.
+- [x] Retire only when queued, executing, staged, held and read-retirement work is absent. Prune empty bookkeeping and reap completed join handles. Integrated bounded-lifecycle stage as `f2300b5f` (worker `a240b72a`). Real 10,000-inode plus race suite: three passed (`cc-9900`); the post-drain census requires exact zero.
+- [x] Preserve striped ordering, cancellation, frozen-overlay and read-visibility tests after rebasing on the aggregate reservation fix. Full mutation prefix: 97 passed, zero ignored (`cc-9909`); root independently read the broker receipt.
 - [ ] Only after the bounded lifecycle gate, remove the redundant forwarding execution layer by explicitly retaining visibility/attribute/read ownership in the overlay and FIFO execution in the materializer. Do not delay the P1 commits for this refactor.
 - [ ] Run churn/race and existing mutation suites, review and commit each independently verifiable stage.
 
@@ -97,10 +98,10 @@ Produces generation-safe idle retirement and reaped task bookkeeping, bounded by
 Consumes existing UUID-scoped ledger/resources, `MetricsAuthorityIdentity` and `WritebackSnapshot` parsers, restart and cleanup infrastructure.
 Produces an executed receipt tied to the actual process incarnation and persistent filesystem/export, including write/barrier/restart/readback and completed cleanup.
 
-- [ ] Use one checked-in config template for the CI fixture and production parser regression; supply positive `min_free_gb` and valid full memory settings. Removing the reserve must fail production validation.
-- [ ] Keep cheap plan/schema validation separate from runtime acceptance. A planned receipt or missing collector cannot satisfy the runtime gate.
-- [ ] Extend existing benchmark authority explicitly for one isolated loopback NBD endpoint and the exact provisioned export. Reuse authority-only TLS with an explicit per-run trusted CA; never emit fabricated plaintext authority. Provision the fresh persistent bucket/export through an owned bootstrap service before authority startup, which intentionally loads only existing identity.
-- [ ] Add bounded loopback HTTPS sampling reusing existing parsers. Reject missing/malformed identities, invalid or regressing frontiers, terminal state and mismatched filesystem/export.
+- [x] Use one checked-in config template for the CI fixture and production parser regression; supply positive `min_free_gb` and valid full memory settings. Removing the reserve fails production validation. Rust configuration batch: 115 passed (`cc-9890`).
+- [x] Keep cheap plan/schema validation separate from runtime acceptance. A planned receipt or missing collector cannot satisfy the runtime gate. Implemented in `fbd9d670` (worker `4c67f5dd`); real mounted acceptance remains pending below.
+- [x] Extend existing benchmark authority explicitly for one isolated loopback NBD endpoint and the exact provisioned export. Reuse authority-only TLS with an explicit per-run trusted CA; never emit fabricated plaintext authority. The owned bootstrap/runtime units use the harness UID and an exact materialized configuration, not ambient systemd environment interpolation.
+- [x] Add bounded loopback HTTPS sampling reusing existing parsers. Reject missing/malformed identities, invalid or regressing frontiers, terminal state and mismatched filesystem/export. Linux Python gate: 136 passed. Independent Mac execution exposed one unnormalized temporary-path expectation; test-only followup `c84686bb` corrected it. Root rerun on Mac: 136 passed in 4.431 seconds.
 - [ ] Capture accepted progress after actual write/barrier, wait for that exact local durability frontier, unmount and detach NBD, then sample and cover the final accepted cutoff before SIGKILL. Retain the same journal, require a new server instance and unchanged filesystem/export, then compare a stored pre-restart checksum after remount.
 - [ ] Preserve ledger-owned resource teardown. Failed commands, stale metrics, checksum mismatch or incomplete cleanup must produce a failed receipt.
 - [ ] Run deterministic Python/config tests and targeted actionlint. Record the four existing non-tiered ShellCheck findings separately; leave other plan-only jobs untouched.
