@@ -328,7 +328,7 @@ min_free_gb = 0.25
                 },
             )
             self.assertEqual(endpoint.url, "https://127.0.0.1:19567/metrics")
-            self.assertEqual(endpoint.ca_file, certificate)
+            self.assertEqual(endpoint.ca_file, certificate.resolve())
             self.assertEqual(
                 endpoint.export_id,
                 "zerofs-tiered-1f4a3c60-8f6f-4c39-9f3e-2b8f6f2d9a01",
