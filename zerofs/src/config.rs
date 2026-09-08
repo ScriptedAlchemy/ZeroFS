@@ -1313,6 +1313,7 @@ pub struct PrometheusConfig {
 pub enum BenchmarkAdapter {
     Nfs,
     Ninep,
+    Nbd,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -1360,15 +1361,17 @@ impl BenchmarkAuthorityConfig {
             );
         }
 
-        if servers.nbd.is_some() || servers.webui.is_some() {
-            anyhow::bail!(
-                "[prometheus.benchmark_authority] requires one isolated NFS or 9P export; disable NBD and WebUI exports"
-            );
-        }
-
         match self.adapter {
+            BenchmarkAdapter::Nfs | BenchmarkAdapter::Ninep
+                if servers.nbd.is_some() || servers.webui.is_some() =>
+            {
+                anyhow::bail!(
+                    "[prometheus.benchmark_authority] requires one isolated NFS or 9P export; disable NBD and WebUI exports"
+                );
+            }
             BenchmarkAdapter::Nfs => self.validate_nfs(servers),
             BenchmarkAdapter::Ninep => self.validate_ninep(servers),
+            BenchmarkAdapter::Nbd => self.validate_nbd(servers),
         }
     }
 
@@ -1426,6 +1429,49 @@ impl BenchmarkAuthorityConfig {
             .saturating_add(usize::from(ninep.unix_socket.is_some()));
         if endpoint_count != 1 {
             anyhow::bail!("[prometheus.benchmark_authority] requires exactly one 9P endpoint");
+        }
+        Ok(())
+    }
+
+    fn validate_nbd(&self, servers: &ServerConfig) -> Result<()> {
+        if servers.nfs.is_some() || servers.ninep.is_some() || servers.webui.is_some() {
+            anyhow::bail!(
+                "[prometheus.benchmark_authority] requires an isolated NBD export; disable NFS, 9P, and WebUI exports"
+            );
+        }
+        let nbd = servers.nbd.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "[prometheus.benchmark_authority] selected NBD but [servers.nbd] is missing"
+            )
+        })?;
+        if nbd.unix_socket.is_some() {
+            anyhow::bail!("[prometheus.benchmark_authority] requires exactly one TCP NBD endpoint");
+        }
+        let addresses = nbd
+            .addresses
+            .as_ref()
+            .filter(|addresses| addresses.len() == 1)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "[prometheus.benchmark_authority] requires exactly one NBD endpoint"
+                )
+            })?;
+        let address = addresses.iter().next().expect("checked one NBD address");
+        if !matches!(address.ip(), IpAddr::V4(ip) if ip.is_loopback()) {
+            anyhow::bail!(
+                "[prometheus.benchmark_authority] NBD authority requires one loopback IPv4 endpoint"
+            );
+        }
+        let export = self.export_id.as_bytes();
+        if self.export_id == "."
+            || self.export_id == ".."
+            || export.contains(&b'/')
+            || export.len() > 255
+            || crate::nbd::is_nbd_provision_staging_name(export)
+        {
+            anyhow::bail!(
+                "[prometheus.benchmark_authority] NBD export_id must be a non-reserved direct child name of at most 255 bytes"
+            );
         }
         Ok(())
     }
@@ -4149,6 +4195,159 @@ tls_private_key = "/etc/zerofs/metrics.key"
                 "unexpected {name} error: {message}"
             );
         }
+    }
+
+    #[test]
+    fn benchmark_authority_valid_single_nbd_export_loads() {
+        let content = r#"
+[cache]
+dir = "/tmp/cache"
+disk_size_gb = 1.0
+
+[storage]
+url = "s3://bucket/data"
+encryption_password = "test"
+
+[servers.nbd]
+addresses = ["127.0.0.1:10809"]
+
+[prometheus]
+addresses = ["127.0.0.1:19567"]
+
+[prometheus.benchmark_authority]
+adapter = "nbd"
+export_id = "zerofs-tiered-1f4a3c60-8f6f-4c39-9f3e-2b8f6f2d9a01"
+tls_certificate = "/var/tmp/control/tls/metrics.crt"
+tls_private_key = "/var/tmp/control/tls/metrics.key"
+"#;
+
+        let authority = write_and_load(content)
+            .unwrap()
+            .prometheus
+            .unwrap()
+            .benchmark_authority
+            .unwrap();
+
+        assert_eq!(authority.adapter, BenchmarkAdapter::Nbd);
+        assert_eq!(
+            authority.export_id,
+            "zerofs-tiered-1f4a3c60-8f6f-4c39-9f3e-2b8f6f2d9a01"
+        );
+    }
+
+    #[test]
+    fn benchmark_authority_rejects_nonisolated_or_ambiguous_nbd_exports() {
+        let valid = r#"
+[cache]
+dir = "/tmp/cache"
+disk_size_gb = 1.0
+
+[storage]
+url = "s3://bucket/data"
+encryption_password = "test"
+
+[servers.nbd]
+addresses = ["127.0.0.1:10809"]
+
+[prometheus]
+addresses = ["127.0.0.1:19567"]
+
+[prometheus.benchmark_authority]
+adapter = "nbd"
+export_id = "exact-export"
+tls_certificate = "/var/tmp/control/tls/metrics.crt"
+tls_private_key = "/var/tmp/control/tls/metrics.key"
+"#;
+
+        for (name, content, expected) in [
+            (
+                "multiple NBD endpoints",
+                valid.replace(
+                    "addresses = [\"127.0.0.1:10809\"]",
+                    "addresses = [\"127.0.0.1:10809\", \"127.0.0.1:10810\"]",
+                ),
+                "exactly one NBD endpoint",
+            ),
+            (
+                "wildcard NBD endpoint",
+                valid.replace("127.0.0.1:10809", "0.0.0.0:10809"),
+                "loopback IPv4 endpoint",
+            ),
+            (
+                "Unix NBD endpoint",
+                valid.replace(
+                    "addresses = [\"127.0.0.1:10809\"]",
+                    "unix_socket = \"/var/tmp/nbd.sock\"",
+                ),
+                "exactly one TCP NBD endpoint",
+            ),
+            (
+                "additional 9P export",
+                valid.replace(
+                    "[prometheus]",
+                    "[servers.ninep]\naddresses = [\"127.0.0.1:15564\"]\n\n[prometheus]",
+                ),
+                "isolated NBD export",
+            ),
+            (
+                "invalid child export",
+                valid.replace("export_id = \"exact-export\"", "export_id = \"dir/export\""),
+                "direct child name",
+            ),
+            (
+                "reserved provisioning export",
+                valid.replace(
+                    "export_id = \"exact-export\"",
+                    "export_id = \".zerofs-nbd-provision-v1-1f4a3c60-8f6f-4c39-9f3e-2b8f6f2d9a01\"",
+                ),
+                "direct child name",
+            ),
+        ] {
+            let error = write_and_load(&content).expect_err(name);
+            let message = format!("{error:#}");
+            assert!(
+                message.contains(expected),
+                "unexpected {name} error: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn xfs_nbd_tiered_fixture_passes_full_ack_and_writeback_normalization() {
+        let run_uuid = "1f4a3c60-8f6f-4c39-9f3e-2b8f6f2d9a01";
+        let temporary = tempfile::tempdir().unwrap();
+        let control = temporary
+            .path()
+            .join(format!("zerofs-tiered-control-{run_uuid}"));
+        let resources = temporary
+            .path()
+            .join(format!("zerofs-tiered-resources-{run_uuid}"));
+        let fixture =
+            include_str!("../../scripts/tiered_writeback_e2e/xfs_nbd_tiered.toml.template")
+                .replace("${RUN_UUID}", run_uuid)
+                .replace("${CONTROL_ROOT}", control.to_str().unwrap())
+                .replace("${RESOURCE_ROOT}", resources.to_str().unwrap())
+                .replace("${MINIO_BUCKET}", "zerofs-xfs-fixture");
+
+        let settings = write_and_load(&fixture).unwrap();
+        let ack = settings
+            .filesystem_write_ack_settings(WritebackAccessMode::ReadWrite)
+            .unwrap();
+        let writeback = settings
+            .writeback_settings(WritebackAccessMode::ReadWrite)
+            .unwrap()
+            .expect("fixture enables writeback");
+
+        assert_eq!(ack.mode, FilesystemWriteAckMode::VolatileMemory);
+        assert!(ack.volatile_memory_bytes > 0);
+        assert!(writeback.memory_bytes > 0);
+        assert!(writeback.disk_bytes > 0);
+        assert!(writeback.min_free_bytes > 0);
+
+        let zero_reserve = fixture.replace("min_free_gb = 0.25", "min_free_gb = 0.0");
+        let error = write_and_load(&zero_reserve)
+            .expect_err("removing the SSD reserve must fail production normalization");
+        assert!(format!("{error:#}").contains("min_free_gb must be greater than zero"));
     }
 
     #[test]

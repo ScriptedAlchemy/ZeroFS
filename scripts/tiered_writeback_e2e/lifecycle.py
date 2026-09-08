@@ -7,6 +7,9 @@ import subprocess
 import sys
 import tempfile
 import time
+import re
+import string
+from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -27,6 +30,12 @@ from .integrity import sha256_file, verify_copied_tree
 from .linux_suites import PINNED_REVISIONS, SUITE_SCENARIOS
 from .protocols import NBD_CLIENT, PROTOCOL_SCENARIOS, ScenarioBuilder, ScenarioContext
 from .resources import ResourceLedger
+from .observed_durability import (
+    ObservedDurabilityCollector,
+    ObservedSnapshot,
+    collector_factory,
+    load_observed_endpoint,
+)
 
 
 class LifecycleError(HarnessError):
@@ -111,6 +120,67 @@ BUSY_PROCESS_TOKENS = (
     "tiered-writeback-e2e",
     "zerofs",
 )
+
+_RUNTIME_SERVERS_BEGIN = "# TIERED_RUNTIME_SERVERS_BEGIN"
+_RUNTIME_SERVERS_END = "# TIERED_RUNTIME_SERVERS_END"
+_XFS_RUNTIME_TEMPLATE = "xfs_nbd_tiered.toml.template"
+
+
+def derive_bootstrap_config(
+    runtime_config: Path,
+    bootstrap_config: Path,
+    *,
+    ninep_socket: Path,
+) -> None:
+    """Replace the fixture's one fixed runtime server block with owned 9P."""
+    text = Path(runtime_config).read_text(encoding="utf-8")
+    if (
+        text.count(_RUNTIME_SERVERS_BEGIN) != 1
+        or text.count(_RUNTIME_SERVERS_END) != 1
+        or text.index(_RUNTIME_SERVERS_BEGIN) > text.index(_RUNTIME_SERVERS_END)
+    ):
+        raise ValueError("fixture must contain exactly one fixed runtime server block")
+    before, marked = text.split(_RUNTIME_SERVERS_BEGIN, 1)
+    _, after = marked.split(_RUNTIME_SERVERS_END, 1)
+    replacement = (
+        f"{_RUNTIME_SERVERS_BEGIN}\n"
+        "[servers.ninep]\n"
+        f"unix_socket = {json.dumps(str(ninep_socket))}\n"
+        f"{_RUNTIME_SERVERS_END}"
+    )
+    Path(bootstrap_config).write_text(
+        before + replacement + after,
+        encoding="utf-8",
+    )
+
+
+def materialize_xfs_runtime_config(
+    config: HarnessConfig,
+    source_config: Path,
+) -> Path:
+    source = Path(source_config)
+    if source.name != _XFS_RUNTIME_TEMPLATE:
+        return source
+    values = {
+        "RUN_UUID": config.run_uuid,
+        "CONTROL_ROOT": str(config.control_root),
+        "RESOURCE_ROOT": str(config.resource_root),
+        "MINIO_BUCKET": f"zerofs-xfs-{config.run_uuid}",
+    }
+    try:
+        rendered = string.Template(source.read_text(encoding="utf-8")).substitute(
+            values
+        )
+    except (KeyError, OSError) as error:
+        raise SetupError("failed to materialize the fixed XFS runtime config") from error
+    if "${" in rendered:
+        raise SetupError("materialized XFS runtime config retains a placeholder")
+    directory = config.control_root / "run"
+    directory.mkdir(mode=0o700)
+    target = directory / "xfs-nbd-tiered.toml"
+    target.write_text(rendered, encoding="utf-8")
+    target.chmod(0o600)
+    return target
 
 
 def _utc_stamp() -> str:
@@ -288,11 +358,13 @@ class HarnessLifecycle:
         *,
         probes: Any | None = None,
         platform: str | None = None,
+        observed_factory: Any | None = None,
     ) -> None:
         self.config = config
         self.runner = runner
         self.probes = probes if probes is not None else Probes(runner)
         self.platform = platform if platform is not None else sys.platform
+        self.observed_factory = observed_factory
 
     def setup(self, *, zerofs_binary: Path, zerofs_config: Path) -> dict[str, Any]:
         config = self.config
@@ -301,6 +373,7 @@ class HarnessLifecycle:
             raise SetupError(
                 f"run {config.run_uuid} is already set up: {config.ledger_path}"
             )
+        runtime_config = materialize_xfs_runtime_config(config, zerofs_config)
         source_command = [
             "git",
             "-C",
@@ -313,7 +386,7 @@ class HarnessLifecycle:
             config,
             source_sha=source_sha,
             binary_sha256=sha256_file(Path(zerofs_binary)),
-            config_sha256=sha256_file(Path(zerofs_config)),
+            config_sha256=sha256_file(runtime_config),
         )
         try:
             config.receipt_root.mkdir()
@@ -336,6 +409,7 @@ class HarnessLifecycle:
             "control_root": str(config.control_root),
             "resource_root": str(config.resource_root),
             "ledger": str(config.ledger_path),
+            "zerofs_config": str(runtime_config),
             "receipt": str(receipt.manifest),
         }
 
@@ -423,6 +497,30 @@ class HarnessLifecycle:
             return Path(str(value)).exists()
         return False  # backend prefixes are covered by the outstanding check.
 
+    def _wait_for_device_detached(self, device: str, *, timeout: float = 10.0) -> None:
+        deadline = time.monotonic() + timeout
+        while self.probes.device_attached(device):
+            if time.monotonic() >= deadline:
+                raise LifecycleError(f"NBD device {device} remained attached")
+            time.sleep(0.1)
+
+    def _wait_for_unit_gone(
+        self,
+        unit: str,
+        pids: list[int],
+        *,
+        timeout: float = 10.0,
+    ) -> None:
+        deadline = time.monotonic() + timeout
+        while self.probes.unit_active(unit) or any(
+            self.probes.process_alive(pid) for pid in pids
+        ):
+            if time.monotonic() >= deadline:
+                raise LifecycleError(
+                    f"transient unit {unit} or its owned MainPID remained active"
+                )
+            time.sleep(0.1)
+
     def assert_clean(self, ledger: ResourceLedger) -> dict[str, Any]:
         ledger.validate_cleanup_scope()
         failures = [
@@ -508,17 +606,49 @@ class HarnessLifecycle:
                 "scenario execution requires Linux; use --plan-only elsewhere"
             )
         commands: list[list[str]] = []
+        checksums: dict[str, str] = {}
+        observed: dict[str, Any] = {}
+        collector: ObservedDurabilityCollector | Any | None = None
+        observed_factory = self.observed_factory
+        initial_observation: ObservedSnapshot | None = None
+        pre_restart_observation: ObservedSnapshot | None = None
+        restarted_observation: ObservedSnapshot | None = None
+        durability_cutoff: int | None = None
+        compared_checksums: set[str] = set()
         try:
             if plan.acceptance_gaps:
                 raise LifecycleError(
                     f"scenario {scenario!r} is unavailable: "
                     + "; ".join(plan.acceptance_gaps)
                 )
-            if plan.requires_observed_durability:
-                raise LifecycleError(
-                    f"scenario {scenario!r} requires observed typed durability "
-                    "frontiers from the production mutation/object path; the "
-                    "collector is not wired"
+            if plan.requires_observed_durability and observed_factory is None:
+                if plan.authority_export_id is None:
+                    raise LifecycleError(
+                        f"scenario {scenario!r} has no exact authority export"
+                    )
+                endpoint = load_observed_endpoint(
+                    zerofs_config,
+                    control_root=self.config.control_root,
+                    expected_export=plan.authority_export_id,
+                )
+                observed_factory = collector_factory(endpoint)
+            if plan.requires_observed_durability and plan.bootstrap_config is not None:
+                bootstrap_config = validate_owned_path(
+                    plan.bootstrap_config, self.config.resource_root
+                )
+                derive_bootstrap_config(
+                    zerofs_config,
+                    bootstrap_config,
+                    ninep_socket=self.config.run_root / "xfs-nbd-bootstrap.9p.sock",
+                )
+                ledger.record_resource(
+                    "path",
+                    str(bootstrap_config),
+                    scenario=scenario,
+                    role="bootstrap-config",
+                )
+                receipt.record(
+                    "bootstrap_config_sha256", sha256_file(bootstrap_config)
                 )
             for step in plan.steps:
                 for resource in step.requires:
@@ -533,11 +663,42 @@ class HarnessLifecycle:
                         step=step.description,
                     )
                 receipt.sync_resources(ledger)
-                self.runner.run(
+                result = self.runner.run(
                     step.argv,
                     sudo=step.sudo,
                     cwd=Path(step.cwd) if step.cwd else None,
                 )
+                if step.require_stdout is not None:
+                    actual_stdout = result.stdout.strip()
+                    if actual_stdout != step.require_stdout:
+                        raise LifecycleError(
+                            f"command output mismatch for {step.description}: "
+                            f"expected {step.require_stdout!r}, got {actual_stdout!r}"
+                        )
+                if step.capture_sha256_as is not None:
+                    digest = result.stdout.strip().split(maxsplit=1)[0]
+                    if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+                        raise LifecycleError(
+                            f"invalid SHA-256 output for {step.description}"
+                        )
+                    checksums[step.capture_sha256_as] = digest
+                    receipt.record("checksums", checksums)
+                if step.compare_sha256_with is not None:
+                    expected = checksums.get(step.compare_sha256_with)
+                    digest = result.stdout.strip().split(maxsplit=1)[0]
+                    if expected is None:
+                        raise LifecycleError(
+                            f"missing pre-restart checksum {step.compare_sha256_with!r}"
+                        )
+                    if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+                        raise LifecycleError(
+                            f"invalid SHA-256 output for {step.description}"
+                        )
+                    if digest != expected:
+                        raise LifecycleError(
+                            f"post-restart checksum mismatch: {digest} != {expected}"
+                        )
+                    compared_checksums.add(step.compare_sha256_with)
                 if step.capture_main_pid_unit is not None:
                     pid_command = [
                         "systemctl",
@@ -594,6 +755,15 @@ class HarnessLifecycle:
                         raise LifecycleError(
                             f"unit {step.release_main_pid_unit!r} has no owned MainPID"
                         )
+                    if step.verify_stopped_unit is not None:
+                        if step.verify_stopped_unit != step.release_main_pid_unit:
+                            raise LifecycleError(
+                                "stopped-unit probe does not match the released unit"
+                            )
+                        self._wait_for_unit_gone(
+                            step.verify_stopped_unit,
+                            [int(value) for _, value in owned_pids],
+                        )
                     for kind, value in owned_pids:
                         ledger.record_release(
                             kind,
@@ -601,6 +771,12 @@ class HarnessLifecycle:
                             scenario=scenario,
                             step=step.description,
                         )
+                elif step.verify_stopped_unit is not None:
+                    raise LifecycleError(
+                        "stopped-unit probe has no owned MainPID release"
+                    )
+                if step.verify_detached_device is not None:
+                    self._wait_for_device_detached(step.verify_detached_device)
                 for resource in step.releases:
                     ledger.record_release(
                         resource.kind,
@@ -608,6 +784,104 @@ class HarnessLifecycle:
                         scenario=scenario,
                         step=step.description,
                     )
+                if step.after_checkpoint is not None and not plan.requires_observed_durability:
+                    continue
+                if step.after_checkpoint == "pin-initial-authority":
+                    collector = observed_factory()
+                    initial_observation = collector.wait_for_initial_snapshot(
+                        timeout=30.0
+                    )
+                    if (
+                        plan.authority_export_id is None
+                        or initial_observation.identity.export_id
+                        != plan.authority_export_id
+                    ):
+                        raise LifecycleError(
+                            "metrics authority export does not match the scenario export"
+                        )
+                    observed["initial"] = asdict(initial_observation)
+                    receipt.record("observed_durability", observed)
+                elif step.after_checkpoint == "final-local-cutoff":
+                    if collector is None or initial_observation is None:
+                        raise LifecycleError(
+                            "final durability cutoff has no pinned initial authority"
+                        )
+                    accepted = collector.wait_for_accepted_after(
+                        initial_observation.writeback.accepted,
+                        timeout=30.0,
+                    )
+                    durability_cutoff = accepted.writeback.accepted
+                    pre_restart_observation = collector.wait_for_local_frontier(
+                        durability_cutoff,
+                        timeout=30.0,
+                    )
+                    remote_coverage = ObservedDurabilityCollector.classify_recovery_source(
+                        target=durability_cutoff,
+                        observed=pre_restart_observation,
+                    )
+                    observed["pre_restart"] = asdict(pre_restart_observation)
+                    receipt.record("observed_durability", observed)
+                    receipt.record("durability_cutoff", durability_cutoff)
+                    receipt.record("pre_kill_remote_coverage", remote_coverage)
+                    receipt.record(
+                        "durability_floors",
+                        [
+                            {
+                                **floor.to_dict(),
+                                "target_sequence": durability_cutoff,
+                                "observed_local_sequence": (
+                                    pre_restart_observation.writeback.local
+                                ),
+                                "observed_remote_sequence": (
+                                    pre_restart_observation.writeback.remote
+                                ),
+                            }
+                            for floor in plan.durability_floors
+                        ],
+                    )
+                elif step.after_checkpoint == "require-restart":
+                    if pre_restart_observation is None or durability_cutoff is None:
+                        raise LifecycleError(
+                            "restart identity check has no pre-restart durability cutoff"
+                        )
+                    collector = observed_factory()
+                    restarted_observation = collector.wait_for_restarted(
+                        pre_restart_observation,
+                        timeout=30.0,
+                    )
+                    if restarted_observation.writeback.local < durability_cutoff:
+                        raise LifecycleError(
+                            "restarted server lost the locally durable cutoff"
+                        )
+                    observed["after_restart"] = asdict(restarted_observation)
+                    receipt.record("observed_durability", observed)
+                elif step.after_checkpoint is not None:
+                    raise LifecycleError(
+                        f"unknown observed checkpoint {step.after_checkpoint!r}"
+                    )
+            if plan.requires_observed_durability:
+                missing: list[str] = []
+                if initial_observation is None:
+                    missing.append("initial authority")
+                if pre_restart_observation is None or durability_cutoff is None:
+                    missing.append("final local cutoff")
+                if restarted_observation is None:
+                    missing.append("restart authority")
+                expected_checksum = "xfs-proof-before-restart"
+                if expected_checksum not in checksums:
+                    missing.append("pre-restart checksum")
+                if expected_checksum not in compared_checksums:
+                    missing.append("post-restart checksum comparison")
+                if missing:
+                    raise LifecycleError(
+                        "missing required runtime evidence: " + ", ".join(missing)
+                    )
+            if plan.requires_completed_cleanup:
+                cleanup_runs = [self.cleanup(ledger), self.cleanup(ledger)]
+                cleanup_verification = self.assert_clean(ledger)
+                receipt.record("cleanup_runs", cleanup_runs)
+                receipt.record("cleanup_verification", cleanup_verification)
+                receipt.record("cleanup_status", "ok")
         except BaseException as error:
             cancelled = isinstance(error, (KeyboardInterrupt, SystemExit))
             receipt.record("terminal_state", "cancelled" if cancelled else "failed")

@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 import uuid
 from dataclasses import replace
@@ -43,6 +44,7 @@ from scripts.tiered_writeback_e2e.resources import (
     ResourceLedger,
     UnownedResourceError,
 )
+from scripts.tiered_writeback_e2e.observed_durability import ObservedSnapshot
 from scripts.tiered_writeback_e2e import lifecycle as lifecycle_module
 from scripts.tiered_writeback_e2e.lifecycle import (
     REQUIRED_RECEIPT_FIELDS,
@@ -58,8 +60,13 @@ from scripts.tiered_writeback_e2e.lifecycle import (
     assert_source_idle,
 )
 from scripts.tiered_writeback_e2e import linux_suites, protocols
-from scripts.tiered_writeback_e2e.protocols import NBD_CLIENT, ScenarioContext
+from scripts.tiered_writeback_e2e.protocols import (
+    NBD_CLIENT,
+    NBD_DEVICE,
+    ScenarioContext,
+)
 from scripts.vm100_pilot.runner import Runner
+from scripts.vm100_pilot.metrics import MetricsAuthorityIdentity, WritebackSnapshot
 
 RUN_UUID = "1f4a3c60-8f6f-4c39-9f3e-2b8f6f2d9a01"
 
@@ -125,7 +132,76 @@ class FakeRunner(Runner):
             pid = self.next_pid
             self.next_pid += 1
             return CompletedProcess(args, 0, f"{pid}\n", "")
+        if args[:2] == ("blockdev", "--getsize64"):
+            return CompletedProcess(args, 0, f"{4 * 1024 * 1024 * 1024}\n", "")
+        if args and args[0] == "sha256sum":
+            return CompletedProcess(args, 0, f"{'a' * 64}  {args[-1]}\n", "")
         return CompletedProcess(args, 0, "", "")
+
+
+def observed_snapshot(
+    instance: str,
+    *,
+    accepted: int,
+    local: int,
+    remote: int,
+) -> ObservedSnapshot:
+    return ObservedSnapshot(
+        MetricsAuthorityIdentity(instance, "filesystem-a", f"zerofs-tiered-{RUN_UUID}"),
+        WritebackSnapshot(
+            accepted=accepted,
+            local=local,
+            remote=remote,
+            dirty_ram=0,
+            dirty_ssd_reserved=0,
+            local_bytes=1,
+            remote_bytes=1,
+            terminal=False,
+        ),
+    )
+
+
+class FakeObservedCollector:
+    def __init__(self, initial: ObservedSnapshot, final: ObservedSnapshot) -> None:
+        self.initial = initial
+        self.final = final
+        self.calls: list[tuple[str, object]] = []
+
+    def snapshot(self) -> ObservedSnapshot:
+        self.calls.append(("snapshot", None))
+        return self.initial
+
+    def wait_for_initial_snapshot(
+        self, *, timeout: float, interval: float = 0.05
+    ) -> ObservedSnapshot:
+        self.calls.append(("wait-initial", timeout))
+        return self.initial
+
+    def wait_for_accepted_after(
+        self, previous: int, *, timeout: float, interval: float = 0.05
+    ) -> ObservedSnapshot:
+        self.calls.append(("wait-accepted", previous))
+        return self.final
+
+    def wait_for_local_frontier(
+        self, target: int, *, timeout: float, interval: float = 0.05
+    ) -> ObservedSnapshot:
+        self.calls.append(("wait-local", target))
+        return self.final
+
+    def require_restarted(self, before: ObservedSnapshot) -> ObservedSnapshot:
+        self.calls.append(("require-restarted", before))
+        return self.final
+
+    def wait_for_restarted(
+        self,
+        before: ObservedSnapshot,
+        *,
+        timeout: float,
+        interval: float = 0.05,
+    ) -> ObservedSnapshot:
+        self.calls.append(("wait-restarted", before))
+        return self.final
 
 
 class FakeProbes:
@@ -522,6 +598,38 @@ class SetupTests(HarnessCase):
         with self.assertRaises(SetupError):
             lifecycle.setup(zerofs_binary=self.binary, zerofs_config=self.zerofs_config)
 
+    def test_setup_materializes_and_hashes_the_exact_xfs_runtime_config(self) -> None:
+        config = self.make_config(filesystem="volatile_memory", object_="ssd")
+        lifecycle, _, _ = self.make_lifecycle(config)
+        template = (
+            Path(__file__).resolve().parents[1]
+            / "tiered_writeback_e2e"
+            / "xfs_nbd_tiered.toml.template"
+        )
+
+        with mock.patch.dict(os.environ, {}, clear=True):
+            summary = lifecycle.setup(
+                zerofs_binary=self.binary,
+                zerofs_config=template,
+            )
+
+        runtime_config = config.control_root / "run" / "xfs-nbd-tiered.toml"
+        rendered = runtime_config.read_text(encoding="utf-8")
+        self.assertNotIn("${", rendered)
+        document = tomllib.loads(rendered)
+        self.assertEqual(
+            document["prometheus"]["benchmark_authority"]["export_id"],
+            config.unit_name,
+        )
+        self.assertEqual(
+            document["storage"]["url"],
+            f"s3://zerofs-xfs-{config.run_uuid}/zerofs-tiered/{config.run_uuid}",
+        )
+        ledger = ResourceLedger.load(config.ledger_path)
+        self.assertEqual(ledger.identity["config_sha256"], sha256_file(runtime_config))
+        self.assertNotEqual(ledger.identity["config_sha256"], sha256_file(template))
+        self.assertEqual(summary["zerofs_config"], str(runtime_config))
+
 
 class CleanupTests(HarnessCase):
     def test_cleanup_does_not_stop_a_unit_that_was_never_created(self) -> None:
@@ -849,9 +957,15 @@ class ScenarioPlanTests(HarnessCase):
                 for step in plan.steps:
                     if step.argv[0] != "systemd-run":
                         continue
-                    self.assertEqual(step.capture_main_pid_unit, config.unit_name)
+                    unit = next(
+                        value.removeprefix("--unit=")
+                        for value in step.argv
+                        if value.startswith("--unit=")
+                    )
+                    self.assertEqual(step.capture_main_pid_unit, unit)
+                    self.assertTrue(unit.startswith(config.unit_name))
                     self.assertIn(
-                        ("unit", config.unit_name),
+                        ("unit", unit),
                         {(resource.kind, resource.value) for resource in step.acquires},
                     )
 
@@ -886,6 +1000,99 @@ class ScenarioPlanTests(HarnessCase):
                 for step in matrix.steps
                 for resource in step.acquires
             )
+        )
+
+    def test_xfs_restart_bootstraps_and_reuses_one_exact_nbd_export(self) -> None:
+        config = self.make_config()
+        plan = SCENARIOS["xfs-over-nbd-restart"](self.context())
+        commands = [step.argv for step in plan.steps]
+        provision = [
+            argv for argv in commands if "provision-striped" in argv
+        ]
+        self.assertEqual(len(provision), 1)
+        self.assertEqual(
+            provision[0][provision[0].index("provision-striped") + 2],
+            config.unit_name,
+        )
+        connects = [
+            argv
+            for argv in commands
+            if argv and argv[0] == NBD_CLIENT and "-d" not in argv
+        ]
+        self.assertEqual(len(connects), 2)
+        for argv in connects:
+            self.assertIn("-N", argv)
+            self.assertEqual(argv[argv.index("-N") + 1], config.unit_name)
+        self.assertEqual(plan.authority_export_id, config.unit_name)
+        self.assertEqual(
+            plan.bootstrap_config,
+            config.run_root / "xfs-nbd-bootstrap.toml",
+        )
+        launches = [argv for argv in commands if argv[0] == "systemd-run"]
+        self.assertEqual(len(launches), 3)
+        for launch in launches:
+            self.assertFalse(any(value.startswith("--setenv=") for value in launch))
+            self.assertIn(f"--uid={os.getuid()}", launch)
+
+    def test_xfs_final_local_cutoff_is_after_unmount_and_detach_before_sigkill(
+        self,
+    ) -> None:
+        plan = SCENARIOS["xfs-over-nbd-restart"](self.context())
+        steps = list(plan.steps)
+        kill_index = next(
+            index
+            for index, step in enumerate(steps)
+            if step.argv[:2] == ("systemctl", "kill")
+        )
+        detach_index = max(
+            index
+            for index, step in enumerate(steps[:kill_index])
+            if step.argv[:2] == (NBD_CLIENT, "-d")
+        )
+        unmount_index = max(
+            index
+            for index, step in enumerate(steps[:detach_index])
+            if step.argv and step.argv[0] == "umount"
+        )
+        cutoff_index = next(
+            index
+            for index, step in enumerate(steps)
+            if step.after_checkpoint == "final-local-cutoff"
+        )
+        self.assertLess(unmount_index, detach_index)
+        self.assertEqual(cutoff_index, detach_index)
+        self.assertLess(cutoff_index, kill_index)
+        self.assertEqual(steps[detach_index].verify_detached_device, NBD_DEVICE)
+        self.assertEqual(
+            steps[kill_index].verify_stopped_unit,
+            self.make_config().unit_name,
+        )
+
+    def test_xfs_restart_captures_and_compares_the_same_checksum_key(self) -> None:
+        plan = SCENARIOS["xfs-over-nbd-restart"](self.context())
+        captures = [
+            step.capture_sha256_as
+            for step in plan.steps
+            if step.capture_sha256_as is not None
+        ]
+        comparisons = [
+            step.compare_sha256_with
+            for step in plan.steps
+            if step.compare_sha256_with is not None
+        ]
+        self.assertEqual(captures, ["xfs-proof-before-restart"])
+        self.assertEqual(comparisons, captures)
+
+    def test_xfs_runtime_pins_authority_then_requires_a_restart_identity(self) -> None:
+        plan = SCENARIOS["xfs-over-nbd-restart"](self.context())
+        checkpoints = [
+            step.after_checkpoint
+            for step in plan.steps
+            if step.after_checkpoint is not None
+        ]
+        self.assertEqual(
+            checkpoints,
+            ["pin-initial-authority", "final-local-cutoff", "require-restart"],
         )
 
     def test_webui_plan_admits_the_missing_browser_wasm_and_grpc_web_leg(self) -> None:
@@ -1207,7 +1414,137 @@ class RunScenarioTests(HarnessCase):
                         config.ledger_path
                     ).outstanding()
                 }
-                self.assertEqual(active_kinds, {"path", "prefix"})
+                expected = (
+                    set()
+                    if scenario == "xfs-over-nbd-restart"
+                    else {"path", "prefix"}
+                )
+                self.assertEqual(active_kinds, expected)
+
+    def test_xfs_runtime_records_observed_cutoff_restart_and_checksum(self) -> None:
+        config = self.make_config(filesystem="volatile_memory", object_="ssd")
+        runtime_config = self.base / "xfs-runtime.toml"
+        runtime_config.write_text(
+            """
+[storage]
+url = "s3://bucket/prefix"
+# TIERED_RUNTIME_SERVERS_BEGIN
+[servers.nbd]
+addresses = ["127.0.0.1:10809"]
+# TIERED_RUNTIME_SERVERS_END
+[writeback]
+enabled = true
+min_free_gb = 0.25
+""",
+            encoding="utf-8",
+        )
+        initial = FakeObservedCollector(
+            observed_snapshot("instance-a", accepted=2, local=2, remote=2),
+            observed_snapshot("instance-a", accepted=9, local=9, remote=4),
+        )
+        restarted = FakeObservedCollector(
+            observed_snapshot("instance-b", accepted=9, local=9, remote=4),
+            observed_snapshot("instance-b", accepted=9, local=9, remote=4),
+        )
+        collectors = iter((initial, restarted))
+        runner = FakeRunner()
+        lifecycle = HarnessLifecycle(
+            config,
+            runner,
+            probes=FakeProbes(),
+            platform="linux",
+            observed_factory=lambda: next(collectors),
+        )
+        lifecycle.setup(zerofs_binary=self.binary, zerofs_config=runtime_config)
+        ledger = ResourceLedger.load(config.ledger_path)
+
+        summary = lifecycle.run_scenario(
+            ledger,
+            "xfs-over-nbd-restart",
+            zerofs_binary=self.binary,
+            zerofs_config=runtime_config,
+        )
+
+        receipt = json.loads(Path(summary["receipt"]).read_text(encoding="utf-8"))
+        self.assertEqual(
+            initial.calls,
+            [
+                ("wait-initial", 30.0),
+                ("wait-accepted", 2),
+                ("wait-local", 9),
+            ],
+        )
+        self.assertEqual(restarted.calls[0][0], "wait-restarted")
+        self.assertEqual(receipt["durability_cutoff"], 9)
+        self.assertEqual(
+            receipt["pre_kill_remote_coverage"],
+            "remote-not-covered-at-pre-kill-sample",
+        )
+        self.assertEqual(receipt["checksums"]["xfs-proof-before-restart"], "a" * 64)
+        self.assertEqual(
+            receipt["observed_durability"]["after_restart"]["identity"][
+                "server_instance_id"
+            ],
+            "instance-b",
+        )
+        self.assertEqual(receipt["cleanup_status"], "ok")
+        self.assertTrue(receipt["cleanup_verification"]["clean"])
+        self.assertFalse(config.resource_root.exists())
+
+    def test_xfs_runtime_rejects_a_plan_missing_restart_evidence(self) -> None:
+        config = self.make_config(filesystem="volatile_memory", object_="ssd")
+        runtime_config = self.base / "xfs-runtime.toml"
+        runtime_config.write_text(
+            """
+[storage]
+url = "s3://bucket/prefix"
+# TIERED_RUNTIME_SERVERS_BEGIN
+[servers.nbd]
+addresses = ["127.0.0.1:10809"]
+# TIERED_RUNTIME_SERVERS_END
+[writeback]
+enabled = true
+min_free_gb = 0.25
+""",
+            encoding="utf-8",
+        )
+        initial = FakeObservedCollector(
+            observed_snapshot("instance-a", accepted=2, local=2, remote=2),
+            observed_snapshot("instance-a", accepted=9, local=9, remote=4),
+        )
+        lifecycle = HarnessLifecycle(
+            config,
+            FakeRunner(),
+            probes=FakeProbes(),
+            platform="linux",
+            observed_factory=lambda: initial,
+        )
+        lifecycle.setup(zerofs_binary=self.binary, zerofs_config=runtime_config)
+        ledger = ResourceLedger.load(config.ledger_path)
+        original = SCENARIOS["xfs-over-nbd-restart"]
+
+        def without_restart_checkpoint(context: ScenarioContext):
+            plan = original(context)
+            return replace(
+                plan,
+                steps=tuple(
+                    replace(step, after_checkpoint=None)
+                    if step.after_checkpoint == "require-restart"
+                    else step
+                    for step in plan.steps
+                ),
+            )
+
+        with mock.patch.dict(
+            SCENARIOS, {"xfs-over-nbd-restart": without_restart_checkpoint}
+        ):
+            with self.assertRaisesRegex(LifecycleError, "missing required runtime evidence"):
+                lifecycle.run_scenario(
+                    ledger,
+                    "xfs-over-nbd-restart",
+                    zerofs_binary=self.binary,
+                    zerofs_config=runtime_config,
+                )
 
 
 class IntegrityHelperTests(HarnessCase):
@@ -1612,6 +1949,43 @@ class WorkflowContractTests(unittest.TestCase):
                         text,
                         f"{filename} mentions production marker {marker!r}",
                     )
+
+    def test_xfs_tiered_separates_planning_from_real_runtime_acceptance(self) -> None:
+        _, tiered = self.regions("xfs-nbd.yml")
+        runs = [
+            command
+            for command in self.harness_commands(tiered)
+            if ".py run " in f"{command} "
+        ]
+        self.assertEqual(len(runs), 2)
+        self.assertIn("--plan-only", runs[0])
+        self.assertNotIn("--plan-only", runs[1])
+
+    def test_xfs_tiered_uses_the_checked_runtime_fixture_and_owned_tls(self) -> None:
+        _, tiered = self.regions("xfs-nbd.yml")
+        self.assertIn(
+            "apt-get install -y nbd-client xfsprogs wget lsof openssl",
+            tiered,
+        )
+        self.assertIn(
+            "scripts/tiered_writeback_e2e/xfs_nbd_tiered.toml.template",
+            tiered,
+        )
+        self.assertNotIn("cat > /tmp/zerofs-tiered.toml", tiered)
+        self.assertIn('TLS_ROOT="${CONTROL_ROOT}/tls"', tiered)
+        self.assertIn("openssl req -x509", tiered)
+        self.assertIn("chmod 600", tiered)
+        self.assertNotIn(
+            'mkdir -p "${RESOURCE_ROOT}/run/cache" "${RESOURCE_ROOT}/run/writeback"',
+            tiered,
+        )
+
+    def test_xfs_tiered_minio_container_and_bucket_are_uuid_scoped(self) -> None:
+        _, tiered = self.regions("xfs-nbd.yml")
+        self.assertIn('MINIO_CONTAINER="zerofs-tiered-minio-${RUN_UUID}"', tiered)
+        self.assertIn('MINIO_BUCKET="zerofs-xfs-${RUN_UUID}"', tiered)
+        self.assertIn('docker rm -f "$MINIO_CONTAINER"', tiered)
+        self.assertNotIn("--name minio", tiered)
 
 
 if __name__ == "__main__":
