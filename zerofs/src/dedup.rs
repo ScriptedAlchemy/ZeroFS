@@ -973,6 +973,23 @@ impl DedupCache {
     pub(crate) fn is_empty(&self) -> bool {
         self.stats().retained_results == 0
     }
+
+    #[cfg(test)]
+    pub(crate) fn clear_replay_state_for_test(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        assert_eq!(
+            inner.inflight_ids, 0,
+            "test replay reset requires no applying operations"
+        );
+        assert_eq!(
+            inner.replay_pinned_results, 0,
+            "test replay reset requires no pinned results"
+        );
+        inner.entries.clear();
+        inner.protected_inodes.clear();
+        inner.reclaim_on_unprotect.clear();
+        inner.promotion_retry_grace = None;
+    }
 }
 
 impl Default for DedupCache {

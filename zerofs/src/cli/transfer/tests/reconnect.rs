@@ -136,7 +136,7 @@ async fn proxy_websocket_session<Downstream, Upstream>(
 }
 
 #[tokio::test]
-async fn websocket_upload_rebinds_linked_temp_after_an_accepted_write_loses_its_reply() {
+async fn websocket_upload_restarts_fresh_temp_after_an_unseen_write_retry() {
     let filesystem = Arc::new(ZeroFS::new_in_memory().await.unwrap());
     let inspect_filesystem = Arc::clone(&filesystem);
     let connections = Arc::new(AtomicUsize::new(0));
@@ -182,10 +182,6 @@ async fn websocket_upload_rebinds_linked_temp_after_an_accepted_write_loses_its_
         .stats
         .files_created
         .load(Ordering::Relaxed);
-    let baseline_bytes_written = inspect_filesystem
-        .stats
-        .bytes_written
-        .load(Ordering::Relaxed);
 
     let upload = tokio::time::timeout(
         Duration::from_secs(10),
@@ -219,17 +215,8 @@ async fn websocket_upload_rebinds_linked_temp_after_an_accepted_write_loses_its_
             .files_created
             .load(Ordering::Relaxed)
             - baseline_files_created,
-        1,
-        "the product upload path must recover within its first temporary file attempt"
-    );
-    assert_eq!(
-        inspect_filesystem
-            .stats
-            .bytes_written
-            .load(Ordering::Relaxed)
-            - baseline_bytes_written,
-        payload.len() as u64,
-        "ambiguous replay must not apply any logical chunk twice"
+        2,
+        "one stale private temporary file must be replaced by one fresh bounded retry"
     );
     let entries = primary_client.read_dir("/dest").await.unwrap();
     assert_eq!(entries.len(), 1);

@@ -1517,25 +1517,10 @@ impl NinePClient {
             let connection_epoch = conn.writer_epoch.load(Ordering::Relaxed);
             let (op_flags, mut send) =
                 attempt.dispatch_frame(has_op_id, connection_epoch, |op_flags, origin_epoch| {
-                    // On a standalone (epoch-zero) server, positioned writes
-                    // can safely replay as another FIRST with the same
-                    // operation ID and full payload. This lets the server
-                    // either join/replay an accepted attempt or admit a frame
-                    // that the previous transport buffered locally but never
-                    // delivered. Nonzero HA epochs must retain RETRY so an
-                    // unseen operation still passes the promotion-coverage
-                    // fence before it can be admitted. Other mutations also
-                    // retain strict RETRY semantics because applying them
-                    // twice is not safe.
-                    let wire_op_flags = if matches!(body, Message::Twrite(_)) && origin_epoch == 0 {
-                        0
-                    } else {
-                        op_flags
-                    };
                     let bytes = P9Message::new_with_op_id_flags_and_origin(
                         tag,
                         op_id,
-                        wire_op_flags,
+                        op_flags,
                         origin_epoch,
                         body.clone(),
                     )
@@ -4915,7 +4900,7 @@ mod session_transition_tests {
     }
 
     #[tokio::test]
-    async fn ambiguous_write_reply_loss_resends_full_payload_as_idempotent_first() {
+    async fn ambiguous_write_reply_loss_preserves_retry_and_accepts_cached_success() {
         let (conn, mut requests) = test_conn_with_receiver();
         let client = test_client(Arc::clone(&conn));
 
@@ -4934,7 +4919,7 @@ mod session_transition_tests {
 
             let retry = recv_op_request(&mut requests, "retried write request").await;
             assert_eq!(retry.op_id, op_id);
-            assert_eq!(retry.op_flags, 0);
+            assert_eq!(retry.op_flags, P9_OP_FLAG_RETRY);
             assert!(matches!(
                 retry.body,
                 Message::Twrite(Twrite { count: 1, .. })
