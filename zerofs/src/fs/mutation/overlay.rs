@@ -11,7 +11,7 @@ use super::overlay_helpers::{
     direct_write_fingerprint, overlay_fs_error, write_admission_fs_error,
 };
 use super::volatile_overlay::{
-    Materializer, OverlayError, OverlayResult, VolatileAdmission, VolatileBudget,
+    IdleHook, Materializer, OverlayError, OverlayResult, VolatileAdmission, VolatileBudget,
     VolatileWriteRuntime, WriteVisibility, record_published_staged_writes,
 };
 use crate::fs::ZeroFS;
@@ -27,15 +27,18 @@ use crate::fs::ops::write::{apply_prepared_batch, prepare_write};
 use crate::fs::types::{AuthContext, FileAttributes};
 use bytes::Bytes;
 use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::ops::Deref;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::oneshot;
+use tokio_util::task::TaskTracker;
 
 pub(crate) struct FilesystemVolatileOverlay {
     budget: Arc<VolatileBudget>,
-    runtimes: Mutex<HashMap<u64, Arc<VolatileWriteRuntime>>>,
+    runtimes: Mutex<RuntimeRegistry>,
+    runtime_workers: TaskTracker,
     pending: Mutex<HashMap<u64, VecDeque<Arc<PendingDispatch>>>>,
     latest_attrs: Mutex<HashMap<u64, VecDeque<VisibleAttrs>>>,
     frozen: AtomicBool,
@@ -47,6 +50,79 @@ pub(crate) struct FilesystemVolatileOverlay {
     #[cfg(test)]
     publish_pause: Mutex<Option<PublicationPause>>,
     fs: Weak<ZeroFS>,
+}
+
+struct RuntimeEntry {
+    generation: u64,
+    handles: usize,
+    runtime: Arc<VolatileWriteRuntime>,
+}
+
+struct RuntimeRegistry {
+    closed: bool,
+    next_generation: u64,
+    entries: HashMap<u64, RuntimeEntry>,
+}
+
+struct RuntimeHandle {
+    owner: Weak<FilesystemVolatileOverlay>,
+    inode: u64,
+    generation: u64,
+    runtime: Option<Arc<VolatileWriteRuntime>>,
+}
+
+impl Deref for RuntimeHandle {
+    type Target = VolatileWriteRuntime;
+
+    fn deref(&self) -> &Self::Target {
+        self.runtime.as_deref().expect("live runtime handle")
+    }
+}
+
+impl Drop for RuntimeHandle {
+    fn drop(&mut self) {
+        drop(self.runtime.take());
+        if let Some(owner) = self.owner.upgrade() {
+            owner.release_runtime_handle(self.inode, self.generation);
+        }
+    }
+}
+
+struct RuntimeAdmission {
+    runtime: RuntimeHandle,
+    admission: VolatileAdmission,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OverlayLifecycleCensus {
+    pub(crate) runtimes: usize,
+    pub(crate) runtime_workers: usize,
+    pub(crate) pending_keys: usize,
+    pub(crate) pending_dispatches: usize,
+    pub(crate) visible_attrs: usize,
+}
+
+#[cfg(test)]
+pub(crate) struct RuntimeIdleRetirementPause {
+    reached: oneshot::Receiver<()>,
+    resume: Option<oneshot::Sender<()>>,
+    _runtime: RuntimeHandle,
+}
+
+#[cfg(test)]
+impl RuntimeIdleRetirementPause {
+    pub(crate) async fn wait_until_reached(&mut self) -> Result<(), oneshot::error::RecvError> {
+        (&mut self.reached).await
+    }
+
+    pub(crate) fn resume(mut self) {
+        self.resume
+            .take()
+            .expect("runtime retirement pause has not resumed")
+            .send(())
+            .expect("runtime retirement worker is still paused");
+    }
 }
 
 struct VisibleAttrs {
@@ -95,7 +171,7 @@ pub(crate) struct IdentifiedWrite<'a> {
 
 struct StagedWriteAccept {
     inode: u64,
-    admission: VolatileAdmission,
+    admission: RuntimeAdmission,
     offset: u64,
     data: Bytes,
     attrs: FileAttributes,
@@ -128,7 +204,12 @@ impl FilesystemVolatileOverlay {
     pub(crate) fn new(max_bytes: u64, max_operations: usize, fs: Weak<ZeroFS>) -> Arc<Self> {
         Arc::new(Self {
             budget: VolatileBudget::new(max_bytes, max_operations),
-            runtimes: Mutex::new(HashMap::new()),
+            runtimes: Mutex::new(RuntimeRegistry {
+                closed: false,
+                next_generation: 1,
+                entries: HashMap::new(),
+            }),
+            runtime_workers: TaskTracker::new(),
             pending: Mutex::new(HashMap::new()),
             latest_attrs: Mutex::new(HashMap::new()),
             frozen: AtomicBool::new(false),
@@ -147,19 +228,106 @@ impl FilesystemVolatileOverlay {
         Arc::clone(&self.budget)
     }
 
-    fn runtime(self: &Arc<Self>, inode: u64) -> Arc<VolatileWriteRuntime> {
+    fn runtime(self: &Arc<Self>, inode: u64) -> OverlayResult<RuntimeHandle> {
         let mut runtimes = self.runtimes.lock().expect("filesystem overlay poisoned");
-        runtimes
-            .entry(inode)
-            .or_insert_with(|| {
-                let overlay = Arc::clone(self);
+        if runtimes.closed {
+            return Err(OverlayError::IoError);
+        }
+        if !runtimes.entries.contains_key(&inode) {
+            let generation = runtimes.next_generation;
+            runtimes.next_generation = runtimes
+                .next_generation
+                .checked_add(1)
+                .ok_or(OverlayError::IoError)?;
+            let overlay = Arc::downgrade(self);
+            let materialize_overlay = overlay.clone();
+            let idle_overlay = overlay.clone();
+            let idle_hook: IdleHook = Arc::new(move |inode, generation| {
+                if let Some(overlay) = idle_overlay.upgrade() {
+                    overlay.try_reap_runtime(inode, generation);
+                }
+            });
+            let runtime = {
                 let materialize: Materializer = Arc::new(move |inode, offset, data| {
-                    let overlay = Arc::clone(&overlay);
-                    Box::pin(async move { overlay.materialize(inode, offset, data).await })
+                    let overlay = materialize_overlay.clone();
+                    Box::pin(async move {
+                        let overlay = overlay.upgrade().ok_or(OverlayError::IoError)?;
+                        overlay.materialize(inode, offset, data).await
+                    })
                 });
-                VolatileWriteRuntime::new(Arc::clone(&self.budget), inode, materialize)
-            })
-            .clone()
+                VolatileWriteRuntime::new_tracked(
+                    Arc::clone(&self.budget),
+                    inode,
+                    materialize,
+                    self.runtime_workers.clone(),
+                    generation,
+                    Some(idle_hook),
+                )
+            };
+            runtimes.entries.insert(
+                inode,
+                RuntimeEntry {
+                    generation,
+                    handles: 0,
+                    runtime,
+                },
+            );
+        }
+        let entry = runtimes.entries.get_mut(&inode).expect("runtime inserted");
+        entry.handles = entry.handles.checked_add(1).ok_or(OverlayError::IoError)?;
+        Ok(RuntimeHandle {
+            owner: Arc::downgrade(self),
+            inode,
+            generation: entry.generation,
+            runtime: Some(Arc::clone(&entry.runtime)),
+        })
+    }
+
+    fn runtime_if_present(self: &Arc<Self>, inode: u64) -> OverlayResult<Option<RuntimeHandle>> {
+        let mut runtimes = self.runtimes.lock().expect("filesystem overlay poisoned");
+        let Some(entry) = runtimes.entries.get_mut(&inode) else {
+            return Ok(None);
+        };
+        entry.handles = entry.handles.checked_add(1).ok_or(OverlayError::IoError)?;
+        Ok(Some(RuntimeHandle {
+            owner: Arc::downgrade(self),
+            inode,
+            generation: entry.generation,
+            runtime: Some(Arc::clone(&entry.runtime)),
+        }))
+    }
+
+    fn release_runtime_handle(&self, inode: u64, generation: u64) {
+        let removed = {
+            let mut runtimes = self.runtimes.lock().expect("filesystem overlay poisoned");
+            let Some(entry) = runtimes.entries.get_mut(&inode) else {
+                return;
+            };
+            if entry.generation != generation {
+                return;
+            }
+            entry.handles = entry
+                .handles
+                .checked_sub(1)
+                .expect("runtime handle count underflow");
+            if entry.handles == 0 && entry.runtime.is_reapable() {
+                runtimes.entries.remove(&inode)
+            } else {
+                None
+            }
+        };
+        drop(removed);
+    }
+
+    fn try_reap_runtime(&self, inode: u64, generation: u64) {
+        let removed = {
+            let mut runtimes = self.runtimes.lock().expect("filesystem overlay poisoned");
+            let reapable = runtimes.entries.get(&inode).is_some_and(|entry| {
+                entry.generation == generation && entry.handles == 0 && entry.runtime.is_reapable()
+            });
+            reapable.then(|| runtimes.entries.remove(&inode)).flatten()
+        };
+        drop(removed);
     }
 
     async fn materialize(
@@ -170,10 +338,14 @@ impl FilesystemVolatileOverlay {
     ) -> OverlayResult<()> {
         let dispatch = {
             let mut pending = self.pending.lock().expect("filesystem overlay poisoned");
-            match pending.get_mut(&inode).and_then(VecDeque::pop_front) {
+            let dispatch = match pending.get_mut(&inode).and_then(VecDeque::pop_front) {
                 Some(dispatch) => dispatch,
                 None => return Ok(()),
+            };
+            if pending.get(&inode).is_some_and(VecDeque::is_empty) {
+                pending.remove(&inode);
             }
+            dispatch
         };
         let Some(fs) = self.fs.upgrade() else {
             return Err(OverlayError::IoError);
@@ -186,8 +358,9 @@ impl FilesystemVolatileOverlay {
             .runtimes
             .lock()
             .expect("filesystem overlay poisoned")
+            .entries
             .get(&inode)
-            .map(|runtime| runtime.dirty_end())
+            .map(|entry| entry.runtime.dirty_end())
             .unwrap_or(0);
         let attrs = self
             .latest_attrs
@@ -229,18 +402,20 @@ impl FilesystemVolatileOverlay {
         self: &Arc<Self>,
         inode: u64,
         bytes: usize,
-    ) -> OverlayResult<VolatileAdmission> {
-        self.runtime(inode).reserve(bytes).await
+    ) -> OverlayResult<RuntimeAdmission> {
+        let runtime = self.runtime(inode)?;
+        let admission = runtime.reserve(bytes).await?;
+        Ok(RuntimeAdmission { runtime, admission })
     }
 
     async fn reserve_batch(
         self: &Arc<Self>,
         members: &[(InodeId, usize)],
-    ) -> OverlayResult<Vec<VolatileAdmission>> {
+    ) -> OverlayResult<Vec<RuntimeAdmission>> {
         let runtimes = members
             .iter()
             .map(|(inode, _)| self.runtime(*inode))
-            .collect::<Vec<_>>();
+            .collect::<OverlayResult<Vec<_>>>()?;
         let member_bytes = members
             .iter()
             .map(|(_, bytes)| *bytes as u64)
@@ -253,7 +428,11 @@ impl FilesystemVolatileOverlay {
             .map(|permits| {
                 permits
                     .into_iter()
-                    .map(VolatileAdmission::from_permit)
+                    .zip(runtimes)
+                    .map(|(permit, runtime)| RuntimeAdmission {
+                        runtime,
+                        admission: VolatileAdmission::from_permit(permit),
+                    })
                     .collect()
             })
     }
@@ -328,7 +507,7 @@ impl FilesystemVolatileOverlay {
         &self,
         dispatch: &Arc<PendingDispatch>,
         member_ids: &[InodeId],
-        accepted: &[(Arc<VolatileWriteRuntime>, u64)],
+        accepted: &[(RuntimeHandle, u64)],
     ) {
         dispatch.cancel_unpublished();
         {
@@ -351,7 +530,7 @@ impl FilesystemVolatileOverlay {
     /// Visibility is accepted per inode; canonical apply happens once.
     async fn accept_batch(
         self: &Arc<Self>,
-        admissions: Vec<VolatileAdmission>,
+        admissions: Vec<RuntimeAdmission>,
         guard: PreparationGuard,
         batch: PreparedWriteBatch,
     ) -> OverlayResult<MutationCutoff> {
@@ -374,7 +553,7 @@ impl FilesystemVolatileOverlay {
     /// accepted mutation to the dispatch that the apply workers drain.
     async fn accept_members(
         self: &Arc<Self>,
-        admissions: Vec<VolatileAdmission>,
+        admissions: Vec<RuntimeAdmission>,
         members: Vec<StagedMember>,
         guard: PreparationGuard,
         batch: PreparedWriteBatch,
@@ -401,7 +580,7 @@ impl FilesystemVolatileOverlay {
         }
         let mut accepted_runtimes = Vec::with_capacity(members.len());
         for (admission, member) in admissions.into_iter().zip(members.iter()) {
-            let runtime = self.runtime(member.id);
+            let RuntimeAdmission { runtime, admission } = admission;
             match runtime
                 .accept_staged_write(
                     admission,
@@ -517,6 +696,46 @@ impl FilesystemVolatileOverlay {
     }
 
     #[cfg(test)]
+    pub(crate) fn lifecycle_census_for_test(&self) -> OverlayLifecycleCensus {
+        let runtimes = self.runtimes.lock().expect("filesystem overlay poisoned");
+        let runtime_count = runtimes.entries.len();
+        let runtime_workers = self.runtime_workers.len();
+        drop(runtimes);
+        let pending = self.pending.lock().expect("filesystem overlay poisoned");
+        let pending_keys = pending.len();
+        let pending_dispatches = pending.values().map(VecDeque::len).sum();
+        drop(pending);
+        let visible_attrs = self
+            .latest_attrs
+            .lock()
+            .expect("filesystem overlay poisoned")
+            .values()
+            .map(VecDeque::len)
+            .sum();
+        OverlayLifecycleCensus {
+            runtimes: runtime_count,
+            runtime_workers,
+            pending_keys,
+            pending_dispatches,
+            visible_attrs,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_next_runtime_idle_retirement_for_test(
+        self: &Arc<Self>,
+        inode: u64,
+    ) -> RuntimeIdleRetirementPause {
+        let runtime = self.runtime(inode).expect("test runtime available");
+        let (reached, resume) = runtime.pause_next_idle_retirement_for_test();
+        RuntimeIdleRetirementPause {
+            reached,
+            resume: Some(resume),
+            _runtime: runtime,
+        }
+    }
+
+    #[cfg(test)]
     fn fail_batch_after_for_test(&self, accepted_members: usize) {
         self.fail_batch_after
             .store(accepted_members, Ordering::Release);
@@ -575,10 +794,7 @@ impl FilesystemVolatileOverlay {
         length: usize,
         base: impl FnOnce() -> futures::future::BoxFuture<'static, OverlayResult<Bytes>>,
     ) -> OverlayResult<Bytes> {
-        let runtime = {
-            let runtimes = self.runtimes.lock().expect("filesystem overlay poisoned");
-            runtimes.get(&inode).cloned()
-        };
+        let runtime = self.runtime_if_present(inode)?;
         match runtime {
             Some(runtime) => runtime.read(offset, length, base).await,
             None => base().await,
@@ -596,36 +812,99 @@ impl FilesystemVolatileOverlay {
     /// the writes accepted while an earlier lane drained.
     pub(crate) async fn wait_inodes(self: &Arc<Self>, inodes: &[InodeId]) -> OverlayResult<()> {
         let targets = {
-            let runtimes = self.runtimes.lock().expect("filesystem overlay poisoned");
-            inodes
-                .iter()
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .filter_map(|inode| runtimes.get(inode).map(materialization_target))
-                .collect::<Vec<_>>()
+            let mut runtimes = self.runtimes.lock().expect("filesystem overlay poisoned");
+            let owner = Arc::downgrade(self);
+            let inodes = inodes.iter().copied().collect::<BTreeSet<_>>();
+            if inodes.iter().any(|inode| {
+                runtimes
+                    .entries
+                    .get(inode)
+                    .is_some_and(|entry| entry.handles == usize::MAX)
+            }) {
+                return Err(OverlayError::IoError);
+            }
+            let mut targets = Vec::with_capacity(inodes.len());
+            for inode in inodes {
+                if let Some(entry) = runtimes.entries.get_mut(&inode) {
+                    entry.handles += 1;
+                    targets.push((
+                        RuntimeHandle {
+                            owner: owner.clone(),
+                            inode,
+                            generation: entry.generation,
+                            runtime: Some(Arc::clone(&entry.runtime)),
+                        },
+                        entry.runtime.accepted_cutoff(),
+                    ));
+                }
+            }
+            targets
         };
         wait_materialization_targets(targets).await
     }
 
     pub(crate) async fn wait_all(self: &Arc<Self>) -> OverlayResult<()> {
         let targets = {
-            let runtimes = self.runtimes.lock().expect("filesystem overlay poisoned");
-            runtimes.values().map(materialization_target).collect()
+            let mut runtimes = self.runtimes.lock().expect("filesystem overlay poisoned");
+            if runtimes
+                .entries
+                .values()
+                .any(|entry| entry.handles == usize::MAX)
+            {
+                return Err(OverlayError::IoError);
+            }
+            let owner = Arc::downgrade(self);
+            let mut targets = Vec::with_capacity(runtimes.entries.len());
+            for (inode, entry) in &mut runtimes.entries {
+                entry.handles += 1;
+                targets.push((
+                    RuntimeHandle {
+                        owner: owner.clone(),
+                        inode: *inode,
+                        generation: entry.generation,
+                        runtime: Some(Arc::clone(&entry.runtime)),
+                    },
+                    entry.runtime.accepted_cutoff(),
+                ));
+            }
+            targets
         };
         wait_materialization_targets(targets).await
     }
 
     pub(crate) async fn shutdown(self: &Arc<Self>) -> OverlayResult<()> {
         let runtimes = {
-            let runtimes = self.runtimes.lock().expect("filesystem overlay poisoned");
-            runtimes.values().cloned().collect::<Vec<_>>()
+            let mut registry = self.runtimes.lock().expect("filesystem overlay poisoned");
+            if registry
+                .entries
+                .values()
+                .any(|entry| entry.handles == usize::MAX)
+            {
+                return Err(OverlayError::IoError);
+            }
+            registry.closed = true;
+            let owner = Arc::downgrade(self);
+            let mut runtimes = Vec::with_capacity(registry.entries.len());
+            for (inode, entry) in &mut registry.entries {
+                entry.handles += 1;
+                runtimes.push(RuntimeHandle {
+                    owner: owner.clone(),
+                    inode: *inode,
+                    generation: entry.generation,
+                    runtime: Some(Arc::clone(&entry.runtime)),
+                });
+            }
+            runtimes
         };
         let mut first_error = None;
-        for runtime in runtimes {
+        for runtime in &runtimes {
             if let Err(error) = runtime.shutdown().await {
                 first_error.get_or_insert(error);
             }
         }
+        drop(runtimes);
+        self.runtime_workers.close();
+        self.runtime_workers.wait().await;
         first_error.map_or(Ok(()), Err)
     }
 }
@@ -1177,18 +1456,9 @@ impl ZeroFS {
     }
 }
 
-/// Pair a lane with the cutoff a barrier must reach, taken while the runtimes
-/// map is still locked so no lane observes a cutoff extended by a later write.
-fn materialization_target(runtime: &Arc<VolatileWriteRuntime>) -> (Arc<VolatileWriteRuntime>, u64) {
-    let target = runtime.accepted_cutoff();
-    (Arc::clone(runtime), target)
-}
-
 /// Await every captured lane concurrently. As with the previous sequential
 /// wait, the first error ends the barrier and the remaining waits are dropped.
-async fn wait_materialization_targets(
-    targets: Vec<(Arc<VolatileWriteRuntime>, u64)>,
-) -> OverlayResult<()> {
+async fn wait_materialization_targets(targets: Vec<(RuntimeHandle, u64)>) -> OverlayResult<()> {
     futures::future::try_join_all(
         targets
             .iter()

@@ -30,12 +30,15 @@ use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+#[cfg(test)]
+use tokio::sync::oneshot;
 use tokio::sync::{Notify, RwLock, mpsc};
-use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 pub(crate) type Materializer =
     Arc<dyn Fn(u64, u64, Bytes) -> BoxFuture<'static, OverlayResult<()>> + Send + Sync + 'static>;
+pub(crate) type IdleHook = Arc<dyn Fn(u64, u64) + Send + Sync + 'static>;
 
 const GRACEFUL_DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -284,6 +287,25 @@ struct AcceptedWrite {
     entry: Arc<OverlayEntry>,
 }
 
+#[cfg(test)]
+struct IdleRetirementPause {
+    reached: oneshot::Sender<()>,
+    resume: oneshot::Receiver<()>,
+}
+
+struct RuntimeWorkerCompletion {
+    runtime: std::sync::Weak<VolatileWriteRuntime>,
+}
+
+impl Drop for RuntimeWorkerCompletion {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.runtime.upgrade() {
+            runtime.worker_running.store(false, Ordering::Release);
+            runtime.worker_stopped.notify_waiters();
+        }
+    }
+}
+
 pub(crate) struct VolatileWriteRuntime {
     state: Mutex<State>,
     changed: Notify,
@@ -294,7 +316,10 @@ pub(crate) struct VolatileWriteRuntime {
     budget: Arc<VolatileBudget>,
     ingress: mpsc::UnboundedSender<AcceptedWrite>,
     task_shutdown: CancellationToken,
-    worker: Mutex<Option<JoinHandle<()>>>,
+    worker_running: AtomicBool,
+    worker_stopped: Notify,
+    #[cfg(test)]
+    idle_retirement_pause: Mutex<Option<IdleRetirementPause>>,
 }
 
 impl VolatileWriteRuntime {
@@ -302,6 +327,17 @@ impl VolatileWriteRuntime {
         budget: Arc<VolatileBudget>,
         inode: u64,
         materialize: Materializer,
+    ) -> Arc<Self> {
+        Self::new_tracked(budget, inode, materialize, TaskTracker::new(), 0, None)
+    }
+
+    pub(crate) fn new_tracked(
+        budget: Arc<VolatileBudget>,
+        inode: u64,
+        materialize: Materializer,
+        workers: TaskTracker,
+        generation: u64,
+        idle_hook: Option<IdleHook>,
     ) -> Arc<Self> {
         let (ingress, mut ingress_rx) = mpsc::unbounded_channel::<AcceptedWrite>();
         let task_shutdown = CancellationToken::new();
@@ -319,13 +355,19 @@ impl VolatileWriteRuntime {
             budget,
             ingress,
             task_shutdown: task_shutdown.clone(),
-            worker: Mutex::new(None),
+            worker_running: AtomicBool::new(true),
+            worker_stopped: Notify::new(),
+            #[cfg(test)]
+            idle_retirement_pause: Mutex::new(None),
         });
 
         let worker_runtime_weak = Arc::downgrade(&runtime);
         let panic_runtime_weak = worker_runtime_weak.clone();
         let worker_shutdown = task_shutdown;
-        let handle = tokio::spawn(async move {
+        drop(workers.spawn(async move {
+            let _completion = RuntimeWorkerCompletion {
+                runtime: worker_runtime_weak.clone(),
+            };
             let outcome = AssertUnwindSafe(async move {
                 loop {
                     let write = tokio::select! {
@@ -355,7 +397,15 @@ impl VolatileWriteRuntime {
                         outcome = &mut materialization => outcome,
                     };
                     match outcome {
-                        Ok(Ok(())) => runtime.complete(write.sequence).await,
+                        Ok(Ok(())) => {
+                            runtime.complete(write.sequence).await;
+                            #[cfg(test)]
+                            runtime.pause_before_idle_retirement_for_test().await;
+                            drop(runtime);
+                            if let Some(idle_hook) = &idle_hook {
+                                idle_hook(inode, generation);
+                            }
+                        }
                         Ok(Err(error)) => {
                             runtime.fail(write.sequence, error);
                             return;
@@ -374,8 +424,7 @@ impl VolatileWriteRuntime {
             {
                 runtime.fail(runtime.accepted_cutoff(), OverlayError::IoError);
             }
-        });
-        *runtime.worker.lock().expect("volatile worker poisoned") = Some(handle);
+        }));
 
         runtime
     }
@@ -473,6 +522,35 @@ impl VolatileWriteRuntime {
             .lock()
             .expect("volatile runtime poisoned")
             .next_sequence
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_next_idle_retirement_for_test(
+        &self,
+    ) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (reached_tx, reached_rx) = oneshot::channel();
+        let (resume_tx, resume_rx) = oneshot::channel();
+        *self
+            .idle_retirement_pause
+            .lock()
+            .expect("volatile worker poisoned") = Some(IdleRetirementPause {
+            reached: reached_tx,
+            resume: resume_rx,
+        });
+        (reached_rx, resume_tx)
+    }
+
+    #[cfg(test)]
+    async fn pause_before_idle_retirement_for_test(&self) {
+        let pause = self
+            .idle_retirement_pause
+            .lock()
+            .expect("volatile worker poisoned")
+            .take();
+        if let Some(pause) = pause {
+            let _ = pause.reached.send(());
+            let _ = pause.resume.await;
+        }
     }
 
     pub(crate) fn dirty_end(&self) -> u64 {
@@ -605,9 +683,9 @@ impl VolatileWriteRuntime {
                 }
             };
         self.task_shutdown.cancel();
-        let worker = self.worker.lock().expect("volatile worker poisoned").take();
-        if let Some(worker) = worker
-            && worker.await.is_err()
+        if tokio::time::timeout(timeout, self.wait_worker_stopped())
+            .await
+            .is_err()
         {
             self.fail(cutoff, OverlayError::IoError);
             result = Err(OverlayError::IoError);
@@ -615,11 +693,29 @@ impl VolatileWriteRuntime {
         result
     }
 
+    async fn wait_worker_stopped(&self) {
+        loop {
+            let stopped = self.worker_stopped.notified();
+            if !self.worker_running.load(Ordering::Acquire) {
+                return;
+            }
+            stopped.await;
+        }
+    }
+
     fn terminal(&self) -> Option<(u64, OverlayError)> {
         self.state
             .lock()
             .expect("volatile runtime poisoned")
             .terminal
+    }
+
+    pub(crate) fn is_reapable(&self) -> bool {
+        let state = self.state.lock().expect("volatile runtime poisoned");
+        state.terminal.is_none()
+            && state.entries.is_empty()
+            && state.completed.is_empty()
+            && state.materialized_through == state.next_sequence
     }
 
     fn fail(&self, sequence: u64, error: OverlayError) {
