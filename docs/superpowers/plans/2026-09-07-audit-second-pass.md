@@ -90,8 +90,8 @@ Produces generation-safe idle retirement and reaped task bookkeeping, bounded by
 - [x] Race hot-inode enqueue against retirement. Enqueue and removal agree on one generation; both materializer and overlay hot-inode races passed.
 - [x] Retire only when queued, executing, staged, held and read-retirement work is absent. Prune empty bookkeeping and reap completed join handles. Integrated bounded-lifecycle stage as `f2300b5f` (worker `a240b72a`). Real 10,000-inode plus race suite: three passed (`cc-9900`); the post-drain census requires exact zero.
 - [x] Preserve striped ordering, cancellation, frozen-overlay and read-visibility tests after rebasing on the aggregate reservation fix. Full mutation prefix: 97 passed, zero ignored (`cc-9909`); root independently read the broker receipt.
-- [ ] Only after the bounded lifecycle gate, remove the redundant forwarding execution layer by explicitly retaining visibility/attribute/read ownership in the overlay and FIFO execution in the materializer. Do not delay the P1 commits for this refactor.
-- [ ] Run churn/race and existing mutation suites, review and commit each independently verifiable stage.
+- [x] Only after the bounded lifecycle gate, remove the redundant forwarding execution layer by explicitly retaining visibility/attribute/read ownership in the overlay and FIFO execution in the materializer. Integrated as `2cabca43` (worker `a4814862`). Runtime state owns visibility and read retirement; materializer lanes own execution. The existing short enqueue gate prevents mixed single/striped admission from splitting a group.
+- [x] Run churn/race and existing mutation suites, review and commit each independently verifiable stage. Second-stage mutation suite: 100 passed, zero ignored (`cc-9941`); final production and test checks passed with zero compiler warnings (`cc-9949`, `cc-9951`). The earlier mixed fixture failure was an invalid overlap blocked by preparation, not an observed ordering defect. Final combined runtime/clippy remains a separate gate.
 
 ## Draft 13: real isolated XFS runtime gate
 
