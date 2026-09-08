@@ -25,7 +25,7 @@ from .config import (
     path_is_within,
     validate_owned_path,
 )
-from .crash import CRASH_SCENARIOS
+from .crash import CRASH_SCENARIOS, xfs_bootstrap_socket
 from .integrity import sha256_file, verify_copied_tree
 from .linux_suites import PINNED_REVISIONS, SUITE_SCENARIOS
 from .protocols import NBD_CLIENT, PROTOCOL_SCENARIOS, ScenarioBuilder, ScenarioContext
@@ -306,6 +306,9 @@ class Probes:
     def device_attached(self, device: str) -> bool:
         return self._succeeds([NBD_CLIENT, "-c", device])
 
+    def unix_socket_ready(self, path: str) -> bool:
+        return self._succeeds(["test", "-S", path])
+
     def pool_exists(self, name: str) -> bool:
         return self._succeeds(["zpool", "list", "-H", "-o", "name", name])
 
@@ -504,6 +507,13 @@ class HarnessLifecycle:
                 raise LifecycleError(f"NBD device {device} remained attached")
             time.sleep(0.1)
 
+    def _wait_for_unix_socket(self, path: Path, *, timeout: float = 10.0) -> None:
+        deadline = time.monotonic() + timeout
+        while not self.probes.unix_socket_ready(str(path)):
+            if time.monotonic() >= deadline:
+                raise LifecycleError(f"Unix socket {path} was not ready")
+            time.sleep(0.1)
+
     def _wait_for_unit_gone(
         self,
         unit: str,
@@ -639,7 +649,7 @@ class HarnessLifecycle:
                 derive_bootstrap_config(
                     zerofs_config,
                     bootstrap_config,
-                    ninep_socket=self.config.run_root / "xfs-nbd-bootstrap.9p.sock",
+                    ninep_socket=xfs_bootstrap_socket(self.config),
                 )
                 ledger.record_resource(
                     "path",
@@ -663,6 +673,15 @@ class HarnessLifecycle:
                         step=step.description,
                     )
                 receipt.sync_resources(ledger)
+                if step.wait_for_unix_socket is not None:
+                    socket = validate_owned_path(
+                        Path(step.wait_for_unix_socket), self.config.resource_root
+                    )
+                    if step.argv != ("test", "-S", str(socket)):
+                        raise LifecycleError(
+                            "socket readiness probe must match its test -S command"
+                        )
+                    self._wait_for_unix_socket(socket)
                 result = self.runner.run(
                     step.argv,
                     sudo=step.sudo,

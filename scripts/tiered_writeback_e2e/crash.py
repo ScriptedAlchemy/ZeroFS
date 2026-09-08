@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
+from .config import ConfigError, HarnessConfig
 from .protocols import (
     NBD_CLIENT,
     NBD_DEVICE,
@@ -28,6 +30,18 @@ from .integrity import floors_for
 # Crash boundaries the failpoint matrix must cover: before the local journal
 # record, after the journal but before remote upload, and after remote ack.
 CRASH_BOUNDARIES = ("pre-journal", "post-journal-pre-remote", "post-remote")
+LINUX_SUN_LEN = 108
+
+
+def xfs_bootstrap_socket(config: HarnessConfig) -> Path:
+    path = config.run_root / "9p.sock"
+    encoded_length = len(os.fsencode(path))
+    if encoded_length >= LINUX_SUN_LEN:
+        raise ConfigError(
+            f"bootstrap Unix socket path is {encoded_length} bytes; "
+            f"it must be shorter than SUN_LEN ({LINUX_SUN_LEN})"
+        )
+    return path
 
 
 def _restart_cycle(
@@ -45,7 +59,7 @@ def _xfs_over_nbd_restart(context: ScenarioContext) -> ScenarioPlan:
     mountpoint = _mountpoint(config, "xfs")
     proof = mountpoint / "xfs-restart-proof.bin"
     bootstrap_config = config.run_root / "xfs-nbd-bootstrap.toml"
-    bootstrap_socket = config.run_root / "xfs-nbd-bootstrap.9p.sock"
+    bootstrap_socket = xfs_bootstrap_socket(config)
     bootstrap_unit = f"{config.unit_name}-bootstrap"
     listeners = (
         ResourceOwnership("listener", NBD_PORT),
@@ -72,11 +86,11 @@ def _xfs_over_nbd_restart(context: ScenarioContext) -> ScenarioPlan:
                 ),
                 capture_main_pid_unit=bootstrap_unit,
             ),
-            Step("wait for the bootstrap 9P socket", ("sleep", "3")),
             Step(
-                "verify the bootstrap 9P socket exists",
+                "wait for and verify the bootstrap 9P socket",
                 ("test", "-S", str(bootstrap_socket)),
                 requires=(ResourceOwnership("path", str(bootstrap_socket)),),
+                wait_for_unix_socket=str(bootstrap_socket),
             ),
             Step(
                 "provision the exact sparse striped NBD export",
