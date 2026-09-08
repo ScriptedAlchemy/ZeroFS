@@ -625,13 +625,11 @@ async fn upload_visible_file_size(fs: &ZeroFS, id: InodeId) -> Result<u64, FsErr
     }
 }
 
-fn upload_admit_request(
-    state: &AppState,
-) -> Result<Arc<UploadRequestGuard>, axum::response::Response> {
+fn upload_admit_request(state: &AppState) -> Result<Arc<UploadRequestGuard>, FsError> {
     if state.shutdown.is_cancelled() {
-        return Err(upload_fs_error(FsError::RetryLater));
+        return Err(FsError::RetryLater);
     }
-    state.upload_ingress.try_request().map_err(upload_fs_error)
+    state.upload_ingress.try_request()
 }
 
 async fn upload_next_body_data(
@@ -713,7 +711,7 @@ async fn upload_part(
 ) -> axum::response::Response {
     let request_guard = match upload_admit_request(&state) {
         Ok(guard) => guard,
-        Err(response) => return response,
+        Err(error) => return upload_fs_error(error),
     };
     if let Err(error) = upload_writeback_preflight(state.writeback.as_ref()).await {
         return upload_fs_error(error);
@@ -903,7 +901,7 @@ async fn upload_status(
 ) -> axum::response::Response {
     let _request_guard = match upload_admit_request(&state) {
         Ok(guard) => guard,
-        Err(response) => return response,
+        Err(error) => return upload_fs_error(error),
     };
     let Some(path) = path.strip_suffix("/status") else {
         return upload_error(
@@ -1097,7 +1095,7 @@ async fn upload_commit(
 ) -> axum::response::Response {
     let request_guard = match upload_admit_request(&state) {
         Ok(guard) => guard,
-        Err(response) => return response,
+        Err(error) => return upload_fs_error(error),
     };
     let workspace_guard = match state
         .upload_ingress

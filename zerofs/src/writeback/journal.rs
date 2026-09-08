@@ -506,6 +506,7 @@ impl Journal {
         read_required::<JournalIdentity>(&meta, IDENTITY_KEY)
     }
 
+    #[cfg(test)]
     pub(crate) fn open(root: impl AsRef<Path>, expected_identity: JournalIdentity) -> Result<Self> {
         Self::open_with_root_hook(root, expected_identity, |_| Ok(()))
     }
@@ -517,6 +518,7 @@ impl Journal {
         Self::open_anchored_with_root_hook(root_dir, expected_identity, |_| Ok(()))
     }
 
+    #[cfg(test)]
     fn open_with_root_hook(
         root: impl AsRef<Path>,
         expected_identity: JournalIdentity,

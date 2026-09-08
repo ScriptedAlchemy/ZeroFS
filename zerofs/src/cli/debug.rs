@@ -275,7 +275,7 @@ pub async fn reseed_writeback_predecessor(
         let expected_identity = crate::cli::init::load_existing_writeback_identity(
             &settings,
             &remote,
-            &database_path.to_string(),
+            database_path.as_ref(),
         )
         .await?;
         let metadata = remote
@@ -359,7 +359,7 @@ pub async fn accept_remote_writeback_branch(
         let expected_identity = crate::cli::init::load_existing_writeback_identity(
             &settings,
             &remote,
-            &database_path.to_string(),
+            database_path.as_ref(),
         )
         .await?;
         let remote_payload = remote

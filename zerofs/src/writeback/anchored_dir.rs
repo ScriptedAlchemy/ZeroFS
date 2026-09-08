@@ -453,9 +453,12 @@ impl AnchoredDir {
 }
 
 fn rustix_mode(mode: u32) -> Result<Mode> {
-    Ok(Mode::from_raw_mode(mode.try_into().map_err(|_| {
-        anyhow::anyhow!("anchored file mode does not fit the host mode type")
-    })?))
+    match mode {
+        0 => Ok(Mode::empty()),
+        0o600 => Ok(Mode::RUSR.union(Mode::WUSR)),
+        0o700 => Ok(Mode::RWXU),
+        _ => bail!("unsupported private anchored file mode {mode:o}"),
+    }
 }
 
 fn validate_component(name: &OsStr) -> Result<()> {
@@ -470,9 +473,9 @@ fn validate_component(name: &OsStr) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::AnchoredDir;
+    use super::{AnchoredDir, rustix_mode};
     use redb::{Database, DatabaseError, ReadOnlyDatabase, ReadableDatabase, TableDefinition};
-    use rustix::fs::OFlags;
+    use rustix::fs::{Mode, OFlags};
     use std::os::unix::fs::PermissionsExt;
 
     fn owner_only(path: &std::path::Path) {
@@ -482,6 +485,14 @@ mod tests {
     fn anchored_temp(root: &tempfile::TempDir) -> AnchoredDir {
         owner_only(root.path());
         AnchoredDir::open_or_create_absolute(&root.path().canonicalize().unwrap(), 0o700).unwrap()
+    }
+
+    #[test]
+    fn rustix_mode_accepts_only_the_private_owner_modes() {
+        assert_eq!(rustix_mode(0).unwrap(), Mode::empty());
+        assert_eq!(rustix_mode(0o600).unwrap(), Mode::RUSR.union(Mode::WUSR));
+        assert_eq!(rustix_mode(0o700).unwrap(), Mode::RWXU);
+        assert!(rustix_mode(0o777).is_err());
     }
 
     #[test]

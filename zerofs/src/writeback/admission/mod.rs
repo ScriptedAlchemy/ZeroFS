@@ -6,6 +6,7 @@
 
 mod ram;
 
+#[cfg(test)]
 pub(crate) use crate::coordination::admission::AdmissionError;
 pub(crate) use ram::{AcceptedAdmission, Admission};
 
