@@ -51,7 +51,18 @@ impl VerifiedPayload {
     }
 
     pub(crate) fn from_staged_file(path: PathBuf, byte_len: u64) -> std::io::Result<Self> {
-        let mut file = open_staged_file(&path)?;
+        let file = open_staged_file(&path)?;
+        Self::from_open_staged_file(file, byte_len)
+    }
+
+    pub(crate) fn from_open_staged_file(mut file: File, byte_len: u64) -> std::io::Result<Self> {
+        if !file.metadata()?.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "staged payload must be a regular file",
+            ));
+        }
+        file.seek(SeekFrom::Start(0))?;
         let (actual_len, sha256) = hash_reader(&mut file)?;
         if actual_len != byte_len {
             return Err(std::io::Error::other(format!(
@@ -251,6 +262,7 @@ mod tests {
     use futures::StreamExt;
     use object_store::PutPayload;
     use std::fs::OpenOptions;
+    use std::io::{Seek, SeekFrom};
 
     #[test]
     fn verified_payload_carries_the_digest_of_its_immutable_bytes() {
@@ -313,6 +325,32 @@ mod tests {
         let mut stream = payload.staged_range(2..8).unwrap();
         std::fs::remove_file(path).unwrap();
 
+        let mut bytes = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            bytes.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(bytes, b"234567");
+    }
+
+    #[tokio::test]
+    async fn open_file_constructor_resets_cursor_and_retains_exact_file() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("payload.staged");
+        let retained = root.path().join("retained.staged");
+        std::fs::write(&path, b"0123456789").unwrap();
+        let mut file = OpenOptions::new().read(true).open(&path).unwrap();
+        file.seek(SeekFrom::Start(7)).unwrap();
+
+        let payload = VerifiedPayload::from_open_staged_file(file, 10).unwrap();
+        std::fs::rename(&path, &retained).unwrap();
+        std::fs::write(&path, b"abcdefghij").unwrap();
+        std::fs::remove_file(retained).unwrap();
+
+        assert_eq!(
+            payload.sha256(),
+            VerifiedPayload::new(Bytes::from_static(b"0123456789")).sha256()
+        );
+        let mut stream = payload.staged_range(2..8).unwrap();
         let mut bytes = Vec::new();
         while let Some(chunk) = stream.next().await {
             bytes.extend_from_slice(&chunk.unwrap());
