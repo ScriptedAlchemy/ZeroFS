@@ -19,7 +19,7 @@
 - No new framework or dependency unless existing mechanisms demonstrably cannot satisfy the contract.
 - All Mac artifacts stay under /Volumes/bigssd/projects. Linux worktrees stay under /fast/projects/ZeroFS-worktrees.
 - Run failing regression before implementation, then targeted green tests. No source-string tests. Capture command, exact result, and commit in each report.
-- Serialize expensive Linux builds using flock on /tmp/zerofs-audit-test.lock; use plain cargo, -j 2, and the existing warm target /fast/projects/ZeroFS-worktrees/http-upload-storage-pressure/zerofs/target. Do not kill unrelated build jobs or bypass toolchain wrappers.
+- Serialize expensive Linux builds using flock on /tmp/zerofs-audit-test.lock; use plain cargo, --features webui, -j 2, and each worktree's own zerofs/target directory. Do not share root-package fingerprints or test binaries between worktrees. Do not kill unrelated build jobs or bypass toolchain wrappers.
 
 ## Workstream boundaries
 
