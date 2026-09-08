@@ -15,6 +15,8 @@ mod rename;
 mod setattr;
 pub(crate) mod write;
 
+pub(crate) use rename::{VerifiedFileContent, VerifiedFileExpectation, VerifiedRenameOutcome};
+
 impl ZeroFS {
     /// Decode a cached result as the operation's expected variant.
     /// An incompatible operation ID reuse returns an error.
