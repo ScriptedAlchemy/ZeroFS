@@ -1753,6 +1753,7 @@ async fn complete_memory_multipart(
         )
         .await
 }
+
 async fn complete_multipart(
     store: WritebackObjectStore,
     location: Path,
@@ -1857,6 +1858,7 @@ async fn complete_multipart(
         )
         .await
 }
+
 async fn cleanup_failed_multipart<T>(
     store: &WritebackObjectStore,
     disk: SsdReservationToken,
@@ -4455,7 +4457,13 @@ mod tests {
             ssd.clone(),
             space.clone(),
         ));
-        tokio::task::yield_now().await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !state.lock().unwrap().cleanup_started {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("owned cleanup did not start");
         first.abort();
         let _ = first.await;
 
@@ -4477,6 +4485,81 @@ mod tests {
         second.await.unwrap().unwrap();
         assert_eq!(admission.used_bytes(), 0);
         assert!(state.lock().unwrap().parts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn owned_cleanup_publishes_failure_when_its_task_is_canceled() {
+        let state = Arc::new(StdMutex::new(MultipartState {
+            cleanup_started: true,
+            ..Default::default()
+        }));
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let completion = super::MultipartCleanupCompletion::new(state.clone(), notify.clone());
+        let task = tokio::spawn(async move {
+            let _completion = completion;
+            futures::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+        task.abort();
+        let _ = task.await;
+
+        let error = super::wait_for_multipart_cleanup(&state, &notify)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("canceled or panicked"));
+    }
+
+    #[tokio::test]
+    async fn later_abort_observes_error_from_canceled_rejection_waiter_cleanup() {
+        let state = Arc::new(StdMutex::new(MultipartState {
+            active: 1,
+            ..Default::default()
+        }));
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let temp = tempfile::tempdir().unwrap();
+        let staging = temp.path().join("multipart-staging");
+        std::fs::create_dir(&staging).unwrap();
+        std::fs::write(staging.join("unexpected-owner"), b"keep directory nonempty").unwrap();
+        let space = Arc::new(PhysicalSpaceSampler::new(temp.path().to_path_buf()));
+        let ssd = SsdAdmission::new(1024, 8, 95, 85, 0).unwrap();
+
+        let first = tokio::spawn(super::reject_multipart_part(
+            state.clone(),
+            notify.clone(),
+            Some(staging),
+            ssd.clone(),
+            space.clone(),
+        ));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !state.lock().unwrap().cleanup_started {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("owned cleanup did not start");
+        first.abort();
+        let _ = first.await;
+        let second = tokio::spawn(super::reject_multipart_part(
+            state.clone(),
+            notify.clone(),
+            None,
+            ssd,
+            space,
+        ));
+        state.lock().unwrap().active = 0;
+        notify.notify_waiters();
+
+        let error = second.await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("multipart cleanup failed"));
+        assert!(
+            state
+                .lock()
+                .unwrap()
+                .cleanup_result
+                .as_ref()
+                .unwrap()
+                .is_err()
+        );
     }
 
     #[tokio::test]

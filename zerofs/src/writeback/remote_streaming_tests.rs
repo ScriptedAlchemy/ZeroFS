@@ -630,6 +630,246 @@ async fn large_create_aborts_when_backend_ignores_conditional_multipart_capabili
 }
 
 #[tokio::test]
+async fn ignored_conditional_capability_is_terminal_without_advancing_worker_frontier() {
+    let temp = tempfile::tempdir().unwrap();
+    let journal = Arc::new(Journal::open(temp.path().join("journal"), identity()).unwrap());
+    let payload = vec![0x75; REMOTE_SINGLE_PUT_BYTES as usize + 1];
+    let record = crate::writeback::test_util::put_record(
+        1,
+        "worker-capability-required",
+        &payload,
+        MutationMode::Create,
+        FenceClass::ImmutableCreate,
+        0x2000,
+        1_786_435_200_000,
+    );
+    journal.commit_put(record, &payload).unwrap();
+    let store = Arc::new(RecordingMultipartStore {
+        inner: Arc::new(LocalFileSystem::new_with_prefix(temp.path()).unwrap()),
+        put_opts_calls: AtomicUsize::new(0),
+        multipart_calls: AtomicUsize::new(0),
+        part_sizes: Arc::new(Mutex::new(Vec::new())),
+    });
+    let remote: Arc<dyn ObjectStore> = store.clone();
+    let overlay = OverlayIndex::new(remote.clone());
+    let admission = Admission::new(64 * 1024 * 1024);
+    let space = Arc::new(PhysicalSpaceSampler::new(journal.root().to_path_buf()));
+    let sample = space.sample().await.unwrap();
+    let ssd = Arc::new(
+        SsdAdmission::recover(
+            64 * 1024 * 1024,
+            64,
+            95,
+            85,
+            0,
+            std::iter::empty(),
+            Some(sample),
+        )
+        .unwrap(),
+    );
+    let journaler = LocalJournaler::start_with_observer_and_space(
+        journal.clone(),
+        admission.clone(),
+        4,
+        1,
+        None,
+        space.clone(),
+    )
+    .unwrap();
+    let scheduler = RemoteScheduler::start(
+        remote,
+        journal,
+        overlay,
+        admission,
+        ssd,
+        space,
+        journaler.barrier(),
+        1,
+    )
+    .unwrap();
+
+    let error = tokio::time::timeout(Duration::from_secs(30), scheduler.barrier().wait_remote(1))
+        .await
+        .expect("ignored capability did not stop the remote worker")
+        .unwrap_err();
+    assert!(error.to_string().contains("permanent remote divergence"));
+    assert_eq!(scheduler.barrier().progress.sequence(), 0);
+    assert!(scheduler.shutdown().await.is_err());
+    assert_eq!(store.multipart_calls.load(Ordering::SeqCst), 1);
+    assert!(store.part_sizes.lock().unwrap().is_empty());
+    journaler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn large_update_fails_closed_before_multipart_initiation() {
+    let temp = tempfile::tempdir().unwrap();
+    let journal = Arc::new(Journal::open(temp.path().join("journal"), identity()).unwrap());
+    let payload = vec![0x73; REMOTE_SINGLE_PUT_BYTES as usize + 1];
+    let target = Path::from("large-update");
+    let predecessor = Bytes::from_static(b"persisted predecessor");
+    let store = Arc::new(RecordingMultipartStore {
+        inner: Arc::new(LocalFileSystem::new_with_prefix(temp.path()).unwrap()),
+        put_opts_calls: AtomicUsize::new(0),
+        multipart_calls: AtomicUsize::new(0),
+        part_sizes: Arc::new(Mutex::new(Vec::new())),
+    });
+    let predecessor_result = store
+        .put(&target, predecessor.clone().into())
+        .await
+        .unwrap();
+    let mut record = crate::writeback::test_util::put_record(
+        1,
+        target.as_ref(),
+        &payload,
+        MutationMode::Update,
+        FenceClass::Fence,
+        0x2000,
+        1_786_435_200_000,
+    );
+    record.remote_predecessor_etag = Some(
+        predecessor_result
+            .e_tag
+            .expect("local predecessor must expose an ETag"),
+    );
+    let record = journal.commit_put(record, &payload).unwrap();
+    let baseline_puts = store.put_opts_calls.load(Ordering::SeqCst);
+
+    let error = apply_record_with_tracked_cleanup(store.clone(), journal, record)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, object_store::Error::NotSupported { .. }));
+    assert!(is_terminal_remote_error(&error));
+    assert_eq!(store.multipart_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(store.put_opts_calls.load(Ordering::SeqCst), baseline_puts);
+    assert_eq!(
+        store
+            .inner
+            .get(&target)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap(),
+        predecessor
+    );
+}
+
+#[tokio::test]
+async fn already_applied_large_update_reconciles_before_unsupported_transfer_gate() {
+    let temp = tempfile::tempdir().unwrap();
+    let journal = Arc::new(Journal::open(temp.path().join("journal"), identity()).unwrap());
+    let payload = vec![0x76; REMOTE_SINGLE_PUT_BYTES as usize + 1];
+    let target = Path::from("already-applied-large-update");
+    let store = Arc::new(RecordingMultipartStore {
+        inner: Arc::new(LocalFileSystem::new_with_prefix(temp.path()).unwrap()),
+        put_opts_calls: AtomicUsize::new(0),
+        multipart_calls: AtomicUsize::new(0),
+        part_sizes: Arc::new(Mutex::new(Vec::new())),
+    });
+    store
+        .put(&target, Bytes::from(payload.clone()).into())
+        .await
+        .unwrap();
+    let baseline_puts = store.put_opts_calls.load(Ordering::SeqCst);
+    let mut record = crate::writeback::test_util::put_record(
+        1,
+        target.as_ref(),
+        &payload,
+        MutationMode::Update,
+        FenceClass::Fence,
+        0x2000,
+        1_786_435_200_000,
+    );
+    record.remote_predecessor_etag = Some("superseded-predecessor-etag".to_owned());
+    let record = journal.commit_put(record, &payload).unwrap();
+
+    apply_record_with_tracked_cleanup(store.clone(), journal, record)
+        .await
+        .unwrap();
+    assert_eq!(store.multipart_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(store.put_opts_calls.load(Ordering::SeqCst), baseline_puts);
+    assert_eq!(
+        store
+            .inner
+            .get(&target)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap(),
+        Bytes::from(payload)
+    );
+}
+
+#[tokio::test]
+async fn large_create_reconciles_identical_competing_completion() {
+    let temp = tempfile::tempdir().unwrap();
+    let journal = Arc::new(Journal::open(temp.path().join("journal"), identity()).unwrap());
+    let payload = vec![0x74; REMOTE_SINGLE_PUT_BYTES as usize + 1];
+    let target = Path::from("identical-completion-race");
+    let record = crate::writeback::test_util::put_record(
+        1,
+        target.as_ref(),
+        &payload,
+        MutationMode::Create,
+        FenceClass::ImmutableCreate,
+        0x2000,
+        1_786_435_200_000,
+    );
+    let record = journal.commit_put(record, &payload).unwrap();
+    let complete_entered = Arc::new(Notify::new());
+    let release_complete = Arc::new(Notify::new());
+    let store = Arc::new(ConditionalRaceStore {
+        inner: Arc::new(InMemory::new()),
+        complete_entered: complete_entered.clone(),
+        release_complete: release_complete.clone(),
+        part_calls: Arc::new(AtomicUsize::new(0)),
+        aborts: Arc::new(AtomicUsize::new(0)),
+    });
+    let mut applying = tokio::spawn(apply_record_with_tracked_cleanup(
+        store.clone(),
+        journal,
+        record,
+    ));
+    let publication = tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::select! {
+            () = complete_entered.notified() => None,
+            result = &mut applying => Some(result),
+        }
+    })
+    .await;
+    match publication {
+        Ok(None) => {}
+        Ok(Some(result)) => panic!("large replay ended before multipart publication: {result:?}"),
+        Err(error) => {
+            release_complete.notify_one();
+            applying.abort();
+            let _ = applying.await;
+            panic!("large replay never reached multipart publication: {error}");
+        }
+    }
+    store
+        .inner
+        .put(&target, Bytes::from(payload.clone()).into())
+        .await
+        .unwrap();
+    release_complete.notify_one();
+
+    applying.await.unwrap().unwrap();
+    assert_eq!(
+        store
+            .inner
+            .get(&target)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap(),
+        Bytes::from(payload)
+    );
+}
+
+#[tokio::test]
 async fn multipart_owner_cancellation_is_drained_by_the_tracked_cleanup_worker() {
     let cleanup_state = RemoteCleanupState::new();
     let mut failure_receiver = cleanup_state.failure.subscribe();
