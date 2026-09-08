@@ -26,6 +26,9 @@ pub(crate) mod volatile_overlay;
 pub(crate) mod request_cache;
 pub(crate) mod types;
 
+#[cfg(test)]
+mod lifecycle_tests;
+
 use crate::fs::ZeroFS;
 use crate::fs::mutation::types::MutationCutoff;
 

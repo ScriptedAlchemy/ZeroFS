@@ -24,7 +24,7 @@ use std::sync::Condvar;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::{mpsc, oneshot};
-use tokio::task::JoinHandle;
+use tokio_util::task::TaskTracker;
 
 pub(crate) type ApplyHook = Arc<
     dyn Fn(
@@ -49,18 +49,32 @@ enum LaneJob {
     },
 }
 
+struct LaneEntry {
+    generation: u64,
+    sender: mpsc::UnboundedSender<LaneJob>,
+}
+
+struct LaneRegistry {
+    closed: bool,
+    next_generation: u64,
+    entries: HashMap<u64, LaneEntry>,
+}
+
 struct MaterializerInner {
     incarnation: MutationIncarnation,
     progress: MutationProgress,
     fs: Weak<ZeroFS>,
     overlay: Weak<FilesystemVolatileOverlay>,
     apply_hook: Option<ApplyHook>,
-    lanes: Mutex<HashMap<u64, mpsc::UnboundedSender<LaneJob>>>,
+    lanes: Mutex<LaneRegistry>,
     hold_enqueue: Mutex<()>,
-    workers: Mutex<Vec<JoinHandle<()>>>,
-    closed: Mutex<bool>,
+    workers: TaskTracker,
     #[cfg(test)]
     hold_enqueue_interleave: HoldEnqueueInterleave,
+    #[cfg(test)]
+    idle_retirement_pause: Mutex<Option<IdleRetirementPause>>,
+    #[cfg(test)]
+    lane_jobs_enqueued: AtomicUsize,
 }
 
 #[cfg(test)]
@@ -69,6 +83,21 @@ struct HoldEnqueueInterleave {
     arrivals: AtomicUsize,
     second_attempted: Mutex<bool>,
     changed: Condvar,
+}
+
+#[cfg(test)]
+struct IdleRetirementPause {
+    inode: u64,
+    reached: oneshot::Sender<()>,
+    resume: oneshot::Receiver<()>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MaterializerLifecycleCensus {
+    pub(crate) lanes: usize,
+    pub(crate) worker_handles: usize,
+    pub(crate) active_workers: usize,
 }
 
 /// Owns per-inode worker loops that apply accepted batches in order.
@@ -101,10 +130,13 @@ impl Materializer {
                     .map(|overlay| Arc::downgrade(&overlay))
                     .unwrap_or_default(),
                 apply_hook,
-                lanes: Mutex::new(HashMap::new()),
+                lanes: Mutex::new(LaneRegistry {
+                    closed: false,
+                    next_generation: 1,
+                    entries: HashMap::new(),
+                }),
                 hold_enqueue: Mutex::new(()),
-                workers: Mutex::new(Vec::new()),
-                closed: Mutex::new(false),
+                workers: TaskTracker::new(),
                 #[cfg(test)]
                 hold_enqueue_interleave: HoldEnqueueInterleave {
                     enabled: AtomicBool::new(false),
@@ -112,6 +144,10 @@ impl Materializer {
                     second_attempted: Mutex::new(false),
                     changed: Condvar::new(),
                 },
+                #[cfg(test)]
+                idle_retirement_pause: Mutex::new(None),
+                #[cfg(test)]
+                lane_jobs_enqueued: AtomicUsize::new(0),
             }),
         })
     }
@@ -151,7 +187,7 @@ impl Materializer {
         if cutoff.mutation_incarnation != self.inner.incarnation {
             return Err(MutationError::StaleIncarnation);
         }
-        if *lock(&self.inner.closed) {
+        if lock(&self.inner.lanes).closed {
             return Err(MutationError::Closed);
         }
         self.inner.progress.check()?;
@@ -175,21 +211,18 @@ impl Materializer {
         if inodes.len() == 1 {
             let inode = *inodes.iter().next().expect("one inode");
             let (reply_tx, reply_rx) = oneshot::channel();
-            self.lane(inode)?
-                .send(LaneJob::Apply {
+            self.enqueue_lane(
+                inode,
+                LaneJob::Apply {
                     cutoff,
                     batch,
                     accepted_write,
                     reply: reply_tx,
-                })
-                .map_err(|_| self.poison("inode worker dropped"))?;
-            let result = reply_rx
+                },
+            )?;
+            return reply_rx
                 .await
                 .unwrap_or_else(|_| Err(self.poison("inode worker dropped")));
-            if result.is_ok() {
-                self.retire_inodes(&inodes);
-            }
-            return result;
         }
 
         let mut holds = Vec::with_capacity(inodes.len());
@@ -205,12 +238,13 @@ impl Materializer {
                 let is_first = holds.is_empty();
                 let (acquired_tx, acquired_rx) = oneshot::channel();
                 let (release_tx, release_rx) = oneshot::channel();
-                self.lane(*inode)?
-                    .send(LaneJob::Hold {
+                self.enqueue_lane(
+                    *inode,
+                    LaneJob::Hold {
                         acquired: acquired_tx,
                         release: release_rx,
-                    })
-                    .map_err(|_| self.poison("inode worker dropped"))?;
+                    },
+                )?;
                 holds.push((acquired_rx, release_tx));
                 #[cfg(test)]
                 if is_first && interleave_position == Some(0) {
@@ -232,49 +266,72 @@ impl Materializer {
         }
 
         let result = self.apply_caught(cutoff, batch, accepted_write).await;
+        if result.is_ok() {
+            // Attribute previews are part of the lane-owned visibility tail.
+            // Retire them before releasing any hold so a replacement lane
+            // generation cannot start while the prior preview is still live.
+            self.retire_inodes(&inodes);
+        }
         for (_, release) in holds {
             let _ = release.send(());
-        }
-        if result.is_ok() {
-            self.retire_inodes(&inodes);
         }
         result
     }
 
     pub(crate) async fn stop(&self) {
-        {
-            *lock(&self.inner.closed) = true;
-        }
         let senders = {
             let mut lanes = lock(&self.inner.lanes);
-            lanes.drain().map(|(_, sender)| sender).collect::<Vec<_>>()
+            lanes.closed = true;
+            lanes
+                .entries
+                .drain()
+                .map(|(_, lane)| lane.sender)
+                .collect::<Vec<_>>()
         };
         drop(senders);
-        let workers = {
-            let mut workers = lock(&self.inner.workers);
-            std::mem::take(&mut *workers)
-        };
-        for worker in workers {
-            let _ = worker.await;
-        }
+        self.inner.workers.close();
+        self.inner.workers.wait().await;
     }
 
-    fn lane(self: &Arc<Self>, inode: u64) -> Result<mpsc::UnboundedSender<LaneJob>, MutationError> {
+    fn enqueue_lane(self: &Arc<Self>, inode: u64, job: LaneJob) -> Result<(), MutationError> {
         let mut lanes = lock(&self.inner.lanes);
-        // Re-checked under the lanes lock: stop() drains this map after
-        // setting `closed`, so a dispatch that passed the earlier closed
-        // check must not repopulate it with a worker stop() never joins.
-        if *lock(&self.inner.closed) {
+        // TaskTracker::close() does not reject later spawns. This registry bit
+        // is therefore the admission authority, checked under the same lock
+        // that creates a lane and sends every job.
+        if lanes.closed {
             return Err(MutationError::Closed);
         }
-        if let Some(sender) = lanes.get(&inode) {
-            return Ok(sender.clone());
+        if !lanes.entries.contains_key(&inode) {
+            let generation = lanes.next_generation;
+            lanes.next_generation = lanes
+                .next_generation
+                .checked_add(1)
+                .ok_or_else(|| self.poison("materializer lane generation exhausted"))?;
+            let (sender, receiver) = mpsc::unbounded_channel();
+            lanes
+                .entries
+                .insert(inode, LaneEntry { generation, sender });
+            drop(self.inner.workers.spawn(spawn_lane(
+                Arc::clone(self),
+                inode,
+                generation,
+                receiver,
+            )));
         }
-        let (sender, receiver) = mpsc::unbounded_channel();
-        let worker = spawn_lane(Arc::clone(self), receiver);
-        lock(&self.inner.workers).push(worker);
-        lanes.insert(inode, sender.clone());
-        Ok(sender)
+        let send_result = lanes
+            .entries
+            .get(&inode)
+            .expect("lane inserted")
+            .sender
+            .send(job);
+        if send_result.is_err() {
+            lanes.entries.remove(&inode);
+            drop(lanes);
+            return Err(self.poison("inode worker dropped"));
+        }
+        #[cfg(test)]
+        self.inner.lane_jobs_enqueued.fetch_add(1, Ordering::AcqRel);
+        Ok(())
     }
 
     #[cfg(test)]
@@ -298,6 +355,53 @@ impl Materializer {
             interleave.changed.notify_all();
         }
         Some(position)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lifecycle_census_for_test(&self) -> MaterializerLifecycleCensus {
+        let lanes = lock(&self.inner.lanes).entries.len();
+        let workers = self.inner.workers.len();
+        MaterializerLifecycleCensus {
+            lanes,
+            worker_handles: workers,
+            active_workers: workers,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lane_jobs_enqueued_for_test(&self) -> usize {
+        self.inner.lane_jobs_enqueued.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_next_idle_retirement_for_test(
+        &self,
+        inode: u64,
+    ) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (reached_tx, reached_rx) = oneshot::channel();
+        let (resume_tx, resume_rx) = oneshot::channel();
+        *lock(&self.inner.idle_retirement_pause) = Some(IdleRetirementPause {
+            inode,
+            reached: reached_tx,
+            resume: resume_rx,
+        });
+        (reached_rx, resume_tx)
+    }
+
+    #[cfg(test)]
+    async fn pause_before_idle_retirement_for_test(&self, inode: u64) {
+        let pause = {
+            let mut pause = lock(&self.inner.idle_retirement_pause);
+            if pause.as_ref().is_some_and(|pause| pause.inode == inode) {
+                pause.take()
+            } else {
+                None
+            }
+        };
+        if let Some(pause) = pause {
+            let _ = pause.reached.send(());
+            let _ = pause.resume.await;
+        }
     }
 
     async fn apply_caught(
@@ -343,10 +447,14 @@ impl Materializer {
     }
 
     fn retire_inodes(&self, inodes: &BTreeSet<u64>) {
+        for inode in inodes {
+            self.retire_inode(*inode);
+        }
+    }
+
+    fn retire_inode(&self, inode: u64) {
         if let Some(overlay) = self.inner.overlay.upgrade() {
-            for inode in inodes {
-                overlay.retire_inode(*inode);
-            }
+            overlay.retire_inode(inode);
         }
     }
 
@@ -362,29 +470,71 @@ impl Materializer {
 
 fn spawn_lane(
     materializer: Arc<Materializer>,
+    inode: u64,
+    generation: u64,
     mut receiver: mpsc::UnboundedReceiver<LaneJob>,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        while let Some(job) = receiver.recv().await {
-            match job {
-                LaneJob::Apply {
-                    cutoff,
-                    batch,
-                    accepted_write,
-                    reply,
-                } => {
-                    let result = materializer
-                        .apply_caught(cutoff, batch, accepted_write)
-                        .await;
-                    let _ = reply.send(result);
-                }
-                LaneJob::Hold { acquired, release } => {
-                    let _ = acquired.send(());
-                    let _ = release.await;
-                }
+) -> impl Future<Output = ()> + Send + 'static {
+    async move {
+        let mut next = receiver.recv().await;
+        while let Some(job) = next {
+            run_lane_job(&materializer, inode, job).await;
+            #[cfg(test)]
+            if receiver.is_empty() {
+                materializer
+                    .pause_before_idle_retirement_for_test(inode)
+                    .await;
             }
+            next = next_lane_job_or_retire(&materializer, inode, generation, &mut receiver);
         }
-    })
+    }
+}
+
+async fn run_lane_job(materializer: &Materializer, inode: u64, job: LaneJob) {
+    match job {
+        LaneJob::Apply {
+            cutoff,
+            batch,
+            accepted_write,
+            reply,
+        } => {
+            let result = materializer
+                .apply_caught(cutoff, batch, accepted_write)
+                .await;
+            if result.is_ok() {
+                // Canonical apply, attribute-preview retirement, and the reply
+                // form one lane-owned completion. A new generation cannot be
+                // installed before this tail finishes.
+                materializer.retire_inode(inode);
+            }
+            let _ = reply.send(result);
+        }
+        LaneJob::Hold { acquired, release } => {
+            let _ = acquired.send(());
+            let _ = release.await;
+        }
+    }
+}
+
+fn next_lane_job_or_retire(
+    materializer: &Materializer,
+    inode: u64,
+    generation: u64,
+    receiver: &mut mpsc::UnboundedReceiver<LaneJob>,
+) -> Option<LaneJob> {
+    let mut lanes = lock(&materializer.inner.lanes);
+    match receiver.try_recv() {
+        Ok(job) => Some(job),
+        Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {
+            if lanes
+                .entries
+                .get(&inode)
+                .is_some_and(|lane| lane.generation == generation)
+            {
+                lanes.entries.remove(&inode);
+            }
+            None
+        }
+    }
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -1028,7 +1178,7 @@ mod tests {
             .unwrap();
         dispatched.await.unwrap().unwrap();
         assert!(
-            lock(&materializer.inner.workers).is_empty(),
+            materializer.inner.workers.is_empty(),
             "stop must take and join every worker handle"
         );
     }
