@@ -50,24 +50,24 @@ Consumes retained `RamMultipartPartReservation`, multipart part state and existi
 Produces controlled pre-commit rejection on unavailable incremental growth, with exact refund/abort accounting; ordinary drainable writes retain their existing waiting policy.
 
 - [x] Execute the A4/B4/A2/B2 schedule with shared capacity 8; both complete objects fit individually. Real RAM and SSD tests each failed at the original wait cycle; declared-length admission failed with zero bytes reserved instead of six. The first implementation's store suite passed 81 tests (two ignored, `cc-9891`), but cancellation/FIFO review followups remain before final acceptance.
-- [ ] Add nonblocking multipart growth admission rather than blocking behind reservations held by incomplete objects. Reject overload before commit, then use owned abort and a fresh logical upload attempt.
-- [ ] For trusted generated segments with a declared payload length, reserve the complete logical payload before acknowledging multipart support. Validate exact completion length. Unknown-length multipart parts use try-only admission without bypassing queued ordinary writes.
-- [ ] Verify failure does not strand active-part counters, retained payloads, FIFO waiters or reservations. Exercise cancellation and retry, including empty multipart completion.
-- [ ] Review the analogous SSD staging path for the same partial-ownership cycle. Do not move the deadlock from RAM to disk or silently weaken physical-space accounting.
-- [ ] Run multipart and ordinary writeback admission suites; review and commit.
+- [x] Add nonblocking multipart growth admission rather than blocking behind reservations held by incomplete objects. Reject overload before commit, then use owned abort and a fresh logical upload attempt.
+- [x] For trusted generated segments with a declared payload length, reserve the complete logical payload before acknowledging multipart support. Validate exact completion length. Unknown-length multipart parts use try-only admission without bypassing queued ordinary writes.
+- [x] Verify failure does not strand active-part counters, retained payloads, FIFO waiters or reservations. Exercise cancellation and retry, including empty multipart completion. Shared completion preserves cleanup errors and survives a cancelled caller; panic/cancellation cannot strand waiters.
+- [x] Review the analogous SSD staging path for the same partial-ownership cycle. Both RAM and SSD growth are nonblocking, FIFO-aware and terminal-state checked. Cleanup retains ownership until payload disposal, parent sync and fresh physical-space observation.
+- [x] Run multipart and ordinary writeback admission suites; reviewed commits `a20edb43`, `151f0188` and `b4f412de`. Final worker writeback suite: 337 passed, eight ignored (`cc-9995`); production check passed (`cc-9999`).
 
 ## Draft 07: conditional large-object replay
 
 Consumes persisted `MutationRecord` mode and the existing `ConditionalMultipartCreate` handshake. Generated-segment provenance remains separate from the backend's atomic-create capability.
 Produces the same Create/Update guarantee above and below the 36 MiB transfer threshold.
 
-- [ ] Pause large Create replay before publication, insert competing different bytes, resume, and assert those bytes survive and the losing record does not advance the remote frontier.
-- [ ] Cover small Create, changed Update ETag, and identical-content lost-reply reconciliation.
-- [ ] Choose conditional publication before initiating multipart. Request and require a genuine atomic Create capability for persisted Create records; no redundant generated-segment tag or provenance reconstruction is needed during replay.
-- [ ] Preserve large generic Create records such as compacted SSTs using SFTP's genuine atomic create capability. Keep the private capability request separate from generated-segment provenance; do not label ordinary SSTs as generated segments. Backends without atomic completion must fail closed and terminally, rather than retrying an unsupported contract forever.
-- [ ] Do not treat `ImmutableCreate` alone as segment provenance: it also covers WAL and compacted SST objects. Never disguise ordinary records as generated segments; reject unsupported conditional completions before sending parts.
-- [ ] Keep bounded streaming; no unbounded collection, extra HEAD-as-lock, or unconditional complete for a conditional mutation.
-- [ ] Run real recording/fault backend regressions and SFTP multipart capability tests; review and commit.
+- [x] Pause large Create replay before publication, insert competing different bytes, resume, and assert those bytes survive and the losing record does not advance the remote frontier. The real scheduler regression covers unsupported capability and a remote frontier remaining zero.
+- [x] Cover small Create, changed Update ETag, and identical-content lost-reply reconciliation. Preserve initial reconciliation for an already-applied large Update; only a transfer requiring unsupported conditional completion fails closed.
+- [x] Choose conditional publication before initiating multipart. Request and require a genuine atomic Create capability for persisted Create records; no redundant generated-segment tag or provenance reconstruction is needed during replay.
+- [x] Preserve large generic Create records such as compacted SSTs using SFTP's genuine atomic create capability. Keep the private capability request separate from generated-segment provenance; do not label ordinary SSTs as generated segments. Backends without atomic completion fail closed and terminally.
+- [x] Do not treat `ImmutableCreate` alone as segment provenance: it also covers WAL and compacted SST objects. Never disguise ordinary records as generated segments; reject unsupported conditional completions before sending parts.
+- [x] Keep bounded streaming; no unbounded collection, extra HEAD-as-lock, or unconditional complete for a conditional mutation.
+- [x] Run real recording/fault backend regressions and SFTP multipart capability tests; reviewed commits `416a3b61` and `151f0188`. Actual local OpenSSH SFTP capability test passed (`cc-9934`, one test, no skip); final writeback gate includes competing publication, changed ETag and identical-content reconciliation. Earlier zero-test filters and the superseded early-gate implementation are not completion receipts.
 
 ## Draft 12: prospective and anchored durable paths
 
@@ -79,7 +79,7 @@ Produces nonmutating prospective physical separation and anchored creation/openi
 - [x] Reproduce the Phase 1 behavioral failure against the tests-only commit, then restore the implementation and run GREEN. Implementation preceded observed RED: tests-only `6885110` ran seven tests, five passed and two failed; fixed `f3bdb5f` ran nine, all passed. Logs: `/var/tmp/zerofs-audit-path-{red,green}.log` on Ubuntu. Integrated as `00330430`; concurrent replacement protection below is still pending.
 - [x] Review a narrowly owned directory-handle API before bootstrap/journal edits. Preserve ancestry through base/namespace creation, lock/database opening, recovery, publication and cleanup; reuse `rustix` and redb's file-backed construction. Integrated as `47bafd04` (worker `9d7b45c2`), with portability followup `68f3a916`. Final Linux writeback prefix: 319 passed, eight ignored (`cc-9924`); Mac helper: seven passed (`cc-14`); Mac Journal: 74 passed, two ignored (`cc-16`). Multipart staging caller integration remains pending.
 - [x] Resolve the read-only redb opening boundary without weakening the first audit's mutation-free identity preflight. Exact-opened-file descriptor probes passed on Linux and macOS; no vendored patch, writable inspection fallback, or platform ban. Parent aliases are normalized before strict final-root traversal; nonregular files cannot block before type validation.
-- [ ] Race parent replacement and final-entry substitution; require anchored behavior or fail-closed nonmutation. Run normalization/bootstrap/journal identity tests; review and commit.
+- [x] Race parent replacement and final-entry substitution; require anchored behavior or fail-closed nonmutation. `1b85dc59` consumes the exact opened payload file; `b4f412de` keeps multipart creation, writes, verification and cleanup under retained directory/file descriptors. The nonempty root-replacement regression passed (`cc-9975`). Full Mac writeback: 338 passed, eight ignored (`cc-19`) after test-only physical-root corrections in `045bd2cc`; production traversal is unchanged.
 
 ## Draft 10: bounded idle execution lifecycle
 
