@@ -586,8 +586,8 @@ mod tests {
                 b"payload-a",
             )
             .unwrap();
-        let before = stopped_journal_files(&journal_path);
         drop(journal);
+        let before = stopped_journal_files(&journal_path);
 
         let mut bucket = identity.clone();
         bucket.bucket_id = "config-b".to_owned();
@@ -742,8 +742,8 @@ mod tests {
             )
             .unwrap();
         journal.mark_remote(1, None).unwrap();
-        let reseed_before = stopped_journal_files(&reseed_journal_path);
         drop(journal);
+        let reseed_before = stopped_journal_files(&reseed_journal_path);
         let error = reseed_writeback_predecessor(
             config_b.clone(),
             reseed_journal_path.clone(),
@@ -793,8 +793,8 @@ mod tests {
         journal
             .commit_put(recovery_put(1, &manifest_path, local), local)
             .unwrap();
-        let accept_before = stopped_journal_files(&accept_journal_path);
         drop(journal);
+        let accept_before = stopped_journal_files(&accept_journal_path);
         let error = accept_remote_writeback_branch(
             config_b,
             accept_journal_path.clone(),
