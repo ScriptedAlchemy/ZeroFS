@@ -105,9 +105,9 @@
 - [x] Review each full commit range for spec compliance and code quality; no mock-only race proof.
 - [x] Merge reviewed commits into the main develop tree without absorbing unrelated changes.
 - [x] Run full WebUI-enabled Rust library suite, ninep-client/transfer suites, formatting on touched files, and 179-test Proxmox suite. Record pre-existing failures separately.
-- [ ] Build the real production artifact only after all six findings are closed.
-- [ ] Production deployment remains subject to existing remote-drain, client quiescence, exact config/resource/namespace, rollback and live data-path verification gates; never bypass drain to finish faster.
-- [ ] Recheck all 1090 uploaded source paths/sizes, remote writeback, physical cache capacity and restoration of original host reserved blocks 46841676 after sustainable cache resizing.
+- [x] Build the real production artifact after the first six and the subsequent seven findings are closed.
+- [x] Deploy through existing remote-drain, client quiescence, exact config/resource/namespace and rollback gates; verify the live data path. Final release details are in the second-pass plan.
+- [x] Recheck all 1090 uploaded source paths/sizes, drained remote writeback, physical cache capacity and unchanged original host reserved blocks 46841676 after sustainable cache resizing.
 
 ## Implementation receipts
 
@@ -130,4 +130,4 @@ Combined verification at 34099ff6 used the reconciled canonical Linux checkout a
 - `cargo fmt --all --check` and `git diff --check`: passed.
 - `python3 -m unittest discover -s proxmox/tests`: 179 passed (25.907 seconds).
 
-The maintained production WebUI build passed. Production release activation and physical client installation remain separate gates; the test results do not claim either occurred. Existing npm dependency audit advisories were not changed by this bounded correctness fix.
+These were the first-pass receipts. The combined 13-finding release is now deployed and verified; see [the final second-pass receipt](2026-09-07-audit-second-pass.md#final-verification-and-production-receipt--2026-09-08). The Mac CLI is updated. Physical iOS installation remains a separate blocked gate; it is not claimed complete. Existing npm dependency audit advisories were not changed by this bounded correctness fix.

@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- Production CT198 remains unchanged. No deployment until the additional P1 repairs and relevant integration gates pass; no journal resets or recovery shortcuts.
+- Production CT198 was held unchanged until the additional P1 repairs and integration gates passed. The verified deployment is recorded below; no journal resets or recovery shortcuts were used.
 - Sol/Terra workers implement; primary agent reads, reviews, plans and integrates.
 - Preserve the first six fixes, ordinary POSIX and 9P semantics, NBD raw-byte ownership, configured resource budgets, and all original audiobook data.
 - No new framework, broad dependency upgrade, minimum-limit workaround, ambiguous-write replay, or fabricated durability result.
@@ -102,16 +102,33 @@ Produces an executed receipt tied to the actual process incarnation and persiste
 - [x] Keep cheap plan/schema validation separate from runtime acceptance. A planned receipt or missing collector cannot satisfy the runtime gate. Implemented in `fbd9d670` (worker `4c67f5dd`); real mounted acceptance remains pending below.
 - [x] Extend existing benchmark authority explicitly for one isolated loopback NBD endpoint and the exact provisioned export. Reuse authority-only TLS with an explicit per-run trusted CA; never emit fabricated plaintext authority. The owned bootstrap/runtime units use the harness UID and an exact materialized configuration, not ambient systemd environment interpolation.
 - [x] Add bounded loopback HTTPS sampling reusing existing parsers. Reject missing/malformed identities, invalid or regressing frontiers, terminal state and mismatched filesystem/export. Linux Python gate: 136 passed. Independent Mac execution exposed one unnormalized temporary-path expectation; test-only followup `c84686bb` corrected it. Root rerun on Mac: 136 passed in 4.431 seconds.
-- [ ] Capture accepted progress after actual write/barrier, wait for that exact local durability frontier, unmount and detach NBD, then sample and cover the final accepted cutoff before SIGKILL. Retain the same journal, require a new server instance and unchanged filesystem/export, then compare a stored pre-restart checksum after remount.
-- [ ] Preserve ledger-owned resource teardown. Failed commands, stale metrics, checksum mismatch or incomplete cleanup must produce a failed receipt.
-- [ ] Run deterministic Python/config tests and targeted actionlint. Record the four existing non-tiered ShellCheck findings separately; leave other plan-only jobs untouched.
-- [ ] Before any mounted run, independently verify disposable loopback service/ports, unattached NBD device, UUID paths and cleanup boundaries. Never point the harness at CT198 or production mounts.
-- [ ] Execute the real XFS scenario and repeated cleanup/assert-clean, retain receipt, review and commit.
+- [x] Capture accepted progress after actual write/barrier, cover the final accepted cutoff after unmount/detach, then SIGKILL and restart with the same journal. The final-artifact run `47334270-c0a2-49f9-ac1e-7e8cc91ce83f` observed accepted/local/remote `66/66/54` before kill and `80/80/80` after restart, a new process identity, the same filesystem/export, and matching checksums. Remote coverage is an observation at sampling time, not a claim it could not advance before kill.
+- [x] Preserve ledger-owned resource teardown. Failed commands, stale metrics, checksum mismatch or incomplete cleanup produce failed receipts. Final repeated cleanup and all 18 live resource checks passed.
+- [x] Run deterministic Python/config tests and targeted actionlint. Final Python: 140 passed on Linux and Mac (Mac uses `TMPDIR=/Volumes/bigssd` for bounded socket-path fixtures). The four existing non-tiered ShellCheck findings remain recorded; other plan-only jobs are unchanged.
+- [x] Independently verify disposable loopback service/ports, unattached NBD device, UUID paths and cleanup boundaries. Tests never used CT198 or production mounts.
+- [x] Execute the real XFS scenario and retain receipts. Actual execution exposed an overlong bootstrap socket; `9c03a7f0` shortens it, validates the encoded Linux pathname bound and waits for readiness. The final run executed 28 steps, not a planned-only receipt.
 
 ## Combined completion gates
 
-- [ ] Integrate reviewed commits without absorbing unrelated dirty work.
-- [ ] Run full WebUI-enabled library, client, formatting/clippy and applicable Python/workflow gates; record ignored and environment-dependent gates literally.
-- [ ] Refresh dependent shipped artifacts only where affected, preserving app data and old CLI backup. iOS install remains blocked on keychain authorization and device availability.
-- [ ] Rebuild the production release from final reviewed source; then use the existing drain/quiesce/rollback lifecycle, never the cancelled earlier candidate.
-- [ ] Verify live upload/readback, remote writeback zero, exact settings/resources and the 1,090-file inventory before reporting deployment success.
+- [x] Integrate reviewed commits without absorbing unrelated dirty work.
+- [x] Run full WebUI-enabled library, client, formatting/clippy and applicable Python/workflow gates; results and exceptions are below.
+- [x] Refresh the Mac CLI from final Rust source, preserving the previous binary. The companion library and unsigned iOS build contain the replay fix; physical iOS installation remains blocked on signing authorization/device availability and is not claimed complete.
+- [x] Rebuild the production release from reviewed source and use the existing drain/quiesce/rollback lifecycle. The first deploy invocation stopped before activation when the Cargo shim backgrounded its build with exit 75. After that broker build succeeded, a private source/hash-checked adapter supplied its artifact through the build seam; all maintained deployment locks, drain, staging, VM transition and rollback/finalize logic remained intact.
+- [x] Verify live upload/readback, remote writeback zero, exact settings/resources and the 1,090-file inventory.
+
+## Final verification and production receipt — 2026-09-08
+
+- Full Linux library at `284966c6`: **1,998 passed, zero failed, 19 ignored** (`cc-10028`). Subsequent source changes are the four Python harness/test files in `9c03a7f0`, not Rust changes.
+- Fresh generated-WASM reconnect smoke: **one passed** (`cc-10035`). Client tests: **71 + 2**, plus one documentation test. Mac writeback: **338 passed, eight ignored**. Proxmox helper suite: **179 passed** on Linux.
+- Formatting and diff checks passed. Strict Clippy retains two pre-existing diagnostics (`cli/server.rs` explicit counter and `ninep/server/session.rs` argument count); no audit-owned diagnostics remain. The existing npm audit reports 12 advisories; this scoped correctness repair did not change dependencies.
+- Maintained production build `cc-10071`: successful, zero compiler warnings. Exact artifact was then tested in the mounted XFS scenario before deployment.
+- CT198 release: `9c03a7f055c0-195edd6e4e113de1`; commit `9c03a7f055c0bf6cc13eca19ca28860807ff3bfa`.
+- Running executable SHA-256: `d4284bb1c186a7dc44dae791d916d88b08147b3c9f16cf32ceb83ee436092bc9`, independently read from `/proc/1249101/exe` and matching the host deployment receipt. Service active, restart count zero; deployment transaction finalized.
+- Live HTTP canary rejected an intentionally wrong digest, published the correct 37-byte payload, verified exact 9P readback and durably removed its own test files. The corresponding verification warning is expected. No other application WARN/ERROR lines were found after readiness in the checked interval.
+- Post-canary accepted/local/remote frontiers matched at `1745546`; dirty RAM/SSD and terminal state were zero. Both the Mac and VM100 NFS mounts were restored to `10.10.10.55:/`.
+- All **1,090** source audiobook paths/sizes match `/Drop` (**561,522,034,236 bytes**); all **1,174** files in the pre-deploy `/Drop` inventory are unchanged. This is path/size continuity, not a new full-content rehash of every audiobook. Originals were preserved.
+- Clean-cache cap is **750 GB**, memory cache **32 GB**; writeback is separately **500 GB SSD / 4 GB RAM**, with **32 GB** minimum free space. Startup reclaimed **249,116,561,408 allocated bytes** from 3,726 surplus disposable cache partitions. Journals and originals were not deleted. Host reserved blocks remain **46,841,676 × 4,096 bytes**.
+- CT resources remain eight cores, 92,160 MiB RAM, zero swap, 32 GB root disk and the same private address/bridge. No unrelated guest changes were made.
+- Mac CLI `284966c6` installed SHA-256: `430f42e215c201ccff4cfb7182f27cb4fb2aeb10583707b26c217230304fe5c2`; arm64, code signature/help verified, previous binary retained.
+
+Detailed local receipts are in `.superpowers/sdd/2026-09-07-audit-boundaries/artifacts/xfs-runtime-final-artifact/` and `final-cli-refresh-284966c6/`. Production operator logs remain under `/fast/zerofs-audit-receipts/`; the durable host receipt is `/var/lib/zerofs-lxc/prod-198/receipts/9c03a7f055c0-195edd6e4e113de1`.
