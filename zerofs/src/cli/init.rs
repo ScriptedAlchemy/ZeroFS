@@ -269,18 +269,12 @@ impl StartupContext {
                 }
             })? {
                 Some(writeback_settings) => {
-                    let storage_url = url::Url::parse(&settings.storage.url)
-                        .context("[storage] url is not valid for writeback identity")?;
-                    let backend_kind = storage_url.scheme().to_owned();
-                    let backend_endpoint = canonical_backend_endpoint(settings, &storage_url)?;
-                    let identity = crate::writeback::model::JournalIdentity {
-                        format_version: 1,
-                        bucket_id: bucket.id().to_string(),
-                        backend_endpoint,
-                        database_prefix: actual_db_path.clone(),
-                        backend_kind,
-                        encryption_key_identity_sha256: Sha256::digest(encryption_key).into(),
-                    };
+                    let identity = writeback_journal_identity(
+                        settings,
+                        &bucket,
+                        &actual_db_path,
+                        &encryption_key,
+                    )?;
                     let attached = crate::writeback::bootstrap::attach(
                         retried_remote,
                         writeback_settings,
@@ -1297,6 +1291,42 @@ pub async fn initialize_filesystem(
             .await
         }
     }
+}
+
+pub(crate) async fn load_existing_writeback_identity(
+    settings: &Settings,
+    object_store: &Arc<dyn object_store::ObjectStore>,
+    database_prefix: &str,
+) -> Result<crate::writeback::model::JournalIdentity> {
+    let bucket = bucket_identity::BucketIdentity::load(object_store, database_prefix)
+        .await
+        .context("failed to load existing bucket identity for writeback recovery")?;
+    let encryption_key = key_management::load_existing_encryption_key(
+        object_store,
+        &Path::from(database_prefix),
+        &settings.storage.encryption_password,
+    )
+    .await
+    .context("failed to load existing encryption key for writeback recovery")?;
+    writeback_journal_identity(settings, &bucket, database_prefix, &encryption_key)
+}
+
+fn writeback_journal_identity(
+    settings: &Settings,
+    bucket: &bucket_identity::BucketIdentity,
+    database_prefix: &str,
+    encryption_key: &[u8; 32],
+) -> Result<crate::writeback::model::JournalIdentity> {
+    let storage_url = url::Url::parse(&settings.storage.url)
+        .context("[storage] url is not valid for writeback identity")?;
+    Ok(crate::writeback::model::JournalIdentity {
+        format_version: 1,
+        bucket_id: bucket.id().to_string(),
+        backend_endpoint: canonical_backend_endpoint(settings, &storage_url)?,
+        database_prefix: database_prefix.to_owned(),
+        backend_kind: storage_url.scheme().to_owned(),
+        encryption_key_identity_sha256: Sha256::digest(encryption_key).into(),
+    })
 }
 
 fn canonical_backend_endpoint(settings: &Settings, url: &url::Url) -> Result<String> {

@@ -131,7 +131,9 @@ use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use fs4::fs_std::FileExt;
 use futures::{StreamExt, stream, stream::BoxStream};
-use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{
+    Database, Durability, ReadOnlyDatabase, ReadableDatabase, ReadableTable, TableDefinition,
+};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -428,16 +430,46 @@ pub struct PendingWindow {
 impl Journal {
     pub(crate) fn open_existing(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
+        let identity = Self::read_existing_identity(&root)?;
+        Self::open(root, identity)
+    }
+
+    /// Open a stopped journal only after its persisted identity matches the
+    /// configured remote identity. The preliminary read is deliberately
+    /// mutation-free: `open` may normalize or recover journal state.
+    pub(crate) fn open_existing_with_identity(
+        root: impl AsRef<Path>,
+        expected_identity: JournalIdentity,
+    ) -> Result<Self> {
+        let root = root.as_ref().to_path_buf();
+        let actual_identity = Self::read_existing_identity(&root)?;
+        if actual_identity != expected_identity {
+            bail!("writeback journal identity mismatch");
+        }
+        Self::open(root, expected_identity)
+    }
+
+    fn read_existing_identity(root: &Path) -> Result<JournalIdentity> {
         let database_path = root.join("journal.redb");
+        reject_symlink_if_present(&database_path, "journal database")?;
         if !database_path.is_file() {
             bail!(
                 "writeback journal database does not exist at {}",
                 database_path.display()
             );
         }
-        let database = Database::create(&database_path).with_context(|| {
+        let metadata =
+            fs::metadata(&database_path).context("failed to inspect journal database")?;
+        if !metadata.is_file() {
+            bail!(
+                "journal database {} is not a regular file",
+                database_path.display()
+            );
+        }
+        validate_owner_only(&database_path, &metadata, 0o600)?;
+        let database = ReadOnlyDatabase::open(&database_path).with_context(|| {
             format!(
-                "failed to open existing journal database {}",
+                "failed to open existing journal database read-only {}",
                 database_path.display()
             )
         })?;
@@ -447,11 +479,7 @@ impl Journal {
         let meta = read
             .open_table(META)
             .context("failed to open existing journal metadata")?;
-        let identity = read_required::<JournalIdentity>(&meta, IDENTITY_KEY)?;
-        drop(meta);
-        drop(read);
-        drop(database);
-        Self::open(root, identity)
+        read_required::<JournalIdentity>(&meta, IDENTITY_KEY)
     }
 
     pub(crate) fn open(root: impl AsRef<Path>, expected_identity: JournalIdentity) -> Result<Self> {

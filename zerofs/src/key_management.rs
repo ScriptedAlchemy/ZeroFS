@@ -206,6 +206,18 @@ pub async fn save_wrapped_key_to_object_store(
     Ok(())
 }
 
+/// Load the existing encryption key without initializing remote state.
+pub(crate) async fn load_existing_encryption_key(
+    object_store: &Arc<dyn ObjectStore>,
+    db_path: &Path,
+    password: &str,
+) -> Result<[u8; 32]> {
+    let wrapped_key = load_wrapped_key_from_object_store(object_store, db_path)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("missing existing encryption key at {db_path}"))?;
+    unwrap_key_blocking(password, wrapped_key).await
+}
+
 /// Load or initialize encryption key from object store.
 ///
 /// This loads the wrapped encryption key from the object store and unwraps it

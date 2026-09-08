@@ -262,7 +262,7 @@ pub async fn reseed_writeback_predecessor(
     let crate::parse_object_store::ParsedStore {
         store: remote,
         sftp_pool,
-        ..
+        path: database_path,
     } = parse_url_opts(
         &settings.storage.url.parse()?,
         env_vars,
@@ -272,6 +272,22 @@ pub async fn reseed_writeback_predecessor(
     let remote = with_storage_class(Arc::from(remote), settings.storage.storage_class.as_deref());
     let location = Path::parse(&path).context("invalid remote predecessor path")?;
     let result: Result<()> = async {
+        let expected_identity = crate::cli::init::load_existing_writeback_identity(
+            &settings,
+            &remote,
+            &database_path.to_string(),
+        )
+        .await?;
+        let journal = crate::writeback::journal::Journal::open_existing_with_identity(
+            &journal_path,
+            expected_identity,
+        )
+        .with_context(|| {
+            format!(
+                "failed to open stopped writeback journal {}",
+                journal_path.display()
+            )
+        })?;
         let metadata = remote
             .head(&location)
             .await
@@ -279,13 +295,6 @@ pub async fn reseed_writeback_predecessor(
         let e_tag = metadata
             .e_tag
             .context("remote predecessor has no ETag and cannot be safely reseeded")?;
-        let journal = crate::writeback::journal::Journal::open_existing(&journal_path)
-            .with_context(|| {
-                format!(
-                    "failed to open stopped writeback journal {}",
-                    journal_path.display()
-                )
-            })?;
         journal.seed_remote_object_etag(&path, sequence, &e_tag)?;
         println!(
             "seeded_remote_predecessor path={} sequence={} etag={}",
@@ -337,7 +346,7 @@ pub async fn accept_remote_writeback_branch(
     let crate::parse_object_store::ParsedStore {
         store: remote,
         sftp_pool,
-        ..
+        path: database_path,
     } = parse_url_opts(
         &settings.storage.url.parse()?,
         env_vars,
@@ -347,6 +356,17 @@ pub async fn accept_remote_writeback_branch(
     let remote = with_storage_class(Arc::from(remote), settings.storage.storage_class.as_deref());
     let location = Path::parse(&manifest_path).context("invalid divergent manifest path")?;
     let result: Result<()> = async {
+        let expected_identity = crate::cli::init::load_existing_writeback_identity(
+            &settings,
+            &remote,
+            &database_path.to_string(),
+        )
+        .await?;
+        let journal = crate::writeback::journal::Journal::open_existing_with_identity(
+            &journal_path,
+            expected_identity,
+        )
+        .with_context(|| format!("failed to open stopped writeback journal {}", journal_path.display()))?;
         let remote_payload = remote
             .get(&location)
             .await
@@ -362,13 +382,6 @@ pub async fn accept_remote_writeback_branch(
                 hex_sha256(actual_remote_sha256)
             );
         }
-        let journal = crate::writeback::journal::Journal::open_existing(&journal_path)
-            .with_context(|| {
-                format!(
-                    "failed to open stopped writeback journal {}",
-                    journal_path.display()
-                )
-            })?;
         let abandoned = journal.abandon_divergent_maintenance_tail(
             expected_remote_sequence,
             expected_local_sequence,
@@ -408,6 +421,19 @@ fn hex_sha256(digest: [u8; 32]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bucket_identity::BucketIdentity;
+    use crate::config::Settings;
+    use crate::key_management;
+    use crate::writeback::config::{AckMode, ShutdownFlush, WritebackConfig};
+    use crate::writeback::journal::Journal;
+    use crate::writeback::model::{
+        FenceClass, JournalIdentity, LocalEtag, MutationKind, MutationMode, MutationRecord,
+    };
+    use object_store::ObjectStore;
+    use object_store::ObjectStoreExt;
+    use std::fs;
+    use tempfile::TempDir;
+    use uuid::Uuid;
 
     // Every key kind the filesystem writes must classify under its KeyPrefix
     // and decode its id payload; keys are built via KeyCodec so this breaks
@@ -482,5 +508,328 @@ mod tests {
         let (prefix, detail) = describe_key(&codec, truncated).unwrap();
         assert_eq!(prefix, KeyPrefix::Inode);
         assert!(detail.starts_with("raw="));
+    }
+
+    fn recovery_identity() -> JournalIdentity {
+        JournalIdentity {
+            format_version: 1,
+            bucket_id: "journal-a".to_owned(),
+            backend_endpoint: "sftp://operator@storage-a:22".to_owned(),
+            database_prefix: "zerofs/a".to_owned(),
+            backend_kind: "sftp".to_owned(),
+            encryption_key_identity_sha256: [0xa5; 32],
+        }
+    }
+
+    fn recovery_put(sequence: u64, path: &str, payload: &[u8]) -> MutationRecord {
+        MutationRecord {
+            format_version: 1,
+            sequence,
+            operation_id: Uuid::from_u128(0x51_0000 + sequence as u128),
+            path: path.to_owned(),
+            kind: MutationKind::Put {
+                mode: MutationMode::Create,
+                expected_visible_version: None,
+                payload_len: payload.len() as u64,
+                payload_sha256: Sha256::digest(payload).into(),
+                blob_path: String::new(),
+            },
+            local_etag: LocalEtag::new(Uuid::nil(), sequence),
+            accepted_at_unix_ms: 1_786_435_200_000 + sequence,
+            remote_predecessor_etag: None,
+            remote_result_etag: None,
+            fence: FenceClass::Fence,
+            retry_count: 0,
+            last_error: None,
+        }
+    }
+
+    fn stopped_journal_files(root: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+        fn collect(
+            root: &std::path::Path,
+            current: &std::path::Path,
+            files: &mut Vec<(std::path::PathBuf, Vec<u8>)>,
+        ) {
+            for entry in fs::read_dir(current).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                if path.is_dir() {
+                    collect(root, &path, files);
+                } else if path.is_file() {
+                    files.push((
+                        path.strip_prefix(root).unwrap().to_path_buf(),
+                        fs::read(path).unwrap(),
+                    ));
+                }
+            }
+        }
+
+        let mut files = Vec::new();
+        collect(root, root, &mut files);
+        files.sort_by(|left, right| left.0.cmp(&right.0));
+        files
+    }
+
+    #[test]
+    fn checked_existing_open_rejects_each_config_identity_field_without_journal_mutation() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal_path = temp.path().join("relocated-offline-journal");
+        let identity = recovery_identity();
+        let journal = Journal::open(&journal_path, identity.clone()).unwrap();
+        journal
+            .commit_put(
+                recovery_put(
+                    1,
+                    "zerofs/a/manifest/00000000000000000001.manifest",
+                    b"payload-a",
+                ),
+                b"payload-a",
+            )
+            .unwrap();
+        drop(journal);
+        let before = stopped_journal_files(&journal_path);
+
+        let mut bucket = identity.clone();
+        bucket.bucket_id = "config-b".to_owned();
+        let mut endpoint = identity.clone();
+        endpoint.backend_endpoint = "sftp://operator@storage-b:22".to_owned();
+        let mut prefix = identity.clone();
+        prefix.database_prefix = "zerofs/b".to_owned();
+        let mut kind = identity.clone();
+        kind.backend_kind = "s3".to_owned();
+        let mut key = identity.clone();
+        key.encryption_key_identity_sha256 = [0xb6; 32];
+        let mut version = identity.clone();
+        version.format_version = 2;
+
+        for (field, config_identity) in [
+            ("bucket", bucket),
+            ("endpoint", endpoint),
+            ("prefix", prefix),
+            ("backend kind", kind),
+            ("encryption key", key),
+            ("format version", version),
+        ] {
+            let error = Journal::open_existing_with_identity(&journal_path, config_identity)
+                .expect_err("config B must not open journal A");
+            assert!(
+                format!("{error:#}").contains("identity mismatch"),
+                "{field}: {error:#}"
+            );
+            assert_eq!(
+                stopped_journal_files(&journal_path),
+                before,
+                "{field} changed journal state"
+            );
+        }
+    }
+
+    #[test]
+    fn checked_existing_open_never_initializes_missing_journal_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing-journal");
+        let error =
+            Journal::open_existing_with_identity(&missing, recovery_identity()).unwrap_err();
+        assert!(format!("{error:#}").contains("database does not exist"));
+        assert!(!missing.exists(), "missing journal must not be initialized");
+
+        let missing_identity = temp.path().join("missing-identity");
+        fs::create_dir(&missing_identity).unwrap();
+        let database_path = missing_identity.join("journal.redb");
+        drop(redb::Database::create(&database_path).unwrap());
+        #[cfg(unix)]
+        fs::set_permissions(
+            &database_path,
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
+        )
+        .unwrap();
+        let error = Journal::open_existing_with_identity(&missing_identity, recovery_identity())
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("journal metadata"));
+        assert!(!missing_identity.join("LOCK").exists());
+        assert!(!missing_identity.join("blobs").exists());
+        assert!(!missing_identity.join("tmp").exists());
+    }
+
+    async fn recovery_config(
+        temp: &TempDir,
+        namespace: &str,
+        password: &str,
+    ) -> (PathBuf, Arc<dyn ObjectStore>, String, JournalIdentity) {
+        let mut settings = Settings::generate_default();
+        settings.aws = None;
+        settings.cache.dir = temp.path().join(format!("cache-{namespace}"));
+        settings.cache.disk_size_gb = 0.01;
+        settings.cache.memory_size_gb = Some(0.01);
+        settings.storage.url = format!(
+            "file://{}",
+            temp.path().join("remote").join(namespace).display()
+        );
+        settings.storage.encryption_password = password.to_owned();
+        settings.writeback = Some(WritebackConfig {
+            enabled: true,
+            dir: temp
+                .path()
+                .join(format!("configured-writeback-{namespace}")),
+            ack_mode: AckMode::Memory,
+            memory_size_gb: 0.01,
+            disk_size_gb: 0.02,
+            min_free_gb: 0.001,
+            high_watermark_percent: 95,
+            resume_percent: 85,
+            upload_concurrency: Some(2),
+            local_concurrency: 2,
+            shutdown_flush: ShutdownFlush::Local,
+        });
+        settings.validate().unwrap();
+        let crate::parse_object_store::ParsedStore {
+            store,
+            path,
+            sftp_pool,
+        } = parse_url_opts(
+            &settings.storage.url.parse().unwrap(),
+            settings.cloud_provider_env_vars(),
+            settings.sftp.as_ref(),
+        )
+        .await
+        .unwrap();
+        assert!(sftp_pool.is_none());
+        let remote =
+            with_storage_class(Arc::from(store), settings.storage.storage_class.as_deref());
+        let prefix = path.to_string();
+        BucketIdentity::get_or_create(&remote, &prefix)
+            .await
+            .unwrap();
+        key_management::load_or_init_encryption_key(
+            &remote,
+            &Path::from(prefix.clone()),
+            password,
+            false,
+        )
+        .await
+        .unwrap();
+        let identity =
+            crate::cli::init::load_existing_writeback_identity(&settings, &remote, &prefix)
+                .await
+                .unwrap();
+        let config = temp.path().join(format!("config-{namespace}.toml"));
+        fs::write(&config, toml::to_string(&settings).unwrap()).unwrap();
+        (config, remote, prefix, identity)
+    }
+
+    #[tokio::test]
+    async fn recovery_commands_reject_config_b_before_mutating_journal_a() {
+        let temp = tempfile::tempdir().unwrap();
+        let (config_a, remote_a, prefix_a, identity_a) =
+            recovery_config(&temp, "a", "a-password").await;
+        let (config_b, remote_b, _prefix_b, _identity_b) =
+            recovery_config(&temp, "b", "b-password").await;
+
+        let reseed_journal_path = temp.path().join("relocated-reseed-journal");
+        let predecessor = format!("{prefix_a}/recovery/predecessor");
+        remote_b
+            .put(
+                &Path::from(predecessor.as_str()),
+                (&b"remote predecessor"[..]).into(),
+            )
+            .await
+            .unwrap();
+        let journal = Journal::open(&reseed_journal_path, identity_a.clone()).unwrap();
+        journal
+            .commit_put(
+                recovery_put(1, &predecessor, b"local predecessor"),
+                b"local predecessor",
+            )
+            .unwrap();
+        journal.mark_remote(1, None).unwrap();
+        drop(journal);
+        let reseed_before = stopped_journal_files(&reseed_journal_path);
+        let error = reseed_writeback_predecessor(
+            config_b.clone(),
+            reseed_journal_path.clone(),
+            predecessor.clone(),
+            1,
+        )
+        .await
+        .expect_err("config B must not seed journal A");
+        assert!(format!("{error:#}").contains("identity mismatch"));
+        assert_eq!(stopped_journal_files(&reseed_journal_path), reseed_before);
+        remote_a
+            .put(
+                &Path::from(predecessor.as_str()),
+                (&b"remote predecessor"[..]).into(),
+            )
+            .await
+            .unwrap();
+        reseed_writeback_predecessor(
+            config_a.clone(),
+            reseed_journal_path.clone(),
+            predecessor.clone(),
+            1,
+        )
+        .await
+        .expect("matching config must accept relocated offline journal");
+        let journal = Journal::open_existing(&reseed_journal_path).unwrap();
+        assert!(
+            journal
+                .remote_object_etag(&predecessor, 1)
+                .unwrap()
+                .is_some()
+        );
+        drop(journal);
+
+        let accept_journal_path = temp.path().join("relocated-accept-journal");
+        let manifest_path = format!("{prefix_a}/manifest/00000000000000000007.manifest");
+        let local = b"local manifest";
+        let remote = b"remote manifest";
+        remote_b
+            .put(
+                &Path::from(manifest_path.as_str()),
+                remote.as_slice().into(),
+            )
+            .await
+            .unwrap();
+        let journal = Journal::open(&accept_journal_path, identity_a).unwrap();
+        journal
+            .commit_put(recovery_put(1, &manifest_path, local), local)
+            .unwrap();
+        drop(journal);
+        let accept_before = stopped_journal_files(&accept_journal_path);
+        let error = accept_remote_writeback_branch(
+            config_b,
+            accept_journal_path.clone(),
+            0,
+            1,
+            manifest_path.clone(),
+            hex_sha256(Sha256::digest(local).into()),
+            hex_sha256(Sha256::digest(remote).into()),
+            true,
+        )
+        .await
+        .expect_err("config B must not abandon journal A");
+        assert!(format!("{error:#}").contains("identity mismatch"));
+        assert_eq!(stopped_journal_files(&accept_journal_path), accept_before);
+        remote_a
+            .put(
+                &Path::from(manifest_path.as_str()),
+                remote.as_slice().into(),
+            )
+            .await
+            .unwrap();
+        accept_remote_writeback_branch(
+            config_a,
+            accept_journal_path.clone(),
+            0,
+            1,
+            manifest_path,
+            hex_sha256(Sha256::digest(local).into()),
+            hex_sha256(Sha256::digest(remote).into()),
+            true,
+        )
+        .await
+        .expect("matching config must accept relocated offline journal");
+        let journal = Journal::open_existing(&accept_journal_path).unwrap();
+        assert_eq!(journal.progress().unwrap().remote_seq, 1);
+        assert!(journal.snapshot().unwrap().records.is_empty());
     }
 }
