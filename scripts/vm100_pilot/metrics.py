@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import re
+import ssl
 import threading
 import time
 import urllib.request
 from dataclasses import asdict, dataclass
+from decimal import Decimal, InvalidOperation
+from pathlib import Path
 from typing import Callable
 from urllib.parse import SplitResult, urlsplit
 
@@ -138,10 +141,22 @@ class WritebackSnapshot:
             parts = line.split()
             if len(parts) < 2 or parts[0] not in _METRICS:
                 continue
+            field = _METRICS[parts[0]]
+            if field in found:
+                raise ValueError(
+                    f"writeback metric has multiple unlabelled samples: {parts[0]}"
+                )
             try:
-                found[_METRICS[parts[0]]] = int(float(parts[1]))
-            except ValueError:
+                value = Decimal(parts[1])
+            except InvalidOperation:
                 raise ValueError("invalid writeback metric value") from None
+            if (
+                not value.is_finite()
+                or value < 0
+                or value != value.to_integral_value()
+            ):
+                raise ValueError("invalid writeback metric value")
+            found[field] = int(value)
         required = set(_METRICS.values()) - {"gc_active"}
         missing = sorted(required - found.keys())
         if missing:
@@ -188,13 +203,21 @@ class MetricsClient:
         url: str,
         expected_identity: MetricsAuthorityIdentity | None = None,
         timeout: float = 5.0,
+        tls_ca_file: Path | None = None,
     ) -> None:
         validate_metrics_url(url)
         self.url = url
         self.expected_identity = expected_identity
         self.timeout = timeout
         self._identity_lock = threading.Lock()
-        self._opener = urllib.request.build_opener(_NoRedirectHandler)
+        handlers: list[urllib.request.BaseHandler] = [_NoRedirectHandler()]
+        if tls_ca_file is not None:
+            ca_file = Path(tls_ca_file)
+            if not ca_file.is_absolute() or not ca_file.is_file():
+                raise ValueError("TLS CA file must be an absolute regular file")
+            context = ssl.create_default_context(cafile=str(ca_file.resolve()))
+            handlers.append(urllib.request.HTTPSHandler(context=context))
+        self._opener = urllib.request.build_opener(*handlers)
 
     def _fetch(self) -> str:
         with self._opener.open(self.url, timeout=self.timeout) as response:
@@ -216,9 +239,14 @@ class MetricsClient:
         return actual
 
     def snapshot(self) -> WritebackSnapshot:
+        text = self.fetch_metrics()
+        return WritebackSnapshot.parse(text)
+
+    def fetch_metrics(self) -> str:
+        """Fetch one TLS response and require its exact authority identity."""
         text = self._fetch()
         self._validate_identity(text)
-        return WritebackSnapshot.parse(text)
+        return text
 
     def identity(self) -> MetricsAuthorityIdentity:
         return self._validate_identity(self._fetch())

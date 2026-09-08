@@ -1,0 +1,52 @@
+# CI-only isolated XFS/NBD acceptance fixture. The 4 GiB NBD export is sparse;
+# these small RAM budgets are independent of production CT sizing.
+[cache]
+dir = "${RESOURCE_ROOT}/run/cache"
+disk_size_gb = 0.5
+memory_size_gb = 0.125
+
+[storage]
+url = "s3://${MINIO_BUCKET}/zerofs-tiered/${RUN_UUID}"
+encryption_password = "test-password-123"
+
+[filesystem]
+max_size_gb = 8.0
+write_ack_mode = "volatile_memory"
+volatile_memory_gb = 0.25
+volatile_max_operations = 128
+
+[writeback]
+enabled = true
+dir = "${RESOURCE_ROOT}/run/writeback"
+ack_mode = "ssd"
+memory_size_gb = 0.25
+disk_size_gb = 1.5
+min_free_gb = 0.25
+high_watermark_percent = 90
+resume_percent = 75
+upload_concurrency = 2
+local_concurrency = 2
+shutdown_flush = "local"
+
+# TIERED_RUNTIME_SERVERS_BEGIN
+[servers.nbd]
+addresses = ["127.0.0.1:10809"]
+
+[prometheus]
+addresses = ["127.0.0.1:19567"]
+
+[prometheus.benchmark_authority]
+adapter = "nbd"
+export_id = "zerofs-tiered-${RUN_UUID}"
+tls_certificate = "${CONTROL_ROOT}/tls/metrics.crt"
+tls_private_key = "${CONTROL_ROOT}/tls/metrics.key"
+# TIERED_RUNTIME_SERVERS_END
+
+[aws]
+access_key_id = "minioadmin"
+secret_access_key = "minioadmin"
+endpoint = "http://127.0.0.1:19000"
+allow_http = "true"
+
+[telemetry]
+enabled = false

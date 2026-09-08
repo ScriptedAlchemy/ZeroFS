@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import os
+
 from .protocols import (
     NBD_CLIENT,
     NBD_DEVICE,
     NBD_PORT,
+    METRICS_PORT,
     NFS_PORT,
     ResourceOwnership,
     ScenarioBuilder,
@@ -41,11 +44,85 @@ def _xfs_over_nbd_restart(context: ScenarioContext) -> ScenarioPlan:
     config = context.config
     mountpoint = _mountpoint(config, "xfs")
     proof = mountpoint / "xfs-restart-proof.bin"
-    listeners = (ResourceOwnership("listener", NBD_PORT),)
+    bootstrap_config = config.run_root / "xfs-nbd-bootstrap.toml"
+    bootstrap_socket = config.run_root / "xfs-nbd-bootstrap.9p.sock"
+    bootstrap_unit = f"{config.unit_name}-bootstrap"
+    listeners = (
+        ResourceOwnership("listener", NBD_PORT),
+        ResourceOwnership("listener", METRICS_PORT),
+    )
     steps = (
-        server_steps(context, listeners)
+        (
+            Step(
+                "start the run-scoped bootstrap server",
+                (
+                    "systemd-run",
+                    "--collect",
+                    f"--unit={bootstrap_unit}",
+                    f"--uid={os.getuid()}",
+                    str(context.zerofs_binary),
+                    "run",
+                    "--config",
+                    str(bootstrap_config),
+                ),
+                sudo=True,
+                acquires=(
+                    ResourceOwnership("unit", bootstrap_unit),
+                    ResourceOwnership("path", str(bootstrap_socket)),
+                ),
+                capture_main_pid_unit=bootstrap_unit,
+            ),
+            Step("wait for the bootstrap 9P socket", ("sleep", "3")),
+            Step(
+                "verify the bootstrap 9P socket exists",
+                ("test", "-S", str(bootstrap_socket)),
+                requires=(ResourceOwnership("path", str(bootstrap_socket)),),
+            ),
+            Step(
+                "provision the exact sparse striped NBD export",
+                (
+                    str(context.zerofs_binary),
+                    "nbd",
+                    "provision-striped",
+                    f"unix:{bootstrap_socket}",
+                    config.unit_name,
+                    "--size",
+                    "4GiB",
+                    "--lanes",
+                    "4",
+                    "--stripe-size",
+                    "1MiB",
+                ),
+            ),
+            Step(
+                "stop the run-scoped bootstrap server",
+                ("systemctl", "stop", bootstrap_unit),
+                sudo=True,
+                releases=(ResourceOwnership("unit", bootstrap_unit),),
+                release_main_pid_unit=bootstrap_unit,
+                verify_stopped_unit=bootstrap_unit,
+            ),
+            Step(
+                "remove the retired bootstrap socket",
+                ("rm", "-f", "--", str(bootstrap_socket)),
+                releases=(ResourceOwnership("path", str(bootstrap_socket)),),
+            ),
+        )
+        + server_steps(
+            context,
+            listeners,
+            after_checkpoint="pin-initial-authority",
+            unit_uid=os.getuid(),
+        )
         + nbd_connect_steps(config)
         + (
+            Step(
+                "verify the attached sparse export has the expected size",
+                ("blockdev", "--getsize64", NBD_DEVICE),
+                sudo=True,
+                requires=(ResourceOwnership("device", NBD_DEVICE),),
+                require_stdout=str(4 * 1024 * 1024 * 1024),
+            ),
             Step(
                 "format XFS on the disposable device",
                 ("mkfs.xfs", "-f", NBD_DEVICE),
@@ -71,26 +148,49 @@ def _xfs_over_nbd_restart(context: ScenarioContext) -> ScenarioPlan:
                 sudo=True,
             ),
             Step(
+                "issue a real NBD FLUSH after the XFS proof fsync",
+                ("blockdev", "--flushbufs", NBD_DEVICE),
+                sudo=True,
+                requires=(ResourceOwnership("device", NBD_DEVICE),),
+            ),
+            Step(
+                "capture the durability proof checksum before restart",
+                ("sha256sum", str(proof)),
+                sudo=True,
+                capture_sha256_as="xfs-proof-before-restart",
+            ),
+            Step(
                 "unmount XFS before the crash",
                 ("umount", str(mountpoint)),
                 sudo=True,
                 releases=(ResourceOwnership("mount", str(mountpoint)),),
             ),
         )
-        + _restart_cycle(context, listeners)
         + (
             Step(
-                "reattach the device after restart",
-                (
-                    NBD_CLIENT,
-                    "127.0.0.1",
-                    str(NBD_PORT),
-                    NBD_DEVICE,
-                    "-name",
-                    config.unit_name,
-                ),
+                "detach NBD before the crash and observe the final local cutoff",
+                (NBD_CLIENT, "-d", NBD_DEVICE),
+                sudo=True,
+                releases=(ResourceOwnership("device", NBD_DEVICE),),
+                after_checkpoint="final-local-cutoff",
+                verify_detached_device=NBD_DEVICE,
+            ),
+        )
+        + server_crash_steps(context, listeners)
+        + server_steps(
+            context,
+            listeners,
+            after_checkpoint="require-restart",
+            unit_uid=os.getuid(),
+        )
+        + nbd_connect_steps(config)
+        + (
+            Step(
+                "verify the restarted export has the same sparse size",
+                ("blockdev", "--getsize64", NBD_DEVICE),
                 sudo=True,
                 requires=(ResourceOwnership("device", NBD_DEVICE),),
+                require_stdout=str(4 * 1024 * 1024 * 1024),
             ),
             Step("check XFS after crash", ("xfs_repair", "-n", NBD_DEVICE), sudo=True),
             Step(
@@ -99,7 +199,12 @@ def _xfs_over_nbd_restart(context: ScenarioContext) -> ScenarioPlan:
                 sudo=True,
                 acquires=(ResourceOwnership("mount", str(mountpoint)),),
             ),
-            _verify_step("verify the durability proof survived", str(proof)),
+            Step(
+                "verify the durability proof checksum survived",
+                ("sha256sum", str(proof)),
+                sudo=True,
+                compare_sha256_with="xfs-proof-before-restart",
+            ),
             Step(
                 "unmount XFS",
                 ("umount", str(mountpoint)),
@@ -115,6 +220,9 @@ def _xfs_over_nbd_restart(context: ScenarioContext) -> ScenarioPlan:
         legs=("nbd", "xfs"),
         steps=steps,
         durability_floors=floors_for(config.ack, ("nbd-flush",)),
+        bootstrap_config=bootstrap_config,
+        authority_export_id=config.unit_name,
+        requires_completed_cleanup=True,
     )
 
 

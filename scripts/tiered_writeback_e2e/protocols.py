@@ -13,6 +13,7 @@ from .integrity import DurabilityFloor, floors_for
 NFS_PORT = 12049
 NINEP_PORT = 15564
 NBD_PORT = 10809
+METRICS_PORT = 19567
 WEBUI_PORT = 18080
 RPC_PORT = 18081
 NBD_DEVICE = "/dev/nbd7"
@@ -46,6 +47,12 @@ class Step:
     requires: tuple[ResourceOwnership, ...] = ()
     capture_main_pid_unit: str | None = None
     release_main_pid_unit: str | None = None
+    after_checkpoint: str | None = None
+    capture_sha256_as: str | None = None
+    compare_sha256_with: str | None = None
+    require_stdout: str | None = None
+    verify_detached_device: str | None = None
+    verify_stopped_unit: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -58,6 +65,12 @@ class Step:
             "requires": [resource.to_dict() for resource in self.requires],
             "capture_main_pid_unit": self.capture_main_pid_unit,
             "release_main_pid_unit": self.release_main_pid_unit,
+            "after_checkpoint": self.after_checkpoint,
+            "capture_sha256_as": self.capture_sha256_as,
+            "compare_sha256_with": self.compare_sha256_with,
+            "require_stdout": self.require_stdout,
+            "verify_detached_device": self.verify_detached_device,
+            "verify_stopped_unit": self.verify_stopped_unit,
         }
 
 
@@ -70,6 +83,9 @@ class ScenarioPlan:
     tools: tuple[str, ...] = ()
     requires_observed_durability: bool = True
     acceptance_gaps: tuple[str, ...] = ()
+    bootstrap_config: Path | None = None
+    authority_export_id: str | None = None
+    requires_completed_cleanup: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -82,6 +98,11 @@ class ScenarioPlan:
             "tools": list(self.tools),
             "requires_observed_durability": self.requires_observed_durability,
             "acceptance_gaps": list(self.acceptance_gaps),
+            "bootstrap_config": (
+                str(self.bootstrap_config) if self.bootstrap_config else None
+            ),
+            "authority_export_id": self.authority_export_id,
+            "requires_completed_cleanup": self.requires_completed_cleanup,
         }
 
 
@@ -102,6 +123,9 @@ def _mountpoint(config: HarnessConfig, leg: str) -> Path:
 def server_steps(
     context: ScenarioContext,
     listeners: tuple[ResourceOwnership, ...] = (),
+    *,
+    after_checkpoint: str | None = None,
+    unit_uid: int | None = None,
 ) -> tuple[Step, ...]:
     unit = context.config.unit_name
     return (
@@ -111,6 +135,7 @@ def server_steps(
                 "systemd-run",
                 "--collect",
                 f"--unit={unit}",
+                *((f"--uid={unit_uid}",) if unit_uid is not None else ()),
                 str(context.zerofs_binary),
                 "run",
                 "--config",
@@ -120,7 +145,11 @@ def server_steps(
             acquires=(ResourceOwnership("unit", unit),) + listeners,
             capture_main_pid_unit=unit,
         ),
-        Step("wait for protocol listeners", ("sleep", "3")),
+        Step(
+            "wait for protocol listeners",
+            ("sleep", "3"),
+            after_checkpoint=after_checkpoint,
+        ),
     )
 
 
@@ -135,6 +164,7 @@ def server_stop_steps(
             sudo=True,
             releases=listeners + (ResourceOwnership("unit", context.config.unit_name),),
             release_main_pid_unit=context.config.unit_name,
+            verify_stopped_unit=context.config.unit_name,
         ),
     )
 
@@ -150,6 +180,7 @@ def server_crash_steps(
             sudo=True,
             releases=listeners + (ResourceOwnership("unit", context.config.unit_name),),
             release_main_pid_unit=context.config.unit_name,
+            verify_stopped_unit=context.config.unit_name,
         ),
     )
 
@@ -266,11 +297,11 @@ def nbd_connect_steps(config: HarnessConfig) -> tuple[Step, ...]:
             "attach the disposable NBD device to the run-scoped export",
             (
                 NBD_CLIENT,
+                "-N",
+                config.unit_name,
                 "127.0.0.1",
                 str(NBD_PORT),
                 NBD_DEVICE,
-                "-name",
-                config.unit_name,
                 "-persist",
             ),
             sudo=True,
@@ -314,6 +345,7 @@ def nbd_disconnect_steps(config: HarnessConfig) -> tuple[Step, ...]:
             (NBD_CLIENT, "-d", NBD_DEVICE),
             sudo=True,
             releases=(ResourceOwnership("device", NBD_DEVICE),),
+            verify_detached_device=NBD_DEVICE,
         ),
     )
 

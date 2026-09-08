@@ -6,7 +6,9 @@ import json
 import tempfile
 import traceback
 import unittest
+import urllib.request
 import io
+import ssl
 from contextlib import redirect_stderr
 from dataclasses import replace
 from pathlib import Path
@@ -281,6 +283,32 @@ class ProtocolAuthorityTests(unittest.TestCase):
             "".join(traceback.format_exception(raised.exception)),
         )
 
+    def test_writeback_frontiers_require_unique_finite_nonnegative_integers(
+        self,
+    ) -> None:
+        identity = MetricsAuthorityIdentity("instance-a", "filesystem-a", "nfs-root")
+        scientific = metrics_text(identity).replace(
+            "zerofs_writeback_accepted_sequence 3",
+            "zerofs_writeback_accepted_sequence 3e0",
+        )
+        self.assertEqual(WritebackSnapshot.parse(scientific).accepted, 3)
+
+        for invalid in ("3.5", "NaN", "+Inf", "-1"):
+            with self.subTest(invalid=invalid):
+                sample = metrics_text(identity).replace(
+                    "zerofs_writeback_accepted_sequence 3",
+                    f"zerofs_writeback_accepted_sequence {invalid}",
+                )
+                with self.assertRaisesRegex(ValueError, "writeback metric value"):
+                    WritebackSnapshot.parse(sample)
+
+        duplicate = (
+            metrics_text(identity)
+            + "\nzerofs_writeback_accepted_sequence 4\n"
+        )
+        with self.assertRaisesRegex(ValueError, "multiple unlabelled samples"):
+            WritebackSnapshot.parse(duplicate)
+
     def test_every_snapshot_rejects_identity_drift_in_the_same_response(self) -> None:
         expected = MetricsAuthorityIdentity("instance-a", "filesystem-a", "nfs-root")
         wrong = MetricsAuthorityIdentity("instance-b", "filesystem-a", "nfs-root")
@@ -308,6 +336,54 @@ class ProtocolAuthorityTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(ValueError, "exactly one"):
                 identity_free.snapshot()
+
+    def test_metrics_client_builds_verified_tls_from_an_explicit_ca_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            ca_file = Path(directory) / "fixture-ca.pem"
+            ca_file.write_text("fixture certificate", encoding="utf-8")
+            context = mock.Mock(spec=ssl.SSLContext)
+            opener = mock.Mock()
+            with (
+                mock.patch(
+                    "scripts.vm100_pilot.metrics.ssl.create_default_context",
+                    return_value=context,
+                ) as create_context,
+                mock.patch(
+                    "scripts.vm100_pilot.metrics.urllib.request.build_opener",
+                    return_value=opener,
+                ) as build_opener,
+            ):
+                MetricsClient(
+                    "https://127.0.0.1:19567/metrics",
+                    tls_ca_file=ca_file,
+                )
+
+            create_context.assert_called_once_with(cafile=str(ca_file.resolve()))
+            handlers = build_opener.call_args.args
+            self.assertTrue(
+                any(
+                    isinstance(handler, urllib.request.HTTPSHandler)
+                    and handler._context is context
+                    for handler in handlers
+                )
+            )
+
+    def test_metrics_client_rejects_relative_or_missing_explicit_ca_file(self) -> None:
+        for ca_file in (Path("relative-ca.pem"), Path("/missing/fixture-ca.pem")):
+            with self.subTest(ca_file=ca_file):
+                with self.assertRaisesRegex(ValueError, "TLS CA file"):
+                    MetricsClient(
+                        "https://127.0.0.1:19567/metrics",
+                        tls_ca_file=ca_file,
+                    )
+
+    def test_fetch_metrics_returns_one_identity_checked_response(self) -> None:
+        identity = MetricsAuthorityIdentity("instance-a", "filesystem-a", "nfs-root")
+        sample = metrics_text(identity)
+        client = MetricsClient("https://10.10.10.55/metrics", identity)
+        with mock.patch.object(client, "_fetch", return_value=sample) as fetch:
+            self.assertEqual(client.fetch_metrics(), sample)
+        fetch.assert_called_once_with()
 
     def test_sftp_read_activity_counter_is_identity_checked_and_missing_means_zero(
         self,

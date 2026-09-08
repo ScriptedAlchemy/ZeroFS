@@ -305,7 +305,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y nbd-client xfsprogs wget
+          sudo apt-get install -y nbd-client xfsprogs wget lsof openssl
 
       - name: Assert the runner owns the disposable NBD device
         run: |
@@ -322,18 +322,44 @@ jobs:
           path: zerofs/target/ci
       - run: chmod +x zerofs/target/ci/zerofs
 
-      - name: Start MinIO
+      - name: Prepare the tiered run roots and TLS authority
+        run: |
+          RUN_UUID=$(python3 -c "import uuid; print(uuid.uuid4())")
+          CONTROL_ROOT="/var/tmp/zerofs-tiered-control-${RUN_UUID}"
+          RESOURCE_ROOT="/var/tmp/zerofs-tiered-resources-${RUN_UUID}"
+          TLS_ROOT="${CONTROL_ROOT}/tls"
+          MINIO_CONTAINER="zerofs-tiered-minio-${RUN_UUID}"
+          MINIO_BUCKET="zerofs-xfs-${RUN_UUID}"
+          install -d -m 700 "$TLS_ROOT"
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+            -subj "/CN=localhost" \
+            -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" \
+            -keyout "${TLS_ROOT}/metrics.key" \
+            -out "${TLS_ROOT}/metrics.crt"
+          chmod 600 "${TLS_ROOT}/metrics.key"
+          {
+            echo "RUN_UUID=${RUN_UUID}"
+            echo "CONTROL_ROOT=${CONTROL_ROOT}"
+            echo "RESOURCE_ROOT=${RESOURCE_ROOT}"
+            echo "TLS_ROOT=${TLS_ROOT}"
+            echo "LEDGER=${CONTROL_ROOT}/ledger.json"
+            echo "MINIO_CONTAINER=${MINIO_CONTAINER}"
+            echo "MINIO_BUCKET=${MINIO_BUCKET}"
+            echo "ZEROFS_CONFIG_TEMPLATE=${GITHUB_WORKSPACE}/scripts/tiered_writeback_e2e/xfs_nbd_tiered.toml.template"
+            echo "ZEROFS_CONFIG=${CONTROL_ROOT}/run/xfs-nbd-tiered.toml"
+          } >> "$GITHUB_ENV"
+
+      - name: Start the UUID-scoped MinIO fixture
         run: |
           docker run -d \
-            --name minio \
-            -p 9000:9000 \
+            --name "$MINIO_CONTAINER" \
+            -p 127.0.0.1:19000:9000 \
             -e MINIO_ROOT_USER=minioadmin \
             -e MINIO_ROOT_PASSWORD=minioadmin \
             minio/minio server /data
 
-          # Wait for MinIO to be ready
           for i in {1..30}; do
-            if curl -f http://localhost:9000/minio/health/live; then
+            if curl -f http://127.0.0.1:19000/minio/health/live; then
               echo "MinIO is ready"
               break
             fi
@@ -344,59 +370,10 @@ jobs:
             sleep 1
           done
 
-          # Install mc (MinIO client)
           wget https://dl.min.io/client/mc/release/linux-amd64/mc
           chmod +x mc
-          ./mc alias set myminio http://localhost:9000 minioadmin minioadmin
-          ./mc mb myminio/zerofs-xfs-test || true
-
-      - name: Prepare the tiered run roots
-        run: |
-          RUN_UUID=$(python3 -c "import uuid; print(uuid.uuid4())")
-          CONTROL_ROOT="/var/tmp/zerofs-tiered-control-${RUN_UUID}"
-          RESOURCE_ROOT="/var/tmp/zerofs-tiered-resources-${RUN_UUID}"
-          {
-            echo "RUN_UUID=${RUN_UUID}"
-            echo "CONTROL_ROOT=${CONTROL_ROOT}"
-            echo "RESOURCE_ROOT=${RESOURCE_ROOT}"
-            echo "LEDGER=${CONTROL_ROOT}/ledger.json"
-          } >> "$GITHUB_ENV"
-
-      - name: Write the tiered ZeroFS config
-        run: |
-          cat > /tmp/zerofs-tiered.toml << EOF
-          [cache]
-          dir = "${RESOURCE_ROOT}/run/cache"
-          disk_size_gb = 2.0
-          memory_size_gb = 1.0
-
-          [storage]
-          url = "s3://zerofs-xfs-test/zerofs-tiered/${RUN_UUID}"
-          encryption_password = "test-password-123"
-
-          [filesystem]
-          write_ack_mode = "volatile_memory"
-          volatile_memory_gb = 1.0
-
-          [writeback]
-          enabled = true
-          dir = "${RESOURCE_ROOT}/run/writeback"
-          ack_mode = "ssd"
-          memory_size_gb = 1.0
-          disk_size_gb = 4.0
-
-          [servers.nbd]
-          addresses = ["127.0.0.1:10809"]
-
-          [aws]
-          access_key_id = "minioadmin"
-          secret_access_key = "minioadmin"
-          endpoint = "http://localhost:9000"
-          allow_http = "true"
-
-          [telemetry]
-          enabled = false
-          EOF
+          ./mc alias set tiered http://127.0.0.1:19000 minioadmin minioadmin
+          ./mc mb "tiered/${MINIO_BUCKET}"
 
       - name: Set up the tiered harness run
         run: |
@@ -405,13 +382,10 @@ jobs:
             --filesystem-ack-mode volatile_memory \
             --object-ack-mode ssd \
             --zerofs-binary "$GITHUB_WORKSPACE/zerofs/target/ci/zerofs" \
-            --zerofs-config /tmp/zerofs-tiered.toml
-          mkdir -p "${RESOURCE_ROOT}/run/cache" "${RESOURCE_ROOT}/run/writeback"
+            --zerofs-config "$ZEROFS_CONFIG_TEMPLATE"
 
-      - name: Run the tiered XFS restart scenario
+      - name: Validate the tiered XFS plan and schema
         run: |
-          # Plan-only until the observed-durability collector is wired:
-          # run_scenario fails closed on requires_observed_durability.
           python3 scripts/tiered-writeback-e2e.py run \
             --plan-only \
             --ledger "$LEDGER" \
@@ -419,13 +393,26 @@ jobs:
             --filesystem-ack-mode volatile_memory \
             --object-ack-mode ssd \
             --zerofs-binary "$GITHUB_WORKSPACE/zerofs/target/ci/zerofs" \
-            --zerofs-config /tmp/zerofs-tiered.toml
+            --zerofs-config "$ZEROFS_CONFIG"
+
+      - name: Run the observed tiered XFS restart scenario
+        run: |
+          python3 scripts/tiered-writeback-e2e.py run \
+            --ledger "$LEDGER" \
+            --scenario xfs-over-nbd-restart \
+            --filesystem-ack-mode volatile_memory \
+            --object-ack-mode ssd \
+            --zerofs-binary "$GITHUB_WORKSPACE/zerofs/target/ci/zerofs" \
+            --zerofs-config "$ZEROFS_CONFIG"
 
       - name: Clean up the tiered run
         if: always()
         run: |
+          CLEANUP_STATUS=0
           if [ -f "$LEDGER" ]; then
-            python3 scripts/tiered-writeback-e2e.py cleanup --ledger "$LEDGER"
-            python3 scripts/tiered-writeback-e2e.py cleanup --ledger "$LEDGER"
-            python3 scripts/tiered-writeback-e2e.py assert-clean --ledger "$LEDGER"
+            python3 scripts/tiered-writeback-e2e.py cleanup --ledger "$LEDGER" || CLEANUP_STATUS=$?
+            python3 scripts/tiered-writeback-e2e.py cleanup --ledger "$LEDGER" || CLEANUP_STATUS=$?
+            python3 scripts/tiered-writeback-e2e.py assert-clean --ledger "$LEDGER" || CLEANUP_STATUS=$?
           fi
+          docker rm -f "$MINIO_CONTAINER" || CLEANUP_STATUS=$?
+          exit "$CLEANUP_STATUS"
