@@ -3,9 +3,12 @@ use bytes::Bytes;
 use futures::{StreamExt, stream, stream::BoxStream};
 use object_store::PutPayload;
 use sha2::{Digest, Sha256};
-use std::fs::{File, OpenOptions};
+use std::fs::File;
+#[cfg(test)]
+use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::ops::Range;
+#[cfg(test)]
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -50,6 +53,7 @@ impl VerifiedPayload {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn from_staged_file(path: PathBuf, byte_len: u64) -> std::io::Result<Self> {
         let file = open_staged_file(&path)?;
         Self::from_open_staged_file(file, byte_len)
@@ -227,6 +231,7 @@ impl StagedPayload {
     }
 }
 
+#[cfg(test)]
 fn open_staged_file(path: &Path) -> std::io::Result<File> {
     let mut options = OpenOptions::new();
     options.read(true);

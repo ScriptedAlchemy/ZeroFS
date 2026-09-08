@@ -1,10 +1,13 @@
 //! Exact ownership for multipart payload staging and final mutation promotion.
 
 use crate::coordination::admission::{AcceptedAdmission, Admission, AdmissionError};
+use crate::writeback::anchored_dir::AnchoredDir;
 use crate::writeback::reservation::{ReservationError, SsdAdmission, SsdReservationToken};
 use crate::writeback::space_sample::PhysicalSpaceSample;
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::ffi::{OsStr, OsString};
+use std::fs::File;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug)]
 pub(crate) struct RamMultipartPartReservation {
@@ -142,10 +145,122 @@ pub(crate) struct SsdMutationReservation {
     admission: SsdAdmission,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct MultipartStaging {
+    inner: Arc<Mutex<MultipartStagingInner>>,
+}
+
+#[derive(Debug)]
+struct MultipartStagingInner {
+    parent: AnchoredDir,
+    name: OsString,
+    directory: Option<AnchoredDir>,
+    payload: Option<File>,
+}
+
+impl MultipartStaging {
+    pub(crate) fn new(parent: AnchoredDir, name: OsString) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(MultipartStagingInner {
+                parent,
+                name,
+                directory: None,
+                payload: None,
+            })),
+        }
+    }
+
+    pub(crate) fn payload_file(&self) -> std::io::Result<File> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| std::io::Error::other("multipart staging lock poisoned"))?;
+        if inner.directory.is_none() {
+            inner.directory = Some(
+                inner
+                    .parent
+                    .open_or_create_child(&inner.name, 0o700)
+                    .map_err(anyhow_to_io)?,
+            );
+        }
+        if inner.payload.is_none() {
+            let (payload, _) = inner
+                .directory
+                .as_ref()
+                .expect("multipart directory initialized")
+                .open_owner_file(OsStr::new("payload.staged"), true)
+                .map_err(anyhow_to_io)?;
+            inner.payload = Some(payload);
+        }
+        inner
+            .payload
+            .as_ref()
+            .expect("multipart payload initialized")
+            .try_clone()
+    }
+
+    pub(crate) fn display_path(&self) -> PathBuf {
+        let inner = self.inner.lock().unwrap();
+        inner.parent.display().join(&inner.name)
+    }
+
+    fn remove(&self) -> std::io::Result<()> {
+        let (parent, name, directory, payload) = {
+            let mut inner = self
+                .inner
+                .lock()
+                .map_err(|_| std::io::Error::other("multipart staging lock poisoned"))?;
+            (
+                inner.parent.clone(),
+                inner.name.clone(),
+                inner.directory.take(),
+                inner.payload.take(),
+            )
+        };
+        drop(payload);
+        let Some(directory) = directory else {
+            return parent.sync().map_err(anyhow_to_io);
+        };
+        directory
+            .remove_file_if_exists(OsStr::new("payload.staged"))
+            .map_err(anyhow_to_io)?;
+        parent
+            .remove_empty_dir_if_exists(&name)
+            .map_err(anyhow_to_io)?;
+        parent.sync().map_err(anyhow_to_io)
+    }
+}
+
+#[cfg(test)]
+impl MultipartStaging {
+    pub(crate) fn from_existing_test_path(path: PathBuf) -> std::io::Result<Self> {
+        use std::os::unix::fs::PermissionsExt;
+        let parent_path = path.parent().expect("multipart staging path has a parent");
+        std::fs::set_permissions(parent_path, std::fs::Permissions::from_mode(0o700))?;
+        let name = path
+            .file_name()
+            .expect("multipart staging path has a final component")
+            .to_os_string();
+        let parent = AnchoredDir::open_absolute(&parent_path.canonicalize()?, 0o700)
+            .map_err(anyhow_to_io)?;
+        let payload_path = path.join("payload.staged");
+        if payload_path.exists() {
+            std::fs::set_permissions(&payload_path, std::fs::Permissions::from_mode(0o600))?;
+        }
+        let staging = Self::new(parent, name);
+        staging.payload_file()?;
+        Ok(staging)
+    }
+}
+
+fn anyhow_to_io(error: anyhow::Error) -> std::io::Error {
+    std::io::Error::other(format!("{error:#}"))
+}
+
 impl SsdMutationReservation {
     pub(crate) fn into_owned(
         self,
-        staging: PathBuf,
+        staging: MultipartStaging,
     ) -> (SsdReservationToken, MultipartStagingCleanup) {
         (
             self.final_journal,
@@ -159,7 +274,7 @@ impl SsdMutationReservation {
 /// directory are removed and the parent directory is durably synced.
 #[derive(Debug)]
 pub(crate) struct MultipartStagingCleanup {
-    staging: Option<PathBuf>,
+    staging: Option<MultipartStaging>,
     tokens: Vec<SsdStagingToken>,
     admission: SsdAdmission,
     settled: bool,
@@ -196,7 +311,11 @@ impl CleanedMultipartStaging {
 }
 
 impl MultipartStagingCleanup {
-    fn new(staging: PathBuf, tokens: Vec<SsdStagingToken>, admission: SsdAdmission) -> Self {
+    fn new(
+        staging: MultipartStaging,
+        tokens: Vec<SsdStagingToken>,
+        admission: SsdAdmission,
+    ) -> Self {
         Self {
             staging: Some(staging),
             tokens,
@@ -217,7 +336,7 @@ impl MultipartStagingCleanup {
                 admission: self.admission.clone(),
             });
         };
-        match remove_staged_payload(&staging) {
+        match staging.remove() {
             Ok(()) => {
                 self.settled = true;
                 Ok(CleanedMultipartStaging {
@@ -229,7 +348,7 @@ impl MultipartStagingCleanup {
                 self.settled = true;
                 self.admission.poison(format!(
                     "multipart staging cleanup failed for {}: {error}",
-                    staging.display()
+                    staging.display_path().display()
                 ));
                 for token in std::mem::take(&mut self.tokens) {
                     token.retain_claim();
@@ -256,24 +375,6 @@ impl Drop for MultipartStagingCleanup {
             }
         }
     }
-}
-
-fn remove_staged_payload(staging: &Path) -> std::io::Result<()> {
-    let payload = staging.join("payload.staged");
-    match fs::remove_file(&payload) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
-    }
-    match fs::remove_dir(staging) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
-    }
-    let parent = staging
-        .parent()
-        .ok_or_else(|| std::io::Error::other("multipart staging directory has no parent"))?;
-    fs::File::open(parent)?.sync_all()
 }
 
 #[derive(Debug)]
@@ -338,14 +439,14 @@ pub(crate) fn promote_multipart(
 }
 
 pub(crate) fn remove_aborted_ssd_multipart(
-    staging: PathBuf,
+    staging: MultipartStaging,
     parts: Vec<SsdMultipartPartReservation>,
 ) -> std::io::Result<Option<CleanedMultipartStaging>> {
     let Some(admission) = parts
         .first()
         .map(|part| part.final_journal_share.admission.clone())
     else {
-        remove_staged_payload(&staging)?;
+        staging.remove()?;
         return Ok(None);
     };
     let mut staging_tokens = Vec::with_capacity(parts.len());
@@ -404,7 +505,24 @@ mod tests {
         drop(cleaned);
     }
 
-    fn cleanup_aborted_ssd_multipart(staging: PathBuf, parts: Vec<SsdMultipartPartReservation>) {
+    fn staging(root: &tempfile::TempDir, name: &str, bytes: &[u8]) -> MultipartStaging {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let parent =
+            AnchoredDir::open_or_create_absolute(&root.path().canonicalize().unwrap(), 0o700)
+                .unwrap();
+        let staging = MultipartStaging::new(parent, name.into());
+        let mut file = staging.payload_file().unwrap();
+        file.write_all(bytes).unwrap();
+        file.sync_data().unwrap();
+        staging
+    }
+
+    fn cleanup_aborted_ssd_multipart(
+        staging: MultipartStaging,
+        parts: Vec<SsdMultipartPartReservation>,
+    ) {
         if let Some(cleaned) = remove_aborted_ssd_multipart(staging, parts).unwrap() {
             release_cleaned(cleaned);
         }
@@ -533,9 +651,7 @@ mod tests {
         assert_eq!(snapshot.available_bytes, 100);
 
         let root = tempfile::tempdir().unwrap();
-        let first_staging = root.path().join("first");
-        fs::create_dir(&first_staging).unwrap();
-        fs::write(first_staging.join("payload.staged"), b"first").unwrap();
+        let first_staging = staging(&root, "first", b"first");
         cleanup_aborted_ssd_multipart(first_staging, vec![first]);
 
         let second = tokio::time::timeout(Duration::from_secs(1), grants.recv())
@@ -547,9 +663,7 @@ mod tests {
         assert_eq!(snapshot.used_ssd_bytes, 50);
         assert_eq!(snapshot.used_operations, 2);
         assert_eq!(snapshot.outstanding_physical_claims, 50);
-        let second_staging = root.path().join("second");
-        fs::create_dir(&second_staging).unwrap();
-        fs::write(second_staging.join("payload.staged"), b"second").unwrap();
+        let second_staging = staging(&root, "second", b"second");
         cleanup_aborted_ssd_multipart(second_staging, vec![second]);
         for task in tasks {
             task.await.unwrap();
@@ -576,13 +690,12 @@ mod tests {
             panic!("expected SSD promotion")
         };
         let root = tempfile::tempdir().unwrap();
-        let staging = root.path().join("multipart");
-        fs::create_dir(&staging).unwrap();
-        fs::write(staging.join("payload.staged"), b"staged").unwrap();
+        let staging = staging(&root, "multipart", b"staged");
+        let staging_path = staging.display_path();
         let (final_journal, cleanup) = mutation.into_owned(staging.clone());
-        assert!(staging.exists());
+        assert!(staging_path.exists());
         release_cleaned(cleanup.remove().unwrap());
-        assert!(!staging.exists());
+        assert!(!staging_path.exists());
         let after_cleanup = admission.snapshot();
         assert_eq!(after_cleanup.used_ssd_bytes, 100);
         assert_eq!(after_cleanup.outstanding_physical_claims, 100);
@@ -617,9 +730,7 @@ mod tests {
             ("first", first_staging, first.clone()),
             ("second", second_staging, second.clone()),
         ] {
-            let staging = root.path().join(name);
-            fs::create_dir(&staging).unwrap();
-            fs::write(staging.join("payload.staged"), b"part").unwrap();
+            let staging = staging(&root, name, b"part");
             release_cleaned(
                 MultipartStagingCleanup::new(staging, vec![staging_token], admission)
                     .remove()
@@ -640,9 +751,7 @@ mod tests {
         let ssd = ssd();
         let ssd_part = ssd_part(&ssd, 4, 6, 1).await;
         let root = tempfile::tempdir().unwrap();
-        let staging = root.path().join("aborted");
-        fs::create_dir(&staging).unwrap();
-        fs::write(staging.join("payload.staged"), b"part").unwrap();
+        let staging = staging(&root, "aborted", b"part");
         cleanup_aborted_ssd_multipart(staging, vec![ssd_part]);
         assert_eq!(ssd.used_bytes(), 0);
         assert_eq!(ssd.outstanding_physical_claims(), 0);
@@ -659,10 +768,8 @@ mod tests {
             panic!("expected SSD promotion")
         };
         let root = tempfile::tempdir().unwrap();
-        let staging = root.path().join("uncleanable");
-        fs::create_dir(&staging).unwrap();
-        fs::write(staging.join("payload.staged"), b"part").unwrap();
-        fs::write(staging.join("unexpected"), b"keep").unwrap();
+        let staging = staging(&root, "uncleanable", b"part");
+        std::fs::write(staging.display_path().join("unexpected"), b"keep").unwrap();
         let (final_journal, cleanup) = mutation.into_owned(staging.clone());
 
         assert!(cleanup.remove().is_err());
@@ -682,6 +789,6 @@ mod tests {
                 .await,
             Err(ReservationError::Poisoned(_))
         ));
-        assert!(staging.join("unexpected").exists());
+        assert!(staging.display_path().join("unexpected").exists());
     }
 }

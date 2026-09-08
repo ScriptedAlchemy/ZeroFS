@@ -594,7 +594,6 @@ impl Journal {
         &self.root
     }
 
-    #[allow(dead_code)]
     pub(crate) fn anchored_root(&self) -> AnchoredDir {
         self.root_dir.clone()
     }
