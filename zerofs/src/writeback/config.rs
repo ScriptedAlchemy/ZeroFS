@@ -235,21 +235,45 @@ fn normalize_absolute_path(path: &Path, name: &str) -> Result<PathBuf> {
             Component::Normal(part) => normalized.push(part),
         }
     }
-    normalized
-        .canonicalize()
-        .or_else(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                Ok(normalized.clone())
-            } else {
-                Err(error)
+    let mut existing = normalized.as_path();
+    let mut missing = Vec::new();
+    loop {
+        match existing.symlink_metadata() {
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let component = existing
+                    .file_name()
+                    .with_context(|| format!("failed to find an existing ancestor for {name}"))?;
+                missing.push(component.to_os_string());
+                existing = existing
+                    .parent()
+                    .with_context(|| format!("failed to find an existing ancestor for {name}"))?;
             }
-        })
-        .with_context(|| format!("failed to normalize {name}"))
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to normalize {name}"));
+            }
+        }
+    }
+
+    let mut resolved = existing
+        .canonicalize()
+        .with_context(|| format!("failed to normalize {name}"))?;
+    for component in missing.into_iter().rev() {
+        resolved.push(component);
+    }
+    Ok(resolved)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn enabled_writeback_at(dir: PathBuf) -> WritebackConfig {
+        WritebackConfig {
+            dir,
+            ..enabled_writeback()
+        }
+    }
 
     fn enabled_writeback() -> WritebackConfig {
         WritebackConfig {
@@ -278,5 +302,140 @@ mod tests {
 
         assert_eq!(generic.upload_concurrency, 4);
         assert_eq!(sftp.upload_concurrency, 8);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_writeback_leaf_under_cache_parent_symlink_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let clean = root.path().join("clean");
+        std::fs::create_dir(&clean).unwrap();
+        let alias = root.path().join("alias");
+        symlink(&clean, &alias).unwrap();
+
+        let error = enabled_writeback_at(alias.join("new-dirty"))
+            .normalize(&clean, None, WritebackAccessMode::ReadWrite, false)
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("inside the clean cache"),
+            "{error:#}"
+        );
+        assert!(!clean.join("new-dirty").exists());
+    }
+
+    #[test]
+    fn prospective_normalization_preserves_nested_missing_suffix_without_creating_it() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("first").join("nested").join("dirty");
+
+        let normalized = normalize_absolute_path(&path, "test path").unwrap();
+
+        assert_eq!(
+            normalized,
+            root.path()
+                .canonicalize()
+                .unwrap()
+                .join("first/nested/dirty")
+        );
+        assert!(!root.path().join("first").exists());
+    }
+
+    #[test]
+    fn missing_sibling_cache2_path_remains_valid() {
+        let root = tempfile::tempdir().unwrap();
+        let clean = root.path().join("cache");
+        std::fs::create_dir(&clean).unwrap();
+        let dirty = root.path().join("cache2").join("new-dirty");
+
+        let settings = enabled_writeback_at(dirty.clone())
+            .normalize(&clean, None, WritebackAccessMode::ReadWrite, false)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            settings.dir,
+            root.path().canonicalize().unwrap().join("cache2/new-dirty")
+        );
+        assert!(!dirty.exists());
+    }
+
+    #[test]
+    fn separate_missing_first_start_paths_remain_valid() {
+        let root = tempfile::tempdir().unwrap();
+        let clean = root.path().join("clean");
+        let dirty = root.path().join("dirty");
+
+        let settings = enabled_writeback_at(dirty.clone())
+            .normalize(&clean, None, WritebackAccessMode::ReadWrite, false)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            settings.dir,
+            root.path().canonicalize().unwrap().join("dirty")
+        );
+        assert!(!clean.exists());
+        assert!(!dirty.exists());
+    }
+
+    #[test]
+    fn direct_nested_missing_writeback_path_is_rejected() {
+        let root = tempfile::tempdir().unwrap();
+        let clean = root.path().join("clean");
+
+        let error = enabled_writeback_at(clean.join("nested/dirty"))
+            .normalize(&clean, None, WritebackAccessMode::ReadWrite, false)
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("inside the clean cache"),
+            "{error:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_parent_symlink_is_an_error() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let dangling = root.path().join("dangling");
+        symlink(root.path().join("missing-target"), &dangling).unwrap();
+
+        let error = normalize_absolute_path(&dangling.join("dirty"), "test path").unwrap_err();
+
+        assert!(
+            error.to_string().contains("failed to normalize test path"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn non_directory_existing_ancestor_preserves_the_filesystem_error() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("not-a-directory");
+        std::fs::write(&file, b"file").unwrap();
+
+        let error = normalize_absolute_path(&file.join("dirty"), "test path").unwrap_err();
+
+        assert!(
+            error.to_string().contains("failed to normalize test path"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn relative_and_parent_components_remain_rejected() {
+        let relative =
+            normalize_absolute_path(Path::new("relative/dirty"), "test path").unwrap_err();
+        assert!(relative.to_string().contains("must be an absolute path"));
+
+        let root = tempfile::tempdir().unwrap();
+        let parent =
+            normalize_absolute_path(&root.path().join("../dirty"), "test path").unwrap_err();
+        assert!(parent.to_string().contains("must not contain '..'"));
     }
 }
