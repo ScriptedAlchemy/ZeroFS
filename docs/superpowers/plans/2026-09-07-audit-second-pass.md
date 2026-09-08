@@ -36,13 +36,13 @@
 Consumes `PreparationGuard`, already-owned raw body bytes, `PrepareWriteRequest.members`, and `VolatileBudget`.
 Produces one aggregate byte reservation and one shared logical operation owner, split into per-member byte permits; no second raw admission.
 
-- [ ] Run a real NBD regression: one operation slot, ample bytes/storage, a write at offset 4092 crossing two 4096-byte stripes; require bounded completion, exact readback and FUA.
-- [ ] Run cancellation before visibility publication; neither member may become visible, and raw/request/overlay ownership must return to zero.
-- [ ] Replace the per-member blocking reserve loop with one checked aggregate reservation. `BudgetPermit` releases only member bytes; a shared `BudgetOperationPermit` releases the operation slot exactly once after the last member retires.
-- [ ] Evaluate acceptance predicates outside the budget mutex. Terminal/frozen transitions must wake blocked reservations; preserve single-inode behavior.
-- [ ] Map request-cache `WriteAdmissionError::Backpressured` to existing `CommandError::IoError`, not `NoSpace`. Consolidate only the small NBD-local mapping.
-- [ ] Hold one request-cache slot, assert the next wire reply is NBD_EIO, release it, and require a subsequent write to succeed without capacity changes or reconnect.
-- [ ] Run focused NBD, overlay, cancellation, and striped ordering suites; review and commit.
+- [x] Run a real NBD handler regression: one operation slot, ample bytes/storage, a write at offset 4092 crossing two 4096-byte stripes; require bounded completion, exact readback and the FUA durability callback.
+- [x] Run pre-publication rollback and cancellation-lifecycle regressions; neither batch member becomes visible on failed publication, and raw/request/overlay ownership returns to zero.
+- [x] Replace the per-member blocking reserve loop with one checked aggregate reservation. `BudgetPermit` releases only member bytes; a shared `BudgetOperationPermit` releases the operation slot exactly once after the last member retires.
+- [x] Evaluate acceptance predicates outside the budget mutex. Terminal/frozen transitions wake blocked reservations; single-inode behavior is preserved.
+- [x] Map request-cache `WriteAdmissionError::Backpressured` to existing `CommandError::IoError`, not `NoSpace`, with the minimal NBD-local change.
+- [x] Hold one request-cache slot, assert NBD_EIO conversion, release it, and execute a subsequent write/readback without capacity changes or reconnect.
+- [x] Run focused NBD, overlay, cancellation, and striped ordering suites; reviewed and pushed as `21354714` (worker `06739bf`). Brokered final mutation suite: 94 passed (`cc-9858`); NBD handlers: 25 passed (`cc-9860`). Logs on Ubuntu: `/tmp/zerofs-audit-nbd-fs-mutation-green.log` and `/tmp/zerofs-audit-nbd-handler-green.log`. This is handler/library proof, not the separate mounted-XFS acceptance gate.
 
 ## Draft 08: incomplete multipart ownership
 
@@ -51,6 +51,7 @@ Produces controlled pre-commit rejection on unavailable incremental growth, with
 
 - [ ] Execute the A4/B4/A2/B2 schedule with shared capacity 8; both complete objects fit individually. A bounded test must observe the current wait cycle before changing admission.
 - [ ] Add nonblocking multipart growth admission rather than blocking behind reservations held by incomplete objects. Reject overload before commit, then use owned abort and a fresh logical upload attempt.
+- [ ] For trusted generated segments with a declared payload length, reserve the complete logical payload before acknowledging multipart support. Validate exact completion length. Unknown-length multipart parts use try-only admission without bypassing queued ordinary writes.
 - [ ] Verify failure does not strand active-part counters, retained payloads, FIFO waiters or reservations. Exercise cancellation and retry, including empty multipart completion.
 - [ ] Review the analogous SSD staging path for the same partial-ownership cycle. Do not move the deadlock from RAM to disk or silently weaken physical-space accounting.
 - [ ] Run multipart and ordinary writeback admission suites; review and commit.
@@ -72,9 +73,9 @@ Produces the same Create/Update guarantee above and below the 36 MiB transfer th
 Consumes configured absolute dirty/cache paths and existing Unix descriptor traversal patterns from `cli/transfer/local_destination.rs`.
 Produces nonmutating prospective physical separation and anchored creation/opening, without a pathname-only check/create/check claim.
 
-- [ ] Execute real Rust temporary-filesystem tests for `alias -> clean` plus missing `alias/new-dirty`, nested missing suffixes, dangling links, ENOTDIR, relative/parent components, legitimate first start, and `cache2` siblings.
-- [ ] Canonicalize the nearest existing ancestor, then append validated missing components. Normalization must create no files or directories.
-- [ ] Reproduce the Phase 1 behavioral failure against the tests-only commit, then restore the implementation and run GREEN. Record honestly that implementation preceded this observed RED.
+- [x] Execute real Rust temporary-filesystem tests for `alias -> clean` plus missing `alias/new-dirty`, nested missing suffixes, dangling links, ENOTDIR, relative/parent components, legitimate first start, and `cache2` siblings.
+- [x] Canonicalize the nearest existing ancestor, then append validated missing components. Normalization must create no files or directories.
+- [x] Reproduce the Phase 1 behavioral failure against the tests-only commit, then restore the implementation and run GREEN. Implementation preceded observed RED: tests-only `6885110` ran seven tests, five passed and two failed; fixed `f3bdb5f` ran nine, all passed. Logs: `/var/tmp/zerofs-audit-path-{red,green}.log` on Ubuntu. Integrated as `00330430`; concurrent replacement protection below is still pending.
 - [ ] Review a narrowly owned directory-handle API before bootstrap/journal edits. Preserve ancestry through base/namespace creation, lock/database opening and initial mutation; reuse `rustix` and redb's file-backed construction where supported.
 - [ ] Resolve the read-only redb opening boundary without weakening the first audit's mutation-free identity preflight. No unreviewed vendored patch, platform ban, or silent path-based fallback.
 - [ ] Race parent replacement and final-entry substitution; require anchored behavior or fail-closed nonmutation. Run normalization/bootstrap/journal identity tests; review and commit.
@@ -98,8 +99,9 @@ Produces an executed receipt tied to the actual process incarnation and persiste
 
 - [ ] Use one checked-in config template for the CI fixture and production parser regression; supply positive `min_free_gb` and valid full memory settings. Removing the reserve must fail production validation.
 - [ ] Keep cheap plan/schema validation separate from runtime acceptance. A planned receipt or missing collector cannot satisfy the runtime gate.
-- [ ] Add a bounded loopback-only metrics transport reusing existing parsers. Reject missing/malformed identities, invalid or regressing frontiers, terminal state and mismatched filesystem/export.
-- [ ] Capture accepted progress after actual write/barrier, wait for that exact local durability frontier, detach NBD before restart, retain the same journal, require a new server instance and unchanged filesystem/export, then compare a stored pre-restart checksum after remount.
+- [ ] Extend existing benchmark authority explicitly for one isolated loopback NBD endpoint and the exact provisioned export. Reuse authority-only TLS with an explicit per-run trusted CA; never emit fabricated plaintext authority. Provision the fresh persistent bucket/export through an owned bootstrap service before authority startup, which intentionally loads only existing identity.
+- [ ] Add bounded loopback HTTPS sampling reusing existing parsers. Reject missing/malformed identities, invalid or regressing frontiers, terminal state and mismatched filesystem/export.
+- [ ] Capture accepted progress after actual write/barrier, wait for that exact local durability frontier, unmount and detach NBD, then sample and cover the final accepted cutoff before SIGKILL. Retain the same journal, require a new server instance and unchanged filesystem/export, then compare a stored pre-restart checksum after remount.
 - [ ] Preserve ledger-owned resource teardown. Failed commands, stale metrics, checksum mismatch or incomplete cleanup must produce a failed receipt.
 - [ ] Run deterministic Python/config tests and targeted actionlint. Record the four existing non-tiered ShellCheck findings separately; leave other plan-only jobs untouched.
 - [ ] Before any mounted run, independently verify disposable loopback service/ports, unattached NBD device, UUID paths and cleanup boundaries. Never point the harness at CT198 or production mounts.
