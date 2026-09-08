@@ -53,6 +53,7 @@ class Step:
     require_stdout: str | None = None
     verify_detached_device: str | None = None
     verify_stopped_unit: str | None = None
+    wait_for_unix_socket: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -71,6 +72,7 @@ class Step:
             "require_stdout": self.require_stdout,
             "verify_detached_device": self.verify_detached_device,
             "verify_stopped_unit": self.verify_stopped_unit,
+            "wait_for_unix_socket": self.wait_for_unix_socket,
         }
 
 

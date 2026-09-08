@@ -215,6 +215,7 @@ class FakeProbes:
         self.active_mounts: set[str] = set()
         self.attached_devices: set[str] = set()
         self.pools: set[str] = set()
+        self.socket_probe_results: list[bool] = []
 
     def process_alive(self, pid: int) -> bool:
         return pid in self.alive_pids
@@ -236,6 +237,12 @@ class FakeProbes:
 
     def pool_exists(self, name: str) -> bool:
         return name in self.pools
+
+    def unix_socket_ready(self, path: str) -> bool:
+        _ = path
+        if self.socket_probe_results:
+            return self.socket_probe_results.pop(0)
+        return True
 
 
 class HarnessCase(unittest.TestCase):
@@ -1033,6 +1040,95 @@ class ScenarioPlanTests(HarnessCase):
         for launch in launches:
             self.assertFalse(any(value.startswith("--setenv=") for value in launch))
             self.assertIn(f"--uid={os.getuid()}", launch)
+
+    def test_xfs_bootstrap_socket_fits_linux_sun_len_under_runtime_parent(
+        self,
+    ) -> None:
+        config = HarnessConfig.create(
+            filesystem_ack_mode="volatile_memory",
+            object_ack_mode="ssd",
+            run_uuid=RUN_UUID,
+            environ={
+                "ZEROFS_TIERED_ROOT_PARENT": "/fast/zerofs-audit-runtime"
+            },
+            workspace_root=self.workspace,
+            source_root=self.workspace,
+        )
+
+        plan = SCENARIOS["xfs-over-nbd-restart"](
+            ScenarioContext(config, self.binary, self.zerofs_config)
+        )
+        socket = Path(
+            next(
+                resource.value
+                for resource in plan.steps[0].acquires
+                if resource.kind == "path"
+            )
+        )
+
+        self.assertEqual(socket, config.run_root / "9p.sock")
+        self.assertEqual(len(os.fsencode(socket)), 99)
+        self.assertLess(len(os.fsencode(socket)), 108)
+
+    def test_xfs_bootstrap_socket_rejects_a_parent_that_exceeds_sun_len(
+        self,
+    ) -> None:
+        config = HarnessConfig.create(
+            filesystem_ack_mode="volatile_memory",
+            object_ack_mode="ssd",
+            run_uuid=RUN_UUID,
+            environ={
+                "ZEROFS_TIERED_ROOT_PARENT": f"/fast/{'x' * 80}"
+            },
+            workspace_root=self.workspace,
+            source_root=self.workspace,
+        )
+
+        with self.assertRaisesRegex(ConfigError, "SUN_LEN"):
+            SCENARIOS["xfs-over-nbd-restart"](
+                ScenarioContext(config, self.binary, self.zerofs_config)
+            )
+
+    def test_xfs_bootstrap_socket_uses_one_bounded_readiness_step(self) -> None:
+        plan = SCENARIOS["xfs-over-nbd-restart"](self.context())
+        waits = [
+            step for step in plan.steps if step.wait_for_unix_socket is not None
+        ]
+
+        self.assertEqual(len(waits), 1)
+        self.assertEqual(waits[0].argv[:2], ("test", "-S"))
+        self.assertEqual(waits[0].wait_for_unix_socket, waits[0].argv[2])
+        provision_index = next(
+            index
+            for index, step in enumerate(plan.steps)
+            if "provision-striped" in step.argv
+        )
+        self.assertNotIn(
+            ("sleep", "3"),
+            [step.argv for step in plan.steps[:provision_index]],
+        )
+
+    def test_socket_readiness_wait_retries_and_is_bounded(self) -> None:
+        config = self.make_config()
+        lifecycle, _, probes = self.make_lifecycle(config)
+        socket = config.run_root / "9p.sock"
+        probes.socket_probe_results = [False, False, True]
+
+        with mock.patch.object(lifecycle_module.time, "sleep") as sleep:
+            lifecycle._wait_for_unix_socket(socket, timeout=10.0)
+        self.assertEqual(sleep.call_count, 2)
+
+        probes.socket_probe_results = [False]
+        with (
+            mock.patch.object(
+                lifecycle_module.time,
+                "monotonic",
+                side_effect=(0.0, 1.0),
+            ),
+            mock.patch.object(lifecycle_module.time, "sleep"),
+            self.assertRaisesRegex(LifecycleError, "Unix socket.*not ready"),
+        ):
+            lifecycle._wait_for_unix_socket(socket, timeout=0.5)
 
     def test_xfs_final_local_cutoff_is_after_unmount_and_detach_before_sigkill(
         self,
