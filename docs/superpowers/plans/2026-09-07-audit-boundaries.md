@@ -35,14 +35,14 @@
 **Consumes:** existing RequestAttempt FIRST/RETRY state, P9_EOPIDSTALE handling, private transfer staging recovery.
 **Produces:** no epoch-zero Twrite override; generic ambiguous dispatch remains RETRY.
 
-- [ ] Add the A/applied/lost reply → B/write+fsync → server replay-state loss → A/retry regression; B must survive. Retain cached lost-reply success and proven non-dispatch FIRST retry tests.
-- [ ] Run the new regression against old behavior and record the failure.
-- [ ] Remove only the standalone wire flag override; use the existing dispatch state:
+- [x] Add the A/applied/lost reply → B/write+fsync → server replay-state loss → A/retry regression; B must survive. Retain cached lost-reply success and proven non-dispatch FIRST retry tests.
+- [x] Run the new regression against old behavior and record the failure.
+- [x] Remove only the standalone wire flag override; use the existing dispatch state:
   ```rust
   P9Message::new_with_op_id_flags_and_origin(tag, op_id, op_flags, origin_epoch, body.clone())
   ```
-- [ ] If transfer recovery now sees ambiguity, reconcile only privately owned staging or restart into a fresh temp object in the transfer layer; never silently retry arbitrary filesystem writes.
-- [ ] Run replay/client and applicable transfer tests, review and commit.
+- [x] If transfer recovery now sees ambiguity, reconcile only privately owned staging or restart into a fresh temp object in the transfer layer; never silently retry arbitrary filesystem writes.
+- [x] Run replay/client and applicable transfer tests, review and commit.
 
 ### Task 2: Bind upload verification to publication
 
@@ -50,11 +50,11 @@
 **Consumes:** existing directory-entry inode/cookie, ordered inode locks, metadata fences, volatile-overlay drain and durability barriers.
 **Produces:** filesystem-owned verified publication tied to source inode, entry identity, and content.
 
-- [ ] Add deterministic tests for source-path replacement, same-length overwrite, and truncate after verification observation; report conflict rather than publishing unverified bytes. Include accepted volatile overlay writes.
-- [ ] Observe the old race; do not settle for asserting mock callbacks.
-- [ ] Implement verification and conditional publication under existing fences/locks. Refactor a private locked rename core if necessary, rather than recursively acquiring locks or creating an upload-only lock system. If verification uses a generation token, every materialized and volatile mutation must invalidate it atomically.
-- [ ] Keep positive HTTP response bound to the verified inode and configured durability target. Preserve ordinary rename API behavior and destination conflict checks.
-- [ ] Run upload, rename, volatile mutation and durability regressions; commit the coherent slice.
+- [x] Add deterministic tests for source-path replacement, same-length overwrite, and truncate after verification observation; report conflict rather than publishing unverified bytes. Include accepted volatile overlay writes.
+- [x] Observe the old race; do not settle for asserting mock callbacks.
+- [x] Implement verification and conditional publication under existing fences/locks. Refactor a private locked rename core if necessary, rather than recursively acquiring locks or creating an upload-only lock system. If verification uses a generation token, every materialized and volatile mutation must invalidate it atomically.
+- [x] Keep positive HTTP response bound to the verified inode and configured durability target. Preserve ordinary rename API behavior and destination conflict checks.
+- [x] Run upload, rename, volatile mutation and durability regressions; commit the coherent slice.
 
 ### Task 3: Conditional assembly cleanup
 
@@ -62,10 +62,10 @@
 **Consumes:** parent/name, expected inode and directory-entry cookie from assembly resolution.
 **Produces:** internal compare-and-unlink using the same filesystem fences/transaction as unlink.
 
-- [ ] Reproduce pathname replacement between observation and cleanup; include remove/recreate and hard-link replacement. Replacement must survive.
-- [ ] Add an internal conditional unlink variant; compare expectation under existing locks before any unlink mutation. Ordinary remove remains unchanged.
-- [ ] Replace upload lookup-then-remove with that variant; skip/retain changed entries.
-- [ ] Run removal and assembly tests, review and commit.
+- [x] Reproduce pathname replacement between observation and cleanup; include remove/recreate and hard-link replacement. Replacement must survive.
+- [x] Add an internal conditional unlink variant; compare expectation under existing locks before any unlink mutation. Ordinary remove remains unchanged.
+- [x] Replace upload lookup-then-remove with that variant; skip/retain changed entries.
+- [x] Run removal and assembly tests, review and commit.
 
 ### Task 4: Bound aggregate HTTP ingress memory
 
@@ -73,10 +73,10 @@
 **Consumes:** upload_write_permits and filesystem-owned accepted writes.
 **Produces:** ingress request/byte ownership separate from active write permits, shared with assembly.
 
-- [ ] Add stalled partial-body and full-buffer/blocked-writer saturation tests asserting resident/request bounds and prompt overload rejection.
-- [ ] Acquire bounded ingress ownership before buffer allocation or filesystem entry creation. Account for retained frames plus copied chunks; lazily allocate and reject excess requests rather than building unbounded waiters.
-- [ ] Add body-idle and shutdown cancellation without canceling/replaying an already accepted mutation. Assembly participates in the same documented aggregate budget and write concurrency.
-- [ ] Retain slow-body fairness regression; test shutdown releases ingress ownership and accepted writes settle safely. Run upload suite and commit.
+- [x] Add stalled partial-body and full-buffer/blocked-writer saturation tests asserting resident/request bounds and prompt overload rejection.
+- [x] Acquire bounded ingress ownership before buffer allocation or filesystem entry creation. Account for retained frames plus copied chunks; lazily allocate and reject excess requests rather than building unbounded waiters.
+- [x] Add body-idle and shutdown cancellation without canceling/replaying an already accepted mutation. Assembly participates in the same documented aggregate budget and write concurrency.
+- [x] Retain slow-body fairness regression; test shutdown releases ingress ownership and accepted writes settle safely. Run upload suite and commit.
 
 ### Task 5: Bind destructive recovery evidence to journal identity
 
@@ -84,10 +84,10 @@
 **Consumes:** JournalIdentity (endpoint/kind/bucket/database prefix/encryption key identity) and bootstrap normalization.
 **Produces:** a shared comparison used by accept_remote_writeback_branch and reseed_writeback_predecessor before journal mutation.
 
-- [ ] Add config B/journal A mismatch cases for identity fields, with otherwise valid path/counter/hash evidence. Snapshot counters/rows/payloads and require unchanged state on rejection. Correct relocated offline journal remains valid.
-- [ ] Observe the missing guard before implementation.
-- [ ] Reuse/extract bootstrap identity normalization and read existing remote bucket/key identity without creating or initializing anything. Compare complete identity before mutation. Do not replace counter/hash/maintenance checks.
-- [ ] Run recovery/identity tests, review and commit.
+- [x] Add config B/journal A mismatch cases for identity fields, with otherwise valid path/counter/hash evidence. Snapshot counters/rows/payloads and require unchanged state on rejection. Correct relocated offline journal remains valid.
+- [x] Demonstrate the missing guard with an honest post-implementation guard-omission RED, restore the source exactly, then rerun GREEN.
+- [x] Reuse/extract bootstrap identity normalization and read existing remote bucket/key identity without creating or initializing anything. Compare complete identity before mutation. Do not replace counter/hash/maintenance checks.
+- [x] Run recovery/identity tests, review and commit.
 
 ### Task 6: Preserve healthy SFTP sessions during credential refresh
 
@@ -95,16 +95,39 @@
 **Consumes:** existing dial gate/backoff, session health/lease activity, session factory reload.
 **Produces:** refresh for future dials without unconditionally recycling established sessions; stale recovery decisions cannot override dial success.
 
-- [ ] Reproduce healthy established work + failed expansion dial + expired watchdog; healthy session must survive. Add successful-dial race and rebuild-None/failure cases.
-- [ ] Distinguish explicit credential rejection from transport failure during authentication.
-- [ ] Separate credential refresh from destructive recycling. Serialize or generation-check against dial success. Recycle only sessions independently evidenced unusable; no pool-wide cancellation merely because authentication timer expired.
-- [ ] Preserve genuine auth-stall recovery test and disabled-window behavior. Run transport suite, review and commit.
+- [x] Reproduce healthy established work + failed expansion dial + expired watchdog; healthy session must survive. Add successful-dial race and rebuild-None/failure cases.
+- [x] Distinguish explicit credential rejection from transport failure during authentication.
+- [x] Separate credential refresh from destructive recycling. Serialize or generation-check against dial success. Recycle only sessions independently evidenced unusable; no pool-wide cancellation merely because authentication timer expired.
+- [x] Preserve genuine auth-stall recovery test and disabled-window behavior. Run transport suite, review and commit.
 
 ## Integration and release gates
 
-- [ ] Review each full commit range for spec compliance and code quality; no mock-only race proof.
-- [ ] Merge reviewed commits into the main develop tree without absorbing unrelated changes.
-- [ ] Run full WebUI-enabled Rust library suite, ninep-client/transfer suites, formatting on touched files, and 179-test Proxmox suite. Record pre-existing failures separately.
+- [x] Review each full commit range for spec compliance and code quality; no mock-only race proof.
+- [x] Merge reviewed commits into the main develop tree without absorbing unrelated changes.
+- [x] Run full WebUI-enabled Rust library suite, ninep-client/transfer suites, formatting on touched files, and 179-test Proxmox suite. Record pre-existing failures separately.
 - [ ] Build the real production artifact only after all six findings are closed.
 - [ ] Production deployment remains subject to existing remote-drain, client quiescence, exact config/resource/namespace, rollback and live data-path verification gates; never bypass drain to finish faster.
 - [ ] Recheck all 1090 uploaded source paths/sizes, remote writeback, physical cache capacity and restoration of original host reserved blocks 46841676 after sustainable cache resizing.
+
+## Implementation receipts
+
+| Finding | Integrated commits | Isolated behavioral gates |
+|---|---|---|
+| Standalone replay | fe323f56 | Real A/B-fsync/replay-loss regression; 54 client session tests; retained cached replay; private staging retry |
+| Verified publication | 67d5aaa4 | 21 rename tests, including replacement, overwrite, truncate, and locked publication |
+| Conditional cleanup | 67d5aaa4 | 11 remove tests, including recreated and hard-link replacement entries |
+| HTTP memory admission | 55f8d385 | 24 WebUI tests; cancellation ownership and 4 MiB coalescing retained |
+| Recovery identity | f7bbe10a, 34099ff6 | 31 identity and 22 recovery tests; two invalid-evidence nonmutation regressions |
+| SFTP credential refresh | 418263ad | 9 authentication, 55 transport, and 19 russh-session tests |
+
+All six fixes had observed behavioral RED and fresh isolated GREEN. Task 5's guard-omission RED was performed after implementation and is not claimed as test-first. Shared-target and zero-test runs were rejected as acceptance evidence.
+
+Combined verification at 34099ff6 used the reconciled canonical Linux checkout and its default target, with unchanged compiler wrappers:
+
+- `cargo test --locked --features webui --lib -j2`: 1,945 passed, 0 failed, 19 ignored (89.13 seconds).
+- `cargo test --locked -p ninep-client -p zerofs-client -j2`: 71 + 2 unit tests and one documentation test passed.
+- Explicit generated-WASM reconnect smoke: 1 passed; this normally ignored test was run after `make webui` regenerated the real browser client.
+- `cargo fmt --all --check` and `git diff --check`: passed.
+- `python3 -m unittest discover -s proxmox/tests`: 179 passed (25.907 seconds).
+
+The maintained production WebUI build passed. Production release activation and physical client installation remain separate gates; the test results do not claim either occurred. Existing npm dependency audit advisories were not changed by this bounded correctness fix.
