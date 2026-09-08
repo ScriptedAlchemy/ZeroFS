@@ -96,13 +96,17 @@ mod tests {
     #[cfg(unix)]
     use std::{fs, os::unix::fs::PermissionsExt};
 
+    fn physical_child(temp: &tempfile::TempDir, name: &str) -> std::path::PathBuf {
+        temp.path().canonicalize().unwrap().join(name)
+    }
+
     #[tokio::test]
     async fn attachment_scopes_the_journal_and_routes_writes_through_the_overlay() {
         let temp = tempfile::tempdir().unwrap();
         let remote = Arc::new(InMemory::new());
         let (partitioned, controls) = FaultStore::new(remote.clone());
         controls.partition_writes(true);
-        let base = temp.path().join("dirty");
+        let base = physical_child(&temp, "dirty");
         let settings = WritebackSettings {
             dir: base.clone(),
             ack_mode: AckMode::Memory,
@@ -157,7 +161,7 @@ mod tests {
         let (partitioned, controls) = FaultStore::new(remote.clone());
         controls.partition_writes(true);
         let settings = WritebackSettings {
-            dir: temp.path().join("dirty"),
+            dir: physical_child(&temp, "dirty"),
             ack_mode: AckMode::Memory,
             memory_bytes: 1_000_000,
             disk_bytes: 10_000_000,
@@ -250,7 +254,7 @@ mod tests {
         let (partitioned, controls) = FaultStore::new(remote);
         controls.partition_writes(true);
         let settings = WritebackSettings {
-            dir: temp.path().join("dirty"),
+            dir: physical_child(&temp, "dirty"),
             ack_mode: AckMode::Memory,
             memory_bytes: 1_000_000,
             disk_bytes: 10_000_000,
@@ -329,7 +333,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let remote = Arc::new(InMemory::new());
         let settings = WritebackSettings {
-            dir: temp.path().join("dirty"),
+            dir: physical_child(&temp, "dirty"),
             ack_mode: AckMode::Memory,
             memory_bytes: 1_000_000,
             disk_bytes: 10_000_000,
@@ -408,7 +412,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let remote = Arc::new(InMemory::new());
         let settings = WritebackSettings {
-            dir: temp.path().join("dirty"),
+            dir: physical_child(&temp, "dirty"),
             ack_mode: AckMode::Memory,
             memory_bytes: 1_000_000,
             disk_bytes: 10_000_000,
@@ -454,7 +458,7 @@ mod tests {
     #[tokio::test]
     async fn attachment_rejects_an_existing_permissive_base_without_chmodding_it() {
         let temp = tempfile::tempdir().unwrap();
-        let base = temp.path().join("dirty");
+        let base = physical_child(&temp, "dirty");
         fs::create_dir(&base).unwrap();
         fs::set_permissions(&base, fs::Permissions::from_mode(0o755)).unwrap();
         let settings = WritebackSettings {
@@ -498,7 +502,7 @@ mod tests {
     #[tokio::test]
     async fn attachment_samples_the_namespaced_writeback_filesystem() {
         let temp = tempfile::tempdir().unwrap();
-        let base = temp.path().join("dirty");
+        let base = physical_child(&temp, "dirty");
         let settings = WritebackSettings {
             dir: base.clone(),
             ack_mode: AckMode::Memory,

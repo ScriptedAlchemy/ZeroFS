@@ -236,8 +236,9 @@ mod tests {
     async fn anchored_sample_survives_pathname_replacement() {
         use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::tempdir().unwrap();
-        let original = temp.path().join("original");
-        let retained = temp.path().join("retained");
+        let physical_root = temp.path().canonicalize().unwrap();
+        let original = physical_root.join("original");
+        let retained = physical_root.join("retained");
         std::fs::create_dir(&original).unwrap();
         std::fs::set_permissions(&original, std::fs::Permissions::from_mode(0o700)).unwrap();
         let anchored = AnchoredDir::open_or_create_absolute(&original, 0o700).unwrap();
