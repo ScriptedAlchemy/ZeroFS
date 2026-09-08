@@ -63,10 +63,7 @@ impl std::error::Error for PermanentError {
 }
 
 pub(crate) fn has_permanent_source(err: &object_store::Error) -> bool {
-    let object_store::Error::Generic { source, .. } = err else {
-        return false;
-    };
-    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(source.as_ref());
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(err);
     while let Some(error) = current {
         if error.is::<PermanentError>() {
             return true;

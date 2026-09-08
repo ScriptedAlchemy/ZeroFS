@@ -1,7 +1,9 @@
 use super::*;
+use crate::segment_store::{ConditionalMultipartCreate, GeneratedSegmentCreate};
 use crate::writeback::journaler::LocalJournaler;
 use crate::writeback::model::JournalIdentity;
 use async_trait::async_trait;
+use bytes::Bytes;
 use futures::future;
 use futures::stream::BoxStream;
 use object_store::local::LocalFileSystem;
@@ -117,6 +119,131 @@ struct BlockingAbortUpload {
 }
 
 #[derive(Debug)]
+struct ConditionalRaceStore {
+    inner: Arc<InMemory>,
+    complete_entered: Arc<Notify>,
+    release_complete: Arc<Notify>,
+    part_calls: Arc<AtomicUsize>,
+    aborts: Arc<AtomicUsize>,
+}
+
+impl Display for ConditionalRaceStore {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ConditionalRaceStore")
+    }
+}
+
+#[async_trait]
+impl ObjectStore for ConditionalRaceStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        options: PutOptions,
+    ) -> object_store::Result<PutResult> {
+        self.inner.put_opts(location, payload, options).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        options: PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        let capability = options
+            .extensions
+            .get::<ConditionalMultipartCreate>()
+            .cloned();
+        let create =
+            options.extensions.get::<GeneratedSegmentCreate>().is_some() || capability.is_some();
+        if create && let Some(capability) = capability {
+            capability.acknowledge();
+        }
+        Ok(Box::new(ConditionalRaceUpload {
+            inner: Arc::clone(&self.inner),
+            location: location.clone(),
+            create,
+            parts: Vec::new(),
+            complete_entered: Arc::clone(&self.complete_entered),
+            release_complete: Arc::clone(&self.release_complete),
+            part_calls: Arc::clone(&self.part_calls),
+            aborts: Arc::clone(&self.aborts),
+        }))
+    }
+
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: GetOptions,
+    ) -> object_store::Result<GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, object_store::Result<Path>>,
+    ) -> BoxStream<'static, object_store::Result<Path>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+#[derive(Debug)]
+struct ConditionalRaceUpload {
+    inner: Arc<InMemory>,
+    location: Path,
+    create: bool,
+    parts: Vec<Bytes>,
+    complete_entered: Arc<Notify>,
+    release_complete: Arc<Notify>,
+    part_calls: Arc<AtomicUsize>,
+    aborts: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl MultipartUpload for ConditionalRaceUpload {
+    fn put_part(&mut self, data: PutPayload) -> UploadPart {
+        self.part_calls.fetch_add(1, Ordering::SeqCst);
+        self.parts.push(Bytes::from(data));
+        Box::pin(async { Ok(()) })
+    }
+
+    async fn complete(&mut self) -> object_store::Result<PutResult> {
+        self.complete_entered.notify_one();
+        self.release_complete.notified().await;
+        let payload = PutPayload::from_iter(std::mem::take(&mut self.parts));
+        let mode = if self.create {
+            PutMode::Create
+        } else {
+            PutMode::Overwrite
+        };
+        self.inner
+            .put_opts(&self.location, payload, PutOptions::from(mode))
+            .await
+    }
+
+    async fn abort(&mut self) -> object_store::Result<()> {
+        self.aborts.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
 struct FailingAbortUpload;
 
 #[async_trait]
@@ -227,8 +354,11 @@ impl ObjectStore for SchedulerCleanupFailureStore {
     async fn put_multipart_opts(
         &self,
         _location: &Path,
-        _options: PutMultipartOptions,
+        options: PutMultipartOptions,
     ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        if let Some(capability) = options.extensions.get::<ConditionalMultipartCreate>() {
+            capability.acknowledge();
+        }
         let call = self.multipart_calls.fetch_add(1, Ordering::SeqCst);
         if call == 0 {
             Ok(Box::new(FailedPartAndAbortUpload {
@@ -389,6 +519,114 @@ async fn remote_replay_at_the_window_boundary_keeps_atomic_put_semantics() {
             .as_ref(),
         payload.as_slice()
     );
+}
+
+#[tokio::test]
+async fn large_generated_create_preserves_writer_landing_at_multipart_complete() {
+    let temp = tempfile::tempdir().unwrap();
+    let journal = Arc::new(Journal::open(temp.path().join("journal"), identity()).unwrap());
+    let payload = vec![0x71; REMOTE_SINGLE_PUT_BYTES as usize + 1];
+    let target = Path::from("zerofs/test/segments/01/0000000000000001/0000000000000001");
+    let record = crate::writeback::test_util::put_record(
+        1,
+        target.as_ref(),
+        &payload,
+        MutationMode::Create,
+        FenceClass::ImmutableCreate,
+        0x2000,
+        1_786_435_200_000,
+    );
+    let record = journal.commit_put(record, &payload).unwrap();
+    let complete_entered = Arc::new(Notify::new());
+    let release_complete = Arc::new(Notify::new());
+    let part_calls = Arc::new(AtomicUsize::new(0));
+    let aborts = Arc::new(AtomicUsize::new(0));
+    let store = Arc::new(ConditionalRaceStore {
+        inner: Arc::new(InMemory::new()),
+        complete_entered: Arc::clone(&complete_entered),
+        release_complete: Arc::clone(&release_complete),
+        part_calls: Arc::clone(&part_calls),
+        aborts: Arc::clone(&aborts),
+    });
+    let mut applying = tokio::spawn(apply_record_with_tracked_cleanup(
+        store.clone(),
+        journal,
+        record,
+    ));
+
+    let publication = tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::select! {
+            () = complete_entered.notified() => None,
+            result = &mut applying => Some(result),
+        }
+    })
+    .await;
+    match publication {
+        Ok(None) => {}
+        Ok(Some(result)) => panic!("large replay ended before multipart publication: {result:?}"),
+        Err(error) => {
+            release_complete.notify_one();
+            applying.abort();
+            let _ = applying.await;
+            panic!("large replay never reached multipart publication: {error}");
+        }
+    }
+    let competing = Bytes::from_static(b"competing incarnation");
+    store
+        .inner
+        .put(&target, competing.clone().into())
+        .await
+        .unwrap();
+    release_complete.notify_one();
+    let result = applying.await.unwrap();
+    let visible = store
+        .inner
+        .get(&target)
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+
+    assert!(
+        result.is_err(),
+        "conditional multipart replay silently replaced a competing writer"
+    );
+    assert_eq!(visible, competing);
+    assert_eq!(part_calls.load(Ordering::SeqCst), 3);
+    assert_eq!(aborts.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn large_create_aborts_when_backend_ignores_conditional_multipart_capability() {
+    let temp = tempfile::tempdir().unwrap();
+    let journal = Arc::new(Journal::open(temp.path().join("journal"), identity()).unwrap());
+    let payload = vec![0x72; REMOTE_SINGLE_PUT_BYTES as usize + 1];
+    let record = crate::writeback::test_util::put_record(
+        1,
+        "immutable-capability-required",
+        &payload,
+        MutationMode::Create,
+        FenceClass::ImmutableCreate,
+        0x2000,
+        1_786_435_200_000,
+    );
+    let record = journal.commit_put(record, &payload).unwrap();
+    let store = Arc::new(RecordingMultipartStore {
+        inner: Arc::new(LocalFileSystem::new_with_prefix(temp.path()).unwrap()),
+        put_opts_calls: AtomicUsize::new(0),
+        multipart_calls: AtomicUsize::new(0),
+        part_sizes: Arc::new(Mutex::new(Vec::new())),
+    });
+
+    let error = apply_record_with_tracked_cleanup(store.clone(), journal, record)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, object_store::Error::NotSupported { .. }));
+    assert!(is_terminal_remote_error(&error));
+    assert_eq!(store.multipart_calls.load(Ordering::SeqCst), 1);
+    assert!(store.part_sizes.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -567,6 +805,11 @@ async fn shipping_scheduler_terminally_drains_cleanup_failure_without_retry() {
                 .to_string()
                 .contains("injected multipart abort failure"),
         "unexpected shutdown error: {shutdown}"
+    );
+    assert_eq!(
+        scheduler.barrier().progress.sequence(),
+        0,
+        "terminal cleanup failure advanced the real worker frontier"
     );
     assert_eq!(store.multipart_calls.load(Ordering::SeqCst), 2);
     assert_eq!(failed_aborts.load(Ordering::SeqCst), 2);

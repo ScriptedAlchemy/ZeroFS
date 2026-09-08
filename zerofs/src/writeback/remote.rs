@@ -1,3 +1,4 @@
+use crate::segment_store::ConditionalMultipartCreate;
 use crate::writeback::admission::Admission;
 use crate::writeback::barrier::{BarrierError, SequenceBarrier, SequenceProgress};
 use crate::writeback::journal::Journal;
@@ -940,6 +941,9 @@ fn finish_ordered_commit(
 }
 
 fn is_terminal_remote_error(error: &object_store::Error) -> bool {
+    if crate::retrying_object_store::has_permanent_source(error) {
+        return true;
+    }
     match error {
         object_store::Error::AlreadyExists { source, .. } => source.is::<RemoteContentDivergence>(),
         object_store::Error::Precondition { source, .. } => source.is::<MissingRemotePredecessor>(),
@@ -952,7 +956,6 @@ fn is_terminal_remote_error(error: &object_store::Error) -> bool {
                     Some(crate::sftp_transport::TransportError::PoolClosed)
                 )
         }
-        _ if crate::retrying_object_store::has_permanent_source(error) => true,
         _ => false,
     }
 }
@@ -1435,10 +1438,25 @@ async fn stream_record_to_remote(
             Err(error) => Err(error),
         };
     }
+    if matches!(mode, PutMode::Update(_)) {
+        return Err(object_store::Error::NotSupported {
+            source: Box::new(crate::retrying_object_store::PermanentError::new(
+                std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "large conditional Update requires backend multipart update support",
+                ),
+            )),
+        });
+    }
     let mut multipart_options = PutMultipartOptions::default();
     multipart_options
         .extensions
         .insert(crate::retrying_object_store::CallerOwnsRetries);
+    let conditional_create = matches!(mode, PutMode::Create)
+        .then(|| ConditionalMultipartCreate::for_payload_len(blob.len()));
+    if let Some(capability) = &conditional_create {
+        multipart_options.extensions.insert(capability.clone());
+    }
     let upload = bounded_remote_step(
         record,
         "multipart initiation",
@@ -1446,6 +1464,20 @@ async fn stream_record_to_remote(
     )
     .await?;
     let mut owner = RemoteMultipartOwner::new(upload, cleanup_sender, cleanup_state);
+    if conditional_create
+        .as_ref()
+        .is_some_and(|capability| !capability.is_acknowledged())
+    {
+        let error = object_store::Error::NotSupported {
+            source: Box::new(crate::retrying_object_store::PermanentError::new(
+                std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "backend ignored conditional multipart Create capability",
+                ),
+            )),
+        };
+        return abort_remote_multipart(&mut owner, record, error).await;
+    }
     let mut parts = FuturesUnordered::new();
     while let Some(chunk) = chunks.next().await {
         let chunk = match chunk {
@@ -1483,26 +1515,28 @@ async fn stream_record_to_remote(
         }
     }
 
-    // Known gap: unlike the single-put path, whose Create/Update mode is
-    // enforced atomically by the backend, multipart emulates the precondition
-    // with this HEAD followed by an unconditional complete(). A concurrent
-    // writer (realistically a not-yet-fenced stale incarnation during
-    // failover) landing between the two is silently clobbered. Incarnation
-    // checks in remote_put_mode shrink the window; closing it needs backend
-    // support for conditional multipart completion.
+    // Overwrite remains unconditional. Create was capability-checked before
+    // the first part, so its complete is atomic at a supporting backend.
     if let Some(existing) =
         reconcile_precondition(remote.as_ref(), &journal, record, target, mode).await?
     {
         bounded_remote_step(record, "multipart precondition abort", owner.abort()).await?;
         return Ok(existing);
     }
-    bounded_remote_step_with_timeout(
+    let result = bounded_remote_step_with_timeout(
         record,
         "multipart completion",
         REMOTE_PUBLICATION_TIMEOUT,
         owner.complete(),
     )
-    .await
+    .await;
+    match result {
+        Ok(result) => Ok(result),
+        Err(object_store::Error::AlreadyExists { .. }) if matches!(mode, PutMode::Create) => {
+            verify_existing(remote.as_ref(), &journal, record, target).await
+        }
+        Err(error) => Err(error),
+    }
 }
 
 async fn abort_remote_multipart<T>(
@@ -2255,6 +2289,21 @@ mod tests {
                 > crate::sftp_object_store::SFTP_STAGING_CLEANUP_ATTEMPTS,
             "pool shutdown must drain the final owner-scheduled cleanup"
         );
+    }
+
+    #[test]
+    fn scheduler_classifier_distinguishes_plain_and_permanent_not_supported_errors() {
+        let plain = object_store::Error::NotSupported {
+            source: "temporary backend limitation".into(),
+        };
+        assert!(!is_terminal_remote_error(&plain));
+
+        let permanent = object_store::Error::NotSupported {
+            source: Box::new(crate::retrying_object_store::PermanentError::new(
+                std::io::Error::new(std::io::ErrorKind::Unsupported, "missing atomic create"),
+            )),
+        };
+        assert!(is_terminal_remote_error(&permanent));
     }
 
     #[tokio::test]

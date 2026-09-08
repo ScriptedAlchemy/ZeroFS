@@ -1117,7 +1117,10 @@ impl ObjectStore for SftpObjectStore {
         location: &ObjectPath,
         opts: PutMultipartOptions,
     ) -> object_store::Result<Box<dyn MultipartUpload>> {
-        let mode = if opts.extensions.get::<GeneratedSegmentCreate>().is_some() {
+        let conditional_create = opts.extensions.get::<ConditionalMultipartCreate>().cloned();
+        let mode = if opts.extensions.get::<GeneratedSegmentCreate>().is_some()
+            || conditional_create.is_some()
+        {
             PublicationMode::Create
         } else {
             PublicationMode::Overwrite
@@ -1137,7 +1140,7 @@ impl ObjectStore for SftpObjectStore {
         .await
         .map_err(|error| publication_error(location, error))?;
         if mode == PublicationMode::Create
-            && let Some(context) = opts.extensions.get::<ConditionalMultipartCreate>()
+            && let Some(context) = conditional_create
         {
             context.acknowledge();
         }
@@ -5311,6 +5314,49 @@ mod tests {
                 .unwrap()
                 .as_ref(),
             b"immutable multipart"
+        );
+
+        let generic_location = ObjectPath::from("zerofs/v1/generic-multipart-create.bin");
+        let capability = ConditionalMultipartCreate::default();
+        let mut options = PutMultipartOptions::default();
+        options.extensions.insert(capability.clone());
+        let mut generic = store
+            .put_multipart_opts(&generic_location, options)
+            .await
+            .unwrap();
+        assert!(capability.is_acknowledged());
+        generic
+            .put_part(PutPayload::from_static(b"generic create"))
+            .await
+            .unwrap();
+        generic.complete().await.unwrap();
+
+        let capability = ConditionalMultipartCreate::default();
+        let mut options = PutMultipartOptions::default();
+        options.extensions.insert(capability.clone());
+        let mut conflicting = store
+            .put_multipart_opts(&generic_location, options)
+            .await
+            .unwrap();
+        assert!(capability.is_acknowledged());
+        conflicting
+            .put_part(PutPayload::from_static(b"replacement"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            conflicting.complete().await.unwrap_err(),
+            object_store::Error::AlreadyExists { .. }
+        ));
+        assert_eq!(
+            store
+                .get(&generic_location)
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap()
+                .as_ref(),
+            b"generic create"
         );
     }
 }
