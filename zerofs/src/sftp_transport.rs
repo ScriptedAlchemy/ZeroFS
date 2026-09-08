@@ -121,13 +121,13 @@ const SFTP_IDLE_REAP_INTERVAL: Duration = Duration::from_secs(10);
 /// disables the watchdog; the production value comes from
 /// `[sftp] flush_stall_recycle_secs`.
 const SFTP_FLUSH_STALL_RECYCLE_DISABLED: u64 = 0;
-/// A backend can reject every dial at authentication while a fresh process
-/// presenting the identical key file succeeds: the in-process client state
-/// is what has gone bad, and the shared dial backoff will retry it forever.
-/// When no dial has authenticated for this long since the first rejection,
-/// the watchdog reloads the identity, rebuilds the session factory, recycles
-/// pooled sessions and resets the backoff. Zero disables it; production
-/// takes `[sftp] auth_stall_recycle_secs`.
+/// A backend can reject every future dial at authentication while established
+/// sessions remain healthy. When no dial has authenticated for this long since
+/// the first explicit rejection, the watchdog attempts to reload the identity,
+/// rebuilds the session factory for future dials when possible, and resets the
+/// backoff after a successful rebuild. Established sessions are independent of
+/// that refresh and remain available. Zero disables it; production takes
+/// `[sftp] auth_stall_recycle_secs`.
 const SFTP_AUTH_STALL_RECYCLE_DISABLED: u64 = 0;
 const SFTP_IDLE_WARM_FLOOR: usize = 1;
 const SFTP_POOL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(45);
@@ -168,6 +168,8 @@ pub enum TransportError {
     MissingCapability(&'static str),
     #[error("failed to open SFTP session: {0}")]
     Open(String),
+    #[error("SFTP authentication rejected: {0}")]
+    AuthenticationRejected(String),
     #[error("failed to close SFTP session: {0}")]
     Close(String),
     #[error("SFTP session pool is closed")]
@@ -754,18 +756,11 @@ struct DialBackoff {
     next_allowed: Option<Instant>,
 }
 
-/// A dial that reached the server and was refused at authentication. The
-/// three phrasings are the ones `russh_session` produces for a rejected
-/// key, a failed auth exchange, and a server that offered no usable method.
+/// A dial that reached the server and was explicitly refused at
+/// authentication. Transport failures during the authentication exchange
+/// remain ordinary open failures and must not arm credential refresh.
 fn is_auth_rejection(error: &TransportError) -> bool {
-    match error {
-        TransportError::Open(message) => {
-            message.contains("authentication rejected")
-                || message.contains("authentication failed")
-                || message.contains("No authentication method")
-        }
-        _ => false,
-    }
+    matches!(error, TransportError::AuthenticationRejected(_))
 }
 
 /// Watchdog state: the completion count last observed and how long write
@@ -1135,19 +1130,37 @@ impl PoolInner {
     }
 
     /// Every dial rejected at authentication since the first rejection, for
-    /// at least the configured window, means the in-process client is what
-    /// has gone bad — the identity file on disk was accepted by a fresh
-    /// process the whole time. Recover the way a restart does, in place:
-    /// reload the identity into a rebuilt factory, force-close every pooled
-    /// session (a stale server-side session count is one plausible reason
-    /// new dials are refused), and clear the backoff so the next dial is
-    /// immediate. The log line is ERROR because silence here cost a day.
-    fn check_auth_stall(self: &Arc<Self>) {
+    /// at least the configured window, triggers an attempt to refresh the
+    /// credentials used by future dials. Serialize with dials and re-check
+    /// after acquiring the gate: a successful dial racing this watchdog
+    /// clears the rejection streak and must not be overwritten by a stale
+    /// factory swap. Existing sessions are not evidence of failed
+    /// authentication and are preserved; their independent health and
+    /// flush-stall paths still retire them when needed. The log line is ERROR
+    /// because silence here cost a day.
+    async fn check_auth_stall(self: &Arc<Self>) {
         let window = self.auth_stall_recycle_millis.load(Ordering::SeqCst);
         if window == SFTP_AUTH_STALL_RECYCLE_DISABLED || self.closed.load(Ordering::SeqCst) {
             return;
         }
         let window = Duration::from_millis(window);
+        {
+            let auth = self
+                .auth_stall
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let Some(rejected_since) = auth.rejected_since else {
+                return;
+            };
+            if Instant::now().saturating_duration_since(rejected_since) < window {
+                return;
+            }
+        }
+
+        let _dial_turn = self.dial_gate.lock().await;
+        if self.closed.load(Ordering::SeqCst) {
+            return;
+        }
         let now = Instant::now();
         let (stalled_for, rejections, recovery) = {
             let mut auth = self
@@ -1184,21 +1197,22 @@ impl PoolInner {
                 None => false,
             }
         };
-        let recycled = self.recycle_all_sessions();
-        *self
-            .dial_backoff
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = DialBackoff::default();
+        if rebuilt {
+            *self
+                .dial_backoff
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = DialBackoff::default();
+        }
+        let sessions_preserved = self.roster.lock().unwrap().len();
         tracing::error!(
             stalled_secs = stalled_for.as_secs(),
             rejected_dials = rejections,
             factory_rebuilt = rebuilt,
-            sessions_recycled = recycled,
+            sessions_preserved,
             recovery,
-            "SFTP authentication has been rejected on every dial since the \
-             stall began; reloaded the identity into a rebuilt session \
-             factory, recycled pooled sessions and reset the dial backoff so \
-             the next dial starts from clean client state"
+            "SFTP authentication rejection window expired; attempted \
+             credential refresh for future dials without disturbing \
+             established sessions"
         );
         metrics::counter!("zerofs_sftp_pool_auth_recoveries_total").increment(1);
     }
@@ -1451,7 +1465,7 @@ impl SftpSessionPool {
                         };
                         inner.reap_expired_idle().await;
                         inner.check_flush_stall();
-                        inner.check_auth_stall();
+                        inner.check_auth_stall().await;
                     }
                 }
             }
@@ -2524,6 +2538,12 @@ mod tests {
         dials: AtomicUsize,
         rejecting: AtomicBool,
         rebuilds: AtomicUsize,
+        rebuild_returns_none: AtomicBool,
+        closes: AtomicUsize,
+        successful_ops: AtomicUsize,
+        block_dial: AtomicUsize,
+        open_started: Notify,
+        allow_open: Notify,
     }
 
     /// Generation 0 is a client whose in-process state has gone bad: every
@@ -2542,23 +2562,216 @@ mod tests {
             &self,
             _force: CancellationToken,
         ) -> Result<Box<dyn TransportSession>, TransportError> {
-            self.state.dials.fetch_add(1, Ordering::SeqCst);
+            let dial = self.state.dials.fetch_add(1, Ordering::SeqCst) + 1;
+            if self.state.block_dial.load(Ordering::SeqCst) == dial {
+                self.state.open_started.notify_one();
+                self.state.allow_open.notified().await;
+            }
             if self.state.rejecting.load(Ordering::SeqCst) && self.generation == 0 {
-                return Err(TransportError::Open(
-                    "public-key authentication rejected for /srv/zerofs-persist/current/storage-key"
-                        .to_owned(),
+                return Err(TransportError::AuthenticationRejected(
+                    "/srv/zerofs-persist/current/storage-key".to_owned(),
                 ));
             }
-            Ok(Box::new(FlakyDialSession))
+            Ok(Box::new(AuthStallSession {
+                state: self.state.clone(),
+            }))
         }
 
         fn rebuild(&self) -> Option<Arc<dyn SessionFactory>> {
             self.state.rebuilds.fetch_add(1, Ordering::SeqCst);
+            if self.state.rebuild_returns_none.load(Ordering::SeqCst) {
+                return None;
+            }
             Some(Arc::new(AuthStallFactory {
                 state: self.state.clone(),
                 generation: self.generation + 1,
             }))
         }
+    }
+
+    #[derive(Debug)]
+    struct AuthStallSession {
+        state: Arc<AuthStallState>,
+    }
+
+    #[async_trait]
+    impl TransportSession for AuthStallSession {
+        fn capabilities(&self) -> SftpCapabilities {
+            SftpCapabilities {
+                fsync: true,
+                hardlink: true,
+                posix_rename: true,
+            }
+        }
+
+        async fn ensure_directory_component(
+            &self,
+            _path: &std::path::Path,
+        ) -> Result<(), TransportError> {
+            self.state.successful_ops.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn close(&self, _force: CancellationToken) -> Result<(), TransportError> {
+            self.state.closes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn auth_watchdog_distinguishes_rejection_from_auth_exchange_transport_failure() {
+        assert!(super::is_auth_rejection(
+            &TransportError::AuthenticationRejected("configured identity".to_owned())
+        ));
+        assert!(!super::is_auth_rejection(&TransportError::Open(
+            "public-key authentication exchange failed: connection closed by remote side"
+                .to_owned()
+        )));
+    }
+
+    /// A rejected expansion dial says the credentials for future sessions may
+    /// be stale. It does not say the established session carrying foreground
+    /// work is unusable, so credential refresh must not cancel that work.
+    #[tokio::test(start_paused = true)]
+    async fn auth_refresh_preserves_healthy_session_after_rejected_expansion_dial() {
+        let state = Arc::new(AuthStallState::default());
+        let pool = SftpSessionPool::new_writable(
+            Arc::new(AuthStallFactory {
+                state: state.clone(),
+                generation: 0,
+            }),
+            2,
+            2,
+            2,
+        )
+        .await
+        .unwrap();
+        pool.inner
+            .auth_stall_recycle_millis
+            .store(60_000, Ordering::SeqCst);
+
+        let mut established = pool.checkout(OperationKind::Write).await.unwrap();
+        established
+            .ensure_directory_component(std::path::Path::new("before-refresh"))
+            .await
+            .unwrap();
+        state.rejecting.store(true, Ordering::SeqCst);
+        let fallback = pool.checkout(OperationKind::Read).await.unwrap();
+        assert_eq!(state.dials.load(Ordering::SeqCst), 2);
+
+        tokio::time::advance(Duration::from_secs(60) + SFTP_IDLE_REAP_INTERVAL).await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert_eq!(state.rebuilds.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            state.closes.load(Ordering::SeqCst),
+            0,
+            "credential refresh must not close the established session"
+        );
+
+        established
+            .ensure_directory_component(std::path::Path::new("after-refresh"))
+            .await
+            .unwrap();
+        assert_eq!(state.successful_ops.load(Ordering::SeqCst), 2);
+        established.complete().await.unwrap();
+        fallback.complete().await.unwrap();
+
+        // The old healthy session remains usable, while expansion uses the
+        // freshly rebuilt factory even though generation 0 still rejects.
+        let established_again = pool.checkout(OperationKind::Write).await.unwrap();
+        let expanded = pool.checkout(OperationKind::Read).await.unwrap();
+        assert_eq!(state.dials.load(Ordering::SeqCst), 3);
+        established_again.complete().await.unwrap();
+        expanded.complete().await.unwrap();
+        pool.shutdown().await.unwrap();
+    }
+
+    /// Reloading credentials can fail (the russh factory reports that as
+    /// `None`). That failure must leave independently healthy sessions alone.
+    #[tokio::test(start_paused = true)]
+    async fn failed_auth_refresh_preserves_healthy_session() {
+        let state = Arc::new(AuthStallState::default());
+        state.rebuild_returns_none.store(true, Ordering::SeqCst);
+        let pool = SftpSessionPool::new_writable(
+            Arc::new(AuthStallFactory {
+                state: state.clone(),
+                generation: 0,
+            }),
+            2,
+            2,
+            2,
+        )
+        .await
+        .unwrap();
+        pool.inner
+            .auth_stall_recycle_millis
+            .store(5_000, Ordering::SeqCst);
+
+        let established = pool.checkout(OperationKind::Write).await.unwrap();
+        state.rejecting.store(true, Ordering::SeqCst);
+        let fallback = pool.checkout(OperationKind::Read).await.unwrap();
+
+        tokio::time::advance(SFTP_IDLE_REAP_INTERVAL).await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert_eq!(state.rebuilds.load(Ordering::SeqCst), 1);
+        assert_eq!(state.closes.load(Ordering::SeqCst), 0);
+
+        established.complete().await.unwrap();
+        fallback.complete().await.unwrap();
+        let still_healthy = pool.checkout(OperationKind::Read).await.unwrap();
+        still_healthy.complete().await.unwrap();
+        pool.shutdown().await.unwrap();
+    }
+
+    /// A successful dial holding the dial gate must clear the rejection
+    /// streak before a queued watchdog can act on its stale observation.
+    #[tokio::test(start_paused = true)]
+    async fn successful_dial_racing_auth_refresh_wins_before_factory_swap() {
+        let state = Arc::new(AuthStallState::default());
+        let pool = SftpSessionPool::new_writable(
+            Arc::new(AuthStallFactory {
+                state: state.clone(),
+                generation: 0,
+            }),
+            2,
+            2,
+            2,
+        )
+        .await
+        .unwrap();
+        pool.inner
+            .auth_stall_recycle_millis
+            .store(5_000, Ordering::SeqCst);
+
+        let established = pool.checkout(OperationKind::Write).await.unwrap();
+        state.rejecting.store(true, Ordering::SeqCst);
+        let fallback = pool.checkout(OperationKind::Read).await.unwrap();
+        fallback.complete().await.unwrap();
+
+        state.rejecting.store(false, Ordering::SeqCst);
+        state.block_dial.store(3, Ordering::SeqCst);
+        let racing_pool = pool.clone();
+        let racing_dial =
+            tokio::spawn(async move { racing_pool.checkout(OperationKind::Read).await });
+        state.open_started.notified().await;
+
+        tokio::time::advance(SFTP_IDLE_REAP_INTERVAL).await;
+        tokio::task::yield_now().await;
+        state.allow_open.notify_one();
+        let opened = racing_dial.await.unwrap().unwrap();
+        opened.complete().await.unwrap();
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            state.rebuilds.load(Ordering::SeqCst),
+            0,
+            "a successful dial must invalidate the queued recovery decision"
+        );
+        established.complete().await.unwrap();
+        pool.shutdown().await.unwrap();
     }
 
     /// Observed live: the backend rejected every russh dial at
@@ -2597,7 +2810,10 @@ mod tests {
             .unwrap();
         for _ in 0..3 {
             let error = pool.checkout(OperationKind::Read).await.unwrap_err();
-            assert!(matches!(error, TransportError::Open(_)), "{error:?}");
+            assert!(
+                matches!(error, TransportError::AuthenticationRejected(_)),
+                "{error:?}"
+            );
         }
         assert_eq!(
             state.rebuilds.load(Ordering::SeqCst),
@@ -2657,7 +2873,7 @@ mod tests {
         assert_eq!(state.rebuilds.load(Ordering::SeqCst), 0);
         assert!(matches!(
             pool.checkout(OperationKind::Read).await,
-            Err(TransportError::Open(_))
+            Err(TransportError::AuthenticationRejected(_))
         ));
         pool.shutdown().await.unwrap();
     }
@@ -2688,8 +2904,14 @@ mod tests {
         tokio::time::advance(Duration::from_secs(30) + SFTP_IDLE_REAP_INTERVAL).await;
         tokio::task::yield_now().await;
         let auth = pool.inner.auth_stall.lock().unwrap();
-        assert_eq!(auth.recoveries, 0, "non-auth failures must not trigger recovery");
-        assert!(auth.rejected_since.is_none(), "non-auth failures must not arm the tracker");
+        assert_eq!(
+            auth.recoveries, 0,
+            "non-auth failures must not trigger recovery"
+        );
+        assert!(
+            auth.rejected_since.is_none(),
+            "non-auth failures must not arm the tracker"
+        );
         drop(auth);
         state.fail.store(false, Ordering::SeqCst);
         pool.shutdown().await.unwrap();

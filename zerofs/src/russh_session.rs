@@ -196,16 +196,21 @@ async fn authenticate_identity(
     let authenticated = handle
         .authenticate_publickey(username, PrivateKeyWithHashAlg::new(identity_key, hash))
         .await
-        .map_err(|error| {
-            TransportError::Open(format!("public-key authentication failed: {error}"))
+        .map_err(|error| match error {
+            russh::Error::NoAuthMethod => TransportError::AuthenticationRejected(format!(
+                "server offered no usable public-key method for {}",
+                identity_file.display()
+            )),
+            error => TransportError::Open(format!(
+                "public-key authentication exchange failed: {error}"
+            )),
         })?;
     if authenticated.success() {
         Ok(())
     } else {
-        Err(TransportError::Open(format!(
-            "public-key authentication rejected for {}",
-            identity_file.display()
-        )))
+        Err(TransportError::AuthenticationRejected(
+            identity_file.display().to_string(),
+        ))
     }
 }
 
@@ -822,7 +827,10 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
             .open(CancellationToken::new())
             .await
             .expect_err("the server must reject a client key it did not configure");
-        assert!(matches!(error, TransportError::Open(_)), "{error:?}");
+        assert!(
+            matches!(error, TransportError::AuthenticationRejected(_)),
+            "{error:?}"
+        );
     }
 
     #[tokio::test]
