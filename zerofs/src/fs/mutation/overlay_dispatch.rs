@@ -2,7 +2,8 @@
 
 use super::admission::AcceptedMutation;
 use super::fence::MutationCoordinator;
-use super::types::{MutationError, PreparedBatchResult, PreparedWriteBatch};
+use super::materializer::Materializer;
+use super::types::{PreparedBatchResult, PreparedWriteBatch};
 use super::volatile_overlay::{OverlayError, OverlayResult};
 use crate::fs::ZeroFS;
 use crate::fs::errors::FsError;
@@ -70,7 +71,11 @@ impl PendingDispatch {
         })
     }
 
-    pub(crate) async fn arrive(&self, fs: Arc<ZeroFS>) -> OverlayResult<()> {
+    pub(crate) async fn arrive_held(
+        &self,
+        fs: Arc<ZeroFS>,
+        materializer: &Materializer,
+    ) -> OverlayResult<()> {
         if let Some(result) = *self.result.lock().expect("pending dispatch poisoned") {
             return result;
         }
@@ -83,7 +88,7 @@ impl PendingDispatch {
                 dispatch: self,
                 armed: true,
             };
-            return completion.finish(self.dispatch(fs).await);
+            return completion.finish(self.dispatch_held(fs, materializer).await);
         }
         loop {
             let changed = self.changed.notified();
@@ -107,6 +112,23 @@ impl PendingDispatch {
         self.set_result(Ok(()));
     }
 
+    pub(crate) fn fail_terminal(&self) {
+        self.set_result(Err(OverlayError::IoError));
+        self.cancelled.cancel();
+        self.accepted
+            .lock()
+            .expect("pending dispatch poisoned")
+            .take();
+        if let Some(accepted_write) = self
+            .accepted_write
+            .lock()
+            .expect("pending dispatch poisoned")
+            .take()
+        {
+            accepted_write.finish(false);
+        }
+    }
+
     pub(crate) fn install_accepted_write(
         &self,
         accepted_write: crate::dedup::AcceptedWriteLifecycle,
@@ -128,7 +150,11 @@ impl PendingDispatch {
         self.changed.notify_waiters();
     }
 
-    async fn dispatch(&self, fs: Arc<ZeroFS>) -> OverlayResult<()> {
+    async fn dispatch_held(
+        &self,
+        fs: Arc<ZeroFS>,
+        materializer: &Materializer,
+    ) -> OverlayResult<()> {
         let receiver = self
             .accepted
             .lock()
@@ -156,15 +182,7 @@ impl PendingDispatch {
             coordinator: Arc::clone(&coordinator),
             armed: true,
         };
-        let result = match (fs.materializer.get(), accepted_write) {
-            (Some(materializer), Some(accepted_write)) => {
-                materializer
-                    .dispatch_accepted_through(cutoff, batch, accepted_write)
-                    .await
-            }
-            (Some(materializer), None) => materializer.dispatch_through(cutoff, batch).await,
-            (None, _) => Err(MutationError::Closed),
-        };
+        let result = materializer.apply_held(cutoff, batch, accepted_write).await;
         coordinator.request_cache().complete(
             request,
             result.as_ref().map(|_| reply).map_err(|_| FsError::IoError),
@@ -194,7 +212,7 @@ mod tests {
     use super::*;
     use crate::fs::mutation::admission::PreparationGate;
     use crate::fs::mutation::progress::MutationProgress;
-    use crate::fs::mutation::types::MutationIncarnation;
+    use crate::fs::mutation::types::{MutationError, MutationIncarnation};
 
     #[test]
     fn cancelled_published_dispatch_poison_progress_instead_of_leaving_a_hole() {
