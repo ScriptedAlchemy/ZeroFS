@@ -1678,7 +1678,12 @@ mod tests {
         let MutationReservation::Ssd(mutation) = promoted.mutation else {
             panic!("expected SSD multipart promotion")
         };
-        let (disk, cleanup) = mutation.into_owned(staging.clone());
+        let (disk, cleanup) = mutation.into_owned(
+            crate::writeback::multipart_reservation::MultipartStaging::from_existing_test_path(
+                staging.clone(),
+            )
+            .unwrap(),
+        );
         let observer = Arc::new(BlockingObserver::default());
         let admission = Admission::new(64);
         let journaler = LocalJournaler::start_with_observer_and_space(
@@ -1730,7 +1735,12 @@ mod tests {
         let MutationReservation::Ssd(mutation) = promoted.mutation else {
             panic!("expected SSD multipart promotion")
         };
-        let (disk, cleanup) = mutation.into_owned(staging.clone());
+        let (disk, cleanup) = mutation.into_owned(
+            crate::writeback::multipart_reservation::MultipartStaging::from_existing_test_path(
+                staging.clone(),
+            )
+            .unwrap(),
+        );
         let (commit_entered_tx, _commit_entered) = tokio_mpsc::unbounded_channel();
         let (staged_tx, _staged) = tokio_mpsc::unbounded_channel();
         let (_release_tx, release_rx) = mpsc::channel();
@@ -1812,7 +1822,12 @@ mod tests {
             let MutationReservation::Ssd(mutation) = promoted.mutation else {
                 panic!("expected SSD multipart promotion")
             };
-            let (disk, cleanup) = mutation.into_owned(staging.clone());
+            let (disk, cleanup) = mutation.into_owned(
+                crate::writeback::multipart_reservation::MultipartStaging::from_existing_test_path(
+                    staging.clone(),
+                )
+                .unwrap(),
+            );
             submissions.push((record, verified, disk, cleanup, staging));
         }
         let (prepare_entered_tx, mut prepare_entered) = tokio_mpsc::unbounded_channel();
@@ -2353,7 +2368,12 @@ mod tests {
         let MutationReservation::Ssd(mutation) = promoted.mutation else {
             panic!("expected SSD multipart promotion")
         };
-        let (disk, cleanup) = mutation.into_owned(staging.clone());
+        let (disk, cleanup) = mutation.into_owned(
+            crate::writeback::multipart_reservation::MultipartStaging::from_existing_test_path(
+                staging.clone(),
+            )
+            .unwrap(),
+        );
         let mut cleanup = Some(cleanup);
         let journaler = LocalJournaler::start_with_observer_and_space(
             journal,

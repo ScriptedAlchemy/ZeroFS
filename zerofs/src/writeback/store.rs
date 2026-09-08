@@ -10,9 +10,9 @@ use crate::writeback::model::{
     classify_mutation_fence,
 };
 use crate::writeback::multipart_reservation::{
-    CleanedMultipartStaging, MultipartReservationSet, MultipartStagingCleanup, MutationReservation,
-    RamMultipartPartReservation, SsdMultipartPartReservation, promote_multipart,
-    remove_aborted_ssd_multipart,
+    CleanedMultipartStaging, MultipartReservationSet, MultipartStaging, MultipartStagingCleanup,
+    MutationReservation, RamMultipartPartReservation, SsdMultipartPartReservation,
+    promote_multipart, remove_aborted_ssd_multipart,
 };
 use crate::writeback::overlay::{OverlayCommitObserver, OverlayIndex, VisibleVersion};
 use crate::writeback::payload::VerifiedPayload;
@@ -36,13 +36,10 @@ use object_store::{
     RenameOptions, RenameTargetMode, UpdateVersion, UploadPart,
 };
 use std::collections::hash_map::DefaultHasher;
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::hash::{Hash, Hasher};
 #[cfg(not(unix))]
 use std::io::Write;
-#[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::{Path as FilePath, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{Mutex, Notify, OwnedMutexGuard};
@@ -1000,9 +997,9 @@ impl ObjectStore for WritebackObjectStore {
             None
         } else {
             Some(
-                allocate_multipart_staging(&self.inner.settings.dir).map_err(|error| {
-                    generic_error(format!("failed to allocate multipart staging: {error}"))
-                })?,
+                allocate_multipart_staging(&self.inner.journal.anchored_root()).map_err(
+                    |error| generic_error(format!("failed to allocate multipart staging: {error}")),
+                )?,
             )
         };
         let declared_payload_len =
@@ -1176,7 +1173,7 @@ struct WritebackMultipartUpload {
     store: WritebackObjectStore,
     location: Path,
     options: PutMultipartOptions,
-    staging: Option<PathBuf>,
+    staging: Option<MultipartStaging>,
     memory_parts: bool,
     state: Arc<StdMutex<MultipartState>>,
     notify: Arc<Notify>,
@@ -1464,10 +1461,10 @@ impl MultipartUpload for WritebackMultipartUpload {
                     },
                 )
             };
-            let part_path = staging.join("payload.staged");
             let (write, aborted) = tokio::task::spawn_blocking(move || {
-                let write = ensure_multipart_staging(&staging)
-                    .and_then(|()| write_multipart_part(&part_path, data, offset))
+                let write = staging
+                    .payload_file()
+                    .and_then(|file| write_multipart_part(&file, data, offset))
                     .map_err(|error| {
                         generic_error(format!("multipart part write failed: {error}"))
                     });
@@ -1622,10 +1619,10 @@ impl Drop for WritebackMultipartUpload {
         } else if let Some(staging) = staging {
             ssd.poison(format!(
                 "multipart runtime disappeared with active staging writes at {}",
-                staging.display()
+                staging.display_path().display()
             ));
             tracing::error!(
-                path = %staging.display(),
+                path = %staging.display_path().display(),
                 "multipart runtime disappeared with active staging writes; claims retained"
             );
         } else {
@@ -1758,7 +1755,7 @@ async fn complete_multipart(
     store: WritebackObjectStore,
     location: Path,
     options: PutMultipartOptions,
-    staging: PathBuf,
+    staging: MultipartStaging,
     parts: Vec<MultipartPart>,
     total_len: u64,
     preowned_reservation: Option<MultipartPartReservation>,
@@ -1817,11 +1814,10 @@ async fn complete_multipart(
     };
     let (disk, cleanup) = ssd.into_owned(staging.clone());
     if create_empty_staging {
-        let empty_path = staging.join("payload.staged");
         let empty_staging = staging.clone();
         let write = tokio::task::spawn_blocking(move || {
-            ensure_multipart_staging(&empty_staging)?;
-            write_multipart_part(&empty_path, Bytes::new().into(), 0)
+            let file = empty_staging.payload_file()?;
+            write_multipart_part(&file, Bytes::new().into(), 0)
         })
         .await
         .map_err(|error| generic_error(format!("empty multipart staging task failed: {error}")))
@@ -1833,9 +1829,20 @@ async fn complete_multipart(
             return cleanup_failed_multipart(&store, disk, cleanup, error).await;
         }
     }
-    let payload_path = staging.join("payload.staged");
+    let payload_file = match staging.payload_file() {
+        Ok(file) => file,
+        Err(error) => {
+            return cleanup_failed_multipart(
+                &store,
+                disk,
+                cleanup,
+                generic_error(format!("multipart payload open failed: {error}")),
+            )
+            .await;
+        }
+    };
     let payload = tokio::task::spawn_blocking(move || {
-        VerifiedPayload::from_staged_file(payload_path, total_len)
+        VerifiedPayload::from_open_staged_file(payload_file, total_len)
     })
     .await
     .map_err(|error| generic_error(format!("multipart verification task failed: {error}")))
@@ -1904,7 +1911,7 @@ fn take_multipart_reservations(state: &StdMutex<MultipartState>) -> Vec<Multipar
 }
 
 fn remove_aborted_reservations(
-    staging: PathBuf,
+    staging: MultipartStaging,
     reservations: Vec<MultipartPartReservation>,
 ) -> std::io::Result<Option<CleanedMultipartStaging>> {
     let mut ssd_reservations = Vec::with_capacity(reservations.len());
@@ -1981,7 +1988,7 @@ async fn wait_for_multipart_cleanup(
 async fn reject_multipart_part(
     state: Arc<StdMutex<MultipartState>>,
     notify: Arc<Notify>,
-    staging: Option<PathBuf>,
+    staging: Option<MultipartStaging>,
     ssd: SsdAdmission,
     space: Arc<PhysicalSpaceSampler>,
 ) -> object_store::Result<()> {
@@ -2002,7 +2009,7 @@ async fn reject_multipart_part(
 
 async fn cleanup_aborted_multipart(
     state: &StdMutex<MultipartState>,
-    staging: Option<PathBuf>,
+    staging: Option<MultipartStaging>,
     ssd: SsdAdmission,
     space: Arc<PhysicalSpaceSampler>,
 ) -> object_store::Result<()> {
@@ -2063,34 +2070,22 @@ async fn release_cleaned_multipart(
     Ok(())
 }
 
-fn allocate_multipart_staging(writeback_root: &FilePath) -> std::io::Result<PathBuf> {
-    let root = writeback_root.join("tmp").join("multipart");
-    match fs::create_dir(&root) {
-        Ok(()) => set_directory_mode(&root)?,
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(error),
-    }
-    validate_private_directory(&root)?;
-    Ok(root.join(Uuid::new_v4().to_string()))
+fn allocate_multipart_staging(
+    writeback_root: &crate::writeback::anchored_dir::AnchoredDir,
+) -> std::io::Result<MultipartStaging> {
+    let tmp = writeback_root
+        .open_or_create_child("tmp".as_ref(), 0o700)
+        .map_err(|error| std::io::Error::other(format!("{error:#}")))?;
+    let multipart = tmp
+        .open_or_create_child("multipart".as_ref(), 0o700)
+        .map_err(|error| std::io::Error::other(format!("{error:#}")))?;
+    Ok(MultipartStaging::new(
+        multipart,
+        Uuid::new_v4().to_string().into(),
+    ))
 }
 
-fn ensure_multipart_staging(staging: &FilePath) -> std::io::Result<()> {
-    match fs::create_dir(staging) {
-        Ok(()) => set_directory_mode(staging)?,
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(error),
-    }
-    validate_private_directory(staging)
-}
-
-fn write_multipart_part(path: &FilePath, payload: PutPayload, offset: u64) -> std::io::Result<()> {
-    let mut options = OpenOptions::new();
-    options.write(true).create(true);
-    #[cfg(unix)]
-    options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-    let file = options.open(path)?;
-    #[cfg(unix)]
-    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+fn write_multipart_part(file: &fs::File, payload: PutPayload, offset: u64) -> std::io::Result<()> {
     let mut written = 0u64;
     for chunk in payload {
         let mut remaining = chunk.as_ref();
@@ -2120,28 +2115,6 @@ fn write_multipart_part(path: &FilePath, payload: PutPayload, offset: u64) -> st
         }
     }
     file.sync_data()
-}
-
-fn validate_private_directory(path: &FilePath) -> std::io::Result<()> {
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(std::io::Error::other(
-            "multipart staging root is not a directory",
-        ));
-    }
-    #[cfg(unix)]
-    if metadata.permissions().mode() & 0o777 != 0o700 {
-        return Err(std::io::Error::other(
-            "multipart staging root is not mode 0700",
-        ));
-    }
-    Ok(())
-}
-
-fn set_directory_mode(path: &FilePath) -> std::io::Result<()> {
-    #[cfg(unix)]
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-    Ok(())
 }
 
 fn validate_put_mode(
@@ -2288,8 +2261,9 @@ async fn reserve_ssd_token_from_sample_with_observer(
 #[cfg(test)]
 mod tests {
     use super::{
-        MultipartPart, MultipartPartReservation, MultipartState, RamMultipartPartReservation,
-        WritebackObjectStore, reserve_ssd_token_from_sample, take_multipart_reservations,
+        MultipartPart, MultipartPartReservation, MultipartStaging, MultipartState,
+        RamMultipartPartReservation, WritebackObjectStore, reserve_ssd_token_from_sample,
+        take_multipart_reservations,
     };
     use crate::config::CompressionConfig;
     use crate::fault_store::{FaultControls, FaultStore};
@@ -4517,9 +4491,19 @@ mod tests {
         }));
         let notify = Arc::new(tokio::sync::Notify::new());
         let temp = tempfile::tempdir().unwrap();
-        let staging = temp.path().join("multipart-staging");
-        std::fs::create_dir(&staging).unwrap();
-        std::fs::write(staging.join("unexpected-owner"), b"keep directory nonempty").unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let parent = crate::writeback::anchored_dir::AnchoredDir::open_or_create_absolute(
+            &temp.path().canonicalize().unwrap(),
+            0o700,
+        )
+        .unwrap();
+        let staging = MultipartStaging::new(parent, "multipart-staging".into());
+        staging.payload_file().unwrap();
+        std::fs::write(
+            staging.display_path().join("unexpected-owner"),
+            b"keep directory nonempty",
+        )
+        .unwrap();
         let space = Arc::new(PhysicalSpaceSampler::new(temp.path().to_path_buf()));
         let ssd = SsdAdmission::new(1024, 8, 95, 85, 0).unwrap();
 
@@ -4722,6 +4706,42 @@ mod tests {
         assert_eq!(
             store.get(&path).await.unwrap().bytes().await.unwrap(),
             Bytes::new()
+        );
+        store.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn nonempty_multipart_staging_stays_anchored_after_root_replacement() {
+        let (store, _remote, temp) =
+            test_store_with_resource_limits(AckMode::Ssd, 8, 1_000_000, 100).await;
+        let path = Path::from("anchored-multipart");
+        let mut upload = store.put_multipart(&path).await.unwrap();
+        upload
+            .put_part(Bytes::from_static(b"anchored payload").into())
+            .await
+            .unwrap();
+
+        let original = temp.path().join("writeback");
+        let retained = temp.path().join("retained-writeback");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("sentinel"), b"outside").unwrap();
+        std::fs::rename(&original, &retained).unwrap();
+        std::os::unix::fs::symlink(&outside, &original).unwrap();
+
+        upload.complete().await.unwrap();
+        store.wait_local(1).await.unwrap();
+        assert_eq!(
+            store.get(&path).await.unwrap().bytes().await.unwrap(),
+            Bytes::from_static(b"anchored payload")
+        );
+        assert_eq!(std::fs::read(outside.join("sentinel")).unwrap(), b"outside");
+        assert!(!outside.join("tmp").exists());
+        let multipart_root = retained.join("tmp/multipart");
+        assert!(
+            std::fs::read_dir(&multipart_root).unwrap().next().is_none(),
+            "anchored multipart cleanup left a UUID directory"
         );
         store.shutdown().await.unwrap();
     }

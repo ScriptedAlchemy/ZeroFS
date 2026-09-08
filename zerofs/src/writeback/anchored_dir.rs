@@ -358,6 +358,15 @@ impl AnchoredDir {
         }
     }
 
+    pub(crate) fn remove_empty_dir_if_exists(&self, name: &OsStr) -> Result<bool> {
+        validate_component(name)?;
+        match unlinkat(self.fd.as_ref(), name, AtFlags::REMOVEDIR) {
+            Ok(()) => Ok(true),
+            Err(Errno::NOENT) => Ok(false),
+            Err(error) => Err(anyhow::Error::new(error)).context("remove anchored directory"),
+        }
+    }
+
     pub(crate) fn for_each_entry(&self, mut visit: impl FnMut(&OsStr) -> Result<()>) -> Result<()> {
         let scan = openat(self.fd.as_ref(), ".", DIRECTORY_FLAGS, Mode::empty())
             .map_err(anyhow::Error::new)
