@@ -635,11 +635,21 @@ mod tests {
         let missing = temp.path().join("missing-journal");
         let error =
             Journal::open_existing_with_identity(&missing, recovery_identity()).unwrap_err();
-        assert!(format!("{error:#}").contains("database does not exist"));
+        let diagnostic = format!("{error:#}");
+        assert!(
+            diagnostic.contains("anchored directory") && diagnostic.contains("does not exist"),
+            "{diagnostic}"
+        );
         assert!(!missing.exists(), "missing journal must not be initialized");
 
         let missing_identity = temp.path().join("missing-identity");
         fs::create_dir(&missing_identity).unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(
+            &missing_identity,
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
         let database_path = missing_identity.join("journal.redb");
         drop(redb::Database::create(&database_path).unwrap());
         #[cfg(unix)]
