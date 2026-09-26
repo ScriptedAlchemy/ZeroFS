@@ -20,7 +20,7 @@ segment_size_mib = 32
 read_cache_part_size_kib = 1024
 
 [filesystem]
-max_size_gb = 6000.0
+max_size_gb = 20000.0
 ignore_fsync = false
 
 [writeback]
