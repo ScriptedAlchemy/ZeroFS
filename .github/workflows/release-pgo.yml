@@ -531,12 +531,12 @@ jobs:
       - name: Build with PGO (cargo)
         if: matrix.platform != 'freebsd' && !matrix.bolt
         run: |
-          cd zerofs && RUSTFLAGS="--cfg tokio_unstable --cfg io_uring_skip_arch_check -C profile-use=$(pwd)/merged.profdata ${{ matrix.extra_rustflags }}" cargo build --release --features webui --target ${{ matrix.target }}
+          cd zerofs && RUSTFLAGS="--cfg tokio_unstable --cfg io_uring_skip_arch_check -C profile-use=$(pwd)/merged.profdata" cargo build --release --features webui --target ${{ matrix.target }}
 
       - name: Build with PGO + BOLT relocs (cargo)
         if: matrix.platform != 'freebsd' && matrix.bolt
         run: |
-          cd zerofs && RUSTFLAGS="--cfg tokio_unstable --cfg io_uring_skip_arch_check -C profile-use=$(pwd)/merged.profdata -C link-arg=-Wl,--emit-relocs -C strip=none ${{ matrix.extra_rustflags }}" cargo build --release --features webui --target ${{ matrix.target }}
+          cd zerofs && RUSTFLAGS="--cfg tokio_unstable --cfg io_uring_skip_arch_check -C profile-use=$(pwd)/merged.profdata -C link-arg=-Wl,--emit-relocs -C strip=none" cargo build --release --features webui --target ${{ matrix.target }}
 
       - name: Build on FreeBSD with PGO
         if: matrix.platform == 'freebsd'

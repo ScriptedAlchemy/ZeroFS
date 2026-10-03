@@ -235,6 +235,72 @@ pub type RemoteResult<T> = Result<T, RemoteError>;
 pub struct StagingCleanupDebt {
     path: PathBuf,
     error: Box<RemoteError>,
+    recovery: Option<StagingCleanupRecovery>,
+}
+
+#[derive(Debug)]
+struct StagingCleanupRecovery {
+    session: Arc<dyn RemoteSession>,
+    path: PathBuf,
+    settled: std::sync::atomic::AtomicBool,
+}
+
+impl Drop for StagingCleanupRecovery {
+    fn drop(&mut self) {
+        if !self.settled.load(std::sync::atomic::Ordering::Acquire) {
+            self.session.schedule_cleanup(self.path.clone());
+        }
+    }
+}
+
+fn transient_staging_recovery(error: &object_store::Error) -> Option<&StagingCleanupRecovery> {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(current) = source {
+        if let Some(RemoteError::CleanupRequired { debt, .. }) =
+            current.downcast_ref::<RemoteError>()
+            && let Some(recovery) = &debt.recovery
+        {
+            return Some(recovery);
+        }
+        source = current.source();
+    }
+    None
+}
+
+/// Settle the owned staging object before journal replay. Cancellation keeps
+/// cleanup armed; conflicts and closed pools remain terminal.
+pub(crate) async fn recover_transient_staging_cleanup(
+    error: &object_store::Error,
+) -> object_store::Result<bool> {
+    let Some(recovery) = transient_staging_recovery(error) else {
+        return Ok(false);
+    };
+    let mut delay = std::time::Duration::from_secs(1);
+    loop {
+        let result =
+            bounded_reconciliation(&recovery.path, recovery.session.remove_file(&recovery.path))
+                .await;
+        match result {
+            Ok(()) | Err(RemoteError::NotFound(_)) => {
+                recovery
+                    .settled
+                    .store(true, std::sync::atomic::Ordering::Release);
+                tracing::info!(path = %recovery.path.display(), "recovered transient SFTP staging cleanup; journal replay can resume");
+                return Ok(true);
+            }
+            Err(error) if error.is_retryable() => {
+                tracing::warn!(path = %recovery.path.display(), %error, retry_secs = delay.as_secs(), "SFTP staging cleanup is pending; retaining journal record without republishing");
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(std::time::Duration::from_secs(30));
+            }
+            Err(error) => {
+                return Err(object_store::Error::Generic {
+                    store: STORE_NAME,
+                    source: Box::new(crate::retrying_object_store::PermanentError::new(error)),
+                });
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -525,10 +591,22 @@ async fn failure_with_cleanup(cleanup: &mut StagingCleanup, operation: RemoteErr
     }
     match cleanup.remove_before_retry().await {
         Ok(()) => operation,
-        Err(debt) => RemoteError::CleanupRequired {
-            operation: Box::new(operation),
-            debt,
-        },
+        Err(mut debt) => {
+            if operation.is_retryable() && debt.error.is_retryable() {
+                // Transfer ownership instead of racing background cleanup with
+                // the scheduler's recovery. Dropping the error still cleans up.
+                debt.recovery = Some(StagingCleanupRecovery {
+                    session: cleanup.session.clone(),
+                    path: debt.path.clone(),
+                    settled: std::sync::atomic::AtomicBool::new(false),
+                });
+                cleanup.disarm();
+            }
+            RemoteError::CleanupRequired {
+                operation: Box::new(operation),
+                debt,
+            }
+        }
     }
 }
 
@@ -563,6 +641,7 @@ impl StagingCleanup {
             Err(error) => Err(StagingCleanupDebt {
                 path,
                 error: Box::new(error),
+                recovery: None,
             }),
         }
     }
@@ -1758,6 +1837,7 @@ mod tests {
                 debt: StagingCleanupDebt {
                     path: PathBuf::from("staging"),
                     error: Box::new(RemoteError::PoolClosed),
+                    recovery: None,
                 },
             },
         );

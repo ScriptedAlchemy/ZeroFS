@@ -611,7 +611,7 @@ async fn run_remote_scheduler(worker: RemoteWorker) {
                         } else {
                             applying.await
                         };
-                        (record, result)
+                        (record, recover_publication_result(result).await)
                     });
                 }
             }
@@ -938,6 +938,26 @@ fn finish_ordered_commit(
     progress.send_modify(|state| state.sequence = sequence);
     *next = incremented;
     Ok(())
+}
+
+async fn recover_publication_result(
+    result: object_store::Result<PutResult>,
+) -> object_store::Result<PutResult> {
+    match result {
+        Err(error) => {
+            if crate::sftp_object_store::recover_transient_staging_cleanup(&error).await? {
+                // Cleanup is proven complete, but publication may have committed
+                // before its reply was lost. Normal journal replay reconciles
+                // the existing target's bytes; never mark this record complete.
+                Err(generic_error(format!(
+                    "transient SFTP cleanup recovered; retry publication: {error}"
+                )))
+            } else {
+                Err(error)
+            }
+        }
+        Ok(result) => Ok(result),
+    }
 }
 
 fn is_terminal_remote_error(error: &object_store::Error) -> bool {
@@ -1829,8 +1849,8 @@ mod tests {
     use super::{
         CompletedRemote, REMOTE_OPERATION_TIMEOUT, REMOTE_PUBLICATION_TIMEOUT, SchedulerWindow,
         apply_record_with_tracked_cleanup, bounded_remote_operation, collect_pipeline_batch,
-        is_terminal_remote_error, load_scheduler_window, validate_scheduler_window,
-        verify_existing,
+        is_terminal_remote_error, load_scheduler_window, recover_publication_result,
+        validate_scheduler_window, verify_existing,
     };
     use crate::fault_store::FaultStore;
     use crate::writeback::journal::Journal;
@@ -1840,8 +1860,11 @@ mod tests {
     use bytes::Bytes;
     use futures::future;
     use object_store::memory::InMemory;
-    use object_store::{ObjectStore, ObjectStoreExt, PutPayload, PutResult, path::Path};
+    use object_store::{
+        ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, PutResult, path::Path,
+    };
     use std::sync::Arc;
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
 
     fn record(sequence: u64, path: &str, fence: FenceClass) -> MutationRecord {
@@ -2159,6 +2182,8 @@ mod tests {
         writes: std::sync::atomic::AtomicUsize,
         removes: std::sync::atomic::AtomicUsize,
         cleanup_pool_closed: std::sync::atomic::AtomicBool,
+        cleanup_recovered: std::sync::atomic::AtomicBool,
+        cleanup_denied: std::sync::atomic::AtomicBool,
     }
 
     #[derive(Debug, Clone)]
@@ -2217,6 +2242,22 @@ mod tests {
             self.0
                 .removes
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self
+                .0
+                .cleanup_recovered
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Ok(());
+            }
+            if self
+                .0
+                .cleanup_denied
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(crate::sftp_transport::TransportError::PermissionDenied(
+                    "injected cleanup permission failure".to_owned(),
+                ));
+            }
             if self
                 .0
                 .cleanup_pool_closed
@@ -2279,6 +2320,7 @@ mod tests {
                 >= crate::sftp_object_store::SFTP_STAGING_CLEANUP_ATTEMPTS,
             "the SFTP layer must settle its bounded inline cleanup attempts before returning"
         );
+        drop(error);
         let shutdown = pool.shutdown().await;
         assert!(
             shutdown.is_err(),
@@ -2288,6 +2330,102 @@ mod tests {
             state.removes.load(std::sync::atomic::Ordering::SeqCst)
                 > crate::sftp_object_store::SFTP_STAGING_CLEANUP_ATTEMPTS,
             "pool shutdown must drain the final owner-scheduled cleanup"
+        );
+    }
+
+    async fn transient_cleanup_failure() -> (
+        Arc<CleanupDebtTransportState>,
+        crate::sftp_transport::SftpSessionPool,
+        object_store::Error,
+    ) {
+        let state = Arc::new(CleanupDebtTransportState::default());
+        let pool = crate::sftp_transport::SftpSessionPool::new_writable(
+            Arc::new(CleanupDebtFactory(state.clone())),
+            1,
+            1,
+            1,
+        )
+        .await
+        .unwrap();
+        let backend =
+            crate::sftp_object_store::SftpObjectStore::new(pool.clone(), Path::from("root"))
+                .unwrap();
+        let error = backend
+            .put_opts(
+                &Path::from("root/cleanup-recovery"),
+                Bytes::from_static(b"durable publication").into(),
+                PutOptions {
+                    mode: PutMode::Create,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(state.writes.load(Ordering::SeqCst), 1, "{error:?}");
+        (state, pool, error)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transient_cleanup_recovery_waits_without_republishing() {
+        let (state, pool, error) = transient_cleanup_failure().await;
+        let recovery = tokio::spawn(recover_publication_result(Err(error)));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while state.removes.load(Ordering::SeqCst)
+                <= crate::sftp_object_store::SFTP_STAGING_CLEANUP_ATTEMPTS
+            {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("cleanup recovery must start");
+        assert!(!recovery.is_finished());
+        assert_eq!(state.writes.load(Ordering::SeqCst), 1);
+        state.cleanup_recovered.store(true, Ordering::SeqCst);
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let error = recovery
+            .await
+            .unwrap()
+            .expect_err("recovery must retry, not acknowledge publication");
+        assert!(!is_terminal_remote_error(&error));
+        assert_eq!(state.writes.load(Ordering::SeqCst), 1);
+        pool.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transient_cleanup_recovery_permission_failure_stays_terminal() {
+        let (state, pool, error) = transient_cleanup_failure().await;
+        state.cleanup_denied.store(true, Ordering::SeqCst);
+        let error = recover_publication_result(Err(error)).await.unwrap_err();
+        assert!(is_terminal_remote_error(&error));
+        assert!(error.to_string().contains("permission"), "{error:?}");
+        assert_eq!(state.writes.load(Ordering::SeqCst), 1);
+        // The failed cleanup owner still schedules its final cleanup on drop.
+        state.cleanup_denied.store(false, Ordering::SeqCst);
+        state.cleanup_recovered.store(true, Ordering::SeqCst);
+        pool.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transient_cleanup_recovery_cancellation_preserves_cleanup() {
+        let (state, pool, error) = transient_cleanup_failure().await;
+        let recovery = tokio::spawn(recover_publication_result(Err(error)));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while state.removes.load(Ordering::SeqCst)
+                <= crate::sftp_object_store::SFTP_STAGING_CLEANUP_ATTEMPTS
+            {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("cleanup recovery must start");
+        state.cleanup_recovered.store(true, Ordering::SeqCst);
+        recovery.abort();
+        assert!(recovery.await.unwrap_err().is_cancelled());
+        pool.shutdown().await.unwrap();
+        assert_eq!(state.writes.load(Ordering::SeqCst), 1);
+        assert!(
+            state.removes.load(Ordering::SeqCst)
+                > crate::sftp_object_store::SFTP_STAGING_CLEANUP_ATTEMPTS + 1
         );
     }
 
