@@ -58,6 +58,7 @@ jobs:
     name: Collect PGO Profile Data - ${{ matrix.test }}
     needs: build-instrumented
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     strategy:
       matrix:
         test: [9p, fuse, zfs-on-zerofs, nfs-kernel-compile]
@@ -347,12 +348,20 @@ jobs:
 
             sudo mkdir -p /mnt/zerofs
             sudo mount -t nfs -o vers=3,async,nolock,rsize=1048576,wsize=1048576,tcp,port=2049,mountport=2049,hard 127.0.0.1:/ /mnt/zerofs
-            cd /mnt/zerofs
+            # Profile compiler output I/O through NFS, not hours of serial source
+            # extraction. The dedicated kernel-compile-nfs workflow still tests
+            # an entire source tree on NFS; this job collects optimization data.
+            KERNEL_SOURCE=$(mktemp -d /tmp/zerofs-pgo-kernel.XXXXXX)
+            cd "$KERNEL_SOURCE"
+            echo "Preparing Linux sources on the runner's local disk"
             wget -q https://git.kernel.org/torvalds/t/linux-7.2-rc1.tar.gz
             tar -xf linux-7.2-rc1.tar.gz
             cd linux-7.2-rc1
-            make tinyconfig
-            make -j$(nproc)
+            echo "Compiling Linux with all build output on ZeroFS NFS"
+            mkdir /mnt/zerofs/linux-build
+            make O=/mnt/zerofs/linux-build tinyconfig
+            make O=/mnt/zerofs/linux-build -j$(nproc)
+            test -s /mnt/zerofs/linux-build/vmlinux
             cd /
             sudo umount /mnt/zerofs || true
             kill -TERM $ZEROFS_PID || true
