@@ -2,13 +2,14 @@
 Description=ZeroFS private storage server in Proxmox LXC
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 EnvironmentFile=-/srv/zerofs-persist/current/zerofs.env
 ExecStart=/srv/zerofs-persist/current/zerofs run --config /srv/zerofs-persist/current/zerofs.toml
 Restart=on-failure
-RestartSec=2s
+RestartSec=30s
 TimeoutStopSec=120s
 LimitNOFILE=1048576
 OOMScoreAdjust=-500

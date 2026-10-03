@@ -523,6 +523,7 @@ enum ServingStopCause {
     Signal,
     LeadershipLost,
     ListenerFailure(anyhow::Error),
+    BackendFailure(anyhow::Error),
 }
 
 impl ServingStopCause {
@@ -538,9 +539,19 @@ impl ServingStopCause {
         match self {
             Self::Signal => None,
             Self::LeadershipLost => Some(leadership_lost_error()),
-            Self::ListenerFailure(error) => Some(error),
+            Self::ListenerFailure(error) | Self::BackendFailure(error) => Some(error),
         }
     }
+}
+
+async fn wait_for_sftp_failure(
+    pool: Option<&crate::sftp_transport::SftpSessionPool>,
+) -> anyhow::Error {
+    match pool {
+        Some(pool) => pool.wait_closed().await,
+        None => std::future::pending().await,
+    }
+    anyhow::anyhow!("SFTP connection pool closed while serving; stopping for journal-safe restart")
 }
 
 fn merge_cleanup_results(
@@ -1741,6 +1752,15 @@ pub async fn run_server(
                 info!("Received SIGTERM, initiating graceful shutdown...");
                 ServingStopCause::Signal
             }
+            error = wait_for_sftp_failure(sftp_pool_for_close.as_ref()) => {
+                // A pool with unresolved physical-session ownership cannot be
+                // reopened safely in process. Stop through the normal local
+                // durability lifecycle; the service manager can start a fresh
+                // process against the retained journal. Content divergence does
+                // not close the pool and must never trigger this recovery.
+                tracing::error!(%error, "SFTP backend stopped; initiating shutdown");
+                ServingStopCause::BackendFailure(error)
+            }
             result = server_handles.next() => {
                 let error = listener_exit_error(
                     result.expect("validated server handles cannot be empty"),
@@ -2560,6 +2580,27 @@ min_free_gb = 256.0
         assert!(alive_rx.await.is_err(), "stuck listener was not joined");
         let message = format!("{:#}", finish_serving_shutdown(cause, Ok(())).unwrap_err());
         assert!(message.starts_with("HA writer was fenced or superseded"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn non_sftp_backend_has_no_transport_failure_signal() {
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                wait_for_sftp_failure(None),
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn closed_backend_remains_a_process_failure_after_graceful_cleanup() {
+        let cause = ServingStopCause::BackendFailure(anyhow::anyhow!("pool closed"));
+        assert!(!cause.is_signal());
+        assert!(!cause.is_leadership_lost());
+        let error = finish_serving_shutdown(cause, Ok(())).unwrap_err();
+        assert_eq!(error.to_string(), "pool closed");
     }
 
     #[test]

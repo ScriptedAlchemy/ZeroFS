@@ -500,6 +500,7 @@ async fn run_remote_scheduler(worker: RemoteWorker) {
         cleanup_receiver,
         upload_concurrency,
         Arc::clone(&cleanup_state),
+        Some(stop.clone()),
     ));
     // A new burst gets one coalescing window. Once its local tail is known, do
     // not make each intervening manifest fence pay that delay again.
@@ -824,6 +825,7 @@ async fn drain_remote_multipart_cleanup(
     mut receiver: mpsc::Receiver<Box<dyn MultipartUpload>>,
     cleanup_concurrency: usize,
     state: Arc<RemoteCleanupState>,
+    stop: Option<watch::Receiver<bool>>,
 ) -> Result<(), String> {
     let mut active = JoinSet::new();
     let mut input_closed = false;
@@ -836,6 +838,7 @@ async fn drain_remote_multipart_cleanup(
             upload = receiver.recv(), if !input_closed && active.len() < cleanup_concurrency.max(1) => {
                 match upload {
                     Some(mut upload) => {
+                        let mut stop = stop.clone();
                         active.spawn(async move {
                             match tokio::time::timeout(REMOTE_OPERATION_TIMEOUT, upload.abort()).await {
                                 Ok(Ok(())) => Ok(()),
@@ -847,7 +850,25 @@ async fn drain_remote_multipart_cleanup(
                                 // the store over an already-resolved handle would
                                 // turn that benign race into an outage.
                                 Ok(Err(object_store::Error::NotFound { .. })) => Ok(()),
-                                Ok(Err(error)) => Err(error.to_string()),
+                                Ok(Err(error)) => {
+                                    tokio::select! {
+                                        biased;
+                                        recovered = crate::sftp_object_store::recover_transient_staging_cleanup(&error) => {
+                                            match recovered {
+                                                Ok(true) => Ok(()),
+                                                Ok(false) => Err(error.to_string()),
+                                                Err(error) => Err(error.to_string()),
+                                            }
+                                        }
+                                        _ = wait_for_cleanup_stop(&mut stop) => {
+                                            // Only shutdown may abandon this in-memory
+                                            // wait. Dropping the typed error hands its
+                                            // staging path to bounded pool cleanup; the
+                                            // uncommitted durable journal remains intact.
+                                            Ok(())
+                                        }
+                                    }
+                                }
                                 Err(_) => Err(format!(
                                     "timed out after {:.3}s",
                                     REMOTE_OPERATION_TIMEOUT.as_secs_f64()
@@ -881,6 +902,17 @@ async fn drain_remote_multipart_cleanup(
     first_error.map_or(Ok(()), Err)
 }
 
+async fn wait_for_cleanup_stop(stop: &mut Option<watch::Receiver<bool>>) {
+    let Some(stop) = stop else {
+        return std::future::pending().await;
+    };
+    while !*stop.borrow() {
+        if stop.changed().await.is_err() {
+            break;
+        }
+    }
+}
+
 #[cfg(test)]
 async fn apply_record_with_tracked_cleanup(
     remote: Arc<dyn ObjectStore>,
@@ -893,6 +925,7 @@ async fn apply_record_with_tracked_cleanup(
         cleanup_receiver,
         1,
         Arc::clone(&cleanup_state),
+        None,
     ));
     let result = apply_record(
         remote,
@@ -1566,9 +1599,17 @@ async fn abort_remote_multipart<T>(
 ) -> object_store::Result<T> {
     match bounded_remote_step(record, "multipart abort", owner.abort()).await {
         Ok(()) => Err(error),
-        Err(abort_error) => Err(generic_error(format!(
-            "{error}; remote multipart abort also failed: {abort_error}"
-        ))),
+        Err(abort_error) => {
+            if crate::sftp_object_store::recover_transient_staging_cleanup(&abort_error).await? {
+                // Preserve the original publication error, including permanent
+                // failures; settling a transient cleanup must never mask it.
+                Err(error)
+            } else {
+                Err(generic_error(format!(
+                    "{error}; remote multipart abort also failed: {abort_error}"
+                )))
+            }
+        }
     }
 }
 

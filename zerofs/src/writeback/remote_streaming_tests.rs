@@ -433,6 +433,399 @@ fn identity() -> JournalIdentity {
     }
 }
 
+// Exercise the shipping pool, object-store publication, journal and scheduler;
+// only the remote server is replaced with deterministic stored bytes/faults.
+#[derive(Debug, Default)]
+struct RecoveryServer {
+    files: Mutex<std::collections::HashMap<std::path::PathBuf, Vec<u8>>>,
+    outage: AtomicBool,
+    // 1: lost hard-link reply, 2: failed part, 3/4: cleanup outage on collision.
+    fault: AtomicUsize,
+    writes: AtomicUsize,
+    removes: AtomicUsize,
+}
+
+#[derive(Debug, Clone)]
+struct RecoverySession(Arc<RecoveryServer>);
+
+#[async_trait]
+impl crate::sftp_transport::SessionFactory for RecoverySession {
+    async fn open(
+        &self,
+        _force: tokio_util::sync::CancellationToken,
+    ) -> Result<
+        Box<dyn crate::sftp_transport::TransportSession>,
+        crate::sftp_transport::TransportError,
+    > {
+        Ok(Box::new(self.clone()))
+    }
+}
+
+impl RecoverySession {
+    fn available(&self) -> Result<(), crate::sftp_transport::TransportError> {
+        if self.0.outage.load(Ordering::SeqCst) {
+            Err(crate::sftp_transport::TransportError::Operation(
+                "temporary server outage".to_owned(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[async_trait]
+impl crate::sftp_transport::TransportSession for RecoverySession {
+    fn capabilities(&self) -> crate::sftp_object_store::SftpCapabilities {
+        crate::sftp_object_store::SftpCapabilities {
+            fsync: true,
+            hardlink: true,
+            posix_rename: true,
+        }
+    }
+
+    async fn ensure_directory_component(
+        &self,
+        _path: &std::path::Path,
+    ) -> Result<(), crate::sftp_transport::TransportError> {
+        Ok(())
+    }
+
+    async fn write_file_durable(
+        &self,
+        path: &std::path::Path,
+        chunks: Vec<Bytes>,
+    ) -> Result<(), crate::sftp_transport::TransportError> {
+        self.available()?;
+        self.0.writes.fetch_add(1, Ordering::SeqCst);
+        self.0
+            .files
+            .lock()
+            .unwrap()
+            .insert(path.to_path_buf(), chunks.into_iter().flatten().collect());
+        Ok(())
+    }
+
+    async fn write_file_at(
+        &self,
+        path: &std::path::Path,
+        offset: u64,
+        chunks: Vec<Bytes>,
+    ) -> Result<(), crate::sftp_transport::TransportError> {
+        self.available()?;
+        if offset > 0
+            && self
+                .0
+                .fault
+                .compare_exchange(2, 0, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
+            self.0.outage.store(true, Ordering::SeqCst);
+            return self.available();
+        }
+        let mut files = self.0.files.lock().unwrap();
+        let file = files.get_mut(path).ok_or_else(|| {
+            crate::sftp_transport::TransportError::NotFound(path.display().to_string())
+        })?;
+        let bytes: Vec<u8> = chunks.into_iter().flatten().collect();
+        let offset = offset as usize;
+        file.resize(file.len().max(offset + bytes.len()), 0);
+        file[offset..offset + bytes.len()].copy_from_slice(&bytes);
+        Ok(())
+    }
+
+    async fn write_file_at_durable(
+        &self,
+        path: &std::path::Path,
+        offset: u64,
+        chunks: Vec<Bytes>,
+    ) -> Result<(), crate::sftp_transport::TransportError> {
+        self.write_file_at(path, offset, chunks).await
+    }
+
+    async fn hard_link(
+        &self,
+        from: &std::path::Path,
+        to: &std::path::Path,
+    ) -> Result<(), crate::sftp_transport::TransportError> {
+        self.available()?;
+        {
+            let mut files = self.0.files.lock().unwrap();
+            if files.contains_key(to) {
+                if self.0.fault.load(Ordering::SeqCst) >= 3 {
+                    self.0.fault.store(0, Ordering::SeqCst);
+                    self.0.outage.store(true, Ordering::SeqCst);
+                }
+                return Err(crate::sftp_transport::TransportError::AlreadyExists(
+                    to.display().to_string(),
+                ));
+            }
+            let bytes = files.get(from).cloned().unwrap();
+            files.insert(to.to_path_buf(), bytes);
+        }
+        if self
+            .0
+            .fault
+            .compare_exchange(1, 0, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            self.0.outage.store(true, Ordering::SeqCst);
+            return self.available();
+        }
+        Ok(())
+    }
+
+    async fn remove_file(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<(), crate::sftp_transport::TransportError> {
+        self.0.removes.fetch_add(1, Ordering::SeqCst);
+        self.available()?;
+        self.0.files.lock().unwrap().remove(path);
+        Ok(())
+    }
+
+    async fn read_exact(
+        &self,
+        path: &std::path::Path,
+        offset: u64,
+        len: usize,
+    ) -> Result<Bytes, crate::sftp_transport::TransportError> {
+        self.available()?;
+        let files = self.0.files.lock().unwrap();
+        let file = files.get(path).ok_or_else(|| {
+            crate::sftp_transport::TransportError::NotFound(path.display().to_string())
+        })?;
+        Ok(Bytes::copy_from_slice(
+            &file[offset as usize..offset as usize + len],
+        ))
+    }
+
+    async fn read_object(
+        &self,
+        path: &std::path::Path,
+        range: Option<object_store::GetRange>,
+        head: bool,
+    ) -> Result<crate::sftp_transport::RemoteObjectRead, crate::sftp_transport::TransportError>
+    {
+        self.available()?;
+        let files = self.0.files.lock().unwrap();
+        let file = files.get(path).ok_or_else(|| {
+            crate::sftp_transport::TransportError::NotFound(path.display().to_string())
+        })?;
+        let header = crate::sftp_object_store::decode_header(
+            &file[..crate::sftp_object_store::OBJECT_HEADER_LEN],
+        )
+        .unwrap();
+        let range = range
+            .map(|range| range.as_range(header.logical_len).unwrap())
+            .unwrap_or(0..header.logical_len);
+        let payload = if head {
+            Bytes::new()
+        } else {
+            let start = crate::sftp_object_store::OBJECT_HEADER_LEN;
+            Bytes::copy_from_slice(&file[start + range.start as usize..start + range.end as usize])
+        };
+        Ok(crate::sftp_transport::RemoteObjectRead {
+            header,
+            range,
+            payload,
+            modified: std::time::SystemTime::UNIX_EPOCH,
+        })
+    }
+
+    async fn close(
+        &self,
+        _force: tokio_util::sync::CancellationToken,
+    ) -> Result<(), crate::sftp_transport::TransportError> {
+        Ok(())
+    }
+}
+
+async fn shipping_sftp_recovery_case(large: bool, fault: usize, stop_during_cleanup: bool) {
+    let temp = tempfile::tempdir().unwrap();
+    let journal = Arc::new(Journal::open(temp.path().join("journal"), identity()).unwrap());
+    let payload = vec![
+        0x79;
+        if large {
+            REMOTE_SINGLE_PUT_BYTES as usize + 1
+        } else {
+            4096
+        }
+    ];
+    let path = format!("root/recovery-{}", uuid::Uuid::new_v4());
+    let record = crate::writeback::test_util::put_record(
+        1,
+        &path,
+        &payload,
+        MutationMode::Create,
+        FenceClass::ImmutableCreate,
+        0x9000,
+        1_786_435_200_000,
+    );
+    journal.commit_put(record, &payload).unwrap();
+    let server = Arc::new(RecoveryServer::default());
+    server.fault.store(fault, Ordering::SeqCst);
+    if fault >= 3 {
+        let header = crate::sftp_object_store::ObjectHeader {
+            generation: uuid::Uuid::new_v4(),
+            logical_len: payload.len() as u64,
+        };
+        let mut existing = crate::sftp_object_store::encode_header(header).to_vec();
+        existing.extend_from_slice(&payload);
+        if fault == 4 {
+            *existing.last_mut().unwrap() ^= 1;
+        }
+        server
+            .files
+            .lock()
+            .unwrap()
+            .insert(std::path::PathBuf::from(&path), existing);
+    }
+    let pool = crate::sftp_transport::SftpSessionPool::new_writable(
+        Arc::new(RecoverySession(server.clone())),
+        2,
+        2,
+        2,
+    )
+    .await
+    .unwrap();
+    let remote: Arc<dyn ObjectStore> = Arc::new(
+        crate::retrying_object_store::RetryingObjectStore::new(Arc::new(
+            crate::sftp_object_store::SftpObjectStore::new(pool.clone(), Path::from("root"))
+                .unwrap(),
+        )),
+    );
+    let overlay = OverlayIndex::new(remote.clone());
+    let admission = Admission::new(128 * 1024 * 1024);
+    let space = Arc::new(PhysicalSpaceSampler::new(journal.root().to_path_buf()));
+    let sample = space.sample().await.unwrap();
+    let ssd = Arc::new(
+        SsdAdmission::recover(
+            128 * 1024 * 1024,
+            64,
+            95,
+            85,
+            0,
+            journal.pending_ssd_reservations().unwrap(),
+            Some(sample),
+        )
+        .unwrap(),
+    );
+    let journaler = LocalJournaler::start_with_observer_and_space(
+        journal.clone(),
+        admission.clone(),
+        4,
+        1,
+        None,
+        space.clone(),
+    )
+    .unwrap();
+    let scheduler = RemoteScheduler::start(
+        remote.clone(),
+        journal.clone(),
+        overlay,
+        admission,
+        ssd,
+        space,
+        journaler.barrier(),
+        1,
+    )
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(300), async {
+        while server.removes.load(Ordering::SeqCst) < 4 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("publication must reach owned cleanup recovery");
+    assert_eq!(scheduler.barrier().progress.sequence(), 0);
+    assert!(scheduler.barrier().progress.current_terminal().is_none());
+    assert_eq!(journal.progress().unwrap().local_seq, 1);
+    assert_eq!(journal.progress().unwrap().remote_seq, 0);
+    assert_eq!(journal.read_blob(1).unwrap(), payload);
+    assert_eq!(
+        server.writes.load(Ordering::SeqCst),
+        1,
+        "no republication while cleanup is pending"
+    );
+    if stop_during_cleanup {
+        tokio::time::timeout(Duration::from_secs(5), scheduler.shutdown())
+            .await
+            .expect("cleanup recovery must not hang shutdown")
+            .unwrap();
+        assert_eq!(journal.progress().unwrap().remote_seq, 0);
+        assert_eq!(journal.read_blob(1).unwrap(), payload);
+        // Allow the bounded Drop fallback to settle before pool shutdown.
+        server.outage.store(false, Ordering::SeqCst);
+    } else {
+        server.outage.store(false, Ordering::SeqCst);
+        let result =
+            tokio::time::timeout(Duration::from_secs(90), scheduler.barrier().wait_remote(1))
+                .await
+                .expect("same scheduler must resume without restart");
+        if fault == 4 {
+            assert!(result.unwrap_err().to_string().contains("different bytes"));
+            assert_eq!(journal.progress().unwrap().remote_seq, 0);
+            assert_eq!(journal.read_blob(1).unwrap(), payload);
+            assert!(scheduler.shutdown().await.is_err());
+        } else {
+            result.unwrap();
+            assert_eq!(journal.progress().unwrap().remote_seq, 1);
+            assert_eq!(
+                remote
+                    .get(&Path::from(path))
+                    .await
+                    .unwrap()
+                    .bytes()
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                payload
+            );
+            scheduler.shutdown().await.unwrap();
+        }
+    }
+    journaler.shutdown().await.unwrap();
+    pool.shutdown().await.unwrap();
+    assert!(server.files.lock().unwrap().keys().all(|path| {
+        !path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with(".zerofs-staging-")
+    }));
+}
+
+#[tokio::test(start_paused = true)]
+async fn shipping_sftp_scheduler_recovers_lost_small_publication_reply() {
+    shipping_sftp_recovery_case(false, 1, false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn shipping_sftp_scheduler_recovers_multipart_part_and_abort_outage() {
+    shipping_sftp_recovery_case(true, 2, false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn shipping_sftp_scheduler_recovers_lost_multipart_publication_reply() {
+    shipping_sftp_recovery_case(true, 1, false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn shipping_sftp_scheduler_shutdown_cancels_cleanup_without_losing_journal() {
+    shipping_sftp_recovery_case(true, 1, true).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn shipping_sftp_scheduler_reconciles_existing_target_after_cleanup_outage() {
+    shipping_sftp_recovery_case(false, 3, false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn shipping_sftp_scheduler_rejects_divergent_target_after_cleanup_outage() {
+    shipping_sftp_recovery_case(false, 4, false).await;
+}
+
 #[tokio::test]
 async fn remote_replay_streams_payload_larger_than_the_window_in_bounded_parts() {
     let temp = tempfile::tempdir().unwrap();
@@ -878,6 +1271,7 @@ async fn multipart_owner_cancellation_is_drained_by_the_tracked_cleanup_worker()
         cleanup_receiver,
         1,
         Arc::clone(&cleanup_state),
+        None,
     ));
     let aborts = Arc::new(AtomicUsize::new(0));
     let entered = Arc::new(Notify::new());
@@ -911,6 +1305,7 @@ async fn cleanup_abort_of_an_already_resolved_upload_is_not_terminal() {
         cleanup_receiver,
         1,
         Arc::clone(&cleanup_state),
+        None,
     ));
     drop(RemoteMultipartOwner::new(
         Box::new(ResolvedAbortUpload),
@@ -935,6 +1330,7 @@ async fn multipart_abort_failure_is_published_while_cleanup_input_remains_live()
         cleanup_receiver,
         1,
         Arc::clone(&cleanup_state),
+        None,
     ));
     drop(RemoteMultipartOwner::new(
         Box::new(FailingAbortUpload),

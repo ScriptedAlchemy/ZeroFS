@@ -914,6 +914,61 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
     }
 
     #[tokio::test]
+    async fn russh_pool_recovers_after_real_stalled_handshake_without_restart() {
+        use crate::sftp_transport::{OperationKind, SftpSessionPool};
+
+        let env = Loopback::start().await;
+        let factory = RusshSessionFactory::new(
+            env.endpoint.clone(),
+            env.identity.clone(),
+            env.known_hosts.clone(),
+        )
+        .unwrap();
+        let pool = SftpSessionPool::new_writable(Arc::new(factory), 1, 1, 1)
+            .await
+            .unwrap();
+        let path = Path::new("reconnect.bin");
+        let payload = Bytes::from_static(b"durable bytes survive transport recovery");
+        let mut lease = pool.checkout(OperationKind::Write).await.unwrap();
+        lease
+            .write_file_durable(path, vec![payload.clone()])
+            .await
+            .unwrap();
+        lease.retire().await.unwrap();
+
+        // Exercise the real socket, russh handshake, pool deadline, and forced
+        // socket shutdown. The next connection works on the same pool/backend.
+        env.stall_next_handshake.store(true, Ordering::SeqCst);
+        let error =
+            tokio::time::timeout(Duration::from_secs(45), pool.checkout(OperationKind::Read))
+                .await
+                .expect("a stalled handshake must return within its cleanup deadline")
+                .expect_err("the injected handshake must time out");
+        assert!(matches!(error, TransportError::Open(_)), "{error:?}");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while env.active_connections.load(Ordering::SeqCst) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the timed-out TCP connection must actually close before retry");
+
+        let mut lease =
+            tokio::time::timeout(Duration::from_secs(5), pool.checkout(OperationKind::Read))
+                .await
+                .unwrap()
+                .expect("the same pool must reconnect without service restart");
+        assert_eq!(
+            lease.read_exact(path, 0, payload.len()).await.unwrap(),
+            payload
+        );
+        lease.remove_file(path).await.unwrap();
+        lease.complete().await.unwrap();
+        pool.shutdown().await.unwrap();
+        assert!(!env._root.path().join("fs/reconnect.bin").exists());
+    }
+
+    #[tokio::test]
     async fn russh_loopback_reassembles_short_sftp_read_replies() {
         let env = Loopback::start_with_read_cap(Some(32 * 1024)).await;
         let factory = RusshSessionFactory::new(
@@ -1103,6 +1158,7 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
         exec_requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         active_connections: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         open_handles: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        stall_next_handshake: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl Loopback {
@@ -1156,6 +1212,7 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
             let exec_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let active_connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let open_handles = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let stall_next_handshake = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
@@ -1319,15 +1376,25 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
                 active_connections: active_connections.clone(),
                 open_handles: open_handles.clone(),
             };
+            let stall_handshake = stall_next_handshake.clone();
             tokio::spawn(async move {
                 loop {
-                    let (socket, _) = match listener.accept().await {
+                    let (mut socket, _) = match listener.accept().await {
                         Ok(pair) => pair,
                         Err(_) => break,
                     };
                     let handler = server.new_client(socket.peer_addr().ok());
                     let config = server_config.clone();
+                    let stall = stall_handshake.swap(false, Ordering::SeqCst);
                     tokio::spawn(async move {
+                        if stall {
+                            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                            socket.write_all(b"SSH-2.0-stalled-kex\r\n").await.unwrap();
+                            let mut buffer = [0; 1024];
+                            while matches!(socket.read(&mut buffer).await, Ok(n) if n > 0) {}
+                            drop(handler);
+                            return;
+                        }
                         if let Ok(running) =
                             russh::server::run_stream(config, socket, handler).await
                         {
@@ -1351,6 +1418,7 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
                 exec_requests,
                 active_connections,
                 open_handles,
+                stall_next_handshake,
             }
         }
     }

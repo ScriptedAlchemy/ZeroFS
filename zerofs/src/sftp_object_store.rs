@@ -592,7 +592,13 @@ async fn failure_with_cleanup(cleanup: &mut StagingCleanup, operation: RemoteErr
     match cleanup.remove_before_retry().await {
         Ok(()) => operation,
         Err(mut debt) => {
-            if operation.is_retryable() && debt.error.is_retryable() {
+            if (operation.is_retryable()
+                || matches!(
+                    operation,
+                    RemoteError::AlreadyExists(_) | RemoteError::Precondition(_)
+                ))
+                && debt.error.is_retryable()
+            {
                 // Transfer ownership instead of racing background cleanup with
                 // the scheduler's recovery. Dropping the error still cleans up.
                 debt.recovery = Some(StagingCleanupRecovery {
@@ -1523,10 +1529,34 @@ impl MultipartUpload for SftpMultipartUpload {
 
     async fn abort(&mut self) -> object_store::Result<()> {
         if let Some(staging) = self.staging.as_ref() {
-            self.session
-                .remove_file(staging)
-                .await
-                .map_err(|error| publication_error(&self.location, error))?;
+            match self.session.remove_file(staging).await {
+                Ok(()) | Err(RemoteError::NotFound(_)) => {}
+                Err(error) if error.is_retryable() => {
+                    // REMOVE is idempotent, including a lost reply. Transfer this
+                    // exact path to the typed recovery owner before releasing the
+                    // upload; generic multipart backends do not have this contract.
+                    let path = self.staging.take().expect("active staging path");
+                    self.terminal = true;
+                    return Err(publication_error(
+                        &self.location,
+                        RemoteError::CleanupRequired {
+                            operation: Box::new(RemoteError::Other(
+                                "multipart abort awaits staging cleanup".to_owned(),
+                            )),
+                            debt: StagingCleanupDebt {
+                                path: path.clone(),
+                                error: Box::new(error),
+                                recovery: Some(StagingCleanupRecovery {
+                                    session: self.session.clone(),
+                                    path,
+                                    settled: std::sync::atomic::AtomicBool::new(false),
+                                }),
+                            },
+                        },
+                    ));
+                }
+                Err(error) => return Err(publication_error(&self.location, error)),
+            }
             self.staging = None;
         }
         self.terminal = true;
@@ -4251,12 +4281,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_multipart_abort_keeps_staging_armed_for_retry() {
+    async fn failed_multipart_abort_transfers_staging_to_recovery_owner() {
         let session = Arc::new(RecordingSession::with_remove_failure());
         let location = ObjectPath::from("zerofs/v1/abort.bin");
         let target = PathBuf::from("zerofs/v1/abort.bin");
         let mut upload = SftpMultipartUpload::begin(
-            session,
+            session.clone(),
             location,
             target,
             Arc::new(DashSet::new()),
@@ -4265,13 +4295,15 @@ mod tests {
         .await
         .unwrap();
 
-        upload.abort().await.expect_err("forced removal must fail");
+        let error = upload.abort().await.expect_err("forced removal must fail");
 
-        assert!(
-            upload.staging.is_some(),
-            "failed cleanup must remain armed for an explicit retry or Drop"
-        );
-        assert!(!upload.terminal);
+        assert!(upload.staging.is_none());
+        assert!(upload.terminal);
+        assert!(transient_staging_recovery(&error).is_some());
+        drop(upload);
+        assert_eq!(session.scheduled_cleanups.load(Ordering::SeqCst), 0);
+        drop(error);
+        assert_eq!(session.scheduled_cleanups.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

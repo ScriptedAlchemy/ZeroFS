@@ -985,13 +985,6 @@ impl PoolInner {
         }
     }
 
-    async fn close_transport(
-        self: &Arc<Self>,
-        transport: Arc<dyn TransportSession>,
-    ) -> Result<(), TransportError> {
-        self.close_owned(transport, None).await
-    }
-
     async fn close_owned(
         self: &Arc<Self>,
         transport: Arc<dyn TransportSession>,
@@ -1513,6 +1506,12 @@ impl SftpSessionPool {
         self.inner.fail_closed();
     }
 
+    /// Resolves only when this pool can no longer serve operations. Ordinary
+    /// session retirement and recoverable dial timeouts do not trigger it.
+    pub(crate) async fn wait_closed(&self) {
+        self.inner.session_shutdown.cancelled().await;
+    }
+
     pub(crate) async fn shutdown(&self) -> Result<(), TransportError> {
         let deadline = Instant::now() + SFTP_POOL_SHUTDOWN_TIMEOUT;
         let _shutdown = tokio::time::timeout_at(deadline, self.inner.shutdown_lock.lock())
@@ -1809,23 +1808,59 @@ impl SftpSessionPool {
                     ))
                 }),
                 _ = tokio::time::sleep(SFTP_SESSION_OPEN_TIMEOUT) => {
-                    owner_pool.fail_closed();
+                    force.cancel();
+                    // A dial deadline says nothing about the health of other
+                    // sessions. Keep its capacity owned until cancellation
+                    // proves the physical connection has terminated.
+                    let opened = match tokio::time::timeout(
+                        SFTP_SESSION_FORCE_CLEANUP_TIMEOUT,
+                        &mut opening,
+                    ).await {
+                        Ok(opened) => opened,
+                        Err(_) => {
+                            owner_pool.fail_closed();
+                            let error = TransportError::Close(format!(
+                                "cancelled SFTP session open cleanup timed out after {}s",
+                                SFTP_SESSION_FORCE_CLEANUP_TIMEOUT.as_secs()
+                            ));
+                            owner_pool.record_close_error(&error);
+                            let _ = sender.send(Err(error));
+                            match opening.await {
+                                Ok(transport) => {
+                                    let _ = owner_pool
+                                        .close_owned(Arc::from(transport), permit.take())
+                                        .await;
+                                }
+                                Err(error @ TransportError::Close(_)) => {
+                                    owner_pool.record_forced_cleanup_error(&error);
+                                }
+                                Err(_) => {}
+                            }
+                            fail_closed_on_drop.disarm();
+                            return;
+                        }
+                    };
+                    let cleanup = match opened {
+                        Ok(transport) => {
+                            owner_pool
+                                .close_owned(Arc::from(transport), permit.take())
+                                .await
+                        }
+                        Err(error @ TransportError::Close(_)) => Err(error),
+                        // PoolClosed is the native opener's cancellation
+                        // result after it has settled its socket/task.
+                        Err(_) => Ok(()),
+                    };
+                    if let Err(error) = &cleanup {
+                        owner_pool.fail_closed();
+                        owner_pool.record_forced_cleanup_error(error);
+                    }
+                    fail_closed_on_drop.disarm();
                     drop(permit.take());
-                    let _ = sender.send(Err(TransportError::Open(format!(
+                    let _ = sender.send(cleanup.and(Err(TransportError::Open(format!(
                         "SFTP session open timed out after {}s",
                         SFTP_SESSION_OPEN_TIMEOUT.as_secs()
-                    ))));
-                    force.cancel();
-                    match opening.await {
-                        Ok(transport) => {
-                            let _ = owner_pool.close_transport(Arc::from(transport)).await;
-                        }
-                        Err(error @ TransportError::Close(_)) => {
-                            tracing::error!(%error, "SFTP opener cleanup failed after open timeout");
-                            owner_pool.record_forced_cleanup_error(&error);
-                        }
-                        Err(_) => {}
-                    }
+                    )))));
                     return;
                 }
             };
@@ -2197,6 +2232,8 @@ mod tests {
         open_started: Notify,
         allow_open: Notify,
         block_open_from: AtomicUsize,
+        // 0 ignores cancellation, 1 settles with an error, 2 returns a late session.
+        cancel_open: AtomicUsize,
         panic_open_from: AtomicUsize,
         fail_open_from: AtomicUsize,
         fail_close: AtomicUsize,
@@ -2225,6 +2262,7 @@ mod tests {
                     open_started: Notify::new(),
                     allow_open: Notify::new(),
                     block_open_from: AtomicUsize::new(0),
+                    cancel_open: AtomicUsize::new(0),
                     panic_open_from: AtomicUsize::new(0),
                     fail_open_from: AtomicUsize::new(0),
                     fail_close: AtomicUsize::new(0),
@@ -2261,7 +2299,7 @@ mod tests {
     impl SessionFactory for RecordingFactory {
         async fn open(
             &self,
-            _force: CancellationToken,
+            force: CancellationToken,
         ) -> Result<Box<dyn TransportSession>, TransportError> {
             let id = self.state.dials.fetch_add(1, Ordering::SeqCst) + 1;
             let live = self.state.live.fetch_add(1, Ordering::SeqCst) + 1;
@@ -2269,7 +2307,20 @@ mod tests {
             let block_open_from = self.state.block_open_from.load(Ordering::SeqCst);
             if block_open_from != 0 && id >= block_open_from {
                 self.state.open_started.notify_one();
-                self.state.allow_open.notified().await;
+                let cancel_open = self.state.cancel_open.load(Ordering::SeqCst);
+                if cancel_open == 0 {
+                    self.state.allow_open.notified().await;
+                } else {
+                    tokio::select! {
+                        _ = self.state.allow_open.notified() => {}
+                        _ = force.cancelled() => {
+                            if cancel_open == 1 {
+                                self.state.live.fetch_sub(1, Ordering::SeqCst);
+                                return Err(TransportError::PoolClosed);
+                            }
+                        }
+                    }
+                }
             }
             let panic_open_from = self.state.panic_open_from.load(Ordering::SeqCst);
             if panic_open_from != 0 && id >= panic_open_from {
@@ -3634,6 +3685,176 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn settled_open_timeout_keeps_pool_available_for_redial() {
+        assert_open_timeout_recovers(false).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn abandoned_open_timeout_keeps_ownership_until_settled_and_recovers() {
+        assert_open_timeout_recovers(true).await;
+    }
+
+    async fn assert_open_timeout_recovers(abandon_caller: bool) {
+        let factory = RecordingFactory::fully_capable();
+        let pool = pool(factory.clone(), 2, 2, 2).await;
+        let held = pool.checkout(OperationKind::Read).await.unwrap();
+        factory.state.block_open_from.store(2, Ordering::SeqCst);
+        factory.state.cancel_open.store(1, Ordering::SeqCst);
+        let open_started = factory.state.open_started.notified();
+        let opening = tokio::spawn({
+            let pool = pool.clone();
+            async move { pool.checkout(OperationKind::Write).await }
+        });
+        open_started.await;
+        assert_eq!(pool.inner.shared.available_permits(), 0);
+        if abandon_caller {
+            opening.abort();
+        }
+        tokio::time::advance(Duration::from_secs(31)).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while pool.inner.shared.available_permits() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled dial settles and releases capacity");
+        if abandon_caller {
+            assert!(opening.await.unwrap_err().is_cancelled());
+        } else {
+            // The healthy session still carries work after expansion fails.
+            opening.await.unwrap().unwrap().complete().await.unwrap();
+        }
+        assert!(!pool.inner.closed.load(Ordering::SeqCst));
+        assert_eq!(factory.live(), 1);
+        factory.state.block_open_from.store(0, Ordering::SeqCst);
+        held.retire().await.unwrap();
+        pool.checkout(OperationKind::Write)
+            .await
+            .unwrap()
+            .complete()
+            .await
+            .unwrap();
+        assert_eq!(factory.dials(), 3, "same pool can dial after the outage");
+        assert_eq!(factory.peak(), 2);
+        pool.shutdown().await.unwrap();
+        assert_eq!(factory.live(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn settled_open_timeout_without_healthy_session_returns_retryable_error() {
+        let factory = RecordingFactory::fully_capable();
+        let pool = pool(factory.clone(), 1, 1, 1).await;
+        pool.checkout(OperationKind::Read)
+            .await
+            .unwrap()
+            .retire()
+            .await
+            .unwrap();
+        factory.state.block_open_from.store(2, Ordering::SeqCst);
+        factory.state.cancel_open.store(1, Ordering::SeqCst);
+        let open_started = factory.state.open_started.notified();
+        let opening = tokio::spawn({
+            let pool = pool.clone();
+            async move { pool.checkout(OperationKind::Write).await }
+        });
+        open_started.await;
+        tokio::time::advance(Duration::from_secs(31)).await;
+        assert!(matches!(opening.await.unwrap(),
+            Err(TransportError::Open(ref message)) if message == "SFTP session open timed out after 30s"));
+        assert!(!pool.inner.closed.load(Ordering::SeqCst));
+        assert_eq!(factory.live(), 0);
+        assert_eq!(pool.inner.shared.available_permits(), 1);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), pool.wait_closed())
+                .await
+                .is_err()
+        );
+        factory.state.block_open_from.store(0, Ordering::SeqCst);
+        pool.checkout(OperationKind::Write)
+            .await
+            .unwrap()
+            .complete()
+            .await
+            .unwrap();
+        assert_eq!(factory.dials(), 3);
+        assert_eq!(factory.peak(), 1);
+        pool.shutdown().await.unwrap();
+        assert_eq!(factory.live(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timed_out_open_closes_late_session_before_releasing_capacity() {
+        let factory = RecordingFactory::fully_capable();
+        let pool = pool(factory.clone(), 2, 2, 2).await;
+        let held = pool.checkout(OperationKind::Read).await.unwrap();
+        factory.state.block_open_from.store(2, Ordering::SeqCst);
+        factory.state.cancel_open.store(2, Ordering::SeqCst);
+        factory.state.block_close.store(1, Ordering::SeqCst);
+        let open_started = factory.state.open_started.notified();
+        let opening = tokio::spawn({
+            let pool = pool.clone();
+            async move { pool.checkout(OperationKind::Write).await }
+        });
+        open_started.await;
+        let close_started = factory.state.close_started.notified();
+        tokio::time::advance(Duration::from_secs(31)).await;
+        close_started.await;
+        assert_eq!(factory.live(), 2);
+        assert_eq!(pool.inner.shared.available_permits(), 0);
+        assert!(!opening.is_finished());
+        assert!(!pool.inner.closed.load(Ordering::SeqCst));
+        factory.state.block_close.store(0, Ordering::SeqCst);
+        factory.state.allow_close.notify_waiters();
+        opening.await.unwrap().unwrap().complete().await.unwrap();
+        assert_eq!(factory.live(), 1);
+        assert_eq!(pool.inner.shared.available_permits(), 1);
+        factory.state.block_open_from.store(0, Ordering::SeqCst);
+        held.retire().await.unwrap();
+        pool.checkout(OperationKind::Write)
+            .await
+            .unwrap()
+            .complete()
+            .await
+            .unwrap();
+        assert_eq!(factory.dials(), 3);
+        assert_eq!(factory.peak(), 2);
+        pool.shutdown().await.unwrap();
+        assert_eq!(factory.live(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timed_out_open_with_failed_late_session_cleanup_fails_closed() {
+        let factory = RecordingFactory::fully_capable();
+        let pool = pool(factory.clone(), 2, 2, 2).await;
+        let held = pool.checkout(OperationKind::Read).await.unwrap();
+        factory.state.block_open_from.store(2, Ordering::SeqCst);
+        factory.state.cancel_open.store(2, Ordering::SeqCst);
+        factory.state.fail_close.store(1, Ordering::SeqCst);
+        let open_started = factory.state.open_started.notified();
+        let opening = tokio::spawn({
+            let pool = pool.clone();
+            async move { pool.checkout(OperationKind::Write).await }
+        });
+        open_started.await;
+        tokio::time::advance(Duration::from_secs(31)).await;
+        assert!(matches!(
+            opening.await.unwrap(),
+            Err(TransportError::Close(_))
+        ));
+        assert!(pool.inner.closed.load(Ordering::SeqCst));
+        tokio::time::timeout(Duration::from_secs(1), pool.wait_closed())
+            .await
+            .expect("fatal cleanup failure wakes the service supervisor");
+        assert!(matches!(
+            pool.checkout(OperationKind::Write).await,
+            Err(TransportError::PoolClosed)
+        ));
+        assert_eq!(factory.dials(), 2);
+        factory.state.fail_close.store(0, Ordering::SeqCst);
+        held.retire().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn forever_pending_open_times_out_and_closes_admission() {
         let factory = RecordingFactory::fully_capable();
         let pool = pool(factory.clone(), 2, 2, 2).await;
@@ -3648,17 +3869,23 @@ mod tests {
         open_started.await;
         tokio::time::advance(std::time::Duration::from_secs(31)).await;
         tokio::task::yield_now().await;
-        let opening = tokio::time::timeout(std::time::Duration::from_secs(1), opening).await;
+        let opening = tokio::time::timeout(std::time::Duration::from_secs(7), opening).await;
 
         assert!(matches!(
             opening,
-            Ok(Ok(Err(TransportError::Open(ref message)))) if message == "SFTP session open timed out after 30s"
+            Ok(Ok(Err(TransportError::Close(ref message)))) if message == "cancelled SFTP session open cleanup timed out after 5s"
         ));
         assert!(matches!(
             pool.checkout(OperationKind::Read).await,
             Err(TransportError::PoolClosed)
         ));
         assert_eq!(factory.dials(), 2);
+        assert_eq!(
+            pool.inner.shared.available_permits(),
+            0,
+            "unsettled opener keeps its physical connection capacity"
+        );
+        factory.state.allow_open.notify_one();
         held.retire().await.unwrap();
     }
 
@@ -3682,9 +3909,14 @@ mod tests {
         for _ in 0..4 {
             tokio::task::yield_now().await;
         }
+        tokio::time::advance(std::time::Duration::from_secs(6)).await;
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
         assert!(pool.inner.closed.load(Ordering::SeqCst));
-        assert_eq!(pool.inner.shared.available_permits(), 1);
+        assert_eq!(pool.inner.shared.available_permits(), 0);
 
+        factory.state.allow_open.notify_one();
         held.retire().await.unwrap();
     }
 
