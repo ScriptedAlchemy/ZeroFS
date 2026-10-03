@@ -2184,6 +2184,7 @@ mod tests {
         cleanup_pool_closed: std::sync::atomic::AtomicBool,
         cleanup_recovered: std::sync::atomic::AtomicBool,
         cleanup_denied: std::sync::atomic::AtomicBool,
+        publication_times_out: std::sync::atomic::AtomicBool,
     }
 
     #[derive(Debug, Clone)]
@@ -2230,6 +2231,9 @@ mod tests {
             self.0
                 .writes
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.0.publication_times_out.load(Ordering::SeqCst) {
+                return Ok(());
+            }
             Err(crate::sftp_transport::TransportError::Operation(
                 "injected publication failure".to_owned(),
             ))
@@ -2248,6 +2252,9 @@ mod tests {
                 .load(std::sync::atomic::Ordering::SeqCst)
             {
                 return Ok(());
+            }
+            if self.0.publication_times_out.load(Ordering::SeqCst) {
+                return future::pending().await;
             }
             if self
                 .0
@@ -2269,6 +2276,14 @@ mod tests {
                     "injected unresolved staging cleanup".to_owned(),
                 ))
             }
+        }
+
+        async fn hard_link(
+            &self,
+            _from: &std::path::Path,
+            _to: &std::path::Path,
+        ) -> Result<(), crate::sftp_transport::TransportError> {
+            future::pending().await
         }
 
         async fn close(
@@ -2333,12 +2348,17 @@ mod tests {
         );
     }
 
-    async fn transient_cleanup_failure() -> (
+    async fn transient_cleanup_failure(
+        publication_times_out: bool,
+    ) -> (
         Arc<CleanupDebtTransportState>,
         crate::sftp_transport::SftpSessionPool,
         object_store::Error,
     ) {
         let state = Arc::new(CleanupDebtTransportState::default());
+        state
+            .publication_times_out
+            .store(publication_times_out, Ordering::SeqCst);
         let pool = crate::sftp_transport::SftpSessionPool::new_writable(
             Arc::new(CleanupDebtFactory(state.clone())),
             1,
@@ -2352,7 +2372,7 @@ mod tests {
                 .unwrap();
         let error = backend
             .put_opts(
-                &Path::from("root/cleanup-recovery"),
+                &Path::from(format!("root/cleanup-recovery-{}", uuid::Uuid::new_v4())),
                 Bytes::from_static(b"durable publication").into(),
                 PutOptions {
                     mode: PutMode::Create,
@@ -2367,7 +2387,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn transient_cleanup_recovery_waits_without_republishing() {
-        let (state, pool, error) = transient_cleanup_failure().await;
+        let (state, pool, error) = transient_cleanup_failure(false).await;
         let recovery = tokio::spawn(recover_publication_result(Err(error)));
         tokio::time::timeout(Duration::from_secs(5), async {
             while state.removes.load(Ordering::SeqCst)
@@ -2392,8 +2412,19 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn transient_cleanup_recovery_after_real_request_deadlines() {
+        let (state, pool, error) = transient_cleanup_failure(true).await;
+        assert!(error.to_string().contains("timed out"), "{error:?}");
+        state.cleanup_recovered.store(true, Ordering::SeqCst);
+        let error = recover_publication_result(Err(error)).await.unwrap_err();
+        assert!(!is_terminal_remote_error(&error));
+        assert_eq!(state.writes.load(Ordering::SeqCst), 1);
+        pool.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn transient_cleanup_recovery_permission_failure_stays_terminal() {
-        let (state, pool, error) = transient_cleanup_failure().await;
+        let (state, pool, error) = transient_cleanup_failure(false).await;
         state.cleanup_denied.store(true, Ordering::SeqCst);
         let error = recover_publication_result(Err(error)).await.unwrap_err();
         assert!(is_terminal_remote_error(&error));
@@ -2407,7 +2438,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn transient_cleanup_recovery_cancellation_preserves_cleanup() {
-        let (state, pool, error) = transient_cleanup_failure().await;
+        let (state, pool, error) = transient_cleanup_failure(false).await;
         let recovery = tokio::spawn(recover_publication_result(Err(error)));
         tokio::time::timeout(Duration::from_secs(5), async {
             while state.removes.load(Ordering::SeqCst)
