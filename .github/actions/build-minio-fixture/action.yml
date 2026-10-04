@@ -4,6 +4,9 @@ inputs:
   docker-image:
     description: Export a local Linux fixture image for existing container-based tests
     default: 'false'
+  mc-image:
+    description: Build a local Linux client image with a shell for Kubernetes bucket initialization
+    default: 'false'
 runs:
   using: composite
   steps:
@@ -33,6 +36,15 @@ runs:
         docker build --file "$GITHUB_ACTION_PATH/Dockerfile" \
           --tag zerofs-minio-ci:local "$image_context"
         docker save --output "$GITHUB_WORKSPACE/ci-minio-image.tar" zerofs-minio-ci:local
+    - name: Build local client image
+      if: runner.os == 'Linux' && inputs.mc-image == 'true'
+      shell: bash
+      run: |
+        client_context="$RUNNER_TEMP/zerofs-mc-image"
+        mkdir -p "$client_context"
+        cp "$RUNNER_TEMP/minio-bin/mc" "$client_context/mc"
+        docker build --file "$GITHUB_ACTION_PATH/Dockerfile.mc" \
+          --tag zerofs-mc-ci:local "$client_context"
     - name: Transfer fixture to the running guest
       if: env.ZEROFS_CI_GUEST == '1'
       shell: bash

@@ -22,7 +22,8 @@ spec:
     spec:
       containers:
         - name: minio
-          image: minio/minio
+          image: docker.io/library/zerofs-minio-ci:local
+          imagePullPolicy: Never
           args: ["server", "/data"]
           env:
             - name: MINIO_ROOT_USER
@@ -68,7 +69,8 @@ spec:
       restartPolicy: OnFailure
       containers:
         - name: mc
-          image: minio/mc
+          image: docker.io/library/zerofs-mc-ci:local
+          imagePullPolicy: Never
           command:
             - sh
             - -c
