@@ -344,6 +344,10 @@ pub(super) async fn enqueue_terminal_response(
 
 /// Dispatch a frame from the exact-size TCP reader or bounded WebSocket.
 /// Receive-time dedup and process ownership are reserved before task spawn.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "dispatch keeps connection and process ownership explicit"
+)]
 pub(crate) async fn dispatch_9p_frame(
     frame: Bytes,
     handler: &Arc<NinePHandler>,

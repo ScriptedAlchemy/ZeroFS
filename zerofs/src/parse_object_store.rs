@@ -43,10 +43,7 @@ pub enum Error {
     Unrecognised { url: Url },
 
     #[error(transparent)]
-    Path {
-        #[from]
-        source: object_store::path::Error,
-    },
+    Path { source: object_store::path::Error },
 
     #[error("Invalid SFTP URL: a host is required")]
     SftpHostRequired,
@@ -56,6 +53,12 @@ pub enum Error {
 
     #[error("Invalid SFTP URL: passwords are not allowed; use SSH key authentication")]
     SftpPasswordNotAllowed,
+}
+
+impl From<object_store::path::Error> for Error {
+    fn from(source: object_store::path::Error) -> Self {
+        Self::Path { source }
+    }
 }
 
 impl From<Error> for object_store::Error {

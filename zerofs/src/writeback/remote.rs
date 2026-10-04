@@ -2207,14 +2207,15 @@ mod tests {
             tokio::time::Instant::now() - started,
             Duration::from_secs(123)
         );
-        let files = state.files.lock().unwrap();
-        assert!(files.contains_key(std::path::Path::new("root/slow-create")));
-        assert!(files.keys().all(|path| {
-            !path
-                .file_name()
-                .is_some_and(|name| name.to_string_lossy().starts_with(".zerofs-staging-"))
-        }));
-        drop(files);
+        {
+            let files = state.files.lock().unwrap();
+            assert!(files.contains_key(std::path::Path::new("root/slow-create")));
+            assert!(files.keys().all(|path| {
+                !path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with(".zerofs-staging-"))
+            }));
+        }
         pool.shutdown().await.unwrap();
     }
 

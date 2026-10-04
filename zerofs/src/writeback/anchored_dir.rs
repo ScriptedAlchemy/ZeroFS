@@ -454,7 +454,7 @@ impl AnchoredDir {
         Path::new("/proc/self/fd").join(file.as_raw_fd().to_string())
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
     pub(crate) fn descriptor_path(file: &File) -> PathBuf {
         use std::os::fd::AsRawFd;
         Path::new("/dev/fd").join(file.as_raw_fd().to_string())

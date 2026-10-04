@@ -15,6 +15,7 @@ mod rename;
 mod setattr;
 pub(crate) mod write;
 
+#[cfg(feature = "webui")]
 pub(crate) use rename::{VerifiedFileContent, VerifiedFileExpectation, VerifiedRenameOutcome};
 
 impl ZeroFS {

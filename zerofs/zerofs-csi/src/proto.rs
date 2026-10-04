@@ -1,4 +1,8 @@
 /// Generated types for the CSI spec (vendored proto/csi.proto, v1.12.0).
+#[allow(
+    clippy::double_must_use,
+    reason = "tonic generates async_trait methods with redundant must_use"
+)]
 pub mod csi {
     pub mod v1 {
         tonic::include_proto!("csi.v1");

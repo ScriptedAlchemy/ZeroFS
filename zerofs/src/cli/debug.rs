@@ -311,7 +311,7 @@ fn parse_sha256(value: &str, label: &str) -> Result<[u8; 32]> {
         anyhow::bail!("{label} must be exactly 64 hexadecimal characters");
     }
     let mut digest = [0_u8; 32];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         digest[index] = u8::from_str_radix(std::str::from_utf8(pair)?, 16)?;
     }
     Ok(digest)

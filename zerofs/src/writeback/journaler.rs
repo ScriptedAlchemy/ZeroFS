@@ -31,6 +31,10 @@ where
     Ok((committed, publish_watermark()))
 }
 
+#[allow(
+    clippy::double_must_use,
+    reason = "async_trait adds must_use to already must-use boxed futures"
+)]
 #[async_trait::async_trait]
 pub trait LocalCommitObserver: Send + Sync + 'static {
     /// Observe one fully committed publication batch. The records are the

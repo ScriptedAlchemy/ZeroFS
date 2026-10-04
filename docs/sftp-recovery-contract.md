@@ -38,6 +38,15 @@ watchdog refreshes the client factory for future dials without retiring healthy
 sessions. Disk-full incidents and genuine immutable-object conflicts are also
 separate failures; transport retry must not conceal them.
 
+## FreeBSD journal inspection
+
+FreeBSD uses `/dev/fd` to reopen the already validated, pinned journal descriptor
+for read-only identity checks. Mount `fdescfs` at `/dev/fd` before running ZeroFS;
+plain `devfs` exposes only descriptors 0–2. A missing descriptor path fails closed
+and never falls back to reopening the journal by its mutable filename. The native
+FreeBSD cross-compile job mounts `fdescfs` and runs the existing descriptor test,
+which replaces the pathname and checks both original identity and writer locking.
+
 ## Regression evidence
 
 The regression suite exercises the shipping scheduler, durable journal, SFTP

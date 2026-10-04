@@ -84,6 +84,7 @@ impl ZeroFS {
     /// Remove only if `name` still denotes the exact observed directory entry.
     /// Inode and cookie comparison occurs under the ordinary remove fence and
     /// ordered locks before any unlink mutation.
+    #[cfg(any(feature = "webui", test))]
     pub(crate) async fn remove_if_entry_matches(
         &self,
         auth: &AuthContext,

@@ -402,6 +402,10 @@ mod tests {
             }
         }
 
+        #[allow(
+            deprecated,
+            reason = "fetch_update supports the existing Rust 1.97 build toolchain"
+        )]
         fn take(counter: &AtomicUsize) -> bool {
             counter
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))

@@ -812,18 +812,16 @@ fn prune_foyer_partitions(root: &StdPath, capacity: usize) -> Result<FoyerPruneR
     }
     partitions.sort_unstable_by_key(|partition| partition.0);
     let mut retained_logical_bytes = 0_u64;
-    let mut expected_id = 0_u32;
     let mut retained = 0;
-    for (id, _, logical, _) in &partitions {
+    for (expected_id, (id, _, logical, _)) in partitions.iter().enumerate() {
         let fits = retained_logical_bytes
             .checked_add(*logical)
             .is_some_and(|bytes| bytes <= capacity as u64);
-        if *id != expected_id || !fits {
+        if usize::try_from(*id).ok() != Some(expected_id) || !fits {
             break;
         }
         retained_logical_bytes += *logical;
-        expected_id += 1;
-        retained += 1;
+        retained = expected_id + 1;
     }
 
     let mut result = FoyerPruneResult::default();

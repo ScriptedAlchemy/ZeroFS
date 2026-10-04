@@ -465,6 +465,10 @@ impl SegmentGcStats {
 }
 
 /// Creation always precedes deletion, so it never actually underflows, but clamp anyway rather than wrap.
+#[allow(
+    deprecated,
+    reason = "fetch_update supports the existing Rust 1.97 build toolchain"
+)]
 fn apply_i64(a: &AtomicU64, d: i64) {
     use Ordering::Relaxed;
     if d >= 0 {

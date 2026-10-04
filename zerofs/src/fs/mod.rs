@@ -37,6 +37,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 pub use self::gc::GarbageCollector;
 pub use handle::OpenHandle;
+#[cfg(feature = "webui")]
 pub(crate) use ops::{VerifiedFileContent, VerifiedFileExpectation, VerifiedRenameOutcome};
 
 use self::errors::FsError;
