@@ -32,5 +32,18 @@ runs:
         cp "$RUNNER_TEMP/minio-bin/minio" "$image_context/minio"
         docker build --file "$GITHUB_ACTION_PATH/Dockerfile" \
           --tag zerofs-minio-ci:local "$image_context"
-        # Native-kernel jobs synchronize this file to their existing QEMU guest.
         docker save --output "$GITHUB_WORKSPACE/ci-minio-image.tar" zerofs-minio-ci:local
+    - name: Transfer fixture to the running guest
+      if: env.ZEROFS_CI_GUEST == '1'
+      shell: bash
+      run: |
+        # The guest checkout is synchronized at startup, before these builds.
+        # Copy only fixture files; preserve all guest-side test/runtime state.
+        bash "$GITHUB_WORKSPACE/kernel/ci/tests/test_qemu_fixture_handoff.sh"
+        for tool in minio mc; do
+          "$GITHUB_WORKSPACE/kernel/ci/qemu-vm.sh" push-file "$RUNNER_TEMP/minio-bin/$tool"
+          "$GITHUB_WORKSPACE/kernel/ci/qemu-vm.sh" push-file "$GITHUB_WORKSPACE/$tool"
+        done
+        if [[ '${{ inputs.docker-image }}' == 'true' ]]; then
+          "$GITHUB_WORKSPACE/kernel/ci/qemu-vm.sh" push-file "$GITHUB_WORKSPACE/ci-minio-image.tar"
+        fi
