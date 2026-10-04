@@ -7,5 +7,9 @@ pub mod proto {
     // are `OBJ_*` to avoid colliding with FileOperation's `RENAME` in the same
     // package, and the lint fires on generated code we can't annotate inline.
     #![allow(clippy::enum_variant_names)]
+    #![allow(
+        clippy::double_must_use,
+        reason = "tonic generates async_trait methods with redundant must_use attributes"
+    )]
     tonic::include_proto!("zerofs.admin");
 }

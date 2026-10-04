@@ -11,6 +11,10 @@ use tokio::sync::{Mutex, Notify, watch};
 use tonic::transport::Channel;
 use tonic::{Request, Response, Status};
 
+#[allow(
+    clippy::double_must_use,
+    reason = "tonic generates async_trait methods with redundant must_use attributes"
+)]
 pub mod proto {
     tonic::include_proto!("zerofs.replication");
 }

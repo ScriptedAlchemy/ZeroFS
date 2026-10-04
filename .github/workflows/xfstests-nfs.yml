@@ -49,14 +49,20 @@ jobs:
           path: zerofs/target/ci
       - run: chmod +x zerofs/target/ci/zerofs
 
+      - name: Build pinned MinIO fixture
+        uses: ./.github/actions/build-minio-fixture
+        with:
+          docker-image: 'true'
+
       - name: Start MinIO
         run: |
+          sudo docker load --input "$GITHUB_WORKSPACE/ci-minio-image.tar"
           docker run -d \
             --name minio \
             -p 9000:9000 \
             -e MINIO_ROOT_USER=minioadmin \
             -e MINIO_ROOT_PASSWORD=minioadmin \
-            minio/minio server /data
+            zerofs-minio-ci:local server /data
 
           # Wait for MinIO to be ready
           for i in {1..30}; do
@@ -72,7 +78,6 @@ jobs:
           done
 
           # The TEST and SCRATCH instances share one bucket under distinct prefixes.
-          wget https://dl.min.io/client/mc/release/linux-amd64/mc
           chmod +x mc
           ./mc alias set myminio http://localhost:9000 minioadmin minioadmin
           ./mc mb myminio/zerofs-test || true
@@ -260,14 +265,20 @@ jobs:
           path: zerofs/target/ci
       - run: chmod +x zerofs/target/ci/zerofs
 
+      - name: Build pinned MinIO fixture
+        uses: ./.github/actions/build-minio-fixture
+        with:
+          docker-image: 'true'
+
       - name: Start MinIO
         run: |
+          sudo docker load --input "$GITHUB_WORKSPACE/ci-minio-image.tar"
           docker run -d \
             --name minio \
             -p 9000:9000 \
             -e MINIO_ROOT_USER=minioadmin \
             -e MINIO_ROOT_PASSWORD=minioadmin \
-            minio/minio server /data
+            zerofs-minio-ci:local server /data
 
           # Wait for MinIO to be ready
           for i in {1..30}; do
@@ -283,7 +294,6 @@ jobs:
           done
 
           # Install mc (MinIO client)
-          wget https://dl.min.io/client/mc/release/linux-amd64/mc
           chmod +x mc
           ./mc alias set myminio http://localhost:9000 minioadmin minioadmin
           ./mc mb myminio/zerofs-test || true

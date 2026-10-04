@@ -37,6 +37,10 @@ const STORE: &str = "RedisConditionalStore";
 ///
 /// Implementations provide mutual exclusion for writes to a given path, so a
 /// HEAD + PUT sequence on a store without native conditional support is atomic.
+#[allow(
+    clippy::double_must_use,
+    reason = "async_trait adds must_use to already must-use boxed futures"
+)]
 #[async_trait]
 pub trait PutCommit: Send + Sync + Debug {
     /// Acquire an exclusive lock for `path`.

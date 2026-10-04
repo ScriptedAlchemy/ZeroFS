@@ -17,9 +17,10 @@ use crate::writeback::multipart_reservation::{
 use crate::writeback::overlay::{OverlayCommitObserver, OverlayIndex, VisibleVersion};
 use crate::writeback::payload::VerifiedPayload;
 use crate::writeback::remote::{RemoteBarrierError, RemoteScheduler};
+#[cfg(feature = "webui")]
+use crate::writeback::reservation::WriteAdmissionHealth;
 use crate::writeback::reservation::{
     ReservationError, SsdAdmission, SsdReservationRequest, SsdReservationToken,
-    WriteAdmissionHealth,
 };
 use crate::writeback::space_refresher::SpaceRefresher;
 use crate::writeback::space_sample::{PhysicalSpaceSample, PhysicalSpaceSampler};
@@ -397,6 +398,7 @@ impl WritebackObjectStore {
 
     /// Current physical-space health for callers that can decline work before
     /// starting a mutation. This is advisory and intentionally holds no token.
+    #[cfg(feature = "webui")]
     pub(crate) async fn write_admission_health(&self) -> anyhow::Result<WriteAdmissionHealth> {
         self.inner
             .remote
@@ -556,6 +558,10 @@ impl WritebackObjectStore {
         ]
     }
 
+    #[allow(
+        deprecated,
+        reason = "fetch_update supports the existing Rust 1.97 build toolchain"
+    )]
     fn allocate_sequence(&self) -> object_store::Result<u64> {
         self.inner
             .next_sequence

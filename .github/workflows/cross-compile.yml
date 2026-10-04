@@ -129,11 +129,16 @@ jobs:
           mem: 12288
           prepare: |
             pkg install -y gmake curl cmake
+            # Descriptor-anchored journal inspection needs all open descriptors.
+            mount -t fdescfs none /dev/fd
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
           run: |
             . $HOME/.cargo/env
             cd zerofs
             cargo build --profile ci --features webui
+            cargo test --locked --profile ci --features webui -p zerofs --lib \
+              writeback::anchored_dir::tests::descriptor_read_only_open_retains_identity_and_exact_writer_lock \
+              -- --exact
             cp target/ci/zerofs ../zerofs-${{ matrix.platform }}-${{ matrix.arch }}
             rm -rf target/
 

@@ -210,6 +210,10 @@ pub struct RemoteObjectRead {
     pub(crate) payload: Bytes,
 }
 
+#[allow(
+    clippy::double_must_use,
+    reason = "async_trait adds must_use to already must-use boxed futures"
+)]
 #[async_trait]
 pub trait TransportSession: fmt::Debug + Send + Sync + 'static {
     fn capabilities(&self) -> SftpCapabilities;
@@ -368,6 +372,10 @@ impl fmt::Debug for SftpBackendNamespace {
     }
 }
 
+#[allow(
+    clippy::double_must_use,
+    reason = "async_trait adds must_use to already must-use boxed futures"
+)]
 #[async_trait]
 pub trait SessionFactory: fmt::Debug + Send + Sync + 'static {
     /// Identify the remote account namespace opened by this factory.
@@ -2954,16 +2962,17 @@ mod tests {
         }
         tokio::time::advance(Duration::from_secs(30) + SFTP_IDLE_REAP_INTERVAL).await;
         tokio::task::yield_now().await;
-        let auth = pool.inner.auth_stall.lock().unwrap();
-        assert_eq!(
-            auth.recoveries, 0,
-            "non-auth failures must not trigger recovery"
-        );
-        assert!(
-            auth.rejected_since.is_none(),
-            "non-auth failures must not arm the tracker"
-        );
-        drop(auth);
+        {
+            let auth = pool.inner.auth_stall.lock().unwrap();
+            assert_eq!(
+                auth.recoveries, 0,
+                "non-auth failures must not trigger recovery"
+            );
+            assert!(
+                auth.rejected_since.is_none(),
+                "non-auth failures must not arm the tracker"
+            );
+        }
         state.fail.store(false, Ordering::SeqCst);
         pool.shutdown().await.unwrap();
     }

@@ -368,6 +368,10 @@ async fn bounded_target_lock<'a>(
         })
 }
 
+#[allow(
+    clippy::double_must_use,
+    reason = "async_trait adds must_use to already must-use boxed futures"
+)]
 #[async_trait]
 pub trait RemoteSession: Debug + Send + Sync {
     /// Identify the remote namespace whose paths this session mutates.

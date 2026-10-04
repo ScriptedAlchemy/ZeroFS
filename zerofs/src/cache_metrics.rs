@@ -72,6 +72,10 @@ impl GaugeOps for Gauge {
         self.0.fetch_add(value, Ordering::Relaxed);
     }
 
+    #[allow(
+        deprecated,
+        reason = "fetch_update supports the existing Rust 1.97 build toolchain"
+    )]
     fn decrease(&self, value: u64) {
         self.0
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {

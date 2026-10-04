@@ -404,6 +404,10 @@ where
     ))
 }
 
+#[allow(
+    clippy::double_must_use,
+    reason = "async_trait adds must_use to already must-use boxed futures"
+)]
 #[async_trait]
 pub(crate) trait SshConnectionOwner: fmt::Debug + Send + Sync {
     async fn close(self: Box<Self>, force: CancellationToken) -> Result<(), TransportError>;

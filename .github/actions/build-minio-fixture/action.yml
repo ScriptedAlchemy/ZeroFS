@@ -1,0 +1,36 @@
+name: Build pinned MinIO fixture
+description: Build the source-pinned MinIO tools used by ZeroFS CI without retired binary downloads
+inputs:
+  docker-image:
+    description: Export a local Linux fixture image for existing container-based tests
+    default: 'false'
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-go@v5
+      with:
+        go-version: '1.24.x'
+        cache: false
+    - name: Build pinned tools
+      shell: bash
+      env:
+        CGO_ENABLED: '0'
+        GOBIN: ${{ runner.temp }}/minio-bin
+      run: |
+        # Keep the same source commits validated by release-pgo.yml.
+        go install github.com/minio/minio@7aac2a2c5b7c882e68c1ce017d8256be2feea27f
+        go install github.com/minio/mc@77f82e18b5401a65958f1619df6ebb994634bd88
+        cp "$GOBIN/minio" "$GITHUB_WORKSPACE/minio"
+        cp "$GOBIN/mc" "$GITHUB_WORKSPACE/mc"
+        echo "$GOBIN" >> "$GITHUB_PATH"
+    - name: Export local fixture image
+      if: runner.os == 'Linux' && inputs.docker-image == 'true'
+      shell: bash
+      run: |
+        image_context="$RUNNER_TEMP/zerofs-minio-image"
+        mkdir -p "$image_context"
+        cp "$RUNNER_TEMP/minio-bin/minio" "$image_context/minio"
+        docker build --file "$GITHUB_ACTION_PATH/Dockerfile" \
+          --tag zerofs-minio-ci:local "$image_context"
+        # Native-kernel jobs synchronize this file to their existing QEMU guest.
+        docker save --output "$GITHUB_WORKSPACE/ci-minio-image.tar" zerofs-minio-ci:local

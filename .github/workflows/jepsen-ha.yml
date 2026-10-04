@@ -81,14 +81,8 @@ jobs:
           sudo chmod +x /usr/local/bin/lein
           lein version
 
-      - name: Download MinIO + mc
-        run: |
-          mkdir -p "$RUNNER_TEMP/minio-bin"
-          curl -fsSL https://dl.min.io/server/minio/release/linux-amd64/minio \
-            -o "$RUNNER_TEMP/minio-bin/minio"
-          curl -fsSL https://dl.min.io/client/mc/release/linux-amd64/mc \
-            -o "$RUNNER_TEMP/minio-bin/mc"
-          chmod +x "$RUNNER_TEMP/minio-bin/minio" "$RUNNER_TEMP/minio-bin/mc"
+      - name: Build pinned MinIO fixture
+        uses: ./.github/actions/build-minio-fixture
 
       - run: chmod +x zerofs/target/ci/zerofs
 
@@ -292,14 +286,8 @@ jobs:
           sudo chmod +x /usr/local/bin/lein
           lein version
 
-      - name: Download MinIO + mc
-        run: |
-          mkdir -p "$RUNNER_TEMP/minio-bin"
-          curl -fsSL https://dl.min.io/server/minio/release/linux-amd64/minio \
-            -o "$RUNNER_TEMP/minio-bin/minio"
-          curl -fsSL https://dl.min.io/client/mc/release/linux-amd64/mc \
-            -o "$RUNNER_TEMP/minio-bin/mc"
-          chmod +x "$RUNNER_TEMP/minio-bin/minio" "$RUNNER_TEMP/minio-bin/mc"
+      - name: Build pinned MinIO fixture
+        uses: ./.github/actions/build-minio-fixture
 
       - run: chmod +x zerofs/target/ci/zerofs
 

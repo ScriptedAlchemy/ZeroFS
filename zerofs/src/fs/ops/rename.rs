@@ -101,6 +101,7 @@ impl ZeroFS {
         }
     }
 
+    #[cfg(any(feature = "webui", test))]
     pub(crate) async fn entry_identity(
         &self,
         dirid: InodeId,
@@ -115,6 +116,7 @@ impl ZeroFS {
     /// holding the ordinary rename fence and ordered inode locks, then
     /// publish without releasing either boundary. Passing the same source and
     /// destination performs a locked verification-only commit.
+    #[cfg(any(feature = "webui", test))]
     pub(crate) async fn rename_verified(
         &self,
         auth: &AuthContext,

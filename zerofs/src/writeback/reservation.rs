@@ -158,6 +158,7 @@ struct SsdState {
     pacing: PacingLedger,
 }
 
+#[cfg(any(feature = "webui", test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WriteAdmissionHealth {
     Ready,
@@ -572,6 +573,7 @@ impl SsdAdmission {
 
     /// Refresh from a current physical-space sample and classify only whether
     /// new writes have the configured free-space floor. This takes no token.
+    #[cfg(any(feature = "webui", test))]
     pub(crate) fn physical_admission_health(
         &self,
         sample: PhysicalSpaceSample,
@@ -1027,85 +1029,6 @@ impl CommittedSsdReservation {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn try_reserve_fresh_sample_grants_existing_fifo_waiter_before_caller() {
-        let admission = SsdAdmission::recover(
-            100,
-            1,
-            95,
-            85,
-            1,
-            std::iter::empty(),
-            Some(PhysicalSpaceSample {
-                generation: 1,
-                available_bytes: 10,
-            }),
-        )
-        .unwrap();
-        let held = admission
-            .reserve(
-                SsdReservationRequest {
-                    ssd_reservation_bytes: 0,
-                    physical_reservation_bytes: 7,
-                    operations: 0,
-                },
-                PhysicalSpaceSample {
-                    generation: 1,
-                    available_bytes: 10,
-                },
-            )
-            .await
-            .unwrap();
-        let queued = Arc::new(Notify::new());
-        let waiter = tokio::spawn({
-            let admission = admission.clone();
-            let queued = queued.clone();
-            async move {
-                admission
-                    .reserve_with_queue_observer(
-                        SsdReservationRequest {
-                            ssd_reservation_bytes: 0,
-                            physical_reservation_bytes: 4,
-                            operations: 1,
-                        },
-                        PhysicalSpaceSample {
-                            generation: 1,
-                            available_bytes: 10,
-                        },
-                        || queued.notify_one(),
-                    )
-                    .await
-            }
-        });
-        queued.notified().await;
-
-        let result = admission.try_reserve(
-            SsdReservationRequest {
-                ssd_reservation_bytes: 0,
-                physical_reservation_bytes: 1,
-                operations: 1,
-            },
-            PhysicalSpaceSample {
-                generation: 2,
-                available_bytes: 20,
-            },
-        );
-
-        assert!(matches!(result, Err(ReservationError::Unavailable)));
-        let waiter = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
-            .await
-            .expect("fresh sample did not wake FIFO waiter")
-            .unwrap()
-            .unwrap();
-        drop(waiter);
-        drop(held);
-    }
-}
-
 impl SsdReservationRequest {
     pub(crate) fn from_pending_record(
         record: &crate::writeback::model::MutationRecord,
@@ -1234,5 +1157,84 @@ impl CommittedSsdReservation {
         Err(ReservationError::Poisoned(
             "cannot release a committed SSD reservation".into(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn try_reserve_fresh_sample_grants_existing_fifo_waiter_before_caller() {
+        let admission = SsdAdmission::recover(
+            100,
+            1,
+            95,
+            85,
+            1,
+            std::iter::empty(),
+            Some(PhysicalSpaceSample {
+                generation: 1,
+                available_bytes: 10,
+            }),
+        )
+        .unwrap();
+        let held = admission
+            .reserve(
+                SsdReservationRequest {
+                    ssd_reservation_bytes: 0,
+                    physical_reservation_bytes: 7,
+                    operations: 0,
+                },
+                PhysicalSpaceSample {
+                    generation: 1,
+                    available_bytes: 10,
+                },
+            )
+            .await
+            .unwrap();
+        let queued = Arc::new(Notify::new());
+        let waiter = tokio::spawn({
+            let admission = admission.clone();
+            let queued = queued.clone();
+            async move {
+                admission
+                    .reserve_with_queue_observer(
+                        SsdReservationRequest {
+                            ssd_reservation_bytes: 0,
+                            physical_reservation_bytes: 4,
+                            operations: 1,
+                        },
+                        PhysicalSpaceSample {
+                            generation: 1,
+                            available_bytes: 10,
+                        },
+                        || queued.notify_one(),
+                    )
+                    .await
+            }
+        });
+        queued.notified().await;
+
+        let result = admission.try_reserve(
+            SsdReservationRequest {
+                ssd_reservation_bytes: 0,
+                physical_reservation_bytes: 1,
+                operations: 1,
+            },
+            PhysicalSpaceSample {
+                generation: 2,
+                available_bytes: 20,
+            },
+        );
+
+        assert!(matches!(result, Err(ReservationError::Unavailable)));
+        let waiter = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("fresh sample did not wake FIFO waiter")
+            .unwrap()
+            .unwrap();
+        drop(waiter);
+        drop(held);
     }
 }
