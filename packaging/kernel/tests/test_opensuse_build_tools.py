@@ -60,7 +60,7 @@ fi
 die() { echo "$*" >&2; exit 1; }
 require_command() { command -v "$1" >/dev/null || die "missing command"; }
 config_value() { sed -n "s/^$2=//p" "$1"; }
-work_root=$3
+readonly work_root=$3
 source "$1"
 install_opensuse_build_tools "$2" "$work_root"
 ''',

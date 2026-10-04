@@ -6,7 +6,7 @@
 # primary-metadata checksums were independently verified before pinning SHA-256.
 install_opensuse_build_tools() {
     local auto_conf=$1
-    local work_root=$2
+    local tools_work_root=$2
     local directory
     local index
     local path
@@ -33,7 +33,7 @@ install_opensuse_build_tools() {
     require_command curl
     require_command rpmkeys
     require_command sha256sum
-    directory=$(mktemp -d "$work_root/opensuse-build-tools.XXXXXX") ||
+    directory=$(mktemp -d "$tools_work_root/opensuse-build-tools.XXXXXX") ||
         die "cannot create the openSUSE build-tools directory"
     for ((index = 0; index < ${#filenames[@]}; index++)); do
         path="$directory/${filenames[$index]}"
