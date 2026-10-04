@@ -138,7 +138,7 @@ jobs:
           enabled = false
           EOF
 
-          ./target/ci/zerofs run -c zerofs-test.toml &
+          ./target/ci/zerofs run -c zerofs-test.toml > /tmp/zerofs-test.log 2>&1 &
           echo $! > /tmp/zerofs-test.pid
 
           echo "Waiting for ZeroFS TEST instance to start..."
@@ -185,7 +185,7 @@ jobs:
           enabled = false
           EOF
 
-          ./target/ci/zerofs run -c zerofs-scratch.toml &
+          ./target/ci/zerofs run -c zerofs-scratch.toml > /tmp/zerofs-scratch.log 2>&1 &
           echo $! > /tmp/zerofs-scratch.pid
 
           echo "Waiting for ZeroFS SCRATCH instance to start..."
@@ -293,6 +293,28 @@ jobs:
         working-directory: /tmp/xfstests
         run: |
           sudo ./check -g quick -E excludes
+
+      - name: Collect FUSE failure diagnostics
+        if: failure()
+        run: |
+          diagnostics="$GITHUB_WORKSPACE/xfstests-fuse-diagnostics"
+          mkdir -p "$diagnostics"
+          if [ -d /tmp/xfstests/results ]; then
+            sudo cp -a /tmp/xfstests/results "$diagnostics/results"
+          fi
+          for log in /tmp/zerofs-test.log /tmp/zerofs-scratch.log /tmp/zerofs-mount.log; do
+            [ ! -f "$log" ] || sudo cp "$log" "$diagnostics/"
+          done
+          sudo chown -R "$(id -u):$(id -g)" "$diagnostics"
+
+      - name: Save FUSE failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xfstests-fuse-diagnostics
+          path: xfstests-fuse-diagnostics
+          retention-days: 7
+          if-no-files-found: warn
 
       - name: Cleanup
         if: always()

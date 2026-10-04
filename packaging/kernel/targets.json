@@ -793,8 +793,8 @@
     {
       "id": "opensuse-tumbleweed-default-x86-64-7.1.5-1-default-r4",
       "enabled": true,
-      "ci": true,
-      "publish": true,
+      "ci": false,
+      "publish": false,
       "channel_id": "opensuse-tumbleweed-default-x86-64",
       "package_revision": "4",
       "kernel_release": "7.1.5-1-default",
@@ -806,6 +806,24 @@
         "kind": "opensuse-history",
         "identity": "kernel-default@7.1.5-1.1,kernel-default-devel@7.1.5-1.1,kernel-devel@7.1.5-1.1,kernel-source@7.1.5-1.1,kernel-syms@7.1.5-1.1",
         "snapshot": "20260731"
+      }
+    },
+    {
+      "id": "opensuse-tumbleweed-default-x86-64-7.2.8-1-default-r5",
+      "enabled": true,
+      "ci": true,
+      "publish": true,
+      "channel_id": "opensuse-tumbleweed-default-x86-64",
+      "package_revision": "5",
+      "kernel_release": "7.2.8-1-default",
+      "kernel_package_name": "kernel-default",
+      "kernel_package_version": "7.2.8-1.1",
+      "kernel_selector_version": "7.2.8-1.1",
+      "builder_image": "opensuse/tumbleweed:latest",
+      "source": {
+        "kind": "opensuse-history",
+        "identity": "kernel-default@7.2.8-1.1,kernel-default-devel@7.2.8-1.1,kernel-devel@7.2.8-1.1,kernel-source@7.2.8-1.1,kernel-syms@7.2.8-1.1",
+        "snapshot": "20261002"
       }
     }
   ],

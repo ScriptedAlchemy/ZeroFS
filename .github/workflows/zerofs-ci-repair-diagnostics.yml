@@ -1,0 +1,15 @@
+name: ZeroFS CI repair diagnostics
+on:
+  push:
+    branches: [codex/zerofs-ci-opensuse-refresh]
+permissions:
+  contents: read
+jobs:
+  build:
+    uses: ./.github/workflows/_build-ci-bin.yml
+  fuse:
+    needs: build
+    uses: ./.github/workflows/xfstests-fuse.yml
+  packages:
+    needs: build
+    uses: ./.github/workflows/kernel-packages.yml
