@@ -9,11 +9,6 @@ on:
 permissions:
   contents: read
 
-env:
-  # Match the source-built tools already validated by release-pgo.yml.
-  MINIO_VERSION: 7aac2a2c5b7c882e68c1ce017d8256be2feea27f
-  MINIO_MC_VERSION: 77f82e18b5401a65958f1619df6ebb994634bd88
-
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -28,20 +23,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-go@v5
+      - name: Build pinned MinIO fixture
+        uses: ./.github/actions/build-minio-fixture
         with:
-          go-version: '1.24.x'
-          cache: false
-
-      - name: Build pinned MinIO tools
-        run: |
-          go install "github.com/minio/minio@${MINIO_VERSION}"
-          go install "github.com/minio/mc@${MINIO_MC_VERSION}"
+          docker-image: 'true'
 
       - name: Start MinIO
         run: |
-          MINIO_ROOT_USER=minioadmin MINIO_ROOT_PASSWORD=minioadmin \
-            minio server "$RUNNER_TEMP/minio-data" > "$RUNNER_TEMP/minio.log" 2>&1 &
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            docker run -d --name minio -p 9000:9000 \
+              -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
+              zerofs-minio-ci:local server /data
+          else
+            MINIO_ROOT_USER=minioadmin MINIO_ROOT_PASSWORD=minioadmin \
+              minio server "$RUNNER_TEMP/minio-data" > "$RUNNER_TEMP/minio.log" 2>&1 &
+          fi
 
           for i in {1..30}; do
             if curl -f http://localhost:9000/minio/health/live; then

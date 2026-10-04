@@ -17,15 +17,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Build pinned MinIO fixture
+        uses: ./.github/actions/build-minio-fixture
+        with:
+          docker-image: 'true'
+
       - name: Start MinIO (Linux)
         if: runner.os == 'Linux'
         run: |
+          sudo docker load --input "$GITHUB_WORKSPACE/ci-minio-image.tar"
           docker run -d \
             --name minio \
             -p 9000:9000 \
             -e MINIO_ROOT_USER=minioadmin \
             -e MINIO_ROOT_PASSWORD=minioadmin \
-            minio/minio server /data
+            zerofs-minio-ci:local server /data
 
           # Wait for MinIO to be ready
           for i in {1..30}; do
@@ -43,10 +49,6 @@ jobs:
       - name: Start MinIO (macOS)
         if: runner.os == 'macOS'
         run: |
-          # Download MinIO binary
-          wget https://dl.min.io/server/minio/release/darwin-amd64/minio
-          chmod +x minio
-
           # Start MinIO in background
           export MINIO_ROOT_USER=minioadmin
           export MINIO_ROOT_PASSWORD=minioadmin
@@ -89,12 +91,6 @@ jobs:
 
       - name: Setup MinIO bucket
         run: |
-          # Install mc (MinIO client)
-          if [[ "$RUNNER_OS" == "Linux" ]]; then
-            wget https://dl.min.io/client/mc/release/linux-amd64/mc
-          else
-            wget https://dl.min.io/client/mc/release/darwin-amd64/mc
-          fi
           chmod +x mc
           ./mc alias set myminio http://localhost:9000 minioadmin minioadmin
           ./mc mb myminio/zerofs-test || true
@@ -235,14 +231,20 @@ jobs:
           path: zerofs/target/ci
       - run: chmod +x zerofs/target/ci/zerofs
 
+      - name: Build pinned MinIO fixture
+        uses: ./.github/actions/build-minio-fixture
+        with:
+          docker-image: 'true'
+
       - name: Start MinIO
         run: |
+          sudo docker load --input "$GITHUB_WORKSPACE/ci-minio-image.tar"
           docker run -d \
             --name minio \
             -p 9000:9000 \
             -e MINIO_ROOT_USER=minioadmin \
             -e MINIO_ROOT_PASSWORD=minioadmin \
-            minio/minio server /data
+            zerofs-minio-ci:local server /data
 
           # Wait for MinIO to be ready
           for i in {1..30}; do
@@ -258,7 +260,6 @@ jobs:
           done
 
           # Install mc (MinIO client)
-          wget https://dl.min.io/client/mc/release/linux-amd64/mc
           chmod +x mc
           ./mc alias set myminio http://localhost:9000 minioadmin minioadmin
           ./mc mb myminio/zerofs-test || true
