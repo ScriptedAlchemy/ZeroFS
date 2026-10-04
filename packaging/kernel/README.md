@@ -133,6 +133,11 @@ fallback remains visible as `target_cc_exact=false`; the self-contained path
 rejects such a fallback because it requires the exact target compiler.
 The official openSUSE builder image supplies its trusted distribution keys;
 snapshot refreshes never import a key advertised by repository metadata.
+The openSUSE kernel built with GCC 16.2.0 and binutils 2.45 uses SHA-256-pinned
+compiler/assembler RPMs from the official 20260924 archive when the kernel
+snapshot's default tools have advanced. Every RPM must also verify against the
+official image's existing trusted keys before installation. The exact compiler
+banner and assembler-version checks remain enforced by the module builder.
 
 The self-contained path handles a narrower `CONFIG_RUST=n` case; it is not a
 general compatibility layer. It needs the exact full kernel source, configured

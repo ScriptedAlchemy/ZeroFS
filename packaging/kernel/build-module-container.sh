@@ -1006,6 +1006,10 @@ build_zerofs_module() {
     if [[ "$distro" == ubuntu || "$distro" == debian ]]; then
         install_apt_rust_tools "$auto_conf"
     fi
+    if [[ "$distro" == opensuse ]]; then
+        source "$tooling_root/packaging/kernel/opensuse-build-tools.sh"
+        install_opensuse_build_tools "$auto_conf" "$work_root"
+    fi
     select_rust_tools "$auto_conf"
     select_target_cc "$auto_conf"
 

@@ -7,9 +7,6 @@ permissions:
 jobs:
   build:
     uses: ./.github/workflows/_build-ci-bin.yml
-  fuse:
-    needs: build
-    uses: ./.github/workflows/xfstests-fuse.yml
   packages:
     needs: build
     uses: ./.github/workflows/kernel-packages.yml
