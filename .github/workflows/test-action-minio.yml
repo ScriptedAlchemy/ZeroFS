@@ -9,6 +9,11 @@ on:
 permissions:
   contents: read
 
+env:
+  # Match the source-built tools already validated by release-pgo.yml.
+  MINIO_VERSION: 7aac2a2c5b7c882e68c1ce017d8256be2feea27f
+  MINIO_MC_VERSION: 77f82e18b5401a65958f1619df6ebb994634bd88
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -23,17 +28,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Start MinIO (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          docker run -d \
-            --name minio \
-            -p 9000:9000 \
-            -e MINIO_ROOT_USER=minioadmin \
-            -e MINIO_ROOT_PASSWORD=minioadmin \
-            minio/minio server /data
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.x'
+          cache: false
 
-          # Wait for MinIO to be ready
+      - name: Build pinned MinIO tools
+        run: |
+          go install "github.com/minio/minio@${MINIO_VERSION}"
+          go install "github.com/minio/mc@${MINIO_MC_VERSION}"
+
+      - name: Start MinIO
+        run: |
+          MINIO_ROOT_USER=minioadmin MINIO_ROOT_PASSWORD=minioadmin \
+            minio server "$RUNNER_TEMP/minio-data" > "$RUNNER_TEMP/minio.log" 2>&1 &
+
           for i in {1..30}; do
             if curl -f http://localhost:9000/minio/health/live; then
               echo "MinIO is ready"
@@ -41,41 +50,12 @@ jobs:
             fi
             sleep 1
           done
-
-      - name: Start MinIO (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          # Download MinIO binary
-          wget https://dl.min.io/server/minio/release/darwin-amd64/archive/minio.RELEASE.2025-07-23T15-54-02Z
-          mv minio.RELEASE.2025-07-23T15-54-02Z minio
-          chmod +x minio
-
-          # Start MinIO in background
-          export MINIO_ROOT_USER=minioadmin
-          export MINIO_ROOT_PASSWORD=minioadmin
-          mkdir -p ${{ github.workspace }}/minio-data
-          ./minio server ${{ github.workspace }}/minio-data &
-
-          # Wait for MinIO to be ready
-          for i in {1..30}; do
-            if curl -f http://localhost:9000/minio/health/live; then
-              echo "MinIO is ready"
-              break
-            fi
-            sleep 1
-          done
+          curl --fail http://localhost:9000/minio/health/live
 
       - name: Setup MinIO bucket
         run: |
-          # Install mc (MinIO client)
-          if [[ "$RUNNER_OS" == "Linux" ]]; then
-            wget https://dl.min.io/client/mc/release/linux-amd64/mc
-          else
-            wget https://dl.min.io/client/mc/release/darwin-amd64/mc
-          fi
-          chmod +x mc
-          ./mc alias set myminio http://localhost:9000 minioadmin minioadmin
-          ./mc mb myminio/test-bucket || true
+          mc alias set myminio http://localhost:9000 minioadmin minioadmin
+          mc mb myminio/test-bucket
 
       - name: Setup ZeroFS Volume
         id: setup-zerofs

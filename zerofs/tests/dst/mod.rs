@@ -128,6 +128,10 @@ enum SeedSource {
 }
 
 impl SeedSource {
+    #[allow(
+        deprecated,
+        reason = "fetch_update supports the existing Rust 1.97 build toolchain"
+    )]
     fn next(&self) -> Option<u64> {
         match self {
             SeedSource::List(queue) => queue.lock().unwrap().pop_front(),
