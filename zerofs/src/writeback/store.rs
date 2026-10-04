@@ -4608,6 +4608,15 @@ mod tests {
 
     #[tokio::test]
     async fn interleaved_unknown_ssd_multiparts_cannot_hold_a4_b4_while_a2_b2_wait() {
+        assert_interleaved_unknown_ssd_multipart_growth(true).await;
+    }
+
+    #[tokio::test]
+    async fn unknown_ssd_multipart_can_complete_after_peer_rejection_refunds_capacity() {
+        assert_interleaved_unknown_ssd_multipart_growth(false).await;
+    }
+
+    async fn assert_interleaved_unknown_ssd_multipart_growth(concurrent: bool) {
         let path_a = Path::from("unknown-ssd-a");
         let path_b = Path::from("unknown-ssd-b");
         let first_part_charge =
@@ -4636,7 +4645,17 @@ mod tests {
         let a2 = upload_a.put_part(Bytes::from_static(b"A2").into());
         let b2 = upload_b.put_part(Bytes::from_static(b"B2").into());
         let (a2, b2) = tokio::time::timeout(Duration::from_secs(1), async {
-            futures::future::join(a2, b2).await
+            if concurrent {
+                futures::future::join(a2, b2).await
+            } else {
+                // Force the legal schedule where A's rejection cleans its
+                // staging before B tries to acquire the refunded capacity.
+                let a2 = a2.await;
+                let b2 = b2.await;
+                assert!(a2.is_err());
+                assert!(b2.is_ok());
+                (a2, b2)
+            }
         })
         .await
         .expect("multipart growth waited on SSD claims owned by the same two uploads");
@@ -4657,7 +4676,13 @@ mod tests {
         );
         let accepted = store.status().unwrap().accepted_seq;
         if accepted != 0 {
-            store.wait_remote(accepted).await.unwrap();
+            // This fixture opens with remote uploads paused. One rejection
+            // can refund enough capacity for its peer's growth to succeed.
+            store.activate_remote().unwrap();
+            tokio::time::timeout(Duration::from_secs(2), store.wait_remote(accepted))
+                .await
+                .expect("accepted multipart did not reach remote durability")
+                .unwrap();
         }
         assert_eq!(store.inner.ssd.used_bytes(), 0);
         assert_eq!(store.inner.ssd.outstanding_physical_claims(), 0);

@@ -39,6 +39,7 @@ usage() {
     cat >&2 <<EOF
 usage: $script_name start
        $script_name exec <working-directory>
+       $script_name push-file <host-path>
        $script_name pull <guest-path> <host-path>
        $script_name stop
 
@@ -523,6 +524,15 @@ sync_file_to_guest_if_present() {
     rsync_to_guest "$path" "$path"
 }
 
+push_guest_file() {
+    local path=$1
+
+    require_ready_vm
+    require_absolute_path host-path "$path"
+    [[ -f "$path" ]] || die "host file does not exist: $path"
+    sync_file_to_guest_if_present "$path"
+}
+
 sync_command_files_to_guest() {
     local variable
     local path
@@ -654,6 +664,14 @@ main() {
             init_paths
             exec_guest_script "$2"
             ;;
+        push-file)
+            [[ $# -eq 2 ]] || {
+                usage
+                exit 2
+            }
+            init_paths
+            push_guest_file "$2"
+            ;;
         pull)
             [[ $# -eq 3 ]] || {
                 usage
@@ -680,4 +698,6 @@ main() {
     esac
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
