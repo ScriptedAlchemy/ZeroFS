@@ -443,6 +443,7 @@ pub struct PrefetchingObjectStore {
     /// parts before deciding whether it needs a data GET or only a HEAD.
     generations: Cache<Path, CacheGeneration>,
     access_tracker: Cache<Path, Arc<Mutex<AccessHistory>>>,
+    discovery_locks: Mutex<HashMap<Path, std::sync::Weak<tokio::sync::Mutex<()>>>>,
     fetches: Fetches,
     cache_instance: uuid::Uuid,
     /// Clean-cache / cgroup-slack RSS ceiling. `0` disables admission.
@@ -735,6 +736,7 @@ impl PrefetchingObjectStore {
             heads,
             generations,
             access_tracker,
+            discovery_locks: Mutex::new(HashMap::new()),
             fetches: Arc::new(Mutex::new(HashMap::new())),
             cache_instance: uuid::Uuid::new_v4(),
             admission_cap_bytes: 0,
@@ -932,6 +934,25 @@ impl PrefetchingObjectStore {
         mut opts: GetOptions,
         fetch_window: usize,
     ) -> object_store::Result<(ObjectMeta, Attributes)> {
+        if let Some(head) = self.read_head(location) {
+            return Ok(head);
+        }
+
+        // Before the generation is known, the part-keyed registry cannot
+        // coordinate readers. Hold a per-object gate until discovery lands.
+        let discovery_lock = {
+            let mut locks = self.discovery_locks.lock().unwrap();
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            match locks.get(location).and_then(std::sync::Weak::upgrade) {
+                Some(lock) => lock,
+                None => {
+                    let lock = Arc::new(tokio::sync::Mutex::new(()));
+                    locks.insert(location.clone(), Arc::downgrade(&lock));
+                    lock
+                }
+            }
+        };
+        let _discovery_guard = discovery_lock.lock().await;
         if let Some(head) = self.read_head(location) {
             return Ok(head);
         }
@@ -2149,6 +2170,59 @@ mod tests {
             ),
             dir,
         )
+    }
+
+    #[tokio::test]
+    async fn concurrent_cold_sftp_reads_share_discovery() {
+        const MIB: usize = 1024 * 1024;
+        let mem = Arc::new(InMemory::new());
+        let path = Path::from("segments/cold-discovery");
+        mem.put(&path, vec![0x5Au8; MIB].into()).await.unwrap();
+        let ranges = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let backend: Arc<dyn ObjectStore> = Arc::new(DelayRecordingStore {
+            inner: mem,
+            ranges: ranges.clone(),
+            delay: std::time::Duration::from_millis(50),
+        });
+        let (store, _dir) = store_over_with_tuning(backend, MIB, MIB, 16 * MIB).await;
+        let reads = (0..6).map(|_| store.get_range(&path, 0..MIB as u64));
+        for result in futures::future::join_all(reads).await {
+            assert_eq!(result.unwrap().as_ref(), vec![0x5Au8; MIB].as_slice());
+        }
+        let seen = ranges.lock().unwrap();
+        assert_eq!(seen.len(), 1, "duplicate cold backend reads: {seen:?}");
+    }
+
+    #[tokio::test]
+    async fn cold_discovery_is_per_object_and_releases_after_cancellation() {
+        const MIB: usize = 1024 * 1024;
+        let mem = Arc::new(InMemory::new());
+        let a = Path::from("segments/cold-a");
+        let b = Path::from("segments/cold-b");
+        for path in [&a, &b] {
+            mem.put(path, vec![0x5Au8; MIB].into()).await.unwrap();
+        }
+        let ranges = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let backend: Arc<dyn ObjectStore> = Arc::new(DelayRecordingStore {
+            inner: mem,
+            ranges: ranges.clone(),
+            delay: std::time::Duration::from_millis(50),
+        });
+        let (store, _dir) = store_over_with_tuning(backend, MIB, MIB, 16 * MIB).await;
+        let mut first = Box::pin(store.get_range(&a, 0..MIB as u64));
+        let mut other = Box::pin(store.get_range(&b, 0..MIB as u64));
+        assert!(futures::poll!(&mut first).is_pending());
+        assert!(futures::poll!(&mut other).is_pending());
+        assert_eq!(ranges.lock().unwrap().len(), 2);
+        drop(first);
+        let (retried, other) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            futures::join!(store.get_range(&a, 0..MIB as u64), other)
+        })
+        .await
+        .expect("cancelled discovery must release its object gate");
+        for result in [retried, other] {
+            assert_eq!(result.unwrap().as_ref(), vec![0x5Au8; MIB].as_slice());
+        }
     }
 
     #[tokio::test]
