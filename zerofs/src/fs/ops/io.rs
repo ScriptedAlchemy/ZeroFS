@@ -235,13 +235,11 @@ impl ZeroFS {
             FallocateMode::PunchHole | FallocateMode::ZeroRange { keep_size: true } => old_size,
         };
         let zeroes_range = !matches!(mode, FallocateMode::Allocate);
-        if new_size > old_size {
-            let increase = new_size - old_size;
-            let (used_bytes, _) = self.global_stats.get_totals();
-            if used_bytes.saturating_add(increase) > self.max_bytes {
-                return Err(FsError::NoSpace);
-            }
-        }
+        let growth_reservation = if new_size > old_size {
+            Some(self.quota.reserve(new_size - old_size)?)
+        } else {
+            None
+        };
 
         let mut txn = self.db.new_transaction()?;
 
@@ -291,6 +289,11 @@ impl ZeroFS {
         self.write_coordinator.commit(txn).await.inspect_err(|e| {
             error!("Failed to commit fallocate batch: {}", e);
         })?;
+
+        if let Some(reservation) = growth_reservation {
+            reservation.accept();
+            reservation.canonical();
+        }
 
         #[cfg(feature = "failpoints")]
         fail_point!(fp::FALLOCATE_AFTER_COMMIT);
@@ -817,9 +820,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fallocate_growth_then_shrink_does_not_poison_quota() {
+        for mode in [
+            FallocateMode::Allocate,
+            FallocateMode::ZeroRange { keep_size: false },
+        ] {
+            let fs = ZeroFS::new_in_memory().await.unwrap();
+            let (id, _) = fs
+                .create(&test_creds(), 0, b"quota-shrink", &SetAttributes::default())
+                .await
+                .unwrap();
+            let auth = (&test_auth()).into();
+            fs.fallocate_opened(&auth, id, 0, 4096, mode).await.unwrap();
+            assert_eq!(fs.quota.committed_bytes(), 4096);
+            assert_eq!(fs.quota.pending_bytes(), 0);
+            fs.setattr(
+                &test_creds(),
+                id,
+                &SetAttributes {
+                    size: crate::fs::types::SetSize::Set(0),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            assert!(!fs.quota.is_poisoned());
+            assert_eq!(fs.quota.committed_bytes(), 0);
+            fs.write(&auth, id, 0, &Bytes::from_static(b"after-shrink"))
+                .await
+                .unwrap();
+            let (data, _) = fs.read_file(&auth, id, 0, 12).await.unwrap();
+            assert_eq!(data.as_ref(), b"after-shrink");
+        }
+    }
+
+    #[tokio::test]
     async fn fallocate_reserves_logical_quota_for_later_writes() {
         let mut fs = ZeroFS::new_in_memory().await.unwrap();
         fs.max_bytes = 8;
+        fs.quota = crate::fs::quota::LogicalQuota::new(8, 0);
         let (file_id, _) = fs
             .create(&test_creds(), 0, b"quota.bin", &SetAttributes::default())
             .await
@@ -966,6 +1005,57 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(attrs.mode & 0o6000, 0);
+    }
+
+    #[cfg(feature = "failpoints")]
+    #[tokio::test]
+    async fn fallocate_growth_reservation_follows_commit_on_panic() {
+        let _scenario = fail::FailScenario::setup();
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let (id, _) = fs
+            .create(&test_creds(), 0, b"quota-panic", &SetAttributes::default())
+            .await
+            .unwrap();
+        let auth: AuthContext = (&test_auth()).into();
+        for point in [
+            fp::FALLOCATE_AFTER_EXTENTS,
+            fp::FALLOCATE_AFTER_INODE,
+            fp::FALLOCATE_AFTER_COMMIT,
+        ] {
+            fail::cfg(point, "panic").unwrap();
+            let task_fs = Arc::clone(&fs);
+            let task_auth = auth.clone();
+            let result = tokio::spawn(async move {
+                task_fs
+                    .fallocate_opened(&task_auth, id, 0, 4096, FallocateMode::Allocate)
+                    .await
+            })
+            .await;
+            fail::cfg(point, "off").unwrap();
+            assert!(result.unwrap_err().is_panic());
+            let expected = if point == fp::FALLOCATE_AFTER_COMMIT {
+                4096
+            } else {
+                0
+            };
+            assert_eq!(persisted_attrs(&fs, id).await.size, expected);
+            assert_eq!(fs.quota.committed_bytes(), expected);
+            assert_eq!(fs.quota.pending_bytes(), 0);
+            assert!(!fs.quota.is_poisoned());
+        }
+        fs.setattr(
+            &test_creds(),
+            id,
+            &SetAttributes {
+                size: crate::fs::types::SetSize::Set(0),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        fs.write(&auth, id, 0, &Bytes::from_static(b"after-panic"))
+            .await
+            .unwrap();
     }
 
     #[cfg(feature = "failpoints")]
