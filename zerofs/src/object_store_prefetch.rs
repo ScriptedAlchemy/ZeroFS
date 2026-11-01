@@ -2536,7 +2536,10 @@ mod tests {
             .await
             .expect("read did not reach the gated backend payload");
             upload.complete().await.unwrap();
-            gate.add_permits(1);
+            // The invalidated cold read may retry against the replacement,
+            // and the verification below fetches another range. Unblock
+            // every post-completion read, not only the stale in-flight GET.
+            gate.add_permits(32);
             tokio::time::timeout(std::time::Duration::from_secs(5), old_read)
                 .await
                 .expect("overlapping read did not settle")
