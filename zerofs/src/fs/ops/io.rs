@@ -10,6 +10,7 @@ use crate::fs::errors::FsError;
 use crate::fs::inode::{Inode, InodeId};
 use crate::fs::mutation::types::{ConflictKey, ConflictScope};
 use crate::fs::permissions::{AccessMode, Credentials, check_access};
+use crate::fs::quota::QuotaSettlement;
 use crate::fs::tracing::FileOperation;
 use crate::fs::types::{AuthContext, FallocateMode, FileAttributes, InodeWithId};
 use crate::fs::{ZeroFS, get_current_time};
@@ -286,14 +287,12 @@ impl ZeroFS {
             },
         );
 
-        self.write_coordinator.commit(txn).await.inspect_err(|e| {
-            error!("Failed to commit fallocate batch: {}", e);
-        })?;
-
-        if let Some(reservation) = growth_reservation {
-            reservation.accept();
-            reservation.canonical();
-        }
+        self.write_coordinator
+            .commit_with_quota(txn, growth_reservation.map(QuotaSettlement::Growth))
+            .await
+            .inspect_err(|e| {
+                error!("Failed to commit fallocate batch: {}", e);
+            })?;
 
         #[cfg(feature = "failpoints")]
         fail_point!(fp::FALLOCATE_AFTER_COMMIT);

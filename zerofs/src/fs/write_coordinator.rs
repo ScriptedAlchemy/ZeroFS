@@ -75,6 +75,7 @@ pub(crate) enum CommitSettlement {
     #[default]
     None,
     Write(crate::fs::ops::write::PostCommitSettlement),
+    Quota(crate::fs::quota::QuotaSettlement),
 }
 
 struct CommitReply {
@@ -109,8 +110,10 @@ impl CommitReply {
             settlement,
             materialized_replay,
         } = self;
-        if let CommitSettlement::Write(settlement) = settlement {
-            settlement.finish(result);
+        match settlement {
+            CommitSettlement::None => {}
+            CommitSettlement::Write(settlement) => settlement.finish(result),
+            CommitSettlement::Quota(settlement) => settlement.finish(result),
         }
         drop(queued_inode);
         if let Some(completion) = materialized_replay {
@@ -243,6 +246,22 @@ impl WriteCoordinator {
 
     pub async fn commit(&self, txn: Transaction) -> Result<(), FsError> {
         self.submit(txn)?.wait().await
+    }
+
+    /// Keep metadata quota changes with the queued transaction until its
+    /// canonical result, even if the request waiting for the reply is cancelled.
+    pub(crate) async fn commit_with_quota(
+        &self,
+        txn: Transaction,
+        quota: Option<crate::fs::quota::QuotaSettlement>,
+    ) -> Result<(), FsError> {
+        self.submit_owned(
+            txn,
+            CommitOwnership::None,
+            quota.map_or(CommitSettlement::None, CommitSettlement::Quota),
+        )?
+        .wait()
+        .await
     }
 
     /// Queue `txn` without waiting for it to apply.

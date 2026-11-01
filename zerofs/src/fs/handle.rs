@@ -207,8 +207,15 @@ impl ZeroFS {
 
                 txn.add_inode_count_delta(id, -1);
                 self.orphan_store.remove(&mut txn, id);
-                self.write_coordinator.commit(txn).await?;
-                self.quota.release_committed(file.size);
+                self.write_coordinator
+                    .commit_with_quota(
+                        txn,
+                        Some(crate::fs::quota::QuotaSettlement::Shrink {
+                            quota: std::sync::Arc::clone(&self.quota),
+                            bytes: file.size,
+                        }),
+                    )
+                    .await?;
                 self.stats.files_deleted.fetch_add(1, Ordering::Relaxed);
                 Ok(())
             }

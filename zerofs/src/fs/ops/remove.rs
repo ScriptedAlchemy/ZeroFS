@@ -478,13 +478,18 @@ impl ZeroFS {
                     txn.add_inode_count_delta(file_id, -1);
                 }
 
-                self.write_coordinator.commit(txn).await?;
-                if !deferred
+                let quota = if !deferred
                     && original_nlink <= 1
                     && let crate::fs::inode::Inode::File(file) = &file_inode
                 {
-                    self.quota.release_committed(file.size);
-                }
+                    Some(crate::fs::quota::QuotaSettlement::Shrink {
+                        quota: std::sync::Arc::clone(&self.quota),
+                        bytes: file.size,
+                    })
+                } else {
+                    None
+                };
+                self.write_coordinator.commit_with_quota(txn, quota).await?;
 
                 if deferred {
                     self.schedule_deferred_orphan_reclaim(file_id);

@@ -62,6 +62,28 @@ pub(crate) struct ProvisionalQuotaReservation {
     state: AtomicU8,
 }
 
+/// Metadata quota ownership transferred to the canonical commit worker.
+/// Dropping a caller must neither refund queued growth nor lose a reclaim.
+pub(crate) enum QuotaSettlement {
+    Growth(ProvisionalQuotaReservation),
+    Shrink { quota: Arc<LogicalQuota>, bytes: u64 },
+}
+
+impl QuotaSettlement {
+    pub(crate) fn finish(self, result: Result<(), FsError>) {
+        if result.is_ok() {
+            match self {
+                Self::Growth(reservation) => {
+                    reservation.accept();
+                    reservation.canonical();
+                }
+                Self::Shrink { quota, bytes } => quota.release_committed(bytes),
+            }
+        }
+        // Failed growth remains provisional and refunds itself on drop.
+    }
+}
+
 impl LogicalQuota {
     pub(crate) fn new(max_bytes: u64, committed: u64) -> Arc<Self> {
         Arc::new(Self {
@@ -280,9 +302,215 @@ impl Drop for ProvisionalQuotaReservation {
 
 #[cfg(test)]
 mod tests {
-    use super::{LogicalQuota, QuotaReservationState};
+    use super::{LogicalQuota, QuotaReservationState, QuotaSettlement};
+    use crate::fs::ZeroFS;
     use crate::fs::errors::FsError;
+    use crate::fs::test_util::test_creds;
+    use crate::fs::types::{AuthContext, FallocateMode, SetAttributes, SetSize};
+    use crate::test_helpers::test_helpers_mod::test_auth;
+    use bytes::Bytes;
     use std::sync::Arc;
+
+    async fn cancel_at_apply(
+        fs: &Arc<ZeroFS>,
+        operation: impl std::future::Future<Output = Result<(), FsError>> + Send + 'static,
+        expected_pending: u64,
+    ) {
+        // The worker has accepted the transaction but cannot apply it while
+        // this permit is held. No timer or scheduler race decides cancellation.
+        let blocked = fs.db.flush_barrier().write_owned().await;
+        let reached = fs.write_coordinator.probe_next_apply();
+        let task = tokio::spawn(operation);
+        tokio::time::timeout(std::time::Duration::from_secs(10), reached)
+            .await
+            .expect("metadata commit did not reach apply")
+            .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(fs.quota.pending_bytes(), expected_pending);
+        drop(blocked);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            fs.write_coordinator.barrier(),
+        )
+        .await
+        .expect("cancelled request stranded its queued commit")
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_metadata_growth_keeps_queued_quota() {
+        for operation in 0..3 {
+            let mut fs = ZeroFS::new_in_memory().await.unwrap();
+            fs.max_bytes = 4096;
+            fs.quota = LogicalQuota::new(4096, 0);
+            let fs = Arc::new(fs);
+            let (id, _) = fs
+                .create(&test_creds(), 0, b"grow", &SetAttributes::default())
+                .await
+                .unwrap();
+            let task_fs = Arc::clone(&fs);
+            cancel_at_apply(
+                &fs,
+                async move {
+                    if operation == 2 {
+                        task_fs
+                            .setattr(
+                                &test_creds(),
+                                id,
+                                &SetAttributes {
+                                    size: SetSize::Set(4096),
+                                    ..Default::default()
+                                },
+                            )
+                            .await?;
+                    } else {
+                        let mode = if operation == 0 {
+                            FallocateMode::Allocate
+                        } else {
+                            FallocateMode::ZeroRange { keep_size: false }
+                        };
+                        task_fs
+                            .fallocate_opened(&(&test_auth()).into(), id, 0, 4096, mode)
+                            .await?;
+                    }
+                    Ok(())
+                },
+                4096,
+            )
+            .await;
+
+            assert_eq!(fs.quota.committed_bytes(), 4096);
+            assert_eq!(fs.quota.pending_bytes(), 0);
+            assert_eq!(fs.global_stats.get_totals().0, 4096);
+            let auth: AuthContext = (&test_auth()).into();
+            assert!(matches!(
+                fs.write(&auth, id, 4096, &Bytes::from_static(b"x")).await,
+                Err(FsError::NoSpace)
+            ));
+            fs.setattr(
+                &test_creds(),
+                id,
+                &SetAttributes {
+                    size: SetSize::Set(0),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            assert!(!fs.quota.is_poisoned());
+            fs.write(&auth, id, 0, &Bytes::from_static(b"after-cancellation"))
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_metadata_reclaim_releases_quota() {
+        for operation in 0..4 {
+            let mut fs = ZeroFS::new_in_memory().await.unwrap();
+            fs.max_bytes = 4096;
+            fs.quota = LogicalQuota::new(4096, 0);
+            let fs = Arc::new(fs);
+            let (id, _) = fs
+                .create(&test_creds(), 0, b"target", &SetAttributes::default())
+                .await
+                .unwrap();
+            let (replacement, _) = fs
+                .create(&test_creds(), 0, b"replacement", &SetAttributes::default())
+                .await
+                .unwrap();
+            let auth: AuthContext = (&test_auth()).into();
+            fs.write(&auth, id, 0, &Bytes::from(vec![b'a'; 4096]))
+                .await
+                .unwrap();
+            if operation == 3 {
+                fs.open_handle_inc(id);
+                fs.remove(&auth, 0, b"target").await.unwrap();
+                assert_eq!(fs.quota.committed_bytes(), 4096);
+            }
+            let task_fs = Arc::clone(&fs);
+            cancel_at_apply(
+                &fs,
+                async move {
+                    let auth: AuthContext = (&test_auth()).into();
+                    match operation {
+                        0 => {
+                            task_fs
+                                .setattr(
+                                    &test_creds(),
+                                    id,
+                                    &SetAttributes {
+                                        size: SetSize::Set(0),
+                                        ..Default::default()
+                                    },
+                                )
+                                .await?;
+                        }
+                        1 => task_fs.remove(&auth, 0, b"target").await?,
+                        2 => {
+                            task_fs
+                                .rename(&auth, 0, b"replacement", 0, b"target")
+                                .await?;
+                        }
+                        _ => task_fs.handle_closed(id).await,
+                    }
+                    Ok(())
+                },
+                0,
+            )
+            .await;
+
+            assert_eq!(fs.quota.committed_bytes(), 0);
+            assert_eq!(fs.global_stats.get_totals().0, 0);
+            assert!(!fs.quota.is_poisoned());
+            fs.write(&auth, replacement, 0, &Bytes::from(vec![b'b'; 4096]))
+                .await
+                .expect("reclaimed bytes must be available to another file");
+        }
+    }
+
+    #[tokio::test]
+    async fn rename_over_open_target_keeps_quota_until_last_close() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let auth: AuthContext = (&test_auth()).into();
+        let (source, _) = fs
+            .create(&test_creds(), 0, b"source", &SetAttributes::default())
+            .await
+            .unwrap();
+        let (target, _) = fs
+            .create(&test_creds(), 0, b"target", &SetAttributes::default())
+            .await
+            .unwrap();
+        fs.write(&auth, source, 0, &Bytes::from_static(b"abc"))
+            .await
+            .unwrap();
+        fs.write(&auth, target, 0, &Bytes::from_static(b"12345"))
+            .await
+            .unwrap();
+        fs.open_handle_inc(target);
+        fs.rename(&auth, 0, b"source", 0, b"target").await.unwrap();
+        assert_eq!(fs.quota.committed_bytes(), 8);
+        fs.handle_closed(target).await;
+        assert_eq!(fs.quota.committed_bytes(), 3);
+        assert!(!fs.quota.is_poisoned());
+    }
+
+    #[test]
+    fn failed_metadata_settlement_preserves_committed_quota() {
+        let quota = LogicalQuota::new(8, 4);
+        let growth = QuotaSettlement::Growth(quota.reserve(4).unwrap());
+        growth.finish(Err(FsError::IoError));
+        assert_eq!(quota.pending_bytes(), 0);
+        assert_eq!(quota.committed_bytes(), 4);
+        QuotaSettlement::Shrink {
+            quota: Arc::clone(&quota),
+            bytes: 4,
+        }
+        .finish(Err(FsError::IoError));
+        assert_eq!(quota.committed_bytes(), 4);
+        assert!(!quota.is_poisoned());
+    }
 
     #[test]
     fn concurrent_preparations_cannot_oversubscribe() {
