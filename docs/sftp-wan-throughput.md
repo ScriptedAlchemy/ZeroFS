@@ -121,11 +121,44 @@ that delta nor the reported 13k/845k ratio identifies failed SFTP reads. The
 diagnostics below separate returned backend outcomes from locally cached
 absence responses, while preserving the engine labels for the next capture.
 
+### Operator report after deploying `80e873d5`
+
+The operator reports **18.7 MB/s at the destination**, versus a **19.2 MB/s**
+baseline, with about **19.3 MB/s** arriving from Hetzner and individual minutes
+ranging from 10 to 24 MB/s. This is a flat result, not a demonstrated gain.
+The effective configuration was byte-identical, a read-integrity check through
+the copier's mount passed, and no transport errors or reconnect loops were
+reported. The first start had a corrected release-ownership problem and a
+3.5-minute NFS outage while no copies were active. The older `b19792a4` release
+was subsequently deleted; it is not an available rollback artifact.
+
+The reported per-object phase means are approximately 1.1 seconds for
+OPEN/FSTAT/header/CLOSE combined and 0.72 seconds for payload, with almost no
+admission wait. FSTAT, header and bounded speculative payload already overlap,
+so those phase means cannot be summed into serial time or a predicted speedup.
+Repeated object operations remain a concrete target: the coalesced file
+read-ahead below amortizes them over more useful bytes without extending the
+logical look-ahead window. A new whole-call duration metric measures elapsed
+time without double-counting overlapping phases.
+
+Of 2,914 reported engine error increments, 511 backend `not_found` results plus
+1,437 negative-cache hits account for 1,948, leaving **966 unclassified**.
+Backend transport failures were zero. The pinned database's
+[boundary-object poller](https://github.com/Barre/slatedb/blob/230ade681f1fdf0f85fc1c2cb6c118575a83ceb1/slatedb-txn-obj/src/object_store.rs)
+issues conditional GETs and handles `NotModified` as an unchanged
+cached value, while its instrumentation counts all returned `Err` variants.
+That is a code-confirmed accounting route, not proof that all 966 increments
+came from it. The outward API outcome counters below make it measurable.
+
+The Mac's reported SSH-agent signing delay affects new administrative SSH
+connections. ZeroFS's backend uses native `russh` with its configured identity
+key and persistent sessions; the Mac agent is not in that data path.
+
 ## Follow-up diagnostics: request waits and object phases
 
-The follow-up adds normal-build metrics without changing transfer limits or
+The diagnostics add normal-build metrics without changing transfer limits or
 read scheduling. They are aggregate process counters, with static `phase`,
-`kind`, `operation`, and `outcome` labels; no path, hostname or reconnect ID
+`kind`, `operation`, `api`, and `outcome` labels; no path, hostname or reconnect ID
 labels are added.
 The timing covers **client future lifetimes**. It is not a count of packets
 on the wire, and a cancelled future may leave a request already sent to the
@@ -146,6 +179,8 @@ server that the transport still has to drain.
 | `zerofs_sftp_phase_duration_seconds{phase,kind,outcome}` | Phase duration, including success, error and cancellation |
 | `zerofs_sftp_negative_cache_hits_total{operation}` | Get/head absence responses satisfied locally without leasing an SFTP session |
 | `zerofs_sftp_backend_read_results_total{operation,outcome}` | Returned get/head backend operation results, classified before conversion to object-store errors |
+| `zerofs_sftp_get_results_total{api,outcome}` | Completed outward SFTP object-store API results, including conditional responses, negative-cache hits and local option rejection |
+| `zerofs_sftp_get_duration_seconds{api,outcome}` | Whole-call elapsed time for those completed API results, including overlapping phases once |
 
 Pool phases are `admission` and `session`, split by read/write/metadata kind.
 Read-operation phases are `open`, `fstat`, `header`, `payload`, and `close`.
@@ -162,6 +197,16 @@ They exclude negative-cache hits, rejected local options/paths and cancelled
 operations that never return. The phase/request observations above retain the
 cancellation evidence. `not_found` can be an expected metadata probe; inspect
 the labeled engine operation before treating it as a copy failure.
+
+Outward API labels are `get`, `get_range`, and `head`. Outcomes are `success`,
+`not_found`, `not_modified`, `precondition_failed`, `permission_denied`,
+`unauthenticated`, `invalid_path`, `not_supported`, and `other_error`.
+These counters wrap the complete `SftpObjectStore::get_opts` result: a
+successful backend HEAD followed by a failed conditional check now produces a
+classified outward result. They do not cover calls answered by outer caches or
+writeback overlays without reaching this adapter, and a cancelled API future
+does not produce a completed result. Use the existing phase cancellation
+observations for that separate case.
 
 LSM series keep their `lsm_` names and now retain engine labels such as
 component, store, operation and API. Consumers needing totals must aggregate
@@ -204,7 +249,11 @@ process aggregates, not proof of an even per-connection request distribution.
   work or EOF/metadata overhead for inspection. Compare like windows and known
   object sizes before attributing every difference to waste.
 - Compare labeled engine errors with backend-result outcomes and negative-cache
-  hits. Locally answered absence probes do not consume SFTP bandwidth. Actual
+  hits, then use outward API outcomes to identify conditional responses or
+  locally rejected options. Do not add the outward results to the lower-level
+  counters: they describe overlapping populations. Compare deltas from the same
+  interval and preserve the engine labels and five-second export cadence.
+  Locally answered absence probes do not consume SFTP bandwidth. Actual
   permission, corruption, transport or pool failures need their own treatment;
   a combined object-store error count cannot distinguish them.
 
@@ -394,10 +443,14 @@ File segment reads now carry a `CacheRangeOnly` hint. They still use the shared
 parts cache and single-flight registry, but expand only to cache-part
 boundaries. The file's extent map chooses the forward reads, so the logical
 8 MiB look-ahead works both within one segment and across segment boundaries.
-It is issued as independent 1 MiB logical ranges; a global sixteen-permit
-budget covers the individual ranges, rather than sixteen whole 8 MiB windows.
-This keeps one file able to use multiple SFTP sessions without letting every
-physical object initiate a separate speculative tail.
+Admission uses 1 MiB logical credits under a global sixteen-permit budget.
+Pairs of adjacent admitted credits now share one read of up to 2 MiB, allowing
+the existing frame-run coalescer to amortize OPEN/FSTAT/header/CLOSE over more
+useful data. An 8 MiB window still holds eight credits and can issue four reads
+concurrently. A partially admitted 1 MiB tail remains usable. Each combined
+read retains all its credits until completion or cancellation. The look-ahead
+distance and global logical-byte budget remain 8 MiB and 16 MiB respectively;
+neither change enlarges the allowed speculative coverage.
 
 When the budget admits only part of a window, the planner records only that
 prefix. Nearby read completions arriving out of order no longer move the
@@ -405,6 +458,15 @@ forward sequence backwards. Cache-part alignment, frame overhead, and
 metadata reads still mean backend traffic need not equal logical file bytes.
 The object-level heuristic remains available to other consumers such as
 metadata storage.
+
+The coalescing regression records backend GET ranges over a seeded,
+incompressible file, verifies exact encoded-frame coverage and returned bytes,
+and confirms that the prefetched range is subsequently served without another
+segment read. The old implementation makes eight GETs for the same 8 MiB
+window and fails the reduced-request assertion; the coalesced path makes four
+GETs with the same frame coverage and exact plaintext. A separate gated cancellation
+test verifies that every constituent byte credit is released. This is local
+request-count and integrity evidence, not a deployed throughput measurement.
 
 The regression uses real encoded frames, the production segment reader, the
 production prefetch cache, and a recording in-memory backend. It checks exact

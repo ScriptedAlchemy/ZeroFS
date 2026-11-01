@@ -24,13 +24,16 @@ use tracing::error;
 /// stream. Follows only the file's extents, including within mixed-file
 /// segments, rather than speculating over unrelated physical frames.
 const READ_AHEAD_WINDOW_BYTES: u64 = 8 * 1024 * 1024;
-/// Independent ranges let one file use several remote sessions. The global
-/// semaphore bounds these individual ranges, not whole multi-range windows.
+/// Admission credits remain small so a partially available byte budget can
+/// still warm a useful prefix of the next window.
 const READ_AHEAD_CHUNK_BYTES: u64 = 1024 * 1024;
+/// Adjacent admitted ranges share a read, amortizing remote object metadata
+/// operations while retaining several parallel reads per file.
+const READ_AHEAD_COALESCE_RANGES: usize = 2;
 /// Consecutive sequential reads before prefetch kicks in, so a one-off read
 /// doesn't drag in a whole window.
 const READ_AHEAD_MIN_SEQ: u32 = 2;
-/// Global cap on concurrent in-flight read-ahead fetches.
+/// Global cap on in-flight 1 MiB read-ahead credits, including coalesced reads.
 pub(super) const READ_AHEAD_MAX_CONCURRENT: usize = 16;
 /// Bound on the per-inode read-ahead state map (LRU-evicted; ~24 B/entry).
 pub(super) const READ_AHEAD_TRACK_BYTES: usize = 4 * 1024 * 1024;
@@ -368,10 +371,17 @@ impl ExtentStore {
         let this = self.clone();
         Some(crate::task::spawn_named("read-ahead", async move {
             futures::stream::iter(ranges)
-                .for_each_concurrent(READ_AHEAD_MAX_CONCURRENT, |(start, end, permit)| {
+                .chunks(READ_AHEAD_COALESCE_RANGES)
+                .for_each_concurrent(READ_AHEAD_MAX_CONCURRENT, |ranges| {
                     let this = this.clone();
                     async move {
-                        let _permit = permit;
+                        // Admission produces a contiguous prefix. Keep every
+                        // constituent credit until the combined read finishes
+                        // or is cancelled; coalescing must not enlarge the
+                        // byte budget or speculatively read unrelated frames.
+                        let start = ranges.first().unwrap().0;
+                        let end = ranges.last().unwrap().1;
+                        let _permits = ranges;
                         let _ = this.read_range(id, start, end - start, false).await;
                     }
                 })
