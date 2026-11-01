@@ -228,6 +228,47 @@ def _load_phase_windows(result: BenchmarkResult) -> dict[str, tuple[int, int]]:
     return parsed
 
 
+def _advance_toml_multiline_quote(line: str, multiline: str | None) -> str | None:
+    """Track triple-quoted TOML strings so their contents cannot impersonate table headers."""
+
+    single: str | None = None
+    index = 0
+    while index < len(line):
+        if multiline == "'''":
+            if line.startswith("'''", index):
+                multiline = None
+                index += 3
+            else:
+                index += 1
+        elif multiline == '"""':
+            if line[index] == "\\":
+                index += 2
+            elif line.startswith('"""', index):
+                multiline = None
+                index += 3
+            else:
+                index += 1
+        elif single is not None:
+            if single == '"' and line[index] == "\\":
+                index += 2
+            elif line[index] == single:
+                single = None
+                index += 1
+            else:
+                index += 1
+        elif line[index] == "#":
+            break
+        elif line.startswith('"""', index) or line.startswith("'''", index):
+            multiline = line[index : index + 3]
+            index += 3
+        elif line[index] in ("'", '"'):
+            single = line[index]
+            index += 1
+        else:
+            index += 1
+    return multiline
+
+
 def rewrite_gc_cadence(text: str, interval_secs: int) -> str:
     """Set the three segment-GC cadence tiers without reformatting the config."""
 
@@ -238,6 +279,7 @@ def rewrite_gc_cadence(text: str, interval_secs: int) -> str:
     in_gc = False
     gc_header: int | None = None
     replaced: set[str] = set()
+    multiline_quote: str | None = None
     assignments = {
         key: re.compile(
             rf"""^(\s*(?:{re.escape(key)}|"{re.escape(key)}"|'{re.escape(key)}')\s*=\s*)"""
@@ -250,7 +292,12 @@ def rewrite_gc_cadence(text: str, interval_secs: int) -> str:
         # A TOML table header may have a trailing comment (even one with ']'). Treat the header
         # as a section boundary so annotated non-GC tables cannot inherit GC
         # key rewrites, and annotated [gc] is never appended a second time.
-        header = re.fullmatch(r"(\[\[?.*?\]\]?)\s*(?:#.*)?", stripped)
+        header = (
+            None
+            if multiline_quote is not None
+            else re.fullmatch(r"(\[\[?.*?\]\]?)\s*(?:#.*)?", stripped)
+        )
+        multiline_quote = _advance_toml_multiline_quote(line, multiline_quote)
         if header is not None:
             # Parse the isolated table name, so ["gc"] and ['gc'] refer to
             # the same table as [gc]. A ']' inside a quoted non-GC name may
