@@ -1888,11 +1888,7 @@ impl PrefetchingObjectStore {
             // An untrusted requested upper bound may round beyond u64::MAX.
             // Keep the bound inclusive of every requested byte and let the
             // backend clip it against the actual object size.
-            end: range
-                .end
-                .div_ceil(alignment)
-                .checked_mul(alignment)
-                .unwrap_or(u64::MAX),
+            end: range.end.div_ceil(alignment).saturating_mul(alignment),
         }
     }
 }
@@ -2118,15 +2114,13 @@ mod tests {
         // Both forms used to panic while rounding up the requested upper
         // bound before the backend could clip it to a real object's EOF.
         for end in [u64::MAX - 1, u64::MAX] {
-            let GetRange::Bounded(range) =
-                store.align_get_range(&GetRange::Bounded(0..end), 1024)
+            let GetRange::Bounded(range) = store.align_get_range(&GetRange::Bounded(0..end), 1024)
             else {
                 panic!("bounded range changed type");
             };
             assert_eq!(range.end, u64::MAX);
         }
-        let GetRange::Suffix(suffix) =
-            store.align_get_range(&GetRange::Suffix(u64::MAX), 1024)
+        let GetRange::Suffix(suffix) = store.align_get_range(&GetRange::Suffix(u64::MAX), 1024)
         else {
             panic!("suffix range changed type");
         };
