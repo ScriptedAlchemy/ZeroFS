@@ -13,6 +13,12 @@
 #include <linux/uio.h>
 
 #include "compat.h"
+#include "create_compat.h"
+
+void zerofs_vfs_set_create(struct inode_operations *operations)
+{
+	zerofs_vfs_assign_create(operations);
+}
 
 void zerofs_vfs_file_accessed(struct file *file)
 {
