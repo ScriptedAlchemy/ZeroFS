@@ -1189,7 +1189,12 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
                 .await
                 .unwrap();
             let start = 64 * 1024;
-            for requested_end in [2 * 1024 * 1024, u64::MAX] {
+            for requested_end in [
+                2 * 1024 * 1024,
+                32 * 1024 * 1024,
+                u64::MAX - OBJECT_HEADER_LEN as u64,
+                u64::MAX,
+            ] {
                 env.read_bytes.store(0, Ordering::SeqCst);
                 let object = session
                     .read_object(

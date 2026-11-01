@@ -1006,7 +1006,10 @@ where
             // Split the missing suffix across free slots instead of keeping it
             // in one serial request chain. The session hint is updated only
             // after a successful read proves a consistent smaller reply cap.
-            packet_size = packet_size.min(received);
+            // An isolated tiny reply must not fragment every queued suffix
+            // into equally tiny requests. Preserve stricter negotiated caps
+            // while keeping speculative splitting at a useful granularity.
+            packet_size = packet_size.min(received.max(SFTP_MIN_READ_PACKET_HINT));
             queued.push_front(PipelinedRead {
                 offset: request.offset + received as u64,
                 len: request.len - received,
@@ -1073,6 +1076,10 @@ impl TransportSession for SftpProtocolSession {
             (Some(object_store::GetRange::Bounded(range)), false) if range.start < range.end => {
                 usize::try_from(range.end - range.start)
                     .ok()
+                    // Untrusted range bounds must not size a speculative
+                    // allocation before the open handle's metadata clips EOF.
+                    // Larger reads follow the metadata-first path below.
+                    .filter(|len| *len <= SFTP_READ_MAX_INFLIGHT_BYTES)
                     .and_then(|len| {
                         // A valid logical bound may exceed the object's EOF
                         // and overflow after adding the internal header. In
@@ -1918,6 +1925,46 @@ mod tests {
         .unwrap();
         assert_eq!(bytes, read_pattern(0, len));
         assert_eq!(read_packets.reply_limit.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn isolated_tiny_reply_keeps_current_read_requests_bounded() {
+        let rtt = std::time::Duration::from_millis(95);
+        let offset = 193;
+        let len = 1024 * 1024;
+        for maximum in [SFTP_READ_PACKET_SIZE, 4096] {
+            let read_packets = ReadPacketSizing::default();
+            let requests = AtomicUsize::new(0);
+            let started = tokio::time::Instant::now();
+            let bytes = read_chunks_pipelined(
+                Path::new("isolated-tiny-reply"),
+                offset,
+                len,
+                maximum,
+                &read_packets,
+                |position, requested| {
+                    requests.fetch_add(1, Ordering::Relaxed);
+                    assert!(requested <= maximum, "negotiated limit exceeded");
+                    async move {
+                        tokio::time::sleep(rtt).await;
+                        let reply = if position == offset { 1 } else { requested };
+                        Ok(read_pattern(position, reply))
+                    }
+                },
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(bytes, read_pattern(offset, len));
+            let request_limit = len.div_ceil(maximum) + maximum.div_ceil(SFTP_MIN_READ_PACKET_HINT);
+            assert!(
+                requests.load(Ordering::Relaxed) <= request_limit,
+                "one tiny reply fragmented a read into {} requests (limit {request_limit})",
+                requests.load(Ordering::Relaxed)
+            );
+            assert!(started.elapsed() <= rtt * 3);
+            assert_eq!(read_packets.reply_limit.load(Ordering::Relaxed), 0);
+        }
     }
 
     #[tokio::test]
