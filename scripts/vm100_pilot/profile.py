@@ -244,8 +244,12 @@ def rewrite_gc_cadence(text: str, interval_secs: int) -> str:
     }
     for index, line in enumerate(lines):
         stripped = line.strip()
-        if stripped.startswith("[") and stripped.endswith("]"):
-            in_gc = stripped == "[gc]"
+        # A TOML table header may have a trailing comment. Treat the header
+        # as a section boundary so annotated non-GC tables cannot inherit GC
+        # key rewrites, and annotated [gc] is never appended a second time.
+        header = re.fullmatch(r"(\[\[?.*\]\]?)\s*(?:#.*)?", stripped)
+        if header is not None:
+            in_gc = header.group(1) == "[gc]"
             if in_gc:
                 gc_header = index
             continue

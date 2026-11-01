@@ -3712,6 +3712,29 @@ enabled = true
 """,
         )
 
+    def test_maintenance_rewrite_handles_annotated_table_headers(self) -> None:
+        source = """[gc] # Preserve this comment
+interval_secs = 60
+read_directed = true
+
+[writeback] # A different section must retain its own values
+interval_secs = 90
+
+["other#section"] # Quoted hashes are not comment delimiters
+interval_secs = 120
+"""
+        rewritten = profile_module.rewrite_gc_cadence(source, 3600)
+        values = tomllib.loads(rewritten)
+        self.assertEqual(values["gc"]["interval_secs"], 3600)
+        self.assertEqual(values["gc"]["idle_interval_secs"], 3600)
+        self.assertEqual(values["gc"]["busy_backlog_interval_secs"], 3600)
+        self.assertTrue(values["gc"]["read_directed"])
+        self.assertEqual(values["writeback"]["interval_secs"], 90)
+        self.assertEqual(values["other#section"]["interval_secs"], 120)
+        self.assertIn("[gc] # Preserve this comment", rewritten)
+        self.assertIn("[writeback] # A different section", rewritten)
+        self.assertEqual(rewritten.count("[gc]"), 1)
+
     def test_maintenance_rewrite_appends_a_missing_gc_section(self) -> None:
         source = '[storage]\nurl = "sftp://pilot@example.test:23/data"'
 
