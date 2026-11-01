@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use std::fmt::{self, Debug};
 use std::future::Future;
 use std::path::{Path as FilePath, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex as StdMutex, Weak};
 use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
@@ -707,6 +708,59 @@ fn read_operation_kind(options: &GetOptions) -> crate::sftp_transport::Operation
 // pool's own read/metadata admission limit still gates real concurrency.
 const SFTP_LIST_METADATA_CONCURRENCY: usize = 8;
 
+// A backend miss started before a concurrent publication must not become a
+// process-lifetime negative-cache entry after that publication succeeds.
+// Every mutation bumps the epoch both before and after the remote operation;
+// Drop owns the second bump even when the caller cancels.
+struct MissingCacheMutationGuard {
+    known_missing: Arc<DashSet<String>>,
+    epoch: Arc<AtomicU64>,
+    location: ObjectPath,
+}
+
+impl MissingCacheMutationGuard {
+    fn new(
+        known_missing: Arc<DashSet<String>>,
+        epoch: Arc<AtomicU64>,
+        location: &ObjectPath,
+    ) -> Self {
+        epoch.fetch_add(1, Ordering::AcqRel);
+        known_missing.remove(location.as_ref());
+        Self {
+            known_missing,
+            epoch,
+            location: location.clone(),
+        }
+    }
+}
+
+impl Drop for MissingCacheMutationGuard {
+    fn drop(&mut self) {
+        self.epoch.fetch_add(1, Ordering::AcqRel);
+        self.known_missing.remove(self.location.as_ref());
+    }
+}
+
+fn remember_missing_if_current(
+    known_missing: &DashSet<String>,
+    epoch: &AtomicU64,
+    location: &ObjectPath,
+    observed_epoch: u64,
+) {
+    if epoch.load(Ordering::Acquire) != observed_epoch {
+        return;
+    }
+    if known_missing.len() >= SFTP_NEGATIVE_CACHE_MAX_ENTRIES {
+        known_missing.clear();
+    }
+    known_missing.insert(location.to_string());
+    // A publication may have completed between the first epoch check and
+    // insertion. In that case discard the speculative stale miss.
+    if epoch.load(Ordering::Acquire) != observed_epoch {
+        known_missing.remove(location.as_ref());
+    }
+}
+
 #[derive(Clone)]
 pub struct SftpObjectStore {
     pool: crate::sftp_transport::SftpSessionPool,
@@ -717,6 +771,7 @@ pub struct SftpObjectStore {
     // four WAN round trips rediscovering the same absent object. Every local
     // publication invalidates its target before and after the remote write.
     known_missing: Arc<DashSet<String>>,
+    miss_epoch: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Clone)]
@@ -916,6 +971,7 @@ impl SftpObjectStore {
             pool,
             prefix,
             known_missing: Arc::new(DashSet::new()),
+            miss_epoch: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -923,15 +979,16 @@ impl SftpObjectStore {
         self.known_missing.remove(location.as_ref());
     }
 
-    fn remember_missing(&self, location: &ObjectPath) {
-        // Absent future manifests are normally removed as soon as this writer
-        // publishes them. Deleted historical objects can remain absent for the
-        // process lifetime, so bound that residue rather than letting a busy
-        // long-running filesystem grow the cache indefinitely.
-        if self.known_missing.len() >= SFTP_NEGATIVE_CACHE_MAX_ENTRIES {
-            self.known_missing.clear();
-        }
-        self.known_missing.insert(location.to_string());
+    fn remember_missing(&self, location: &ObjectPath, observed_epoch: u64) {
+        remember_missing_if_current(&self.known_missing, &self.miss_epoch, location, observed_epoch);
+    }
+
+    fn mutation_guard(&self, location: &ObjectPath) -> MissingCacheMutationGuard {
+        MissingCacheMutationGuard::new(
+            self.known_missing.clone(),
+            self.miss_epoch.clone(),
+            location,
+        )
     }
 
     fn validate_location(
@@ -978,7 +1035,10 @@ impl SftpObjectStore {
             });
         }
         let remote = self.remote_path(location, false)?;
-        if self.known_missing.contains(location.as_ref()) {
+        let observed_epoch = self.miss_epoch.load(Ordering::Acquire);
+        if self.known_missing.contains(location.as_ref())
+            && self.miss_epoch.load(Ordering::Acquire) == observed_epoch
+        {
             return Err(object_store::Error::NotFound {
                 path: location.to_string(),
                 source: "SFTP object is known absent for this single-owner process".into(),
@@ -999,7 +1059,7 @@ impl SftpObjectStore {
                     .increment(object.payload.len() as u64);
             }
             Err(object_store::Error::NotFound { .. }) => {
-                self.remember_missing(location);
+                self.remember_missing(location, observed_epoch);
             }
             Err(_) => {}
         }
@@ -1115,6 +1175,7 @@ impl SftpObjectStore {
 
     async fn remove_remote(&self, location: &ObjectPath) -> object_store::Result<()> {
         let remote = self.remote_path(location, false)?;
+        let observed_epoch = self.miss_epoch.load(Ordering::Acquire);
         let result = with_lease!(
             self.pool,
             crate::sftp_transport::OperationKind::Write,
@@ -1124,7 +1185,7 @@ impl SftpObjectStore {
         .await
         .map_err(transport_error);
         if result.is_ok() || matches!(&result, Err(object_store::Error::NotFound { .. })) {
-            self.remember_missing(location);
+            self.remember_missing(location, observed_epoch);
         }
         result
     }
@@ -1154,7 +1215,7 @@ impl ObjectStore for SftpObjectStore {
         opts: PutOptions,
     ) -> object_store::Result<PutResult> {
         let target = self.remote_path(location, false)?;
-        self.forget_missing(location);
+        let _missing_guard = self.mutation_guard(location);
         let (mode, expected_generation) = match opts.mode {
             PutMode::Overwrite => (PublicationMode::Overwrite, None),
             PutMode::Create => (PublicationMode::Create, None),
@@ -1224,6 +1285,7 @@ impl ObjectStore for SftpObjectStore {
             location.clone(),
             target,
             self.known_missing.clone(),
+            self.miss_epoch.clone(),
             mode,
         )
         .await
@@ -1349,6 +1411,7 @@ struct SftpMultipartUpload {
     generation: Uuid,
     state: Arc<StdMutex<SftpMultipartState>>,
     known_missing: Arc<DashSet<String>>,
+    miss_epoch: Arc<AtomicU64>,
     mode: PublicationMode,
     terminal: bool,
 }
@@ -1365,6 +1428,7 @@ impl SftpMultipartUpload {
         location: ObjectPath,
         target: PathBuf,
         known_missing: Arc<DashSet<String>>,
+        miss_epoch: Arc<AtomicU64>,
         mode: PublicationMode,
     ) -> RemoteResult<Self> {
         validate_publication_capabilities(session.capabilities(), mode).map_err(|extension| {
@@ -1399,6 +1463,7 @@ impl SftpMultipartUpload {
             generation,
             state: Arc::new(StdMutex::new(SftpMultipartState::default())),
             known_missing,
+            miss_epoch,
             mode,
             terminal: false,
         })
@@ -1456,6 +1521,11 @@ impl MultipartUpload for SftpMultipartUpload {
     }
 
     async fn complete(&mut self) -> object_store::Result<PutResult> {
+        let _missing_guard = MissingCacheMutationGuard::new(
+            self.known_missing.clone(),
+            self.miss_epoch.clone(),
+            &self.location,
+        );
         if self.terminal {
             return Err(generic_error(
                 "multipart upload is already completed or aborted",
@@ -3883,6 +3953,13 @@ mod tests {
         durable_writes: AtomicUsize,
         lose_hardlink_reply: AtomicBool,
         corrupt_hardlink_target: AtomicBool,
+        rename_pause: Option<Arc<PublishPause>>,
+    }
+
+    #[derive(Debug, Default)]
+    struct PublishPause {
+        entered: Notify,
+        release: Notify,
     }
 
     impl ParallelMultipartSession {
@@ -3896,6 +3973,14 @@ mod tests {
                 durable_writes: AtomicUsize::new(0),
                 lose_hardlink_reply: AtomicBool::new(false),
                 corrupt_hardlink_target: AtomicBool::new(false),
+                rename_pause: None,
+            }
+        }
+
+        fn with_delayed_rename(pause: Arc<PublishPause>) -> Self {
+            Self {
+                rename_pause: Some(pause),
+                ..Self::new()
             }
         }
 
@@ -4098,17 +4183,86 @@ mod tests {
         }
 
         async fn posix_rename(&self, from: &FilePath, to: &FilePath) -> RemoteResult<()> {
-            let mut files = self.files.lock().unwrap();
-            let bytes = files
-                .remove(from)
-                .ok_or_else(|| RemoteError::NotFound(from.display().to_string()))?;
-            files.insert(to.to_path_buf(), bytes);
+            {
+                let mut files = self.files.lock().unwrap();
+                let bytes = files
+                    .remove(from)
+                    .ok_or_else(|| RemoteError::NotFound(from.display().to_string()))?;
+                files.insert(to.to_path_buf(), bytes);
+            }
+            if let Some(pause) = &self.rename_pause {
+                pause.entered.notify_one();
+                pause.release.notified().await;
+            }
             Ok(())
         }
 
         fn schedule_cleanup(&self, path: PathBuf) {
             self.files.lock().unwrap().remove(&path);
         }
+    }
+
+    #[test]
+    fn cancelled_publication_fences_old_and_late_negative_cache_misses() {
+        let location = ObjectPath::from("zerofs/v1/replaced.bin");
+        let known_missing = Arc::new(DashSet::new());
+        let epoch = Arc::new(AtomicU64::new(0));
+        known_missing.insert(location.to_string());
+        let old_read = epoch.load(Ordering::Acquire);
+        let read_during_write;
+        {
+            let _write = MissingCacheMutationGuard::new(
+                known_missing.clone(),
+                epoch.clone(),
+                &location,
+            );
+            assert!(!known_missing.contains(location.as_ref()));
+            read_during_write = epoch.load(Ordering::Acquire);
+            remember_missing_if_current(&known_missing, &epoch, &location, read_during_write);
+            assert!(known_missing.contains(location.as_ref()));
+        }
+        assert!(!known_missing.contains(location.as_ref()));
+        // A read that started before or during publication may return after
+        // a successful remote rename and cancellation of its caller.
+        remember_missing_if_current(&known_missing, &epoch, &location, old_read);
+        remember_missing_if_current(&known_missing, &epoch, &location, read_during_write);
+        assert!(!known_missing.contains(location.as_ref()));
+        let fresh_read = epoch.load(Ordering::Acquire);
+        remember_missing_if_current(&known_missing, &epoch, &location, fresh_read);
+        assert!(known_missing.contains(location.as_ref()));
+    }
+
+    #[tokio::test]
+    async fn cancelled_multipart_completion_clears_miss_after_remote_rename() {
+        let pause = Arc::new(PublishPause::default());
+        let session = Arc::new(ParallelMultipartSession::with_delayed_rename(pause.clone()));
+        let location = ObjectPath::from("zerofs/v1/cancelled-complete.bin");
+        let target = PathBuf::from("zerofs/v1/cancelled-complete.bin");
+        let known_missing = Arc::new(DashSet::new());
+        let epoch = Arc::new(AtomicU64::new(0));
+        let mut upload = SftpMultipartUpload::begin(
+            session.clone(),
+            location.clone(),
+            target.clone(),
+            known_missing.clone(),
+            epoch.clone(),
+            PublicationMode::Overwrite,
+        )
+        .await
+        .unwrap();
+        let stale_read = epoch.load(Ordering::Acquire);
+        let task = tokio::spawn(async move { upload.complete().await });
+        tokio::time::timeout(Duration::from_secs(1), pause.entered.notified())
+            .await
+            .expect("rename must publish before the response is released");
+        known_missing.insert(location.to_string());
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(!known_missing.contains(location.as_ref()));
+        remember_missing_if_current(&known_missing, &epoch, &location, stale_read);
+        assert!(!known_missing.contains(location.as_ref()));
+        let published = session.files.lock().unwrap().get(&target).cloned().unwrap();
+        assert_eq!(decode_header(&published).unwrap().logical_len, 0);
     }
 
     #[tokio::test]
@@ -4121,6 +4275,7 @@ mod tests {
             location,
             target.to_path_buf(),
             Arc::new(DashSet::new()),
+            Arc::new(AtomicU64::new(0)),
             PublicationMode::Overwrite,
         )
         .await
@@ -4167,6 +4322,7 @@ mod tests {
                     ObjectPath::from("zerofs/v1/cancelled-begin.bin"),
                     PathBuf::from("zerofs/v1/cancelled-begin.bin"),
                     Arc::new(DashSet::new()),
+                    Arc::new(AtomicU64::new(0)),
                     PublicationMode::Overwrite,
                 )
                 .await
@@ -4211,6 +4367,7 @@ mod tests {
             location,
             target.clone(),
             Arc::new(DashSet::new()),
+            Arc::new(AtomicU64::new(0)),
             PublicationMode::Create,
         )
         .await
@@ -4238,6 +4395,7 @@ mod tests {
             location,
             target.clone(),
             Arc::new(DashSet::new()),
+            Arc::new(AtomicU64::new(0)),
             PublicationMode::Create,
         )
         .await
@@ -4270,6 +4428,7 @@ mod tests {
             location,
             target,
             Arc::new(DashSet::new()),
+            Arc::new(AtomicU64::new(0)),
             PublicationMode::Create,
         )
         .await
@@ -4294,6 +4453,7 @@ mod tests {
             location,
             target,
             Arc::new(DashSet::new()),
+            Arc::new(AtomicU64::new(0)),
             PublicationMode::Overwrite,
         )
         .await
@@ -4355,6 +4515,7 @@ mod tests {
             location,
             target,
             Arc::new(DashSet::new()),
+            Arc::new(AtomicU64::new(0)),
             PublicationMode::Overwrite,
         )
         .await
