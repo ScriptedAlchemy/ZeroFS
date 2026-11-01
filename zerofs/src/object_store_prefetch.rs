@@ -1152,36 +1152,55 @@ impl PrefetchingObjectStore {
                 let start_part: PartId = (aligned.start / part_size)
                     .try_into()
                     .expect("part id exceeds usize");
+                // The caller's requested end is not an object-size bound.
+                // An evicted HEAD can coexist with a cached generation; a
+                // 0..u64::MAX request must not reserve billions of parts while
+                // trying to reestablish the metadata. One bounded probe is
+                // enough: the lazy data read is planned after HEAD/EOF clipping.
+                let max_probe_parts = fetch_window
+                    .max(self.part_size_bytes)
+                    .div_ceil(self.part_size_bytes);
                 let end_part: PartId = aligned
                     .end
                     .div_ceil(part_size)
                     .try_into()
                     .expect("part id exceeds usize");
+                let end_part = end_part.min(start_part.saturating_add(max_probe_parts));
                 let needed_end: PartId = requested
                     .end
                     .div_ceil(part_size)
                     .try_into()
                     .expect("part id exceeds usize");
-                let ctx = self.ctx(read);
-                match Self::plan_window(
-                    &ctx,
-                    location,
-                    &generation,
-                    start_part,
-                    end_part - start_part,
-                    Some(needed_end),
-                ) {
-                    WindowPlan::Lead { shared, guard, .. } => {
-                        let _guard = guard;
-                        let _ = shared.await;
+                let needed_end = needed_end.min(end_part);
+                // The saturated MAX endpoint is not part-aligned; use HEAD
+                // rather than risk constructing an unrepresentable part end.
+                // Invalid/empty ranges likewise defer to canonical validation.
+                if requested.start < requested.end
+                    && aligned.end != u64::MAX
+                    && end_part > start_part
+                    && needed_end > start_part
+                {
+                    let ctx = self.ctx(read);
+                    match Self::plan_window(
+                        &ctx,
+                        location,
+                        &generation,
+                        start_part,
+                        end_part - start_part,
+                        Some(needed_end),
+                    ) {
+                        WindowPlan::Lead { shared, guard, .. } => {
+                            let _guard = guard;
+                            let _ = shared.await;
+                        }
+                        WindowPlan::Join(shared) => {
+                            let _ = shared.await;
+                        }
+                        WindowPlan::Covered => {}
                     }
-                    WindowPlan::Join(shared) => {
-                        let _ = shared.await;
+                    if let Some(head) = self.read_head(location) {
+                        return Ok(head);
                     }
-                    WindowPlan::Covered => {}
-                }
-                if let Some(head) = self.read_head(location) {
-                    return Ok(head);
                 }
             }
 
@@ -2129,6 +2148,45 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.bytes().await.unwrap().as_ref(), b"small object");
+    }
+
+    #[tokio::test]
+    async fn evicted_head_with_oversized_bounded_read_does_not_plan_unbounded_parts() {
+        let (store, inner, _dir) = make_store(1024, MEM, DISK).await;
+        let location = Path::from("evicted-head-huge-request");
+        let payload = vec![0xA5u8; 3 * 1024];
+        inner.put(&location, payload.clone().into()).await.unwrap();
+
+        // A consumed cold GET preserves the generation even if HEAD is evicted.
+        let first = store
+            .get_opts(
+                &location,
+                GetOptions {
+                    range: Some(GetRange::Bounded(0..1)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.bytes().await.unwrap().as_ref(), &payload[..1]);
+        assert!(store.generations.get(&location).is_some());
+
+        // Before the fix, the non-MAX request tried to reserve an enormous
+        // registry window; MAX could additionally overflow its byte end.
+        for end in [1u64 << 60, u64::MAX] {
+            store.heads.remove(&location);
+            let result = store
+                .get_opts(
+                    &location,
+                    GetOptions {
+                        range: Some(GetRange::Bounded(0..end)),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.bytes().await.unwrap().as_ref(), payload.as_slice());
+        }
     }
 
     fn versioned_result(tag: &str) -> PutResult {
