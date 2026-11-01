@@ -510,7 +510,7 @@ impl Debug for PrefetchingMultipartUpload {
     }
 }
 
-struct InvalidateMultipartHead<'a> {
+struct InvalidateOnDrop<'a> {
     location: &'a Path,
     heads: &'a Cache<Path, Arc<CachedHead>>,
     generations: &'a Cache<Path, CacheGeneration>,
@@ -518,7 +518,7 @@ struct InvalidateMultipartHead<'a> {
     access_tracker: &'a Cache<Path, Arc<Mutex<AccessHistory>>>,
 }
 
-impl Drop for InvalidateMultipartHead<'_> {
+impl Drop for InvalidateOnDrop<'_> {
     fn drop(&mut self) {
         let mut revision = self.state.revision.lock().unwrap();
         *revision = uuid::Uuid::new_v4();
@@ -537,7 +537,7 @@ impl MultipartUpload for PrefetchingMultipartUpload {
     async fn complete(&mut self) -> object_store::Result<PutResult> {
         // Readers can refill the old head while this upload is in progress.
         // Invalidate on every completion outcome, including cancellation.
-        let _invalidate = InvalidateMultipartHead {
+        let _invalidate = InvalidateOnDrop {
             location: &self.location,
             heads: &self.heads,
             generations: &self.generations,
@@ -962,12 +962,19 @@ impl PrefetchingObjectStore {
     }
 
     fn invalidate(&self, location: &Path) {
-        let read = self.read_lease(location);
-        let mut revision = read.state.revision.lock().unwrap();
-        *revision = uuid::Uuid::new_v4();
-        self.heads.remove(location);
-        self.generations.remove(location);
-        self.access_tracker.remove(location);
+        drop(self.invalidation_guard(location));
+    }
+
+    /// Keep invalidation ownership across an awaited backend mutation. A
+    /// cancelled request may have committed remotely before its future drops.
+    fn invalidation_guard<'a>(&'a self, location: &'a Path) -> InvalidateOnDrop<'a> {
+        InvalidateOnDrop {
+            location,
+            heads: &self.heads,
+            generations: &self.generations,
+            state: self.read_lease(location).state,
+            access_tracker: &self.access_tracker,
+        }
     }
 
     /// Backend GET that does not `save_get_result`, `read_part`, or
@@ -1860,8 +1867,9 @@ impl ObjectStore for PrefetchingObjectStore {
         // Clone is cheap (Arc-backed) and lets us write the bytes through to the
         // parts cache once the upload commits.
         let cached = payload.clone();
+        let invalidate = self.invalidation_guard(location);
         let result = self.inner.put_opts(location, payload, opts).await?;
-        self.invalidate(location);
+        drop(invalidate);
         self.write_through(location, cached, &result);
         Ok(result)
     }
@@ -1921,8 +1929,9 @@ impl ObjectStore for PrefetchingObjectStore {
         to: &Path,
         options: CopyOptions,
     ) -> object_store::Result<()> {
+        let invalidate = self.invalidation_guard(to);
         let result = self.inner.copy_opts(from, to, options).await;
-        self.invalidate(to);
+        drop(invalidate);
         result
     }
 
@@ -1932,9 +1941,11 @@ impl ObjectStore for PrefetchingObjectStore {
         to: &Path,
         options: RenameOptions,
     ) -> object_store::Result<()> {
+        let invalidate_from = self.invalidation_guard(from);
+        let invalidate_to = self.invalidation_guard(to);
         let result = self.inner.rename_opts(from, to, options).await;
-        self.invalidate(from);
-        self.invalidate(to);
+        drop(invalidate_to);
+        drop(invalidate_from);
         result
     }
 }
@@ -2591,6 +2602,152 @@ mod tests {
                     .unwrap(),
                 Bytes::from(vec![0x22; PART])
             );
+        }
+    }
+
+
+    /// Simulates a backend that has applied a mutation but whose response
+    /// cannot yet be observed. Cancelling the caller must still fence cached
+    /// predecessor metadata and parts.
+    #[derive(Debug)]
+    struct HeldMutationStore {
+        inner: Arc<InMemory>,
+        operation: usize,
+        applied: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    impl Display for HeldMutationStore {
+        fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+            write!(f, "HeldMutationStore")
+        }
+    }
+
+    impl HeldMutationStore {
+        async fn hold_after_apply(&self, kind: usize) {
+            if self.operation == kind {
+                self.applied.notify_one();
+                self.release.notified().await;
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for HeldMutationStore {
+        async fn get_opts(&self, path: &Path, opts: GetOptions) -> object_store::Result<GetResult> {
+            self.inner.get_opts(path, opts).await
+        }
+
+        async fn put_opts(
+            &self,
+            path: &Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            let result = self.inner.put_opts(path, payload, opts).await?;
+            self.hold_after_apply(0).await;
+            Ok(result)
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            path: &Path,
+            opts: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(path, opts).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, object_store::Result<Path>>,
+        ) -> BoxStream<'static, object_store::Result<Path>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            opts: CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, opts).await?;
+            self.hold_after_apply(1).await;
+            Ok(())
+        }
+
+        async fn rename_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            opts: RenameOptions,
+        ) -> object_store::Result<()> {
+            self.inner.rename_opts(from, to, opts).await?;
+            self.hold_after_apply(2).await;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_completed_mutations_do_not_leave_stale_cache() {
+        for operation in 0..3 {
+            let inner = Arc::new(InMemory::new());
+            let from = Path::from("mutation-source");
+            let to = Path::from("mutation-target");
+            let replacement = Bytes::from_static(b"new-and-longer");
+            inner.put(&from, replacement.clone().into()).await.unwrap();
+            inner.put(&to, Bytes::from_static(b"old").into()).await.unwrap();
+
+            let applied = Arc::new(tokio::sync::Notify::new());
+            let backend: Arc<dyn ObjectStore> = Arc::new(HeldMutationStore {
+                inner,
+                operation,
+                applied: Arc::clone(&applied),
+                release: Arc::new(tokio::sync::Notify::new()),
+            });
+            let (store, _dir) = store_over(backend, DEFAULT_PART_SIZE_BYTES).await;
+            let store = Arc::new(store);
+            assert_eq!(
+                store.get(&to).await.unwrap().bytes().await.unwrap(),
+                Bytes::from_static(b"old")
+            );
+            if operation == 2 {
+                store.head(&from).await.unwrap();
+            }
+
+            let mutating = Arc::clone(&store);
+            let from_mutation = from.clone();
+            let to_mutation = to.clone();
+            let task = tokio::spawn(async move {
+                match operation {
+                    0 => mutating.put(&to_mutation, replacement.into()).await.map(|_| ()),
+                    1 => mutating.copy(&from_mutation, &to_mutation).await,
+                    _ => mutating.rename(&from_mutation, &to_mutation).await,
+                }
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(5), applied.notified())
+                .await
+                .expect("backend mutation did not apply");
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            assert_eq!(
+                store.get(&to).await.unwrap().bytes().await.unwrap(),
+                Bytes::from_static(b"new-and-longer"),
+                "cancelled operation {operation} retained the predecessor"
+            );
+            if operation == 2 {
+                assert!(store.head(&from).await.is_err(), "rename source is gone");
+            }
         }
     }
 
