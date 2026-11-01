@@ -239,7 +239,7 @@ def rewrite_gc_cadence(text: str, interval_secs: int) -> str:
     gc_header: int | None = None
     replaced: set[str] = set()
     assignments = {
-        key: re.compile(rf"^(\s*{re.escape(key)}\s*=\s*)\d+(\s*(?:#.*)?(?:\r?\n)?)$")
+        key: re.compile(rf"^(\s*{re.escape(key)}\s*=\s*)(?:0[xX][0-9A-Fa-f_]+|0[oO][0-7_]+|0[bB][01_]+|[+-]?[0-9][0-9_]*)(\s*(?:#.*)?(?:\r?\n)?)$")
         for key in _GC_CADENCE_KEYS
     }
     for index, line in enumerate(lines):

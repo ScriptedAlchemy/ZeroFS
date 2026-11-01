@@ -3735,6 +3735,28 @@ interval_secs = 120
         self.assertIn("[writeback] # A different section", rewritten)
         self.assertEqual(rewritten.count("[gc]"), 1)
 
+    def test_maintenance_rewrite_accepts_toml_integer_spellings(self) -> None:
+        source = """[gc] # Valid TOML integer spellings
+interval_secs = +1_000 # keep the comment
+idle_interval_secs = 0x3c # hexadecimal
+busy_backlog_interval_secs = 0b1_010 # binary
+
+[writeback]
+interval_secs = 0o144 # unrelated value must remain unchanged
+"""
+        rewritten = profile_module.rewrite_gc_cadence(source, 3600)
+        self.assertEqual(
+            rewritten,
+            source.replace("+1_000", "3600")
+            .replace("0x3c", "3600")
+            .replace("0b1_010", "3600"),
+        )
+        parsed = tomllib.loads(rewritten)
+        self.assertEqual(parsed["gc"]["interval_secs"], 3600)
+        self.assertEqual(parsed["gc"]["idle_interval_secs"], 3600)
+        self.assertEqual(parsed["gc"]["busy_backlog_interval_secs"], 3600)
+        self.assertEqual(parsed["writeback"]["interval_secs"], 100)
+
     def test_maintenance_rewrite_appends_a_missing_gc_section(self) -> None:
         source = '[storage]\nurl = "sftp://pilot@example.test:23/data"'
 
