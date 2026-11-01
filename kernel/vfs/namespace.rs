@@ -680,12 +680,12 @@ fn invalidate_new_entry_attempt(
     expire_cached_attributes_at(parent, generation);
 }
 
-pub(super) unsafe extern "C" fn zerofs_create(
+#[no_mangle]
+pub(super) unsafe extern "C" fn zerofs_vfs_create(
     _idmap: *mut bindings::mnt_idmap,
     parent: *mut bindings::inode,
     dentry: *mut bindings::dentry,
     mode: bindings::umode_t,
-    _exclusive: bindings::bool_,
 ) -> ffi::c_int {
     from_result(|| {
         // SAFETY: VFS retains the locked parent and negative child dentry.
