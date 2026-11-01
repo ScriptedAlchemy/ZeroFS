@@ -726,6 +726,23 @@ struct EvictionCtx {
     states: ObjectStates,
 }
 
+/// Keeps deletion targets owned until the backend has reported each result.
+/// Dropping a partially consumed stream must invalidate paths whose remote
+/// deletions may already have committed without yielding an acknowledgement.
+struct DeleteStreamCleanup {
+    pending: Arc<Mutex<HashMap<Path, usize>>>,
+    eviction: EvictionCtx,
+}
+
+impl Drop for DeleteStreamCleanup {
+    fn drop(&mut self) {
+        let pending = std::mem::take(&mut *self.pending.lock().unwrap());
+        for (path, _) in pending {
+            self.eviction.evict_location(&path);
+        }
+    }
+}
+
 impl EvictionCtx {
     fn evict_location(&self, location: &Path) {
         let read = ReadLease::acquire(&self.states, &self.generations, location);
@@ -1895,14 +1912,43 @@ impl ObjectStore for PrefetchingObjectStore {
         &self,
         locations: BoxStream<'static, object_store::Result<Path>>,
     ) -> BoxStream<'static, object_store::Result<Path>> {
-        let eviction = self.eviction_ctx();
+        // The backend may delete a path and then lose its result when the
+        // consumer cancels. Remember each admitted path until its result is
+        // observed, and invalidate any unacknowledged paths when the stream
+        // is dropped. Count repeated paths rather than losing a later delete.
+        let pending = Arc::new(Mutex::new(HashMap::<Path, usize>::new()));
+        let input_pending = Arc::clone(&pending);
+        let input_eviction = self.eviction_ctx();
+        let tracked = locations.map(move |result| {
+            if let Ok(path) = &result {
+                let mut pending = input_pending.lock().unwrap();
+                *pending.entry(path.clone()).or_default() += 1;
+                drop(pending);
+                // Prevent a warm hit while the delete is being dispatched.
+                // A concurrent reader may refill the old object, so also
+                // invalidate on acknowledgement or cancellation below.
+                input_eviction.evict_location(path);
+            }
+            result
+        });
+        let cleanup = DeleteStreamCleanup {
+            pending,
+            eviction: self.eviction_ctx(),
+        };
         self.inner
-            .delete_stream(locations)
-            .map(move |res| {
-                if let Ok(path) = &res {
-                    eviction.evict_location(path);
+            .delete_stream(tracked.boxed())
+            .map(move |result| {
+                if let Ok(path) = &result {
+                    cleanup.eviction.evict_location(path);
+                    let mut pending = cleanup.pending.lock().unwrap();
+                    if let Some(count) = pending.get_mut(path) {
+                        *count -= 1;
+                        if *count == 0 {
+                            pending.remove(path);
+                        }
+                    }
                 }
-                res
+                result
             })
             .boxed()
     }
@@ -4977,6 +5023,132 @@ mod tests {
                 "part {part_id} aliases the window GET allocation"
             );
         }
+    }
+
+    /// The backend may apply a delete before yielding its acknowledgement.
+    /// This wrapper holds that acknowledgement so the consumer can cancel
+    /// deterministically after remote deletion, before cache eviction.
+    #[derive(Debug)]
+    struct DelayedDeleteAckStore {
+        inner: Arc<InMemory>,
+        applied: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    impl Display for DelayedDeleteAckStore {
+        fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+            write!(f, "DelayedDeleteAckStore")
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for DelayedDeleteAckStore {
+        async fn get_opts(&self, path: &Path, opts: GetOptions) -> object_store::Result<GetResult> {
+            self.inner.get_opts(path, opts).await
+        }
+
+        async fn put_opts(
+            &self,
+            path: &Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            self.inner.put_opts(path, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            path: &Path,
+            opts: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(path, opts).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, object_store::Result<Path>>,
+        ) -> BoxStream<'static, object_store::Result<Path>> {
+            let inner = Arc::clone(&self.inner);
+            let applied = Arc::clone(&self.applied);
+            let release = Arc::clone(&self.release);
+            locations
+                .then(move |result| {
+                    let inner = Arc::clone(&inner);
+                    let applied = Arc::clone(&applied);
+                    let release = Arc::clone(&release);
+                    async move {
+                        let path = result?;
+                        object_store::ObjectStoreExt::delete(inner.as_ref(), &path).await?;
+                        applied.notify_one();
+                        release.notified().await;
+                        Ok(path)
+                    }
+                })
+                .boxed()
+        }
+
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            opts: CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, opts).await
+        }
+
+        async fn rename_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            opts: RenameOptions,
+        ) -> object_store::Result<()> {
+            self.inner.rename_opts(from, to, opts).await
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_delete_stream_evicts_after_remote_delete_without_ack() {
+        let inner = Arc::new(InMemory::new());
+        let applied = Arc::new(tokio::sync::Notify::new());
+        let backend = Arc::new(DelayedDeleteAckStore {
+            inner: Arc::clone(&inner),
+            applied: Arc::clone(&applied),
+            release: Arc::new(tokio::sync::Notify::new()),
+        });
+        let (store, _dir) = store_over(backend, 64 * 1024).await;
+        let path = Path::from("delete-cancel-after-apply");
+        store.put(&path, vec![42u8; 128 * 1024].into()).await.unwrap();
+        let _ = store.get(&path).await.unwrap().bytes().await.unwrap();
+        assert!(store.read_head(&path).is_some());
+        assert!(store.cached_part(&path, 0).await.is_some());
+
+        let delete_path = path.clone();
+        let mut stream = store.delete_stream(
+            stream::once(async move { Ok(delete_path) }).boxed(),
+        );
+        let task = tokio::spawn(async move { stream.next().await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), applied.notified())
+            .await
+            .expect("backend deletion did not apply");
+        // The backend has deleted the object, but its output stream has not
+        // yielded Ok(path). Dropping the awaiting consumer must evict anyway.
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(inner.head(&path).await.is_err());
+        assert!(store.read_head(&path).is_none());
+        assert!(store.cached_part(&path, 0).await.is_none());
+        assert!(store.get(&path).await.is_err());
     }
 
     #[tokio::test]
