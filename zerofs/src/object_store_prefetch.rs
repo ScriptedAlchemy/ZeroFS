@@ -38,7 +38,7 @@ const MAX_STREAMS: usize = 4;
 const SEQUENTIAL_FETCH_WINDOW_MULTIPLIER: usize = 15;
 /// Look-ahead horizon for a proven sequential stream. Each window remains a
 /// separate backend GET so SFTP can use several physical sessions at once.
-const PREFETCH_DEPTH_WINDOWS: usize = 4;
+const PREFETCH_DEPTH_WINDOWS: usize = 8;
 
 /// Resolved cold-read geometry for one backend. `Default` is the tuning used by
 /// every backend that does not publish a profile of its own.

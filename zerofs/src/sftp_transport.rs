@@ -1474,9 +1474,9 @@ impl SftpSessionPool {
     }
 
     fn validate_limits(shared: usize, reads: usize, writes: usize) -> Result<(), TransportError> {
-        if !(1..=8).contains(&shared) {
+        if !(1..=10).contains(&shared) {
             return Err(TransportError::InvalidLimits(
-                "shared sessions must be between 1 and 8".to_owned(),
+                "shared sessions must be between 1 and 10".to_owned(),
             ));
         }
         // Operations multiplex onto shared sessions, so per-kind concurrency
