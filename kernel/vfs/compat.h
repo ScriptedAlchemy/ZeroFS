@@ -8,11 +8,13 @@
 
 struct file;
 struct inode;
+struct inode_operations;
 struct iov_iter;
 struct user_namespace;
 struct vm_fault;
 
 void zerofs_vfs_file_accessed(struct file *file);
+void zerofs_vfs_set_create(struct inode_operations *operations);
 slab_flags_t zerofs_vfs_inode_slab_flags(void);
 kuid_t zerofs_vfs_make_kuid(struct user_namespace *namespace, uid_t uid);
 kgid_t zerofs_vfs_make_kgid(struct user_namespace *namespace, gid_t gid);

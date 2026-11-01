@@ -459,8 +459,10 @@ done
 linked="$module_output/self_contained/zerofs_main.linked.bc"
 internal="$module_output/self_contained/zerofs_main.internal.bc"
 "$llvm_link" --suppress-warnings "${bitcode[@]}" -o "$linked"
+# C compatibility helpers are linked by Kbuild after this bitcode pass, so
+# their Rust callback must remain externally visible through internalization.
 "$opt" --passes=internalize,globaldce \
-    --internalize-public-api-list=init_module,cleanup_module \
+    --internalize-public-api-list=init_module,cleanup_module,zerofs_vfs_create \
     "$linked" -o "$internal"
 
 make "${module_args[@]}" modules
