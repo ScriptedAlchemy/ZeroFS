@@ -265,6 +265,9 @@ jobs:
           [[ $(findmnt -nr -o FSTYPE /mnt/test) == "$expected_type" ]]
           [[ $(findmnt -nr -o FSTYPE /mnt/scratch) == "$expected_type" ]]
 
+      - name: Check traversal from a removed working directory
+        run: sudo timeout 60s python3 kernel/ci/removed-cwd.py /mnt/test
+
       - name: Configure xfstests
         id: configure_xfstests
         run: |
