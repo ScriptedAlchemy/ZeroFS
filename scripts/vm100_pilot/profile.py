@@ -280,13 +280,27 @@ def rewrite_gc_cadence(text: str, interval_secs: int) -> str:
     gc_header: int | None = None
     replaced: set[str] = set()
     multiline_quote: str | None = None
-    assignments = {
-        key: re.compile(
-            rf"""^(\s*(?:{re.escape(key)}|"{re.escape(key)}"|'{re.escape(key)}')\s*=\s*)"""
-            rf"(?:0[xX][0-9A-Fa-f_]+|0[oO][0-7_]+|0[bB][01_]+|[+-]?[0-9][0-9_]*)(\s*(?:#.*)?(?:\r?\n)?)$"
+    root_scope = True
+    root_gc_anchor: int | None = None
+    root_inline_gc = False
+    gc_path = r"""(?:gc|"gc"|'gc')"""
+    cadence_value = (
+        r"(?:0[xX][0-9A-Fa-f_]+|0[oO][0-7_]+|0[bB][01_]+|[+-]?[0-9][0-9_]*)"
+    )
+    cadence_suffix = r"(\s*(?:#.*)?(?:\r?\n)?)$"
+    assignments: dict[str, re.Pattern[str]] = {}
+    dotted_assignments: dict[str, re.Pattern[str]] = {}
+    for key in _GC_CADENCE_KEYS:
+        key_pattern = (
+            rf"""(?:{re.escape(key)}|"{re.escape(key)}"|'{re.escape(key)}')"""
         )
-        for key in _GC_CADENCE_KEYS
-    }
+        assignments[key] = re.compile(
+            rf"^(\s*{key_pattern}\s*=\s*){cadence_value}{cadence_suffix}"
+        )
+        dotted_assignments[key] = re.compile(
+            rf"^(\s*{gc_path}\s*\.\s*{key_pattern}\s*=\s*)"
+            rf"{cadence_value}{cadence_suffix}"
+        )
     for index, line in enumerate(lines):
         stripped = line.strip()
         # A TOML table header may have a trailing comment (even one with ']'). Treat the header
@@ -302,6 +316,7 @@ def rewrite_gc_cadence(text: str, interval_secs: int) -> str:
         if inside_multiline_value:
             continue
         if header is not None:
+            root_scope = False
             # Parse the isolated table name, so ["gc"] and ['gc'] refer to
             # the same table as [gc]. A ']' inside a quoted non-GC name may
             # truncate the boundary regex, but still closes the GC scope.
@@ -312,9 +327,17 @@ def rewrite_gc_cadence(text: str, interval_secs: int) -> str:
             if in_gc:
                 gc_header = index
             continue
-        if not in_gc:
+        if root_scope:
+            # A root dotted key creates an implicit [gc] table. Appending an
+            # explicit [gc] afterward would redeclare that table.
+            if re.match(rf"^\s*{gc_path}\s*\.", line):
+                root_gc_anchor = index
+            if re.match(rf"^\s*{gc_path}\s*=\s*\x7b", line):
+                root_inline_gc = True
+        if not in_gc and not root_scope:
             continue
-        for key, assignment in assignments.items():
+        for key in _GC_CADENCE_KEYS:
+            assignment = assignments[key] if in_gc else dotted_assignments[key]
             match = assignment.fullmatch(line)
             if match is None:
                 continue
@@ -324,16 +347,23 @@ def rewrite_gc_cadence(text: str, interval_secs: int) -> str:
     missing = [key for key in _GC_CADENCE_KEYS if key not in replaced]
     if missing:
         newline = "\r\n" if "\r\n" in text else "\n"
-        additions = [
-            f"{key} = {interval_secs}{newline}"
-            for key in _GC_CADENCE_KEYS
-            if key in missing
-        ]
         if gc_header is not None:
+            additions = [f"{key} = {interval_secs}{newline}" for key in missing]
             # A final [gc] header is valid TOML without a trailing newline.
             if not lines[gc_header].endswith("\n"):
                 lines[gc_header] += newline
             lines[gc_header + 1 : gc_header + 1] = additions
+        elif root_gc_anchor is not None:
+            # Retain root dotted-table syntax, including quoted keys and
+            # unrelated sections, rather than append a duplicate [gc].
+            additions = [f"gc.{key} = {interval_secs}{newline}" for key in missing]
+            if not lines[root_gc_anchor].endswith("\n"):
+                lines[root_gc_anchor] += newline
+            lines[root_gc_anchor + 1 : root_gc_anchor + 1] = additions
+        elif root_inline_gc:
+            # Inline tables cannot be extended with dotted keys; do not
+            # corrupt otherwise valid TOML in an attempted profile rewrite.
+            raise ValueError("cannot safely rewrite an inline GC table")
         else:
             if text.endswith(newline * 2):
                 separator = ""
@@ -342,7 +372,10 @@ def rewrite_gc_cadence(text: str, interval_secs: int) -> str:
             else:
                 separator = newline * 2
             lines.append(separator)
-            lines.extend([f"[gc]{newline}", *additions])
+            lines.extend(
+                [f"[gc]{newline}"]
+                + [f"{key} = {interval_secs}{newline}" for key in missing]
+            )
     rewritten = "".join(lines)
     settings = tomllib.loads(rewritten)
     gc = settings.get("gc", {})
