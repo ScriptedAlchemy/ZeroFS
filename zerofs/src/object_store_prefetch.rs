@@ -9,7 +9,7 @@ use object_store::path::Path;
 use object_store::{
     Attributes, CopyOptions, GetOptions, GetRange, GetResult, GetResultPayload, ListResult,
     MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload,
-    PutResult, RenameOptions,
+    PutResult, RenameOptions, UploadPart,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -428,6 +428,57 @@ impl PartKey {
 struct CachedHead {
     meta: ObjectMeta,
     attributes: Attributes,
+}
+
+struct PrefetchingMultipartUpload {
+    inner: Box<dyn MultipartUpload>,
+    location: Path,
+    heads: Cache<Path, Arc<CachedHead>>,
+    generations: Cache<Path, CacheGeneration>,
+}
+
+impl Debug for PrefetchingMultipartUpload {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PrefetchingMultipartUpload")
+            .field("inner", &self.inner)
+            .field("location", &self.location)
+            .finish_non_exhaustive()
+    }
+}
+
+struct InvalidateMultipartHead<'a> {
+    location: &'a Path,
+    heads: &'a Cache<Path, Arc<CachedHead>>,
+    generations: &'a Cache<Path, CacheGeneration>,
+}
+
+impl Drop for InvalidateMultipartHead<'_> {
+    fn drop(&mut self) {
+        self.heads.remove(self.location);
+        self.generations.remove(self.location);
+    }
+}
+
+#[async_trait]
+impl MultipartUpload for PrefetchingMultipartUpload {
+    fn put_part(&mut self, data: PutPayload) -> UploadPart {
+        self.inner.put_part(data)
+    }
+
+    async fn complete(&mut self) -> object_store::Result<PutResult> {
+        // Readers can refill the old head while this upload is in progress.
+        // Invalidate on every completion outcome, including cancellation.
+        let _invalidate = InvalidateMultipartHead {
+            location: &self.location,
+            heads: &self.heads,
+            generations: &self.generations,
+        };
+        self.inner.complete().await
+    }
+
+    async fn abort(&mut self) -> object_store::Result<()> {
+        self.inner.abort().await
+    }
 }
 
 pub struct PrefetchingObjectStore {
@@ -895,6 +946,7 @@ impl PrefetchingObjectStore {
         }
     }
 
+    #[cfg(test)]
     async fn cached_head(&self, location: &Path) -> object_store::Result<ObjectMeta> {
         Ok(self.cached_head_with_attrs(location).await?.0)
     }
@@ -906,6 +958,18 @@ impl PrefetchingObjectStore {
         if let Some((meta, attrs)) = self.read_head(location) {
             return Ok((meta, attrs));
         }
+        let discovery_lock = self.discovery_lock(location);
+        let _discovery_guard = discovery_lock.lock().await;
+        if let Some(head) = self.read_head(location) {
+            return Ok(head);
+        }
+        self.fetch_head_with_attrs(location).await
+    }
+
+    async fn fetch_head_with_attrs(
+        &self,
+        location: &Path,
+    ) -> object_store::Result<(ObjectMeta, Attributes)> {
         let result = self
             .inner
             .get_opts(
@@ -921,6 +985,19 @@ impl PrefetchingObjectStore {
         // back the whole object, which must not bypass the parts discipline.
         self.save_head(location, &result.meta, &result.attributes);
         Ok((result.meta, result.attributes))
+    }
+
+    fn discovery_lock(&self, location: &Path) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.discovery_locks.lock().unwrap();
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        match locks.get(location).and_then(std::sync::Weak::upgrade) {
+            Some(lock) => lock,
+            None => {
+                let lock = Arc::new(tokio::sync::Mutex::new(()));
+                locks.insert(location.clone(), Arc::downgrade(&lock));
+                lock
+            }
+        }
     }
 
     /// Establish metadata for a data read without an unconditional HEAD. A
@@ -940,18 +1017,7 @@ impl PrefetchingObjectStore {
 
         // Before the generation is known, the part-keyed registry cannot
         // coordinate readers. Hold a per-object gate until discovery lands.
-        let discovery_lock = {
-            let mut locks = self.discovery_locks.lock().unwrap();
-            locks.retain(|_, lock| lock.strong_count() > 0);
-            match locks.get(location).and_then(std::sync::Weak::upgrade) {
-                Some(lock) => lock,
-                None => {
-                    let lock = Arc::new(tokio::sync::Mutex::new(()));
-                    locks.insert(location.clone(), Arc::downgrade(&lock));
-                    lock
-                }
-            }
-        };
+        let discovery_lock = self.discovery_lock(location);
         let _discovery_guard = discovery_lock.lock().await;
         if let Some(head) = self.read_head(location) {
             return Ok(head);
@@ -1009,7 +1075,7 @@ impl PrefetchingObjectStore {
             // Cache coverage alone cannot reconstruct ObjectMeta. A HEAD is
             // sufficient here; this is not a cold data miss and avoids a
             // redundant payload transfer.
-            return self.cached_head_with_attrs(location).await;
+            return self.fetch_head_with_attrs(location).await;
         }
 
         if let Some(range) = &opts.range {
@@ -1039,13 +1105,13 @@ impl PrefetchingObjectStore {
         }
 
         if opts.head {
-            let meta = self.cached_head(location).await?;
+            let (meta, attributes) = self.cached_head_with_attrs(location).await?;
             return Ok(GetResult {
                 payload: GetResultPayload::Stream(
                     stream::empty::<object_store::Result<Bytes>>().boxed(),
                 ),
                 range: 0..0,
-                attributes: Attributes::default(),
+                attributes,
                 extensions: Default::default(),
                 meta,
             });
@@ -1288,12 +1354,14 @@ impl PrefetchingObjectStore {
         result: GetResult,
     ) -> object_store::Result<()> {
         let generation = CacheGeneration::from_meta(&result.meta, self.cache_instance);
-        self.save_head(location, &result.meta, &result.attributes);
+        let meta = result.meta.clone();
+        let attributes = result.attributes.clone();
 
         let part_size = self.part_size_bytes as u64;
         let aligned_end =
             result.range.end.is_multiple_of(part_size) || result.range.end == result.meta.size;
         if !aligned_end {
+            self.save_head(location, &meta, &attributes);
             return Ok(());
         }
 
@@ -1302,6 +1370,7 @@ impl PrefetchingObjectStore {
         let skip = result.range.start.next_multiple_of(part_size) - result.range.start;
         let first_full = result.range.start + skip;
         if first_full >= result.range.end {
+            self.save_head(location, &meta, &attributes);
             return Ok(());
         }
         let start_part: PartId = (first_full / part_size)
@@ -1311,7 +1380,11 @@ impl PrefetchingObjectStore {
         let admission = self.admission_ctx();
         admission
             .save_parts_stream(location, &generation, stream, start_part, skip as usize)
-            .await
+            .await?;
+        // A head hit bypasses the cold-discovery gate. Publish it only after
+        // the payload lands so late readers cannot start duplicate downloads.
+        self.save_head(location, &meta, &attributes);
+        Ok(())
     }
 
     /// Populate the parts cache from a just-uploaded object's bytes. Inserts
@@ -1693,7 +1766,13 @@ impl ObjectStore for PrefetchingObjectStore {
         opts: PutMultipartOptions,
     ) -> object_store::Result<Box<dyn MultipartUpload>> {
         self.invalidate(location);
-        self.inner.put_multipart_opts(location, opts).await
+        let inner = self.inner.put_multipart_opts(location, opts).await?;
+        Ok(Box::new(PrefetchingMultipartUpload {
+            inner,
+            location: location.clone(),
+            heads: self.heads.clone(),
+            generations: self.generations.clone(),
+        }))
     }
 
     fn delete_stream(
@@ -2183,6 +2262,7 @@ mod tests {
             inner: mem,
             ranges: ranges.clone(),
             delay: std::time::Duration::from_millis(50),
+            body_gate: None,
         });
         let (store, _dir) = store_over_with_tuning(backend, MIB, MIB, 16 * MIB).await;
         let reads = (0..6).map(|_| store.get_range(&path, 0..MIB as u64));
@@ -2191,6 +2271,175 @@ mod tests {
         }
         let seen = ranges.lock().unwrap();
         assert_eq!(seen.len(), 1, "duplicate cold backend reads: {seen:?}");
+    }
+
+    #[tokio::test]
+    async fn late_cold_reader_waits_for_discovery_payload() {
+        const MIB: usize = 1024 * 1024;
+        let inner = Arc::new(InMemory::new());
+        let path = Path::from("segments/streaming-discovery");
+        inner.put(&path, vec![0x5A; MIB].into()).await.unwrap();
+        let ranges = Arc::new(Mutex::new(Vec::new()));
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let backend: Arc<dyn ObjectStore> = Arc::new(DelayRecordingStore {
+            inner,
+            ranges: Arc::clone(&ranges),
+            delay: std::time::Duration::ZERO,
+            body_gate: Some(Arc::clone(&gate)),
+        });
+        let (store, _dir) = store_over_with_tuning(backend, MIB, MIB, MIB).await;
+        let options = GetOptions {
+            range: Some(GetRange::Bounded(0..MIB as u64)),
+            ..Default::default()
+        };
+        let mut first = Box::pin(store.get_opts(&path, options.clone()));
+        assert!(futures::poll!(&mut first).is_pending());
+        assert_eq!(ranges.lock().unwrap().len(), 1);
+        // Headers have arrived, but no body bytes have. A later reader must
+        // still join discovery instead of escaping through the cached head.
+        let mut late = Box::pin(store.get_opts(&path, options));
+        assert!(futures::poll!(&mut late).is_pending());
+        let mut head = Box::pin(store.get_opts(
+            &path,
+            GetOptions {
+                head: true,
+                ..Default::default()
+            },
+        ));
+        assert!(futures::poll!(&mut head).is_pending());
+        gate.add_permits(1);
+        let (first, late, head) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            futures::join!(first, late, head)
+        })
+        .await
+        .expect("discovery readers did not finish after releasing the payload");
+        for result in [first, late] {
+            assert_eq!(
+                result.unwrap().bytes().await.unwrap().as_ref(),
+                vec![0x5A; MIB].as_slice()
+            );
+        }
+        assert_eq!(head.unwrap().meta.size, MIB as u64);
+        assert_eq!(ranges.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn head_preserves_attributes_on_cold_and_warm_cache() {
+        let (store, inner, _dir) = make_store(DEFAULT_PART_SIZE_BYTES, MEM, DISK).await;
+        let path = Path::from("head-attributes");
+        let attributes = Attributes::from_iter([
+            (
+                object_store::Attribute::ContentType,
+                "application/octet-stream",
+            ),
+            (object_store::Attribute::Metadata("checksum".into()), "abc123"),
+        ]);
+        inner
+            .put_opts(
+                &path,
+                Bytes::from_static(b"payload").into(),
+                PutOptions {
+                    attributes: attributes.clone(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            let head = store
+                .get_opts(
+                    &path,
+                    GetOptions {
+                        head: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(head.attributes, attributes);
+            assert!(head.bytes().await.unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn multipart_completion_invalidates_reads_during_upload() {
+        let (store, inner, _dir) = make_store(DEFAULT_PART_SIZE_BYTES, MEM, DISK).await;
+        let path = Path::from("multipart-replacement");
+        inner
+            .put(&path, Bytes::from_static(b"old").into())
+            .await
+            .unwrap();
+        let mut upload = store.put_multipart(&path).await.unwrap();
+        let replacement = Bytes::from_static(b"new-and-longer");
+        upload.put_part(replacement.clone().into()).await.unwrap();
+        assert_eq!(
+            store.get(&path).await.unwrap().bytes().await.unwrap(),
+            Bytes::from_static(b"old")
+        );
+        upload.complete().await.unwrap();
+        assert_eq!(
+            store.head(&path).await.unwrap().size,
+            replacement.len() as u64
+        );
+        assert_eq!(
+            store.get(&path).await.unwrap().bytes().await.unwrap(),
+            replacement
+        );
+    }
+
+    #[derive(Debug)]
+    struct UnsuccessfulCompletion {
+        fail: bool,
+    }
+
+    #[async_trait]
+    impl MultipartUpload for UnsuccessfulCompletion {
+        fn put_part(&mut self, _: PutPayload) -> UploadPart {
+            Box::pin(async { Ok(()) })
+        }
+
+        async fn complete(&mut self) -> object_store::Result<PutResult> {
+            if self.fail {
+                Err(object_store::Error::Generic {
+                    store: "UnsuccessfulCompletion",
+                    source: "publication outcome is unknown".into(),
+                })
+            } else {
+                std::future::pending().await
+            }
+        }
+
+        async fn abort(&mut self) -> object_store::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn unsuccessful_multipart_completion_invalidates_metadata() {
+        let (store, inner, _dir) = make_store(DEFAULT_PART_SIZE_BYTES, MEM, DISK).await;
+        let path = Path::from("multipart-uncertain");
+        inner
+            .put(&path, Bytes::from_static(b"old").into())
+            .await
+            .unwrap();
+        for fail in [false, true] {
+            store.head(&path).await.unwrap();
+            let mut upload = PrefetchingMultipartUpload {
+                inner: Box::new(UnsuccessfulCompletion { fail }),
+                location: path.clone(),
+                heads: store.heads.clone(),
+                generations: store.generations.clone(),
+            };
+            if fail {
+                assert!(upload.complete().await.is_err());
+            } else {
+                let mut completion = Box::pin(upload.complete());
+                assert!(futures::poll!(&mut completion).is_pending());
+                drop(completion);
+            }
+            assert!(store.read_head(&path).is_none());
+            assert!(store.generations.get(&path).is_none());
+        }
     }
 
     #[tokio::test]
@@ -2207,6 +2456,7 @@ mod tests {
             inner: mem,
             ranges: ranges.clone(),
             delay: std::time::Duration::from_millis(50),
+            body_gate: None,
         });
         let (store, _dir) = store_over_with_tuning(backend, MIB, MIB, 16 * MIB).await;
         let mut first = Box::pin(store.get_range(&a, 0..MIB as u64));
@@ -3515,6 +3765,7 @@ mod tests {
         inner: Arc<InMemory>,
         ranges: Arc<std::sync::Mutex<Vec<Range<u64>>>>,
         delay: std::time::Duration,
+        body_gate: Option<Arc<tokio::sync::Semaphore>>,
     }
 
     impl Display for DelayRecordingStore {
@@ -3529,8 +3780,27 @@ mod tests {
             if let Some(GetRange::Bounded(r)) = &o.range {
                 self.ranges.lock().unwrap().push(r.clone());
             }
-            tokio::time::sleep(self.delay).await;
-            self.inner.get_opts(l, o).await
+            if !self.delay.is_zero() {
+                tokio::time::sleep(self.delay).await;
+            }
+            let mut result = self.inner.get_opts(l, o).await?;
+            if let Some(gate) = &self.body_gate {
+                let gate = Arc::clone(gate);
+                return Ok(GetResult {
+                    meta: result.meta.clone(),
+                    range: result.range.clone(),
+                    attributes: result.attributes.clone(),
+                    extensions: std::mem::take(&mut result.extensions),
+                    payload: GetResultPayload::Stream(
+                        stream::once(async move {
+                            let _permit = gate.acquire().await.unwrap();
+                            result.bytes().await
+                        })
+                        .boxed(),
+                    ),
+                });
+            }
+            Ok(result)
         }
         async fn put_opts(
             &self,
@@ -3593,6 +3863,7 @@ mod tests {
             inner: mem,
             ranges: ranges.clone(),
             delay: std::time::Duration::from_millis(15),
+            body_gate: None,
         });
         let dir = tempfile::tempdir().unwrap();
         let parts = HybridCacheBuilder::new()
