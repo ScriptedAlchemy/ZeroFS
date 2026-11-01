@@ -5087,7 +5087,10 @@ mod tests {
                 .boxed()
         }
 
-        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
             self.inner.list(prefix)
         }
 
@@ -5134,9 +5137,7 @@ mod tests {
         assert!(store.cached_part(&path, 0).await.is_some());
 
         let delete_path = path.clone();
-        let mut stream = store.delete_stream(
-            stream::once(async move { Ok(delete_path) }).boxed(),
-        );
+        let mut stream = store.delete_stream(stream::once(async move { Ok(delete_path) }).boxed());
         let task = tokio::spawn(async move { stream.next().await });
         tokio::time::timeout(std::time::Duration::from_secs(5), applied.notified())
             .await
