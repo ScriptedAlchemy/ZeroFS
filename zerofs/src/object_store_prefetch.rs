@@ -2605,7 +2605,6 @@ mod tests {
         }
     }
 
-
     /// Simulates a backend that has applied a mutation but whose response
     /// cannot yet be observed. Cancelling the caller must still fence cached
     /// predecessor metadata and parts.
@@ -2664,7 +2663,10 @@ mod tests {
             self.inner.delete_stream(locations)
         }
 
-        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
             self.inner.list(prefix)
         }
 
