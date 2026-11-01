@@ -373,8 +373,8 @@ enum CacheGeneration {
     },
     Unversioned {
         // A store without a version or ETag may reuse mtime+size on overwrite.
-        // Keep those parts useful in-process but never recover them into a new
-        // prefetching store instance.
+        // Keep parts only within one object incarnation. Invalidation rotates
+        // this identity even when an overwrite preserves size and timestamp.
         cache_instance: uuid::Uuid,
         size: u64,
         modified_nanos: i64,
@@ -430,11 +430,75 @@ struct CachedHead {
     attributes: Attributes,
 }
 
+/// Only active operations retain per-object state. The bounded generation
+/// cache remembers unversioned incarnations between operations.
+type ObjectStates = Arc<Mutex<HashMap<Path, std::sync::Weak<ObjectState>>>>;
+
+struct ObjectState {
+    discovery: tokio::sync::Mutex<()>,
+    revision: Mutex<uuid::Uuid>,
+}
+
+#[derive(Clone)]
+struct ReadLease {
+    state: Arc<ObjectState>,
+    revision: uuid::Uuid,
+}
+
+impl ReadLease {
+    fn acquire(
+        states: &ObjectStates,
+        generations: &Cache<Path, CacheGeneration>,
+        location: &Path,
+    ) -> Self {
+        let state = {
+            let mut states = states.lock().unwrap();
+            states.retain(|_, state| state.strong_count() > 0);
+            states
+                .get(location)
+                .and_then(std::sync::Weak::upgrade)
+                .unwrap_or_else(|| {
+                    let revision = match generations.get(location).as_ref().map(|e| e.value()) {
+                        Some(CacheGeneration::Unversioned { cache_instance, .. }) => {
+                            *cache_instance
+                        }
+                        _ => uuid::Uuid::new_v4(),
+                    };
+                    let state = Arc::new(ObjectState {
+                        discovery: tokio::sync::Mutex::new(()),
+                        revision: Mutex::new(revision),
+                    });
+                    states.insert(location.clone(), Arc::downgrade(&state));
+                    state
+                })
+        };
+        let revision = *state.revision.lock().unwrap();
+        Self { state, revision }
+    }
+
+    fn is_current(&self) -> bool {
+        *self.state.revision.lock().unwrap() == self.revision
+    }
+
+    fn publish(&self, publish: impl FnOnce()) {
+        let revision = self.state.revision.lock().unwrap();
+        if *revision == self.revision {
+            publish();
+        }
+    }
+
+    fn generation(&self, meta: &ObjectMeta) -> CacheGeneration {
+        CacheGeneration::from_meta(meta, self.revision)
+    }
+}
+
 struct PrefetchingMultipartUpload {
     inner: Box<dyn MultipartUpload>,
     location: Path,
     heads: Cache<Path, Arc<CachedHead>>,
     generations: Cache<Path, CacheGeneration>,
+    states: ObjectStates,
+    access_tracker: Cache<Path, Arc<Mutex<AccessHistory>>>,
 }
 
 impl Debug for PrefetchingMultipartUpload {
@@ -450,12 +514,17 @@ struct InvalidateMultipartHead<'a> {
     location: &'a Path,
     heads: &'a Cache<Path, Arc<CachedHead>>,
     generations: &'a Cache<Path, CacheGeneration>,
+    state: Arc<ObjectState>,
+    access_tracker: &'a Cache<Path, Arc<Mutex<AccessHistory>>>,
 }
 
 impl Drop for InvalidateMultipartHead<'_> {
     fn drop(&mut self) {
+        let mut revision = self.state.revision.lock().unwrap();
+        *revision = uuid::Uuid::new_v4();
         self.heads.remove(self.location);
         self.generations.remove(self.location);
+        self.access_tracker.remove(self.location);
     }
 }
 
@@ -472,6 +541,8 @@ impl MultipartUpload for PrefetchingMultipartUpload {
             location: &self.location,
             heads: &self.heads,
             generations: &self.generations,
+            state: ReadLease::acquire(&self.states, &self.generations, &self.location).state,
+            access_tracker: &self.access_tracker,
         };
         self.inner.complete().await
     }
@@ -494,9 +565,8 @@ pub struct PrefetchingObjectStore {
     /// parts before deciding whether it needs a data GET or only a HEAD.
     generations: Cache<Path, CacheGeneration>,
     access_tracker: Cache<Path, Arc<Mutex<AccessHistory>>>,
-    discovery_locks: Mutex<HashMap<Path, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+    object_states: ObjectStates,
     fetches: Fetches,
-    cache_instance: uuid::Uuid,
     /// Clean-cache / cgroup-slack RSS ceiling. `0` disables admission.
     admission_cap_bytes: u64,
     /// Highest part_id+1 seen per object, so evict can form PartKeys
@@ -515,7 +585,7 @@ struct FetchCtx {
     access_tracker: Cache<Path, Arc<Mutex<AccessHistory>>>,
     fetches: Fetches,
     part_size_bytes: usize,
-    cache_instance: uuid::Uuid,
+    read: ReadLease,
     admission_cap_bytes: u64,
     part_counts: Cache<Path, usize>,
 }
@@ -597,6 +667,7 @@ impl AdmissionCtx<'_> {
         &self,
         location: &Path,
         generation: &CacheGeneration,
+        read: &ReadLease,
         mut stream: S,
         start_part_number: PartId,
         mut skip: usize,
@@ -619,22 +690,26 @@ impl AdmissionCtx<'_> {
             buffer.extend_from_slice(&chunk);
             while buffer.len() >= self.part_size_bytes {
                 let to_write = buffer.split_to(self.part_size_bytes);
-                self.admit_part(
-                    location,
-                    generation,
-                    part_number,
-                    Bytes::copy_from_slice(&to_write),
-                );
+                read.publish(|| {
+                    self.admit_part(
+                        location,
+                        generation,
+                        part_number,
+                        Bytes::copy_from_slice(&to_write),
+                    )
+                });
                 part_number += 1;
             }
         }
         if !buffer.is_empty() {
-            self.admit_part(
-                location,
-                generation,
-                part_number,
-                Bytes::copy_from_slice(&buffer),
-            );
+            read.publish(|| {
+                self.admit_part(
+                    location,
+                    generation,
+                    part_number,
+                    Bytes::copy_from_slice(&buffer),
+                )
+            });
         }
         Ok(())
     }
@@ -648,11 +723,13 @@ struct EvictionCtx {
     access_tracker: Cache<Path, Arc<Mutex<AccessHistory>>>,
     part_counts: Cache<Path, usize>,
     part_size_bytes: usize,
-    cache_instance: uuid::Uuid,
+    states: ObjectStates,
 }
 
 impl EvictionCtx {
     fn evict_location(&self, location: &Path) {
+        let read = ReadLease::acquire(&self.states, &self.generations, location);
+        let mut revision = read.state.revision.lock().unwrap();
         let from_counts = self
             .part_counts
             .get(location)
@@ -670,7 +747,7 @@ impl EvictionCtx {
             .or_else(|| {
                 self.heads
                     .get(location)
-                    .map(|e| CacheGeneration::from_meta(&e.value().meta, self.cache_instance))
+                    .map(|e| read.generation(&e.value().meta))
             });
         let from_gen = match &generation {
             Some(CacheGeneration::Unversioned { size, .. }) => {
@@ -689,6 +766,7 @@ impl EvictionCtx {
                 ));
             }
         }
+        *revision = uuid::Uuid::new_v4();
         self.heads.remove(location);
         self.generations.remove(location);
         self.access_tracker.remove(location);
@@ -787,9 +865,8 @@ impl PrefetchingObjectStore {
             heads,
             generations,
             access_tracker,
-            discovery_locks: Mutex::new(HashMap::new()),
+            object_states: Arc::new(Mutex::new(HashMap::new())),
             fetches: Arc::new(Mutex::new(HashMap::new())),
-            cache_instance: uuid::Uuid::new_v4(),
             admission_cap_bytes: 0,
             part_counts: foyer::CacheBuilder::new(HEADS_CAPACITY_ENTRIES)
                 .with_name("zerofs-object-prefetch-part-counts")
@@ -805,7 +882,11 @@ impl PrefetchingObjectStore {
         self
     }
 
-    fn ctx(&self) -> FetchCtx {
+    fn read_lease(&self, location: &Path) -> ReadLease {
+        ReadLease::acquire(&self.object_states, &self.generations, location)
+    }
+
+    fn ctx(&self, read: &ReadLease) -> FetchCtx {
         FetchCtx {
             inner: self.inner.clone(),
             parts: self.parts.clone(),
@@ -814,7 +895,7 @@ impl PrefetchingObjectStore {
             access_tracker: self.access_tracker.clone(),
             fetches: self.fetches.clone(),
             part_size_bytes: self.part_size_bytes,
-            cache_instance: self.cache_instance,
+            read: read.clone(),
             admission_cap_bytes: self.admission_cap_bytes,
             part_counts: self.part_counts.clone(),
         }
@@ -837,22 +918,22 @@ impl PrefetchingObjectStore {
             access_tracker: self.access_tracker.clone(),
             part_counts: self.part_counts.clone(),
             part_size_bytes: self.part_size_bytes,
-            cache_instance: self.cache_instance,
+            states: self.object_states.clone(),
         }
     }
 
-    fn save_head(&self, location: &Path, meta: &ObjectMeta, attrs: &Attributes) {
-        self.generations.insert(
-            location.clone(),
-            CacheGeneration::from_meta(meta, self.cache_instance),
-        );
-        self.heads.insert(
-            location.clone(),
-            Arc::new(CachedHead {
-                meta: meta.clone(),
-                attributes: attrs.clone(),
-            }),
-        );
+    fn save_head(&self, location: &Path, meta: &ObjectMeta, attrs: &Attributes, read: &ReadLease) {
+        read.publish(|| {
+            self.generations
+                .insert(location.clone(), read.generation(meta));
+            self.heads.insert(
+                location.clone(),
+                Arc::new(CachedHead {
+                    meta: meta.clone(),
+                    attributes: attrs.clone(),
+                }),
+            );
+        });
     }
 
     fn read_head(&self, location: &Path) -> Option<(ObjectMeta, Attributes)> {
@@ -863,9 +944,10 @@ impl PrefetchingObjectStore {
 
     #[cfg(test)]
     async fn cached_part(&self, location: &Path, part_id: PartId) -> Option<Bytes> {
+        let read = self.read_lease(location);
         let generation = self
             .read_head(location)
-            .map(|(meta, _)| CacheGeneration::from_meta(&meta, self.cache_instance))?;
+            .map(|(meta, _)| read.generation(&meta))?;
         self.parts
             .get(&PartKey::new(
                 location,
@@ -880,8 +962,12 @@ impl PrefetchingObjectStore {
     }
 
     fn invalidate(&self, location: &Path) {
+        let read = self.read_lease(location);
+        let mut revision = read.state.revision.lock().unwrap();
+        *revision = uuid::Uuid::new_v4();
         self.heads.remove(location);
         self.generations.remove(location);
+        self.access_tracker.remove(location);
     }
 
     /// Backend GET that does not `save_get_result`, `read_part`, or
@@ -955,20 +1041,23 @@ impl PrefetchingObjectStore {
         &self,
         location: &Path,
     ) -> object_store::Result<(ObjectMeta, Attributes)> {
-        if let Some((meta, attrs)) = self.read_head(location) {
-            return Ok((meta, attrs));
+        loop {
+            let read = self.read_lease(location);
+            let _discovery_guard = read.state.discovery.lock().await;
+            let result = match self.read_head(location) {
+                Some(head) => Ok(head),
+                None => self.fetch_head_with_attrs(location, &read).await,
+            };
+            if read.is_current() {
+                return result;
+            }
         }
-        let discovery_lock = self.discovery_lock(location);
-        let _discovery_guard = discovery_lock.lock().await;
-        if let Some(head) = self.read_head(location) {
-            return Ok(head);
-        }
-        self.fetch_head_with_attrs(location).await
     }
 
     async fn fetch_head_with_attrs(
         &self,
         location: &Path,
+        read: &ReadLease,
     ) -> object_store::Result<(ObjectMeta, Attributes)> {
         let result = self
             .inner
@@ -983,21 +1072,8 @@ impl PrefetchingObjectStore {
             .await?;
         // Save only the head: a backend that ignores `head` (InMemory) hands
         // back the whole object, which must not bypass the parts discipline.
-        self.save_head(location, &result.meta, &result.attributes);
+        self.save_head(location, &result.meta, &result.attributes, read);
         Ok((result.meta, result.attributes))
-    }
-
-    fn discovery_lock(&self, location: &Path) -> Arc<tokio::sync::Mutex<()>> {
-        let mut locks = self.discovery_locks.lock().unwrap();
-        locks.retain(|_, lock| lock.strong_count() > 0);
-        match locks.get(location).and_then(std::sync::Weak::upgrade) {
-            Some(lock) => lock,
-            None => {
-                let lock = Arc::new(tokio::sync::Mutex::new(()));
-                locks.insert(location.clone(), Arc::downgrade(&lock));
-                lock
-            }
-        }
     }
 
     /// Establish metadata for a data read without an unconditional HEAD. A
@@ -1010,6 +1086,7 @@ impl PrefetchingObjectStore {
         location: &Path,
         mut opts: GetOptions,
         fetch_window: usize,
+        read: &ReadLease,
     ) -> object_store::Result<(ObjectMeta, Attributes)> {
         if let Some(head) = self.read_head(location) {
             return Ok(head);
@@ -1017,8 +1094,7 @@ impl PrefetchingObjectStore {
 
         // Before the generation is known, the part-keyed registry cannot
         // coordinate readers. Hold a per-object gate until discovery lands.
-        let discovery_lock = self.discovery_lock(location);
-        let _discovery_guard = discovery_lock.lock().await;
+        let _discovery_guard = read.state.discovery.lock().await;
         if let Some(head) = self.read_head(location) {
             return Ok(head);
         }
@@ -1049,7 +1125,7 @@ impl PrefetchingObjectStore {
                     .div_ceil(part_size)
                     .try_into()
                     .expect("part id exceeds usize");
-                let ctx = self.ctx();
+                let ctx = self.ctx(read);
                 match Self::plan_window(
                     &ctx,
                     location,
@@ -1075,7 +1151,7 @@ impl PrefetchingObjectStore {
             // Cache coverage alone cannot reconstruct ObjectMeta. A HEAD is
             // sufficient here; this is not a cold data miss and avoids a
             // redundant payload transfer.
-            return self.fetch_head_with_attrs(location).await;
+            return self.fetch_head_with_attrs(location, read).await;
         }
 
         if let Some(range) = &opts.range {
@@ -1085,8 +1161,8 @@ impl PrefetchingObjectStore {
         let meta = result.meta.clone();
         let attributes = result.attributes.clone();
         let fetched = result.range.clone();
-        self.save_get_result(location, result).await?;
-        self.note_fetch(location, fetched.start, fetched.end);
+        self.save_get_result(location, result, read).await?;
+        read.publish(|| self.note_fetch(location, fetched.start, fetched.end));
         Ok((meta, attributes))
     }
 
@@ -1127,20 +1203,29 @@ impl PrefetchingObjectStore {
         let decision = self.record_access(location, access_offset, access_len);
         let fetch_window = decision.fetch_window;
 
-        let (meta, attributes) = self
-            .discover_data_meta(location, opts.clone(), fetch_window)
-            .await?;
-        let generation = CacheGeneration::from_meta(&meta, self.cache_instance);
+        let (meta, attributes, read) = loop {
+            let read = self.read_lease(location);
+            let result = self
+                .discover_data_meta(location, opts.clone(), fetch_window, &read)
+                .await;
+            // Discovery consumes its body into the cache. If a mutation crossed
+            // it, neither that body nor its metadata can back this lazy result.
+            if read.is_current() {
+                let (meta, attributes) = result?;
+                break (meta, attributes, read);
+            }
+        };
+        let generation = read.generation(&meta);
 
         let mut scheduled_to = None;
         for prefetch in decision.async_prefetch {
-            match self.spawn_async_prefetch(location, &generation, prefetch, access_offset) {
+            match self.spawn_async_prefetch(location, &generation, prefetch, access_offset, &read) {
                 Some(end) => scheduled_to = Some(end),
                 None => break,
             }
         }
         if let Some(end) = scheduled_to {
-            self.note_schedule(location, access_offset, end);
+            read.publish(|| self.note_schedule(location, access_offset, end));
         }
 
         let range = self.canonicalize_range(opts.range.clone(), meta.size)?;
@@ -1161,6 +1246,7 @@ impl PrefetchingObjectStore {
                     part_id,
                     range_in_part,
                     window,
+                    &read,
                 )
             })
             .collect::<Vec<_>>();
@@ -1185,6 +1271,7 @@ impl PrefetchingObjectStore {
         generation: &CacheGeneration,
         prefetch: AsyncPrefetch,
         trigger_offset: u64,
+        read: &ReadLease,
     ) -> Option<u64> {
         let part_size_u64 = self.part_size_bytes as u64;
         let window_end = prefetch.start + prefetch.size as u64;
@@ -1214,7 +1301,7 @@ impl PrefetchingObjectStore {
             end_part = end_part.min(eof_part);
         }
 
-        let ctx = self.ctx();
+        let ctx = self.ctx(read);
         let mut part = start_part;
         while part < end_part {
             match Self::plan_window(
@@ -1234,19 +1321,22 @@ impl PrefetchingObjectStore {
                     let tracker = ctx.access_tracker.clone();
                     let location = location.clone();
                     let failed_start = prefetch.start;
+                    let read = read.clone();
                     tokio::spawn(async move {
                         let _guard = guard;
                         // Errors are contained: the parts stay uncached and a
                         // demand read fetches them itself.
-                        if shared.await.is_err()
-                            && let Some(entry) = tracker.get(&location)
-                        {
-                            entry
-                                .value()
-                                .clone()
-                                .lock()
-                                .unwrap()
-                                .note_schedule_failure(trigger_offset, failed_start);
+                        if shared.await.is_err() {
+                            read.publish(|| {
+                                if let Some(entry) = tracker.get(&location) {
+                                    entry
+                                        .value()
+                                        .clone()
+                                        .lock()
+                                        .unwrap()
+                                        .note_schedule_failure(trigger_offset, failed_start);
+                                }
+                            });
                         }
                     });
                     part = lead_end;
@@ -1352,8 +1442,9 @@ impl PrefetchingObjectStore {
         &self,
         location: &Path,
         result: GetResult,
+        read: &ReadLease,
     ) -> object_store::Result<()> {
-        let generation = CacheGeneration::from_meta(&result.meta, self.cache_instance);
+        let generation = read.generation(&result.meta);
         let meta = result.meta.clone();
         let attributes = result.attributes.clone();
 
@@ -1361,7 +1452,7 @@ impl PrefetchingObjectStore {
         let aligned_end =
             result.range.end.is_multiple_of(part_size) || result.range.end == result.meta.size;
         if !aligned_end {
-            self.save_head(location, &meta, &attributes);
+            self.save_head(location, &meta, &attributes, read);
             return Ok(());
         }
 
@@ -1370,7 +1461,7 @@ impl PrefetchingObjectStore {
         let skip = result.range.start.next_multiple_of(part_size) - result.range.start;
         let first_full = result.range.start + skip;
         if first_full >= result.range.end {
-            self.save_head(location, &meta, &attributes);
+            self.save_head(location, &meta, &attributes, read);
             return Ok(());
         }
         let start_part: PartId = (first_full / part_size)
@@ -1379,11 +1470,18 @@ impl PrefetchingObjectStore {
         let stream = result.into_stream();
         let admission = self.admission_ctx();
         admission
-            .save_parts_stream(location, &generation, stream, start_part, skip as usize)
+            .save_parts_stream(
+                location,
+                &generation,
+                read,
+                stream,
+                start_part,
+                skip as usize,
+            )
             .await?;
         // A head hit bypasses the cold-discovery gate. Publish it only after
         // the payload lands so late readers cannot start duplicate downloads.
-        self.save_head(location, &meta, &attributes);
+        self.save_head(location, &meta, &attributes, read);
         Ok(())
     }
 
@@ -1413,26 +1511,29 @@ impl PrefetchingObjectStore {
         let Some(generation) = CacheGeneration::from_put_result(result) else {
             return;
         };
-        self.generations
-            .insert(location.clone(), generation.clone());
-        let ps = self.part_size_bytes;
-        let mut off = 0usize;
-        let mut part_id: PartId = 0;
-        while off < bytes.len() {
-            let end = (off + ps).min(bytes.len());
-            // Owned copy, not `bytes.slice(..)`: a slice keeps the whole
-            // source allocation (a 256 MiB sealed segment) alive while any
-            // one part survives in the cache, and the weigher only sees the
-            // slice length. That was the multi-GB RSS retention bug.
-            self.admit_part(
-                location,
-                &generation,
-                part_id,
-                Bytes::copy_from_slice(&bytes[off..end]),
-            );
-            off = end;
-            part_id += 1;
-        }
+        let read = self.read_lease(location);
+        read.publish(|| {
+            self.generations
+                .insert(location.clone(), generation.clone());
+            let ps = self.part_size_bytes;
+            let mut off = 0usize;
+            let mut part_id: PartId = 0;
+            while off < bytes.len() {
+                let end = (off + ps).min(bytes.len());
+                // Owned copy, not `bytes.slice(..)`: a slice keeps the whole
+                // source allocation (a 256 MiB sealed segment) alive while any
+                // one part survives in the cache, and the weigher only sees the
+                // slice length. That was the multi-GB RSS retention bug.
+                self.admit_part(
+                    location,
+                    &generation,
+                    part_id,
+                    Bytes::copy_from_slice(&bytes[off..end]),
+                );
+                off = end;
+                part_id += 1;
+            }
+        });
     }
 
     fn split_range_into_parts(&self, range: Range<u64>) -> Vec<(PartId, Range<usize>)> {
@@ -1471,8 +1572,9 @@ impl PrefetchingObjectStore {
         part_id: PartId,
         range_in_part: Range<usize>,
         fetch_window: usize,
+        read: &ReadLease,
     ) -> BoxFuture<'static, object_store::Result<Bytes>> {
-        let ctx = self.ctx();
+        let ctx = self.ctx(read);
         Box::pin(async move {
             let part_size_bytes = ctx.part_size_bytes;
             let key = PartKey::new(&location, part_size_bytes, &generation, part_id);
@@ -1557,16 +1659,18 @@ impl PrefetchingObjectStore {
                 },
             )
             .await?;
-        let generation = CacheGeneration::from_meta(&get_result.meta, ctx.cache_instance);
+        let generation = ctx.read.generation(&get_result.meta);
         let bytes = get_result.bytes().await?;
         // Owned copy: a backend may serve this range as a slice of a larger
         // retained allocation, which a cached part must never pin.
-        ctx.admission_ctx().admit_part(
-            location,
-            &generation,
-            part_id,
-            Bytes::copy_from_slice(&bytes),
-        );
+        ctx.read.publish(|| {
+            ctx.admission_ctx().admit_part(
+                location,
+                &generation,
+                part_id,
+                Bytes::copy_from_slice(&bytes),
+            )
+        });
         let end = range_in_part.end.min(bytes.len());
         let start = range_in_part.start.min(end);
         Ok(bytes.slice(start..end))
@@ -1599,42 +1703,44 @@ impl PrefetchingObjectStore {
             .await
             .map_err(Arc::new)?;
         let meta = get_result.meta.clone();
-        let generation = CacheGeneration::from_meta(&meta, ctx.cache_instance);
+        let generation = ctx.read.generation(&meta);
         let attrs = get_result.attributes.clone();
         let actual_end = get_result.range.end;
         let all_bytes = get_result.bytes().await.map_err(Arc::new)?;
 
-        ctx.heads.insert(
-            location.clone(),
-            Arc::new(CachedHead {
-                meta,
-                attributes: attrs,
-            }),
-        );
-        ctx.generations.insert(location.clone(), generation.clone());
-        if let Some(entry) = ctx.access_tracker.get(&location) {
-            entry
-                .value()
-                .clone()
-                .lock()
-                .unwrap()
-                .note_fetch(fetch_offset, actual_end);
-        }
-        for i in 0..window_parts {
-            let start = i * part_size_bytes;
-            if start >= all_bytes.len() {
-                break;
-            }
-            let end = ((i + 1) * part_size_bytes).min(all_bytes.len());
-            // Owned copy: a slice would pin the whole window allocation for
-            // as long as any one part survives in the cache.
-            ctx.admission_ctx().admit_part(
-                &location,
-                &generation,
-                fetch_start + i,
-                Bytes::copy_from_slice(&all_bytes[start..end]),
+        ctx.read.publish(|| {
+            ctx.heads.insert(
+                location.clone(),
+                Arc::new(CachedHead {
+                    meta,
+                    attributes: attrs,
+                }),
             );
-        }
+            ctx.generations.insert(location.clone(), generation.clone());
+            if let Some(entry) = ctx.access_tracker.get(&location) {
+                entry
+                    .value()
+                    .clone()
+                    .lock()
+                    .unwrap()
+                    .note_fetch(fetch_offset, actual_end);
+            }
+            for i in 0..window_parts {
+                let start = i * part_size_bytes;
+                if start >= all_bytes.len() {
+                    break;
+                }
+                let end = ((i + 1) * part_size_bytes).min(all_bytes.len());
+                // Owned copy: a slice would pin the whole window allocation for
+                // as long as any one part survives in the cache.
+                ctx.admission_ctx().admit_part(
+                    &location,
+                    &generation,
+                    fetch_start + i,
+                    Bytes::copy_from_slice(&all_bytes[start..end]),
+                );
+            }
+        });
         Ok((fetch_start, all_bytes))
     }
 
@@ -1772,6 +1878,8 @@ impl ObjectStore for PrefetchingObjectStore {
             location: location.clone(),
             heads: self.heads.clone(),
             generations: self.generations.clone(),
+            states: self.object_states.clone(),
+            access_tracker: self.access_tracker.clone(),
         }))
     }
 
@@ -1905,10 +2013,9 @@ mod tests {
     }
 
     fn cached_generation(store: &PrefetchingObjectStore, path: &Path) -> CacheGeneration {
-        CacheGeneration::from_meta(
-            &store.read_head(path).expect("cached object head").0,
-            store.cache_instance,
-        )
+        store
+            .read_lease(path)
+            .generation(&store.read_head(path).expect("cached object head").0)
     }
 
     #[tokio::test]
@@ -2263,6 +2370,7 @@ mod tests {
             ranges: ranges.clone(),
             delay: std::time::Duration::from_millis(50),
             body_gate: None,
+            unversioned: false,
         });
         let (store, _dir) = store_over_with_tuning(backend, MIB, MIB, 16 * MIB).await;
         let reads = (0..6).map(|_| store.get_range(&path, 0..MIB as u64));
@@ -2286,6 +2394,7 @@ mod tests {
             ranges: Arc::clone(&ranges),
             delay: std::time::Duration::ZERO,
             body_gate: Some(Arc::clone(&gate)),
+            unversioned: false,
         });
         let (store, _dir) = store_over_with_tuning(backend, MIB, MIB, MIB).await;
         let options = GetOptions {
@@ -2332,7 +2441,10 @@ mod tests {
                 object_store::Attribute::ContentType,
                 "application/octet-stream",
             ),
-            (object_store::Attribute::Metadata("checksum".into()), "abc123"),
+            (
+                object_store::Attribute::Metadata("checksum".into()),
+                "abc123",
+            ),
         ]);
         inner
             .put_opts(
@@ -2387,6 +2499,98 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn multipart_completion_fences_inflight_cold_and_warm_reads() {
+        const MIB: usize = 1024 * 1024;
+        for warm_head in [false, true] {
+            let inner = Arc::new(InMemory::new());
+            let path = Path::from("multipart-inflight");
+            inner.put(&path, vec![0x11; MIB].into()).await.unwrap();
+            let ranges = Arc::new(Mutex::new(Vec::new()));
+            let gate = Arc::new(tokio::sync::Semaphore::new(0));
+            let backend = Arc::new(DelayRecordingStore {
+                inner,
+                ranges: Arc::clone(&ranges),
+                delay: std::time::Duration::ZERO,
+                body_gate: Some(Arc::clone(&gate)),
+                unversioned: false,
+            });
+            let (store, _dir) = store_over_with_tuning(backend, MIB, MIB, MIB).await;
+            let mut upload = store.put_multipart(&path).await.unwrap();
+            upload.put_part(vec![0x22; 2 * MIB].into()).await.unwrap();
+            if warm_head {
+                store.head(&path).await.unwrap();
+            }
+            let mut old_read = Box::pin(store.get_range(&path, 0..MIB as u64));
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                futures::future::poll_fn(|cx| {
+                    assert!(std::future::Future::poll(old_read.as_mut(), cx).is_pending());
+                    if ranges.lock().unwrap().len() == 1 {
+                        std::task::Poll::Ready(())
+                    } else {
+                        std::task::Poll::Pending
+                    }
+                }),
+            )
+            .await
+            .expect("read did not reach the gated backend payload");
+            upload.complete().await.unwrap();
+            gate.add_permits(1);
+            tokio::time::timeout(std::time::Duration::from_secs(5), old_read)
+                .await
+                .expect("overlapping read did not settle")
+                .unwrap();
+            assert_eq!(store.head(&path).await.unwrap().size, (2 * MIB) as u64);
+            assert_eq!(
+                store
+                    .get_range(&path, MIB as u64..(2 * MIB) as u64)
+                    .await
+                    .unwrap(),
+                Bytes::from(vec![0x22; MIB]),
+                "a predecessor window republished after completion (warm={warm_head})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn multipart_overwrite_rotates_unversioned_same_metadata_parts() {
+        const PART: usize = 1024;
+        let inner = Arc::new(InMemory::new());
+        let path = Path::from("multipart-unversioned");
+        inner.put(&path, vec![0x11; 4 * PART].into()).await.unwrap();
+        let backend = Arc::new(DelayRecordingStore {
+            inner,
+            ranges: Arc::new(Mutex::new(Vec::new())),
+            delay: std::time::Duration::ZERO,
+            body_gate: None,
+            unversioned: true,
+        });
+        let (store, _dir) = store_over_with_tuning(backend, PART, PART, PART).await;
+        assert_eq!(
+            store.get(&path).await.unwrap().bytes().await.unwrap(),
+            Bytes::from(vec![0x11; 4 * PART])
+        );
+        let before = store.head(&path).await.unwrap();
+        let mut upload = store.put_multipart(&path).await.unwrap();
+        upload.put_part(vec![0x22; 4 * PART].into()).await.unwrap();
+        upload.complete().await.unwrap();
+        let after = store.head(&path).await.unwrap();
+        assert_eq!(before.size, after.size);
+        assert_eq!(before.last_modified, after.last_modified);
+        assert!(after.e_tag.is_none() && after.version.is_none());
+        for part in [0, 3] {
+            let start = (part * PART) as u64;
+            assert_eq!(
+                store
+                    .get_range(&path, start..start + PART as u64)
+                    .await
+                    .unwrap(),
+                Bytes::from(vec![0x22; PART])
+            );
+        }
+    }
+
     #[derive(Debug)]
     struct UnsuccessfulCompletion {
         fail: bool,
@@ -2429,6 +2633,8 @@ mod tests {
                 location: path.clone(),
                 heads: store.heads.clone(),
                 generations: store.generations.clone(),
+                states: store.object_states.clone(),
+                access_tracker: store.access_tracker.clone(),
             };
             if fail {
                 assert!(upload.complete().await.is_err());
@@ -2457,6 +2663,7 @@ mod tests {
             ranges: ranges.clone(),
             delay: std::time::Duration::from_millis(50),
             body_gate: None,
+            unversioned: false,
         });
         let (store, _dir) = store_over_with_tuning(backend, MIB, MIB, 16 * MIB).await;
         let mut first = Box::pin(store.get_range(&a, 0..MIB as u64));
@@ -3578,11 +3785,23 @@ mod tests {
             size: part_size * 4,
         };
         assert_eq!(
-            store.spawn_async_prefetch(&path, &generation, prefetch, prefetch.start),
+            store.spawn_async_prefetch(
+                &path,
+                &generation,
+                prefetch,
+                prefetch.start,
+                &store.read_lease(&path)
+            ),
             Some((5 * part_size + 4 * part_size) as u64)
         );
         assert_eq!(
-            store.spawn_async_prefetch(&path, &generation, prefetch, prefetch.start),
+            store.spawn_async_prefetch(
+                &path,
+                &generation,
+                prefetch,
+                prefetch.start,
+                &store.read_lease(&path)
+            ),
             Some((5 * part_size + 4 * part_size) as u64),
             "an in-flight window still counts as covered"
         );
@@ -3615,6 +3834,7 @@ mod tests {
                 size: part_size * 4,
             },
             (start_part * part_size) as u64,
+            &store.read_lease(&path),
         );
 
         for _ in 0..100 {
@@ -3766,6 +3986,7 @@ mod tests {
         ranges: Arc<std::sync::Mutex<Vec<Range<u64>>>>,
         delay: std::time::Duration,
         body_gate: Option<Arc<tokio::sync::Semaphore>>,
+        unversioned: bool,
     }
 
     impl Display for DelayRecordingStore {
@@ -3784,6 +4005,11 @@ mod tests {
                 tokio::time::sleep(self.delay).await;
             }
             let mut result = self.inner.get_opts(l, o).await?;
+            if self.unversioned {
+                result.meta.e_tag = None;
+                result.meta.version = None;
+                result.meta.last_modified = chrono::DateTime::from_timestamp(0, 0).unwrap();
+            }
             if let Some(gate) = &self.body_gate {
                 let gate = Arc::clone(gate);
                 return Ok(GetResult {
@@ -3864,6 +4090,7 @@ mod tests {
             ranges: ranges.clone(),
             delay: std::time::Duration::from_millis(15),
             body_gate: None,
+            unversioned: false,
         });
         let dir = tempfile::tempdir().unwrap();
         let parts = HybridCacheBuilder::new()
@@ -4041,6 +4268,7 @@ mod tests {
                 size: 16 * part_size,
             },
             0,
+            &store.read_lease(&path),
         );
 
         let off = (3 * part_size) as u64;
@@ -4140,7 +4368,7 @@ mod tests {
         let (store, _dir) = store_over(mem, part_size).await;
         store.head(&path).await.unwrap();
         let generation = cached_generation(&store, &path);
-        let ctx = store.ctx();
+        let ctx = store.ctx(&store.read_lease(&path));
         let key = PartKey::new(&path, part_size, &generation, 0);
 
         assert!(ctx.parts.get(&key).await.unwrap().is_none());
@@ -4252,6 +4480,7 @@ mod tests {
                 size: 8 * part_size,
             },
             (start_part * part_size) as u64,
+            &store.read_lease(&path),
         );
         assert_eq!(covered, Some(((start_part + 8) * part_size) as u64));
 
