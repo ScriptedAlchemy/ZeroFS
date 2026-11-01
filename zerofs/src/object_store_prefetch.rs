@@ -25,6 +25,13 @@ use crate::alloc_rss;
 #[derive(Clone, Copy, Debug)]
 pub struct SkipPartsCache;
 
+/// Cache the requested range without predicting more physical object bytes.
+/// Segment callers already know the logical file's next extents; adjacent
+/// physical frames can belong to other files. Cache-part alignment and the
+/// shared in-flight registry still apply.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CacheRangeOnly;
+
 const DEFAULT_PART_SIZE_BYTES: usize = 128 * 1024;
 const HEADS_CAPACITY_ENTRIES: usize = 16 * 1024;
 const ACCESS_TRACKER_CAPACITY: usize = 8 * 1024;
@@ -34,8 +41,9 @@ const FETCH_WINDOW_MAX: usize = 8 * 1024 * 1024;
 const MAX_STREAMS: usize = 4;
 /// Minimum confirmed-stream window relative to the random-access minimum. The
 /// live SFTP profile promotes 1 MiB to 4 MiB after sequential access is proven.
-/// Eight look-ahead windows can then use all eight default SFTP sessions within
-/// a 32 MiB segment, while an unproven/random stream stays at 1 MiB.
+/// Ordinary object consumers can then use several default SFTP sessions, while
+/// an unproven/random stream stays at 1 MiB. File segment reads opt out of this
+/// physical prediction and use their logical extent map instead.
 const SEQUENTIAL_FETCH_WINDOW_MULTIPLIER: usize = 4;
 /// Look-ahead horizon for a proven sequential stream. Each window remains a
 /// separate backend GET so SFTP can use several physical sessions at once.
@@ -1059,7 +1067,16 @@ impl PrefetchingObjectStore {
             Some(GetRange::Bounded(r)) => r.end.saturating_sub(r.start),
             _ => 0,
         };
-        let decision = self.record_access(location, access_offset, access_len);
+        let decision = if opts.extensions.get::<CacheRangeOnly>().is_some() {
+            RecordDecision {
+                // Zero means no expansion beyond cache-part alignment. Using
+                // one part here would expand an unaligned tiny read into two.
+                fetch_window: 0,
+                async_prefetch: Vec::new(),
+            }
+        } else {
+            self.record_access(location, access_offset, access_len)
+        };
         let fetch_window = decision.fetch_window;
 
         let (meta, attributes) = self
@@ -2192,6 +2209,105 @@ mod tests {
         }
         let seen = ranges.lock().unwrap();
         assert_eq!(seen.len(), 1, "duplicate cold backend reads: {seen:?}");
+    }
+
+    #[tokio::test]
+    async fn segment_reads_do_not_speculate_into_unrelated_file_frames() {
+        use crate::config::CompressionConfig;
+        use crate::frame_codec::FrameCodec;
+        use crate::fs::EXTENT_SIZE;
+        use crate::segment::SEGMENT_INFO;
+        use crate::segment_store::SegmentStore;
+
+        const MIB: usize = 1024 * 1024;
+        const WANTED_BYTES: usize = 8 * MIB;
+        let mem = Arc::new(InMemory::new());
+        let codec = || FrameCodec::new(&[1; 32], SEGMENT_INFO, CompressionConfig::Lz4);
+        let writer = SegmentStore::new(mem.clone(), codec(), 5, None);
+        let mut seed = 0x6a09_e667_f3bc_c909u64;
+        let noise: Vec<u8> = (0..EXTENT_SIZE)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed as u8
+            })
+            .collect();
+        let wanted_frames = WANTED_BYTES / EXTENT_SIZE;
+        let frames: Vec<_> = (0..32 * MIB / EXTENT_SIZE)
+            .map(|index| {
+                let inode = if index < wanted_frames { 1 } else { 2 };
+                let extent = if inode == 1 {
+                    index
+                } else {
+                    index - wanted_frames
+                };
+                let mut bytes = noise.clone();
+                bytes[..8].copy_from_slice(&(index as u64).to_le_bytes());
+                (inode, extent as u64, Bytes::from(bytes))
+            })
+            .collect();
+        let locations = writer.seal(&frames).await.unwrap();
+        let object_size = mem
+            .head(&Path::from(locations[0].2.segid.object_key()))
+            .await
+            .unwrap()
+            .size;
+        let ranges = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let backend: Arc<dyn ObjectStore> = Arc::new(RangeRecordingStore {
+            inner: mem,
+            ranges: ranges.clone(),
+        });
+        let (cache, _dir) = store_over_with_tuning(backend, MIB, MIB, 32 * MIB).await;
+        let reader = SegmentStore::new(Arc::new(cache), codec(), 6, None);
+        let per_read = MIB / EXTENT_SIZE;
+
+        for start in (0..wanted_frames).step_by(per_read) {
+            let run = &locations[start..start + per_read];
+            let first = run[0].2;
+            let last = run.last().unwrap().2;
+            let slots: Vec<_> = run
+                .iter()
+                .map(|(inode, extent, _)| (*inode, *extent))
+                .collect();
+            let got = reader
+                .read_run(
+                    first.segid,
+                    first.byte_offset,
+                    (last.byte_offset + u64::from(last.byte_len) - first.byte_offset) as u32,
+                    first.frame_index,
+                    &slots,
+                )
+                .await
+                .unwrap();
+            for (index, bytes) in got.iter().enumerate() {
+                assert_eq!(bytes, &frames[start + index].2);
+            }
+        }
+        // Let any detached speculation reach the recording backend.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let last = locations[wanted_frames - 1].2;
+        let wanted_end = last.byte_offset + u64::from(last.byte_len);
+        let cache_aligned_end = wanted_end.next_multiple_of(MIB as u64);
+        let seen = ranges.lock().unwrap();
+        let fetched: u64 = seen
+            .iter()
+            .map(|range| match range {
+                GetRange::Bounded(range) => range.end.min(object_size).saturating_sub(range.start),
+                _ => panic!("segment reads must remain bounded: {range:?}"),
+            })
+            .sum();
+        eprintln!("mixed segment: {WANTED_BYTES} logical bytes, {fetched} backend range bytes");
+        assert!(
+            seen.iter().all(
+                |range| matches!(range, GetRange::Bounded(range) if range.end <= cache_aligned_end)
+            ),
+            "copying inode 1 fetched unrelated inode 2 beyond the final cache part: {seen:?}"
+        );
+        assert!(
+            fetched <= cache_aligned_end,
+            "overlapping frame reads fetched duplicate parts: {seen:?}"
+        );
     }
 
     #[tokio::test]

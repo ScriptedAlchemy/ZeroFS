@@ -21,9 +21,12 @@ use tokio::sync::Semaphore;
 use tracing::error;
 
 /// Logical (file-offset) read-ahead distance for a confirmed-sequential
-/// stream. Follows the file's extents across segments, which the physical
-/// (per-object) prefetcher can't do.
+/// stream. Follows only the file's extents, including within mixed-file
+/// segments, rather than speculating over unrelated physical frames.
 const READ_AHEAD_WINDOW_BYTES: u64 = 8 * 1024 * 1024;
+/// Independent ranges let one file use several remote sessions. The global
+/// semaphore bounds these individual ranges, not whole multi-range windows.
+const READ_AHEAD_CHUNK_BYTES: u64 = 1024 * 1024;
 /// Consecutive sequential reads before prefetch kicks in, so a one-off read
 /// doesn't drag in a whole window.
 const READ_AHEAD_MIN_SEQ: u32 = 2;
@@ -41,6 +44,11 @@ fn plan_read_ahead(
     length: u64,
 ) -> ((u64, u64, u32), Option<(u64, u64)>) {
     let read_end = offset + length;
+    // Concurrent NFS/9P replies can complete out of order. A nearby older
+    // completion must not move the forward stream back and erase its history.
+    if read_end <= last_end && last_end.saturating_sub(offset) <= READ_AHEAD_WINDOW_BYTES {
+        return ((last_end, prefetched_to, seq), None);
+    }
     // A jump starts a new (unconfirmed) sequence.
     if offset != last_end {
         return ((read_end, read_end, 1), None);
@@ -338,44 +346,37 @@ impl ExtentStore {
             self.read_ahead.insert(id, state);
             return None;
         };
-        // Skip when at the concurrency cap rather than queueing (read-ahead is
-        // best-effort). Coverage is committed only once the fetch is spawned:
-        // on a skip, `prefetched_to` stays at the true high-water mark
-        // (`start`), so the next read re-plans and re-tries the permit.
-        let Ok(permit) = Arc::clone(&self.prefetch_sem).try_acquire_owned() else {
-            let (read_end, _, seq) = state;
-            self.read_ahead.insert(id, (read_end, start, seq));
+        // Admit each range before spawning, without queueing behind the cap.
+        // Record only the prefix actually admitted so another read can retry
+        // the remainder. Sixteen permits bound speculation to sixteen 1 MiB
+        // logical ranges across all files, instead of sixteen 8 MiB windows.
+        let mut ranges = Vec::new();
+        let mut scheduled_to = start;
+        while scheduled_to < end {
+            let Ok(permit) = Arc::clone(&self.prefetch_sem).try_acquire_owned() else {
+                break;
+            };
+            let next = (scheduled_to + READ_AHEAD_CHUNK_BYTES).min(end);
+            ranges.push((scheduled_to, next, permit));
+            scheduled_to = next;
+        }
+        let (read_end, _, seq) = state;
+        self.read_ahead.insert(id, (read_end, scheduled_to, seq));
+        if ranges.is_empty() {
             return None;
-        };
-        self.read_ahead.insert(id, state);
+        }
         let this = self.clone();
-        let read_end = offset + length;
         Some(crate::task::spawn_named("read-ahead", async move {
-            let _permit = permit;
-            // Cross-segment only: within one segment the per-object prefetcher
-            // already reads ahead, and a second interleaved stream would
-            // fragment its window ramp into tiny GETs. Prefetch only when the
-            // window reaches a segment it can't follow into.
-            let cur_ext = read_end.saturating_sub(1) / EXTENT_SIZE as u64;
-            let tgt_ext = end.saturating_sub(1) / EXTENT_SIZE as u64;
-            let cur_seg = this.segment_at(id, cur_ext).await;
-            if cur_seg.is_some() && cur_seg == this.segment_at(id, tgt_ext).await {
-                return;
-            }
-            let _ = this.read_range(id, start, end - start, false).await;
+            futures::stream::iter(ranges)
+                .for_each_concurrent(READ_AHEAD_MAX_CONCURRENT, |(start, end, permit)| {
+                    let this = this.clone();
+                    async move {
+                        let _permit = permit;
+                        let _ = this.read_range(id, start, end - start, false).await;
+                    }
+                })
+                .await;
         }))
-    }
-
-    /// The segment an extent's current frame lives in, or `None` for a hole.
-    async fn segment_at(&self, id: InodeId, extent: u64) -> Option<Segid> {
-        self.extent_location_cache
-            .get_or_load((id, extent), || self.load_extent_location(id, extent))
-            .await
-            .ok()
-            .and_then(|location| match location {
-                CachedExtentLocation::Hole => None,
-                CachedExtentLocation::Frame(loc) => Some(loc.segid),
-            })
     }
 
     /// A byte-range read with no read-ahead side effect (the raw path; also what
