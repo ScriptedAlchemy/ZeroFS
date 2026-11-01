@@ -3806,6 +3806,47 @@ interval_secs = 0o144 # unrelated
                     self.assertEqual(parsed["gc"][key], 3600)
                 self.assertEqual(parsed["other]#section"]["interval_secs"], 90)
 
+    def test_maintenance_rewrite_ignores_multiline_string_headers(self) -> None:
+        basic = "\n".join(
+            (
+                "[gc]",
+                'notes = """',
+                "This is prose, not a table:",
+                "[writeback]",
+                '"""',
+                "interval_secs = 60",
+                "idle_interval_secs = 5",
+                "busy_backlog_interval_secs = 15",
+                "[writeback]",
+                "interval_secs = 90",
+            )
+        ) + "\n"
+        rewritten = profile_module.rewrite_gc_cadence(basic, 3600)
+        self.assertIn('notes = """\nThis is prose, not a table:\n[writeback]\n"""', rewritten)
+        self.assertEqual(tomllib.loads(rewritten)["writeback"]["interval_secs"], 90)
+        for key in profile_module._GC_CADENCE_KEYS:
+            self.assertEqual(tomllib.loads(rewritten)["gc"][key], 3600)
+
+        literal = "\n".join(
+            (
+                "[storage]",
+                "notes = '''",
+                "[gc]",
+                "'''",
+                "[gc]",
+                "comment = '\"\"\" is quoted, not a multiline opener'",
+                "interval_secs = 60",
+            )
+        ) + "\n"
+        rewritten = profile_module.rewrite_gc_cadence(literal, 3600)
+        parsed = tomllib.loads(rewritten)
+        self.assertEqual(parsed["storage"]["notes"], "[gc]\n")
+        self.assertEqual(
+            parsed["gc"]["comment"], '""" is quoted, not a multiline opener'
+        )
+        for key in profile_module._GC_CADENCE_KEYS:
+            self.assertEqual(parsed["gc"][key], 3600)
+
     def test_maintenance_rewrite_appends_a_missing_gc_section(self) -> None:
         source = '[storage]\nurl = "sftp://pilot@example.test:23/data"'
 
