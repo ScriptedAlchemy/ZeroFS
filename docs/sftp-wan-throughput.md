@@ -26,6 +26,15 @@ limit. The upstream/downstream gap alone does not prove that every extra byte
 is wasted: it can also include useful cache filling, protocol traffic, and
 differences between measurement intervals.
 
+A later operator update reports ten active Hetzner connections and about
+37 MB/s at the destination soon after restarting copies whose earlier reads
+may still be cached. That is an early, potentially warm measurement. The
+operator's expected 16–18 MB/s after the cache runs out is a forecast, not a
+measured cold-read result. The running binary revision remains unverified
+here. With all ten account slots occupied, an additional SFTP benchmark must
+wait for capacity; the eight-production-plus-two-test example below does not
+apply to that live configuration.
+
 ## Transport and application windows
 
 ZeroFS already configures a 16 MiB SSH receive window. SFTP READ requests are
@@ -189,6 +198,41 @@ the operator's live upstream/downstream gap it explains.
 ```console
 cargo test --locked --no-default-features --lib \
   object_store_prefetch::tests::segment_reads_do_not_speculate_into_unrelated_file_frames \
+  -- --exact --nocapture
+```
+
+## Keep the valid bytes when a cache range crosses EOF
+
+Cold cache ranges are aligned before the object's length is known. The SFTP
+reader overlaps the payload request with the header and FSTAT requests. If
+the aligned range crosses EOF, the old exact-read pipeline failed after
+receiving part or all of the valid prefix. Once the header clipped the range,
+`read_object` downloaded that prefix again.
+
+A regression over a real local SSH/SFTP connection reproduced this duplicate
+transfer. Reading a 720,913-byte suffix of a valid object transferred
+1,441,858 SFTP DATA bytes: twice the useful payload plus the 32-byte internal
+header. The repaired path transfers 720,945 DATA bytes: the payload once plus
+the header. It checks identical patterned contents with both full-sized and
+32 KiB server replies. These totals exclude SSH/SFTP framing and are specific
+to this clipped-range case, not a claim of halving all backend traffic or
+doubling deployed copy speed.
+
+Speculative reads now retain the complete prefix before an explicit SFTP EOF
+status. They drain already-issued requests, finish missing earlier ranges,
+and validate the byte count against the same open handle's header and FSTAT.
+Empty DATA replies, data beyond an earlier EOF, truncated objects, and other
+errors still fail. Exact reads still require their full length. A logical
+bound that would overflow after adding the internal header waits for metadata
+to clip it before issuing payload requests. EOF tails do not update the
+session's learned reply-size hint.
+
+The protocol distinction between DATA and EOF is described in the
+[SFTP v3 protocol draft, section 6.4](https://datatracker.ietf.org/doc/html/draft-ietf-secsh-filexfer-02#section-6.4).
+
+```console
+cargo test --locked --no-default-features --lib \
+  russh_session::tests::russh_clipped_object_range_does_not_download_the_payload_twice \
   -- --exact --nocapture
 ```
 

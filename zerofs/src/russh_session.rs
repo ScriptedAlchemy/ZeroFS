@@ -1155,6 +1155,110 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
         session.close(CancellationToken::new()).await.unwrap();
     }
 
+    #[tokio::test]
+    async fn russh_clipped_object_range_does_not_download_the_payload_twice() {
+        use crate::sftp_object_store::{OBJECT_HEADER_LEN, ObjectHeader, encode_header};
+
+        for read_cap in [None, Some(32 * 1024)] {
+            let env = Loopback::start_with_read_cap(read_cap).await;
+            let factory = RusshSessionFactory::new(
+                env.endpoint.clone(),
+                env.identity.clone(),
+                env.known_hosts.clone(),
+            )
+            .unwrap();
+            let session = factory.open(CancellationToken::new()).await.unwrap();
+            let payload = Bytes::from(
+                (0..768 * 1024 + 17)
+                    .map(|offset| ((offset * 31 + offset / 257) % 251) as u8)
+                    .collect::<Vec<_>>(),
+            );
+            let header = ObjectHeader {
+                generation: uuid::Uuid::new_v4(),
+                logical_len: payload.len() as u64,
+            };
+            let path = Path::new("clipped-object.bin");
+            session
+                .write_file_durable(
+                    path,
+                    vec![
+                        Bytes::copy_from_slice(&encode_header(header)),
+                        payload.clone(),
+                    ],
+                )
+                .await
+                .unwrap();
+            let start = 64 * 1024;
+            for requested_end in [2 * 1024 * 1024, u64::MAX] {
+                env.read_bytes.store(0, Ordering::SeqCst);
+                let object = session
+                    .read_object(
+                        path,
+                        Some(object_store::GetRange::Bounded(start as u64..requested_end)),
+                        false,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(object.header, header);
+                assert_eq!(object.range, start as u64..payload.len() as u64);
+                assert_eq!(object.payload, payload.slice(start..));
+                assert_eq!(env.open_handles.load(Ordering::SeqCst), 0);
+                assert_eq!(
+                    env.read_bytes.load(Ordering::SeqCst),
+                    OBJECT_HEADER_LEN + payload.len() - start,
+                    "a range crossing EOF must transfer each payload byte only once (reply cap {read_cap:?}, requested end {requested_end})"
+                );
+            }
+            session.close(CancellationToken::new()).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn russh_speculative_eof_does_not_hide_truncated_objects_or_exact_reads() {
+        use crate::sftp_object_store::{ObjectHeader, encode_header};
+
+        let env = Loopback::start().await;
+        let factory = RusshSessionFactory::new(
+            env.endpoint.clone(),
+            env.identity.clone(),
+            env.known_hosts.clone(),
+        )
+        .unwrap();
+        let session = factory.open(CancellationToken::new()).await.unwrap();
+        let path = Path::new("truncated-object.bin");
+        let header = ObjectHeader {
+            generation: uuid::Uuid::new_v4(),
+            logical_len: 4096,
+        };
+        session
+            .write_file_durable(
+                path,
+                vec![
+                    Bytes::copy_from_slice(&encode_header(header)),
+                    Bytes::from(vec![42; 1024]),
+                ],
+            )
+            .await
+            .unwrap();
+        let error = session
+            .read_object(path, Some(object_store::GetRange::Bounded(0..8192)), false)
+            .await
+            .expect_err("EOF cannot make a truncated object valid");
+        assert!(
+            matches!(error, TransportError::CorruptObject(_)),
+            "{error:?}"
+        );
+        assert_eq!(env.open_handles.load(Ordering::SeqCst), 0);
+
+        let error = session
+            .read_exact(path, 0, 8192)
+            .await
+            .expect_err("non-speculative reads still require every requested byte");
+        assert!(matches!(error, TransportError::Operation(_)), "{error:?}");
+        assert_eq!(env.open_handles.load(Ordering::SeqCst), 0);
+        session.close(CancellationToken::new()).await.unwrap();
+    }
+
     struct Loopback {
         _root: tempfile::TempDir,
         endpoint: crate::config::SftpEndpoint,
@@ -1165,6 +1269,7 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
         exec_requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         active_connections: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         open_handles: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        read_bytes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         stall_next_handshake: Arc<std::sync::atomic::AtomicBool>,
     }
 
@@ -1219,6 +1324,7 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
             let exec_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let active_connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let open_handles = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let read_bytes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let stall_next_handshake = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1266,6 +1372,7 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
                 exec_requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
                 active_connections: std::sync::Arc<std::sync::atomic::AtomicUsize>,
                 open_handles: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+                read_bytes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
             }
 
             struct SshSession {
@@ -1352,6 +1459,7 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
                         inflight: self.state.inflight.clone(),
                         peak: self.state.peak.clone(),
                         open_handles: self.state.open_handles.clone(),
+                        read_bytes: self.state.read_bytes.clone(),
                     };
                     // Drive SFTP off the russh session task so SSH packets
                     // keep flowing into ChannelStream.
@@ -1382,6 +1490,7 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
                 exec_requests: exec_requests.clone(),
                 active_connections: active_connections.clone(),
                 open_handles: open_handles.clone(),
+                read_bytes: read_bytes.clone(),
             };
             let stall_handshake = stall_next_handshake.clone();
             tokio::spawn(async move {
@@ -1425,6 +1534,7 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
                 exec_requests,
                 active_connections,
                 open_handles,
+                read_bytes,
                 stall_next_handshake,
             }
         }
@@ -1445,6 +1555,7 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
         inflight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         peak: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         open_handles: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        read_bytes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl FsSftp {
@@ -1574,6 +1685,10 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
             let requested = usize::try_from(len).map_err(|_| StatusCode::Failure)?;
             let mut buf = vec![0; self.read_cap.map_or(requested, |cap| requested.min(cap))];
             let n = file.read(&mut buf).map_err(|_| StatusCode::Failure)?;
+            if n == 0 {
+                return Err(StatusCode::Eof);
+            }
+            self.read_bytes.fetch_add(n, Ordering::SeqCst);
             buf.truncate(n);
             Ok(russh_sftp::protocol::Data { id, data: buf })
         }

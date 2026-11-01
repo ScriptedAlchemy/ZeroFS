@@ -799,6 +799,75 @@ where
     F: Fn(u64, usize) -> Fut,
     Fut: std::future::Future<Output = Result<Bytes, TransportError>>,
 {
+    read_chunks_up_to(
+        path,
+        offset,
+        len,
+        maximum_packet_size,
+        read_packets,
+        |offset, len| {
+            let response = read(offset, len);
+            async move { response.await.map(Some) }
+        },
+    )
+    .await
+}
+
+/// Read a speculative bounded range without losing its valid prefix at EOF.
+/// Only an explicit SFTP EOF status permits a shorter result. The caller must
+/// validate its length against metadata from the same open object handle.
+async fn read_handle_up_to(
+    sftp: &RawSftpSession,
+    handle: &str,
+    path: &Path,
+    offset: u64,
+    len: usize,
+    limits: SftpLimits,
+    read_packets: &ReadPacketSizing,
+) -> Result<Bytes, TransportError> {
+    let packet_size = transfer_request_len(
+        SFTP_READ_PACKET_SIZE,
+        limits.read_len,
+        limits.packet_len,
+        handle.len(),
+    )?;
+    read_chunks_up_to(
+        path,
+        offset,
+        len,
+        packet_size,
+        read_packets,
+        |offset, len| async move {
+            match sftp.read(handle, offset, len as u32).await {
+                Ok(data) => Ok(Some(Bytes::from(data.data))),
+                Err(russh_sftp::client::error::Error::Status(status))
+                    if status.status_code == StatusCode::Eof =>
+                {
+                    Ok(None)
+                }
+                Err(error) => Err(TransportError::Operation(format!(
+                    "short read from {} at {}: {error}",
+                    path.display(),
+                    offset
+                ))),
+            }
+        },
+    )
+    .await
+}
+
+async fn read_chunks_up_to<F, Fut>(
+    path: &Path,
+    offset: u64,
+    len: usize,
+    maximum_packet_size: usize,
+    read_packets: &ReadPacketSizing,
+    read: F,
+) -> Result<Bytes, TransportError>
+where
+    F: Fn(u64, usize) -> Fut,
+    Fut: std::future::Future<Output = Result<Option<Bytes>, TransportError>>,
+{
     // Plan/validate the entire range before allocating or sending any request.
     let packet_plan = read_packets.plan(maximum_packet_size, len);
     let mut packet_size = packet_plan.packet_size;
@@ -808,6 +877,10 @@ where
     let mut pending = futures::stream::FuturesUnordered::new();
     let mut pending_bytes = 0;
     let mut reply_shape = ReadReplyShape::default();
+    let requested_end = offset + len as u64; // Validated by the plan above.
+    let mut covered_end = requested_end;
+    let mut received_total = 0;
+    let mut greatest_data_end = offset;
     loop {
         while pending.len() < SFTP_READ_REQUEST_CONCURRENCY
             && pending_bytes < SFTP_READ_MAX_INFLIGHT_BYTES
@@ -815,6 +888,10 @@ where
             let Some(mut request) = queued.pop_front() else {
                 break;
             };
+            if request.offset >= covered_end {
+                continue;
+            }
+            request.len = request.len.min((covered_end - request.offset) as usize);
             let request_size = packet_size.min(SFTP_READ_MAX_INFLIGHT_BYTES - pending_bytes);
             if request.len > request_size {
                 queued.push_front(PipelinedRead {
@@ -833,6 +910,19 @@ where
         };
         let (request, bytes) = response?;
         pending_bytes -= request.len;
+        let Some(bytes) = bytes else {
+            // EOF may arrive before earlier DATA replies. Stop issuing work
+            // beyond this bound, but drain every already-issued request and
+            // finish all missing ranges below it before returning the prefix.
+            covered_end = covered_end.min(request.offset);
+            if greatest_data_end > covered_end {
+                return Err(TransportError::Operation(format!(
+                    "inconsistent EOF from {} at {covered_end}",
+                    path.display()
+                )));
+            }
+            continue;
+        };
         let received = bytes.len();
         if received == 0 || received > request.len {
             return Err(TransportError::Operation(format!(
@@ -842,6 +932,15 @@ where
                 request.len
             )));
         }
+        let data_end = request.offset + received as u64;
+        if data_end > covered_end {
+            return Err(TransportError::Operation(format!(
+                "data beyond EOF from {} at {covered_end}",
+                path.display()
+            )));
+        }
+        greatest_data_end = greatest_data_end.max(data_end);
+        received_total += received;
         reply_shape.observe(request.len, received);
         // Every queued range is a disjoint subrange of the validated plan.
         // Copy by offset so out-of-order replies never hold up slot refills.
@@ -859,7 +958,18 @@ where
             });
         }
     }
-    read_packets.completed(packet_plan, reply_shape);
+    let covered_len = (covered_end - offset) as usize;
+    if received_total != covered_len {
+        return Err(TransportError::Operation(format!(
+            "incomplete read from {}: received {received_total} of {covered_len} bytes",
+            path.display()
+        )));
+    }
+    // An EOF tail is not evidence of a stable server reply-size cap.
+    if covered_end == requested_end {
+        read_packets.completed(packet_plan, reply_shape);
+    }
+    buffer.truncate(covered_len);
     Ok(buffer.freeze())
 }
 
@@ -904,17 +1014,19 @@ impl TransportSession for SftpProtocolSession {
                 usize::try_from(range.end - range.start)
                     .ok()
                     .and_then(|len| {
-                        (OBJECT_HEADER_LEN as u64)
-                            .checked_add(range.start)
-                            .map(|physical_start| (range.clone(), physical_start, len))
+                        // A valid logical bound may exceed the object's EOF
+                        // and overflow after adding the internal header. In
+                        // that case, wait for metadata to clip the range.
+                        (OBJECT_HEADER_LEN as u64).checked_add(range.end)?;
+                        Some((OBJECT_HEADER_LEN as u64 + range.start, len))
                     })
             }
             _ => None,
             };
             let speculative_payload = async {
             match &speculative_range {
-                Some((_, physical_start, len)) => Some(
-                    read_handle_pipelined(sftp, &handle, path, *physical_start, *len, self.limits, &self.read_packets)
+                Some((physical_start, len)) => Some(
+                    read_handle_up_to(sftp, &handle, path, *physical_start, *len, self.limits, &self.read_packets)
                         .await,
                 ),
                 None => None,
@@ -969,11 +1081,20 @@ impl TransportSession for SftpProtocolSession {
             };
             let payload = if head || range.is_empty() {
             Bytes::new()
-        } else if let (Some(result), Some((requested, _, _))) =
-            (speculative_payload, &speculative_range)
-            && *requested == range
-        {
-                result?
+        } else if let Some(result) = speculative_payload {
+            // Bounded GetRange clips only its end. Retain the bytes already
+            // received when that end crossed EOF instead of downloading the
+            // valid range a second time. A premature EOF still fails closed.
+            let payload = result?;
+            if payload.len() as u64 != range.end - range.start {
+                return Err(TransportError::Operation(format!(
+                    "short read from {}: received {} of {} bytes",
+                    path.display(),
+                    payload.len(),
+                    range.end - range.start
+                )));
+            }
+            payload
         } else {
             let physical_start = (OBJECT_HEADER_LEN as u64)
                 .checked_add(range.start)
@@ -1670,6 +1791,97 @@ mod tests {
             0,
             4096,
             4096,
+            &ReadPacketSizing::default(),
+            |_, _| std::future::ready(Err(TransportError::PermissionDenied("denied".to_owned()))),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, TransportError::PermissionDenied(_)),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn eof_before_earlier_short_replies_preserves_the_complete_prefix() {
+        use std::time::Duration;
+
+        let offset = 37;
+        let payload_len = 6 * 32 * 1024 + 17;
+        let eof = offset + payload_len as u64;
+        let transferred = AtomicUsize::new(0);
+        let read_packets = ReadPacketSizing::default();
+        let bytes = read_chunks_up_to(
+            Path::new("clipped-range"),
+            offset,
+            512 * 1024,
+            64 * 1024,
+            &read_packets,
+            |at, requested| {
+                let transferred = &transferred;
+                async move {
+                    if at >= eof {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                        return Ok(None);
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    let len = requested.min(32 * 1024).min((eof - at) as usize);
+                    transferred.fetch_add(len, Ordering::SeqCst);
+                    Ok(Some(read_pattern(at, len)))
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(bytes, read_pattern(offset, payload_len));
+        assert_eq!(transferred.load(Ordering::SeqCst), payload_len);
+        assert_eq!(read_packets.reply_limit.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn speculative_read_rejects_data_beyond_eof_in_either_reply_order() {
+        use std::time::Duration;
+
+        for eof_first in [false, true] {
+            let error = read_chunks_up_to(
+                Path::new("inconsistent-eof"),
+                0,
+                8,
+                4,
+                &ReadPacketSizing::default(),
+                |offset, len| async move {
+                    let is_eof = offset == 0;
+                    let delay = if is_eof == eof_first { 1 } else { 2 };
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                    Ok((!is_eof).then(|| read_pattern(offset, len)))
+                },
+            )
+            .await
+            .expect_err("EOF must not conceal a hole before later data");
+            assert!(matches!(error, TransportError::Operation(_)), "{error:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn speculative_read_accepts_only_explicit_eof_and_preserves_errors() {
+        for reply_len in [0, 5] {
+            let error = read_chunks_up_to(
+                Path::new("invalid-speculative-reply"),
+                0,
+                4,
+                4,
+                &ReadPacketSizing::default(),
+                |_, _| std::future::ready(Ok(Some(Bytes::from(vec![0; reply_len])))),
+            )
+            .await
+            .expect_err("empty and oversized DATA are errors, not EOF");
+            assert!(matches!(error, TransportError::Operation(_)), "{error:?}");
+        }
+        let error = read_chunks_up_to(
+            Path::new("denied-speculative-reply"),
+            0,
+            4,
+            4,
             &ReadPacketSizing::default(),
             |_, _| std::future::ready(Err(TransportError::PermissionDenied("denied".to_owned()))),
         )
