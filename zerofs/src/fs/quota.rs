@@ -66,7 +66,10 @@ pub(crate) struct ProvisionalQuotaReservation {
 /// Dropping a caller must neither refund queued growth nor lose a reclaim.
 pub(crate) enum QuotaSettlement {
     Growth(ProvisionalQuotaReservation),
-    Shrink { quota: Arc<LogicalQuota>, bytes: u64 },
+    Shrink {
+        quota: Arc<LogicalQuota>,
+        bytes: u64,
+    },
 }
 
 impl QuotaSettlement {
