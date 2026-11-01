@@ -980,7 +980,12 @@ impl SftpObjectStore {
     }
 
     fn remember_missing(&self, location: &ObjectPath, observed_epoch: u64) {
-        remember_missing_if_current(&self.known_missing, &self.miss_epoch, location, observed_epoch);
+        remember_missing_if_current(
+            &self.known_missing,
+            &self.miss_epoch,
+            location,
+            observed_epoch,
+        );
     }
 
     fn mutation_guard(&self, location: &ObjectPath) -> MissingCacheMutationGuard {
