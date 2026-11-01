@@ -239,7 +239,10 @@ def rewrite_gc_cadence(text: str, interval_secs: int) -> str:
     gc_header: int | None = None
     replaced: set[str] = set()
     assignments = {
-        key: re.compile(rf"^(\s*{re.escape(key)}\s*=\s*)(?:0[xX][0-9A-Fa-f_]+|0[oO][0-7_]+|0[bB][01_]+|[+-]?[0-9][0-9_]*)(\s*(?:#.*)?(?:\r?\n)?)$")
+        key: re.compile(
+            rf"""^(\s*(?:{re.escape(key)}|"{re.escape(key)}"|'{re.escape(key)}')\s*=\s*)"""
+            rf"(?:0[xX][0-9A-Fa-f_]+|0[oO][0-7_]+|0[bB][01_]+|[+-]?[0-9][0-9_]*)(\s*(?:#.*)?(?:\r?\n)?)$"
+        )
         for key in _GC_CADENCE_KEYS
     }
     for index, line in enumerate(lines):
@@ -271,6 +274,9 @@ def rewrite_gc_cadence(text: str, interval_secs: int) -> str:
             if key in missing
         ]
         if gc_header is not None:
+            # A final [gc] header is valid TOML without a trailing newline.
+            if not lines[gc_header].endswith("\n"):
+                lines[gc_header] += newline
             lines[gc_header + 1 : gc_header + 1] = additions
         else:
             if text.endswith(newline * 2):

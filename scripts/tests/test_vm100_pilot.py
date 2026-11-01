@@ -3757,6 +3757,40 @@ interval_secs = 0o144 # unrelated value must remain unchanged
         self.assertEqual(parsed["gc"]["busy_backlog_interval_secs"], 3600)
         self.assertEqual(parsed["writeback"]["interval_secs"], 100)
 
+    def test_maintenance_rewrite_handles_gc_header_without_newline(self) -> None:
+        for source in ("[gc]", "[gc] # annotated header ]"):
+            with self.subTest(source=source):
+                rewritten = profile_module.rewrite_gc_cadence(source, 3600)
+                self.assertTrue(rewritten.startswith(source + "\n"))
+                self.assertEqual(rewritten.count("[gc]"), 1)
+                gc = tomllib.loads(rewritten)["gc"]
+                for key in profile_module._GC_CADENCE_KEYS:
+                    self.assertEqual(gc[key], 3600)
+
+    def test_maintenance_rewrite_preserves_quoted_gc_keys(self) -> None:
+        source = """[gc]
+"interval_secs" = 0x10 # preserve this comment
+'idle_interval_secs' = +1_000
+busy_backlog_interval_secs = 23
+
+[writeback]
+interval_secs = 0o144 # unrelated
+"""
+        rewritten = profile_module.rewrite_gc_cadence(source, 3600)
+        self.assertEqual(
+            rewritten,
+            source.replace("0x10 # preserve", "3600 # preserve")
+            .replace("+1_000", "3600")
+            .replace(
+                "busy_backlog_interval_secs = 23",
+                "busy_backlog_interval_secs = 3600",
+            ),
+        )
+        parsed = tomllib.loads(rewritten)
+        for key in profile_module._GC_CADENCE_KEYS:
+            self.assertEqual(parsed["gc"][key], 3600)
+        self.assertEqual(parsed["writeback"]["interval_secs"], 100)
+
     def test_maintenance_rewrite_appends_a_missing_gc_section(self) -> None:
         source = '[storage]\nurl = "sftp://pilot@example.test:23/data"'
 
