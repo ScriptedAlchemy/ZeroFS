@@ -48,6 +48,10 @@ const SEQUENTIAL_FETCH_WINDOW_MULTIPLIER: usize = 4;
 /// Look-ahead horizon for a proven sequential stream. Each window remains a
 /// separate backend GET so SFTP can use several physical sessions at once.
 const PREFETCH_DEPTH_WINDOWS: usize = 8;
+/// Poll several required cache parts while preserving their output order.
+/// A join on an earlier in-flight window must not serialize independent
+/// missing gaps later in the same read. Backend admission still applies.
+const PART_READ_CONCURRENCY: usize = 8;
 
 /// Resolved cold-read geometry for one backend. `Default` is the tuning used by
 /// every backend that does not publish a profile of its own.
@@ -1116,7 +1120,9 @@ impl PrefetchingObjectStore {
                 )
             })
             .collect::<Vec<_>>();
-        let result_stream = stream::iter(futures).then(|fut| fut).boxed();
+        let result_stream = stream::iter(futures)
+            .buffered(PART_READ_CONCURRENCY)
+            .boxed();
 
         Ok(GetResult {
             meta,
@@ -2655,6 +2661,153 @@ mod tests {
                 .unwrap()
                 .as_ref(),
             &payload[31 * MIB..]
+        );
+    }
+
+    #[tokio::test]
+    async fn demand_read_starts_missing_tail_while_joined_prefix_is_pending() {
+        const MIB: usize = 1024 * 1024;
+        let inner = Arc::new(InMemory::new());
+        let path = Path::from("segments/joined-prefix-missing-tail");
+        let payload: Vec<u8> = (0..3 * MIB)
+            .map(|i| ((i * 17 + i / 251) % 253) as u8)
+            .collect();
+        inner.put(&path, payload.clone().into()).await.unwrap();
+        let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
+        let gate = Arc::new(WindowGate {
+            slots: tokio::sync::Semaphore::new(8),
+            release: tokio::sync::Semaphore::new(0),
+            started,
+        });
+        let ranges = Arc::new(Mutex::new(Vec::new()));
+        let backend = Arc::new(WindowGatedStore {
+            inner,
+            ranges: Arc::clone(&ranges),
+            gate: Arc::clone(&gate),
+        });
+        let (store, _dir) = store_over_with_tuning(backend, MIB, MIB, 8 * MIB).await;
+        let range_only = |range| {
+            let mut opts = GetOptions {
+                range: Some(GetRange::Bounded(range)),
+                ..Default::default()
+            };
+            opts.extensions.insert(CacheRangeOnly);
+            opts
+        };
+        store
+            .get_opts(&path, range_only(0..1))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        store.spawn_async_prefetch(
+            &path,
+            &cached_generation(&store, &path),
+            AsyncPrefetch {
+                start: MIB as u64,
+                size: MIB,
+            },
+            0,
+        );
+        let prefix = tokio::time::timeout(std::time::Duration::from_secs(2), starts.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(prefix, MIB as u64..2 * MIB as u64);
+
+        let requested = MIB as u64 + 17..3 * MIB as u64 - 29;
+        let result = store
+            .get_opts(&path, range_only(requested.clone()))
+            .await
+            .unwrap();
+        let reader = tokio::spawn(async move { result.bytes().await });
+        let tail = tokio::time::timeout(std::time::Duration::from_secs(2), starts.recv()).await;
+        // Release and join on both success and the old serial-path failure so
+        // the regression never strands a background fetch or a cache handle.
+        gate.release.add_permits(8);
+        let got = reader.await.unwrap().unwrap();
+        assert_eq!(
+            got.as_ref(),
+            &payload[requested.start as usize..requested.end as usize]
+        );
+        assert_eq!(
+            tail.expect("missing tail waited for the unrelated in-flight prefix to finish")
+                .unwrap(),
+            2 * MIB as u64..3 * MIB as u64
+        );
+        assert_eq!(
+            ranges.lock().unwrap().as_slice(),
+            &[
+                0..MIB as u64,
+                MIB as u64..2 * MIB as u64,
+                2 * MIB as u64..3 * MIB as u64
+            ],
+            "the needed tail must start early without duplicating the prefix or fetching outside the range"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_multi_part_read_releases_all_missing_range_fetches() {
+        const PART: usize = 64 * 1024;
+        let inner = Arc::new(InMemory::new());
+        let path = Path::from("segments/cancel-missing-ranges");
+        let payload = Bytes::from(vec![0x5a; 4 * PART]);
+        inner.put(&path, payload.clone().into()).await.unwrap();
+        let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
+        let gate = Arc::new(WindowGate {
+            slots: tokio::sync::Semaphore::new(8),
+            release: tokio::sync::Semaphore::new(0),
+            started,
+        });
+        let ranges = Arc::new(Mutex::new(Vec::new()));
+        let backend = Arc::new(WindowGatedStore {
+            inner: Arc::clone(&inner),
+            ranges: Arc::clone(&ranges),
+            gate: Arc::clone(&gate),
+        });
+        let (store, _dir) = store_over_with_tuning(backend, PART, PART, 8 * PART).await;
+        let meta = inner.head(&path).await.unwrap();
+        store.save_head(&path, &meta, &Attributes::default());
+        let generation = cached_generation(&store, &path);
+        store.admit_part(
+            &path,
+            &generation,
+            2,
+            Bytes::copy_from_slice(&payload[2 * PART..3 * PART]),
+        );
+        let mut opts = GetOptions {
+            range: Some(GetRange::Bounded(PART as u64..4 * PART as u64)),
+            ..Default::default()
+        };
+        opts.extensions.insert(CacheRangeOnly);
+        let result = store.get_opts(&path, opts).await.unwrap();
+        let reader = tokio::spawn(async move { result.bytes().await });
+        let started = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let first = starts.recv().await.unwrap();
+            let second = starts.recv().await.unwrap();
+            [first, second]
+        })
+        .await;
+        reader.abort();
+        assert!(reader.await.unwrap_err().is_cancelled());
+        assert!(
+            store.fetches.lock().unwrap().is_empty(),
+            "cancelled reads stranded shared fetch entries"
+        );
+        assert_eq!(
+            gate.slots.available_permits(),
+            8,
+            "cancelled reads retained backend slots"
+        );
+        let mut started = Vec::from(started.expect("independent cache gaps were serialized"));
+        started.sort_unstable_by_key(|r| r.start);
+        assert_eq!(
+            started,
+            vec![
+                PART as u64..2 * PART as u64,
+                3 * PART as u64..4 * PART as u64
+            ]
         );
     }
 

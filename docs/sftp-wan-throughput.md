@@ -26,14 +26,16 @@ limit. The upstream/downstream gap alone does not prove that every extra byte
 is wasted: it can also include useful cache filling, protocol traffic, and
 differences between measurement intervals.
 
-A later operator update reports ten active Hetzner connections and about
-37 MB/s at the destination soon after restarting copies whose earlier reads
-may still be cached. That is an early, potentially warm measurement. The
-operator's expected 16–18 MB/s after the cache runs out is a forecast, not a
-measured cold-read result. The running binary revision remains unverified
-here. With all ten account slots occupied, an additional SFTP benchmark must
-wait for capacity; the eight-production-plus-two-test example below does not
-apply to that live configuration.
+The latest operator update reports that ten open Hetzner connections and four
+concurrent NFS copies settled back to about **13 MB/s at the destination**.
+The earlier 37 MB/s burst was attributed to cached data; the forecast of
+16–18 MB/s did not materialize. Increasing the pool from eight to ten therefore
+did not produce a reported sustained improvement. Open connections alone do
+not establish active request concurrency, or distinguish scheduling gaps from
+a shared backend limit. The running binary revision remains unverified here.
+With all ten account slots occupied, an additional SFTP benchmark must wait
+for capacity; the eight-production-plus-two-test example below does not apply
+to that live configuration.
 
 ## Transport and application windows
 
@@ -233,6 +235,38 @@ The protocol distinction between DATA and EOF is described in the
 ```console
 cargo test --locked --no-default-features --lib \
   russh_session::tests::russh_clipped_object_range_does_not_download_the_payload_twice \
+  -- --exact --nocapture
+```
+
+## Start independent missing cache parts while earlier parts are pending
+
+The logical read-ahead window already covers 8 MiB. The cache's result stream
+had a separate serialization point: it polled one part at a time. If the first
+part joined an existing pending fetch, the next missing part did not start
+until that earlier fetch completed, even when backend capacity was available.
+Adjacent logical ranges can share a cache part at an encoded-frame boundary,
+so this dependency can arise within otherwise parallel file-aware reads.
+
+The stream now polls up to eight part reads concurrently and returns their
+bytes in order. Each part still uses the common range registry: it joins a
+covering fetch, trims around cached/in-flight coverage, or leads only a missing
+gap. A contiguous cold range can still coalesce into one backend GET. This
+starts useful missing data earlier without increasing the 8 MiB logical
+look-ahead distance or the physical SFTP connection limit.
+
+The regression holds an existing prefix fetch open, requests a range spanning
+that prefix and a missing tail, and requires the tail GET to start before the
+prefix is released. The previous serial stream fails this barrier. The
+parallel stream passes, checks the complete patterned output, and verifies
+that each backend range was fetched once with no out-of-range speculation.
+A cancellation regression holds two missing gaps around a cached part and
+checks that dropping the read releases both backend slots and every registered
+fetch. These are local scheduling and integrity checks, not a live copy-rate
+measurement.
+
+```console
+cargo test --locked --no-default-features --lib \
+  object_store_prefetch::tests::demand_read_starts_missing_tail_while_joined_prefix_is_pending \
   -- --exact --nocapture
 ```
 
