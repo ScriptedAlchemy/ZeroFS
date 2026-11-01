@@ -513,6 +513,59 @@ trial still requires its command and trace. A CLI download writes to a
 temporary sibling and publishes the final destination only after completion,
 so measurement must include the temporary file or actual device writes.
 
+## Overlap CLI upload reads with ready p9 writes
+
+The upload stream queued positioned writes in `FuturesUnordered`, then awaited
+the next local `read_exact`. Queuing a future does not start it: writes were
+only polled when all source buffers were occupied or the source loop finished.
+A slow next disk read could therefore leave an already filled chunk waiting
+instead of sending it to ZeroFS.
+
+The stream now polls queued writes alongside each local read. It keeps the
+same `read_exact` future pinned while write completions are processed; starting
+that read over after partially consuming the source would skip bytes. The
+existing two writes per connection and two connections per upload worker still
+bound buffering. There is no background producer or additional transfer
+connection. File sync, rename, and the post-rename filesystem sync retain their
+existing order.
+
+The regression uses a real local p9 client/server and an `AsyncRead` source
+held 17 bytes into its second chunk. The first chunk must be acknowledged and
+counted in the active file's progress while that source gate remains closed.
+After the gate opens, the complete patterned file must match exactly. Separate
+cancellation and source-error cases hold a dispatched server write, stop the
+partially completed local read, and require the uploader to settle the write
+before returning. The incomplete next chunk must never be submitted.
+
+## Start independent CLI worker connections together
+
+Worker setup previously completed each p9 handshake before starting the next.
+Uploads use two client connections per worker, so a four-file upload incurred
+seven additional serial handshakes after its initial connection. Downloads
+used the same serial setup helper.
+
+Setup now starts up to eight additional handshakes concurrently. The requested
+total connection count and worker order are unchanged. These are frontend p9
+connections to ZeroFS, not additional SFTP connections to Hetzner. If a
+handshake fails, setup stops launching workers, settles every attempt already
+started, and explicitly closes all successfully connected clients.
+
+One real-transport regression holds the first new handshake and requires a
+second connection to start before it is released. Another holds the entire
+eight-connection setup window, rejects one peer, and checks the concurrency
+bound, draining of pending peers, closure of successful clients, and absence
+of new attempts after failure. The original serial code fails the overlap
+check.
+
+These gated regressions prove removal of scheduling dependencies and verify
+cleanup and byte integrity. They do not establish a deployed upload rate or
+an improvement in the NFS copy's Hetzner download throughput.
+
+```console
+cargo test --locked --no-default-features --lib cli::transfer::tests::upload_overlap
+cargo test --locked --no-default-features --lib cli::transfer::tests::connections
+```
+
 ## Check the endpoint before comparing hosts
 
 Hetzner documents better SFTP performance through its SSH service on port 23

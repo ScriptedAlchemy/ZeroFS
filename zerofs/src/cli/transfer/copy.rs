@@ -7,7 +7,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use zerofs_client::{Client, File, OpenOptions};
@@ -203,6 +203,27 @@ pub(super) async fn stream_upload(
         bail!("upload requires at least one remote file handle");
     }
     let mut local = open_local_source(planned).await?;
+    stream_upload_from(
+        remotes,
+        &mut local,
+        planned,
+        chunk_size,
+        progress,
+        cancellation,
+    )
+    .await
+}
+
+/// Stream an already opened and validated source, retaining each buffer until
+/// its positioned remote write has settled.
+pub(super) async fn stream_upload_from<R: AsyncRead + Unpin>(
+    remotes: &[Arc<File>],
+    local: &mut R,
+    planned: &PlannedFile,
+    chunk_size: usize,
+    progress: &FileProgress,
+    cancellation: &CancellationToken,
+) -> Result<()> {
     let buffer_size = upload_buffer_size(planned.size, chunk_size);
     let mut buffers = (0..UPLOAD_PIPELINE_DEPTH_PER_CONNECTION * remotes.len())
         .map(|_| vec![0; buffer_size])
@@ -229,7 +250,41 @@ pub(super) async fn stream_upload(
         }
         let mut buffer = buffers.pop().expect("non-empty upload buffer pool");
         let wanted = (planned.size - offset).min(chunk_size as u64) as usize;
-        if let Err(error) = local.read_exact(&mut buffer[..wanted]).await {
+        let read_result = {
+            // FuturesUnordered does not poll newly queued writes until its
+            // next item is requested. Drive them while the disk read waits,
+            // rather than leaving a ready network chunk behind local I/O.
+            // Keep this exact read pinned across write completions: restarting
+            // a partially completed read_exact could skip source bytes.
+            let read = local.read_exact(&mut buffer[..wanted]);
+            tokio::pin!(read);
+            loop {
+                tokio::select! {
+                    biased;
+                    Some((remote_index, returned, result)) = writes.next(), if !writes.is_empty() => {
+                        in_flight[remote_index] -= 1;
+                        buffers.push(returned);
+                        match result {
+                            Ok(written) => progress.advance(written as u64),
+                            Err(error) => {
+                                first_error = Some(error);
+                                break None;
+                            }
+                        }
+                    }
+                    _ = cancellation.cancelled() => {
+                        first_error = Some(anyhow!("upload cancelled"));
+                        break None;
+                    }
+                    result = &mut read => break Some(result),
+                }
+            }
+        };
+        let Some(read_result) = read_result else {
+            buffers.push(buffer);
+            break;
+        };
+        if let Err(error) = read_result {
             if error.kind() == std::io::ErrorKind::UnexpectedEof {
                 first_error = Some(anyhow::anyhow!(
                     "local source changed while uploading: {}",

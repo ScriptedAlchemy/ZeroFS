@@ -22,11 +22,13 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use zerofs_client::Client;
 
+mod connections;
 #[cfg(feature = "webui")]
 mod reconnect;
 mod resume;
 mod safety;
 mod throughput;
+mod upload_overlap;
 
 async fn remote_client() -> (Arc<Client>, CancellationToken, tempfile::TempDir) {
     let (client, shutdown, temp, _) = remote_client_with_filesystem().await;
