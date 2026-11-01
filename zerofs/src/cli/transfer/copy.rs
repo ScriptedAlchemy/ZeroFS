@@ -13,6 +13,10 @@ use uuid::Uuid;
 use zerofs_client::{Client, File, OpenOptions};
 
 const UPLOAD_PIPELINE_DEPTH_PER_CONNECTION: usize = 2;
+// Keep one large file moving over a WAN without unbounded payload buffering.
+// Normal full replies retain four 9 MiB chunks per active file. Short replies
+// additionally use a bounded assembly buffer for each unfinished range.
+const DOWNLOAD_PIPELINE_DEPTH: usize = 4;
 
 pub(super) async fn upload_file(
     worker: UploadWorker,
@@ -335,7 +339,7 @@ async fn open_local_source(planned: &PlannedFile) -> Result<tokio::fs::File> {
     Ok(local)
 }
 
-async fn stream_download(
+pub(super) async fn stream_download(
     remote: &zerofs_client::File,
     local: &mut tokio::fs::File,
     planned: &PlannedFile,
@@ -343,28 +347,39 @@ async fn stream_download(
     progress: &FileProgress,
     cancellation: &CancellationToken,
 ) -> Result<()> {
-    let mut offset = 0u64;
-    while offset < planned.size {
-        if cancellation.is_cancelled() {
-            bail!("download cancelled");
+    if chunk_size == 0 {
+        bail!("download chunk size must be positive");
+    }
+    let mut next_offset = 0;
+    let ranges = std::iter::from_fn(|| {
+        if next_offset >= planned.size {
+            return None;
         }
+        let offset = next_offset;
         let wanted = (planned.size - offset).min(u64::from(chunk_size)) as u32;
-        let chunk = tokio::select! {
+        next_offset += u64::from(wanted);
+        Some((offset, wanted))
+    });
+    let reads = futures::stream::iter(ranges)
+        .map(|(offset, wanted)| async move {
+            read_download_range(remote, &planned.source, offset, wanted)
+                .await
+                .map(|chunk| (offset, chunk))
+        })
+        .buffered(DOWNLOAD_PIPELINE_DEPTH);
+    futures::pin_mut!(reads);
+    let mut offset = 0u64;
+    loop {
+        let next = tokio::select! {
             biased;
             _ = cancellation.cancelled() => bail!("download cancelled"),
-            result = remote.read_at(offset, wanted) => {
-                result.with_context(|| format!("read remote source at offset {offset}"))?
-            }
+            result = reads.next() => result,
         };
-        if chunk.len() > wanted as usize {
-            bail!(
-                "remote source returned more than the planned read size: {}",
-                planned.source.display()
-            );
-        }
-        if chunk.is_empty() {
+        let Some(result) = next else {
             break;
-        }
+        };
+        let (chunk_offset, chunk) = result?;
+        debug_assert_eq!(chunk_offset, offset);
         local
             .write_all(&chunk)
             .await
@@ -392,6 +407,45 @@ async fn stream_download(
         );
     }
     Ok(())
+}
+
+/// Fill one disjoint pipeline range before advancing to the next. A short
+/// nonempty 9P response is legal and must not create a hole in the output.
+async fn read_download_range(
+    remote: &zerofs_client::File,
+    source: &Path,
+    offset: u64,
+    wanted: u32,
+) -> Result<bytes::Bytes> {
+    let mut collected = bytes::BytesMut::new();
+    while collected.len() < wanted as usize {
+        let current = offset + collected.len() as u64;
+        let remaining = wanted - collected.len() as u32;
+        let chunk = remote
+            .read_at(current, remaining)
+            .await
+            .with_context(|| format!("read remote source at offset {current}"))?;
+        if chunk.len() > remaining as usize {
+            bail!(
+                "remote source returned more than the planned read size: {}",
+                source.display()
+            );
+        }
+        if chunk.is_empty() {
+            bail!(
+                "remote source changed while downloading: {}",
+                source.display()
+            );
+        }
+        if collected.is_empty() && chunk.len() == wanted as usize {
+            return Ok(chunk);
+        }
+        if collected.is_empty() {
+            collected = bytes::BytesMut::with_capacity(wanted as usize);
+        }
+        collected.extend_from_slice(&chunk);
+    }
+    Ok(collected.freeze())
 }
 
 fn temporary_sibling(destination: &Path) -> Result<PathBuf> {

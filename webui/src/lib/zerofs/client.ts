@@ -5,6 +5,7 @@ import initWasm, {
 } from "../../generated/zerofs-client/zerofs_client";
 import { pooled } from "../async";
 import { joinPath as join } from "../format";
+import { readFileChunks } from "./read-pipeline";
 
 export type ConnectionState = "disconnected" | "connecting" | "connected";
 
@@ -465,20 +466,18 @@ export class ZeroFsClient {
   async readFile(path: string, signal?: AbortSignal): Promise<Uint8Array> {
     const fs = await this.fs();
     const file = await fs.openFile(path, true, false, false, false, false, 0o644);
-    const chunks: Uint8Array[] = [];
-    let offset = 0n;
+    let chunks: Uint8Array[];
     try {
-      while (!signal?.aborted) {
-        const chunk = file.readAt(offset, this.maxReadChunk);
-        const data = await chunk;
-        if (data.length === 0) break;
-        chunks.push(data);
-        offset += BigInt(data.length);
-      }
-      if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+      chunks = await readFileChunks(
+        (offset, length) => file.readAt(offset, length),
+        this.maxReadChunk,
+        undefined,
+        signal,
+      );
     } finally {
       await file.close();
     }
+    if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
     const result = new Uint8Array(chunks.reduce((sum, chunk) => sum + chunk.length, 0));
     let position = 0;
     for (const chunk of chunks) {
@@ -602,18 +601,13 @@ export class ZeroFsClient {
     const total = Number(info.stat.size);
     const fs = await this.fs();
     const file = await fs.openFile(path, true, false, false, false, false, 0o644);
-    const chunks: Uint8Array[] = [];
-    let offset = 0n;
     try {
-      while (!signal?.aborted) {
-        const data = await file.readAt(offset, this.maxReadChunk);
-        if (data.length === 0) break;
-        chunks.push(data);
-        offset += BigInt(data.length);
-        onProgress?.(Number(offset), total);
-      }
-      if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
-      return chunks;
+      return await readFileChunks(
+        (offset, length) => file.readAt(offset, length),
+        this.maxReadChunk,
+        (received) => onProgress?.(received, total),
+        signal,
+      );
     } finally {
       await file.close();
     }
@@ -625,6 +619,7 @@ export class ZeroFsClient {
     signal?: AbortSignal,
   ): Promise<void> {
     const chunks = await this.readToChunks(path, onProgress, signal);
+    if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
     const blobParts = chunks.map((chunk) => chunk.slice().buffer as ArrayBuffer);
     const url = URL.createObjectURL(new Blob(blobParts));
     const anchor = document.createElement("a");

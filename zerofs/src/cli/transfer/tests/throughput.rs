@@ -1,5 +1,177 @@
-use super::super::copy::{stream_upload, sync_remote_files};
+use super::super::copy::{stream_download, stream_upload, sync_remote_files};
 use super::*;
+
+async fn download_with_reordered_pipeline(short_reads: bool, through_cursor: bool) {
+    const CHUNK: usize = 64 * 1024;
+    let (primary, shutdown, local) = remote_client().await;
+    let payload: Vec<u8> = (0..CHUNK * 5 + 17).map(|i| (i % 251) as u8).collect();
+    primary.write("/source.bin", &payload).await.unwrap();
+    let socket = local.path().join("transfer.9p.sock");
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let target = format!("tcp://{}", listener.local_addr().unwrap());
+    let wave_size = if through_cursor { 8 } else { 4 };
+    let (wave_ready, wait_for_wave) = tokio::sync::oneshot::channel();
+    let release_wave = Arc::new(tokio::sync::Semaphore::new(usize::from(!through_cursor)));
+    let proxy_release_wave = Arc::clone(&release_wave);
+    let proxy = tokio::spawn(async move {
+        let mut wave_ready = Some(wave_ready);
+        let (downstream, _) = listener.accept().await.unwrap();
+        let upstream = tokio::net::UnixStream::connect(&socket).await.unwrap();
+        let (mut requests, mut responses) = downstream.into_split();
+        let (mut backend_responses, mut backend_requests) = upstream.into_split();
+        let reply_task = tokio::spawn(async move {
+            let _ = tokio::io::copy(&mut backend_responses, &mut responses).await;
+        });
+        let mut first_wave = Vec::new();
+        let mut reads = 0usize;
+        loop {
+            let mut size = [0; P9_SIZE_FIELD_LEN];
+            if requests.read_exact(&mut size).await.is_err() {
+                break;
+            }
+            let mut frame = vec![0; u32::from_le_bytes(size) as usize];
+            frame[..P9_SIZE_FIELD_LEN].copy_from_slice(&size);
+            if requests
+                .read_exact(&mut frame[P9_SIZE_FIELD_LEN..])
+                .await
+                .is_err()
+            {
+                break;
+            }
+            if let Ok(mut message) = P9Message::from_bytes_ctx(&frame, true)
+                && let Message::Tread(read) = &mut message.body
+            {
+                reads += 1;
+                let mut changed = false;
+                if short_reads && read.count > 1 {
+                    read.count /= 2;
+                    changed = true;
+                }
+                if through_cursor && read.offset >= (CHUNK * 6) as u64 {
+                    // Errors from speculative ranges beyond the earlier EOF
+                    // must be discarded instead of failing a complete copy.
+                    read.fid = u32::MAX;
+                    changed = true;
+                }
+                if changed {
+                    frame = message.to_bytes().unwrap();
+                }
+                let wave_read = reads.saturating_sub(usize::from(through_cursor));
+                if wave_read > 0 && wave_read <= wave_size {
+                    first_wave.push(frame);
+                    if wave_read == wave_size {
+                        let _ = wave_ready.take().unwrap().send(());
+                        proxy_release_wave.acquire().await.unwrap().forget();
+                        // No reply is possible until the entire wave is issued.
+                        // Forward their disjoint ranges in reverse order.
+                        for pending in first_wave.drain(..).rev() {
+                            backend_requests.write_all(&pending).await.unwrap();
+                        }
+                    }
+                    continue;
+                }
+            }
+            if backend_requests.write_all(&frame).await.is_err() {
+                break;
+            }
+        }
+        reply_task.abort();
+        let _ = reply_task.await;
+    });
+    let client = if through_cursor {
+        Client::connect_with(
+            &target,
+            zerofs_client::ConnectOptions {
+                msize: CHUNK as u32 + ninep_proto::P9_IOHDRSZ,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+    } else {
+        connect_transfer_client(&target).await.unwrap()
+    };
+    let planned = scan_remote(&client, Path::new("/source.bin"))
+        .await
+        .unwrap()
+        .files
+        .pop()
+        .unwrap();
+    let remote = client
+        .open("/source.bin", zerofs_client::OpenOptions::read_only())
+        .await
+        .unwrap();
+    let destination = local.path().join("download.bin");
+    let mut output = tokio::fs::File::create(&destination).await.unwrap();
+    let progress = Progress::new("download", planned.size, 1);
+    let file_progress = progress.start_file(Path::new("source.bin"), planned.size);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        if through_cursor {
+            let mut cursor = remote.cursor();
+            let mut priming_byte = [0];
+            cursor.read_exact(&mut priming_byte).await.unwrap();
+            output.write_all(&priming_byte).await.unwrap();
+            {
+                let mut first_buffer = vec![0; CHUNK];
+                let first_read = cursor.read(&mut first_buffer);
+                tokio::pin!(first_read);
+                tokio::select! {
+                    _ = wait_for_wave => {},
+                    result = &mut first_read => panic!("read completed before the gate: {result:?}"),
+                }
+                // Cancel a pending demand read, then resume with copy's much
+                // smaller buffer. No prefetched bytes may be lost or skipped.
+            }
+            assert_eq!(cursor.position(), 1);
+            release_wave.add_permits(1);
+            let copied = tokio::io::copy(&mut cursor, &mut output).await.unwrap();
+            assert_eq!(copied, planned.size - 1);
+            assert_eq!(cursor.position(), planned.size);
+        } else {
+            stream_download(
+                &remote,
+                &mut output,
+                &planned,
+                CHUNK as u32,
+                &file_progress,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        }
+    })
+    .await
+    .expect("download waited for its first reply instead of filling the pipeline");
+    output.sync_all().await.unwrap();
+    assert_eq!(fs::read(&destination).unwrap(), payload);
+    remote.close().await;
+    client.close().await;
+    proxy.abort();
+    let _ = proxy.await;
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn download_pipelines_one_file_and_preserves_order() {
+    download_with_reordered_pipeline(false, false).await;
+}
+
+#[tokio::test]
+async fn download_fills_short_responses_without_skipping_ranges() {
+    download_with_reordered_pipeline(true, false).await;
+}
+
+#[tokio::test]
+async fn cursor_pipelines_reads_and_resumes_cancelled_read_with_smaller_buffer() {
+    download_with_reordered_pipeline(false, true).await;
+}
+
+#[tokio::test]
+async fn cursor_fills_short_responses_without_skipping_ranges() {
+    download_with_reordered_pipeline(true, true).await;
+}
 
 #[tokio::test]
 async fn upload_stripes_positioned_writes_across_remote_sessions() {

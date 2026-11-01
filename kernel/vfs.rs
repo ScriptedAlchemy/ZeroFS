@@ -99,7 +99,7 @@ const LOCK_RETRY_POLL_MS: u32 = 50;
 const MIN_READAHEAD_WINDOW_BYTES: usize = 1024 * 1024;
 /// Bound speculative page-cache and per-request memory even with a very large
 /// negotiated msize.
-const MAX_READAHEAD_WINDOW_BYTES: usize = 4 * 1024 * 1024;
+const MAX_READAHEAD_WINDOW_BYTES: usize = 32 * 1024 * 1024;
 /// Deeper pipelining stops helping one stream once its request window reaches
 /// this many concurrent subrequests, and bounding it also bounds BDI memory
 /// pressure.

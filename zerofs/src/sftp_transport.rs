@@ -146,7 +146,7 @@ const SFTP_DIAL_BACKOFF_BASE: Duration = Duration::from_millis(100);
 const SFTP_DIAL_BACKOFF_MAX: Duration = Duration::from_secs(5);
 const SFTP_DIRECTORY_CACHE_MAX_ENTRIES: usize = 64 * 1024;
 /// Maximum operations multiplexed onto one SSH session. The SFTP layer
-/// pipelines up to 64 outstanding requests per session, so a handful of
+/// pipelines up to 64 outstanding READ requests per leased operation, so a handful of
 /// concurrent operations sharing one connection hide the WAN RTT instead of
 /// serializing on it; the cap keeps one session's request window and remote
 /// handle usage bounded.

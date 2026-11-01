@@ -41,8 +41,13 @@ impl File {
         Ok(self.guard.fid())
     }
 
-    /// Largest payload a single `read_at` round trip can return; used by the
-    /// cursor to keep one `poll_read` to one round trip.
+    #[cfg(feature = "tokio-io")]
+    pub(crate) fn check_open(&self) -> Result<(), ZeroFsError> {
+        self.fid().map(|_| ())
+    }
+
+    /// Largest payload a single `read_at` round trip can return; used to bound
+    /// each request in the cursor's read-ahead pipeline.
     #[cfg(feature = "tokio-io")]
     pub(crate) fn max_read_chunk(&self) -> u32 {
         self.session.client.max_io()

@@ -1,8 +1,8 @@
 use bytes::Bytes;
 use ninep_proto::{
-    DekuBytes, Message, P9_COUNT_FIELD_LEN, P9_HEADER_SIZE, P9_MAX_MSIZE, P9_MIN_MESSAGE_SIZE,
-    P9_OP_ENVELOPE_LEN, P9_OP_FLAG_RETRY, P9_OP_ID_LEN, P9_SIZE_FIELD_LEN, P9Message, T_WRITE,
-    Twrite, message_type,
+    DekuBytes, Message, P9_COUNT_FIELD_LEN, P9_HEADER_SIZE, P9_IOHDRSZ, P9_MAX_MSIZE,
+    P9_MIN_MESSAGE_SIZE, P9_OP_ENVELOPE_LEN, P9_OP_FLAG_RETRY, P9_OP_ID_LEN, P9_SIZE_FIELD_LEN,
+    P9Message, T_WRITE, Twrite, message_type,
 };
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio_util::sync::CancellationToken;
@@ -164,6 +164,28 @@ pub(super) fn possible_response_bytes(type_byte: u8) -> usize {
         | message_type::TREADDIRATTR => 2 * P9_MAX_MSIZE as usize,
         _ => P9_MAX_MSIZE as usize,
     }
+}
+
+/// Bound a validated fixed-size Tread by its requested payload. Charging the
+/// maximum msize for every small read otherwise consumes the connection's byte
+/// budget after only three requests, starving high-latency read pipelines.
+pub(super) fn possible_frame_response_bytes(frame: &[u8]) -> usize {
+    let type_byte = frame.get(4).copied().unwrap_or_default();
+    const TREAD_FRAME_LEN: usize = P9_HEADER_SIZE + 4 + 8 + P9_COUNT_FIELD_LEN;
+    if type_byte == message_type::TREAD
+        && frame.len() == TREAD_FRAME_LEN
+        && read_u32_at(frame, 0) == Some(TREAD_FRAME_LEN as u32)
+        && let Some(count) = read_u32_at(frame, P9_HEADER_SIZE + 4 + 8)
+    {
+        // Use the protocol ceiling, not a negotiated-msize snapshot that a
+        // concurrent Tversion could change before execution. Include both the
+        // source payload and serialized response, including an error reply.
+        let payload = count.min(P9_MAX_MSIZE.saturating_sub(P9_IOHDRSZ));
+        // A sub-extent read can retain a slice of one decoded extent. Account
+        // for that allocation even when the wire payload is only a few bytes.
+        return 2 * (P9_IOHDRSZ as usize + (payload as usize).max(crate::fs::EXTENT_SIZE));
+    }
+    possible_response_bytes(type_byte)
 }
 
 pub(super) async fn read_9p_frame<R>(

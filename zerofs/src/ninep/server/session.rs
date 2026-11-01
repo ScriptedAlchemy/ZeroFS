@@ -4,7 +4,7 @@ use super::admission::{
 };
 use super::frame_codec::{
     FidFootprint, TCLUNK_TYPE, TFLUSH_TYPE, TVERSION_TYPE, inspect_frame_metadata,
-    possible_response_bytes, read_9p_frame, shallow_epoch_zero_retry_write,
+    possible_frame_response_bytes, read_9p_frame, shallow_epoch_zero_retry_write,
 };
 use super::response_writer::{P9Response, ResponseAuthority, spawn_response_writer};
 use crate::fs::ZeroFS;
@@ -367,13 +367,13 @@ pub(crate) async fn dispatch_9p_frame(
     }
 
     let type_byte = frame[4];
-    // Reserve the received allocation and a conservative type-specific reply
-    // before detaching request work. Bulk writes have a fixed-size Rwrite;
-    // other requests retain the full negotiated-response allowance.
+    // Reserve the received allocation and bounded response before detaching
+    // request work. Fixed Tread frames declare their maximum response payload;
+    // malformed or other read-like requests keep the conservative allowance.
     let admission_permit = admission
         .admit_request_or_shutdown(
             frame.len(),
-            possible_response_bytes(type_byte),
+            possible_frame_response_bytes(&frame),
             connection_shutdown,
         )
         .await?;

@@ -95,9 +95,10 @@ pub const RUSSH_SFTP_MAX_CONCURRENT_WRITES: usize = 128;
 pub(crate) const SFTP_WRITE_PACKET_SIZE: usize = 255 * 1024;
 pub(crate) const SFTP_READ_PACKET_SIZE: usize = 255 * 1024;
 const SFTP_WRITE_REQUEST_CONCURRENCY: usize = RUSSH_SFTP_MAX_CONCURRENT_WRITES;
-// 128 x 255 KiB keeps ~32 MiB in flight per session, above the ~12 MiB
-// bandwidth-delay product of a 1 Gbit/s link at ~95 ms transatlantic RTT.
-const SFTP_READ_REQUEST_CONCURRENCY: usize = 128;
+// Per operation, not per physical session: several leased reads can share
+// one RawSftpSession. A 4 MiB sequential window fits in 17 requests, while
+// this cap still permits larger demand ranges without doubling reply memory.
+const SFTP_READ_REQUEST_CONCURRENCY: usize = 64;
 pub(crate) const POSIX_RENAME: &str = "posix-rename@openssh.com";
 pub(crate) const FSYNC: &str = "fsync@openssh.com";
 pub(crate) const HARDLINK: &str = "hardlink@openssh.com";
@@ -1181,7 +1182,7 @@ mod tests {
             plan_pipelined_reads(0, SFTP_READ_PACKET_SIZE * 3, SFTP_READ_PACKET_SIZE).unwrap();
         assert_eq!(plan.len(), 3);
         assert_eq!(plan[2].offset, (SFTP_READ_PACKET_SIZE * 2) as u64);
-        assert_eq!(SFTP_READ_REQUEST_CONCURRENCY, 128);
+        assert_eq!(SFTP_READ_REQUEST_CONCURRENCY, 64);
     }
 
     #[test]

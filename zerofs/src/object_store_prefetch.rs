@@ -33,9 +33,10 @@ const FETCH_WINDOW_MIN: usize = 128 * 1024;
 const FETCH_WINDOW_MAX: usize = 8 * 1024 * 1024;
 const MAX_STREAMS: usize = 4;
 /// Minimum confirmed-stream window relative to the random-access minimum. The
-/// live SFTP profile therefore promotes 1 MiB to 16 MiB after sequential access
-/// is proven, while an unproven/random stream stays at 1 MiB.
-const SEQUENTIAL_FETCH_WINDOW_MULTIPLIER: usize = 15;
+/// live SFTP profile promotes 1 MiB to 4 MiB after sequential access is proven.
+/// Eight look-ahead windows can then use all eight default SFTP sessions within
+/// a 32 MiB segment, while an unproven/random stream stays at 1 MiB.
+const SEQUENTIAL_FETCH_WINDOW_MULTIPLIER: usize = 4;
 /// Look-ahead horizon for a proven sequential stream. Each window remains a
 /// separate backend GET so SFTP can use several physical sessions at once.
 const PREFETCH_DEPTH_WINDOWS: usize = 8;
@@ -2266,13 +2267,13 @@ mod tests {
         assert!(
             bounded
                 .iter()
-                .any(|range| range.end - range.start == 15 * MIB as u64),
-            "sequential reads never reached the 15 MiB one-wave window: {bounded:?}"
+                .any(|range| range.end - range.start == 4 * MIB as u64),
+            "sequential reads never reached the 4 MiB parallel window: {bounded:?}"
         );
         assert!(
             bounded
                 .iter()
-                .all(|range| range.end - range.start <= 15 * MIB as u64)
+                .all(|range| range.end - range.start <= 4 * MIB as u64)
         );
     }
 
@@ -2357,14 +2358,14 @@ mod tests {
         let confirmed = bounded.get(1).expect("confirmed-stream backend GET");
         assert_eq!(
             confirmed.end - confirmed.start,
-            15 * MIB as u64,
+            4 * MIB as u64,
             "the first confirmed-sequential GET must fit one 64-request SFTP payload wave"
         );
         assert!(
             bounded
                 .iter()
                 .skip(1)
-                .all(|range| range.end - range.start <= 15 * MIB as u64),
+                .all(|range| range.end - range.start <= 4 * MIB as u64),
             "a proven-sequential GET exceeded one 64-request SFTP wave: {bounded:?}"
         );
         let mut ordered = bounded.clone();
@@ -2374,13 +2375,170 @@ mod tests {
             "sequential SFTP windows overlapped: {bounded:?}"
         );
         assert!(
-            bounded.len() <= 9,
-            "120 MiB sequential stream used {} backend GETs instead of <=9: {bounded:?}",
+            bounded.len() <= 31,
+            "120 MiB sequential stream used {} backend GETs instead of <=31: {bounded:?}",
             bounded.len()
         );
         assert!(
             amplification <= 1.15,
             "120 MiB sequential amplification {amplification:.3}x > 1.15x ({fetched} fetched)"
+        );
+    }
+
+    #[derive(Debug)]
+    struct WindowGate {
+        slots: tokio::sync::Semaphore,
+        release: tokio::sync::Semaphore,
+        started: tokio::sync::mpsc::UnboundedSender<Range<u64>>,
+    }
+
+    #[derive(Debug)]
+    struct WindowGatedStore {
+        inner: Arc<InMemory>,
+        ranges: Arc<Mutex<Vec<Range<u64>>>>,
+        gate: Arc<WindowGate>,
+    }
+
+    impl Display for WindowGatedStore {
+        fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+            write!(f, "WindowGatedStore")
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for WindowGatedStore {
+        async fn get_opts(&self, l: &Path, o: GetOptions) -> object_store::Result<GetResult> {
+            if let Some(GetRange::Bounded(r)) = &o.range {
+                self.ranges.lock().unwrap().push(r.clone());
+            }
+            let _slot = if let Some(GetRange::Bounded(range)) = &o.range
+                && range.start > 0
+            {
+                let gate = &self.gate;
+                let slot = gate.slots.acquire().await.unwrap();
+                gate.started.send(range.clone()).unwrap();
+                gate.release.acquire().await.unwrap().forget();
+                Some(slot)
+            } else {
+                None
+            };
+            self.inner.get_opts(l, o).await
+        }
+        async fn put_opts(
+            &self,
+            l: &Path,
+            p: PutPayload,
+            o: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            self.inner.put_opts(l, p, o).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            l: &Path,
+            o: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(l, o).await
+        }
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, object_store::Result<Path>>,
+        ) -> BoxStream<'static, object_store::Result<Path>> {
+            self.inner.delete_stream(locations)
+        }
+        fn list(&self, p: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.inner.list(p)
+        }
+        async fn list_with_delimiter(&self, p: Option<&Path>) -> object_store::Result<ListResult> {
+            self.inner.list_with_delimiter(p).await
+        }
+        async fn copy_opts(&self, f: &Path, t: &Path, o: CopyOptions) -> object_store::Result<()> {
+            self.inner.copy_opts(f, t, o).await
+        }
+        async fn rename_opts(
+            &self,
+            f: &Path,
+            t: &Path,
+            o: RenameOptions,
+        ) -> object_store::Result<()> {
+            self.inner.rename_opts(f, t, o).await
+        }
+    }
+
+    #[tokio::test]
+    async fn sftp_sequential_segment_can_fill_eight_sessions_before_any_window_finishes() {
+        const MIB: usize = 1024 * 1024;
+        let inner = Arc::new(InMemory::new());
+        let path = Path::from("segments/eight-sessions");
+        let payload: Vec<u8> = (0..32 * MIB).map(|i| (i % 251) as u8).collect();
+        inner.put(&path, payload.clone().into()).await.unwrap();
+        let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
+        let gate = Arc::new(WindowGate {
+            slots: tokio::sync::Semaphore::new(8),
+            release: tokio::sync::Semaphore::new(0),
+            started,
+        });
+        let ranges = Arc::new(Mutex::new(Vec::new()));
+        let backend = Arc::new(WindowGatedStore {
+            inner,
+            ranges: Arc::clone(&ranges),
+            gate: Arc::clone(&gate),
+        });
+        let (store, _dir) = store_over_with_tuning(backend, MIB, MIB, 32 * MIB).await;
+        assert_eq!(
+            store.get_range(&path, 0..65536).await.unwrap().as_ref(),
+            &payload[..65536]
+        );
+        assert_eq!(
+            ranges.lock().unwrap().as_slice(),
+            std::slice::from_ref(&(0..MIB as u64))
+        );
+        assert_eq!(
+            store
+                .get_range(&path, 65536..131072)
+                .await
+                .unwrap()
+                .as_ref(),
+            &payload[65536..131072]
+        );
+
+        let mut inflight = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut inflight = Vec::new();
+            for _ in 0..8 {
+                inflight.push(starts.recv().await.unwrap());
+            }
+            inflight
+        })
+        .await
+        .expect("one sequential segment could not keep eight sessions busy");
+        assert_eq!(gate.slots.available_permits(), 0);
+        inflight.sort_unstable_by_key(|range| range.start);
+        for (index, range) in inflight.iter().enumerate() {
+            assert_eq!(range.start, ((1 + 4 * index) * MIB) as u64);
+            assert_eq!(
+                range.end,
+                (range.start + (4 * MIB) as u64).min((32 * MIB) as u64)
+            );
+        }
+        assert!(inflight.windows(2).all(|pair| pair[0].end == pair[1].start));
+        gate.release.add_permits(8);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !store.fetches.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("window downloads did not settle");
+        // Permit a cache-evicted tail to be fetched again; the concurrency proof
+        // above held all eight sessions before allowing any completion.
+        gate.release.add_permits(8);
+        let start = (31 * MIB) as u64;
+        assert_eq!(
+            store
+                .get_range(&path, start..(32 * MIB) as u64)
+                .await
+                .unwrap()
+                .as_ref(),
+            &payload[31 * MIB..]
         );
     }
 
