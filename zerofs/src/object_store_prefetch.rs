@@ -5143,7 +5143,10 @@ mod tests {
         });
         let (store, _dir) = store_over(backend, 64 * 1024).await;
         let path = Path::from("delete-cancel-after-apply");
-        store.put(&path, vec![42u8; 128 * 1024].into()).await.unwrap();
+        store
+            .put(&path, vec![42u8; 128 * 1024].into())
+            .await
+            .unwrap();
         let _ = store.get(&path).await.unwrap().bytes().await.unwrap();
         assert!(store.read_head(&path).is_some());
         assert!(store.cached_part(&path, 0).await.is_some());
