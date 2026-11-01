@@ -856,13 +856,19 @@ impl ZeroFS {
             }
         }
 
+        let settlement = if let Some(target_id) = deferred_target_id {
+            crate::fs::write_coordinator::CommitSettlement::DeferredReclaim(
+                self.deferred_orphan_reclaim(target_id),
+            )
+        } else {
+            quota_settlement.map_or(
+                crate::fs::write_coordinator::CommitSettlement::None,
+                crate::fs::write_coordinator::CommitSettlement::Quota,
+            )
+        };
         self.write_coordinator
-            .commit_with_quota(txn, quota_settlement)
+            .commit_with_settlement(txn, settlement)
             .await?;
-
-        if let Some(target_id) = deferred_target_id {
-            self.schedule_deferred_orphan_reclaim(target_id);
-        }
 
         #[cfg(feature = "failpoints")]
         fail_point!(fp::RENAME_AFTER_COMMIT);

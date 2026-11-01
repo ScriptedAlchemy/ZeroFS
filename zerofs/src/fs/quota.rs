@@ -499,6 +499,168 @@ mod tests {
         assert!(!fs.quota.is_poisoned());
     }
 
+    #[tokio::test]
+    async fn durability_errors_preserve_applied_quota() {
+        for operation in 0..6 {
+            let mut fs = ZeroFS::new_in_memory_with_sync_writes(true).await.unwrap();
+            fs.max_bytes = 4096;
+            fs.quota = LogicalQuota::new(4096, 0);
+            let auth: AuthContext = (&test_auth()).into();
+            let (target, _) = fs
+                .create(&test_creds(), 0, b"target", &SetAttributes::default())
+                .await
+                .unwrap();
+            let (replacement, _) = fs
+                .create(&test_creds(), 0, b"replacement", &SetAttributes::default())
+                .await
+                .unwrap();
+            if operation >= 3 {
+                fs.write(&auth, target, 0, &Bytes::from(vec![b'a'; 4096]))
+                    .await
+                    .unwrap();
+            }
+            let fail_flush = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            fs.flush_coordinator.set_local_durability_barrier({
+                let fail_flush = Arc::clone(&fail_flush);
+                Arc::new(move || {
+                    let fail_flush = Arc::clone(&fail_flush);
+                    Box::pin(async move {
+                        if fail_flush.load(std::sync::atomic::Ordering::SeqCst) {
+                            Err(FsError::IoError)
+                        } else {
+                            Ok(())
+                        }
+                    })
+                })
+            });
+            let result = match operation {
+                0 => fs
+                    .fallocate_opened(&auth, target, 0, 4096, FallocateMode::Allocate)
+                    .await
+                    .map(|_| ()),
+                1 | 3 => fs
+                    .setattr(
+                        &test_creds(),
+                        target,
+                        &SetAttributes {
+                            size: SetSize::Set(if operation == 1 { 4096 } else { 0 }),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .map(|_| ()),
+                2 => fs
+                    .write(&auth, target, 0, &Bytes::from(vec![b'b'; 4096]))
+                    .await
+                    .map(|_| ()),
+                4 => fs.remove(&auth, 0, b"target").await,
+                _ => fs.rename(&auth, 0, b"replacement", 0, b"target").await,
+            };
+            assert!(
+                matches!(result, Err(FsError::IoError)),
+                "operation {operation}"
+            );
+            let applied_size = if operation < 3 { 4096 } else { 0 };
+            assert_eq!(fs.global_stats.get_totals().0, applied_size);
+            assert_eq!(fs.quota.committed_bytes(), applied_size);
+            assert_eq!(fs.quota.pending_bytes(), 0);
+            assert!(!fs.quota.is_poisoned());
+
+            fail_flush.store(false, std::sync::atomic::Ordering::SeqCst);
+            if operation < 3 {
+                fs.setattr(
+                    &test_creds(),
+                    target,
+                    &SetAttributes {
+                        size: SetSize::Set(0),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            }
+            fs.write(&auth, replacement, 0, &Bytes::from(vec![b'c'; 4096]))
+                .await
+                .expect("applied reclaim must remain reusable after a durability failure");
+        }
+    }
+
+    async fn cancelled_replay_protected_reclaim(rename: bool) {
+        let mut fs = ZeroFS::new_in_memory().await.unwrap();
+        fs.max_bytes = 4096;
+        fs.quota = LogicalQuota::new(4096, 0);
+        let fs = Arc::new(fs);
+        let mut reclaims = fs.reclaim_rx.lock().unwrap().take().unwrap();
+        let op_id = [7; 16];
+        let (target, _) = fs
+            .create_idempotent(
+                &test_creds(),
+                0,
+                b"target",
+                &SetAttributes::default(),
+                op_id,
+            )
+            .await
+            .unwrap();
+        let (replacement, _) = fs
+            .create(&test_creds(), 0, b"replacement", &SetAttributes::default())
+            .await
+            .unwrap();
+        let auth: AuthContext = (&test_auth()).into();
+        fs.write(&auth, target, 0, &Bytes::from(vec![b'a'; 4096]))
+            .await
+            .unwrap();
+        assert_eq!(fs.open_handle_count(target), 0);
+        assert!(fs.dedup.protects_replay_inode(target));
+        let task_fs = Arc::clone(&fs);
+        cancel_at_apply(
+            &fs,
+            async move {
+                let auth: AuthContext = (&test_auth()).into();
+                if rename {
+                    task_fs.rename(&auth, 0, b"replacement", 0, b"target").await
+                } else {
+                    task_fs.remove(&auth, 0, b"target").await
+                }
+            },
+            0,
+        )
+        .await;
+
+        // Drive the production drainer one notification at a time. Its first
+        // pass must register replay expiry even though the caller was aborted.
+        assert_eq!(reclaims.try_recv().unwrap(), target);
+        fs.reclaim_if_unreferenced(target).await;
+        assert_eq!(fs.quota.committed_bytes(), 4096);
+        tokio::time::pause();
+        tokio::time::advance(crate::dedup::OP_ID_RETENTION + std::time::Duration::from_secs(1))
+            .await;
+        assert!(fs.dedup.get(&op_id).is_none());
+        tokio::time::resume();
+        assert_eq!(reclaims.try_recv().unwrap(), target);
+        fs.reclaim_if_unreferenced(target).await;
+        assert!(matches!(
+            fs.inode_store.get(target).await,
+            Err(FsError::NotFound)
+        ));
+        assert_eq!(fs.global_stats.get_totals().0, 0);
+        assert_eq!(fs.quota.committed_bytes(), 0);
+        assert!(!fs.quota.is_poisoned());
+        fs.write(&auth, replacement, 0, &Bytes::from(vec![b'b'; 4096]))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_remove_reclaims_after_replay_expiry() {
+        cancelled_replay_protected_reclaim(false).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_rename_reclaims_after_replay_expiry() {
+        cancelled_replay_protected_reclaim(true).await;
+    }
+
     #[test]
     fn failed_metadata_settlement_preserves_committed_quota() {
         let quota = LogicalQuota::new(8, 4);
