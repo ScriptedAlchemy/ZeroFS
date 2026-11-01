@@ -5031,6 +5031,8 @@ mod tests {
     #[derive(Debug)]
     struct DelayedDeleteAckStore {
         inner: Arc<InMemory>,
+        entered: Arc<tokio::sync::Notify>,
+        proceed: Arc<tokio::sync::Notify>,
         applied: Arc<tokio::sync::Notify>,
         release: Arc<tokio::sync::Notify>,
     }
@@ -5069,15 +5071,21 @@ mod tests {
             locations: BoxStream<'static, object_store::Result<Path>>,
         ) -> BoxStream<'static, object_store::Result<Path>> {
             let inner = Arc::clone(&self.inner);
+            let entered = Arc::clone(&self.entered);
+            let proceed = Arc::clone(&self.proceed);
             let applied = Arc::clone(&self.applied);
             let release = Arc::clone(&self.release);
             locations
                 .then(move |result| {
                     let inner = Arc::clone(&inner);
+                    let entered = Arc::clone(&entered);
+                    let proceed = Arc::clone(&proceed);
                     let applied = Arc::clone(&applied);
                     let release = Arc::clone(&release);
                     async move {
                         let path = result?;
+                        entered.notify_one();
+                        proceed.notified().await;
                         object_store::ObjectStoreExt::delete(inner.as_ref(), &path).await?;
                         applied.notify_one();
                         release.notified().await;
@@ -5123,9 +5131,13 @@ mod tests {
     #[tokio::test]
     async fn cancelled_delete_stream_evicts_after_remote_delete_without_ack() {
         let inner = Arc::new(InMemory::new());
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let proceed = Arc::new(tokio::sync::Notify::new());
         let applied = Arc::new(tokio::sync::Notify::new());
         let backend = Arc::new(DelayedDeleteAckStore {
             inner: Arc::clone(&inner),
+            entered: Arc::clone(&entered),
+            proceed: Arc::clone(&proceed),
             applied: Arc::clone(&applied),
             release: Arc::new(tokio::sync::Notify::new()),
         });
@@ -5139,6 +5151,14 @@ mod tests {
         let delete_path = path.clone();
         let mut stream = store.delete_stream(stream::once(async move { Ok(delete_path) }).boxed());
         let task = tokio::spawn(async move { stream.next().await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .expect("backend deletion was not dispatched");
+        // The input-side invalidation is not enough: while the delete waits
+        // for the backend, another reader can refill the old head and parts.
+        let _ = store.get(&path).await.unwrap().bytes().await.unwrap();
+        assert!(store.read_head(&path).is_some());
+        proceed.notify_one();
         tokio::time::timeout(std::time::Duration::from_secs(5), applied.notified())
             .await
             .expect("backend deletion did not apply");
