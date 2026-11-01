@@ -1,3 +1,4 @@
+use crate::sftp_metrics::{SftpPhase, observe_phase};
 use crate::sftp_object_store::{ObjectHeader, SftpCapabilities};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -1497,10 +1498,15 @@ impl SftpSessionPool {
         &self,
         kind: OperationKind,
     ) -> Result<SessionLease, TransportError> {
-        let admission = self.inner.admission.acquire(kind).await?;
+        let admission = observe_phase(
+            SftpPhase::Admission,
+            kind,
+            self.inner.admission.acquire(kind),
+        )
+        .await?;
         let activity = self.inner.register_activity()?;
 
-        let session = self.acquire_session(kind).await?;
+        let session = observe_phase(SftpPhase::Session, kind, self.acquire_session(kind)).await?;
         Ok(SessionLease {
             pool: self.inner.clone(),
             session: Some(session),

@@ -14,7 +14,7 @@ read path can therefore matter substantially even without relocating ZeroFS.
 Those network measurements are operator reports; this change has not repeated
 them or benchmarked the deployed Hetzner service.
 
-The operator's later full trace supersedes the early throughput estimate:
+An earlier operator trace superseded the first throughput estimate:
 the destination drive receives **12–14 MB/s**, while approximately **25 MB/s**
 arrives at CT198 from Hetzner. The earlier 25 MB/s figure was not completed
 copy throughput. Each of eight SFTP sessions delivers approximately 2–4 MB/s;
@@ -26,16 +26,140 @@ limit. The upstream/downstream gap alone does not prove that every extra byte
 is wasted: it can also include useful cache filling, protocol traffic, and
 differences between measurement intervals.
 
-The latest operator update reports that ten open Hetzner connections and four
+A subsequent operator update reported that ten open Hetzner connections and four
 concurrent NFS copies settled back to about **13 MB/s at the destination**.
 The earlier 37 MB/s burst was attributed to cached data; the forecast of
 16–18 MB/s did not materialize. Increasing the pool from eight to ten therefore
 did not produce a reported sustained improvement. Open connections alone do
 not establish active request concurrency, or distinguish scheduling gaps from
-a shared backend limit. The running binary revision remains unverified here.
+a shared backend limit. That update did not yet identify the running binary revision.
 With all ten account slots occupied, an additional SFTP benchmark must wait
 for capacity; the eight-production-plus-two-test example below does not apply
 to that live configuration.
+
+## Uploaded capture: November 1, 06:09–06:24 UTC
+
+The operator supplied a capture from the running `bbe5f3d6` build with ten
+connections, `read_concurrency = 64`, 1 MiB cache parts and four concurrent NFS
+copies. The subsequent `e40f15a` missing-range scheduling fix was **not deployed**
+for this capture. No live gain is attributed to that follow-up.
+
+The common interval is 06:09:22.611–06:23:57.447 UTC (874.836 seconds). Rates
+use cumulative byte differences divided by elapsed time. Socket and Mac
+endpoints are interpolated within their approximately one-second samples;
+filesystem/cache counters have a separate five-second export cadence.
+
+| Counter layer | Decimal MB/s | MiB/s |
+| --- | ---: | ---: |
+| TCP received on the ten SFTP connections | 18.610 | 17.748 |
+| Accepted SFTP object payload | 18.578 | 17.717 |
+| Filesystem read bytes | 18.141 | 17.300 |
+| Logical growth of the four destination files | 18.148 | 17.307 |
+| Destination filesystem allocated-space growth | 18.146 | 17.305 |
+
+Destination file growth is about 97.5% of TCP bytes received in this window.
+That is a cross-layer ratio, **not an exact useful-byte efficiency**: cache
+boundaries, compression/encryption representation, metadata and metric export
+lag differ. It does not support carrying forward the earlier estimate of a
+30% incoming-byte loss. With unchanged ingress, recovering the observed
+18.610 minus 18.148 MB/s gap alone would be about 0.46 MB/s, not a large gain.
+
+All ten socket identities persisted across 903 samples, averaging 1.78–1.91
+MB/s each. All four destination file identities persisted across 934 samples,
+with no logical-size resets. Complete one-minute file-growth intervals ranged
+from 16.44 to 21.03 MB/s. The derived `het_1s.csv` exactly matches socket byte
+differences and is not a second independent network measurement.
+
+Allocator memory remained steady; cache overflow counters did not increase.
+Process thread CPU averaged approximately 0.54 core, **assuming the unrecorded
+Linux CLK_TCK value was 100**. The Mac iostat command failed and produced an
+empty file; file sizes and `df` therefore do not establish physical disk
+latency, device utilization or durable completion. CT198 diskstats lacked a
+cache-mount-to-device mapping, so stacked device counters cannot be attributed
+to the cache or summed as separate workload traffic.
+
+The metadata engine's unlabeled object-store counters in this capture are not
+aggregate request/error counts. The old exporter discarded each series' labels,
+merged counters through `absolute` (effectively the highest value), and overwrote
+gauges and histogram sums. The follow-up preserves the original label sets.
+Do not calculate a failed-read rate from those old flattened values. The
+journal contains no WARN/ERROR lines, but that does not classify every engine
+error or prove zero retries.
+
+This capture narrows the question to increasing successful backend delivery;
+it does not establish a provider throttle, sufficient SFTP request concurrency,
+or the exact origin of waiting time. TCP socket statistics do not count SFTP
+requests inside the encrypted SSH stream.
+
+## Follow-up diagnostics: request waits and object phases
+
+The follow-up adds normal-build metrics without changing transfer limits or
+read scheduling. They are aggregate process counters, with static `phase`,
+`kind`, and `outcome` labels; no path, hostname or reconnect ID labels are added.
+The timing covers **client future lifetimes**. It is not a count of packets
+on the wire, and a cancelled future may leave a request already sent to the
+server that the transport still has to drain.
+
+| Metric | Meaning |
+| --- | --- |
+| `zerofs_sftp_read_requests_total` | READ futures first polled, including header reads and EOF probes |
+| `zerofs_sftp_read_requests_inflight` | Polled READ futures whose result has not returned or been cancelled |
+| `zerofs_sftp_read_requested_bytes_total` | Sum of lengths requested by those futures; not delivered bytes |
+| `zerofs_sftp_read_requested_bytes_inflight` | Requested lengths owned by currently pending READ futures |
+| `zerofs_sftp_read_requests_finished_total{outcome}` | DATA, EOF, error, or cancellation results |
+| `zerofs_sftp_read_reply_bytes_total` | All DATA reply bytes, including headers and replies later discarded with a failed object |
+| `zerofs_sftp_read_reply_size_bytes` | DATA size distribution; exporter exposes `_count`, `_sum`, and quantiles |
+| `zerofs_sftp_read_short_replies_total` | Nonempty DATA replies smaller than requested |
+| `zerofs_sftp_read_request_duration_seconds{outcome}` | Client READ duration, including local queueing and transport/server time |
+| `zerofs_sftp_phase_inflight{phase,kind}` | Pending phase futures |
+| `zerofs_sftp_phase_duration_seconds{phase,kind,outcome}` | Phase duration, including success, error and cancellation |
+
+Pool phases are `admission` and `session`, split by read/write/metadata kind.
+Read-operation phases are `open`, `fstat`, `header`, `payload`, and `close`.
+FSTAT, header and speculative payload run concurrently: **do not sum their
+latencies as sequential wall time**. Both object reads and exact reads carry
+OPEN/payload/CLOSE observations. Drop guards release gauges on cancellation;
+the counters report cancellation separately from EOF or failure.
+
+LSM series keep their `lsm_` names and now retain engine labels such as
+component, store, operation and API. Consumers needing totals must aggregate
+across the intended labels. The legacy engine histogram export remains a
+labeled cumulative-sum gauge, not a request-latency percentile.
+
+### Next capture and decision
+
+At a planned service change point, compare a build containing `e40f15a` and
+these diagnostics with the captured `bbe5f3d6` baseline, preserving resumable
+partial copies. Record the exact deployed SHA and unchanged effective
+configuration. A restart/cache burst is not a steady-state gain.
+
+Capture 10–15 minutes of full raw Prometheus scrapes at one-second intervals
+alongside the existing socket and per-file growth data. Preserve labels and
+raw cumulative counters. Keep the four-copy workload and account connection
+budget unchanged; ten production connections leave no extra SFTP benchmark
+slots. Record host clock synchronization, `getconf CLK_TCK`, cgroup CPU limits
+and throttling, and the actual cache mount/device mapping. For the Mac disk
+monitor, resolve the volume's whole disk with `diskutil info` and monitor that
+whole disk; the partition identifier in the previous command was rejected.
+
+Calculate request mean latency from deltas of the duration `_sum` and `_count`,
+and mean DATA size from reply bytes divided by the DATA-size `_count` delta.
+Use outcome-separated durations and sampled pending gauges. Request-duration
+sums per elapsed second approximate average occupied client READ futures only
+in steady state, with boundary-censored requests accounted for. Those are
+process aggregates, not proof of an even per-connection request distribution.
+
+- Long admission/session waits identify local admission or pool placement as
+  the next target; distinguish read demand from metadata/write competition.
+- Low pending payload work with substantial OPEN/CLOSE time motivates a
+  controlled test of larger useful ranges or safe immutable-handle reuse.
+- Many pending READs with slow replies and small local waits point further
+  into SSH/network/server service; they do not by themselves prove a provider
+  rate cap. A direct native-SFTP comparison needs an isolated connection budget
+  and the same object/range workload.
+- A persistent large reply-byte/object-payload gap identifies retries, discarded
+  work or EOF/metadata overhead for inspection. Compare like windows and known
+  object sizes before attributing every difference to waste.
 
 ## Transport and application windows
 
@@ -155,9 +279,10 @@ a measurement of the deployed Mac's outstanding reads:
 For a live comparison, record the running binary revision, effective SFTP
 configuration, the actual copy command, NFS READ size/latency/outstanding count,
 server backend activity, and destination write latency over the same interval.
-The exact running revision has not been independently verified here. Use the
-corrected **12–14 MB/s destination rate**, not the superseded 25 MB/s estimate,
-as the operator-reported baseline. Compare the next build only at an agreed
+The later uploaded capture above identifies the operator-reported revision
+and gives an aligned **18.15 MB/s logical destination growth** baseline. The
+older 12–14 MB/s destination and 25 MB/s upstream figures describe an earlier
+interval, not this capture. Compare the next build only at an agreed
 service change point, recording the same workload and cache conditions while
 preserving the in-progress copies.
 

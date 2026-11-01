@@ -1,6 +1,8 @@
+use crate::sftp_metrics::{ReadRequestObservation, SftpPhase, observe_phase};
 use crate::sftp_object_store::{OBJECT_HEADER_LEN, SftpCapabilities, decode_header};
 use crate::sftp_transport::{
-    RemoteDirectoryEntry, RemoteEntryKind, RemoteObjectRead, TransportError, TransportSession,
+    OperationKind, RemoteDirectoryEntry, RemoteEntryKind, RemoteObjectRead, TransportError,
+    TransportSession,
 };
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
@@ -902,7 +904,16 @@ where
             }
             pending_bytes += request.len;
             let response = read(request.offset, request.len);
-            pending.push(async move { response.await.map(|bytes| (request, bytes)) });
+            pending.push(async move {
+                let mut observation = ReadRequestObservation::start(request.len);
+                let result = response.await;
+                match &result {
+                    Ok(Some(bytes)) => observation.data(bytes.len()),
+                    Ok(None) => observation.eof(),
+                    Err(_) => observation.error(),
+                }
+                result.map(|bytes| (request, bytes))
+            });
         }
 
         let Some(response) = pending.next().await else {
@@ -1003,10 +1014,13 @@ impl TransportSession for SftpProtocolSession {
     ) -> Result<RemoteObjectRead, TransportError> {
         let sftp = self.sftp()?;
         let remote = sftp_path(path)?;
-        let opened = sftp
-            .open(remote, OpenFlags::READ, FileAttributes::default())
-            .await
-            .map_err(|error| map_sftp_error(path, error))?;
+        let opened = observe_phase(
+            SftpPhase::Open,
+            OperationKind::Read,
+            sftp.open(remote, OpenFlags::READ, FileAttributes::default()),
+        )
+        .await
+        .map_err(|error| map_sftp_error(path, error))?;
         let handle = opened.handle;
         let result = async {
             let speculative_range = match (&requested_range, head) {
@@ -1026,15 +1040,22 @@ impl TransportSession for SftpProtocolSession {
             let speculative_payload = async {
             match &speculative_range {
                 Some((physical_start, len)) => Some(
-                    read_handle_up_to(sftp, &handle, path, *physical_start, *len, self.limits, &self.read_packets)
-                        .await,
+                    observe_phase(
+                        SftpPhase::Payload,
+                        OperationKind::Read,
+                        read_handle_up_to(sftp, &handle, path, *physical_start, *len, self.limits, &self.read_packets),
+                    ).await,
                 ),
                 None => None,
             }
             };
             let (metadata, encoded_header, speculative_payload) = tokio::join!(
-            sftp.fstat(handle.as_str()),
-            read_handle_pipelined(sftp, &handle, path, 0, OBJECT_HEADER_LEN, self.limits, &self.read_packets),
+            observe_phase(SftpPhase::Fstat, OperationKind::Read, sftp.fstat(handle.as_str())),
+            observe_phase(
+                SftpPhase::Header,
+                OperationKind::Read,
+                read_handle_pipelined(sftp, &handle, path, 0, OBJECT_HEADER_LEN, self.limits, &self.read_packets),
+            ),
             speculative_payload,
             );
             let metadata = metadata.map_err(|error| map_sftp_error(path, error))?.attrs;
@@ -1110,7 +1131,11 @@ impl TransportSession for SftpProtocolSession {
                     path.display()
                 ))
             })?;
-                read_handle_pipelined(sftp, &handle, path, physical_start, len, self.limits, &self.read_packets).await?
+                observe_phase(
+                    SftpPhase::Payload,
+                    OperationKind::Read,
+                    read_handle_pipelined(sftp, &handle, path, physical_start, len, self.limits, &self.read_packets),
+                ).await?
             };
             Ok(RemoteObjectRead {
                 header,
@@ -1120,8 +1145,7 @@ impl TransportSession for SftpProtocolSession {
             })
         }
         .await;
-        let close = sftp
-            .close(handle)
+        let close = observe_phase(SftpPhase::Close, OperationKind::Read, sftp.close(handle))
             .await
             .map_err(|error| map_sftp_close_error(path, error));
         finish_raw_handle(result, close.map(|_| ()))
@@ -1278,23 +1302,29 @@ impl TransportSession for SftpProtocolSession {
     ) -> Result<Bytes, TransportError> {
         let sftp = self.sftp()?;
         let remote = sftp_path(path)?;
-        let opened = sftp
-            .open(remote, OpenFlags::READ, FileAttributes::default())
-            .await
-            .map_err(|error| map_sftp_error(path, error))?;
+        let opened = observe_phase(
+            SftpPhase::Open,
+            OperationKind::Read,
+            sftp.open(remote, OpenFlags::READ, FileAttributes::default()),
+        )
+        .await
+        .map_err(|error| map_sftp_error(path, error))?;
         let handle = opened.handle;
-        let bytes = read_handle_pipelined(
-            sftp,
-            &handle,
-            path,
-            offset,
-            len,
-            self.limits,
-            &self.read_packets,
+        let bytes = observe_phase(
+            SftpPhase::Payload,
+            OperationKind::Read,
+            read_handle_pipelined(
+                sftp,
+                &handle,
+                path,
+                offset,
+                len,
+                self.limits,
+                &self.read_packets,
+            ),
         )
         .await;
-        let close = sftp
-            .close(handle)
+        let close = observe_phase(SftpPhase::Close, OperationKind::Read, sftp.close(handle))
             .await
             .map_err(|error| map_sftp_close_error(path, error))
             .map(|_| ());
@@ -1360,6 +1390,162 @@ impl TransportSession for SftpProtocolSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_pipeline_metrics_account_for_short_data_and_eof() {
+        use crate::sftp_metrics::tests::metric_value;
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        let bytes = read_chunks_up_to(
+            Path::new("metrics-object"),
+            0,
+            96 * 1024,
+            64 * 1024,
+            &ReadPacketSizing::default(),
+            |offset, _len| async move {
+                if offset >= 64 * 1024 {
+                    Ok(None)
+                } else {
+                    Ok(Some(Bytes::from(vec![0x5a; 32 * 1024])))
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(bytes, Bytes::from(vec![0x5a; 64 * 1024]));
+        let body = handle.render();
+        for name in [
+            "zerofs_sftp_read_requests_inflight",
+            "zerofs_sftp_read_requested_bytes_inflight",
+        ] {
+            assert_eq!(metric_value(&body, name, &[]), 0.0);
+        }
+        assert_eq!(
+            metric_value(&body, "zerofs_sftp_read_requests_total", &[]),
+            3.0
+        );
+        assert_eq!(
+            metric_value(&body, "zerofs_sftp_read_requested_bytes_total", &[]),
+            (128 * 1024) as f64
+        );
+        assert_eq!(
+            metric_value(&body, "zerofs_sftp_read_reply_bytes_total", &[]),
+            (64 * 1024) as f64
+        );
+        assert_eq!(
+            metric_value(&body, "zerofs_sftp_read_reply_size_bytes_count", &[]),
+            2.0
+        );
+        assert_eq!(
+            metric_value(&body, "zerofs_sftp_read_short_replies_total", &[]),
+            1.0
+        );
+        for (outcome, count) in [("data", 2.0), ("eof", 1.0)] {
+            assert_eq!(
+                metric_value(
+                    &body,
+                    "zerofs_sftp_read_requests_finished_total",
+                    &[("outcome", outcome)]
+                ),
+                count
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn read_pipeline_metrics_release_pending_requests_on_cancellation() {
+        use crate::sftp_metrics::tests::metric_value;
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        let sizing = ReadPacketSizing::default();
+        let mut read = Box::pin(read_chunks_up_to(
+            Path::new("metrics-object"),
+            0,
+            128 * 1024,
+            32 * 1024,
+            &sizing,
+            |_offset, _len| std::future::pending::<Result<Option<Bytes>, TransportError>>(),
+        ));
+        assert!(futures::poll!(read.as_mut()).is_pending());
+        let body = handle.render();
+        assert_eq!(
+            metric_value(&body, "zerofs_sftp_read_requests_inflight", &[]),
+            4.0
+        );
+        assert_eq!(
+            metric_value(&body, "zerofs_sftp_read_requested_bytes_inflight", &[]),
+            (128 * 1024) as f64
+        );
+        tokio::time::advance(std::time::Duration::from_millis(100)).await;
+        drop(read);
+        let body = handle.render();
+        assert_eq!(
+            metric_value(&body, "zerofs_sftp_read_requests_inflight", &[]),
+            0.0
+        );
+        assert_eq!(
+            metric_value(&body, "zerofs_sftp_read_requested_bytes_inflight", &[]),
+            0.0
+        );
+        assert_eq!(
+            metric_value(
+                &body,
+                "zerofs_sftp_read_requests_finished_total",
+                &[("outcome", "cancelled")]
+            ),
+            4.0
+        );
+        assert_eq!(
+            metric_value(
+                &body,
+                "zerofs_sftp_read_request_duration_seconds_sum",
+                &[("outcome", "cancelled")]
+            ),
+            0.4
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_pipeline_metrics_preserve_failed_request_results() {
+        use crate::sftp_metrics::tests::metric_value;
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        let result = read_chunks_up_to(
+            Path::new("metrics-object"),
+            0,
+            32 * 1024,
+            32 * 1024,
+            &ReadPacketSizing::default(),
+            |_offset, _len| async { Err(TransportError::Operation("read failed".to_owned())) },
+        )
+        .await;
+        assert!(
+            matches!(result, Err(TransportError::Operation(message)) if message == "read failed")
+        );
+        let body = handle.render();
+        assert_eq!(
+            metric_value(&body, "zerofs_sftp_read_requests_inflight", &[]),
+            0.0
+        );
+        assert_eq!(
+            metric_value(&body, "zerofs_sftp_read_requested_bytes_inflight", &[]),
+            0.0
+        );
+        assert_eq!(
+            metric_value(
+                &body,
+                "zerofs_sftp_read_requests_finished_total",
+                &[("outcome", "error")]
+            ),
+            1.0
+        );
+    }
 
     #[tokio::test]
     async fn bounded_sftp_stream_rejects_oversized_length_before_forwarding_it() {
