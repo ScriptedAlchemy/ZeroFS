@@ -35,6 +35,7 @@ jobs:
       - name: Clone xfstests
         run: |
           git clone https://github.com/Barre/xfstests.git /tmp/xfstests
+          bash scripts/ci/xfstests-gnu-tools.sh /tmp/xfstests
 
       - name: Build xfstests
         working-directory: /tmp/xfstests
