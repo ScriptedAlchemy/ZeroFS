@@ -91,11 +91,42 @@ it does not establish a provider throttle, sufficient SFTP request concurrency,
 or the exact origin of waiting time. TCP socket statistics do not count SFTP
 requests inside the encrypted SSH stream.
 
+### Later operator-reported path matrix
+
+The operator subsequently reported the following results from
+`path-matrix-20261101T065508Z`. The raw files for this matrix were not available
+to this code session, so these are operator reports, separate from the uploaded
+capture analyzed above. The four production copies continued during the tests;
+the service configuration and deployed build were unchanged.
+
+| Test | Reported result |
+| --- | --- |
+| CT198 to Mac iperf3, 1 / 4 / 8 streams | 38 / 62 / 56 MB/s, with the copies competing |
+| Four additional readers of cached ZeroFS data | Approximately 15 MB/s above the copy traffic |
+| Additional uncached readers, 1 / 4 / 8 | No aggregate increase; shared the existing approximately 18 MB/s backend ingress |
+| Destination drive write with fsync | 163 MB/s |
+| CT198 cache disk write / read | Approximately 680 / 807 MB/s |
+
+The operator also reports 80–88% idle CPU on CT198, a 1280-byte MTU, about
+70 ms round trip and no observed drops on the tested overlay path. These tests
+support focusing on uncached backend delivery. The fast CT198-to-Mac TCP test
+does not directly measure the separate CT198-to-Hetzner connection, or isolate
+SFTP request scheduling from SSH service and backend storage behavior.
+
+Mac Tailscale used approximately 4.3 cores at 60 MB/s. That point identifies a
+possible later constraint; it does not establish a hard 60 MB/s throughput
+ceiling. The reported object-store error-counter growth (approximately 22 per
+ten seconds) is still from the exporter that discarded engine labels. Neither
+that delta nor the reported 13k/845k ratio identifies failed SFTP reads. The
+diagnostics below separate returned backend outcomes from locally cached
+absence responses, while preserving the engine labels for the next capture.
+
 ## Follow-up diagnostics: request waits and object phases
 
 The follow-up adds normal-build metrics without changing transfer limits or
 read scheduling. They are aggregate process counters, with static `phase`,
-`kind`, and `outcome` labels; no path, hostname or reconnect ID labels are added.
+`kind`, `operation`, and `outcome` labels; no path, hostname or reconnect ID
+labels are added.
 The timing covers **client future lifetimes**. It is not a count of packets
 on the wire, and a cancelled future may leave a request already sent to the
 server that the transport still has to drain.
@@ -113,6 +144,8 @@ server that the transport still has to drain.
 | `zerofs_sftp_read_request_duration_seconds{outcome}` | Client READ duration, including local queueing and transport/server time |
 | `zerofs_sftp_phase_inflight{phase,kind}` | Pending phase futures |
 | `zerofs_sftp_phase_duration_seconds{phase,kind,outcome}` | Phase duration, including success, error and cancellation |
+| `zerofs_sftp_negative_cache_hits_total{operation}` | Get/head absence responses satisfied locally without leasing an SFTP session |
+| `zerofs_sftp_backend_read_results_total{operation,outcome}` | Returned get/head backend operation results, classified before conversion to object-store errors |
 
 Pool phases are `admission` and `session`, split by read/write/metadata kind.
 Read-operation phases are `open`, `fstat`, `header`, `payload`, and `close`.
@@ -121,6 +154,15 @@ latencies as sequential wall time**. Both object reads and exact reads carry
 OPEN/payload/CLOSE observations. Drop guards release gauges on cancellation;
 the counters report cancellation separately from EOF or failure.
 
+Backend results use `operation="get"` or `"head"` and outcomes `success`,
+`not_found`, `invalid_range`, `permission_denied`, `corrupt_object`,
+`pool_closed`, and `transport_error`. They include admission, session and
+handle-completion failures; they are not a count of on-wire READ responses.
+They exclude negative-cache hits, rejected local options/paths and cancelled
+operations that never return. The phase/request observations above retain the
+cancellation evidence. `not_found` can be an expected metadata probe; inspect
+the labeled engine operation before treating it as a copy failure.
+
 LSM series keep their `lsm_` names and now retain engine labels such as
 component, store, operation and API. Consumers needing totals must aggregate
 across the intended labels. The legacy engine histogram export remains a
@@ -128,10 +170,11 @@ labeled cumulative-sum gauge, not a request-latency percentile.
 
 ### Next capture and decision
 
-At a planned service change point, compare a build containing `e40f15a` and
-these diagnostics with the captured `bbe5f3d6` baseline, preserving resumable
-partial copies. Record the exact deployed SHA and unchanged effective
-configuration. A restart/cache burst is not a steady-state gain.
+At a planned service change point, compare a build containing `e40f15a`,
+these diagnostics and the EOF reply-size learning fix below with the captured
+`bbe5f3d6` baseline, preserving resumable partial copies. Record the exact
+deployed SHA and unchanged effective configuration. A restart/cache burst is
+not a steady-state gain.
 
 Capture 10–15 minutes of full raw Prometheus scrapes at one-second intervals
 alongside the existing socket and per-file growth data. Preserve labels and
@@ -160,6 +203,10 @@ process aggregates, not proof of an even per-connection request distribution.
 - A persistent large reply-byte/object-payload gap identifies retries, discarded
   work or EOF/metadata overhead for inspection. Compare like windows and known
   object sizes before attributing every difference to waste.
+- Compare labeled engine errors with backend-result outcomes and negative-cache
+  hits. Locally answered absence probes do not consume SFTP bandwidth. Actual
+  permission, corruption, transport or pool failures need their own treatment;
+  a combined object-store error count cannot distinguish them.
 
 ## Transport and application windows
 
@@ -259,6 +306,53 @@ No deployed Hetzner measurements are claimed for this follow-up.
 ```console
 cargo test --locked --no-default-features --lib \
   sftp_protocol::tests::repeated_short_reply_windows_keep_the_wan_pipeline_full \
+  -- --exact --nocapture
+```
+
+### Preserve nonterminal reply-size evidence across EOF
+
+The clipped-read repair originally suppressed reply-size learning whenever a
+speculative cache range crossed the object's end. That protected against
+mistaking an EOF tail for a server cap, but also discarded every preceding
+consistent short reply. Repeated reads of smaller objects could therefore pay
+the reply-size discovery cost on every operation on the same connection.
+
+A regression requests a 1 MiB range from a 720,913-byte patterned payload, with
+32 KiB capped replies and a deterministic 95 ms response delay. It failed on
+the preceding implementation: both the first and second read took 285 ms.
+After the fix, the first read still takes 285 ms and the next two take 190 ms.
+Each read verifies every payload byte and that DATA transfers the payload
+exactly once.
+
+| Controlled EOF-clipped payload read | Before | After |
+| --- | ---: | ---: |
+| First read on the session | 285 ms | 285 ms |
+| Next read on the same session | 285 ms | 190 ms |
+
+The reader now holds back the DATA sample with the greatest end offset while
+aggregating earlier samples. After complete coverage validation, it excludes
+a terminal short reply when EOF clipped the requested range, but retains the
+nonterminal evidence. This takes constant additional state, handles reordered
+DATA/EOF, and does not change request, byte, connection or admission limits.
+At least two matching nonterminal short replies are still required to learn
+a cap. A complete maximum-sized final reply remains valid evidence for a
+periodic probe to clear an old smaller hint.
+
+Additional regressions cover empty/small uncapped objects, a 40 KiB EOF tail
+after consistent 64 KiB capped replies, out-of-order EOF, and recovery to a
+full-sized reply on an object exactly one maximum packet long. Existing
+coverage, invalid-reply, negotiated-limit, cancellation, and native SSH
+integrity checks remain applicable.
+
+The measured 95 ms reduction is confined to the **simulated payload scheduler**.
+It excludes connection/handle setup, metadata, SSH/TCP, remote disk and the
+mounted copy path. The actual Hetzner reply-size distribution and the frequency
+of these clipped reads have not yet been measured. This is a reproduced
+conditional optimization, not a measured live throughput increase.
+
+```console
+cargo test --locked --no-default-features --lib \
+  sftp_protocol::tests::repeated_eof_clipped_reads_reuse_nonterminal_reply_size \
   -- --exact --nocapture
 ```
 

@@ -160,6 +160,50 @@ impl ReadReplyShape {
     }
 }
 
+struct ReadReplySample {
+    end: u64,
+    requested: usize,
+    received: usize,
+}
+
+/// Keep the last DATA reply by offset separate from the aggregate. A short
+/// terminal reply can be an object tail, but earlier consistent short replies
+/// still establish a useful server cap when a speculative read crosses EOF.
+/// Holding one sample also handles replies arriving out of order without
+/// retaining a list of requests or any additional payload bytes.
+#[derive(Default)]
+struct ReadReplySamples {
+    shape: ReadReplyShape,
+    last: Option<ReadReplySample>,
+}
+
+impl ReadReplySamples {
+    fn observe(&mut self, end: u64, requested: usize, received: usize) {
+        if self.last.as_ref().is_none_or(|last| end > last.end) {
+            if let Some(last) = self.last.replace(ReadReplySample {
+                end,
+                requested,
+                received,
+            }) {
+                self.shape.observe(last.requested, last.received);
+            }
+        } else {
+            self.shape.observe(requested, received);
+        }
+    }
+
+    fn finish(mut self, clipped_by_eof: bool) -> ReadReplyShape {
+        if let Some(last) = self.last
+            && (!clipped_by_eof || last.received == last.requested)
+        {
+            // A full reply is useful even at EOF: periodic probes must be able
+            // to clear a stale smaller hint for a one-packet object too.
+            self.shape.observe(last.requested, last.received);
+        }
+        self.shape
+    }
+}
+
 impl ReadPacketSizing {
     fn plan(&self, maximum: usize, len: usize) -> ReadPacketPlan {
         let previous_hint = self.reply_limit.load(Ordering::Relaxed);
@@ -878,7 +922,7 @@ where
     let mut buffer = BytesMut::zeroed(len);
     let mut pending = futures::stream::FuturesUnordered::new();
     let mut pending_bytes = 0;
-    let mut reply_shape = ReadReplyShape::default();
+    let mut reply_samples = ReadReplySamples::default();
     let requested_end = offset + len as u64; // Validated by the plan above.
     let mut covered_end = requested_end;
     let mut received_total = 0;
@@ -952,7 +996,7 @@ where
         }
         greatest_data_end = greatest_data_end.max(data_end);
         received_total += received;
-        reply_shape.observe(request.len, received);
+        reply_samples.observe(data_end, request.len, received);
         // Every queued range is a disjoint subrange of the validated plan.
         // Copy by offset so out-of-order replies never hold up slot refills.
         let start = (request.offset - offset) as usize;
@@ -976,10 +1020,12 @@ where
             path.display()
         )));
     }
-    // An EOF tail is not evidence of a stable server reply-size cap.
-    if covered_end == requested_end {
-        read_packets.completed(packet_plan, reply_shape);
-    }
+    // Learn only after complete coverage is validated, excluding a short EOF
+    // tail without discarding the preceding nonterminal reply-size evidence.
+    read_packets.completed(
+        packet_plan,
+        reply_samples.finish(covered_end < requested_end),
+    );
     buffer.truncate(covered_len);
     Ok(buffer.freeze())
 }
@@ -1712,6 +1758,147 @@ mod tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn repeated_eof_clipped_reads_reuse_nonterminal_reply_size() {
+        use std::time::Duration;
+
+        let rtt = Duration::from_millis(95);
+        let offset = 193;
+        let payload_len = 720_913;
+        let eof = offset + payload_len as u64;
+        let read_packets = ReadPacketSizing::default();
+        for window in 0..3 {
+            let transferred = AtomicUsize::new(0);
+            let started = tokio::time::Instant::now();
+            let bytes = read_chunks_up_to(
+                Path::new("repeated-clipped-short-replies"),
+                offset,
+                1024 * 1024,
+                SFTP_READ_PACKET_SIZE,
+                &read_packets,
+                |at, requested| {
+                    let transferred = &transferred;
+                    async move {
+                        tokio::time::sleep(rtt).await;
+                        if at >= eof {
+                            return Ok(None);
+                        }
+                        let received = requested.min(32 * 1024).min((eof - at) as usize);
+                        transferred.fetch_add(received, Ordering::SeqCst);
+                        Ok(Some(read_pattern(at, received)))
+                    }
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(bytes, read_pattern(offset, payload_len));
+            assert_eq!(transferred.load(Ordering::SeqCst), payload_len);
+            let elapsed = started.elapsed();
+            eprintln!(
+                "simulated SFTP clipped read: window {window}, {payload_len} bytes, 32 KiB replies: {elapsed:?}"
+            );
+            if window != 0 {
+                assert!(
+                    elapsed <= rtt * 2,
+                    "EOF discarded the preceding reply-size evidence: {elapsed:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn eof_tail_sizes_do_not_train_a_reply_cap() {
+        for payload_len in [
+            0,
+            40 * 1024,
+            SFTP_READ_PACKET_SIZE,
+            2 * SFTP_READ_PACKET_SIZE + 40 * 1024,
+        ] {
+            let read_packets = ReadPacketSizing::default();
+            let bytes = read_chunks_up_to(
+                Path::new("uncapped-object-tail"),
+                0,
+                1024 * 1024,
+                SFTP_READ_PACKET_SIZE,
+                &read_packets,
+                |at, requested| async move {
+                    Ok((at < payload_len as u64)
+                        .then(|| read_pattern(at, requested.min(payload_len - at as usize))))
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(bytes, read_pattern(0, payload_len));
+            assert_eq!(read_packets.reply_limit.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn different_sized_eof_tail_does_not_hide_nonterminal_reply_cap() {
+        let read_packets = ReadPacketSizing::default();
+        let payload_len = 3 * SFTP_READ_PACKET_SIZE + 40 * 1024;
+        let bytes = read_chunks_up_to(
+            Path::new("capped-object-tail"),
+            0,
+            1024 * 1024,
+            SFTP_READ_PACKET_SIZE,
+            &read_packets,
+            |at, requested| async move {
+                Ok((at < payload_len as u64).then(|| {
+                    read_pattern(at, requested.min(64 * 1024).min(payload_len - at as usize))
+                }))
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(bytes, read_pattern(0, payload_len));
+        assert_eq!(read_packets.reply_limit.load(Ordering::Relaxed), 64 * 1024);
+    }
+
+    #[tokio::test]
+    async fn eof_clipped_periodic_probe_recovers_a_full_sized_reply() {
+        let read_packets = ReadPacketSizing::default();
+        let payload_len = 720_913;
+        let path = Path::new("changing-clipped-reply-cap");
+        let bytes = read_chunks_up_to(
+            path,
+            0,
+            1024 * 1024,
+            SFTP_READ_PACKET_SIZE,
+            &read_packets,
+            |at, requested| async move {
+                Ok((at < payload_len as u64).then(|| {
+                    read_pattern(at, requested.min(32 * 1024).min(payload_len - at as usize))
+                }))
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(bytes, read_pattern(0, payload_len));
+        assert_eq!(read_packets.reply_limit.load(Ordering::Relaxed), 32 * 1024);
+
+        // A full response at EOF is sufficient to clear the old cap, even
+        // when there is only one DATA packet during the periodic probe.
+        for _ in 0..SFTP_READ_PACKET_PROBE_INTERVAL {
+            let bytes = read_chunks_up_to(
+                path,
+                0,
+                1024 * 1024,
+                SFTP_READ_PACKET_SIZE,
+                &read_packets,
+                |at, requested| async move {
+                    Ok((at < SFTP_READ_PACKET_SIZE as u64).then(|| {
+                        read_pattern(at, requested.min(SFTP_READ_PACKET_SIZE - at as usize))
+                    }))
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(bytes, read_pattern(0, SFTP_READ_PACKET_SIZE));
+        }
+        assert_eq!(read_packets.reply_limit.load(Ordering::Relaxed), 0);
+    }
+
     #[tokio::test]
     async fn isolated_short_reply_does_not_tune_future_reads() {
         let read_packets = ReadPacketSizing::default();
@@ -2021,7 +2208,7 @@ mod tests {
         .unwrap();
         assert_eq!(bytes, read_pattern(offset, payload_len));
         assert_eq!(transferred.load(Ordering::SeqCst), payload_len);
-        assert_eq!(read_packets.reply_limit.load(Ordering::Relaxed), 0);
+        assert_eq!(read_packets.reply_limit.load(Ordering::Relaxed), 32 * 1024);
     }
 
     #[tokio::test(start_paused = true)]

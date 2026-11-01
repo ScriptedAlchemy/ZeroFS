@@ -972,13 +972,21 @@ impl SftpObjectStore {
         location: &ObjectPath,
         options: &GetOptions,
     ) -> object_store::Result<crate::sftp_transport::RemoteObjectRead> {
+        use crate::sftp_transport::TransportError;
+
         if options.version.is_some() {
             return Err(object_store::Error::NotSupported {
                 source: "SFTP object versions are not exposed separately from ETags".into(),
             });
         }
         let remote = self.remote_path(location, false)?;
+        let operation = if options.head { "head" } else { "get" };
         if self.known_missing.contains(location.as_ref()) {
+            metrics::counter!(
+                "zerofs_sftp_negative_cache_hits_total",
+                "operation" => operation,
+            )
+            .increment(1);
             return Err(object_store::Error::NotFound {
                 path: location.to_string(),
                 source: "SFTP object is known absent for this single-owner process".into(),
@@ -990,8 +998,26 @@ impl SftpObjectStore {
             "SFTP object read",
             |lease| lease.read_object(&remote, options.range.clone(), options.head)
         )
-        .await
-        .map_err(transport_error);
+        .await;
+        // Classify typed backend results before adapting them to object_store
+        // errors. Known misses above never lease a session; they must not be
+        // mistaken for failed remote reads. These completed operations can
+        // include admission, open, close, or pool errors, not just wire READs.
+        let outcome = match &result {
+            Ok(_) => "success",
+            Err(TransportError::NotFound(_)) => "not_found",
+            Err(TransportError::InvalidRange(_)) => "invalid_range",
+            Err(TransportError::PermissionDenied(_)) => "permission_denied",
+            Err(TransportError::CorruptObject(_)) => "corrupt_object",
+            Err(TransportError::PoolClosed) => "pool_closed",
+            Err(_) => "transport_error",
+        };
+        metrics::counter!(
+            "zerofs_sftp_backend_read_results_total",
+            "operation" => operation, "outcome" => outcome,
+        )
+        .increment(1);
+        let result = result.map_err(transport_error);
         match &result {
             Ok(object) => {
                 self.forget_missing(location);
@@ -3234,6 +3260,84 @@ mod tests {
             rendered.contains("zerofs_sftp_object_read_bytes_total 15"),
             "metrics:\n{rendered}"
         );
+        assert_eq!(
+            crate::sftp_metrics::tests::metric_value(
+                &rendered,
+                "zerofs_sftp_backend_read_results_total",
+                &[("operation", "get"), ("outcome", "success")],
+            ),
+            1.0
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_result_metrics_separate_cached_misses_and_backend_failures() {
+        use crate::sftp_metrics::tests::metric_value;
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        let remote = Arc::new(SharedRemoteFs::default());
+        remote.files.lock().unwrap().insert(
+            PathBuf::from("root/corrupt.bin"),
+            Bytes::from_static(b"invalid object"),
+        );
+        let pool = crate::sftp_transport::SftpSessionPool::new_writable(
+            Arc::new(SharedRemoteFactory(remote)),
+            1,
+            1,
+            1,
+        )
+        .await
+        .unwrap();
+        let store = SftpObjectStore::new(pool.clone(), ObjectPath::from("root")).unwrap();
+        let missing = ObjectPath::from("root/missing.bin");
+        for _ in 0..2 {
+            assert!(matches!(
+                store.get(&missing).await.unwrap_err(),
+                object_store::Error::NotFound { .. }
+            ));
+        }
+        assert!(matches!(
+            store.head(&missing).await.unwrap_err(),
+            object_store::Error::NotFound { .. }
+        ));
+        assert!(matches!(
+            store
+                .get(&ObjectPath::from("root/corrupt.bin"))
+                .await
+                .unwrap_err(),
+            object_store::Error::Generic { .. }
+        ));
+        pool.shutdown().await.unwrap();
+        assert!(
+            store
+                .get(&ObjectPath::from("root/after-shutdown.bin"))
+                .await
+                .is_err()
+        );
+
+        let body = handle.render();
+        for operation in ["get", "head"] {
+            assert_eq!(
+                metric_value(
+                    &body,
+                    "zerofs_sftp_negative_cache_hits_total",
+                    &[("operation", operation)],
+                ),
+                1.0
+            );
+        }
+        for outcome in ["not_found", "corrupt_object", "pool_closed"] {
+            assert_eq!(
+                metric_value(
+                    &body,
+                    "zerofs_sftp_backend_read_results_total",
+                    &[("operation", "get"), ("outcome", outcome)],
+                ),
+                1.0
+            );
+        }
     }
 
     /// The kill-during-staged-manifest recovery shape from the vm100 pilot: a
