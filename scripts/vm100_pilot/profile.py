@@ -292,12 +292,15 @@ def rewrite_gc_cadence(text: str, interval_secs: int) -> str:
         # A TOML table header may have a trailing comment (even one with ']'). Treat the header
         # as a section boundary so annotated non-GC tables cannot inherit GC
         # key rewrites, and annotated [gc] is never appended a second time.
+        inside_multiline_value = multiline_quote is not None
         header = (
             None
-            if multiline_quote is not None
+            if inside_multiline_value
             else re.fullmatch(r"(\[\[?.*?\]\]?)\s*(?:#.*)?", stripped)
         )
         multiline_quote = _advance_toml_multiline_quote(line, multiline_quote)
+        if inside_multiline_value:
+            continue
         if header is not None:
             # Parse the isolated table name, so ["gc"] and ['gc'] refer to
             # the same table as [gc]. A ']' inside a quoted non-GC name may
