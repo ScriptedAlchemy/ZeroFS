@@ -13,10 +13,12 @@ use uuid::Uuid;
 use zerofs_client::{Client, File, OpenOptions};
 
 const UPLOAD_PIPELINE_DEPTH_PER_CONNECTION: usize = 2;
-// Keep one large file moving over a WAN without unbounded payload buffering.
-// Normal full replies retain four 9 MiB chunks per active file. Short replies
-// additionally use a bounded assembly buffer for each unfinished range.
-const DOWNLOAD_PIPELINE_DEPTH: usize = 4;
+// The upload negotiation permits 9 MiB messages, but four reads of that size
+// exceed the server's 64 MiB connection budget once source and encoded reply
+// buffers are charged. A blocked fourth request also blocks liveness probes
+// behind it. Keep bulk reads below both byte and request admission limits.
+const DOWNLOAD_CHUNK_SIZE: u32 = 1024 * 1024;
+const DOWNLOAD_PIPELINE_DEPTH: usize = 8;
 
 pub(super) async fn upload_file(
     worker: UploadWorker,
@@ -350,6 +352,7 @@ pub(super) async fn stream_download(
     if chunk_size == 0 {
         bail!("download chunk size must be positive");
     }
+    let chunk_size = chunk_size.min(DOWNLOAD_CHUNK_SIZE);
     let mut next_offset = 0;
     let ranges = std::iter::from_fn(|| {
         if next_offset >= planned.size {

@@ -474,6 +474,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn download_read_window_leaves_admission_for_liveness() {
+        let global = P9GlobalAdmission::for_test(GLOBAL_INFLIGHT_MEMORY, GLOBAL_INFLIGHT_REQUESTS);
+        let connection =
+            global.connection_for_test(CONNECTION_INFLIGHT_MEMORY, CONNECTION_INFLIGHT_REQUESTS);
+        // Reproduce the old geometry: three upload-sized reads fit, but the
+        // fourth blocks the receive loop and the probe cannot be admitted.
+        let large = encoded_read(9 * 1024 * 1024);
+        let mut previous = Vec::new();
+        for _ in 0..3 {
+            previous.push(
+                connection
+                    .admit_request(large.len(), possible_frame_response_bytes(&large))
+                    .await
+                    .unwrap(),
+            );
+        }
+        let mut fourth =
+            Box::pin(connection.admit_request(large.len(), possible_frame_response_bytes(&large)));
+        assert!(futures::poll!(&mut fourth).is_pending());
+        let probe = P9Message::new(9, Message::Tgetlineage(ninep_proto::Tgetlineage))
+            .to_bytes()
+            .unwrap();
+        let mut blocked_probe =
+            Box::pin(connection.admit_request(probe.len(), possible_frame_response_bytes(&probe)));
+        assert!(futures::poll!(&mut blocked_probe).is_pending());
+        drop(blocked_probe);
+        drop(fourth);
+        drop(previous);
+        // The CLI's wire-level regression separately verifies this geometry.
+        // Retain every reply credit, as a slow backend does, while admitting
+        // the real lineage probe used by the client's reply-timeout path.
+        let frame = encoded_read(1024 * 1024);
+        let mut reads = Vec::new();
+        for _ in 0..8 {
+            reads.push(
+                connection
+                    .admit_request(frame.len(), possible_frame_response_bytes(&frame))
+                    .await
+                    .unwrap(),
+            );
+        }
+        let admitted_probe = tokio::time::timeout(
+            TEST_TIMEOUT,
+            connection.admit_request(probe.len(), possible_frame_response_bytes(&probe)),
+        )
+        .await
+        .expect("slow download reads must not prevent a liveness reply")
+        .unwrap();
+        drop(admitted_probe);
+        drop(reads);
+        assert_eq!(global.snapshot().reserved_bytes, 0);
+    }
+
+    #[tokio::test]
     async fn maximum_reads_still_obey_connection_byte_backpressure() {
         let global = P9GlobalAdmission::for_test(GLOBAL_INFLIGHT_MEMORY, GLOBAL_INFLIGHT_REQUESTS);
         let connection =

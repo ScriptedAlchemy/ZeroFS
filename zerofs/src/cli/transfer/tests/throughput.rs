@@ -1,17 +1,26 @@
 use super::super::copy::{stream_download, stream_upload, sync_remote_files};
 use super::*;
 
-async fn download_with_reordered_pipeline(short_reads: bool, through_cursor: bool) {
-    const CHUNK: usize = 64 * 1024;
+async fn download_with_reordered_pipeline(
+    short_reads: bool,
+    through_cursor: bool,
+    negotiated_chunks: bool,
+) {
+    let chunk = if negotiated_chunks {
+        1024 * 1024
+    } else {
+        64 * 1024
+    };
     let (primary, shutdown, local) = remote_client().await;
-    let payload: Vec<u8> = (0..CHUNK * 5 + 17).map(|i| (i % 251) as u8).collect();
+    let chunks = if through_cursor { 5 } else { 9 };
+    let payload: Vec<u8> = (0..chunk * chunks + 17).map(|i| (i % 251) as u8).collect();
     primary.write("/source.bin", &payload).await.unwrap();
     let socket = local.path().join("transfer.9p.sock");
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
         .unwrap();
     let target = format!("tcp://{}", listener.local_addr().unwrap());
-    let wave_size = if through_cursor { 8 } else { 4 };
+    let wave_size = 8;
     let (wave_ready, wait_for_wave) = tokio::sync::oneshot::channel();
     let release_wave = Arc::new(tokio::sync::Semaphore::new(usize::from(!through_cursor)));
     let proxy_release_wave = Arc::clone(&release_wave);
@@ -44,12 +53,19 @@ async fn download_with_reordered_pipeline(short_reads: bool, through_cursor: boo
                 && let Message::Tread(read) = &mut message.body
             {
                 reads += 1;
+                if negotiated_chunks {
+                    assert!(
+                        read.count <= 1024 * 1024,
+                        "download used the upload-sized negotiation for a read: {} bytes",
+                        read.count
+                    );
+                }
                 let mut changed = false;
                 if short_reads && read.count > 1 {
                     read.count /= 2;
                     changed = true;
                 }
-                if through_cursor && read.offset >= (CHUNK * 6) as u64 {
+                if through_cursor && read.offset >= (chunk * 6) as u64 {
                     // Errors from speculative ranges beyond the earlier EOF
                     // must be discarded instead of failing a complete copy.
                     read.fid = u32::MAX;
@@ -84,7 +100,7 @@ async fn download_with_reordered_pipeline(short_reads: bool, through_cursor: boo
         Client::connect_with(
             &target,
             zerofs_client::ConnectOptions {
-                msize: CHUNK as u32 + ninep_proto::P9_IOHDRSZ,
+                msize: chunk as u32 + ninep_proto::P9_IOHDRSZ,
                 ..Default::default()
             },
         )
@@ -114,7 +130,7 @@ async fn download_with_reordered_pipeline(short_reads: bool, through_cursor: boo
             cursor.read_exact(&mut priming_byte).await.unwrap();
             output.write_all(&priming_byte).await.unwrap();
             {
-                let mut first_buffer = vec![0; CHUNK];
+                let mut first_buffer = vec![0; chunk];
                 let first_read = cursor.read(&mut first_buffer);
                 tokio::pin!(first_read);
                 tokio::select! {
@@ -134,7 +150,11 @@ async fn download_with_reordered_pipeline(short_reads: bool, through_cursor: boo
                 &remote,
                 &mut output,
                 &planned,
-                CHUNK as u32,
+                if negotiated_chunks {
+                    client.capabilities().max_read_chunk
+                } else {
+                    chunk as u32
+                },
                 &file_progress,
                 &CancellationToken::new(),
             )
@@ -155,22 +175,27 @@ async fn download_with_reordered_pipeline(short_reads: bool, through_cursor: boo
 
 #[tokio::test]
 async fn download_pipelines_one_file_and_preserves_order() {
-    download_with_reordered_pipeline(false, false).await;
+    download_with_reordered_pipeline(false, false, false).await;
 }
 
 #[tokio::test]
 async fn download_fills_short_responses_without_skipping_ranges() {
-    download_with_reordered_pipeline(true, false).await;
+    download_with_reordered_pipeline(true, false, false).await;
+}
+
+#[tokio::test]
+async fn download_bounds_reads_independently_of_the_upload_negotiation() {
+    download_with_reordered_pipeline(false, false, true).await;
 }
 
 #[tokio::test]
 async fn cursor_pipelines_reads_and_resumes_cancelled_read_with_smaller_buffer() {
-    download_with_reordered_pipeline(false, true).await;
+    download_with_reordered_pipeline(false, true, false).await;
 }
 
 #[tokio::test]
 async fn cursor_fills_short_responses_without_skipping_ranges() {
-    download_with_reordered_pipeline(true, true).await;
+    download_with_reordered_pipeline(true, true, false).await;
 }
 
 #[tokio::test]
