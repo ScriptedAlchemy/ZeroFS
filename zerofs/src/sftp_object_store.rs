@@ -4216,11 +4216,8 @@ mod tests {
         let old_read = epoch.load(Ordering::Acquire);
         let read_during_write;
         {
-            let _write = MissingCacheMutationGuard::new(
-                known_missing.clone(),
-                epoch.clone(),
-                &location,
-            );
+            let _write =
+                MissingCacheMutationGuard::new(known_missing.clone(), epoch.clone(), &location);
             assert!(!known_missing.contains(location.as_ref()));
             read_during_write = epoch.load(Ordering::Acquire);
             remember_missing_if_current(&known_missing, &epoch, &location, read_during_write);
