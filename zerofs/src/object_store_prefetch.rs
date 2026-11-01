@@ -1866,7 +1866,14 @@ impl PrefetchingObjectStore {
         let alignment = alignment as u64;
         Range {
             start: range.start - range.start % alignment,
-            end: range.end.div_ceil(alignment) * alignment,
+            // An untrusted requested upper bound may round beyond u64::MAX.
+            // Keep the bound inclusive of every requested byte and let the
+            // backend clip it against the actual object size.
+            end: range
+                .end
+                .div_ceil(alignment)
+                .checked_mul(alignment)
+                .unwrap_or(u64::MAX),
         }
     }
 }
@@ -2084,6 +2091,45 @@ mod tests {
 
     const MEM: usize = 4 * 1024 * 1024;
     const DISK: usize = 64 * 1024 * 1024;
+
+    #[tokio::test]
+    async fn oversized_requested_ranges_saturate_without_overflow() {
+        let (store, inner, _dir) = make_store(1024, MEM, DISK).await;
+
+        // Both forms used to panic while rounding up the requested upper
+        // bound before the backend could clip it to a real object's EOF.
+        for end in [u64::MAX - 1, u64::MAX] {
+            let GetRange::Bounded(range) =
+                store.align_get_range(&GetRange::Bounded(0..end), 1024)
+            else {
+                panic!("bounded range changed type");
+            };
+            assert_eq!(range.end, u64::MAX);
+        }
+        let GetRange::Suffix(suffix) =
+            store.align_get_range(&GetRange::Suffix(u64::MAX), 1024)
+        else {
+            panic!("suffix range changed type");
+        };
+        assert_eq!(suffix, u64::MAX);
+
+        let location = Path::from("oversized-suffix");
+        inner
+            .put(&location, Bytes::from_static(b"small object").into())
+            .await
+            .unwrap();
+        let result = store
+            .get_opts(
+                &location,
+                GetOptions {
+                    range: Some(GetRange::Suffix(u64::MAX)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.bytes().await.unwrap().as_ref(), b"small object");
+    }
 
     fn versioned_result(tag: &str) -> PutResult {
         PutResult {
