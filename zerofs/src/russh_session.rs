@@ -489,7 +489,7 @@ mod tests {
     use super::*;
     use crate::sftp_protocol::{
         CLIENT_WRITE_IN_FLIGHT, CLIENT_WRITE_PEAK, CLIENT_WRITE_TRACKING, FSYNC, HARDLINK,
-        POSIX_RENAME, SFTP_READ_PACKET_SIZE, SFTP_WRITE_PACKET_SIZE,
+        POSIX_RENAME, SFTP_WRITE_PACKET_SIZE,
     };
     use bytes::Bytes;
     use russh_sftp::protocol::{FileAttributes, OpenFlags, StatusCode};
@@ -978,7 +978,11 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
         )
         .unwrap();
         let session = factory.open(CancellationToken::new()).await.unwrap();
-        let payload = Bytes::from(vec![0xa5; SFTP_READ_PACKET_SIZE + 17]);
+        let payload = Bytes::from(
+            (0..4 * 1024 * 1024 + 17)
+                .map(|position| (((position * 31) ^ (position >> 8)) % 251) as u8)
+                .collect::<Vec<_>>(),
+        );
 
         session
             .write_file_durable(
@@ -987,12 +991,15 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
             )
             .await
             .unwrap();
-        let read = session
-            .read_exact(std::path::Path::new("short-read.bin"), 0, payload.len())
-            .await
-            .unwrap();
-
-        assert_eq!(read, payload);
+        // The second read reuses the physical session's learned reply size
+        // and exercises the larger small-packet window through real SSH/SFTP.
+        for _ in 0..2 {
+            let read = session
+                .read_exact(std::path::Path::new("short-read.bin"), 0, payload.len())
+                .await
+                .unwrap();
+            assert_eq!(read, payload);
+        }
         session.close(CancellationToken::new()).await.unwrap();
     }
 
