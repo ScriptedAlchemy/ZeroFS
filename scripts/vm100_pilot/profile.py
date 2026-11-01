@@ -252,7 +252,13 @@ def rewrite_gc_cadence(text: str, interval_secs: int) -> str:
         # key rewrites, and annotated [gc] is never appended a second time.
         header = re.fullmatch(r"(\[\[?.*?\]\]?)\s*(?:#.*)?", stripped)
         if header is not None:
-            in_gc = header.group(1) == "[gc]"
+            # Parse the isolated table name, so ["gc"] and ['gc'] refer to
+            # the same table as [gc]. A ']' inside a quoted non-GC name may
+            # truncate the boundary regex, but still closes the GC scope.
+            try:
+                in_gc = tomllib.loads(header.group(1)) == {"gc": {}}
+            except tomllib.TOMLDecodeError:
+                in_gc = False
             if in_gc:
                 gc_header = index
             continue

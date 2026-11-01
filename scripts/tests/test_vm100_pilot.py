@@ -3791,6 +3791,21 @@ interval_secs = 0o144 # unrelated
             self.assertEqual(parsed["gc"][key], 3600)
         self.assertEqual(parsed["writeback"]["interval_secs"], 100)
 
+    def test_maintenance_rewrite_accepts_quoted_gc_tables(self) -> None:
+        for header in ('["gc"]', "['gc']", '[ "gc" ] # trailing ]'):
+            with self.subTest(header=header):
+                source = (
+                    f"{header}\ninterval_secs = 60\n\n"
+                    '["other]#section"]\ninterval_secs = 90\n'
+                )
+                rewritten = profile_module.rewrite_gc_cadence(source, 3600)
+                parsed = tomllib.loads(rewritten)
+                self.assertTrue(rewritten.startswith(header + "\n"))
+                self.assertNotIn("\n[gc]\n", rewritten)
+                for key in profile_module._GC_CADENCE_KEYS:
+                    self.assertEqual(parsed["gc"][key], 3600)
+                self.assertEqual(parsed["other]#section"]["interval_secs"], 90)
+
     def test_maintenance_rewrite_appends_a_missing_gc_section(self) -> None:
         source = '[storage]\nurl = "sftp://pilot@example.test:23/data"'
 
