@@ -3813,6 +3813,7 @@ interval_secs = 0o144 # unrelated
                 'notes = """',
                 "This is prose, not a table:",
                 "[writeback]",
+                "interval_secs = 777",
                 '"""',
                 "interval_secs = 60",
                 "idle_interval_secs = 5",
@@ -3822,10 +3823,16 @@ interval_secs = 0o144 # unrelated
             )
         ) + "\n"
         rewritten = profile_module.rewrite_gc_cadence(basic, 3600)
-        self.assertIn('notes = """\nThis is prose, not a table:\n[writeback]\n"""', rewritten)
-        self.assertEqual(tomllib.loads(rewritten)["writeback"]["interval_secs"], 90)
+        self.assertIn(
+            'notes = """\nThis is prose, not a table:\n[writeback]\n'
+            'interval_secs = 777\n"""',
+            rewritten,
+        )
+        parsed = tomllib.loads(rewritten)
+        self.assertEqual(parsed["writeback"]["interval_secs"], 90)
+        self.assertIn("interval_secs = 777", parsed["gc"]["notes"])
         for key in profile_module._GC_CADENCE_KEYS:
-            self.assertEqual(tomllib.loads(rewritten)["gc"][key], 3600)
+            self.assertEqual(parsed["gc"][key], 3600)
 
         literal = "\n".join(
             (
