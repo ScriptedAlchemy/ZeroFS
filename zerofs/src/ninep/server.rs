@@ -1855,6 +1855,106 @@ mod tests {
         );
     }
 
+    async fn blocked_first_reserves_replay_before_admission(cancel_process: bool) {
+        let filesystem = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let old = Arc::new(NinePHandler::new(
+            Arc::clone(&filesystem),
+            Arc::new(FileLockManager::new()),
+        ));
+        let replacement =
+            NinePHandler::new(Arc::clone(&filesystem), Arc::new(FileLockManager::new()));
+        for handler in [&*old, &replacement] {
+            establish_session(handler, 1, b"root", 0, None).await;
+        }
+
+        let op_id = [0x64; 16];
+        let mkdir = Message::Tmkdir(Tmkdir {
+            dfid: 1,
+            name: P9String::new(b"received-before-admission".to_vec()),
+            mode: 0o755,
+            gid: 0,
+        });
+        let first = P9Message::new_with_op_id(10, op_id, mkdir.clone())
+            .to_bytes_ctx(true)
+            .unwrap();
+        let (tx, mut rx) = mpsc::channel(2);
+        let inflight = InflightRegistry::default();
+        let byte_limit = P9_MAX_MSIZE as usize * 2;
+        let global = P9GlobalAdmission::for_test(byte_limit, 1);
+        let admission = global.connection_for_test(byte_limit, 1);
+        let blocked = admission.admit_request(1, 0).await.unwrap();
+        let requests = TaskTracker::new();
+        let connection_shutdown = CancellationToken::new();
+        let process_shutdown = CancellationToken::new();
+        let dispatch = dispatch_9p_frame(
+            Bytes::from(first),
+            &old,
+            &tx,
+            &inflight,
+            &admission,
+            &requests,
+            &connection_shutdown,
+            &process_shutdown,
+        );
+        tokio::pin!(dispatch);
+        assert!(futures::poll!(&mut dispatch).is_pending());
+        assert_eq!(
+            filesystem.dedup.stats().inflight_ids,
+            1,
+            "a fully received FIRST must reserve its identity before waiting for capacity"
+        );
+        assert_eq!(admission.accepted_work.len(), 1);
+        assert_eq!(global.snapshot().active_requests, 1);
+
+        if cancel_process {
+            process_shutdown.cancel();
+            assert!(dispatch.await.is_err());
+            assert_eq!(filesystem.dedup.stats().inflight_ids, 0);
+            assert_eq!(admission.accepted_work.len(), 0);
+            drop(blocked);
+            assert_eq!(global.snapshot().reserved_bytes, 0);
+            return;
+        }
+
+        old.close_for_disconnect();
+        connection_shutdown.cancel();
+        let retry = replacement.handle_message_with_op_envelope_origin(
+            11,
+            op_id,
+            ninep_proto::P9_OP_FLAG_RETRY,
+            0,
+            mkdir,
+        );
+        tokio::pin!(retry);
+        assert!(
+            futures::poll!(&mut retry).is_pending(),
+            "a reconnect retry must join the received FIRST, not report ESTALE"
+        );
+
+        drop(blocked);
+        dispatch.await.unwrap();
+        let replayed = tokio::time::timeout(TEST_TIMEOUT, retry)
+            .await
+            .expect("retry must finish when request capacity returns");
+        assert!(matches!(replayed.body, Message::Rmkdir(_)));
+        drop(rx.recv().await.unwrap());
+        requests.close();
+        requests.wait().await;
+        assert_eq!(admission.accepted_work.len(), 0);
+        assert_eq!(global.snapshot().active_requests, 0);
+        assert_eq!(global.snapshot().reserved_bytes, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn received_first_survives_disconnect_while_waiting_for_admission() {
+        blocked_first_reserves_replay_before_admission(false).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn process_shutdown_releases_received_first_waiting_for_admission() {
+        blocked_first_reserves_replay_before_admission(true).await;
+    }
+
     #[tokio::test(start_paused = true)]
     async fn stuck_response_sender_times_out_and_closes_writer() {
         let (mut client, server) = tokio::io::duplex(64);

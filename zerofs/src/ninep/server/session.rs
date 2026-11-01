@@ -367,26 +367,37 @@ pub(crate) async fn dispatch_9p_frame(
     }
 
     let type_byte = frame[4];
-    // Reserve the received allocation and a conservative type-specific reply
-    // before detaching request work. Bulk writes have a fixed-size Rwrite;
-    // other requests retain the full negotiated-response allowance.
-    let admission_permit = admission
-        .admit_request_or_shutdown(
-            frame.len(),
-            possible_response_bytes(type_byte),
-            connection_shutdown,
-        )
-        .await?;
-    let accepted_work = admission
-        .accepted_work
-        .try_accept()
-        .ok_or_else(|| anyhow::anyhow!("9P request admission is sealed for shutdown"))?;
-    let admission = admission_permit;
-
     let tag = u16::from_le_bytes([frame[5], frame[6]]);
     let zerofs_protocol = handler.zerofs_protocol_enabled();
     let metadata = inspect_frame_metadata(&frame, zerofs_protocol);
     let shallow_retry = shallow_epoch_zero_retry_write(&frame, metadata);
+    let accepted_work = admission
+        .accepted_work
+        .try_accept()
+        .ok_or_else(|| anyhow::anyhow!("9P request admission is sealed for shutdown"))?;
+
+    // A replacement connection can deliver RETRY while this fully received
+    // FIRST is waiting for request/response capacity. Reserve its identity
+    // before that first await, and retain process ownership if the old
+    // connection closes. The reader still holds the bounded receive credit;
+    // no task or request-byte admission is bypassed while capacity is full.
+    let received_guard = metadata
+        .received_op
+        .and_then(|(op_id, op_flags, _origin_epoch)| {
+            handler.try_reserve_received_first(op_id, op_flags, type_byte)
+        });
+    let admission_shutdown = if received_guard.is_some() {
+        process_shutdown
+    } else {
+        connection_shutdown
+    };
+    let admission = admission
+        .admit_request_or_shutdown(
+            frame.len(),
+            possible_response_bytes(type_byte),
+            admission_shutdown,
+        )
+        .await?;
 
     // Capture `oldtag` before any yield or tag reuse.
     let (flush_oldtag, flush_waiters, request_lease, prior_waiters) = if type_byte == TFLUSH_TYPE {
@@ -413,13 +424,6 @@ pub(crate) async fn dispatch_9p_frame(
         };
         (None, Vec::new(), request_lease, prior_waiters)
     };
-
-    // Reserve a FIRST envelope before EOF can admit a replacement RETRY.
-    let received_guard = metadata
-        .received_op
-        .and_then(|(op_id, op_flags, _origin_epoch)| {
-            handler.try_reserve_received_first(op_id, op_flags, type_byte)
-        });
 
     let handler = Arc::clone(handler);
     let tx = tx.clone();
