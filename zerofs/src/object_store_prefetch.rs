@@ -2708,7 +2708,10 @@ mod tests {
             let to = Path::from("mutation-target");
             let replacement = Bytes::from_static(b"new-and-longer");
             inner.put(&from, replacement.clone().into()).await.unwrap();
-            inner.put(&to, Bytes::from_static(b"old").into()).await.unwrap();
+            inner
+                .put(&to, Bytes::from_static(b"old").into())
+                .await
+                .unwrap();
 
             let applied = Arc::new(tokio::sync::Notify::new());
             let backend: Arc<dyn ObjectStore> = Arc::new(HeldMutationStore {
@@ -2732,7 +2735,10 @@ mod tests {
             let to_mutation = to.clone();
             let task = tokio::spawn(async move {
                 match operation {
-                    0 => mutating.put(&to_mutation, replacement.into()).await.map(|_| ()),
+                    0 => mutating
+                        .put(&to_mutation, replacement.into())
+                        .await
+                        .map(|_| ()),
                     1 => mutating.copy(&from_mutation, &to_mutation).await,
                     _ => mutating.rename(&from_mutation, &to_mutation).await,
                 }
