@@ -3791,6 +3791,42 @@ interval_secs = 0o144 # unrelated
             self.assertEqual(parsed["gc"][key], 3600)
         self.assertEqual(parsed["writeback"]["interval_secs"], 100)
 
+    def test_maintenance_rewrite_decodes_unicode_escaped_gc_keys(self) -> None:
+        source = (
+            "[gc]\n"
+            '"\\u0069nterval_secs" = 60 # preserve the spelling\n'
+            "idle_interval_secs = 90\n"
+            "busy_backlog_interval_secs = 15\n"
+            "[writeback]\n"
+            "interval_secs = 33\n"
+        )
+        rewritten = profile_module.rewrite_gc_cadence(source, 3600)
+        self.assertIn('"\\u0069nterval_secs" = 3600 # preserve the spelling', rewritten)
+        self.assertEqual(tomllib.loads(rewritten)["writeback"]["interval_secs"], 33)
+        for key in profile_module._GC_CADENCE_KEYS:
+            self.assertEqual(tomllib.loads(rewritten)["gc"][key], 3600)
+
+        dotted = (
+            '"\\u0067c"."\\u0069nterval_secs" = 60 # keep\n'
+            '"\\u0067c".note = "unchanged"\n'
+            "[writeback]\n"
+            "interval_secs = 33\n"
+        )
+        rewritten = profile_module.rewrite_gc_cadence(dotted, 3600)
+        self.assertIn('"\\u0067c"."\\u0069nterval_secs" = 3600 # keep', rewritten)
+        self.assertNotIn("\n[gc]", rewritten)
+        self.assertEqual(tomllib.loads(rewritten)["gc"]["note"], "unchanged")
+        self.assertEqual(tomllib.loads(rewritten)["writeback"]["interval_secs"], 33)
+        for key in profile_module._GC_CADENCE_KEYS:
+            self.assertEqual(tomllib.loads(rewritten)["gc"][key], 3600)
+
+        inline = (
+            '"\\u0067c" = { interval_secs = 60, idle_interval_secs = 5, '
+            "busy_backlog_interval_secs = 15 }\n"
+        )
+        with self.assertRaisesRegex(ValueError, "inline GC table"):
+            profile_module.rewrite_gc_cadence(inline, 3600)
+
     def test_maintenance_rewrite_accepts_quoted_gc_tables(self) -> None:
         for header in ('["gc"]', "['gc']", '[ "gc" ] # trailing ]'):
             with self.subTest(header=header):

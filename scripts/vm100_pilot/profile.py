@@ -283,24 +283,17 @@ def rewrite_gc_cadence(text: str, interval_secs: int) -> str:
     root_scope = True
     root_gc_anchor: int | None = None
     root_inline_gc = False
-    gc_path = r"""(?:gc|"gc"|'gc')"""
+    # Parse TOML keys semantically, since quoted basic keys may contain escapes.
+    toml_key = r'''(?:[A-Za-z0-9_-]+|"(?:\\.|[^"\\])*"|'[^']*')'''
+    toml_path = rf"{toml_key}(?:\s*\.\s*{toml_key})*"
     cadence_value = (
         r"(?:0[xX][0-9A-Fa-f_]+|0[oO][0-7_]+|0[bB][01_]+|[+-]?[0-9][0-9_]*)"
     )
-    cadence_suffix = r"(\s*(?:#.*)?(?:\r?\n)?)$"
-    assignments: dict[str, re.Pattern[str]] = {}
-    dotted_assignments: dict[str, re.Pattern[str]] = {}
-    for key in _GC_CADENCE_KEYS:
-        key_pattern = (
-            rf"""(?:{re.escape(key)}|"{re.escape(key)}"|'{re.escape(key)}')"""
-        )
-        assignments[key] = re.compile(
-            rf"^(\s*{key_pattern}\s*=\s*){cadence_value}{cadence_suffix}"
-        )
-        dotted_assignments[key] = re.compile(
-            rf"^(\s*{gc_path}\s*\.\s*{key_pattern}\s*=\s*)"
-            rf"{cadence_value}{cadence_suffix}"
-        )
+    assignment_head = re.compile(rf"^\s*(?P<path>{toml_path})\s*=\s*")
+    cadence_assignment = re.compile(
+        rf"^(?P<prefix>\s*(?P<path>{toml_path})\s*=\s*)"
+        rf"{cadence_value}(?P<suffix>\s*(?:#.*)?(?:\r?\n)?)$"
+    )
     for index, line in enumerate(lines):
         stripped = line.strip()
         # A TOML table header may have a trailing comment (even one with ']'). Treat the header
@@ -327,21 +320,30 @@ def rewrite_gc_cadence(text: str, interval_secs: int) -> str:
             if in_gc:
                 gc_header = index
             continue
-        if root_scope:
-            # A root dotted key creates an implicit [gc] table. Appending an
-            # explicit [gc] afterward would redeclare that table.
-            if re.match(rf"^\s*{gc_path}\s*\.", line):
-                root_gc_anchor = index
-            if re.match(rf"^\s*{gc_path}\s*=\s*\x7b", line):
-                root_inline_gc = True
         if not in_gc and not root_scope:
             continue
+        head = assignment_head.match(line)
+        path_value = None
+        if head is not None:
+            # The full configuration is validated above. Decode the isolated
+            # assignment path as TOML so escaped basic keys keep their meaning.
+            try:
+                path_value = tomllib.loads(f"{head.group('path')} = 0")
+            except tomllib.TOMLDecodeError:
+                path_value = None
+        if root_scope and path_value is not None:
+            if isinstance(path_value.get("gc"), dict):
+                root_gc_anchor = index
+            elif "gc" in path_value and line[head.end():].lstrip().startswith("{"):
+                root_inline_gc = True
+        match = cadence_assignment.fullmatch(line)
+        if match is None or path_value is None:
+            continue
         for key in _GC_CADENCE_KEYS:
-            assignment = assignments[key] if in_gc else dotted_assignments[key]
-            match = assignment.fullmatch(line)
-            if match is None:
+            target = {key: 0} if in_gc else {"gc": {key: 0}}
+            if path_value != target:
                 continue
-            lines[index] = f"{match.group(1)}{interval_secs}{match.group(2)}"
+            lines[index] = f"{match.group('prefix')}{interval_secs}{match.group('suffix')}"
             replaced.add(key)
             break
     missing = [key for key in _GC_CADENCE_KEYS if key not in replaced]
