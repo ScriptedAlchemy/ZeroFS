@@ -1,6 +1,12 @@
 name: kernel-upstream-canary
 
 on:
+  pull_request:
+    branches: ["main", "develop"]
+    paths:
+      - "kernel/**"
+      - ".github/workflows/kernel-upstream-canary.yml"
+      - ".github/workflows/kernel-compile-9p.yml"
   schedule:
     - cron: "0 4 * * *"
   workflow_dispatch:
@@ -9,7 +15,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: kernel-upstream-canary
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -21,6 +27,9 @@ jobs:
       matrix: ${{ steps.releases.outputs.matrix }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Test kernel compatibility helpers
+        run: python3 -m unittest discover -s kernel/ci/tests -p 'test_*.py' -v
 
       - name: Resolve release tags
         id: releases

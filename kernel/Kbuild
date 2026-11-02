@@ -34,7 +34,11 @@ zerofs_bindgen_target := $(zerofs_bindgen_target_$(SRCARCH))
 zerofs_bindgen_arch_flags_x86 := -m64 -march=x86-64
 zerofs_bindgen_arch_flags_arm64 := -mlittle-endian
 zerofs_bindgen_arch_flags := $(zerofs_bindgen_arch_flags_$(SRCARCH))
-zerofs_bindgen_compiler_flags := $(filter -DCC_USING_%,$(KBUILD_CFLAGS))
+# Upstream ARM64 kernels (7.4+) define ARM64_S390_COMMON through
+# KBUILD_CPPFLAGS. Bindgen runs a separate Clang invocation, so propagate
+# architecture API-selection defines as well as the original CC_USING flags.
+# Do not forward unrelated GCC-only C/CPP flags into this Clang invocation.
+zerofs_bindgen_compiler_flags := $(filter -DCC_USING_% -DARM64_S390_COMMON=%,$(KBUILD_CFLAGS) $(KBUILD_CPPFLAGS))
 
 ifeq ($(zerofs_bindgen_target),)
 $(error ZeroFS does not support Kbuild architecture $(SRCARCH))

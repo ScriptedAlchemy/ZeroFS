@@ -5,6 +5,7 @@ use kernel::bindings;
 
 #[allow(improper_ctypes)]
 unsafe extern "C" {
+    fn zerofs_vfs_set_create(operations: *mut bindings::inode_operations);
     fn zerofs_vfs_file_accessed(file: *mut bindings::file);
     fn zerofs_vfs_inode_slab_flags() -> bindings::slab_flags_t;
     fn zerofs_vfs_make_kuid(
@@ -35,6 +36,15 @@ unsafe extern "C" {
     fn zerofs_vfs_iov_iter_count(iter: *const bindings::iov_iter) -> usize;
     fn zerofs_vfs_iov_iter_truncate(iter: *mut bindings::iov_iter, count: usize);
     fn zerofs_vfs_release_pinned_iov_iter(iter: *mut bindings::iov_iter, dirty_bytes: usize);
+}
+
+/// Install the create callback using the target kernel's exact function type.
+///
+/// # Safety
+///
+/// `operations` must point to a live, exclusively owned operations table.
+pub(crate) unsafe fn set_create(operations: *mut bindings::inode_operations) {
+    unsafe { zerofs_vfs_set_create(operations) }
 }
 
 /// Return the target configuration's flags for the inode cache.

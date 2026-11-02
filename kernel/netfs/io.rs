@@ -38,13 +38,22 @@ pub(crate) enum Origin {
 
 impl Origin {
     fn from_raw(origin: abi::netfs_io_origin) -> Self {
+        // Linux 7.4 removed the writethrough origin, shifting subsequent
+        // discriminants. Detect the old enum shape from the actual generated
+        // values, so a new kernel's UNBUFFERED_WRITE stays UNBUFFERED_WRITE.
+        let old_writethrough = abi::netfs_io_origin_NETFS_WRITEBACK_SINGLE + 1;
+        if abi::netfs_io_origin_NETFS_UNBUFFERED_WRITE == old_writethrough + 1
+            && origin == old_writethrough
+        {
+            return Self::Writethrough;
+        }
+
         match origin {
             abi::netfs_io_origin_NETFS_READAHEAD => Self::Readahead,
             abi::netfs_io_origin_NETFS_DIO_READ => Self::DioRead,
             abi::netfs_io_origin_NETFS_UNBUFFERED_READ => Self::UnbufferedRead,
             abi::netfs_io_origin_NETFS_WRITEBACK => Self::Writeback,
             abi::netfs_io_origin_NETFS_WRITEBACK_SINGLE => Self::WritebackSingle,
-            abi::netfs_io_origin_NETFS_WRITETHROUGH => Self::Writethrough,
             abi::netfs_io_origin_NETFS_DIO_WRITE => Self::DioWrite,
             abi::netfs_io_origin_NETFS_UNBUFFERED_WRITE => Self::UnbufferedWrite,
             _ => Self::Other,

@@ -127,12 +127,43 @@ jobs:
       - name: Check disk space
         run: df -h
 
-      - name: Download Linux kernel
+      - name: Download and unpack Linux kernel on NFS
         run: |
-          cd /mnt/zerofs
-          wget -q https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/snapshot/linux-7.2-rc1.tar.gz
-          tar -xf linux-7.2-rc1.tar.gz
-          rm linux-7.2-rc1.tar.gz
+          set -euo pipefail
+
+          # Keep the network transfer and archive validation off the mounted
+          # filesystem; the complete kernel source is still unpacked onto NFS
+          # and compiled there, with no change to the workload or assertions.
+          archive="${RUNNER_TEMP}/linux-7.2-rc1.tar.gz"
+          url="https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/snapshot/linux-7.2-rc1.tar.gz"
+          echo "Fetching kernel archive to runner-local scratch"
+          curl --fail --location --silent --show-error --retry 5 --retry-all-errors \
+            --connect-timeout 30 --output "$archive" "$url"
+          test -s "$archive"
+          gzip -t "$archive"
+          echo "Kernel archive verified: $(stat -c %s "$archive") bytes"
+          echo "Extracting complete kernel source on the ZeroFS NFS mount"
+
+          # The previous NFS extraction ran silently for nearly six hours
+          # before cancellation. Report process/blocking state periodically,
+          # without probing a potentially D-state-blocked hard mount.
+          (
+            while sleep 120; do
+              echo "NFS extraction diagnostic: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+              ps -eo pid,ppid,stat,wchan:32,etime,pcpu,comm |
+                awk 'NR == 1 || $NF == "tar" || $NF == "gzip" || $NF == "zerofs"'
+            done
+          ) &
+          monitor_pid=$!
+          trap 'kill "$monitor_pid" 2>/dev/null || true' EXIT
+          tar -xzf "$archive" -C /mnt/zerofs \
+            --checkpoint=20000 \
+            --checkpoint-action='echo=tar archive checkpoint %u'
+          kill "$monitor_pid" 2>/dev/null || true
+          trap - EXIT
+
+          test -s /mnt/zerofs/linux-7.2-rc1/Makefile
+          echo "Kernel source extraction on NFS completed"
 
       - name: Compile kernel
         run: |
