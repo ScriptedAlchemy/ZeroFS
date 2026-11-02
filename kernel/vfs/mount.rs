@@ -451,7 +451,9 @@ pub(super) unsafe extern "C" fn zerofs_d_weak_revalidate(
         let attributes =
             match getattr_attributes(&state.client, &inode, &credentials, expected_type) {
                 Ok(attributes) => attributes,
-                Err(error) if error == ENOENT => return Ok(0),
+                // Removal can race the remote lookup after the initial
+                // unlinked-inode check. A held cwd still remains valid.
+                Err(error) if error == ENOENT => return Ok((inode.link_count() == 0).into()),
                 Err(error) => return Err(error),
             };
         validate_stat(&attributes)?;
