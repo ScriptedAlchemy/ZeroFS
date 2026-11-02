@@ -1022,6 +1022,35 @@ fn shared_maintenance_runtime() -> &'static tokio::runtime::Handle {
 const BARRIER_CONTROLLED_L0_SST_SIZE_BYTES: usize = usize::MAX - 1;
 const BARRIER_CONTROLLED_MAX_UNFLUSHED_BYTES: usize = usize::MAX;
 
+// A mounted NFS FILE_SYNC capture showed 16–32 ~9ms WRITEs followed by
+// 10–25s tails, with replies tracking L0 compaction publication. These clocks
+// previously added successive five-second waits while the L0 backlog drained.
+// Shorten metadata maintenance polling without changing any durability barrier,
+// compaction concurrency, L0 admission limit, or WAL policy.
+const METADATA_COMPACTION_TICK: Duration = Duration::from_secs(1);
+
+fn metadata_compactor_options(
+    max_concurrent_compactions: usize,
+    scheduler_options: std::collections::HashMap<String, String>,
+) -> slatedb::config::CompactorOptions {
+    let worker = Some(slatedb::config::CompactionWorkerOptions {
+        max_sst_size: 256 * 1024 * 1024,
+        max_fetch_tasks: 2,
+        bytes_to_fetch: 8 * 1024 * 1024,
+        max_subcompactions: 2,
+        compactions_poll_interval: METADATA_COMPACTION_TICK,
+        ..Default::default()
+    });
+    slatedb::config::CompactorOptions {
+        poll_interval: METADATA_COMPACTION_TICK,
+        commit_compacted_interval: METADATA_COMPACTION_TICK,
+        max_concurrent_compactions,
+        scheduler_options,
+        worker,
+        ..Default::default()
+    }
+}
+
 fn select_rss_pressure_cap(installed_cap: u64, clean_cache_fallback: u64) -> u64 {
     if installed_cap == 0 {
         clean_cache_fallback
@@ -1148,7 +1177,7 @@ pub async fn build_slatedb(
         compactor_options: None,
         flush_interval: None,
         // Independent of HA authority checks.
-        manifest_poll_interval: std::time::Duration::from_secs(5),
+        manifest_poll_interval: METADATA_COMPACTION_TICK,
         max_unflushed_bytes: BARRIER_CONTROLLED_MAX_UNFLUSHED_BYTES,
         compression_codec: None, // Disable compression as we handle it in encryption layer
         l0_flush_parallelism: 16,
@@ -1265,29 +1294,13 @@ pub async fn build_slatedb(
                         ..Default::default()
                     }
                     .into();
-                let worker = Some(slatedb::config::CompactionWorkerOptions {
-                    max_sst_size: 256 * 1024 * 1024,
-                    max_fetch_tasks: 2,
-                    bytes_to_fetch: 8 * 1024 * 1024,
-                    // Metadata-only DB now that chunks live outside SlateDB, so
-                    // compactions are small. Match the 2-job coordinator cap: the
-                    // 256MiB max_sst_size floor keeps a compaction single-range
-                    // until its input tops 512MiB, so only a rare large one splits
-                    // into a second sub-range instead of running single-threaded.
-                    max_subcompactions: 2,
-                    ..Default::default()
-                });
                 let compactor = CompactorBuilder::new(db_path, compactor_object_store)
                     .with_runtime(maintenance_runtime.clone())
                     .with_filter_policies(crate::fs::filter_policy::filter_policies())
-                    .with_options(slatedb::config::CompactorOptions {
-                        poll_interval: std::time::Duration::from_secs(5),
-                        commit_compacted_interval: std::time::Duration::from_secs(5),
+                    .with_options(metadata_compactor_options(
                         max_concurrent_compactions,
                         scheduler_options,
-                        worker,
-                        ..Default::default()
-                    });
+                    ));
 
                 builder = builder.with_compactor_builder(compactor);
             }
@@ -2670,6 +2683,26 @@ min_free_gb = 256.0
         settings
             .validate()
             .expect("barrier-controlled flush thresholds must satisfy SlateDB validation");
+    }
+
+    #[test]
+    fn stable_write_compaction_cadence_removes_five_second_poll_chain() {
+        let options = metadata_compactor_options(2, std::collections::HashMap::new());
+        let worker = options.worker.as_ref().expect("embedded compactor worker");
+        let cumulative_poll_budget = METADATA_COMPACTION_TICK
+            + options.poll_interval
+            + worker.compactions_poll_interval
+            + options.commit_compacted_interval;
+        assert!(
+            cumulative_poll_budget <= Duration::from_secs(4),
+            "stable writes must not stall across four five-second metadata polls"
+        );
+        // Preserve resource and scheduling limits: the repair is cadence-only.
+        assert_eq!(options.max_concurrent_compactions, 2);
+        assert_eq!(worker.max_fetch_tasks, 2);
+        assert_eq!(worker.max_subcompactions, 2);
+        assert_eq!(worker.max_sst_size, 256 * 1024 * 1024);
+        assert_eq!(worker.bytes_to_fetch, 8 * 1024 * 1024);
     }
 
     #[test]
