@@ -16,8 +16,13 @@ typedef unsigned short umode_t;
 struct mnt_idmap { int unused; };
 struct inode { int unused; };
 struct dentry { int unused; };
+#if CONST_IDMAP
+#define ABI_IDMAP_QUAL const
+#else
+#define ABI_IDMAP_QUAL
+#endif
 struct inode_operations {
-    int (*create)(struct mnt_idmap *, struct inode *, struct dentry *, umode_t
+    int (*create)(ABI_IDMAP_QUAL struct mnt_idmap *, struct inode *, struct dentry *, umode_t
 #if LEGACY_CREATE
                   , bool
 #endif
@@ -66,7 +71,7 @@ int main(void)
 
 
 class CreateCompatibilityTests(unittest.TestCase):
-    def check_abi(self, legacy):
+    def check_abi(self, legacy, const_idmap=False):
         with tempfile.TemporaryDirectory(prefix="zerofs-create-abi-") as directory:
             root = Path(directory)
             (root / "linux").mkdir()
@@ -80,6 +85,7 @@ class CreateCompatibilityTests(unittest.TestCase):
                     "-std=gnu11", "-Wall", "-Wextra", "-Werror",
                     "-Wcast-function-type", "-Wmissing-prototypes",
                     f"-DLEGACY_CREATE={int(legacy)}",
+                    f"-DCONST_IDMAP={int(const_idmap)}",
                     "-I", str(root), "-I", str(KERNEL / "vfs"),
                     str(source), "-o", str(executable),
                 ],
@@ -94,6 +100,11 @@ class CreateCompatibilityTests(unittest.TestCase):
 
     def test_create_without_exclusive_argument(self):
         self.check_abi(legacy=False)
+
+    def test_const_idmap_across_both_create_abis(self):
+        for legacy in (True, False):
+            with self.subTest(legacy=legacy):
+                self.check_abi(legacy=legacy, const_idmap=True)
 
 
 if __name__ == "__main__":
