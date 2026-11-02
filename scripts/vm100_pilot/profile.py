@@ -283,7 +283,13 @@ def rewrite_gc_cadence(text: str, interval_secs: int) -> str:
     if not 300 <= interval_secs <= 86400:
         raise ValueError("maintenance GC interval must be between 300 and 86400")
     tomllib.loads(text)
-    lines = text.splitlines(keepends=True)
+    # TOML lines end only at LF/CRLF. splitlines() also breaks on Unicode
+    # NEL/line/paragraph separators inside valid quoted TOML strings, allowing
+    # their contents to impersonate a header and create duplicate GC keys.
+    parts = text.split("\n")
+    lines = [part + "\n" for part in parts[:-1]]
+    if parts[-1]:
+        lines.append(parts[-1])
     in_gc = False
     gc_header: int | None = None
     replaced: set[str] = set()

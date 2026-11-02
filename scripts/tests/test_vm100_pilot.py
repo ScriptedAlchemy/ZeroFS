@@ -3965,6 +3965,28 @@ interval_secs = 0o144 # unrelated
                 self.assertIn(f"  {nested} # nested array value", rewritten)
                 self.assertEqual(rewritten.count("[gc]"), 1)
 
+    def test_maintenance_rewrite_preserves_unicode_separators_in_strings(self) -> None:
+        # These codepoints are legal TOML string characters, not line breaks.
+        # A parser using str.splitlines() mistook their intervening prose for
+        # a real [writeback] section, then inserted duplicate GC cadence keys.
+        for separator in ("\u0085", "\u2028", "\u2029"):
+            with self.subTest(separator=hex(ord(separator))):
+                notes = f"before{separator}[writeback]{separator}interval_secs = 777"
+                source = (
+                    "[gc]\n"
+                    f'notes = "{notes}"\n'
+                    "interval_secs = 60\n"
+                    "[writeback]\n"
+                    "interval_secs = 90\n"
+                )
+                rewritten = profile_module.rewrite_gc_cadence(source, 3600)
+                parsed = tomllib.loads(rewritten)
+                self.assertIn(f'notes = "{notes}"\n', rewritten)
+                self.assertEqual(parsed["gc"]["notes"], notes)
+                for key in profile_module._GC_CADENCE_KEYS:
+                    self.assertEqual(parsed["gc"][key], 3600)
+                self.assertEqual(parsed["writeback"]["interval_secs"], 90)
+
     def test_maintenance_rewrite_appends_a_missing_gc_section(self) -> None:
         source = '[storage]\nurl = "sftp://pilot@example.test:23/data"'
 
