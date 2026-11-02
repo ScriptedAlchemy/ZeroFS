@@ -25,6 +25,14 @@ pub(crate) mod abi {
         _private: [u8; 0],
     }
 
+    /// Linux 7.4's netfs_cache_ops::query_occupancy takes this FS-Cache type
+    /// by pointer. It is intentionally excluded by the nonrecursive netfs
+    /// bindgen allowlist and has no layout or ownership contract here.
+    #[repr(C)]
+    pub struct fscache_occupancy {
+        _private: [u8; 0],
+    }
+
     include!(concat!(env!("ZEROFS_KBUILD_OUTPUT"), "/netfs/bindings.rs"));
 }
 
