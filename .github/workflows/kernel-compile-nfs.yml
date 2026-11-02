@@ -14,6 +14,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Test the bounded NFS diagnostic collector
+        run: python3 -m unittest discover -s scripts/tests -p test_nfs_ci_diagnostics.py -v
+
       - name: Build pinned MinIO fixture
         uses: ./.github/actions/build-minio-fixture
         with:
@@ -45,7 +48,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y nfs-common build-essential libncurses-dev bison flex libssl-dev libelf-dev bc
+          sudo apt-get install -y nfs-common build-essential libncurses-dev bison flex libssl-dev libelf-dev bc tcpdump
 
       - name: Setup MinIO bucket
         run: |
@@ -91,8 +94,11 @@ jobs:
           enabled = false
           EOF
 
-          # Start ZeroFS in the background
-          ./target/ci/zerofs run -c zerofs-ci.toml &
+          # Keep the server's output attached to runner-local storage, not to
+          # an earlier Actions step's pipe that is no longer being consumed.
+          mkdir -p "$RUNNER_TEMP/zerofs-nfs-diagnostics"
+          RUST_LOG=info,zerofs::nfs=debug ./target/ci/zerofs run -c zerofs-ci.toml \
+            > "$RUNNER_TEMP/zerofs-nfs-server.log" 2>&1 &
 
           # Save PID for stats collection
           echo $! > /tmp/zerofs.pid
@@ -112,6 +118,31 @@ jobs:
             echo "ZeroFS failed to start"
             exit 1
           fi
+
+      - name: Capture bounded loopback NFS RPC evidence
+        run: |
+          set -euo pipefail
+          capture_dir="$RUNNER_TEMP/zerofs-nfs-diagnostics"
+          mkdir -p "$capture_dir"
+          # Only this disposable runner's loopback NFS traffic. Four 4 MB
+          # rotating files retain RPC headers without recording full payloads.
+          sudo sh -c '
+            echo $$ > "$1/capture.pid"
+            exec tcpdump -Z root -i lo -U -s 256 -C 4 -W 4 \
+              -w "$1/rpc.pcap" "tcp port 2049"
+          ' sh "$capture_dir" > "$capture_dir/tcpdump.log" 2>&1 &
+          for attempt in {1..20}; do
+            if [ -s "$capture_dir/capture.pid" ]; then
+              capture_pid=$(cat "$capture_dir/capture.pid")
+              if [ "$(cat "/proc/$capture_pid/comm" 2>/dev/null)" = tcpdump ]; then
+                break
+              fi
+            fi
+            sleep 0.1
+          done
+          test -s "$capture_dir/capture.pid"
+          capture_pid=$(cat "$capture_dir/capture.pid")
+          test "$(cat "/proc/$capture_pid/comm")" = tcpdump
 
       - name: Mount NFS
         run: |
@@ -152,6 +183,12 @@ jobs:
               echo "NFS extraction diagnostic: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
               ps -eo pid,ppid,stat,wchan:32,etime,pcpu,comm |
                 awk 'NR == 1 || $NF == "tar" || $NF == "gzip" || $NF == "zerofs"'
+              # /proc reads never traverse the mounted test filesystem.
+              # Preserve retransmit/COMMIT counters and actual kernel stacks,
+              # not just the last wait-channel name in a six-hour log.
+              timeout --kill-after=2s 10s sudo python3 scripts/nfs_ci_diagnostics.py \
+                --output "$RUNNER_TEMP/zerofs-nfs-diagnostics/snapshots.jsonl" \
+                || echo "NFS diagnostic snapshot failed; workload status remains authoritative"
             done
           ) &
           monitor_pid=$!
@@ -187,6 +224,41 @@ jobs:
             echo "Kernel compilation failed!"
             exit 1
           fi
+
+      - name: Preserve NFS failure evidence before unmount
+        if: always()
+        run: |
+          capture_dir="$RUNNER_TEMP/zerofs-nfs-diagnostics"
+          mkdir -p "$capture_dir"
+          timeout --kill-after=2s 10s sudo python3 scripts/nfs_ci_diagnostics.py \
+            --output "$capture_dir/snapshots.jsonl" || true
+          if [ -s "$capture_dir/capture.pid" ]; then
+            capture_pid=$(cat "$capture_dir/capture.pid")
+            # Stop only the capture process owned by this job, never an
+            # unrelated process or a workload blocked in kernel I/O.
+            if [[ "$capture_pid" =~ ^[0-9]+$ ]] && \
+               [ "$(cat "/proc/$capture_pid/comm" 2>/dev/null)" = tcpdump ] && \
+               sudo grep -zFq -- "$capture_dir/rpc.pcap" "/proc/$capture_pid/cmdline"; then
+              sudo kill -INT "$capture_pid" || true
+            fi
+          fi
+          tail -c 16777216 "$RUNNER_TEMP/zerofs-nfs-server.log" \
+            > "$capture_dir/server-tail.log" 2>/dev/null || true
+          tail -c 4194304 /tmp/kernel-build.log \
+            > "$capture_dir/kernel-build-tail.log" 2>/dev/null || true
+          sudo dmesg --ctime | tail -n 2000 > "$capture_dir/dmesg.log" || true
+          timeout --kill-after=2s 10s sudo ss -tinp \
+            > "$capture_dir/tcp-state.log" 2>&1 || true
+          sudo chmod -R a+rX "$capture_dir"
+
+      - name: Upload NFS kernel diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nfs-kernel-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/zerofs-nfs-diagnostics/
+          retention-days: 7
+          if-no-files-found: warn
 
       - name: Cleanup
         if: always()
