@@ -228,8 +228,10 @@ def _load_phase_windows(result: BenchmarkResult) -> dict[str, tuple[int, int]]:
     return parsed
 
 
-def _advance_toml_multiline_quote(line: str, multiline: str | None) -> str | None:
-    """Track triple-quoted TOML strings so their contents cannot impersonate table headers."""
+def _advance_toml_structure(
+    line: str, multiline: str | None, array_depth: int
+) -> tuple[str | None, int]:
+    """Track TOML strings and nested arrays so their contents cannot impersonate table headers."""
 
     single: str | None = None
     index = 0
@@ -264,9 +266,15 @@ def _advance_toml_multiline_quote(line: str, multiline: str | None) -> str | Non
         elif line[index] in ("'", '"'):
             single = line[index]
             index += 1
+        elif line[index] == "[":
+            array_depth += 1
+            index += 1
+        elif line[index] == "]":
+            array_depth -= 1
+            index += 1
         else:
             index += 1
-    return multiline
+    return multiline, array_depth
 
 
 def rewrite_gc_cadence(text: str, interval_secs: int) -> str:
@@ -280,6 +288,7 @@ def rewrite_gc_cadence(text: str, interval_secs: int) -> str:
     gc_header: int | None = None
     replaced: set[str] = set()
     multiline_quote: str | None = None
+    array_depth = 0
     root_scope = True
     root_gc_anchor: int | None = None
     root_inline_gc = False
@@ -300,12 +309,16 @@ def rewrite_gc_cadence(text: str, interval_secs: int) -> str:
         # as a section boundary so annotated non-GC tables cannot inherit GC
         # key rewrites, and annotated [gc] is never appended a second time.
         inside_multiline_value = multiline_quote is not None
+        # A nested array element on its own line can resemble a table header.
+        # Only treat headers as section boundaries at the TOML top level.
         header = (
             None
-            if inside_multiline_value
+            if inside_multiline_value or array_depth
             else re.fullmatch(r"(\[\[?.*?\]\]?)\s*(?:#.*)?", stripped)
         )
-        multiline_quote = _advance_toml_multiline_quote(line, multiline_quote)
+        multiline_quote, array_depth = _advance_toml_structure(
+            line, multiline_quote, array_depth
+        )
         if inside_multiline_value:
             continue
         if header is not None:

@@ -3935,6 +3935,36 @@ interval_secs = 0o144 # unrelated
         for key in profile_module._GC_CADENCE_KEYS:
             self.assertEqual(parsed["gc"][key], 3600)
 
+
+    def test_maintenance_rewrite_ignores_nested_array_lines_as_headers(self) -> None:
+        # A nested array such as ["writeback"] is valid TOML and syntactically
+        # resembles a table header when considered without the enclosing array.
+        # It must not end the active [gc] section.
+        for nested in ('["writeback"]', '["gc"]', '[1, 2]'):
+            with self.subTest(nested=nested):
+                source = (
+                    "[gc]\n"
+                    "examples = [\n"
+                    f"  {nested} # nested array value, not a table header\n"
+                    "]\n"
+                    "interval_secs = 60\n"
+                    "idle_interval_secs = 5\n"
+                    "busy_backlog_interval_secs = 15\n"
+                    "[writeback]\n"
+                    "interval_secs = 99\n"
+                )
+                rewritten = profile_module.rewrite_gc_cadence(source, 3600)
+                parsed = tomllib.loads(rewritten)
+                self.assertEqual(
+                    parsed["gc"]["examples"],
+                    [tomllib.loads(f"array = {nested}")["array"]],
+                )
+                for key in profile_module._GC_CADENCE_KEYS:
+                    self.assertEqual(parsed["gc"][key], 3600)
+                self.assertEqual(parsed["writeback"]["interval_secs"], 99)
+                self.assertIn(f"  {nested} # nested array value", rewritten)
+                self.assertEqual(rewritten.count("[gc]"), 1)
+
     def test_maintenance_rewrite_appends_a_missing_gc_section(self) -> None:
         source = '[storage]\nurl = "sftp://pilot@example.test:23/data"'
 
