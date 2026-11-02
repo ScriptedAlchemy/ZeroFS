@@ -324,6 +324,10 @@ jobs:
             echo generic/732 >> excludes
           fi
 
+      - name: Verify deleted-cwd traversal on native VFS
+        if: matrix.client == 'native'
+        run: sudo timeout 60s python3 kernel/ci/removed-cwd.py /mnt/test
+
       - name: Run xfstests
         timeout-minutes: 90
         run: |

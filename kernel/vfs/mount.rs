@@ -432,6 +432,14 @@ pub(super) unsafe extern "C" fn zerofs_d_weak_revalidate(
         let Some(inode) = dentry.inode()? else {
             return Ok(state.is_relaxed().into());
         };
+        // A task may still hold an unlinked directory as its cwd. Weak
+        // revalidation is for '.', '..' and held path references, not a new
+        // name lookup. The server deliberately refuses to rebind a detached
+        // inode, so do not turn an otherwise live VFS dentry into ENOENT.
+        // Strong name revalidation still rejects deleted/replaced entries.
+        if inode.link_count() == 0 {
+            return Ok(1);
+        }
         let credentials = RebindCredentials::current()?;
         let now = monotonic_now_ns();
         if dentry_cache_is_fresh(state, &dentry, &credentials, now, false) {
