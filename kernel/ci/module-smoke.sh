@@ -5,7 +5,8 @@ export LC_ALL=C
 
 readonly script_name=${0##*/}
 readonly pass_marker=ZEROFS_MODULE_SMOKE=PASS
-readonly guest_server=10.0.2.2:5564
+readonly smoke_port=15565
+readonly guest_server=10.0.2.2:${smoke_port}
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 readonly script_dir
 repo_root=$(cd -- "$script_dir/../.." && pwd)
@@ -448,18 +449,27 @@ url = "memory:///"
 encryption_password = "test-password-123"
 
 [servers.ninep]
-addresses = ["127.0.0.1:5564"]
+addresses = ["127.0.0.1:${smoke_port}"]
 
 [telemetry]
 enabled = false
 EOF
+
+    # This smoke server is independent of the workflow's earlier :5564
+    # listener. Never accept a lingering listener as our own readiness signal.
+    if (
+        exec 9<>/dev/tcp/127.0.0.1/"$smoke_port"
+        exec 9>&-
+    ) 2>/dev/null; then
+        die "isolated smoke-test port $smoke_port is already occupied"
+    fi
 
     server_log="$work_dir/server.log"
     "$server_binary" run -c "$config" >"$server_log" 2>&1 &
     server_pid=$!
     for _ in {1..60}; do
         if (
-            exec 9<>/dev/tcp/127.0.0.1/5564
+            exec 9<>/dev/tcp/127.0.0.1/"$smoke_port"
             exec 9>&-
         ) 2>/dev/null; then
             ready=true
