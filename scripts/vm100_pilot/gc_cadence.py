@@ -1,6 +1,7 @@
 """Rewrite GC cadence values without changing unrelated TOML text."""
 from __future__ import annotations
 
+import io
 import re
 import tomllib
 from collections.abc import Iterator
@@ -10,16 +11,16 @@ CADENCE_KEYS = ("interval_secs", "idle_interval_secs", "busy_backlog_interval_se
 
 def _statements(text: str) -> Iterator[tuple[str, dict]]:
     """Let tomllib decide where multiline values end, not a second TOML lexer."""
-    start = 0
-    for line in re.finditer(r"[^\n]*\n|[^\n]+\Z", text):
-        fragment = text[start : line.end()]
+    fragment = ""
+    for line in io.StringIO(text):
+        fragment += line
         try:
             value = tomllib.loads(fragment)
         except tomllib.TOMLDecodeError:
             continue  # The complete input is validated by the caller.
         yield fragment, value
-        start = line.end()
-    if start != len(text):
+        fragment = ""
+    if fragment:
         raise ValueError("cannot locate a complete TOML statement")
 
 

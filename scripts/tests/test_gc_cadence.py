@@ -1,12 +1,9 @@
 """Pure GC rewrite regressions; no pilot lifecycle or mounted filesystem."""
 import math
-from pathlib import Path
-import sys
 import tomllib
 import unittest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from vm100_pilot.gc_cadence import CADENCE_KEYS, rewrite_gc_cadence
+from scripts.vm100_pilot.gc_cadence import CADENCE_KEYS, rewrite_gc_cadence
 
 
 class GcCadenceTests(unittest.TestCase):
@@ -26,6 +23,19 @@ class GcCadenceTests(unittest.TestCase):
                 self.assertEqual(tomllib.loads(result), expected)
                 self.assertIn(f'gc.note = {value}\n', result)
                 self.assertEqual(rewrite_gc_cadence(result, 3600), result)
+
+    def test_unicode_separators_preserve_physical_line_boundaries(self):
+        for newline in ("\n", "\r\n"):
+            for separator in ("\u0085", "\u2028", "\u2029"):
+                with self.subTest(newline=newline, separator=separator):
+                    value = f'"""first{separator}[gc]{separator}last"""'
+                    source = f'gc.note = {value}{newline}[writeback]{newline}interval_secs=90'
+                    result = rewrite_gc_cadence(source, 3600)
+                    expected = tomllib.loads(source)
+                    expected["gc"].update(dict.fromkeys(CADENCE_KEYS, 3600))
+                    self.assertEqual(tomllib.loads(result), expected)
+                    self.assertIn(f'gc.note = {value}{newline}', result)
+                    self.assertEqual(rewrite_gc_cadence(result, 3600), result)
 
     def test_equals_signs_in_quoted_keys_are_preserved(self):
         source = 'gc."note=literal" = "untouched"\n["other=table"]\nvalue=4\n'
