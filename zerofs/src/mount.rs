@@ -57,6 +57,74 @@ const PREFETCH_WINDOW: u32 = 128 * 1024;
 /// arrives later than this is dropped and served fresh from the server instead.
 const ATTR_TTL: Duration = Duration::from_secs(1);
 
+fn sequential_read_ahead(msize: u32) -> u32 {
+    msize.saturating_mul(4).clamp(1 << 20, 32 << 20)
+}
+
+/// FUSE INIT cannot increase read-ahead beyond the kernel's initial BDI
+/// setting. After initialization, raise this mount's setting when permitted.
+/// Only relaxed-consistency mounts use the kernel's buffered read-ahead.
+#[cfg(target_os = "linux")]
+async fn tune_fuse_read_ahead(
+    mountpoint: &Path,
+    wanted: u32,
+    underlying_device: u64,
+) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    // Pin the mounted filesystem while identifying and tuning its BDI. If it
+    // was unmounted before this open, never tune the underlying host filesystem.
+    let directory = tokio::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_DIRECTORY)
+        .open(mountpoint)
+        .await
+        .context("open the mounted FUSE directory")?;
+    let device = directory.metadata().await?.dev();
+    if device == underlying_device {
+        return Err(anyhow!(
+            "mountpoint still identifies the underlying filesystem"
+        ));
+    }
+    // STATFS may itself invoke a FUSE callback. Keep the runtime free to serve it.
+    let (directory, fs_type) = tokio::task::spawn_blocking(move || {
+        rustix::fs::fstatfs(&directory).map(|stat| (directory, stat.f_type))
+    })
+    .await
+    .context("inspect the mounted filesystem type")??;
+    if fs_type as u64 != libc::FUSE_SUPER_MAGIC as u64 {
+        return Err(anyhow!("mountpoint is no longer a FUSE filesystem"));
+    }
+    let setting = PathBuf::from(format!(
+        "/sys/class/bdi/{}:{}/read_ahead_kb",
+        libc::major(device),
+        libc::minor(device)
+    ));
+    let current: u32 = tokio::fs::read_to_string(&setting)
+        .await
+        .with_context(|| format!("read {}", setting.display()))?
+        .trim()
+        .parse()
+        .context("parse FUSE read-ahead size")?;
+    let wanted_kib = wanted.div_ceil(1024);
+    if current < wanted_kib {
+        tokio::fs::write(&setting, format!("{wanted_kib}\n"))
+            .await
+            .with_context(|| {
+                format!(
+                    "kernel read-ahead remains {current} KiB; set {} to {wanted_kib} for larger sequential reads",
+                    setting.display()
+                )
+            })?;
+    }
+    debug!(
+        read_ahead_kib = current.max(wanted_kib),
+        "configured FUSE sequential read-ahead"
+    );
+    drop(directory);
+    Ok(())
+}
+
 /// Read-ahead state for one open directory handle.
 type DirRead = ReaddirState<ninep_proto::DirEntry>;
 
@@ -520,15 +588,10 @@ impl Filesystem for Fuse9P {
         // close to the background cap.
         let _ = config.set_congestion_threshold(60);
 
-        // Bump sequential read-ahead so the kernel pipelines more, larger reads ahead
-        // of the app, which hides latency over a remote backend. Read-ahead below
-        // msize is pointless, and the kernel only reads ahead on detected-sequential
-        // access, so random IO is largely unaffected. Clamp to the kernel's own cap.
-        let want_readahead = self
-            .client
-            .msize()
-            .saturating_mul(4)
-            .clamp(1 << 20, 4 << 20);
+        // Negotiate the available ceiling here. Linux may advertise only its
+        // small initial BDI setting; relaxed mounts also tune that per-mount
+        // setting after INIT, once the dispatcher can service metadata reads.
+        let want_readahead = sequential_read_ahead(self.client.msize());
         if let Err(max) = config.set_max_readahead(want_readahead) {
             let _ = config.set_max_readahead(max);
         }
@@ -1961,6 +2024,14 @@ pub async fn run(target: String, mountpoint: PathBuf, opts: MountOptions) -> Res
     config.n_threads = Some(dispatch_threads);
     config.clone_fd = true;
 
+    #[cfg(target_os = "linux")]
+    let underlying_device = {
+        use std::os::unix::fs::MetadataExt;
+        tokio::fs::metadata(&mountpoint)
+            .await
+            .context("inspect the mountpoint before mounting")?
+            .dev()
+    };
     let session = Session::new(fs, &mountpoint, &config).map_err(|e| {
         let mut err = anyhow!(
             "failed to mount filesystem at {}: {e}",
@@ -1978,6 +2049,17 @@ pub async fn run(target: String, mountpoint: PathBuf, opts: MountOptions) -> Res
     // `spawn` moves the mount handle into the BackgroundSession, so unmounting
     // must go through `umount_and_join` rather than a SessionUnmounter.
     let bg = session.spawn().context("failed to start FUSE session")?;
+
+    #[cfg(target_os = "linux")]
+    if !strict
+        && let Err(error) =
+            tune_fuse_read_ahead(&mountpoint, sequential_read_ahead(msize), underlying_device).await
+    {
+        tracing::warn!(
+            "could not enlarge read-ahead for {}: {error:#}",
+            mountpoint.display()
+        );
+    }
 
     println!(
         "ZeroFS mounted at {} (9P: {}, msize: {} KiB, cache: {})",
@@ -2021,6 +2103,19 @@ pub async fn run(target: String, mountpoint: PathBuf, opts: MountOptions) -> Res
 #[cfg(test)]
 mod consistency_tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn read_ahead_tuning_rejects_the_underlying_mountpoint() {
+        use std::os::unix::fs::MetadataExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let underlying = std::fs::metadata(directory.path()).unwrap().dev();
+        let error = tune_fuse_read_ahead(directory.path(), 32 << 20, underlying)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("underlying filesystem"));
+    }
 
     #[test]
     fn open_flags_precedence() {

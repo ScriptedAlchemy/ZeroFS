@@ -1426,14 +1426,14 @@ async fn canonical_read_base(
         return Ok(Bytes::from(vec![0u8; read_len]));
     }
     let canonical_len = std::cmp::min(read_len as u64, canonical_size - offset);
-    let mut data = extent_store
+    let canonical = extent_store
         .read(id, offset, canonical_len)
         .await
-        .map_err(OverlayError::from)?
-        .to_vec();
-    if data.len() < read_len {
-        data.resize(read_len, 0);
-    }
+        .map_err(OverlayError::from)?;
+    // Allocate the final bound once. Growing a copied prefix can retain nearly
+    // twice the requested payload and escape 9P's response-byte accounting.
+    let mut data = vec![0u8; read_len];
+    data[..canonical.len()].copy_from_slice(&canonical);
     Ok(Bytes::from(data))
 }
 
@@ -1458,6 +1458,21 @@ mod tests {
             source: FilesystemWriteAckSource::Filesystem,
             client_durability_target: ClientDurabilityTarget::LocalSsd,
         }
+    }
+
+    #[tokio::test]
+    async fn padded_canonical_read_retains_only_the_requested_allocation() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let auth = crate::fs::types::AuthContext::from(&test_creds());
+        let file = fs.create_exclusive(&auth, 0, b"padded-read").await.unwrap();
+        let prefix = Bytes::from(vec![0x5a; 48 * 1024]);
+        fs.write(&auth, file, 0, &prefix).await.unwrap();
+        let data = canonical_read_base(&fs.extent_store, file, 0, 64 * 1024, prefix.len() as u64)
+            .await
+            .unwrap();
+        assert_eq!(&data[..prefix.len()], prefix.as_ref());
+        assert!(data[prefix.len()..].iter().all(|byte| *byte == 0));
+        assert_eq!(data.try_into_mut().unwrap().capacity(), 64 * 1024);
     }
 
     #[tokio::test]
