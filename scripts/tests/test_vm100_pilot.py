@@ -3712,6 +3712,281 @@ enabled = true
 """,
         )
 
+    def test_maintenance_rewrite_handles_annotated_table_headers(self) -> None:
+        source = """[gc] # Preserve this comment with ] bracket
+interval_secs = 60
+read_directed = true
+
+[writeback] # A different section must retain its own values ]
+interval_secs = 90
+
+["other]#section"] # Quoted hashes and brackets are not comment delimiters ]
+interval_secs = 120
+"""
+        rewritten = profile_module.rewrite_gc_cadence(source, 3600)
+        values = tomllib.loads(rewritten)
+        self.assertEqual(values["gc"]["interval_secs"], 3600)
+        self.assertEqual(values["gc"]["idle_interval_secs"], 3600)
+        self.assertEqual(values["gc"]["busy_backlog_interval_secs"], 3600)
+        self.assertTrue(values["gc"]["read_directed"])
+        self.assertEqual(values["writeback"]["interval_secs"], 90)
+        self.assertEqual(values["other]#section"]["interval_secs"], 120)
+        self.assertIn("[gc] # Preserve this comment", rewritten)
+        self.assertIn("[writeback] # A different section", rewritten)
+        self.assertEqual(rewritten.count("[gc]"), 1)
+
+    def test_maintenance_rewrite_accepts_toml_integer_spellings(self) -> None:
+        source = """[gc] # Valid TOML integer spellings
+interval_secs = +1_000 # keep the comment
+idle_interval_secs = 0x3c # hexadecimal
+busy_backlog_interval_secs = 0b1_010 # binary
+
+[writeback]
+interval_secs = 0o144 # unrelated value must remain unchanged
+"""
+        rewritten = profile_module.rewrite_gc_cadence(source, 3600)
+        self.assertEqual(
+            rewritten,
+            source.replace("+1_000", "3600")
+            .replace("0x3c", "3600")
+            .replace("0b1_010", "3600"),
+        )
+        parsed = tomllib.loads(rewritten)
+        self.assertEqual(parsed["gc"]["interval_secs"], 3600)
+        self.assertEqual(parsed["gc"]["idle_interval_secs"], 3600)
+        self.assertEqual(parsed["gc"]["busy_backlog_interval_secs"], 3600)
+        self.assertEqual(parsed["writeback"]["interval_secs"], 100)
+
+    def test_maintenance_rewrite_handles_gc_header_without_newline(self) -> None:
+        for source in ("[gc]", "[gc] # annotated header ]"):
+            with self.subTest(source=source):
+                rewritten = profile_module.rewrite_gc_cadence(source, 3600)
+                self.assertTrue(rewritten.startswith(source + "\n"))
+                self.assertEqual(rewritten.count("[gc]"), 1)
+                gc = tomllib.loads(rewritten)["gc"]
+                for key in profile_module._GC_CADENCE_KEYS:
+                    self.assertEqual(gc[key], 3600)
+
+    def test_maintenance_rewrite_preserves_quoted_gc_keys(self) -> None:
+        source = """[gc]
+"interval_secs" = 0x10 # preserve this comment
+'idle_interval_secs' = +1_000
+busy_backlog_interval_secs = 23
+
+[writeback]
+interval_secs = 0o144 # unrelated
+"""
+        rewritten = profile_module.rewrite_gc_cadence(source, 3600)
+        self.assertEqual(
+            rewritten,
+            source.replace("0x10 # preserve", "3600 # preserve")
+            .replace("+1_000", "3600")
+            .replace(
+                "busy_backlog_interval_secs = 23",
+                "busy_backlog_interval_secs = 3600",
+            ),
+        )
+        parsed = tomllib.loads(rewritten)
+        for key in profile_module._GC_CADENCE_KEYS:
+            self.assertEqual(parsed["gc"][key], 3600)
+        self.assertEqual(parsed["writeback"]["interval_secs"], 100)
+
+    def test_maintenance_rewrite_decodes_unicode_escaped_gc_keys(self) -> None:
+        source = (
+            "[gc]\n"
+            '"\\u0069nterval_secs" = 60 # preserve the spelling\n'
+            "idle_interval_secs = 90\n"
+            "busy_backlog_interval_secs = 15\n"
+            "[writeback]\n"
+            "interval_secs = 33\n"
+        )
+        rewritten = profile_module.rewrite_gc_cadence(source, 3600)
+        self.assertIn('"\\u0069nterval_secs" = 3600 # preserve the spelling', rewritten)
+        self.assertEqual(tomllib.loads(rewritten)["writeback"]["interval_secs"], 33)
+        for key in profile_module._GC_CADENCE_KEYS:
+            self.assertEqual(tomllib.loads(rewritten)["gc"][key], 3600)
+
+        dotted = (
+            '"\\u0067c"."\\u0069nterval_secs" = 60 # keep\n'
+            '"\\u0067c".note = "unchanged"\n'
+            "[writeback]\n"
+            "interval_secs = 33\n"
+        )
+        rewritten = profile_module.rewrite_gc_cadence(dotted, 3600)
+        self.assertIn('"\\u0067c"."\\u0069nterval_secs" = 3600 # keep', rewritten)
+        self.assertNotIn("\n[gc]", rewritten)
+        self.assertEqual(tomllib.loads(rewritten)["gc"]["note"], "unchanged")
+        self.assertEqual(tomllib.loads(rewritten)["writeback"]["interval_secs"], 33)
+        for key in profile_module._GC_CADENCE_KEYS:
+            self.assertEqual(tomllib.loads(rewritten)["gc"][key], 3600)
+
+        inline = (
+            '"\\u0067c" = { interval_secs = 60, idle_interval_secs = 5, '
+            "busy_backlog_interval_secs = 15 }\n"
+        )
+        with self.assertRaisesRegex(ValueError, "inline GC table"):
+            profile_module.rewrite_gc_cadence(inline, 3600)
+
+    def test_maintenance_rewrite_accepts_quoted_gc_tables(self) -> None:
+        for header in ('["gc"]', "['gc']", '[ "gc" ] # trailing ]'):
+            with self.subTest(header=header):
+                source = (
+                    f"{header}\ninterval_secs = 60\n\n"
+                    '["other]#section"]\ninterval_secs = 90\n'
+                )
+                rewritten = profile_module.rewrite_gc_cadence(source, 3600)
+                parsed = tomllib.loads(rewritten)
+                self.assertTrue(rewritten.startswith(header + "\n"))
+                self.assertNotIn("\n[gc]\n", rewritten)
+                for key in profile_module._GC_CADENCE_KEYS:
+                    self.assertEqual(parsed["gc"][key], 3600)
+                self.assertEqual(parsed["other]#section"]["interval_secs"], 90)
+
+    def test_maintenance_rewrite_preserves_root_dotted_cadence(self) -> None:
+        for root in ("gc", '"gc"', "'gc'"):
+            with self.subTest(root=root):
+                source = (
+                    f"{root}.interval_secs = 60 # keep this comment\n"
+                    f"{root}.idle_interval_secs = 0x3c\n"
+                    f"{root}.busy_backlog_interval_secs = +1_000\n"
+                    "[writeback]\ninterval_secs = 88\n"
+                )
+                rewritten = profile_module.rewrite_gc_cadence(source, 3600)
+                self.assertEqual(
+                    rewritten,
+                    source.replace("60 # keep", "3600 # keep")
+                    .replace("0x3c", "3600")
+                    .replace("+1_000", "3600"),
+                )
+                self.assertNotIn("\n[gc]", rewritten)
+                parsed = tomllib.loads(rewritten)
+                for key in profile_module._GC_CADENCE_KEYS:
+                    self.assertEqual(parsed["gc"][key], 3600)
+                self.assertEqual(parsed["writeback"]["interval_secs"], 88)
+
+    def test_maintenance_rewrite_adds_missing_root_dotted_keys(self) -> None:
+        source = "gc.interval_secs = 60 # keep\n[writeback]\ninterval_secs = 88\n"
+        rewritten = profile_module.rewrite_gc_cadence(source, 3600)
+        self.assertIn("gc.interval_secs = 3600 # keep\n", rewritten)
+        self.assertNotIn("\n[gc]\n", rewritten)
+        self.assertLess(
+            rewritten.index("gc.idle_interval_secs"),
+            rewritten.index("[writeback]"),
+        )
+        parsed = tomllib.loads(rewritten)
+        for key in profile_module._GC_CADENCE_KEYS:
+            self.assertEqual(parsed["gc"][key], 3600)
+        self.assertEqual(parsed["writeback"]["interval_secs"], 88)
+
+    def test_maintenance_rewrite_rejects_inline_gc_safely(self) -> None:
+        source = (
+            "gc = { interval_secs = 60, idle_interval_secs = 5, "
+            "busy_backlog_interval_secs = 15 }\n"
+        )
+        with self.assertRaisesRegex(ValueError, "inline GC table"):
+            profile_module.rewrite_gc_cadence(source, 3600)
+        self.assertEqual(tomllib.loads(source)["gc"]["interval_secs"], 60)
+
+    def test_maintenance_rewrite_ignores_multiline_string_headers(self) -> None:
+        basic = "\n".join(
+            (
+                "[gc]",
+                'notes = """',
+                "This is prose, not a table:",
+                "[writeback]",
+                "interval_secs = 777",
+                '"""',
+                "interval_secs = 60",
+                "idle_interval_secs = 5",
+                "busy_backlog_interval_secs = 15",
+                "[writeback]",
+                "interval_secs = 90",
+            )
+        ) + "\n"
+        rewritten = profile_module.rewrite_gc_cadence(basic, 3600)
+        self.assertIn(
+            'notes = """\nThis is prose, not a table:\n[writeback]\n'
+            'interval_secs = 777\n"""',
+            rewritten,
+        )
+        parsed = tomllib.loads(rewritten)
+        self.assertEqual(parsed["writeback"]["interval_secs"], 90)
+        self.assertIn("interval_secs = 777", parsed["gc"]["notes"])
+        for key in profile_module._GC_CADENCE_KEYS:
+            self.assertEqual(parsed["gc"][key], 3600)
+
+        literal = "\n".join(
+            (
+                "[storage]",
+                "notes = '''",
+                "[gc]",
+                "'''",
+                "[gc]",
+                "comment = '\"\"\" is quoted, not a multiline opener'",
+                "interval_secs = 60",
+            )
+        ) + "\n"
+        rewritten = profile_module.rewrite_gc_cadence(literal, 3600)
+        parsed = tomllib.loads(rewritten)
+        self.assertEqual(parsed["storage"]["notes"], "[gc]\n")
+        self.assertEqual(
+            parsed["gc"]["comment"], '""" is quoted, not a multiline opener'
+        )
+        for key in profile_module._GC_CADENCE_KEYS:
+            self.assertEqual(parsed["gc"][key], 3600)
+
+
+    def test_maintenance_rewrite_ignores_nested_array_lines_as_headers(self) -> None:
+        # A nested array such as ["writeback"] is valid TOML and syntactically
+        # resembles a table header when considered without the enclosing array.
+        # It must not end the active [gc] section.
+        for nested in ('["writeback"]', '["gc"]', '[1, 2]'):
+            with self.subTest(nested=nested):
+                source = (
+                    "[gc]\n"
+                    "examples = [\n"
+                    f"  {nested} # nested array value, not a table header\n"
+                    "]\n"
+                    "interval_secs = 60\n"
+                    "idle_interval_secs = 5\n"
+                    "busy_backlog_interval_secs = 15\n"
+                    "[writeback]\n"
+                    "interval_secs = 99\n"
+                )
+                rewritten = profile_module.rewrite_gc_cadence(source, 3600)
+                parsed = tomllib.loads(rewritten)
+                self.assertEqual(
+                    parsed["gc"]["examples"],
+                    [tomllib.loads(f"array = {nested}")["array"]],
+                )
+                for key in profile_module._GC_CADENCE_KEYS:
+                    self.assertEqual(parsed["gc"][key], 3600)
+                self.assertEqual(parsed["writeback"]["interval_secs"], 99)
+                self.assertIn(f"  {nested} # nested array value", rewritten)
+                self.assertEqual(rewritten.count("[gc]"), 1)
+
+    def test_maintenance_rewrite_preserves_unicode_separators_in_strings(self) -> None:
+        # These codepoints are legal TOML string characters, not line breaks.
+        # A parser using str.splitlines() mistook their intervening prose for
+        # a real [writeback] section, then inserted duplicate GC cadence keys.
+        for separator in ("\u0085", "\u2028", "\u2029"):
+            with self.subTest(separator=hex(ord(separator))):
+                notes = f"before{separator}[writeback]{separator}interval_secs = 777"
+                source = (
+                    "[gc]\n"
+                    f'notes = "{notes}"\n'
+                    "interval_secs = 60\n"
+                    "[writeback]\n"
+                    "interval_secs = 90\n"
+                )
+                rewritten = profile_module.rewrite_gc_cadence(source, 3600)
+                parsed = tomllib.loads(rewritten)
+                self.assertIn(f'notes = "{notes}"\n', rewritten)
+                self.assertEqual(parsed["gc"]["notes"], notes)
+                for key in profile_module._GC_CADENCE_KEYS:
+                    self.assertEqual(parsed["gc"][key], 3600)
+                self.assertEqual(parsed["writeback"]["interval_secs"], 90)
+
     def test_maintenance_rewrite_appends_a_missing_gc_section(self) -> None:
         source = '[storage]\nurl = "sftp://pilot@example.test:23/data"'
 

@@ -8,7 +8,6 @@ import shutil
 import socket
 import tempfile
 import time
-import tomllib
 import urllib.error
 import urllib.request
 import uuid
@@ -18,6 +17,7 @@ from typing import IO, Protocol
 
 from .benchmark import BenchmarkResult, BenchmarkRunner
 from .config import PilotConfig
+from .gc_cadence import CADENCE_KEYS as _GC_CADENCE_KEYS, rewrite_gc_cadence
 from .lifecycle import PilotLifecycle
 from .owned_resources import atomic_write_json
 from .receipts import RunReceipt
@@ -25,11 +25,6 @@ from .runner import ManagedProcess, Runner
 from .system_io import file_sha256
 
 
-_GC_CADENCE_KEYS = (
-    "interval_secs",
-    "idle_interval_secs",
-    "busy_backlog_interval_secs",
-)
 _SYSTEMD_RUNTIME_DIR = Path("/run/systemd/system")
 _SYSTEMD_SERVICE_NAME = re.compile(r"[A-Za-z0-9_.@:-]+\.service\Z")
 _UNSAFE_SYSTEMD_ENVIRONMENT_PATH = re.compile(r'["\\\r\n%]')
@@ -226,63 +221,6 @@ def _load_phase_windows(result: BenchmarkResult) -> dict[str, tuple[int, int]]:
             raise RuntimeError(f"non-positive benchmark phase window: {name}")
         parsed[name] = (start_ns, end_ns)
     return parsed
-
-
-def rewrite_gc_cadence(text: str, interval_secs: int) -> str:
-    """Set the three segment-GC cadence tiers without reformatting the config."""
-
-    if not 300 <= interval_secs <= 86400:
-        raise ValueError("maintenance GC interval must be between 300 and 86400")
-    tomllib.loads(text)
-    lines = text.splitlines(keepends=True)
-    in_gc = False
-    gc_header: int | None = None
-    replaced: set[str] = set()
-    assignments = {
-        key: re.compile(rf"^(\s*{re.escape(key)}\s*=\s*)\d+(\s*(?:#.*)?(?:\r?\n)?)$")
-        for key in _GC_CADENCE_KEYS
-    }
-    for index, line in enumerate(lines):
-        stripped = line.strip()
-        if stripped.startswith("[") and stripped.endswith("]"):
-            in_gc = stripped == "[gc]"
-            if in_gc:
-                gc_header = index
-            continue
-        if not in_gc:
-            continue
-        for key, assignment in assignments.items():
-            match = assignment.fullmatch(line)
-            if match is None:
-                continue
-            lines[index] = f"{match.group(1)}{interval_secs}{match.group(2)}"
-            replaced.add(key)
-            break
-    missing = [key for key in _GC_CADENCE_KEYS if key not in replaced]
-    if missing:
-        newline = "\r\n" if "\r\n" in text else "\n"
-        additions = [
-            f"{key} = {interval_secs}{newline}"
-            for key in _GC_CADENCE_KEYS
-            if key in missing
-        ]
-        if gc_header is not None:
-            lines[gc_header + 1 : gc_header + 1] = additions
-        else:
-            if text.endswith(newline * 2):
-                separator = ""
-            elif text.endswith(newline):
-                separator = newline
-            else:
-                separator = newline * 2
-            lines.append(separator)
-            lines.extend([f"[gc]{newline}", *additions])
-    rewritten = "".join(lines)
-    settings = tomllib.loads(rewritten)
-    gc = settings.get("gc", {})
-    if any(gc.get(key) != interval_secs for key in _GC_CADENCE_KEYS):
-        raise RuntimeError("rewritten [gc] cadence did not validate")
-    return rewritten
 
 
 _sha256 = file_sha256
