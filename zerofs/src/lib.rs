@@ -36,6 +36,7 @@ mod russh_session;
 pub mod segment;
 pub mod segment_extractor;
 pub mod segment_store;
+mod sftp_metrics;
 pub mod sftp_object_store;
 mod sftp_protocol;
 pub mod sftp_transport;

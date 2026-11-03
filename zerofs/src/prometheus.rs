@@ -682,18 +682,21 @@ fn collect_lsm_stats(recorder: &DefaultMetricsRecorder) {
     let snapshot = recorder.snapshot();
     for metric in snapshot.all() {
         let prom_name = lsm_export_name(&metric.name);
+        // The engine registers independent series for each component, store,
+        // operation and API. Dropping those labels merges counters by maximum
+        // and overwrites gauges/histogram sums in snapshot iteration order.
         match &metric.value {
             MetricValue::Counter(v) => {
-                counter!(prom_name).absolute(*v);
+                counter!(prom_name, &metric.labels).absolute(*v);
             }
             MetricValue::Gauge(v) => {
-                gauge!(prom_name).set(*v as f64);
+                gauge!(prom_name, &metric.labels).set(*v as f64);
             }
             MetricValue::UpDownCounter(v) => {
-                gauge!(prom_name).set(*v as f64);
+                gauge!(prom_name, &metric.labels).set(*v as f64);
             }
             MetricValue::Histogram { sum, .. } => {
-                gauge!(prom_name).set(*sum);
+                gauge!(prom_name, &metric.labels).set(*sum);
             }
         }
     }
@@ -1170,6 +1173,79 @@ mod tests {
         // A name without the engine prefix still exports under lsm_: the
         // recorder holds only metadata-engine metrics.
         assert_eq!(lsm_export_name("some.other.stat"), "lsm_some_other_stat");
+    }
+
+    #[test]
+    fn engine_metrics_preserve_labels_across_collector_ticks() {
+        use crate::sftp_metrics::tests::metric_value;
+        use slatedb_common::metrics::{DefaultMetricsRecorder, MetricsRecorder};
+
+        let engine = DefaultMetricsRecorder::new();
+        let get = engine.register_counter(
+            "slatedb.object_store.request_count",
+            "requests",
+            &[("api", "get")],
+        );
+        let list = engine.register_counter(
+            "slatedb.object_store.request_count",
+            "requests",
+            &[("api", "list")],
+        );
+        let active_get =
+            engine.register_gauge("slatedb.object_store.active", "active", &[("api", "get")]);
+        let active_list =
+            engine.register_gauge("slatedb.object_store.active", "active", &[("api", "list")]);
+        get.increment(10);
+        list.increment(3);
+        active_get.set(2);
+        active_list.set(1);
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            super::collect_lsm_stats(&engine);
+            let body = handle.render();
+            assert_eq!(
+                metric_value(&body, "lsm_object_store_request_count", &[("api", "get")]),
+                10.0
+            );
+            assert_eq!(
+                metric_value(&body, "lsm_object_store_request_count", &[("api", "list")]),
+                3.0
+            );
+            assert_eq!(
+                metric_value(&body, "lsm_object_store_active", &[("api", "get")]),
+                2.0
+            );
+            assert_eq!(
+                metric_value(&body, "lsm_object_store_active", &[("api", "list")]),
+                1.0
+            );
+            get.increment(2);
+            active_get.set(0);
+            super::collect_lsm_stats(&engine);
+            let body = handle.render();
+            assert_eq!(
+                metric_value(&body, "lsm_object_store_request_count", &[("api", "get")]),
+                12.0
+            );
+            assert_eq!(
+                metric_value(&body, "lsm_object_store_request_count", &[("api", "list")]),
+                3.0
+            );
+            assert_eq!(
+                metric_value(&body, "lsm_object_store_active", &[("api", "get")]),
+                0.0
+            );
+            assert_eq!(
+                metric_value(&body, "lsm_object_store_active", &[("api", "list")]),
+                1.0
+            );
+            assert!(
+                !body
+                    .lines()
+                    .any(|line| line.starts_with("lsm_object_store_request_count "))
+            );
+        });
     }
 
     #[test]

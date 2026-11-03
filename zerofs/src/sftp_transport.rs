@@ -1,3 +1,4 @@
+use crate::sftp_metrics::{SftpPhase, observe_phase};
 use crate::sftp_object_store::{ObjectHeader, SftpCapabilities};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -146,7 +147,7 @@ const SFTP_DIAL_BACKOFF_BASE: Duration = Duration::from_millis(100);
 const SFTP_DIAL_BACKOFF_MAX: Duration = Duration::from_secs(5);
 const SFTP_DIRECTORY_CACHE_MAX_ENTRIES: usize = 64 * 1024;
 /// Maximum operations multiplexed onto one SSH session. The SFTP layer
-/// pipelines up to 64 outstanding requests per session, so a handful of
+/// pipelines up to 64 outstanding READ requests per leased operation, so a handful of
 /// concurrent operations sharing one connection hide the WAN RTT instead of
 /// serializing on it; the cap keeps one session's request window and remote
 /// handle usage bounded.
@@ -1474,9 +1475,9 @@ impl SftpSessionPool {
     }
 
     fn validate_limits(shared: usize, reads: usize, writes: usize) -> Result<(), TransportError> {
-        if !(1..=8).contains(&shared) {
+        if !(1..=10).contains(&shared) {
             return Err(TransportError::InvalidLimits(
-                "shared sessions must be between 1 and 8".to_owned(),
+                "shared sessions must be between 1 and 10".to_owned(),
             ));
         }
         // Operations multiplex onto shared sessions, so per-kind concurrency
@@ -1497,10 +1498,15 @@ impl SftpSessionPool {
         &self,
         kind: OperationKind,
     ) -> Result<SessionLease, TransportError> {
-        let admission = self.inner.admission.acquire(kind).await?;
+        let admission = observe_phase(
+            SftpPhase::Admission,
+            kind,
+            self.inner.admission.acquire(kind),
+        )
+        .await?;
         let activity = self.inner.register_activity()?;
 
-        let session = self.acquire_session(kind).await?;
+        let session = observe_phase(SftpPhase::Session, kind, self.acquire_session(kind)).await?;
         Ok(SessionLease {
             pool: self.inner.clone(),
             session: Some(session),

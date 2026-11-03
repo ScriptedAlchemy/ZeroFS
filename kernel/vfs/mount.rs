@@ -432,6 +432,14 @@ pub(super) unsafe extern "C" fn zerofs_d_weak_revalidate(
         let Some(inode) = dentry.inode()? else {
             return Ok(state.is_relaxed().into());
         };
+        // A jumped path can still name a directory retained as cwd after
+        // rmdir, including an already-removed parent reached through "..".
+        // Its VFS reference remains usable even though Trebind deliberately
+        // rejects namespace-detached inodes. Permission checks still use the
+        // live inode; strong name revalidation must not revive its old name.
+        if inode.link_count() == 0 {
+            return Ok(1);
+        }
         let credentials = RebindCredentials::current()?;
         let now = monotonic_now_ns();
         if dentry_cache_is_fresh(state, &dentry, &credentials, now, false) {
@@ -443,7 +451,9 @@ pub(super) unsafe extern "C" fn zerofs_d_weak_revalidate(
         let attributes =
             match getattr_attributes(&state.client, &inode, &credentials, expected_type) {
                 Ok(attributes) => attributes,
-                Err(error) if error == ENOENT => return Ok(0),
+                // A local rmdir may have completed while getattr was in
+                // flight. The same retained-inode rule applies after the RPC.
+                Err(error) if error == ENOENT => return Ok((inode.link_count() == 0).into()),
                 Err(error) => return Err(error),
             };
         validate_stat(&attributes)?;
