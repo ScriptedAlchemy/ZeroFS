@@ -265,6 +265,18 @@ jobs:
           [[ $(findmnt -nr -o FSTYPE /mnt/test) == "$expected_type" ]]
           [[ $(findmnt -nr -o FSTYPE /mnt/scratch) == "$expected_type" ]]
 
+      - name: Check traversal from a removed working directory
+        run: |
+          # v9fs explicitly clunks non-open directory fids during rmdir;
+          # test its retained-open-fid contract. The native client must
+          # continue to traverse using cwd references alone.
+          if [[ "${{ matrix.client }}" == v9fs ]]; then
+            sudo timeout 60s python3 kernel/ci/removed-cwd.py /mnt/test \
+              --keep-directory-fds
+          else
+            sudo timeout 60s python3 kernel/ci/removed-cwd.py /mnt/test
+          fi
+
       - name: Configure xfstests
         id: configure_xfstests
         run: |

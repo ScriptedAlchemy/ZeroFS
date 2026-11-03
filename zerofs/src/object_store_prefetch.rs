@@ -25,6 +25,13 @@ use crate::alloc_rss;
 #[derive(Clone, Copy, Debug)]
 pub struct SkipPartsCache;
 
+/// Cache the requested range without predicting more physical object bytes.
+/// Segment callers already know the logical file's next extents; adjacent
+/// physical frames can belong to other files. Cache-part alignment and the
+/// shared in-flight registry still apply.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CacheRangeOnly;
+
 const DEFAULT_PART_SIZE_BYTES: usize = 128 * 1024;
 const HEADS_CAPACITY_ENTRIES: usize = 16 * 1024;
 const ACCESS_TRACKER_CAPACITY: usize = 8 * 1024;
@@ -33,12 +40,18 @@ const FETCH_WINDOW_MIN: usize = 128 * 1024;
 const FETCH_WINDOW_MAX: usize = 8 * 1024 * 1024;
 const MAX_STREAMS: usize = 4;
 /// Minimum confirmed-stream window relative to the random-access minimum. The
-/// live SFTP profile therefore promotes 1 MiB to 16 MiB after sequential access
-/// is proven, while an unproven/random stream stays at 1 MiB.
-const SEQUENTIAL_FETCH_WINDOW_MULTIPLIER: usize = 15;
+/// live SFTP profile promotes 1 MiB to 4 MiB after sequential access is proven.
+/// Ordinary object consumers can then use several default SFTP sessions, while
+/// an unproven/random stream stays at 1 MiB. File segment reads opt out of this
+/// physical prediction and use their logical extent map instead.
+const SEQUENTIAL_FETCH_WINDOW_MULTIPLIER: usize = 4;
 /// Look-ahead horizon for a proven sequential stream. Each window remains a
 /// separate backend GET so SFTP can use several physical sessions at once.
-const PREFETCH_DEPTH_WINDOWS: usize = 4;
+const PREFETCH_DEPTH_WINDOWS: usize = 8;
+/// Poll several required cache parts while preserving their output order.
+/// A join on an earlier in-flight window must not serialize independent
+/// missing gaps later in the same read. Backend admission still applies.
+const PART_READ_CONCURRENCY: usize = 8;
 
 /// Resolved cold-read geometry for one backend. `Default` is the tuning used by
 /// every backend that does not publish a profile of its own.
@@ -1139,36 +1152,55 @@ impl PrefetchingObjectStore {
                 let start_part: PartId = (aligned.start / part_size)
                     .try_into()
                     .expect("part id exceeds usize");
+                // The caller's requested end is not an object-size bound.
+                // An evicted HEAD can coexist with a cached generation; a
+                // 0..u64::MAX request must not reserve billions of parts while
+                // trying to reestablish the metadata. One bounded probe is
+                // enough: the lazy data read is planned after HEAD/EOF clipping.
+                let max_probe_parts = fetch_window
+                    .max(self.part_size_bytes)
+                    .div_ceil(self.part_size_bytes);
                 let end_part: PartId = aligned
                     .end
                     .div_ceil(part_size)
                     .try_into()
                     .expect("part id exceeds usize");
+                let end_part = end_part.min(start_part.saturating_add(max_probe_parts));
                 let needed_end: PartId = requested
                     .end
                     .div_ceil(part_size)
                     .try_into()
                     .expect("part id exceeds usize");
-                let ctx = self.ctx(read);
-                match Self::plan_window(
-                    &ctx,
-                    location,
-                    &generation,
-                    start_part,
-                    end_part - start_part,
-                    Some(needed_end),
-                ) {
-                    WindowPlan::Lead { shared, guard, .. } => {
-                        let _guard = guard;
-                        let _ = shared.await;
+                let needed_end = needed_end.min(end_part);
+                // The saturated MAX endpoint is not part-aligned; use HEAD
+                // rather than risk constructing an unrepresentable part end.
+                // Invalid/empty ranges likewise defer to canonical validation.
+                if requested.start < requested.end
+                    && aligned.end != u64::MAX
+                    && end_part > start_part
+                    && needed_end > start_part
+                {
+                    let ctx = self.ctx(read);
+                    match Self::plan_window(
+                        &ctx,
+                        location,
+                        &generation,
+                        start_part,
+                        end_part - start_part,
+                        Some(needed_end),
+                    ) {
+                        WindowPlan::Lead { shared, guard, .. } => {
+                            let _guard = guard;
+                            let _ = shared.await;
+                        }
+                        WindowPlan::Join(shared) => {
+                            let _ = shared.await;
+                        }
+                        WindowPlan::Covered => {}
                     }
-                    WindowPlan::Join(shared) => {
-                        let _ = shared.await;
+                    if let Some(head) = self.read_head(location) {
+                        return Ok(head);
                     }
-                    WindowPlan::Covered => {}
-                }
-                if let Some(head) = self.read_head(location) {
-                    return Ok(head);
                 }
             }
 
@@ -1224,7 +1256,16 @@ impl PrefetchingObjectStore {
             Some(GetRange::Bounded(r)) => r.end.saturating_sub(r.start),
             _ => 0,
         };
-        let decision = self.record_access(location, access_offset, access_len);
+        let decision = if opts.extensions.get::<CacheRangeOnly>().is_some() {
+            RecordDecision {
+                // Zero means no expansion beyond cache-part alignment. Using
+                // one part here would expand an unaligned tiny read into two.
+                fetch_window: 0,
+                async_prefetch: Vec::new(),
+            }
+        } else {
+            self.record_access(location, access_offset, access_len)
+        };
         let fetch_window = decision.fetch_window;
 
         let (meta, attributes, read) = loop {
@@ -1274,7 +1315,9 @@ impl PrefetchingObjectStore {
                 )
             })
             .collect::<Vec<_>>();
-        let result_stream = stream::iter(futures).then(|fut| fut).boxed();
+        let result_stream = stream::iter(futures)
+            .buffered(PART_READ_CONCURRENCY)
+            .boxed();
 
         Ok(GetResult {
             meta,
@@ -1842,7 +1885,10 @@ impl PrefetchingObjectStore {
         let alignment = alignment as u64;
         Range {
             start: range.start - range.start % alignment,
-            end: range.end.div_ceil(alignment) * alignment,
+            // An untrusted requested upper bound may round beyond u64::MAX.
+            // Keep the bound inclusive of every requested byte and let the
+            // backend clip it against the actual object size.
+            end: range.end.div_ceil(alignment).saturating_mul(alignment),
         }
     }
 }
@@ -2060,6 +2106,82 @@ mod tests {
 
     const MEM: usize = 4 * 1024 * 1024;
     const DISK: usize = 64 * 1024 * 1024;
+
+    #[tokio::test]
+    async fn oversized_requested_ranges_saturate_without_overflow() {
+        let (store, inner, _dir) = make_store(1024, MEM, DISK).await;
+
+        // Both forms used to panic while rounding up the requested upper
+        // bound before the backend could clip it to a real object's EOF.
+        for end in [u64::MAX - 1, u64::MAX] {
+            let GetRange::Bounded(range) = store.align_get_range(&GetRange::Bounded(0..end), 1024)
+            else {
+                panic!("bounded range changed type");
+            };
+            assert_eq!(range.end, u64::MAX);
+        }
+        let GetRange::Suffix(suffix) = store.align_get_range(&GetRange::Suffix(u64::MAX), 1024)
+        else {
+            panic!("suffix range changed type");
+        };
+        assert_eq!(suffix, u64::MAX);
+
+        let location = Path::from("oversized-suffix");
+        inner
+            .put(&location, Bytes::from_static(b"small object").into())
+            .await
+            .unwrap();
+        let result = store
+            .get_opts(
+                &location,
+                GetOptions {
+                    range: Some(GetRange::Suffix(u64::MAX)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.bytes().await.unwrap().as_ref(), b"small object");
+    }
+
+    #[tokio::test]
+    async fn evicted_head_with_oversized_bounded_read_does_not_plan_unbounded_parts() {
+        let (store, inner, _dir) = make_store(1024, MEM, DISK).await;
+        let location = Path::from("evicted-head-huge-request");
+        let payload = vec![0xA5u8; 3 * 1024];
+        inner.put(&location, payload.clone().into()).await.unwrap();
+
+        // A consumed cold GET preserves the generation even if HEAD is evicted.
+        let first = store
+            .get_opts(
+                &location,
+                GetOptions {
+                    range: Some(GetRange::Bounded(0..1)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.bytes().await.unwrap().as_ref(), &payload[..1]);
+        assert!(store.generations.get(&location).is_some());
+
+        // Before the fix, the non-MAX request tried to reserve an enormous
+        // registry window; MAX could additionally overflow its byte end.
+        for end in [1u64 << 60, u64::MAX] {
+            store.heads.remove(&location);
+            let result = store
+                .get_opts(
+                    &location,
+                    GetOptions {
+                        range: Some(GetRange::Bounded(0..end)),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.bytes().await.unwrap().as_ref(), payload.as_slice());
+        }
+    }
 
     fn versioned_result(tag: &str) -> PutResult {
         PutResult {
@@ -2436,6 +2558,105 @@ mod tests {
         }
         let seen = ranges.lock().unwrap();
         assert_eq!(seen.len(), 1, "duplicate cold backend reads: {seen:?}");
+    }
+
+    #[tokio::test]
+    async fn segment_reads_do_not_speculate_into_unrelated_file_frames() {
+        use crate::config::CompressionConfig;
+        use crate::frame_codec::FrameCodec;
+        use crate::fs::EXTENT_SIZE;
+        use crate::segment::SEGMENT_INFO;
+        use crate::segment_store::SegmentStore;
+
+        const MIB: usize = 1024 * 1024;
+        const WANTED_BYTES: usize = 8 * MIB;
+        let mem = Arc::new(InMemory::new());
+        let codec = || FrameCodec::new(&[1; 32], SEGMENT_INFO, CompressionConfig::Lz4);
+        let writer = SegmentStore::new(mem.clone(), codec(), 5, None);
+        let mut seed = 0x6a09_e667_f3bc_c909u64;
+        let noise: Vec<u8> = (0..EXTENT_SIZE)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed as u8
+            })
+            .collect();
+        let wanted_frames = WANTED_BYTES / EXTENT_SIZE;
+        let frames: Vec<_> = (0..32 * MIB / EXTENT_SIZE)
+            .map(|index| {
+                let inode = if index < wanted_frames { 1 } else { 2 };
+                let extent = if inode == 1 {
+                    index
+                } else {
+                    index - wanted_frames
+                };
+                let mut bytes = noise.clone();
+                bytes[..8].copy_from_slice(&(index as u64).to_le_bytes());
+                (inode, extent as u64, Bytes::from(bytes))
+            })
+            .collect();
+        let locations = writer.seal(&frames).await.unwrap();
+        let object_size = mem
+            .head(&Path::from(locations[0].2.segid.object_key()))
+            .await
+            .unwrap()
+            .size;
+        let ranges = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let backend: Arc<dyn ObjectStore> = Arc::new(RangeRecordingStore {
+            inner: mem,
+            ranges: ranges.clone(),
+        });
+        let (cache, _dir) = store_over_with_tuning(backend, MIB, MIB, 32 * MIB).await;
+        let reader = SegmentStore::new(Arc::new(cache), codec(), 6, None);
+        let per_read = MIB / EXTENT_SIZE;
+
+        for start in (0..wanted_frames).step_by(per_read) {
+            let run = &locations[start..start + per_read];
+            let first = run[0].2;
+            let last = run.last().unwrap().2;
+            let slots: Vec<_> = run
+                .iter()
+                .map(|(inode, extent, _)| (*inode, *extent))
+                .collect();
+            let got = reader
+                .read_run(
+                    first.segid,
+                    first.byte_offset,
+                    (last.byte_offset + u64::from(last.byte_len) - first.byte_offset) as u32,
+                    first.frame_index,
+                    &slots,
+                )
+                .await
+                .unwrap();
+            for (index, bytes) in got.iter().enumerate() {
+                assert_eq!(bytes, &frames[start + index].2);
+            }
+        }
+        // Let any detached speculation reach the recording backend.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let last = locations[wanted_frames - 1].2;
+        let wanted_end = last.byte_offset + u64::from(last.byte_len);
+        let cache_aligned_end = wanted_end.next_multiple_of(MIB as u64);
+        let seen = ranges.lock().unwrap();
+        let fetched: u64 = seen
+            .iter()
+            .map(|range| match range {
+                GetRange::Bounded(range) => range.end.min(object_size).saturating_sub(range.start),
+                _ => panic!("segment reads must remain bounded: {range:?}"),
+            })
+            .sum();
+        eprintln!("mixed segment: {WANTED_BYTES} logical bytes, {fetched} backend range bytes");
+        assert!(
+            seen.iter().all(
+                |range| matches!(range, GetRange::Bounded(range) if range.end <= cache_aligned_end)
+            ),
+            "copying inode 1 fetched unrelated inode 2 beyond the final cache part: {seen:?}"
+        );
+        assert!(
+            fetched <= cache_aligned_end,
+            "overlapping frame reads fetched duplicate parts: {seen:?}"
+        );
     }
 
     #[tokio::test]
@@ -2937,13 +3158,13 @@ mod tests {
         assert!(
             bounded
                 .iter()
-                .any(|range| range.end - range.start == 15 * MIB as u64),
-            "sequential reads never reached the 15 MiB one-wave window: {bounded:?}"
+                .any(|range| range.end - range.start == 4 * MIB as u64),
+            "sequential reads never reached the 4 MiB parallel window: {bounded:?}"
         );
         assert!(
             bounded
                 .iter()
-                .all(|range| range.end - range.start <= 15 * MIB as u64)
+                .all(|range| range.end - range.start <= 4 * MIB as u64)
         );
     }
 
@@ -3028,14 +3249,14 @@ mod tests {
         let confirmed = bounded.get(1).expect("confirmed-stream backend GET");
         assert_eq!(
             confirmed.end - confirmed.start,
-            15 * MIB as u64,
+            4 * MIB as u64,
             "the first confirmed-sequential GET must fit one 64-request SFTP payload wave"
         );
         assert!(
             bounded
                 .iter()
                 .skip(1)
-                .all(|range| range.end - range.start <= 15 * MIB as u64),
+                .all(|range| range.end - range.start <= 4 * MIB as u64),
             "a proven-sequential GET exceeded one 64-request SFTP wave: {bounded:?}"
         );
         let mut ordered = bounded.clone();
@@ -3045,13 +3266,323 @@ mod tests {
             "sequential SFTP windows overlapped: {bounded:?}"
         );
         assert!(
-            bounded.len() <= 9,
-            "120 MiB sequential stream used {} backend GETs instead of <=9: {bounded:?}",
+            bounded.len() <= 31,
+            "120 MiB sequential stream used {} backend GETs instead of <=31: {bounded:?}",
             bounded.len()
         );
         assert!(
             amplification <= 1.15,
             "120 MiB sequential amplification {amplification:.3}x > 1.15x ({fetched} fetched)"
+        );
+    }
+
+    #[derive(Debug)]
+    struct WindowGate {
+        slots: tokio::sync::Semaphore,
+        release: tokio::sync::Semaphore,
+        started: tokio::sync::mpsc::UnboundedSender<Range<u64>>,
+    }
+
+    #[derive(Debug)]
+    struct WindowGatedStore {
+        inner: Arc<InMemory>,
+        ranges: Arc<Mutex<Vec<Range<u64>>>>,
+        gate: Arc<WindowGate>,
+    }
+
+    impl Display for WindowGatedStore {
+        fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+            write!(f, "WindowGatedStore")
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for WindowGatedStore {
+        async fn get_opts(&self, l: &Path, o: GetOptions) -> object_store::Result<GetResult> {
+            if let Some(GetRange::Bounded(r)) = &o.range {
+                self.ranges.lock().unwrap().push(r.clone());
+            }
+            let _slot = if let Some(GetRange::Bounded(range)) = &o.range
+                && range.start > 0
+            {
+                let gate = &self.gate;
+                let slot = gate.slots.acquire().await.unwrap();
+                gate.started.send(range.clone()).unwrap();
+                gate.release.acquire().await.unwrap().forget();
+                Some(slot)
+            } else {
+                None
+            };
+            self.inner.get_opts(l, o).await
+        }
+        async fn put_opts(
+            &self,
+            l: &Path,
+            p: PutPayload,
+            o: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            self.inner.put_opts(l, p, o).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            l: &Path,
+            o: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(l, o).await
+        }
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, object_store::Result<Path>>,
+        ) -> BoxStream<'static, object_store::Result<Path>> {
+            self.inner.delete_stream(locations)
+        }
+        fn list(&self, p: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.inner.list(p)
+        }
+        async fn list_with_delimiter(&self, p: Option<&Path>) -> object_store::Result<ListResult> {
+            self.inner.list_with_delimiter(p).await
+        }
+        async fn copy_opts(&self, f: &Path, t: &Path, o: CopyOptions) -> object_store::Result<()> {
+            self.inner.copy_opts(f, t, o).await
+        }
+        async fn rename_opts(
+            &self,
+            f: &Path,
+            t: &Path,
+            o: RenameOptions,
+        ) -> object_store::Result<()> {
+            self.inner.rename_opts(f, t, o).await
+        }
+    }
+
+    #[tokio::test]
+    async fn sftp_sequential_segment_can_fill_eight_sessions_before_any_window_finishes() {
+        const MIB: usize = 1024 * 1024;
+        let inner = Arc::new(InMemory::new());
+        let path = Path::from("segments/eight-sessions");
+        let payload: Vec<u8> = (0..32 * MIB).map(|i| (i % 251) as u8).collect();
+        inner.put(&path, payload.clone().into()).await.unwrap();
+        let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
+        let gate = Arc::new(WindowGate {
+            slots: tokio::sync::Semaphore::new(8),
+            release: tokio::sync::Semaphore::new(0),
+            started,
+        });
+        let ranges = Arc::new(Mutex::new(Vec::new()));
+        let backend = Arc::new(WindowGatedStore {
+            inner,
+            ranges: Arc::clone(&ranges),
+            gate: Arc::clone(&gate),
+        });
+        let (store, _dir) = store_over_with_tuning(backend, MIB, MIB, 32 * MIB).await;
+        assert_eq!(
+            store.get_range(&path, 0..65536).await.unwrap().as_ref(),
+            &payload[..65536]
+        );
+        assert_eq!(
+            ranges.lock().unwrap().as_slice(),
+            std::slice::from_ref(&(0..MIB as u64))
+        );
+        assert_eq!(
+            store
+                .get_range(&path, 65536..131072)
+                .await
+                .unwrap()
+                .as_ref(),
+            &payload[65536..131072]
+        );
+
+        let mut inflight = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut inflight = Vec::new();
+            for _ in 0..8 {
+                inflight.push(starts.recv().await.unwrap());
+            }
+            inflight
+        })
+        .await
+        .expect("one sequential segment could not keep eight sessions busy");
+        assert_eq!(gate.slots.available_permits(), 0);
+        inflight.sort_unstable_by_key(|range| range.start);
+        for (index, range) in inflight.iter().enumerate() {
+            assert_eq!(range.start, ((1 + 4 * index) * MIB) as u64);
+            assert_eq!(
+                range.end,
+                (range.start + (4 * MIB) as u64).min((32 * MIB) as u64)
+            );
+        }
+        assert!(inflight.windows(2).all(|pair| pair[0].end == pair[1].start));
+        gate.release.add_permits(8);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !store.fetches.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("window downloads did not settle");
+        // Permit a cache-evicted tail to be fetched again; the concurrency proof
+        // above held all eight sessions before allowing any completion.
+        gate.release.add_permits(8);
+        let start = (31 * MIB) as u64;
+        assert_eq!(
+            store
+                .get_range(&path, start..(32 * MIB) as u64)
+                .await
+                .unwrap()
+                .as_ref(),
+            &payload[31 * MIB..]
+        );
+    }
+
+    #[tokio::test]
+    async fn demand_read_starts_missing_tail_while_joined_prefix_is_pending() {
+        const MIB: usize = 1024 * 1024;
+        let inner = Arc::new(InMemory::new());
+        let path = Path::from("segments/joined-prefix-missing-tail");
+        let payload: Vec<u8> = (0..3 * MIB)
+            .map(|i| ((i * 17 + i / 251) % 253) as u8)
+            .collect();
+        inner.put(&path, payload.clone().into()).await.unwrap();
+        let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
+        let gate = Arc::new(WindowGate {
+            slots: tokio::sync::Semaphore::new(8),
+            release: tokio::sync::Semaphore::new(0),
+            started,
+        });
+        let ranges = Arc::new(Mutex::new(Vec::new()));
+        let backend = Arc::new(WindowGatedStore {
+            inner,
+            ranges: Arc::clone(&ranges),
+            gate: Arc::clone(&gate),
+        });
+        let (store, _dir) = store_over_with_tuning(backend, MIB, MIB, 8 * MIB).await;
+        let range_only = |range| {
+            let mut opts = GetOptions {
+                range: Some(GetRange::Bounded(range)),
+                ..Default::default()
+            };
+            opts.extensions.insert(CacheRangeOnly);
+            opts
+        };
+        store
+            .get_opts(&path, range_only(0..1))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        store.spawn_async_prefetch(
+            &path,
+            &cached_generation(&store, &path),
+            AsyncPrefetch {
+                start: MIB as u64,
+                size: MIB,
+            },
+            0,
+            &store.read_lease(&path),
+        );
+        let prefix = tokio::time::timeout(std::time::Duration::from_secs(2), starts.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(prefix, MIB as u64..2 * MIB as u64);
+
+        let requested = MIB as u64 + 17..3 * MIB as u64 - 29;
+        let result = store
+            .get_opts(&path, range_only(requested.clone()))
+            .await
+            .unwrap();
+        let reader = tokio::spawn(async move { result.bytes().await });
+        let tail = tokio::time::timeout(std::time::Duration::from_secs(2), starts.recv()).await;
+        // Release and join on both success and the old serial-path failure so
+        // the regression never strands a background fetch or a cache handle.
+        gate.release.add_permits(8);
+        let got = reader.await.unwrap().unwrap();
+        assert_eq!(
+            got.as_ref(),
+            &payload[requested.start as usize..requested.end as usize]
+        );
+        assert_eq!(
+            tail.expect("missing tail waited for the unrelated in-flight prefix to finish")
+                .unwrap(),
+            2 * MIB as u64..3 * MIB as u64
+        );
+        assert_eq!(
+            ranges.lock().unwrap().as_slice(),
+            &[
+                0..MIB as u64,
+                MIB as u64..2 * MIB as u64,
+                2 * MIB as u64..3 * MIB as u64
+            ],
+            "the needed tail must start early without duplicating the prefix or fetching outside the range"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_multi_part_read_releases_all_missing_range_fetches() {
+        const PART: usize = 64 * 1024;
+        let inner = Arc::new(InMemory::new());
+        let path = Path::from("segments/cancel-missing-ranges");
+        let payload = Bytes::from(vec![0x5a; 4 * PART]);
+        inner.put(&path, payload.clone().into()).await.unwrap();
+        let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
+        let gate = Arc::new(WindowGate {
+            slots: tokio::sync::Semaphore::new(8),
+            release: tokio::sync::Semaphore::new(0),
+            started,
+        });
+        let ranges = Arc::new(Mutex::new(Vec::new()));
+        let backend = Arc::new(WindowGatedStore {
+            inner: Arc::clone(&inner),
+            ranges: Arc::clone(&ranges),
+            gate: Arc::clone(&gate),
+        });
+        let (store, _dir) = store_over_with_tuning(backend, PART, PART, 8 * PART).await;
+        let meta = inner.head(&path).await.unwrap();
+        store.save_head(
+            &path,
+            &meta,
+            &Attributes::default(),
+            &store.read_lease(&path),
+        );
+        let generation = cached_generation(&store, &path);
+        store.admit_part(
+            &path,
+            &generation,
+            2,
+            Bytes::copy_from_slice(&payload[2 * PART..3 * PART]),
+        );
+        let mut opts = GetOptions {
+            range: Some(GetRange::Bounded(PART as u64..4 * PART as u64)),
+            ..Default::default()
+        };
+        opts.extensions.insert(CacheRangeOnly);
+        let result = store.get_opts(&path, opts).await.unwrap();
+        let reader = tokio::spawn(async move { result.bytes().await });
+        let started = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let first = starts.recv().await.unwrap();
+            let second = starts.recv().await.unwrap();
+            [first, second]
+        })
+        .await;
+        reader.abort();
+        assert!(reader.await.unwrap_err().is_cancelled());
+        assert!(
+            store.fetches.lock().unwrap().is_empty(),
+            "cancelled reads stranded shared fetch entries"
+        );
+        assert_eq!(
+            gate.slots.available_permits(),
+            8,
+            "cancelled reads retained backend slots"
+        );
+        let mut started = Vec::from(started.expect("independent cache gaps were serialized"));
+        started.sort_unstable_by_key(|r| r.start);
+        assert_eq!(
+            started,
+            vec![
+                PART as u64..2 * PART as u64,
+                3 * PART as u64..4 * PART as u64
+            ]
         );
     }
 

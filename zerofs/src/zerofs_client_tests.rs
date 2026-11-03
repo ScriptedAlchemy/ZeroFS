@@ -801,6 +801,68 @@ async fn file_cursor_async_io_and_seek() {
 }
 
 #[tokio::test]
+async fn file_cursor_read_ahead_respects_seek_write_and_growing_eof() {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+
+    let (client, _shutdown, _dir) = setup().await;
+    let file = client.create("/buffered-cursor.bin").await.unwrap();
+    let original: Vec<u8> = (0..(3 << 20)).map(|i| (i % 251) as u8).collect();
+    file.write_at(0, &original).await.unwrap();
+    let mut cursor = file.cursor();
+    let mut byte = [0];
+    client.wait_for_cleanup().await;
+    let before = client.traffic_stats().operations;
+    cursor.read_exact(&mut byte).await.unwrap();
+    assert_eq!(client.traffic_stats().operations - before, 1);
+    assert_eq!(byte[0], original[0]);
+    assert_eq!(cursor.position(), 1);
+    assert_eq!(cursor.seek(std::io::SeekFrom::Current(1)).await.unwrap(), 2);
+    let before = client.traffic_stats().operations;
+    cursor.read_exact(&mut byte).await.unwrap();
+    assert_eq!(client.traffic_stats().operations - before, 1);
+    assert_eq!(byte[0], original[2]);
+    cursor.write_all(b"!").await.unwrap();
+    assert_eq!(cursor.position(), 4);
+    cursor.read_exact(&mut byte).await.unwrap();
+    assert_eq!(byte[0], original[4]);
+    cursor.seek(std::io::SeekFrom::Start(3)).await.unwrap();
+    cursor.read_exact(&mut byte).await.unwrap();
+    assert_eq!(&byte, b"!");
+
+    cursor.seek(std::io::SeekFrom::Start(0)).await.unwrap();
+    client.wait_for_cleanup().await;
+    let before = client.traffic_stats().operations;
+    let copied = tokio::io::copy(&mut cursor, &mut tokio::io::sink())
+        .await
+        .unwrap();
+    assert_eq!(copied, original.len() as u64);
+    assert!(
+        client.traffic_stats().operations - before < 24,
+        "small copy buffers must not cause one RPC per 8 KiB"
+    );
+
+    file.write_at(original.len() as u64, b"appended")
+        .await
+        .unwrap();
+    let mut appended = Vec::new();
+    cursor.read_to_end(&mut appended).await.unwrap();
+    assert_eq!(appended, b"appended");
+    assert_eq!(cursor.position(), original.len() as u64 + 8);
+
+    cursor.seek(std::io::SeekFrom::Start(0)).await.unwrap();
+    cursor.read_exact(&mut byte).await.unwrap();
+    cursor.read_exact(&mut byte).await.unwrap();
+    file.close().await;
+    let error = cursor.read_exact(&mut byte).await.unwrap_err();
+    assert!(matches!(
+        error
+            .get_ref()
+            .and_then(|error| error.downcast_ref::<ZeroFsError>()),
+        Some(ZeroFsError::Closed)
+    ));
+}
+
+#[tokio::test]
 async fn connect_with_options_identity_aname_and_msize() {
     let fs_be = Arc::new(ZeroFS::new_in_memory().await.unwrap());
     let dir = tempfile::tempdir().unwrap();

@@ -1033,14 +1033,22 @@ impl SftpObjectStore {
         location: &ObjectPath,
         options: &GetOptions,
     ) -> object_store::Result<crate::sftp_transport::RemoteObjectRead> {
+        use crate::sftp_transport::TransportError;
+
         if options.version.is_some() {
             return Err(object_store::Error::NotSupported {
                 source: "SFTP object versions are not exposed separately from ETags".into(),
             });
         }
         let remote = self.remote_path(location, false)?;
+        let operation = if options.head { "head" } else { "get" };
         let (known_missing, observed_epoch) = self.known_missing.probe(location);
         if known_missing {
+            metrics::counter!(
+                "zerofs_sftp_negative_cache_hits_total",
+                "operation" => operation,
+            )
+            .increment(1);
             return Err(object_store::Error::NotFound {
                 path: location.to_string(),
                 source: "SFTP object is known absent for this single-owner process".into(),
@@ -1052,8 +1060,26 @@ impl SftpObjectStore {
             "SFTP object read",
             |lease| lease.read_object(&remote, options.range.clone(), options.head)
         )
-        .await
-        .map_err(transport_error);
+        .await;
+        // Classify typed backend results before adapting them to object_store
+        // errors. Known misses above never lease a session; they must not be
+        // mistaken for failed remote reads. These completed operations can
+        // include admission, open, close, or pool errors, not just wire READs.
+        let outcome = match &result {
+            Ok(_) => "success",
+            Err(TransportError::NotFound(_)) => "not_found",
+            Err(TransportError::InvalidRange(_)) => "invalid_range",
+            Err(TransportError::PermissionDenied(_)) => "permission_denied",
+            Err(TransportError::CorruptObject(_)) => "corrupt_object",
+            Err(TransportError::PoolClosed) => "pool_closed",
+            Err(_) => "transport_error",
+        };
+        metrics::counter!(
+            "zerofs_sftp_backend_read_results_total",
+            "operation" => operation, "outcome" => outcome,
+        )
+        .increment(1);
+        let result = result.map_err(transport_error);
         match &result {
             Ok(object) => {
                 self.forget_missing(location);
@@ -1304,31 +1330,62 @@ impl ObjectStore for SftpObjectStore {
         location: &ObjectPath,
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
-        let has_preconditions = options.if_match.is_some()
-            || options.if_none_match.is_some()
-            || options.if_modified_since.is_some()
-            || options.if_unmodified_since.is_some();
-        if has_preconditions && !options.head {
-            let metadata_options = GetOptions {
-                version: options.version.clone(),
-                head: true,
-                ..Default::default()
-            };
-            let object = self.read_remote(location, &metadata_options).await?;
+        let api = if options.head {
+            "head"
+        } else if options.range.is_some() {
+            "get_range"
+        } else {
+            "get"
+        };
+        let started = tokio::time::Instant::now();
+        let result: object_store::Result<GetResult> = async {
+            let has_preconditions = options.if_match.is_some()
+                || options.if_none_match.is_some()
+                || options.if_modified_since.is_some()
+                || options.if_unmodified_since.is_some();
+            if has_preconditions && !options.head {
+                let metadata_options = GetOptions {
+                    version: options.version.clone(),
+                    head: true,
+                    ..Default::default()
+                };
+                let object = self.read_remote(location, &metadata_options).await?;
+                let meta = object_meta(location.clone(), &object);
+                options.check_preconditions(&meta)?;
+            }
+            let object = self.read_remote(location, &options).await?;
             let meta = object_meta(location.clone(), &object);
             options.check_preconditions(&meta)?;
+            let payload = object.payload;
+            Ok(GetResult {
+                payload: GetResultPayload::Stream(stream::once(async move { Ok(payload) }).boxed()),
+                meta,
+                range: object.range,
+                attributes: Attributes::default(),
+                extensions: Extensions::default(),
+            })
         }
-        let object = self.read_remote(location, &options).await?;
-        let meta = object_meta(location.clone(), &object);
-        options.check_preconditions(&meta)?;
-        let payload = object.payload;
-        Ok(GetResult {
-            payload: GetResultPayload::Stream(stream::once(async move { Ok(payload) }).boxed()),
-            meta,
-            range: object.range,
-            attributes: Attributes::default(),
-            extensions: Extensions::default(),
-        })
+        .await;
+        // Count the outward API result, including local negative-cache hits,
+        // option rejection and conditional responses after a successful HEAD.
+        // Backend read counters alone cannot account for those engine errors.
+        // This is elapsed wall time, not the sum of overlapping phase times.
+        let outcome = match &result {
+            Ok(_) => "success",
+            Err(object_store::Error::NotFound { .. }) => "not_found",
+            Err(object_store::Error::NotModified { .. }) => "not_modified",
+            Err(object_store::Error::Precondition { .. }) => "precondition_failed",
+            Err(object_store::Error::PermissionDenied { .. }) => "permission_denied",
+            Err(object_store::Error::Unauthenticated { .. }) => "unauthenticated",
+            Err(object_store::Error::InvalidPath { .. }) => "invalid_path",
+            Err(object_store::Error::NotSupported { .. }) => "not_supported",
+            Err(_) => "other_error",
+        };
+        metrics::counter!("zerofs_sftp_get_results_total", "api" => api, "outcome" => outcome)
+            .increment(1);
+        metrics::histogram!("zerofs_sftp_get_duration_seconds", "api" => api, "outcome" => outcome)
+            .record(started.elapsed().as_secs_f64());
+        result
     }
 
     fn delete_stream(
@@ -3298,6 +3355,228 @@ mod tests {
         assert!(
             rendered.contains("zerofs_sftp_object_read_bytes_total 15"),
             "metrics:\n{rendered}"
+        );
+        assert_eq!(
+            crate::sftp_metrics::tests::metric_value(
+                &rendered,
+                "zerofs_sftp_backend_read_results_total",
+                &[("operation", "get"), ("outcome", "success")],
+            ),
+            1.0
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_result_metrics_separate_cached_misses_and_backend_failures() {
+        use crate::sftp_metrics::tests::metric_value;
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        let remote = Arc::new(SharedRemoteFs::default());
+        remote.files.lock().unwrap().insert(
+            PathBuf::from("root/corrupt.bin"),
+            Bytes::from_static(b"invalid object"),
+        );
+        let pool = crate::sftp_transport::SftpSessionPool::new_writable(
+            Arc::new(SharedRemoteFactory(remote)),
+            1,
+            1,
+            1,
+        )
+        .await
+        .unwrap();
+        let store = SftpObjectStore::new(pool.clone(), ObjectPath::from("root")).unwrap();
+        let missing = ObjectPath::from("root/missing.bin");
+        for _ in 0..2 {
+            assert!(matches!(
+                store.get(&missing).await.unwrap_err(),
+                object_store::Error::NotFound { .. }
+            ));
+        }
+        assert!(matches!(
+            store.head(&missing).await.unwrap_err(),
+            object_store::Error::NotFound { .. }
+        ));
+        assert!(matches!(
+            store
+                .get(&ObjectPath::from("root/corrupt.bin"))
+                .await
+                .unwrap_err(),
+            object_store::Error::Generic { .. }
+        ));
+        pool.shutdown().await.unwrap();
+        assert!(
+            store
+                .get(&ObjectPath::from("root/after-shutdown.bin"))
+                .await
+                .is_err()
+        );
+
+        let body = handle.render();
+        for operation in ["get", "head"] {
+            assert_eq!(
+                metric_value(
+                    &body,
+                    "zerofs_sftp_negative_cache_hits_total",
+                    &[("operation", operation)],
+                ),
+                1.0
+            );
+        }
+        for outcome in ["not_found", "corrupt_object", "pool_closed"] {
+            assert_eq!(
+                metric_value(
+                    &body,
+                    "zerofs_sftp_backend_read_results_total",
+                    &[("operation", "get"), ("outcome", outcome)],
+                ),
+                1.0
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_result_metrics_include_conditional_results_and_cached_misses() {
+        use crate::sftp_metrics::tests::metric_value;
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        let remote = Arc::new(SharedRemoteFs::default());
+        let header = ObjectHeader {
+            generation: Uuid::new_v4(),
+            logical_len: 6,
+        };
+        let mut encoded = encode_header(header).to_vec();
+        encoded.extend_from_slice(b"abcdef");
+        remote
+            .files
+            .lock()
+            .unwrap()
+            .insert(PathBuf::from("root/present.bin"), Bytes::from(encoded));
+        let pool = crate::sftp_transport::SftpSessionPool::new_writable(
+            Arc::new(SharedRemoteFactory(remote)),
+            1,
+            1,
+            1,
+        )
+        .await
+        .unwrap();
+        let store = SftpObjectStore::new(pool.clone(), ObjectPath::from("root")).unwrap();
+        let present = ObjectPath::from("root/present.bin");
+        let etag = store.get(&present).await.unwrap().meta.e_tag.unwrap();
+        assert_eq!(store.head(&present).await.unwrap().size, 6);
+        assert_eq!(
+            store.get_range(&present, 1..4).await.unwrap(),
+            Bytes::from_static(b"bcd")
+        );
+        assert!(matches!(
+            store
+                .get_opts(
+                    &present,
+                    GetOptions {
+                        if_none_match: Some(etag),
+                        ..Default::default()
+                    }
+                )
+                .await
+                .unwrap_err(),
+            object_store::Error::NotModified { .. }
+        ));
+        assert!(matches!(
+            store
+                .get_opts(
+                    &present,
+                    GetOptions {
+                        if_match: Some("wrong-generation".to_owned()),
+                        ..Default::default()
+                    }
+                )
+                .await
+                .unwrap_err(),
+            object_store::Error::Precondition { .. }
+        ));
+        let missing = ObjectPath::from("root/missing.bin");
+        for _ in 0..2 {
+            assert!(matches!(
+                store.get(&missing).await.unwrap_err(),
+                object_store::Error::NotFound { .. }
+            ));
+        }
+        assert!(matches!(
+            store
+                .get_opts(
+                    &present,
+                    GetOptions {
+                        version: Some("unsupported-version".to_owned()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap_err(),
+            object_store::Error::NotSupported { .. }
+        ));
+        pool.shutdown().await.unwrap();
+        let body = handle.render();
+        for (outcome, expected) in [
+            ("success", 1.0),
+            ("not_modified", 1.0),
+            ("precondition_failed", 1.0),
+            ("not_found", 2.0),
+            ("not_supported", 1.0),
+        ] {
+            assert_eq!(
+                metric_value(
+                    &body,
+                    "zerofs_sftp_get_results_total",
+                    &[("api", "get"), ("outcome", outcome)]
+                ),
+                expected
+            );
+            assert_eq!(
+                metric_value(
+                    &body,
+                    "zerofs_sftp_get_duration_seconds_count",
+                    &[("api", "get"), ("outcome", outcome)]
+                ),
+                expected
+            );
+        }
+        for api in ["head", "get_range"] {
+            for metric in [
+                "zerofs_sftp_get_results_total",
+                "zerofs_sftp_get_duration_seconds_count",
+            ] {
+                assert_eq!(
+                    metric_value(&body, metric, &[("api", api), ("outcome", "success")]),
+                    1.0
+                );
+            }
+        }
+        assert_eq!(
+            metric_value(
+                &body,
+                "zerofs_sftp_backend_read_results_total",
+                &[("operation", "head"), ("outcome", "success")]
+            ),
+            3.0
+        );
+        assert_eq!(
+            metric_value(
+                &body,
+                "zerofs_sftp_backend_read_results_total",
+                &[("operation", "get"), ("outcome", "not_found")]
+            ),
+            1.0
+        );
+        assert_eq!(
+            metric_value(
+                &body,
+                "zerofs_sftp_negative_cache_hits_total",
+                &[("operation", "get")]
+            ),
+            1.0
         );
     }
 

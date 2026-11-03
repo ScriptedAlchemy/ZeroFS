@@ -36,8 +36,8 @@ fn dec_open_handle(map: &DashMap<InodeId, u64>, id: InodeId) -> u64 {
     }
 }
 
-/// Pins an inode's open-handle count for the lifetime of one opened 9P fid.
-/// Created (incrementing the count) when a fid is opened, and stored in that
+/// Pins an inode while an opened 9P fid or a walked directory fid retains it.
+/// Created (incrementing the count) under the inode lock, and stored in that
 /// fid's slot in the session table. Because it lives in the slot, every way a
 /// fid goes away (clunk, close_all, a walk that overwrites it, the session
 /// table being dropped) releases the count exactly once, with no release call

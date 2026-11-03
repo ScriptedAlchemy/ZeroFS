@@ -10,6 +10,10 @@ jobs:
   zfs-test:
     name: Run ZFS on top of ZeroFS
     runs-on: ubuntu-latest
+    env:
+      # Use a dedicated disposable NBD minor, rather than assuming nbd0 is free.
+      # belongs to this job on an evolving hosted-runner image.
+      ZEROFS_CI_NBD_DEVICE: /dev/nbd7
 
     steps:
       - uses: actions/checkout@v4
@@ -47,14 +51,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y nbd-client zfsutils-linux wget pigz pixz parallel
 
-      # The hosted runner may have an occupied/absent nbd0. Use the same
-      # explicit, disposable NBD device as the tiered ZFS scenario.
-      - name: Assert the runner owns the disposable NBD device
+      - name: Assert the runner owns a disposable NBD device
         run: |
+          # This is a local CI fixture, not a production block device.
           sudo modprobe nbd
-          test -b /dev/nbd7
-          if [ "$(cat /sys/block/nbd7/size)" != "0" ]; then
-            echo "/dev/nbd7 is already mapped; refusing to reuse it" >&2
+          test -b "$ZEROFS_CI_NBD_DEVICE"
+          if sudo nbd-client -c "$ZEROFS_CI_NBD_DEVICE" >/dev/null 2>&1; then
+            echo "$ZEROFS_CI_NBD_DEVICE already has an NBD export; refusing to reuse it" >&2
             exit 1
           fi
 
@@ -139,20 +142,23 @@ jobs:
       - name: Connect NBD device
         run: |
           echo "Connecting to NBD device..."
-          if ! sudo nbd-client 127.0.0.1 10809 /dev/nbd7 -N test-device; then
-            echo "Host NBD setup failed; kernel diagnostics follow" >&2
-            sudo dmesg | tail -n 100 || true
+          if ! sudo nbd-client 127.0.0.1 10809 "$ZEROFS_CI_NBD_DEVICE" -N test-device; then
+            echo "NBD negotiation/device attachment failed; recording kernel evidence" >&2
+            sudo dmesg | tail -n 120 || true
+            sudo ls -l "$ZEROFS_CI_NBD_DEVICE" || true
+            cat /sys/block/nbd7/pid 2>/dev/null || true
+            cat /sys/block/nbd7/size 2>/dev/null || true
             exit 1
           fi
 
-          sudo blockdev --getsize64 /dev/nbd7
-          sudo fdisk -l /dev/nbd7
+          sudo blockdev --getsize64 "$ZEROFS_CI_NBD_DEVICE"
+          sudo fdisk -l "$ZEROFS_CI_NBD_DEVICE"
 
       - name: Create ZFS pool
         run: |
           # Create ZFS pool directly on NBD block device
           echo "Creating ZFS pool on NBD device..."
-          sudo zpool create testpool /dev/nbd7
+          sudo zpool create testpool "$ZEROFS_CI_NBD_DEVICE"
 
           # Check pool status
           sudo zpool status testpool
@@ -276,7 +282,7 @@ jobs:
       - name: Disconnect NBD and stop ZeroFS
         run: |
           echo "Disconnecting NBD device..."
-          sudo nbd-client -d /dev/nbd7
+          sudo nbd-client -d "$ZEROFS_CI_NBD_DEVICE"
 
           # Wait for NBD to fully disconnect - check if device is actually in use
           echo "Waiting for NBD device to disconnect..."
@@ -292,11 +298,11 @@ jobs:
           done
 
           # Also check using nbd-client -c to see if device is connected
-          if sudo nbd-client -c /dev/nbd7 2>/dev/null; then
-            echo "WARNING: NBD device reports as still connected, but continuing..."
-          else
-            echo "NBD device confirmed disconnected"
+          if sudo nbd-client -c "$ZEROFS_CI_NBD_DEVICE" 2>/dev/null; then
+            echo "NBD device is still attached after disconnect; refusing stale restart" >&2
+            exit 1
           fi
+          echo "NBD device confirmed disconnected"
 
           echo "Stopping ZeroFS..."
           # Find and kill the zerofs process
@@ -368,15 +374,18 @@ jobs:
       - name: Reconnect NBD and import pool
         run: |
           echo "Reconnecting NBD device..."
-          if ! sudo nbd-client 127.0.0.1 10809 /dev/nbd7 -N test-device; then
-            echo "Host NBD setup failed; kernel diagnostics follow" >&2
-            sudo dmesg | tail -n 100 || true
+          if ! sudo nbd-client 127.0.0.1 10809 "$ZEROFS_CI_NBD_DEVICE" -N test-device; then
+            echo "NBD negotiation/device attachment failed; recording kernel evidence" >&2
+            sudo dmesg | tail -n 120 || true
+            sudo ls -l "$ZEROFS_CI_NBD_DEVICE" || true
+            cat /sys/block/nbd7/pid 2>/dev/null || true
+            cat /sys/block/nbd7/size 2>/dev/null || true
             exit 1
           fi
 
           # Verify NBD device is available
-          sudo blockdev --getsize64 /dev/nbd7
-          sudo fdisk -l /dev/nbd7
+          sudo blockdev --getsize64 "$ZEROFS_CI_NBD_DEVICE"
+          sudo fdisk -l "$ZEROFS_CI_NBD_DEVICE"
 
           echo "Importing ZFS pool..."
           sudo zpool import testpool
@@ -432,7 +441,7 @@ jobs:
           sudo zpool export testpool || true
 
           # Disconnect NBD device
-          sudo nbd-client -d /dev/nbd7 || true
+          sudo nbd-client -d "$ZEROFS_CI_NBD_DEVICE" || true
 
           # Kill ZeroFS
           pkill -f "zerofs run -c zerofs-ci.toml" || true

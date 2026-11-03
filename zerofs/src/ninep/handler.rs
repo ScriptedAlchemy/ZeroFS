@@ -185,6 +185,10 @@ pub struct FidSlot {
     pub fid: Fid,
     /// Open-handle pin installed only after an open is authorized.
     pub handle: Option<OpenHandle>,
+    /// A directory walked by a client stays addressable until its last fid
+    /// retires, including when rmdir unlinks the current working directory.
+    /// This does not confer an open/read capability or authorize Trebind.
+    pub directory_pin: Option<OpenHandle>,
     /// `Trebind(OPENED)` expects this unopened fid to be reopened next.
     ///
     /// This is deliberately metadata rather than an `OpenHandle`: a
@@ -201,6 +205,7 @@ impl FidSlot {
         Self {
             fid,
             handle: None,
+            directory_pin: None,
             replay_reopen: false,
             lock_guard: None,
         }
@@ -532,13 +537,48 @@ impl NinePHandler {
         Ok(())
     }
 
-    fn install_walk_fid(&self, source: u32, newfid: u32, fid: Fid) -> P9Result<()> {
+    /// Retain a directory inode while the client holds an authorized walked
+    /// fid. A cwd dentry need not have been opened with Tlopen, yet the Linux
+    /// VFS can still issue getattr(".") and walk("..") after rmdir.
+    ///
+    /// Pin under the inode lock, ordering the liveness check and increment
+    /// against the last-link removal. A zero-link inode may only be cloned
+    /// from another still-live fid; it must never be resurrected from an
+    /// unprotected stale inode number.
+    async fn pin_walked_directory(&self, id: InodeId) -> P9Result<Option<OpenHandle>> {
+        if id == 0 {
+            return Ok(None);
+        }
+        let _guard = self.filesystem.lock_manager.acquire(id).await;
+        let inode = self.filesystem.inode_store.get(id).await?;
+        if !matches!(inode, Inode::Directory(_)) {
+            return Ok(None);
+        }
+        if inode.nlink() == 0 && self.filesystem.open_handle_count(id) == 0 {
+            return Err(FsError::StaleHandle.into());
+        }
+        Ok(Some(self.filesystem.new_open_handle(id)))
+    }
+
+    fn install_walk_fid(
+        &self,
+        source: u32,
+        newfid: u32,
+        fid: Fid,
+        directory_pin: Option<OpenHandle>,
+    ) -> P9Result<()> {
         let replaced = {
             let mut state = self.session_state();
             if source != newfid && state.fids.contains_key(&newfid) {
                 return Err(P9Error::FidInUse);
             }
-            state.fids.insert(newfid, FidSlot::unopened(fid))
+            state.fids.insert(
+                newfid,
+                FidSlot {
+                    directory_pin,
+                    ..FidSlot::unopened(fid)
+                },
+            )
         };
         drop(replaced);
         Ok(())
@@ -1049,6 +1089,7 @@ impl NinePHandler {
         }
 
         let qid = inode_to_qid(&root_inode, root_id);
+        let directory_pin = self.pin_walked_directory(root_id).await?;
 
         let mut state = self.session_state();
         if state.fids.contains_key(&ta.fid) {
@@ -1056,20 +1097,23 @@ impl NinePHandler {
         }
         state.fids.insert(
             ta.fid,
-            FidSlot::unopened(Fid {
-                // The fid's path stays absolute (rename resolves it from
-                // inode 0), so it starts at the aname components.
-                path: components
-                    .iter()
-                    .map(|c| Bytes::copy_from_slice(c.as_bytes()))
-                    .collect(),
-                inode_id: root_id,
-                root: root_id,
-                qid,
-                opened: false,
-                mode: None,
-                creds,
-            }),
+            FidSlot {
+                directory_pin,
+                ..FidSlot::unopened(Fid {
+                    // The fid's path stays absolute (rename resolves it from
+                    // inode 0), so it starts at the aname components.
+                    path: components
+                        .iter()
+                        .map(|c| Bytes::copy_from_slice(c.as_bytes()))
+                        .collect(),
+                    inode_id: root_id,
+                    root: root_id,
+                    qid,
+                    opened: false,
+                    mode: None,
+                    creds,
+                })
+            },
         );
         Ok(Message::Rattach(Rattach { qid }))
     }
@@ -1202,6 +1246,7 @@ impl NinePHandler {
                     creds,
                 },
                 handle: None,
+                directory_pin: None,
                 replay_reopen,
                 lock_guard: None,
             },
@@ -1332,7 +1377,8 @@ impl NinePHandler {
                 creds: src_fid.creds, // Inherit credentials from source fid
             };
             // In-place replacement drops the old slot's resource guards.
-            self.install_walk_fid(tw.fid, tw.newfid, new_fid)?;
+            let directory_pin = self.pin_walked_directory(current_id).await?;
+            self.install_walk_fid(tw.fid, tw.newfid, new_fid, directory_pin)?;
         }
 
         Ok(Message::Rwalk(Rwalk {
@@ -1369,6 +1415,7 @@ impl NinePHandler {
             Some(inode) => inode,
             None => self.filesystem.inode_store.get(current_id).await?,
         };
+        let directory_pin = self.pin_walked_directory(current_id).await?;
         self.install_walk_fid(
             tw.fid,
             tw.newfid,
@@ -1381,6 +1428,7 @@ impl NinePHandler {
                 mode: None,
                 creds: src_fid.creds,
             },
+            directory_pin,
         )?;
 
         Ok(Message::Rwalkgetattr(Rwalkgetattr {
@@ -1568,7 +1616,13 @@ impl NinePHandler {
             state
                 .fids
                 .values_mut()
-                .map(|slot| (slot.handle.take(), slot.lock_guard.take()))
+                .map(|slot| {
+                    (
+                        slot.handle.take(),
+                        slot.directory_pin.take(),
+                        slot.lock_guard.take(),
+                    )
+                })
                 .collect::<Vec<_>>()
         };
         drop(resources);
@@ -5180,6 +5234,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn walked_directory_fids_keep_removed_cwd_and_parent_addressable() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let creds = test_creds();
+        let auth = AuthContext::from(&creds);
+        let (parent_id, _) = fs
+            .mkdir(&creds, 0, b"cwd-parent", &SetAttributes::default())
+            .await
+            .unwrap();
+        let (child_id, _) = fs
+            .mkdir(&creds, parent_id, b"cwd-child", &SetAttributes::default())
+            .await
+            .unwrap();
+
+        let handler = NinePHandler::new(Arc::clone(&fs), Arc::new(FileLockManager::new()));
+        start_plain_session(&handler).await;
+        expect_walk(&handler, 2, 1, 2, &[b"cwd-parent"]).await;
+        expect_walk(&handler, 3, 2, 3, &[b"cwd-child"]).await;
+        assert_eq!(fs.open_handle_count(parent_id), 1);
+        assert_eq!(fs.open_handle_count(child_id), 1);
+
+        fs.remove(&auth, parent_id, b"cwd-child").await.unwrap();
+        fs.remove(&auth, 0, b"cwd-parent").await.unwrap();
+
+        // A cwd need not have been opened. Its walked fid must nonetheless
+        // survive the last unlink, and its detached parent must remain walkable.
+        let child_stat = request(
+            &handler,
+            4,
+            Message::Tgetattr(Tgetattr {
+                fid: 3,
+                request_mask: GETATTR_ALL,
+            }),
+        )
+        .await;
+        assert!(matches!(child_stat.body, Message::Rgetattr(_)));
+        expect_walk(&handler, 5, 3, 4, &[b".."]).await;
+        assert_eq!(handler.get_fid(4).unwrap().inode_id, parent_id);
+        let parent_stat = request(
+            &handler,
+            6,
+            Message::Tgetattr(Tgetattr {
+                fid: 4,
+                request_mask: GETATTR_ALL,
+            }),
+        )
+        .await;
+        assert!(matches!(parent_stat.body, Message::Rgetattr(_)));
+        expect_walk(&handler, 7, 4, 5, &[b".."]).await;
+        assert_eq!(handler.get_fid(5).unwrap().inode_id, 0);
+
+        handler.close_for_disconnect();
+        assert_eq!(fs.open_handle_count(child_id), 0);
+        assert_eq!(fs.open_handle_count(parent_id), 0);
+        handler.close_all_open_handles();
+        assert_eq!(fs.open_handle_count(child_id), 0);
+        assert_eq!(fs.open_handle_count(parent_id), 0);
+    }
+
+    #[tokio::test]
     async fn disconnect_releases_open_handle_immediately() {
         let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
         let handler = zerofs_handler(&fs).await;
@@ -5206,6 +5319,7 @@ mod tests {
                     creds,
                 },
                 handle: Some(handle),
+                directory_pin: None,
                 replay_reopen: false,
                 lock_guard: None,
             },
