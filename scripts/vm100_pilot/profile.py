@@ -8,7 +8,6 @@ import shutil
 import socket
 import tempfile
 import time
-import tomllib
 import urllib.error
 import urllib.request
 import uuid
@@ -18,6 +17,7 @@ from typing import IO, Protocol
 
 from .benchmark import BenchmarkResult, BenchmarkRunner
 from .config import PilotConfig
+from .gc_cadence import CADENCE_KEYS as _GC_CADENCE_KEYS, rewrite_gc_cadence
 from .lifecycle import PilotLifecycle
 from .owned_resources import atomic_write_json
 from .receipts import RunReceipt
@@ -25,11 +25,6 @@ from .runner import ManagedProcess, Runner
 from .system_io import file_sha256
 
 
-_GC_CADENCE_KEYS = (
-    "interval_secs",
-    "idle_interval_secs",
-    "busy_backlog_interval_secs",
-)
 _SYSTEMD_RUNTIME_DIR = Path("/run/systemd/system")
 _SYSTEMD_SERVICE_NAME = re.compile(r"[A-Za-z0-9_.@:-]+\.service\Z")
 _UNSAFE_SYSTEMD_ENVIRONMENT_PATH = re.compile(r'["\\\r\n%]')
@@ -226,183 +221,6 @@ def _load_phase_windows(result: BenchmarkResult) -> dict[str, tuple[int, int]]:
             raise RuntimeError(f"non-positive benchmark phase window: {name}")
         parsed[name] = (start_ns, end_ns)
     return parsed
-
-
-def _advance_toml_structure(
-    line: str, multiline: str | None, array_depth: int
-) -> tuple[str | None, int]:
-    """Track TOML strings and nested arrays so their contents cannot impersonate table headers."""
-
-    single: str | None = None
-    index = 0
-    while index < len(line):
-        if multiline == "'''":
-            if line.startswith("'''", index):
-                multiline = None
-                index += 3
-            else:
-                index += 1
-        elif multiline == '"""':
-            if line[index] == "\\":
-                index += 2
-            elif line.startswith('"""', index):
-                multiline = None
-                index += 3
-            else:
-                index += 1
-        elif single is not None:
-            if single == '"' and line[index] == "\\":
-                index += 2
-            elif line[index] == single:
-                single = None
-                index += 1
-            else:
-                index += 1
-        elif line[index] == "#":
-            break
-        elif line.startswith('"""', index) or line.startswith("'''", index):
-            multiline = line[index : index + 3]
-            index += 3
-        elif line[index] in ("'", '"'):
-            single = line[index]
-            index += 1
-        elif line[index] == "[":
-            array_depth += 1
-            index += 1
-        elif line[index] == "]":
-            array_depth -= 1
-            index += 1
-        else:
-            index += 1
-    return multiline, array_depth
-
-
-def rewrite_gc_cadence(text: str, interval_secs: int) -> str:
-    """Set the three segment-GC cadence tiers without reformatting the config."""
-
-    if not 300 <= interval_secs <= 86400:
-        raise ValueError("maintenance GC interval must be between 300 and 86400")
-    tomllib.loads(text)
-    # TOML lines end only at LF/CRLF. splitlines() also breaks on Unicode
-    # NEL/line/paragraph separators inside valid quoted TOML strings, allowing
-    # their contents to impersonate a header and create duplicate GC keys.
-    parts = text.split("\n")
-    lines = [part + "\n" for part in parts[:-1]]
-    if parts[-1]:
-        lines.append(parts[-1])
-    in_gc = False
-    gc_header: int | None = None
-    replaced: set[str] = set()
-    multiline_quote: str | None = None
-    array_depth = 0
-    root_scope = True
-    root_gc_anchor: int | None = None
-    root_inline_gc = False
-    # Parse TOML keys semantically, since quoted basic keys may contain escapes.
-    toml_key = r'''(?:[A-Za-z0-9_-]+|"(?:\\.|[^"\\])*"|'[^']*')'''
-    toml_path = rf"{toml_key}(?:\s*\.\s*{toml_key})*"
-    cadence_value = (
-        r"(?:0[xX][0-9A-Fa-f_]+|0[oO][0-7_]+|0[bB][01_]+|[+-]?[0-9][0-9_]*)"
-    )
-    assignment_head = re.compile(rf"^\s*(?P<path>{toml_path})\s*=\s*")
-    cadence_assignment = re.compile(
-        rf"^(?P<prefix>\s*(?P<path>{toml_path})\s*=\s*)"
-        rf"{cadence_value}(?P<suffix>\s*(?:#.*)?(?:\r?\n)?)$"
-    )
-    for index, line in enumerate(lines):
-        stripped = line.strip()
-        # A TOML table header may have a trailing comment (even one with ']'). Treat the header
-        # as a section boundary so annotated non-GC tables cannot inherit GC
-        # key rewrites, and annotated [gc] is never appended a second time.
-        inside_multiline_value = multiline_quote is not None
-        # A nested array element on its own line can resemble a table header.
-        # Only treat headers as section boundaries at the TOML top level.
-        header = (
-            None
-            if inside_multiline_value or array_depth
-            else re.fullmatch(r"(\[\[?.*?\]\]?)\s*(?:#.*)?", stripped)
-        )
-        multiline_quote, array_depth = _advance_toml_structure(
-            line, multiline_quote, array_depth
-        )
-        if inside_multiline_value:
-            continue
-        if header is not None:
-            root_scope = False
-            # Parse the isolated table name, so ["gc"] and ['gc'] refer to
-            # the same table as [gc]. A ']' inside a quoted non-GC name may
-            # truncate the boundary regex, but still closes the GC scope.
-            try:
-                in_gc = tomllib.loads(header.group(1)) == {"gc": {}}
-            except tomllib.TOMLDecodeError:
-                in_gc = False
-            if in_gc:
-                gc_header = index
-            continue
-        if not in_gc and not root_scope:
-            continue
-        head = assignment_head.match(line)
-        path_value = None
-        if head is not None:
-            # The full configuration is validated above. Decode the isolated
-            # assignment path as TOML so escaped basic keys keep their meaning.
-            try:
-                path_value = tomllib.loads(f"{head.group('path')} = 0")
-            except tomllib.TOMLDecodeError:
-                path_value = None
-        if root_scope and path_value is not None:
-            if isinstance(path_value.get("gc"), dict):
-                root_gc_anchor = index
-            elif "gc" in path_value and line[head.end():].lstrip().startswith("{"):
-                root_inline_gc = True
-        match = cadence_assignment.fullmatch(line)
-        if match is None or path_value is None:
-            continue
-        for key in _GC_CADENCE_KEYS:
-            target = {key: 0} if in_gc else {"gc": {key: 0}}
-            if path_value != target:
-                continue
-            lines[index] = f"{match.group('prefix')}{interval_secs}{match.group('suffix')}"
-            replaced.add(key)
-            break
-    missing = [key for key in _GC_CADENCE_KEYS if key not in replaced]
-    if missing:
-        newline = "\r\n" if "\r\n" in text else "\n"
-        if gc_header is not None:
-            additions = [f"{key} = {interval_secs}{newline}" for key in missing]
-            # A final [gc] header is valid TOML without a trailing newline.
-            if not lines[gc_header].endswith("\n"):
-                lines[gc_header] += newline
-            lines[gc_header + 1 : gc_header + 1] = additions
-        elif root_gc_anchor is not None:
-            # Retain root dotted-table syntax, including quoted keys and
-            # unrelated sections, rather than append a duplicate [gc].
-            additions = [f"gc.{key} = {interval_secs}{newline}" for key in missing]
-            if not lines[root_gc_anchor].endswith("\n"):
-                lines[root_gc_anchor] += newline
-            lines[root_gc_anchor + 1 : root_gc_anchor + 1] = additions
-        elif root_inline_gc:
-            # Inline tables cannot be extended with dotted keys; do not
-            # corrupt otherwise valid TOML in an attempted profile rewrite.
-            raise ValueError("cannot safely rewrite an inline GC table")
-        else:
-            if text.endswith(newline * 2):
-                separator = ""
-            elif text.endswith(newline):
-                separator = newline
-            else:
-                separator = newline * 2
-            lines.append(separator)
-            lines.extend(
-                [f"[gc]{newline}"]
-                + [f"{key} = {interval_secs}{newline}" for key in missing]
-            )
-    rewritten = "".join(lines)
-    settings = tomllib.loads(rewritten)
-    gc = settings.get("gc", {})
-    if any(gc.get(key) != interval_secs for key in _GC_CADENCE_KEYS):
-        raise RuntimeError("rewritten [gc] cadence did not validate")
-    return rewritten
 
 
 _sha256 = file_sha256
