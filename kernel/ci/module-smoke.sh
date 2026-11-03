@@ -465,7 +465,6 @@ EOF
     # listener. Never accept a lingering listener as our own readiness signal.
     if (
         exec 9<>/dev/tcp/127.0.0.1/"$smoke_port"
-        exec 9>&-
     ) 2>/dev/null; then
         die "isolated smoke-test port $smoke_port is already occupied"
     fi
@@ -476,7 +475,6 @@ EOF
     for _ in {1..60}; do
         if (
             exec 9<>/dev/tcp/127.0.0.1/"$smoke_port"
-            exec 9>&-
         ) 2>/dev/null; then
             ready=true
             break
@@ -627,6 +625,8 @@ run_package() {
     unload_module=false
     run_resolved "$4" "exact distro kernel"
 }
+
+[[ "${BASH_SOURCE[0]}" == "$0" ]] || return 0
 
 case ${1:-} in
     prepare)
