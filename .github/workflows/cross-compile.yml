@@ -57,6 +57,7 @@ jobs:
     needs: build-webui
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
@@ -69,7 +70,7 @@ jobs:
             platform: linux
           - target: x86_64-apple-darwin
             arch: x86_64
-            os: macos-latest
+            os: macos-15-intel
             platform: darwin
           - target: aarch64-apple-darwin
             arch: aarch64
@@ -103,7 +104,7 @@ jobs:
 
       - name: Configure jemalloc page size for aarch64
         if: startsWith(matrix.target, 'aarch64-') && matrix.platform == 'darwin'
-        run: echo "JEMALLOC_SYS_WITH_LG_PAGE=16" >> $GITHUB_ENV
+        run: echo "JEMALLOC_SYS_WITH_LG_PAGE=16" >> "$GITHUB_ENV"
 
       - name: Build with cross (Linux)
         if: matrix.platform == 'linux'
