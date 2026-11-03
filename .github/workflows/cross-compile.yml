@@ -136,9 +136,13 @@ jobs:
             . $HOME/.cargo/env
             cd zerofs
             cargo build --profile ci --features webui
-            cargo test --locked --profile ci --features webui -p zerofs --lib \
-              writeback::anchored_dir::tests::descriptor_read_only_open_retains_identity_and_exact_writer_lock \
-              -- --exact
+            # FreeBSD's 12 GiB CI guest SIGKILLed rustc while compiling the
+            # lib-test target with 16 codegen units. Keep the same test,
+            # optimization profile and features; bound only compile parallelism.
+            CARGO_BUILD_JOBS=2 CARGO_PROFILE_CI_CODEGEN_UNITS=4 \
+              cargo test --locked --profile ci --features webui -p zerofs --lib \
+                writeback::anchored_dir::tests::descriptor_read_only_open_retains_identity_and_exact_writer_lock \
+                -- --exact
             cp target/ci/zerofs ../zerofs-${{ matrix.platform }}-${{ matrix.arch }}
             rm -rf target/
 
