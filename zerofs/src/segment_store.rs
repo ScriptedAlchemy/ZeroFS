@@ -507,7 +507,12 @@ impl SegmentStore {
             range: Some(GetRange::Bounded(range)),
             ..Default::default()
         };
-        if !cache {
+        if cache {
+            // Logical read-ahead follows this file's extent map. Do not turn
+            // a frame run into speculation over neighboring files' frames.
+            opts.extensions
+                .insert(crate::object_store_prefetch::CacheRangeOnly);
+        } else {
             opts.extensions
                 .insert(crate::object_store_prefetch::SkipPartsCache);
         }

@@ -7,12 +7,18 @@ use anyhow::{Context, Result, anyhow, bail};
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use zerofs_client::{Client, File, OpenOptions};
 
 const UPLOAD_PIPELINE_DEPTH_PER_CONNECTION: usize = 2;
+// The upload negotiation permits 9 MiB messages, but four reads of that size
+// exceed the server's 64 MiB connection budget once source and encoded reply
+// buffers are charged. A blocked fourth request also blocks liveness probes
+// behind it. Keep bulk reads below both byte and request admission limits.
+const DOWNLOAD_CHUNK_SIZE: u32 = 1024 * 1024;
+const DOWNLOAD_PIPELINE_DEPTH: usize = 8;
 
 pub(super) async fn upload_file(
     worker: UploadWorker,
@@ -197,6 +203,27 @@ pub(super) async fn stream_upload(
         bail!("upload requires at least one remote file handle");
     }
     let mut local = open_local_source(planned).await?;
+    stream_upload_from(
+        remotes,
+        &mut local,
+        planned,
+        chunk_size,
+        progress,
+        cancellation,
+    )
+    .await
+}
+
+/// Stream an already opened and validated source, retaining each buffer until
+/// its positioned remote write has settled.
+pub(super) async fn stream_upload_from<R: AsyncRead + Unpin>(
+    remotes: &[Arc<File>],
+    local: &mut R,
+    planned: &PlannedFile,
+    chunk_size: usize,
+    progress: &FileProgress,
+    cancellation: &CancellationToken,
+) -> Result<()> {
     let buffer_size = upload_buffer_size(planned.size, chunk_size);
     let mut buffers = (0..UPLOAD_PIPELINE_DEPTH_PER_CONNECTION * remotes.len())
         .map(|_| vec![0; buffer_size])
@@ -223,7 +250,41 @@ pub(super) async fn stream_upload(
         }
         let mut buffer = buffers.pop().expect("non-empty upload buffer pool");
         let wanted = (planned.size - offset).min(chunk_size as u64) as usize;
-        if let Err(error) = local.read_exact(&mut buffer[..wanted]).await {
+        let read_result = {
+            // FuturesUnordered does not poll newly queued writes until its
+            // next item is requested. Drive them while the disk read waits,
+            // rather than leaving a ready network chunk behind local I/O.
+            // Keep this exact read pinned across write completions: restarting
+            // a partially completed read_exact could skip source bytes.
+            let read = local.read_exact(&mut buffer[..wanted]);
+            tokio::pin!(read);
+            loop {
+                tokio::select! {
+                    biased;
+                    Some((remote_index, returned, result)) = writes.next(), if !writes.is_empty() => {
+                        in_flight[remote_index] -= 1;
+                        buffers.push(returned);
+                        match result {
+                            Ok(written) => progress.advance(written as u64),
+                            Err(error) => {
+                                first_error = Some(error);
+                                break None;
+                            }
+                        }
+                    }
+                    _ = cancellation.cancelled() => {
+                        first_error = Some(anyhow!("upload cancelled"));
+                        break None;
+                    }
+                    result = &mut read => break Some(result),
+                }
+            }
+        };
+        let Some(read_result) = read_result else {
+            buffers.push(buffer);
+            break;
+        };
+        if let Err(error) = read_result {
             if error.kind() == std::io::ErrorKind::UnexpectedEof {
                 first_error = Some(anyhow::anyhow!(
                     "local source changed while uploading: {}",
@@ -335,7 +396,7 @@ async fn open_local_source(planned: &PlannedFile) -> Result<tokio::fs::File> {
     Ok(local)
 }
 
-async fn stream_download(
+pub(super) async fn stream_download(
     remote: &zerofs_client::File,
     local: &mut tokio::fs::File,
     planned: &PlannedFile,
@@ -343,28 +404,40 @@ async fn stream_download(
     progress: &FileProgress,
     cancellation: &CancellationToken,
 ) -> Result<()> {
-    let mut offset = 0u64;
-    while offset < planned.size {
-        if cancellation.is_cancelled() {
-            bail!("download cancelled");
+    if chunk_size == 0 {
+        bail!("download chunk size must be positive");
+    }
+    let chunk_size = chunk_size.min(DOWNLOAD_CHUNK_SIZE);
+    let mut next_offset = 0;
+    let ranges = std::iter::from_fn(|| {
+        if next_offset >= planned.size {
+            return None;
         }
+        let offset = next_offset;
         let wanted = (planned.size - offset).min(u64::from(chunk_size)) as u32;
-        let chunk = tokio::select! {
+        next_offset += u64::from(wanted);
+        Some((offset, wanted))
+    });
+    let reads = futures::stream::iter(ranges)
+        .map(|(offset, wanted)| async move {
+            read_download_range(remote, &planned.source, offset, wanted)
+                .await
+                .map(|chunk| (offset, chunk))
+        })
+        .buffered(DOWNLOAD_PIPELINE_DEPTH);
+    futures::pin_mut!(reads);
+    let mut offset = 0u64;
+    loop {
+        let next = tokio::select! {
             biased;
             _ = cancellation.cancelled() => bail!("download cancelled"),
-            result = remote.read_at(offset, wanted) => {
-                result.with_context(|| format!("read remote source at offset {offset}"))?
-            }
+            result = reads.next() => result,
         };
-        if chunk.len() > wanted as usize {
-            bail!(
-                "remote source returned more than the planned read size: {}",
-                planned.source.display()
-            );
-        }
-        if chunk.is_empty() {
+        let Some(result) = next else {
             break;
-        }
+        };
+        let (chunk_offset, chunk) = result?;
+        debug_assert_eq!(chunk_offset, offset);
         local
             .write_all(&chunk)
             .await
@@ -392,6 +465,45 @@ async fn stream_download(
         );
     }
     Ok(())
+}
+
+/// Fill one disjoint pipeline range before advancing to the next. A short
+/// nonempty 9P response is legal and must not create a hole in the output.
+async fn read_download_range(
+    remote: &zerofs_client::File,
+    source: &Path,
+    offset: u64,
+    wanted: u32,
+) -> Result<bytes::Bytes> {
+    let mut collected = bytes::BytesMut::new();
+    while collected.len() < wanted as usize {
+        let current = offset + collected.len() as u64;
+        let remaining = wanted - collected.len() as u32;
+        let chunk = remote
+            .read_at(current, remaining)
+            .await
+            .with_context(|| format!("read remote source at offset {current}"))?;
+        if chunk.len() > remaining as usize {
+            bail!(
+                "remote source returned more than the planned read size: {}",
+                source.display()
+            );
+        }
+        if chunk.is_empty() {
+            bail!(
+                "remote source changed while downloading: {}",
+                source.display()
+            );
+        }
+        if collected.is_empty() && chunk.len() == wanted as usize {
+            return Ok(chunk);
+        }
+        if collected.is_empty() {
+            collected = bytes::BytesMut::with_capacity(wanted as usize);
+        }
+        collected.extend_from_slice(&chunk);
+    }
+    Ok(collected.freeze())
 }
 
 fn temporary_sibling(destination: &Path) -> Result<PathBuf> {

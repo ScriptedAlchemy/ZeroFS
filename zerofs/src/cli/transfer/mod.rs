@@ -9,7 +9,7 @@ use self::plan::{PlannedFile, TransferPlan, scan_local, scan_remote, validate_re
 use self::progress::{DeleteProgress, Progress};
 use crate::cli::{attach_cleanup_errors, has_attached_cleanup_error};
 use anyhow::{Context, Result, bail};
-use futures::StreamExt;
+use futures::stream::{FuturesUnordered, StreamExt};
 use ninep_proto::{P9_OP_ENVELOPE_LEN, P9_TWRITE_HDR};
 use std::collections::VecDeque;
 use std::future::Future;
@@ -24,6 +24,7 @@ const CLIENT_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 const TRANSFER_WRITE_PAYLOAD: u32 = 9 * 1024 * 1024;
 const TRANSFER_MSIZE: u32 = TRANSFER_WRITE_PAYLOAD + P9_TWRITE_HDR + P9_OP_ENVELOPE_LEN as u32;
 const UPLOAD_CONNECTIONS_PER_WORKER: usize = 2;
+const TRANSFER_CONNECT_CONCURRENCY: usize = 8;
 const FILE_TRANSFER_ATTEMPTS: usize = 3;
 const LINUX_EAGAIN: i32 = 11;
 /// How long cancelled work may settle before the CLI restates what it waits on.
@@ -165,20 +166,47 @@ async fn connect_workers(
     first: Arc<Client>,
     count: usize,
 ) -> Result<Vec<Arc<Client>>> {
-    let mut clients = Vec::with_capacity(count);
-    clients.push(first);
-    while clients.len() < count {
-        let worker = match connect_transfer_client(target).await.with_context(|| {
-            format!(
-                "connect transfer worker {}/{} to 9P target {target}",
-                clients.len() + 1,
-                count
-            )
-        }) {
-            Ok(worker) => worker,
-            Err(error) => return finish_clients(&clients, Err(error)).await,
+    let mut clients = Vec::with_capacity(count.max(1));
+    clients.push((0, first));
+    let mut connecting = FuturesUnordered::new();
+    let mut next_worker = 1;
+    let mut first_error = None;
+    loop {
+        while first_error.is_none()
+            && next_worker < count
+            && connecting.len() < TRANSFER_CONNECT_CONCURRENCY
+        {
+            let index = next_worker;
+            next_worker += 1;
+            connecting.push(async move {
+                let result = connect_transfer_client(target).await.with_context(|| {
+                    format!(
+                        "connect transfer worker {}/{} to 9P target {target}",
+                        index + 1,
+                        count
+                    )
+                });
+                (index, result)
+            });
+        }
+        let Some((index, result)) = connecting.next().await else {
+            break;
         };
-        clients.push(worker);
+        match result {
+            Ok(client) => clients.push((index, client)),
+            Err(error) if first_error.is_none() => first_error = Some(error),
+            Err(_) => {}
+        }
+        // After an error, stop starting workers but settle every connection
+        // already attempted. Successful peers still need explicit cleanup.
+    }
+    clients.sort_unstable_by_key(|(index, _)| *index);
+    let clients = clients
+        .into_iter()
+        .map(|(_, client)| client)
+        .collect::<Vec<_>>();
+    if let Some(error) = first_error {
+        return finish_clients(&clients, Err(error)).await;
     }
     Ok(clients)
 }

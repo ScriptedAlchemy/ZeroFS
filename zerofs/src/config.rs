@@ -327,7 +327,9 @@ impl Default for SftpConfig {
 }
 
 impl SftpConfig {
-    const MAX_ACCOUNT_CONNECTIONS: usize = 8;
+    /// Hetzner Storage Box documents a hard limit of 10 simultaneous connections
+    /// per account; exceeding it triggers a lockout cooldown.
+    const MAX_ACCOUNT_CONNECTIONS: usize = 10;
     // Operations multiplex onto pooled connections, so per-direction
     // concurrency may exceed max_connections; the transport still caps how
     // many operations share one connection.
@@ -412,8 +414,9 @@ fn default_sftp_identity_file() -> PathBuf {
     PathBuf::from(shellexpand::tilde("~/.ssh/id_ed25519").into_owned())
 }
 
+/// Default leaves two of the account's ten slots free for admin and backup tools.
 const fn default_sftp_max_connections() -> usize {
-    SftpConfig::MAX_ACCOUNT_CONNECTIONS
+    8
 }
 
 const fn default_sftp_direction_concurrency() -> usize {
@@ -3346,7 +3349,7 @@ known_hosts = "${ZEROFS_TEST_KNOWN_HOSTS}""#,
     fn sftp_connection_and_direction_limits_are_strict() {
         let invalid = [
             ("max_connections = 0", "max_connections"),
-            ("max_connections = 9", "max_connections"),
+            ("max_connections = 11", "max_connections"),
             ("read_concurrency = 0", "read_concurrency"),
             ("read_concurrency = 65", "read_concurrency"),
             ("write_concurrency = 0", "write_concurrency"),

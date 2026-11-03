@@ -383,6 +383,21 @@ zerofs mount 127.0.0.1:5564 /mnt/zerofs        # TCP
 zerofs mount /tmp/zerofs.9p.sock /mnt/zerofs   # Unix socket
 ```
 
+For sequential copies over a high-latency link, the native kernel client and
+the CLI downloader keep multiple large reads in flight. The SDK's `File::cursor()`
+and browser downloads also pipeline bounded reads, independently of small
+application copy buffers.
+
+FUSE defaults to relaxed consistency, with kernel caching, sequential read-ahead,
+and a one-second metadata cache lifetime. `zerofs mount --relaxed-consistency false`
+selects strict consistency and direct I/O; read concurrency in that mode is
+controlled by the application. On Linux, relaxed mounts also try to increase **their own**
+`/sys/class/bdi/<major>:<minor>/read_ahead_kb` setting to a window of up to
+32 MiB after initialization. An unprivileged mount may be unable to change this;
+in that case it continues mounting and logs the current limit, the exact setting,
+and the requested value for an administrator to apply. FUSE INIT negotiation
+alone cannot raise the kernel's initially advertised read-ahead limit.
+
 ### Stock Linux v9fs
 
 ```bash
