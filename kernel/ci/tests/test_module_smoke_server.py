@@ -28,6 +28,12 @@ class ModuleSmokeServerTests(unittest.TestCase):
         # Reserve an ephemeral port without listening; no port-reuse race or
         # collision with another test's fixed smoke listener.
         self.assertEqual(source.count("readonly smoke_port=15565"), 1)
+        # Source the real startup functions without executing the CLI dispatcher.
+        # The script's final case block exits on an unrecognized $1, so sourcing
+        # the complete executable would never reach start_server in these tests.
+        dispatch = "\ncase ${1:-} in\n"
+        self.assertEqual(source.count(dispatch), 1)
+        source = source.split(dispatch, 1)[0] + "\n"
         self.script.write_text(
             source.replace("readonly smoke_port=15565", f"readonly smoke_port={port}"),
             encoding="utf-8",
