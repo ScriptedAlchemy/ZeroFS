@@ -2,7 +2,6 @@ use async_trait::async_trait;
 use backon::Retryable;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use dashmap::DashSet;
 use futures::stream::{self, BoxStream};
 use futures::{StreamExt, TryStreamExt};
 use object_store::path::{Path as ObjectPath, PathPart};
@@ -12,7 +11,7 @@ use object_store::{
     PutResult, UploadPart,
 };
 use std::collections::BTreeSet;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Debug};
 use std::future::Future;
 use std::path::{Path as FilePath, PathBuf};
@@ -707,6 +706,71 @@ fn read_operation_kind(options: &GetOptions) -> crate::sftp_transport::Operation
 // pool's own read/metadata admission limit still gates real concurrency.
 const SFTP_LIST_METADATA_CONCURRENCY: usize = 8;
 
+#[derive(Debug, Default)]
+struct MissingCacheState {
+    epoch: u64,
+    entries: HashSet<String>,
+}
+
+/// The epoch and entries share one lock: checking an epoch before and after
+/// inserting into a separate set still lets readers observe a stale miss in
+/// between. No remote operation holds this lock.
+#[derive(Debug, Default)]
+struct MissingCache {
+    state: StdMutex<MissingCacheState>,
+}
+
+impl MissingCache {
+    fn probe(&self, location: &ObjectPath) -> (bool, u64) {
+        let state = self.state.lock().unwrap();
+        (state.entries.contains(location.as_ref()), state.epoch)
+    }
+
+    fn remember(&self, location: &ObjectPath, observed_epoch: u64) {
+        let mut state = self.state.lock().unwrap();
+        if state.epoch != observed_epoch {
+            return;
+        }
+        if state.entries.len() >= SFTP_NEGATIVE_CACHE_MAX_ENTRIES {
+            state.entries.clear();
+        }
+        state.entries.insert(location.to_string());
+    }
+
+    fn forget(&self, location: &ObjectPath) {
+        self.state.lock().unwrap().entries.remove(location.as_ref());
+    }
+
+    fn invalidate(&self, location: &ObjectPath) {
+        let mut state = self.state.lock().unwrap();
+        state.epoch = state.epoch.wrapping_add(1);
+        state.entries.remove(location.as_ref());
+    }
+}
+
+// Every publication advances the epoch before and after the remote operation;
+// Drop owns the second transition even when the caller cancels.
+struct MissingCacheMutationGuard {
+    known_missing: Arc<MissingCache>,
+    location: ObjectPath,
+}
+
+impl MissingCacheMutationGuard {
+    fn new(known_missing: Arc<MissingCache>, location: &ObjectPath) -> Self {
+        known_missing.invalidate(location);
+        Self {
+            known_missing,
+            location: location.clone(),
+        }
+    }
+}
+
+impl Drop for MissingCacheMutationGuard {
+    fn drop(&mut self) {
+        self.known_missing.invalidate(&self.location);
+    }
+}
+
 #[derive(Clone)]
 pub struct SftpObjectStore {
     pool: crate::sftp_transport::SftpSessionPool,
@@ -716,7 +780,7 @@ pub struct SftpObjectStore {
     // misses for this process lifetime so metadata/GC polling does not spend
     // four WAN round trips rediscovering the same absent object. Every local
     // publication invalidates its target before and after the remote write.
-    known_missing: Arc<DashSet<String>>,
+    known_missing: Arc<MissingCache>,
 }
 
 #[derive(Debug, Clone)]
@@ -915,23 +979,20 @@ impl SftpObjectStore {
         Ok(Self {
             pool,
             prefix,
-            known_missing: Arc::new(DashSet::new()),
+            known_missing: Arc::new(MissingCache::default()),
         })
     }
 
     fn forget_missing(&self, location: &ObjectPath) {
-        self.known_missing.remove(location.as_ref());
+        self.known_missing.forget(location);
     }
 
-    fn remember_missing(&self, location: &ObjectPath) {
-        // Absent future manifests are normally removed as soon as this writer
-        // publishes them. Deleted historical objects can remain absent for the
-        // process lifetime, so bound that residue rather than letting a busy
-        // long-running filesystem grow the cache indefinitely.
-        if self.known_missing.len() >= SFTP_NEGATIVE_CACHE_MAX_ENTRIES {
-            self.known_missing.clear();
-        }
-        self.known_missing.insert(location.to_string());
+    fn remember_missing(&self, location: &ObjectPath, observed_epoch: u64) {
+        self.known_missing.remember(location, observed_epoch);
+    }
+
+    fn mutation_guard(&self, location: &ObjectPath) -> MissingCacheMutationGuard {
+        MissingCacheMutationGuard::new(self.known_missing.clone(), location)
     }
 
     fn validate_location(
@@ -972,13 +1033,22 @@ impl SftpObjectStore {
         location: &ObjectPath,
         options: &GetOptions,
     ) -> object_store::Result<crate::sftp_transport::RemoteObjectRead> {
+        use crate::sftp_transport::TransportError;
+
         if options.version.is_some() {
             return Err(object_store::Error::NotSupported {
                 source: "SFTP object versions are not exposed separately from ETags".into(),
             });
         }
         let remote = self.remote_path(location, false)?;
-        if self.known_missing.contains(location.as_ref()) {
+        let operation = if options.head { "head" } else { "get" };
+        let (known_missing, observed_epoch) = self.known_missing.probe(location);
+        if known_missing {
+            metrics::counter!(
+                "zerofs_sftp_negative_cache_hits_total",
+                "operation" => operation,
+            )
+            .increment(1);
             return Err(object_store::Error::NotFound {
                 path: location.to_string(),
                 source: "SFTP object is known absent for this single-owner process".into(),
@@ -990,8 +1060,26 @@ impl SftpObjectStore {
             "SFTP object read",
             |lease| lease.read_object(&remote, options.range.clone(), options.head)
         )
-        .await
-        .map_err(transport_error);
+        .await;
+        // Classify typed backend results before adapting them to object_store
+        // errors. Known misses above never lease a session; they must not be
+        // mistaken for failed remote reads. These completed operations can
+        // include admission, open, close, or pool errors, not just wire READs.
+        let outcome = match &result {
+            Ok(_) => "success",
+            Err(TransportError::NotFound(_)) => "not_found",
+            Err(TransportError::InvalidRange(_)) => "invalid_range",
+            Err(TransportError::PermissionDenied(_)) => "permission_denied",
+            Err(TransportError::CorruptObject(_)) => "corrupt_object",
+            Err(TransportError::PoolClosed) => "pool_closed",
+            Err(_) => "transport_error",
+        };
+        metrics::counter!(
+            "zerofs_sftp_backend_read_results_total",
+            "operation" => operation, "outcome" => outcome,
+        )
+        .increment(1);
+        let result = result.map_err(transport_error);
         match &result {
             Ok(object) => {
                 self.forget_missing(location);
@@ -999,7 +1087,7 @@ impl SftpObjectStore {
                     .increment(object.payload.len() as u64);
             }
             Err(object_store::Error::NotFound { .. }) => {
-                self.remember_missing(location);
+                self.remember_missing(location, observed_epoch);
             }
             Err(_) => {}
         }
@@ -1115,6 +1203,7 @@ impl SftpObjectStore {
 
     async fn remove_remote(&self, location: &ObjectPath) -> object_store::Result<()> {
         let remote = self.remote_path(location, false)?;
+        let (_, observed_epoch) = self.known_missing.probe(location);
         let result = with_lease!(
             self.pool,
             crate::sftp_transport::OperationKind::Write,
@@ -1124,7 +1213,7 @@ impl SftpObjectStore {
         .await
         .map_err(transport_error);
         if result.is_ok() || matches!(&result, Err(object_store::Error::NotFound { .. })) {
-            self.remember_missing(location);
+            self.remember_missing(location, observed_epoch);
         }
         result
     }
@@ -1154,7 +1243,7 @@ impl ObjectStore for SftpObjectStore {
         opts: PutOptions,
     ) -> object_store::Result<PutResult> {
         let target = self.remote_path(location, false)?;
-        self.forget_missing(location);
+        let _missing_guard = self.mutation_guard(location);
         let (mode, expected_generation) = match opts.mode {
             PutMode::Overwrite => (PublicationMode::Overwrite, None),
             PutMode::Create => (PublicationMode::Create, None),
@@ -1241,31 +1330,62 @@ impl ObjectStore for SftpObjectStore {
         location: &ObjectPath,
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
-        let has_preconditions = options.if_match.is_some()
-            || options.if_none_match.is_some()
-            || options.if_modified_since.is_some()
-            || options.if_unmodified_since.is_some();
-        if has_preconditions && !options.head {
-            let metadata_options = GetOptions {
-                version: options.version.clone(),
-                head: true,
-                ..Default::default()
-            };
-            let object = self.read_remote(location, &metadata_options).await?;
+        let api = if options.head {
+            "head"
+        } else if options.range.is_some() {
+            "get_range"
+        } else {
+            "get"
+        };
+        let started = tokio::time::Instant::now();
+        let result: object_store::Result<GetResult> = async {
+            let has_preconditions = options.if_match.is_some()
+                || options.if_none_match.is_some()
+                || options.if_modified_since.is_some()
+                || options.if_unmodified_since.is_some();
+            if has_preconditions && !options.head {
+                let metadata_options = GetOptions {
+                    version: options.version.clone(),
+                    head: true,
+                    ..Default::default()
+                };
+                let object = self.read_remote(location, &metadata_options).await?;
+                let meta = object_meta(location.clone(), &object);
+                options.check_preconditions(&meta)?;
+            }
+            let object = self.read_remote(location, &options).await?;
             let meta = object_meta(location.clone(), &object);
             options.check_preconditions(&meta)?;
+            let payload = object.payload;
+            Ok(GetResult {
+                payload: GetResultPayload::Stream(stream::once(async move { Ok(payload) }).boxed()),
+                meta,
+                range: object.range,
+                attributes: Attributes::default(),
+                extensions: Extensions::default(),
+            })
         }
-        let object = self.read_remote(location, &options).await?;
-        let meta = object_meta(location.clone(), &object);
-        options.check_preconditions(&meta)?;
-        let payload = object.payload;
-        Ok(GetResult {
-            payload: GetResultPayload::Stream(stream::once(async move { Ok(payload) }).boxed()),
-            meta,
-            range: object.range,
-            attributes: Attributes::default(),
-            extensions: Extensions::default(),
-        })
+        .await;
+        // Count the outward API result, including local negative-cache hits,
+        // option rejection and conditional responses after a successful HEAD.
+        // Backend read counters alone cannot account for those engine errors.
+        // This is elapsed wall time, not the sum of overlapping phase times.
+        let outcome = match &result {
+            Ok(_) => "success",
+            Err(object_store::Error::NotFound { .. }) => "not_found",
+            Err(object_store::Error::NotModified { .. }) => "not_modified",
+            Err(object_store::Error::Precondition { .. }) => "precondition_failed",
+            Err(object_store::Error::PermissionDenied { .. }) => "permission_denied",
+            Err(object_store::Error::Unauthenticated { .. }) => "unauthenticated",
+            Err(object_store::Error::InvalidPath { .. }) => "invalid_path",
+            Err(object_store::Error::NotSupported { .. }) => "not_supported",
+            Err(_) => "other_error",
+        };
+        metrics::counter!("zerofs_sftp_get_results_total", "api" => api, "outcome" => outcome)
+            .increment(1);
+        metrics::histogram!("zerofs_sftp_get_duration_seconds", "api" => api, "outcome" => outcome)
+            .record(started.elapsed().as_secs_f64());
+        result
     }
 
     fn delete_stream(
@@ -1348,7 +1468,7 @@ struct SftpMultipartUpload {
     staging: Option<PathBuf>,
     generation: Uuid,
     state: Arc<StdMutex<SftpMultipartState>>,
-    known_missing: Arc<DashSet<String>>,
+    known_missing: Arc<MissingCache>,
     mode: PublicationMode,
     terminal: bool,
 }
@@ -1364,7 +1484,7 @@ impl SftpMultipartUpload {
         session: Arc<dyn RemoteSession>,
         location: ObjectPath,
         target: PathBuf,
-        known_missing: Arc<DashSet<String>>,
+        known_missing: Arc<MissingCache>,
         mode: PublicationMode,
     ) -> RemoteResult<Self> {
         validate_publication_capabilities(session.capabilities(), mode).map_err(|extension| {
@@ -1456,6 +1576,8 @@ impl MultipartUpload for SftpMultipartUpload {
     }
 
     async fn complete(&mut self) -> object_store::Result<PutResult> {
+        let _missing_guard =
+            MissingCacheMutationGuard::new(self.known_missing.clone(), &self.location);
         if self.terminal {
             return Err(generic_error(
                 "multipart upload is already completed or aborted",
@@ -1523,7 +1645,7 @@ impl MultipartUpload for SftpMultipartUpload {
             self.session.schedule_cleanup(staging);
         }
         self.staging = None;
-        self.known_missing.remove(self.location.as_ref());
+        self.known_missing.forget(&self.location);
         Ok(PutResult {
             e_tag: Some(self.generation.to_string()),
             version: None,
@@ -3234,6 +3356,228 @@ mod tests {
             rendered.contains("zerofs_sftp_object_read_bytes_total 15"),
             "metrics:\n{rendered}"
         );
+        assert_eq!(
+            crate::sftp_metrics::tests::metric_value(
+                &rendered,
+                "zerofs_sftp_backend_read_results_total",
+                &[("operation", "get"), ("outcome", "success")],
+            ),
+            1.0
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_result_metrics_separate_cached_misses_and_backend_failures() {
+        use crate::sftp_metrics::tests::metric_value;
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        let remote = Arc::new(SharedRemoteFs::default());
+        remote.files.lock().unwrap().insert(
+            PathBuf::from("root/corrupt.bin"),
+            Bytes::from_static(b"invalid object"),
+        );
+        let pool = crate::sftp_transport::SftpSessionPool::new_writable(
+            Arc::new(SharedRemoteFactory(remote)),
+            1,
+            1,
+            1,
+        )
+        .await
+        .unwrap();
+        let store = SftpObjectStore::new(pool.clone(), ObjectPath::from("root")).unwrap();
+        let missing = ObjectPath::from("root/missing.bin");
+        for _ in 0..2 {
+            assert!(matches!(
+                store.get(&missing).await.unwrap_err(),
+                object_store::Error::NotFound { .. }
+            ));
+        }
+        assert!(matches!(
+            store.head(&missing).await.unwrap_err(),
+            object_store::Error::NotFound { .. }
+        ));
+        assert!(matches!(
+            store
+                .get(&ObjectPath::from("root/corrupt.bin"))
+                .await
+                .unwrap_err(),
+            object_store::Error::Generic { .. }
+        ));
+        pool.shutdown().await.unwrap();
+        assert!(
+            store
+                .get(&ObjectPath::from("root/after-shutdown.bin"))
+                .await
+                .is_err()
+        );
+
+        let body = handle.render();
+        for operation in ["get", "head"] {
+            assert_eq!(
+                metric_value(
+                    &body,
+                    "zerofs_sftp_negative_cache_hits_total",
+                    &[("operation", operation)],
+                ),
+                1.0
+            );
+        }
+        for outcome in ["not_found", "corrupt_object", "pool_closed"] {
+            assert_eq!(
+                metric_value(
+                    &body,
+                    "zerofs_sftp_backend_read_results_total",
+                    &[("operation", "get"), ("outcome", outcome)],
+                ),
+                1.0
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_result_metrics_include_conditional_results_and_cached_misses() {
+        use crate::sftp_metrics::tests::metric_value;
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        let remote = Arc::new(SharedRemoteFs::default());
+        let header = ObjectHeader {
+            generation: Uuid::new_v4(),
+            logical_len: 6,
+        };
+        let mut encoded = encode_header(header).to_vec();
+        encoded.extend_from_slice(b"abcdef");
+        remote
+            .files
+            .lock()
+            .unwrap()
+            .insert(PathBuf::from("root/present.bin"), Bytes::from(encoded));
+        let pool = crate::sftp_transport::SftpSessionPool::new_writable(
+            Arc::new(SharedRemoteFactory(remote)),
+            1,
+            1,
+            1,
+        )
+        .await
+        .unwrap();
+        let store = SftpObjectStore::new(pool.clone(), ObjectPath::from("root")).unwrap();
+        let present = ObjectPath::from("root/present.bin");
+        let etag = store.get(&present).await.unwrap().meta.e_tag.unwrap();
+        assert_eq!(store.head(&present).await.unwrap().size, 6);
+        assert_eq!(
+            store.get_range(&present, 1..4).await.unwrap(),
+            Bytes::from_static(b"bcd")
+        );
+        assert!(matches!(
+            store
+                .get_opts(
+                    &present,
+                    GetOptions {
+                        if_none_match: Some(etag),
+                        ..Default::default()
+                    }
+                )
+                .await
+                .unwrap_err(),
+            object_store::Error::NotModified { .. }
+        ));
+        assert!(matches!(
+            store
+                .get_opts(
+                    &present,
+                    GetOptions {
+                        if_match: Some("wrong-generation".to_owned()),
+                        ..Default::default()
+                    }
+                )
+                .await
+                .unwrap_err(),
+            object_store::Error::Precondition { .. }
+        ));
+        let missing = ObjectPath::from("root/missing.bin");
+        for _ in 0..2 {
+            assert!(matches!(
+                store.get(&missing).await.unwrap_err(),
+                object_store::Error::NotFound { .. }
+            ));
+        }
+        assert!(matches!(
+            store
+                .get_opts(
+                    &present,
+                    GetOptions {
+                        version: Some("unsupported-version".to_owned()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap_err(),
+            object_store::Error::NotSupported { .. }
+        ));
+        pool.shutdown().await.unwrap();
+        let body = handle.render();
+        for (outcome, expected) in [
+            ("success", 1.0),
+            ("not_modified", 1.0),
+            ("precondition_failed", 1.0),
+            ("not_found", 2.0),
+            ("not_supported", 1.0),
+        ] {
+            assert_eq!(
+                metric_value(
+                    &body,
+                    "zerofs_sftp_get_results_total",
+                    &[("api", "get"), ("outcome", outcome)]
+                ),
+                expected
+            );
+            assert_eq!(
+                metric_value(
+                    &body,
+                    "zerofs_sftp_get_duration_seconds_count",
+                    &[("api", "get"), ("outcome", outcome)]
+                ),
+                expected
+            );
+        }
+        for api in ["head", "get_range"] {
+            for metric in [
+                "zerofs_sftp_get_results_total",
+                "zerofs_sftp_get_duration_seconds_count",
+            ] {
+                assert_eq!(
+                    metric_value(&body, metric, &[("api", api), ("outcome", "success")]),
+                    1.0
+                );
+            }
+        }
+        assert_eq!(
+            metric_value(
+                &body,
+                "zerofs_sftp_backend_read_results_total",
+                &[("operation", "head"), ("outcome", "success")]
+            ),
+            3.0
+        );
+        assert_eq!(
+            metric_value(
+                &body,
+                "zerofs_sftp_backend_read_results_total",
+                &[("operation", "get"), ("outcome", "not_found")]
+            ),
+            1.0
+        );
+        assert_eq!(
+            metric_value(
+                &body,
+                "zerofs_sftp_negative_cache_hits_total",
+                &[("operation", "get")]
+            ),
+            1.0
+        );
     }
 
     /// The kill-during-staged-manifest recovery shape from the vm100 pilot: a
@@ -3883,6 +4227,13 @@ mod tests {
         durable_writes: AtomicUsize,
         lose_hardlink_reply: AtomicBool,
         corrupt_hardlink_target: AtomicBool,
+        rename_pause: Option<Arc<PublishPause>>,
+    }
+
+    #[derive(Debug, Default)]
+    struct PublishPause {
+        entered: Notify,
+        release: Notify,
     }
 
     impl ParallelMultipartSession {
@@ -3896,6 +4247,14 @@ mod tests {
                 durable_writes: AtomicUsize::new(0),
                 lose_hardlink_reply: AtomicBool::new(false),
                 corrupt_hardlink_target: AtomicBool::new(false),
+                rename_pause: None,
+            }
+        }
+
+        fn with_delayed_rename(pause: Arc<PublishPause>) -> Self {
+            Self {
+                rename_pause: Some(pause),
+                ..Self::new()
             }
         }
 
@@ -4098,17 +4457,119 @@ mod tests {
         }
 
         async fn posix_rename(&self, from: &FilePath, to: &FilePath) -> RemoteResult<()> {
-            let mut files = self.files.lock().unwrap();
-            let bytes = files
-                .remove(from)
-                .ok_or_else(|| RemoteError::NotFound(from.display().to_string()))?;
-            files.insert(to.to_path_buf(), bytes);
+            {
+                let mut files = self.files.lock().unwrap();
+                let bytes = files
+                    .remove(from)
+                    .ok_or_else(|| RemoteError::NotFound(from.display().to_string()))?;
+                files.insert(to.to_path_buf(), bytes);
+            }
+            if let Some(pause) = &self.rename_pause {
+                pause.entered.notify_one();
+                pause.release.notified().await;
+            }
             Ok(())
         }
 
         fn schedule_cleanup(&self, path: PathBuf) {
             self.files.lock().unwrap().remove(&path);
         }
+    }
+
+    #[test]
+    fn cancelled_publication_fences_old_and_late_negative_cache_misses() {
+        let location = ObjectPath::from("zerofs/v1/replaced.bin");
+        let known_missing = Arc::new(MissingCache::default());
+        let (_, old_read) = known_missing.probe(&location);
+        known_missing.remember(&location, old_read);
+        let read_during_write;
+        {
+            let _write = MissingCacheMutationGuard::new(known_missing.clone(), &location);
+            assert!(!known_missing.probe(&location).0);
+            read_during_write = known_missing.probe(&location).1;
+            known_missing.remember(&location, read_during_write);
+            assert!(known_missing.probe(&location).0);
+        }
+        assert!(!known_missing.probe(&location).0);
+        // A read that started before or during publication may return after
+        // a successful remote rename and cancellation of its caller.
+        known_missing.remember(&location, old_read);
+        known_missing.remember(&location, read_during_write);
+        assert!(!known_missing.probe(&location).0);
+        let (_, fresh_read) = known_missing.probe(&location);
+        known_missing.remember(&location, fresh_read);
+        assert!(known_missing.probe(&location).0);
+    }
+
+    #[test]
+    fn publication_preserves_unrelated_negative_cache_entries() {
+        let location = ObjectPath::from("zerofs/v1/published.bin");
+        let unrelated = ObjectPath::from("zerofs/v1/still-missing.bin");
+        let known_missing = Arc::new(MissingCache::default());
+        let (_, old_read) = known_missing.probe(&location);
+        known_missing.remember(&location, old_read);
+        known_missing.remember(&unrelated, old_read);
+
+        let publication = MissingCacheMutationGuard::new(known_missing.clone(), &location);
+        assert!(!known_missing.probe(&location).0);
+        assert!(known_missing.probe(&unrelated).0);
+        drop(publication);
+        known_missing.remember(&location, old_read);
+        assert!(!known_missing.probe(&location).0);
+        assert!(known_missing.probe(&unrelated).0);
+    }
+
+    #[test]
+    fn overlapping_publications_fence_all_earlier_negative_reads() {
+        let location = ObjectPath::from("zerofs/v1/overlapping.bin");
+        let known_missing = Arc::new(MissingCache::default());
+        let mut reads = vec![known_missing.probe(&location).1];
+        let first = MissingCacheMutationGuard::new(known_missing.clone(), &location);
+        reads.push(known_missing.probe(&location).1);
+        let second = MissingCacheMutationGuard::new(known_missing.clone(), &location);
+        reads.push(known_missing.probe(&location).1);
+        drop(first);
+        reads.push(known_missing.probe(&location).1);
+        known_missing.remember(&location, *reads.last().unwrap());
+        assert!(known_missing.probe(&location).0);
+        drop(second);
+
+        for observed_epoch in reads {
+            known_missing.remember(&location, observed_epoch);
+            assert!(!known_missing.probe(&location).0);
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_multipart_completion_clears_miss_after_remote_rename() {
+        let pause = Arc::new(PublishPause::default());
+        let session = Arc::new(ParallelMultipartSession::with_delayed_rename(pause.clone()));
+        let location = ObjectPath::from("zerofs/v1/cancelled-complete.bin");
+        let target = PathBuf::from("zerofs/v1/cancelled-complete.bin");
+        let known_missing = Arc::new(MissingCache::default());
+        let mut upload = SftpMultipartUpload::begin(
+            session.clone(),
+            location.clone(),
+            target.clone(),
+            known_missing.clone(),
+            PublicationMode::Overwrite,
+        )
+        .await
+        .unwrap();
+        let (_, stale_read) = known_missing.probe(&location);
+        let task = tokio::spawn(async move { upload.complete().await });
+        tokio::time::timeout(Duration::from_secs(1), pause.entered.notified())
+            .await
+            .expect("rename must publish before the response is released");
+        let (_, pending_read) = known_missing.probe(&location);
+        known_missing.remember(&location, pending_read);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(!known_missing.probe(&location).0);
+        known_missing.remember(&location, stale_read);
+        assert!(!known_missing.probe(&location).0);
+        let published = session.files.lock().unwrap().get(&target).cloned().unwrap();
+        assert_eq!(decode_header(&published).unwrap().logical_len, 0);
     }
 
     #[tokio::test]
@@ -4120,7 +4581,7 @@ mod tests {
             session.clone(),
             location,
             target.to_path_buf(),
-            Arc::new(DashSet::new()),
+            Arc::new(MissingCache::default()),
             PublicationMode::Overwrite,
         )
         .await
@@ -4166,7 +4627,7 @@ mod tests {
                     session,
                     ObjectPath::from("zerofs/v1/cancelled-begin.bin"),
                     PathBuf::from("zerofs/v1/cancelled-begin.bin"),
-                    Arc::new(DashSet::new()),
+                    Arc::new(MissingCache::default()),
                     PublicationMode::Overwrite,
                 )
                 .await
@@ -4210,7 +4671,7 @@ mod tests {
             session.clone(),
             location,
             target.clone(),
-            Arc::new(DashSet::new()),
+            Arc::new(MissingCache::default()),
             PublicationMode::Create,
         )
         .await
@@ -4237,7 +4698,7 @@ mod tests {
             session.clone(),
             location,
             target.clone(),
-            Arc::new(DashSet::new()),
+            Arc::new(MissingCache::default()),
             PublicationMode::Create,
         )
         .await
@@ -4269,7 +4730,7 @@ mod tests {
             session,
             location,
             target,
-            Arc::new(DashSet::new()),
+            Arc::new(MissingCache::default()),
             PublicationMode::Create,
         )
         .await
@@ -4293,7 +4754,7 @@ mod tests {
             session.clone(),
             location,
             target,
-            Arc::new(DashSet::new()),
+            Arc::new(MissingCache::default()),
             PublicationMode::Overwrite,
         )
         .await
@@ -4354,7 +4815,7 @@ mod tests {
             session.clone(),
             location,
             target,
-            Arc::new(DashSet::new()),
+            Arc::new(MissingCache::default()),
             PublicationMode::Overwrite,
         )
         .await

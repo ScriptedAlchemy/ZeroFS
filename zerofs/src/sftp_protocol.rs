@@ -1,6 +1,8 @@
+use crate::sftp_metrics::{ReadRequestObservation, SftpPhase, observe_phase};
 use crate::sftp_object_store::{OBJECT_HEADER_LEN, SftpCapabilities, decode_header};
 use crate::sftp_transport::{
-    RemoteDirectoryEntry, RemoteEntryKind, RemoteObjectRead, TransportError, TransportSession,
+    OperationKind, RemoteDirectoryEntry, RemoteEntryKind, RemoteObjectRead, TransportError,
+    TransportSession,
 };
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
@@ -10,11 +12,12 @@ use russh_sftp::extensions::HardlinkExtension;
 use russh_sftp::protocol::{FileAttributes, OpenFlags, StatusCode};
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::sync::CancellationToken;
 
 #[cfg(test)]
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 
 #[cfg(test)]
 #[derive(Debug, Clone, Copy)]
@@ -95,8 +98,14 @@ pub const RUSSH_SFTP_MAX_CONCURRENT_WRITES: usize = 128;
 pub(crate) const SFTP_WRITE_PACKET_SIZE: usize = 255 * 1024;
 pub(crate) const SFTP_READ_PACKET_SIZE: usize = 255 * 1024;
 const SFTP_WRITE_REQUEST_CONCURRENCY: usize = RUSSH_SFTP_MAX_CONCURRENT_WRITES;
-// Read prefetch retains its separately proven 64-request memory bound.
-const SFTP_READ_REQUEST_CONCURRENCY: usize = 64;
+// Per operation, not per physical session: several leased reads can share
+// one RawSftpSession. 128 small replies can fill a 4 MiB sequential window
+// in one wave. The byte cap retains the previous 64 x 255 KiB reply envelope
+// when a server supports larger packets.
+const SFTP_READ_REQUEST_CONCURRENCY: usize = 128;
+const SFTP_READ_MAX_INFLIGHT_BYTES: usize = 64 * SFTP_READ_PACKET_SIZE;
+const SFTP_READ_PACKET_PROBE_INTERVAL: usize = 16;
+const SFTP_MIN_READ_PACKET_HINT: usize = 32 * 1024;
 pub(crate) const POSIX_RENAME: &str = "posix-rename@openssh.com";
 pub(crate) const FSYNC: &str = "fsync@openssh.com";
 pub(crate) const HARDLINK: &str = "hardlink@openssh.com";
@@ -107,9 +116,131 @@ struct PipelinedWrite {
 }
 
 struct PipelinedRead {
-    index: usize,
     offset: u64,
     len: usize,
+}
+
+/// A performance hint scoped to one physical SFTP connection. Short replies
+/// remain legal at any size; the hint only avoids relearning a stable cap on
+/// every window. Periodic full-size probes recover if that cap disappears.
+#[derive(Default)]
+struct ReadPacketSizing {
+    reply_limit: AtomicUsize,
+    bulk_reads: AtomicUsize,
+}
+
+struct ReadPacketPlan {
+    packet_size: usize,
+    previous_hint: usize,
+    probe: bool,
+}
+
+#[derive(Default)]
+struct ReadReplyShape {
+    short_size: Option<usize>,
+    matching_shorts: usize,
+    inconsistent: bool,
+    largest_reply: usize,
+}
+
+impl ReadReplyShape {
+    fn observe(&mut self, requested: usize, received: usize) {
+        self.largest_reply = self.largest_reply.max(received);
+        // Tiny/isolated short reads can occur without a stable server cap.
+        // They still refill this operation, but do not tune future windows.
+        if received >= requested || received < SFTP_MIN_READ_PACKET_HINT {
+            return;
+        }
+        match self.short_size {
+            None => self.short_size = Some(received),
+            Some(size) if size != received => self.inconsistent = true,
+            Some(_) => {}
+        }
+        self.matching_shorts += 1;
+    }
+}
+
+struct ReadReplySample {
+    end: u64,
+    requested: usize,
+    received: usize,
+}
+
+/// Keep the last DATA reply by offset separate from the aggregate. A short
+/// terminal reply can be an object tail, but earlier consistent short replies
+/// still establish a useful server cap when a speculative read crosses EOF.
+/// Holding one sample also handles replies arriving out of order without
+/// retaining a list of requests or any additional payload bytes.
+#[derive(Default)]
+struct ReadReplySamples {
+    shape: ReadReplyShape,
+    last: Option<ReadReplySample>,
+}
+
+impl ReadReplySamples {
+    fn observe(&mut self, end: u64, requested: usize, received: usize) {
+        if self.last.as_ref().is_none_or(|last| end > last.end) {
+            if let Some(last) = self.last.replace(ReadReplySample {
+                end,
+                requested,
+                received,
+            }) {
+                self.shape.observe(last.requested, last.received);
+            }
+        } else {
+            self.shape.observe(requested, received);
+        }
+    }
+
+    fn finish(mut self, clipped_by_eof: bool) -> ReadReplyShape {
+        if let Some(last) = self.last
+            && (!clipped_by_eof || last.received == last.requested)
+        {
+            // A full reply is useful even at EOF: periodic probes must be able
+            // to clear a stale smaller hint for a one-packet object too.
+            self.shape.observe(last.requested, last.received);
+        }
+        self.shape
+    }
+}
+
+impl ReadPacketSizing {
+    fn plan(&self, maximum: usize, len: usize) -> ReadPacketPlan {
+        let previous_hint = self.reply_limit.load(Ordering::Relaxed);
+        // Header reads must not consume the probe cadence for bulk payloads.
+        let probe = len >= maximum
+            && self
+                .bulk_reads
+                .fetch_add(1, Ordering::Relaxed)
+                .is_multiple_of(SFTP_READ_PACKET_PROBE_INTERVAL);
+        ReadPacketPlan {
+            packet_size: if previous_hint == 0 || probe {
+                maximum
+            } else {
+                maximum.min(previous_hint)
+            },
+            previous_hint,
+            probe,
+        }
+    }
+
+    fn completed(&self, plan: ReadPacketPlan, shape: ReadReplyShape) {
+        if let Some(size) = shape.short_size
+            && shape.matching_shorts >= 2
+            && !shape.inconsistent
+            && shape.largest_reply <= size
+        {
+            self.reply_limit.store(size, Ordering::Relaxed);
+        } else if plan.probe && shape.largest_reply >= plan.packet_size {
+            // Do not overwrite a different hint learned by a concurrent read.
+            let _ = self.reply_limit.compare_exchange(
+                plan.previous_hint,
+                0,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+        }
+    }
 }
 
 fn plan_pipelined_writes(
@@ -153,7 +284,6 @@ fn plan_pipelined_reads(
     while remaining != 0 {
         let request_len = remaining.min(packet_size);
         requests.push(PipelinedRead {
-            index: requests.len(),
             offset,
             len: request_len,
         });
@@ -430,6 +560,7 @@ pub struct SftpProtocolSession {
     closed: std::sync::atomic::AtomicBool,
     capabilities: SftpCapabilities,
     limits: SftpLimits,
+    read_packets: ReadPacketSizing,
     // Taken exactly once by `close`; the pool guarantees no operations are in
     // flight when it closes a session, so contention here is teardown-only.
     owner: std::sync::Mutex<Option<Box<dyn SshConnectionOwner>>>,
@@ -464,6 +595,7 @@ impl SftpProtocolSession {
             closed: std::sync::atomic::AtomicBool::new(false),
             capabilities,
             limits,
+            read_packets: ReadPacketSizing::default(),
             owner: std::sync::Mutex::new(Some(owner)),
             #[cfg(test)]
             bench_session_slot: usize::try_from(
@@ -668,6 +800,7 @@ async fn read_handle_pipelined(
     offset: u64,
     len: usize,
     limits: SftpLimits,
+    read_packets: &ReadPacketSizing,
 ) -> Result<Bytes, TransportError> {
     let packet_size = transfer_request_len(
         SFTP_READ_PACKET_SIZE,
@@ -675,56 +808,229 @@ async fn read_handle_pipelined(
         limits.packet_len,
         handle.len(),
     )?;
-    let requests = plan_pipelined_reads(offset, len, packet_size)?;
-    let mut buffer = BytesMut::zeroed(len);
-    let mut reads = Vec::with_capacity(requests.len());
-    for request in requests {
-        let region = buffer.split_to(request.len);
-        reads.push((request, region));
-    }
-    let mut chunks = futures::stream::iter(reads)
-        .map(|(request, mut region)| {
+    read_chunks_pipelined(
+        path,
+        offset,
+        len,
+        packet_size,
+        read_packets,
+        |offset, len| {
             let handle = handle.to_owned();
             async move {
-                let mut received = 0;
-                while received < request.len {
-                    let remaining = request.len - received;
-                    let offset = request.offset.checked_add(received as u64).ok_or_else(|| {
-                        TransportError::Operation("SFTP read offset overflow".to_owned())
-                    })?;
-                    let data = sftp
-                        .read(handle.clone(), offset, remaining as u32)
-                        .await
-                        .map_err(|error| {
-                            TransportError::Operation(format!(
-                                "short read from {} at {}: {error}",
-                                path.display(),
-                                offset
-                            ))
-                        })?;
-                    let len = data.data.len();
-                    if len == 0 || len > remaining {
-                        return Err(TransportError::Operation(format!(
-                            "short read from {} at {}: got {len} bytes with {remaining} remaining",
+                sftp.read(handle, offset, len as u32)
+                    .await
+                    .map(|data| Bytes::from(data.data))
+                    .map_err(|error| {
+                        TransportError::Operation(format!(
+                            "short read from {} at {}: {error}",
                             path.display(),
                             offset
-                        )));
-                    }
-                    region[received..received + len].copy_from_slice(&data.data);
-                    received += len;
-                }
-                Ok::<_, TransportError>((request.index, region))
+                        ))
+                    })
             }
-        })
-        .buffer_unordered(SFTP_READ_REQUEST_CONCURRENCY)
-        .try_collect::<Vec<_>>()
-        .await?;
-    chunks.sort_unstable_by_key(|(index, _)| *index);
-    let mut payload = BytesMut::new();
-    for (_, chunk) in chunks {
-        payload.unsplit(chunk);
+        },
+    )
+    .await
+}
+
+async fn read_chunks_pipelined<F, Fut>(
+    path: &Path,
+    offset: u64,
+    len: usize,
+    maximum_packet_size: usize,
+    read_packets: &ReadPacketSizing,
+    read: F,
+) -> Result<Bytes, TransportError>
+where
+    F: Fn(u64, usize) -> Fut,
+    Fut: std::future::Future<Output = Result<Bytes, TransportError>>,
+{
+    read_chunks_up_to(
+        path,
+        offset,
+        len,
+        maximum_packet_size,
+        read_packets,
+        |offset, len| {
+            let response = read(offset, len);
+            async move { response.await.map(Some) }
+        },
+    )
+    .await
+}
+
+/// Read a speculative bounded range without losing its valid prefix at EOF.
+/// Only an explicit SFTP EOF status permits a shorter result. The caller must
+/// validate its length against metadata from the same open object handle.
+async fn read_handle_up_to(
+    sftp: &RawSftpSession,
+    handle: &str,
+    path: &Path,
+    offset: u64,
+    len: usize,
+    limits: SftpLimits,
+    read_packets: &ReadPacketSizing,
+) -> Result<Bytes, TransportError> {
+    let packet_size = transfer_request_len(
+        SFTP_READ_PACKET_SIZE,
+        limits.read_len,
+        limits.packet_len,
+        handle.len(),
+    )?;
+    read_chunks_up_to(
+        path,
+        offset,
+        len,
+        packet_size,
+        read_packets,
+        |offset, len| async move {
+            match sftp.read(handle, offset, len as u32).await {
+                Ok(data) => Ok(Some(Bytes::from(data.data))),
+                Err(russh_sftp::client::error::Error::Status(status))
+                    if status.status_code == StatusCode::Eof =>
+                {
+                    Ok(None)
+                }
+                Err(error) => Err(TransportError::Operation(format!(
+                    "short read from {} at {}: {error}",
+                    path.display(),
+                    offset
+                ))),
+            }
+        },
+    )
+    .await
+}
+
+async fn read_chunks_up_to<F, Fut>(
+    path: &Path,
+    offset: u64,
+    len: usize,
+    maximum_packet_size: usize,
+    read_packets: &ReadPacketSizing,
+    read: F,
+) -> Result<Bytes, TransportError>
+where
+    F: Fn(u64, usize) -> Fut,
+    Fut: std::future::Future<Output = Result<Option<Bytes>, TransportError>>,
+{
+    // Plan/validate the entire range before allocating or sending any request.
+    let packet_plan = read_packets.plan(maximum_packet_size, len);
+    let mut packet_size = packet_plan.packet_size;
+    let mut queued: std::collections::VecDeque<_> =
+        plan_pipelined_reads(offset, len, packet_size)?.into();
+    let mut buffer = BytesMut::zeroed(len);
+    let mut pending = futures::stream::FuturesUnordered::new();
+    let mut pending_bytes = 0;
+    let mut reply_samples = ReadReplySamples::default();
+    let requested_end = offset + len as u64; // Validated by the plan above.
+    let mut covered_end = requested_end;
+    let mut received_total = 0;
+    let mut greatest_data_end = offset;
+    loop {
+        while pending.len() < SFTP_READ_REQUEST_CONCURRENCY
+            && pending_bytes < SFTP_READ_MAX_INFLIGHT_BYTES
+        {
+            let Some(mut request) = queued.pop_front() else {
+                break;
+            };
+            if request.offset >= covered_end {
+                continue;
+            }
+            request.len = request.len.min((covered_end - request.offset) as usize);
+            let request_size = packet_size.min(SFTP_READ_MAX_INFLIGHT_BYTES - pending_bytes);
+            if request.len > request_size {
+                queued.push_front(PipelinedRead {
+                    offset: request.offset + request_size as u64,
+                    len: request.len - request_size,
+                });
+                request.len = request_size;
+            }
+            pending_bytes += request.len;
+            let response = read(request.offset, request.len);
+            pending.push(async move {
+                let mut observation = ReadRequestObservation::start(request.len);
+                let result = response.await;
+                match &result {
+                    Ok(Some(bytes)) => observation.data(bytes.len()),
+                    Ok(None) => observation.eof(),
+                    Err(_) => observation.error(),
+                }
+                result.map(|bytes| (request, bytes))
+            });
+        }
+
+        let Some(response) = pending.next().await else {
+            break;
+        };
+        let (request, bytes) = response?;
+        pending_bytes -= request.len;
+        let Some(bytes) = bytes else {
+            // EOF may arrive before earlier DATA replies. Stop issuing work
+            // beyond this bound, but drain every already-issued request and
+            // finish all missing ranges below it before returning the prefix.
+            covered_end = covered_end.min(request.offset);
+            if greatest_data_end > covered_end {
+                return Err(TransportError::Operation(format!(
+                    "inconsistent EOF from {} at {covered_end}",
+                    path.display()
+                )));
+            }
+            continue;
+        };
+        let received = bytes.len();
+        if received == 0 || received > request.len {
+            return Err(TransportError::Operation(format!(
+                "short read from {} at {}: got {received} bytes with {} remaining",
+                path.display(),
+                request.offset,
+                request.len
+            )));
+        }
+        let data_end = request.offset + received as u64;
+        if data_end > covered_end {
+            return Err(TransportError::Operation(format!(
+                "data beyond EOF from {} at {covered_end}",
+                path.display()
+            )));
+        }
+        greatest_data_end = greatest_data_end.max(data_end);
+        received_total += received;
+        reply_samples.observe(data_end, request.len, received);
+        // Every queued range is a disjoint subrange of the validated plan.
+        // Copy by offset so out-of-order replies never hold up slot refills.
+        let start = (request.offset - offset) as usize;
+        buffer[start..start + received].copy_from_slice(&bytes);
+        if received < request.len {
+            // A server may silently cap DATA below its advertised READ limit.
+            // Split the missing suffix across free slots instead of keeping it
+            // in one serial request chain. The session hint is updated only
+            // after a successful read proves a consistent smaller reply cap.
+            // An isolated tiny reply must not fragment every queued suffix
+            // into equally tiny requests. Preserve stricter negotiated caps
+            // while keeping speculative splitting at a useful granularity.
+            packet_size = packet_size.min(received.max(SFTP_MIN_READ_PACKET_HINT));
+            queued.push_front(PipelinedRead {
+                offset: request.offset + received as u64,
+                len: request.len - received,
+            });
+        }
     }
-    Ok(payload.freeze())
+    let covered_len = (covered_end - offset) as usize;
+    if received_total != covered_len {
+        return Err(TransportError::Operation(format!(
+            "incomplete read from {}: received {received_total} of {covered_len} bytes",
+            path.display()
+        )));
+    }
+    // Learn only after complete coverage is validated, excluding a short EOF
+    // tail without discarding the preceding nonterminal reply-size evidence.
+    read_packets.completed(
+        packet_plan,
+        reply_samples.finish(covered_end < requested_end),
+    );
+    buffer.truncate(covered_len);
+    Ok(buffer.freeze())
 }
 
 async fn stat_directory(
@@ -757,36 +1063,52 @@ impl TransportSession for SftpProtocolSession {
     ) -> Result<RemoteObjectRead, TransportError> {
         let sftp = self.sftp()?;
         let remote = sftp_path(path)?;
-        let opened = sftp
-            .open(remote, OpenFlags::READ, FileAttributes::default())
-            .await
-            .map_err(|error| map_sftp_error(path, error))?;
+        let opened = observe_phase(
+            SftpPhase::Open,
+            OperationKind::Read,
+            sftp.open(remote, OpenFlags::READ, FileAttributes::default()),
+        )
+        .await
+        .map_err(|error| map_sftp_error(path, error))?;
         let handle = opened.handle;
         let result = async {
             let speculative_range = match (&requested_range, head) {
             (Some(object_store::GetRange::Bounded(range)), false) if range.start < range.end => {
                 usize::try_from(range.end - range.start)
                     .ok()
+                    // Untrusted range bounds must not size a speculative
+                    // allocation before the open handle's metadata clips EOF.
+                    // Larger reads follow the metadata-first path below.
+                    .filter(|len| *len <= SFTP_READ_MAX_INFLIGHT_BYTES)
                     .and_then(|len| {
-                        (OBJECT_HEADER_LEN as u64)
-                            .checked_add(range.start)
-                            .map(|physical_start| (range.clone(), physical_start, len))
+                        // A valid logical bound may exceed the object's EOF
+                        // and overflow after adding the internal header. In
+                        // that case, wait for metadata to clip the range.
+                        (OBJECT_HEADER_LEN as u64).checked_add(range.end)?;
+                        Some((OBJECT_HEADER_LEN as u64 + range.start, len))
                     })
             }
             _ => None,
             };
             let speculative_payload = async {
             match &speculative_range {
-                Some((_, physical_start, len)) => Some(
-                    read_handle_pipelined(sftp, &handle, path, *physical_start, *len, self.limits)
-                        .await,
+                Some((physical_start, len)) => Some(
+                    observe_phase(
+                        SftpPhase::Payload,
+                        OperationKind::Read,
+                        read_handle_up_to(sftp, &handle, path, *physical_start, *len, self.limits, &self.read_packets),
+                    ).await,
                 ),
                 None => None,
             }
             };
             let (metadata, encoded_header, speculative_payload) = tokio::join!(
-            sftp.fstat(handle.as_str()),
-            read_handle_pipelined(sftp, &handle, path, 0, OBJECT_HEADER_LEN, self.limits),
+            observe_phase(SftpPhase::Fstat, OperationKind::Read, sftp.fstat(handle.as_str())),
+            observe_phase(
+                SftpPhase::Header,
+                OperationKind::Read,
+                read_handle_pipelined(sftp, &handle, path, 0, OBJECT_HEADER_LEN, self.limits, &self.read_packets),
+            ),
             speculative_payload,
             );
             let metadata = metadata.map_err(|error| map_sftp_error(path, error))?.attrs;
@@ -833,11 +1155,20 @@ impl TransportSession for SftpProtocolSession {
             };
             let payload = if head || range.is_empty() {
             Bytes::new()
-        } else if let (Some(result), Some((requested, _, _))) =
-            (speculative_payload, &speculative_range)
-            && *requested == range
-        {
-                result?
+        } else if let Some(result) = speculative_payload {
+            // Bounded GetRange clips only its end. Retain the bytes already
+            // received when that end crossed EOF instead of downloading the
+            // valid range a second time. A premature EOF still fails closed.
+            let payload = result?;
+            if payload.len() as u64 != range.end - range.start {
+                return Err(TransportError::Operation(format!(
+                    "short read from {}: received {} of {} bytes",
+                    path.display(),
+                    payload.len(),
+                    range.end - range.start
+                )));
+            }
+            payload
         } else {
             let physical_start = (OBJECT_HEADER_LEN as u64)
                 .checked_add(range.start)
@@ -853,7 +1184,11 @@ impl TransportSession for SftpProtocolSession {
                     path.display()
                 ))
             })?;
-                read_handle_pipelined(sftp, &handle, path, physical_start, len, self.limits).await?
+                observe_phase(
+                    SftpPhase::Payload,
+                    OperationKind::Read,
+                    read_handle_pipelined(sftp, &handle, path, physical_start, len, self.limits, &self.read_packets),
+                ).await?
             };
             Ok(RemoteObjectRead {
                 header,
@@ -863,8 +1198,7 @@ impl TransportSession for SftpProtocolSession {
             })
         }
         .await;
-        let close = sftp
-            .close(handle)
+        let close = observe_phase(SftpPhase::Close, OperationKind::Read, sftp.close(handle))
             .await
             .map_err(|error| map_sftp_close_error(path, error));
         finish_raw_handle(result, close.map(|_| ()))
@@ -1021,14 +1355,29 @@ impl TransportSession for SftpProtocolSession {
     ) -> Result<Bytes, TransportError> {
         let sftp = self.sftp()?;
         let remote = sftp_path(path)?;
-        let opened = sftp
-            .open(remote, OpenFlags::READ, FileAttributes::default())
-            .await
-            .map_err(|error| map_sftp_error(path, error))?;
+        let opened = observe_phase(
+            SftpPhase::Open,
+            OperationKind::Read,
+            sftp.open(remote, OpenFlags::READ, FileAttributes::default()),
+        )
+        .await
+        .map_err(|error| map_sftp_error(path, error))?;
         let handle = opened.handle;
-        let bytes = read_handle_pipelined(sftp, &handle, path, offset, len, self.limits).await;
-        let close = sftp
-            .close(handle)
+        let bytes = observe_phase(
+            SftpPhase::Payload,
+            OperationKind::Read,
+            read_handle_pipelined(
+                sftp,
+                &handle,
+                path,
+                offset,
+                len,
+                self.limits,
+                &self.read_packets,
+            ),
+        )
+        .await;
+        let close = observe_phase(SftpPhase::Close, OperationKind::Read, sftp.close(handle))
             .await
             .map_err(|error| map_sftp_close_error(path, error))
             .map(|_| ());
@@ -1094,6 +1443,162 @@ impl TransportSession for SftpProtocolSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_pipeline_metrics_account_for_short_data_and_eof() {
+        use crate::sftp_metrics::tests::metric_value;
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        let bytes = read_chunks_up_to(
+            Path::new("metrics-object"),
+            0,
+            96 * 1024,
+            64 * 1024,
+            &ReadPacketSizing::default(),
+            |offset, _len| async move {
+                if offset >= 64 * 1024 {
+                    Ok(None)
+                } else {
+                    Ok(Some(Bytes::from(vec![0x5a; 32 * 1024])))
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(bytes, Bytes::from(vec![0x5a; 64 * 1024]));
+        let body = handle.render();
+        for name in [
+            "zerofs_sftp_read_requests_inflight",
+            "zerofs_sftp_read_requested_bytes_inflight",
+        ] {
+            assert_eq!(metric_value(&body, name, &[]), 0.0);
+        }
+        assert_eq!(
+            metric_value(&body, "zerofs_sftp_read_requests_total", &[]),
+            3.0
+        );
+        assert_eq!(
+            metric_value(&body, "zerofs_sftp_read_requested_bytes_total", &[]),
+            (128 * 1024) as f64
+        );
+        assert_eq!(
+            metric_value(&body, "zerofs_sftp_read_reply_bytes_total", &[]),
+            (64 * 1024) as f64
+        );
+        assert_eq!(
+            metric_value(&body, "zerofs_sftp_read_reply_size_bytes_count", &[]),
+            2.0
+        );
+        assert_eq!(
+            metric_value(&body, "zerofs_sftp_read_short_replies_total", &[]),
+            1.0
+        );
+        for (outcome, count) in [("data", 2.0), ("eof", 1.0)] {
+            assert_eq!(
+                metric_value(
+                    &body,
+                    "zerofs_sftp_read_requests_finished_total",
+                    &[("outcome", outcome)]
+                ),
+                count
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn read_pipeline_metrics_release_pending_requests_on_cancellation() {
+        use crate::sftp_metrics::tests::metric_value;
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        let sizing = ReadPacketSizing::default();
+        let mut read = Box::pin(read_chunks_up_to(
+            Path::new("metrics-object"),
+            0,
+            128 * 1024,
+            32 * 1024,
+            &sizing,
+            |_offset, _len| std::future::pending::<Result<Option<Bytes>, TransportError>>(),
+        ));
+        assert!(futures::poll!(read.as_mut()).is_pending());
+        let body = handle.render();
+        assert_eq!(
+            metric_value(&body, "zerofs_sftp_read_requests_inflight", &[]),
+            4.0
+        );
+        assert_eq!(
+            metric_value(&body, "zerofs_sftp_read_requested_bytes_inflight", &[]),
+            (128 * 1024) as f64
+        );
+        tokio::time::advance(std::time::Duration::from_millis(100)).await;
+        drop(read);
+        let body = handle.render();
+        assert_eq!(
+            metric_value(&body, "zerofs_sftp_read_requests_inflight", &[]),
+            0.0
+        );
+        assert_eq!(
+            metric_value(&body, "zerofs_sftp_read_requested_bytes_inflight", &[]),
+            0.0
+        );
+        assert_eq!(
+            metric_value(
+                &body,
+                "zerofs_sftp_read_requests_finished_total",
+                &[("outcome", "cancelled")]
+            ),
+            4.0
+        );
+        assert_eq!(
+            metric_value(
+                &body,
+                "zerofs_sftp_read_request_duration_seconds_sum",
+                &[("outcome", "cancelled")]
+            ),
+            0.4
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_pipeline_metrics_preserve_failed_request_results() {
+        use crate::sftp_metrics::tests::metric_value;
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        let result = read_chunks_up_to(
+            Path::new("metrics-object"),
+            0,
+            32 * 1024,
+            32 * 1024,
+            &ReadPacketSizing::default(),
+            |_offset, _len| async { Err(TransportError::Operation("read failed".to_owned())) },
+        )
+        .await;
+        assert!(
+            matches!(result, Err(TransportError::Operation(message)) if message == "read failed")
+        );
+        let body = handle.render();
+        assert_eq!(
+            metric_value(&body, "zerofs_sftp_read_requests_inflight", &[]),
+            0.0
+        );
+        assert_eq!(
+            metric_value(&body, "zerofs_sftp_read_requested_bytes_inflight", &[]),
+            0.0
+        );
+        assert_eq!(
+            metric_value(
+                &body,
+                "zerofs_sftp_read_requests_finished_total",
+                &[("outcome", "error")]
+            ),
+            1.0
+        );
+    }
 
     #[tokio::test]
     async fn bounded_sftp_stream_rejects_oversized_length_before_forwarding_it() {
@@ -1180,7 +1685,713 @@ mod tests {
             plan_pipelined_reads(0, SFTP_READ_PACKET_SIZE * 3, SFTP_READ_PACKET_SIZE).unwrap();
         assert_eq!(plan.len(), 3);
         assert_eq!(plan[2].offset, (SFTP_READ_PACKET_SIZE * 2) as u64);
-        assert_eq!(SFTP_READ_REQUEST_CONCURRENCY, 64);
+        assert_eq!(SFTP_READ_REQUEST_CONCURRENCY, 128);
+    }
+
+    fn read_pattern(offset: u64, len: usize) -> Bytes {
+        Bytes::from(
+            (offset..offset + len as u64)
+                .map(|position| ((position.wrapping_mul(31) ^ (position >> 8)) % 251) as u8)
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn short_sftp_read_replies_fill_available_request_slots() {
+        use std::time::Duration;
+
+        // Some servers return less than the requested/advertised maximum.
+        // A 1 MiB fetch must not become eight serial 95 ms reply waves merely
+        // because its original 255 KiB packets receive 32 KiB at a time.
+        let rtt = Duration::from_millis(95);
+        let offset = 193;
+        let len = 1024 * 1024;
+        let started = tokio::time::Instant::now();
+        let bytes = read_chunks_pipelined(
+            Path::new("short-replies"),
+            offset,
+            len,
+            SFTP_READ_PACKET_SIZE,
+            &ReadPacketSizing::default(),
+            |offset, requested| async move {
+                tokio::time::sleep(rtt).await;
+                Ok(read_pattern(offset, requested.min(32 * 1024)))
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(bytes, read_pattern(offset, len));
+        let elapsed = started.elapsed();
+        eprintln!("simulated SFTP: 1 MiB, 32 KiB replies, {rtt:?} RTT: {elapsed:?}");
+        assert!(
+            elapsed <= rtt * 3,
+            "short replies left request slots idle: {elapsed:?} for a 1 MiB read at {rtt:?} RTT"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn repeated_short_reply_windows_keep_the_wan_pipeline_full() {
+        use std::time::Duration;
+
+        let rtt = Duration::from_millis(95);
+        let len = 4 * 1024 * 1024;
+        let read_packets = ReadPacketSizing::default();
+        for window in 0..3 {
+            let offset = 193 + (window * len) as u64;
+            let started = tokio::time::Instant::now();
+            let bytes = read_chunks_pipelined(
+                Path::new("repeated-short-replies"),
+                offset,
+                len,
+                SFTP_READ_PACKET_SIZE,
+                &read_packets,
+                |offset, requested| async move {
+                    tokio::time::sleep(rtt).await;
+                    Ok(read_pattern(offset, requested.min(32 * 1024)))
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(bytes, read_pattern(offset, len));
+            let elapsed = started.elapsed();
+            eprintln!("simulated SFTP: 4 MiB window {window}, 32 KiB replies: {elapsed:?}");
+            if window != 0 {
+                assert!(
+                    elapsed <= rtt,
+                    "a learned 32 KiB reply size must fill a 4 MiB request wave: {elapsed:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn repeated_eof_clipped_reads_reuse_nonterminal_reply_size() {
+        use std::time::Duration;
+
+        let rtt = Duration::from_millis(95);
+        let offset = 193;
+        let payload_len = 720_913;
+        let eof = offset + payload_len as u64;
+        let read_packets = ReadPacketSizing::default();
+        for window in 0..3 {
+            let transferred = AtomicUsize::new(0);
+            let started = tokio::time::Instant::now();
+            let bytes = read_chunks_up_to(
+                Path::new("repeated-clipped-short-replies"),
+                offset,
+                1024 * 1024,
+                SFTP_READ_PACKET_SIZE,
+                &read_packets,
+                |at, requested| {
+                    let transferred = &transferred;
+                    async move {
+                        tokio::time::sleep(rtt).await;
+                        if at >= eof {
+                            return Ok(None);
+                        }
+                        let received = requested.min(32 * 1024).min((eof - at) as usize);
+                        transferred.fetch_add(received, Ordering::SeqCst);
+                        Ok(Some(read_pattern(at, received)))
+                    }
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(bytes, read_pattern(offset, payload_len));
+            assert_eq!(transferred.load(Ordering::SeqCst), payload_len);
+            let elapsed = started.elapsed();
+            eprintln!(
+                "simulated SFTP clipped read: window {window}, {payload_len} bytes, 32 KiB replies: {elapsed:?}"
+            );
+            if window != 0 {
+                assert!(
+                    elapsed <= rtt * 2,
+                    "EOF discarded the preceding reply-size evidence: {elapsed:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn eof_tail_sizes_do_not_train_a_reply_cap() {
+        for payload_len in [
+            0,
+            40 * 1024,
+            SFTP_READ_PACKET_SIZE,
+            2 * SFTP_READ_PACKET_SIZE + 40 * 1024,
+        ] {
+            let read_packets = ReadPacketSizing::default();
+            let bytes = read_chunks_up_to(
+                Path::new("uncapped-object-tail"),
+                0,
+                1024 * 1024,
+                SFTP_READ_PACKET_SIZE,
+                &read_packets,
+                |at, requested| async move {
+                    Ok((at < payload_len as u64)
+                        .then(|| read_pattern(at, requested.min(payload_len - at as usize))))
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(bytes, read_pattern(0, payload_len));
+            assert_eq!(read_packets.reply_limit.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn different_sized_eof_tail_does_not_hide_nonterminal_reply_cap() {
+        let read_packets = ReadPacketSizing::default();
+        let payload_len = 3 * SFTP_READ_PACKET_SIZE + 40 * 1024;
+        let bytes = read_chunks_up_to(
+            Path::new("capped-object-tail"),
+            0,
+            1024 * 1024,
+            SFTP_READ_PACKET_SIZE,
+            &read_packets,
+            |at, requested| async move {
+                Ok((at < payload_len as u64).then(|| {
+                    read_pattern(at, requested.min(64 * 1024).min(payload_len - at as usize))
+                }))
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(bytes, read_pattern(0, payload_len));
+        assert_eq!(read_packets.reply_limit.load(Ordering::Relaxed), 64 * 1024);
+    }
+
+    #[tokio::test]
+    async fn eof_clipped_periodic_probe_recovers_a_full_sized_reply() {
+        let read_packets = ReadPacketSizing::default();
+        let payload_len = 720_913;
+        let path = Path::new("changing-clipped-reply-cap");
+        let bytes = read_chunks_up_to(
+            path,
+            0,
+            1024 * 1024,
+            SFTP_READ_PACKET_SIZE,
+            &read_packets,
+            |at, requested| async move {
+                Ok((at < payload_len as u64).then(|| {
+                    read_pattern(at, requested.min(32 * 1024).min(payload_len - at as usize))
+                }))
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(bytes, read_pattern(0, payload_len));
+        assert_eq!(read_packets.reply_limit.load(Ordering::Relaxed), 32 * 1024);
+
+        // A full response at EOF is sufficient to clear the old cap, even
+        // when there is only one DATA packet during the periodic probe.
+        for _ in 0..SFTP_READ_PACKET_PROBE_INTERVAL {
+            let bytes = read_chunks_up_to(
+                path,
+                0,
+                1024 * 1024,
+                SFTP_READ_PACKET_SIZE,
+                &read_packets,
+                |at, requested| async move {
+                    Ok((at < SFTP_READ_PACKET_SIZE as u64).then(|| {
+                        read_pattern(at, requested.min(SFTP_READ_PACKET_SIZE - at as usize))
+                    }))
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(bytes, read_pattern(0, SFTP_READ_PACKET_SIZE));
+        }
+        assert_eq!(read_packets.reply_limit.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn isolated_short_reply_does_not_tune_future_reads() {
+        let read_packets = ReadPacketSizing::default();
+        let len = 1024 * 1024;
+        let bytes = read_chunks_pipelined(
+            Path::new("isolated-short-reply"),
+            0,
+            len,
+            SFTP_READ_PACKET_SIZE,
+            &read_packets,
+            |offset, requested| async move {
+                let reply = if offset == 0 { 32 * 1024 } else { requested };
+                Ok(read_pattern(offset, reply))
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(bytes, read_pattern(0, len));
+        assert_eq!(read_packets.reply_limit.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn isolated_tiny_reply_keeps_current_read_requests_bounded() {
+        let rtt = std::time::Duration::from_millis(95);
+        let offset = 193;
+        let len = 1024 * 1024;
+        for maximum in [SFTP_READ_PACKET_SIZE, 4096] {
+            let read_packets = ReadPacketSizing::default();
+            let requests = AtomicUsize::new(0);
+            let started = tokio::time::Instant::now();
+            let bytes = read_chunks_pipelined(
+                Path::new("isolated-tiny-reply"),
+                offset,
+                len,
+                maximum,
+                &read_packets,
+                |position, requested| {
+                    requests.fetch_add(1, Ordering::Relaxed);
+                    assert!(requested <= maximum, "negotiated limit exceeded");
+                    async move {
+                        tokio::time::sleep(rtt).await;
+                        let reply = if position == offset { 1 } else { requested };
+                        Ok(read_pattern(position, reply))
+                    }
+                },
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(bytes, read_pattern(offset, len));
+            let request_limit = len.div_ceil(maximum) + maximum.div_ceil(SFTP_MIN_READ_PACKET_HINT);
+            assert!(
+                requests.load(Ordering::Relaxed) <= request_limit,
+                "one tiny reply fragmented a read into {} requests (limit {request_limit})",
+                requests.load(Ordering::Relaxed)
+            );
+            assert!(started.elapsed() <= rtt * 3);
+            assert_eq!(read_packets.reply_limit.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn periodic_probe_recovers_larger_replies_and_respects_new_limits() {
+        let read_packets = ReadPacketSizing::default();
+        let len = 1024 * 1024;
+        let path = Path::new("changing-reply-cap");
+        let bytes = read_chunks_pipelined(
+            path,
+            0,
+            len,
+            SFTP_READ_PACKET_SIZE,
+            &read_packets,
+            |offset, requested| async move { Ok(read_pattern(offset, requested.min(32 * 1024))) },
+        )
+        .await
+        .unwrap();
+        assert_eq!(bytes, read_pattern(0, len));
+        assert_eq!(read_packets.reply_limit.load(Ordering::Relaxed), 32 * 1024);
+
+        // A cached hint never overrides a stricter negotiated transfer limit.
+        read_chunks_pipelined(
+            path,
+            0,
+            len,
+            16 * 1024,
+            &read_packets,
+            |offset, requested| {
+                assert!(requested <= 16 * 1024);
+                std::future::ready(Ok(read_pattern(offset, requested)))
+            },
+        )
+        .await
+        .unwrap();
+
+        // A server or object that supports full replies must not remain stuck
+        // with a smaller hint forever. Exercise actual payload reads, not the
+        // hint counter in isolation.
+        for _ in 0..SFTP_READ_PACKET_PROBE_INTERVAL {
+            let bytes = read_chunks_pipelined(
+                path,
+                0,
+                len,
+                SFTP_READ_PACKET_SIZE,
+                &read_packets,
+                |offset, requested| std::future::ready(Ok(read_pattern(offset, requested))),
+            )
+            .await
+            .unwrap();
+            assert_eq!(bytes, read_pattern(0, len));
+        }
+        assert_eq!(read_packets.reply_limit.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn failed_read_does_not_publish_a_reply_size_hint() {
+        let read_packets = ReadPacketSizing::default();
+        let error = read_chunks_pipelined(
+            Path::new("failed-probe"),
+            0,
+            1024 * 1024,
+            SFTP_READ_PACKET_SIZE,
+            &read_packets,
+            |offset, requested| async move {
+                if offset >= 2 * SFTP_READ_PACKET_SIZE as u64 {
+                    Err(TransportError::PermissionDenied("denied".to_owned()))
+                } else {
+                    Ok(read_pattern(offset, requested.min(32 * 1024)))
+                }
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, TransportError::PermissionDenied(_)));
+        assert_eq!(read_packets.reply_limit.load(Ordering::Relaxed), 0);
+    }
+
+    #[derive(Default)]
+    struct ReadActivity {
+        active: std::sync::atomic::AtomicUsize,
+        peak: std::sync::atomic::AtomicUsize,
+        requested_bytes: std::sync::atomic::AtomicUsize,
+        peak_requested_bytes: std::sync::atomic::AtomicUsize,
+    }
+
+    struct ActiveRead<'a>(&'a ReadActivity, usize);
+
+    impl ReadActivity {
+        fn enter(&self) -> ActiveRead<'_> {
+            self.enter_bytes(0)
+        }
+
+        fn enter_bytes(&self, requested: usize) -> ActiveRead<'_> {
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(active, Ordering::SeqCst);
+            let bytes = self.requested_bytes.fetch_add(requested, Ordering::SeqCst) + requested;
+            self.peak_requested_bytes.fetch_max(bytes, Ordering::SeqCst);
+            ActiveRead(self, requested)
+        }
+    }
+
+    impl Drop for ActiveRead<'_> {
+        fn drop(&mut self) {
+            self.0.active.fetch_sub(1, Ordering::SeqCst);
+            self.0.requested_bytes.fetch_sub(self.1, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn more_small_read_slots_preserve_the_large_reply_byte_budget() {
+        use std::time::Duration;
+
+        let activity = ReadActivity::default();
+        let len = SFTP_READ_MAX_INFLIGHT_BYTES + SFTP_READ_PACKET_SIZE;
+        let bytes = read_chunks_pipelined(
+            Path::new("bounded-reply-bytes"),
+            0,
+            len,
+            SFTP_READ_PACKET_SIZE,
+            &ReadPacketSizing::default(),
+            |offset, requested| {
+                let activity = &activity;
+                async move {
+                    let _active = activity.enter_bytes(requested);
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    Ok(read_pattern(offset, requested))
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(bytes, read_pattern(0, len));
+        assert_eq!(activity.peak.load(Ordering::SeqCst), 64);
+        assert_eq!(
+            activity.peak_requested_bytes.load(Ordering::SeqCst),
+            SFTP_READ_MAX_INFLIGHT_BYTES
+        );
+        assert_eq!(activity.active.load(Ordering::SeqCst), 0);
+        assert_eq!(activity.requested_bytes.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn read_pipeline_refills_before_slowest_reply_and_preserves_offsets() {
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        let activity = Arc::new(ReadActivity::default());
+        let refill_at = Arc::new(Mutex::new(None));
+        let packet_size = 4096;
+        let offset = 97;
+        let len = packet_size * (SFTP_READ_REQUEST_CONCURRENCY + 3) + 17;
+        let first_refill = offset + (packet_size * SFTP_READ_REQUEST_CONCURRENCY) as u64;
+        let started = tokio::time::Instant::now();
+        let bytes = read_chunks_pipelined(
+            Path::new("out-of-order"),
+            offset,
+            len,
+            packet_size,
+            &ReadPacketSizing::default(),
+            |position, requested| {
+                assert!(requested <= packet_size, "negotiated limit exceeded");
+                if position == first_refill {
+                    *refill_at.lock().unwrap() = Some(started.elapsed());
+                }
+                let activity = Arc::clone(&activity);
+                async move {
+                    let _active = activity.enter();
+                    let delay = if position == offset { 50 } else { 5 };
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                    Ok(read_pattern(position, requested))
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(bytes, read_pattern(offset, len));
+        assert_eq!(activity.active.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            activity.peak.load(Ordering::SeqCst),
+            SFTP_READ_REQUEST_CONCURRENCY
+        );
+        assert!(
+            refill_at.lock().unwrap().unwrap() < Duration::from_millis(50),
+            "a slow first reply must not hold up the next request wave"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn short_replies_keep_request_count_bounded() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let activity = Arc::new(ReadActivity::default());
+        let offset = 137;
+        let len = 4 * 1024 * 1024 + 13;
+        let bytes = read_chunks_pipelined(
+            Path::new("bounded-short-replies"),
+            offset,
+            len,
+            SFTP_READ_PACKET_SIZE,
+            &ReadPacketSizing::default(),
+            |position, requested| {
+                assert!(requested <= SFTP_READ_PACKET_SIZE);
+                let activity = Arc::clone(&activity);
+                async move {
+                    let _active = activity.enter();
+                    // Reorder the responses and force repeated short replies.
+                    tokio::time::sleep(Duration::from_millis(1 + position % 5)).await;
+                    Ok(read_pattern(position, requested.min(8 * 1024)))
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(bytes, read_pattern(offset, len));
+        assert_eq!(activity.active.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            activity.peak.load(Ordering::SeqCst),
+            SFTP_READ_REQUEST_CONCURRENCY,
+            "short-read recovery must fill, but never exceed, the request budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_pipeline_rejects_invalid_replies_and_preserves_errors() {
+        for reply_len in [0, 4097] {
+            let error = read_chunks_pipelined(
+                Path::new("invalid-reply"),
+                29,
+                4096,
+                4096,
+                &ReadPacketSizing::default(),
+                |_, _| std::future::ready(Ok(Bytes::from(vec![0; reply_len]))),
+            )
+            .await
+            .expect_err("empty and oversized replies cannot satisfy an exact read");
+            assert!(matches!(error, TransportError::Operation(_)), "{error:?}");
+        }
+
+        let error = read_chunks_pipelined(
+            Path::new("denied"),
+            0,
+            4096,
+            4096,
+            &ReadPacketSizing::default(),
+            |_, _| std::future::ready(Err(TransportError::PermissionDenied("denied".to_owned()))),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, TransportError::PermissionDenied(_)),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn eof_before_earlier_short_replies_preserves_the_complete_prefix() {
+        use std::time::Duration;
+
+        let offset = 37;
+        let payload_len = 6 * 32 * 1024 + 17;
+        let eof = offset + payload_len as u64;
+        let transferred = AtomicUsize::new(0);
+        let read_packets = ReadPacketSizing::default();
+        let bytes = read_chunks_up_to(
+            Path::new("clipped-range"),
+            offset,
+            512 * 1024,
+            64 * 1024,
+            &read_packets,
+            |at, requested| {
+                let transferred = &transferred;
+                async move {
+                    if at >= eof {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                        return Ok(None);
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    let len = requested.min(32 * 1024).min((eof - at) as usize);
+                    transferred.fetch_add(len, Ordering::SeqCst);
+                    Ok(Some(read_pattern(at, len)))
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(bytes, read_pattern(offset, payload_len));
+        assert_eq!(transferred.load(Ordering::SeqCst), payload_len);
+        assert_eq!(read_packets.reply_limit.load(Ordering::Relaxed), 32 * 1024);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn speculative_read_rejects_data_beyond_eof_in_either_reply_order() {
+        use std::time::Duration;
+
+        for eof_first in [false, true] {
+            let error = read_chunks_up_to(
+                Path::new("inconsistent-eof"),
+                0,
+                8,
+                4,
+                &ReadPacketSizing::default(),
+                |offset, len| async move {
+                    let is_eof = offset == 0;
+                    let delay = if is_eof == eof_first { 1 } else { 2 };
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                    Ok((!is_eof).then(|| read_pattern(offset, len)))
+                },
+            )
+            .await
+            .expect_err("EOF must not conceal a hole before later data");
+            assert!(matches!(error, TransportError::Operation(_)), "{error:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn speculative_read_accepts_only_explicit_eof_and_preserves_errors() {
+        for reply_len in [0, 5] {
+            let error = read_chunks_up_to(
+                Path::new("invalid-speculative-reply"),
+                0,
+                4,
+                4,
+                &ReadPacketSizing::default(),
+                |_, _| std::future::ready(Ok(Some(Bytes::from(vec![0; reply_len])))),
+            )
+            .await
+            .expect_err("empty and oversized DATA are errors, not EOF");
+            assert!(matches!(error, TransportError::Operation(_)), "{error:?}");
+        }
+        let error = read_chunks_up_to(
+            Path::new("denied-speculative-reply"),
+            0,
+            4,
+            4,
+            &ReadPacketSizing::default(),
+            |_, _| std::future::ready(Err(TransportError::PermissionDenied("denied".to_owned()))),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, TransportError::PermissionDenied(_)),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn read_pipeline_cancellation_drops_all_pending_reads() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let activity = Arc::new(ReadActivity::default());
+        let read_packets = ReadPacketSizing::default();
+        let read = read_chunks_pipelined(
+            Path::new("cancelled"),
+            0,
+            1024 * (SFTP_READ_REQUEST_CONCURRENCY + 1),
+            1024,
+            &read_packets,
+            |_, _| {
+                let activity = Arc::clone(&activity);
+                async move {
+                    let _active = activity.enter();
+                    std::future::pending::<Result<Bytes, TransportError>>().await
+                }
+            },
+        );
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), read)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            activity.peak.load(Ordering::SeqCst),
+            SFTP_READ_REQUEST_CONCURRENCY
+        );
+        assert_eq!(activity.active.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn read_pipeline_validates_ranges_before_issuing_io() {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let read = |_, _| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(Ok(Bytes::new()))
+        };
+        assert!(
+            read_chunks_pipelined(
+                Path::new("overflow"),
+                u64::MAX,
+                2,
+                1024,
+                &ReadPacketSizing::default(),
+                read
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            read_chunks_pipelined(
+                Path::new("zero-packet"),
+                0,
+                2,
+                0,
+                &ReadPacketSizing::default(),
+                read
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            read_chunks_pipelined(
+                Path::new("empty"),
+                u64::MAX,
+                0,
+                1024,
+                &ReadPacketSizing::default(),
+                read
+            )
+            .await
+            .unwrap()
+            .is_empty()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]

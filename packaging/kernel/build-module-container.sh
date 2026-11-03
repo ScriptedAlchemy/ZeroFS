@@ -222,6 +222,10 @@ apt_package_available() {
 }
 
 install_apt_snapshot_ca() {
+    # Snapshot mirrors occasionally return 502 for otherwise pinned packages.
+    # Bound retries per download; retain the snapshot and package/hash checks.
+    mkdir -p /etc/apt/apt.conf.d
+    printf 'Acquire::Retries "5";\n' > /etc/apt/apt.conf.d/80zerofs-retries
     # The minimal base images may not contain a current CA bundle. APT still
     # authenticates the signed repository metadata during this bootstrap.
     apt-get \
