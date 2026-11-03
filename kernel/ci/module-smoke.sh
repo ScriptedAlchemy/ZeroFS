@@ -263,6 +263,7 @@ resolve_artifact() {
     local manifest=$1
     local target_id=$2
     local artifact_dir=$3
+    local artifact_listing
     local entry
     local kind
     local path
@@ -294,7 +295,9 @@ resolve_artifact() {
     export ZEROFS_TARGET_ID=$target_id
     export ZEROFS_KERNEL_RELEASE=$kernel_release
     export ZEROFS_TARGET_ARCH=$arch
-    mapfile -t artifact_entries < <(
+    # Process substitution hides the resolver's exit status from mapfile.
+    # Admit its output only after every listed artifact has been validated.
+    if ! artifact_listing=$(
         python3 - "$artifact_dir/artifact.json" <<'PY'
 import hashlib
 import json
@@ -363,7 +366,10 @@ for index, relative in enumerate(dependencies):
 for index, relative in enumerate(boot_modules):
     print(f"boot\t{resolve(relative, f'boot_modules[{index}]')}")
 PY
-    )
+    ); then
+        die "artifact manifest validation failed"
+    fi
+    mapfile -t artifact_entries <<< "$artifact_listing"
 
     kernel_image=
     module=
