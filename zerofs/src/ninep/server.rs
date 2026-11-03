@@ -45,7 +45,7 @@ pub(crate) use admission::{P9AcceptedWorkTracker, P9GlobalAdmission};
 #[cfg(test)]
 use frame_codec::{
     FidFootprint, P9_RWRITE_MAX_SIZE, ShallowFrameMetadata, inspect_frame_metadata,
-    possible_response_bytes, read_9p_frame,
+    possible_frame_response_bytes, possible_response_bytes, read_9p_frame,
 };
 #[cfg(any(feature = "webui", test))]
 #[allow(unused_imports)]
@@ -411,6 +411,145 @@ mod tests {
             2 * P9_MAX_MSIZE as usize,
             "a large read retains its source payload while serializing the wire response"
         );
+    }
+
+    fn encoded_read(count: u32) -> Vec<u8> {
+        P9Message::new(
+            7,
+            Message::Tread(ninep_proto::Tread {
+                fid: 1,
+                offset: 0,
+                count,
+            }),
+        )
+        .to_bytes()
+        .unwrap()
+    }
+
+    #[test]
+    fn read_response_credit_validates_frame_shape_and_bounds_count() {
+        for count in [0, 4096, 128 * 1024, u32::MAX] {
+            let frame = encoded_read(count);
+            let payload = count.min(P9_MAX_MSIZE - ninep_proto::P9_IOHDRSZ) as usize;
+            assert_eq!(
+                possible_frame_response_bytes(&frame),
+                2 * (ninep_proto::P9_IOHDRSZ as usize + payload.max(crate::fs::EXTENT_SIZE))
+            );
+            let mut truncated = frame.clone();
+            truncated.pop();
+            let mut extended = frame.clone();
+            extended.push(0);
+            let mut wrong_size = frame;
+            wrong_size[..4].copy_from_slice(&7u32.to_le_bytes());
+            for malformed in [truncated, extended, wrong_size] {
+                assert_eq!(
+                    possible_frame_response_bytes(&malformed),
+                    2 * P9_MAX_MSIZE as usize
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn small_reads_fill_the_request_pipeline_within_existing_byte_limits() {
+        let global = P9GlobalAdmission::for_test(GLOBAL_INFLIGHT_MEMORY, GLOBAL_INFLIGHT_REQUESTS);
+        let connection =
+            global.connection_for_test(CONNECTION_INFLIGHT_MEMORY, CONNECTION_INFLIGHT_REQUESTS);
+        let frame = encoded_read(128 * 1024);
+        let mut admitted = Vec::new();
+        for _ in 0..CONNECTION_INFLIGHT_REQUESTS {
+            admitted.push(
+                tokio::time::timeout(
+                    TEST_TIMEOUT,
+                    connection.admit_request(frame.len(), possible_frame_response_bytes(&frame)),
+                )
+                .await
+                .expect("small reads exhausted the byte budget before the request budget")
+                .unwrap(),
+            );
+        }
+        assert!(global.snapshot().reserved_bytes < CONNECTION_INFLIGHT_MEMORY);
+        drop(admitted);
+        assert_eq!(global.snapshot().reserved_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn download_read_window_leaves_admission_for_liveness() {
+        let global = P9GlobalAdmission::for_test(GLOBAL_INFLIGHT_MEMORY, GLOBAL_INFLIGHT_REQUESTS);
+        let connection =
+            global.connection_for_test(CONNECTION_INFLIGHT_MEMORY, CONNECTION_INFLIGHT_REQUESTS);
+        // Reproduce the old geometry: three upload-sized reads fit, but the
+        // fourth blocks the receive loop and the probe cannot be admitted.
+        let large = encoded_read(9 * 1024 * 1024);
+        let mut previous = Vec::new();
+        for _ in 0..3 {
+            previous.push(
+                connection
+                    .admit_request(large.len(), possible_frame_response_bytes(&large))
+                    .await
+                    .unwrap(),
+            );
+        }
+        let mut fourth =
+            Box::pin(connection.admit_request(large.len(), possible_frame_response_bytes(&large)));
+        assert!(futures::poll!(&mut fourth).is_pending());
+        let probe = P9Message::new(9, Message::Tgetlineage(ninep_proto::Tgetlineage))
+            .to_bytes()
+            .unwrap();
+        let mut blocked_probe =
+            Box::pin(connection.admit_request(probe.len(), possible_frame_response_bytes(&probe)));
+        assert!(futures::poll!(&mut blocked_probe).is_pending());
+        drop(blocked_probe);
+        drop(fourth);
+        drop(previous);
+        // The CLI's wire-level regression separately verifies this geometry.
+        // Retain every reply credit, as a slow backend does, while admitting
+        // the real lineage probe used by the client's reply-timeout path.
+        let frame = encoded_read(1024 * 1024);
+        let mut reads = Vec::new();
+        for _ in 0..8 {
+            reads.push(
+                connection
+                    .admit_request(frame.len(), possible_frame_response_bytes(&frame))
+                    .await
+                    .unwrap(),
+            );
+        }
+        let admitted_probe = tokio::time::timeout(
+            TEST_TIMEOUT,
+            connection.admit_request(probe.len(), possible_frame_response_bytes(&probe)),
+        )
+        .await
+        .expect("slow download reads must not prevent a liveness reply")
+        .unwrap();
+        drop(admitted_probe);
+        drop(reads);
+        assert_eq!(global.snapshot().reserved_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn maximum_reads_still_obey_connection_byte_backpressure() {
+        let global = P9GlobalAdmission::for_test(GLOBAL_INFLIGHT_MEMORY, GLOBAL_INFLIGHT_REQUESTS);
+        let connection =
+            global.connection_for_test(CONNECTION_INFLIGHT_MEMORY, CONNECTION_INFLIGHT_REQUESTS);
+        let frame = encoded_read(u32::MAX);
+        let mut admitted = Vec::new();
+        for _ in 0..3 {
+            admitted.push(
+                connection
+                    .admit_request(frame.len(), possible_frame_response_bytes(&frame))
+                    .await
+                    .unwrap(),
+            );
+        }
+        let mut fourth =
+            Box::pin(connection.admit_request(frame.len(), possible_frame_response_bytes(&frame)));
+        assert!(futures::poll!(&mut fourth).is_pending());
+        drop(admitted.pop());
+        tokio::time::timeout(TEST_TIMEOUT, fourth)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1853,6 +1992,106 @@ mod tests {
                 .unwrap(),
             cached_inode
         );
+    }
+
+    async fn blocked_first_reserves_replay_before_admission(cancel_process: bool) {
+        let filesystem = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let old = Arc::new(NinePHandler::new(
+            Arc::clone(&filesystem),
+            Arc::new(FileLockManager::new()),
+        ));
+        let replacement =
+            NinePHandler::new(Arc::clone(&filesystem), Arc::new(FileLockManager::new()));
+        for handler in [&*old, &replacement] {
+            establish_session(handler, 1, b"root", 0, None).await;
+        }
+
+        let op_id = [0x64; 16];
+        let mkdir = Message::Tmkdir(Tmkdir {
+            dfid: 1,
+            name: P9String::new(b"received-before-admission".to_vec()),
+            mode: 0o755,
+            gid: 0,
+        });
+        let first = P9Message::new_with_op_id(10, op_id, mkdir.clone())
+            .to_bytes_ctx(true)
+            .unwrap();
+        let (tx, mut rx) = mpsc::channel(2);
+        let inflight = InflightRegistry::default();
+        let byte_limit = P9_MAX_MSIZE as usize * 2;
+        let global = P9GlobalAdmission::for_test(byte_limit, 1);
+        let admission = global.connection_for_test(byte_limit, 1);
+        let blocked = admission.admit_request(1, 0).await.unwrap();
+        let requests = TaskTracker::new();
+        let connection_shutdown = CancellationToken::new();
+        let process_shutdown = CancellationToken::new();
+        let dispatch = dispatch_9p_frame(
+            Bytes::from(first),
+            &old,
+            &tx,
+            &inflight,
+            &admission,
+            &requests,
+            &connection_shutdown,
+            &process_shutdown,
+        );
+        tokio::pin!(dispatch);
+        assert!(futures::poll!(&mut dispatch).is_pending());
+        assert_eq!(
+            filesystem.dedup.stats().inflight_ids,
+            1,
+            "a fully received FIRST must reserve its identity before waiting for capacity"
+        );
+        assert_eq!(admission.accepted_work.len(), 1);
+        assert_eq!(global.snapshot().active_requests, 1);
+
+        if cancel_process {
+            process_shutdown.cancel();
+            assert!(dispatch.await.is_err());
+            assert_eq!(filesystem.dedup.stats().inflight_ids, 0);
+            assert_eq!(admission.accepted_work.len(), 0);
+            drop(blocked);
+            assert_eq!(global.snapshot().reserved_bytes, 0);
+            return;
+        }
+
+        old.close_for_disconnect();
+        connection_shutdown.cancel();
+        let retry = replacement.handle_message_with_op_envelope_origin(
+            11,
+            op_id,
+            ninep_proto::P9_OP_FLAG_RETRY,
+            0,
+            mkdir,
+        );
+        tokio::pin!(retry);
+        assert!(
+            futures::poll!(&mut retry).is_pending(),
+            "a reconnect retry must join the received FIRST, not report ESTALE"
+        );
+
+        drop(blocked);
+        dispatch.await.unwrap();
+        let replayed = tokio::time::timeout(TEST_TIMEOUT, retry)
+            .await
+            .expect("retry must finish when request capacity returns");
+        assert!(matches!(replayed.body, Message::Rmkdir(_)));
+        drop(rx.recv().await.unwrap());
+        requests.close();
+        requests.wait().await;
+        assert_eq!(admission.accepted_work.len(), 0);
+        assert_eq!(global.snapshot().active_requests, 0);
+        assert_eq!(global.snapshot().reserved_bytes, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn received_first_survives_disconnect_while_waiting_for_admission() {
+        blocked_first_reserves_replay_before_admission(false).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn process_shutdown_releases_received_first_waiting_for_admission() {
+        blocked_first_reserves_replay_before_admission(true).await;
     }
 
     #[tokio::test(start_paused = true)]

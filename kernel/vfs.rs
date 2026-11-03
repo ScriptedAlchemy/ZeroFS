@@ -60,9 +60,9 @@ use mount::{
     zerofs_umount_begin,
 };
 use namespace::{
-    zerofs_atomic_open, zerofs_create, zerofs_get_link, zerofs_getattr, zerofs_link, zerofs_lookup,
-    zerofs_mkdir, zerofs_mknod, zerofs_permission, zerofs_rename, zerofs_rmdir, zerofs_setattr,
-    zerofs_symlink, zerofs_unlink,
+    zerofs_atomic_open, zerofs_get_link, zerofs_getattr, zerofs_link, zerofs_lookup, zerofs_mkdir,
+    zerofs_mknod, zerofs_permission, zerofs_rename, zerofs_rmdir, zerofs_setattr, zerofs_symlink,
+    zerofs_unlink,
 };
 pub(crate) use netfs_ops::{run_netfs_read_subrequest, run_netfs_write_subrequest};
 use netfs_ops::{
@@ -99,7 +99,7 @@ const LOCK_RETRY_POLL_MS: u32 = 50;
 const MIN_READAHEAD_WINDOW_BYTES: usize = 1024 * 1024;
 /// Bound speculative page-cache and per-request memory even with a very large
 /// negotiated msize.
-const MAX_READAHEAD_WINDOW_BYTES: usize = 4 * 1024 * 1024;
+const MAX_READAHEAD_WINDOW_BYTES: usize = 32 * 1024 * 1024;
 /// Deeper pipelining stops helping one stream once its request window reaches
 /// this many concurrent subrequests, and bounding it also bounds BDI memory
 /// pressure.
@@ -1512,6 +1512,72 @@ impl InodeSlab {
 
 static INODE_SLAB: InodeSlab = InodeSlab::new();
 
+// Linux 7.4 made inode_operations' mnt_idmap parameter const. The
+// function-pointer ABI is otherwise unchanged: const qualification does not
+// alter the C calling convention, parameter order, or representation. Keep
+// each Rust callback's original typed signature checked at the call site;
+// only adapt its first pointer's qualification to the target kernel binding.
+macro_rules! idmap_callback {
+    ($function:path, $signature:ty) => {{
+        let callback: $signature = $function;
+        // SAFETY: On the supported kernels the destination callback differs
+        // solely in *mut versus *const mnt_idmap; both are C pointers and
+        // Rust never mutates the idmap. No argument is reinterpreted.
+        unsafe { core::mem::transmute(callback) }
+    }};
+}
+
+type MutableIdmapGetattrFn = unsafe extern "C" fn(
+    *mut bindings::mnt_idmap,
+    *const bindings::path,
+    *mut bindings::kstat,
+    u32,
+    ffi::c_uint,
+) -> ffi::c_int;
+
+type MutableIdmapSetattrFn = unsafe extern "C" fn(
+    *mut bindings::mnt_idmap,
+    *mut bindings::dentry,
+    *mut bindings::iattr,
+) -> ffi::c_int;
+
+type MutableIdmapSymlinkFn = unsafe extern "C" fn(
+    *mut bindings::mnt_idmap,
+    *mut bindings::inode,
+    *mut bindings::dentry,
+    *const ffi::c_char,
+) -> ffi::c_int;
+
+type MutableIdmapMkdirFn = unsafe extern "C" fn(
+    *mut bindings::mnt_idmap,
+    *mut bindings::inode,
+    *mut bindings::dentry,
+    bindings::umode_t,
+) -> *mut bindings::dentry;
+
+type MutableIdmapMknodFn = unsafe extern "C" fn(
+    *mut bindings::mnt_idmap,
+    *mut bindings::inode,
+    *mut bindings::dentry,
+    bindings::umode_t,
+    bindings::dev_t,
+) -> ffi::c_int;
+
+type MutableIdmapRenameFn = unsafe extern "C" fn(
+    *mut bindings::mnt_idmap,
+    *mut bindings::inode,
+    *mut bindings::dentry,
+    *mut bindings::inode,
+    *mut bindings::dentry,
+    ffi::c_uint,
+) -> ffi::c_int;
+
+type MutableIdmapPermissionFn = unsafe extern "C" fn(
+    *mut bindings::mnt_idmap,
+    *mut bindings::inode,
+    ffi::c_int,
+) -> ffi::c_int;
+
 /// Initialize operation tables before the containing filesystem is published.
 pub(crate) fn initialize(module: &'static ThisModule) -> Result<()> {
     let netfs_request_operations = netfs::netfs_request_ops {
@@ -1583,34 +1649,36 @@ pub(crate) fn initialize(module: &'static ThisModule) -> Result<()> {
         ..Default::default()
     };
 
-    let directory_inode_operations = bindings::inode_operations {
+    let mut directory_inode_operations = bindings::inode_operations {
         lookup: Some(zerofs_lookup),
         atomic_open: Some(zerofs_atomic_open),
-        getattr: Some(zerofs_getattr),
-        setattr: Some(zerofs_setattr),
-        create: Some(zerofs_create),
+        getattr: Some(idmap_callback!(zerofs_getattr, MutableIdmapGetattrFn)),
+        setattr: Some(idmap_callback!(zerofs_setattr, MutableIdmapSetattrFn)),
         link: Some(zerofs_link),
         unlink: Some(zerofs_unlink),
-        symlink: Some(zerofs_symlink),
-        mkdir: Some(zerofs_mkdir),
+        symlink: Some(idmap_callback!(zerofs_symlink, MutableIdmapSymlinkFn)),
+        mkdir: Some(idmap_callback!(zerofs_mkdir, MutableIdmapMkdirFn)),
         rmdir: Some(zerofs_rmdir),
-        mknod: Some(zerofs_mknod),
-        rename: Some(zerofs_rename),
-        permission: Some(zerofs_permission),
+        mknod: Some(idmap_callback!(zerofs_mknod, MutableIdmapMknodFn)),
+        rename: Some(idmap_callback!(zerofs_rename, MutableIdmapRenameFn)),
+        permission: Some(idmap_callback!(zerofs_permission, MutableIdmapPermissionFn)),
         ..Default::default()
     };
+    // SAFETY: The local operations table is exclusively owned here. The C
+    // bridge selects the callback type from the actual target-kernel headers.
+    unsafe { compat::set_create(&mut directory_inode_operations) };
 
     let file_inode_operations = bindings::inode_operations {
-        getattr: Some(zerofs_getattr),
-        setattr: Some(zerofs_setattr),
-        permission: Some(zerofs_permission),
+        getattr: Some(idmap_callback!(zerofs_getattr, MutableIdmapGetattrFn)),
+        setattr: Some(idmap_callback!(zerofs_setattr, MutableIdmapSetattrFn)),
+        permission: Some(idmap_callback!(zerofs_permission, MutableIdmapPermissionFn)),
         ..Default::default()
     };
 
     let symlink_inode_operations = bindings::inode_operations {
         get_link: Some(zerofs_get_link),
-        getattr: Some(zerofs_getattr),
-        setattr: Some(zerofs_setattr),
+        getattr: Some(idmap_callback!(zerofs_getattr, MutableIdmapGetattrFn)),
+        setattr: Some(idmap_callback!(zerofs_setattr, MutableIdmapSetattrFn)),
         ..Default::default()
     };
 

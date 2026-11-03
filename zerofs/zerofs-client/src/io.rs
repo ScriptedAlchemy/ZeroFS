@@ -5,6 +5,8 @@
 
 use crate::error::ZeroFsError;
 use crate::file::File;
+use bytes::{Bytes, BytesMut};
+use std::collections::VecDeque;
 use std::future::Future;
 use std::io::{self, SeekFrom};
 use std::pin::Pin;
@@ -19,7 +21,7 @@ type BoxFut<T> = Pin<Box<dyn Future<Output = T>>>;
 
 enum State {
     Idle,
-    Reading(BoxFut<Result<bytes::Bytes, ZeroFsError>>),
+    Reading,
     /// A write in flight, plus how many bytes it covers (added to `pos` on success).
     Writing {
         fut: BoxFut<Result<(), ZeroFsError>>,
@@ -32,18 +34,65 @@ enum State {
     },
 }
 
+// Bound speculative payloads independently of both the caller's (often 8 KiB)
+// copy buffer and a potentially much larger negotiated msize.
+const READ_AHEAD_DEPTH: usize = 8;
+const READ_AHEAD_CHUNK: u32 = 1024 * 1024;
+
+enum ReadState {
+    Pending(BoxFut<Result<Bytes, ZeroFsError>>),
+    Ready(Result<Bytes, ZeroFsError>),
+}
+
+struct ReadRequest {
+    len: u32,
+    state: ReadState,
+}
+
+async fn read_chunk(file: Arc<File>, offset: u64, len: u32) -> Result<Bytes, ZeroFsError> {
+    let mut collected = BytesMut::new();
+    while collected.len() < len as usize {
+        let remaining = len - collected.len() as u32;
+        let data = file
+            .read_at(offset + collected.len() as u64, remaining)
+            .await?;
+        if data.len() > remaining as usize {
+            return Err(ZeroFsError::Protocol {
+                message: "read reply exceeds the requested range".into(),
+            });
+        }
+        if data.is_empty() {
+            break;
+        }
+        if collected.is_empty() && data.len() == len as usize {
+            return Ok(data);
+        }
+        if collected.is_empty() {
+            collected = BytesMut::with_capacity(len as usize);
+        }
+        collected.extend_from_slice(&data);
+    }
+    Ok(collected.freeze())
+}
+
 /// An owned cursor over a [`File`] implementing `AsyncRead + AsyncWrite +
 /// AsyncSeek`, built entirely on [`File::read_at`]/[`File::write_at`]. Multiple
 /// cursors over one `File` are safe; each carries its own position and the
 /// underlying I/O is positioned, so there is no shared seek pointer.
 ///
-/// One operation is in flight at a time per cursor (it is driven by `&mut self`
-/// like every async-io adapter); starting a seek while a read or write is
-/// pending is rejected with `io::ErrorKind::Other`.
+/// After the first successful read, contiguous reads use bounded, ordered
+/// read-ahead: up to eight chunks of at most 1 MiB, regardless of the caller's
+/// buffer size. Seek and write discard speculation and reset this promotion,
+/// keeping isolated small reads small. Starting a seek or write while a demand
+/// read is pending is rejected with `io::ErrorKind::Other`.
 pub struct FileCursor {
     file: Arc<File>,
     pos: u64,
     state: State,
+    read_buffer: Bytes,
+    read_ahead: VecDeque<ReadRequest>,
+    next_read_offset: Option<u64>,
+    read_ahead_enabled: bool,
 }
 
 impl FileCursor {
@@ -52,12 +101,66 @@ impl FileCursor {
             file,
             pos: 0,
             state: State::Idle,
+            read_buffer: Bytes::new(),
+            read_ahead: VecDeque::new(),
+            next_read_offset: Some(0),
+            read_ahead_enabled: false,
         }
     }
 
     /// The cursor's current absolute byte offset.
     pub fn position(&self) -> u64 {
         self.pos
+    }
+
+    fn discard_read_ahead(&mut self) {
+        self.read_buffer = Bytes::new();
+        self.read_ahead.clear();
+        self.next_read_offset = Some(self.pos);
+        self.read_ahead_enabled = false;
+    }
+
+    fn poll_read_ahead(&mut self, cx: &mut Context<'_>, initial_len: usize) {
+        let buffered = usize::from(!self.read_buffer.is_empty());
+        let depth = if self.read_ahead_enabled {
+            READ_AHEAD_DEPTH
+        } else {
+            1
+        };
+        while self.read_ahead.len() + buffered < depth {
+            let Some(offset) = self.next_read_offset else {
+                break;
+            };
+            let chunk = self.file.max_read_chunk().clamp(1, READ_AHEAD_CHUNK);
+            let len = if self.read_ahead_enabled {
+                chunk
+            } else {
+                initial_len.min(chunk as usize) as u32
+            };
+            let len = u64::from(len).min(u64::MAX - offset) as u32;
+            if len == 0 {
+                self.next_read_offset = None;
+                break;
+            }
+            self.next_read_offset = Some(offset + u64::from(len));
+            self.read_ahead.push_back(ReadRequest {
+                len,
+                state: ReadState::Pending(Box::pin(read_chunk(
+                    Arc::clone(&self.file),
+                    offset,
+                    len,
+                ))),
+            });
+        }
+        // Poll every request before waiting on the first one. Responses may
+        // arrive in any order, but only the front is exposed to the caller.
+        for request in &mut self.read_ahead {
+            if let ReadState::Pending(future) = &mut request.state {
+                if let Poll::Ready(result) = future.as_mut().poll(cx) {
+                    request.state = ReadState::Ready(result);
+                }
+            }
+        }
     }
 }
 
@@ -67,33 +170,58 @@ impl AsyncRead for FileCursor {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        loop {
-            match &mut self.state {
-                State::Reading(fut) => {
-                    let data = ready!(fut.as_mut().poll(cx));
-                    self.state = State::Idle;
-                    let data = data.map_err(io::Error::from)?;
-                    let n = data.len().min(buf.remaining());
-                    buf.put_slice(&data[..n]);
-                    self.pos += n as u64;
-                    return Poll::Ready(Ok(()));
-                }
-                State::Idle => {
-                    if buf.remaining() == 0 {
-                        return Poll::Ready(Ok(()));
-                    }
-                    // Cap one read at the negotiated chunk so each poll is a
-                    // single round trip; a partial fill is normal for AsyncRead.
-                    let chunk = self.file.max_read_chunk().max(1) as usize;
-                    let len = buf.remaining().min(chunk) as u32;
-                    let offset = self.pos;
-                    let file = Arc::clone(&self.file);
-                    self.state =
-                        State::Reading(Box::pin(async move { file.read_at(offset, len).await }));
-                }
-                _ => return Poll::Ready(Err(busy())),
+        if !matches!(self.state, State::Idle | State::Reading) {
+            return Poll::Ready(Err(busy()));
+        }
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        if matches!(self.state, State::Idle) {
+            if let Err(error) = self.file.check_open() {
+                self.discard_read_ahead();
+                return Poll::Ready(Err(error.into()));
             }
         }
+        self.poll_read_ahead(cx, buf.remaining());
+        if self.read_buffer.is_empty() {
+            if let Some(request) = self.read_ahead.front() {
+                if matches!(request.state, ReadState::Pending(_)) {
+                    self.state = State::Reading;
+                    return Poll::Pending;
+                }
+                let request = self.read_ahead.pop_front().unwrap();
+                let ReadState::Ready(result) = request.state else {
+                    unreachable!();
+                };
+                self.state = State::Idle;
+                let data = match result {
+                    Ok(data) => data,
+                    Err(error) => {
+                        self.discard_read_ahead();
+                        return Poll::Ready(Err(error.into()));
+                    }
+                };
+                if data.len() < request.len as usize {
+                    self.read_ahead.clear();
+                    self.next_read_offset = None;
+                }
+                self.read_buffer = data;
+            }
+            if self.read_buffer.is_empty() {
+                // Report EOF once, then allow a later read to observe growth.
+                self.next_read_offset = Some(self.pos);
+                self.read_ahead_enabled = false;
+                self.state = State::Idle;
+                return Poll::Ready(Ok(()));
+            }
+        }
+        let n = self.read_buffer.len().min(buf.remaining());
+        buf.put_slice(&self.read_buffer.split_to(n));
+        self.pos += n as u64;
+        // Promote the next call, not this one: a read followed by a seek must
+        // not launch speculative ranges that the caller will immediately drop.
+        self.read_ahead_enabled = true;
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -111,12 +239,14 @@ impl AsyncWrite for FileCursor {
                     self.state = State::Idle;
                     res.map_err(io::Error::from)?;
                     self.pos += len;
+                    self.next_read_offset = Some(self.pos);
                     return Poll::Ready(Ok(len as usize));
                 }
                 State::Idle => {
                     if buf.is_empty() {
                         return Poll::Ready(Ok(0));
                     }
+                    self.discard_read_ahead();
                     // write_at writes all of `data` (chunked internally), so one
                     // poll consumes the whole buffer.
                     let offset = self.pos;
@@ -144,6 +274,7 @@ impl AsyncWrite for FileCursor {
                 self.state = State::Idle;
                 res.map_err(io::Error::from)?;
                 self.pos += len;
+                self.next_read_offset = Some(self.pos);
                 Poll::Ready(Ok(()))
             }
             _ => Poll::Ready(Ok(())),
@@ -160,6 +291,7 @@ impl AsyncSeek for FileCursor {
         if !matches!(self.state, State::Idle) {
             return Err(busy());
         }
+        self.discard_read_ahead();
         match position {
             SeekFrom::Start(n) => self.pos = n,
             SeekFrom::Current(delta) => {
@@ -176,6 +308,7 @@ impl AsyncSeek for FileCursor {
                 };
             }
         }
+        self.next_read_offset = Some(self.pos);
         Ok(())
     }
 
@@ -186,6 +319,7 @@ impl AsyncSeek for FileCursor {
             self.state = State::Idle;
             let size = size.map_err(io::Error::from)?;
             self.pos = size.checked_add_signed(delta).ok_or_else(negative_seek)?;
+            self.next_read_offset = Some(self.pos);
         }
         Poll::Ready(Ok(self.pos))
     }

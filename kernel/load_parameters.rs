@@ -8,6 +8,21 @@ use core::{cell::UnsafeCell, ptr};
 
 use kernel::{bindings, ffi};
 
+// Use the stable module-loader symbol instead of a Rust macro's generated
+// identifier. Newer kernels expose THIS_MODULE through ModuleMetadata only.
+#[cfg(MODULE)]
+const MODULE_OWNER: *mut bindings::module = {
+    unsafe extern "C" {
+        static __this_module: kernel::types::Opaque<bindings::module>;
+    }
+    // SAFETY: The loader constructs this symbol before reading parameters and
+    // retains it until the module and its parameter descriptors are unloaded.
+    unsafe { __this_module.get() }
+};
+
+#[cfg(not(MODULE))]
+const MODULE_OWNER: *mut bindings::module = ptr::null_mut();
+
 #[repr(transparent)]
 pub(super) struct ModuleParameter<T>(UnsafeCell<T>);
 
@@ -67,7 +82,7 @@ macro_rules! module_parameter {
             #[used(compiler)]
             static DESCRIPTOR: RegisteredParameter = RegisteredParameter(bindings::kernel_param {
                 name: kernel::str::as_char_ptr_in_const_context(PARAMETER_NAME),
-                mod_: super::THIS_MODULE.as_ptr(),
+                mod_: MODULE_OWNER,
                 // `param_ops_*` are immutable, exported kernel descriptors
                 // that remain live for the module's lifetime.
                 ops: core::ptr::addr_of!(bindings::$ops),

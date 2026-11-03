@@ -462,6 +462,233 @@ async fn read_ahead_skip_at_cap_keeps_coverage_honest() {
     h.unwrap().await.unwrap();
 }
 
+#[test]
+fn lagging_read_completion_preserves_the_forward_sequence() {
+    let mib = 1024 * 1024;
+    let (first, _) = plan_read_ahead((0, 0, 0), 0, mib);
+    let (ahead, _) = plan_read_ahead(first, 2 * mib, mib);
+    let (lagging, plan) = plan_read_ahead(ahead, mib, mib);
+    assert_eq!(
+        lagging, ahead,
+        "an earlier completed read reset the forward stream"
+    );
+    assert!(plan.is_none());
+    let (_, plan) = plan_read_ahead(lagging, 3 * mib, mib);
+    assert!(
+        plan.is_some(),
+        "forward continuation lost its sequential history"
+    );
+}
+
+#[tokio::test]
+async fn read_ahead_records_only_the_prefix_admitted_by_the_global_budget() {
+    let (store, _db) = make().await;
+    let held: Vec<_> = (0..READ_AHEAD_MAX_CONCURRENT - 1)
+        .map(|_| Arc::clone(&store.prefetch_sem).try_acquire_owned().unwrap())
+        .collect();
+    let mib = 1024 * 1024;
+    assert!(store.trigger_read_ahead(1, 0, mib).is_none());
+    let task = store.trigger_read_ahead(1, mib, mib).unwrap();
+    let (_, prefetched_to, _) = store.read_ahead.get(&1).map(|entry| *entry).unwrap();
+    assert_eq!(
+        prefetched_to,
+        3 * mib,
+        "unadmitted ranges were recorded as covered"
+    );
+    task.await.unwrap();
+    drop(held);
+    assert_eq!(
+        store.prefetch_sem.available_permits(),
+        READ_AHEAD_MAX_CONCURRENT
+    );
+}
+
+#[tokio::test]
+async fn logical_read_ahead_fetches_same_segment_ranges_in_parallel() {
+    let (writer, db, inner) = make_with_compression(CompressionConfig::Lz4).await;
+    let mib = 1024 * 1024;
+    let payload = Bytes::from(vec![0x5a; 10 * mib]);
+    write_committed(&writer, &db, 1, 0, &payload, 0).await;
+    writer.seal_open().await.unwrap();
+    let (gated, gate) = GatedGetStore::wrap(inner);
+    let store = make_store(gated, db, CompressionConfig::Lz4, 8);
+    assert_eq!(
+        store.read(1, 0, mib as u64).await.unwrap(),
+        payload.slice(..mib)
+    );
+    gate.hold();
+    let mut task = store.trigger_read_ahead(1, mib as u64, mib as u64).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let started = gate.started.notified();
+            if gate.peak() >= 2 {
+                break;
+            }
+            tokio::select! {
+                _ = started => {},
+                result = &mut task => panic!("same-segment read-ahead did not fetch in parallel: {result:?}"),
+            }
+        }
+    }).await.expect("file-aware read-ahead did not start multiple independent ranges");
+    assert!(gate.peak() <= READ_AHEAD_MAX_CONCURRENT);
+    gate.release();
+    task.await.unwrap();
+    let before = store.segments.read_calls();
+    let cached = store
+        .read_range(1, 2 * mib as u64, 8 * mib as u64, true)
+        .await
+        .unwrap();
+    assert_eq!(cached, payload.slice(2 * mib..));
+    assert_eq!(
+        store.segments.read_calls(),
+        before,
+        "logical prefetch did not warm the requested file"
+    );
+    assert_eq!(
+        store.prefetch_sem.available_permits(),
+        READ_AHEAD_MAX_CONCURRENT
+    );
+}
+
+#[tokio::test]
+async fn read_ahead_coalesces_useful_ranges_without_expanding_coverage() {
+    use rand::{RngCore, SeedableRng};
+
+    let (writer, db, inner) = make_with_compression(CompressionConfig::Lz4).await;
+    let mib = 1024 * 1024;
+    let mut payload = vec![0; 12 * mib];
+    rand::rngs::StdRng::seed_from_u64(0x5f7f).fill_bytes(&mut payload);
+    let payload = Bytes::from(payload);
+    write_committed(&writer, &db, 1, 0, &payload, 0).await;
+    writer.seal_open().await.unwrap();
+    let (gated, gate) = GatedGetStore::wrap(inner);
+    let store = make_store(gated, db.clone(), CompressionConfig::Lz4, 8);
+    assert_eq!(
+        store.read(1, 0, mib as u64).await.unwrap(),
+        payload.slice(..mib)
+    );
+    gate.ranges.lock().unwrap().clear();
+    gate.hold();
+    let task = store.trigger_read_ahead(1, mib as u64, mib as u64).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while gate.peak() < 2 {
+            gate.started.notified().await;
+        }
+    })
+    .await
+    .expect("coalesced ranges must still run concurrently");
+    assert_eq!(
+        store.prefetch_sem.available_permits(),
+        READ_AHEAD_MAX_CONCURRENT - 8,
+        "an 8 MiB window must still hold eight 1 MiB credits"
+    );
+    gate.release();
+    task.await.unwrap();
+
+    let ranges = gate.ranges.lock().unwrap().clone();
+    // Four 2 MiB reads, plus at most one additional run where this random,
+    // incompressible file crosses the fixture's 8 MiB segment boundary.
+    assert!(
+        ranges.len() <= 5,
+        "an 8 MiB window opened {} object ranges",
+        ranges.len()
+    );
+    let mut expected = HashMap::<String, Vec<std::ops::Range<u64>>>::new();
+    for extent in 2 * mib / EXTENT_SIZE..10 * mib / EXTENT_SIZE {
+        let location = frameloc_of(&writer, &db, 1, extent as u64).await.unwrap();
+        expected
+            .entry(location.segid.object_key())
+            .or_default()
+            .push(location.byte_offset..location.byte_offset + u64::from(location.byte_len));
+    }
+    assert!(
+        ranges
+            .iter()
+            .all(|(location, _)| expected.contains_key(location.as_ref())),
+        "read-ahead fetched an object outside the requested file frames"
+    );
+    println!(
+        "8 MiB logical read-ahead used {} backend GETs",
+        ranges.len()
+    );
+    for (path, expected) in expected {
+        let mut actual = ranges
+            .iter()
+            .filter_map(|(location, range)| {
+                if location.as_ref() != path {
+                    return None;
+                }
+                match range {
+                    object_store::GetRange::Bounded(range) => Some(range.clone()),
+                    _ => panic!("file read-ahead must use bounded ranges"),
+                }
+            })
+            .collect::<Vec<_>>();
+        actual.sort_by_key(|range| range.start);
+        assert_eq!(
+            actual.first().unwrap().start,
+            expected.first().unwrap().start
+        );
+        assert_eq!(actual.last().unwrap().end, expected.last().unwrap().end);
+        assert!(actual.windows(2).all(|pair| pair[0].end == pair[1].start));
+        assert_eq!(
+            actual
+                .iter()
+                .map(|range| range.end - range.start)
+                .sum::<u64>(),
+            expected
+                .iter()
+                .map(|range| range.end - range.start)
+                .sum::<u64>(),
+            "read-ahead fetched bytes outside the requested file frames"
+        );
+    }
+    let before = store.segments.read_calls();
+    let got = store
+        .read_range(1, 2 * mib as u64, 8 * mib as u64, true)
+        .await
+        .unwrap();
+    assert_eq!(got, payload.slice(2 * mib..10 * mib));
+    assert_eq!(store.segments.read_calls(), before);
+    assert_eq!(
+        store.prefetch_sem.available_permits(),
+        READ_AHEAD_MAX_CONCURRENT
+    );
+}
+
+#[tokio::test]
+async fn cancelled_coalesced_read_ahead_releases_every_byte_credit() {
+    let (writer, db, inner) = make_with_compression(CompressionConfig::Lz4).await;
+    let mib = 1024 * 1024;
+    let payload = Bytes::from(vec![0x5a; 10 * mib]);
+    write_committed(&writer, &db, 1, 0, &payload, 0).await;
+    writer.seal_open().await.unwrap();
+    let (gated, gate) = GatedGetStore::wrap(inner);
+    let store = make_store(gated, db, CompressionConfig::Lz4, 8);
+    store.read(1, 0, mib as u64).await.unwrap();
+    gate.hold();
+    let task = store.trigger_read_ahead(1, mib as u64, mib as u64).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while gate.peak() < 2 {
+            gate.started.notified().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        store.prefetch_sem.available_permits(),
+        READ_AHEAD_MAX_CONCURRENT - 8
+    );
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert_eq!(
+        store.prefetch_sem.available_permits(),
+        READ_AHEAD_MAX_CONCURRENT
+    );
+    assert_eq!(gate.active.load(Ordering::SeqCst), 0);
+    gate.release();
+}
+
 use crate::fault_store::FaultStore;
 use futures::stream::BoxStream;
 use object_store::memory::InMemory;
@@ -480,6 +707,7 @@ struct GetGate {
     peak: AtomicUsize,
     started: Notify,
     release: Notify,
+    ranges: std::sync::Mutex<Vec<(Path, object_store::GetRange)>>,
 }
 
 impl GetGate {
@@ -490,6 +718,7 @@ impl GetGate {
             peak: AtomicUsize::new(0),
             started: Notify::new(),
             release: Notify::new(),
+            ranges: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -511,6 +740,14 @@ impl GetGate {
 struct GatedGetStore {
     inner: Arc<dyn ObjectStore>,
     gate: Arc<GetGate>,
+}
+
+struct ActiveGet(Arc<GetGate>);
+
+impl Drop for ActiveGet {
+    fn drop(&mut self) {
+        self.0.active.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl GatedGetStore {
@@ -557,6 +794,14 @@ impl ObjectStore for GatedGetStore {
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
         let now = self.gate.active.fetch_add(1, Ordering::SeqCst) + 1;
+        let _active = ActiveGet(Arc::clone(&self.gate));
+        if let Some(range) = &options.range {
+            self.gate
+                .ranges
+                .lock()
+                .unwrap()
+                .push((location.clone(), range.clone()));
+        }
         self.gate.peak.fetch_max(now, Ordering::SeqCst);
         self.gate.started.notify_waiters();
         while self.gate.hold.load(Ordering::SeqCst) {
@@ -566,9 +811,7 @@ impl ObjectStore for GatedGetStore {
             }
             notified.await;
         }
-        let result = self.inner.get_opts(location, options).await;
-        self.gate.active.fetch_sub(1, Ordering::SeqCst);
-        result
+        self.inner.get_opts(location, options).await
     }
 
     fn delete_stream(

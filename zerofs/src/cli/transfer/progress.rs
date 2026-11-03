@@ -310,6 +310,11 @@ impl FileProgress {
         self.bar.inc(bytes);
     }
 
+    #[cfg(test)]
+    pub(super) fn transferred_bytes(&self) -> u64 {
+        self.bar.position()
+    }
+
     pub(super) fn finish(self) {
         let bytes = self.bar.position();
         self.progress.multi.remove(&self.bar);
