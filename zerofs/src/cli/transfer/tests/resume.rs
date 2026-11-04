@@ -12,7 +12,7 @@ async fn upload_skips_materialized_same_length_files() {
     let progress = Progress::new("upload", plan.total_bytes, plan.files.len());
 
     execute_upload(
-        &upload_workers(std::slice::from_ref(&client)),
+        &single_connection_workers(std::slice::from_ref(&client)),
         plan,
         Path::new("/dest/book.m4b"),
         true,
@@ -51,7 +51,7 @@ async fn directory_skips_complete_files_and_replaces_partial_files() {
     let progress = Progress::new("upload", plan.total_bytes, plan.files.len());
 
     execute_upload(
-        &upload_workers(std::slice::from_ref(&client)),
+        &single_connection_workers(std::slice::from_ref(&client)),
         plan,
         Path::new("/dest"),
         true,
@@ -83,7 +83,7 @@ async fn rechecks_local_source_before_skipping() {
     fs::write(&source, b"x").unwrap();
 
     let error = execute_upload(
-        &upload_workers(std::slice::from_ref(&client)),
+        &single_connection_workers(std::slice::from_ref(&client)),
         plan,
         Path::new("/dest/book.m4b"),
         true,
@@ -112,7 +112,7 @@ async fn retry_rewrites_a_same_length_file_left_by_the_first_attempt() {
     let observed_attempts = Arc::clone(&attempts);
 
     run_file_workers(
-        &upload_workers(std::slice::from_ref(&client)),
+        &single_connection_workers(std::slice::from_ref(&client)),
         plan.files,
         progress.clone(),
         CancellationToken::new(),

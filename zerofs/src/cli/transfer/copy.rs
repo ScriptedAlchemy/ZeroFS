@@ -1,4 +1,4 @@
-use super::UploadWorker;
+use super::TransferWorker;
 use super::local_destination::LocalFileTarget;
 use super::plan::PlannedFile;
 use super::progress::{FileProgress, Progress};
@@ -21,7 +21,7 @@ const DOWNLOAD_CHUNK_SIZE: u32 = 1024 * 1024;
 const DOWNLOAD_PIPELINE_DEPTH: usize = 8;
 
 pub(super) async fn upload_file(
-    worker: UploadWorker,
+    worker: TransferWorker,
     planned: PlannedFile,
     destination: PathBuf,
     resume: bool,
@@ -128,7 +128,7 @@ pub(super) async fn upload_file(
 }
 
 pub(super) async fn download_file(
-    client: Arc<Client>,
+    worker: TransferWorker,
     planned: PlannedFile,
     destination: LocalFileTarget,
     progress: Progress,
@@ -137,24 +137,69 @@ pub(super) async fn download_file(
     if cancellation.is_cancelled() {
         bail!("download cancelled");
     }
+    let clients = worker.clients();
+    if clients.is_empty() {
+        bail!("download requires a 9P client");
+    }
     let file_progress = progress.start_file(progress_path(&planned), planned.size);
-    let remote = client
-        .open(&planned.source, OpenOptions::read_only())
-        .await
-        .with_context(|| format!("open remote source {}", planned.source.display()))?;
+    let mut remotes = Vec::new();
+    let opened = async {
+        let connection_count = if planned.size > u64::from(DOWNLOAD_CHUNK_SIZE) {
+            clients.len()
+        } else {
+            1
+        };
+        for client in clients.iter().take(connection_count) {
+            remotes.push(
+                client
+                    .open(&planned.source, OpenOptions::read_only())
+                    .await
+                    .with_context(|| format!("open remote source {}", planned.source.display()))?,
+            );
+        }
+        let expected = remotes[0].metadata().await?;
+        if expected.size != planned.size {
+            bail!(
+                "remote source changed while downloading: {}",
+                planned.source.display()
+            );
+        }
+        for remote in remotes.iter().skip(1) {
+            let metadata = remote.metadata().await?;
+            if (metadata.ino, metadata.size, metadata.mtime, metadata.ctime)
+                != (expected.ino, expected.size, expected.mtime, expected.ctime)
+            {
+                bail!(
+                    "remote source changed between download connections: {}",
+                    planned.source.display()
+                );
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    if let Err(error) = opened {
+        close_remote_files(&remotes).await;
+        return Err(error);
+    }
     let temporary = destination.create_temporary();
     let mut temporary = match temporary {
         Ok(temporary) => temporary,
         Err(error) => {
-            remote.close().await;
+            close_remote_files(&remotes).await;
             return Err(error);
         }
     };
     let result = stream_download(
-        &remote,
+        &remotes,
         &mut temporary.file,
         &planned,
-        client.capabilities().max_read_chunk.max(1),
+        clients
+            .iter()
+            .map(|client| client.capabilities().max_read_chunk)
+            .min()
+            .unwrap_or(1)
+            .max(1),
         &file_progress,
         &cancellation,
     )
@@ -166,7 +211,7 @@ pub(super) async fn download_file(
             destination.path().display()
         )
     });
-    remote.close().await;
+    close_remote_files(&remotes).await;
     let result = match result {
         Ok(()) => temporary
             .file
@@ -397,13 +442,16 @@ async fn open_local_source(planned: &PlannedFile) -> Result<tokio::fs::File> {
 }
 
 pub(super) async fn stream_download(
-    remote: &zerofs_client::File,
+    remotes: &[Arc<File>],
     local: &mut tokio::fs::File,
     planned: &PlannedFile,
     chunk_size: u32,
     progress: &FileProgress,
     cancellation: &CancellationToken,
 ) -> Result<()> {
+    if remotes.is_empty() {
+        bail!("download requires at least one remote file handle");
+    }
     if chunk_size == 0 {
         bail!("download chunk size must be positive");
     }
@@ -419,12 +467,14 @@ pub(super) async fn stream_download(
         Some((offset, wanted))
     });
     let reads = futures::stream::iter(ranges)
-        .map(|(offset, wanted)| async move {
+        .enumerate()
+        .map(|(index, (offset, wanted))| async move {
+            let remote = &remotes[index % remotes.len()];
             read_download_range(remote, &planned.source, offset, wanted)
                 .await
                 .map(|chunk| (offset, chunk))
         })
-        .buffered(DOWNLOAD_PIPELINE_DEPTH);
+        .buffered(DOWNLOAD_PIPELINE_DEPTH * remotes.len());
     futures::pin_mut!(reads);
     let mut offset = 0u64;
     loop {
@@ -454,7 +504,7 @@ pub(super) async fn stream_download(
     let trailing = tokio::select! {
         biased;
         _ = cancellation.cancelled() => bail!("download cancelled"),
-        result = remote.read_at(offset, 1) => {
+        result = remotes[0].read_at(offset, 1) => {
             result.with_context(|| format!("check remote source length at offset {offset}"))?
         }
     };
