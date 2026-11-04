@@ -205,8 +205,7 @@ jobs:
           kernel_major=${ZEROFS_CI_KERNEL%%.*}
           if [[ "$ZEROFS_CI_KERNEL" == *-rc* ]]; then
             archive="linux-${ZEROFS_CI_KERNEL}.tar.gz"
-            source_url="https://git.kernel.org/pub/scm/linux/kernel/git"
-            source_url+="/torvalds/linux.git/snapshot/$archive"
+            source_url="https://codeload.github.com/torvalds/linux/tar.gz/refs/tags/v${ZEROFS_CI_KERNEL}"
           else
             archive="linux-${ZEROFS_CI_KERNEL}.tar.xz"
             source_url="https://cdn.kernel.org/pub/linux/kernel"

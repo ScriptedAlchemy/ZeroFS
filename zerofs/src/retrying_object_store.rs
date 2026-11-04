@@ -8,6 +8,7 @@
 //! reconciles ambiguous writes by reading the record before continuing.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -258,12 +259,30 @@ impl ObjectStore for RetryingObjectStore {
                 let inner = Arc::clone(&inner);
                 async move {
                     let loc = loc?;
-                    (|| async { inner.delete(&loc).await })
+                    // A remote DELETE may apply and lose its acknowledgement.
+                    // A later NotFound then proves the requested absence, but
+                    // an initial NotFound must keep its ordinary error semantics.
+                    let retried_transient = AtomicBool::new(false);
+                    let result = (|| async { inner.delete(&loc).await })
                         .retry(Self::retry_builder())
                         .notify(Self::notify)
-                        .when(Self::should_retry)
-                        .await?;
-                    Ok(loc)
+                        .when(|error| {
+                            let retry = Self::should_retry(error);
+                            if retry {
+                                retried_transient.store(true, Ordering::Relaxed);
+                            }
+                            retry
+                        })
+                        .await;
+                    match result {
+                        Ok(()) => Ok(loc),
+                        Err(object_store::Error::NotFound { .. })
+                            if retried_transient.load(Ordering::Relaxed) =>
+                        {
+                            Ok(loc)
+                        }
+                        Err(error) => Err(error),
+                    }
                 }
             })
             .buffered(RETRY_DELETE_CONCURRENCY)
@@ -368,6 +387,8 @@ mod tests {
         puts: AtomicUsize,
         truncate_gets: AtomicUsize,
         delete_barrier: Option<Arc<Barrier>>,
+        lost_delete_reply: Option<Arc<AtomicUsize>>,
+        delete_attempts: Arc<AtomicUsize>,
         deletes_in_flight: Arc<AtomicUsize>,
         peak_deletes_in_flight: Arc<AtomicUsize>,
     }
@@ -383,6 +404,8 @@ mod tests {
                 puts: AtomicUsize::new(0),
                 truncate_gets: AtomicUsize::new(0),
                 delete_barrier: None,
+                lost_delete_reply: None,
+                delete_attempts: Arc::new(AtomicUsize::new(0)),
                 deletes_in_flight: Arc::new(AtomicUsize::new(0)),
                 peak_deletes_in_flight: Arc::new(AtomicUsize::new(0)),
             }
@@ -391,6 +414,13 @@ mod tests {
         fn with_delete_barrier(inner: Arc<dyn ObjectStore>, participants: usize) -> Self {
             Self {
                 delete_barrier: Some(Arc::new(Barrier::new(participants))),
+                ..Self::new(inner)
+            }
+        }
+
+        fn with_lost_delete_reply(inner: Arc<dyn ObjectStore>) -> Self {
+            Self {
+                lost_delete_reply: Some(Arc::new(AtomicUsize::new(1))),
                 ..Self::new(inner)
             }
         }
@@ -494,6 +524,29 @@ mod tests {
                             peak_deletes_in_flight.fetch_max(current, Ordering::SeqCst);
                             barrier.wait().await;
                             deletes_in_flight.fetch_sub(1, Ordering::SeqCst);
+                            Ok(location)
+                        }
+                    })
+                    .boxed();
+            }
+            if let Some(lost_reply) = self.lost_delete_reply.clone() {
+                let inner = Arc::clone(&self.inner);
+                let attempts = Arc::clone(&self.delete_attempts);
+                return locations
+                    .then(move |location| {
+                        let inner = Arc::clone(&inner);
+                        let lost_reply = Arc::clone(&lost_reply);
+                        let attempts = Arc::clone(&attempts);
+                        async move {
+                            let location = location?;
+                            attempts.fetch_add(1, Ordering::SeqCst);
+                            // This backend reports NotFound for an absent key,
+                            // unlike InMemory's idempotent DELETE behavior.
+                            inner.head(&location).await?;
+                            inner.delete(&location).await?;
+                            if FlakyStore::take(lost_reply.as_ref()) {
+                                return Err(FlakyStore::transient());
+                            }
                             Ok(location)
                         }
                     })
@@ -748,6 +801,35 @@ mod tests {
             )),
         };
         assert!(RetryingObjectStore::should_retry(&error));
+    }
+
+    #[tokio::test]
+    async fn lost_delete_reply_reconciles_not_found_but_initial_miss_still_fails() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let flaky = Arc::new(FlakyStore::with_lost_delete_reply(inner.clone()));
+        let retrying = RetryingObjectStore::new(flaky.clone());
+        let path = Path::from("lost-delete-ack");
+        retrying
+            .put(&path, PutPayload::from_static(b"durable object"))
+            .await
+            .unwrap();
+
+        retrying
+            .delete(&path)
+            .await
+            .expect("a lost DELETE reply followed by NotFound confirms absence");
+        assert_eq!(flaky.delete_attempts.load(Ordering::SeqCst), 2);
+        assert!(matches!(
+            inner.head(&path).await,
+            Err(object_store::Error::NotFound { .. })
+        ));
+
+        let error = retrying
+            .delete(&path)
+            .await
+            .expect_err("a fresh NotFound without an ambiguous attempt remains an error");
+        assert!(matches!(error, object_store::Error::NotFound { .. }));
+        assert_eq!(flaky.delete_attempts.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test]
