@@ -538,6 +538,7 @@ impl ZeroFS {
 
         let mut target_was_directory = false;
         let mut deferred_target_id = None;
+        let mut quota_settlement = None;
         if let Some((target_id, existing_inode)) = target {
             target_was_directory = matches!(existing_inode, Inode::Directory(_));
 
@@ -633,6 +634,10 @@ impl ZeroFS {
                         }
 
                         self.inode_store.delete(&mut txn, target_id);
+                        quota_settlement = Some(crate::fs::quota::QuotaSettlement::Shrink {
+                            quota: std::sync::Arc::clone(&self.quota),
+                            bytes: file.size,
+                        });
                     }
                 }
                 Inode::Directory(mut dir) => {
@@ -851,11 +856,19 @@ impl ZeroFS {
             }
         }
 
-        self.write_coordinator.commit(txn).await?;
-
-        if let Some(target_id) = deferred_target_id {
-            self.schedule_deferred_orphan_reclaim(target_id);
-        }
+        let settlement = if let Some(target_id) = deferred_target_id {
+            crate::fs::write_coordinator::CommitSettlement::DeferredReclaim(
+                self.deferred_orphan_reclaim(target_id),
+            )
+        } else {
+            quota_settlement.map_or(
+                crate::fs::write_coordinator::CommitSettlement::None,
+                crate::fs::write_coordinator::CommitSettlement::Quota,
+            )
+        };
+        self.write_coordinator
+            .commit_with_settlement(txn, settlement)
+            .await?;
 
         #[cfg(feature = "failpoints")]
         fail_point!(fp::RENAME_AFTER_COMMIT);

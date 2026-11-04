@@ -12,6 +12,7 @@ use crate::fs::mutation::types::{ConflictKey, ConflictScope};
 use crate::fs::permissions::{
     AccessMode, Credentials, can_set_times, check_access, check_ownership, validate_mode,
 };
+use crate::fs::quota::QuotaSettlement;
 use crate::fs::tracing::FileOperation;
 use crate::fs::types::{
     FileAttributes, InodeWithId, SetAttributes, SetGid, SetMode, SetSize, SetTime, SetUid,
@@ -353,14 +354,16 @@ impl ZeroFS {
                         },
                     );
 
-                    self.write_coordinator.commit(txn).await?;
-
-                    if let Some(reservation) = growth_reservation {
-                        reservation.accept();
-                        reservation.canonical();
-                    } else if new_size < old_size {
-                        self.quota.release_committed(old_size - new_size);
-                    }
+                    let quota = match growth_reservation {
+                        Some(reservation) => QuotaSettlement::Growth(reservation),
+                        None => QuotaSettlement::Shrink {
+                            quota: std::sync::Arc::clone(&self.quota),
+                            bytes: old_size - new_size,
+                        },
+                    };
+                    self.write_coordinator
+                        .commit_with_quota(txn, Some(quota))
+                        .await?;
 
                     #[cfg(feature = "failpoints")]
                     fail_point!(fp::TRUNCATE_AFTER_COMMIT);

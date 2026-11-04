@@ -61,7 +61,28 @@ impl Drop for OpenHandle {
     }
 }
 
+/// A deferred orphan must be revisited even when the request awaiting its
+/// canonical commit disappears. The drainer rechecks both open handles and
+/// replay protection before reclaiming or registering an expiry notification.
+pub(crate) struct DeferredOrphanReclaim {
+    inode_id: InodeId,
+    reclaim_tx: UnboundedSender<InodeId>,
+}
+
+impl DeferredOrphanReclaim {
+    pub(crate) fn schedule(self) {
+        let _ = self.reclaim_tx.send(self.inode_id);
+    }
+}
+
 impl ZeroFS {
+    pub(crate) fn deferred_orphan_reclaim(&self, inode_id: InodeId) -> DeferredOrphanReclaim {
+        DeferredOrphanReclaim {
+            inode_id,
+            reclaim_tx: self.reclaim_tx.clone(),
+        }
+    }
+
     /// Increment the open-handle count for `id`. MUST be invoked under
     /// `lock_manager.acquire(id)` together with the inode-liveness `get`, so
     /// that the increment and the "is the inode alive" check are serialized
@@ -124,15 +145,6 @@ impl ZeroFS {
                 }
             }
         });
-    }
-
-    /// Recheck a deferred inode after its orphan transaction commits.
-    /// Handle and replay protection can expire before the key becomes visible.
-    pub(crate) fn schedule_deferred_orphan_reclaim(&self, id: InodeId) {
-        let replay_protected = self.dedup.reclaim_when_unprotected(id);
-        if self.open_handle_count(id) == 0 && !replay_protected {
-            let _ = self.reclaim_tx.send(id);
-        }
     }
 
     /// Synchronous decrement-then-reclaim. Production drives this through the
@@ -207,8 +219,15 @@ impl ZeroFS {
 
                 txn.add_inode_count_delta(id, -1);
                 self.orphan_store.remove(&mut txn, id);
-                self.write_coordinator.commit(txn).await?;
-                self.quota.release_committed(file.size);
+                self.write_coordinator
+                    .commit_with_quota(
+                        txn,
+                        Some(crate::fs::quota::QuotaSettlement::Shrink {
+                            quota: std::sync::Arc::clone(&self.quota),
+                            bytes: file.size,
+                        }),
+                    )
+                    .await?;
                 self.stats.files_deleted.fetch_add(1, Ordering::Relaxed);
                 Ok(())
             }
@@ -424,7 +443,7 @@ mod tests {
 
         // Suppress the drop wakeup to isolate post-commit scheduling.
         assert_eq!(fs.open_handle_dec(file_id), 0);
-        fs.schedule_deferred_orphan_reclaim(file_id);
+        fs.deferred_orphan_reclaim(file_id).schedule();
         wait_for_inode_gone(&fs, file_id).await;
         assert!(orphan_ids(&fs).await.is_empty());
     }

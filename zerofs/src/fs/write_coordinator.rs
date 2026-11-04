@@ -75,6 +75,8 @@ pub(crate) enum CommitSettlement {
     #[default]
     None,
     Write(crate::fs::ops::write::PostCommitSettlement),
+    Quota(crate::fs::quota::QuotaSettlement),
+    DeferredReclaim(crate::fs::handle::DeferredOrphanReclaim),
 }
 
 struct CommitReply {
@@ -102,16 +104,28 @@ impl CommitReply {
         }
     }
 
-    fn send(self, result: Result<(), FsError>) {
+    fn settle(&mut self, result: Result<(), FsError>) {
+        match std::mem::take(&mut self.settlement) {
+            CommitSettlement::None => {}
+            CommitSettlement::Write(settlement) => settlement.finish(result),
+            CommitSettlement::Quota(settlement) => settlement.finish(result),
+            CommitSettlement::DeferredReclaim(reclaim) => {
+                if result.is_ok() {
+                    reclaim.schedule();
+                }
+            }
+        }
+    }
+
+    fn send(mut self, result: Result<(), FsError>) {
+        // Early failures have no separate apply phase to settle them.
+        self.settle(result);
         let Self {
             reply,
             queued_inode,
-            settlement,
             materialized_replay,
+            ..
         } = self;
-        if let CommitSettlement::Write(settlement) = settlement {
-            settlement.finish(result);
-        }
         drop(queued_inode);
         if let Some(completion) = materialized_replay {
             completion.finish(result);
@@ -243,6 +257,30 @@ impl WriteCoordinator {
 
     pub async fn commit(&self, txn: Transaction) -> Result<(), FsError> {
         self.submit(txn)?.wait().await
+    }
+
+    /// Keep metadata quota changes with the queued transaction until its
+    /// canonical result, even if the request waiting for the reply is cancelled.
+    pub(crate) async fn commit_with_quota(
+        &self,
+        txn: Transaction,
+        quota: Option<crate::fs::quota::QuotaSettlement>,
+    ) -> Result<(), FsError> {
+        self.commit_with_settlement(
+            txn,
+            quota.map_or(CommitSettlement::None, CommitSettlement::Quota),
+        )
+        .await
+    }
+
+    pub(crate) async fn commit_with_settlement(
+        &self,
+        txn: Transaction,
+        settlement: CommitSettlement,
+    ) -> Result<(), FsError> {
+        self.submit_owned(txn, CommitOwnership::None, settlement)?
+            .wait()
+            .await
     }
 
     /// Queue `txn` without waiting for it to apply.
@@ -974,6 +1012,13 @@ async fn worker_loop(
         }
 
         drop(extent_ref_guards);
+
+        // Accounting and orphan ownership follow the canonical apply. A later
+        // durability error still reaches the caller, but cannot undo metadata
+        // that the database and global statistics have already published.
+        for reply in &mut replies {
+            reply.settle(result);
+        }
 
         // `sync_writes` returns success only after the batch is durable.
         if ctx.sync_writes && result.is_ok() && any_ops {
