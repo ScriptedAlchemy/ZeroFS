@@ -60,6 +60,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     strategy:
+      # A failed profile must not cancel the other independent expensive profiles.
+      # All profiles are still required by merge-pgo-data.
+      fail-fast: false
       matrix:
         test: [9p, fuse, zfs-on-zerofs, nfs-kernel-compile]
 
@@ -96,6 +99,8 @@ jobs:
             sudo apt-get install -y fuse3
           elif [ "${{ matrix.test }}" = "zfs-on-zerofs" ]; then
             sudo apt-get install -y nbd-client zfsutils-linux wget pigz pixz parallel
+            # The runner's NBD module is not guaranteed to be loaded already.
+            sudo modprobe nbd
           elif [ "${{ matrix.test }}" = "nfs-kernel-compile" ]; then
             sudo apt-get install -y nfs-common
           fi
@@ -301,7 +306,11 @@ jobs:
             sudo mkdir -p /mnt/zerofs/.nbd
             sudo truncate -s 3G /mnt/zerofs/.nbd/test-device
             sudo umount /mnt/zerofs
-            sudo nbd-client 127.0.0.1 10809 /dev/nbd0 -N test-device
+            if ! sudo nbd-client 127.0.0.1 10809 /dev/nbd0 -N test-device; then
+              # nbd-client reports an ioctl failure but otherwise loses kernel context.
+              sudo dmesg | tail -80 || true
+              exit 1
+            fi
             sudo zpool create testpool /dev/nbd0
             sudo zfs create testpool/data
             sudo zfs set mountpoint=/mnt/zfsdata testpool/data
