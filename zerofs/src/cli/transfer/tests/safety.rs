@@ -13,7 +13,7 @@ async fn cancelled_download_preserves_the_existing_destination() {
     cancellation.cancel();
 
     let error = execute_download(
-        std::slice::from_ref(&client),
+        &single_connection_workers(std::slice::from_ref(&client)),
         plan,
         &destination,
         Progress::new("download", 11, 1),
@@ -45,7 +45,7 @@ async fn file_directory_conflicts_fail_before_copying_bytes() {
     let upload_progress = Progress::new("upload", 7, 1);
 
     let upload_error = execute_upload(
-        &upload_workers(std::slice::from_ref(&client)),
+        &single_connection_workers(std::slice::from_ref(&client)),
         scan_local(&source).unwrap(),
         Path::new("/occupied"),
         false,
@@ -76,7 +76,7 @@ async fn file_directory_conflicts_fail_before_copying_bytes() {
     fs::create_dir(&destination).unwrap();
     let download_progress = Progress::new("download", 7, 1);
     let download_error = execute_download(
-        std::slice::from_ref(&client),
+        &single_connection_workers(std::slice::from_ref(&client)),
         scan_remote(&client, Path::new("/source.bin"))
             .await
             .unwrap(),
@@ -107,7 +107,7 @@ async fn upload_does_not_follow_a_source_replaced_by_a_symlink_after_planning() 
     let clients = vec![client.clone()];
 
     let error = execute_upload(
-        &upload_workers(&clients),
+        &single_connection_workers(&clients),
         TransferPlan {
             source_is_dir: false,
             directories: Vec::new(),
@@ -161,7 +161,7 @@ async fn download_rejects_growth_without_copying_beyond_the_plan() {
     let progress = Progress::new("download", 7, 1);
 
     let error = execute_download(
-        std::slice::from_ref(&client),
+        &single_connection_workers(std::slice::from_ref(&client)),
         plan,
         &destination,
         progress.clone(),
@@ -196,7 +196,7 @@ async fn download_rejects_truncation_and_preserves_the_existing_destination() {
     let progress = Progress::new("download", 7, 1);
 
     let error = execute_download(
-        std::slice::from_ref(&client),
+        &single_connection_workers(std::slice::from_ref(&client)),
         plan,
         &destination,
         progress.clone(),
@@ -236,7 +236,7 @@ async fn download_rejects_symlinked_destination_ancestors() {
     symlink(&outside, destination.join("link")).unwrap();
 
     let error = execute_download(
-        std::slice::from_ref(&client),
+        &single_connection_workers(std::slice::from_ref(&client)),
         plan,
         &destination,
         Progress::new("download", 7, 1),
@@ -264,7 +264,7 @@ async fn single_file_download_rejects_a_symlinked_destination_ancestor() {
     let destination = destination_root.join("link/nested/result.bin");
 
     let error = execute_download(
-        std::slice::from_ref(&client),
+        &single_connection_workers(std::slice::from_ref(&client)),
         plan,
         &destination,
         Progress::new("download", 7, 1),
@@ -292,7 +292,7 @@ async fn download_preflights_all_file_directory_conflicts_before_copying() {
     let progress = Progress::new("download", 9, 2);
 
     let error = execute_download(
-        std::slice::from_ref(&client),
+        &single_connection_workers(std::slice::from_ref(&client)),
         plan,
         &destination,
         progress.clone(),
@@ -324,7 +324,7 @@ async fn upload_preflights_all_file_directory_conflicts_before_copying() {
     let progress = Progress::new("upload", 9, 2);
 
     let error = execute_upload(
-        &upload_workers(std::slice::from_ref(&client)),
+        &single_connection_workers(std::slice::from_ref(&client)),
         plan,
         Path::new("/destination"),
         false,

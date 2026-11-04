@@ -168,7 +168,7 @@ async fn websocket_upload_restarts_fresh_temp_after_an_unseen_write_retry() {
         .await
         .unwrap();
     let clients = vec![Arc::clone(&primary_client), Arc::clone(&secondary_client)];
-    let workers = vec![UploadWorker::new(&clients)];
+    let workers = vec![TransferWorker::new(&clients)];
 
     let local = tempfile::tempdir().unwrap();
     let local_path = local.path().to_path_buf();

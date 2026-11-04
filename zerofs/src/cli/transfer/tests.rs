@@ -3,7 +3,7 @@ use super::progress::{DeleteProgress, Progress};
 #[cfg(feature = "webui")]
 use super::run_upload;
 use super::{
-    InterruptPolicy, SETTLE_NOTICE_INTERVAL, TRANSFER_MSIZE, UploadWorker, close_client,
+    InterruptPolicy, SETTLE_NOTICE_INTERVAL, TRANSFER_MSIZE, TransferWorker, close_client,
     connect_transfer_client, execute_delete, execute_download, execute_upload,
     resume_enabled_for_attempt, run_file_workers, with_settling_notices,
 };
@@ -156,10 +156,10 @@ async fn quiesced_fids(client: &Client) -> usize {
     client.outstanding_fids()
 }
 
-fn upload_workers(clients: &[Arc<Client>]) -> Vec<UploadWorker> {
+fn single_connection_workers(clients: &[Arc<Client>]) -> Vec<TransferWorker> {
     clients
         .iter()
-        .map(|client| UploadWorker::new(std::slice::from_ref(client)))
+        .map(|client| TransferWorker::new(std::slice::from_ref(client)))
         .collect()
 }
 
@@ -516,7 +516,7 @@ async fn upload_streams_each_chunk_once_and_releases_temporary_resources() {
     let progress = Progress::new("upload", plan.total_bytes, plan.files.len());
 
     execute_upload(
-        &upload_workers(std::slice::from_ref(&client)),
+        &single_connection_workers(std::slice::from_ref(&client)),
         plan,
         Path::new("/dest"),
         false,
@@ -566,7 +566,7 @@ async fn completed_files_are_visible_before_the_rest_of_the_batch_finishes() {
     fs::remove_file(source.join("z-fails.txt")).unwrap();
 
     let error = execute_upload(
-        &upload_workers(std::slice::from_ref(&client)),
+        &single_connection_workers(std::slice::from_ref(&client)),
         plan,
         Path::new("/dest"),
         false,
@@ -607,7 +607,7 @@ async fn download_streams_nested_files_and_preserves_unrelated_entries() {
     let baseline_fids = quiesced_fids(&client).await;
 
     execute_download(
-        std::slice::from_ref(&client),
+        &single_connection_workers(std::slice::from_ref(&client)),
         plan,
         &destination,
         Progress::new("download", payload.len() as u64, 1),
@@ -642,7 +642,7 @@ async fn single_file_transfers_use_the_exact_destination_path() {
     client.write("/uploaded.bin", b"old").await.unwrap();
     let upload_plan = scan_local(&source).unwrap();
     execute_upload(
-        &upload_workers(std::slice::from_ref(&client)),
+        &single_connection_workers(std::slice::from_ref(&client)),
         upload_plan,
         Path::new("/uploaded.bin"),
         false,
@@ -660,7 +660,7 @@ async fn single_file_transfers_use_the_exact_destination_path() {
     fs::write(&destination, b"old").unwrap();
 
     execute_download(
-        std::slice::from_ref(&client),
+        &single_connection_workers(std::slice::from_ref(&client)),
         download_plan,
         &destination,
         Progress::new("download", 7, 1),
@@ -685,8 +685,9 @@ async fn assert_first_cancellation_interrupts_read(read_number: usize) {
     let cancellation = CancellationToken::new();
     disconnect_on_read.store(read_number, Ordering::Release);
 
+    let workers = single_connection_workers(&clients);
     let download = execute_download(
-        &clients,
+        &workers,
         plan,
         &destination,
         Progress::new("download", 11, 1),
@@ -926,7 +927,7 @@ async fn cancellation_during_empty_directory_sync_never_prints_completion() {
     let task_cancellation = cancellation.clone();
     let task = tokio::spawn(async move {
         execute_upload(
-            &upload_workers(&[client]),
+            &single_connection_workers(&[client]),
             TransferPlan {
                 source_is_dir: true,
                 directories: vec![Path::new("").to_path_buf()],
@@ -974,7 +975,7 @@ async fn cancellation_after_upload_bytes_removes_the_temporary_file() {
     let task_client = Arc::clone(&client);
     let task = tokio::spawn(async move {
         execute_upload(
-            &upload_workers(&[task_client]),
+            &single_connection_workers(&[task_client]),
             scan_local(&source).unwrap(),
             Path::new("/destination.bin"),
             false,
@@ -1014,7 +1015,7 @@ async fn upload_sync_failure_preserves_the_old_destination_and_cleans_temporary_
     fs::write(&source, b"replacement").unwrap();
 
     let error = execute_upload(
-        &upload_workers(std::slice::from_ref(&client)),
+        &single_connection_workers(std::slice::from_ref(&client)),
         scan_local(&source).unwrap(),
         Path::new("/destination.bin"),
         false,
@@ -1057,7 +1058,7 @@ async fn final_upload_sync_failure_reports_visible_but_unverified_publication() 
     fs::write(&source, b"replacement").unwrap();
 
     let error = execute_upload(
-        &upload_workers(std::slice::from_ref(&client)),
+        &single_connection_workers(std::slice::from_ref(&client)),
         scan_local(&source).unwrap(),
         Path::new("/destination.bin"),
         false,

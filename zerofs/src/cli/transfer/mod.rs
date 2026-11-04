@@ -24,6 +24,8 @@ const CLIENT_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 const TRANSFER_WRITE_PAYLOAD: u32 = 9 * 1024 * 1024;
 const TRANSFER_MSIZE: u32 = TRANSFER_WRITE_PAYLOAD + P9_TWRITE_HDR + P9_OP_ENVELOPE_LEN as u32;
 const UPLOAD_CONNECTIONS_PER_WORKER: usize = 2;
+const DOWNLOAD_CONNECTIONS_PER_WORKER: usize = 4;
+const DOWNLOAD_CONNECTION_BUDGET: usize = 32;
 const TRANSFER_CONNECT_CONCURRENCY: usize = 8;
 const FILE_TRANSFER_ATTEMPTS: usize = 3;
 const LINUX_EAGAIN: i32 = 11;
@@ -61,11 +63,11 @@ pub(crate) async fn run_upload(
     let clients =
         connect_workers(target, client, worker_count * UPLOAD_CONNECTIONS_PER_WORKER).await?;
     // `as_chunks` would yield `&[_; N]` chunks and force reworking
-    // `UploadWorker::new`'s `&[Arc<Client>]` signature for no benefit here.
+    // `TransferWorker::new`'s `&[Arc<Client>]` signature for no benefit here.
     #[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
     let workers = clients
         .chunks_exact(UPLOAD_CONNECTIONS_PER_WORKER)
-        .map(UploadWorker::new)
+        .map(TransferWorker::new)
         .collect::<Vec<_>>();
     let progress = Progress::new_ordered("upload", plan.total_bytes, &progress_paths(&plan));
     let (cancellation, signal) = cancellation_on_ctrl_c();
@@ -103,12 +105,19 @@ pub(crate) async fn run_download(
         Ok(plan) => plan,
         Err(error) => return finish_client(&client, Err(error)).await,
     };
-    let clients = connect_workers(target, client, jobs.min(plan.files.len().max(1))).await?;
+    let worker_count = jobs.min(plan.files.len().max(1));
+    let connections_per_worker =
+        (DOWNLOAD_CONNECTION_BUDGET / worker_count).clamp(1, DOWNLOAD_CONNECTIONS_PER_WORKER);
+    let clients = connect_workers(target, client, worker_count * connections_per_worker).await?;
+    let workers = clients
+        .chunks(connections_per_worker)
+        .map(TransferWorker::new)
+        .collect::<Vec<_>>();
     let progress = Progress::new_ordered("download", plan.total_bytes, &progress_paths(&plan));
     let (cancellation, signal) = cancellation_on_ctrl_c();
     let notice_progress = progress.clone();
     let result = with_settling_notices(
-        execute_download(&clients, plan, &destination, progress, cancellation.clone()),
+        execute_download(&workers, plan, &destination, progress, cancellation.clone()),
         cancellation,
         move |waited| notice_progress.settling(waited),
     )
@@ -212,11 +221,11 @@ async fn connect_workers(
 }
 
 #[derive(Clone)]
-struct UploadWorker {
+struct TransferWorker {
     clients: Vec<Arc<Client>>,
 }
 
-impl UploadWorker {
+impl TransferWorker {
     fn new(clients: &[Arc<Client>]) -> Self {
         Self {
             clients: clients.to_vec(),
@@ -226,7 +235,7 @@ impl UploadWorker {
     fn primary(&self) -> &Arc<Client> {
         self.clients
             .first()
-            .expect("an upload worker always has a primary client")
+            .expect("a transfer worker always has a primary client")
     }
 
     fn clients(&self) -> &[Arc<Client>] {
@@ -414,7 +423,7 @@ fn is_retryable_transfer_error(error: &anyhow::Error) -> bool {
 }
 
 async fn execute_upload(
-    workers: &[UploadWorker],
+    workers: &[TransferWorker],
     plan: TransferPlan,
     destination: &Path,
     resume: bool,
@@ -491,13 +500,13 @@ fn resume_enabled_for_attempt(resume: bool, attempt: usize) -> bool {
 }
 
 async fn execute_download(
-    clients: &[Arc<Client>],
+    workers: &[TransferWorker],
     plan: TransferPlan,
     destination: &Path,
     progress: Progress,
     cancellation: CancellationToken,
 ) -> Result<()> {
-    if clients.is_empty() {
+    if workers.is_empty() {
         bail!("download requires a 9P client");
     }
     if cancellation.is_cancelled() {
@@ -517,16 +526,16 @@ async fn execute_download(
 
     let worker_progress = progress.clone();
     run_file_workers(
-        clients,
+        workers,
         plan.files,
         progress.clone(),
         cancellation.child_token(),
-        move |client, file, cancellation, _attempt| {
+        move |worker, file, cancellation, _attempt| {
             let prepared = prepared.clone();
             let progress = worker_progress.clone();
             async move {
                 let target = prepared.target(&file)?;
-                download_file(client, file, target, progress, cancellation).await
+                download_file(worker, file, target, progress, cancellation).await
             }
         },
     )

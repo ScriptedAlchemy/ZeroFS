@@ -147,7 +147,7 @@ async fn download_with_reordered_pipeline(
             assert_eq!(cursor.position(), planned.size);
         } else {
             stream_download(
-                &remote,
+                std::slice::from_ref(&remote),
                 &mut output,
                 &planned,
                 if negotiated_chunks {
@@ -171,6 +171,94 @@ async fn download_with_reordered_pipeline(
     proxy.abort();
     let _ = proxy.await;
     shutdown.cancel();
+}
+
+#[tokio::test]
+async fn download_uses_four_connections_for_one_file() {
+    let (primary, shutdown, local) = remote_client().await;
+    let payload: Vec<u8> = (0..9 * 1024 * 1024 + 17)
+        .map(|index| (index % 251) as u8)
+        .collect();
+    primary.write("/source.bin", &payload).await.unwrap();
+    let socket = local.path().join("transfer.9p.sock");
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let target = format!("tcp://{}", listener.local_addr().unwrap());
+    let proxy = tokio::spawn(async move {
+        let mut relays = tokio::task::JoinSet::new();
+        for _ in 0..4 {
+            let (mut downstream, _) = listener.accept().await.unwrap();
+            let mut upstream = tokio::net::UnixStream::connect(&socket).await.unwrap();
+            relays.spawn(async move {
+                tokio::io::copy_bidirectional(&mut downstream, &mut upstream).await
+            });
+        }
+        let mut received = Vec::new();
+        while let Some(result) = relays.join_next().await {
+            received.push(result.unwrap().unwrap().1);
+        }
+        received
+    });
+    let destination = local.path().join("download.bin");
+    tokio::time::timeout(
+        Duration::from_secs(15),
+        super::super::run_download(&target, "/source.bin".into(), destination.clone(), 1),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let received = tokio::time::timeout(Duration::from_secs(5), proxy)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(fs::read(destination).unwrap(), payload);
+    assert_eq!(received.len(), 4);
+    assert!(received.iter().all(|bytes| *bytes >= 2 * 1024 * 1024));
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn download_rejects_different_source_inodes_across_connections() {
+    let (primary, primary_shutdown, local) = remote_client().await;
+    let (secondary, secondary_shutdown, _other_local) = remote_client().await;
+    let payload = vec![0x41; 1024 * 1024 + 17];
+    primary.write("/source.bin", &payload).await.unwrap();
+    secondary.write("/other.bin", b"other").await.unwrap();
+    secondary.write("/source.bin", &payload).await.unwrap();
+    assert_ne!(
+        primary.metadata("/source.bin").await.unwrap().ino,
+        secondary.metadata("/source.bin").await.unwrap().ino
+    );
+    let plan = scan_remote(&primary, Path::new("/source.bin"))
+        .await
+        .unwrap();
+    let destination = local.path().join("download.bin");
+    let error = execute_download(
+        &[super::super::TransferWorker::new(&[primary, secondary])],
+        plan,
+        &destination,
+        Progress::new("download", payload.len() as u64, 1),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("changed between download connections"),
+        "{error:#}"
+    );
+    assert!(!destination.exists());
+    assert!(!fs::read_dir(local.path()).unwrap().any(|entry| {
+        entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".zerofs-")
+    }));
+    primary_shutdown.cancel();
+    secondary_shutdown.cancel();
 }
 
 #[tokio::test]
