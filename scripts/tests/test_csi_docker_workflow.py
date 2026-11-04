@@ -2,6 +2,7 @@ import json
 import re
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -49,6 +50,88 @@ class CsiDockerWorkflowTests(unittest.TestCase):
             csi_publish.index("- name: Log in to Container Registry"),
             csi_publish.index("- name: Resolve release base image"),
         )
+
+    def test_validation_checkouts_keep_the_event_commit(self) -> None:
+        for path in (WORKFLOW, BASE_WORKFLOW):
+            with self.subTest(workflow=path.name):
+                validate = path.read_text().split("  validate-image:", 1)[1]
+                validate = validate.split("  publish-image:", 1)[0]
+                self.assertIn("uses: actions/checkout@", validate)
+                # checkout's default includes github.sha; overriding ref with
+                # github.ref discards that commit and refetches a mutable name.
+                self.assertNotIn("          ref:", validate)
+
+    def test_csi_build_overrides_checkout_only_for_explicit_release_tags(self) -> None:
+        build = WORKFLOW.read_text().split("  build-binaries:", 1)[1]
+        build = build.split("  validate-image:", 1)[0]
+        self.assertIn(
+            "ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag != '' "
+            "&& format('refs/tags/{0}', inputs.tag) || '' }}",
+            build,
+        )
+        self.assertIn("fetch-tags: true", build)
+        self.assertIn('git tag --points-at HEAD | grep -Fx -- "$RELEASE_TAG"', build)
+
+    def test_event_commit_survives_merge_ref_update_and_deletion(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            def git(
+                cwd: Path, *args: str, check: bool = True
+            ) -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    [
+                        "git", "-c", "user.name=ZeroFS test",
+                        "-c", "user.email=zerofs-test@example.invalid",
+                        "-C", str(cwd), *args,
+                    ],
+                    input="",
+                    text=True,
+                    capture_output=True,
+                    check=check,
+                    timeout=10,
+                )
+
+            git(root, "init", "--bare", "origin.git")
+            origin = root / "origin.git"
+            tree = git(origin, "mktree").stdout.strip()
+            event_sha = git(origin, "commit-tree", tree, "-m", "event").stdout.strip()
+            newer_sha = git(
+                origin, "commit-tree", tree, "-p", event_sha, "-m", "newer"
+            ).stdout.strip()
+            ref = "refs/pull/50/merge"
+            destination = "refs/remotes/pull/50/merge"
+            git(origin, "update-ref", ref, newer_sha)
+            for state in ("moved", "deleted"):
+                with self.subTest(ref_state=state):
+                    if state == "deleted":
+                        git(origin, "update-ref", "-d", ref)
+                    git(root, "init", state)
+                    checkout = root / state
+                    git(checkout, "remote", "add", "origin", str(origin))
+                    by_name = git(
+                        checkout, "fetch", "--depth=1", "origin",
+                        f"+{ref}:{destination}", check=False,
+                    )
+                    if state == "moved":
+                        self.assertEqual(by_name.returncode, 0, by_name.stderr)
+                        self.assertEqual(
+                            git(checkout, "rev-parse", destination).stdout.strip(),
+                            newer_sha,
+                        )
+                    else:
+                        self.assertNotEqual(by_name.returncode, 0)
+                        self.assertIn("couldn't find remote ref", by_name.stderr)
+                    # The pinned checkout action's default refspec uses the
+                    # event commit, not the possibly deleted PR merge ref.
+                    git(
+                        checkout, "fetch", "--depth=1", "origin",
+                        f"+{event_sha}:{destination}",
+                    )
+                    self.assertEqual(
+                        git(checkout, "rev-parse", destination).stdout.strip(),
+                        event_sha,
+                    )
 
     def test_external_actions_and_cross_are_immutable(self) -> None:
         for path in (WORKFLOW, BASE_WORKFLOW):
