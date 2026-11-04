@@ -13,12 +13,10 @@ use uuid::Uuid;
 use zerofs_client::{Client, File, OpenOptions};
 
 const UPLOAD_PIPELINE_DEPTH_PER_CONNECTION: usize = 2;
-// The upload negotiation permits 9 MiB messages, but four reads of that size
-// exceed the server's 64 MiB connection budget once source and encoded reply
-// buffers are charged. A blocked fourth request also blocks liveness probes
-// behind it. Keep bulk reads below both byte and request admission limits.
-const DOWNLOAD_CHUNK_SIZE: u32 = 1024 * 1024;
-const DOWNLOAD_PIPELINE_DEPTH: usize = 8;
+// Four 4 MiB reads charge 32 MiB for source and encoded reply buffers,
+// leaving room for control requests within the server's 64 MiB budget.
+const DOWNLOAD_CHUNK_SIZE: u32 = 4 * 1024 * 1024;
+const DOWNLOAD_PIPELINE_DEPTH: usize = 4;
 
 pub(super) async fn upload_file(
     worker: TransferWorker,
