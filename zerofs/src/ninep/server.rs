@@ -505,9 +505,9 @@ mod tests {
         // The CLI's wire-level regression separately verifies this geometry.
         // Retain every reply credit, as a slow backend does, while admitting
         // the real lineage probe used by the client's reply-timeout path.
-        let frame = encoded_read(1024 * 1024);
+        let frame = encoded_read(4 * 1024 * 1024);
         let mut reads = Vec::new();
-        for _ in 0..8 {
+        for _ in 0..4 {
             reads.push(
                 connection
                     .admit_request(frame.len(), possible_frame_response_bytes(&frame))
