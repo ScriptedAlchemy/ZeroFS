@@ -352,6 +352,38 @@ jobs:
             RESULT_BASE=/tmp/xfstests/results-strict \
             ./check generic/732
 
+      - name: Diagnose native generic/011 with syscall trace
+        if: ${{ failure() && matrix.client == 'native' && steps.configure_xfstests.outcome == 'success' }}
+        continue-on-error: true
+        timeout-minutes: 4
+        run: |
+          trace_dir="$RUNNER_TEMP/zerofs-xfstests-native/generic-011-trace"
+          if [[ ! -f /tmp/xfstests/results/generic/011.out.bad ]]; then
+            echo "generic/011 did not fail; no diagnostic replay needed"
+            exit 0
+          fi
+          mkdir -p "$trace_dir"
+          # Preserve the original full-suite failure before the replay can
+          # replace xfstests' result files.
+          for name in generic/011.full generic/011.out.bad check.log; do
+            if [[ -f "/tmp/xfstests/results/$name" ]]; then
+              sudo cp "/tmp/xfstests/results/$name" \
+                "$trace_dir/original-$(basename "$name")"
+            fi
+          done
+          sudo apt-get install -y strace
+          cd /tmp/xfstests
+          # The original quick suite remains authoritative. Bounded replay
+          # captures the actual failing syscall sequence without waiving it.
+          set +e
+          sudo timeout 120s strace -ff -ttt -s 128 \
+            -e trace=chdir,rename,renameat,renameat2,mkdir,mkdirat,rmdir,unlink,unlinkat,stat,statx,newfstatat,getcwd \
+            -o "$trace_dir/syscall" \
+            ./check generic/011 > "$trace_dir/replay.log" 2>&1
+          status=$?
+          set -e
+          printf 'diagnostic_generic_011_exit=%s\n' "$status" > "$trace_dir/status"
+          echo "generic/011 strace replay exit: $status; original result unchanged"
       - name: Collect xfstests diagnostics
         if: always()
         continue-on-error: true
