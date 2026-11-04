@@ -7,7 +7,7 @@ async fn download_with_reordered_pipeline(
     negotiated_chunks: bool,
 ) {
     let chunk = if negotiated_chunks {
-        1024 * 1024
+        4 * 1024 * 1024
     } else {
         64 * 1024
     };
@@ -20,7 +20,7 @@ async fn download_with_reordered_pipeline(
         .await
         .unwrap();
     let target = format!("tcp://{}", listener.local_addr().unwrap());
-    let wave_size = 8;
+    let wave_size = if through_cursor { 8 } else { 4 };
     let (wave_ready, wait_for_wave) = tokio::sync::oneshot::channel();
     let release_wave = Arc::new(tokio::sync::Semaphore::new(usize::from(!through_cursor)));
     let proxy_release_wave = Arc::clone(&release_wave);
@@ -55,10 +55,17 @@ async fn download_with_reordered_pipeline(
                 reads += 1;
                 if negotiated_chunks {
                     assert!(
-                        read.count <= 1024 * 1024,
+                        read.count <= 4 * 1024 * 1024,
                         "download used the upload-sized negotiation for a read: {} bytes",
                         read.count
                     );
+                    if reads <= wave_size {
+                        assert_eq!(
+                            read.count,
+                            4 * 1024 * 1024,
+                            "bulk reads should give the backend a contiguous range to coalesce"
+                        );
+                    }
                 }
                 let mut changed = false;
                 if short_reads && read.count > 1 {
@@ -176,7 +183,7 @@ async fn download_with_reordered_pipeline(
 #[tokio::test]
 async fn download_uses_four_connections_for_one_file() {
     let (primary, shutdown, local) = remote_client().await;
-    let payload: Vec<u8> = (0..9 * 1024 * 1024 + 17)
+    let payload: Vec<u8> = (0..17 * 1024 * 1024 + 17)
         .map(|index| (index % 251) as u8)
         .collect();
     primary.write("/source.bin", &payload).await.unwrap();
@@ -222,7 +229,7 @@ async fn download_uses_four_connections_for_one_file() {
 async fn download_rejects_different_source_inodes_across_connections() {
     let (primary, primary_shutdown, local) = remote_client().await;
     let (secondary, secondary_shutdown, _other_local) = remote_client().await;
-    let payload = vec![0x41; 1024 * 1024 + 17];
+    let payload = vec![0x41; 4 * 1024 * 1024 + 17];
     primary.write("/source.bin", &payload).await.unwrap();
     secondary.write("/other.bin", b"other").await.unwrap();
     secondary.write("/source.bin", &payload).await.unwrap();
