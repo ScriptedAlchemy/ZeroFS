@@ -1,6 +1,7 @@
 (ns zerofs-ha.core-test
   (:require [clojure.java.io :as io]
             [clojure.test :refer [deftest is testing]]
+            [jepsen.client :as client]
             [jepsen.checker :as checker]
             [jepsen.util :as util]
             [slingshot.slingshot :refer [try+]]
@@ -72,6 +73,43 @@
     (is (= {} @handles))
     (is (= #{:file :dir} (set @closed)))
     (is (= 2 (count @closed)))))
+
+(deftest final-durability-read-does-not-depend-on-live-handles
+  (let [dir      (.toFile (Files/createTempDirectory
+                           "zerofs-ha-final-read" (make-array FileAttribute 0)))
+        data     (io/file dir "h")
+        child    (io/file dir "directory-not-a-data-file")
+        handles  (atom {})
+        dc       (core/->DurabilityClient (.getPath dir) handles (atom 0))
+        history  [{:type :ok :process 0 :f :write :file "h" :value 1533}
+                  {:type :invoke :process 0 :f :fsync :file "h"}
+                  {:type :ok :process 0 :f :fsync :file "h"}]
+        checked? (fn [op] (:valid? (checker/check
+                                    (core/fsync-honesty-checker)
+                                    {} (conj history op) {})))]
+    (try
+      (spit data "1533\n")
+      (is (.mkdir child))
+      (reset! handles {"h" {:raf (java.io.RandomAccessFile. data "rw")
+                            :file "h"}})
+      (core/close-durability-handles! handles)
+      (is (empty? @handles))
+      ;; An acknowledged fsync must remain verifiable even after a Jepsen
+      ;; worker has closed the shared descriptor registry.
+      (let [observed (client/invoke! dc {} {:f :read})]
+        (is (= #{"h"} (set (keys (:value observed)))))
+        (is (= {:size 5 :values (sorted-set 1533)}
+               (get (:value observed) "h")))
+        (is (true? (checked? observed))))
+      ;; Deleting the actual file must still be detected as a lost fsync.
+      (is (.delete data))
+      (let [missing (client/invoke! dc {} {:f :read})]
+        (is (= {} (:value missing)))
+        (is (false? (checked? missing))))
+      (finally
+        (.delete data)
+        (.delete child)
+        (.delete dir)))))
 
 (deftest unmount-dispatches-to-the-selected-client
   (let [commands (atom [])

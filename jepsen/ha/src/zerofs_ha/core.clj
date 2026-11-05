@@ -697,17 +697,21 @@
                    (try (.sync (.getFD raf)) (assoc op :type :ok :file file)
                         (catch java.io.IOException e
                           (assoc op :type :fail :file file :error (str (.getMessage e))))))
-          ;; Final state per distinct file: {file -> {:values #{values} :size bytes}}.
+          ;; Observe the recovered namespace, not Jepsen's open-fid registry:
+          ;; worker close! may empty shared handles without removing a file.
           :read (assoc op :type :ok
-                       :value (into {}
-                                    (for [f (distinct (keep :file (vals @handles)))]
-                                      [f {:size (.length (dc-file dir f))
-                                          :values (with-open [r (io/reader (dc-file dir f))]
+                       :value (let [files (or (.listFiles (io/file dir))
+                                              (throw (java.io.IOException.
+                                                      (str "Cannot list durability files: " dir))))]
+                                (into {}
+                                      (for [^java.io.File f files :when (.isFile f)]
+                                        [(.getName f)
+                                         {:size (.length f)
+                                          :values (with-open [r (io/reader f)]
                                                     (into (sorted-set)
                                                           (keep #(try (Long/parseLong %)
                                                                       (catch Exception _ nil))
-                                                                (line-seq r))))}])))
-
+                                                                (line-seq r))))}]))))
           ;; Open a directory, fsync it (a force on a dir channel flushes the db, so the
           ;; directory exists durably and only its later un-fsync'd entries are at risk),
           ;; and keep the channel keyed by the directory name.
