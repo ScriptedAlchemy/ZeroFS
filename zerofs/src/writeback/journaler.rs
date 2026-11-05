@@ -144,6 +144,11 @@ trait LocalJournalSink: Send + Sync + 'static {
     fn discard(&self, prepared: PreparedMutation) {
         drop(prepared);
     }
+
+    // Test-only acknowledgement after the worker has collected a preparation.
+    // A sink's prepare() notification runs before its JoinHandle is collected.
+    #[cfg(test)]
+    fn preparation_collected(&self, _sequence: Sequence) {}
 }
 
 impl LocalJournalSink for Journal {
@@ -572,10 +577,13 @@ struct MutationOwnership {
 fn collect_preparation(
     result: Result<Preparation, tokio::task::JoinError>,
     prepared: &mut BTreeMap<Sequence, PreparedEntry>,
+    _sink: &dyn LocalJournalSink,
 ) -> Option<String> {
     match result {
         Ok((sequence, result, ownership)) => {
             prepared.insert(sequence, (result, ownership));
+            #[cfg(test)]
+            _sink.preparation_collected(sequence);
             None
         }
         Err(error) => Some(format!("local journal preparer panicked: {error}")),
@@ -1025,7 +1033,7 @@ async fn run_journaler(
             let Some(Some(result)) = preparations.next().now_or_never() else {
                 break;
             };
-            terminal = collect_preparation(result, &mut prepared);
+            terminal = collect_preparation(result, &mut prepared, sink.as_ref());
         }
 
         // Commit the oldest staged batch as soon as the commit half is free.
@@ -1211,7 +1219,7 @@ async fn run_journaler(
                 }
             }
             Some(result) = preparations.next(), if !preparations.is_empty() => {
-                if let Some(error) = collect_preparation(result, &mut prepared)
+                if let Some(error) = collect_preparation(result, &mut prepared, sink.as_ref())
                     && terminal.is_none()
                 {
                     terminal = Some(error);
@@ -1457,6 +1465,7 @@ mod tests {
         journal: Arc<Journal>,
         head_release: Mutex<Option<mpsc::Receiver<()>>>,
         prepared: tokio_mpsc::UnboundedSender<u64>,
+        collected: Option<tokio_mpsc::UnboundedSender<Sequence>>,
     }
 
     /// A real journal with the publication pipeline's two halves under test
@@ -2159,6 +2168,12 @@ mod tests {
             prepared: Vec<crate::writeback::journal::PreparedMutation>,
         ) -> Result<Vec<MutationRecord>> {
             self.journal.publish_batch(prepared)
+        }
+
+        fn preparation_collected(&self, sequence: Sequence) {
+            if let Some(collected) = &self.collected {
+                collected.send(sequence).unwrap();
+            }
         }
     }
 
@@ -3080,10 +3095,12 @@ mod tests {
         let disk = test_ssd(100, 10);
         let (head_release_tx, head_release_rx) = mpsc::channel();
         let (prepared_tx, mut prepared_rx) = tokio_mpsc::unbounded_channel();
+        let (collected_tx, mut collected_rx) = tokio_mpsc::unbounded_channel();
         let sink = Arc::new(HeadBlockingJournalSink {
             journal: journal.clone(),
             head_release: Mutex::new(Some(head_release_rx)),
             prepared: prepared_tx,
+            collected: Some(collected_tx),
         });
         let journaler = LocalJournaler::start_with_sink_and_observer(
             sink,
@@ -3109,6 +3126,9 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(prepared_rx.recv().await.unwrap(), 2);
+        // Wait for the worker to own #2 before releasing #1; otherwise
+        // the observer may legitimately see two separate batches.
+        assert_eq!(collected_rx.recv().await.unwrap(), 2);
         head_release_tx.send(()).unwrap();
 
         assert!(matches!(
@@ -3178,6 +3198,7 @@ mod tests {
             journal: journal.clone(),
             head_release: Mutex::new(Some(head_release_rx)),
             prepared: prepared_tx,
+            collected: None,
         });
         let journaler = LocalJournaler::start_with_sink_and_observer(
             sink,
