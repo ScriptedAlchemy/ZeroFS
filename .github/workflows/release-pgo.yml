@@ -59,7 +59,13 @@ jobs:
     needs: build-instrumented
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    env:
+      # Dedicated disposable CI minor; never reuse an attached export.
+      ZEROFS_CI_NBD_DEVICE: /dev/nbd7
     strategy:
+      # A failed profile must not cancel the other independent expensive profiles.
+      # All profiles are still required by merge-pgo-data.
+      fail-fast: false
       matrix:
         test: [9p, fuse, zfs-on-zerofs, nfs-kernel-compile]
 
@@ -96,6 +102,13 @@ jobs:
             sudo apt-get install -y fuse3
           elif [ "${{ matrix.test }}" = "zfs-on-zerofs" ]; then
             sudo apt-get install -y nbd-client zfsutils-linux wget pigz pixz parallel
+            # The runner's NBD module is not guaranteed to be loaded already.
+            sudo modprobe nbd
+            test -b "$ZEROFS_CI_NBD_DEVICE"
+            if sudo nbd-client -c "$ZEROFS_CI_NBD_DEVICE" >/dev/null 2>&1; then
+              echo "$ZEROFS_CI_NBD_DEVICE already has an NBD export; refusing to reuse it" >&2
+              exit 1
+            fi
           elif [ "${{ matrix.test }}" = "nfs-kernel-compile" ]; then
             sudo apt-get install -y nfs-common
           fi
@@ -189,7 +202,7 @@ jobs:
             sudo mkdir -p /mnt/zerofs
             sudo mount -t 9p -o trans=tcp,port=5564,version=9p2000.L,cache=mmap,access=user 127.0.0.1 /mnt/zerofs
             cd /mnt/zerofs
-            wget -q https://git.kernel.org/torvalds/t/linux-7.2-rc1.tar.gz
+            wget -q https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/snapshot/linux-7.2-rc1.tar.gz
             tar -xf linux-7.2-rc1.tar.gz
             cd linux-7.2-rc1
             make tinyconfig
@@ -245,7 +258,7 @@ jobs:
               sleep 0.5
             done
             cd /mnt/zerofs
-            wget -q https://git.kernel.org/torvalds/t/linux-7.2-rc1.tar.gz
+            wget -q https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/snapshot/linux-7.2-rc1.tar.gz
             tar -xf linux-7.2-rc1.tar.gz
             cd linux-7.2-rc1
             make tinyconfig
@@ -301,12 +314,18 @@ jobs:
             sudo mkdir -p /mnt/zerofs/.nbd
             sudo truncate -s 3G /mnt/zerofs/.nbd/test-device
             sudo umount /mnt/zerofs
-            sudo nbd-client 127.0.0.1 10809 /dev/nbd0 -N test-device
-            sudo zpool create testpool /dev/nbd0
+            if ! sudo nbd-client 127.0.0.1 10809 "$ZEROFS_CI_NBD_DEVICE" -N test-device; then
+              # nbd-client reports an ioctl failure but otherwise loses kernel context.
+              sudo dmesg | tail -80 || true
+              cat /sys/block/nbd7/pid 2>/dev/null || true
+              cat /sys/block/nbd7/size 2>/dev/null || true
+              exit 1
+            fi
+            sudo zpool create testpool "$ZEROFS_CI_NBD_DEVICE"
             sudo zfs create testpool/data
             sudo zfs set mountpoint=/mnt/zfsdata testpool/data
             cd /mnt/zfsdata
-            sudo wget -q https://git.kernel.org/torvalds/t/linux-7.2-rc1.tar.gz
+            sudo wget -q https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/snapshot/linux-7.2-rc1.tar.gz
             sudo tar -xf linux-7.2-rc1.tar.gz
             sudo zfs snapshot testpool/data@snapshot1
             kill -TERM $ZEROFS_PID || true
@@ -354,7 +373,7 @@ jobs:
             KERNEL_SOURCE=$(mktemp -d /tmp/zerofs-pgo-kernel.XXXXXX)
             cd "$KERNEL_SOURCE"
             echo "Preparing Linux sources on the runner's local disk"
-            wget -q https://git.kernel.org/torvalds/t/linux-7.2-rc1.tar.gz
+            wget -q https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/snapshot/linux-7.2-rc1.tar.gz
             tar -xf linux-7.2-rc1.tar.gz
             cd linux-7.2-rc1
             echo "Compiling Linux with all build output on ZeroFS NFS"
@@ -688,7 +707,7 @@ jobs:
           done
 
           cd /mnt/zerofs
-          wget -q https://git.kernel.org/torvalds/t/linux-7.2-rc1.tar.gz
+          wget -q https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/snapshot/linux-7.2-rc1.tar.gz
           tar -xf linux-7.2-rc1.tar.gz
           cd linux-7.2-rc1
           make tinyconfig
@@ -782,3 +801,4 @@ jobs:
           subject-path: |
             zerofs-pgo-multiplatform.tar.gz
             release/zerofs-*-pgo*
+
