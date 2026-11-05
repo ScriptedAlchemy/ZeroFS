@@ -16,10 +16,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::local_object_store::LocalConditionalStore;
 use object_store::ClientConfigKey;
 use object_store::ClientOptions;
 use object_store::ObjectStore;
-use crate::local_object_store::LocalConditionalStore;
 use object_store::memory::InMemory;
 use object_store::path::Path;
 use std::sync::Arc;
@@ -388,9 +388,9 @@ pub(crate) async fn build_sftp_store_with_warmup(
         crate::sftp_transport::SftpSessionPool::from_config_writable_deferred(factory, &config)
     }
     .map_err(|source| object_store::Error::Generic {
-            store: "SFTP",
-            source: Box::new(source),
-        })?;
+        store: "SFTP",
+        source: Box::new(source),
+    })?;
     let store = crate::sftp_object_store::SftpObjectStore::new(pool.clone(), path.clone())?;
     Ok(ParsedStore {
         store: Box::new(store),

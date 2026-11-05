@@ -60,11 +60,7 @@ async fn placement(store: &PoolObjectStore, path: &Path) -> String {
         .member_id
 }
 
-async fn multipart(
-    store: &PoolObjectStore,
-    path: &Path,
-    size: u64,
-) -> Box<dyn MultipartUpload> {
+async fn multipart(store: &PoolObjectStore, path: &Path, size: u64) -> Box<dyn MultipartUpload> {
     let capability = ConditionalMultipartCreate::for_payload_len(size);
     let mut options = PutMultipartOptions::default();
     options.extensions.insert(GeneratedSegmentCreate);
@@ -298,7 +294,10 @@ async fn metadata_stays_on_authority_while_segments_fill_members_in_order() {
     create(&pool, &segment(1), b"12345678").await;
     create(&pool, &segment(2), b"abcd").await;
 
-    assert_eq!(read(fixture.authority.as_ref(), &metadata).await, "metadata");
+    assert_eq!(
+        read(fixture.authority.as_ref(), &metadata).await,
+        "metadata"
+    );
     assert!(matches!(
         fixture.authority.head(&segment(1)).await,
         Err(object_store::Error::NotFound { .. })
@@ -425,9 +424,13 @@ async fn pending_uploads_cannot_overcommit_capacity_and_abort_releases_it() {
     assert_eq!(usage(&pool, "hdd-a").await, (0, 6, 0));
     assert_eq!(usage(&pool, "hdd-b").await, (0, 6, 0));
     assert!(
-        pool.put_opts(&segment(3), Bytes::from_static(b"x").into(), create_options())
-            .await
-            .is_err()
+        pool.put_opts(
+            &segment(3),
+            Bytes::from_static(b"x").into(),
+            create_options()
+        )
+        .await
+        .is_err()
     );
     first.abort().await.unwrap();
     second.abort().await.unwrap();
@@ -691,12 +694,23 @@ async fn listing_and_delimiters_merge_legacy_and_pool_objects_without_duplicates
     );
     let expected_prefixes: BTreeSet<_> = expected
         .iter()
-        .map(|path| Path::from(path.as_ref().split('/').take(3).collect::<Vec<_>>().join("/")))
+        .map(|path| {
+            Path::from(
+                path.as_ref()
+                    .split('/')
+                    .take(3)
+                    .collect::<Vec<_>>()
+                    .join("/"),
+            )
+        })
         .collect();
     let delimited = pool.list_with_delimiter(Some(&prefix)).await.unwrap();
     assert!(delimited.objects.is_empty());
     assert_eq!(
-        delimited.common_prefixes.into_iter().collect::<BTreeSet<_>>(),
+        delimited
+            .common_prefixes
+            .into_iter()
+            .collect::<BTreeSet<_>>(),
         expected_prefixes
     );
 }
@@ -782,7 +796,11 @@ async fn a_replaced_member_root_cannot_silently_be_treated_as_empty_storage() {
     {
         assert!(pool.get(&segment(1)).await.is_err());
         if pool
-            .put_opts(&segment(2), Bytes::from_static(b"new").into(), create_options())
+            .put_opts(
+                &segment(2),
+                Bytes::from_static(b"new").into(),
+                create_options(),
+            )
             .await
             .is_ok()
         {
@@ -816,12 +834,19 @@ async fn cancelled_member_put_is_recovered_without_publishing_or_leaking_quota()
     let writer = pool.clone();
     let task = tokio::spawn(async move {
         writer
-            .put_opts(&segment(1), Bytes::from_static(b"abcdef").into(), create_options())
+            .put_opts(
+                &segment(1),
+                Bytes::from_static(b"abcdef").into(),
+                create_options(),
+            )
             .await
     });
-    tokio::time::timeout(Duration::from_secs(5), fixture.first.control.entered.notified())
-        .await
-        .expect("the member PUT should be reached after reserving capacity");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        fixture.first.control.entered.notified(),
+    )
+    .await
+    .expect("the member PUT should be reached after reserving capacity");
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
     assert_eq!(pool.status().await.unwrap().mapped_objects, 0);
@@ -870,6 +895,18 @@ async fn copied_catalog_cannot_open_a_second_owner_at_a_different_directory() {
     // Copy only after closing the original database, so this is a valid
     // catalog copy rather than a torn snapshot or a malformed file.
     let copied_directory = tempfile::tempdir().unwrap();
+    // Make this a valid private catalog directory before testing its identity.
+    // Some hosted environments create temporary directories with mode 0755.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(
+            copied_directory.path(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+    }
     std::fs::copy(
         fixture
             .catalog

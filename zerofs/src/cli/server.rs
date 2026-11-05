@@ -539,9 +539,7 @@ impl ServingStopCause {
     }
 }
 
-async fn wait_for_sftp_failure(
-    pool: Option<&BackendSessions>,
-) -> anyhow::Error {
+async fn wait_for_sftp_failure(pool: Option<&BackendSessions>) -> anyhow::Error {
     match pool {
         Some(pool) => pool.wait_closed().await,
         None => std::future::pending().await,

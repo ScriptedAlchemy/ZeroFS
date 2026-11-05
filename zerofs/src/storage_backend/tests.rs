@@ -202,10 +202,24 @@ async fn configured_local_disks_spill_at_capacity_and_reopen_with_the_same_place
     assert_eq!(member_for(&pool, &second).await, "disk-b");
     let before = pool.status().await.unwrap();
     assert_eq!(before.mapped_objects, 2);
-    let a = before.members.iter().find(|member| member.id == "disk-a").unwrap();
-    let b = before.members.iter().find(|member| member.id == "disk-b").unwrap();
-    assert_eq!((a.capacity_bytes, a.used_bytes, a.reserved_bytes), (8, 8, 0));
-    assert_eq!((b.capacity_bytes, b.used_bytes, b.reserved_bytes), (16, 4, 0));
+    let a = before
+        .members
+        .iter()
+        .find(|member| member.id == "disk-a")
+        .unwrap();
+    let b = before
+        .members
+        .iter()
+        .find(|member| member.id == "disk-b")
+        .unwrap();
+    assert_eq!(
+        (a.capacity_bytes, a.used_bytes, a.reserved_bytes),
+        (8, 8, 0)
+    );
+    assert_eq!(
+        (b.capacity_bytes, b.used_bytes, b.reserved_bytes),
+        (16, 4, 0)
+    );
     assert_eq!(copies_on_disk(&fixture.members[0], b"12345678").await, 1);
     assert_eq!(copies_on_disk(&fixture.members[1], b"12345678").await, 0);
     assert_eq!(copies_on_disk(&fixture.members[0], b"abcd").await, 0);
@@ -259,7 +273,13 @@ async fn ordinary_open_requires_initialization_and_never_recreates_a_lost_catalo
 async fn adding_a_configured_disk_preserves_existing_data_and_uses_new_capacity() {
     let fixture = Fixture::new(8, 16);
     let mut initial_settings = fixture.settings.clone();
-    initial_settings.storage.pool.as_mut().unwrap().members.truncate(1);
+    initial_settings
+        .storage
+        .pool
+        .as_mut()
+        .unwrap()
+        .members
+        .truncate(1);
     let initial_settings = fixture.reload(&initial_settings).unwrap();
     let (opened, pool) = open_pool_storage(&initial_settings, true).await.unwrap();
     let first = segment(&opened.path, 1);
@@ -342,7 +362,10 @@ fn invalid_member_ids_and_capacity_budgets_are_rejected_during_settings_validati
     for id in ["", "../disk", "authority", "disk-b"] {
         let mut settings = fixture.settings.clone();
         settings.storage.pool.as_mut().unwrap().members[0].id = id.to_owned();
-        assert!(fixture.reload(&settings).is_err(), "accepted invalid member id {id:?}");
+        assert!(
+            fixture.reload(&settings).is_err(),
+            "accepted invalid member id {id:?}"
+        );
     }
     for capacity in [0.0, -1.0, f64::NAN, f64::INFINITY] {
         let mut settings = fixture.settings.clone();
@@ -359,10 +382,17 @@ fn invalid_member_ids_and_capacity_budgets_are_rejected_during_settings_validati
 #[test]
 fn unsupported_member_schemes_and_remote_metadata_are_rejected_before_opening_storage() {
     let fixture = Fixture::new(8, 16);
-    for url in ["memory:///transient", "https://example.invalid/data", "ftp://example.invalid/data"] {
+    for url in [
+        "memory:///transient",
+        "https://example.invalid/data",
+        "ftp://example.invalid/data",
+    ] {
         let mut settings = fixture.settings.clone();
         settings.storage.pool.as_mut().unwrap().members[0].url = url.to_owned();
-        assert!(fixture.reload(&settings).is_err(), "accepted unsupported member URL {url}");
+        assert!(
+            fixture.reload(&settings).is_err(),
+            "accepted unsupported member URL {url}"
+        );
     }
     let mut settings = fixture.settings.clone();
     settings.storage.url = "s3://metadata-must-stay-local/data".to_owned();

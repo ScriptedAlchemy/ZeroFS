@@ -691,7 +691,11 @@ pub struct StoragePoolMemberConfig {
     pub(crate) gcp: Option<GcsConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) sftp: Option<SftpConfig>,
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_optional_expandable_string")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_expandable_string"
+    )]
     pub(crate) storage_class: Option<String>,
 }
 
@@ -701,7 +705,8 @@ fn default_pool_reserve_free_gb() -> f64 {
 
 impl fmt::Debug for StoragePoolMemberConfig {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_struct("StoragePoolMemberConfig")
+        formatter
+            .debug_struct("StoragePoolMemberConfig")
             .field("id", &self.id)
             .field("url", &redacted_storage_url(&self.url))
             .field("capacity_gb", &self.capacity_gb)
@@ -738,8 +743,16 @@ impl StoragePoolMemberConfig {
 
 fn pool_gb_to_bytes(value: f64, name: &str, allow_zero: bool) -> Result<u64> {
     let bytes = value * 1_000_000_000.0;
-    if !value.is_finite() || value < 0.0 || (!allow_zero && bytes < 1.0) || bytes >= u64::MAX as f64 {
-        anyhow::bail!("[storage.pool.members] {name} must be a finite {} GB value within the byte limit", if allow_zero { "nonnegative" } else { "positive" });
+    if !value.is_finite() || value < 0.0 || (!allow_zero && bytes < 1.0) || bytes >= u64::MAX as f64
+    {
+        anyhow::bail!(
+            "[storage.pool.members] {name} must be a finite {} GB value within the byte limit",
+            if allow_zero {
+                "nonnegative"
+            } else {
+                "positive"
+            }
+        );
     }
     Ok(bytes.floor() as u64)
 }
@@ -748,55 +761,105 @@ impl StoragePoolConfig {
     fn validate(&self, settings: &Settings) -> Result<()> {
         let authority = url::Url::parse(&settings.storage.url)?;
         if authority.scheme() != "file" || authority.to_file_path().is_err() {
-            anyhow::bail!("[storage.pool] requires a local file:// [storage].url for authoritative metadata");
+            anyhow::bail!(
+                "[storage.pool] requires a local file:// [storage].url for authoritative metadata"
+            );
         }
         if settings.replication.is_some() {
-            anyhow::bail!("[storage.pool] owns a local catalog exclusively and does not support [replication]");
+            anyhow::bail!(
+                "[storage.pool] owns a local catalog exclusively and does not support [replication]"
+            );
         }
         if settings.storage.storage_class.is_some() {
-            anyhow::bail!("set storage_class on individual pool members, not the local metadata store");
+            anyhow::bail!(
+                "set storage_class on individual pool members, not the local metadata store"
+            );
         }
-        if !self.catalog_dir.is_absolute() || self.catalog_dir.components().any(|part| matches!(part, std::path::Component::ParentDir)) {
-            anyhow::bail!("[storage.pool] catalog_dir must be an absolute path without parent components");
+        if !self.catalog_dir.is_absolute()
+            || self
+                .catalog_dir
+                .components()
+                .any(|part| matches!(part, std::path::Component::ParentDir))
+        {
+            anyhow::bail!(
+                "[storage.pool] catalog_dir must be an absolute path without parent components"
+            );
         }
         if self.members.is_empty() {
             anyhow::bail!("[storage.pool] requires at least one member");
         }
         let mut ids = HashSet::new();
         let mut urls = HashSet::new();
-        let mut account_connections = std::collections::HashMap::<(String, u16, String), usize>::new();
+        let mut account_connections =
+            std::collections::HashMap::<(String, u16, String), usize>::new();
         for member in &self.members {
-            if member.id.is_empty() || member.id == "authority" || member.id.len() > 64 || !member.id.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')) || !ids.insert(member.id.as_str()) {
-                anyhow::bail!("pool member IDs must be unique, nonempty ASCII letters/digits/hyphens/underscores (at most 64 bytes)");
+            if member.id.is_empty()
+                || member.id == "authority"
+                || member.id.len() > 64
+                || !member
+                    .id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+                || !ids.insert(member.id.as_str())
+            {
+                anyhow::bail!(
+                    "pool member IDs must be unique, nonempty ASCII letters/digits/hyphens/underscores (at most 64 bytes)"
+                );
             }
             member.capacity_bytes()?;
             member.reserve_free_bytes()?;
-            let url = url::Url::parse(&member.url).with_context(|| format!("invalid URL for pool member {}", member.id))?;
+            let url = url::Url::parse(&member.url)
+                .with_context(|| format!("invalid URL for pool member {}", member.id))?;
             if url.password().is_some() || url.query().is_some() || url.fragment().is_some() {
-                anyhow::bail!("pool member URLs must not contain passwords, queries, or fragments; configure credentials in provider sections");
+                anyhow::bail!(
+                    "pool member URLs must not contain passwords, queries, or fragments; configure credentials in provider sections"
+                );
             }
             if !urls.insert(url.to_string()) {
                 anyhow::bail!("pool members must not reuse the same storage URL");
             }
             let (scheme, _) = crate::parse_object_store::ObjectStoreScheme::parse(&url)?;
             use crate::parse_object_store::ObjectStoreScheme;
-            if !matches!(scheme, ObjectStoreScheme::Local | ObjectStoreScheme::AmazonS3 | ObjectStoreScheme::GoogleCloudStorage | ObjectStoreScheme::MicrosoftAzure | ObjectStoreScheme::Sftp) {
-                anyhow::bail!("pool members must use persistent local, S3, Azure, GCS, or SFTP storage");
+            if !matches!(
+                scheme,
+                ObjectStoreScheme::Local
+                    | ObjectStoreScheme::AmazonS3
+                    | ObjectStoreScheme::GoogleCloudStorage
+                    | ObjectStoreScheme::MicrosoftAzure
+                    | ObjectStoreScheme::Sftp
+            ) {
+                anyhow::bail!(
+                    "pool members must use persistent local, S3, Azure, GCS, or SFTP storage"
+                );
             }
-            if matches!(scheme, ObjectStoreScheme::Local | ObjectStoreScheme::Sftp) && member.storage_class.is_some() {
+            if matches!(scheme, ObjectStoreScheme::Local | ObjectStoreScheme::Sftp)
+                && member.storage_class.is_some()
+            {
                 anyhow::bail!("storage_class is not supported on local or SFTP pool members");
             }
             if scheme == ObjectStoreScheme::Sftp {
-                let host = url.host_str().filter(|host| !host.is_empty()).context("SFTP pool member requires a host")?;
+                let host = url
+                    .host_str()
+                    .filter(|host| !host.is_empty())
+                    .context("SFTP pool member requires a host")?;
                 if url.username().is_empty() {
                     anyhow::bail!("SFTP pool member requires a username");
                 }
                 let sftp = member.sftp.clone().unwrap_or_default();
                 sftp.validate()?;
-                let total = account_connections.entry((host.to_owned(), url.port().unwrap_or(22), url.username().to_owned())).or_default();
+                let total = account_connections
+                    .entry((
+                        host.to_owned(),
+                        url.port().unwrap_or(22),
+                        url.username().to_owned(),
+                    ))
+                    .or_default();
                 *total += sftp.max_connections;
                 if *total > SftpConfig::MAX_ACCOUNT_CONNECTIONS {
-                    anyhow::bail!("SFTP pool members for the same account must share a total connection budget of at most {}", SftpConfig::MAX_ACCOUNT_CONNECTIONS);
+                    anyhow::bail!(
+                        "SFTP pool members for the same account must share a total connection budget of at most {}",
+                        SftpConfig::MAX_ACCOUNT_CONNECTIONS
+                    );
                 }
             } else if member.sftp.is_some() {
                 anyhow::bail!("a pool member's [sftp] section requires an sftp:// URL");
@@ -2084,7 +2147,9 @@ impl Settings {
     /// profile; every other backend runs on the defaults.
     pub(crate) fn store_profile(&self) -> Result<StoreProfile> {
         if let Some(pool) = &self.storage.pool {
-            let profile = pool.members.iter()
+            let profile = pool
+                .members
+                .iter()
                 .filter(|member| has_sftp_scheme(&member.url))
                 .map(|member| member.sftp.clone().unwrap_or_default().data_profile())
                 .min_by_key(|profile| profile.segment_size_bytes);

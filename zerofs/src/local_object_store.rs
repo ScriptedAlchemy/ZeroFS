@@ -28,9 +28,9 @@ use futures::{FutureExt, StreamExt};
 use object_store::local::LocalFileSystem;
 use object_store::path::Path;
 use object_store::{
-    CopyOptions, Error, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    ObjectStoreExt, PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions,
-    Result, UploadPart,
+    CopyOptions, Error, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+    ObjectStore, ObjectStoreExt, PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    RenameOptions, Result, UploadPart,
 };
 use std::fmt::{self, Display, Formatter};
 use std::fs::{File, OpenOptions};
@@ -202,9 +202,10 @@ impl ObjectStore for LocalConditionalStore {
         let path = self.inner.path_to_filesystem(location)?;
         let location = location.clone();
         let inner = self.inner.clone();
-        let upload =
-            run_local(move || futures::executor::block_on(inner.put_multipart_opts(&location, opts)))
-                .await?;
+        let upload = run_local(move || {
+            futures::executor::block_on(inner.put_multipart_opts(&location, opts))
+        })
+        .await?;
         Ok(Box::new(LocalMultipartUpload {
             upload: Some(upload),
             path,
@@ -336,7 +337,8 @@ struct LocalMultipartUpload {
 impl MultipartUpload for LocalMultipartUpload {
     fn put_part(&mut self, payload: PutPayload) -> UploadPart {
         let Some(upload) = self.upload.as_mut() else {
-            return futures::future::ready(Err(generic("multipart upload already finished"))).boxed();
+            return futures::future::ready(Err(generic("multipart upload already finished")))
+                .boxed();
         };
         self.parts.pending.fetch_add(1, Ordering::AcqRel);
         let mut guard = PartGuard {
@@ -413,7 +415,10 @@ mod tests {
             .put_opts(&path, "first".into(), PutMode::Create.into())
             .await
             .unwrap();
-        assert_eq!(std::fs::read(directory.path().join("object")).unwrap(), b"first");
+        assert_eq!(
+            std::fs::read(directory.path().join("object")).unwrap(),
+            b"first"
+        );
         assert_eq!(store.head(&path).await.unwrap().e_tag, first.e_tag);
         assert!(matches!(
             store
@@ -462,7 +467,11 @@ mod tests {
             Err(Error::Precondition { .. })
         ));
         assert_eq!(bytes(&store, &path).await, "newer");
-        let listed = store.list(Some(&prefix)).try_collect::<Vec<_>>().await.unwrap();
+        let listed = store
+            .list(Some(&prefix))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].location, path);
         let listing = store.list_with_delimiter(Some(&prefix)).await.unwrap();
@@ -529,8 +538,7 @@ mod tests {
         );
         assert!(matches!(
             (a, b),
-            (Ok(_), Err(Error::Precondition { .. }))
-                | (Err(Error::Precondition { .. }), Ok(_))
+            (Ok(_), Err(Error::Precondition { .. })) | (Err(Error::Precondition { .. }), Ok(_))
         ));
         assert_eq!(bytes(&store, &path).await, bytes(&store, &alias).await);
     }
@@ -593,12 +601,20 @@ mod tests {
         let target = prefix.clone().join("a").join("target");
         store.put(&source, "payload".into()).await.unwrap();
         store
-            .copy_opts(&source, &copy, CopyOptions::new().with_mode(CopyMode::Create))
+            .copy_opts(
+                &source,
+                &copy,
+                CopyOptions::new().with_mode(CopyMode::Create),
+            )
             .await
             .unwrap();
         assert!(matches!(
             store
-                .copy_opts(&source, &copy, CopyOptions::new().with_mode(CopyMode::Create))
+                .copy_opts(
+                    &source,
+                    &copy,
+                    CopyOptions::new().with_mode(CopyMode::Create)
+                )
                 .await,
             Err(Error::AlreadyExists { .. })
         ));
@@ -610,7 +626,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(matches!(store.head(&copy).await, Err(Error::NotFound { .. })));
+        assert!(matches!(
+            store.head(&copy).await,
+            Err(Error::NotFound { .. })
+        ));
         let previous = store.head(&target).await.unwrap();
         store.delete(&target).await.unwrap();
         assert!(matches!(
@@ -633,7 +652,11 @@ mod tests {
                 .await,
             Err(Error::Precondition { .. })
         ));
-        let listed = store.list(Some(&prefix)).try_collect::<Vec<_>>().await.unwrap();
+        let listed = store
+            .list(Some(&prefix))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].location, source);
     }
@@ -711,19 +734,24 @@ mod tests {
         std::fs::write(root.join(format!("{name}.ready")), "ready").unwrap();
         let deadline = Instant::now() + Duration::from_secs(15);
         while !root.join("go").exists() {
-            assert!(Instant::now() < deadline, "parent did not release CAS writers");
+            assert!(
+                Instant::now() < deadline,
+                "parent did not release CAS writers"
+            );
             std::thread::sleep(Duration::from_millis(5));
         }
         let location = Path::from_filesystem_path(&root).unwrap().join("object");
-        let result = futures::executor::block_on(LocalConditionalStore::new().put_opts(
-            &location,
-            name.clone().into(),
-            PutMode::Update(UpdateVersion {
-                e_tag: Some(expected),
-                version: None,
-            })
-            .into(),
-        ));
+        let result = futures::executor::block_on(
+            LocalConditionalStore::new().put_opts(
+                &location,
+                name.clone().into(),
+                PutMode::Update(UpdateVersion {
+                    e_tag: Some(expected),
+                    version: None,
+                })
+                .into(),
+            ),
+        );
         let outcome = match result {
             Ok(_) => "won",
             Err(Error::Precondition { .. }) => "stale",
@@ -747,7 +775,10 @@ mod tests {
                     .arg("--nocapture")
                     .env("ZEROFS_LOCAL_CAS_TEST_ROOT", directory.path())
                     .env("ZEROFS_LOCAL_CAS_TEST_WRITER", name)
-                    .env("ZEROFS_LOCAL_CAS_TEST_ETAG", initial.e_tag.as_ref().unwrap())
+                    .env(
+                        "ZEROFS_LOCAL_CAS_TEST_ETAG",
+                        initial.e_tag.as_ref().unwrap(),
+                    )
                     .kill_on_drop(true)
                     .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::piped())
@@ -777,8 +808,9 @@ mod tests {
                 String::from_utf8_lossy(&output.stderr),
             );
         }
-        let mut outcomes = ["left", "right"]
-            .map(|name| std::fs::read_to_string(directory.path().join(format!("{name}.result"))).unwrap());
+        let mut outcomes = ["left", "right"].map(|name| {
+            std::fs::read_to_string(directory.path().join(format!("{name}.result"))).unwrap()
+        });
         outcomes.sort();
         assert_eq!(outcomes, ["stale", "won"]);
         let actual = bytes(&store, &path).await;

@@ -55,5 +55,10 @@ pub async fn run(command: PoolCommands) -> Result<()> {
     }.await;
     drop(pool);
     drop(opened);
-    finish_with_sftp_cleanup(sessions.as_ref(), "Failed to shut down storage pool transports", result).await
+    finish_with_sftp_cleanup(
+        sessions.as_ref(),
+        "Failed to shut down storage pool transports",
+        result,
+    )
+    .await
 }

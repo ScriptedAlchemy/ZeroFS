@@ -15,9 +15,9 @@ pub mod frame_codec;
 pub mod fs;
 mod key_management;
 pub mod length_checked_object_store;
-mod local_object_store;
 #[allow(dead_code)]
 mod linux_errno;
+mod local_object_store;
 pub(crate) mod metadata_digest;
 #[cfg(target_os = "linux")]
 mod mount;
@@ -42,9 +42,9 @@ mod sftp_metrics;
 pub mod sftp_object_store;
 mod sftp_protocol;
 pub mod sftp_transport;
+mod storage_backend;
 pub mod storage_class_object_store;
 mod storage_compatibility;
-mod storage_backend;
 pub(crate) mod task;
 mod telemetry;
 #[cfg(feature = "webui")]

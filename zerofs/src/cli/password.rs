@@ -53,8 +53,8 @@ pub async fn change_password(
         path: path_from_url,
         sftp_pool,
     } = crate::storage_backend::open_storage(settings)
-    .await
-    .map_err(|e| PasswordError::Other(e.to_string()))?;
+        .await
+        .map_err(|e| PasswordError::Other(e.to_string()))?;
 
     let object_store = with_storage_class(
         Arc::from(object_store),

@@ -4602,7 +4602,11 @@ mod tests {
         assert_eq!(factory.live(), 0);
         tokio::time::advance(SFTP_IDLE_TIMEOUT + SFTP_IDLE_REAP_INTERVAL).await;
         tokio::task::yield_now().await;
-        assert_eq!(factory.dials(), 0, "maintenance must not activate an unused member");
+        assert_eq!(
+            factory.dials(),
+            0,
+            "maintenance must not activate an unused member"
+        );
 
         let lease = pool.checkout(OperationKind::Read).await.unwrap();
         assert_eq!(factory.dials(), 1);
