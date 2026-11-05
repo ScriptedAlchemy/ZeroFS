@@ -751,7 +751,11 @@
                                                              (or (.listFiles (dc-file dir dirname))
                                                                  (into-array java.io.File []))))])))))))
   (teardown! [_ _test] (close-durability-handles! handles))
-  (close! [_ _test] (close-durability-handles! handles)))
+  ;; Jepsen closes a worker before replacing a crashed logical process. These
+  ;; handles belong to the whole test, not that worker: closing them here erases
+  ;; the final read's file inventory and invalidates other workers' open fds.
+  ;; Global teardown still atomically closes every resource exactly once.
+  (close! [_ _test]))
 
 ;; Nemesis: process loss, object-store pauses, replication partitions, blocked
 ;; survivor restart, forced recovery, and cluster repair.
@@ -1606,3 +1610,4 @@
   (cli/run! (merge (cli/single-test-cmd {:test-fn ha-test :opt-spec cli-opts})
                    (cli/serve-cmd))
             args))
+

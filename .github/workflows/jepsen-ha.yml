@@ -81,6 +81,11 @@ jobs:
           sudo chmod +x /usr/local/bin/lein
           lein version
 
+      - name: Test HA harness contracts
+        run: |
+          cd "$GITHUB_WORKSPACE/jepsen/ha"
+          lein test zerofs-ha.core-test
+
       - name: Build pinned MinIO fixture
         uses: ./.github/actions/build-minio-fixture
 
@@ -371,3 +376,4 @@ jobs:
             jepsen/ha/store
             jepsen/ha/guest-store
           if-no-files-found: ignore
+
