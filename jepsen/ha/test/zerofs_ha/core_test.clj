@@ -3,6 +3,7 @@
             [clojure.test :refer [deftest is testing]]
             [jepsen.checker :as checker]
             [jepsen.util :as util]
+            [jepsen.nemesis :as nemesis]
             [slingshot.slingshot :refer [try+]]
             [zerofs-ha.core :as core])
   (:import [java.net StandardProtocolFamily UnixDomainSocketAddress]
@@ -127,6 +128,39 @@
       (finally
         (.delete log-a)
         (.delete log-b)))))
+
+(deftest await-serving-requires-promoted-node
+  (let [previous @core/cluster-roles
+        probe (fn [roles op live]
+                (reset! core/cluster-roles roles)
+                (let [seen (atom [])
+                      accepted (atom nil)]
+                  (with-redefs [core/node-9p-up?
+                                (fn [_ node]
+                                  (swap! seen conj node)
+                                  (contains? live node))
+                                util/await-fn
+                                (fn [predicate _]
+                                  (reset! accepted
+                                          (try (boolean (predicate))
+                                               (catch Throwable _ false))))]
+                    (nemesis/invoke! (core/ha-nemesis)
+                                     {:work-dir "/tmp/zerofs-ha-test"} op))
+                  [@accepted @seen]))]
+    (try
+      ;; SIGKILL need not close the old socket before the next poll.
+      (is (= [false [:b]]
+             (probe {:a :dead :b :leader} {:f :await-serving} #{:a})))
+      (is (= [true [:b]]
+             (probe {:a :dead :b :leader} {:f :await-serving} #{:b})))
+      ;; The Solo leader still accepts connections during partition.
+      (is (= [false [:b]]
+             (probe {:a :leader :b :standby}
+                    {:f :await-serving :target :standby} #{:a})))
+      (is (= [true [:b]]
+             (probe {:a :leader :b :standby}
+                    {:f :await-serving :target :standby} #{:b})))
+      (finally (reset! core/cluster-roles previous)))))
 
 (deftest make-bucket-waits-for-a-readable-bucket
   (let [commands (atom [])

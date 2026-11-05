@@ -81,6 +81,13 @@ jobs:
           sudo chmod +x /usr/local/bin/lein
           lein version
 
+      # Verify takeover readiness once, before costly mounted HA scenarios.
+      - name: Test HA promoted-listener readiness
+        if: matrix.mount-client == 'fuse'
+        run: |
+          cd "$GITHUB_WORKSPACE/jepsen/ha"
+          sudo env HOME=/root LEIN_ROOT=1 JAVA_HOME="$JAVA_HOME" /usr/local/bin/lein test zerofs-ha.core-test
+
       - name: Build pinned MinIO fixture
         uses: ./.github/actions/build-minio-fixture
 
