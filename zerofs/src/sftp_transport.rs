@@ -1391,6 +1391,7 @@ impl SftpSessionPool {
         Ok(pool)
     }
 
+    #[cfg(test)]
     pub(crate) async fn new_writable(
         factory: Arc<dyn SessionFactory>,
         shared: usize,

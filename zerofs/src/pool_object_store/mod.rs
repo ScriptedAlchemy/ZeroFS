@@ -102,6 +102,17 @@ struct PoolInner {
     locks: Vec<Arc<RwLock<()>>>,
 }
 
+struct ReservedPut {
+    location: Path,
+    payload: PutPayload,
+    options: PutOptions,
+    upload: Upload,
+    previous: Option<Entry>,
+    preserve: Option<Entry>,
+    cancelled: Arc<AtomicBool>,
+    verify: bool,
+}
+
 impl fmt::Debug for PoolObjectStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PoolObjectStore")
@@ -387,11 +398,10 @@ impl PoolObjectStore {
         self.catalog(move |catalog| catalog.reserve(&key, size, &members, target.as_deref())).await
     }
 
-    async fn put_reserved(
-        &self, location: &Path, payload: PutPayload, mut options: PutOptions,
-        upload: Upload, previous: Option<Entry>, preserve: Option<Entry>,
-        cancelled: Arc<AtomicBool>, verify: bool,
-    ) -> object_store::Result<PutResult> {
+    async fn put_reserved(&self, request: ReservedPut) -> object_store::Result<PutResult> {
+        let ReservedPut {
+            location, payload, mut options, upload, previous, preserve, cancelled, verify,
+        } = request;
         let outcome = async {
             if u64::try_from(payload.content_length()).ok() != Some(upload.size) {
                 return Err(error("pool payload length does not match its reservation"));
@@ -477,7 +487,29 @@ impl PoolObjectStore {
         Self::check_mode(&location, &options.mode, previous.as_ref())?;
         let size = u64::try_from(payload.content_length()).map_err(|_| error("pool payload length overflow"))?;
         let upload = self.reserve(&location, size, None).await?;
-        self.put_reserved(&location, payload, options, upload, previous, None, cancelled, false).await
+        self.put_reserved(ReservedPut {
+            location, payload, options, upload, previous, preserve: None, cancelled, verify: false,
+        }).await
+    }
+
+    async fn begin_multipart_owned(
+        &self, location: Path, options: PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        let capability = options.extensions.get::<ConditionalMultipartCreate>().cloned()
+            .ok_or_else(|| unsupported("pool multipart requires a declared conditional-create segment length"))?;
+        let length = capability.declared_payload_len()
+            .ok_or_else(|| unsupported("pool multipart requires a declared payload length"))?;
+        {
+            let _guard = self.key_lock(&location).write_owned().await;
+            let previous = self.visible(&location).await?;
+            Self::check_mode(&location, &PutMode::Create, previous.as_ref())?;
+        }
+        let upload = self.reserve(&location, length, None).await?;
+        capability.acknowledge();
+        Ok(Box::new(PoolMultipartUpload {
+            pool: self.clone(), location, upload: Some(upload), options: Some(options),
+            parts: Vec::new(), received: 0, completed: Arc::new(StdMutex::new(Vec::new())),
+        }))
     }
 
     async fn physical_get(&self, physical: &Physical, options: GetOptions) -> object_store::Result<GetResult> {
@@ -693,7 +725,10 @@ impl PoolObjectStore {
             };
             let mut options = PutOptions::from(PutMode::Create);
             options.attributes = attributes;
-            pool.put_reserved(&location, payload, options, upload, Some(previous.clone()), Some(previous), cancelled, true).await?;
+            pool.put_reserved(ReservedPut {
+                location, payload, options, upload, previous: Some(previous.clone()),
+                preserve: Some(previous), cancelled, verify: true,
+            }).await?;
             Ok(())
         }).await.map_err(|e| error(format!("pool migration task failed: {e}")))?
     }
@@ -745,21 +780,13 @@ impl ObjectStore for PoolObjectStore {
     async fn put_multipart_opts(&self, location: &Path, options: PutMultipartOptions) -> object_store::Result<Box<dyn MultipartUpload>> {
         if self.internal(location) { return Err(unsupported("pool identity metadata is reserved")); }
         if !self.segment(location) { return self.inner.authority.put_multipart_opts(location, options).await }
-        let capability = options.extensions.get::<ConditionalMultipartCreate>().cloned()
-            .ok_or_else(|| unsupported("pool multipart requires a declared conditional-create segment length"))?;
-        let length = capability.declared_payload_len()
-            .ok_or_else(|| unsupported("pool multipart requires a declared payload length"))?;
-        {
-            let _guard = self.key_lock(location).write_owned().await;
-            let previous = self.visible(location).await?;
-            Self::check_mode(location, &PutMode::Create, previous.as_ref())?;
-        }
-        let upload = self.reserve(location, length, None).await?;
-        capability.acknowledge();
-        Ok(Box::new(PoolMultipartUpload {
-            pool: self.clone(), location: location.clone(), upload: Some(upload), options: Some(options),
-            parts: Vec::new(), received: 0, completed: Arc::new(StdMutex::new(Vec::new())),
-        }))
+        let pool = self.clone();
+        let location = location.clone();
+        // A redb reservation can commit after the waiting future is cancelled.
+        // The owner must still construct its upload handle: if nobody receives
+        // that handle, its Drop path reclaims the reservation automatically.
+        tokio::spawn(async move { pool.begin_multipart_owned(location, options).await })
+            .await.map_err(|e| error(format!("pool multipart begin task failed: {e}")))?
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> object_store::Result<GetResult> {
@@ -919,7 +946,13 @@ impl MultipartUpload for PoolMultipartUpload {
         let _cancel = CancelOnDrop(cancelled.clone());
         tokio::spawn(async move {
             let _guard = pool.key_lock(&location).write_owned().await;
-            let previous = pool.visible(&location).await?;
+            let previous = match pool.visible(&location).await {
+                Ok(previous) => previous,
+                Err(error) => {
+                    let _ = pool.cleanup_upload(&upload).await;
+                    return Err(error);
+                },
+            };
             if let Err(error) = PoolObjectStore::check_mode(&location, &PutMode::Create, previous.as_ref()) {
                 let _ = pool.cleanup_upload(&upload).await;
                 return Err(error);
@@ -928,7 +961,10 @@ impl MultipartUpload for PoolMultipartUpload {
             put.attributes = options.attributes;
             put.tags = options.tags;
             put.extensions = options.extensions;
-            pool.put_reserved(&location, payload, put, upload, previous, None, cancelled, false).await
+            pool.put_reserved(ReservedPut {
+                location, payload, options: put, upload, previous,
+                preserve: None, cancelled, verify: false,
+            }).await
         }).await.map_err(|e| error(format!("pool multipart completion task failed: {e}")))?
     }
 

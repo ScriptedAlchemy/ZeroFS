@@ -858,3 +858,80 @@ async fn cancelled_member_put_is_recovered_without_publishing_or_leaking_quota()
     create(&pool, &segment(2), b"abcdef").await;
     assert_eq!(usage(&pool, "hdd-a").await, (6, 0, 1));
 }
+
+#[tokio::test]
+async fn copied_catalog_cannot_open_a_second_owner_at_a_different_directory() {
+    let fixture = Fixture::new(32);
+    let pool = fixture.initialize().await;
+    let path = segment(1);
+    create(&pool, &path, b"original-data").await;
+    drop(pool);
+
+    // Copy only after closing the original database, so this is a valid
+    // catalog copy rather than a torn snapshot or a malformed file.
+    let copied_directory = tempfile::tempdir().unwrap();
+    std::fs::copy(
+        fixture
+            .catalog
+            .path()
+            .join("catalog")
+            .join(super::CATALOG_FILE_NAME),
+        copied_directory.path().join(super::CATALOG_FILE_NAME),
+    )
+    .unwrap();
+
+    let error = PoolObjectStore::open(
+        fixture.authority.clone(),
+        Path::from("db"),
+        copied_directory.path().to_path_buf(),
+        fixture.members(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("bound to a different catalog directory"),
+        "a valid copy must fail on its directory identity: {error}"
+    );
+
+    let original = fixture.reopen().await.unwrap();
+    assert_eq!(read(&original, &path).await, "original-data");
+    assert_eq!(placement(&original, &path).await, "hdd-a");
+}
+
+#[tokio::test]
+async fn multipart_completion_reclaims_reservation_when_authority_lookup_fails() {
+    let fixture = Fixture::new(6);
+    let authority = FaultStore::new();
+    let pool = PoolObjectStore::initialize(
+        authority.clone(),
+        Path::from("db"),
+        fixture.catalog.path().join("catalog"),
+        fixture.members(),
+    )
+    .await
+    .unwrap();
+    let path = segment(1);
+    let mut upload = multipart(&pool, &path, 6).await;
+    upload
+        .put_part(Bytes::from_static(b"abcdef").into())
+        .await
+        .unwrap();
+    assert_eq!(usage(&pool, "hdd-a").await, (0, 6, 0));
+
+    // Completion must recheck conditional-create visibility. Failure before
+    // the physical PUT must still retire its already-owned reservation.
+    authority.control.offline.store(true, Ordering::SeqCst);
+    assert!(upload.complete().await.is_err());
+    assert_eq!(usage(&pool, "hdd-a").await, (0, 0, 0));
+    assert_eq!(pool.status().await.unwrap().pending_operations, 0);
+
+    authority.control.offline.store(false, Ordering::SeqCst);
+    assert!(matches!(
+        pool.head(&path).await,
+        Err(object_store::Error::NotFound { .. })
+    ));
+    create(&pool, &path, b"abcdef").await;
+    assert_eq!(usage(&pool, "hdd-a").await, (6, 0, 1));
+}

@@ -90,7 +90,9 @@ zerofs run --config zerofs.toml
 silently become an empty replacement pool. An existing authority marker is
 bound to its catalog identity. Normal startup refuses a missing catalog, a
 changed known member identity, and an existing pool opened without its pool
-configuration.
+configuration. The catalog is also bound to its original resolved directory;
+copying the database into a different directory cannot create a second owner of
+the same member data.
 
 Members are considered in configuration order. Each new immutable segment goes
 to the first member whose configured quota and local free-space reserve allow
@@ -211,7 +213,9 @@ directory.
 
 The metadata directory and `catalog_dir` are both authoritative data. A backup
 must preserve both consistently, along with the configured encryption password
-and the member objects they reference. The catalog must never live in an
+and the member objects they reference. Restore the catalog at its original
+resolved directory; relocating it requires a future explicit relocation
+operation. The catalog must never live in an
 evictable cache or disposable temporary directory. Aggregate capacity is not
 redundancy: a segment stored only on one HDD is lost if that HDD fails.
 

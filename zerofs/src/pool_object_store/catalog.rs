@@ -30,12 +30,18 @@ pub(super) struct Identity {
     pub format: u32,
     pub pool_id: String,
     pub authority_prefix: String,
+    pub catalog_directory: String,
     pub initialized: bool,
 }
 
 impl Identity {
     pub fn marker(&self) -> Result<Vec<u8>> {
-        Ok(bincode::serialize(&(self.format, &self.pool_id, &self.authority_prefix))?)
+        Ok(bincode::serialize(&(
+            self.format,
+            &self.pool_id,
+            &self.authority_prefix,
+            &self.catalog_directory,
+        ))?)
     }
 }
 
@@ -175,6 +181,12 @@ impl Catalog {
         } else {
             AnchoredDir::open_absolute(root, 0o700)?
         };
+        let resolved_directory = std::fs::canonicalize(root)
+            .context("resolve pool catalog directory")?;
+        let catalog_directory = resolved_directory
+            .to_str()
+            .context("pool catalog directory must be valid UTF-8")?
+            .to_owned();
         let (lock, _) = anchored.open_owner_file("pool.lock".as_ref(), true)?;
         if !FileExt::try_lock_exclusive(&lock)? {
             bail!("pool catalog is already locked by another process");
@@ -204,12 +216,20 @@ impl Catalog {
                     format: 1,
                     pool_id: Uuid::new_v4().to_string(),
                     authority_prefix: prefix.to_owned(),
+                    catalog_directory: catalog_directory.clone(),
                     initialized: false,
                 },
                 None => bail!("pool catalog has no identity; explicit initialization or recovery is required"),
             };
             if identity.format != 1 || identity.authority_prefix != prefix {
                 bail!("pool catalog format or authority prefix does not match this configuration");
+            }
+            if identity.catalog_directory != catalog_directory {
+                bail!(
+                    "pool is bound to a different catalog directory; restore the catalog at {} instead of opening a moved or copied catalog at {}",
+                    identity.catalog_directory,
+                    catalog_directory,
+                );
             }
             if let Some(marker) = marker {
                 if marker != identity.marker()? {

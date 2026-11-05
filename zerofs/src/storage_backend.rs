@@ -36,7 +36,7 @@ impl BackendSessions {
             std::future::pending::<()>().await;
         }
         let mut closed = self.pools.iter().map(SftpSessionPool::wait_closed).collect::<FuturesUnordered<_>>();
-        closed.next().await;
+        let _ = closed.next().await;
     }
 
     pub(crate) async fn shutdown(&self) -> Result<()> {
@@ -185,10 +185,10 @@ fn validate_directories(settings: &Settings) -> Result<()> {
         ("catalog".to_owned(), resolved_path(&config.catalog_dir)?),
         ("clean cache".to_owned(), resolved_path(&settings.cache.dir)?),
     ];
-    if let Some(writeback) = &settings.writeback {
-        if writeback.enabled {
-            roots.push(("writeback journal".to_owned(), resolved_path(&writeback.dir)?));
-        }
+    if let Some(writeback) = &settings.writeback
+        && writeback.enabled
+    {
+        roots.push(("writeback journal".to_owned(), resolved_path(&writeback.dir)?));
     }
     for member in &config.members {
         let url: url::Url = member.url.parse()?;
