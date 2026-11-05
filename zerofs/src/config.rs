@@ -659,6 +659,151 @@ pub struct StorageConfig {
         deserialize_with = "deserialize_optional_expandable_string"
     )]
     pub(crate) storage_class: Option<String>,
+    /// Permanent segment placement across local disks and remote stores.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) pool: Option<StoragePoolConfig>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct StoragePoolConfig {
+    /// Authoritative placement database; this is data, never an evictable cache.
+    #[serde(deserialize_with = "deserialize_expandable_path")]
+    pub(crate) catalog_dir: PathBuf,
+    /// First member with sufficient capacity receives each new segment.
+    pub(crate) members: Vec<StoragePoolMemberConfig>,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct StoragePoolMemberConfig {
+    pub(crate) id: String,
+    #[serde(deserialize_with = "deserialize_expandable_string")]
+    pub(crate) url: String,
+    pub(crate) capacity_gb: f64,
+    #[serde(default = "default_pool_reserve_free_gb")]
+    pub(crate) reserve_free_gb: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) aws: Option<AwsConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) azure: Option<AzureConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) gcp: Option<GcsConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) sftp: Option<SftpConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_optional_expandable_string")]
+    pub(crate) storage_class: Option<String>,
+}
+
+fn default_pool_reserve_free_gb() -> f64 {
+    1.0
+}
+
+impl fmt::Debug for StoragePoolMemberConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_struct("StoragePoolMemberConfig")
+            .field("id", &self.id)
+            .field("url", &redacted_storage_url(&self.url))
+            .field("capacity_gb", &self.capacity_gb)
+            .field("reserve_free_gb", &self.reserve_free_gb)
+            .finish_non_exhaustive()
+    }
+}
+
+impl StoragePoolMemberConfig {
+    pub(crate) fn capacity_bytes(&self) -> Result<u64> {
+        pool_gb_to_bytes(self.capacity_gb, "capacity_gb", false)
+    }
+
+    pub(crate) fn reserve_free_bytes(&self) -> Result<u64> {
+        pool_gb_to_bytes(self.reserve_free_gb, "reserve_free_gb", true)
+    }
+
+    pub(crate) fn cloud_provider_env_vars(&self) -> Vec<(String, String)> {
+        let mut options = Vec::new();
+        for (prefix, values) in [
+            ("aws", self.aws.as_ref().map(|value| &value.0)),
+            ("azure", self.azure.as_ref().map(|value| &value.0)),
+            ("google", self.gcp.as_ref().map(|value| &value.0)),
+        ] {
+            if let Some(values) = values {
+                options.extend(values.iter().map(|(key, value)| {
+                    (format!("{prefix}_{}", key.to_lowercase()), value.clone())
+                }));
+            }
+        }
+        options
+    }
+}
+
+fn pool_gb_to_bytes(value: f64, name: &str, allow_zero: bool) -> Result<u64> {
+    let bytes = value * 1_000_000_000.0;
+    if !value.is_finite() || value < 0.0 || (!allow_zero && bytes < 1.0) || bytes >= u64::MAX as f64 {
+        anyhow::bail!("[storage.pool.members] {name} must be a finite {} GB value within the byte limit", if allow_zero { "nonnegative" } else { "positive" });
+    }
+    Ok(bytes.floor() as u64)
+}
+
+impl StoragePoolConfig {
+    fn validate(&self, settings: &Settings) -> Result<()> {
+        let authority = url::Url::parse(&settings.storage.url)?;
+        if authority.scheme() != "file" || authority.to_file_path().is_err() {
+            anyhow::bail!("[storage.pool] requires a local file:// [storage].url for authoritative metadata");
+        }
+        if settings.replication.is_some() {
+            anyhow::bail!("[storage.pool] owns a local catalog exclusively and does not support [replication]");
+        }
+        if settings.storage.storage_class.is_some() {
+            anyhow::bail!("set storage_class on individual pool members, not the local metadata store");
+        }
+        if !self.catalog_dir.is_absolute() || self.catalog_dir.components().any(|part| matches!(part, std::path::Component::ParentDir)) {
+            anyhow::bail!("[storage.pool] catalog_dir must be an absolute path without parent components");
+        }
+        if self.members.is_empty() {
+            anyhow::bail!("[storage.pool] requires at least one member");
+        }
+        let mut ids = HashSet::new();
+        let mut urls = HashSet::new();
+        let mut account_connections = std::collections::HashMap::<(String, u16, String), usize>::new();
+        for member in &self.members {
+            if member.id.is_empty() || member.id == "authority" || member.id.len() > 64 || !member.id.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')) || !ids.insert(member.id.as_str()) {
+                anyhow::bail!("pool member IDs must be unique, nonempty ASCII letters/digits/hyphens/underscores (at most 64 bytes)");
+            }
+            member.capacity_bytes()?;
+            member.reserve_free_bytes()?;
+            let url = url::Url::parse(&member.url).with_context(|| format!("invalid URL for pool member {}", member.id))?;
+            if url.password().is_some() || url.query().is_some() || url.fragment().is_some() {
+                anyhow::bail!("pool member URLs must not contain passwords, queries, or fragments; configure credentials in provider sections");
+            }
+            if !urls.insert(url.to_string()) {
+                anyhow::bail!("pool members must not reuse the same storage URL");
+            }
+            let (scheme, _) = crate::parse_object_store::ObjectStoreScheme::parse(&url)?;
+            use crate::parse_object_store::ObjectStoreScheme;
+            if !matches!(scheme, ObjectStoreScheme::Local | ObjectStoreScheme::AmazonS3 | ObjectStoreScheme::GoogleCloudStorage | ObjectStoreScheme::MicrosoftAzure | ObjectStoreScheme::Sftp) {
+                anyhow::bail!("pool members must use persistent local, S3, Azure, GCS, or SFTP storage");
+            }
+            if matches!(scheme, ObjectStoreScheme::Local | ObjectStoreScheme::Sftp) && member.storage_class.is_some() {
+                anyhow::bail!("storage_class is not supported on local or SFTP pool members");
+            }
+            if scheme == ObjectStoreScheme::Sftp {
+                let host = url.host_str().filter(|host| !host.is_empty()).context("SFTP pool member requires a host")?;
+                if url.username().is_empty() {
+                    anyhow::bail!("SFTP pool member requires a username");
+                }
+                let sftp = member.sftp.clone().unwrap_or_default();
+                sftp.validate()?;
+                let total = account_connections.entry((host.to_owned(), url.port().unwrap_or(22), url.username().to_owned())).or_default();
+                *total += sftp.max_connections;
+                if *total > SftpConfig::MAX_ACCOUNT_CONNECTIONS {
+                    anyhow::bail!("SFTP pool members for the same account must share a total connection budget of at most {}", SftpConfig::MAX_ACCOUNT_CONNECTIONS);
+                }
+            } else if member.sftp.is_some() {
+                anyhow::bail!("a pool member's [sftp] section requires an sftp:// URL");
+            }
+        }
+        Ok(())
+    }
 }
 
 impl fmt::Debug for StorageConfig {
@@ -668,6 +813,7 @@ impl fmt::Debug for StorageConfig {
             .field("url", &redacted_storage_url(&self.url))
             .field("encryption_password", &"[REDACTED]")
             .field("storage_class", &self.storage_class)
+            .field("pool", &self.pool)
             .finish()
     }
 }
@@ -679,12 +825,15 @@ impl Serialize for StorageConfig {
     {
         let mut state = serializer.serialize_struct(
             "StorageConfig",
-            2 + usize::from(self.storage_class.is_some()),
+            2 + usize::from(self.storage_class.is_some()) + usize::from(self.pool.is_some()),
         )?;
         state.serialize_field("url", &redacted_storage_url(&self.url))?;
         state.serialize_field("encryption_password", &self.encryption_password)?;
         if let Some(storage_class) = &self.storage_class {
             state.serialize_field("storage_class", storage_class)?;
+        }
+        if let Some(pool) = &self.pool {
+            state.serialize_field("pool", pool)?;
         }
         state.end()
     }
@@ -1754,6 +1903,9 @@ impl Settings {
     pub(crate) fn validate(&self) -> Result<()> {
         self.servers.validate()?;
         self.runtime_memory_limit_bytes()?;
+        if let Some(pool) = &self.storage.pool {
+            pool.validate(self)?;
+        }
         if let Some(prometheus) = &self.prometheus
             && let Some(authority) = &prometheus.benchmark_authority
         {
@@ -1931,6 +2083,15 @@ impl Settings {
     /// Data-plane tuning for the configured backend. SFTP publishes its own
     /// profile; every other backend runs on the defaults.
     pub(crate) fn store_profile(&self) -> Result<StoreProfile> {
+        if let Some(pool) = &self.storage.pool {
+            let profile = pool.members.iter()
+                .filter(|member| has_sftp_scheme(&member.url))
+                .map(|member| member.sftp.clone().unwrap_or_default().data_profile())
+                .min_by_key(|profile| profile.segment_size_bytes);
+            if let Some(profile) = profile {
+                return Ok(StoreProfile::from(profile));
+            }
+        }
         Ok(match self.sftp_endpoint()? {
             // `from_file` fills `[sftp]` whenever the URL is SFTP; fall back to
             // the same defaults `validate` uses so a Settings built in code
@@ -2010,6 +2171,7 @@ impl Settings {
                 url: "s3://your-bucket/zerofs-data".to_string(),
                 encryption_password: "${ZEROFS_PASSWORD}".to_string(),
                 storage_class: None,
+                pool: None,
             },
             servers: ServerConfig {
                 nfs: Some(NfsConfig {
@@ -3281,6 +3443,7 @@ known_hosts = "${ZEROFS_TEST_KNOWN_HOSTS}""#,
             url: format!("sftp://alice:{secret}@example.com/data"),
             encryption_password: "volume-encryption-secret".to_owned(),
             storage_class: None,
+            pool: None,
         };
 
         let debug = format!("{storage:?}");

@@ -1353,24 +1353,7 @@ impl SftpSessionPool {
         factory: Arc<dyn SessionFactory>,
         config: &crate::config::SftpConfig,
     ) -> Result<Self, TransportError> {
-        let pool = Self::new_writable(
-            factory,
-            config.max_connections,
-            config.read_concurrency,
-            config.write_concurrency,
-        )
-        .await?;
-        pool.inner
-            .idle_warm_floor
-            .store(config.max_connections, Ordering::SeqCst);
-        pool.inner.flush_stall_recycle_millis.store(
-            config.flush_stall_recycle_secs.saturating_mul(1000),
-            Ordering::SeqCst,
-        );
-        pool.inner.auth_stall_recycle_millis.store(
-            config.auth_stall_recycle_secs.saturating_mul(1000),
-            Ordering::SeqCst,
-        );
+        let pool = Self::from_config_writable_deferred(factory, config)?;
         if let Err(error) = pool.warm_to(config.max_connections).await {
             return match pool.shutdown().await {
                 Ok(()) => Err(error),
@@ -1382,7 +1365,51 @@ impl SftpSessionPool {
         Ok(pool)
     }
 
+    /// Construct a fully owned transport without dialing the remote member.
+    /// Its first checkout uses the ordinary admission and connection limits.
+    pub(crate) fn from_config_writable_deferred(
+        factory: Arc<dyn SessionFactory>,
+        config: &crate::config::SftpConfig,
+    ) -> Result<Self, TransportError> {
+        let pool = Self::new_writable_deferred(
+            factory,
+            config.max_connections,
+            config.read_concurrency,
+            config.write_concurrency,
+        )?;
+        pool.inner
+            .idle_warm_floor
+            .store(config.max_connections, Ordering::SeqCst);
+        pool.inner.flush_stall_recycle_millis.store(
+            config.flush_stall_recycle_secs.saturating_mul(1000),
+            Ordering::SeqCst,
+        );
+        pool.inner.auth_stall_recycle_millis.store(
+            config.auth_stall_recycle_secs.saturating_mul(1000),
+            Ordering::SeqCst,
+        );
+        Ok(pool)
+    }
+
     pub(crate) async fn new_writable(
+        factory: Arc<dyn SessionFactory>,
+        shared: usize,
+        reads: usize,
+        writes: usize,
+    ) -> Result<Self, TransportError> {
+        let pool = Self::new_writable_deferred(factory, shared, reads, writes)?;
+        if let Err(error) = pool.warm_to(1).await {
+            return match pool.shutdown().await {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(TransportError::Close(format!(
+                    "SFTP pool warmup failed: {error}; cleanup also failed: {cleanup}"
+                ))),
+            };
+        }
+        Ok(pool)
+    }
+
+    fn new_writable_deferred(
         factory: Arc<dyn SessionFactory>,
         shared: usize,
         reads: usize,
@@ -1430,8 +1457,6 @@ impl SftpSessionPool {
             }),
         };
 
-        let session = pool.open_physical().await?;
-        pool.inner.roster.lock().unwrap().push(session);
         pool.start_idle_reaper();
         Ok(pool)
     }
@@ -1716,17 +1741,6 @@ impl SftpSessionPool {
                 Placement::Wait => changed.await,
             }
         }
-    }
-
-    async fn open_physical(&self) -> Result<Arc<SharedSession>, TransportError> {
-        let permit = self
-            .inner
-            .shared
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| TransportError::PoolClosed)?;
-        self.open_with_permit(permit).await
     }
 
     async fn open_with_permit(
@@ -4567,6 +4581,63 @@ mod tests {
         for lease in leases {
             lease.complete().await.unwrap();
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn deferred_writable_pool_dials_only_when_a_member_operation_is_requested() {
+        let factory = RecordingFactory::fully_capable();
+        let config = crate::config::SftpConfig {
+            identity_file: "/tmp/id-ed25519".into(),
+            known_hosts: "/tmp/known-hosts".into(),
+            max_connections: 4,
+            read_concurrency: 4,
+            write_concurrency: 4,
+            ..Default::default()
+        };
+        let pool =
+            SftpSessionPool::from_config_writable_deferred(Arc::new(factory.clone()), &config)
+                .unwrap();
+        assert_eq!(factory.dials(), 0);
+        assert_eq!(factory.live(), 0);
+        tokio::time::advance(SFTP_IDLE_TIMEOUT + SFTP_IDLE_REAP_INTERVAL).await;
+        tokio::task::yield_now().await;
+        assert_eq!(factory.dials(), 0, "maintenance must not activate an unused member");
+
+        let lease = pool.checkout(OperationKind::Read).await.unwrap();
+        assert_eq!(factory.dials(), 1);
+        assert_eq!(factory.live(), 1);
+        lease.complete().await.unwrap();
+        pool.shutdown().await.unwrap();
+        assert_eq!(factory.live(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_deferred_member_does_not_prevent_construction_or_unused_shutdown() {
+        let factory = RecordingFactory::fully_capable();
+        factory.state.fail_open_from.store(1, Ordering::SeqCst);
+        let config = crate::config::SftpConfig {
+            identity_file: "/tmp/id-ed25519".into(),
+            known_hosts: "/tmp/known-hosts".into(),
+            max_connections: 2,
+            read_concurrency: 2,
+            write_concurrency: 2,
+            ..Default::default()
+        };
+        let pool =
+            SftpSessionPool::from_config_writable_deferred(Arc::new(factory.clone()), &config)
+                .unwrap();
+        assert_eq!(factory.dials(), 0);
+        pool.shutdown().await.unwrap();
+        assert_eq!(factory.dials(), 0);
+        assert_eq!(factory.live(), 0);
+
+        let pool =
+            SftpSessionPool::from_config_writable_deferred(Arc::new(factory.clone()), &config)
+                .unwrap();
+        assert!(pool.checkout(OperationKind::Read).await.is_err());
+        assert_eq!(factory.dials(), 1);
+        assert_eq!(factory.live(), 0);
+        pool.shutdown().await.unwrap();
     }
 
     #[tokio::test(start_paused = true)]

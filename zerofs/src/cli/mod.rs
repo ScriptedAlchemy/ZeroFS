@@ -1,6 +1,6 @@
 use crate::config::Settings;
 use crate::rpc::client::RpcClient;
-use crate::sftp_transport::SftpSessionPool;
+use crate::storage_backend::BackendSessions;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
@@ -15,6 +15,7 @@ pub mod monitor;
 pub mod nbd;
 pub mod otrace;
 pub mod password;
+pub mod pool;
 pub mod server;
 pub(crate) mod transfer;
 
@@ -89,6 +90,11 @@ pub enum Commands {
     ChangePassword {
         #[arg(short, long)]
         config: PathBuf,
+    },
+    /// Initialize, inspect, or rebalance permanent storage (server must be stopped)
+    Pool {
+        #[command(subcommand)]
+        subcommand: PoolCommands,
     },
     /// Debug commands for inspecting the database
     Debug {
@@ -182,6 +188,42 @@ fn parse_transfer_jobs(value: &str) -> std::result::Result<usize, String> {
     } else {
         Ok(jobs)
     }
+}
+
+#[derive(Subcommand)]
+pub enum PoolCommands {
+    /// Initialize a new placement catalog; never recreates a lost catalog
+    Init {
+        #[arg(short, long)]
+        config: PathBuf,
+    },
+    /// Print per-member committed capacity and pending reservations as JSON
+    Status {
+        #[arg(short, long)]
+        config: PathBuf,
+    },
+    /// List segment placements as JSON
+    List {
+        #[arg(short, long)]
+        config: PathBuf,
+    },
+    /// Move verified segments to another member, retaining the same filesystem
+    Migrate {
+        #[arg(short, long)]
+        config: PathBuf,
+        /// Destination member ID from the configuration
+        #[arg(long)]
+        to: String,
+        /// Move segments from this member (legacy metadata-store segments use "authority")
+        #[arg(long, conflicts_with = "segment", required_unless_present = "segment")]
+        from: Option<String>,
+        /// Move one exact segment object path returned by `pool list`
+        #[arg(long, conflicts_with = "from")]
+        segment: Option<String>,
+        /// Bound the amount of work in one maintenance invocation
+        #[arg(long, default_value_t = 128, value_parser = parse_transfer_jobs)]
+        limit: usize,
+    },
 }
 
 #[derive(Subcommand)]
@@ -360,7 +402,7 @@ pub(crate) fn has_attached_cleanup_error(error: &anyhow::Error) -> bool {
 /// Callers that must only clean up on failure keep that shape by calling this
 /// with an already-`Err` result.
 pub(crate) async fn finish_with_sftp_cleanup<T>(
-    pool: Option<&SftpSessionPool>,
+    pool: Option<&BackendSessions>,
     cleanup_context: &'static str,
     result: Result<T>,
 ) -> Result<T> {

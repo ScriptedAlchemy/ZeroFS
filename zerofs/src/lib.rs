@@ -15,6 +15,7 @@ pub mod frame_codec;
 pub mod fs;
 mod key_management;
 pub mod length_checked_object_store;
+mod local_object_store;
 #[allow(dead_code)]
 mod linux_errno;
 pub(crate) mod metadata_digest;
@@ -27,6 +28,7 @@ mod ninep;
 pub mod object_store_prefetch;
 pub mod object_trace;
 mod parse_object_store;
+mod pool_object_store;
 mod prometheus;
 mod redis_conditional_store;
 pub mod replication;
@@ -42,6 +44,7 @@ mod sftp_protocol;
 pub mod sftp_transport;
 pub mod storage_class_object_store;
 mod storage_compatibility;
+mod storage_backend;
 pub(crate) mod task;
 mod telemetry;
 #[cfg(feature = "webui")]
@@ -128,6 +131,9 @@ pub async fn run_cli() -> Result<()> {
             checkpoint,
         } => {
             cli::server::run_server(config, read_only, checkpoint).await?;
+        }
+        cli::Commands::Pool { subcommand } => {
+            cli::pool::run(subcommand).await?;
         }
         cli::Commands::Debug { subcommand } => match subcommand {
             cli::DebugCommands::ListKeys { config } => {
