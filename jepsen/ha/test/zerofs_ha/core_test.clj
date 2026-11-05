@@ -107,18 +107,26 @@
         (.delete socket)
         (.delete dir)))))
 
-(deftest standby-ready-count-is-node-specific
-  (let [log (java.io.File/createTempFile "zerofs-ha-test" ".log")
-        c   {:nodes {:a {:log (.getPath log)}
-                     :b {:log (.getPath log)}}}]
+(deftest standby-ready-count-requires-an-accepted-heartbeat
+  (let [log-a (java.io.File/createTempFile "zerofs-ha-a" ".log")
+        log-b (java.io.File/createTempFile "zerofs-ha-b" ".log")
+        armed "HA standby: accepted leader heartbeat; takeover watch armed"
+        c {:nodes {:a {:log (.getPath log-a)}
+                   :b {:log (.getPath log-b)}}}]
     (try
-      (spit log (str "HA standby a: watching leader heartbeats\n"
-                     "HA standby b: watching leader heartbeats\n"
-                     "HA standby b: watching leader heartbeats\n"))
+      ;; Starting the watcher alone must not make Jepsen kill the leader.
+      (spit log-a (str "HA standby a: watching leader heartbeats\n"
+                       armed "\n"))
+      (spit log-b "HA standby b: watching leader heartbeats\n")
       (is (= 1 (core/standby-ready-count c :a)))
+      (is (zero? (core/standby-ready-count c :b)))
+      ;; Count only events from this node, emitted after covered liveness arms.
+      (spit log-b (str armed "\n" armed "\n") :append true)
       (is (= 2 (core/standby-ready-count c :b)))
+      (is (= 1 (core/standby-ready-count c :a)))
       (finally
-        (.delete log)))))
+        (.delete log-a)
+        (.delete log-b)))))
 
 (deftest make-bucket-waits-for-a-readable-bucket
   (let [commands (atom [])

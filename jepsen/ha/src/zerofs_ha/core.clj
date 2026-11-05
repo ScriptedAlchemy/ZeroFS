@@ -248,8 +248,7 @@
 
 (defn standby-ready-count [c node-key]
   (try
-    (let [marker (str "HA standby " (name node-key)
-                      ": watching leader heartbeats")]
+    (let [marker "HA standby: accepted leader heartbeat; takeover watch armed"]
       (->> (slurp (get-in c [:nodes node-key :log]))
            (re-seq (re-pattern (java.util.regex.Pattern/quote marker)))
            count))
