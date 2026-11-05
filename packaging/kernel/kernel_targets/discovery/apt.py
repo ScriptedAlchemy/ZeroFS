@@ -150,6 +150,8 @@ def observe(
         [
             "apt-get",
             "-o",
+            "APT::Update::Error-Mode=any",
+            "-o",
             "Acquire::Check-Valid-Until=false",
             "-o",
             "Acquire::https::Verify-Peer=false",
@@ -191,6 +193,8 @@ def observe(
     runner.run(
         [
             "apt-get",
+            "-o",
+            "APT::Update::Error-Mode=any",
             "-o",
             "Acquire::Check-Valid-Until=false",
             "update",
