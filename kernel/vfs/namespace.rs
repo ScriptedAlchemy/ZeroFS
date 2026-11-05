@@ -272,7 +272,15 @@ pub(super) unsafe extern "C" fn zerofs_permission(
             let expected_type = expected_qid_type(inode.file_type())?;
             let observation = mount.begin_cache_observation();
             let attributes =
-                getattr_attributes(&mount.client, &inode, &credentials, expected_type)?;
+                match getattr_attributes(&mount.client, &inode, &credentials, expected_type) {
+                    Ok(attributes) => attributes,
+                    // rmdir can finish while this permission refresh is in
+                    // flight. A retained cwd remains searchable after removal,
+                    // just as when nlink was already zero before the RPC.
+                    // Still run generic_permission on the retained inode.
+                    Err(error) if error == ENOENT && inode.link_count() == 0 => break,
+                    Err(error) => return Err(error),
+                };
             validate_stat_for_inode(&inode, &attributes)?;
             if cache_inode_attributes_at(&inode, &attributes, observation) {
                 break;
@@ -1339,3 +1347,4 @@ pub(super) unsafe extern "C" fn zerofs_get_link(
         Ok(result.cast_const())
     })
 }
+
